@@ -5417,14 +5417,31 @@ function selectedBenchmarkSlots() {
   return slots;
 }
 
+/* Resolve the effective API provider behind an OpenRouter proxy model, mirroring
+   the server-side getUnderlyingProvider in benchmark/settings.ts. */
+function getUnderlyingProvider(model) {
+  if (model && model.provider === 'openrouter' && model.model) {
+    var parts = model.model.split('/');
+    if (parts.length > 1) {
+      var sub = parts[0].toLowerCase();
+      if (sub === 'google') return 'gemini';
+      if (sub === 'x-ai') return 'xai';
+      return sub;
+    }
+  }
+  return model ? model.provider : '';
+}
+
 /* Blocking pre-checks mirroring the server rules, phrased for the A–E panel. */
 function validateBenchmarkSlots(slots) {
   if (!slots.A || !slots.B || !slots.C || !slots.D || !slots.E) return 'Choose a model for every slot (A–E).';
+  if (slots.A.provider === 'openrouter' && slots.A.model === 'auto') return 'openrouter/auto cannot be the primary extractor because its routing is unpredictable.';
+  if (slots.B.provider === 'openrouter' && slots.B.model === 'auto') return 'openrouter/auto cannot be the failover extractor because its routing is unpredictable.';
   if (benchmarkModelKey(slots.A) === benchmarkModelKey(slots.B)) return 'A (primary) and B (failover) must be different models.';
-  if (slots.A.provider === slots.B.provider) return 'A (primary) and B (failover) must use different providers, so the failover survives a provider outage.';
+  if (getUnderlyingProvider(slots.A) === getUnderlyingProvider(slots.B)) return 'A (primary) and B (failover) must use different providers, so the failover survives a provider outage.';
   var trioKeys = [benchmarkModelKey(slots.C), benchmarkModelKey(slots.D), benchmarkModelKey(slots.E)];
   if (new Set(trioKeys).size !== 3) return 'C, D, and E must be three different models.';
-  var trioProviders = [slots.C.provider, slots.D.provider, slots.E.provider];
+  var trioProviders = [getUnderlyingProvider(slots.C), getUnderlyingProvider(slots.D), getUnderlyingProvider(slots.E)];
   if (new Set(trioProviders).size !== 3) return 'C, D, and E must use three different providers, so agreement votes stay independent.';
   return '';
 }
@@ -5434,7 +5451,7 @@ function updateBenchmarkSlotWarnings() {
   var note = el('benchmarkSlotWarnings');
   if (!note) return;
   var slots = selectedBenchmarkSlots();
-  var warning = slots.A && ((slots.C && slots.A.provider === slots.C.provider) || (slots.D && slots.A.provider === slots.D.provider))
+  var warning = slots.A && ((slots.C && getUnderlyingProvider(slots.A) === getUnderlyingProvider(slots.C)) || (slots.D && getUnderlyingProvider(slots.A) === getUnderlyingProvider(slots.D)))
     ? 'Note: tier-1 agreement shares a provider with the primary extractor — votes are less independent.'
     : '';
   note.style.color = warning ? 'var(--warn)' : '';
