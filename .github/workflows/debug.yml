@@ -1,5 +1,5 @@
 name: Debug
-on: [workflow_dispatch]
+on: [push]
 jobs:
   debug:
     runs-on: [self-hosted, oracle-ci]
