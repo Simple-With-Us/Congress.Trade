@@ -1,0 +1,11 @@
+name: Debug
+on:
+  push:
+    branches:
+      - debug-logs
+jobs:
+  debug:
+    runs-on: [self-hosted, oracle-ci]
+    steps:
+      - run: docker logs congress-app --tail 200
+      - run: docker logs congress-sqlite-web --tail 200
