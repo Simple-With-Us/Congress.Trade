@@ -4,6 +4,4 @@ jobs:
   debug:
     runs-on: [self-hosted, oracle-ci]
     steps:
-      - run: sudo ss -tlnp || true
-      - run: cat /etc/cloudflared/config.yml || true
-      - run: docker ps -a
+      - run: docker exec oracle-caddy-1 cat /etc/caddy/Caddyfile
