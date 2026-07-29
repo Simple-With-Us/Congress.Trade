@@ -16,7 +16,9 @@ services:
       - PORT=5000
 
   sqlite-web:
-    image: coleifer/sqlite-web
+    build: 
+      context: .
+      dockerfile: Dockerfile.sqlite-web
     container_name: congress-sqlite-web
     restart: unless-stopped
     ports:

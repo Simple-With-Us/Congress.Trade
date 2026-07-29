@@ -14,4 +14,4 @@ RUN deno cache src/deno/main.ts
 
 EXPOSE 5000
 
-CMD ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "src/deno/main.ts"]
+CMD ["deno", "run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "--allow-sys", "--allow-ffi", "src/deno/main.ts"]
