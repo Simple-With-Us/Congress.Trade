@@ -4,4 +4,5 @@ jobs:
   debug:
     runs-on: [self-hosted, oracle-ci]
     steps:
-      - run: docker exec oracle-caddy-1 cat /etc/caddy/Caddyfile
+      - run: docker inspect congress-app -f '{{json .NetworkSettings.Networks}}'
+      - run: docker inspect oracle-caddy-1 -f '{{json .NetworkSettings.Networks}}'
