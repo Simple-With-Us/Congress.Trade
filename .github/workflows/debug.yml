@@ -4,5 +4,6 @@ jobs:
   debug:
     runs-on: [self-hosted, oracle-ci]
     steps:
-      - run: curl -v -I http://localhost:5000/api/health || true
+      - run: sudo ss -tlnp || true
+      - run: cat /etc/cloudflared/config.yml || true
       - run: docker ps -a
