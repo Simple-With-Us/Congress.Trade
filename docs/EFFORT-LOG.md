@@ -9,6 +9,7 @@ as open `state:planned` even though all six are done. A mirror-sync commit lands
 #155/#161.
 
 ## Active / In Progress
+- **2026-08-04 — GROK — In Progress — Concurrent-race timing filter (PR #1306).** Only score lead/win when both CT and provider stamps fall in the 7d window and |delta|≤48h.
 - **2026-08-04 — GROK — COMPLETED + DEPLOYED — Member drawer dual performance vs S&P (PR #1302, `1d435a3a`).** Politician detail now shows (1) trade-date buy skill and (2) filing-date copy-trade with annualized excess matching Top Performers basis. Buys only; sells excluded. Live verified McCormick: tradeDate avgExcess +0.4%, filingDate ann +51.7% (window=all). Coolify deploy forced after merge (auto-webhook lag). Gates: typecheck + CI green; prod HTML `memberPerfHtml` live.
 
 
