@@ -337,20 +337,9 @@ struct FeedDashboardView: View {
 
 // MARK: - Header / controls
 
-/// Website-parity brand lockup: eagle+bag with CONGRESS / TRADE baked into the
-/// light/dark lockup assets. No trailing "Congress.Trade" text after the mark.
-/// Sized ~50% larger than the old 28pt bar, then +10% (42→46 / 300→330) and
-/// lockup art has ~½ capital-width extra gap between CONGRESS|eagle|TRADE.
-struct BrandTitle: View {
-    var body: some View {
-        Image("BrandLockup")
-            .resizable()
-            .scaledToFit()
-            .frame(height: 46)
-            .frame(maxWidth: 330)
-            .accessibilityLabel("Congress.Trade")
-    }
-}
+// `BrandTitle` now lives in Views/Components/Components.swift — it has to be
+// one fixed rendered size for every tab, which is a shared-primitive concern,
+// not a Trades one.
 
 /// Shared under-header filter strip used on both Trades and Trends.
 struct FeedControlBar: View {
