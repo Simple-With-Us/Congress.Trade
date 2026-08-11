@@ -355,18 +355,157 @@ export function buildSectorBreakdownQuery(p: CommonFilters & { limit?: number })
 // ---------------------------------------------------------------------------
 
 /**
+ * securities_ref.sector / .market_cap_bucket are populated by several
+ * enrichment providers racing a COALESCE-on-conflict upsert (see
+ * enrichment/service.ts insertOrUpdate) — whichever provider's row lands
+ * first wins the value, and providers do not share a vocabulary. Some write
+ * a literal junk string instead of leaving the column NULL/empty (observed
+ * live: a bare "N/A", 2 trades in a 90d window). The old
+ * `COALESCE(NULLIF(x, ''), 'Unknown')` fallback only catches the empty
+ * string — NULLIF does not know these sentinels are also "no value". This
+ * list is intentionally small and conservative (exact, case-insensitive
+ * matches only); it must never catch a real short sector/bucket label.
+ */
+const JUNK_SENTINEL_VALUES = ['', 'n/a', 'na', '-', '--', 'none', 'null', 'unknown'];
+
+/** `WHEN`-worthy boolean SQL: true when `expr` (trimmed, lowercased) is a junk sentinel. */
+function junkSentinelSql(expr: string): string {
+  const raw = `lower(trim(coalesce(${expr}, '')))`;
+  return JUNK_SENTINEL_VALUES.map((v) => `${raw} = ${sectorSqlQuote(v)}`).join(' OR ');
+}
+
+function sectorSqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * securities_ref.sector fragments one real sector across several rows because
+ * different enrichment providers write different vocabularies into the same
+ * column (see the comment on {@link JUNK_SENTINEL_VALUES} above). Observed
+ * live in a 90d window: "Health Care" (43 trades) and "Healthcare" (33
+ * trades) are the same sector split in two; "Communication Services" /
+ * "Communications" / "Telecommunication" fragment one sector into three; and
+ * dozens of rows are GICS *sub-industries* masquerading as sectors
+ * (Semiconductors, Pharmaceuticals, Banking, Aerospace & Defense, …).
+ *
+ * This maps the labels we are CONFIDENT about onto the 11-sector
+ * Morningstar/GICS-style set already named in this codebase's product copy
+ * (Technology, Financial Services, Health Care, Consumer Cyclical, Consumer
+ * Defensive, Industrials, Energy, Utilities, Real Estate, Basic Materials,
+ * Communication Services). It is deliberately NOT exhaustive: a handful of
+ * observed labels are genuinely ambiguous between two canonical sectors
+ * under GICS (e.g. "Retail" spans Consumer Discretionary Retail AND Consumer
+ * Staples Distribution & Retail; "Construction" spans Construction &
+ * Engineering [Industrials] and Home Builders [Consumer Cyclical]; "Finance
+ * Insurance & Real Estate" spans two sectors outright; "Consumer products"
+ * — lowercase p — gives no signal beyond "consumer") and are intentionally
+ * left OUT of this table so they fall through to their own original label
+ * in the ELSE branch below, rather than being guessed into the wrong
+ * bucket. Anything not recognized here is never swallowed into 'Unknown' —
+ * only genuine junk sentinels (see {@link junkSentinelSql}) become 'Unknown'.
+ */
+const SECTOR_ALIASES: Record<string, string> = {
+  // Exact duplicates / cross-taxonomy synonyms for the SAME sector.
+  healthcare: 'Health Care',
+  'health care': 'Health Care',
+  communications: 'Communication Services',
+  'communication services': 'Communication Services',
+  telecommunication: 'Communication Services',
+  telecommunications: 'Communication Services',
+  financials: 'Financial Services',
+  'financial services': 'Financial Services',
+  technology: 'Technology',
+  'information technology': 'Technology',
+  industrials: 'Industrials',
+  energy: 'Energy',
+  utilities: 'Utilities',
+  'real estate': 'Real Estate',
+  materials: 'Basic Materials',
+  'basic materials': 'Basic Materials',
+  'consumer cyclical': 'Consumer Cyclical',
+  'consumer discretionary': 'Consumer Cyclical',
+  'consumer defensive': 'Consumer Defensive',
+  'consumer staples': 'Consumer Defensive',
+
+  // GICS sub-industries rolled up into their (unambiguous) parent sector.
+  semiconductors: 'Technology',
+  software: 'Technology',
+  'consumer electronics': 'Technology',
+  media: 'Communication Services',
+  entertainment: 'Communication Services',
+  banking: 'Financial Services',
+  banks: 'Financial Services',
+  insurance: 'Financial Services',
+  'asset management': 'Financial Services',
+  'capital markets': 'Financial Services',
+  pharmaceuticals: 'Health Care',
+  biotechnology: 'Health Care',
+  'life sciences tools & services': 'Health Care',
+  'medical devices': 'Health Care',
+  automobiles: 'Consumer Cyclical',
+  'hotels/restaurants & leisure': 'Consumer Cyclical',
+  'hotels restaurants & leisure': 'Consumer Cyclical',
+  beverages: 'Consumer Defensive',
+  'food products': 'Consumer Defensive',
+  tobacco: 'Consumer Defensive',
+  machinery: 'Industrials',
+  'electrical equipment': 'Industrials',
+  'aerospace & defense': 'Industrials',
+  'aerospace and defense': 'Industrials',
+  'road & rail': 'Industrials',
+  'road and rail': 'Industrials',
+  'logistics & transportation': 'Industrials',
+  'logistics and transportation': 'Industrials',
+  'industrial conglomerates': 'Industrials',
+  'metals & mining': 'Basic Materials',
+  'metals and mining': 'Basic Materials',
+};
+
+/**
+ * SQL CASE expression canonicalizing `sectorExpr` (a `securities_ref.sector`
+ * reference) — same shape as {@link canonicalAssetTypeCategorySql} in
+ * shared/assetTypes.ts: junk sentinels collapse to 'Unknown', recognized
+ * aliases collapse onto their canonical label, everything else passes
+ * through unchanged (trimmed) so no raw sector value silently disappears.
+ */
+export function canonicalSectorSql(sectorExpr: string): string {
+  const aliasWhen = Object.entries(SECTOR_ALIASES)
+    .map(
+      ([label, canonical]) =>
+        `WHEN lower(trim(coalesce(${sectorExpr}, ''))) = ${sectorSqlQuote(label)} THEN ${sectorSqlQuote(canonical)}`,
+    )
+    .join(' ');
+  return (
+    `(CASE WHEN ${junkSentinelSql(sectorExpr)} THEN 'Unknown' ` +
+    `${aliasWhen} ELSE trim(${sectorExpr}) END)`
+  );
+}
+
+/**
  * Net buy/sell flow by REAL GICS sector (securities_ref.sector) — distinct from
  * buildSectorBreakdownQuery, which groups by the free-text `asset_type` (an
- * instrument class, not a sector). Resolved tickers only; un-enriched/unknown
- * sectors collapse to 'Unknown'. Reports signed net flow so a sector's
- * accumulation vs distribution is visible, plus politician/ticker breadth.
+ * instrument class, not a sector). Resolved tickers only; un-enriched/junk
+ * sectors collapse to 'Unknown'; known duplicate/sub-industry labels collapse
+ * onto one canonical sector via {@link canonicalSectorSql} (see that comment
+ * for why — multi-provider enrichment writes different vocabularies into one
+ * column). Reports signed net flow so a sector's accumulation vs distribution
+ * is visible, plus politician/ticker breadth.
+ *
+ * NOTE — this query (and buildMarketCapBreakdownQuery below) filters on
+ * TICKER_RESOLVED_SQL, so trades with no resolved ticker are excluded here
+ * entirely (they have no `t.ticker` to join securities_ref on, so they
+ * couldn't contribute a sector anyway). That population is invisible in this
+ * view and in the market-cap breakdown; buildSummaryQuery already computes
+ * `resolved_ticker_count` / `total_trades` (surfaced as `resolvedTickerPct`
+ * by GET /api/analytics/summary) for sizing it. Changing that gate is a
+ * product decision outside the scope of this fix.
  */
 export function buildSectorFlowQuery(p: CommonFilters & { limit?: number }): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const limit = clampLimit(p.limit, 20, 100);
   const allWhere = [TICKER_RESOLVED_SQL, ...where];
   const sql =
-    "SELECT COALESCE(NULLIF(sr.sector, ''), 'Unknown') AS sector, " +
+    `SELECT ${canonicalSectorSql('sr.sector')} AS sector, ` +
     'COUNT(*) AS trade_count, ' +
     `${BUY} AS buy_count, ${SELL} AS sell_count, ` +
     `SUM(${MID}) AS est_volume, ` +
@@ -383,13 +522,15 @@ export function buildSectorFlowQuery(p: CommonFilters & { limit?: number }): Bui
 /**
  * Net flow + activity by market-cap bucket (securities_ref.market_cap_bucket:
  * mega…nano). Surfaces a size tilt (e.g. concentration in small/micro caps).
- * Resolved tickers only; un-enriched rows collapse to 'unknown'.
+ * Resolved tickers only (same TICKER_RESOLVED_SQL gate + exclusion caveat as
+ * buildSectorFlowQuery above); un-enriched/junk rows collapse to 'unknown'
+ * via the same sentinel list as the sector query (see JUNK_SENTINEL_VALUES).
  */
 export function buildMarketCapBreakdownQuery(p: CommonFilters): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const allWhere = [TICKER_RESOLVED_SQL, ...where];
   const sql =
-    "SELECT COALESCE(NULLIF(sr.market_cap_bucket, ''), 'unknown') AS bucket, " +
+    `SELECT (CASE WHEN ${junkSentinelSql('sr.market_cap_bucket')} THEN 'unknown' ELSE trim(sr.market_cap_bucket) END) AS bucket, ` +
     'COUNT(*) AS trade_count, ' +
     `${BUY} AS buy_count, ${SELL} AS sell_count, ` +
     `SUM(${MID}) AS est_volume, ` +

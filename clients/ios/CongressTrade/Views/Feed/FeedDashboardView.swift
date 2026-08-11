@@ -16,8 +16,21 @@ struct FeedDashboardView: View {
     /// list item 2b) — never a per-view `@State` that resets on tab switch.
     @AppStorage("ct_disclaimer_expanded") private var disclaimerExpanded = true
     @AppStorage("ct_disclaimer_intro_done") private var disclaimerIntroDone = false
-    @State private var showExportSheet = false
     @FocusState private var searchFocused: Bool
+
+    /// `cachedTrades` minus any row whose SwiftData backing is already gone.
+    ///
+    /// Every refresh ends in `replaceCache`, which DELETES every cached
+    /// `ClientTrade` missing from the new response. `@Query` republishes on its
+    /// own schedule, so between the delete and that republish `cachedTrades`
+    /// still hands out dead objects — and reading ANY persisted property on one
+    /// traps (`EXC_BREAKPOINT` inside `ClientTrade.storedAsset.getter`,
+    /// reproduced repeatedly by tapping the sort-direction control). Both the
+    /// sort/filter closures below and `TradeCard` read persisted properties, so
+    /// the window is closed here, once, rather than at each reader.
+    private var liveCachedTrades: [ClientTrade] {
+        cachedTrades.filter { !$0.isDeleted && $0.modelContext != nil }
+    }
 
     /// Orders the loaded page per the active Trades sort control (owner
     /// punch list #2, item 7). Date is a real backend sort key — the server
@@ -29,7 +42,7 @@ struct FeedDashboardView: View {
         let ascending = store.feedSortDirection == .ascending
         switch store.feedSortKey {
         case .date:
-            return cachedTrades.sorted { lhs, rhs in
+            return liveCachedTrades.sorted { lhs, rhs in
                 let ld = lhs.transaction.date ?? ""
                 let rd = rhs.transaction.date ?? ""
                 if ld != rd { return ascending ? ld < rd : ld > rd }
@@ -41,7 +54,7 @@ struct FeedDashboardView: View {
                 return ascending ? lc < rc : lc > rc
             }
         case .amount:
-            return cachedTrades.sorted { lhs, rhs in
+            return liveCachedTrades.sorted { lhs, rhs in
                 let la = lhs.transaction.amountMin ?? 0
                 let ra = rhs.transaction.amountMin ?? 0
                 if la != ra { return ascending ? la < ra : la > ra }
@@ -111,8 +124,36 @@ struct FeedDashboardView: View {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// The count line above the list — the owner's "the # of trades says 100 on
+    /// top of that tab still".
+    ///
+    /// It said 100 because 100 is the PAGE SIZE, not a total: `replaceCache`
+    /// deletes every cached row that is not in the latest response, so the
+    /// local cache is exactly one page and `filteredTrades.count` saturates at
+    /// `store.pageSize` whenever the page is full. No filter could ever move
+    /// that number, which is precisely why it looked broken.
+    ///
+    /// `store.honestTradeTotal(localSearchText:)` returns the server's
+    /// `COUNT(*)` only while it genuinely describes what is on screen (right
+    /// filters, request landed, no client-only narrowing, no local search) and
+    /// `nil` otherwise. In the `nil` case we never back-fill with a page count
+    /// dressed up as a total: we either say nothing (the owner explicitly
+    /// accepted "no number there") or say, in words, that the number is scoped
+    /// to this page.
+    private func tradeCountLabel(rows: [ClientTrade]) -> String? {
+        if let total = store.honestTradeTotal(localSearchText: searchText) {
+            return "\(total.formatted(.number.grouping(.automatic))) trades"
+        }
+        // Mid-apply the rows on screen still belong to the filter set the user
+        // just changed away from, so any number would be describing the past.
+        guard !store.isFeedFilterPending, !rows.isEmpty else { return nil }
+        return "\(rows.count.formatted(.number.grouping(.automatic))) on this page"
+    }
+
     var body: some View {
-        NavigationStack {
+        let rows = filteredTrades
+
+        return NavigationStack {
             ScrollView {
                 VStack(spacing: 12) {
                     DisclaimerBanner(isExpanded: $disclaimerExpanded)
@@ -138,12 +179,37 @@ struct FeedDashboardView: View {
                         scheduleSearchDebounce()
                     }
 
+                    // Owner: "when you update filter options it takes 3-5
+                    // seconds … there should be some indicator so you don't
+                    // think that it just isn't working."
+                    //
+                    // It shares the count's slot rather than taking a row of
+                    // its own because the two are mutually exclusive by
+                    // construction — `tradeCountLabel` returns nil for exactly
+                    // the window in which the indicator is up — so one slot
+                    // costs no extra vertical space and can never jump: this
+                    // row's height is set by `FeedSortControl` either way.
+                    //
+                    // Bound to the FEED half of the pending state, not the
+                    // combined flag: a shared filter also kicks off Trends' 12
+                    // analytics requests, which routinely outlive the feed
+                    // fetch by seconds, and "Updating…" must come down when
+                    // THESE rows are final. Trends renders its own indicator
+                    // against `isTrendsFilterPending`.
                     HStack(spacing: 8) {
                         FeedSortControl()
                         Spacer(minLength: 0)
-                        Text("\(filteredTrades.count) trades")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
+                        if store.isFeedFilterPending {
+                            // `fixedSize` because the shared indicator is built
+                            // to span a full row elsewhere; here it must claim
+                            // only its own width.
+                            FilterActivityIndicator(isActive: true)
+                                .fixedSize()
+                        } else if let countLabel = tradeCountLabel(rows: rows) {
+                            Text(countLabel)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(Color.secondary)
+                        }
                     }
 
                     // Only real offline/error notices — never cancellation noise.
@@ -157,7 +223,13 @@ struct FeedDashboardView: View {
                         )
                     }
 
-                    if filteredTrades.isEmpty && !store.isRefreshing {
+                    // Gated on the pending flag as well as `isRefreshing`: a
+                    // filter change with a non-empty cache used to fall between
+                    // the two — the cold-start overlay was suppressed (cache not
+                    // empty) and this branch was suppressed (`isRefreshing` was
+                    // only true once the request had actually started), leaving
+                    // a blank page mid-apply.
+                    if rows.isEmpty && !store.isRefreshing && !store.isFeedFilterPending {
                         ContentUnavailableView {
                             Label(
                                 hasActiveTextFilter ? "No Matching Trades" : "No Trades in Range",
@@ -177,8 +249,17 @@ struct FeedDashboardView: View {
                         .padding(.top, 40)
                     }
 
+                    // Owner: pagination was "way at bottom and missing from top
+                    // of the list of trades". Same component top and bottom —
+                    // `FeedPaginationBar` holds no state of its own (page,
+                    // page size and bounds all live on the store), so the two
+                    // instances cannot drift.
+                    if !rows.isEmpty {
+                        FeedPaginationBar()
+                    }
+
                     LazyVStack(spacing: 8) {
-                        ForEach(filteredTrades) { trade in
+                        ForEach(rows) { trade in
                             Button {
                                 selectedTrade = trade
                             } label: {
@@ -195,10 +276,31 @@ struct FeedDashboardView: View {
                             .accessibilityHint("Opens trade details")
                         }
                     }
+                    // NO "dim the stale rows while applying" TREATMENT HERE,
+                    // deliberately — it looked good and it crashed the app.
+                    //
+                    // Any modifier that composites this subtree (`.opacity`,
+                    // and worse `.animation(_:value:)` keyed on the pending
+                    // flag) makes SwiftUI realize and re-render rows that the
+                    // `LazyVStack` would otherwise never touch — and it does so
+                    // at exactly the wrong instant, because the flag clears in
+                    // the same turn `replaceCache` deletes every cached
+                    // `ClientTrade` missing from the new response. Reading
+                    // `trade.asset` on a deleted SwiftData model traps:
+                    // EXC_BREAKPOINT in `ClientTrade.storedAsset.getter`,
+                    // reproduced three times on iPhone 17 Pro / iOS 26.5 by
+                    // tapping the sort-direction control repeatedly, and zero
+                    // times in a control build with only this file reverted.
+                    // The "Updating…" strip beside the count is the whole
+                    // signal; it costs nothing to render and cannot touch a
+                    // model object.
 
-                    if !filteredTrades.isEmpty {
+                    if !rows.isEmpty {
                         FeedPaginationBar()
                     }
+
+                    LegalFooterLinks()
+                        .padding(.top, 8)
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
@@ -208,9 +310,17 @@ struct FeedDashboardView: View {
             .background(AppTheme.background)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                // Swapped vs the old layout (owner punch list item 3): ⓘ now
-                // leads (where the export arrow used to be), arrow trails —
-                // matching Trends' ⓘ side after its own swap below.
+                // EXACT toolbar parity with Trends: ⓘ leading, brand
+                // principal, hamburger trailing — one item on each side.
+                //
+                // The export-CSV arrow that used to sit next to the hamburger
+                // is gone: CSV export now lives inside `AccountQuickMenu` (and
+                // on the Delivery tab), which is what the owner asked for
+                // ("the export CSV button needs to be in settings"). Removing
+                // it also fixes "the Trades tab shouldn't have a smaller logo"
+                // — a `.principal` item is squeezed by whatever its leading and
+                // trailing siblings need, so Trades' two trailing items were
+                // shrinking the lockup that Trends rendered at full size.
                 ToolbarItem(placement: .topBarLeading) {
                     HeaderIconButton(
                         systemImage: "info.circle",
@@ -222,13 +332,7 @@ struct FeedDashboardView: View {
                 ToolbarItem(placement: .principal) {
                     BrandTitle()
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    HeaderIconButton(
-                        systemImage: "arrow.down.circle",
-                        accessibilityLabel: "Export CSV"
-                    ) {
-                        showExportSheet = true
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
                     HamburgerMenuButton()
                 }
                 ToolbarItemGroup(placement: .keyboard) {
@@ -285,12 +389,6 @@ struct FeedDashboardView: View {
                         .presentationCornerRadius(18)
                 }
             }
-            .sheet(isPresented: $showExportSheet) {
-                ExportCSVSheet()
-                    .environmentObject(store)
-                    .presentationDetents([.medium])
-                    .presentationDragIndicator(.visible)
-            }
             .onDisappear { filterTask?.cancel() }
             .simultaneousGesture(
                 TapGesture().onEnded { searchFocused = false }
@@ -313,6 +411,12 @@ struct FeedDashboardView: View {
     /// than waiting for the typing debounce below.
     private func applyUnifiedSearch() {
         filterTask?.cancel()
+        // Submitting is an explicit "go", so the indicator must light on the
+        // tap rather than when the request happens to start. (Typing does NOT
+        // do this: the local re-filter is instantaneous, so a spinner on every
+        // keystroke would be noise — the debounced server call still raises
+        // the flag itself once it fires.)
+        store.noteFilterIntent()
         Task { await store.setSearch(searchText) }
     }
 
@@ -348,6 +452,19 @@ struct BrandTitle: View {
             .scaledToFit()
             .frame(height: 46)
             .frame(maxWidth: 330)
+            // A `.principal` toolbar item is laid out in whatever width its
+            // leading/trailing siblings leave behind, which is how Trades (two
+            // trailing items) ended up rendering a visibly smaller lockup than
+            // Trends (one). The item counts now match, and these two modifiers
+            // stop the bar from compressing the image even if that ever
+            // changes again.
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+            // Owner: "the heading/logo can be moved upward like 2 millimeters
+            // to have tiny white space between dynamic island and eagle still."
+            // ~6pt ≈ 2mm on a 460ppi iPhone. `.offset` rather than negative
+            // padding so nothing else in the bar reflows around it.
+            .offset(y: -6)
             .accessibilityLabel("Congress.Trade")
     }
 }
@@ -357,6 +474,47 @@ struct FeedControlBar: View {
     @EnvironmentObject private var store: CongressTradeStore
     var showMetrics: Bool = true
 
+    /// Which control a debounce slot belongs to. One slot PER dimension rather
+    /// than one shared timer: a shared timer would let a party tap cancel a
+    /// still-pending chamber tap and silently drop it.
+    private enum FilterDimension: Hashable {
+        case timeframe
+        case chamber
+        case party
+        case side
+    }
+
+    /// The multi-select menus are built from `Toggle` rows precisely so the
+    /// menu stays OPEN across taps, which makes 2-3 taps per gesture the normal
+    /// case. Each of those taps used to fire its own full feed refresh plus a
+    /// 12-request analytics refresh, serialized behind one another — most of
+    /// the "3-5 seconds" the owner measured was simply the same work done
+    /// three times. This window coalesces the burst into a single apply.
+    private static let multiSelectDebounce: Duration = .milliseconds(400)
+
+    /// Rows that dismiss the menu on tap (a timeframe pick, the "All X" resets)
+    /// cannot burst, so they apply immediately — but they still go through the
+    /// same slot, so a Toggle tapped moments earlier in the same menu can never
+    /// land AFTER the reset and resurrect the selection it just cleared.
+    private static let immediateApply: Duration = .zero
+
+    @State private var filterTasks: [FilterDimension: Task<Void, Never>] = [:]
+
+    /// Optimistic mirrors of the store's selections, alive only for the
+    /// debounce window (`nil` = read the store). Without them the checkmark
+    /// inside an open menu would not move until the request was already in
+    /// flight, which reads as a dead control — the exact impression the
+    /// debounce exists to remove.
+    @State private var pendingTimeRange: TimeRange?
+    @State private var pendingChambers: Set<ChamberFilter>?
+    @State private var pendingParties: Set<PartyFilter>?
+    @State private var pendingTradeTypes: Set<TradeTypeFilter>?
+
+    private var timeRange: TimeRange { pendingTimeRange ?? store.selectedTimeRange }
+    private var chambers: Set<ChamberFilter> { pendingChambers ?? store.selectedChambers }
+    private var parties: Set<PartyFilter> { pendingParties ?? store.selectedParties }
+    private var tradeTypes: Set<TradeTypeFilter> { pendingTradeTypes ?? store.selectedTradeTypes }
+
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
@@ -365,11 +523,11 @@ struct FeedControlBar: View {
                 Menu {
                     ForEach(TimeRange.allCases) { range in
                         Button {
-                            Task { await store.setTimeRange(range) }
+                            applyTimeRange(range)
                         } label: {
                             HStack {
                                 Text(range.label)
-                                if store.selectedTimeRange == range {
+                                if timeRange == range {
                                     Image(systemName: "checkmark")
                                 }
                             }
@@ -377,11 +535,11 @@ struct FeedControlBar: View {
                     }
                 } label: {
                     FilterMenuLabel(
-                        title: store.selectedTimeRange.label,
+                        title: timeRange.label,
                         icon: "calendar",
-                        isActive: store.selectedTimeRange != .ninetyDays,
+                        isActive: timeRange != .ninetyDays,
                         alwaysShowLabel: true,
-                        accessibilityLabel: "Time range, \(store.selectedTimeRange.label)"
+                        accessibilityLabel: "Time range, \(timeRange.label)"
                     )
                 }
 
@@ -394,7 +552,7 @@ struct FeedControlBar: View {
                 // client-mobile-api.md`).
                 Menu {
                     Button {
-                        Task { await store.setChamberSelection([]) }
+                        applyChambers([], after: Self.immediateApply)
                     } label: {
                         Label("All Branches", systemImage: "xmark.circle")
                     }
@@ -404,30 +562,32 @@ struct FeedControlBar: View {
                             Text(chamber.label)
                         }
                         .accessibilityLabel(chamber.label)
-                        .accessibilityValue(store.selectedChambers.contains(chamber) ? "Selected" : "Not selected")
+                        .accessibilityValue(chambers.contains(chamber) ? "Selected" : "Not selected")
                     }
                 } label: {
                     FilterMenuLabel(
                         // Full labels joined "+" once modified (owner spec:
                         // "House+Senate"); icon-only "All" at default.
-                        title: store.selectedChambers.isEmpty
+                        title: chambers.isEmpty
                             ? "All"
                             : ChamberFilter.allCases
-                                .filter { store.selectedChambers.contains($0) }
+                                .filter { chambers.contains($0) }
                                 .map(\.label)
                                 .joined(separator: "+"),
                         icon: "building.columns",
-                        isActive: !store.selectedChambers.isEmpty,
-                        accessibilityLabel: "Branch filter, \(store.selectedChambers.isEmpty ? "all" : ChamberFilter.allCases.filter { store.selectedChambers.contains($0) }.map(\.label).joined(separator: ", "))"
+                        isActive: !chambers.isEmpty,
+                        accessibilityLabel: "Branch filter, \(chambers.isEmpty ? "all" : ChamberFilter.allCases.filter { chambers.contains($0) }.map(\.label).joined(separator: ", "))"
                     )
                 }
 
                 // Party Filter — multi-select, entirely client-side on the
-                // Trades feed (server has no `party=` feed param at all); see
-                // `CongressTradeStore.selectedParties`.
+                // Trades feed (`FeedQuery` carries no `party` field); see
+                // `CongressTradeStore.selectedParties`. That is also why a
+                // party selection suppresses the trade count: the server's
+                // COUNT(*) never saw this narrowing.
                 Menu {
                     Button {
-                        Task { await store.setPartySelection([]) }
+                        applyParties([], after: Self.immediateApply)
                     } label: {
                         Label("All Parties", systemImage: "xmark.circle")
                     }
@@ -437,30 +597,30 @@ struct FeedControlBar: View {
                             Text("\(party.emoji) \(party.label)")
                         }
                         .accessibilityLabel(party.label)
-                        .accessibilityValue(store.selectedParties.contains(party) ? "Selected" : "Not selected")
+                        .accessibilityValue(parties.contains(party) ? "Selected" : "Not selected")
                     }
                 } label: {
                     FilterMenuLabel(
-                        title: store.selectedParties.isEmpty
+                        title: parties.isEmpty
                             ? "All"
                             : PartyFilter.allCases
-                                .filter { store.selectedParties.contains($0) }
+                                .filter { parties.contains($0) }
                                 .map(\.summaryLabel)
                                 .joined(separator: "+"),
                         icon: "person.2.fill",
-                        isActive: !store.selectedParties.isEmpty,
-                        accessibilityLabel: "Party filter, \(store.selectedParties.isEmpty ? "all" : PartyFilter.allCases.filter { store.selectedParties.contains($0) }.map(\.label).joined(separator: ", "))"
+                        isActive: !parties.isEmpty,
+                        accessibilityLabel: "Party filter, \(parties.isEmpty ? "all" : PartyFilter.allCases.filter { parties.contains($0) }.map(\.label).joined(separator: ", "))"
                     )
                 }
 
                 // Side/Trade Type Filter (Buy/Sell/Exchange) — multi-select.
-                // Server `type=` is single-valued, so it's only forwarded
-                // when exactly one side is chosen; any selection count is
-                // still filtered correctly client-side
+                // `type=` is only forwarded when exactly one side is chosen
+                // (`CongressTradeStore.tradeTypeQueryValue`); any selection
+                // count is still filtered correctly client-side
                 // (`FeedDashboardView.filteredTrades`).
                 Menu {
                     Button {
-                        Task { await store.setTradeTypeSelection([]) }
+                        applyTradeTypes([], after: Self.immediateApply)
                     } label: {
                         Label("All Sides", systemImage: "xmark.circle")
                     }
@@ -470,18 +630,18 @@ struct FeedControlBar: View {
                             Text(type.label)
                         }
                         .accessibilityLabel(type.label)
-                        .accessibilityValue(store.selectedTradeTypes.contains(type) ? "Selected" : "Not selected")
+                        .accessibilityValue(tradeTypes.contains(type) ? "Selected" : "Not selected")
                     }
                 } label: {
                     SidesFilterMenuLabel(
-                        title: store.selectedTradeTypes.isEmpty
+                        title: tradeTypes.isEmpty
                             ? "All"
                             : TradeTypeFilter.allCases
-                                .filter { store.selectedTradeTypes.contains($0) }
+                                .filter { tradeTypes.contains($0) }
                                 .map(\.summaryLabel)
                                 .joined(separator: "+"),
-                        isActive: !store.selectedTradeTypes.isEmpty,
-                        selected: store.selectedTradeTypes
+                        isActive: !tradeTypes.isEmpty,
+                        selected: tradeTypes
                     )
                 }
             }
@@ -492,53 +652,191 @@ struct FeedControlBar: View {
 
     private func chamberBinding(for chamber: ChamberFilter) -> Binding<Bool> {
         Binding(
-            get: { store.selectedChambers.contains(chamber) },
+            get: { chambers.contains(chamber) },
             set: { _ in toggleChamber(chamber) }
         )
     }
 
     private func partyBinding(for party: PartyFilter) -> Binding<Bool> {
         Binding(
-            get: { store.selectedParties.contains(party) },
+            get: { parties.contains(party) },
             set: { _ in toggleParty(party) }
         )
     }
 
     private func tradeTypeBinding(for type: TradeTypeFilter) -> Binding<Bool> {
         Binding(
-            get: { store.selectedTradeTypes.contains(type) },
+            get: { tradeTypes.contains(type) },
             set: { _ in toggleTradeType(type) }
         )
     }
 
     private func toggleParty(_ party: PartyFilter) {
-        var next = store.selectedParties
+        var next = parties
         if next.contains(party) {
             next.remove(party)
         } else {
             next.insert(party)
         }
-        Task { await store.setPartySelection(next) }
+        applyParties(next, after: Self.multiSelectDebounce)
     }
 
     private func toggleTradeType(_ type: TradeTypeFilter) {
-        var next = store.selectedTradeTypes
+        var next = tradeTypes
         if next.contains(type) {
             next.remove(type)
         } else {
             next.insert(type)
         }
-        Task { await store.setTradeTypeSelection(next) }
+        applyTradeTypes(next, after: Self.multiSelectDebounce)
     }
 
     private func toggleChamber(_ chamber: ChamberFilter) {
-        var next = store.selectedChambers
+        var next = chambers
         if next.contains(chamber) {
             next.remove(chamber)
         } else {
             next.insert(chamber)
         }
-        Task { await store.setChamberSelection(next) }
+        applyChambers(next, after: Self.multiSelectDebounce)
+    }
+
+    // MARK: - Debounced apply
+
+    private func applyTimeRange(_ next: TimeRange) {
+        guard next != timeRange else { return }
+        pendingTimeRange = next
+        scheduleApply(.timeframe, after: Self.immediateApply) {
+            await store.setTimeRange(next)
+            // Only retire the mirror if it is still OURS. A tap during the
+            // (multi-second) apply installs a newer mirror, and clearing it
+            // here would snap the pill back to the value that just landed.
+            if pendingTimeRange == next { pendingTimeRange = nil }
+        }
+    }
+
+    private func applyChambers(_ next: Set<ChamberFilter>, after delay: Duration) {
+        guard next != chambers else { return }
+        pendingChambers = next
+        scheduleApply(.chamber, after: delay) {
+            await store.setChamberSelection(next)
+            if pendingChambers == next { pendingChambers = nil }
+        }
+    }
+
+    private func applyParties(_ next: Set<PartyFilter>, after delay: Duration) {
+        guard next != parties else { return }
+        pendingParties = next
+        scheduleApply(.party, after: delay) {
+            await store.setPartySelection(next)
+            if pendingParties == next { pendingParties = nil }
+        }
+    }
+
+    private func applyTradeTypes(_ next: Set<TradeTypeFilter>, after delay: Duration) {
+        guard next != tradeTypes else { return }
+        pendingTradeTypes = next
+        scheduleApply(.side, after: delay) {
+            await store.setTradeTypeSelection(next)
+            if pendingTradeTypes == next { pendingTradeTypes = nil }
+        }
+    }
+
+    /// Lights the indicator on the TAP — `noteFilterIntent()`'s own
+    /// documentation is explicit that the view owns this moment, because the
+    /// store cannot see a gesture that has not reached it yet. Without it the
+    /// "Updating…" strip would appear only once the debounce fired, i.e. after
+    /// the exact window in which the control feels dead.
+    ///
+    /// The debounce Task only ever SLEEPS; the apply runs in a separate
+    /// unstructured Task so a later tap's `cancel()` kills a pending timer and
+    /// never an apply that is already talking to the server (which would
+    /// surface as a spurious cancelled-request notice). Overlapping applies are
+    /// safe — the store coalesces the feed refresh chain and version-stamps the
+    /// trends fan-out.
+    private func scheduleApply(
+        _ dimension: FilterDimension,
+        after delay: Duration,
+        _ work: @escaping @MainActor () async -> Void
+    ) {
+        store.noteFilterIntent()
+        filterTasks[dimension]?.cancel()
+        filterTasks[dimension] = Task { @MainActor in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+            }
+            Task { @MainActor in await work() }
+        }
+    }
+}
+
+// MARK: - One control language for the whole tab
+
+/// Shared metrics for every pill-shaped control on Trades.
+///
+/// The owner's complaint was that the tab looked like three different apps:
+/// the sort key used the filter capsule, the sort direction was a 30pt circle
+/// with its own fill and stroke, and the pager was a row of unstyled chevrons
+/// inside an `ultraThinMaterial` card. Sort key, sort direction, prev/next and
+/// rows-per-page are now literally the same capsule — same height, same corner
+/// family, same border, same type — so the strip above the list and the strip
+/// below it read as one system.
+private enum FeedControlMetrics {
+    static let verticalPadding: CGFloat = 8
+    static let horizontalPadding: CGFloat = 12
+    /// Icon-only controls get tighter sides so a lone glyph does not float in
+    /// the middle of an over-wide capsule.
+    static let compactHorizontalPadding: CGFloat = 10
+    /// Pinned so a text capsule and a glyph-only capsule come out the same
+    /// height despite different intrinsic content heights.
+    static let minHeight: CGFloat = 32
+    static let labelFont: Font = .caption.weight(.semibold)
+    static let glyphFont: Font = .caption.weight(.bold)
+    static let chevronFont: Font = .system(size: 9, weight: .bold)
+}
+
+/// The capsule itself. Colors are CONCRETE `Color` values, never the
+/// hierarchical `.primary`/`.secondary` shape styles: these capsules sit inside
+/// `Button` and `Menu` labels, where a hierarchical style resolves against the
+/// current foreground style — which is the app tint — and comes out blue. That
+/// is the same trap that kept the toolbar icons blue through an earlier "make
+/// them grey" pass.
+private struct FeedControlSurface: ViewModifier {
+    var isActive: Bool
+    var isEnabled: Bool
+    var horizontalPadding: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, FeedControlMetrics.verticalPadding)
+            .frame(minHeight: FeedControlMetrics.minHeight)
+            .foregroundStyle(isActive ? Color.white : (isEnabled ? Color.primary : Color.secondary))
+            .background(
+                isActive ? Color.blue : Color(uiColor: .secondarySystemBackground),
+                in: Capsule()
+            )
+            .overlay(Capsule().stroke(AppTheme.borderColor, lineWidth: 1))
+            // Explicit rather than relying on the button style to dim a
+            // disabled control: `.buttonStyle(.plain)` does not.
+            .opacity(isEnabled ? 1 : 0.4)
+    }
+}
+
+private extension View {
+    func feedControlSurface(
+        isActive: Bool = false,
+        isEnabled: Bool = true,
+        horizontalPadding: CGFloat = FeedControlMetrics.horizontalPadding
+    ) -> some View {
+        modifier(
+            FeedControlSurface(
+                isActive: isActive,
+                isEnabled: isEnabled,
+                horizontalPadding: horizontalPadding
+            )
+        )
     }
 }
 
@@ -555,6 +853,8 @@ struct FeedSortControl: View {
             Menu {
                 ForEach(FeedSortKey.allCases) { key in
                     Button {
+                        guard key != store.feedSortKey else { return }
+                        store.noteFilterIntent()
                         Task { await store.setFeedSortKey(key) }
                     } label: {
                         HStack {
@@ -576,15 +876,14 @@ struct FeedSortControl: View {
             }
 
             Button {
+                store.noteFilterIntent()
                 Task { await store.toggleFeedSortDirection() }
             } label: {
                 Image(systemName: store.feedSortDirection.systemImage)
-                    .font(.caption.weight(.bold))
-                    .frame(width: 30, height: 30)
-                    .foregroundStyle(.secondary)
-                    .background(Color(uiColor: .secondarySystemBackground), in: Circle())
-                    .overlay(Circle().stroke(AppTheme.borderColor, lineWidth: 1))
+                    .font(FeedControlMetrics.glyphFont)
+                    .feedControlSurface(horizontalPadding: FeedControlMetrics.compactHorizontalPadding)
             }
+            .buttonStyle(.plain)
             .accessibilityLabel("\(store.feedSortDirection.accessibilityLabel), tap to flip")
         }
     }
@@ -595,36 +894,51 @@ struct FeedSortControl: View {
 /// (`app/src/ui/dashboardHtml.ts`). Reads `total`/`limit` from the feed's own
 /// response metadata via the store's `totalPages`/`pageSize`; never a
 /// client-side estimate.
+///
+/// Rendered ABOVE and BELOW the list (owner: it was "way at bottom and missing
+/// from top"). Both instances are the same struct holding no state of its own —
+/// page index, page size and bounds all live on the store — so they cannot
+/// drift out of sync.
 struct FeedPaginationBar: View {
     @EnvironmentObject private var store: CongressTradeStore
 
     private static let pageSizeOptions = [50, 100, 200]
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Button {
+                store.noteFilterIntent()
                 Task { await store.goToPreviousPage() }
             } label: {
                 Image(systemName: "chevron.left")
-                    .font(.caption.weight(.bold))
-                    .frame(width: 30, height: 30)
+                    .font(FeedControlMetrics.glyphFont)
+                    .feedControlSurface(
+                        isEnabled: store.canGoToPreviousPage,
+                        horizontalPadding: FeedControlMetrics.compactHorizontalPadding
+                    )
             }
+            .buttonStyle(.plain)
             .disabled(!store.canGoToPreviousPage)
             .accessibilityLabel("Previous page")
 
             Text("Page \(store.currentPage + 1) of \(store.totalPages)")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(minWidth: 84)
+                .font(FeedControlMetrics.labelFont)
+                .foregroundStyle(Color.secondary)
+                .frame(minWidth: 92)
                 .accessibilityLabel("Page \(store.currentPage + 1) of \(store.totalPages)")
 
             Button {
+                store.noteFilterIntent()
                 Task { await store.goToNextPage() }
             } label: {
                 Image(systemName: "chevron.right")
-                    .font(.caption.weight(.bold))
-                    .frame(width: 30, height: 30)
+                    .font(FeedControlMetrics.glyphFont)
+                    .feedControlSurface(
+                        isEnabled: store.canGoToNextPage,
+                        horizontalPadding: FeedControlMetrics.compactHorizontalPadding
+                    )
             }
+            .buttonStyle(.plain)
             .disabled(!store.canGoToNextPage)
             .accessibilityLabel("Next page")
 
@@ -633,6 +947,12 @@ struct FeedPaginationBar: View {
             Menu {
                 ForEach(Self.pageSizeOptions, id: \.self) { size in
                     Button {
+                        // Guarded so a no-op pick does not strand the pending
+                        // indicator on for the store's watchdog timeout:
+                        // `setPageSize` short-circuits inside `viewLimit`'s
+                        // `didSet` and never reaches an apply.
+                        guard store.pageSize != size else { return }
+                        store.noteFilterIntent()
                         store.setPageSize(size)
                     } label: {
                         HStack {
@@ -644,24 +964,18 @@ struct FeedPaginationBar: View {
                     }
                 }
             } label: {
-                HStack(spacing: 3) {
+                HStack(spacing: 4) {
                     Text("\(store.pageSize)/page")
-                        .font(.caption.weight(.semibold))
+                        .font(FeedControlMetrics.labelFont)
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(FeedControlMetrics.chevronFont)
                         .opacity(0.5)
+                        .padding(.leading, 2)
                 }
-                .foregroundStyle(.secondary)
+                .feedControlSurface()
             }
             .accessibilityLabel("Rows per page, \(store.pageSize)")
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(AppTheme.border(cornerRadius: 12))
     }
 }
 
@@ -683,7 +997,26 @@ struct SidesFilterMenuLabel: View {
         selected.isEmpty || selected.contains(type)
     }
 
-    private var dimColor: Color { isActive ? .white.opacity(0.45) : .secondary }
+    private var dimColor: Color { isActive ? .white.opacity(0.45) : Color.secondary }
+
+    /// The exchange glyph.
+    ///
+    /// Owner: "make the double arrow symbol for exchanges be black instead of
+    /// red and could be '↔' that sort of symbol if the arrows were in same
+    /// style as the up and down buy and sell arrows." `arrow.left.arrow.right`
+    /// already IS that shape, so only its treatment changes: same 9pt heavy
+    /// weight as its siblings (it was 8pt, which is why it read as a different
+    /// set), and `Color.primary` rather than `Color.orange`.
+    ///
+    /// `Color.primary`, not a literal `.black`: primary resolves to black in
+    /// light mode and white in dark, and a literal black would be invisible
+    /// against the dark-mode capsule. On an active (blue) pill it is the white
+    /// the other two glyphs also take, which is the correct high-contrast
+    /// answer there.
+    private var exchangeColor: Color {
+        guard isOn(.exchange) else { return dimColor }
+        return isActive ? .white : Color.primary
+    }
 
     var body: some View {
         HStack(spacing: 4) {
@@ -695,26 +1028,24 @@ struct SidesFilterMenuLabel: View {
                     .font(.system(size: 9, weight: .heavy))
                     .foregroundStyle(isOn(.sell) ? Color.red : dimColor)
                 Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 8, weight: .heavy))
-                    .foregroundStyle(isOn(.exchange) ? Color.orange : dimColor)
+                    .font(.system(size: 9, weight: .heavy))
+                    .foregroundStyle(exchangeColor)
             }
             if isActive {
                 Text(title)
-                    .font(.caption.weight(.semibold))
+                    .font(FeedControlMetrics.labelFont)
             }
             Image(systemName: "chevron.down")
-                .font(.system(size: 9, weight: .bold))
+                .font(FeedControlMetrics.chevronFont)
                 .opacity(0.5)
                 .padding(.leading, 2)
         }
-        .padding(.horizontal, isActive ? 12 : 10)
-        .padding(.vertical, 8)
-        .foregroundStyle(isActive ? .white : .primary)
-        .background(
-            isActive ? Color.blue : Color(uiColor: .secondarySystemBackground),
-            in: Capsule()
+        .feedControlSurface(
+            isActive: isActive,
+            horizontalPadding: isActive
+                ? FeedControlMetrics.horizontalPadding
+                : FeedControlMetrics.compactHorizontalPadding
         )
-        .overlay(Capsule().stroke(AppTheme.borderColor, lineWidth: 1))
         .accessibilityLabel("Trade side filter, \(title)")
     }
 }
@@ -735,24 +1066,22 @@ struct FilterMenuLabel: View {
     var body: some View {
         HStack(spacing: 4) {
             Image(systemName: icon)
-                .font(.caption.weight(.bold))
+                .font(FeedControlMetrics.glyphFont)
             if showsLabel {
                 Text(title)
-                    .font(.caption.weight(.semibold))
+                    .font(FeedControlMetrics.labelFont)
             }
             Image(systemName: "chevron.down")
-                .font(.system(size: 9, weight: .bold))
+                .font(FeedControlMetrics.chevronFont)
                 .opacity(0.5)
                 .padding(.leading, 2)
         }
-        .padding(.horizontal, showsLabel ? 12 : 10)
-        .padding(.vertical, 8)
-        .foregroundStyle(isActive ? .white : .primary)
-        .background(
-            isActive ? Color.blue : Color(uiColor: .secondarySystemBackground),
-            in: Capsule()
+        .feedControlSurface(
+            isActive: isActive,
+            horizontalPadding: showsLabel
+                ? FeedControlMetrics.horizontalPadding
+                : FeedControlMetrics.compactHorizontalPadding
         )
-        .overlay(Capsule().stroke(AppTheme.borderColor, lineWidth: 1))
         .accessibilityLabel(accessibilityLabel ?? title)
     }
 }
@@ -986,7 +1315,26 @@ struct TradeCard: View {
     var onPoliticianTap: (() -> Void)? = nil
     var onTickerTap: (() -> Void)? = nil
 
+    /// SwiftData models are observable, and a DELETE is an observed change — so
+    /// when `replaceCache` drops the rows that are not in a new response,
+    /// SwiftUI re-runs this body for a row whose backing data is already gone,
+    /// before the parent's `@Query` array has caught up and dropped it. Reading
+    /// any persisted property at that moment traps. The parent filters dead
+    /// models out of its array (`liveCachedTrades`), but that only covers rows
+    /// built from a fresh body pass; this covers a row SwiftUI refreshes in
+    /// place because the model itself notified. Bailing to an empty row is
+    /// invisible in practice — the parent re-renders without it a frame later.
+    private var isLive: Bool {
+        !trade.isDeleted && trade.modelContext != nil
+    }
+
     var body: some View {
+        if isLive {
+            card
+        }
+    }
+
+    private var card: some View {
         HStack(alignment: .center, spacing: 12) {
             // Only reserve logo column when a ticker exists; AssetMark is EmptyView
             // until a real logo loads (no blue monogram tiles that steal width).

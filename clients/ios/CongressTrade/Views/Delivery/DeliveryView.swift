@@ -9,95 +9,82 @@ struct DeliveryView: View {
     @State private var membersText = ""
     @State private var watchlistDraft: [String] = []
     @State private var newTicker = ""
-    @State private var showSubscribe = false
-    @State private var editingSubscriptionId: String?
-
-    @AppStorage("notify_all_trades") private var notifyAllTrades = true
-    @AppStorage("notify_new_buys") private var notifyNewBuys = false
-    @AppStorage("notify_new_sells") private var notifyNewSells = false
-    @AppStorage("notify_watchlist") private var notifyWatchlist = false
+    @State private var showPremiumInfo = false
+    @State private var showExport = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Notifications") {
-                    Toggle("All Trades", isOn: Binding(
-                        get: { notifyAllTrades },
-                        set: { isOn in
-                            notifyAllTrades = isOn
-                            if isOn {
-                                notifyNewBuys = false
-                                notifyNewSells = false
-                                notifyWatchlist = false
-                            }
-                        }
-                    ))
-                    Toggle("New Buys", isOn: Binding(
-                        get: { notifyNewBuys },
-                        set: { isOn in
-                            notifyNewBuys = isOn
-                            if isOn { notifyAllTrades = false }
-                        }
-                    ))
-                    Toggle("New Sells", isOn: Binding(
-                        get: { notifyNewSells },
-                        set: { isOn in
-                            notifyNewSells = isOn
-                            if isOn { notifyAllTrades = false }
-                        }
-                    ))
-                    Toggle("Watchlist", isOn: Binding(
-                        get: { notifyWatchlist },
-                        set: { isOn in
-                            notifyWatchlist = isOn
-                            if isOn { notifyAllTrades = false }
-                        }
-                    ))
+                // Phone alerts lead this screen, and they are the SHARED
+                // control — the identical `TradeDisclosureAlertsToggle` the
+                // Settings tab and the header menu render, so there is one
+                // switch reachable from three places rather than three
+                // switches that each claim to own push.
+                //
+                // What used to sit here was a "Notifications" section of four
+                // `@AppStorage` toggles (All Trades / New Buys / New Sells /
+                // Watchlist). Nothing in the app ever read them: they were
+                // never serialized into a request, `createDelivery` ignores
+                // them, and `push_devices` has no column that could receive
+                // them. They looked exactly like push controls while changing
+                // nothing, which is precisely why this tab read as "unsure if
+                // any options there impact push notifications". Switches that
+                // do nothing are worse than no switches, so they are deleted
+                // rather than relabelled.
+                Section {
+                    TradeDisclosureAlertsToggle()
+                } header: {
+                    Text("Phone Alerts")
+                } footer: {
+                    Text("The same switch is in Settings and in the header menu.")
                 }
 
-                Section("Create Delivery") {
+                // Export sits directly beside the Premium entry point by
+                // request. Both are account-level, so they belong above the
+                // developer integration instead of buried underneath it.
+                Section {
+                    Button {
+                        showExport = true
+                    } label: {
+                        Label("Export CSV", systemImage: "arrow.down.circle")
+                    }
+                    premiumRow
+                }
+
+                Section("Developer Delivery") {
+                    // Hoisted out of the individual branches so the audience is
+                    // named before anything else on this screen — including for
+                    // signed-out and free accounts, which previously saw the
+                    // paywall with no explanation of what they would be buying.
+                    DeliveryMethodExplainer()
+                        .padding(.bottom, 2)
+
                     if !store.signedIn {
-                        VStack(alignment: .leading, spacing: 10) {
-                            DeliveryMethodExplainer()
-                            Text("Sign in to create delivery alerts.")
-                                .foregroundStyle(.primary)
-                        }
-                        .padding(.vertical, 4)
+                        Text("Sign in to create a delivery.")
+                            .padding(.vertical, 4)
                     } else if !store.isPremium {
-                        // Delivery creation is Premium-gated server-side; show
-                        // the paywall up front instead of letting free users
-                        // hit a raw 403 from `create_subscription`.
-                        VStack(alignment: .leading, spacing: 10) {
-                            Label("Premium Feature", systemImage: "star.fill")
-                                .font(.headline)
-                                .foregroundStyle(.orange)
-                            Text("1-month free trial, then $5/month or $50/year. Upgrade with In‑App Purchase or on the website to create SSE/webhook deliveries. Existing deliveries still appear below.")
+                        // Delivery creation is Premium-gated server-side, so the
+                        // gate is still shown up front rather than letting a
+                        // free account hit a raw 403 from `create_subscription`
+                        // — but the pitch itself moved into the shared
+                        // `PremiumInfoSheet`, so the app has exactly one
+                        // Premium explanation instead of a bespoke paragraph
+                        // per screen.
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Creating a delivery requires Premium.")
                                 .font(.subheadline)
-                                .foregroundStyle(.secondary)
                             Button {
-                                showSubscribe = true
+                                showPremiumInfo = true
                             } label: {
-                                Label("Subscribe with Apple", systemImage: "apple.logo")
+                                Label("See What Premium Includes", systemImage: "sparkles")
                                     .font(.subheadline.weight(.semibold))
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 10)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            if let url = store.api.upgradeURL {
-                                Link(destination: url) {
-                                    Label("Or subscribe on Congress.Trade", systemImage: "safari")
-                                        .font(.subheadline.weight(.semibold))
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 8)
-                                }
-                            }
+                            Text("Existing deliveries still appear below.")
+                                .font(.caption)
+                                .foregroundStyle(Color.secondary)
                         }
                         .padding(.vertical, 4)
                     } else {
-                        DeliveryMethodExplainer()
-                            .padding(.bottom, 2)
-
                         Picker("Mode", selection: $deliveryMode) {
                             ForEach(DeliveryMode.allCases) { mode in
                                 Text(mode.rawValue).tag(mode)
@@ -169,9 +156,12 @@ struct DeliveryView: View {
                     }
                 }
 
-                Section("Existing Subscriptions") {
+                // "Subscriptions" collided with the Premium billing
+                // subscription in the owner's reading of this screen; these are
+                // deliveries, so they are called deliveries.
+                Section("Existing Deliveries") {
                     if store.subscriptions.isEmpty {
-                        Text(store.signedIn ? "No delivery subscriptions yet." : "Sign in to manage delivery subscriptions.")
+                        Text(store.signedIn ? "No deliveries yet." : "Sign in to manage deliveries.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(store.subscriptions) { subscription in
@@ -245,6 +235,11 @@ struct DeliveryView: View {
                 } footer: {
                     Text("New deliveries filter to these tickers. The watchlist syncs to your Congress.Trade account.")
                 }
+
+                Section {
+                    LegalFooterLinks()
+                }
+                .listRowBackground(Color.clear)
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.background)
@@ -253,9 +248,21 @@ struct DeliveryView: View {
             .sheet(item: $store.pendingDeliveryCredential) { credential in
                 DeliveryCredentialView(credential: credential)
             }
-            .sheet(isPresented: $showSubscribe) {
-                SubscribeView()
+            .sheet(isPresented: $showPremiumInfo) {
+                PremiumInfoSheet(isPresented: $showPremiumInfo)
                     .environmentObject(store)
+            }
+            // `ExportCSVSheet` lives with the Trades tab and is reused verbatim:
+            // it does its own signed-in / Premium gating and exports the CURRENT
+            // global Trades filter state, so it behaves identically opened from
+            // here. Presented from this view (which stays alive) rather than
+            // from a row that dismisses itself, so the presentation host cannot
+            // be torn down in the same update that raises the sheet.
+            .sheet(isPresented: $showExport) {
+                ExportCSVSheet()
+                    .environmentObject(store)
+                    .presentationDetents([.medium])
+                    .presentationDragIndicator(.visible)
             }
             .onAppear {
                 watchlistDraft = store.watchlist
@@ -263,6 +270,30 @@ struct DeliveryView: View {
             }
             .onChange(of: store.watchlist) { _, newValue in
                 watchlistDraft = newValue
+            }
+        }
+    }
+
+    /// The single Premium entry point on this tab, sitting next to Export CSV.
+    ///
+    /// It opens the shared `PremiumInfoSheet` — one screen, no hard sell, "Not
+    /// Now" as its largest control, readable while signed out — rather than the
+    /// paragraph-plus-buy-button that used to be inlined in the create-delivery
+    /// gate. `PremiumInfoSheet` still owns the `SubscribeView` purchase path, so
+    /// the money path and the server-side entitlement checks are untouched; only
+    /// the explanation moved, and it is now the same explanation app-wide.
+    ///
+    /// Nothing renders for accounts that already have Premium: managing an
+    /// existing subscription lives in Settings and in the header menu, and a
+    /// third copy here would recreate the "settings in multiple illogical
+    /// places" problem this pass exists to fix.
+    @ViewBuilder
+    private var premiumRow: some View {
+        if !store.isPremium {
+            Button {
+                showPremiumInfo = true
+            } label: {
+                Label("Upgrade to Premium", systemImage: "sparkles")
             }
         }
     }
@@ -276,18 +307,25 @@ struct DeliveryView: View {
     }
 }
 
-/// One-line-each Webhook/SSE explainer (owner punch list #2, item 10) —
-/// mirrors the web's shortened Delivery copy (lane W2, `app/src/ui/dashboardHtml.ts`),
-/// replacing the old single long paragraph that tried to cover both methods
-/// at once.
+/// One-line-each Webhook/SSE explainer, now led by the audience.
+///
+/// Both delivery modes terminate at a server the user runs — the backend
+/// accepts no delivery channel other than `sse` or `webhook`, so nothing
+/// configured on this screen can reach a phone. The old copy described both
+/// mechanisms accurately but never said who they were for, which is how a
+/// non-developer read "webhook" and "live stream" as two ways of getting
+/// alerts on their phone. The audience line goes first for that reason; the
+/// phone control itself is the toggle at the top of this tab.
 struct DeliveryMethodExplainer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Webhooks: we POST each new filing to your URL, HMAC-signed.")
+            Text("Sends filings to a server you run — not to this phone.")
+                .fontWeight(.semibold)
+            Text("Webhook: we POST each new filing to your HTTPS URL, HMAC-signed.")
             Text("Live stream (SSE): one open connection that pushes filings as they land.")
         }
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(Color.secondary)
     }
 }
 

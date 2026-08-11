@@ -82,6 +82,12 @@ struct PeopleDirectoryView: View {
                                 }
                             }
                         }
+
+                        // Legal links close out every tab, so they are inside
+                        // the scroll content (below the last row) rather than
+                        // pinned — pinning would cost a permanent strip of the
+                        // list's height on a screen that is nothing but list.
+                        LegalFooterLinks()
                     }
                     .padding(.horizontal, 16)
                     .padding(.bottom, 24)

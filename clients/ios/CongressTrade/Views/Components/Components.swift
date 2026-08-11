@@ -475,12 +475,749 @@ extension View {
     }
 }
 
+// MARK: - Sign-in controls (one implementation, used by Settings + the menu)
+
+/// Shared metrics so the Apple and Google buttons are pixel-identical in
+/// height and corner radius. The owner's complaint was that the two buttons
+/// looked like different controls; the only reliable way to keep them matched
+/// is to have one place that owns the numbers.
+enum SignInControlMetrics {
+    /// `SignInWithAppleButton` honors an explicit `.frame(height:)`, so both
+    /// buttons are driven off this one value.
+    static let height: CGFloat = 50
+    /// 8pt continuous — the radius Apple's own control clips to when we
+    /// `.clipShape` it, so the Google outline traces the same silhouette.
+    static let cornerRadius: CGFloat = 8
+}
+
+/// Google's four-color "G", drawn with `Canvas` rather than shipped as an
+/// asset so it is resolution-independent and cannot be re-tinted.
+///
+/// WHY A CANVAS AND NOT AN `Image`: a template/SF-Symbol image inside a
+/// `Button` label inherits the button's foreground style, which inside a
+/// `Form` row or a tinted `TabView` resolves to the app accent — that is
+/// exactly the "all blue, no G" failure the owner reported. `context.stroke`
+/// / `context.fill` take explicit `.color(...)` shadings that no ancestor
+/// style can override, so the mark renders in Google's palette everywhere.
+/// Moved here (was `private struct GoogleMark` in `SettingsView.swift`) so
+/// the Settings tab and the header menu draw the identical mark.
+struct GoogleGMark: View {
+    var body: some View {
+        Canvas { context, size in
+            let blue = Color(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255)
+            let green = Color(red: 0x34 / 255, green: 0xA8 / 255, blue: 0x53 / 255)
+            let yellow = Color(red: 0xFB / 255, green: 0xBC / 255, blue: 0x05 / 255)
+            let red = Color(red: 0xEA / 255, green: 0x43 / 255, blue: 0x35 / 255)
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+            let radius = size.width * 0.42
+            let lineWidth = size.width * 0.18
+
+            func arc(_ start: Double, _ end: Double, _ color: Color) {
+                var path = Path()
+                path.addArc(
+                    center: center,
+                    radius: radius,
+                    startAngle: .degrees(start),
+                    endAngle: .degrees(end),
+                    clockwise: false
+                )
+                context.stroke(
+                    path,
+                    with: .color(color),
+                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .butt)
+                )
+            }
+
+            // Clockwise from the crossbar: blue right edge, green bottom,
+            // yellow left, red top — the canonical Google mark ordering.
+            arc(-35, 20, blue)
+            arc(20, 120, green)
+            arc(120, 220, yellow)
+            arc(220, 325, red)
+
+            // The blue crossbar that turns the ring into a "G".
+            context.fill(
+                Path(CGRect(
+                    x: size.width * 0.48,
+                    y: size.height * 0.42,
+                    width: size.width * 0.42,
+                    height: size.width * 0.16
+                )),
+                with: .color(blue)
+            )
+        }
+        // The button already carries the accessibility label; the mark itself
+        // is decoration and must not become a second VoiceOver stop.
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Google-branded sign-in button, visually matched to `SignInWithAppleButton`
+/// (same height, same 8pt continuous radius, same full width).
+///
+/// Colors are Google's published identity values, not approximations:
+/// light = `#FFFFFF` surface / `#747775` 1pt border / `#1F1F1F` label,
+/// dark  = `#131314` surface / `#8E918F` border / `#E3E3E3` label.
+///
+/// WHY THE TINT ARMOR: this control has to render identically inside a `Form`
+/// row and inside a plain `VStack` on a screen whose `TabView` sets
+/// `.tint(.blue)`. Three independent things can repaint a button label with
+/// the accent color — the automatic button style, the enclosing row's tint,
+/// and hierarchical (`.secondary`-style) foreground resolution. So we neutralize
+/// all three at once: `.buttonStyle(.plain)` removes the style substitution,
+/// `.tint` overrides the tint channel the bar/row bridge reads, and every
+/// foreground style is a CONCRETE `Color` (never bare `.primary`/`.secondary`,
+/// which are hierarchical styles that resolve against whatever the current
+/// foreground style happens to be).
+struct GoogleSignInButton: View {
+    let isLoading: Bool
+    let action: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var surface: Color {
+        colorScheme == .dark
+            ? Color(red: 0x13 / 255, green: 0x13 / 255, blue: 0x14 / 255)
+            : Color.white
+    }
+
+    private var border: Color {
+        colorScheme == .dark
+            ? Color(red: 0x8E / 255, green: 0x91 / 255, blue: 0x8F / 255)
+            : Color(red: 0x74 / 255, green: 0x77 / 255, blue: 0x75 / 255)
+    }
+
+    private var labelColor: Color {
+        colorScheme == .dark
+            ? Color(red: 0xE3 / 255, green: 0xE3 / 255, blue: 0xE3 / 255)
+            : Color(red: 0x1F / 255, green: 0x1F / 255, blue: 0x1F / 255)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                GoogleGMark()
+                    .frame(width: 18, height: 18)
+                // Google's guidelines require this exact string, so the
+                // in-flight state is a trailing spinner rather than a
+                // "Opening Google…" label swap.
+                Text("Sign in with Google")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(labelColor)
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(labelColor)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: SignInControlMetrics.height)
+            .background(
+                surface,
+                in: RoundedRectangle(cornerRadius: SignInControlMetrics.cornerRadius, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: SignInControlMetrics.cornerRadius, style: .continuous)
+                    .stroke(border, lineWidth: 1)
+            )
+            .contentShape(
+                RoundedRectangle(cornerRadius: SignInControlMetrics.cornerRadius, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .tint(labelColor)
+        .foregroundStyle(labelColor)
+        .disabled(isLoading)
+        .accessibilityLabel("Sign in with Google")
+    }
+}
+
+/// The app's ONE sign-in implementation: Sign in with Apple (native),
+/// Sign in with Google (`ASWebAuthenticationSession`), and an email
+/// magic-link row — used by both the Settings tab and the header quick menu.
+///
+/// Previously the Google + magic-link flows existed only in `SettingsView`
+/// and the quick menu punted with a "More Sign-In Options" button that
+/// switched tabs. That is why the owner described sign-in as living in
+/// "multiple illogical places". Consolidating also fixes a silent-failure
+/// bug: the quick menu never rendered `store.watchlistNotice`, so every
+/// sign-in error there was invisible. This panel always renders it.
+struct SignInPanel: View {
+    /// Fires after any path actually establishes a session — the quick menu
+    /// uses it to dismiss itself.
+    var onSignedIn: () -> Void = {}
+
+    @EnvironmentObject private var store: CongressTradeStore
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isAuthenticatingWithGoogle = false
+    @State private var magicEmail = ""
+    /// Raw nonce for the in-flight Sign in with Apple request, set by the
+    /// button's request-configuration closure and consumed on completion.
+    /// See `Store/AppleSignIn.swift`.
+    @State private var currentAppleNonce: String?
+    @FocusState private var magicEmailFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 12) {
+            SignInWithAppleButton(.signIn) { request in
+                // Apple only ever returns `fullName` on the very first
+                // authorization for this app, so ask for it up front.
+                request.requestedScopes = [.fullName, .email]
+                let nonce = AppleSignInNonce.generate()
+                currentAppleNonce = nonce
+                request.nonce = nonce
+            } onCompletion: { result in
+                handleAppleCompletion(result)
+            }
+            .signInWithAppleButtonStyle(colorScheme == .dark ? .white : .black)
+            .frame(maxWidth: .infinity)
+            .frame(height: SignInControlMetrics.height)
+            .clipShape(
+                RoundedRectangle(cornerRadius: SignInControlMetrics.cornerRadius, style: .continuous)
+            )
+            .accessibilityLabel("Sign in with Apple")
+
+            GoogleSignInButton(isLoading: isAuthenticatingWithGoogle) {
+                startGoogleSignIn()
+            }
+
+            HStack(spacing: 8) {
+                // `Text(verbatim:)`, NOT a String title: a String placeholder
+                // becomes a `LocalizedStringKey`, and SwiftUI's markdown pass
+                // auto-links anything email-shaped — which painted
+                // "you@example.com" in link blue and was a large part of the
+                // owner's "weird all blue text" report. verbatim skips that
+                // processing and keeps the standard placeholder grey (adding
+                // a foreground style here instead renders visibly darker than
+                // a normal placeholder).
+                TextField("", text: $magicEmail, prompt: Text(verbatim: "you@example.com"))
+                    .urlKeyboard()
+                    .neverAutocapitalized()
+                    .autocorrectionDisabled()
+                    .focused($magicEmailFocused)
+                    .submitLabel(.done)
+                    .onSubmit { sendMagicLink() }
+                Button("Email Link") { sendMagicLink() }
+                    .font(.subheadline.weight(.medium))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(magicEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            // The one place every sign-in failure surfaces. Settings had this;
+            // the quick menu did not, which is how a failing Apple sign-in
+            // could look like a button that simply does nothing.
+            if let notice = store.watchlistNotice, !notice.isEmpty {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(Color.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
+        .onChange(of: store.signedIn) { _, isSignedIn in
+            // Every path (Apple, Google, a magic link opened while this view
+            // is on screen) lands here once the bootstrap resolves a user —
+            // one callback instead of three flow-specific ones.
+            if isSignedIn { onSignedIn() }
+        }
+    }
+
+    // MARK: Apple
+
+    /// Sign in with Apple fails on the DEVICE, before any network call, when
+    /// no Apple ID is signed into iCloud — and iOS reports that dismissal as
+    /// `.canceled`, indistinguishable from a real user cancel. Genuine cancels
+    /// must stay silent (Apple HIG), but the configuration-shaped codes get
+    /// copy that names the actual next step instead of surfacing
+    /// "AuthorizationError error 1000", which tells the owner nothing.
+    private func handleAppleCompletion(_ result: Result<ASAuthorization, Error>) {
+        if case .failure(let error) = result,
+           let authError = error as? ASAuthorizationError {
+            switch authError.code {
+            case .canceled:
+                return
+            case .unknown, .failed, .notHandled, .invalidResponse:
+                store.setAccountNotice(
+                    "Sign in with Apple needs an Apple ID signed in on this device.  Open iOS Settings, sign in to your iPhone, then try again."
+                )
+                currentAppleNonce = nil
+                return
+            // Deliberately a plain `default`, not `@unknown default`. The rest
+            // of `ASAuthorizationError.Code` is the passkey/credential-manager
+            // family (`.matchedExcludedCredential`, `.credentialImport`,
+            // `.deviceNotConfiguredForPasskeyCreation`, …) which this button's
+            // ID-token flow never raises, and Apple keeps adding to it — an
+            // `@unknown default` warns on every SDK bump that lands a new code
+            // even though the handling is unchanged: hand it to the store and
+            // let the normal error path speak.
+            default:
+                break
+            }
+        }
+        Task {
+            await store.handleAppleSignIn(result, rawNonce: currentAppleNonce)
+            currentAppleNonce = nil
+        }
+    }
+
+    // MARK: Google
+
+    /// Browser-based OAuth round trip. Honors the configured API base URL
+    /// (`CONGRESS_TRADE_API_BASE_URL`) so non-prod backends get the same flow.
+    /// `AuthPresentationContext` intentionally still lives in
+    /// `SettingsView.swift` — it is a UIKit presentation-anchor shim with no
+    /// SwiftUI state, shared by reference from here.
+    private func startGoogleSignIn() {
+        guard !isAuthenticatingWithGoogle else { return }
+
+        var components = URLComponents(
+            url: store.api.origin.appendingPathComponent("auth/google/start"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "client", value: "ios")]
+        guard let authURL = components?.url else {
+            store.setAccountNotice("Google sign-in is not configured for this build.")
+            return
+        }
+        isAuthenticatingWithGoogle = true
+
+        let session = ASWebAuthenticationSession(
+            url: authURL,
+            callbackURLScheme: "congresstrade"
+        ) { callbackURL, error in
+            isAuthenticatingWithGoogle = false
+            if let error {
+                if let authError = error as? ASWebAuthenticationSessionError,
+                   authError.code == .canceledLogin {
+                    return
+                }
+                store.setAccountNotice("Google sign-in failed: \(error.localizedDescription)")
+                return
+            }
+            guard let callbackURL else {
+                store.setAccountNotice("Google sign-in did not return a session.")
+                return
+            }
+            // Expected URL: congresstrade://auth?token=XYZ
+            guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
+                  let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
+                  !token.isEmpty else {
+                store.setAccountNotice("Google sign-in did not return a usable session token.")
+                return
+            }
+            // `saveSessionToken` writes its own failure notice; the discard is
+            // deliberate rather than an ignored error.
+            _ = store.saveSessionToken(token)
+        }
+
+        session.presentationContextProvider = AuthPresentationContext.shared
+        session.start()
+    }
+
+    // MARK: Magic link
+
+    private func sendMagicLink() {
+        magicEmailFocused = false
+        let email = magicEmail
+        guard !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        Task { await store.requestMagicLink(email: email) }
+    }
+}
+
+// MARK: - Legal footer (bottom of every tab)
+
+/// Quiet legal links row pinned to the bottom of every tab. Same destinations
+/// as the Settings tab's About section, so there is one set of URLs to keep
+/// current. Deliberately low-contrast and small: it is a compliance surface,
+/// not navigation.
+///
+/// Rendered as `Button`s over `openURL` rather than `Link`s because a `Link`
+/// paints its label with the accent color, and this row must read grey inside
+/// a `TabView` that sets `.tint(.blue)`.
+struct LegalFooterLinks: View {
+    @Environment(\.openURL) private var openURL
+
+    private struct Destination: Identifiable {
+        let id: String
+        let title: String
+        let url: URL
+    }
+
+    /// Built with `compactMap` rather than force-unwrapped literals so a typo
+    /// in a URL drops one link instead of crashing the app at the bottom of
+    /// every tab.
+    private var destinations: [Destination] {
+        let raw: [(id: String, title: String, url: String)] = [
+            (id: "privacy", title: "Privacy", url: "https://Congress.Trade/privacy-policy"),
+            (id: "terms", title: "Terms", url: "https://Congress.Trade/terms-of-service"),
+            (id: "pricing", title: "Pricing", url: "https://Congress.Trade/pricing"),
+            (id: "support", title: "Support", url: "mailto:congress.trade@jays.services"),
+        ]
+        return raw.compactMap { entry in
+            guard let url = URL(string: entry.url) else { return nil }
+            return Destination(id: entry.id, title: entry.title, url: url)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(destinations.enumerated()), id: \.element.id) { index, destination in
+                if index > 0 {
+                    Text("  ·  ")
+                        .foregroundStyle(Color.secondary)
+                }
+                Button(destination.title) { openURL(destination.url) }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.secondary)
+            }
+        }
+        .font(.caption2)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, 18)
+        .padding(.bottom, 6)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Legal links")
+    }
+}
+
+// MARK: - Premium explainer (low-pressure, readable signed out)
+
+/// One-screen explanation of what Premium actually unlocks. Explicitly NOT a
+/// hard sell: no countdown, no scarcity copy, no interstitial that has to be
+/// defeated — "Not Now" is the largest control on the screen and the whole
+/// explanation is readable while signed out.
+///
+/// Every bullet maps to a real server-side gate (source PDFs, CSV export,
+/// the 2-subscription delivery quota) — see `SubscribeView` and the Premium
+/// checks in `app/src/client/*`. The push line is deliberately hedged: device
+/// registration works today, but the APNs fan-out has not shipped
+/// (`app/docs/client-mobile-api.md`), and promising alerts that cannot arrive
+/// is exactly the kind of thing that makes the rest of the screen untrusted.
+struct PremiumInfoSheet: View {
+    @Binding var isPresented: Bool
+
+    @EnvironmentObject private var store: CongressTradeStore
+    @Environment(\.openURL) private var openURL
+    @State private var showSubscribe = false
+
+    private struct Benefit: Identifiable {
+        let id: String
+        let systemImage: String
+        let title: String
+        let detail: String?
+    }
+
+    // `private` because `Benefit` is private — an internal stored property
+    // cannot expose a private type.
+    private let benefits: [Benefit] = [
+        .init(
+            id: "pdf",
+            systemImage: "doc.text",
+            title: "Source Filing PDFs",
+            detail: "open the original disclosure straight from Congress"
+        ),
+        .init(
+            id: "csv",
+            systemImage: "square.and.arrow.down",
+            title: "Full CSV Exports",
+            detail: "the whole filtered database, not just the page on screen"
+        ),
+        .init(
+            id: "delivery",
+            systemImage: "antenna.radiowaves.left.and.right",
+            title: "Two Delivery Methods",
+            detail: "live SSE stream or signed webhook to a server you run"
+        ),
+        .init(
+            id: "push",
+            systemImage: "bell.badge",
+            title: "Trade Disclosure Alerts",
+            detail: "starts sending when the alert service goes live"
+        ),
+    ]
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Premium adds the paid-data pieces on top of everything the app already shows for free.")
+                    .font(.subheadline)
+                    .foregroundStyle(Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(benefits) { benefit in
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            Image(systemName: benefit.systemImage)
+                                .font(.body)
+                                .foregroundStyle(Color.secondary)
+                                .frame(width: 22)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(benefit.title)
+                                    .font(.subheadline.weight(.semibold))
+                                if let detail = benefit.detail {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(Color.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(minLength: 12)
+
+                // Price sits with the CTA, not with the benefits: it is the
+                // last thing read before deciding, and keeping the bottom
+                // block together avoids a large dead band mid-screen.
+                VStack(spacing: 10) {
+                    Text("1-month free trial, then $5/month or $50/year.")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(Color.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+
+                    if store.isPremium {
+                        Text("You already have Premium.")
+                            .font(.subheadline.weight(.semibold))
+                    } else if store.signedIn {
+                        Button {
+                            // Do NOT dismiss first: this view owns the sheet
+                            // presentation, and tearing it down in the same
+                            // update destroys the presentation host, leaving
+                            // a button that appears to do nothing.
+                            showSubscribe = true
+                        } label: {
+                            Label("Subscribe with Apple", systemImage: "apple.logo")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .clipShape(
+                            RoundedRectangle(cornerRadius: SignInControlMetrics.cornerRadius, style: .continuous)
+                        )
+                    } else {
+                        // Signed out: explain, never gate the explanation and
+                        // never bounce them into a sign-in wall. A subscription
+                        // has to attach to an account, so the Apple CTA would
+                        // dead-end here.
+                        Text("Sign in first — a subscription attaches to your account.")
+                            .font(.caption)
+                            .foregroundStyle(Color.secondary)
+                    }
+
+                    if let url = store.api.upgradeURL {
+                        Button("See Pricing on Congress.Trade") { openURL(url) }
+                            .font(.footnote)
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Color.secondary)
+                    }
+
+                    Button {
+                        isPresented = false
+                    } label: {
+                        Text("Not Now")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.bordered)
+                    .clipShape(
+                        RoundedRectangle(cornerRadius: SignInControlMetrics.cornerRadius, style: .continuous)
+                    )
+                }
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(AppTheme.background)
+            .navigationTitle("Premium")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { isPresented = false }
+                }
+            }
+            .sheet(isPresented: $showSubscribe) {
+                SubscribeView()
+                    .environmentObject(store)
+            }
+        }
+    }
+}
+
+// MARK: - Trade disclosure alerts (the one push control in the app)
+
+/// Single source of truth for the push on/off row — replaces the old
+/// "Push Notifications (APNs)" wording everywhere. "APNs" is an
+/// implementation detail the owner should never have had to read.
+///
+/// The control collapses three orthogonal pieces of state into one switch:
+/// the iOS permission (`UNAuthorizationStatus`), the APNs token, and the
+/// backend `register_device` row (signed-in only). Two rules keep it honest:
+///
+/// 1. When the permission is `.denied`, iOS will never re-prompt, so an
+///    interactive `Toggle` would silently snap back and read as broken. That
+///    state renders as a static row plus a jump to iOS Settings instead.
+/// 2. There is no client wrapper for the backend's `unregister_device`
+///    command yet, so switching OFF cannot be honored locally. Rather than
+///    animate a switch that changes nothing, OFF routes to iOS Settings —
+///    the surface that genuinely controls it — and the row re-reads the real
+///    permission when the app comes back to the foreground.
+struct TradeDisclosureAlertsToggle: View {
+    @EnvironmentObject private var store: CongressTradeStore
+    @EnvironmentObject private var pushManager: PushNotificationManager
+    @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
+    /// Set for the moment between "user asked to turn it off" and coming back
+    /// from iOS Settings, so the caption explains where the switch actually is.
+    @State private var awaitingSystemSettings = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if pushManager.authorizationStatus == .denied {
+                HStack(alignment: .firstTextBaseline) {
+                    labelStack
+                    Spacer(minLength: 12)
+                    Button("Open iOS Settings") { openSystemSettings() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            } else {
+                Toggle(isOn: alertsBinding) {
+                    labelStack
+                }
+                if needsRetry {
+                    Button("Retry") {
+                        Task { await pushManager.syncTokenWithBackend(api: store.api, force: true) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+        // `PushNotificationManager` samples the OS permission only in `init()`.
+        // Returning from iOS Settings is the one moment it can have changed
+        // under us, so re-read it or the row shows a stale answer until the
+        // next cold launch.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            awaitingSystemSettings = false
+            Task { await pushManager.checkPermissionStatus() }
+        }
+    }
+
+    private var labelStack: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Trade Disclosure Alerts")
+                .font(.body)
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(captionColor)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var alertsBinding: Binding<Bool> {
+        Binding(
+            get: { pushManager.isAuthorized },
+            set: { wantsOn in
+                if wantsOn {
+                    Task {
+                        await pushManager.requestAuthorization()
+                        // `register_device` is signed-in only and 401s
+                        // otherwise, so only sync once both are true.
+                        if pushManager.isAuthorized, store.signedIn {
+                            await pushManager.syncTokenWithBackend(api: store.api)
+                        }
+                    }
+                } else {
+                    awaitingSystemSettings = true
+                    openSystemSettings()
+                }
+            }
+        )
+    }
+
+    /// One short sentence-case line — never a paragraph.
+    private var caption: String {
+        if awaitingSystemSettings { return "turn alerts off in iOS Settings" }
+        switch pushManager.authorizationStatus {
+        case .denied:
+            return "turned off in iOS Settings"
+        case .notDetermined, .ephemeral:
+            return "not enabled yet"
+        default:
+            break
+        }
+        if !store.signedIn { return "sign in to finish enabling" }
+        if pushManager.isRegistering { return "registering this device…" }
+        if pushManager.lastError != nil { return "registration failed — tap Retry" }
+        if pushManager.isBackendSynced { return "registered — alerts start when the service goes live" }
+        return "permission granted — waiting for sync"
+    }
+
+    private var captionColor: Color {
+        if pushManager.authorizationStatus == .denied { return Color.secondary }
+        if needsRetry { return .red }
+        if pushManager.isBackendSynced && store.signedIn { return .green }
+        return Color.secondary
+    }
+
+    private var needsRetry: Bool {
+        pushManager.isAuthorized
+            && store.signedIn
+            && pushManager.lastError != nil
+            && !pushManager.isRegistering
+    }
+
+    private func openSystemSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        openURL(url)
+    }
+}
+
+// MARK: - Filter activity
+
+/// Inline "updating…" strip shown while a filter/search change is still in
+/// flight. Filter applies can take seconds, and with no indicator the owner
+/// reasonably concluded the controls were broken.
+///
+/// The row keeps its height whether or not it is active and animates opacity
+/// only, so appearing/disappearing never shoves the content below it.
+struct FilterActivityIndicator: View {
+    let isActive: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.mini)
+            Text("Updating…")
+                .font(.caption)
+                .foregroundStyle(Color.secondary)
+        }
+        .frame(height: 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .opacity(isActive ? 1 : 0)
+        .animation(.easeInOut(duration: 0.15), value: isActive)
+        .accessibilityHidden(!isActive)
+        .accessibilityLabel("Updating results")
+    }
+}
+
 // MARK: - Header chrome (subtle icon buttons + hamburger account menu)
 
 /// Subtle header circle button used for the ⓘ / export-arrow controls on
 /// Trades and Trends: no tinted stroke (the SF Symbol's own `.circle` glyph
-/// already reads as a circle), grey secondary color, a slightly larger glyph,
-/// and a tap target smaller than the default ~44pt toolbar hit area.
+/// already reads as a circle) and a grey, non-accent glyph.
+///
+/// On iOS 26 the toolbar wraps each of these in its own glass capsule with
+/// system metrics, so `minWidth`/`minHeight` no longer sets the hit area —
+/// it is retained purely so the glyph is not clipped at large Dynamic Type
+/// (and still matters if a pre-glass toolbar is ever rendered).
 struct HeaderIconButton: View {
     let systemImage: String
     let accessibilityLabel: String
@@ -492,13 +1229,23 @@ struct HeaderIconButton: View {
                 // `.title3` (not a fixed point size) so the "slightly larger"
                 // glyph still scales with Dynamic Type.
                 .font(.title3.weight(.semibold))
-                .foregroundStyle(.secondary)
-                // minWidth/minHeight (not a fixed frame) so the tap target can
-                // grow past 34pt for large Dynamic Type sizes instead of
-                // clipping the glyph.
+                // `Color.secondary` — the CONCRETE secondaryLabel grey — and
+                // NOT bare `.secondary`. `.secondary` is a HierarchicalShapeStyle
+                // meaning "level 2 of the current foreground style", and inside
+                // a toolbar Button the current style is the app tint, so it
+                // renders as blue at ~55% opacity. That is why an earlier pass
+                // at "make these grey" changed nothing visible: the modifier
+                // was working exactly as specified, it just never referred to
+                // grey. Measured, the old blue was 1.88:1 against the glass
+                // capsule (below the WCAG 3:1 floor for UI components); this
+                // grey is 5.31:1.
+                .foregroundStyle(Color.secondary)
                 .frame(minWidth: 34, minHeight: 34)
                 .contentShape(Circle())
         }
+        // Belt-and-braces: `.tint` is the channel the bar-button bridge reads,
+        // so this holds even if a future OS re-tints the label from outside.
+        .tint(Color.secondary)
         .accessibilityLabel(accessibilityLabel)
     }
 }
@@ -506,7 +1253,15 @@ struct HeaderIconButton: View {
 /// Header hamburger button (top-right on Trades/Trends) opening
 /// `AccountQuickMenu` — mobile-web parity with `.acct-hamburger` /
 /// `#acctMobileMenu` in `app/src/ui/dashboardHtml.ts`.
+///
+/// The menu is a LARGE SHEET, not the 290pt popover it used to be: it is now
+/// a real settings surface (account, alerts, CSV export, Premium, theme), and
+/// a popover could neither fit that nor host the sheets those rows present.
+/// See the note on `AccountQuickMenu` about why the child sheets live inside
+/// the menu rather than on this button.
 struct HamburgerMenuButton: View {
+    @EnvironmentObject private var store: CongressTradeStore
+    @EnvironmentObject private var pushManager: PushNotificationManager
     @State private var showMenu = false
 
     var body: some View {
@@ -515,180 +1270,214 @@ struct HamburgerMenuButton: View {
         } label: {
             Image(systemName: "line.3.horizontal")
                 .font(.title3.weight(.semibold))
-                .foregroundStyle(.secondary)
+                // Concrete grey — see the note in `HeaderIconButton`.
+                .foregroundStyle(Color.secondary)
                 .frame(minWidth: 34, minHeight: 34)
                 .contentShape(Circle())
         }
+        .tint(Color.secondary)
         .accessibilityLabel("Menu")
-        .popover(isPresented: $showMenu) {
+        .sheet(isPresented: $showMenu) {
             AccountQuickMenu(isPresented: $showMenu)
-                .presentationCompactAdaptation(.popover)
+                // Sheets inherit the environment, but re-injecting is cheap
+                // insurance: an @EnvironmentObject miss is a hard crash.
+                .environmentObject(store)
+                .environmentObject(pushManager)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
         }
     }
 }
 
-/// Compact account/theme/upgrade dropdown — mobile-web parity with the
-/// hamburger's `#acctMobileMenu` content (Sign In/account, theme picker,
-/// Upgrade or Manage Subscription, Sign Out) plus the short site-footer
-/// disclaimer line. Sign in with Apple is native (no browser hop), so it's
-/// offered right here; Google + magic-link still route to the Settings tab
-/// instead of duplicating that browser-based OAuth flow in a popover.
+/// The header menu — a full settings surface, not a dropdown.
+///
+/// It used to be a 290pt popover offering only Apple sign-in, a theme picker
+/// and billing, punting everything else to the Settings tab. That is what the
+/// owner meant by settings living "in multiple illogical places": CSV export
+/// was a separate toolbar icon, push lived in the Settings tab, Google/email
+/// sign-in lived somewhere else again. This sheet now carries account,
+/// alerts, export, Premium and theme in one reachable place.
+///
+/// WHY THE CHILD SHEETS LIVE HERE AND NOT ON THE BUTTON: a sheet modifier
+/// belongs to the view it is attached to, so a row that dismisses this menu
+/// and raises a sheet in the same update destroys its own presentation host
+/// and the sheet never appears — the old popover's "Upgrade to Premium"
+/// button had exactly that bug. Every row below therefore only sets its flag;
+/// nothing sets `isPresented = false` on the way to a sheet.
 struct AccountQuickMenu: View {
     @EnvironmentObject private var store: CongressTradeStore
-    @EnvironmentObject private var tabRouter: TabRouter
     @Environment(\.openURL) private var openURL
-    @Environment(\.colorScheme) private var colorScheme
     @AppStorage("app_color_scheme") private var appColorScheme = "system"
     @Binding var isPresented: Bool
-    @State private var showSubscribe = false
-    /// Raw nonce for the in-flight Sign in with Apple request, set by the
-    /// button's request-configuration closure and consumed by
-    /// `handleAppleSignIn` on completion. See `Store/AppleSignIn.swift`.
-    @State private var currentAppleNonce: String?
+    @State private var showPremiumInfo = false
+    @State private var showExport = false
     @State private var isOpeningManageSubscription = false
     @State private var manageSubscriptionError: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            accountSection
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Theme")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                ThemeSegmentControl(selection: $appColorScheme)
-            }
-
-            if store.signedIn {
-                Divider()
-                billingButton
-                Divider()
-                Button(role: .destructive) {
-                    isPresented = false
-                    Task { await store.signOut() }
-                } label: {
-                    Label(
-                        store.isLoggingOut ? "Signing Out…" : "Sign Out",
-                        systemImage: "rectangle.portrait.and.arrow.right"
-                    )
-                    .font(.subheadline.weight(.medium))
+        NavigationStack {
+            Form {
+                Section {
+                    accountSection
                 }
-                .disabled(store.isLoggingOut)
+
+                // Alerts / export / Premium share one section on purpose: as
+                // three separate sections the inset-grouped gaps made a short
+                // menu look mostly empty, and they are the same kind of thing
+                // — the account-level switches this menu exists to expose.
+                Section {
+                    TradeDisclosureAlertsToggle()
+
+                    // Owner asked for CSV export to be reachable from this
+                    // menu rather than as its own toolbar icon. `ExportCSVSheet`
+                    // (defined alongside the Trades tab) does its own
+                    // signed-in / Premium gating and exports the CURRENT
+                    // global Trades filter state, so it behaves identically
+                    // whether it is opened from here or from that tab.
+                    Button {
+                        showExport = true
+                    } label: {
+                        Label("Export CSV", systemImage: "arrow.down.circle")
+                    }
+
+                    billingRow
+                }
+
+                Section {
+                    // No "Theme" caption and no explanation of what Light and
+                    // Dark do: the icons and labels are self-evident and the
+                    // owner explicitly asked for the words to go.
+                    ThemeSegmentControl(selection: $appColorScheme)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                }
+
+                Section {
+                    // Short disclaimer line — mobile-web parity with `.site-footer`.
+                    Text("Congress.Trade is an educational tool for public STOCK Act disclosures. Not financial advice — dollar figures are estimates from disclosed brackets.")
+                        .font(.caption2)
+                        .foregroundStyle(Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    LegalFooterLinks()
+                }
+                .listRowBackground(Color.clear)
             }
-
-            Divider()
-
-            // Short disclaimer line — mobile-web parity with `.site-footer`.
-            Text("Congress.Trade is an educational tool for public STOCK Act disclosures. Not financial advice — dollar figures are estimates from disclosed brackets.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(16)
-        .frame(width: 290)
-        .sheet(isPresented: $showSubscribe) {
-            SubscribeView()
-                .environmentObject(store)
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.background)
+            .navigationTitle("Account")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { isPresented = false }
+                }
+            }
+            .sheet(isPresented: $showPremiumInfo) {
+                PremiumInfoSheet(isPresented: $showPremiumInfo)
+                    .environmentObject(store)
+            }
+            .sheet(isPresented: $showExport) {
+                ExportCSVSheet()
+                    .environmentObject(store)
+                    .presentationDetents([.medium])
+                    .presentationDragIndicator(.visible)
+            }
         }
     }
 
     @ViewBuilder
     private var accountSection: some View {
         if store.signedIn, let user = store.signedInUser {
-            HStack(spacing: 10) {
-                Image(systemName: "person.crop.circle.fill")
-                    .font(.system(size: 30))
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 12) {
+                if let picture = user.picture, let url = URL(string: picture) {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().scaledToFill()
+                        default:
+                            Image(systemName: "person.crop.circle.fill")
+                                .resizable()
+                                .foregroundStyle(Color.secondary)
+                        }
+                    }
+                    .frame(width: 44, height: 44)
+                    .clipShape(Circle())
+                } else {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Color.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
                     Text(user.name?.isEmpty == false ? user.name! : user.email)
-                        .font(.subheadline.weight(.semibold))
+                        .font(.body.weight(.semibold))
+                        .lineLimit(1)
+                    Text(user.email)
+                        .font(.caption)
+                        .foregroundStyle(Color.secondary)
                         .lineLimit(1)
                     Text(store.entitlementLabel)
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(.blue)
                 }
             }
+            .padding(.vertical, 4)
             .accessibilityElement(children: .combine)
-        } else {
-            VStack(alignment: .leading, spacing: 8) {
-                SignInWithAppleButton(.signIn) { request in
-                    // Match SettingsView: name + email scopes + nonce.
-                    request.requestedScopes = [.fullName, .email]
-                    let nonce = AppleSignInNonce.generate()
-                    currentAppleNonce = nonce
-                    request.nonce = nonce
-                } onCompletion: { result in
-                    Task {
-                        await store.handleAppleSignIn(result, rawNonce: currentAppleNonce)
-                        currentAppleNonce = nil
-                        if store.signedIn { isPresented = false }
-                    }
-                }
-                .signInWithAppleButtonStyle(colorScheme == .dark ? .white : .black)
-                // 48pt matches Settings' ST-parity Apple button height.
-                .frame(height: 48)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .accessibilityLabel("Sign in with Apple")
 
-                Button {
-                    isPresented = false
-                    tabRouter.selection = .settings
-                } label: {
-                    Label("More Sign-In Options", systemImage: "person.crop.circle")
-                        .font(.subheadline.weight(.semibold))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+            Button(role: .destructive) {
+                Task { await store.signOut() }
+            } label: {
+                Label(
+                    store.isLoggingOut ? "Signing Out…" : "Sign Out",
+                    systemImage: "rectangle.portrait.and.arrow.right"
+                )
             }
+            .disabled(store.isLoggingOut)
+        } else {
+            // The same panel the Settings tab renders — one sign-in
+            // implementation, so Apple/Google/email behave identically here.
+            SignInPanel(onSignedIn: { isPresented = false })
         }
     }
 
     @ViewBuilder
-    private var billingButton: some View {
+    private var billingRow: some View {
         if store.isPremium {
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    Task { await openManageSubscription() }
-                } label: {
-                    HStack {
-                        Label("Manage Subscription", systemImage: "creditcard")
-                            .font(.subheadline.weight(.medium))
-                        if isOpeningManageSubscription {
-                            Spacer()
-                            ProgressView()
-                        }
+            Button {
+                Task { await openManageSubscription() }
+            } label: {
+                HStack {
+                    Label("Manage Subscription", systemImage: "creditcard")
+                    if isOpeningManageSubscription {
+                        Spacer()
+                        ProgressView()
                     }
                 }
-                .disabled(isOpeningManageSubscription)
-                .accessibilityHint(
-                    store.entitlementSource == "apple"
-                        ? "Opens the App Store subscriptions page"
-                        : "Opens the Congress.Trade billing portal"
-                )
-                if let manageSubscriptionError {
-                    Text(manageSubscriptionError)
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            }
+            .disabled(isOpeningManageSubscription)
+            .accessibilityHint(
+                store.entitlementSource == "apple"
+                    ? "Opens the App Store subscriptions page"
+                    : "Opens the Congress.Trade billing portal"
+            )
+            if let manageSubscriptionError {
+                Text(manageSubscriptionError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         } else {
             Button {
-                isPresented = false
-                showSubscribe = true
+                showPremiumInfo = true
             } label: {
                 Label("Upgrade to Premium", systemImage: "sparkles")
-                    .font(.subheadline.weight(.medium))
             }
         }
     }
 
     /// Routes by `entitlementSource` — see `Store/ManageSubscription.swift`.
-    /// Only dismisses the popover once a URL is actually opened; a failure
-    /// stays put and shows `manageSubscriptionError` inline instead of
-    /// silently closing on a dead link.
+    /// Only dismisses the menu once a URL is actually opened; a failure stays
+    /// put and shows `manageSubscriptionError` inline instead of silently
+    /// closing on a dead link.
     private func openManageSubscription() async {
         manageSubscriptionError = nil
         isOpeningManageSubscription = true

@@ -21,6 +21,16 @@ struct TrendsView: View {
                     // Identical shared filters as Trades (no export, no politician/asset extras).
                     FeedControlBar(showMetrics: false)
 
+                    // First load already has the big centered "Loading trends…"
+                    // ProgressView below. This is the gap the owner actually hit:
+                    // a SUBSEQUENT filter change on an already-loaded tab used to
+                    // leave stale charts on screen with zero signal that anything
+                    // was happening. `isTrendsFilterPending` spans the debounce
+                    // window through the (possibly superseded) refreshTrends()
+                    // call, so this reads correctly even when a fast follow-up
+                    // filter tap cancels an in-flight one.
+                    FilterActivityIndicator(isActive: store.isTrendsFilterPending)
+
                     if store.isLoadingTrends && store.analyticsSummary == nil {
                         ProgressView("Loading trends…")
                             .frame(maxWidth: .infinity)
@@ -67,6 +77,9 @@ struct TrendsView: View {
                             LatencyComparisonView(summary: summary)
                         }
                     }
+
+                    LegalFooterLinks()
+                        .padding(.top, 8)
                 }
                 // Same horizontal/top/bottom insets as Trades so the
                 // disclaimer banner lands at an identical position/size on
@@ -355,25 +368,110 @@ struct TrendsView: View {
         }
     }
 
+    /// One row in the Net Flow by Sector list. Real sectors keep their raw
+    /// API label; `isAggregate` rows ("Other" and "Unknown") render with a
+    /// secondary/grey label so they read as catch-alls rather than real
+    /// sectors, matching the trailing-row treatment `marketCapDisplayRows`
+    /// gives the "unknown" market-cap bucket below.
+    private struct SectorDisplayRow: Identifiable {
+        let id: String
+        let label: String
+        let subtitle: String?
+        let estNetFlowUsd: Double?
+        let isAggregate: Bool
+    }
+
+    /// Splits `store.sectorFlow` into up to 8 real sectors (the API already
+    /// orders by trade count, descending) plus a trailing "Other" row that
+    /// sums whatever fell past the top 8, plus a trailing "Unknown" row when
+    /// the API returns one. Fixes the previous silent truncation: the API
+    /// can return up to ~39 fragmented sector buckets (see builders.ts
+    /// `canonicalSectorSql`), and `prefix(8)` used to drop the rest with no
+    /// indication anything was omitted.
+    private var sectorDisplayRows: [SectorDisplayRow] {
+        let unknownItem = store.sectorFlow.first { $0.sector.caseInsensitiveCompare("Unknown") == .orderedSame }
+        let known = store.sectorFlow.filter { $0.sector.caseInsensitiveCompare("Unknown") != .orderedSame }
+
+        var rows: [SectorDisplayRow] = known.prefix(8).map { item in
+            SectorDisplayRow(id: item.id, label: item.sector, subtitle: nil, estNetFlowUsd: item.estNetFlowUsd, isAggregate: false)
+        }
+
+        let overflow = known.dropFirst(8)
+        if !overflow.isEmpty {
+            let overflowNetFlow = overflow.reduce(0.0) { $0 + ($1.estNetFlowUsd ?? 0) }
+            rows.append(SectorDisplayRow(
+                id: "__other__",
+                label: "Other",
+                subtitle: "\(overflow.count) more \(overflow.count == 1 ? "sector" : "sectors")",
+                estNetFlowUsd: overflowNetFlow,
+                isAggregate: true
+            ))
+        }
+
+        if let unknownItem {
+            rows.append(SectorDisplayRow(
+                id: unknownItem.id,
+                label: "Unknown",
+                subtitle: nil,
+                estNetFlowUsd: unknownItem.estNetFlowUsd,
+                isAggregate: true
+            ))
+        }
+
+        return rows
+    }
+
+    /// Canonical size order (mega -> nano), matching the SQL thresholds in
+    /// `prices/service.ts`. `marketCapDisplayRows` sorts into this order so
+    /// the list reads largest-to-smallest instead of whatever arbitrary
+    /// order SQLite's unordered `GROUP BY` happens to return, and forces
+    /// "unknown" to the trailing position — parity with how `sectorDisplayRows`
+    /// above trails "Unknown"/"Other" rather than interleaving them.
+    private static let marketCapOrder = ["mega", "large", "mid", "small", "micro", "nano"]
+
+    private func marketCapRank(_ bucket: String) -> Int {
+        let lower = bucket.lowercased()
+        if let idx = Self.marketCapOrder.firstIndex(of: lower) { return idx }
+        // Unrecognized bucket sorts after every known size band; "unknown"
+        // specifically sorts after that so it is always the trailing row.
+        return Self.marketCapOrder.count + (lower == "unknown" ? 1 : 0)
+    }
+
+    /// `store.marketCapBuckets` already covers every bucket the API returns,
+    /// including "unknown" — verified against production data, so no rows
+    /// are added or dropped here, only ordered (see `marketCapRank`).
+    private var marketCapDisplayRows: [MarketCapItem] {
+        store.marketCapBuckets.sorted { marketCapRank($0.bucket) < marketCapRank($1.bucket) }
+    }
+
     private var sectorAndCapSection: some View {
         VStack(alignment: .leading, spacing: 18) {
             if !store.sectorFlow.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Net Flow by Sector")
                         .font(.headline)
+                    Text("Sectors come from ticker enrichment; trades without a resolved ticker aren't included.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     VStack(spacing: 0) {
-                        ForEach(Array(store.sectorFlow.prefix(8).enumerated()), id: \.element.id) { idx, s in
+                        ForEach(Array(sectorDisplayRows.enumerated()), id: \.element.id) { idx, row in
                             HStack {
-                                Text(s.sector)
+                                Text(row.label)
                                     .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(row.isAggregate ? Color.secondary : Color.primary)
                                     .lineLimit(1)
+                                if let subtitle = row.subtitle {
+                                    Text(subtitle)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                                 Spacer()
-                                Text(CompactFormat.usd(s.estNetFlowUsd))
+                                Text(CompactFormat.usd(row.estNetFlowUsd))
                                     .font(.subheadline.weight(.bold))
-                                    .foregroundStyle((s.estNetFlowUsd ?? 0) >= 0 ? .green : .red)
+                                    .foregroundStyle((row.estNetFlowUsd ?? 0) >= 0 ? .green : .red)
                             }
                             .padding(.vertical, 8)
-                            if idx < min(7, store.sectorFlow.count - 1) {
+                            if idx < sectorDisplayRows.count - 1 {
                                 Divider()
                             }
                         }
@@ -388,10 +486,11 @@ struct TrendsView: View {
                     Text("By Market Cap")
                         .font(.headline)
                     VStack(spacing: 0) {
-                        ForEach(Array(store.marketCapBuckets.enumerated()), id: \.element.id) { idx, cap in
+                        ForEach(Array(marketCapDisplayRows.enumerated()), id: \.element.id) { idx, cap in
                             HStack {
                                 Text(cap.bucket.capitalized)
                                     .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(cap.bucket.lowercased() == "unknown" ? Color.secondary : Color.primary)
                                 Spacer()
                                 Text("\(cap.tradeCount) trades")
                                     .font(.caption)
@@ -402,7 +501,7 @@ struct TrendsView: View {
                                     .frame(width: 80, alignment: .trailing)
                             }
                             .padding(.vertical, 8)
-                            if idx < store.marketCapBuckets.count - 1 {
+                            if idx < marketCapDisplayRows.count - 1 {
                                 Divider()
                             }
                         }

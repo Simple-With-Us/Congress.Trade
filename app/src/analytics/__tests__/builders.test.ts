@@ -26,6 +26,7 @@ import {
   buildSectorBreakdownQuery,
   buildSectorFlowQuery,
   buildMarketCapBreakdownQuery,
+  canonicalSectorSql,
   buildMemberPerformanceLeaderboardQuery,
   buildSummaryQuery,
   buildTickerLeaderboardQuery,
@@ -191,9 +192,11 @@ describe('buildSectorBreakdownQuery', () => {
 });
 
 describe('buildSectorFlowQuery (real GICS sector)', () => {
-  it('groups by securities_ref.sector with signed net flow, resolved tickers only', () => {
+  it('canonicalizes securities_ref.sector (junk sentinels + duplicate labels collapsed) with signed net flow, resolved tickers only', () => {
     const q = buildSectorFlowQuery({ window: '90d' });
-    expect(q.sql).toContain("COALESCE(NULLIF(sr.sector, ''), 'Unknown') AS sector");
+    expect(q.sql).toContain(`${canonicalSectorSql('sr.sector')} AS sector`);
+    expect(q.sql).toContain("THEN 'Unknown'");
+    expect(q.sql).toContain("THEN 'Health Care'");
     expect(q.sql).toContain('LEFT JOIN securities_ref sr ON sr.ticker = t.ticker');
     expect(q.sql).toContain('AS est_net_flow');
     expect(q.sql).toContain('GROUP BY sector');
@@ -202,12 +205,65 @@ describe('buildSectorFlowQuery (real GICS sector)', () => {
 });
 
 describe('buildMarketCapBreakdownQuery', () => {
-  it('groups by market_cap_bucket with net flow + breadth', () => {
+  it('normalizes junk sentinels (not just empty string) to unknown, groups by bucket', () => {
     const q = buildMarketCapBreakdownQuery({ window: 'all' });
-    expect(q.sql).toContain("COALESCE(NULLIF(sr.market_cap_bucket, ''), 'unknown') AS bucket");
+    expect(q.sql).toContain("THEN 'unknown' ELSE trim(sr.market_cap_bucket) END) AS bucket");
     expect(q.sql).toContain('LEFT JOIN securities_ref sr ON sr.ticker = t.ticker');
     expect(q.sql).toContain('AS est_net_flow');
     expect(q.sql).toContain('GROUP BY bucket');
+  });
+});
+
+describe('canonicalSectorSql', () => {
+  /**
+   * Executes the generated CASE expression in a real SQLite engine (rather
+   * than only asserting on the SQL text) so these tests catch logic bugs,
+   * not just accidental string-shape drift. `sectorExpr` is passed a SQL
+   * string literal directly (no table needed) since the function only ever
+   * interpolates its expr argument, never binds it as a param.
+   */
+  async function evalSector(rawValue: string): Promise<string> {
+    const { DatabaseSync } = (await import('node:sqlite')) as unknown as {
+      DatabaseSync: new (path: string) => {
+        prepare(sql: string): { get(): Record<string, unknown> | undefined };
+        close(): void;
+      };
+    };
+    const db = new DatabaseSync(':memory:');
+    try {
+      const literal = `'${rawValue.replace(/'/g, "''")}'`;
+      const row = db.prepare(`SELECT ${canonicalSectorSql(literal)} AS out`).get();
+      return row?.out as string;
+    } finally {
+      db.close();
+    }
+  }
+
+  it('normalizes junk sentinels (N/A and friends, whitespace-only) to Unknown — not just empty string', async () => {
+    expect(await evalSector('N/A')).toBe('Unknown');
+    expect(await evalSector('n/a')).toBe('Unknown');
+    expect(await evalSector('-')).toBe('Unknown');
+    expect(await evalSector('None')).toBe('Unknown');
+    expect(await evalSector('Unknown')).toBe('Unknown');
+    expect(await evalSector('   ')).toBe('Unknown');
+    expect(await evalSector('')).toBe('Unknown');
+  });
+
+  it('collapses duplicate/fragmented provider labels onto one canonical sector', async () => {
+    expect(await evalSector('Health Care')).toBe('Health Care');
+    expect(await evalSector('Healthcare')).toBe('Health Care');
+    expect(await evalSector('HEALTHCARE')).toBe('Health Care');
+    expect(await evalSector('Communication Services')).toBe('Communication Services');
+    expect(await evalSector('Communications')).toBe('Communication Services');
+    expect(await evalSector('Telecommunication')).toBe('Communication Services');
+  });
+
+  it('passes an unrecognized (including genuinely ambiguous) label through unchanged instead of guessing', async () => {
+    // "Retail" spans both Consumer Cyclical and Consumer Defensive under GICS —
+    // deliberately left unmapped rather than guessed into the wrong bucket.
+    expect(await evalSector('Retail')).toBe('Retail');
+    expect(await evalSector('Consumer products')).toBe('Consumer products');
+    expect(await evalSector('Some Brand New Provider Label')).toBe('Some Brand New Provider Label');
   });
 });
 

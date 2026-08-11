@@ -4,8 +4,26 @@ import XCTest
 @testable import CongressTrade
 
 final class CongressTradeTests: XCTestCase {
+    /// A store does not necessarily go quiet the moment its test method
+    /// returns. `refreshTrends()` fans out to 12 concurrent `/api/analytics/*`
+    /// requests behind `async let`, and when one of them throws, the siblings
+    /// are cancelled at scope exit — but URLSession cancellation is
+    /// asynchronous, so an already-started request can still reach
+    /// `MockURLProtocol` a moment later, by which time the NEXT test owns the
+    /// global handler. That straggler then failed the innocent test, because
+    /// handlers assert on the request they expect ("Idempotency-Key == del-1").
+    ///
+    /// Stamping every session with the epoch of the test that built it, and
+    /// dropping requests whose epoch is stale, makes each test see only its
+    /// own traffic.
+    override func setUp() {
+        super.setUp()
+        MockURLProtocol.epoch = UUID().uuidString
+    }
+
     override func tearDown() {
         MockURLProtocol.handler = nil
+        MockURLProtocol.epoch = UUID().uuidString
         super.tearDown()
     }
 
@@ -24,7 +42,7 @@ final class CongressTradeTests: XCTestCase {
         MockURLProtocol.handler = { request in
             XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), "intent-123")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-session")
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try XCTUnwrap(Self.requestBody(request))
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
             let payload = try XCTUnwrap(json["payload"] as? [String: Any])
             XCTAssertEqual(payload["id"] as? String, "sub_1")
@@ -154,7 +172,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
         }
 
@@ -180,7 +198,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
         }
 
@@ -224,8 +242,10 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedCallCount += 1
-            feedURL = request.url
+            if Self.isFeedRequest(request) {
+                feedCallCount += 1
+                feedURL = request.url
+            }
             return Self.response(for: request, json: Self.feedJSON(
                 items: (1...10).map { Self.tradeJSON(id: "a\($0)", cursor: 100 + $0) },
                 cursor: 110, count: 10, total: 718, limit: 100
@@ -250,8 +270,11 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(items.first(where: { $0.name == "order" })?.value, "desc")
         XCTAssertEqual(items.first(where: { $0.name == "sort" })?.value, "tx_date")
         XCTAssertNotNil(items.first(where: { $0.name == "from" })?.value, "Default 90d window must send from=")
-        // Cursor watermark is keyed by chamber+range.
-        XCTAssertEqual(cursorStore.cursor(for: "house,senate|90d"), 110)
+        // Cursor watermark is keyed by chamber+range+sides — the literal key
+        // matters, not just the value: a watermark written under a key nobody
+        // reads back silently disables background catch-up instead of failing
+        // loudly. `Set<TradeTypeFilter>()` (no side chips) serializes as "all".
+        XCTAssertEqual(cursorStore.cursor(for: "house,senate|90d|all"), 110)
     }
 
     @MainActor
@@ -261,7 +284,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 100))
         }
 
@@ -285,7 +308,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURLs.append(request.url!)
+            if Self.isFeedRequest(request), let url = request.url { feedURLs.append(url) }
             return Self.response(for: request, json: Self.feedJSON(
                 items: (1...10).map { Self.tradeJSON(id: "a\($0)", cursor: 100 + $0) },
                 cursor: 110, count: 10, total: 250, limit: 100
@@ -326,7 +349,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedCallCount += 1
+            if Self.isFeedRequest(request) { feedCallCount += 1 }
             lastURL = request.url
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 100))
         }
@@ -366,7 +389,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURLs.append(request.url!)
+            if Self.isFeedRequest(request), let url = request.url { feedURLs.append(url) }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 300, limit: 100))
         }
 
@@ -887,7 +910,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
         }
 
@@ -917,7 +940,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
         }
 
@@ -942,7 +965,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
         }
 
@@ -977,7 +1000,7 @@ final class CongressTradeTests: XCTestCase {
         )
         MockURLProtocol.handler = { request in
             XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), "del-1")
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try XCTUnwrap(Self.requestBody(request))
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
             XCTAssertEqual(json["type"] as? String, "delete_subscription")
             let payload = try XCTUnwrap(json["payload"] as? [String: Any])
@@ -1014,7 +1037,7 @@ final class CongressTradeTests: XCTestCase {
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
             }
-            feedURL = request.url
+            if Self.isFeedRequest(request) { feedURL = request.url }
             return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
         }
 
@@ -1139,10 +1162,28 @@ final class CongressTradeTests: XCTestCase {
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
+        // See `setUp()` — this is what keeps one test's late requests from
+        // landing on the next test's handler.
+        configuration.httpAdditionalHeaders = [MockURLProtocol.epochHeader: MockURLProtocol.epoch]
         return URLSession(configuration: configuration)
     }
 
     private static let baseURL = URL(string: "https://example.test/api/client/v1")!
+
+    /// Identifies the `GET /api/client/v1/feed` request specifically.
+    ///
+    /// The filters both tabs share (chamber, party, timeframe, sides) fan out
+    /// to `refreshTrends()` as well as the feed, and `refreshTrends()` is
+    /// TWELVE concurrent `/api/analytics/*` requests. Handlers that recorded
+    /// "anything whose path is not /bootstrap" as the feed were therefore
+    /// recording 13 requests and keeping whichever one happened to finish
+    /// last — so `feedURL` usually ended up being an analytics URL with no
+    /// `sort`/`order`/`from`/`chamber`/`type` on it, and `feedCallCount` read
+    /// 13. Matching the feed endpoint POSITIVELY is what makes these
+    /// assertions deterministic; it does not relax any of them.
+    private static func isFeedRequest(_ request: URLRequest) -> Bool {
+        request.url?.path.hasSuffix("/feed") == true
+    }
 
     private static let bootstrapJSON = """
     {"serverTime":"2026-07-18T00:00:00Z","auth":{"user":null,"entitlement":{"premium":false,"status":null,"plan":null}},
@@ -1241,12 +1282,27 @@ private final class MemoryTokenStore: SessionTokenStore {
 private final class MockURLProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
+    /// Identifies which test built the session a request came from. Rotated in
+    /// `setUp`/`tearDown`; see the comment there for what it prevents.
+    static let epochHeader = "X-CT-Test-Epoch"
+    static var epoch = UUID().uuidString
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        // Answer only requests belonging to the test that is running right
+        // now (see `CongressTradeTests.setUp`). A straggler from a finished
+        // test gets the same cancellation the store already treats as benign
+        // (`APIError.isCancellation`) instead of being unwrapped into a
+        // failure charged to an innocent test.
+        guard let handler = Self.handler,
+              request.value(forHTTPHeaderField: Self.epochHeader) == Self.epoch else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+            return
+        }
         do {
-            let (response, data) = try XCTUnwrap(Self.handler)(request)
+            let (response, data) = try handler(request)
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)

@@ -1,6 +1,14 @@
 import SwiftUI
 import AuthenticationServices
 
+/// UIKit presentation anchor for `ASWebAuthenticationSession`.
+///
+/// The Google OAuth round trip itself now lives in `SignInPanel`
+/// (`Views/Components/Components.swift`) so the app has exactly ONE sign-in
+/// implementation — but `ASWebAuthenticationSession` still needs a real window
+/// to present over and SwiftUI has no equivalent. This shim stays in this file
+/// and is used by reference from `SignInPanel.startGoogleSignIn()`. It holds no
+/// SwiftUI state, so there is nothing here to duplicate or keep in sync.
 class AuthPresentationContext: NSObject, ASWebAuthenticationPresentationContextProviding {
     static let shared = AuthPresentationContext()
 
@@ -13,172 +21,73 @@ class AuthPresentationContext: NSObject, ASWebAuthenticationPresentationContextP
     }
 }
 
+/// Settings tab — deliberately header-less and caption-light.
+///
+/// The owner's complaint was that this tab explained itself instead of just
+/// working: "Don't need bunch of words on that tab like Appearance or Theme or
+/// explanations of what light and dark are for." So section *grouping* does the
+/// organizing rather than prose, and every control is either self-evident (the
+/// account card, the pictographic theme segment) or carries at most one
+/// sentence-case status line (`TradeDisclosureAlertsToggle`).
+///
+/// Every control on this tab is a SHARED component that the header quick menu
+/// (`AccountQuickMenu`) renders too, so the two surfaces cannot drift: one
+/// sign-in implementation, one push toggle, one Premium explanation, one legal
+/// footer. That is the fix for "the settings … in multiple illogical places".
 struct SettingsView: View {
     @EnvironmentObject private var store: CongressTradeStore
+    /// Not read directly here any more — `TradeDisclosureAlertsToggle` pulls the
+    /// push manager out of the environment itself. Declared anyway so this tab's
+    /// dependency on it is stated at THIS boundary: if a future refactor stops
+    /// injecting it, the failure points at the tab instead of crashing deep
+    /// inside a nested component with no obvious owner.
     @EnvironmentObject private var pushManager: PushNotificationManager
-    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.openURL) private var openURL
     @AppStorage("app_color_scheme") private var appColorScheme = "system"
-    @State private var isAuthenticating = false
-    @State private var magicEmail = ""
-    @State private var showSubscribe = false
-    /// Raw nonce for the in-flight Sign in with Apple request — see
-    /// `Store/AppleSignIn.swift` / `AccountQuickMenu`'s identical button.
-    @State private var currentAppleNonce: String?
-    @FocusState private var magicEmailFocused: Bool
+    @State private var showPremiumInfo = false
+    @State private var isOpeningManageSubscription = false
+    @State private var manageSubscriptionError: String?
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    if store.signedIn, let user = store.signedInUser {
-                        HStack(spacing: 12) {
-                            if let picture = user.picture, let url = URL(string: picture) {
-                                AsyncImage(url: url) { phase in
-                                    switch phase {
-                                    case .success(let image):
-                                        image.resizable().scaledToFill()
-                                    default:
-                                        Image(systemName: "person.crop.circle.fill")
-                                            .resizable()
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                .frame(width: 44, height: 44)
-                                .clipShape(Circle())
-                            } else {
-                                Image(systemName: "person.crop.circle.fill")
-                                    .font(.system(size: 40))
-                                    .foregroundStyle(.secondary)
-                            }
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(user.name?.isEmpty == false ? user.name! : user.email)
-                                    .font(.body.weight(.semibold))
-                                Text(user.email)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(store.entitlementLabel)
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(.blue)
-                            }
-                        }
-                        .padding(.vertical, 4)
-
-                        Button(role: .destructive) {
-                            Task { await store.signOut() }
-                        } label: {
-                            Label(
-                                store.isLoggingOut ? "Signing Out…" : "Sign Out",
-                                systemImage: "rectangle.portrait.and.arrow.right"
-                            )
-                        }
-                        .disabled(store.isLoggingOut)
-                    } else if store.hasStoredSessionToken && !store.signedIn {
-                        // Token present but bootstrap hasn't resolved a user yet
-                        // (offline / expired). Offer retry + clear.
-                        Text("Session could not be verified.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        Button {
-                            Task { await store.refresh() }
-                        } label: {
-                            Label("Retry", systemImage: "arrow.clockwise")
-                        }
-                        Button(role: .destructive) {
-                            Task { await store.signOut() }
-                        } label: {
-                            Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
-                        }
-                        .disabled(store.isLoggingOut)
-                    } else {
-                        signInButtons
-                    }
-                } header: {
-                    Text("Account")
+                    accountSection
                 } footer: {
                     accountFooter
                 }
 
+                // No "Appearance" header and no "Theme" label. The three
+                // pictographic options say what they are; the owner explicitly
+                // asked for the surrounding words to go.
                 Section {
-                    HStack {
-                        Text("Theme")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 12)
-                        ThemeSegmentControl(selection: $appColorScheme)
-                            .frame(maxWidth: 280)
-                    }
-                    .padding(.vertical, 2)
-                    .accessibilityElement(children: .contain)
-                } header: {
-                    Text("Appearance")
+                    ThemeSegmentControl(selection: $appColorScheme)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                 }
 
+                // No headers. "Push Notifications (APNs)" is gone app-wide — the
+                // toggle names the thing it actually turns on and owns its single
+                // status line, including the honest "alerts start when the
+                // service goes live" state.
+                //
+                // Alerts and Premium share one section for the same reason
+                // `AccountQuickMenu` groups them: they are both account-level
+                // switches, and as separate sections the inset-grouped gaps left
+                // a mostly-empty screen with two lone rows floating in it.
                 Section {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Real-Time Trade Alerts")
-                                .font(.body.weight(.medium))
-                            Text(pushStatusCaption)
-                                .font(.caption)
-                                .foregroundStyle(pushStatusColor)
-                        }
-                        Spacer()
-                        if pushManager.isAuthorized {
-                            if pushManager.isBackendSynced {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                            } else if store.signedIn {
-                                Button("Sync") {
-                                    Task {
-                                        await pushManager.syncTokenWithBackend(api: store.api, force: true)
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                            } else {
-                                Image(systemName: "checkmark.circle")
-                                    .foregroundStyle(.secondary)
-                            }
-                        } else {
-                            Button("Enable Alerts") {
-                                Task { await pushManager.requestAuthorization() }
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
-                    }
-
-                    // APNs device token is never shown in Settings (not even DEBUG).
-
-                    if let error = pushManager.lastError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-                } header: {
-                    Text("Push Notifications")
+                    TradeDisclosureAlertsToggle()
+                    premiumRow
                 }
 
-                if store.signedIn && !store.isPremium {
-                    Section("Premium") {
-                        Text("1-month free trial, then $5/month or $50/year.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        Button {
-                            showSubscribe = true
-                        } label: {
-                            Label("Subscribe with Apple", systemImage: "apple.logo")
-                        }
-                        if let url = store.api.upgradeURL {
-                            Link("Subscribe on Congress.Trade", destination: url)
-                        }
-                    }
+                // Replaces the old four-`Link` "About" section: the same legal
+                // row every other tab shows, so there is one set of URLs and one
+                // appearance for them.
+                Section {
+                    LegalFooterLinks()
                 }
-
-                Section("About") {
-                    Link("Privacy Policy", destination: URL(string: "https://Congress.Trade/privacy-policy")!)
-                    Link("Terms of Service", destination: URL(string: "https://Congress.Trade/terms-of-service")!)
-                    Link("Pricing", destination: URL(string: "https://Congress.Trade/pricing")!)
-                    Link("Support", destination: URL(string: "mailto:congress.trade@jays.services")!)
-                }
+                .listRowBackground(Color.clear)
             }
             .scrollContentBackground(.hidden)
             .scrollDismissesKeyboard(.interactively)
@@ -188,212 +97,181 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
-                    Button("Done") { magicEmailFocused = false }
+                    // The magic-link field lives inside `SignInPanel` now, so its
+                    // `@FocusState` is not reachable from here. Resigning first
+                    // responder through UIKit dismisses whichever field in this
+                    // tab raised the keyboard, without this view having to own
+                    // focus state it has no other use for.
+                    Button("Done") {
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder),
+                            to: nil,
+                            from: nil,
+                            for: nil
+                        )
+                    }
                 }
             }
-            .sheet(isPresented: $showSubscribe) {
-                SubscribeView()
+            .sheet(isPresented: $showPremiumInfo) {
+                PremiumInfoSheet(isPresented: $showPremiumInfo)
                     .environmentObject(store)
             }
         }
     }
 
-    /// Full-width Apple + Google buttons (ST-style parity: same height/radius,
-    /// Google uses outline + multicolor G mark; Apple stays the system control).
+    // MARK: - Account
+
     @ViewBuilder
-    private var signInButtons: some View {
-        VStack(spacing: 12) {
-            SignInWithAppleButton(.signIn) { request in
-                // Request name + email on first authorization so the backend
-                // can store a display name (email also lands in the JWT).
-                request.requestedScopes = [.fullName, .email]
-                let nonce = AppleSignInNonce.generate()
-                currentAppleNonce = nonce
-                request.nonce = nonce
-            } onCompletion: { result in
-                Task {
-                    await store.handleAppleSignIn(result, rawNonce: currentAppleNonce)
-                    currentAppleNonce = nil
-                }
-            }
-            .signInWithAppleButtonStyle(colorScheme == .dark ? .white : .black)
-            .frame(height: 48)
-            .frame(maxWidth: 375)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .accessibilityLabel("Sign in with Apple")
-
-            Button {
-                startGoogleSignIn()
-            } label: {
-                HStack(spacing: 8) {
-                    GoogleMark()
-                        .frame(width: 18, height: 18)
-                    Text(isAuthenticating ? "Opening Google…" : "Sign in with Google")
-                        .font(.subheadline.weight(.medium))
-                }
-                .frame(maxWidth: .infinity)
-                .frame(minHeight: 48)
-                .foregroundStyle(Color.primary)
-                .background {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(colorScheme == .dark
-                              ? Color(white: 0.09).opacity(0.78)
-                              : Color.white.opacity(0.65))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(
-                                    Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.1),
-                                    lineWidth: 1
-                                )
+    private var accountSection: some View {
+        if store.signedIn, let user = store.signedInUser {
+            HStack(spacing: 12) {
+                if let picture = user.picture, let url = URL(string: picture) {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().scaledToFill()
+                        default:
+                            Image(systemName: "person.crop.circle.fill")
+                                .resizable()
+                                // Concrete `Color.secondary`, never the bare
+                                // hierarchical `.secondary`: the latter resolves
+                                // against the current foreground style, which
+                                // under this app's `.tint(.blue)` renders blue.
+                                .foregroundStyle(Color.secondary)
                         }
+                    }
+                    .frame(width: 44, height: 44)
+                    .clipShape(Circle())
+                } else {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(Color.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(user.name?.isEmpty == false ? user.name! : user.email)
+                        .font(.body.weight(.semibold))
+                        .lineLimit(1)
+                    Text(user.email)
+                        .font(.caption)
+                        .foregroundStyle(Color.secondary)
+                        .lineLimit(1)
+                    Text(store.entitlementLabel)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.blue)
                 }
             }
-            .buttonStyle(.plain)
-            .disabled(isAuthenticating)
-            .accessibilityLabel("Sign in with Google")
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
 
-            HStack(spacing: 8) {
-                TextField("you@example.com", text: $magicEmail)
-                    .urlKeyboard()
-                    .neverAutocapitalized()
-                    .autocorrectionDisabled()
-                    .focused($magicEmailFocused)
-                    .submitLabel(.done)
-                    .onSubmit { magicEmailFocused = false }
-                Button {
-                    magicEmailFocused = false
-                    Task { await store.requestMagicLink(email: magicEmail) }
-                } label: {
-                    Text("Email Link")
-                        .font(.subheadline.weight(.medium))
-                }
-                .disabled(magicEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button(role: .destructive) {
+                Task { await store.signOut() }
+            } label: {
+                Label(
+                    store.isLoggingOut ? "Signing Out…" : "Sign Out",
+                    systemImage: "rectangle.portrait.and.arrow.right"
+                )
             }
+            .disabled(store.isLoggingOut)
+        } else if store.hasStoredSessionToken && !store.signedIn {
+            // A token is on the device but the bootstrap has not resolved a user
+            // (offline, or the session expired). Offer retry + clear rather than
+            // silently dropping them back to the sign-in panel, which would look
+            // like the previous sign-in never happened.
+            Text("Session could not be verified.")
+                .font(.subheadline)
+                .foregroundStyle(Color.secondary)
+            Button {
+                Task { await store.refresh() }
+            } label: {
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+            Button(role: .destructive) {
+                Task { await store.signOut() }
+            } label: {
+                Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+            }
+            .disabled(store.isLoggingOut)
+        } else {
+            // The app's ONE sign-in implementation. This tab used to carry its
+            // own Apple + Google + magic-link stack (and its own copy of the
+            // Google mark), which is how the two surfaces ended up looking and
+            // failing differently. `SignInPanel` also renders every sign-in
+            // error itself, so failures are visible wherever it appears.
+            SignInPanel()
         }
-        .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
     }
 
+    /// `SignInPanel` surfaces `store.watchlistNotice` inside itself, so the
+    /// footer only carries it for the signed-in / unverified branches. Without
+    /// this guard a failed sign-in would print the same sentence twice, one row
+    /// apart.
     @ViewBuilder
     private var accountFooter: some View {
-        if let notice = store.watchlistNotice, !notice.isEmpty {
+        if store.signedIn || store.hasStoredSessionToken,
+           let notice = store.watchlistNotice,
+           !notice.isEmpty {
             Text(notice)
-        } else if !store.signedIn {
-            Text("Sign in to manage delivery alerts and a saved watchlist.")
         }
     }
 
-    private var pushStatusCaption: String {
-        // Secondary status / data lines: sentence case per FLEET-UI-COPY.md
-        if !pushManager.isAuthorized {
-            return "notifications disabled"
-        }
-        if !store.signedIn {
-            return "sign in to register this device"
-        }
-        if pushManager.isBackendSynced {
-            return "device registered for alerts"
-        }
-        if pushManager.isRegistering {
-            return "registering device…"
-        }
-        if pushManager.lastError != nil {
-            return "registration failed — tap Sync"
-        }
-        return "permission granted — waiting for sync"
-    }
+    // MARK: - Premium
 
-    private var pushStatusColor: Color {
-        if !pushManager.isAuthorized { return .secondary }
-        if pushManager.isBackendSynced { return .green }
-        if pushManager.lastError != nil { return .red }
-        return .secondary
-    }
-
-    private func startGoogleSignIn() {
-        guard !isAuthenticating else { return }
-
-        // Honor the configured API base URL (CONGRESS_TRADE_API_BASE_URL) so
-        // non-prod backends get the OAuth round trip too.
-        var components = URLComponents(
-            url: store.api.origin.appendingPathComponent("auth/google/start"),
-            resolvingAgainstBaseURL: false
-        )
-        components?.queryItems = [URLQueryItem(name: "client", value: "ios")]
-        guard let authURL = components?.url else { return }
-        isAuthenticating = true
-        let scheme = "congresstrade"
-
-        let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: scheme) { callbackURL, error in
-            isAuthenticating = false
-            if let error {
-                if let authError = error as? ASWebAuthenticationSessionError,
-                   authError.code == .canceledLogin {
-                    return
+    /// Premium entry point, intentionally NOT gated on being signed in:
+    /// `PremiumInfoSheet` is readable signed out by design (the owner asked for
+    /// a one-screen explanation that is easy to walk away from) and it owns the
+    /// sign-in / subscribe branching internally. That is why this tab no longer
+    /// carries its own price string, its own `SubscribeView` presentation, or a
+    /// second "subscribe on the web" link — there is one Premium explanation in
+    /// the app and this is a door to it.
+    @ViewBuilder
+    private var premiumRow: some View {
+        if store.isPremium {
+            Button {
+                Task { await openManageSubscription() }
+            } label: {
+                HStack {
+                    Label("Manage Subscription", systemImage: "creditcard")
+                    if isOpeningManageSubscription {
+                        Spacer()
+                        ProgressView()
+                    }
                 }
-                store.setAccountNotice("Google sign-in failed: \(error.localizedDescription)")
-                return
             }
-            guard let callbackURL else {
-                store.setAccountNotice("Google sign-in did not return a session.")
-                return
-            }
-
-            // Expected URL: congresstrade://auth?token=XYZ
-            guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
-                  let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
-                  !token.isEmpty else {
-                store.setAccountNotice("Google sign-in did not return a usable session token.")
-                return
-            }
-
-            _ = store.saveSessionToken(token)
-        }
-
-        session.presentationContextProvider = AuthPresentationContext.shared
-        session.start()
-    }
-}
-
-// MARK: - Google mark (ST LoginView parity — multicolor G ring)
-
-/// Multicolor "G" mark matching Socratic.Trade's `LoginView.GoogleMark` so the
-/// Google button sits next to Apple with comparable visual weight.
-private struct GoogleMark: View {
-    var body: some View {
-        Canvas { context, size in
-            let blue = Color(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255)
-            let green = Color(red: 0x34 / 255, green: 0xA8 / 255, blue: 0x53 / 255)
-            let yellow = Color(red: 0xFB / 255, green: 0xBC / 255, blue: 0x05 / 255)
-            let red = Color(red: 0xEA / 255, green: 0x43 / 255, blue: 0x35 / 255)
-            let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            let radius = size.width * 0.42
-            let lw = size.width * 0.18
-
-            func arc(_ start: Double, _ end: Double, _ color: Color) {
-                var p = Path()
-                p.addArc(
-                    center: center,
-                    radius: radius,
-                    startAngle: .degrees(start),
-                    endAngle: .degrees(end),
-                    clockwise: false
-                )
-                context.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: lw, lineCap: .butt))
-            }
-            arc(-35, 20, blue)
-            arc(20, 120, green)
-            arc(120, 220, yellow)
-            arc(220, 325, red)
-            context.fill(
-                Path(CGRect(
-                    x: size.width * 0.48,
-                    y: size.height * 0.42,
-                    width: size.width * 0.42,
-                    height: size.width * 0.16
-                )),
-                with: .color(blue)
+            .disabled(isOpeningManageSubscription)
+            .accessibilityHint(
+                store.entitlementSource == "apple"
+                    ? "Opens the App Store subscriptions page"
+                    : "Opens the Congress.Trade billing portal"
             )
+            if let manageSubscriptionError {
+                Text(manageSubscriptionError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } else {
+            Button {
+                showPremiumInfo = true
+            } label: {
+                Label("Upgrade to Premium", systemImage: "sparkles")
+            }
         }
-        .accessibilityHidden(true)
+    }
+
+    /// Routes by `entitlementSource` — an Apple subscriber must land on the App
+    /// Store subscriptions page and a Stripe subscriber on the billing portal;
+    /// sending either to the other's surface is a dead end. See
+    /// `Store/ManageSubscription.swift`, which also supplies the user-ready
+    /// failure copy. A failure renders inline instead of opening a dead link.
+    private func openManageSubscription() async {
+        manageSubscriptionError = nil
+        isOpeningManageSubscription = true
+        defer { isOpeningManageSubscription = false }
+        switch await store.resolveManageSubscriptionURL() {
+        case .url(let url):
+            openURL(url)
+        case .failed(let message):
+            manageSubscriptionError = message
+        }
     }
 }
