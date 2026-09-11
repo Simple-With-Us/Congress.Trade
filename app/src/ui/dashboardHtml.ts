@@ -3926,7 +3926,13 @@ ${speedProofSectionHtml(true)}
         <tbody id="healthBody"></tbody>
       </table>
       <div id="sourceTimelineSection" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
-        <h4 style="margin-bottom:6px;font-size:14px;font-weight:600">Source Ingestion & Error Timeline (Past 24 Hours)</h4>
+        <div class="row-flex" style="justify-content:space-between;align-items:center;margin-bottom:6px">
+          <h4 id="sourceTimelineHeading" style="margin:0;font-size:14px;font-weight:600">Source Ingestion &amp; Error Timeline (Past Week)</h4>
+          <div class="row-flex" style="gap:6px">
+            <button class="btn ghost sm on" id="sourceHealthWindowWeek" onclick="setSourceHealthWindow('7d')">Past Week</button>
+            <button class="btn ghost sm" id="sourceHealthWindow24h" onclick="setSourceHealthWindow('24h')">Past 24 Hours</button>
+          </div>
+        </div>
         <p class="sub" style="margin-bottom:14px">Live timeline graphic and numbers tracking poll attempts, error rates, and failure frequencies by source site.</p>
         <div id="sourceStatsGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:16px"></div>
         <div id="sourceTimelineGraphic" style="margin-bottom:16px;background:var(--bg-card);padding:14px;border:1px solid var(--border);border-radius:6px"></div>
@@ -8131,14 +8137,27 @@ function runOgeBackfill() {
 }
 
 /* ============================ SOURCE HEALTH ============================ */
-function loadHealth() {
-  // API HOOK: GET /api/admin/sources/health
-  return fetch('/api/admin/sources/health', { headers: adminHeaders() })
+var SOURCE_HEALTH_WINDOW = '7d';
+
+function setSourceHealthWindow(win) {
+  SOURCE_HEALTH_WINDOW = win === '24h' ? '24h' : '7d';
+  var btnWeek = el('sourceHealthWindowWeek');
+  var btn24h = el('sourceHealthWindow24h');
+  if (btnWeek) btnWeek.classList.toggle('on', SOURCE_HEALTH_WINDOW === '7d');
+  if (btn24h) btn24h.classList.toggle('on', SOURCE_HEALTH_WINDOW === '24h');
+  loadHealth(SOURCE_HEALTH_WINDOW);
+}
+
+function loadHealth(win) {
+  var activeWin = win || SOURCE_HEALTH_WINDOW || '7d';
+  // API HOOK: GET /api/admin/sources/health?window=
+  return fetch('/api/admin/sources/health?window=' + encodeURIComponent(activeWin), { headers: adminHeaders() })
     .then(okOrThrow)
     .then(function (data) {
       var sources = data.sources || [];
       var timeline = data.timeline || [];
       var recentFailures = data.recentFailures || [];
+      var resolvedWin = data.window || activeWin;
       var body = el('healthBody');
       var resetMsg = el('latencyResetMsg');
       if (resetMsg) resetMsg.textContent = data.latencyResetAt ? ('Latency reset: ' + dateTimeText(data.latencyResetAt)) : '';
@@ -8163,20 +8182,25 @@ function loadHealth() {
         '</tr>';
       }).join('');
 
-      renderSourceHealthTimeline(sources, timeline, recentFailures);
+      renderSourceHealthTimeline(sources, timeline, recentFailures, resolvedWin);
     })
     .catch(function (e) {
       el('healthBody').innerHTML = stateRow(9, isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load source health: ' + e.message));
     });
 }
 
-function renderSourceHealthTimeline(sources, timeline, recentFailures) {
+function renderSourceHealthTimeline(sources, timeline, recentFailures, windowMode) {
+  var is24h = windowMode === '24h';
+  var heading = el('sourceTimelineHeading');
+  if (heading) {
+    heading.textContent = is24h ? 'Source Ingestion & Error Timeline (Past 24 Hours)' : 'Source Ingestion & Error Timeline (Past Week)';
+  }
   var grid = el('sourceStatsGrid');
   var graphic = el('sourceTimelineGraphic');
   var errorsEl = el('sourceRecentErrors');
   if (!grid || !graphic) return;
 
-  // 1. Group 24-hour statistics per source
+  // 1. Group statistics per source
   var statsBySource = {};
   var knownSources = ['house', 'senate', 'executive'];
   knownSources.forEach(function (src) {
@@ -8192,56 +8216,73 @@ function renderSourceHealthTimeline(sources, timeline, recentFailures) {
     statsBySource[src].newFilings += (row.new_filings || 0);
   });
 
+  var badgeLabel = is24h ? ' (24h)' : ' (7d)';
   grid.innerHTML = Object.keys(statsBySource).map(function (src) {
     var st = statsBySource[src];
     var errRate = st.total > 0 ? ((st.failures / st.total) * 100).toFixed(1) : '0.0';
     var color = st.failures > 0 ? (Number(errRate) > 10 ? 'var(--sell)' : '#f59e0b') : 'var(--buy)';
     return '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:12px 14px">' +
-      '<div style="font-size:12px;font-weight:600;text-transform:uppercase;color:var(--text-muted);margin-bottom:4px">' + esc(chamberLabel(src)) + ' (24h)</div>' +
+      '<div style="font-size:12px;font-weight:600;text-transform:uppercase;color:var(--text-muted);margin-bottom:4px">' + esc(chamberLabel(src)) + badgeLabel + '</div>' +
       '<div style="font-size:18px;font-weight:700;color:' + color + '">' + st.failures + ' <span style="font-size:13px;font-weight:400;color:var(--text-muted)">errors / ' + st.total + ' polls (' + errRate + '%)</span></div>' +
       '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">Successes: ' + st.successes + ' · Filings Discovered: ' + st.newFilings + '</div>' +
     '</div>';
   }).join('');
 
-  // 2. Build 24-Hour Timeline Bar Chart
+  // 2. Build Timeline Bar Chart (Daily for 7d, Hourly for 24h)
   var now = new Date();
-  var hours = [];
-  for (var i = 23; i >= 0; i--) {
-    var d = new Date(now.getTime() - i * 3600_000);
-    var hourKey = d.toISOString().slice(0, 13) + ':00:00.000Z';
-    var hourLabel = d.getHours() + ':00';
-    hours.push({ key: hourKey, label: hourLabel });
+  var slots = [];
+  var dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  if (is24h) {
+    for (var i = 23; i >= 0; i--) {
+      var d = new Date(now.getTime() - i * 3600_000);
+      var hourKey = d.toISOString().slice(0, 13) + ':00:00.000Z';
+      var hourLabel = d.getHours() + ':00';
+      slots.push({ key: hourKey, label: hourLabel, fullLabel: hourLabel + ' UTC' });
+    }
+  } else {
+    for (var j = 6; j >= 0; j--) {
+      var dt = new Date(now.getTime() - j * 86400_000);
+      var dayKey = dt.toISOString().slice(0, 10);
+      var dayLabel = dayNames[dt.getDay()] + ' ' + (dt.getMonth() + 1) + '/' + dt.getDate();
+      slots.push({ key: dayKey, label: dayLabel, fullLabel: dayLabel });
+    }
   }
 
-  var hourlyMap = {};
-  hours.forEach(function (h) { hourlyMap[h.key] = { total: 0, failures: 0, houseFail: 0, senateFail: 0, ogeFail: 0 }; });
+  var slotMap = {};
+  slots.forEach(function (s) { slotMap[s.key] = { total: 0, failures: 0 }; });
 
   timeline.forEach(function (row) {
-    var hk = row.hour;
-    if (hourlyMap[hk]) {
-      hourlyMap[hk].total += (row.total || 0);
-      hourlyMap[hk].failures += (row.failures || 0);
-      if (row.source === 'house') hourlyMap[hk].houseFail += (row.failures || 0);
-      if (row.source === 'senate') hourlyMap[hk].senateFail += (row.failures || 0);
-      if (row.source === 'executive' || row.source === 'oge') hourlyMap[hk].ogeFail += (row.failures || 0);
+    var k = row.hour;
+    if (slotMap[k]) {
+      slotMap[k].total += (row.total || 0);
+      slotMap[k].failures += (row.failures || 0);
     }
   });
 
-  var barHtml = hours.map(function (h) {
-    var hm = hourlyMap[h.key] || { total: 0, failures: 0 };
-    var hasFail = hm.failures > 0;
-    var barColor = hasFail ? 'var(--sell)' : (hm.total > 0 ? 'var(--buy)' : 'var(--border)');
-    var barHeight = Math.min(Math.max(hm.total * 3, 12), 48);
-    var tip = h.label + ' UTC: ' + hm.total + ' polls (' + hm.failures + ' errors)';
+  var maxTotal = 1;
+  slots.forEach(function (s) {
+    var sm = slotMap[s.key] || { total: 0 };
+    if (sm.total > maxTotal) maxTotal = sm.total;
+  });
+
+  var barMaxWidth = is24h ? '14px' : '36px';
+  var barHtml = slots.map(function (s) {
+    var sm = slotMap[s.key] || { total: 0, failures: 0 };
+    var hasFail = sm.failures > 0;
+    var barColor = hasFail ? 'var(--sell)' : (sm.total > 0 ? 'var(--buy)' : 'var(--border)');
+    var scaledHeight = Math.round((sm.total / maxTotal) * 44);
+    var barHeight = Math.min(Math.max(scaledHeight, 10), 48);
+    var tip = s.fullLabel + ': ' + sm.total + ' polls (' + sm.failures + ' errors)';
 
     return '<div style="flex:1;display:flex;flex-direction:column;align-items:center" title="' + esc(tip) + '">' +
       '<div style="font-size:10px;color:var(--text-muted);margin-bottom:4px">' + (hasFail ? '⚠️' : '') + '</div>' +
-      '<div style="width:100%;max-width:14px;height:' + barHeight + 'px;background:' + barColor + ';border-radius:2px"></div>' +
-      '<div style="font-size:9px;color:var(--text-muted);margin-top:4px;white-space:nowrap">' + h.label + '</div>' +
+      '<div style="width:100%;max-width:' + barMaxWidth + ';height:' + barHeight + 'px;background:' + barColor + ';border-radius:2px"></div>' +
+      '<div style="font-size:9px;color:var(--text-muted);margin-top:4px;white-space:nowrap">' + s.label + '</div>' +
     '</div>';
   }).join('');
 
-  graphic.innerHTML = '<div style="font-size:12px;font-weight:600;margin-bottom:10px">Hourly Ingestion Health & Error Timeline (24 Hours)</div>' +
+  var timelineTitle = is24h ? 'Hourly Ingestion Health & Error Timeline (Past 24 Hours)' : 'Daily Ingestion Health & Error Timeline (Past Week)';
+  graphic.innerHTML = '<div style="font-size:12px;font-weight:600;margin-bottom:10px">' + timelineTitle + '</div>' +
     '<div style="display:flex;align-items:flex-end;gap:4px;height:70px;padding-top:10px;border-bottom:1px solid var(--border)">' + barHtml + '</div>' +
     '<div style="display:flex;gap:16px;margin-top:8px;font-size:11px;color:var(--text-muted)">' +
       '<span><span style="display:inline-block;width:10px;height:10px;background:var(--buy);border-radius:2px;margin-right:4px"></span> 100% Successful Polls</span>' +
@@ -8249,11 +8290,14 @@ function renderSourceHealthTimeline(sources, timeline, recentFailures) {
     '</div>';
 
   // 3. Render Recent Failures Log
-  if (recentFailures.length > 0) {
-    errorsEl.innerHTML = '<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--sell)">Recent Ingestion Failures & Errors</div>' +
+  var failureLimit = is24h ? 10 : 25;
+  var displayFailures = recentFailures.slice(0, failureLimit);
+  if (displayFailures.length > 0) {
+    var errorHeading = is24h ? 'Recent Ingestion Failures & Errors (Past 24 Hours)' : 'Recent Ingestion Failures & Errors (Past Week)';
+    errorsEl.innerHTML = '<div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--sell)">' + errorHeading + '</div>' +
       '<table style="width:100%;font-size:12px;border-collapse:collapse">' +
         '<thead><tr style="text-align:left;color:var(--text-muted)"><th>Timestamp</th><th>Source</th><th>Error Message</th></tr></thead>' +
-        '<tbody>' + recentFailures.slice(0, 5).map(function (rf) {
+        '<tbody>' + displayFailures.map(function (rf) {
           return '<tr style="border-top:1px solid var(--border)">' +
             '<td style="padding:6px 0" class="muted">' + esc(dateTimeText(rf.attempted_at)) + '</td>' +
             '<td style="padding:6px 0"><strong>' + esc(chamberLabel(rf.source)) + '</strong></td>' +
@@ -8262,7 +8306,8 @@ function renderSourceHealthTimeline(sources, timeline, recentFailures) {
         }).join('') + '</tbody>' +
       '</table>';
   } else {
-    errorsEl.innerHTML = '<div style="font-size:12px;color:var(--buy)">✓ No ingestion failures recorded in the recent log window.</div>';
+    var emptyMsg = is24h ? '✓ No ingestion failures recorded in the past 24 hours.' : '✓ No ingestion failures recorded in the past week.';
+    errorsEl.innerHTML = '<div style="font-size:12px;color:var(--buy)">' + emptyMsg + '</div>';
   }
 }
 
@@ -8440,8 +8485,12 @@ function loadPremiumRoster() {
           body.innerHTML = stateRow(7, 'No Premium members yet.');
         } else {
           body.innerHTML = rows.map(function (m) {
+            var actionHtml = '';
+            if (m.stripeMatch === 'No Local Account' && m.stripeSubscriptionId) {
+              actionHtml = ' <button class="btn ghost sm" style="padding:2px 6px;font-size:10px;margin-left:6px" onclick="linkRosterMember(&quot;' + esc(m.stripeSubscriptionId) + '&quot;)">Link User</button>';
+            }
             return '<tr class="row">' +
-              '<td>' + esc(m.email || '—') + '</td>' +
+              '<td>' + esc(m.email || '—') + actionHtml + '</td>' +
               '<td class="muted">' + esc(m.plan || '—') + '</td>' +
               '<td>' + esc(m.billing || '—') + '</td>' +
               '<td class="muted">' + esc(m.source || '—') + '</td>' +
@@ -8457,6 +8506,28 @@ function loadPremiumRoster() {
       var msg = isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load Premium members: ' + e.message);
       if (cards) cards.innerHTML = '<div class="state">' + esc(msg) + '</div>';
       if (body) body.innerHTML = stateRow(7, msg);
+    });
+}
+
+function linkRosterMember(subId) {
+  var target = prompt('Enter user email or userId to link this Stripe subscription (' + subId + ') to:');
+  if (!target || !target.trim()) return;
+  var isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target.trim());
+  var body = { stripeSubscriptionId: subId };
+  if (isUuid) body.userId = target.trim();
+  else body.email = target.trim();
+  fetch('/api/admin/premium-roster/link', {
+    method: 'POST',
+    headers: adminHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify(body)
+  })
+    .then(okOrThrow)
+    .then(function () {
+      toast('Subscription linked successfully.');
+      loadPremiumRoster();
+    })
+    .catch(function (e) {
+      alert('Failed to link subscription: ' + e.message);
     });
 }
 

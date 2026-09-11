@@ -65,7 +65,7 @@ function isoFromUnix(sec: number | null | undefined): string | null {
   return typeof sec === 'number' && Number.isFinite(sec) ? new Date(sec * 1000).toISOString() : null;
 }
 
-function priceIdFromItem(price: string | { id?: string } | undefined): string | null {
+export function priceIdFromItem(price: string | { id?: string } | undefined): string | null {
   if (typeof price === 'string' && price.length > 0) return price;
   if (price && typeof price === 'object' && typeof price.id === 'string' && price.id.length > 0) {
     return price.id;

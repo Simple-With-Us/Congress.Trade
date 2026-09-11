@@ -7,21 +7,25 @@
  * `trialing` row when Stripe already shows `active`.
  */
 
-import type { Env } from '../shared/types.ts';
-import { all } from '../shared/db.ts';
+import type { Env, User } from '../shared/types.ts';
+import { all, run } from '../shared/db.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { isAppleSandboxEnvironment } from '../billing/apple.ts';
 import {
   applyRetrievedStripeSubscription,
+  planForPriceAsync,
+  priceIdFromItem,
 } from '../billing/subscription.ts';
 import {
   listStripeSubscriptions,
   retrieveStripeSubscription,
+  updateStripeSubscription,
   stripeEnvironmentFromKey,
   stripeEnvironmentFromLivemode,
   stripeObjectId,
   type StripeSubscriptionObject,
 } from '../billing/stripe.ts';
+import { getUserByEmail, getUserById } from '../auth/users.ts';
 
 export type PremiumPlanLabel = 'Monthly' | 'Annual' | '—';
 export type PremiumBillingLabel = 'Trial' | 'Paid' | 'Past Due' | 'Grace Period' | 'Ended';
@@ -256,7 +260,30 @@ export async function buildPremiumRoster(env: Env): Promise<PremiumRosterRespons
   const seenStripeIds = new Set<string>();
 
   for (const row of stripeRows) {
-    const subId = row.stripe_subscription_id;
+    let subId = row.stripe_subscription_id;
+    if (!subId && stripeKey && stripeReconcile.ok) {
+      for (const [candId, candidate] of listed) {
+        if (seenStripeIds.has(candId)) continue;
+        const cEmail = customerEmail(candidate.customer);
+        const matchesUser = candidate.metadata?.userId === row.id;
+        const matchesEmail = Boolean(cEmail && cEmail.toLowerCase() === row.email.toLowerCase());
+        if (matchesUser || matchesEmail) {
+          const candCustId = customerIdOf(candidate);
+          const linkRes = await linkStripeSubscriptionToUser(env, {
+            userId: row.id,
+            stripeSubscriptionId: candId,
+            stripeCustomerId: candCustId || undefined,
+          });
+          if (linkRes.ok) {
+            subId = candId;
+            row.stripe_subscription_id = candId;
+            if (candCustId) row.stripe_customer_id = candCustId;
+            row.subscription_status = candidate.status || row.subscription_status;
+            break;
+          }
+        }
+      }
+    }
     if (subId) seenStripeIds.add(subId);
     let live: StripeSubscriptionObject | null = null;
     let reached = stripeReconcile.ok;
@@ -344,8 +371,8 @@ export async function buildPremiumRoster(env: Env): Promise<PremiumRosterRespons
       const customerId = customerIdOf(live);
       members.push({
         userId: live.metadata?.userId ?? null,
-        email: customerEmail(live) || 'Stripe Customer (No Local Account)',
-        name: customerName(live),
+        email: customerEmail(live.customer) || 'Stripe Customer (No Local Account)',
+        name: customerName(live.customer),
         plan: planLabel(null),
         billing: stripeBilling(status),
         source: 'Stripe',
@@ -404,4 +431,70 @@ export async function localPremiumCounts(env: Env): Promise<{
     stripeUsers: stripeRows.length,
     appleUsers: appleRows.length,
   };
+}
+
+/**
+ * Link an orphaned or unlinked Stripe subscription to a local user account.
+ * Updates local DB columns (stripe_subscription_id, stripe_customer_id,
+ * subscription_status, plan, current_period_end) and updates Stripe metadata.
+ */
+export async function linkStripeSubscriptionToUser(
+  env: Env,
+  args: {
+    userId?: string;
+    email?: string;
+    stripeSubscriptionId: string;
+    stripeCustomerId?: string;
+  },
+): Promise<{ ok: boolean; user?: User; error?: string }> {
+  if (!args.stripeSubscriptionId) {
+    return { ok: false, error: 'stripeSubscriptionId is required' };
+  }
+  let user: User | null = null;
+  if (args.userId) {
+    user = await getUserById(env, args.userId);
+  } else if (args.email) {
+    user = await getUserByEmail(env, args.email);
+  }
+  if (!user) {
+    return { ok: false, error: `User not found (${args.userId || args.email || 'no identifier'})` };
+  }
+
+  let live: StripeSubscriptionObject | null = null;
+  try {
+    live = await retrieveStripeSubscription(env, args.stripeSubscriptionId);
+  } catch (err) {
+    console.warn('retrieveStripeSubscription failed on link:', (err as Error).message);
+  }
+
+  const customerId = args.stripeCustomerId || (live ? customerIdOf(live) : null) || user.stripeCustomerId;
+  const status = live?.status || 'active';
+  const priceId = priceIdFromItem(live?.items?.data?.[0]?.price);
+  const plan = (await planForPriceAsync(env, priceId)) || user.plan || 'monthly';
+  const periodEnd = live?.items?.data?.[0]?.current_period_end
+    ? new Date((live.items.data[0].current_period_end as number) * 1000).toISOString()
+    : (user.currentPeriodEnd || null);
+
+  await run(
+    env.DB,
+    `UPDATE users
+        SET stripe_customer_id = COALESCE(?, stripe_customer_id),
+            stripe_subscription_id = ?,
+            subscription_status = ?,
+            plan = COALESCE(?, plan, 'monthly'),
+            current_period_end = COALESCE(?, current_period_end)
+      WHERE id = ?`,
+    [customerId, args.stripeSubscriptionId, status, plan, periodEnd, user.id],
+  );
+
+  try {
+    await updateStripeSubscription(env, args.stripeSubscriptionId, {
+      metadata: { userId: user.id },
+    });
+  } catch (err) {
+    console.warn('Failed to update Stripe metadata on link:', (err as Error).message);
+  }
+
+  const updatedUser = await getUserById(env, user.id);
+  return { ok: true, user: updatedUser ?? user };
 }

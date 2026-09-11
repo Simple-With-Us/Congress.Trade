@@ -171,7 +171,22 @@ export function retrieveStripeSubscription(
 ): Promise<StripeSubscriptionObject> {
   return stripeGet<StripeSubscriptionObject>(
     env,
+    `/subscriptions/${encodeURIComponent(subscriptionId)}?expand[]=customer`,
+  );
+}
+
+/** Update subscription metadata (e.g. to link a userId). */
+export function updateStripeSubscription(
+  env: Env,
+  subscriptionId: string,
+  params: Record<string, unknown>,
+  idempotencyKey?: string,
+): Promise<StripeSubscriptionObject> {
+  return stripePost<StripeSubscriptionObject>(
+    env,
     `/subscriptions/${encodeURIComponent(subscriptionId)}`,
+    params,
+    idempotencyKey || `sub_up_${subscriptionId}_${Date.now()}`,
   );
 }
 

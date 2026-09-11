@@ -106,7 +106,7 @@ import { fetchLlamaParseCredits } from '../extraction/llamaParseCredits.ts';
 import { mapFiling } from '../delivery/rows.ts';
 import { verifyAccessJwt, certsUrl } from './access.ts';
 import { adminRuntimeConfig } from './identity.ts';
-import { buildPremiumRoster, localPremiumCounts } from './premiumRoster.ts';
+import { buildPremiumRoster, linkStripeSubscriptionToUser, localPremiumCounts } from './premiumRoster.ts';
 import { getLogoDisplay, setLogoDisplay } from '../shared/settings.ts';
 import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
@@ -3558,6 +3558,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return ia - ib;
     });
 
+    const windowParam = c.req.query('window');
+    const window = windowParam === '24h' ? '24h' : '7d';
+    const is24h = window === '24h';
+    const timeModifier = is24h ? '-24 hours' : '-7 days';
+
     const timeline = await optionalAll<{
       source: string;
       hour: string;
@@ -3567,17 +3572,29 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       new_filings: number;
     }>(
       c.env,
-      `SELECT 
-         CASE WHEN lower(source) IN ('oge', 'exec') THEN 'executive' ELSE source END AS source,
-         strftime('%Y-%m-%dT%H:00:00.000Z', attempted_at) AS hour,
-         COUNT(*) AS total,
-         SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failures,
-         SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes,
-         COALESCE(SUM(new_count), 0) AS new_filings
-        FROM source_attempts
-       WHERE attempted_at >= datetime('now', '-24 hours')
-       GROUP BY 1, hour
-       ORDER BY hour ASC`,
+      is24h
+        ? `SELECT 
+             CASE WHEN lower(source) IN ('oge', 'exec') THEN 'executive' ELSE source END AS source,
+             strftime('%Y-%m-%dT%H:00:00.000Z', attempted_at) AS hour,
+             COUNT(*) AS total,
+             SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failures,
+             SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes,
+             COALESCE(SUM(new_count), 0) AS new_filings
+            FROM source_attempts
+           WHERE attempted_at >= datetime('now', '-24 hours')
+           GROUP BY 1, hour
+           ORDER BY hour ASC`
+        : `SELECT 
+             CASE WHEN lower(source) IN ('oge', 'exec') THEN 'executive' ELSE source END AS source,
+             strftime('%Y-%m-%d', attempted_at) AS hour,
+             COUNT(*) AS total,
+             SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failures,
+             SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes,
+             COALESCE(SUM(new_count), 0) AS new_filings
+            FROM source_attempts
+           WHERE attempted_at >= datetime('now', '-7 days')
+           GROUP BY 1, hour
+           ORDER BY hour ASC`,
     );
 
     const recentFailures = await optionalAll<{
@@ -3592,11 +3609,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
               attempted_at, error
          FROM source_attempts
         WHERE outcome = 'failure'
+          AND attempted_at >= datetime('now', ?)
         ORDER BY attempted_at DESC, id DESC
-        LIMIT 10`,
+        LIMIT ?`,
+      [timeModifier, is24h ? 25 : 50],
     );
 
-    return c.json({ sources, count: sources.length, timeline, recentFailures, latencyResetAt });
+    return c.json({ sources, count: sources.length, timeline, recentFailures, latencyResetAt, window });
   });
 
   // --- POST /sources/health/latency-reset ---------------------------------
@@ -4889,6 +4908,34 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // local `trialing` when Stripe already shows `active`.
   r.get('/premium-roster', async (c) => {
     return c.json(await buildPremiumRoster(c.env));
+  });
+
+  // --- POST /premium-roster/link -------------------------------------------
+  // Admin link an unlinked or mismatched Stripe subscription to a local user.
+  r.post('/premium-roster/link', async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { userId, email, stripeSubscriptionId, stripeCustomerId } = body as {
+      userId?: string;
+      email?: string;
+      stripeSubscriptionId?: string;
+      stripeCustomerId?: string;
+    };
+    if (!stripeSubscriptionId) {
+      return c.json({ ok: false, error: 'Missing stripeSubscriptionId' }, 400);
+    }
+    if (!userId && !email) {
+      return c.json({ ok: false, error: 'Missing userId or email to link to' }, 400);
+    }
+    const result = await linkStripeSubscriptionToUser(c.env, {
+      userId,
+      email,
+      stripeSubscriptionId,
+      stripeCustomerId,
+    });
+    if (!result.ok) {
+      return c.json({ ok: false, error: result.error || 'Failed to link subscription' }, 400);
+    }
+    return c.json(result);
   });
 
   // --- POST /diagnostics/secrets/refresh ----------------------------------
