@@ -91,7 +91,7 @@ function speedProofSectionHtml(admin: boolean): string {
 }
 
 export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
-<html lang="en" data-view="trends">
+<html lang="en" data-view="trades">
 <head>
 %GA_SCRIPT%
 <meta charset="utf-8" />
