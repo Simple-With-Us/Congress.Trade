@@ -32,7 +32,11 @@ import {
 import { logProbeCadence } from './probeCadenceLog.ts';
 import { ALL_CHAMBERS, previousSuccessfulProbeAt, recordProbeRun } from './probeRunLog.ts';
 import { scheduleCtPublishSnapshot } from './latencyPriceSnapshots.ts';
-import { closeProviderMissingStubIfOfficialPersisted, findOfficialCounterpartDocIdForObservation } from './providerMissingStubClose.ts';
+import {
+  closeProviderMissingStubIfOfficialPersisted,
+  enqueueOfficialSenateFromProviderObservation,
+  findOfficialCounterpartDocIdForObservation,
+} from './providerMissingStubClose.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 type Chamber = 'house' | 'senate' | 'executive';
@@ -2195,6 +2199,10 @@ async function routeProviderOnlyObservationsToReview(
     const docId = providerOnlyDocId(row);
     const closeResult = await closeProviderMissingStubIfOfficialPersisted(env, row, docId, nowIso);
     if (closeResult.officialDocId) continue;
+
+    // Official Senate PTR URL/UUID from the provider feed: enqueue S-{uuid}
+    // and skip the synthetic review stub.  House PDF ids stay on the stub path.
+    if (await enqueueOfficialSenateFromProviderObservation(env, row, nowIso)) continue;
 
     if (await findOfficialCounterpartDocIdForObservation(env.DB, row)) continue;
 

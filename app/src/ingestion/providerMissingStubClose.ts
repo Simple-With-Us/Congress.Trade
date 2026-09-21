@@ -14,8 +14,10 @@ import { batch, get } from '../shared/db.ts';
 import { recordIngestionDecision } from '../shared/ingestionDecisions.ts';
 import { PIPELINE_TX_SOURCES_SQL } from '../extraction/sourceSupersede.ts';
 import type { DisclosureProviderRow } from './tradeLatency.ts';
+import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
 
 const REJECT_PREFIX = 'rejected: duplicate — official filing';
+const SENATE_PTR_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface ProviderMissingStubCloseResult {
   closed: boolean;
@@ -224,4 +226,66 @@ export async function findOfficialCounterpartDocIdForObservation(
   row: DisclosureProviderRow,
 ): Promise<string | null> {
   return findOfficialCounterpartDocId(db, row);
+}
+
+/** Senate eFD report UUID → official `S-{uuid}` doc id, or null when the key is not a PTR id. */
+export function senateOfficialDocIdFromProvider(row: DisclosureProviderRow): string | null {
+  if (row.chamber !== 'senate') return null;
+  const key = row.providerKey.trim().toLowerCase();
+  if (!SENATE_PTR_UUID.test(key)) return null;
+  return `S-${key}`;
+}
+
+export function senateOfficialSourceUrlFromProvider(row: DisclosureProviderRow): string | null {
+  const docId = senateOfficialDocIdFromProvider(row);
+  if (!docId) return null;
+  const fromRow = (row.sourceUrl || '').trim();
+  if (/efdsearch\.senate\.gov\/search\/view\/ptr\//i.test(fromRow)) {
+    return fromRow.endsWith('/') ? fromRow : `${fromRow}/`;
+  }
+  const key = row.providerKey.trim().toLowerCase();
+  return `https://efdsearch.senate.gov/search/view/ptr/${key}/`;
+}
+
+/**
+ * When FMP (or another provider) already carries the official Senate PTR view
+ * URL / UUID, insert `S-{uuid}` and hand it to the ingest outbox instead of
+ * opening a synthetic provider-missing review stub.  The official senateHtml
+ * path then publishes; a later provider pass still auto-rejects any leftover
+ * stub once that filing is persisted (#2221).
+ */
+export async function enqueueOfficialSenateFromProviderObservation(
+  env: Env,
+  row: DisclosureProviderRow,
+  nowIso: string,
+): Promise<string | null> {
+  const docId = senateOfficialDocIdFromProvider(row);
+  const sourceUrl = senateOfficialSourceUrlFromProvider(row);
+  if (!docId || !sourceUrl) return null;
+
+  const existing = await findOfficialCounterpartDocId(env.DB, row);
+  if (existing) return existing;
+
+  await batch(env.DB, [
+    [
+      `INSERT OR IGNORE INTO filings
+         (doc_id, chamber, filer_id, filing_type, filed_date, source_url,
+          raw_object_key, ingest_status, doc_kind, extractor, model_version,
+          confidence, first_seen_at, source_updated_at, error)
+       VALUES (?, 'senate', NULL, 'P', ?, ?, NULL, 'new', 'senate_html', NULL, NULL,
+               NULL, ?, NULL, NULL)`,
+      [docId, row.filedDate, sourceUrl, nowIso],
+    ],
+    ingestionOutboxInsertForDoc(docId, nowIso),
+  ]);
+  try {
+    await enqueueIngestionOutboxNow(env, docId);
+  } catch (err) {
+    console.error(
+      'provider-missing official enqueue failed',
+      docId,
+      (err as Error).message,
+    );
+  }
+  return (await findOfficialCounterpartDocId(env.DB, row)) ?? docId;
 }

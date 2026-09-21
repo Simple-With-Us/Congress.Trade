@@ -1,5 +1,9 @@
 # Current Handoff
 
+## 2026-09-16 BF-PUBLISHER — FMP Senate PTR official enqueue
+
+Live queue empty.  Angus King FMP stub closed as duplicate after official `S-e67c6e56-…` persisted.  Pipeline now enqueues `S-{uuid}` from provider PTR view ids instead of parking `provider-missing-*`.  Branch `publisher/fmp-senate-official-enqueue`.  Rollout: `docs/rollouts/2026-09-16-fmp-senate-official-enqueue.md`.
+
 ## 2026-09-13 FX — drop hardcoded ADMIN_TOKEN scratch script
 
 Deleted `filed_date_week_latency.ts` from git (hardcoded bearer to `/api/admin/debug-sql`).  Owner must rotate `ADMIN_TOKEN`.  Boards `010936c8` `ab7cf3be`.  Branch `fx/drop-admin-token-script`.

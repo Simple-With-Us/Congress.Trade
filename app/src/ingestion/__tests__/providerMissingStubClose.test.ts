@@ -6,7 +6,9 @@ import type { Env } from '../../shared/types.ts';
 import type { DisclosureProviderRow } from '../tradeLatency.ts';
 import {
   closeProviderMissingStubIfOfficialPersisted,
+  enqueueOfficialSenateFromProviderObservation,
   findPersistedOfficialCounterpartForObservation,
+  senateOfficialDocIdFromProvider,
 } from '../providerMissingStubClose.ts';
 
 const SENATE_UUID = '51455bcd-4966-4e77-b481-09897ada81ae';
@@ -34,7 +36,10 @@ describe('providerMissingStubClose', () => {
   let d1: ReturnType<typeof d1Database>;
 
   function makeEnv(): Env {
-    return { DB: d1 } as unknown as Env;
+    return {
+      DB: d1,
+      INGEST_QUEUE: { send: async () => undefined, sendBatch: async () => undefined },
+    } as unknown as Env;
   }
 
   beforeEach(async () => {
@@ -152,5 +157,48 @@ describe('providerMissingStubClose', () => {
       'SELECT ingest_status FROM filings WHERE doc_id = ?',
     ).bind(STUB_SENATE_ID).first<{ ingest_status: string }>();
     expect(stubFiling?.ingest_status).toBe('needs_review');
+  });
+
+  it('maps a Senate PTR UUID to S-{uuid} and ignores House / non-uuid keys', () => {
+    expect(senateOfficialDocIdFromProvider(senateObservation())).toBe(OFFICIAL_SENATE_ID);
+    expect(senateOfficialDocIdFromProvider(senateObservation({ chamber: 'house', providerKey: '2026-8221264' }))).toBeNull();
+    expect(senateOfficialDocIdFromProvider(senateObservation({ providerKey: 'not-a-uuid' }))).toBeNull();
+  });
+
+  it('enqueues the official Senate PTR instead of waiting for a review stub', async () => {
+    const nowIso = '2026-09-15T08:00:00.000Z';
+    const official = await enqueueOfficialSenateFromProviderObservation(
+      makeEnv(),
+      senateObservation(),
+      nowIso,
+    );
+    expect(official).toBe(OFFICIAL_SENATE_ID);
+
+    const filing = await d1.prepare(
+      'SELECT ingest_status, doc_kind, source_url FROM filings WHERE doc_id = ?',
+    ).bind(OFFICIAL_SENATE_ID).first<{
+      ingest_status: string;
+      doc_kind: string | null;
+      source_url: string | null;
+    }>();
+    expect(filing?.ingest_status).toBe('new');
+    expect(filing?.doc_kind).toBe('senate_html');
+    expect(filing?.source_url).toBe(SOURCE_URL);
+
+    const outbox = await d1.prepare(
+      'SELECT status FROM ingestion_outbox WHERE doc_id = ?',
+    ).bind(OFFICIAL_SENATE_ID).first<{ status: string }>();
+    expect(outbox?.status).toMatch(/pending|enqueued/);
+
+    const again = await enqueueOfficialSenateFromProviderObservation(
+      makeEnv(),
+      senateObservation(),
+      nowIso,
+    );
+    expect(again).toBe(OFFICIAL_SENATE_ID);
+    const count = await d1.prepare(
+      'SELECT COUNT(*) AS n FROM filings WHERE doc_id = ?',
+    ).bind(OFFICIAL_SENATE_ID).first<{ n: number }>();
+    expect(count?.n).toBe(1);
   });
 });
