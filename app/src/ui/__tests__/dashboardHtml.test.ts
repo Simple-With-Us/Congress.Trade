@@ -4590,6 +4590,7 @@ describe('static UI assets (issue #1040)', () => {
     const cases: Array<{ path: string; typePrefix: string; minBytes: number; cache: string }> = [
       { path: '/icon-192.png', typePrefix: 'image/png', minBytes: 1_000, cache: 'public, max-age=86400' },
       { path: '/favicon.ico', typePrefix: 'image/png', minBytes: 100, cache: 'public, max-age=86400' },
+      { path: '/swu-logo-wide.webp', typePrefix: 'image/webp', minBytes: 10_000, cache: 'public, max-age=86400' },
       { path: '/assets/brand-logo-light.png', typePrefix: 'image/png', minBytes: 1_000, cache: 'immutable' },
       { path: '/assets/zilla-slab-700.woff2', typePrefix: 'font/woff2', minBytes: 1_000, cache: 'immutable' },
       { path: '/assets/inter-400.woff2', typePrefix: 'font/woff2', minBytes: 1_000, cache: 'immutable' },
@@ -7071,4 +7072,3 @@ describe('Prices as of copy (6c05e09b)', () => {
     expect(DASHBOARD_HTML).toContain("(d.pricesAsOf ? ' · Prices as of ' + esc(fmtAsOf(d.pricesAsOf)) : '')");
   });
 });
-

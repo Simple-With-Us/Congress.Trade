@@ -49,6 +49,7 @@ export const EAGLE_SPLASH_PNG = loadAsset('assets/eagle-splash.png', 'image/png'
 export const BRAND_LOGO_PNG = loadAsset('assets/brand-logo.png', 'image/png');
 export const BRAND_LOGO_DARK_PNG = loadAsset('assets/brand-logo-dark.png', 'image/png');
 export const BRAND_LOGO_LIGHT_PNG = loadAsset('assets/brand-logo-light.png', 'image/png');
+export const SWU_LOGO_WEBP = loadAsset('swu-logo-wide.webp', 'image/webp');
 
 // Well-known root icons / social cards (long cache, stable paths).
 // Context-specific OG cards share the site heading lockup (CONGRESS + eagle + TRADE)
