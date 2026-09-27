@@ -54,7 +54,7 @@ Effort logs are standardized across all apps: protocol at
 
 ## Current Shape
 
-Hosting and routing (apexes, hostnames, hosts, deploy paths): see [`Fleet-OPS/docs/DOMAINS-AND-ROUTING.md`](https://github.com/jaywedgeworth22/Fleet-OPS/blob/main/docs/DOMAINS-AND-ROUTING.md). Built from live Cloudflare, Vercel, Coolify, Namecheap/RDAP, and GitHub APIs by CLAUDE on 2026-09-25; refresh via `Fleet-OPS/scripts/domain-inventory/run-all.sh`.
+Hosting details are maintained in the private operations inventory; keep its repository links out of public documentation.
 
 - The runnable app is in `app/`, not the repository root.
 - The backend app runs on **Coolify (Docker container with Deno runtime)** on the **production
