@@ -326,6 +326,8 @@ jobs:
           bash -n scripts/ios-fleet/scheduled-ship-gate.sh
           bash -n scripts/ios-fleet/test-scheduled-ship-gate.sh
           bash -n scripts/ios-ship-testflight.sh
+          bash -n scripts/ios-stage-asc-key.sh
+          bash -n scripts/test-ios-stage-asc-key.sh
           bash -n scripts/ios-ci-xctest.sh
           bash -n scripts/ios-fleet/publish-ios-versions.sh
           node --check scripts/ios-fleet/asc-api.mjs
@@ -338,6 +340,9 @@ jobs:
 
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs
+
+      - name: iOS signing key-file handoff
+        run: bash scripts/test-ios-stage-asc-key.sh
 
       - name: Build-number + ship-gate tests
         run: bash scripts/ios-fleet/test-ship-seq.sh
