@@ -175,6 +175,27 @@ describe('Datadog RUM injection', () => {
 });
 
 describe('iOS Beta / TestFlight redirect routes', () => {
+  it('uses the app-specific invitation when no install URL is configured', async () => {
+    const app = buildUiRouter();
+    for (const path of ['/beta', '/testflight', '/ios', '/app']) {
+      const res = await app.request(`http://localhost${path}`, {}, {} as never);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')).toBe('https://testflight.apple.com/join/VNUEU6Ge');
+    }
+  });
+
+  it.each([
+    'https://testflight.apple.com/',
+    'https://testflight.apple.com/join/trade.congress.ios',
+    'http://testflight.apple.com/join/VNUEU6Ge',
+    'https://example.com/install',
+    'not a URL',
+  ])('does not advertise an invalid configured install destination: %s', async (url) => {
+    const app = buildUiRouter();
+    const res = await app.request('http://localhost/beta', {}, { IOS_TESTFLIGHT_URL: url } as never);
+    expect(res.headers.get('location')).toBe('https://testflight.apple.com/join/VNUEU6Ge');
+  });
+
   it('redirects /beta, /testflight, /ios, /app to the configured TestFlight or App Store URL', async () => {
     const app = buildUiRouter();
     const env = { IOS_TESTFLIGHT_URL: 'https://testflight.apple.com/join/xyz123' } as never;
