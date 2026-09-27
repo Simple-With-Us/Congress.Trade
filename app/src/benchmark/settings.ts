@@ -86,8 +86,8 @@ const LLAMAPARSE_CANDIDATES: BakeoffCandidate[] = [
 // was moved here when its offered slot became `openrouter:mistral/mistral-ocr-latest`.
 const LEGACY_CANDIDATES: BakeoffCandidate[] = [
   { provider: 'openai', model: 'gpt-5.6-terra' },
-  { provider: 'openai', model: 'gpt-5.6-luna' },
-  { provider: 'openai', model: 'gpt-5.6-sol' },
+  { provider: 'openai', model: 'gpt-6-luna' },
+  { provider: 'openai', model: 'gpt-6-sol' },
   { provider: 'gemini', model: 'gemini-3.5-flash' },
   { provider: 'anthropic', model: 'claude-sonnet-5' },
   { provider: 'anthropic', model: 'claude-haiku-4-5' },

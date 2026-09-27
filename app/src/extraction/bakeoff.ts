@@ -115,10 +115,10 @@ export const DEFAULT_CANDIDATES: BakeoffCandidate[] = [
   // direct route; the direct entry lives in LEGACY_CANDIDATES for decode only.
   { provider: 'openrouter', model: 'mistral/mistral-ocr-latest' },
   { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-  { provider: 'openrouter', model: 'openai/gpt-5.6-luna' },
+  { provider: 'openrouter', model: 'openai/gpt-6-luna' },
   { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
   { provider: 'openrouter', model: 'anthropic/claude-haiku-4.5' },
-  { provider: 'openrouter', model: 'anthropic/claude-opus-5' },
+  { provider: 'openrouter', model: 'anthropic/claude-opus-5-5' },
   { provider: 'openrouter', model: 'x-ai/grok-4.6' },
   { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro' },
   { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
@@ -146,7 +146,7 @@ export const NON_OFFERED_CANDIDATES: BakeoffCandidate[] = [
   // reasoning models. Removed to prevent routine benchmark waste, but kept
   // in catalog for targeted or historical runs.
   { provider: 'openrouter', model: 'openai/gpt-5.6-terra-pro' },
-  { provider: 'openrouter', model: 'openai/gpt-5.6-sol' },
+  { provider: 'openrouter', model: 'openai/gpt-6-sol' },
 ];
 
 /**
@@ -171,10 +171,10 @@ export function upgradeRetiredDisclosureCandidate(candidate: BakeoffCandidate): 
   return retired;
 }
 
-/** Production reasoning profile for the three GPT-5.6 scanned-document roles. */
+/** Production reasoning profile for the GPT-6 scanned-document roles. */
 export function openAiDisclosureReasoningEffort(model: string): 'low' | 'medium' | 'high' {
-  if (model.startsWith('gpt-5.6-sol')) return 'high';
-  if (model.startsWith('gpt-5.6-luna')) return 'low';
+  if (model.startsWith('gpt-6-sol') || model.startsWith('gpt-5.6-sol')) return 'high';
+  if (model.startsWith('gpt-6-luna') || model.startsWith('gpt-5.6-luna')) return 'low';
   return 'medium';
 }
 

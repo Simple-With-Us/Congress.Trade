@@ -6684,7 +6684,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         }
         const candidate = { provider: o.provider as Provider, model: o.model };
         if (isRetiredDisclosureCandidate(candidate)) {
-          return c.json({ error: 'GPT-4o is retired for new disclosure extraction; use gpt-5.6-terra, gpt-5.6-luna, or gpt-5.6-sol' }, 400);
+          return c.json({ error: 'GPT-4o is retired for new disclosure extraction; use gpt-5.6-terra, gpt-6-luna, or gpt-6-sol' }, 400);
         }
         parsed.push(candidate);
       }
@@ -6882,7 +6882,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         : provider === 'xai' ? 'grok-4.6'
         : 'mistral-ocr-latest';
     if (isRetiredDisclosureCandidate({ provider, model })) {
-      return c.json({ error: 'GPT-4o is retired for new disclosure extraction; use gpt-5.6-terra, gpt-5.6-luna, or gpt-5.6-sol' }, 400);
+      return c.json({ error: 'GPT-4o is retired for new disclosure extraction; use gpt-5.6-terra, gpt-6-luna, or gpt-6-sol' }, 400);
     }
 
     let n = typeof body.n === 'number' && body.n > 0 ? Math.floor(body.n) : 50;
@@ -7936,7 +7936,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // still receives its explicit retirement message (GPT-4o is absent from the
     // catalog and would otherwise fail with the generic not-in-catalog error).
     if ([rawA, rawB, rawC].some((model) => model && isRetiredDisclosureCandidate(model))) {
-      return c.json({ error: 'GPT-4o is retired for new disclosure extraction; use gpt-5.6-terra, gpt-5.6-luna, or gpt-5.6-sol' }, 400);
+      return c.json({ error: 'GPT-4o is retired for new disclosure extraction; use gpt-5.6-terra, gpt-6-luna, or gpt-6-sol' }, 400);
     }
     let mA: BakeoffCandidate, mB: BakeoffCandidate, mC: BakeoffCandidate | null;
     try {
