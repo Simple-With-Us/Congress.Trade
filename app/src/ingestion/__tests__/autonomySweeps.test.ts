@@ -392,6 +392,42 @@ describe('autonomySweeps', () => {
     });
 
 
+    it('keeps non-cascade audit reasons when includeAgreementCascade is mixed', async () => {
+      const env = makeEnv();
+      const cascadeId = 'H-2025-mixed-cascade';
+      const regularId = 'H-2025-mixed-regular';
+      await insertFiling({ doc_id: cascadeId, ingest_status: 'error', doc_kind: 'scanned_pdf', first_seen_at: new Date().toISOString() });
+      await insertFiling({ doc_id: regularId, ingest_status: 'extraction_pending_local', doc_kind: 'scanned_pdf', first_seen_at: new Date().toISOString() });
+      await insertOpenReview(cascadeId, 'agreement_cascade_unresolved');
+      await insertOpenReview(regularId);
+      await insertLiveTx(cascadeId, 'local_mac');
+      await insertLiveTx(regularId);
+      await insertPublishDecision(cascadeId);
+      await insertPublishDecision(regularId);
+
+      const result = await sweepAlreadyPublishedReviewRows(env, { includeAgreementCascade: true });
+      expect(result.cleared).toBe(2);
+      expect(result.filingsUpdated).toBe(2);
+
+      const cascade = await d1.prepare(
+        `SELECT resolved, resolution_reason FROM review_queue WHERE doc_id = ?`,
+      ).bind(cascadeId).first<{ resolved: number; resolution_reason: string }>();
+      const regular = await d1.prepare(
+        `SELECT resolved, resolution_reason FROM review_queue WHERE doc_id = ?`,
+      ).bind(regularId).first<{ resolved: number; resolution_reason: string }>();
+      expect(cascade?.resolved).toBe(1);
+      expect(cascade?.resolution_reason).toBe('reconciled_published_after_local_mac');
+      expect(regular?.resolved).toBe(1);
+      expect(regular?.resolution_reason).toBe('reconciled_published');
+
+      const cascadeFiling = await d1.prepare(`SELECT ingest_status FROM filings WHERE doc_id = ?`)
+        .bind(cascadeId).first<{ ingest_status: string }>();
+      const regularFiling = await d1.prepare(`SELECT ingest_status FROM filings WHERE doc_id = ?`)
+        .bind(regularId).first<{ ingest_status: string }>();
+      expect(cascadeFiling?.ingest_status).toBe('persisted');
+      expect(regularFiling?.ingest_status).toBe('persisted');
+    });
+
     it('closes agreement-cascade when includeAgreementCascade is set', async () => {
       const env = makeEnv();
       const docId = 'H-2025-8220844-close';

@@ -1037,19 +1037,27 @@ export async function sweepAlreadyPublishedReviewRows(
 ): Promise<AlreadyPublishedReviewSweepResult> {
   const limit = opts.limit ?? 500;
   const includeAgreementCascade = opts.includeAgreementCascade === true;
-  const reason = includeAgreementCascade
-    ? ALREADY_PUBLISHED_CASCADE_REASON
-    : ALREADY_PUBLISHED_REVIEW_REASON;
   const cascadeClause = includeAgreementCascade
     ? ''
     : `AND COALESCE(rq.reason, '') NOT LIKE '%agreement_cascade%'`;
   const statusPlaceholders = ALREADY_PUBLISHED_FILING_STATUSES.map(() => '?').join(',');
+  // When includeAgreementCascade is on, the same UPDATE can close both
+  // cascade and non-cascade rows. Stamp the cascade-specific audit reason
+  // only on cascade rows so non-cascade closes stay reconciled_published.
+  const filingReasons = includeAgreementCascade
+    ? [ALREADY_PUBLISHED_REVIEW_REASON, ALREADY_PUBLISHED_CASCADE_REASON]
+    : [ALREADY_PUBLISHED_REVIEW_REASON];
+  const filingReasonPlaceholders = filingReasons.map(() => '?').join(',');
   const results = await batch(env.DB, [
     [
       `UPDATE review_queue
           SET resolved = 1,
               resolution_kind = 'published',
-              resolution_reason = ?,
+              resolution_reason = CASE
+                WHEN COALESCE(reason, '') LIKE '%agreement_cascade%'
+                  THEN ?
+                ELSE ?
+              END,
               resolved_at = CURRENT_TIMESTAMP,
               review_revision = review_revision + 1
         WHERE resolved = 0
@@ -1074,7 +1082,7 @@ export async function sweepAlreadyPublishedReviewRows(
              ORDER BY rq.created_at ASC
              LIMIT ?
           )`,
-      [reason, limit],
+      [ALREADY_PUBLISHED_CASCADE_REASON, ALREADY_PUBLISHED_REVIEW_REASON, limit],
     ],
     [
       `UPDATE filings
@@ -1086,7 +1094,7 @@ export async function sweepAlreadyPublishedReviewRows(
             JOIN review_queue rq ON rq.doc_id = f.doc_id
            WHERE rq.resolved = 1
              AND rq.resolution_kind = 'published'
-             AND rq.resolution_reason = ?
+             AND rq.resolution_reason IN (${filingReasonPlaceholders})
              AND f.ingest_status IN (${statusPlaceholders})
              AND EXISTS (
                SELECT 1 FROM transactions t
@@ -1096,7 +1104,7 @@ export async function sweepAlreadyPublishedReviewRows(
              )
            LIMIT ?
         )`,
-      [reason, ...ALREADY_PUBLISHED_FILING_STATUSES, limit],
+      [...filingReasons, ...ALREADY_PUBLISHED_FILING_STATUSES, limit],
     ],
   ]);
   return {
