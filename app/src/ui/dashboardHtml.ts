@@ -1621,6 +1621,10 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   footer .footer-links { display:inline-flex; flex-wrap:wrap; gap:12px 16px; justify-content:center; }
   footer .footer-links a { color: var(--text-dim); text-decoration:none; }
   footer .footer-links a:hover { color: var(--accent); }
+  footer .swu-attribution { display:inline-flex; align-items:center; gap:5px; color:var(--text-dim); text-decoration:none; font-size:10px; }
+  footer .swu-attribution:hover { color:var(--accent); }
+  footer .swu-attribution:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  footer .swu-attribution img { display:block; width:min(288px, calc(100vw - 105px)); height:auto; border-radius:2px; background:#fff; }
   /* ---- account control + auth/billing modals ---- */
   .acct { display:flex; align-items:center; gap:8px; }
   .acct-desktop { display:flex; align-items:center; gap:10px; }
@@ -4088,6 +4092,7 @@ ${speedProofSectionHtml(true)}
       <a href="mailto:support@congress.trade">Support</a>
       <a href="#" onclick="if(window.openSentryFeedback){window.openSentryFeedback();}else if(window.Sentry&amp;&amp;window.Sentry.getFeedback){try{window.Sentry.getFeedback().createForm().then(function(f){f.appendToDom();f.open();});}catch(e){}}return false;">Report a Problem</a>
     </span>
+    <a class="swu-attribution" href="https://simplewithus.com/" aria-label="From Simple With Us"><span>From</span><img src="/swu-logo-wide.webp" alt="Simple With Us by Jay Wedgeworth" width="288" height="30"></a>
   </footer>
 </main>
 
