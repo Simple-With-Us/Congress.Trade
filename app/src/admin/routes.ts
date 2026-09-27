@@ -18,6 +18,7 @@
  *   POST  /subscriptions/:id/rotate-secret -> rotate signing secret (shown-once if generated)
  *   POST  /subscriptions/:id/deactivate    -> deactivate (drops from fanout, frees creation quota)
  *   POST  /filings-hygiene              -> dry-run (default) / apply probe delete + review desync (#1576/#1574)
+ *   POST  /sweep-already-published     -> dry-run (default) / apply already-published review integrity close
  *
  * AUTH (deny-by-default once provisioned). A request is authorized if:
  *   1. Bearer token — env.ADMIN_TOKEN is set and the request carries a matching
@@ -171,7 +172,11 @@ function isObjectStoreAuthError(message: string): boolean {
   return /\bunauthorized\b|\baccessdenied\b|\binvalidaccesskeyid\b|\bsignaturedoesnotmatch\b/i.test(message);
 }
 import { flushIngestionOutbox, requeueFailedIngestionOutbox } from '../ingestion/outbox.ts';
-import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts';
+import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
+import {
+  listAlreadyPublishedReviewCandidates,
+  sweepAlreadyPublishedReviewRows,
+} from '../ingestion/autonomySweeps.ts';
 import {
   requeueTransientFailedDurableJobs,
   requeueTransientFailedIngestionOutbox,
@@ -5850,6 +5855,55 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       limit,
     });
     return c.json({ ok: true, dryRun: !apply, ...result });
+  });
+
+
+  // --- POST /sweep-already-published --------------------------------------
+  // On-demand trigger for sweepAlreadyPublishedReviewRows. The hourly
+  // autonomy-sweeps lane already runs this, but deadline abort / lock races
+  // can leave terminal-with-live orphans in the review queue (observed
+  // 2026-09-25: 16 form_chrome_only + 13 agreement_cascade, all with live
+  // txs + publish decisions; reject/confirm unsafe). Body (all optional):
+  //   { apply?: boolean, dryRun?: boolean, includeAgreementCascade?: boolean,
+  //     limit?: number }
+  // Default is dry-run. Writes require apply:true AND dryRun !== true.
+  r.post('/sweep-already-published', async (c) => {
+    let body: Record<string, unknown> = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const apply = body.apply === true && body.dryRun !== true;
+    const includeAgreementCascade = body.includeAgreementCascade === true;
+    let limit = typeof body.limit === 'number' && body.limit > 0 ? Math.floor(body.limit) : 500;
+    if (limit > 2000) limit = 2000;
+    const candidates = await listAlreadyPublishedReviewCandidates(c.env, {
+      limit,
+      includeAgreementCascade,
+    });
+    if (!apply) {
+      return c.json({
+        ok: true,
+        dryRun: true,
+        includeAgreementCascade,
+        candidateCount: candidates.length,
+        candidates,
+      });
+    }
+    const result = await sweepAlreadyPublishedReviewRows(c.env, {
+      limit,
+      includeAgreementCascade,
+    });
+    return c.json({
+      ok: true,
+      dryRun: false,
+      includeAgreementCascade,
+      candidateCount: candidates.length,
+      candidates,
+      ...result,
+    });
   });
 
   // --- GET /scanned-filings/pending ---------------------------------------

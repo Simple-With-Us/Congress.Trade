@@ -1016,18 +1016,48 @@ const PUBLISH_DECISION_ACTIONS_SQL = `('auto_published','confirmed','manual','ag
  * bump makes a concurrent admin decision that read the pre-sweep revision
  * no-op cleanly.
  */
+export const ALREADY_PUBLISHED_CASCADE_REASON = 'reconciled_published_after_local_mac';
+
+/** Ingest statuses the already-published close may stamp back to persisted. */
+const ALREADY_PUBLISHED_FILING_STATUSES = [
+  ...DESYNCED_INGEST_STATUSES,
+  // Cascade orphans often sit at filings.ingest_status='error' after a prior
+  // reject, even though local_mac later published live rows.
+  'error',
+] as const;
+
 export async function sweepAlreadyPublishedReviewRows(
   env: Env,
-  opts: { limit?: number } = {},
+  opts: {
+    limit?: number;
+    /** When true, also close agreement_cascade_unresolved rows that still have
+     *  live published txs + a publish decision (local_mac won after cascade). */
+    includeAgreementCascade?: boolean;
+  } = {},
 ): Promise<AlreadyPublishedReviewSweepResult> {
   const limit = opts.limit ?? 500;
-  const statusPlaceholders = DESYNCED_INGEST_STATUSES.map(() => '?').join(',');
+  const includeAgreementCascade = opts.includeAgreementCascade === true;
+  const cascadeClause = includeAgreementCascade
+    ? ''
+    : `AND COALESCE(rq.reason, '') NOT LIKE '%agreement_cascade%'`;
+  const statusPlaceholders = ALREADY_PUBLISHED_FILING_STATUSES.map(() => '?').join(',');
+  // When includeAgreementCascade is on, the same UPDATE can close both
+  // cascade and non-cascade rows. Stamp the cascade-specific audit reason
+  // only on cascade rows so non-cascade closes stay reconciled_published.
+  const filingReasons = includeAgreementCascade
+    ? [ALREADY_PUBLISHED_REVIEW_REASON, ALREADY_PUBLISHED_CASCADE_REASON]
+    : [ALREADY_PUBLISHED_REVIEW_REASON];
+  const filingReasonPlaceholders = filingReasons.map(() => '?').join(',');
   const results = await batch(env.DB, [
     [
       `UPDATE review_queue
           SET resolved = 1,
               resolution_kind = 'published',
-              resolution_reason = ?,
+              resolution_reason = CASE
+                WHEN COALESCE(reason, '') LIKE '%agreement_cascade%'
+                  THEN ?
+                ELSE ?
+              END,
               resolved_at = CURRENT_TIMESTAMP,
               review_revision = review_revision + 1
         WHERE resolved = 0
@@ -1036,7 +1066,7 @@ export async function sweepAlreadyPublishedReviewRows(
               FROM review_queue rq
              WHERE rq.resolved = 0
                AND COALESCE(rq.reason, '') NOT LIKE '%unpublished%'
-               AND COALESCE(rq.reason, '') NOT LIKE '%agreement_cascade%'
+               ${cascadeClause}
                AND COALESCE(rq.reason, '') NOT LIKE '%provider_discovered_missing_official%'
                AND EXISTS (
                  SELECT 1 FROM transactions t
@@ -1052,7 +1082,7 @@ export async function sweepAlreadyPublishedReviewRows(
              ORDER BY rq.created_at ASC
              LIMIT ?
           )`,
-      [ALREADY_PUBLISHED_REVIEW_REASON, limit],
+      [ALREADY_PUBLISHED_CASCADE_REASON, ALREADY_PUBLISHED_REVIEW_REASON, limit],
     ],
     [
       `UPDATE filings
@@ -1064,7 +1094,7 @@ export async function sweepAlreadyPublishedReviewRows(
             JOIN review_queue rq ON rq.doc_id = f.doc_id
            WHERE rq.resolved = 1
              AND rq.resolution_kind = 'published'
-             AND rq.resolution_reason = ?
+             AND rq.resolution_reason IN (${filingReasonPlaceholders})
              AND f.ingest_status IN (${statusPlaceholders})
              AND EXISTS (
                SELECT 1 FROM transactions t
@@ -1074,13 +1104,58 @@ export async function sweepAlreadyPublishedReviewRows(
              )
            LIMIT ?
         )`,
-      [ALREADY_PUBLISHED_REVIEW_REASON, ...DESYNCED_INGEST_STATUSES, limit],
+      [...filingReasons, ...ALREADY_PUBLISHED_FILING_STATUSES, limit],
     ],
   ]);
   return {
     cleared: results[0]?.meta?.changes ?? 0,
     filingsUpdated: results[1]?.meta?.changes ?? 0,
   };
+}
+
+/** Read-only preview of docs the already-published sweep would close. */
+export async function listAlreadyPublishedReviewCandidates(
+  env: Env,
+  opts: { limit?: number; includeAgreementCascade?: boolean } = {},
+): Promise<Array<{ docId: string; reason: string | null; liveTxCount: number }>> {
+  const limit = opts.limit ?? 500;
+  const includeAgreementCascade = opts.includeAgreementCascade === true;
+  const cascadeClause = includeAgreementCascade
+    ? ''
+    : `AND COALESCE(rq.reason, '') NOT LIKE '%agreement_cascade%'`;
+  const rows = await all<{ doc_id: string; reason: string | null; live_n: number }>(
+    env.DB,
+    `SELECT rq.doc_id AS doc_id,
+            rq.reason AS reason,
+            (SELECT COUNT(*) FROM transactions t
+              WHERE t.doc_id = rq.doc_id
+                AND t.deprecated_at IS NULL
+                AND t.source IN ${LIVE_PUBLISHED_TX_SOURCES_SQL}) AS live_n
+       FROM review_queue rq
+      WHERE rq.resolved = 0
+        AND COALESCE(rq.reason, '') NOT LIKE '%unpublished%'
+        ${cascadeClause}
+        AND COALESCE(rq.reason, '') NOT LIKE '%provider_discovered_missing_official%'
+        AND EXISTS (
+          SELECT 1 FROM transactions t
+           WHERE t.doc_id = rq.doc_id
+             AND t.deprecated_at IS NULL
+             AND t.source IN ${LIVE_PUBLISHED_TX_SOURCES_SQL}
+        )
+        AND EXISTS (
+          SELECT 1 FROM ingestion_decisions d
+           WHERE d.doc_id = rq.doc_id
+             AND d.action IN ${PUBLISH_DECISION_ACTIONS_SQL}
+        )
+      ORDER BY rq.created_at ASC
+      LIMIT ?`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    docId: r.doc_id,
+    reason: r.reason,
+    liveTxCount: Number(r.live_n) || 0,
+  }));
 }
 
 /**
