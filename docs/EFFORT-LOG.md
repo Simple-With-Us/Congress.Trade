@@ -251,6 +251,7 @@ as open `state:planned` even though all six are done. A mirror-sync commit lands
 
 - **2026-08-04 — GROK — R2 free-tier opt (ST/CT/UM).** Class A pace ST 74%/CT 123%; UM storage 104%. Applied litestream **60s sync** + shorter retention (ST 24h, CT 36h host, UM 48h). App path unchanged. ST kill-switch cleared + resumed. PRs: ST #2382, UM #915, CT docs #1298.
 ## Active / In Progress
+- **2026-09-27 — CODEX — IN PROGRESS — Stage iOS signing key through a file path (board `d49b27c8`, issue #2579, branch `codex/ios-signing-loader-20260927`, worktree `~/apps/congress-codex-ios-signing-loader`).**  Workflow disabled pending owner credential decision; scope is ship workflow, helper, and synthetic fixture test.
 - **2026-09-04 - MINIMAX - PLANNED - Senate realy + Senate tunnel removal across fleet.** <!-- wb-agent-report:ba810d46cdcf4de88a695e2afe4e5b4f -->
 - **2026-09-04 - MINIMAX - PLANNED - Residential proxy removal — Mac + CT + UM repos.** <!-- wb-agent-report:ab688ea5015b42ffbfff834cbe3cfccc -->
 - **2026-08-27 - AG - PLANNED - Options & Kalshi event contract account separation, distinct settings & exact pricing.** <!-- wb-agent-report:37bdf975f0684f6d8b9af9188c61b5b2 -->

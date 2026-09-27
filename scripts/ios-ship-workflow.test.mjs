@@ -25,6 +25,8 @@ test("ios-ship.yml keeps the ship gate and never uses secrets in if", () => {
   assert.match(yml, /secrets\.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/);
   assert.match(yml, /infisical login --method=universal-auth/);
   assert.match(yml, /ASC_KEY_ID/);
+  assert.match(yml, /scripts\/ios-stage-asc-key\.sh/);
+  assert.doesNotMatch(yml, /for name in .*ASC_KEY_P8/);
   assert.doesNotMatch(yml, /secrets\.ASC_KEY_ID/);
   assert.doesNotMatch(yml, /ASC_KEY_ID: \$\{\{ secrets\.ASC_KEY_ID \}\}/);
   assert.doesNotMatch(yml, /if:.*secrets\./);
@@ -32,7 +34,7 @@ test("ios-ship.yml keeps the ship gate and never uses secrets in if", () => {
   assert.match(yml, /workflow_dispatch/);
   assert.match(yml, /scripts\/ios-ship-testflight\.sh/);
 
-  assert.match(prepare, /ASC_KEY_P8 required/);
+  assert.match(prepare, /ASC_KEY_P8 or ASC_KEY_PATH required/);
   assert.doesNotMatch(prepare, /echo "\$ASC_KEY_P8"/);
   assert.doesNotMatch(prepare, /echo "\$IOS_DIST_P12/);
 });
