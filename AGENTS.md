@@ -490,7 +490,7 @@ Canonical: `/Users/jay/apps/AGENT-SYNC.md` § iOS agent build loop. Onboarding: 
 
 - Do **not** stand up, debug, or narrate Xcode MCP (`build_sim`, `mcpbridge`).
 - `xcodebuild` / `xcrun simctl` via bash are pre-approved. Run them. Do not ask.
-- User-visible changes need `xcrun simctl io booted screenshot …` before you claim done.
+- UI changes must be covered by automated visual verification where feasible: Playwright screenshot assertions for web surfaces, `xcrun simctl io booted screenshot` for iOS simulator. The owner never takes manual screenshots and does not run local UI preview sessions. Native Mac app UI is verified through code review and CI.
 - Do not hand-edit `.pbxproj` / entitlements / xibs. `clients/ios/project.yml` is the XcodeGen source of truth — edit it, then `cd clients/ios && xcodegen generate`.
 - `@Observable` + `@MainActor`; `NavigationStack`; light theme default.
 
@@ -581,3 +581,4 @@ Canonical: `/Users/jay/apps/AGENT-SYNC.md` § Two spaces and
 ## Fleet recall
 
 Search `fleet-agents` before re-deriving a lesson (`recall "<topic>"` or MCP `recall_search`).  Contribute every reusable lesson at closeout (`recall contribute "…" --category lesson --app congress-trade`).  Cloud seats: https://agents.jays.services/mcp .  Do not dump chat logs into the corpus.  Canonical: ai-fleet-coordinator/docs/RAG-FLEET-INFRA.md.
+
