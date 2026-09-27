@@ -425,6 +425,9 @@ export async function runMaintenancePipeline(
       // Before this, the server probed every configured provider on every tick
       // even for providers it had already handed to the Mac scout — both hosts
       // hitting the same free-tier quota, which is pure waste.
+      // NOTE: when includeLatencyLanes=false these lanes run in their own
+      // dedicated sub-minute crons (cronLanes.ts) so the main tick is not
+      // burdened by their abort-ignorant external HTTP calls (CONGRESS-TRADE-1B).
       await runLane('disclosure_latency', () =>
         runLeasedLatencyProbe(
           env,
