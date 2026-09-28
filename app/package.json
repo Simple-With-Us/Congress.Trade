@@ -16,7 +16,7 @@
     "deploy:full": "bash scripts/ship.sh",
     "preview:provision": "bash scripts/provision-preview.sh",
     "preview:deploy": "bash scripts/deploy-preview.sh",
-    "sentry:sourcemaps": "_SENTRY_RELEASE=$(sentry-cli releases propose-version) && sentry-cli releases new $_SENTRY_RELEASE --org=jays-services --project=congress-trade && sentry-cli sourcemaps upload --org=jays-services --project=congress-trade --release=$_SENTRY_RELEASE --strip-prefix 'dist/..' dist",
+    "sentry:sourcemaps": "_SENTRY_RELEASE=$(sentry-cli releases propose-version) && sentry-cli releases new $_SENTRY_RELEASE --org=simple-with-us --project=congress-trade && sentry-cli sourcemaps upload --org=simple-with-us --project=congress-trade --release=$_SENTRY_RELEASE --strip-prefix 'dist/..' dist",
     "postdeploy": "if [ -n \"$SENTRY_AUTH_TOKEN\" ]; then npm run sentry:sourcemaps || echo '::warning::sentry sourcemaps upload failed (non-fatal); the Worker deploy already succeeded'; else echo '::warning::SENTRY_AUTH_TOKEN not set; skipping sentry sourcemaps upload'; fi"
   },
   "imports": {
