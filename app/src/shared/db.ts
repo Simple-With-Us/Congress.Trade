@@ -48,6 +48,38 @@ export async function all<T = Record<string, unknown>>(
   return res?.results ?? [];
 }
 
+/**
+ * True for a SQLite lock the caller must not treat as "unavailable, continue".
+ * A missing table during migrate is not one of these.
+ */
+export function isSqliteLockBusy(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.includes('SQLITE_BUSY')
+    || message.includes('database is locked')
+    || message.includes('SQL statements in progress')
+  );
+}
+
+/** Waits before each retry. Three retries, then the last error is rethrown. */
+export const SQLITE_LOCK_BUSY_RETRY_DELAYS_MS = [50, 150, 400] as const;
+
+/**
+ * Re-run `op` when SQLite is busy or a statement is already in progress.
+ * Any other error throws on the first failure, so a missing table is not retried.
+ */
+export async function withSqliteLockRetry<T>(op: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (err) {
+      const delayMs = SQLITE_LOCK_BUSY_RETRY_DELAYS_MS[attempt];
+      if (!isSqliteLockBusy(err) || delayMs === undefined) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 /** Execute a write (INSERT/UPDATE/DELETE) and return the D1 meta result. */
 export async function run(
   db: D1Database,
