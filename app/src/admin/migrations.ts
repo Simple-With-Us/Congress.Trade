@@ -35,6 +35,44 @@ export const BASE_SCHEMA_STATEMENTS = [
   'CREATE INDEX IF NOT EXISTS idx_review_resolved ON review_queue (resolved)',
   `CREATE TABLE IF NOT EXISTS ingest_log (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, polled_at TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0, first_seen_at TEXT)`,
   'CREATE INDEX IF NOT EXISTS idx_ingest_log_source ON ingest_log (source, polled_at)',
+  // Feed joins.  CREATE IF NOT EXISTS so sqlite tests that exec only this list
+  // can prepare GET /api/transactions.  Production already has both tables, so
+  // a repeat create is a no-op.  price_at_filing matches migration 0014.
+  `CREATE TABLE IF NOT EXISTS tx_performance (
+     tx_id TEXT PRIMARY KEY,
+     price_at_trade REAL,
+     spx_at_trade REAL,
+     price_at_filing REAL,
+     spx_at_filing REAL,
+     computed_at TEXT
+   )`,
+  `CREATE TABLE IF NOT EXISTS trade_latency_candidates (
+     trade_hash TEXT NOT NULL,
+     doc_id TEXT NOT NULL,
+     provider TEXT NOT NULL DEFAULT 'fmp',
+     chamber TEXT NOT NULL,
+     source_url TEXT,
+     filed_date TEXT,
+     filer_name TEXT,
+     ticker TEXT,
+     tx_date TEXT,
+     tx_type TEXT,
+     congress_first_seen_at TEXT NOT NULL,
+     provider_key TEXT,
+     provider_first_seen_at TEXT,
+     provider_published_at TEXT,
+     match_method TEXT,
+     status TEXT NOT NULL DEFAULT 'pending',
+     attempts INTEGER NOT NULL DEFAULT 0,
+     last_checked_at TEXT,
+     error TEXT,
+     payload TEXT,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (trade_hash, provider)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_trade_latency_candidates_doc
+     ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
 ] as const;
 
 /**

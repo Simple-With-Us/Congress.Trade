@@ -112,6 +112,20 @@ export interface Filing {
   localWaitExpiresAt?: string | null;
 }
 
+/** One `trade_latency_candidates` row, already reduced to a single object. */
+export interface TradeLatencyRead {
+  provider: string | null;
+  /** `provider_first_seen_at`.  There is no `observed_at` column. */
+  observedAt: string | null;
+  providerPublishedAt: string | null;
+  congressFirstSeenAt: string | null;
+  /** `observedAt` minus `congressFirstSeenAt`, in seconds.  Not a stored column. */
+  providerDeltaSec: number | null;
+  /** `providerPublishedAt` minus `congressFirstSeenAt`, in seconds.  Not a stored column. */
+  providerPublishedDeltaSec: number | null;
+  status: string | null;
+}
+
 export interface Transaction {
   id: string;
   docId: string;
@@ -186,6 +200,21 @@ export interface Transaction {
   disclosureLagDays?: number | null;
   /** STOCK Act 45-day classification of the disclosure lag; null = unknown. */
   stockActStatus?: StockActStatus | null;
+  /** Close on/before the trade date (`tx_performance.price_at_trade`).  Feed only. */
+  priceAtTrade?: number | null;
+  /** S&P close on that same trade anchor (`tx_performance.spx_at_trade`). */
+  spxAtTrade?: number | null;
+  /** Close on/before the filing date (`tx_performance.price_at_filing`). */
+  priceAtFiling?: number | null;
+  /** S&P close on that same filing anchor (`tx_performance.spx_at_filing`). */
+  spxAtFiling?: number | null;
+  /**
+   * One provider-race row for this trade.  Null when the feed selected the
+   * latency columns and no candidate matched.  Absent when the query did not
+   * select them (SSE and CSV).  `observedAt` is `provider_first_seen_at`.
+   * Deltas are computed the same way as GET /api/admin/disclosure-latency.
+   */
+  latency?: TradeLatencyRead | null;
   // --- Optional cross-referenced asset data (securities_ref; feed only) ------
   // Populated when the ticker has been enriched; null/absent otherwise.
   refCompanyName?: string | null;
