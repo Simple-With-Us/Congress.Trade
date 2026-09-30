@@ -248,6 +248,10 @@ export const DEFAULT_PIPELINE_THRESHOLDS: PipelineThresholds = {
   // (weekday coverage floor 15 min; weekend hourly). last_poll advances on
   // empty success, so a working poller never looks stale. The 26h window is
   // slack for a disabled/broken executive path, not the poll interval.
+  // Config ceiling. evaluatePipelineSignals also caps these by session:
+  // 45 minutes on a weekday (the poll floor is at most 30 minutes) and 90
+  // minutes on a weekend (the weekend budget is hourly). A 3 hour / 26 hour
+  // ceiling hid a multi-hour SQLITE_BUSY wedge.
   pollSuccessMaxAgeHours: { house: 3, senate: 3, executive: 26 },
   latencyObservationMaxAgeHours: 24,
   latencyProviderSilenceHours: 48,
@@ -295,6 +299,27 @@ const STATUS_WEIGHT: Record<PipelineStatus, number> = {
 
 function worstStatus(a: PipelineStatus, b: PipelineStatus): PipelineStatus {
   return STATUS_WEIGHT[a] >= STATUS_WEIGHT[b] ? a : b;
+}
+
+/** Weekday poll floor is at most 30 minutes, so 45 minutes is one missed slot. Weekend cadence is hourly, so 90 minutes does not flap a healthy hourly poll. */
+const WEEKDAY_POLL_MAX_AGE_HOURS = 0.75;
+const WEEKEND_POLL_MAX_AGE_HOURS = 1.5;
+
+function isEtWeekend(nowMs: number): boolean {
+  const weekday = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+  }).format(new Date(nowMs));
+  return weekday === 'Sat' || weekday === 'Sun';
+}
+
+function pollMaxAgeHours(
+  src: 'house' | 'senate' | 'executive',
+  nowMs: number,
+  configured: PipelineThresholds,
+): number {
+  const cap = isEtWeekend(nowMs) ? WEEKEND_POLL_MAX_AGE_HOURS : WEEKDAY_POLL_MAX_AGE_HOURS;
+  return Math.min(configured.pollSuccessMaxAgeHours[src], cap);
 }
 
 /**
@@ -501,7 +526,7 @@ export function evaluatePipelineSignals(
     const isDegraded = !isCritical && (ageSec == null || ageSec > 3600 || (f429 ?? 0) > 5);
     const tier: PipelineStatus = isCritical ? 'critical' : isDegraded ? 'degraded' : 'ok';
     const detail = isCritical
-      ? `FMP latency probe silent for ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'no observation in 48h'} (${count ?? 0} obs/24h). Check FMP_LATENCY_API_KEY rotation.`
+      ? `FMP latency probe silent for ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'no observation in 48h'} (${count ?? 0} obs/24h). Observations are not committing.  Check SQLITE_BUSY / WAL checkpoint before rotating FMP_LATENCY_API_KEY.`
       : isDegraded
         ? `FMP latency probe lagging (last age ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'unknown'}, ${f429 ?? 0} HTTP 429s in 24h).`
         : `FMP latency probe live (last observation ${ageSec != null ? Math.round(ageSec / 60) + ' min ago' : 'unknown'}, ${count ?? 0} obs in 24h, ${f429 ?? 0} 429s).`;
@@ -649,7 +674,7 @@ export function evaluatePipelineSignals(
     for (const src of ['house', 'senate', 'executive'] as const) {
       const id = `polling_${src}`;
       const st = s.pollSources.find((p) => p.source === src);
-      const maxAgeH = t.pollSuccessMaxAgeHours[src];
+      const maxAgeH = pollMaxAgeHours(src, nowMs, t);
       if (!st) {
         checks.push({ id, status: 'stalled', detail: `${src} polling NOT RUNNING — no liveness record at all`, value: null });
         continue;
@@ -1031,8 +1056,22 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     const kvList = await env.CONFIG_KV.list<{ count?: number }>({ prefix: 'fmp-latency:http429:key' });
     let total = 0;
     for (const k of kvList.keys) {
-      const v = await env.CONFIG_KV.get(k.name, 'json');
-      const n = Number((v as { count?: number } | null)?.count ?? 0);
+      // markFmpSlotHttp429 stores the raw flag "1", not {"count": n}.  A json
+      // read of that flag throws, and one throw used to leave the whole 24h
+      // counter null so the health line said "0 429s" either way.
+      let n = 0;
+      try {
+        const parsed = await env.CONFIG_KV.get(k.name, 'json');
+        n = Number((parsed as { count?: number } | null)?.count ?? 0);
+      } catch {
+        try {
+          const raw = await env.CONFIG_KV.get(k.name);
+          const asNum = Number(raw);
+          n = Number.isFinite(asNum) && asNum > 0 ? asNum : 0;
+        } catch {
+          n = 0;
+        }
+      }
       if (Number.isFinite(n) && n > 0) total += n;
     }
     if (fmpLatency) fmpLatency.http429s24h = total;

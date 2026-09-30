@@ -29,7 +29,8 @@ describe('evaluatePipelineSignals', () => {
     pollSources: [
       { source: 'house', lastSuccessAt: new Date(nowMs - 30 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 30 * 60_000).toISOString(), configDisabled: false },
       { source: 'senate', lastSuccessAt: new Date(nowMs - 45 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 45 * 60_000).toISOString(), configDisabled: false },
-      { source: 'executive', lastSuccessAt: new Date(nowMs - 5 * 3_600_000).toISOString(), lastAttemptAt: new Date(nowMs - 5 * 3_600_000).toISOString(), configDisabled: false },
+      // Weekday cap is 45 minutes.  A 5 hour executive success used to sit inside the old 26 hour ceiling and would now mark the whole fixture stalled.
+      { source: 'executive', lastSuccessAt: new Date(nowMs - 20 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 60_000).toISOString(), configDisabled: false },
     ],
     latencyProviders: [
       { provider: 'quiver', lastObservedAt: new Date(nowMs - 2 * 3_600_000).toISOString() },
@@ -352,7 +353,8 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     pollSources: [
       { source: 'house', lastSuccessAt: new Date(nowMs - 30 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 30 * 60_000).toISOString(), configDisabled: false },
       { source: 'senate', lastSuccessAt: new Date(nowMs - 45 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 45 * 60_000).toISOString(), configDisabled: false },
-      { source: 'executive', lastSuccessAt: new Date(nowMs - 5 * 3_600_000).toISOString(), lastAttemptAt: new Date(nowMs - 5 * 3_600_000).toISOString(), configDisabled: false },
+      // Weekday cap is 45 minutes.  A 5 hour executive success used to sit inside the old 26 hour ceiling and would now mark the whole fixture stalled.
+      { source: 'executive', lastSuccessAt: new Date(nowMs - 20 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 60_000).toISOString(), configDisabled: false },
     ],
     latencyProviders: [
       { provider: 'quiver', lastObservedAt: new Date(nowMs - 2 * 3_600_000).toISOString() },
@@ -412,16 +414,47 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.status).toBe('stalled');
   });
 
-  it('executive success inside its slower 26h window stays ok', () => {
-    const s: PipelineSignals = {
+  it('weekend hourly cadence stays ok at 70 minutes and stalls at 2 hours', () => {
+    // Saturday 2025-08-02 12:00 ET (EDT).  The fixture clock above is a Friday.
+    const saturdayMs = Date.parse('2025-08-02T16:00:00Z');
+    const withinHourly: PipelineSignals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) =>
+        p.source === 'executive'
+          ? { ...p, lastSuccessAt: new Date(saturdayMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 70 * 60_000).toISOString() }
+          : { ...p, lastSuccessAt: new Date(saturdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 50 * 60_000).toISOString() }),
+    };
+    expect(evaluatePipelineSignals(withinHourly, saturdayMs).checks.find((c) => c.id === 'polling_executive')!.status).toBe('ok');
+
+    const missedHourly: PipelineSignals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) =>
+        p.source === 'executive'
+          ? { ...p, lastSuccessAt: new Date(saturdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 2 * 3_600_000).toISOString() }
+          : { ...p, lastSuccessAt: new Date(saturdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 50 * 60_000).toISOString() }),
+    };
+    expect(evaluatePipelineSignals(missedHourly, saturdayMs).checks.find((c) => c.id === 'polling_executive')!.status).toBe('stalled');
+  });
+
+  it('executive success inside the weekday 45 minute window stays ok, and 20h does not', () => {
+    const fresh: PipelineSignals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) =>
+        p.source === 'executive'
+          ? { ...p, lastSuccessAt: new Date(nowMs - 20 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 60_000).toISOString() }
+          : p),
+    };
+    expect(evaluatePipelineSignals(fresh, nowMs).checks.find((c) => c.id === 'polling_executive')!.status).toBe('ok');
+
+    const stale: PipelineSignals = {
       ...base,
       pollSources: base.pollSources!.map((p) =>
         p.source === 'executive'
           ? { ...p, lastSuccessAt: new Date(nowMs - 20 * 3_600_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 3_600_000).toISOString() }
           : p),
     };
-    const res = evaluatePipelineSignals(s, nowMs);
-    expect(res.checks.find((c) => c.id === 'polling_executive')!.status).toBe('ok');
+    const res = evaluatePipelineSignals(stale, nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_executive')!.status).toBe('stalled');
   });
 
   it('zero latency observations ever is stalled (monitoring never wired = loudest case)', () => {
