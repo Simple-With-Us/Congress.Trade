@@ -17,7 +17,11 @@ import {
   parseTransientRetryMarker,
   transientRetryEligible,
   nextTransientRetryMarker,
+  obviousNonEquity,
+  NO_PROVIDER_DATA_ERROR,
+  NOT_AN_EQUITY_ERROR,
 } from '../service.ts';
+import { buildSocraticProvider, peerProfileSymbol, SOCRATIC_PROFILE_PATH } from '../socratic.ts';
 import { __resetSharedEdgarPacerForTests } from '../../shared/pace.ts';
 import { openMigratedD1 } from '../../prices/__tests__/sqliteD1.ts';
 
@@ -73,6 +77,86 @@ describe('enrichmentNeededSql', () => {
     expect(withKey).toContain("sr.source LIKE '%socratic%'");
     expect(withKey).not.toContain("sr.source LIKE '%fmp%'");
     expect(withKey).toContain('AND NOT');
+    expect(withKey).toContain(NO_PROVIDER_DATA_ERROR);
+    expect(withKey).toContain('REPLACE');
+    expect(enrichmentNeededSql('sr', false)).not.toContain(NO_PROVIDER_DATA_ERROR);
+  });
+
+  it('selects a ticker-shaped no-provider tombstone once, and skips spaced or non-equity names', async () => {
+    const { db, close } = await openMigratedD1();
+    try {
+      const insertTx = db.prepare(
+        `INSERT INTO transactions (id, ticker, asset_name, tx_date, source, created_at)
+         VALUES (?, ?, ?, '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+      );
+      const insertRef = db.prepare(
+        `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error, source)
+         VALUES (?, '2026-01-01T00:00:00.000Z', ?, ?)`,
+      );
+      insertTx.run('tx-a', 'AAPL', 'AAPL');
+      insertRef.run('AAPL', NO_PROVIDER_DATA_ERROR, null);
+      insertTx.run('tx-brk', 'BRK/B', 'BRK/B');
+      insertRef.run('BRK/B', NO_PROVIDER_DATA_ERROR, null);
+      insertTx.run('tx-spaced', 'MSFT', 'Microsoft Corp');
+      insertRef.run('MSFT', NO_PROVIDER_DATA_ERROR, null);
+      insertTx.run('tx-fund', 'QQQ', 'INDEX FUND');
+      insertRef.run('QQQ', NO_PROVIDER_DATA_ERROR, null);
+      insertTx.run('tx-muni', 'DALLAS WATER MUNICIPAL BOND', 'DALLAS WATER MUNICIPAL BOND');
+      insertRef.run('DALLAS WATER MUNICIPAL BOND', NO_PROVIDER_DATA_ERROR, null);
+      insertTx.run('tx-done', 'IBM', 'IBM');
+      insertRef.run('IBM', NO_PROVIDER_DATA_ERROR, 'socratic');
+      insertTx.run('tx-ne', 'CITY TREASURY NOTE', 'CITY TREASURY NOTE');
+      insertRef.run('CITY TREASURY NOTE', NOT_AN_EQUITY_ERROR, null);
+
+      const sql = `SELECT t.ticker AS ticker
+        FROM transactions t
+        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
+        WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+          AND ${enrichmentNeededSql('sr', true)}
+        GROUP BY t.ticker
+        ORDER BY t.ticker`;
+      const tickers = db.prepare(sql).all().map((row) => String(row.ticker));
+      expect(tickers).toEqual(['AAPL', 'BRK/B']);
+    } finally {
+      close();
+    }
+  });
+});
+
+describe('peer share-class alias and non-equity classification', () => {
+  it('requests BRK/B as BRK.B and leaves other symbols unchanged', () => {
+    expect(peerProfileSymbol('BRK/B')).toBe('BRK.B');
+    expect(peerProfileSymbol('brk/b')).toBe('BRK.B');
+    expect(peerProfileSymbol('BF/B')).toBe('BF.B');
+    expect(peerProfileSymbol('AAPL')).toBe('AAPL');
+    expect(peerProfileSymbol('BRK-B')).toBe('BRK-B');
+    expect(peerProfileSymbol('ABCDEF/G')).toBe('ABCDEF/G');
+  });
+
+  it('asks the peer for the dotted symbol', async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ ref: null }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const provider = buildSocraticProvider('https://socratic.trade', 'token', fetchImpl);
+    expect(await provider.fetchRef('BRK/B')).toBeNull();
+    expect(urls).toEqual([`https://socratic.trade${SOCRATIC_PROFILE_PATH}BRK.B`]);
+  });
+
+  it('classifies obvious non-tickers and not a normal 1-5 letter miss', () => {
+    expect(obviousNonEquity('DALLAS WATER MUNICIPAL BOND')).toBe(true);
+    expect(obviousNonEquity('CITY OF DALLAS')).toBe(true);
+    expect(obviousNonEquity('SOME CORPORATE BOND')).toBe(true);
+    expect(obviousNonEquity('TREASURY')).toBe(true);
+    expect(obviousNonEquity('AAPL')).toBe(false);
+    expect(obviousNonEquity('AAPL', 'CITY MUNICIPAL BOND')).toBe(false);
+    expect(obviousNonEquity('BOND')).toBe(false);
+    expect(obviousNonEquity('BRK/B')).toBe(false);
+    expect(obviousNonEquity('BRK.B')).toBe(false);
   });
 });
 
@@ -461,6 +545,171 @@ describe('runEnrichment — transient-retry backoff (real D1)', () => {
         .prepare('SELECT enrichment_error FROM securities_ref WHERE ticker = ?')
         .get('FLAKY');
       expect(row?.enrichment_error).toBe('transient-retry:1:2999-01-01T00:00:00.000Z'); // untouched
+    } finally {
+      close();
+    }
+  });
+});
+
+describe('runEnrichment — slash alias, tombstone retry, non-equity', () => {
+  function fakeKv() {
+    const store = new Map<string, string>();
+    return {
+      async get(k: string) {
+        return store.get(k) ?? null;
+      },
+      async put(k: string, v: string) {
+        store.set(k, v);
+      },
+      async delete(k: string) {
+        store.delete(k);
+      },
+    };
+  }
+
+  function peerEnv(d1: D1Database) {
+    return {
+      DB: d1,
+      CONFIG_KV: fakeKv(),
+      APP_B_IMPORT_URL: 'https://socratic.trade',
+      APP_B_INGEST_TOKEN: 'token',
+    } as unknown as Parameters<typeof runEnrichment>[0];
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('stores a BRK/B profile on the original ticker and does not invent country', async () => {
+    const { db, d1, close } = await openMigratedD1();
+    try {
+      db.prepare(
+        `INSERT INTO transactions (id, ticker, asset_name, tx_date, source, created_at)
+         VALUES ('tx-brk', 'BRK/B', 'BRK/B', '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error)
+         VALUES ('BRK/B', '2026-01-01T00:00:00.000Z', 'no provider data')`,
+      ).run();
+
+      const urls: string[] = [];
+      const fetchImpl = vi.fn(async (url: string) => {
+        urls.push(String(url));
+        if (String(url).includes('/api/market/profile/BRK.B')) {
+          return new Response(JSON.stringify({
+            ref: { companyName: 'Berkshire Hathaway', sector: 'Financial Services', marketCap: 1_000_000_000_000 },
+          }), { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+      });
+      vi.stubGlobal('fetch', fetchImpl);
+
+      const result = await runEnrichment(peerEnv(d1), { max: 10 });
+      expect(result.enriched).toBe(1);
+      expect(urls.some((u) => u.endsWith('/api/market/profile/BRK.B'))).toBe(true);
+      expect(urls.some((u) => u.includes('BRK%2F') || u.includes('BRK/B'))).toBe(false);
+
+      const row = db.prepare(
+        'SELECT ticker, company_name, sector, country, market_cap, enrichment_error FROM securities_ref WHERE ticker = ?',
+      ).get('BRK/B');
+      expect(db.prepare('SELECT ticker FROM securities_ref WHERE ticker = ?').get('BRK.B')).toBeUndefined();
+      expect(row?.company_name).toBeTruthy();
+      expect(row?.sector).toBe('Financial Services');
+      expect(row?.country).toBeNull();
+      expect(row?.market_cap).toBeTruthy();
+      expect(row?.enrichment_error).toBeNull();
+    } finally {
+      close();
+    }
+  });
+
+  it('retries a ticker-shaped no-provider tombstone once and keeps that error on a clean miss', async () => {
+    const { db, d1, close } = await openMigratedD1();
+    try {
+      db.prepare(
+        `INSERT INTO transactions (id, ticker, asset_name, tx_date, source, created_at)
+         VALUES ('tx-z', 'ZZZZ', 'ZZZZ', '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error)
+         VALUES ('ZZZZ', '2026-01-01T00:00:00.000Z', 'no provider data')`,
+      ).run();
+
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (String(url).includes('/api/market/profile/')) {
+          return new Response(JSON.stringify({ ref: null }), {
+            status: 404,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+      });
+      vi.stubGlobal('fetch', fetchImpl);
+      const env = peerEnv(d1);
+
+      const first = await runEnrichment(env, { max: 10 });
+      expect(first.scanned).toBe(1);
+      expect(first.enriched).toBe(0);
+      const row = db.prepare('SELECT enrichment_error, source FROM securities_ref WHERE ticker = ?').get('ZZZZ');
+      expect(row?.enrichment_error).toBe(NO_PROVIDER_DATA_ERROR);
+      expect(String(row?.source)).toContain('socratic');
+
+      fetchImpl.mockClear();
+      const second = await runEnrichment(env, { max: 10 });
+      expect(second.scanned).toBe(0);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      close();
+    }
+  });
+
+  it('marks a municipal name not an equity and does not select it again', async () => {
+    const { db, d1, close } = await openMigratedD1();
+    try {
+      db.prepare(
+        `INSERT INTO transactions (id, ticker, asset_name, tx_date, source, created_at)
+         VALUES ('tx-m', 'DALLAS WATER MUNICIPAL BOND', 'DALLAS WATER MUNICIPAL BOND', '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+      ).run();
+
+      const fetchImpl = vi.fn(async () => new Response('nope', { status: 500 }));
+      vi.stubGlobal('fetch', fetchImpl);
+      const env = peerEnv(d1);
+
+      const first = await runEnrichment(env, { max: 10 });
+      expect(first.scanned).toBe(1);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      const row = db.prepare('SELECT enrichment_error, enriched_at FROM securities_ref WHERE ticker = ?').get('DALLAS WATER MUNICIPAL BOND');
+      expect(row?.enrichment_error).toBe(NOT_AN_EQUITY_ERROR);
+      expect(row?.enriched_at).toBeTruthy();
+
+      const second = await runEnrichment(env, { max: 10 });
+      expect(second.scanned).toBe(0);
+      const still = db.prepare('SELECT enrichment_error FROM securities_ref WHERE ticker = ?').get('DALLAS WATER MUNICIPAL BOND');
+      expect(still?.enrichment_error).toBe(NOT_AN_EQUITY_ERROR);
+    } finally {
+      close();
+    }
+  });
+
+  it('does not classify a normal ticker as non-equity when the peer has no profile', async () => {
+    const { db, d1, close } = await openMigratedD1();
+    try {
+      db.prepare(
+        `INSERT INTO transactions (id, ticker, asset_name, tx_date, source, created_at)
+         VALUES ('tx-a', 'AAPL', 'AAPL', '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+      ).run();
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (String(url).includes('/api/market/profile/')) {
+          return new Response(JSON.stringify({ ref: null }), {
+            status: 404,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } });
+      });
+      vi.stubGlobal('fetch', fetchImpl);
+
+      await runEnrichment(peerEnv(d1), { max: 10 });
+      const row = db.prepare('SELECT enrichment_error FROM securities_ref WHERE ticker = ?').get('AAPL');
+      expect(row?.enrichment_error).toBe(NO_PROVIDER_DATA_ERROR);
     } finally {
       close();
     }
