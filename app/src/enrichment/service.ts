@@ -18,7 +18,7 @@ import { all, run } from '../shared/db.ts';
 import type { SqlParam } from '../shared/db.ts';
 import { mergeRefs } from './compute.ts';
 import { buildSecProvider } from './sec.ts';
-import { buildSocraticProvider } from './socratic.ts';
+import { buildSocraticProvider, isTickerShapedSymbol } from './socratic.ts';
 import { getSharedFmpPacer, getSharedEdgarPacer } from '../shared/pace.ts';
 import type { EnrichmentProvider, SecurityRef } from './types.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
@@ -68,12 +68,17 @@ function missingDisplayCriticalSql(alias: string): string {
  * never a clean "no data" result). `enriched_at` stays NULL for these, so the
  * ticker remains selectable by the base `enrichmentNeededSql` predicate (which
  * only tests `enriched_at`); only a DETERMINISTIC no-data outcome (every
- * provider returned null without throwing) tombstones a ticker permanently via
- * `upsertEmpty`. The marker itself provides attempt-aging: each consecutive
+ * provider returned null without throwing) tombstones a ticker via
+ * `upsertEmpty`.  A ticker-shaped tombstone is eligible for one more peer
+ * attempt until that attempt is recorded on `source`.  The transient marker
+ * provides attempt-aging: each consecutive
  * transient miss doubles the backoff (capped), so a sustained outage or a
  * broken key/rate-limit doesn't get hammered every single cron tick while
  * still recovering automatically once the provider is healthy again.
  */
+export const NO_PROVIDER_DATA_ERROR = 'no provider data';
+export const NOT_AN_EQUITY_ERROR = 'not an equity';
+
 const TRANSIENT_RETRY_PREFIX = 'transient-retry:';
 const TRANSIENT_RETRY_BASE_BACKOFF_MS = 60 * 60 * 1000; // 1 hour
 const TRANSIENT_RETRY_MAX_BACKOFF_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -118,11 +123,90 @@ export function nextTransientRetryMarker(raw: string | null | undefined, now = D
 }
 
 /**
+ * Obvious non-equity: the ticker or asset name contains MUNICIPAL, TREASURY,
+ * or CORPORATE BOND, or the ticker is more than one word and is not
+ * ticker-shaped.  A normal 1-5 letter symbol is never classified just because
+ * a profile is missing (a keyword has to be on that symbol itself, and those
+ * phrases are longer than five letters).
+ */
+export function obviousNonEquity(ticker: string, assetName?: string | null): boolean {
+  const raw = ticker.trim().toUpperCase();
+  const name = (assetName ?? '').toUpperCase();
+  // A normal 1-5 letter ticker stays eligible.  A missing profile is not a classification.
+  if (/^[A-Z]{1,5}$/.test(raw)) return false;
+  const keyword = (s: string) =>
+    s.includes('MUNICIPAL') || s.includes('TREASURY') || s.includes('CORPORATE BOND');
+  // Ticker-shaped symbols (including BRK/B → BRK.B) are classified only when the
+  // symbol itself contains a non-equity marker such as TREASURY.
+  if (isTickerShapedSymbol(raw)) return keyword(raw);
+  if (keyword(raw) || keyword(name)) return true;
+  return raw.split(/\s+/).filter(Boolean).length > 1;
+}
+
+/** SQLite GLOB complement is `^` (this build treats `!` as a literal). */
+function tickerShapedExprSql(expr: string): string {
+  return `(LENGTH(${expr}) BETWEEN 1 AND 10
+    AND ${expr} GLOB '[A-Z]*'
+    AND NOT (${expr} GLOB '*[^A-Z0-9.]*'))`;
+}
+
+/** `BRK/B` / `BF/B` → dotted peer symbol.  Same rule as `peerProfileSymbol`. */
+function aliasedTickerSql(col: string): string {
+  const upper = `UPPER(${col})`;
+  const slash = [
+    "'[A-Z]/[A-Z]'",
+    "'[A-Z][A-Z]/[A-Z]'",
+    "'[A-Z][A-Z][A-Z]/[A-Z]'",
+    "'[A-Z][A-Z][A-Z][A-Z]/[A-Z]'",
+    "'[A-Z][A-Z][A-Z][A-Z][A-Z]/[A-Z]'",
+  ].map((glob) => `${upper} GLOB ${glob}`).join(' OR ');
+  return `CASE WHEN ${slash} THEN REPLACE(${upper}, '/', '.') ELSE ${upper} END`;
+}
+
+/** Spaces or non-equity words on a name.  `LP` is a token so ALPHABET is not a hit. */
+function nameBlocksTombstoneRetrySql(col: string): string {
+  const u = `UPPER(IFNULL(${col}, ''))`;
+  return `(INSTR(IFNULL(${col}, ''), ' ') > 0
+    OR ${u} LIKE '%MUNICIPAL%'
+    OR ${u} LIKE '%TREASURY%'
+    OR ${u} LIKE '%BOND%'
+    OR ${u} LIKE '%FUND%'
+    OR ${u} = 'LP'
+    OR ${u} LIKE 'LP %'
+    OR ${u} LIKE '% LP'
+    OR ${u} LIKE '% LP %'
+    OR ${u} LIKE '% LP.%'
+    OR ${u} LIKE '%L.P.%')`;
+}
+
+/**
+ * One more peer attempt for a ticker-shaped `no provider data` tombstone whose
+ * `source` does not yet record socratic.  A space, or MUNICIPAL / TREASURY /
+ * BOND / FUND / LP, on the ticker or on any asset name blocks the retry.
+ *
+ * The keyed form of `enrichmentNeededSql` references `transactions`.  Every
+ * caller already joins that table as the ticker source.
+ */
+function tickerShapedTombstoneRetrySql(alias: string): string {
+  return `(${alias}.enrichment_error = '${NO_PROVIDER_DATA_ERROR}'
+    AND (${alias}.source IS NULL OR ${alias}.source NOT LIKE '%socratic%')
+    AND ${tickerShapedExprSql(aliasedTickerSql(`${alias}.ticker`))}
+    AND NOT ${nameBlocksTombstoneRetrySql(`${alias}.ticker`)}
+    AND NOT EXISTS (
+      SELECT 1 FROM transactions tx_ne
+      WHERE tx_ne.ticker = ${alias}.ticker
+        AND ${nameBlocksTombstoneRetrySql('tx_ne.asset_name')}
+    ))`;
+}
+
+/**
  * SQL predicate for tickers still worth enriching. With no keyed provider, one
  * SEC/EDGAR pass is enough; EDGAR cannot fill country or market cap. Once a
  * keyed provider exists, retry EDGAR/imported rows that are still missing
- * display-critical company metadata. Rows already attempted by a keyed source
- * are not hammered forever if the provider itself lacks a field.
+ * display-critical company metadata, and retry a ticker-shaped
+ * "no provider data" tombstone once.  Rows already attempted by a keyed source
+ * are not hammered forever if the provider itself lacks a field.  Country is
+ * not invented when the peer omits it.
  */
 export function enrichmentNeededSql(alias = 'sr', retryIncompleteWithKeyedProvider = false): string {
   if (!retryIncompleteWithKeyedProvider) {
@@ -133,7 +217,8 @@ export function enrichmentNeededSql(alias = 'sr', retryIncompleteWithKeyedProvid
           OR (${missingDisplayCriticalSql(alias)}
               AND NOT ${keyedSourceTriedSql(alias)}
               AND (${alias}.enrichment_error IS NULL OR ${alias}.enrichment_error = ''
-                   OR ${alias}.enrichment_error LIKE '${TRANSIENT_RETRY_PREFIX}%')))`;
+                   OR ${alias}.enrichment_error LIKE '${TRANSIENT_RETRY_PREFIX}%'))
+          OR ${tickerShapedTombstoneRetrySql(alias)})`;
 }
 
 /**
@@ -217,6 +302,7 @@ export async function addDailyUsed(env: Env, n: number): Promise<number> {
 export interface EnrichCandidate {
   ticker: string;
   enrichmentError: string | null;
+  assetName: string | null;
 }
 
 /** Distinct tickers that still need enrichment, newest-traded first. */
@@ -226,9 +312,11 @@ export async function selectTickersToEnrich(
   retryIncompleteWithKeyedProvider = false,
 ): Promise<EnrichCandidate[]> {
   if (limit <= 0) return [];
-  const rows = await all<{ ticker: string; enrichment_error: string | null }>(
+  const rows = await all<{ ticker: string; enrichment_error: string | null; asset_name: string | null }>(
     env.DB,
-    `SELECT t.ticker AS ticker, MAX(sr.enrichment_error) AS enrichment_error
+    `SELECT t.ticker AS ticker,
+            MAX(sr.enrichment_error) AS enrichment_error,
+            MAX(t.asset_name) AS asset_name
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> ''
@@ -238,7 +326,11 @@ export async function selectTickersToEnrich(
       LIMIT ?`,
     [limit],
   );
-  return rows.map((r) => ({ ticker: r.ticker, enrichmentError: r.enrichment_error ?? null }));
+  return rows.map((r) => ({
+    ticker: r.ticker,
+    enrichmentError: r.enrichment_error ?? null,
+    assetName: r.asset_name ?? null,
+  }));
 }
 
 export interface EnrichResult {
@@ -334,6 +426,12 @@ export async function runEnrichment(
     if (!transientRetryEligible(candidate.enrichmentError, runStartedAt)) continue;
     const ticker = candidate.ticker;
     result.scanned++;
+    if (obviousNonEquity(ticker, candidate.assetName)) {
+      // Leave the retry set without asking the peer.  A normal 1-5 letter miss
+      // never reaches here.
+      if (!dryRun) await upsertEmpty(env, ticker, NOT_AN_EQUITY_ERROR);
+      continue;
+    }
     // Quality-ranked chain (best first). Each provider fills only what better
     // ones missed; we stop early once the display-critical fields are covered.
     const collected: Array<Partial<SecurityRef>> = [];
@@ -372,7 +470,7 @@ export async function runEnrichment(
           // Deterministic no-data (every provider ran cleanly and found
           // nothing): tombstone only when a keyed provider was actually
           // consulted; a key-less SEC-only miss stays eligible.
-          await upsertEmpty(env, ticker, 'no provider data');
+          await upsertEmpty(env, ticker, NO_PROVIDER_DATA_ERROR, true);
         }
       }
       continue;
@@ -506,12 +604,23 @@ async function upsertRef(env: Env, ref: SecurityRef): Promise<void> {
   );
 }
 
-async function upsertEmpty(env: Env, ticker: string, err: string): Promise<void> {
+async function upsertEmpty(env: Env, ticker: string, err: string, recordPeerAttempt = false): Promise<void> {
+  // A clean miss keeps the error text.  Recording socratic on `source` is what
+  // makes the ticker-shaped tombstone ineligible for a second retry.
+  const peerSource = recordPeerAttempt ? 'socratic' : null;
   await run(
     env.DB,
-    `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error) VALUES (?,?,?)
-     ON CONFLICT(ticker) DO UPDATE SET enriched_at=excluded.enriched_at, enrichment_error=excluded.enrichment_error`,
-    [ticker, new Date().toISOString(), err],
+    `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error, source) VALUES (?,?,?,?)
+     ON CONFLICT(ticker) DO UPDATE SET
+       enriched_at=excluded.enriched_at,
+       enrichment_error=excluded.enrichment_error,
+       source=CASE
+         WHEN ? = 0 THEN securities_ref.source
+         WHEN securities_ref.source IS NULL OR securities_ref.source = '' THEN excluded.source
+         WHEN securities_ref.source LIKE '%socratic%' THEN securities_ref.source
+         ELSE securities_ref.source || '+socratic'
+       END`,
+    [ticker, new Date().toISOString(), err, peerSource, recordPeerAttempt ? 1 : 0],
   );
 }
 

@@ -15,7 +15,7 @@
  */
 
 import type { Chamber, Env } from '../shared/types.ts';
-import { all, batch, get, run } from '../shared/db.ts';
+import { all, batch, get, isSqliteLockBusy, run, withSqliteLockRetry } from '../shared/db.ts';
 import { sameFilerIdentity } from '../shared/filerIdentityMatch.ts';
 import {
   getConfig,
@@ -553,16 +553,22 @@ async function recordSourceAttempt(
   error: string | null,
 ): Promise<void> {
   try {
-    await run(
+    await withSqliteLockRetry(() => run(
       env.DB,
       `INSERT INTO source_attempts (source, attempted_at, outcome, new_count, error)
        VALUES (?, ?, ?, ?, ?)`,
       [source, attemptedAt, outcome, newCount, error?.slice(0, 1000) ?? null],
-    );
+    ));
   } catch (err) {
-    // Deploys briefly run new code before /api/admin/migrate. Do not convert a
+    // Deploys briefly run new code before /api/admin/migrate.  Do not convert a
     // source success/failure into a different result solely because the new
-    // observability table is not present yet.
+    // observability table is not present yet.  A missing table is one warn and
+    // no retry.  A busy database is retried, then logged, and still does not
+    // fail the poll.
+    if (isSqliteLockBusy(err)) {
+      console.error('watcher: failed to record source attempt:', source, (err as Error).message);
+      return;
+    }
     console.warn('watcher: failed to record source attempt:', source, (err as Error).message);
   }
 }

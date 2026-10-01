@@ -24,6 +24,27 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 
 export const SOCRATIC_PROFILE_PATH = '/api/market/profile/';
 
+/** Berkshire-style share class as filed (`BRK/B`, `BF/B`).  Peer history is dotted (`BRK.B`). */
+const SLASH_SHARE_CLASS = /^[A-Z]{1,5}\/[A-Z]$/;
+
+/** Symbol shape the peer can be asked about.  Applied after the slash-to-dot alias. */
+const TICKER_SHAPED = /^[A-Z][A-Z0-9.]{0,9}$/;
+
+/**
+ * Symbol to put on the peer profile URL.  `BRK/B` is requested as `BRK.B`
+ * (dotted, not `BRK-B`).  The caller still stores the ref on the original ticker.
+ */
+export function peerProfileSymbol(ticker: string): string {
+  const upper = ticker.trim().toUpperCase();
+  if (SLASH_SHARE_CLASS.test(upper)) return upper.replace('/', '.');
+  return upper;
+}
+
+/** True when the peer symbol (after the slash alias) is ticker-shaped. */
+export function isTickerShapedSymbol(ticker: string): boolean {
+  return TICKER_SHAPED.test(peerProfileSymbol(ticker));
+}
+
 function str(v: unknown): string | null {
   return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
 }
@@ -115,7 +136,7 @@ export function buildSocraticProvider(
   return {
     name: 'socratic',
     async fetchRef(ticker: string): Promise<Partial<SecurityRef> | null> {
-      const symbol = ticker.trim().toUpperCase();
+      const symbol = peerProfileSymbol(ticker);
       if (!origin || !symbol || surfaceMissing) return null;
       const url = `${origin}${SOCRATIC_PROFILE_PATH}${encodeURIComponent(symbol)}`;
       const res = await trackedFetch(url, { headers }, {

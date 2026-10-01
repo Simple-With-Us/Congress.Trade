@@ -48,6 +48,38 @@ export async function all<T = Record<string, unknown>>(
   return res?.results ?? [];
 }
 
+/**
+ * True for a SQLite lock the caller must not treat as "unavailable, continue".
+ * A missing table during migrate is not one of these.
+ */
+export function isSqliteLockBusy(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.includes('SQLITE_BUSY')
+    || message.includes('database is locked')
+    || message.includes('SQL statements in progress')
+  );
+}
+
+/** Waits before each retry. Three retries, then the last error is rethrown. */
+export const SQLITE_LOCK_BUSY_RETRY_DELAYS_MS = [50, 150, 400] as const;
+
+/**
+ * Re-run `op` when SQLite is busy or a statement is already in progress.
+ * Any other error throws on the first failure, so a missing table is not retried.
+ */
+export async function withSqliteLockRetry<T>(op: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (err) {
+      const delayMs = SQLITE_LOCK_BUSY_RETRY_DELAYS_MS[attempt];
+      if (!isSqliteLockBusy(err) || delayMs === undefined) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 /** Execute a write (INSERT/UPDATE/DELETE) and return the D1 meta result. */
 export async function run(
   db: D1Database,
@@ -154,12 +186,21 @@ export function chunkArray<T>(items: readonly T[], size = 90): T[][] {
 }
 
 /**
- * Execute PRAGMA busy_timeout = 10000; on a database connection to enforce
+ * Per-connection wait before SQLITE_BUSY. `busy_timeout` does not retry
+ * SQLITE_BUSY_SNAPSHOT; multi-statement writers still need BEGIN IMMEDIATE
+ * (`D1DatabaseShim.batch` uses libsql `"write"` mode for that).
+ */
+export const SQLITE_BUSY_TIMEOUT_MS = 10_000;
+
+export const SQLITE_BUSY_TIMEOUT_PRAGMA = `PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`;
+
+/**
+ * Execute PRAGMA busy_timeout on a database connection to enforce
  * write-lock discipline and prevent instant SQLITE_BUSY errors under concurrency.
  */
 export async function ensureBusyTimeout(db: D1Database): Promise<void> {
   try {
-    await db.prepare('PRAGMA busy_timeout = 10000;').run();
+    await db.prepare(SQLITE_BUSY_TIMEOUT_PRAGMA).run();
   } catch {
     /* ignore if unsupported in mock environment */
   }

@@ -64,6 +64,26 @@ levels:
 
 dbs:
   - path: /data/congress-trade/db.sqlite
+    # CONGRESS-TRADE-1M / 1J (2026-10-01, sibling of the 2026-09-29 ~500MB
+    # truncate storm). Litestream 0.5.13 holds a long read transaction so only
+    # it can checkpoint, then at truncate-page-n (default ~500MB / 121359
+    # pages) it runs wal_checkpoint(TRUNCATE). That exclusive lock waits on
+    # every reader while the app's writes return SQLITE_BUSY; the cron tick
+    # skips, and house/senate polling stays dark until someone stops the
+    # process and truncates by hand.
+    #
+    # On THIS pin, truncate-page-n: 0 disables that blocking checkpoint.
+    # Later Litestream releases changed 0 to mean "keep the default" — do not
+    # bump scripts/fetch-litestream.sh off 0.5.13 without revisiting this.
+    # PASSIVE checkpoints stay on: ~4MB (min-checkpoint-page-count) and every
+    # 30s after a real write. busy-timeout is Litestream's own wait for short
+    # app writes (PASSIVE itself does not block). The app must not hold a
+    # second connection's read snapshot across those attempts — see
+    # src/deno/sqliteClient.ts.
+    busy-timeout: 5s
+    checkpoint-interval: 30s
+    min-checkpoint-page-count: 1000
+    truncate-page-n: 0
     replica:
       type: s3
       # Expected production values (Infisical congress-trade prod project):
