@@ -186,12 +186,21 @@ export function chunkArray<T>(items: readonly T[], size = 90): T[][] {
 }
 
 /**
- * Execute PRAGMA busy_timeout = 10000; on a database connection to enforce
+ * Per-connection wait before SQLITE_BUSY. `busy_timeout` does not retry
+ * SQLITE_BUSY_SNAPSHOT; multi-statement writers still need BEGIN IMMEDIATE
+ * (`D1DatabaseShim.batch` uses libsql `"write"` mode for that).
+ */
+export const SQLITE_BUSY_TIMEOUT_MS = 10_000;
+
+export const SQLITE_BUSY_TIMEOUT_PRAGMA = `PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`;
+
+/**
+ * Execute PRAGMA busy_timeout on a database connection to enforce
  * write-lock discipline and prevent instant SQLITE_BUSY errors under concurrency.
  */
 export async function ensureBusyTimeout(db: D1Database): Promise<void> {
   try {
-    await db.prepare('PRAGMA busy_timeout = 10000;').run();
+    await db.prepare(SQLITE_BUSY_TIMEOUT_PRAGMA).run();
   } catch {
     /* ignore if unsupported in mock environment */
   }

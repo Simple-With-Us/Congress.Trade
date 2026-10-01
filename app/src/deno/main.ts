@@ -22,6 +22,7 @@ import { resolveProductionDatadogEnv } from '../shared/datadogRuntime.ts';
 import { captureException, initProductionSentry } from '#sentry';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
+import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
 
 // 1. Initialize the KV namespace used for configuration and Infisical caching.
 // Deno KV Connect does not support queues, so queue bindings are attached only
@@ -148,22 +149,15 @@ if (!tursoUrl || tursoUrl.includes('dummy-url')) {
   console.warn("WARNING: TURSO_DATABASE_URL is missing after resolving secrets. The app is falling back to a dummy URL, which means database connections will fail. Ensure INFISICAL_APP_CLIENT_ID and INFISICAL_APP_CLIENT_SECRET are set in Coolify.");
 }
 
-// 3. Initialize Turso DB Shim
-const libsqlClient = createClient({
-  url: tursoUrl || 'libsql://dummy-url.turso.io', // Provide a valid dummy URL to prevent crash at boot
-  authToken: tursoToken,
-});
+// 3. Initialize Turso DB Shim.
+// File URLs (production /data/congress-trade/db.sqlite) use one connection
+// and a per-connection busy timeout. See sqliteClient.ts (CONGRESS-TRADE-1M).
+const libsqlClient = createClient(libsqlClientOptions(
+  tursoUrl || 'libsql://dummy-url.turso.io', // Provide a valid dummy URL to prevent crash at boot
+  tursoToken,
+));
 
-// Execute connection pragmas for performance and concurrency resilience
-async function initSqlite(client: typeof libsqlClient) {
-  await client.execute("PRAGMA journal_mode = WAL;").catch(() => {});
-  await client.execute("PRAGMA foreign_keys = ON;").catch(() => {});
-  await client.execute("PRAGMA busy_timeout = 10000;").catch(() => {});
-  await client.execute("PRAGMA synchronous = NORMAL;").catch(() => {});
-  await client.execute("PRAGMA cache_size = -64000;").catch(() => {});
-  await client.execute("PRAGMA mmap_size = 268435456;").catch(() => {});
-}
-await initSqlite(libsqlClient);
+await applySqliteConnectionPragmas(libsqlClient);
 
 const dbShim = new D1DatabaseShim(libsqlClient);
 tursoDbShim = dbShim;
