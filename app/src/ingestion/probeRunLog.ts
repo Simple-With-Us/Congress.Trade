@@ -49,7 +49,7 @@
  */
 
 import type { Env } from '../shared/types.ts';
-import { all, run } from '../shared/db.ts';
+import { all, run, withSqliteLockRetry } from '../shared/db.ts';
 
 /** A single probe attempt against one provider/chamber lane. */
 export interface ProbeRun {
@@ -139,7 +139,7 @@ export function boundedLeadSec(
 /** Record one probe attempt. Best-effort: never throws into the probe path. */
 export async function recordProbeRun(env: Env, probe: ProbeRun): Promise<void> {
   try {
-    await run(
+    await withSqliteLockRetry(() => run(
       env.DB,
       `INSERT INTO provider_probe_runs (provider, chamber, ran_at, ok, rows_seen, error)
        VALUES (?, ?, ?, ?, ?, ?)
@@ -155,7 +155,7 @@ export async function recordProbeRun(env: Env, probe: ProbeRun): Promise<void> {
         Number.isFinite(probe.rowsSeen) ? probe.rowsSeen : 0,
         probe.error ? String(probe.error).slice(0, MAX_ERROR_LEN) : null,
       ],
-    );
+    ));
   } catch (err) {
     console.warn(`probe run log: could not record ${probe.provider}/${probe.chamber}:`, (err as Error).message);
   }

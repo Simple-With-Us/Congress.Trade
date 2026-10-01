@@ -6,6 +6,7 @@
  */
 
 import type { Env } from '../shared/types.ts';
+import { isSqliteLockBusy } from '../shared/db.ts';
 import { flushD1Budget } from '../shared/d1Budget.ts';
 import { maybeRunDailyJobs } from '../jobs.ts';
 import { runWatcher } from '../ingestion/watcher.ts';
@@ -37,7 +38,7 @@ export interface PendingWorkProbe {
 export interface ScheduledTickResult {
   profile: DenoCostProfile['name'];
   skippedDrain: boolean;
-  /** True when another live tick holds the singleton lock; no lanes ran. */
+  /** True when no lanes ran: the singleton lock was held, or the lock write was busy. */
   skippedOverlap: boolean;
   /** True when the AbortSignal stopped the pipeline between lanes. */
   aborted: boolean;
@@ -58,6 +59,15 @@ export interface ScheduledTickResult {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Busy lock errors must not fail open.  A second tick on the same connection
+ * keeps the WAL from truncating.  A missing table during migrate still
+ * fail-opens, or that gap parks the whole pipeline.
+ */
+export function tickLockErrorShouldFailOpen(err: unknown): boolean {
+  return !isSqliteLockBusy(err);
 }
 
 /**
@@ -476,9 +486,10 @@ export async function runScheduledTick(
   };
 
   // Singleton guard: a second tick (cron overlap or admin runtime-tick) exits
-  // immediately instead of racing watcher/outbox writes. Fail-open when the
-  // lock statement itself errors so a KV-table problem cannot park all
-  // background work.
+  // immediately instead of racing watcher/outbox writes.  A busy lock must not
+  // fail open.  That second tick shares this connection and the WAL cannot
+  // truncate.  Any other lock error (a missing table during migrate) still
+  // fail-opens so a schema gap cannot park background work.
   let lock: TickSingletonLock | null = null;
   try {
     lock = await acquireDenoCronSingleton(
@@ -489,6 +500,11 @@ export async function runScheduledTick(
     );
   } catch (err) {
     errors.push(`tick_singleton_unavailable: ${errorText(err)}`);
+    if (!tickLockErrorShouldFailOpen(err)) {
+      result.skippedOverlap = true;
+      console.error('Deno tick singleton lock busy; skipping tick:', err);
+      return result;
+    }
     console.error('Deno tick singleton lock unavailable; running unguarded:', err);
   }
   if (!lock && !errors.some((entry) => entry.startsWith('tick_singleton_unavailable'))) {

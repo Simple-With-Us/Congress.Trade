@@ -6,7 +6,9 @@ import {
   hasDrainableWork,
   probePendingWork,
   runScheduledTick,
+  tickLockErrorShouldFailOpen,
 } from '../scheduledTick.ts';
+import { withSqliteLockRetry } from '../../shared/db.ts';
 import type { DenoCostProfile } from '../costProfile.ts';
 import type { DurableQueueHandlers } from '../durableQueue.ts';
 
@@ -430,5 +432,84 @@ describe('runScheduledTick singleton + abort', () => {
     expect(result.errors).toContain('tick: aborted');
     expect(refreshSecrets).not.toHaveBeenCalled();
     expect(maybeRunAgreementAutopublish).not.toHaveBeenCalled();
+  });
+
+  it('does not fail open on a busy, locked, or in-progress singleton lock', () => {
+    expect(tickLockErrorShouldFailOpen(new Error('SQLITE_BUSY'))).toBe(false);
+    expect(tickLockErrorShouldFailOpen(new Error('database is locked'))).toBe(false);
+    expect(tickLockErrorShouldFailOpen(new Error('cannot commit transaction - SQL statements in progress'))).toBe(false);
+    expect(tickLockErrorShouldFailOpen(new Error('no such table: deno_runtime_kv'))).toBe(true);
+  });
+
+  it('skips the tick when acquiring the singleton lock throws SQLITE_BUSY', async () => {
+    const { db } = await makeDb();
+    const busy = {
+      prepare(sql: string) {
+        const stmt = db.prepare(sql);
+        return {
+          bind(...args: unknown[]) {
+            stmt.bind(...args);
+            return {
+              run: async () => {
+                throw new Error('SQLITE_BUSY: database is locked');
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await runScheduledTick(
+        testEnv(busy),
+        emptyHandlers(),
+        FREE,
+        new Date('2026-07-25T12:00:00.000Z'),
+      );
+      expect(result.skippedOverlap).toBe(true);
+      expect(result.errors).toEqual([
+        'tick_singleton_unavailable: SQLITE_BUSY: database is locked',
+      ]);
+      expect(refreshSecrets).not.toHaveBeenCalled();
+      expect(maybeRunAgreementAutopublish).not.toHaveBeenCalled();
+      expect(errorSpy.mock.calls.some((args) => String(args[0]).includes('running unguarded'))).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('still runs the tick when the singleton lock table is missing', async () => {
+    const { client, db } = await makeDb();
+    await client.execute('DROP TABLE deno_runtime_kv');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await runScheduledTick(
+        testEnv(db),
+        emptyHandlers(),
+        FREE,
+        new Date('2026-07-25T12:00:00.000Z'),
+      );
+      expect(result.skippedOverlap).toBe(false);
+      expect(result.errors.some((entry) => entry.startsWith('tick_singleton_unavailable:') && entry.includes('no such table'))).toBe(true);
+      expect(refreshSecrets).toHaveBeenCalledOnce();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('retries a busy write three times and does not retry a missing table', async () => {
+    let busyCalls = 0;
+    await expect(withSqliteLockRetry(async () => {
+      busyCalls += 1;
+      throw new Error('SQLITE_BUSY: database is locked');
+    })).rejects.toThrow('SQLITE_BUSY');
+    expect(busyCalls).toBe(4);
+
+    let missingCalls = 0;
+    await expect(withSqliteLockRetry(async () => {
+      missingCalls += 1;
+      throw new Error('no such table: source_attempts');
+    })).rejects.toThrow('no such table');
+    expect(missingCalls).toBe(1);
   });
 });
