@@ -228,7 +228,7 @@ export async function buildPriceNeedsExport(
     env.DB,
     `SELECT MIN(tx_date) AS d FROM transactions
       WHERE deprecated_at IS NULL AND ticker IS NOT NULL AND ticker <> ''
-        AND tx_date IS NOT NULL AND tx_date <> ''`,
+        AND tx_date >= '1990-01-01'`,
   );
   const spxCached = await get<{ mn: string | null; mx: string | null }>(
     env.DB,
