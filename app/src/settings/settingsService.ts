@@ -184,7 +184,7 @@ export function appSettings(): AppSettings {
 export function startSettingsRefresh(env: Env, intervalMs?: number): void {
   stopSettingsRefresh();
   const ttlSeconds = parsePositiveInt(
-    (env as Record<string, string | undefined>).INFISICAL_CACHE_TTL_SECONDS,
+    (env as unknown as Record<string, string | undefined>).INFISICAL_CACHE_TTL_SECONDS,
     300,
     3600,
   );
