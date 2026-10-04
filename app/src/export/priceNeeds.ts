@@ -193,7 +193,8 @@ export async function buildPriceNeedsExport(
           FROM transactions t
          WHERE t.deprecated_at IS NULL
            AND t.ticker IS NOT NULL AND t.ticker <> ''
-           AND t.tx_date IS NOT NULL AND t.tx_date <> '') AS distinct_tickers,
+           AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+           AND t.tx_date >= '1990-01-01') AS distinct_tickers,
        (SELECT COUNT(*) FROM (
           SELECT t.ticker
             FROM transactions t
@@ -214,6 +215,7 @@ export async function buildPriceNeedsExport(
          WHERE t.deprecated_at IS NULL
            AND t.ticker IS NOT NULL AND t.ticker <> ''
            AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+           AND t.tx_date >= '1990-01-01'
            AND (tp.price_at_trade IS NULL OR tp.price_at_trade <= 0)) AS miss_price,
        (SELECT COUNT(*)
           FROM transactions t
@@ -221,6 +223,7 @@ export async function buildPriceNeedsExport(
          WHERE t.deprecated_at IS NULL
            AND t.ticker IS NOT NULL AND t.ticker <> ''
            AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+           AND t.tx_date >= '1990-01-01'
            AND (tp.spx_at_trade IS NULL OR tp.spx_at_trade <= 0)) AS miss_spx`,
     [firstUnavailableCutoff, unavailableCutoff, freshThrough],
   );

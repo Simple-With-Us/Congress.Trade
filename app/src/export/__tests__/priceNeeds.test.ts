@@ -154,6 +154,21 @@ describe('buildPriceNeedsExport', () => {
     const out = await buildPriceNeedsExport(env, { limit: 50, cursor: null }, NOW);
     expect(out.tickers.map((t) => t.ticker)).toEqual(['VISIBLE']);
   });
+
+  it('ignores pre-1990 dates in the oldest-trade window and the missing-anchor counts', async () => {
+    const opened = await openMigratedD1();
+    close = opened.close;
+    const { db, d1 } = opened;
+    seedTrade(db, { id: 'old', ticker: 'GARBAGE', txDate: '1202-07-02' });
+    seedTrade(db, { id: 'live', ticker: 'NEED', txDate: '2020-01-15' });
+    const out = await buildPriceNeedsExport({ DB: d1 } as never, { limit: 50, cursor: null }, NOW);
+    expect(out.tickers.map((t) => t.ticker)).toEqual(['NEED']);
+    expect(out.tickers[0].oldestTradeDate).toBe('2020-01-15');
+    expect(out.spx.oldestTradeDate).toBe('2020-01-15');
+    expect(out.summary.distinctTickers).toBe(1);
+    expect(out.summary.tradesMissingPriceAnchor).toBe(1);
+    expect(out.summary.tradesMissingSpxAnchor).toBe(1);
+  });
 });
 
 describe('GET /price-needs route', () => {

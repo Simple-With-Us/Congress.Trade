@@ -249,7 +249,7 @@ export async function selectTickersNeedingPrices(
     `SELECT t.ticker AS ticker
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
-      WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL
+      WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
         AND (
           sr.latest_price_date IS NULL
           OR sr.latest_price_date < ?

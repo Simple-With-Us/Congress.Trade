@@ -10355,7 +10355,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                ?
              FROM transactions t
              LEFT JOIN filings f ON f.doc_id = t.doc_id
-             WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+             WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> '' AND t.tx_date >= '1990-01-01'
              ON CONFLICT(tx_id) DO UPDATE SET
                price_at_trade=excluded.price_at_trade, spx_at_trade=excluded.spx_at_trade,
                price_at_filing=excluded.price_at_filing, spx_at_filing=excluded.spx_at_filing,
@@ -11211,7 +11211,7 @@ export async function marketPending(env: Env): Promise<{ enrich: number; prices:
     `SELECT COUNT(*) AS n FROM (
        SELECT t.ticker FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
-       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL
+       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
          AND NOT EXISTS (SELECT 1 FROM price_eod pe WHERE pe.ticker = t.ticker)
          AND NOT (
            COALESCE(sr.price_unavailable, 0) <> 0
