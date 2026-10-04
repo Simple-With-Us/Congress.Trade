@@ -18,6 +18,7 @@ import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { z } from 'zod';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -304,6 +305,16 @@ function worstStatus(a: PipelineStatus, b: PipelineStatus): PipelineStatus {
 /** Weekday poll floor is at most 30 minutes, so 45 minutes is one missed slot. Weekend cadence is hourly, so 90 minutes does not flap a healthy hourly poll. */
 const WEEKDAY_POLL_MAX_AGE_HOURS = 0.75;
 const WEEKEND_POLL_MAX_AGE_HOURS = 1.5;
+
+/**
+ * Shape of an `fmp-latency:http429:` KV value (boundary data — validated, not
+ * asserted). markFmpSlotHttp429 stores the raw flag text "1"; a legacy writer
+ * shape `{count: n}` is also accepted. Anything else is rejected by the reader.
+ */
+export const Http429ValueSchema = z.union([
+  z.string(),
+  z.object({ count: z.number() }).strict(),
+]);
 
 function isEtWeekend(nowMs: number): boolean {
   const weekday = new Intl.DateTimeFormat('en-US', {
@@ -1051,27 +1062,32 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
 
   // 2026-09-21: count 24h 429s across both FMP latency slots. Cheaper to read
   // than to maintain a separate counter on every probe — keys auto-expire
-  // after 36h anyway (see tradeLatency.ts:644-686 for the key shape).
+  // after 48h anyway (see tradeLatency.ts:644-686 for the key shape).
   try {
-    const kvList = await env.CONFIG_KV.list<{ count?: number }>({ prefix: 'fmp-latency:http429:key' });
+    const kvList = await env.CONFIG_KV.list({ prefix: 'fmp-latency:http429:key' });
     let total = 0;
     for (const k of kvList.keys) {
-      // markFmpSlotHttp429 stores the raw flag "1", not {"count": n}.  A json
-      // read of that flag throws, and one throw used to leave the whole 24h
-      // counter null so the health line said "0 429s" either way.
-      let n = 0;
+      // Read as text first: markFmpSlotHttp429 stores the raw flag "1", and a
+      // 'json' read of that flag returns the number 1 (no throw), whose .count
+      // is undefined — the old catch fallback was unreachable and the counter
+      // silently summed 0 for every key.
+      let raw: string | null = null;
       try {
-        const parsed = await env.CONFIG_KV.get(k.name, 'json');
-        n = Number((parsed as { count?: number } | null)?.count ?? 0);
+        raw = await env.CONFIG_KV.get(k.name);
       } catch {
-        try {
-          const raw = await env.CONFIG_KV.get(k.name);
-          const asNum = Number(raw);
-          n = Number.isFinite(asNum) && asNum > 0 ? asNum : 0;
-        } catch {
-          n = 0;
-        }
+        raw = null;
       }
+      if (raw == null) continue;
+      let value: unknown = raw;
+      try {
+        value = JSON.parse(raw);
+      } catch {
+        value = raw;
+      }
+      const parsed = Http429ValueSchema.safeParse(value);
+      if (!parsed.success) continue; // malformed value: reject, don't coerce
+      const v = parsed.data;
+      const n = typeof v === 'string' ? Number(v) : v.count;
       if (Number.isFinite(n) && n > 0) total += n;
     }
     if (fmpLatency) fmpLatency.http429s24h = total;
