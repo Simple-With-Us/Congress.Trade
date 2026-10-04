@@ -12964,6 +12964,7 @@ function renderAccount() {
     // Theme stays out of the signed-out top bar (owner: it dumped Light/Dark/System
     // into the header).  Default is light; theme lives in the hamburger.
     var authGroup = '<span class="acct-auth-group">' +
+      '<a class="btn ghost sm" href="/beta" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:inline-flex;align-items:center;">iOS Beta</a>' +
       '<button class="btn ghost sm" type="button" onclick="openLogin()">Sign In</button>' +
       (checkoutConfigured() ? '<button class="btn sm" type="button" onclick="openPricing()">Upgrade</button>' : '') +
       '</span>';
