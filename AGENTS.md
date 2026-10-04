@@ -7,6 +7,16 @@
 >
 > Owner action items (this PR does not have the credentials): register the App Group on the App ID `trade.congress.ios` in the Apple Developer Portal; host `apple-app-site-association` on `congress.trade`.  Full rollout: `docs/rollouts/2026-09-22-app-group-and-domain.md`.  Fleet-wide context: `/Users/jay/.minimax/sessions/mvs_0bdfe8c73c1046a986df888aa99dcb2e/workspace/fleet-bundle-id-plan.md`.
 
+## Infisical Sole Source of Truth
+
+Infisical is the sole source of truth for secrets, env config, and tunable settings knobs (fleet directive 2026-10-03).  Full policy + key inventory: repo-root `INFISICAL.md` — read it before touching any setting.
+
+- Runtime: `app/src/settings/settingsService.ts` — `initSettings(env)` at boot (in-memory snapshot), `appSettings().get*()` reads (memory only, never per-request), `startSettingsRefresh()` + SIGHUP + tick-lane refresh (failures keep last-known-good), `settings.set()` write-through (Infisical FIRST, then cache; failed write fails the save).
+- The shared-package `createInfisicalSettings` helper was NOT adopted: this is a Deno runtime and the repo's own `app/src/secrets/infisical.ts` is the vendored equivalent already wired through boot, refresh, and admin write-through — importing the npm-shaped helper would add a rewrite with no behavioral gain.
+- Tunable knobs live in the `APP_SETTINGS` schema (`congress-trade` Infisical project, prod env).  Do NOT add direct `Deno.env.get('CT_...')` reads for knobs — route through the settings service.
+- Admin surface: `GET/PUT /api/admin/settings` behind the existing `/api/admin/*` auth gate (401 for non-admins; writes rejected with 403 in preview deployments).  No new auth system.
+- Per-user settings (notification prefs, sessions, browser UI state) stay in SQLite/KV and are explicitly out of scope.
+
 ## Codex Cloud protocol bootstrap
 
 Run `bash .codex/setup.sh` during cloud provisioning and `bash .codex/maintenance.sh` on

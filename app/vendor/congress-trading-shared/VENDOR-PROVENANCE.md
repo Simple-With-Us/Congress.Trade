@@ -1,11 +1,11 @@
 # congress-trading-shared provenance
 
-- Upstream: `https://github.com/jaywedgeworth22/congress-trading-shared`
-- Immutable release: `v2.7.0`
-- Commit: `5748e53d209908fa76dfee5a1834c0c15d03cff3`
-- Imported: `2026-09-15`
+- Upstream: `https://github.com/Simple-With-Us/congress-trading-shared`
+- Immutable release: `v2.7.1`
+- Commit: `5084afb3ffb269e7e28e0c30c880cab7d93409e7`
+- Imported: `2026-10-03`
 - Imported paths: `src/`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, and `LICENSE`
-- Local source modifications: synced with upstream v2.5.2 (sub-$1,001 STOCK_ACT_BRACKETS tier, TxType B/S/E coercion, IsoDateTimeSchema, TradeEventRowSchema, AnalystRowSchema.asOfTimestamp upstreamed).
+- Local source modifications: none — vendored `src/` is byte-identical to the upstream v2.7.1 tag.  Earlier drift (sub-$1,001 STOCK_ACT_BRACKETS tier, TxType B/S/E coercion, IsoDateTimeSchema, TradeEventRowSchema, AnalystRowSchema.asOfTimestamp) was upstreamed and is covered by APPROVED-DRIFT.patch as a historical record.  New in this bump: the zero-dependency `infisicalSettings` module (upstream pilot PR #329); Congress.Trade does not adopt `createInfisicalSettings` itself — the Deno runtime uses `app/src/secrets/infisical.ts` — the module is vendored only for source parity.
 
 Congress.Trade's Deno import map resolves the package to `src/index.ts`; the
 checked-in `dist/` and root compatibility files are older, unused build
