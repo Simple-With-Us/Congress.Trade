@@ -227,7 +227,9 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
       rows.sort((a, b) => Number(a.cursor_seq ?? 0) - Number(b.cursor_seq ?? 0));
     }
     // Page LIMIT is last; an earlier LIMIT is the cheap twin-candidate window (#2062).
-    const limitMatches = [...sql.matchAll(/LIMIT\s+(\d+)/gi)];
+    // The latency join's LIMIT 1 is not the page size.
+    const pageSql = sql.replace(/LEFT JOIN trade_latency_candidates[\s\S]*$/i, '');
+    const limitMatches = [...pageSql.matchAll(/LIMIT\s+(\d+)/gi)];
     const limit = Number(limitMatches.at(-1)?.[1] ?? rows.length);
     const offsetMatch = sql.match(/OFFSET\s+(\d+)/i);
     const offset = offsetMatch ? Number(offsetMatch[1]) : 0;

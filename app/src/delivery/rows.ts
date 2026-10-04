@@ -107,6 +107,17 @@ export interface FeedTransactionRow extends TransactionRow {
   ref_country?: string | null;
   ref_exchange_short?: string | null;
   ref_asset_class?: string | null;
+  /** Present only when the feed SELECT aliases `fl.party`.  SSE/CSV omit it. */
+  filer_party?: string | null;
+  price_at_trade?: number | null;
+  spx_at_trade?: number | null;
+  price_at_filing?: number | null;
+  spx_at_filing?: number | null;
+  latency_provider?: string | null;
+  latency_observed_at?: string | null;
+  latency_provider_published_at?: string | null;
+  latency_congress_first_seen_at?: string | null;
+  latency_status?: string | null;
 }
 
 export interface SubscriptionRow {
@@ -208,6 +219,61 @@ export function mapTransaction(row: TransactionRow): Transaction {
  * mapTransaction so the webhook/normalizer paths (which never join filers) are
  * unaffected.
  */
+function selectedNumber(row: object, key: string): number | null | undefined {
+  if (!Object.prototype.hasOwnProperty.call(row, key)) return undefined;
+  const value = (row as Record<string, unknown>)[key];
+  if (value == null || value === '') return null;
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Later minus earlier, in seconds.  Same rounding as admin disclosure-latency. */
+function deltaSeconds(later: string | null, earlier: string | null): number | null {
+  if (!later || !earlier) return null;
+  const a = Date.parse(later);
+  const b = Date.parse(earlier);
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.round((a - b) / 1000) : null;
+}
+
+const LATENCY_ROW_KEYS = [
+  'latency_provider',
+  'latency_observed_at',
+  'latency_provider_published_at',
+  'latency_congress_first_seen_at',
+  'latency_status',
+] as const;
+
+/**
+ * One latency object, or null when the columns were selected and every one is
+ * null.  Undefined when this query did not select the latency columns.
+ */
+function feedLatency(row: FeedTransactionRow): Transaction['latency'] {
+  if (!LATENCY_ROW_KEYS.some((key) => Object.prototype.hasOwnProperty.call(row, key))) return undefined;
+  const provider = row.latency_provider ?? null;
+  const observedAt = row.latency_observed_at ?? null;
+  const providerPublishedAt = row.latency_provider_published_at ?? null;
+  const congressFirstSeenAt = row.latency_congress_first_seen_at ?? null;
+  const status = row.latency_status ?? null;
+  if (
+    provider == null &&
+    observedAt == null &&
+    providerPublishedAt == null &&
+    congressFirstSeenAt == null &&
+    status == null
+  ) {
+    return null;
+  }
+  return {
+    provider,
+    observedAt,
+    providerPublishedAt,
+    congressFirstSeenAt,
+    providerDeltaSec: deltaSeconds(observedAt, congressFirstSeenAt),
+    providerPublishedDeltaSec: deltaSeconds(providerPublishedAt, congressFirstSeenAt),
+    status,
+  };
+}
+
 export function mapFeedTransaction(row: FeedTransactionRow): Transaction {
   const transaction = mapTransaction(row);
 
@@ -219,7 +285,7 @@ export function mapFeedTransaction(row: FeedTransactionRow): Transaction {
   transaction.assetName =
     resolveAssetDisplayName(row.asset_name, row.ticker, row.ref_company_name) || transaction.assetName;
 
-  return sanitizeCompetitorPublication({
+  const mapped = sanitizeCompetitorPublication({
     ...transaction,
     fullName: row.filer_full_name ? (cleanFilerName(row.filer_full_name) || row.filer_full_name) : null,
     state: row.filer_state,
@@ -252,6 +318,20 @@ export function mapFeedTransaction(row: FeedTransactionRow): Transaction {
     refExchangeShort: row.ref_exchange_short,
     refAssetClass: row.ref_asset_class,
   });
+  if (Object.prototype.hasOwnProperty.call(row, 'filer_party')) {
+    mapped.party = row.filer_party ?? null;
+  }
+  const priceAtTrade = selectedNumber(row, 'price_at_trade');
+  const spxAtTrade = selectedNumber(row, 'spx_at_trade');
+  const priceAtFiling = selectedNumber(row, 'price_at_filing');
+  const spxAtFiling = selectedNumber(row, 'spx_at_filing');
+  if (priceAtTrade !== undefined) mapped.priceAtTrade = priceAtTrade;
+  if (spxAtTrade !== undefined) mapped.spxAtTrade = spxAtTrade;
+  if (priceAtFiling !== undefined) mapped.priceAtFiling = priceAtFiling;
+  if (spxAtFiling !== undefined) mapped.spxAtFiling = spxAtFiling;
+  const latency = feedLatency(row);
+  if (latency !== undefined) mapped.latency = latency;
+  return mapped;
 }
 
 export function mapSubscription(row: SubscriptionRow): Subscription {
@@ -660,6 +740,33 @@ const REF_SELECT =
   'sr.market_cap_bucket AS ref_market_cap_bucket, sr.country AS ref_country, ' +
   'sr.exchange_short AS ref_exchange_short, sr.asset_class AS ref_asset_class, ';
 
+/** Price anchors plus one latency candidate.  Outer feed SELECT only. */
+const FEED_ENRICH_SELECT =
+  'txp.price_at_trade AS price_at_trade, txp.spx_at_trade AS spx_at_trade, ' +
+  'txp.price_at_filing AS price_at_filing, txp.spx_at_filing AS spx_at_filing, ' +
+  'tlc.provider AS latency_provider, tlc.provider_first_seen_at AS latency_observed_at, ' +
+  'tlc.provider_published_at AS latency_provider_published_at, ' +
+  'tlc.congress_first_seen_at AS latency_congress_first_seen_at, tlc.status AS latency_status ';
+
+/**
+ * Left joins after the page is already limited.  tx_performance is 1:1 on tx_id.
+ * The latency join is one row: correlated LIMIT 1 on rowid, preferring status
+ * `matched`, then the earliest provider_first_seen_at.  A miss leaves the
+ * latency columns NULL and does not multiply feed rows.
+ */
+const FEED_ENRICH_JOINS =
+  'LEFT JOIN tx_performance txp ON txp.tx_id = t.id ' +
+  'LEFT JOIN trade_latency_candidates tlc ON tlc.rowid = (' +
+  'SELECT c.rowid FROM trade_latency_candidates c ' +
+  'WHERE c.doc_id = t.doc_id ' +
+  "AND c.status = 'matched' " +
+  "AND (c.ticker IS NULL OR c.ticker = '' OR UPPER(c.ticker) = UPPER(COALESCE(t.ticker, ''))) " +
+  "AND (c.tx_date IS NULL OR c.tx_date = '' OR c.tx_date = t.tx_date) " +
+  "AND (c.tx_type IS NULL OR c.tx_type = '' OR c.tx_type = t.tx_type) " +
+  "ORDER BY CASE WHEN c.status = 'matched' THEN 0 ELSE 1 END, " +
+  "CASE WHEN c.provider_first_seen_at IS NULL OR c.provider_first_seen_at = '' THEN 1 ELSE 0 END, " +
+  'c.provider_first_seen_at, c.provider LIMIT 1) ';
+
 /** SQL expression resolving the chamber, preferring the filers table. */
 const CHAMBER_EXPR = 'COALESCE(fl.chamber, f.chamber)';
 
@@ -980,11 +1087,12 @@ export function buildTransactionsQuery(p: TxQueryParams): BuiltQuery {
       : `${orderExpr} ${direction}, t.cursor_seq ${direction}`;
 
   const selectList =
-    `SELECT t.*, ${CHAMBER_EXPR} AS __chamber, COALESCE(fl.display_name, fl.full_name) AS __member_name, fl.party AS __party, ` +
+    `SELECT t.*, ${CHAMBER_EXPR} AS __chamber, COALESCE(fl.display_name, fl.full_name) AS __member_name, fl.party AS __party, fl.party AS filer_party, ` +
     'COALESCE(fl.display_name, fl.full_name) AS filer_full_name, fl.state AS filer_state, ' +
     'fl.photo_url AS filer_photo_url, fl.resolved_bioguide_id AS filer_bioguide_id, ' +
     REF_SELECT +
-    'f.filed_date AS filing_filed_date, f.first_seen_at AS filing_first_seen_at, f.source_url AS filing_source_url, f.raw_object_key AS filing_raw_object_key ';
+    'f.filed_date AS filing_filed_date, f.first_seen_at AS filing_first_seen_at, f.source_url AS filing_source_url, f.raw_object_key AS filing_raw_object_key, ' +
+    FEED_ENRICH_SELECT;
 
   const pageLimitClause =
     `LIMIT ${limit}` + (offset > 0 ? ` OFFSET ${offset}` : '');
@@ -1012,25 +1120,37 @@ export function buildTransactionsQuery(p: TxQueryParams): BuiltQuery {
       ') t ' +
       'LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id ' +
       'LEFT JOIN filings f ON f.doc_id = t.doc_id ' +
-      'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker';
+      'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
+      FEED_ENRICH_JOINS;
     return { sql, params, limit, offset };
   }
 
   const sql =
     selectList +
     'FROM (' +
-    'SELECT t.* ' +
+    // The page LIMIT below must apply BEFORE the enrichment joins: the latency
+    // join carries a correlated subquery, and evaluating it once per page row
+    // (<= limit) instead of once per candidate row (up to ~8800 on deep pages)
+    // is the difference between a bounded lookup and a full candidate scan.
+    // The middle ORDER BY re-applies the page order after twin-dedupe; it
+    // sorts on a projected __sort_key because the sort expression can
+    // reference the filings join, which is not in scope at this level.
+    'SELECT t.* FROM (' +
+    'SELECT t.*, ' +
+    `(${orderExpr}) AS __sort_key ` +
     TX_FROM_JOINS_LITE +
     `WHERE ${cheapWhere} ` +
     `ORDER BY ${orderClause} ` +
     `LIMIT ${candidateLimit}` +
     ') t ' +
+    `WHERE ${TWIN_DEDUPE_SQL} ` +
+    `ORDER BY __sort_key ${direction}, t.cursor_seq ${direction} ` +
+    pageLimitClause +
+    ') t ' +
     'LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id ' +
     'LEFT JOIN filings f ON f.doc_id = t.doc_id ' +
     'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    `WHERE ${TWIN_DEDUPE_SQL} ` +
-    `ORDER BY ${orderClause} ` +
-    pageLimitClause;
+    FEED_ENRICH_JOINS;
 
   return { sql, params, limit, offset };
 }

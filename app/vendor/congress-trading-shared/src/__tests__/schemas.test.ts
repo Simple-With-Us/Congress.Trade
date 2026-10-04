@@ -585,6 +585,74 @@ describe("TransactionsPageSchema", () => {
     ).toBe(false);
   });
 
+  it("keeps live ingestion sources and the disclosure fields the read schema used to strip", () => {
+    const latency = {
+      provider: "fmp",
+      observedAt: "2026-01-16T00:00:00Z",
+      providerPublishedAt: "2026-01-16T01:00:00Z",
+      congressFirstSeenAt: "2026-01-16T00:00:10Z",
+      providerDeltaSec: 12,
+      providerPublishedDeltaSec: 50,
+      status: "matched",
+    };
+    for (const source of ["competitor_backfill", "local_mac", "server_cpu"] as const) {
+      const parsed = TransactionsPageSchema.safeParse({
+        transactions: [{
+          ...validTx,
+          source,
+          party: "D",
+          bioguideId: "P000197",
+          pdfUrl: "/api/documents/doc-1/pdf",
+          disclosureLagDays: -2,
+          stockActStatus: "on_time",
+          priceAtTrade: 10.5,
+          spxAtTrade: 5000,
+          priceAtFiling: 11,
+          spxAtFiling: 5010,
+          latency,
+        }],
+        cursor: 50,
+        count: 1,
+        total: 100,
+        limit: 20,
+      });
+      expect(parsed.success).toBe(true);
+      if (!parsed.success) continue;
+      expect(parsed.data.transactions[0]).toMatchObject({
+        source,
+        party: "D",
+        bioguideId: "P000197",
+        pdfUrl: "/api/documents/doc-1/pdf",
+        disclosureLagDays: -2,
+        stockActStatus: "on_time",
+        priceAtTrade: 10.5,
+        spxAtTrade: 5000,
+        priceAtFiling: 11,
+        spxAtFiling: 5010,
+        latency,
+      });
+    }
+    expect(TransactionsPageSchema.safeParse({
+      transactions: [{ ...validTx, source: "unknown_source" }],
+      cursor: 50,
+      count: 1,
+      total: 100,
+      limit: 20,
+    }).success).toBe(false);
+    const emptyLatency = TransactionsPageSchema.safeParse({
+      transactions: [{ ...validTx, latency: null, priceAtTrade: null }],
+      cursor: 50,
+      count: 1,
+      total: 100,
+      limit: 20,
+    });
+    expect(emptyLatency.success).toBe(true);
+    if (emptyLatency.success) {
+      expect(emptyLatency.data.transactions[0].latency).toBeNull();
+      expect(emptyLatency.data.transactions[0].priceAtTrade).toBeNull();
+    }
+  });
+
   it("rejects read rows missing required cursor provenance", () => {
     const { cursorSeq: _cursorSeq, ...withoutCursor } = validTx;
     expect(TransactionsPageSchema.safeParse({
@@ -1437,6 +1505,23 @@ describe("ClientTradeSchema", () => {
       source: "unknown_source",
     };
     expect(ClientTradeSchema.safeParse(valid).success).toBe(false);
+  });
+
+  it("accepts the live ingestion sources and still rejects an invented one", () => {
+    const base = {
+      id: "trade-1",
+      cursor: 42,
+      docId: "doc-1",
+      member: { id: null, name: null, chamber: null, party: null, state: null, photoUrl: null },
+      asset: { name: "Apple Inc.", ticker: "AAPL", type: null, sector: null, marketCapBucket: null },
+      transaction: { date: null, type: "P", owner: null, amountMin: null, amountMax: null, isOption: false },
+      filing: { filedDate: null, firstSeenAt: null, sourceUrl: null },
+      confidence: 0.95,
+    };
+    for (const source of ["local_mac", "server_cpu", "competitor_backfill"] as const) {
+      expect(ClientTradeSchema.safeParse({ ...base, source }).success).toBe(true);
+    }
+    expect(ClientTradeSchema.safeParse({ ...base, source: "unknown_source" }).success).toBe(false);
   });
 });
 

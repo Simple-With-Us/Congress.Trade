@@ -52,6 +52,20 @@ describe('asTxSource', () => {
 });
 
 describe('buildTransactionsQuery', () => {
+  it('left-joins price and one latency row on the page, not on count or csv', () => {
+    const nested = buildTransactionsQuery({});
+    expect(nested.sql).toContain('LEFT JOIN tx_performance txp ON txp.tx_id = t.id');
+    expect(nested.sql).toContain('trade_latency_candidates tlc');
+    expect(nested.sql).toContain('LIMIT 1');
+    const unnested = buildTransactionsQuery({ memberName: 'Pelo' });
+    expect(unnested.sql).toContain('LEFT JOIN tx_performance txp ON txp.tx_id = t.id');
+    expect(unnested.sql).toContain('trade_latency_candidates tlc');
+    expect(buildTransactionsCountQuery({}).sql).not.toContain('tx_performance');
+    expect(buildTransactionsCountQuery({}).sql).not.toContain('trade_latency_candidates');
+    expect(buildTransactionsExportQuery({}).sql).not.toContain('tx_performance');
+    expect(buildTransactionsExportQuery({}).sql).not.toContain('trade_latency_candidates');
+  });
+
   it('always filters cursor_seq > since (defaulting since to 0) and orders by cursor ASC', () => {
     const q = buildTransactionsQuery({});
     expect(q.sql).toContain('t.cursor_seq > ?');
@@ -158,7 +172,7 @@ describe('buildTransactionsQuery', () => {
     expect(q.sql).toContain('LEFT JOIN filings f ON f.doc_id = t.doc_id');
     expect(q.sql).toContain('COALESCE(fl.chamber, f.chamber) = ?');
     expect(q.params).toEqual([0, 'senate']);
-    expect(q.sql).toContain('SELECT t.* FROM transactions t');
+    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
     expect(q.sql).toContain(`LIMIT ${twinCandidateLimit(DEFAULT_TX_LIMIT, 0)}`);
   });
 
@@ -172,7 +186,7 @@ describe('buildTransactionsQuery', () => {
         "ELSE 'O' END) IN (?)",
     );
     expect(q.params).toEqual([0, 'D']);
-    expect(q.sql).toContain('SELECT t.* FROM transactions t');
+    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
     expect(q.sql).toContain(`LIMIT ${twinCandidateLimit(DEFAULT_TX_LIMIT, 0)}`);
     const count = buildTransactionsCountQuery({ partyBuckets: ['D', 'R'] });
     expect(count.sql).toContain('IN (?, ?)');
@@ -198,8 +212,19 @@ describe('buildTransactionsQuery', () => {
   it('nests a cheap candidate window when memberName requires filers', () => {
     const q = buildTransactionsQuery({ memberName: 'Pelo' });
     expect(q.sql).toContain("LOWER(COALESCE(fl.full_name, t.filer_id, '')) LIKE ?");
-    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM transactions t/);
+    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
     expect(q.sql).toContain('LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id');
+  });
+
+  it('limits the page before the enrichment joins on the non-nested path', () => {
+    // The latency join carries a correlated subquery: it must run once per
+    // page row, not once per candidate row, so the page LIMIT has to sit in
+    // a derived table below the enrichment joins.
+    const q = buildTransactionsQuery({ memberName: 'Pelo' });
+    expect(q.sql).toMatch(/LIMIT 100\) t LEFT JOIN filers fl/);
+    const enrichIdx = q.sql.indexOf('LEFT JOIN tx_performance txp');
+    const pageLimitIdx = q.sql.indexOf('LIMIT 100) t');
+    expect(enrichIdx).toBeGreaterThan(pageLimitIdx);
   });
 
   it('selects the resolved chamber + politician name alongside t.*', () => {
@@ -656,6 +681,58 @@ describe('mapFeedTransaction', () => {
   it('leaves a genuinely unknown asset (no ref, no useful ticker match) as its filing text', () => {
     const tx = mapFeedTransaction(feedRow({ asset_name: 'Securities', ticker: null, ref_company_name: null }));
     expect(tx.assetName).toBe('Securities');
+  });
+
+  it('omits price, party, and latency when the query did not select them', () => {
+    const tx = mapFeedTransaction(feedRow());
+    expect(tx.priceAtTrade).toBeUndefined();
+    expect(tx.party).toBeUndefined();
+    expect(tx.latency).toBeUndefined();
+  });
+
+  it('maps price anchors, raw party, and one latency object when those columns are present', () => {
+    const tx = mapFeedTransaction(feedRow({
+      filer_party: 'Democratic',
+      price_at_trade: 10.5,
+      spx_at_trade: 5000,
+      price_at_filing: 11,
+      spx_at_filing: 5010,
+      latency_provider: 'fmp',
+      latency_observed_at: '2026-01-16T00:00:12.000Z',
+      latency_provider_published_at: '2026-01-16T00:01:00.000Z',
+      latency_congress_first_seen_at: '2026-01-16T00:00:00.000Z',
+      latency_status: 'matched',
+    }));
+    expect(tx.party).toBe('Democratic');
+    expect(tx.priceAtTrade).toBe(10.5);
+    expect(tx.spxAtTrade).toBe(5000);
+    expect(tx.priceAtFiling).toBe(11);
+    expect(tx.spxAtFiling).toBe(5010);
+    expect(tx.latency).toEqual({
+      provider: 'fmp',
+      observedAt: '2026-01-16T00:00:12.000Z',
+      providerPublishedAt: '2026-01-16T00:01:00.000Z',
+      congressFirstSeenAt: '2026-01-16T00:00:00.000Z',
+      providerDeltaSec: 12,
+      providerPublishedDeltaSec: 60,
+      status: 'matched',
+    });
+  });
+
+  it('publishes latency null when the columns were selected and no candidate matched', () => {
+    const tx = mapFeedTransaction(feedRow({
+      price_at_trade: null,
+      spx_at_trade: null,
+      price_at_filing: null,
+      spx_at_filing: null,
+      latency_provider: null,
+      latency_observed_at: null,
+      latency_provider_published_at: null,
+      latency_congress_first_seen_at: null,
+      latency_status: null,
+    }));
+    expect(tx.priceAtTrade).toBeNull();
+    expect(tx.latency).toBeNull();
   });
 });
 

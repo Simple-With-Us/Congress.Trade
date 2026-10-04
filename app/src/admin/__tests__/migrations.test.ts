@@ -69,6 +69,7 @@ import {
   GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS,
   UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS,
   LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
+  FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../../benchmark/schema.ts';
 import {
@@ -296,6 +297,7 @@ describe('admin migration bootstrap', () => {
       ...GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS,
       ...UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS,
       ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
+      ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
     ]);
   });
 
@@ -305,6 +307,12 @@ describe('admin migration bootstrap', () => {
     expect(sql).toContain("error LIKE '%phantom%'");
     expect(sql).toContain("DELETE FROM ingestion_outbox");
     expect(sql).toContain("DELETE FROM filings");
+  });
+
+  it('indexes trade_latency_candidates by doc_id for the feed join (0099)', () => {
+    const sql = FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('idx_trade_latency_candidates_doc');
+    expect(sql).toContain('trade_latency_candidates (doc_id, ticker, tx_date, tx_type)');
   });
 
   it('adds observed-vs-claimed time provenance on latency snapshots (0098)', () => {
