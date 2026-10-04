@@ -1379,6 +1379,17 @@ export const LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS = [
       AND time_provenance IS NULL`,
 ] as const;
 
+/**
+ * 0099_feed_latency_join_index.sql
+ * GET /api/transactions looks up one trade_latency_candidates row by doc_id.
+ * The file migration creates the index.  POST_0024 must create the same
+ * object or the file-vs-admin schema snapshot diverges.
+ */
+export const FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS = [
+  `CREATE INDEX IF NOT EXISTS idx_trade_latency_candidates_doc
+     ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1533,6 +1544,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS,
   // 0098_latency_time_provenance.sql
   ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
+  // 0099_feed_latency_join_index.sql
+  ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [
