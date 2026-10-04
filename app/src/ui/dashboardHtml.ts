@@ -4078,6 +4078,9 @@ ${speedProofSectionHtml(true)}
   </section>
 
   <footer class="site-footer">
+    <a href="https://simplewithus.com" target="_blank" rel="noopener noreferrer">
+      <img src="/assets/simple-with-us.webp" alt="Simple With Us - Jay Wedgeworth" style="height: 18px; margin-bottom: 6px; opacity: 0.9;" />
+    </a>
     <span>Congress.Trade  ·  educational tool for public STOCK Act (2012) disclosures  ·  not financial advice  ·  $ estimated from brackets  ·  independent/private service not affiliated with or endorsed/sponsored by any government agency</span>
     <span class="footer-links">
       <a href="/privacy-policy">Privacy</a>
