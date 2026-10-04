@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] — 2026-09-15
+
+### Added
+- `scripts/cloud-setup.sh` (and `.devcontainer/devcontainer.json`) for cold Code Cloud, Codespaces, and throwaway clones — runs `npm ci --include=dev` + `npm run build` idempotently.
+- `AGENTS.md` Fleet Recall pointer that requires a corpus search before re-deriving a lesson and a contribution at closeout (app slug: `congress-trading-shared`).
+- `normalizeSecurityRef` (`src/client.ts`) now also coerces a producer-supplied `marketCapBucket` to `null` when the string is outside the 6-value mega/large/mid/small/micro/nano enum, and truncates a `currentPriceDate` ISO timestamp down to the `YYYY-MM-DD` segment (or `null`) so a single bad row cannot reject the rest of an enrichment batch.
+
+### Changed
+- `CongressTradeClient.createSubscription(clientId, desiredSecret)` — `clientId` is now optional and only added to the POST body when supplied; the field on the wire is left out of legacy authless callers.
+- Dev dep `vitest` bumped from `^4.1.11` to `^5.0.0` (paired `@vitest/coverage-v8` `^4.1.10` → `^5.0.0`); `zod` peer/dev dep moves to `^4.6.2`; ancillary bumps for `@types/node`, `publint`, and `anthropics/claude-code-action`.
+
+### Fixed
+- `scripts/codex-coordination.sh` — `slack_call` removes its temporary auth config file inside the subshell invocation; `filter_history` now runs Python with `-c` so `sys.stdin` consumes the piped Slack JSON instead of capturing a heredoc.
+- `.github/workflows/auto-merge-prs.yml` — never auto-merge public-fork PRs; the workflow stopped dispatching on `pull_request_target`, switches to a same-repo guard, and refuses to arm auto-merge against `GITHUB_TOKEN` (rollout note: `docs/rollouts/2026-09-13-automerge-fork-guard.md`).
+
 ## [2.6.0] — 2026-08-23
 
 ### Added

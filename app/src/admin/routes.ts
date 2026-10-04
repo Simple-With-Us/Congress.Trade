@@ -5098,6 +5098,64 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     return c.json({ ok: true, secrets: await refreshSecrets(c.env) });
   });
 
+  // --- GET /settings ------------------------------------------------------
+  // App-level tunable knobs (Infisical SOT, see repo-root INFISICAL.md).
+  // Values come from the in-memory settings snapshot — no Infisical read here.
+  // Knob values are non-sensitive; nothing here returns secret material.
+  r.get('/settings', async (c) => {
+    const { appSettings, isSettingsInitialized, APP_SETTINGS } = await import('../settings/settingsService.ts');
+    if (!isSettingsInitialized()) {
+      return c.json({ ok: false, error: 'settings not initialized' }, 503);
+    }
+    const settings = appSettings();
+    return c.json({
+      ok: true,
+      settings: APP_SETTINGS.map((def) => ({
+        key: def.key,
+        source: def.source,
+        description: def.description,
+        value: settings.get(def.key) ?? null,
+      })),
+    });
+  });
+
+  // --- PUT /settings ------------------------------------------------------
+  // Write-through admin save for tunable knobs. Body: { key, value }.
+  // Writes to Infisical FIRST (the save fails if that write fails), then
+  // updates the in-memory snapshot — the two never diverge silently.
+  // Disabled in preview deployments (same as /diagnostics/secrets/update).
+  r.put('/settings', async (c) => {
+    if (isPreviewDeployment(c.env)) {
+      return c.json({
+        ok: false,
+        error: 'App settings updates are disabled in preview deployments',
+        code: 'preview_write_protected',
+      }, 403);
+    }
+    let body: Record<string, unknown> = {};
+    try {
+      const text = await c.req.text();
+      if (text) body = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return c.json({ ok: false, error: 'invalid JSON body' }, 400);
+    }
+    const key = typeof body.key === 'string' ? body.key.trim() : '';
+    const value = typeof body.value === 'string' ? body.value : undefined;
+    if (!key || value === undefined) {
+      return c.json({ ok: false, error: 'Missing key or value' }, 400);
+    }
+    const { appSettings, isSettingsInitialized } = await import('../settings/settingsService.ts');
+    if (!isSettingsInitialized()) {
+      return c.json({ ok: false, error: 'settings not initialized' }, 503);
+    }
+    try {
+      const saved = await appSettings().set(c.env, key, value);
+      return c.json({ ok: true, key, value: saved });
+    } catch (err) {
+      return c.json({ ok: false, error: (err as Error).message }, /Unknown app setting/.test((err as Error).message) ? 400 : 502);
+    }
+  });
+
   // --- GET /ui-settings ---------------------------------------------------
   // Site-wide UI settings the admin controls for ALL visitors (logo style).
   r.get('/ui-settings', async (c) => {
