@@ -1354,10 +1354,33 @@ components:
         amountMin: { type: number, nullable: true }
         amountMax: { type: number, nullable: true }
         owner: { type: string, nullable: true }
-        source: { type: string }
+        source:
+          type: string
+          enum: [primary, seed_dataset, manual, competitor_backfill, local_mac, server_cpu]
         confidence: { type: number }
         cursorSeq: { type: integer }
         createdAt: { type: string, format: date-time }
+        party: { type: string, nullable: true, description: Raw filer party.  Not a display label. }
+        bioguideId: { type: string, nullable: true }
+        pdfUrl: { type: string, nullable: true }
+        disclosureLagDays: { type: number, nullable: true }
+        stockActStatus: { type: string, enum: [on_time, late, severely_late], nullable: true }
+        priceAtTrade: { type: number, nullable: true }
+        spxAtTrade: { type: number, nullable: true }
+        priceAtFiling: { type: number, nullable: true }
+        spxAtFiling: { type: number, nullable: true }
+        latency:
+          type: object
+          nullable: true
+          description: One trade_latency_candidates row.  observedAt is provider_first_seen_at.  Lag seconds are computed, not stored columns.
+          properties:
+            provider: { type: string, nullable: true }
+            observedAt: { type: string, nullable: true }
+            providerPublishedAt: { type: string, nullable: true }
+            congressFirstSeenAt: { type: string, nullable: true }
+            providerDeltaSec: { type: number, nullable: true }
+            providerPublishedDeltaSec: { type: number, nullable: true }
+            status: { type: string, nullable: true }
     PublicFiling:
       type: object
       properties:
