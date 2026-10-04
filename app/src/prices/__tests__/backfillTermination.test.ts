@@ -209,6 +209,15 @@ describe('selectTickersNeedingPrices — no perpetual re-selection', () => {
 
     expect(await selectTickersNeedingPrices(env, 50)).toEqual(['FIRST', 'SECOND', 'THIRD']);
   });
+
+  it('does not select or count a ticker whose only trade is before 1990', async () => {
+    db.prepare(
+      `INSERT INTO transactions (id, ticker, tx_date, source, created_at)
+       VALUES ('tx-ancient', 'ANCIENT', '1202-07-02', 'primary', '2026-01-05T00:00:00Z')`,
+    ).run();
+    expect(await selectTickersNeedingPrices(env, 50)).toEqual([]);
+    expect((await marketPending(env)).prices).toBe(0);
+  });
 });
 
 describe('0043 migration backfill', () => {

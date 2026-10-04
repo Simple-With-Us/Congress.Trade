@@ -101,6 +101,7 @@ export async function buildPriceNeedsExport(
     t.deprecated_at IS NULL
     AND t.ticker IS NOT NULL AND t.ticker <> ''
     AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+    AND t.tx_date >= '1990-01-01'  /* ignore pre-market garbage (e.g. year 1202) in the EOD window math */
     AND ${unavailableExclusionSql()}
   `;
 
@@ -192,7 +193,8 @@ export async function buildPriceNeedsExport(
           FROM transactions t
          WHERE t.deprecated_at IS NULL
            AND t.ticker IS NOT NULL AND t.ticker <> ''
-           AND t.tx_date IS NOT NULL AND t.tx_date <> '') AS distinct_tickers,
+           AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+           AND t.tx_date >= '1990-01-01') AS distinct_tickers,
        (SELECT COUNT(*) FROM (
           SELECT t.ticker
             FROM transactions t
@@ -213,6 +215,7 @@ export async function buildPriceNeedsExport(
          WHERE t.deprecated_at IS NULL
            AND t.ticker IS NOT NULL AND t.ticker <> ''
            AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+           AND t.tx_date >= '1990-01-01'
            AND (tp.price_at_trade IS NULL OR tp.price_at_trade <= 0)) AS miss_price,
        (SELECT COUNT(*)
           FROM transactions t
@@ -220,6 +223,7 @@ export async function buildPriceNeedsExport(
          WHERE t.deprecated_at IS NULL
            AND t.ticker IS NOT NULL AND t.ticker <> ''
            AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+           AND t.tx_date >= '1990-01-01'
            AND (tp.spx_at_trade IS NULL OR tp.spx_at_trade <= 0)) AS miss_spx`,
     [firstUnavailableCutoff, unavailableCutoff, freshThrough],
   );
@@ -228,7 +232,7 @@ export async function buildPriceNeedsExport(
     env.DB,
     `SELECT MIN(tx_date) AS d FROM transactions
       WHERE deprecated_at IS NULL AND ticker IS NOT NULL AND ticker <> ''
-        AND tx_date IS NOT NULL AND tx_date <> ''`,
+        AND tx_date >= '1990-01-01'`,
   );
   const spxCached = await get<{ mn: string | null; mx: string | null }>(
     env.DB,

@@ -249,7 +249,7 @@ export async function selectTickersNeedingPrices(
     `SELECT t.ticker AS ticker
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
-      WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL
+      WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
         AND (
           sr.latest_price_date IS NULL
           OR sr.latest_price_date < ?
@@ -369,7 +369,10 @@ export async function runPriceRefresh(
   );
   const oldestTradeRow = await get<{ d: string | null }>(
     env.DB,
-    "SELECT MIN(tx_date) AS d FROM transactions WHERE tx_date IS NOT NULL AND tx_date <> ''",
+    // Year 1202 (and any other pre-market garbage) must not force a full-history
+    // pull on every run. Seven such rows were keeping the S&P window open back
+    // to the 13th century, so the cheap 7-day incremental path never ran.
+    "SELECT MIN(tx_date) AS d FROM transactions WHERE tx_date >= '1990-01-01'",
   );
   let spxFrom: string;
   if (spxCached?.mx) {
@@ -428,7 +431,7 @@ export async function runPriceRefresh(
       env.DB,
       `SELECT t.id AS id, t.tx_date AS tx_date
          FROM transactions t
-        WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> ''`,
+        WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> '' AND t.tx_date >= '1990-01-01'`,
       [ticker],
     );
     if (trades.length === 0) continue;
@@ -449,10 +452,15 @@ export async function runPriceRefresh(
       'SELECT MIN(date) AS mn, MAX(date) AS mx FROM price_eod WHERE ticker = ?',
       [ticker],
     );
-    let oldestTrade = trades[0].tx_date;
-    for (const t of trades) if (t.tx_date < oldestTrade) oldestTrade = t.tx_date;
+    let oldestTrade: string | null = null;
+    for (const t of trades) {
+      if (t.tx_date < '1990-01-01') continue;
+      if (oldestTrade == null || t.tx_date < oldestTrade) oldestTrade = t.tx_date;
+    }
     let from: string;
-    if (cached?.mx) {
+    if (!oldestTrade) {
+      from = cached?.mx ? isoDaysAgo(7, new Date(cached.mx)) : isoDaysAgo(365 * 5);
+    } else if (cached?.mx) {
       const hasGapBelowCache = cached.mn != null && oldestTrade < cached.mn;
       from = hasGapBelowCache
         ? isoDaysAgo(7, new Date(oldestTrade))
@@ -589,7 +597,7 @@ export async function runPriceRefresh(
          ?
        FROM transactions t
        LEFT JOIN filings f ON f.doc_id = t.doc_id
-       WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+       WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> '' AND t.tx_date >= '1990-01-01'
        ON CONFLICT(tx_id) DO UPDATE SET
          price_at_trade=excluded.price_at_trade,
          spx_at_trade=COALESCE(excluded.spx_at_trade, tx_performance.spx_at_trade),
