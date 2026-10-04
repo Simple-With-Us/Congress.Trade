@@ -3463,7 +3463,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       </div>
     </div>
     <div class="row-flex" id="gateRow" style="margin-top:10px;justify-content:center">
-      <span class="gate-note" data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $9/mo or $80/yr &middot; 1-week free trial
+      <span class="gate-note" data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial
         <button class="btn sm" onclick="openPricing('export')">Start Free Trial</button></span>
     </div>
 
@@ -3840,7 +3840,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         <div id="subsMsg" class="note subs-msg" aria-live="polite"></div>
       </div>
       <div class="row-flex" style="margin-top:20px;justify-content:center" data-premium-cue="alerts">
-        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $9/mo or $80/yr &middot; 1-week free trial
+        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial
           <button class="btn sm" onclick="openPricing('alerts')">Start Free Trial</button></span>
       </div>
     </div>
@@ -7638,7 +7638,7 @@ function updateDeliveryGate() {
   }
   if (!premium) {
     gate.style.display = '';
-    gate.innerHTML = 'You are signed in.&nbsp; Premium is required to create or edit Delivery targets (1-week free trial · $9/mo or $80/yr).&nbsp; Existing deliveries still appear below. '
+    gate.innerHTML = 'You are signed in.&nbsp; Premium is required to create or edit Delivery targets (1-week free trial · $8.99/mo or $79.99/yr).&nbsp; Existing deliveries still appear below. '
       + (checkoutConfigured()
         ? '<button class="btn sm" onclick="openPricing(&quot;alerts&quot;)">Start Free Trial</button>'
         : '<span class="muted">Billing is not configured yet.</span>');

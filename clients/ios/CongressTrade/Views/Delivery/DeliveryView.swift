@@ -49,7 +49,7 @@ struct DeliveryView: View {
                     } header: {
                         Text("Premium")
                     } footer: {
-                        Text("CSV files export according to the filters set on the Trades tab.  Premium is $9/month or $80/year, with a 1-week free trial.")
+                        Text("CSV files export according to the filters set on the Trades tab.  Premium is $8.99/month or $79.99/year, with a 1-week free trial.")
                     }
 
                     Section {
