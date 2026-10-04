@@ -172,7 +172,7 @@ describe('buildTransactionsQuery', () => {
     expect(q.sql).toContain('LEFT JOIN filings f ON f.doc_id = t.doc_id');
     expect(q.sql).toContain('COALESCE(fl.chamber, f.chamber) = ?');
     expect(q.params).toEqual([0, 'senate']);
-    expect(q.sql).toContain('SELECT t.* FROM transactions t');
+    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
     expect(q.sql).toContain(`LIMIT ${twinCandidateLimit(DEFAULT_TX_LIMIT, 0)}`);
   });
 
@@ -186,7 +186,7 @@ describe('buildTransactionsQuery', () => {
         "ELSE 'O' END) IN (?)",
     );
     expect(q.params).toEqual([0, 'D']);
-    expect(q.sql).toContain('SELECT t.* FROM transactions t');
+    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
     expect(q.sql).toContain(`LIMIT ${twinCandidateLimit(DEFAULT_TX_LIMIT, 0)}`);
     const count = buildTransactionsCountQuery({ partyBuckets: ['D', 'R'] });
     expect(count.sql).toContain('IN (?, ?)');
@@ -212,8 +212,19 @@ describe('buildTransactionsQuery', () => {
   it('nests a cheap candidate window when memberName requires filers', () => {
     const q = buildTransactionsQuery({ memberName: 'Pelo' });
     expect(q.sql).toContain("LOWER(COALESCE(fl.full_name, t.filer_id, '')) LIKE ?");
-    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM transactions t/);
+    expect(q.sql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
     expect(q.sql).toContain('LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id');
+  });
+
+  it('limits the page before the enrichment joins on the non-nested path', () => {
+    // The latency join carries a correlated subquery: it must run once per
+    // page row, not once per candidate row, so the page LIMIT has to sit in
+    // a derived table below the enrichment joins.
+    const q = buildTransactionsQuery({ memberName: 'Pelo' });
+    expect(q.sql).toMatch(/LIMIT 100\) t LEFT JOIN filers fl/);
+    const enrichIdx = q.sql.indexOf('LEFT JOIN tx_performance txp');
+    const pageLimitIdx = q.sql.indexOf('LIMIT 100) t');
+    expect(enrichIdx).toBeGreaterThan(pageLimitIdx);
   });
 
   it('selects the resolved chamber + politician name alongside t.*', () => {

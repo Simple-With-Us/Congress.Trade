@@ -759,6 +759,7 @@ const FEED_ENRICH_JOINS =
   'LEFT JOIN trade_latency_candidates tlc ON tlc.rowid = (' +
   'SELECT c.rowid FROM trade_latency_candidates c ' +
   'WHERE c.doc_id = t.doc_id ' +
+  "AND c.status = 'matched' " +
   "AND (c.ticker IS NULL OR c.ticker = '' OR UPPER(c.ticker) = UPPER(COALESCE(t.ticker, ''))) " +
   "AND (c.tx_date IS NULL OR c.tx_date = '' OR c.tx_date = t.tx_date) " +
   "AND (c.tx_type IS NULL OR c.tx_type = '' OR c.tx_type = t.tx_type) " +
@@ -1127,19 +1128,29 @@ export function buildTransactionsQuery(p: TxQueryParams): BuiltQuery {
   const sql =
     selectList +
     'FROM (' +
-    'SELECT t.* ' +
+    // The page LIMIT below must apply BEFORE the enrichment joins: the latency
+    // join carries a correlated subquery, and evaluating it once per page row
+    // (<= limit) instead of once per candidate row (up to ~8800 on deep pages)
+    // is the difference between a bounded lookup and a full candidate scan.
+    // The middle ORDER BY re-applies the page order after twin-dedupe; it
+    // sorts on a projected __sort_key because the sort expression can
+    // reference the filings join, which is not in scope at this level.
+    'SELECT t.* FROM (' +
+    'SELECT t.*, ' +
+    `(${orderExpr}) AS __sort_key ` +
     TX_FROM_JOINS_LITE +
     `WHERE ${cheapWhere} ` +
     `ORDER BY ${orderClause} ` +
     `LIMIT ${candidateLimit}` +
     ') t ' +
+    `WHERE ${TWIN_DEDUPE_SQL} ` +
+    `ORDER BY __sort_key ${direction}, t.cursor_seq ${direction} ` +
+    pageLimitClause +
+    ') t ' +
     'LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id ' +
     'LEFT JOIN filings f ON f.doc_id = t.doc_id ' +
     'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    FEED_ENRICH_JOINS +
-    `WHERE ${TWIN_DEDUPE_SQL} ` +
-    `ORDER BY ${orderClause} ` +
-    pageLimitClause;
+    FEED_ENRICH_JOINS;
 
   return { sql, params, limit, offset };
 }

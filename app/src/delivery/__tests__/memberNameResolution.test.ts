@@ -82,7 +82,7 @@ describe('GET /transactions memberName handling', () => {
     expect(res.status).toBe(200);
     const feedSql = captured.sql.find((s) => /FROM transactions/i.test(s)) ?? '';
     expect(feedSql).toContain("LOWER(COALESCE(fl.full_name, t.filer_id, '')) LIKE ?");
-    expect(feedSql).toMatch(/FROM \(SELECT t\.\* FROM transactions t/);
+    expect(feedSql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
   });
 
   it('does not look up a filer when member (filer_id) is already given', async () => {
