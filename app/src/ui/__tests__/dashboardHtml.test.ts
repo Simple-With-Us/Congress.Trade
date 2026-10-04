@@ -2909,8 +2909,8 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
 
   // ---- 7. Canonical Premium pricing = $5/mo · $50/yr · 2-week trial -------
   it('shows $5/mo and $50/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
-    expect(DASHBOARD_HTML).toContain('Delivery + CSV export are included in Premium &middot; $5/mo or $50/yr &middot; 2-week free trial');
-    expect(DASHBOARD_HTML).toContain('Premium unlocks full-history CSV export and instant delivery (webhook / SSE) · $5/mo or $50/yr · 2-week free trial');
+    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial');
+    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial');
     expect(DASHBOARD_HTML).toContain('$5<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).toContain('$50<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).toContain('2-week free trial');

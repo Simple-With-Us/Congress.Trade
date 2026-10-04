@@ -3467,7 +3467,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       </div>
     </div>
     <div class="row-flex" id="gateRow" style="margin-top:10px;justify-content:center">
-      <span class="gate-note" data-premium-cue="export">Premium unlocks full-history CSV export and instant delivery (webhook / SSE) · $5/mo or $50/yr · 2-week free trial
+      <span class="gate-note" data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial
         <button class="btn sm" onclick="openPricing('export')">Start Free Trial</button></span>
     </div>
 
@@ -3844,7 +3844,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         <div id="subsMsg" class="note subs-msg" aria-live="polite"></div>
       </div>
       <div class="row-flex" style="margin-top:20px;justify-content:center" data-premium-cue="alerts">
-        <span class="gate-note">Delivery + CSV export are included in Premium &middot; $5/mo or $50/yr &middot; 2-week free trial
+        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial
           <button class="btn sm" onclick="openPricing('alerts')">Start Free Trial</button></span>
       </div>
     </div>
@@ -13227,8 +13227,9 @@ function pricingCopy(intent) {
     sub: 'The public dashboard stays free.  Premium gets full-history CSV export and the filing the moment we see it.',
     features: [
       'Full-history CSV export of the filtered trade feed',
-      'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
-      'Live SSE stream of every new filing — no polling',
+      'Instant filing alerts &mdash; signed webhooks (HMAC-verified) to any URL',
+      'Live SSE stream of every new filing &mdash; no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
 }
