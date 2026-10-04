@@ -51,6 +51,7 @@ struct PremiumSheet: View {
 
     private let benefits: [Benefit] = [
         .init(systemImage: "doc.text", text: "Open the original filing PDF from Congress"),
+        .init(systemImage: "chart.bar.doc.horizontal", text: "Proprietary Enrichment Data in every payload"),
         .init(systemImage: "arrow.down.doc", text: "Full-history CSV export"),
         .init(
             systemImage: "bolt.horizontal",
@@ -586,11 +587,11 @@ struct PremiumSheet: View {
 ///
 /// Verified 2026-08-14 against live ASC + Infisical: both
 /// `trade.congress.premium.monthly` and `.annual` carry `FREE_TRIAL` /
-/// `TWO_WEEKS` (start 2026-08-12, no end); US prices $5 / $50; prod
-/// `STRIPE_TRIAL_DAYS=14`. Receipt:
+/// `ONE_WEEK`; US prices $9 / $80; prod
+/// `STRIPE_TRIAL_DAYS=7`. Receipt:
 /// `docs/rollouts/2026-08-14-premium-trial-asc-verified.md`.
 enum PremiumPricing {
-    static let headline = "$5/month  •  $50/year  •  2-week free trial"
+    static let headline = "$9/month  •  $80/year  •  1-week free trial"
 
     /// Renewal disclosure required on the paywall itself (Guideline 3.1.2).
     /// Kept factual and free of marketing so it reads the same to App Review
@@ -663,7 +664,7 @@ enum PremiumPricing {
 
     /// Delivery paywall.  In-App Purchase only — no website Stripe CTA.
     static let deliveryUpgradeMessage =
-        "2-week free trial, then $5/month or $50/year.  Upgrade with In-App Purchase to create SSE/webhook deliveries.  Existing deliveries still appear below."
+        "1-week free trial, then $9/month or $80/year.  Upgrade with In-App Purchase to create SSE/webhook deliveries.  Existing deliveries still appear below."
 
     static func subtitle(for product: Product) -> String? {
         switch AppleIAPProduct(rawValue: product.id) {
