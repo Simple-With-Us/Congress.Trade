@@ -591,7 +591,7 @@ struct PremiumSheet: View {
 /// `STRIPE_TRIAL_DAYS=7`. Receipt:
 /// `docs/rollouts/2026-08-14-premium-trial-asc-verified.md`.
 enum PremiumPricing {
-    static let headline = "$8.99/month  •  $79.99/year  •  1-week free trial"
+    static let headline = "1-week free trial  •  Cancel anytime"
 
     /// Renewal disclosure required on the paywall itself (Guideline 3.1.2).
     /// Kept factual and free of marketing so it reads the same to App Review
@@ -664,7 +664,7 @@ enum PremiumPricing {
 
     /// Delivery paywall.  In-App Purchase only — no website Stripe CTA.
     static let deliveryUpgradeMessage =
-        "1-week free trial, then $8.99/month or $79.99/year.  Upgrade with In-App Purchase to create SSE/webhook deliveries.  Existing deliveries still appear below."
+        "Try Premium free for 1 week to create SSE/webhook deliveries.  Existing deliveries still appear below."
 
     static func subtitle(for product: Product) -> String? {
         switch AppleIAPProduct(rawValue: product.id) {
