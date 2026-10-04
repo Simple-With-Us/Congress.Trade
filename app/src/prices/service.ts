@@ -431,7 +431,7 @@ export async function runPriceRefresh(
       env.DB,
       `SELECT t.id AS id, t.tx_date AS tx_date
          FROM transactions t
-        WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> ''`,
+        WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> '' AND t.tx_date >= '1990-01-01'`,
       [ticker],
     );
     if (trades.length === 0) continue;
@@ -597,7 +597,7 @@ export async function runPriceRefresh(
          ?
        FROM transactions t
        LEFT JOIN filings f ON f.doc_id = t.doc_id
-       WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+       WHERE t.ticker = ? AND t.tx_date IS NOT NULL AND t.tx_date <> '' AND t.tx_date >= '1990-01-01'
        ON CONFLICT(tx_id) DO UPDATE SET
          price_at_trade=excluded.price_at_trade,
          spx_at_trade=COALESCE(excluded.spx_at_trade, tx_performance.spx_at_trade),

@@ -101,6 +101,7 @@ export async function buildPriceNeedsExport(
     t.deprecated_at IS NULL
     AND t.ticker IS NOT NULL AND t.ticker <> ''
     AND t.tx_date IS NOT NULL AND t.tx_date <> ''
+    AND t.tx_date >= '1990-01-01'  /* ignore pre-market garbage (e.g. year 1202) in the EOD window math */
     AND ${unavailableExclusionSql()}
   `;
 
