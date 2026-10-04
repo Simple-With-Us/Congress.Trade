@@ -1,6 +1,6 @@
 {
   "name": "@jaywedgeworth22/congress-trading-shared",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "private": true,
   "type": "commonjs",
   "description": "Shared types, Zod schemas, constants, and utilities for Congress.Trade ↔ Socratic Trade cross-app integration",
@@ -39,14 +39,14 @@
     "zod": "^4.6.2"
   },
   "devDependencies": {
-    "zod": "^4.6.2",
-    "@types/node": "^22.20.2",
-    "@vitest/coverage-v8": "^5.0.0",
+    "zod": "^4.6.5",
+    "@types/node": "^22.20.4",
+    "@vitest/coverage-v8": "^5.0.2",
     "publint": "^0.3.24",
     "tsup": "^8.3.5",
     "typescript": "^7.0.2",
     "typescript-v5": "npm:typescript@6.0.3",
-    "vitest": "^5.0.0"
+    "vitest": "^5.0.2"
   },
   "overrides": {
     "esbuild": "0.28.1"

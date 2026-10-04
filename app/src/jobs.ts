@@ -22,6 +22,7 @@ import { runCommitteeSync } from './enrichment/committeeSync.ts';
 import { runIdentitySync } from './enrichment/identitySync.ts';
 import { runBulkSnapshot } from './export/snapshot.ts';
 import { resolveSecrets } from './secrets/infisical.ts';
+import { readSetting } from './settings/settingsService.ts';
 import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
 import { backfillCurrentPricesFromEod } from './prices/service.ts';
@@ -258,8 +259,11 @@ export async function runRetentionSweep(env: Env, now = new Date()): Promise<Rec
  */
 export const RETENTION_MIN_AGE_DAYS = 30;
 
-function retentionDeleteRawObjectsEnabled(): boolean {
+function retentionDeleteRawObjectsEnabled(env: Env): boolean {
+  // Infisical knob first (settings snapshot when booted), legacy process env
+  // fallback for scripts/tests that run without the Deno boot sequence.
   const raw =
+    readSetting(env as unknown as Record<string, string | undefined>, 'RETENTION_DELETE_RAW_OBJECTS') ??
     (typeof Deno !== 'undefined' ? Deno.env.get('RETENTION_DELETE_RAW_OBJECTS') : undefined) ??
     (typeof process !== 'undefined' ? process.env?.RETENTION_DELETE_RAW_OBJECTS : undefined) ??
     '';
@@ -271,7 +275,7 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
   const cutoff = fiveYearsAgo.toISOString().slice(0, 10); // 'YYYY-MM-DD'
   // Protects freshly-backfilled history from being destroyed by the next run.
   const minAge = new Date(now.getTime() - RETENTION_MIN_AGE_DAYS * 86_400_000).toISOString();
-  const deleteRawObjects = retentionDeleteRawObjectsEnabled();
+  const deleteRawObjects = retentionDeleteRawObjectsEnabled(env);
 
   let totalDeleted = 0;
   let rawKept = 0;
@@ -700,8 +704,10 @@ export async function maybeRunDailyRetentionJobs(env: Env, now = new Date()): Pr
   // Daily R2 free-tier usage summary → Pushover. Own day-stamp (not retention's)
   // so we can wait until fleet-staggered UTC hour 20 (ST=14, UM=8) without
   // burning the once-per-day retention stamp on an early-hour skip.
-  // Deno in prod; Node/vitest in unit tests — read both without throwing.
+  // Deno in prod; Node/vitest in unit tests. Infisical knob first (settings
+  // snapshot when booted), legacy process env fallback for scripts/tests.
   const preferHourEnv =
+    readSetting(env as unknown as Record<string, string | undefined>, 'R2_USAGE_DIGEST_UTC_HOUR') ??
     (typeof Deno !== 'undefined' ? Deno.env.get('R2_USAGE_DIGEST_UTC_HOUR') : undefined) ??
     (typeof process !== 'undefined' ? process.env?.R2_USAGE_DIGEST_UTC_HOUR : undefined) ??
     '20';

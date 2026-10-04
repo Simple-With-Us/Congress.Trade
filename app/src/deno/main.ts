@@ -6,6 +6,7 @@ import { DurableQueueAdapter } from './durableQueue.ts';
 import app from '../index.ts';
 import type { Env, QueueMessage } from '../shared/types.ts';
 import { resolveSecret, resolveSecrets, refreshSecrets } from '../secrets/infisical.ts';
+import { initSettings, startSettingsRefresh, appSettings } from '../settings/settingsService.ts';
 import { resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import { resolveDenoCostProfile } from './costProfile.ts';
 import { createRuntimeQueueHandlers } from './runtimeHandlers.ts';
@@ -95,10 +96,23 @@ const secretEnv = {
   CONFIG_KV: configKvShim as any,
 } as Env;
 
-// 2. Resolve Infisical secrets at boot, then init Sentry for this Coolify
-// container (Deno-in-Docker on Hetzner).  Not Deno Deploy — no deployctl,
-// no Deploy APIs.  Missing Coolify/Infisical SENTRY_DSN is fail-soft.
+// 2. Resolve Infisical secrets at boot, then load the typed app-settings
+// snapshot (Infisical SOT: startup load, in-memory cache, background refresh,
+// write-through on admin save — see INFISICAL.md).  Boot fails fast here if
+// the resolver is misconfigured; individual knobs stay fail-soft with safe
+// defaults.
 await refreshSecrets(secretEnv);
+const settings = await initSettings(secretEnv);
+startSettingsRefresh(secretEnv);
+// SIGHUP = on-demand settings reload (canonical "Reload settings" path).
+try {
+  Deno.addSignalListener('SIGHUP', () => {
+    settings.refresh(secretEnv).catch((err) => {
+      console.error('settings.SIGHUP refresh failed (keeping last-known-good):', (err as Error).message);
+    });
+  });
+} catch {}
+console.log(`App settings initialized (${settings.keys().length} knobs from Infisical/env)`);
 const sentryResolved = await resolveProductionSentryEnv(secretEnv, resolveSecret);
 const sentryBoot = initProductionSentry(sentryResolved);
 console.log(
@@ -222,7 +236,11 @@ function buildEnv(): Env {
 }
 
 const durableQueueHandlers = createRuntimeQueueHandlers();
-const costProfile = resolveDenoCostProfile(Deno.env);
+// Tick cost profile knobs come from Infisical first (settings snapshot),
+// with process env as the legacy fallback — never direct env reads alone.
+const costProfile = resolveDenoCostProfile({
+  get: (k: string) => settings.get(k) ?? Deno.env.get(k) ?? undefined,
+});
 
 // Start Cron Tasks. Deno Deploy does not run the Cloudflare Worker
 // `scheduled()` entrypoint, so the live filing watcher and durable outbox
@@ -257,10 +275,8 @@ if (!costProfile.disableInternalCron) {
   Deno.cron('Worker scheduled tasks', costProfile.cronSchedule, async () => {
     if (tickInFlight) {
       const heldMs = Date.now() - tickInFlightSinceMs;
-      const stuckMinutes = (() => {
-        const n = Number.parseInt(Deno.env.get('CT_TICK_STUCK_MINUTES') || '', 10);
-        return Number.isFinite(n) && n >= 1 ? Math.min(n, 60) : 10;
-      })();
+      // Stuck detection (Infisical knob CT_TICK_STUCK_MINUTES, default 10).
+      const stuckMinutes = settings.getInt('CT_TICK_STUCK_MINUTES', 10, 60);
       consecutiveOverlapTicks += 1;
       sentryLoggerWarn('cron.tick_overlap', {
         runtime: 'deno',
@@ -298,12 +314,9 @@ if (!costProfile.disableInternalCron) {
     consecutiveOverlapTicks = 0;
     // The tick deadline aborts the tick pipeline instead of abandoning it:
     // lanes stop at the next boundary and the queue drain stops claiming.
-    // Default 45s (Deno Deploy free-tier heritage); the Oracle container
-    // raises it via CT_TICK_DEADLINE_MS so bigger drain batches fit one tick.
-    const tickDeadlineMs = (() => {
-      const n = Number.parseInt(Deno.env.get('CT_TICK_DEADLINE_MS') || '', 10);
-      return Number.isFinite(n) && n >= 10_000 ? Math.min(n, 14 * 60_000) : 45_000;
-    })();
+    // Default 45s; the Oracle container raises it via CT_TICK_DEADLINE_MS
+    // (Infisical knob) so bigger drain batches fit one tick.
+    const tickDeadlineMs = Math.max(10_000, Math.min(settings.getInt('CT_TICK_DEADLINE_MS', 45_000), 14 * 60_000));
     const tickAbort = new AbortController();
     try {
       const env = buildEnv();
