@@ -3770,7 +3770,8 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
          requires a signed-in Premium account. -->
     <div class="section" id="subsMarketing">
       <h3>Alerts</h3>
-      <p class="sub">Get the Filing First.&nbsp; Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
+      <p class="sub">We ingest official House, Senate, and Executive Branch trades.&nbsp; Relaying a 3rd-party competitor API would ruin our minutes-to-hours edge that Congress.Trade was made for.</p>
+      <p class="sub" style="margin-top: 8px;">Get the Filing First.&nbsp; Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
       <div class="speed-mini" id="alertsSpeedMini"></div>
       <div class="delivery-grid">
         <div class="delivery-card">
