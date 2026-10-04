@@ -2908,14 +2908,14 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
   // in the same loadTrSectorFlow() change.)
 
   // ---- 7. Canonical Premium pricing = $5/mo · $50/yr · 2-week trial -------
-  it('shows $5/mo and $50/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
-    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial');
-    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial');
-    expect(DASHBOARD_HTML).toContain('$5<span class="per">/mo</span>');
-    expect(DASHBOARD_HTML).toContain('$50<span class="per">/yr</span>');
-    expect(DASHBOARD_HTML).toContain('2-week free trial');
-    expect(DASHBOARD_HTML).not.toContain('$9<span class="per">/mo</span>');
-    expect(DASHBOARD_HTML).not.toContain('$90<span class="per">/yr</span>');
+  it('shows $9/mo and $80/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
+    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $9/mo or $80/yr &middot; 1-week free trial');
+    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $9/mo or $80/yr &middot; 1-week free trial');
+    expect(DASHBOARD_HTML).toContain('$9<span class="per">/mo</span>');
+    expect(DASHBOARD_HTML).toContain('$80<span class="per">/yr</span>');
+    expect(DASHBOARD_HTML).toContain('1-week free trial');
+    expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');
+    expect(DASHBOARD_HTML).not.toContain('$50<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).not.toContain('$15/mo');
     expect(DASHBOARD_HTML).not.toContain('$140/yr');
   });
