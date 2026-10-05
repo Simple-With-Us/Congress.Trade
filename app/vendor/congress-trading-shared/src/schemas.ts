@@ -329,9 +329,6 @@ export const PriceSeriesSchema = z.object({
   closes: z.array(PriceCloseSchema),
   currentPrice: nullAsUndefined(z.number()),
   currentPriceDate: nullAsUndefined(IsoDateSchema),
-  stale: z.boolean().optional(),
-  freshThrough: IsoDateSchema.optional(),
-  dataAgeDays: z.number().int().nonnegative().optional(),
 });
 export type PriceSeries = z.infer<typeof PriceSeriesSchema>;
 

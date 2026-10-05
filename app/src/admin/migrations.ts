@@ -1551,7 +1551,7 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
   // 0099_feed_latency_join_index.sql
   ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
-  // 0100_market_import_provenance.sql
+  // 0101_market_import_provenance.sql (0100 reserved for peer import receipts in #2634)
   ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
 ] as const;
 
