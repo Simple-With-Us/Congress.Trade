@@ -19,6 +19,14 @@ import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { z } from 'zod';
+import {
+  allocateProbes,
+  dayTypeFor,
+  etClock,
+  probeScheduleConfigFromEnv,
+  DEFAULT_PROBE_SCHEDULE_CONFIG,
+  type ProbeScheduleConfig,
+} from '../ingestion/probeSchedule.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -207,6 +215,19 @@ export interface PipelineThresholds {
   strandedFilingsWarn: number; // default 1 (any is worth a look; sweep clears them hourly)
   /** Max hours since last successful poll before a chamber is stalled. */
   pollSuccessMaxAgeHours: { house: number; senate: number; executive: number };
+  /**
+   * Optional override of the shipped 0.75h weekday / 1.5h weekend session cap.
+   * `pollMaxAgeHours` also widens the cap to honor a *legally slower* coverage
+   * floor (e.g. PROBE_SCHEDULE_MAX_INTERVAL_SEC=3600) by one missed slot
+   * (1.5x the longest allocated gap), so a slower but still legal poll is not
+   * permanently stalled. `pollSuccessMaxAgeHours[src]` therefore binds only
+   * when it is itself at least one missed slot long; a per-source ceiling
+   * shorter than the missed-slot extension does not cap below the missed slot.
+   * Both fields default to the shipped constants when omitted, so existing
+   * callers do not change.
+   */
+  weekdayPollMaxAgeHours?: number;
+  weekendPollMaxAgeHours?: number;
   /** Max hours since the newest provider latency observation, system-wide. */
   latencyObservationMaxAgeHours: number;
   /** Hours of silence before an individual recently-active provider is flagged. */
@@ -302,9 +323,19 @@ function worstStatus(a: PipelineStatus, b: PipelineStatus): PipelineStatus {
   return STATUS_WEIGHT[a] >= STATUS_WEIGHT[b] ? a : b;
 }
 
-/** Weekday poll floor is at most 30 minutes, so 45 minutes is one missed slot. Weekend cadence is hourly, so 90 minutes does not flap a healthy hourly poll. */
-const WEEKDAY_POLL_MAX_AGE_HOURS = 0.75;
-const WEEKEND_POLL_MAX_AGE_HOURS = 1.5;
+/**
+ * Session caps for the polling liveness check.
+ *
+ * At the SHIPPED probe-schedule floors (30 min weekday / 60 min weekend globally,
+ * 15 min weekday for executive via its profile floor), 45 minutes is one missed
+ * slot on a weekday and 90 minutes is one missed slot on a weekend. A legally
+ * SLOWER coverage floor (e.g. PROBE_SCHEDULE_MAX_INTERVAL_SEC=3600 on a weekday)
+ * widens the cap to 1.5x the longest allocated gap so a healthy, slower poll is
+ * not falsely stalled — without ever reopening the 3h/26h per-source ceilings
+ * that hid the multi-hour SQLITE_BUSY wedge this PR exists to close.
+ */
+const DEFAULT_WEEKDAY_POLL_MAX_AGE_HOURS = 0.75;
+const DEFAULT_WEEKEND_POLL_MAX_AGE_HOURS = 1.5;
 
 const Http429NonNegFiniteNumber = z.number().refine(
   (n) => Number.isFinite(n) && n >= 0,
@@ -325,30 +356,74 @@ export const Http429ValueSchema = z.union([
   z.object({ count: Http429NonNegFiniteNumber }).strict(),
 ]);
 
-function isEtWeekend(nowMs: number): boolean {
-  const weekday = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'short',
-  }).format(new Date(nowMs));
-  return weekday === 'Sat' || weekday === 'Sun';
+/**
+ * Resolve the longest legal gap (in hours) for `src` and the ET day type that
+ * `etClock(new Date(nowMs))` reports, via the same allocateProbes() the
+ * scheduler uses. Returns the *shipped* floor when allocation is at-or-tighter
+ * than it, so the default schedule produces the original 0.5h / 1h gaps.
+ */
+function longestGapHours(
+  src: 'house' | 'senate' | 'executive',
+  nowMs: number,
+  schedule: ProbeScheduleConfig,
+): { longestGapHours: number; dayType: 'weekday' | 'weekend' } {
+  const dayType = dayTypeFor(etClock(new Date(nowMs)).dayOfWeekET);
+  const profile = schedule.profiles[src];
+  const allocation = allocateProbes(profile, dayType, schedule);
+  return { longestGapHours: allocation.troughIntervalSec / 3600, dayType };
 }
 
+/**
+ * Effective max-age (hours) below which a chamber's last successful poll is
+ * still considered live. The shipped session caps are 0.75h weekday / 1.5h
+ * weekend; `pollSuccessMaxAgeHours[src]` is the absolute ceiling the operator
+ * can raise; and a legally slower coverage floor (e.g.
+ * PROBE_SCHEDULE_MAX_INTERVAL_SEC=3600) widens the cap to 1.5x the longest
+ * allocated gap so a healthy slower poll is not falsely stalled — without
+ * ever restoring the 3h/26h ceilings this PR exists to close.
+ */
 function pollMaxAgeHours(
   src: 'house' | 'senate' | 'executive',
   nowMs: number,
   configured: PipelineThresholds,
+  schedule: ProbeScheduleConfig = DEFAULT_PROBE_SCHEDULE_CONFIG,
 ): number {
-  const cap = isEtWeekend(nowMs) ? WEEKEND_POLL_MAX_AGE_HOURS : WEEKDAY_POLL_MAX_AGE_HOURS;
-  return Math.min(configured.pollSuccessMaxAgeHours[src], cap);
+  const { longestGapHours: gapHours, dayType } = longestGapHours(src, nowMs, schedule);
+  const sessionCap = dayType === 'weekend'
+    ? (configured.weekendPollMaxAgeHours ?? DEFAULT_WEEKEND_POLL_MAX_AGE_HOURS)
+    : (configured.weekdayPollMaxAgeHours ?? DEFAULT_WEEKDAY_POLL_MAX_AGE_HOURS);
+  const missedSlotHours = gapHours * 1.5;
+  const configuredCeiling = configured.pollSuccessMaxAgeHours[src];
+  // Tighter custom threshold: honor it, but never below the longest legal gap
+  // (a threshold shorter than the longest legal gap stalls a healthy poll).
+  if (configuredCeiling < sessionCap) {
+    return Math.max(configuredCeiling, gapHours);
+  }
+  // Otherwise: cap by session cap (or the missed-slot extension when the
+  // coverage floor is slower), and floor at the missed-slot extension so the
+  // returned value can never lag the actual longest legal gap by more than
+  // half a slot.
+  return Math.max(
+    Math.min(configuredCeiling, Math.max(sessionCap, missedSlotHours)),
+    missedSlotHours,
+  );
 }
 
 /**
  * Pure, clock-injected evaluator for pipeline signals.
+ *
+ * `schedule` is optional: omitting it behaves as DEFAULT_PROBE_SCHEDULE_CONFIG
+ * (the shipped 30/60-minute coverage floors + 15-minute executive weekday
+ * floor), which is what tests that don't care about a probe retune want. The
+ * production call passes `probeScheduleConfigFromEnv(env)` so a retuned
+ * coverage floor widens the poll cap to one missed slot instead of falsely
+ * stalling a healthy slower poll.
  */
 export function evaluatePipelineSignals(
   s: PipelineSignals,
   nowMs: number,
   t = DEFAULT_PIPELINE_THRESHOLDS,
+  schedule: ProbeScheduleConfig = DEFAULT_PROBE_SCHEDULE_CONFIG,
 ): PipelineHealth {
   const checks: PipelineCheck[] = [];
   let overall: PipelineStatus = 'ok';
@@ -694,7 +769,7 @@ export function evaluatePipelineSignals(
     for (const src of ['house', 'senate', 'executive'] as const) {
       const id = `polling_${src}`;
       const st = s.pollSources.find((p) => p.source === src);
-      const maxAgeH = pollMaxAgeHours(src, nowMs, t);
+      const maxAgeH = pollMaxAgeHours(src, nowMs, t, schedule);
       if (!st) {
         checks.push({ id, status: 'stalled', detail: `${src} polling NOT RUNNING — no liveness record at all`, value: null });
         continue;
@@ -963,6 +1038,12 @@ export function evaluatePipelineSignals(
 export async function checkPipelineHealth(env: Env, now = new Date()): Promise<PipelineHealth> {
   const nowMs = now.getTime();
   const iso24hAgo = new Date(nowMs - 24 * 3600 * 1000).toISOString();
+  // 2026-10-04: read the live probe schedule from env so a legally slower
+  // coverage floor widens the poll cap to 1.5x the longest allocated gap
+  // (one missed slot) instead of falsely stalling a healthy slower poll.
+  // The default schedule (30/60-minute floors) keeps the shipped 0.75/1.5h
+  // caps, so unset env is a strict no-op vs the previous behavior.
+  const schedule = probeScheduleConfigFromEnv(env);
 
   let outboxPending: number | null = null;
   let outboxOldestAt: string | null = null;
@@ -1364,6 +1445,6 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     fmpLatency,
   };
 
-  const evaluated = evaluatePipelineSignals(signals, nowMs);
+  const evaluated = evaluatePipelineSignals(signals, nowMs, DEFAULT_PIPELINE_THRESHOLDS, schedule);
   return { ...evaluated, reviewQueue };
 }
