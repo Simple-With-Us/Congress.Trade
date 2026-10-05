@@ -11295,8 +11295,12 @@ function isLatencyComparisonPublic(p) {
 function speedBoastProvider(d) {
   var best = null;
   (d.providers || []).filter(function (p) {
-    return isLatencyComparisonPublic(p) &&
-      p.matched >= SPEED_LANE_MIN_MATCHED && (p.comparisonStatus === 'usable' || p.comparisonStatus === 'preliminary');
+    if (String(p.id).indexOf('fmp') === 0) return false; // TODO: temporarily hide FMP from public until we are confident in its accuracy
+    var preliminaryOk = p.comparisonStatus === 'preliminary' &&
+      Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT &&
+      Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
+    return isLatencyComparisonPublic(p) && p.matched >= SPEED_LANE_MIN_MATCHED &&
+      (p.comparisonStatus === 'usable' || preliminaryOk);
   })
     .forEach(function (p) { if (!best || p.matched > best.matched) best = p; });
   return best && best.matched >= SPEED_BOAST_MIN_MATCHED && (best.medianLeadSec || 0) > 0 ? best : null;
@@ -13221,6 +13225,7 @@ function pricingCopy(intent) {
     features: [
       'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
       'Live SSE stream of every new filing — no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
   if (intent === 'export') return {
@@ -13230,6 +13235,7 @@ function pricingCopy(intent) {
       'Full-history CSV export with ticker, member, type, chamber, and date filters',
       'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
       'Live SSE stream of every new filing — no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
   return {
