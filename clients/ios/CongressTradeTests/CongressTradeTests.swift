@@ -2135,6 +2135,190 @@ final class CongressTradeTests: XCTestCase {
         )
     }
 
+    // MARK: - StoreKit-driven Premium copy (no hardcoded prices/trial lengths)
+
+    /// Reference numbers kept here as XCTest fixtures only — never used as
+    /// UI copy.  US storefront (2026-10-04): $8.99/mo, $79.99/yr, 1-week
+    /// free-trial intro offer.  Other storefronts localize differently.
+    private static let referenceUSDMonthly = "$8.99"
+    private static let referenceUSDAnnual = "$79.99"
+
+    func testPremiumCopyHasNoHardcodedPrices() {
+        let noDollar = { (s: String) in !s.contains("$") }
+        let noDecimalAmount = { (s: String) in
+            // Any "\d+[.,]\d{2}" — matches "$8.99", "8,99 €", "79.99".
+            s.range(of: #"\d+[.,]\d{2}"#, options: .regularExpression) == nil
+        }
+        let noTrialLength = { (s: String) in
+            let needles = ["-week free trial", "-day free trial", "-month free trial", "-year free trial"]
+            return needles.allSatisfy { !s.localizedCaseInsensitiveContains($0) }
+        }
+
+        let headline = PremiumPricing.fallbackHeadline
+        let delivery = PremiumPricing.deliveryUpgradeMessage
+        for (label, str) in [("fallbackHeadline", headline), ("deliveryUpgradeMessage", delivery)] {
+            XCTAssertTrue(noDollar(str), "\(label) unexpectedly contains a $: \(str)")
+            XCTAssertTrue(noDecimalAmount(str), "\(label) unexpectedly contains a decimal amount: \(str)")
+            XCTAssertTrue(noTrialLength(str), "\(label) unexpectedly contains a trial-length phrase: \(str)")
+        }
+
+        XCTAssertEqual(
+            PremiumPricing.headline(for: []),
+            PremiumPricing.fallbackHeadline,
+            "headline(for: []) must fall back to the price-free fallback"
+        )
+    }
+
+    func testPremiumHeadlineUsesStoreKitDisplayPrice() {
+        // US storefront reference numbers — these are fixtures, not UI strings.
+        let usdMonthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: PremiumFreeTrial(unit: .week, value: 1)
+        )
+        let usdAnnual = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDAnnual,
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let usHeadline = PremiumPricing.headline(for: [usdMonthly, usdAnnual])
+        XCTAssertTrue(usHeadline.contains(Self.referenceUSDMonthly))
+        XCTAssertTrue(usHeadline.contains(Self.referenceUSDAnnual))
+        XCTAssertTrue(usHeadline.localizedCaseInsensitiveContains("1-week free trial"))
+
+        // Localized (non-USD) storefront with no intro offer — must show the
+        // localized prices verbatim and must not invent a trial.
+        let eurMonthly = PremiumPlanQuote(
+            displayPrice: "8,99 €",
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let eurAnnual = PremiumPlanQuote(
+            displayPrice: "79,99 €",
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let eurHeadline = PremiumPricing.headline(for: [eurMonthly, eurAnnual])
+        XCTAssertTrue(eurHeadline.contains("8,99 €"))
+        XCTAssertTrue(eurHeadline.contains("79,99 €"))
+        XCTAssertFalse(eurHeadline.contains("$"))
+        XCTAssertFalse(eurHeadline.localizedCaseInsensitiveContains("free trial"))
+    }
+
+    func testAnnualSavingsIsComputedFromQuotes() {
+        // 12 * $8.99 = $107.88/mo if you paid monthly.  $79.99/yr saves
+        // ($107.88 - $79.99) / $107.88 ≈ 0.2586 → 25% rounded down.  This
+        // formula lives in PremiumPricing and is the only place the % claim
+        // appears, so the test pins both the formula and the rounding.
+        let monthly = PremiumPlanQuote(
+            displayPrice: "$8.99",
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let annual = PremiumPlanQuote(
+            displayPrice: "$79.99",
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let pct = PremiumPricing.savingsPercent(monthly: monthly, annual: annual)
+        XCTAssertEqual(pct, 25, "expected 25% savings (rounded down from 25.86%)")
+    }
+
+    func testMonthlySubtitleWithTrialUsesNaturalPerPeriodSuffix() {
+        // Per-period price suffix should drop the hyphen and read as
+        // "$8.99/month" (not "$8.99/1-month").  Trial phrase stays
+        // "1-week free trial" so users see the length Apple will charge.
+        let monthlyWithTrial = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: PremiumFreeTrial(unit: .week, value: 1)
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: monthlyWithTrial, allQuotes: [monthlyWithTrial]),
+            "1-week free trial, then \(Self.referenceUSDMonthly)/month"
+        )
+    }
+
+    func testMonthlySubtitleWithoutTrialUsesBillingAdverb() {
+        // No intro offer → no "X-week free trial" wording, just the
+        // billing adverb ("monthly") so the cadence reads naturally.
+        let monthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: monthly, allQuotes: [monthly]),
+            "Billed monthly.  Cancel anytime."
+        )
+    }
+
+    func testYearlySubtitleWithoutTrialIncludesSavings() {
+        // 12 * $8.99 = $107.88.  $79.99/yr saves ~25.86% → 25% rounded down.
+        // The annual subtitle should append that claim vs. the monthly
+        // product so the user can see why the yearly plan is recommended;
+        // "Cancel anytime" is replaced by the savings tail so the line
+        // still reads naturally.
+        let monthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let annual = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDAnnual,
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: annual, allQuotes: [monthly, annual]),
+            "Billed yearly.  Save 25% vs. monthly."
+        )
+    }
+
+    func testYearlySubtitleWithTrialIncludesSavings() {
+        // Trial copy stays in front when eligible; the savings tail goes
+        // after the price so the user still sees both the trial and the
+        // yearly discount vs. monthly.
+        let monthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let annualWithTrial = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDAnnual,
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: PremiumFreeTrial(unit: .week, value: 1)
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: annualWithTrial, allQuotes: [monthly, annualWithTrial]),
+            "1-week free trial, then \(Self.referenceUSDAnnual)/year.  Save 25% vs. monthly."
+        )
+    }
+
     // MARK: - Manage Subscription (Apple vs website/Stripe)
 
     func testWebManageSubscriptionURLIsBillingManageOnOrigin() {

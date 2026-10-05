@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   evaluatePipelineSignals,
   tradingDaysBehind,
+  Http429ValueSchema,
   type PipelineSignals,
   DEFAULT_PIPELINE_THRESHOLDS,
 } from '../pipelineHealth.ts';
+import { DEFAULT_PROBE_SCHEDULE_CONFIG } from '../../ingestion/probeSchedule.ts';
 
 describe('evaluatePipelineSignals', () => {
   const nowMs = 1754092800000; // Fixed clock for testing
@@ -29,7 +31,8 @@ describe('evaluatePipelineSignals', () => {
     pollSources: [
       { source: 'house', lastSuccessAt: new Date(nowMs - 30 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 30 * 60_000).toISOString(), configDisabled: false },
       { source: 'senate', lastSuccessAt: new Date(nowMs - 45 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 45 * 60_000).toISOString(), configDisabled: false },
-      { source: 'executive', lastSuccessAt: new Date(nowMs - 5 * 3_600_000).toISOString(), lastAttemptAt: new Date(nowMs - 5 * 3_600_000).toISOString(), configDisabled: false },
+      // Weekday cap is 45 minutes.  A 5 hour executive success used to sit inside the old 26 hour ceiling and would now mark the whole fixture stalled.
+      { source: 'executive', lastSuccessAt: new Date(nowMs - 20 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 60_000).toISOString(), configDisabled: false },
     ],
     latencyProviders: [
       { provider: 'quiver', lastObservedAt: new Date(nowMs - 2 * 3_600_000).toISOString() },
@@ -352,7 +355,8 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     pollSources: [
       { source: 'house', lastSuccessAt: new Date(nowMs - 30 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 30 * 60_000).toISOString(), configDisabled: false },
       { source: 'senate', lastSuccessAt: new Date(nowMs - 45 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 45 * 60_000).toISOString(), configDisabled: false },
-      { source: 'executive', lastSuccessAt: new Date(nowMs - 5 * 3_600_000).toISOString(), lastAttemptAt: new Date(nowMs - 5 * 3_600_000).toISOString(), configDisabled: false },
+      // Weekday cap is 45 minutes.  A 5 hour executive success used to sit inside the old 26 hour ceiling and would now mark the whole fixture stalled.
+      { source: 'executive', lastSuccessAt: new Date(nowMs - 20 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 60_000).toISOString(), configDisabled: false },
     ],
     latencyProviders: [
       { provider: 'quiver', lastObservedAt: new Date(nowMs - 2 * 3_600_000).toISOString() },
@@ -412,16 +416,47 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.status).toBe('stalled');
   });
 
-  it('executive success inside its slower 26h window stays ok', () => {
-    const s: PipelineSignals = {
+  it('weekend hourly cadence stays ok at 70 minutes and stalls at 2 hours', () => {
+    // Saturday 2025-08-02 12:00 ET (EDT).  The fixture clock above is a Friday.
+    const saturdayMs = Date.parse('2025-08-02T16:00:00Z');
+    const withinHourly: PipelineSignals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) =>
+        p.source === 'executive'
+          ? { ...p, lastSuccessAt: new Date(saturdayMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 70 * 60_000).toISOString() }
+          : { ...p, lastSuccessAt: new Date(saturdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 50 * 60_000).toISOString() }),
+    };
+    expect(evaluatePipelineSignals(withinHourly, saturdayMs).checks.find((c) => c.id === 'polling_executive')!.status).toBe('ok');
+
+    const missedHourly: PipelineSignals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) =>
+        p.source === 'executive'
+          ? { ...p, lastSuccessAt: new Date(saturdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 2 * 3_600_000).toISOString() }
+          : { ...p, lastSuccessAt: new Date(saturdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(saturdayMs - 50 * 60_000).toISOString() }),
+    };
+    expect(evaluatePipelineSignals(missedHourly, saturdayMs).checks.find((c) => c.id === 'polling_executive')!.status).toBe('stalled');
+  });
+
+  it('executive success inside the weekday 45 minute window stays ok, and 20h does not', () => {
+    const fresh: PipelineSignals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) =>
+        p.source === 'executive'
+          ? { ...p, lastSuccessAt: new Date(nowMs - 20 * 60_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 60_000).toISOString() }
+          : p),
+    };
+    expect(evaluatePipelineSignals(fresh, nowMs).checks.find((c) => c.id === 'polling_executive')!.status).toBe('ok');
+
+    const stale: PipelineSignals = {
       ...base,
       pollSources: base.pollSources!.map((p) =>
         p.source === 'executive'
           ? { ...p, lastSuccessAt: new Date(nowMs - 20 * 3_600_000).toISOString(), lastAttemptAt: new Date(nowMs - 20 * 3_600_000).toISOString() }
           : p),
     };
-    const res = evaluatePipelineSignals(s, nowMs);
-    expect(res.checks.find((c) => c.id === 'polling_executive')!.status).toBe('ok');
+    const res = evaluatePipelineSignals(stale, nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_executive')!.status).toBe('stalled');
   });
 
   it('zero latency observations ever is stalled (monitoring never wired = loudest case)', () => {
@@ -699,5 +734,403 @@ describe('price_freshness check', () => {
     expect(v.worstBehind).toBe(4);
     expect(v.legs['price cache']).toEqual({ date: '2026-09-08', behind: 4 });
     expect(v.legs['S&P 500 series']).toEqual({ date: '2026-09-15', behind: 0 });
+  });
+});
+
+describe('Http429ValueSchema', () => {
+  it('accepts a parsed number marker (1)', () => {
+    const res = Http429ValueSchema.safeParse(1);
+    expect(res.success).toBe(true);
+    if (res.success) expect(res.data).toEqual({ count: 1 });
+  });
+  it('accepts a raw numeric string marker ("1")', () => {
+    const res = Http429ValueSchema.safeParse('1');
+    expect(res.success).toBe(true);
+  });
+  it('accepts the legacy { count } object', () => {
+    const res = Http429ValueSchema.safeParse({ count: 2 });
+    expect(res.success).toBe(true);
+    if (res.success) expect(res.data).toEqual({ count: 2 });
+  });
+  it('rejects a negative number', () => {
+    expect(Http429ValueSchema.safeParse(-1).success).toBe(false);
+  });
+  it('rejects a random object', () => {
+    expect(Http429ValueSchema.safeParse({ foo: 'bar' }).success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pollMaxAgeHours session-cap widening (#PR-2599 follow-up)
+//
+// The shipped schedule floors are 30 min weekday / 60 min weekend (house,
+// senate, provider) and 15 min weekday (executive profile). A *legally slower*
+// coverage floor (e.g. PROBE_SCHEDULE_MAX_INTERVAL_SEC=3600) widens the cap to
+// 1.5x the longest allocated gap so a healthy slower poll is not falsely
+// stalled — without ever restoring the 3h/26h per-source ceilings that hid a
+// multi-hour SQLITE_BUSY wedge.
+// ---------------------------------------------------------------------------
+
+describe('pollMaxAgeHours session-cap widening', () => {
+  // Friday 2025-08-01 12:00 ET (EDT) — a weekday in the same week as the
+  // saturday test below; matches the fixture clock used elsewhere in this
+  // file so the existing "ok at 20 min / stalled at 20 h" executive test
+  // continues to anchor the shipped-floor case.
+  const weekdayMs = 1754092800000;
+  // Saturday 2025-08-02 12:00 ET (EDT) = 2025-08-02T16:00:00Z.
+  const weekendMs = Date.parse('2025-08-02T16:00:00Z');
+
+  // Local copy of the shipped default poll-success ceilings (DEFAULT_PIPELINE_THRESHOLDS
+  // would also work, but writing the literals here makes the per-source ceiling
+  // the test cares about impossible to miss).
+  const defaultThresholds = {
+    ...DEFAULT_PIPELINE_THRESHOLDS,
+    pollSuccessMaxAgeHours: { house: 3, senate: 3, executive: 26 },
+  };
+
+  it('shipped schedule: house / senate collapse to 0.75h weekday', () => {
+    const res = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 30 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 30 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 30 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 30 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 10 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 10 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, defaultThresholds);
+    expect(res.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.status).toBe('ok');
+  });
+
+  it('shipped schedule: house / senate collapse to 1.5h weekend (default 3h ceiling does NOT reopen)', () => {
+    // House last success 2h ago on a Saturday — must be stalled, not ok, even
+    // though the 3h per-source ceiling is well above 2h.
+    const res = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekendMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekendMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekendMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekendMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekendMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekendMs, defaultThresholds);
+    expect(res.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.status).toBe('ok');
+  });
+
+  it('raised pollSuccessMaxAgeHours=10 with the shipped schedule stays capped at 0.75h weekday (3h/26h ceilings do NOT reopen)', () => {
+    // 2h ago is *inside* a 3h/10h/26h ceiling but outside the 0.75h session
+    // cap, so the chamber must be stalled.
+    const res = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, pollSuccessMaxAgeHours: { house: 10, senate: 10, executive: 10 } });
+    expect(res.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.status).toBe('stalled');
+    expect(res.checks.find((c) => c.id === 'polling_executive')!.status).toBe('stalled');
+  });
+
+  it('PROBE_SCHEDULE_MAX_INTERVAL_SEC=3600 weekday: house widens to 1.5h, executive stays 0.75h (profile floor wins)', () => {
+    // Global weekday floor raised to 1h: house/senate longest gap = 1h so
+    // threshold = 1.5 * 1h = 1.5h. Executive profile floor stays 15 min so
+    // its longest gap stays 0.25h and its threshold stays 0.75h. The global
+    // env var does NOT widen executive.
+    const slowWeekday = {
+      ...DEFAULT_PROBE_SCHEDULE_CONFIG,
+      maxIntervalSec: 3600,
+    };
+    // House last success 50 min ago — ok (under 1.5h widened cap).
+    const within = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 50 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 50 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 50 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, defaultThresholds, slowWeekday);
+    expect(within.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+    expect(within.checks.find((c) => c.id === 'polling_senate')!.status).toBe('ok');
+    // Executive profile floor (15 min) wins over the global env var.
+    expect(within.checks.find((c) => c.id === 'polling_executive')!.status).toBe('stalled');
+
+    // House last success 2h ago — stalled (over 1.5h widened cap).
+    const pastSignals = {
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 10 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 10 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+      filingSkips24h: 0,
+      filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0 },
+      fmpLatency: {
+        observationCount24h: 120,
+        lastObservationAt: new Date(weekdayMs - 600 * 1000).toISOString(),
+        lastObservationAgeSec: 600,
+        http429s24h: 0,
+        byProvider: { fmp: { lastObservationAt: new Date(weekdayMs - 600 * 1000).toISOString(), ageSec: 600, count24h: 120 } },
+      },
+    } satisfies PipelineSignals;
+    const past = evaluatePipelineSignals(pastSignals, weekdayMs, defaultThresholds, slowWeekday);
+    expect(past.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+  });
+
+  it('PROBE_SCHEDULE_WEEKEND_MAX_INTERVAL_SEC=7200 on shipped profiles: weekend trough is still 1h, so a 2h house success is stalled (7200 alone does NOT widen the cap)', () => {
+    // 7200 is the legal max of PROBE_SCHEDULE_WEEKEND_MAX_INTERVAL_SEC, but
+    // the shipped weekend budget (27) keeps the trough at 3600s. The cap
+    // therefore stays 1.5h and a house success 2h ago is stalled.
+    const slowWeekend = {
+      ...DEFAULT_PROBE_SCHEDULE_CONFIG,
+      weekendMaxIntervalSec: 7200,
+    };
+    const stalled = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekendMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekendMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekendMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekendMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekendMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekendMs, defaultThresholds, slowWeekend);
+    expect(stalled.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+  });
+
+  it('a schedule that actually lengthens the weekend gap: weekendBudget 12 widens house weekend trough to 8640s, cap stays at 3h ceiling, 2h ok / 4h stalled', () => {
+    // weekendBudget 12 -> effectiveBudget 10 (10% headroom) -> 86400/10 = 8640s
+    // trough. missedSlotHours = 1.5 * 2.4h = 3.6h would widen the cap, but the
+    // 3h per-source ceiling binds (min(3, 3.6)). Senate and executive use the
+    // shipped budgets and stay at the 1.5h weekend cap.
+    const widerHouseWeekend = {
+      ...DEFAULT_PROBE_SCHEDULE_CONFIG,
+      profiles: {
+        ...DEFAULT_PROBE_SCHEDULE_CONFIG.profiles,
+        house: { ...DEFAULT_PROBE_SCHEDULE_CONFIG.profiles.house, weekendBudget: 12 },
+      },
+    };
+    // 2h ago: ok under the 3h ceiling-bound cap.
+    const within = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekendMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekendMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekendMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekendMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekendMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekendMs, defaultThresholds, widerHouseWeekend);
+    expect(within.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+
+    // 4h ago: stalled, over the 3h ceiling-bound cap.
+    const past = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekendMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekendMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekendMs - 4 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekendMs - 4 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekendMs - 70 * 60_000).toISOString(), lastAttemptAt: new Date(weekendMs - 70 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekendMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekendMs, defaultThresholds, widerHouseWeekend);
+    expect(past.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+  });
+
+  it('weekdayPollMaxAgeHours: 2 with the shipped schedule raises the weekday cap to 2h (cannot exceed pollSuccessMaxAgeHours)', () => {
+    // 1.5h ago is ok under 2h widened cap (would have been stalled at 0.75h).
+    const within = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 90 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 90 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 90 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 90 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 90 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 90 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, weekdayPollMaxAgeHours: 2 });
+    expect(within.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+
+    // 2.5h ago is stalled (over 2h widened cap).
+    const past = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 150 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 150 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 150 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 150 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 150 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 150 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, weekdayPollMaxAgeHours: 2 });
+    expect(past.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+
+    // weekdayPollMaxAgeHours: 5 with the per-source ceiling at 3h:
+    // 2h ago is inside the 3h per-source ceiling AND inside the 3h cap, so
+    // it stays ok. 4h ago is over both and stalls.
+    const capped = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 2 * 3_600_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, weekdayPollMaxAgeHours: 5 });
+    expect(capped.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+
+    const pastCapped = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 4 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 4 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 4 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 4 * 3_600_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 4 * 3_600_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 4 * 3_600_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, weekdayPollMaxAgeHours: 5 });
+    expect(pastCapped.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
+  });
+
+  it('tight custom pollSuccessMaxAgeHours=0.6h floors at one missed slot (0.75h), not 0.6h', () => {
+    // 0.6h is below sessionCap (0.75h) and below one missed slot (0.75h), so the
+    // effective cap is 0.75h per the PipelineThresholds contract.
+    const ok = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 35 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 35 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 35 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 35 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 10 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 10 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, pollSuccessMaxAgeHours: { house: 0.6, senate: 0.6, executive: 26 } });
+    expect(ok.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+
+    // 40 min is under the 0.75h missed-slot floor (would have been stalled at 0.6h).
+    const withinMissedSlot = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 40 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 40 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 40 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 40 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 10 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 10 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, pollSuccessMaxAgeHours: { house: 0.6, senate: 0.6, executive: 26 } });
+    expect(withinMissedSlot.checks.find((c) => c.id === 'polling_house')!.status).toBe('ok');
+
+    // 50 min is over the 0.75h missed-slot floor, stalled.
+    const stalled = evaluatePipelineSignals({
+      outboxPending: 0, outboxOldestAt: null, outboxFailed: 0,
+      reviewBacklog: 0, reviewEligible: 0, reviewSuppressed: 0, reviewTerminal: 0,
+      extractionAttempts24h: 10, extractionOk24h: 10,
+      lastExtractionSuccessAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      localWorkerActivity24h: 0, autopilotHaltReason: null,
+      latestTxCreatedAt: new Date(weekdayMs - 3_600_000).toISOString(),
+      dishonestResolutionCount: 0, orphanedNeedsReviewCount: 0, strandedFilings: 0,
+      pollSources: [
+        { source: 'house', lastSuccessAt: new Date(weekdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 50 * 60_000).toISOString(), configDisabled: false },
+        { source: 'senate', lastSuccessAt: new Date(weekdayMs - 50 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 50 * 60_000).toISOString(), configDisabled: false },
+        { source: 'executive', lastSuccessAt: new Date(weekdayMs - 10 * 60_000).toISOString(), lastAttemptAt: new Date(weekdayMs - 10 * 60_000).toISOString(), configDisabled: false },
+      ],
+      latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
+      senateRelay: null,
+    }, weekdayMs, { ...defaultThresholds, pollSuccessMaxAgeHours: { house: 0.6, senate: 0.6, executive: 26 } });
+    expect(stalled.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
   });
 });
