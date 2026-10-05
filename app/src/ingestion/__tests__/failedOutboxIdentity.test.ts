@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   fingerprintFailedIngestionDocIds,
+  fingerprintFailedIngestionIdentity,
   formatIngestionDeadLetterIdentityDetail,
 } from '../failedOutboxIdentity.ts';
 
@@ -16,6 +17,20 @@ describe('failedOutboxIdentity', () => {
     const senatePair = await fingerprintFailedIngestionDocIds(['S-aaa', 'S-bbb']);
     const otherPair = await fingerprintFailedIngestionDocIds(['S-aaa', 'S-ccc']);
     expect(senatePair).not.toBe(otherPair);
+  });
+
+  it('identity fingerprint differs when tail doc_ids differ at the same count (truncated head)', async () => {
+    const head = ['s-00001', 's-00002'];
+    const a = await fingerprintFailedIngestionIdentity(600, head, ['s-00777']);
+    const b = await fingerprintFailedIngestionIdentity(600, head, ['s-00888']);
+    expect(a).not.toBe(b);
+  });
+
+  it('identity fingerprint differs when count differs with the same head window', async () => {
+    const head = ['s-00001', 's-00002'];
+    const a = await fingerprintFailedIngestionIdentity(500, head, []);
+    const b = await fingerprintFailedIngestionIdentity(501, head, ['s-00999']);
+    expect(a).not.toBe(b);
   });
 
   it('formatIngestionDeadLetterIdentityDetail includes short fp and doc preview', () => {

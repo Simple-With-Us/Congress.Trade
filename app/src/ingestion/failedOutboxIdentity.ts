@@ -8,8 +8,10 @@ import { all, get } from '../shared/db.ts';
 /** Max failed rows returned in admin receipts (count-only aggregates stay unbounded). */
 export const FAILED_INGESTION_OUTBOX_DETAIL_LIMIT = 50;
 
-/** Max doc_ids loaded into memory for SHA-256 fingerprinting (health + admin). */
+/** Head window for fingerprint scans; tail doc_ids are hashed separately when truncated. */
 export const FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT = 500;
+
+const FINGERPRINT_TAIL_PAGE_SIZE = 500;
 
 export interface FailedIngestionOutboxRow {
   doc_id: string;
@@ -21,11 +23,11 @@ export interface FailedIngestionOutboxRow {
 
 export interface FailedIngestionOutboxIdentity {
   count: number;
-  /** SHA-256 hex of sorted doc_ids joined by `\n` (empty string when count is 0). */
+  /** SHA-256 hex of count + sorted head doc_ids + tail digest (see {@link fingerprintFailedIngestionIdentity}). */
   fingerprint: string;
   /** Preview doc_ids (admin detail rows; ordered by available_at, not fingerprint input). */
   doc_ids: string[];
-  /** False when `count` exceeds {@link FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT}. */
+  /** True only when the fingerprint scan saw every failed row with no truncation or count drift. */
   fingerprintCoversAll: boolean;
 }
 
@@ -46,6 +48,22 @@ export async function fingerprintFailedIngestionDocIds(docIds: string[]): Promis
   if (docIds.length === 0) return await sha256Hex('');
   const sorted = [...docIds].sort();
   return await sha256Hex(sorted.join('\n'));
+}
+
+/**
+ * Fingerprint for the full failed set: `count`, lexicographic head window, and a
+ * digest of any tail doc_ids beyond the head window (so truncated scans stay distinct).
+ */
+export async function fingerprintFailedIngestionIdentity(
+  count: number,
+  headDocIds: string[],
+  tailDocIds: string[] = [],
+): Promise<string> {
+  const sortedHead = [...headDocIds].sort();
+  const tailDigest = tailDocIds.length > 0
+    ? await fingerprintFailedIngestionDocIds(tailDocIds)
+    : '';
+  return await sha256Hex(`${count}\n${sortedHead.join('\n')}\n${tailDigest}`);
 }
 
 export function formatIngestionDeadLetterIdentityDetail(
@@ -80,13 +98,38 @@ export async function loadFailedIngestionOutboxRows(
   );
 }
 
-async function loadFailedIngestionOutboxDocIdsForFingerprint(db: D1Database): Promise<string[]> {
-  const rows = await all<{ doc_id: string }>(
+async function loadFingerprintHeadDocIds(
+  db: D1Database,
+): Promise<{ headDocIds: string[]; truncatedByScan: boolean }> {
+  const scanLimit = FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT + 1;
+  const scanned = await all<{ doc_id: string }>(
     db,
     `SELECT doc_id FROM ingestion_outbox WHERE status = 'failed' ORDER BY doc_id ASC LIMIT ?`,
-    [FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT],
+    [scanLimit],
   );
-  return rows.map((row) => row.doc_id);
+  const truncatedByScan = scanned.length > FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT;
+  const headDocIds = (truncatedByScan
+    ? scanned.slice(0, FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT)
+    : scanned
+  ).map((row) => row.doc_id);
+  return { headDocIds, truncatedByScan };
+}
+
+async function loadFingerprintTailDocIds(db: D1Database): Promise<string[]> {
+  const tailDocIds: string[] = [];
+  let offset = FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT;
+  while (true) {
+    const page = await all<{ doc_id: string }>(
+      db,
+      `SELECT doc_id FROM ingestion_outbox WHERE status = 'failed' ORDER BY doc_id ASC LIMIT ? OFFSET ?`,
+      [FINGERPRINT_TAIL_PAGE_SIZE, offset],
+    );
+    if (page.length === 0) break;
+    tailDocIds.push(...page.map((row) => row.doc_id));
+    offset += page.length;
+    if (page.length < FINGERPRINT_TAIL_PAGE_SIZE) break;
+  }
+  return tailDocIds;
 }
 
 export async function buildFailedIngestionOutboxIdentity(
@@ -94,30 +137,37 @@ export async function buildFailedIngestionOutboxIdentity(
   failedCount?: number | null,
   limit = FAILED_INGESTION_OUTBOX_DETAIL_LIMIT,
 ): Promise<FailedIngestionOutboxIdentity | null> {
-  let count = failedCount;
-  if (count === undefined) {
-    const row = await get<{ n: number }>(
-      db,
-      `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed'`,
-    );
-    count = Number(row?.n ?? 0);
-  }
-  if (count === null) return null;
+  if (failedCount === null) return null;
+
+  const { headDocIds, truncatedByScan } = await loadFingerprintHeadDocIds(db);
+  const tailDocIds = truncatedByScan ? await loadFingerprintTailDocIds(db) : [];
+
+  const countRow = await get<{ n: number }>(
+    db,
+    `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed'`,
+  );
+  const count = Number(countRow?.n ?? 0);
+
   if (count === 0) {
     return {
       count: 0,
-      fingerprint: await fingerprintFailedIngestionDocIds([]),
+      fingerprint: await fingerprintFailedIngestionIdentity(0, [], []),
       doc_ids: [],
       fingerprintCoversAll: true,
     };
   }
-  const fingerprintDocIds = await loadFailedIngestionOutboxDocIdsForFingerprint(db);
+
+  const fingerprintCoversAll = !truncatedByScan
+    && headDocIds.length === count
+    && tailDocIds.length === 0;
+
   const rows = await loadFailedIngestionOutboxRows(db, limit);
   const previewDocIds = rows.map((row) => row.doc_id);
+
   return {
     count,
-    fingerprint: await fingerprintFailedIngestionDocIds(fingerprintDocIds),
+    fingerprint: await fingerprintFailedIngestionIdentity(count, headDocIds, tailDocIds),
     doc_ids: previewDocIds,
-    fingerprintCoversAll: count <= FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT,
+    fingerprintCoversAll,
   };
 }
