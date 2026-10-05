@@ -11311,8 +11311,10 @@ function publicLatencySummary(d) {
 function speedBoastProvider(d) {
   var best = null;
   publicLatencyProviders(d.providers).filter(function (p) {
-    return p.matched >= SPEED_LANE_MIN_MATCHED && p.comparisonStatus === 'usable' &&
-      Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT && Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
+    if (Number(p.ctCoveragePct) < SPEED_MIN_COVERAGE_PCT || Number(p.providerCoveragePct) < SPEED_MIN_COVERAGE_PCT) return false;
+    return p.matched >= SPEED_LANE_MIN_MATCHED &&
+      (p.comparisonStatus === 'usable' || p.comparisonStatus === 'preliminary');
+  })
   })
     .forEach(function (p) { if (!best || p.matched > best.matched) best = p; });
   return best && best.matched >= SPEED_BOAST_MIN_MATCHED && (best.medianLeadSec || 0) > 0 ? best : null;
@@ -13236,6 +13238,7 @@ function pricingCopy(intent) {
     features: [
       'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
       'Live SSE stream of every new filing — no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
   if (intent === 'export') return {
@@ -13245,6 +13248,7 @@ function pricingCopy(intent) {
       'Full-history CSV export with ticker, member, type, chamber, and date filters',
       'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
       'Live SSE stream of every new filing — no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
   return {
