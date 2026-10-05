@@ -1043,7 +1043,8 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // (one missed slot) instead of falsely stalling a healthy slower poll.
   // The default schedule (30/60-minute floors) keeps the shipped 0.75/1.5h
   // caps, so unset env is a strict no-op vs the previous behavior.
-  const schedule = probeScheduleConfigFromEnv(env);
+  // Env does not declare the probe-schedule keys.  Same cast as watcher.ts.
+  const schedule = probeScheduleConfigFromEnv(env as unknown as Record<string, string | undefined>);
 
   let outboxPending: number | null = null;
   let outboxOldestAt: string | null = null;
