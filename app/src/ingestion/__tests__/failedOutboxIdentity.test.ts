@@ -23,9 +23,25 @@ describe('failedOutboxIdentity', () => {
       count: 2,
       fingerprint: 'abcdef0123456789'.padEnd(64, '0'),
       doc_ids: ['S-6bf3b6f7', 'S-9e2ff733'],
+      fingerprintCoversAll: true,
     });
     expect(detail).toContain('fp=abcdef012345');
     expect(detail).toContain('S-6bf3b6f7');
     expect(detail).toContain('S-9e2ff733');
+  });
+
+  it('omits doc_id preview on public health surfaces', () => {
+    const detail = formatIngestionDeadLetterIdentityDetail(
+      {
+        count: 2,
+        fingerprint: 'abcdef0123456789'.padEnd(64, '0'),
+        doc_ids: ['S-6bf3b6f7', 'S-9e2ff733'],
+        fingerprintCoversAll: true,
+      },
+      { includeDocIdPreview: false },
+    );
+    expect(detail).toContain('fp=abcdef012345');
+    expect(detail).toContain('all failed=2');
+    expect(detail).not.toContain('S-6bf3b6f7');
   });
 });

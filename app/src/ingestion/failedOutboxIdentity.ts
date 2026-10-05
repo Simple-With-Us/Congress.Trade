@@ -8,6 +8,9 @@ import { all, get } from '../shared/db.ts';
 /** Max failed rows returned in admin receipts (count-only aggregates stay unbounded). */
 export const FAILED_INGESTION_OUTBOX_DETAIL_LIMIT = 50;
 
+/** Max doc_ids loaded into memory for SHA-256 fingerprinting (health + admin). */
+export const FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT = 500;
+
 export interface FailedIngestionOutboxRow {
   doc_id: string;
   chamber: string;
@@ -20,7 +23,15 @@ export interface FailedIngestionOutboxIdentity {
   count: number;
   /** SHA-256 hex of sorted doc_ids joined by `\n` (empty string when count is 0). */
   fingerprint: string;
+  /** Preview doc_ids (admin detail rows; ordered by available_at, not fingerprint input). */
   doc_ids: string[];
+  /** False when `count` exceeds {@link FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT}. */
+  fingerprintCoversAll: boolean;
+}
+
+export interface FormatIngestionDeadLetterIdentityOptions {
+  /** When false, omit doc_id preview (public `/api/health` surfaces). */
+  includeDocIdPreview?: boolean;
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -39,12 +50,18 @@ export async function fingerprintFailedIngestionDocIds(docIds: string[]): Promis
 
 export function formatIngestionDeadLetterIdentityDetail(
   identity: FailedIngestionOutboxIdentity | null | undefined,
+  options: FormatIngestionDeadLetterIdentityOptions = {},
 ): string {
   if (!identity || identity.count === 0) return '';
+  const includeDocIdPreview = options.includeDocIdPreview ?? true;
   const shortFp = identity.fingerprint.slice(0, 12);
+  const partial = identity.fingerprintCoversAll ? '' : ' partial';
+  if (!includeDocIdPreview) {
+    return `; identity fp=${shortFp}${partial} (all failed=${identity.count})`;
+  }
   const preview = identity.doc_ids.slice(0, 8).join(', ');
   const more = identity.doc_ids.length > 8 ? ` +${identity.doc_ids.length - 8} more` : '';
-  return `; identity fp=${shortFp} [${preview}${more}]`;
+  return `; identity fp=${shortFp}${partial} [${preview}${more}]`;
 }
 
 export async function loadFailedIngestionOutboxRows(
@@ -63,10 +80,11 @@ export async function loadFailedIngestionOutboxRows(
   );
 }
 
-async function loadAllFailedIngestionOutboxDocIds(db: D1Database): Promise<string[]> {
+async function loadFailedIngestionOutboxDocIdsForFingerprint(db: D1Database): Promise<string[]> {
   const rows = await all<{ doc_id: string }>(
     db,
-    `SELECT doc_id FROM ingestion_outbox WHERE status = 'failed' ORDER BY doc_id ASC`,
+    `SELECT doc_id FROM ingestion_outbox WHERE status = 'failed' ORDER BY doc_id ASC LIMIT ?`,
+    [FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT],
   );
   return rows.map((row) => row.doc_id);
 }
@@ -86,14 +104,20 @@ export async function buildFailedIngestionOutboxIdentity(
   }
   if (count === null) return null;
   if (count === 0) {
-    return { count: 0, fingerprint: await fingerprintFailedIngestionDocIds([]), doc_ids: [] };
+    return {
+      count: 0,
+      fingerprint: await fingerprintFailedIngestionDocIds([]),
+      doc_ids: [],
+      fingerprintCoversAll: true,
+    };
   }
-  const allDocIds = await loadAllFailedIngestionOutboxDocIds(db);
+  const fingerprintDocIds = await loadFailedIngestionOutboxDocIdsForFingerprint(db);
   const rows = await loadFailedIngestionOutboxRows(db, limit);
   const previewDocIds = rows.map((row) => row.doc_id);
   return {
     count,
-    fingerprint: await fingerprintFailedIngestionDocIds(allDocIds),
+    fingerprint: await fingerprintFailedIngestionDocIds(fingerprintDocIds),
     doc_ids: previewDocIds,
+    fingerprintCoversAll: count <= FAILED_INGESTION_OUTBOX_FINGERPRINT_LIMIT,
   };
 }
