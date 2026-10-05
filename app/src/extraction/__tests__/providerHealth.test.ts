@@ -8,6 +8,7 @@ import {
   isFalseSourceAuthHalt,
   isTransientFilesPrepaidError,
   isTransientFilesPrepaidHalt,
+  isTransientInfrastructureHalt,
   summarizeProviderHaltCause,
   healthWindowKey,
   modelBanKey,
@@ -110,8 +111,24 @@ describe('classifyProviderErrorClass', () => {
   it('classifies timeouts and parse failures', () => {
     expect(classifyProviderErrorClass('request timed out after 120000ms')).toBe('timeout');
     expect(classifyProviderErrorClass('The operation was aborted')).toBe('timeout');
+    expect(classifyProviderErrorClass('SQLITE_BUSY: database is locked')).toBe('other');
+    expect(classifyProviderErrorClass('Deno cron tick exceeded 45000ms deadline')).toBe('other');
+    expect(classifyProviderErrorClass('scheduled tick aborted')).toBe('other');
     expect(classifyProviderErrorClass('could not parse model JSON: unexpected token')).toBe('parse');
     expect(classifyProviderErrorClass('openai: empty completion')).toBe('parse');
+  });
+
+  it('auto-resumes only infrastructure halts, not a real provider timeout', () => {
+    expect(isTransientInfrastructureHalt('error_class:timeout', {
+      lock: 'SQLITE_BUSY: database is locked',
+    })).toBe(true);
+    expect(isTransientInfrastructureHalt('error_class:timeout', {
+      provider: 'request timed out after 120000ms',
+    })).toBe(false);
+    expect(isTransientInfrastructureHalt('error_class:timeout', {
+      lock: 'SQLITE_BUSY: database is locked',
+      provider: 'request timed out after 120000ms',
+    })).toBe(false);
   });
 
   it('returns other for unknown failures and null for no error', () => {

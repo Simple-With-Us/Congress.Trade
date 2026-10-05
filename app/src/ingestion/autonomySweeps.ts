@@ -22,6 +22,7 @@ import { extractText, getDocumentProxy } from 'unpdf';
 import type { Env } from '../shared/types.ts';
 import { all, batch, run } from '../shared/db.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
@@ -429,6 +430,8 @@ export interface AutonomySweepResult {
   pollingHeartbeat: PollingHeartbeatResult | null;
   /** Empty 278e → verified_empty; refused 278-T → unreadable.  Allowlist only. */
   executiveTerminals: ExecutiveTerminalSweepResult | null;
+  /** Bounded replay of transient failed outbox / queue rows. */
+  transientDlq: TransientDlqSweepResult | null;
   errors: string[];
 }
 
@@ -517,6 +520,13 @@ const LIVENESS_ALARM_CHECK_IDS = new Set([
   // network outage that has been silent for >3h. Owner ask: FMP latency
   // should be visible everywhere; it is also a hard alarm when silent.
   'fmp_latency',
+  // Fresh failures and parked / cycle-capped dead letters.  Priority 0 while
+  // degraded, so a standing parked row notifies without hiding a later
+  // critical check.  The hourly sweep requeues safe rows before this runs.
+  'ingestion_dead_letter',
+  // Deadline abort and SQLITE_BUSY tick skip.  Count >= 3 inside 6h is
+  // critical and wakes the phone; a single miss is a silent notify.
+  'cron_deadline',
 ]);
 const LIVENESS_ALARM_KV_PREFIX = 'liveness-alarm:';
 const LIVENESS_RENOTIFY_MS = 6 * 3_600_000;
@@ -1193,6 +1203,7 @@ export async function runAutonomySweeps(
     hostedFallback: null,
     pollingHeartbeat: null,
     executiveTerminals: null,
+    transientDlq: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -1302,6 +1313,16 @@ export async function runAutonomySweeps(
     result.hostedFallback = await sweepLocalVisionHostedFallback(env);
   } catch (err) {
     errors.push(`hostedFallback: ${(err as Error).message}`);
+  }
+
+  // Requeue SQLITE_BUSY / deadline / 429 failures before the alarm sweep
+  // reads health, so a row that just became pending does not page.  Parked
+  // and poison rows are left failed on purpose.
+  try {
+    throwIfAborted();
+    result.transientDlq = await sweepTransientDeadLetters(env, now);
+  } catch (err) {
+    errors.push(`transientDlq: ${(err as Error).message}`);
   }
 
   try {
