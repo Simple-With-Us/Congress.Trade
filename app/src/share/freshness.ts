@@ -4,12 +4,13 @@
  *
  * Cross-app freshness watchdog (App A's half of the mutual health check). Once a
  * day the cron compares how stale the market-data streams a sibling app keeps
- * current — S&P closes, per-ticker prices, and the fundamentals it pushes — are
- * against generous thresholds. If a stream that WAS being kept current goes
- * stale (App B's nightly push silently broke, or our own price refresh is
- * failing), we email a throttled admin alert via the same path as the FMP-tier
- * alert. Streams that were never populated (null latest) are skipped so a
- * not-yet-wired partner never trips a false alarm.
+ * current — S&P closes, per-ticker prices, fundamentals, insider / short-volume,
+ * analyst consensus, and imported reference enrichment — are against generous
+ * thresholds. If a stream that should be kept current goes stale (App B's nightly
+ * push silently broke, or our own price refresh is failing), we email a throttled
+ * admin alert via the same path as the FMP-tier alert. A never-populated stream
+ * (null latest) is treated as stale so a silent partner cannot hide behind an
+ * empty table.
  *
  * The decision logic (evaluateFreshness) is pure + deterministic so it unit-
  * tests without a database or clock.
@@ -19,13 +20,25 @@ import type { Env } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
 
-export type FreshnessStream = 'spx' | 'prices' | 'fundamentals';
+export type FreshnessStream =
+  | 'spx'
+  | 'prices'
+  | 'fundamentals'
+  | 'insider'
+  | 'shortVolume'
+  | 'analyst'
+  | 'refEnrichment';
 
 /** Latest timestamp seen per donated stream (YYYY-MM-DD or ISO; null = never). */
 export interface FreshnessSnapshot {
   spxLatestDate: string | null;
   priceLatestDate: string | null;
   fundamentalsLatest: string | null;
+  insiderLatestDate: string | null;
+  shortVolumeLatestDate: string | null;
+  analystLatest: string | null;
+  /** Proxy for sibling-pushed company reference rows (`source = imported`). */
+  refEnrichmentLatest: string | null;
 }
 
 export interface StaleStream {
@@ -37,13 +50,22 @@ export interface StaleStream {
 /**
  * Max age (whole days) before a kept-current stream is considered stale. Roomy
  * enough to absorb weekends + a market holiday (closes don't update Sat/Sun)
- * without false alarms; fundamentals gets extra slack for a nightly cadence.
+ * without false alarms; fundamentals / analyst / ref enrichment get extra slack
+ * for a nightly cadence; insider / short-volume follow daily EOD with the same
+ * weekend headroom as prices.
  */
 export const FRESHNESS_MAX_AGE_DAYS: Record<FreshnessStream, number> = {
   spx: 5,
   prices: 5,
   fundamentals: 8,
+  insider: 5,
+  shortVolume: 5,
+  analyst: 8,
+  refEnrichment: 8,
 };
+
+/** Shown in alerts when a stream has never received data. */
+export const FRESHNESS_NEVER_LABEL = 'never';
 
 const DAY_MS = 86_400_000;
 
@@ -58,9 +80,8 @@ export function ageInDays(value: string | null, nowMs: number): number | null {
 }
 
 /**
- * Pure: which donated streams are stale beyond their threshold. Never-populated
- * streams (null latest) are skipped — we only flag a stream that was being kept
- * current and then stopped.
+ * Pure: which donated streams are stale beyond their threshold. Null latest is
+ * stale (never populated) for every stream in the snapshot.
  */
 export function evaluateFreshness(
   snapshot: FreshnessSnapshot,
@@ -71,11 +92,19 @@ export function evaluateFreshness(
     ['spx', snapshot.spxLatestDate],
     ['prices', snapshot.priceLatestDate],
     ['fundamentals', snapshot.fundamentalsLatest],
+    ['insider', snapshot.insiderLatestDate],
+    ['shortVolume', snapshot.shortVolumeLatestDate],
+    ['analyst', snapshot.analystLatest],
+    ['refEnrichment', snapshot.refEnrichmentLatest],
   ];
   const stale: StaleStream[] = [];
   for (const [stream, latest] of checks) {
+    if (latest == null) {
+      stale.push({ stream, latest: FRESHNESS_NEVER_LABEL, ageDays: max[stream] + 1 });
+      continue;
+    }
     const age = ageInDays(latest, nowMs);
-    if (latest != null && age != null && age > max[stream]) {
+    if (age != null && age > max[stream]) {
       stale.push({ stream, latest, ageDays: age });
     }
   }
@@ -94,6 +123,10 @@ export async function runFreshnessCheck(env: Env, now = new Date()): Promise<Sta
       spx_latest: string | null;
       price_latest: string | null;
       fundamentals_latest: string | null;
+      insider_latest: string | null;
+      short_volume_latest: string | null;
+      analyst_latest: string | null;
+      ref_enrichment_latest: string | null;
     }>(
       env.DB,
       // price_latest is the WORST (oldest) latest_price_date among the 25 most-
@@ -111,12 +144,20 @@ export async function runFreshnessCheck(env: Env, now = new Date()): Promise<Sta
         'AND COALESCE(sr.price_unavailable, 0) = 0 AND sr.latest_price_date IS NOT NULL ' +
         'GROUP BY t.ticker ORDER BY MAX(t.cursor_seq) DESC LIMIT 25' +
         ')) AS price_latest, ' +
-        '(SELECT MAX(updated_at) FROM fundamentals_eod) AS fundamentals_latest',
+        '(SELECT MAX(updated_at) FROM fundamentals_eod) AS fundamentals_latest, ' +
+        '(SELECT MAX(date) FROM insider_eod) AS insider_latest, ' +
+        '(SELECT MAX(date) FROM short_volume_eod) AS short_volume_latest, ' +
+        "(SELECT MAX(updated_at) FROM analyst_consensus WHERE source = 'imported') AS analyst_latest, " +
+        "(SELECT MAX(price_checked_at) FROM securities_ref WHERE source = 'imported') AS ref_enrichment_latest",
     );
     snapshot = {
       spxLatestDate: row?.spx_latest ?? null,
       priceLatestDate: row?.price_latest ?? null,
       fundamentalsLatest: row?.fundamentals_latest ?? null,
+      insiderLatestDate: row?.insider_latest ?? null,
+      shortVolumeLatestDate: row?.short_volume_latest ?? null,
+      analystLatest: row?.analyst_latest ?? null,
+      refEnrichmentLatest: row?.ref_enrichment_latest ?? null,
     };
   } catch {
     return []; // DB unavailable → skip rather than false-alarm
@@ -126,7 +167,12 @@ export async function runFreshnessCheck(env: Env, now = new Date()): Promise<Sta
   if (stale.length === 0) return [];
 
   const lines = stale
-    .map((s) => `  • ${s.stream}: last update ${s.latest} (${s.ageDays}d ago)`)
+    .map((s) => {
+      const ago = s.latest === FRESHNESS_NEVER_LABEL
+        ? 'never populated'
+        : `${s.ageDays}d ago`;
+      return `  • ${s.stream}: last update ${s.latest} (${ago})`;
+    })
     .join('\n');
   await notifyAdmin(env, {
     dedupeKey: 'data-freshness',
