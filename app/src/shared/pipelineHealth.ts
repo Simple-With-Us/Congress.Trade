@@ -394,19 +394,11 @@ function pollMaxAgeHours(
     : (configured.weekdayPollMaxAgeHours ?? DEFAULT_WEEKDAY_POLL_MAX_AGE_HOURS);
   const missedSlotHours = gapHours * 1.5;
   const configuredCeiling = configured.pollSuccessMaxAgeHours[src];
-  // Tighter custom threshold: honor it, but never below the longest legal gap
-  // (a threshold shorter than the longest legal gap stalls a healthy poll).
-  if (configuredCeiling < sessionCap) {
-    return Math.max(configuredCeiling, gapHours);
-  }
-  // Otherwise: cap by session cap (or the missed-slot extension when the
-  // coverage floor is slower), and floor at the missed-slot extension so the
-  // returned value can never lag the actual longest legal gap by more than
-  // half a slot.
-  return Math.max(
-    Math.min(configuredCeiling, Math.max(sessionCap, missedSlotHours)),
-    missedSlotHours,
-  );
+  const sessionOrMissed = Math.max(sessionCap, missedSlotHours);
+  // Monotonic in configuredCeiling: honor a tighter operator ceiling and widen
+  // for a legally slower schedule, but never below one missed slot (see
+  // PipelineThresholds doc).
+  return Math.max(missedSlotHours, Math.min(configuredCeiling, sessionOrMissed));
 }
 
 /**
