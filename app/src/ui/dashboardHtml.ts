@@ -3467,7 +3467,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       </div>
     </div>
     <div class="row-flex" id="gateRow" style="margin-top:10px;justify-content:center">
-      <span class="gate-note" data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $9/mo or $80/yr &middot; 1-week free trial
+      <span class="gate-note" data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial
         <button class="btn sm" onclick="openPricing('export')">Start Free Trial</button></span>
     </div>
 
@@ -3844,7 +3844,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         <div id="subsMsg" class="note subs-msg" aria-live="polite"></div>
       </div>
       <div class="row-flex" style="margin-top:20px;justify-content:center" data-premium-cue="alerts">
-        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $9/mo or $80/yr &middot; 1-week free trial
+        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial
           <button class="btn sm" onclick="openPricing('alerts')">Start Free Trial</button></span>
       </div>
     </div>
@@ -4152,13 +4152,13 @@ ${speedProofSectionHtml(true)}
       <label class="plan sel" id="planMonthly" for="planMonthlyRadio">
         <input type="radio" class="plan-radio-input" id="planMonthlyRadio" name="plan" value="monthly" checked onchange="selectPlan('monthly')">
         <div class="cad">Monthly</div>
-        <div class="price">$9<span class="per">/mo</span></div>
+        <div class="price">$8.99<span class="per">/mo</span></div>
       </label>
       <label class="plan" id="planAnnual" for="planAnnualRadio">
         <input type="radio" class="plan-radio-input" id="planAnnualRadio" name="plan" value="annual" onchange="selectPlan('annual')">
         <span class="save">SAVE ~25%</span>
         <div class="cad">Annual</div>
-        <div class="price">$80<span class="per">/yr</span></div>
+        <div class="price">$79.99<span class="per">/yr</span></div>
       </label>
     </div>
     <p class="trial-note" id="pricingTrialNote">1-week free trial. No charge today.</p>
@@ -7643,7 +7643,7 @@ function updateDeliveryGate() {
   }
   if (!premium) {
     gate.style.display = '';
-    gate.innerHTML = 'You are signed in.&nbsp; Premium is required to create or edit Delivery targets (1-week free trial · $9/mo or $80/yr).&nbsp; Existing deliveries still appear below. '
+    gate.innerHTML = 'You are signed in.&nbsp; Premium is required to create or edit Delivery targets (1-week free trial · $8.99/mo or $79.99/yr).&nbsp; Existing deliveries still appear below. '
       + (checkoutConfigured()
         ? '<button class="btn sm" onclick="openPricing(&quot;alerts&quot;)">Start Free Trial</button>'
         : '<span class="muted">Billing is not configured yet.</span>');
