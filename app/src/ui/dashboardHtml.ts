@@ -13227,8 +13227,8 @@ function pricingCopy(intent) {
     sub: 'The public dashboard stays free.  Premium gets full-history CSV export and the filing the moment we see it.',
     features: [
       'Full-history CSV export of the filtered trade feed',
-      'Instant filing alerts &mdash; signed webhooks (HMAC-verified) to any URL',
-      'Live SSE stream of every new filing &mdash; no polling',
+      'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
+      'Live SSE stream of every new filing — no polling',
       'Proprietary enrichment data in every payload',
     ],
   };
