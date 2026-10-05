@@ -87,33 +87,47 @@ describe('evaluatePipelineSignals', () => {
     expect(res.checks.every((c) => c.status === 'unknown' || c.status === 'ok')).toBe(true);
   });
 
-  it('degrades only on fresh dead-letter items, not a saturated triaged DLQ (#2182)', () => {
-    const triaged: PipelineSignals = {
+  it('degrades on non-parked dead-letter rows even when none are fresh in 24h (board f6be69f466af)', () => {
+    const staleFailures: PipelineSignals = {
       ...cleanSignals,
       outboxFailed: 81,
       outboxFailedFresh: 0,
+      outboxFailedActive: 81,
     };
-    const res = evaluatePipelineSignals(triaged, nowMs);
+    const res = evaluatePipelineSignals(staleFailures, nowMs);
     const check = res.checks.find((c) => c.id === 'ingestion_dead_letter');
-    expect(check?.status).toBe('ok');
-    expect(check?.value).toBe(0);
-    expect(check?.detail).toContain('81 triaged');
-    expect(check?.detail).toContain('0 fresh');
-    expect(res.status).toBe('ok');
+    expect(check?.status).toBe('degraded');
+    expect(check?.value).toBe(81);
+    expect(check?.detail).toContain('81 active');
+    expect(res.status).toBe('degraded');
   });
 
-  it('still degrades when a fresh outbox failure arrives beside triaged rows', () => {
+  it('stays ok when failed outbox rows are explicitly parked', () => {
+    const parkedOnly: PipelineSignals = {
+      ...cleanSignals,
+      outboxFailed: 12,
+      outboxFailedFresh: 0,
+      outboxFailedActive: 0,
+    };
+    const res = evaluatePipelineSignals(parkedOnly, nowMs);
+    const check = res.checks.find((c) => c.id === 'ingestion_dead_letter');
+    expect(check?.status).toBe('ok');
+    expect(check?.detail).toContain('12 parked');
+  });
+
+  it('still degrades when a fresh outbox failure arrives beside older active rows', () => {
     const mixed: PipelineSignals = {
       ...cleanSignals,
       outboxFailed: 82,
       outboxFailedFresh: 1,
+      outboxFailedActive: 82,
     };
     const res = evaluatePipelineSignals(mixed, nowMs);
     const check = res.checks.find((c) => c.id === 'ingestion_dead_letter');
     expect(check?.status).toBe('degraded');
-    expect(check?.value).toBe(1);
-    expect(check?.detail).toContain('1 fresh');
-    expect(check?.detail).toContain('81 triaged');
+    expect(check?.value).toBe(82);
+    expect(check?.detail).toContain('1 fresh in 24h');
+    expect(check?.detail).toContain('82 active');
     expect(res.status).toBe('degraded');
   });
 
@@ -603,15 +617,44 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('stale');
   });
 
-  it('marks senate_relay ok when residential proxy is configured (scout relay retired)', () => {
+  it('marks senate_relay stalled when residential proxy is configured but probe is down (board f6be69f466af)', () => {
     const res = evaluatePipelineSignals({
       ...base,
       senateRelay: { configured: false, probe: null },
       residentialProxyConfigured: true,
+      residentialProxy: {
+        configured: true,
+        probe: {
+          ok: false,
+          status: 503,
+          checkedAt: new Date(nowMs - 30_000).toISOString(),
+          host: '10.99.0.2:8888',
+        },
+      },
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'senate_relay')!;
+    expect(check.status).toBe('stalled');
+    expect(check.detail).toContain('Residential proxy DOWN');
+  });
+
+  it('marks senate_relay ok when residential proxy probe is live', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateRelay: { configured: false, probe: null },
+      residentialProxyConfigured: true,
+      residentialProxy: {
+        configured: true,
+        probe: {
+          ok: true,
+          status: 200,
+          checkedAt: new Date(nowMs - 30_000).toISOString(),
+          host: '10.99.0.2:8888',
+        },
+      },
     }, nowMs);
     const check = res.checks.find((c) => c.id === 'senate_relay')!;
     expect(check.status).toBe('ok');
-    expect(check.detail).toContain('Residential proxy active');
+    expect(check.detail).toContain('Residential proxy live');
   });
 });
 
