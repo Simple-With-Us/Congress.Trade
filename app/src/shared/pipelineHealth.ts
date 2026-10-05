@@ -35,6 +35,11 @@ import {
   DEFAULT_PROBE_SCHEDULE_CONFIG,
   type ProbeScheduleConfig,
 } from '../ingestion/probeSchedule.ts';
+import {
+  buildFailedIngestionOutboxIdentity,
+  formatIngestionDeadLetterIdentityDetail,
+  type FailedIngestionOutboxIdentity,
+} from '../ingestion/failedOutboxIdentity.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -111,6 +116,8 @@ export interface PipelineSignals {
   outboxFailedNonRetryable?: number | null;
   /** Recent cron deadline / lock-skip episode.  Null or omitted means none. */
   cronTickOverrun?: CronTickOverrun | null;
+  /** Sorted failed doc_ids fingerprint for count-only dispute resolution (board c5a4de41). */
+  outboxFailedIdentity?: FailedIngestionOutboxIdentity | null;
   /** ALL unresolved review_queue rows (eligible + suppressed + terminal). */
   reviewBacklog: number | null;
   reviewEligible: number | null;
@@ -498,6 +505,7 @@ export function evaluatePipelineSignals(
     const parked = Math.max(0, s.outboxFailed - (s.outboxFailedActive ?? s.outboxFailed));
     const active = s.outboxFailedActive ?? Math.max(0, s.outboxFailed - parked);
     const fresh = s.outboxFailedFresh ?? 0;
+    const identitySuffix = formatIngestionDeadLetterIdentityDetail(s.outboxFailedIdentity);
     const nonRetryable = s.outboxFailedNonRetryable;
     const actionDetail = nonRetryable != null && nonRetryable > 0
       ? `  ${nonRetryable} non-transient or past the retry cap (not auto-retried).  Operator replay after a fix: POST /api/admin/ingest-requeue-failed.`
@@ -508,14 +516,15 @@ export function evaluatePipelineSignals(
         status: 'degraded',
         detail: `${active} active failed outbox item(s)` +
           (fresh > 0 ? ` (${fresh} fresh in 24h` + (parked > 0 ? `; ${parked} parked)` : ')') : parked > 0 ? ` (${parked} parked)` : '') +
-          actionDetail,
+          actionDetail +
+          identitySuffix,
         value: active,
       });
     } else if (s.outboxFailed > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'ok',
-        detail: `${s.outboxFailed} parked dead-letter item(s) (human review, not auto-retried)`,
+        detail: `${s.outboxFailed} parked dead-letter item(s) (human review, not auto-retried)` + identitySuffix,
         value: 0,
       });
     } else {
@@ -1322,6 +1331,11 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   } catch {}
 
+  let outboxFailedIdentity: FailedIngestionOutboxIdentity | null = null;
+  try {
+    outboxFailedIdentity = await buildFailedIngestionOutboxIdentity(env.DB, outboxFailed);
+  } catch {}
+
   try {
     const rows = await all<{
       last_error: string | null;
@@ -1579,6 +1593,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     outboxFailedParked,
     outboxFailedNonRetryable,
     cronTickOverrun,
+    outboxFailedIdentity,
     reviewBacklog,
     reviewEligible,
     reviewSuppressed,
