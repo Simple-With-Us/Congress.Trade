@@ -19,6 +19,13 @@ import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.t
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { classifyFailedOutboxRow } from '../ingestion/transientDlq.ts';
+import {
+  cronOverrunIsLoud,
+  CRON_TICK_OVERRUN_CRITICAL_COUNT,
+  readCronTickOverrun,
+  type CronTickOverrun,
+} from './cronDeadlineSignal.ts';
 import { z } from 'zod';
 import {
   allocateProbes,
@@ -90,6 +97,20 @@ export interface PipelineSignals {
    * degrades health (board f6be69f466af — age alone must not clear failures).
    */
   outboxFailedActive?: number | null;
+  /**
+   * Failed rows whose last_error starts with `parked:`.  Human review.
+   * Null means the classifier did not run.  Parked-only stays ok.
+   */
+  outboxFailedParked?: number | null;
+  /**
+   * Aged failures that are poison, non-transient, or past the auto-retry cap.
+   * Null means the classifier did not run.  These stay inside the active
+   * count, so they degrade with every other non-parked failure.  The detail
+   * names the operator replay because the hourly sweep will not touch them.
+   */
+  outboxFailedNonRetryable?: number | null;
+  /** Recent cron deadline / lock-skip episode.  Null or omitted means none. */
+  cronTickOverrun?: CronTickOverrun | null;
   /** ALL unresolved review_queue rows (eligible + suppressed + terminal). */
   reviewBacklog: number | null;
   reviewEligible: number | null;
@@ -465,33 +486,62 @@ export function evaluatePipelineSignals(
   }
 
   // 2. Ingestion dead letter.  Parked rows (`parked:`) are intentionally
-  // triaged; every other failed row degrades until requeued or parked.
-  // Fresh (24h) is surfaced in detail so a new stall is obvious beside a
-  // saturated DLQ (#2182) without going green merely because rows are old.
+  // triaged and stay ok.  Every other failed row degrades until requeued or
+  // parked (board f6be69f466af — age alone must not clear failures).  Fresh
+  // (24h) is detail only so a new stall is obvious beside a saturated DLQ
+  // (#2182).  The hourly sweep still replays transient rows under the cycle
+  // cap; while they remain failed they stay degraded.  Poison and capped
+  // rows add the operator replay because that sweep will not touch them.
   if (s.outboxFailed === null) {
     checks.push({ id: 'ingestion_dead_letter', status: 'unknown', detail: 'Outbox failure count uncollected', value: null });
   } else {
     const parked = Math.max(0, s.outboxFailed - (s.outboxFailedActive ?? s.outboxFailed));
     const active = s.outboxFailedActive ?? Math.max(0, s.outboxFailed - parked);
     const fresh = s.outboxFailedFresh ?? 0;
+    const nonRetryable = s.outboxFailedNonRetryable;
+    const actionDetail = nonRetryable != null && nonRetryable > 0
+      ? `  ${nonRetryable} non-transient or past the retry cap (not auto-retried).  Operator replay after a fix: POST /api/admin/ingest-requeue-failed.`
+      : '';
     if (active > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'degraded',
         detail: `${active} active failed outbox item(s)` +
-          (fresh > 0 ? ` (${fresh} fresh in 24h` + (parked > 0 ? `; ${parked} parked)` : ')') : parked > 0 ? ` (${parked} parked)` : ''),
+          (fresh > 0 ? ` (${fresh} fresh in 24h` + (parked > 0 ? `; ${parked} parked)` : ')') : parked > 0 ? ` (${parked} parked)` : '') +
+          actionDetail,
         value: active,
       });
     } else if (s.outboxFailed > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'ok',
-        detail: `${s.outboxFailed} parked dead-letter item(s)`,
+        detail: `${s.outboxFailed} parked dead-letter item(s) (human review, not auto-retried)`,
         value: 0,
       });
     } else {
       checks.push({ id: 'ingestion_dead_letter', status: 'ok', detail: 'No failed outbox items', value: 0 });
     }
+  }
+
+  // Cron deadline / lock skip.  Omitted and null both mean no open episode,
+  // so a KV blip does not flip the whole pipeline to unknown.  The detail
+  // carries the real reason (deadline text or SQLITE_BUSY).
+  if (cronOverrunIsLoud(s.cronTickOverrun, nowMs)) {
+    const overrun = s.cronTickOverrun!;
+    const critical = overrun.count >= CRON_TICK_OVERRUN_CRITICAL_COUNT;
+    checks.push({
+      id: 'cron_deadline',
+      status: critical ? 'critical' : 'degraded',
+      detail: `Tick did not finish ${overrun.count} time(s) since ${overrun.at}: ${overrun.reason}.  The in-flight tick is aborted so the next tick can reclaim leases.`,
+      value: overrun.count,
+    });
+  } else {
+    checks.push({
+      id: 'cron_deadline',
+      status: 'ok',
+      detail: 'No recent cron deadline or lock-skip episode',
+      value: 0,
+    });
   }
 
   // 3. Extraction provider success rate
@@ -1101,6 +1151,9 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   let outboxFailed: number | null = null;
   let outboxFailedFresh: number | null = null;
   let outboxFailedActive: number | null = null;
+  let outboxFailedParked: number | null = null;
+  let outboxFailedNonRetryable: number | null = null;
+  let cronTickOverrun: CronTickOverrun | null = null;
   let reviewBacklog: number | null = null;
   let reviewEligible: number | null = null;
   let reviewSuppressed: number | null = null;
@@ -1268,6 +1321,35 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
       outboxFailedFresh = Number(res.fresh ?? 0);
     }
   } catch {}
+
+  try {
+    const rows = await all<{
+      last_error: string | null;
+      dead_letter_cycles: number | null;
+      updated_at: string | null;
+    }>(
+      env.DB,
+      `SELECT last_error, dead_letter_cycles, updated_at
+         FROM ingestion_outbox
+        WHERE status = 'failed'
+        LIMIT 500`,
+    );
+    let parked = 0;
+    let nonRetryable = 0;
+    for (const row of rows) {
+      const kind = classifyFailedOutboxRow(row, iso24hAgo);
+      if (kind === 'parked') parked += 1;
+      else if (kind === 'non_retryable') nonRetryable += 1;
+    }
+    outboxFailedParked = parked;
+    outboxFailedNonRetryable = nonRetryable;
+  } catch {}
+
+  try {
+    cronTickOverrun = await readCronTickOverrun(env);
+  } catch {
+    cronTickOverrun = null;
+  }
 
   try {
     const res = await get<{ attempts: number; ok_count: number; last_success: string | null }>(
@@ -1494,6 +1576,9 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     outboxFailed,
     outboxFailedFresh,
     outboxFailedActive,
+    outboxFailedParked,
+    outboxFailedNonRetryable,
+    cronTickOverrun,
     reviewBacklog,
     reviewEligible,
     reviewSuppressed,

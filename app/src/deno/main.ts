@@ -24,6 +24,11 @@ import { captureException, initProductionSentry } from '#sentry';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
+import {
+  clearCronTickOverrun,
+  recordCronTickOverrun,
+  tickOutcomeShouldRecord,
+} from '../shared/cronDeadlineSignal.ts';
 
 // 1. Initialize the KV namespace used for configuration and Infisical caching.
 // Deno KV Connect does not support queues, so queue bindings are attached only
@@ -293,6 +298,14 @@ if (!costProfile.disableInternalCron) {
           `Deno cron tick stuck for ${Math.round(heldMs / 1000)}s — force-releasing tickInFlight so subsequent ticks can run`,
         );
         console.error('cron.tick_stuck', { heldMs, consecutive: consecutiveOverlapTicks });
+        try {
+          await recordCronTickOverrun(buildEnv(), {
+            deadlineMs: settings.getInt('CT_TICK_DEADLINE_MS', 45_000),
+            reason: err.message,
+          });
+        } catch (recordErr) {
+          console.error('cron overrun signal failed:', recordErr);
+        }
         captureException(err, {
           tags: { cron: 'deno-tick', class: 'stuck-force-released' },
           extra: { heldMs, consecutive: consecutiveOverlapTicks },
@@ -352,6 +365,17 @@ if (!costProfile.disableInternalCron) {
 
       try {
         const result = await Promise.race([tickPromise, timeoutPromise]);
+        const overrunReason = tickOutcomeShouldRecord(result);
+        if (overrunReason) {
+          await recordCronTickOverrun(env, {
+            deadlineMs: tickDeadlineMs,
+            reason: overrunReason,
+          });
+        } else if (!result.skippedOverlap) {
+          // A finished tick is the recovery signal.  An overlap skip must
+          // not clear an open deadline episode it did not prove over.
+          await clearCronTickOverrun(env);
+        }
         if (result.skippedOverlap) {
           console.log('Deno tick skipped: another tick holds the singleton lock');
         } else if (result.aborted) {
@@ -374,6 +398,15 @@ if (!costProfile.disableInternalCron) {
       console.error('Deno cron tick caught error:', err);
       captureException(err, { tags: { cron: 'deno-tick' } });
       datadogCaptureException(err, { cron: 'deno-tick' });
+      const message = err instanceof Error ? err.message : String(err);
+      try {
+        await recordCronTickOverrun(buildEnv(), {
+          deadlineMs: settings.getInt('CT_TICK_DEADLINE_MS', 45_000),
+          reason: message,
+        });
+      } catch (recordErr) {
+        console.error('cron overrun signal failed:', recordErr);
+      }
     } finally {
       tickInFlight = false;
       tickInFlightSinceMs = 0;
