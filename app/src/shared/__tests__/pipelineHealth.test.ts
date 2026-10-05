@@ -194,6 +194,20 @@ describe('evaluatePipelineSignals', () => {
     expect(evaluatePipelineSignals(stale, nowMs).checks.find((c) => c.id === 'cron_deadline')?.status).toBe('ok');
   });
 
+  it('degrades when webhook deliveries are quarantined after parked-cap overflow', () => {
+    const quarantined: PipelineSignals = {
+      ...cleanSignals,
+      deliveryParked: 500,
+      deliveryQuarantined: 57_321,
+    };
+    const res = evaluatePipelineSignals(quarantined, nowMs);
+    const check = res.checks.find((c) => c.id === 'delivery_quarantine');
+    expect(check?.status).toBe('degraded');
+    expect(check?.value).toBe(57_321);
+    expect(check?.detail).toContain('delivery-requeue-quarantined');
+    expect(res.status).toBe('degraded');
+  });
+
   it('still degrades when a fresh outbox failure arrives beside older active rows', () => {
     const mixed: PipelineSignals = {
       ...cleanSignals,

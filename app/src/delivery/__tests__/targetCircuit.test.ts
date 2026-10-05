@@ -16,6 +16,7 @@ import {
   checkTargetCircuit,
   flushParkedDeliveries,
   parkDelivery,
+  recoverQuarantinedDeliveries,
   recordTargetFailure,
   recordTargetSuccess,
   targetKeyForUrl,
@@ -76,8 +77,11 @@ function circuitEnv(extra: { subscriptions?: Array<Record<string, unknown>>; var
       }
       if (/FROM deliveries d\s+JOIN subscriptions s/i.test(sql)) {
         const rows: unknown[] = [];
+        const wantQuarantined = /status = 'quarantined'/i.test(sql);
+        const wantParked = /status = 'parked'/i.test(sql);
         for (const d of store.deliveries.values()) {
-          if (d.status !== 'parked') continue;
+          if (wantQuarantined && d.status !== 'quarantined') continue;
+          if (wantParked && d.status !== 'parked') continue;
           const sub = (extra.subscriptions ?? []).find((s) => s.id === d.subscription_id);
           if (!sub) continue;
           rows.push({ subscription_id: d.subscription_id, tx_id: d.tx_id, target_url: sub.target_url });
@@ -156,6 +160,15 @@ function circuitEnv(extra: { subscriptions?: Array<Record<string, unknown>>; var
         const row = store.deliveries.get(`${subscriptionId}:${txId}`);
         if (row) row.status = 'quarantined';
         return { success: true, meta: { changes: row ? 1 : 0 } };
+      }
+      if (/UPDATE deliveries\s+SET status = 'parked'/i.test(sql) && /status = 'quarantined'/i.test(sql)) {
+        const [, subscriptionId, txId] = this.params as [string, string, string];
+        const row = store.deliveries.get(`${subscriptionId}:${txId}`);
+        if (row && row.status === 'quarantined') {
+          row.status = 'parked';
+          return { success: true, meta: { changes: 1 } };
+        }
+        return { success: true, meta: { changes: 0 } };
       }
       return { success: true, meta: { changes: 1 } };
     },
@@ -359,6 +372,63 @@ describe('parked-not-retried storm scenario (dispatchWebhook)', () => {
     expect(await parkDelivery(env, 'sub_1', 'tx_2', 'circuit-open')).toBe('parked');
     expect(await parkDelivery(env, 'sub_1', 'tx_3', 'circuit-open')).toBe('quarantined');
     expect(store.deliveries.get('sub_1:tx_3')!.status).toBe('quarantined');
+  });
+});
+
+describe('recoverQuarantinedDeliveries', () => {
+  const sub = {
+    id: 'sub_1', client_id: 'client_1', delivery: 'webhook',
+    target_url: 'https://dead.socratictrade.com/hooks', active: 1,
+  };
+
+  it('recovers quarantined rows to parked when the target circuit is closed and headroom exists', async () => {
+    const { env, store } = circuitEnv({ subscriptions: [sub], vars: { DELIVERY_TARGET_PARKED_CAP: '5' } });
+    store.deliveries.set('sub_1:tx_q', {
+      subscription_id: 'sub_1', tx_id: 'tx_q', status: 'quarantined', attempts: 0, last_error: 'overflow',
+    });
+    const result = await recoverQuarantinedDeliveries(env, { limit: 10 });
+    expect(result).toMatchObject({ scanned: 1, recovered: 1, skipped: 0 });
+    expect(store.deliveries.get('sub_1:tx_q')!.status).toBe('parked');
+  });
+
+  it('skips recovery while the target circuit is still open', async () => {
+    const { env, store } = circuitEnv({ subscriptions: [sub] });
+    const now = new Date('2026-07-18T12:00:00.000Z');
+    store.circuits.set(TARGET, {
+      target_key: TARGET,
+      consecutive_failures: 6,
+      open_until: new Date(now.getTime() + 3600_000).toISOString(),
+      failures_day: '2026-07-18',
+      failures_today: 6,
+      last_error: 'HTTP 401',
+      updated_at: now.toISOString(),
+    });
+    store.deliveries.set('sub_1:tx_q', {
+      subscription_id: 'sub_1', tx_id: 'tx_q', status: 'quarantined', attempts: 0, last_error: 'overflow',
+    });
+    const result = await recoverQuarantinedDeliveries(env, { limit: 10, now });
+    expect(result).toMatchObject({ scanned: 1, recovered: 0, skipped: 1 });
+    expect(store.deliveries.get('sub_1:tx_q')!.status).toBe('quarantined');
+  });
+
+  it('honors ignoreCircuit for operator replay', async () => {
+    const { env, store } = circuitEnv({ subscriptions: [sub] });
+    const now = new Date('2026-07-18T12:00:00.000Z');
+    store.circuits.set(TARGET, {
+      target_key: TARGET,
+      consecutive_failures: 6,
+      open_until: new Date(now.getTime() + 3600_000).toISOString(),
+      failures_day: '2026-07-18',
+      failures_today: 6,
+      last_error: 'HTTP 401',
+      updated_at: now.toISOString(),
+    });
+    store.deliveries.set('sub_1:tx_q', {
+      subscription_id: 'sub_1', tx_id: 'tx_q', status: 'quarantined', attempts: 0, last_error: 'overflow',
+    });
+    const result = await recoverQuarantinedDeliveries(env, { limit: 10, now, ignoreCircuit: true });
+    expect(result.recovered).toBe(1);
+    expect(store.deliveries.get('sub_1:tx_q')!.status).toBe('parked');
   });
 });
 
