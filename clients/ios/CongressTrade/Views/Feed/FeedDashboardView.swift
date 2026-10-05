@@ -1440,8 +1440,7 @@ struct ExportCSVSheet: View {
                     // a device purchase already linked to a DIFFERENT account
                     // (Premium belongs to the account, not the device).
                     if !store.premiumFeatureAccess {
-                        Text("CSV export is a Premium feature ($5/mo or $50/yr, 2-week free trial).  "
-                            + "No account needed to buy.")
+                        Text("CSV export is a Premium feature.  No account needed to buy.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         Button {
