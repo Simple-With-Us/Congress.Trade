@@ -67,8 +67,10 @@ import {
   isFalseSourceAuthHalt,
   isTransientFilesPrepaidError,
   isTransientFilesPrepaidHalt,
+  isTransientInfrastructureHalt,
   type ProviderErrorClass,
 } from './providerHealth.ts';
+import { isTransientInfrastructureError } from '../shared/transientInfra.ts';
 import { isDocScopedOpenRouterError } from './openRouterReply.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import { countReviewQueueBuckets, TERMINAL_REVIEW_REASON_EXCLUDE_SQL } from './reviewQueueHealth.ts';
@@ -812,12 +814,15 @@ export async function maybeStartBacklogAutopilot(
   if (haltedRows.length) {
     const resumable = haltedRows.filter((row) =>
       isTransientFilesPrepaidHalt(row.halt_reason, row.sample_errors)
-      || isFalseSourceAuthHalt(row.halt_reason, row.sample_errors));
+      || isFalseSourceAuthHalt(row.halt_reason, row.sample_errors)
+      || isTransientInfrastructureHalt(row.halt_reason, row.sample_errors));
     if (resumable.length && resumable.length === haltedRows.length) {
       for (const row of resumable) {
         const actor = isFalseSourceAuthHalt(row.halt_reason, row.sample_errors)
           ? 'auto_resume:false_source_auth'
-          : 'auto_resume:files_prepaid';
+          : isTransientInfrastructureHalt(row.halt_reason, row.sample_errors)
+            ? 'auto_resume:transient_infra'
+            : 'auto_resume:files_prepaid';
         await acknowledgeAutopilotHalt(env, {
           runId: row.id,
           actor,
@@ -1399,10 +1404,13 @@ export async function handleAutopilotTick(
       && haltSamples.every((sample) => isFalseSourceAuthError(sample));
     const docScopedOpenRouterOnly = haltSamples.length > 0
       && haltSamples.every((sample) => isDocScopedOpenRouterError(sample));
+    const infraOnly = haltSamples.length > 0
+      && haltSamples.every((sample) => isTransientInfrastructureError(sample));
     const skipTransientLatch = (
       (transientFilesOnly && (haltClass === 'billing' || haltClass === 'quota'))
       || (falseSourceAuthOnly && haltClass === 'auth')
       || (docScopedOpenRouterOnly && (haltClass === 'auth' || haltClass === 'parse'))
+      || infraOnly
     );
     if (haltClass && !skipTransientLatch) {
       await finalize('halted', `error_class:${haltClass}`);

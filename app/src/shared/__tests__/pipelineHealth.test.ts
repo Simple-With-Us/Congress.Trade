@@ -108,11 +108,83 @@ describe('evaluatePipelineSignals', () => {
       outboxFailed: 12,
       outboxFailedFresh: 0,
       outboxFailedActive: 0,
+      outboxFailedParked: 12,
+      outboxFailedNonRetryable: 0,
     };
     const res = evaluatePipelineSignals(parkedOnly, nowMs);
     const check = res.checks.find((c) => c.id === 'ingestion_dead_letter');
     expect(check?.status).toBe('ok');
     expect(check?.detail).toContain('12 parked');
+    expect(check?.detail).toContain('not auto-retried');
+    expect(res.status).toBe('ok');
+  });
+
+  it('names the operator replay when active rows are non-transient or cycle-capped', () => {
+    const capped: PipelineSignals = {
+      ...cleanSignals,
+      outboxFailed: 4,
+      outboxFailedFresh: 0,
+      outboxFailedActive: 4,
+      outboxFailedParked: 0,
+      outboxFailedNonRetryable: 4,
+    };
+    const res = evaluatePipelineSignals(capped, nowMs);
+    const check = res.checks.find((c) => c.id === 'ingestion_dead_letter');
+    expect(check?.status).toBe('degraded');
+    expect(check?.value).toBe(4);
+    expect(check?.detail).toContain('not auto-retried');
+    expect(check?.detail).toContain('POST /api/admin/ingest-requeue-failed');
+    expect(res.status).toBe('degraded');
+  });
+
+  it('keeps active retryable failures degraded until the sweep clears them', () => {
+    const aged: PipelineSignals = {
+      ...cleanSignals,
+      outboxFailed: 81,
+      outboxFailedFresh: 0,
+      outboxFailedActive: 81,
+      outboxFailedParked: 0,
+      outboxFailedNonRetryable: 0,
+    };
+    const res = evaluatePipelineSignals(aged, nowMs);
+    const check = res.checks.find((c) => c.id === 'ingestion_dead_letter');
+    expect(check?.status).toBe('degraded');
+    expect(check?.value).toBe(81);
+    expect(check?.detail).not.toContain('POST /api/admin/ingest-requeue-failed');
+    expect(res.status).toBe('degraded');
+  });
+
+  it('degrades on a recent cron deadline and pages when it repeats', () => {
+    const once: PipelineSignals = {
+      ...cleanSignals,
+      cronTickOverrun: {
+        at: new Date(nowMs - 60_000).toISOString(),
+        deadlineMs: 45000,
+        reason: 'Deno cron tick exceeded 45000ms deadline',
+        count: 1,
+      },
+    };
+    const onceRes = evaluatePipelineSignals(once, nowMs);
+    const onceCheck = onceRes.checks.find((c) => c.id === 'cron_deadline');
+    expect(onceCheck?.status).toBe('degraded');
+    expect(onceCheck?.detail).toContain('Deno cron tick exceeded 45000ms deadline');
+
+    const repeated: PipelineSignals = {
+      ...cleanSignals,
+      cronTickOverrun: { ...once.cronTickOverrun!, count: 3 },
+    };
+    expect(evaluatePipelineSignals(repeated, nowMs).checks.find((c) => c.id === 'cron_deadline')?.status).toBe('critical');
+
+    const stale: PipelineSignals = {
+      ...cleanSignals,
+      cronTickOverrun: {
+        at: new Date(nowMs - 7 * 60 * 60 * 1000).toISOString(),
+        deadlineMs: 45000,
+        reason: 'Deno cron tick exceeded 45000ms deadline',
+        count: 4,
+      },
+    };
+    expect(evaluatePipelineSignals(stale, nowMs).checks.find((c) => c.id === 'cron_deadline')?.status).toBe('ok');
   });
 
   it('still degrades when a fresh outbox failure arrives beside older active rows', () => {
