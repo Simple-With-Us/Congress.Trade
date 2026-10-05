@@ -1,8 +1,30 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { buildAdminRouter } from '../routes.ts';
+import type { Env } from '../../shared/types.ts';
 
 const app = buildAdminRouter();
+
+const DataRecoveryStatusSchema = z.object({
+  queues: z.object({
+    ingestionOutboxFailed: z.array(
+      z.object({
+        doc_id: z.string(),
+        chamber: z.string(),
+        available_at: z.string(),
+        updated_at: z.string(),
+        last_error: z.string().nullable(),
+      }),
+    ),
+    ingestionOutboxFailedIdentity: z.object({
+      count: z.number().int().nonnegative(),
+      fingerprint: z.string().length(64),
+      doc_ids: z.array(z.string()),
+      fingerprintCoversAll: z.boolean(),
+    }),
+  }),
+});
 
 const SCHEMA = `
 CREATE TABLE filings (
@@ -44,7 +66,7 @@ CREATE TABLE price_eod_stats (id INTEGER PRIMARY KEY, row_count INTEGER);
 CREATE TABLE securities_ref (id TEXT PRIMARY KEY, latest_price_date TEXT);
 `;
 
-function makeEnv() {
+function makeEnv(): Env {
   const raw = new DatabaseSync(':memory:');
   raw.exec(SCHEMA);
   raw.prepare(
@@ -96,20 +118,15 @@ function makeEnv() {
 
   return {
     ADMIN_OPEN_IN_DEV: 'true',
-    DB: { prepare } as D1Database,
-  };
+    DB: { prepare },
+  } as unknown as Env;
 }
 
 describe('GET /data-recovery/status', () => {
   it('exposes failed ingestion_outbox row identity (read-only)', async () => {
-    const res = await app.request('http://localhost/data-recovery/status', {}, makeEnv() as never);
+    const res = await app.request('http://localhost/data-recovery/status', {}, makeEnv());
     expect(res.status).toBe(200);
-    const body = await res.json() as {
-      queues: {
-        ingestionOutboxFailed: Array<Record<string, string>>;
-        ingestionOutboxFailedIdentity: { count: number; fingerprint: string; doc_ids: string[] };
-      };
-    };
+    const body = DataRecoveryStatusSchema.parse(await res.json());
     expect(body.queues.ingestionOutboxFailed).toHaveLength(2);
     expect(body.queues.ingestionOutboxFailed[0]).toMatchObject({
       doc_id: 'S-6bf3b6f7-aaaa',
@@ -122,6 +139,6 @@ describe('GET /data-recovery/status', () => {
       'S-6bf3b6f7-aaaa',
       'S-9e2ff733-bbbb',
     ]);
-    expect(body.queues.ingestionOutboxFailedIdentity.fingerprint).toHaveLength(64);
+    expect(body.queues.ingestionOutboxFailedIdentity.fingerprintCoversAll).toBe(true);
   });
 });
