@@ -180,6 +180,23 @@ describe('aggregateMemberPerformance', () => {
     expect(out.medianExcess).toBeCloseTo(0.05, 5); // median of +0.20 and -0.10
   });
 
+  it('skips stale-priced rows when priceFreshThrough is set', () => {
+    const dual = aggregateMemberDualPerformance(
+      [
+        row({
+          priceAtTrade: 100,
+          currentPrice: 120,
+          spxAtTrade: 100,
+          currentPriceDate: '2026-07-01',
+          spxNow: 105,
+        }),
+      ],
+      110,
+      { priceFreshThrough: '2026-08-01' },
+    );
+    expect(dual.tradeDate.scoredCount).toBe(0);
+  });
+
   it('leaves excess null (but still scores the return) when no S&P anchor exists', () => {
     const out = aggregateMemberPerformance([row({ spxAtTrade: null })], null);
     expect(out.scoredCount).toBe(1);

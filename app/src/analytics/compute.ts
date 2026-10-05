@@ -267,7 +267,13 @@ function rowAnchors(
 export function aggregateMemberPerformance(
   rows: MemberPerfRow[],
   currentSpx: number | null,
-  opts: { anchor?: PerfAnchor; buysOnly?: boolean; annualize?: boolean } = {},
+  opts: {
+    anchor?: PerfAnchor;
+    buysOnly?: boolean;
+    annualize?: boolean;
+    /** Skip trades whose current price is older than this YYYY-MM-DD bar. */
+    priceFreshThrough?: string;
+  } = {},
 ): MemberPerfSummary {
   const anchor = opts.anchor ?? 'trade';
   const buysOnly = opts.buysOnly === true;
@@ -279,8 +285,13 @@ export function aggregateMemberPerformance(
   const annualized: number[] = [];
   const weights: number[] = [];
 
+  const freshThrough = opts.priceFreshThrough?.slice(0, 10);
   for (const r of considered) {
     if (r.isOption) continue;
+    if (freshThrough && r.currentPriceDate) {
+      const d = r.currentPriceDate.slice(0, 10);
+      if (d < freshThrough) continue;
+    }
     const { priceAt, spxAt } = rowAnchors(r, anchor);
     if (priceAt == null || r.currentPrice == null) continue;
     const perf = computePerformance(priceAt, r.currentPrice, spxAt, r.spxNow ?? currentSpx);
@@ -340,16 +351,19 @@ export function aggregateMemberPerformance(
 export function aggregateMemberDualPerformance(
   rows: MemberPerfRow[],
   currentSpx: number | null,
+  opts: { priceFreshThrough?: string } = {},
 ): MemberDualPerformance {
   const buyCount = rows.filter(isBuyRow).length;
+  const perfOpts = { priceFreshThrough: opts.priceFreshThrough };
   return {
     side: 'buys',
     buyCount,
-    tradeDate: aggregateMemberPerformance(rows, currentSpx, { anchor: 'trade', buysOnly: true }),
+    tradeDate: aggregateMemberPerformance(rows, currentSpx, { anchor: 'trade', buysOnly: true, ...perfOpts }),
     filingDate: aggregateMemberPerformance(rows, currentSpx, {
       anchor: 'filing',
       buysOnly: true,
       annualize: true,
+      ...perfOpts,
     }),
   };
 }

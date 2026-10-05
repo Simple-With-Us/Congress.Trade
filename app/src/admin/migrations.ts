@@ -1390,6 +1390,11 @@ export const FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS = [
      ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
 ] as const;
 
+export const MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS = [
+  'ALTER TABLE fundamentals_eod ADD COLUMN received_at TEXT',
+  'ALTER TABLE analyst_consensus ADD COLUMN received_at TEXT',
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1546,6 +1551,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
   // 0099_feed_latency_join_index.sql
   ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
+  // 0100_market_import_provenance.sql
+  ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

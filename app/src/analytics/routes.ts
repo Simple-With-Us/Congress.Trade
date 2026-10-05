@@ -88,6 +88,7 @@ import {
 import { committeeConflict } from './conflicts.ts';
 import { computePerformance } from '../prices/compute.ts';
 import { latestSpxClose } from '../prices/service.ts';
+import { currentPriceFreshThrough, evaluateCurrentPriceStaleness } from '../prices/staleness.ts';
 import {
   getDisclosureLatencySummary,
   isLatencyComparisonPublic,
@@ -444,7 +445,10 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       const memberSkill = new Map<string, { scored: number; wins: number; avgExcess: number }>();
       await Promise.all(
         chunk([...allFilers], D1_IN_CHUNK).map((batch) => {
-          const sq = buildMemberSkillQuery(batch, f);
+          const sq = buildMemberSkillQuery(batch, {
+            ...f,
+            priceFreshThrough: currentPriceFreshThrough(),
+          });
           return all<Record<string, unknown>>(c.env.DB, sq.sql, sq.params).then((rows) => {
             for (const row of rows) {
               const fid = str(row.filer_id);
@@ -833,7 +837,12 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const minTrades = q.minTrades ? Number(q.minTrades) : undefined;
     const key = cacheKey('member-performance', { ...f, limit, minTrades });
     const data = await cached(c.env, key, 900, async () => {
-      const built = buildMemberPerformanceLeaderboardQuery({ ...f, limit, minTrades });
+      const built = buildMemberPerformanceLeaderboardQuery({
+        ...f,
+        limit,
+        minTrades,
+        priceFreshThrough: currentPriceFreshThrough(),
+      });
       const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
       const members = rows.map((row) => {
         const n = num(row.trade_count);
@@ -1116,9 +1125,29 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     // exit leg is the S&P close on or before that SAME day (board row 6c05e09b);
     // the latest S&P close is only the fallback when the price has no date.
     const currentPriceDate = str(row.current_price_date);
+    const staleness = evaluateCurrentPriceStaleness(currentPriceDate);
     const currentSpx =
       (currentPriceDate ? await closeOnOrBefore(c.env, 'spx_eod', currentPriceDate) : null) ??
       (await latestSpxClose(c.env));
+    if (staleness.stale) {
+      return c.json({
+        available: true,
+        stale: true,
+        staleDataAgeDays: staleness.dataAgeDays,
+        freshThrough: staleness.freshThrough,
+        txType: str(row.tx_type),
+        ticker: str(row.ticker),
+        txDate: str(row.tx_date),
+        filedDate: str(row.filed_date),
+        priceAtTrade,
+        currentPrice,
+        currentPriceDate,
+        pricesAsOf: currentPriceDate,
+        tradeDatePerformance: null,
+        filingDatePerformance: null,
+        estimatedAmounts: true,
+      });
+    }
     const perf = computePerformance(priceAtTrade, currentPrice, spxAtTrade, currentSpx);
     const filedDate = str(row.filed_date);
     const priceAtFiling = await closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker));
@@ -1306,9 +1335,11 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         currentPriceDate: str(row.current_price_date),
         spxNow: row.spx_now == null ? null : num(row.spx_now),
       }));
-      const dual = aggregateMemberDualPerformance(perfRows, currentSpx);
+      const freshThrough = currentPriceFreshThrough();
+      const dual = aggregateMemberDualPerformance(perfRows, currentSpx, { priceFreshThrough: freshThrough });
       return meta(f, {
         filerId: txFilerId,
+        priceFreshThrough: freshThrough,
         // Newest price date behind any scored trade: the drawer prints "Prices as of".
         pricesAsOf: perfRows.reduce<string | null>(
           (best, r) => (r.currentPriceDate && (!best || r.currentPriceDate > best) ? r.currentPriceDate : best),
