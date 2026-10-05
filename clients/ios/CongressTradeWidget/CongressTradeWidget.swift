@@ -12,13 +12,11 @@ struct Provider: TimelineProvider {
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<Entry>) -> ()) {
-        var entries: [SimpleEntry] = []
         let currentDate = Date()
-        
-        let entry = SimpleEntry(date: currentDate, tradeCount: Int.random(in: 1...10))
-        entries.append(entry)
-
-        let timeline = Timeline(entries: entries, policy: .atEnd)
+        // Scaffold only.  A fixed count, refreshed on a 30-minute cadence.
+        // Random counts plus `.atEnd` redraw a different number on every reload.
+        let entry = SimpleEntry(date: currentDate, tradeCount: 5)
+        let timeline = Timeline(entries: [entry], policy: .after(currentDate.addingTimeInterval(30 * 60)))
         completion(timeline)
     }
 }
