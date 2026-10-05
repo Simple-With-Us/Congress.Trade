@@ -2907,15 +2907,15 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
   // (covered above alongside the sector canonicalization fix, since both land
   // in the same loadTrSectorFlow() change.)
 
-  // ---- 7. Canonical Premium pricing = $5/mo · $50/yr · 2-week trial -------
-  it('shows $5/mo and $50/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
-    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial');
-    expect(DASHBOARD_HTML).toContain('Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $5/mo or $50/yr &middot; 2-week free trial');
-    expect(DASHBOARD_HTML).toContain('$5<span class="per">/mo</span>');
-    expect(DASHBOARD_HTML).toContain('$50<span class="per">/yr</span>');
-    expect(DASHBOARD_HTML).toContain('2-week free trial');
-    expect(DASHBOARD_HTML).not.toContain('$9<span class="per">/mo</span>');
-    expect(DASHBOARD_HTML).not.toContain('$90<span class="per">/yr</span>');
+  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 1-week trial -------
+  it('shows $8.99/mo and $79.99/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
+    expect(DASHBOARD_HTML).toContain('data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial');
+    expect(DASHBOARD_HTML).toContain('data-premium-cue="alerts">\n        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial');
+    expect(DASHBOARD_HTML).toContain('$8.99<span class="per">/mo</span>');
+    expect(DASHBOARD_HTML).toContain('$79.99<span class="per">/yr</span>');
+    expect(DASHBOARD_HTML).toContain('1-week free trial');
+    expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');
+    expect(DASHBOARD_HTML).not.toContain('$50<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).not.toContain('$15/mo');
     expect(DASHBOARD_HTML).not.toContain('$140/yr');
   });
