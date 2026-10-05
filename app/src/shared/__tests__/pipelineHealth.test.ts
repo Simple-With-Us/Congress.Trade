@@ -97,6 +97,7 @@ describe('evaluatePipelineSignals', () => {
         count: 81,
         fingerprint: 'a'.repeat(64),
         doc_ids: ['S-6bf3b6f7', 'S-9e2ff733'],
+        fingerprintCoversAll: true,
       },
     };
     const res = evaluatePipelineSignals(staleFailures, nowMs);
@@ -105,7 +106,8 @@ describe('evaluatePipelineSignals', () => {
     expect(check?.value).toBe(81);
     expect(check?.detail).toContain('81 active');
     expect(check?.detail).toContain('identity fp=aaaaaaaaaaaa');
-    expect(check?.detail).toContain('S-6bf3b6f7');
+    expect(check?.detail).toContain('all failed=81');
+    expect(check?.detail).not.toContain('S-6bf3b6f7');
     expect(res.status).toBe('degraded');
   });
 
