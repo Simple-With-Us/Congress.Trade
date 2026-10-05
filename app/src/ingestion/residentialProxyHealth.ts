@@ -8,6 +8,17 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { DEFAULT_RESIDENTIAL_PROXY_URL, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import type { Env } from '../shared/types.ts';
 
+export const RESIDENTIAL_PROXY_HEALTH_KV_KEY = 'residential-proxy:health';
+export const RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS = 5_000;
+
+/** Cached GET /health result for pipelineHealth (no live hop on /api/health). */
+export interface ResidentialProxyProbeRecord {
+  ok: boolean;
+  status: number | null;
+  checkedAt: string;
+  host: string | null;
+}
+
 export interface ResidentialProxyHealthResult {
   /** An operator explicitly set a residential proxy env. */
   configured: boolean;
@@ -108,5 +119,54 @@ export async function probeResidentialProxyHealth(
       latencyMs: Date.now() - t0,
       error: (err as Error).message,
     };
+  }
+}
+
+function residentialProxyHost(proxyUrl: string): string | null {
+  try {
+    return new URL(proxyUrl).host;
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+export async function refreshResidentialProxyHealth(env: Env, now = new Date()): Promise<void> {
+  const proxyUrl = resolveResidentialProxyUrl(env, { allowDefault: false });
+  const checkedAt = now.toISOString();
+  if (!proxyUrl) {
+    await persistResidentialProxyProbe(env, { ok: true, status: null, checkedAt, host: null });
+    return;
+  }
+  const result = await probeResidentialProxyHealth(env, globalThis.fetch, RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS);
+  const host = result.proxyUrl ? residentialProxyHost(result.proxyUrl) : null;
+  await persistResidentialProxyProbe(env, {
+    ok: result.reachable,
+    status: result.status ?? null,
+    checkedAt,
+    host,
+  });
+}
+
+export async function readResidentialProxyProbe(env: Env): Promise<ResidentialProxyProbeRecord | null> {
+  if (!env.CONFIG_KV) return null;
+  try {
+    const raw = await env.CONFIG_KV.get(RESIDENTIAL_PROXY_HEALTH_KV_KEY, 'json');
+    if (!raw || typeof raw !== 'object') return null;
+    const rec = raw as ResidentialProxyProbeRecord;
+    if (typeof rec.ok !== 'boolean' || typeof rec.checkedAt !== 'string') return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+async function persistResidentialProxyProbe(env: Env, rec: ResidentialProxyProbeRecord): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(RESIDENTIAL_PROXY_HEALTH_KV_KEY, JSON.stringify(rec), {
+      expirationTtl: 86_400,
+    });
+  } catch {
+    /* best-effort; pipelineHealth treats a missing probe as unknown */
   }
 }
