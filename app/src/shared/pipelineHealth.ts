@@ -248,6 +248,13 @@ export interface PipelineSignals {
   priceEodLatestDate?: string | null;
   /** Newest S&P 500 daily bar (MAX spx_eod.date).  Same absent/null semantics. */
   spxEodLatestDate?: string | null;
+  /** Webhook rows parked behind an open per-target circuit breaker. */
+  deliveryParked?: number | null;
+  /**
+   * Webhook rows past the per-subscription parked depth cap.  Recoverable via
+   * recoverQuarantinedDeliveries and POST /api/admin/delivery-requeue-quarantined.
+   */
+  deliveryQuarantined?: number | null;
 }
 
 export interface PipelineThresholds {
@@ -551,6 +558,35 @@ export function evaluatePipelineSignals(
       detail: 'No recent cron deadline or lock-skip episode',
       value: 0,
     });
+  }
+
+  if (s.deliveryQuarantined !== undefined || s.deliveryParked !== undefined) {
+    if (s.deliveryQuarantined === null) {
+      checks.push({
+        id: 'delivery_quarantine',
+        status: 'unknown',
+        detail: 'Quarantined delivery count uncollected',
+        value: null,
+      });
+    } else if (s.deliveryQuarantined > 0) {
+      const parkedDeliveries = s.deliveryParked ?? 0;
+      checks.push({
+        id: 'delivery_quarantine',
+        status: 'degraded',
+        detail:
+          `${s.deliveryQuarantined} webhook delivery(ies) quarantined after parked cap overflow ` +
+          `(${parkedDeliveries} still parked). Rows recover when the target circuit closes and parked ` +
+          `headroom opens, or via POST /api/admin/delivery-requeue-quarantined`,
+        value: s.deliveryQuarantined,
+      });
+    } else {
+      checks.push({
+        id: 'delivery_quarantine',
+        status: 'ok',
+        detail: 'No quarantined webhook deliveries',
+        value: 0,
+      });
+    }
   }
 
   // 3. Extraction provider success rate
@@ -1156,6 +1192,8 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   const schedule = probeScheduleConfigFromEnv(env as unknown as Record<string, string | undefined>);
 
   let outboxPending: number | null = null;
+  let deliveryParked: number | null = null;
+  let deliveryQuarantined: number | null = null;
   let outboxOldestAt: string | null = null;
   let outboxFailed: number | null = null;
   let outboxFailedFresh: number | null = null;
@@ -1364,6 +1402,19 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   } catch {
     cronTickOverrun = null;
   }
+
+  try {
+    const res = await get<{ parked: number; quarantined: number }>(
+      env.DB,
+      `SELECT SUM(CASE WHEN status = 'parked' THEN 1 ELSE 0 END) AS parked,
+              SUM(CASE WHEN status = 'quarantined' THEN 1 ELSE 0 END) AS quarantined
+         FROM deliveries`,
+    );
+    if (res) {
+      deliveryParked = Number(res.parked ?? 0);
+      deliveryQuarantined = Number(res.quarantined ?? 0);
+    }
+  } catch {}
 
   try {
     const res = await get<{ attempts: number; ok_count: number; last_success: string | null }>(
@@ -1617,6 +1668,8 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     filingSkips24h,
     filingSkipsByAction24h,
     fmpLatency,
+    deliveryParked,
+    deliveryQuarantined,
   };
 
   const evaluated = evaluatePipelineSignals(signals, nowMs, DEFAULT_PIPELINE_THRESHOLDS, schedule);
