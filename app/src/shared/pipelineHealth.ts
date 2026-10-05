@@ -306,14 +306,23 @@ function worstStatus(a: PipelineStatus, b: PipelineStatus): PipelineStatus {
 const WEEKDAY_POLL_MAX_AGE_HOURS = 0.75;
 const WEEKEND_POLL_MAX_AGE_HOURS = 1.5;
 
+const Http429NonNegFiniteNumber = z.number().refine(
+  (n) => Number.isFinite(n) && n >= 0,
+  'must be a finite nonnegative number',
+);
+
 /**
  * Shape of an `fmp-latency:http429:` KV value (boundary data — validated, not
- * asserted). markFmpSlotHttp429 stores the raw flag text "1"; a legacy writer
- * shape `{count: n}` is also accepted. Anything else is rejected by the reader.
+ * asserted).  markFmpSlotHttp429 stores the raw flag text "1"; a parsed
+ * number is a valid marker (JSON.parse of "1" yields the number 1, not a
+ * string).  The legacy writer shape `{count: n}` is also accepted.  Anything
+ * else is rejected by the reader.  Numeric inputs normalize to `{count: n}`
+ * so the reader can read a single field.
  */
 export const Http429ValueSchema = z.union([
+  Http429NonNegFiniteNumber.transform((n) => ({ count: n })),
   z.string(),
-  z.object({ count: z.number() }).strict(),
+  z.object({ count: Http429NonNegFiniteNumber }).strict(),
 ]);
 
 function isEtWeekend(nowMs: number): boolean {

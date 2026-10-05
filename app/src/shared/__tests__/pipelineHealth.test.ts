@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   evaluatePipelineSignals,
   tradingDaysBehind,
+  Http429ValueSchema,
   type PipelineSignals,
   DEFAULT_PIPELINE_THRESHOLDS,
 } from '../pipelineHealth.ts';
@@ -732,5 +733,28 @@ describe('price_freshness check', () => {
     expect(v.worstBehind).toBe(4);
     expect(v.legs['price cache']).toEqual({ date: '2026-09-08', behind: 4 });
     expect(v.legs['S&P 500 series']).toEqual({ date: '2026-09-15', behind: 0 });
+  });
+});
+
+describe('Http429ValueSchema', () => {
+  it('accepts a parsed number marker (1)', () => {
+    const res = Http429ValueSchema.safeParse(1);
+    expect(res.success).toBe(true);
+    if (res.success) expect(res.data).toEqual({ count: 1 });
+  });
+  it('accepts a raw numeric string marker ("1")', () => {
+    const res = Http429ValueSchema.safeParse('1');
+    expect(res.success).toBe(true);
+  });
+  it('accepts the legacy { count } object', () => {
+    const res = Http429ValueSchema.safeParse({ count: 2 });
+    expect(res.success).toBe(true);
+    if (res.success) expect(res.data).toEqual({ count: 2 });
+  });
+  it('rejects a negative number', () => {
+    expect(Http429ValueSchema.safeParse(-1).success).toBe(false);
+  });
+  it('rejects a random object', () => {
+    expect(Http429ValueSchema.safeParse({ foo: 'bar' }).success).toBe(false);
   });
 });
