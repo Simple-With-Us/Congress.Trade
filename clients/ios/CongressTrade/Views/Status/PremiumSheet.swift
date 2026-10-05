@@ -413,7 +413,7 @@ struct PremiumSheet: View {
         let isPrimary = product.id == products.first?.id
         let quote = PremiumPlanQuote(product: product, includeIntroOffer: isEligibleForIntroOffer)
         let allQuotes = products.compactMap { PremiumPlanQuote(product: $0, includeIntroOffer: isEligibleForIntroOffer) }
-        let subtitle = PremiumPricing.subtitle(for: quote, allQuotes: allQuotes)
+        let subtitle = quote.flatMap { PremiumPricing.subtitle(for: $0, allQuotes: allQuotes) }
         let button = Button {
             Task { await purchase(product) }
         } label: {
