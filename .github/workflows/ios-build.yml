@@ -2,7 +2,9 @@ name: iOS build (Mac runner)
 
 # Compile AND run CongressTradeTests on GitHub-hosted macos-latest.
 # A broken compile or a failing XCTest must fail this job (never continue-on-error).
-# Do not restore self-hosted / Mac Studio labels — none are registered on the org.
+# Prefer macos-latest here — self-hosted / Mac Studio labels are not registered
+# on the org today (check-actions-runner-policy.mjs still allowlists the old
+# xcode26 label set; do not restore it in this workflow until runners exist).
 #
 # The required-check job name is `xcodebuild (unsigned)`.  That job always
 # reports on pull_request (no paths: filter on that event) so GitHub can
@@ -10,7 +12,7 @@ name: iOS build (Mac runner)
 # an iOS-path gate (ubuntu path gate + macos-latest only when ios=1).
 #
 # XCODE BUILDS ONLY: macos-latest is only used by the compile+test job below.
-# Backend typecheck/test/lint stay on ubuntu-latest (see ci.yml).
+# Backend typecheck/test stay on ubuntu-latest (see ci.yml).
 #
 # Why this exists: version 1.0 was rejected as INVALID_BINARY twice, and the
 # box carries stable Xcode 26.x and Xcode-beta 27 side by side.  A binary
