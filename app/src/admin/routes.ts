@@ -192,7 +192,7 @@ import { resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { createRuntimeQueueHandlers } from '../deno/runtimeHandlers.ts';
 import { runScheduledTick } from '../deno/scheduledTick.ts';
 import { requeueFailedDurableJobs } from '../deno/durableQueue.ts';
-import { readTargetCircuits } from '../delivery/targetCircuit.ts';
+import { flushParkedDeliveries, readTargetCircuits, recoverQuarantinedDeliveries } from '../delivery/targetCircuit.ts';
 import { inspectLlmSpend } from '../shared/llmSpend.ts';
 import { runR2UsageSummary } from '../shared/r2Usage.ts';
 import {
@@ -5782,6 +5782,37 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           dryRun: body.dryRun === true,
         }),
       );
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  // --- POST /delivery-requeue-quarantined -----------------------------------
+  // Recover webhook deliveries quarantined by the per-subscription parked-depth
+  // cap (status='quarantined'). Moves rows back to 'parked' when headroom exists,
+  // then flushes a batch. Idempotent. Body (all optional):
+  //   { subscriptionId?: string, limit?: number (default 500, max 5000),
+  //     ignoreCircuit?: boolean, dryRun?: boolean }
+  r.post('/delivery-requeue-quarantined', async (c) => {
+    let body: Record<string, unknown> = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const limit = typeof body.limit === 'number' ? body.limit : 500;
+    try {
+      const recovery = await recoverQuarantinedDeliveries(c.env, {
+        subscriptionId: typeof body.subscriptionId === 'string' ? body.subscriptionId : undefined,
+        limit,
+        ignoreCircuit: body.ignoreCircuit === true,
+        dryRun: body.dryRun === true,
+      });
+      const flushed = body.dryRun === true
+        ? { scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 }
+        : await flushParkedDeliveries(c.env, { limit: Math.min(limit, 200) });
+      return c.json({ ok: true, recovery, flushed });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }

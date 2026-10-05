@@ -317,12 +317,7 @@ export async function parkDelivery(
   // parked backlog. Overflow rows become terminal 'quarantined' + one
   // throttled admin alert per subscription.
   try {
-    const depth = await get<{ c: number }>(
-      env.DB,
-      `SELECT COUNT(*) AS c FROM deliveries WHERE subscription_id = ? AND status = 'parked'`,
-      [subscriptionId],
-    );
-    if ((depth?.c ?? 0) > parkedCap(env)) {
+    if ((await parkedDepth(env, subscriptionId)) > parkedCap(env)) {
       await run(
         env.DB,
         `UPDATE deliveries SET status = 'quarantined', updated_at = ?
@@ -333,8 +328,10 @@ export async function parkDelivery(
         subject: 'Outbound delivery parked-queue overflow',
         text:
           `Subscription ${subscriptionId} exceeded the parked-delivery depth cap ` +
-          `(${parkedCap(env)}). Overflow deliveries are being quarantined until the ` +
-          `target recovers. Latest quarantined transaction: ${txId}\nReason: ${note}`,
+          `(${parkedCap(env)}). Overflow deliveries are quarantined (not dropped) and ` +
+          `recover to parked when the target circuit closes and parked headroom opens. ` +
+          `Operator replay: POST /api/admin/delivery-requeue-quarantined. ` +
+          `Latest quarantined transaction: ${txId}\nReason: ${note}`,
         dedupeKey: `target-parked-overflow:${subscriptionId}`,
         throttleSec: 3600,
       }).catch(() => {});
@@ -350,6 +347,125 @@ export interface ParkedFlushResult {
   scanned: number;
   released: number;
   skipped: number;
+  quarantineRecovered: number;
+}
+
+export interface QuarantineRecoveryResult {
+  scanned: number;
+  recovered: number;
+  skipped: number;
+}
+
+async function parkedDepth(env: Env, subscriptionId: string): Promise<number> {
+  const depth = await get<{ c: number }>(
+    env.DB,
+    `SELECT COUNT(*) AS c FROM deliveries WHERE subscription_id = ? AND status = 'parked'`,
+    [subscriptionId],
+  );
+  return depth?.c ?? 0;
+}
+
+/**
+ * Move quarantined webhook rows back to `parked` when it is safe: the target
+ * circuit is not open (unless `ignoreCircuit`), the daily attempt cap has
+ * headroom, and the subscription still has parked-queue depth under the cap.
+ * Oldest quarantined rows are recovered first so a long outage drains in order.
+ */
+export async function recoverQuarantinedDeliveries(
+  env: Env,
+  opts: {
+    limit?: number;
+    now?: Date;
+    subscriptionId?: string;
+    ignoreCircuit?: boolean;
+    dryRun?: boolean;
+  } = {},
+): Promise<QuarantineRecoveryResult> {
+  const now = opts.now ?? new Date();
+  const nowIso = now.toISOString();
+  const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 500);
+  const subscriptionFilter = opts.subscriptionId?.trim()
+    ? ` AND d.subscription_id = ?`
+    : '';
+  const params: (string | number)[] = opts.subscriptionId?.trim() ? [opts.subscriptionId.trim()] : [];
+  let rows: Array<{ subscription_id: string; tx_id: string; target_url: string | null }> = [];
+  try {
+    rows = await all(
+      env.DB,
+      `SELECT d.subscription_id, d.tx_id, s.target_url
+         FROM deliveries d
+         JOIN subscriptions s ON s.id = d.subscription_id
+        WHERE d.status = 'quarantined' AND s.active = 1 AND s.delivery = 'webhook'${subscriptionFilter}
+        ORDER BY d.updated_at ASC
+        LIMIT ${limit}`,
+      params,
+    );
+  } catch {
+    return { scanned: 0, recovered: 0, skipped: 0 };
+  }
+  const result: QuarantineRecoveryResult = { scanned: rows.length, recovered: 0, skipped: 0 };
+  const depthCache = new Map<string, number>();
+  const day = dayStr(now);
+  for (const row of rows) {
+    const targetKey = targetKeyForUrl(row.target_url);
+    if (!targetKey) {
+      result.skipped += 1;
+      continue;
+    }
+    if (!opts.ignoreCircuit) {
+      const gate = await checkTargetCircuit(env, targetKey, now);
+      if (!gate.allowed) {
+        result.skipped += 1;
+        continue;
+      }
+      try {
+        const circuit = await readCircuitRow(env, targetKey);
+        if (circuit && circuit.failures_day === day && circuit.failures_today >= dailyAttemptCap(env)) {
+          result.skipped += 1;
+          continue;
+        }
+      } catch {
+        /* fail open */
+      }
+    }
+    let depth = depthCache.get(row.subscription_id);
+    if (depth === undefined) {
+      try {
+        depth = await parkedDepth(env, row.subscription_id);
+      } catch {
+        result.skipped += 1;
+        continue;
+      }
+      depthCache.set(row.subscription_id, depth);
+    }
+    if (depth >= parkedCap(env)) {
+      result.skipped += 1;
+      continue;
+    }
+    if (opts.dryRun) {
+      result.recovered += 1;
+      depthCache.set(row.subscription_id, depth + 1);
+      continue;
+    }
+    try {
+      const updated = await run(
+        env.DB,
+        `UPDATE deliveries
+            SET status = 'parked', updated_at = ?
+          WHERE subscription_id = ? AND tx_id = ? AND status = 'quarantined'`,
+        [nowIso, row.subscription_id, row.tx_id],
+      );
+      if ((updated.meta?.changes ?? 0) === 1) {
+        result.recovered += 1;
+        depthCache.set(row.subscription_id, depth + 1);
+      } else {
+        result.skipped += 1;
+      }
+    } catch {
+      result.skipped += 1;
+    }
+  }
+  return result;
 }
 
 /**
@@ -367,6 +483,7 @@ export async function flushParkedDeliveries(
 ): Promise<ParkedFlushResult> {
   const now = opts.now ?? new Date();
   const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
+  const quarantineRecovery = await recoverQuarantinedDeliveries(env, { limit, now });
   let rows: Array<{ subscription_id: string; tx_id: string; target_url: string | null }> = [];
   try {
     rows = await all(
@@ -380,9 +497,14 @@ export async function flushParkedDeliveries(
       [],
     );
   } catch {
-    return { scanned: 0, released: 0, skipped: 0 };
+    return { scanned: 0, released: 0, skipped: 0, quarantineRecovered: quarantineRecovery.recovered };
   }
-  const result: ParkedFlushResult = { scanned: rows.length, released: 0, skipped: 0 };
+  const result: ParkedFlushResult = {
+    scanned: rows.length,
+    released: 0,
+    skipped: 0,
+    quarantineRecovered: quarantineRecovery.recovered,
+  };
   const byTarget = new Map<string, typeof rows>();
   for (const row of rows) {
     const key = targetKeyForUrl(row.target_url);
