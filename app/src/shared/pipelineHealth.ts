@@ -394,14 +394,11 @@ function pollMaxAgeHours(
     : (configured.weekdayPollMaxAgeHours ?? DEFAULT_WEEKDAY_POLL_MAX_AGE_HOURS);
   const missedSlotHours = gapHours * 1.5;
   const configuredCeiling = configured.pollSuccessMaxAgeHours[src];
-  // Tighter custom threshold: honor it, but never below one missed slot — same
-  // floor as the widened branch below (see PipelineThresholds doc).
-  if (configuredCeiling < sessionCap) {
-    return Math.max(configuredCeiling, missedSlotHours);
-  }
-  // Widen for a legally slower coverage floor, but never past the operator's
-  // per-source ceiling — that ceiling is the hard bound on the blind window.
-  return Math.min(configuredCeiling, Math.max(sessionCap, missedSlotHours));
+  const sessionOrMissed = Math.max(sessionCap, missedSlotHours);
+  // Monotonic in configuredCeiling: honor a tighter operator ceiling and widen
+  // for a legally slower schedule, but never below one missed slot (see
+  // PipelineThresholds doc).
+  return Math.max(missedSlotHours, Math.min(configuredCeiling, sessionOrMissed));
 }
 
 /**

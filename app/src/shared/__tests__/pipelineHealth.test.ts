@@ -903,6 +903,15 @@ describe('pollMaxAgeHours session-cap widening', () => {
       ],
       latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
       senateRelay: null,
+      filingSkips24h: 0,
+      filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0 },
+      fmpLatency: {
+        observationCount24h: 120,
+        lastObservationAt: new Date(weekdayMs - 600 * 1000).toISOString(),
+        lastObservationAgeSec: 600,
+        http429s24h: 0,
+        byProvider: { fmp: { lastObservationAt: new Date(weekdayMs - 600 * 1000).toISOString(), ageSec: 600, count24h: 120 } },
+      },
     } satisfies PipelineSignals;
     const past = evaluatePipelineSignals(pastSignals, weekdayMs, defaultThresholds, slowWeekday);
     expect(past.checks.find((c) => c.id === 'polling_house')!.status).toBe('stalled');
