@@ -512,7 +512,9 @@ export function evaluatePipelineSignals(
     const parked = Math.max(0, s.outboxFailed - (s.outboxFailedActive ?? s.outboxFailed));
     const active = s.outboxFailedActive ?? Math.max(0, s.outboxFailed - parked);
     const fresh = s.outboxFailedFresh ?? 0;
-    const identitySuffix = formatIngestionDeadLetterIdentityDetail(s.outboxFailedIdentity);
+    const identitySuffix = formatIngestionDeadLetterIdentityDetail(s.outboxFailedIdentity, {
+      includeDocIdPreview: false,
+    });
     const nonRetryable = s.outboxFailedNonRetryable;
     const actionDetail = nonRetryable != null && nonRetryable > 0
       ? `  ${nonRetryable} non-transient or past the retry cap (not auto-retried).  Operator replay after a fix: POST /api/admin/ingest-requeue-failed.`
