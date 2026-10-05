@@ -172,6 +172,10 @@ function isObjectStoreAuthError(message: string): boolean {
   return /\bunauthorized\b|\baccessdenied\b|\binvalidaccesskeyid\b|\bsignaturedoesnotmatch\b/i.test(message);
 }
 import { flushIngestionOutbox, requeueFailedIngestionOutbox } from '../ingestion/outbox.ts';
+import {
+  buildFailedIngestionOutboxIdentity,
+  loadFailedIngestionOutboxRows,
+} from '../ingestion/failedOutboxIdentity.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
@@ -5361,9 +5365,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // --- GET /data-recovery/status -----------------------------------------
   // Secret-safe production receipt for migration/backfill work. Counts are
   // grouped server-side so operators can prove live-source progress without
-  // downloading the corpus or exposing filing/member payloads.
+  // downloading the corpus or exposing filing/member payloads. Failed
+  // ingestion_outbox rows include doc_id identity for board c5a4de41 (read-only;
+  // does not requeue — follow board 50e7996f for operator recovery).
   r.get('/data-recovery/status', async (c) => {
-    const [filings, transactions, ingestionOutbox, deliveryOutbox, runtimeQueue, filers, prices] = await Promise.all([
+    const [filings, transactions, ingestionOutbox, deliveryOutbox, runtimeQueue, filers, prices, ingestionOutboxFailed, ingestionOutboxFailedIdentity] = await Promise.all([
       all<{ chamber: string; ingest_status: string; count: number }>(
         c.env.DB,
         `SELECT chamber, COALESCE(ingest_status, 'unknown') AS ingest_status, COUNT(*) AS count
@@ -5418,13 +5424,21 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
             ), 0) AS tickers,
             (SELECT MAX(latest_price_date) FROM securities_ref) AS latest_date`,
       ),
+      loadFailedIngestionOutboxRows(c.env.DB),
+      buildFailedIngestionOutboxIdentity(c.env.DB),
     ]);
     return c.json({
       ok: true,
       asOf: new Date().toISOString(),
       filings,
       transactions,
-      queues: { ingestionOutbox, deliveryOutbox, runtimeQueue },
+      queues: {
+        ingestionOutbox,
+        deliveryOutbox,
+        runtimeQueue,
+        ingestionOutboxFailed,
+        ingestionOutboxFailedIdentity,
+      },
       filers: filers[0] ?? { total: 0, missing_party: 0, missing_state: 0, missing_photo: 0 },
       prices: prices[0] ?? { rows: 0, tickers: 0, latest_date: null },
     });
