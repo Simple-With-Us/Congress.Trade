@@ -23,10 +23,10 @@ import SwiftUI
 enum AppUpdatePrompt {
 
     static let defaultManifestURL = URL(
-        string: "https://raw.githubusercontent.com/Simple-With-Us/ai-fleet-coordinator/main/site/ios-versions.json"
+        string: "https://raw.githubusercontent.com/jaywedgeworth22/ai-fleet-coordinator/main/site/ios-versions.json"
     )!
 
-    /// Numeric Apple IDs live in Simple-With-Us/ai-fleet-coordinator site/ios-versions.json
+    /// Numeric Apple IDs live in jaywedgeworth22/ai-fleet-coordinator site/ios-versions.json
     /// and scripts/ios-fleet/apps.json.  Do not hardcode a bundle-id map here.
     /// Live DealDex is net.dealdex (appleId 6802474288).  online.dealdex is a
     /// stale leftover, not live.  Do not treat me.grok.dealdex as shippable.
