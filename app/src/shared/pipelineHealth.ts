@@ -15,6 +15,7 @@ import {
 } from '../extraction/reviewQueueHealth.ts';
 import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
+import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
@@ -80,11 +81,15 @@ export interface PipelineSignals {
   outboxOldestAt: string | null;
   outboxFailed: number | null;
   /**
-   * Failed outbox rows that still count as live degradation: not parked
-   * (`last_error LIKE 'parked:%'`) and updated within 24h.  Saturated
-   * historical DLQ must not mask a new stall (#2182).
+   * Failed outbox rows updated within 24h that are not parked (`parked:%`).
+   * Used for detail only — active failures degrade regardless of age.
    */
   outboxFailedFresh?: number | null;
+  /**
+   * Failed outbox rows that are not explicitly parked.  Any non-zero count
+   * degrades health (board f6be69f466af — age alone must not clear failures).
+   */
+  outboxFailedActive?: number | null;
   /** ALL unresolved review_queue rows (eligible + suppressed + terminal). */
   reviewBacklog: number | null;
   reviewEligible: number | null;
@@ -197,6 +202,16 @@ export interface PipelineSignals {
   } | null;
   /** True when a residential proxy is configured (retires the legacy scout relay). */
   residentialProxyConfigured?: boolean;
+  /** Residential proxy GET /health probe (CONFIG_KV), when explicitly configured. */
+  residentialProxy?: {
+    configured: boolean;
+    probe: {
+      ok: boolean;
+      status: number | null;
+      checkedAt: string;
+      host?: string;
+    } | null;
+  } | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
    * an indexed column — price_eod itself is 1.4M rows).  Absent = the signal builder
@@ -449,27 +464,29 @@ export function evaluatePipelineSignals(
     checks.push({ id: 'ingestion_backlog', status: 'ok', detail: 'Outbox backlog clear', value: 0 });
   }
 
-  // 2. Ingestion dead letter.  Only FRESH failures degrade: parked rows
-  // (`last_error` prefix `parked:`) and failures older than 24h stay visible
-  // as a triaged count so a saturated DLQ cannot hide a new stall (#2182).
+  // 2. Ingestion dead letter.  Parked rows (`parked:`) are intentionally
+  // triaged; every other failed row degrades until requeued or parked.
+  // Fresh (24h) is surfaced in detail so a new stall is obvious beside a
+  // saturated DLQ (#2182) without going green merely because rows are old.
   if (s.outboxFailed === null) {
     checks.push({ id: 'ingestion_dead_letter', status: 'unknown', detail: 'Outbox failure count uncollected', value: null });
   } else {
-    const fresh = s.outboxFailedFresh ?? s.outboxFailed;
-    const triaged = Math.max(0, s.outboxFailed - (fresh ?? 0));
-    if (fresh != null && fresh > 0) {
+    const parked = Math.max(0, s.outboxFailed - (s.outboxFailedActive ?? s.outboxFailed));
+    const active = s.outboxFailedActive ?? Math.max(0, s.outboxFailed - parked);
+    const fresh = s.outboxFailedFresh ?? 0;
+    if (active > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'degraded',
-        detail: `${fresh} fresh failed outbox item(s) in 24h` +
-          (triaged > 0 ? ` (${triaged} triaged/parked)` : ''),
-        value: fresh,
+        detail: `${active} active failed outbox item(s)` +
+          (fresh > 0 ? ` (${fresh} fresh in 24h` + (parked > 0 ? `; ${parked} parked)` : ')') : parked > 0 ? ` (${parked} parked)` : ''),
+        value: active,
       });
     } else if (s.outboxFailed > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'ok',
-        detail: `${s.outboxFailed} triaged dead-letter item(s); 0 fresh in 24h`,
+        detail: `${s.outboxFailed} parked dead-letter item(s)`,
         value: 0,
       });
     } else {
@@ -872,14 +889,55 @@ export function evaluatePipelineSignals(
     }
   }
 
-  // 13. Senate residential relay / residential proxy egress (issue #1604).
+  // 13. Senate egress: residential proxy (preferred) or named Senate relay (#1604).
   if (s.residentialProxyConfigured) {
-    checks.push({
-      id: 'senate_relay',
-      status: 'ok',
-      detail: 'Residential proxy active for Senate/House scraping (scout relay retired)',
-      value: 0,
-    });
+    const rp = s.residentialProxy;
+    if (rp == null) {
+      checks.push({ id: 'senate_relay', status: 'unknown', detail: 'Residential proxy liveness uncollected', value: null });
+    } else if (!rp.configured) {
+      checks.push({
+        id: 'senate_relay',
+        status: 'degraded',
+        detail: 'Residential proxy env missing despite configured signal — Senate/House egress may use datacenter IP',
+        value: null,
+      });
+    } else if (!rp.probe) {
+      checks.push({
+        id: 'senate_relay',
+        status: 'unknown',
+        detail: 'Residential proxy configured but not yet probed',
+        value: null,
+      });
+    } else {
+      const probe = rp.probe;
+      const checkedMs = Date.parse(probe.checkedAt);
+      const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
+      const host = probe.host ?? 'residential-proxy';
+      if (!probe.ok) {
+        checks.push({
+          id: 'senate_relay',
+          status: 'stalled',
+          detail: `Residential proxy DOWN at ${host}`
+            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + ' — Senate/House fetches may fail Imperva checks until the proxy is back.',
+          value: probe.status,
+        });
+      } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+        checks.push({
+          id: 'senate_relay',
+          status: 'degraded',
+          detail: `Residential proxy probe stale: last ok ${Math.round(ageMin)}m ago at ${host} (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+          value: Math.round(ageMin),
+        });
+      } else {
+        checks.push({
+          id: 'senate_relay',
+          status: 'ok',
+          detail: `Residential proxy live at ${host}: probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+          value: Math.round(ageMin * 10) / 10,
+        });
+      }
+    }
   } else if (s.senateRelay == null) {
     checks.push({ id: 'senate_relay', status: 'unknown', detail: 'Senate relay liveness uncollected', value: null });
   } else if (!s.senateRelay.configured) {
@@ -1042,6 +1100,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   let outboxOldestAt: string | null = null;
   let outboxFailed: number | null = null;
   let outboxFailedFresh: number | null = null;
+  let outboxFailedActive: number | null = null;
   let reviewBacklog: number | null = null;
   let reviewEligible: number | null = null;
   let reviewSuppressed: number | null = null;
@@ -1188,19 +1247,24 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   } catch {}
 
   try {
-    const res = await get<{ n: number; fresh: number }>(
+    const res = await get<{ n: number; fresh: number; active: number }>(
       env.DB,
       `SELECT COUNT(*) AS n,
               SUM(CASE
                     WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 0
-                    WHEN updated_at IS NOT NULL AND updated_at < ? THEN 0
                     ELSE 1
+                  END) AS active,
+              SUM(CASE
+                    WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 0
+                    WHEN updated_at IS NOT NULL AND updated_at >= ? THEN 1
+                    ELSE 0
                   END) AS fresh
          FROM ingestion_outbox WHERE status = 'failed'`,
       [iso24hAgo],
     );
     if (res) {
       outboxFailed = Number(res.n ?? 0);
+      outboxFailedActive = Number(res.active ?? 0);
       outboxFailedFresh = Number(res.fresh ?? 0);
     }
   } catch {}
@@ -1409,11 +1473,27 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     resolveResidentialProxyUrl(env, { allowDefault: false }),
   );
 
+  let residentialProxy: PipelineSignals['residentialProxy'] = {
+    configured: residentialProxyConfigured,
+    probe: null,
+  };
+  if (residentialProxyConfigured) {
+    try {
+      residentialProxy = {
+        configured: true,
+        probe: await readResidentialProxyProbe(env),
+      };
+    } catch {
+      residentialProxy = null;
+    }
+  }
+
   const signals: PipelineSignals = {
     outboxPending,
     outboxOldestAt,
     outboxFailed,
     outboxFailedFresh,
+    outboxFailedActive,
     reviewBacklog,
     reviewEligible,
     reviewSuppressed,
@@ -1431,6 +1511,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     latencyProviders,
     senateRelay,
     residentialProxyConfigured,
+    residentialProxy,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,
