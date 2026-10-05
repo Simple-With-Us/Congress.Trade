@@ -17,12 +17,12 @@
  * supported for backward compatibility with existing streamUrls.
  *
  * BACKLOG / GAP-FREE RESUME:
- *   The catch-up replay reads straight from the `transactions` table (which is
- *   the durable system of record), so the available backlog is the full feed
- *   history — not a bounded in-memory window. A client that reconnects with the
- *   last cursor it saw (via Last-Event-ID) gets every row it missed, in order,
- *   before the live tail attaches. Each emitted trade carries `id:<cursorSeq>`,
- *   so EventSource tracks the resume point automatically across reconnects.
+ *   A fresh open with no `?since=` and no `Last-Event-ID` starts at the current
+ *   durable high-water mark (live tail only — no history replay). Explicit
+ *   `?since=<cursor_seq>` or the EventSource `Last-Event-ID` header replays
+ *   `cursor_seq > since` from the `transactions` table (gap-free catch-up,
+ *   paged at MAX_DRAIN_PAGES_PER_TICK per tick). Each trade carries
+ *   `id:<cursorSeq>` so reconnects resume automatically.
  *
  * APPROACH (Workers-friendly poll loop):
  *   We back the Response with a TransformStream and await writer.ready plus
@@ -304,7 +304,8 @@ export async function openSseStream(
   );
   const startedAt = Date.now();
   const deadlineAt = startedAt + maxStreamMs;
-  let cursor = Number.isFinite(since) ? Number(since) : 0;
+  /** When true, the client did not supply ?since= or Last-Event-ID — live tail only. */
+  const liveTailDefault = since === undefined;
   let closed = false;
   const stream = createSseBackpressureStream(slowReaderTimeoutMs);
   const send = async (chunk: string): Promise<void> => {
@@ -313,21 +314,28 @@ export async function openSseStream(
   };
 
   const produce = async (): Promise<void> => {
-    // Clamp a resume cursor (?since= / Last-Event-ID) above the real high-water
-    // mark; otherwise the stream never emits again for the life of the client.
     const hwm = await readCursorHighWater(env);
-    if (cursor > 1_000_000_000_000 || (hwm > 0 && cursor > hwm)) {
-      cursor = Math.min(cursor, hwm);
+    let cursor: number;
+    if (liveTailDefault) {
+      cursor = hwm;
+    } else {
+      cursor = Number(since);
+      // Clamp an explicit resume cursor above the real high-water mark; otherwise
+      // the stream never emits again for the life of the client.
+      if (cursor > 1_000_000_000_000 || (hwm > 0 && cursor > hwm)) {
+        cursor = Math.min(cursor, hwm);
+      }
     }
 
     // Opening comment + initial cursor so clients know the resume point.
     await send(`: connected\n`);
     await send(`event: cursor\ndata: ${cursor}\n\n`);
 
-    // 1) Catch-up replay (drain everything newer than `since`). D1 is the
-    // source of truth; module globals are isolate-local and cannot safely gate
-    // this query in a distributed Worker.
-    cursor = await drainSseBacklog(env, sub, cursor, send);
+    // 1) Catch-up replay when the client asked for history (?since= / header).
+    // Fresh opens at the HWM skip this — they are already on the live tail.
+    if (!liveTailDefault) {
+      cursor = await drainSseBacklog(env, sub, cursor, send);
+    }
     // The HTTP handler's waitUntil settles when this Response is created, but
     // the producer continues querying D1 in the background. Flush those rows
     // while the stream is alive instead of leaving them in the isolate until
