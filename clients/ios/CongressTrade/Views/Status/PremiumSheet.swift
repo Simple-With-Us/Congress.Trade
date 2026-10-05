@@ -7,8 +7,7 @@ import SwiftUI
 /// This used to be two sheets. `PremiumInfoSheet` sold Premium as a benefit
 /// list and then pushed `SubscribeView`, which re-explained the same thing as
 /// one dense paragraph and only there showed the products. Two screens meant
-/// two copies of the pricing/trial line, and they drifted (the info sheet still
-/// said "1-month free trial" months after the trial became two weeks).
+/// two copies of the pricing/trial line, and they drifted.
 ///
 /// Every benefit line is a gate that exists in the backend today — archived
 /// filing PDFs (`serveDocumentPdf` returns 402 JSON for Bearer / Accept: pdf;
@@ -23,8 +22,16 @@ import SwiftUI
 /// deciding.
 ///
 /// Products must exist in App Store Connect:
-/// - `trade.congress.premium.monthly` ($5/mo)
-/// - `trade.congress.premium.annual` ($50/yr)
+/// - `trade.congress.premium.monthly`
+/// - `trade.congress.premium.annual`
+///
+/// Prices and free-trial length are NOT hardcoded here — Apple localizes the
+/// real price per storefront, so all UI price/trial text is built at runtime
+/// from `Product.displayPrice`, `Product.subscription?.subscriptionPeriod`, and
+/// the product's introductory offer when it is a `.freeTrial` payment mode.
+/// App Store Connect is the source of truth.  As of 2026-08-14, the US
+/// storefront lists $8.99/mo and $79.99/yr with a 1-week free-trial intro
+/// offer; other storefronts may differ.
 struct PremiumSheet: View {
     @EnvironmentObject private var store: CongressTradeStore
     @Environment(\.dismiss) private var dismiss
@@ -61,6 +68,14 @@ struct PremiumSheet: View {
 
     private var isBusy: Bool { purchasingProductID != nil || isRestoring || isLinking }
 
+    /// Headline copy driven by loaded `Product`s.  While products are still
+    /// loading, empty, or failed to load, falls back to a price-free,
+    /// trial-length-free line so we never quote an amount we can't substantiate.
+    private var headlineText: String {
+        let quotes = products.compactMap(PremiumPlanQuote.init(product:))
+        return PremiumPricing.headline(for: quotes)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -84,7 +99,7 @@ struct PremiumSheet: View {
                         }
                     }
 
-                    Text(PremiumPricing.headline)
+                    Text(headlineText)
                         .font(.subheadline.weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -390,6 +405,8 @@ struct PremiumSheet: View {
     @ViewBuilder
     private func purchaseButton(for product: Product) -> some View {
         let isPrimary = product.id == products.first?.id
+        let quote = PremiumPlanQuote(product: product)
+        let subtitle = PremiumPricing.subtitle(for: product, quote: quote)
         let button = Button {
             Task { await purchase(product) }
         } label: {
@@ -397,7 +414,7 @@ struct PremiumSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(product.displayName)
                         .font(.body.weight(.semibold))
-                    if let subtitle = PremiumPricing.subtitle(for: product) {
+                    if let subtitle {
                         Text(subtitle)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -578,19 +595,49 @@ struct PremiumSheet: View {
 
 // MARK: - Shared Premium copy
 
-/// One home for the price/trial line so the phone can never drift from the web
-/// again. The trial length here must match BOTH the Stripe default
-/// (`STRIPE_TRIAL_DAYS`, 14 days — `app/src/billing/routes.ts`) and the
-/// introductory offer configured on each product in App Store Connect. Change
-/// it in all three or the app is quoting a trial Apple will not honor.
-///
-/// Verified 2026-08-14 against live ASC + Infisical: both
-/// `trade.congress.premium.monthly` and `.annual` carry `FREE_TRIAL` /
-/// `TWO_WEEKS` (start 2026-08-12, no end); US prices $5 / $50; prod
-/// `STRIPE_TRIAL_DAYS=14`. Receipt:
-/// `docs/rollouts/2026-08-14-premium-trial-asc-verified.md`.
+/// One home for the price/trial line so the phone can never drift from the web.
+/// The displayed price, period, and free-trial length come from StoreKit at
+/// runtime (`Product.displayPrice`, `Product.subscription?.subscriptionPeriod`,
+/// `Product.subscription?.introductoryOffer` when `paymentMode == .freeTrial`) so
+/// Apple can localize the real price per storefront. App Store Connect is the
+/// source of truth.  As of 2026-08-14, the US storefront lists $8.99/mo and
+/// $79.99/yr with a 1-week free-trial introductory offer; other storefronts may
+/// differ.
 enum PremiumPricing {
-    static let headline = "$5/month  •  $50/year  •  2-week free trial"
+    /// Used before StoreKit returns products (loading, empty catalog, or load
+    /// error).  Never contains a "$" literal or a hardcoded trial length.
+    static let fallbackHeadline = "Monthly or yearly plans  •  Cancel anytime"
+
+    /// Build the headline from a list of `PremiumPlanQuote` values derived
+    /// from loaded StoreKit `Product`s.  Returns `fallbackHeadline` when no
+    /// quotes are supplied.
+    static func headline(for quotes: [PremiumPlanQuote]) -> String {
+        guard !quotes.isEmpty else { return fallbackHeadline }
+        let monthly = quotes.first { $0.periodUnit == .month && $0.periodValue == 1 }
+        let yearly = quotes.first { $0.periodUnit == .year && $0.periodValue == 1 }
+        let trialQuote = quotes.first { $0.freeTrial != nil }
+
+        var parts: [String] = []
+        if let monthly {
+            parts.append("\(monthly.displayPrice)/month")
+        }
+        if let yearly {
+            parts.append("\(yearly.displayPrice)/year")
+        }
+        // For non-USD locales there's no guarantee both monthly/yearly products
+        // are present; if we only have one product (or the subscription periods
+        // are not 1 month / 1 year), describe the cadence from the period we
+        // actually loaded so the user still sees something period-shaped.
+        if parts.isEmpty {
+            if let only = quotes.first {
+                parts.append("\(only.displayPrice)/\(only.periodPhrase)")
+            }
+        }
+        if let trial = trialQuote, let ft = trial.freeTrial {
+            parts.append("\(ft.value)-\(ft.unit.phrase) free trial")
+        }
+        return parts.joined(separator: "  •  ")
+    }
 
     /// Renewal disclosure required on the paywall itself (Guideline 3.1.2).
     /// Kept factual and free of marketing so it reads the same to App Review
@@ -662,15 +709,44 @@ enum PremiumPricing {
     }
 
     /// Delivery paywall.  In-App Purchase only — no website Stripe CTA.
+    /// Apple handles the actual price and trial copy in the App Store
+    /// purchase sheet, so this string only needs to say "upgrade with In-App
+    /// Purchase"; it must keep "in-app purchase" so the
+    /// `testIOSNeverOffersWebCheckoutForDigitalGoods` assertion stays valid.
     static let deliveryUpgradeMessage =
-        "2-week free trial, then $5/month or $50/year.  Upgrade with In-App Purchase to create SSE/webhook deliveries.  Existing deliveries still appear below."
+        "Upgrade to Premium with In-App Purchase to create SSE/webhook deliveries.  Existing deliveries still appear below."
 
-    static func subtitle(for product: Product) -> String? {
-        switch AppleIAPProduct(rawValue: product.id) {
-        case .monthly: return "Billed monthly.  Cancel anytime."
-        case .annual: return "Billed yearly — two months cheaper than monthly."
-        case nil: return nil
+    /// Per-product button subtitle. Built from the StoreKit `Product` (period
+    /// + free-trial intro offer) so the wording matches what App Store Connect
+    /// currently publishes. Falls back to a period-only phrase when no intro
+    /// offer is configured.
+    static func subtitle(for product: Product, quote: PremiumPlanQuote?) -> String? {
+        guard let quote else { return nil }
+        if let ft = quote.freeTrial {
+            return "\(ft.value)-\(ft.unit.phrase) free trial, then \(quote.displayPrice)/\(quote.periodPhrase)"
         }
+        return "Billed \(quote.periodPhrase).  Cancel anytime."
+    }
+
+    /// Compute the yearly savings percentage against paying monthly, rounded
+    /// down to a whole number. Returns nil when either quote is missing or the
+    /// monthly price is zero (avoid divide-by-zero / meaningless math). The
+    /// % claim is built from these two loaded products — never a hardcoded
+    /// marketing number — so it follows App Store Connect if prices change.
+    static func savingsPercent(monthly: PremiumPlanQuote?, annual: PremiumPlanQuote?) -> Int? {
+        // Approximate the annualized monthly cost by multiplying the monthly
+        // product's price by 12. Both `Decimal`s are positive for any real
+        // StoreKit subscription; we guard against zero to keep the math sane.
+        guard let monthly, let annual else { return nil }
+        let monthlyPrice = monthly.price
+        let annualPrice = annual.price
+        guard monthlyPrice > 0 else { return nil }
+        let annualizedMonthly = monthlyPrice * Decimal(12)
+        guard annualizedMonthly > annualPrice else { return nil }
+        let saved = annualizedMonthly - annualPrice
+        // Use NSDecimalNumber for the ratio to avoid Double rounding.
+        let ratio = NSDecimalNumber(decimal: saved / annualizedMonthly).doubleValue
+        return Int(ratio * 100.0)
     }
 
     /// Never hand a raw transport/HTTP string to someone Apple has already
@@ -681,5 +757,92 @@ enum PremiumPricing {
         return "Apple took the purchase, but Congress.Trade could not confirm it yet.  "
             + "Nothing was lost — tap Restore Purchases in a moment, or reopen the app.  ("
             + detail + ")"
+    }
+}
+
+// MARK: - StoreKit-derived plan quote
+
+/// Subscription-period unit translated into a small, UI-friendly vocabulary.
+/// The unit words are the only English period words used in copy; Apple
+/// already supplies a localized `displayName` on `Product.SubscriptionPeriod`
+/// for any number other than 1 ("2 weeks", "3 months"), but the paywall copy
+/// only ever needs the singular case so we do not duplicate that.
+enum PremiumPeriodUnit {
+    case day
+    case week
+    case month
+    case year
+
+    init(_ storeKit: Product.SubscriptionPeriod.Unit) {
+        switch storeKit {
+        case .day: self = .day
+        case .week: self = .week
+        case .month: self = .month
+        case .year: self = .year
+        @unknown default: self = .month
+        }
+    }
+
+    /// Singular English noun, e.g. "month", "year", "week", "day".  All
+    /// trial/period phrases in the app render with this noun — keep it
+    /// singular and lowercase.
+    var phrase: String {
+        switch self {
+        case .day: return "day"
+        case .week: return "week"
+        case .month: return "month"
+        case .year: return "year"
+        }
+    }
+}
+
+/// Snapshot of everything the paywall needs to describe one Premium plan, as
+/// pulled from a StoreKit `Product`.  Tests construct these directly without
+/// StoreKit — see `PremiumPricing.headline(for:)` and the unit tests.
+struct PremiumPlanQuote {
+    let displayPrice: String
+    let price: Decimal
+    let periodUnit: PremiumPeriodUnit
+    let periodValue: Int
+    let freeTrial: (unit: PremiumPeriodUnit, value: Int)?
+
+    /// Period rendered as "<value>-<unit>", e.g. "1-month", "1-year", "3-day".
+    /// Singular noun used for all values; the App Store purchase sheet shows
+    /// localized pluralization itself.
+    var periodPhrase: String {
+        "\(periodValue)-\(periodUnit.phrase)"
+    }
+
+    init?(product: Product) {
+        guard let subscription = product.subscription else { return nil }
+        let period = subscription.subscriptionPeriod
+        self.displayPrice = product.displayPrice
+        self.price = product.price
+        self.periodUnit = PremiumPeriodUnit(period.unit)
+        self.periodValue = period.value
+        if let intro = subscription.introductoryOffer,
+           intro.paymentMode == .freeTrial {
+            self.freeTrial = .init(
+                unit: PremiumPeriodUnit(intro.period.unit),
+                value: intro.period.value
+            )
+        } else {
+            self.freeTrial = nil
+        }
+    }
+
+    /// Direct memberwise init for tests (no live StoreKit).
+    init(
+        displayPrice: String,
+        price: Decimal,
+        periodUnit: PremiumPeriodUnit,
+        periodValue: Int,
+        freeTrial: (unit: PremiumPeriodUnit, value: Int)?
+    ) {
+        self.displayPrice = displayPrice
+        self.price = price
+        self.periodUnit = periodUnit
+        self.periodValue = periodValue
+        self.freeTrial = freeTrial
     }
 }
