@@ -230,7 +230,7 @@ export interface PipelineSignals {
   } | null;
   /** True when a residential proxy is configured (retires the legacy scout relay). */
   residentialProxyConfigured?: boolean;
-  /** Residential proxy GET /health probe (CONFIG_KV), when explicitly configured. */
+  /** Residential proxy egress probe (CONFIG_KV), when explicitly configured. */
   residentialProxy?: {
     configured: boolean;
     probe: {
