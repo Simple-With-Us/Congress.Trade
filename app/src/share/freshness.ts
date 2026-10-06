@@ -112,8 +112,10 @@ export function evaluateFreshness(
  * MAX(latest_price_date) across the whole table, which one freshly-priced
  * quiet ticker keeps green forever (2026-08-10: megacaps sat 12+ sessions
  * stale while SOFI/RKT masked the backlog). It still reads only the indexed
- * securities_ref.latest_price_date, never price_eod. `MAX(date)` /
- * `MAX(updated_at)` use the indexes in `0102_freshness_stream_indexes.sql`.
+ * securities_ref.latest_price_date, never price_eod. Fundamentals freshness
+ * is MAX(received_at): updated_at is the provider as-of, and a backfill must
+ * not keep that alert green. `MAX(date)` / analyst `MAX(updated_at)` use the
+ * indexes in `0102_freshness_stream_indexes.sql`.
  */
 export const FRESHNESS_LATEST_SQL =
   'SELECT (SELECT MAX(date) FROM spx_eod) AS spx_latest, ' +
@@ -124,7 +126,7 @@ export const FRESHNESS_LATEST_SQL =
   'AND COALESCE(sr.price_unavailable, 0) = 0 AND sr.latest_price_date IS NOT NULL ' +
   'GROUP BY t.ticker ORDER BY MAX(t.cursor_seq) DESC LIMIT 25' +
   ')) AS price_latest, ' +
-  '(SELECT MAX(updated_at) FROM fundamentals_eod) AS fundamentals_latest, ' +
+  '(SELECT MAX(received_at) FROM fundamentals_eod) AS fundamentals_latest, ' +
   '(SELECT MAX(date) FROM insider_eod) AS insider_latest, ' +
   '(SELECT MAX(date) FROM short_volume_eod) AS short_volume_latest, ' +
   "(SELECT MAX(updated_at) FROM analyst_consensus WHERE source = 'imported') AS analyst_latest";
