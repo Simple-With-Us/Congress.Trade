@@ -1390,6 +1390,19 @@ export const FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS = [
      ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
 ] as const;
 
+/**
+ * 0102_freshness_stream_indexes.sql
+ * Daily freshness MAX(date) / imported MAX(updated_at) cannot ride
+ * PRIMARY KEY (ticker, date).  Same statements as the file migration so the
+ * file-vs-admin schema snapshot stays aligned.
+ */
+export const FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS = [
+  'CREATE INDEX IF NOT EXISTS idx_insider_eod_date ON insider_eod (date)',
+  'CREATE INDEX IF NOT EXISTS idx_short_volume_eod_date ON short_volume_eod (date)',
+  `CREATE INDEX IF NOT EXISTS idx_analyst_consensus_source_updated
+     ON analyst_consensus (source, updated_at)`,
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1546,6 +1559,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
   // 0099_feed_latency_join_index.sql
   ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
+  // 0102_freshness_stream_indexes.sql
+  ...FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [
