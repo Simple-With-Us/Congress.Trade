@@ -329,6 +329,7 @@ jobs:
           bash -n scripts/ios-stage-asc-key.sh
           bash -n scripts/test-ios-stage-asc-key.sh
           bash -n scripts/ios-ci-xctest.sh
+          bash -n scripts/ios-assert-stable-xcode.sh
           bash -n scripts/ios-fleet/publish-ios-versions.sh
           node --check scripts/ios-fleet/asc-api.mjs
 
