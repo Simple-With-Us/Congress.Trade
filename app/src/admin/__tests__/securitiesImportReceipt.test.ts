@@ -77,6 +77,37 @@ describe('POST /securities/import — import receipts', () => {
     });
   });
 
+  it('records an empty-closes price series as one accepted row, not zero', async () => {
+    const { db, binds } = fakeDb();
+    const res = await importReq(
+      {
+        origin: 'app-b',
+        prices: [
+          { ticker: 'AAPL', closes: [] },
+          { ticker: 'NOPE' },
+        ],
+      },
+      { ...env, DB: db },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      pricedTickers: number;
+      priceRows: number;
+      dropped: { prices?: { count: number; reason: string } };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.pricedTickers).toBe(1);
+    expect(body.priceRows).toBe(0);
+    expect(body.dropped.prices).toEqual({ count: 1, reason: SCHEMA_DROP_REASON });
+
+    const row = binds.find((b) => b[0] === 'peer-push-req-99');
+    expect(JSON.parse(String(row?.[6]))).toMatchObject({ prices: 1 });
+    expect(JSON.parse(String(row?.[7]))).toMatchObject({
+      prices: { count: 1, reason: SCHEMA_DROP_REASON },
+    });
+  });
+
   it('keeps backward-compatible fields when dropped is empty', async () => {
     const { db } = fakeDb();
     const res = await importReq({}, { ...env, DB: db });

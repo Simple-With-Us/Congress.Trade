@@ -42,7 +42,7 @@ describe('rejectedCountsFromErrors', () => {
 });
 
 describe('acceptedCountsFromSummary', () => {
-  it('maps summary counters onto share streams', () => {
+  it('counts prices as series rows so they reconcile with dropped.prices', () => {
     const accepted = acceptedCountsFromSummary({
       refs: 2,
       spxRows: 3,
@@ -57,12 +57,27 @@ describe('acceptedCountsFromSummary', () => {
     expect(accepted).toEqual({
       refs: 2,
       spx: 3,
-      prices: 10,
+      prices: 1,
       insider: 0,
       shortVolume: 0,
       fundamentals: 4,
       analyst: 5,
     });
+  });
+
+  it('counts a processed series that wrote zero closes as accepted', () => {
+    const accepted = acceptedCountsFromSummary({
+      refs: 0,
+      spxRows: 0,
+      pricedTickers: 1,
+      priceRows: 0,
+      perfTickers: 1,
+      insiderRows: 0,
+      shortVolumeRows: 0,
+      fundamentalsRows: 0,
+      analystRows: 0,
+    });
+    expect(accepted.prices).toBe(1);
   });
 });
 

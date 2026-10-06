@@ -77,7 +77,9 @@ export function countSchemaDropped(
 export function acceptedCountsFromSummary(summary: ShareImportSummaryCounts): Record<ShareImportStream, number> {
   return {
     refs: summary.refs,
-    prices: summary.priceRows,
+    // Series rows, same unit as dropped.prices. priceRows counts closes written
+    // and leaves a valid series with an empty closes array uncounted.
+    prices: summary.pricedTickers,
     spx: summary.spxRows,
     insider: summary.insiderRows,
     shortVolume: summary.shortVolumeRows,
