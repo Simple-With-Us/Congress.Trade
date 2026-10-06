@@ -1,0 +1,10 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Jay 2026-10-05 correction: UM-only for the daily/7+4/restore change.
+# ST + CT stay on the previous 6-hourly keep-2 until Jay decides separately.
+# Separate locks so the two dump lanes never share a flock.
+# UM dump staggered to :45 so it does not share disk with the 06:15 ST/CT tick.
+15 */6 * * * root flock -n /var/lock/fleet-sqlite-backup-stct.lock -c "FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup-stct.inner.lock FLEET_BACKUP_APPS=socratic,congress FLEET_BACKUP_KEEP_DAYS=2 FLEET_BACKUP_KEEP_COUNT=2 B2_KEEP_SETS=2 /usr/local/sbin/fleet-sqlite-backup.sh" >> /var/log/fleet-backup/cron-sqlite-stct.log 2>&1
+45 6 * * * root flock -n /var/lock/fleet-sqlite-backup-um.lock -c "FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup-um.inner.lock FLEET_BACKUP_APPS=usage-monitor FLEET_BACKUP_KEEP_DAYS=40 FLEET_BACKUP_KEEP_COUNT=11 B2_KEEP_DAILY=7 B2_KEEP_WEEKLY=4 /usr/local/sbin/fleet-sqlite-backup.sh" >> /var/log/fleet-backup/cron-sqlite-um.log 2>&1
+*/15 * * * * root /usr/local/sbin/fleet-health-verify.sh >> /var/log/fleet-backup/cron-health.log 2>&1
+30 4 * * 0 root FLEET_BACKUP_VERIFY_APPS=usage-monitor /usr/local/sbin/fleet-backup-verify-weekly.sh >> /var/log/fleet-backup/cron-weekly.log 2>&1
