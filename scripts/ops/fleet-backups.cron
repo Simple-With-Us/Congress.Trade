@@ -1,0 +1,8 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Jay 2026-10-05: daily full dump (was */6).  Litestream is the continuous
+# replica.  Retention: ~7 daily + ~4 weekly dump sets on B2 hetzner/ only.
+# Local keep 40d / 11 complete dumps.  flock so overlaps cannot pile up.
+15 6 * * * root flock -n /var/lock/fleet-sqlite-backup.lock -c "FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup.inner.lock FLEET_BACKUP_KEEP_DAYS=40 FLEET_BACKUP_KEEP_COUNT=11 B2_KEEP_DAILY=7 B2_KEEP_WEEKLY=4 /usr/local/sbin/fleet-sqlite-backup.sh" >> /var/log/fleet-backup/cron-sqlite.log 2>&1
+*/15 * * * * root /usr/local/sbin/fleet-health-verify.sh >> /var/log/fleet-backup/cron-health.log 2>&1
+30 4 * * 0 root /usr/local/sbin/fleet-backup-verify-weekly.sh >> /var/log/fleet-backup/cron-weekly.log 2>&1

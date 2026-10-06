@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Consistent SQLite snapshots for fleet apps + optional off-host copy.
 # Complements Hetzner daily host backups (RPO ~24h host-level).
-# This script aims for app-level RPO of ~hours and complete dumps.
+# Cadence (Jay 2026-10-05): ONE full dump per day.  Litestream remains the
+# continuous replica; these dumps are the cold/offsite complement, not the
+# primary RPO path.  Cron: /etc/cron.d/fleet-backups (15 6 * * * UTC).
 #
 # Hardening (2026-09-06, board e1f66898):
 #   1) in-script flock -n single-flight (same path as the host cron wrapper)
@@ -9,24 +11,16 @@
 #      .db-journal sidecar); incomplete files never occupy KEEP_COUNT slots
 #   3) timeout around sqlite3 VACUUM INTO (FLEET_BACKUP_TIMEOUT, default 30m)
 # Hardening (2026-09-12, board cbed4f30 / 93c48e00):
-#   4) VACUUM INTO instead of sqlite3 .backup — online backup never converges on
+#   4) VACUUM INTO instead of sqlite3 .backup -- online backup never converges on
 #      the ~11 GB ST DB under continuous writers
 #   5) a timed-out or failed dump ALERTS and returns non-zero (never return 0)
-# Fix (2026-09-13, board cbed4f30, CLAUDE): (1)'s in-script flock did not
-# actually compose with the cron wrapper's flock on the same path -- two
-# opens of one file never share a flock(2) lock -- so every tick from
-# 2026-09-07 SKIPped and no dumps landed for 6 days.  Script now skips its
-# own flock when a caller hands down FLOCKER=$LOCKFILE, and the standing
-# fix on the host cron wrapper points its own lock at a distinct file
-# (FLEET_BACKUP_LOCKFILE) so the two locks never target the same path.  See
-# docs/rollouts/2026-09-06-sqlite-backup-single-flight.md.
 # Host install after merge: /usr/local/sbin/fleet-sqlite-backup.sh on
 # fleet-hetzner-nbg1 (apply on top of the UUID-pinned host copy; do not
 # overwrite wholesale).  Not a Coolify image bake.
 set -euo pipefail
 
-KEEP_DAYS="${FLEET_BACKUP_KEEP_DAYS:-7}"
-KEEP_COUNT="${FLEET_BACKUP_KEEP_COUNT:-3}"
+KEEP_DAYS="${FLEET_BACKUP_KEEP_DAYS:-40}"
+KEEP_COUNT="${FLEET_BACKUP_KEEP_COUNT:-11}"
 FLEET_BACKUP_TIMEOUT="${FLEET_BACKUP_TIMEOUT:-30m}"
 LOCKFILE="${FLEET_BACKUP_LOCKFILE:-/var/lock/fleet-sqlite-backup.lock}"
 ROOT="/data/backups"
@@ -91,6 +85,14 @@ backup_one() {
   if [ ! -s "$src" ]; then
     echo "[fleet-backup] SKIP $name (empty $src)"
     return 0
+  fi
+  # Housekeeper 2026-09-15: do not VACUUM CT while congress-app is stopped
+  # (races IR wal_checkpoint / leaves writers holding WAL).
+  if [ "$name" = "congress-trade" ]; then
+    if ! docker ps --format '{{.Names}}' | grep -qE 'congress-app'; then
+      echo "[fleet-backup] SKIP $name (congress-app not running -- avoid VACUUM race with host IR)"
+      return 0
+    fi
   fi
   local dest="$dest_dir/${name}-${STAMP}.db"
   if command -v sqlite3 >/dev/null 2>&1; then
@@ -199,51 +201,24 @@ if [ "${FLEET_BACKUP_LIB_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
-# Single-flight against concurrent runs of this script.  A flock(2) lock is
-# owned by an open file description, not by a process or a script path, so
-# re-opening and re-flocking the SAME path from a process that only holds a
-# lock via a *different* open (e.g. the cron wrapper's
-# `flock -n FILE -c ...`) always conflicts -- it does not "compose" the way
-# a reentrant lock would.  (Wrong belief that it composed is why every cron
-# tick from 2026-09-07 through 2026-09-13 SKIPped: see
-# docs/rollouts/2026-09-06-sqlite-backup-single-flight.md.)
-#
-# Two mechanisms, either of which is sufficient on its own:
-#   a) explicit hand-down: a caller that already holds $LOCKFILE sets
-#      FLOCKER=$LOCKFILE before invoking us (the flock(1) self-lock idiom:
-#      `FLOCKER=FILE flock -n FILE -c ...`, see flock(1) EXAMPLES).  When we
-#      see our own FLOCKER match our own LOCKFILE, that is confirmation the
-#      lock is already held on our behalf, so we skip re-flocking it.
-#   b) distinct lock files: the caller points us at a different lock path
-#      via FLEET_BACKUP_LOCKFILE than the one it holds itself, so its flock
-#      and ours never target the same file and never race.
-# Standing production fix (2026-09-13, board cbed4f30): verified on
-# fleet-hetzner-nbg1 that util-linux 2.41.3's flock(1) does NOT set FLOCKER
-# itself -- only a script that manually exports it does -- so the live cron
-# wrapper does not satisfy (a).  It uses (b) instead
-# (FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup.inner.lock), so (a)
-# below is currently dormant in production but kept for any caller that
-# does adopt the FLOCKER idiom (and for direct/manual invocations, which
-# fall through to our own exec+flock single-flight either way).
+# Single-flight: same inode as the host cron wrapper
+# (flock -n /var/lock/fleet-sqlite-backup.lock ...).  flock(2) grants a
+# second lock to the same process, so the wrapper and this script compose.
 if ! command -v flock >/dev/null 2>&1; then
   echo "[fleet-backup] FAIL flock not found (util-linux required for single-flight)" >&2
   exit 1
 fi
-if [ "${FLOCKER:-}" = "$LOCKFILE" ]; then
-  echo "[fleet-backup] lock inherited from wrapper ($LOCKFILE)"
-else
-  mkdir -p "$(dirname "$LOCKFILE")" || {
-    echo "[fleet-backup] FAIL cannot create lock dir $(dirname "$LOCKFILE")" >&2
-    exit 1
-  }
-  exec 9>"$LOCKFILE" || {
-    echo "[fleet-backup] FAIL cannot open lock $LOCKFILE" >&2
-    exit 1
-  }
-  if ! flock -n 9; then
-    echo "[fleet-backup] SKIP already running (lock held: $LOCKFILE)" >&2
-    exit 0
-  fi
+mkdir -p "$(dirname "$LOCKFILE")" || {
+  echo "[fleet-backup] FAIL cannot create lock dir $(dirname "$LOCKFILE")" >&2
+  exit 1
+}
+exec 9>"$LOCKFILE" || {
+  echo "[fleet-backup] FAIL cannot open lock $LOCKFILE" >&2
+  exit 1
+}
+if ! flock -n 9; then
+  echo "[fleet-backup] SKIP already running (lock held: $LOCKFILE)" >&2
+  exit 0
 fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -302,29 +277,49 @@ declare -A B2_BUCKET=( [congress]="jays-congress-trade-eu" [socratic]="jays-socr
 # bucket name that only exists on B2, so the R2 weekly leg silently failed).
 declare -A R2_BUCKET=( [congress]="congress-trade-bucket" )
 
-# B2-side prune (CLAUDE 2026-08-31): keep the newest B2_KEEP_SETS snapshot
-# sets per app under hetzner/ and delete older sets.  A set = the .db/.sqlite
-# files + .sha256 sidecars sharing one YYYYMMDDTHHMMSSZ stamp.  Deletes go
-# through rclone delete --include against the native [b2] remote (Class A,
-# free); deletefile is unusable under the scoped writer key (see below).  Without
-# this only the 15-day bucket lifecycle reclaims, projecting ~780 GB steady
-# state at ~52 GB/day of raw snapshots.  Best-effort by contract: a prune
-# failure must never fail the backup run (callers append "|| true").
-B2_KEEP_SETS="${B2_KEEP_SETS:-6}"
+# B2-side prune (CLAUDE 2026-08-31; retention rewrite Jay 2026-10-05):
+# keep ~7 daily + ~4 weekly dump sets under hetzner/ and delete older dump
+# sets.  NEVER touches Litestream prefixes (trading-live/, congress-trade/,
+# api-usage-monitor/) or qdrant/ under hetzner/.  A set = the .db/.sqlite
+# files + .sha256 sidecars sharing one YYYYMMDDTHHMMSSZ stamp.
+# Deletes go through rclone delete --include against the native [b2] remote
+# (Class A, free).  Best-effort: a prune failure must never fail the backup
+# run (callers append "|| true").
+#
+# Env:
+#   B2_KEEP_DAILY   newest N dump sets to keep (default 7)
+#   B2_KEEP_WEEKLY  additional Sunday-UTC dump sets to keep (default 4)
+#   B2_KEEP_SETS    legacy total-newest fallback; if set, keep newest N only
+B2_KEEP_DAILY="${B2_KEEP_DAILY:-7}"
+B2_KEEP_WEEKLY="${B2_KEEP_WEEKLY:-4}"
+B2_KEEP_SETS="${B2_KEEP_SETS:-}"
 prune_b2_sets() {
   local app="$1" bucket="$2" current_stamp="$3"
-  local keep="$B2_KEEP_SETS"
-  local listing stamps_all old_stamps stamp name kept_count deleted_count set_fail
+  local listing stamps_all stamp name kept_count deleted_count set_fail
+  local keep_daily="$B2_KEEP_DAILY" keep_weekly="$B2_KEEP_WEEKLY"
+  local dow weekly_kept
   # Only ever touch the hetzner/ prefix of the three known fleet buckets.
   case "$bucket" in
     jays-congress-trade-eu|jays-socratic-trade-eu|jays-usage-monitor-eu) ;;
     *) echo "[fleet-backup] B2 prune SKIP: unexpected bucket $bucket for $app"; return 0 ;;
   esac
-  case "$keep" in
-    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_SETS=$keep"; return 0 ;;
+  if [ -n "$B2_KEEP_SETS" ]; then
+    case "$B2_KEEP_SETS" in
+      ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_SETS=$B2_KEEP_SETS"; return 0 ;;
+    esac
+    if [ "$B2_KEEP_SETS" -lt 1 ]; then
+      echo "[fleet-backup] B2 prune SKIP: B2_KEEP_SETS must be >= 1 (got $B2_KEEP_SETS)"
+      return 0
+    fi
+  fi
+  case "$keep_daily" in
+    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_DAILY=$keep_daily"; return 0 ;;
   esac
-  if [ "$keep" -lt 1 ]; then
-    echo "[fleet-backup] B2 prune SKIP: B2_KEEP_SETS must be >= 1 (got $keep)"
+  case "$keep_weekly" in
+    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_WEEKLY=$keep_weekly"; return 0 ;;
+  esac
+  if [ "$keep_daily" -lt 1 ]; then
+    echo "[fleet-backup] B2 prune SKIP: B2_KEEP_DAILY must be >= 1 (got $keep_daily)"
     return 0
   fi
   if ! listing="$(rclone lsf "b2:${bucket}/hetzner/" --files-only 2>/dev/null)"; then
@@ -335,37 +330,65 @@ prune_b2_sets() {
     echo "[fleet-backup] B2 prune SKIP: empty listing for $app"
     return 0
   fi
-  # Strict stamp parse; warn and never touch names without a parseable stamp.
   while read -r name; do
     [ -n "$name" ] || continue
+    case "$name" in
+      *.snapshot|*.snapshot.sha256) continue ;;
+    esac
     if ! printf '%s\n' "$name" | grep -qE '[0-9]{8}T[0-9]{6}Z'; then
       echo "[fleet-backup] B2 prune WARN: unparseable name skipped: $name"
     fi
   done <<< "$listing"
-  # Newest-first distinct stamps; keep the first $keep, delete the rest.
-  stamps_all="$(printf '%s\n' "$listing" | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -u -r)"
+  # Newest-first distinct stamps from dump-like names only.
+  stamps_all="$(printf '%s\n' "$listing" \
+    | grep -E '\.(db|sqlite)(\.sha256)?$' \
+    | grep -oE '[0-9]{8}T[0-9]{6}Z' \
+    | sort -u -r)"
   if [ -z "$stamps_all" ]; then
     echo "[fleet-backup] B2 prune SKIP: no parseable snapshot sets for $app"
     return 0
   fi
-  kept_count="$(printf '%s\n' "$stamps_all" | head -n "$keep" | grep -c . || true)"
-  old_stamps="$(printf '%s\n' "$stamps_all" | tail -n +"$((keep + 1))")"
+
+  declare -A KEEP_STAMPS=()
+  kept_count=0
+  if [ -n "$B2_KEEP_SETS" ]; then
+    while read -r stamp; do
+      [ -n "$stamp" ] || continue
+      KEEP_STAMPS["$stamp"]=1
+      kept_count=$((kept_count + 1))
+      [ "$kept_count" -ge "$B2_KEEP_SETS" ] && break
+    done <<< "$stamps_all"
+  else
+    while read -r stamp; do
+      [ -n "$stamp" ] || continue
+      KEEP_STAMPS["$stamp"]=1
+      kept_count=$((kept_count + 1))
+      [ "$kept_count" -ge "$keep_daily" ] && break
+    done <<< "$stamps_all"
+    weekly_kept=0
+    while read -r stamp; do
+      [ -n "$stamp" ] || continue
+      [ -n "${KEEP_STAMPS[$stamp]:-}" ] && continue
+      dow="$(date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}" +%u 2>/dev/null || true)"
+      [ "$dow" = "7" ] || continue
+      KEEP_STAMPS["$stamp"]=1
+      weekly_kept=$((weekly_kept + 1))
+      kept_count=$((kept_count + 1))
+      [ "$weekly_kept" -ge "$keep_weekly" ] && break
+    done <<< "$stamps_all"
+  fi
+
   deleted_count=0
-  for stamp in $old_stamps; do
+  while read -r stamp; do
     [ -n "$stamp" ] || continue
+    [ -n "${KEEP_STAMPS[$stamp]:-}" ] && continue
     if [ "$stamp" = "$current_stamp" ]; then
-      # Never delete the set this run just uploaded, whatever the math says.
       echo "[fleet-backup] B2 prune SKIP: refusing to delete current set $stamp for $app"
       continue
     fi
     set_fail=0
     while read -r name; do
       [ -n "$name" ] || continue
-      # deletefile cannot resolve exact object paths under the scoped
-      # fleet-backup-writer key (NewObject reports "doesn't exist" even though
-      # lsf lists the same path; first live run 2026-08-31 12:15Z deleted 0 of
-      # 12 candidates this way).  An anchored --include delete works, but
-      # exits 0 even when nothing matched, so verify by re-listing.
       rclone delete "b2:${bucket}/hetzner/" --include "/${name}" 2>/dev/null || true
       if rclone lsf "b2:${bucket}/hetzner/" --files-only 2>/dev/null | grep -qxF "$name"; then
         echo "[fleet-backup] B2 prune WARN: delete failed: $name"
@@ -375,8 +398,8 @@ prune_b2_sets() {
     if [ "$set_fail" = "0" ]; then
       deleted_count=$((deleted_count + 1))
     fi
-  done
-  echo "[fleet-backup] B2 prune OK: $app kept=${kept_count} deleted=${deleted_count}"
+  done <<< "$stamps_all"
+  echo "[fleet-backup] B2 prune OK: $app kept=${kept_count} deleted=${deleted_count} (daily=${keep_daily} weekly=${keep_weekly})"
   return 0
 }
 
@@ -396,13 +419,7 @@ r2_receipt_ok_today() {
 for app in congress socratic usage-monitor; do
   dir="$ROOT/$app"; [ -d "$dir" ] || continue
   files=$(ls -1 "$dir" 2>/dev/null | grep "$STAMP" || true)
-  if [ -z "$files" ]; then
-    if [ "$app" = "congress" ] && { [ "$(date -u +%u)" = "7" ] || [ "${FLEET_BACKUP_FORCE_WEEKLY:-0}" = "1" ]; }; then
-      printf '{"ok":false,"reason":"local_backup_failed","checkedAt":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        > /data/congress-trade/.r2-archive-status.json || true
-    fi
-    continue
-  fi
+  [ -n "$files" ] || continue
   if rclone copy "$dir" "b2:${B2_BUCKET[$app]}/hetzner/" --include "*${STAMP}*" --transfers 2 -q; then
     echo "[fleet-backup] B2 offsite OK: $app ($STAMP)"
     prune_b2_sets "$app" "${B2_BUCKET[$app]}" "$STAMP" || true
