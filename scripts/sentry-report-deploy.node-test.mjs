@@ -65,3 +65,16 @@ test('pagination finds an older production deployment without posting again',asy
 test('untrusted Sentry pagination cannot forward the token',async()=>{
  let calls=0;await assert.rejects(report(async()=>{calls++;return json([],200,{link:'<https://evil.invalid/steal>; rel="next"; results="true"'});}),/not trusted/);assert.equal(calls,1);
 });
+test('git ancestry distinguishes divergence from execution failures',async()=>{
+ const {gitAncestry}=await import('./sentry-report-deploy.mjs');
+ assert.equal(gitAncestry(expected,newer,()=>({status:0})),true);
+ assert.equal(gitAncestry(expected,newer,()=>({status:1})),false);
+ for(const result of [{status:null},{status:128},{status:1,error:new Error('spawn failed')}]) assert.throws(()=>gitAncestry(expected,newer,()=>result),/execution failed/);
+});
+test('transient refresh failures retry without using stale ancestry',async()=>{
+ let calls=0;const r=await observe([expected,expected],{attempts:3,refreshMain:()=>{if(++calls===1)throw Error('temporary network failure');}});
+ assert.equal(r.revision,expected);assert.equal(calls,3);
+});
+test('persistent ancestry errors fail within bounded observation window',async()=>{
+ await assert.rejects(observe([expected,expected],{isAncestor:()=>{throw Error('execution failure')}}),/Unable to refresh or evaluate main ancestry/);
+});
