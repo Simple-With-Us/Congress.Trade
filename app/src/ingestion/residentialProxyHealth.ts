@@ -5,13 +5,16 @@
  */
 
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
-import { DEFAULT_RESIDENTIAL_PROXY_URL, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
+import { createProxiedFetch, DEFAULT_RESIDENTIAL_PROXY_URL, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import type { Env } from '../shared/types.ts';
 
 export const RESIDENTIAL_PROXY_HEALTH_KV_KEY = 'residential-proxy:health';
 export const RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS = 5_000;
 
-/** Cached GET /health result for pipelineHealth (no live hop on /api/health). */
+/** Cheap origin fetched *through* the HTTP proxy (never GET {proxy}/health). */
+export const RESIDENTIAL_PROXY_PROBE_TARGET_URL = 'http://example.com/';
+
+/** Cached proxy-egress probe for pipelineHealth (no live hop on /api/health). */
 export interface ResidentialProxyProbeRecord {
   ok: boolean;
   status: number | null;
@@ -36,7 +39,9 @@ export interface ResidentialProxyHealthResult {
 }
 
 /**
- * Probe the health endpoint of the residential proxy daemon.
+ * Probe residential proxy liveness by tunneling a cheap HTTP request through it
+ * (equivalent to `curl -x {proxy} http://example.com`).  Never issues a plain
+ * GET to `{proxy}/health` — tinyproxy has no health route and will wedge workers.
  */
 export async function probeResidentialProxyHealth(
   proxyUrlOrEnv?: string | Env,
@@ -65,7 +70,7 @@ export async function probeResidentialProxyHealth(
   }
 
   const cleanUrl = proxyUrl.replace(/\/$/, '');
-  const healthEndpoint = `${cleanUrl}/health`;
+  const proxiedFetch = createProxiedFetch(cleanUrl, fetchImpl);
   const t0 = Date.now();
 
   const controller = new AbortController();
@@ -73,31 +78,26 @@ export async function probeResidentialProxyHealth(
 
   try {
     const res = await trackedFetch(
-      healthEndpoint,
+      RESIDENTIAL_PROXY_PROBE_TARGET_URL,
       {
         method: 'GET',
-        headers: { accept: 'application/json' },
+        headers: { accept: 'text/html' },
         signal: controller.signal,
       },
       { service: 'filing-discovery', operation: 'probe-residential-proxy-health' },
-      fetchImpl,
+      proxiedFetch,
     );
 
     clearTimeout(timeoutId);
     const latencyMs = Date.now() - t0;
+    const reachable = res.status >= 200 && res.status < 600;
 
-    if (res.ok) {
-      let data: { ok?: boolean; service?: string; uptime?: number } = {};
-      try {
-        data = (await res.json()) as typeof data;
-      } catch {}
+    if (reachable) {
       return {
         configured: true,
         proxyUrl: cleanUrl,
         reachable: true,
         status: res.status,
-        service: data.service,
-        uptime: data.uptime,
         latencyMs,
       };
     }

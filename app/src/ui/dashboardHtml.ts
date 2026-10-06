@@ -12251,6 +12251,16 @@ var OPTION_PERF_NOTE = '<div class="tier-gate-note">Performance isn\\'t shown fo
 function perfPct(x) { return x == null ? '—' : (x > 0 ? '▲ ' : x < 0 ? '▼ ' : '') + (x * 100).toFixed(1) + '%'; }
 function perfLineHtml(d, txType) {
   if (!d || !d.available) return (d && d.isOption) ? OPTION_PERF_NOTE : PERF_GATE;
+  if (d.stale) {
+    var staleChip = '<div class="chip muted">Older price';
+    if (d.currentPriceDate) staleChip += ' (' + esc(fmtAsOf(d.currentPriceDate)) + ')';
+    staleChip += '</div>';
+    var staleNote = '<div class="tier-gate-note">Excess return is hidden until newer market data arrives.</div>';
+    if (d.currentPrice != null) {
+      staleChip += '<div class="chip muted">Last seen $' + Number(d.currentPrice).toFixed(2) + '</div>';
+    }
+    return staleChip + staleNote;
+  }
   var verb = txType === 'S' ? 'since sold' : 'since traded';
   function perfBlock(label, perf, anchorPrice) {
     if (!perf) return '';

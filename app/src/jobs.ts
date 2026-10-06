@@ -143,6 +143,7 @@ export const RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: 'dead_letter_events', column: 'created_at', days: 30 },
   { table: 'ingest_log', column: 'polled_at', days: 90 },
   { table: 'source_attempts', column: 'attempted_at', days: 30 },
+  { table: 'peer_import_receipts', column: 'received_at', days: 30 },
 
   // --- Durable queue / outbox terminal rows -------------------------------
   // These are audit history only. Retention is asymmetric on purpose:
