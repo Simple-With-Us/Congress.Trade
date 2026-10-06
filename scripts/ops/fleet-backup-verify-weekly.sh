@@ -2,7 +2,12 @@
 # Weekly restore drill for fleet SQLite backups.
 # Cadence: 30 4 * * 0 (Sunday 04:30 UTC) via /etc/cron.d/fleet-backups.
 #
-# For each of socratic / congress / usage-monitor:
+# Jay 2026-10-05 correction: Usage-Monitor ONLY by default
+# (FLEET_BACKUP_VERIFY_APPS=usage-monitor).  ST/CT stay on the previous
+# dump cadence and are not part of this weekly Litestream restore drill
+# until Jay decides separately.
+#
+# For each selected app:
 #   1) restore the latest local full dump to a scratch path
 #   2) PRAGMA integrity_check + a simple row-count query
 #   3) Litestream restore of the latest replica into scratch (when the
@@ -12,6 +17,8 @@
 set -euo pipefail
 
 ROOT=/data/backups
+# Comma-separated: socratic, congress, usage-monitor.  Default = UM only.
+FLEET_BACKUP_VERIFY_APPS="${FLEET_BACKUP_VERIFY_APPS:-usage-monitor}"
 SCRATCH="${FLEET_RESTORE_SCRATCH:-/data/scratch/fleet-restore-drill}"
 LOG=/var/log/fleet-backup/weekly-verify-$(date -u +%Y%m%d).log
 mkdir -p /var/log/fleet-backup "$SCRATCH"
@@ -234,14 +241,41 @@ check_litestream() {
   rm -f "$tmp_host"
 }
 
+verify_app_enabled() {
+  local want="$1" raw token
+  raw="$(printf '%s' "$FLEET_BACKUP_VERIFY_APPS" | tr '[:upper:]' '[:lower:]' | tr ',' ' ')"
+  for token in $raw; do
+    [ "$token" = "$want" ] && return 0
+  done
+  return 1
+}
+
+echo "[weekly-verify] apps=$FLEET_BACKUP_VERIFY_APPS"
+
 for d in socratic congress usage-monitor; do
-  check_dump "$d"
+  if verify_app_enabled "$d"; then
+    check_dump "$d"
+  else
+    echo "SKIP $d dump (not in FLEET_BACKUP_VERIFY_APPS)"
+  fi
 done
 
-# Litestream restores (one at a time; ST is ~14 GB).
-check_litestream "socratic" 'd83b1aykr03uwr32yhgzaiay' "/app/data/app.db" "/app/litestream.coolify.yml" "/app/data/.bin/litestream" "litestream.coolify.yml"
-check_litestream "congress" 'congress-app' "/data/congress-trade/db.sqlite" "/app/litestream.yml" "/app/bin/litestream" "unstable-cron"
-check_litestream "usage-monitor" 'yagelvqux9e8l1kztif7bf2o' "/data/prod.db" "/app/litestream.yml" "/app/bin/litestream" "run-app-with-replica-heartbeat"
+# Litestream restores (one at a time).  ST is ~14 GB -- only when selected.
+if verify_app_enabled socratic; then
+  check_litestream "socratic" 'd83b1aykr03uwr32yhgzaiay' "/app/data/app.db" "/app/litestream.coolify.yml" "/app/data/.bin/litestream" "litestream.coolify.yml"
+else
+  echo "SKIP socratic litestream (not in FLEET_BACKUP_VERIFY_APPS)"
+fi
+if verify_app_enabled congress; then
+  check_litestream "congress" 'congress-app' "/data/congress-trade/db.sqlite" "/app/litestream.yml" "/app/bin/litestream" "unstable-cron"
+else
+  echo "SKIP congress litestream (not in FLEET_BACKUP_VERIFY_APPS)"
+fi
+if verify_app_enabled usage-monitor; then
+  check_litestream "usage-monitor" 'yagelvqux9e8l1kztif7bf2o' "/data/prod.db" "/app/litestream.yml" "/app/bin/litestream" "run-app-with-replica-heartbeat"
+else
+  echo "SKIP usage-monitor litestream (not in FLEET_BACKUP_VERIFY_APPS)"
+fi
 
 echo "[weekly-verify] done fail=$FAIL"
 echo "NOTE: Hetzner server backups ON - use for full host recovery; this drill is app SQLite only."

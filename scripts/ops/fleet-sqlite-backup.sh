@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Consistent SQLite snapshots for fleet apps + optional off-host copy.
 # Complements Hetzner daily host backups (RPO ~24h host-level).
-# Cadence (Jay 2026-10-05): ONE full dump per day.  Litestream remains the
-# continuous replica; these dumps are the cold/offsite complement, not the
-# primary RPO path.  Cron: /etc/cron.d/fleet-backups (15 6 * * * UTC).
+#
+# Per-app split (Jay 2026-10-05 correction): Usage-Monitor alone is daily with
+# 7+4 B2 retention.  Socratic.Trade and Congress.Trade stay on the previous
+# 6-hourly keep-2 cadence until Jay decides separately.  Select apps with
+# FLEET_BACKUP_APPS=socratic,congress,usage-monitor (comma-separated).
+# Cron: /etc/cron.d/fleet-backups (two dump lines + weekly UM-only verify).
 #
 # Hardening (2026-09-06, board e1f66898):
 #   1) in-script flock -n single-flight (same path as the host cron wrapper)
@@ -19,11 +22,48 @@
 # overwrite wholesale).  Not a Coolify image bake.
 set -euo pipefail
 
-KEEP_DAYS="${FLEET_BACKUP_KEEP_DAYS:-40}"
-KEEP_COUNT="${FLEET_BACKUP_KEEP_COUNT:-11}"
+KEEP_DAYS="${FLEET_BACKUP_KEEP_DAYS:-2}"
+KEEP_COUNT="${FLEET_BACKUP_KEEP_COUNT:-2}"
 FLEET_BACKUP_TIMEOUT="${FLEET_BACKUP_TIMEOUT:-30m}"
 LOCKFILE="${FLEET_BACKUP_LOCKFILE:-/var/lock/fleet-sqlite-backup.lock}"
 ROOT="/data/backups"
+
+# Comma-separated app dirs to dump/prune this run.  Default = all three.
+# Valid tokens: socratic, congress, usage-monitor.
+FLEET_BACKUP_APPS="${FLEET_BACKUP_APPS:-socratic,congress,usage-monitor}"
+# When 1: print which local dirs and B2 hetzner/ prefixes prune would touch,
+# then exit before VACUUM / upload / delete.  Never deletes.
+FLEET_BACKUP_DRY_RUN="${FLEET_BACKUP_DRY_RUN:-0}"
+
+backup_apps_selected() {
+  local raw token
+  BACKUP_APP_LIST=()
+  raw="$(printf '%s' "${FLEET_BACKUP_APPS:-}" | tr '[:upper:]' '[:lower:]' | tr ',' ' ')"
+  for token in $raw; do
+    case "$token" in
+      socratic|congress|usage-monitor) BACKUP_APP_LIST+=("$token") ;;
+      '' ) ;;
+      *) echo "[fleet-backup] WARN unknown FLEET_BACKUP_APPS token: $token (ignored)" ;;
+    esac
+  done
+  if [ "${#BACKUP_APP_LIST[@]}" -eq 0 ]; then
+    echo "[fleet-backup] FAIL FLEET_BACKUP_APPS empty after parse" >&2
+    return 1
+  fi
+  return 0
+}
+
+app_enabled() {
+  local want="$1" a
+  [ "${#BACKUP_APP_LIST[@]}" -eq 0 ] && return 1
+  for a in "${BACKUP_APP_LIST[@]}"; do
+    [ "$a" = "$want" ] && return 0
+  done
+  return 1
+}
+
+BACKUP_APP_LIST=()
+
 
 # A dump is complete only when the .db exists, a matching .sha256 sidecar
 # exists, and sqlite3 is not still writing a rollback journal.  Incomplete
@@ -120,9 +160,10 @@ backup_one() {
 }
 
 prune_incomplete_dumps() {
-  local dir f
+  local app dir f
   [ -d "$ROOT" ] || return 0
-  for dir in "$ROOT"/*; do
+  for app in "${BACKUP_APP_LIST[@]}"; do
+    dir="$ROOT/$app"
     [ -d "$dir" ] || continue
     for f in "$dir"/*.db; do
       [ -f "$f" ] || continue
@@ -136,7 +177,7 @@ prune_incomplete_dumps() {
 }
 
 prune_by_age() {
-  local f s db
+  local app dir f s db
   [ -d "$ROOT" ] || return 0
   case "$KEEP_DAYS" in
     ''|*[!0-9]*)
@@ -145,24 +186,29 @@ prune_by_age() {
       ;;
   esac
   # Age-prune only complete dumps so an incomplete newer file cannot keep a
-  # finished snapshot from being the one KEEP_DAYS considers.
-  find "$ROOT" -type f -name '*.db' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r f; do
-    dump_is_complete "$f" || continue
-    echo "[fleet-backup] prune-age $f"
-    rm -f "$f" "${f}.sha256"
-  done || true
-  find "$ROOT" -type f -name '*.sqlite' -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null || true
-  find "$ROOT" -type f -name '*.sha256' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r s; do
-    db="${s%.sha256}"
-    if [ ! -f "$db" ]; then
-      echo "[fleet-backup] prune-age-orphan $s"
-      rm -f "$s"
-    fi
-  done || true
+  # finished snapshot from being the one KEEP_DAYS considers.  Scoped to
+  # FLEET_BACKUP_APPS dirs only (ST/CT keep-2 must not touch UM dumps).
+  for app in "${BACKUP_APP_LIST[@]}"; do
+    dir="$ROOT/$app"
+    [ -d "$dir" ] || continue
+    find "$dir" -type f -name '*.db' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r f; do
+      dump_is_complete "$f" || continue
+      echo "[fleet-backup] prune-age $f"
+      rm -f "$f" "${f}.sha256"
+    done || true
+    find "$dir" -type f -name '*.sqlite' -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null || true
+    find "$dir" -type f -name '*.sha256' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r s; do
+      db="${s%.sha256}"
+      if [ ! -f "$db" ]; then
+        echo "[fleet-backup] prune-age-orphan $s"
+        rm -f "$s"
+      fi
+    done || true
+  done
 }
 
 prune_by_keep_count() {
-  local dir f n
+  local app dir f n
   [ -d "$ROOT" ] || return 0
   case "$KEEP_COUNT" in
     ''|*[!0-9]*)
@@ -174,7 +220,8 @@ prune_by_keep_count() {
     echo "[fleet-backup] retention SKIP: FLEET_BACKUP_KEEP_COUNT must be >= 1 (got $KEEP_COUNT)"
     return 0
   fi
-  for dir in "$ROOT"/*; do
+  for app in "${BACKUP_APP_LIST[@]}"; do
+    dir="$ROOT/$app"
     [ -d "$dir" ] || continue
     n=0
     # Newest-first; skip anything that is not a complete dump so a live
@@ -192,6 +239,10 @@ prune_by_keep_count() {
 }
 
 apply_local_retention() {
+  # Tests / callers may set ROOT without going through main; ensure app list.
+  if [ "${#BACKUP_APP_LIST[@]}" -eq 0 ]; then
+    backup_apps_selected || return 0
+  fi
   prune_incomplete_dumps
   prune_by_age
   prune_by_keep_count
@@ -226,38 +277,70 @@ BACKUP_FAILED=0
 LOG="/var/log/fleet-backup/sqlite-${STAMP}.log"
 mkdir -p "$ROOT" /var/log/fleet-backup
 exec > >(tee -a "$LOG") 2>&1
-echo "[fleet-backup] start $STAMP"
+echo "[fleet-backup] start $STAMP apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-}"
+
+if ! backup_apps_selected; then
+  exit 1
+fi
+
+if [ "$FLEET_BACKUP_DRY_RUN" = "1" ]; then
+  echo "[fleet-backup] DRY-RUN: would dump/prune local dirs and B2 hetzner/ prefixes:"
+  declare -A _B2_BUCKET=( [congress]="jays-congress-trade-eu" [socratic]="jays-socratic-trade-eu" [usage-monitor]="jays-usage-monitor-eu" )
+  for app in "${BACKUP_APP_LIST[@]}"; do
+    echo "  local: $ROOT/$app/"
+    echo "  B2:    b2:${_B2_BUCKET[$app]}/hetzner/  (dump sets only; never Litestream / qdrant/)"
+    if [ -d "$ROOT/$app" ]; then
+      ls -1t "$ROOT/$app"/*.db 2>/dev/null | head -5 | while read -r f; do
+        echo "    present: $(basename "$f") ($(du -h "$f" | awk '{print $1}'))"
+      done || true
+    fi
+  done
+  echo "[fleet-backup] DRY-RUN done (no VACUUM, upload, or delete)"
+  exit 0
+fi
 
 # Socratic: Coolify docker volume
-SOCRATIC_VOL=$(docker volume ls -q | grep -E 'socratic.*prod-app-data|prod-app-data' | head -1 || true)
-if [ -n "$SOCRATIC_VOL" ] && [ -f "/var/lib/docker/volumes/${SOCRATIC_VOL}/_data/app.db" ]; then
-  backup_one "socratic-app" "/var/lib/docker/volumes/${SOCRATIC_VOL}/_data/app.db" "$ROOT/socratic" || BACKUP_FAILED=1
-else
-  # try live container path via docker cp
-  C=$(docker ps --format '{{.Names}}' | grep -E 'socratic-app|socratic' | head -1 || true)
-  if [ -n "$C" ]; then
-    tmp="/tmp/socratic-app.db"
-    docker cp "$C:/app/data/app.db" "$tmp"
-    backup_one "socratic-app" "$tmp" "$ROOT/socratic" || BACKUP_FAILED=1
-    rm -f "$tmp"
+if app_enabled socratic; then
+  SOCRATIC_VOL=$(docker volume ls -q | grep -E 'socratic.*prod-app-data|prod-app-data' | head -1 || true)
+  if [ -n "$SOCRATIC_VOL" ] && [ -f "/var/lib/docker/volumes/${SOCRATIC_VOL}/_data/app.db" ]; then
+    backup_one "socratic-app" "/var/lib/docker/volumes/${SOCRATIC_VOL}/_data/app.db" "$ROOT/socratic" || BACKUP_FAILED=1
   else
-    echo "[fleet-backup] SKIP socratic (no volume/container)"
+    # try live container path via docker cp
+    C=$(docker ps --format '{{.Names}}' | grep -E 'socratic-app|socratic|d83b1aykr03uwr32yhgzaiay' | head -1 || true)
+    if [ -n "$C" ]; then
+      tmp="/tmp/socratic-app.db"
+      docker cp "$C:/app/data/app.db" "$tmp"
+      backup_one "socratic-app" "$tmp" "$ROOT/socratic" || BACKUP_FAILED=1
+      rm -f "$tmp"
+    else
+      echo "[fleet-backup] SKIP socratic (no volume/container)"
+    fi
   fi
+else
+  echo "[fleet-backup] SKIP socratic (not in FLEET_BACKUP_APPS)"
 fi
 
-backup_one "congress-trade" "/data/congress-trade/db.sqlite" "$ROOT/congress" || BACKUP_FAILED=1
-# Deno KV is not pure sqlite recovery the same way; still copy for best-effort
-if [ -f /data/congress-trade/kv.sqlite ]; then
-  mkdir -p "$ROOT/congress"
-  cp -a /data/congress-trade/kv.sqlite "$ROOT/congress/kv-${STAMP}.sqlite" || true
-  echo "[fleet-backup] copied congress kv"
+if app_enabled congress; then
+  backup_one "congress-trade" "/data/congress-trade/db.sqlite" "$ROOT/congress" || BACKUP_FAILED=1
+  # Deno KV is not pure sqlite recovery the same way; still copy for best-effort
+  if [ -f /data/congress-trade/kv.sqlite ]; then
+    mkdir -p "$ROOT/congress"
+    cp -a /data/congress-trade/kv.sqlite "$ROOT/congress/kv-${STAMP}.sqlite" || true
+    echo "[fleet-backup] copied congress kv"
+  fi
+else
+  echo "[fleet-backup] SKIP congress (not in FLEET_BACKUP_APPS)"
 fi
 
-backup_one "usage-monitor" "/data/prod.db" "$ROOT/usage-monitor" || BACKUP_FAILED=1
-# Coolify also mounts UM volume - find it
-UM_VOL=$(docker volume ls -q | grep -E 'usage-data|usage-monitor' | head -1 || true)
-if [ -n "$UM_VOL" ] && [ -f "/var/lib/docker/volumes/${UM_VOL}/_data/prod.db" ]; then
-  backup_one "usage-monitor-vol" "/var/lib/docker/volumes/${UM_VOL}/_data/prod.db" "$ROOT/usage-monitor" || BACKUP_FAILED=1
+if app_enabled usage-monitor; then
+  backup_one "usage-monitor" "/data/prod.db" "$ROOT/usage-monitor" || BACKUP_FAILED=1
+  # Coolify also mounts UM volume - find it
+  UM_VOL=$(docker volume ls -q | grep -E 'usage-data|usage-monitor' | head -1 || true)
+  if [ -n "$UM_VOL" ] && [ -f "/var/lib/docker/volumes/${UM_VOL}/_data/prod.db" ]; then
+    backup_one "usage-monitor-vol" "/var/lib/docker/volumes/${UM_VOL}/_data/prod.db" "$ROOT/usage-monitor" || BACKUP_FAILED=1
+  fi
+else
+  echo "[fleet-backup] SKIP usage-monitor (not in FLEET_BACKUP_APPS)"
 fi
 
 # retention: drop incomplete dumps first, then age-based (default 7d) AND
@@ -417,6 +500,7 @@ r2_receipt_ok_today() {
 }
 
 for app in congress socratic usage-monitor; do
+  app_enabled "$app" || continue
   dir="$ROOT/$app"; [ -d "$dir" ] || continue
   files=$(ls -1 "$dir" 2>/dev/null | grep "$STAMP" || true)
   [ -n "$files" ] || continue
