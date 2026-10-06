@@ -183,7 +183,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: CongressTradeWidget/CongressTradeWidget.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
-        GENERATE_INFOPLIST_FILE: YES
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: CongressTradeWidget/Info.plist
         SWIFT_VERSION: "5.0"
         SKIP_INSTALL: YES
     info:
