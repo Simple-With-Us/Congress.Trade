@@ -70,10 +70,16 @@ function spxOnOrBeforePriceDateSql(dateExpr: string): string {
  * figure.  Materialized once per query (securities_ref is small) instead of a
  * correlated lookup per trade row.
  */
-const PRICE_ANCHOR_CTE_BODY =
-  'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
-  `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
-  'FROM securities_ref r WHERE r.current_price IS NOT NULL AND r.current_price > 0';
+/** Materialized once per query; excludes tickers whose current price is too old for excess-return math. */
+export function buildPriceAnchorCteBody(priceFreshThrough: string): string {
+  const through = priceFreshThrough.slice(0, 10);
+  return (
+    'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
+    `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
+    'FROM securities_ref r WHERE r.current_price IS NOT NULL AND r.current_price > 0 ' +
+    `AND r.current_price_date IS NOT NULL AND r.current_price_date >= '${through}'`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // 1. Summary — KPI strip
@@ -705,7 +711,7 @@ export function buildLateFilersQuery(p: CommonFilters & { limit?: number }): Bui
  * is not. Skipped per perf constraint, not an oversight.
  */
 export function buildMemberPerformanceLeaderboardQuery(
-  p: CommonFilters & { limit?: number; minTrades?: number },
+  p: CommonFilters & { limit?: number; minTrades?: number; priceFreshThrough: string },
 ): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const limit = clampLimit(p.limit, 20, 100);
@@ -740,7 +746,7 @@ export function buildMemberPerformanceLeaderboardQuery(
     ...where,
   ];
   const sql =
-    `WITH px AS MATERIALIZED (${PRICE_ANCHOR_CTE_BODY}) ` +
+    `WITH px AS MATERIALIZED (${buildPriceAnchorCteBody(p.priceFreshThrough)}) ` +
     'SELECT t.filer_id AS filer_id, MAX(COALESCE(fl.display_name, fl.full_name)) AS full_name, MAX(fl.party) AS party, ' +
     'MAX(fl.photo_url) AS photo_url, ' +
     'MAX(px.price_date) AS prices_as_of, ' +
@@ -795,7 +801,10 @@ export function buildConvictionMemberLinksQuery(tickers: string[], p: CommonFilt
  * ?source=primary won't let seed-dataset buys leak in). Only politicians with >= 5
  * scored buys are returned. Caller must chunk `filerIds` under D1's 100-bind cap.
  */
-export function buildMemberSkillQuery(filerIds: string[], p: CommonFilters): BuiltQuery {
+export function buildMemberSkillQuery(
+  filerIds: string[],
+  p: CommonFilters & { priceFreshThrough: string },
+): BuiltQuery {
   // Same as-of-aligned exit legs as the performance leaderboard (see PRICE_ANCHOR_CTE_BODY).
   const EXCESS =
     '((px.current_price / p.price_at_filing) - 1.0) - ((px.spx_now / p.spx_at_filing) - 1.0)';
@@ -820,7 +829,7 @@ export function buildMemberSkillQuery(filerIds: string[], p: CommonFilters): Bui
   where.push(`t.filer_id IN (${filerIds.map(() => '?').join(', ')})`);
   for (const id of filerIds) params.push(id);
   const sql =
-    `WITH px AS MATERIALIZED (${PRICE_ANCHOR_CTE_BODY}) ` +
+    `WITH px AS MATERIALIZED (${buildPriceAnchorCteBody(p.priceFreshThrough)}) ` +
     'SELECT t.filer_id AS filer_id, COUNT(*) AS scored, ' +
     `SUM(CASE WHEN ${EXCESS} > 0 THEN 1 ELSE 0 END) AS wins, ` +
     `AVG(${EXCESS}) AS avg_excess ` +

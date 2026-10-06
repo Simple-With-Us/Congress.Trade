@@ -70,6 +70,7 @@ import { buildMemberPerformanceQuery } from '../analytics/builders.ts';
 import { asWindow } from '../analytics/sql.ts';
 import { aggregateMemberDualPerformance } from '../analytics/compute.ts';
 import { latestSpxClose } from '../prices/service.ts';
+import { currentPriceFreshThrough } from '../prices/staleness.ts';
 import type { TradeSummaryRow } from './types.ts';
 import type { TxQueryParams } from '../delivery/rows.ts';
 import { mergePeeledQuery, peelEncodedQueryFromPathParam } from '../shared/memberPath.ts';
@@ -307,7 +308,9 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
       currentPriceDate: str(row.current_price_date),
       spxNow: row.spx_now == null ? null : num(row.spx_now),
     }));
-    const dual = aggregateMemberDualPerformance(perfRows, currentSpx);
+    const dual = aggregateMemberDualPerformance(perfRows, currentSpx, {
+      priceFreshThrough: currentPriceFreshThrough(),
+    });
     // Flat `performance` stays trade-date buy skill for older iOS decoders;
     // nested legs expose both anchors for new clients.
     const performance = {
