@@ -262,6 +262,14 @@ import {
   trackedFetch,
 } from '../shared/thirdPartyTelemetry.ts';
 import {
+  acceptedCountsFromSummary,
+  countSchemaDropped,
+  persistPeerImportReceipt,
+  rejectedCountsFromErrors,
+  resolvePeerImportRequestId,
+  warnPeerImportSchemaDrops,
+} from '../share/importReceipt.ts';
+import {
   BASE_SCHEMA_STATEMENTS,
   DISCLOSURE_AVAILABLE_SCHEMA_STATEMENTS,
   POST_0024_SCHEMA_STATEMENTS,
@@ -10176,6 +10184,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // the app can be dialed back without code changes.
     const limits = await importLimits(c.env);
     const contentLength = Number(c.req.header('content-length') ?? 0);
+    const requestId = resolvePeerImportRequestId(c.req.raw.headers);
     if (contentLength > limits.bytes) {
       return c.json(
         {
@@ -10188,13 +10197,15 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       );
     }
 
+    let rawText = '';
     let body: Record<string, unknown> = {};
     try {
-      const raw = await c.req.text();
-      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+      rawText = await c.req.text();
+      if (rawText) body = JSON.parse(rawText) as Record<string, unknown>;
     } catch {
       return c.json({ error: 'invalid JSON body' }, 400);
     }
+    const payloadBytes = rawText.length > 0 ? rawText.length : contentLength;
     const summary = {
       refs: 0, spxRows: 0, pricedTickers: 0, priceRows: 0, perfTickers: 0,
       insiderRows: 0, shortVolumeRows: 0, fundamentalsRows: 0, analystRows: 0,
@@ -10226,7 +10237,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (body.origin != null && typeof body.origin !== 'string') {
       return c.json({ error: 'invalid shared payload: origin must be a string' }, 400);
     }
-    body = {
+    const originTag = typeof body.origin === 'string' ? body.origin : null;
+    const filteredShareBody = {
       ...body,
       refs: filterShareRows(body.refs, SecurityRefInputSchema),
       prices: filterShareRows(body.prices, PriceSeriesSchema),
@@ -10236,6 +10248,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       fundamentals: filterShareRows(body.fundamentals, FundamentalRowSchema, normalizeFundamentalAliases),
       analyst: filterShareRows(body.analyst, AnalystRowSchema),
     };
+    const dropped = countSchemaDropped(body, filteredShareBody);
+    body = filteredShareBody;
 
     const REF_KEYS = [
       'companyName', 'sector', 'industry', 'assetClass', 'isEtf', 'isAdr', 'country',
@@ -10572,7 +10586,27 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       summary.analystRows += rows.length;
     }
 
-    return c.json({ ok: summary.errors.length === 0, ...summary });
+    const ok = summary.errors.length === 0;
+    const accepted = acceptedCountsFromSummary(summary);
+    const rejected = rejectedCountsFromErrors(summary.errors);
+    warnPeerImportSchemaDrops({ requestId, origin: originTag, dropped, payloadBytes });
+    try {
+      await persistPeerImportReceipt(c.env.DB, {
+        requestId,
+        receivedAt: nowIso,
+        origin: originTag,
+        payloadBytes,
+        ok,
+        accepted,
+        dropped,
+        rejected,
+        errors: summary.errors,
+      });
+    } catch (err) {
+      console.warn('peer import receipt persist failed:', (err as Error).message);
+    }
+
+    return c.json({ ok, ...summary, dropped });
   });
 
   // --- POST /enrich-photos ------------------------------------------------
