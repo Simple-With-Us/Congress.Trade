@@ -1390,6 +1390,25 @@ export const FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS = [
      ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
 ] as const;
 
+/** 0100_peer_import_receipts.sql — inbound ST share-push import audit log. */
+export const PEER_IMPORT_RECEIPT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS peer_import_receipts (
+     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+     request_id      TEXT NOT NULL,
+     received_at     TEXT NOT NULL,
+     origin          TEXT,
+     kind            TEXT NOT NULL DEFAULT 'share_push',
+     payload_bytes   INTEGER NOT NULL DEFAULT 0,
+     ok              INTEGER NOT NULL DEFAULT 1,
+     accepted_json   TEXT NOT NULL DEFAULT '{}',
+     dropped_json    TEXT NOT NULL DEFAULT '{}',
+     rejected_json   TEXT NOT NULL DEFAULT '{}',
+     errors_json     TEXT NOT NULL DEFAULT '[]'
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_peer_import_receipts_received_at ON peer_import_receipts (received_at)',
+  'CREATE INDEX IF NOT EXISTS idx_peer_import_receipts_request_id ON peer_import_receipts (request_id)',
+] as const;
+
 /**
  * 0101_market_import_provenance.sql
  * Provider as-of stays in updated_at. received_at is when the push landed.
@@ -1574,6 +1593,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
   // 0099_feed_latency_join_index.sql
   ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
+  // 0100_peer_import_receipts.sql
+  ...PEER_IMPORT_RECEIPT_SCHEMA_STATEMENTS,
   // 0101_market_import_provenance.sql (0100 reserved for peer import receipts in #2634)
   ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
   // 0102_freshness_stream_indexes.sql (#2635)
