@@ -9,8 +9,8 @@ import { describe, it, expect } from 'vitest';
 import {
   ageInDays,
   evaluateFreshness,
+  FRESHNESS_LATEST_SQL,
   FRESHNESS_MAX_AGE_DAYS,
-  FRESHNESS_NEVER_LABEL,
   type FreshnessSnapshot,
 } from '../freshness.ts';
 
@@ -27,7 +27,6 @@ const freshSnapshot: FreshnessSnapshot = {
   insiderLatestDate: daysAgo(2),
   shortVolumeLatestDate: daysAgo(1),
   analystLatest: daysAgo(1),
-  refEnrichmentLatest: daysAgo(1),
 };
 
 describe('ageInDays', () => {
@@ -46,7 +45,7 @@ describe('evaluateFreshness', () => {
     expect(evaluateFreshness(freshSnapshot, NOW)).toEqual([]);
   });
 
-  it('flags never-populated (null) streams as stale', () => {
+  it('skips never-populated streams, including an empty price cohort', () => {
     const snap: FreshnessSnapshot = {
       spxLatestDate: null,
       priceLatestDate: null,
@@ -54,11 +53,19 @@ describe('evaluateFreshness', () => {
       insiderLatestDate: null,
       shortVolumeLatestDate: null,
       analystLatest: null,
-      refEnrichmentLatest: null,
     };
-    const stale = evaluateFreshness(snap, NOW);
-    expect(stale).toHaveLength(7);
-    expect(stale.every((s) => s.latest === FRESHNESS_NEVER_LABEL)).toBe(true);
+    expect(evaluateFreshness(snap, NOW)).toEqual([]);
+  });
+
+  it('does not page a null partner stream next to fresh ones', () => {
+    const snap: FreshnessSnapshot = {
+      ...freshSnapshot,
+      insiderLatestDate: null,
+      shortVolumeLatestDate: null,
+      analystLatest: null,
+      priceLatestDate: null,
+    };
+    expect(evaluateFreshness(snap, NOW)).toEqual([]);
   });
 
   it('flags a stream past its threshold, with stream/age', () => {
@@ -76,7 +83,6 @@ describe('evaluateFreshness', () => {
       insiderLatestDate: daysAgo(FRESHNESS_MAX_AGE_DAYS.insider),
       shortVolumeLatestDate: daysAgo(FRESHNESS_MAX_AGE_DAYS.shortVolume),
       analystLatest: daysAgoIso(FRESHNESS_MAX_AGE_DAYS.analyst),
-      refEnrichmentLatest: daysAgoIso(FRESHNESS_MAX_AGE_DAYS.refEnrichment),
     };
     expect(evaluateFreshness(snap, NOW)).toEqual([]);
   });
@@ -114,19 +120,30 @@ describe('evaluateFreshness', () => {
     expect(streams).toEqual(['insider', 'shortVolume']);
   });
 
-  it('flags analyst and refEnrichment only past the nightly slack threshold', () => {
+  it('flags analyst only past the nightly slack threshold', () => {
     const snap: FreshnessSnapshot = {
       ...freshSnapshot,
       analystLatest: daysAgoIso(6),
-      refEnrichmentLatest: daysAgoIso(6),
     };
     expect(evaluateFreshness(snap, NOW)).toEqual([]);
     const staleSnap: FreshnessSnapshot = {
       ...snap,
       analystLatest: daysAgoIso(9),
-      refEnrichmentLatest: daysAgoIso(9),
     };
     const streams = evaluateFreshness(staleSnap, NOW).map((s) => s.stream);
-    expect(streams).toEqual(['analyst', 'refEnrichment']);
+    expect(streams).toEqual(['analyst']);
+  });
+});
+
+describe('FRESHNESS_LATEST_SQL', () => {
+  it('watches partner EOD dates and imported analyst updated_at, not price_checked_at', () => {
+    expect(FRESHNESS_LATEST_SQL).toContain('SELECT MAX(date) FROM insider_eod');
+    expect(FRESHNESS_LATEST_SQL).toContain('SELECT MAX(date) FROM short_volume_eod');
+    expect(FRESHNESS_LATEST_SQL).toContain(
+      "SELECT MAX(updated_at) FROM analyst_consensus WHERE source = 'imported'",
+    );
+    expect(FRESHNESS_LATEST_SQL).not.toContain('price_checked_at');
+    expect(FRESHNESS_LATEST_SQL).not.toContain('ref_enrichment');
+    expect(FRESHNESS_LATEST_SQL).not.toContain("source = 'imported') AS ref");
   });
 });
