@@ -202,3 +202,45 @@ describe('GET /health/senate-relay', () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe('GET /health/residential-proxy', () => {
+  function proxyEnv(url?: string) {
+    const store = new Map<string, string>();
+    return {
+      ...makeEnv(),
+      RESIDENTIAL_PROXY_URL: url,
+      CONFIG_KV: {
+        get: async (k: string, mode?: string) => {
+          const v = store.get(k) ?? null;
+          if (v === null) return null;
+          return mode === 'json' ? JSON.parse(v) : v;
+        },
+        put: async (k: string, v: string) => { store.set(k, v); },
+      },
+    } as unknown as Env;
+  }
+
+  it('200 with configured=false when RESIDENTIAL_PROXY_URL is unset', async () => {
+    const res = await app.request('http://localhost/health/residential-proxy', {}, proxyEnv());
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; configured: boolean };
+    expect(body.ok).toBe(true);
+    expect(body.configured).toBe(false);
+  });
+
+  it('503 when CONNECT egress fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('Connection refused');
+    }));
+    const res = await app.request(
+      'http://localhost/health/residential-proxy',
+      {},
+      proxyEnv('http://10.99.0.2:8888'),
+    );
+    expect(res.status).toBe(503);
+    const body = await res.json() as { ok: boolean; host: string };
+    expect(body.ok).toBe(false);
+    expect(body.host).toBe('10.99.0.2:8888');
+    vi.unstubAllGlobals();
+  });
+});

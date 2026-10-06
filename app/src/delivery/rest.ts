@@ -8,7 +8,8 @@
  * (YYYY-MM-DD), and filtering by ticker / member / chamber / type.
  *
  * Routes (all relative to /api):
- *   GET   /health/senate-relay  live probe of the named Senate tunnel origin (#1604)
+ *   GET   /health/senate-relay       live probe of the named Senate tunnel origin (#1604)
+ *   GET   /health/residential-proxy  live CONNECT probe of the Mango tinyproxy egress
  *   GET   /transactions      cursor-paged transaction feed (reconciliation backstop)
  *   GET   /feed.xml          RSS 2.0 feed of recent trades (same filters as /transactions)
  *   GET   /stream            SSE live stream (?since= or Last-Event-ID resume)
@@ -31,6 +32,7 @@ import { readBuildInfo } from '../shared/buildInfo.ts';
 import { datadogPublicStatus } from '../shared/datadogRuntime.ts';
 import { getDatadogInitInput } from '../shared/datadog.ts';
 import { checkPipelineHealth, type PipelineHealth } from '../shared/pipelineHealth.ts';
+import { probeResidentialProxyLive } from '../ingestion/residentialProxyHealth.ts';
 import { probeSenateRelay } from '../ingestion/senateRelayHealth.ts';
 import { providerHealthDiagnostics } from '../extraction/providerHealth.ts';
 import { enhanceSenateHtmlDocument } from '../extraction/senatePaperMedia.ts';
@@ -610,6 +612,14 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // is already the uptime-monitor target and must not grow an outbound hop.
   r.get('/health/senate-relay', async (c) => {
     const check = await probeSenateRelay(c.env);
+    c.header('Cache-Control', 'no-store');
+    return c.json(check, check.ok ? 200 : 503);
+  });
+
+  // Live CONNECT probe for the Mango / tinyproxy path (cached in CONFIG_KV for
+  // pipelineHealth `senate_relay` when RESIDENTIAL_PROXY_* is set).
+  r.get('/health/residential-proxy', async (c) => {
+    const check = await probeResidentialProxyLive(c.env);
     c.header('Cache-Control', 'no-store');
     return c.json(check, check.ok ? 200 : 503);
   });
