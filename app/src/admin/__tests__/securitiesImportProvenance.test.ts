@@ -4,6 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildAdminRouter } from '../routes.ts';
+import { MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS } from '../migrations.ts';
 import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
 
 const app = buildAdminRouter();
@@ -72,5 +73,27 @@ describe('POST /securities/import — provider timestamps', () => {
       .get('AN') as { updated_at: string; received_at: string };
     expect(row.updated_at).toBe('2026-05-15T08:30:00Z');
     expect(row.received_at).toMatch(/^2026-/);
+  });
+
+  it('backfills received_at from pre-0101 updated_at and does not overwrite a real receive time', () => {
+    db.exec(
+      `INSERT INTO fundamentals_eod (ticker, date, source, updated_at)
+       VALUES ('OLD', '2026-01-01', 'imported', '2026-06-01T00:00:00Z')`,
+    );
+    db.exec(
+      `INSERT INTO analyst_consensus (ticker, date, source, updated_at, received_at)
+       VALUES ('KEEP', '2026-01-01', 'imported', '2020-01-01T00:00:00Z', '2026-10-01T00:00:00Z')`,
+    );
+    for (const sql of MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS) {
+      if (sql.startsWith('UPDATE ')) db.exec(sql);
+    }
+    const oldRow = db
+      .prepare('SELECT received_at FROM fundamentals_eod WHERE ticker = ?')
+      .get('OLD') as { received_at: string };
+    const keepRow = db
+      .prepare('SELECT received_at FROM analyst_consensus WHERE ticker = ?')
+      .get('KEEP') as { received_at: string };
+    expect(oldRow.received_at).toBe('2026-06-01T00:00:00Z');
+    expect(keepRow.received_at).toBe('2026-10-01T00:00:00Z');
   });
 });

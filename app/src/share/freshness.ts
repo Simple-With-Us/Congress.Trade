@@ -111,7 +111,9 @@ export async function runFreshnessCheck(env: Env, now = new Date()): Promise<Sta
         'AND COALESCE(sr.price_unavailable, 0) = 0 AND sr.latest_price_date IS NOT NULL ' +
         'GROUP BY t.ticker ORDER BY MAX(t.cursor_seq) DESC LIMIT 25' +
         ')) AS price_latest, ' +
-        '(SELECT MAX(updated_at) FROM fundamentals_eod) AS fundamentals_latest',
+        // updated_at is the provider as-of. A backfill or one fresh-dated row
+        // must not drive this alert; received_at is when the push landed.
+        '(SELECT MAX(received_at) FROM fundamentals_eod) AS fundamentals_latest',
     );
     snapshot = {
       spxLatestDate: row?.spx_latest ?? null,

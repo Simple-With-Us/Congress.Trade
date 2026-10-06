@@ -10,6 +10,7 @@ import {
   ageInDays,
   evaluateFreshness,
   FRESHNESS_MAX_AGE_DAYS,
+  runFreshnessCheck,
   type FreshnessSnapshot,
 } from '../freshness.ts';
 
@@ -83,5 +84,32 @@ describe('evaluateFreshness', () => {
     };
     const streams = evaluateFreshness(snap, NOW).map((s) => s.stream);
     expect(streams).toEqual(['spx', 'prices']);
+  });
+});
+
+describe('runFreshnessCheck', () => {
+  it('reads fundamentals freshness from received_at, not provider updated_at', async () => {
+    let sql = '';
+    const db = {
+      prepare(q: string) {
+        sql = q;
+        return {
+          bind() {
+            return this;
+          },
+          async first() {
+            return {
+              spx_latest: '2026-06-24',
+              price_latest: '2026-06-24',
+              fundamentals_latest: '2026-06-24T00:00:00.000Z',
+            };
+          },
+        };
+      },
+    };
+    const stale = await runFreshnessCheck({ DB: db } as never, new Date('2026-06-25T00:00:00Z'));
+    expect(stale).toEqual([]);
+    expect(sql).toContain('MAX(received_at)');
+    expect(sql).not.toContain('updated_at');
   });
 });

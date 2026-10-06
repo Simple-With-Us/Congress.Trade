@@ -14,6 +14,7 @@ import {
   LAG_BUCKETS as SHARED_LAG_BUCKETS,
 } from '@jaywedgeworth22/congress-trading-shared';
 import { computePerformance } from '../prices/compute.ts';
+import { isCurrentPriceFresh } from '../prices/staleness.ts';
 
 /**
  * Estimated dollar value of one STOCK Act bracket. Mirror of
@@ -288,10 +289,8 @@ export function aggregateMemberPerformance(
   const freshThrough = opts.priceFreshThrough?.slice(0, 10);
   for (const r of considered) {
     if (r.isOption) continue;
-    if (freshThrough && r.currentPriceDate) {
-      const d = r.currentPriceDate.slice(0, 10);
-      if (d < freshThrough) continue;
-    }
+    // A missing date is stale, same as the price-anchor SQL and evaluateCurrentPriceStaleness.
+    if (freshThrough && !isCurrentPriceFresh(r.currentPriceDate, freshThrough)) continue;
     const { priceAt, spxAt } = rowAnchors(r, anchor);
     if (priceAt == null || r.currentPrice == null) continue;
     const perf = computePerformance(priceAt, r.currentPrice, spxAt, r.spxNow ?? currentSpx);

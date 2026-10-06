@@ -1122,13 +1122,12 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       return c.json({ available: false, isOption });
     }
     // The asset's current price is the close on current_price_date, so the S&P's
-    // exit leg is the S&P close on or before that SAME day (board row 6c05e09b);
-    // the latest S&P close is only the fallback when the price has no date.
+    // exit leg is the S&P close on or before that SAME day (board row 6c05e09b).
+    // A missing or old price date is stale and returns before these lookups.
+    // latestSpxClose is only the fallback when that day's S&P bar is absent.
     const currentPriceDate = str(row.current_price_date);
     const staleness = evaluateCurrentPriceStaleness(currentPriceDate);
-    const currentSpx =
-      (currentPriceDate ? await closeOnOrBefore(c.env, 'spx_eod', currentPriceDate) : null) ??
-      (await latestSpxClose(c.env));
+    // Stale responses drop both performance legs, so skip the S&P lookups.
     if (staleness.stale) {
       return c.json({
         available: true,
@@ -1148,6 +1147,9 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         estimatedAmounts: true,
       });
     }
+    const currentSpx =
+      (currentPriceDate ? await closeOnOrBefore(c.env, 'spx_eod', currentPriceDate) : null) ??
+      (await latestSpxClose(c.env));
     const perf = computePerformance(priceAtTrade, currentPrice, spxAtTrade, currentSpx);
     const filedDate = str(row.filed_date);
     const priceAtFiling = await closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker));

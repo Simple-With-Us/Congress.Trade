@@ -4489,11 +4489,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
          (SELECT COUNT(*) FROM securities_ref WHERE source = 'imported') AS imported_refs,
          (SELECT COUNT(*) FROM fundamentals_eod WHERE source = 'imported') AS fundamentals_rows,
          (SELECT COUNT(*) FROM analyst_consensus WHERE source = 'imported') AS analyst_rows,
-         (SELECT MAX(updated_at)
+         (SELECT MAX(received_at)
             FROM (
-              SELECT updated_at FROM fundamentals_eod WHERE source = 'imported'
+              SELECT received_at FROM fundamentals_eod WHERE source = 'imported'
               UNION ALL
-              SELECT updated_at FROM analyst_consensus WHERE source = 'imported'
+              SELECT received_at FROM analyst_consensus WHERE source = 'imported'
             )) AS latest_import_at`,
     );
     const appBReceived = appBReceivedRows[0];
