@@ -184,10 +184,16 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Congress.Trade
-        INFOPLIST_KEY_NSExtension_NSExtensionPointIdentifier: com.apple.widgetkit-extension
         SWIFT_VERSION: "5.0"
         SKIP_INSTALL: YES
+    info:
+      path: CongressTradeWidget/Info.plist
+      properties:
+        CFBundleDisplayName: Congress.Trade
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:
       path: CongressTradeWidget/CongressTradeWidget.entitlements
       properties:
