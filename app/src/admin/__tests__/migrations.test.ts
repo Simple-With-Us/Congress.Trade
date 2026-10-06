@@ -71,6 +71,7 @@ import {
   LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
   FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
   MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
+  FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../../benchmark/schema.ts';
 import {
@@ -300,6 +301,7 @@ describe('admin migration bootstrap', () => {
       ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
       ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
       ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
+      ...FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
     ]);
   });
 
@@ -309,6 +311,43 @@ describe('admin migration bootstrap', () => {
     expect(sql).toContain("error LIKE '%phantom%'");
     expect(sql).toContain("DELETE FROM ingestion_outbox");
     expect(sql).toContain("DELETE FROM filings");
+  });
+
+  it('indexes freshness MAX() columns the primary key cannot serve (0102)', async () => {
+    const sql = FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('idx_insider_eod_date');
+    expect(sql).toContain('idx_short_volume_eod_date');
+    expect(sql).toContain('idx_analyst_consensus_source_updated');
+    expect(sql).toContain('analyst_consensus (source, updated_at)');
+
+    const db = await sqliteDatabase();
+    try {
+      db.exec(
+        `CREATE TABLE insider_eod (
+           ticker TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (ticker, date))`,
+      );
+      db.exec(
+        `CREATE TABLE short_volume_eod (
+           ticker TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (ticker, date))`,
+      );
+      db.exec(
+        `CREATE TABLE analyst_consensus (
+           ticker TEXT NOT NULL, date TEXT NOT NULL, source TEXT,
+           updated_at TEXT NOT NULL, PRIMARY KEY (ticker, date))`,
+      );
+      for (const statement of FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS) db.exec(statement);
+      const plan = (query: string) =>
+        db.prepare(`EXPLAIN QUERY PLAN ${query}`).all()
+          .map((row) => String(row.detail))
+          .join('\n');
+      expect(plan('SELECT MAX(date) FROM insider_eod')).toContain('idx_insider_eod_date');
+      expect(plan('SELECT MAX(date) FROM short_volume_eod')).toContain('idx_short_volume_eod_date');
+      expect(plan(
+        "SELECT MAX(updated_at) FROM analyst_consensus WHERE source = 'imported'",
+      )).toContain('idx_analyst_consensus_source_updated');
+    } finally {
+      db.close();
+    }
   });
 
   it('indexes trade_latency_candidates by doc_id for the feed join (0099)', () => {
