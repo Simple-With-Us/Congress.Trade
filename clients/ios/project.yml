@@ -187,14 +187,11 @@ targets:
         INFOPLIST_FILE: CongressTradeWidget/Info.plist
         SWIFT_VERSION: "5.0"
         SKIP_INSTALL: YES
-    info:
-      path: CongressTradeWidget/Info.plist
-      properties:
-        CFBundleDisplayName: Congress.Trade
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    # No `info:` block: `info.path` makes XcodeGen rewrite CongressTradeWidget/Info.plist
+    # from `info.properties` on every `xcodegen generate`. With GENERATE_INFOPLIST_FILE = NO
+    # there is no synthesized-key fallback, so the checked-in plist (NSExtension + XPC! bundle
+    # keys) is the single source of truth — same pattern as excluding CongressTrade/Info.plist
+    # from the app target sources while keeping INFOPLIST_FILE.
     entitlements:
       path: CongressTradeWidget/CongressTradeWidget.entitlements
       properties:
