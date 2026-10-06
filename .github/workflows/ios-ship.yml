@@ -68,7 +68,6 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -164,7 +163,7 @@ jobs:
           fi
           printf '::add-mask::%s\n' "${TOKEN//'%'/'%25'}"
 
-          for name in ASC_KEY_ID ASC_ISSUER_ID \
+          for name in ASC_KEY_ID ASC_ISSUER_ID SENTRY_DSN \
                       IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
             val="$(
               INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
@@ -183,7 +182,7 @@ jobs:
             printf -v "$name" '%s' "$val"
             export "$name"
             # Certificate credentials belong only to this load/import step.
-            if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID ]]; then
+            if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID || "$name" == SENTRY_DSN ]]; then
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
             fi
           done
