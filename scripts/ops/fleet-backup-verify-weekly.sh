@@ -46,13 +46,11 @@ alert_pushover() {
 
 row_count_ok() {
   local db="$1"
-  # Prefer sqlite_schema count (always present); fall back to a table scan.
   local n
   n="$(sqlite3 "$db" "SELECT COUNT(*) FROM sqlite_schema;" 2>/dev/null || echo "")"
   if [[ -z "$n" ]]; then
     return 1
   fi
-  # Empty schema is impossible for a real app DB; treat 0 as fail.
   [[ "$n" -gt 0 ]]
 }
 
@@ -96,11 +94,81 @@ check_dump() {
   rm -f "$tmp"
 }
 
-# Litestream restore via the live app container (credentials already in-process).
-# Mapping: app dir -> container name pattern -> in-container DB path -> config.
+# Find the host PID of the litestream replicate process whose cmdline
+# mentions the given config basename and whose root is this container.
+find_litestream_host_pid() {
+  local c="$1" needle="$2"
+  local cid hp cmd
+  cid="$(docker inspect -f '{{.Id}}' "$c" 2>/dev/null || true)"
+  [ -n "$cid" ] || return 1
+  for hp in $(pgrep -f "litestream replicate" || true); do
+    cmd="$(tr '\0' ' ' < "/proc/$hp/cmdline" 2>/dev/null || true)"
+    printf '%s' "$cmd" | grep -qF "$needle" || continue
+    if grep -q "$cid" "/proc/$hp/cgroup" 2>/dev/null; then
+      echo "$hp"
+      return 0
+    fi
+    if docker top "$c" -eo pid,cmd 2>/dev/null | awk '{print $1}' | grep -qx "$hp"; then
+      echo "$hp"
+      return 0
+    fi
+  done
+  # Last resort on this single-host fleet: unique needle alone.
+  for hp in $(pgrep -f "litestream replicate" || true); do
+    cmd="$(tr '\0' ' ' < "/proc/$hp/cmdline" 2>/dev/null || true)"
+    printf '%s' "$cmd" | grep -qF "$needle" || continue
+    echo "$hp"
+    return 0
+  done
+  return 1
+}
+
+# Write a 0600 env-file with only the S3/Litestream keys the restore needs.
+# Values come from the live litestream process environ (Infisical-injected).
+# File is deleted by the caller; never logged.
+write_litestream_envfile() {
+  local hp="$1" dest="$2"
+  python3 - "$hp" "$dest" <<'PY'
+import sys
+hp, dest = sys.argv[1], sys.argv[2]
+want_exact = {
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_REGION",
+}
+want_prefixes = (
+  "LITESTREAM_S3_",
+  "AWS_S3_",
+)
+keys = {}
+with open(f"/proc/{hp}/environ", "rb") as f:
+  for item in f.read().split(b"\0"):
+    if not item or b"=" not in item:
+      continue
+    k, v = item.split(b"=", 1)
+    ks = k.decode("utf-8", "replace")
+    if ks in want_exact or any(ks.startswith(p) for p in want_prefixes):
+      keys[ks] = v.decode("utf-8", "replace")
+if not keys:
+  raise SystemExit("no litestream/AWS S3 env keys on process")
+with open(dest, "w") as out:
+  for k, v in keys.items():
+    if "\n" in v or "\r" in v:
+      continue
+    out.write(f"{k}={v}\n")
+import os
+os.chmod(dest, 0o600)
+print(f"[weekly-verify] litestream env keys={sorted(keys.keys())}")
+PY
+}
+
+# Litestream restore via the live app container.
+# Credentials are NOT in a bare docker exec shell; they live on the
+# litestream replicate process.  We copy only the S3 key names into a
+# temporary --env-file (0600, deleted in the same tick).
 check_litestream() {
-  local label="$1" name_pat="$2" db_path="$3" config_path="$4" bin_path="$5"
-  local c tmp_host tmp_ctr
+  local label="$1" name_pat="$2" db_path="$3" config_path="$4" bin_path="$5" cmdline_needle="$6"
+  local c tmp_host tmp_ctr hp envfile config_base
   c=$(docker ps --format '{{.Names}}' | grep -E "$name_pat" | head -1 || true)
   if [ -z "$c" ]; then
     echo "WARN $label litestream: no running container matching $name_pat (skip)"
@@ -110,18 +178,36 @@ check_litestream() {
     echo "WARN $label litestream: binary/config missing in $c (skip)"
     return 0
   fi
+  config_base="$(basename "$config_path")"
+  hp="$(find_litestream_host_pid "$c" "$cmdline_needle" || true)"
+  if [ -z "$hp" ]; then
+    echo "FAIL $label litestream: cannot find replicate PID for env"
+    FAIL=1
+    FAIL_MSGS+=("$label litestream env")
+    return 0
+  fi
+  envfile="$(mktemp /tmp/fleet-ls-restore.XXXXXX.env)"
+  chmod 600 "$envfile"
+  if ! write_litestream_envfile "$hp" "$envfile"; then
+    echo "FAIL $label litestream: env extract"
+    FAIL=1
+    FAIL_MSGS+=("$label litestream env")
+    rm -f "$envfile"
+    return 0
+  fi
   tmp_ctr="/tmp/fleet-restore-drill-${label}.db"
   tmp_host="$SCRATCH/litestream-${label}.db"
   rm -f "$tmp_host"
   docker exec "$c" sh -c "rm -f '$tmp_ctr'"
-  if ! docker exec "$c" "$bin_path" restore -config "$config_path" -o "$tmp_ctr" "$db_path"; then
+  if ! docker exec --env-file "$envfile" "$c" "$bin_path" restore -config "$config_path" -o "$tmp_ctr" "$db_path"; then
     echo "FAIL $label litestream: restore"
     FAIL=1
     FAIL_MSGS+=("$label litestream restore")
+    rm -f "$envfile"
     docker exec "$c" sh -c "rm -f '$tmp_ctr'" || true
     return 0
   fi
-  # Copy out for host-side sqlite3 checks (container may lack sqlite3).
+  rm -f "$envfile"
   if ! docker cp "$c:$tmp_ctr" "$tmp_host"; then
     echo "FAIL $label litestream: docker cp"
     FAIL=1
@@ -153,9 +239,9 @@ for d in socratic congress usage-monitor; do
 done
 
 # Litestream restores (one at a time; ST is ~14 GB).
-check_litestream "socratic" 'd83b1aykr03uwr32yhgzaiay' "/app/data/app.db" "/app/litestream.coolify.yml" "/app/data/.bin/litestream"
-check_litestream "congress" 'congress-app' "/data/congress-trade/db.sqlite" "/app/litestream.yml" "/app/bin/litestream"
-check_litestream "usage-monitor" 'yagelvqux9e8l1kztif7bf2o' "/data/prod.db" "/app/litestream.yml" "/app/bin/litestream"
+check_litestream "socratic" 'd83b1aykr03uwr32yhgzaiay' "/app/data/app.db" "/app/litestream.coolify.yml" "/app/data/.bin/litestream" "litestream.coolify.yml"
+check_litestream "congress" 'congress-app' "/data/congress-trade/db.sqlite" "/app/litestream.yml" "/app/bin/litestream" "unstable-cron"
+check_litestream "usage-monitor" 'yagelvqux9e8l1kztif7bf2o' "/data/prod.db" "/app/litestream.yml" "/app/bin/litestream" "run-app-with-replica-heartbeat"
 
 echo "[weekly-verify] done fail=$FAIL"
 echo "NOTE: Hetzner server backups ON - use for full host recovery; this drill is app SQLite only."
