@@ -2907,11 +2907,11 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
   // (covered above alongside the sector canonicalization fix, since both land
   // in the same loadTrSectorFlow() change.)
 
-  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 1-week trial -------
+  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 2-week trial -------
   it('shows $8.99/mo and $79.99/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
     // Each gate is its own surface.  A single shared toContain cannot tell
     // the export note from the alerts note.
-    const canonical = 'Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial';
+    const canonical = 'Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 2-week free trial';
     const exportAt = DASHBOARD_HTML.indexOf('data-premium-cue="export">');
     const alertsAt = DASHBOARD_HTML.indexOf('data-premium-cue="alerts">');
     expect(exportAt).toBeGreaterThan(-1);
@@ -2920,7 +2920,7 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
     expect(DASHBOARD_HTML.slice(alertsAt, alertsAt + 400)).toContain(canonical);
     expect(DASHBOARD_HTML).toContain('$8.99<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).toContain('$79.99<span class="per">/yr</span>');
-    expect(DASHBOARD_HTML).toContain('1-week free trial');
+    expect(DASHBOARD_HTML).toContain('2-week free trial');
     expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).not.toContain('$50<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).not.toContain('$15/mo');
