@@ -193,6 +193,7 @@ import { createRuntimeQueueHandlers } from '../deno/runtimeHandlers.ts';
 import { runScheduledTick } from '../deno/scheduledTick.ts';
 import { requeueFailedDurableJobs } from '../deno/durableQueue.ts';
 import { flushParkedDeliveries, readTargetCircuits, recoverQuarantinedDeliveries } from '../delivery/targetCircuit.ts';
+import { z } from 'zod';
 import { inspectLlmSpend } from '../shared/llmSpend.ts';
 import { runR2UsageSummary } from '../shared/r2Usage.ts';
 import {
@@ -2224,6 +2225,15 @@ async function stampLocalVisionSubmitted(
 }
 
 export const createAdminApp = buildAdminRouter;
+
+const DeliveryRequeueBodySchema = z
+  .object({
+    subscriptionId: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(5000).default(500),
+    ignoreCircuit: z.boolean().default(false),
+    dryRun: z.boolean().default(false),
+  })
+  .strict();
 
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
@@ -5802,24 +5812,28 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   //   { subscriptionId?: string, limit?: number (default 500, max 5000),
   //     ignoreCircuit?: boolean, dryRun?: boolean }
   r.post('/delivery-requeue-quarantined', async (c) => {
-    let body: Record<string, unknown> = {};
+    let json: unknown = {};
     try {
       const raw = await c.req.text();
-      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+      if (raw) json = JSON.parse(raw);
     } catch {
       return c.json({ error: 'invalid JSON body' }, 400);
     }
-    const limit = typeof body.limit === 'number' ? body.limit : 500;
+    const parsed = DeliveryRequeueBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
     try {
       const recovery = await recoverQuarantinedDeliveries(c.env, {
-        subscriptionId: typeof body.subscriptionId === 'string' ? body.subscriptionId : undefined,
-        limit,
-        ignoreCircuit: body.ignoreCircuit === true,
-        dryRun: body.dryRun === true,
+        subscriptionId: body.subscriptionId,
+        limit: body.limit,
+        ignoreCircuit: body.ignoreCircuit,
+        dryRun: body.dryRun,
       });
-      const flushed = body.dryRun === true
+      const flushed = body.dryRun
         ? { scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 }
-        : await flushParkedDeliveries(c.env, { limit: Math.min(limit, 200) });
+        : await flushParkedDeliveries(c.env, { limit: Math.min(body.limit, 200) });
       return c.json({ ok: true, recovery, flushed });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
