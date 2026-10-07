@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import ts from 'typescript';
-import { UsageTelemetryV2EventSchema } from '@jaywedgeworth22/congress-trading-shared';
+import { LegacyUsageTelemetryOutboxEventSchema, UsageTelemetryV2EventSchema } from '@jaywedgeworth22/congress-trading-shared';
 import type { Env, QueueMessage, ThirdPartyUsageTelemetryEvent } from '../types.ts';
 import {
   deliverUsageTelemetryEvent,
@@ -488,6 +488,7 @@ describe('third-party usage telemetry', () => {
     expect(await flushUsageTelemetryFallback(env, { limit: 1 })).toMatchObject({ delivered: 0, failed: 1 });
     expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
     expect(fallback.objects.get(quarantineKey)).toBe(poisonRaw);
+    expect(fallback.put).toHaveBeenCalledTimes(2);
     expect(fallback.objects.has(poisonKey)).toBe(false);
     expect(fallback.put).toHaveBeenCalledWith(quarantineKey, poisonRaw, expect.objectContaining({
       customMetadata: { reason: 'terminal_receiver_rejection' },
@@ -612,6 +613,53 @@ describe('third-party usage telemetry', () => {
     expect(fallback.rows.has(healthy.idempotencyKey)).toBe(false);
     expect(store.has('usage_telemetry_d1_drain_complete')).toBe(false);
     expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+  });
+
+  it('uses one quarantine PUT per canonical R2 rejection with distinct identities', async () => {
+    const events = ['one', 'two'].map((id) => UsageTelemetryV2EventSchema.parse({
+      ...deliveryEvent, eventId: `ct-third-party:${id}`,
+    }));
+    const fallback = fallbackBucket(Object.fromEntries(events.map((event) => [
+      `_ops/usage-telemetry/${encodeURIComponent(event.eventId)}.json`, JSON.stringify(event),
+    ])));
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ...acceptedAck, persisted: 0, rejected: 1 }, { status: 202 })));
+    const env = {
+      RAW_FILES: fallback.bucket, USAGE_MONITOR_ENABLED: 'true',
+      USAGE_MONITOR_INGEST_URL: 'https://usage.example.test', USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+    } as unknown as Env;
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 0, failed: 2 });
+    expect(fallback.put).toHaveBeenCalledTimes(2);
+    for (const event of events) {
+      expect(fallback.objects.get(`_ops/usage-telemetry-quarantine/${encodeURIComponent(event.eventId)}.json`))
+        .toBe(JSON.stringify(event));
+      expect(fallback.objects.has(`_ops/usage-telemetry/${encodeURIComponent(event.eventId)}.json`)).toBe(false);
+    }
+  });
+
+  it.each(['r2', 'd1'])('retains original %s bytes when the canonical copy succeeds but exact-byte quarantine fails', async (source) => {
+    const event = source === 'r2'
+      ? UsageTelemetryV2EventSchema.parse(deliveryEvent)
+      : LegacyUsageTelemetryOutboxEventSchema.parse(legacyDeliveryEvent);
+    const raw = JSON.stringify(event, null, 2);
+    const canonical = JSON.stringify(event);
+    const key = '_ops/usage-telemetry/ct-third-party%3Adelivery-test.json';
+    const fallback = fallbackBucket(source === 'r2' ? { [key]: raw } : {});
+    const legacy = fallbackD1(source === 'd1' ? { [deliveryEvent.eventId]: raw } : {});
+    const put = vi.fn(async (target: string, value: unknown) => {
+      if (value === raw) throw new Error('exact-byte copy unavailable');
+      await fallback.put(target, value);
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ...acceptedAck, persisted: 0, rejected: 1 }, { status: 202 })));
+    const env = {
+      RAW_FILES: { ...fallback.bucket, put }, DB: legacy.db,
+      USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+    } as unknown as Env;
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 0, failed: 1 });
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(fallback.objects.get('_ops/usage-telemetry-quarantine/ct-third-party%3Adelivery-test.json')).toBe(canonical);
+    if (source === 'r2') expect(fallback.objects.get(key)).toBe(raw);
+    else expect(legacy.rows.get(deliveryEvent.eventId)?.event_json).toBe(raw);
   });
 
   it('retains an ambiguous rejection for a different event instead of quarantining it', async () => {
@@ -861,28 +909,30 @@ describe('third-party usage telemetry', () => {
     expect(fallback.rows.has(legacyDeliveryEvent.idempotencyKey)).toBe(true);
   });
 
-  it('finishes the bounded legacy D1 drain after rejected ACKs with a replayable quarantine copy', async () => {
-    const raw = JSON.stringify(legacyDeliveryEvent, null, 2);
+  it.each([false, true])('retires a durably quarantined D1 rejection without repeated delivery (formatted=%s)', async (formatted) => {
+    const raw = JSON.stringify(LegacyUsageTelemetryOutboxEventSchema.parse(legacyDeliveryEvent), null, formatted ? 2 : undefined);
     const fallback = fallbackD1({ [legacyDeliveryEvent.idempotencyKey]: raw });
     const quarantine = fallbackBucket();
     const { kv, store } = fakeConfigKv();
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+    const fetchMock = vi.fn(async () => Response.json({
       ...acceptedAck, persisted: 0, rejected: 1,
       rejections: [{ index: 0, eventId: deliveryEvent.eventId, issues: ['rejected'] }],
-    }, { status: 202 })));
+    }, { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
     const env = {
       RAW_FILES: quarantine.bucket, DB: fallback.db, CONFIG_KV: kv,
       USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
       USAGE_MONITOR_INGEST_TOKEN: 'test-token', USAGE_TELEMETRY_CIRCUIT_FAILURE_THRESHOLD: '1',
     } as unknown as Env;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 0, failed: 1 });
-      expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
-    }
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 0, failed: 1 });
+    expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+    expect(quarantine.put).toHaveBeenCalledTimes(formatted ? 2 : 1);
     expect(fallback.rows.size).toBe(0);
     expect(quarantine.objects.get('_ops/usage-telemetry-quarantine/ct-third-party%3Adelivery-test.json')).toBe(raw);
     await flushUsageTelemetryFallback(env);
     expect(store.has('usage_telemetry_d1_drain_complete')).toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fallback.prepare.mock.calls.some(([sql]) => /UPDATE usage_telemetry_fallback_events/.test(sql))).toBe(false);
   });
 
   it('quarantines a terminal R2 outbox object instead of replaying it forever', async () => {
