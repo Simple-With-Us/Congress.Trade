@@ -691,6 +691,36 @@ class UsageTelemetryDeliveryAckError extends Error {
   }
 }
 
+/** A valid ACK rejected this event, rather than failing the receiver. Queue
+ * ownership may end only after a recoverable quarantine copy exists. */
+class UsageTelemetryDeliveryEventRejectedError extends Error {
+  constructor(readonly quarantined: boolean) {
+    super(quarantined
+      ? 'usage telemetry event rejected; preserved in quarantine for replay'
+      : 'usage telemetry event rejected; quarantine unavailable');
+    this.name = 'UsageTelemetryDeliveryEventRejectedError';
+  }
+}
+
+/** The receiver adds bounded per-event details outside the shared ACK schema.
+ * Validate their request identity before omitting only this known extension.
+ * Counts and all remaining fields still pass the strict shared validator. */
+function usageTelemetryAckPayload(payload: unknown, eventId: string): unknown {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || !('rejections' in payload)) return payload;
+  const { rejections, ...ack } = payload as Record<string, unknown>;
+  if (!Array.isArray(rejections) || rejections.length > 1
+    || (rejections.length > 0 && (ack.received !== 1 || ack.rejected !== 1))
+    || rejections.some((detail) => !detail || typeof detail !== 'object' || Array.isArray(detail)
+      || Object.keys(detail).some((key) => !['index', 'eventId', 'issues'].includes(key))
+      || detail.index !== 0
+      || (detail.eventId !== undefined && detail.eventId !== eventId)
+      || !Array.isArray(detail.issues) || !detail.issues.every((issue: unknown) => typeof issue === 'string'))) {
+    throw new UsageTelemetryDeliveryAckError();
+  }
+  return ack;
+}
+
 function usageTelemetryErrorStatus(error: unknown): number | null {
   if (!error || typeof error !== 'object') return null;
   const candidate = error as { status?: unknown; response?: { status?: unknown } };
@@ -698,12 +728,13 @@ function usageTelemetryErrorStatus(error: unknown): number | null {
   return typeof status === 'number' && Number.isInteger(status) ? status : null;
 }
 
-/** True only for deterministic per-event receiver rejects that cannot become
- * successful when the identical queue payload is retried. The plain-error
+/** True for durably quarantined rejected events or deterministic legacy HTTP
+ * rejections. Malformed/ambiguous ACKs always remain retryable. The plain-error
  * branch keeps the queue boundary compatible with a future shared client that
  * exposes status/message directly instead of the local HTTP wrapper. */
 export function isTerminalUsageTelemetryDeliveryError(error: unknown): boolean {
   if (error instanceof UsageTelemetryCircuitOpenError || error instanceof UsageTelemetryDeliveryAckError) return false;
+  if (error instanceof UsageTelemetryDeliveryEventRejectedError) return error.quarantined;
   if (error instanceof UsageTelemetryDeliveryHttpError) {
     const eventSpecific = /\b(?:schema|idempotency|invalid payload|malformed payload|required.*idempotency|event\s+\d+.*invalid)\b/i.test(error.message);
     return eventSpecific || (error.status === 400 && /\b(?:validation|field|property)\b/i.test(error.message));
@@ -1336,6 +1367,14 @@ export async function deliverUsageTelemetryEvent(
               },
             );
             receiverStatus = response.status;
+            if (response.ok && response.status !== 204 && response.status !== 205) {
+              // Consume the body under the existing delivery deadline. Do not
+              // log or retain receiver-provided rejection detail strings.
+              const payload = usageTelemetryAckPayload(
+                await response.json(), usageTelemetryEventIdentity(event),
+              );
+              return Response.json(payload, { status: response.status });
+            }
             return response;
           },
         });
@@ -1345,14 +1384,26 @@ export async function deliverUsageTelemetryEvent(
         // The shared client validates the v2 ACK shape and bucket sum. Bind
         // it to this one-event request before clearing any durable receipt.
         // Duplicates and pruned events are acknowledged by the v2 contract.
-        if (ack.received !== 1 || ack.rejected !== 0) {
+        if (ack.received !== 1) {
           throw new UsageTelemetryDeliveryAckError();
+        }
+        if (ack.rejected !== 0) {
+          signal?.throwIfAborted();
+          const quarantined = await writeUsageTelemetryQuarantine(
+            (env as Partial<Env>).RAW_FILES,
+            usageTelemetryEventIdentity(event),
+            JSON.stringify(event),
+            'terminal_receiver_rejection',
+          );
+          signal?.throwIfAborted();
+          throw new UsageTelemetryDeliveryEventRejectedError(quarantined);
         }
       } catch (error) {
         if (signal?.aborted) {
           throw signal.reason ?? new Error('durable queue lease lost');
         }
         if (controller.signal.aborted) throw new UsageTelemetryDeliveryTimeoutError();
+        if (error instanceof UsageTelemetryDeliveryEventRejectedError) throw error;
         if (receiverStatus != null && receiverStatus >= 200 && receiverStatus < 300) {
           // Do not expose response bytes, or let a response-schema error
           // match the terminal-event classifier's schema/idempotency words.
@@ -1373,7 +1424,10 @@ export async function deliverUsageTelemetryEvent(
     if (signal?.aborted) {
       throw signal.reason ?? new Error('durable queue lease lost');
     }
-    if (isTerminalUsageTelemetryDeliveryError(error)) {
+    if (error instanceof UsageTelemetryDeliveryEventRejectedError || isTerminalUsageTelemetryDeliveryError(error)) {
+      // A fully validated per-event rejection proves the receiver is healthy.
+      // Even a quarantine write failure must not trip the shared breaker and
+      // prevent unrelated healthy events from making progress.
       const closedPersisted = await recordUsageTelemetryDeliverySuccess(env);
       if (probeLease && closedPersisted) {
         await releaseUsageTelemetryHalfOpenProbe(env, probeLease.token);

@@ -906,6 +906,51 @@ describe('Deno durable queue', () => {
     }
   });
 
+  it('preserves a rejected receipt in quarantine before marking it failed and completing its healthy neighbor', async () => {
+    const harness = await createHarness();
+    try {
+      const poison = {
+        eventId: 'ct-third-party:queue-poison', provider: 'openai', service: 'llm',
+        billingMode: 'actual' as const, metricType: 'usage' as const,
+        requests: 1, confidence: 'actual' as const, occurredAt: START.toISOString(),
+      };
+      const healthy = { ...poison, eventId: 'ct-third-party:queue-healthy' };
+      await harness.ingest.send({ type: 'usage.telemetry', event: poison });
+      await harness.ingest.send({ type: 'usage.telemetry', event: healthy });
+      const quarantine = new Map<string, string>();
+      Object.assign(harness.env, {
+        RAW_FILES: { put: vi.fn(async (key: string, value: string) => { quarantine.set(key, value); }) },
+        USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+        USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+      });
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const eventId = JSON.parse(String(init?.body)).events[0].eventId;
+        const rejected = eventId === poison.eventId ? 1 : 0;
+        return Response.json({
+          ok: true, schemaVersion: 2, received: 1, persisted: 1 - rejected,
+          duplicates: 0, pruned: 0, rejected,
+        }, { status: 202 });
+      }));
+      const handlers = createHandlers({
+        handleIngestMessage,
+        isTerminalDeadLetterError: (_message, error) => {
+          expect(quarantine.get('_ops/usage-telemetry-quarantine/ct-third-party%3Aqueue-poison.json'))
+            .toBe(JSON.stringify(poison));
+          return isTerminalUsageTelemetryDeliveryError(error);
+        },
+      });
+      expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
+        .toEqual({ claimed: 2, completed: 1, retried: 0, failed: 1 });
+      const rows = await harness.rows();
+      expect(rows.map((row) => row.status)).toEqual(['failed', 'completed']);
+      expect(rows[0].last_error).toContain('preserved in quarantine for replay');
+      expect(JSON.parse(String(rows[0].payload))).toEqual({ type: 'usage.telemetry', event: poison });
+    } finally {
+      vi.unstubAllGlobals();
+      harness.client.close();
+    }
+  });
+
   it('terminalizes deterministic telemetry DLQ rejects without re-pending', async () => {
     const harness = await createHarness();
     try {
