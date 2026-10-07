@@ -681,6 +681,16 @@ class UsageTelemetryDeliveryHttpError extends Error {
   }
 }
 
+/** A successful HTTP response is not proof that the receiver accepted this
+ * event. Keep incomplete ACKs retryable, including malformed response bodies:
+ * receiver contract failures must never be classified as poison event data. */
+class UsageTelemetryDeliveryAckError extends Error {
+  constructor() {
+    super('usage telemetry receiver did not acknowledge delivery');
+    this.name = 'UsageTelemetryDeliveryAckError';
+  }
+}
+
 function usageTelemetryErrorStatus(error: unknown): number | null {
   if (!error || typeof error !== 'object') return null;
   const candidate = error as { status?: unknown; response?: { status?: unknown } };
@@ -693,7 +703,7 @@ function usageTelemetryErrorStatus(error: unknown): number | null {
  * branch keeps the queue boundary compatible with a future shared client that
  * exposes status/message directly instead of the local HTTP wrapper. */
 export function isTerminalUsageTelemetryDeliveryError(error: unknown): boolean {
-  if (error instanceof UsageTelemetryCircuitOpenError) return false;
+  if (error instanceof UsageTelemetryCircuitOpenError || error instanceof UsageTelemetryDeliveryAckError) return false;
   if (error instanceof UsageTelemetryDeliveryHttpError) {
     const eventSpecific = /\b(?:schema|idempotency|invalid payload|malformed payload|required.*idempotency|event\s+\d+.*invalid)\b/i.test(error.message);
     return eventSpecific || (error.status === 400 && /\b(?:validation|field|property)\b/i.test(error.message));
@@ -1329,16 +1339,25 @@ export async function deliverUsageTelemetryEvent(
             return response;
           },
         });
-        if (isV2UsageTelemetryEvent(event)) {
-          await client.send([event]);
-        } else {
-          await client.sendLegacyOutbox([event]);
+        const ack = isV2UsageTelemetryEvent(event)
+          ? await client.send([event])
+          : await client.sendLegacyOutbox([event]);
+        // The shared client validates the v2 ACK shape and bucket sum. Bind
+        // it to this one-event request before clearing any durable receipt.
+        // Duplicates and pruned events are acknowledged by the v2 contract.
+        if (ack.received !== 1 || ack.rejected !== 0) {
+          throw new UsageTelemetryDeliveryAckError();
         }
       } catch (error) {
         if (signal?.aborted) {
           throw signal.reason ?? new Error('durable queue lease lost');
         }
         if (controller.signal.aborted) throw new UsageTelemetryDeliveryTimeoutError();
+        if (receiverStatus != null && receiverStatus >= 200 && receiverStatus < 300) {
+          // Do not expose response bytes, or let a response-schema error
+          // match the terminal-event classifier's schema/idempotency words.
+          throw new UsageTelemetryDeliveryAckError();
+        }
         if (receiverStatus != null) {
           const message = error instanceof Error ? error.message : String(error ?? '');
           throw new UsageTelemetryDeliveryHttpError(receiverStatus, message);

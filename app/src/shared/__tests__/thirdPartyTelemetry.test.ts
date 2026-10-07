@@ -8,6 +8,7 @@ import {
   enqueueUsageTelemetryEvent,
   flushUsageTelemetryFallback,
   isUsageTelemetryCircuitOpen,
+  isTerminalUsageTelemetryDeliveryError,
   persistUsageTelemetryFallback,
   providerForThirdPartyRequest,
   recordMeasuredThirdPartyUsage,
@@ -355,6 +356,100 @@ describe('third-party usage telemetry', () => {
       events: [deliveryEvent],
     }]);
     expect(JSON.stringify(requestedBodies)).not.toMatch(/sourceApp|idempotencyKey|keyRef/);
+  });
+
+  const acceptedAck = {
+    ok: true, schemaVersion: 2, received: 1,
+    persisted: 1, duplicates: 0, pruned: 0, rejected: 0,
+  };
+  const incompleteAcks = [
+    ['full rejection', { ...acceptedAck, persisted: 0, rejected: 1 }],
+    ['rejection with receiver details', {
+      ...acceptedAck, persisted: 0, rejected: 1,
+      rejections: [{ index: 0, reason: 'private-response-value' }],
+    }],
+    ['partial rejection for the wrong batch', { ...acceptedAck, received: 2, rejected: 1 }],
+    ['empty acknowledgement', { ...acceptedAck, received: 0, persisted: 0 }],
+    ['wrong received count', { ...acceptedAck, received: 2, persisted: 2 }],
+    ['inconsistent sum', { ...acceptedAck, persisted: 0 }],
+    ['negative count', { ...acceptedAck, duplicates: -1, persisted: 2 }],
+    ['fractional count', { ...acceptedAck, duplicates: 0.5, persisted: 0.5 }],
+    ['missing counts', { ok: true, schemaVersion: 2 }],
+    ['wrong version', { ...acceptedAck, schemaVersion: 1 }],
+    ['unexpected schema field', { ...acceptedAck, schema: 'private-response-value' }],
+    ['malformed JSON', 'not-json'],
+  ] as const;
+
+  it.each(incompleteAcks)('retains the original R2 event on a 202 with %s', async (_label, ack) => {
+    const raw = JSON.stringify(deliveryEvent);
+    const key = '_ops/usage-telemetry/ct-third-party%3Adelivery-test.json';
+    const fallback = fallbackBucket({ [key]: raw });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      typeof ack === 'string' ? ack : JSON.stringify(ack), { status: 202 },
+    )));
+    const env = {
+      RAW_FILES: fallback.bucket,
+      USAGE_MONITOR_ENABLED: 'true',
+      USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+    } as unknown as Env;
+
+    await expect(deliverUsageTelemetryEvent(env, deliveryEvent)).rejects.toSatisfy((error: unknown) => {
+      expect(isTerminalUsageTelemetryDeliveryError(error)).toBe(false);
+      expect(String(error)).not.toContain('private-response-value');
+      return true;
+    });
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 0, failed: 1 });
+    expect(fallback.objects.get(key)).toBe(raw);
+    expect(fallback.bucket.delete).not.toHaveBeenCalled();
+    expect(fallback.put).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['persisted', { ...acceptedAck }],
+    ['duplicate', { ...acceptedAck, persisted: 0, duplicates: 1 }],
+    ['pruned', { ...acceptedAck, persisted: 0, pruned: 1 }],
+  ])('removes an R2 receipt only after a valid %s ACK', async (_label, ack) => {
+    const key = '_ops/usage-telemetry/ct-third-party%3Adelivery-test.json';
+    const fallback = fallbackBucket({ [key]: JSON.stringify(deliveryEvent) });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(ack), { status: 202 })));
+    const env = {
+      RAW_FILES: fallback.bucket,
+      USAGE_MONITOR_ENABLED: 'true',
+      USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+    } as unknown as Env;
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 1, failed: 0 });
+    expect(fallback.objects.has(key)).toBe(false);
+  });
+
+  it.each([
+    ['v2', deliveryEvent], ['legacy', legacyDeliveryEvent],
+  ])('retries a rejected %s event with unchanged identity and accepts a duplicate ACK', async (_label, event) => {
+    const key = '_ops/usage-telemetry/ct-third-party%3Adelivery-test.json';
+    const raw = JSON.stringify(event);
+    const fallback = fallbackBucket({ [key]: raw });
+    const bodies: unknown[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      const ack = bodies.length === 1
+        ? { ...acceptedAck, persisted: 0, rejected: 1 }
+        : { ...acceptedAck, persisted: 0, duplicates: 1 };
+      return new Response(JSON.stringify(ack), { status: 202 });
+    }));
+    const env = {
+      RAW_FILES: fallback.bucket,
+      USAGE_MONITOR_ENABLED: 'true',
+      USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+    } as unknown as Env;
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 0, failed: 1 });
+    expect(fallback.objects.get(key)).toBe(raw);
+    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 1, failed: 0 });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[0]).toMatchObject({ events: [{ eventId: deliveryEvent.eventId }] });
+    expect(fallback.objects.has(key)).toBe(false);
   });
 
   it('persists the exact idempotent event to the R2 fallback when Queue hand-off fails', async () => {

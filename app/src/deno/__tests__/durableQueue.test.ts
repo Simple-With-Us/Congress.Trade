@@ -1,4 +1,6 @@
 import { createClient } from '@libsql/client';
+import { handleIngestMessage } from '../../queueHandlers.ts';
+import { isTerminalUsageTelemetryDeliveryError } from '../../shared/thirdPartyTelemetry.ts';
 import { describe, expect, it, vi } from 'vitest';
 import type { Env, QueueMessage } from '../../shared/types.ts';
 import {
@@ -818,6 +820,54 @@ describe('Deno durable queue', () => {
       expect(row).toMatchObject({ status: 'failed', dead_letter_pending: 0 });
       expect(String(row.last_error)).toContain('dead-letter recovery budget exhausted');
     } finally {
+      harness.client.close();
+    }
+  });
+
+  it('retries a rejected 202 usage ACK without completing the receipt, then accepts the same event as a duplicate', async () => {
+    const harness = await createHarness();
+    try {
+      const event = {
+        eventId: 'ct-third-party:queue-ack-test',
+        provider: 'openai', service: 'llm', billingMode: 'actual' as const,
+        metricType: 'usage' as const, quantity: 1, unit: 'request', requests: 1,
+        confidence: 'actual' as const, occurredAt: START.toISOString(),
+      };
+      const message: QueueMessage = { type: 'usage.telemetry', event };
+      await harness.ingest.send(message);
+      Object.assign(harness.env, {
+        USAGE_MONITOR_ENABLED: 'true',
+        USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+        USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+      });
+      const bodies: unknown[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({
+          ok: true, schemaVersion: 2, received: 1, persisted: 0, pruned: 0,
+          rejected: bodies.length === 1 ? 1 : 0,
+          duplicates: bodies.length === 1 ? 0 : 1,
+        }), { status: 202 });
+      }));
+      const handlers = createHandlers({
+        handleIngestMessage,
+        isTerminalDeadLetterError: (_message, error) => isTerminalUsageTelemetryDeliveryError(error),
+      });
+      expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
+        .toEqual({ claimed: 1, completed: 0, retried: 1, failed: 0 });
+      const row = (await harness.rows())[0];
+      expect(row.status).toBe('pending');
+      expect(JSON.parse(String(row.payload))).toEqual(message);
+      expect(handlers.completeIngestionOutbox).not.toHaveBeenCalled();
+
+      harness.setNow(new Date(String(row.available_at)));
+      expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
+        .toEqual({ claimed: 1, completed: 1, retried: 0, failed: 0 });
+      expect(bodies).toHaveLength(2);
+      expect(bodies[1]).toEqual(bodies[0]);
+      expect((await harness.rows())[0].status).toBe('completed');
+    } finally {
+      vi.unstubAllGlobals();
       harness.client.close();
     }
   });
