@@ -1350,6 +1350,7 @@ export async function deliverUsageTelemetryEvent(
         usageTelemetryDeliveryTimeoutMs(env),
       );
       let receiverStatus: number | null = null;
+      let eventRejected = false;
       try {
         signal?.throwIfAborted();
         const client = createUsageTelemetryClient({
@@ -1387,23 +1388,12 @@ export async function deliverUsageTelemetryEvent(
         if (ack.received !== 1) {
           throw new UsageTelemetryDeliveryAckError();
         }
-        if (ack.rejected !== 0) {
-          signal?.throwIfAborted();
-          const quarantined = await writeUsageTelemetryQuarantine(
-            (env as Partial<Env>).RAW_FILES,
-            usageTelemetryEventIdentity(event),
-            JSON.stringify(event),
-            'terminal_receiver_rejection',
-          );
-          signal?.throwIfAborted();
-          throw new UsageTelemetryDeliveryEventRejectedError(quarantined);
-        }
+        eventRejected = ack.rejected !== 0;
       } catch (error) {
         if (signal?.aborted) {
           throw signal.reason ?? new Error('durable queue lease lost');
         }
         if (controller.signal.aborted) throw new UsageTelemetryDeliveryTimeoutError();
-        if (error instanceof UsageTelemetryDeliveryEventRejectedError) throw error;
         if (receiverStatus != null && receiverStatus >= 200 && receiverStatus < 300) {
           // Do not expose response bytes, or let a response-schema error
           // match the terminal-event classifier's schema/idempotency words.
@@ -1418,6 +1408,19 @@ export async function deliverUsageTelemetryEvent(
         // Keep the same deadline active through response-body parsing and
         // response-schema validation, not just until fetch returns headers.
         clearTimeout(timer);
+      }
+      if (eventRejected) {
+        // Persistence has its own failure mode; it must not inherit the
+        // receiver deadline or turn a healthy receiver into a global outage.
+        signal?.throwIfAborted();
+        const quarantined = await writeUsageTelemetryQuarantine(
+          (env as Partial<Env>).RAW_FILES,
+          usageTelemetryEventIdentity(event),
+          JSON.stringify(event),
+          'terminal_receiver_rejection',
+        );
+        signal?.throwIfAborted();
+        throw new UsageTelemetryDeliveryEventRejectedError(quarantined);
       }
     });
   } catch (error) {
@@ -1442,6 +1445,38 @@ export async function deliverUsageTelemetryEvent(
   if (probeLease && closedPersisted) {
     await releaseUsageTelemetryHalfOpenProbe(env, probeLease.token);
   }
+}
+
+interface UsageTelemetryDrainCursor {
+  r2?: string;
+  d1?: { updatedAt: string; idempotencyKey: string };
+}
+const USAGE_TELEMETRY_DRAIN_CURSOR_KEY = 'usage_telemetry_drain_cursor';
+const usageTelemetryDrainCursors = new WeakMap<Env, UsageTelemetryDrainCursor>();
+
+async function readUsageTelemetryDrainCursor(env: Env): Promise<UsageTelemetryDrainCursor> {
+  let value: unknown = usageTelemetryDrainCursors.get(env);
+  try {
+    if (value === undefined && env.CONFIG_KV?.get) value = await env.CONFIG_KV.get(USAGE_TELEMETRY_DRAIN_CURSOR_KEY, 'json');
+  } catch { /* A cursor outage must not authorize removing retained data. */ }
+  if (!value || typeof value !== 'object') return {};
+  const cursor = value as UsageTelemetryDrainCursor;
+  return {
+    ...(typeof cursor.r2 === 'string' && cursor.r2 ? { r2: cursor.r2 } : {}),
+    ...(cursor.d1 && typeof cursor.d1.updatedAt === 'string' && typeof cursor.d1.idempotencyKey === 'string'
+      ? { d1: { ...cursor.d1 } } : {}),
+  };
+}
+
+async function writeUsageTelemetryDrainCursor(env: Env, cursor: UsageTelemetryDrainCursor): Promise<void> {
+  try {
+    if (env.CONFIG_KV?.put) {
+      await env.CONFIG_KV.put(USAGE_TELEMETRY_DRAIN_CURSOR_KEY, JSON.stringify(cursor));
+      usageTelemetryDrainCursors.delete(env);
+      return;
+    }
+  } catch { /* Keep same-isolate progress without weakening durability. */ }
+  usageTelemetryDrainCursors.set(env, cursor);
 }
 
 export interface UsageTelemetryFallbackFlushResult {
@@ -1477,18 +1512,42 @@ export async function flushUsageTelemetryFallback(
   if (await isUsageTelemetryCircuitOpen(env)) {
     return { listed: 0, delivered: 0, failed: 0, expired: 0, skipped: true };
   }
+  const cursor = await readUsageTelemetryDrainCursor(env);
+  const initialCursor = JSON.stringify(cursor);
+  try {
+    return await drainUsageTelemetryFallbackPage(env, options, cursor);
+  } finally {
+    if (JSON.stringify(cursor) !== initialCursor) await writeUsageTelemetryDrainCursor(env, cursor);
+  }
+}
+
+async function drainUsageTelemetryFallbackPage(
+  env: Env,
+  options: { limit?: number },
+  cursor: UsageTelemetryDrainCursor,
+): Promise<UsageTelemetryFallbackFlushResult> {
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 25)));
   const storage = (env as Partial<Env>).RAW_FILES;
   const db = (env as Partial<Env>).DB;
   const ttlMs = usageTelemetryFallbackTtlMs(env);
   const now = Date.now();
   const r2Available = Boolean(storage?.list);
+  const startingR2Cursor = cursor.r2;
   const listed = storage?.list
     ? await storage.list({
         prefix: USAGE_TELEMETRY_FALLBACK_PREFIX,
         limit,
+        ...(startingR2Cursor ? { cursor: startingR2Cursor } : {}),
+      }).catch((error) => {
+        // A stale continuation token must not permanently wedge the drain.
+        delete cursor.r2;
+        throw error;
       })
     : { objects: [] as R2Object[], truncated: false as const };
+  if (r2Available) {
+    if (listed.truncated && 'cursor' in listed) cursor.r2 = listed.cursor;
+    else delete cursor.r2;
+  }
   let delivered = 0;
   let failed = 0;
   let expired = 0;
@@ -1539,11 +1598,11 @@ export async function flushUsageTelemetryFallback(
     }
   }
   // Maintain the O(1) admission counter. When the bounded list was the entire
-  // outbox (not truncated), the exact remainder is known, so set it
+  // outbox (not truncated and starting at the prefix), the exact remainder is known, so set it
   // authoritatively — this self-heals any drift, including R2 objects that
   // predate the counter. Otherwise best-effort decrement by what we removed.
   if (r2Available) {
-    if (!listed.truncated) {
+    if (!listed.truncated && !startingR2Cursor) {
       await writeUsageTelemetryOutboxCount(env, Math.max(0, listed.objects.length - r2Removed));
     } else if (r2Removed > 0) {
       await adjustUsageTelemetryOutboxCount(env, -r2Removed);
@@ -1553,15 +1612,29 @@ export async function flushUsageTelemetryFallback(
   const d1DrainComplete = await isUsageTelemetryD1DrainComplete(env);
   if (remainingLimit > 0 && db?.prepare && !d1DrainComplete) {
     try {
-      const rows = await db.prepare(
-        `SELECT idempotency_key, event_json, attempts
-           FROM usage_telemetry_fallback_events
-          ORDER BY updated_at ASC
-          LIMIT ?`,
-      )
-        .bind(Math.min(remainingLimit, usageTelemetryD1DrainLimit(env)))
-        .all<{ idempotency_key: string; event_json: string; attempts: number }>();
+      type LegacyRow = { idempotency_key: string; event_json: string; attempts: number; updated_at: string };
+      const readPage = async (after?: UsageTelemetryDrainCursor['d1']) => {
+        const where = after ? 'WHERE updated_at > ? OR (updated_at = ? AND idempotency_key > ?)' : '';
+        const params: unknown[] = after ? [after.updatedAt, after.updatedAt, after.idempotencyKey] : [];
+        return await db.prepare(
+          `SELECT idempotency_key, event_json, attempts, updated_at
+             FROM usage_telemetry_fallback_events
+             ${where}
+            ORDER BY updated_at ASC, idempotency_key ASC
+            LIMIT ?`,
+        ).bind(...params, Math.min(remainingLimit, usageTelemetryD1DrainLimit(env))).all<LegacyRow>();
+      };
+      let rows = await readPage(cursor.d1);
+      if (cursor.d1 && !(rows.results?.length)) {
+        // An empty suffix is not an empty table. Wrap and verify its head
+        // before setting the one-time drain-complete marker.
+        delete cursor.d1;
+        rows = await readPage();
+      }
       const results = rows.results ?? [];
+      const lastRow = results.at(-1);
+      if (lastRow) cursor.d1 = { updatedAt: lastRow.updated_at, idempotencyKey: lastRow.idempotency_key };
+      else delete cursor.d1;
       for (const row of results) {
         let event: DeliverableUsageTelemetryEvent | null = null;
         try {

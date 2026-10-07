@@ -81,11 +81,14 @@ function fallbackBucket(initial: Record<string, string> = {}, uploadedAt: Record
       const value = objects.get(key);
       return value == null ? null : { text: async () => value };
     },
-    async list(options?: { prefix?: string; limit?: number }) {
+    async list(options?: { prefix?: string; limit?: number; cursor?: string }) {
       const filtered = [...objects.keys()]
-        .filter((key) => !options?.prefix || key.startsWith(options.prefix));
+        .filter((key) => (!options?.prefix || key.startsWith(options.prefix))
+          && (!options?.cursor || key > options.cursor)).sort();
       const keys = filtered.slice(0, options?.limit ?? filtered.length);
-      return { objects: keys.map((key) => ({ key, uploaded: uploadedAt[key] })), truncated: false };
+      const truncated = keys.length < filtered.length;
+      return { objects: keys.map((key) => ({ key, uploaded: uploadedAt[key] })), truncated,
+        ...(truncated ? { cursor: keys.at(-1) } : {}) };
     },
   } as unknown as R2Bucket;
   return { bucket, objects, put, remove };
@@ -192,14 +195,19 @@ function fallbackD1(initial: Record<string, string> = {}) {
       },
       async all<T>() {
         if (/FROM usage_telemetry_fallback_events/i.test(sql)) {
-          const limit = Math.max(0, Number(params[0] ?? rows.size));
-          // Mirror ORDER BY updated_at ASC so "move failing row to the back" is observable.
-          const ordered = [...rows.entries()].sort((a, b) => a[1].updated_at.localeCompare(b[1].updated_at));
+          const limit = Math.max(0, Number(params.at(-1) ?? rows.size));
+          const after = params.length > 1 ? { stamp: String(params[0]), key: String(params[2]) } : undefined;
+          // Mirror the deterministic keyset ordering used by the bounded drain.
+          const ordered = [...rows.entries()]
+            .filter(([key, row]) => !after || row.updated_at > after.stamp
+              || (row.updated_at === after.stamp && key > after.key))
+            .sort((a, b) => a[1].updated_at.localeCompare(b[1].updated_at) || a[0].localeCompare(b[0]));
           return {
             results: ordered.slice(0, limit).map(([idempotency_key, row]) => ({
               idempotency_key,
               event_json: row.event_json,
               attempts: row.attempts,
+              updated_at: row.updated_at,
             })) as T[],
           };
         }
@@ -452,11 +460,11 @@ describe('third-party usage telemetry', () => {
   });
 
   it.each([false, true])('quarantines a rejected event before healthy events without tripping the shared breaker (details=%s)', async (withDetails) => {
-    const poison = { ...deliveryEvent, eventId: 'ct-third-party:poison' };
-    const healthy = { ...deliveryEvent, eventId: 'ct-third-party:healthy' };
-    const poisonKey = '_ops/usage-telemetry/ct-third-party%3Apoison.json';
-    const healthyKey = '_ops/usage-telemetry/ct-third-party%3Ahealthy.json';
-    const quarantineKey = '_ops/usage-telemetry-quarantine/ct-third-party%3Apoison.json';
+    const poison = { ...deliveryEvent, eventId: 'ct-third-party:aaa-poison' };
+    const healthy = { ...deliveryEvent, eventId: 'ct-third-party:zzz-healthy' };
+    const poisonKey = '_ops/usage-telemetry/ct-third-party%3Aaaa-poison.json';
+    const healthyKey = '_ops/usage-telemetry/ct-third-party%3Azzz-healthy.json';
+    const quarantineKey = '_ops/usage-telemetry-quarantine/ct-third-party%3Aaaa-poison.json';
     const poisonRaw = JSON.stringify(poison, null, 2);
     const fallback = fallbackBucket({ [poisonKey]: poisonRaw, [healthyKey]: JSON.stringify(healthy) });
     const { kv } = fakeConfigKv();
@@ -501,14 +509,21 @@ describe('third-party usage telemetry', () => {
     expect(fallback.objects.get(quarantineKey)).toBe(poisonRaw);
   });
 
-  it('keeps rejected data retryable when quarantine fails and still delivers a healthy neighbor', async () => {
-    const poison = { ...deliveryEvent, eventId: 'ct-third-party:poison' };
-    const healthy = { ...deliveryEvent, eventId: 'ct-third-party:healthy' };
-    const poisonKey = '_ops/usage-telemetry/ct-third-party%3Apoison.json';
-    const healthyKey = '_ops/usage-telemetry/ct-third-party%3Ahealthy.json';
+  it.each([false, true])('advances a one-object R2 cursor past failed quarantine without undercounting retained data (cursor write failure=%s)', async (cursorWriteFails) => {
+    const poison = { ...deliveryEvent, eventId: 'ct-third-party:aaa-poison' };
+    const healthy = { ...deliveryEvent, eventId: 'ct-third-party:zzz-healthy' };
+    const poisonKey = '_ops/usage-telemetry/ct-third-party%3Aaaa-poison.json';
+    const healthyKey = '_ops/usage-telemetry/ct-third-party%3Azzz-healthy.json';
     const poisonRaw = JSON.stringify(poison);
     const fallback = fallbackBucket({ [poisonKey]: poisonRaw, [healthyKey]: JSON.stringify(healthy) });
-    const { kv } = fakeConfigKv();
+    const { kv, store } = fakeConfigKv({ usage_telemetry_outbox_count: '2' });
+    if (cursorWriteFails) {
+      const originalPut = kv.put.bind(kv);
+      kv.put = vi.fn(async (key: string, value: string) => {
+        if (key === 'usage_telemetry_drain_cursor') throw new Error('cursor write unavailable');
+        await originalPut(key, value);
+      }) as KVNamespace['put'];
+    }
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const eventId = JSON.parse(String(init?.body)).events[0].eventId;
       return Response.json(eventId === poison.eventId
@@ -524,9 +539,78 @@ describe('third-party usage telemetry', () => {
       expect(isTerminalUsageTelemetryDeliveryError(error)).toBe(false);
       return true;
     });
-    expect(await flushUsageTelemetryFallback(env)).toMatchObject({ delivered: 1, failed: 1 });
+    expect(await flushUsageTelemetryFallback(env, { limit: 1 })).toMatchObject({ delivered: 0, failed: 1 });
+    expect(store.get('usage_telemetry_outbox_count')).toBe('2');
+    expect(await flushUsageTelemetryFallback(cursorWriteFails ? env : { ...env }, { limit: 1 })).toMatchObject({ delivered: 1, failed: 0 });
+    expect(store.get('usage_telemetry_outbox_count')).toBe('1');
+    expect(await flushUsageTelemetryFallback(env, { limit: 1 })).toMatchObject({ delivered: 0, failed: 1 });
     expect(fallback.objects.get(poisonKey)).toBe(poisonRaw);
     expect(fallback.objects.has(healthyKey)).toBe(false);
+    expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+  });
+
+  it('ends the receiver deadline before slow quarantine storage', async () => {
+    vi.useFakeTimers();
+    const { kv } = fakeConfigKv();
+    const quarantine = fallbackBucket();
+    let finishPut!: () => void;
+    const put = vi.fn(async (key: string, value: unknown) => {
+      await new Promise<void>((resolve) => { finishPut = resolve; });
+      await quarantine.put(key, value);
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ ...acceptedAck, persisted: 0, rejected: 1 }, { status: 202 })));
+    const env = {
+      RAW_FILES: { ...quarantine.bucket, put }, CONFIG_KV: kv,
+      USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token', USAGE_TELEMETRY_DELIVERY_TIMEOUT_MS: '10',
+      USAGE_TELEMETRY_CIRCUIT_FAILURE_THRESHOLD: '1',
+    } as unknown as Env;
+    const delivery = deliverUsageTelemetryEvent(env, deliveryEvent);
+    const check = expect(delivery).rejects.toSatisfy((error: unknown) => {
+      expect(isTerminalUsageTelemetryDeliveryError(error)).toBe(true);
+      expect(String(error)).toContain('preserved in quarantine');
+      return true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(put).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(2_000);
+    finishPut();
+    await check;
+    expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+    expect(quarantine.objects.size).toBe(1);
+  });
+
+  it('advances a one-row legacy D1 cursor past failed quarantine and never mistakes an empty suffix for completion', async () => {
+    const poison = { ...legacyDeliveryEvent, idempotencyKey: 'ct-third-party:aaa-poison' };
+    const healthy = { ...legacyDeliveryEvent, idempotencyKey: 'ct-third-party:zzz-healthy' };
+    const raw = JSON.stringify(poison);
+    const fallback = fallbackD1({ [poison.idempotencyKey]: raw, [healthy.idempotencyKey]: JSON.stringify(healthy) });
+    // Exercise the identity tie-breaker, not just timestamps.
+    for (const row of fallback.rows.values()) row.updated_at = '2026-07-22T16:00:00.000Z';
+    const { kv, store } = fakeConfigKv();
+    const submitted: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const eventId = JSON.parse(String(init?.body)).events[0].eventId;
+      submitted.push(eventId);
+      return Response.json(eventId === poison.idempotencyKey
+        ? { ...acceptedAck, persisted: 0, rejected: 1 } : acceptedAck, { status: 202 });
+    }));
+    const env = {
+      RAW_FILES: { list: vi.fn(async () => ({ objects: [], truncated: false })),
+        put: vi.fn(async () => { throw new Error('unavailable'); }) },
+      DB: fallback.db, CONFIG_KV: kv, USAGE_MONITOR_ENABLED: 'true',
+      USAGE_MONITOR_INGEST_URL: 'https://usage.example.test', USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+      USAGE_TELEMETRY_CIRCUIT_FAILURE_THRESHOLD: '1',
+    } as unknown as Env;
+    expect(await flushUsageTelemetryFallback(env, { limit: 1 })).toMatchObject({ delivered: 0, failed: 1 });
+    expect(await flushUsageTelemetryFallback({ ...env }, { limit: 1 })).toMatchObject({ delivered: 1, failed: 0 });
+    // Empty continuation wraps and retries the retained head; it is not done.
+    expect(await flushUsageTelemetryFallback(env, { limit: 1 })).toMatchObject({ delivered: 0, failed: 1 });
+    expect(submitted).toEqual([poison.idempotencyKey, healthy.idempotencyKey, poison.idempotencyKey]);
+    expect(fallback.rows.get(poison.idempotencyKey)?.event_json).toBe(raw);
+    expect(fallback.rows.get(poison.idempotencyKey)?.attempts).toBe(0);
+    expect(fallback.rows.has(healthy.idempotencyKey)).toBe(false);
+    expect(store.has('usage_telemetry_d1_drain_complete')).toBe(false);
     expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
   });
 
@@ -947,7 +1031,7 @@ describe('third-party usage telemetry', () => {
 
   it('does not let one poison legacy D1 row wedge the drain: quarantines it after a bounded budget while rows behind it still deliver', async () => {
     // Oldest row is permanently unparseable (poison); a good row sits behind it.
-    const poisonKey = 'ct-third-party:poison-legacy-row';
+    const poisonKey = 'ct-third-party:aaa-poison-legacy-row';
     const goodEvent = { ...legacyDeliveryEvent, idempotencyKey: 'ct-third-party:good-legacy-row' };
     const fallback = fallbackD1({
       [poisonKey]: 'not-valid-json{',
