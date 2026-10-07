@@ -11295,9 +11295,12 @@ function isLatencyComparisonPublic(p) {
 function speedBoastProvider(d) {
   var best = null;
   (d.providers || []).filter(function (p) {
-    return isLatencyComparisonPublic(p) &&
-      p.matched >= SPEED_LANE_MIN_MATCHED && p.comparisonStatus === 'usable' &&
-      Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT && Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
+    if (String(p.id).indexOf('fmp') === 0) return false; // TODO: temporarily hide FMP from public until we are confident in its accuracy
+    var preliminaryOk = p.comparisonStatus === 'preliminary' &&
+      Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT &&
+      Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
+    return isLatencyComparisonPublic(p) && p.matched >= SPEED_LANE_MIN_MATCHED &&
+      (p.comparisonStatus === 'usable' || preliminaryOk);
   })
     .forEach(function (p) { if (!best || p.matched > best.matched) best = p; });
   return best && best.matched >= SPEED_BOAST_MIN_MATCHED && (best.medianLeadSec || 0) > 0 ? best : null;
@@ -11314,11 +11317,12 @@ function isLatencyAhead(summary) {
   var ahead = 0, behind = 0;
   (summary.providers || []).forEach(function (p) {
     if (!isLatencyComparisonPublic(p)) return;
+    if (p.id === 'fmp' || String(p.id).indexOf('fmp') === 0) return; // TODO: temporarily hide FMP from public until we are confident in its accuracy
     var wins = p.usFirstCount || 0, losses = p.providerFirstCount || 0, ties = p.tieCount || 0;
     var deltaSample = wins + losses + ties;
     var hasLead = p.avgLeadSec != null || p.medianLeadSec != null;
     var hasTiming = p.matched >= SPEED_LANE_MIN_MATCHED && deltaSample > 0 && hasLead;
-    var adequate = hasTiming && p.comparisonStatus === 'usable';
+    var adequate = hasTiming && (p.comparisonStatus === 'usable' || p.comparisonStatus === 'preliminary');
     if (!adequate) return;
     var headline = p.medianLeadSec != null ? p.medianLeadSec : p.avgLeadSec;
     var verdict = leadVerdict(headline, p.avgLeadSec);
@@ -11593,7 +11597,7 @@ function renderSpeedProof() {
   fetchLatencySummary().then(function (d) {
     function byMatched(a, b) { return b.matched - a.matched; }
     var adminProvs = (d.adminProviders && d.adminProviders.length ? d.adminProviders : (d.providers || [])).slice().sort(byMatched);
-    var publicProvs = (d.providers || []).filter(isLatencyComparisonPublic).slice().sort(byMatched);
+    var publicProvs = (d.providers || []).filter(function(p) { return isLatencyComparisonPublic(p) && String(p.id).indexOf('fmp') !== 0; /* TODO: temporarily hidden */ }).slice().sort(byMatched);
     var hasAdminData = !!(d.totals && d.totals.racedDisclosures && adminProvs.length);
     var hasPublicData = !!(d.totals && d.totals.racedDisclosures && publicProvs.length);
 
@@ -13221,6 +13225,7 @@ function pricingCopy(intent) {
     features: [
       'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
       'Live SSE stream of every new filing — no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
   if (intent === 'export') return {
@@ -13230,6 +13235,7 @@ function pricingCopy(intent) {
       'Full-history CSV export with ticker, member, type, chamber, and date filters',
       'Instant filing alerts — signed webhooks (HMAC-verified) to any URL',
       'Live SSE stream of every new filing — no polling',
+      'Proprietary enrichment data in every payload',
     ],
   };
   return {
