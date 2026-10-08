@@ -35,6 +35,7 @@ import {
   OG_IMAGE_POLITICIAN_PNG,
   OG_IMAGE_TRENDS_PNG,
   SITE_WEBMANIFEST,
+  SIMPLE_WITH_US_WEBP,
   SWU_LOGO_WEBP,
   ZILLA_SLAB_WOFF2,
   type StaticAsset,
@@ -367,6 +368,7 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   r.get('/assets/brand-logo.png', serveAsset(BRAND_LOGO_PNG, IMMUTABLE));
   r.get('/assets/brand-logo-dark.png', serveAsset(BRAND_LOGO_DARK_PNG, IMMUTABLE));
   r.get('/assets/brand-logo-light.png', serveAsset(BRAND_LOGO_LIGHT_PNG, IMMUTABLE));
+  r.get('/assets/simple-with-us.webp', serveAsset(SIMPLE_WITH_US_WEBP, IMMUTABLE));
   r.get('/swu-logo-wide.webp', serveAsset(SWU_LOGO_WEBP, LONG));
   r.get('/og-image.png', serveAsset(OG_IMAGE_PNG, LONG));
   r.get('/og-image-trends.png', serveAsset(OG_IMAGE_TRENDS_PNG, LONG));

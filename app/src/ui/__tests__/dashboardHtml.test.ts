@@ -2907,13 +2907,20 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
   // (covered above alongside the sector canonicalization fix, since both land
   // in the same loadTrSectorFlow() change.)
 
-  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 1-week trial -------
+  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 2-week trial -------
   it('shows $8.99/mo and $79.99/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
-    expect(DASHBOARD_HTML).toContain('data-premium-cue="export">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial');
-    expect(DASHBOARD_HTML).toContain('data-premium-cue="alerts">\n        <span class="gate-note">Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial');
+    // Each gate is its own surface.  A single shared toContain cannot tell
+    // the export note from the alerts note.
+    const canonical = 'Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 2-week free trial';
+    const exportAt = DASHBOARD_HTML.indexOf('data-premium-cue="export">');
+    const alertsAt = DASHBOARD_HTML.indexOf('data-premium-cue="alerts">');
+    expect(exportAt).toBeGreaterThan(-1);
+    expect(alertsAt).toBeGreaterThan(exportAt);
+    expect(DASHBOARD_HTML.slice(exportAt, exportAt + 400)).toContain(canonical);
+    expect(DASHBOARD_HTML.slice(alertsAt, alertsAt + 400)).toContain(canonical);
     expect(DASHBOARD_HTML).toContain('$8.99<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).toContain('$79.99<span class="per">/yr</span>');
-    expect(DASHBOARD_HTML).toContain('1-week free trial');
+    expect(DASHBOARD_HTML).toContain('2-week free trial');
     expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).not.toContain('$50<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).not.toContain('$15/mo');
@@ -4592,6 +4599,7 @@ describe('static UI assets (issue #1040)', () => {
       { path: '/favicon.ico', typePrefix: 'image/png', minBytes: 100, cache: 'public, max-age=86400' },
       { path: '/swu-logo-wide.webp', typePrefix: 'image/webp', minBytes: 10_000, cache: 'public, max-age=86400' },
       { path: '/assets/brand-logo-light.png', typePrefix: 'image/png', minBytes: 1_000, cache: 'immutable' },
+      { path: '/assets/simple-with-us.webp', typePrefix: 'image/webp', minBytes: 10_000, cache: 'immutable' },
       { path: '/assets/zilla-slab-700.woff2', typePrefix: 'font/woff2', minBytes: 1_000, cache: 'immutable' },
       { path: '/assets/inter-400.woff2', typePrefix: 'font/woff2', minBytes: 1_000, cache: 'immutable' },
       { path: '/assets/inter-500.woff2', typePrefix: 'font/woff2', minBytes: 1_000, cache: 'immutable' },
