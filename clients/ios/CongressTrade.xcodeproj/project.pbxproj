@@ -15,11 +15,15 @@
 		2C4A62E17A2B5A42FB5581C5 /* TickerDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CBD0B7344DF909E5AD17EFB /* TickerDetailView.swift */; };
 		30518D05E57024E89C72E199 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56B13A449C89D5073DF53F09 /* APIClient.swift */; };
 		33255C8B65CE5D57BEA0FD21 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 174A07BA61795B86BDB4680A /* AppDelegate.swift */; };
+		3371CCA65D08A24FF22974CC /* CongressTradeWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 4C7664CE19D4129836BD2C07 /* CongressTradeWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		370D2F2464BBCC7421D280A0 /* CongressTradeWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE8AFE3C1246C9784D767563 /* CongressTradeWidget.swift */; };
 		39DB62AB8DDF6A793CC85212 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0581F1E0FA9E674A8DCFAB97 /* SettingsView.swift */; };
 		4308206D9F2A7BBBD5C5AA01 /* CongressTradeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35DCB2F2A6141B54963BA496 /* CongressTradeStore.swift */; };
 		4837D1981DFE50931AEE71ED /* AuthenticationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CF41FEDB3A57F8AABEE02647 /* AuthenticationServices.framework */; };
+		4AB52C3CF1A18B50A94ECF8A /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E9479AF84239696A19A494DB /* WidgetKit.framework */; };
 		4DAA09F7FD517568DBC9918C /* ManageSubscription.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81B503A6AEE41626E4AF16CD /* ManageSubscription.swift */; };
 		509D089DD61840203B631B02 /* DeliveryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81F67F29AFA574E2D8485DC8 /* DeliveryView.swift */; };
+		54F65A39E944189CB3B65B78 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 94CC41F88D7600BCBE6805D2 /* SwiftUI.framework */; };
 		5BAEB0EB0379AFD0F2A7932B /* TrendsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82FE08F0795D7F20D3412D3D /* TrendsView.swift */; };
 		5C311D25040A164B751721AD /* SentryTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = B03D2C5CABCA42062909C5F7 /* SentryTelemetry.swift */; };
 		641A6E22DE9D752F30C9BCE6 /* Sentry in Frameworks */ = {isa = PBXBuildFile; productRef = 0C539488DD9EB29F701C4EDE /* Sentry */; };
@@ -48,7 +52,28 @@
 			remoteGlobalIDString = 57122C3759BA08F17E156C72;
 			remoteInfo = CongressTrade;
 		};
+		B4575E5BF12691F4503C8D51 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 38D6325FF91FB47EC3A33F58 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9A4117AFE32B43BB61E6F58A;
+			remoteInfo = CongressTradeWidget;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		83584ADF9D38C9143059B8A8 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				3371CCA65D08A24FF22974CC /* CongressTradeWidget.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		000EC5BF9DE684A3C1BBB545 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
@@ -61,31 +86,46 @@
 		39E422DDE36A2C9EFCD398C7 /* PeopleDirectoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeopleDirectoryView.swift; sourceTree = "<group>"; };
 		48F558FD5F7F57175BD1B8D0 /* AppleSignIn.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleSignIn.swift; sourceTree = "<group>"; };
 		4B957ADF3CA0C16B86E4DCFE /* FeedDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedDashboardView.swift; sourceTree = "<group>"; };
+		4C7664CE19D4129836BD2C07 /* CongressTradeWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = CongressTradeWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		4F5EE103A6EDDC2AD3034435 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		55B48D70FD05BF58BF28E110 /* CongressTrade.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CongressTrade.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		55E698A393A955A6C20B0AF2 /* ZillaSlab-Bold.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "ZillaSlab-Bold.ttf"; sourceTree = "<group>"; };
 		56B13A449C89D5073DF53F09 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
 		56FDA85A80BDE2C431CB66F1 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		5CBD0B7344DF909E5AD17EFB /* TickerDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TickerDetailView.swift; sourceTree = "<group>"; };
+		6770D9E32CED5BE1904F5E87 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		7DE0AC397B4127CD7EFA07D0 /* TradeDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TradeDetailView.swift; sourceTree = "<group>"; };
 		81B503A6AEE41626E4AF16CD /* ManageSubscription.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManageSubscription.swift; sourceTree = "<group>"; };
 		81F67F29AFA574E2D8485DC8 /* DeliveryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeliveryView.swift; sourceTree = "<group>"; };
 		82FE08F0795D7F20D3412D3D /* TrendsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrendsView.swift; sourceTree = "<group>"; };
 		8615B9FDFDB42B9E5188F272 /* CongressTradeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CongressTradeTests.swift; sourceTree = "<group>"; };
+		94BC030BA22C9E8830FC7E44 /* CongressTradeWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CongressTradeWidget.entitlements; sourceTree = "<group>"; };
+		94CC41F88D7600BCBE6805D2 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		9E81C8753B4AE9ECBAFADD52 /* AppleIAP.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleIAP.swift; sourceTree = "<group>"; };
 		A418B3C0E8F5E768B8693BEA /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		A6E566E6BEBEFF8D5FB1A265 /* AppUpdatePrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdatePrompt.swift; sourceTree = "<group>"; };
 		AE2059172121EBE601E63405 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		AE8AFE3C1246C9784D767563 /* CongressTradeWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CongressTradeWidget.swift; sourceTree = "<group>"; };
 		B03D2C5CABCA42062909C5F7 /* SentryTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentryTelemetry.swift; sourceTree = "<group>"; };
 		BEB7983B4D6A95CF77BCA369 /* PushNotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushNotificationManager.swift; sourceTree = "<group>"; };
 		CF41FEDB3A57F8AABEE02647 /* AuthenticationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AuthenticationServices.framework; path = System/Library/Frameworks/AuthenticationServices.framework; sourceTree = SDKROOT; };
 		D9A917373D55B3A8D9D05CDB /* PremiumSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PremiumSheet.swift; sourceTree = "<group>"; };
 		DCABF812047DBA489A1CEE3B /* KeychainTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainTokenStore.swift; sourceTree = "<group>"; };
+		E9479AF84239696A19A494DB /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
 		F6213C613EEED13D8D90D998 /* ZillaSlab-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "ZillaSlab-Regular.ttf"; sourceTree = "<group>"; };
 		FF9642633B7915F9C25D4019 /* MemberDirectorySearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemberDirectorySearch.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		1C80341C51D68A843D77D770 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4AB52C3CF1A18B50A94ECF8A /* WidgetKit.framework in Frameworks */,
+				54F65A39E944189CB3B65B78 /* SwiftUI.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		CE44FC9A16E4C5CA4F463CF2 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -120,6 +160,7 @@
 			children = (
 				55B48D70FD05BF58BF28E110 /* CongressTrade.app */,
 				180D3FC66744FB8E539F2705 /* CongressTradeTests.xctest */,
+				4C7664CE19D4129836BD2C07 /* CongressTradeWidget.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -128,6 +169,8 @@
 			isa = PBXGroup;
 			children = (
 				CF41FEDB3A57F8AABEE02647 /* AuthenticationServices.framework */,
+				94CC41F88D7600BCBE6805D2 /* SwiftUI.framework */,
+				E9479AF84239696A19A494DB /* WidgetKit.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -137,6 +180,7 @@
 			children = (
 				A5DC822700310E1CCB24AF5E /* CongressTrade */,
 				B7D98163539C41FD6C3523EB /* CongressTradeTests */,
+				919D6213BB943997A2F13EA0 /* CongressTradeWidget */,
 				52DFDDEE26BAB22C38DD95D9 /* Frameworks */,
 				5073ADDB38044A19B80C5460 /* Products */,
 			);
@@ -157,6 +201,16 @@
 				39E422DDE36A2C9EFCD398C7 /* PeopleDirectoryView.swift */,
 			);
 			path = People;
+			sourceTree = "<group>";
+		};
+		919D6213BB943997A2F13EA0 /* CongressTradeWidget */ = {
+			isa = PBXGroup;
+			children = (
+				94BC030BA22C9E8830FC7E44 /* CongressTradeWidget.entitlements */,
+				AE8AFE3C1246C9784D767563 /* CongressTradeWidget.swift */,
+				6770D9E32CED5BE1904F5E87 /* Info.plist */,
+			);
+			path = CongressTradeWidget;
 			sourceTree = "<group>";
 		};
 		94B61AE94ED1B663B4FC7A74 /* Components */ = {
@@ -260,10 +314,12 @@
 				BBF457532D759E6234952802 /* Sources */,
 				1D4AF7EB2464CEAAD18EB8C6 /* Resources */,
 				CE44FC9A16E4C5CA4F463CF2 /* Frameworks */,
+				83584ADF9D38C9143059B8A8 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				F3419DFC6AD337DF22D972B0 /* PBXTargetDependency */,
 			);
 			name = CongressTrade;
 			packageProductDependencies = (
@@ -272,6 +328,24 @@
 			productName = CongressTrade;
 			productReference = 55B48D70FD05BF58BF28E110 /* CongressTrade.app */;
 			productType = "com.apple.product-type.application";
+		};
+		9A4117AFE32B43BB61E6F58A /* CongressTradeWidget */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9ECED8F223EC231CB0C657CB /* Build configuration list for PBXNativeTarget "CongressTradeWidget" */;
+			buildPhases = (
+				3F35F19EE2D1F0C5239CDC32 /* Sources */,
+				1C80341C51D68A843D77D770 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CongressTradeWidget;
+			packageProductDependencies = (
+			);
+			productName = CongressTradeWidget;
+			productReference = 4C7664CE19D4129836BD2C07 /* CongressTradeWidget.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -287,6 +361,10 @@
 						ProvisioningStyle = Automatic;
 					};
 					57122C3759BA08F17E156C72 = {
+						DevelopmentTeam = CC8UTF7ATG;
+						ProvisioningStyle = Automatic;
+					};
+					9A4117AFE32B43BB61E6F58A = {
 						DevelopmentTeam = CC8UTF7ATG;
 						ProvisioningStyle = Automatic;
 					};
@@ -310,6 +388,7 @@
 			projectRoot = "";
 			targets = (
 				57122C3759BA08F17E156C72 /* CongressTrade */,
+				9A4117AFE32B43BB61E6F58A /* CongressTradeWidget */,
 				563FEE9D41DFA2D4CB4AA5A5 /* CongressTradeTests */,
 			);
 		};
@@ -330,6 +409,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		3F35F19EE2D1F0C5239CDC32 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				370D2F2464BBCC7421D280A0 /* CongressTradeWidget.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		BBF457532D759E6234952802 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -377,6 +464,11 @@
 			target = 57122C3759BA08F17E156C72 /* CongressTrade */;
 			targetProxy = 06282408FD7B2A1F47BFE3B1 /* PBXContainerItemProxy */;
 		};
+		F3419DFC6AD337DF22D972B0 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9A4117AFE32B43BB61E6F58A /* CongressTradeWidget */;
+			targetProxy = B4575E5BF12691F4503C8D51 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -401,6 +493,29 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Congress.Trade.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Congress.Trade";
+			};
+			name = Release;
+		};
+		365968A452637A6A3313FB53 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = CongressTradeWidget/CongressTradeWidget.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = CC8UTF7ATG;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CongressTradeWidget/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = trade.congress.ios.widget;
+				PRODUCT_NAME = CongressTradeWidget;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
@@ -566,6 +681,29 @@
 			};
 			name = Release;
 		};
+		9F4A30BAC5ED2796E60E676E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = CongressTradeWidget/CongressTradeWidget.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = CC8UTF7ATG;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CongressTradeWidget/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = trade.congress.ios.widget;
+				PRODUCT_NAME = CongressTradeWidget;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
 		D15911EFE345F7A87A99B3F4 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -625,6 +763,15 @@
 			buildConfigurations = (
 				75339727B4CB59ECC87BDD18 /* Debug */,
 				FD6DA8ACF60798EF18776070 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		9ECED8F223EC231CB0C657CB /* Build configuration list for PBXNativeTarget "CongressTradeWidget" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9F4A30BAC5ED2796E60E676E /* Debug */,
+				365968A452637A6A3313FB53 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

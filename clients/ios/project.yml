@@ -67,6 +67,8 @@ targets:
       - package: Sentry
         product: Sentry
       - sdk: AuthenticationServices.framework
+      - target: CongressTradeWidget
+        embed: true
     sources:
       - path: CongressTrade
         excludes:
@@ -160,6 +162,39 @@ targets:
         # between the iOS app and any future extensions (no extensions
         # ship today; the entitlement is registered proactively so we
         # don't have to ship a follow-up PR before adding one).
+        com.apple.security.application-groups:
+          - group.trade.congress
+
+
+  CongressTradeWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CongressTradeWidget
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: trade.congress.ios.widget
+        PRODUCT_NAME: "CongressTradeWidget"
+        DEVELOPMENT_TEAM: CC8UTF7ATG
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: CongressTradeWidget/CongressTradeWidget.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: CongressTradeWidget/Info.plist
+        SWIFT_VERSION: "5.0"
+        SKIP_INSTALL: YES
+    # No `info:` block: `info.path` makes XcodeGen rewrite CongressTradeWidget/Info.plist
+    # from `info.properties` on every `xcodegen generate`. With GENERATE_INFOPLIST_FILE = NO
+    # there is no synthesized-key fallback, so the checked-in plist (NSExtension + XPC! bundle
+    # keys) is the single source of truth — same pattern as excluding CongressTrade/Info.plist
+    # from the app target sources while keeping INFOPLIST_FILE.
+    entitlements:
+      path: CongressTradeWidget/CongressTradeWidget.entitlements
+      properties:
         com.apple.security.application-groups:
           - group.trade.congress
 
