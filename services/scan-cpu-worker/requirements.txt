@@ -1,7 +1,7 @@
 # Core (CPU-only, Linux ARM64 + amd64) — pinned to avoid pip ResolutionImpossible on Coolify
 numpy==2.5.3
 pillow==12.3.0
-opencv-python-headless==4.14.0.94
+opencv-python-headless==5.0.0.93
 pytesseract==0.3.13
 packaging>=24.0
 # PDF render uses system poppler-utils (pdftoppm), not a Python dep
