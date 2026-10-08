@@ -2,14 +2,14 @@
   "version": "5",
   "specifiers": {
     "npm:@aws-sdk/client-s3@3.1146.0": "3.1146.0",
-    "npm:@cloudflare/workers-types@^4.20240718.0": "4.20260702.1",
+    "npm:@cloudflare/workers-types@5": "5.20261007.1",
     "npm:@fontsource/zilla-slab@^5.3.0": "5.3.0",
     "npm:@google/genai@^2.23.0": "2.28.0",
     "npm:@google/genai@^2.27.0": "2.28.0",
     "npm:@libsql/client@*": "0.18.0",
     "npm:@libsql/client@0.18": "0.18.0",
     "npm:@sentry/cli@^3.8.0": "3.8.0",
-    "npm:@sentry/cloudflare@^10.66.0": "10.66.0_@cloudflare+workers-types@4.20260702.1",
+    "npm:@sentry/cloudflare@^10.66.0": "10.66.0_@cloudflare+workers-types@5.20261007.1",
     "npm:@sentry/deno@^10.75.0": "10.75.0",
     "npm:@sentry/deno@^11.4.0": "11.4.0",
     "npm:@types/node@26.6.4": "26.6.4",
@@ -303,8 +303,8 @@
         "keyv"
       ]
     },
-    "@cloudflare/workers-types@4.20260702.1": {
-      "integrity": "sha512-mOhf5TUEB1m2vPrxtqoIGfz0fUC9xyxRDx5gWHy5s+OCo6dcV+g7wI1R7gYCMFohhqF/2y2xeKVwMwCJjfn/WA=="
+    "@cloudflare/workers-types@5.20261007.1": {
+      "integrity": "sha512-NUzZ+p0tDFK6RXbJ/pa7sTG93y5zoK34gIV2PGvUMA+pwoKBBAeTlnvrLaQsDWswYW5gQA/b124+XZc0tn8Ihg=="
     },
     "@datadog/libdatadog@0.12.1": {
       "integrity": "sha512-4cKRaO1mB9npfklJjOizzJaNBdZvw1V62EVbSD6Y32zX92bTBq/vAno/TTN9dMAvzomXYmvADpGo4798E9fMoA=="
@@ -898,7 +898,7 @@
       "scripts": true,
       "bin": true
     },
-    "@sentry/cloudflare@10.66.0_@cloudflare+workers-types@4.20260702.1": {
+    "@sentry/cloudflare@10.66.0_@cloudflare+workers-types@5.20261007.1": {
       "integrity": "sha512-QYEZQsR09OO/0nfyZP4J56JG8zNO5PCPon7TM96fjjbKIbshpbUcr73XmUhHh3h1Kv0Ic/M5LWBm9eV6H5Cmmw==",
       "dependencies": [
         "@cloudflare/workers-types",
@@ -2376,7 +2376,7 @@
   "workspace": {
     "dependencies": [
       "npm:@aws-sdk/client-s3@3.1146.0",
-      "npm:@cloudflare/workers-types@^4.20240718.0",
+      "npm:@cloudflare/workers-types@5",
       "npm:@google/genai@^2.23.0",
       "npm:@libsql/client@0.18",
       "npm:@sentry/cloudflare@^10.66.0",
