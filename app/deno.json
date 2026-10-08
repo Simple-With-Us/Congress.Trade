@@ -19,7 +19,7 @@
     "cheerio": "npm:cheerio@^1.2.0",
     "fflate": "npm:fflate@^0.8.3",
     "jsonrepair": "npm:jsonrepair@^3.15.0",
-    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1136.0",
+    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1146.0",
     "@google/genai": "npm:@google/genai@^2.23.0",
     "@libsql/client": "npm:@libsql/client@^0.18.0",
     "@libsql/client/web": "npm:@libsql/client@^0.18.0/web",
