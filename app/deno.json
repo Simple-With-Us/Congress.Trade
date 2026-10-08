@@ -24,7 +24,7 @@
     "@libsql/client": "npm:@libsql/client@^0.18.0",
     "@libsql/client/web": "npm:@libsql/client@^0.18.0/web",
     "@sentry/cloudflare": "npm:@sentry/cloudflare@^10.66.0",
-    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^4.20240718.0"
+    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^5.0.0"
   },
   "exclude": [
     "node_modules",
