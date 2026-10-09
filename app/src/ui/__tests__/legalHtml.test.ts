@@ -12,14 +12,18 @@ describe('legalHtml pricing copy', () => {
   it('states the canonical $8.99/mo · $79.99/yr Premium price in the Terms of Service', () => {
     expect(TOS_HTML).toContain('$8.99 / month');
     expect(TOS_HTML).toContain('$79.99 / year');
-    // 7 days, matching STRIPE_TRIAL_DAYS' default (billing/routes.ts) and the
-    // "1-week free trial" the dashboard and StoreKit-driven iOS paywall quote.
-    expect(TOS_HTML).toContain('7 days');
+    expect(TOS_HTML).toContain('1-week free trial');
+    expect(TOS_HTML).toContain('U.S. reference prices in USD');
+    expect(TOS_HTML).toContain('local currency at purchase');
+    expect(TOS_HTML).not.toContain('14 days');
+    expect(TOS_HTML).not.toContain('2 weeks');
     expect(TOS_HTML).not.toContain('30 days');
     expect(TOS_HTML).not.toContain('14 days / 2 weeks');
   });
 
   it('never mentions stale price points', () => {
+    expect(TOS_HTML).not.toContain('$5.00 / month');
+    expect(TOS_HTML).not.toContain('$50.00 / year');
     expect(TOS_HTML).not.toContain('$15.00');
     expect(TOS_HTML).not.toContain('$140.00');
     expect(TOS_HTML).not.toContain('$9.00');
