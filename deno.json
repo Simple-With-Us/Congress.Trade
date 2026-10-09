@@ -1,7 +1,7 @@
 {
   "imports": {
     "#sentry": "./app/src/deno/sentry.ts",
-    "@sentry/deno": "npm:@sentry/deno@^10.70.0",
+    "@sentry/deno": "npm:@sentry/deno@^11.0.0",
     "@jaywedgeworth22/congress-trading-shared": "./app/vendor/congress-trading-shared/src/index.ts",
     "hono": "npm:hono@^4.12.31",
     "hono/cookie": "npm:hono@^4.12.31/cookie",
