@@ -170,6 +170,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Upload simulator screenshot (visual CI artifact)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: congress-trade-ios-simulator-screenshot
+          path: ${{ runner.temp }}/congress-trade-ios-ci-simulator.png
+          if-no-files-found: warn
+          retention-days: 14
+
   # Always-present status.  This is the context to tick required after merge.
   # If it needed: the Mac job, a red compile or XCTest makes this red too.
   report:
