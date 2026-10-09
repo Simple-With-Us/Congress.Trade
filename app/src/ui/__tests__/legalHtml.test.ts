@@ -18,6 +18,7 @@ describe('legalHtml pricing copy', () => {
     expect(TOS_HTML).not.toContain('14 days');
     expect(TOS_HTML).not.toContain('2 weeks');
     expect(TOS_HTML).not.toContain('30 days');
+    expect(TOS_HTML).not.toContain('14 days / 2 weeks');
   });
 
   it('never mentions stale price points', () => {
@@ -161,9 +162,9 @@ describe('shared legal chrome and theme path', () => {
       expect(html).toContain('Congress<span class="dot">.</span>Trade');
     }
     expect(TOS_HTML).toContain('<h1>Terms of Service</h1>');
-    expect(TOS_HTML).toContain('<p class="eff">Effective August 21, 2026</p>');
+    expect(TOS_HTML).toContain('<p class="eff">Effective October 9, 2026</p>');
     expect(PRIVACY_HTML).toContain('<h1>Privacy Policy</h1>');
-    expect(PRIVACY_HTML).toContain('<p class="eff">Effective August 21, 2026</p>');
+    expect(PRIVACY_HTML).toContain('<p class="eff">Effective October 9, 2026</p>');
   });
 
   it('honors the site Light / Dark / System switch on both pages', () => {

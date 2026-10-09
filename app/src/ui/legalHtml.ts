@@ -8,7 +8,7 @@
  * before relying on them. Update EFFECTIVE_DATE when the text changes.
  */
 
-const EFFECTIVE_DATE = 'August 21, 2026';
+const EFFECTIVE_DATE = 'October 9, 2026';
 const ENTITY = 'Jay Wedgeworth, LLC d/b/a Congress.Trade';
 const CONTACT = 'support@congress.trade';
 
