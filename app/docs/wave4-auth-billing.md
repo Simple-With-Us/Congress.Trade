@@ -22,7 +22,7 @@ Coolify, not a Worker.
 
 ## 1. Stripe (freemium paywall)
 
-**Pricing (current, verified 2026-08-14):** 2-week free trial → **$5/mo** or **$50/yr**.  The 2026-08-05 first-ship used a 1-month trial; the configured offer is now 14 days (`STRIPE_TRIAL_DAYS=14`, App Store Connect intro offer `TWO_WEEKS` on both `trade.congress.premium.monthly` and `.annual`).  In-app / store copy must quote 2 weeks, never 1 month.
+**Pricing (current, verified 2026-10-09):** 1-week free trial → **$8.99/mo** or **$79.99/yr**.  Stripe checkout uses `STRIPE_TRIAL_DAYS` (default **7** when unset in `billing/routes.ts`).  App Store Connect intro offer must match **ONE_WEEK** on both `trade.congress.premium.monthly` and `.annual`.  In-app / store / web copy must quote 1 week, never 2 weeks or 1 month.
 
 1. **Create the product + prices** (Stripe Dashboard → Products, in *live* mode):
    - Product: "Congress.Trade Premium".
@@ -38,11 +38,11 @@ Coolify, not a Worker.
    - Copy the **Signing secret** (`whsec_…`).
 4. **Set the secrets/vars in Infisical** (`STRIPE_SECRET_KEY`,
    `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_ANNUAL`,
-   `STRIPE_TRIAL_DAYS=14`).  Do not `wrangler secret put`.
+   `STRIPE_TRIAL_DAYS=7`).  Do not `wrangler secret put`.
 
 **Test before live:** do all of the above in Stripe *test* mode with `sk_test_…`
 keys and the test webhook secret; use card `4242 4242 4242 4242`.  The trial means
-no charge for 14 days (2 weeks), so confirm the flow end-to-end first.
+no charge for 7 days (1 week), so confirm the flow end-to-end first.
 
 How it reconciles: checkout creates the customer up-front and stores the
 `customer ↔ user` link; the `customer.subscription.*` webhooks are the source of
