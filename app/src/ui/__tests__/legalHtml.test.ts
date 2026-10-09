@@ -2,21 +2,21 @@
  * src/ui/__tests__/legalHtml.test.ts
  *
  * Guards the Terms of Service pricing copy against drifting from the owner-
- * decided canonical Premium price ($5/mo · $50/yr, 2-week trial).
+ * decided canonical Premium price ($8.99/mo · $79.99/yr, 1-week trial).
  */
 
 import { describe, it, expect } from 'vitest';
 import { TOS_HTML, PRIVACY_HTML } from '../legalHtml.ts';
 
 describe('legalHtml pricing copy', () => {
-  it('states the canonical $5/mo · $50/yr Premium price in the Terms of Service', () => {
-    expect(TOS_HTML).toContain('$5.00 / month');
-    expect(TOS_HTML).toContain('$50.00 / year');
-    // 14 days, matching STRIPE_TRIAL_DAYS' default (billing/routes.ts) and the
-    // "2-week free trial" the dashboard and the iOS Premium sheet both quote.
-    // The Terms said "30 days / 1 month" long after the trial became 2 weeks.
-    expect(TOS_HTML).toContain('14 days');
+  it('states the canonical $8.99/mo · $79.99/yr Premium price in the Terms of Service', () => {
+    expect(TOS_HTML).toContain('$8.99 / month');
+    expect(TOS_HTML).toContain('$79.99 / year');
+    // 7 days, matching STRIPE_TRIAL_DAYS' default (billing/routes.ts) and the
+    // "1-week free trial" the dashboard and StoreKit-driven iOS paywall quote.
+    expect(TOS_HTML).toContain('7 days');
     expect(TOS_HTML).not.toContain('30 days');
+    expect(TOS_HTML).not.toContain('14 days / 2 weeks');
   });
 
   it('never mentions stale price points', () => {
@@ -158,9 +158,9 @@ describe('shared legal chrome and theme path', () => {
       expect(html).toContain('Congress<span class="dot">.</span>Trade');
     }
     expect(TOS_HTML).toContain('<h1>Terms of Service</h1>');
-    expect(TOS_HTML).toContain('<p class="eff">Effective August 21, 2026</p>');
+    expect(TOS_HTML).toContain('<p class="eff">Effective October 9, 2026</p>');
     expect(PRIVACY_HTML).toContain('<h1>Privacy Policy</h1>');
-    expect(PRIVACY_HTML).toContain('<p class="eff">Effective August 21, 2026</p>');
+    expect(PRIVACY_HTML).toContain('<p class="eff">Effective October 9, 2026</p>');
   });
 
   it('honors the site Light / Dark / System switch on both pages', () => {

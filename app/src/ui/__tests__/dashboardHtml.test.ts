@@ -4033,6 +4033,8 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
       extractFn(DASHBOARD_HTML, 'leadDirection'),
       extractFn(DASHBOARD_HTML, 'leadVerdict'),
       extractFn(DASHBOARD_HTML, 'isLatencyComparisonPublic'),
+      extractFn(DASHBOARD_HTML, 'isFmpLatencyProvider'),
+      extractFn(DASHBOARD_HTML, 'publicLatencyProviders'),
       extractFn(DASHBOARD_HTML, 'isLatencyAhead'),
       'return isLatencyAhead;',
     ].join('\n');
@@ -4149,6 +4151,23 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
         providers: [
           provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
           provider({ label: 'B', operationalStatus: 'off' }),
+        ],
+      };
+      expect(isLatencyAhead(summary)).toBe(true);
+    });
+
+    it('ignores FMP-family providers in public latency gates', () => {
+      const summary = {
+        providers: [
+          provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
+          provider({
+            id: 'fmp',
+            label: 'FMP',
+            usFirstCount: 1,
+            providerFirstCount: 9,
+            medianLeadSec: -7200,
+            avgLeadSec: -5400,
+          }),
         ],
       };
       expect(isLatencyAhead(summary)).toBe(true);

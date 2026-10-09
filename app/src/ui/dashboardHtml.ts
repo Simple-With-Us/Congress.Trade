@@ -11291,12 +11291,27 @@ function isLatencyComparisonPublic(p) {
   if (p.coverageIntegrity === 'contradiction') return false;
   return true;
 }
+/* FMP latency probes are admin-visible but excluded from public marketing until
+   we trust the feed (owner 2026-10-04). */
+function isFmpLatencyProvider(p) {
+  var id = String((p && p.id) || '');
+  return id === 'fmp' || id.indexOf('fmp') === 0;
+}
+/* Single filter for every public latency gate (scoreboard, mini strip, pricing proof). */
+function publicLatencyProviders(providers) {
+  return (providers || []).filter(function (p) {
+    return isLatencyComparisonPublic(p) && !isFmpLatencyProvider(p);
+  });
+}
+function publicLatencySummary(d) {
+  if (!d) return null;
+  return { providers: publicLatencyProviders(d.providers) };
+}
 /* Best-covered provider that boast copy may cite (well-sampled AND favorable). */
 function speedBoastProvider(d) {
   var best = null;
-  (d.providers || []).filter(function (p) {
-    return isLatencyComparisonPublic(p) &&
-      p.matched >= SPEED_LANE_MIN_MATCHED && p.comparisonStatus === 'usable' &&
+  publicLatencyProviders(d.providers).filter(function (p) {
+    return p.matched >= SPEED_LANE_MIN_MATCHED && p.comparisonStatus === 'usable' &&
       Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT && Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
   })
     .forEach(function (p) { if (!best || p.matched > best.matched) best = p; });
@@ -11312,8 +11327,7 @@ function speedBoastProvider(d) {
 function isLatencyAhead(summary) {
   if (!summary || !summary.providers) return false;
   var ahead = 0, behind = 0;
-  (summary.providers || []).forEach(function (p) {
-    if (!isLatencyComparisonPublic(p)) return;
+  publicLatencyProviders(summary.providers).forEach(function (p) {
     var wins = p.usFirstCount || 0, losses = p.providerFirstCount || 0, ties = p.tieCount || 0;
     var deltaSample = wins + losses + ties;
     var hasLead = p.avgLeadSec != null || p.medianLeadSec != null;
@@ -11593,7 +11607,7 @@ function renderSpeedProof() {
   fetchLatencySummary().then(function (d) {
     function byMatched(a, b) { return b.matched - a.matched; }
     var adminProvs = (d.adminProviders && d.adminProviders.length ? d.adminProviders : (d.providers || [])).slice().sort(byMatched);
-    var publicProvs = (d.providers || []).filter(isLatencyComparisonPublic).slice().sort(byMatched);
+    var publicProvs = publicLatencyProviders(d.providers).slice().sort(byMatched);
     var hasAdminData = !!(d.totals && d.totals.racedDisclosures && adminProvs.length);
     var hasPublicData = !!(d.totals && d.totals.racedDisclosures && publicProvs.length);
 
@@ -11620,8 +11634,8 @@ function renderSpeedProof() {
    a one-liner has no room for honest hedging, so below threshold it stays silent. */
 function renderAlertsMini() {
   var box = el('alertsSpeedMini'); if (!box) return;
-  var d = LATENCY.data;
-  var best = d && isLatencyAhead(d) ? speedBoastProvider(d) : null;
+  var pub = publicLatencySummary(LATENCY.data);
+  var best = pub && isLatencyAhead(pub) ? speedBoastProvider(pub) : null;
   if (!best) { box.className = 'speed-mini'; box.innerHTML = ''; return; }
   box.className = 'speed-mini show';
   box.innerHTML = '<span>⚡ Ahead of ' + esc(best.label) + ' on <span class="lead">' + fmtCount(best.usFirstCount) + ' of ' + fmtCount(best.matched) +
@@ -11638,7 +11652,8 @@ function openSpeedProof() {
    median, so an unsigned magnitude here can never hide a loss. */
 function setPricingProof() {
   var n = el('pricingProof'); if (!n) return;
-  var best = LATENCY.data ? speedBoastProvider(LATENCY.data) : null;
+  var pub = publicLatencySummary(LATENCY.data);
+  var best = pub ? speedBoastProvider(pub) : null;
   n.textContent = best
     ? 'Right now: filings land here a median ' + fmtLead(best.medianLeadSec) + ' before ' + best.label +
       ' — measured live over the last ' + fmtCount(best.matched) + ' live matched races.'
