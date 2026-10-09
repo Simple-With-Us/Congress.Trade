@@ -233,8 +233,8 @@ export const TOS_HTML = shell(
 
 <h2>3. Subscriptions, billing &amp; trials</h2>
 <ul>
-<li>Premium is offered as an auto-renewing subscription: <strong>$5.00 / month</strong> or <strong>$50.00 / year</strong> (USD), plus any applicable taxes.&nbsp; The same Premium entitlement is available through the Congress.Trade website (billed by Stripe) or through the Congress.Trade iOS app (billed by Apple as an In-App Purchase); whichever you purchase through, the entitlement applies across both the website and the iOS app on your account.</li>
-<li>New subscriptions may include a free trial (currently 14 days / 2 weeks).&nbsp; If you do not cancel before the trial ends, the subscription renews and your payment method is charged.</li>
+<li>Premium is offered as an auto-renewing subscription: <strong>$8.99 / month</strong> or <strong>$79.99 / year</strong> (USD), plus any applicable taxes.&nbsp; The same Premium entitlement is available through the Congress.Trade website (billed by Stripe) or through the Congress.Trade iOS app (billed by Apple as an In-App Purchase); whichever you purchase through, the entitlement applies across both the website and the iOS app on your account.</li>
+<li>New subscriptions may include a free trial (currently 7 days / 1 week).&nbsp; If you do not cancel before the trial ends, the subscription renews and your payment method is charged.</li>
 <li>Subscriptions <strong>automatically renew</strong> at the end of each billing period until canceled.&nbsp; You authorize recurring charges to your payment method.</li>
 <li>We may change prices or plan features; changes apply to the next billing period after reasonable notice.&nbsp; Continued use after a price change constitutes acceptance.</li>
 </ul>
