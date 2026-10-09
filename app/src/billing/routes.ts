@@ -51,8 +51,8 @@ import {
 import { AppleRedeemError, jwsFromInput, requireAppleIapEnabled, verifyAppleRedemption } from './appleRedeem.ts';
 import { clientRedeemWouldResurrectRevoked, getAppleSubscription, upsertAppleSubscription } from './appleSubscriptions.ts';
 
-/** Default free trial when STRIPE_TRIAL_DAYS is unset: 14 days (2 weeks). */
-const DEFAULT_TRIAL_DAYS = 14;
+/** Default free trial when STRIPE_TRIAL_DAYS is unset: 7 days (1 week). */
+const DEFAULT_TRIAL_DAYS = 7;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 
 /**
