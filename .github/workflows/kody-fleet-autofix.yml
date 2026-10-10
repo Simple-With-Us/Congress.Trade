@@ -1,0 +1,229 @@
+# DEFAULT-DISABLED SETUP DRAFT.  This pin implements the initial DeepSeek route only.
+# MiniMax routing and budget integration remain pending in Usage-Monitor #1602:
+# https://github.com/Simple-With-Us/Usage-Monitor/issues/1602
+# Local job definitions preserve this repository's auditable runner policy.
+# Derived from congress-trading-shared workflow commit 8ef33de1953158f26b2fd872b8d1bc045032844e.
+# Keep literal zero/pending gates and environment values aligned until reviewed activation.
+# Full checkout is restricted to the trusted public helper commit; no target PR checkout.
+name: Kody DeepSeek Fix Proposals
+
+on:
+  check_run:
+    types: [completed]
+
+permissions: {}
+concurrency:
+  group: kody-caller-${{ github.repository_id }}-${{ github.event.check_run.pull_requests[0].number || github.event.check_run.id }}
+  cancel-in-progress: false
+
+
+env:
+  EXPECTED_REPOSITORY_ID: '1275616664'
+  PROFILE: 'web'
+  SOURCE_PREFIXES: '["app/src/"]'
+  DAILY_ATTEMPT_LIMIT: '0'
+  BUDGET_POLICY_ID: 'pending'
+  CHECK_RUN_ID: ${{ github.event.check_run.id }}
+
+jobs:
+  prepare:
+    if: >-
+      vars.SWU_KODY_AUTOFIX_ENABLED == 'true' &&
+      0 > 0 && 'pending' != 'pending' &&
+      'web' != 'blocked' &&
+      github.event_name == 'check_run' && github.event.action == 'completed' &&
+      github.run_attempt == 1 &&
+      github.event.check_run.app.id == 413034 &&
+      github.event.sender.type == 'Bot' && github.event.sender.id == 148880201 &&
+      github.event.sender.login == 'kody-ai[bot]' &&
+      github.event.check_run.conclusion == 'success' &&
+      github.event.check_run.pull_requests[0].number != null &&
+      github.event.check_run.pull_requests[1] == null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      eligible: ${{ steps.prepare.outputs.eligible }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+      result: ${{ steps.prepare.outputs.result }}
+      utc_day: ${{ steps.clock.outputs.utc_day }}
+    steps:
+      - name: Check Out Trusted Helper Only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Simple-With-Us/congress-trading-shared
+          ref: 'b9a84788524243c9ec10ba7a6604c479cd4cfffb'
+          path: trusted-helper
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Record UTC Reservation Day
+        id: clock
+        shell: bash
+        run: printf 'utc_day=%s\n' "$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Validate Check And Snapshot Eligible Findings
+        id: prepare
+        run: node trusted-helper/.github/kody-autofix/fleet.mjs prepare "$RUNNER_TEMP/kody-autofix"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.prepare.outputs.eligible == 'true'
+        with:
+          name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix/snapshot.json
+          if-no-files-found: error
+          retention-days: 1
+
+  reserve:
+    needs: prepare
+    if: needs.prepare.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: kody-reserve-${{ github.repository_id }}-${{ needs.prepare.outputs.utc_day }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: read
+      checks: read
+      actions: read
+    outputs:
+      reserved: ${{ steps.reserve.outputs.reserved }}
+      result: ${{ steps.reserve.outputs.result }}
+    steps:
+      - name: Check Out Trusted Helper Only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Simple-With-Us/congress-trading-shared
+          ref: 'b9a84788524243c9ec10ba7a6604c479cd4cfffb'
+          path: trusted-helper
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix
+      - name: Reserve Create-Only Daily Slot And PR Head Attempt
+        id: reserve
+        run: node trusted-helper/.github/kody-autofix/fleet.mjs reserve "$RUNNER_TEMP/kody-autofix"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.reserve.outputs.reserved == 'true'
+        with:
+          name: kody-reservation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix/reservation.json
+          if-no-files-found: error
+          retention-days: 1
+
+  generate:
+    needs: [prepare, reserve]
+    if: needs.reserve.outputs.reserved == 'true'
+    environment: kody-autofix
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check Out Trusted Helper Only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Simple-With-Us/congress-trading-shared
+          ref: 'b9a84788524243c9ec10ba7a6604c479cd4cfffb'
+          path: trusted-helper
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-reservation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix
+      - name: Install Verified Gitleaks Scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/kody-tools"
+          mkdir -p "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --max-time 60 --retry 0 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$tools_dir/gitleaks.tar.gz"
+          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$tools_dir/gitleaks.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file "$tools_dir/gitleaks.tar.gz" --directory "$tools_dir" \
+            --no-same-owner --no-same-permissions gitleaks
+          chmod 0755 "$tools_dir/gitleaks"
+      - name: Reject Secret-Bearing Context Before Provider Credentials
+        run: node trusted-helper/.github/kody-autofix/fleet.mjs scan "$RUNNER_TEMP/kody-autofix"
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/kody-tools/gitleaks
+      # Install outside target sources, without repository scripts or configuration.
+      - name: Install Pinned Claude Code
+        run: npm install --global @anthropic-ai/claude-code@2.1.289
+      - name: Generate One Bounded Proposal
+        run: node trusted-helper/.github/kody-autofix/fleet.mjs generate "$RUNNER_TEMP/kody-autofix"
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.KODY_DEEPSEEK_API_KEY }}
+      - name: Reject Secret-Bearing Generated Results
+        run: node trusted-helper/.github/kody-autofix/fleet.mjs scan-answer "$RUNNER_TEMP/kody-autofix"
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/kody-tools/gitleaks
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kody-answer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kody-autofix/answer.json
+            ${{ runner.temp }}/kody-autofix/answer-scan.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [prepare, reserve, generate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: kody-publish-${{ github.repository_id }}-${{ needs.prepare.outputs.pr_number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      actions: read
+    steps:
+      - name: Check Out Trusted Helper Only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Simple-With-Us/congress-trading-shared
+          ref: 'b9a84788524243c9ec10ba7a6604c479cd4cfffb'
+          path: trusted-helper
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-reservation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-answer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kody-autofix
+      - name: Revalidate And Create Draft Proposal
+        run: node trusted-helper/.github/kody-autofix/fleet.mjs publish "$RUNNER_TEMP/kody-autofix"
+        env:
+          GH_TOKEN: ${{ github.token }}
