@@ -1,7 +1,7 @@
 GUIDELINE 2.1 — APP REVIEW INFORMATION (Congress.Trade iOS 1.0)
 
 1) SCREEN RECORDING
-Attached: physical iPhone 16 Pro Max, iOS 27.0.  Starts at launch.  Walks Trends, Trades, Directory, Delivery, and Account.  It signs in and out, and shows Delivery both with methods configured and with none.  Premium sheet: monthly $5, annual $50, 2-week trial, Restore, Terms, Privacy.
+Attached: physical iPhone 16 Pro Max, iOS 27.0.  Starts at launch.  Walks Trends, Trades, Directory, Delivery, and Account.  It signs in and out, and shows Delivery both with methods configured and with none.  Premium sheet: monthly $8.99, annual $79.99, 1-week free trial, Restore, Terms, Privacy.
 
 2) DEVICES AND OPERATING SYSTEMS TESTED
 - Jay's iPhone (iPhone 16 Pro Max, iPhone17,2), iOS 27.0 — physical; this recording
@@ -19,7 +19,7 @@ To create an account (optional, for Delivery / Premium / alerts):
 - Tap Menu (top right) and use Sign in with Apple (recommended for review) or Sign in with Google.
 There is no password.  demoAccountRequired is false because Sign in with Apple with the reviewer's own Apple ID is the intended path.
 
-After sign-in: Menu → Premium shows trade.congress.premium.monthly ($5/mo after a 2-week free trial) and trade.congress.premium.annual ($50/yr after a 2-week free trial), Restore Purchases, Terms of Use, and Privacy Policy.  Use a sandbox Apple ID to complete a purchase.  Sign Out is on the Account sheet.
+After sign-in: Menu → Premium shows trade.congress.premium.monthly ($8.99/mo after a 1-week free trial) and trade.congress.premium.annual ($79.99/yr after a 1-week free trial), Restore Purchases, Terms of Use, and Privacy Policy.  Use a sandbox Apple ID to complete a purchase.  Sign Out is on the Account sheet.
 
 Account deletion: signed-in users tap Menu → Delete Account, confirm, and the app signs them out.  The backend deletes the account, sessions, push devices, delivery subscriptions, and personal information.  Email support@congress.trade remains an alternate path.  The app has no user-generated posts, comments, or profiles, so there is no report/block UI.
 
