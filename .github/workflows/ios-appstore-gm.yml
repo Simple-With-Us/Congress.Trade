@@ -55,12 +55,18 @@ jobs:
           set +o xtrace
           set -euo pipefail
           export INFISICAL_DISABLE_UPDATE_CHECK=true
+
           if ! command -v infisical >/dev/null 2>&1; then
             NONINTERACTIVE=1 HOMEBREW_NO_AUTO_UPDATE=1 brew install infisical/get-cli/infisical
           fi
-          command -v infisical >/dev/null 2>&1 || { echo "::error::Infisical CLI is not installed."; exit 1; }
+          command -v infisical >/dev/null 2>&1 || {
+            echo "::error::Infisical CLI is not installed."
+            exit 1
+          }
+
           if [ -z "${INFISICAL_PROJECT_ID}" ]; then
-            echo "::error::Missing INFISICAL_PROJECT_ID GitHub secret."; exit 1
+            echo "::error::Missing INFISICAL_PROJECT_ID GitHub secret."
+            exit 1
           fi
           CLIENT_ID="${INFISICAL_UNIVERSAL_AUTH_CLIENT_ID}"
           CLIENT_SECRET="${INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET}"
@@ -69,8 +75,10 @@ jobs:
             CLIENT_SECRET="${INFISICAL_CLIENT_SECRET}"
           fi
           if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
-            echo "::error::Missing Infisical machine identity."; exit 1
+            echo "::error::Missing Infisical machine identity.  Set INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/SECRET (fallback INFISICAL_CLIENT_ID/SECRET) on the repo."
+            exit 1
           fi
+
           TOKEN="$(
             env -u INFISICAL_CLIENT_ID -u INFISICAL_CLIENT_SECRET -u INFISICAL_TOKEN \
               INFISICAL_UNIVERSAL_AUTH_CLIENT_ID="$CLIENT_ID" \
@@ -78,23 +86,55 @@ jobs:
               infisical login --method=universal-auth --silent --plain --telemetry=false 2>/dev/null || true
           )"
           if [ -z "$TOKEN" ]; then
-            echo "::error::Infisical universal-auth login failed."; exit 1
+            echo "::error::Infisical universal-auth login failed."
+            exit 1
           fi
-          echo "::add-mask::$TOKEN"
-          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
+          if [[ "$TOKEN" == *$'\n'* || "$TOKEN" == *$'\r'* ]]; then
+            echo '::error::Infisical returned a multiline token.' >&2
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${TOKEN//'%'/'%25'}"
+
+          for name in ASC_KEY_ID ASC_ISSUER_ID \
+                      IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
             val="$(
               INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
                 --plain --silent --telemetry=false --expand=false \
-                --projectId="$INFISICAL_PROJECT_ID" --env=prod --path=/ 2>/dev/null || true
+                --projectId="$INFISICAL_PROJECT_ID" --env=prod --path=/ \
+                2>/dev/null || true
             )"
-            [ -n "$val" ] || continue
-            echo "::add-mask::$val"
-            { echo "${name}<<INFISICAL_EOF"; printf '%s\n' "$val"; echo "INFISICAL_EOF"; } >> "$GITHUB_ENV"
+            if [ -z "$val" ]; then
+              continue
+            fi
+            if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+              echo "::error::Signing field $name must be single-line; correct Infisical formatting." >&2
+              exit 1
+            fi
+            printf '::add-mask::%s\n' "${val//'%'/'%25'}"
+            printf -v "$name" '%s' "$val"
+            export "$name"
+            # Certificate credentials belong only to this load/import step.
+            if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID ]]; then
+              printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
+            fi
           done
-          unset TOKEN CLIENT_ID CLIENT_SECRET val
-
-      - name: Import signing + ASC key
-        run: bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
+          # Keep multiline PEM out of GITHUB_ENV and every later step environment.
+          # Only its mode-600 file path crosses the step boundary.
+          key_material="$(
+            INFISICAL_TOKEN="$TOKEN" infisical secrets get ASC_KEY_P8 \
+              --plain --silent --telemetry=false --expand=false \
+              --projectId="$INFISICAL_PROJECT_ID" --env=prod --path=/ \
+              2>/dev/null || true
+          )"
+          if [ -z "$key_material" ]; then
+            echo "::error::Missing ASC key material in Infisical prod."
+            exit 1
+          fi
+          printf '%s\n' "$key_material" | bash "$GITHUB_WORKSPACE/scripts/ios-stage-asc-key.sh"
+          ASC_KEY_PATH="$(sed -n 's/^ASC_KEY_PATH=//p' "$GITHUB_ENV" | tail -n 1)"
+          export ASC_KEY_PATH
+          bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
+          unset key_material TOKEN CLIENT_ID CLIENT_SECRET val IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
       - name: Ship CongressTrade from GM host
         run: |
