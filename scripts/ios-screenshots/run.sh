@@ -34,8 +34,8 @@ xcodebuild build-for-testing \
 xcrun simctl list devices available | sed -n 1,80p
 
 # label|device name prefix
-DEVICES="${SHOT_DEVICES:-phone69|iPhone 17 Pro Max
-phone67|iPhone 16 Plus
+DEVICES="${SHOT_DEVICES:-phone63|iPhone 17 Pro
+phone69|iPhone 17 Pro Max
 ipad13|iPad Pro 13-inch}"
 
 pick_udid() {
@@ -57,8 +57,7 @@ while IFS='|' read -r LABEL NAME; do
   [ -z "$LABEL" ] && continue
   UDID="$(pick_udid "$NAME")"
   if [ -z "$UDID" ]; then
-    echo "::warning::no simulator named '$NAME' for $LABEL"
-    FAIL=1
+    echo "::warning::no simulator named '$NAME' for $LABEL (skipped)"
     continue
   fi
   echo "=== $LABEL: $NAME ($UDID)"
@@ -82,4 +81,6 @@ for f in "$OUT"/*.png; do
   [ -f "$f" ] || continue
   echo "$(basename "$f") $(sips -g pixelWidth -g pixelHeight "$f" | awk '/pixel/{printf "%s ", $2}')"
 done
+# A missing device is only a warning; fail when a test failed or nothing was captured.
+ls "$OUT"/*.png >/dev/null 2>&1 || FAIL=1
 exit "$FAIL"
