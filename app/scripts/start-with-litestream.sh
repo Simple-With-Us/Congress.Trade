@@ -38,7 +38,14 @@ log() {
 }
 
 CT_PROJECT_ID="${INFISICAL_APP_PROJECT_ID:-}"
-CT_ENV="${INFISICAL_ENV:-prod}"
+# prod is the only Infisical environment (owner 2026-10-10:  dev and staging are
+# retired).  Replication credentials are always read from prod, whatever
+# INFISICAL_ENV says;  a stray value is logged loudly (the app itself refuses it).
+CT_ENV="prod"
+case "${INFISICAL_ENV:-prod}" in
+  prod|production) ;;
+  *) log "ERROR-LEVEL WARNING: INFISICAL_ENV is not prod (dev and staging are retired);  reading the prod environment for Litestream anyway." ;;
+esac
 
 litestream_enabled=false
 
