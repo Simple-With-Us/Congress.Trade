@@ -1,5 +1,41 @@
 name: Auto Update PRs
 
+# WHY PR_FILTER IS "labelled", NOT "auto_merge"
+# ---------------------------------------------
+# This workflow merges `main` into open PR branches using GITHUB_TOKEN. GitHub's
+# recursion guard suppresses ALL workflow runs on a GITHUB_TOKEN-authored push,
+# so every sync commit it writes lands a PR head that can never pass CI: the
+# required checks (`typecheck + test` and `gitleaks`, ruleset 20961339) never
+# report, mergeStateStatus stays BLOCKED, and the PR can never merge.
+#
+# The old `PR_FILTER: "auto_merge"` made that a self-sustaining DEADLOCK, because
+# that filter selects PRs with GitHub auto-merge ENABLED -- and this repo's own
+# landing policy is `gh pr merge <n> --squash --auto`, which enables it. The loop:
+#
+#   1. `gh pr merge --auto` arms auto-merge on the PR.
+#   2. PR_FILTER "auto_merge" now selects it; this workflow syncs its branch.
+#   3. The sync commit is authored by github-actions[bot] -> recursion guard.
+#   4. Required checks never report -> BLOCKED -> auto-merge never fires.
+#   5. Auto-merge stays enabled, so the next push to main re-syncs and re-poisons.
+#
+# Measured 2026-10-05: PRs #2615, #2640, #2641 sat in exactly that loop, their
+# heads authored by github-actions[bot] as "chore: auto-update branch with main",
+# re-advanced at 22:27:44-47Z, all BLOCKED.
+#
+# Fix: opt branches in EXPLICITLY with an `autoupdate` label. Arming auto-merge
+# no longer implies branch auto-sync, so a PR can be armed to land on green
+# without its head being poisoned before it gets there.
+#
+# To opt a branch in:  gh pr edit <n> --add-label autoupdate
+# To opt a branch out: label `do-not-update` (EXCLUDED_LABELS, unchanged).
+#
+# This deliberately does NOT switch to a PAT. Owner policy forbids it and
+# scripts/check-actions-runner-policy.mjs hard-fails any workflow containing
+# `secrets.GH_PAT` / `secrets.SHEPHERD_TOKEN` -- see .github/workflows/
+# auto-merge-prs.yml for the full rationale. Note that the PAT objection there
+# is about *arming merges* as a bot; this workflow only writes branch sync
+# commits, so the label gate is both sufficient and policy-clean.
+
 on:
   push:
     branches:
@@ -19,7 +55,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DRY_RUN: "false"
-          PR_FILTER: "auto_merge"
+          PR_FILTER: "labelled"
+          PR_LABELS: "autoupdate"
           EXCLUDED_LABELS: "do-not-update"
           MERGE_MSG: "chore: auto-update branch with main"
           RETRY_COUNT: "3"

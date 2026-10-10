@@ -8,7 +8,7 @@
  * before relying on them. Update EFFECTIVE_DATE when the text changes.
  */
 
-const EFFECTIVE_DATE = 'August 21, 2026';
+const EFFECTIVE_DATE = 'October 9, 2026';
 const ENTITY = 'Jay Wedgeworth, LLC d/b/a Congress.Trade';
 const CONTACT = 'support@congress.trade';
 
@@ -233,8 +233,8 @@ export const TOS_HTML = shell(
 
 <h2>3. Subscriptions, billing &amp; trials</h2>
 <ul>
-<li>Premium is offered as an auto-renewing subscription: <strong>$5.00 / month</strong> or <strong>$50.00 / year</strong> (USD), plus any applicable taxes.&nbsp; The same Premium entitlement is available through the Congress.Trade website (billed by Stripe) or through the Congress.Trade iOS app (billed by Apple as an In-App Purchase); whichever you purchase through, the entitlement applies across both the website and the iOS app on your account.</li>
-<li>New subscriptions may include a free trial (currently 14 days / 2 weeks).&nbsp; If you do not cancel before the trial ends, the subscription renews and your payment method is charged.</li>
+<li>Premium is offered as an auto-renewing subscription: <strong>$8.99 / month</strong> or <strong>$79.99 / year</strong> (U.S. reference prices in USD), plus any applicable taxes.&nbsp; App Store prices in other countries and regions are shown in local currency at purchase.&nbsp; The same Premium entitlement is available through the Congress.Trade website (billed by Stripe) or through the Congress.Trade iOS app (billed by Apple as an In-App Purchase); whichever you purchase through, the entitlement applies across both the website and the iOS app on your account.</li>
+<li>Eligible new subscriptions may include a 1-week free trial.&nbsp; If you do not cancel before the trial ends, the subscription renews and your payment method is charged.</li>
 <li>Subscriptions <strong>automatically renew</strong> at the end of each billing period until canceled.&nbsp; You authorize recurring charges to your payment method.</li>
 <li>We may change prices or plan features; changes apply to the next billing period after reasonable notice.&nbsp; Continued use after a price change constitutes acceptance.</li>
 </ul>

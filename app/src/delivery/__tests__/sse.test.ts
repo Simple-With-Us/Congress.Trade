@@ -55,7 +55,7 @@ describe('openSseStream live-tail backlog drain (cross-region safety net)', () =
     created_at: '2026-01-01T00:00:00.000Z',
   };
 
-  function makeEnv(counter: { backlogReads: number }): Env {
+  function makeEnv(counter: { backlogReads: number; backlogSince?: number[] }, hwm = 0): Env {
     const prepare = (sql: string) => ({
       params: [] as unknown[],
       bind(...params: unknown[]) {
@@ -65,11 +65,16 @@ describe('openSseStream live-tail backlog drain (cross-region safety net)', () =
       async first<T>() {
         if (/FROM subscriptions WHERE id = \?/i.test(sql)) return subRow as T;
         if (/SELECT active FROM subscriptions/i.test(sql)) return { active: 1 } as T;
+        if (/MAX\(cursor_seq\)/i.test(sql)) return { hwm } as T;
         return null as T | null;
       },
       async all<T>() {
+        if (/MAX\(cursor_seq\)/i.test(sql)) {
+          return { results: [{ hwm }] as T[] };
+        }
         if (/idx_tx_cursor/i.test(sql)) {
           counter.backlogReads += 1;
+          counter.backlogSince?.push(Number(this.params[0]));
           return { results: [] as T[] };
         }
         return { results: [] as T[] };
@@ -115,5 +120,34 @@ describe('openSseStream live-tail backlog drain (cross-region safety net)', () =
   it('exposes a sane default drain cadence (30-60s per the cross-region fix)', () => {
     expect(SSE_BACKLOG_DRAIN_INTERVAL_MS).toBeGreaterThanOrEqual(30_000);
     expect(SSE_BACKLOG_DRAIN_INTERVAL_MS).toBeLessThanOrEqual(60_000);
+  });
+
+  it('does not replay history when no resume cursor is provided (live tail at HWM)', async () => {
+    const counter = { backlogReads: 0, backlogSince: [] as number[] };
+    const hwm = 12_345;
+    const res = await openSseStream(makeEnv(counter, hwm), 'sub_1', undefined, 'stream-secret', '127.0.0.1', {
+      maxStreamMs: 120,
+      pollIntervalMs: 10,
+      backlogDrainIntervalMs: 200,
+      reconnectGraceMs: 10,
+    });
+    expect(res.status).toBe(200);
+    const body = await readToClose(res);
+    expect(body).toContain(`event: cursor\ndata: ${hwm}`);
+    // No initial catch-up drain; periodic safety-net drains use the live cursor.
+    expect(counter.backlogReads).toBe(0);
+  });
+
+  it('still runs catch-up replay when since=0 is explicit', async () => {
+    const counter = { backlogReads: 0, backlogSince: [] as number[] };
+    const res = await openSseStream(makeEnv(counter, 99), 'sub_1', 0, 'stream-secret', '127.0.0.1', {
+      maxStreamMs: 80,
+      pollIntervalMs: 10,
+      reconnectGraceMs: 10,
+    });
+    expect(res.status).toBe(200);
+    await readToClose(res);
+    expect(counter.backlogReads).toBeGreaterThanOrEqual(1);
+    expect(counter.backlogSince[0]).toBe(0);
   });
 });

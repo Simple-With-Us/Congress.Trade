@@ -1,7 +1,7 @@
 {
   "imports": {
     "#sentry": "./app/src/deno/sentry.ts",
-    "@sentry/deno": "npm:@sentry/deno@^10.70.0",
+    "@sentry/deno": "npm:@sentry/deno@^11.0.0",
     "@jaywedgeworth22/congress-trading-shared": "./app/vendor/congress-trading-shared/src/index.ts",
     "hono": "npm:hono@^4.12.31",
     "hono/cookie": "npm:hono@^4.12.31/cookie",
@@ -12,7 +12,7 @@
     "cheerio": "npm:cheerio@^1.2.0",
     "fflate": "npm:fflate@^0.8.3",
     "jsonrepair": "npm:jsonrepair@^3.15.0",
-    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1126.0",
+    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1146.0",
     "@google/genai": "npm:@google/genai@^2.21.0",
     "@libsql/client": "npm:@libsql/client@^0.18.0",
     "@libsql/client/web": "npm:@libsql/client@^0.18.0/web"

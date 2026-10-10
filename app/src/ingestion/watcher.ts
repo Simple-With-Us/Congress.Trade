@@ -37,6 +37,7 @@ import {
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
 import { fetchSenatePtrFilings } from './senateSource.ts';
+import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
@@ -1175,6 +1176,11 @@ export async function runWatcher(
     await refreshSenateRelayHealth(env, now);
   } catch (err) {
     console.warn('watcher: senate relay health probe failed:', (err as Error).message);
+  }
+  try {
+    await refreshResidentialProxyHealth(env, now);
+  } catch (err) {
+    console.warn('watcher: residential proxy health probe failed:', (err as Error).message);
   }
   return result;
 }

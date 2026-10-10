@@ -175,7 +175,7 @@ jobs:
         working-directory: app
     steps:
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The persistent workspace may have been left in sparse-checkout mode by
       # an older reporter run. Explicitly restore every tracked path before a
@@ -188,9 +188,9 @@ jobs:
           test -f scripts/check-actions-runner-policy.mjs
           test -d app
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 24
 
       # package.json typecheck is `deno check`; Coolify runners do not ship Deno.
       - name: Install Deno CLI
@@ -276,11 +276,11 @@ jobs:
       run:
         working-directory: services/scan-cpu-worker
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       # The existing worker tests import checkbox/form_chrome, which pull in
       # numpy and OpenCV, so the runtime requirements are needed too — not just
@@ -317,7 +317,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Syntax-check the ship scripts
         run: |
@@ -329,6 +329,7 @@ jobs:
           bash -n scripts/ios-stage-asc-key.sh
           bash -n scripts/test-ios-stage-asc-key.sh
           bash -n scripts/ios-ci-xctest.sh
+          bash -n scripts/ios-assert-stable-xcode.sh
           bash -n scripts/ios-fleet/publish-ios-versions.sh
           node --check scripts/ios-fleet/asc-api.mjs
 

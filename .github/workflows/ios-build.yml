@@ -1,21 +1,24 @@
 name: iOS build (Mac runner)
 
-# Compile AND run the 71 CongressTradeTests cases on the self-hosted Mac runner.
+# Compile AND run CongressTradeTests on GitHub-hosted macos-latest.
 # A broken compile or a failing XCTest must fail this job (never continue-on-error).
+# Prefer macos-latest here — self-hosted / Mac Studio labels are not registered
+# on the org today (check-actions-runner-policy.mjs still allowlists the old
+# xcode26 label set; do not restore it in this workflow until runners exist).
 #
 # The required-check job name is `xcodebuild (unsigned)`.  That job always
 # reports on pull_request (no paths: filter on that event) so GitHub can
 # require it without blocking backend-only PRs.  The Mac work stays behind
-# an iOS-path gate.
+# an iOS-path gate (ubuntu path gate + macos-latest only when ios=1).
 #
-# XCODE BUILDS ONLY (owner directive, 2026-08-12): the Mac labels are only
-# used by the compile+test job below.  Backend typecheck/test/lint stay on
-# hetzner/ubuntu.
+# XCODE BUILDS ONLY: macos-latest is only used by the compile+test job below.
+# Backend typecheck/test stay on ubuntu-latest (see ci.yml).
 #
-# Why this exists: version 1.0 was rejected as INVALID_BINARY twice, and the
-# box carries stable Xcode 26.x and Xcode-beta 27 side by side.  A binary
+# Why this exists: version 1.0 was rejected as INVALID_BINARY twice.  A binary
 # built against the beta SDK passes TestFlight upload but fails App Store
-# submission.  CI pins DEVELOPER_DIR to stable and ASSERTS the version.
+# submission.  DEVELOPER_DIR is the hosted image default /Applications/Xcode.app
+# (stable).  scripts/ios-assert-stable-xcode.sh rejects beta toolchains (path,
+# plist, and xcodebuild -version) — it does not pin a specific Xcode version.
 #
 # Deliberately unsigned for the device compile, and no archive/upload —
 # TestFlight shipping stays in scripts/ios-ship-testflight.sh.
@@ -34,6 +37,7 @@ on:
       - 'clients/ios/**'
       - '.github/workflows/ios-build.yml'
       - 'scripts/ios-ci-xctest.sh'
+      - 'scripts/ios-assert-stable-xcode.sh'
   workflow_dispatch:
 
 permissions:
@@ -54,7 +58,7 @@ jobs:
     outputs:
       ios: ${{ steps.filter.outputs.ios }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Decide whether Mac compile+test must run
         id: filter
@@ -74,7 +78,7 @@ jobs:
             exit 0
           fi
           git fetch --depth=1 origin "$BASE_SHA"
-          if git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -E '^(clients/ios/|\.github/workflows/ios-build\.yml$|scripts/ios-ci-xctest\.sh$)'; then
+          if git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -E '^(clients/ios/|\.github/workflows/ios-build\.yml$|scripts/ios-ci-xctest\.sh$|scripts/ios-assert-stable-xcode\.sh$)'; then
             echo "ios=1" >> "$GITHUB_OUTPUT"
             echo "iOS paths changed; Mac compile+test required."
           else
@@ -94,20 +98,10 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Assert stable Xcode (never beta)
-        run: |
-          echo "DEVELOPER_DIR=${DEVELOPER_DIR}"
-          xcodebuild -version
-          ver=$(xcodebuild -version | awk 'NR==1{print $2}')
-          echo "Xcode version: ${ver}"
-          case "$DEVELOPER_DIR" in
-            *[Bb]eta*)
-              echo "::error::DEVELOPER_DIR resolves to a beta Xcode: $DEVELOPER_DIR"
-              exit 1
-              ;;
-          esac
+        run: bash scripts/ios-assert-stable-xcode.sh
 
       - name: Assert XcodeGen drift
         run: |
@@ -129,9 +123,8 @@ jobs:
             [ -x "$candidate" ] && XCODEGEN="$candidate"
           done
           if [ -z "$XCODEGEN" ]; then
-            # This job runs on `macos-latest` — a GitHub-HOSTED, ephemeral VM,
-            # not the owned Mac (the stale comment at the top of this file says
-            # otherwise; the job log's /Users/runner paths settle it).  The
+            # This job runs on `macos-latest` — a GitHub-hosted ephemeral VM
+            # (/Users/runner in logs).  The
             # hosted image used to ship xcodegen — the 2026-09-04 run resolved
             # it fine — and no longer does.  So installing it here is the
             # correct fix, not a workaround: it touches nobody's machine and
@@ -170,7 +163,7 @@ jobs:
 
       - name: Upload XCTest result bundle
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: congress-trade-ios-xcresult
           path: ${{ runner.temp }}/CongressTrade.xcresult

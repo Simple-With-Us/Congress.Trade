@@ -52,7 +52,7 @@ describe('POST /securities/import — refs batching', () => {
     expect(body.refs).toBe(5);
     expect(batchCalls).toBe(1); // single chunk (<100)
     expect(batchedStmts).toBe(5);
-    expect(runCalls).toBe(0); // happy path uses batch, not per-row run
+    expect(runCalls).toBe(1); // peer_import_receipts insert (refs still use batch, not per-row run)
   });
 
   it('chunks more than 100 refs into multiple batch() calls', async () => {

@@ -15,9 +15,17 @@ import {
 } from '../extraction/reviewQueueHealth.ts';
 import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
+import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { classifyFailedOutboxRow } from '../ingestion/transientDlq.ts';
+import {
+  cronOverrunIsLoud,
+  CRON_TICK_OVERRUN_CRITICAL_COUNT,
+  readCronTickOverrun,
+  type CronTickOverrun,
+} from './cronDeadlineSignal.ts';
 import { z } from 'zod';
 import {
   allocateProbes,
@@ -27,6 +35,11 @@ import {
   DEFAULT_PROBE_SCHEDULE_CONFIG,
   type ProbeScheduleConfig,
 } from '../ingestion/probeSchedule.ts';
+import {
+  buildFailedIngestionOutboxIdentity,
+  formatIngestionDeadLetterIdentityDetail,
+  type FailedIngestionOutboxIdentity,
+} from '../ingestion/failedOutboxIdentity.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -80,11 +93,31 @@ export interface PipelineSignals {
   outboxOldestAt: string | null;
   outboxFailed: number | null;
   /**
-   * Failed outbox rows that still count as live degradation: not parked
-   * (`last_error LIKE 'parked:%'`) and updated within 24h.  Saturated
-   * historical DLQ must not mask a new stall (#2182).
+   * Failed outbox rows updated within 24h that are not parked (`parked:%`).
+   * Used for detail only — active failures degrade regardless of age.
    */
   outboxFailedFresh?: number | null;
+  /**
+   * Failed outbox rows that are not explicitly parked.  Any non-zero count
+   * degrades health (board f6be69f466af — age alone must not clear failures).
+   */
+  outboxFailedActive?: number | null;
+  /**
+   * Failed rows whose last_error starts with `parked:`.  Human review.
+   * Null means the classifier did not run.  Parked-only stays ok.
+   */
+  outboxFailedParked?: number | null;
+  /**
+   * Aged failures that are poison, non-transient, or past the auto-retry cap.
+   * Null means the classifier did not run.  These stay inside the active
+   * count, so they degrade with every other non-parked failure.  The detail
+   * names the operator replay because the hourly sweep will not touch them.
+   */
+  outboxFailedNonRetryable?: number | null;
+  /** Recent cron deadline / lock-skip episode.  Null or omitted means none. */
+  cronTickOverrun?: CronTickOverrun | null;
+  /** Sorted failed doc_ids fingerprint for count-only dispute resolution (board c5a4de41). */
+  outboxFailedIdentity?: FailedIngestionOutboxIdentity | null;
   /** ALL unresolved review_queue rows (eligible + suppressed + terminal). */
   reviewBacklog: number | null;
   reviewEligible: number | null;
@@ -197,6 +230,16 @@ export interface PipelineSignals {
   } | null;
   /** True when a residential proxy is configured (retires the legacy scout relay). */
   residentialProxyConfigured?: boolean;
+  /** Residential proxy egress probe (CONFIG_KV), when explicitly configured. */
+  residentialProxy?: {
+    configured: boolean;
+    probe: {
+      ok: boolean;
+      status: number | null;
+      checkedAt: string;
+      host?: string;
+    } | null;
+  } | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
    * an indexed column — price_eod itself is 1.4M rows).  Absent = the signal builder
@@ -205,6 +248,13 @@ export interface PipelineSignals {
   priceEodLatestDate?: string | null;
   /** Newest S&P 500 daily bar (MAX spx_eod.date).  Same absent/null semantics. */
   spxEodLatestDate?: string | null;
+  /** Webhook rows parked behind an open per-target circuit breaker. */
+  deliveryParked?: number | null;
+  /**
+   * Webhook rows past the per-subscription parked depth cap.  Recoverable via
+   * recoverQuarantinedDeliveries and POST /api/admin/delivery-requeue-quarantined.
+   */
+  deliveryQuarantined?: number | null;
 }
 
 export interface PipelineThresholds {
@@ -449,31 +499,95 @@ export function evaluatePipelineSignals(
     checks.push({ id: 'ingestion_backlog', status: 'ok', detail: 'Outbox backlog clear', value: 0 });
   }
 
-  // 2. Ingestion dead letter.  Only FRESH failures degrade: parked rows
-  // (`last_error` prefix `parked:`) and failures older than 24h stay visible
-  // as a triaged count so a saturated DLQ cannot hide a new stall (#2182).
+  // 2. Ingestion dead letter.  Parked rows (`parked:`) are intentionally
+  // triaged and stay ok.  Every other failed row degrades until requeued or
+  // parked (board f6be69f466af — age alone must not clear failures).  Fresh
+  // (24h) is detail only so a new stall is obvious beside a saturated DLQ
+  // (#2182).  The hourly sweep still replays transient rows under the cycle
+  // cap; while they remain failed they stay degraded.  Poison and capped
+  // rows add the operator replay because that sweep will not touch them.
   if (s.outboxFailed === null) {
     checks.push({ id: 'ingestion_dead_letter', status: 'unknown', detail: 'Outbox failure count uncollected', value: null });
   } else {
-    const fresh = s.outboxFailedFresh ?? s.outboxFailed;
-    const triaged = Math.max(0, s.outboxFailed - (fresh ?? 0));
-    if (fresh != null && fresh > 0) {
+    const parked = Math.max(0, s.outboxFailed - (s.outboxFailedActive ?? s.outboxFailed));
+    const active = s.outboxFailedActive ?? Math.max(0, s.outboxFailed - parked);
+    const fresh = s.outboxFailedFresh ?? 0;
+    const identitySuffix = formatIngestionDeadLetterIdentityDetail(s.outboxFailedIdentity, {
+      includeDocIdPreview: false,
+    });
+    const nonRetryable = s.outboxFailedNonRetryable;
+    const actionDetail = nonRetryable != null && nonRetryable > 0
+      ? `  ${nonRetryable} non-transient or past the retry cap (not auto-retried).  Operator replay after a fix: POST /api/admin/ingest-requeue-failed.`
+      : '';
+    if (active > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'degraded',
-        detail: `${fresh} fresh failed outbox item(s) in 24h` +
-          (triaged > 0 ? ` (${triaged} triaged/parked)` : ''),
-        value: fresh,
+        detail: `${active} active failed outbox item(s)` +
+          (fresh > 0 ? ` (${fresh} fresh in 24h` + (parked > 0 ? `; ${parked} parked)` : ')') : parked > 0 ? ` (${parked} parked)` : '') +
+          actionDetail +
+          identitySuffix,
+        value: active,
       });
     } else if (s.outboxFailed > 0) {
       checks.push({
         id: 'ingestion_dead_letter',
         status: 'ok',
-        detail: `${s.outboxFailed} triaged dead-letter item(s); 0 fresh in 24h`,
+        detail: `${s.outboxFailed} parked dead-letter item(s) (human review, not auto-retried)` + identitySuffix,
         value: 0,
       });
     } else {
       checks.push({ id: 'ingestion_dead_letter', status: 'ok', detail: 'No failed outbox items', value: 0 });
+    }
+  }
+
+  // Cron deadline / lock skip.  Omitted and null both mean no open episode,
+  // so a KV blip does not flip the whole pipeline to unknown.  The detail
+  // carries the real reason (deadline text or SQLITE_BUSY).
+  if (cronOverrunIsLoud(s.cronTickOverrun, nowMs)) {
+    const overrun = s.cronTickOverrun!;
+    const critical = overrun.count >= CRON_TICK_OVERRUN_CRITICAL_COUNT;
+    checks.push({
+      id: 'cron_deadline',
+      status: critical ? 'critical' : 'degraded',
+      detail: `Tick did not finish ${overrun.count} time(s) since ${overrun.at}: ${overrun.reason}.  The in-flight tick is aborted so the next tick can reclaim leases.`,
+      value: overrun.count,
+    });
+  } else {
+    checks.push({
+      id: 'cron_deadline',
+      status: 'ok',
+      detail: 'No recent cron deadline or lock-skip episode',
+      value: 0,
+    });
+  }
+
+  if (s.deliveryQuarantined !== undefined || s.deliveryParked !== undefined) {
+    if (s.deliveryQuarantined === null) {
+      checks.push({
+        id: 'delivery_quarantine',
+        status: 'unknown',
+        detail: 'Quarantined delivery count uncollected',
+        value: null,
+      });
+    } else if (s.deliveryQuarantined > 0) {
+      const parkedDeliveries = s.deliveryParked ?? 0;
+      checks.push({
+        id: 'delivery_quarantine',
+        status: 'degraded',
+        detail:
+          `${s.deliveryQuarantined} webhook delivery(ies) quarantined after parked cap overflow ` +
+          `(${parkedDeliveries} still parked). Rows recover when the target circuit closes and parked ` +
+          `headroom opens, or via POST /api/admin/delivery-requeue-quarantined`,
+        value: s.deliveryQuarantined,
+      });
+    } else {
+      checks.push({
+        id: 'delivery_quarantine',
+        status: 'ok',
+        detail: 'No quarantined webhook deliveries',
+        value: 0,
+      });
     }
   }
 
@@ -872,14 +986,55 @@ export function evaluatePipelineSignals(
     }
   }
 
-  // 13. Senate residential relay / residential proxy egress (issue #1604).
+  // 13. Senate egress: residential proxy (preferred) or named Senate relay (#1604).
   if (s.residentialProxyConfigured) {
-    checks.push({
-      id: 'senate_relay',
-      status: 'ok',
-      detail: 'Residential proxy active for Senate/House scraping (scout relay retired)',
-      value: 0,
-    });
+    const rp = s.residentialProxy;
+    if (rp == null) {
+      checks.push({ id: 'senate_relay', status: 'unknown', detail: 'Residential proxy liveness uncollected', value: null });
+    } else if (!rp.configured) {
+      checks.push({
+        id: 'senate_relay',
+        status: 'degraded',
+        detail: 'Residential proxy env missing despite configured signal — Senate/House egress may use datacenter IP',
+        value: null,
+      });
+    } else if (!rp.probe) {
+      checks.push({
+        id: 'senate_relay',
+        status: 'unknown',
+        detail: 'Residential proxy configured but not yet probed',
+        value: null,
+      });
+    } else {
+      const probe = rp.probe;
+      const checkedMs = Date.parse(probe.checkedAt);
+      const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
+      const host = probe.host ?? 'residential-proxy';
+      if (!probe.ok) {
+        checks.push({
+          id: 'senate_relay',
+          status: 'stalled',
+          detail: `Residential proxy DOWN at ${host}`
+            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + ' — Senate/House fetches may fail Imperva checks until the proxy is back.',
+          value: probe.status,
+        });
+      } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+        checks.push({
+          id: 'senate_relay',
+          status: 'degraded',
+          detail: `Residential proxy probe stale: last ok ${Math.round(ageMin)}m ago at ${host} (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+          value: Math.round(ageMin),
+        });
+      } else {
+        checks.push({
+          id: 'senate_relay',
+          status: 'ok',
+          detail: `Residential proxy live at ${host}: probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+          value: Math.round(ageMin * 10) / 10,
+        });
+      }
+    }
   } else if (s.senateRelay == null) {
     checks.push({ id: 'senate_relay', status: 'unknown', detail: 'Senate relay liveness uncollected', value: null });
   } else if (!s.senateRelay.configured) {
@@ -1039,9 +1194,15 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   const schedule = probeScheduleConfigFromEnv(env as unknown as Record<string, string | undefined>);
 
   let outboxPending: number | null = null;
+  let deliveryParked: number | null = null;
+  let deliveryQuarantined: number | null = null;
   let outboxOldestAt: string | null = null;
   let outboxFailed: number | null = null;
   let outboxFailedFresh: number | null = null;
+  let outboxFailedActive: number | null = null;
+  let outboxFailedParked: number | null = null;
+  let outboxFailedNonRetryable: number | null = null;
+  let cronTickOverrun: CronTickOverrun | null = null;
   let reviewBacklog: number | null = null;
   let reviewEligible: number | null = null;
   let reviewSuppressed: number | null = null;
@@ -1188,20 +1349,72 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   } catch {}
 
   try {
-    const res = await get<{ n: number; fresh: number }>(
+    const res = await get<{ n: number; fresh: number; active: number }>(
       env.DB,
       `SELECT COUNT(*) AS n,
               SUM(CASE
                     WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 0
-                    WHEN updated_at IS NOT NULL AND updated_at < ? THEN 0
                     ELSE 1
+                  END) AS active,
+              SUM(CASE
+                    WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 0
+                    WHEN updated_at IS NOT NULL AND updated_at >= ? THEN 1
+                    ELSE 0
                   END) AS fresh
          FROM ingestion_outbox WHERE status = 'failed'`,
       [iso24hAgo],
     );
     if (res) {
       outboxFailed = Number(res.n ?? 0);
+      outboxFailedActive = Number(res.active ?? 0);
       outboxFailedFresh = Number(res.fresh ?? 0);
+    }
+  } catch {}
+
+  let outboxFailedIdentity: FailedIngestionOutboxIdentity | null = null;
+  try {
+    outboxFailedIdentity = await buildFailedIngestionOutboxIdentity(env.DB, outboxFailed);
+  } catch {}
+
+  try {
+    const rows = await all<{
+      last_error: string | null;
+      dead_letter_cycles: number | null;
+      updated_at: string | null;
+    }>(
+      env.DB,
+      `SELECT last_error, dead_letter_cycles, updated_at
+         FROM ingestion_outbox
+        WHERE status = 'failed'
+        LIMIT 500`,
+    );
+    let parked = 0;
+    let nonRetryable = 0;
+    for (const row of rows) {
+      const kind = classifyFailedOutboxRow(row, iso24hAgo);
+      if (kind === 'parked') parked += 1;
+      else if (kind === 'non_retryable') nonRetryable += 1;
+    }
+    outboxFailedParked = parked;
+    outboxFailedNonRetryable = nonRetryable;
+  } catch {}
+
+  try {
+    cronTickOverrun = await readCronTickOverrun(env);
+  } catch {
+    cronTickOverrun = null;
+  }
+
+  try {
+    const res = await get<{ parked: number; quarantined: number }>(
+      env.DB,
+      `SELECT SUM(CASE WHEN status = 'parked' THEN 1 ELSE 0 END) AS parked,
+              SUM(CASE WHEN status = 'quarantined' THEN 1 ELSE 0 END) AS quarantined
+         FROM deliveries`,
+    );
+    if (res) {
+      deliveryParked = Number(res.parked ?? 0);
+      deliveryQuarantined = Number(res.quarantined ?? 0);
     }
   } catch {}
 
@@ -1409,11 +1622,31 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     resolveResidentialProxyUrl(env, { allowDefault: false }),
   );
 
+  let residentialProxy: PipelineSignals['residentialProxy'] = {
+    configured: residentialProxyConfigured,
+    probe: null,
+  };
+  if (residentialProxyConfigured) {
+    try {
+      residentialProxy = {
+        configured: true,
+        probe: await readResidentialProxyProbe(env),
+      };
+    } catch {
+      residentialProxy = null;
+    }
+  }
+
   const signals: PipelineSignals = {
     outboxPending,
     outboxOldestAt,
     outboxFailed,
     outboxFailedFresh,
+    outboxFailedActive,
+    outboxFailedParked,
+    outboxFailedNonRetryable,
+    cronTickOverrun,
+    outboxFailedIdentity,
     reviewBacklog,
     reviewEligible,
     reviewSuppressed,
@@ -1431,11 +1664,14 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     latencyProviders,
     senateRelay,
     residentialProxyConfigured,
+    residentialProxy,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,
     filingSkipsByAction24h,
     fmpLatency,
+    deliveryParked,
+    deliveryQuarantined,
   };
 
   const evaluated = evaluatePipelineSignals(signals, nowMs, DEFAULT_PIPELINE_THRESHOLDS, schedule);

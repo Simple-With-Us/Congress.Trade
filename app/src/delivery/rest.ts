@@ -59,6 +59,7 @@ import { getUserById } from '../auth/users.ts';
 import { getAppleSubscription, appleStatusGrantsAccess } from '../billing/appleSubscriptions.ts';
 import { verifyDeviceEntitlementToken } from '../billing/deviceEntitlement.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
+import { currentPriceStalenessFields } from '../prices/staleness.ts';
 
 /**
  * `__member_name` is a raw join alias (COALESCE(display_name, full_name) at
@@ -109,8 +110,8 @@ function parseIntOrUndef(v: string | undefined): number | undefined {
  * header, which clients resend automatically on reconnect. Each `trade.new`
  * event is emitted with `id: <cursorSeq>`, so the header value is the last
  * cursor the client saw — replaying cursor_seq > that value resumes gap-free.
- * Returns undefined when neither is a finite number (openSseStream treats that
- * as "from the beginning").
+ * Returns undefined when neither is a finite number (openSseStream starts at
+ * the durable high-water mark for a live tail with no history replay).
  */
 export function resolveResumeCursor(
   sinceParam: string | undefined,
@@ -915,11 +916,10 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- GET /stream --------------------------------------------------------
-  // SSE live stream. Resume point comes from ?since=<cursor_seq> or, on an
-  // automatic EventSource reconnect, the Last-Event-ID header (each trade event
-  // carries id:<cursorSeq>). The backlog replay is sourced from the full
-  // transactions table, so resume is gap-free regardless of how long the client
-  // was disconnected.
+  // SSE live stream. With no ?since= and no Last-Event-ID, the stream attaches
+  // at the current cursor high-water mark (live tail only). Resume / catch-up
+  // uses ?since=<cursor_seq> or the Last-Event-ID header (each trade event
+  // carries id:<cursorSeq>); replay is gap-free from the transactions table.
   //
   // Token transport: prefer `Authorization: Bearer <secret>` (or
   // X-Subscription-Secret) so the secret stays out of URLs (browser history,
@@ -1095,11 +1095,15 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       'SELECT current_price, current_price_date FROM securities_ref WHERE ticker = ?',
       [ticker],
     );
+    const staleness = currentPriceStalenessFields(ref?.current_price_date ?? null);
     return c.json({
       ticker,
       closes,
       currentPrice: ref?.current_price ?? null,
       currentPriceDate: ref?.current_price_date ?? null,
+      stale: staleness.stale,
+      freshThrough: staleness.freshThrough,
+      dataAgeDays: staleness.dataAgeDays,
     });
   });
 
@@ -1262,6 +1266,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const closes = await all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params);
     const sq = priceRangeQuery('spx_eod', null, from, to, limit);
     const spx = await all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params);
+    const staleness = currentPriceStalenessFields(refRow?.current_price_date ?? null);
     return c.json({
       ticker,
       ref: refRow ? mapSecurityRef(refRow) : null,
@@ -1270,6 +1275,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         closes,
         currentPrice: refRow?.current_price ?? null,
         currentPriceDate: refRow?.current_price_date ?? null,
+        stale: staleness.stale,
+        freshThrough: staleness.freshThrough,
+        dataAgeDays: staleness.dataAgeDays,
       },
       spx,
     });

@@ -64,6 +64,7 @@ struct PremiumSheet: View {
 
     private let benefits: [Benefit] = [
         .init(systemImage: "doc.text", text: "Open the original filing PDF from Congress"),
+        .init(systemImage: "chart.bar.doc.horizontal", text: "Proprietary Enrichment Data in every payload"),
         .init(systemImage: "arrow.down.doc", text: "Full-history CSV export"),
         .init(
             systemImage: "bolt.horizontal",

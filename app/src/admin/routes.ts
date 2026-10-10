@@ -172,6 +172,10 @@ function isObjectStoreAuthError(message: string): boolean {
   return /\bunauthorized\b|\baccessdenied\b|\binvalidaccesskeyid\b|\bsignaturedoesnotmatch\b/i.test(message);
 }
 import { flushIngestionOutbox, requeueFailedIngestionOutbox } from '../ingestion/outbox.ts';
+import {
+  buildFailedIngestionOutboxIdentity,
+  loadFailedIngestionOutboxRows,
+} from '../ingestion/failedOutboxIdentity.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
@@ -188,7 +192,8 @@ import { resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { createRuntimeQueueHandlers } from '../deno/runtimeHandlers.ts';
 import { runScheduledTick } from '../deno/scheduledTick.ts';
 import { requeueFailedDurableJobs } from '../deno/durableQueue.ts';
-import { readTargetCircuits } from '../delivery/targetCircuit.ts';
+import { flushParkedDeliveries, readTargetCircuits, recoverQuarantinedDeliveries } from '../delivery/targetCircuit.ts';
+import { z } from 'zod';
 import { inspectLlmSpend } from '../shared/llmSpend.ts';
 import { runR2UsageSummary } from '../shared/r2Usage.ts';
 import {
@@ -257,6 +262,14 @@ import {
   stableMeasuredUsageIdempotencyKey,
   trackedFetch,
 } from '../shared/thirdPartyTelemetry.ts';
+import {
+  acceptedCountsFromSummary,
+  countSchemaDropped,
+  persistPeerImportReceipt,
+  rejectedCountsFromErrors,
+  resolvePeerImportRequestId,
+  warnPeerImportSchemaDrops,
+} from '../share/importReceipt.ts';
 import {
   BASE_SCHEMA_STATEMENTS,
   DISCLOSURE_AVAILABLE_SCHEMA_STATEMENTS,
@@ -2212,6 +2225,15 @@ async function stampLocalVisionSubmitted(
 }
 
 export const createAdminApp = buildAdminRouter;
+
+const DeliveryRequeueBodySchema = z
+  .object({
+    subscriptionId: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(5000).default(500),
+    ignoreCircuit: z.boolean().default(false),
+    dryRun: z.boolean().default(false),
+  })
+  .strict();
 
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
@@ -4485,11 +4507,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
          (SELECT COUNT(*) FROM securities_ref WHERE source = 'imported') AS imported_refs,
          (SELECT COUNT(*) FROM fundamentals_eod WHERE source = 'imported') AS fundamentals_rows,
          (SELECT COUNT(*) FROM analyst_consensus WHERE source = 'imported') AS analyst_rows,
-         (SELECT MAX(updated_at)
+         (SELECT MAX(received_at)
             FROM (
-              SELECT updated_at FROM fundamentals_eod WHERE source = 'imported'
+              SELECT received_at FROM fundamentals_eod WHERE source = 'imported'
               UNION ALL
-              SELECT updated_at FROM analyst_consensus WHERE source = 'imported'
+              SELECT received_at FROM analyst_consensus WHERE source = 'imported'
             )) AS latest_import_at`,
     );
     const appBReceived = appBReceivedRows[0];
@@ -5361,9 +5383,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // --- GET /data-recovery/status -----------------------------------------
   // Secret-safe production receipt for migration/backfill work. Counts are
   // grouped server-side so operators can prove live-source progress without
-  // downloading the corpus or exposing filing/member payloads.
+  // downloading the corpus or exposing filing/member payloads. Failed
+  // ingestion_outbox rows include doc_id identity for board c5a4de41 (read-only;
+  // does not requeue — follow board 50e7996f for operator recovery).
   r.get('/data-recovery/status', async (c) => {
-    const [filings, transactions, ingestionOutbox, deliveryOutbox, runtimeQueue, filers, prices] = await Promise.all([
+    const [filings, transactions, ingestionOutbox, deliveryOutbox, runtimeQueue, filers, prices, ingestionOutboxFailed, ingestionOutboxFailedIdentity] = await Promise.all([
       all<{ chamber: string; ingest_status: string; count: number }>(
         c.env.DB,
         `SELECT chamber, COALESCE(ingest_status, 'unknown') AS ingest_status, COUNT(*) AS count
@@ -5418,13 +5442,21 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
             ), 0) AS tickers,
             (SELECT MAX(latest_price_date) FROM securities_ref) AS latest_date`,
       ),
+      loadFailedIngestionOutboxRows(c.env.DB),
+      buildFailedIngestionOutboxIdentity(c.env.DB),
     ]);
     return c.json({
       ok: true,
       asOf: new Date().toISOString(),
       filings,
       transactions,
-      queues: { ingestionOutbox, deliveryOutbox, runtimeQueue },
+      queues: {
+        ingestionOutbox,
+        deliveryOutbox,
+        runtimeQueue,
+        ingestionOutboxFailed,
+        ingestionOutboxFailedIdentity,
+      },
       filers: filers[0] ?? { total: 0, missing_party: 0, missing_state: 0, missing_photo: 0 },
       prices: prices[0] ?? { rows: 0, tickers: 0, latest_date: null },
     });
@@ -5768,6 +5800,41 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           dryRun: body.dryRun === true,
         }),
       );
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  // --- POST /delivery-requeue-quarantined -----------------------------------
+  // Recover webhook deliveries quarantined by the per-subscription parked-depth
+  // cap (status='quarantined'). Moves rows back to 'parked' when headroom exists,
+  // then flushes a batch. Idempotent. Body (all optional):
+  //   { subscriptionId?: string, limit?: number (default 500, max 5000),
+  //     ignoreCircuit?: boolean, dryRun?: boolean }
+  r.post('/delivery-requeue-quarantined', async (c) => {
+    let json: unknown = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) json = JSON.parse(raw);
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = DeliveryRequeueBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
+    try {
+      const recovery = await recoverQuarantinedDeliveries(c.env, {
+        subscriptionId: body.subscriptionId,
+        limit: body.limit,
+        ignoreCircuit: body.ignoreCircuit,
+        dryRun: body.dryRun,
+      });
+      const flushed = body.dryRun
+        ? { scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 }
+        : await flushParkedDeliveries(c.env, { limit: Math.min(body.limit, 200) });
+      return c.json({ ok: true, recovery, flushed });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }
@@ -10131,6 +10198,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // the app can be dialed back without code changes.
     const limits = await importLimits(c.env);
     const contentLength = Number(c.req.header('content-length') ?? 0);
+    const requestId = resolvePeerImportRequestId(c.req.raw.headers);
     if (contentLength > limits.bytes) {
       return c.json(
         {
@@ -10143,13 +10211,15 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       );
     }
 
+    let rawText = '';
     let body: Record<string, unknown> = {};
     try {
-      const raw = await c.req.text();
-      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+      rawText = await c.req.text();
+      if (rawText) body = JSON.parse(rawText) as Record<string, unknown>;
     } catch {
       return c.json({ error: 'invalid JSON body' }, 400);
     }
+    const payloadBytes = rawText.length > 0 ? rawText.length : contentLength;
     const summary = {
       refs: 0, spxRows: 0, pricedTickers: 0, priceRows: 0, perfTickers: 0,
       insiderRows: 0, shortVolumeRows: 0, fundamentalsRows: 0, analystRows: 0,
@@ -10181,7 +10251,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (body.origin != null && typeof body.origin !== 'string') {
       return c.json({ error: 'invalid shared payload: origin must be a string' }, 400);
     }
-    body = {
+    const originTag = typeof body.origin === 'string' ? body.origin : null;
+    const filteredShareBody = {
       ...body,
       refs: filterShareRows(body.refs, SecurityRefInputSchema),
       prices: filterShareRows(body.prices, PriceSeriesSchema),
@@ -10191,6 +10262,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       fundamentals: filterShareRows(body.fundamentals, FundamentalRowSchema, normalizeFundamentalAliases),
       analyst: filterShareRows(body.analyst, AnalystRowSchema),
     };
+    const dropped = countSchemaDropped(body, filteredShareBody);
+    body = filteredShareBody;
 
     const REF_KEYS = [
       'companyName', 'sector', 'industry', 'assetClass', 'isEtf', 'isAdr', 'country',
@@ -10300,21 +10373,34 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           // the ticker is marked fresh below and won't be re-selected to fill them,
           // so leaving them null would strand current-return analytics.
           let currentPrice: number | null = null;
-          let currentPriceDate = nowIso.slice(0, 10);
+          let currentPriceDate: string | null = null;
           if (typeof o.currentPrice === 'number') {
             currentPrice = o.currentPrice;
-            if (typeof o.currentPriceDate === 'string') currentPriceDate = o.currentPriceDate;
+            if (typeof o.currentPriceDate === 'string' && o.currentPriceDate.length >= 10) {
+              currentPriceDate = o.currentPriceDate.slice(0, 10);
+            } else if (latestCached?.d) {
+              currentPriceDate = latestCached.d;
+            }
           } else if (latestCached?.c != null && latestCached.d) {
             currentPrice = latestCached.c;
             currentPriceDate = latestCached.d;
           }
           if (currentPrice !== null) {
-            await run(
-              c.env.DB,
-              `INSERT INTO securities_ref (ticker, current_price, current_price_date) VALUES (?, ?, ?)
-               ON CONFLICT(ticker) DO UPDATE SET current_price=excluded.current_price, current_price_date=excluded.current_price_date`,
-              [ticker, currentPrice, currentPriceDate],
-            );
+            if (currentPriceDate) {
+              await run(
+                c.env.DB,
+                `INSERT INTO securities_ref (ticker, current_price, current_price_date) VALUES (?, ?, ?)
+                 ON CONFLICT(ticker) DO UPDATE SET current_price=excluded.current_price, current_price_date=excluded.current_price_date`,
+                [ticker, currentPrice, currentPriceDate],
+              );
+            } else {
+              await run(
+                c.env.DB,
+                `INSERT INTO securities_ref (ticker, current_price) VALUES (?, ?)
+                 ON CONFLICT(ticker) DO UPDATE SET current_price=excluded.current_price`,
+                [ticker, currentPrice],
+              );
+            }
           }
           // Freshness: derive latest_price_date ONLY from the true max cached CLOSE
           // date — never today() or a bare currentPriceDate, which would mark a
@@ -10444,8 +10530,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           rows.slice(i, i + 100).map((o) =>
             c.env.DB.prepare(
               `INSERT INTO fundamentals_eod (ticker, date, pe_ratio, eps, beta, dividend_yield,
-                 week52_high, week52_low, fcf_yield, debt_to_equity, eps_growth, source, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?)
+                 week52_high, week52_low, fcf_yield, debt_to_equity, eps_growth, source, updated_at, received_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?)
                ON CONFLICT(ticker, date) DO UPDATE SET
                  pe_ratio=COALESCE(excluded.pe_ratio, fundamentals_eod.pe_ratio),
                  eps=COALESCE(excluded.eps, fundamentals_eod.eps),
@@ -10456,7 +10542,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                  fcf_yield=COALESCE(excluded.fcf_yield, fundamentals_eod.fcf_yield),
                  debt_to_equity=COALESCE(excluded.debt_to_equity, fundamentals_eod.debt_to_equity),
                  eps_growth=COALESCE(excluded.eps_growth, fundamentals_eod.eps_growth),
-                 source=excluded.source, updated_at=excluded.updated_at`,
+                 source=excluded.source, updated_at=excluded.updated_at, received_at=excluded.received_at`,
             ).bind(
               (o.ticker as string).toUpperCase(),
               (o.date as string).slice(0, 10),
@@ -10469,6 +10555,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
               numOrNull(o.fcfYield),
               numOrNull(o.debtToEquity),
               numOrNull(o.epsGrowth),
+              importSourceTimestamp(o, ['updatedAt'], nowIso),
               nowIso,
             ),
           ),
@@ -10490,8 +10577,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
             c.env.DB.prepare(
               `INSERT INTO analyst_consensus (ticker, date, rating, target_mean, target_high,
                  target_low, target_median, analyst_count, strong_buy, buy, hold, sell, strong_sell,
-                 source, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?)
+                 source, updated_at, received_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?)
                ON CONFLICT(ticker, date) DO UPDATE SET
                  rating=COALESCE(excluded.rating, analyst_consensus.rating),
                  target_mean=COALESCE(excluded.target_mean, analyst_consensus.target_mean),
@@ -10504,7 +10591,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                  hold=COALESCE(excluded.hold, analyst_consensus.hold),
                  sell=COALESCE(excluded.sell, analyst_consensus.sell),
                  strong_sell=COALESCE(excluded.strong_sell, analyst_consensus.strong_sell),
-                 source=excluded.source, updated_at=excluded.updated_at`,
+                 source=excluded.source, updated_at=excluded.updated_at, received_at=excluded.received_at`,
             ).bind(
               (o.ticker as string).toUpperCase(),
               (o.date as string).slice(0, 10),
@@ -10519,6 +10606,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
               intOrNull(o.hold),
               intOrNull(o.sell),
               intOrNull(o.strongSell),
+              importSourceTimestamp(o, ['asOfTimestamp', 'updatedAt'], nowIso),
               nowIso,
             ),
           ),
@@ -10527,7 +10615,27 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       summary.analystRows += rows.length;
     }
 
-    return c.json({ ok: summary.errors.length === 0, ...summary });
+    const ok = summary.errors.length === 0;
+    const accepted = acceptedCountsFromSummary(summary);
+    const rejected = rejectedCountsFromErrors(summary.errors);
+    warnPeerImportSchemaDrops({ requestId, origin: originTag, dropped, payloadBytes });
+    try {
+      await persistPeerImportReceipt(c.env.DB, {
+        requestId,
+        receivedAt: nowIso,
+        origin: originTag,
+        payloadBytes,
+        ok,
+        accepted,
+        dropped,
+        rejected,
+        errors: summary.errors,
+      });
+    } catch (err) {
+      console.warn('peer import receipt persist failed:', (err as Error).message);
+    }
+
+    return c.json({ ok, ...summary, dropped });
   });
 
   // --- POST /enrich-photos ------------------------------------------------
@@ -11433,6 +11541,19 @@ function normalizeFundamentalAliases(row: Record<string, unknown>): Record<strin
 }
 
 /** Coerce an unknown to a finite number or null (for defensive ingest). */
+/** First non-empty string timestamp on the payload; otherwise the receive time. */
+function importSourceTimestamp(
+  row: Record<string, unknown>,
+  keys: string[],
+  receiveIso: string,
+): string {
+  for (const k of keys) {
+    const v = row[k];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return receiveIso;
+}
+
 function numOrNull(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }

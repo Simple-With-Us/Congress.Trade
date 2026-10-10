@@ -8,7 +8,7 @@
   },
   "imports": {
     "#sentry": "./src/deno/sentry.ts",
-    "@sentry/deno": "npm:@sentry/deno@^10.75.0",
+    "@sentry/deno": "npm:@sentry/deno@^11.0.0",
     "@jaywedgeworth22/congress-trading-shared": "./vendor/congress-trading-shared/src/index.ts",
     "hono": "npm:hono@^4.13.7",
     "hono/cookie": "npm:hono@^4.13.7/cookie",
@@ -19,12 +19,12 @@
     "cheerio": "npm:cheerio@^1.2.0",
     "fflate": "npm:fflate@^0.8.3",
     "jsonrepair": "npm:jsonrepair@^3.15.0",
-    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1136.0",
+    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1146.0",
     "@google/genai": "npm:@google/genai@^2.23.0",
     "@libsql/client": "npm:@libsql/client@^0.18.0",
     "@libsql/client/web": "npm:@libsql/client@^0.18.0/web",
-    "@sentry/cloudflare": "npm:@sentry/cloudflare@^10.66.0",
-    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^4.20240718.0"
+    "@sentry/cloudflare": "npm:@sentry/cloudflare@^11.0.0",
+    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^5.0.0"
   },
   "exclude": [
     "node_modules",

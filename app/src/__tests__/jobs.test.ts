@@ -188,6 +188,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
       dead_letter_events: 0,
       ingest_log: 0,
       source_attempts: 0,
+      peer_import_receipts: 0,
       deno_runtime_queue_completed: 0,
       deno_runtime_queue_failed: 0,
       ingestion_outbox_completed: 0,

@@ -53,7 +53,9 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/fleet-backup-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
+export FLEET_BACKUP_APPS=socratic,congress
 FLEET_BACKUP_LIB_ONLY=1 . "$SCRIPT"
+backup_apps_selected
 
 # --- dump_is_complete -------------------------------------------------------
 APP="$TMP/socratic"
