@@ -36,6 +36,15 @@ cd app && npm ci && npm run typecheck && npm run coverage   # 335 files, 4389 te
 
 ## Next Steps & Blockers
 
-- Parent session deletes the `dev` and `staging` environments of the `congress-trade` Infisical project after the data-side checks in its audit note.  Nothing in this repo reads them any more.
-- Eight CT dev-only knobs were deliberately left out of prod.  Each has a safe code default, none hard-fails, and all keep working as before in prod:  `CT_CRON_SCHEDULE` (code default in `app/src/deno/costProfile.ts`), `CT_OUTBOX_LIMIT` (same file), `CT_TICK_DEADLINE_MS` (code default 45000, compose sets 120000), `CT_TICK_STUCK_MINUTES` (10), `CT_UI_LOGO_DISPLAY` (transparent), `INFISICAL_CACHE_TTL_SECONDS` (600 in the resolver), `R2_USAGE_DIGEST_UTC_HOUR` (20), `RETENTION_DELETE_RAW_OBJECTS` (unset means off, deletion stays opt-in).
+- Nothing is outstanding for this change.  The `dev` and `staging` environments are deleted and the eight dev-only knobs are in prod;  see "Update Sat Oct 10 (owner decision)" below.
 - Four kept-prod value conflicts (`CT_DRAIN_CLAIM_SIZE`, `CT_DRAIN_LIMIT`, `RESIDENTIAL_PROXY_HOST`, `RESIDENTIAL_PROXY_URL`) mean local runs now get prod's values for those.
+
+## Update Sat Oct 10 (owner decision)
+
+Later on Sat Oct 10 the owner decided "ok to do all" and "if values differ defer to prod, all the rest move to prod".  That replaces the plan in the first version of this note, which was to leave the eight dev-only knobs out of prod and let them run on their code defaults.
+
+- Copied to prod:  all 8 dev-only keys.  They are `CT_CRON_SCHEDULE`, `CT_OUTBOX_LIMIT`, `CT_TICK_DEADLINE_MS`, `CT_TICK_STUCK_MINUTES`, `CT_UI_LOGO_DISPLAY`, `INFISICAL_CACHE_TTL_SECONDS`, `R2_USAGE_DIGEST_UTC_HOUR` and `RETENTION_DELETE_RAW_OBJECTS`.  Prod now holds an explicit value for each one instead of relying on the code default.
+- `CT_TICK_DEADLINE_MS`:  the code default is 45000 and compose sets 120000.
+- `RETENTION_DELETE_RAW_OBJECTS` was copied with the value `0`, so raw-object deletion stays off.  `app/src/jobs.ts` treats only `1`, `true`, `yes` and `on` as enabled.
+- Value conflicts, prod's value kept:  `CT_DRAIN_CLAIM_SIZE`, `CT_DRAIN_LIMIT`, `RESIDENTIAL_PROXY_HOST` and `RESIDENTIAL_PROXY_URL` differ between dev and prod, and prod's value stays.
+- Environments:  the `dev` and `staging` environments of the `congress-trade` Infisical project are deleted.  Prod is the only environment.
