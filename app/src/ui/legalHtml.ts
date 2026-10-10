@@ -348,7 +348,7 @@ export const PRIVACY_HTML = shell(
 <p>We operate from the United States, and our providers may process data in the U.S. and other countries.&nbsp; By using the Service, you understand your information may be transferred to and processed in the United States.</p>
 
 <h2>9. Children</h2>
-<p>The Service is not directed to, and may not be used by, children under 13.&nbsp; We do not knowingly collect personal information from children under 13.&nbsp; If you believe a child under 13 has provided personal information, contact support@congress.trade so we can investigate and delete it.</p>
+<p>The Service is not directed to, and may not be used by, children under 13.&nbsp; We do not knowingly collect personal information from children under 13.&nbsp; If you believe a child under 13 has provided personal information, contact ${CONTACT} so we can investigate and delete it.</p>
 
 <h2>10. Changes to this Policy</h2>
 <p>We may update this Policy from time to time.&nbsp; Material changes will be reflected by an updated effective date and, where appropriate, additional notice.</p>
