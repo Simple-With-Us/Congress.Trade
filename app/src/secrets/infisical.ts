@@ -67,11 +67,18 @@ function cacheTtlSeconds(env: Env): number {
   return Number.isFinite(n) && n > 0 ? Math.min(n, 3600) : DEFAULT_TTL_SECONDS;
 }
 
+/**
+ * prod is the only Infisical environment the fleet reads (owner 2026-10-10:
+ * dev and staging are retired).  Unset or blank falls back to prod and
+ * "production" is accepted as an alias;  anything else is refused so a stale
+ * INFISICAL_ENV can never read, or write to, a retired environment.
+ */
 function envName(env: Env): string {
-  const val = (env.INFISICAL_ENV || DEFAULT_ENV).trim();
-  if (val === 'production') return 'prod';
-  if (val === 'development') return 'dev';
-  return val || DEFAULT_ENV;
+  const val = (env.INFISICAL_ENV || '').trim();
+  if (!val || val === DEFAULT_ENV || val === 'production') return DEFAULT_ENV;
+  throw new Error(
+    `INFISICAL_ENV must be "${DEFAULT_ENV}" (dev and staging are retired); got "${val.slice(0, 32)}"`,
+  );
 }
 
 function envFallbackAllowed(env: Env): boolean {
@@ -372,6 +379,7 @@ export async function deleteSecret(
 ): Promise<void> {
   const source = configuredSource(env, sourceName);
   const baseUrl = cleanBaseUrl(env.INFISICAL_BASE_URL);
+  const infisicalEnv = envName(env);
   const token = await login(baseUrl, source, options.signal);
   const res = await trackedFetch(`${baseUrl}/api/v3/secrets/raw/${secretKey}`, {
     method: 'DELETE',
@@ -381,7 +389,7 @@ export async function deleteSecret(
     },
     body: JSON.stringify({
       workspaceId: source.projectId,
-      environment: envName(env),
+      environment: infisicalEnv,
       secretPath: source.secretPath || '/',
       type: 'shared',
     }),

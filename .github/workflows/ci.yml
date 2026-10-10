@@ -206,6 +206,15 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
+      # stub `infisical` first on PATH records its arguments, so the real CLI,
+      # network and credentials are never reached.
+      - name: Infisical safe wrapper is prod-only
+        working-directory: .
+        run: |
+          bash -n scripts/infisical-secrets-safe.sh
+          node --test scripts/infisical-secrets-safe.test.mjs
+
       # Static guard for the class of defect behind the sqlite-web finding: a
       # security-relevant variable given a fail-open default, or a password
       # literal committed to source. Both existed on main until 2026-08-02 —
