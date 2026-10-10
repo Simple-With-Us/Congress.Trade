@@ -1,0 +1,38 @@
+# Runtime-only XcodeGen overlay for App Store screenshots.  run.sh copies this
+# next to clients/ios/project.yml, generates in the CI checkout, and never
+# commits the result.  The app target and committed pbxproj are untouched.
+include:
+  - project.yml
+
+targets:
+  CongressTradeShotsUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ShotsUITests
+        excludes:
+          - Shots.storekit
+      - path: ShotsUITests/Shots.storekit
+        buildPhase: none
+    dependencies:
+      - target: CongressTrade
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: trade.congress.ios.shotsuitests
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: CongressTrade
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        SWIFT_VERSION: "5.0"
+
+schemes:
+  CongressTradeShots:
+    build:
+      targets:
+        CongressTrade: all
+        CongressTradeShotsUITests: [test]
+    test:
+      storeKitConfiguration: ShotsUITests/Shots.storekit
+      targets:
+        - CongressTradeShotsUITests
