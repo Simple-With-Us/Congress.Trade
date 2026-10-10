@@ -1,8 +1,15 @@
 name: Uptime Monitor
 
+# Manual edge-liveness check only.  The */5 schedule was removed (board
+# 9abe9098261b41cdb4b60bbfbb3d9e66 / GB-HOUSEKEEPER): it duplicated Sentry
+# Uptime + the host congress-health-recover loop, opened GitHub issues with no
+# page path, and polled GET /api/health — the endpoint explicitly documented as
+# "the uptime-monitor target", which runs a heavy readiness probe on every hit.
+# That self-referential load is gone: this workflow now curls the static
+# GET /health ({ ok: true }) for optional operator verification.
+# Pipeline halt / DB readiness: GET /api/health/deep or scoped /api/health/polling.
+
 on:
-  schedule:
-    - cron: '*/5 * * * *'  # Every 5 minutes
   workflow_dispatch: {}
 
 permissions:
@@ -19,6 +26,7 @@ jobs:
     timeout-minutes: 5
     env:
       BROWSER_UA: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36
+      HEALTH_URL: https://congress.trade/health
     steps:
       - name: Set up Node for health-response validation
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -32,7 +40,7 @@ jobs:
           HTTP_CODE="000"
           STATUS="fail"
           REASON="curl failed"
-          if HTTP_CODE="$(curl -sS -A "$BROWSER_UA" --connect-timeout 10 --max-time 30 -o "$BODY" -w "%{http_code}" https://congress.trade/api/health)"; then
+          if HTTP_CODE="$(curl -sS -A "$BROWSER_UA" --connect-timeout 10 --max-time 30 -o "$BODY" -w "%{http_code}" "$HEALTH_URL")"; then
             if [ "$HTTP_CODE" != "200" ]; then
               REASON="unexpected HTTP status"
             elif REASON="$(node - "$BODY" <<'NODE'
@@ -49,15 +57,6 @@ jobs:
             console.log('health.ok is not true');
             process.exit(1);
           }
-          if (health.db !== true) {
-            console.log('health.db is not true');
-            process.exit(1);
-          }
-          if (health.status && health.status === 'stalled') {
-            const bad = (health.pipeline?.checks ?? []).filter((c) => c.status !== 'ok');
-            console.log(`pipeline stalled: ${bad.map((c) => `${c.id}=${c.status} (${c.detail})`).join('; ')}`);
-            process.exit(1);
-          }
           console.log('ok');
           NODE
             )"; then
@@ -72,8 +71,6 @@ jobs:
             echo "reason=$REASON"
             echo "health_body<<$delimiter"
             cat "$BODY"
-            # curl writes compact JSON without a trailing newline. Force one so the
-            # GitHub-output terminator always starts on its own line.
             printf '\n%s\n' "$delimiter"
           } >> "$GITHUB_OUTPUT"
 
@@ -83,13 +80,15 @@ jobs:
           HEALTH_HTTP_CODE: ${{ steps.check.outputs.http_code }}
           HEALTH_REASON: ${{ steps.check.outputs.reason }}
           HEALTH_BODY: ${{ steps.check.outputs.health_body }}
+          HEALTH_URL: ${{ env.HEALTH_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          title="Uptime Alert: congress.trade health returned HTTP ${HEALTH_HTTP_CODE}"
+          title="Uptime Alert: ${HEALTH_URL} returned HTTP ${HEALTH_HTTP_CODE}"
           body_file="$(mktemp)"
           now="$(date -u)"
           {
             printf 'Health check failed at %s.\n\n' "$now"
+            printf 'URL: %s\n' "$HEALTH_URL"
             printf 'HTTP status: %s\n' "$HEALTH_HTTP_CODE"
             printf 'Reason: %s\n\n' "$HEALTH_REASON"
             printf 'Body:\n%s\n' "$HEALTH_BODY"
@@ -98,7 +97,7 @@ jobs:
           const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
           const headers = {
             accept: 'application/vnd.github+json',
-            authorization: `Bearer ${process.env.GH_TOKEN}`,
+            authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
             'content-type': 'application/json',
             'user-agent': 'congress-trade-uptime-monitor',
             'x-github-api-version': '2022-11-28',
@@ -118,8 +117,9 @@ jobs:
           const issues = await request(
             `/repos/${owner}/${repo}/issues?state=open&labels=incident&per_page=100`,
           );
+          const needle = process.env.HEALTH_URL || 'congress.trade';
           const existing = issues.find((issue) =>
-            !issue.pull_request && issue.title.includes('congress.trade health')
+            !issue.pull_request && issue.title.includes(needle)
           );
           if (existing) {
             await request(`/repos/${owner}/${repo}/issues/${existing.number}/comments`, {
