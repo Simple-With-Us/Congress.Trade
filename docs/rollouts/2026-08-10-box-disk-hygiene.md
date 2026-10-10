@@ -17,7 +17,7 @@ This change adds **scheduled disk checks + safe automated Docker prune** and har
 |------|------|
 | `scripts/ops/box-disk-hygiene.sh` | Check `df`, log SQLite/WAL + `docker system df`; light/soft/aggressive prune by thresholds |
 | `scripts/ops/box-disk-hygiene.service` | systemd oneshot |
-| `scripts/ops/box-disk-hygiene.timer` | every 30 min + 5 min after boot |
+| `scripts/ops/box-disk-hygiene.timer` | every 15 min + 5 min after boot |
 | `scripts/ops/congress-health-recover.sh` | label-first container match; name fallback **running only** |
 
 ## Behavior
