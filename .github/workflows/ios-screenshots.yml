@@ -1,0 +1,155 @@
+name: iOS App Store screenshots
+
+# Captures the App Store Connect screenshot set on GitHub-hosted macOS
+# runners. A UI-test lane (clients/ios/CongressTradeScreenshotTests) drives
+# the real app on booted simulators; a local StoreKit configuration makes the
+# paywall render the live offer (1-week free trial, $8.99/mo, $79.99/yr) with
+# no sandbox account. Nothing here touches App Store Connect - PNGs land as
+# workflow artifacts and the ASC lane uploads them.
+#
+# The project is generated on the runner from project-screenshots.yml (an
+# xcodegen spec that merges over project.yml and adds only the UI-test
+# target). The checked-in CongressTrade.xcodeproj is untouched, so the
+# ios-build drift gate keeps passing.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - instinct/congress-trade-screenshots
+    paths:
+      - '.github/workflows/ios-screenshots.yml'
+      - 'clients/ios/project-screenshots.yml'
+      - 'clients/ios/CongressTradeScreenshotTests/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-screenshots-congress
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    if: github.event.repository.fork == false
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Slot names match docs/brand/app-store-screenshots + ASC display
+          # classes. First device type that exists on the runner image wins;
+          # the exact pixel size is recorded in the artifact inventory.
+          - slot: iphone_67
+            devices: iPhone-15-Pro-Max iPhone-14-Pro-Max iPhone-16-Pro-Max
+          - slot: iphone_61
+            devices: iPhone-15-Pro iPhone-14-Pro iPhone-16-Pro iPhone-17-Pro
+          - slot: ipad_13
+            devices: iPad-Pro-13-inch-M4 iPad-Pro-12-9-inch-6th-generation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Assert stable Xcode (never beta)
+        run: bash scripts/ios-assert-stable-xcode.sh
+
+      - name: Install xcodegen
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            NONINTERACTIVE=1 HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate project with screenshot target (runner-local)
+        run: |
+          set -euo pipefail
+          cd clients/ios
+          xcodegen generate --spec project-screenshots.yml
+
+      - name: Ensure iOS simulator platform
+        run: xcodebuild -downloadPlatform iOS || true
+
+      - name: Create + boot simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          CHOSEN=""
+          for t in ${{ matrix.devices }}; do
+            if xcrun simctl list devicetypes | grep -qF "SimDeviceType.$t)"; then
+              CHOSEN="$t"
+              break
+            fi
+          done
+          if [ -z "$CHOSEN" ]; then
+            echo "::error::None of the preferred device types exist: ${{ matrix.devices }}"
+            xcrun simctl list devicetypes
+            exit 1
+          fi
+          echo "device_type=$CHOSEN" >> "$GITHUB_OUTPUT"
+          udid="$(xcrun simctl create "ctshot-${{ matrix.slot }}-$GITHUB_RUN_ID" "com.apple.CoreSimulator.SimDeviceType.$CHOSEN")"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$udid" || true
+
+      - name: Status bar 9:41, full battery
+        run: |
+          xcrun simctl status_bar "${{ steps.sim.outputs.udid }}" override \
+            --time "9:41" --batteryState charged --batteryLevel 100 \
+            --wifiMode active --wifiBars 3 --cellularMode active --cellularBars 4
+
+      - name: Build + run screenshot UI test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project clients/ios/CongressTrade.xcodeproj \
+            -scheme CongressTradeScreenshots \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:CongressTradeScreenshotTests/CongressTradeScreenshotTests/testCaptureAppStoreScreenshots \
+            -resultBundlePath "$RUNNER_TEMP/shots-${{ matrix.slot }}.xcresult" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUNNER_TEMP/xcodebuild-shots.log"
+
+      - name: Export screenshots from xcresult
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          slot="${{ matrix.slot }}"
+          out="screenshots/$slot"
+          mkdir -p "$out"
+          exp="$RUNNER_TEMP/attachments-$slot"
+          xcrun xcresulttool export attachments \
+            --path "$RUNNER_TEMP/shots-$slot.xcresult" \
+            --output-path "$exp"
+          manifest="$exp/manifest.json"
+          for scene in paywall trends trades account; do
+            file="$(jq -r --arg s "$scene" '
+              [.[] | .attachments[]? | select(.suggestedHumanReadableName != null)
+                | select(.suggestedHumanReadableName | startswith($s + "_") or . == $s)
+                | .exportedFileName] | first // empty' "$manifest" 2>/dev/null || true)"
+            if [ -n "$file" ] && [ -f "$exp/$file" ]; then
+              cp "$exp/$file" "$out/${slot}__${scene}.png"
+            fi
+          done
+          {
+            echo "slot: $slot"
+            echo "device_type: ${{ steps.sim.outputs.device_type }}"
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "sha: $GITHUB_SHA"
+            for f in "$out"/*.png; do
+              [ -e "$f" ] || continue
+              w="$(sips -g pixelWidth "$f" | awk '/pixelWidth/{print $2}')"
+              h="$(sips -g pixelHeight "$f" | awk '/pixelHeight/{print $2}')"
+              echo "$(basename "$f"): ${w}x${h}"
+            done
+          } | tee "$out/inventory.txt"
+          ls -la "$out"
+
+      - name: Upload screenshot artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ct-appstore-screenshots-${{ matrix.slot }}
+          path: screenshots/${{ matrix.slot }}/
+          if-no-files-found: error
+          retention-days: 30
