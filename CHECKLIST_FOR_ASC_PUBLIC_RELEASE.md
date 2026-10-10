@@ -18,7 +18,7 @@ unverified, it says so.
 | Build attached to v1.0.177 | **`202608262138`** (marketing 1.0.177) from GitHub `macos-latest` Tahoe GM, run 33016281432 | ASC `appStoreVersions/{id}/build` |
 | Latest main TestFlight build | **`202608262138`** (marketing 1.0.177, Tahoe GM Xcode 26.6) | ASC `builds` list |
 | Deletion recording | ✅ `account-deletion-physical-device.mp4` COMPLETE (39s, physical device attached to review notes) | ASC `appStoreReviewAttachments` |
-| Subscriptions monthly / annual | Group `22287016` ("Premium"), `trade.congress.premium.monthly` ($5/mo, 2-week trial) and `trade.congress.premium.annual` ($50/yr, 2-week trial) attached in group with localized descriptions and review screenshots | ASC `subscriptions` / `subscriptionVersions` |
+| Subscriptions monthly / annual | Group `22287016` ("Premium"), `trade.congress.premium.monthly` ($8.99/mo, 1-week free trial) and `trade.congress.premium.annual` ($79.99/yr, 1-week free trial) attached in group with localized descriptions and review screenshots | ASC `subscriptions` / `subscriptionVersions` |
 
 **Do not attach Mac-runner TestFlight IPAs directly to App Store versions.**  The local Mac runner is macOS 27.0 beta (`26A5416b`).  App Store review rejects that build host stamp as `INVALID_BINARY`.  The production GM build path is `.github/workflows/ios-appstore-gm.yml` (GitHub-hosted `macos-latest` Tahoe GM + Xcode 26.6).
 
@@ -64,8 +64,8 @@ Check the exact message text in App Store Connect for submission `b174dd86`.  Ve
 
 ### 1b.  Confirm product configuration in ASC — ✅ VERIFIED 2026-08-26 by agent, no action needed
 Read directly from the ASC API (`scripts/asc/asc_subs.py`, `scripts/asc/asc_price_map.py` — read-only, see `scripts/asc/README.md`):
-- **Free trial**: both products carry `offerMode=FREE_TRIAL`, `duration=TWO_WEEKS`, `numberOfPeriods=1`, active since 2026-08-12 with no end date.  Matches the paywall copy.
-- **Prices (USA territory)**: `trade.congress.premium.monthly` = **$5.00**, `trade.congress.premium.annual` = **$50.00**.  Matches the copy.
+- **Free trial**: both products carry a 1-week free-trial introductory offer.  Matches the paywall copy.
+- **Prices (USA territory)**: `trade.congress.premium.monthly` = **$8.99**, `trade.congress.premium.annual` = **$79.99**.  Matches the copy.
 - Note for anyone re-checking: the raw `prices` endpoint also returns $19.99 / $199.99 rows.  Those are OTHER territories' price points, not the US price — map each price row to its `territory` relationship before reading it, or you will misreport the live price.
 
 ### 1c.  Approve resubmission when GM binary is ready — ✅ DONE
