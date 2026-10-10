@@ -13,11 +13,13 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { z } from 'zod';
 import {
   API_USAGE_MONITOR_INGEST_PATH,
   createUsageTelemetryClient,
   LegacyUsageTelemetryOutboxEventSchema,
   UsageTelemetryV2EventSchema,
+  UsageTelemetryV2IngestAckSchema,
 } from '@jaywedgeworth22/congress-trading-shared';
 import type { LegacyUsageTelemetryOutboxEventInput } from '@jaywedgeworth22/congress-trading-shared';
 import { resolveSecrets } from '../secrets/infisical.ts';
@@ -681,6 +683,51 @@ class UsageTelemetryDeliveryHttpError extends Error {
   }
 }
 
+/** A successful HTTP response is not proof that the receiver accepted this
+ * event. Keep incomplete ACKs retryable, including malformed response bodies:
+ * receiver contract failures must never be classified as poison event data. */
+class UsageTelemetryDeliveryAckError extends Error {
+  constructor() {
+    super('usage telemetry receiver did not acknowledge delivery');
+    this.name = 'UsageTelemetryDeliveryAckError';
+  }
+}
+
+/** A valid ACK rejected this event, rather than failing the receiver. Queue
+ * ownership may end only after a recoverable quarantine copy exists. */
+class UsageTelemetryDeliveryEventRejectedError extends Error {
+  constructor(readonly quarantined: boolean) {
+    super(quarantined
+      ? 'usage telemetry event rejected; preserved in quarantine for replay'
+      : 'usage telemetry event rejected; quarantine unavailable');
+    this.name = 'UsageTelemetryDeliveryEventRejectedError';
+  }
+}
+
+/** The only receiver-specific extension to the shared strict ACK contract. */
+export const UsageTelemetryReceiverRejectionSchema = z.object({
+  index: z.literal(0),
+  eventId: z.string().min(1).max(200).optional(),
+  issues: z.array(z.string()),
+}).strict();
+export const UsageTelemetryReceiverAckSchema = UsageTelemetryV2IngestAckSchema.safeExtend({
+  rejections: z.array(UsageTelemetryReceiverRejectionSchema).max(1).optional(),
+});
+export type UsageTelemetryReceiverAck = z.infer<typeof UsageTelemetryReceiverAckSchema>;
+
+/** Parse before inspecting external data. The shared schema still validates
+ * every count and their sum; only validated, request-bound details are removed. */
+function usageTelemetryAckPayload(payload: unknown, eventId: string): Omit<UsageTelemetryReceiverAck, 'rejections'> {
+  const parsed = UsageTelemetryReceiverAckSchema.safeParse(payload);
+  if (!parsed.success) throw new UsageTelemetryDeliveryAckError();
+  const { rejections = [], ...ack } = parsed.data;
+  if ((rejections.length > 0 && (ack.received !== 1 || ack.rejected !== 1))
+    || rejections.some((detail) => detail.eventId !== undefined && detail.eventId !== eventId)) {
+    throw new UsageTelemetryDeliveryAckError();
+  }
+  return ack;
+}
+
 function usageTelemetryErrorStatus(error: unknown): number | null {
   if (!error || typeof error !== 'object') return null;
   const candidate = error as { status?: unknown; response?: { status?: unknown } };
@@ -688,12 +735,13 @@ function usageTelemetryErrorStatus(error: unknown): number | null {
   return typeof status === 'number' && Number.isInteger(status) ? status : null;
 }
 
-/** True only for deterministic per-event receiver rejects that cannot become
- * successful when the identical queue payload is retried. The plain-error
+/** True for durably quarantined rejected events or deterministic legacy HTTP
+ * rejections. Malformed/ambiguous ACKs always remain retryable. The plain-error
  * branch keeps the queue boundary compatible with a future shared client that
  * exposes status/message directly instead of the local HTTP wrapper. */
 export function isTerminalUsageTelemetryDeliveryError(error: unknown): boolean {
-  if (error instanceof UsageTelemetryCircuitOpenError) return false;
+  if (error instanceof UsageTelemetryCircuitOpenError || error instanceof UsageTelemetryDeliveryAckError) return false;
+  if (error instanceof UsageTelemetryDeliveryEventRejectedError) return error.quarantined;
   if (error instanceof UsageTelemetryDeliveryHttpError) {
     const eventSpecific = /\b(?:schema|idempotency|invalid payload|malformed payload|required.*idempotency|event\s+\d+.*invalid)\b/i.test(error.message);
     return eventSpecific || (error.status === 400 && /\b(?:validation|field|property)\b/i.test(error.message));
@@ -1309,6 +1357,7 @@ export async function deliverUsageTelemetryEvent(
         usageTelemetryDeliveryTimeoutMs(env),
       );
       let receiverStatus: number | null = null;
+      let eventRejected = false;
       try {
         signal?.throwIfAborted();
         const client = createUsageTelemetryClient({
@@ -1326,19 +1375,37 @@ export async function deliverUsageTelemetryEvent(
               },
             );
             receiverStatus = response.status;
+            if (response.ok && response.status !== 204 && response.status !== 205) {
+              // Consume the body under the existing delivery deadline. Do not
+              // log or retain receiver-provided rejection detail strings.
+              const payload = usageTelemetryAckPayload(
+                await response.json(), usageTelemetryEventIdentity(event),
+              );
+              return Response.json(payload, { status: response.status });
+            }
             return response;
           },
         });
-        if (isV2UsageTelemetryEvent(event)) {
-          await client.send([event]);
-        } else {
-          await client.sendLegacyOutbox([event]);
+        const ack = isV2UsageTelemetryEvent(event)
+          ? await client.send([event])
+          : await client.sendLegacyOutbox([event]);
+        // The shared client validates the v2 ACK shape and bucket sum. Bind
+        // it to this one-event request before clearing any durable receipt.
+        // Duplicates and pruned events are acknowledged by the v2 contract.
+        if (ack.received !== 1) {
+          throw new UsageTelemetryDeliveryAckError();
         }
+        eventRejected = ack.rejected !== 0;
       } catch (error) {
         if (signal?.aborted) {
           throw signal.reason ?? new Error('durable queue lease lost');
         }
         if (controller.signal.aborted) throw new UsageTelemetryDeliveryTimeoutError();
+        if (receiverStatus != null && receiverStatus >= 200 && receiverStatus < 300) {
+          // Do not expose response bytes, or let a response-schema error
+          // match the terminal-event classifier's schema/idempotency words.
+          throw new UsageTelemetryDeliveryAckError();
+        }
         if (receiverStatus != null) {
           const message = error instanceof Error ? error.message : String(error ?? '');
           throw new UsageTelemetryDeliveryHttpError(receiverStatus, message);
@@ -1349,12 +1416,28 @@ export async function deliverUsageTelemetryEvent(
         // response-schema validation, not just until fetch returns headers.
         clearTimeout(timer);
       }
+      if (eventRejected) {
+        // Persistence has its own failure mode; it must not inherit the
+        // receiver deadline or turn a healthy receiver into a global outage.
+        signal?.throwIfAborted();
+        const quarantined = await writeUsageTelemetryQuarantine(
+          (env as Partial<Env>).RAW_FILES,
+          usageTelemetryEventIdentity(event),
+          JSON.stringify(event),
+          'terminal_receiver_rejection',
+        );
+        signal?.throwIfAborted();
+        throw new UsageTelemetryDeliveryEventRejectedError(quarantined);
+      }
     });
   } catch (error) {
     if (signal?.aborted) {
       throw signal.reason ?? new Error('durable queue lease lost');
     }
-    if (isTerminalUsageTelemetryDeliveryError(error)) {
+    if (error instanceof UsageTelemetryDeliveryEventRejectedError || isTerminalUsageTelemetryDeliveryError(error)) {
+      // A fully validated per-event rejection proves the receiver is healthy.
+      // Even a quarantine write failure must not trip the shared breaker and
+      // prevent unrelated healthy events from making progress.
       const closedPersisted = await recordUsageTelemetryDeliverySuccess(env);
       if (probeLease && closedPersisted) {
         await releaseUsageTelemetryHalfOpenProbe(env, probeLease.token);
@@ -1369,6 +1452,34 @@ export async function deliverUsageTelemetryEvent(
   if (probeLease && closedPersisted) {
     await releaseUsageTelemetryHalfOpenProbe(env, probeLease.token);
   }
+}
+
+const UsageTelemetryDrainCursorSchema = z.object({
+  r2: z.string().min(1).optional(),
+  d1: z.object({ updatedAt: z.string().min(1), idempotencyKey: z.string().min(1) }).strict().optional(),
+}).strict();
+type UsageTelemetryDrainCursor = z.infer<typeof UsageTelemetryDrainCursorSchema>;
+const USAGE_TELEMETRY_DRAIN_CURSOR_KEY = 'usage_telemetry_drain_cursor';
+const usageTelemetryDrainCursors = new WeakMap<Env, UsageTelemetryDrainCursor>();
+
+async function readUsageTelemetryDrainCursor(env: Env): Promise<UsageTelemetryDrainCursor> {
+  let value: unknown = usageTelemetryDrainCursors.get(env);
+  try {
+    if (value === undefined && env.CONFIG_KV?.get) value = await env.CONFIG_KV.get(USAGE_TELEMETRY_DRAIN_CURSOR_KEY, 'json');
+  } catch { /* A cursor outage must not authorize removing retained data. */ }
+  const parsed = UsageTelemetryDrainCursorSchema.safeParse(value);
+  return parsed.success ? parsed.data : {};
+}
+
+async function writeUsageTelemetryDrainCursor(env: Env, cursor: UsageTelemetryDrainCursor): Promise<void> {
+  try {
+    if (env.CONFIG_KV?.put) {
+      await env.CONFIG_KV.put(USAGE_TELEMETRY_DRAIN_CURSOR_KEY, JSON.stringify(cursor));
+      usageTelemetryDrainCursors.delete(env);
+      return;
+    }
+  } catch { /* Keep same-isolate progress without weakening durability. */ }
+  usageTelemetryDrainCursors.set(env, cursor);
 }
 
 export interface UsageTelemetryFallbackFlushResult {
@@ -1404,18 +1515,42 @@ export async function flushUsageTelemetryFallback(
   if (await isUsageTelemetryCircuitOpen(env)) {
     return { listed: 0, delivered: 0, failed: 0, expired: 0, skipped: true };
   }
+  const cursor = await readUsageTelemetryDrainCursor(env);
+  const initialCursor = JSON.stringify(cursor);
+  try {
+    return await drainUsageTelemetryFallbackPage(env, options, cursor);
+  } finally {
+    if (JSON.stringify(cursor) !== initialCursor) await writeUsageTelemetryDrainCursor(env, cursor);
+  }
+}
+
+async function drainUsageTelemetryFallbackPage(
+  env: Env,
+  options: { limit?: number },
+  cursor: UsageTelemetryDrainCursor,
+): Promise<UsageTelemetryFallbackFlushResult> {
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 25)));
   const storage = (env as Partial<Env>).RAW_FILES;
   const db = (env as Partial<Env>).DB;
   const ttlMs = usageTelemetryFallbackTtlMs(env);
   const now = Date.now();
   const r2Available = Boolean(storage?.list);
+  const startingR2Cursor = cursor.r2;
   const listed = storage?.list
     ? await storage.list({
         prefix: USAGE_TELEMETRY_FALLBACK_PREFIX,
         limit,
+        ...(startingR2Cursor ? { cursor: startingR2Cursor } : {}),
+      }).catch((error) => {
+        // A stale continuation token must not permanently wedge the drain.
+        delete cursor.r2;
+        throw error;
       })
     : { objects: [] as R2Object[], truncated: false as const };
+  if (r2Available) {
+    if (listed.truncated && 'cursor' in listed) cursor.r2 = listed.cursor;
+    else delete cursor.r2;
+  }
   let delivered = 0;
   let failed = 0;
   let expired = 0;
@@ -1448,12 +1583,12 @@ export async function flushUsageTelemetryFallback(
         const quarantineIdentity = event ? usageTelemetryEventIdentity(event) : object.key;
         const quarantineReason = event == null ? 'malformed' : 'terminal_receiver_rejection';
         if (event == null || isTerminalUsageTelemetryDeliveryError(error)) {
-          const quarantined = await writeUsageTelemetryQuarantine(
-            storage,
-            quarantineIdentity,
-            raw,
-            quarantineReason,
-          );
+          // The delivery path already wrote canonical event bytes. Reuse
+          // that durable copy when identical; otherwise preserve the original
+          // formatted/migrated bytes before removing the source receipt.
+          const quarantined = (error instanceof UsageTelemetryDeliveryEventRejectedError
+            && error.quarantined && raw === JSON.stringify(event))
+            || await writeUsageTelemetryQuarantine(storage, quarantineIdentity, raw, quarantineReason);
           if (quarantined) {
             await storage?.delete(object.key);
             r2Removed += 1;
@@ -1466,11 +1601,11 @@ export async function flushUsageTelemetryFallback(
     }
   }
   // Maintain the O(1) admission counter. When the bounded list was the entire
-  // outbox (not truncated), the exact remainder is known, so set it
+  // outbox (not truncated and starting at the prefix), the exact remainder is known, so set it
   // authoritatively — this self-heals any drift, including R2 objects that
   // predate the counter. Otherwise best-effort decrement by what we removed.
   if (r2Available) {
-    if (!listed.truncated) {
+    if (!listed.truncated && !startingR2Cursor) {
       await writeUsageTelemetryOutboxCount(env, Math.max(0, listed.objects.length - r2Removed));
     } else if (r2Removed > 0) {
       await adjustUsageTelemetryOutboxCount(env, -r2Removed);
@@ -1480,15 +1615,29 @@ export async function flushUsageTelemetryFallback(
   const d1DrainComplete = await isUsageTelemetryD1DrainComplete(env);
   if (remainingLimit > 0 && db?.prepare && !d1DrainComplete) {
     try {
-      const rows = await db.prepare(
-        `SELECT idempotency_key, event_json, attempts
-           FROM usage_telemetry_fallback_events
-          ORDER BY updated_at ASC
-          LIMIT ?`,
-      )
-        .bind(Math.min(remainingLimit, usageTelemetryD1DrainLimit(env)))
-        .all<{ idempotency_key: string; event_json: string; attempts: number }>();
+      type LegacyRow = { idempotency_key: string; event_json: string; attempts: number; updated_at: string };
+      const readPage = async (after?: UsageTelemetryDrainCursor['d1']) => {
+        const where = after ? 'WHERE updated_at > ? OR (updated_at = ? AND idempotency_key > ?)' : '';
+        const params: unknown[] = after ? [after.updatedAt, after.updatedAt, after.idempotencyKey] : [];
+        return await db.prepare(
+          `SELECT idempotency_key, event_json, attempts, updated_at
+             FROM usage_telemetry_fallback_events
+             ${where}
+            ORDER BY updated_at ASC, idempotency_key ASC
+            LIMIT ?`,
+        ).bind(...params, Math.min(remainingLimit, usageTelemetryD1DrainLimit(env))).all<LegacyRow>();
+      };
+      let rows = await readPage(cursor.d1);
+      if (cursor.d1 && !(rows.results?.length)) {
+        // An empty suffix is not an empty table. Wrap and verify its head
+        // before setting the one-time drain-complete marker.
+        delete cursor.d1;
+        rows = await readPage();
+      }
       const results = rows.results ?? [];
+      const lastRow = results.at(-1);
+      if (lastRow) cursor.d1 = { updatedAt: lastRow.updated_at, idempotencyKey: lastRow.idempotency_key };
+      else delete cursor.d1;
       for (const row of results) {
         let event: DeliverableUsageTelemetryEvent | null = null;
         try {
@@ -1512,7 +1661,17 @@ export async function flushUsageTelemetryFallback(
           // Keep valid rows intact across transient receiver/circuit failures.
           // Deterministic per-event rejections are bounded and moved to the
           // back so one poison row cannot wedge the legacy drain forever.
-          if (isTerminalUsageTelemetryDeliveryError(error)) {
+          if (error instanceof UsageTelemetryDeliveryEventRejectedError && error.quarantined) {
+            // A valid ACK already produced a replayable copy. Do not POST and
+            // rewrite it five times through the legacy HTTP-poison budget.
+            const exactCopy = (row.idempotency_key === usageTelemetryEventIdentity(event)
+              && row.event_json === JSON.stringify(event))
+              || await writeUsageTelemetryQuarantine(storage, row.idempotency_key, row.event_json, 'terminal_receiver_rejection');
+            if (exactCopy) {
+              await db.prepare('DELETE FROM usage_telemetry_fallback_events WHERE idempotency_key = ?')
+                .bind(row.idempotency_key).run();
+            }
+          } else if (isTerminalUsageTelemetryDeliveryError(error)) {
             await advanceTerminalLegacyUsageTelemetryRow(
               db,
               storage,

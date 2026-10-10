@@ -1,4 +1,6 @@
 import { createClient } from '@libsql/client';
+import { handleIngestMessage } from '../../queueHandlers.ts';
+import { isTerminalUsageTelemetryDeliveryError } from '../../shared/thirdPartyTelemetry.ts';
 import { describe, expect, it, vi } from 'vitest';
 import type { Env, QueueMessage } from '../../shared/types.ts';
 import {
@@ -822,6 +824,54 @@ describe('Deno durable queue', () => {
     }
   });
 
+  it('retries a rejected 202 usage ACK without completing the receipt, then accepts the same event as a duplicate', async () => {
+    const harness = await createHarness();
+    try {
+      const event = {
+        eventId: 'ct-third-party:queue-ack-test',
+        provider: 'openai', service: 'llm', billingMode: 'actual' as const,
+        metricType: 'usage' as const, quantity: 1, unit: 'request', requests: 1,
+        confidence: 'actual' as const, occurredAt: START.toISOString(),
+      };
+      const message: QueueMessage = { type: 'usage.telemetry', event };
+      await harness.ingest.send(message);
+      Object.assign(harness.env, {
+        USAGE_MONITOR_ENABLED: 'true',
+        USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+        USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+      });
+      const bodies: unknown[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({
+          ok: true, schemaVersion: 2, received: 1, persisted: 0, pruned: 0,
+          rejected: bodies.length === 1 ? 1 : 0,
+          duplicates: bodies.length === 1 ? 0 : 1,
+        }), { status: 202 });
+      }));
+      const handlers = createHandlers({
+        handleIngestMessage,
+        isTerminalDeadLetterError: (_message, error) => isTerminalUsageTelemetryDeliveryError(error),
+      });
+      expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
+        .toEqual({ claimed: 1, completed: 0, retried: 1, failed: 0 });
+      const row = (await harness.rows())[0];
+      expect(row.status).toBe('pending');
+      expect(JSON.parse(String(row.payload))).toEqual(message);
+      expect(handlers.completeIngestionOutbox).not.toHaveBeenCalled();
+
+      harness.setNow(new Date(String(row.available_at)));
+      expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
+        .toEqual({ claimed: 1, completed: 1, retried: 0, failed: 0 });
+      expect(bodies).toHaveLength(2);
+      expect(bodies[1]).toEqual(bodies[0]);
+      expect((await harness.rows())[0].status).toBe('completed');
+    } finally {
+      vi.unstubAllGlobals();
+      harness.client.close();
+    }
+  });
+
   it('terminalizes deterministic primary telemetry rejects immediately', async () => {
     const harness = await createHarness();
     try {
@@ -852,6 +902,51 @@ describe('Deno durable queue', () => {
         last_error: 'invalid payload',
       });
     } finally {
+      harness.client.close();
+    }
+  });
+
+  it('preserves a rejected receipt in quarantine before marking it failed and completing its healthy neighbor', async () => {
+    const harness = await createHarness();
+    try {
+      const poison = {
+        eventId: 'ct-third-party:queue-poison', provider: 'openai', service: 'llm',
+        billingMode: 'actual' as const, metricType: 'usage' as const,
+        requests: 1, confidence: 'actual' as const, occurredAt: START.toISOString(),
+      };
+      const healthy = { ...poison, eventId: 'ct-third-party:queue-healthy' };
+      await harness.ingest.send({ type: 'usage.telemetry', event: poison });
+      await harness.ingest.send({ type: 'usage.telemetry', event: healthy });
+      const quarantine = new Map<string, string>();
+      Object.assign(harness.env, {
+        RAW_FILES: { put: vi.fn(async (key: string, value: string) => { quarantine.set(key, value); }) },
+        USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+        USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+      });
+      vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const eventId = JSON.parse(String(init?.body)).events[0].eventId;
+        const rejected = eventId === poison.eventId ? 1 : 0;
+        return Response.json({
+          ok: true, schemaVersion: 2, received: 1, persisted: 1 - rejected,
+          duplicates: 0, pruned: 0, rejected,
+        }, { status: 202 });
+      }));
+      const handlers = createHandlers({
+        handleIngestMessage,
+        isTerminalDeadLetterError: (_message, error) => {
+          expect(quarantine.get('_ops/usage-telemetry-quarantine/ct-third-party%3Aqueue-poison.json'))
+            .toBe(JSON.stringify(poison));
+          return isTerminalUsageTelemetryDeliveryError(error);
+        },
+      });
+      expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
+        .toEqual({ claimed: 2, completed: 1, retried: 0, failed: 1 });
+      const rows = await harness.rows();
+      expect(rows.map((row) => row.status)).toEqual(['failed', 'completed']);
+      expect(rows[0].last_error).toContain('preserved in quarantine for replay');
+      expect(JSON.parse(String(rows[0].payload))).toEqual({ type: 'usage.telemetry', event: poison });
+    } finally {
+      vi.unstubAllGlobals();
       harness.client.close();
     }
   });
