@@ -1,0 +1,44 @@
+# Screenshot-lane XcodeGen spec (workflow ios-screenshots.yml).
+#
+# Merged ON THE RUNNER over project.yml (`xcodegen generate --spec
+# project-screenshots.yml`), adding one UI-testing target and one scheme used
+# only for App Store screenshot capture. The checked-in
+# CongressTrade.xcodeproj stays generated from project.yml alone, so the
+# ios-build "Assert XcodeGen drift" gate is unaffected.
+#
+# Why a UI test instead of fastlane snapshot: this repo has no fastlane; one
+# XCTest + SKTestSession does the same job with zero new tooling.
+
+include:
+  - project.yml
+
+targets:
+  CongressTradeScreenshotTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: CongressTradeScreenshotTests
+      - path: CongressTradeScreenshotTests/CongressTradeScreenshots.storekit
+        buildPhase: resources
+        type: file
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: trade.congress.ios.screenshottests
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        GENERATE_INFOPLIST_FILE: YES
+        DEVELOPMENT_TEAM: CC8UTF7ATG
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        TEST_TARGET_NAME: CongressTrade
+        SWIFT_VERSION: "5.0"
+
+schemes:
+  CongressTradeScreenshots:
+    build:
+      targets:
+        CongressTrade: all
+        CongressTradeScreenshotTests: [test]
+    test:
+      targets:
+        - CongressTradeScreenshotTests
