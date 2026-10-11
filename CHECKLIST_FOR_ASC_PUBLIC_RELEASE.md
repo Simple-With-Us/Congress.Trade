@@ -1,6 +1,6 @@
 # Checklist for App Store public release — Congress.Trade iOS
 
-Living document.  Last verified against live App Store Connect and GitHub: **2026-08-26** (prices, trial, submission state and build attachment re-read from the live API).
+Living document.  Last verified against live App Store Connect and GitHub: **2026-10-10** (prices, trial, submission state and build attachment re-read from the live API).
 
 App id `6798076688` · bundle `trade.congress.ios` · team `CC8UTF7ATG` · version `1.0.177`
 
@@ -62,7 +62,7 @@ unverified, it says so.
 ### 1a.  Read Resolution Center message in App Store Connect
 Check the exact message text in App Store Connect for submission `b174dd86`.  Verify if Apple provided specific reproduction steps or screenshots for the Guideline 2.1(a) / 2.1(b) notes beyond what is addressed in PR #2222.
 
-### 1b.  Confirm product configuration in ASC — ✅ VERIFIED 2026-08-26 by agent, no action needed
+### 1b.  Confirm product configuration in ASC — ✅ VERIFIED 2026-10-10 by agent, no action needed
 Read directly from the ASC API (`scripts/asc/asc_subs.py`, `scripts/asc/asc_price_map.py` — read-only, see `scripts/asc/README.md`):
 - **Free trial**: both products carry a 1-week free-trial introductory offer.  Matches the paywall copy.
 - **Prices (USA territory)**: `trade.congress.premium.monthly` = **$8.99**, `trade.congress.premium.annual` = **$79.99**.  Matches the copy.
