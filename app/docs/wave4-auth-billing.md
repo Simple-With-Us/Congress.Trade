@@ -26,7 +26,7 @@ Coolify, not a Worker.
 
 1. **Create the product + prices** (Stripe Dashboard → Products, in *live* mode):
    - Product: "Congress.Trade Premium".
-   - Add two **recurring** prices: `$5 / month` and `$50 / year`. Copy each
+   - Add two **recurring** prices: `$8.99 / month` and `$79.99 / year`. Copy each
      `price_…` id.
 2. **Enable the Billing Portal**: Dashboard → Settings → Billing → Customer portal
    → activate (allow cancel + payment-method updates). This backs the
