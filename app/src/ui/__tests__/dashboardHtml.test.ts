@@ -2922,7 +2922,6 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
     expect(DASHBOARD_HTML).toContain('$79.99<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).not.toContain('$9<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).not.toContain('$80<span class="per">/yr</span>');
-    expect(DASHBOARD_HTML).not.toContain('2-week free trial');
     expect(DASHBOARD_HTML).toContain('1-week free trial');
     expect(DASHBOARD_HTML).not.toContain('2-week free trial');
     expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');

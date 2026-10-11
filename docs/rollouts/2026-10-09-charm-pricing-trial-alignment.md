@@ -12,9 +12,10 @@ The exploratory WidgetKit extension from an earlier revision of PR #2618 was
 
 ## Files changed
 
-- `app/src/billing/routes.ts` — `DEFAULT_TRIAL_DAYS` **7** (was 14)
-- `app/src/ui/legalHtml.ts` — ToS §3 subscription price + trial length
-- `app/src/ui/__tests__/legalHtml.test.ts` — guards for new canonical copy
+- `app/src/billing/routes.ts` — `DEFAULT_TRIAL_DAYS` **7** (was 14; landed on `main` via the parallel pricing lane before this PR merged, rebase kept `main`)
+- `app/src/ui/legalHtml.ts` — ToS §3 subscription price + trial length (same: landed on `main` first, rebase kept `main`)
+- `app/src/ui/__tests__/legalHtml.test.ts` — guards for new canonical copy (same: landed on `main` first)
+- `app/src/ui/__tests__/dashboardHtml.test.ts` — reject rounded `$9` / `$80` modal prices
 - `app/docs/wave4-auth-billing.md` — operator runbook
 - `scripts/ios-ci-xctest.sh` + `.github/workflows/ios-build.yml` — post-XCTest simulator screenshot artifact
 
