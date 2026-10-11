@@ -18,6 +18,14 @@ const allowedRunners = new Set([
 
 const fullCommitSha = /^[0-9a-f]{40}$/;
 
+// Fleet autofix reusable workflows (board 04b963b7).  Exact path + full SHA only;
+// both run on ubuntu-latest, so the hosted-runner policy still holds.  A caller
+// may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
+const allowedReusableWorkflows = new Set([
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@9f9eaeb7dd6b88cc48d422cd4b5dc461abd87f57",
+  "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@3af2bff8dc3c17d713d64316ad46f5841c92701d",
+]);
+
 for (const name of workflowNames) {
   const text = await readFile(new URL(name, workflowsDir), "utf8");
   const lines = text.split("\n");
@@ -91,7 +99,7 @@ for (const name of workflowNames) {
     if (!fullCommitSha.test(ref)) {
       errors.push(`${name}:${index + 1}: third-party action must be pinned to a full commit SHA`);
     }
-    if (action[1].includes("/.github/workflows/")) {
+    if (action[1].includes("/.github/workflows/") && !allowedReusableWorkflows.has(action[1])) {
       errors.push(`${name}:${index + 1}: reusable workflow runner policy is not locally auditable`);
     }
   });
