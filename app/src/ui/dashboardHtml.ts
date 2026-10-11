@@ -11311,10 +11311,11 @@ function publicLatencySummary(d) {
 function speedBoastProvider(d) {
   var best = null;
   publicLatencyProviders(d.providers).filter(function (p) {
-    if (Number(p.ctCoveragePct) < SPEED_MIN_COVERAGE_PCT || Number(p.providerCoveragePct) < SPEED_MIN_COVERAGE_PCT) return false;
+    var coverageOk = Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT &&
+      Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
+    var preliminaryOk = p.comparisonStatus === 'preliminary' && coverageOk;
     return p.matched >= SPEED_LANE_MIN_MATCHED &&
-      (p.comparisonStatus === 'usable' || p.comparisonStatus === 'preliminary');
-  })
+      (p.comparisonStatus === 'usable' || preliminaryOk);
   })
     .forEach(function (p) { if (!best || p.matched > best.matched) best = p; });
   return best && best.matched >= SPEED_BOAST_MIN_MATCHED && (best.medianLeadSec || 0) > 0 ? best : null;
@@ -11323,9 +11324,10 @@ function speedBoastProvider(d) {
    the Delivery section and the Trends link render only when we are NOT
    behind on most adequately-covered providers. Each usable provider
    votes Lead or Lag only when median AND average agree (same rule as the
-   card badge). Gathering / preliminary / limited-coverage providers
-   neither qualify nor block. Hide when there is no usable vote, or when
-   lag votes are a strict majority. Admin ignores this gate. */
+   card badge). Gathering / limited-coverage providers neither qualify
+   nor block. Preliminary providers vote only when both coverage floors
+   hold. Hide when there is no usable-or-preliminary vote, or when lag
+   votes are a strict majority. Admin ignores this gate. */
 function isLatencyAhead(summary) {
   if (!summary || !summary.providers) return false;
   var ahead = 0, behind = 0;
@@ -11334,7 +11336,10 @@ function isLatencyAhead(summary) {
     var deltaSample = wins + losses + ties;
     var hasLead = p.avgLeadSec != null || p.medianLeadSec != null;
     var hasTiming = p.matched >= SPEED_LANE_MIN_MATCHED && deltaSample > 0 && hasLead;
-    var adequate = hasTiming && p.comparisonStatus === 'usable';
+    var coverageOk = Number(p.ctCoveragePct) >= SPEED_MIN_COVERAGE_PCT &&
+      Number(p.providerCoveragePct) >= SPEED_MIN_COVERAGE_PCT;
+    var preliminaryOk = p.comparisonStatus === 'preliminary' && coverageOk;
+    var adequate = hasTiming && (p.comparisonStatus === 'usable' || preliminaryOk);
     if (!adequate) return;
     var headline = p.medianLeadSec != null ? p.medianLeadSec : p.avgLeadSec;
     var verdict = leadVerdict(headline, p.avgLeadSec);
