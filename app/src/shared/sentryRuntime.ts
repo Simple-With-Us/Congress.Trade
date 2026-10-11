@@ -25,6 +25,29 @@ let activeLoggerWarn: LoggerWarn | undefined;
 let activeMetricsCount:
   | ((name: string, value?: number, options?: { attributes?: SentryLogAttributes }) => unknown)
   | undefined;
+let activeFlush: ((timeout?: number) => Promise<boolean>) | undefined;
+let logFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+const LOG_FLUSH_DELAY_MS = 250;
+
+function scheduleSentryLogFlush(): void {
+  if (!activeFlush || logFlushTimer) return;
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = undefined;
+    void activeFlush?.(2000);
+  }, LOG_FLUSH_DELAY_MS);
+}
+
+/**
+ * Flush buffered Sentry Logs / envelopes.  Deno's SDK only auto-flushes logs
+ * on `beforeExit` / `unload` or after 100 items; a long-lived Coolify process
+ * never exits, so sparse `sentryLoggerWarn` lines sat in the buffer (0 logs
+ * in 7d after the last hourly heartbeat on 2026-09-22).
+ */
+export function flushSentry(timeout = 2000): Promise<boolean> {
+  if (!activeFlush) return Promise.resolve(false);
+  return activeFlush(timeout);
+}
 
 /**
  * Sparse operational log for Sentry Logs.  After a successful SDK init this
@@ -43,6 +66,7 @@ export function sentryLoggerWarn(message: string, attributes?: SentryLogAttribut
   if (activeLoggerWarn) {
     try {
       activeLoggerWarn(message, attributes);
+      scheduleSentryLogFlush();
       return;
     } catch {
       // SDK logger threw; do not also console.warn (that would dual-ship).
@@ -99,6 +123,7 @@ export interface ProductionSentryBindings {
   setTags: (tags: Record<string, unknown>) => void;
   consoleLoggingIntegration: (options?: { levels?: string[] }) => unknown;
   isInitialized: () => boolean;
+  flush: (timeout?: number) => Promise<boolean>;
 }
 
 export function resolveSentryDsn(env: SentryInitInput | undefined): string | undefined {
@@ -143,6 +168,10 @@ export function buildSentryInitOptions(
     beforeSendTransaction: <T>(event: T) => scrubSentryEvent(event),
     beforeSendLog: <T>(log: T) => scrubSentryEvent(log),
     enableLogs: true,
+    // Deno's default 5s unref'd timer never fires if the isolate is quiet
+    // and the process never exits.  1s plus an explicit flush after warns
+    // and cron/request boundaries is what actually delivers Logs.
+    _flushInterval: 1000,
     ignoreErrors: SENTRY_PDF_IGNORE_ERRORS,
     tracePropagationTargets: [/^https:\/\/([\w-]+\.)?congress\.trade/],
     ...extras,
@@ -170,6 +199,11 @@ export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindin
   let initialized = false;
   activeLoggerWarn = undefined;
   activeMetricsCount = undefined;
+  activeFlush = undefined;
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = undefined;
+  }
 
   const initProductionSentry = (
     env: SentryInitInput,
@@ -193,6 +227,16 @@ export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindin
       }
       if (typeof sdk.metrics?.count === 'function') {
         activeMetricsCount = sdk.metrics.count.bind(sdk.metrics);
+      }
+      if (typeof sdk.flush === 'function') {
+        const flushFn = sdk.flush.bind(sdk);
+        activeFlush = async (timeout) => {
+          try {
+            return Boolean(await flushFn(timeout));
+          } catch {
+            return false;
+          }
+        };
       }
       return { initialized: true, reason: 'dsn' };
     } catch (err) {
@@ -304,6 +348,7 @@ export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindin
     setTags,
     consoleLoggingIntegration,
     isInitialized: () => initialized,
+    flush: flushSentry,
   };
 }
 

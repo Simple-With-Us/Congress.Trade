@@ -186,6 +186,10 @@ jobs:
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
             fi
           done
+          if [ -z "${SENTRY_DSN:-}" ]; then
+            echo "::error::Infisical prod SENTRY_DSN is missing; refusing a mute TestFlight archive."
+            exit 1
+          fi
           # Keep multiline PEM out of GITHUB_ENV and every later step environment.
           # Only its mode-600 file path crosses the step boundary.
           key_material="$(

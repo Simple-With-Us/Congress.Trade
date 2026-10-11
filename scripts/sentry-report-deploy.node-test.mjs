@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CONFIG, readIdentity, observeProduction, reportDeploy } from './sentry-report-deploy.mjs';
+import { CONFIG, readIdentity, observeProduction, reportDeploy, isCoolifyDeployRelevant } from './sentry-report-deploy.mjs';
 const old = '1'.repeat(40), expected = '2'.repeat(40), newer = '3'.repeat(40), foreign = '4'.repeat(40);
 const healthy = (revision) => ({ ok: true, status: 'live', environment: 'production', revision, build: { sha: revision }, checks: { release: { sha: revision } } });
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
@@ -77,4 +77,23 @@ test('transient refresh failures retry without using stale ancestry',async()=>{
 });
 test('persistent ancestry errors fail within bounded observation window',async()=>{
  await assert.rejects(observe([expected,expected],{isAncestor:()=>{throw Error('execution failure')}}),/Unable to refresh or evaluate main ancestry/);
+});
+test('skips Sentry deploy when the SHA does not change Coolify watch_paths', () => {
+  const spawn = (cmd, args) => {
+    if (cmd === 'git') return { status: 0, stdout: '.github/workflows/ci.yml\nSTATUS.md\n' };
+    if (cmd === 'python3' && args.includes('--from-stdin')) return { status: 1, stdout: 'skip: .github/workflows/ci.yml STATUS.md\n' };
+    return { status: 1 };
+  };
+  assert.equal(isCoolifyDeployRelevant(expected, { spawn }), false);
+});
+test('records a Sentry deploy when the SHA changes app/ or services/', () => {
+  const spawn = (cmd, args) => {
+    if (cmd === 'git') return { status: 0, stdout: 'app/src/index.ts\n' };
+    if (cmd === 'python3' && args.includes('--from-stdin')) return { status: 0, stdout: 'deploy: app/src/index.ts\n' };
+    return { status: 1 };
+  };
+  assert.equal(isCoolifyDeployRelevant(expected, { spawn }), true);
+});
+test('deploy relevance fails closed when git cannot list files', () => {
+  assert.throws(() => isCoolifyDeployRelevant(expected, { spawn: () => ({ status: 128 }) }), /file list/);
 });

@@ -997,6 +997,12 @@ if [[ -n "${SENTRY_DSN:-}" ]]; then
   SENTRY_DSN_FLAGS+=(SENTRY_DSN="$SENTRY_DSN")
   log "SENTRY_DSN present for archive (length ${#SENTRY_DSN})"
 else
+  # Local debug archives stay silent.  A GitHub Actions TestFlight ship
+  # with an empty plist is why congress-trade iOS had 30 days of Sentry
+  # silence: Cocoa skips init when $(SENTRY_DSN) is unsubstituted.
+  if [[ -n "${GITHUB_ACTIONS:-}" && "${APP_KEY}" == "congress" ]]; then
+    die "SENTRY_DSN unset; refusing to archive a mute TestFlight build (Infisical prod SENTRY_DSN)"
+  fi
   log "SENTRY_DSN unset; Cocoa no-ops when the plist value is empty"
 fi
 

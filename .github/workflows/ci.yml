@@ -206,6 +206,10 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      - name: Sentry deploy reporter + browser sourcemap tests
+        working-directory: .
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
+
       # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
       # stub `infisical` first on PATH records its arguments, so the real CLI,
       # network and credentials are never reached.
