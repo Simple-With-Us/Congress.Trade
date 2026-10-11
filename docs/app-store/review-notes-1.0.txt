@@ -1,7 +1,7 @@
 GUIDELINE 2.1 — APP REVIEW INFORMATION (Congress.Trade iOS 1.0)
 
 1) SCREEN RECORDING
-Attached: physical iPhone 16 Pro Max, iOS 27.0. Starts at launch.  Walks Trends, Trades, Directory, Delivery, and Account.  It signs in and out, and shows Delivery both with methods configured and with none.  Premium sheet: monthly $8.99, annual $79.99, 1-week free trial, Restore, Terms, Privacy.
+Attached: physical iPhone 16 Pro Max, iOS 27.0.  Starts at launch.  Walks Trends, Trades, Directory, Delivery, and Account.  It signs in and out, and shows Delivery both with methods configured and with none.  Premium sheet: monthly $8.99, annual $79.99, 1-week free trial, Restore, Terms, Privacy.
 
 2) DEVICES AND OPERATING SYSTEMS TESTED
 - Jay's iPhone (iPhone 16 Pro Max, iPhone17,2), iOS 27.0 — physical; this recording
