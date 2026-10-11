@@ -102,6 +102,7 @@ rm -f "$tmp_dir/imported" "$tmp_dir/unexpected-import"
 env -u ASC_KEY_P8 PATH="$tmp_dir/bin:$PATH" \
   GITHUB_WORKSPACE="$tmp_dir/workspace" GITHUB_ENV="$tmp_dir/workflow-env" \
   INFISICAL_PROJECT_ID=synthetic-project \
+  ASC_INFISICAL_PROJECT_ID=synthetic-fleet \
   INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=synthetic-client \
   INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=synthetic-secret \
   ASC_TEST_FIXTURE="$tmp_dir/fixture" ASC_TEST_IMPORT_MARKER="$tmp_dir/imported" \
@@ -126,6 +127,7 @@ fi
 if env -u ASC_KEY_P8 PATH="$tmp_dir/bin:$PATH" \
   GITHUB_WORKSPACE="$tmp_dir/workspace" GITHUB_ENV="$tmp_dir/multiline-env" \
   INFISICAL_PROJECT_ID=synthetic-project \
+  ASC_INFISICAL_PROJECT_ID=synthetic-fleet \
   INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=synthetic-client \
   INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=synthetic-secret \
   ASC_TEST_FIXTURE="$tmp_dir/fixture" ASC_TEST_IMPORT_MARKER="$tmp_dir/unexpected-import" \
