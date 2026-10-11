@@ -6,6 +6,8 @@ on:
     paths:
       - .github/workflows/sentry-deploy.yml
       - scripts/sentry-report-deploy*
+      - scripts/sentry-upload-browser-sourcemaps*
+      - scripts/ops/deploy_relevance.py
   workflow_run:
     workflows: [CI]
     types: [completed]
@@ -26,7 +28,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
-      - run: node --test scripts/sentry-report-deploy.node-test.mjs
+      - run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
 
   record-production-deploy:
     needs: test-reporter
@@ -47,9 +49,16 @@ jobs:
         with:
           node-version: '24'
       - name: Test deployment evidence and reporting
-        run: node --test scripts/sentry-report-deploy.node-test.mjs
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
       - name: Verify live revision and record Sentry deployment
+        id: record
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: node scripts/sentry-report-deploy.mjs
+      - name: Upload browser dashboard source maps
+        if: steps.record.outputs.release != ''
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_RELEASE: ${{ steps.record.outputs.release }}
+        run: node scripts/sentry-upload-browser-sourcemaps.mjs
