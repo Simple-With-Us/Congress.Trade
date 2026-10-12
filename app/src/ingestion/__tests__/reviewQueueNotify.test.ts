@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
-import { notifyReviewQueuePublisher } from '../reviewQueueNotify.ts';
+import { notifyPipelineStallPublisher, notifyReviewQueuePublisher } from '../reviewQueueNotify.ts';
 
 const DNS_A = JSON.stringify({
   Status: 0,
@@ -46,6 +46,49 @@ describe('notifyReviewQueuePublisher', () => {
       'https://evil.example/hook',
       expect.anything(),
     );
+  });
+
+  it('fans out to primary and GB webhook URLs with the same signature', async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      urls.push(url);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb.example/hook',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(urls.sort()).toEqual(['https://bf.example/hook', 'https://gb.example/hook']);
+  });
+
+  it('POSTs pipeline.stalled with null docId', async () => {
+    let postedBody = '';
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      postedBody = String(init?.body ?? '');
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyPipelineStallPublisher(envWith(), {
+      pipeline: 'senate_fetch_success',
+      detail: 'stale senate',
+      at: '2026-10-12T12:00:00.000Z',
+    }, { fetchImpl });
+
+    expect(postedBody).toContain('"event":"pipeline.stalled"');
+    expect(postedBody).toContain('"docId":null');
+    expect(postedBody).toContain('"pipeline":"senate_fetch_success"');
   });
 
   it('POSTs a signed payload to a validated public target', async () => {
