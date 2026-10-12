@@ -189,8 +189,10 @@ describe('pipelineLoudAlerts', () => {
     expect(result.evaluated).toContain('ocr_scan_reader');
     expect(result.evaluated).toContain('senate_fetch_success');
     expect(result.evaluated).toContain('house_fetch_success');
+    expect(result.evaluated).toContain('executive_fetch_success');
     expect(result.alerted).toContain('ocr_scan_reader');
     expect(result.alerted).toContain('senate_fetch_success');
+    expect(result.alerted).toContain('executive_fetch_success');
     expect(notifyStallSpy).toHaveBeenCalled();
     const ocrCall = notifyStallSpy.mock.calls.find((c) => c[1]?.pipeline === 'ocr_scan_reader');
     expect(ocrCall?.[1]).toMatchObject({

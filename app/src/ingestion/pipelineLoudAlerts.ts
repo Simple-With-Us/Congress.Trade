@@ -21,7 +21,9 @@ import { hasConfiguredKeyedEnrichmentProvider } from '../enrichment/service.ts';
 import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
+  FRESHNESS_MAX_AGE_DAYS,
   type FreshnessSnapshot,
+  type FreshnessStream,
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
@@ -467,7 +469,8 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
             AND COALESCE(sr.price_unavailable, 0) = 0
             AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)) AS n,
          (SELECT MAX(price_checked_at) FROM securities_ref
-           WHERE price_checked_at IS NOT NULL) AS last_at`,
+           WHERE price_checked_at IS NOT NULL
+             AND source LIKE '%socratic%') AS last_at`,
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
@@ -507,7 +510,21 @@ async function loadFreshnessSnapshot(env: Env): Promise<FreshnessSnapshot | null
   }
 }
 
-async function evaluateStInboundMarketData(env: Env, now: Date): Promise<StallEval> {
+function scaledFreshnessMaxAgeDays(thresholdMs: number): Record<FreshnessStream, number> {
+  const baseMs = stallWindowMs(DEFAULT_PIPELINE_STALL_HOURS);
+  const ratio = thresholdMs / baseMs;
+  const out = { ...FRESHNESS_MAX_AGE_DAYS };
+  for (const stream of Object.keys(out) as FreshnessStream[]) {
+    out[stream] = Math.max(1, Math.ceil(out[stream] * ratio));
+  }
+  return out;
+}
+
+async function evaluateStInboundMarketData(
+  env: Env,
+  now: Date,
+  thresholdMs: number,
+): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST inbound streams not configured', skip: true };
   }
@@ -515,7 +532,7 @@ async function evaluateStInboundMarketData(env: Env, now: Date): Promise<StallEv
   if (!snapshot) {
     return { stalled: false, detail: 'freshness snapshot unavailable', skip: true };
   }
-  const stale = evaluateFreshness(snapshot, now.getTime());
+  const stale = evaluateFreshness(snapshot, now.getTime(), scaledFreshnessMaxAgeDays(thresholdMs));
   if (stale.length === 0) {
     return { stalled: false, detail: 'inbound market-data streams fresh' };
   }
@@ -658,15 +675,18 @@ export async function sweepPipelineStallAlerts(
     deps,
   );
 
+  const inboundThresholdMs = stallWindowMs(readPipelineStallHours(env, 'st_inbound_market_data'));
   await processStallCondition(
     env,
     'st_inbound_market_data',
-    await evaluateStInboundMarketData(env, now),
+    await evaluateStInboundMarketData(env, now, inboundThresholdMs),
     now,
     result,
     deps,
   );
 
+  // Circuit-open stalls are immediate; `CT_PIPELINE_STALL_HOURS_st_outbound_share_push`
+  // only controls re-alert cadence via processStallCondition dedupe window.
   await processStallCondition(
     env,
     'st_outbound_share_push',

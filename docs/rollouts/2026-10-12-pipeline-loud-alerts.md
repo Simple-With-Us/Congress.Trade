@@ -14,6 +14,13 @@ Terminal non-retryable ingest/extract failures wake GB Publisher and BF-Publishe
 - `app/src/ingestion/__tests__/pipelineLoudAlerts.test.ts`
 - `app/src/ingestion/__tests__/reviewQueueNotify.test.ts`
 
+## Decisions
+
+- Stall webhooks use `pipeline.stalled` / `pipeline.stall_recovered` with a null `docId` (optional backlog `docId` for OCR) so GB Publisher, BF-Publisher, and Sentry share one envelope across House, Senate, Executive/OGE, OCR, Socratic.Trade, and `/api/health` checks (`health_<id>`).
+- Reuse the existing `REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET` HMAC for both `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL` (BF) and optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (GB); no second secret source.
+- Default stall threshold is 6h (`CT_PIPELINE_STALL_HOURS`); per-condition overrides use `CT_PIPELINE_STALL_HOURS_<CONDITION>` (uppercased condition id).  Inbound market-data scales `evaluateFreshness` day thresholds proportionally to that override; outbound peer-share treats an open delivery circuit as an immediate stall and uses the env hours only for re-alert dedupe.
+- KV episodes track `active` plus `notifiedAt`: dedupe within the stall window, `pipeline.stall_recovered` when a condition clears, and 7d dedupe for terminal per-doc failures.
+
 ## Verification
 
 - `cd app && npm run typecheck` -> ok
