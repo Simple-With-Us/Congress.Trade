@@ -1,6 +1,6 @@
 # Enabled fleet wide by the owner on 2026-10-11 (boards 04b963b7 and 99e559ea).
-# MiniMax M3 via Vercel AI Gateway, paid; at most 5 attempts per UTC day in this repository.
-# The generation step reads the org secret VERCEL_AI_GATEWAY_API_KEY directly as MODEL_API_KEY.
+# MiniMax M3 via its direct OpenAI-compatible endpoint, paid; at most 5 attempts per UTC day in this repository.
+# The generation step reads the org secret MINIMAX_API_KEY directly as MODEL_API_KEY.
 # Local job definitions preserve this repository's auditable runner policy.
 # Mirrors congress-trading-shared kody-autofix-reusable.yml at e28fefcd12d4747e3ed66cb5c5b3f3dd7ea2db88.
 # Full checkout is restricted to the trusted public helper commit; no target PR checkout.
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: '59ae449dc93f691877f0fe8b58b43f6ca48e751d'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -102,7 +102,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: '59ae449dc93f691877f0fe8b58b43f6ca48e751d'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -142,7 +142,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: '59ae449dc93f691877f0fe8b58b43f6ca48e751d'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -181,9 +181,9 @@ jobs:
       - name: Generate One Bounded Proposal
         run: node trusted-helper/.github/kody-autofix/fleet.mjs generate "$RUNNER_TEMP/kody-autofix"
         env:
-          MODEL_API_KEY: ${{ secrets.VERCEL_AI_GATEWAY_API_KEY }}
-          KODY_MODEL: 'minimax/minimax-m3'
-          KODY_MODEL_BASE_URL: 'https://ai-gateway.vercel.sh/v1'
+          MODEL_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          KODY_MODEL: 'MiniMax-M3'
+          KODY_MODEL_BASE_URL: 'https://api.minimax.io/v1'
       - name: Reject Secret-Bearing Generated Results
         run: node trusted-helper/.github/kody-autofix/fleet.mjs scan-answer "$RUNNER_TEMP/kody-autofix"
         env:
@@ -214,7 +214,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: '59ae449dc93f691877f0fe8b58b43f6ca48e751d'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
