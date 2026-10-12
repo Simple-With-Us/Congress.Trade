@@ -25,6 +25,7 @@ import {
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
+import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
@@ -39,7 +40,16 @@ export type PipelineStallCondition =
   | 'st_peer_enrichment'
   | 'st_peer_prices'
   | 'st_inbound_market_data'
-  | 'st_outbound_share_push';
+  | 'st_outbound_share_push'
+  /** `/api/health` check ids (ingest outbox, extract, delivery, probes, …). */
+  | `health_${string}`;
+
+/** Chamber poll checks are covered by explicit `*_fetch_success` stall detectors. */
+const HEALTH_STALL_SKIP_IDS = new Set([
+  'polling_house',
+  'polling_senate',
+  'polling_executive',
+]);
 
 export interface PipelineStallAlertResult {
   evaluated: string[];
@@ -665,6 +675,30 @@ export async function sweepPipelineStallAlerts(
     result,
     deps,
   );
+
+  try {
+    const health = await checkPipelineHealth(env, now);
+    for (const check of health.checks) {
+      if (HEALTH_STALL_SKIP_IDS.has(check.id)) continue;
+      const stalled = check.status === 'stalled' || check.status === 'critical';
+      const condition = `health_${check.id}` satisfies PipelineStallCondition;
+      await processStallCondition(
+        env,
+        condition,
+        {
+          stalled,
+          detail: stalled
+            ? `[health/${check.status}] ${check.detail}`
+            : (check.detail || `${check.id} ok`),
+        },
+        now,
+        result,
+        deps,
+      );
+    }
+  } catch {
+    /* health collection must not break the stall sweep */
+  }
 
   return result;
 }

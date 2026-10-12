@@ -40,6 +40,10 @@ vi.mock('../../delivery/targetCircuit.ts', () => ({
   checkTargetCircuit: vi.fn(async () => ({ allowed: true, probe: false })),
 }));
 
+vi.mock('../../shared/pipelineHealth.ts', () => ({
+  checkPipelineHealth: vi.fn(async () => ({ status: 'ok', checks: [] })),
+}));
+
 function kvEnv() {
   const store = new Map<string, string>();
   const env = {

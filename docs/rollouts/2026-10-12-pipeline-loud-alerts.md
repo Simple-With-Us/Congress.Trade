@@ -2,7 +2,7 @@
 
 ## Summary
 
-Terminal non-retryable ingest/extract failures wake GB Publisher and BF-Publisher via signed publisher webhook(s) and emit Sentry errors, instead of only appearing on `/api/health`.  An hourly stall detector pages when ingest chambers (House, Senate, Executive/OGE), the OCR/scan-reader, or Socratic.Trade enrichment/price/share paths go stale.  Stall events use `pipeline.stalled` / `pipeline.stall_recovered` with a null `docId` (optional wake `docId` for OCR backlog).  Threshold default is 6h per pipeline (`CT_PIPELINE_STALL_HOURS` and `CT_PIPELINE_STALL_HOURS_<CONDITION>`).  BF receives `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL`; GB receives optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (same HMAC secret).
+Terminal non-retryable ingest/extract failures wake GB Publisher and BF-Publisher via signed publisher webhook(s) and emit Sentry errors, instead of only appearing on `/api/health`.  An hourly stall detector pages when ingest chambers (House, Senate, Executive/OGE), the OCR/scan-reader, or Socratic.Trade enrichment/price/share paths go stale, and when any other `/api/health` check is `stalled` or `critical` (ingestion outbox, extraction provider, delivery circuit, latency probes, etc.) — keyed as `health_<checkId>` with `polling_{house,senate,executive}` skipped to avoid duplicate chamber pages.  Stall events use `pipeline.stalled` / `pipeline.stall_recovered` with a null `docId` (optional wake `docId` for OCR backlog).  Threshold default is 6h per pipeline (`CT_PIPELINE_STALL_HOURS` and `CT_PIPELINE_STALL_HOURS_<CONDITION>`).  BF receives `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL`; GB receives optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (same HMAC secret).
 
 ## Files changed
 
