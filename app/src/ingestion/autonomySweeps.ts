@@ -432,7 +432,7 @@ export interface AutonomySweepResult {
    *  check cannot see, because a tick that never fires is not a tick that
    *  failed). */
   pollingHeartbeat: PollingHeartbeatResult | null;
-  /** OCR/scan-reader + Senate fetch success stall detector (Sentry + publisher webhook). */
+  /** Ingest/OCR/ST stall detector (Sentry + dual publisher webhooks + recovery). */
   pipelineStallAlerts: PipelineStallAlertResult | null;
   /** Empty 278e → verified_empty; refused 278-T → unreadable.  Allowlist only. */
   executiveTerminals: ExecutiveTerminalSweepResult | null;
