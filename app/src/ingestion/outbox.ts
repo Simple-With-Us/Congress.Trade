@@ -1,5 +1,6 @@
 import type { Env, Chamber } from '../shared/types.ts';
 import { all, run, type SqlParam } from '../shared/db.ts';
+import { maybeAlertTerminalIngestionOutbox } from './pipelineLoudAlerts.ts';
 
 export type IngestionOutboxStatement = [string, SqlParam[]];
 
@@ -231,12 +232,14 @@ export async function reconnectDeadLetteredIngestionOutbox(
     return { status: 'pending', deadLetterCycles: row.dead_letter_cycles };
   }
   if (row.dead_letter_cycles >= MAX_DEAD_LETTER_CYCLES) {
+    const lastError = error.slice(0, 1000);
     await run(
       env.DB,
       `UPDATE ingestion_outbox SET status = 'failed', last_error = ?, updated_at = ?
         WHERE doc_id = ?`,
-      [error.slice(0, 1000), nowIso, docId],
+      [lastError, nowIso, docId],
     );
+    await maybeAlertTerminalIngestionOutbox(env, docId, lastError, now);
     return { status: 'failed', deadLetterCycles: row.dead_letter_cycles };
   }
   const nextCycle = row.dead_letter_cycles + 1;
