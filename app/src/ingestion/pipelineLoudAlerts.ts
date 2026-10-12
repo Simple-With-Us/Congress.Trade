@@ -526,13 +526,13 @@ async function evaluateStOutboundShare(env: Env): Promise<StallEval> {
     return { stalled: false, detail: 'peer URL invalid', skip: true };
   }
   const gate = await checkTargetCircuit(env, targetKey);
-  if (gate.allowed) {
-    return { stalled: false, detail: 'peer share circuit closed' };
+  if (gate.allowed === false) {
+    const detail =
+      `Outbound share push to Socratic.Trade is blocked (${gate.reason}); ` +
+      `retry after ~${gate.retryAfterSec}s`;
+    return { stalled: true, detail };
   }
-  const detail =
-    `Outbound share push to Socratic.Trade is blocked (${gate.reason}); ` +
-    `retry after ~${gate.retryAfterSec}s`;
-  return { stalled: true, detail };
+  return { stalled: false, detail: 'peer share circuit closed' };
 }
 
 async function processStallCondition(
