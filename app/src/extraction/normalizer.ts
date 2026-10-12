@@ -33,6 +33,7 @@ import {
   handCheckReviewReason,
   mergeHandCheckIntoReviewReason,
   NEEDS_HAND_CHECK_MAC_VISION,
+  NEEDS_HAND_CHECK_SCANNED_VISION,
   requiresHandCheckBeforePublish,
 } from './handCheckPublish.ts';
 import type { ExtractorParseDisposition } from '../extractors/types.ts';
@@ -1800,7 +1801,7 @@ async function routeToReview(
   ]);
   const queueTouched = (results[0]?.meta?.changes ?? 0) > 0;
   const handCheckWake = reason.includes(NEEDS_HAND_CHECK_MAC_VISION)
-    || reason.includes('needs_hand_check:scanned_vision');
+    || reason.includes(NEEDS_HAND_CHECK_SCANNED_VISION);
   if (queueTouched && (!review || handCheckWake)) {
     void notifyReviewQueuePublisher(env, {
       docId: filing.docId,

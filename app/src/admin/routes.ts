@@ -280,6 +280,10 @@ import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import {
+  NEEDS_HAND_CHECK_MAC_VISION,
+  mergeHandCheckIntoReviewReason,
+} from '../extraction/handCheckPublish.ts';
+import {
   grantAdmin,
   revokeAdmin,
   listGrantedAdmins,
@@ -2186,7 +2190,7 @@ async function stampLocalVisionSubmitted(
     `SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0 LIMIT 1`,
     [docId],
   );
-  const handCheckReason = 'needs_hand_check:mac_vision';
+  const publisherReason = mergeHandCheckIntoReviewReason(tag, NEEDS_HAND_CHECK_MAC_VISION);
   if (open) {
     await run(
       env.DB,
@@ -2201,7 +2205,7 @@ async function stampLocalVisionSubmitted(
     );
     void notifyReviewQueuePublisher(env, {
       docId,
-      reason: handCheckReason,
+      reason: publisherReason,
       kind: 'reopen',
       at: nowIso,
     });
@@ -2215,7 +2219,7 @@ async function stampLocalVisionSubmitted(
     if ((insertResult.meta?.changes ?? 0) > 0) {
       void notifyReviewQueuePublisher(env, {
         docId,
-        reason: handCheckReason,
+        reason: publisherReason,
         kind: 'insert',
         at: nowIso,
       });
