@@ -17,3 +17,7 @@ A synthetic live request using the pinned compatibility helper authenticated aga
 ## Follow-ups
 
 This provider change preserves the existing gates, profile, source paths, budget, shared per-PR concurrency, and draft-proposal behavior.  Production Kody execution remains tracked separately in CTS-326; a synthetic request is not proof of a production proposal.
+
+## Native M3 Answer Mode
+
+The helper pin `b1503884e547a8fb5d1449a94e03cae8c496da4c` disables thinking for native `MiniMax-M3`, using the documented API mode to avoid upstream MiniMax-M3 issue 28, where reasoning boundaries can truncate the answer.  A live synthetic edit canary passed against this exact revision; all 71 offline helper tests passed.  The model, endpoint, key, source scope, and budget stay unchanged.
