@@ -22,7 +22,7 @@ const fullCommitSha = /^[0-9a-f]{40}$/;
 // both run on ubuntu-latest, so the hosted-runner policy still holds.  A caller
 // may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
 const allowedReusableWorkflows = new Set([
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@9f9eaeb7dd6b88cc48d422cd4b5dc461abd87f57",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2e671004afff99a69565aa70853d5bd7a276c667",
   "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@3bff293b56adcc0367d3a91066938b2d4d5ebbc5",
 ]);
 
