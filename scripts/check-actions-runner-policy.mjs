@@ -23,7 +23,7 @@ const fullCommitSha = /^[0-9a-f]{40}$/;
 // may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
 const allowedReusableWorkflows = new Set([
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@9f9eaeb7dd6b88cc48d422cd4b5dc461abd87f57",
-  "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@43752150800873da81f01f104df47c9b8aab19de",
+  "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@3bff293b56adcc0367d3a91066938b2d4d5ebbc5",
 ]);
 
 for (const name of workflowNames) {
