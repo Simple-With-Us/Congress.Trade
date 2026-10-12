@@ -43,13 +43,18 @@ pick_udid() {
 import json, sys
 prefix = sys.argv[1]
 data = json.load(sys.stdin)["devices"]
-best = None
+exact, variant = None, None
 for runtime in sorted(data):
     for d in data[runtime]:
         name = d["name"]
-        if name == prefix or name.startswith(prefix + " ("):
-            best = d["udid"]
-print(best or "")
+        if name == prefix:
+            exact = d["udid"]
+            break
+        if variant is None and name.startswith(prefix + " ("):
+            variant = d["udid"]
+    if exact:
+        break
+print(exact or variant or "")
 ' "$1"
 }
 
