@@ -30,7 +30,7 @@ def _bootstrap_credentials() -> Tuple[str, str, str]:
         os.getenv("INFISICAL_APP_CLIENT_ID") or os.getenv("INFISICAL_CLIENT_ID") or ""
     ).strip()
     client_secret = (
-        os.getenv("INFISICAL_CLIENT_SECRET") or os.getenv("INFISICAL_APP_CLIENT_SECRET") or ""
+        os.getenv("INFISICAL_APP_CLIENT_SECRET") or os.getenv("INFISICAL_CLIENT_SECRET") or ""
     ).strip()
     project_id = (os.getenv("INFISICAL_APP_PROJECT_ID") or "").strip()
     if not client_id or not client_secret or not project_id:

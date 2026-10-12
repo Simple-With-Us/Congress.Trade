@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest import mock
 
-from infisical_config import fetch_secret_from_infisical, resolve_admin_token
+from infisical_config import _bootstrap_credentials, fetch_secret_from_infisical, resolve_admin_token
 
 
 class InfisicalConfigTests(unittest.TestCase):
@@ -15,6 +15,17 @@ class InfisicalConfigTests(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.clear()
         os.environ.update(self._env)
+
+    def test_bootstrap_credentials_prefers_app_client_secret(self) -> None:
+        os.environ["INFISICAL_APP_CLIENT_ID"] = "app-id"
+        os.environ["INFISICAL_CLIENT_ID"] = "legacy-id"
+        os.environ["INFISICAL_APP_CLIENT_SECRET"] = "app-secret"
+        os.environ["INFISICAL_CLIENT_SECRET"] = "legacy-secret"
+        os.environ["INFISICAL_APP_PROJECT_ID"] = "proj"
+        cid, csec, proj = _bootstrap_credentials()
+        self.assertEqual(cid, "app-id")
+        self.assertEqual(csec, "app-secret")
+        self.assertEqual(proj, "proj")
 
     def test_resolve_admin_token_prefers_env(self) -> None:
         os.environ["ADMIN_TOKEN"] = "from-env-token"
