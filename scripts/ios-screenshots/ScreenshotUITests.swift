@@ -18,8 +18,8 @@ final class ScreenshotUITests: XCTestCase {
         sleep(2)
         let image = XCUIScreen.main.screenshot()
         let env = ProcessInfo.processInfo.environment
-        let dir = env["SHOT_DIR"] ?? NSTemporaryDirectory()
-        let prefix = env["SHOT_PREFIX"] ?? "device"
+        let dir = env["TEST_RUNNER_SHOT_DIR"] ?? NSTemporaryDirectory()
+        let prefix = env["TEST_RUNNER_SHOT_PREFIX"] ?? "device"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let path = (dir as NSString).appendingPathComponent("\(prefix)_\(name).png")
         try? image.pngRepresentation.write(to: URL(fileURLWithPath: path))
