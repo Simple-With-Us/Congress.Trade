@@ -2,7 +2,7 @@
 
 ## 2026-10-11 CODEX — Kody Direct MiniMax (CTS-330)
 
-Kody uses `MiniMax-M3` through MiniMax’s direct OpenAI-compatible endpoint with the existing MiniMax key.  The helper passed a synthetic live edit canary and 70 offline tests.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
+Kody uses `MiniMax-M3` through MiniMax’s direct OpenAI-compatible endpoint with the existing MiniMax key.  The helper passed a synthetic live edit canary and 71 offline tests.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
 
 
 ## 2026-09-24 BF-PUBLISHER — Disputed agreement vision vs unreadable 278-T

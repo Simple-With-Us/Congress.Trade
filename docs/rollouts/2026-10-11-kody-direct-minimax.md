@@ -12,7 +12,7 @@ Owner correction for CTS-330: use MiniMax’s direct OpenAI-compatible API inste
 
 ## Verification
 
-A synthetic live request using the pinned compatibility helper authenticated against `https://api.minimax.io/v1/chat/completions`, returned an edit, and applied it successfully.  Seventy shared helper and generator tests passed, including response validation.  Scoped actionlint and `git diff --check` validate this caller before push.  Hosted checks and current-head Codex review gate merge.
+A synthetic live request using the pinned compatibility helper authenticated against `https://api.minimax.io/v1/chat/completions`, returned an edit, and applied it successfully.  Seventy-one shared helper and generator tests passed, including response validation.  Scoped actionlint and `git diff --check` validate this caller before push.  Hosted checks and current-head Codex review gate merge.
 
 ## Follow-ups
 
