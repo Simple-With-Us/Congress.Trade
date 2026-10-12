@@ -202,7 +202,7 @@ function letterVariant(index: number): string {
 }
 
 describe('normalize', () => {
-  it('publishes a clean oversized extraction instead of capping at 200', async () => {
+  it('holds a clean oversized scanned vision extraction for hand check instead of capping at 200', async () => {
     const { env, cap } = makeEnv([{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }]);
     const parsed = Array.from(
       { length: 201 },
@@ -217,11 +217,11 @@ describe('normalize', () => {
       parsed,
       { extractor: 'visionLlm' },
     );
-    expect(result.needsReview).toBe(false);
-    expect(result.published).toBe(true);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
     expect(result.transactions.length).toBe(201);
-    expect(cap.insertedTx).toHaveLength(201);
-    await expect(persistTransactions(env, result.transactions)).resolves.toBeTruthy();
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(String(cap.reviewRows[0][1])).toContain('needs_hand_check:scanned_vision');
   });
 
   it('still holds a low-confidence uniform OCR flood above 200 rows', async () => {
@@ -241,7 +241,9 @@ describe('normalize', () => {
     );
     expect(result.needsReview).toBe(true);
     expect(cap.insertedTx).toHaveLength(0);
-    expect(String(cap.reviewRows[0][1])).toBe('extraction_row_limit_exceeded_likely_garbage:0.00');
+    expect(String(cap.reviewRows[0][1])).toBe(
+      'needs_hand_check:scanned_vision,extraction_row_limit_exceeded_likely_garbage:0.00',
+    );
   });
 
   it('makes the publication receipt part of the atomic batch and retries it idempotently', async () => {
@@ -483,15 +485,12 @@ describe('normalize', () => {
       ],
       { extractor: 'local_grok_cli_v1', source: 'local_mac' },
     );
-    expect(result.needsReview).toBe(false);
-    expect(result.published).toBe(true);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
     expect(result.transactions).toHaveLength(2);
-    expect(cap.insertedTx).toHaveLength(2);
-    expect(cap.reviewRows).toHaveLength(0);
-    expect(cap.batches.at(-1)).toEqual(expect.arrayContaining([
-      expect.stringMatching(/deprecated_reason = \?/i),
-      expect.stringMatching(/source IN \('primary', 'manual', 'server_cpu'\)/),
-    ]));
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(cap.reviewRows).toHaveLength(1);
+    expect(String(cap.reviewRows[0][1])).toContain('needs_hand_check:mac_vision');
   });
 
   it('local Grok vision does not auto-publish when every row omitted the amount', async () => {
@@ -528,7 +527,7 @@ describe('normalize', () => {
     expect(String(cap.reviewRows[0][1])).toContain('no_amount');
   });
 
-  it('Mac Gemini cascade publishes siblings when some PTR rows omit the amount checkbox', async () => {
+  it('Mac Gemini cascade holds for hand check even when some PTR rows omit the amount checkbox', async () => {
     const { env, cap } = makeEnv([]);
     const result = await normalize(
       env,
@@ -555,11 +554,12 @@ describe('normalize', () => {
       ],
       { extractor: 'openrouter_google_gemini_3_7_flash', source: 'local_mac' },
     );
-    expect(result.needsReview).toBe(false);
-    expect(result.published).toBe(true);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
     expect(result.transactions).toHaveLength(2);
-    expect(cap.insertedTx).toHaveLength(2);
-    expect(cap.reviewRows).toHaveLength(0);
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(cap.reviewRows).toHaveLength(1);
+    expect(String(cap.reviewRows[0][1])).toContain('needs_hand_check:mac_vision');
   });
 
   it('server-side OpenRouter still holds the filing when any row omitted the amount', async () => {
@@ -1257,7 +1257,7 @@ describe('normalize', () => {
     expect(cap3.reviewRows.length).toBe(0);
   });
 
-  it('local vision publishes dated siblings when one grid row omitted the date', async () => {
+  it('local vision holds dated siblings for hand check when one grid row omitted the date', async () => {
     const { env, cap } = makeEnv([{ ticker: 'META', name: 'Meta Platforms', aliases: '[]' }]);
     const result = await normalize(
       env,
@@ -1284,9 +1284,11 @@ describe('normalize', () => {
       ],
       { extractor: 'local_grok_cli_v1', source: 'local_mac' },
     );
-    expect(result.needsReview).toBe(false);
-    expect(result.published).toBe(true);
-    expect(cap.insertedTx).toHaveLength(1);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(cap.reviewRows).toHaveLength(1);
+    expect(String(cap.reviewRows[0][1])).toContain('needs_hand_check:mac_vision');
   });
 
   it('publishes a disclosed trade a few days after Clerk filed_date when the date is not in the future', async () => {

@@ -24,10 +24,17 @@ import {
   looksLikeHeaderContaminatedAsset,
   looksLikeNothingToReport,
   looksLikeOgePart7ExplicitNone,
+  dropPtrFormSampleParsedRows,
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
 } from './extractRouting.ts';
+import {
+  handCheckReviewReason,
+  mergeHandCheckIntoReviewReason,
+  NEEDS_HAND_CHECK_MAC_VISION,
+  requiresHandCheckBeforePublish,
+} from './handCheckPublish.ts';
 import type { ExtractorParseDisposition } from '../extractors/types.ts';
 import {
   closeUnreadableExecutive,
@@ -375,10 +382,8 @@ export async function normalize(
   // Drop form-chrome rows up front. Pure letterhead OCR floods were parking
   // hundreds of "Clerk of the House…" fakes in review_queue and burning the
   // agreement cascade budget on documents with zero real trades.
-  const usableParsed = parsed.filter((p) =>
+  const usableParsed = dropPtrFormSampleParsedRows(parsed).filter((p) =>
     !looksLikeHeaderContaminatedAsset(p.assetName)
-    && !looksLikePtrFormSampleAsset(p.assetName)
-    && !looksLikePtrFormSampleRow(p)
     && !looksLikeSeeAttachmentPointer(p.assetName)
     && !looksLikeSeeAttachmentPointer(p.rawText)
     && !looksLikeNothingToReport(p.assetName)
@@ -442,7 +447,7 @@ export async function normalize(
   // OpenRouter agreement outages cannot strand already-structured rows.
   const confThreshold = confidenceThresholdFor(extractorName, filing.docKind);
 
-  const needsReview =
+  let needsReview =
     flagged.length === 0
     || gateMinConfidence < confThreshold
     || hasHardFailure
@@ -478,6 +483,13 @@ export async function normalize(
        FROM review_queue WHERE doc_id = ?`,
     [filing.docId],
   );
+
+  const handCheckRequired = requiresHandCheckBeforePublish(filing, extractorName, source)
+    && reviewSnapshot?.resolved !== 1
+    && flagged.length > 0;
+  if (handCheckRequired) {
+    needsReview = true;
+  }
 
   // A completed decision is authoritative unless a later complete vision
   // extract is replacing a truncated confirm on the same doc_id. Replaying
@@ -635,6 +647,12 @@ export async function normalize(
     let reason = exceedsPublishLimit
       ? classifyRowLimitReason(flagged)
       : reviewReason(flagged, minConfidence, confThreshold);
+    if (handCheckRequired && flagged.length > 0) {
+      reason = mergeHandCheckIntoReviewReason(
+        reason,
+        handCheckReviewReason(filing, extractorName, source),
+      );
+    }
     // A refused text layer that could not be closed still must not be labeled
     // as an empty extract.  ocr_unusable is already a health terminal and an
     // agreement hard-stop.
@@ -686,6 +704,7 @@ export async function normalize(
           || (flagged.length === 0 && droppedFormChrome > 0)
           || ocrUnusable
           || (filing.chamber === 'executive' && meta?.parseDisposition === 'unreadable')
+          || handCheckRequired
             ? reason
             : undefined,
       },
@@ -1779,16 +1798,18 @@ async function routeToReview(
       ],
     ],
   ]);
-  const entered = (results[0]?.meta?.changes ?? 0) > 0;
-  if (entered && !review) {
+  const queueTouched = (results[0]?.meta?.changes ?? 0) > 0;
+  const handCheckWake = reason.includes(NEEDS_HAND_CHECK_MAC_VISION)
+    || reason.includes('needs_hand_check:scanned_vision');
+  if (queueTouched && (!review || handCheckWake)) {
     void notifyReviewQueuePublisher(env, {
       docId: filing.docId,
       reason,
-      kind: 'insert',
+      kind: review ? 'reopen' : 'insert',
       at: nowIso,
     });
   }
-  return entered;
+  return queueTouched;
 }
 
 function isAmendedFilingStatus(status: string | null | undefined): boolean {

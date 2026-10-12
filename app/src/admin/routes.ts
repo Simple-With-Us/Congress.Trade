@@ -2186,6 +2186,7 @@ async function stampLocalVisionSubmitted(
     `SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0 LIMIT 1`,
     [docId],
   );
+  const handCheckReason = 'needs_hand_check:mac_vision';
   if (open) {
     await run(
       env.DB,
@@ -2198,6 +2199,12 @@ async function stampLocalVisionSubmitted(
         WHERE doc_id = ? AND resolved = 0`,
       [tag, tag, docId],
     );
+    void notifyReviewQueuePublisher(env, {
+      docId,
+      reason: handCheckReason,
+      kind: 'reopen',
+      at: nowIso,
+    });
   } else {
     const insertResult = await run(
       env.DB,
@@ -2208,7 +2215,7 @@ async function stampLocalVisionSubmitted(
     if ((insertResult.meta?.changes ?? 0) > 0) {
       void notifyReviewQueuePublisher(env, {
         docId,
-        reason: tag,
+        reason: handCheckReason,
         kind: 'insert',
         at: nowIso,
       });
@@ -3914,7 +3921,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       ],
       'auth-billing': [
         'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
-        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
         'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'WEBHOOK_SIGNING_KEY',
         'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICE_MONTHLY', 'STRIPE_PRICE_ANNUAL',
         'STRIPE_TRIAL_DAYS', 'STRIPE_MANAGED_PAYMENTS', 'RESEND_API_KEY', 'EMAIL_FROM', 'ALERT_EMAIL',

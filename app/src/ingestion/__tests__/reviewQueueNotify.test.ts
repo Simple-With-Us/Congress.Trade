@@ -77,4 +77,31 @@ describe('notifyReviewQueuePublisher', () => {
       expect.objectContaining({ method: 'POST' }),
     );
   });
+
+  it('fans out the same signed payload to BF and GB publisher webhook URLs', async () => {
+    const postedUrls: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      postedUrls.push(url);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf-publisher.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb-publisher.example/hook',
+    }), {
+      docId: 'H-2026-9116355',
+      reason: 'needs_hand_check:mac_vision',
+      kind: 'insert',
+      at: '2026-10-12T09:28:00.000Z',
+    }, { fetchImpl });
+
+    expect(postedUrls).toContain('https://bf-publisher.example/hook');
+    expect(postedUrls).toContain('https://gb-publisher.example/hook');
+    expect(postedUrls.length).toBe(2);
+  });
 });
