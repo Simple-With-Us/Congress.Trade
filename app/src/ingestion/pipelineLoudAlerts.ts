@@ -8,12 +8,14 @@
 import type { Env } from '../shared/types.ts';
 import type { QueueMessage } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
-import { isParkedDlqError, isTransientDlqError } from './transientDlq.ts';
+import { isParkedDlqError } from './transientDlq.ts';
 import { notifyReviewQueuePublisher } from './reviewQueueNotify.ts';
 import { captureException, captureMessage } from '../deno/sentry.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
+/** Re-alert the same doc+stage after this window if it fails terminally again. */
+export const TERMINAL_REDUP_WINDOW_MS = 7 * 24 * 3_600_000;
 
 export type PipelineTerminalStage = 'ingest' | 'extract';
 
@@ -87,7 +89,7 @@ function terminalIngestReason(stage: PipelineTerminalStage, lastError: string): 
 
 /**
  * Terminal non-retryable ingest (outbox) or extract (durable queue) failure.
- * Fires once per doc_id per stage (KV dedupe without expiry).
+ * Deduped per doc_id per stage for TERMINAL_REDUP_WINDOW_MS (KV pre-claim before side effects).
  */
 export async function alertPipelineTerminalFailure(
   env: Env,
@@ -104,10 +106,13 @@ export async function alertPipelineTerminalFailure(
   const lastError = input.lastError?.trim() ?? '';
   if (isParkedDlqError(lastError)) return;
 
+  const now = new Date(input.at ?? Date.now());
   const kvKey = `${PIPELINE_LOUD_ALERT_KV_PREFIX}terminal:${input.stage}:${docId}`;
-  if (await readEpisode(env, kvKey)) return;
+  if (!(await shouldRenotify(env, kvKey, TERMINAL_REDUP_WINDOW_MS, now))) return;
 
-  const at = input.at ?? new Date().toISOString();
+  await markNotified(env, kvKey, now);
+
+  const at = now.toISOString();
   const reason = terminalIngestReason(input.stage, lastError);
 
   const err = new Error(`Pipeline terminal ${input.stage} failure for ${docId}: ${lastError.slice(0, 500)}`);
@@ -125,8 +130,6 @@ export async function alertPipelineTerminalFailure(
     { docId, reason, kind: 'insert', at },
     deps,
   );
-
-  await markNotified(env, kvKey, new Date(at));
 }
 
 /** After ingestion_outbox is stamped failed (dead-letter budget exhausted). */
@@ -155,7 +158,7 @@ export async function maybeAlertTerminalDurableIngestFailure(
   if (!('docId' in message) || !message.docId) return;
   const stage: PipelineTerminalStage =
     message.type === 'filing.extracted' ? 'extract' : 'ingest';
-  if (isTransientDlqError(lastError)) return;
+  if (isParkedDlqError(lastError)) return;
   await alertPipelineTerminalFailure(
     env,
     { docId: message.docId, stage, lastError, at: now.toISOString() },
@@ -171,7 +174,33 @@ async function countScannedReaderBacklog(env: Env): Promise<{ pending: number; f
       env.DB,
       `SELECT COUNT(*) AS n
          FROM filings f
-        WHERE f.doc_kind = 'scanned_pdf'
+        WHERE ${SCANNED_READER_BACKLOG_WHERE}`,
+    );
+    pending = Number(row?.n ?? 0);
+  } catch {
+    pending = 0;
+  }
+
+  try {
+    const row = await get<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n
+         FROM ingestion_outbox o
+         JOIN filings f ON f.doc_id = o.doc_id
+        WHERE o.status = 'failed'
+          AND f.doc_kind = 'scanned_pdf'
+          AND COALESCE(o.last_error, '') NOT LIKE 'parked:%'`,
+    );
+    failed = Number(row?.n ?? 0);
+  } catch {
+    failed = 0;
+  }
+
+  return { pending, failed };
+}
+
+const SCANNED_READER_BACKLOG_WHERE = `
+          f.doc_kind = 'scanned_pdf'
           AND f.raw_object_key IS NOT NULL
           AND TRIM(f.raw_object_key) != ''
           AND (
@@ -201,29 +230,23 @@ async function countScannedReaderBacklog(env: Env): Promise<{ pending: number; f
           AND NOT EXISTS (
             SELECT 1 FROM transactions tx
              WHERE tx.doc_id = f.doc_id AND tx.deprecated_at IS NULL
-          )`,
-    );
-    pending = Number(row?.n ?? 0);
-  } catch {
-    pending = 0;
-  }
+          )`;
 
+async function pickOcrStallWakeDocId(env: Env): Promise<string | null> {
   try {
-    const row = await get<{ n: number }>(
+    const row = await get<{ doc_id: string }>(
       env.DB,
-      `SELECT COUNT(*) AS n
-         FROM ingestion_outbox o
-         JOIN filings f ON f.doc_id = o.doc_id
-        WHERE o.status = 'failed'
-          AND f.doc_kind = 'scanned_pdf'
-          AND COALESCE(o.last_error, '') NOT LIKE 'parked:%'`,
+      `SELECT f.doc_id AS doc_id
+         FROM filings f
+        WHERE ${SCANNED_READER_BACKLOG_WHERE}
+        ORDER BY f.updated_at ASC
+        LIMIT 1`,
     );
-    failed = Number(row?.n ?? 0);
+    const id = row?.doc_id?.trim();
+    return id || null;
   } catch {
-    failed = 0;
+    return null;
   }
-
-  return { pending, failed };
 }
 
 async function lastOcrScanAttemptAt(env: Env): Promise<string | null> {
@@ -260,30 +283,34 @@ async function emitStallAlert(
   detail: string,
   now: Date,
   windowMs: number,
+  opts: { wakeDocId?: string | null } = {},
   deps: { fetchImpl?: typeof fetch } = {},
 ): Promise<boolean> {
   const kvKey = `${PIPELINE_LOUD_ALERT_KV_PREFIX}stall:${condition}`;
   if (!(await shouldRenotify(env, kvKey, windowMs, now))) return false;
 
-  const syntheticDocId = `stall:${condition}`;
+  await markNotified(env, kvKey, now);
+
   try {
     captureMessage(`Pipeline stall: ${condition} — ${detail}`, 'error');
   } catch {
     /* fail-soft */
   }
 
-  await notifyReviewQueuePublisher(
-    env,
-    {
-      docId: syntheticDocId,
-      reason: `pipeline_stall:${condition}: ${detail}`.slice(0, 500),
-      kind: 'insert',
-      at: now.toISOString(),
-    },
-    deps,
-  );
+  const wakeDocId = opts.wakeDocId?.trim();
+  if (wakeDocId) {
+    await notifyReviewQueuePublisher(
+      env,
+      {
+        docId: wakeDocId,
+        reason: `pipeline_stall:${condition}: ${detail}`.slice(0, 500),
+        kind: 'insert',
+        at: now.toISOString(),
+      },
+      deps,
+    );
+  }
 
-  await markNotified(env, kvKey, now);
   return true;
 }
 
@@ -317,7 +344,10 @@ export async function sweepPipelineStallAlerts(
       `${workUnits} scanned PDF(s) pending or failed ingest ` +
       `(pending=${backlog.pending}, failed=${backlog.failed}); ` +
       `no OCR/scan-reader submission in ${hoursIdle}h (threshold ${stallHours}h)`;
-    if (await emitStallAlert(env, 'ocr_scan_reader', detail, now, windowMs, deps)) {
+    const wakeDocId = await pickOcrStallWakeDocId(env);
+    if (
+      await emitStallAlert(env, 'ocr_scan_reader', detail, now, windowMs, { wakeDocId }, deps)
+    ) {
       result.alerted.push('ocr_scan_reader');
     }
   }
@@ -335,7 +365,7 @@ export async function sweepPipelineStallAlerts(
     const detail =
       `No successful Senate fetch in ${hoursStale}h (threshold ${stallHours}h); ` +
       `check residential proxy / eFD egress`;
-    if (await emitStallAlert(env, 'senate_fetch_success', detail, now, windowMs, deps)) {
+    if (await emitStallAlert(env, 'senate_fetch_success', detail, now, windowMs, {}, deps)) {
       result.alerted.push('senate_fetch_success');
     }
   }

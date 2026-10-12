@@ -2,7 +2,7 @@
 
 ## Summary
 
-Terminal non-retryable ingest/extract failures now wake Publisher/BF-Publisher via the same signed `review_queue` webhook and emit Sentry errors, instead of only appearing on `/api/health`.  An hourly stall detector pages when the OCR/scan-reader has scanned-PDF backlog but no `server_cpu`/`local_mac` submission in N hours (default 6, `CT_PIPELINE_STALL_HOURS`), and when Senate polling has had no successful fetch in the same window.
+Terminal non-retryable ingest/extract failures now wake Publisher/BF-Publisher via the same signed `review_queue` webhook and emit Sentry errors, instead of only appearing on `/api/health`.  An hourly stall detector pages when the OCR/scan-reader has scanned-PDF backlog but no `server_cpu`/`local_mac` submission in N hours (default 6, `CT_PIPELINE_STALL_HOURS`), and when Senate polling has had no successful fetch in the same window.  OCR stall wakes Publisher with a real backlog `doc_id`; Senate stall is Sentry-only (no synthetic `doc_id` webhook).
 
 ## Files changed
 
@@ -14,8 +14,11 @@ Terminal non-retryable ingest/extract failures now wake Publisher/BF-Publisher v
 
 ## Verification
 
-- `cd app && npm run typecheck && npm test`
-- Simulate: terminal outbox failure triggers one webhook + Sentry per `doc_id`; stall sweep dedupes within the stall window
+- `cd app && npm run lint` -> ok
+- `cd app && npm run typecheck` (`deno check src/deno/main.ts`) -> ok
+- `cd app && npm test` -> ok
+- `npm run build` — not defined for this Deno app (N/A)
+- Simulate: terminal outbox failure triggers one webhook + Sentry per `doc_id` (7d dedupe window); stall sweep dedupes within the stall window
 
 ## Follow-ups
 

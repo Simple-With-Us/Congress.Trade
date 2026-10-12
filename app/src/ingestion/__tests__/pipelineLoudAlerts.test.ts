@@ -2,9 +2,11 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import {
   alertPipelineTerminalFailure,
+  maybeAlertTerminalDurableIngestFailure,
   readPipelineStallHours,
   sweepPipelineStallAlerts,
   PIPELINE_LOUD_ALERT_KV_PREFIX,
+  TERMINAL_REDUP_WINDOW_MS,
 } from '../pipelineLoudAlerts.ts';
 
 const notifySpy = vi.fn(async () => {});
@@ -42,6 +44,9 @@ function kvEnv() {
           return this;
         },
         async first<T>() {
+          if (/SELECT f\.doc_id AS doc_id/i.test(sql)) {
+            return { doc_id: 'H-2026-9116355' } as T;
+          }
           if (/COUNT\(\*\) AS n[\s\S]*scanned_pdf/i.test(sql) && /filings f/i.test(sql)) {
             return { n: 2 } as T;
           }
@@ -117,14 +122,48 @@ describe('pipelineLoudAlerts', () => {
     expect(notifySpy).toHaveBeenCalledTimes(1);
   });
 
-  it('sweepPipelineStallAlerts fires OCR and Senate stall webhooks when dedupe window elapsed', async () => {
+  it('maybeAlertTerminalDurableIngestFailure alerts on transient-pattern lastError', async () => {
+    const { env } = kvEnv();
+    await maybeAlertTerminalDurableIngestFailure(
+      env,
+      { type: 'filing.received', docId: 'H-2026-9116356' },
+      'timeout: upstream reset after retries',
+    );
+    expect(notifySpy).toHaveBeenCalledTimes(1);
+    expect(notifySpy.mock.calls[0][1]).toMatchObject({ docId: 'H-2026-9116356' });
+  });
+
+  it('re-alerts terminal failure after dedupe window', async () => {
+    const { env, store } = kvEnv();
+    const kvKey = `${PIPELINE_LOUD_ALERT_KV_PREFIX}terminal:ingest:H-3`;
+    store.set(
+      kvKey,
+      JSON.stringify({ notifiedAt: new Date(Date.now() - TERMINAL_REDUP_WINDOW_MS - 1000).toISOString() }),
+    );
+    await alertPipelineTerminalFailure(env, {
+      docId: 'H-3',
+      stage: 'ingest',
+      lastError: 'failed again',
+    });
+    expect(notifySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('sweepPipelineStallAlerts fires OCR stall webhook with backlog doc_id; Senate Sentry only', async () => {
     const { env, store } = kvEnv();
     const now = new Date('2026-10-12T18:00:00.000Z');
     const result = await sweepPipelineStallAlerts(env, now);
     expect(result.evaluated).toEqual(['ocr_scan_reader', 'senate_fetch_success']);
     expect(result.alerted).toContain('ocr_scan_reader');
     expect(result.alerted).toContain('senate_fetch_success');
-    expect(notifySpy).toHaveBeenCalledTimes(2);
+    expect(notifySpy).toHaveBeenCalledTimes(1);
+    expect(notifySpy.mock.calls[0][1]).toMatchObject({
+      docId: 'H-2026-9116355',
+      reason: expect.stringContaining('pipeline_stall:ocr_scan_reader'),
+    });
+    expect(captureMessage).toHaveBeenCalledWith(
+      expect.stringContaining('senate_fetch_success'),
+      'error',
+    );
 
     notifySpy.mockClear();
     const again = await sweepPipelineStallAlerts(env, now);
