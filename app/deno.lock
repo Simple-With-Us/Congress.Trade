@@ -2,6 +2,7 @@
   "version": "5",
   "specifiers": {
     "npm:@aws-sdk/client-s3@3.1146.0": "3.1146.0",
+    "npm:@aws-sdk/client-s3@3.1147.0": "3.1147.0",
     "npm:@cloudflare/workers-types@5": "5.20261007.1",
     "npm:@fontsource/zilla-slab@^5.3.0": "5.3.0",
     "npm:@google/genai@^2.23.0": "2.28.0",
@@ -47,6 +48,22 @@
     },
     "@aws-sdk/client-s3@3.1146.0": {
       "integrity": "sha512-WY0YCBzxc4muFfY6UbGpA+oib0nGT/Px2aEPGYX7pp1la2OmDLChnK81mu8H7LdYvwGU1pLAsLIa/qgad0Wd7g==",
+      "dependencies": [
+        "@aws-sdk/checksums",
+        "@aws-sdk/core",
+        "@aws-sdk/credential-provider-node",
+        "@aws-sdk/middleware-sdk-s3",
+        "@aws-sdk/signature-v4-multi-region",
+        "@aws-sdk/types",
+        "@smithy/core",
+        "@smithy/fetch-http-handler",
+        "@smithy/node-http-handler",
+        "@smithy/types",
+        "tslib@2.8.1"
+      ]
+    },
+    "@aws-sdk/client-s3@3.1147.0": {
+      "integrity": "sha512-uTrcJxnJKPr8bc1z7cMxopYSQyAm2dPfiMK+UiBr51L8MzimDxHbW/d9GR6X/LFbWDpMzfFPLhB4UohDrCSaPQ==",
       "dependencies": [
         "@aws-sdk/checksums",
         "@aws-sdk/core",
@@ -2226,7 +2243,7 @@
   },
   "workspace": {
     "dependencies": [
-      "npm:@aws-sdk/client-s3@3.1146.0",
+      "npm:@aws-sdk/client-s3@3.1147.0",
       "npm:@cloudflare/workers-types@5",
       "npm:@google/genai@^2.23.0",
       "npm:@libsql/client@0.18",
