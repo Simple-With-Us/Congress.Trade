@@ -374,6 +374,11 @@ export async function runMaintenancePipeline(
   const laneTimeoutFor = (lane: MaintenanceLane): number =>
     options.laneTimeoutMs?.[lane] ?? DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS[lane];
 
+  const mergeLaneSignal = (laneSignal: AbortSignal): AbortSignal => {
+    if (!options.signal) return laneSignal;
+    return AbortSignal.any([laneSignal, options.signal]);
+  };
+
   const alertLaneTimeout = (lane: MaintenanceLane, timeoutMs: number, err: unknown) => {
     const detail = errorText(err);
     const message = `Cron maintenance lane timed out: ${lane} (${timeoutMs}ms) — ${detail}`;
@@ -387,16 +392,19 @@ export async function runMaintenancePipeline(
 
   const runLane = async <T>(
     lane: MaintenanceLane,
-    run: () => Promise<T>,
+    run: (laneSignal: AbortSignal) => Promise<T>,
   ): Promise<T | null> => {
     const timeoutMs = laneTimeoutFor(lane);
     try {
       throwIfAborted();
-      const execute = () => {
-        const inner = options.observeLane ? options.observeLane(lane, run) : run();
-        return raceMaintenanceLane(lane, timeoutMs, () => inner as Promise<T>);
-      };
-      return await execute();
+      return await raceMaintenanceLane(lane, timeoutMs, (laneSignal) => {
+        const signal = mergeLaneSignal(laneSignal);
+        const work = run(signal);
+        const observed = options.observeLane
+          ? options.observeLane(lane, () => work)
+          : work;
+        return observed as Promise<T>;
+      });
     } catch (err) {
       if (isTickAbort(err)) throw err;
       if (isMaintenanceLaneTimeout(err)) {
@@ -411,9 +419,9 @@ export async function runMaintenancePipeline(
   };
 
   try {
-    await runLane('secrets_refresh', () => refreshSecrets(env, { signal: options.signal }));
-    result.watcher = await runLane('watcher', () =>
-      runWatcher(env, now, { signal: options.signal }),
+    await runLane('secrets_refresh', (signal) => refreshSecrets(env, { signal }));
+    result.watcher = await runLane('watcher', (signal) =>
+      runWatcher(env, now, { signal }),
     );
     // Autonomy lanes run before the outbox gate so newly enqueued
     // agreement.check / autopilot.tick messages are visible to the gate probe.
@@ -421,15 +429,15 @@ export async function runMaintenancePipeline(
     // halted on quota — never block free publish paths behind paid agreement.
     result.deterministicDrain = await runLane(
       'deterministic_drain',
-      async () => {
+      async (signal) => {
         const { maybeRunDeterministicReviewDrain } = await import(
           '../extraction/deterministicDrain.ts'
         );
-        const drain = await maybeRunDeterministicReviewDrain(env, { signal: options.signal });
+        const drain = await maybeRunDeterministicReviewDrain(env, { signal });
         const { maybePublishFromStoredRuns } = await import(
           '../extraction/storedRunPublish.ts'
         );
-        await maybePublishFromStoredRuns(env, { signal: options.signal });
+        await maybePublishFromStoredRuns(env, { signal });
         return drain;
       },
     );
@@ -458,7 +466,7 @@ export async function runMaintenancePipeline(
         () => flushDeliveryOutbox(env, { limit: options.outboxLimit, now }),
       );
       if (options.afterOutboxFlush) {
-        await runLane('durable_queue', options.afterOutboxFlush);
+        await runLane('durable_queue', () => options.afterOutboxFlush!());
       }
     }
     // APNs is independent of the idle outbox gate so a prior throw can still
@@ -494,9 +502,9 @@ export async function runMaintenancePipeline(
           now,
         ),
       );
-      await runLane('latency_price_snapshots', async () => {
+      await runLane('latency_price_snapshots', async (signal) => {
         const { runLatencyPriceSnapshotTick } = await import('../ingestion/latencyPriceSnapshots.ts');
-        return runLatencyPriceSnapshotTick(env, now, deadlineFetch, options.signal);
+        return runLatencyPriceSnapshotTick(env, now, deadlineFetch, signal);
       });
     }
     if (options.includeDailyJobs !== false) {

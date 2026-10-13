@@ -21,6 +21,18 @@ describe('raceMaintenanceLane', () => {
     expect(Date.now() - started).toBeLessThan(150);
   });
 
+  it('aborts the lane signal when the budget is exceeded', async () => {
+    let seenSignal: AbortSignal | undefined;
+    await expect(
+      raceMaintenanceLane('secrets_refresh', 30, async (laneSignal) => {
+        seenSignal = laneSignal;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return 'late';
+      }),
+    ).rejects.toBeInstanceOf(MaintenanceLaneTimeoutError);
+    expect(seenSignal?.aborted).toBe(true);
+  });
+
   it('classifies timeout errors', async () => {
     const err = new MaintenanceLaneTimeoutError('apns_fanout', 1000);
     expect(isMaintenanceLaneTimeout(err)).toBe(true);

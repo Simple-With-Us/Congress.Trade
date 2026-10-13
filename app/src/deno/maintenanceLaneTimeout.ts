@@ -22,18 +22,22 @@ export function isMaintenanceLaneTimeout(err: unknown): boolean {
 export async function raceMaintenanceLane<T>(
   lane: string,
   timeoutMs: number,
-  run: () => Promise<T>,
+  run: (laneSignal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const budgetMs = Math.max(1, timeoutMs);
+  const ctrl = new AbortController();
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new MaintenanceLaneTimeoutError(lane, budgetMs)),
-      budgetMs,
-    );
+    timeoutId = setTimeout(() => {
+      const err = new MaintenanceLaneTimeoutError(lane, budgetMs);
+      ctrl.abort(err);
+      reject(err);
+    }, budgetMs);
   });
+  let innerPromise: Promise<T> | undefined;
+  const startInner = () => (innerPromise ??= Promise.resolve().then(() => run(ctrl.signal)));
   try {
-    return await Promise.race([run(), timeoutPromise]);
+    return await Promise.race([startInner(), timeoutPromise]);
   } finally {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
