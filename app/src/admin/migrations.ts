@@ -1437,6 +1437,14 @@ export const FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS = [
      ON analyst_consensus (source, updated_at)`,
 ] as const;
 
+/**
+ * 0103_price_unavailable_reason.sql — optional operator/provider reason text
+ * when a ticker is negative-cached as unpriceable.
+ */
+export const PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS = [
+  'ALTER TABLE securities_ref ADD COLUMN price_unavailable_reason TEXT',
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1599,6 +1607,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
   // 0102_freshness_stream_indexes.sql (#2635)
   ...FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
+  // 0103_price_unavailable_reason.sql
+  ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

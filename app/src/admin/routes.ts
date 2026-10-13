@@ -157,6 +157,8 @@ import {
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
   PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
+  PRICE_UNAVAILABLE_REASON_PEER_IMPORT_EMPTY,
+  markTickerPriceUnavailable,
 } from '../prices/service.ts';
 import { getSecretResolverStatus, refreshSecrets, resolveSecret, resolveSecrets, updateSecret } from '../secrets/infisical.ts';
 import {
@@ -10205,6 +10207,31 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // fundamentals_eod / analyst_consensus and recomputes per-trade
   // performance anchors for imported tickers. Idempotent. Authorized by the
   // full ADMIN_TOKEN/Access OR the scoped INGEST_TOKEN (this endpoint only).
+  const PriceUnavailableBodySchema = z.object({
+    reason: z.string().trim().min(1).max(500),
+  });
+
+  r.post('/securities/:ticker/price-unavailable', async (c) => {
+    const rawTicker = c.req.param('ticker');
+    const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
+    if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
+      return c.json({ error: 'invalid ticker' }, 400);
+    }
+    let body: z.infer<typeof PriceUnavailableBodySchema>;
+    try {
+      body = PriceUnavailableBodySchema.parse(await c.req.json());
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso });
+      return c.json({ ok: true, ticker, reason: body.reason, price_checked_at: nowIso });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
   r.post('/securities/import', async (c) => {
     // This endpoint runs inside a normal Worker request. Keep callers honest.
     // Paid Workers allow larger batches, but the cap remains configurable so
@@ -10426,14 +10453,29 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           if (latestCached?.d) {
             await run(
               c.env.DB,
-              `INSERT INTO securities_ref (ticker, latest_price_date, price_unavailable, price_checked_at)
-                 VALUES (?, ?, 0, ?)
+              `INSERT INTO securities_ref (ticker, latest_price_date, price_unavailable, price_checked_at, price_unavailable_reason)
+                 VALUES (?, ?, 0, ?, NULL)
                ON CONFLICT(ticker) DO UPDATE SET
                  latest_price_date = excluded.latest_price_date,
                  price_unavailable = 0,
-                 price_checked_at = excluded.price_checked_at`,
+                 price_checked_at = excluded.price_checked_at,
+                 price_unavailable_reason = NULL`,
               [ticker, latestCached.d, nowIso],
             );
+          } else if (closes.length === 0 && !latestCached?.d) {
+            const refRow = await get<{ latest_price_date: string | null }>(
+              c.env.DB,
+              'SELECT latest_price_date FROM securities_ref WHERE ticker = ?',
+              [ticker],
+            );
+            if (!refRow?.latest_price_date) {
+              await markTickerPriceUnavailable(
+                c.env,
+                ticker,
+                PRICE_UNAVAILABLE_REASON_PEER_IMPORT_EMPTY,
+                { checkedAt: nowIso },
+              );
+            }
           }
           // Recompute BOTH the trade-date and filing-date anchors for this ticker
           // from the cached series, mirroring runPriceRefresh. The import now marks

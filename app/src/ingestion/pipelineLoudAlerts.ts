@@ -8,7 +8,7 @@
 
 import type { Env } from '../shared/types.ts';
 import type { QueueMessage } from '../shared/types.ts';
-import { get } from '../shared/db.ts';
+import { all, get } from '../shared/db.ts';
 import { getLastPollAt } from '../shared/config.ts';
 import { isParkedDlqError } from './transientDlq.ts';
 import {
@@ -31,6 +31,8 @@ import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
+/** Default stall window for ST peer price backlog (daily EOD cadence). */
+export const DEFAULT_ST_PEER_PRICES_STALL_HOURS = 30;
 /** Re-alert the same doc+stage after this window if it fails terminally again. */
 export const TERMINAL_REDUP_WINDOW_MS = 7 * 24 * 3_600_000;
 
@@ -89,6 +91,7 @@ export function readPipelineStallHours(env: Env, condition?: string): number {
   if (Number.isFinite(n) && n >= 1) return Math.min(n, 168);
   const legacy = Number.parseInt(envGet('CT_OCR_STALL_HOURS') ?? '', 10);
   if (Number.isFinite(legacy) && legacy >= 1) return Math.min(legacy, 168);
+  if (condition === 'st_peer_prices') return DEFAULT_ST_PEER_PRICES_STALL_HOURS;
   return DEFAULT_PIPELINE_STALL_HOURS;
 }
 
@@ -452,28 +455,39 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   return { stalled: true, detail };
 }
 
+const ST_PEER_PRICE_PENDING_SQL = `
+  FROM transactions t
+  JOIN securities_ref sr ON sr.ticker = t.ticker
+ WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
+   AND t.deprecated_at IS NULL
+   AND COALESCE(sr.price_unavailable, 0) = 0
+   AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
+
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST peer prices not configured', skip: true };
   }
   let pending = 0;
   let lastChecked: string | null = null;
+  let pendingSample: string[] = [];
   try {
     const row = await get<{ n: number; last_at: string | null }>(
       env.DB,
       `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) FROM transactions t
-           JOIN securities_ref sr ON sr.ticker = t.ticker
-          WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
-            AND t.deprecated_at IS NULL
-            AND COALESCE(sr.price_unavailable, 0) = 0
-            AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)) AS n,
-         (SELECT MAX(price_checked_at) FROM securities_ref
-           WHERE price_checked_at IS NOT NULL
-             AND source LIKE '%socratic%') AS last_at`,
+         (SELECT COUNT(DISTINCT t.ticker) ${ST_PEER_PRICE_PENDING_SQL}) AS n,
+         (SELECT MAX(sr.price_checked_at) ${ST_PEER_PRICE_PENDING_SQL}) AS last_at`,
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
+    if (pending > 0) {
+      const names = await all<{ ticker: string }>(
+        env.DB,
+        `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
+         ORDER BY t.ticker ASC
+         LIMIT 10`,
+      );
+      pendingSample = names.map((r) => r.ticker);
+    }
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
   }
@@ -481,9 +495,13 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
     return { stalled: false, detail: 'ST price refresh moving' };
   }
   const stallHours = readPipelineStallHours(env, 'st_peer_prices');
+  const sampleSuffix = pendingSample.length
+    ? `; pending sample: ${pendingSample.join(', ')}`
+    : '';
   const detail =
-    `${pending} ticker(s) still need EOD/current prices from Socratic.Trade; ` +
-    `no price_checked_at progress in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
+    `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
+    sampleSuffix +
+    `; no price_checked_at progress on pending tickers in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
   return { stalled: true, detail };
 }
 
