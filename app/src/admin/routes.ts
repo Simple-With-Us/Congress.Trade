@@ -10232,7 +10232,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     try {
       const nowIso = new Date().toISOString();
-      await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso });
+      await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso, force: true });
       return c.json({ ok: true, ticker, reason: body.reason, price_checked_at: nowIso });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
@@ -10253,7 +10253,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     try {
       const nowIso = new Date().toISOString();
-      await markTickerEnrichmentUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso });
+      await markTickerEnrichmentUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso, force: true });
       return c.json({ ok: true, ticker, reason: body.reason, enrichment_checked_at: nowIso });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);

@@ -22,6 +22,7 @@ import {
   enrichmentUnavailableExcludedSql,
   hasConfiguredKeyedEnrichmentProvider,
 } from '../enrichment/service.ts';
+import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
@@ -35,8 +36,6 @@ import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
-/** Default stall window for ST peer price backlog (daily EOD cadence). */
-export const DEFAULT_ST_PEER_PRICES_STALL_HOURS = 30;
 /** Default stall window for ST peer enrichment backlog (daily + hourly drain). */
 export const DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS = 30;
 /** Re-alert the same doc+stage after this window if it fails terminally again. */
@@ -97,7 +96,6 @@ export function readPipelineStallHours(env: Env, condition?: string): number {
   if (Number.isFinite(n) && n >= 1) return Math.min(n, 168);
   const legacy = Number.parseInt(envGet('CT_OCR_STALL_HOURS') ?? '', 10);
   if (Number.isFinite(legacy) && legacy >= 1) return Math.min(legacy, 168);
-  if (condition === 'st_peer_prices') return DEFAULT_ST_PEER_PRICES_STALL_HOURS;
   if (condition === 'st_peer_enrichment') return DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS;
   return DEFAULT_PIPELINE_STALL_HOURS;
 }
@@ -452,6 +450,7 @@ async function buildStPeerEnrichmentPendingSql(env: Env): Promise<string> {
   LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
  WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
    AND t.deprecated_at IS NULL
+   AND ${excludeCompetitorFixtureTransactionSql('t')}
    AND ${unavailable}
    AND ${needed}`;
 }
@@ -504,6 +503,7 @@ const ST_PEER_PRICE_PENDING_SQL = `
   JOIN securities_ref sr ON sr.ticker = t.ticker
  WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
    AND t.deprecated_at IS NULL
+   AND ${excludeCompetitorFixtureTransactionSql('t')}
    AND COALESCE(sr.price_unavailable, 0) = 0
    AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
 

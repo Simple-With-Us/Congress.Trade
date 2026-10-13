@@ -142,6 +142,22 @@ describe('st_peer_enrichment stall detector', () => {
     expect(result.alerted).not.toContain('st_peer_enrichment');
   });
 
+  it('does not count COMPETITOR-* fixture-only tickers as pending', async () => {
+    seedTrade('GNKOQ');
+    db.prepare(
+      `UPDATE transactions SET doc_id = 'COMPETITOR-synthetic-gnkoq', source = 'competitor_backfill' WHERE ticker = 'GNKOQ'`,
+    ).run();
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, enrichment_checked_at, source)
+       VALUES ('GNKOQ', datetime('now', '-40 days'), 'socratic')`,
+    ).run();
+
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.evaluated).toContain('st_peer_enrichment');
+    expect(result.alerted).not.toContain('st_peer_enrichment');
+  });
+
   it('does not count enrichment_unavailable tickers as pending', async () => {
     seedTrade('GHOST');
     db.prepare(

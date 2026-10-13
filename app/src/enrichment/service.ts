@@ -15,6 +15,10 @@
 
 import type { Env } from '../shared/types.ts';
 import { all, run } from '../shared/db.ts';
+import {
+  excludeCompetitorFixtureTransactionSql,
+  tickerHasNonCompetitorFixtureTrade,
+} from '../shared/competitorFixtures.ts';
 import type { SqlParam } from '../shared/db.ts';
 import { mergeRefs } from './compute.ts';
 import { buildSecProvider } from './sec.ts';
@@ -100,10 +104,11 @@ export async function markTickerEnrichmentUnavailable(
   env: Env,
   ticker: string,
   reason: string,
-  opts: { checkedAt?: string } = {},
+  opts: { checkedAt?: string; force?: boolean } = {},
 ): Promise<void> {
   const sym = ticker.trim().toUpperCase();
   if (!sym) return;
+  if (!opts.force && !(await tickerHasNonCompetitorFixtureTrade(env, sym))) return;
   const nowIso = opts.checkedAt ?? new Date().toISOString();
   const reasonText = normalizeEnrichmentUnavailableReason(reason);
   await run(
@@ -364,6 +369,7 @@ export async function selectTickersToEnrich(
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+        AND ${excludeCompetitorFixtureTransactionSql('t')}
         AND ${enrichmentUnavailableExcludedSql('sr')}
         AND ${enrichmentNeededSql('sr', retryIncompleteWithKeyedProvider)}
       GROUP BY t.ticker
@@ -655,6 +661,7 @@ async function upsertRef(env: Env, ref: SecurityRef): Promise<void> {
 }
 
 async function upsertEmpty(env: Env, ticker: string, err: string, recordPeerAttempt = false): Promise<void> {
+  if (!(await tickerHasNonCompetitorFixtureTrade(env, ticker))) return;
   // A clean miss keeps the error text.  Recording socratic on `source` is what
   // makes the ticker-shaped tombstone ineligible for a second retry.
   const peerSource = recordPeerAttempt ? 'socratic' : null;
