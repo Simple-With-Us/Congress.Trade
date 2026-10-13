@@ -111,8 +111,13 @@ import { recordProviderHealth } from './providerHealth.ts';
 import {
   shouldSkipAgreementForReviewReason,
   dropJunkAgreementRows,
+  dropPtrFormSampleParsedRows,
   evaluateExtractQuality,
 } from './extractRouting.ts';
+import {
+  handCheckReviewReason,
+  requiresHandCheckBeforePublish,
+} from './handCheckPublish.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import { shouldRetryFetchStatus } from '../ingestion/fetcher.ts';
 import { TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED } from './reviewQueueHealth.ts';
@@ -1075,6 +1080,18 @@ export async function finalizePublish(
   dryRun: boolean,
   audit: CascadeAudit,
 ): Promise<AgreementDocResult> {
+  const filing = mapFiling(frow);
+  const withoutSamples = dropPtrFormSampleParsedRows(parsed);
+  const extractor = frow.extractor ?? filing.extractor ?? null;
+  if (requiresHandCheckBeforePublish(filing, extractor, 'primary')) {
+    return {
+      docId,
+      outcome: 'skipped',
+      tier: audit.tier,
+      reason: handCheckReviewReason(filing, extractor, 'primary'),
+    };
+  }
+  parsed = withoutSamples;
   const filedDate = frow.filed_date?.slice(0, 10) ?? null;
   if (parsed.some((tx) => !isValidTransactionDate(tx.txDate) || (filedDate !== null && tx.txDate! > filedDate))) {
     return {
