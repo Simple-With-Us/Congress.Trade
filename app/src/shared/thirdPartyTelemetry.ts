@@ -1527,7 +1527,7 @@ export async function flushUsageTelemetryFallback(
 
 async function drainUsageTelemetryFallbackPage(
   env: Env,
-  options: { limit?: number },
+  options: { limit?: number; signal?: AbortSignal },
   cursor: UsageTelemetryDrainCursor,
 ): Promise<UsageTelemetryFallbackFlushResult> {
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 25)));
