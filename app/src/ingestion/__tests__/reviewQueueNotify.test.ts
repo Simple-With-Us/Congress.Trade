@@ -115,6 +115,28 @@ describe('notifyReviewQueuePublisher', () => {
     expect(postedHeaders?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
   });
 
+  it('does not send Authorization on a URL configured for both BF and GB', async () => {
+    const headersByUrl = new Map<string, Record<string, string>>();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      headersByUrl.set(url, init?.headers as Record<string, string>);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://shared.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://shared.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB: 'Bearer gb-publisher-token',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(headersByUrl.get('https://shared.example/hook')?.authorization).toBeUndefined();
+    expect(headersByUrl.get('https://shared.example/hook')?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+  });
+
   it('POSTs pipeline.stalled with null docId', async () => {
     let postedBody = '';
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
