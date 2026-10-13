@@ -473,10 +473,14 @@ describe('runEnrichment — transient-retry backoff (real D1)', () => {
       expect(result.errors.some((e) => e.includes('FLAKY') && e.includes('edgar'))).toBe(true);
 
       const row = db
-        .prepare('SELECT enriched_at, enrichment_error FROM securities_ref WHERE ticker = ?')
+        .prepare('SELECT enriched_at, enrichment_error, enrichment_checked_at FROM securities_ref WHERE ticker = ?')
         .get('FLAKY');
       expect(row?.enriched_at).toBeNull(); // NOT tombstoned — stays selectable
       expect(row?.enrichment_error).toMatch(/^transient-retry:1:/);
+      // A transient retry is NOT forward progress: stamping enrichment_checked_at
+      // here would make the stall detector read a provider outage as healthy
+      // progress and suppress the alert.
+      expect(row?.enrichment_checked_at).toBeNull();
     } finally {
       close();
     }
