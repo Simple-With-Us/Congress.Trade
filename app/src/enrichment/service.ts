@@ -133,31 +133,32 @@ function assertSafeSqlAlias(alias: string): void {
   }
 }
 
-let securitiesRefEnrichmentUnavailableColumnsCache: boolean | undefined;
+let securitiesRefEnrichmentUnavailableColumnsCache = new WeakMap<Env['DB'], boolean>();
 
 /** Test-only: clear PRAGMA cache between cases. */
 export function resetSecuritiesRefEnrichmentSchemaCacheForTests(): void {
-  securitiesRefEnrichmentUnavailableColumnsCache = undefined;
+  securitiesRefEnrichmentUnavailableColumnsCache = new WeakMap();
 }
 
-/** Whether migration 0104 columns exist on `securities_ref` (cached per isolate). */
+/** Whether migration 0104 columns exist on `securities_ref` (cached per `DB` binding). */
 export async function securitiesRefHasEnrichmentUnavailableColumns(
   db: Env['DB'],
 ): Promise<boolean> {
-  if (securitiesRefEnrichmentUnavailableColumnsCache !== undefined) {
-    return securitiesRefEnrichmentUnavailableColumnsCache;
-  }
+  const cached = securitiesRefEnrichmentUnavailableColumnsCache.get(db);
+  if (cached !== undefined) return cached;
+  let hasColumns = false;
   try {
     const rows = await all<{ name: string }>(db, 'PRAGMA table_info(securities_ref)');
     const names = new Set(rows.map((r) => r.name));
-    securitiesRefEnrichmentUnavailableColumnsCache =
+    hasColumns =
       names.has('enrichment_unavailable') &&
       names.has('enrichment_unavailable_reason') &&
       names.has('enrichment_checked_at');
   } catch {
-    securitiesRefEnrichmentUnavailableColumnsCache = false;
+    hasColumns = false;
   }
-  return securitiesRefEnrichmentUnavailableColumnsCache;
+  securitiesRefEnrichmentUnavailableColumnsCache.set(db, hasColumns);
+  return hasColumns;
 }
 
 /**
@@ -174,14 +175,9 @@ export function enrichmentUnavailableExcludedSql(
 }
 
 /** Stall/progress timestamp column: `enrichment_checked_at` post-0104, else `enriched_at`. */
-export function enrichmentProgressTimestampSql(
-  alias = 'sr',
-  options: { columnsPresent?: boolean } = {},
-): string {
+export function enrichmentProgressTimestampSql(alias: string, columnsPresent: boolean): string {
   assertSafeSqlAlias(alias);
-  return options.columnsPresent === false
-    ? `${alias}.enriched_at`
-    : `${alias}.enrichment_checked_at`;
+  return columnsPresent ? `${alias}.enrichment_checked_at` : `${alias}.enriched_at`;
 }
 
 const TRANSIENT_RETRY_PREFIX = 'transient-retry:';

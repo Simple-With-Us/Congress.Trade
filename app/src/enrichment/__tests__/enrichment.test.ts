@@ -17,6 +17,7 @@ import {
   hasConfiguredKeyedEnrichmentProvider,
   markTickerEnrichmentUnavailable,
   resetSecuritiesRefEnrichmentSchemaCacheForTests,
+  securitiesRefHasEnrichmentUnavailableColumns,
   runEnrichment,
   selectTickersToEnrich,
   parseTransientRetryMarker,
@@ -737,7 +738,22 @@ describe('enrichment 0104 schema fallbacks', () => {
 
   it('uses a no-op unavailable filter before migration 0104', () => {
     expect(enrichmentUnavailableExcludedSql('sr', { columnsPresent: false })).toBe('1=1');
-    expect(enrichmentProgressTimestampSql('sr', { columnsPresent: false })).toBe('sr.enriched_at');
+    expect(enrichmentProgressTimestampSql('sr', false)).toBe('sr.enriched_at');
+    expect(enrichmentProgressTimestampSql('sr', true)).toBe('sr.enrichment_checked_at');
+  });
+
+  it('caches PRAGMA 0104 detection per DB binding', async () => {
+    resetSecuritiesRefEnrichmentSchemaCacheForTests();
+    const migrated = await openMigratedD1();
+    const pre0104 = await openMigratedD1Before0104();
+    try {
+      expect(await securitiesRefHasEnrichmentUnavailableColumns(migrated.d1)).toBe(true);
+      expect(await securitiesRefHasEnrichmentUnavailableColumns(pre0104.d1)).toBe(false);
+      expect(await securitiesRefHasEnrichmentUnavailableColumns(migrated.d1)).toBe(true);
+    } finally {
+      migrated.close();
+      pre0104.close();
+    }
   });
 
   it('selectTickersToEnrich runs without enrichment_unavailable columns', async () => {

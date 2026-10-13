@@ -467,7 +467,7 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   let pendingSample: string[] = [];
   let pendingSql = '';
   const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(env.DB);
-  const progressAt = enrichmentProgressTimestampSql('sr', { columnsPresent: has0104 });
+  const progressAt = enrichmentProgressTimestampSql('sr', has0104);
   try {
     pendingSql = stPeerEnrichmentPendingSql(has0104);
     const row = await get<{ n: number; last_at: string | null }>(

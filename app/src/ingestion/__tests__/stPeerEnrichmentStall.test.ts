@@ -47,6 +47,22 @@ vi.mock('../../shared/pipelineHealth.ts', () => ({
   checkPipelineHealth: vi.fn(async () => ({ status: 'ok', checks: [] })),
 }));
 
+function createKv() {
+  const store = new Map<string, string>();
+  return {
+    get: async (key: string) => {
+      const raw = store.get(key);
+      return raw ? JSON.parse(raw) : null;
+    },
+    put: async (key: string, value: string) => {
+      store.set(key, value);
+    },
+    delete: async (key: string) => {
+      store.delete(key);
+    },
+  };
+}
+
 let db: SqliteDatabase;
 let d1: D1Database;
 let close: () => void;
@@ -68,22 +84,6 @@ function seedTrade(ticker: string): void {
 
 function envWithDb(): Env {
   return { DB: d1, CONFIG_KV: createKv() } as Env;
-}
-
-function createKv() {
-  const store = new Map<string, string>();
-  return {
-    get: async (key: string) => {
-      const raw = store.get(key);
-      return raw ? JSON.parse(raw) : null;
-    },
-    put: async (key: string, value: string) => {
-      store.set(key, value);
-    },
-    delete: async (key: string) => {
-      store.delete(key);
-    },
-  };
 }
 
 describe('st_peer_enrichment stall detector', () => {
