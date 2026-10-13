@@ -19,8 +19,9 @@ import { captureException, captureMessage } from '../deno/sentry.ts';
 import { ogeWatchEnabled } from './ogeSource.ts';
 import {
   enrichmentNeededSql,
-  enrichmentUnavailableExcludedSql,
+  enrichmentProgressTimestampSql,
   hasConfiguredKeyedEnrichmentProvider,
+  securitiesRefHasEnrichmentUnavailableColumns,
 } from '../enrichment/service.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import {
@@ -441,9 +442,12 @@ async function evaluateChamberFetchStall(
   return { stalled: true, detail };
 }
 
-function buildStPeerEnrichmentPendingSql(retryIncomplete: boolean): string {
-  const needed = enrichmentNeededSql('sr', retryIncomplete);
-  const unavailable = enrichmentUnavailableExcludedSql('sr');
+/** Static unavailable filter for stall SQL (fixed `sr` alias — no dynamic composition). */
+const ST_PEER_ENRICHMENT_UNAVAILABLE_EXCLUDED_SQL =
+  '(sr.ticker IS NULL OR COALESCE(sr.enrichment_unavailable, 0) = 0)';
+
+function stPeerEnrichmentPendingSql(has0104: boolean): string {
+  const unavailable = has0104 ? ST_PEER_ENRICHMENT_UNAVAILABLE_EXCLUDED_SQL : '1=1';
   return `
   FROM transactions t
   LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
@@ -451,7 +455,7 @@ function buildStPeerEnrichmentPendingSql(retryIncomplete: boolean): string {
    AND t.deprecated_at IS NULL
    AND ${excludeCompetitorFixtureTransactionSql('t')}
    AND ${unavailable}
-   AND ${needed}`;
+   AND ${enrichmentNeededSql('sr', true)}`;
 }
 
 async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
@@ -462,13 +466,15 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
   let pendingSql = '';
+  const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(env.DB);
+  const progressAt = enrichmentProgressTimestampSql('sr', { columnsPresent: has0104 });
   try {
-    pendingSql = buildStPeerEnrichmentPendingSql(true);
+    pendingSql = stPeerEnrichmentPendingSql(has0104);
     const row = await get<{ n: number; last_at: string | null }>(
       env.DB,
       `SELECT
          (SELECT COUNT(DISTINCT t.ticker) ${pendingSql}) AS n,
-         (SELECT MAX(sr.enrichment_checked_at) ${pendingSql}) AS last_at`,
+         (SELECT MAX(${progressAt}) ${pendingSql}) AS last_at`,
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;

@@ -4,7 +4,12 @@ import {
   readPipelineStallHours,
   sweepPipelineStallAlerts,
 } from '../pipelineLoudAlerts.ts';
-import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
+import {
+  openMigratedD1,
+  openMigratedD1Before0104,
+  type SqliteDatabase,
+} from '../../prices/__tests__/sqliteD1.ts';
+import { resetSecuritiesRefEnrichmentSchemaCacheForTests } from '../../enrichment/service.ts';
 import type { Env } from '../../shared/types.ts';
 
 vi.mock('../reviewQueueNotify.ts', () => ({
@@ -167,6 +172,37 @@ describe('st_peer_enrichment stall detector', () => {
 
     const now = new Date('2026-10-12T18:00:00.000Z');
     const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.evaluated).toContain('st_peer_enrichment');
+    expect(result.alerted).not.toContain('st_peer_enrichment');
+  });
+});
+
+describe('st_peer_enrichment stall (pre-0104 schema)', () => {
+  let preDb: SqliteDatabase;
+  let preD1: D1Database;
+  let preClose: () => void;
+
+  beforeEach(async () => {
+    resetSecuritiesRefEnrichmentSchemaCacheForTests();
+    const opened = await openMigratedD1Before0104();
+    preDb = opened.db;
+    preD1 = opened.d1;
+    preClose = opened.close;
+  });
+  afterEach(() => {
+    preClose();
+    resetSecuritiesRefEnrichmentSchemaCacheForTests();
+  });
+
+  it('evaluates stall SQL without enrichment_unavailable columns', async () => {
+    preDb.prepare(
+      `INSERT INTO transactions (id, ticker, tx_date, source, created_at)
+       VALUES ('tx-old', 'OLDSCHEMA', '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+    ).run();
+    preDb.prepare(`INSERT INTO securities_ref (ticker, source) VALUES ('OLDSCHEMA', 'socratic')`).run();
+    const env = { DB: preD1, CONFIG_KV: createKv() } as Env;
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(env, now);
     expect(result.evaluated).toContain('st_peer_enrichment');
     expect(result.alerted).not.toContain('st_peer_enrichment');
   });
