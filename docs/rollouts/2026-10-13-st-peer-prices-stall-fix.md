@@ -22,9 +22,12 @@ or `POST /api/admin/securities/:ticker/price-unavailable`).
 
 ## Verification
 
-```bash
-cd app && npm run typecheck && npm test
-```
+From `app/` (Cursor Cloud, 2026-10-13):
+
+- `npm run typecheck` → pass
+- `npm test` → pass (4429 tests)
+- `npm run lint` → not run (repo-wide deno lint baseline unrelated to this slice)
+- `npm run build` → N/A (Coolify Deno app; no `build` script in `app/package.json`)
 
 Manual (prod, after deploy + migrate):
 

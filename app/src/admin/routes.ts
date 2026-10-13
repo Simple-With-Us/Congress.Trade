@@ -10209,7 +10209,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // full ADMIN_TOKEN/Access OR the scoped INGEST_TOKEN (this endpoint only).
   const PriceUnavailableBodySchema = z.object({
     reason: z.string().trim().min(1).max(500),
-  });
+  }).strict();
 
   r.post('/securities/:ticker/price-unavailable', async (c) => {
     const rawTicker = c.req.param('ticker');
@@ -10462,7 +10462,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                  price_unavailable_reason = NULL`,
               [ticker, latestCached.d, nowIso],
             );
-          } else if (closes.length === 0 && !latestCached?.d) {
+          } else if (
+            closes.length === 0
+            && !latestCached?.d
+            && typeof o.currentPrice !== 'number'
+          ) {
             const refRow = await get<{ latest_price_date: string | null }>(
               c.env.DB,
               'SELECT latest_price_date FROM securities_ref WHERE ticker = ?',

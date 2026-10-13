@@ -123,6 +123,19 @@ describe('st_peer_prices stall detector', () => {
     expect(msg?.[0]).toContain('pending sample');
   });
 
+  it('does not stall when pending tickers were never price-checked', async () => {
+    seedTrade('NEW1');
+    seedTrade('NEW2');
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, source) VALUES ('NEW1', 'socratic'), ('NEW2', 'socratic')`,
+    ).run();
+
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.evaluated).toContain('st_peer_prices');
+    expect(result.alerted).not.toContain('st_peer_prices');
+  });
+
   it('does not count price_unavailable tickers as pending', async () => {
     seedTrade('GHOST');
     db.prepare(

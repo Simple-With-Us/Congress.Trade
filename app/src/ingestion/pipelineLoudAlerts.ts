@@ -378,6 +378,13 @@ function idleBeyondThreshold(lastAt: string | null, now: Date, thresholdMs: numb
   return !Number.isFinite(lastMs) || now.getTime() - lastMs >= thresholdMs;
 }
 
+/** Pending-set progress: ignore tickers that have never been price-checked. */
+function pendingPriceProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
+  const lastMs = lastAt ? Date.parse(lastAt) : NaN;
+  if (!Number.isFinite(lastMs)) return false;
+  return now.getTime() - lastMs >= thresholdMs;
+}
+
 function hoursLabel(lastAt: string | null, now: Date): string {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
   if (!Number.isFinite(lastMs)) return 'never';
@@ -491,7 +498,7 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
   }
-  if (pending <= 0 || !idleBeyondThreshold(lastChecked, now, thresholdMs)) {
+  if (pending <= 0 || !pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST price refresh moving' };
   }
   const stallHours = readPipelineStallHours(env, 'st_peer_prices');

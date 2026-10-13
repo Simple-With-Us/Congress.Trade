@@ -607,7 +607,7 @@ export async function runPriceRefresh(
          price_unavailable=excluded.price_unavailable,
          price_checked_at=excluded.price_checked_at,
          price_unavailable_reason=CASE
-           WHEN excluded.price_unavailable = 0 THEN NULL
+           WHEN excluded.price_unavailable IN (0, ${PRICE_UNAVAILABLE_STALLED}) THEN NULL
            ELSE securities_ref.price_unavailable_reason END,
          market_cap = CASE
            WHEN securities_ref.shares_outstanding IS NOT NULL AND securities_ref.shares_outstanding > 0

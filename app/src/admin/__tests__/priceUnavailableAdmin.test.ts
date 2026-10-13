@@ -55,6 +55,22 @@ describe('POST /securities/:ticker/price-unavailable', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects unknown JSON keys (strict schema)', async () => {
+    const res = await app.request(
+      '/securities/junk/price-unavailable',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          Authorization: 'Bearer admin-secret',
+        },
+        body: JSON.stringify({ reason: 'ok', extra: true }),
+      },
+      { ...AUTH_ENV, DB: d1 } as never,
+    );
+    expect(res.status).toBe(400);
+  });
+
   it('validates body with Zod', async () => {
     const res = await app.request(
       '/securities/junk/price-unavailable',
