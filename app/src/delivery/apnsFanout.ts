@@ -16,6 +16,7 @@ import {
   type PushSettings,
 } from '../shared/pushSettings.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import {
   apnsConfigured,
   loadApnsConfig,
@@ -127,6 +128,7 @@ export interface ApnsFanoutState {
 export interface ApnsFanoutDeps {
   transport?: ApnsTransport;
   now?: Date;
+  signal?: AbortSignal;
   loadConfig?: (env: Env) => ApnsConfig | null | Promise<ApnsConfig | null>;
   readState?: (env: Env) => Promise<ApnsFanoutState>;
   writeState?: (env: Env, state: ApnsFanoutState) => Promise<void>;
@@ -450,6 +452,7 @@ export async function fanOutApnsProductEvents(
 
     let sendError: string | null = null;
     userLoop: for (const [userId, userDevices] of devicesByUser) {
+      abortIfSignal(deps.signal);
       const prefs = prefsByUser.get(userId);
       const settings = parsePushSettings(prefs?.notificationSettings);
       if (settings.pushMode === 'off') continue;

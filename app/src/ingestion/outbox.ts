@@ -1,6 +1,7 @@
 import type { Env, Chamber } from '../shared/types.ts';
 import { all, run, type SqlParam } from '../shared/db.ts';
 import { maybeAlertTerminalIngestionOutbox } from './pipelineLoudAlerts.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 
 export type IngestionOutboxStatement = [string, SqlParam[]];
 
@@ -93,7 +94,7 @@ export async function enqueueIngestionOutboxNow(env: Env, docId: string): Promis
 /** Lease and flush ready discovery handoffs without scanning filing history. */
 export async function flushIngestionOutbox(
   env: Env,
-  opts: { docIds?: string[]; limit?: number; now?: Date } = {},
+  opts: { docIds?: string[]; limit?: number; now?: Date; signal?: AbortSignal } = {},
 ): Promise<IngestionOutboxFlushResult> {
   const now = opts.now ?? new Date();
   const nowIso = now.toISOString();
@@ -113,6 +114,7 @@ export async function flushIngestionOutbox(
   );
   const result: IngestionOutboxFlushResult = { claimed: 0, enqueued: 0, failed: 0 };
   for (const row of rows) {
+    abortIfSignal(opts.signal);
     const leaseUntil = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
     const claim = await run(
       env.DB,
