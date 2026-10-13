@@ -157,6 +157,8 @@ describe('evaluateExtractQuality — hard-stops', () => {
   it('treats the printed PTR Example Mega Corp sample as form chrome', () => {
     expect(looksLikePtrFormSampleAsset('Example Mega Corp Common Stock')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Exemplje Mega Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Exempl Mfg Corp Common Stock')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Example Mfg. Corp.')).toBe(true);
     expect(looksLikeHeaderContaminatedAsset('Exemplje Mega Corp Common Stock')).toBe(true);
     expect(looksLikeNothingToReport('Nothing to report for July 2026')).toBe(true);
     expect(looksLikeNothingToReport('Nothlng to report for July 2026')).toBe(true);
@@ -211,6 +213,13 @@ describe('evaluateExtractQuality — hard-stops', () => {
       amountRange: '$15,001 - $50,000',
       txDate: '2026-05-10',
     })).toBe(false);
+
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Exempl Mfg Corp',
+      rawText: 'Exempl Mfg Corp P 8/14/12',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2020-01-15',
+    })).toBe(true);
   });
 
   it('hard-stops letterhead-as-asset (Clerk / B81 Cannon)', () => {

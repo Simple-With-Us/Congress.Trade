@@ -20,7 +20,7 @@ import { withThirdPartyTelemetry } from '../shared/thirdPartyTelemetry.ts';
 import { resolveProductionSentryEnv } from '../shared/sentryRuntime.ts';
 import { datadogCaptureException, initProductionDatadog } from '../shared/datadog.ts';
 import { resolveProductionDatadogEnv } from '../shared/datadogRuntime.ts';
-import { captureException, initProductionSentry } from '#sentry';
+import { captureException, flushSentry, initProductionSentry } from '#sentry';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
@@ -410,6 +410,9 @@ if (!costProfile.disableInternalCron) {
     } finally {
       tickInFlight = false;
       tickInFlightSinceMs = 0;
+      try {
+        await flushSentry(2000);
+      } catch {}
     }
   });
 
@@ -440,5 +443,11 @@ const portStr = Deno.env.get('PORT');
 const port = portStr ? parseInt(portStr, 10) : 5000;
 Deno.serve({ port }, async (req) => {
   const env = buildEnv();
-  return app.fetch(req, env, dummyCtx as any);
+  try {
+    return await app.fetch(req, env, dummyCtx as any);
+  } finally {
+    // Do not await: a 2s flush must not hold the HTTP response.  The
+    // long-lived Deno process keeps the envelope fetch alive.
+    void flushSentry(2000);
+  }
 });

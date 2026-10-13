@@ -280,6 +280,10 @@ import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import {
+  NEEDS_HAND_CHECK_MAC_VISION,
+  mergeHandCheckIntoReviewReason,
+} from '../extraction/handCheckPublish.ts';
+import {
   grantAdmin,
   revokeAdmin,
   listGrantedAdmins,
@@ -2186,6 +2190,7 @@ async function stampLocalVisionSubmitted(
     `SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0 LIMIT 1`,
     [docId],
   );
+  const publisherReason = mergeHandCheckIntoReviewReason(tag, NEEDS_HAND_CHECK_MAC_VISION);
   if (open) {
     await run(
       env.DB,
@@ -2198,6 +2203,12 @@ async function stampLocalVisionSubmitted(
         WHERE doc_id = ? AND resolved = 0`,
       [tag, tag, docId],
     );
+    void notifyReviewQueuePublisher(env, {
+      docId,
+      reason: publisherReason,
+      kind: 'reopen',
+      at: nowIso,
+    });
   } else {
     const insertResult = await run(
       env.DB,
@@ -2208,7 +2219,7 @@ async function stampLocalVisionSubmitted(
     if ((insertResult.meta?.changes ?? 0) > 0) {
       void notifyReviewQueuePublisher(env, {
         docId,
-        reason: tag,
+        reason: publisherReason,
         kind: 'insert',
         at: nowIso,
       });
@@ -3914,7 +3925,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       ],
       'auth-billing': [
         'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
-        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
         'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'WEBHOOK_SIGNING_KEY',
         'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICE_MONTHLY', 'STRIPE_PRICE_ANNUAL',
         'STRIPE_TRIAL_DAYS', 'STRIPE_MANAGED_PAYMENTS', 'RESEND_API_KEY', 'EMAIL_FROM', 'ALERT_EMAIL',
@@ -5095,7 +5108,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Force-refresh the Infisical secret cache. This does not write plaintext
   // secrets into KV/D1/Cloudflare vars; optional KV cache entries are encrypted.
   r.post('/diagnostics/secrets/refresh', async (c) => {
-    return c.json({ secrets: await refreshSecrets(c.env) });
+    return c.json({ secrets: await refreshSecrets(c.env, { force: true }) });
   });
 
   // --- POST /diagnostics/secrets/update -----------------------------------
@@ -5117,7 +5130,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     await updateSecret(c.env, source, key, value);
     // Refresh the local cache to pull down the newly updated secret
-    return c.json({ ok: true, secrets: await refreshSecrets(c.env) });
+    return c.json({ ok: true, secrets: await refreshSecrets(c.env, { force: true }) });
   });
 
   // --- GET /settings ------------------------------------------------------

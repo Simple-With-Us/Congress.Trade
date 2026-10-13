@@ -226,7 +226,7 @@ export const TOS_HTML = shell(
 
 <h2>2. Eligibility &amp; accounts</h2>
 <ul>
-<li>You must be at least 18 years old and able to form a binding contract.</li>
+<li>You must be at least 13 years old to use the Service.&nbsp; If you are under the legal age to enter a contract where you live, your parent or legal guardian must agree to these Terms on your behalf.</li>
 <li>You are responsible for the accuracy of your account information and for safeguarding your sign-in.&nbsp; Notify us promptly at <a href="mailto:${CONTACT}">${CONTACT}</a> of any unauthorized use.</li>
 <li>You are responsible for all activity under your account.</li>
 </ul>
@@ -348,7 +348,7 @@ export const PRIVACY_HTML = shell(
 <p>We operate from the United States, and our providers may process data in the U.S. and other countries.&nbsp; By using the Service, you understand your information may be transferred to and processed in the United States.</p>
 
 <h2>9. Children</h2>
-<p>The Service is not directed to, and may not be used by, anyone under 18.&nbsp; We do not knowingly collect personal information from children.</p>
+<p>The Service is not directed to, and may not be used by, children under 13.&nbsp; We do not knowingly collect personal information from children under 13.&nbsp; If you believe a child under 13 has provided personal information, contact ${CONTACT} so we can investigate and delete it.</p>
 
 <h2>10. Changes to this Policy</h2>
 <p>We may update this Policy from time to time.&nbsp; Material changes will be reflected by an updated effective date and, where appropriate, additional notice.</p>

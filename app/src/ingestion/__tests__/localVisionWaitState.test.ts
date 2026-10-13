@@ -382,24 +382,37 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
 
       expect(res.status).toBe(200);
 
-      const json = await res.json() as { ok: boolean; docId: string; published: boolean; txCount: number };
+      const json = await res.json() as {
+        ok: boolean;
+        docId: string;
+        published: boolean;
+        needsReview: boolean;
+        txCount: number;
+      };
       expect(json.ok).toBe(true);
       expect(json.docId).toBe('doc-local-vision-1');
-      expect(json.published).toBe(true);
+      expect(json.published).toBe(false);
+      expect(json.needsReview).toBe(true);
       expect(json.txCount).toBe(1);
 
       const txRow = await d1.prepare(
         `SELECT doc_id, ticker, source FROM transactions WHERE doc_id = ?`
       ).bind('doc-local-vision-1').first<{ doc_id: string; ticker: string; source: string }>();
 
-      expect(txRow?.ticker).toBe('NVDA');
-      expect(txRow?.source).toBe('local_mac');
+      expect(txRow).toBeNull();
 
       const filingRow = await d1.prepare(
         `SELECT ingest_status FROM filings WHERE doc_id = ?`
       ).bind('doc-local-vision-1').first<{ ingest_status: string }>();
 
-      expect(filingRow?.ingest_status).toBe('persisted');
+      expect(filingRow?.ingest_status).toBe('needs_review');
+
+      const review = await d1.prepare(
+        `SELECT reason, payload FROM review_queue WHERE doc_id = ?`
+      ).bind('doc-local-vision-1').first<{ reason: string; payload: string }>();
+      expect(review?.reason).toContain('needs_hand_check:mac_vision');
+      const staged = JSON.parse(review?.payload ?? '{}') as { transactionCount?: number };
+      expect(staged.transactionCount).toBe(1);
     });
 
     it('GET /api/admin/scanned-filings/pending excludes local_vision_exhausted parks', async () => {
@@ -1051,15 +1064,19 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
         txCount: number;
       };
       expect(json.ok).toBe(true);
-      expect(json.published).toBe(true);
-      expect(json.needsReview).toBe(false);
+      expect(json.published).toBe(false);
+      expect(json.needsReview).toBe(true);
       expect(json.txCount).toBe(1);
 
       const txRow = await d1.prepare(
         `SELECT ticker, source FROM transactions WHERE doc_id = ?`
       ).bind('doc-server-cpu-1').first<{ ticker: string; source: string }>();
-      expect(txRow?.ticker).toBe('NVDA');
-      expect(txRow?.source).toBe('server_cpu');
+      expect(txRow).toBeNull();
+
+      const review = await d1.prepare(
+        `SELECT reason FROM review_queue WHERE doc_id = ?`,
+      ).bind('doc-server-cpu-1').first<{ reason: string }>();
+      expect(review?.reason).toContain('needs_hand_check:scanned_vision');
     });
   });
 });

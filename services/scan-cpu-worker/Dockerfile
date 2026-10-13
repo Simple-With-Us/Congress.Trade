@@ -1,5 +1,5 @@
 # Congress.Trade server CPU scan worker — Linux/ARM64 (Oracle Coolify) + amd64
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -20,7 +20,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY checkbox.py form_chrome.py grid_ptr.py ocr_backends.py pipeline.py worker.py ./
+COPY checkbox.py form_chrome.py grid_ptr.py infisical_config.py ocr_backends.py pipeline.py worker.py ./
 
 # Optional health: process stays in poll loop
 CMD ["python", "worker.py"]

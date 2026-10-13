@@ -75,6 +75,7 @@
 
 import type { Env, ParsedTx, Transaction } from '../shared/types.ts';
 import { all, batch, fromBool, get, run } from '../shared/db.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import {
   runCandidateOnDoc,
   persistExtractionRun,
@@ -111,8 +112,13 @@ import { recordProviderHealth } from './providerHealth.ts';
 import {
   shouldSkipAgreementForReviewReason,
   dropJunkAgreementRows,
+  dropPtrFormSampleParsedRows,
   evaluateExtractQuality,
 } from './extractRouting.ts';
+import {
+  handCheckReviewReason,
+  requiresHandCheckBeforePublish,
+} from './handCheckPublish.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import { shouldRetryFetchStatus } from '../ingestion/fetcher.ts';
 import { TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED } from './reviewQueueHealth.ts';
@@ -1075,6 +1081,18 @@ export async function finalizePublish(
   dryRun: boolean,
   audit: CascadeAudit,
 ): Promise<AgreementDocResult> {
+  const filing = mapFiling(frow);
+  const withoutSamples = dropPtrFormSampleParsedRows(parsed);
+  const extractor = frow.extractor ?? filing.extractor ?? null;
+  if (requiresHandCheckBeforePublish(filing, extractor, 'primary')) {
+    return {
+      docId,
+      outcome: 'skipped',
+      tier: audit.tier,
+      reason: handCheckReviewReason(filing, extractor, 'primary'),
+    };
+  }
+  parsed = withoutSamples;
   const filedDate = frow.filed_date?.slice(0, 10) ?? null;
   if (parsed.some((tx) => !isValidTransactionDate(tx.txDate) || (filedDate !== null && tx.txDate! > filedDate))) {
     return {
@@ -2956,7 +2974,9 @@ async function recoverExpiredCappedReviews(
  */
 export async function maybeRunAgreementAutopublish(
   env: Env,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<{ attempted: number; enqueued: number; terminalized: number } | null> {
+  abortIfSignal(opts.signal);
   const e = await resolveAgreementEnv(env);
   if (e.AGREEMENT_AUTOPUBLISH_ENABLED !== 'true') return null;
   const limit = Math.min(Math.max(parseInt(e.AGREEMENT_AUTOPUBLISH_LIMIT || '3', 10) || 3, 1), 10);
@@ -2999,6 +3019,7 @@ export async function maybeRunAgreementAutopublish(
 
   let enqueued = 0;
   for (const d of docs) {
+    abortIfSignal(opts.signal);
     if (await enqueueAgreementCheck(env, d.doc_id, d.raw_object_key)) enqueued++;
   }
   if (docs.length) console.log(`agreement autopublish: enqueued ${enqueued}/${docs.length} checks`);

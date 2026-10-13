@@ -1,8 +1,11 @@
 // Production evidence reporter.  No deployment triggers and no third-party dependencies.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DEPLOY_RELEVANCE = resolve(HERE, 'ops/deploy_relevance.py');
 
 export const CONFIG = Object.freeze({"project": "congress-trade", "health": "https://congress.trade/api/health", "repositoryId": "1275616664", "repository": "Simple-With-Us/Congress.Trade"});
 const API = 'https://sentry.io/api/0/organizations/simple-with-us/';
@@ -15,6 +18,32 @@ export function readIdentity(body) {
   const revision = body.build?.sha;
   if (typeof revision !== 'string' || !SHA.test(revision)) throw new Error('Production did not expose a full source SHA');
   return revision;
+}
+
+/**
+ * Coolify watch_paths are `app/**` and `services/**`.  A main push that only
+ * touches workflows, docs, or iOS never rebuilds congress-app, so waiting 25
+ * minutes for that SHA to appear on /api/health is FLEET-INFRA-DR (15
+ * failures).  Reuses scripts/ops/deploy_relevance.py.
+ */
+export function isCoolifyDeployRelevant(sha, { spawn = spawnSync } = {}) {
+  if (!SHA.test(sha || '')) throw new Error('Expected CI revision must be a full SHA');
+  const diff = spawn('git', ['diff', '--name-only', `${sha}^`, sha], {
+    encoding: 'utf8',
+    timeout: 30000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (diff.error || ![0].includes(diff.status)) throw new Error('Git file list execution failed');
+  const files = String(diff.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  if (!files.length) return false;
+  const check = spawn('python3', [DEPLOY_RELEVANCE, '--from-stdin'], {
+    input: `${files.join('\n')}\n`,
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  if (check.status === 0) return true;
+  if (check.status === 1) return false;
+  throw new Error('Deploy relevance check failed');
 }
 
 export function gitAncestry(ancestor, descendant, spawn = spawnSync) {
@@ -135,12 +164,27 @@ export async function reportDeploy(receipt, { token, repositoryId, runId, attrib
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     if (!process.env.SENTRY_AUTH_TOKEN?.trim()) throw new Error('SENTRY_AUTH_TOKEN is required');
-    const receipt = await observeProduction({ expected: process.env.EXPECTED_SHA });
-    const result = await reportDeploy(receipt, { token: process.env.SENTRY_AUTH_TOKEN, repositoryId: process.env.GITHUB_REPOSITORY_ID, runId: process.env.GITHUB_RUN_ID });
-    const summary = `Production health and Sentry deployment reporting confirmed.${result.alreadyRecorded ? '  A matching deployment receipt already exists.' : '  A new deployment receipt was recorded.'}${receipt.superseded ? '  The triggering CI revision was superseded; only the observed live revision was reported.' : ''}\n`;
-    console.log(`Verified production source SHA: ${receipt.revision}`);
-    console.log(summary.trim());
-    if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+    let relevant = true;
+    try {
+      relevant = isCoolifyDeployRelevant(process.env.EXPECTED_SHA);
+    } catch {
+      // Fail closed: observe production rather than skip a real app deploy.
+      relevant = true;
+    }
+    if (!relevant) {
+      const skip = 'Skipping Sentry production deploy: this SHA does not change Coolify watch_paths (app/**, services/**), so congress-app will not rebuild.\n';
+      console.log(skip.trim());
+      if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, skip);
+      process.exitCode = 0;
+    } else {
+      const receipt = await observeProduction({ expected: process.env.EXPECTED_SHA });
+      const result = await reportDeploy(receipt, { token: process.env.SENTRY_AUTH_TOKEN, repositoryId: process.env.GITHUB_REPOSITORY_ID, runId: process.env.GITHUB_RUN_ID });
+      const summary = `Production health and Sentry deployment reporting confirmed.${result.alreadyRecorded ? '  A matching deployment receipt already exists.' : '  A new deployment receipt was recorded.'}${receipt.superseded ? '  The triggering CI revision was superseded; only the observed live revision was reported.' : ''}\n`;
+      console.log(`Verified production source SHA: ${receipt.revision}`);
+      console.log(summary.trim());
+      if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+      if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `release=${receipt.revision}\n`);
+    }
   } catch (error) {
     console.error(`::error::${error.message}`);
     process.exitCode = 1;

@@ -50,6 +50,7 @@
 
 import type { Env } from '../shared/types.ts';
 import { all, batch, get, run } from '../shared/db.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import { uuid } from '../shared/ids.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import {
@@ -781,7 +782,9 @@ export interface AutopilotStartResult {
 export async function maybeStartBacklogAutopilot(
   env: Env,
   now = new Date(),
+  opts: { signal?: AbortSignal } = {},
 ): Promise<AutopilotStartResult | null> {
+  abortIfSignal(opts.signal);
   const knobs = await resolveAutopilotKnobs(env);
   if (!knobs.enabled) return null;
 
@@ -875,6 +878,7 @@ export async function maybeStartBacklogAutopilot(
   }
   if (!trigger) return { blocked: 'not_due' };
   if (backlog == null) backlog = await countEligibleBacklog(env);
+  abortIfSignal(opts.signal);
 
   // Stamp BEFORE starting so the next cron tick can't double-start.
   try {
