@@ -68,6 +68,53 @@ describe('notifyReviewQueuePublisher', () => {
     expect(urls.sort()).toEqual(['https://bf.example/hook', 'https://gb.example/hook']);
   });
 
+  it('sends Authorization on GB webhook when REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB is set', async () => {
+    const headersByUrl = new Map<string, Record<string, string>>();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      headersByUrl.set(url, init?.headers as Record<string, string>);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB: 'Bearer gb-publisher-token',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(headersByUrl.get('https://gb.example/hook')?.authorization).toBe('Bearer gb-publisher-token');
+    expect(headersByUrl.get('https://gb.example/hook')?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+    expect(headersByUrl.get('https://bf.example/hook')?.authorization).toBeUndefined();
+    expect(headersByUrl.get('https://bf.example/hook')?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+  });
+
+  it('omits Authorization on GB webhook when REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB is unset', async () => {
+    let postedHeaders: Record<string, string> | undefined;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      if (url === 'https://gb.example/hook') {
+        postedHeaders = init?.headers as Record<string, string>;
+      }
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb.example/hook',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(postedHeaders?.authorization).toBeUndefined();
+    expect(postedHeaders?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+  });
+
   it('POSTs pipeline.stalled with null docId', async () => {
     let postedBody = '';
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

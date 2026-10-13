@@ -17,7 +17,7 @@ Terminal non-retryable ingest/extract failures wake GB Publisher and BF-Publishe
 ## Decisions
 
 - Stall webhooks use `pipeline.stalled` / `pipeline.stall_recovered` with a null `docId` (optional backlog `docId` for OCR) so GB Publisher, BF-Publisher, and Sentry share one envelope across House, Senate, Executive/OGE, OCR, Socratic.Trade, and `/api/health` checks (`health_<id>`).
-- Reuse the existing `REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET` HMAC for both `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL` (BF) and optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (GB); no second secret source.
+- Reuse the existing `REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET` HMAC for both `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL` (BF) and optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (GB); no second HMAC secret.  Optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB` adds an `Authorization` header (value already includes the `Bearer ` prefix) on GB posts only; `x-ct-signature` stays on every target.
 - Default stall threshold is 6h (`CT_PIPELINE_STALL_HOURS`); per-condition overrides use `CT_PIPELINE_STALL_HOURS_<CONDITION>` (uppercased condition id).  Inbound market-data scales `evaluateFreshness` day thresholds proportionally to that override; outbound peer-share treats an open delivery circuit as an immediate stall and uses the env hours only for re-alert dedupe.
 - KV episodes track `active` plus `notifiedAt`: dedupe within the stall window, `pipeline.stall_recovered` when a condition clears, and 7d dedupe for terminal per-doc failures.
 
@@ -29,4 +29,4 @@ Terminal non-retryable ingest/extract failures wake GB Publisher and BF-Publishe
 
 ## Follow-ups
 
-- Ensure Infisical prod sets `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` to the GB Publisher automation URL when Jay wants both bots live on every stall (BF URL already points at `agents.jays.services`).
+- Ensure Infisical prod sets `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` to the GB Publisher automation URL when Jay wants both bots live on every stall (BF URL already points at `agents.jays.services`).  Jay sets optional `REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB` in CT Infisical prod when GB Publisher requires bearer auth (never sent to the BF URL).

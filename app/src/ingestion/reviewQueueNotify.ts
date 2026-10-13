@@ -5,7 +5,8 @@
  * human review or when a pipeline stall / recovery event fires.  Fail-closed:
  * REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL and REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET
  * must be configured; optional REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB fans the
- * same signed payload to GB.  Targets are SSRF-checked before every POST.
+ * same signed payload to GB with optional REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB
+ * on GB targets only.  Targets are SSRF-checked before every POST.
  *
  * FAIL-SOFT BY CONTRACT: callers invoke this after the review transition has
  * committed.  A missing config, DNS failure, or HTTP error is logged and
@@ -39,8 +40,14 @@ export interface ReviewQueueNotifyInput {
   pipeline?: string | null;
 }
 
+interface PublisherWebhookTarget {
+  url: string;
+  /** Full `Authorization` header value (includes `Bearer ` prefix); GB targets only. */
+  authorization?: string;
+}
+
 interface ReviewQueuePublisherConfig {
-  urls: string[];
+  targets: PublisherWebhookTarget[];
   secret: string;
 }
 
@@ -53,20 +60,32 @@ function splitWebhookUrls(raw: string | undefined): string[] {
 }
 
 async function loadPublisherConfig(env: Env): Promise<ReviewQueuePublisherConfig | null> {
-  const [urlRes, gbUrlRes, secretRes] = await Promise.all([
+  const [urlRes, gbUrlRes, secretRes, gbAuthRes] = await Promise.all([
     resolveSecret(env, 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL'),
     resolveSecret(env, 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB'),
     resolveSecret(env, 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET'),
+    resolveSecret(env, 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB'),
   ]);
   const secret = secretRes.value?.trim();
   if (!secret) return null;
 
-  const urls = new Set<string>();
-  for (const u of splitWebhookUrls(urlRes.value)) urls.add(u);
-  for (const u of splitWebhookUrls(gbUrlRes.value)) urls.add(u);
-  for (const u of splitWebhookUrls(env.REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB)) urls.add(u);
-  if (urls.size === 0) return null;
-  return { urls: [...urls], secret };
+  const bfUrls = new Set<string>();
+  for (const u of splitWebhookUrls(urlRes.value)) bfUrls.add(u);
+
+  const gbUrls = new Set<string>();
+  for (const u of splitWebhookUrls(gbUrlRes.value)) gbUrls.add(u);
+  for (const u of splitWebhookUrls(env.REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB)) gbUrls.add(u);
+
+  const gbAuth = gbAuthRes.value?.trim() || env.REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB?.trim() || undefined;
+
+  const allUrls = new Set<string>([...bfUrls, ...gbUrls]);
+  if (allUrls.size === 0) return null;
+
+  const targets: PublisherWebhookTarget[] = [...allUrls].map((url) => {
+    const authorization = gbAuth && gbUrls.has(url) && !bfUrls.has(url) ? gbAuth : undefined;
+    return { url, authorization };
+  });
+  return { targets, secret };
 }
 
 async function postSignedPublisherWebhook(
@@ -82,7 +101,8 @@ async function postSignedPublisherWebhook(
   const allowLocalhost = env.USAGE_MONITOR_ENVIRONMENT?.toLowerCase() === 'local'
     || env.ADMIN_OPEN_IN_DEV === 'true';
 
-  for (const url of cfg.urls) {
+  for (const target of cfg.targets) {
+    const { url } = target;
     const targetError = await validatePublicWebhookTarget(url, {
       allowLocalhost,
       fetchImpl: deps.fetchImpl,
@@ -91,15 +111,19 @@ async function postSignedPublisherWebhook(
       console.warn(`review_queue notify: blocked target (${logLabel}) —`, targetError);
       continue;
     }
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'x-ct-signature': `t=${signedAtSec},v1=${signature}`,
+    };
+    if (target.authorization) {
+      headers.authorization = target.authorization;
+    }
     try {
       const response = await trackedFetch(
         url,
         {
           method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-ct-signature': `t=${signedAtSec},v1=${signature}`,
-          },
+          headers,
           body,
         },
         { service: 'review-queue-notify', operation: 'publisher-webhook' },
