@@ -19,6 +19,8 @@ import { validatePublicWebhookTarget } from '../delivery/webhookTarget.ts';
 import { signWebhookPayloadV1 } from '../delivery/webhook.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 
+const PUBLISHER_WEBHOOK_TIMEOUT_MS = 12_000;
+
 /** Sentinel doc id for pipeline-wide stall webhooks (no review_queue row). */
 export const PIPELINE_STALL_SENTINEL_DOC_ID = '__pipeline_stall__';
 
@@ -119,16 +121,27 @@ async function postSignedPublisherWebhook(
       headers.authorization = target.authorization;
     }
     try {
-      const response = await trackedFetch(
-        url,
-        {
-          method: 'POST',
-          headers,
-          body,
-        },
-        { service: 'review-queue-notify', operation: 'publisher-webhook' },
-        fetchImpl,
+      const reqAbort = new AbortController();
+      const timeoutId = setTimeout(
+        () => reqAbort.abort(new Error(`publisher webhook timeout after ${PUBLISHER_WEBHOOK_TIMEOUT_MS}ms`)),
+        PUBLISHER_WEBHOOK_TIMEOUT_MS,
       );
+      let response: Response;
+      try {
+        response = await trackedFetch(
+          url,
+          {
+            method: 'POST',
+            headers,
+            body,
+            signal: reqAbort.signal,
+          },
+          { service: 'review-queue-notify', operation: 'publisher-webhook' },
+          fetchImpl,
+        );
+      } finally {
+        clearTimeout(timeoutId);
+      }
       if (!response.ok) {
         console.warn(
           `review_queue notify: publisher returned HTTP ${response.status} for ${logLabel} → ${url}`,

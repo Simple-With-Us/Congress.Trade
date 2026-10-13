@@ -19,6 +19,11 @@ import { AGREEMENT_CLAIM_LEASE_MS, maybeRunAgreementAutopublish } from '../extra
 import { maybeStartBacklogAutopilot } from '../extraction/autopilot.ts';
 import { TERMINAL_REVIEW_REASON_EXCLUDE_SQL } from '../extraction/reviewQueueHealth.ts';
 import { refreshSecrets } from '../secrets/infisical.ts';
+import { captureMessage } from './sentry.ts';
+import {
+  isMaintenanceLaneTimeout,
+  raceMaintenanceLane,
+} from './maintenanceLaneTimeout.ts';
 import { flushUsageTelemetryFallback } from '../shared/thirdPartyTelemetry.ts';
 import {
   drainDurableQueues,
@@ -256,6 +261,25 @@ export type MaintenanceLane =
   | 'daily_jobs'
   | 'd1_budget';
 
+/** Default per-lane wall-clock budgets (ms) for the Deno minute tick. */
+export const DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS: Record<MaintenanceLane, number> = {
+  secrets_refresh: 12_000,
+  watcher: 22_000,
+  deterministic_drain: 15_000,
+  agreement_autopublish: 8_000,
+  backlog_autopilot: 8_000,
+  ingestion_outbox: 12_000,
+  delivery_outbox: 12_000,
+  apns_fanout: 18_000,
+  durable_queue: 18_000,
+  parked_deliveries: 8_000,
+  usage_telemetry: 8_000,
+  disclosure_latency: 15_000,
+  latency_price_snapshots: 15_000,
+  daily_jobs: 30_000,
+  d1_budget: 8_000,
+};
+
 export interface MaintenancePipelineOptions {
   outboxLimit: number;
   /** When set, re-dispatch circuit-parked deliveries. */
@@ -287,6 +311,8 @@ export interface MaintenancePipelineOptions {
     lane: MaintenanceLane,
     run: () => Promise<unknown>,
   ) => Promise<unknown>;
+  /** Override per-lane wall-clock budgets (see DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS). */
+  laneTimeoutMs?: Partial<Record<MaintenanceLane, number>>;
 }
 
 export interface MaintenancePipelineResult {
@@ -345,16 +371,39 @@ export async function runMaintenancePipeline(
     }
   };
 
+  const laneTimeoutFor = (lane: MaintenanceLane): number =>
+    options.laneTimeoutMs?.[lane] ?? DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS[lane];
+
+  const alertLaneTimeout = (lane: MaintenanceLane, timeoutMs: number, err: unknown) => {
+    const detail = errorText(err);
+    const message = `Cron maintenance lane timed out: ${lane} (${timeoutMs}ms) — ${detail}`;
+    console.error(message);
+    try {
+      captureMessage(message, 'error');
+    } catch {
+      /* fail-soft */
+    }
+  };
+
   const runLane = async <T>(
     lane: MaintenanceLane,
     run: () => Promise<T>,
   ): Promise<T | null> => {
+    const timeoutMs = laneTimeoutFor(lane);
     try {
       throwIfAborted();
-      const observed = options.observeLane ? options.observeLane(lane, run) : run();
-      return (await observed) as T;
+      const execute = () => {
+        const inner = options.observeLane ? options.observeLane(lane, run) : run();
+        return raceMaintenanceLane(lane, timeoutMs, () => inner as Promise<T>);
+      };
+      return await execute();
     } catch (err) {
       if (isTickAbort(err)) throw err;
+      if (isMaintenanceLaneTimeout(err)) {
+        alertLaneTimeout(lane, timeoutMs, err);
+        errors.push(`${lane}: timed out after ${timeoutMs}ms`);
+        return null;
+      }
       errors.push(`${lane}: ${errorText(err)}`);
       console.error(`maintenance lane ${lane} failed:`, err);
       return null;
@@ -362,7 +411,7 @@ export async function runMaintenancePipeline(
   };
 
   try {
-    await runLane('secrets_refresh', () => refreshSecrets(env));
+    await runLane('secrets_refresh', () => refreshSecrets(env, { signal: options.signal }));
     result.watcher = await runLane('watcher', () =>
       runWatcher(env, now, { signal: options.signal }),
     );

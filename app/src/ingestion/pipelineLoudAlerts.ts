@@ -696,8 +696,17 @@ export async function sweepPipelineStallAlerts(
     deps,
   );
 
+  const HEALTH_STALL_BUDGET_MS = 20_000;
   try {
-    const health = await checkPipelineHealth(env, now);
+    const health = await Promise.race([
+      checkPipelineHealth(env, now),
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error(`checkPipelineHealth exceeded ${HEALTH_STALL_BUDGET_MS}ms`)),
+          HEALTH_STALL_BUDGET_MS,
+        );
+      }),
+    ]);
     for (const check of health.checks) {
       if (HEALTH_STALL_SKIP_IDS.has(check.id)) continue;
       const stalled = check.status === 'stalled' || check.status === 'critical';
