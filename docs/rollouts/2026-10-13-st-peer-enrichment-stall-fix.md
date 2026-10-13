@@ -18,6 +18,13 @@ symbols in alert detail, stamps `enrichment_checked_at` on every enrichment
 attempt, and negative-caches confirmed no-profile symbols only when the ticker
 also appears on real disclosures (runner tombstone, or admin mark with `force`).
 
+## Decisions
+
+- Pending enrichment stall SQL matches `selectTickersToEnrich` (including `deprecated_at IS NULL` and `COMPETITOR-%` exclusion) with keyed `enrichmentNeededSql`.
+- Progress uses `enrichment_checked_at` on the pending set only; transient failures do not stamp that column (success/tombstone/admin marks do).
+- `st_peer_enrichment` keeps a **30h** code default; `st_peer_prices` returns to the **6h** general default once fixture rows are excluded from its pending set.
+- Stall alert detail includes up to **10** pending ticker symbols when a stall fires.
+
 ## Files changed
 
 - `app/src/ingestion/pipelineLoudAlerts.ts` — pending-scoped progress + sample tickers + fixture exclusion

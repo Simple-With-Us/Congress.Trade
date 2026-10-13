@@ -441,8 +441,7 @@ async function evaluateChamberFetchStall(
   return { stalled: true, detail };
 }
 
-async function buildStPeerEnrichmentPendingSql(env: Env): Promise<string> {
-  const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(env);
+function buildStPeerEnrichmentPendingSql(retryIncomplete: boolean): string {
   const needed = enrichmentNeededSql('sr', retryIncomplete);
   const unavailable = enrichmentUnavailableExcludedSql('sr');
   return `
@@ -462,8 +461,9 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   let pending = 0;
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
+  let pendingSql = '';
   try {
-    const pendingSql = await buildStPeerEnrichmentPendingSql(env);
+    pendingSql = buildStPeerEnrichmentPendingSql(true);
     const row = await get<{ n: number; last_at: string | null }>(
       env.DB,
       `SELECT
@@ -472,20 +472,22 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
-    if (pending > 0) {
-      const names = await all<{ ticker: string }>(
-        env.DB,
-        `SELECT DISTINCT t.ticker AS ticker ${pendingSql}
-         ORDER BY t.ticker ASC
-         LIMIT 10`,
-      );
-      pendingSample = names.map((r) => r.ticker);
-    }
   } catch {
     return { stalled: false, detail: 'enrichment stall query failed', skip: true };
   }
   if (pending <= 0 || !pendingEnrichmentProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST enrichment moving' };
+  }
+  try {
+    const names = await all<{ ticker: string }>(
+      env.DB,
+      `SELECT DISTINCT t.ticker AS ticker ${pendingSql}
+       ORDER BY t.ticker ASC
+       LIMIT 10`,
+    );
+    pendingSample = names.map((r) => r.ticker);
+  } catch {
+    /* sample is optional detail */
   }
   const stallHours = readPipelineStallHours(env, 'st_peer_enrichment');
   const sampleSuffix = pendingSample.length
@@ -523,20 +525,22 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
-    if (pending > 0) {
-      const names = await all<{ ticker: string }>(
-        env.DB,
-        `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
-         ORDER BY t.ticker ASC
-         LIMIT 10`,
-      );
-      pendingSample = names.map((r) => r.ticker);
-    }
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
   }
   if (pending <= 0 || !pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST price refresh moving' };
+  }
+  try {
+    const names = await all<{ ticker: string }>(
+      env.DB,
+      `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
+       ORDER BY t.ticker ASC
+       LIMIT 10`,
+    );
+    pendingSample = names.map((r) => r.ticker);
+  } catch {
+    /* sample is optional detail */
   }
   const stallHours = readPipelineStallHours(env, 'st_peer_prices');
   const sampleSuffix = pendingSample.length

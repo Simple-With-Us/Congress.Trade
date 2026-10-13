@@ -369,6 +369,7 @@ export async function selectTickersToEnrich(
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+        AND t.deprecated_at IS NULL
         AND ${excludeCompetitorFixtureTransactionSql('t')}
         AND ${enrichmentUnavailableExcludedSql('sr')}
         AND ${enrichmentNeededSql('sr', retryIncompleteWithKeyedProvider)}

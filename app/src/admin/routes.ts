@@ -2250,6 +2250,16 @@ const DeliveryRequeueBodySchema = z
   })
   .strict();
 
+export const PriceUnavailableBodySchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+export type PriceUnavailableBody = z.infer<typeof PriceUnavailableBodySchema>;
+
+export const EnrichmentUnavailableBodySchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+export type EnrichmentUnavailableBody = z.infer<typeof EnrichmentUnavailableBodySchema>;
+
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   const r = new Hono<{ Bindings: Env }>();
@@ -10210,14 +10220,6 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // fundamentals_eod / analyst_consensus and recomputes per-trade
   // performance anchors for imported tickers. Idempotent. Authorized by the
   // full ADMIN_TOKEN/Access OR the scoped INGEST_TOKEN (this endpoint only).
-  const PriceUnavailableBodySchema = z.object({
-    reason: z.string().trim().min(1).max(500),
-  }).strict();
-
-  const EnrichmentUnavailableBodySchema = z.object({
-    reason: z.string().trim().min(1).max(500),
-  }).strict();
-
   r.post('/securities/:ticker/price-unavailable', async (c) => {
     const rawTicker = c.req.param('ticker');
     const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
@@ -10245,7 +10247,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
       return c.json({ error: 'invalid ticker' }, 400);
     }
-    let body: z.infer<typeof EnrichmentUnavailableBodySchema>;
+    let body: EnrichmentUnavailableBody;
     try {
       body = EnrichmentUnavailableBodySchema.parse(await c.req.json());
     } catch (err) {
