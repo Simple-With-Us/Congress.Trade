@@ -4,6 +4,11 @@
 include:
   - project.yml
 
+settings:
+  base:
+    # Fleet base app bundle ID (mirrors CongressTrade in project.yml).
+    TRADE_BUNDLE_ID: trade.congress.ios
+
 targets:
   CongressTradeShotsUITests:
     type: bundle.ui-testing
@@ -18,7 +23,7 @@ targets:
       - target: CongressTrade
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: trade.congress.ios.shotsuitests
+        PRODUCT_BUNDLE_IDENTIFIER: $(TRADE_BUNDLE_ID).shotsuitests
         PRODUCT_NAME: "$(TARGET_NAME)"
         GENERATE_INFOPLIST_FILE: YES
         TEST_TARGET_NAME: CongressTrade
