@@ -715,13 +715,10 @@ async function markTransientEnrichmentFailure(
   now: number,
 ): Promise<void> {
   const marker = nextTransientRetryMarker(priorEnrichmentError, now);
-  const checkedAt = new Date(now).toISOString();
   await run(
     env.DB,
-    `INSERT INTO securities_ref (ticker, enrichment_error, enrichment_checked_at) VALUES (?, ?, ?)
-     ON CONFLICT(ticker) DO UPDATE SET
-       enrichment_error = excluded.enrichment_error,
-       enrichment_checked_at = excluded.enrichment_checked_at`,
-    [ticker, marker, checkedAt],
+    `INSERT INTO securities_ref (ticker, enrichment_error) VALUES (?, ?)
+     ON CONFLICT(ticker) DO UPDATE SET enrichment_error = excluded.enrichment_error`,
+    [ticker, marker],
   );
 }
