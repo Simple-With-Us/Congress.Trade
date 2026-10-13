@@ -148,7 +148,9 @@ import {
   getDailyUsed,
   prepareImportSecurityRef,
   enrichmentNeededSql,
+  enrichmentUnavailableExcludedSql,
   hasConfiguredKeyedEnrichmentProvider,
+  markTickerEnrichmentUnavailable,
 } from '../enrichment/service.ts';
 import { mergeRefs } from '../enrichment/compute.ts';
 import type { SecurityRef } from '../enrichment/types.ts';
@@ -10012,6 +10014,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
          SELECT t.ticker FROM transactions t
          LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
          WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+           AND ${enrichmentUnavailableExcludedSql('sr')}
            AND ${enrichmentNeededSql('sr', retryIncomplete)}
          GROUP BY t.ticker)`,
     );
@@ -10211,6 +10214,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     reason: z.string().trim().min(1).max(500),
   }).strict();
 
+  const EnrichmentUnavailableBodySchema = z.object({
+    reason: z.string().trim().min(1).max(500),
+  }).strict();
+
   r.post('/securities/:ticker/price-unavailable', async (c) => {
     const rawTicker = c.req.param('ticker');
     const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
@@ -10227,6 +10234,27 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       const nowIso = new Date().toISOString();
       await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso });
       return c.json({ ok: true, ticker, reason: body.reason, price_checked_at: nowIso });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  r.post('/securities/:ticker/enrichment-unavailable', async (c) => {
+    const rawTicker = c.req.param('ticker');
+    const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
+    if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
+      return c.json({ error: 'invalid ticker' }, 400);
+    }
+    let body: z.infer<typeof EnrichmentUnavailableBodySchema>;
+    try {
+      body = EnrichmentUnavailableBodySchema.parse(await c.req.json());
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await markTickerEnrichmentUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso });
+      return c.json({ ok: true, ticker, reason: body.reason, enrichment_checked_at: nowIso });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }
@@ -11370,6 +11398,7 @@ export async function marketPending(env: Env): Promise<{ enrich: number; prices:
        SELECT t.ticker FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
        WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+         AND ${enrichmentUnavailableExcludedSql('sr')}
          AND ${enrichmentNeededSql('sr', retryIncomplete)}
        GROUP BY t.ticker)`,
   );

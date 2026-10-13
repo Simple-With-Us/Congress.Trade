@@ -79,6 +79,50 @@ function missingDisplayCriticalSql(alias: string): string {
 export const NO_PROVIDER_DATA_ERROR = 'no provider data';
 export const NOT_AN_EQUITY_ERROR = 'not an equity';
 
+/** Peer profile chain returned a clean empty result for this symbol. */
+export const ENRICHMENT_UNAVAILABLE_REASON_PEER_NO_PROFILE = 'socratic_no_profile';
+
+const ENRICHMENT_UNAVAILABLE_REASON_MAX_LEN = 500;
+
+function normalizeEnrichmentUnavailableReason(reason: string): string {
+  const trimmed = reason.trim();
+  if (!trimmed) return ENRICHMENT_UNAVAILABLE_REASON_PEER_NO_PROFILE;
+  return trimmed.length > ENRICHMENT_UNAVAILABLE_REASON_MAX_LEN
+    ? trimmed.slice(0, ENRICHMENT_UNAVAILABLE_REASON_MAX_LEN)
+    : trimmed;
+}
+
+/**
+ * Negative-cache a ticker as not enrichable (excluded from pending enrichment work
+ * and the st_peer_enrichment stall detector).
+ */
+export async function markTickerEnrichmentUnavailable(
+  env: Env,
+  ticker: string,
+  reason: string,
+  opts: { checkedAt?: string } = {},
+): Promise<void> {
+  const sym = ticker.trim().toUpperCase();
+  if (!sym) return;
+  const nowIso = opts.checkedAt ?? new Date().toISOString();
+  const reasonText = normalizeEnrichmentUnavailableReason(reason);
+  await run(
+    env.DB,
+    `INSERT INTO securities_ref (ticker, enrichment_unavailable, enrichment_checked_at, enrichment_unavailable_reason)
+       VALUES (?, 1, ?, ?)
+     ON CONFLICT(ticker) DO UPDATE SET
+       enrichment_unavailable = 1,
+       enrichment_checked_at = excluded.enrichment_checked_at,
+       enrichment_unavailable_reason = excluded.enrichment_unavailable_reason`,
+    [sym, nowIso, reasonText],
+  );
+}
+
+/** Exclude rows explicitly marked as not enrichable (pending selectors + stall SQL). */
+export function enrichmentUnavailableExcludedSql(alias = 'sr'): string {
+  return `(${alias}.ticker IS NULL OR COALESCE(${alias}.enrichment_unavailable, 0) = 0)`;
+}
+
 const TRANSIENT_RETRY_PREFIX = 'transient-retry:';
 const TRANSIENT_RETRY_BASE_BACKOFF_MS = 60 * 60 * 1000; // 1 hour
 const TRANSIENT_RETRY_MAX_BACKOFF_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -320,6 +364,7 @@ export async function selectTickersToEnrich(
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+        AND ${enrichmentUnavailableExcludedSql('sr')}
         AND ${enrichmentNeededSql('sr', retryIncompleteWithKeyedProvider)}
       GROUP BY t.ticker
       ORDER BY MAX(t.cursor_seq) DESC
@@ -565,8 +610,8 @@ async function upsertRef(env: Env, ref: SecurityRef): Promise<void> {
        ticker, company_name, sector, industry, asset_class, is_etf, is_adr,
        country, state_hq, state_of_incorp, exchange, exchange_short, currency,
        market_cap, market_cap_bucket, shares_outstanding, ipo_date, cik, sic_code, sic_description,
-       source, enriched_at, enrichment_error
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+       source, enriched_at, enrichment_error, enrichment_checked_at
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
      ON CONFLICT(ticker) DO UPDATE SET
        company_name=COALESCE(excluded.company_name, securities_ref.company_name),
        sector=COALESCE(excluded.sector, securities_ref.sector),
@@ -593,12 +638,17 @@ async function upsertRef(env: Env, ref: SecurityRef): Promise<void> {
          WHEN securities_ref.source LIKE '%' || excluded.source || '%' THEN securities_ref.source
          ELSE securities_ref.source || '+' || excluded.source
        END,
-       enriched_at=excluded.enriched_at, enrichment_error=NULL`,
+       enriched_at=excluded.enriched_at,
+       enrichment_error=NULL,
+       enrichment_checked_at=excluded.enrichment_checked_at,
+       enrichment_unavailable=0,
+       enrichment_unavailable_reason=NULL`,
     [
       ref.ticker, ref.companyName, ref.sector, ref.industry, ref.assetClass,
       ref.isEtf ? 1 : 0, ref.isAdr ? 1 : 0, ref.country, ref.stateHq, ref.stateOfIncorp,
       ref.exchange, ref.exchangeShort, ref.currency, ref.marketCap, ref.marketCapBucket,
       ref.sharesOutstanding ?? null, ref.ipoDate, ref.cik, ref.sicCode, ref.sicDescription, ref.source,
+      new Date().toISOString(),
       new Date().toISOString(),
     ],
   );
@@ -608,19 +658,39 @@ async function upsertEmpty(env: Env, ticker: string, err: string, recordPeerAtte
   // A clean miss keeps the error text.  Recording socratic on `source` is what
   // makes the ticker-shaped tombstone ineligible for a second retry.
   const peerSource = recordPeerAttempt ? 'socratic' : null;
+  const nowIso = new Date().toISOString();
+  const unavailableReason = recordPeerAttempt
+    ? (err === NOT_AN_EQUITY_ERROR ? err : ENRICHMENT_UNAVAILABLE_REASON_PEER_NO_PROFILE)
+    : null;
   await run(
     env.DB,
-    `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error, source) VALUES (?,?,?,?)
+    `INSERT INTO securities_ref (
+       ticker, enriched_at, enrichment_error, source,
+       enrichment_checked_at, enrichment_unavailable, enrichment_unavailable_reason
+     ) VALUES (?,?,?,?,?,?,?)
      ON CONFLICT(ticker) DO UPDATE SET
        enriched_at=excluded.enriched_at,
        enrichment_error=excluded.enrichment_error,
+       enrichment_checked_at=excluded.enrichment_checked_at,
+       enrichment_unavailable=CASE WHEN ? IS NOT NULL THEN 1 ELSE securities_ref.enrichment_unavailable END,
+       enrichment_unavailable_reason=COALESCE(excluded.enrichment_unavailable_reason, securities_ref.enrichment_unavailable_reason),
        source=CASE
          WHEN ? = 0 THEN securities_ref.source
          WHEN securities_ref.source IS NULL OR securities_ref.source = '' THEN excluded.source
          WHEN securities_ref.source LIKE '%socratic%' THEN securities_ref.source
          ELSE securities_ref.source || '+socratic'
        END`,
-    [ticker, new Date().toISOString(), err, peerSource, recordPeerAttempt ? 1 : 0],
+    [
+      ticker,
+      nowIso,
+      err,
+      peerSource,
+      nowIso,
+      recordPeerAttempt ? 1 : 0,
+      unavailableReason,
+      unavailableReason,
+      recordPeerAttempt ? 1 : 0,
+    ],
   );
 }
 
@@ -638,10 +708,13 @@ async function markTransientEnrichmentFailure(
   now: number,
 ): Promise<void> {
   const marker = nextTransientRetryMarker(priorEnrichmentError, now);
+  const checkedAt = new Date(now).toISOString();
   await run(
     env.DB,
-    `INSERT INTO securities_ref (ticker, enrichment_error) VALUES (?, ?)
-     ON CONFLICT(ticker) DO UPDATE SET enrichment_error = excluded.enrichment_error`,
-    [ticker, marker],
+    `INSERT INTO securities_ref (ticker, enrichment_error, enrichment_checked_at) VALUES (?, ?, ?)
+     ON CONFLICT(ticker) DO UPDATE SET
+       enrichment_error = excluded.enrichment_error,
+       enrichment_checked_at = excluded.enrichment_checked_at`,
+    [ticker, marker, checkedAt],
   );
 }
