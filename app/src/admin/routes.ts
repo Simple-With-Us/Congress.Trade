@@ -10226,7 +10226,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
       return c.json({ error: 'invalid ticker' }, 400);
     }
-    let body: z.infer<typeof PriceUnavailableBodySchema>;
+    let body: PriceUnavailableBody;
     try {
       body = PriceUnavailableBodySchema.parse(await c.req.json());
     } catch (err) {
