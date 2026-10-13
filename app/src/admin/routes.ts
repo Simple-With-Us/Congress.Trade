@@ -5108,7 +5108,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Force-refresh the Infisical secret cache. This does not write plaintext
   // secrets into KV/D1/Cloudflare vars; optional KV cache entries are encrypted.
   r.post('/diagnostics/secrets/refresh', async (c) => {
-    return c.json({ secrets: await refreshSecrets(c.env) });
+    return c.json({ secrets: await refreshSecrets(c.env, { force: true }) });
   });
 
   // --- POST /diagnostics/secrets/update -----------------------------------
@@ -5130,7 +5130,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     await updateSecret(c.env, source, key, value);
     // Refresh the local cache to pull down the newly updated secret
-    return c.json({ ok: true, secrets: await refreshSecrets(c.env) });
+    return c.json({ ok: true, secrets: await refreshSecrets(c.env, { force: true }) });
   });
 
   // --- GET /settings ------------------------------------------------------

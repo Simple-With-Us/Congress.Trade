@@ -1,6 +1,7 @@
 import type { Env } from '../shared/types.ts';
 import { all, run, type SqlParam } from '../shared/db.ts';
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 
 export type SqlStatement = [string, SqlParam[]];
 
@@ -81,7 +82,7 @@ function retryDelaySeconds(attempt: number): number {
  */
 export async function flushDeliveryOutbox(
   env: Env,
-  opts: { txIds?: string[]; limit?: number; now?: Date } = {},
+  opts: { txIds?: string[]; limit?: number; now?: Date; signal?: AbortSignal } = {},
 ): Promise<OutboxFlushResult> {
   const now = opts.now ?? new Date();
   const nowIso = now.toISOString();
@@ -102,6 +103,7 @@ export async function flushDeliveryOutbox(
 
   const result: OutboxFlushResult = { claimed: 0, enqueued: 0, failed: 0 };
   for (const row of rows) {
+    abortIfSignal(opts.signal);
     // GOVERNOR 2: the outbox fan-out performs 2-3 writes per claimed row. Past
     // the per-invocation governed-write cap, stop this cycle early — the
     // remaining rows stay 'pending' and the next scheduled flush drains them,

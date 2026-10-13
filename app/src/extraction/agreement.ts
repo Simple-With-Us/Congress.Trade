@@ -75,6 +75,7 @@
 
 import type { Env, ParsedTx, Transaction } from '../shared/types.ts';
 import { all, batch, fromBool, get, run } from '../shared/db.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import {
   runCandidateOnDoc,
   persistExtractionRun,
@@ -2973,7 +2974,9 @@ async function recoverExpiredCappedReviews(
  */
 export async function maybeRunAgreementAutopublish(
   env: Env,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<{ attempted: number; enqueued: number; terminalized: number } | null> {
+  abortIfSignal(opts.signal);
   const e = await resolveAgreementEnv(env);
   if (e.AGREEMENT_AUTOPUBLISH_ENABLED !== 'true') return null;
   const limit = Math.min(Math.max(parseInt(e.AGREEMENT_AUTOPUBLISH_LIMIT || '3', 10) || 3, 1), 10);
@@ -3016,6 +3019,7 @@ export async function maybeRunAgreementAutopublish(
 
   let enqueued = 0;
   for (const d of docs) {
+    abortIfSignal(opts.signal);
     if (await enqueueAgreementCheck(env, d.doc_id, d.raw_object_key)) enqueued++;
   }
   if (docs.length) console.log(`agreement autopublish: enqueued ${enqueued}/${docs.length} checks`);
