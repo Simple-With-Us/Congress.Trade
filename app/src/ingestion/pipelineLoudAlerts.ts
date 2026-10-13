@@ -17,7 +17,13 @@ import {
 } from './reviewQueueNotify.ts';
 import { captureException, captureMessage } from '../deno/sentry.ts';
 import { ogeWatchEnabled } from './ogeSource.ts';
-import { hasConfiguredKeyedEnrichmentProvider } from '../enrichment/service.ts';
+import {
+  enrichmentNeededSql,
+  enrichmentProgressTimestampSql,
+  hasConfiguredKeyedEnrichmentProvider,
+  securitiesRefHasEnrichmentUnavailableColumns,
+} from '../enrichment/service.ts';
+import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
@@ -31,8 +37,8 @@ import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
-/** Default stall window for ST peer price backlog (daily EOD cadence). */
-export const DEFAULT_ST_PEER_PRICES_STALL_HOURS = 30;
+/** Default stall window for ST peer enrichment backlog (daily + hourly drain). */
+export const DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS = 30;
 /** Re-alert the same doc+stage after this window if it fails terminally again. */
 export const TERMINAL_REDUP_WINDOW_MS = 7 * 24 * 3_600_000;
 
@@ -91,7 +97,7 @@ export function readPipelineStallHours(env: Env, condition?: string): number {
   if (Number.isFinite(n) && n >= 1) return Math.min(n, 168);
   const legacy = Number.parseInt(envGet('CT_OCR_STALL_HOURS') ?? '', 10);
   if (Number.isFinite(legacy) && legacy >= 1) return Math.min(legacy, 168);
-  if (condition === 'st_peer_prices') return DEFAULT_ST_PEER_PRICES_STALL_HOURS;
+  if (condition === 'st_peer_enrichment') return DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS;
   return DEFAULT_PIPELINE_STALL_HOURS;
 }
 
@@ -385,6 +391,13 @@ function pendingPriceProgressIdle(lastAt: string | null, now: Date, thresholdMs:
   return now.getTime() - lastMs >= thresholdMs;
 }
 
+/** Pending-set enrichment progress: ignore tickers never attempted on the backlog. */
+function pendingEnrichmentProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
+  const lastMs = lastAt ? Date.parse(lastAt) : NaN;
+  if (!Number.isFinite(lastMs)) return false;
+  return now.getTime() - lastMs >= thresholdMs;
+}
+
 function hoursLabel(lastAt: string | null, now: Date): string {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
   if (!Number.isFinite(lastMs)) return 'never';
@@ -429,36 +442,67 @@ async function evaluateChamberFetchStall(
   return { stalled: true, detail };
 }
 
+/** Static unavailable filter for stall SQL (fixed `sr` alias — no dynamic composition). */
+const ST_PEER_ENRICHMENT_UNAVAILABLE_EXCLUDED_SQL =
+  '(sr.ticker IS NULL OR COALESCE(sr.enrichment_unavailable, 0) = 0)';
+
+function stPeerEnrichmentPendingSql(has0104: boolean): string {
+  const unavailable = has0104 ? ST_PEER_ENRICHMENT_UNAVAILABLE_EXCLUDED_SQL : '1=1';
+  return `
+  FROM transactions t
+  LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
+ WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
+   AND t.deprecated_at IS NULL
+   AND ${excludeCompetitorFixtureTransactionSql('t')}
+   AND ${unavailable}
+   AND ${enrichmentNeededSql('sr', true)}`;
+}
+
 async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST peer enrichment not configured', skip: true };
   }
   let pending = 0;
-  let lastEnriched: string | null = null;
+  let lastChecked: string | null = null;
+  let pendingSample: string[] = [];
+  let pendingSql = '';
+  const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(env.DB);
+  const progressAt = enrichmentProgressTimestampSql('sr', has0104);
   try {
+    pendingSql = stPeerEnrichmentPendingSql(has0104);
     const row = await get<{ n: number; last_at: string | null }>(
       env.DB,
       `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) FROM transactions t
-           LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
-          WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
-            AND t.deprecated_at IS NULL
-            AND (sr.enriched_at IS NULL)) AS n,
-         (SELECT MAX(enriched_at) FROM securities_ref
-           WHERE source LIKE '%socratic%') AS last_at`,
+         (SELECT COUNT(DISTINCT t.ticker) ${pendingSql}) AS n,
+         (SELECT MAX(${progressAt}) ${pendingSql}) AS last_at`,
     );
     pending = Number(row?.n ?? 0);
-    lastEnriched = row?.last_at ?? null;
+    lastChecked = row?.last_at ?? null;
   } catch {
     return { stalled: false, detail: 'enrichment stall query failed', skip: true };
   }
-  if (pending <= 0 || !idleBeyondThreshold(lastEnriched, now, thresholdMs)) {
+  if (pending <= 0 || !pendingEnrichmentProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST enrichment moving' };
   }
+  try {
+    const names = await all<{ ticker: string }>(
+      env.DB,
+      `SELECT DISTINCT t.ticker AS ticker ${pendingSql}
+       ORDER BY t.ticker ASC
+       LIMIT 10`,
+    );
+    pendingSample = names.map((r) => r.ticker);
+  } catch {
+    /* sample is optional detail */
+  }
   const stallHours = readPipelineStallHours(env, 'st_peer_enrichment');
+  const sampleSuffix = pendingSample.length
+    ? `; pending sample: ${pendingSample.join(', ')}`
+    : '';
   const detail =
-    `${pending} ticker(s) still lack enrichment; ` +
-    `no successful Socratic.Trade enrichment in ${hoursLabel(lastEnriched, now)}h (threshold ${stallHours}h)`;
+    `${pending} ticker(s) still need enrichment from Socratic.Trade / SEC` +
+    sampleSuffix +
+    `; no enrichment_checked_at progress on pending tickers in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
   return { stalled: true, detail };
 }
 
@@ -467,6 +511,7 @@ const ST_PEER_PRICE_PENDING_SQL = `
   JOIN securities_ref sr ON sr.ticker = t.ticker
  WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
    AND t.deprecated_at IS NULL
+   AND ${excludeCompetitorFixtureTransactionSql('t')}
    AND COALESCE(sr.price_unavailable, 0) = 0
    AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
 
@@ -486,20 +531,22 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
-    if (pending > 0) {
-      const names = await all<{ ticker: string }>(
-        env.DB,
-        `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
-         ORDER BY t.ticker ASC
-         LIMIT 10`,
-      );
-      pendingSample = names.map((r) => r.ticker);
-    }
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
   }
   if (pending <= 0 || !pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST price refresh moving' };
+  }
+  try {
+    const names = await all<{ ticker: string }>(
+      env.DB,
+      `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
+       ORDER BY t.ticker ASC
+       LIMIT 10`,
+    );
+    pendingSample = names.map((r) => r.ticker);
+  } catch {
+    /* sample is optional detail */
   }
   const stallHours = readPipelineStallHours(env, 'st_peer_prices');
   const sampleSuffix = pendingSample.length

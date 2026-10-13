@@ -74,6 +74,7 @@ import {
   MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
   FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
   PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+  ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../../benchmark/schema.ts';
 import {
@@ -306,6 +307,7 @@ describe('admin migration bootstrap', () => {
       ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
       ...FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
       ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+      ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
     ]);
   });
 
@@ -526,6 +528,13 @@ describe('admin migration bootstrap', () => {
 
   it('adds price_unavailable_reason (0103)', () => {
     expect(PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS.join('\n')).toContain('price_unavailable_reason TEXT');
+  });
+
+  it('adds enrichment_unavailable columns (0104)', () => {
+    const sql = ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('enrichment_unavailable INTEGER');
+    expect(sql).toContain('enrichment_unavailable_reason TEXT');
+    expect(sql).toContain('enrichment_checked_at TEXT');
   });
 
   it('negative-caches un-priceable tickers and indexes latest_price_date (0043)', () => {

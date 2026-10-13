@@ -148,7 +148,10 @@ import {
   getDailyUsed,
   prepareImportSecurityRef,
   enrichmentNeededSql,
+  enrichmentUnavailableExcludedSql,
   hasConfiguredKeyedEnrichmentProvider,
+  markTickerEnrichmentUnavailable,
+  securitiesRefHasEnrichmentUnavailableColumns,
 } from '../enrichment/service.ts';
 import { mergeRefs } from '../enrichment/compute.ts';
 import type { SecurityRef } from '../enrichment/types.ts';
@@ -2247,6 +2250,16 @@ const DeliveryRequeueBodySchema = z
     dryRun: z.boolean().default(false),
   })
   .strict();
+
+export const PriceUnavailableBodySchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+export type PriceUnavailableBody = z.infer<typeof PriceUnavailableBodySchema>;
+
+export const EnrichmentUnavailableBodySchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+export type EnrichmentUnavailableBody = z.infer<typeof EnrichmentUnavailableBodySchema>;
 
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
@@ -10006,12 +10019,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   r.get('/enrich-securities/status', async (c) => {
     const used = await getDailyUsed(c.env);
     const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(c.env);
+    const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(c.env.DB);
     const row = await first<{ pending: number }>(
       c.env.DB,
       `SELECT COUNT(*) AS pending FROM (
          SELECT t.ticker FROM transactions t
          LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
          WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+           AND ${enrichmentUnavailableExcludedSql('sr', { columnsPresent: has0104 })}
            AND ${enrichmentNeededSql('sr', retryIncomplete)}
          GROUP BY t.ticker)`,
     );
@@ -10207,17 +10222,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // fundamentals_eod / analyst_consensus and recomputes per-trade
   // performance anchors for imported tickers. Idempotent. Authorized by the
   // full ADMIN_TOKEN/Access OR the scoped INGEST_TOKEN (this endpoint only).
-  const PriceUnavailableBodySchema = z.object({
-    reason: z.string().trim().min(1).max(500),
-  }).strict();
-
   r.post('/securities/:ticker/price-unavailable', async (c) => {
     const rawTicker = c.req.param('ticker');
     const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
     if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
       return c.json({ error: 'invalid ticker' }, 400);
     }
-    let body: z.infer<typeof PriceUnavailableBodySchema>;
+    let body: PriceUnavailableBody;
     try {
       body = PriceUnavailableBodySchema.parse(await c.req.json());
     } catch (err) {
@@ -10225,8 +10236,29 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     try {
       const nowIso = new Date().toISOString();
-      await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso });
+      await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso, force: true });
       return c.json({ ok: true, ticker, reason: body.reason, price_checked_at: nowIso });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  r.post('/securities/:ticker/enrichment-unavailable', async (c) => {
+    const rawTicker = c.req.param('ticker');
+    const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
+    if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
+      return c.json({ error: 'invalid ticker' }, 400);
+    }
+    let body: EnrichmentUnavailableBody;
+    try {
+      body = EnrichmentUnavailableBodySchema.parse(await c.req.json());
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await markTickerEnrichmentUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso, force: true });
+      return c.json({ ok: true, ticker, reason: body.reason, enrichment_checked_at: nowIso });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }
@@ -11364,12 +11396,14 @@ async function marketCoverage(env: Env): Promise<MarketCoverage> {
  */
 export async function marketPending(env: Env): Promise<{ enrich: number; prices: number }> {
   const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(env);
+  const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(env.DB);
   const e = await first<{ n: number }>(
     env.DB,
     `SELECT COUNT(*) AS n FROM (
        SELECT t.ticker FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
        WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+         AND ${enrichmentUnavailableExcludedSql('sr', { columnsPresent: has0104 })}
          AND ${enrichmentNeededSql('sr', retryIncomplete)}
        GROUP BY t.ticker)`,
   );
