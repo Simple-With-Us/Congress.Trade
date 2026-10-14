@@ -48,7 +48,7 @@ import {
   ShortVolumeRowSchema,
 } from '@jaywedgeworth22/congress-trading-shared';
 import type { Env, ParsedTx, PollConfig, PollWindow, TxType, TxSource, Subscription, DocKind, Chamber, Filing } from '../shared/types.ts';
-import { all, batch, batchPrepared, chunkArray, first, get, run, type SqlParam } from '../shared/db.ts';
+import { all, batch, batchPrepared, chunkArray, first, get, isSqliteLockBusy, run, type SqlParam } from '../shared/db.ts';
 import { checkReadiness } from '../shared/readiness.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
 import { listIngestionDecisions, recordIngestionDecision } from '../shared/ingestionDecisions.ts';
@@ -10265,6 +10265,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   });
 
   r.post('/securities/import', async (c) => {
+    try {
     // This endpoint runs inside a normal Worker request. Keep callers honest.
     // Paid Workers allow larger batches, but the cap remains configurable so
     // the app can be dialed back without code changes.
@@ -10727,6 +10728,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
 
     return c.json({ ok, ...summary, dropped });
+    } catch (err) {
+      if (isSqliteLockBusy(err)) {
+        return c.json({ error: 'database busy; retry import' }, 503);
+      }
+      console.error('peer import unhandled:', err);
+      return c.json({ error: (err as Error).message }, 500);
+    }
   });
 
   // --- POST /enrich-photos ------------------------------------------------

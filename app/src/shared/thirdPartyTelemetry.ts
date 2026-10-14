@@ -1556,8 +1556,14 @@ async function drainUsageTelemetryFallbackPage(
   let failed = 0;
   let expired = 0;
   let r2Removed = 0; // outbox objects deleted this cycle (delivered + expired + quarantined)
+  // Stay inside the usage_telemetry maintenance lane budget (8s default).  Each
+  // object can take multiple remote calls; stop early instead of timing out the
+  // whole tick (CONGRESS-TRADE-1S).
+  const drainStartedMs = Date.now();
+  const drainBudgetMs = 6_500;
   for (const object of listed.objects) {
     abortIfSignal(options.signal);
+    if (Date.now() - drainStartedMs > drainBudgetMs) break;
     if (object.uploaded && now - object.uploaded.getTime() > ttlMs) {
       try {
         await storage?.delete(object.key);
