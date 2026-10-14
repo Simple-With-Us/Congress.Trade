@@ -550,6 +550,61 @@ describe('third-party usage telemetry', () => {
     expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
   });
 
+  it('keeps the R2 cursor on the current page when the drain budget stops early', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T00:00:00.000Z'));
+    const keyA = '_ops/usage-telemetry/a.json';
+    const keyB = '_ops/usage-telemetry/b.json';
+    const eventA = { ...deliveryEvent, eventId: 'ct-third-party:budget-a' };
+    const eventB = { ...deliveryEvent, eventId: 'ct-third-party:budget-b' };
+    const fallback = fallbackBucket({
+      [keyA]: JSON.stringify(eventA),
+      [keyB]: JSON.stringify(eventB),
+    });
+    const cursors: Array<string | undefined> = [];
+    const list = vi.fn(async (opts?: { cursor?: string }) => {
+      cursors.push(opts?.cursor);
+      const keys = [keyA, keyB].filter((key) => fallback.objects.has(key));
+      return {
+        objects: keys.map((key) => ({ key, uploaded: new Date('2026-10-13T00:00:00.000Z') })),
+        truncated: true,
+        cursor: 'next-page',
+      };
+    });
+    const get = vi.fn(async (key: string) => {
+      if (key === keyA) vi.setSystemTime(new Date('2026-10-14T00:00:07.000Z'));
+      const value = fallback.objects.get(key);
+      return value == null ? null : { text: async () => value };
+    });
+    const { kv, store } = fakeConfigKv({
+      usage_telemetry_drain_cursor: JSON.stringify({ r2: 'start-cursor' }),
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(acceptedAck), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })));
+    const env = {
+      RAW_FILES: { ...fallback.bucket, list, get },
+      CONFIG_KV: kv,
+      USAGE_MONITOR_ENABLED: 'true',
+      USAGE_MONITOR_INGEST_URL: 'https://usage.jays.services/api/ingest/usage',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token',
+    } as unknown as Env;
+
+    const first = await flushUsageTelemetryFallback(env);
+    expect(first).toMatchObject({ delivered: 1 });
+    expect(fallback.objects.has(keyA)).toBe(false);
+    expect(fallback.objects.has(keyB)).toBe(true);
+    expect(store.get('usage_telemetry_drain_cursor')).toBe(JSON.stringify({ r2: 'start-cursor' }));
+    expect(get).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(new Date('2026-10-14T00:01:00.000Z'));
+    const second = await flushUsageTelemetryFallback(env);
+    expect(second).toMatchObject({ delivered: 1 });
+    expect(fallback.objects.has(keyB)).toBe(false);
+    expect(cursors).toEqual(['start-cursor', 'start-cursor']);
+  });
+
   it('ends the receiver deadline before slow quarantine storage', async () => {
     vi.useFakeTimers();
     const { kv } = fakeConfigKv();

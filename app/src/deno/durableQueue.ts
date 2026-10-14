@@ -841,12 +841,19 @@ async function failIngestQueueClaim(
 ): Promise<boolean> {
   const failed = await failClaim(env.DB, row, now, error);
   if (failed && queueName === "ingest" && message) {
-    await maybeAlertTerminalDurableIngestFailure(
+    // Do not block the bounded durable_queue cron lane on KV + webhook I/O per
+    // failed row (CONGRESS-TRADE-1T).  Alert asynchronously; drain continues.
+    void maybeAlertTerminalDurableIngestFailure(
       env,
       message,
       errorText(error),
       now,
-    );
+    ).catch((alertErr) => {
+      console.warn(
+        "terminal durable ingest alert failed:",
+        errorText(alertErr),
+      );
+    });
   }
   return failed;
 }
