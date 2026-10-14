@@ -100,7 +100,7 @@ jobs:
                       IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
             secret_project="$INFISICAL_PROJECT_ID"
             secret_path=/
-            if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID ]]; then
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
               secret_project="$ASC_INFISICAL_PROJECT_ID"
               secret_path=/asc
             fi
@@ -111,7 +111,7 @@ jobs:
                 2>/dev/null || true
             )"
             if [ -z "$val" ]; then
-              if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID ]]; then
+              if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
                 echo "::error::Missing $name in Fleet Secrets prod /asc; verify CI identity read access."
                 exit 1
               fi
@@ -125,7 +125,7 @@ jobs:
             printf -v "$name" '%s' "$val"
             export "$name"
             # Certificate credentials belong only to this load/import step.
-            if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID ]]; then
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
             fi
           done

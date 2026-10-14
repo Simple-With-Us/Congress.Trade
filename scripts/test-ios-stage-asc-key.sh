@@ -61,6 +61,11 @@ if ! grep -Fq 'scripts/ios-stage-asc-key.sh' "$workflow"; then
   echo 'workflow does not use the protected key-file handoff' >&2
   exit 1
 fi
+# RHS of [[ == ]] is a pattern unless quoted.  Keep secret names literal.
+if grep -E '== (ASC_KEY_ID|ASC_ISSUER_ID|SENTRY_DSN)([^"[:alnum:]_]|$)' "$workflow" >/dev/null; then
+  echo "unquoted secret-name comparison in [[ == ]]: $workflow" >&2
+  exit 1
+fi
 
 # Exercise the actual workflow run block using a fake Infisical CLI.
 # No Apple or Infisical credentials are used by this test.
@@ -85,12 +90,27 @@ cat > "$tmp_dir/bin/infisical" <<'CLI'
 case "${1:-}" in
   login) printf '%s\n' synthetic-session-token ;;
   secrets)
-    if [[ "${3:-}" == ASC_KEY_P8 ]]; then
+    secret_name="${3:-}"
+    project=""
+    secret_path_arg=""
+    for arg in "$@"; do
+      case "$arg" in
+        --projectId=*) project="${arg#--projectId=}" ;;
+        --path=*) secret_path_arg="${arg#--path=}" ;;
+      esac
+    done
+    if [[ -n "${ASC_TEST_FETCH_LOG:-}" ]]; then
+      printf '%s\t%s\t%s\n' "$secret_name" "$project" "$secret_path_arg" >> "$ASC_TEST_FETCH_LOG"
+    fi
+    if [[ ",${ASC_TEST_EMPTY_NAMES:-}," == *",$secret_name,"* ]]; then
+      exit 0
+    fi
+    if [[ "$secret_name" == ASC_KEY_P8 ]]; then
       cat "$ASC_TEST_FIXTURE"
-    elif [[ "${3:-}" == IOS_DIST_P12_BASE64 && "${ASC_TEST_MULTILINE_P12:-}" == 1 ]]; then
+    elif [[ "$secret_name" == IOS_DIST_P12_BASE64 && "${ASC_TEST_MULTILINE_P12:-}" == 1 ]]; then
       printf '%s\n' SYNTHETIC-P12-FIRST SYNTHETIC-P12-CONTINUATION
     else
-      printf 'synthetic-%s\n' "${3:-value}"
+      printf 'synthetic-%s\n' "$secret_name"
     fi
     ;;
   *) exit 1 ;;
@@ -98,6 +118,7 @@ esac
 CLI
 chmod 700 "$tmp_dir/bin/infisical"
 : > "$tmp_dir/workflow-env"
+: > "$tmp_dir/fetch-log"
 rm -f "$tmp_dir/imported" "$tmp_dir/unexpected-import"
 env -u ASC_KEY_P8 PATH="$tmp_dir/bin:$PATH" \
   GITHUB_WORKSPACE="$tmp_dir/workspace" GITHUB_ENV="$tmp_dir/workflow-env" \
@@ -106,6 +127,7 @@ env -u ASC_KEY_P8 PATH="$tmp_dir/bin:$PATH" \
   INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=synthetic-client \
   INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=synthetic-secret \
   ASC_TEST_FIXTURE="$tmp_dir/fixture" ASC_TEST_IMPORT_MARKER="$tmp_dir/imported" \
+  ASC_TEST_FETCH_LOG="$tmp_dir/fetch-log" \
   bash "$tmp_dir/workflow-load.sh" > "$tmp_dir/workflow-stdout" 2> "$tmp_dir/workflow-stderr"
 if grep -Fq -f "$tmp_dir/fixture" "$tmp_dir/workflow-env" "$tmp_dir/workflow-stdout" "$tmp_dir/workflow-stderr"; then
   echo 'workflow leaked multiline key material' >&2
@@ -121,6 +143,44 @@ if grep -q '^IOS_DIST_P12_' "$tmp_dir/workflow-env"; then
   echo 'certificate credentials escaped the import step' >&2
   exit 1
 fi
+expect_fetch() {
+  local name="$1" project="$2" path="$3" row
+  printf -v row '%s\t%s\t%s' "$name" "$project" "$path"
+  if ! grep -Fxq "$row" "$tmp_dir/fetch-log"; then
+    echo "unexpected Infisical route for $name in $workflow" >&2
+    exit 1
+  fi
+}
+expect_fetch ASC_KEY_ID synthetic-fleet /asc
+expect_fetch ASC_ISSUER_ID synthetic-fleet /asc
+expect_fetch ASC_KEY_P8 synthetic-fleet /asc
+expect_fetch IOS_DIST_P12_BASE64 synthetic-project /
+expect_fetch IOS_DIST_P12_PASSWORD synthetic-project /
+if grep -q 'for name in ASC_KEY_ID ASC_ISSUER_ID SENTRY_DSN' "$workflow"; then
+  expect_fetch SENTRY_DSN synthetic-project /
+  grep -q '^SENTRY_DSN=synthetic-SENTRY_DSN$' "$tmp_dir/workflow-env"
+fi
+grep -q '^ASC_KEY_ID=synthetic-ASC_KEY_ID$' "$tmp_dir/workflow-env"
+grep -q '^ASC_ISSUER_ID=synthetic-ASC_ISSUER_ID$' "$tmp_dir/workflow-env"
+
+# A missing Fleet ASC id must fail closed.  It must not continue into import.
+: > "$tmp_dir/missing-env"
+rm -f "$tmp_dir/missing-imported"
+if env -u ASC_KEY_P8 PATH="$tmp_dir/bin:$PATH" \
+  GITHUB_WORKSPACE="$tmp_dir/workspace" GITHUB_ENV="$tmp_dir/missing-env" \
+  INFISICAL_PROJECT_ID=synthetic-project \
+  ASC_INFISICAL_PROJECT_ID=synthetic-fleet \
+  INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=synthetic-client \
+  INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=synthetic-secret \
+  ASC_TEST_FIXTURE="$tmp_dir/fixture" ASC_TEST_IMPORT_MARKER="$tmp_dir/missing-imported" \
+  ASC_TEST_EMPTY_NAMES=ASC_KEY_ID \
+  bash "$tmp_dir/workflow-load.sh" \
+  > "$tmp_dir/missing-stdout" 2> "$tmp_dir/missing-stderr"; then
+  echo 'missing ASC_KEY_ID was accepted' >&2
+  exit 1
+fi
+grep -q 'Missing ASC_KEY_ID in Fleet Secrets prod /asc' "$tmp_dir/missing-stdout"
+[[ ! -e "$tmp_dir/missing-imported" ]]
 
 # Wrapped P12 text must fail before add-mask can print continuation lines.
 : > "$tmp_dir/multiline-env"

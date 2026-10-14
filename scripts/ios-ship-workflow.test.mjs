@@ -38,3 +38,17 @@ test("ios-ship.yml keeps the ship gate and never uses secrets in if", () => {
   assert.doesNotMatch(prepare, /echo "\$ASC_KEY_P8"/);
   assert.doesNotMatch(prepare, /echo "\$IOS_DIST_P12/);
 });
+
+test("ios ship workflows quote ASC name comparisons", () => {
+  for (const rel of [
+    ".github/workflows/ios-ship.yml",
+    ".github/workflows/ios-appstore-gm.yml",
+  ]) {
+    const yml = read(rel);
+    const quoted = yml.match(/\[\[ "\$name" == "ASC_KEY_ID" \|\| "\$name" == "ASC_ISSUER_ID" \]\]/g) || [];
+    assert.ok(quoted.length >= 2, `${rel} must quote both ASC routing checks`);
+    assert.doesNotMatch(yml, /== ASC_KEY_ID(?!")/);
+    assert.doesNotMatch(yml, /== ASC_ISSUER_ID(?!")/);
+    assert.doesNotMatch(yml, /== SENTRY_DSN(?!")/);
+  }
+});
