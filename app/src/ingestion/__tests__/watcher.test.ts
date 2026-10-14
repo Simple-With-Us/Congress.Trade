@@ -164,6 +164,43 @@ describe('runWatcher', () => {
     expect(mocks.fetchHouseIndex).not.toHaveBeenCalled();
   });
 
+  it('gives House, Senate, and OGE each a fresh I/O signal', async () => {
+    const { env } = fakeEnv();
+    const signals: AbortSignal[] = [];
+    mocks.fetchHouseIndex.mockImplementation(async (_year: number, opts: { signal?: AbortSignal }) => {
+      expect(opts.signal?.aborted).toBe(false);
+      signals.push(opts.signal!);
+      return [];
+    });
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    mocks.fetchSenatePtrFilings.mockImplementation(async (opts: { signal?: AbortSignal }) => {
+      expect(opts.signal?.aborted).toBe(false);
+      signals.push(opts.signal!);
+      return [];
+    });
+    mocks.pollOgeExecutive.mockImplementation(async (
+      _env: unknown,
+      _now: unknown,
+      _fetchImpl: unknown,
+      opts: { signal?: AbortSignal },
+    ) => {
+      expect(opts.signal?.aborted).toBe(false);
+      signals.push(opts.signal!);
+      return [];
+    });
+
+    const result = await runWatcher(env, new Date('2026-07-04T15:00:00.000Z'));
+
+    expect(result).toMatchObject({ house: 'success', senate: 'success', executive: 'success' });
+    expect(signals).toHaveLength(3);
+    expect(new Set(signals).size).toBe(3);
+    expect(mocks.pollHouseLiveSearch).toHaveBeenCalledWith(
+      2026,
+      expect.any(Function),
+      expect.objectContaining({ signal: signals[0] }),
+    );
+  });
+
   it('threads the tick signal into active source I/O and aborts without recording a failure', async () => {
     const { env, dbRuns } = fakeEnv();
     const controller = new AbortController();

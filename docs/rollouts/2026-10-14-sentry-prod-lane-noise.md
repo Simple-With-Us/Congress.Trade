@@ -17,9 +17,13 @@ slow upstream cannot consume the entire 22s watcher lane (CONGRESS-TRADE-1V).
 
 ## Verification
 
-```bash
-cd app && npm run typecheck && npm test
-```
+Repo gate is `npm run typecheck` (`deno check src/deno/main.ts`) and `npm test` (vitest), from `app/`.  Recorded 2026-10-14 after merging `origin/main`:
+
+- `cd app && npm run typecheck` -> ok
+- `cd app && npm test` -> ok (347 files, 4467 tests)
+- `cd app && npm run lint` -> fail (471 pre-existing `deno lint` findings; none on the lines this change adds)
+- `cd app && npx tsc --noEmit` -> fail (no `tsconfig.json` in `app/`; Deno is the typecheck gate)
+- `cd app && npm run build` -> fail (no `build` script; Coolify runs the Deno app)
 
 ## Follow-ups
 

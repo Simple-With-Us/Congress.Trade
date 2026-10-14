@@ -26,6 +26,7 @@ import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
 import {
   clearCronTickOverrun,
+  isDenoCronTickHardDeadline,
   recordCronTickOverrun,
   tickOutcomeShouldRecord,
 } from '../shared/cronDeadlineSignal.ts';
@@ -396,7 +397,7 @@ if (!costProfile.disableInternalCron) {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const hardDeadline = /exceeded \d+ms deadline/.test(message);
+      const hardDeadline = isDenoCronTickHardDeadline(message);
       if (hardDeadline) {
         // Soft abort already stopped new work; the hard race is expected when a
         // lane ignores the tick signal (CONGRESS-TRADE-1B).  Overrun KV + logs

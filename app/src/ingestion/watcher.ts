@@ -1021,7 +1021,6 @@ export async function runWatcher(
   options: { signal?: AbortSignal } = {},
 ): Promise<WatcherResult> {
   throwIfWatcherAborted(options.signal);
-  const sourceSignal = watcherSourceIoSignal(options.signal);
   const cfg = await getConfig(env);
   const schedule = scheduleConfigFor(env);
   const result: WatcherResult = { house: 'skipped', senate: 'skipped', executive: 'skipped' };
@@ -1060,7 +1059,9 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'house', now);
-        await pollHouse(env, now, sourceSignal);
+        // Fresh 7s budget per source.  A timer created once at tick entry
+        // would already be spent by the time Senate and OGE run.
+        await pollHouse(env, now, watcherSourceIoSignal(options.signal));
         result.house = 'success';
       }
     }
@@ -1105,7 +1106,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'senate', now);
-        await pollSenate(env, now, sourceSignal);
+        await pollSenate(env, now, watcherSourceIoSignal(options.signal));
         result.senate = 'success';
       }
     }
@@ -1157,7 +1158,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'oge', now);
-        const polled = await pollExecutive(env, now, { signal: sourceSignal });
+        const polled = await pollExecutive(env, now, { signal: watcherSourceIoSignal(options.signal) });
         if (polled !== null) result.executive = 'success';
       }
     }

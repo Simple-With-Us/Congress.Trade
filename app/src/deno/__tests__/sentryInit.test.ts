@@ -262,6 +262,8 @@ describe('production entry wiring', () => {
     expect(src).toContain('initProductionSentry');
     expect(src).toContain('flushSentry');
     expect(src).toContain('captureException(err, { tags: { cron: \'deno-tick\' } })');
+    expect(src).toContain('isDenoCronTickHardDeadline(message)');
+    expect(src).not.toContain('/exceeded \\d+ms deadline/');
     expect(src).toContain('isExpectedPdfParseNoise');
     expect(src).toContain('sentryLoggerWarn');
     expect(src).not.toContain('sentryDummy');
