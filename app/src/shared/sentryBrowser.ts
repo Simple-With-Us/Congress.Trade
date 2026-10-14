@@ -11,6 +11,7 @@
  */
 
 import { readBuildInfo } from './buildInfo.ts';
+import { SENTRY_BROWSER_IGNORE_ERRORS } from './sentryNoise.ts';
 
 export const SENTRY_BROWSER_SCRIPT_ORIGIN = 'https://browser.sentry-cdn.com';
 export const SENTRY_BROWSER_BUNDLE =
@@ -105,6 +106,7 @@ export function renderSentryBrowserScript(env: SentryBrowserInput | undefined): 
     replaysSessionSampleRate: resolved.replaysSessionSampleRate,
     replaysOnErrorSampleRate: resolved.replaysOnErrorSampleRate,
     enableLogs: true,
+    ignoreErrors: SENTRY_BROWSER_IGNORE_ERRORS,
     ...(resolved.release ? { release: resolved.release } : {}),
   };
   const integrations: string[] = [

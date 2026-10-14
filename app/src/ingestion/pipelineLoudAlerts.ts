@@ -652,11 +652,9 @@ async function processStallCondition(
   if (!evalResult.stalled) {
     if (episode?.active) {
       const recoveredDetail = evalResult.detail || `${condition} cleared`;
-      try {
-        captureMessage(`Pipeline stall recovered: ${condition} — ${recoveredDetail}`, 'info');
-      } catch {
-        /* fail-soft */
-      }
+      // Recovery is published via notifyPipelineStallPublisher; Sentry info
+      // messages created noisy issues (CONGRESS-TRADE-1Q).
+      console.info(`Pipeline stall recovered: ${condition} — ${recoveredDetail}`);
       await notifyPipelineStallPublisher(
         env,
         { pipeline: condition, detail: recoveredDetail, recovered: true, at: now.toISOString() },

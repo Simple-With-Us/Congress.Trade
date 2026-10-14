@@ -26,6 +26,7 @@ import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
 import {
   clearCronTickOverrun,
+  isDenoCronTickHardDeadline,
   recordCronTickOverrun,
   tickOutcomeShouldRecord,
 } from '../shared/cronDeadlineSignal.ts';
@@ -395,10 +396,18 @@ if (!costProfile.disableInternalCron) {
         if (hardTimeoutId !== undefined) clearTimeout(hardTimeoutId);
       }
     } catch (err) {
-      console.error('Deno cron tick caught error:', err);
-      captureException(err, { tags: { cron: 'deno-tick' } });
-      datadogCaptureException(err, { cron: 'deno-tick' });
       const message = err instanceof Error ? err.message : String(err);
+      const hardDeadline = isDenoCronTickHardDeadline(message);
+      if (hardDeadline) {
+        // Soft abort already stopped new work; the hard race is expected when a
+        // lane ignores the tick signal (CONGRESS-TRADE-1B).  Overrun KV + logs
+        // are enough — avoid a second Sentry exception on top of lane alerts.
+        console.warn('Deno cron tick hard deadline:', message);
+      } else {
+        console.error('Deno cron tick caught error:', err);
+        captureException(err, { tags: { cron: 'deno-tick' } });
+        datadogCaptureException(err, { cron: 'deno-tick' });
+      }
       try {
         await recordCronTickOverrun(buildEnv(), {
           deadlineMs: settings.getInt('CT_TICK_DEADLINE_MS', 45_000),

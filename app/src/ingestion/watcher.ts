@@ -43,6 +43,7 @@ import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { pollOgeExecutive } from './ogeSource.ts';
+import { watcherSourceIoSignal } from './watcherSourceIo.ts';
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 
@@ -1058,7 +1059,9 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'house', now);
-        await pollHouse(env, now, options.signal);
+        // Fresh 7s budget per source.  A timer created once at tick entry
+        // would already be spent by the time Senate and OGE run.
+        await pollHouse(env, now, watcherSourceIoSignal(options.signal));
         result.house = 'success';
       }
     }
@@ -1103,7 +1106,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'senate', now);
-        await pollSenate(env, now, options.signal);
+        await pollSenate(env, now, watcherSourceIoSignal(options.signal));
         result.senate = 'success';
       }
     }
@@ -1155,7 +1158,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'oge', now);
-        const polled = await pollExecutive(env, now, { signal: options.signal });
+        const polled = await pollExecutive(env, now, { signal: watcherSourceIoSignal(options.signal) });
         if (polled !== null) result.executive = 'success';
       }
     }

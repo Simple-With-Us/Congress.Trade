@@ -39,6 +39,8 @@ describe('sentry browser loader', () => {
     expect(html).toContain('window.openSentryFeedback=window.openSentryFeedback||function');
     expect(html).toContain('maskAllText:true');
     expect(html).toContain('"enableLogs":true');
+    expect(html).toContain('ignoreErrors');
+    expect(html).toContain('Unexpected end of input');
     expect(html).toContain('consoleLoggingIntegration');
     expect(html).not.toContain('"release"');
   });
