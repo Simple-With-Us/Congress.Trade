@@ -43,10 +43,11 @@ jobs:
           echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
 
 
-      # Identity stays on GitHub.  Apple/iOS signing material comes from Infisical prod.
+      # Identity stays on GitHub. ASC uses Fleet Secrets prod /asc; certificates stay in CT prod /.
       - name: Load Infisical signing secrets
         env:
           INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          ASC_INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
           INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID }}
           INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
@@ -97,13 +98,23 @@ jobs:
 
           for name in ASC_KEY_ID ASC_ISSUER_ID \
                       IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
+            secret_project="$INFISICAL_PROJECT_ID"
+            secret_path=/
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
+              secret_project="$ASC_INFISICAL_PROJECT_ID"
+              secret_path=/asc
+            fi
             val="$(
               INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
                 --plain --silent --telemetry=false --expand=false \
-                --projectId="$INFISICAL_PROJECT_ID" --env=prod --path=/ \
+                --projectId="$secret_project" --env=prod --path="$secret_path" \
                 2>/dev/null || true
             )"
             if [ -z "$val" ]; then
+              if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
+                echo "::error::Missing $name in Fleet Secrets prod /asc; verify CI identity read access."
+                exit 1
+              fi
               continue
             fi
             if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
@@ -114,7 +125,7 @@ jobs:
             printf -v "$name" '%s' "$val"
             export "$name"
             # Certificate credentials belong only to this load/import step.
-            if [[ "$name" == ASC_KEY_ID || "$name" == ASC_ISSUER_ID ]]; then
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
             fi
           done
@@ -123,18 +134,18 @@ jobs:
           key_material="$(
             INFISICAL_TOKEN="$TOKEN" infisical secrets get ASC_KEY_P8 \
               --plain --silent --telemetry=false --expand=false \
-              --projectId="$INFISICAL_PROJECT_ID" --env=prod --path=/ \
+              --projectId="$ASC_INFISICAL_PROJECT_ID" --env=prod --path=/asc \
               2>/dev/null || true
           )"
           if [ -z "$key_material" ]; then
-            echo "::error::Missing ASC key material in Infisical prod."
+            echo "::error::Missing ASC key material in Fleet Secrets prod /asc; verify CI identity read access."
             exit 1
           fi
           printf '%s\n' "$key_material" | bash "$GITHUB_WORKSPACE/scripts/ios-stage-asc-key.sh"
           ASC_KEY_PATH="$(sed -n 's/^ASC_KEY_PATH=//p' "$GITHUB_ENV" | tail -n 1)"
           export ASC_KEY_PATH
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
-          unset key_material TOKEN CLIENT_ID CLIENT_SECRET val IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
+          unset key_material TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
       - name: Ship CongressTrade from GM host
         run: |
