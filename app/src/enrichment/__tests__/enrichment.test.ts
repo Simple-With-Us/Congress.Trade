@@ -12,8 +12,14 @@ import { parseCompanyTickers, parseSecSubmissions, padCik, buildSecProvider } fr
 import {
   enrichmentNeededSql,
   enrichmentChainNames,
+  enrichmentUnavailableExcludedSql,
+  enrichmentProgressTimestampSql,
   hasConfiguredKeyedEnrichmentProvider,
+  markTickerEnrichmentUnavailable,
+  resetSecuritiesRefEnrichmentSchemaCacheForTests,
+  securitiesRefHasEnrichmentUnavailableColumns,
   runEnrichment,
+  selectTickersToEnrich,
   parseTransientRetryMarker,
   transientRetryEligible,
   nextTransientRetryMarker,
@@ -23,7 +29,8 @@ import {
 } from '../service.ts';
 import { buildSocraticProvider, peerProfileSymbol, SOCRATIC_PROFILE_PATH } from '../socratic.ts';
 import { __resetSharedEdgarPacerForTests } from '../../shared/pace.ts';
-import { openMigratedD1 } from '../../prices/__tests__/sqliteD1.ts';
+import { openMigratedD1, openMigratedD1Before0104 } from '../../prices/__tests__/sqliteD1.ts';
+import type { Env } from '../../shared/types.ts';
 
 describe('marketCapBucket', () => {
   it('buckets by the standard thresholds', () => {
@@ -714,6 +721,67 @@ describe('runEnrichment — slash alias, tombstone retry, non-equity', () => {
       await runEnrichment(peerEnv(d1), { max: 10 });
       const row = db.prepare('SELECT enrichment_error FROM securities_ref WHERE ticker = ?').get('AAPL');
       expect(row?.enrichment_error).toBe(NO_PROVIDER_DATA_ERROR);
+    } finally {
+      close();
+    }
+  });
+});
+
+describe('enrichment 0104 schema fallbacks', () => {
+  afterEach(() => {
+    resetSecuritiesRefEnrichmentSchemaCacheForTests();
+  });
+
+  it('rejects unsafe SQL aliases in enrichmentUnavailableExcludedSql', () => {
+    expect(() => enrichmentUnavailableExcludedSql('sr; DROP TABLE')).toThrow(/Invalid SQL alias/);
+  });
+
+  it('uses a no-op unavailable filter before migration 0104', () => {
+    expect(enrichmentUnavailableExcludedSql('sr', { columnsPresent: false })).toBe('1=1');
+    expect(enrichmentProgressTimestampSql('sr', false)).toBe('sr.enriched_at');
+    expect(enrichmentProgressTimestampSql('sr', true)).toBe('sr.enrichment_checked_at');
+  });
+
+  it('caches PRAGMA 0104 detection per DB binding', async () => {
+    resetSecuritiesRefEnrichmentSchemaCacheForTests();
+    const migrated = await openMigratedD1();
+    const pre0104 = await openMigratedD1Before0104();
+    try {
+      expect(await securitiesRefHasEnrichmentUnavailableColumns(migrated.d1)).toBe(true);
+      expect(await securitiesRefHasEnrichmentUnavailableColumns(pre0104.d1)).toBe(false);
+      expect(await securitiesRefHasEnrichmentUnavailableColumns(migrated.d1)).toBe(true);
+    } finally {
+      migrated.close();
+      pre0104.close();
+    }
+  });
+
+  it('selectTickersToEnrich runs without enrichment_unavailable columns', async () => {
+    const { db, d1, close } = await openMigratedD1Before0104();
+    try {
+      db.prepare(
+        `INSERT INTO transactions (id, ticker, tx_date, source, created_at, cursor_seq)
+         VALUES ('tx-pre', 'PRE0104', '2026-01-05', 'primary', '2026-01-05T00:00:00Z', 1)`,
+      ).run();
+      const env = { DB: d1 } as Env;
+      const rows = await selectTickersToEnrich(env, 5, false);
+      expect(rows.map((r) => r.ticker)).toContain('PRE0104');
+    } finally {
+      close();
+    }
+  });
+
+  it('markTickerEnrichmentUnavailable is a no-op before migration 0104', async () => {
+    const { db, d1, close } = await openMigratedD1Before0104();
+    try {
+      db.prepare(`INSERT INTO securities_ref (ticker, source) VALUES ('JUNK', 'socratic')`).run();
+      const env = { DB: d1 } as Env;
+      await markTickerEnrichmentUnavailable(env, 'JUNK', 'operator_junk_symbol', { force: true });
+      const row = db.prepare('SELECT ticker FROM securities_ref WHERE ticker = ?').get('JUNK');
+      expect(row).toBeTruthy();
+      expect(() =>
+        db.prepare('SELECT enrichment_unavailable FROM securities_ref WHERE ticker = ?').get('JUNK'),
+      ).toThrow();
     } finally {
       close();
     }

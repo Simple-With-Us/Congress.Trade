@@ -1,32 +1,13 @@
 /**
- * Detect migration 0104 enrichment columns on securities_ref (cached per isolate).
+ * Thin helpers for stall SQL modules (schema probe lives in service.ts).
  */
 
 import type { Env } from '../shared/types.ts';
-import { get } from '../shared/db.ts';
-
-let enrichment0104ColumnsReady: boolean | null = null;
-
-/** True when enrichment_unavailable / enrichment_checked_at / reason columns exist. */
-export async function hasEnrichment0104Columns(db: D1Database): Promise<boolean> {
-  if (enrichment0104ColumnsReady !== null) return enrichment0104ColumnsReady;
-  try {
-    const row = await get<{ ok: number }>(
-      db,
-      `SELECT 1 AS ok FROM pragma_table_info('securities_ref')
-        WHERE name = 'enrichment_unavailable' LIMIT 1`,
-    );
-    enrichment0104ColumnsReady = row?.ok === 1;
-  } catch {
-    enrichment0104ColumnsReady = false;
-  }
-  return enrichment0104ColumnsReady;
-}
-
-/** Reset probe cache (tests only). */
-export function resetEnrichment0104ColumnsCache(): void {
-  enrichment0104ColumnsReady = null;
-}
+import {
+  enrichmentUnavailableExcludedSql,
+  resetSecuritiesRefEnrichmentSchemaCacheForTests,
+  securitiesRefHasEnrichmentUnavailableColumns,
+} from './service.ts';
 
 /** Pending-selector / stall SQL when 0104 columns are present (alias `sr`). */
 export const ENRICHMENT_UNAVAILABLE_EXCLUDED_SR_SQL =
@@ -35,12 +16,21 @@ export const ENRICHMENT_UNAVAILABLE_EXCLUDED_SR_SQL =
 /** No-op filter when 0104 columns are not migrated yet. */
 export const ENRICHMENT_UNAVAILABLE_EXCLUDED_LEGACY_SQL = '(1=1)';
 
+/** True when enrichment_unavailable / enrichment_checked_at / reason columns exist. */
+export async function hasEnrichment0104Columns(db: D1Database): Promise<boolean> {
+  return securitiesRefHasEnrichmentUnavailableColumns(db as Env['DB']);
+}
+
+/** Reset probe cache (tests only). */
+export function resetEnrichment0104ColumnsCache(): void {
+  resetSecuritiesRefEnrichmentSchemaCacheForTests();
+}
+
 export async function enrichmentUnavailableExcludedSqlForDb(
   db: D1Database,
 ): Promise<string> {
-  return (await hasEnrichment0104Columns(db))
-    ? ENRICHMENT_UNAVAILABLE_EXCLUDED_SR_SQL
-    : ENRICHMENT_UNAVAILABLE_EXCLUDED_LEGACY_SQL;
+  const columnsPresent = await securitiesRefHasEnrichmentUnavailableColumns(db as Env['DB']);
+  return enrichmentUnavailableExcludedSql('sr', { columnsPresent });
 }
 
 export async function enrichmentUnavailableExcludedSqlForEnv(env: Env): Promise<string> {

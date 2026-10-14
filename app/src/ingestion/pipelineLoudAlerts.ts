@@ -17,8 +17,10 @@ import {
 } from './reviewQueueNotify.ts';
 import { captureException, captureMessage } from '../deno/sentry.ts';
 import { ogeWatchEnabled } from './ogeSource.ts';
-import { hasConfiguredKeyedEnrichmentProvider } from '../enrichment/service.ts';
-import { hasEnrichment0104Columns } from '../enrichment/securitiesRefEnrichmentSchema.ts';
+import {
+  hasConfiguredKeyedEnrichmentProvider,
+  securitiesRefHasEnrichmentUnavailableColumns,
+} from '../enrichment/service.ts';
 import {
   ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_LEGACY,
   ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_MODERN,
@@ -452,7 +454,7 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   let pending = 0;
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
-  const modern0104 = await hasEnrichment0104Columns(env.DB);
+  const modern0104 = await securitiesRefHasEnrichmentUnavailableColumns(env.DB);
   const countSql = modern0104
     ? ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_MODERN
     : ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_LEGACY;

@@ -53,11 +53,15 @@ async function sqliteDatabase(): Promise<SqliteDatabase> {
   return new sqlite.DatabaseSync(':memory:');
 }
 
-function applyMigrationFiles(db: SqliteDatabase): void {
-  const files = readdirSync(migrationsUrl as unknown as string)
+function migrationSqlFiles(beforeExclusive?: string): string[] {
+  return readdirSync(migrationsUrl as unknown as string)
     .filter((name: string) => name.endsWith('.sql'))
-    .sort();
-  for (const name of files) {
+    .sort()
+    .filter((name) => !beforeExclusive || name.localeCompare(beforeExclusive) < 0);
+}
+
+function applyMigrationFiles(db: SqliteDatabase, beforeExclusive?: string): void {
+  for (const name of migrationSqlFiles(beforeExclusive)) {
     db.exec(readFileSync(new URL(name, migrationsUrl) as unknown as string, 'utf8'));
   }
 }
@@ -109,5 +113,16 @@ export async function openMigratedD1(): Promise<{
 }> {
   const db = await sqliteDatabase();
   applyMigrationFiles(db);
+  return { db, d1: d1Database(db), close: () => db.close() };
+}
+
+/** Open a DB with migrations strictly before 0104 (pre enrichment_unavailable columns). */
+export async function openMigratedD1Before0104(): Promise<{
+  db: SqliteDatabase;
+  d1: D1Database;
+  close: () => void;
+}> {
+  const db = await sqliteDatabase();
+  applyMigrationFiles(db, '0104_enrichment_unavailable.sql');
   return { db, d1: d1Database(db), close: () => db.close() };
 }

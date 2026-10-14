@@ -46,7 +46,7 @@ describe('securitiesRefEnrichmentSchema', () => {
   it('falls back when 0104 columns are absent', async () => {
     const opened = await openPre0104D1();
     expect(await hasEnrichment0104Columns(opened.d1)).toBe(false);
-    expect(await enrichmentUnavailableExcludedSqlForDb(opened.d1)).toBe('(1=1)');
+    expect(await enrichmentUnavailableExcludedSqlForDb(opened.d1)).toBe('1=1');
     opened.close();
   });
 
