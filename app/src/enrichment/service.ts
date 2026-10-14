@@ -15,10 +15,11 @@
 
 import type { Env } from '../shared/types.ts';
 import { all, run } from '../shared/db.ts';
+import { tickerHasNonCompetitorFixtureTrade } from '../shared/competitorFixtures.ts';
 import {
-  excludeCompetitorFixtureTransactionSql,
-  tickerHasNonCompetitorFixtureTrade,
-} from '../shared/competitorFixtures.ts';
+  enrichmentUnavailableExcludedSqlForDb,
+  hasEnrichment0104Columns,
+} from './securitiesRefEnrichmentSchema.ts';
 import type { SqlParam } from '../shared/db.ts';
 import { mergeRefs } from './compute.ts';
 import { buildSecProvider } from './sec.ts';
@@ -111,6 +112,17 @@ export async function markTickerEnrichmentUnavailable(
   if (!opts.force && !(await tickerHasNonCompetitorFixtureTrade(env, sym))) return;
   const nowIso = opts.checkedAt ?? new Date().toISOString();
   const reasonText = normalizeEnrichmentUnavailableReason(reason);
+  if (!(await hasEnrichment0104Columns(env.DB))) {
+    await run(
+      env.DB,
+      `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error) VALUES (?, ?, ?)
+       ON CONFLICT(ticker) DO UPDATE SET
+         enriched_at = excluded.enriched_at,
+         enrichment_error = excluded.enrichment_error`,
+      [sym, nowIso, reasonText],
+    );
+    return;
+  }
   await run(
     env.DB,
     `INSERT INTO securities_ref (ticker, enrichment_unavailable, enrichment_checked_at, enrichment_unavailable_reason)
@@ -270,6 +282,9 @@ export function enrichmentNeededSql(alias = 'sr', retryIncompleteWithKeyedProvid
           OR ${tickerShapedTombstoneRetrySql(alias)})`;
 }
 
+/** Keyed-provider enrichment predicate with alias `sr` (static export for stall SQL). */
+export const KEYED_ENRICHMENT_NEEDED_SR_SQL = enrichmentNeededSql('sr', true);
+
 /**
  * Whether Socratic.Trade is configured to fill display-critical company fields.
  * Direct vendor keys (FMP, Massive, Tiingo, …) do not count: they are not on
@@ -361,6 +376,8 @@ export async function selectTickersToEnrich(
   retryIncompleteWithKeyedProvider = false,
 ): Promise<EnrichCandidate[]> {
   if (limit <= 0) return [];
+  const unavailableSql = await enrichmentUnavailableExcludedSqlForDb(env.DB);
+  const neededSql = enrichmentNeededSql('sr', retryIncompleteWithKeyedProvider);
   const rows = await all<{ ticker: string; enrichment_error: string | null; asset_name: string | null }>(
     env.DB,
     `SELECT t.ticker AS ticker,
@@ -370,9 +387,9 @@ export async function selectTickersToEnrich(
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> ''
         AND t.deprecated_at IS NULL
-        AND ${excludeCompetitorFixtureTransactionSql('t')}
-        AND ${enrichmentUnavailableExcludedSql('sr')}
-        AND ${enrichmentNeededSql('sr', retryIncompleteWithKeyedProvider)}
+        AND (t.doc_id IS NULL OR t.doc_id NOT LIKE 'COMPETITOR-%')
+        AND ${unavailableSql}
+        AND ${neededSql}
       GROUP BY t.ticker
       ORDER BY MAX(t.cursor_seq) DESC
       LIMIT ?`,
@@ -611,15 +628,15 @@ export async function importSecurityRef(env: Env, ref: SecurityRef): Promise<voi
 }
 
 async function upsertRef(env: Env, ref: SecurityRef): Promise<void> {
-  await run(
-    env.DB,
-    `INSERT INTO securities_ref (
-       ticker, company_name, sector, industry, asset_class, is_etf, is_adr,
-       country, state_hq, state_of_incorp, exchange, exchange_short, currency,
-       market_cap, market_cap_bucket, shares_outstanding, ipo_date, cik, sic_code, sic_description,
-       source, enriched_at, enrichment_error, enrichment_checked_at
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
-     ON CONFLICT(ticker) DO UPDATE SET
+  const nowIso = new Date().toISOString();
+  const refBindings = [
+    ref.ticker, ref.companyName, ref.sector, ref.industry, ref.assetClass,
+    ref.isEtf ? 1 : 0, ref.isAdr ? 1 : 0, ref.country, ref.stateHq, ref.stateOfIncorp,
+    ref.exchange, ref.exchangeShort, ref.currency, ref.marketCap, ref.marketCapBucket,
+    ref.sharesOutstanding ?? null, ref.ipoDate, ref.cik, ref.sicCode, ref.sicDescription, ref.source,
+    nowIso,
+  ];
+  const refUpdateTail = `
        company_name=COALESCE(excluded.company_name, securities_ref.company_name),
        sector=COALESCE(excluded.sector, securities_ref.sector),
        industry=COALESCE(excluded.industry, securities_ref.industry),
@@ -646,18 +663,36 @@ async function upsertRef(env: Env, ref: SecurityRef): Promise<void> {
          ELSE securities_ref.source || '+' || excluded.source
        END,
        enriched_at=excluded.enriched_at,
-       enrichment_error=NULL,
+       enrichment_error=NULL`;
+  if (await hasEnrichment0104Columns(env.DB)) {
+    await run(
+      env.DB,
+      `INSERT INTO securities_ref (
+         ticker, company_name, sector, industry, asset_class, is_etf, is_adr,
+         country, state_hq, state_of_incorp, exchange, exchange_short, currency,
+         market_cap, market_cap_bucket, shares_outstanding, ipo_date, cik, sic_code, sic_description,
+         source, enriched_at, enrichment_error, enrichment_checked_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+       ON CONFLICT(ticker) DO UPDATE SET
+       ${refUpdateTail},
        enrichment_checked_at=excluded.enrichment_checked_at,
        enrichment_unavailable=0,
        enrichment_unavailable_reason=NULL`,
-    [
-      ref.ticker, ref.companyName, ref.sector, ref.industry, ref.assetClass,
-      ref.isEtf ? 1 : 0, ref.isAdr ? 1 : 0, ref.country, ref.stateHq, ref.stateOfIncorp,
-      ref.exchange, ref.exchangeShort, ref.currency, ref.marketCap, ref.marketCapBucket,
-      ref.sharesOutstanding ?? null, ref.ipoDate, ref.cik, ref.sicCode, ref.sicDescription, ref.source,
-      new Date().toISOString(),
-      new Date().toISOString(),
-    ],
+      [...refBindings, nowIso],
+    );
+    return;
+  }
+  await run(
+    env.DB,
+    `INSERT INTO securities_ref (
+       ticker, company_name, sector, industry, asset_class, is_etf, is_adr,
+       country, state_hq, state_of_incorp, exchange, exchange_short, currency,
+       market_cap, market_cap_bucket, shares_outstanding, ipo_date, cik, sic_code, sic_description,
+       source, enriched_at, enrichment_error
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+     ON CONFLICT(ticker) DO UPDATE SET
+     ${refUpdateTail}`,
+    refBindings,
   );
 }
 
@@ -670,35 +705,48 @@ async function upsertEmpty(env: Env, ticker: string, err: string, recordPeerAtte
   const unavailableReason = recordPeerAttempt
     ? (err === NOT_AN_EQUITY_ERROR ? err : ENRICHMENT_UNAVAILABLE_REASON_PEER_NO_PROFILE)
     : null;
-  await run(
-    env.DB,
-    `INSERT INTO securities_ref (
-       ticker, enriched_at, enrichment_error, source,
-       enrichment_checked_at, enrichment_unavailable, enrichment_unavailable_reason
-     ) VALUES (?,?,?,?,?,?,?)
-     ON CONFLICT(ticker) DO UPDATE SET
-       enriched_at=excluded.enriched_at,
-       enrichment_error=excluded.enrichment_error,
-       enrichment_checked_at=excluded.enrichment_checked_at,
-       enrichment_unavailable=CASE WHEN ? IS NOT NULL THEN 1 ELSE securities_ref.enrichment_unavailable END,
-       enrichment_unavailable_reason=COALESCE(excluded.enrichment_unavailable_reason, securities_ref.enrichment_unavailable_reason),
-       source=CASE
+  const sourceCase = `source=CASE
          WHEN ? = 0 THEN securities_ref.source
          WHEN securities_ref.source IS NULL OR securities_ref.source = '' THEN excluded.source
          WHEN securities_ref.source LIKE '%socratic%' THEN securities_ref.source
          ELSE securities_ref.source || '+socratic'
-       END`,
-    [
-      ticker,
-      nowIso,
-      err,
-      peerSource,
-      nowIso,
-      recordPeerAttempt ? 1 : 0,
-      unavailableReason,
-      unavailableReason,
-      recordPeerAttempt ? 1 : 0,
-    ],
+       END`;
+  if (await hasEnrichment0104Columns(env.DB)) {
+    await run(
+      env.DB,
+      `INSERT INTO securities_ref (
+         ticker, enriched_at, enrichment_error, source,
+         enrichment_checked_at, enrichment_unavailable, enrichment_unavailable_reason
+       ) VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(ticker) DO UPDATE SET
+         enriched_at=excluded.enriched_at,
+         enrichment_error=excluded.enrichment_error,
+         enrichment_checked_at=excluded.enrichment_checked_at,
+         enrichment_unavailable=CASE WHEN ? IS NOT NULL THEN 1 ELSE securities_ref.enrichment_unavailable END,
+         enrichment_unavailable_reason=COALESCE(excluded.enrichment_unavailable_reason, securities_ref.enrichment_unavailable_reason),
+         ${sourceCase}`,
+      [
+        ticker,
+        nowIso,
+        err,
+        peerSource,
+        nowIso,
+        recordPeerAttempt ? 1 : 0,
+        unavailableReason,
+        unavailableReason,
+        recordPeerAttempt ? 1 : 0,
+      ],
+    );
+    return;
+  }
+  await run(
+    env.DB,
+    `INSERT INTO securities_ref (ticker, enriched_at, enrichment_error, source) VALUES (?,?,?,?)
+     ON CONFLICT(ticker) DO UPDATE SET
+       enriched_at=excluded.enriched_at,
+       enrichment_error=excluded.enrichment_error,
+       ${sourceCase}`,
+    [ticker, nowIso, err, peerSource, recordPeerAttempt ? 1 : 0],
   );
 }
 

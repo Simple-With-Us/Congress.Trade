@@ -17,12 +17,16 @@ import {
 } from './reviewQueueNotify.ts';
 import { captureException, captureMessage } from '../deno/sentry.ts';
 import { ogeWatchEnabled } from './ogeSource.ts';
+import { hasConfiguredKeyedEnrichmentProvider } from '../enrichment/service.ts';
+import { hasEnrichment0104Columns } from '../enrichment/securitiesRefEnrichmentSchema.ts';
 import {
-  enrichmentNeededSql,
-  enrichmentUnavailableExcludedSql,
-  hasConfiguredKeyedEnrichmentProvider,
-} from '../enrichment/service.ts';
-import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
+  ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_LEGACY,
+  ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_MODERN,
+  ST_PEER_ENRICHMENT_PENDING_SAMPLE_SQL_LEGACY,
+  ST_PEER_ENRICHMENT_PENDING_SAMPLE_SQL_MODERN,
+  ST_PEER_PRICE_PENDING_COUNT_SQL,
+  ST_PEER_PRICE_PENDING_SAMPLE_SQL,
+} from './stPeerStallSql.ts';
 import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
@@ -441,19 +445,6 @@ async function evaluateChamberFetchStall(
   return { stalled: true, detail };
 }
 
-function buildStPeerEnrichmentPendingSql(retryIncomplete: boolean): string {
-  const needed = enrichmentNeededSql('sr', retryIncomplete);
-  const unavailable = enrichmentUnavailableExcludedSql('sr');
-  return `
-  FROM transactions t
-  LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
- WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
-   AND t.deprecated_at IS NULL
-   AND ${excludeCompetitorFixtureTransactionSql('t')}
-   AND ${unavailable}
-   AND ${needed}`;
-}
-
 async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST peer enrichment not configured', skip: true };
@@ -461,15 +452,16 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   let pending = 0;
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
-  let pendingSql = '';
+  const modern0104 = await hasEnrichment0104Columns(env.DB);
+  const countSql = modern0104
+    ? ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_MODERN
+    : ST_PEER_ENRICHMENT_PENDING_COUNT_SQL_LEGACY;
+  const sampleSql = modern0104
+    ? ST_PEER_ENRICHMENT_PENDING_SAMPLE_SQL_MODERN
+    : ST_PEER_ENRICHMENT_PENDING_SAMPLE_SQL_LEGACY;
+  const progressField = modern0104 ? 'enrichment_checked_at' : 'enriched_at';
   try {
-    pendingSql = buildStPeerEnrichmentPendingSql(true);
-    const row = await get<{ n: number; last_at: string | null }>(
-      env.DB,
-      `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${pendingSql}) AS n,
-         (SELECT MAX(sr.enrichment_checked_at) ${pendingSql}) AS last_at`,
-    );
+    const row = await get<{ n: number; last_at: string | null }>(env.DB, countSql);
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
   } catch {
@@ -479,12 +471,7 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
     return { stalled: false, detail: 'ST enrichment moving' };
   }
   try {
-    const names = await all<{ ticker: string }>(
-      env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${pendingSql}
-       ORDER BY t.ticker ASC
-       LIMIT 10`,
-    );
+    const names = await all<{ ticker: string }>(env.DB, sampleSql);
     pendingSample = names.map((r) => r.ticker);
   } catch {
     /* sample is optional detail */
@@ -496,18 +483,9 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   const detail =
     `${pending} ticker(s) still need enrichment from Socratic.Trade / SEC` +
     sampleSuffix +
-    `; no enrichment_checked_at progress on pending tickers in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
+    `; no ${progressField} progress on pending tickers in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
   return { stalled: true, detail };
 }
-
-const ST_PEER_PRICE_PENDING_SQL = `
-  FROM transactions t
-  JOIN securities_ref sr ON sr.ticker = t.ticker
- WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
-   AND t.deprecated_at IS NULL
-   AND ${excludeCompetitorFixtureTransactionSql('t')}
-   AND COALESCE(sr.price_unavailable, 0) = 0
-   AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
 
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
@@ -517,12 +495,7 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
   try {
-    const row = await get<{ n: number; last_at: string | null }>(
-      env.DB,
-      `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${ST_PEER_PRICE_PENDING_SQL}) AS n,
-         (SELECT MAX(sr.price_checked_at) ${ST_PEER_PRICE_PENDING_SQL}) AS last_at`,
-    );
+    const row = await get<{ n: number; last_at: string | null }>(env.DB, ST_PEER_PRICE_PENDING_COUNT_SQL);
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
   } catch {
@@ -532,12 +505,7 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
     return { stalled: false, detail: 'ST price refresh moving' };
   }
   try {
-    const names = await all<{ ticker: string }>(
-      env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
-       ORDER BY t.ticker ASC
-       LIMIT 10`,
-    );
+    const names = await all<{ ticker: string }>(env.DB, ST_PEER_PRICE_PENDING_SAMPLE_SQL);
     pendingSample = names.map((r) => r.ticker);
   } catch {
     /* sample is optional detail */

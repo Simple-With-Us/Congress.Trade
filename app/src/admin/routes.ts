@@ -148,10 +148,10 @@ import {
   getDailyUsed,
   prepareImportSecurityRef,
   enrichmentNeededSql,
-  enrichmentUnavailableExcludedSql,
   hasConfiguredKeyedEnrichmentProvider,
   markTickerEnrichmentUnavailable,
 } from '../enrichment/service.ts';
+import { enrichmentUnavailableExcludedSqlForEnv } from '../enrichment/securitiesRefEnrichmentSchema.ts';
 import { mergeRefs } from '../enrichment/compute.ts';
 import type { SecurityRef } from '../enrichment/types.ts';
 import {
@@ -10018,13 +10018,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   r.get('/enrich-securities/status', async (c) => {
     const used = await getDailyUsed(c.env);
     const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(c.env);
+    const enrichmentUnavailableSql = await enrichmentUnavailableExcludedSqlForEnv(c.env);
     const row = await first<{ pending: number }>(
       c.env.DB,
       `SELECT COUNT(*) AS pending FROM (
          SELECT t.ticker FROM transactions t
          LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
          WHERE t.ticker IS NOT NULL AND t.ticker <> ''
-           AND ${enrichmentUnavailableExcludedSql('sr')}
+           AND ${enrichmentUnavailableSql}
            AND ${enrichmentNeededSql('sr', retryIncomplete)}
          GROUP BY t.ticker)`,
     );
@@ -11394,13 +11395,14 @@ async function marketCoverage(env: Env): Promise<MarketCoverage> {
  */
 export async function marketPending(env: Env): Promise<{ enrich: number; prices: number }> {
   const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(env);
+  const enrichmentUnavailableSql = await enrichmentUnavailableExcludedSqlForEnv(env);
   const e = await first<{ n: number }>(
     env.DB,
     `SELECT COUNT(*) AS n FROM (
        SELECT t.ticker FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
        WHERE t.ticker IS NOT NULL AND t.ticker <> ''
-         AND ${enrichmentUnavailableExcludedSql('sr')}
+         AND ${enrichmentUnavailableSql}
          AND ${enrichmentNeededSql('sr', retryIncomplete)}
        GROUP BY t.ticker)`,
   );

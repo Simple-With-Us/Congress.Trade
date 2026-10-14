@@ -1,10 +1,12 @@
+import { readFileSync, readdirSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS,
   readPipelineStallHours,
   sweepPipelineStallAlerts,
 } from '../pipelineLoudAlerts.ts';
-import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
+import { d1Database, openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
+import { resetEnrichment0104ColumnsCache } from '../../enrichment/securitiesRefEnrichmentSchema.ts';
 import type { Env } from '../../shared/types.ts';
 
 vi.mock('../reviewQueueNotify.ts', () => ({
@@ -169,5 +171,54 @@ describe('st_peer_enrichment stall detector', () => {
     const result = await sweepPipelineStallAlerts(envWithDb(), now);
     expect(result.evaluated).toContain('st_peer_enrichment');
     expect(result.alerted).not.toContain('st_peer_enrichment');
+  });
+});
+
+const migrationsUrl = new URL('../../../migrations/', import.meta.url);
+
+async function openPre0104D1(): Promise<{
+  db: SqliteDatabase;
+  d1: D1Database;
+  close: () => void;
+}> {
+  const sqlite = (await import('node:sqlite')) as {
+    DatabaseSync: new (path: string) => SqliteDatabase;
+  };
+  const legacyDb = new sqlite.DatabaseSync(':memory:');
+  const files = readdirSync(migrationsUrl as unknown as string)
+    .filter((name: string) => name.endsWith('.sql') && name < '0104_enrichment_unavailable.sql')
+    .sort();
+  for (const name of files) {
+    legacyDb.exec(readFileSync(new URL(name, migrationsUrl) as unknown as string, 'utf8'));
+  }
+  return { db: legacyDb, d1: d1Database(legacyDb), close: () => legacyDb.close() };
+}
+
+describe('st_peer_enrichment stall detector (pre-0104 schema)', () => {
+  beforeEach(() => resetEnrichment0104ColumnsCache());
+  afterEach(() => resetEnrichment0104ColumnsCache());
+
+  it('stalls using enriched_at when enrichment_checked_at is absent', async () => {
+    const { captureMessage } = await import('../../deno/sentry.ts');
+    const opened = await openPre0104D1();
+    opened.db.prepare(
+      `INSERT INTO transactions (id, ticker, tx_date, source, created_at)
+       VALUES ('tx-OLD', 'OLD', '2026-01-05', 'primary', '2026-01-05T00:00:00Z')`,
+    ).run();
+    const stale = '2026-10-01T00:00:00.000Z';
+    // EDGAR-only row still missing display-critical fields — pending under keyed retry.
+    opened.db.prepare(
+      `INSERT INTO securities_ref (ticker, enriched_at, source) VALUES ('OLD', ?, 'edgar')`,
+    ).run(stale);
+
+    const env = { DB: opened.d1, CONFIG_KV: createKv() } as Env;
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(env, now);
+    expect(result.alerted).toContain('st_peer_enrichment');
+    const msg = (captureMessage as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+      String(c[0]).includes('st_peer_enrichment'),
+    );
+    expect(msg?.[0]).toContain('enriched_at');
+    opened.close();
   });
 });
