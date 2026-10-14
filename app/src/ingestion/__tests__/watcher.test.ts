@@ -169,7 +169,7 @@ describe('runWatcher', () => {
     const controller = new AbortController();
     mocks.fetchHouseIndex.mockImplementationOnce(
       (_year: number | string, opts: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
-        expect(opts.signal).toBe(controller.signal);
+        expect(opts.signal).toBeDefined();
         opts.signal?.addEventListener('abort', () => reject(opts.signal?.reason), { once: true });
         setTimeout(() => controller.abort(new Error('deadline')), 0);
       }),
@@ -195,7 +195,7 @@ describe('runWatcher', () => {
     expect(mocks.pollHouseLiveSearch).toHaveBeenCalledWith(
       2026,
       expect.any(Function),
-      expect.objectContaining({ env, signal: undefined }),
+      expect.objectContaining({ env, signal: expect.any(AbortSignal) }),
     );
     expect(queueSends).toHaveLength(3);
     expect(queueSends).toEqual([
@@ -230,7 +230,7 @@ describe('runWatcher', () => {
     expect(mocks.pollHouseLiveSearch).toHaveBeenCalledWith(
       2026,
       expect.any(Function),
-      expect.objectContaining({ env, signal: undefined }),
+      expect.objectContaining({ env, signal: expect.any(AbortSignal) }),
     );
     expect(queueSends).toEqual([expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' })]);
     expect(kvPuts.map(([key]) => key)).toContain('last_poll:house');

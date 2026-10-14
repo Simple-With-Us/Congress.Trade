@@ -43,6 +43,7 @@ import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { pollOgeExecutive } from './ogeSource.ts';
+import { watcherSourceIoSignal } from './watcherSourceIo.ts';
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 
@@ -1020,6 +1021,7 @@ export async function runWatcher(
   options: { signal?: AbortSignal } = {},
 ): Promise<WatcherResult> {
   throwIfWatcherAborted(options.signal);
+  const sourceSignal = watcherSourceIoSignal(options.signal);
   const cfg = await getConfig(env);
   const schedule = scheduleConfigFor(env);
   const result: WatcherResult = { house: 'skipped', senate: 'skipped', executive: 'skipped' };
@@ -1058,7 +1060,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'house', now);
-        await pollHouse(env, now, options.signal);
+        await pollHouse(env, now, sourceSignal);
         result.house = 'success';
       }
     }
@@ -1103,7 +1105,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'senate', now);
-        await pollSenate(env, now, options.signal);
+        await pollSenate(env, now, sourceSignal);
         result.senate = 'success';
       }
     }
@@ -1155,7 +1157,7 @@ export async function runWatcher(
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'oge', now);
-        const polled = await pollExecutive(env, now, { signal: options.signal });
+        const polled = await pollExecutive(env, now, { signal: sourceSignal });
         if (polled !== null) result.executive = 'success';
       }
     }

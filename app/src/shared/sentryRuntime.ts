@@ -14,6 +14,7 @@ import {
   sentryEventLooksLikePdfParseNoise,
   SENTRY_PDF_IGNORE_ERRORS,
 } from './pdfParseErrors.ts';
+import { sentryOperationalNoiseShouldDrop } from './sentryNoise.ts';
 import { scrubSentryEvent } from './sentryScrub.ts';
 import type { Env } from './types.ts';
 
@@ -163,6 +164,7 @@ export function buildSentryInitOptions(
     beforeSend: <T>(event: T) => {
       const scrubbed = scrubSentryEvent(event);
       if (sentryEventLooksLikePdfParseNoise(scrubbed)) return null;
+      if (sentryOperationalNoiseShouldDrop(scrubbed)) return null;
       return scrubbed;
     },
     beforeSendTransaction: <T>(event: T) => scrubSentryEvent(event),
