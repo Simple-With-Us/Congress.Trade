@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  DEFAULT_ST_PEER_PRICES_STALL_HOURS,
+  DEFAULT_PIPELINE_STALL_HOURS,
   readPipelineStallHours,
   sweepPipelineStallAlerts,
 } from '../pipelineLoudAlerts.ts';
@@ -21,9 +21,13 @@ vi.mock('../ogeSource.ts', () => ({
   ogeWatchEnabled: vi.fn(async () => false),
 }));
 
-vi.mock('../../enrichment/service.ts', () => ({
-  hasConfiguredKeyedEnrichmentProvider: vi.fn(async () => true),
-}));
+vi.mock('../../enrichment/service.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../enrichment/service.ts')>();
+  return {
+    ...actual,
+    hasConfiguredKeyedEnrichmentProvider: vi.fn(async () => true),
+  };
+});
 
 vi.mock('../../secrets/infisical.ts', () => ({
   resolveSecrets: vi.fn(async () => ({})),
@@ -78,15 +82,15 @@ function createKv() {
 }
 
 describe('st_peer_prices stall detector', () => {
-  it('readPipelineStallHours defaults st_peer_prices to 30h', () => {
-    expect(readPipelineStallHours({} as Env, 'st_peer_prices')).toBe(DEFAULT_ST_PEER_PRICES_STALL_HOURS);
+  it('readPipelineStallHours defaults st_peer_prices to the general 6h window', () => {
+    expect(readPipelineStallHours({} as Env, 'st_peer_prices')).toBe(DEFAULT_PIPELINE_STALL_HOURS);
     expect(readPipelineStallHours({} as Env, 'senate_fetch_success')).toBe(6);
   });
 
   it('ignores global price_checked_at when pending tickers were checked recently', async () => {
     seedTrade('FRESHP');
     seedTrade('STUCK');
-    const recent = '2026-10-12T12:00:00.000Z';
+    const recent = '2026-10-12T14:00:00.000Z';
     const old = '2026-10-01T00:00:00.000Z';
     db.prepare(
       `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
@@ -128,6 +132,21 @@ describe('st_peer_prices stall detector', () => {
     seedTrade('NEW2');
     db.prepare(
       `INSERT INTO securities_ref (ticker, source) VALUES ('NEW1', 'socratic'), ('NEW2', 'socratic')`,
+    ).run();
+
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.evaluated).toContain('st_peer_prices');
+    expect(result.alerted).not.toContain('st_peer_prices');
+  });
+
+  it('does not count COMPETITOR-* fixture-only tickers as pending', async () => {
+    seedTrade('BHI');
+    db.prepare(
+      `UPDATE transactions SET doc_id = 'COMPETITOR-synthetic-bhi', source = 'competitor_backfill' WHERE ticker = 'BHI'`,
+    ).run();
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, price_checked_at, source) VALUES ('BHI', datetime('now', '-40 days'), 'socratic')`,
     ).run();
 
     const now = new Date('2026-10-12T18:00:00.000Z');

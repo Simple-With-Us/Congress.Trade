@@ -12,6 +12,10 @@
 
 import type { Env } from '../shared/types.ts';
 import { all, batchPrepared, get, run } from '../shared/db.ts';
+import {
+  excludeCompetitorFixtureTransactionSql,
+  tickerHasNonCompetitorFixtureTrade,
+} from '../shared/competitorFixtures.ts';
 import { getSharedFmpPacer } from '../shared/pace.ts';
 import type { PriceClient } from './fmp.ts';
 import { buildPeerPriceClient } from './peer.ts';
@@ -95,10 +99,11 @@ export async function markTickerPriceUnavailable(
   env: Env,
   ticker: string,
   reason: string,
-  opts: { checkedAt?: string; stage?: number } = {},
+  opts: { checkedAt?: string; stage?: number; force?: boolean } = {},
 ): Promise<void> {
   const sym = ticker.trim().toUpperCase();
   if (!sym) return;
+  if (!opts.force && !(await tickerHasNonCompetitorFixtureTrade(env, sym))) return;
   const nowIso = opts.checkedAt ?? new Date().toISOString();
   const reasonText = normalizePriceUnavailableReason(reason);
   const stageFirst = PRICE_UNAVAILABLE_NOT_FOUND_FIRST;
@@ -311,6 +316,7 @@ export async function selectTickersNeedingPrices(
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
+        AND ${excludeCompetitorFixtureTransactionSql('t')}
         AND (
           sr.latest_price_date IS NULL
           OR sr.latest_price_date < ?

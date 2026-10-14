@@ -27,9 +27,13 @@ vi.mock('../ogeSource.ts', () => ({
   ogeWatchEnabled: vi.fn(async () => true),
 }));
 
-vi.mock('../../enrichment/service.ts', () => ({
-  hasConfiguredKeyedEnrichmentProvider: vi.fn(async () => false),
-}));
+vi.mock('../../enrichment/service.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../enrichment/service.ts')>();
+  return {
+    ...actual,
+    hasConfiguredKeyedEnrichmentProvider: vi.fn(async () => false),
+  };
+});
 
 vi.mock('../../secrets/infisical.ts', () => ({
   resolveSecrets: vi.fn(async () => ({})),
