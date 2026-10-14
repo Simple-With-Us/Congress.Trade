@@ -26,6 +26,7 @@ import { resolveSecrets } from '../secrets/infisical.ts';
 import { startDatadogSpan } from './datadog.ts';
 import { withDatadogLlmObs } from './datadogLlmobs.ts';
 import type { Env, ThirdPartyUsageTelemetryEvent } from './types.ts';
+import { abortIfSignal } from './signalAbort.ts';
 
 interface TelemetryContext {
   env: Env;
@@ -1510,7 +1511,7 @@ export interface UsageTelemetryFallbackFlushResult {
  */
 export async function flushUsageTelemetryFallback(
   env: Env,
-  options: { limit?: number } = {},
+  options: { limit?: number; signal?: AbortSignal } = {},
 ): Promise<UsageTelemetryFallbackFlushResult> {
   if (await isUsageTelemetryCircuitOpen(env)) {
     return { listed: 0, delivered: 0, failed: 0, expired: 0, skipped: true };
@@ -1526,7 +1527,7 @@ export async function flushUsageTelemetryFallback(
 
 async function drainUsageTelemetryFallbackPage(
   env: Env,
-  options: { limit?: number },
+  options: { limit?: number; signal?: AbortSignal },
   cursor: UsageTelemetryDrainCursor,
 ): Promise<UsageTelemetryFallbackFlushResult> {
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 25)));
@@ -1556,6 +1557,7 @@ async function drainUsageTelemetryFallbackPage(
   let expired = 0;
   let r2Removed = 0; // outbox objects deleted this cycle (delivered + expired + quarantined)
   for (const object of listed.objects) {
+    abortIfSignal(options.signal);
     if (object.uploaded && now - object.uploaded.getTime() > ttlMs) {
       try {
         await storage?.delete(object.key);

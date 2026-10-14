@@ -1,10 +1,10 @@
 # Enabled fleet wide by the owner on 2026-10-11 (boards 04b963b7 and 99e559ea).
-# Meta Muse Spark via Vercel AI Gateway, paid; at most 5 attempts per UTC day in this repository.
-# The generation step reads the org secret VERCEL_AI_GATEWAY_API_KEY directly as MODEL_API_KEY.
+# MiniMax M3 via its direct OpenAI-compatible endpoint, paid; at most 5 attempts per UTC day in this repository.
+# The generation step reads the org secret MINIMAX_API_KEY directly as MODEL_API_KEY.
 # Local job definitions preserve this repository's auditable runner policy.
 # Mirrors congress-trading-shared kody-autofix-reusable.yml at e28fefcd12d4747e3ed66cb5c5b3f3dd7ea2db88.
 # Full checkout is restricted to the trusted public helper commit; no target PR checkout.
-name: Kody Muse Spark Fix Proposals
+name: Kody MiniMax M3 Fix Proposals
 
 on:
   check_run:
@@ -55,10 +55,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
           path: trusted-helper
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Install Trusted Helper Dependencies
@@ -73,7 +73,7 @@ jobs:
         run: node trusted-helper/.github/kody-autofix/fleet.mjs prepare "$RUNNER_TEMP/kody-autofix"
         env:
           GH_TOKEN: ${{ github.token }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.prepare.outputs.eligible == 'true'
         with:
           name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
@@ -102,16 +102,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
           path: trusted-helper
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Install Trusted Helper Dependencies
         working-directory: trusted-helper/.github/kody-autofix
         run: npm ci
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kody-autofix
@@ -120,7 +120,7 @@ jobs:
         run: node trusted-helper/.github/kody-autofix/fleet.mjs reserve "$RUNNER_TEMP/kody-autofix"
         env:
           GH_TOKEN: ${{ github.token }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.reserve.outputs.reserved == 'true'
         with:
           name: kody-reservation-${{ github.run_id }}-${{ github.run_attempt }}
@@ -142,20 +142,20 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
           path: trusted-helper
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Install Trusted Helper Dependencies
         working-directory: trusted-helper/.github/kody-autofix
         run: npm ci
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kody-autofix
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kody-reservation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kody-autofix
@@ -181,14 +181,14 @@ jobs:
       - name: Generate One Bounded Proposal
         run: node trusted-helper/.github/kody-autofix/fleet.mjs generate "$RUNNER_TEMP/kody-autofix"
         env:
-          MODEL_API_KEY: ${{ secrets.VERCEL_AI_GATEWAY_API_KEY }}
-          KODY_MODEL: 'meta/muse-spark-1.3-contributor'
-          KODY_MODEL_BASE_URL: 'https://ai-gateway.vercel.sh/v1'
+          MODEL_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          KODY_MODEL: 'MiniMax-M3'
+          KODY_MODEL_BASE_URL: 'https://api.minimax.io/v1'
       - name: Reject Secret-Bearing Generated Results
         run: node trusted-helper/.github/kody-autofix/fleet.mjs scan-answer "$RUNNER_TEMP/kody-autofix"
         env:
           GITLEAKS_BIN: ${{ runner.temp }}/kody-tools/gitleaks
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kody-answer-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -214,24 +214,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: '4dd0ab2ec91a9dace9f73fd625661cdc3bccb0b4'
+          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
           path: trusted-helper
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Install Trusted Helper Dependencies
         working-directory: trusted-helper/.github/kody-autofix
         run: npm ci
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kody-context-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kody-autofix
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kody-reservation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kody-autofix
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: kody-answer-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kody-autofix

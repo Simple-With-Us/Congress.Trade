@@ -150,3 +150,12 @@ if [ "$executed" -lt "$MIN_TESTS" ]; then
   exit 1
 fi
 echo "Executed ${executed} XCTest cases."
+
+# Visual regression artifact: booted simulator after XCTest (WidgetKit / paywall
+# changes should be reviewed from this PNG in CI artifacts).
+SCREENSHOT="${RUNNER_TEMP:-/tmp}/congress-trade-ios-ci-simulator.png"
+if xcrun simctl io booted screenshot "$SCREENSHOT" 2>/dev/null; then
+  echo "Simulator screenshot saved to ${SCREENSHOT}"
+else
+  echo "::warning::Could not capture simulator screenshot (simulator may have shut down)."
+fi

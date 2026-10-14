@@ -12,6 +12,10 @@
 
 import type { Env } from '../shared/types.ts';
 import { all, batchPrepared, get, run } from '../shared/db.ts';
+import {
+  excludeCompetitorFixtureTransactionSql,
+  tickerHasNonCompetitorFixtureTrade,
+} from '../shared/competitorFixtures.ts';
 import { getSharedFmpPacer } from '../shared/pace.ts';
 import type { PriceClient } from './fmp.ts';
 import { buildPeerPriceClient } from './peer.ts';
@@ -70,6 +74,68 @@ const PRICE_STALE_LISTING_DAYS = 14;
 export const PRICE_UNAVAILABLE_NOT_FOUND_FIRST = 1;
 const PRICE_UNAVAILABLE_NOT_FOUND_AGAIN = 2;
 const PRICE_UNAVAILABLE_STALLED = 3;
+
+/** Provider / import confirmed no EOD history for this symbol. */
+export const PRICE_UNAVAILABLE_REASON_PEER_NO_EOD = 'socratic_no_eod_history';
+/** Peer import push carried no closes and no cached price rows. */
+export const PRICE_UNAVAILABLE_REASON_PEER_IMPORT_EMPTY = 'socratic_import_no_price';
+
+const PRICE_UNAVAILABLE_REASON_MAX_LEN = 500;
+
+function normalizePriceUnavailableReason(reason: string): string {
+  const trimmed = reason.trim();
+  if (!trimmed) return PRICE_UNAVAILABLE_REASON_PEER_NO_EOD;
+  return trimmed.length > PRICE_UNAVAILABLE_REASON_MAX_LEN
+    ? trimmed.slice(0, PRICE_UNAVAILABLE_REASON_MAX_LEN)
+    : trimmed;
+}
+
+/**
+ * Negative-cache a ticker as unpriceable (excluded from pending price work and
+ * the st_peer_prices stall detector). Uses the same two-stage not-found backoff
+ * as an empty EOD fetch unless `stage` is set explicitly.
+ */
+export async function markTickerPriceUnavailable(
+  env: Env,
+  ticker: string,
+  reason: string,
+  opts: { checkedAt?: string; stage?: number; force?: boolean } = {},
+): Promise<void> {
+  const sym = ticker.trim().toUpperCase();
+  if (!sym) return;
+  if (!opts.force && !(await tickerHasNonCompetitorFixtureTrade(env, sym))) return;
+  const nowIso = opts.checkedAt ?? new Date().toISOString();
+  const reasonText = normalizePriceUnavailableReason(reason);
+  const stageFirst = PRICE_UNAVAILABLE_NOT_FOUND_FIRST;
+  const stageAgain = PRICE_UNAVAILABLE_NOT_FOUND_AGAIN;
+  if (opts.stage != null) {
+    await run(
+      env.DB,
+      `INSERT INTO securities_ref (ticker, price_unavailable, price_checked_at, price_unavailable_reason)
+         VALUES (?, ?, ?, ?)
+       ON CONFLICT(ticker) DO UPDATE SET
+         price_unavailable = excluded.price_unavailable,
+         price_checked_at = excluded.price_checked_at,
+         price_unavailable_reason = excluded.price_unavailable_reason`,
+      [sym, opts.stage, nowIso, reasonText],
+    );
+    return;
+  }
+  await run(
+    env.DB,
+    `INSERT INTO securities_ref (ticker, price_unavailable, price_checked_at, price_unavailable_reason)
+       VALUES (?, ${stageFirst}, ?, ?)
+     ON CONFLICT(ticker) DO UPDATE SET
+       price_unavailable = CASE
+         WHEN securities_ref.price_unavailable IN (${stageFirst}, ${stageAgain})
+           THEN ${stageAgain}
+         ELSE ${stageFirst}
+       END,
+       price_checked_at = excluded.price_checked_at,
+       price_unavailable_reason = excluded.price_unavailable_reason`,
+    [sym, nowIso, reasonText],
+  );
+}
 type EnvX = Env & {
   FMP_MAX_PER_MINUTE?: string;
   APP_B_IMPORT_URL?: string;
@@ -250,6 +316,7 @@ export async function selectTickersNeedingPrices(
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
+        AND ${excludeCompetitorFixtureTransactionSql('t')}
         AND (
           sr.latest_price_date IS NULL
           OR sr.latest_price_date < ?
@@ -503,19 +570,9 @@ export async function runPriceRefresh(
       // selectTickersNeedingPrices. A ticker that was previously priced or
       // stalled (not already in a not-found streak) always restarts at stage 1.
       if (!dryRun) {
-        await run(
-          env.DB,
-          `INSERT INTO securities_ref (ticker, price_unavailable, price_checked_at)
-             VALUES (?, ${PRICE_UNAVAILABLE_NOT_FOUND_FIRST}, ?)
-           ON CONFLICT(ticker) DO UPDATE SET
-             price_unavailable = CASE
-               WHEN securities_ref.price_unavailable IN (${PRICE_UNAVAILABLE_NOT_FOUND_FIRST}, ${PRICE_UNAVAILABLE_NOT_FOUND_AGAIN})
-                 THEN ${PRICE_UNAVAILABLE_NOT_FOUND_AGAIN}
-               ELSE ${PRICE_UNAVAILABLE_NOT_FOUND_FIRST}
-             END,
-             price_checked_at = excluded.price_checked_at`,
-          [ticker, nowIso],
-        );
+        await markTickerPriceUnavailable(env, ticker, PRICE_UNAVAILABLE_REASON_PEER_NO_EOD, {
+          checkedAt: nowIso,
+        });
       }
       continue;
     }
@@ -547,14 +604,17 @@ export async function runPriceRefresh(
     const priceStalled = latest.date < isoDaysAgo(PRICE_STALE_LISTING_DAYS);
     await run(
       env.DB,
-      `INSERT INTO securities_ref (ticker, current_price, current_price_date, latest_price_date, price_unavailable, price_checked_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO securities_ref (ticker, current_price, current_price_date, latest_price_date, price_unavailable, price_checked_at, price_unavailable_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(ticker) DO UPDATE SET
          current_price=excluded.current_price,
          current_price_date=excluded.current_price_date,
          latest_price_date=excluded.latest_price_date,
          price_unavailable=excluded.price_unavailable,
          price_checked_at=excluded.price_checked_at,
+         price_unavailable_reason=CASE
+           WHEN excluded.price_unavailable IN (0, ${PRICE_UNAVAILABLE_STALLED}) THEN NULL
+           ELSE securities_ref.price_unavailable_reason END,
          market_cap = CASE
            WHEN securities_ref.shares_outstanding IS NOT NULL AND securities_ref.shares_outstanding > 0
              THEN securities_ref.shares_outstanding * excluded.current_price
@@ -568,7 +628,15 @@ export async function runPriceRefresh(
            WHEN securities_ref.shares_outstanding * excluded.current_price >=    300000000 THEN 'small'
            WHEN securities_ref.shares_outstanding * excluded.current_price >=     50000000 THEN 'micro'
            ELSE 'nano' END`,
-      [ticker, latest.close, latest.date, latest.date, priceStalled ? PRICE_UNAVAILABLE_STALLED : 0, nowIso],
+      [
+        ticker,
+        latest.close,
+        latest.date,
+        latest.date,
+        priceStalled ? PRICE_UNAVAILABLE_STALLED : 0,
+        nowIso,
+        null,
+      ],
     );
     result.sharePrices.push({ ticker, closes: hist, currentPrice: latest.close, currentPriceDate: latest.date });
     // Per-trade anchors: recompute from the CACHED price_eod / spx_eod series (not

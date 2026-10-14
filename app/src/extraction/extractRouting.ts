@@ -13,6 +13,32 @@
  */
 
 import type { Filing, ParsedTx } from '../shared/types.ts';
+
+const HOUSE_PRINTED_EXAMPLE_ASSET_RE =
+  /\bexempl(?:je|e)?\s+(?:mega|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg)\s*\.?\s*corp\b/i;
+
+/** Printed House PTR instruction dates (8/14/12) and newer 2020 sample grids. */
+export function looksLikePtrFormSampleDate(txDate: string | null | undefined): boolean {
+  if (!txDate?.trim()) return false;
+  const iso = txDate.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) {
+    if (iso === '2012-08-14' || iso.startsWith('2012-') || iso.startsWith('2020-')) return true;
+  }
+  return /(?:\b8\/14\/12\b|\b08\/14\/2012\b)/.test(txDate);
+}
+
+export function looksLikeHousePrintedExampleAsset(text: string | null | undefined): boolean {
+  if (!text?.trim()) return false;
+  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(text.trim());
+}
+
+/** Drop printed PTR form sample rows in every extraction path before normalize/publish. */
+export function dropPtrFormSampleParsedRows(parsed: ParsedTx[]): ParsedTx[] {
+  return parsed.filter((p) =>
+    !looksLikePtrFormSampleAsset(p.assetName)
+    && !looksLikePtrFormSampleRow(p)
+  );
+}
 import { isJunkAssetString } from './nameNormalizer.ts';
 
 /** Same publish cap the normalizer uses; duplicated to avoid an import cycle. */
@@ -128,7 +154,7 @@ export function looksLikeHeaderContaminatedAsset(assetName: string | null): bool
 export function looksLikePtrFormSampleAsset(assetName: string | null): boolean {
   if (!assetName) return false;
   const clean = assetName.trim();
-  if (/exempl(?:je|e)\s+mega\s+corp|\bexample\s+mega\s+corp/i.test(clean)) return true;
+  if (looksLikeHousePrintedExampleAsset(clean)) return true;
   if (/ibm\s+corp\.?\s*(?:\(\s*stock\s*\))?\s*nyse/i.test(clean)) return true;
   if (/^(?:\(dc\)\s*)?microsoft\s*(?:\(\s*stock\s*\))?\s*nasdaq\s*\/\s*otc/i.test(clean)) return true;
   return false;
@@ -155,6 +181,12 @@ export function looksLikePtrFormSampleRow(row: {
 
   if (looksLikePtrFormSampleAsset(asset)) return true;
   if (looksLikePtrFormSampleAsset(raw)) return true;
+
+  if (looksLikeHousePrintedExampleAsset(asset) || looksLikeHousePrintedExampleAsset(raw)) {
+    if (!date || looksLikePtrFormSampleDate(date) || /8\/14\/12|08\/14\/2012/.test(raw)) {
+      return true;
+    }
+  }
 
   // Amount column spells EXAMPLE or raw text has EXAMPLE with sample tickers/assets
   if (/\bexample\b/i.test(amount) || /\bexample\b/i.test(raw)) {

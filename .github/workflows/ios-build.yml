@@ -163,10 +163,19 @@ jobs:
 
       - name: Upload XCTest result bundle
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: congress-trade-ios-xcresult
           path: ${{ runner.temp }}/CongressTrade.xcresult
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload simulator screenshot (visual CI artifact)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: congress-trade-ios-simulator-screenshot
+          path: ${{ runner.temp }}/congress-trade-ios-ci-simulator.png
           if-no-files-found: warn
           retention-days: 14
 

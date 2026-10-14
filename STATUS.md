@@ -1,5 +1,10 @@
 # Current Handoff
 
+## 2026-10-11 CODEX — Kody Direct MiniMax (CTS-330)
+
+Kody uses `MiniMax-M3` through MiniMax’s direct OpenAI-compatible endpoint with the existing MiniMax key.  The helper uses native M3 non-thinking mode to avoid answer truncation and passed a synthetic live edit canary plus 71 offline tests.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
+
+
 ## 2026-09-24 BF-PUBLISHER — Disputed agreement vision vs unreadable 278-T
 
 Live Trump `E-2026-donald-j-trump-09-8-2026-278t` rejected at rev 35 (unusable OCR; official 1156 rows; vision 472/66/33).  `#2554` sweep could not close it because disagreed kind=agreement runs counted as a successful nonempty read.  Branch `publisher/oge-disputed-vision-guard`.  No merge/deploy.  House historic backlog untouched.  Rollout: `docs/rollouts/2026-09-24-disputed-agreement-vision-unreadable.md`.

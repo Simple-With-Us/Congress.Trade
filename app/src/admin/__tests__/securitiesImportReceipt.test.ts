@@ -16,7 +16,19 @@ function fakeDb() {
       return {
         bind: (...args: unknown[]) => {
           binds.push(args);
-          return { run: async () => ({}) };
+          const stmt = {
+            run: async () => ({}),
+            first: async () => {
+              if (/SELECT latest_price_date FROM securities_ref/i.test(query)) {
+                return null;
+              }
+              if (/SELECT date AS d, close AS c FROM price_eod/i.test(query)) {
+                return null;
+              }
+              return null;
+            },
+          };
+          return stmt;
         },
       };
     },

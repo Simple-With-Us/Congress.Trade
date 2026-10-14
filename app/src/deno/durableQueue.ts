@@ -1,4 +1,5 @@
 import type { Env, QueueMessage } from "../shared/types.ts";
+import { maybeAlertTerminalDurableIngestFailure } from "../ingestion/pipelineLoudAlerts.ts";
 import {
   AUTOPILOT_BUDGET_SETTLEMENT_WRITER,
   LLM_SPEND_SETTLEMENT_WRITER,
@@ -830,6 +831,26 @@ async function failClaim(
   );
 }
 
+async function failIngestQueueClaim(
+  env: Env,
+  queueName: DurableQueueName,
+  row: DurableQueueRow,
+  now: Date,
+  error: unknown,
+  message: QueueMessage | null,
+): Promise<boolean> {
+  const failed = await failClaim(env.DB, row, now, error);
+  if (failed && queueName === "ingest" && message) {
+    await maybeAlertTerminalDurableIngestFailure(
+      env,
+      message,
+      errorText(error),
+      now,
+    );
+  }
+  return failed;
+}
+
 async function dispatchMessage(
   env: Env,
   queueName: DurableQueueName,
@@ -956,11 +977,13 @@ export async function drainDurableQueue(
           await lease.assertOwned();
           await stopHeartbeat();
           if (
-            await failClaim(
-              env.DB,
+            await failIngestQueueClaim(
+              env,
+              queueName,
               row,
               now(),
               row.last_error || "message exhausted retries",
+              canonicalMessage,
             )
           ) {
             result.failed += 1;
@@ -975,11 +998,13 @@ export async function drainDurableQueue(
             )
           ) {
             if (
-              await failClaim(
-                env.DB,
+              await failIngestQueueClaim(
+                env,
+                queueName,
                 row,
                 now(),
                 deadLetterError,
+                canonicalMessage,
               )
             ) {
               result.failed += 1;
@@ -993,13 +1018,15 @@ export async function drainDurableQueue(
             // Recovery budget exhausted: go terminal instead of looping the
             // poison receipt forever.
             if (
-              await failClaim(
-                env.DB,
+              await failIngestQueueClaim(
+                env,
+                queueName,
                 row,
                 now(),
                 new Error(
                   `dead-letter recovery budget exhausted (${DURABLE_QUEUE_MAX_DEAD_LETTER_CYCLES} cycles): ${errorText(deadLetterError)}`,
                 ),
+                canonicalMessage,
               )
             ) {
               result.failed += 1;
@@ -1043,7 +1070,7 @@ export async function drainDurableQueue(
           handlers.isTerminalDeadLetterError(canonicalMessage, error)
         ) {
           await stopHeartbeat();
-          if (await failClaim(env.DB, row, now(), error)) {
+          if (await failIngestQueueClaim(env, queueName, row, now(), error, canonicalMessage)) {
             result.failed += 1;
           }
           continue;
@@ -1085,11 +1112,13 @@ export async function drainDurableQueue(
             )
           ) {
             if (
-              await failClaim(
-                env.DB,
+              await failIngestQueueClaim(
+                env,
+                queueName,
                 row,
                 now(),
                 deadLetterError,
+                canonicalMessage,
               )
             ) {
               result.failed += 1;
@@ -1113,7 +1142,7 @@ export async function drainDurableQueue(
           }
           continue;
         }
-        if (await failClaim(env.DB, row, now(), error)) {
+        if (await failIngestQueueClaim(env, queueName, row, now(), error, canonicalMessage)) {
           result.failed += 1;
         }
       }

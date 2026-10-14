@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import {
   deleteSecret,
+  INFISICAL_KV_CACHE_MAX_BYTES,
   readSourceSecrets,
   refreshSecrets,
   resolveSecret,
@@ -75,6 +76,55 @@ describe('Infisical environment selection is prod-only', () => {
 });
 
 describe('Infisical runtime secret resolver', () => {
+  it('skips Infisical network when the in-memory cache is still fresh', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return Response.json({ accessToken: 'token' });
+      }
+      if (url.includes('/api/v3/secrets/raw')) {
+        return Response.json({ secrets: [{ secretKey: 'FMP_API_KEY', secretValue: 'infisical-fmp' }] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-fresh-cache',
+      INFISICAL_CACHE_TTL_SECONDS: '600',
+    });
+    await refreshSecrets(e);
+    expect(fetchMock).toHaveBeenCalled();
+    const callsAfterFirst = fetchMock.mock.calls.length;
+
+    await refreshSecrets(e);
+    expect(fetchMock.mock.calls.length).toBe(callsAfterFirst);
+
+    await refreshSecrets(e, { force: true });
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('does not write KV when the encrypted cache blob would exceed the Deno KV limit', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json({ accessToken: 'token' });
+        if (url.includes('/api/v3/secrets/raw')) {
+          const huge = 'x'.repeat(INFISICAL_KV_CACHE_MAX_BYTES);
+          return Response.json({ secrets: [{ secretKey: 'BLOB', secretValue: huge }] });
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+    const kvPut = vi.fn(async () => {});
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-kv-limit',
+      INFISICAL_APP_CLIENT_SECRET: '01234567890123456789012345678901',
+      CONFIG_KV: { get: vi.fn(), put: kvPut, delete: vi.fn() } as unknown as KVNamespace,
+    });
+    await refreshSecrets(e);
+    expect(kvPut).not.toHaveBeenCalled();
+  });
+
   it('merges shared then app secrets, with app overriding shared', async () => {
     vi.stubGlobal(
       'fetch',

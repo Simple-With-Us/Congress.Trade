@@ -971,6 +971,10 @@ export interface Env {
   ADMIN_EMAILS?: string;
   /** HTTPS webhook that wakes Grok Bot Publisher on review_queue entry. */
   REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL?: string;
+  /** Optional GB Publisher (Grok Bot) webhook; same secret as BF. Comma-separated URLs also supported on the primary key. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB?: string;
+  /** Optional `Authorization` header for GB Publisher only (value includes `Bearer ` prefix). */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB?: string;
   /** HMAC secret for REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL payloads. */
   REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET?: string;
   /** Cloudflare Access team name/hostname for admin API JWT verification. */

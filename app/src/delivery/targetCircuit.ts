@@ -40,6 +40,7 @@ import type { Env } from '../shared/types.ts';
 import { all, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 
 export const DEFAULT_TARGET_FAILURE_THRESHOLD = 5;
 export const DEFAULT_TARGET_DAILY_ATTEMPT_CAP = 50;
@@ -479,7 +480,7 @@ export async function recoverQuarantinedDeliveries(
  */
 export async function flushParkedDeliveries(
   env: Env,
-  opts: { limit?: number; now?: Date } = {},
+  opts: { limit?: number; now?: Date; signal?: AbortSignal } = {},
 ): Promise<ParkedFlushResult> {
   const now = opts.now ?? new Date();
   const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
@@ -518,6 +519,7 @@ export async function flushParkedDeliveries(
   }
   const nowIso = now.toISOString();
   for (const [targetKey, group] of byTarget) {
+    abortIfSignal(opts.signal);
     let circuit: CircuitRow | null = null;
     try {
       circuit = await readCircuitRow(env, targetKey);
@@ -536,6 +538,7 @@ export async function flushParkedDeliveries(
     const releasable = open ? [] : probeDue ? group.slice(0, 1) : group;
     result.skipped += group.length - releasable.length;
     for (const row of releasable) {
+      abortIfSignal(opts.signal);
       try {
         await env.DELIVERY_QUEUE.send({
           type: 'delivery.dispatch',

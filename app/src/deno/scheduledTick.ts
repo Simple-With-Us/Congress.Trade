@@ -8,6 +8,7 @@
 import type { Env } from '../shared/types.ts';
 import { isSqliteLockBusy } from '../shared/db.ts';
 import { flushD1Budget } from '../shared/d1Budget.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import { maybeRunDailyJobs } from '../jobs.ts';
 import { runWatcher } from '../ingestion/watcher.ts';
 import { runDisclosureLatencyProbe } from '../ingestion/tradeLatency.ts';
@@ -19,6 +20,11 @@ import { AGREEMENT_CLAIM_LEASE_MS, maybeRunAgreementAutopublish } from '../extra
 import { maybeStartBacklogAutopilot } from '../extraction/autopilot.ts';
 import { TERMINAL_REVIEW_REASON_EXCLUDE_SQL } from '../extraction/reviewQueueHealth.ts';
 import { refreshSecrets } from '../secrets/infisical.ts';
+import { captureMessage } from './sentry.ts';
+import {
+  isMaintenanceLaneTimeout,
+  raceMaintenanceLane,
+} from './maintenanceLaneTimeout.ts';
 import { flushUsageTelemetryFallback } from '../shared/thirdPartyTelemetry.ts';
 import {
   drainDurableQueues,
@@ -256,6 +262,25 @@ export type MaintenanceLane =
   | 'daily_jobs'
   | 'd1_budget';
 
+/** Default per-lane wall-clock budgets (ms) for the Deno minute tick. */
+export const DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS: Record<MaintenanceLane, number> = {
+  secrets_refresh: 12_000,
+  watcher: 22_000,
+  deterministic_drain: 15_000,
+  agreement_autopublish: 8_000,
+  backlog_autopilot: 8_000,
+  ingestion_outbox: 12_000,
+  delivery_outbox: 12_000,
+  apns_fanout: 18_000,
+  durable_queue: 18_000,
+  parked_deliveries: 8_000,
+  usage_telemetry: 8_000,
+  disclosure_latency: 15_000,
+  latency_price_snapshots: 15_000,
+  daily_jobs: 30_000,
+  d1_budget: 8_000,
+};
+
 export interface MaintenancePipelineOptions {
   outboxLimit: number;
   /** When set, re-dispatch circuit-parked deliveries. */
@@ -281,12 +306,14 @@ export interface MaintenancePipelineOptions {
   /** Gate for the two outbox lanes (Deno idle short-circuit). Default: run. */
   beforeOutboxFlush?: () => Promise<boolean>;
   /** Runs right after the outbox lanes when they are not gated off (Deno drain). */
-  afterOutboxFlush?: () => Promise<unknown>;
+  afterOutboxFlush?: (opts: { signal?: AbortSignal }) => Promise<unknown>;
   /** Per-lane observability wrapper (Workers cron uses Sentry monitors). */
   observeLane?: (
     lane: MaintenanceLane,
     run: () => Promise<unknown>,
   ) => Promise<unknown>;
+  /** Override per-lane wall-clock budgets (see DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS). */
+  laneTimeoutMs?: Partial<Record<MaintenanceLane, number>>;
 }
 
 export interface MaintenancePipelineResult {
@@ -345,16 +372,47 @@ export async function runMaintenancePipeline(
     }
   };
 
+  const laneTimeoutFor = (lane: MaintenanceLane): number =>
+    options.laneTimeoutMs?.[lane] ?? DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS[lane];
+
+  const mergeLaneSignal = (laneSignal: AbortSignal): AbortSignal => {
+    if (!options.signal) return laneSignal;
+    return AbortSignal.any([laneSignal, options.signal]);
+  };
+
+  const alertLaneTimeout = (lane: MaintenanceLane, timeoutMs: number, err: unknown) => {
+    const detail = errorText(err);
+    const message = `Cron maintenance lane timed out: ${lane} (${timeoutMs}ms) — ${detail}`;
+    console.error(message);
+    try {
+      captureMessage(message, 'error');
+    } catch {
+      /* fail-soft */
+    }
+  };
+
   const runLane = async <T>(
     lane: MaintenanceLane,
-    run: () => Promise<T>,
+    run: (laneSignal: AbortSignal) => Promise<T>,
   ): Promise<T | null> => {
+    const timeoutMs = laneTimeoutFor(lane);
     try {
       throwIfAborted();
-      const observed = options.observeLane ? options.observeLane(lane, run) : run();
-      return (await observed) as T;
+      return await raceMaintenanceLane(lane, timeoutMs, (laneSignal) => {
+        const signal = mergeLaneSignal(laneSignal);
+        const work = run(signal);
+        const observed = options.observeLane
+          ? options.observeLane(lane, () => work)
+          : work;
+        return observed as Promise<T>;
+      });
     } catch (err) {
       if (isTickAbort(err)) throw err;
+      if (isMaintenanceLaneTimeout(err)) {
+        alertLaneTimeout(lane, timeoutMs, err);
+        errors.push(`${lane}: timed out after ${timeoutMs}ms`);
+        return null;
+      }
       errors.push(`${lane}: ${errorText(err)}`);
       console.error(`maintenance lane ${lane} failed:`, err);
       return null;
@@ -362,9 +420,9 @@ export async function runMaintenancePipeline(
   };
 
   try {
-    await runLane('secrets_refresh', () => refreshSecrets(env));
-    result.watcher = await runLane('watcher', () =>
-      runWatcher(env, now, { signal: options.signal }),
+    await runLane('secrets_refresh', (signal) => refreshSecrets(env, { signal }));
+    result.watcher = await runLane('watcher', (signal) =>
+      runWatcher(env, now, { signal }),
     );
     // Autonomy lanes run before the outbox gate so newly enqueued
     // agreement.check / autopilot.tick messages are visible to the gate probe.
@@ -372,25 +430,25 @@ export async function runMaintenancePipeline(
     // halted on quota — never block free publish paths behind paid agreement.
     result.deterministicDrain = await runLane(
       'deterministic_drain',
-      async () => {
+      async (signal) => {
         const { maybeRunDeterministicReviewDrain } = await import(
           '../extraction/deterministicDrain.ts'
         );
-        const drain = await maybeRunDeterministicReviewDrain(env, { signal: options.signal });
+        const drain = await maybeRunDeterministicReviewDrain(env, { signal });
         const { maybePublishFromStoredRuns } = await import(
           '../extraction/storedRunPublish.ts'
         );
-        await maybePublishFromStoredRuns(env, { signal: options.signal });
+        await maybePublishFromStoredRuns(env, { signal });
         return drain;
       },
     );
     result.agreementAutopublish = await runLane(
       'agreement_autopublish',
-      () => maybeRunAgreementAutopublish(env),
+      (signal) => maybeRunAgreementAutopublish(env, { signal }),
     );
     result.autopilot = await runLane(
       'backlog_autopilot',
-      () => maybeStartBacklogAutopilot(env, now),
+      (signal) => maybeStartBacklogAutopilot(env, now, { signal }),
     );
 
     throwIfAborted();
@@ -402,32 +460,32 @@ export async function runMaintenancePipeline(
     if (flushOutboxes) {
       result.ingestionOutbox = await runLane(
         'ingestion_outbox',
-        () => flushIngestionOutbox(env, { limit: options.outboxLimit, now }),
+        (signal) => flushIngestionOutbox(env, { limit: options.outboxLimit, now, signal }),
       );
       result.deliveryOutbox = await runLane(
         'delivery_outbox',
-        () => flushDeliveryOutbox(env, { limit: options.outboxLimit, now }),
+        (signal) => flushDeliveryOutbox(env, { limit: options.outboxLimit, now, signal }),
       );
       if (options.afterOutboxFlush) {
-        await runLane('durable_queue', options.afterOutboxFlush);
+        await runLane('durable_queue', (signal) => options.afterOutboxFlush!({ signal }));
       }
     }
     // APNs is independent of the idle outbox gate so a prior throw can still
     // recover the 2h lookback.  fanOut cheap-probes delivery_outbox / review_queue
     // (PK lookup, not an unindexed transactions.created_at scan) and only runs
     // TRADE_SQL when events are pending or a recent lane error needs recovery.
-    result.apnsFanout = await runLane('apns_fanout', () =>
-      import('../delivery/apnsFanout.ts').then((mod) => mod.fanOutApnsProductEvents(env, { now })),
+    result.apnsFanout = await runLane('apns_fanout', (signal) =>
+      import('../delivery/apnsFanout.ts').then((mod) => mod.fanOutApnsProductEvents(env, { now, signal })),
     );
     if (options.parkedDeliveryLimit !== undefined) {
       const limit = options.parkedDeliveryLimit;
-      await runLane('parked_deliveries', () => flushParkedDeliveries(env, { limit }));
+      await runLane('parked_deliveries', (signal) => flushParkedDeliveries(env, { limit, signal }));
     }
     if (options.usageTelemetryLimit !== undefined) {
       const limit = options.usageTelemetryLimit;
       await runLane(
         'usage_telemetry',
-        () => flushUsageTelemetryFallback(env, { limit }),
+        (signal) => flushUsageTelemetryFallback(env, { limit, signal }),
       );
     }
     if (options.disclosureLatency && options.includeLatencyLanes !== false) {
@@ -438,22 +496,29 @@ export async function runMaintenancePipeline(
       // NOTE: when includeLatencyLanes=false these lanes run in their own
       // dedicated sub-minute crons (cronLanes.ts) so the main tick is not
       // burdened by their abort-ignorant external HTTP calls (CONGRESS-TRADE-1B).
-      await runLane('disclosure_latency', () =>
-        runLeasedLatencyProbe(
+      await runLane('disclosure_latency', (signal) => {
+        abortIfSignal(signal);
+        return runLeasedLatencyProbe(
           env,
           (providers) => runDisclosureLatencyProbe(env, now, deadlineFetch, { providers }),
           now,
-        ),
-      );
-      await runLane('latency_price_snapshots', async () => {
+        );
+      });
+      await runLane('latency_price_snapshots', async (signal) => {
         const { runLatencyPriceSnapshotTick } = await import('../ingestion/latencyPriceSnapshots.ts');
-        return runLatencyPriceSnapshotTick(env, now, deadlineFetch, options.signal);
+        return runLatencyPriceSnapshotTick(env, now, deadlineFetch, signal);
       });
     }
     if (options.includeDailyJobs !== false) {
-      await runLane('daily_jobs', () => maybeRunDailyJobs(env, now));
+      await runLane('daily_jobs', (signal) => {
+        abortIfSignal(signal);
+        return maybeRunDailyJobs(env, now);
+      });
     }
-    await runLane('d1_budget', () => flushD1Budget(env, now));
+    await runLane('d1_budget', (signal) => {
+      abortIfSignal(signal);
+      return flushD1Budget(env, now);
+    });
   } catch (err) {
     if (!isTickAbort(err)) throw err;
     result.aborted = true;
@@ -539,11 +604,11 @@ export async function runScheduledTick(
         const probe = await probePendingWork(env, now);
         return hasDrainableWork(probe);
       },
-      afterOutboxFlush: async () => {
+      afterOutboxFlush: async ({ signal: drainSignal }) => {
         const drained = await drainDurableQueues(env, handlers, {
           limit: profile.drainLimit,
           claimSize: profile.drainClaimSize,
-          signal,
+          signal: drainSignal,
         });
         result.drained = drained;
         if (drained.ingest.claimed > 0 || drained.delivery.claimed > 0) {

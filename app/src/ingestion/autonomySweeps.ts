@@ -42,6 +42,10 @@ import {
   sweepKnownParkedExecutiveTerminals,
   type ExecutiveTerminalSweepResult,
 } from '../extraction/executiveDisposition.ts';
+import {
+  sweepPipelineStallAlerts,
+  type PipelineStallAlertResult,
+} from './pipelineLoudAlerts.ts';
 
 /** Provider-placeholder bookkeeping rows (tradeLatency.ts
  *  routeProviderOnlyObservationsToReview) are working-as-designed synthetic
@@ -428,6 +432,8 @@ export interface AutonomySweepResult {
    *  check cannot see, because a tick that never fires is not a tick that
    *  failed). */
   pollingHeartbeat: PollingHeartbeatResult | null;
+  /** Ingest/OCR/ST stall detector (Sentry + dual publisher webhooks + recovery). */
+  pipelineStallAlerts: PipelineStallAlertResult | null;
   /** Empty 278e → verified_empty; refused 278-T → unreadable.  Allowlist only. */
   executiveTerminals: ExecutiveTerminalSweepResult | null;
   /** Bounded replay of transient failed outbox / queue rows. */
@@ -1202,6 +1208,7 @@ export async function runAutonomySweeps(
     localVisionRequeue: null,
     hostedFallback: null,
     pollingHeartbeat: null,
+    pipelineStallAlerts: null,
     executiveTerminals: null,
     transientDlq: null,
     errors,
@@ -1347,6 +1354,13 @@ export async function runAutonomySweeps(
     result.pollingHeartbeat = await sweepPollingHeartbeat(env, now);
   } catch (err) {
     errors.push(`pollingHeartbeat: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    result.pipelineStallAlerts = await sweepPipelineStallAlerts(env, now);
+  } catch (err) {
+    errors.push(`pipelineStallAlerts: ${(err as Error).message}`);
   }
 
   return result;

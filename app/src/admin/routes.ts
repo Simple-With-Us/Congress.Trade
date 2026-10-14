@@ -148,7 +148,10 @@ import {
   getDailyUsed,
   prepareImportSecurityRef,
   enrichmentNeededSql,
+  enrichmentUnavailableExcludedSql,
   hasConfiguredKeyedEnrichmentProvider,
+  markTickerEnrichmentUnavailable,
+  securitiesRefHasEnrichmentUnavailableColumns,
 } from '../enrichment/service.ts';
 import { mergeRefs } from '../enrichment/compute.ts';
 import type { SecurityRef } from '../enrichment/types.ts';
@@ -157,6 +160,8 @@ import {
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
   PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
+  PRICE_UNAVAILABLE_REASON_PEER_IMPORT_EMPTY,
+  markTickerPriceUnavailable,
 } from '../prices/service.ts';
 import { getSecretResolverStatus, refreshSecrets, resolveSecret, resolveSecrets, updateSecret } from '../secrets/infisical.ts';
 import {
@@ -279,6 +284,10 @@ import {
 import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
+import {
+  NEEDS_HAND_CHECK_MAC_VISION,
+  mergeHandCheckIntoReviewReason,
+} from '../extraction/handCheckPublish.ts';
 import {
   grantAdmin,
   revokeAdmin,
@@ -2186,6 +2195,7 @@ async function stampLocalVisionSubmitted(
     `SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0 LIMIT 1`,
     [docId],
   );
+  const publisherReason = mergeHandCheckIntoReviewReason(tag, NEEDS_HAND_CHECK_MAC_VISION);
   if (open) {
     await run(
       env.DB,
@@ -2198,6 +2208,12 @@ async function stampLocalVisionSubmitted(
         WHERE doc_id = ? AND resolved = 0`,
       [tag, tag, docId],
     );
+    void notifyReviewQueuePublisher(env, {
+      docId,
+      reason: publisherReason,
+      kind: 'reopen',
+      at: nowIso,
+    });
   } else {
     const insertResult = await run(
       env.DB,
@@ -2208,7 +2224,7 @@ async function stampLocalVisionSubmitted(
     if ((insertResult.meta?.changes ?? 0) > 0) {
       void notifyReviewQueuePublisher(env, {
         docId,
-        reason: tag,
+        reason: publisherReason,
         kind: 'insert',
         at: nowIso,
       });
@@ -2234,6 +2250,16 @@ const DeliveryRequeueBodySchema = z
     dryRun: z.boolean().default(false),
   })
   .strict();
+
+export const PriceUnavailableBodySchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+export type PriceUnavailableBody = z.infer<typeof PriceUnavailableBodySchema>;
+
+export const EnrichmentUnavailableBodySchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+}).strict();
+export type EnrichmentUnavailableBody = z.infer<typeof EnrichmentUnavailableBodySchema>;
 
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
@@ -3914,7 +3940,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       ],
       'auth-billing': [
         'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
-        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB',
+        'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
         'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'WEBHOOK_SIGNING_KEY',
         'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'STRIPE_PRICE_MONTHLY', 'STRIPE_PRICE_ANNUAL',
         'STRIPE_TRIAL_DAYS', 'STRIPE_MANAGED_PAYMENTS', 'RESEND_API_KEY', 'EMAIL_FROM', 'ALERT_EMAIL',
@@ -5095,7 +5123,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Force-refresh the Infisical secret cache. This does not write plaintext
   // secrets into KV/D1/Cloudflare vars; optional KV cache entries are encrypted.
   r.post('/diagnostics/secrets/refresh', async (c) => {
-    return c.json({ secrets: await refreshSecrets(c.env) });
+    return c.json({ secrets: await refreshSecrets(c.env, { force: true }) });
   });
 
   // --- POST /diagnostics/secrets/update -----------------------------------
@@ -5117,7 +5145,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     await updateSecret(c.env, source, key, value);
     // Refresh the local cache to pull down the newly updated secret
-    return c.json({ ok: true, secrets: await refreshSecrets(c.env) });
+    return c.json({ ok: true, secrets: await refreshSecrets(c.env, { force: true }) });
   });
 
   // --- GET /settings ------------------------------------------------------
@@ -9991,12 +10019,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   r.get('/enrich-securities/status', async (c) => {
     const used = await getDailyUsed(c.env);
     const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(c.env);
+    const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(c.env.DB);
     const row = await first<{ pending: number }>(
       c.env.DB,
       `SELECT COUNT(*) AS pending FROM (
          SELECT t.ticker FROM transactions t
          LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
          WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+           AND ${enrichmentUnavailableExcludedSql('sr', { columnsPresent: has0104 })}
            AND ${enrichmentNeededSql('sr', retryIncomplete)}
          GROUP BY t.ticker)`,
     );
@@ -10192,6 +10222,48 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // fundamentals_eod / analyst_consensus and recomputes per-trade
   // performance anchors for imported tickers. Idempotent. Authorized by the
   // full ADMIN_TOKEN/Access OR the scoped INGEST_TOKEN (this endpoint only).
+  r.post('/securities/:ticker/price-unavailable', async (c) => {
+    const rawTicker = c.req.param('ticker');
+    const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
+    if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
+      return c.json({ error: 'invalid ticker' }, 400);
+    }
+    let body: PriceUnavailableBody;
+    try {
+      body = PriceUnavailableBodySchema.parse(await c.req.json());
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await markTickerPriceUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso, force: true });
+      return c.json({ ok: true, ticker, reason: body.reason, price_checked_at: nowIso });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  r.post('/securities/:ticker/enrichment-unavailable', async (c) => {
+    const rawTicker = c.req.param('ticker');
+    const ticker = typeof rawTicker === 'string' ? rawTicker.trim().toUpperCase() : '';
+    if (!ticker || !/^[A-Z0-9._-]{1,16}$/.test(ticker)) {
+      return c.json({ error: 'invalid ticker' }, 400);
+    }
+    let body: EnrichmentUnavailableBody;
+    try {
+      body = EnrichmentUnavailableBodySchema.parse(await c.req.json());
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
+    }
+    try {
+      const nowIso = new Date().toISOString();
+      await markTickerEnrichmentUnavailable(c.env, ticker, body.reason, { checkedAt: nowIso, force: true });
+      return c.json({ ok: true, ticker, reason: body.reason, enrichment_checked_at: nowIso });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
   r.post('/securities/import', async (c) => {
     // This endpoint runs inside a normal Worker request. Keep callers honest.
     // Paid Workers allow larger batches, but the cap remains configurable so
@@ -10413,14 +10485,33 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           if (latestCached?.d) {
             await run(
               c.env.DB,
-              `INSERT INTO securities_ref (ticker, latest_price_date, price_unavailable, price_checked_at)
-                 VALUES (?, ?, 0, ?)
+              `INSERT INTO securities_ref (ticker, latest_price_date, price_unavailable, price_checked_at, price_unavailable_reason)
+                 VALUES (?, ?, 0, ?, NULL)
                ON CONFLICT(ticker) DO UPDATE SET
                  latest_price_date = excluded.latest_price_date,
                  price_unavailable = 0,
-                 price_checked_at = excluded.price_checked_at`,
+                 price_checked_at = excluded.price_checked_at,
+                 price_unavailable_reason = NULL`,
               [ticker, latestCached.d, nowIso],
             );
+          } else if (
+            closes.length === 0
+            && !latestCached?.d
+            && typeof o.currentPrice !== 'number'
+          ) {
+            const refRow = await get<{ latest_price_date: string | null }>(
+              c.env.DB,
+              'SELECT latest_price_date FROM securities_ref WHERE ticker = ?',
+              [ticker],
+            );
+            if (!refRow?.latest_price_date) {
+              await markTickerPriceUnavailable(
+                c.env,
+                ticker,
+                PRICE_UNAVAILABLE_REASON_PEER_IMPORT_EMPTY,
+                { checkedAt: nowIso },
+              );
+            }
           }
           // Recompute BOTH the trade-date and filing-date anchors for this ticker
           // from the cached series, mirroring runPriceRefresh. The import now marks
@@ -11305,12 +11396,14 @@ async function marketCoverage(env: Env): Promise<MarketCoverage> {
  */
 export async function marketPending(env: Env): Promise<{ enrich: number; prices: number }> {
   const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(env);
+  const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(env.DB);
   const e = await first<{ n: number }>(
     env.DB,
     `SELECT COUNT(*) AS n FROM (
        SELECT t.ticker FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
        WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+         AND ${enrichmentUnavailableExcludedSql('sr', { columnsPresent: has0104 })}
          AND ${enrichmentNeededSql('sr', retryIncomplete)}
        GROUP BY t.ticker)`,
   );

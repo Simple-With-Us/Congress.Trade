@@ -2920,6 +2920,8 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
     expect(DASHBOARD_HTML.slice(alertsAt, alertsAt + 400)).toContain(canonical);
     expect(DASHBOARD_HTML).toContain('$8.99<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).toContain('$79.99<span class="per">/yr</span>');
+    expect(DASHBOARD_HTML).not.toContain('$9<span class="per">/mo</span>');
+    expect(DASHBOARD_HTML).not.toContain('$80<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).toContain('1-week free trial');
     expect(DASHBOARD_HTML).not.toContain('2-week free trial');
     expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');
@@ -4038,6 +4040,7 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
   function loadIsLatencyAhead(): (summary: LatencySummary) => boolean {
     const src = [
       extractVarDecl(DASHBOARD_HTML, 'SPEED_LANE_MIN_MATCHED'),
+      extractVarDecl(DASHBOARD_HTML, 'SPEED_MIN_COVERAGE_PCT'),
       extractFn(DASHBOARD_HTML, 'leadDirection'),
       extractFn(DASHBOARD_HTML, 'leadVerdict'),
       extractFn(DASHBOARD_HTML, 'isLatencyComparisonPublic'),
@@ -4147,8 +4150,42 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
         providers: [
           provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
           // Behind on raw counts, but comparisonStatus is only 'preliminary' —
-          // not adequate coverage, so it must not veto the definitive lead.
+          // without the coverage floor it must not veto the definitive lead.
           provider({ label: 'B', usFirstCount: 1, providerFirstCount: 9, comparisonStatus: 'preliminary' }),
+        ],
+      };
+      expect(isLatencyAhead(summary)).toBe(true);
+    });
+
+    it('lets a preliminary provider vote when both coverage floors hold', () => {
+      const summary = {
+        providers: [
+          provider({
+            label: 'A',
+            usFirstCount: 1,
+            providerFirstCount: 9,
+            medianLeadSec: -3600,
+            avgLeadSec: -1800,
+            comparisonStatus: 'preliminary',
+            ctCoveragePct: 90,
+            providerCoveragePct: 90,
+          }),
+        ],
+      };
+      expect(isLatencyAhead(summary)).toBe(false);
+    });
+
+    it('lets a preliminary provider qualify when both coverage floors hold', () => {
+      const summary = {
+        providers: [
+          provider({
+            label: 'A',
+            usFirstCount: 8,
+            providerFirstCount: 2,
+            comparisonStatus: 'preliminary',
+            ctCoveragePct: 90,
+            providerCoveragePct: 90,
+          }),
         ],
       };
       expect(isLatencyAhead(summary)).toBe(true);
