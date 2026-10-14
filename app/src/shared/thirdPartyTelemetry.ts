@@ -1548,10 +1548,6 @@ async function drainUsageTelemetryFallbackPage(
         throw error;
       })
     : { objects: [] as R2Object[], truncated: false as const };
-  if (r2Available) {
-    if (listed.truncated && 'cursor' in listed) cursor.r2 = listed.cursor;
-    else delete cursor.r2;
-  }
   let delivered = 0;
   let failed = 0;
   let expired = 0;
@@ -1561,9 +1557,16 @@ async function drainUsageTelemetryFallbackPage(
   // whole tick (CONGRESS-TRADE-1S).
   const drainStartedMs = Date.now();
   const drainBudgetMs = 6_500;
+  // Publish the next page token only after every object on this page is
+  // visited.  listed.cursor points past this page; saving it on a budget
+  // break skips the objects not yet processed until wrap-around.
+  let r2PageFinished = true;
   for (const object of listed.objects) {
     abortIfSignal(options.signal);
-    if (Date.now() - drainStartedMs > drainBudgetMs) break;
+    if (Date.now() - drainStartedMs > drainBudgetMs) {
+      r2PageFinished = false;
+      break;
+    }
     if (object.uploaded && now - object.uploaded.getTime() > ttlMs) {
       try {
         await storage?.delete(object.key);
@@ -1607,6 +1610,10 @@ async function drainUsageTelemetryFallbackPage(
     } catch {
       failed += 1;
     }
+  }
+  if (r2Available && r2PageFinished) {
+    if (listed.truncated && 'cursor' in listed) cursor.r2 = listed.cursor;
+    else delete cursor.r2;
   }
   // Maintain the O(1) admission counter. When the bounded list was the entire
   // outbox (not truncated and starting at the prefix), the exact remainder is known, so set it

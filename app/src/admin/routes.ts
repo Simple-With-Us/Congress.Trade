@@ -10365,7 +10365,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         try {
           await batchPrepared(c.env.DB, chunk.map((r) => r.stmt));
           summary.refs += chunk.length;
-        } catch {
+        } catch (err) {
+          // Lock exhaustion must reach the outer 503.  A 200 with the busy
+          // error buried in summary.errors tells the peer the import stuck.
+          if (isSqliteLockBusy(err)) throw err;
           // Batch failed as a unit — retry the chunk row-by-row to surface the
           // specific ticker(s) at fault without dropping the whole chunk.
           for (const r of chunk) {
@@ -10373,6 +10376,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
               await r.stmt.run();
               summary.refs++;
             } catch (e) {
+              if (isSqliteLockBusy(e)) throw e;
               summary.errors.push(r.ticker + ' ref: ' + (e as Error).message);
             }
           }
@@ -10543,6 +10547,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           summary.pricedTickers++;
           summary.perfTickers++;
         } catch (e) {
+          if (isSqliteLockBusy(e)) throw e;
           summary.errors.push(ticker + ' price: ' + (e as Error).message);
         }
       }

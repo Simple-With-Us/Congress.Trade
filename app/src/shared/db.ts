@@ -65,16 +65,29 @@ export function isSqliteLockBusy(err: unknown): boolean {
 export const SQLITE_LOCK_BUSY_RETRY_DELAYS_MS = [50, 150, 400] as const;
 
 /**
+ * An attempt that already lasted this long has burned the libsql file client's
+ * busy_timeout (10s).  Another attempt would stack another full wait on the
+ * single connection and blow the 8s and 18s maintenance lane budgets.
+ * Immediate lock errors (SQLITE_BUSY_SNAPSHOT, statements in progress) return
+ * faster than this and stay retriable.
+ */
+export const SQLITE_LOCK_RETRY_ATTEMPT_BUDGET_MS = 1_000;
+
+/**
  * Re-run `op` when SQLite is busy or a statement is already in progress.
  * Any other error throws on the first failure, so a missing table is not retried.
+ * A lock error that already waited out the driver busy timeout is not retried.
  */
 export async function withSqliteLockRetry<T>(op: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
+    const startedMs = Date.now();
     try {
       return await op();
     } catch (err) {
       const delayMs = SQLITE_LOCK_BUSY_RETRY_DELAYS_MS[attempt];
-      if (!isSqliteLockBusy(err) || delayMs === undefined) throw err;
+      const attemptMs = Date.now() - startedMs;
+      const driverAlreadyWaited = attemptMs >= SQLITE_LOCK_RETRY_ATTEMPT_BUDGET_MS;
+      if (!isSqliteLockBusy(err) || delayMs === undefined || driverAlreadyWaited) throw err;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
