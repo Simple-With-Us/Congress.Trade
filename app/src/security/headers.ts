@@ -13,6 +13,12 @@
  * exceptions (QABUGHUNT-01 / WEBPERF-01): every font (Zilla Slab, and now
  * Inter) is self-hosted under /assets/*, so the third-party Google Fonts
  * request — and the CSP holes it required — is gone, not just fixed.
+ *
+ * worker-src is widened to 'self' blob: only when Sentry is enabled, because
+ * the Sentry browser SDK's Replay integration (bundle.tracing.replay.*) creates
+ * a blob: worker to capture DOM mutations. Without this, every page load emits
+ * a console error and the replay worker silently fails to start. Without
+ * Sentry, the default 'none' for worker-src is the right tight default.
  */
 
 import type { MiddlewareHandler } from 'hono';
@@ -43,6 +49,9 @@ export function buildContentSecurityPolicy(opts: {
     ...(opts.rumConnectOrigins ?? []),
     ...(opts.sentryConnectOrigins ?? []),
   ].join(' ');
+  // Sentry Replay creates a blob: worker. 'self' is also needed so the worker
+  // can importScripts from the Sentry CDN origin (already in script-src).
+  const worker = opts.sentryScriptSrc ? "'self' blob:" : "'none'";
   return [
     "default-src 'self'",
     "base-uri 'self'",
@@ -58,6 +67,7 @@ export function buildContentSecurityPolicy(opts: {
     // is not CSP-blocked on every anonymous load (issue #1457).
     // Datadog RUM origins are added only when a complete public RUM config exists.
     `connect-src ${connect}`,
+    `worker-src ${worker}`,
     "form-action 'self'",
   ].join('; ');
 }
