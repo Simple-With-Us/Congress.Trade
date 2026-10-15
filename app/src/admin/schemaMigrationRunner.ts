@@ -17,10 +17,12 @@ const SAFE_SQL_IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
  * POST /api/admin/migrate (Coolify auto-deploy does not call ship.sh).
  */
 async function sqliteTableExists(db: D1Database, table: string): Promise<boolean> {
+  if (!SAFE_SQL_IDENTIFIER.test(table)) {
+    throw new Error(`unsafe SQLite identifier: ${table}`);
+  }
   const row = await get<{ name: string }>(
     db,
-    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`,
-    [table],
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = '${table}'`,
   );
   return row !== null;
 }
