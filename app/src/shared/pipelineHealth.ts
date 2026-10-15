@@ -6,6 +6,7 @@
  */
 
 import type { Env } from './types.ts';
+import { OGE_TEXT_UNREADABLE_DECISION_ACTION } from './ingestionDecisions.ts';
 import { all, get } from './db.ts';
 import { getLastPollAt } from './config.ts';
 import {
@@ -17,6 +18,7 @@ import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
 import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
+import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { classifyFailedOutboxRow } from '../ingestion/transientDlq.ts';
@@ -43,6 +45,14 @@ import {
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
+/** Actions that mean "we produced no usable rows".  Unreadable is included:
+ *  a refused 278-T is not evidence the filing is empty. */
+export type FilingSkipAction =
+  | 'extract_empty_failure'
+  | 'auto_resolved_empty'
+  | 'doc_quarantined'
+  | typeof OGE_TEXT_UNREADABLE_DECISION_ACTION;
+
 export interface PipelineCheck {
   id: string;
   status: PipelineStatus;
@@ -60,7 +70,7 @@ export interface PipelineCheck {
     | { worstBehind: number; legs: Record<string, { date: string | null; behind: number | null }> }
     | {
         total: number;
-        byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number>>;
+        byAction: Partial<Record<FilingSkipAction, number>>;
         threshold: number;
       }
     | {
@@ -128,7 +138,7 @@ export interface PipelineSignals {
   /**
    * 2026-09-21: count of filings in the last 24h whose extract produced zero
    * usable transactions (`extract_empty_failure`, `auto_resolved_empty`,
-   * `doc_quarantined`). These outcomes are almost-always an app error
+   * `doc_quarantined`, `oge_text_unreadable`). These outcomes are almost-always an app error
    * (corrupt parse, OCR failure, model dead-letter) — not a real "this
    * filing was blank". A non-zero count is the loud red flag the admin
    * surface and Pushover liveness alarm look for. Tunable via env
@@ -136,7 +146,7 @@ export interface PipelineSignals {
    */
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
-  filingSkipsByAction24h: Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number> | null;
+  filingSkipsByAction24h: Record<FilingSkipAction, number> | null;
   /**
    * 2026-09-21: FMP-family latency summary for both admin and user surfaces.
    * The user-facing dashboard renders `lastObservationAgeSec` + `observationCount24h`
@@ -238,6 +248,16 @@ export interface PipelineSignals {
       status: number | null;
       checkedAt: string;
       host?: string;
+    } | null;
+  } | null;
+  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  senateEfd?: {
+    probe: {
+      ok: boolean;
+      status: number | null;
+      checkedAt: string;
+      egress?: string | null;
+      error?: string | null;
     } | null;
   } | null;
   /**
@@ -666,7 +686,7 @@ export function evaluatePipelineSignals(
     }
   }
 
-  // 4. Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined).
+  // 4. Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   // Owner 2026-09-21 ask: "big red flag ... anytime a filing is skipped or
   // considered empty or blank or unreadable since that is almost always
   // false and app error." These three outcomes are the "almost always an
@@ -685,7 +705,7 @@ export function evaluatePipelineSignals(
       return Number.isFinite(n) && n >= 0 ? Math.min(n, 100) : 0;
     })();
     if (s.filingSkips24h > threshold) {
-      const byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number>> =
+      const byAction: Partial<Record<FilingSkipAction, number>> =
         s.filingSkipsByAction24h ?? {};
       const breakdown = Object.entries(byAction)
         .filter(([, v]) => typeof v === 'number' && v > 0)
@@ -1083,6 +1103,47 @@ export function evaluatePipelineSignals(
     }
   }
 
+  if (s.senateEfd === undefined) {
+    /* optional — fixtures predating the direct eFD probe omit this signal */
+  } else if (s.senateEfd == null) {
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
+  } else if (!s.senateEfd.probe) {
+    checks.push({
+      id: 'senate_efd',
+      status: 'unknown',
+      detail: 'Senate eFD direct landing not yet probed',
+      value: null,
+    });
+  } else {
+    const probe = s.senateEfd.probe;
+    const checkedMs = Date.parse(probe.checkedAt);
+    const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
+    if (!probe.ok) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'stalled',
+        detail: `Senate eFD direct landing unreachable`
+          + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+          + `${probe.error ? ` — ${probe.error}` : ''}`,
+        value: probe.status,
+      });
+    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        value: Math.round(ageMin),
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'ok',
+        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        value: Math.round(ageMin * 10) / 10,
+      });
+    }
+  }
+
   // Price / S&P cache freshness (board row 6c05e09b). Every "excess vs S&P" figure
   // is current_price against the latest S&P close, so a stalled price cache turns
   // into confidently wrong performance numbers with nothing alerting: prod sat
@@ -1219,7 +1280,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   let strandedFilings: number | null = null;
   let priceEodLatestDate: string | null = null;
   let spxEodLatestDate: string | null = null;
-  // 2026-09-21: filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined).
+  // Filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
@@ -1240,24 +1301,32 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // parse, OCR failure, vision model dead-letter). Real blank filings are
   // vanishingly rare — the docs are PDFs from official sources.
   try {
-    const res = await get<{ extract_empty_failure: number | null; auto_resolved_empty: number | null; doc_quarantined: number | null }>(
+    const res = await get<{
+      extract_empty_failure: number | null;
+      auto_resolved_empty: number | null;
+      doc_quarantined: number | null;
+      oge_text_unreadable: number | null;
+    }>(
       env.DB,
       `SELECT
          SUM(CASE WHEN action = 'extract_empty_failure' THEN 1 ELSE 0 END) AS extract_empty_failure,
          SUM(CASE WHEN action = 'auto_resolved_empty'   THEN 1 ELSE 0 END) AS auto_resolved_empty,
-         SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined
+         SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined,
+         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable
        FROM ingestion_decisions
        WHERE created_at >= ?`,
-      [iso24hAgo],
+      [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
     );
     const ee = Number(res?.extract_empty_failure ?? 0);
     const ar = Number(res?.auto_resolved_empty ?? 0);
     const dq = Number(res?.doc_quarantined ?? 0);
-    filingSkips24h = ee + ar + dq;
+    const unread = Number(res?.oge_text_unreadable ?? 0);
+    filingSkips24h = ee + ar + dq + unread;
     filingSkipsByAction24h = {
       extract_empty_failure: ee,
       auto_resolved_empty: ar,
       doc_quarantined: dq,
+      oge_text_unreadable: unread,
     };
   } catch {}
 
@@ -1637,6 +1706,13 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   }
 
+  let senateEfd: PipelineSignals['senateEfd'] = { probe: null };
+  try {
+    senateEfd = { probe: await readSenateEfdProbe(env) };
+  } catch {
+    senateEfd = null;
+  }
+
   const signals: PipelineSignals = {
     outboxPending,
     outboxOldestAt,
@@ -1665,6 +1741,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     senateRelay,
     residentialProxyConfigured,
     residentialProxy,
+    senateEfd,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,

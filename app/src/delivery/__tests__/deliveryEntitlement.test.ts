@@ -81,7 +81,16 @@ function targetFetch() {
       return Response.json({ Status: 0, Answer: type === 'A' ? [{ type: 1, data: '93.184.216.34' }] : [] });
     }
     targetCalls += 1;
-    return new Response('ok', { status: 200 });
+    return new Response(
+      JSON.stringify({
+        receiptVersion: 1,
+        delivered: true,
+        consumed: true,
+        ok: true,
+        applied: 1,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
   });
   return { fetchMock, targetCalls: () => targetCalls };
 }

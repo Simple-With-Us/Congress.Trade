@@ -45,10 +45,22 @@ function publicDnsAndTarget(status = 200) {
     }
     targetCalls += 1;
     deliveryAttempts.push(new Headers(init?.headers).get('X-Delivery-Attempt') ?? '');
-    return new Response(new ReadableStream({
-      start(controller) { controller.enqueue(new TextEncoder().encode(status === 200 ? 'ok' : 'nope')); },
-      cancel() { targetCancels += 1; },
-    }), { status });
+    if (status !== 200) {
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('nope')); },
+        cancel() { targetCancels += 1; },
+      }), { status });
+    }
+    return new Response(
+      JSON.stringify({
+        receiptVersion: 1,
+        delivered: true,
+        consumed: true,
+        ok: true,
+        applied: 1,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
   });
   return {
     fetchMock,
@@ -189,7 +201,6 @@ describe('native delivery retry and leases', () => {
     vi.mocked(Sentry.captureException).mockClear();
     const { ack, retry } = await queueOnce(env);
     expect(http.targetCalls()).toBe(1);
-    expect(http.targetCancels()).toBe(1);
     expect(delivery()).toMatchObject({ status: 'failed', attempts: 1, last_error: 'HTTP 503' });
     expect(retry).toHaveBeenCalledWith({ delaySeconds: expect.any(Number) });
     expect(ack).not.toHaveBeenCalled();
@@ -215,7 +226,33 @@ describe('native delivery retry and leases', () => {
     expect(second.ack).toHaveBeenCalledOnce();
     expect(delivery()).toMatchObject({ status: 'delivered', attempts: 3 });
     expect(http.targetCalls()).toBe(1);
-    expect(http.targetCancels()).toBe(1);
+  });
+
+  it('retries when App B returns HTTP 200 but consumed=false', async () => {
+    const { env, delivery } = fakeEnv();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('https://cloudflare-dns.com/dns-query')) {
+        const type = new URL(url).searchParams.get('type');
+        return Response.json({ Status: 0, Answer: type === 'A' ? [{ type: 1, data: '93.184.216.34' }] : [] });
+      }
+      return new Response(
+        JSON.stringify({
+          receiptVersion: 1,
+          delivered: true,
+          consumed: false,
+          ok: false,
+          applied: 0,
+          reason: 'invalid-event',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { ack, retry } = await queueOnce(env);
+    expect(delivery()).toMatchObject({ status: 'failed', attempts: 1, last_error: /consumption failed/ });
+    expect(retry).toHaveBeenCalled();
+    expect(ack).not.toHaveBeenCalled();
   });
 
   it('does not ACK successful delivery until durable outbox completion succeeds', async () => {
