@@ -12235,7 +12235,7 @@ function seeAllTradesLinkHtml(total, filterQuery) {
   if (!n || !q) return '';
   var label = 'See all ' + fmtCount(n) + ' trade' + (n === 1 ? '' : 's') + ' \u2192';
   var href = seeAllTradesHref(q);
-  return '<p class="drawer-see-all"><a class="drawer-see-all-link" href="' + esc(href) + '" onclick="return navigateTradesFromDrawer(event, ' + JSON.stringify(q) + ')">' + esc(label) + '</a></p>';
+  return '<p class="drawer-see-all"><a class="drawer-see-all-link" href="' + esc(href) + '" data-trades-fq="' + esc(q) + '" onclick="return navigateTradesFromDrawer(event, this.dataset.tradesFq)">' + esc(label) + '</a></p>';
 }
 function navigateTradesFromDrawer(e, filterQuery) {
   var q = String(filterQuery || '').trim();
