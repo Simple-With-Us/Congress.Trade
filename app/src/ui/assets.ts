@@ -69,7 +69,7 @@ export const APPLE_TOUCH_ICON_PNG = loadAsset('apple-touch-icon.png', 'image/png
 export const FAVICON_PNG = loadAsset('favicon.png', 'image/png');
 
 /** Cache-bust query for og:image URLs. Bump when regenerating social cards. */
-export const OG_IMAGE_VERSION = '23';
+export const OG_IMAGE_VERSION = '24';
 
 /** Absolute path to the public asset root (for tests / tooling). */
 export const PUBLIC_ASSETS_DIR = PUBLIC_DIR;

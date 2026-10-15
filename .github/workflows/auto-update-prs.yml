@@ -5,7 +5,8 @@ name: Auto Update PRs
 # This workflow merges `main` into open PR branches using GITHUB_TOKEN. GitHub's
 # recursion guard suppresses ALL workflow runs on a GITHUB_TOKEN-authored push,
 # so every sync commit it writes lands a PR head that can never pass CI: the
-# required checks (`typecheck + test` and `gitleaks`, ruleset 20961339) never
+# required checks (`typecheck + test`, `gitleaks`, and `xcodebuild (unsigned)`;
+# ruleset 20961339) never
 # report, mergeStateStatus stays BLOCKED, and the PR can never merge.
 #
 # The old `PR_FILTER: "auto_merge"` made that a self-sustaining DEADLOCK, because

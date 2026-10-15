@@ -24,7 +24,7 @@ import {
   looksLikeHeaderContaminatedAsset,
   looksLikeNothingToReport,
   looksLikeOgePart7ExplicitNone,
-  dropPtrFormSampleParsedRows,
+  dropPtrFormSamplesForPublish,
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
@@ -383,7 +383,7 @@ export async function normalize(
   // Drop form-chrome rows up front. Pure letterhead OCR floods were parking
   // hundreds of "Clerk of the House…" fakes in review_queue and burning the
   // agreement cascade budget on documents with zero real trades.
-  const usableParsed = dropPtrFormSampleParsedRows(parsed).filter((p) =>
+  const usableParsed = dropPtrFormSamplesForPublish(filing.docId, parsed).filter((p) =>
     !looksLikeHeaderContaminatedAsset(p.assetName)
     && !looksLikeSeeAttachmentPointer(p.assetName)
     && !looksLikeSeeAttachmentPointer(p.rawText)
@@ -550,7 +550,8 @@ export async function normalize(
 
   if (needsReview) {
     // A refused 278-T is not an empty filing.  docClassifier calls every
-    // text_pdf `typed`, so this is the close the empty doc-class path misses.
+    // text_pdf `typed`, so this is the park the empty doc-class path misses.
+    // The row stays open for a human.  It is not resolved in this tick.
     if (
       filing.chamber === 'executive'
       && flagged.length === 0
@@ -569,7 +570,7 @@ export async function normalize(
         return {
           transactions: [],
           minConfidence: 0,
-          needsReview: false,
+          needsReview: true,
           published: false,
           reviewReason: OGE_TEXT_UNREADABLE_REASON,
         };
