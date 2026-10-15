@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Filing, ParsedTx } from '../../shared/types.ts';
 import {
   OPENROUTER_FILES_HOLD_USD,
@@ -13,7 +13,11 @@ import {
   isHousePaperScanDocId,
   looksLikePlausibleTradeTable,
   looksLikeHeaderContaminatedAsset,
+  dropPtrFormSampleParsedRows,
+  dropPtrFormSamplesForPublish,
+  looksLikeHousePrintedExampleAsset,
   looksLikePtrFormSampleAsset,
+  looksLikePtrFormSampleDate,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
   looksLikeNothingToReport,
@@ -220,6 +224,142 @@ describe('evaluateExtractQuality — hard-stops', () => {
       amountRange: '$1,001 - $15,000',
       txDate: '2020-01-15',
     })).toBe(true);
+  });
+
+  it('drops OCR spellings of the House PTR example row and keeps real names', () => {
+    const samples = [
+      'Exempl Mfg Corp.',
+      'Exempl Mfg Corp Common Stock',
+      'Example Mfg. Corp.',
+      'Ex Mpi Meg Corp.',
+      'Mega Corp.',
+      'Example Meg Corp.',
+      'Example: Meg Corp Common Stock',
+      'Exempl Manufacturing Corp',
+      'Example Mega Corp Common Stock',
+      'Exemplje Mega Corp.',
+    ];
+    for (const name of samples) {
+      expect(looksLikeHousePrintedExampleAsset(name), name).toBe(true);
+      expect(looksLikePtrFormSampleAsset(name), name).toBe(true);
+    }
+
+    const kept = [
+      'AAPL',
+      'MSFT',
+      'Apple Inc',
+      'Microsoft Corporation',
+      'Exxon Mobil Corp.',
+      'Omega Corp',
+      'American Mega Corp',
+      'Mega Corp Holdings Inc',
+      '3M Company',
+      'AbbVie Inc.',
+    ];
+    for (const name of kept) {
+      expect(looksLikeHousePrintedExampleAsset(name), name).toBe(false);
+      expect(looksLikePtrFormSampleAsset(name), name).toBe(false);
+    }
+
+    expect(looksLikePtrFormSampleDate('2012-08-14')).toBe(true);
+    expect(looksLikePtrFormSampleDate('2020-02-05')).toBe(true);
+    expect(looksLikePtrFormSampleDate('2020-05-02')).toBe(true);
+    expect(looksLikePtrFormSampleDate('8/14/12')).toBe(true);
+    expect(looksLikePtrFormSampleDate('2020-11-16')).toBe(false);
+    expect(looksLikePtrFormSampleDate('2020-05-14')).toBe(false);
+    expect(looksLikePtrFormSampleDate('2012-05-01')).toBe(false);
+    expect(looksLikePtrFormSampleDate('2012-04-12')).toBe(false);
+    expect(looksLikePtrFormSampleDate('2026-02-05')).toBe(false);
+    expect(looksLikePtrFormSampleDate('2026-08-19')).toBe(false);
+
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Example Meg Corp.',
+      rawText: 'Example Meg Corp Common Stock',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2020-05-02',
+    })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Ex Mpi Meg Corp.',
+      rawText: 'Ex Mpi Meg Corp. S',
+      amountRange: '$50,001 - $100,000',
+      txDate: '2026-07-30',
+    })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Mega Corp.',
+      rawText: '',
+      amountRange: '$15,001 - $50,000',
+      txDate: '2026-02-05',
+    })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'US Treasury note',
+      rawText: 'Ex Mpi Meg Corp P 02/05/20',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2026-09-01',
+    })).toBe(true);
+
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'AbbVie Inc.',
+      rawText: 'AbbVie Inc. purchase',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2020-11-16',
+    })).toBe(false);
+    expect(looksLikePtrFormSampleRow({
+      assetName: '3M Company',
+      rawText: '3M Company',
+      amountRange: '$15,001 - $50,000',
+      txDate: '2020-05-14',
+    })).toBe(false);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Mega Corp Holdings Inc',
+      rawText: 'Mega Corp Holdings Inc common stock',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2012-08-14',
+    })).toBe(false);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Exxon Mobil Corp.',
+      rawText: 'Exxon Mobil Corp. P 8/14/12',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2012-08-14',
+    })).toBe(false);
+
+    const keptRows = dropPtrFormSampleParsedRows([
+      tx({
+        assetName: 'Example Meg Corp.',
+        ticker: null,
+        txDate: '2020-05-02',
+        rawText: 'Example Meg Corp Common Stock',
+      }),
+      tx({
+        assetName: 'Us Tsy Note 4.00',
+        ticker: null,
+        txDate: '2026-09-01',
+        rawText: 'Us Tsy Note 4.00',
+      }),
+      tx({
+        assetName: 'KKR Private Equity Conglomerate LLC',
+        ticker: null,
+        txDate: '2026-08-26',
+        rawText: 'KKR Private Equity Conglomerate LLC',
+      }),
+    ]);
+    expect(keptRows.map((row) => row.assetName)).toEqual([
+      'Us Tsy Note 4.00',
+      'KKR Private Equity Conglomerate LLC',
+    ]);
+  });
+
+  it('logs a dropped House sample row to Sentry on the publish path', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const kept = dropPtrFormSamplesForPublish('H-2026-9116357', [
+      tx({ assetName: 'Example Meg Corp.', ticker: null, txDate: '2020-05-02' }),
+      tx({ assetName: 'AbbVie Inc.', ticker: null, txDate: '2020-11-16' }),
+    ]);
+    expect(kept.map((row) => row.assetName)).toEqual(['AbbVie Inc.']);
+    expect(warn).toHaveBeenCalledWith('ptr.form_sample_dropped', expect.objectContaining({
+      docId: 'H-2026-9116357',
+      dropped: 1,
+    }));
+    warn.mockRestore();
   });
 
   it('hard-stops letterhead-as-asset (Clerk / B81 Cannon)', () => {

@@ -24,7 +24,7 @@ import {
   looksLikeHeaderContaminatedAsset,
   looksLikeNothingToReport,
   looksLikeOgePart7ExplicitNone,
-  dropPtrFormSampleParsedRows,
+  dropPtrFormSamplesForPublish,
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
@@ -383,7 +383,7 @@ export async function normalize(
   // Drop form-chrome rows up front. Pure letterhead OCR floods were parking
   // hundreds of "Clerk of the House…" fakes in review_queue and burning the
   // agreement cascade budget on documents with zero real trades.
-  const usableParsed = dropPtrFormSampleParsedRows(parsed).filter((p) =>
+  const usableParsed = dropPtrFormSamplesForPublish(filing.docId, parsed).filter((p) =>
     !looksLikeHeaderContaminatedAsset(p.assetName)
     && !looksLikeSeeAttachmentPointer(p.assetName)
     && !looksLikeSeeAttachmentPointer(p.rawText)
