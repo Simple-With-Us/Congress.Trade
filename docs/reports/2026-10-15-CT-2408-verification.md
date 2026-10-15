@@ -12,8 +12,10 @@ the price lane.
 
 ## Verdict
 
-**Already fixed on `main` by merged PRs #2724 and #2726.**  No additional
-application code is required for CT-2408.
+**Already fixed on `main` by merged PRs #2724, #2726, and #2738** (tail-backlog
+stall suppression + shared `peerPricePending` SQL aligned with the price refresh
+selector).  **No further application code is required for CT-2408**; this report
+is the documentation closeout only.
 
 ## What #2724 fixed (`st_peer_prices`)
 
@@ -45,11 +47,21 @@ From `app/`:
 
 - `npm test -- src/ingestion/__tests__/stPeerPricesStall.test.ts src/shared/__tests__/competitorFixtures.test.ts` → pass (10 tests).
 
+## What #2738 added (tail backlog, same ticket)
+
+- `app/src/prices/peerPricePending.ts` — shared pending predicate with
+  `selectTickersNeedingPrices` / stall detector.
+- Suppresses `st_peer_prices` stall when the corpus EOD is current through
+  `lastTradingDay` and at most five tail tickers remain (permanent junk / FIFO
+  tail without paging the whole fleet).
+
+Rollout: `docs/rollouts/2026-10-15-st-peer-prices-tail-stall.md`.
+
 ## Overlap / scope
 
 - Held iOS/pricing PRs **#2614–#2619** were not touched.
-- Open **#2735** (schema startup migrate for `price_unavailable_reason`) is
-  deploy hygiene, not a CT-2408 stall-logic change.
+- **#2735** (schema startup migrate for `price_unavailable_reason`) is deploy
+  hygiene, not stall-logic (merged separately on `main`).
 
 ## Post-deploy expectation
 
