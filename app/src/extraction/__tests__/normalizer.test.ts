@@ -768,7 +768,7 @@ describe('normalize', () => {
     expect(String(cap.reviewRows[0][1])).toContain('extract_empty_failure');
   });
 
-  it('closes a refused executive extract as unreadable, not verified_empty', async () => {
+  it('parks a refused executive extract as unreadable, not verified_empty', async () => {
     const { env, cap } = makeEnv([]);
     const result = await normalize(
       env,
@@ -781,13 +781,17 @@ describe('normalize', () => {
       [],
       { extractor: 'ogeText', parseDisposition: 'unreadable' },
     );
-    expect(result.needsReview).toBe(false);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
     expect(result.reviewReason).toContain('oge_text_unreadable');
     expect(result.reviewReason).toContain('ocr_unusable');
     const sql = cap.batches.flat().join('\n');
-    expect(sql).toContain('resolution_kind = ?');
+    expect(sql).toContain("ingest_status = 'needs_review'");
+    expect(sql).not.toContain('resolution_kind = ?');
     expect(sql).not.toContain("ingest_status = 'verified_empty'");
-    expect(cap.auditRows.some((row) => row[2] === 'rejected' && row[5] === 'oge_text_unreadable')).toBe(true);
+    expect(sql).not.toMatch(/SET resolved = 1/i);
+    expect(cap.auditRows.some((row) => row[2] === 'oge_text_unreadable' && row[3] === 'oge_text_unreadable')).toBe(true);
+    expect(cap.auditRows.some((row) => row[2] === 'rejected')).toBe(false);
   });
 
   it('closes a refused executive extract only against the captured review revision', async () => {
@@ -805,19 +809,20 @@ describe('normalize', () => {
       [],
       { extractor: 'ogeText', parseDisposition: 'unreadable' },
     );
-    expect(result.needsReview).toBe(false);
-    // The close UPDATE must carry the snapshot's review_revision in its guard
-    // (writeClose appends the reviewWhere params after docId), so a row revised
-    // after the snapshot is left for the human instead of resolved by a stale
-    // zero-row parse.
+    expect(result.needsReview).toBe(true);
+    // The park UPDATE must carry the snapshot's review_revision in its guard
+    // (openUnreadableParkSql appends the reviewWhere params after docId), so a
+    // row revised after the snapshot is left for the human instead of relabeled
+    // by a stale zero-row parse.  It must not resolve the row.
     const closeIdx = cap.batches.findIndex((batch) =>
-      batch.some((sql) => /UPDATE review_queue\s+SET resolved = 1/i.test(sql)),
+      batch.some((sql) => /UPDATE review_queue\s+SET resolved = 0/i.test(sql)),
     );
     expect(closeIdx).toBeGreaterThanOrEqual(0);
     const closeParams = cap.batchParams[closeIdx][
-      cap.batches[closeIdx].findIndex((sql) => /UPDATE review_queue\s+SET resolved = 1/i.test(sql))
+      cap.batches[closeIdx].findIndex((sql) => /UPDATE review_queue\s+SET resolved = 0/i.test(sql))
     ];
     expect(closeParams).toContain(7);
+    expect(cap.batches.flat().some((sql) => /SET resolved = 1/i.test(sql))).toBe(false);
   });
 
   it('closes a verified-empty executive extract only against the captured review revision', async () => {
