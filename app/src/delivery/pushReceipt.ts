@@ -59,16 +59,15 @@ const CongressPushApplyLikeSchema = z
   })
   .strict();
 
-const LegacyCongressPushReceiptEnvelopeSchema = z
-  .object({
-    ok: z.boolean().optional(),
-    applied: nonNegativeInt.optional(),
-    type: z.string().trim().min(1).optional(),
-    reason: z.string().trim().min(1).optional(),
-    duplicate: z.boolean().optional(),
-    results: z.array(CongressPushApplyLikeSchema).optional(),
-  })
-  .strict();
+/** Legacy shim: strip unknown keys (non-strict) so extra fields do not widen fail-open. */
+const LegacyCongressPushReceiptEnvelopeSchema = z.object({
+  ok: z.boolean().optional(),
+  applied: nonNegativeInt.optional(),
+  type: z.string().trim().min(1).optional(),
+  reason: z.string().trim().min(1).optional(),
+  duplicate: z.boolean().optional(),
+  results: z.array(CongressPushApplyLikeSchema).optional(),
+});
 
 function eventConsumed(result: CongressPushApplyLike): boolean {
   return result.ok === true;
@@ -173,6 +172,12 @@ export function congressPushReceiptFailureReason(parsed: ParseCongressPushReceip
 /** Max bytes to read from App B's webhook response body when validating consumption. */
 export const WEBHOOK_PUSH_RECEIPT_MAX_BYTES = 32_768;
 
+/** Release an unread subscriber webhook response body (Workers outbound connection budget). */
+export async function releaseSubscriberWebhookResponseBody(response: Response): Promise<void> {
+  if (response.bodyUsed) return;
+  await response.body?.cancel().catch(() => {});
+}
+
 export async function readWebhookPushReceipt(response: Response): Promise<ParseCongressPushReceiptResult> {
   const contentType = response.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().includes('application/json')) {
@@ -200,7 +205,7 @@ export async function readWebhookPushReceipt(response: Response): Promise<ParseC
 export async function webhookSubscriberConsumptionError(response: Response): Promise<string | null> {
   const contentType = response.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().includes('application/json')) {
-    await response.body?.cancel().catch(() => {});
+    await releaseSubscriberWebhookResponseBody(response);
     return null;
   }
   const text = await response.text();

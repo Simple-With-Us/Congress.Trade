@@ -32,7 +32,6 @@ interface DeliveryState {
 
 function publicDnsAndTarget(status = 200) {
   let targetCalls = 0;
-  let targetCancels = 0;
   const deliveryAttempts: string[] = [];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -45,7 +44,7 @@ function publicDnsAndTarget(status = 200) {
     if (status !== 200) {
       return new Response(new ReadableStream({
         start(controller) { controller.enqueue(new TextEncoder().encode('nope')); },
-        cancel() { targetCancels += 1; },
+        cancel() {},
       }), { status });
     }
     return new Response(
@@ -62,7 +61,6 @@ function publicDnsAndTarget(status = 200) {
   return {
     fetchMock,
     targetCalls: () => targetCalls,
-    targetCancels: () => targetCancels,
     deliveryAttempts: () => deliveryAttempts,
   };
 }

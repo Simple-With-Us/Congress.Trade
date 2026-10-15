@@ -3,6 +3,7 @@ import {
   congressPushReceiptFailureReason,
   parseCongressPushReceipt,
   readWebhookPushReceipt,
+  releaseSubscriberWebhookResponseBody,
   webhookSubscriberConsumptionError,
 } from '../pushReceipt.ts';
 
@@ -39,6 +40,17 @@ describe('pushReceipt', () => {
     expect(parsed.receipt.consumed).toBe(true);
   });
 
+  it('fails closed on legacy ok:false even with extra envelope keys', () => {
+    const parsed = parseCongressPushReceipt({
+      ok: false,
+      applied: 0,
+      reason: 'invalid-event',
+      traceId: 'extra-field',
+    });
+    expect(parsed.ok).toBe(true);
+    expect(congressPushReceiptFailureReason(parsed)).toMatch(/invalid-event/);
+  });
+
   it('reads JSON receipts from fetch responses', async () => {
     const response = new Response(
       JSON.stringify({
@@ -55,8 +67,21 @@ describe('pushReceipt', () => {
   });
 
   it('webhookSubscriberConsumptionError ignores plain 2xx non-JSON bodies', async () => {
-    const response = new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } });
+    let cancelled = false;
+    const response = new Response(new ReadableStream({
+      cancel() { cancelled = true; },
+    }), { status: 200, headers: { 'content-type': 'text/plain' } });
     expect(await webhookSubscriberConsumptionError(response)).toBeNull();
+    expect(cancelled).toBe(true);
+  });
+
+  it('releaseSubscriberWebhookResponseBody cancels unread bodies', async () => {
+    let cancelled = false;
+    const response = new Response(new ReadableStream({
+      cancel() { cancelled = true; },
+    }), { status: 503 });
+    await releaseSubscriberWebhookResponseBody(response);
+    expect(cancelled).toBe(true);
   });
 
   it('webhookSubscriberConsumptionError ignores generic JSON without receipt fields', async () => {
