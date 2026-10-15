@@ -25,7 +25,8 @@
  * unresolved with reason `extract_empty_failure`, and do NOT escalate tiers
  * (escalating burns budget on a dead extract).  An executive 278e whose
  * deterministic read also found no 278-T table closes as verified_empty
- * instead.  A deterministic refusal (garbled 278-T) closes as unreadable.
+ * instead.  A deterministic refusal (garbled 278-T) parks open as unreadable
+ * for a human.  It is not a terminal reject.
  * Capped-row recovery must not relabel either outcome as
  * agreement_cascade_unresolved.
  *
@@ -87,7 +88,7 @@ import {
   type CandidateDocResult,
   type CandidateInvocation,
 } from './bakeoff.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { canonicalArbitrationKeys } from '../extractors/types.ts';
 import {
   recomputeTransactions,
   HARD_FAILURE_FLAGS,
@@ -1272,8 +1273,9 @@ export async function processAgreementDoc(
     if (part7) return { ...part7, rows: lineupRows() };
     // Every non-dry caller — handleAgreementCheck's tier-1 claim AND the
     // operator /agreement-reprocess route — settles an executive zero-read
-    // here before extract_empty_failure: a real 278e empty / unreadable 278-T
-    // closes itself, and deterministic rows are routed through normalization.
+    // here before extract_empty_failure: a real 278e empty closes itself, an
+    // unreadable 278-T parks for a human, and deterministic rows are routed
+    // through normalization.
     if (!dryRun) {
       const settled = await maybeSettleExecutiveZeroRead(
         env,
@@ -1439,13 +1441,15 @@ export function buildMajorityRows(
     );
     return String(nonEmpty[0].text);
   };
-  const groups = reads.map((read) => {
+  const canonical = canonicalArbitrationKeys(reads.map((read) => read.rows));
+  const groups = reads.map((read, groupIndex) => {
     const grouped = new Map<string, ParsedTx[]>();
-    for (const tx of read.rows) {
+    for (let index = 0; index < read.rows.length; index += 1) {
+      const tx = read.rows[index];
+      const key = canonical[groupIndex][index];
       if (!isValidTransactionDate(tx.txDate)) {
-        return { grouped, error: `invalid_transaction_date:${arbitrationRowKey(tx)}` };
+        return { grouped, error: `invalid_transaction_date:${key}` };
       }
-      const key = arbitrationRowKey(tx);
       const rows = grouped.get(key) ?? [];
       rows.push(tx);
       grouped.set(key, rows);
@@ -2751,11 +2755,12 @@ export async function handleAgreementCheck(
         || flags.includes('auto_resolved_empty')
         || flags.includes('oge_text_unreadable')
       ) {
-        // processAgreementDoc already settled/closed this executive zero-read.
+        // processAgreementDoc already settled this executive zero-read.
+        // Empty is terminal.  Unreadable is parked open for a human.
       } else if (flags.includes('extract_empty_failure')) {
         // Do not escalate empty×empty and do not soft-label as cascade_unresolved.
-        // Executive 278e empty / refused 278-T close themselves; everything
-        // else stays extract_empty_failure.
+        // Executive 278e empty closes itself.  A refused 278-T parks open.
+        // Everything else stays extract_empty_failure.
         const settled = await maybeSettleExecutiveZeroRead(env, docId, async () => {
           const loaded = signal
             ? await loadDocBytes(env, docId, rawObjectKey, signal)
@@ -2814,17 +2819,18 @@ export async function handleAgreementCheck(
 
 /**
  * Reasons capped-row recovery must leave alone: rows already carrying the
- * capped terminal label, and unreadable/OCR terminals (health-terminal
- * already; relabeling them would hide why they closed).
+ * capped terminal label, and unreadable/OCR parks (health-terminal reason
+ * already; relabeling them would hide why they are waiting on a human).
  *
  * Empty failures are NOT excluded.  They are not health-terminal
  * (reviewQueueHealth only treats ocr_unusable etc. as terminal), and once
  * capped the normal selectors reject them, so without this path they sit
  * eligible/unhealthy forever.  An executive empty failure is first re-run
  * through the Part 7 classifier (maybeSettleExecutiveZeroRead) so a real
- * empty 278e or refused 278-T still closes honestly instead of being
- * relabeled; only a read that stays `unconfirmed` (blank, garbled,
- * header-only) gets the human-review label.
+ * empty 278e still closes verified_empty and a refused 278-T parks open
+ * for a human instead of being relabeled; only a read that stays
+ * `unconfirmed` (blank, garbled, header-only) gets the cascade-unresolved
+ * label.
  */
 export const CAPPED_RECOVERY_REASON_EXCLUDE_SQL = `
   COALESCE(reason, '') <> 'agreement_cascade_unresolved'
@@ -2837,7 +2843,7 @@ export const CAPPED_RECOVERY_REASON_EXCLUDE_SQL = `
  * terminal human-review flag. A fresh CAS lease makes this safe under
  * concurrent cron ticks; failures retain the lease and are retried after its
  * 15-minute expiry instead of silently stranding the row at the attempt cap.
- * Unreadable rows are already an honest terminal; do not relabel them.
+ * Unreadable rows are already parked for a human; do not relabel them.
  * Executive empty failures get one more classifier pass before the label.
  */
 async function recoverExpiredCappedReviews(
