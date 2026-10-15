@@ -1515,6 +1515,9 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
      to live on drawer-all-link alone so both controls still read as one
      compact affordance, just two of them now. */
   .drawer-link-row { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:9px; }
+  .drawer-see-all { margin:10px 0 0; }
+  .drawer-see-all-link { font-weight:600; text-decoration:none; color:var(--accent); }
+  .drawer-see-all-link:hover { text-decoration:underline; }
   .drawer-all-link, .drawer-copy-link-btn { display:inline-block; margin:0; font-size:13px; background:none; border:0; padding:0; color:var(--accent); text-decoration:none; cursor:pointer; text-align:left; font-family:inherit; }
   .source-link { display:inline-block; margin-top:9px; font-size:13px; }
   .review-doc-link { display:block; margin-top:5px; font-size:12px; font-family:var(--sans); font-weight:600; white-space:nowrap; }
@@ -12220,6 +12223,46 @@ function closeDrawer() {
    WEBA11Y-08's intent — a control shouldn't lie about what it is). Splitting
    into an <a href> that only navigates and a <button> that only copies keeps
    both properties true at once, each on the control that actually has it. */
+function seeAllTradesHref(filterQuery) {
+  var q = String(filterQuery || '').trim();
+  if (!q) return '/?view=trades';
+  return '/?view=trades&fq=' + encodeURIComponent(q);
+}
+/** Crawlable handoff from member/ticker drawers to the Trades tab search. */
+function seeAllTradesLinkHtml(total, filterQuery) {
+  var n = Number(total) || 0;
+  var q = String(filterQuery || '').trim();
+  if (!n || !q) return '';
+  var label = 'See all ' + fmtCount(n) + ' trade' + (n === 1 ? '' : 's') + ' \u2192';
+  var href = seeAllTradesHref(q);
+  return '<p class="drawer-see-all"><a class="drawer-see-all-link" href="' + esc(href) + '" onclick="return navigateTradesFromDrawer(event, ' + JSON.stringify(q) + ')">' + esc(label) + '</a></p>';
+}
+function navigateTradesFromDrawer(e, filterQuery) {
+  var q = String(filterQuery || '').trim();
+  if (!q) return true;
+  if (e && (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button === 1)) return true;
+  if (e && e.preventDefault) e.preventDefault();
+  closeDrawer();
+  try {
+    var u = new URL(window.location.href);
+    u.searchParams.delete('member');
+    u.searchParams.delete('ticker');
+    u.searchParams.delete('trade');
+    u.searchParams.set('view', 'trades');
+    u.searchParams.set('fq', q);
+    var activeTab = document.querySelector('nav.tabs a.active');
+    window.history.pushState({ view: activeTab ? activeTab.getAttribute('data-view') : 'trades' }, '', u.pathname + u.search + u.hash);
+  } catch (err) {}
+  var searchEl = el('qSearch');
+  if (searchEl) searchEl.value = q;
+  showView('trades');
+  tradesPage = 0;
+  if (typeof refreshIosFilterSummaries === 'function') refreshIosFilterSummaries();
+  renderTrades();
+  fetchPage();
+  syncFilterUrl();
+  return false;
+}
 function copyLinkHtml(param, value, entityLabel) {
   // SEOSOCIAL-02: reuses the same entityHref() the Directory member/ticker
   // cells and drawer-open links use — one URL builder, not a second copy of
@@ -12555,7 +12598,9 @@ function openAsset(ticker) {
       '<div class="drawer-stack-grid"><div class="drawer-section"><h3>Top Buyers</h3>' + traderList(d.topBuyers, 'buyers') + '</div>' +
         '<div class="drawer-section"><h3>Top Sellers</h3>' + traderList(d.topSellers, 'sellers') + '</div></div>' +
       '<div class="drawer-section"><h3>Recent Trades</h3><div class="table-wrap"><table class="mini-tbl"><tbody>' +
-        (recent || '<tr><td class="state" colspan="4">No recent trades.</td></tr>') + '</tbody></table></div></div>' +
+        (recent || '<tr><td class="state" colspan="4">No recent trades.</td></tr>') + '</tbody></table></div>' +
+        ((s.totalTrades || 0) > (d.recentTrades || []).length ? seeAllTradesLinkHtml(s.totalTrades, d.ticker) : '') +
+        '</div>' +
       '<div class="drawer-section">' + copyLinkHtml('ticker', d.ticker, d.ticker) + '</div>',
       topbarTitle
     );
@@ -12662,7 +12707,9 @@ function openMember(filerId) {
       '<div class="drawer-section"><h3>Performance vs S&amp;P 500</h3><div id="memberPerf"><div class="note">Loading performance…</div></div></div>' +
       '<div class="drawer-section"><h3>Most-Traded</h3>' + top + '</div>' +
       '<div class="drawer-section"><h3>Recent Trades</h3><div class="table-wrap"><table class="mini-tbl"><tbody>' +
-        (recent || '<tr><td class="state" colspan="4">No trades.</td></tr>') + '</tbody></table></div></div>' +
+        (recent || '<tr><td class="state" colspan="4">No trades.</td></tr>') + '</tbody></table></div>' +
+        ((st.totalTrades || 0) > (d.recentTrades || []).length ? seeAllTradesLinkHtml(st.totalTrades, name) : '') +
+        '</div>' +
       '<div class="drawer-section">' + copyLinkHtml('member', filerId, name) + '</div>',
       // Owner punch list #13(f): sticky-header summary — the politician's name.
       esc(name)

@@ -160,6 +160,12 @@ struct PoliticianDetailView: View {
                                 }
                             }
                             .padding(.horizontal, 16)
+
+                            SeeAllTradesHandoff(
+                                totalTrades: summary?.totalTrades ?? 0,
+                                displayedCount: trades.count,
+                                filter: .politician(member?.name ?? memberName)
+                            )
                         }
                     }
                 }

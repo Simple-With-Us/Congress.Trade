@@ -5561,6 +5561,26 @@ describe('web blocking defects (audited)', () => {
     expect(DASHBOARD_HTML).toContain('Politician Details</button>');
   });
 
+  it('member and ticker drawers link to the Trades tab with the entity filter (CT-1359)', () => {
+    const sources = loadDashboardFunctions(['esc', 'fmtCount', 'seeAllTradesHref', 'seeAllTradesLinkHtml', 'navigateTradesFromDrawer']);
+    const helpers = new Function(
+      sources.join('\n\n') + '\nreturn { seeAllTradesHref, seeAllTradesLinkHtml, navigateTradesFromDrawer };',
+    )() as {
+      seeAllTradesHref: (q: string) => string;
+      seeAllTradesLinkHtml: (total: number, q: string) => string;
+      navigateTradesFromDrawer: (e: { preventDefault?: () => void }, q: string) => boolean;
+    };
+    expect(helpers.seeAllTradesHref('NVDA')).toBe('/?view=trades&fq=NVDA');
+    const html = helpers.seeAllTradesLinkHtml(633, 'NVDA');
+    expect(html).toContain('class="drawer-see-all-link"');
+    expect(html).toContain('href="/?view=trades&amp;fq=NVDA"');
+    expect(html).toContain('See all 633 trades');
+    expect(html).toContain('navigateTradesFromDrawer');
+    expect(DASHBOARD_HTML).toContain('seeAllTradesLinkHtml(st.totalTrades, name)');
+    expect(DASHBOARD_HTML).toContain('seeAllTradesLinkHtml(s.totalTrades, d.ticker)');
+    expect(DASHBOARD_HTML).toContain('function navigateTradesFromDrawer');
+  });
+
   it('labels what every trade count counts (this filter vs all time)', () => {
     expect(DASHBOARD_HTML).not.toContain('<span class="match-window">');
     expect(DASHBOARD_HTML).toContain("if (typeof stampWindowChips === 'function') stampWindowChips();");
