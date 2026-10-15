@@ -57,6 +57,7 @@ import type { Env, Subscription, Transaction } from '../shared/types.ts';
 import { all, get, run } from '../shared/db.ts';
 import { mapSubscription, mapFeedTransaction, readCursorHighWater, type SubscriptionRow, type FeedTransactionRow } from './rows.ts';
 import { matchesFiltersWithContext, subscriptionOwnerEntitled } from './subscriptions.ts';
+import { stampDeliveryFreshness } from './deliveryFreshness.ts';
 import { constantTimeEqual } from '../auth/tokens.ts';
 import { createCongressEvent } from '@jaywedgeworth22/congress-trading-shared';
 import { prefixedId } from '../shared/ids.ts';
@@ -99,7 +100,8 @@ export const MAX_DRAIN_PAGES_PER_TICK = 5;
  * carries `cursorSeq` for Last-Event-ID resume.
  */
 export function formatTradeEvent(tx: Transaction): string {
-  const event = createCongressEvent('congress.trade', { trades: [tx] }, { id: String(tx.cursorSeq) });
+  const stamped = stampDeliveryFreshness(tx);
+  const event = createCongressEvent('congress.trade', { trades: [stamped] }, { id: String(tx.cursorSeq) });
   return `id: ${tx.cursorSeq}\nevent: congress.trade\ndata: ${JSON.stringify(event)}\n\n`;
 }
 

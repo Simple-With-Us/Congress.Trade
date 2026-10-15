@@ -25,6 +25,7 @@ import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { all, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
 import { mapSubscription, mapTransaction, type SubscriptionRow, type TransactionRow } from './rows.ts';
+import { stampDeliveryFreshness } from './deliveryFreshness.ts';
 import { matchesFiltersWithContext, subscriptionOwnerEntitled, webhookTargetLengthError } from './subscriptions.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from './webhookTarget.ts';
@@ -243,7 +244,7 @@ export async function dispatchWebhook(
   if ((txRow as { deprecated_at?: string | null }).deprecated_at) {
     return { outboxComplete: !msg.subscriptionId };
   }
-  const tx = mapTransaction(txRow);
+  const tx = stampDeliveryFreshness(mapTransaction(txRow));
 
   // Resolve chamber via the owning filing (Transaction carries no chamber col).
   const chamberRow = await get<{ chamber: string | null }>(

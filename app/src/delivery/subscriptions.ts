@@ -11,6 +11,7 @@ import type { Env, Subscription, SubscriptionFilters, Transaction } from '../sha
 import { all, first, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
 import { findMemberCandidates, mapSubscription, pickMemberCandidate, type SubscriptionRow } from './rows.ts';
+import { isDeliveryBackfill } from './deliveryFreshness.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { getUserById } from '../auth/users.ts';
 import { isPremiumUserAsync } from '../billing/entitlement.ts';
@@ -143,7 +144,10 @@ export function validateSubscriptionFilters(value: unknown):
   if (value == null) return { ok: true, filters: {} };
   if (typeof value !== 'object' || Array.isArray(value)) return { ok: false, error: 'filters must be an object' };
   const raw = value as Record<string, unknown>;
-  const allowed = new Set(['members', 'tickers', 'chambers', 'minAmount', 'maxAmount', 'sides', 'sectors', 'marketCapBuckets']);
+  const allowed = new Set([
+    'members', 'tickers', 'chambers', 'minAmount', 'maxAmount', 'sides', 'sectors', 'marketCapBuckets',
+    'includeBackfill',
+  ]);
   if (Object.keys(raw).some((key) => !allowed.has(key))) return { ok: false, error: 'filters contain unsupported fields' };
 
   const strings = (key: string, limit: number, maxLength: number): string[] | string => {
@@ -171,12 +175,17 @@ export function validateSubscriptionFilters(value: unknown):
   if (min != null && (typeof min !== 'number' || !Number.isFinite(min) || min < 0)) return { ok: false, error: 'minAmount must be a non-negative number' };
   if (max != null && (typeof max !== 'number' || !Number.isFinite(max) || max < 0)) return { ok: false, error: 'maxAmount must be a non-negative number' };
   if (typeof min === 'number' && typeof max === 'number' && min > max) return { ok: false, error: 'minAmount cannot exceed maxAmount' };
+  const includeBackfill = raw.includeBackfill;
+  if (includeBackfill != null && typeof includeBackfill !== 'boolean') {
+    return { ok: false, error: 'includeBackfill must be a boolean' };
+  }
   return { ok: true, filters: {
     ...(members.length ? { members } : {}), ...(tickersRaw.length ? { tickers: [...new Set(tickersRaw.map((v) => v.toUpperCase()))] } : {}),
     ...(chambers.length ? { chambers: chambers as SubscriptionFilters['chambers'] } : {}),
     ...(typeof min === 'number' ? { minAmount: min } : {}), ...(typeof max === 'number' ? { maxAmount: max } : {}),
     ...(sidesNorm.length ? { sides: sidesNorm as SubscriptionFilters['sides'] } : {}), ...(sectors.length ? { sectors } : {}),
     ...(buckets.length ? { marketCapBuckets: buckets } : {}),
+    ...(includeBackfill === true ? { includeBackfill: true } : {}),
   } };
 }
 
@@ -626,6 +635,8 @@ export function matchesFilters(tx: Transaction, filters: SubscriptionFilters): b
     const side = String(tx.txType) === 'P' ? 'B' : tx.txType;
     if (!side || !filters.sides.includes(side)) return false;
   }
+
+  if (filters.includeBackfill !== true && isDeliveryBackfill(tx)) return false;
 
   return true;
 }
