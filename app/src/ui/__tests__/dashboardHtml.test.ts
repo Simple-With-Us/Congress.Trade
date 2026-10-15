@@ -111,6 +111,12 @@ describe('light-mode semantic text contrast (CT-1356)', () => {
     expect(DASHBOARD_HTML).toContain(`--neg:       ${SEMANTIC_DARK_NEG};`);
     expect(DASHBOARD_HTML).toContain('html[data-theme="light"] .tag.E { color: #fff; }');
   });
+
+  it('light Exchange pills use white ink on --exch #9a3412 (Sentry .tag.E thread)', () => {
+    expect(contrastRatio('#080c17', SEMANTIC_LIGHT.exch)).toBeLessThan(WCAG_AA_NORMAL_TEXT);
+    expect(contrastRatio('#ffffff', SEMANTIC_LIGHT.exch)).toBeGreaterThanOrEqual(WCAG_AA_NORMAL_TEXT);
+    expect(DASHBOARD_HTML).toMatch(/html\[data-theme="light"\][\s\S]*--exch:\s*#9a3412/);
+  });
 });
 
 describe('DASHBOARD_HTML', () => {
