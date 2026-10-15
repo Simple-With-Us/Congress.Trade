@@ -15,7 +15,25 @@
 import type { Filing, ParsedTx } from '../shared/types.ts';
 
 const HOUSE_PRINTED_EXAMPLE_ASSET_RE =
-  /\bexempl(?:je|e)?\s+(?:mega|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg)\s*\.?\s*corp\b/i;
+  /\bexempl(?:je|e|l)?\s+(?:mega|meg|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|meg|mfg)\s*\.?\s*corp\b|\bex\s+mpi\s+(?:mega|meg|mfg)\s*\.?\s*corp\b/i;
+
+function squashHousePrintedExampleName(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * OCR-tolerant House PTR printed sample row (Example Mega/Meg/Mfg Corp).  Requires
+ * an example stem or the bare printed "Mega Corp" / "Meg Corp" chrome so a random
+ * live holding named Mega Corp is not dropped without a sample date elsewhere.
+ */
+export function looksLikeHousePrintedExampleSquashedAnchor(text: string | null | undefined): boolean {
+  if (!text?.trim()) return false;
+  const sq = squashHousePrintedExampleName(text.trim());
+  if (!sq.includes('corp')) return false;
+  if (!/(?:mega|meg|mfg)/.test(sq)) return false;
+  if (/exempl|example|examp|exmpi|xample|exmpl/.test(sq)) return true;
+  return /^(?:mega|meg)corp$/.test(sq) || sq === 'mfgcorp';
+}
 
 /** Printed House PTR instruction dates (8/14/12) and newer 2020 sample grids. */
 export function looksLikePtrFormSampleDate(txDate: string | null | undefined): boolean {
@@ -184,6 +202,12 @@ export function looksLikePtrFormSampleRow(row: {
 
   if (looksLikeHousePrintedExampleAsset(asset) || looksLikeHousePrintedExampleAsset(raw)) {
     if (!date || looksLikePtrFormSampleDate(date) || /8\/14\/12|08\/14\/2012/.test(raw)) {
+      return true;
+    }
+  }
+
+  if (date && looksLikePtrFormSampleDate(date)) {
+    if (looksLikeHousePrintedExampleSquashedAnchor(asset) || looksLikeHousePrintedExampleSquashedAnchor(raw)) {
       return true;
     }
   }
