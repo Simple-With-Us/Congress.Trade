@@ -171,6 +171,16 @@ function circuitEnv(extra: { subscriptions?: Array<Record<string, unknown>>; var
         }
         return { success: true, meta: { changes: 0 } };
       }
+      if (/UPDATE deliveries[\s\S]*status = 'skipped'/i.test(sql) && /status = 'parked'/i.test(sql)) {
+        const [, subscriptionId, txId] = this.params as [string, string, string];
+        const row = store.deliveries.get(`${subscriptionId}:${txId}`);
+        if (row && row.status === 'parked') {
+          row.status = 'skipped';
+          row.last_error = 'subscription filters no longer match transaction';
+          return { success: true, meta: { changes: 1 } };
+        }
+        return { success: true, meta: { changes: 0 } };
+      }
       return { success: true, meta: { changes: 1 } };
     },
   });
@@ -297,7 +307,10 @@ describe('parked-not-retried storm scenario (dispatchWebhook)', () => {
     cursor: 0, active: 1, created_at: '2026-06-20T00:00:00.000Z',
   };
 
-  function webhookEnv(circuit: CircuitState): { env: Env; store: FakeStore; fetchSpy: ReturnType<typeof vi.fn> } {
+  function webhookEnv(
+    circuit: CircuitState,
+    transactionRow: typeof txRow = txRow,
+  ): { env: Env; store: FakeStore; fetchSpy: ReturnType<typeof vi.fn> } {
     const { env, store } = circuitEnv({ subscriptions: [subRow] });
     store.circuits.set(circuit.target_key, circuit);
     const baseDb = env.DB;
@@ -306,7 +319,7 @@ describe('parked-not-retried storm scenario (dispatchWebhook)', () => {
       const inner = {
         bind(...params: unknown[]) { stmt.bind(...params); return inner; },
         async first<T>() {
-          if (/FROM transactions WHERE id = \?/i.test(sql)) return txRow as T;
+          if (/FROM transactions WHERE id = \?/i.test(sql)) return transactionRow as T;
           if (/SELECT chamber FROM filings/i.test(sql)) return { chamber: 'house' } as T;
           if (/FROM securities_ref/i.test(sql)) return { sector: 'Technology', market_cap_bucket: 'mega' } as T;
           if (/FROM subscriptions\s+WHERE id = \?/is.test(sql)) return subRow as T;
@@ -358,6 +371,46 @@ describe('parked-not-retried storm scenario (dispatchWebhook)', () => {
     expect(store.deliveries.get('sub_1:tx_1')).toMatchObject({ status: 'parked' });
     // Circuit failure count unchanged: a parked delivery is not an attempt.
     expect(store.circuits.get(TARGET)!.failures_today).toBe(5);
+  });
+
+  it('targeted redispatch clears parked rows when freshness filters reject the trade', async () => {
+    const backfillTx = {
+      ...txRow,
+      id: 'tx_old',
+      filed_date: '2020-01-01',
+      tx_date: '2020-01-01',
+      first_seen_at: freshDeliveryIso,
+    };
+    const { env, store, fetchSpy } = webhookEnv(
+      {
+        target_key: TARGET,
+        consecutive_failures: 0,
+        open_until: null,
+        failures_day: new Date().toISOString().slice(0, 10),
+        failures_today: 0,
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      },
+      backfillTx,
+    );
+    store.deliveries.set('sub_1:tx_old', {
+      subscription_id: 'sub_1',
+      tx_id: 'tx_old',
+      status: 'parked',
+      attempts: 0,
+      last_error: 'target circuit: circuit-open',
+    });
+    try {
+      await dispatchWebhook(env, {
+        type: 'delivery.dispatch',
+        txId: 'tx_old',
+        subscriptionId: 'sub_1',
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(store.deliveries.get('sub_1:tx_old')).toMatchObject({ status: 'skipped' });
   });
 
   it('never resurrects a delivered row when parking', async () => {
