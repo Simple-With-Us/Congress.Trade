@@ -483,7 +483,8 @@ export async function fanOutApnsProductEvents(
     }
 
     if (!sendError) {
-      for (const trade of trades) {
+      // Advance from the raw outbox page so backfill filtering cannot stall the cursor.
+      for (const trade of tradesRaw) {
         if (trade.created_at > lastTradeAt) lastTradeAt = trade.created_at;
       }
       // Review-queue rows are operator work, not a product alert. Advance the

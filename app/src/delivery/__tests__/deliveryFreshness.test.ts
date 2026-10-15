@@ -43,6 +43,17 @@ describe('deliveryFreshness', () => {
     expect(stampDeliveryFreshness(row).isBackfill).toBe(false);
   });
 
+  it('treats late-discovered historical filings as backfill even when first-seen is recent', () => {
+    const row = tx({
+      filedDate: '2023-03-08',
+      txDate: '2023-03-08',
+      firstSeenAt: recent,
+      createdAt: recent,
+    });
+    expect(isDeliveryBackfill(row, now)).toBe(true);
+    expect(stampDeliveryFreshness(row).isBackfill).toBe(true);
+  });
+
   it('treats trades first-seen before the window as backfill', () => {
     const row = tx({
       firstSeenAt: stale,

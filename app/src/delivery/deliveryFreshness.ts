@@ -34,8 +34,20 @@ export function deliveryFreshnessAnchorMs(tx: FreshnessInput): number | null {
   return parseInstantMs(tx.createdAt);
 }
 
+function isStaleCalendarDay(day: string | null | undefined, nowMs: number): boolean {
+  const filed = isoDatePrefix(day);
+  if (!filed) return false;
+  const filedMs = Date.parse(`${filed}T23:59:59.999Z`);
+  if (!Number.isFinite(filedMs)) return false;
+  return nowMs - filedMs > DELIVERY_FRESH_WINDOW_DAYS * MS_PER_DAY;
+}
+
 /** True when the trade is older than the fresh window (or has no anchor). */
 export function isDeliveryBackfill(tx: FreshnessInput, nowMs = Date.now()): boolean {
+  // Late-discovered rows still carry an old official filing date — treat as backfill.
+  if (isStaleCalendarDay(tx.filedDate, nowMs) || isStaleCalendarDay(tx.txDate, nowMs)) {
+    return true;
+  }
   const anchor = deliveryFreshnessAnchorMs(tx);
   if (anchor == null) return true;
   return nowMs - anchor > DELIVERY_FRESH_WINDOW_DAYS * MS_PER_DAY;
