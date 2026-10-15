@@ -286,7 +286,14 @@ export async function dispatchWebhook(
 
   const visit = async (sub: Subscription): Promise<void> => {
     if (!sub.targetUrl) return;
-    if (!matchesFiltersWithContext(tx, sub.filters, ctx)) return;
+    if (!matchesFiltersWithContext(tx, sub.filters, ctx)) {
+      // flushParkedDeliveries targets one subscription; a filter miss must not
+      // leave the row parked at the head of ORDER BY updated_at ASC forever.
+      if (msg.subscriptionId) {
+        await markParkedDeliveryFilterSkipped(env, sub.id, tx.id);
+      }
+      return;
+    }
     await deliverToSubscription(env, sub, tx, lease);
   };
 
@@ -543,6 +550,28 @@ async function markDeliverySkipped(env: Env, subscriptionId: string, txId: strin
     [prefixedId('dlv'), subscriptionId, txId, new Date().toISOString()],
   ).catch((err) =>
     console.warn('markDeliverySkipped failed', (err as Error).message),
+  );
+}
+
+/** Parked rows re-dispatched after a filter miss must not block flushParkedDeliveries forever. */
+async function markParkedDeliveryFilterSkipped(
+  env: Env,
+  subscriptionId: string,
+  txId: string,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  await run(
+    env.DB,
+    `UPDATE deliveries
+        SET status = 'skipped',
+            last_error = 'subscription filters no longer match transaction',
+            updated_at = ?,
+            claim_token = NULL,
+            lease_until = NULL
+      WHERE subscription_id = ? AND tx_id = ? AND status = 'parked'`,
+    [nowIso, subscriptionId, txId],
+  ).catch((err) =>
+    console.warn('markParkedDeliveryFilterSkipped failed', (err as Error).message),
   );
 }
 
