@@ -2,7 +2,7 @@
 
 ## Summary
 
-Scanned House PTRs print an example row (Mega / Meg / Mfg Corp).  Local vision OCR publishes that row under several spellings.  `looksLikeHousePrintedExampleAsset` now squashes the name to letters and requires the whole string to be the example signature, so "Exempl Mfg Corp.", "Ex Mpi Meg Corp.", "Mega Corp.", and "Example Meg Corp." drop before normalize and agreement publish.  A longer real name such as "Mega Corp Holdings Inc" or "Exxon Mobil Corp." is kept.
+Scanned House PTRs print an example row (Mega / Meg / Mfg Corp).  Local vision OCR publishes that row under several spellings.  `looksLikeHousePrintedExampleAsset` strips a leading owner code, a trailing `[ST]` / `(stock)`, and a short parenthetical ticker, then squashes the name to letters and requires the whole string to be the example signature.  "Exempl Mfg Corp.", "Ex Mpi Meg Corp.", "Mega Corp.", "Example Meg Corp.", and "SP Example Meg Corp [ST]" drop before normalize and agreement publish.  A longer real name such as "Mega Corp Holdings Inc" or "Exxon Mobil Corp." is kept.
 
 `looksLikePtrFormSampleDate` used to return true for every day in 2012 and 2020.  That year match is gone.  Only the printed example dates remain (2012-08-14, 2020-02-05, 2020-05-02, and the slash forms).  A date never drops a row by itself.  CT-2407.
 
