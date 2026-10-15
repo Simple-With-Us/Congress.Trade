@@ -139,11 +139,7 @@ describe('st_peer_prices stall detector', () => {
        VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
     ).run();
     db.prepare(
-<<<<<<< HEAD
       `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 100)`,
-=======
-      `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 1)`,
->>>>>>> origin/cursor/senate-efd-peer-prices-977e
     ).run();
 
     const now = new Date('2026-10-12T18:00:00.000Z');
