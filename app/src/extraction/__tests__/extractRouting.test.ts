@@ -13,6 +13,7 @@ import {
   isHousePaperScanDocId,
   looksLikePlausibleTradeTable,
   looksLikeHeaderContaminatedAsset,
+  dropPtrFormSampleParsedRows,
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
@@ -162,6 +163,8 @@ describe('evaluateExtractQuality — hard-stops', () => {
     expect(looksLikePtrFormSampleAsset('Example Mfg. Corp.')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Example Meg Corp.')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Ex Mpi Meg Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Apple Inc.')).toBe(false);
+    expect(looksLikePtrFormSampleAsset('Mega Corp Holdings Inc.')).toBe(false);
     expect(looksLikeHeaderContaminatedAsset('Exemplje Mega Corp Common Stock')).toBe(true);
     expect(looksLikeNothingToReport('Nothing to report for July 2026')).toBe(true);
     expect(looksLikeNothingToReport('Nothlng to report for July 2026')).toBe(true);
@@ -244,6 +247,54 @@ describe('evaluateExtractQuality — hard-stops', () => {
       amountRange: '$15,001 - $50,000',
       txDate: '2026-05-10',
     })).toBe(false);
+  });
+
+  it('CT-2407 / H-2026-9116355 — drops House printed-sample rows before publish', () => {
+    expect(looksLikePtrFormSampleAsset('Exempl Mfg Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Ex Mpi Meg Corp.')).toBe(true);
+
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Mega Corp.',
+      rawText: 'Mega Corp.',
+      txDate: '2020-05-02',
+    })).toBe(true);
+
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Mega Corp Holdings',
+      rawText: 'Mega Corp Holdings common stock',
+      txDate: '2026-05-10',
+    })).toBe(false);
+
+    const extracted = [
+      tx({
+        assetName: 'Exempl Mfg Corp.',
+        rawText: 'Exempl Mfg Corp Common Stock',
+        ticker: null,
+        txDate: '2026-02-05',
+      }),
+      tx({
+        assetName: 'Ex Mpi Meg Corp.',
+        rawText: 'Ex Mpi Meg Corp.',
+        ticker: null,
+        txDate: '2026-07-30',
+      }),
+      tx({
+        assetName: 'Mega Corp.',
+        rawText: 'Mega Corp.',
+        ticker: null,
+        txDate: '2020-05-02',
+      }),
+      tx({
+        assetName: 'Mega Corp Holdings',
+        rawText: 'Mega Corp Holdings purchase',
+        ticker: null,
+        txDate: '2026-05-10',
+      }),
+    ];
+
+    const kept = dropPtrFormSampleParsedRows(extracted);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].assetName).toBe('Mega Corp Holdings');
   });
 
   it('hard-stops letterhead-as-asset (Clerk / B81 Cannon)', () => {
