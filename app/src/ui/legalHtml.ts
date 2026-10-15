@@ -8,22 +8,11 @@
  * before relying on them. Update EFFECTIVE_DATE when the text changes.
  */
 
+import { NOT_AFFILIATED_SENTENCE, SITE_FOOTER_DISCLAIMER } from './disclaimers.ts';
+
 const EFFECTIVE_DATE = 'October 9, 2026';
 const ENTITY = 'Jay Wedgeworth, LLC d/b/a Congress.Trade';
 const CONTACT = 'support@congress.trade';
-
-/**
- * LEGALCOMPLIANCE-04: a product named "Congress.Trade" that carries a
- * bald-eagle mark needs an explicit, unmissable non-affiliation statement —
- * shown in the site footer, the legal-page footer, and ToS §1.  Keep this
- * string identical everywhere it appears so the disclaimer cannot drift.
- */
-const NOT_AFFILIATED_SENTENCE =
-  'Congress.Trade is an independent, privately operated service and is not affiliated with, endorsed by, or sponsored by the U.S. Congress, the U.S. House of Representatives, the U.S. Senate, the Office of Government Ethics, or any government agency.';
-
-/** Site-footer combined line (owner 2026-08-20).  Two spaces around each · and no trailing period. */
-const SITE_FOOTER_DISCLAIMER =
-  'Congress.Trade  ·  educational tool for public STOCK Act (2012) disclosures  ·  not financial advice  ·  $ estimated from brackets  ·  independent/private service not affiliated with or endorsed/sponsored by any government agency';
 
 /**
  * Shared legal chrome for /terms-of-service and /privacy-policy.

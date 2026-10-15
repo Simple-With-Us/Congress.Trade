@@ -25,6 +25,14 @@ import {
 } from '../enrichment/service.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import {
+  isTailOnlyPeerPriceBacklog,
+  readCorpusLatestPriceDate,
+  stPeerPriceNeverPricedPendingFromSql,
+  stPeerPricePendingBindParams,
+  stPeerPricePendingBindsForSubqueries,
+  stPeerPricePendingFromSql,
+} from '../prices/peerPricePending.ts';
+import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
   FRESHNESS_MAX_AGE_DAYS,
@@ -506,43 +514,54 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   return { stalled: true, detail };
 }
 
-const ST_PEER_PRICE_PENDING_SQL = `
-  FROM transactions t
-  JOIN securities_ref sr ON sr.ticker = t.ticker
- WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
-   AND t.deprecated_at IS NULL
-   AND ${excludeCompetitorFixtureTransactionSql('t')}
-   AND COALESCE(sr.price_unavailable, 0) = 0
-   AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
-
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST peer prices not configured', skip: true };
   }
+  const pendingParams = stPeerPricePendingBindParams(now);
+  const pendingFrom = stPeerPricePendingFromSql();
+  const neverPricedFrom = stPeerPriceNeverPricedPendingFromSql();
+  const countAndProgressBinds = stPeerPricePendingBindsForSubqueries(pendingParams, 3);
   let pending = 0;
+  let neverPricedPending = 0;
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
   try {
-    const row = await get<{ n: number; last_at: string | null }>(
+    const row = await get<{ n: number; never_n: number; last_at: string | null }>(
       env.DB,
       `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${ST_PEER_PRICE_PENDING_SQL}) AS n,
-         (SELECT MAX(sr.price_checked_at) ${ST_PEER_PRICE_PENDING_SQL}) AS last_at`,
+         (SELECT COUNT(DISTINCT t.ticker) ${pendingFrom}) AS n,
+         (SELECT COUNT(DISTINCT t.ticker) ${neverPricedFrom}) AS never_n,
+         (SELECT MAX(sr.price_checked_at) ${pendingFrom}) AS last_at`,
+      countAndProgressBinds,
     );
     pending = Number(row?.n ?? 0);
+    neverPricedPending = Number(row?.never_n ?? 0);
     lastChecked = row?.last_at ?? null;
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
   }
-  if (pending <= 0 || !pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
+  if (pending <= 0) {
+    return { stalled: false, detail: 'ST price refresh moving' };
+  }
+  const corpusLatest = await readCorpusLatestPriceDate(env);
+  if (isTailOnlyPeerPriceBacklog(pending, neverPricedPending, corpusLatest, now)) {
+    return {
+      stalled: false,
+      detail:
+        `ST price tail backlog only (${pending} pending); corpus EOD current through ${pendingParams.freshThrough}`,
+    };
+  }
+  if (!pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST price refresh moving' };
   }
   try {
     const names = await all<{ ticker: string }>(
       env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
+      `SELECT DISTINCT t.ticker AS ticker ${pendingFrom}
        ORDER BY t.ticker ASC
        LIMIT 10`,
+      stPeerPricePendingBindsForSubqueries(pendingParams, 1),
     );
     pendingSample = names.map((r) => r.ticker);
   } catch {

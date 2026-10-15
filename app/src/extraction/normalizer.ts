@@ -550,7 +550,8 @@ export async function normalize(
 
   if (needsReview) {
     // A refused 278-T is not an empty filing.  docClassifier calls every
-    // text_pdf `typed`, so this is the close the empty doc-class path misses.
+    // text_pdf `typed`, so this is the park the empty doc-class path misses.
+    // The row stays open for a human.  It is not resolved in this tick.
     if (
       filing.chamber === 'executive'
       && flagged.length === 0
@@ -569,7 +570,7 @@ export async function normalize(
         return {
           transactions: [],
           minConfidence: 0,
-          needsReview: false,
+          needsReview: true,
           published: false,
           reviewReason: OGE_TEXT_UNREADABLE_REASON,
         };
