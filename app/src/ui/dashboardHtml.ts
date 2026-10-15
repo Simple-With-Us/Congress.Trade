@@ -128,13 +128,15 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 <script>
   // Admin-controlled, site-wide logo style (injected at serve time).
   window.__LOGO_DISPLAY__ = "%LOGO_DISPLAY%";
-  // Theme before first paint: default LIGHT (owner 2026-08-10); stored may be
+  // Theme before first paint: default SYSTEM (follows OS prefers-color-scheme,
+  // owner 2026-10-15 — revisit the 2026-08-10 'light' default so a brand-new
+  // visitor on a dark OS no longer flashes white); stored may be
   // light|dark|system.  Sepia was removed (owner 2026-08-21: "too dark of a
   // color that doesn't look like old fashioned paper", only half-themed) —
   // any stored 'sepia' value is migrated to 'light' here so a returning
   // visitor never gets stuck failing validation.
   (function () {
-    var pref = 'light';
+    var pref = 'system';
     try {
       var s = localStorage.getItem('ui-theme');
       if (s === 'sepia') {
@@ -4827,8 +4829,10 @@ function fmtMs(ms) {
   return fmtDuration(Math.round(ms / 1000));
 }
 
-/* ---- light / dark / system theme (per-visitor preference; default LIGHT) ---- */
-/* Mirrors Socratic.Trade console: Light | Dark | System segmented control. */
+/* ---- light / dark / system theme (per-visitor preference; default SYSTEM) ---- */
+/* Default follows OS prefers-color-scheme (owner 2026-10-15) so a brand-new
+   visitor on a dark OS no longer flashes white.  Mirrors Socratic.Trade
+   console: Light | Dark | System segmented control. */
 function readThemePref() {
   try {
     var s = localStorage.getItem('ui-theme');
@@ -4841,7 +4845,7 @@ function readThemePref() {
     }
     if (s === 'light' || s === 'dark' || s === 'system') return s;
   } catch (e) {}
-  return 'light';
+  return 'system';
 }
 function resolveTheme(pref) {
   if (pref === 'dark' || pref === 'light') return pref;

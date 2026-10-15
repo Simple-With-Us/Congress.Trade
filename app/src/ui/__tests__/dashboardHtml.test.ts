@@ -871,9 +871,12 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_HTML).toContain("function polFull(n)");
   });
 
-  it('defaults theme to light and offers Light/Dark/System controls', () => {
-    expect(DASHBOARD_HTML).toContain("var pref = 'light'");
-    expect(DASHBOARD_HTML).toContain("return 'light'");
+  it('defaults theme to system and offers Light/Dark/System controls', () => {
+    // Default is 'system' so a brand-new visitor follows OS prefers-color-scheme
+    // (owner 2026-10-15). The 'light' return is still present as the sepia
+    // migration target — we assert that separately.
+    expect(DASHBOARD_HTML).toContain("var pref = 'system'");
+    expect(DASHBOARD_HTML).toContain("return 'system'");
     expect(DASHBOARD_HTML).toContain('function setThemePref(pref)');
     expect(DASHBOARD_HTML).toContain('function themeRowHtml(pref, hideLabel)');
     expect(DASHBOARD_HTML).toContain('function themeSegHtml(pref)');
