@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
+  DEFAULT_ST_PEER_PRICES_STALL_HOURS,
   readPipelineStallHours,
   sweepPipelineStallAlerts,
 } from '../pipelineLoudAlerts.ts';
@@ -29,18 +30,26 @@ vi.mock('../../enrichment/service.ts', async (importOriginal) => {
   };
 });
 
-vi.mock('../../secrets/infisical.ts', () => ({
-  resolveSecrets: vi.fn(async () => ({})),
-}));
+vi.mock('../../secrets/infisical.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../secrets/infisical.ts')>();
+  return {
+    ...actual,
+    resolveSecrets: vi.fn(async () => ({})),
+  };
+});
 
 vi.mock('../../delivery/targetCircuit.ts', () => ({
   targetKeyForUrl: vi.fn(() => null),
   checkTargetCircuit: vi.fn(async () => ({ allowed: true, probe: false })),
 }));
 
-vi.mock('../../shared/pipelineHealth.ts', () => ({
-  checkPipelineHealth: vi.fn(async () => ({ status: 'ok', checks: [] })),
-}));
+vi.mock('../../shared/pipelineHealth.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../shared/pipelineHealth.ts')>();
+  return {
+    ...actual,
+    checkPipelineHealth: vi.fn(async () => ({ status: 'ok', checks: [] })),
+  };
+});
 
 let db: SqliteDatabase;
 let d1: D1Database;
@@ -82,9 +91,36 @@ function createKv() {
 }
 
 describe('st_peer_prices stall detector', () => {
-  it('readPipelineStallHours defaults st_peer_prices to the general 6h window', () => {
-    expect(readPipelineStallHours({} as Env, 'st_peer_prices')).toBe(DEFAULT_PIPELINE_STALL_HOURS);
-    expect(readPipelineStallHours({} as Env, 'senate_fetch_success')).toBe(6);
+  it('readPipelineStallHours defaults st_peer_prices to the EOD refresh window', () => {
+    expect(readPipelineStallHours({} as Env, 'st_peer_prices')).toBe(DEFAULT_ST_PEER_PRICES_STALL_HOURS);
+    expect(readPipelineStallHours({} as Env, 'senate_fetch_success')).toBe(DEFAULT_PIPELINE_STALL_HOURS);
+  });
+
+  function seedFreshCorpus(asOf: string): void {
+    db.prepare(`INSERT INTO spx_eod (date, close) VALUES (?, 5000)`).run(asOf);
+    for (let i = 0; i < 26; i++) {
+      const ticker = `CORP${i}`;
+      seedTrade(ticker);
+      db.prepare(
+        `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
+         VALUES (?, ?, datetime('now'), 'socratic')`,
+      ).run(ticker, asOf);
+    }
+  }
+
+  it('does not stall on tail junk when the traded corpus is within trading-day freshness', async () => {
+    const now = new Date('2026-10-13T12:42:00.000Z');
+    seedFreshCorpus('2026-10-12');
+    seedTrade('BVVA');
+    const stale = '2026-09-01T00:00:00.000Z';
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, price_checked_at, source)
+       VALUES ('BVVA', ?, 'socratic')`,
+    ).run(stale);
+
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.evaluated).toContain('st_peer_prices');
+    expect(result.alerted).not.toContain('st_peer_prices');
   });
 
   it('ignores global price_checked_at when pending tickers were checked recently', async () => {

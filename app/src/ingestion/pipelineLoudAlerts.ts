@@ -8,7 +8,7 @@
 
 import type { Env } from '../shared/types.ts';
 import type { QueueMessage } from '../shared/types.ts';
-import { all, get } from '../shared/db.ts';
+import { all, get, type SqlParam } from '../shared/db.ts';
 import { getLastPollAt } from '../shared/config.ts';
 import { isParkedDlqError } from './transientDlq.ts';
 import {
@@ -33,12 +33,22 @@ import {
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
-import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { checkPipelineHealth, tradingDaysBehind } from '../shared/pipelineHealth.ts';
+import {
+  lastTradingDay,
+  PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
+  priceUnavailableCutoffIso,
+  priceUnavailableFirstRecheckCutoffIso,
+} from '../prices/service.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
 /** Default stall window for ST peer enrichment backlog (daily + hourly drain). */
 export const DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS = 30;
+/** Default stall window for ST peer EOD price refresh (one session + overnight slack). */
+export const DEFAULT_ST_PEER_PRICES_STALL_HOURS = 30;
+/** Match `price_freshness` ok tier — corpus behind this is a real outage, not tail junk. */
+const PEER_PRICE_CORPUS_OK_TRADING_DAYS = 3;
 /** Re-alert the same doc+stage after this window if it fails terminally again. */
 export const TERMINAL_REDUP_WINDOW_MS = 7 * 24 * 3_600_000;
 
@@ -98,6 +108,7 @@ export function readPipelineStallHours(env: Env, condition?: string): number {
   const legacy = Number.parseInt(envGet('CT_OCR_STALL_HOURS') ?? '', 10);
   if (Number.isFinite(legacy) && legacy >= 1) return Math.min(legacy, 168);
   if (condition === 'st_peer_enrichment') return DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS;
+  if (condition === 'st_peer_prices') return DEFAULT_ST_PEER_PRICES_STALL_HOURS;
   return DEFAULT_PIPELINE_STALL_HOURS;
 }
 
@@ -506,43 +517,85 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   return { stalled: true, detail };
 }
 
-const ST_PEER_PRICE_PENDING_SQL = `
+/** Pending price backlog — same predicate as `selectTickersNeedingPrices` (trading-session freshness). */
+function stPeerPricePendingSql(now: Date): { fromWhere: string; params: SqlParam[] } {
+  const freshThrough = lastTradingDay(now);
+  const unavailableCutoff = priceUnavailableCutoffIso(now);
+  const firstUnavailableCutoff = priceUnavailableFirstRecheckCutoffIso(now);
+  const fromWhere = `
   FROM transactions t
   JOIN securities_ref sr ON sr.ticker = t.ticker
  WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
    AND t.deprecated_at IS NULL
    AND ${excludeCompetitorFixtureTransactionSql('t')}
-   AND COALESCE(sr.price_unavailable, 0) = 0
-   AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
+   AND (
+     sr.latest_price_date IS NULL
+     OR sr.latest_price_date < ?
+   )
+   AND NOT (
+     COALESCE(sr.price_unavailable, 0) <> 0
+     AND sr.price_checked_at IS NOT NULL
+     AND sr.price_checked_at >= CASE
+           WHEN sr.price_unavailable = ${PRICE_UNAVAILABLE_NOT_FOUND_FIRST} THEN ?
+           ELSE ?
+         END
+   )`;
+  return { fromWhere, params: [freshThrough, firstUnavailableCutoff, unavailableCutoff] };
+}
+
+function peerPriceCorpusFresh(snapshot: FreshnessSnapshot, nowMs: number): boolean {
+  const legs = [snapshot.spxLatestDate, snapshot.priceLatestDate];
+  for (const latest of legs) {
+    if (!latest) return false;
+    const behind = tradingDaysBehind(latest, nowMs);
+    if (behind === null || behind > PEER_PRICE_CORPUS_OK_TRADING_DAYS) return false;
+  }
+  return true;
+}
 
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST peer prices not configured', skip: true };
   }
+  const pendingSql = stPeerPricePendingSql(now);
   let pending = 0;
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
   try {
+    const pendingParams = [...pendingSql.params, ...pendingSql.params];
     const row = await get<{ n: number; last_at: string | null }>(
       env.DB,
       `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${ST_PEER_PRICE_PENDING_SQL}) AS n,
-         (SELECT MAX(sr.price_checked_at) ${ST_PEER_PRICE_PENDING_SQL}) AS last_at`,
+         (SELECT COUNT(DISTINCT t.ticker) ${pendingSql.fromWhere}) AS n,
+         (SELECT MAX(sr.price_checked_at) ${pendingSql.fromWhere}) AS last_at`,
+      pendingParams,
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
   }
-  if (pending <= 0 || !pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
+  if (pending <= 0) {
+    return { stalled: false, detail: 'ST price refresh moving' };
+  }
+  const snapshot = await loadFreshnessSnapshot(env);
+  if (snapshot && peerPriceCorpusFresh(snapshot, now.getTime())) {
+    return {
+      stalled: false,
+      detail:
+        `ST price backlog (${pending} ticker(s)) while corpus within ${PEER_PRICE_CORPUS_OK_TRADING_DAYS} trading days`,
+    };
+  }
+  if (!pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
     return { stalled: false, detail: 'ST price refresh moving' };
   }
   try {
     const names = await all<{ ticker: string }>(
       env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
+      `SELECT DISTINCT t.ticker AS ticker ${pendingSql.fromWhere}
        ORDER BY t.ticker ASC
        LIMIT 10`,
+      pendingSql.params,
     );
     pendingSample = names.map((r) => r.ticker);
   } catch {
