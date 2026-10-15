@@ -39,7 +39,9 @@ import {
   type ProviderMissingStubReconcileResult,
 } from './providerMissingStubClose.ts';
 import {
+  sweepAutoRejectedUnreadable,
   sweepKnownParkedExecutiveTerminals,
+  type AutoRejectedUnreadableSweepResult,
   type ExecutiveTerminalSweepResult,
 } from '../extraction/executiveDisposition.ts';
 import {
@@ -434,8 +436,10 @@ export interface AutonomySweepResult {
   pollingHeartbeat: PollingHeartbeatResult | null;
   /** Ingest/OCR/ST stall detector (Sentry + dual publisher webhooks + recovery). */
   pipelineStallAlerts: PipelineStallAlertResult | null;
-  /** Empty 278e → verified_empty; refused 278-T → unreadable.  Allowlist only. */
+  /** Empty 278e → verified_empty; refused 278-T parks open.  Allowlist only. */
   executiveTerminals: ExecutiveTerminalSweepResult | null;
+  /** Pipeline auto-rejects of oge_text_unreadable, reopened for a human. */
+  unreadableReopened: AutoRejectedUnreadableSweepResult | null;
   /** Bounded replay of transient failed outbox / queue rows. */
   transientDlq: TransientDlqSweepResult | null;
   errors: string[];
@@ -516,7 +520,7 @@ const LIVENESS_ALARM_CHECK_IDS = new Set([
   // prod observation 2026-09-20 with S&P frozen at 2026-08-03 for 46 days
   // and nobody alerted.
   'price_freshness',
-  // 2026-09-21: filing_skips (extract_empty_failure/auto_resolved_empty/doc_quarantined).
+  // Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   // Owner ask: "big red flag ... anytime a filing is skipped or considered
   // empty or blank or unreadable since that is almost always false and app
   // error." These three outcomes mean the OCR/vision/model pipeline failed;
@@ -1210,6 +1214,7 @@ export async function runAutonomySweeps(
     pollingHeartbeat: null,
     pipelineStallAlerts: null,
     executiveTerminals: null,
+    unreadableReopened: null,
     transientDlq: null,
     errors,
   };
@@ -1298,13 +1303,21 @@ export async function runAutonomySweeps(
     errors.push(`ogeUndated: ${(err as Error).message}`);
   }
 
-  // Close the two parked executive rows: empty 278e vs unreadable 278-T.
-  // Allowlist, idempotent, no PDF refetch.
+  // Empty 278e still closes.  Unreadable 278-T parks open.  Allowlist,
+  // idempotent, no PDF refetch.  Then reopen rows the old path already
+  // auto-rejected with no human actor.
   try {
     throwIfAborted();
     result.executiveTerminals = await sweepKnownParkedExecutiveTerminals(env, now);
   } catch (err) {
     errors.push(`executiveTerminals: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    result.unreadableReopened = await sweepAutoRejectedUnreadable(env, now);
+  } catch (err) {
+    errors.push(`unreadableReopened: ${(err as Error).message}`);
   }
 
   // A5/C8: one-shot local-vision requeue for rejected scanned+raw garbage OCR.

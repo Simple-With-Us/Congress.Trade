@@ -2,17 +2,19 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   ArbitratingExtractor,
   arbitrationRowKey,
+  arbitrationRowKeyAliases,
   buildExtractorPipeline,
+  canonicalArbitrationKeys,
   fieldAgreement,
   HousePdfExtractor,
+  legacyArbitrationRowKey,
+  migrateArbitrationRowKey,
   OgePdfExtractor,
   mergeResults,
   type Extractor,
   type ExtractorResult,
 } from '../types.ts';
 import { IngestRetryError } from '../../ingestion/fetcher.ts';
-import { buildMajorityRows } from '../../extraction/agreement.ts';
-import type { CandidateDocResult } from '../../extraction/bakeoff.ts';
 import type { Env, Filing, ParsedTx } from '../../shared/types.ts';
 
 function tx(over: Partial<ParsedTx> = {}): ParsedTx {
@@ -72,69 +74,82 @@ function extractor(name: string, out: ExtractorResult): Extractor {
 
 describe('arbitrationRowKey', () => {
   it('keys on ticker + date + type + owner, uppercased', () => {
-    expect(arbitrationRowKey(tx({ ticker: 'aapl' }))).toBe('AAPL|2026-01-02|B|self');
+    expect(arbitrationRowKey(tx({ ticker: 'aapl', owner: 'self' }))).toBe('AAPL|2026-01-02|B|SELF');
+    expect(arbitrationRowKey(tx({ ticker: 'aapl', owner: 'spouse' }))).toBe('AAPL|2026-01-02|B|SPOUSE');
+  });
+  it('keeps same-day lots for different owners distinct', () => {
+    const spouse = arbitrationRowKey(tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11' }));
+    const dependent = arbitrationRowKey(tx({ ticker: 'COO', owner: 'dependent', txDate: '2026-09-11' }));
+    expect(spouse).not.toBe(dependent);
+    expect(spouse).toBe('COO|2026-09-11|B|SPOUSE');
+    expect(dependent).toBe('COO|2026-09-11|B|DEPENDENT');
   });
   it('falls back to asset name when no ticker', () => {
-    expect(arbitrationRowKey(tx({ ticker: null, assetName: 'US T-Bill' }))).toBe(
-      'US T-BILL|2026-01-02|B|self',
+    expect(arbitrationRowKey(tx({ ticker: null, assetName: 'US T-Bill', owner: 'joint' }))).toBe(
+      'US T-BILL|2026-01-02|B|JOINT',
     );
   });
-  it('omits owner segment when owner is blank', () => {
+  it('omits owner when it is missing so the historical 3-part key is unchanged', () => {
     expect(arbitrationRowKey(tx({ owner: null }))).toBe('AAPL|2026-01-02|B');
-    expect(arbitrationRowKey(tx({ owner: '  ' }))).toBe('AAPL|2026-01-02|B');
+    expect(legacyArbitrationRowKey(tx({ owner: 'spouse' }))).toBe('AAPL|2026-01-02|B');
+    expect(arbitrationRowKey(tx({ owner: 'not-a-person' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B');
   });
-  it('keeps spouse and dependent lots on the same ticker/date/type distinct', () => {
-    const base = { ticker: 'COO', txDate: '2026-09-11', txType: 'B' as const };
-    expect(arbitrationRowKey(tx({ ...base, owner: 'spouse' }))).toBe('COO|2026-09-11|B|spouse');
-    expect(arbitrationRowKey(tx({ ...base, owner: 'dependent' }))).toBe('COO|2026-09-11|B|dependent');
-    expect(arbitrationRowKey(tx({ ...base, owner: 'spouse' }))).not.toBe(
-      arbitrationRowKey(tx({ ...base, owner: 'dependent' })),
-    );
+  it('normalizes raw owner codes before appending them', () => {
+    expect(arbitrationRowKey(tx({ owner: ' SP ' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(arbitrationRowKey(tx({ owner: 'child' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B|DEPENDENT');
+    expect(arbitrationRowKey(tx({ owner: 'jt' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B|JOINT');
   });
-});
+  it('migrates a stored 3-part key when owner is known and leaves a current key alone', () => {
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B', 'spouse')).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B', null)).toBe('AAPL|2026-01-02|B');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B', 'nope')).toBe('AAPL|2026-01-02|B');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B|SELF', 'spouse')).toBe('AAPL|2026-01-02|B|SELF');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B|SELF#2', null)).toBe('AAPL|2026-01-02|B|SELF');
+  });
+  it('lists the current key and the historical alias', () => {
+    expect(arbitrationRowKeyAliases(tx({ owner: 'self' }))).toEqual([
+      'AAPL|2026-01-02|B|SELF',
+      'AAPL|2026-01-02|B',
+    ]);
+    expect(arbitrationRowKeyAliases(tx({ owner: null }))).toEqual(['AAPL|2026-01-02|B']);
+  });
+  it('keeps a single lot on the historical key even when owners disagree or one side omitted owner', () => {
+    const [left, right] = canonicalArbitrationKeys([
+      [tx({ owner: 'self' })],
+      [tx({ owner: 'spouse' })],
+    ]);
+    expect(left).toEqual(['AAPL|2026-01-02|B']);
+    expect(right).toEqual(['AAPL|2026-01-02|B']);
 
-function candidateRead(rows: ParsedTx[], model: string): CandidateDocResult {
-  return {
-    provider: 'openai',
-    model,
-    docId: 'H-test',
-    ok: true,
-    latencyMs: 1,
-    rowCount: rows.length,
-    rowKeys: rows.map(arbitrationRowKey),
-    avgConfidence: 0.9,
-    rows,
-  };
-}
-
-describe('buildMajorityRows owner-aware row keys', () => {
-  it('does not reject ambiguous_multi_lot when spouse and dependent share ticker/date/type', () => {
-    const spouse = tx({
-      ticker: 'COO',
-      txDate: '2026-09-11',
-      txType: 'B',
-      owner: 'spouse',
-      amountMin: 1001,
-      amountMax: 15000,
-    });
-    const dependent = tx({
-      ticker: 'COO',
-      txDate: '2026-09-11',
-      txType: 'B',
-      owner: 'dependent',
-      amountMin: 1001,
-      amountMax: 15000,
-    });
-    const reads = [
-      candidateRead([spouse, dependent], 'm1'),
-      candidateRead([spouse, dependent], 'm2'),
-      candidateRead([spouse, dependent], 'm3'),
-    ];
-    const majority = buildMajorityRows(reads, 3, true);
-    expect(majority.ok).toBe(true);
-    expect(majority.reason).toBeUndefined();
-    expect(majority.rows).toHaveLength(2);
-    expect(majority.rows.map((r) => r.owner).sort()).toEqual(['dependent', 'spouse']);
+    const [withOwner, missing] = canonicalArbitrationKeys([
+      [tx({ owner: 'spouse' })],
+      [tx({ owner: null })],
+    ]);
+    expect(withOwner).toEqual(['AAPL|2026-01-02|B']);
+    expect(missing).toEqual(['AAPL|2026-01-02|B']);
+  });
+  it('splits a read that contains two owners and does not guess which lot a bare key is', () => {
+    const spouse = tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11' });
+    const dependent = tx({ ticker: 'COO', owner: 'dependent', txDate: '2026-09-11' });
+    const bare = tx({ ticker: 'COO', owner: null, txDate: '2026-09-11' });
+    const [split, other, unmatched] = canonicalArbitrationKeys([
+      [spouse, dependent],
+      [spouse, dependent],
+      [bare],
+    ]);
+    expect(split).toEqual(['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|DEPENDENT']);
+    expect(other).toEqual(split);
+    expect(unmatched).toEqual(['COO|2026-09-11|B']);
+  });
+  it('upgrades a bare key when the prefix has exactly one known owner', () => {
+    const spouse = tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11' });
+    const bare = tx({ ticker: 'COO', owner: null, txDate: '2026-09-11' });
+    const [qualified, upgraded] = canonicalArbitrationKeys([
+      [spouse, bare],
+      [spouse],
+    ]);
+    expect(qualified).toEqual(['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|SPOUSE']);
+    expect(upgraded).toEqual(['COO|2026-09-11|B|SPOUSE']);
   });
 });
 
@@ -183,6 +198,23 @@ describe('mergeResults', () => {
     // ...but the secondary-only row drags doc confidence below the row confidence.
     expect(merged.confidence).toBeLessThan(merged.transactions[0].confidence);
     expect(merged.raw).toContain('secondaryOnly=1');
+  });
+
+  it('does not let a spouse lot corroborate a dependent lot that shares ticker, date, and type', () => {
+    const primary = result([
+      tx({ ticker: 'COO', owner: 'spouse', confidence: 0.8, txDate: '2026-09-11' }),
+      tx({ ticker: 'COO', owner: 'dependent', confidence: 0.8, txDate: '2026-09-11' }),
+    ]);
+    const secondary = result([
+      tx({ ticker: 'COO', owner: 'dependent', confidence: 0.8, txDate: '2026-09-11' }),
+      tx({ ticker: 'COO', owner: 'spouse', confidence: 0.8, txDate: '2026-09-11' }),
+    ]);
+    const merged = mergeResults(primary, secondary);
+    expect(merged.transactions).toHaveLength(2);
+    expect(merged.transactions.map((row) => row.owner)).toEqual(['spouse', 'dependent']);
+    expect(merged.transactions[0].confidence).toBeCloseTo(0.9, 5);
+    expect(merged.transactions[1].confidence).toBeCloseTo(0.9, 5);
+    expect(merged.raw).toContain('secondaryOnly=0');
   });
 
   it('exposes the per-side only counts so downstream empty checks see a contested empty', () => {

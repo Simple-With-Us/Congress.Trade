@@ -2404,6 +2404,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   interface ConsensusSandbox {
     consensusGridHtml: (docId: string, consensus: unknown, status?: unknown) => string;
+    consensusQueuedRowKey: (row: Record<string, unknown>) => string;
     useConsensusRows: (docId: string) => void;
     setReviewItem: (item: unknown) => void;
     setQueued: (rows: unknown[]) => void;
@@ -2438,11 +2439,16 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
       extractFn(html, 'consensusModelCellHtml'),
       extractFn(html, 'consensusStatusHtml'),
       extractFn(html, 'consensusGridHtml'),
+      extractFn(html, 'clientArbitrationOwner'),
+      extractFn(html, 'clientLegacyArbitrationRowKey'),
+      extractFn(html, 'clientArbitrationRowKey'),
       extractFn(html, 'consensusQueuedRowKey'),
+      extractFn(html, 'consensusLegacyRowKey'),
+      extractFn(html, 'consensusStoredLegacy'),
       extractFn(html, 'consensusFieldValueForEdit'),
       extractFn(html, 'consensusApplyField'),
       extractFn(html, 'useConsensusRows'),
-      'return { consensusGridHtml: consensusGridHtml, useConsensusRows: useConsensusRows, ' +
+      'return { consensusGridHtml: consensusGridHtml, consensusQueuedRowKey: consensusQueuedRowKey, useConsensusRows: useConsensusRows, ' +
         'setReviewItem: function (item) { REVIEW_ITEM_FOR_TEST = item; }, ' +
         'setQueued: function (rows) { QUEUED_FOR_TEST = rows; }, ' +
         'setConsensus: function (docId, c) { REVIEW_CONSENSUS[docId] = c; }, ' +
@@ -2468,7 +2474,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   // Every model agrees on every field.
   const unanimousRow = {
-    rowKey: 'AAPL|2024-01-05|B|self',
+    rowKey: 'AAPL|2024-01-05|B',
     presentIn: MODELS,
     missingFrom: [],
     rowConsensus: 'unanimous',
@@ -2484,7 +2490,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   // Every field has a strict majority, but "owner" has one dissenter (2-1).
   const majorityRow = {
-    rowKey: 'MSFT|2024-02-01|S|joint',
+    rowKey: 'MSFT|2024-02-01|S',
     presentIn: MODELS,
     missingFrom: [],
     rowConsensus: 'majority',
@@ -2501,7 +2507,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
   // "amount" is a 1-1 tie between the two present models -> no majority ->
   // contested (winner value null, every present value listed as a dissenter).
   const contestedRow = {
-    rowKey: 'TSLA|2024-03-10|B|self',
+    rowKey: 'TSLA|2024-03-10|B',
     presentIn: ['anthropic:claude-sonnet-5', 'gemini:gemini-3.5-flash'],
     missingFrom: ['openai:gpt-4o'],
     rowConsensus: 'contested',
@@ -2568,7 +2574,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
   // (minority presence), yet every field's local electorate is that single
   // model, so votes*2 > total is trivially true for each field.
   const minorityRow = {
-    rowKey: 'NVDA|2024-04-01|B|self',
+    rowKey: 'NVDA|2024-04-01|B',
     presentIn: ['openai:gpt-4o'],
     missingFrom: ['anthropic:claude-sonnet-5', 'gemini:gemini-3.5-flash'],
     rowConsensus: 'contested',
@@ -2598,8 +2604,8 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     });
     sandbox.setReviewItem({ docId: 'doc-2', chamber: 'house', payload: null });
     sandbox.setQueued([
-      { ticker: 'MSFT', txType: 'S', txDate: '2024-02-01', owner: 'joint', assetName: 'Microsoft (queued)', amountMin: 1, amountMax: 2 },
-      { ticker: 'TSLA', txType: 'B', txDate: '2024-03-10', owner: 'self', assetName: 'Tesla Inc (queued)', amountMin: 999, amountMax: 1000 },
+      { ticker: 'MSFT', txType: 'S', txDate: '2024-02-01', owner: 'spouse', assetName: 'Microsoft (queued)', amountMin: 1, amountMax: 2 },
+      { ticker: 'TSLA', txType: 'B', txDate: '2024-03-10', owner: 'spouse', assetName: 'Tesla Inc (queued)', amountMin: 999, amountMax: 1000 },
     ]);
 
     sandbox.useConsensusRows('doc-2');
@@ -2613,14 +2619,14 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     expect(call!.rows).toHaveLength(2);
 
     const [majority, contested] = call!.rows;
-    // majority row: consensus-backed fields replace queued values when keys match.
+    // majority row: the vote winner is used for every field, including "owner"
+    // (2-1 majority) — the dissenting model's "spouse" value must not leak in.
     expect(majority.ticker).toBe('MSFT');
     expect(majority.owner).toBe('joint');
-    expect(majority.assetName).toBe('Microsoft Corp');
 
     // Any contested field makes the row human-only: no fieldwise partial merge.
     expect(contested.ticker).toBe('TSLA');
-    expect(contested.owner).toBe('self');
+    expect(contested.owner).toBe('spouse');
     expect(contested.assetName).toBe('Tesla Inc (queued)');
     expect(contested.amountMin).toBe(999);
     expect(contested.amountMax).toBe(1000);
@@ -2717,16 +2723,69 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     expect(row.rawText).toBe('queued unresolved ticker');
   });
 
+  it('pairs owner-qualified consensus keys with the matching queued owner', () => {
+    const sandbox = loadConsensusSandbox();
+    const spouse = {
+      ...unanimousRow,
+      rowKey: 'COO|2026-09-11|B|SPOUSE',
+      baseRowKey: 'COO|2026-09-11|B|SPOUSE',
+      fields: {
+        ...unanimousRow.fields,
+        ticker: fieldConsensus('COO', 3, 3, [], true),
+        owner: fieldConsensus('spouse', 3, 3, [], true),
+        amount: fieldConsensus({ amountMin: 1001, amountMax: 15000 }, 3, 3, [], true),
+      },
+    };
+    const dependent = {
+      ...unanimousRow,
+      rowKey: 'COO|2026-09-11|B|DEPENDENT',
+      baseRowKey: 'COO|2026-09-11|B|DEPENDENT',
+      fields: {
+        ...unanimousRow.fields,
+        ticker: fieldConsensus('COO', 3, 3, [], true),
+        owner: fieldConsensus('dependent', 3, 3, [], true),
+        amount: fieldConsensus({ amountMin: 15001, amountMax: 50000 }, 3, 3, [], true),
+      },
+    };
+    sandbox.setConsensus('doc-owners', {
+      rows: [spouse, dependent],
+      summary: { models: MODELS, rowsUnanimous: 2, rowsMajority: 0, rowsContested: 0, perFieldAgreementPct: {} },
+    });
+    sandbox.setReviewItem({ docId: 'doc-owners', chamber: 'house', payload: null });
+    sandbox.setQueued([
+      { ticker: 'COO', txType: 'B', txDate: '2026-09-11', owner: 'dependent', assetName: 'queued dependent', amountMin: 1, amountMax: 2 },
+      { ticker: 'COO', txType: 'B', txDate: '2026-09-11', owner: 'spouse', assetName: 'queued spouse', amountMin: 3, amountMax: 4 },
+    ]);
+
+    sandbox.useConsensusRows('doc-owners');
+
+    const rows = sandbox.getEditorCall()!.rows;
+    expect(rows.map((row) => [row.owner, row.amountMin, row.amountMax])).toEqual([
+      ['dependent', 15001, 50000],
+      ['spouse', 1001, 15000],
+    ]);
+  });
+
+  it('builds an owner-qualified queued key and keeps a missing owner on the historical key', () => {
+    const sandbox = loadConsensusSandbox();
+    expect(sandbox.consensusQueuedRowKey({
+      ticker: 'aapl', txDate: '2026-01-02', txType: 'B', owner: 'spouse',
+    })).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(sandbox.consensusQueuedRowKey({
+      ticker: 'aapl', txDate: '2026-01-02', txType: 'B', owner: null,
+    })).toBe('AAPL|2026-01-02|B');
+  });
+
   it('leaves duplicate queued lots untouched because occurrence order is ambiguous', () => {
     const sandbox = loadConsensusSandbox();
     const lot1 = {
       ...unanimousRow,
-      rowKey: 'AAPL|2024-01-05|B|self#1', baseRowKey: 'AAPL|2024-01-05|B|self', occurrence: 1,
+      rowKey: 'AAPL|2024-01-05|B#1', baseRowKey: 'AAPL|2024-01-05|B', occurrence: 1,
       fields: { ...unanimousRow.fields, amount: fieldConsensus({ amountMin: 1001, amountMax: 15000 }, 3, 3, [], true) },
     };
     const lot2 = {
       ...unanimousRow,
-      rowKey: 'AAPL|2024-01-05|B|self#2', baseRowKey: 'AAPL|2024-01-05|B|self', occurrence: 2,
+      rowKey: 'AAPL|2024-01-05|B#2', baseRowKey: 'AAPL|2024-01-05|B', occurrence: 2,
       fields: { ...unanimousRow.fields, amount: fieldConsensus({ amountMin: 15001, amountMax: 50000 }, 3, 3, [], true) },
     };
     sandbox.setConsensus('doc-6', {
@@ -2735,8 +2794,8 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     });
     sandbox.setReviewItem({ docId: 'doc-6', chamber: 'house', payload: null });
     sandbox.setQueued([
-      { ticker: 'AAPL', txType: 'B', txDate: '2024-01-05', owner: 'self', assetName: 'Lot 1', amountMin: 1, amountMax: 2, rawText: 'lot one' },
-      { ticker: 'AAPL', txType: 'B', txDate: '2024-01-05', owner: 'self', assetName: 'Lot 2', amountMin: 3, amountMax: 4, rawText: 'lot two' },
+      { ticker: 'AAPL', txType: 'B', txDate: '2024-01-05', assetName: 'Lot 1', amountMin: 1, amountMax: 2, rawText: 'lot one' },
+      { ticker: 'AAPL', txType: 'B', txDate: '2024-01-05', assetName: 'Lot 2', amountMin: 3, amountMax: 4, rawText: 'lot two' },
     ]);
 
     sandbox.useConsensusRows('doc-6');
@@ -2769,6 +2828,70 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     sandbox.useConsensusRows('doc-3'); // no setConsensus() call for doc-3
     expect(sandbox.getEditorCall()).toBeNull();
     expect(sandbox.getAlerts()).toHaveLength(1);
+  });
+});
+
+describe('client majority preview owner keys (CT-2397)', () => {
+  function extractFn(html: string, name: string): string {
+    const marker = 'function ' + name + '(';
+    const start = html.indexOf(marker);
+    if (start < 0) throw new Error('function not found in DASHBOARD_HTML: ' + name);
+    const braceStart = html.indexOf('{', start);
+    let depth = 0;
+    let i = braceStart;
+    for (; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          i++;
+          break;
+        }
+      }
+    }
+    return html.slice(start, i);
+  }
+
+  function loadPreview(): {
+    clientBuildMajorityRows: (reads: Array<{ rows: unknown[] }>) => { ok: boolean; reason?: string; rows: Array<{ owner: string | null }> };
+  } {
+    const src = [
+      extractFn(DASHBOARD_HTML, 'clientArbitrationOwner'),
+      extractFn(DASHBOARD_HTML, 'clientLegacyArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientParseArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientCanonicalArbitrationKeys'),
+      extractFn(DASHBOARD_HTML, 'clientBuildMajorityRows'),
+      'return { clientBuildMajorityRows: clientBuildMajorityRows };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func -- executing the real shipped source
+    return new Function(src)();
+  }
+
+  const spouse = { ticker: 'COO', txDate: '2026-09-11', txType: 'B', owner: 'spouse', amountMin: 1001, amountMax: 15000 };
+  const dependent = { ticker: 'COO', txDate: '2026-09-11', txType: 'B', owner: 'dependent', amountMin: 15001, amountMax: 50000 };
+
+  it('publishes spouse and dependent lots instead of treating them as one ambiguous key', () => {
+    const preview = loadPreview();
+    const built = preview.clientBuildMajorityRows([
+      { rows: [spouse, dependent] },
+      { rows: [spouse, dependent] },
+      { rows: [dependent, spouse] },
+    ]);
+    expect(built.ok).toBe(true);
+    expect(built.rows.map((row) => row.owner).sort()).toEqual(['dependent', 'spouse']);
+  });
+
+  it('still rejects two lots that share an owner', () => {
+    const preview = loadPreview();
+    const first = { ...spouse, owner: 'self' };
+    const second = { ...dependent, owner: 'self' };
+    const built = preview.clientBuildMajorityRows([
+      { rows: [first, second] },
+      { rows: [first, second] },
+    ]);
+    expect(built.ok).toBe(false);
+    expect(built.reason).toBe('ambiguous_multi_lot');
   });
 });
 
