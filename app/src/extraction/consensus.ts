@@ -4,7 +4,7 @@
  * Pure, I/O-free consensus voting over the SAME document read by several
  * extraction models. Given each model's ParsedTx[] (the row shape produced by
  * the bake-off's runCandidateOnDoc), this module aligns rows across models on
- * the shared stable row key (ticker|date|type — {@link arbitrationRowKey}) and
+ * the shared stable row key (ticker|date|type|owner — {@link arbitrationRowKey}) and
  * occurrence within that key, then votes every material field to a majority
  * value so a reviewer sees exactly where the models agree and diverge.
  *

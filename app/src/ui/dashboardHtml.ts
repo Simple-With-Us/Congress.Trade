@@ -7415,7 +7415,9 @@ function useModelRows(docId, idx) {
    payload transaction can be paired with its consensus row below. */
 function consensusQueuedRowKey(t) {
   var sym = String((t && (t.ticker || t.assetName)) || '').trim().toUpperCase();
-  return sym + '|' + String((t && t.txDate) || '') + '|' + String((t && t.txType) || '');
+  var owner = String((t && t.owner) || '').trim().toLowerCase();
+  var ownerSeg = owner ? '|' + owner : '';
+  return sym + '|' + String((t && t.txDate) || '') + '|' + String((t && t.txType) || '') + ownerSeg;
 }
 /* Missing/null consensus values never erase a queued value. Contested rows are
    handled as a whole below and do not call this helper. */

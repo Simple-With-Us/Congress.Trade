@@ -84,8 +84,8 @@ function fakeDb(rows: unknown[]) {
 
 describe('GET /review/:docId/extractions — consensus', () => {
   it('3 stored runs across 3 distinct models -> consensus present with majority fields', async () => {
-    // Same row (AAPL / 2026-01-15 / P) read by 3 models; owner disagrees 2-1
-    // (self, self, spouse) so the row reconciles as 'majority' with owner's
+    // Same row (AAPL / 2026-01-15 / B) read by 3 models; assetType disagrees 2-1
+    // (ST, ST, OP) so the row reconciles as 'majority' with assetType's
     // dissenter recorded, matching buildConsensusRows's voting contract.
     const rowsDesc = [
       extractionRunRow({
@@ -95,7 +95,7 @@ describe('GET /review/:docId/extractions — consensus', () => {
         ok: 1,
         createdAt: '2026-06-25T00:00:03.000Z',
         batchId: 'coherent-1',
-        rows: [tx({ owner: 'spouse' })],
+        rows: [tx({ assetType: 'OP' })],
       }),
       extractionRunRow({
         provider: 'openai',
@@ -162,7 +162,7 @@ describe('GET /review/:docId/extractions — consensus', () => {
       'openai:gpt-4o',
     ]);
     expect(row.rowConsensus).toBe('majority');
-    expect(row.fields.owner).toMatchObject({ value: 'self', votes: 2, total: 3 });
+    expect(row.fields.assetType).toMatchObject({ value: 'ST', votes: 2, total: 3 });
     expect(consensus.summary.rowsMajority).toBe(1);
     expect(body.consensusStatus).toMatchObject({
       batchId: 'coherent-1',

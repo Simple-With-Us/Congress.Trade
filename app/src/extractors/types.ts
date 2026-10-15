@@ -24,14 +24,18 @@ const ROW_KEY_CACHE = new WeakMap<ParsedTx, string>();
 
 /**
  * Stable matching key for a parsed row: ticker (or asset name when no ticker) +
- * transaction date + transaction type. Two extractors that read the same row
- * should produce the same key even if other fields differ slightly.
+ * transaction date + transaction type + owner when present. Two extractors that
+ * read the same row should produce the same key even if other fields differ
+ * slightly. Owner is included when set so spouse/dependent lots on the same
+ * asset/day/type stay distinct (House PTR pattern).
  */
 export function arbitrationRowKey(tx: ParsedTx): string {
   const cached = ROW_KEY_CACHE.get(tx);
   if (cached !== undefined) return cached;
   const sym = (tx.ticker || tx.assetName || '').trim().toUpperCase();
-  const key = `${sym}|${tx.txDate ?? ''}|${tx.txType}`;
+  const owner = (tx.owner ?? '').trim().toLowerCase();
+  const ownerSeg = owner ? `|${owner}` : '';
+  const key = `${sym}|${tx.txDate ?? ''}|${tx.txType}${ownerSeg}`;
   ROW_KEY_CACHE.set(tx, key);
   return key;
 }

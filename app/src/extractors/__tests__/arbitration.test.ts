@@ -11,6 +11,8 @@ import {
   type ExtractorResult,
 } from '../types.ts';
 import { IngestRetryError } from '../../ingestion/fetcher.ts';
+import { buildMajorityRows } from '../../extraction/agreement.ts';
+import type { CandidateDocResult } from '../../extraction/bakeoff.ts';
 import type { Env, Filing, ParsedTx } from '../../shared/types.ts';
 
 function tx(over: Partial<ParsedTx> = {}): ParsedTx {
@@ -69,13 +71,70 @@ function extractor(name: string, out: ExtractorResult): Extractor {
 }
 
 describe('arbitrationRowKey', () => {
-  it('keys on ticker + date + type, uppercased', () => {
-    expect(arbitrationRowKey(tx({ ticker: 'aapl' }))).toBe('AAPL|2026-01-02|B');
+  it('keys on ticker + date + type + owner, uppercased', () => {
+    expect(arbitrationRowKey(tx({ ticker: 'aapl' }))).toBe('AAPL|2026-01-02|B|self');
   });
   it('falls back to asset name when no ticker', () => {
     expect(arbitrationRowKey(tx({ ticker: null, assetName: 'US T-Bill' }))).toBe(
-      'US T-BILL|2026-01-02|B',
+      'US T-BILL|2026-01-02|B|self',
     );
+  });
+  it('omits owner segment when owner is blank', () => {
+    expect(arbitrationRowKey(tx({ owner: null }))).toBe('AAPL|2026-01-02|B');
+    expect(arbitrationRowKey(tx({ owner: '  ' }))).toBe('AAPL|2026-01-02|B');
+  });
+  it('keeps spouse and dependent lots on the same ticker/date/type distinct', () => {
+    const base = { ticker: 'COO', txDate: '2026-09-11', txType: 'B' as const };
+    expect(arbitrationRowKey(tx({ ...base, owner: 'spouse' }))).toBe('COO|2026-09-11|B|spouse');
+    expect(arbitrationRowKey(tx({ ...base, owner: 'dependent' }))).toBe('COO|2026-09-11|B|dependent');
+    expect(arbitrationRowKey(tx({ ...base, owner: 'spouse' }))).not.toBe(
+      arbitrationRowKey(tx({ ...base, owner: 'dependent' })),
+    );
+  });
+});
+
+function candidateRead(rows: ParsedTx[], model: string): CandidateDocResult {
+  return {
+    provider: 'openai',
+    model,
+    docId: 'H-test',
+    ok: true,
+    latencyMs: 1,
+    rowCount: rows.length,
+    rowKeys: rows.map(arbitrationRowKey),
+    avgConfidence: 0.9,
+    rows,
+  };
+}
+
+describe('buildMajorityRows owner-aware row keys', () => {
+  it('does not reject ambiguous_multi_lot when spouse and dependent share ticker/date/type', () => {
+    const spouse = tx({
+      ticker: 'COO',
+      txDate: '2026-09-11',
+      txType: 'B',
+      owner: 'spouse',
+      amountMin: 1001,
+      amountMax: 15000,
+    });
+    const dependent = tx({
+      ticker: 'COO',
+      txDate: '2026-09-11',
+      txType: 'B',
+      owner: 'dependent',
+      amountMin: 1001,
+      amountMax: 15000,
+    });
+    const reads = [
+      candidateRead([spouse, dependent], 'm1'),
+      candidateRead([spouse, dependent], 'm2'),
+      candidateRead([spouse, dependent], 'm3'),
+    ];
+    const majority = buildMajorityRows(reads, 3, true);
+    expect(majority.ok).toBe(true);
+    expect(majority.reason).toBeUndefined();
+    expect(majority.rows).toHaveLength(2);
+    expect(majority.rows.map((r) => r.owner).sort()).toEqual(['dependent', 'spouse']);
   });
 });
 
