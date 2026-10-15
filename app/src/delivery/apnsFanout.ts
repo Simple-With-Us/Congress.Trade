@@ -400,12 +400,13 @@ export async function fanOutApnsProductEvents(
     }
 
     const tradesRaw = await all<TradeRow>(env.DB, APNS_FANOUT_TRADE_SQL, [tradeSince]);
+    const nowMs = now.getTime();
     const trades = tradesRaw.filter((row) => !isDeliveryBackfill({
       filedDate: row.filed_date,
       firstSeenAt: row.first_seen_at,
       createdAt: row.created_at,
       txDate: row.tx_date,
-    }));
+    }, nowMs));
     const reviews = await all<ReviewRow>(env.DB, APNS_FANOUT_REVIEW_SQL, [reviewSince]);
 
     let delivered = 0;
