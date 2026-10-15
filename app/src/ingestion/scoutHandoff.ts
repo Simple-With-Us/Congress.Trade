@@ -249,6 +249,53 @@ async function writeHealthMap(env: Env, map: HealthMap): Promise<void> {
   await env.CONFIG_KV.put(LATENCY_PROBE_HEALTH_KV_KEY, JSON.stringify(map));
 }
 
+const MEMBERSHIP_LATENCY_PROVIDERS: LatencyProbeProviderId[] = ['unusual_whales', 'quiver'];
+
+/** True when a probe error is an auth/plan rejection, not a transient outage. */
+export function isLatencyProbeAuthError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return /HTTP_(401|403)|FMP_HTTP_(401|403)|UW HTTP 401|QQ (?:house|senate|trump) HTTP 403/i.test(message);
+}
+
+/**
+ * Membership providers (UW/Quiver) whose keys are persistently rejected.
+ * These stay out of `/api/health/latency` paging and skip further HTTP until
+ * a successful probe clears the latch (new key / renewed plan).
+ */
+export async function latencyProvidersWithRejectedCredentials(env: Env): Promise<Set<string>> {
+  const rejected = new Set<string>();
+  const map = await readHealthMap(env);
+  for (const provider of MEMBERSHIP_LATENCY_PROVIDERS) {
+    const health = map[provider];
+    if (
+      health
+      && health.consecutiveServerErrors >= LATENCY_SCOUT_CONSECUTIVE_ERRORS
+      && isLatencyProbeAuthError(health.lastError)
+    ) {
+      rejected.add(provider);
+    }
+  }
+  for (const provider of MEMBERSHIP_LATENCY_PROVIDERS) {
+    if (rejected.has(provider)) continue;
+    try {
+      const rows = await all<{ ok: number; error: string | null }>(
+        env.DB,
+        `SELECT ok, error FROM provider_probe_runs
+          WHERE provider = ?
+          ORDER BY ran_at DESC
+          LIMIT ?`,
+        [provider, LATENCY_SCOUT_CONSECUTIVE_ERRORS],
+      );
+      if (rows.length < LATENCY_SCOUT_CONSECUTIVE_ERRORS) continue;
+      const allAuthFailures = rows.every((row) => row.ok === 0 && isLatencyProbeAuthError(row.error));
+      if (allAuthFailures) rejected.add(provider);
+    } catch {
+      /* table may not exist in local dev */
+    }
+  }
+  return rejected;
+}
+
 /**
  * Derive needScout + consecutive error count from a probe outcome.
  *

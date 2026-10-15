@@ -2377,7 +2377,8 @@ export async function getDisclosureLatencyProviderStatuses(env: Env): Promise<Di
  * Empty set when the disclosure-latency watch itself is off — callers decide
  * how loud "nothing is expected to run" should be.
  */
-export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>> {
+/** Config-intended latency providers (before auth-rejection latch). */
+export async function configExpectedLatencyProviderIds(env: Env): Promise<Set<string>> {
   const envx = env as EnvWithWatch;
   const out = new Set<string>();
   if (!(await enabled(envx))) return out;
@@ -2392,6 +2393,13 @@ export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>>
     }
     out.add(id);
   }
+  return out;
+}
+
+export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>> {
+  const out = await configExpectedLatencyProviderIds(env);
+  const { latencyProvidersWithRejectedCredentials } = await import('./scoutHandoff.ts');
+  for (const id of await latencyProvidersWithRejectedCredentials(env)) out.delete(id);
   return out;
 }
 
@@ -3812,6 +3820,21 @@ async function runProviderProbe(
       /* handoff bookkeeping best-effort */
     }
   };
+
+  const { latencyProvidersWithRejectedCredentials } = await import('./scoutHandoff.ts');
+  if ((await latencyProvidersWithRejectedCredentials(env)).has(provider.id)) {
+    await recordHandoff('disabled', { error: 'credentials rejected (401/403 latch)' });
+    return {
+      ...base,
+      enabled: false,
+      operationalStatus: 'stopped',
+      reason: `${provider.label} credentials rejected (401/403); probe paused until key/plan is renewed`,
+      fetchedRows: 0,
+      pending: 0,
+      matched: 0,
+      errors,
+    };
+  }
 
   // FMP family: skip HTTP when explicitly OFF (FMP_LATENCY_PROBE_ENABLED=false)
   // or path filtered out of FMP_LATENCY_PATHS. Default is ON for CT.

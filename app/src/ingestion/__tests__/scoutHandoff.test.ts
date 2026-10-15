@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   computeNeedScout,
+  isLatencyProbeAuthError,
   LATENCY_PROBE_HEALTH_KV_KEY,
   LATENCY_SCOUT_CONSECUTIVE_ERRORS,
+  latencyProvidersWithRejectedCredentials,
   recordLatencyProbeOutcome,
   buildScoutPlan,
   refreshLatencySilenceFromDb,
@@ -265,5 +267,51 @@ describe('recordLatencyProbeOutcome + plan', () => {
     expect(plan.latencyNeedScout.some((h) => h.provider === 'fmp_rapidapi')).toBe(false);
     const row = plan.latency.find((h) => h.provider === 'fmp_rapidapi');
     expect(row?.needScout).toBe(false);
+  });
+});
+
+describe('isLatencyProbeAuthError', () => {
+  it('matches server and scout auth failure signatures', () => {
+    expect(isLatencyProbeAuthError('HTTP_401:https://api.example')).toBe(true);
+    expect(isLatencyProbeAuthError('UW HTTP 401')).toBe(true);
+    expect(isLatencyProbeAuthError('qq:house: QQ house HTTP 403')).toBe(true);
+    expect(isLatencyProbeAuthError('HTTP_429')).toBe(false);
+  });
+});
+
+describe('latencyProvidersWithRejectedCredentials', () => {
+  it('latches membership providers after consecutive auth errors in KV health', async () => {
+    const kvStore = new Map<string, string>();
+    kvStore.set(
+      LATENCY_PROBE_HEALTH_KV_KEY,
+      JSON.stringify({
+        unusual_whales: {
+          provider: 'unusual_whales',
+          consecutiveServerErrors: 3,
+          lastError: 'HTTP_401:https://api.unusualwhales.com/',
+          lastAttemptAt: '2026-10-01T00:00:00.000Z',
+          lastSuccessAt: null,
+          lastFetchedRows: 0,
+          lastSource: 'server',
+          needScout: false,
+          needScoutReason: null,
+          updatedAt: '2026-10-01T00:00:00.000Z',
+        },
+      }),
+    );
+    const env = {
+      CONFIG_KV: {
+        get: async (key: string, type?: string) => {
+          const v = kvStore.get(key);
+          if (v == null) return null;
+          return type === 'json' ? JSON.parse(v) : v;
+        },
+        put: async () => {},
+      },
+      DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [] }) }) }) },
+    } as never;
+    const rejected = await latencyProvidersWithRejectedCredentials(env);
+    expect(rejected.has('unusual_whales')).toBe(true);
+    expect(rejected.has('fmp')).toBe(false);
   });
 });

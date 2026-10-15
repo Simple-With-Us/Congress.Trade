@@ -625,6 +625,32 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.value).toBe(1);
   });
 
+  it('auth-rejected membership providers do not page; detail names credentials rejected', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      latencyProviders: [
+        { provider: 'fmp', lastObservedAt: new Date(nowMs - 1 * 3_600_000).toISOString(), expected: true },
+        {
+          provider: 'quiver',
+          lastObservedAt: new Date(nowMs - 181 * 3_600_000).toISOString(),
+          expected: false,
+          authRejected: true,
+        },
+        {
+          provider: 'unusual_whales',
+          lastObservedAt: new Date(nowMs - 144 * 3_600_000).toISOString(),
+          expected: false,
+          authRejected: true,
+        },
+      ],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'latency_probes')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('credentials rejected (not paged)');
+    expect(check.detail).toContain('quiver');
+    expect(check.detail).not.toContain('retired in config');
+  });
+
   it('an expected provider going quiet still pages even alongside retired ones', () => {
     const res = evaluatePipelineSignals({
       ...base,
