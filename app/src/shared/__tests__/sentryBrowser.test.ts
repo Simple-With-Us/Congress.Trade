@@ -168,4 +168,27 @@ describe('sentry browser loader', () => {
     expect(message).not.toContain(appleTxn);
     expect(message).toContain(SENTRY_FILTERED_VALUE);
   });
+
+  it('redacts URL query params and path-aware nested id like the Deno scrubber', () => {
+    const scrub = loadBrowserScrubFromScript(renderSentryBrowserScript({ SENTRY_DSN: DSN }));
+    const opaque = 'abcdefghijklmnopqrstuvwxyz123456';
+    const url = `https://congress.trade/api/stream?subscription=${opaque}&chamber=senate`;
+
+    const scrubbed = scrub({
+      breadcrumbs: [{
+        data: { url },
+      }],
+      device: { id: 'device-token-leak' },
+    }) as {
+      breadcrumbs: Array<{ data: { url: string } }>;
+      device: { id: string };
+    };
+
+    const scrubbedUrl = scrubbed.breadcrumbs[0].data.url;
+    expect(scrubbedUrl).not.toContain(opaque);
+    expect(scrubbedUrl.includes(SENTRY_FILTERED_VALUE) || scrubbedUrl.includes('%5BFiltered%5D')).toBe(
+      true,
+    );
+    expect(scrubbed.device.id).toBe(SENTRY_FILTERED_VALUE);
+  });
 });
