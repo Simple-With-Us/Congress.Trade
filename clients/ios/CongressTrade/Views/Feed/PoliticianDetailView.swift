@@ -161,11 +161,13 @@ struct PoliticianDetailView: View {
                             }
                             .padding(.horizontal, 16)
 
-                            SeeAllTradesHandoff(
-                                totalTrades: summary?.totalTrades ?? 0,
-                                displayedCount: trades.count,
-                                filter: .politician(member?.name ?? memberName)
-                            )
+                            if let polName = member?.name, !polName.isEmpty, polName != "Unknown" {
+                                SeeAllTradesHandoff(
+                                    totalTrades: summary?.totalTrades ?? 0,
+                                    displayedCount: trades.count,
+                                    filter: .politician(polName)
+                                )
+                            }
                         }
                     }
                 }

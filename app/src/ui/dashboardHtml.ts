@@ -12250,12 +12250,12 @@ function navigateTradesFromDrawer(e, filterQuery) {
     u.searchParams.delete('trade');
     u.searchParams.set('view', 'trades');
     u.searchParams.set('fq', q);
+    var searchEl = el('qSearch');
+    if (searchEl) searchEl.value = q;
+    showView('trades');
     var activeTab = document.querySelector('nav.tabs a.active');
     window.history.pushState({ view: activeTab ? activeTab.getAttribute('data-view') : 'trades' }, '', u.pathname + u.search + u.hash);
   } catch (err) {}
-  var searchEl = el('qSearch');
-  if (searchEl) searchEl.value = q;
-  showView('trades');
   tradesPage = 0;
   if (typeof refreshIosFilterSummaries === 'function') refreshIosFilterSummaries();
   renderTrades();
