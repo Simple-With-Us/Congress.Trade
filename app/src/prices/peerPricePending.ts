@@ -67,6 +67,7 @@ export function stPeerPricePendingFromSql(): string {
    AND (
      sr.latest_price_date IS NULL
      OR sr.latest_price_date < ?
+     OR NOT EXISTS (SELECT 1 FROM price_eod pe WHERE pe.ticker = t.ticker)
    )
    AND NOT (
      COALESCE(sr.price_unavailable, 0) <> 0

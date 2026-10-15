@@ -25,6 +25,7 @@ import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { all, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
 import { mapSubscription, mapTransaction, type SubscriptionRow, type TransactionRow } from './rows.ts';
+import { stampDeliveryFreshness } from './deliveryFreshness.ts';
 import { matchesFiltersWithContext, subscriptionOwnerEntitled, webhookTargetLengthError } from './subscriptions.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from './webhookTarget.ts';
@@ -38,6 +39,10 @@ import {
   recordTargetSuccess,
   targetKeyForUrl,
 } from './targetCircuit.ts';
+import {
+  releaseSubscriberWebhookResponseBody,
+  webhookSubscriberConsumptionError,
+} from './pushReceipt.ts';
 
 /** Max delivery attempts before we give up (initial try + retries). */
 const MAX_ATTEMPTS = 5;
@@ -239,7 +244,7 @@ export async function dispatchWebhook(
   if ((txRow as { deprecated_at?: string | null }).deprecated_at) {
     return { outboxComplete: !msg.subscriptionId };
   }
-  const tx = mapTransaction(txRow);
+  const tx = stampDeliveryFreshness(mapTransaction(txRow));
 
   // Resolve chamber via the owning filing (Transaction carries no chamber col).
   const chamberRow = await get<{ chamber: string | null }>(
@@ -430,49 +435,58 @@ async function deliverToSubscription(
     let res: Response | undefined;
     try {
       await lease?.assertOwned();
-      res = await trackedFetch(sub.targetUrl as string, {
-        method: 'POST',
-        redirect: 'manual',
-        signal: lease
-          ? AbortSignal.any([controller.signal, lease.signal])
-          : controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          // Legacy: HMAC over the body alone, so it never expires. Retained
-          // for existing consumers during migration — prefer X-CT-Signature.
-          'X-Signature': `sha256=${signature}`,
-          // v1: HMAC over `${t}.${body}`. Verify this one and reject anything
-          // outside your acceptance window (we suggest
-          // WEBHOOK_SIGNATURE_TOLERANCE_SEC) so a captured request expires.
-          'X-CT-Signature': `t=${signedAtSec},v1=${signatureV1}`,
-          'X-CT-Event': 'transaction.created',
-          'X-Tx-Id': tx.id,
-          'X-Subscription-Id': sub.id,
-          'X-Delivery-Attempt': String(attempt),
-        },
-        body,
-      }, {
-        service: 'webhook-delivery',
-        operation: 'deliver-subscriber-event',
-        dynamicTarget: 'subscriber-webhook',
-      });
-    } catch (err) {
-      if (lease?.signal.aborted) {
-        throw lease.signal.reason ?? new Error('durable queue lease lost');
+      try {
+        res = await trackedFetch(sub.targetUrl as string, {
+          method: 'POST',
+          redirect: 'manual',
+          signal: lease
+            ? AbortSignal.any([controller.signal, lease.signal])
+            : controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            // Legacy: HMAC over the body alone, so it never expires. Retained
+            // for existing consumers during migration — prefer X-CT-Signature.
+            'X-Signature': `sha256=${signature}`,
+            // v1: HMAC over `${t}.${body}`. Verify this one and reject anything
+            // outside your acceptance window (we suggest
+            // WEBHOOK_SIGNATURE_TOLERANCE_SEC) so a captured request expires.
+            'X-CT-Signature': `t=${signedAtSec},v1=${signatureV1}`,
+            'X-CT-Event': 'transaction.created',
+            'X-Tx-Id': tx.id,
+            'X-Subscription-Id': sub.id,
+            'X-Delivery-Attempt': String(attempt),
+          },
+          body,
+        }, {
+          service: 'webhook-delivery',
+          operation: 'deliver-subscriber-event',
+          dynamicTarget: 'subscriber-webhook',
+        });
+      } catch (err) {
+        if (lease?.signal.aborted) {
+          throw lease.signal.reason ?? new Error('durable queue lease lost');
+        }
+        throw new Error(timedOut ? `timeout after ${WEBHOOK_FETCH_TIMEOUT_MS}ms` : ((err as Error).message ?? 'fetch failed'));
       }
-      throw new Error(timedOut ? `timeout after ${WEBHOOK_FETCH_TIMEOUT_MS}ms` : ((err as Error).message ?? 'fetch failed'));
+      if (!res.ok) {
+        await releaseSubscriberWebhookResponseBody(res);
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const consumptionError = await webhookSubscriberConsumptionError(res);
+      if (consumptionError) {
+        throw new Error(consumptionError);
+      }
+      await lease?.assertOwned();
+      await recordDelivery(env, claim.id, claim.token, true, attempt, null);
+      // 2xx auto-closes the target circuit (probe success releases the parked backlog).
+      if (targetKey) await recordTargetSuccess(env, targetKey);
     } finally {
       clearTimeout(timeout);
-      // We only need status/headers. Releasing every response body promptly is
-      // essential under Workers' six-outbound-connection limit, especially
-      // across several bounded fanout chunks.
-      await res?.body?.cancel().catch(() => {});
+      // We only need status/headers unless we read the body above. Releasing every
+      // unread response body promptly is essential under Workers' six-outbound-
+      // connection limit, especially across several bounded fanout chunks.
+      if (res) await releaseSubscriberWebhookResponseBody(res);
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    await lease?.assertOwned();
-    await recordDelivery(env, claim.id, claim.token, true, attempt, null);
-    // 2xx auto-closes the target circuit (probe success releases the parked backlog).
-    if (targetKey) await recordTargetSuccess(env, targetKey);
   } catch (err) {
     if (lease?.signal.aborted) {
       throw lease.signal.reason ?? new Error('durable queue lease lost');

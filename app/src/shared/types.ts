@@ -190,6 +190,11 @@ export interface Transaction {
    * otherwise the persist time. Never a date before txDate.
    */
   firstSeenAt?: string | null;
+  /**
+   * Delivery-only stamp: true when filed/first-seen is outside the default
+   * fresh window (webhook/SSE payloads). Absent on feed rows until stamped.
+   */
+  isBackfill?: boolean;
   /** Original public disclosure document URL. Feed only. */
   sourceUrl?: string | null;
   /**
@@ -279,6 +284,11 @@ export interface SubscriptionFilters {
   sectors?: string[];
   /** Market-cap buckets to include (mega…nano, securities_ref.market_cap_bucket). */
   marketCapBuckets?: string[];
+  /**
+   * When true, deliver historical backfill rows too. Default (omitted/false) is
+   * fresh-only (filed or first-seen within seven days).
+   */
+  includeBackfill?: boolean;
 }
 
 export interface Subscription {

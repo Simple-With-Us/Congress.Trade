@@ -9,6 +9,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
+import { freshDeliveryDay, freshDeliveryIso } from './freshDeliveryFixtures.ts';
 import {
   DEFAULT_TARGET_DAILY_ATTEMPT_CAP,
   DEFAULT_TARGET_FAILURE_THRESHOLD,
@@ -282,11 +283,13 @@ describe('circuit lifecycle: open → hourly probe → close', () => {
 
 describe('parked-not-retried storm scenario (dispatchWebhook)', () => {
   const txRow = {
-    id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: '2026-06-20', owner: 'self',
+    id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: freshDeliveryDay, owner: 'self',
     asset_name: 'Apple Inc.', ticker: 'AAPL', asset_type: 'stock', tx_type: 'B',
     amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0,
     raw_text: 'AAPL purchase', confidence: 0.99, source: 'primary',
-    created_at: '2026-06-20T00:00:00.000Z', cursor_seq: 42,
+    filed_date: freshDeliveryDay,
+    first_seen_at: freshDeliveryIso,
+    created_at: freshDeliveryIso, cursor_seq: 42,
   };
   const subRow = {
     id: 'sub_1', client_id: 'client_1', delivery: 'webhook',

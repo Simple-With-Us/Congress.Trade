@@ -143,6 +143,7 @@ describe('selectTickersNeedingPrices — no perpetual re-selection', () => {
 
   it('drops fresh (latest_price_date == last trading day), keeps stale/never/expired-unavailable', async () => {
     seedTicker('FRESH', { latestPriceDate: FRESH_THROUGH }); // == Monday → not stale
+    seedPriceRows('FRESH', [FRESH_THROUGH]);
     seedTicker('STALE', { latestPriceDate: '2026-07-01' }); // older → stale
     seedTicker('NEVER', { latestPriceDate: null }); // never priced
     seedTicker('DEADRECENT', {
@@ -193,6 +194,7 @@ describe('selectTickersNeedingPrices — no perpetual re-selection', () => {
 
   it('with the real clock, a ticker carrying the last trading day is not re-selected', async () => {
     seedTicker('CUR', { latestPriceDate: lastTradingDay() });
+    seedPriceRows('CUR', [lastTradingDay()]);
     expect(await selectTickersNeedingPrices(env, 50)).toEqual([]);
   });
 

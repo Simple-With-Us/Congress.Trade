@@ -11,6 +11,7 @@
  */
 
 import type { Env } from '../shared/types.ts';
+import { ensurePriceUnavailableReasonColumn } from '../admin/ensurePeerSchema.ts';
 import { all, batchPrepared, get, run } from '../shared/db.ts';
 import {
   excludeCompetitorFixtureTransactionSql,
@@ -104,6 +105,7 @@ export async function markTickerPriceUnavailable(
   const sym = ticker.trim().toUpperCase();
   if (!sym) return;
   if (!opts.force && !(await tickerHasNonCompetitorFixtureTrade(env, sym))) return;
+  await ensurePriceUnavailableReasonColumn(env.DB);
   const nowIso = opts.checkedAt ?? new Date().toISOString();
   const reasonText = normalizePriceUnavailableReason(reason);
   const stageFirst = PRICE_UNAVAILABLE_NOT_FOUND_FIRST;
@@ -317,14 +319,18 @@ export async function selectTickersNeedingPrices(
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
         AND ${excludeCompetitorFixtureTransactionSql('t')}
+        AND t.deprecated_at IS NULL
         AND (
           sr.latest_price_date IS NULL
           OR sr.latest_price_date < ?
+          OR NOT EXISTS (SELECT 1 FROM price_eod pe WHERE pe.ticker = t.ticker)
           -- Do NOT re-select solely on current_price IS NULL: that would
           -- perpetually re-queue tickers that already have a fresh
           -- latest_price_date (termination guarantee). Stamp missing
           -- current_price from local price_eod via backfillCurrentPricesFromEod
-          -- before the peer refresh instead.
+          -- before the peer refresh instead.  DO re-select when metadata says
+          -- fresh but there is no local price_eod — otherwise two tickers can
+          -- sit forever with a stamped latest_price_date and never re-price.
         )
         AND NOT (
           COALESCE(sr.price_unavailable, 0) <> 0
@@ -385,7 +391,7 @@ export async function backfillCurrentPricesFromEod(
 
 export async function runPriceRefresh(
   env: Env,
-  opts: { max?: number; dryRun?: boolean; maxPerMinute?: number } = {},
+  opts: { max?: number; dryRun?: boolean; maxPerMinute?: number; signal?: AbortSignal } = {},
 ): Promise<PriceRefreshResult> {
   const runtimeSecrets = await resolveSecrets(env, [
     'APP_B_IMPORT_URL',
@@ -490,8 +496,18 @@ export async function runPriceRefresh(
 
   // 2) Per-ticker EOD history + per-trade performance anchors. Skipped
   // entirely once the run has been aborted above.
+  if (!result.aborted) {
+    // #2724 writes price_unavailable_reason.  Coolify does not run migrate,
+    // so the column is added here or the ticker INSERT throws and the
+    // pending-set clock never moves (CT-2409).
+    await ensurePriceUnavailableReasonColumn(env.DB);
+  }
   const tickers = result.aborted ? [] : await selectTickersNeedingPrices(env, budget);
   for (const ticker of tickers) {
+    if (opts.signal?.aborted) {
+      result.aborted = true;
+      break;
+    }
     if (budget <= 0) break;
     const nowIso = new Date().toISOString();
     const trades = await all<{ id: string; tx_date: string }>(

@@ -113,7 +113,7 @@ import { recordProviderHealth } from './providerHealth.ts';
 import {
   shouldSkipAgreementForReviewReason,
   dropJunkAgreementRows,
-  dropPtrFormSampleParsedRows,
+  dropPtrFormSamplesForPublish,
   evaluateExtractQuality,
 } from './extractRouting.ts';
 import {
@@ -1083,7 +1083,7 @@ export async function finalizePublish(
   audit: CascadeAudit,
 ): Promise<AgreementDocResult> {
   const filing = mapFiling(frow);
-  const withoutSamples = dropPtrFormSampleParsedRows(parsed);
+  const withoutSamples = dropPtrFormSamplesForPublish(docId, parsed);
   const extractor = frow.extractor ?? filing.extractor ?? null;
   if (requiresHandCheckBeforePublish(filing, extractor, 'primary')) {
     return {

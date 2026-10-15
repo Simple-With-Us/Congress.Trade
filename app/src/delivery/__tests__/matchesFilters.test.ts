@@ -10,13 +10,16 @@ import { describe, it, expect } from 'vitest';
 import { matchesFilters, matchesFiltersWithChamber, matchesFiltersWithContext } from '../subscriptions.ts';
 import type { SubscriptionFilters, Transaction } from '../../shared/types.ts';
 
+const FRESH_STAMP = new Date().toISOString();
+const FRESH_DAY = FRESH_STAMP.slice(0, 10);
+
 /** Build a Transaction fixture with sensible defaults, overridable per-test. */
 function tx(overrides: Partial<Transaction> = {}): Transaction {
   return {
     id: 'tx_1',
     docId: 'doc_1',
     filerId: 'M000001',
-    txDate: '2026-06-01',
+    txDate: FRESH_DAY,
     owner: 'self',
     assetName: 'Apple Inc.',
     ticker: 'AAPL',
@@ -29,7 +32,9 @@ function tx(overrides: Partial<Transaction> = {}): Transaction {
     rawText: 'AAPL purchase $1,001 - $15,000',
     confidence: 0.99,
     source: 'primary',
-    createdAt: '2026-06-02T12:00:00.000Z',
+    createdAt: FRESH_STAMP,
+    firstSeenAt: FRESH_STAMP,
+    filedDate: FRESH_DAY,
     cursorSeq: 42,
     ...overrides,
   };
@@ -103,6 +108,18 @@ describe('matchesFilters', () => {
   });
 
   // --- sides[] ------------------------------------------------------------
+  it('excludes backfill trades unless includeBackfill is true', () => {
+    const old = tx({
+      txDate: '2020-01-01',
+      firstSeenAt: '2020-01-01T00:00:00.000Z',
+      filedDate: '2020-01-01',
+      createdAt: '2020-01-02T00:00:00.000Z',
+    });
+    expect(matchesFilters(old, {})).toBe(false);
+    expect(matchesFilters(old, { includeBackfill: true })).toBe(true);
+    expect(matchesFilters(tx({ firstSeenAt: new Date().toISOString() }), {})).toBe(true);
+  });
+
   it('filters by transaction side (buys only)', () => {
     expect(matchesFilters(tx({ txType: 'B' }), { sides: ['B'] })).toBe(true);
     expect(matchesFilters(tx({ txType: 'S' }), { sides: ['B'] })).toBe(false);
