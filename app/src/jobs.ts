@@ -55,6 +55,8 @@ import { peerPricesNeedCatchUp } from './prices/peerPriceCatchUp.ts';
  * for tests; dedicated lane crons ignore it.
  */
 const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
+/** Set only after a non-aborted price catch-up.  Separate from the lane stamp. */
+const PRICE_CATCHUP_KEY = LANE_KEY_PREFIX + 'market-data-price-catchup';
 const SUBCLAIM_KEY_PREFIX = 'jobs:daily:lastdate:';
 const DAILY_KEY = 'jobs:daily:lastdate';
 
@@ -389,8 +391,12 @@ export async function maybeRunDailyMarketDataJobs(
   if (await laneHasSucceeded(env, laneKey, day)) {
     // The 2026-10-14/15 price refresh threw on a missing column and the
     // catch below still stamped the day, so the corpus sat one session
-    // behind until the next UTC date.  Retry prices only while that is true.
+    // behind until the next UTC date.  One successful catch-up per UTC day
+    // is enough: lastTradingDay ignores weekday holidays, so a corpus that
+    // can never reach that date must not re-walk the universe every hour.
+    if (await laneHasSucceeded(env, PRICE_CATCHUP_KEY, day)) return 'stamped';
     if (!(await peerPricesNeedCatchUp(env, now))) return 'stamped';
+    if (await dailyBudgetExceeded(env, 'price catch-up')) return 'budget';
     console.warn(
       'market-data lane stamped but peer prices are still behind; retrying price refresh',
     );
@@ -406,6 +412,7 @@ export async function maybeRunDailyMarketDataJobs(
       console.warn('daily price refresh failed:', (err as Error).message);
       return 'error';
     }
+    await markLaneOk(env, PRICE_CATCHUP_KEY, day);
     return 'ran';
   }
 

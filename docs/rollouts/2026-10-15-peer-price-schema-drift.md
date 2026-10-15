@@ -34,5 +34,5 @@ After this deploys, the next market-data tick (`7 * * * *`) runs the ALTER insid
 ## Follow-ups
 
 - #2735 can still land a startup migrate so other new columns do not depend on a write-path guard.
-- Today's lane stamp is already set.  The catch-up path is what unblocks 2026-10-15 without waiting for 2026-10-16T00:07Z.
+- Today's lane stamp is already set.  The catch-up path is what unblocks 2026-10-15 without waiting for 2026-10-16T00:07Z.  A finished catch-up stamps its own day key, so a weekday holiday (which `lastTradingDay` does not model) cannot re-walk the universe every hour.  An aborted or thrown catch-up leaves that key unset.  The catch-up also honors the D1 row budget.
 - Do not requeue Senate DLQ `50e7996f` or touch quarantined deliveries.

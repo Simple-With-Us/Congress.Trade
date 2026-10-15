@@ -334,6 +334,28 @@ describe('maybeRunDailyJobs secret resolution', () => {
   });
 });
 
+function stickyPriceDb(row: Record<string, unknown> | null) {
+  const statement = {
+    bind() {
+      return statement;
+    },
+    async first() {
+      return row;
+    },
+    async all() {
+      return { results: [] };
+    },
+    async run() {
+      return { success: true, meta: { changes: 0 } };
+    },
+  };
+  return {
+    prepare() {
+      return statement;
+    },
+  };
+}
+
 function priceProbeDb(rows: Array<Record<string, unknown> | null>) {
   const queue = [...rows];
   const statement = {
@@ -509,6 +531,54 @@ describe('staggered daily lanes', () => {
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
     expect(mocks.runEnrichment).not.toHaveBeenCalled();
     expect(mocks.backfillCurrentPricesFromEod).toHaveBeenCalledTimes(1);
+    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBe('2026-10-15');
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not catch up again the same day after one successful price retry', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    const morning = new Date('2026-10-15T08:42:00Z');
+    const later = new Date('2026-10-15T15:07:00Z');
+
+    expect(await maybeRunDailyMarketDataJobs(env, morning)).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, later)).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a catch-up that aborted, and skips it when the D1 budget is already spent', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    const now = new Date('2026-10-15T08:42:00Z');
+    mocks.isD1RowBudgetExceeded.mockResolvedValue(true);
+
+    expect(await maybeRunDailyMarketDataJobs(env, now)).toBe('budget');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBeUndefined();
+
+    mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
+    mocks.runPriceRefresh.mockResolvedValueOnce({
+      aborted: true,
+      errors: [],
+      sharePrices: [],
+      shareSpx: [],
+    });
+    expect(await maybeRunDailyMarketDataJobs(env, now)).toBe('error');
+    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBeUndefined();
+
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false,
+      errors: [],
+      sharePrices: [],
+      shareSpx: [],
+    });
+    expect(await maybeRunDailyMarketDataJobs(env, now)).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
+    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBe('2026-10-15');
   });
 
   it('stays stamped when the corpus is current and the pending tail is small', async () => {
