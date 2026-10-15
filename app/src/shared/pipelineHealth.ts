@@ -20,7 +20,8 @@ import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.t
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
-import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { latencyProvidersWithRejectedCredentials } from '../ingestion/scoutHandoff.ts';
 import { classifyFailedOutboxRow } from '../ingestion/transientDlq.ts';
 import {
   cronOverrunIsLoud,
@@ -218,12 +219,19 @@ export interface PipelineSignals {
    *
    * `expected` marks providers the current config intends to probe
    * (DISCLOSURE_LATENCY_PROVIDERS ∩ watch/FMP switches ∩ membership keys —
-   * see expectedLatencyProviderIds). expected=false rows are retired: shown
-   * in details, never paged. Absent = expected, so signal builders that
+   * see configExpectedLatencyProviderIds), minus auth-rejected membership
+   * keys. expected=false rows are retired or auth-latched: shown in details,
+   * never paged. `authRejected` distinguishes lapsed keys (401/403) from
+   * intentional config retire. Absent = expected, so signal builders that
    * predate the flag keep the old always-page behavior. lastObservedAt null
    * = expected but never observed (just-enabled provider) — counts silent.
    */
-  latencyProviders: Array<{ provider: string; lastObservedAt: string | null; expected?: boolean }> | null;
+  latencyProviders: Array<{
+    provider: string;
+    lastObservedAt: string | null;
+    expected?: boolean;
+    authRejected?: boolean;
+  }> | null;
   /**
    * Named-tunnel Senate relay liveness (issue #1604).  configured reflects
    * SENATE_RELAY_URL; probe is the last GET /health written by the watcher
@@ -952,17 +960,22 @@ export function evaluatePipelineSignals(
     checks.push({ id: 'latency_probes', status: 'unknown', detail: 'Latency-probe liveness uncollected', value: null });
   } else {
     const expected = s.latencyProviders.filter((p) => p.expected !== false);
-    const retired = s.latencyProviders.filter((p) => p.expected === false);
+    const authRejected = s.latencyProviders.filter((p) => p.authRejected);
+    const retired = s.latencyProviders.filter((p) => p.expected === false && !p.authRejected);
+    const authRejectedNote = authRejected.length
+      ? `; credentials rejected (not paged): ${authRejected.map((p) => p.provider).join(', ')}`
+      : '';
     const retiredNote = retired.length
       ? `; retired in config (not paged): ${retired.map((p) => p.provider).join(', ')}`
       : '';
+    const contextNote = `${authRejectedNote}${retiredNote}`;
     if (expected.length === 0) {
       checks.push({
         id: 'latency_probes',
         status: 'stalled',
         detail: s.latencyProviders.length === 0
           ? 'Latency monitoring NOT RUNNING — zero provider observations recorded, ever'
-          : `Latency monitoring NOT RUNNING — no provider is enabled in config${retiredNote}`,
+          : `Latency monitoring NOT RUNNING — no provider is enabled in config${contextNote}`,
         value: null,
       });
     } else {
@@ -985,21 +998,21 @@ export function evaluatePipelineSignals(
           id: 'latency_probes',
           status: 'stalled',
           detail: `Latency monitoring SILENT: newest expected-provider observation is `
-            + `${newestAgeH === Infinity ? 'missing' : Math.round(newestAgeH) + 'h'} old (threshold ${t.latencyObservationMaxAgeHours}h)${retiredNote}`,
+            + `${newestAgeH === Infinity ? 'missing' : Math.round(newestAgeH) + 'h'} old (threshold ${t.latencyObservationMaxAgeHours}h)${contextNote}`,
           value: newestAgeH === Infinity ? null : Math.round(newestAgeH),
         });
       } else if (silent.length > 0) {
         checks.push({
           id: 'latency_probes',
           status: 'degraded',
-          detail: `Latency provider(s) gone quiet: ${silent.join(', ')} (silence threshold ${t.latencyProviderSilenceHours}h)${retiredNote}`,
+          detail: `Latency provider(s) gone quiet: ${silent.join(', ')} (silence threshold ${t.latencyProviderSilenceHours}h)${contextNote}`,
           value: silent.length,
         });
       } else {
         checks.push({
           id: 'latency_probes',
           status: 'ok',
-          detail: `Latency probes live: newest observation ${newestAgeH < 1 ? Math.round(newestAgeH * 60) + 'm' : Math.round(newestAgeH) + 'h'} ago across ${expected.length} provider(s)${retiredNote}`,
+          detail: `Latency probes live: newest observation ${newestAgeH < 1 ? Math.round(newestAgeH * 60) + 'm' : Math.round(newestAgeH) + 'h'} ago across ${expected.length} provider(s)${contextNote}`,
           value: expected.length,
         });
       }
@@ -1649,21 +1662,33 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     );
     // Config-expected set; null when the resolver itself fails, which leaves
     // every observed row expected (fails open to the old always-page shape).
-    let expectedIds: Set<string> | null = null;
+    let configExpectedIds: Set<string> | null = null;
+    let authRejectedIds = new Set<string>();
     try {
-      expectedIds = await expectedLatencyProviderIds(env);
+      configExpectedIds = await configExpectedLatencyProviderIds(env);
+    } catch {}
+    try {
+      authRejectedIds = await latencyProvidersWithRejectedCredentials(env);
     } catch {}
     const collected: NonNullable<PipelineSignals['latencyProviders']> = rows
       .filter((r) => r.provider && r.last_observed)
       .map((r) => ({
         provider: r.provider,
         lastObservedAt: r.last_observed,
-        expected: expectedIds === null ? true : expectedIds.has(r.provider),
+        expected: configExpectedIds === null
+          ? true
+          : configExpectedIds.has(r.provider) && !authRejectedIds.has(r.provider),
+        authRejected: authRejectedIds.has(r.provider),
       }));
-    if (expectedIds) {
-      for (const id of expectedIds) {
+    if (configExpectedIds) {
+      for (const id of configExpectedIds) {
         if (!collected.some((p) => p.provider === id)) {
-          collected.push({ provider: id, lastObservedAt: null, expected: true });
+          collected.push({
+            provider: id,
+            lastObservedAt: null,
+            expected: !authRejectedIds.has(id),
+            authRejected: authRejectedIds.has(id),
+          });
         }
       }
     }
