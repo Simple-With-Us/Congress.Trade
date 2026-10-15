@@ -39,7 +39,9 @@ import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayH
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 /** Backoff between direct Senate eFD attempts before optional explicit proxy. */
-export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 2_000, 5_000];
+/** Keep direct retry waits under pollSenate's 7s abort when a proxy fallback exists. */
+export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
+export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
 
 function isRetryableSenateTransportError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? '');
@@ -87,9 +89,12 @@ export async function withSenateEfdEgress<T>(
   let lastErr: unknown;
   for (let i = 0; i < strategies.length; i++) {
     const { egress, fetch: fetchImpl } = strategies[i];
-    const attempts = egress === 'direct' ? SENATE_EFD_DIRECT_BACKOFF_MS.length : 1;
+    const directBackoff = explicitProxy
+      ? SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS
+      : SENATE_EFD_DIRECT_BACKOFF_MS;
+    const attempts = egress === 'direct' ? directBackoff.length : 1;
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const waitMs = egress === 'direct' ? SENATE_EFD_DIRECT_BACKOFF_MS[attempt] ?? 0 : 0;
+      const waitMs = egress === 'direct' ? directBackoff[attempt] ?? 0 : 0;
       if (waitMs > 0) await delay(waitMs, opts.signal);
       try {
         return await run(fetchImpl, egress);

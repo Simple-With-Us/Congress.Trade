@@ -13,41 +13,65 @@
  */
 
 import type { Filing, ParsedTx } from '../shared/types.ts';
+import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
+import { isJunkAssetString } from './nameNormalizer.ts';
 
-const HOUSE_PRINTED_EXAMPLE_ASSET_RE =
-  /\bexempl(?:je|e|l)?\s+(?:mega|meg|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|meg|mfg)\s*\.?\s*corp\b|\bex\s+mpi\s+(?:mega|meg|mfg)\s*\.?\s*corp\b/i;
+/**
+ * Printed House PTR example row after letters-only squash.
+ * Optional "ex" plus up to 10 letters of OCR junk (Example, Exempl, Ex Mpi),
+ * then mega / meg / mfg / manufactur…, then corp, then optional commonstock.
+ * Both ends are anchored so "Mega Corp Holdings Inc" and "Exxon Mobil Corp"
+ * stay live trades.  A spelling list loses the next OCR reading.
+ */
+const HOUSE_SAMPLE_SQUASHED_RE =
+  /^(?:ex[a-z]{0,10})?(?:manufactur[a-z]{0,8}|mfg|mega|meg)corp(?:commonstock)?$/;
 
-function squashHousePrintedExampleName(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]/g, '');
+/** Exact printed example dates.  Not every day in 2012 or 2020. */
+const HOUSE_SAMPLE_ISO_DATES = new Set(['2012-08-14', '2020-02-05', '2020-05-02']);
+
+function squashPtrAssetLetters(text: string): string {
+  return text.toLowerCase().replace(/[^a-z]/g, '');
 }
 
 /**
- * OCR-tolerant House PTR printed sample row (Example Mega/Meg/Mfg Corp).  Requires
- * an example stem or the bare printed "Mega Corp" / "Meg Corp" chrome so a random
- * live holding named Mega Corp is not dropped without a sample date elsewhere.
+ * Printed House sample dates only: 8/14/12, and the two ISO readings of the
+ * later form's 02/05/20 grid (2020-02-05 and 2020-05-02).  A year match is
+ * not a sample.  Callers must not drop a row on this date alone.
  */
-export function looksLikeHousePrintedExampleSquashedAnchor(text: string | null | undefined): boolean {
-  if (!text?.trim()) return false;
-  const sq = squashHousePrintedExampleName(text.trim());
-  if (!sq.includes('corp')) return false;
-  if (!/(?:mega|meg|mfg)/.test(sq)) return false;
-  if (/exempl|example|examp|exmpi|xample|exmpl/.test(sq)) return true;
-  return /^(?:mega|meg)corp$/.test(sq) || sq === 'mfgcorp';
-}
-
-/** Printed House PTR instruction dates (8/14/12) and newer 2020 sample grids. */
 export function looksLikePtrFormSampleDate(txDate: string | null | undefined): boolean {
   if (!txDate?.trim()) return false;
   const iso = txDate.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) {
-    if (iso === '2012-08-14' || iso.startsWith('2012-') || iso.startsWith('2020-')) return true;
+  if (HOUSE_SAMPLE_ISO_DATES.has(iso)) return true;
+  return /\b(?:8\/14\/12|08\/14\/2012|0?2\/0?5\/20|0?5\/0?2\/20)\b/.test(txDate);
+}
+
+/**
+ * Owner codes, a trailing asset class, and a short parenthetical ticker sit
+ * outside the printed name.  They are removed before the anchored signature
+ * so "SP Example Meg Corp [ST]" still matches, while "Mega Corp Holdings Inc"
+ * still does not.
+ */
+function stripHouseSampleAffixes(text: string): string {
+  let value = text.trim();
+  for (let i = 0; i < 2; i++) {
+    const next = value.replace(/^(?:(?:\((?:sp|dc|jt|self)\))|(?:(?:sp|dc|jt|self)\b))[\s:.-]*/i, '');
+    if (next === value) break;
+    value = next.trim();
   }
-  return /(?:\b8\/14\/12\b|\b08\/14\/2012\b)/.test(txDate);
+  value = value.replace(/\s*[\[(]\s*(?:st|cs|stock|common\s*stock)\s*[\])]\s*$/i, '').trim();
+  value = value.replace(/\s*\([A-Za-z]{1,5}\)\s*$/g, '').trim();
+  return value;
 }
 
 export function looksLikeHousePrintedExampleAsset(text: string | null | undefined): boolean {
   if (!text?.trim()) return false;
-  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(text.trim());
+  return HOUSE_SAMPLE_SQUASHED_RE.test(squashPtrAssetLetters(stripHouseSampleAffixes(text)));
+}
+
+/** Asset text from a raw OCR line that also carries a tx code and a date. */
+function housePrintedExampleCandidate(text: string): string {
+  const cut = text.split(/\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\/\d{1,2}\/\d{2,4}\b|\$\s*\d/)[0] ?? text;
+  return cut.replace(/\s+\b(?:P|S|E|purchase|sale|exchange)\b\s*$/i, '').trim();
 }
 
 /** Drop printed PTR form sample rows in every extraction path before normalize/publish. */
@@ -57,7 +81,30 @@ export function dropPtrFormSampleParsedRows(parsed: ParsedTx[]): ParsedTx[] {
     && !looksLikePtrFormSampleRow(p)
   );
 }
-import { isJunkAssetString } from './nameNormalizer.ts';
+
+/**
+ * Publish-path drop.  One Sentry log per filing when a printed sample is
+ * removed, so the drop is observable without a per-row issue.
+ */
+export function dropPtrFormSamplesForPublish(docId: string, parsed: ParsedTx[]): ParsedTx[] {
+  const kept = dropPtrFormSampleParsedRows(parsed);
+  const dropped = parsed.length - kept.length;
+  if (dropped > 0) {
+    const assets = parsed
+      .filter((row) => !kept.includes(row))
+      .map((row) => (row.assetName || row.rawText || '').trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .join('; ')
+      .slice(0, 240);
+    sentryLoggerWarn('ptr.form_sample_dropped', {
+      docId,
+      dropped,
+      assets,
+    });
+  }
+  return kept;
+}
 
 /** Same publish cap the normalizer uses; duplicated to avoid an import cycle. */
 export const EXTRACT_ROW_LIMIT = 200;
@@ -163,11 +210,13 @@ export function looksLikeHeaderContaminatedAsset(assetName: string | null): bool
 }
 
 /**
- * Printed PTR sample rows. House: "Example Mega Corp" dated 8/14/12 (OCR often
- * reads Exemplje). Senate paper: "IBM Corp. (stock) NYSE" dated 2/1/1X and
- * "(DC) Microsoft (stock) NASDAQ/OTC" dated 2/27/1X, with amount columns that
- * spell EXAMPLE. Those are form instructions, never live trades. A real IBM or
- * Microsoft lot will not use that exact printed wording.
+ * Printed PTR sample rows.  House: the example Mega / Meg / Mfg Corp line
+ * (OCR reads Exempl, Ex Mpi, Mega Corp, Example Meg Corp).  Senate paper:
+ * "IBM Corp. (stock) NYSE" dated 2/1/1X and "(DC) Microsoft (stock) NASDAQ/OTC"
+ * dated 2/27/1X, with amount columns that spell EXAMPLE.  Those are form
+ * instructions, never live trades.  A real IBM or Microsoft lot will not use
+ * that exact printed wording.  A real Mega Corp holding with any extra word
+ * ("Holdings", "Inc") is kept.
  */
 export function looksLikePtrFormSampleAsset(assetName: string | null): boolean {
   if (!assetName) return false;
@@ -199,18 +248,10 @@ export function looksLikePtrFormSampleRow(row: {
 
   if (looksLikePtrFormSampleAsset(asset)) return true;
   if (looksLikePtrFormSampleAsset(raw)) return true;
-
-  if (looksLikeHousePrintedExampleAsset(asset) || looksLikeHousePrintedExampleAsset(raw)) {
-    if (!date || looksLikePtrFormSampleDate(date) || /8\/14\/12|08\/14\/2012/.test(raw)) {
-      return true;
-    }
-  }
-
-  if (date && looksLikePtrFormSampleDate(date)) {
-    if (looksLikeHousePrintedExampleSquashedAnchor(asset) || looksLikeHousePrintedExampleSquashedAnchor(raw)) {
-      return true;
-    }
-  }
+  // Raw lines keep a tx code and a date after the printed name.  The name
+  // signature still has to match.  looksLikePtrFormSampleDate is not a drop
+  // by itself: 2012 and 2020 are real trading years.
+  if (raw && looksLikeHousePrintedExampleAsset(housePrintedExampleCandidate(raw))) return true;
 
   // Amount column spells EXAMPLE or raw text has EXAMPLE with sample tickers/assets
   if (/\bexample\b/i.test(amount) || /\bexample\b/i.test(raw)) {
