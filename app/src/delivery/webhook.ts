@@ -38,7 +38,7 @@ import {
   recordTargetSuccess,
   targetKeyForUrl,
 } from './targetCircuit.ts';
-import { congressPushReceiptFailureReason, readWebhookPushReceipt } from './pushReceipt.ts';
+import { webhookSubscriberConsumptionError } from './pushReceipt.ts';
 
 /** Max delivery attempts before we give up (initial try + retries). */
 const MAX_ATTEMPTS = 5;
@@ -466,8 +466,7 @@ async function deliverToSubscription(
       clearTimeout(timeout);
     }
     if (!res?.ok) throw new Error(`HTTP ${res?.status ?? 'unknown'}`);
-    const receiptParsed = await readWebhookPushReceipt(res);
-    const consumptionError = congressPushReceiptFailureReason(receiptParsed);
+    const consumptionError = await webhookSubscriberConsumptionError(res);
     if (consumptionError) {
       throw new Error(consumptionError);
     }

@@ -3,6 +3,7 @@ import {
   congressPushReceiptFailureReason,
   parseCongressPushReceipt,
   readWebhookPushReceipt,
+  webhookSubscriberConsumptionError,
 } from '../pushReceipt.ts';
 
 describe('pushReceipt', () => {
@@ -51,5 +52,34 @@ describe('pushReceipt', () => {
     );
     const parsed = await readWebhookPushReceipt(response);
     expect(parsed.ok).toBe(true);
+  });
+
+  it('webhookSubscriberConsumptionError ignores plain 2xx non-JSON bodies', async () => {
+    const response = new Response('ok', { status: 200, headers: { 'content-type': 'text/plain' } });
+    expect(await webhookSubscriberConsumptionError(response)).toBeNull();
+  });
+
+  it('webhookSubscriberConsumptionError ignores generic JSON without receipt fields', async () => {
+    const response = new Response(JSON.stringify({ status: 'ok' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(await webhookSubscriberConsumptionError(response)).toBeNull();
+  });
+
+  it('webhookSubscriberConsumptionError fails on v1 consumed=false', async () => {
+    const response = new Response(
+      JSON.stringify({
+        receiptVersion: 1,
+        delivered: true,
+        consumed: false,
+        ok: false,
+        applied: 0,
+        reason: 'invalid-event',
+      }),
+      { status: 200,
+        headers: { 'content-type': 'application/json' } },
+    );
+    expect(await webhookSubscriberConsumptionError(response)).toMatch(/invalid-event/);
   });
 });

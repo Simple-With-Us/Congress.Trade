@@ -7,7 +7,7 @@ Webhook dispatch marked deliveries `delivered` on HTTP 2xx without validating Ap
 ## Changes Made
 
 - `app/src/delivery/pushReceipt.ts` — parse/validate receipt (legacy `ok`/`applied` tolerated).
-- `app/src/delivery/webhook.ts` — read JSON response; fail delivery when `consumed=false`.
+- `app/src/delivery/webhook.ts` — when the response is a recognized v1 or legacy ok/applied receipt, fail delivery when `consumed=false`; generic third-party 2xx bodies unchanged.
 - Tests updated in `deliveryEntitlement`, `queueRetry`, new `pushReceipt.test.ts`.
 
 ## Verification State

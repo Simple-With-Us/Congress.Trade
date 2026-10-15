@@ -101,6 +101,10 @@ export type ParseCongressPushReceiptResult =
   | { ok: true; receipt: CongressPushReceipt }
   | { ok: false; reason: string };
 
+/** JSON body that is not a v1 receipt or legacy ok/applied shape (generic third-party webhook). */
+export const PUSH_RECEIPT_UNRECOGNIZED_SHAPE_REASON =
+  'push response missing receiptVersion and legacy ok/applied fields';
+
 export function parseCongressPushReceipt(payload: unknown): ParseCongressPushReceiptResult {
   const versioned = CongressPushReceiptSchema.safeParse(payload);
   if (versioned.success) {
@@ -117,7 +121,7 @@ export function parseCongressPushReceipt(payload: unknown): ParseCongressPushRec
   }
 
   if (typeof legacy.ok !== 'boolean' || typeof legacy.applied !== 'number') {
-    return { ok: false, reason: 'push response missing receiptVersion and legacy ok/applied fields' };
+    return { ok: false, reason: PUSH_RECEIPT_UNRECOGNIZED_SHAPE_REASON };
   }
 
   return { ok: true, receipt: buildReceipt(legacy) };
@@ -152,4 +156,37 @@ export async function readWebhookPushReceipt(response: Response): Promise<ParseC
   } catch {
     return { ok: false, reason: 'push response body was not valid JSON' };
   }
+}
+
+/**
+ * Subscriber webhook delivery: validate consumption only when the receiver returns
+ * a recognized App B receipt or legacy ok/applied JSON.  Plain 2xx, non-JSON, empty
+ * JSON, and generic JSON ({ "status": "ok" }) stay successful deliveries.
+ */
+export async function webhookSubscriberConsumptionError(response: Response): Promise<string | null> {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (!contentType.toLowerCase().includes('application/json')) {
+    return null;
+  }
+  const text = await response.text();
+  if (text.length > WEBHOOK_PUSH_RECEIPT_MAX_BYTES) {
+    return 'push response body too large';
+  }
+  if (!text.trim()) {
+    return null;
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return 'push response body was not valid JSON';
+  }
+  const parsed = parseCongressPushReceipt(payload);
+  if (parsed.ok === false) {
+    if (parsed.reason === PUSH_RECEIPT_UNRECOGNIZED_SHAPE_REASON) {
+      return null;
+    }
+    return parsed.reason;
+  }
+  return congressPushReceiptFailureReason(parsed);
 }
