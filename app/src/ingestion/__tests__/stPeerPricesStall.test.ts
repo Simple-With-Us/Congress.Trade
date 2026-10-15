@@ -125,6 +125,29 @@ describe('st_peer_prices stall detector', () => {
     expect(msg?.[0]).toContain('pending sample');
   });
 
+  it('still stalls when pending tickers have stale bars while corpus MAX is fresh', async () => {
+    const { captureMessage } = await import('../../deno/sentry.ts');
+    seedTrade('STALE1');
+    const staleChecked = '2026-10-01T00:00:00.000Z';
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
+       VALUES ('STALE1', '2026-10-01', ?, 'socratic')`,
+    ).run(staleChecked);
+    seedTrade('FRESH');
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
+       VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
+    ).run();
+
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.alerted).toContain('st_peer_prices');
+    const msg = (captureMessage as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+      String(c[0]).includes('st_peer_prices'),
+    );
+    expect(msg?.[0]).toContain('STALE1');
+  });
+
   it('does not stall on a tiny tail when corpus EOD is current through lastTradingDay', async () => {
     seedTrade('TAIL1');
     seedTrade('TAIL2');

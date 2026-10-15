@@ -27,7 +27,9 @@ import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixt
 import {
   isTailOnlyPeerPriceBacklog,
   readCorpusLatestPriceDate,
+  stPeerPriceNeverPricedPendingFromSql,
   stPeerPricePendingBindParams,
+  stPeerPricePendingBindsForSubqueries,
   stPeerPricePendingFromSql,
 } from '../prices/peerPricePending.ts';
 import {
@@ -518,23 +520,23 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
   }
   const pendingParams = stPeerPricePendingBindParams(now);
   const pendingFrom = stPeerPricePendingFromSql();
-  const pendingBinds = [
-    pendingParams.freshThrough,
-    pendingParams.firstUnavailableCutoff,
-    pendingParams.unavailableCutoff,
-  ];
+  const neverPricedFrom = stPeerPriceNeverPricedPendingFromSql();
+  const countAndProgressBinds = stPeerPricePendingBindsForSubqueries(pendingParams, 3);
   let pending = 0;
+  let neverPricedPending = 0;
   let lastChecked: string | null = null;
   let pendingSample: string[] = [];
   try {
-    const row = await get<{ n: number; last_at: string | null }>(
+    const row = await get<{ n: number; never_n: number; last_at: string | null }>(
       env.DB,
       `SELECT
          (SELECT COUNT(DISTINCT t.ticker) ${pendingFrom}) AS n,
+         (SELECT COUNT(DISTINCT t.ticker) ${neverPricedFrom}) AS never_n,
          (SELECT MAX(sr.price_checked_at) ${pendingFrom}) AS last_at`,
-      pendingBinds,
+      countAndProgressBinds,
     );
     pending = Number(row?.n ?? 0);
+    neverPricedPending = Number(row?.never_n ?? 0);
     lastChecked = row?.last_at ?? null;
   } catch {
     return { stalled: false, detail: 'price stall query failed', skip: true };
@@ -543,7 +545,7 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
     return { stalled: false, detail: 'ST price refresh moving' };
   }
   const corpusLatest = await readCorpusLatestPriceDate(env);
-  if (isTailOnlyPeerPriceBacklog(pending, corpusLatest, now)) {
+  if (isTailOnlyPeerPriceBacklog(pending, neverPricedPending, corpusLatest, now)) {
     return {
       stalled: false,
       detail:
@@ -559,7 +561,7 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
       `SELECT DISTINCT t.ticker AS ticker ${pendingFrom}
        ORDER BY t.ticker ASC
        LIMIT 10`,
-      pendingBinds,
+      stPeerPricePendingBindsForSubqueries(pendingParams, 1),
     );
     pendingSample = names.map((r) => r.ticker);
   } catch {

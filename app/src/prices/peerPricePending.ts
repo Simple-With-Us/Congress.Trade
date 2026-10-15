@@ -31,9 +31,29 @@ export function stPeerPricePendingBindParams(now = new Date()): StPeerPricePendi
   };
 }
 
+/** One subquery's bind order: freshThrough, firstUnavailableCutoff, unavailableCutoff. */
+export function stPeerPricePendingBindsOnce(params: StPeerPricePendingParams): [
+  string,
+  string,
+  string,
+] {
+  return [params.freshThrough, params.firstUnavailableCutoff, params.unavailableCutoff];
+}
+
+/** Repeat bind triplets for SQL that interpolates `stPeerPricePendingFromSql()` N times. */
+export function stPeerPricePendingBindsForSubqueries(
+  params: StPeerPricePendingParams,
+  subqueryCount: number,
+): string[] {
+  const once = stPeerPricePendingBindsOnce(params);
+  const out: string[] = [];
+  for (let i = 0; i < subqueryCount; i++) out.push(...once);
+  return out;
+}
+
 /**
- * SQL fragment: `FROM transactions t … WHERE …` with four bind slots in order:
- * freshThrough, firstUnavailableCutoff, unavailableCutoff (twice in CASE).
+ * SQL fragment: `FROM transactions t … WHERE …` with three `?` bind slots in order:
+ * freshThrough, firstUnavailableCutoff, unavailableCutoff (third reused in CASE).
  */
 export function stPeerPricePendingFromSql(): string {
   const stageFirst = PRICE_UNAVAILABLE_NOT_FOUND_FIRST;
@@ -58,6 +78,12 @@ export function stPeerPricePendingFromSql(): string {
    )`;
 }
 
+/** Pending rows that have never received an EOD bar (CT-2408 tail class only). */
+export function stPeerPriceNeverPricedPendingFromSql(): string {
+  return `${stPeerPricePendingFromSql()}
+   AND sr.latest_price_date IS NULL`;
+}
+
 export async function readCorpusLatestPriceDate(env: Env): Promise<string | null> {
   try {
     const row = await get<{ d: string | null }>(
@@ -77,10 +103,13 @@ export async function readCorpusLatestPriceDate(env: Env): Promise<string | null
  */
 export function isTailOnlyPeerPriceBacklog(
   pending: number,
+  neverPricedPending: number,
   corpusLatest: string | null,
   now: Date,
 ): boolean {
   if (pending <= 0 || pending > ST_PEER_PRICE_TAIL_STALL_MAX_PENDING) return false;
+  // Stale-bar backlog (has history but behind freshThrough) must still page.
+  if (neverPricedPending !== pending) return false;
   const freshThrough = lastTradingDay(now);
   return isCurrentPriceFresh(corpusLatest, freshThrough);
 }
