@@ -149,7 +149,7 @@ ${LEGAL_THEME_BOOT}
   html[data-theme="dark"] { color-scheme: dark; }
   html[data-theme="light"] {
     color-scheme: light;
-    --bg:#eff3f8;--bg2:#e4ebf4;--panel:#ffffff;--border:#c1cde2;--text:#09101c;--dim:#34435b;--body:#34435b;--accent:#2563eb;--warn:#b45309;
+    --bg:#eff3f8;--bg2:#e4ebf4;--panel:#ffffff;--border:#c1cde2;--text:#09101c;--dim:#34435b;--body:#34435b;--accent:#2563eb;--warn:#9a3412;
   }
   *{box-sizing:border-box}
   body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,var(--bg2),var(--bg));color:var(--text);

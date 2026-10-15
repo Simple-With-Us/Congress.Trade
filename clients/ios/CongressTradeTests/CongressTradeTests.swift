@@ -135,6 +135,35 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(UIColor(AppTheme.card).resolvedColor(with: darkTraits).cgColor.alpha, 1.0, accuracy: 0.001)
     }
 
+    func testLightSemanticTextMeetsWcagAaOnCardBackgroundCT1356() {
+        let lightTraits = UITraitCollection(userInterfaceStyle: .light)
+        let card = UIColor(AppTheme.card).resolvedColor(with: lightTraits)
+        let positive = UIColor(AppTheme.semanticPositive).resolvedColor(with: lightTraits)
+        let negative = UIColor(AppTheme.semanticNegative).resolvedColor(with: lightTraits)
+        let caution = UIColor(AppTheme.semanticCaution).resolvedColor(with: lightTraits)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: positive, background: card), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: negative, background: card), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: caution, background: card), 4.5)
+        // Regression: system green on white is well below 4.5:1.
+        XCTAssertLessThan(Self.wcagContrast(foreground: .systemGreen, background: .white), 4.5)
+    }
+
+    private static func wcagContrast(foreground: UIColor, background: UIColor) -> CGFloat {
+        func relativeLuminance(_ color: UIColor) -> CGFloat {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            color.getRed(&r, green: &g, blue: &b, alpha: &a)
+            func channel(_ c: CGFloat) -> CGFloat {
+                c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        let l1 = relativeLuminance(foreground)
+        let l2 = relativeLuminance(background)
+        let lighter = max(l1, l2)
+        let darker = min(l1, l2)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
     func testSignedFlowFormatUsesUnicodeMinusOnOneLine() {
         XCTAssertEqual(SignedFlowFormat.usd(1_200_000), "+$1.2m")
         XCTAssertEqual(SignedFlowFormat.usd(-178_300_000), "\u{2212}$178.3m")
