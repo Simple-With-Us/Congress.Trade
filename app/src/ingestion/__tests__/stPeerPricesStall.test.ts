@@ -138,6 +138,9 @@ describe('st_peer_prices stall detector', () => {
       `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
        VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
     ).run();
+    db.prepare(
+      `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 100)`,
+    ).run();
 
     const now = new Date('2026-10-12T18:00:00.000Z');
     const result = await sweepPipelineStallAlerts(envWithDb(), now);
@@ -161,6 +164,9 @@ describe('st_peer_prices stall detector', () => {
     db.prepare(
       `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
        VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 100)`,
     ).run();
 
     const now = new Date('2026-10-12T18:00:00.000Z');

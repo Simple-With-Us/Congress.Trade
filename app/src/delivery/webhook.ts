@@ -38,6 +38,7 @@ import {
   recordTargetSuccess,
   targetKeyForUrl,
 } from './targetCircuit.ts';
+import { webhookSubscriberConsumptionError } from './pushReceipt.ts';
 
 /** Max delivery attempts before we give up (initial try + retries). */
 const MAX_ATTEMPTS = 5;
@@ -463,12 +464,16 @@ async function deliverToSubscription(
       throw new Error(timedOut ? `timeout after ${WEBHOOK_FETCH_TIMEOUT_MS}ms` : ((err as Error).message ?? 'fetch failed'));
     } finally {
       clearTimeout(timeout);
-      // We only need status/headers. Releasing every response body promptly is
-      // essential under Workers' six-outbound-connection limit, especially
-      // across several bounded fanout chunks.
-      await res?.body?.cancel().catch(() => {});
+      // Drain bodies we will not read (non-JSON 2xx). JSON paths consume via text() below.
+      if (res && !res.ok) {
+        await res.body?.cancel().catch(() => {});
+      }
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res?.ok) throw new Error(`HTTP ${res?.status ?? 'unknown'}`);
+    const consumptionError = await webhookSubscriberConsumptionError(res);
+    if (consumptionError) {
+      throw new Error(consumptionError);
+    }
     await lease?.assertOwned();
     await recordDelivery(env, claim.id, claim.token, true, attempt, null);
     // 2xx auto-closes the target circuit (probe success releases the parked backlog).

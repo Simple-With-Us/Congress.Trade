@@ -153,7 +153,7 @@ const proxySecrets = await resolveSecrets(secretEnv, [
 const resolvedProxyUrl = resolveResidentialProxyUrl({
   ...secretEnv,
   ...proxySecrets,
-});
+}, { allowDefault: false });
 if (resolvedProxyUrl && cachedEnvValues) {
   cachedEnvValues['RESIDENTIAL_PROXY_URL'] = resolvedProxyUrl;
   console.log('Residential proxy initialized from Infisical for Senate/House scraping');
