@@ -1,0 +1,28 @@
+[
+  {
+    "assetName": "Exempl Mfg Corp.",
+    "ticker": null,
+    "txDate": "2020-05-02",
+    "txType": "B",
+    "owner": "self",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "isOption": false,
+    "capGainsOver200": false,
+    "confidence": 0.55,
+    "rawText": "Exempl Mfg Corp. P 8/14/12"
+  },
+  {
+    "assetName": "Vanguard Total Stock Market ETF",
+    "ticker": "VTI",
+    "txDate": "2026-08-14",
+    "txType": "B",
+    "owner": "spouse",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "isOption": false,
+    "capGainsOver200": false,
+    "confidence": 0.92,
+    "rawText": "SP Vanguard Total Stock Market ETF (VTI) P 08/14/2026"
+  }
+]
