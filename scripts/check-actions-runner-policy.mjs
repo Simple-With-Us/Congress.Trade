@@ -139,9 +139,16 @@ if (!xctest.includes("IOS_CI_MIN_TESTS:-71") && !xctest.includes("-lt \"$MIN_TES
 async function assertMainRulesetRequiredChecks() {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const repo = process.env.GITHUB_REPOSITORY;
+  const inCi = process.env.GITHUB_ACTIONS === "true" || process.env.CI === "true";
   if (!token || !repo) {
+    if (inCi) {
+      errors.push(
+        "ruleset check: GITHUB_TOKEN (or GH_TOKEN) and GITHUB_REPOSITORY must be set in CI — do not skip validation",
+      );
+      return;
+    }
     console.log(
-      "Ruleset check skipped (no GITHUB_TOKEN/GH_TOKEN or GITHUB_REPOSITORY); CI must set both.",
+      "Ruleset check skipped locally (no GITHUB_TOKEN/GH_TOKEN or GITHUB_REPOSITORY).",
     );
     return;
   }

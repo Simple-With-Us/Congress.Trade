@@ -198,6 +198,9 @@ jobs:
 
       - name: Enforce owned-runner workflow policy
         working-directory: .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
       # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
