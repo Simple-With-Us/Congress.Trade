@@ -7412,10 +7412,26 @@ function useModelRows(docId, idx) {
   openReviewEditor(docId, run.rows, 'confirm', run.provider + ':' + run.model, item && item.chamber);
 }
 /* Row key matching arbitrationRowKey in src/extractors/types.ts, so a queued
-   payload transaction can be paired with its consensus row below. */
+   payload transaction can be paired with its consensus row below. Owner is
+   included when it is a known code. A stored consensus key from before that
+   change is the 3-part ticker|date|type form and still matches when the lot
+   is unique. */
 function consensusQueuedRowKey(t) {
-  var sym = String((t && (t.ticker || t.assetName)) || '').trim().toUpperCase();
-  return sym + '|' + String((t && t.txDate) || '') + '|' + String((t && t.txType) || '');
+  return clientArbitrationRowKey(t || {});
+}
+function consensusLegacyRowKey(t) {
+  return clientLegacyArbitrationRowKey(t || {});
+}
+function consensusStoredLegacy(key) {
+  var raw = String(key || '');
+  var hash = raw.lastIndexOf('#');
+  if (hash > 0 && /^[0-9]+$/.test(raw.slice(hash + 1))) raw = raw.slice(0, hash);
+  var parts = raw.split('|');
+  var last = parts.length ? parts[parts.length - 1] : '';
+  if (parts.length >= 4 && (last === 'SELF' || last === 'SPOUSE' || last === 'JOINT' || last === 'DEPENDENT')) {
+    return parts.slice(0, -1).join('|');
+  }
+  return raw;
 }
 /* Missing/null consensus values never erase a queued value. Contested rows are
    handled as a whole below and do not call this helper. */
@@ -7440,28 +7456,42 @@ function useConsensusRows(docId) {
   var rows = reviewPayloadTransactions(item && item.payload).map(function (t) { return Object.assign({}, t); });
   if (!rows.length) { showToast('Consensus cannot be applied safely because the queued review payload has no rows.', true); return; }
   var queuedByKey = {};
+  var queuedByLegacy = {};
   rows.forEach(function (t, index) {
     var key = consensusQueuedRowKey(t);
+    var legacy = consensusLegacyRowKey(t);
     if (!queuedByKey[key]) queuedByKey[key] = [];
     queuedByKey[key].push({ index: index, row: t });
+    if (!queuedByLegacy[legacy]) queuedByLegacy[legacy] = [];
+    queuedByLegacy[legacy].push({ index: index, row: t });
   });
   var consensusCountByKey = {};
+  var consensusCountByLegacy = {};
   consensus.rows.forEach(function (row) {
     var baseKey = row.baseRowKey || row.rowKey;
+    var legacy = consensusStoredLegacy(baseKey);
     consensusCountByKey[baseKey] = (consensusCountByKey[baseKey] || 0) + 1;
+    consensusCountByLegacy[legacy] = (consensusCountByLegacy[legacy] || 0) + 1;
   });
   var reservedQueueIndexes = {};
   var safeMatches = [];
   var unmatchedConsensus = [];
   consensus.rows.forEach(function (row) {
     var baseKey = row.baseRowKey || row.rowKey;
+    var legacy = consensusStoredLegacy(baseKey);
     var rowAuthoritative = (row.rowConsensus === 'unanimous' || row.rowConsensus === 'majority') &&
       row.presentIn.length * 2 > models.length;
-    // Duplicate groups have no trustworthy cross-model occurrence identity;
-    // buildConsensusRows marks them contested, and the UI also refuses an
-    // occurrence match here as defense in depth.
-    if (consensusCountByKey[baseKey] > 1 || (queuedByKey[baseKey] || []).length > 1) return;
-    var exact = queuedByKey[baseKey] && queuedByKey[baseKey][0];
+    // Exact owner-qualified keys win. A stored 3-part key (no owner segment)
+    // still pairs with a queued row that now includes owner, but only when
+    // that historical prefix is unique on both sides. Duplicate groups have
+    // no trustworthy cross-model occurrence identity; buildConsensusRows marks
+    // them contested, and the UI also refuses an occurrence match here.
+    var queuedExact = queuedByKey[baseKey] || [];
+    var useLegacy = queuedExact.length === 0 && baseKey === legacy;
+    var queued = useLegacy ? (queuedByLegacy[legacy] || []) : queuedExact;
+    var consensusCount = useLegacy ? (consensusCountByLegacy[legacy] || 0) : (consensusCountByKey[baseKey] || 0);
+    if (consensusCount > 1 || queued.length > 1) return;
+    var exact = queued[0];
     if (exact && !reservedQueueIndexes[exact.index]) {
       reservedQueueIndexes[exact.index] = true;
       if (rowAuthoritative) safeMatches.push({ row: row, index: exact.index });
@@ -10203,9 +10233,79 @@ async function runAllBenchmarks() {
   }
 }
 
+function clientArbitrationOwner(owner) {
+  var raw = String(owner || '').trim().toLowerCase();
+  if (raw === 'self') return 'SELF';
+  if (raw === 'spouse' || raw === 'sp') return 'SPOUSE';
+  if (raw === 'joint' || raw === 'jt') return 'JOINT';
+  if (raw === 'dependent' || raw === 'child' || raw === 'dc') return 'DEPENDENT';
+  return '';
+}
+function clientLegacyArbitrationRowKey(tx) {
+  var sym = ((tx && (tx.ticker || tx.assetName) || '') + '').trim().toUpperCase();
+  return sym + '|' + ((tx && tx.txDate) || '') + '|' + (tx && tx.txType);
+}
 function clientArbitrationRowKey(tx) {
-  var sym = ((tx.ticker || tx.assetName || '') + '').trim().toUpperCase();
-  return sym + '|' + (tx.txDate || '') + '|' + tx.txType;
+  var legacy = clientLegacyArbitrationRowKey(tx);
+  var owner = clientArbitrationOwner(tx && tx.owner);
+  return owner ? legacy + '|' + owner : legacy;
+}
+function clientParseArbitrationRowKey(key) {
+  var raw = String(key || '');
+  var hash = raw.lastIndexOf('#');
+  if (hash > 0 && /^[0-9]+$/.test(raw.slice(hash + 1))) raw = raw.slice(0, hash);
+  var parts = raw.split('|');
+  var last = parts.length ? parts[parts.length - 1] : '';
+  if (parts.length >= 4 && (last === 'SELF' || last === 'SPOUSE' || last === 'JOINT' || last === 'DEPENDENT')) {
+    return { legacy: parts.slice(0, -1).join('|'), owner: last };
+  }
+  return { legacy: raw, owner: '' };
+}
+function clientCanonicalArbitrationKeys(keyGroups) {
+  var parsed = [];
+  var g;
+  var i;
+  for (g = 0; g < keyGroups.length; g++) {
+    parsed[g] = [];
+    for (i = 0; i < keyGroups[g].length; i++) parsed[g][i] = clientParseArbitrationRowKey(keyGroups[g][i]);
+  }
+  var info = {};
+  for (g = 0; g < keyGroups.length; g++) {
+    for (i = 0; i < keyGroups[g].length; i++) {
+      var prefix = parsed[g][i].legacy;
+      if (!info[prefix]) {
+        info[prefix] = { counts: [], owners: {} };
+        var z;
+        for (z = 0; z < keyGroups.length; z++) info[prefix].counts.push(0);
+      }
+      info[prefix].counts[g] += 1;
+      if (parsed[g][i].owner) info[prefix].owners[parsed[g][i].owner] = true;
+    }
+  }
+  var out = [];
+  for (g = 0; g < keyGroups.length; g++) {
+    out[g] = [];
+    for (i = 0; i < keyGroups[g].length; i++) {
+      var parsedKey = parsed[g][i];
+      var slot = info[parsedKey.legacy];
+      var split = false;
+      var c;
+      for (c = 0; c < slot.counts.length; c++) if (slot.counts[c] > 1) split = true;
+      if (!split) { out[g][i] = parsedKey.legacy; continue; }
+      var ownerCount = 0;
+      var only = '';
+      var name;
+      for (name in slot.owners) {
+        if (Object.prototype.hasOwnProperty.call(slot.owners, name)) {
+          ownerCount += 1;
+          only = name;
+        }
+      }
+      if (!parsedKey.owner && ownerCount === 1) out[g][i] = parsedKey.legacy + '|' + only;
+      else out[g][i] = parsedKey.owner ? parsedKey.legacy + '|' + parsedKey.owner : keyGroups[g][i];
+    }
+  }
+  return out;
 }
 
 function clientBuildMajorityRows(reads) {
@@ -10226,12 +10326,19 @@ function clientBuildMajorityRows(reads) {
     return (val === null || val === undefined) ? '' : String(val).trim().replace(/\\s+/g, ' ').toUpperCase();
   };
 
-  var groups = reads.map(function(read) {
+  var stableGroups = reads.map(function(read) {
+    var rows = read.rows || [];
+    var keys = [];
+    for (var i = 0; i < rows.length; i++) keys.push(clientArbitrationRowKey(rows[i]));
+    return keys;
+  });
+  var canonicalGroups = clientCanonicalArbitrationKeys(stableGroups);
+  var groups = reads.map(function(read, gi) {
     var grouped = {};
     var rows = read.rows || [];
     for (var i = 0; i < rows.length; i++) {
       var tx = rows[i];
-      var key = clientArbitrationRowKey(tx);
+      var key = canonicalGroups[gi][i];
       if (!grouped[key]) grouped[key] = [];
       grouped[key].push(tx);
     }
