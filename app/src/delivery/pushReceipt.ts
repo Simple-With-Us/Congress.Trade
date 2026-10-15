@@ -49,6 +49,27 @@ export interface CongressPushApplyLike {
   duplicate?: boolean;
 }
 
+const CongressPushApplyLikeSchema = z
+  .object({
+    ok: z.boolean(),
+    applied: nonNegativeInt,
+    type: z.string().trim().min(1).optional(),
+    reason: z.string().trim().min(1).optional(),
+    duplicate: z.boolean().optional(),
+  })
+  .strict();
+
+const LegacyCongressPushReceiptEnvelopeSchema = z
+  .object({
+    ok: z.boolean().optional(),
+    applied: nonNegativeInt.optional(),
+    type: z.string().trim().min(1).optional(),
+    reason: z.string().trim().min(1).optional(),
+    duplicate: z.boolean().optional(),
+    results: z.array(CongressPushApplyLikeSchema).optional(),
+  })
+  .strict();
+
 function eventConsumed(result: CongressPushApplyLike): boolean {
   return result.ok === true;
 }
@@ -115,8 +136,12 @@ export function parseCongressPushReceipt(payload: unknown): ParseCongressPushRec
     return { ok: false, reason: 'push response body was empty or unparseable' };
   }
 
-  const legacy = payload as CongressPushApplyLike & { results?: CongressPushApplyLike[] };
-  if (Array.isArray(legacy.results)) {
+  const legacyEnvelope = LegacyCongressPushReceiptEnvelopeSchema.safeParse(payload);
+  if (!legacyEnvelope.success) {
+    return { ok: false, reason: PUSH_RECEIPT_UNRECOGNIZED_SHAPE_REASON };
+  }
+  const legacy = legacyEnvelope.data;
+  if (legacy.results) {
     return { ok: true, receipt: buildBatchReceipt(legacy.results) };
   }
 
@@ -124,7 +149,16 @@ export function parseCongressPushReceipt(payload: unknown): ParseCongressPushRec
     return { ok: false, reason: PUSH_RECEIPT_UNRECOGNIZED_SHAPE_REASON };
   }
 
-  return { ok: true, receipt: buildReceipt(legacy) };
+  return {
+    ok: true,
+    receipt: buildReceipt({
+      ok: legacy.ok,
+      applied: legacy.applied,
+      type: legacy.type,
+      reason: legacy.reason,
+      duplicate: legacy.duplicate,
+    }),
+  };
 }
 
 export function congressPushReceiptFailureReason(parsed: ParseCongressPushReceiptResult): string | null {
@@ -166,6 +200,7 @@ export async function readWebhookPushReceipt(response: Response): Promise<ParseC
 export async function webhookSubscriberConsumptionError(response: Response): Promise<string | null> {
   const contentType = response.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().includes('application/json')) {
+    await response.body?.cancel().catch(() => {});
     return null;
   }
   const text = await response.text();

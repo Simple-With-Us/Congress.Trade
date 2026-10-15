@@ -464,6 +464,10 @@ async function deliverToSubscription(
       throw new Error(timedOut ? `timeout after ${WEBHOOK_FETCH_TIMEOUT_MS}ms` : ((err as Error).message ?? 'fetch failed'));
     } finally {
       clearTimeout(timeout);
+      // Drain bodies we will not read (non-JSON 2xx). JSON paths consume via text() below.
+      if (res && !res.ok) {
+        await res.body?.cancel().catch(() => {});
+      }
     }
     if (!res?.ok) throw new Error(`HTTP ${res?.status ?? 'unknown'}`);
     const consumptionError = await webhookSubscriberConsumptionError(res);
