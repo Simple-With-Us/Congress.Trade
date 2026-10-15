@@ -3824,6 +3824,10 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           <option value="E">Exchanges</option>
           <option value="B,S">Buys + Sells</option>
         </select>
+        <label class="minamt-label" style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="newIncludeBackfill" disabled />
+          Include historical backfill (older than 7 days)
+        </label>
         <label class="minamt-label" style="display:flex;align-items:center;gap:6px">Minimum Trade Size:
           <select id="newMinAmt" disabled title="Minimum amount bracket floor">
             <option value="">Any</option>
@@ -7620,6 +7624,7 @@ function updateDeliveryGate() {
   var chambersSel = el('newChambers');
   var sidesSel = el('newSides');
   var minAmtIn = el('newMinAmt');
+  var backfillIn = el('newIncludeBackfill');
   var body = el('subsBody');
   var signedIn = !!(ME.user && ME.user.id);
   var premium = isPremium();
@@ -7631,6 +7636,7 @@ function updateDeliveryGate() {
   if (chambersSel) chambersSel.disabled = !canCreate;
   if (sidesSel) sidesSel.disabled = !canCreate;
   if (minAmtIn) minAmtIn.disabled = !canCreate;
+  if (backfillIn) backfillIn.disabled = !canCreate;
   if (createBtn) createBtn.disabled = !canCreate;
   updateNewTargetVisibility();
   if (!gate) return;
@@ -7718,6 +7724,8 @@ function renderSubs(subs) {
     if (f.chambers && f.chambers.length) parts.push(f.chambers.join('+')); else parts.push('all chambers');
     if (f.sides && f.sides.length) parts.push(f.sides.map(function (x) { return typeName[x] || x; }).join('/'));
     if (f.minAmount) parts.push('≥ ' + fmt(f.minAmount));
+    if (f.includeBackfill) parts.push('incl. backfill');
+    else parts.push('fresh only');
     if (f.tickers && f.tickers.length) parts.push(f.tickers.join(','));
     if (f.members && f.members.length) parts.push(memberFilterText(s));
     if (parts.length === 1 && parts[0] === 'all chambers') parts.push('all events');
@@ -7755,6 +7763,7 @@ function clearDeliveryForm() {
   if (el('newChambers')) el('newChambers').value = '';
   if (el('newSides')) el('newSides').value = '';
   if (el('newMinAmt')) el('newMinAmt').value = '';
+  if (el('newIncludeBackfill')) el('newIncludeBackfill').checked = false;
   if (el('subsCreateBtn')) el('subsCreateBtn').textContent = 'Add New Delivery';
   if (el('subsMsg')) el('subsMsg').textContent = '';
   updateNewTargetVisibility();
@@ -7801,6 +7810,7 @@ function beginEditSubscription(id) {
     }
     minAmtSel.value = hasMinAmtExact ? minAmtStr : '';
   }
+  if (el('newIncludeBackfill')) el('newIncludeBackfill').checked = !!f.includeBackfill;
   if (el('subsCreateBtn')) el('subsCreateBtn').textContent = 'Save changes';
   var cancel = el('subsEditCancel');
   if (cancel) cancel.hidden = false;
@@ -7825,6 +7835,7 @@ function saveSubscriptionEdits() {
   var minAmtRaw = el('newMinAmt') ? el('newMinAmt').value : '';
   var minAmt = minAmtRaw === '' || minAmtRaw == null ? NaN : Number(minAmtRaw);
   if (Number.isFinite(minAmt) && minAmt > 0) filters.minAmount = minAmt;
+  if (el('newIncludeBackfill') && el('newIncludeBackfill').checked) filters.includeBackfill = true;
   el('subsMsg').textContent = 'Saving…';
   var idem = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('sub-edit-' + Date.now());
   var payload = { id: EDITING_SUB_ID, filters: filters };
@@ -7956,6 +7967,7 @@ function createSubscription() {
   var minAmtRaw = el('newMinAmt') ? el('newMinAmt').value : '';
   var minAmt = minAmtRaw === '' || minAmtRaw == null ? NaN : Number(minAmtRaw);
   if (Number.isFinite(minAmt) && minAmt > 0) filters.minAmount = minAmt;
+  if (el('newIncludeBackfill') && el('newIncludeBackfill').checked) filters.includeBackfill = true;
   el('subsMsg').textContent = 'Creating…';
   var idem = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('sub-' + Date.now());
   fetch('/api/client/v1/commands', {
