@@ -13,7 +13,10 @@ import {
   isHousePaperScanDocId,
   looksLikePlausibleTradeTable,
   looksLikeHeaderContaminatedAsset,
+  dropPtrFormSampleParsedRows,
+  looksLikeHousePrintedExampleAsset,
   looksLikePtrFormSampleAsset,
+  looksLikePtrFormSampleDate,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
   looksLikeNothingToReport,
@@ -158,7 +161,14 @@ describe('evaluateExtractQuality — hard-stops', () => {
     expect(looksLikePtrFormSampleAsset('Example Mega Corp Common Stock')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Exemplje Mega Corp.')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Exempl Mfg Corp Common Stock')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Exempl Mfg Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Ex Mpi Meg Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Mega Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Example Meg Corp.')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Example Mfg. Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Apple Inc.')).toBe(false);
+    expect(looksLikePtrFormSampleAsset('Exxon Mobil Corp.')).toBe(false);
+    expect(looksLikePtrFormSampleAsset('Mega Corp Holdings Inc.')).toBe(false);
     expect(looksLikeHeaderContaminatedAsset('Exemplje Mega Corp Common Stock')).toBe(true);
     expect(looksLikeNothingToReport('Nothing to report for July 2026')).toBe(true);
     expect(looksLikeNothingToReport('Nothlng to report for July 2026')).toBe(true);
@@ -220,6 +230,29 @@ describe('evaluateExtractQuality — hard-stops', () => {
       amountRange: '$1,001 - $15,000',
       txDate: '2020-01-15',
     })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Example Meg Corp.',
+      rawText: 'Example Meg Corp. Common Stock',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2020-05-02',
+    })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Mega Corp.',
+      rawText: 'Mega Corp.',
+      amountRange: '$15,001 - $50,000',
+      txDate: '2026-02-05',
+    })).toBe(true);
+
+    const withSample = [
+      { assetName: 'Exempl Mfg Corp.', rawText: 'Exempl Mfg Corp Common Stock', txDate: '2026-02-05' },
+      { assetName: 'Ex Mpi Meg Corp.', rawText: 'Ex Mpi Meg Corp.', txDate: '2026-07-30' },
+      { assetName: 'Mega Corp.', rawText: 'Mega Corp.', txDate: '2026-02-05' },
+      { assetName: 'Apple Inc.', rawText: 'Apple Inc. common stock', txDate: '2026-08-19' },
+    ];
+    expect(dropPtrFormSampleParsedRows(withSample as never)).toHaveLength(1);
+    expect(dropPtrFormSampleParsedRows(withSample as never)[0].assetName).toBe('Apple Inc.');
+    expect(looksLikePtrFormSampleDate('2020-05-02')).toBe(true);
+    expect(looksLikeHousePrintedExampleAsset('Example Meg Corp.')).toBe(true);
   });
 
   it('hard-stops letterhead-as-asset (Clerk / B81 Cannon)', () => {

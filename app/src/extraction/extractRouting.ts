@@ -15,7 +15,31 @@
 import type { Filing, ParsedTx } from '../shared/types.ts';
 
 const HOUSE_PRINTED_EXAMPLE_ASSET_RE =
-  /\bexempl(?:je|e)?\s+(?:mega|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg)\s*\.?\s*corp\b/i;
+  /\bexempl(?:je|e)?\s+(?:mega|mfg|meg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg|meg)\s*\.?\s*corp\b/i;
+
+/** Lowercase letters only — for anchored House PTR printed-sample matching. */
+function squashHousePtrAssetName(text: string): string {
+  return text.toLowerCase().replace(/[^a-z]/g, '');
+}
+
+/**
+ * Anchored squashed-name match for the House PTR template's printed example row.
+ * OCR on 200ppi scans mangles the same row many ways; the signature is corp
+ * preceded by mega/meg/mfg/manuf, optionally behind an ex(empl|ample) prefix,
+ * optionally followed by commonstock.  Whole-string anchor avoids dropping real
+ * holdings whose names merely contain "Mega Corp" as a substring.
+ */
+function looksLikeSquashedHousePrintedExampleAsset(squashed: string): boolean {
+  if (!squashed) return false;
+  if (/^(?:ex(?:empl|ample)?)?(?:mfg|mega|meg|manuf|manufacturing)corp(?:commonstock)?$/.test(squashed)) {
+    return true;
+  }
+  // e.g. "Ex Mpi Meg Corp." → exmpimegcorp (noise between Ex and Meg)
+  if (/^ex[a-z]{1,10}megcorp(?:commonstock)?$/.test(squashed)) {
+    return true;
+  }
+  return false;
+}
 
 /** Printed House PTR instruction dates (8/14/12) and newer 2020 sample grids. */
 export function looksLikePtrFormSampleDate(txDate: string | null | undefined): boolean {
@@ -29,7 +53,9 @@ export function looksLikePtrFormSampleDate(txDate: string | null | undefined): b
 
 export function looksLikeHousePrintedExampleAsset(text: string | null | undefined): boolean {
   if (!text?.trim()) return false;
-  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(text.trim());
+  const clean = text.trim();
+  if (HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(clean)) return true;
+  return looksLikeSquashedHousePrintedExampleAsset(squashHousePtrAssetName(clean));
 }
 
 /** Drop printed PTR form sample rows in every extraction path before normalize/publish. */
@@ -188,9 +214,14 @@ export function looksLikePtrFormSampleRow(row: {
     }
   }
 
-  // Amount column spells EXAMPLE or raw text has EXAMPLE with sample tickers/assets
-  if (/\bexample\b/i.test(amount) || /\bexample\b/i.test(raw)) {
-    if (/microsoft|ibm|mega\s+corp/i.test(asset) || /microsoft|ibm|mega\s+corp/i.test(raw)) {
+  // Amount column spells EXAMPLE or raw text has EXAMPLE / Exempl* with sample tickers/assets
+  if (/\bexample\b/i.test(amount) || /\bexample\b/i.test(raw) || /\bexempl/i.test(raw)) {
+    if (
+      looksLikeHousePrintedExampleAsset(asset)
+      || looksLikeHousePrintedExampleAsset(raw)
+      || /microsoft|ibm|mega\s+corp/i.test(asset)
+      || /microsoft|ibm|mega\s+corp/i.test(raw)
+    ) {
       return true;
     }
   }
