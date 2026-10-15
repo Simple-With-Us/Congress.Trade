@@ -158,6 +158,9 @@ describe('evaluateExtractQuality — hard-stops', () => {
     expect(looksLikePtrFormSampleAsset('Example Mega Corp Common Stock')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Exemplje Mega Corp.')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Exempl Mfg Corp Common Stock')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Exempl Mfg Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Example Meg Corp.')).toBe(true);
+    expect(looksLikePtrFormSampleAsset('Ex Mpi Meg Corp.')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Example Mfg. Corp.')).toBe(true);
     expect(looksLikeHeaderContaminatedAsset('Exemplje Mega Corp Common Stock')).toBe(true);
     expect(looksLikeNothingToReport('Nothing to report for July 2026')).toBe(true);
@@ -220,6 +223,18 @@ describe('evaluateExtractQuality — hard-stops', () => {
       amountRange: '$1,001 - $15,000',
       txDate: '2020-01-15',
     })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Example Meg Corp.',
+      rawText: 'Example Meg Corp. P',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2020-05-02',
+    })).toBe(true);
+    expect(looksLikePtrFormSampleRow({
+      assetName: 'Vanguard Total Stock Market ETF',
+      rawText: 'VTI purchase',
+      amountRange: '$1,001 - $15,000',
+      txDate: '2020-05-02',
+    })).toBe(false);
   });
 
   it('hard-stops letterhead-as-asset (Clerk / B81 Cannon)', () => {

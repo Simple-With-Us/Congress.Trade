@@ -2468,7 +2468,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   // Every model agrees on every field.
   const unanimousRow = {
-    rowKey: 'AAPL|2024-01-05|B',
+    rowKey: 'AAPL|2024-01-05|B|self',
     presentIn: MODELS,
     missingFrom: [],
     rowConsensus: 'unanimous',
@@ -2484,7 +2484,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   // Every field has a strict majority, but "owner" has one dissenter (2-1).
   const majorityRow = {
-    rowKey: 'MSFT|2024-02-01|S',
+    rowKey: 'MSFT|2024-02-01|S|spouse',
     presentIn: MODELS,
     missingFrom: [],
     rowConsensus: 'majority',
@@ -2501,7 +2501,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
   // "amount" is a 1-1 tie between the two present models -> no majority ->
   // contested (winner value null, every present value listed as a dissenter).
   const contestedRow = {
-    rowKey: 'TSLA|2024-03-10|B',
+    rowKey: 'TSLA|2024-03-10|B|spouse',
     presentIn: ['anthropic:claude-sonnet-5', 'gemini:gemini-3.5-flash'],
     missingFrom: ['openai:gpt-4o'],
     rowConsensus: 'contested',
@@ -2509,7 +2509,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
       ticker: fieldConsensus('TSLA', 2, 2, [], true),
       txType: fieldConsensus('P', 2, 2, [], true),
       transactionDate: fieldConsensus('2024-03-10', 2, 2, [], true),
-      owner: fieldConsensus('self', 2, 2, [], true),
+      owner: fieldConsensus('spouse', 2, 2, [], true),
       assetName: fieldConsensus('Tesla Inc', 2, 2, [], true),
       amount: fieldConsensus(
         null,
@@ -2568,7 +2568,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
   // (minority presence), yet every field's local electorate is that single
   // model, so votes*2 > total is trivially true for each field.
   const minorityRow = {
-    rowKey: 'NVDA|2024-04-01|B',
+    rowKey: 'NVDA|2024-04-01|B|spouse',
     presentIn: ['openai:gpt-4o'],
     missingFrom: ['anthropic:claude-sonnet-5', 'gemini:gemini-3.5-flash'],
     rowConsensus: 'contested',
@@ -2721,12 +2721,12 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     const sandbox = loadConsensusSandbox();
     const lot1 = {
       ...unanimousRow,
-      rowKey: 'AAPL|2024-01-05|B#1', baseRowKey: 'AAPL|2024-01-05|B', occurrence: 1,
+      rowKey: 'AAPL|2024-01-05|B|self#1', baseRowKey: 'AAPL|2024-01-05|B|self', occurrence: 1,
       fields: { ...unanimousRow.fields, amount: fieldConsensus({ amountMin: 1001, amountMax: 15000 }, 3, 3, [], true) },
     };
     const lot2 = {
       ...unanimousRow,
-      rowKey: 'AAPL|2024-01-05|B#2', baseRowKey: 'AAPL|2024-01-05|B', occurrence: 2,
+      rowKey: 'AAPL|2024-01-05|B|self#2', baseRowKey: 'AAPL|2024-01-05|B|self', occurrence: 2,
       fields: { ...unanimousRow.fields, amount: fieldConsensus({ amountMin: 15001, amountMax: 50000 }, 3, 3, [], true) },
     };
     sandbox.setConsensus('doc-6', {

@@ -71,8 +71,8 @@ describe('buildConsensusRows', () => {
   });
 
   it('picks the 2-of-3 majority value per field and records the dissenter', () => {
-    // owner differs on m3; the row key (ticker|date|type) is identical, so the
-    // three readings reconcile onto one row and owner is voted 2-1.
+    // owner differs on m3; row keys split by owner, so self is 2-of-3 on its
+    // lot and spouse is a separate minority lot.
     const runs = [
       run('m1', [tx({ owner: 'self' })]),
       run('m2', [tx({ owner: 'self' })]),
@@ -80,17 +80,14 @@ describe('buildConsensusRows', () => {
     ];
     const { rows, summary } = buildConsensusRows(runs);
 
-    expect(rows).toHaveLength(1);
-    const row = rows[0];
-    expect(row.rowConsensus).toBe('majority');
-    const owner = row.fields.owner;
-    expect(owner.value).toBe('self');
-    expect(owner.votes).toBe(2);
-    expect(owner.total).toBe(3);
-    expect(owner.unanimous).toBe(false);
-    expect(owner.dissenters).toEqual([{ model: 'm3', value: 'spouse' }]);
-    // Fields everyone agreed on stay unanimous.
-    expect(row.fields.assetName.unanimous).toBe(true);
+    expect(rows).toHaveLength(2);
+    const selfRow = rows.find((r) => r.fields.owner.value === 'self')!;
+    const spouseRow = rows.find((r) => r.fields.owner.value === 'spouse')!;
+    expect(selfRow.rowConsensus).toBe('majority');
+    expect(selfRow.fields.owner.unanimous).toBe(true);
+    expect(selfRow.presentIn).toEqual(['m1', 'm2']);
+    expect(spouseRow.rowConsensus).toBe('contested');
+    expect(spouseRow.presentIn).toEqual(['m3']);
     expect(summary.rowsMajority).toBe(1);
   });
 
@@ -158,7 +155,7 @@ describe('buildConsensusRows', () => {
     expect(rows[0].presentIn).toHaveLength(3);
   });
 
-  it('marks a field contested on a 2-2 tie', () => {
+  it('splits a 2-2 owner split into two lots (no single-row owner tie)', () => {
     const runs = [
       run('m1', [tx({ owner: 'self' })]),
       run('m2', [tx({ owner: 'self' })]),
@@ -166,11 +163,14 @@ describe('buildConsensusRows', () => {
       run('m4', [tx({ owner: 'spouse' })]),
     ];
     const { rows } = buildConsensusRows(runs);
-    const owner = rows[0].fields.owner;
-    expect(owner.value).toBeNull();
-    expect(owner.votes).toBe(2);
-    expect(owner.total).toBe(4);
-    expect(rows[0].rowConsensus).toBe('contested');
+    expect(rows).toHaveLength(2);
+    const selfRow = rows.find((r) => r.fields.owner.value === 'self')!;
+    const spouseRow = rows.find((r) => r.fields.owner.value === 'spouse')!;
+    expect(selfRow.fields.owner.votes).toBe(2);
+    expect(spouseRow.fields.owner.votes).toBe(2);
+    // Each lot is only present in half the electorate, so neither is authoritative.
+    expect(selfRow.rowConsensus).toBe('contested');
+    expect(spouseRow.rowConsensus).toBe('contested');
   });
 
   it('votes the amount bracket as one unit (never mixing mins and maxes)', () => {
@@ -255,12 +255,12 @@ describe('buildConsensusRows', () => {
     const { rows } = buildConsensusRows(runs);
     expect(rows).toHaveLength(2);
     expect(rows.map((row) => row.rowKey)).toEqual([
-      'AAPL|2026-01-15|B#1',
-      'AAPL|2026-01-15|B#2',
+      'AAPL|2026-01-15|B|self#1',
+      'AAPL|2026-01-15|B|self#2',
     ]);
     expect(rows.map((row) => row.baseRowKey)).toEqual([
-      'AAPL|2026-01-15|B',
-      'AAPL|2026-01-15|B',
+      'AAPL|2026-01-15|B|self',
+      'AAPL|2026-01-15|B|self',
     ]);
     expect(rows.map((row) => row.occurrence)).toEqual([1, 2]);
     expect(rows[0].fields.amount.value).toEqual({ amountMin: 1001, amountMax: 15000 });

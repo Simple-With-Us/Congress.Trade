@@ -969,7 +969,7 @@ describe('runCandidateOnDoc extraction cache', () => {
       cached: true,
       latencyMs: 0,
       rowCount: 1,
-      rowKeys: ['AAPL|2026-07-14|B'],
+      rowKeys: ['AAPL|2026-07-14|B|self'],
       avgConfidence: 0.9,
       rows: [cachedRow],
     });

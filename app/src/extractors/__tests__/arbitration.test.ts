@@ -69,13 +69,26 @@ function extractor(name: string, out: ExtractorResult): Extractor {
 }
 
 describe('arbitrationRowKey', () => {
-  it('keys on ticker + date + type, uppercased', () => {
-    expect(arbitrationRowKey(tx({ ticker: 'aapl' }))).toBe('AAPL|2026-01-02|B');
+  it('keys on ticker + date + type + owner, uppercased', () => {
+    expect(arbitrationRowKey(tx({ ticker: 'aapl' }))).toBe('AAPL|2026-01-02|B|self');
   });
   it('falls back to asset name when no ticker', () => {
     expect(arbitrationRowKey(tx({ ticker: null, assetName: 'US T-Bill' }))).toBe(
-      'US T-BILL|2026-01-02|B',
+      'US T-BILL|2026-01-02|B|self',
     );
+  });
+  it('splits same ticker/date/type when owner differs (H-2026-9116376)', () => {
+    const base = {
+      ticker: 'COO',
+      assetName: 'The Cooper Companies, Inc.',
+      txDate: '2026-09-11',
+      txType: 'B' as const,
+    };
+    const dependent = arbitrationRowKey(tx({ ...base, owner: 'dependent' }));
+    const spouse = arbitrationRowKey(tx({ ...base, owner: 'spouse' }));
+    expect(dependent).toBe('COO|2026-09-11|B|dependent');
+    expect(spouse).toBe('COO|2026-09-11|B|spouse');
+    expect(dependent).not.toBe(spouse);
   });
 });
 

@@ -15,7 +15,21 @@
 import type { Filing, ParsedTx } from '../shared/types.ts';
 
 const HOUSE_PRINTED_EXAMPLE_ASSET_RE =
-  /\bexempl(?:je|e)?\s+(?:mega|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg)\s*\.?\s*corp\b/i;
+  /\bexempl(?:je|e)?\s+(?:mega|mfg|meg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg|meg)\s*\.?\s*corp\b|\bex\s+mpi\s+meg\s+corp\b/i;
+
+/** Squash OCR punctuation/spacing so near-miss House PTR sample names still match. */
+function squashedHouseExampleName(text: string): string {
+  return text.trim().toLowerCase().replace(/[^a-z]/g, '');
+}
+
+function looksLikeSquashedHousePrintedExampleAsset(text: string | null | undefined): boolean {
+  if (!text?.trim()) return false;
+  const s = squashedHouseExampleName(text);
+  if (!s) return false;
+  if (/^exmpimegcorp$/.test(s)) return true;
+  if (/^examplemegcorp$/.test(s)) return true;
+  return /^(?:exempl|example)(?:je|e)?(?:mfg|mega|meg)corp$/.test(s);
+}
 
 /** Printed House PTR instruction dates (8/14/12) and newer 2020 sample grids. */
 export function looksLikePtrFormSampleDate(txDate: string | null | undefined): boolean {
@@ -29,7 +43,8 @@ export function looksLikePtrFormSampleDate(txDate: string | null | undefined): b
 
 export function looksLikeHousePrintedExampleAsset(text: string | null | undefined): boolean {
   if (!text?.trim()) return false;
-  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(text.trim());
+  const clean = text.trim();
+  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(clean) || looksLikeSquashedHousePrintedExampleAsset(clean);
 }
 
 /** Drop printed PTR form sample rows in every extraction path before normalize/publish. */
@@ -184,6 +199,16 @@ export function looksLikePtrFormSampleRow(row: {
 
   if (looksLikeHousePrintedExampleAsset(asset) || looksLikeHousePrintedExampleAsset(raw)) {
     if (!date || looksLikePtrFormSampleDate(date) || /8\/14\/12|08\/14\/2012/.test(raw)) {
+      return true;
+    }
+  }
+
+  // Printed sample grid dates (e.g. 2020-05-02) with OCR-mangled example names.
+  if (date && looksLikePtrFormSampleDate(date)) {
+    if (
+      looksLikeSquashedHousePrintedExampleAsset(asset)
+      || looksLikeSquashedHousePrintedExampleAsset(raw)
+    ) {
       return true;
     }
   }
