@@ -45,9 +45,27 @@ export function looksLikePtrFormSampleDate(txDate: string | null | undefined): b
   return /\b(?:8\/14\/12|08\/14\/2012|0?2\/0?5\/20|0?5\/0?2\/20)\b/.test(txDate);
 }
 
+/**
+ * Owner codes, a trailing asset class, and a short parenthetical ticker sit
+ * outside the printed name.  They are removed before the anchored signature
+ * so "SP Example Meg Corp [ST]" still matches, while "Mega Corp Holdings Inc"
+ * still does not.
+ */
+function stripHouseSampleAffixes(text: string): string {
+  let value = text.trim();
+  for (let i = 0; i < 2; i++) {
+    const next = value.replace(/^(?:(?:\((?:sp|dc|jt|self)\))|(?:(?:sp|dc|jt|self)\b))[\s:.-]*/i, '');
+    if (next === value) break;
+    value = next.trim();
+  }
+  value = value.replace(/\s*[\[(]\s*(?:st|cs|stock|common\s*stock)\s*[\])]\s*$/i, '').trim();
+  value = value.replace(/\s*\([A-Za-z]{1,5}\)\s*$/g, '').trim();
+  return value;
+}
+
 export function looksLikeHousePrintedExampleAsset(text: string | null | undefined): boolean {
   if (!text?.trim()) return false;
-  return HOUSE_SAMPLE_SQUASHED_RE.test(squashPtrAssetLetters(text));
+  return HOUSE_SAMPLE_SQUASHED_RE.test(squashPtrAssetLetters(stripHouseSampleAffixes(text)));
 }
 
 /** Asset text from a raw OCR line that also carries a tx code and a date. */

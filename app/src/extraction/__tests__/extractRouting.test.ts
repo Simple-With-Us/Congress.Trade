@@ -244,6 +244,11 @@ describe('evaluateExtractQuality — hard-stops', () => {
       expect(looksLikePtrFormSampleAsset(name), name).toBe(true);
     }
 
+    expect(looksLikeHousePrintedExampleAsset('SP Example Meg Corp.')).toBe(true);
+    expect(looksLikeHousePrintedExampleAsset('JT Mega Corp. [ST]')).toBe(true);
+    expect(looksLikeHousePrintedExampleAsset('Example Meg Corp (EX)')).toBe(true);
+    expect(looksLikeHousePrintedExampleAsset('(DC) Exempl Mfg Corp.')).toBe(true);
+
     const kept = [
       'AAPL',
       'MSFT',
@@ -255,6 +260,9 @@ describe('evaluateExtractQuality — hard-stops', () => {
       'Mega Corp Holdings Inc',
       '3M Company',
       'AbbVie Inc.',
+      'Mega Corp Holdings Inc [ST]',
+      'Exxon Mobil Corp (XOM)',
+      'Apple Inc (AAPL)',
     ];
     for (const name of kept) {
       expect(looksLikeHousePrintedExampleAsset(name), name).toBe(false);
