@@ -5704,6 +5704,18 @@ describe('web blocking defects (audited)', () => {
     expect(DASHBOARD_HTML).toContain('function navigateTradesFromDrawer');
   });
 
+  it('navigateTradesFromDrawer writes fq in history before activating the Trades tab (CT-1359)', () => {
+    const start = DASHBOARD_HTML.indexOf('function navigateTradesFromDrawer');
+    expect(start).toBeGreaterThan(-1);
+    const end = DASHBOARD_HTML.indexOf('\nfunction ', start + 1);
+    const body = DASHBOARD_HTML.slice(start, end > start ? end : undefined);
+    const pushIdx = body.indexOf('history.pushState');
+    const showIdx = body.indexOf("showView('trades')");
+    expect(pushIdx).toBeGreaterThan(-1);
+    expect(showIdx).toBeGreaterThan(pushIdx);
+    expect(body).toContain("u.searchParams.set('fq', q)");
+  });
+
   it('labels what every trade count counts (this filter vs all time)', () => {
     expect(DASHBOARD_HTML).not.toContain('<span class="match-window">');
     expect(DASHBOARD_HTML).toContain("if (typeof stampWindowChips === 'function') stampWindowChips();");
