@@ -871,9 +871,9 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_HTML).toContain("function polFull(n)");
   });
 
-  it('defaults theme to light and offers Light/Dark/System controls', () => {
-    expect(DASHBOARD_HTML).toContain("var pref = 'light'");
-    expect(DASHBOARD_HTML).toContain("return 'light'");
+  it('defaults theme to system (follows prefers-color-scheme) and offers Light/Dark/System controls', () => {
+    expect(DASHBOARD_HTML).toContain("var pref = 'system'");
+    expect(DASHBOARD_HTML).toContain("return 'system'");
     expect(DASHBOARD_HTML).toContain('function setThemePref(pref)');
     expect(DASHBOARD_HTML).toContain('function themeRowHtml(pref, hideLabel)');
     expect(DASHBOARD_HTML).toContain('function themeSegHtml(pref)');
