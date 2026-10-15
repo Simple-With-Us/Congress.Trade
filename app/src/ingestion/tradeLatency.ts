@@ -3821,14 +3821,19 @@ async function runProviderProbe(
     }
   };
 
-  const { latencyProvidersWithRejectedCredentials } = await import('./scoutHandoff.ts');
-  if ((await latencyProvidersWithRejectedCredentials(env)).has(provider.id)) {
-    await recordHandoff('disabled', { error: 'credentials rejected (401/403 latch)' });
+  const { shouldThrottleAuthRejectedLatencyProbe } = await import('./scoutHandoff.ts');
+  const membershipId = provider.id === 'unusual_whales' || provider.id === 'quiver'
+    ? provider.id
+    : null;
+  if (
+    membershipId
+    && await shouldThrottleAuthRejectedLatencyProbe(env, membershipId, now, { force: opts.force })
+  ) {
     return {
       ...base,
       enabled: false,
       operationalStatus: 'stopped',
-      reason: `${provider.label} credentials rejected (401/403); probe paused until key/plan is renewed`,
+      reason: `${provider.label} credentials rejected (401/403); next recovery probe after backoff (admin force bypasses)`,
       fetchedRows: 0,
       pending: 0,
       matched: 0,

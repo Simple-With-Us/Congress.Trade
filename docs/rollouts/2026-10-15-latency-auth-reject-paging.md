@@ -26,8 +26,10 @@ the monitor could not fire again if FMP later went quiet.
   `LATENCY_SCOUT_CONSECUTIVE_ERRORS` (3) successive auth errors (`HTTP_401` /
   `HTTP_403`, including scout log shapes), membership providers are treated as
   credential-latched.
-- `tradeLatency.ts` — latched providers are skipped for HTTP probes; FMP
-  family unchanged (misconfigured FMP key must still page).
+- `tradeLatency.ts` — latched providers throttle routine HTTP (6h recovery
+  spacing by default, `DISCLOSURE_LATENCY_AUTH_RECOVERY_HOURS` override);
+  `force` admin probes and recovery ticks still hit the API so renewed keys
+  clear the latch.  FMP family unchanged (misconfigured FMP key must still page).
 - `pipelineHealth.ts` — latched providers are excluded from paging with detail
   `credentials rejected (not paged): …` (distinct from config retire).
 
