@@ -1,27 +1,43 @@
 /**
  * src/extraction/executiveDisposition.ts
  *
- * Close the two executive zero-row outcomes that used to look identical.
+ * Close an empty executive 278e, and park an unreadable 278-T for a human.
  *
  * A 278e whose deterministic read finds no 278-T table and whose other
  * successful reads also found nothing is verified_empty
- * (auto_resolved_empty).  A read the ogeText gate refuses, or a 278-T we
- * could not read, is an unreadable/OCR terminal (resolution_kind rejected,
- * reason ocr_unusable).  Neither outcome may be rewritten to
- * agreement_cascade_unresolved.
+ * (auto_resolved_empty).  That close is terminal: Part 7 was actually empty
+ * (explicit None, or a 278e with no 278-T table and no contradictory read).
  *
- * The known-doc sweep is the one-shot corrective for the two rows already
- * parked that way.  It is bounded to that allowlist and idempotent.
+ * A read the ogeText gate refuses is a different fact.  The text layer is
+ * garbage, so the pipeline cannot know whether Part 7 has rows.  The Sep 8
+ * Trump 278-T carried reason oge_text_unreadable and later published 1113
+ * rows after a manual read.  Auto-resolving the next one as rejected (actor
+ * null, same second the review opens) drops the filing with no human and no
+ * alarm.  Park it unresolved, record oge_text_unreadable for the filing-skip
+ * alarm, and leave verified_empty alone.
+ *
+ * The known-doc sweep still corrects the two historical parked rows.  Empty
+ * stays verified_empty.  Unreadable is parked open.  A bounded sweep reopens
+ * rows this path already auto-rejected.
  */
 
 import type { Env } from '../shared/types.ts';
-import { batch, get, type SqlParam } from '../shared/db.ts';
+import { all, batch, get, type SqlParam } from '../shared/db.ts';
 import { AGREEMENT_CLAIM_LEASE_MS } from './agreement.ts';
-import { recordIngestionDecision } from '../shared/ingestionDecisions.ts';
+import {
+  OGE_TEXT_UNREADABLE_DECISION_ACTION,
+  recordIngestionDecision,
+} from '../shared/ingestionDecisions.ts';
+import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 
 export const EXECUTIVE_EMPTY_RESOLUTION_REASON = 'executive_278e_no_transactions';
 export const OGE_TEXT_UNREADABLE_RESOLUTION = 'oge_text_unreadable';
-/** Health-terminal token.  `ocr_unusable` is already a review-queue terminal class. */
+/**
+ * Health-terminal token so agreement and the deterministic drain do not
+ * spend another read on a refused text layer.  The review row stays
+ * unresolved: `ocr_unusable` hides it from the selector, not from humans.
+ * The filing-skip alarm is the loud signal.
+ */
 export const OGE_TEXT_UNREADABLE_REASON = 'ocr_unusable,oge_text_unreadable';
 
 export const BONDI_EMPTY_DOC_ID = 'E-undated-pam-bondi-2026-278term';
@@ -39,20 +55,32 @@ const UNREADABLE_FILING_ERROR =
 export const AGREEMENT_VISION_COUNT_AGREE_RATIO = 0.8;
 
 /**
+ * maxAttempts() never exceeds 5.  A parked unreadable row at this floor is
+ * not selector-due, so the agreement autopublish loop does not spend vision
+ * on a text layer the deterministic gate already refused.
+ */
+export const UNREADABLE_PARK_ATTEMPT_FLOOR = 5;
+
+/** Per hourly pass.  Older pipeline auto-rejects reopen first. */
+export const AUTO_REJECTED_UNREADABLE_REOPEN_LIMIT = 25;
+
+/**
  * True when extraction_runs already holds a successful nonempty read of
- * `doc_id`.  Bind `doc_id` three times: a non-agreement (or null-kind) ok
- * run with rows still blocks; kind=agreement vision blocks only when at
- * least two ok>0 runs exist in one batch and every pair in that same batch
- * has min/max row_count >= AGREEMENT_VISION_COUNT_AGREE_RATIO.  Disputed
- * agreement vision must not block an unreadable or empty close, and a
- * disputed batch vetoes only itself, never another corroborated batch.  A pair is two distinct models
+ * the doc named by `docIdExpr` (`?` or a correlated column).  A
+ * non-agreement (or null-kind) ok run with rows still blocks; kind=agreement
+ * vision blocks only when at least two ok>0 runs exist in one batch and
+ * every pair in that same batch has min/max row_count >=
+ * AGREEMENT_VISION_COUNT_AGREE_RATIO.  Disputed agreement vision must not
+ * block an unreadable park or empty close, and a disputed batch vetoes only
+ * itself, never another corroborated batch.  A pair is two distinct models
  * (provider or model differs) in the same agreement batch: retries of one
  * model, or runs from different batches, are not independent agreement.
  */
-export const SUCCESSFUL_NONEMPTY_READ_SQL = `(
+function successfulNonemptyReadSql(docIdExpr: string): string {
+  return `(
   EXISTS (
     SELECT 1 FROM extraction_runs
-     WHERE doc_id = ? AND ok = 1 AND COALESCE(row_count, 0) > 0
+     WHERE doc_id = ${docIdExpr} AND ok = 1 AND COALESCE(row_count, 0) > 0
        AND COALESCE(kind, '') <> 'agreement'
   )
   OR EXISTS (
@@ -61,7 +89,7 @@ export const SUCCESSFUL_NONEMPTY_READ_SQL = `(
         ON b.doc_id = a.doc_id AND b.rowid > a.rowid
        AND b.batch_id = a.batch_id
        AND (b.provider <> a.provider OR b.model <> a.model)
-     WHERE a.doc_id = ?
+     WHERE a.doc_id = ${docIdExpr}
        AND a.ok = 1 AND b.ok = 1
        AND COALESCE(a.kind, '') = 'agreement'
        AND COALESCE(b.kind, '') = 'agreement'
@@ -75,7 +103,7 @@ export const SUCCESSFUL_NONEMPTY_READ_SQL = `(
              ON d.doc_id = c.doc_id AND d.rowid > c.rowid
             AND d.batch_id = c.batch_id
             AND (d.provider <> c.provider OR d.model <> c.model)
-          WHERE c.doc_id = ?
+          WHERE c.doc_id = ${docIdExpr}
             AND c.batch_id = a.batch_id
             AND c.ok = 1 AND d.ok = 1
             AND COALESCE(c.kind, '') = 'agreement'
@@ -87,6 +115,10 @@ export const SUCCESSFUL_NONEMPTY_READ_SQL = `(
        )
   )
 )`;
+}
+
+/** Bind `doc_id` three times when this fragment is used with `?`. */
+export const SUCCESSFUL_NONEMPTY_READ_SQL = successfulNonemptyReadSql('?');
 
 function successfulNonemptyReadParams(docId: string): SqlParam[] {
   return [docId, docId, docId];
@@ -186,7 +218,7 @@ async function writeClose(
     resolutionReason: string;
   },
   filing: { ingestStatus: string; error: string | null },
-  decision: { action: 'auto_resolved_empty' | 'rejected'; reason: string },
+  decision: { action: 'auto_resolved_empty'; reason: string },
 ): Promise<boolean> {
   const nowIso = opts.nowIso ?? new Date().toISOString();
   const where = reviewWhere(opts);
@@ -329,27 +361,166 @@ export async function closeVerifiedEmptyExecutive(
   );
 }
 
-/** Garbled / refused deterministic read.  Not an empty filing. */
+const UNREADABLE_DECISION_PAYLOAD = JSON.stringify({
+  resolvedBy: 'executive-disposition',
+  parked: true,
+});
+
+/**
+ * Leave the review open with the unreadable reason, move the filing to
+ * needs_review, and write one filing-skip decision.  `reviewSql` is the
+ * review_queue write (park an open row, or reopen a pipeline auto-reject).
+ * A second pass matches nothing.
+ */
+async function commitUnreadablePark(
+  env: Env,
+  docId: string,
+  opts: ExecutiveCloseOptions,
+  reviewSql: { sql: string; params: SqlParam[] },
+  notifyKind: 'insert' | 'reopen',
+): Promise<boolean> {
+  const nowIso = opts.nowIso ?? new Date().toISOString();
+  const decisionId = `decision:${OGE_TEXT_UNREADABLE_DECISION_ACTION}:${docId}`;
+  const insertStatements: Array<[string, SqlParam[]]> = opts.insertIfAbsent
+    ? [[
+        `INSERT OR IGNORE INTO review_queue (
+            doc_id, reason, payload, created_at, resolved, agreement_attempts
+          ) SELECT ?, ?, '{}', ?, 0, ?
+             WHERE NOT EXISTS (SELECT 1 FROM review_queue WHERE doc_id = ?)
+               AND EXISTS (
+                 SELECT 1 FROM filings WHERE doc_id = ? AND ingest_status <> 'persisted'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL
+               )
+               AND NOT ${SUCCESSFUL_NONEMPTY_READ_SQL}`,
+        [
+          docId,
+          OGE_TEXT_UNREADABLE_REASON,
+          nowIso,
+          UNREADABLE_PARK_ATTEMPT_FLOOR,
+          docId,
+          docId,
+          docId,
+          ...successfulNonemptyReadParams(docId),
+        ],
+      ]]
+    : [];
+  const results = await batch(env.DB, [
+    ...insertStatements,
+    [reviewSql.sql, reviewSql.params],
+    [
+      `UPDATE filings
+          SET ingest_status = 'needs_review',
+              error = ?
+        WHERE doc_id = ?
+          AND ingest_status <> 'persisted'
+          AND (
+            ingest_status <> 'needs_review'
+            OR COALESCE(error, '') <> ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM transactions
+             WHERE doc_id = ? AND deprecated_at IS NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM review_queue
+             WHERE doc_id = ? AND resolved = 0 AND reason = ?
+          )`,
+      [
+        UNREADABLE_FILING_ERROR,
+        docId,
+        UNREADABLE_FILING_ERROR,
+        docId,
+        docId,
+        OGE_TEXT_UNREADABLE_REASON,
+      ],
+    ],
+    [
+      `INSERT OR IGNORE INTO ingestion_decisions
+         (id, doc_id, action, source, actor, reason, payload, transaction_ids, created_at)
+       SELECT ?, ?, ?, 'pipeline', NULL, ?, ?, '[]', ?
+        WHERE EXISTS (
+          SELECT 1 FROM review_queue
+           WHERE doc_id = ? AND resolved = 0 AND reason = ?
+        )`,
+      [
+        decisionId,
+        docId,
+        OGE_TEXT_UNREADABLE_DECISION_ACTION,
+        OGE_TEXT_UNREADABLE_RESOLUTION,
+        UNREADABLE_DECISION_PAYLOAD,
+        nowIso,
+        docId,
+        OGE_TEXT_UNREADABLE_REASON,
+      ],
+    ],
+  ]);
+  const reviewChanged = results
+    .slice(0, insertStatements.length + 1)
+    .some((result) => (result?.meta?.changes ?? 0) > 0);
+  const changed = results.some((result) => (result?.meta?.changes ?? 0) > 0);
+  if (reviewChanged) {
+    void notifyReviewQueuePublisher(env, {
+      docId,
+      reason: OGE_TEXT_UNREADABLE_REASON,
+      kind: notifyKind,
+      at: nowIso,
+    });
+  }
+  return changed;
+}
+
+function openUnreadableParkSql(
+  docId: string,
+  opts: ExecutiveCloseOptions,
+): { sql: string; params: SqlParam[] } {
+  const where = reviewWhere(opts);
+  return {
+    sql: `UPDATE review_queue
+            SET resolved = 0,
+                reason = ?,
+                agreement_claim_token = NULL,
+                agreement_claimed_at = NULL,
+                agreement_next_attempt_at = NULL,
+                agreement_attempts = MAX(COALESCE(agreement_attempts, 0), ${UNREADABLE_PARK_ATTEMPT_FLOOR}),
+                resolution_kind = NULL,
+                resolution_reason = NULL,
+                resolved_at = NULL,
+                review_revision = review_revision + 1
+          WHERE ${where.sql}
+            AND COALESCE(reason, '') NOT LIKE '%oge_text_unreadable%'
+            AND NOT EXISTS (
+              SELECT 1 FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL
+            )
+            AND NOT ${SUCCESSFUL_NONEMPTY_READ_SQL}
+            AND NOT (COALESCE(json_extract(payload, '$.transactionCount'), 0) > 0)`,
+    params: [
+      OGE_TEXT_UNREADABLE_REASON,
+      docId,
+      ...where.params,
+      docId,
+      ...successfulNonemptyReadParams(docId),
+    ],
+  };
+}
+
+/** Garbled / refused deterministic read.  Not an empty filing, and not a terminal reject. */
 export async function closeUnreadableExecutive(
   env: Env,
   docId: string,
   opts: ExecutiveCloseOptions = {},
 ): Promise<boolean> {
   if (await hasLiveTransactions(env, docId)) return false;
-  // A later refused read must not reject a filing an earlier successful read
-  // already found rows for - same guard the verified_empty close applies.
+  // A later refused read must not park over a filing an earlier successful
+  // read already found rows for — same guard the verified_empty close applies.
   if (await otherSuccessfulReadHasRows(env, docId)) return false;
-  return writeClose(
+  return commitUnreadablePark(
     env,
     docId,
     opts,
-    {
-      reason: OGE_TEXT_UNREADABLE_REASON,
-      resolutionKind: 'rejected',
-      resolutionReason: OGE_TEXT_UNREADABLE_RESOLUTION,
-    },
-    { ingestStatus: 'error', error: UNREADABLE_FILING_ERROR },
-    { action: 'rejected', reason: OGE_TEXT_UNREADABLE_RESOLUTION },
+    openUnreadableParkSql(docId, opts),
+    'insert',
   );
 }
 
@@ -359,10 +530,11 @@ export interface ExecutiveTerminalSweepResult {
 }
 
 /**
- * Correct the two parked rows.  Bondi is an empty 278e.  Trump is an
- * unreadable 278-T.  A second run matches nothing.  A row an administrator
- * reopened (agreement_suppressed_at set) is left for human review; the sweep
- * must not undo a reopen on its next hourly run.
+ * Correct the two parked rows.  Bondi is an empty 278e and still closes
+ * verified_empty.  Trump is an unreadable 278-T and is parked open, not
+ * rejected.  A second run matches nothing.  A row an administrator reopened
+ * (agreement_suppressed_at set) is left for human review; the sweep must not
+ * undo a reopen on its next hourly run.
  */
 export async function sweepKnownParkedExecutiveTerminals(
   env: Env,
@@ -414,7 +586,128 @@ export async function sweepKnownParkedExecutiveTerminals(
   return { verifiedEmpty, unreadable };
 }
 
-/** Docs the sweep is allowed to touch.  Tests and callers share this list. */
+/** Docs the allowlisted sweep is allowed to touch.  Tests and callers share this list. */
 export function knownParkedExecutiveDocIds(): string[] {
   return [BONDI_EMPTY_DOC_ID, TRUMP_UNREADABLE_DOC_ID];
+}
+
+export interface AutoRejectedUnreadableSweepResult {
+  reopened: number;
+}
+
+/**
+ * Reopen executive 278-Ts that executive-disposition already terminal-rejected
+ * for oge_text_unreadable with no human actor.  A later human decision, a
+ * live transaction, or a corroborated nonempty read stays closed.  Bounded
+ * and idempotent: a reopened row is unresolved, so the next pass skips it.
+ */
+export async function sweepAutoRejectedUnreadable(
+  env: Env,
+  now = new Date(),
+): Promise<AutoRejectedUnreadableSweepResult> {
+  const nowIso = now.toISOString();
+  let rows: Array<{ doc_id: string }> = [];
+  try {
+    rows = await all<{ doc_id: string }>(
+      env.DB,
+      `SELECT rq.doc_id
+         FROM review_queue rq
+         JOIN filings f ON f.doc_id = rq.doc_id
+        WHERE rq.resolved = 1
+          AND rq.resolution_kind = 'rejected'
+          AND rq.resolution_reason = ?
+          AND COALESCE(rq.reason, '') LIKE '%oge_text_unreadable%'
+          AND rq.agreement_suppressed_at IS NULL
+          AND f.ingest_status <> 'persisted'
+          AND NOT EXISTS (
+            SELECT 1 FROM transactions t
+             WHERE t.doc_id = rq.doc_id AND t.deprecated_at IS NULL
+          )
+          AND NOT ${successfulNonemptyReadSql('rq.doc_id')}
+          AND NOT (COALESCE(json_extract(rq.payload, '$.transactionCount'), 0) > 0)
+          AND EXISTS (
+            SELECT 1 FROM ingestion_decisions d
+             WHERE d.doc_id = rq.doc_id
+               AND d.action = 'rejected'
+               AND d.actor IS NULL
+               AND d.source = 'pipeline'
+               AND json_extract(d.payload, '$.resolvedBy') = 'executive-disposition'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM ingestion_decisions h
+             WHERE h.doc_id = rq.doc_id
+               AND h.actor IS NOT NULL
+               AND TRIM(h.actor) <> ''
+          )
+        ORDER BY rq.resolved_at ASC
+        LIMIT ?`,
+      [OGE_TEXT_UNREADABLE_RESOLUTION, AUTO_REJECTED_UNREADABLE_REOPEN_LIMIT],
+    );
+  } catch (err) {
+    console.warn('sweepAutoRejectedUnreadable select failed:', (err as Error).message);
+    return { reopened: 0 };
+  }
+
+  let reopened = 0;
+  for (const row of rows) {
+    const parked = await commitUnreadablePark(
+      env,
+      row.doc_id,
+      { nowIso, respectSuppression: true },
+      {
+        sql: `UPDATE review_queue
+                SET resolved = 0,
+                    reason = ?,
+                    agreement_claim_token = NULL,
+                    agreement_claimed_at = NULL,
+                    agreement_next_attempt_at = NULL,
+                    agreement_attempts = MAX(COALESCE(agreement_attempts, 0), ${UNREADABLE_PARK_ATTEMPT_FLOOR}),
+                    resolution_kind = NULL,
+                    resolution_reason = NULL,
+                    resolved_at = NULL,
+                    review_revision = review_revision + 1
+              WHERE doc_id = ?
+                AND resolved = 1
+                AND resolution_kind = 'rejected'
+                AND resolution_reason = ?
+                AND COALESCE(reason, '') LIKE '%oge_text_unreadable%'
+                AND agreement_suppressed_at IS NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL
+                )
+                AND NOT ${SUCCESSFUL_NONEMPTY_READ_SQL}
+                AND NOT (COALESCE(json_extract(payload, '$.transactionCount'), 0) > 0)
+                AND EXISTS (
+                  SELECT 1 FROM ingestion_decisions d
+                   WHERE d.doc_id = review_queue.doc_id
+                     AND d.action = 'rejected'
+                     AND d.actor IS NULL
+                     AND d.source = 'pipeline'
+                     AND json_extract(d.payload, '$.resolvedBy') = 'executive-disposition'
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM ingestion_decisions h
+                   WHERE h.doc_id = review_queue.doc_id
+                     AND h.actor IS NOT NULL
+                     AND TRIM(h.actor) <> ''
+                )`,
+        params: [
+          OGE_TEXT_UNREADABLE_REASON,
+          row.doc_id,
+          OGE_TEXT_UNREADABLE_RESOLUTION,
+          row.doc_id,
+          ...successfulNonemptyReadParams(row.doc_id),
+        ],
+      },
+      'reopen',
+    ).catch((err) => {
+      console.warn('sweepAutoRejectedUnreadable park failed:', row.doc_id, (err as Error).message);
+      return false;
+    });
+    if (parked) reopened += 1;
+  }
+  if (reopened) {
+    console.log(`executiveDisposition sweep: reopened unreadable=${reopened}`);
+  }
+  return { reopened };
 }
