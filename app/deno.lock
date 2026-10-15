@@ -13,7 +13,7 @@
     "npm:@sentry/deno@11": "11.4.0",
     "npm:@sentry/deno@^11.4.0": "11.4.0",
     "npm:@types/node@26.6.5": "26.6.5",
-    "npm:@typescript-eslint/eslint-plugin@^8.71.0": "8.71.1_@typescript-eslint+parser@8.71.1_eslint@10.12.0_typescript@5.9.3",
+    "npm:@typescript-eslint/eslint-plugin@^8.71.0": "8.71.1_@typescript-eslint+parser@8.71.1__eslint@10.12.0__typescript@5.9.3_eslint@10.12.0_typescript@5.9.3",
     "npm:@typescript-eslint/parser@^8.71.0": "8.71.1_eslint@10.12.0_typescript@5.9.3",
     "npm:@vitest/coverage-v8@^5.0.3": "5.0.3_vitest@5.0.3_@types+node@26.6.5",
     "npm:cheerio@^1.2.0": "1.2.0",
@@ -30,7 +30,7 @@
     "npm:unpdf@^1.6.2": "1.8.1",
     "npm:unpdf@^1.8.1": "1.8.1",
     "npm:vite@^8.3.2": "8.3.3_@types+node@26.6.5",
-    "npm:vitest@^5.0.3": "5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3",
+    "npm:vitest@^5.0.3": "5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3__@types+node@26.6.5",
     "npm:zod@^4.4.3": "4.6.5",
     "npm:zod@^4.6.5": "4.6.5"
   },
@@ -982,7 +982,7 @@
         "@types/node"
       ]
     },
-    "@typescript-eslint/eslint-plugin@8.71.1_@typescript-eslint+parser@8.71.1_eslint@10.12.0_typescript@5.9.3": {
+    "@typescript-eslint/eslint-plugin@8.71.1_@typescript-eslint+parser@8.71.1__eslint@10.12.0__typescript@5.9.3_eslint@10.12.0_typescript@5.9.3": {
       "integrity": "sha512-nNlBf6HuotqMgZvSkWD5hNdemiBIxQ2NmrlgfcUIeZRs+BbakjscCQRq/Hb74EFVnFiSWWdL12JruqwBy3ERDw==",
       "dependencies": [
         "@eslint-community/regexpp",
@@ -1103,7 +1103,7 @@
         "@vitest/istanbul-lib-coverage"
       ]
     },
-    "@vitest/mocker@5.0.3_vite@8.3.3_@types+node@26.6.5": {
+    "@vitest/mocker@5.0.3_vite@8.3.3__@types+node@26.6.5_@types+node@26.6.5": {
       "integrity": "sha512-T8sWAIbkSyAjkwTcaEc3Iu0o9A27X1/kdXrizhZkGuSKScRQtRzclfAMpOTcGdXCsqxeWlpGy3XjqaW8CpLORg==",
       "dependencies": [
         "@jridgewell/trace-mapping",
@@ -2117,7 +2117,7 @@
       ],
       "bin": true
     },
-    "vitest@5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3": {
+    "vitest@5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3__@types+node@26.6.5": {
       "integrity": "sha512-xMw97S3rjdtj5dkVat7jCsqWBpvchs3RlpQctUqwJD0KkERk40vz2fJ77lDwW/Vzh/pk18eItYAzkodhSes3jQ==",
       "dependencies": [
         "@opentelemetry/api",
