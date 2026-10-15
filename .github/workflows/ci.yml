@@ -199,7 +199,7 @@ jobs:
       - name: Enforce owned-runner workflow policy
         working-directory: .
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
