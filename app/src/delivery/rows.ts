@@ -210,6 +210,7 @@ export function mapTransaction(row: TransactionRow): Transaction {
   return sanitizeCompetitorPublication({
     ...transaction,
     filedDate: row.filed_date ?? null,
+    firstSeenAt: tradeLearnedAt(row.first_seen_at, row.created_at, row.tx_date),
   });
 }
 

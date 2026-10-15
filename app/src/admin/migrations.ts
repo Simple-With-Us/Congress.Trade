@@ -1439,7 +1439,9 @@ export const FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS = [
 
 /**
  * 0103_price_unavailable_reason.sql — optional operator/provider reason text
- * when a ticker is negative-cached as unpriceable.
+ * when a ticker is negative-cached as unpriceable.  Also applied via
+ * `applyGuardedSecuritiesRefColumnMigrations` (PRAGMA table_info guard) so
+ * deploy-before-migrate windows cannot 500 price writes.
  */
 export const PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS = [
   'ALTER TABLE securities_ref ADD COLUMN price_unavailable_reason TEXT',

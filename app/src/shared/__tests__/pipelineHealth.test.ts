@@ -44,7 +44,7 @@ describe('evaluatePipelineSignals', () => {
     },
     // 2026-09-21: defaults for the new signals; matches a healthy pipeline.
     filingSkips24h: 0,
-    filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0 },
+    filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0, oge_text_unreadable: 0 },
     fmpLatency: {
       observationCount24h: 120,
       lastObservationAt: new Date(nowMs - 600 * 1000).toISOString(),
@@ -58,6 +58,22 @@ describe('evaluatePipelineSignals', () => {
     const res = evaluatePipelineSignals(cleanSignals, nowMs);
     expect(res.status).toBe('ok');
     expect(res.checks.every((c) => c.status === 'ok')).toBe(true);
+  });
+
+  it('pages filing_skips when an unreadable executive 278-T was parked', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 0,
+        doc_quarantined: 0,
+        oge_text_unreadable: 1,
+      },
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(String(check?.detail)).toContain('oge_text_unreadable=1');
   });
 
   it('returns unknown status when signals are null', () => {
@@ -625,6 +641,32 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.value).toBe(1);
   });
 
+  it('auth-rejected membership providers do not page; detail names credentials rejected', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      latencyProviders: [
+        { provider: 'fmp', lastObservedAt: new Date(nowMs - 1 * 3_600_000).toISOString(), expected: true },
+        {
+          provider: 'quiver',
+          lastObservedAt: new Date(nowMs - 181 * 3_600_000).toISOString(),
+          expected: false,
+          authRejected: true,
+        },
+        {
+          provider: 'unusual_whales',
+          lastObservedAt: new Date(nowMs - 144 * 3_600_000).toISOString(),
+          expected: false,
+          authRejected: true,
+        },
+      ],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'latency_probes')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('credentials rejected (not paged)');
+    expect(check.detail).toContain('quiver');
+    expect(check.detail).not.toContain('retired in config');
+  });
+
   it('an expected provider going quiet still pages even alongside retired ones', () => {
     const res = evaluatePipelineSignals({
       ...base,
@@ -767,7 +809,7 @@ describe('price_freshness check', () => {
     // 2026-09-21: defaults for the new signals. Tests that don't override
     // these should still produce a stable check count.
     filingSkips24h: 0,
-    filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0 },
+    filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0, oge_text_unreadable: 0 },
     fmpLatency: {
       observationCount24h: 100,
       lastObservationAt: new Date(nowMs - 600 * 1000).toISOString(),
@@ -1042,7 +1084,7 @@ describe('pollMaxAgeHours session-cap widening', () => {
       latencyProviders: [{ provider: 'quiver', lastObservedAt: new Date(weekdayMs - 3_600_000).toISOString() }],
       senateRelay: null,
       filingSkips24h: 0,
-      filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0 },
+      filingSkipsByAction24h: { extract_empty_failure: 0, auto_resolved_empty: 0, doc_quarantined: 0, oge_text_unreadable: 0 },
       fmpLatency: {
         observationCount24h: 120,
         lastObservationAt: new Date(weekdayMs - 600 * 1000).toISOString(),

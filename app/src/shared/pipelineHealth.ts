@@ -6,6 +6,7 @@
  */
 
 import type { Env } from './types.ts';
+import { OGE_TEXT_UNREADABLE_DECISION_ACTION } from './ingestionDecisions.ts';
 import { all, get } from './db.ts';
 import { getLastPollAt } from './config.ts';
 import {
@@ -17,8 +18,10 @@ import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
 import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
+import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
-import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
+import { latencyProvidersWithRejectedCredentials } from '../ingestion/scoutHandoff.ts';
 import { classifyFailedOutboxRow } from '../ingestion/transientDlq.ts';
 import {
   cronOverrunIsLoud,
@@ -43,6 +46,14 @@ import {
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
+/** Actions that mean "we produced no usable rows".  Unreadable is included:
+ *  a refused 278-T is not evidence the filing is empty. */
+export type FilingSkipAction =
+  | 'extract_empty_failure'
+  | 'auto_resolved_empty'
+  | 'doc_quarantined'
+  | typeof OGE_TEXT_UNREADABLE_DECISION_ACTION;
+
 export interface PipelineCheck {
   id: string;
   status: PipelineStatus;
@@ -60,7 +71,7 @@ export interface PipelineCheck {
     | { worstBehind: number; legs: Record<string, { date: string | null; behind: number | null }> }
     | {
         total: number;
-        byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number>>;
+        byAction: Partial<Record<FilingSkipAction, number>>;
         threshold: number;
       }
     | {
@@ -128,7 +139,7 @@ export interface PipelineSignals {
   /**
    * 2026-09-21: count of filings in the last 24h whose extract produced zero
    * usable transactions (`extract_empty_failure`, `auto_resolved_empty`,
-   * `doc_quarantined`). These outcomes are almost-always an app error
+   * `doc_quarantined`, `oge_text_unreadable`). These outcomes are almost-always an app error
    * (corrupt parse, OCR failure, model dead-letter) — not a real "this
    * filing was blank". A non-zero count is the loud red flag the admin
    * surface and Pushover liveness alarm look for. Tunable via env
@@ -136,7 +147,7 @@ export interface PipelineSignals {
    */
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
-  filingSkipsByAction24h: Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number> | null;
+  filingSkipsByAction24h: Record<FilingSkipAction, number> | null;
   /**
    * 2026-09-21: FMP-family latency summary for both admin and user surfaces.
    * The user-facing dashboard renders `lastObservationAgeSec` + `observationCount24h`
@@ -208,12 +219,19 @@ export interface PipelineSignals {
    *
    * `expected` marks providers the current config intends to probe
    * (DISCLOSURE_LATENCY_PROVIDERS ∩ watch/FMP switches ∩ membership keys —
-   * see expectedLatencyProviderIds). expected=false rows are retired: shown
-   * in details, never paged. Absent = expected, so signal builders that
+   * see configExpectedLatencyProviderIds), minus auth-rejected membership
+   * keys. expected=false rows are retired or auth-latched: shown in details,
+   * never paged. `authRejected` distinguishes lapsed keys (401/403) from
+   * intentional config retire. Absent = expected, so signal builders that
    * predate the flag keep the old always-page behavior. lastObservedAt null
    * = expected but never observed (just-enabled provider) — counts silent.
    */
-  latencyProviders: Array<{ provider: string; lastObservedAt: string | null; expected?: boolean }> | null;
+  latencyProviders: Array<{
+    provider: string;
+    lastObservedAt: string | null;
+    expected?: boolean;
+    authRejected?: boolean;
+  }> | null;
   /**
    * Named-tunnel Senate relay liveness (issue #1604).  configured reflects
    * SENATE_RELAY_URL; probe is the last GET /health written by the watcher
@@ -238,6 +256,16 @@ export interface PipelineSignals {
       status: number | null;
       checkedAt: string;
       host?: string;
+    } | null;
+  } | null;
+  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  senateEfd?: {
+    probe: {
+      ok: boolean;
+      status: number | null;
+      checkedAt: string;
+      egress?: string | null;
+      error?: string | null;
     } | null;
   } | null;
   /**
@@ -666,7 +694,7 @@ export function evaluatePipelineSignals(
     }
   }
 
-  // 4. Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined).
+  // 4. Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   // Owner 2026-09-21 ask: "big red flag ... anytime a filing is skipped or
   // considered empty or blank or unreadable since that is almost always
   // false and app error." These three outcomes are the "almost always an
@@ -685,7 +713,7 @@ export function evaluatePipelineSignals(
       return Number.isFinite(n) && n >= 0 ? Math.min(n, 100) : 0;
     })();
     if (s.filingSkips24h > threshold) {
-      const byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number>> =
+      const byAction: Partial<Record<FilingSkipAction, number>> =
         s.filingSkipsByAction24h ?? {};
       const breakdown = Object.entries(byAction)
         .filter(([, v]) => typeof v === 'number' && v > 0)
@@ -932,17 +960,22 @@ export function evaluatePipelineSignals(
     checks.push({ id: 'latency_probes', status: 'unknown', detail: 'Latency-probe liveness uncollected', value: null });
   } else {
     const expected = s.latencyProviders.filter((p) => p.expected !== false);
-    const retired = s.latencyProviders.filter((p) => p.expected === false);
+    const authRejected = s.latencyProviders.filter((p) => p.authRejected);
+    const retired = s.latencyProviders.filter((p) => p.expected === false && !p.authRejected);
+    const authRejectedNote = authRejected.length
+      ? `; credentials rejected (not paged): ${authRejected.map((p) => p.provider).join(', ')}`
+      : '';
     const retiredNote = retired.length
       ? `; retired in config (not paged): ${retired.map((p) => p.provider).join(', ')}`
       : '';
+    const contextNote = `${authRejectedNote}${retiredNote}`;
     if (expected.length === 0) {
       checks.push({
         id: 'latency_probes',
         status: 'stalled',
         detail: s.latencyProviders.length === 0
           ? 'Latency monitoring NOT RUNNING — zero provider observations recorded, ever'
-          : `Latency monitoring NOT RUNNING — no provider is enabled in config${retiredNote}`,
+          : `Latency monitoring NOT RUNNING — no provider is enabled in config${contextNote}`,
         value: null,
       });
     } else {
@@ -965,21 +998,21 @@ export function evaluatePipelineSignals(
           id: 'latency_probes',
           status: 'stalled',
           detail: `Latency monitoring SILENT: newest expected-provider observation is `
-            + `${newestAgeH === Infinity ? 'missing' : Math.round(newestAgeH) + 'h'} old (threshold ${t.latencyObservationMaxAgeHours}h)${retiredNote}`,
+            + `${newestAgeH === Infinity ? 'missing' : Math.round(newestAgeH) + 'h'} old (threshold ${t.latencyObservationMaxAgeHours}h)${contextNote}`,
           value: newestAgeH === Infinity ? null : Math.round(newestAgeH),
         });
       } else if (silent.length > 0) {
         checks.push({
           id: 'latency_probes',
           status: 'degraded',
-          detail: `Latency provider(s) gone quiet: ${silent.join(', ')} (silence threshold ${t.latencyProviderSilenceHours}h)${retiredNote}`,
+          detail: `Latency provider(s) gone quiet: ${silent.join(', ')} (silence threshold ${t.latencyProviderSilenceHours}h)${contextNote}`,
           value: silent.length,
         });
       } else {
         checks.push({
           id: 'latency_probes',
           status: 'ok',
-          detail: `Latency probes live: newest observation ${newestAgeH < 1 ? Math.round(newestAgeH * 60) + 'm' : Math.round(newestAgeH) + 'h'} ago across ${expected.length} provider(s)${retiredNote}`,
+          detail: `Latency probes live: newest observation ${newestAgeH < 1 ? Math.round(newestAgeH * 60) + 'm' : Math.round(newestAgeH) + 'h'} ago across ${expected.length} provider(s)${contextNote}`,
           value: expected.length,
         });
       }
@@ -1078,6 +1111,47 @@ export function evaluatePipelineSignals(
         id: 'senate_relay',
         status: 'ok',
         detail: `Senate relay live at ${host}: probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        value: Math.round(ageMin * 10) / 10,
+      });
+    }
+  }
+
+  if (s.senateEfd === undefined) {
+    /* optional — fixtures predating the direct eFD probe omit this signal */
+  } else if (s.senateEfd == null) {
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
+  } else if (!s.senateEfd.probe) {
+    checks.push({
+      id: 'senate_efd',
+      status: 'unknown',
+      detail: 'Senate eFD direct landing not yet probed',
+      value: null,
+    });
+  } else {
+    const probe = s.senateEfd.probe;
+    const checkedMs = Date.parse(probe.checkedAt);
+    const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
+    if (!probe.ok) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'stalled',
+        detail: `Senate eFD direct landing unreachable`
+          + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+          + `${probe.error ? ` — ${probe.error}` : ''}`,
+        value: probe.status,
+      });
+    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        value: Math.round(ageMin),
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'ok',
+        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
         value: Math.round(ageMin * 10) / 10,
       });
     }
@@ -1219,7 +1293,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   let strandedFilings: number | null = null;
   let priceEodLatestDate: string | null = null;
   let spxEodLatestDate: string | null = null;
-  // 2026-09-21: filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined).
+  // Filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
@@ -1240,24 +1314,32 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // parse, OCR failure, vision model dead-letter). Real blank filings are
   // vanishingly rare — the docs are PDFs from official sources.
   try {
-    const res = await get<{ extract_empty_failure: number | null; auto_resolved_empty: number | null; doc_quarantined: number | null }>(
+    const res = await get<{
+      extract_empty_failure: number | null;
+      auto_resolved_empty: number | null;
+      doc_quarantined: number | null;
+      oge_text_unreadable: number | null;
+    }>(
       env.DB,
       `SELECT
          SUM(CASE WHEN action = 'extract_empty_failure' THEN 1 ELSE 0 END) AS extract_empty_failure,
          SUM(CASE WHEN action = 'auto_resolved_empty'   THEN 1 ELSE 0 END) AS auto_resolved_empty,
-         SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined
+         SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined,
+         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable
        FROM ingestion_decisions
        WHERE created_at >= ?`,
-      [iso24hAgo],
+      [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
     );
     const ee = Number(res?.extract_empty_failure ?? 0);
     const ar = Number(res?.auto_resolved_empty ?? 0);
     const dq = Number(res?.doc_quarantined ?? 0);
-    filingSkips24h = ee + ar + dq;
+    const unread = Number(res?.oge_text_unreadable ?? 0);
+    filingSkips24h = ee + ar + dq + unread;
     filingSkipsByAction24h = {
       extract_empty_failure: ee,
       auto_resolved_empty: ar,
       doc_quarantined: dq,
+      oge_text_unreadable: unread,
     };
   } catch {}
 
@@ -1580,21 +1662,33 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     );
     // Config-expected set; null when the resolver itself fails, which leaves
     // every observed row expected (fails open to the old always-page shape).
-    let expectedIds: Set<string> | null = null;
+    let configExpectedIds: Set<string> | null = null;
+    let authRejectedIds = new Set<string>();
     try {
-      expectedIds = await expectedLatencyProviderIds(env);
+      configExpectedIds = await configExpectedLatencyProviderIds(env);
+    } catch {}
+    try {
+      authRejectedIds = await latencyProvidersWithRejectedCredentials(env);
     } catch {}
     const collected: NonNullable<PipelineSignals['latencyProviders']> = rows
       .filter((r) => r.provider && r.last_observed)
       .map((r) => ({
         provider: r.provider,
         lastObservedAt: r.last_observed,
-        expected: expectedIds === null ? true : expectedIds.has(r.provider),
+        expected: configExpectedIds === null
+          ? true
+          : configExpectedIds.has(r.provider) && !authRejectedIds.has(r.provider),
+        authRejected: authRejectedIds.has(r.provider),
       }));
-    if (expectedIds) {
-      for (const id of expectedIds) {
+    if (configExpectedIds) {
+      for (const id of configExpectedIds) {
         if (!collected.some((p) => p.provider === id)) {
-          collected.push({ provider: id, lastObservedAt: null, expected: true });
+          collected.push({
+            provider: id,
+            lastObservedAt: null,
+            expected: !authRejectedIds.has(id),
+            authRejected: authRejectedIds.has(id),
+          });
         }
       }
     }
@@ -1637,6 +1731,13 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   }
 
+  let senateEfd: PipelineSignals['senateEfd'] = { probe: null };
+  try {
+    senateEfd = { probe: await readSenateEfdProbe(env) };
+  } catch {
+    senateEfd = null;
+  }
+
   const signals: PipelineSignals = {
     outboxPending,
     outboxOldestAt,
@@ -1665,6 +1766,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     senateRelay,
     residentialProxyConfigured,
     residentialProxy,
+    senateEfd,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,

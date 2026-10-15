@@ -9,12 +9,15 @@ import { buildRestRouter, xmlEscape } from '../rest.ts';
 import type { Env } from '../../shared/types.ts';
 import type { FeedTransactionRow } from '../rows.ts';
 
+const FRESH_STAMP = new Date().toISOString();
+const FRESH_DAY = FRESH_STAMP.slice(0, 10);
+
 function feedRow(over: Partial<FeedTransactionRow> = {}): FeedTransactionRow {
   return {
     id: 'tx_1',
     doc_id: 'H-2026-1',
     filer_id: 'P000197',
-    tx_date: '2026-07-01',
+    tx_date: FRESH_DAY,
     owner: 'self',
     asset_name: 'Acme & Sons <Corp>',
     ticker: 'ACME',
@@ -27,14 +30,14 @@ function feedRow(over: Partial<FeedTransactionRow> = {}): FeedTransactionRow {
     raw_text: '',
     confidence: 0.9,
     source: 'primary',
-    created_at: '2026-07-02T12:00:00Z',
+    created_at: FRESH_STAMP,
     cursor_seq: 9,
     est_value: null,
     filer_full_name: 'Nancy Pelosi',
     filer_state: 'CA',
     filer_photo_url: null,
-    filing_filed_date: '2026-07-02',
-    filing_first_seen_at: '2026-07-02T12:00:00Z',
+    filing_filed_date: FRESH_DAY,
+    filing_first_seen_at: FRESH_STAMP,
     ...over,
   };
 }
@@ -88,6 +91,33 @@ describe('GET /feed.xml', () => {
     expect(body).not.toContain('ACME & Sons <Corp>');
     // Newest-first snapshot over the shared builder.
     expect(sql()).toContain('ORDER BY COALESCE(t.first_seen_at, t.filed_date, t.tx_date, t.cursor_seq) DESC, t.cursor_seq DESC');
+  });
+
+  it('omits backfill rows by default but honors includeBackfill=1', async () => {
+    const stale = feedRow({
+      id: 'tx_old',
+      tx_date: '2020-01-01',
+      filing_first_seen_at: '2020-01-01T00:00:00.000Z',
+      filing_filed_date: '2020-01-01',
+      created_at: '2020-01-02T12:00:00Z',
+    });
+    const freshStamp = new Date().toISOString();
+    const fresh = feedRow({
+      id: 'tx_new',
+      tx_date: freshStamp.slice(0, 10),
+      created_at: freshStamp,
+      filing_first_seen_at: freshStamp,
+      filing_filed_date: freshStamp.slice(0, 10),
+    });
+    const app = buildRestRouter();
+    const resDefault = await app.request('http://localhost/feed.xml', {}, makeEnv([stale, fresh]).env);
+    const bodyDefault = await resDefault.text();
+    expect(bodyDefault).toContain('tx_new');
+    expect(bodyDefault).not.toContain('tx_old');
+    const resAll = await app.request('http://localhost/feed.xml?includeBackfill=1', {}, makeEnv([stale, fresh]).env);
+    const bodyAll = await resAll.text();
+    expect(bodyAll).toContain('tx_new');
+    expect(bodyAll).toContain('tx_old');
   });
 
   it('passes the shared feed filters through to the query builder', async () => {
