@@ -5,8 +5,7 @@ import {
   executeAdminSchemaMigrations,
   isIdempotentMigrationError,
 } from '../schemaMigrationRunner.ts';
-import { BASE_SCHEMA_STATEMENTS } from '../migrations.ts';
-import { PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS } from '../migrations.ts';
+import { BASE_SCHEMA_STATEMENTS, PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS } from '../migrations.ts';
 import { markTickerPriceUnavailable } from '../../prices/service.ts';
 import type { Env } from '../../shared/types.ts';
 import {
@@ -60,15 +59,13 @@ describe('schemaMigrationRunner', () => {
 
     afterEach(() => close());
 
-    it('skips when securities_ref does not exist yet', async () => {
-      const emptyDb = new (await import('node:sqlite')).DatabaseSync(':memory:');
+    it('skips add when the target table does not exist yet', async () => {
+      const sqlite = (await import('node:sqlite')) as { DatabaseSync: new (path: string) => SqliteDatabase };
+      const emptyDb = new sqlite.DatabaseSync(':memory:');
       const emptyD1 = d1Database(emptyDb);
-      try {
-        const result = await ensureSqliteColumn(emptyD1, 'securities_ref', 'price_unavailable_reason', 'TEXT');
-        expect(result).toBe('skipped');
-      } finally {
-        emptyDb.close();
-      }
+      const status = await ensureSqliteColumn(emptyD1, 'securities_ref', 'price_unavailable_reason', 'TEXT');
+      expect(status).toBe('skipped');
+      emptyDb.close();
     });
 
     it('adds price_unavailable_reason when missing', async () => {
@@ -118,15 +115,32 @@ describe('schemaMigrationRunner', () => {
       expect(result.skipped.length + result.applied.length).toBeGreaterThan(0);
     });
 
-    it('does not fail on an empty database before CREATE TABLE statements run', async () => {
-      const emptyDb = new (await import('node:sqlite')).DatabaseSync(':memory:');
+    it('skips guarded securities_ref preflight on an empty database then applies CREATE/ALTER', async () => {
+      const sqlite = (await import('node:sqlite')) as { DatabaseSync: new (path: string) => SqliteDatabase };
+      const emptyDb = new sqlite.DatabaseSync(':memory:');
       const emptyD1 = d1Database(emptyDb);
-      try {
-        const result = await executeAdminSchemaMigrations(emptyD1, [...BASE_SCHEMA_STATEMENTS]);
-        expect(result.failed).toHaveLength(0);
-      } finally {
-        emptyDb.close();
-      }
+      const bootstrap = [
+        `CREATE TABLE IF NOT EXISTS securities_ref (
+           ticker TEXT PRIMARY KEY,
+           price_unavailable INTEGER NOT NULL DEFAULT 0,
+           price_checked_at TEXT
+         )`,
+        ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+      ];
+      const result = await executeAdminSchemaMigrations(emptyD1, bootstrap);
+      expect(result.failed).toHaveLength(0);
+      const cols = emptyDb.prepare('PRAGMA table_info(securities_ref)').all() as Array<{ name: string }>;
+      expect(cols.some((c) => c.name === 'price_unavailable_reason')).toBe(true);
+      emptyDb.close();
+    });
+
+    it('does not fail on an empty database when bootstrapping base schema', async () => {
+      const sqlite = (await import('node:sqlite')) as { DatabaseSync: new (path: string) => SqliteDatabase };
+      const emptyDb = new sqlite.DatabaseSync(':memory:');
+      const emptyD1 = d1Database(emptyDb);
+      const result = await executeAdminSchemaMigrations(emptyD1, [...BASE_SCHEMA_STATEMENTS]);
+      expect(result.failed).toHaveLength(0);
+      emptyDb.close();
     });
   });
 });

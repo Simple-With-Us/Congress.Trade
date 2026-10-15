@@ -37,7 +37,9 @@ export async function ensureSqliteColumn(
   if (!SAFE_SQL_IDENTIFIER.test(table) || !SAFE_SQL_IDENTIFIER.test(column)) {
     throw new Error(`unsafe SQLite identifier: ${table}.${column}`);
   }
-  if (!(await sqliteTableExists(db, table))) return 'skipped';
+  if (!(await sqliteTableExists(db, table))) {
+    return 'skipped';
+  }
   const rows = await all<{ name: string }>(db, `PRAGMA table_info("${table}")`);
   if (rows.some((row) => row.name === column)) return 'present';
   try {
