@@ -16,5 +16,6 @@ describe('og-card.html share-card template (CT-1336)', () => {
     expect(html).toContain('id="og-share-disclaimer"');
     expect(html).toContain(OG_SHARE_DISCLAIMER_LINE);
     expect(html).toContain('share-disclaimer');
+    expect(html).toMatch(/\.share-disclaimer\{[\s\S]*margin:0/);
   });
 });
