@@ -15,20 +15,24 @@
 import type { Filing, ParsedTx } from '../shared/types.ts';
 
 const HOUSE_PRINTED_EXAMPLE_ASSET_RE =
-  /\bexempl(?:je|e)?\s+(?:mega|mfg|meg)\s*\.?\s*corp\b|\bexample\s+(?:mega|mfg|meg)\s*\.?\s*corp\b|\bex\s+mpi\s+meg\s+corp\b/i;
+  /\bexempl(?:je|e|l)?\s+(?:mega|meg|mfg)\s*\.?\s*corp\b|\bexample\s+(?:mega|meg|mfg)\s*\.?\s*corp\b|\bex\s+mpi\s+(?:mega|meg|mfg)\s*\.?\s*corp\b/i;
 
-/** Squash OCR punctuation/spacing so near-miss House PTR sample names still match. */
-function squashedHouseExampleName(text: string): string {
-  return text.trim().toLowerCase().replace(/[^a-z]/g, '');
+function squashHousePrintedExampleName(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-function looksLikeSquashedHousePrintedExampleAsset(text: string | null | undefined): boolean {
+/**
+ * OCR-tolerant House PTR printed sample row (Example Mega/Meg/Mfg Corp).  Requires
+ * an example stem or the bare printed "Mega Corp" / "Meg Corp" chrome so a random
+ * live holding named Mega Corp is not dropped without a sample date elsewhere.
+ */
+export function looksLikeHousePrintedExampleSquashedAnchor(text: string | null | undefined): boolean {
   if (!text?.trim()) return false;
-  const s = squashedHouseExampleName(text);
-  if (!s) return false;
-  if (/^exmpimegcorp$/.test(s)) return true;
-  if (/^examplemegcorp$/.test(s)) return true;
-  return /^(?:exempl|example)(?:je|e)?(?:mfg|mega|meg)corp$/.test(s);
+  const sq = squashHousePrintedExampleName(text.trim());
+  if (!sq.includes('corp')) return false;
+  if (!/(?:mega|meg|mfg)/.test(sq)) return false;
+  if (/exempl|example|examp|exmpi|xample|exmpl/.test(sq)) return true;
+  return /^(?:mega|meg)corp$/.test(sq) || sq === 'mfgcorp';
 }
 
 /** Printed House PTR instruction dates (8/14/12) and newer 2020 sample grids. */
@@ -43,8 +47,7 @@ export function looksLikePtrFormSampleDate(txDate: string | null | undefined): b
 
 export function looksLikeHousePrintedExampleAsset(text: string | null | undefined): boolean {
   if (!text?.trim()) return false;
-  const clean = text.trim();
-  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(clean) || looksLikeSquashedHousePrintedExampleAsset(clean);
+  return HOUSE_PRINTED_EXAMPLE_ASSET_RE.test(text.trim());
 }
 
 /** Drop printed PTR form sample rows in every extraction path before normalize/publish. */
@@ -203,12 +206,8 @@ export function looksLikePtrFormSampleRow(row: {
     }
   }
 
-  // Printed sample grid dates (e.g. 2020-05-02) with OCR-mangled example names.
   if (date && looksLikePtrFormSampleDate(date)) {
-    if (
-      looksLikeSquashedHousePrintedExampleAsset(asset)
-      || looksLikeSquashedHousePrintedExampleAsset(raw)
-    ) {
+    if (looksLikeHousePrintedExampleSquashedAnchor(asset) || looksLikeHousePrintedExampleSquashedAnchor(raw)) {
       return true;
     }
   }

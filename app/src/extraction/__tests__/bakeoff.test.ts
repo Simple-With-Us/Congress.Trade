@@ -146,6 +146,28 @@ describe('computeConsensusAgreement', () => {
     expect(agree.get('openai:o')).toBeCloseTo(1.0); // (1 + 1) / 2
     expect(agree.get('anthropic:a')).toBeCloseTo(0.75); // (1 + 0.5) / 2
   });
+
+  it('treats a stored 3-part key as the same single lot as an owner-qualified key', () => {
+    const results = [
+      r('gemini', 'g', 'doc1', ['AAPL|2026-07-14|B']),
+      r('openai', 'o', 'doc1', ['AAPL|2026-07-14|B|SELF']),
+    ];
+    const agree = computeConsensusAgreement(results);
+    expect(agree.get('gemini:g')).toBeCloseTo(1);
+    expect(agree.get('openai:o')).toBeCloseTo(1);
+  });
+
+  it('does not merge different owners into one stored key', () => {
+    const results = [
+      r('gemini', 'g', 'doc1', ['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|DEPENDENT']),
+      r('openai', 'o', 'doc1', ['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|DEPENDENT']),
+      r('anthropic', 'a', 'doc1', ['COO|2026-09-11|B']),
+    ];
+    const agree = computeConsensusAgreement(results);
+    expect(agree.get('gemini:g')).toBeCloseTo(1);
+    expect(agree.get('openai:o')).toBeCloseTo(1);
+    expect(agree.get('anthropic:a')).toBeCloseTo(0);
+  });
 });
 
 describe('summarizeModels', () => {
@@ -969,7 +991,7 @@ describe('runCandidateOnDoc extraction cache', () => {
       cached: true,
       latencyMs: 0,
       rowCount: 1,
-      rowKeys: ['AAPL|2026-07-14|B|self'],
+      rowKeys: ['AAPL|2026-07-14|B|SELF'],
       avgConfidence: 0.9,
       rows: [cachedRow],
     });

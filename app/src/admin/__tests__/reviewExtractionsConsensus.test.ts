@@ -84,8 +84,9 @@ function fakeDb(rows: unknown[]) {
 
 describe('GET /review/:docId/extractions — consensus', () => {
   it('3 stored runs across 3 distinct models -> consensus present with majority fields', async () => {
-    // Same row (AAPL / 2026-01-15 / B / self) read by 2 models; a third model
-    // reads a spouse-owned lot as a separate row key.
+    // Same row (AAPL / 2026-01-15 / P) read by 3 models; owner disagrees 2-1
+    // (self, self, spouse) so the row reconciles as 'majority' with owner's
+    // dissenter recorded, matching buildConsensusRows's voting contract.
     const rowsDesc = [
       extractionRunRow({
         provider: 'anthropic',
@@ -153,14 +154,15 @@ describe('GET /review/:docId/extractions — consensus', () => {
       'mistral:mistral-ocr-latest',
       'openai:gpt-4o',
     ]);
-    expect(consensus.rows).toHaveLength(2);
-    const selfRow = consensus.rows.find((r) => r.fields.owner.value === 'self')!;
-    const spouseRow = consensus.rows.find((r) => r.fields.owner.value === 'spouse')!;
-    expect(selfRow.presentIn).toEqual(['mistral:mistral-ocr-latest', 'openai:gpt-4o']);
-    expect(selfRow.rowConsensus).toBe('majority');
-    expect(selfRow.fields.owner).toMatchObject({ value: 'self', votes: 2, total: 2 });
-    expect(spouseRow.presentIn).toEqual(['anthropic:claude-sonnet-5']);
-    expect(spouseRow.rowConsensus).toBe('contested');
+    expect(consensus.rows).toHaveLength(1);
+    const row = consensus.rows[0];
+    expect(row.presentIn).toEqual([
+      'anthropic:claude-sonnet-5',
+      'mistral:mistral-ocr-latest',
+      'openai:gpt-4o',
+    ]);
+    expect(row.rowConsensus).toBe('majority');
+    expect(row.fields.owner).toMatchObject({ value: 'self', votes: 2, total: 3 });
     expect(consensus.summary.rowsMajority).toBe(1);
     expect(body.consensusStatus).toMatchObject({
       batchId: 'coherent-1',
