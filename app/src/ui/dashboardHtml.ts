@@ -12252,9 +12252,10 @@ function navigateTradesFromDrawer(e, filterQuery) {
     u.searchParams.set('fq', q);
     var searchEl = el('qSearch');
     if (searchEl) searchEl.value = q;
+    // Push the target URL before showView: tab click runs replaceState from
+    // location and would briefly write ?view=trades without fq (Kody).
+    window.history.pushState({ view: 'trades' }, '', u.pathname + u.search + u.hash);
     showView('trades');
-    var activeTab = document.querySelector('nav.tabs a.active');
-    window.history.pushState({ view: activeTab ? activeTab.getAttribute('data-view') : 'trades' }, '', u.pathname + u.search + u.hash);
   } catch (err) {}
   tradesPage = 0;
   if (typeof refreshIosFilterSummaries === 'function') refreshIosFilterSummaries();
