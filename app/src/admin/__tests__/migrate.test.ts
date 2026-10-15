@@ -95,6 +95,9 @@ describe('POST /api/admin/migrate error handling', () => {
               return { count: 1 };
             },
             async all() {
+              if (/PRAGMA\s+table_info/i.test(sql)) {
+                return { results: [] };
+              }
               return { results: [] };
             },
           };
@@ -178,9 +181,15 @@ describe('POST /api/admin/migrate error handling', () => {
               return { success: true };
             },
             async first() {
+              if (/SELECT 1 AS ok/i.test(sql)) {
+                throw new Error('D1_ERROR: database is unreachable');
+              }
               throw new Error('D1_ERROR: database is unreachable');
             },
             async all() {
+              if (/PRAGMA\s+table_info/i.test(sql)) {
+                return { results: [] };
+              }
               throw new Error('D1_ERROR: database is unreachable');
             },
           };

@@ -24,6 +24,8 @@ import { captureException, flushSentry, initProductionSentry } from '#sentry';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
+import { buildAdminMigrateStatements } from '../admin/migrateStatements.ts';
+import { executeAdminSchemaMigrations } from '../admin/schemaMigrationRunner.ts';
 import {
   clearCronTickOverrun,
   isDenoCronTickHardDeadline,
@@ -181,6 +183,37 @@ await applySqliteConnectionPragmas(libsqlClient);
 
 const dbShim = new D1DatabaseShim(libsqlClient);
 tursoDbShim = dbShim;
+
+function startupSchemaMigrateDisabled(): boolean {
+  const flag = Deno.env.get('CT_DISABLE_STARTUP_SCHEMA_MIGRATE')
+    ?? Deno.env.get('DENO_DISABLE_STARTUP_SCHEMA_MIGRATE');
+  return flag === '1' || flag === 'true' || flag === 'TRUE';
+}
+
+if (!startupSchemaMigrateDisabled()) {
+  try {
+    console.log('[startup] applying idempotent schema migrations…');
+    const migrateResult = await executeAdminSchemaMigrations(
+      dbShim as unknown as D1Database,
+      buildAdminMigrateStatements(),
+    );
+    if (migrateResult.failed.length > 0) {
+      console.error(
+        `[startup] schema migrate finished with ${migrateResult.failed.length} failed statement(s); ` +
+          'see [schema-migrate] logs',
+      );
+    } else {
+      console.log(
+        `[startup] schema migrate ok (applied=${migrateResult.applied.length}, ` +
+          `skipped=${migrateResult.skipped.length})`,
+      );
+    }
+  } catch (err) {
+    console.error('[startup] schema migrate threw:', (err as Error).message);
+  }
+} else {
+  console.log('[startup] schema migrate disabled (CT_DISABLE_STARTUP_SCHEMA_MIGRATE)');
+}
 const durableQueueDb = dbShim as unknown as D1Database;
 const ingestQueueShim = new DurableQueueAdapter<QueueMessage>(durableQueueDb, 'ingest');
 const deliveryQueueShim = new DurableQueueAdapter<QueueMessage>(durableQueueDb, 'delivery');

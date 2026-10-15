@@ -889,6 +889,15 @@ describe('admin migration bootstrap', () => {
         return {
           bind() { return this; },
           async run() { statements.push(sql); return { success: true, meta: { changes: 1 } }; },
+          async all() {
+            if (/PRAGMA\s+table_info/i.test(sql)) {
+              return { results: [], success: true };
+            }
+            return { results: [], success: true };
+          },
+          async first() {
+            return null;
+          },
         };
       },
     } as unknown as D1Database;

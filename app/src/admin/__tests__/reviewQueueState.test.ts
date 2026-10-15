@@ -80,6 +80,12 @@ describe('review queue durable state migration', () => {
             statements.push(sql);
             return { success: true, meta: { changes: 1 } };
           },
+          async all() {
+            return { results: [], success: true };
+          },
+          async first() {
+            return null;
+          },
         };
       },
     } as unknown as D1Database;
