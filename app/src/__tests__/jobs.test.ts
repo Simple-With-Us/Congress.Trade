@@ -33,10 +33,14 @@ vi.mock('../enrichment/service', () => ({
   runEnrichment: mocks.runEnrichment,
   DEFAULT_DAILY_CAP: 230,
 }));
-vi.mock('../prices/service', () => ({
-  runPriceRefresh: mocks.runPriceRefresh,
-  backfillCurrentPricesFromEod: mocks.backfillCurrentPricesFromEod,
-}));
+vi.mock('../prices/service', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prices/service.ts')>();
+  return {
+    ...actual,
+    runPriceRefresh: mocks.runPriceRefresh,
+    backfillCurrentPricesFromEod: mocks.backfillCurrentPricesFromEod,
+  };
+});
 vi.mock('../shared/fmpStatus', () => ({
   hasFmpTierFailure: mocks.hasFmpTierFailure,
 }));
@@ -77,6 +81,7 @@ vi.mock('../shared/db', async (importOriginal) => ({
 
 import {
   maybeRunDailyJobs,
+  maybeRunDailyMarketDataJobs,
   runHourlyEnrichmentSlice,
   HOURLY_ENRICHMENT_SLICE_MAX,
   HOURLY_ENRICHMENT_SLICE_DEADLINE_MS,
@@ -329,6 +334,29 @@ describe('maybeRunDailyJobs secret resolution', () => {
   });
 });
 
+function priceProbeDb(rows: Array<Record<string, unknown> | null>) {
+  const queue = [...rows];
+  const statement = {
+    bind() {
+      return statement;
+    },
+    async first() {
+      return queue.shift() ?? null;
+    },
+    async all() {
+      return { results: [] };
+    },
+    async run() {
+      return { success: true, meta: { changes: 0 } };
+    },
+  };
+  return {
+    prepare() {
+      return statement;
+    },
+  };
+}
+
 describe('staggered daily lanes', () => {
   // Same env shape as fakeEnv(), but with an injectable KV map so tests can
   // pre-seed per-lane date stamps.
@@ -441,6 +469,58 @@ describe('staggered daily lanes', () => {
     // Same day, no work: cheap no-op via the stamp.
     expect(await maybeRunDailySnapshotJob(env, DAY)).toBe('stamped');
     expect(mocks.runBulkSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not stamp the market-data lane when price refresh throws, so the next tick retries', async () => {
+    const kv = new Map<string, string>();
+    const env = laneEnv(kv);
+    const day = new Date('2026-10-15T00:07:00Z');
+    mocks.runPriceRefresh.mockRejectedValue(
+      new Error(
+        'D1 statement error: SQLITE_ERROR: table securities_ref has no column named price_unavailable_reason',
+      ),
+    );
+
+    expect(await maybeRunDailyMarketDataJobs(env, day)).toBe('error');
+    expect(kv.get('jobs:daily:lastok:market-data')).toBeUndefined();
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+
+    mocks.runPriceRefresh.mockResolvedValue({
+      hasFmpKey: false,
+      fmpCalls: 0,
+      errors: [],
+      sharePrices: [],
+      shareSpx: [],
+      aborted: false,
+    });
+    expect(await maybeRunDailyMarketDataJobs(env, day)).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
+    expect(kv.get('jobs:daily:lastok:market-data')).toBe('2026-10-15');
+  });
+
+  it('retries prices only when the lane is already stamped but the corpus is behind', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = priceProbeDb([{ d: '2026-10-13' }]);
+
+    const status = await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'));
+
+    expect(status).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+    expect(mocks.runEnrichment).not.toHaveBeenCalled();
+    expect(mocks.backfillCurrentPricesFromEod).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays stamped when the corpus is current and the pending tail is small', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = priceProbeDb([{ d: '2026-10-14' }, { n: 2 }]);
+
+    const status = await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'));
+
+    expect(status).toBe('stamped');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+    expect(mocks.runEnrichment).not.toHaveBeenCalled();
   });
 
   it('combined wrapper runs all four lanes exactly once on a fresh day', async () => {

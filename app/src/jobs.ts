@@ -26,6 +26,7 @@ import { readSetting } from './settings/settingsService.ts';
 import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
 import { backfillCurrentPricesFromEod } from './prices/service.ts';
+import { peerPricesNeedCatchUp } from './prices/peerPriceCatchUp.ts';
 // NOTE: runHouseReconciler (./ingestion/houseReconciler) is intentionally not
 // imported here yet -- it is reserved for future scheduled-job wiring. Importing
 // it unused would trip noUnusedLocals (enabled in this PR).
@@ -57,7 +58,7 @@ const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
 const SUBCLAIM_KEY_PREFIX = 'jobs:daily:lastdate:';
 const DAILY_KEY = 'jobs:daily:lastdate';
 
-export type DailyLaneStatus = 'ran' | 'stamped' | 'budget';
+export type DailyLaneStatus = 'ran' | 'stamped' | 'budget' | 'error';
 
 /**
  * Sub-feature stamp: claim-before-run. Used by the R2-usage digest nested
@@ -385,7 +386,28 @@ export async function maybeRunDailyMarketDataJobs(
   // Stamp-on-success: only the LAST successful run suppresses same-day
   // retries. A budget trip today lets the next hourly cron tick try again.
   // See the LANE_KEY_PREFIX comment block at the top of this file.
-  if (await laneHasSucceeded(env, laneKey, day)) return 'stamped';
+  if (await laneHasSucceeded(env, laneKey, day)) {
+    // The 2026-10-14/15 price refresh threw on a missing column and the
+    // catch below still stamped the day, so the corpus sat one session
+    // behind until the next UTC date.  Retry prices only while that is true.
+    if (!(await peerPricesNeedCatchUp(env, now))) return 'stamped';
+    console.warn(
+      'market-data lane stamped but peer prices are still behind; retrying price refresh',
+    );
+    try {
+      await backfillCurrentPricesFromEod(env);
+    } catch (err) {
+      console.warn('current-price backfill failed:', (err as Error).message);
+    }
+    try {
+      const caughtUp = await runPriceRefresh(env, { signal: opts.signal });
+      if (caughtUp.aborted) return 'error';
+    } catch (err) {
+      console.warn('daily price refresh failed:', (err as Error).message);
+      return 'error';
+    }
+    return 'ran';
+  }
 
   // Opt-in D1 spend guard (D1_ROW_BUDGET_ENFORCE): if today's metered D1 rows
   // already exceeded the budget, skip this discretionary daily batch — its big
@@ -450,14 +472,17 @@ export async function maybeRunDailyMarketDataJobs(
   } catch (err) {
     console.warn('current-price backfill failed:', (err as Error).message);
   }
+  let priceRefreshFailed = false;
   try {
-    const r = await runPriceRefresh(env, { maxPerMinute });
+    const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });
     errors.push(...r.errors);
     share.prices = r.sharePrices;
     share.spx = r.shareSpx;
+    if (r.aborted) priceRefreshFailed = true;
   } catch (err) {
     console.warn('daily price refresh failed:', (err as Error).message);
     errors.push('prices: ' + (err as Error).message);
+    priceRefreshFailed = true;
   }
 
   // Return half of the cross-app share: push what WE fetched this run to App B
@@ -500,11 +525,11 @@ export async function maybeRunDailyMarketDataJobs(
   } catch (err) {
     console.warn('freshness check failed:', (err as Error).message);
   }
-  // Stamp-on-success: the day stamp only suppresses future ticks when the
-  // lane actually finished all of enrichment, price refresh, peer share, the
-  // FMP tier-failure alert, and the freshness check. If any of those threw
-  // hard enough to skip this point, the stamp stays unset and the next
-  // hourly cron tick will retry the whole lane.
+  // Stamp-on-success: the day stamp only suppresses future ticks when price
+  // refresh finished.  A caught throw used to stamp anyway and park the
+  // lane until the next UTC day (CT-2409).  Leave the stamp unset so the
+  // next hourly tick retries the whole lane.
+  if (priceRefreshFailed) return 'error';
   await markLaneOk(env, laneKey, day);
   return 'ran';
 }

@@ -281,6 +281,7 @@ import {
   POST_0024_SCHEMA_STATEMENTS,
   CLEAN_PLACEHOLDER_TICKERS_SCHEMA_STATEMENTS,
 } from './migrations.ts';
+import { ensurePeerImportSchemaColumns } from './ensurePeerSchema.ts';
 import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
@@ -10266,6 +10267,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   r.post('/securities/import', async (c) => {
     try {
+      // #2724 / #2638 write columns that Coolify auto-deploy does not add.
+      // Without this, congress-share imports 500 and ST reports the dependency down.
+      await ensurePeerImportSchemaColumns(c.env.DB);
     // This endpoint runs inside a normal Worker request. Keep callers honest.
     // Paid Workers allow larger batches, but the cap remains configurable so
     // the app can be dialed back without code changes.

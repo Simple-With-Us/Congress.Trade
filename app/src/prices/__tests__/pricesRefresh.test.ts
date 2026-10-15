@@ -564,3 +564,34 @@ describe('runPriceRefresh — vendor keys are not a price fallback', () => {
     expect(srRow('IBM')).toBeUndefined();
   });
 });
+
+describe('runPriceRefresh — missing price_unavailable_reason column (CT-2409)', () => {
+  it('adds the column when production never migrated and still stamps price_checked_at', async () => {
+    db.exec('ALTER TABLE securities_ref DROP COLUMN price_unavailable_reason');
+    seedTrade('t1', 'AAPL', '2026-01-05');
+    h.responses.set('AAPL', [{ date: '2026-10-14', close: 230 }]);
+
+    const res = await runPriceRefresh(env, { max: 10 });
+
+    expect(res.aborted).toBe(false);
+    expect(res.errors).toEqual([]);
+    const row = srRow('AAPL');
+    expect(row?.latest_price_date).toBe('2026-10-14');
+    expect(row?.price_checked_at).toBeTruthy();
+    const cols = db.prepare('PRAGMA table_info(securities_ref)').all() as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === 'price_unavailable_reason')).toBe(true);
+  });
+
+  it('stops the ticker loop when the lane deadline aborts the signal', async () => {
+    seedTrade('t1', 'AAPL', '2026-01-05');
+    h.responses.set('AAPL', [{ date: '2026-10-14', close: 230 }]);
+    const controller = new AbortController();
+    controller.abort();
+
+    const res = await runPriceRefresh(env, { max: 10, signal: controller.signal });
+
+    expect(res.aborted).toBe(true);
+    expect(res.tickersPriced).toBe(0);
+    expect(h.eodCalls.some((c) => c.symbol === 'AAPL')).toBe(false);
+  });
+});
