@@ -317,14 +317,18 @@ export async function selectTickersNeedingPrices(
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
         AND ${excludeCompetitorFixtureTransactionSql('t')}
+        AND t.deprecated_at IS NULL
         AND (
           sr.latest_price_date IS NULL
           OR sr.latest_price_date < ?
+          OR NOT EXISTS (SELECT 1 FROM price_eod pe WHERE pe.ticker = t.ticker)
           -- Do NOT re-select solely on current_price IS NULL: that would
           -- perpetually re-queue tickers that already have a fresh
           -- latest_price_date (termination guarantee). Stamp missing
           -- current_price from local price_eod via backfillCurrentPricesFromEod
-          -- before the peer refresh instead.
+          -- before the peer refresh instead.  DO re-select when metadata says
+          -- fresh but there is no local price_eod — otherwise two tickers can
+          -- sit forever with a stamped latest_price_date and never re-price.
         )
         AND NOT (
           COALESCE(sr.price_unavailable, 0) <> 0

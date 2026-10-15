@@ -34,6 +34,7 @@ import {
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { buildPeerPricePendingSql } from '../prices/peerPricePending.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
 export const DEFAULT_PIPELINE_STALL_HOURS = 6;
@@ -506,16 +507,8 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
   return { stalled: true, detail };
 }
 
-const ST_PEER_PRICE_PENDING_SQL = `
-  FROM transactions t
-  JOIN securities_ref sr ON sr.ticker = t.ticker
- WHERE t.ticker IS NOT NULL AND TRIM(t.ticker) != ''
-   AND t.deprecated_at IS NULL
-   AND ${excludeCompetitorFixtureTransactionSql('t')}
-   AND COALESCE(sr.price_unavailable, 0) = 0
-   AND (sr.latest_price_date IS NULL OR sr.price_checked_at IS NULL)`;
-
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
+  const pendingSql = buildPeerPricePendingSql(now);
   if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
     return { stalled: false, detail: 'ST peer prices not configured', skip: true };
   }
@@ -526,8 +519,9 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
     const row = await get<{ n: number; last_at: string | null }>(
       env.DB,
       `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${ST_PEER_PRICE_PENDING_SQL}) AS n,
-         (SELECT MAX(sr.price_checked_at) ${ST_PEER_PRICE_PENDING_SQL}) AS last_at`,
+         (SELECT COUNT(DISTINCT t.ticker) ${pendingSql.fromSql}) AS n,
+         (SELECT MAX(sr.price_checked_at) ${pendingSql.fromSql}) AS last_at`,
+      pendingSql.params,
     );
     pending = Number(row?.n ?? 0);
     lastChecked = row?.last_at ?? null;
@@ -540,9 +534,10 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
   try {
     const names = await all<{ ticker: string }>(
       env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${ST_PEER_PRICE_PENDING_SQL}
+      `SELECT DISTINCT t.ticker AS ticker ${pendingSql.fromSql}
        ORDER BY t.ticker ASC
        LIMIT 10`,
+      pendingSql.params,
     );
     pendingSample = names.map((r) => r.ticker);
   } catch {

@@ -38,8 +38,75 @@ import * as cheerio from 'cheerio';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
+/** Backoff between direct Senate eFD attempts before optional explicit proxy. */
+export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 2_000, 5_000];
+
+function isRetryableSenateTransportError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  if (/HTTP 403/.test(message)) return true;
+  if (/HTTP 502|HTTP 503|HTTP 504/.test(message)) return true;
+  if (/abort/i.test(message)) return false;
+  if (/fetch failed|network|ECONNREFUSED|ETIMEDOUT|timed out/i.test(message)) return true;
+  return false;
+}
+
+function resolveExplicitSenateProxyUrl(opts: FetchSenatePtrFilingsOptions): string | undefined {
+  const trimmed = opts.proxyUrl?.trim();
+  if (trimmed) return trimmed;
+  const env = typeof process !== 'undefined'
+    ? {
+        RESIDENTIAL_PROXY_URL: process.env?.RESIDENTIAL_PROXY_URL,
+        SENATE_PROXY_URL: process.env?.SENATE_PROXY_URL,
+      }
+    : undefined;
+  return resolveResidentialProxyUrl(env, { allowDefault: false });
+}
+
+/**
+ * Run `run` with direct datacenter egress first (with backoff), then an
+ * operator-configured residential proxy when direct keeps failing.  The Mango
+ * default is never used implicitly — a dead mesh proxy must not block Senate
+ * discovery when direct (or backoff) works.
+ */
+export async function withSenateEfdEgress<T>(
+  opts: FetchSenatePtrFilingsOptions,
+  baseFetch: typeof fetch,
+  run: (fetchImpl: typeof fetch, egress: 'direct' | 'proxy') => Promise<T>,
+): Promise<T> {
+  const explicitProxy = resolveExplicitSenateProxyUrl(opts);
+  const strategies: Array<{ egress: 'direct' | 'proxy'; fetch: typeof fetch }> = [
+    { egress: 'direct', fetch: baseFetch },
+  ];
+  if (explicitProxy) {
+    strategies.push({
+      egress: 'proxy',
+      fetch: createProxiedFetch(explicitProxy, baseFetch),
+    });
+  }
+
+  let lastErr: unknown;
+  for (let i = 0; i < strategies.length; i++) {
+    const { egress, fetch: fetchImpl } = strategies[i];
+    const attempts = egress === 'direct' ? SENATE_EFD_DIRECT_BACKOFF_MS.length : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const waitMs = egress === 'direct' ? SENATE_EFD_DIRECT_BACKOFF_MS[attempt] ?? 0 : 0;
+      if (waitMs > 0) await delay(waitMs, opts.signal);
+      try {
+        return await run(fetchImpl, egress);
+      } catch (err) {
+        lastErr = err;
+        const retryable = isRetryableSenateTransportError(err);
+        const moreDirect = egress === 'direct' && attempt + 1 < attempts;
+        if (retryable && (moreDirect || i + 1 < strategies.length)) continue;
+        throw err;
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'senate egress failed'));
+}
+
 const SENATE_BASE = 'https://efdsearch.senate.gov';
-const SENATE_SEARCH = `${SENATE_BASE}/search/`;
+export const SENATE_SEARCH = `${SENATE_BASE}/search/`;
 const SENATE_HOME = `${SENATE_BASE}/search/home/`;
 const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
 
@@ -397,9 +464,6 @@ export async function fetchSenatePtrFilings(
   const maxPages = boundedPositiveInt(opts.maxPages, SENATE_MAX_PAGES, SENATE_MAX_PAGES);
   const politeDelayMs = boundedNonNegativeInt(opts.politeDelayMs, POLITE_DELAY_MS);
 
-  const proxyUrl = opts.proxyUrl ?? resolveResidentialProxyUrl();
-  const effectiveFetch = proxyUrl ? createProxiedFetch(proxyUrl, fetchImpl) : fetchImpl;
-
   // Owner 2026-09-09: the Mac scout relay (`https://scout.jays.services`)
   // is retired (board `ba810d46`).  The Senate relay fallback at the
   // bottom of this function used to point there; it is now a no-op.
@@ -416,6 +480,7 @@ export async function fetchSenatePtrFilings(
     );
   }
 
+  return await withSenateEfdEgress(opts, fetchImpl, async (effectiveFetch, _egress) => {
   let session: SenateSession | null = null;
 
   if (opts.kv) {
@@ -511,5 +576,6 @@ export async function fetchSenatePtrFilings(
   }
 
   return parseSenateRows(rows);
+  });
 }
 // Senate Scraper Hardening applied

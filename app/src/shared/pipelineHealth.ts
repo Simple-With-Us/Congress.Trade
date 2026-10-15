@@ -17,6 +17,7 @@ import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
 import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
+import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { expectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { classifyFailedOutboxRow } from '../ingestion/transientDlq.ts';
@@ -238,6 +239,16 @@ export interface PipelineSignals {
       status: number | null;
       checkedAt: string;
       host?: string;
+    } | null;
+  } | null;
+  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  senateEfd?: {
+    probe: {
+      ok: boolean;
+      status: number | null;
+      checkedAt: string;
+      egress?: string | null;
+      error?: string | null;
     } | null;
   } | null;
   /**
@@ -1083,6 +1094,47 @@ export function evaluatePipelineSignals(
     }
   }
 
+  if (s.senateEfd === undefined) {
+    /* optional — fixtures predating the direct eFD probe omit this signal */
+  } else if (s.senateEfd == null) {
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
+  } else if (!s.senateEfd.probe) {
+    checks.push({
+      id: 'senate_efd',
+      status: 'unknown',
+      detail: 'Senate eFD direct landing not yet probed',
+      value: null,
+    });
+  } else {
+    const probe = s.senateEfd.probe;
+    const checkedMs = Date.parse(probe.checkedAt);
+    const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
+    if (!probe.ok) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'stalled',
+        detail: `Senate eFD direct landing unreachable`
+          + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+          + `${probe.error ? ` — ${probe.error}` : ''}`,
+        value: probe.status,
+      });
+    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        value: Math.round(ageMin),
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'ok',
+        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        value: Math.round(ageMin * 10) / 10,
+      });
+    }
+  }
+
   // Price / S&P cache freshness (board row 6c05e09b). Every "excess vs S&P" figure
   // is current_price against the latest S&P close, so a stalled price cache turns
   // into confidently wrong performance numbers with nothing alerting: prod sat
@@ -1637,6 +1689,13 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   }
 
+  let senateEfd: PipelineSignals['senateEfd'] = { probe: null };
+  try {
+    senateEfd = { probe: await readSenateEfdProbe(env) };
+  } catch {
+    senateEfd = null;
+  }
+
   const signals: PipelineSignals = {
     outboxPending,
     outboxOldestAt,
@@ -1665,6 +1724,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     senateRelay,
     residentialProxyConfigured,
     residentialProxy,
+    senateEfd,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,
