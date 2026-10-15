@@ -2831,6 +2831,70 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
   });
 });
 
+describe('client majority preview owner keys (CT-2397)', () => {
+  function extractFn(html: string, name: string): string {
+    const marker = 'function ' + name + '(';
+    const start = html.indexOf(marker);
+    if (start < 0) throw new Error('function not found in DASHBOARD_HTML: ' + name);
+    const braceStart = html.indexOf('{', start);
+    let depth = 0;
+    let i = braceStart;
+    for (; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          i++;
+          break;
+        }
+      }
+    }
+    return html.slice(start, i);
+  }
+
+  function loadPreview(): {
+    clientBuildMajorityRows: (reads: Array<{ rows: unknown[] }>) => { ok: boolean; reason?: string; rows: Array<{ owner: string | null }> };
+  } {
+    const src = [
+      extractFn(DASHBOARD_HTML, 'clientArbitrationOwner'),
+      extractFn(DASHBOARD_HTML, 'clientLegacyArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientParseArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientCanonicalArbitrationKeys'),
+      extractFn(DASHBOARD_HTML, 'clientBuildMajorityRows'),
+      'return { clientBuildMajorityRows: clientBuildMajorityRows };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func -- executing the real shipped source
+    return new Function(src)();
+  }
+
+  const spouse = { ticker: 'COO', txDate: '2026-09-11', txType: 'B', owner: 'spouse', amountMin: 1001, amountMax: 15000 };
+  const dependent = { ticker: 'COO', txDate: '2026-09-11', txType: 'B', owner: 'dependent', amountMin: 15001, amountMax: 50000 };
+
+  it('publishes spouse and dependent lots instead of treating them as one ambiguous key', () => {
+    const preview = loadPreview();
+    const built = preview.clientBuildMajorityRows([
+      { rows: [spouse, dependent] },
+      { rows: [spouse, dependent] },
+      { rows: [dependent, spouse] },
+    ]);
+    expect(built.ok).toBe(true);
+    expect(built.rows.map((row) => row.owner).sort()).toEqual(['dependent', 'spouse']);
+  });
+
+  it('still rejects two lots that share an owner', () => {
+    const preview = loadPreview();
+    const first = { ...spouse, owner: 'self' };
+    const second = { ...dependent, owner: 'self' };
+    const built = preview.clientBuildMajorityRows([
+      { rows: [first, second] },
+      { rows: [first, second] },
+    ]);
+    expect(built.ok).toBe(false);
+    expect(built.reason).toBe('ambiguous_multi_lot');
+  });
+});
+
 describe('dashboard truth + a11y fixes (app review backlog)', () => {
   // Small standalone-function extractor shared by the pure-function tests
   // below (pluralCount / canonSector have no DOM or outer-scope deps).
