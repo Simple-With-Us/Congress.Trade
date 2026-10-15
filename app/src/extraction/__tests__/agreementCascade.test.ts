@@ -399,12 +399,12 @@ describe('agreement cascade — tier 2 / tier 3', () => {
   });
 
   it('2-of-3 majority on every material field publishes with a cascade audit (tier 3)', async () => {
-    // Same row identity in all reads; C disagrees on owner, so exact tier-2
-    // unanimity fails and tier 3 resolves the 2-of-3 material-field majority.
+    // Same row identity in all reads; C disagrees on amount bracket, so exact
+    // tier-2 unanimity fails and tier 3 resolves the 2-of-3 material-field majority.
     stub(
       asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
       asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
-      asJson([row('AAPL', 'B', AB, { owner: 'spouse' })]),
+      asJson([row('AAPL', 'B', AB2, { owner: 'self' })]),
     );
     const { env, cap } = makeEnv();
     const res = await processAgreementCascadeTier2(env, MODELS_C, 'H-6', 'raw/H-6', false);
