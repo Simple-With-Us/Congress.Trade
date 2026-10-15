@@ -87,7 +87,7 @@ import {
   type CandidateDocResult,
   type CandidateInvocation,
 } from './bakeoff.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { canonicalArbitrationKeys } from '../extractors/types.ts';
 import {
   recomputeTransactions,
   HARD_FAILURE_FLAGS,
@@ -1439,13 +1439,15 @@ export function buildMajorityRows(
     );
     return String(nonEmpty[0].text);
   };
-  const groups = reads.map((read) => {
+  const canonical = canonicalArbitrationKeys(reads.map((read) => read.rows));
+  const groups = reads.map((read, groupIndex) => {
     const grouped = new Map<string, ParsedTx[]>();
-    for (const tx of read.rows) {
+    for (let index = 0; index < read.rows.length; index += 1) {
+      const tx = read.rows[index];
+      const key = canonical[groupIndex][index];
       if (!isValidTransactionDate(tx.txDate)) {
-        return { grouped, error: `invalid_transaction_date:${arbitrationRowKey(tx)}` };
+        return { grouped, error: `invalid_transaction_date:${key}` };
       }
-      const key = arbitrationRowKey(tx);
       const rows = grouped.get(key) ?? [];
       rows.push(tx);
       grouped.set(key, rows);

@@ -2404,6 +2404,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   interface ConsensusSandbox {
     consensusGridHtml: (docId: string, consensus: unknown, status?: unknown) => string;
+    consensusQueuedRowKey: (row: Record<string, unknown>) => string;
     useConsensusRows: (docId: string) => void;
     setReviewItem: (item: unknown) => void;
     setQueued: (rows: unknown[]) => void;
@@ -2438,11 +2439,16 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
       extractFn(html, 'consensusModelCellHtml'),
       extractFn(html, 'consensusStatusHtml'),
       extractFn(html, 'consensusGridHtml'),
+      extractFn(html, 'clientArbitrationOwner'),
+      extractFn(html, 'clientLegacyArbitrationRowKey'),
+      extractFn(html, 'clientArbitrationRowKey'),
       extractFn(html, 'consensusQueuedRowKey'),
+      extractFn(html, 'consensusLegacyRowKey'),
+      extractFn(html, 'consensusStoredLegacy'),
       extractFn(html, 'consensusFieldValueForEdit'),
       extractFn(html, 'consensusApplyField'),
       extractFn(html, 'useConsensusRows'),
-      'return { consensusGridHtml: consensusGridHtml, useConsensusRows: useConsensusRows, ' +
+      'return { consensusGridHtml: consensusGridHtml, consensusQueuedRowKey: consensusQueuedRowKey, useConsensusRows: useConsensusRows, ' +
         'setReviewItem: function (item) { REVIEW_ITEM_FOR_TEST = item; }, ' +
         'setQueued: function (rows) { QUEUED_FOR_TEST = rows; }, ' +
         'setConsensus: function (docId, c) { REVIEW_CONSENSUS[docId] = c; }, ' +
@@ -2715,6 +2721,59 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     const [row] = sandbox.getEditorCall()!.rows;
     expect(row.ticker).toBe('AAPL');
     expect(row.rawText).toBe('queued unresolved ticker');
+  });
+
+  it('pairs owner-qualified consensus keys with the matching queued owner', () => {
+    const sandbox = loadConsensusSandbox();
+    const spouse = {
+      ...unanimousRow,
+      rowKey: 'COO|2026-09-11|B|SPOUSE',
+      baseRowKey: 'COO|2026-09-11|B|SPOUSE',
+      fields: {
+        ...unanimousRow.fields,
+        ticker: fieldConsensus('COO', 3, 3, [], true),
+        owner: fieldConsensus('spouse', 3, 3, [], true),
+        amount: fieldConsensus({ amountMin: 1001, amountMax: 15000 }, 3, 3, [], true),
+      },
+    };
+    const dependent = {
+      ...unanimousRow,
+      rowKey: 'COO|2026-09-11|B|DEPENDENT',
+      baseRowKey: 'COO|2026-09-11|B|DEPENDENT',
+      fields: {
+        ...unanimousRow.fields,
+        ticker: fieldConsensus('COO', 3, 3, [], true),
+        owner: fieldConsensus('dependent', 3, 3, [], true),
+        amount: fieldConsensus({ amountMin: 15001, amountMax: 50000 }, 3, 3, [], true),
+      },
+    };
+    sandbox.setConsensus('doc-owners', {
+      rows: [spouse, dependent],
+      summary: { models: MODELS, rowsUnanimous: 2, rowsMajority: 0, rowsContested: 0, perFieldAgreementPct: {} },
+    });
+    sandbox.setReviewItem({ docId: 'doc-owners', chamber: 'house', payload: null });
+    sandbox.setQueued([
+      { ticker: 'COO', txType: 'B', txDate: '2026-09-11', owner: 'dependent', assetName: 'queued dependent', amountMin: 1, amountMax: 2 },
+      { ticker: 'COO', txType: 'B', txDate: '2026-09-11', owner: 'spouse', assetName: 'queued spouse', amountMin: 3, amountMax: 4 },
+    ]);
+
+    sandbox.useConsensusRows('doc-owners');
+
+    const rows = sandbox.getEditorCall()!.rows;
+    expect(rows.map((row) => [row.owner, row.amountMin, row.amountMax])).toEqual([
+      ['dependent', 15001, 50000],
+      ['spouse', 1001, 15000],
+    ]);
+  });
+
+  it('builds an owner-qualified queued key and keeps a missing owner on the historical key', () => {
+    const sandbox = loadConsensusSandbox();
+    expect(sandbox.consensusQueuedRowKey({
+      ticker: 'aapl', txDate: '2026-01-02', txType: 'B', owner: 'spouse',
+    })).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(sandbox.consensusQueuedRowKey({
+      ticker: 'aapl', txDate: '2026-01-02', txType: 'B', owner: null,
+    })).toBe('AAPL|2026-01-02|B');
   });
 
   it('leaves duplicate queued lots untouched because occurrence order is ambiguous', () => {
