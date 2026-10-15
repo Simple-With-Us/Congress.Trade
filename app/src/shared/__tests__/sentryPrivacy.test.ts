@@ -136,6 +136,23 @@ describe('NOT_LINKED Sentry privacy controls', () => {
     expect(JSON.stringify(metricAttrs)).not.toContain(FIXTURE.subscriptionId);
   });
 
+  it('keeps public member route slugs in URLs while redacting opaque path tokens', () => {
+    const memberSlug = 'house-ca17-ro-khanna';
+    const url = scrubSentryFreeText(`https://congress.trade/member/${memberSlug}`);
+    expect(url).toContain(memberSlug);
+    const opaque = 'a'.repeat(32);
+    const redacted = scrubSentryFreeText(`https://congress.trade/api/admin/review/${opaque}`);
+    expect(redacted).not.toContain(opaque);
+    expect(redacted).toContain(SENTRY_FILTERED_VALUE);
+  });
+
+  it('does not redact span description keys when scrubbing nested objects', () => {
+    const scrubbed = scrubSentryEvent({
+      spans: [{ description: 'GET /api/health', op: 'http.client' }],
+    }) as { spans: Array<{ description: string }> };
+    expect(scrubbed.spans[0].description).toBe('GET /api/health');
+  });
+
   it('redacts identity fields on direct scrub helper', () => {
     const scrubbed = scrubSentryEvent({
       breadcrumbs: [{ message: `user ${FIXTURE.email} txn ${FIXTURE.originalTransactionId}` }],

@@ -141,6 +141,17 @@ function redactSentryQuery(query: string): string {
   return changed ? `${prefix}${params.toString()}` : query;
 }
 
+/** Public member/ticker route slugs (kebab-case); not opaque account identifiers. */
+function isPublicKebabRouteSlug(segment: string): boolean {
+  return /^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(segment);
+}
+
+function looksLikeOpaquePathToken(segment: string): boolean {
+  if (segment.length < 20) return false;
+  if (isPublicKebabRouteSlug(segment)) return false;
+  return /^[A-Za-z0-9_]{20,}$/.test(segment);
+}
+
 function redactIdentifierPathSegments(pathname: string): string {
   const segments = pathname.split('/');
   let changed = false;
@@ -151,7 +162,7 @@ function redactIdentifierPathSegments(pathname: string): string {
       UUID_IN_TEXT.lastIndex = 0;
       return SENTRY_FILTERED_VALUE;
     }
-    if (/^[A-Za-z0-9_-]{20,}$/.test(segment)) {
+    if (looksLikeOpaquePathToken(segment)) {
       changed = true;
       return SENTRY_FILTERED_VALUE;
     }

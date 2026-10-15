@@ -147,7 +147,7 @@ export function renderSentryBrowserScript(env: SentryBrowserInput | undefined): 
     'var integrations=[' + integrations.join(',') + '];',
     'if(window.Sentry.consoleLoggingIntegration)integrations.push(window.Sentry.consoleLoggingIntegration({levels:["warn","error"]}));',
     'var F="[Filtered]";function norm(k){return String(k||"").toLowerCase().replace(/[^a-z0-9]/g,"");}'
-    + 'function redactKey(k){var n=norm(k);return n==="email"||n==="userid"||n==="subscriptionid"||n==="clientid"||n.indexOf("transaction")>=0||n.indexOf("ip")>=0;}'
+    + 'function redactKey(k){var n=norm(k);return n==="email"||n==="userid"||n==="subscriptionid"||n==="clientid"||n==="ip"||n==="ipaddress"||n.indexOf("transaction")>=0;}'
     + 'function scrubStr(s,f){if(typeof s!=="string")return s;if(redactKey(f))return F;'
     + 'return s.replace(/\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b/gi,F).replace(/\\b(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)){3}\\b/g,F);}'
     + 'function scrub(v,f){if(v==null)return v;if(typeof v==="string")return scrubStr(v,f);'
