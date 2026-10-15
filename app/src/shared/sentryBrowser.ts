@@ -11,6 +11,7 @@
  */
 
 import { readBuildInfo } from './buildInfo.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from './sentryDataCollection.ts';
 import { SENTRY_BROWSER_IGNORE_ERRORS } from './sentryNoise.ts';
 
 export const SENTRY_BROWSER_SCRIPT_ORIGIN = 'https://browser.sentry-cdn.com';
@@ -102,6 +103,7 @@ export function renderSentryBrowserScript(env: SentryBrowserInput | undefined): 
     dsn: resolved.dsn,
     environment: resolved.environment,
     sendDefaultPii: false,
+    dataCollection: NOT_LINKED_SENTRY_DATA_COLLECTION,
     tracesSampleRate: resolved.tracesSampleRate,
     replaysSessionSampleRate: resolved.replaysSessionSampleRate,
     replaysOnErrorSampleRate: resolved.replaysOnErrorSampleRate,
@@ -144,7 +146,20 @@ export function renderSentryBrowserScript(env: SentryBrowserInput | undefined): 
     'window.__ctSentryInitialized=1;',
     'var integrations=[' + integrations.join(',') + '];',
     'if(window.Sentry.consoleLoggingIntegration)integrations.push(window.Sentry.consoleLoggingIntegration({levels:["warn","error"]}));',
-    'window.Sentry.init(Object.assign(' + JSON.stringify(init) + ',{integrations:integrations}));',
+    'var F="[Filtered]";function norm(k){return String(k||"").toLowerCase().replace(/[^a-z0-9]/g,"");}'
+    + 'function redactKey(k){var n=norm(k);return n==="email"||n==="userid"||n==="subscriptionid"||n==="clientid"||n.indexOf("transaction")>=0||n.indexOf("ip")>=0;}'
+    + 'function scrubStr(s,f){if(typeof s!=="string")return s;if(redactKey(f))return F;'
+    + 'return s.replace(/\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b/gi,F).replace(/\\b(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)){3}\\b/g,F);}'
+    + 'function scrub(v,f){if(v==null)return v;if(typeof v==="string")return scrubStr(v,f);'
+    + 'if(Array.isArray(v))return v.map(function(i){return scrub(i,f);});'
+    + 'if(typeof v==="object"){var o={};for(var k in v){if(Object.prototype.hasOwnProperty.call(v,k))o[k]=redactKey(k)?F:scrub(v[k],k);}return o;}return v;}'
+    + 'window.__ctScrubSentry=function(p){return scrub(p,"");};',
+    'window.Sentry.init(Object.assign(' + JSON.stringify(init) + ',{integrations:integrations,'
+    + 'beforeSend:function(e){return window.__ctScrubSentry(e);},'
+    + 'beforeSendLog:function(l){return window.__ctScrubSentry(l);},'
+    + 'beforeSendSpan:function(s){return window.__ctScrubSentry(s);},'
+    + 'beforeSendMetric:function(m){return window.__ctScrubSentry(m);}'
+    + '}));',
     '};',
     'document.head.appendChild(n);',
     '})();',
