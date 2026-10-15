@@ -118,7 +118,7 @@ struct TickerDetailView: View {
                                         if let netSentiment = winSummary.netSentiment {
                                             Text(String(format: "%.0f%%", netSentiment * 100))
                                                 .font(.subheadline.weight(.bold))
-                                                .foregroundStyle(netSentiment >= 0.5 ? Color.green : Color.red)
+                                                .foregroundStyle(netSentiment >= 0.5 ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                                         } else {
                                             Text("—")
                                                 .font(.subheadline)
@@ -141,11 +141,11 @@ struct TickerDetailView: View {
                                     HStack {
                                         Text("\(winSummary.buyCount ?? 0) Buys")
                                             .font(.caption2)
-                                            .foregroundStyle(Color.green)
+                                            .foregroundStyle(AppTheme.semanticPositive)
                                         Spacer()
                                         Text("\(winSummary.sellCount ?? 0) Sells")
                                             .font(.caption2)
-                                            .foregroundStyle(Color.red)
+                                            .foregroundStyle(AppTheme.semanticNegative)
                                     }
                                 }
                                 .padding(.vertical, 4)
@@ -257,7 +257,7 @@ struct TickerDetailView: View {
                                         if let medRet = h.medianReturn {
                                             Text(String(format: "%+.1f%%", medRet * 100))
                                                 .font(.subheadline.weight(.semibold))
-                                                .foregroundStyle(medRet >= 0 ? Color.green : Color.red)
+                                                .foregroundStyle(medRet >= 0 ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                                         } else {
                                             Text("—")
                                                 .font(.subheadline)
@@ -266,7 +266,7 @@ struct TickerDetailView: View {
                                         if let excess = h.medianExcess {
                                             Text(String(format: "(%+.1f%% vs SPX)", excess * 100))
                                                 .font(.caption)
-                                                .foregroundStyle(excess >= 0 ? Color.green : Color.red)
+                                                .foregroundStyle(excess >= 0 ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                                         }
                                     }
                                 }

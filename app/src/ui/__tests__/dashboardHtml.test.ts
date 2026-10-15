@@ -13,6 +13,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { parse } from 'node-html-parser';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
+import { SEMANTIC_LIGHT, WCAG_AA_NORMAL_TEXT, contrastRatio } from '../semanticThemeTokens.ts';
 import { browserSecurityHeaders } from '../../security/headers.ts';
 import { MAX_PUBLIC_TX_OFFSET } from '../../security/botDefense.ts';
 
@@ -84,6 +85,23 @@ function loadBenchmarkPresentationHelpers() {
     ) => { warning: boolean; message: string };
   };
 }
+
+describe('light-mode semantic text contrast (CT-1356)', () => {
+  it('injects WCAG-safe light semantic tokens into html[data-theme="light"]', () => {
+    const block = DASHBOARD_HTML.match(/html\[data-theme="light"\] \{([\s\S]*?)\n  \}/)?.[1] ?? '';
+    expect(block).toContain(`--buy:       ${SEMANTIC_LIGHT.buy};`);
+    expect(block).toContain(`--sell:      ${SEMANTIC_LIGHT.sell};`);
+    expect(block).toContain(`--warn:      ${SEMANTIC_LIGHT.warn};`);
+    expect(block).toContain(`--good:      ${SEMANTIC_LIGHT.good};`);
+    expect(block).toContain('--pos:       var(--good);');
+    expect(block).toContain('--neg:       var(--sell);');
+  });
+
+  it('does not leave bright dark-theme --good on light surfaces (regression)', () => {
+    expect(contrastRatio('#34d399', '#ffffff')).toBeLessThan(WCAG_AA_NORMAL_TEXT);
+    expect(contrastRatio(SEMANTIC_LIGHT.good, '#ffffff')).toBeGreaterThanOrEqual(WCAG_AA_NORMAL_TEXT);
+  });
+});
 
 describe('DASHBOARD_HTML', () => {
   it('fills <title>/meta description from server-side OgMeta, per view/entity (SEOSOCIAL-04)', () => {

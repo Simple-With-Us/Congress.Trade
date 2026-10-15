@@ -1145,10 +1145,10 @@ struct SidesFilterMenuLabel: View {
                 HStack(spacing: 1) {
                     Image(systemName: "arrow.up")
                         .font(.caption2.weight(.heavy))
-                        .foregroundStyle(isOn(.buy) ? Color.green : dimColor)
+                        .foregroundStyle(isOn(.buy) ? AppTheme.semanticPositive : dimColor)
                     Image(systemName: "arrow.down")
                         .font(.caption2.weight(.heavy))
-                        .foregroundStyle(isOn(.sell) ? Color.red : dimColor)
+                        .foregroundStyle(isOn(.sell) ? AppTheme.semanticNegative : dimColor)
                     // Same semi-dark grey as the other filter glyphs (owner
                     // 2026-08-22). Green/red stay on buy/sell because those
                     // colours mean something; exchange does not.

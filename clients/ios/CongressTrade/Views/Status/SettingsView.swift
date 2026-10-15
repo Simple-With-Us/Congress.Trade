@@ -398,9 +398,9 @@ struct AdminStatusRow: View {
 
     static func color(for status: String?) -> Color {
         switch (status ?? "").lowercased() {
-        case "ok": return .green
-        case "degraded": return .orange
-        case "stalled", "down": return .red
+        case "ok": return AppTheme.semanticPositive
+        case "degraded": return AppTheme.semanticCaution
+        case "stalled", "down": return AppTheme.semanticNegative
         default: return .secondary
         }
     }
@@ -596,7 +596,7 @@ struct ReviewDetailView: View {
                                 Spacer()
                                 Text(run.ok == true ? "ok" : "error")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(run.ok == true ? .green : .red)
+                                    .foregroundStyle(run.ok == true ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                             }
                             if let provider = run.provider, !provider.isEmpty {
                                 Text("Provider \(provider)")
@@ -606,7 +606,7 @@ struct ReviewDetailView: View {
                             if let error = run.error, !error.isEmpty {
                                 Text(error)
                                     .font(.caption)
-                                    .foregroundStyle(.red)
+                                    .foregroundStyle(AppTheme.semanticNegative)
                             }
                             ForEach(Array(run.rows.prefix(8).enumerated()), id: \.offset) { _, row in
                                 ReviewExtractedRowView(row: row)

@@ -228,8 +228,8 @@ struct TrendsView: View {
                     value: SignedFlowFormat.usd(s?.estimatedNetFlowUsd),
                     tint: SignedFlowFormat.tint(s?.estimatedNetFlowUsd)
                 )
-                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: .green)
-                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: .red)
+                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: AppTheme.semanticPositive)
+                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: AppTheme.semanticNegative)
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                 TrendKPI(title: "Trades", value: CompactFormat.count(s?.totalTrades))
@@ -240,8 +240,8 @@ struct TrendsView: View {
                     value: SignedFlowFormat.usd(s?.estimatedNetFlowUsd),
                     tint: SignedFlowFormat.tint(s?.estimatedNetFlowUsd)
                 )
-                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: .green)
-                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: .red)
+                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: AppTheme.semanticPositive)
+                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: AppTheme.semanticNegative)
             }
         }
     }
@@ -426,7 +426,7 @@ struct TrendsView: View {
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 2)
                                         .background(Color.green.opacity(0.15))
-                                        .foregroundStyle(.green)
+                                        .foregroundStyle(AppTheme.semanticPositive)
                                         .clipShape(Capsule())
                                 }
                             }
@@ -468,7 +468,7 @@ struct TrendsView: View {
                             Spacer()
                             StatusPill(
                                 text: (c.txType == "B" || c.txType == "P") ? "Buy" : (c.txType == "S" ? "Sell" : (c.txType == "E" ? "Exchange" : c.txType)),
-                                color: (c.txType == "B" || c.txType == "P") ? .green : (c.txType == "S" ? .red : .blue),
+                                color: (c.txType == "B" || c.txType == "P") ? AppTheme.semanticPositive : (c.txType == "S" ? AppTheme.semanticNegative : .blue),
                                 compact: true
                             )
                             Text("\(c.memberCount) \(c.memberCount == 1 ? "politician" : "politicians")")
@@ -757,7 +757,7 @@ struct TrendsView: View {
                                         .font(.caption.weight(.bold))
                                     StatusPill(
                                         text: c.txType == "B" ? "Buy" : (c.txType == "S" ? "Sell" : "Exchange"),
-                                        color: c.txType == "B" ? .green : (c.txType == "S" ? .red : .blue),
+                                        color: c.txType == "B" ? AppTheme.semanticPositive : (c.txType == "S" ? AppTheme.semanticNegative : .blue),
                                         compact: true
                                     )
                                 }
@@ -798,7 +798,7 @@ struct TrendsView: View {
                     TrendKPI(
                         title: "Over 45 Days",
                         value: SignedPercentFormat.plainPercent(s.overFortyFivePct),
-                        tint: (s.overFortyFivePct ?? 0) > 0 ? .orange : .green
+                        tint: (s.overFortyFivePct ?? 0) > 0 ? AppTheme.semanticCaution : AppTheme.semanticPositive
                     )
                 }
                 if let count = s.count, count > 0 {
@@ -834,7 +834,7 @@ struct TrendsView: View {
                                 Spacer()
                                 Text("\(Int(round(f.avgLagDays ?? 0)))d avg")
                                     .font(.subheadline.weight(.bold))
-                                    .foregroundStyle(.orange)
+                                    .foregroundStyle(AppTheme.semanticCaution)
                             }
                             .padding(.vertical, 6)
                             .frame(minHeight: 44)
@@ -934,7 +934,7 @@ enum SignedFlowFormat {
     /// two carry no direction to colour.
     static func tint(_ value: Double?) -> Color {
         guard let value, value != 0 else { return .primary }
-        return value > 0 ? .green : .red
+        return value > 0 ? AppTheme.semanticPositive : AppTheme.semanticNegative
     }
 }
 
@@ -1318,8 +1318,8 @@ enum LatencyScorecardCopy {
 
     static func leadColor(_ direction: Direction) -> Color {
         switch direction {
-        case .ahead: return .green
-        case .behind: return .red
+        case .ahead: return AppTheme.semanticPositive
+        case .behind: return AppTheme.semanticNegative
         case .even: return .primary
         }
     }
@@ -1340,9 +1340,9 @@ enum LatencyScorecardCopy {
             let stem = token.lowercased().trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
             let piece: Text
             if stem == "earlier" || stem == "lead" {
-                piece = Text(token).foregroundColor(.green).fontWeight(.semibold)
+                piece = Text(token).foregroundColor(AppTheme.semanticPositive).fontWeight(.semibold)
             } else if stem == "later" || stem == "lag" {
-                piece = Text(token).foregroundColor(.red).fontWeight(.semibold)
+                piece = Text(token).foregroundColor(AppTheme.semanticNegative).fontWeight(.semibold)
             } else {
                 piece = Text(token).foregroundColor(base)
             }
@@ -1434,13 +1434,13 @@ struct ProviderScorecard: View {
         switch kind {
         case .mixed:
             bg = Color.orange.opacity(0.15)
-            fg = .orange
+            fg = AppTheme.semanticCaution
         case .ahead:
-            bg = Color.green.opacity(0.2)
-            fg = .green
+            bg = AppTheme.semanticPositive.opacity(0.2)
+            fg = AppTheme.semanticPositive
         case .behind:
-            bg = Color.red.opacity(0.2)
-            fg = .red
+            bg = AppTheme.semanticNegative.opacity(0.2)
+            fg = AppTheme.semanticNegative
         case .muted:
             bg = Color.gray.opacity(0.2)
             fg = Color.secondary
