@@ -1,10 +1,10 @@
 [Unit]
-Description=Run box disk hygiene every 30 minutes
+Description=Run box disk hygiene every 15 minutes
 Requires=box-disk-hygiene.service
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=30min
+OnUnitActiveSec=15min
 AccuracySec=1min
 Persistent=true
 Unit=box-disk-hygiene.service

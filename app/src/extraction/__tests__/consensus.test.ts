@@ -92,6 +92,26 @@ describe('buildConsensusRows', () => {
     // Fields everyone agreed on stay unanimous.
     expect(row.fields.assetName.unanimous).toBe(true);
     expect(summary.rowsMajority).toBe(1);
+    // One lot per ticker|date|type: owner stays a voted field, and the key
+    // stays the historical 3-part form so stored keys still match.
+    expect(row.baseRowKey).toBe('AAPL|2026-01-15|B');
+  });
+
+  it('keeps same-day lots for different owners as separate rows', () => {
+    const spouse = tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11', amountMin: 1001, amountMax: 15000 });
+    const dependent = tx({ ticker: 'COO', owner: 'dependent', txDate: '2026-09-11', amountMin: 15001, amountMax: 50000 });
+    const { rows } = buildConsensusRows([
+      run('m1', [spouse, dependent]),
+      run('m2', [dependent, spouse]),
+    ]);
+    expect(rows.map((row) => row.baseRowKey).sort()).toEqual([
+      'COO|2026-09-11|B|DEPENDENT',
+      'COO|2026-09-11|B|SPOUSE',
+    ]);
+    expect(rows.every((row) => row.rowConsensus === 'unanimous')).toBe(true);
+    const byOwner = Object.fromEntries(rows.map((row) => [row.fields.owner.value, row.fields.amount.value]));
+    expect(byOwner.spouse).toEqual({ amountMin: 1001, amountMax: 15000 });
+    expect(byOwner.dependent).toEqual({ amountMin: 15001, amountMax: 50000 });
   });
 
   it('marks a field contested on a 1-1 tie and nulls the value', () => {
@@ -243,9 +263,9 @@ describe('buildConsensusRows', () => {
     expect(row.rowConsensus).toBe('contested');
   });
 
-  it('preserves duplicate lots with the same ticker/date/type as separate occurrences', () => {
-    // Two real disclosure lots may share arbitrationRowKey while carrying
-    // different brackets/details. Neither may be collapsed as a "duplicate".
+  it('preserves duplicate lots with the same ticker/date/type/owner as separate occurrences', () => {
+    // Two real disclosure lots may share an owner-qualified arbitration key
+    // while carrying different brackets/details. Neither may be collapsed.
     const lot1 = tx({ amountMin: 1001, amountMax: 15000, description: 'Lot one' });
     const lot2 = tx({ amountMin: 15001, amountMax: 50000, description: 'Lot two' });
     const runs = [
@@ -255,12 +275,12 @@ describe('buildConsensusRows', () => {
     const { rows } = buildConsensusRows(runs);
     expect(rows).toHaveLength(2);
     expect(rows.map((row) => row.rowKey)).toEqual([
-      'AAPL|2026-01-15|B#1',
-      'AAPL|2026-01-15|B#2',
+      'AAPL|2026-01-15|B|SELF#1',
+      'AAPL|2026-01-15|B|SELF#2',
     ]);
     expect(rows.map((row) => row.baseRowKey)).toEqual([
-      'AAPL|2026-01-15|B',
-      'AAPL|2026-01-15|B',
+      'AAPL|2026-01-15|B|SELF',
+      'AAPL|2026-01-15|B|SELF',
     ]);
     expect(rows.map((row) => row.occurrence)).toEqual([1, 2]);
     expect(rows[0].fields.amount.value).toEqual({ amountMin: 1001, amountMax: 15000 });

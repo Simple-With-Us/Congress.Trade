@@ -132,7 +132,7 @@ services:
       - POLL_INTERVAL_SEC=30
       - HEARTBEAT_INTERVAL_SEC=60
       - EXTRACTOR=server_cpu_v1
-      # ADMIN_TOKEN comes from env_file (.env / Coolify secrets)
+      # ADMIN_TOKEN: env override optional; worker fetches from Infisical at boot
     depends_on:
       - congress-app
     healthcheck:

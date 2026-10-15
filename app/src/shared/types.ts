@@ -190,6 +190,11 @@ export interface Transaction {
    * otherwise the persist time. Never a date before txDate.
    */
   firstSeenAt?: string | null;
+  /**
+   * Delivery-only stamp: true when filed/first-seen is outside the default
+   * fresh window (webhook/SSE payloads). Absent on feed rows until stamped.
+   */
+  isBackfill?: boolean;
   /** Original public disclosure document URL. Feed only. */
   sourceUrl?: string | null;
   /**
@@ -279,6 +284,11 @@ export interface SubscriptionFilters {
   sectors?: string[];
   /** Market-cap buckets to include (mega…nano, securities_ref.market_cap_bucket). */
   marketCapBuckets?: string[];
+  /**
+   * When true, deliver historical backfill rows too. Default (omitted/false) is
+   * fresh-only (filed or first-seen within seven days).
+   */
+  includeBackfill?: boolean;
 }
 
 export interface Subscription {
@@ -971,6 +981,10 @@ export interface Env {
   ADMIN_EMAILS?: string;
   /** HTTPS webhook that wakes Grok Bot Publisher on review_queue entry. */
   REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL?: string;
+  /** Optional GB Publisher (Grok Bot) webhook; same secret as BF. Comma-separated URLs also supported on the primary key. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB?: string;
+  /** Optional `Authorization` header for GB Publisher only (value includes `Bearer ` prefix). */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB?: string;
   /** HMAC secret for REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL payloads. */
   REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET?: string;
   /** Cloudflare Access team name/hostname for admin API JWT verification. */

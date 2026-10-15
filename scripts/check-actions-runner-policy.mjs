@@ -1,5 +1,13 @@
 import { readdir, readFile } from "node:fs/promises";
 
+/** default-main-protection ruleset on Simple-With-Us/Congress.Trade */
+const MAIN_RULESET_ID = "20961339";
+const REQUIRED_MAIN_STATUS_CHECKS = [
+  "typecheck + test",
+  "gitleaks",
+  "xcodebuild (unsigned)",
+];
+
 const workflowsDir = new URL("../.github/workflows/", import.meta.url);
 const workflowNames = (await readdir(workflowsDir))
   .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
@@ -17,6 +25,14 @@ const allowedRunners = new Set([
 ]);
 
 const fullCommitSha = /^[0-9a-f]{40}$/;
+
+// Fleet autofix reusable workflows (board 04b963b7).  Exact path + full SHA only;
+// both run on ubuntu-latest, so the hosted-runner policy still holds.  A caller
+// may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
+const allowedReusableWorkflows = new Set([
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2e671004afff99a69565aa70853d5bd7a276c667",
+  "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@825f8ee008d6ce104107f2a7267c14d370e6013e",
+]);
 
 for (const name of workflowNames) {
   const text = await readFile(new URL(name, workflowsDir), "utf8");
@@ -91,7 +107,7 @@ for (const name of workflowNames) {
     if (!fullCommitSha.test(ref)) {
       errors.push(`${name}:${index + 1}: third-party action must be pinned to a full commit SHA`);
     }
-    if (action[1].includes("/.github/workflows/")) {
+    if (action[1].includes("/.github/workflows/") && !allowedReusableWorkflows.has(action[1])) {
       errors.push(`${name}:${index + 1}: reusable workflow runner policy is not locally auditable`);
     }
   });
@@ -119,6 +135,54 @@ if (!xctest.includes("-only-testing:CongressTradeTests")) {
 if (!xctest.includes("IOS_CI_MIN_TESTS:-71") && !xctest.includes("-lt \"$MIN_TESTS\"")) {
   errors.push("scripts/ios-ci-xctest.sh: must assert at least 71 XCTest cases ran");
 }
+
+async function assertMainRulesetRequiredChecks() {
+  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const repo = process.env.GITHUB_REPOSITORY;
+  const inCi = process.env.GITHUB_ACTIONS === "true" || process.env.CI === "true";
+  if (!token || !repo) {
+    if (inCi) {
+      errors.push(
+        "ruleset check: GITHUB_TOKEN (or GH_TOKEN) and GITHUB_REPOSITORY must be set in CI — do not skip validation",
+      );
+      return;
+    }
+    console.log(
+      "Ruleset check skipped locally (no GITHUB_TOKEN/GH_TOKEN or GITHUB_REPOSITORY).",
+    );
+    return;
+  }
+
+  const url = `https://api.github.com/repos/${repo}/rulesets/${MAIN_RULESET_ID}`;
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!response.ok) {
+    errors.push(
+      `ruleset ${MAIN_RULESET_ID}: API ${response.status} — cannot verify required status checks`,
+    );
+    return;
+  }
+
+  const ruleset = await response.json();
+  const rule = (ruleset.rules ?? []).find((entry) => entry.type === "required_status_checks");
+  const contexts = (rule?.parameters?.required_status_checks ?? []).map(
+    (entry) => entry.context,
+  );
+  for (const required of REQUIRED_MAIN_STATUS_CHECKS) {
+    if (!contexts.includes(required)) {
+      errors.push(
+        `ruleset ${MAIN_RULESET_ID}: required status check missing "${required}" (have: ${contexts.join(", ") || "(none)"})`,
+      );
+    }
+  }
+}
+
+await assertMainRulesetRequiredChecks();
 
 if (errors.length) {
   console.error(errors.join("\n"));

@@ -5,6 +5,7 @@ import {
   BONDI_EMPTY_DOC_ID,
   closeUnreadableExecutive,
   closeVerifiedEmptyExecutive,
+  sweepAutoRejectedUnreadable,
   sweepKnownParkedExecutiveTerminals,
   TRUMP_UNREADABLE_DOC_ID,
 } from '../executiveDisposition.ts';
@@ -211,7 +212,7 @@ afterEach(() => {
 });
 
 describe('sweepKnownParkedExecutiveTerminals', () => {
-  it('closes Bondi as verified_empty and Trump as unreadable, then no-ops', async () => {
+  it('closes Bondi as verified_empty and parks Trump as unreadable, then no-ops', async () => {
     const db = await sqliteDatabase();
     seedReview(db, BONDI_EMPTY_DOC_ID, 'agreement_cascade_unresolved');
     seedReview(db, TRUMP_UNREADABLE_DOC_ID, 'agreement_cascade_unresolved');
@@ -240,10 +241,10 @@ describe('sweepKnownParkedExecutiveTerminals', () => {
         WHERE rq.doc_id = ?`,
     ).get(TRUMP_UNREADABLE_DOC_ID) as Record<string, unknown>;
     expect(trump).toMatchObject({
-      resolved: 1,
-      resolution_kind: 'rejected',
-      resolution_reason: 'oge_text_unreadable',
-      ingest_status: 'error',
+      resolved: 0,
+      resolution_kind: null,
+      resolution_reason: null,
+      ingest_status: 'needs_review',
     });
     expect(String(trump.reason)).toContain('ocr_unusable');
     expect(String(trump.reason)).toContain('oge_text_unreadable');
@@ -256,7 +257,7 @@ describe('sweepKnownParkedExecutiveTerminals', () => {
       .all() as Array<{ doc_id: string; action: string; reason: string }>;
     expect(decisions).toEqual(expect.arrayContaining([
       { doc_id: BONDI_EMPTY_DOC_ID, action: 'auto_resolved_empty', reason: 'executive_278e_no_transactions' },
-      { doc_id: TRUMP_UNREADABLE_DOC_ID, action: 'rejected', reason: 'oge_text_unreadable' },
+      { doc_id: TRUMP_UNREADABLE_DOC_ID, action: 'oge_text_unreadable', reason: 'oge_text_unreadable' },
     ]));
     expect(decisions).toHaveLength(2);
 
@@ -302,7 +303,7 @@ describe('sweepKnownParkedExecutiveTerminals', () => {
     expect(trump.resolved).toBe(0);
   });
 
-  it('closes Trump as unreadable when agreement vision counts disagree (33/66/472)', async () => {
+  it('parks Trump as unreadable when agreement vision counts disagree (33/66/472)', async () => {
     const db = await sqliteDatabase();
     seedReview(db, TRUMP_UNREADABLE_DOC_ID, 'agreement_cascade_unresolved');
     const insert = db.prepare(
@@ -319,11 +320,12 @@ describe('sweepKnownParkedExecutiveTerminals', () => {
       `SELECT resolved, resolution_kind, resolution_reason, reason FROM review_queue WHERE doc_id = ?`,
     ).get(TRUMP_UNREADABLE_DOC_ID) as Record<string, unknown>;
     expect(trump).toMatchObject({
-      resolved: 1,
-      resolution_kind: 'rejected',
-      resolution_reason: 'oge_text_unreadable',
+      resolved: 0,
+      resolution_kind: null,
+      resolution_reason: null,
     });
     expect(String(trump.reason)).toContain('ocr_unusable');
+    expect(String(trump.reason)).toContain('oge_text_unreadable');
   });
 
   it('does not close Trump when two agreement vision runs agree on row count', async () => {
@@ -380,13 +382,14 @@ describe('sweepKnownParkedExecutiveTerminals', () => {
     const result = await sweepKnownParkedExecutiveTerminals(envFor(db));
     expect(result).toEqual({ verifiedEmpty: 0, unreadable: 1 });
     const trump = db.prepare(
-      `SELECT resolved, resolution_kind, resolution_reason FROM review_queue WHERE doc_id = ?`,
+      `SELECT resolved, resolution_kind, resolution_reason, reason FROM review_queue WHERE doc_id = ?`,
     ).get(TRUMP_UNREADABLE_DOC_ID) as Record<string, unknown>;
     expect(trump).toMatchObject({
-      resolved: 1,
-      resolution_kind: 'rejected',
-      resolution_reason: 'oge_text_unreadable',
+      resolved: 0,
+      resolution_kind: null,
+      resolution_reason: null,
     });
+    expect(String(trump.reason)).toContain('oge_text_unreadable');
   });
 
   it('still verified_empties when the only successful reads are zero-row', async () => {
@@ -441,7 +444,7 @@ describe('admin reopen and first-pass closes', () => {
     expect(db.prepare(`SELECT COUNT(*) AS n FROM ingestion_decisions`).get()).toEqual({ n: 0 });
   });
 
-  it('inserts a resolved row on first pass when no review row exists yet', async () => {
+  it('inserts an open review row on first pass when no review row exists yet', async () => {
     const db = await sqliteDatabase();
     db.prepare(
       `INSERT INTO filings (doc_id, chamber, ingest_status, doc_kind, extractor)
@@ -456,12 +459,12 @@ describe('admin reopen and first-pass closes', () => {
          FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id WHERE rq.doc_id = ?`,
     ).get(TRUMP_UNREADABLE_DOC_ID);
     expect(row).toMatchObject({
-      resolved: 1,
-      resolution_kind: 'rejected',
-      resolution_reason: 'oge_text_unreadable',
-      ingest_status: 'error',
+      resolved: 0,
+      resolution_kind: null,
+      resolution_reason: null,
+      ingest_status: 'needs_review',
     });
-    // Idempotent: a second first-pass close changes nothing.
+    // Idempotent: a second first-pass park changes nothing.
     expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { insertIfAbsent: true })).toBe(false);
   });
 
@@ -509,6 +512,96 @@ describe('admin reopen and first-pass closes', () => {
     expect(closed).toBe(false);
     expect(db.prepare(`SELECT resolved FROM review_queue WHERE doc_id = ?`).get(BONDI_EMPTY_DOC_ID))
       .toEqual({ resolved: 0 });
+  });
+});
+
+describe('sweepAutoRejectedUnreadable', () => {
+  function seedPipelineAutoReject(db: SqliteDatabase, docId: string): void {
+    seedReview(db, docId, 'ocr_unusable,oge_text_unreadable');
+    db.prepare(
+      `UPDATE filings SET ingest_status = 'error', error = 'old reject' WHERE doc_id = ?`,
+    ).run(docId);
+    db.prepare(
+      `UPDATE review_queue
+          SET resolved = 1,
+              resolution_kind = 'rejected',
+              resolution_reason = 'oge_text_unreadable',
+              resolved_at = '2026-10-08T09:13:13.402Z'
+        WHERE doc_id = ?`,
+    ).run(docId);
+    db.prepare(
+      `INSERT INTO ingestion_decisions
+         (id, doc_id, action, source, actor, reason, payload, transaction_ids, created_at)
+       VALUES (?, ?, 'rejected', 'pipeline', NULL, 'oge_text_unreadable', ?, '[]', '2026-10-08T09:13:13.461Z')`,
+    ).run(
+      `rej-${docId}`,
+      docId,
+      JSON.stringify({ resolvedBy: 'executive-disposition', resolutionKind: 'rejected' }),
+    );
+  }
+
+  it('reopens a same-tick pipeline auto-reject and then no-ops', async () => {
+    const db = await sqliteDatabase();
+    const docId = 'E-2026-donald-j-trump-09-17-2026-278t';
+    seedPipelineAutoReject(db, docId);
+
+    const first = await sweepAutoRejectedUnreadable(envFor(db));
+    expect(first).toEqual({ reopened: 1 });
+    const row = db.prepare(
+      `SELECT rq.resolved, rq.resolution_kind, rq.resolution_reason, rq.reason, f.ingest_status
+         FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
+        WHERE rq.doc_id = ?`,
+    ).get(docId) as Record<string, unknown>;
+    expect(row).toMatchObject({
+      resolved: 0,
+      resolution_kind: null,
+      resolution_reason: null,
+      ingest_status: 'needs_review',
+    });
+    expect(String(row.reason)).toContain('oge_text_unreadable');
+    const parked = db.prepare(
+      `SELECT action, actor, source FROM ingestion_decisions WHERE doc_id = ? AND action = 'oge_text_unreadable'`,
+    ).get(docId) as { action: string; actor: string | null; source: string };
+    expect(parked).toEqual({ action: 'oge_text_unreadable', actor: null, source: 'pipeline' });
+
+    const second = await sweepAutoRejectedUnreadable(envFor(db));
+    expect(second).toEqual({ reopened: 0 });
+    expect(
+      db.prepare(`SELECT COUNT(*) AS n FROM ingestion_decisions WHERE action = 'oge_text_unreadable'`).get(),
+    ).toEqual({ n: 1 });
+  });
+
+  it('does not reopen a rejection a human already made', async () => {
+    const db = await sqliteDatabase();
+    const docId = 'E-2026-human-rejected-278t';
+    seedPipelineAutoReject(db, docId);
+    db.prepare(
+      `INSERT INTO ingestion_decisions
+         (id, doc_id, action, source, actor, reason, payload, transaction_ids, created_at)
+       VALUES ('human-rej', ?, 'rejected', 'admin', 'jay', 'rejected by admin', '{}', '[]', '2026-10-08T10:00:00.000Z')`,
+    ).run(docId);
+
+    const result = await sweepAutoRejectedUnreadable(envFor(db));
+    expect(result).toEqual({ reopened: 0 });
+    const row = db.prepare(`SELECT resolved, resolution_kind FROM review_queue WHERE doc_id = ?`).get(docId) as {
+      resolved: number;
+      resolution_kind: string;
+    };
+    expect(row).toEqual({ resolved: 1, resolution_kind: 'rejected' });
+  });
+
+  it('does not reopen an auto-reject that already has live transactions', async () => {
+    const db = await sqliteDatabase();
+    const docId = TRUMP_UNREADABLE_DOC_ID;
+    seedPipelineAutoReject(db, docId);
+    db.prepare(
+      `INSERT INTO transactions (doc_id, source, deprecated_at) VALUES (?, 'primary', NULL)`,
+    ).run(docId);
+
+    const result = await sweepAutoRejectedUnreadable(envFor(db));
+    expect(result).toEqual({ reopened: 0 });
+    const row = db.prepare(`SELECT resolved FROM review_queue WHERE doc_id = ?`).get(docId) as { resolved: number };
+    expect(row.resolved).toBe(1);
   });
 });
 
@@ -754,7 +847,7 @@ describe('recoverExpiredCappedReviews', () => {
     ).get(docId) as Record<string, unknown>;
   }
 
-  it('re-classifies a capped executive empty failure: empty closes, unreadable rejects, unconfirmed goes to human review', async () => {
+  it('re-classifies a capped executive empty failure: empty closes, unreadable parks, unconfirmed goes to human review', async () => {
     const db = await sqliteDatabase();
     for (const id of ['E-2026-empty-278e', 'E-2026-refused-278t', 'E-2026-garbled-278e']) {
       seedReview(db, id, 'extract_empty_failure,no_transactions_extracted');
@@ -777,8 +870,9 @@ describe('recoverExpiredCappedReviews', () => {
       resolved: 1, resolution_kind: 'verified_empty', agreement_claim_token: null,
     });
     expect(reviewRow(db, 'E-2026-refused-278t')).toMatchObject({
-      resolved: 1, resolution_kind: 'rejected', agreement_claim_token: null,
+      resolved: 0, resolution_kind: null, agreement_claim_token: null,
     });
+    expect(String(reviewRow(db, 'E-2026-refused-278t').reason)).toContain('oge_text_unreadable');
     // Blank/garbled/header-only 278e: not auto-closed, but no longer stuck
     // eligible at the cap - it gets the terminal human-review label.
     expect(reviewRow(db, 'E-2026-garbled-278e')).toMatchObject({

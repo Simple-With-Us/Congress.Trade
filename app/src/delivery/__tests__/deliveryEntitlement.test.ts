@@ -12,13 +12,16 @@ import type { Env } from '../../shared/types.ts';
 import { dispatchWebhook } from '../webhook.ts';
 import { openSseStream } from '../sse.ts';
 import { subscriptionOwnerEntitled } from '../subscriptions.ts';
+import { freshDeliveryAnchor, freshDeliveryDay, freshDeliveryIso } from './freshDeliveryFixtures.ts';
 
 const txRow = {
-  id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: '2026-06-20', owner: 'self',
+  id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: freshDeliveryDay, owner: 'self',
   asset_name: 'Apple Inc.', ticker: 'AAPL', asset_type: 'stock', tx_type: 'B',
   amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0,
   raw_text: 'AAPL purchase', confidence: 0.99, source: 'primary',
-  created_at: '2026-06-20T00:00:00.000Z', cursor_seq: 42,
+  filed_date: freshDeliveryDay,
+  first_seen_at: freshDeliveryIso,
+  created_at: freshDeliveryIso, cursor_seq: 42,
 };
 
 interface OwnerState {
@@ -78,7 +81,16 @@ function targetFetch() {
       return Response.json({ Status: 0, Answer: type === 'A' ? [{ type: 1, data: '93.184.216.34' }] : [] });
     }
     targetCalls += 1;
-    return new Response('ok', { status: 200 });
+    return new Response(
+      JSON.stringify({
+        receiptVersion: 1,
+        delivered: true,
+        consumed: true,
+        ok: true,
+        applied: 1,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
   });
   return { fetchMock, targetCalls: () => targetCalls };
 }

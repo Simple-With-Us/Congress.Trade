@@ -67,11 +67,18 @@ function cacheTtlSeconds(env: Env): number {
   return Number.isFinite(n) && n > 0 ? Math.min(n, 3600) : DEFAULT_TTL_SECONDS;
 }
 
+/**
+ * prod is the only Infisical environment the fleet reads (owner 2026-10-10:
+ * dev and staging are retired).  Unset or blank falls back to prod and
+ * "production" is accepted as an alias;  anything else is refused so a stale
+ * INFISICAL_ENV can never read, or write to, a retired environment.
+ */
 function envName(env: Env): string {
-  const val = (env.INFISICAL_ENV || DEFAULT_ENV).trim();
-  if (val === 'production') return 'prod';
-  if (val === 'development') return 'dev';
-  return val || DEFAULT_ENV;
+  const val = (env.INFISICAL_ENV || '').trim();
+  if (!val || val === DEFAULT_ENV || val === 'production') return DEFAULT_ENV;
+  throw new Error(
+    `INFISICAL_ENV must be "${DEFAULT_ENV}" (dev and staging are retired); got "${val.slice(0, 32)}"`,
+  );
 }
 
 function envFallbackAllowed(env: Env): boolean {
@@ -206,13 +213,17 @@ function secretEntries(payload: unknown): Array<{ key: string; value: string }> 
   return entries;
 }
 
+/** Deno KV value limit (bytes).  Encrypted blobs must stay under this. */
+export const INFISICAL_KV_CACHE_MAX_BYTES = 65_536;
+
 async function fetchSourceSecrets(
   baseUrl: string,
   infisicalEnv: string,
   source: SourceConfig,
   includeImports = true,
+  signal?: AbortSignal,
 ): Promise<Record<string, string>> {
-  const token = await login(baseUrl, source);
+  const token = await login(baseUrl, source, signal);
   const params = new URLSearchParams({
     workspaceId: source.projectId || '',
     environment: infisicalEnv,
@@ -222,6 +233,7 @@ async function fetchSourceSecrets(
   });
   const res = await trackedFetch(`${baseUrl}/api/v3/secrets/raw?${params.toString()}`, {
     headers: { authorization: `Bearer ${token}` },
+    signal,
   }, { service: 'secret-management', operation: 'read-secrets', dynamicTarget: 'infisical' });
   const body = (await res.json().catch(() => ({}))) as { message?: string };
   if (!res.ok) throw new Error(`Infisical ${source.name} secrets failed: HTTP ${res.status} ${body.message || ''}`.trim());
@@ -372,6 +384,7 @@ export async function deleteSecret(
 ): Promise<void> {
   const source = configuredSource(env, sourceName);
   const baseUrl = cleanBaseUrl(env.INFISICAL_BASE_URL);
+  const infisicalEnv = envName(env);
   const token = await login(baseUrl, source, options.signal);
   const res = await trackedFetch(`${baseUrl}/api/v3/secrets/raw/${secretKey}`, {
     method: 'DELETE',
@@ -381,7 +394,7 @@ export async function deleteSecret(
     },
     body: JSON.stringify({
       workspaceId: source.projectId,
-      environment: envName(env),
+      environment: infisicalEnv,
       secretPath: source.secretPath || '/',
       type: 'shared',
     }),
@@ -394,10 +407,24 @@ export async function deleteSecret(
   await invalidateSecretCache(env);
 }
 
-export async function refreshSecrets(env: Env): Promise<SecretResolverStatus> {
+export interface RefreshSecretsOptions {
+  /** Bypass in-memory TTL (admin refresh, post-mutation). */
+  force?: boolean;
+  signal?: AbortSignal;
+}
+
+export async function refreshSecrets(
+  env: Env,
+  options: RefreshSecretsOptions = {},
+): Promise<SecretResolverStatus> {
   const key = cacheKey(env);
   const ttlMs = cacheTtlSeconds(env) * 1000;
   const now = Date.now();
+  const existing = cache.get(key);
+  if (!options.force && existing && existing.expiresAt > now) {
+    return statusFromEntry(env, existing);
+  }
+
   const baseUrl = cleanBaseUrl(env.INFISICAL_BASE_URL);
   const infisicalEnv = envName(env);
   const sources = sourceConfigs(env);
@@ -411,7 +438,13 @@ export async function refreshSecrets(env: Env): Promise<SecretResolverStatus> {
       continue;
     }
     try {
-      const sourceValues = await fetchSourceSecrets(baseUrl, infisicalEnv, source);
+      const sourceValues = await fetchSourceSecrets(
+        baseUrl,
+        infisicalEnv,
+        source,
+        true,
+        options.signal,
+      );
       Object.assign(values, sourceValues);
       sourceStatus.push({ name: source.name, configured: true, ok: true, count: Object.keys(sourceValues).length });
     } catch (err) {
@@ -435,9 +468,21 @@ export async function refreshSecrets(env: Env): Promise<SecretResolverStatus> {
   if (env.CONFIG_KV && kvSecret && errors.length === 0 && Object.keys(values).length > 0) {
     try {
       const kvKey = `infisical_secrets_cache:${key}`;
-      const encrypted = await encryptData(JSON.stringify(entry), kvSecret);
-      const ttlSec = cacheTtlSeconds(env);
-      await env.CONFIG_KV.put(kvKey, encrypted, { expirationTtl: ttlSec });
+      const plaintext = JSON.stringify(entry);
+      const encrypted = await encryptData(plaintext, kvSecret);
+      if (encrypted.length > INFISICAL_KV_CACHE_MAX_BYTES) {
+        console.warn(
+          'infisical: skipping KV cache write (encrypted payload exceeds Deno KV limit)',
+          {
+            secretCount: Object.keys(values).length,
+            encryptedBytes: encrypted.length,
+            maxBytes: INFISICAL_KV_CACHE_MAX_BYTES,
+          },
+        );
+      } else {
+        const ttlSec = cacheTtlSeconds(env);
+        await env.CONFIG_KV.put(kvKey, encrypted, { expirationTtl: ttlSec });
+      }
     } catch (err) {
       console.warn('infisical: failed to encrypt or write to KV cache', (err as Error).message);
     }

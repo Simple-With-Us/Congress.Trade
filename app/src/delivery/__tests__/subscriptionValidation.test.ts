@@ -102,7 +102,13 @@ describe('members filter resolves names to filer ids (a6058af2)', () => {
     expect(membersOf(result)).toEqual(['P000197']);
     if (!result.ok) throw new Error('unreachable');
     // The stored filter now matches the trade; the raw name never could.
-    const tx = { filerId: 'P000197' } as unknown as Transaction;
+    const tx = {
+      filerId: 'P000197',
+      txDate: '2026-10-13',
+      filedDate: '2026-10-13',
+      firstSeenAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+      createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+    } as unknown as Transaction;
     expect(matchesFilters(tx, result.filters)).toBe(true);
     expect(matchesFilters(tx, { members: ['Nancy Pelosi'] })).toBe(false);
   });

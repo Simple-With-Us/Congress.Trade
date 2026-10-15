@@ -34,6 +34,7 @@ describe('formatTradeEvent (SSE cross-app contract)', () => {
     expect(Array.isArray(payload.data?.trades)).toBe(true);
     expect(payload.data.trades).toHaveLength(1);
     expect(payload.data.trades[0].id).toBe('tx_123');
+    expect(typeof payload.data.trades[0].isBackfill).toBe('boolean');
   });
 
   it('carries cursorSeq as the SSE id for Last-Event-ID resume', () => {

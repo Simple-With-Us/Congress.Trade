@@ -175,7 +175,7 @@ jobs:
         working-directory: app
     steps:
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The persistent workspace may have been left in sparse-checkout mode by
       # an older reporter run. Explicitly restore every tracked path before a
@@ -188,9 +188,9 @@ jobs:
           test -f scripts/check-actions-runner-policy.mjs
           test -d app
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 24
 
       # package.json typecheck is `deno check`; Coolify runners do not ship Deno.
       - name: Install Deno CLI
@@ -198,6 +198,9 @@ jobs:
 
       - name: Enforce owned-runner workflow policy
         working-directory: .
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
       # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
@@ -205,6 +208,19 @@ jobs:
       - name: Deploy overlap policy tests
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
+
+      - name: Sentry deploy reporter + browser sourcemap tests
+        working-directory: .
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
+
+      # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
+      # stub `infisical` first on PATH records its arguments, so the real CLI,
+      # network and credentials are never reached.
+      - name: Infisical safe wrapper is prod-only
+        working-directory: .
+        run: |
+          bash -n scripts/infisical-secrets-safe.sh
+          node --test scripts/infisical-secrets-safe.test.mjs
 
       # Static guard for the class of defect behind the sqlite-web finding: a
       # security-relevant variable given a fail-open default, or a password
@@ -276,11 +292,11 @@ jobs:
       run:
         working-directory: services/scan-cpu-worker
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       # The existing worker tests import checkbox/form_chrome, which pull in
       # numpy and OpenCV, so the runtime requirements are needed too — not just
@@ -317,7 +333,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Syntax-check the ship scripts
         run: |

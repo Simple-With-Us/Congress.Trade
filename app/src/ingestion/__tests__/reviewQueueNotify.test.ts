@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
-import { notifyReviewQueuePublisher } from '../reviewQueueNotify.ts';
+import { notifyPipelineStallPublisher, notifyReviewQueuePublisher } from '../reviewQueueNotify.ts';
 
 const DNS_A = JSON.stringify({
   Status: 0,
@@ -48,6 +48,118 @@ describe('notifyReviewQueuePublisher', () => {
     );
   });
 
+  it('fans out to primary and GB webhook URLs with the same signature', async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      urls.push(url);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb.example/hook',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(urls.sort()).toEqual(['https://bf.example/hook', 'https://gb.example/hook']);
+  });
+
+  it('sends Authorization on GB webhook when REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB is set', async () => {
+    const headersByUrl = new Map<string, Record<string, string>>();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      headersByUrl.set(url, init?.headers as Record<string, string>);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB: 'Bearer gb-publisher-token',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(headersByUrl.get('https://gb.example/hook')?.authorization).toBe('Bearer gb-publisher-token');
+    expect(headersByUrl.get('https://gb.example/hook')?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+    expect(headersByUrl.get('https://bf.example/hook')?.authorization).toBeUndefined();
+    expect(headersByUrl.get('https://bf.example/hook')?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+  });
+
+  it('omits Authorization on GB webhook when REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB is unset', async () => {
+    let postedHeaders: Record<string, string> | undefined;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      if (url === 'https://gb.example/hook') {
+        postedHeaders = init?.headers as Record<string, string>;
+      }
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb.example/hook',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(postedHeaders?.authorization).toBeUndefined();
+    expect(postedHeaders?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+  });
+
+  it('does not send Authorization on a URL configured for both BF and GB', async () => {
+    const headersByUrl = new Map<string, Record<string, string>>();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      headersByUrl.set(url, init?.headers as Record<string, string>);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://shared.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://shared.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB: 'Bearer gb-publisher-token',
+    }), { docId: 'H-42' }, { fetchImpl });
+
+    expect(headersByUrl.get('https://shared.example/hook')?.authorization).toBeUndefined();
+    expect(headersByUrl.get('https://shared.example/hook')?.['x-ct-signature']).toMatch(/^t=\d+,v1=/);
+  });
+
+  it('POSTs pipeline.stalled with null docId', async () => {
+    let postedBody = '';
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      postedBody = String(init?.body ?? '');
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyPipelineStallPublisher(envWith(), {
+      pipeline: 'senate_fetch_success',
+      detail: 'stale senate',
+      at: '2026-10-12T12:00:00.000Z',
+    }, { fetchImpl });
+
+    expect(postedBody).toContain('"event":"pipeline.stalled"');
+    expect(postedBody).toContain('"docId":null');
+    expect(postedBody).toContain('"pipeline":"senate_fetch_success"');
+  });
+
   it('POSTs a signed payload to a validated public target', async () => {
     let postedBody = '';
     let postedSig = '';
@@ -76,5 +188,32 @@ describe('notifyReviewQueuePublisher', () => {
       'https://publisher.example/hook',
       expect.objectContaining({ method: 'POST' }),
     );
+  });
+
+  it('fans out the same signed payload to BF and GB publisher webhook URLs', async () => {
+    const postedUrls: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('dns-query')) {
+        const type = url.includes('type=AAAA') ? DNS_AAAA : DNS_A;
+        return new Response(type, { status: 200 });
+      }
+      postedUrls.push(url);
+      return new Response('ok', { status: 202 });
+    });
+
+    await notifyReviewQueuePublisher(envWith({
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: 'https://bf-publisher.example/hook',
+      REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB: 'https://gb-publisher.example/hook',
+    }), {
+      docId: 'H-2026-9116355',
+      reason: 'needs_hand_check:mac_vision',
+      kind: 'insert',
+      at: '2026-10-12T09:28:00.000Z',
+    }, { fetchImpl });
+
+    expect(postedUrls).toContain('https://bf-publisher.example/hook');
+    expect(postedUrls).toContain('https://gb-publisher.example/hook');
+    expect(postedUrls.length).toBe(2);
   });
 });

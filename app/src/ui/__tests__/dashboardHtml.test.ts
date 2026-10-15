@@ -2404,6 +2404,7 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
 
   interface ConsensusSandbox {
     consensusGridHtml: (docId: string, consensus: unknown, status?: unknown) => string;
+    consensusQueuedRowKey: (row: Record<string, unknown>) => string;
     useConsensusRows: (docId: string) => void;
     setReviewItem: (item: unknown) => void;
     setQueued: (rows: unknown[]) => void;
@@ -2438,11 +2439,16 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
       extractFn(html, 'consensusModelCellHtml'),
       extractFn(html, 'consensusStatusHtml'),
       extractFn(html, 'consensusGridHtml'),
+      extractFn(html, 'clientArbitrationOwner'),
+      extractFn(html, 'clientLegacyArbitrationRowKey'),
+      extractFn(html, 'clientArbitrationRowKey'),
       extractFn(html, 'consensusQueuedRowKey'),
+      extractFn(html, 'consensusLegacyRowKey'),
+      extractFn(html, 'consensusStoredLegacy'),
       extractFn(html, 'consensusFieldValueForEdit'),
       extractFn(html, 'consensusApplyField'),
       extractFn(html, 'useConsensusRows'),
-      'return { consensusGridHtml: consensusGridHtml, useConsensusRows: useConsensusRows, ' +
+      'return { consensusGridHtml: consensusGridHtml, consensusQueuedRowKey: consensusQueuedRowKey, useConsensusRows: useConsensusRows, ' +
         'setReviewItem: function (item) { REVIEW_ITEM_FOR_TEST = item; }, ' +
         'setQueued: function (rows) { QUEUED_FOR_TEST = rows; }, ' +
         'setConsensus: function (docId, c) { REVIEW_CONSENSUS[docId] = c; }, ' +
@@ -2717,6 +2723,59 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     expect(row.rawText).toBe('queued unresolved ticker');
   });
 
+  it('pairs owner-qualified consensus keys with the matching queued owner', () => {
+    const sandbox = loadConsensusSandbox();
+    const spouse = {
+      ...unanimousRow,
+      rowKey: 'COO|2026-09-11|B|SPOUSE',
+      baseRowKey: 'COO|2026-09-11|B|SPOUSE',
+      fields: {
+        ...unanimousRow.fields,
+        ticker: fieldConsensus('COO', 3, 3, [], true),
+        owner: fieldConsensus('spouse', 3, 3, [], true),
+        amount: fieldConsensus({ amountMin: 1001, amountMax: 15000 }, 3, 3, [], true),
+      },
+    };
+    const dependent = {
+      ...unanimousRow,
+      rowKey: 'COO|2026-09-11|B|DEPENDENT',
+      baseRowKey: 'COO|2026-09-11|B|DEPENDENT',
+      fields: {
+        ...unanimousRow.fields,
+        ticker: fieldConsensus('COO', 3, 3, [], true),
+        owner: fieldConsensus('dependent', 3, 3, [], true),
+        amount: fieldConsensus({ amountMin: 15001, amountMax: 50000 }, 3, 3, [], true),
+      },
+    };
+    sandbox.setConsensus('doc-owners', {
+      rows: [spouse, dependent],
+      summary: { models: MODELS, rowsUnanimous: 2, rowsMajority: 0, rowsContested: 0, perFieldAgreementPct: {} },
+    });
+    sandbox.setReviewItem({ docId: 'doc-owners', chamber: 'house', payload: null });
+    sandbox.setQueued([
+      { ticker: 'COO', txType: 'B', txDate: '2026-09-11', owner: 'dependent', assetName: 'queued dependent', amountMin: 1, amountMax: 2 },
+      { ticker: 'COO', txType: 'B', txDate: '2026-09-11', owner: 'spouse', assetName: 'queued spouse', amountMin: 3, amountMax: 4 },
+    ]);
+
+    sandbox.useConsensusRows('doc-owners');
+
+    const rows = sandbox.getEditorCall()!.rows;
+    expect(rows.map((row) => [row.owner, row.amountMin, row.amountMax])).toEqual([
+      ['dependent', 15001, 50000],
+      ['spouse', 1001, 15000],
+    ]);
+  });
+
+  it('builds an owner-qualified queued key and keeps a missing owner on the historical key', () => {
+    const sandbox = loadConsensusSandbox();
+    expect(sandbox.consensusQueuedRowKey({
+      ticker: 'aapl', txDate: '2026-01-02', txType: 'B', owner: 'spouse',
+    })).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(sandbox.consensusQueuedRowKey({
+      ticker: 'aapl', txDate: '2026-01-02', txType: 'B', owner: null,
+    })).toBe('AAPL|2026-01-02|B');
+  });
+
   it('leaves duplicate queued lots untouched because occurrence order is ambiguous', () => {
     const sandbox = loadConsensusSandbox();
     const lot1 = {
@@ -2769,6 +2828,70 @@ describe('consensus grid + Use Consensus prefill (executed)', () => {
     sandbox.useConsensusRows('doc-3'); // no setConsensus() call for doc-3
     expect(sandbox.getEditorCall()).toBeNull();
     expect(sandbox.getAlerts()).toHaveLength(1);
+  });
+});
+
+describe('client majority preview owner keys (CT-2397)', () => {
+  function extractFn(html: string, name: string): string {
+    const marker = 'function ' + name + '(';
+    const start = html.indexOf(marker);
+    if (start < 0) throw new Error('function not found in DASHBOARD_HTML: ' + name);
+    const braceStart = html.indexOf('{', start);
+    let depth = 0;
+    let i = braceStart;
+    for (; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          i++;
+          break;
+        }
+      }
+    }
+    return html.slice(start, i);
+  }
+
+  function loadPreview(): {
+    clientBuildMajorityRows: (reads: Array<{ rows: unknown[] }>) => { ok: boolean; reason?: string; rows: Array<{ owner: string | null }> };
+  } {
+    const src = [
+      extractFn(DASHBOARD_HTML, 'clientArbitrationOwner'),
+      extractFn(DASHBOARD_HTML, 'clientLegacyArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientParseArbitrationRowKey'),
+      extractFn(DASHBOARD_HTML, 'clientCanonicalArbitrationKeys'),
+      extractFn(DASHBOARD_HTML, 'clientBuildMajorityRows'),
+      'return { clientBuildMajorityRows: clientBuildMajorityRows };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func -- executing the real shipped source
+    return new Function(src)();
+  }
+
+  const spouse = { ticker: 'COO', txDate: '2026-09-11', txType: 'B', owner: 'spouse', amountMin: 1001, amountMax: 15000 };
+  const dependent = { ticker: 'COO', txDate: '2026-09-11', txType: 'B', owner: 'dependent', amountMin: 15001, amountMax: 50000 };
+
+  it('publishes spouse and dependent lots instead of treating them as one ambiguous key', () => {
+    const preview = loadPreview();
+    const built = preview.clientBuildMajorityRows([
+      { rows: [spouse, dependent] },
+      { rows: [spouse, dependent] },
+      { rows: [dependent, spouse] },
+    ]);
+    expect(built.ok).toBe(true);
+    expect(built.rows.map((row) => row.owner).sort()).toEqual(['dependent', 'spouse']);
+  });
+
+  it('still rejects two lots that share an owner', () => {
+    const preview = loadPreview();
+    const first = { ...spouse, owner: 'self' };
+    const second = { ...dependent, owner: 'self' };
+    const built = preview.clientBuildMajorityRows([
+      { rows: [first, second] },
+      { rows: [first, second] },
+    ]);
+    expect(built.ok).toBe(false);
+    expect(built.reason).toBe('ambiguous_multi_lot');
   });
 });
 
@@ -2911,7 +3034,7 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
   it('shows $8.99/mo and $79.99/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
     // Each gate is its own surface.  A single shared toContain cannot tell
     // the export note from the alerts note.
-    const canonical = 'Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 2-week free trial';
+    const canonical = 'Premium unlocks Webhooks + SSE + Proprietary Enrichment Data + CSV &middot; $8.99/mo or $79.99/yr &middot; 1-week free trial';
     const exportAt = DASHBOARD_HTML.indexOf('data-premium-cue="export">');
     const alertsAt = DASHBOARD_HTML.indexOf('data-premium-cue="alerts">');
     expect(exportAt).toBeGreaterThan(-1);
@@ -2920,7 +3043,10 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
     expect(DASHBOARD_HTML.slice(alertsAt, alertsAt + 400)).toContain(canonical);
     expect(DASHBOARD_HTML).toContain('$8.99<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).toContain('$79.99<span class="per">/yr</span>');
-    expect(DASHBOARD_HTML).toContain('2-week free trial');
+    expect(DASHBOARD_HTML).not.toContain('$9<span class="per">/mo</span>');
+    expect(DASHBOARD_HTML).not.toContain('$80<span class="per">/yr</span>');
+    expect(DASHBOARD_HTML).toContain('1-week free trial');
+    expect(DASHBOARD_HTML).not.toContain('2-week free trial');
     expect(DASHBOARD_HTML).not.toContain('$5<span class="per">/mo</span>');
     expect(DASHBOARD_HTML).not.toContain('$50<span class="per">/yr</span>');
     expect(DASHBOARD_HTML).not.toContain('$15/mo');
@@ -4037,9 +4163,12 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
   function loadIsLatencyAhead(): (summary: LatencySummary) => boolean {
     const src = [
       extractVarDecl(DASHBOARD_HTML, 'SPEED_LANE_MIN_MATCHED'),
+      extractVarDecl(DASHBOARD_HTML, 'SPEED_MIN_COVERAGE_PCT'),
       extractFn(DASHBOARD_HTML, 'leadDirection'),
       extractFn(DASHBOARD_HTML, 'leadVerdict'),
       extractFn(DASHBOARD_HTML, 'isLatencyComparisonPublic'),
+      extractFn(DASHBOARD_HTML, 'isFmpLatencyProvider'),
+      extractFn(DASHBOARD_HTML, 'publicLatencyProviders'),
       extractFn(DASHBOARD_HTML, 'isLatencyAhead'),
       'return isLatencyAhead;',
     ].join('\n');
@@ -4144,8 +4273,42 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
         providers: [
           provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
           // Behind on raw counts, but comparisonStatus is only 'preliminary' —
-          // not adequate coverage, so it must not veto the definitive lead.
+          // without the coverage floor it must not veto the definitive lead.
           provider({ label: 'B', usFirstCount: 1, providerFirstCount: 9, comparisonStatus: 'preliminary' }),
+        ],
+      };
+      expect(isLatencyAhead(summary)).toBe(true);
+    });
+
+    it('lets a preliminary provider vote when both coverage floors hold', () => {
+      const summary = {
+        providers: [
+          provider({
+            label: 'A',
+            usFirstCount: 1,
+            providerFirstCount: 9,
+            medianLeadSec: -3600,
+            avgLeadSec: -1800,
+            comparisonStatus: 'preliminary',
+            ctCoveragePct: 90,
+            providerCoveragePct: 90,
+          }),
+        ],
+      };
+      expect(isLatencyAhead(summary)).toBe(false);
+    });
+
+    it('lets a preliminary provider qualify when both coverage floors hold', () => {
+      const summary = {
+        providers: [
+          provider({
+            label: 'A',
+            usFirstCount: 8,
+            providerFirstCount: 2,
+            comparisonStatus: 'preliminary',
+            ctCoveragePct: 90,
+            providerCoveragePct: 90,
+          }),
         ],
       };
       expect(isLatencyAhead(summary)).toBe(true);
@@ -4156,6 +4319,23 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
         providers: [
           provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
           provider({ label: 'B', operationalStatus: 'off' }),
+        ],
+      };
+      expect(isLatencyAhead(summary)).toBe(true);
+    });
+
+    it('ignores FMP-family providers in public latency gates', () => {
+      const summary = {
+        providers: [
+          provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
+          provider({
+            id: 'fmp',
+            label: 'FMP',
+            usFirstCount: 1,
+            providerFirstCount: 9,
+            medianLeadSec: -7200,
+            avgLeadSec: -5400,
+          }),
         ],
       };
       expect(isLatencyAhead(summary)).toBe(true);

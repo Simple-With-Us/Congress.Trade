@@ -10,17 +10,22 @@ describe('POST /api/admin/migrate error handling', () => {
       DB: {
         prepare(sql: string) {
           executedSql.push(sql);
-          return {
+          const stmt = {
+            bind() {
+              return stmt;
+            },
             async run() {
               return { success: true };
             },
             async first() {
-              return { count: 1 };
+              if (/sqlite_master/i.test(sql)) return null;
+              return { ok: 1 };
             },
             async all() {
               return { results: [] };
             },
           };
+          return stmt;
         },
       },
     } as unknown as Env;
@@ -47,7 +52,10 @@ describe('POST /api/admin/migrate error handling', () => {
       ADMIN_TOKEN: 'admin-secret',
       DB: {
         prepare(sql: string) {
-          return {
+          const stmt = {
+            bind() {
+              return stmt;
+            },
             async run() {
               if (sql.includes('transactions')) {
                 throw new Error('UNIQUE constraint failed: transactions.doc_id');
@@ -55,12 +63,14 @@ describe('POST /api/admin/migrate error handling', () => {
               return { success: true };
             },
             async first() {
-              return { count: 1 };
+              if (/sqlite_master/i.test(sql)) return null;
+              return { ok: 1 };
             },
             async all() {
               return { results: [] };
             },
           };
+          return stmt;
         },
       },
     } as unknown as Env;
@@ -87,17 +97,22 @@ describe('POST /api/admin/migrate error handling', () => {
       ADMIN_TOKEN: 'admin-secret',
       DB: {
         prepare(sql: string) {
-          return {
+          const stmt = {
+            bind() {
+              return stmt;
+            },
             async run() {
               throw new Error('duplicate column name: test_col');
             },
             async first() {
-              return { count: 1 };
+              if (/sqlite_master/i.test(sql)) return null;
+              return { ok: 1 };
             },
             async all() {
               return { results: [] };
             },
           };
+          return stmt;
         },
       },
     } as unknown as Env;
@@ -135,6 +150,7 @@ describe('POST /api/admin/migrate error handling', () => {
               return { success: true };
             },
             async first() {
+              if (/sqlite_master/i.test(sql)) return null;
               // `SELECT 1 AS ok` succeeds so the DB is reachable, but every
               // schema probe comes back empty -> readiness.ok === false.
               return /SELECT 1 AS ok/i.test(sql) ? { ok: 1 } : null;
@@ -178,9 +194,15 @@ describe('POST /api/admin/migrate error handling', () => {
               return { success: true };
             },
             async first() {
+              if (/sqlite_master/i.test(sql)) {
+                return null;
+              }
               throw new Error('D1_ERROR: database is unreachable');
             },
             async all() {
+              if (/PRAGMA\s+table_info/i.test(sql)) {
+                return { results: [] };
+              }
               throw new Error('D1_ERROR: database is unreachable');
             },
           };

@@ -53,6 +53,7 @@ import {
   type FeedTransactionRow,
   type TxQueryParams,
 } from './rows.ts';
+import { isDeliveryBackfill } from './deliveryFreshness.ts';
 import { getCurrentUserFromRequest } from '../auth/session.ts';
 import { isPremiumUserAsync } from '../billing/entitlement.ts';
 import { getUserById } from '../auth/users.ts';
@@ -873,9 +874,11 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
     >(c.env.DB, built.sql, built.params);
     const origin = new URL(c.req.url).origin;
+    const includeBackfill = c.req.query('includeBackfill') === '1' || c.req.query('includeBackfill') === 'true';
 
     const items = rows.map((row) => {
       const tx = mapFeedTransaction(row);
+      if (!includeBackfill && isDeliveryBackfill(tx)) return '';
       const who = tx.fullName ?? cleanMemberNameFallback(row.__member_name) ?? tx.filerId ?? 'Unknown filer';
       const side = (tx.txType === 'B' || String(tx.txType) === 'P') ? 'bought' : tx.txType === 'S' ? 'sold' : 'traded';
       const what = tx.ticker ?? tx.assetName;
@@ -898,7 +901,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         + (pubDate ? `      <pubDate>${pubDate}</pubDate>\n` : '')
         + `      <description>${xmlEscape(description)}</description>\n`
         + '    </item>';
-    });
+    }).filter(Boolean);
 
     const xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
       + '<rss version="2.0">\n  <channel>\n'

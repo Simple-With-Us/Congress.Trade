@@ -8,7 +8,7 @@ Two spaces between sentences in this file per the owner's prose style.
 
 - Project: **`congress-trade`** (`f61a79de-8d77-4f0b-9361-4b7208598290`), org `jays-services`.
 - Plus imports from the shared project **`shared-at-ct`** (fleet-wide keys like `AGENT_SYNC_TOKEN` — they MUST live only there; duplicating them on this project shadows the shared row and makes rotation a multi-project chore).
-- Environments: `dev` / `staging` / `prod`.  Production reads `prod`.
+- Environment: `prod` only (owner 2026-10-10:  `dev` and `staging` are retired).  `INFISICAL_ENV` must be unset or `prod`;  the resolver (`app/src/secrets/infisical.ts`) and `scripts/infisical-secrets-safe.sh` refuse any other value, and the wrapper adds `--env prod` when a call has none (the Infisical CLI defaults to `dev`).
 - Bootstrap identity is the org machine identity (universal-auth client id/secret); only these bootstrap vars stay in process env — they are the chicken-and-egg: `INFISICAL_APP_CLIENT_ID`, `INFISICAL_APP_CLIENT_SECRET`, `INFISICAL_SHARED_CLIENT_ID`, `INFISICAL_SHARED_CLIENT_SECRET`, `INFISICAL_APP_PROJECT_ID`, `INFISICAL_SHARED_PROJECT_ID`, `INFISICAL_ENV`, `INFISICAL_BASE_URL`.
 
 ## Runtime contract

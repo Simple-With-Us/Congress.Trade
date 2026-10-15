@@ -38,6 +38,21 @@ describe('sentry browser loader', () => {
     expect(html).toContain("formTitle:'Report a Problem'");
     expect(html).toContain('window.openSentryFeedback=window.openSentryFeedback||function');
     expect(html).toContain('maskAllText:true');
+    expect(html).toContain('"enableLogs":true');
+    expect(html).toContain('ignoreErrors');
+    expect(html).toContain('Unexpected end of input');
+    expect(html).toContain('consoleLoggingIntegration');
+    expect(html).not.toContain('"release"');
+  });
+
+  it('tags the Coolify image SHA as the browser release so events join the Deno release', () => {
+    const sha = '94a3a921f0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5';
+    const resolved = resolveSentryBrowser({ SENTRY_DSN: DSN, CT_BUILD_SHA: sha });
+    expect(resolved.enabled).toBe(true);
+    if (!resolved.enabled) return;
+    expect(resolved.release).toBe(sha);
+    const html = renderSentryBrowserScript({ SENTRY_DSN: DSN, SOURCE_COMMIT: sha });
+    expect(html).toContain(`"release":"${sha}"`);
   });
 
   // CONGRESS-TRADE-1H.  Replay's constructor throws on a second instance, so a
@@ -59,6 +74,7 @@ describe('sentry browser loader', () => {
       browserTracingIntegration: () => ({}),
       replayIntegration: () => ({}),
       feedbackIntegration: () => ({}),
+      consoleLoggingIntegration: () => ({}),
     };
     const win: Record<string, unknown> = { Sentry: sentry };
     const doc = {

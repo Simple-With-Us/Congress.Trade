@@ -8,22 +8,11 @@
  * before relying on them. Update EFFECTIVE_DATE when the text changes.
  */
 
-const EFFECTIVE_DATE = 'August 21, 2026';
+import { NOT_AFFILIATED_SENTENCE, SITE_FOOTER_DISCLAIMER } from './disclaimers.ts';
+
+const EFFECTIVE_DATE = 'October 9, 2026';
 const ENTITY = 'Jay Wedgeworth, LLC d/b/a Congress.Trade';
 const CONTACT = 'support@congress.trade';
-
-/**
- * LEGALCOMPLIANCE-04: a product named "Congress.Trade" that carries a
- * bald-eagle mark needs an explicit, unmissable non-affiliation statement —
- * shown in the site footer, the legal-page footer, and ToS §1.  Keep this
- * string identical everywhere it appears so the disclaimer cannot drift.
- */
-const NOT_AFFILIATED_SENTENCE =
-  'Congress.Trade is an independent, privately operated service and is not affiliated with, endorsed by, or sponsored by the U.S. Congress, the U.S. House of Representatives, the U.S. Senate, the Office of Government Ethics, or any government agency.';
-
-/** Site-footer combined line (owner 2026-08-20).  Two spaces around each · and no trailing period. */
-const SITE_FOOTER_DISCLAIMER =
-  'Congress.Trade  ·  educational tool for public STOCK Act (2012) disclosures  ·  not financial advice  ·  $ estimated from brackets  ·  independent/private service not affiliated with or endorsed/sponsored by any government agency';
 
 /**
  * Shared legal chrome for /terms-of-service and /privacy-policy.
@@ -227,15 +216,15 @@ export const TOS_HTML = shell(
 
 <h2>2. Eligibility &amp; accounts</h2>
 <ul>
-<li>You must be at least 18 years old and able to form a binding contract.</li>
+<li>You must be at least 13 years old to use the Service.&nbsp; If you are under the legal age to enter a contract where you live, your parent or legal guardian must agree to these Terms on your behalf.</li>
 <li>You are responsible for the accuracy of your account information and for safeguarding your sign-in.&nbsp; Notify us promptly at <a href="mailto:${CONTACT}">${CONTACT}</a> of any unauthorized use.</li>
 <li>You are responsible for all activity under your account.</li>
 </ul>
 
 <h2>3. Subscriptions, billing &amp; trials</h2>
 <ul>
-<li>Premium is offered as an auto-renewing subscription: <strong>$5.00 / month</strong> or <strong>$50.00 / year</strong> (USD), plus any applicable taxes.&nbsp; The same Premium entitlement is available through the Congress.Trade website (billed by Stripe) or through the Congress.Trade iOS app (billed by Apple as an In-App Purchase); whichever you purchase through, the entitlement applies across both the website and the iOS app on your account.</li>
-<li>New subscriptions may include a free trial (currently 14 days / 2 weeks).&nbsp; If you do not cancel before the trial ends, the subscription renews and your payment method is charged.</li>
+<li>Premium is offered as an auto-renewing subscription: <strong>$8.99 / month</strong> or <strong>$79.99 / year</strong> (U.S. reference prices in USD), plus any applicable taxes.&nbsp; App Store prices in other countries and regions are shown in local currency at purchase.&nbsp; The same Premium entitlement is available through the Congress.Trade website (billed by Stripe) or through the Congress.Trade iOS app (billed by Apple as an In-App Purchase); whichever you purchase through, the entitlement applies across both the website and the iOS app on your account.</li>
+<li>Eligible new subscriptions may include a 1-week free trial.&nbsp; If you do not cancel before the trial ends, the subscription renews and your payment method is charged.</li>
 <li>Subscriptions <strong>automatically renew</strong> at the end of each billing period until canceled.&nbsp; You authorize recurring charges to your payment method.</li>
 <li>We may change prices or plan features; changes apply to the next billing period after reasonable notice.&nbsp; Continued use after a price change constitutes acceptance.</li>
 </ul>
@@ -349,7 +338,7 @@ export const PRIVACY_HTML = shell(
 <p>We operate from the United States, and our providers may process data in the U.S. and other countries.&nbsp; By using the Service, you understand your information may be transferred to and processed in the United States.</p>
 
 <h2>9. Children</h2>
-<p>The Service is not directed to, and may not be used by, anyone under 18.&nbsp; We do not knowingly collect personal information from children.</p>
+<p>The Service is not directed to, and may not be used by, children under 13.&nbsp; We do not knowingly collect personal information from children under 13.&nbsp; If you believe a child under 13 has provided personal information, contact ${CONTACT} so we can investigate and delete it.</p>
 
 <h2>10. Changes to this Policy</h2>
 <p>We may update this Policy from time to time.&nbsp; Material changes will be reflected by an updated effective date and, where appropriate, additional notice.</p>

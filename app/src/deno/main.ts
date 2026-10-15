@@ -20,12 +20,15 @@ import { withThirdPartyTelemetry } from '../shared/thirdPartyTelemetry.ts';
 import { resolveProductionSentryEnv } from '../shared/sentryRuntime.ts';
 import { datadogCaptureException, initProductionDatadog } from '../shared/datadog.ts';
 import { resolveProductionDatadogEnv } from '../shared/datadogRuntime.ts';
-import { captureException, initProductionSentry } from '#sentry';
+import { captureException, flushSentry, initProductionSentry } from '#sentry';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
+import { buildAdminMigrateStatements } from '../admin/migrateStatements.ts';
+import { executeAdminSchemaMigrations } from '../admin/schemaMigrationRunner.ts';
 import {
   clearCronTickOverrun,
+  isDenoCronTickHardDeadline,
   recordCronTickOverrun,
   tickOutcomeShouldRecord,
 } from '../shared/cronDeadlineSignal.ts';
@@ -150,7 +153,7 @@ const proxySecrets = await resolveSecrets(secretEnv, [
 const resolvedProxyUrl = resolveResidentialProxyUrl({
   ...secretEnv,
   ...proxySecrets,
-});
+}, { allowDefault: false });
 if (resolvedProxyUrl && cachedEnvValues) {
   cachedEnvValues['RESIDENTIAL_PROXY_URL'] = resolvedProxyUrl;
   console.log('Residential proxy initialized from Infisical for Senate/House scraping');
@@ -180,6 +183,37 @@ await applySqliteConnectionPragmas(libsqlClient);
 
 const dbShim = new D1DatabaseShim(libsqlClient);
 tursoDbShim = dbShim;
+
+function startupSchemaMigrateDisabled(): boolean {
+  const flag = Deno.env.get('CT_DISABLE_STARTUP_SCHEMA_MIGRATE')
+    ?? Deno.env.get('DENO_DISABLE_STARTUP_SCHEMA_MIGRATE');
+  return flag === '1' || flag === 'true' || flag === 'TRUE';
+}
+
+if (!startupSchemaMigrateDisabled()) {
+  try {
+    console.log('[startup] applying idempotent schema migrations…');
+    const migrateResult = await executeAdminSchemaMigrations(
+      dbShim as unknown as D1Database,
+      buildAdminMigrateStatements(),
+    );
+    if (migrateResult.failed.length > 0) {
+      console.error(
+        `[startup] schema migrate finished with ${migrateResult.failed.length} failed statement(s); ` +
+          'see [schema-migrate] logs',
+      );
+    } else {
+      console.log(
+        `[startup] schema migrate ok (applied=${migrateResult.applied.length}, ` +
+          `skipped=${migrateResult.skipped.length})`,
+      );
+    }
+  } catch (err) {
+    console.error('[startup] schema migrate threw:', (err as Error).message);
+  }
+} else {
+  console.log('[startup] schema migrate disabled (CT_DISABLE_STARTUP_SCHEMA_MIGRATE)');
+}
 const durableQueueDb = dbShim as unknown as D1Database;
 const ingestQueueShim = new DurableQueueAdapter<QueueMessage>(durableQueueDb, 'ingest');
 const deliveryQueueShim = new DurableQueueAdapter<QueueMessage>(durableQueueDb, 'delivery');
@@ -395,10 +429,18 @@ if (!costProfile.disableInternalCron) {
         if (hardTimeoutId !== undefined) clearTimeout(hardTimeoutId);
       }
     } catch (err) {
-      console.error('Deno cron tick caught error:', err);
-      captureException(err, { tags: { cron: 'deno-tick' } });
-      datadogCaptureException(err, { cron: 'deno-tick' });
       const message = err instanceof Error ? err.message : String(err);
+      const hardDeadline = isDenoCronTickHardDeadline(message);
+      if (hardDeadline) {
+        // Soft abort already stopped new work; the hard race is expected when a
+        // lane ignores the tick signal (CONGRESS-TRADE-1B).  Overrun KV + logs
+        // are enough — avoid a second Sentry exception on top of lane alerts.
+        console.warn('Deno cron tick hard deadline:', message);
+      } else {
+        console.error('Deno cron tick caught error:', err);
+        captureException(err, { tags: { cron: 'deno-tick' } });
+        datadogCaptureException(err, { cron: 'deno-tick' });
+      }
       try {
         await recordCronTickOverrun(buildEnv(), {
           deadlineMs: settings.getInt('CT_TICK_DEADLINE_MS', 45_000),
@@ -410,6 +452,9 @@ if (!costProfile.disableInternalCron) {
     } finally {
       tickInFlight = false;
       tickInFlightSinceMs = 0;
+      try {
+        await flushSentry(2000);
+      } catch {}
     }
   });
 
@@ -440,5 +485,11 @@ const portStr = Deno.env.get('PORT');
 const port = portStr ? parseInt(portStr, 10) : 5000;
 Deno.serve({ port }, async (req) => {
   const env = buildEnv();
-  return app.fetch(req, env, dummyCtx as any);
+  try {
+    return await app.fetch(req, env, dummyCtx as any);
+  } finally {
+    // Do not await: a 2s flush must not hold the HTTP response.  The
+    // long-lived Deno process keeps the envelope fetch alive.
+    void flushSentry(2000);
+  }
 });

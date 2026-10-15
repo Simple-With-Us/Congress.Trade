@@ -9,6 +9,7 @@ import {
   sentryLoggerWarn,
   type SentrySdkLike,
 } from '../../shared/sentryRuntime.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from '../../shared/sentryDataCollection.ts';
 import { SENTRY_FILTERED_VALUE, scrubSentryEvent } from '../../shared/sentryScrub.ts';
 
 function fakeSdk(overrides: Partial<SentrySdkLike> = {}): SentrySdkLike & {
@@ -48,6 +49,11 @@ describe('production Sentry init', () => {
     expect(options.environment).toBe('production');
     expect(options.tracesSampleRate).toBe(0.2);
     expect(options.sendDefaultPii).toBe(false);
+    expect(options.dataCollection).toEqual(NOT_LINKED_SENTRY_DATA_COLLECTION);
+    expect(typeof options.beforeSendSpan).toBe('function');
+    expect(typeof options.beforeSendMetric).toBe('function');
+    expect(options.enableLogs).toBe(true);
+    expect(options._flushInterval).toBe(1000);
     expect(typeof options.beforeSend).toBe('function');
     expect(Array.isArray(options.ignoreErrors)).toBe(true);
     expect(options.ignoreErrors).toEqual(expect.arrayContaining(['XRefEntryException']));
@@ -73,6 +79,19 @@ describe('production Sentry init', () => {
     });
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
+  });
+
+  it('flushes the SDK after init and no-ops before', async () => {
+    const flush = vi.fn(async () => true);
+    const sdk = fakeSdk({ flush });
+    const sentry = createSentryBindings(sdk);
+    expect(await sentry.flush(500)).toBe(false);
+    expect(flush).not.toHaveBeenCalled();
+    sentry.initProductionSentry({
+      SENTRY_DSN: 'https://key@o1.ingest.us.sentry.io/1',
+    });
+    await expect(sentry.flush(1500)).resolves.toBe(true);
+    expect(flush).toHaveBeenCalledWith(1500);
   });
 
   it('falls back to console.warn when Sentry is not initialized', () => {
@@ -245,7 +264,10 @@ describe('production entry wiring', () => {
     const src = readFileSync(resolve(process.cwd(), 'src/deno/main.ts'), 'utf8');
     expect(src).toContain('resolveProductionSentryEnv');
     expect(src).toContain('initProductionSentry');
+    expect(src).toContain('flushSentry');
     expect(src).toContain('captureException(err, { tags: { cron: \'deno-tick\' } })');
+    expect(src).toContain('isDenoCronTickHardDeadline(message)');
+    expect(src).not.toContain('/exceeded \\d+ms deadline/');
     expect(src).toContain('isExpectedPdfParseNoise');
     expect(src).toContain('sentryLoggerWarn');
     expect(src).not.toContain('sentryDummy');
