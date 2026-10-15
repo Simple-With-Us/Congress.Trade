@@ -107,14 +107,13 @@ describe('st_peer_prices stall detector', () => {
 
   it('alerts with pending ticker sample when pending set is idle beyond threshold', async () => {
     const { captureMessage } = await import('../../deno/sentry.ts');
-    seedTrade('JUNK1');
-    seedTrade('JUNK2');
+    for (let i = 1; i <= 6; i++) seedTrade(`JUNK${i}`);
     const stale = '2026-10-01T00:00:00.000Z';
-    db.prepare(
+    const stmt = db.prepare(
       `INSERT INTO securities_ref (ticker, price_checked_at, source)
-       VALUES ('JUNK1', ?, 'socratic'),
-              ('JUNK2', ?, 'socratic')`,
-    ).run(stale, stale);
+       VALUES (?, ?, 'socratic')`,
+    );
+    for (let i = 1; i <= 6; i++) stmt.run(`JUNK${i}`, stale);
 
     const now = new Date('2026-10-12T18:00:00.000Z');
     const result = await sweepPipelineStallAlerts(envWithDb(), now);
@@ -123,8 +122,54 @@ describe('st_peer_prices stall detector', () => {
       String(c[0]).includes('st_peer_prices'),
     );
     expect(msg?.[0]).toContain('JUNK1');
-    expect(msg?.[0]).toContain('JUNK2');
     expect(msg?.[0]).toContain('pending sample');
+  });
+
+  it('still stalls when pending tickers have stale bars while corpus MAX is fresh', async () => {
+    const { captureMessage } = await import('../../deno/sentry.ts');
+    seedTrade('STALE1');
+    const staleChecked = '2026-10-01T00:00:00.000Z';
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
+       VALUES ('STALE1', '2026-10-01', ?, 'socratic')`,
+    ).run(staleChecked);
+    seedTrade('FRESH');
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
+       VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 1)`,
+    ).run();
+
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.alerted).toContain('st_peer_prices');
+    const msg = (captureMessage as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+      String(c[0]).includes('st_peer_prices'),
+    );
+    expect(msg?.[0]).toContain('STALE1');
+  });
+
+  it('does not stall on a tiny tail when corpus EOD is current through lastTradingDay', async () => {
+    seedTrade('TAIL1');
+    seedTrade('TAIL2');
+    const stale = '2026-10-01T00:00:00.000Z';
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, price_checked_at, source)
+       VALUES ('TAIL1', ?, 'socratic'),
+              ('TAIL2', ?, 'socratic')`,
+    ).run(stale, stale);
+    seedTrade('FRESH');
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
+       VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
+    ).run();
+
+    const now = new Date('2026-10-12T18:00:00.000Z');
+    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    expect(result.evaluated).toContain('st_peer_prices');
+    expect(result.alerted).not.toContain('st_peer_prices');
   });
 
   it('does not stall when pending tickers were never price-checked', async () => {

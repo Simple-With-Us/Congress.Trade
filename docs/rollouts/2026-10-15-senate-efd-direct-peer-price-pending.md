@@ -4,7 +4,7 @@
 
 CT-2361: Senate PTR discovery no longer implicitly routes through the dead GL.iNet Mango default (`10.99.0.2:8888`).  The watcher tries direct datacenter egress with bounded backoff, then only an **explicit** `RESIDENTIAL_PROXY_URL` / `SENATE_PROXY_URL`.  A cached direct `GET /search/` probe (`senate_efd` on `/api/health`) runs each watcher tick.
 
-CT-2408: `selectTickersNeedingPrices` and the `st_peer_prices` stall detector now share `buildPeerPricePendingSql`, and tickers with a fresh-looking `latest_price_date` but **no** `price_eod` rows are re-selected for pricing (regression test added).  #2724/#2726 addressed stall false positives; this closes the metadata-without-EOD gap.
+CT-2408: `selectTickersNeedingPrices` and the `st_peer_prices` stall detector now share `stPeerPricePendingFromSql`, and tickers with a fresh-looking `latest_price_date` but **no** `price_eod` rows are re-selected for pricing (regression test added).  #2724/#2726 addressed stall false positives; this closes the metadata-without-EOD gap.
 
 No dead-letter queue requeue was performed.
 
