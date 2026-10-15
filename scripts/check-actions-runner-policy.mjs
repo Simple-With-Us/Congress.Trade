@@ -1,5 +1,13 @@
 import { readdir, readFile } from "node:fs/promises";
 
+/** default-main-protection ruleset on Simple-With-Us/Congress.Trade */
+const MAIN_RULESET_ID = "20961339";
+const REQUIRED_MAIN_STATUS_CHECKS = [
+  "typecheck + test",
+  "gitleaks",
+  "xcodebuild (unsigned)",
+];
+
 const workflowsDir = new URL("../.github/workflows/", import.meta.url);
 const workflowNames = (await readdir(workflowsDir))
   .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))
@@ -127,6 +135,47 @@ if (!xctest.includes("-only-testing:CongressTradeTests")) {
 if (!xctest.includes("IOS_CI_MIN_TESTS:-71") && !xctest.includes("-lt \"$MIN_TESTS\"")) {
   errors.push("scripts/ios-ci-xctest.sh: must assert at least 71 XCTest cases ran");
 }
+
+async function assertMainRulesetRequiredChecks() {
+  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const repo = process.env.GITHUB_REPOSITORY;
+  if (!token || !repo) {
+    console.log(
+      "Ruleset check skipped (no GITHUB_TOKEN/GH_TOKEN or GITHUB_REPOSITORY); CI must set both.",
+    );
+    return;
+  }
+
+  const url = `https://api.github.com/repos/${repo}/rulesets/${MAIN_RULESET_ID}`;
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!response.ok) {
+    errors.push(
+      `ruleset ${MAIN_RULESET_ID}: API ${response.status} — cannot verify required status checks`,
+    );
+    return;
+  }
+
+  const ruleset = await response.json();
+  const rule = (ruleset.rules ?? []).find((entry) => entry.type === "required_status_checks");
+  const contexts = (rule?.parameters?.required_status_checks ?? []).map(
+    (entry) => entry.context,
+  );
+  for (const required of REQUIRED_MAIN_STATUS_CHECKS) {
+    if (!contexts.includes(required)) {
+      errors.push(
+        `ruleset ${MAIN_RULESET_ID}: required status check missing "${required}" (have: ${contexts.join(", ") || "(none)"})`,
+      );
+    }
+  }
+}
+
+await assertMainRulesetRequiredChecks();
 
 if (errors.length) {
   console.error(errors.join("\n"));
