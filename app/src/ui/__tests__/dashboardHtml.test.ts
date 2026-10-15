@@ -13,7 +13,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { parse } from 'node-html-parser';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
-import { SEMANTIC_LIGHT, WCAG_AA_NORMAL_TEXT, contrastRatio } from '../semanticThemeTokens.ts';
+import {
+  SEMANTIC_DARK_NEG,
+  SEMANTIC_LIGHT,
+  WCAG_AA_NORMAL_TEXT,
+  contrastRatio,
+} from '../semanticThemeTokens.ts';
 import { browserSecurityHeaders } from '../../security/headers.ts';
 import { MAX_PUBLIC_TX_OFFSET } from '../../security/botDefense.ts';
 
@@ -100,6 +105,11 @@ describe('light-mode semantic text contrast (CT-1356)', () => {
   it('does not leave bright dark-theme --good on light surfaces (regression)', () => {
     expect(contrastRatio('#34d399', '#ffffff')).toBeLessThan(WCAG_AA_NORMAL_TEXT);
     expect(contrastRatio(SEMANTIC_LIGHT.good, '#ffffff')).toBeGreaterThanOrEqual(WCAG_AA_NORMAL_TEXT);
+  });
+
+  it('wires dark --neg to SEMANTIC_DARK_NEG for AA status text on panel-2', () => {
+    expect(DASHBOARD_HTML).toContain(`--neg:       ${SEMANTIC_DARK_NEG};`);
+    expect(DASHBOARD_HTML).toContain('html[data-theme="light"] .tag.E { color: #fff; }');
   });
 });
 

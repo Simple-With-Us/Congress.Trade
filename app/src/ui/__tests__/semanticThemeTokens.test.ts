@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   SEMANTIC_DARK,
+  SEMANTIC_DARK_NEG,
   SEMANTIC_LIGHT,
   WCAG_AA_NORMAL_TEXT,
   contrastRatio,
+  darkNegativeTextContrastCases,
   lightSemanticTextContrastCases,
 } from '../semanticThemeTokens.ts';
 
@@ -29,10 +31,19 @@ describe('semanticThemeTokens (CT-1356)', () => {
     expect(SEMANTIC_LIGHT.good).toBe('#166534');
   });
 
-  it('does not change dark semantic hues', () => {
+  it('keeps dark pill chrome hues; --neg is lighter sell ink for status text', () => {
     expect(SEMANTIC_DARK.good).toBe('#34d399');
     expect(SEMANTIC_DARK.buy).toBe('#22c55e');
     expect(SEMANTIC_DARK.sell).toBe('#ef4444');
     expect(SEMANTIC_DARK.warn).toBe('#f59e0b');
+    expect(SEMANTIC_DARK_NEG).toBe('#f87d80');
+  });
+
+  it('dark --neg text meets 4.5:1 on every dark panel surface and sell-tint mix', () => {
+    const cases = darkNegativeTextContrastCases();
+    const failures = cases.filter((c) => c.ratio < WCAG_AA_NORMAL_TEXT);
+    expect(failures).toEqual([]);
+    expect(contrastRatio(SEMANTIC_DARK.sell, '#172440')).toBeLessThan(WCAG_AA_NORMAL_TEXT);
+    expect(contrastRatio(SEMANTIC_DARK_NEG, '#172440')).toBeGreaterThanOrEqual(WCAG_AA_NORMAL_TEXT);
   });
 });

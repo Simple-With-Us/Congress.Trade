@@ -14,7 +14,7 @@ export type SemanticTokenSet = {
   good: string;
 };
 
-/** Dark theme (:root) — unchanged for CT-1356. */
+/** Dark theme (:root) — pill/fill chrome and general sell ink. */
 export const SEMANTIC_DARK: SemanticTokenSet = {
   buy: '#22c55e',
   sell: '#ef4444',
@@ -22,6 +22,9 @@ export const SEMANTIC_DARK: SemanticTokenSet = {
   warn: '#f59e0b',
   good: '#34d399',
 };
+
+/** Dark theme negative **text** (`--neg`): lighter than `--sell` so 12–14px status lines pass 4.5:1 on `--panel-2`. */
+export const SEMANTIC_DARK_NEG = '#f87d80';
 
 /** Light theme (html[data-theme="light"]). */
 export const SEMANTIC_LIGHT: SemanticTokenSet = {
@@ -40,6 +43,15 @@ export const LIGHT_SEMANTIC_TEXT_SURFACES = [
 
 /** Background mix percentages where semantic ink sits on a same-hue tint. */
 export const LIGHT_SEMANTIC_TINT_PERCENTAGES = [6, 8, 12, 13, 14, 16, 18] as const;
+
+export const DARK_SEMANTIC_TEXT_SURFACES = [
+  '#080c17',
+  '#0e1626',
+  '#121b30',
+  '#172440',
+] as const;
+
+export const DARK_SEMANTIC_TINT_PERCENTAGES = LIGHT_SEMANTIC_TINT_PERCENTAGES;
 
 function hexToRgb(hex: string): [number, number, number] {
   const h = hex.replace('#', '');
@@ -99,6 +111,21 @@ export function lightSemanticTextContrastCases(
         const surface = mixSrgb(fg, bg, pct);
         cases.push({ token, foreground: fg, background: surface, ratio: contrastRatio(fg, surface) });
       }
+    }
+  }
+  return cases;
+}
+
+/** Dark-mode `--neg` ink on panels and same-hue tinted backgrounds (status/error text). */
+export function darkNegativeTextContrastCases(neg: string = SEMANTIC_DARK_NEG): SemanticContrastCase[] {
+  const cases: SemanticContrastCase[] = [];
+  for (const bg of DARK_SEMANTIC_TEXT_SURFACES) {
+    cases.push({ token: 'sell', foreground: neg, background: bg, ratio: contrastRatio(neg, bg) });
+  }
+  for (const pct of DARK_SEMANTIC_TINT_PERCENTAGES) {
+    for (const bg of ['#121b30', '#172440'] as const) {
+      const surface = mixSrgb(neg, bg, pct);
+      cases.push({ token: 'sell', foreground: neg, background: surface, ratio: contrastRatio(neg, surface) });
     }
   }
   return cases;

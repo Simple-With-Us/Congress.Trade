@@ -33,7 +33,7 @@
 import { benchmarkSelectableCatalog } from '../benchmark/settings.ts';
 import { executiveTitleForms } from '../shared/executiveTitles.ts';
 import { MAX_PUBLIC_TX_OFFSET } from '../security/botDefense.ts';
-import { SEMANTIC_LIGHT } from './semanticThemeTokens.ts';
+import { SEMANTIC_DARK, SEMANTIC_DARK_NEG, SEMANTIC_LIGHT } from './semanticThemeTokens.ts';
 
 /**
  * Filing Latency Comparison ("speed proof") section markup, shared between its
@@ -183,13 +183,13 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     --text-dim:  #b8c7dd;
     --icon-grey: #9ca3af; /* medium grey for header hamburger + info glyphs (dark theme) */
     --accent:    #4f8cff;
-    --buy:       #22c55e;
-    --sell:      #ef4444;
-    --exch:      #eab308;
-    --warn:      #f59e0b;
-    --good:      #34d399;
+    --buy:       ${SEMANTIC_DARK.buy};
+    --sell:      ${SEMANTIC_DARK.sell};
+    --exch:      ${SEMANTIC_DARK.exch};
+    --warn:      ${SEMANTIC_DARK.warn};
+    --good:      ${SEMANTIC_DARK.good};
     --pos:       var(--good);
-    --neg:       var(--sell);
+    --neg:       ${SEMANTIC_DARK_NEG};
     /* Party dots (replaces the old donkey/elephant/eagle glyphs everywhere a
        member's party is shown — filter chips, drawers, Trends): red for
        Republican, blue for Democrat, purple for Independent/Other. Same
@@ -748,6 +748,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   html[data-theme="dark"] .tag.B, html[data-theme="dark"] .tag.P { color: #080c17; }
   .tag.S { background: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--sell) 30%, transparent); }
   .tag.E { background: linear-gradient(135deg, var(--exch), color-mix(in srgb, var(--exch) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--exch) 30%, transparent); color: #080c17; }
+  html[data-theme="light"] .tag.E { color: #fff; }
   .conf { font-family: var(--mono); font-size: 12px; }
   .conf.hi { color: var(--good); } .conf.mid { color: var(--warn); } .conf.lo { color: var(--sell); }
   .muted { color: var(--text-dim); }
