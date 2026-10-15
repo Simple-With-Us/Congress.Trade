@@ -15,6 +15,7 @@
  */
 
 import { OG_IMAGE_VERSION } from './assets.ts';
+import { withOgShareDisclaimer } from './disclaimers.ts';
 
 export type OgContext = 'default' | 'trends' | 'company' | 'politician' | 'trade';
 
@@ -37,8 +38,9 @@ export type OgMeta = {
 };
 
 export const SITE = 'https://congress.trade';
-const DEFAULT_DESC =
-  'We ingest and publish official House & Senate STOCK Act disclosures ourselves — a live congressional stock-trade feed, not a wrapper around one third-party API.';
+const DEFAULT_DESC = withOgShareDisclaimer(
+  'We ingest and publish public House, Senate, and Executive Branch STOCK Act disclosures ourselves — a live financial-disclosure feed, not a wrapper around one third-party API.',
+);
 
 function imagePath(context: OgContext): string {
   switch (context) {
@@ -195,7 +197,7 @@ export function resolveOgMeta(
       context: 'politician',
       title: heading,
       pageTitle: pageTitleFor(heading, false),
-      description: `Trading activity for ${heading} on Congress.Trade.`,
+      description: withOgShareDisclaimer(`Trading activity for ${heading} on Congress.Trade.`),
       url: pageUrl,
       imageUrl: absImage('politician'),
       imageAlt:
@@ -209,7 +211,7 @@ export function resolveOgMeta(
       context: 'company',
       title: ticker,
       pageTitle: pageTitleFor(ticker, false),
-      description: `Disclosed trades in ${ticker} on Congress.Trade.`,
+      description: withOgShareDisclaimer(`Disclosed trades in ${ticker} on Congress.Trade.`),
       url: pageUrl,
       imageUrl: absImage('company'),
       imageAlt:
@@ -232,9 +234,10 @@ export function resolveOgMeta(
       context: 'trade',
       title: heading,
       pageTitle: pageTitleFor(heading, false),
-      description:
+      description: withOgShareDisclaimer(
         `${who}${verbCased} ${s.assetLabel} for ${s.amountBracket}, disclosed ${s.txDateLabel} ` +
-        'under the STOCK Act — Congress.Trade.',
+          'under the STOCK Act — Congress.Trade.',
+      ),
       url: pageUrl,
       imageUrl: absImage('trade'),
       imageAlt:
@@ -248,8 +251,9 @@ export function resolveOgMeta(
       context: 'trends',
       title: 'Trends',
       pageTitle: pageTitleFor('Trends', false),
-      description:
+      description: withOgShareDisclaimer(
         'Trading trends — volume, consensus moves, sectors, and disclosure lag on Congress.Trade.',
+      ),
       url: pageUrl,
       imageUrl: absImage('trends'),
       imageAlt:
@@ -286,7 +290,7 @@ export function resolveOgMeta(
       context: 'default',
       title,
       pageTitle: pageTitleFor(title, false),
-      description,
+      description: withOgShareDisclaimer(description),
       url: pageUrl,
       imageUrl: absImage('default'),
       imageAlt:

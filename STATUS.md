@@ -1,5 +1,9 @@
 # Current Handoff
 
+## 2026-10-15 CURSOR — Socratic-Trade push receipt (ST-3846)
+
+`shareWithPeer` sends `x-push-id` and reads the delivered and consumed acks.  A 200 without those acks is not a successful push.  Sentry warns and the admin email is throttled (`peer-push-missing-ack`).  The receiver is Socratic-Trade branch `cursor/ct-push-receipt-2155`.  Do not mark ST-3846 completed until both pulls merge.  Rollout: `docs/rollouts/2026-10-15-st-push-receipt.md`.
+
 ## 2026-10-11 CODEX — Kody Direct MiniMax (CTS-330)
 
 Kody uses `MiniMax-M3` through MiniMax’s direct OpenAI-compatible endpoint with the existing MiniMax key.  The helper uses native M3 non-thinking mode to avoid answer truncation and passed a synthetic live edit canary plus 71 offline tests.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
