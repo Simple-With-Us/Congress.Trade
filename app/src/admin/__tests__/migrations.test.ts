@@ -886,19 +886,18 @@ describe('admin migration bootstrap', () => {
     const statements: string[] = [];
     const db = {
       prepare(sql: string) {
-        return {
-          bind() { return this; },
+        const stmt = {
+          bind() { return stmt; },
           async run() { statements.push(sql); return { success: true, meta: { changes: 1 } }; },
           async all() {
-            if (/PRAGMA\s+table_info/i.test(sql)) {
-              return { results: [], success: true };
-            }
             return { results: [], success: true };
           },
           async first() {
+            if (/sqlite_master/i.test(sql)) return null;
             return null;
           },
         };
+        return stmt;
       },
     } as unknown as D1Database;
 

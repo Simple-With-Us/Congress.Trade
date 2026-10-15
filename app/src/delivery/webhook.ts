@@ -506,7 +506,7 @@ async function deliverToSubscription(
     env.DB,
     'UPDATE subscriptions SET cursor = ? WHERE id = ? AND cursor < ?',
     [tx.cursorSeq, sub.id, tx.cursorSeq],
-  ).catch((err) => console.warn('dispatchWebhook: cursor update failed', sub.id, (err as Error).message));
+  ).catch((err) => console.warn('dispatchWebhook: cursor update failed', (err as Error).message));
 }
 
 type DeliveryClaim =
@@ -528,7 +528,7 @@ async function markDeliverySkipped(env: Env, subscriptionId: string, txId: strin
      ON CONFLICT (subscription_id, tx_id) DO NOTHING`,
     [prefixedId('dlv'), subscriptionId, txId, new Date().toISOString()],
   ).catch((err) =>
-    console.warn('markDeliverySkipped failed', subscriptionId, txId, (err as Error).message),
+    console.warn('markDeliverySkipped failed', (err as Error).message),
   );
 }
 

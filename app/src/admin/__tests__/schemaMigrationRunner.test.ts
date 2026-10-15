@@ -5,6 +5,7 @@ import {
   executeAdminSchemaMigrations,
   isIdempotentMigrationError,
 } from '../schemaMigrationRunner.ts';
+import { BASE_SCHEMA_STATEMENTS } from '../migrations.ts';
 import { PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS } from '../migrations.ts';
 import { markTickerPriceUnavailable } from '../../prices/service.ts';
 import type { Env } from '../../shared/types.ts';
@@ -59,6 +60,17 @@ describe('schemaMigrationRunner', () => {
 
     afterEach(() => close());
 
+    it('skips when securities_ref does not exist yet', async () => {
+      const emptyDb = new (await import('node:sqlite')).DatabaseSync(':memory:');
+      const emptyD1 = d1Database(emptyDb);
+      try {
+        const result = await ensureSqliteColumn(emptyD1, 'securities_ref', 'price_unavailable_reason', 'TEXT');
+        expect(result).toBe('skipped');
+      } finally {
+        emptyDb.close();
+      }
+    });
+
     it('adds price_unavailable_reason when missing', async () => {
       const first = await ensureSqliteColumn(d1, 'securities_ref', 'price_unavailable_reason', 'TEXT');
       expect(first).toBe('added');
@@ -104,6 +116,17 @@ describe('schemaMigrationRunner', () => {
       const cols = db.prepare('PRAGMA table_info(securities_ref)').all() as Array<{ name: string }>;
       expect(cols.some((c) => c.name === 'price_unavailable_reason')).toBe(true);
       expect(result.skipped.length + result.applied.length).toBeGreaterThan(0);
+    });
+
+    it('does not fail on an empty database before CREATE TABLE statements run', async () => {
+      const emptyDb = new (await import('node:sqlite')).DatabaseSync(':memory:');
+      const emptyD1 = d1Database(emptyDb);
+      try {
+        const result = await executeAdminSchemaMigrations(emptyD1, [...BASE_SCHEMA_STATEMENTS]);
+        expect(result.failed).toHaveLength(0);
+      } finally {
+        emptyDb.close();
+      }
     });
   });
 });
