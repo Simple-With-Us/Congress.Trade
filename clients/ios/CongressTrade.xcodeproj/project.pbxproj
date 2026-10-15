@@ -38,8 +38,8 @@
 		DB4A9A138AEC40157B8DDE3F /* KeychainTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCABF812047DBA489A1CEE3B /* KeychainTokenStore.swift */; };
 		DE6C69EB41A053D93631BBAB /* EagleSplashView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1939539E64C47D229BA5B405 /* EagleSplashView.swift */; };
 		E10C86050E64AF4C74F95F8F /* PremiumSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9A917373D55B3A8D9D05CDB /* PremiumSheet.swift */; };
-		E9A8D71944BCB023B677EE5F /* SeeAllTradesHandoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF3DF9988CC13699D08F373 /* SeeAllTradesHandoff.swift */; };
 		E4A9BCCA0D7B029E6BE92CC5 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 4F5EE103A6EDDC2AD3034435 /* PrivacyInfo.xcprivacy */; };
+		E9A8D71944BCB023B677EE5F /* SeeAllTradesHandoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF3DF9988CC13699D08F373 /* SeeAllTradesHandoff.swift */; };
 		EEA8085F9159BE7218AE0CEC /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AE2059172121EBE601E63405 /* Assets.xcassets */; };
 		F357D380C3C7579E81EEC12C /* AppUpdatePrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6E566E6BEBEFF8D5FB1A265 /* AppUpdatePrompt.swift */; };
 		F6024A981EC57B59E8E940E7 /* AppleSignIn.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48F558FD5F7F57175BD1B8D0 /* AppleSignIn.swift */; };
@@ -442,8 +442,8 @@
 				0DC3DE29A9E85DA255EC7F8D /* PeopleDirectoryView.swift in Sources */,
 				C2449E524C2E025623BCA167 /* PoliticianDetailView.swift in Sources */,
 				E10C86050E64AF4C74F95F8F /* PremiumSheet.swift in Sources */,
-				E9A8D71944BCB023B677EE5F /* SeeAllTradesHandoff.swift in Sources */,
 				D10A2276A5D67E5847C43234 /* PushNotificationManager.swift in Sources */,
+				E9A8D71944BCB023B677EE5F /* SeeAllTradesHandoff.swift in Sources */,
 				5C311D25040A164B751721AD /* SentryTelemetry.swift in Sources */,
 				39DB62AB8DDF6A793CC85212 /* SettingsView.swift in Sources */,
 				2C4A62E17A2B5A42FB5581C5 /* TickerDetailView.swift in Sources */,
