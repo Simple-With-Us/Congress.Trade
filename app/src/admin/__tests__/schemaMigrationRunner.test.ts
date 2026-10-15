@@ -59,6 +59,15 @@ describe('schemaMigrationRunner', () => {
 
     afterEach(() => close());
 
+    it('skips add when the target table does not exist yet', async () => {
+      const empty = await import('node:sqlite') as { DatabaseSync: new (path: string) => SqliteDatabase };
+      const emptyDb = new empty.DatabaseSync(':memory:');
+      const emptyD1 = d1Database(emptyDb);
+      const status = await ensureSqliteColumn(emptyD1, 'securities_ref', 'price_unavailable_reason', 'TEXT');
+      expect(status).toBe('skipped');
+      emptyDb.close();
+    });
+
     it('adds price_unavailable_reason when missing', async () => {
       const first = await ensureSqliteColumn(d1, 'securities_ref', 'price_unavailable_reason', 'TEXT');
       expect(first).toBe('added');
@@ -104,6 +113,25 @@ describe('schemaMigrationRunner', () => {
       const cols = db.prepare('PRAGMA table_info(securities_ref)').all() as Array<{ name: string }>;
       expect(cols.some((c) => c.name === 'price_unavailable_reason')).toBe(true);
       expect(result.skipped.length + result.applied.length).toBeGreaterThan(0);
+    });
+
+    it('skips guarded securities_ref preflight on an empty database then applies CREATE/ALTER', async () => {
+      const sqlite = (await import('node:sqlite')) as { DatabaseSync: new (path: string) => SqliteDatabase };
+      const emptyDb = new sqlite.DatabaseSync(':memory:');
+      const emptyD1 = d1Database(emptyDb);
+      const bootstrap = [
+        `CREATE TABLE IF NOT EXISTS securities_ref (
+           ticker TEXT PRIMARY KEY,
+           price_unavailable INTEGER NOT NULL DEFAULT 0,
+           price_checked_at TEXT
+         )`,
+        ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+      ];
+      const result = await executeAdminSchemaMigrations(emptyD1, bootstrap);
+      expect(result.failed).toHaveLength(0);
+      const cols = emptyDb.prepare('PRAGMA table_info(securities_ref)').all() as Array<{ name: string }>;
+      expect(cols.some((c) => c.name === 'price_unavailable_reason')).toBe(true);
+      emptyDb.close();
     });
   });
 });

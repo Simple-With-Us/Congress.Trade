@@ -1,4 +1,4 @@
-import { all, run } from '../shared/db.ts';
+import { all, get, run } from '../shared/db.ts';
 
 export const MIGRATE_IDEMPOTENT_ERROR_PATTERNS: readonly RegExp[] = [
   /duplicate column name/i,
@@ -16,14 +16,26 @@ const SAFE_SQL_IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
  * relying on duplicate-column errors alone when new code paths run before
  * POST /api/admin/migrate (Coolify auto-deploy does not call ship.sh).
  */
+async function sqliteTableExists(db: D1Database, table: string): Promise<boolean> {
+  const row = await get<{ name: string }>(
+    db,
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`,
+    [table],
+  );
+  return row !== null;
+}
+
 export async function ensureSqliteColumn(
   db: D1Database,
   table: string,
   column: string,
   columnDef: string,
-): Promise<'added' | 'present'> {
+): Promise<'added' | 'present' | 'skipped'> {
   if (!SAFE_SQL_IDENTIFIER.test(table) || !SAFE_SQL_IDENTIFIER.test(column)) {
     throw new Error(`unsafe SQLite identifier: ${table}.${column}`);
+  }
+  if (!(await sqliteTableExists(db, table))) {
+    return 'skipped';
   }
   const rows = await all<{ name: string }>(db, `PRAGMA table_info("${table}")`);
   if (rows.some((row) => row.name === column)) return 'present';
