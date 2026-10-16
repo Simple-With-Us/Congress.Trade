@@ -87,10 +87,10 @@ describe('collapseDuplicateSpans', () => {
     expect(result.rows.slice(0, 33).map((r) => r.assetName)).toEqual(singles.map((r) => r.assetName));
   });
 
-  it('keeps short adjacent repeats -- a filing may disclose the same trade twice', () => {
+  it('keeps short adjacent repeats -- a filing may legitimately disclose identical lots up to threshold', () => {
     const rows = [...distinct(2), ...flood(DUPLICATE_RUN_THRESHOLD)];
     const result = collapseDuplicateSpans(rows, 'local_mac');
-    expect(result.rows).toHaveLength(5);
+    expect(result.rows).toHaveLength(2 + DUPLICATE_RUN_THRESHOLD);
     expect(result.removed).toBe(0);
     expect(result.runs).toEqual([]);
   });

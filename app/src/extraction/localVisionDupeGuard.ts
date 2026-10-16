@@ -22,11 +22,12 @@ import { transactionRowKey } from './normalizer.ts';
 import type { ParsedTx, TxSource } from '../shared/types.ts';
 
 /**
- * Runs of this length or longer collapse to their first row. Set above any
- * plausible genuine repeat (same security, same day, same bracket, adjacent
- * lines) and far below the 251 seen in the wild.
+ * Runs strictly longer than this threshold collapse to their first row. Set
+ * to 5 so legitimate multi-lot filings (e.g. 2-5 lots across family trusts,
+ * 529 plans, or partial executions) are preserved, while looping extraction
+ * floods (such as the 251 identical rows in H-2026-9116378) are collapsed.
  */
-export const DUPLICATE_RUN_THRESHOLD = 3;
+export const DUPLICATE_RUN_THRESHOLD = 5;
 
 export interface DuplicateSpanRun {
   /** Fourth rowKey segment shared by the whole run. */
