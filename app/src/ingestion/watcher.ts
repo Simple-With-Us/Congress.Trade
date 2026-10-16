@@ -622,6 +622,8 @@ const HOUSE_PRIOR_YEAR_KV_KEY = 'house_prior_year:last_fetch_at';
  *  bulk-XML window. Escalate to console.error (Sentry-visible) once per
  *  sustained outage window instead of warn-spam that nobody sees. */
 const HOUSE_LIVE_SEARCH_FAILS_KV_KEY = 'house_live_search:consecutive_failures';
+const HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY = 'house_live_search:last_fetch_at';
+const HOUSE_LIVE_SEARCH_FETCH_INTERVAL_MS = 1800_000;
 const HOUSE_LIVE_SEARCH_ESCALATE_EVERY = 12;
 
 /**
@@ -645,7 +647,12 @@ export function inHousePriorYearWindow(now: Date, overlapDays: number): boolean 
  * Poll the House yearly bulk index, diff against D1, enqueue new PTRs.
  * Throws on any failure (caught by the per-source guard in runWatcher).
  */
-async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<number> {
+async function pollHouse(
+  env: Env,
+  now: Date,
+  signal?: AbortSignal,
+  tickSignal?: AbortSignal,
+): Promise<number> {
   const nowIso = now.toISOString();
   const year = Number(
     new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric' }).format(now),
@@ -660,10 +667,11 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
   }
 
   // YEAR-BOUNDARY GAP: for the first N days of a new ET year, also sweep the
-  // PRIOR year's index (hourly, not every poll). A PTR filed Dec 30 can enter
+  // PRIOR year's index (hourly, not every poll).  A PTR filed Dec 30 can enter
   // the {YEAR-1}FD index days later — after we've switched to polling {YEAR} —
-  // and would otherwise never be discovered. Fail-soft: a prior-year fetch
-  // problem must not fail the current-year poll.
+  // and would otherwise never be discovered.  Fail-soft: a prior-year fetch
+  // problem (including a per-source 7s timeout after current-year succeeded)
+  // must not fail the current-year poll unless the outer tickSignal aborted.
   const overlapDays = await tunableInt(
     env,
     'HOUSE_PRIOR_YEAR_OVERLAP_DAYS',
@@ -683,57 +691,78 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
         if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_PRIOR_YEAR_KV_KEY, nowIso);
       }
     } catch (err) {
-      if (signal?.aborted) throw err;
+      if (tickSignal?.aborted) throw err;
       console.warn('watcher: house prior-year index poll failed (current year unaffected):', (err as Error).message);
     }
   }
 
-  // Intraday overlay: catch same-day PTRs that the daily XML hasn't picked up
-  // yet. Fail-soft — a flaky/anti-bot live endpoint must never break the stable
-  // bulk path. INSERT OR IGNORE de-dupes the overlap with the bulk rows above.
+  // Intraday live-search overlay: throttled to at most once every 30 minutes
+  // (house_live_search:last_fetch_at) so it stays active without competing with
+  // the 1-minute 8:00 AM Central bulk-ZIP peak polls.  Fail-soft — a flaky live
+  // endpoint or per-source timeout after the current-year bulk XML has already
+  // been fetched must never discard the bulk rows above unless the outer
+  // tickSignal aborted.
   if (await houseLiveSearchEnabled(env)) {
-    let liveErr: Error | null = null;
+    let liveDue = true;
     try {
-      const live = await pollHouseLiveSearch(year, fetch, { env, signal });
-      for (const f of live) {
-        if (!byDoc.has(f.pipelineDocId)) {
-          byDoc.set(f.pipelineDocId, houseDiscovery(f));
-        }
+      const lastLiveIso = env.CONFIG_KV ? await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY) : null;
+      const lastLiveMs = lastLiveIso ? Date.parse(lastLiveIso) : NaN;
+      if (Number.isFinite(lastLiveMs) && now.getTime() - lastLiveMs < HOUSE_LIVE_SEARCH_FETCH_INTERVAL_MS) {
+        liveDue = false;
       }
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      liveErr = err as Error;
+    } catch {
+      liveDue = true;
     }
-    // Consecutive-failure counter — fully isolated in its own try/catch. A KV
-    // blip here must never (a) fall into the poll's failure path and record a
-    // live-search *success* as a failure, nor (b) escape and abort the
-    // authoritative bulk persist/enqueue below. The observability overlay is
-    // strictly best-effort; the bulk path is not.
-    let fails = liveErr ? 1 : 0;
-    try {
-      if (env.CONFIG_KV) {
-        if (!liveErr) {
-          const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
-          if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
-        } else {
-          fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
-          await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+
+    if (liveDue) {
+      let liveErr: Error | null = null;
+      try {
+        const live = await pollHouseLiveSearch(year, fetch, { env, signal });
+        for (const f of live) {
+          if (!byDoc.has(f.pipelineDocId)) {
+            byDoc.set(f.pipelineDocId, houseDiscovery(f));
+          }
         }
+        try {
+          if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY, nowIso);
+        } catch {
+          // Best-effort throttle timestamp
+        }
+      } catch (err) {
+        if (tickSignal?.aborted) throw err;
+        liveErr = err as Error;
       }
-    } catch (counterErr) {
-      console.warn(
-        'watcher: house live-search failure-counter update failed (ignored):',
-        (counterErr as Error).message,
-      );
-    }
-    if (liveErr) {
-      if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
-        console.error(
-          `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
-          liveErr.message,
+      // Consecutive-failure counter — fully isolated in its own try/catch. A KV
+      // blip here must never (a) fall into the poll's failure path and record a
+      // live-search *success* as a failure, nor (b) escape and abort the
+      // authoritative bulk persist/enqueue below. The observability overlay is
+      // strictly best-effort; the bulk path is not.
+      let fails = liveErr ? 1 : 0;
+      try {
+        if (env.CONFIG_KV) {
+          if (!liveErr) {
+            const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
+            if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
+          } else {
+            fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
+            await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+          }
+        }
+      } catch (counterErr) {
+        console.warn(
+          'watcher: house live-search failure-counter update failed (ignored):',
+          (counterErr as Error).message,
         );
-      } else {
-        console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
+      }
+      if (liveErr) {
+        if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
+          console.error(
+            `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
+            liveErr.message,
+          );
+        } else {
+          console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
+        }
       }
     }
   }
@@ -1062,7 +1091,7 @@ export async function runWatcher(
         await setLastAttemptAt(env, 'house', now);
         // Fresh 7s budget per source.  A timer created once at tick entry
         // would already be spent by the time Senate and OGE run.
-        await pollHouse(env, now, watcherSourceIoSignal(options.signal));
+        await pollHouse(env, now, watcherSourceIoSignal(options.signal), options.signal);
         result.house = 'success';
       }
     }

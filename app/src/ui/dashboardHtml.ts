@@ -11419,8 +11419,7 @@ function isLatencyComparisonPublic(p) {
   if (p.coverageIntegrity === 'contradiction') return false;
   return true;
 }
-/* FMP latency probes are admin-visible but excluded from public marketing until
-   we trust the feed (owner 2026-10-04). */
+/* FMP latency provider helper retained for compatibility with test extractors. */
 function isFmpLatencyProvider(p) {
   var id = String((p && p.id) || '');
   return id === 'fmp' || id.indexOf('fmp') === 0;
@@ -11428,7 +11427,7 @@ function isFmpLatencyProvider(p) {
 /* Single filter for every public latency gate (scoreboard, mini strip, pricing proof). */
 function publicLatencyProviders(providers) {
   return (providers || []).filter(function (p) {
-    return isLatencyComparisonPublic(p) && !isFmpLatencyProvider(p);
+    return isLatencyComparisonPublic(p);
   });
 }
 function publicLatencySummary(d) {
@@ -13884,11 +13883,7 @@ document.querySelectorAll('nav.tabs a').forEach(function (b) {
    the Admin tab opens, from the two call sites near the tab-switch handlers. */
 (function () {
   var s = el('trLatencySection'); if (!s) return;
-  if (!('IntersectionObserver' in window)) { renderSpeedProof(); return; }
-  var io = new IntersectionObserver(function (entries) {
-    if (entries[0] && entries[0].isIntersecting) { io.disconnect(); renderSpeedProof(); }
-  }, { rootMargin: '300px' });
-  io.observe(s);
+  renderSpeedProof();
 })();
 setInterval(refreshSpeedUpdated, 60000);
 
@@ -14683,7 +14678,7 @@ loadMe().then(function () {
     if (initialView === 'subs') {
       updateDeliveryGate();
       loadSubs();
-      fetchLatencySummary().then(renderAlertsMini).catch(function () {});
+      renderSpeedProof();
     }
     if (initialView === 'admin') { loadAdminList(); loadLogoSetting(); loadHealth(); loadInstrumentPricing(); loadMarketCoverage(); loadDiagnostics(); loadBenchmarkHistory(); renderSpeedProof(); loadLlmSpendPanel(); loadExtractionIncident(); }
   } else {
