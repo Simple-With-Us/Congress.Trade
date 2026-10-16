@@ -174,13 +174,13 @@ describe('Datadog RUM injection', () => {
   });
 });
 
-describe('iOS Beta / TestFlight redirect routes', () => {
-  it('uses the app-specific invitation when no install URL is configured', async () => {
+describe('iOS install redirect routes', () => {
+  it('uses the released App Store listing when no install URL is configured', async () => {
     const app = buildUiRouter();
     for (const path of ['/beta', '/testflight', '/ios', '/app']) {
       const res = await app.request(`http://localhost${path}`, {}, {} as never);
       expect(res.status).toBe(302);
-      expect(res.headers.get('location')).toBe('https://testflight.apple.com/join/VNUEU6Ge');
+      expect(res.headers.get('location')).toBe('https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4');
     }
   });
 
@@ -193,7 +193,7 @@ describe('iOS Beta / TestFlight redirect routes', () => {
   ])('does not advertise an invalid configured install destination: %s', async (url) => {
     const app = buildUiRouter();
     const res = await app.request('http://localhost/beta', {}, { IOS_TESTFLIGHT_URL: url } as never);
-    expect(res.headers.get('location')).toBe('https://testflight.apple.com/join/VNUEU6Ge');
+    expect(res.headers.get('location')).toBe('https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4');
   });
 
   it('redirects /beta, /testflight, /ios, /app to the configured TestFlight or App Store URL', async () => {

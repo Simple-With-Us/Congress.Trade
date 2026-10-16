@@ -3768,9 +3768,9 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       <h3>Push Notifications</h3>
       <p class="sub">Phone push alerts are set in the iOS app: Off, one digest per new filing (name, position, and trade counts), or a ticker watchlist with a minimum amount and buys or sells.&nbsp; On the web, create a webhook or live stream below.</p>
       <div style="margin-top:12px;">
-        <a href="/beta" class="btn sm" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;">
+        <a href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" class="btn sm" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;">
           <svg viewBox="0 0 170 170" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.83.13-9.67-1.92-14.52-6.13-3.23-2.75-7.14-7.46-11.75-14.13-6.53-9.47-11.73-20.08-15.58-31.8-3.86-11.73-5.79-22.9-5.79-33.52 0-14.88 3.75-27.18 11.24-36.9 7.49-9.72 17.06-14.65 28.71-14.78 4.71 0 10.08 1.18 16.12 3.54 6.03 2.36 10.08 3.54 12.14 3.54 1.83 0 5.92-1.22 12.27-3.66 6.35-2.44 11.48-3.58 15.39-3.42 12.37.52 22.25 4.88 29.62 13.08-11.05 6.67-16.48 15.77-16.3 27.31.18 9.07 3.57 16.65 10.17 22.75 6.6 6.1 14.58 9.54 23.94 10.32-2.12 6.53-4.9 13.11-8.35 19.74zM119.22 31.78c0-7.07 2.53-13.67 7.59-19.8 5.06-6.13 11.46-9.75 19.2-10.86.36 1.44.54 2.76.54 3.96 0 7.07-2.61 13.79-7.83 20.16-5.22 6.37-11.66 9.87-19.32 10.51-.12-1.32-.18-2.65-.18-3.97z"/></svg>
-          Get iOS Beta (TestFlight)
+          Get iOS app
         </a>
       </div>
     </div>
@@ -4104,7 +4104,7 @@ ${speedProofSectionHtml(true)}
       <a href="/privacy-policy">Privacy</a>
       <a href="/terms-of-service">Terms</a>
       <a href="/pricing">Pricing</a>
-      <a href="/beta" target="_blank" rel="noopener noreferrer">iOS Beta</a>
+      <a href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer">iOS app</a>
       <a href="/api/feed.xml" rel="alternate" type="application/rss+xml">RSS</a>
       <a href="mailto:support@congress.trade">Support</a>
       <a href="#" onclick="if(window.openSentryFeedback){window.openSentryFeedback();}else if(window.Sentry&amp;&amp;window.Sentry.getFeedback){try{window.Sentry.getFeedback().createForm().then(function(f){f.appendToDom();f.open();});}catch(e){}}return false;">Report a Problem</a>
@@ -13179,7 +13179,7 @@ function renderAccount() {
     // Theme stays out of the signed-out top bar (owner: it dumped Light/Dark/System
     // into the header).  Default is light; theme lives in the hamburger.
     var authGroup = '<span class="acct-auth-group">' +
-      '<a class="btn ghost sm" href="/beta" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:inline-flex;align-items:center;">iOS Beta</a>' +
+      '<a class="btn ghost sm" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:inline-flex;align-items:center;">iOS app</a>' +
       '<button class="btn ghost sm" type="button" onclick="openLogin()">Sign In</button>' +
       (checkoutConfigured() ? '<button class="btn sm" type="button" onclick="openPricing()">Upgrade</button>' : '') +
       '</span>';
@@ -13189,7 +13189,7 @@ function renderAccount() {
       (checkoutConfigured() ? '<button class="btn sm" type="button" onclick="closeAcctMobileMenu();openPricing()">Upgrade</button>' : '') +
       '</span>' +
       '<div class="menu-section-label">Mobile App</div>' +
-      '<a class="btn ghost sm" href="/beta" target="_blank" rel="noopener noreferrer" style="width:100%;justify-content:center;text-decoration:none;">iOS Beta (TestFlight)</a>' +
+      '<a class="btn ghost sm" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" style="width:100%;justify-content:center;text-decoration:none;">iOS app</a>' +
       '<div class="menu-section-label">Appearance</div>' +
       themeRowHtml(null, true) +
       adminMenuHtml('closeAcctMobileMenu();') +
@@ -13221,7 +13221,7 @@ function renderAccount() {
           '<div class="menu-section-label">Account</div>' +
           '<button type="button" onclick="closeAcctMenu();openExportCsvDialog()">Export CSV</button>' +
           '<button type="button" onclick="closeAcctMenu();showView(\\'subs\\')">Delivery</button>' +
-          '<a href="/beta" target="_blank" rel="noopener noreferrer" onclick="closeAcctMenu()">iOS Beta (TestFlight)</a>' +
+          '<a href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" onclick="closeAcctMenu()">iOS app</a>' +
           (canManageSubscription()
             ? '<button type="button" onclick="manageBilling()">Manage Subscription</button>'
             : '') +
@@ -13240,7 +13240,7 @@ function renderAccount() {
       '<div class="menu-section-label">Account</div>' +
       '<button type="button" onclick="closeAcctMobileMenu();openExportCsvDialog()">Export CSV</button>' +
       '<button type="button" onclick="closeAcctMobileMenu();showView(\\'subs\\')">Delivery</button>' +
-      '<a href="/beta" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS Beta (TestFlight)</a>' +
+      '<a href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
       upgrade +
       (canManageSubscription()
         ? '<button type="button" onclick="closeAcctMobileMenu();manageBilling()">Manage Subscription</button>'
