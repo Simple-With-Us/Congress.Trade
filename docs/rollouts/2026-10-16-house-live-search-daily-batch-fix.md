@@ -2,14 +2,11 @@
 
 ## Summary
 
-Investigation of all 23 House STOCK Act PTR filings ingested between October 2 and October 16, 2026 (plus all 30 House discovery batches in `ingest_log` across 108 days of production history) established why `pollHouseLiveSearch()` (`POST https://disclosures-clerk.house.gov/FinancialDisclosure/ViewMemberSearchResult`) had not discovered filings ahead of the daily bulk XML index (`https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{YEAR}FD.ZIP`):
+The House live-search endpoint is an intraday overlay on the daily bulk XML index. It stays enabled by default because filings can arrive outside the morning bulk window.
 
-1. **Upstream Clerk release schedule (shared daily 8:00 AM publication batch):**
-   - The House Clerk's interactive member search (`POST /FinancialDisclosure/ViewMemberSearchResult`) and the yearly bulk XML (`{YEAR}FD.ZIP` -> `{YEAR}FD.xml`) refresh on the same once-daily publication cycle at ~8:00 AM on business days.
-   - Live comparison on `2026-10-16`: `2026FD.ZIP` (`Last-Modified: Oct 15, 8:00:04 AM`) and `POST /FinancialDisclosure/ViewMemberSearchResult` (`FilingYear=2026`) both return the exact same **427** PTR `DocID`s (`live - bulk = []`, `bulk - live = []`).
-   - HTTP `Last-Modified` headers on the 23 October 2026 PTR PDFs (`/public_disc/ptr-pdfs/2026/{docId}.pdf`) show the exact timestamp each PDF was generated/signed:
-     - On October 14, 2026, `20035487` (Daniel Meuser) was signed at **7:49:54 AM** (10 minutes before the 8:00 AM daily cut) and published in the October 14 8:00 AM batch (discovered by our watcher at **8:02:00 AM**, 12 minutes after PDF creation).
-     - Four other October 14 filings — `20035627` (Suzan K. DelBene, signed **2:36:44 PM**), `20035648` (Richard W. Allen, signed **3:40:53 PM**), `20035651` (Rich McCormick, signed **3:46:54 PM**), and `20035652` (Robin Kelly, signed **4:04:57 PM**) — were signed in the afternoon after the 8:00 AM cut.  Between 2:36 PM on Oct 14 and 8:00 AM on Oct 15, `source_attempts` recorded **45 consecutive successful House polls**; all 45 returned `0` new filings until the Clerk's index refreshed at **8:00:04 AM** on Oct 15.
+1. **Do not infer a shared publication schedule from a matching snapshot:**
+   - A live/bulk comparison returning the same DocIDs at one moment does not establish that both sources always publish together. PDF Last-Modified timestamps also do not prove when the live search first exposed a filing.
+   - `app/docs/probe-schedule.md` records 7 of 32 House arrival events after its 08:55-09:40 ET peak window (about 22%). This supports continued intraday polling; it does not prove that both sources publish together. Keep the two paths complementary rather than disabling the overlay based on a daily-batch assumption.
 
 2. **Client & timeout defects fixed in `pollHouseLiveSearch()` and `pollHouse()`:**
    - **Keep `HOUSE_LIVE_SEARCH_ENABLED` on by default, throttled to once per 30 minutes (`house_live_search:last_fetch_at`):** Instead of running `pollHouseLiveSearch()` on every 1-minute peak / 4-minute morning poll (153 times/day), it now runs at most once every 30 minutes (~48 times/day) so it stays active intraday without competing with the 1-minute 8:00 AM bulk-ZIP sprint.
@@ -30,7 +27,7 @@ Investigation of all 23 House STOCK Act PTR filings ingested between October 2 a
 
 ## Decisions
 
-- Keep `HOUSE_LIVE_SEARCH_ENABLED` enabled by default (`!== 'false'`) and throttle successful `pollHouseLiveSearch()` runs to once per 30 minutes via `house_live_search:last_fetch_at` in `CONFIG_KV`.  Failed runs intentionally do not set `house_live_search:last_fetch_at` so they can retry on the next tick and advance the 3-strike `house_live_search:consecutive_fails` alert.
+- Keep `HOUSE_LIVE_SEARCH_ENABLED` enabled by default (`!== 'false'`) and throttle successful `pollHouseLiveSearch()` runs to once per 30 minutes via `house_live_search:last_fetch_at` in `CONFIG_KV`.  Failed runs intentionally do not set `house_live_search:last_fetch_at` so they can retry on the next tick and advance the 12-failure `house_live_search:consecutive_failures` alert escalation.
 - Isolate `tickSignal` from the per-source `signal` so a slow `pollHouseLiveSearch()` call never aborts and discards already-fetched `fetchHouseIndex()` bulk rows.
 - Include `FinancialModelingPrep.com` (`fmp`) in `publicLatencyProviders()` and run `renderSpeedProof()` on boot and `subs` tab restore so the public website displays live FMP vs. Congress.Trade latency comparisons.
 
