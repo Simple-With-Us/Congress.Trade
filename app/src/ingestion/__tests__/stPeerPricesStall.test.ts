@@ -47,6 +47,7 @@ let d1: D1Database;
 let close: () => void;
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   const opened = await openMigratedD1();
   db = opened.db;
   d1 = opened.d1;
