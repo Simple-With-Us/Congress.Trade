@@ -24,12 +24,27 @@ Investigation of all 23 House STOCK Act PTR filings ingested between October 2 a
 - `app/src/shared/types.ts`
 - `app/src/ingestion/__tests__/houseSource.test.ts`
 - `app/src/ingestion/__tests__/watcher.test.ts`
+- `app/src/ui/dashboardHtml.ts`
+- `app/src/ui/__tests__/dashboardHtml.test.ts`
 - `docs/rollouts/2026-10-16-house-live-search-daily-batch-fix.md`
+
+## Decisions
+
+- Keep `HOUSE_LIVE_SEARCH_ENABLED` enabled by default (`!== 'false'`) and throttle successful `pollHouseLiveSearch()` runs to once per 30 minutes via `house_live_search:last_fetch_at` in `CONFIG_KV`.  Failed runs intentionally do not set `house_live_search:last_fetch_at` so they can retry on the next tick and advance the 3-strike `house_live_search:consecutive_fails` alert.
+- Isolate `tickSignal` from the per-source `signal` so a slow `pollHouseLiveSearch()` call never aborts and discards already-fetched `fetchHouseIndex()` bulk rows.
+- Include `FinancialModelingPrep.com` (`fmp`) in `publicLatencyProviders()` and run `renderSpeedProof()` on boot and `subs` tab restore so the public website displays live FMP vs. Congress.Trade latency comparisons.
 
 ## Verification
 
 ```bash
 cd app
 npm run typecheck
-npm test
+npx vitest run src/ingestion/__tests__/houseSource.test.ts src/ingestion/__tests__/watcher.test.ts src/ui/__tests__/dashboardHtml.test.ts
 ```
+
+- `npm run typecheck`: passed (`0` errors).
+- `vitest`: `441/441` tests passed across `houseSource.test.ts` (`12`), `watcher.test.ts` (`34`), and `dashboardHtml.test.ts` (`395`).
+
+## Next Steps
+
+- Deploy to production via `bash app/scripts/ship.sh` after merge to `main` and verify `/api/health` and the public Filing Latency Comparison scoreboard on `https://congress.trade`.
