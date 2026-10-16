@@ -267,6 +267,22 @@ export function scrubSentryEvent<T>(event: T): T {
   return scrubSentryValue(event) as T;
 }
 
+/** Inputs for the browser loader's inline scrub IIFE (must match shouldRedactFieldKey / scrubSentryFreeText). */
+export const SENTRY_BROWSER_SCRUB_CODEGEN = {
+  filteredValue: SENTRY_FILTERED_VALUE,
+  credentialKeys: [...SENTRY_CREDENTIAL_KEYS],
+  identityKeys: [...SENTRY_IDENTITY_KEYS],
+  sensitiveHeaderKeys: [...SENTRY_SENSITIVE_HEADER_KEYS],
+  textPatterns: {
+    email: EMAIL_IN_TEXT.source,
+    ipv4: IPV4_IN_TEXT.source,
+    uuid: UUID_IN_TEXT.source,
+    stripeId: STRIPE_ID_IN_TEXT.source,
+    appleTxn: APPLE_TXN_IN_TEXT.source,
+    userPrefixedId: USER_PREFIXED_ID.source,
+  },
+} as const;
+
 export function scrubSentryLogAttributes(
   attributes?: Record<string, string | number | boolean | null>,
 ): Record<string, string | number | boolean | null> | undefined {

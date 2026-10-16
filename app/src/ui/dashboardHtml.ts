@@ -33,6 +33,7 @@
 import { benchmarkSelectableCatalog } from '../benchmark/settings.ts';
 import { executiveTitleForms } from '../shared/executiveTitles.ts';
 import { MAX_PUBLIC_TX_OFFSET } from '../security/botDefense.ts';
+import { SEMANTIC_DARK, SEMANTIC_DARK_NEG, SEMANTIC_LIGHT } from './semanticThemeTokens.ts';
 
 /**
  * Filing Latency Comparison ("speed proof") section markup, shared between its
@@ -182,11 +183,13 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     --text-dim:  #b8c7dd;
     --icon-grey: #9ca3af; /* medium grey for header hamburger + info glyphs (dark theme) */
     --accent:    #4f8cff;
-    --buy:       #22c55e;
-    --sell:      #ef4444;
-    --exch:      #eab308;
-    --warn:      #f59e0b;
-    --good:      #34d399;
+    --buy:       ${SEMANTIC_DARK.buy};
+    --sell:      ${SEMANTIC_DARK.sell};
+    --exch:      ${SEMANTIC_DARK.exch};
+    --warn:      ${SEMANTIC_DARK.warn};
+    --good:      ${SEMANTIC_DARK.good};
+    --pos:       var(--good);
+    --neg:       ${SEMANTIC_DARK_NEG};
     /* Party dots (replaces the old donkey/elephant/eagle glyphs everywhere a
        member's party is shown — filter chips, drawers, Trends): red for
        Republican, blue for Democrat, purple for Independent/Other. Same
@@ -234,11 +237,13 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     --icon-grey: #6b7280; /* medium grey for header hamburger + info glyphs */
     --text-dim:  #34435b;
     --accent:    #2563eb;
-    --buy:       #15803d;
-    --sell:      #dc2626;
-    --exch:      #b45309;
-    --warn:      #b45309;
-    --good:      #15803d;
+    --buy:       ${SEMANTIC_LIGHT.buy};
+    --sell:      ${SEMANTIC_LIGHT.sell};
+    --exch:      ${SEMANTIC_LIGHT.exch};
+    --warn:      ${SEMANTIC_LIGHT.warn};
+    --good:      ${SEMANTIC_LIGHT.good};
+    --pos:       var(--good);
+    --neg:       var(--sell);
     --rival:     #64748b;
   }
   html[data-theme="light"] header.top {
@@ -743,6 +748,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   html[data-theme="dark"] .tag.B, html[data-theme="dark"] .tag.P { color: #080c17; }
   .tag.S { background: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--sell) 30%, transparent); }
   .tag.E { background: linear-gradient(135deg, var(--exch), color-mix(in srgb, var(--exch) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--exch) 30%, transparent); color: #080c17; }
+  html[data-theme="light"] .tag.E { color: #fff; }
   .conf { font-family: var(--mono); font-size: 12px; }
   .conf.hi { color: var(--good); } .conf.mid { color: var(--warn); } .conf.lo { color: var(--sell); }
   .muted { color: var(--text-dim); }
@@ -8424,7 +8430,7 @@ function renderSourceHealthTimeline(sources, timeline, recentFailures) {
   grid.innerHTML = Object.keys(statsBySource).map(function (src) {
     var st = statsBySource[src];
     var errRate = st.total > 0 ? ((st.failures / st.total) * 100).toFixed(1) : '0.0';
-    var color = st.failures > 0 ? (Number(errRate) > 10 ? 'var(--sell)' : '#f59e0b') : 'var(--buy)';
+    var color = st.failures > 0 ? (Number(errRate) > 10 ? 'var(--sell)' : 'var(--warn)') : 'var(--buy)';
     return '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:12px 14px">' +
       '<div style="font-size:12px;font-weight:600;text-transform:uppercase;color:var(--text-muted);margin-bottom:4px">' + esc(chamberLabel(src)) + ' (24h)</div>' +
       '<div style="font-size:18px;font-weight:700;color:' + color + '">' + st.failures + ' <span style="font-size:13px;font-weight:400;color:var(--text-muted)">errors / ' + st.total + ' polls (' + errRate + '%)</span></div>' +

@@ -207,6 +207,33 @@ enum AppTheme {
     static let senateColor = Color.purple.opacity(0.8)
     static let execColor = Color.orange.opacity(0.8)
 
+    /// Buy / net-positive / ahead — matches web `--buy` / `--good` per theme.
+    static var semanticPositive: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0x22 / 255.0, green: 0xc5 / 255.0, blue: 0x5e / 255.0, alpha: 1.0)
+                : UIColor(red: 0x16 / 255.0, green: 0x65 / 255.0, blue: 0x34 / 255.0, alpha: 1.0)
+        })
+    }
+
+    /// Sell / net-negative / behind — matches web `--sell`.
+    static var semanticNegative: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0xef / 255.0, green: 0x44 / 255.0, blue: 0x44 / 255.0, alpha: 1.0)
+                : UIColor(red: 0x99 / 255.0, green: 0x1b / 255.0, blue: 0x1b / 255.0, alpha: 1.0)
+        })
+    }
+
+    /// Warn / caution / mixed — matches web `--warn` / `--exch` in light mode.
+    static var semanticCaution: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0xf5 / 255.0, green: 0x9e / 255.0, blue: 0x0b / 255.0, alpha: 1.0)
+                : UIColor(red: 0x9a / 255.0, green: 0x34 / 255.0, blue: 0x12 / 255.0, alpha: 1.0)
+        })
+    }
+
     static func border(cornerRadius: CGFloat = 16) -> some View {
         RoundedRectangle(cornerRadius: cornerRadius)
             .stroke(borderColor, lineWidth: 1)
@@ -872,8 +899,8 @@ extension String {
 
     var tint: Color {
         switch self {
-        case "S": return .red
-        case "B", "P": return .green
+        case "S": return AppTheme.semanticNegative
+        case "B", "P": return AppTheme.semanticPositive
         default: return .blue
         }
     }
@@ -882,10 +909,10 @@ extension String {
 extension ClientCommand.Status {
     var tint: Color {
         switch self {
-        case .queued: return .orange
+        case .queued: return AppTheme.semanticCaution
         case .running: return .blue
-        case .succeeded: return .green
-        case .failed: return .red
+        case .succeeded: return AppTheme.semanticPositive
+        case .failed: return AppTheme.semanticNegative
         case .canceled: return .secondary
         }
     }

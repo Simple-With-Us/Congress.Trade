@@ -5,8 +5,38 @@ import {
   sentryIngestOrigin,
   SENTRY_BROWSER_SCRIPT_ORIGIN,
 } from '../sentryBrowser.ts';
+import { SENTRY_FILTERED_VALUE } from '../sentryScrub.ts';
 
 const DSN = 'https://key@o1.ingest.us.sentry.io/1';
+
+function loadBrowserScrubFromScript(html: string): (payload: unknown) => unknown {
+  const body = html.replace(/^<script>/, '').replace(/<\/script>$/, '');
+  const sentry = {
+    init: () => {},
+    browserTracingIntegration: () => ({}),
+    replayIntegration: () => ({}),
+    feedbackIntegration: () => ({}),
+    consoleLoggingIntegration: () => ({}),
+  };
+  const win: Record<string, unknown> = { Sentry: sentry };
+  const tags: Array<{ onload?: () => void }> = [];
+  const doc = {
+    createElement: () => {
+      const tag: { onload?: () => void } = {};
+      tags.push(tag);
+      return tag;
+    },
+    head: { appendChild: () => {} },
+  };
+  const run = new Function('window', 'document', 'Sentry', body);
+  run(win, doc, sentry);
+  tags[0].onload?.();
+  const scrub = win.__ctScrubSentry;
+  if (typeof scrub !== 'function') {
+    throw new Error('browser scrub hook missing from loader');
+  }
+  return scrub as (payload: unknown) => unknown;
+}
 
 describe('sentry browser loader', () => {
   it('stays dark without a DSN', () => {
@@ -108,5 +138,57 @@ describe('sentry browser loader', () => {
   it('parses ingest origin without wildcards', () => {
     expect(sentryIngestOrigin(DSN)).toBe('https://o1.ingest.us.sentry.io');
     expect(sentryIngestOrigin('not-a-url')).toBeUndefined();
+  });
+
+  it('scrubs credential keys, identity fields, and free-text identifiers before send', () => {
+    const scrub = loadBrowserScrubFromScript(renderSentryBrowserScript({ SENTRY_DSN: DSN }));
+    const email = 'operator@example.com';
+    const ip = '203.0.113.42';
+    const subscriptionId = 'sub_1QwErTyUiOpAsDfG';
+    const uuid = '9f3c2a1b-4e5d-4789-abcd-ef0123456789';
+    const appleTxn = 'otxn-anon-export-12345';
+
+    const scrubbed = scrub({
+      authorization: 'Bearer deadbeef',
+      apiKey: 'sk_live_abc',
+      cookie: 'session=deadbeef',
+      userId: 'user-abc',
+      message: `notify ${email} sub ${subscriptionId} from ${ip} uuid ${uuid} ${appleTxn} user:user-abc-1234`,
+    }) as Record<string, unknown>;
+
+    expect(scrubbed.authorization).toBe(SENTRY_FILTERED_VALUE);
+    expect(scrubbed.apiKey).toBe(SENTRY_FILTERED_VALUE);
+    expect(scrubbed.cookie).toBe(SENTRY_FILTERED_VALUE);
+    expect(scrubbed.userId).toBe(SENTRY_FILTERED_VALUE);
+    const message = String(scrubbed.message);
+    expect(message).not.toContain(email);
+    expect(message).not.toContain(ip);
+    expect(message).not.toContain(subscriptionId);
+    expect(message).not.toContain(uuid);
+    expect(message).not.toContain(appleTxn);
+    expect(message).toContain(SENTRY_FILTERED_VALUE);
+  });
+
+  it('redacts URL query params and path-aware nested id like the Deno scrubber', () => {
+    const scrub = loadBrowserScrubFromScript(renderSentryBrowserScript({ SENTRY_DSN: DSN }));
+    const opaque = 'abcdefghijklmnopqrstuvwxyz123456';
+    const url = `https://congress.trade/api/stream?subscription=${opaque}&chamber=senate`;
+
+    const scrubbed = scrub({
+      breadcrumbs: [{
+        data: { url },
+      }],
+      device: { id: 'device-token-leak' },
+    }) as {
+      breadcrumbs: Array<{ data: { url: string } }>;
+      device: { id: string };
+    };
+
+    const scrubbedUrl = scrubbed.breadcrumbs[0].data.url;
+    expect(scrubbedUrl).not.toContain(opaque);
+    expect(scrubbedUrl.includes(SENTRY_FILTERED_VALUE) || scrubbedUrl.includes('%5BFiltered%5D')).toBe(
+      true,
+    );
+    expect(scrubbed.device.id).toBe(SENTRY_FILTERED_VALUE);
   });
 });
