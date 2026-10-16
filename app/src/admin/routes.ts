@@ -95,6 +95,10 @@ import {
 } from '../extraction/normalizer.ts';
 import { storedReviewBlocksSmallerVisionSubmit, storedReviewTransactionCount } from '../extraction/visionSubmitGuard.ts';
 import { collapseDuplicateSpans } from '../extraction/localVisionDupeGuard.ts';
+import {
+  refuseIllegibleBandAmounts,
+  rejectConstantColumnReads,
+} from '../extraction/visionIntegrityGuards.ts';
 import { PIPELINE_TX_SOURCES_SQL, VISION_SUPERSEDE_REASON } from '../extraction/sourceSupersede.ts';
 import { EXTRACTION_PROMPT_VERSION } from '../extraction/visionLlm.ts';
 import { deprecatePredecessorFilingTransactions, duplicateLineupReason, enqueueAgreementCheck, processAgreementDoc, loadDocBytes, loadFilingRow, sameRowSet, type AgreementModels } from '../extraction/agreement.ts';
@@ -2866,16 +2870,39 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         400,
       );
     }
+    // CT-2415 Guard 1b: the confirm gate had NO duplicate check, so a review
+    // payload carrying a re-emitted-row flood could be published verbatim with
+    // one operator action. Collapse the same contiguous runs the ingest path
+    // collapses, BEFORE the N-of-M comparison below — so the under-transcription
+    // guard sees the true row count and refuses the flood by name instead of
+    // letting 286 rows through as a legitimate confirm.
+    //
+    // The edits carry exactly the fields transactionRowKey fingerprints
+    // (txDate/owner/asset/ticker/type/amount/rawText/…), so the same real
+    // fingerprint applies; RowKeyFields is narrower than ParsedTx, hence the cast.
+    const confirmedDeduped = collapseDuplicateSpans(
+      rawEdits as unknown as ParsedTx[],
+      source,
+    );
+    const confirmedEdits = confirmedDeduped.rows as unknown[];
+
     // N-of-M under-transcription guard: don't let confirm/manual silently
     // shrink a filing to fewer rows than the stored extraction itself
     // claimed/held. This is what let Kupor (E-2026-scott-a-kupor-01-09-2026-278t)
     // get manually confirmed with 1 of 3 real transactions — nothing compared
     // the confirm against the extraction's own completeness signal.
     const storedCount = storedReviewTransactionCount(review.payload);
-    if (storedCount > rawEdits.length && body.acknowledgeUnderTranscription !== true) {
+    if (storedCount > confirmedEdits.length && body.acknowledgeUnderTranscription !== true) {
       return c.json(
         {
-          error: `confirm has fewer transactions (${rawEdits.length}) than the stored extraction found (${storedCount}) — pass acknowledgeUnderTranscription: true to confirm anyway, or add the missing rows`,
+          error: `confirm has fewer transactions (${confirmedEdits.length}) than the stored extraction found (${storedCount}) — pass acknowledgeUnderTranscription: true to confirm anyway, or add the missing rows`,
+          duplicateSpanCollapsed: confirmedDeduped.removed,
+          duplicateSpanRuns: confirmedDeduped.runs.map((r) => ({
+            contentHash: r.contentHash,
+            count: r.count,
+            firstIndex: r.firstIndex,
+            lastIndex: r.lastIndex,
+          })),
         },
         409,
       );
@@ -2901,7 +2928,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ docId, decision: 'orphan_resolved', resolved: true });
     }
     const filingFilerId = filing?.filer_id ?? null;
-    const validated = validateReviewEdits(rawEdits, filing.filed_date);
+    const validated = validateReviewEdits(confirmedEdits, filing.filed_date);
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
@@ -6473,7 +6500,16 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // than the one it would replace.  H-2026-9116378 arrived with 286 rows of
     // which 251 were one trade at contiguous rowIndex 35..285.
     const deduped = collapseDuplicateSpans(parsedTxIncoming, txSource);
-    const parsedTx = deduped.rows;
+
+    // CT-2415 Guards 2 and 3. Both run AFTER the flood collapse, so a 286-row
+    // duplicate burst is judged as the handful of real reads underneath it
+    // rather than as 286 rows of apparently-constant data. Neither guard drops
+    // a row: Guard 2 leaves the amount unread, Guard 3 leaves the type unread,
+    // and both route the filing to review instead of publishing an inferred
+    // value.
+    const bandChecked = refuseIllegibleBandAmounts(deduped.rows);
+    const columnChecked = rejectConstantColumnReads(bandChecked.rows);
+    const parsedTx = columnChecked.rows;
 
     try {
       const existingReview = await get<{ reason: string | null; payload: string | null }>(
@@ -6562,6 +6598,17 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           count: r.count,
           firstIndex: r.firstIndex,
           lastIndex: r.lastIndex,
+        })),
+        illegibleBandAmountsRefused: bandChecked.refusals.length,
+        illegibleBandAmounts: bandChecked.refusals.map((r) => ({
+          rowIndex: r.rowIndex,
+          amountMin: r.amountMin,
+          amountMax: r.amountMax,
+        })),
+        constantColumnReadsRejected: columnChecked.rejections.map((r) => ({
+          field: r.field,
+          value: r.value,
+          rowCount: r.rowIndexes.length,
         })),
       });
     } catch (err) {

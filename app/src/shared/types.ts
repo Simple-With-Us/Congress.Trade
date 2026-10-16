@@ -253,8 +253,14 @@ export interface ParsedTx {
    * Source fields that were explicitly unreadable and were defaulted locally,
    * or provenance markers for the row itself (e.g. recovered from a truncated
    * provider response — see `salvageTruncatedTransactions` in visionLlm.ts).
+   *
+   * `band_amount_inferred` marks an amount bracket that parseAmountRange SNAPPED
+   * onto a canonical STOCK Act tier rather than matching one the document
+   * printed. On a checkbox-band form that means the band legend was not legible
+   * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
+   * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output'>;
+  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred'>;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
