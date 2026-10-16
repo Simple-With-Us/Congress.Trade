@@ -245,19 +245,21 @@ describe('runWatcher', () => {
     expect(filingInserts).toHaveLength(3);
   });
 
-  it('rate-limits the live House search overlay to one fetch per 30-minute window', async () => {
+  it('runs live House search alongside the bulk index on scheduled House polls by default', async () => {
     const now = new Date('2026-07-04T15:00:00.000Z');
-    const { env, queueSends } = fakeEnv({}, {}, {
-      'house_live_search:last_fetch_at': new Date(now.getTime() - 10 * 60_000).toISOString(),
-    });
+    const { env, queueSends } = fakeEnv();
     mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001')]);
+    mocks.pollHouseLiveSearch.mockResolvedValueOnce([housePtr('20026002')]);
     mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
 
     await runWatcher(env, now);
 
     expect(mocks.fetchHouseIndex).toHaveBeenCalledTimes(1);
-    expect(mocks.pollHouseLiveSearch).not.toHaveBeenCalled();
-    expect(queueSends).toEqual([expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' })]);
+    expect(mocks.pollHouseLiveSearch).toHaveBeenCalledTimes(1);
+    expect(queueSends).toEqual([
+      expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' }),
+      expect.objectContaining({ docId: 'H-2026-20026002', chamber: 'house' }),
+    ]);
   });
 
   it('skips the live House search when explicitly disabled', async () => {
