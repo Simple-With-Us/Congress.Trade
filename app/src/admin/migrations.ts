@@ -1360,6 +1360,7 @@ export const LATENCY_SNAPSHOT_12H_SWEEP_SCHEMA_STATEMENTS = [
 export const GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS = [
   'ALTER TABLE filings ADD COLUMN prev_probe_at TEXT',
   'ALTER TABLE filings ADD COLUMN probe_interval_sec INTEGER',
+  'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
   'ALTER TABLE trade_latency_candidates ADD COLUMN congress_window_start TEXT',
 ] as const;
 

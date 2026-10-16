@@ -103,6 +103,10 @@ export interface DiscoveredFiling {
   party?: string | null;
   photoUrl?: string | null;
   docKind?: string | null;
+  /** Which discovery path first surfaced this filing: intraday live-search
+   *  or the daily bulk index. Set by pollHouse(); used for the bulk-window
+   *  discovery alert. Undefined for non-House sources. */
+  discoveredVia?: 'live' | 'bulk';
 }
 
 export function preclassifyDocKind(
@@ -339,10 +343,11 @@ export async function insertFilingIfNew(
       `INSERT OR IGNORE INTO filings
        (doc_id, chamber, filer_id, filing_type, filed_date, source_url,
         raw_object_key, ingest_status, doc_kind, extractor, model_version,
-        confidence, first_seen_at, source_updated_at, error, prev_probe_at, probe_interval_sec)
+        confidence, first_seen_at, source_updated_at, error, prev_probe_at, probe_interval_sec,
+        discovered_via)
      VALUES (?, ?, ?, 'P', ?, ?, NULL, 'new', ?, NULL, NULL,
-             NULL, ?, NULL, NULL, ?, ?)`,
-      [f.docId, f.chamber, filerId ?? null, filedDate, f.sourceUrl, docKind, nowIso, opts?.prevProbeAt ?? null, opts?.probeIntervalSec ?? null],
+             NULL, ?, NULL, NULL, ?, ?, ?)`,
+      [f.docId, f.chamber, filerId ?? null, filedDate, f.sourceUrl, docKind, nowIso, opts?.prevProbeAt ?? null, opts?.probeIntervalSec ?? null, f.discoveredVia ?? null],
     ],
     ingestionOutboxInsertForDoc(f.docId, nowIso),
   ]);
@@ -512,8 +517,9 @@ async function persistAndEnqueue(
   filings: DiscoveredFiling[],
   nowIso: string,
   opts: { maxNew?: number; prevProbeAt?: string | null; probeIntervalSec?: number | null } = {},
-): Promise<number> {
+): Promise<{ count: number; inserted: DiscoveredFiling[] }> {
   let newCount = 0;
+  const inserted: DiscoveredFiling[] = [];
   for (const f of filings) {
     if (opts.maxNew !== undefined && newCount >= opts.maxNew) break;
     const insertResult = await insertFilingIfNew(env, f, nowIso, {
@@ -524,9 +530,10 @@ async function persistAndEnqueue(
       await recordDisclosureLatencyCandidate(env, f, nowIso);
       await enqueueFilingNew(env, f);
       newCount += 1;
+      inserted.push(f);
     }
   }
-  return newCount;
+  return { count: newCount, inserted };
 }
 
 /** Write one ingest_log row recording the cadence + yield of a poll. */
@@ -656,7 +663,7 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
 
   const byDoc = new Map<string, DiscoveredFiling>();
   for (const f of ptrs) {
-    byDoc.set(f.pipelineDocId, houseDiscovery(f));
+    byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'bulk' });
   }
 
   // YEAR-BOUNDARY GAP: for the first N days of a new ET year, also sweep the
@@ -678,7 +685,7 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
       if (!Number.isFinite(lastMs) || now.getTime() - lastMs >= HOUSE_PRIOR_YEAR_FETCH_INTERVAL_MS) {
         const prior = (await fetchHouseIndex(year - 1, { relayUrl: houseRelayUrl, signal })).filter((f) => f.isPtr);
         for (const f of prior) {
-          if (!byDoc.has(f.pipelineDocId)) byDoc.set(f.pipelineDocId, houseDiscovery(f));
+          if (!byDoc.has(f.pipelineDocId)) byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'bulk' });
         }
         if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_PRIOR_YEAR_KV_KEY, nowIso);
       }
@@ -697,7 +704,7 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
       const live = await pollHouseLiveSearch(year, fetch, { env, signal });
       for (const f of live) {
         if (!byDoc.has(f.pipelineDocId)) {
-          byDoc.set(f.pipelineDocId, houseDiscovery(f));
+          byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'live' });
         }
       }
     } catch (err) {
@@ -743,12 +750,98 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
     : null;
-  const newCount = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  const { count: newCount, inserted } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  await alertOnStaleBulkDiscoveries(env, inserted, nowIso);
   await logPoll(env, 'house', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'house', now);
   await recordSourceAttempt(env, 'house', nowIso, 'success', newCount, null);
   return newCount;
 }
+
+/**
+ * Bulk-window discovery alert (Jay directive 2026-10-16).
+ *
+ *  A filing first discovered via the daily bulk XML whose filed_date is more
+ *  than BULK_DISCOVERY_ALERT_THRESHOLD_MS old means live-search missed it
+ *  intraday across a full window of polls. Logs via console.error (Sentry-visible,
+ *  matching the watcher's existing escalation pattern) with the doc id, member,
+ *  filed/discovered timestamps, hours late, and live-search health.
+ */
+export interface StaleBulkDiscoveryAlert {
+  docId: string;
+  filerName: string | null;
+  filedDate: string;
+  discoveredAt: string;
+  hoursLate: number;
+  liveSearchFails: string;
+}
+
+/**
+ * Pure helper: returns alerts for bulk-discovered filings older than the threshold.
+ * Exported for testing; the console.error side effect lives in alertOnStaleBulkDiscoveries.
+ */
+export function findStaleBulkDiscoveries(
+  inserted: DiscoveredFiling[],
+  nowIso: string,
+  liveSearchFails: string = 'unknown',
+): StaleBulkDiscoveryAlert[] {
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs)) return [];
+  const alerts: StaleBulkDiscoveryAlert[] = [];
+  for (const f of inserted) {
+    if (f.discoveredVia !== 'bulk') continue;
+    if (!f.filedDate) continue;
+    const filedMs = Date.parse(f.filedDate);
+    if (!Number.isFinite(filedMs)) continue;
+    const lateMs = nowMs - filedMs;
+    if (lateMs <= BULK_DISCOVERY_ALERT_THRESHOLD_MS) continue;
+    alerts.push({
+      docId: f.docId,
+      filerName: f.filerName ?? null,
+      filedDate: f.filedDate,
+      discoveredAt: nowIso,
+      hoursLate: Math.round((lateMs / 3600000) * 10) / 10,
+      liveSearchFails,
+    });
+  }
+  return alerts;
+}
+
+export async function alertOnStaleBulkDiscoveries(
+  env: Env,
+  inserted: DiscoveredFiling[],
+  nowIso: string,
+): Promise<void> {
+  let liveSearchFails: string = 'unknown';
+  try {
+    if (env.CONFIG_KV) {
+      liveSearchFails = (await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0';
+    }
+  } catch {
+    // best-effort only; never block the alert on a KV read
+  }
+  for (const a of findStaleBulkDiscoveries(inserted, nowIso, liveSearchFails)) {
+    console.error(
+      `watcher: house filing ${a.docId} (${a.filerName ?? 'unknown member'}) ` +
+      `filed ${a.filedDate} but first discovered via BULK index at ${a.discoveredAt} ` +
+      `(${a.hoursLate}h late) — live-search missed it intraday ` +
+      `(live-search consecutive failures: ${a.liveSearchFails})`,
+    );
+  }
+}
+
+/** Bulk-window discovery alert threshold.
+ *
+ *  When a House filing is first discovered via the daily bulk XML (not intraday
+ *  live-search) and its filed_date is older than this, something is wrong: the
+ *  filing survived a full window of live-search polls (~12 polls at the 20-min
+ *  off-hours cadence, ~48 at the 5-min weekday cadence) without intraday
+ *  discovery. Either live-search is failing/missing it, or the Clerk published
+ *  very late — both warrant a look. Under the threshold stays silent (normal
+ *  Clerk publication lag). Set per Jay 2026-10-16: he'd rather investigate a
+ *  false positive than miss a live-search failure.
+ */
+export const BULK_DISCOVERY_ALERT_THRESHOLD_MS = 4 * 3600 * 1000;
 
 /** Default / max lookback windows for the Senate submitted-date filter.
  *  Tunable via SENATE_LOOKBACK_DAYS / SENATE_MAX_LOOKBACK_DAYS. */
@@ -844,7 +937,7 @@ async function pollSenate(env: Env, now: Date, signal?: AbortSignal): Promise<nu
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
     : null;
-  const newCount = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  const { count: newCount } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
   await logPoll(env, 'senate', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'senate', now);
   await recordSourceAttempt(env, 'senate', nowIso, 'success', newCount, null);
@@ -897,7 +990,7 @@ export async function pollExecutive(
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
     : null;
-  const newCount = await persistAndEnqueue(env, filings, nowIso, { maxNew: maxFilings, prevProbeAt: prevAttemptAt, probeIntervalSec });
+  const { count: newCount } = await persistAndEnqueue(env, filings, nowIso, { maxNew: maxFilings, prevProbeAt: prevAttemptAt, probeIntervalSec });
   await setLastPollAt(env, 'oge', now);
   await logPoll(env, 'oge', nowIso, newCount, nowIso);
   // Liveness receipt (owner 2026-08-10: polling must never be silently off
