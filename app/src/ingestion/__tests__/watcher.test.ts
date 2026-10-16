@@ -165,7 +165,7 @@ describe('runWatcher', () => {
   });
 
   it('gives House, Senate, and OGE each a fresh I/O signal', async () => {
-    const { env } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' });
+    const { env } = fakeEnv();
     const signals: AbortSignal[] = [];
     mocks.fetchHouseIndex.mockImplementation(async (_year: number, opts: { signal?: AbortSignal }) => {
       expect(opts.signal?.aborted).toBe(false);
@@ -218,19 +218,8 @@ describe('runWatcher', () => {
     expect(dbRuns.filter((run) => /INSERT INTO source_attempts/i.test(run.sql))).toHaveLength(0);
   });
 
-  it('skips the live House search by default unless explicitly enabled', async () => {
-    const { env, queueSends } = fakeEnv();
-    mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001')]);
-    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
-
-    await runWatcher(env, new Date('2026-07-04T15:00:00.000Z'));
-
-    expect(mocks.pollHouseLiveSearch).not.toHaveBeenCalled();
-    expect(queueSends).toEqual([expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' })]);
-  });
-
-  it('polls the live House search when explicitly enabled and de-dupes overlap against the bulk index', async () => {
-    const { env, dbRuns, queueSends } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' });
+  it('polls the live House search by default and de-dupes overlap against the bulk index', async () => {
+    const { env, dbRuns, queueSends } = fakeEnv();
     mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001'), housePtr('20026002')]);
     mocks.pollHouseLiveSearch.mockResolvedValueOnce([
       housePtr('20026002', { filingDate: '' }),
@@ -256,6 +245,21 @@ describe('runWatcher', () => {
     expect(filingInserts).toHaveLength(3);
   });
 
+  it('rate-limits the live House search overlay to one fetch per 30-minute window', async () => {
+    const now = new Date('2026-07-04T15:00:00.000Z');
+    const { env, queueSends } = fakeEnv({}, {}, {
+      'house_live_search:last_fetch_at': new Date(now.getTime() - 10 * 60_000).toISOString(),
+    });
+    mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001')]);
+    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
+
+    await runWatcher(env, now);
+
+    expect(mocks.fetchHouseIndex).toHaveBeenCalledTimes(1);
+    expect(mocks.pollHouseLiveSearch).not.toHaveBeenCalled();
+    expect(queueSends).toEqual([expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' })]);
+  });
+
   it('skips the live House search when explicitly disabled', async () => {
     const { env, queueSends } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'false' });
     mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001')]);
@@ -268,7 +272,7 @@ describe('runWatcher', () => {
   });
 
   it('fails soft when the live House search errors and still persists the bulk index', async () => {
-    const { env, kvPuts, queueSends } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' });
+    const { env, kvPuts, queueSends } = fakeEnv();
     mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001')]);
     mocks.pollHouseLiveSearch.mockRejectedValueOnce(new Error('live blocked'));
     mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
@@ -285,7 +289,7 @@ describe('runWatcher', () => {
   });
 
   it('does not discard already-fetched bulk index filings when the per-source timeout fires during live search', async () => {
-    const { env, kvPuts, queueSends, dbRuns } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' });
+    const { env, kvPuts, queueSends, dbRuns } = fakeEnv();
     mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20035652')]);
     mocks.pollHouseLiveSearch.mockImplementationOnce(async () => {
       const timeoutErr = new Error('The operation was aborted due to timeout');
@@ -314,7 +318,7 @@ describe('runWatcher', () => {
   });
 
   it('isolates a live-search counter KV failure from the authoritative bulk persist', async () => {
-    const base = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' });
+    const base = fakeEnv();
     const COUNTER_KEY = 'house_live_search:consecutive_failures';
     const innerKv = base.env.CONFIG_KV as {
       get(k: string): Promise<string | null>;

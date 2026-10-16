@@ -719,7 +719,7 @@ export interface Env {
   /** Override URLs for the seed backfill datasets (House / Senate mirrors). */
   SEED_HOUSE_URL?: string;
   SEED_SENATE_URL?: string;
-  /** House live search polling flag; opt-in (off unless explicitly "true"). */
+  /** House live search polling flag; fail-soft (on unless explicitly "false"). */
   HOUSE_LIVE_SEARCH_ENABLED?: string;
   /** Days into January during which the prior-year House index is also swept
    *  (year-boundary gap; default 14, 0 disables). Infisical-tunable. */

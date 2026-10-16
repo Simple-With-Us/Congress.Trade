@@ -51,16 +51,14 @@ import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 /** Env shape (read defensively — Env is the frozen foundation contract). */
 type EnvWithFlags = Env & { HOUSE_LIVE_SEARCH_ENABLED?: string };
 
-/** Live House search is disabled by default because ViewMemberSearchResult
- *  refreshes on the same once-daily ~09:00 ET (13:00 UTC EDT) cycle as
- *  {YEAR}FD.ZIP and omits FilingDate.  Opt in via
- *  HOUSE_LIVE_SEARCH_ENABLED=true (Infisical-tunable without a redeploy). */
+/** Live House search is on unless explicitly disabled (fail-soft, and
+ *  Infisical-tunable so it can be toggled without a redeploy). */
 async function houseLiveSearchEnabled(env: Env): Promise<boolean> {
   try {
     const live = (await resolveSecret(env, 'HOUSE_LIVE_SEARCH_ENABLED')).value;
-    return (live ?? (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED) === 'true';
+    return (live ?? (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED) !== 'false';
   } catch {
-    return (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED === 'true';
+    return (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED !== 'false';
   }
 }
 
@@ -624,6 +622,8 @@ const HOUSE_PRIOR_YEAR_KV_KEY = 'house_prior_year:last_fetch_at';
  *  bulk-XML window. Escalate to console.error (Sentry-visible) once per
  *  sustained outage window instead of warn-spam that nobody sees. */
 const HOUSE_LIVE_SEARCH_FAILS_KV_KEY = 'house_live_search:consecutive_failures';
+const HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY = 'house_live_search:last_fetch_at';
+const HOUSE_LIVE_SEARCH_FETCH_INTERVAL_MS = 1800_000;
 const HOUSE_LIVE_SEARCH_ESCALATE_EVERY = 12;
 
 /**
@@ -696,54 +696,73 @@ async function pollHouse(
     }
   }
 
-  // Optional live-search overlay (opt-in via HOUSE_LIVE_SEARCH_ENABLED=true).
-  // Fail-soft — a flaky/anti-bot live endpoint or per-source timeout after the
-  // current-year bulk XML has already been fetched must never discard the bulk
-  // rows above unless the outer tickSignal aborted.  INSERT OR IGNORE de-dupes
-  // the overlap with the bulk rows above.
+  // Intraday live-search overlay: throttled to at most once every 30 minutes
+  // (house_live_search:last_fetch_at) so it stays active without competing with
+  // the 1-minute 8:00 AM Central bulk-ZIP peak polls.  Fail-soft — a flaky live
+  // endpoint or per-source timeout after the current-year bulk XML has already
+  // been fetched must never discard the bulk rows above unless the outer
+  // tickSignal aborted.
   if (await houseLiveSearchEnabled(env)) {
-    let liveErr: Error | null = null;
+    let liveDue = true;
     try {
-      const live = await pollHouseLiveSearch(year, fetch, { env, signal });
-      for (const f of live) {
-        if (!byDoc.has(f.pipelineDocId)) {
-          byDoc.set(f.pipelineDocId, houseDiscovery(f));
-        }
+      const lastLiveIso = env.CONFIG_KV ? await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY) : null;
+      const lastLiveMs = lastLiveIso ? Date.parse(lastLiveIso) : NaN;
+      if (Number.isFinite(lastLiveMs) && now.getTime() - lastLiveMs < HOUSE_LIVE_SEARCH_FETCH_INTERVAL_MS) {
+        liveDue = false;
       }
-    } catch (err) {
-      if (tickSignal?.aborted) throw err;
-      liveErr = err as Error;
+    } catch {
+      liveDue = true;
     }
-    // Consecutive-failure counter — fully isolated in its own try/catch. A KV
-    // blip here must never (a) fall into the poll's failure path and record a
-    // live-search *success* as a failure, nor (b) escape and abort the
-    // authoritative bulk persist/enqueue below. The observability overlay is
-    // strictly best-effort; the bulk path is not.
-    let fails = liveErr ? 1 : 0;
-    try {
-      if (env.CONFIG_KV) {
-        if (!liveErr) {
-          const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
-          if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
-        } else {
-          fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
-          await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+
+    if (liveDue) {
+      let liveErr: Error | null = null;
+      try {
+        const live = await pollHouseLiveSearch(year, fetch, { env, signal });
+        for (const f of live) {
+          if (!byDoc.has(f.pipelineDocId)) {
+            byDoc.set(f.pipelineDocId, houseDiscovery(f));
+          }
         }
+        try {
+          if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY, nowIso);
+        } catch {
+          // Best-effort throttle timestamp
+        }
+      } catch (err) {
+        if (tickSignal?.aborted) throw err;
+        liveErr = err as Error;
       }
-    } catch (counterErr) {
-      console.warn(
-        'watcher: house live-search failure-counter update failed (ignored):',
-        (counterErr as Error).message,
-      );
-    }
-    if (liveErr) {
-      if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
-        console.error(
-          `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
-          liveErr.message,
+      // Consecutive-failure counter — fully isolated in its own try/catch. A KV
+      // blip here must never (a) fall into the poll's failure path and record a
+      // live-search *success* as a failure, nor (b) escape and abort the
+      // authoritative bulk persist/enqueue below. The observability overlay is
+      // strictly best-effort; the bulk path is not.
+      let fails = liveErr ? 1 : 0;
+      try {
+        if (env.CONFIG_KV) {
+          if (!liveErr) {
+            const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
+            if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
+          } else {
+            fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
+            await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+          }
+        }
+      } catch (counterErr) {
+        console.warn(
+          'watcher: house live-search failure-counter update failed (ignored):',
+          (counterErr as Error).message,
         );
-      } else {
-        console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
+      }
+      if (liveErr) {
+        if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
+          console.error(
+            `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
+            liveErr.message,
+          );
+        } else {
+          console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
+        }
       }
     }
   }

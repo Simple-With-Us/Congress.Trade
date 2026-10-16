@@ -15,16 +15,14 @@
  *   is flat and regular, so a dependency-free regex/scan parser is robust and
  *   avoids pulling in fast-xml-parser.
  *
- * LIVE SEARCH (optional overlay, disabled by default unless HOUSE_LIVE_SEARCH_ENABLED=true):
+ * LIVE SEARCH (throttled intraday overlay, on by default every 30 min):
  *   The interactive UI at https://disclosures-clerk.house.gov/FinancialDisclosure
  *   posts to /FinancialDisclosure/ViewMemberSearchResult, which returns a single
  *   server-rendered Razor HTML table for the requested FilingYear (client-side
  *   DataTables paginates the DOM in the browser; the server ignores draw/start/length).
- *   Verified against production Clerk responses and PDF Last-Modified timestamps
- *   (2026-10-16): ViewMemberSearchResult refreshes on the exact same once-daily
- *   ~09:00 ET (13:00 UTC EDT) batch cycle as {YEAR}FD.ZIP and omits FilingDate,
- *   so pollHouseLiveSearch() is disabled by default to avoid redundant 207 KB HTML
- *   fetches inside the 7s watcher I/O budget.
+ *   pollHouseLiveSearch() runs as a fail-soft overlay throttled to once per 30
+ *   minutes so it stays active without competing with the 1-minute 8:00 AM
+ *   bulk-ZIP peak polls.
  *
  * FETCH ORDER: server-first.  Direct Clerk host, then Mac/scout
  * POST /fetch-house if HOUSE_RELAY_URL or INGEST_RELAY_URL is set and
