@@ -622,8 +622,6 @@ const HOUSE_PRIOR_YEAR_KV_KEY = 'house_prior_year:last_fetch_at';
  *  bulk-XML window. Escalate to console.error (Sentry-visible) once per
  *  sustained outage window instead of warn-spam that nobody sees. */
 const HOUSE_LIVE_SEARCH_FAILS_KV_KEY = 'house_live_search:consecutive_failures';
-const HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY = 'house_live_search:last_fetch_at';
-const HOUSE_LIVE_SEARCH_FETCH_INTERVAL_MS = 1800_000;
 const HOUSE_LIVE_SEARCH_ESCALATE_EVERY = 12;
 
 /**
@@ -696,42 +694,24 @@ async function pollHouse(
     }
   }
 
-  // Intraday live-search overlay: throttled to at most once every 30 minutes
-  // (house_live_search:last_fetch_at) so it stays active without competing with
-  // the 1-minute 8:00 AM Central bulk-ZIP peak polls.  Fail-soft — a flaky live
-  // endpoint or per-source timeout after the current-year bulk XML has already
-  // been fetched must never discard the bulk rows above unless the outer
-  // tickSignal aborted.
+  // Intraday live-search overlay: runs on each scheduled House poll (following
+  // the adaptive cadence: 60s in the morning burst, 4 min shoulder, ~10 min
+  // midday, 30 min overnight).  Fail-soft — a flaky live endpoint or per-source
+  // timeout after the current-year bulk XML has already been fetched must never
+  // discard the bulk rows above unless the outer tickSignal aborted.
   if (await houseLiveSearchEnabled(env)) {
-    let liveDue = true;
+    let liveErr: Error | null = null;
     try {
-      const lastLiveIso = env.CONFIG_KV ? await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY) : null;
-      const lastLiveMs = lastLiveIso ? Date.parse(lastLiveIso) : NaN;
-      if (Number.isFinite(lastLiveMs) && now.getTime() - lastLiveMs < HOUSE_LIVE_SEARCH_FETCH_INTERVAL_MS) {
-        liveDue = false;
+      const live = await pollHouseLiveSearch(year, fetch, { env, signal });
+      for (const f of live) {
+        if (!byDoc.has(f.pipelineDocId)) {
+          byDoc.set(f.pipelineDocId, houseDiscovery(f));
+        }
       }
-    } catch {
-      liveDue = true;
+    } catch (err) {
+      if (tickSignal?.aborted) throw err;
+      liveErr = err as Error;
     }
-
-    if (liveDue) {
-      let liveErr: Error | null = null;
-      try {
-        const live = await pollHouseLiveSearch(year, fetch, { env, signal });
-        for (const f of live) {
-          if (!byDoc.has(f.pipelineDocId)) {
-            byDoc.set(f.pipelineDocId, houseDiscovery(f));
-          }
-        }
-        try {
-          if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_LAST_FETCH_KV_KEY, nowIso);
-        } catch {
-          // Best-effort throttle timestamp
-        }
-      } catch (err) {
-        if (tickSignal?.aborted) throw err;
-        liveErr = err as Error;
-      }
       // Consecutive-failure counter — fully isolated in its own try/catch. A KV
       // blip here must never (a) fall into the poll's failure path and record a
       // live-search *success* as a failure, nor (b) escape and abort the
@@ -765,7 +745,6 @@ async function pollHouse(
         }
       }
     }
-  }
 
   const discovered: DiscoveredFiling[] = Array.from(byDoc.values());
   const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'house', nowIso);
