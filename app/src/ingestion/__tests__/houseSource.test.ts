@@ -133,10 +133,15 @@ describe('parseHouseSearchHtml', () => {
 });
 
 describe('buildHouseSearchBody', () => {
-  it('scopes the search to the requested filing year with a blank name', () => {
+  it('scopes the search to the requested filing year with a blank name and omits fake DataTables params', () => {
     const body = buildHouseSearchBody(2026);
     expect(body.get('FilingYear')).toBe('2026');
     expect(body.get('LastName')).toBe('');
+    expect(body.get('State')).toBe('');
+    expect(body.get('District')).toBe('');
+    expect(body.has('draw')).toBe(false);
+    expect(body.has('start')).toBe(false);
+    expect(body.has('length')).toBe(false);
   });
 });
 
@@ -156,7 +161,7 @@ describe('pollHouseLiveSearch', () => {
       });
     });
 
-    const rows = await pollHouseLiveSearch(2026, fetchMock as unknown as typeof fetch);
+    const rows = await pollHouseLiveSearch(2026, fetchMock as unknown as typeof fetch, { delayMs: 0 });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(String(fetchMock.mock.calls[0][0])).toContain('/FinancialDisclosure/ViewSearch');
@@ -171,6 +176,44 @@ describe('pollHouseLiveSearch', () => {
     });
 
     expect(rows.map((row) => row.pipelineDocId)).toEqual(['H-2026-20026001', 'H-2026-20026002']);
+  });
+
+  it('issues only a single POST even when ViewMemberSearchResult returns >100 PTR rows in one HTML table', async () => {
+    const manyRowsHtml = [
+      '<table><tbody>',
+      ...Array.from({ length: 150 }, (_, idx) => {
+        const docId = String(20035000 + idx);
+        return `<tr role="row"><td data-label="Name" class="memberName"><a href="public_disc/ptr-pdfs/2026/${docId}.pdf">Kelly, Hon.. Robin</a></td><td data-label="Office">IL02</td><td data-label="Filing Year">2026</td><td data-label="Filing">PTR Original</td></tr>`;
+      }),
+      '</tbody></table>',
+    ].join('\n');
+
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      if (fetchMock.mock.calls.length === 1) {
+        return new Response('<html></html>', { status: 200 });
+      }
+      return new Response(manyRowsHtml, {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      });
+    });
+
+    const rows = await pollHouseLiveSearch(2026, fetchMock as unknown as typeof fetch, {
+      delayMs: 0,
+      proxyUrl: 'http://internal-proxy.local:3128',
+    });
+
+    // Exactly 1 GET (/ViewSearch) + 1 POST (/ViewMemberSearchResult), no second POST loop
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(rows).toHaveLength(150);
+    expect(rows[0].pipelineDocId).toBe('H-2026-20035000');
+    expect(rows[149].pipelineDocId).toBe('H-2026-20035149');
+
+    // Never leak internal proxy URL header to the Clerk origin
+    const getHeaders = (fetchMock.mock.calls[0][1] as RequestInit)?.headers as Record<string, string>;
+    const postHeaders = (fetchMock.mock.calls[1][1] as RequestInit)?.headers as Record<string, string>;
+    expect(getHeaders['x-residential-proxy-url']).toBeUndefined();
+    expect(postHeaders['x-residential-proxy-url']).toBeUndefined();
   });
 
   it('automatically falls back to public proxy relays on attempt 2 when direct fetch fails', async () => {

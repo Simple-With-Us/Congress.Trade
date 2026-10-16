@@ -51,14 +51,16 @@ import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 /** Env shape (read defensively — Env is the frozen foundation contract). */
 type EnvWithFlags = Env & { HOUSE_LIVE_SEARCH_ENABLED?: string };
 
-/** Live House search is on unless explicitly disabled (fail-soft, and
- *  Infisical-tunable so it can be toggled without a redeploy). */
+/** Live House search is disabled by default because ViewMemberSearchResult
+ *  refreshes on the same once-daily ~09:00 ET (13:00 UTC EDT) cycle as
+ *  {YEAR}FD.ZIP and omits FilingDate.  Opt in via
+ *  HOUSE_LIVE_SEARCH_ENABLED=true (Infisical-tunable without a redeploy). */
 async function houseLiveSearchEnabled(env: Env): Promise<boolean> {
   try {
     const live = (await resolveSecret(env, 'HOUSE_LIVE_SEARCH_ENABLED')).value;
-    return (live ?? (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED) !== 'false';
+    return (live ?? (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED) === 'true';
   } catch {
-    return (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED !== 'false';
+    return (env as EnvWithFlags).HOUSE_LIVE_SEARCH_ENABLED === 'true';
   }
 }
 
@@ -645,7 +647,12 @@ export function inHousePriorYearWindow(now: Date, overlapDays: number): boolean 
  * Poll the House yearly bulk index, diff against D1, enqueue new PTRs.
  * Throws on any failure (caught by the per-source guard in runWatcher).
  */
-async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<number> {
+async function pollHouse(
+  env: Env,
+  now: Date,
+  signal?: AbortSignal,
+  tickSignal?: AbortSignal,
+): Promise<number> {
   const nowIso = now.toISOString();
   const year = Number(
     new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric' }).format(now),
@@ -660,10 +667,11 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
   }
 
   // YEAR-BOUNDARY GAP: for the first N days of a new ET year, also sweep the
-  // PRIOR year's index (hourly, not every poll). A PTR filed Dec 30 can enter
+  // PRIOR year's index (hourly, not every poll).  A PTR filed Dec 30 can enter
   // the {YEAR-1}FD index days later — after we've switched to polling {YEAR} —
-  // and would otherwise never be discovered. Fail-soft: a prior-year fetch
-  // problem must not fail the current-year poll.
+  // and would otherwise never be discovered.  Fail-soft: a prior-year fetch
+  // problem (including a per-source 7s timeout after current-year succeeded)
+  // must not fail the current-year poll unless the outer tickSignal aborted.
   const overlapDays = await tunableInt(
     env,
     'HOUSE_PRIOR_YEAR_OVERLAP_DAYS',
@@ -683,14 +691,16 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
         if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_PRIOR_YEAR_KV_KEY, nowIso);
       }
     } catch (err) {
-      if (signal?.aborted) throw err;
+      if (tickSignal?.aborted) throw err;
       console.warn('watcher: house prior-year index poll failed (current year unaffected):', (err as Error).message);
     }
   }
 
-  // Intraday overlay: catch same-day PTRs that the daily XML hasn't picked up
-  // yet. Fail-soft — a flaky/anti-bot live endpoint must never break the stable
-  // bulk path. INSERT OR IGNORE de-dupes the overlap with the bulk rows above.
+  // Optional live-search overlay (opt-in via HOUSE_LIVE_SEARCH_ENABLED=true).
+  // Fail-soft — a flaky/anti-bot live endpoint or per-source timeout after the
+  // current-year bulk XML has already been fetched must never discard the bulk
+  // rows above unless the outer tickSignal aborted.  INSERT OR IGNORE de-dupes
+  // the overlap with the bulk rows above.
   if (await houseLiveSearchEnabled(env)) {
     let liveErr: Error | null = null;
     try {
@@ -701,7 +711,7 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
         }
       }
     } catch (err) {
-      if (signal?.aborted) throw err;
+      if (tickSignal?.aborted) throw err;
       liveErr = err as Error;
     }
     // Consecutive-failure counter — fully isolated in its own try/catch. A KV
@@ -1062,7 +1072,7 @@ export async function runWatcher(
         await setLastAttemptAt(env, 'house', now);
         // Fresh 7s budget per source.  A timer created once at tick entry
         // would already be spent by the time Senate and OGE run.
-        await pollHouse(env, now, watcherSourceIoSignal(options.signal));
+        await pollHouse(env, now, watcherSourceIoSignal(options.signal), options.signal);
         result.house = 'success';
       }
     }
