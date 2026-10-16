@@ -3030,7 +3030,7 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
   // (covered above alongside the sector canonicalization fix, since both land
   // in the same loadTrSectorFlow() change.)
 
-  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 2-week trial -------
+  // ---- 7. Canonical Premium pricing = $8.99/mo · $79.99/yr · 1-week trial -------
   it('shows $8.99/mo and $79.99/yr consistently across the dashboard pricing surfaces (alerts gate note + pricing modal)', () => {
     // Each gate is its own surface.  A single shared toContain cannot tell
     // the export note from the alerts note.
