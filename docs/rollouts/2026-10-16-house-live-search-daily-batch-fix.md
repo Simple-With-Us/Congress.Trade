@@ -27,7 +27,7 @@ The House live-search endpoint is an intraday overlay on the daily bulk XML inde
 
 ## Decisions
 
-- Keep `HOUSE_LIVE_SEARCH_ENABLED` enabled by default (`!== 'false'`) and throttle successful `pollHouseLiveSearch()` runs to once per 30 minutes via `house_live_search:last_fetch_at` in `CONFIG_KV`.  Failed runs intentionally do not set `house_live_search:last_fetch_at` so they can retry on the next tick and advance the 3-strike `house_live_search:consecutive_fails` alert.
+- Keep `HOUSE_LIVE_SEARCH_ENABLED` enabled by default (`!== 'false'`) and throttle successful `pollHouseLiveSearch()` runs to once per 30 minutes via `house_live_search:last_fetch_at` in `CONFIG_KV`.  Failed runs intentionally do not set `house_live_search:last_fetch_at` so they can retry on the next tick and advance the 12-failure `house_live_search:consecutive_failures` alert escalation.
 - Isolate `tickSignal` from the per-source `signal` so a slow `pollHouseLiveSearch()` call never aborts and discards already-fetched `fetchHouseIndex()` bulk rows.
 - Include `FinancialModelingPrep.com` (`fmp`) in `publicLatencyProviders()` and run `renderSpeedProof()` on boot and `subs` tab restore so the public website displays live FMP vs. Congress.Trade latency comparisons.
 
