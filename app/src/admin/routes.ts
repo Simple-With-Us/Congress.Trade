@@ -1001,6 +1001,28 @@ function auditAdminSubscriptionAction(
   }
 }
 
+export const ReviewEditItemSchema = z.object({
+  filerId: z.string().nullable().optional(),
+  txDate: z.string().nullable().optional(),
+  owner: z.string().nullable().optional(),
+  assetName: z.string().optional(),
+  ticker: z.string().nullable().optional(),
+  assetType: z.string().nullable().optional(),
+  assetTypeName: z.string().nullable().optional(),
+  txType: z.string().optional(),
+  amountMin: z.number().nullable().optional(),
+  amountMax: z.number().nullable().optional(),
+  isOption: z.boolean().optional(),
+  capGainsOver200: z.boolean().optional(),
+  rawText: z.string().optional(),
+  filingStatus: z.string().nullable().optional(),
+  subholding: z.string().nullable().optional(),
+  location: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  supplementalText: z.string().nullable().optional(),
+  confidence: z.number().optional(),
+}).passthrough();
+
 interface EditedTx {
   filerId?: string | null;
   txDate?: string | null;
@@ -2847,7 +2869,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // confirm/manual: insert the (corrected or hand-entered) transactions.
     // 'manual' tags provenance so admins can tell hand-entered rows from machine reads.
     const source: TxSource = decision === 'manual' ? 'manual' : 'primary';
-    if (!Array.isArray(body.edits)) {
+    const editsParse = z.array(ReviewEditItemSchema).safeParse(body.edits);
+    if (!editsParse.success) {
       return c.json(
         {
           error:
@@ -2858,7 +2881,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         400,
       );
     }
-    const rawEdits = body.edits as unknown[];
+    const rawEdits = editsParse.data;
     if (rawEdits.length === 0) {
       return c.json(
         {
