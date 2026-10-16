@@ -94,6 +94,7 @@ import {
   hasHardFailureFlags,
 } from '../extraction/normalizer.ts';
 import { storedReviewBlocksSmallerVisionSubmit, storedReviewTransactionCount } from '../extraction/visionSubmitGuard.ts';
+import { collapseDuplicateSpans } from '../extraction/localVisionDupeGuard.ts';
 import { PIPELINE_TX_SOURCES_SQL, VISION_SUPERSEDE_REASON } from '../extraction/sourceSupersede.ts';
 import { EXTRACTION_PROMPT_VERSION } from '../extraction/visionLlm.ts';
 import { deprecatePredecessorFilingTransactions, duplicateLineupReason, enqueueAgreementCheck, processAgreementDoc, loadDocBytes, loadFilingRow, sameRowSet, type AgreementModels } from '../extraction/agreement.ts';
@@ -6457,7 +6458,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!docId) {
       return c.json({ error: 'docId is required' }, 400);
     }
-    const parsedTx = Array.isArray(body.transactions) ? (body.transactions as ParsedTx[]) : [];
+    const parsedTxIncoming = Array.isArray(body.transactions) ? (body.transactions as ParsedTx[]) : [];
     const extractor = typeof body.extractor === 'string' ? body.extractor : 'mac_vision_v1';
     const workerId = typeof body.workerId === 'string' ? body.workerId : 'local_mac_1';
     // Mac worker → local_mac; Coolify CPU worker → server_cpu; default local_mac for back-compat.
@@ -6466,6 +6467,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       rawSource === 'server_cpu' || extractor.startsWith('server_cpu')
         ? 'server_cpu'
         : 'local_mac';
+
+    // Collapse contiguous duplicate runs BEFORE the stored-review size comparison
+    // below, so a repeated-row flood cannot present itself as a larger extract
+    // than the one it would replace.  H-2026-9116378 arrived with 286 rows of
+    // which 251 were one trade at contiguous rowIndex 35..285.
+    const deduped = collapseDuplicateSpans(parsedTxIncoming, txSource);
+    const parsedTx = deduped.rows;
 
     try {
       const existingReview = await get<{ reason: string | null; payload: string | null }>(
@@ -6547,6 +6555,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         needsReview: result.needsReview,
         minConfidence: result.minConfidence,
         txCount: result.transactions.length,
+        submittedTxCount: parsedTxIncoming.length,
+        duplicateSpanCollapsed: deduped.removed,
+        duplicateSpanRuns: deduped.runs.map((r) => ({
+          contentHash: r.contentHash,
+          count: r.count,
+          firstIndex: r.firstIndex,
+          lastIndex: r.lastIndex,
+        })),
       });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
