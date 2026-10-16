@@ -13,6 +13,8 @@ import { Hono } from 'hono';
 import { buildUiRouter } from '../routes.ts';
 import { browserSecurityHeadersMiddleware } from '../../security/headers.ts';
 import { resetSitemapCacheForTests } from '../sitemap.ts';
+import { APP_STORE_URL, testFlightUrl } from '../appLinks.ts';
+import { DASHBOARD_HTML } from '../dashboardHtml.ts';
 
 describe('/robots.txt', () => {
   it('allows the read-only render paths the SPA needs under the general Disallow: /api/', async () => {
@@ -174,13 +176,20 @@ describe('Datadog RUM injection', () => {
   });
 });
 
-describe('iOS Beta / TestFlight redirect routes', () => {
-  it('uses the app-specific invitation when no install URL is configured', async () => {
+describe('iOS install redirect routes', () => {
+  it('shares the released listing across dashboard links and the install fallback', () => {
+    expect(testFlightUrl()).toBe(APP_STORE_URL);
+    expect(testFlightUrl({ IOS_APP_STORE_ID: 'invalid' } as never)).toBe(APP_STORE_URL);
+    expect(DASHBOARD_HTML.split(APP_STORE_URL)).toHaveLength(7);
+    expect(DASHBOARD_HTML).not.toContain('href="null"');
+  });
+
+  it('uses the released App Store listing when no install URL is configured', async () => {
     const app = buildUiRouter();
     for (const path of ['/beta', '/testflight', '/ios', '/app']) {
       const res = await app.request(`http://localhost${path}`, {}, {} as never);
       expect(res.status).toBe(302);
-      expect(res.headers.get('location')).toBe('https://testflight.apple.com/join/VNUEU6Ge');
+      expect(res.headers.get('location')).toBe(APP_STORE_URL);
     }
   });
 
@@ -193,7 +202,7 @@ describe('iOS Beta / TestFlight redirect routes', () => {
   ])('does not advertise an invalid configured install destination: %s', async (url) => {
     const app = buildUiRouter();
     const res = await app.request('http://localhost/beta', {}, { IOS_TESTFLIGHT_URL: url } as never);
-    expect(res.headers.get('location')).toBe('https://testflight.apple.com/join/VNUEU6Ge');
+    expect(res.headers.get('location')).toBe(APP_STORE_URL);
   });
 
   it('redirects /beta, /testflight, /ios, /app to the configured TestFlight or App Store URL', async () => {
