@@ -2873,10 +2873,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!editsParse.success) {
       return c.json(
         {
-          error:
-            decision === 'confirm'
+          error: !Array.isArray(body.edits)
+            ? (decision === 'confirm'
               ? 'confirm requires explicit transaction edits; choose a model, edit the queued rows, or reject the item'
-              : 'manual review requires explicit transaction edits',
+              : 'manual review requires explicit transaction edits')
+            : 'one or more edits have the wrong field types; fix the listed rows and retry',
+          ...(Array.isArray(body.edits) ? { issues: editsParse.error.issues.map((issue) => ({
+            path: issue.path, code: issue.code, message: issue.message,
+          })) } : {}),
         },
         400,
       );
@@ -6527,7 +6531,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // CT-2415 Guards 2 and 3. Both run AFTER the flood collapse, so a 286-row
     // duplicate burst is judged as the handful of real reads underneath it
     // rather than as 286 rows of apparently-constant data. Neither guard drops
-    // a row: Guard 2 leaves the amount unread, Guard 3 leaves the type unread,
+    // a row: Guard 2 leaves the amount unread, Guard 3 preserves the type with a review warning,
     // and both route the filing to review instead of publishing an inferred
     // value.
     const bandChecked = refuseIllegibleBandAmounts(deduped.rows);

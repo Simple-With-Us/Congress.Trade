@@ -153,3 +153,22 @@ describe('POST /review/:docId — under-transcription guard', () => {
     expect(body).toMatchObject({ decision: 'manual', source: 'manual', resolved: true });
   });
 });
+
+
+describe('POST /review/:docId type diagnostics', () => {
+  it('distinguishes an invalid row field from missing edits', async () => {
+    const { db, runSql } = fakeDb(null);
+    const result = await postReview(db, { decision: 'confirm', reviewRevision: 1, edits: [{ ...VALID_EDIT, txType: 42 }] });
+    expect(result.status).toBe(400);
+    expect(String(result.body.error)).toContain('wrong field types');
+    expect(result.body.issues).toEqual(expect.arrayContaining([expect.objectContaining({ path: [0, 'txType'] })]));
+    expect(runSql).toHaveLength(0);
+  });
+  it('keeps the domain nudge for absent edits', async () => {
+    const { db } = fakeDb(null);
+    const result = await postReview(db, { decision: 'confirm', reviewRevision: 1 });
+    expect(result.status).toBe(400);
+    expect(String(result.body.error)).toContain('requires explicit transaction edits');
+    expect(result.body.issues).toBeUndefined();
+  });
+});

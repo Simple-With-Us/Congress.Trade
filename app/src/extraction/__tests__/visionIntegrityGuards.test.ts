@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   ILLEGIBLE_BAND_WARNING,
+  CONSTANT_COLUMN_WARNING,
   MIN_CONSTANT_COLUMN_ROWS,
   findConstantColumnReads,
   findIllegibleBandAmounts,
@@ -140,7 +141,8 @@ describe('Guard 3 — constant column reads', () => {
     const { rows: cleaned, rejections } = rejectConstantColumnReads(rows);
     expect(rejections).toHaveLength(1);
     expect(cleaned).toHaveLength(rows.length);
-    expect(cleaned.every((r) => r.txType === null)).toBe(true);
+    expect(cleaned.every((r) => r.txType === 'B')).toBe(true);
+    expect(cleaned.every((r) => r.extractionWarnings?.includes(CONSTANT_COLUMN_WARNING))).toBe(true);
   });
 
   it('CONTROL: genuinely varying types pass through untouched', () => {
