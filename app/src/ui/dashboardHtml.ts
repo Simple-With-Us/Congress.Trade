@@ -129,13 +129,13 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 <script>
   // Admin-controlled, site-wide logo style (injected at serve time).
   window.__LOGO_DISPLAY__ = "%LOGO_DISPLAY%";
-  // Theme before first paint: default LIGHT (owner 2026-08-10); stored may be
-  // light|dark|system.  Sepia was removed (owner 2026-08-21: "too dark of a
-  // color that doesn't look like old fashioned paper", only half-themed) —
-  // any stored 'sepia' value is migrated to 'light' here so a returning
-  // visitor never gets stuck failing validation.
+  // Theme before first paint: default SYSTEM (follows prefers-color-scheme);
+  // stored may be light|dark|system.  Sepia was removed (owner 2026-08-21:
+  // "too dark of a color that doesn't look like old fashioned paper", only
+  // half-themed) — any stored 'sepia' value is migrated to 'light' here so a
+  // returning visitor never gets stuck failing validation.
   (function () {
-    var pref = 'light';
+    var pref = 'system';
     try {
       var s = localStorage.getItem('ui-theme');
       if (s === 'sepia') {
@@ -4836,8 +4836,10 @@ function fmtMs(ms) {
   return fmtDuration(Math.round(ms / 1000));
 }
 
-/* ---- light / dark / system theme (per-visitor preference; default LIGHT) ---- */
-/* Mirrors Socratic.Trade console: Light | Dark | System segmented control. */
+/* ---- light / dark / system theme (per-visitor preference; default SYSTEM) ---- */
+/* Mirrors Socratic.Trade console: Light | Dark | System segmented control.
+   New visitors follow OS prefers-color-scheme by default; the segmented
+   control in the hamburger menu / header is an explicit override. */
 function readThemePref() {
   try {
     var s = localStorage.getItem('ui-theme');
@@ -4850,7 +4852,7 @@ function readThemePref() {
     }
     if (s === 'light' || s === 'dark' || s === 'system') return s;
   } catch (e) {}
-  return 'light';
+  return 'system';
 }
 function resolveTheme(pref) {
   if (pref === 'dark' || pref === 'light') return pref;
@@ -14570,7 +14572,7 @@ renderTradesHeader();
 
 window.addEventListener('resize', function () { syncTradesTableWidth(); applyColumnWidthClasses(); });
 
-// Apply resolved theme (default light; respects light|dark|system pref).
+// Apply resolved theme (default system; respects light|dark|system pref).
 applyTheme(resolveTheme(readThemePref()));
 
 // Initial loading states + boot.

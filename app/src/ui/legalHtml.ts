@@ -20,12 +20,13 @@ const CONTACT = 'support@congress.trade';
  * Dark tokens are the Privacy Policy reference (navy, 26px title, dim
  * "Effective …" subtitle, numbered h2s, system sans).  Light tokens and
  * the Light / Dark / System control are the same path the dashboard uses
- * (`ui-theme` in localStorage, default light).  Do not give one page a
- * second shell.
+ * (`ui-theme` in localStorage, default system — follows prefers-color-scheme
+ * for new visitors; the segmented control in the header is an explicit
+ * override).  Do not give one page a second shell.
  */
 const LEGAL_THEME_BOOT = /* html */ `<script>
   (function () {
-    var pref = 'light';
+    var pref = 'system';
     try {
       var s = localStorage.getItem('ui-theme');
       if (s === 'sepia') {
@@ -80,7 +81,7 @@ const LEGAL_THEME_RUNTIME = /* html */ `<script>
       }
       if (s === 'light' || s === 'dark' || s === 'system') return s;
     } catch (e) {}
-    return 'light';
+    return 'system';
   }
   function resolveTheme(pref) {
     if (pref === 'dark' || pref === 'light') return pref;
