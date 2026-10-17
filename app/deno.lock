@@ -2,6 +2,7 @@
   "version": "5",
   "specifiers": {
     "npm:@aws-sdk/client-s3@3.1149.0": "3.1149.0",
+    "npm:@aws-sdk/client-s3@3.1150.0": "3.1150.0",
     "npm:@cloudflare/workers-types@5": "5.20261007.1",
     "npm:@fontsource/zilla-slab@^5.3.0": "5.3.0",
     "npm:@google/genai@^2.23.0": "2.28.0",
@@ -13,7 +14,7 @@
     "npm:@sentry/deno@11": "11.4.0",
     "npm:@sentry/deno@^11.4.0": "11.4.0",
     "npm:@types/node@26.6.5": "26.6.5",
-    "npm:@typescript-eslint/eslint-plugin@^8.71.0": "8.71.1_@typescript-eslint+parser@8.71.1__eslint@10.12.0__typescript@5.9.3_eslint@10.12.0_typescript@5.9.3",
+    "npm:@typescript-eslint/eslint-plugin@^8.71.0": "8.71.1_@typescript-eslint+parser@8.71.1_eslint@10.12.0_typescript@5.9.3",
     "npm:@typescript-eslint/parser@^8.71.0": "8.71.1_eslint@10.12.0_typescript@5.9.3",
     "npm:@vitest/coverage-v8@^5.0.3": "5.0.3_vitest@5.0.3_@types+node@26.6.5",
     "npm:cheerio@^1.2.0": "1.2.0",
@@ -30,7 +31,7 @@
     "npm:unpdf@^1.6.2": "1.8.1",
     "npm:unpdf@^1.8.1": "1.8.1",
     "npm:vite@^8.3.2": "8.3.3_@types+node@26.6.5",
-    "npm:vitest@^5.0.3": "5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3__@types+node@26.6.5",
+    "npm:vitest@^5.0.3": "5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3",
     "npm:zod@^4.4.3": "4.6.5",
     "npm:zod@^4.6.5": "4.6.5"
   },
@@ -47,6 +48,22 @@
     },
     "@aws-sdk/client-s3@3.1149.0": {
       "integrity": "sha512-wEccG+3/ap7iIBO4DbWwqNHh2u5Qm5OCQJzJaAvtVFIoZbp0qia8HIXv4rpnNmJJEX8205mlq67F9QJ0nKlcxg==",
+      "dependencies": [
+        "@aws-sdk/checksums",
+        "@aws-sdk/core",
+        "@aws-sdk/credential-provider-node",
+        "@aws-sdk/middleware-sdk-s3",
+        "@aws-sdk/signature-v4-multi-region",
+        "@aws-sdk/types",
+        "@smithy/core",
+        "@smithy/fetch-http-handler",
+        "@smithy/node-http-handler",
+        "@smithy/types",
+        "tslib@2.8.1"
+      ]
+    },
+    "@aws-sdk/client-s3@3.1150.0": {
+      "integrity": "sha512-tv7KzK7PY7GqBwA6nzAVAsazIY/tAagDjlqvmCwlIYpH2SMfUuD6pJklg++LGcMaNy5p0VMvz+F+/es1BpoyRw==",
       "dependencies": [
         "@aws-sdk/checksums",
         "@aws-sdk/core",
@@ -982,7 +999,7 @@
         "@types/node"
       ]
     },
-    "@typescript-eslint/eslint-plugin@8.71.1_@typescript-eslint+parser@8.71.1__eslint@10.12.0__typescript@5.9.3_eslint@10.12.0_typescript@5.9.3": {
+    "@typescript-eslint/eslint-plugin@8.71.1_@typescript-eslint+parser@8.71.1_eslint@10.12.0_typescript@5.9.3": {
       "integrity": "sha512-nNlBf6HuotqMgZvSkWD5hNdemiBIxQ2NmrlgfcUIeZRs+BbakjscCQRq/Hb74EFVnFiSWWdL12JruqwBy3ERDw==",
       "dependencies": [
         "@eslint-community/regexpp",
@@ -1103,7 +1120,7 @@
         "@vitest/istanbul-lib-coverage"
       ]
     },
-    "@vitest/mocker@5.0.3_vite@8.3.3__@types+node@26.6.5_@types+node@26.6.5": {
+    "@vitest/mocker@5.0.3_vite@8.3.3_@types+node@26.6.5": {
       "integrity": "sha512-T8sWAIbkSyAjkwTcaEc3Iu0o9A27X1/kdXrizhZkGuSKScRQtRzclfAMpOTcGdXCsqxeWlpGy3XjqaW8CpLORg==",
       "dependencies": [
         "@jridgewell/trace-mapping",
@@ -2117,7 +2134,7 @@
       ],
       "bin": true
     },
-    "vitest@5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3__@types+node@26.6.5": {
+    "vitest@5.0.3_@types+node@26.6.5_@vitest+coverage-v8@5.0.3_vite@8.3.3": {
       "integrity": "sha512-xMw97S3rjdtj5dkVat7jCsqWBpvchs3RlpQctUqwJD0KkERk40vz2fJ77lDwW/Vzh/pk18eItYAzkodhSes3jQ==",
       "dependencies": [
         "@opentelemetry/api",
@@ -2226,7 +2243,7 @@
   },
   "workspace": {
     "dependencies": [
-      "npm:@aws-sdk/client-s3@3.1149.0",
+      "npm:@aws-sdk/client-s3@3.1150.0",
       "npm:@cloudflare/workers-types@5",
       "npm:@google/genai@^2.23.0",
       "npm:@libsql/client@0.18",
