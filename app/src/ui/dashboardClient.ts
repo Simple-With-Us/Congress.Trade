@@ -770,7 +770,7 @@ function applyTheme(effective) {
   }
   syncTickerLogoThemes(theme);
   var meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute('content', theme === 'dark' ? '#08111f' : '#eff3f8');
+  if (meta) meta.setAttribute('content', theme === 'dark' ? '#1c1c1e' : '#ffffff');
   syncThemeSegUI();
 }
 function syncThemeSegUI() {
@@ -7625,8 +7625,8 @@ function renderAlertsMini() {
   var best = pub && isLatencyAhead(pub) ? speedBoastProvider(pub) : null;
   if (!best) { box.className = 'speed-mini'; box.innerHTML = ''; return; }
   box.className = 'speed-mini show';
-  box.innerHTML = '<span>⚡ Ahead of ' + esc(best.label) + ' on <span class="lead">' + fmtCount(best.usFirstCount) + ' of ' + fmtCount(best.matched) +
-    '</span> matched filings · typical lead ' + leadFigureHtml(best.medianLeadSec, { word: false }) + '</span>' +
+  box.innerHTML = '<span class="speed-mini-copy"><span class="speed-mini-bolt" aria-hidden="true">⚡</span><span>Ahead of ' + esc(best.label) + ' on <span class="lead">' + fmtCount(best.usFirstCount) + ' of ' + fmtCount(best.matched) +
+    '</span> matched filings · typical lead ' + leadFigureHtml(best.medianLeadSec, { word: false }) + '</span></span>' +
     '<button class="btn ghost sm" onclick="openSpeedProof()">See the scoreboard →</button>';
 }
 function openSpeedProof() {
@@ -9091,7 +9091,7 @@ function renderAccount() {
       '<div class="menu-section-label">Account</div>' +
       '<button type="button" onclick="closeAcctMobileMenu();openExportCsvDialog()">Export CSV</button>' +
       '<button type="button" onclick="closeAcctMobileMenu();showView(\\'subs\\')">Delivery</button>' +
-      '<a href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
+      '<a class="btn ghost" href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
       upgrade +
       (canManageSubscription()
         ? '<button type="button" onclick="closeAcctMobileMenu();manageBilling()">Manage Subscription</button>'
