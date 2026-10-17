@@ -3181,9 +3181,12 @@ export const DASHBOARD_CSS = /* css */ `
   .owner-alert-title { font-weight: 700; flex: 0 0 auto; }
   .owner-alert-detail { flex: 1 1 320px; color: #374151; }
 
-  /* Keep filters on the content ground, separate from the white masthead. */
+  /* Keep filters on the content ground, separate from the white masthead.
+     The flexible track stays on the nav column (brand and account are
+     auto), so a narrow signed-out window squeezes the tabs, never the
+     wordmark; the tabs right-align inside that track. */
   header.top {
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     grid-template-rows: auto; row-gap: 0;
     padding-bottom: 16px;
   }

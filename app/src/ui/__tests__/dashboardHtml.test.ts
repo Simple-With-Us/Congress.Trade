@@ -7454,6 +7454,10 @@ describe('masthead and Delivery layout update', () => {
     expect(DASHBOARD_SOURCE).toContain('margin: 0 auto; padding: 16px var(--ct-main-pad, 35px) 0;');
     expect(DASHBOARD_SOURCE).toContain('#ctFilters { display: block; padding: 14px var(--ct-main-pad, 14px) 0; }');
   });
+  it('keeps the flexible header track on the nav so a narrow window squeezes the tabs, not the wordmark', () => {
+    expect(DASHBOARD_SOURCE).toContain('header.top {\n    grid-template-columns: auto minmax(0, 1fr) auto;\n    grid-template-rows: auto; row-gap: 0;');
+    expect(DASHBOARD_SOURCE).not.toContain('grid-template-columns: minmax(0, 1fr) auto auto;');
+  });
   it('uses hanging bolt text and a right aligned scoreboard action', () => {
     expect(DASHBOARD_SOURCE).toContain('class="speed-mini-copy"');
     expect(DASHBOARD_SOURCE).toContain('class="speed-mini-bolt"');
