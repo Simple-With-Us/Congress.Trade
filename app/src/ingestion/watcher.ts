@@ -711,8 +711,16 @@ async function pollHouse(
     try {
       const live = await pollHouseLiveSearch(year, fetch, { env, signal });
       for (const f of live) {
-        if (!byDoc.has(f.pipelineDocId)) {
+        const existing = byDoc.get(f.pipelineDocId);
+        if (!existing) {
           byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'live' });
+        } else if (existing.discoveredVia === 'bulk') {
+          // Seen by BOTH the bulk index and live search this poll: live search
+          // did surface it, so attribute it to 'live' (otherwise the stale
+          // bulk-discovery alert would false-positive).  Keep the bulk record
+          // itself: the live-search HTML carries no FilingDate, so replacing it
+          // would insert filed_date NULL.
+          byDoc.set(f.pipelineDocId, { ...existing, discoveredVia: 'live' });
         }
       }
     } catch (err) {
@@ -785,8 +793,48 @@ export interface StaleBulkDiscoveryAlert {
 }
 
 /**
+ * Latest instant a filed_date can denote, so the filing's age is a lower bound.
+ * The House bulk XML reports a
+ * day-granularity `M/D/YYYY` (normalized rows hold `YYYY-MM-DD`), which says
+ * nothing about the time of day.  Reading it as midnight UTC would make a
+ * filing filed earlier the same day look ~13h old at the morning bulk refresh,
+ * so a date-only value counts as filed at the END of that calendar day on the
+ * Clerk's ET clock: lateness is then a lower bound and a same-day discovery is
+ * never late.  A value that carries a time of day is parsed as given.
+ * Returns null for empty or unparseable input.
+ */
+export function filedInstantUpperBoundMs(filedDate: string | null | undefined): number | null {
+  const s = (filedDate ?? '').trim();
+  if (!s) return null;
+  const dayOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s) ?? /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  if (!dayOnly) {
+    const ms = Date.parse(s);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const iso = s.includes('-');
+  const y = Number(iso ? dayOnly[1] : dayOnly[3]);
+  const m = Number(iso ? dayOnly[2] : dayOnly[1]);
+  const d = Number(iso ? dayOnly[3] : dayOnly[2]);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  // Midnight ET starting the NEXT day is 04:00Z (EDT) or 05:00Z (EST).
+  const nextDayUtc = Date.UTC(y, m - 1, d + 1);
+  const etHour = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    hourCycle: 'h23',
+  });
+  for (const offsetHours of [4, 5]) {
+    const t = nextDayUtc + offsetHours * 3600000;
+    if (Number(etHour.format(t)) === 0) return t;
+  }
+  return nextDayUtc + 5 * 3600000;
+}
+
+/**
  * Pure helper: returns alerts for bulk-discovered filings older than the threshold.
  * Exported for testing; the console.error side effect lives in alertOnStaleBulkDiscoveries.
+ * `hoursLate` is measured from the end of the filed day in ET for day-only
+ * filed dates (see filedInstantUpperBoundMs).
  */
 export function findStaleBulkDiscoveries(
   inserted: DiscoveredFiling[],
@@ -799,8 +847,8 @@ export function findStaleBulkDiscoveries(
   for (const f of inserted) {
     if (f.discoveredVia !== 'bulk') continue;
     if (!f.filedDate) continue;
-    const filedMs = Date.parse(f.filedDate);
-    if (!Number.isFinite(filedMs)) continue;
+    const filedMs = filedInstantUpperBoundMs(f.filedDate);
+    if (filedMs === null) continue;
     const lateMs = nowMs - filedMs;
     if (lateMs <= BULK_DISCOVERY_ALERT_THRESHOLD_MS) continue;
     alerts.push({
@@ -832,7 +880,7 @@ export async function alertOnStaleBulkDiscoveries(
     console.error(
       `watcher: house filing ${a.docId} (${a.filerName ?? 'unknown member'}) ` +
       `filed ${a.filedDate} but first discovered via BULK index at ${a.discoveredAt} ` +
-      `(${a.hoursLate}h late) — live-search missed it intraday ` +
+      `(${a.hoursLate}h late, measured from the end of the filed day in ET) — live-search missed it intraday ` +
       `(live-search consecutive failures: ${a.liveSearchFails})`,
     );
   }

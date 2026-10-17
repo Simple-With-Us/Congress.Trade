@@ -1360,7 +1360,6 @@ export const LATENCY_SNAPSHOT_12H_SWEEP_SCHEMA_STATEMENTS = [
 export const GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS = [
   'ALTER TABLE filings ADD COLUMN prev_probe_at TEXT',
   'ALTER TABLE filings ADD COLUMN probe_interval_sec INTEGER',
-  'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
   'ALTER TABLE trade_latency_candidates ADD COLUMN congress_window_start TEXT',
 ] as const;
 
@@ -1455,6 +1454,16 @@ export const ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS = [
   'ALTER TABLE securities_ref ADD COLUMN enrichment_unavailable INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE securities_ref ADD COLUMN enrichment_unavailable_reason TEXT',
   'ALTER TABLE securities_ref ADD COLUMN enrichment_checked_at TEXT',
+] as const;
+
+/**
+ * 0106_filings_discovered_via.sql — which discovery path first surfaced a House
+ * filing ('live' intraday search or 'bulk' daily index); feeds the stale
+ * bulk-discovery alert in the watcher.  0105 is reserved for
+ * 0105_filers_bioguide_lower_indexes.sql (open PR #2775).
+ */
+export const FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
 ] as const;
 
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
@@ -1623,6 +1632,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
   // 0104_enrichment_unavailable.sql
   ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
+  // 0106_filings_discovered_via.sql (0105 reserved for #2775)
+  ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [
