@@ -268,6 +268,28 @@ function meta(f: CommonQuery, extra: Record<string, unknown> = {}): Record<strin
 export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
 
+  // CT-2418: every route in this router is public and user-independent (the
+  // router is mounted bare at /api/analytics with no auth middleware), and every
+  // one of them already wraps its work in the server-side `cached()` KV helper.
+  // They just never told Cloudflare, so none of them could ever be served from
+  // the edge and each one re-hit the origin on every repeat view.
+  //
+  // s-maxage=300 / stale-while-revalidate=600 matches PUBLIC_STABLE_CACHE in
+  // delivery/rest.ts, the policy already applied to /api/market/*. Cloudflare's
+  // cache key includes the path, so ?ticker= style path params key naturally and
+  // one entity's response can never be served for another's URL.
+  //
+  // Only sets the header when a route has not already chosen its own, so
+  // /latency-summary keeps its explicit `public, max-age=300`.
+  r.use('*', async (c, next) => {
+    await next();
+    if (c.req.method === 'GET' && c.res.status === 200) {
+      if (!c.res.headers.has('Cache-Control')) {
+        c.res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
+      }
+    }
+  });
+
   // --- GET /summary -------------------------------------------------------
   r.get('/summary', async (c) => {
     const f = commonFromQuery(c.req.query());
