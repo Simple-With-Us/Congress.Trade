@@ -12,8 +12,11 @@
  */
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { Env } from '../shared/types.ts';
 import { DASHBOARD_HTML } from './dashboardHtml.ts';
+import { DASHBOARD_CSS, DASHBOARD_CSS_VERSION } from './dashboardStyles.ts';
+import { DASHBOARD_APP_JS, DASHBOARD_APP_JS_VERSION } from './dashboardClient.ts';
 import { TOS_HTML, PRIVACY_HTML } from './legalHtml.ts';
 import { getLogoDisplay } from '../shared/settings.ts';
 import {
@@ -166,13 +169,22 @@ const TICKER_QUERY_FORMAT = /^[A-Z][A-Z0-9.\-]{0,9}$/;
 
 /** Whether ?ticker= names a security that has actually traded (never
  *  throws) — gates the company share card so arbitrary query text can't be
- *  echoed back as branded og:title/og:description (SEOSOCIAL-06). */
+ *  echoed back as branded og:title/og:description (SEOSOCIAL-06).
+ *
+ *  CT-2418: the FROM clause needs the `t` alias. TICKER_RESOLVED_SQL qualifies
+ *  every column as `t.<col>`, so selecting `FROM transactions` unaliased raised
+ *  `no such column: t.ticker`, the catch below swallowed it, and this function
+ *  returned false for *every* ticker — the ?ticker= company share card never
+ *  rendered, and the follow-on lookupTradeShareSummary query still ran because
+ *  tickerResolved was permanently false. */
 async function lookupTickerResolved(env: Env, ticker: string): Promise<boolean> {
   const t = ticker.trim().toUpperCase();
   if (!t || !TICKER_QUERY_FORMAT.test(t) || !env.DB) return false;
   try {
     const row = await env.DB
-      .prepare(`SELECT 1 FROM transactions WHERE ${TICKER_RESOLVED_SQL} AND ticker = ? LIMIT 1`)
+      .prepare(
+        `SELECT 1 FROM transactions t WHERE ${TICKER_RESOLVED_SQL} AND t.ticker = ? LIMIT 1`,
+      )
       .bind(t)
       .first();
     return !!row;
@@ -338,6 +350,31 @@ function renderLegalHtml(html: string, env: Env): string {
   return html.split('%GA_SCRIPT%').join(telemetryScripts(env));
 }
 
+/** CT-2418: let shared/edge caches serve the dashboard document instead of
+ *  re-rendering it at the origin on every hit. Matches the PUBLIC_STABLE_CACHE
+ *  policy already used for daily-grain public reads in delivery/rest.ts.
+ *
+ *  Gated on the entity deep-link params. `?member=`, `?ticker=` and `?trade=`
+ *  each render a *different* og:title/og:description from a DB lookup, and
+ *  Cloudflare's cache key includes the query string, so an ungated header would
+ *  let every distinct crawler URL become its own multi-hundred-KB edge object
+ *  and hand a paid tier an unbounded cache-fill vector. Bare `/`, `/?view=…`
+ *  and friends are pure functions of the build, so those cache normally. */
+const DASHBOARD_CACHE = 'public, s-maxage=300, stale-while-revalidate=600';
+const DASHBOARD_ENTITY_PARAMS = ['member', 'ticker', 'trade'] as const;
+
+function dashboardCacheControl(requestUrl: string): string | null {
+  try {
+    const params = new URL(requestUrl).searchParams;
+    for (const key of DASHBOARD_ENTITY_PARAMS) {
+      if ((params.get(key) || '').trim()) return null;
+    }
+    return DASHBOARD_CACHE;
+  } catch {
+    return null;
+  }
+}
+
 export function buildUiRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
   mountAppLinks(r); // iOS Universal Links (AASA + Smart App Banner) — src/ui/appLinks.ts.
@@ -345,8 +382,14 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   // Dashboard SPA. Hono's c.html() sets `content-type: text/html; charset=UTF-8`.
   // OG/Twitter meta is filled from the request URL so crawlers unfurl the
   // correct card for ?view=trends / ?ticker= / ?member= deep links.
-  r.get('/', async (c) => c.html(await renderDashboard(c.env, c.req.url)));
-  r.get('/admin', async (c) => c.html(await renderDashboard(c.env, c.req.url)));
+  const serveDashboard = async (c: Context<{ Bindings: Env }>) => {
+    const html = await renderDashboard(c.env, c.req.url);
+    const cache = dashboardCacheControl(c.req.url);
+    if (cache) c.header('Cache-Control', cache);
+    return c.html(html);
+  };
+  r.get('/', serveDashboard);
+  r.get('/admin', serveDashboard);
 
   // Binary assets live under app/public/ (loaded by assets.ts) and are served
   // here with long cache headers. HTML references these URL paths — never
@@ -356,8 +399,53 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
       'content-type': a.contentType,
       'cache-control': cacheControl,
     });
+  /**
+   * Same contract as serveAsset, but for text built at module load and carrying a
+   * content digest. The digest is what makes `immutable` safe: a stale `?v=` means
+   * the caller is holding a document cached from an earlier deploy, so redirect it
+   * to the current URL instead of handing it this build's bytes under a URL it
+   * would then pin for a year. The redirect is not itself immutable, so the next
+   * navigation re-checks and settles on the right pair.
+   */
+  const serveText =
+    (body: string, contentType: string, version: string, cacheControl: string) =>
+    (c: Context<{ Bindings: Env }>) => {
+      const requested = c.req.query('v');
+      if (requested && requested !== version) {
+        return c.redirect(`${new URL(c.req.url).pathname}?v=${version}`, 302);
+      }
+      return c.body(body, 200, { 'content-type': contentType, 'cache-control': cacheControl });
+    };
   const IMMUTABLE = 'public, max-age=31536000, immutable';
   const LONG = 'public, max-age=86400';
+
+  // CT-2418: the dashboard stylesheet and application script are built at module
+  // load (same pattern as the binary assets below) and served as real files so
+  // the HTML document is a small, cacheable shell instead of a ~820 KB response
+  // that re-downloaded everything on every navigation and re-invalidated on
+  // every deploy. Both are same-origin, so CSP `'self'` already covers them.
+  //
+  // Cache busting: the path is stable, which is the whole point, so a deploy has
+  // to change something a client can see. `?v=` carries a digest of the content,
+  // and it is a fresh immutable entry in the URL, so a deploy invalidates exactly
+  // the changed file rather than every returning visitor's year-long cache.
+  // serveText enforces the pairing: a stale `?v=` is redirected to the current
+  // one, so a client holding a cached document never pins new bytes under an old
+  // version URL (which is the failure mode Sentry flagged in review).
+  r.get(
+    '/assets/dashboard.css',
+    serveText(DASHBOARD_CSS, 'text/css; charset=utf-8', DASHBOARD_CSS_VERSION, IMMUTABLE),
+  );
+  r.get(
+    '/assets/dashboard.js',
+    serveText(
+      DASHBOARD_APP_JS,
+      'application/javascript; charset=utf-8',
+      DASHBOARD_APP_JS_VERSION,
+      IMMUTABLE,
+    ),
+  );
+
   r.get('/assets/zilla-slab-700.woff2', serveAsset(ZILLA_SLAB_WOFF2, IMMUTABLE));
   r.get('/assets/inter-400.woff2', serveAsset(INTER_400_WOFF2, IMMUTABLE));
   r.get('/assets/inter-500.woff2', serveAsset(INTER_500_WOFF2, IMMUTABLE));

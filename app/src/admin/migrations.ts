@@ -1457,10 +1457,20 @@ export const ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS = [
 ] as const;
 
 /**
+ * 0105_filers_bioguide_lower_indexes.sql (CT-2418) — expression indexes so the
+ * case-insensitive member-id lookups stop full-scanning `filers`.  Same
+ * statements as the file migration; follows the 0075_filers_full_name_lower
+ * precedent.
+ */
+export const FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS = [
+  'CREATE INDEX IF NOT EXISTS idx_filers_bioguide_lower ON filers (LOWER(bioguide_id))',
+  'CREATE INDEX IF NOT EXISTS idx_filers_resolved_bioguide_lower ON filers (LOWER(resolved_bioguide_id))',
+] as const;
+
+/**
  * 0106_filings_discovered_via.sql — which discovery path first surfaced a House
  * filing ('live' intraday search or 'bulk' daily index); feeds the stale
- * bulk-discovery alert in the watcher.  0105 is reserved for
- * 0105_filers_bioguide_lower_indexes.sql (open PR #2775).
+ * bulk-discovery alert in the watcher.
  */
 export const FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS = [
   'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
@@ -1632,7 +1642,9 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
   // 0104_enrichment_unavailable.sql
   ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
-  // 0106_filings_discovered_via.sql (0105 reserved for #2775)
+  // 0105_filers_bioguide_lower_indexes.sql (CT-2418)
+  ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+  // 0106_filings_discovered_via.sql
   ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
 ] as const;
 
