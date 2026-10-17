@@ -1467,6 +1467,15 @@ export const FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS = [
   'CREATE INDEX IF NOT EXISTS idx_filers_resolved_bioguide_lower ON filers (LOWER(resolved_bioguide_id))',
 ] as const;
 
+/**
+ * 0106_filings_discovered_via.sql — which discovery path first surfaced a House
+ * filing ('live' intraday search or 'bulk' daily index); feeds the stale
+ * bulk-discovery alert in the watcher.
+ */
+export const FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1635,6 +1644,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
   // 0105_filers_bioguide_lower_indexes.sql (CT-2418)
   ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+  // 0106_filings_discovered_via.sql
+  ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

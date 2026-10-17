@@ -76,6 +76,7 @@ import {
   PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
   ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
   FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+  FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../../benchmark/schema.ts';
 import {
@@ -310,6 +311,7 @@ describe('admin migration bootstrap', () => {
       ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
       ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
       ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+      ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
     ]);
   });
 
@@ -530,6 +532,14 @@ describe('admin migration bootstrap', () => {
 
   it('adds price_unavailable_reason (0103)', () => {
     expect(PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS.join('\n')).toContain('price_unavailable_reason TEXT');
+  });
+
+  it('adds filings.discovered_via (0106)', () => {
+    expect(FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS.join('\n')).toContain(
+      'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
+    );
+    // The column belongs to its own migration, not the 0096 probe-interval set.
+    expect(GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS.join('\n')).not.toContain('discovered_via');
   });
 
   it('adds enrichment_unavailable columns (0104)', () => {
