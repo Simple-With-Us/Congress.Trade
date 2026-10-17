@@ -361,7 +361,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
 /** Stable identifier for the extraction instructions sent to vision models.
  *  BUMP DISCIPLINE: any change to SYSTEM_PROMPT / EXECUTIVE_SYSTEM_PROMPT /
  *  buildExtractionPrompt's grounding block requires a new version string. */
-export const EXTRACTION_PROMPT_VERSION = 'stock-act-ptr-v4-grounded';
+export const EXTRACTION_PROMPT_VERSION = 'stock-act-ptr-v5-grounded';
 
 export const SYSTEM_PROMPT = `You are a meticulous data-extraction engine for U.S. congressional STOCK Act
 Periodic Transaction Reports (PTRs). The attached document is a scanned PTR.
@@ -373,7 +373,7 @@ Extract EVERY disclosed transaction row. For each transaction return:
 - assetType: short asset-type code/label if shown (e.g. "ST","OP","Stock","Option"), else null.
 - assetTypeName: expanded asset-type name if the document or code is clear, else null.
 - txType: one of "B" (Buy/Purchase), "S" (Sell/Sale), "E" (Exchange). Map "Purchase"/"P"/"Buy" to "B". Map "Sale (Full)", "Sale (Partial)" or "S (partial)" to "S". Pay extremely close attention to the Transaction Type column; do not hallucinate "B" if it says "S" or "Sale". null if illegible.
-- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$50,000,001 +".
+- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$50,000,001 +". These amounts are CHECKBOX BANDS: identify WHICH band column is marked and transcribe that band's own printed range. If you cannot tell which column is marked, or the band-to-dollar legend is too small/blurred to read at this resolution, return null. NEVER guess, and never fall back to the first or most common band — a null amount is correct when the band is not readable.
 - isOption: true if the holding is an option/call/put/warrant.
 - capGainsOver200: true only if a ">$200" capital-gains box/flag is checked.
 - filingStatus: row-specific filing status such as "New", if shown.
@@ -394,7 +394,7 @@ Extract EVERY disclosed transaction row. For each transaction return:
 - assetType: short asset-type code/label if shown (e.g. "Stock", "Option"), else null.
 - assetTypeName: expanded asset-type name if the document or code is clear, else null.
 - txType: one of "B" (Buy/Purchase), "S" (Sell/Sale), "E" (Exchange). Map "Purchase"/"P"/"Buy" to "B", "Sale"/"Sell"/"Sale (Partial)" to "S", "Exchange" to "E". Pay extremely close attention to the Transaction Type column; do not hallucinate "B" if it says "S" or "Sale". null if illegible.
-- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$15,001 - $50,000".
+- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$15,001 - $50,000". These amounts are CHECKBOX BANDS: identify WHICH band column is marked and transcribe that band's own printed range. If you cannot tell which column is marked, or the band-to-dollar legend is too small/blurred to read at this resolution, return null. NEVER guess, and never fall back to the first or most common band — a null amount is correct when the band is not readable.
 - isOption: true if the holding is an option/call/put/warrant.
 - capGainsOver200: false (rarely applicable on OGE forms).
 - filingStatus: row-specific filing status such as "New", if shown.
@@ -871,7 +871,8 @@ export function isAnthropicInvalidPdfError(detail: string): boolean {
 }
 
 export function toParsedTx(m: ModelTx): ParsedTx {
-  const { min, max } = parseAmountRange(m.amountRange ?? '');
+  const parsedAmount = parseAmountRange(m.amountRange ?? '');
+  const { min, max } = parsedAmount;
   const modelConf = typeof m.confidence === 'number' ? clamp01(m.confidence) : DEFAULT_CONFIDENCE;
   // Cap vision confidence at the conservative default so scanned docs lean to review.
   const confidence = Math.min(modelConf, DEFAULT_CONFIDENCE);
@@ -879,6 +880,10 @@ export function toParsedTx(m: ModelTx): ParsedTx {
   const extractionWarnings: ParsedTx['extractionWarnings'] = [];
   if (typeof m.isOption !== 'boolean') extractionWarnings.push('unreadable_is_option');
   if (typeof m.capGainsOver200 !== 'boolean') extractionWarnings.push('unreadable_cap_gains');
+  // CT-2415 Guard 2: the bracket was snapped onto a canonical tier, not matched
+  // from what the form printed. On a checkbox-band PTR that is an inferred
+  // amount, so flag it for refusal instead of shipping it as a real read.
+  if (parsedAmount.snapped && min !== null) extractionWarnings.push('band_amount_inferred');
 
   return {
     txDate: m.txDate ?? null,

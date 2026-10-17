@@ -95,6 +95,10 @@ import {
 } from '../extraction/normalizer.ts';
 import { storedReviewBlocksSmallerVisionSubmit, storedReviewTransactionCount } from '../extraction/visionSubmitGuard.ts';
 import { collapseDuplicateSpans } from '../extraction/localVisionDupeGuard.ts';
+import {
+  refuseIllegibleBandAmounts,
+  rejectConstantColumnReads,
+} from '../extraction/visionIntegrityGuards.ts';
 import { PIPELINE_TX_SOURCES_SQL, VISION_SUPERSEDE_REASON } from '../extraction/sourceSupersede.ts';
 import { EXTRACTION_PROMPT_VERSION } from '../extraction/visionLlm.ts';
 import { deprecatePredecessorFilingTransactions, duplicateLineupReason, enqueueAgreementCheck, processAgreementDoc, loadDocBytes, loadFilingRow, sameRowSet, type AgreementModels } from '../extraction/agreement.ts';
@@ -997,6 +1001,35 @@ function auditAdminSubscriptionAction(
   }
 }
 
+// The declared fields are the allow-list for review edits.  Zod's default
+// strip mode drops any other key at the boundary, so nothing undeclared reaches
+// collapseDuplicateSpans, validateReviewEdits or the transaction writer.  Not
+// .strict(): a stored review payload row (which also carries flags, rowKey and
+// similar derived fields) is a valid edit shape, and those rows must confirm
+// rather than 400.  The console's meSubmit sends confidence: null for a row
+// with no stored confidence, and the writer already falls back to 1.
+export const ReviewEditItemSchema = z.object({
+  filerId: z.string().nullable().optional(),
+  txDate: z.string().nullable().optional(),
+  owner: z.string().nullable().optional(),
+  assetName: z.string().optional(),
+  ticker: z.string().nullable().optional(),
+  assetType: z.string().nullable().optional(),
+  assetTypeName: z.string().nullable().optional(),
+  txType: z.string().optional(),
+  amountMin: z.number().nullable().optional(),
+  amountMax: z.number().nullable().optional(),
+  isOption: z.boolean().optional(),
+  capGainsOver200: z.boolean().optional(),
+  rawText: z.string().optional(),
+  filingStatus: z.string().nullable().optional(),
+  subholding: z.string().nullable().optional(),
+  location: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  supplementalText: z.string().nullable().optional(),
+  confidence: z.number().nullable().optional(),
+});
+
 interface EditedTx {
   filerId?: string | null;
   txDate?: string | null;
@@ -1016,7 +1049,7 @@ interface EditedTx {
   location?: string | null;
   description?: string | null;
   supplementalText?: string | null;
-  confidence?: number;
+  confidence?: number | null;
 }
 
 type ValidatedEditedTx = EditedTx & {
@@ -2843,18 +2876,23 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // confirm/manual: insert the (corrected or hand-entered) transactions.
     // 'manual' tags provenance so admins can tell hand-entered rows from machine reads.
     const source: TxSource = decision === 'manual' ? 'manual' : 'primary';
-    if (!Array.isArray(body.edits)) {
+    const editsParse = z.array(ReviewEditItemSchema).safeParse(body.edits);
+    if (!editsParse.success) {
       return c.json(
         {
-          error:
-            decision === 'confirm'
+          error: !Array.isArray(body.edits)
+            ? (decision === 'confirm'
               ? 'confirm requires explicit transaction edits; choose a model, edit the queued rows, or reject the item'
-              : 'manual review requires explicit transaction edits',
+              : 'manual review requires explicit transaction edits')
+            : 'one or more edits have the wrong field types; fix the listed rows and retry',
+          ...(Array.isArray(body.edits) ? { issues: editsParse.error.issues.map((issue) => ({
+            path: issue.path, code: issue.code, message: issue.message,
+          })) } : {}),
         },
         400,
       );
     }
-    const rawEdits = body.edits as unknown[];
+    const rawEdits = editsParse.data;
     if (rawEdits.length === 0) {
       return c.json(
         {
@@ -2866,16 +2904,39 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         400,
       );
     }
+    // CT-2415 Guard 1b: the confirm gate had NO duplicate check, so a review
+    // payload carrying a re-emitted-row flood could be published verbatim with
+    // one operator action. Collapse the same contiguous runs the ingest path
+    // collapses, BEFORE the N-of-M comparison below — so the under-transcription
+    // guard sees the true row count and refuses the flood by name instead of
+    // letting 286 rows through as a legitimate confirm.
+    //
+    // The edits carry exactly the fields transactionRowKey fingerprints
+    // (txDate/owner/asset/ticker/type/amount/rawText/…), so the same real
+    // fingerprint applies; RowKeyFields is narrower than ParsedTx, hence the cast.
+    const confirmedDeduped = collapseDuplicateSpans(
+      rawEdits as unknown as ParsedTx[],
+      source,
+    );
+    const confirmedEdits = confirmedDeduped.rows as unknown[];
+
     // N-of-M under-transcription guard: don't let confirm/manual silently
     // shrink a filing to fewer rows than the stored extraction itself
     // claimed/held. This is what let Kupor (E-2026-scott-a-kupor-01-09-2026-278t)
     // get manually confirmed with 1 of 3 real transactions — nothing compared
     // the confirm against the extraction's own completeness signal.
     const storedCount = storedReviewTransactionCount(review.payload);
-    if (storedCount > rawEdits.length && body.acknowledgeUnderTranscription !== true) {
+    if (storedCount > confirmedEdits.length && body.acknowledgeUnderTranscription !== true) {
       return c.json(
         {
-          error: `confirm has fewer transactions (${rawEdits.length}) than the stored extraction found (${storedCount}) — pass acknowledgeUnderTranscription: true to confirm anyway, or add the missing rows`,
+          error: `confirm has fewer transactions (${confirmedEdits.length}) than the stored extraction found (${storedCount}) — pass acknowledgeUnderTranscription: true to confirm anyway, or add the missing rows`,
+          duplicateSpanCollapsed: confirmedDeduped.removed,
+          duplicateSpanRuns: confirmedDeduped.runs.map((r) => ({
+            contentHash: r.contentHash,
+            count: r.count,
+            firstIndex: r.firstIndex,
+            lastIndex: r.lastIndex,
+          })),
         },
         409,
       );
@@ -2901,7 +2962,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ docId, decision: 'orphan_resolved', resolved: true });
     }
     const filingFilerId = filing?.filer_id ?? null;
-    const validated = validateReviewEdits(rawEdits, filing.filed_date);
+    const validated = validateReviewEdits(confirmedEdits, filing.filed_date);
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
@@ -6473,7 +6534,16 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // than the one it would replace.  H-2026-9116378 arrived with 286 rows of
     // which 251 were one trade at contiguous rowIndex 35..285.
     const deduped = collapseDuplicateSpans(parsedTxIncoming, txSource);
-    const parsedTx = deduped.rows;
+
+    // CT-2415 Guards 2 and 3. Both run AFTER the flood collapse, so a 286-row
+    // duplicate burst is judged as the handful of real reads underneath it
+    // rather than as 286 rows of apparently-constant data. Neither guard drops
+    // a row: Guard 2 leaves the amount unread, Guard 3 preserves the type with a review warning,
+    // and both route the filing to review instead of publishing an inferred
+    // value.
+    const bandChecked = refuseIllegibleBandAmounts(deduped.rows);
+    const columnChecked = rejectConstantColumnReads(bandChecked.rows);
+    const parsedTx = columnChecked.rows;
 
     try {
       const existingReview = await get<{ reason: string | null; payload: string | null }>(
@@ -6562,6 +6632,17 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           count: r.count,
           firstIndex: r.firstIndex,
           lastIndex: r.lastIndex,
+        })),
+        illegibleBandAmountsRefused: bandChecked.refusals.length,
+        illegibleBandAmounts: bandChecked.refusals.map((r) => ({
+          rowIndex: r.rowIndex,
+          amountMin: r.amountMin,
+          amountMax: r.amountMax,
+        })),
+        constantColumnReadsRejected: columnChecked.rejections.map((r) => ({
+          field: r.field,
+          value: r.value,
+          rowCount: r.rowIndexes.length,
         })),
       });
     } catch (err) {

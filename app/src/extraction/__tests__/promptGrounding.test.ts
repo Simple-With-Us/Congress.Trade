@@ -10,8 +10,19 @@ import {
 
 describe('metadata-grounded extraction prompts', () => {
   it('bumped the prompt version for the grounding change', () => {
-    expect(EXTRACTION_PROMPT_VERSION).toBe('stock-act-ptr-v4-grounded');
+    expect(EXTRACTION_PROMPT_VERSION).toBe('stock-act-ptr-v5-grounded');
     expect(EXTRACTION_PROMPT_VERSION).not.toBe('stock-act-ptr-v2');
+  });
+
+  it('offers an illegibility escape for the checkbox-band amount', () => {
+    // CT-2415 Guard 2: the amount column is a checkbox band, and the prompt
+    // used to name it without ever offering a null, so an unreadable legend
+    // forced the model to emit *some* band. It must be allowed to say null.
+    for (const prompt of [SYSTEM_PROMPT, EXECUTIVE_SYSTEM_PROMPT]) {
+      expect(prompt).toContain('CHECKBOX BANDS');
+      expect(prompt).toMatch(/return null/);
+      expect(prompt).toMatch(/never fall back to the first or most common band/i);
+    }
   });
 
   it('returns the base prompt unchanged when no metadata is available', () => {
