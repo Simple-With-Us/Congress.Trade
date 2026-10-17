@@ -3034,7 +3034,7 @@ describe('dashboard truth + a11y fixes (app review backlog)', () => {
     expect(DASHBOARD_SOURCE).not.toContain('<em class="tr-window-label"');
     // The filter row lives in header.top row 2 (owner 2026-09-09); the old
     // sticky 100vw strips are gone.
-    expect(DASHBOARD_SOURCE).toContain('header.top #ctFilters {');
+    expect(DASHBOARD_SOURCE).toContain('#ctFilters {');
     expect(DASHBOARD_SOURCE).not.toContain('position: sticky; top: var(--ct-header-h, 52px); z-index: 9;');
     expect(DASHBOARD_SOURCE).not.toContain('margin-left: calc(50% - 50vw);');
     expect(DASHBOARD_SOURCE).toContain("if (savedW == null && !w) w = (k && DEFAULT_CAP[k]) || minColWidth(k);");
@@ -5089,7 +5089,7 @@ describe('MONET web punch list 2 (LANE W1)', () => {
     // so the Trades banner is the first thing inside #view-trades and the
     // Trends filter markup is a hidden state mirror followed by #banner.
     const tradesFilters = document.querySelector('#tradesToolbars');
-    expect(tradesFilters?.closest('header.top')).not.toBeNull();
+    expect(tradesFilters?.closest('header.top')).toBeNull();
     expect(tradesFilters?.closest('#ctFilters')).not.toBeNull();
     const trendsFilters = document.querySelector('#trendsSharedFilters');
     expect(trendsFilters?.getAttribute('hidden')).not.toBeNull();
@@ -7093,7 +7093,7 @@ describe('web chrome column + Trends flow rows (owner 2026-09-08)', () => {
     // Owner 2026-09-09: the filter row is header.top grid row 2 (right of
     // the wordmark, under the tabs) — it inherits the header's column pads,
     // so the old 100vw breakout strip and its inverse pad are gone.
-    expect(DASHBOARD_SOURCE).toContain('header.top #ctFilters {\n    grid-column: 2 / -1; grid-row: 2;');
+    expect(DASHBOARD_SOURCE).toContain('#ctFilters {\n    grid-column: 2 / -1; grid-row: 2;');
     expect(DASHBOARD_SOURCE).not.toContain('margin-left: calc(50% - 50vw);');
     expect(DASHBOARD_SOURCE).not.toContain('padding: 4px calc(50vw - 50%) 10px;');
     expect(DASHBOARD_SOURCE).not.toContain('position: sticky; top: var(--ct-header-h, 100px); z-index: 9;');
@@ -7200,12 +7200,12 @@ describe('Committee Sector Conflicts table (owner 2026-09-08)', () => {
  * sign-in buttons, and a single-row phone pager band.
  */
 describe('header chrome rework (owner 2026-09-09)', () => {
-  it('moves the shared filter row into header.top beside the wordmark and mirrors state on Trends', () => {
+  it('keeps the shared filter row outside the masthead and mirrors state on Trends', () => {
     const document = parse(DASHBOARD_HTML);
     const header = document.querySelector('header.top');
     expect(header).not.toBeNull();
     const kids = header!.childNodes.filter((n) => n.nodeType === 1).map((n: any) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + (n.classList.contains('brand') ? '.brand' : '') + (n.classList.contains('tabs') ? '.tabs' : ''));
-    expect(kids).toEqual(['a.brand', 'nav.tabs', 'div#acct', 'div#ctFilters']);
+    expect(kids).toEqual(['a.brand', 'nav.tabs', 'div#acct']);
     // Brand is a real link home (Trends) — no more inert div.
     const brand = document.querySelector('header.top a.brand');
     expect(brand?.getAttribute('href')).toBe('/?view=trends');
@@ -7213,6 +7213,7 @@ describe('header chrome rework (owner 2026-09-09)', () => {
     // The whole #tradesToolbars block moved as-is: ids / handlers unchanged,
     // Reset chip is the last child of the group.
     const ctf = document.querySelector('#ctFilters');
+    expect(header?.nextElementSibling).toBe(ctf);
     expect(ctf?.getAttribute('role')).toBe('group');
     const ctfKids = ctf!.childNodes.filter((n) => n.nodeType === 1).map((n: any) => n.id);
     expect(ctfKids).toEqual(['tradesToolbars', 'ctFilterReset']);
@@ -7246,7 +7247,7 @@ describe('header chrome rework (owner 2026-09-09)', () => {
     // Laptop + small-window fallbacks.
     expect(DASHBOARD_SOURCE).toContain('@media (max-width: 1332px) {\n    header.top { column-gap: 16px; }');
     expect(DASHBOARD_SOURCE).toContain('@media (min-width: 769px) and (max-width: 999px) and (hover: hover) {');
-    expect(DASHBOARD_SOURCE).toContain('header.top #ctFilters { grid-column: 1 / -1; grid-row: 2; }');
+    expect(DASHBOARD_SOURCE).toContain('#ctFilters { grid-column: 1 / -1; grid-row: 2; }');
   });
 
   it('shares one control radius across tabs, chips, selects, search, account and pager', () => {
@@ -7307,7 +7308,7 @@ describe('header chrome rework (owner 2026-09-09)', () => {
 
   it('phones: one-row header filters and a single 40px pager band (sort | page | rows)', () => {
     expect(DASHBOARD_SOURCE).toContain('header.top {\n      display: grid; grid-template-columns: minmax(0, 1fr) 44px; grid-template-rows: auto auto;');
-    expect(DASHBOARD_SOURCE).toContain('header.top #ctFilters { grid-column: 1 / -1; grid-row: 2; display: block; padding: 4px 4px 8px; min-width: 0; }');
+    expect(DASHBOARD_SOURCE).toContain('#ctFilters { grid-column: 1 / -1; grid-row: 2; display: block; padding: 4px 4px 8px; min-width: 0; }');
     expect(DASHBOARD_SOURCE).toContain('#ctFilters #tradesSharedFilters::-webkit-scrollbar { display: none; }');
     expect(DASHBOARD_SOURCE).toContain('#ctFilters .ios-filter-btn { height: 40px; padding: 0 8px; }');
     // The fixed dock resets the desktop inline-flex/height on nav.tabs a.
@@ -7443,5 +7444,31 @@ describe('CT-2418 document caching', () => {
       expect(res.status, path).toBe(200);
       expect(res.headers.get('cache-control') ?? '', path).not.toContain('s-maxage');
     }
+  });
+});
+
+
+describe('masthead and Delivery layout update', () => {
+  it('separates white masthead from content filters and right aligns sections', () => {
+    expect(DASHBOARD_SOURCE).toContain('header.top nav.tabs { justify-self: end; align-self: center; }');
+    expect(DASHBOARD_SOURCE).toContain('margin: 0 auto; padding: 16px var(--ct-main-pad, 35px) 0;');
+    expect(DASHBOARD_SOURCE).toContain('#ctFilters { display: block; padding: 14px var(--ct-main-pad, 14px) 0; }');
+  });
+  it('keeps the flexible header track on the nav so a narrow window squeezes the tabs, not the wordmark', () => {
+    expect(DASHBOARD_SOURCE).toContain('header.top {\n    grid-template-columns: auto minmax(0, 1fr) auto;\n    grid-template-rows: auto; row-gap: 0;');
+    expect(DASHBOARD_SOURCE).not.toContain('grid-template-columns: minmax(0, 1fr) auto auto;');
+  });
+  it('uses hanging bolt text and a right aligned scoreboard action', () => {
+    expect(DASHBOARD_SOURCE).toContain('class="speed-mini-copy"');
+    expect(DASHBOARD_SOURCE).toContain('class="speed-mini-bolt"');
+    expect(DASHBOARD_SOURCE).toContain('.speed-mini > button { margin-left: auto; flex: 0 0 auto; }');
+    expect(DASHBOARD_SOURCE).not.toContain('Get the Filing First.&nbsp; Premium pushes');
+    expect(DASHBOARD_SOURCE).toContain('>Premium pushes a filing to you the moment we ingest it');
+  });
+  it('paints mobile chrome white and styles the iOS link as a button', () => {
+    expect(DASHBOARD_SOURCE).toContain('nav.tabs { padding-top: 6px; padding-bottom: env(safe-area-inset-bottom, 0px); }');
+    expect(DASHBOARD_SOURCE).toContain('html[data-theme="dark"] header.top { background: #1c1c1e; }');
+    expect(DASHBOARD_HTML).toContain('<meta name="theme-color" content="#ffffff" />');
+    expect(DASHBOARD_SOURCE).toContain('class="btn ghost" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4"');
   });
 });

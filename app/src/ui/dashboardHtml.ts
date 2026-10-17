@@ -101,7 +101,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 <title>%TITLE%</title>
 <meta name="description" content="%META_DESCRIPTION%" />
 <link rel="canonical" href="%CANONICAL_URL%" />
-<meta name="theme-color" content="#eff3f8" />
+<meta name="theme-color" content="#ffffff" />
 <!-- Open Graph — placeholders filled server-side from deep-link query
      (?view=trends / ?ticker= / ?member=) so crawlers get the right card. -->
 <meta property="og:type" content="website" />
@@ -151,7 +151,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.setAttribute('data-theme-pref', pref);
     var meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', theme === 'dark' ? '#08111f' : '#eff3f8');
+    if (meta) meta.setAttribute('content', theme === 'dark' ? '#1c1c1e' : '#ffffff');
   })();
   // Header column before first paint: header.top pads out to the active
   // view's content column (--ct-col-max via html[data-view]).  The static
@@ -186,6 +186,9 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <a href="/?view=admin" data-view="admin" data-mobile="Admin" data-icon="⚙" id="tab-admin" role="tab" aria-selected="false" aria-controls="view-admin" data-admin-tab="true" title="Admin · Cadence" hidden aria-label="Admin · Cadence"><span aria-hidden="true">Admin · Cadence <span class="tab-count-badge" id="adminTabBadge" hidden></span></span></a>
   </nav>
   <div id="acct" class="acct"></div>
+
+</header>
+
   <!-- Shared filter row (Trades + Trends).  Owner punch list #9 merged the
        Trades feed's two toolbars onto one row via #tradesToolbars
        (display:contents on both children + flex order, see CSS); owner
@@ -265,7 +268,6 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     </div>
     <button type="button" class="btn ghost sm ct-filter-reset" id="ctFilterReset" onclick="resetSharedFilters()" title="Reset filters to defaults" hidden>Reset</button>
   </div>
-</header>
 
 <main>
   <!-- #2071: do not put #banner here. A first-child status strip sits
@@ -658,7 +660,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <div class="section" id="subsMarketing">
       <h3>Alerts</h3>
       <p class="sub">We ingest official House, Senate, and Executive Branch trades.&nbsp; Relaying a 3rd-party competitor API would ruin our minutes-to-hours edge that Congress.Trade was made for.</p>
-      <p class="sub" style="margin-top: 8px;">Get the Filing First.&nbsp; Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
+      <p class="sub" style="margin-top: 8px;">Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
       <div class="speed-mini" id="alertsSpeedMini"></div>
       <div class="delivery-grid">
         <div class="delivery-card">

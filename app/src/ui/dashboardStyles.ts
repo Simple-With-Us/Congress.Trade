@@ -262,7 +262,7 @@ export const DASHBOARD_CSS = /* css */ `
      Hidden on views that have no filters; #tradesExtraFilters (search) is
      Trades-only.  html[data-view] is stamped pre-paint and on every tab
      switch, so this never flashes. */
-  header.top #ctFilters {
+  #ctFilters {
     grid-column: 2 / -1; grid-row: 2;
     display: flex; align-items: center; gap: 12px; min-width: 0; min-height: var(--control-h, 34px);
   }
@@ -1997,7 +1997,7 @@ export const DASHBOARD_CSS = /* css */ `
     header.top .brand { grid-row: 1; }
     nav.tabs { flex-wrap: wrap; }
     nav.tabs a { padding: 0 9px; }
-    header.top #ctFilters { grid-column: 1 / -1; grid-row: 2; }
+    #ctFilters { grid-column: 1 / -1; grid-row: 2; }
     html:not([data-view="trades"]):not([data-view="trends"]) header.top { grid-template-rows: auto; row-gap: 0; }
     .trades-toolbars #qSearchField { max-width: none; }
     /* Row 1 has to hold logo + four tabs + account at 769px: a slightly
@@ -2197,7 +2197,7 @@ export const DASHBOARD_CSS = /* css */ `
     }
     header.top .brand { grid-column: 1; grid-row: 1; }
     header.top #acct { grid-column: 2; grid-row: 1; justify-self: end; }
-    header.top #ctFilters { grid-column: 1 / -1; grid-row: 2; display: block; padding: 4px 4px 8px; min-width: 0; }
+    #ctFilters { grid-column: 1 / -1; grid-row: 2; display: block; padding: 4px 4px 8px; min-width: 0; }
     #ctFilters .trades-toolbars { display: block; position: static; margin: 0; padding: 0; width: auto; }
     #ctFilters #tradesSharedFilters {
       display: flex; flex-wrap: nowrap; align-items: center; gap: 6px;
@@ -3181,10 +3181,40 @@ export const DASHBOARD_CSS = /* css */ `
   .owner-alert-title { font-weight: 700; flex: 0 0 auto; }
   .owner-alert-detail { flex: 1 1 320px; color: #374151; }
 
-
-
-
-
+  /* Keep filters on the content ground, separate from the white masthead.
+     The flexible track stays on the nav column (brand and account are
+     auto), so a narrow signed-out window squeezes the tabs, never the
+     wordmark; the tabs right-align inside that track. */
+  header.top {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-rows: auto; row-gap: 0;
+    padding-bottom: 16px;
+  }
+  header.top .brand { grid-row: 1; }
+  header.top nav.tabs { justify-self: end; align-self: center; }
+  #ctFilters {
+    box-sizing: border-box; width: 100%; max-width: var(--ct-col-max, 1730px);
+    margin: 0 auto; padding: 16px var(--ct-main-pad, 35px) 0;
+    display: flex; align-items: center; gap: 12px; min-width: 0;
+  }
+  @media (min-width: 769px) and (hover: hover) and (pointer: fine) {
+    #ctFilters { max-width: calc(var(--ct-col-max, 1730px) + 2 * var(--ct-main-pad, 35px)); }
+  }
+  .speed-mini-copy { display: flex; align-items: flex-start; gap: 7px; flex: 1 1 340px; min-width: 0; }
+  .speed-mini-bolt { flex: 0 0 auto; }
+  .speed-mini > button { margin-left: auto; flex: 0 0 auto; }
+  @media (max-width: 768px), (hover: none) and (pointer: coarse) {
+    html[data-theme="light"] { background: #fff; }
+    html[data-theme="dark"] { background: #1c1c1e; }
+    html[data-theme="dark"] header.top { background: #1c1c1e; }
+    header.top { grid-template-columns: minmax(0, 1fr) 44px; grid-template-rows: auto; padding-bottom: 12px; }
+    #ctFilters { display: block; padding: 14px var(--ct-main-pad, 14px) 0; }
+    header.top nav.tabs { justify-self: stretch; width: 100%; }
+    nav.tabs { padding-top: 6px; padding-bottom: env(safe-area-inset-bottom, 0px); }
+    html[data-theme="light"] nav.tabs { background: #fff; }
+    html[data-theme="dark"] nav.tabs { background: #1c1c1e; }
+    .acct-mobile-menu > a.btn { display: flex; align-items: center; min-height: 48px; font-size: 16px; box-sizing: border-box; }
+  }
 `;
 
 /** `?v=` cache-busting fingerprint; see assetVersion(). */
