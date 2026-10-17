@@ -1620,3 +1620,51 @@ describe('scoreFields ticker/asset-name consistency (informational, unpenalized)
     expect(scored.confidence).toBe(0.97);
   });
 });
+
+
+describe('constant-type vision extraction review round trip', () => {
+  it.each(['S', 'E'] as const)('preserves all-%s rows through staging and explicit confirmation', async (type) => {
+    const { rejectConstantColumnReads, CONSTANT_COLUMN_WARNING } = await import('../visionIntegrityGuards.ts');
+    const { buildAdminRouter } = await import('../../admin/routes.ts');
+    const { env, cap } = makeEnv([{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }]);
+    const parsed = ['2024-06-14', '2024-06-15', '2024-06-16'].map((date) => tx({ txDate: date, txType: type, rawText: `AAPL Apple Inc ${type} $1,001 - $15,000` }));
+    const guarded = rejectConstantColumnReads(parsed);
+    expect(guarded.rows.map((r) => r.txType)).toEqual([type, type, type]);
+    expect(parsed.every((r) => !r.extractionWarnings?.includes(CONSTANT_COLUMN_WARNING))).toBe(true);
+    const result = await normalize(env, filing(), guarded.rows, { source: 'local_mac', extractor: 'mac_vision', modelVersion: 'fixture' });
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
+    const payloadText = cap.reviewRows.flat().find((v) => typeof v === 'string' && v.startsWith('{') && v.includes('"transactions"')) as string;
+    expect(payloadText).toBeDefined();
+    const payload = JSON.parse(payloadText);
+    expect(payload.transactions).toHaveLength(3);
+    expect(payload.transactions.every((r: { txType: string; flags: string[] }) => r.txType === type && r.flags.includes(CONSTANT_COLUMN_WARNING))).toBe(true);
+
+    // Exercise the real admin confirm handler with exactly the staged candidate
+    // values. Capture its explicit insertRows payload, not a reimplemented writer.
+    const originalPrepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = ((sql: string) => {
+      const stmt = originalPrepare(sql);
+      const first = stmt.first.bind(stmt);
+      // Confirm's outbox INSERT selects already-inserted transactions rather
+      // than normalize's JSON-backed row list; it is outside this type assertion.
+      if (/INSERT OR IGNORE INTO delivery_outbox/i.test(sql)) {
+        stmt.run = (async () => ({ success: true, meta: { changes: 3 } })) as typeof stmt.run;
+      }
+      stmt.first = (async () => {
+        if (/FROM review_queue WHERE doc_id/i.test(sql)) return { doc_id: 'doc1', reason: CONSTANT_COLUMN_WARNING, payload: payloadText, resolved: 0, review_revision: 1 };
+        if (/FROM filings WHERE doc_id/i.test(sql)) return { filer_id: 'F1', first_seen_at: null, filed_date: '2024-07-01', filing_status: null };
+        return first();
+      }) as typeof stmt.first;
+      return stmt;
+    }) as typeof env.DB.prepare;
+    const response = await buildAdminRouter().request('/review/doc1', {
+      method: 'POST', headers: { Authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'confirm', reviewRevision: 1, edits: payload.transactions }),
+    }, { ...env, ADMIN_TOKEN: 'admin-secret' });
+    expect(response.status).toBe(200);
+    expect(cap.insertedTx).toHaveLength(3);
+    expect(cap.insertedTx.map((r) => r.txType)).toEqual([type, type, type]);
+  });
+});
