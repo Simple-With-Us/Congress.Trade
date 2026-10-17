@@ -905,9 +905,9 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_HTML).toContain("function polFull(n)");
   });
 
-  it('defaults theme to light and offers Light/Dark/System controls', () => {
-    expect(DASHBOARD_HTML).toContain("var pref = 'light'");
-    expect(DASHBOARD_HTML).toContain("return 'light'");
+  it('defaults theme to system (follows prefers-color-scheme) and offers Light/Dark/System controls', () => {
+    expect(DASHBOARD_HTML).toContain("var pref = 'system'");
+    expect(DASHBOARD_HTML).toContain("return 'system'");
     expect(DASHBOARD_HTML).toContain('function setThemePref(pref)');
     expect(DASHBOARD_HTML).toContain('function themeRowHtml(pref, hideLabel)');
     expect(DASHBOARD_HTML).toContain('function themeSegHtml(pref)');
@@ -4358,13 +4358,27 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
       expect(isLatencyAhead(summary)).toBe(true);
     });
 
-    it('ignores FMP-family providers in public latency gates', () => {
-      const summary = {
+    it('includes FMP-family providers in public latency gates when running and usable', () => {
+      const aheadSummary = {
         providers: [
-          provider({ label: 'A', usFirstCount: 8, providerFirstCount: 2 }),
           provider({
             id: 'fmp',
-            label: 'FMP',
+            label: 'FinancialModelingPrep.com',
+            usFirstCount: 84,
+            providerFirstCount: 0,
+            matched: 84,
+            medianLeadSec: 8160,
+            avgLeadSec: 40199,
+          }),
+        ],
+      };
+      expect(isLatencyAhead(aheadSummary)).toBe(true);
+
+      const behindSummary = {
+        providers: [
+          provider({
+            id: 'fmp',
+            label: 'FinancialModelingPrep.com',
             usFirstCount: 1,
             providerFirstCount: 9,
             medianLeadSec: -7200,
@@ -4372,7 +4386,7 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
           }),
         ],
       };
-      expect(isLatencyAhead(summary)).toBe(true);
+      expect(isLatencyAhead(behindSummary)).toBe(false);
     });
 
     it('ignores error and stopped providers so a dead probe cannot vote', () => {
