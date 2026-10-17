@@ -3313,6 +3313,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
   @media (max-width: 768px), (hover: none) and (pointer: coarse) {
     html[data-theme="light"] { background: #fff; }
     html[data-theme="dark"] { background: #1c1c1e; }
+    html[data-theme="dark"] header.top { background: #1c1c1e; }
     header.top { grid-template-columns: minmax(0, 1fr) 44px; grid-template-rows: auto; padding-bottom: 12px; }
     #ctFilters { display: block; padding: 14px var(--ct-main-pad, 14px) 0; }
     header.top nav.tabs { justify-self: stretch; width: 100%; }

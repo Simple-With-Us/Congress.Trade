@@ -7358,6 +7358,7 @@ describe('masthead and Delivery layout update', () => {
   });
   it('paints mobile chrome white and styles the iOS link as a button', () => {
     expect(DASHBOARD_HTML).toContain('nav.tabs { padding-top: 6px; padding-bottom: env(safe-area-inset-bottom, 0px); }');
+    expect(DASHBOARD_HTML).toContain('html[data-theme="dark"] header.top { background: #1c1c1e; }');
     expect(DASHBOARD_HTML).toContain('<meta name="theme-color" content="#ffffff" />');
     expect(DASHBOARD_HTML).toContain('class="btn ghost" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4"');
   });
