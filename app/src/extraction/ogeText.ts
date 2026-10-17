@@ -154,9 +154,57 @@ export function executiveDisclosureForm(docId: string): '278e' | '278t' | 'unkno
 export type OgeTextClassification =
   | { disposition: 'rows'; rows: ParsedTx[] }
   | { disposition: 'empty'; rows: ParsedTx[] }
-  | { disposition: 'unreadable'; rows: ParsedTx[]; reason: 'index_incoherent' | 'unreadable_278t' }
+  | {
+      disposition: 'unreadable';
+      rows: ParsedTx[];
+      reason: 'index_incoherent' | 'unreadable_278t';
+      /**
+       * Diagnostics only; never gates publishing. How many transaction rows the
+       * refusal is standing in front of, when the row-index column could still be
+       * counted. See detectOgeRowAnchors().
+       */
+      detectedRowAnchors?: number;
+      detectedRowMaxIndex?: number;
+    }
   /** Zero rows, but nothing shows Part 7 is empty (blank, garbled, or unsupported layout). */
   | { disposition: 'unconfirmed'; rows: ParsedTx[] };
+
+/**
+ * Count the row-index column of a 278-T without trusting the Type word.
+ *
+ * ROW_RE anchors a row on `<index> <description> Purchase|Sale <date> ...`, so on
+ * a scanned-then-OCR'd 278-T — where the Type word survives on only a minority of
+ * rows ("salo", "lourchaso") — it matches few rows and the sequence gate refuses.
+ * The refusal is correct: the resulting rows would carry OCR-mangled dates, and
+ * publishing those is worse than parking. But it leaves a readable 500+ row file
+ * labelled exactly like a corrupt one, with nothing telling an operator how many
+ * transactions are actually at stake or that the remedy is an image read.
+ *
+ * The row INDEX column is the one field OCR preserves on these documents: it
+ * prints contiguously 1..N in its own leading column. Counting those anchors is
+ * therefore a reliable size estimate, and it needs no date, type, or amount.
+ *
+ * Scope: line-anchored rows only (newline-separated layout, the form this repo's
+ * fixtures use). A pdf.js `mergePages` read that flattens the document to one
+ * line yields no anchors and returns zero — a diagnostic miss, never a behaviour
+ * change. Callers must treat every field here as informational.
+ */
+export function detectOgeRowAnchors(text: string): { anchors: number; maxIndex: number | null } {
+  if (!text) return { anchors: 0, maxIndex: null };
+  let anchors = 0;
+  let maxIndex: number | null = null;
+  const re = /^[ \t]*(\d{1,5})[ \t]{2,}\S/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    // A 278-T never numbers rows past the thousands; anything larger is a
+    // dollar figure, a year, or a page number caught by the leading-digits rule.
+    const n = Number(m[1]);
+    if (n < 1 || n > 5000) continue;
+    anchors += 1;
+    if (maxIndex === null || n > maxIndex) maxIndex = n;
+  }
+  return { anchors, maxIndex };
+}
 
 /**
  * True when the matched rows' leading "#" tokens look like a real table index:
@@ -255,13 +303,23 @@ async function extractPdfText(
  */
 export function classifyOgeTransactionText(text: string, docId = ''): OgeTextClassification {
   const scanned = scanOgeTransactionRows(text);
+  const anchors = detectOgeRowAnchors(text);
+  const anchorFields = {
+    detectedRowAnchors: anchors.anchors,
+    detectedRowMaxIndex: anchors.maxIndex,
+  };
   if (scanned.refused) {
-    return { disposition: 'unreadable', rows: [], reason: 'index_incoherent' };
+    return {
+      disposition: 'unreadable',
+      rows: [],
+      reason: 'index_incoherent',
+      ...anchorFields,
+    };
   }
   if (scanned.rows.length > 0) return { disposition: 'rows', rows: scanned.rows };
   const form = executiveDisclosureForm(docId);
   if (form === '278t' || (form !== '278e' && scanned.has278tTable)) {
-    return { disposition: 'unreadable', rows: [], reason: 'unreadable_278t' };
+    return { disposition: 'unreadable', rows: [], reason: 'unreadable_278t', ...anchorFields };
   }
   if (ogePart7SectionLooksEmpty(text)) return { disposition: 'empty', rows: [] };
   return { disposition: 'unconfirmed', rows: [] };
