@@ -22,6 +22,30 @@ export interface StaticAsset {
 /** Directory containing committed binary assets (relative to this module). */
 const PUBLIC_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../public');
 
+/**
+ * CT-2418: content fingerprint for a generated text asset, used as the `?v=`
+ * cache-busting query on its URL.
+ *
+ * The dashboard CSS and JS are served `immutable` for a year, which is the whole
+ * point (a repeat visit costs nothing) but means a deploy must change something
+ * the client can see. Folding a fingerprint of the bytes into the query string
+ * gives a deploy a fresh immutable URL, so it invalidates exactly the files that
+ * changed instead of stranding returning visitors on last month's CSS.
+ *
+ * FNV-1a 32-bit, not a cryptographic hash: this only has to change when the
+ * content changes, and it has to be synchronous (module-load time, and the
+ * worker has no sync crypto).
+ */
+export function assetVersion(content: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < content.length; i++) {
+    hash ^= content.charCodeAt(i);
+    // 16777619 (FNV prime), kept in 32-bit range without BigInt.
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
 function loadAsset(relativePath: string, contentType: string): StaticAsset {
   const abs = join(PUBLIC_DIR, relativePath);
   const buf = readFileSync(abs);
