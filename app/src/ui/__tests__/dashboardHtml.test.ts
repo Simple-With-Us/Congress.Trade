@@ -13,8 +13,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { parse } from 'node-html-parser';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
-import { DASHBOARD_CSS } from '../dashboardStyles.ts';
-import { DASHBOARD_APP_JS } from '../dashboardClient.ts';
+import { DASHBOARD_CSS, DASHBOARD_CSS_VERSION } from '../dashboardStyles.ts';
+import { DASHBOARD_APP_JS, DASHBOARD_APP_JS_VERSION } from '../dashboardClient.ts';
 import {
   SEMANTIC_DARK_NEG,
   SEMANTIC_LIGHT,
@@ -4882,6 +4882,51 @@ describe('static UI assets (issue #1040)', () => {
       const buf = new Uint8Array(await res.arrayBuffer());
       expect(buf.byteLength, c.path).toBeGreaterThan(c.minBytes);
     }
+  });
+
+  it('serves the versioned dashboard assets under their own content digest', async () => {
+    // CT-2418 follow-up to review: the document links /assets/dashboard.{css,js}?v=<digest>,
+    // so the route must serve the same bytes for that exact digest, otherwise the
+    // client pins the wrong bytes for a year under `immutable`.
+    const { buildUiRouter } = await import('../routes.ts');
+    const app = buildUiRouter();
+    for (const [path, version] of [
+      ['/assets/dashboard.css', DASHBOARD_CSS_VERSION],
+      ['/assets/dashboard.js', DASHBOARD_APP_JS_VERSION],
+    ] as const) {
+      const res = await app.request(`http://localhost${path}?v=${version}`, {}, {} as never);
+      expect(res.status, path).toBe(200);
+      expect(res.headers.get('cache-control') ?? '', path).toContain('immutable');
+      expect(await res.text(), path).toBe(path.endsWith('.css') ? DASHBOARD_CSS : DASHBOARD_APP_JS);
+    }
+  });
+
+  it('redirects a stale ?v= to the current digest instead of pinning new bytes under the old URL', async () => {
+    // The failure mode Sentry flagged in review: a client holding a document cached
+    // from an earlier deploy asks for the old digest. Serving current bytes there
+    // would be cached immutably under the old URL for a year, so the old URL must
+    // bounce to the current one instead.
+    const { buildUiRouter } = await import('../routes.ts');
+    const app = buildUiRouter();
+    for (const [path, current] of [
+      ['/assets/dashboard.css', DASHBOARD_CSS_VERSION],
+      ['/assets/dashboard.js', DASHBOARD_APP_JS_VERSION],
+    ] as const) {
+      const res = await app.request(`http://localhost${path}?v=deadbeef`, {}, {} as never);
+      expect(res.status, path).toBe(302);
+      expect(res.headers.get('location') ?? '', path).toBe(`${path}?v=${current}`);
+      expect(res.headers.get('cache-control') ?? '', path).not.toContain('immutable');
+    }
+  });
+
+  it('serves the current bytes when no ?v= is supplied', async () => {
+    // A bare request is not version skew — there is nothing stale to correct — so it
+    // gets the normal immutable response rather than a redirect loop.
+    const { buildUiRouter } = await import('../routes.ts');
+    const app = buildUiRouter();
+    const res = await app.request('http://localhost/assets/dashboard.css', {}, {} as never);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control') ?? '').toContain('immutable');
   });
 });
 
