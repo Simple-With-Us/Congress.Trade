@@ -705,3 +705,199 @@ describe('inHousePriorYearWindow', () => {
     expect(inHousePriorYearWindow(new Date('2026-01-01T15:00:00.000Z'), 14)).toBe(true);
   });
 });
+
+describe('bulk-window discovery alert', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.pollOgeExecutive.mockResolvedValue(null);
+  });
+
+  function disc(docId: string, filedDate: string | null, via: 'live' | 'bulk') {
+    return {
+      docId: `H-2026-${docId}`,
+      chamber: 'house' as const,
+      sourceUrl: `https://example.test/${docId}.pdf`,
+      filedDate,
+      filerName: 'Jane Smith',
+      discoveredVia: via,
+    };
+  }
+
+  it('flags a bulk-discovered filing older than the threshold', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035648', '2026-10-14', 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({
+      docId: 'H-2026-20035648',
+      filerName: 'Jane Smith',
+      filedDate: '2026-10-14',
+      discoveredAt: '2026-10-15T13:12:00.000Z',
+      liveSearchFails: '0',
+    });
+    // Day-only filed_date counts from the END of that day in ET (EDT: 2026-10-15T04:00Z).
+    expect(alerts[0].hoursLate).toBe(9.2);
+  });
+
+  it('does not flag a same-day bulk discovery at the morning refresh (M/D/YYYY filed date)', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    // The House XML reports FilingDate as M/D/YYYY with no time of day.  Read as
+    // midnight UTC this filing would look ~13h late at the ~13:00Z refresh.
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035660', '10/15/2026', 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('treats M/D/YYYY and YYYY-MM-DD filed dates the same', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const now = '2026-10-15T13:12:00.000Z';
+    const us = findStaleBulkDiscoveries([disc('20035661', '10/14/2026', 'bulk')], now, '0');
+    const iso = findStaleBulkDiscoveries([disc('20035661', '2026-10-14', 'bulk')], now, '0');
+    expect(us).toHaveLength(1);
+    expect(us[0].hoursLate).toBe(9.2);
+    expect(iso[0].hoursLate).toBe(us[0].hoursLate);
+  });
+
+  it('measures day-only filed dates against the ET day boundary in both EST and EDT', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    // EST (UTC-5): end of 2026-12-01 ET is 2026-12-02T05:00Z.
+    expect(
+      findStaleBulkDiscoveries([disc('20035662', '2026-12-01', 'bulk')], '2026-12-02T08:00:00.000Z', '0'),
+    ).toHaveLength(0); // 3h after the day ended: under the threshold
+    const est = findStaleBulkDiscoveries([disc('20035662', '2026-12-01', 'bulk')], '2026-12-02T10:00:00.000Z', '0');
+    expect(est).toHaveLength(1);
+    expect(est[0].hoursLate).toBe(5);
+    // EDT (UTC-4): end of 2026-10-14 ET is 2026-10-15T04:00Z.
+    expect(
+      findStaleBulkDiscoveries([disc('20035663', '2026-10-14', 'bulk')], '2026-10-15T07:00:00.000Z', '0'),
+    ).toHaveLength(0);
+    const edt = findStaleBulkDiscoveries([disc('20035663', '2026-10-14', 'bulk')], '2026-10-15T09:00:00.000Z', '0');
+    expect(edt).toHaveLength(1);
+    expect(edt[0].hoursLate).toBe(5);
+  });
+
+  it('stays silent for empty or malformed filed dates and an unparseable discovery time', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const now = '2026-10-15T13:12:00.000Z';
+    expect(findStaleBulkDiscoveries([disc('20035664', '', 'bulk')], now, '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035665', 'not-a-date', 'bulk')], now, '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035666', '13/45/2026', 'bulk')], now, '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035667', '2026-10-01', 'bulk')], '', '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035668', '2026-10-01', 'bulk')], 'garbage', '0')).toHaveLength(0);
+  });
+
+  it('stays silent for a bulk-discovered filing under the threshold', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    // Filed 2h before discovery — normal Clerk publication lag
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035649', '2026-10-15T11:12:00.000Z', 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('stays silent for live-search discoveries even when old', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035650', '2026-10-10', 'live')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('stays silent when filed_date is missing', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035651', null, 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('persists discovered_via=bulk for bulk index filings', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValue([{
+      pipelineDocId: 'H-2026-20035648',
+      sourceUrl: 'https://example.test/20035648.pdf',
+      filingDate: '2026-10-14',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    }]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+    const inserts = dbRuns.filter((r) => /INSERT OR IGNORE INTO filings/i.test(r.sql));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].sql).toContain('discovered_via');
+    expect(inserts[0].params[inserts[0].params.length - 1]).toBe('bulk');
+  });
+
+  it('attributes a filing seen by BOTH bulk and live search to live and keeps its bulk filed_date', async () => {
+    const { env, dbRuns } = fakeEnv();
+    const row = {
+      pipelineDocId: 'H-2026-20035670',
+      sourceUrl: 'https://example.test/20035670.pdf',
+      filingDate: '2026-10-14',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    };
+    mocks.fetchHouseIndex.mockResolvedValue([row]);
+    // The live-search HTML carries no FilingDate.
+    mocks.pollHouseLiveSearch.mockResolvedValue([{ ...row, filingDate: '' }]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+      const inserts = dbRuns.filter((r) => /INSERT OR IGNORE INTO filings/i.test(r.sql));
+      expect(inserts).toHaveLength(1);
+      expect(inserts[0].params[3]).toBe('2026-10-14'); // filed_date from the bulk record
+      expect(inserts[0].params[inserts[0].params.length - 1]).toBe('live');
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes('first discovered via BULK'))).toBe(false);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('logs the stale bulk alert end to end for a bulk-only filing the live search missed', async () => {
+    const { env } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValue([{
+      pipelineDocId: 'H-2026-20035671',
+      sourceUrl: 'https://example.test/20035671.pdf',
+      filingDate: '10/14/2026',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    }]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+      const msgs = errSpy.mock.calls.map((c) => String(c[0]));
+      expect(msgs.some((m) => m.includes('H-2026-20035671') && m.includes('9.2h late'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('persists discovered_via=live for live-search-only filings', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValue([]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([{
+      pipelineDocId: 'H-2026-20035650',
+      sourceUrl: 'https://example.test/20035650.pdf',
+      filingDate: '2026-10-10',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    }]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+    const inserts = dbRuns.filter((r) => /INSERT OR IGNORE INTO filings/i.test(r.sql));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].params[inserts[0].params.length - 1]).toBe('live');
+  });
+});

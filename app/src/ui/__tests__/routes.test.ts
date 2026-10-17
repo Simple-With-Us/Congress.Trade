@@ -15,6 +15,7 @@ import { browserSecurityHeadersMiddleware } from '../../security/headers.ts';
 import { resetSitemapCacheForTests } from '../sitemap.ts';
 import { APP_STORE_URL, testFlightUrl } from '../appLinks.ts';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
+import { DASHBOARD_APP_JS } from '../dashboardClient.ts';
 
 describe('/robots.txt', () => {
   it('allows the read-only render paths the SPA needs under the general Disallow: /api/', async () => {
@@ -180,8 +181,15 @@ describe('iOS install redirect routes', () => {
   it('shares the released listing across dashboard links and the install fallback', () => {
     expect(testFlightUrl()).toBe(APP_STORE_URL);
     expect(testFlightUrl({ IOS_APP_STORE_ID: 'invalid' } as never)).toBe(APP_STORE_URL);
-    expect(DASHBOARD_HTML.split(APP_STORE_URL)).toHaveLength(7);
+    // CT-2418: six of the seven links are rendered by the application script,
+    // which now lives in dashboardClient.ts rather than in the document; the
+    // document keeps the install-fallback link. Count across both so the
+    // "every install path points at the released listing" invariant is still
+    // what this test actually enforces.
+    const dashboardSource = DASHBOARD_HTML + DASHBOARD_APP_JS;
+    expect(dashboardSource.split(APP_STORE_URL)).toHaveLength(7);
     expect(DASHBOARD_HTML).not.toContain('href="null"');
+    expect(dashboardSource).not.toContain('href="null"');
   });
 
   it('uses the released App Store listing when no install URL is configured', async () => {
