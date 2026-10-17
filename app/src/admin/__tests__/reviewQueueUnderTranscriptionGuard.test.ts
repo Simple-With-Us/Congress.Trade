@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildAdminRouter } from '../routes.ts';
+import { buildAdminRouter, ReviewEditItemSchema } from '../routes.ts';
 
 /**
  * N-of-M / page-count under-transcription guard for POST /review/:docId.
@@ -170,5 +170,18 @@ describe('POST /review/:docId type diagnostics', () => {
     expect(result.status).toBe(400);
     expect(String(result.body.error)).toContain('requires explicit transaction edits');
     expect(result.body.issues).toBeUndefined();
+  });
+  it('strips undeclared keys at the boundary instead of forwarding them', () => {
+    const parsed = ReviewEditItemSchema.parse({ ...VALID_EDIT, flags: ['bad_tx_type'], injected: 'x' });
+    expect(parsed).toEqual(VALID_EDIT);
+    expect(Object.keys(parsed)).not.toContain('injected');
+    expect(Object.keys(parsed)).not.toContain('flags');
+  });
+  it('accepts confidence: null from a console row with no stored confidence', async () => {
+    const { db, runSql } = fakeDb(null);
+    const result = await postReview(db, { decision: 'confirm', reviewRevision: 1, edits: [{ ...VALID_EDIT, confidence: null }] });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ decision: 'confirm', resolved: true });
+    expect(runSql.some((sql) => /INSERT OR IGNORE INTO transactions/i.test(sql))).toBe(true);
   });
 });

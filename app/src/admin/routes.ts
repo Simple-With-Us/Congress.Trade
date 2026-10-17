@@ -1001,6 +1001,13 @@ function auditAdminSubscriptionAction(
   }
 }
 
+// The declared fields are the allow-list for review edits.  Zod's default
+// strip mode drops any other key at the boundary, so nothing undeclared reaches
+// collapseDuplicateSpans, validateReviewEdits or the transaction writer.  Not
+// .strict(): a stored review payload row (which also carries flags, rowKey and
+// similar derived fields) is a valid edit shape, and those rows must confirm
+// rather than 400.  The console's meSubmit sends confidence: null for a row
+// with no stored confidence, and the writer already falls back to 1.
 export const ReviewEditItemSchema = z.object({
   filerId: z.string().nullable().optional(),
   txDate: z.string().nullable().optional(),
@@ -1020,8 +1027,8 @@ export const ReviewEditItemSchema = z.object({
   location: z.string().nullable().optional(),
   description: z.string().nullable().optional(),
   supplementalText: z.string().nullable().optional(),
-  confidence: z.number().optional(),
-}).passthrough();
+  confidence: z.number().nullable().optional(),
+});
 
 interface EditedTx {
   filerId?: string | null;
@@ -1042,7 +1049,7 @@ interface EditedTx {
   location?: string | null;
   description?: string | null;
   supplementalText?: string | null;
-  confidence?: number;
+  confidence?: number | null;
 }
 
 type ValidatedEditedTx = EditedTx & {
