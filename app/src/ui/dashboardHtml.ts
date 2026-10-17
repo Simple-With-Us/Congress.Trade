@@ -100,7 +100,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 <title>%TITLE%</title>
 <meta name="description" content="%META_DESCRIPTION%" />
 <link rel="canonical" href="%CANONICAL_URL%" />
-<meta name="theme-color" content="#eff3f8" />
+<meta name="theme-color" content="#ffffff" />
 <!-- Open Graph — placeholders filled server-side from deep-link query
      (?view=trends / ?ticker= / ?member=) so crawlers get the right card. -->
 <meta property="og:type" content="website" />
@@ -150,7 +150,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.setAttribute('data-theme-pref', pref);
     var meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', theme === 'dark' ? '#08111f' : '#eff3f8');
+    if (meta) meta.setAttribute('content', theme === 'dark' ? '#1c1c1e' : '#ffffff');
   })();
   // Header column before first paint: header.top pads out to the active
   // view's content column (--ct-col-max via html[data-view]).  The static
@@ -408,7 +408,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
      Hidden on views that have no filters; #tradesExtraFilters (search) is
      Trades-only.  html[data-view] is stamped pre-paint and on every tab
      switch, so this never flashes. */
-  header.top #ctFilters {
+  #ctFilters {
     grid-column: 2 / -1; grid-row: 2;
     display: flex; align-items: center; gap: 12px; min-width: 0; min-height: var(--control-h, 34px);
   }
@@ -2102,7 +2102,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     header.top .brand { grid-row: 1; }
     nav.tabs { flex-wrap: wrap; }
     nav.tabs a { padding: 0 9px; }
-    header.top #ctFilters { grid-column: 1 / -1; grid-row: 2; }
+    #ctFilters { grid-column: 1 / -1; grid-row: 2; }
     html:not([data-view="trades"]):not([data-view="trends"]) header.top { grid-template-rows: auto; row-gap: 0; }
     .trades-toolbars #qSearchField { max-width: none; }
     /* Row 1 has to hold logo + four tabs + account at 769px: a slightly
@@ -2302,7 +2302,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     }
     header.top .brand { grid-column: 1; grid-row: 1; }
     header.top #acct { grid-column: 2; grid-row: 1; justify-self: end; }
-    header.top #ctFilters { grid-column: 1 / -1; grid-row: 2; display: block; padding: 4px 4px 8px; min-width: 0; }
+    #ctFilters { grid-column: 1 / -1; grid-row: 2; display: block; padding: 4px 4px 8px; min-width: 0; }
     #ctFilters .trades-toolbars { display: block; position: static; margin: 0; padding: 0; width: auto; }
     #ctFilters #tradesSharedFilters {
       display: flex; flex-wrap: nowrap; align-items: center; gap: 6px;
@@ -3290,6 +3290,38 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 
 
 
+
+  /* Keep filters on the content ground, separate from the white masthead. */
+  header.top {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-rows: auto; row-gap: 0;
+    padding-bottom: 16px;
+  }
+  header.top .brand { grid-row: 1; }
+  header.top nav.tabs { justify-self: end; align-self: center; }
+  #ctFilters {
+    box-sizing: border-box; width: 100%; max-width: var(--ct-col-max, 1730px);
+    margin: 0 auto; padding: 16px var(--ct-main-pad, 35px) 0;
+    display: flex; align-items: center; gap: 12px; min-width: 0;
+  }
+  @media (min-width: 769px) and (hover: hover) and (pointer: fine) {
+    #ctFilters { max-width: calc(var(--ct-col-max, 1730px) + 2 * var(--ct-main-pad, 35px)); }
+  }
+  .speed-mini-copy { display: flex; align-items: flex-start; gap: 7px; flex: 1 1 340px; min-width: 0; }
+  .speed-mini-bolt { flex: 0 0 auto; }
+  .speed-mini > button { margin-left: auto; flex: 0 0 auto; }
+  @media (max-width: 768px), (hover: none) and (pointer: coarse) {
+    html[data-theme="light"] { background: #fff; }
+    html[data-theme="dark"] { background: #1c1c1e; }
+    header.top { grid-template-columns: minmax(0, 1fr) 44px; grid-template-rows: auto; padding-bottom: 12px; }
+    #ctFilters { display: block; padding: 14px var(--ct-main-pad, 14px) 0; }
+    header.top nav.tabs { justify-self: stretch; width: 100%; }
+    nav.tabs { padding-top: 6px; padding-bottom: env(safe-area-inset-bottom, 0px); }
+    html[data-theme="light"] nav.tabs { background: #fff; }
+    html[data-theme="dark"] nav.tabs { background: #1c1c1e; }
+    .acct-mobile-menu > a.btn { display: flex; align-items: center; min-height: 48px; font-size: 16px; box-sizing: border-box; }
+  }
+
 </style>
 </head>
 <body>
@@ -3306,6 +3338,9 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <a href="/?view=admin" data-view="admin" data-mobile="Admin" data-icon="⚙" id="tab-admin" role="tab" aria-selected="false" aria-controls="view-admin" data-admin-tab="true" title="Admin · Cadence" hidden aria-label="Admin · Cadence"><span aria-hidden="true">Admin · Cadence <span class="tab-count-badge" id="adminTabBadge" hidden></span></span></a>
   </nav>
   <div id="acct" class="acct"></div>
+
+</header>
+
   <!-- Shared filter row (Trades + Trends).  Owner punch list #9 merged the
        Trades feed's two toolbars onto one row via #tradesToolbars
        (display:contents on both children + flex order, see CSS); owner
@@ -3385,7 +3420,6 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     </div>
     <button type="button" class="btn ghost sm ct-filter-reset" id="ctFilterReset" onclick="resetSharedFilters()" title="Reset filters to defaults" hidden>Reset</button>
   </div>
-</header>
 
 <main>
   <!-- #2071: do not put #banner here. A first-child status strip sits
@@ -3778,7 +3812,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <div class="section" id="subsMarketing">
       <h3>Alerts</h3>
       <p class="sub">We ingest official House, Senate, and Executive Branch trades.&nbsp; Relaying a 3rd-party competitor API would ruin our minutes-to-hours edge that Congress.Trade was made for.</p>
-      <p class="sub" style="margin-top: 8px;">Get the Filing First.&nbsp; Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
+      <p class="sub" style="margin-top: 8px;">Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
       <div class="speed-mini" id="alertsSpeedMini"></div>
       <div class="delivery-grid">
         <div class="delivery-card">
@@ -4917,7 +4951,7 @@ function applyTheme(effective) {
   }
   syncTickerLogoThemes(theme);
   var meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute('content', theme === 'dark' ? '#08111f' : '#eff3f8');
+  if (meta) meta.setAttribute('content', theme === 'dark' ? '#1c1c1e' : '#ffffff');
   syncThemeSegUI();
 }
 function syncThemeSegUI() {
@@ -11772,8 +11806,8 @@ function renderAlertsMini() {
   var best = pub && isLatencyAhead(pub) ? speedBoastProvider(pub) : null;
   if (!best) { box.className = 'speed-mini'; box.innerHTML = ''; return; }
   box.className = 'speed-mini show';
-  box.innerHTML = '<span>⚡ Ahead of ' + esc(best.label) + ' on <span class="lead">' + fmtCount(best.usFirstCount) + ' of ' + fmtCount(best.matched) +
-    '</span> matched filings · typical lead ' + leadFigureHtml(best.medianLeadSec, { word: false }) + '</span>' +
+  box.innerHTML = '<span class="speed-mini-copy"><span class="speed-mini-bolt" aria-hidden="true">⚡</span><span>Ahead of ' + esc(best.label) + ' on <span class="lead">' + fmtCount(best.usFirstCount) + ' of ' + fmtCount(best.matched) +
+    '</span> matched filings · typical lead ' + leadFigureHtml(best.medianLeadSec, { word: false }) + '</span></span>' +
     '<button class="btn ghost sm" onclick="openSpeedProof()">See the scoreboard →</button>';
 }
 function openSpeedProof() {
@@ -13238,7 +13272,7 @@ function renderAccount() {
       '<div class="menu-section-label">Account</div>' +
       '<button type="button" onclick="closeAcctMobileMenu();openExportCsvDialog()">Export CSV</button>' +
       '<button type="button" onclick="closeAcctMobileMenu();showView(\\'subs\\')">Delivery</button>' +
-      '<a href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
+      '<a class="btn ghost" href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
       upgrade +
       (canManageSubscription()
         ? '<button type="button" onclick="closeAcctMobileMenu();manageBilling()">Manage Subscription</button>'
