@@ -86,3 +86,79 @@ test("release notes timestamp uses the owner clock without a timezone abbreviati
   assert.doesNotMatch(fn, /\bCT\b[`"']/);
   assert.match(fn, /toLowerCase\(\)/);
 });
+
+// ---- Auto-ship contract for ios-ship.yml (owner 2026-10-17) ---------------
+// A merge to main that touches the app's native tree must upload a TestFlight
+// build with no human step.  These checks pin every piece of that wiring so a
+// refactor cannot quietly turn the pipeline back into a manual one.
+
+function withoutComments(text) {
+  return text
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+}
+
+function onBlock(yml) {
+  // The top-level `on:` mapping, up to the next top-level key.
+  const m = yml.match(/^on:\n((?:[ \t]+.*\n|[ \t]*#.*\n|\n)*)/m);
+  assert.ok(m, "ios-ship.yml must declare an on: block");
+  return m[1];
+}
+
+test("ios-ship.yml ships automatically on a merge that touches the native tree", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const code = withoutComments(yml);
+  const on = withoutComments(onBlock(yml));
+
+  // Trigger: push to main, filtered to the native tree (and the workflow file).
+  assert.match(on, /push:\s*\n\s+branches:\s*\[main\]/);
+  assert.match(on, /paths:\s*\n(?:\s+-\s+'[^']+'\n)*?\s+-\s+'clients\/ios\/\*\*'/);
+  assert.match(on, /workflow_dispatch:/);
+
+  // A scheduled catch-up is allowed only behind the scheduled path gate.
+  if (/^\s+schedule:/m.test(on)) {
+    assert.match(code, /scheduled-ship-gate\.sh/);
+    assert.match(code, /--path-prefix 'clients\/ios\/'/);
+    assert.match(code, /--event "\$\{\{ github\.event_name \}\}"/);
+  }
+
+  // The gate diffs against an older sha, and the notes need the commit range.
+  assert.match(code, /fetch-depth:\s*0/);
+  // What to Test is mandatory and published, never dry-rendered.
+  assert.match(code, /IOS_TF_RELEASE_NOTES:\s*"1"/);
+  // Ship through the wrapper that runs ship-testflight.sh (ensure-tf-ready inside).
+  assert.match(code, /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"\s*$/m);
+  // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
+  assert.match(code, /runs-on:\s*macos-latest/);
+  assert.match(code, /Assert stable Xcode/);
+  assert.match(code, /secret_path=\/asc/);
+  assert.match(code, /ASC_INFISICAL_PROJECT_ID:\s*8dae6d03-8f12-48b2-adf3-e5c1b881c8c5/);
+});
+
+test("no iOS ship workflow carries a standing gate override", () => {
+  for (const rel of [
+    ".github/workflows/ios-ship.yml",
+    ".github/workflows/ios-appstore-gm.yml",
+  ]) {
+    const code = withoutComments(read(rel));
+    assert.doesNotMatch(code, /IOS_TF_MIN_INTERVAL_SEC/, `${rel} must not set the interval override`);
+    assert.doesNotMatch(code, /ios-ship-testflight\.sh["'\s].*--force-ship/, `${rel} must not hard-code --force-ship`);
+    assert.doesNotMatch(code, /IOS_TF_RELEASE_NOTES:\s*"0"/, `${rel} must not turn What to Test off`);
+  }
+});
+
+test("the push paths filter matches the native tree and not backend code", () => {
+  const on = withoutComments(onBlock(read(".github/workflows/ios-ship.yml")));
+  const globs = [...on.matchAll(/^\s+-\s+'([^']+)'$/gm)].map((m) => m[1]);
+  // GitHub's `dir/**` matches anything under dir/.
+  const matches = (glob, file) => glob.endsWith("/**")
+    ? file.startsWith(glob.slice(0, -2))
+    : file === glob;
+  const hit = (file) => globs.some((g) => matches(g, file));
+
+  assert.ok(hit("clients/ios/CongressTrade/ContentView.swift"));
+  assert.ok(hit("clients/ios/CongressTrade.xcodeproj/project.pbxproj"));
+  assert.ok(!hit("app/src/deno/main.ts"), "backend-only commits must not ship a TestFlight build");
+  assert.ok(!hit("docs/rollouts/2026-10-17-ios-autoship-reenable.md"));
+});
