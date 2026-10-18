@@ -4,12 +4,25 @@ name: iOS App Store GM ship
 # The owned Mac runner is macOS 27 beta; App Store review rejects those
 # binaries as INVALID_BINARY even when TestFlight accepts them.
 # Manual only — do not put this on a schedule.
+#
+# Gate (2026-10-17): the 2.5 hour per-app interval and the same-HEAD skip are
+# live here.  A hosted runner starts with an empty home, so the "Seed last-ship
+# state" step reads the previous successful run of this workflow and writes the
+# state file the ship script reads.  There is NO standing gate override: set the
+# force_ship input for one run when the gate would skip a genuinely stale app.
+# The same seed gives the TestFlight What to Test notes their commit range.
 
 on:
   workflow_dispatch:
+    inputs:
+      force_ship:
+        description: "Bypass the 2.5 hour interval and same-HEAD gate for this run only"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ios-appstore-gm-congress
@@ -23,7 +36,7 @@ jobs:
     timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-      IOS_TF_MIN_INTERVAL_SEC: "0"
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -96,7 +109,7 @@ jobs:
           fi
           printf '::add-mask::%s\n' "${TOKEN//'%'/'%25'}"
 
-          for name in ASC_KEY_ID ASC_ISSUER_ID \
+          for name in ASC_KEY_ID ASC_ISSUER_ID SENTRY_DSN \
                       IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
             secret_project="$INFISICAL_PROJECT_ID"
             secret_path=/
@@ -125,10 +138,14 @@ jobs:
             printf -v "$name" '%s' "$val"
             export "$name"
             # Certificate credentials belong only to this load/import step.
-            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" || "$name" == "SENTRY_DSN" ]]; then
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
             fi
           done
+          if [ -z "${SENTRY_DSN:-}" ]; then
+            echo "::error::Infisical prod SENTRY_DSN is missing; refusing a mute TestFlight archive."
+            exit 1
+          fi
           # Keep multiline PEM out of GITHUB_ENV and every later step environment.
           # Only its mode-600 file path crosses the step boundary.
           key_material="$(
@@ -147,6 +164,56 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
           unset key_material TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
-      - name: Ship CongressTrade from GM host
+      # Hosted runners have an empty home each job, and this repo forbids
+      # actions/cache.  Without a state file the ship gate reads "never shipped"
+      # and the release notes fall back to the HEAD subject only.  Seed both from
+      # the previous successful run of this workflow.
+      - name: Seed last-ship state from the previous successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --force-ship
+          set -euo pipefail
+          prev="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-appstore-gm.yml \
+            --status success --limit 1 --json headSha,updatedAt \
+            --jq '.[0] | select(. != null) | "\(.updatedAt) \(.headSha)"' || true)"
+          if [ -z "$prev" ]; then
+            echo "No previous successful run; the ship gate treats this as a first ship."
+            exit 0
+          fi
+          prev_at="${prev%% *}"
+          prev_sha="${prev##* }"
+          if ! [[ "$prev_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::Previous run sha is not a full sha; not seeding."
+            exit 0
+          fi
+          prev_ts="$(python3 -c 'import sys,datetime; print(int(datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()))' "$prev_at")"
+          state_dir="${IOS_FLEET_STATE_DIR:-$HOME/.cache/ios-fleet}"
+          mkdir -p "$state_dir"
+          printf '%s %s\n' "$prev_ts" "$prev_sha" > "$state_dir/last-ship-congress.txt"
+          echo "Seeded last ship: ${prev_sha:0:10} at ${prev_at}"
+
+      - name: Ship CongressTrade from GM host
+        env:
+          IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          FORCE_SHIP: ${{ inputs.force_ship }}
+        run: |
+          args=()
+          if [ "$FORCE_SHIP" = "true" ]; then
+            args+=(--force-ship)
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" ${args[@]:+"${args[@]}"}
+
+      # A gate skip exits 0 inside the ship script.  For a manual dispatch that
+      # must not look like a shipped build, so assert the state file now records
+      # this checkout as shipped.
+      - name: Assert this checkout was uploaded
+        run: |
+          set -euo pipefail
+          state_dir="${IOS_FLEET_STATE_DIR:-$HOME/.cache/ios-fleet}"
+          read -r _ts shipped < "$state_dir/last-ship-congress.txt" || true
+          head_sha="$(git rev-parse HEAD)"
+          if [ "${shipped:-}" != "$head_sha" ]; then
+            echo "::error::Nothing was uploaded for ${head_sha:0:10}; the ship gate skipped this run.  Re-run with force_ship if the app is genuinely stale."
+            exit 1
+          fi
+          echo "Uploaded ${head_sha:0:10} to TestFlight."
