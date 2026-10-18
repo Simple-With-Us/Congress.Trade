@@ -152,3 +152,112 @@ describe('openSseStream live-tail backlog drain (cross-region safety net)', () =
     expect(counter.backlogSince[0]).toBe(0);
   });
 });
+
+describe('the streamed trade carries the filer party', () => {
+  // The dashboard's D/R chips call rowPartyBucket(), which reads row.party and
+  // falls back to 'O' when it is absent. The backlog query joined filers for
+  // display_name, state and photo_url but never projected party, so every
+  // replayed row arrived party-less, bucketed as 'O', and was rejected wholesale
+  // whenever a party chip was selected. The HTTP feed selected the same alias
+  // the whole time, so the two producers disagreed on shape.
+  // Dated today on purpose: isDeliveryBackfill() treats a row with no dates as
+  // backfill, and matchesFilters drops backfill unless includeBackfill is set.
+  // An undated fixture would be rejected before reaching the party assertion,
+  // which is the wrong-reason failure mode, not a party failure.
+  const today = new Date().toISOString().slice(0, 10);
+  const partyRow = {
+    id: 'tx_party',
+    cursor_seq: 7,
+    ticker: 'AAPL',
+    tx_type: 'B',
+    doc_id: 'doc_1',
+    filer_id: 'K000388',
+    asset_name: 'Apple Inc',
+    tx_date: today,
+    filed_date: today,
+    created_at: new Date().toISOString(),
+  };
+
+  function makePartyEnv(seen: string[], rows: unknown[], hwm = 99): Env {
+    const prepare = (sql: string) => ({
+      params: [] as unknown[],
+      bind(...params: unknown[]) {
+        this.params = params;
+        return this;
+      },
+      async first<T>() {
+        if (/FROM subscriptions WHERE id = \?/i.test(sql)) {
+          return {
+            id: 'sub_1',
+            client_id: 'ops-integration',
+            delivery: 'sse',
+            target_url: null,
+            secret: 'stream-secret',
+            filters: '{}',
+            cursor: 0,
+            active: 1,
+            created_at: '2026-01-01T00:00:00.000Z',
+          } as T;
+        }
+        if (/SELECT active FROM subscriptions/i.test(sql)) return { active: 1 } as T;
+        if (/MAX\(cursor_seq\)/i.test(sql)) return { hwm } as T;
+        return null as T | null;
+      },
+      async all<T>() {
+        if (/MAX\(cursor_seq\)/i.test(sql)) return { results: [{ hwm }] as T[] };
+        if (/idx_tx_cursor/i.test(sql)) {
+          seen.push(sql);
+          return { results: rows as T[] };
+        }
+        return { results: [] as T[] };
+      },
+      async run() {
+        return { success: true, meta: { changes: 1 } };
+      },
+    });
+    return { DB: { prepare } as unknown as D1Database } as unknown as Env;
+  }
+
+  async function firstFrame(sqls: string[], rows: unknown[]): Promise<any> {
+    // 80ms is enough for the catch-up drain to emit one frame and for the
+    // stream to close. Longer streams here would add load to the same worker as
+    // the timing-sensitive drain test above, which asserts on a deadline event.
+    const res = await openSseStream(makePartyEnv(sqls, rows), 'sub_1', 0, 'stream-secret', '127.0.0.1', {
+      maxStreamMs: 80,
+      pollIntervalMs: 10,
+      backlogDrainIntervalMs: 500,
+      reconnectGraceMs: 10,
+    });
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    const line = text.split('\n').find((l) => l.startsWith('data: {"type":"congress.trade"'));
+    expect(line, 'a congress.trade frame was emitted').toBeDefined();
+    return JSON.parse(line!.slice('data: '.length));
+  }
+
+  it('projects filer_party in the backlog query, like the HTTP feed does', async () => {
+    const sqls: string[] = [];
+    await firstFrame(sqls, [{ ...partyRow, filer_party: 'D' }]);
+    expect(sqls.length).toBeGreaterThan(0);
+    expect(sqls[0]).toMatch(/fl\.party AS filer_party/i);
+  });
+
+  it('carries party on the emitted transaction, so the client party filter can read it', async () => {
+    const payload = await firstFrame([], [{ ...partyRow, filer_party: 'D' }]);
+    expect(payload.data.trades[0].party).toBe('D');
+  });
+
+  it('reports a filer with no party as null rather than omitting the field', async () => {
+    const payload = await firstFrame([], [{ ...partyRow, filer_party: null }]);
+    // Absent and null both bucket as 'O' client-side, but null says "known, and
+    // it is genuinely unknown" while an absent key reads as "nobody populated
+    // this", which is how the original omission stayed invisible.
+    expect(payload.data.trades[0].party).toBeNull();
+  });
+});
