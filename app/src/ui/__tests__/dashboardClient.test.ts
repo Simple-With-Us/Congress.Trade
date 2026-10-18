@@ -393,6 +393,58 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
   // chamber, side, party and search but not the date window that
   // tradesFilterParams() applies to the HTTP feed. A late filing outside the
   // window would be appended into a narrowed table.
+  // Codex, on the same function again: the server sends `ticker=` for an
+  // all-caps token and filters it with "t.ticker = ?" — exact — while the client
+  // used indexOf, so an AAPL view accepted a streamed AAPLX and counted it.
+  it('matches a ticker token exactly, the way the server does', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    const origQuery = win['tradesSearchQuery'] as () => string;
+    (win as Record<string, unknown>)['chipSel'] = () => [];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => '';
+    (win as Record<string, unknown>)['tradesSearchQuery'] = () => 'AAPL';
+    try {
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, ticker: 'AAPL', asset: '' }),
+      ).toBe(true);
+      // The failure this pins: a longer ticker must NOT satisfy an AAPL search.
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, ticker: 'AAPLX', asset: '' }),
+      ).toBe(false);
+      // Case is irrelevant — the server upper-cases before comparing.
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, ticker: 'aapl', asset: '' }),
+      ).toBe(true);
+      // An exact ticker row with no ticker at all is excluded, same as the feed.
+      expect(client.makeTradesFilterMatcher()({ ...row, asset: '' })).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+      (win as Record<string, unknown>)['tradesSearchQuery'] = origQuery;
+    }
+  });
+
+  // The classification must be case-sensitive in the way the server's is: a
+  // lower-case word is a name, not a ticker, so it keeps substring matching.
+  it('still matches a lower-case token as a name, not an exact ticker', () => {
+    const origQuery = win['tradesSearchQuery'] as () => string;
+    (win as Record<string, unknown>)['tradesSearchQuery'] = () => 'khanna';
+    try {
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, member: 'Ro Khanna', ticker: '' }),
+      ).toBe(true);
+      // Substring still applies to the ticker field for a non-ticker token.
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, member: '', ticker: 'AAPL' }),
+      ).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['tradesSearchQuery'] = origQuery;
+    }
+  });
+
   describe('the active date window', () => {
     const base = { chamber: 'house', type: 'Purchase', member: 'Ro Khanna', st: 'CA' };
 

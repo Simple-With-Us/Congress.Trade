@@ -1331,16 +1331,25 @@ function resetCols() {
 /** Multi-token AND trade search: any order; each token matches politician
  *  name, ticker, asset name, state (abbr or full), or party synonyms. */
 function tradeRowMatchesSearch(r, q) {
-  var raw = String(q || '').trim().toLowerCase();
+  var raw = String(q || '').trim();
   if (!raw) return true;
-  var tokens = raw.split(/\s+/).filter(Boolean);
+  // Lower-cased copy for matching; the original casing is kept alongside because
+  // classifySearchToken() has to see what the user typed to spot a ticker.
+  var rawTokens = raw.split(/\s+/).filter(Boolean);
+  var tokens = raw.toLowerCase().split(/\s+/).filter(Boolean);
   var name = String(r.member || '').toLowerCase();
   var nameParts = name.split(/[\s,.\-']+/).filter(Boolean);
   var ticker = String(r.ticker || '').toLowerCase();
   var asset = String(r.asset || r.company || '').toLowerCase();
   var state = String(r.st || r.state || '').toLowerCase();
   var party = String(r.party || r.partyBucket || '');
-  return tokens.every(function (tok) {
+  return tokens.every(function (tok, idx) {
+    // A token the server would send as "ticker=" is an EXACT match there
+    // ("t.ticker = ?"), so it must be exact here too. Substring matching let a
+    // streamed AAPLX through an AAPL search and counted it in totalRows.
+    if (classifySearchToken(rawTokens[idx]) === 'ticker') {
+      return !!ticker && ticker === tok;
+    }
     if (name.indexOf(tok) >= 0) return true;
     for (var i = 0; i < nameParts.length; i++) {
       if (nameParts[i].indexOf(tok) === 0 || nameParts[i].indexOf(tok) >= 0) return true;
@@ -1439,28 +1448,43 @@ var COMMON_POLITICIAN_NAMES = {
   wood: 1, wright: 1, young: 1
 };
 /** Heuristic server params from unified query (OR-ish fetch; client re-filters). */
+// ONE classifier for both consumers of the search box. applySearchToServerParams()
+// below builds the HTTP query from it and tradeRowMatchesSearch() applies the
+// same meaning to a streamed row. They had drifted: the server filters a ticker
+// with "t.ticker = ?" (exact, upper-cased) while the client used indexOf, so an
+// "AAPL" view accepted a streamed AAPLX that a reload would remove. One
+// definition, so the two cannot disagree about what a token means again.
+function classifySearchToken(tok) {
+  var tokL = tok.toLowerCase();
+  var polDict = (typeof COMMON_POLITICIAN_NAMES !== 'undefined') ? COMMON_POLITICIAN_NAMES : {};
+  var isState = (typeof US_STATE_ABBR !== 'undefined' && US_STATE_ABBR[tokL]) ||
+    (typeof US_STATE_NAME_TO_ABBR !== 'undefined' && US_STATE_NAME_TO_ABBR[tokL]);
+  var isParty = /^(dem|rep|ind|gop|other|democrat|republican|independent)s?$/i.test(tok);
+  var isPolitician = !!polDict[tokL];
+  // isAllUpper needs the token as the user typed it: 'aapl' is not a ticker
+  // hint, and lower-casing before this test would turn every word into one.
+  var isAllUpper = tok === tok.toUpperCase() && /^[A-Z0-9]{1,5}$/.test(tok);
+  if (isAllUpper && !isState && !isParty && !isPolitician) return 'ticker';
+  if (isState) return 'state';
+  if (isParty) return 'party';
+  if (isPolitician) return 'politician';
+  return 'name';
+}
 function applySearchToServerParams(p, q) {
   var raw = String(q || '').trim();
   if (!raw) return;
   var tokens = raw.split(/\s+/).filter(Boolean);
   var nameBits = [];
   var tickerHint = '';
-  var polDict = (typeof COMMON_POLITICIAN_NAMES !== 'undefined') ? COMMON_POLITICIAN_NAMES : {};
   for (var i = 0; i < tokens.length; i++) {
     var tok = tokens[i];
-    var up = tok.toUpperCase();
-    var tokL = tok.toLowerCase();
-    var isState = (typeof US_STATE_ABBR !== 'undefined' && US_STATE_ABBR[tokL]) ||
-      (typeof US_STATE_NAME_TO_ABBR !== 'undefined' && US_STATE_NAME_TO_ABBR[tokL]);
-    var isParty = /^(dem|rep|ind|gop|other|democrat|republican|independent)s?$/i.test(tok);
-    var isPolitician = !!polDict[tokL];
-    var isAllUpper = tok === up && /^[A-Z0-9]{1,5}$/.test(tok);
-    if (isAllUpper && !isState && !isParty && !isPolitician) {
-      if (!tickerHint) tickerHint = up;
+    var kind = classifySearchToken(tok);
+    if (kind === 'ticker') {
+      if (!tickerHint) tickerHint = tok.toUpperCase();
       else nameBits.push(tok);
-    } else if (isState) {
+    } else if (kind === 'state') {
       // state — client filter only (server has no state= on public feed)
-    } else if (isParty) {
+    } else if (kind === 'party') {
       // party — client filter
     } else {
       nameBits.push(tok);

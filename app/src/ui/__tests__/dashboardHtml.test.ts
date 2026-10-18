@@ -7010,11 +7010,17 @@ describe('web frontend bug fixes, accessibility enhancements, and mobile polish'
     const chamberAll = DASHBOARD_SOURCE.match(/var CHAMBER_ALL = \[[^\]]*\];/);
     const polDict = DASHBOARD_SOURCE.match(/var COMMON_POLITICIAN_NAMES = \{[\s\S]*?\n\};/);
     if (!chamberAll || !polDict) throw new Error('Declarations not found in DASHBOARD_SOURCE');
-    const [applySearchToServerParamsSrc] = loadDashboardFunctions(['applySearchToServerParams']);
+    // classifySearchToken carries the token rules and is called by
+    // applySearchToServerParams, so it has to be in the same evaluated scope.
+    const [classifySearchTokenSrc, applySearchToServerParamsSrc] = loadDashboardFunctions([
+      'classifySearchToken',
+      'applySearchToServerParams',
+    ]);
     const factory = new Function(
       'US_STATE_ABBR',
       'US_STATE_NAME_TO_ABBR',
-      [chamberAll[0], polDict[0], applySearchToServerParamsSrc].join('\n\n') + '\nreturn applySearchToServerParams;',
+      [chamberAll[0], polDict[0], classifySearchTokenSrc, applySearchToServerParamsSrc].join('\n\n') +
+        '\nreturn applySearchToServerParams;',
     );
     const applySearchToServerParams = factory({}, {}) as (p: URLSearchParams, q: string) => void;
 
