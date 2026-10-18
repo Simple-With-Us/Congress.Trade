@@ -182,6 +182,10 @@ jobs:
           fi
           prev_at="${prev%% *}"
           prev_sha="${prev##* }"
+          # gh prints RFC 3339 without fractions, but drop any fraction so a
+          # format change cannot fail this step under set -e.
+          prev_at="${prev_at%%.*}"
+          prev_at="${prev_at%Z}Z"
           if ! [[ "$prev_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::warning::Previous run sha is not a full sha; not seeding."
             exit 0
