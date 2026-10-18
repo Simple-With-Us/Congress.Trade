@@ -467,7 +467,7 @@ Public `/api/health` is HTTP 200 on live sha `a50c09e5` (PR #1885
 merged + Coolify auto-deploy).  `checks.secrets`: shared ok/65, app
 ok/145, cacheReady, 0 errors, no values.  Pipeline `status:stalled`
 is the existing autopilot/senate halt, not this change.  Owner: paste
-`CT_ADMIN_TOKEN` from `~/.secrets/global-api-keys` into the
+`CT_ADMIN_TOKEN` (via `fleet-secrets get CT_ADMIN_TOKEN`) into the
 congress.trade admin UI localStorage (do not paste into chat).
 
 ## 2026-08-15 GROK — Trends layout, Directory pager, Khanna recent dates

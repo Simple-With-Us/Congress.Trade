@@ -222,6 +222,12 @@ jobs:
           bash -n scripts/infisical-secrets-safe.sh
           node --test scripts/infisical-secrets-safe.test.mjs
 
+      # Local Infisical bootstrap reads the machine identity from env, then a
+      # fake `fleet-secrets` stub.  Offline: no real CLI, network or credentials.
+      - name: Local dev-vars bootstrap tests
+        working-directory: .
+        run: node --test scripts/merge-local-dev-vars.test.mjs
+
       # Static guard for the class of defect behind the sqlite-web finding: a
       # security-relevant variable given a fail-open default, or a password
       # literal committed to source. Both existed on main until 2026-08-02 —

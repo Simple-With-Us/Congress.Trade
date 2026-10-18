@@ -259,9 +259,12 @@ Public rules that belong in this file:
 - **`congress.trade` admin routes sit behind a Cloudflare managed challenge.**
   Default curl User-Agents often get an edge 502/403 that looks like a dead
   credential. Use a browser UA. Never paste tokens into chat.
-- **Never dump the operator handoff file.** Names only:
-  `grep -oE '^[A-Z][A-Z0-9_]*' ~/.secrets/global-api-keys`. Never `cat` it,
-  never open it with a Read tool. Canonical: `~/apps/AGENT-SYNC.md` § secret-safety.
+- **Never print secret values.** Names only:
+  `fleet-secrets names` (values: `fleet-secrets get NAME` into a variable, never
+  echoed; `fleet-secrets run -- CMD` for env). The old flat handoff file is
+  retired and nothing reads it any more (OPS-818). Canonical:
+  `~/apps/AGENT-SYNC.md` § secret-safety and AI-Fleet-Coordinator `INFISICAL.md`
+  § fleet-secrets.
 - **Never run bare `infisical secrets`.** It table-prints every value. Use
   `scripts/infisical-secrets-safe.sh` (`set` / `has` / `names`).
 - Runtime secrets live in Infisical (app prod). Coolify env is bootstrap +
@@ -385,7 +388,7 @@ Durable, non-obvious notes for running/testing locally (all from `app/`):
   `bash scripts/cloud-setup.sh` from the repository root.
 - `cloud-setup.sh` safely maps the
   Infisical app/shared machine identities from explicit environment variables
-  or the owner-only `$HOME/.secrets/global-api-keys` file. It also retains only
+  or, on a Mac with the CLI installed, `fleet-secrets get NAME`. It also retains only
   the documented early-init/local overrides (`SENTRY_DSN`,
   `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE`, `ADMIN_OPEN_IN_DEV`, and
   `USAGE_MONITOR_ENVIRONMENT`). All other runtime config remains in Infisical;

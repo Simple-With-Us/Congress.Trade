@@ -186,10 +186,9 @@ There is no production `wrangler.toml`.  The Deno entrypoint in
 Local development variables are documented in `.dev.vars.example`, but that
 template is reference-only. From the repository root run
 `bash scripts/cloud-setup.sh`; it safely maps the Congress.Trade and shared
-Infisical machine identities from explicit environment variables or the
-optional owner-only `$HOME/.secrets/global-api-keys` file (no group/other
-permission bits) into the gitignored `.dev.vars`. The global file is parsed as
-inert assignments and never sourced.
+Infisical machine identities from explicit environment variables or, on a Mac
+with the CLI installed, `fleet-secrets get NAME` into the gitignored
+`.dev.vars`. Cloud and CI use the environment only.
 The setup also carries forward only the five documented early-init/local
 selectors (`SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE`,
 `ADMIN_OPEN_IN_DEV`, and `USAGE_MONITOR_ENVIRONMENT`) from the explicit process

@@ -76,7 +76,7 @@ type EnvWithWatch = Env & {
   FMP_DISCLOSURE_WATCH_ENABLED?: string;
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias used in global-api-keys / Infisical (no underscores in “unusualwhales”). */
+  /** Alias used in Infisical (no underscores in “unusualwhales”). */
   UNUSUALWHALES_API_KEY?: string;
   QUIVER_API_KEY?: string;
   QUIVER_API_TOKEN?: string;
