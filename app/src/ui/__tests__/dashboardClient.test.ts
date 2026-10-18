@@ -404,12 +404,28 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
       const made: string[] = [];
       const restoreValues: Array<() => void> = [];
       const setValue = (id: string, value: string) => {
-        const existing = win.document.getElementById(id) as HTMLInputElement | null;
+        const existing = win.document.getElementById(id) as
+          | (HTMLInputElement & { selectedIndex?: number })
+          | null;
         if (existing) {
           const prior = existing.value;
-          existing.value = value;
+          const priorIndex = existing.selectedIndex;
+          // A <select> carrying no empty <option> cannot hold the value ''.
+          // Assigning '' already deselects every option (measured in jsdom:
+          // selectedIndex goes to -1 and the value reads back as '', it does NOT
+          // fall back to the first option), but relying on that subtle rule
+          // would leave the intent implicit. State it instead.
+          if (existing.tagName === 'SELECT' && value === '') {
+            existing.selectedIndex = -1;
+          } else {
+            existing.value = value;
+          }
           restoreValues.push(() => {
-            existing.value = prior;
+            if (existing.tagName === 'SELECT') {
+              existing.selectedIndex = priorIndex ?? -1;
+            } else {
+              existing.value = prior;
+            }
           });
           return;
         }
