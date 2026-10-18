@@ -1361,25 +1361,22 @@ function resetCols() {
 /** Multi-token AND trade search: any order; each token matches politician
  *  name, ticker, asset name, state (abbr or full), or party synonyms. */
 function tradeRowMatchesSearch(r, q) {
-  var raw = String(q || '').trim();
-  if (!raw) return true;
-  // Lower-cased copy for matching; the original casing is kept alongside because
-  // classifySearchToken() has to see what the user typed to spot a ticker.
-  var rawTokens = raw.split(/\\s+/).filter(Boolean);
-  var tokens = raw.toLowerCase().split(/\\s+/).filter(Boolean);
+  var parsed = searchTokenPlan(q);
+  if (!parsed.raw) return true;
   var name = String(r.member || '').toLowerCase();
   var nameParts = name.split(/[\\s,.\\-']+/).filter(Boolean);
   var ticker = String(r.ticker || '').toLowerCase();
   var asset = String(r.asset || r.company || '').toLowerCase();
   var state = String(r.st || r.state || '').toLowerCase();
   var party = String(r.party || r.partyBucket || '');
-  return tokens.every(function (tok, idx) {
-    // A token the server would send as "ticker=" is an EXACT match there
-    // ("t.ticker = ?"), so it must be exact here too. Substring matching let a
-    // streamed AAPLX through an AAPL search and counted it in totalRows.
-    if (classifySearchToken(rawTokens[idx]) === 'ticker') {
-      return !!ticker && ticker === tok;
-    }
+  return parsed.plan.every(function (entry) {
+    var tok = entry.lower;
+    // Only the token that became ticker= is an EXACT match here, because the
+    // server compares that one with "t.ticker = ?" (exact, upper-cased).
+    // Substring matching let a streamed AAPLX through an AAPL search and counted
+    // it in totalRows. Later ticker-shaped tokens are NOT exact: they travel as
+    // part of memberName and are matched as substrings there.
+    if (entry.exactTicker) return !!ticker && ticker === tok;
     if (name.indexOf(tok) >= 0) return true;
     for (var i = 0; i < nameParts.length; i++) {
       if (nameParts[i].indexOf(tok) === 0 || nameParts[i].indexOf(tok) >= 0) return true;
@@ -1500,30 +1497,61 @@ function classifySearchToken(tok) {
   if (isPolitician) return 'politician';
   return 'name';
 }
-function applySearchToServerParams(p, q) {
+/* Classify the query ONCE and hand both consumers the same answer.
+ *
+ * classifySearchToken() says what each token is; this also says which one is the
+ * ticker the request is actually keyed on. Only the FIRST ticker-shaped token
+ * becomes ticker=, and that is the only one the server compares exactly — every
+ * later ticker-shaped token falls into memberName and is matched as a substring
+ * there.
+ *
+ * The two consumers drifted on exactly that point. The row predicate treated
+ * every ticker-shaped token as exact, so "AAPL RO" demanded the row's ticker
+ * equal BOTH AAPL and RO: no row can, so a search that the HTTP feed happily
+ * returns matched nothing on the live path — a row that would appear on reload
+ * and vanish after it. Extracting the decision, rather than patching the
+ * comparison, is what keeps them from disagreeing again. */
+function searchTokenPlan(q) {
   var raw = String(q || '').trim();
-  if (!raw) return;
   var tokens = raw.split(/\\s+/).filter(Boolean);
+  var plan = [];
+  var tickerClaimed = false;
+  for (var i = 0; i < tokens.length; i++) {
+    var kind = classifySearchToken(tokens[i]);
+    var exactTicker = kind === 'ticker' && !tickerClaimed;
+    if (kind === 'ticker') tickerClaimed = true;
+    plan.push({
+      token: tokens[i],
+      // Lower-cased copy for matching; the original casing is kept because
+      // classifySearchToken() has to see what the user typed to spot a ticker.
+      lower: tokens[i].toLowerCase(),
+      kind: kind,
+      exactTicker: exactTicker,
+    });
+  }
+  return { raw: raw, plan: plan };
+}
+function applySearchToServerParams(p, q) {
+  var parsed = searchTokenPlan(q);
+  if (!parsed.raw) return;
   var nameBits = [];
   var tickerHint = '';
-  for (var i = 0; i < tokens.length; i++) {
-    var tok = tokens[i];
-    var kind = classifySearchToken(tok);
-    if (kind === 'ticker') {
-      if (!tickerHint) tickerHint = tok.toUpperCase();
-      else nameBits.push(tok);
-    } else if (kind === 'state') {
-      // state — client filter only (server has no state= on public feed)
-    } else if (kind === 'party') {
-      // party — client filter
-    } else {
-      nameBits.push(tok);
+  for (var i = 0; i < parsed.plan.length; i++) {
+    var entry = parsed.plan[i];
+    if (entry.exactTicker) {
+      tickerHint = entry.token.toUpperCase();
+      continue;
     }
+    if (entry.kind === 'state' || entry.kind === 'party') {
+      // state / party — client filter only (server has no state= on public feed)
+      continue;
+    }
+    nameBits.push(entry.token);
   }
   if (tickerHint) p.set('ticker', tickerHint);
   if (nameBits.length) p.set('memberName', nameBits.join(' '));
   // If nothing classified, send whole string as memberName so server still narrows
-  if (!tickerHint && !nameBits.length) p.set('memberName', raw);
+  if (!tickerHint && !nameBits.length) p.set('memberName', parsed.raw);
 }
 // See the .row-open-btn CSS comment above for why this exists: a real,
 // named control dropped into a clickable table row's first cell, invisible

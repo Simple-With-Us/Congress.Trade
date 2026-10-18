@@ -274,6 +274,47 @@ describe('tradeRowMatchesSearch — multi-token AND matching', () => {
   it('matches on a name part, not only a prefix of the whole name', () => {
     expect(client.tradeRowMatchesSearch(row, 'kha')).toBe(true);
   });
+
+  // The HTTP feed is the reference: applySearchToServerParams keys the request
+  // on the FIRST ticker-shaped token and folds the rest into memberName, which
+  // the server matches as a substring. The live path has to agree or a row
+  // shows up live and disappears on reload.
+  const aaplRo = {
+    member: 'Ro Khanna', ticker: 'AAPL', asset: 'Apple Inc',
+    st: 'CA', state: 'California', party: 'D',
+  };
+
+  it('matches a second ticker-shaped token as a substring, not an exact ticker', () => {
+    expect(client.tradeRowMatchesSearch(aaplRo, 'AAPL RO')).toBe(true);
+    expect(client.tradeRowMatchesSearch(aaplRo, 'AAPL Khanna')).toBe(true);
+  });
+
+  it('still applies exact matching to the token the request is keyed on', () => {
+    // AAPL is the ticker= token, so it stays exact: AAPLX must not slip in.
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'AAPLX' }, 'AAPL RO')).toBe(false);
+  });
+
+  it('keys exact matching on the FIRST ticker-shaped token, whichever it is', () => {
+    // Not order-independent for ticker-shaped tokens, and deliberately so:
+    // "RO AAPL" asks the server for ticker=RO as well, so the client has to
+    // agree with that rather than be cleverer than the request it is filtering.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'RO AAPL');
+    expect(p.get('ticker')).toBe('RO');
+    expect(p.get('memberName')).toBe('AAPL');
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'AAPL' }, 'RO AAPL')).toBe(false);
+    // An RO-ticker row matches on the exact token, then on AAPL as a substring.
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'RO', asset: 'AAPL Holding' }, 'RO AAPL')).toBe(true);
+  });
+
+  it('builds the same query the matcher assumes', () => {
+    // The two halves of the parity: if this ever stops being ticker=AAPL +
+    // memberName=RO, the exact-match rule above is pinned to the wrong token.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'AAPL RO');
+    expect(p.get('ticker')).toBe('AAPL');
+    expect(p.get('memberName')).toBe('RO');
+  });
 });
 
 describe('applySearchToServerParams — filter-to-query builder', () => {
