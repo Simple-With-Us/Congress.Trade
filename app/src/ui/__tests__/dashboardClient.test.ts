@@ -276,9 +276,8 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
   });
 
   it('excludes a row whose chamber is not selected', () => {
-    const cb = win['chipSel'] as (id: string) => string[];
-    const sel = win['chamberParam'] as (id: string) => string;
-    const origChip = cb;
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
     // Stand in the DOM-derived filter state; the real one depends on the
     // chip markup, which this document does have but with nothing selected.
     (win as Record<string, unknown>)['chipSel'] = () => ['senate'];
@@ -288,18 +287,21 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
       expect(client.makeTradesFilterMatcher()({ ...row, chamber: 'senate' })).toBe(true);
     } finally {
       (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
     }
   });
 
   it('honours the empty-selection-means-all semantics', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
     (win as Record<string, unknown>)['chipSel'] = () => ['house'];
     (win as Record<string, unknown>)['chamberParam'] = () => '';
     try {
       // No chamber selected = ALL branches, including unresolved-chamber rows.
       expect(client.makeTradesFilterMatcher()({ ...row, chamber: 'executive' })).toBe(true);
     } finally {
-      delete (win as Record<string, unknown>)['chipSel'];
-      delete (win as Record<string, unknown>)['chamberParam'];
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
     }
   });
 });
@@ -330,11 +332,30 @@ describe('asset-name hygiene', () => {
   });
 
   it('cleanAsset strips exchange suffixes and trailing noise', () => {
-    // The rewritten regex in this change is the one that had to keep working:
-    // it previously read /[\/\-\s]+$/ and must still trim a trailing separator.
     expect(client.cleanAsset('Apple Inc.   ')).not.toMatch(/[\s]$/);
     expect(client.cleanAsset('Apple Inc -')).not.toMatch(/-$/);
     expect(client.cleanAsset('Apple Inc (NASDAQ)')).not.toContain('NASDAQ');
+  });
+
+  // The two cases below are regressions caught in review of this change: a
+  // mechanical "remove the useless escapes" rewrite silently dropped one
+  // character from each of these two character classes, and the test above had
+  // a comment claiming to cover the separator while asserting only whitespace
+  // and a hyphen. The comment was the false comfort.
+  it('cleanAsset trims a trailing slash, not just whitespace and hyphens', () => {
+    expect(client.cleanAsset('Vanguard Group /')).toBe('Vanguard Group');
+    expect(client.cleanAsset('Berkshire Hathaway //')).toBe('Berkshire Hathaway');
+    expect(client.cleanAsset('Berkshire -/')).toBe('Berkshire');
+    // Normalization runs after the trim, so this is 'Apple Inc' -> 'Apple Inc.'.
+    expect(client.cleanAsset('Apple Inc /')).toBe('Apple Inc.');
+  });
+
+  it('isJunkAssetString treats a semicolon-only value as junk', () => {
+    // OCR extraction noise arrives as punctuation-only runs. `;` must stay in
+    // the stripped character class or these render as real asset names.
+    expect(client.isJunkAssetString(';;;')).toBe(true);
+    expect(client.isJunkAssetString('.,;:!?')).toBe(true);
+    expect(client.cleanAsset(';;;')).toBe('');
   });
 });
 

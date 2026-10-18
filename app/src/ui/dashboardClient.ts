@@ -619,7 +619,7 @@ function isJunkAssetString(s) {
   ) {
     return true;
   }
-  var stripped = str.replace(/[.\\s_?:,!-]/g, '');
+  var stripped = str.replace(/[.\\s_?:;,!-]/g, '');
   if (stripped.length === 0) return true;
   if (/[._-]{2,}/.test(str) && stripped.length <= 2) return true;
   return false;
@@ -636,7 +636,7 @@ function cleanAsset(s) {
 
   if (isJunkAssetString(t)) return '';
 
-  t = t.replace(/[\\s-]+$/, '');
+  t = t.replace(/[\\s/-]+$/, '');
   t = t.replace(/\\s*\\(\\s*(?:NASDAQ|NYSE|AMEX|OTC|BATS|ARCA|ASX|LSE|TSX)[^)]*\\)\\s*$/i, '');
 
   if (t === t.toUpperCase() && /[A-Z]{4,}/.test(t)) {

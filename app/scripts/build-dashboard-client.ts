@@ -24,27 +24,11 @@
  * the build instead of being silently overwritten by the next generation.
  */
 
-import { APP_STORE_URL } from '../src/ui/appLinks.ts';
-import { executiveTitleForms } from '../src/shared/executiveTitles.ts';
-import { MAX_PUBLIC_TX_OFFSET } from '../src/security/botDefense.ts';
-import { benchmarkSelectableCatalog } from '../src/benchmark/settings.ts';
 import { assetVersion } from '../src/ui/assets.ts';
+import { escapeForTemplateLiteral, inject } from './dashboard-client-escape.ts';
 
 const SOURCE_PATH = new URL('../src/ui/client/dashboard.js', import.meta.url);
 const TARGET_PATH = new URL('../src/ui/dashboardClient.ts', import.meta.url);
-
-/**
- * Sentinel -> replacement. Values are serialized exactly as the old template
- * literal serialized them, so the generated asset is byte-identical to the one
- * PR #2775 shipped apart from the four sentinels becoming real values again.
- */
-function inject(source: string): string {
-  return source
-    .replaceAll('__CT_EXEC_TITLE_FORMS__', JSON.stringify(executiveTitleForms()))
-    .replaceAll('__CT_MAX_PUBLIC_TRADES_OFFSET__', String(MAX_PUBLIC_TX_OFFSET))
-    .replaceAll('__CT_BENCHMARK_CATALOG__', JSON.stringify(benchmarkSelectableCatalog()))
-    .replaceAll('__CT_APP_STORE_URL__', APP_STORE_URL);
-}
 
 const HEADER = `/**
  * src/ui/dashboardClient.ts
@@ -77,23 +61,6 @@ const HEADER = `/**
 import { assetVersion } from './assets.ts';
 
 export const DASHBOARD_APP_JS = /* js */ \``;
-
-/**
- * Escapes a string so it can sit inside a template literal unchanged.
- *
- * This is the subtle one. `dashboard.js` is real JavaScript, so its regexes hold
- * real backslashes: `/\[([A-Z0-9]{2,3})\]/`. Dropped into a template literal
- * unescaped, `\[` evaluates to `[` and the regex becomes `/[([A-Z0-9]{2,3})]/`,
- * which throws "Unmatched ')'" the moment the script is evaluated. Backslashes
- * are escaped FIRST — escaping them after the other two would double-escape the
- * backslashes this function itself inserts.
- */
-function escapeForTemplateLiteral(text: string): string {
-  return text
-    .replaceAll('\\', '\\\\')
-    .replaceAll('`', '\\`')
-    .replaceAll('${', '\\${');
-}
 
 /** Builds the full generated file content. */
 function build(source: string): string {
