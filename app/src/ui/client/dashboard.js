@@ -1429,7 +1429,11 @@ function makeTradesFilterMatcher() {
   var db = tradesDateBounds();
   return function (r) {
     if (!chDefault && chs.indexOf(r.chamber) < 0) return false;
-    if (sides.length && sides.indexOf(r.type) < 0) return false;
+    // typeKnown === false means the transaction carried no txType. txToRow still
+    // renders that as 'B', but the server's Buy filter matches stored 'B' and
+    // legacy 'P' only, so the row is absent from the feed and must be absent
+    // here. Testing r.type alone would admit and count it.
+    if (sides.length && (r.typeKnown === false || sides.indexOf(r.type) < 0)) return false;
     if (parties.length && parties.indexOf(rowPartyBucket(r)) < 0) return false;
     var d = r.txdate || '';
     if (db.from || db.to) {
@@ -1948,6 +1952,13 @@ function txToRow(tx) {
     assetType: tx.assetType || '',
     assetTypeName: tx.assetTypeName || '',
     type: (tx.txType === 'P' ? 'B' : tx.txType) || 'B',
+    // A transaction with no txType renders as a buy, which is the historical
+    // display default, but it is NOT a buy to the server: buildTxFilters matches
+    // Buy against stored 'B' and legacy 'P' only, so a NULL tx_type row is
+    // excluded from the feed. Keep the missing state visible so the live-push
+    // matcher can mirror that instead of admitting and counting a row that the
+    // next reload drops.
+    typeKnown: !!(tx.txType === 'P' || tx.txType),
     min: tx.amountMin, max: tx.amountMax,
     txdate: toISODate(tx.txDate) || '',
     owner: tx.owner || '',

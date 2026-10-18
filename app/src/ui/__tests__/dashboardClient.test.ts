@@ -58,6 +58,7 @@ type Client = {
   cleanAsset: (s: string) => string;
   esc: (s: string) => string;
   sortRows: (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+  txToRow: (tx: Partial<Transaction>) => Record<string, unknown>;
 };
 
 let dom: JSDOM;
@@ -615,6 +616,57 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
     } finally {
       (win as Record<string, unknown>)['chipSel'] = origChip;
       (win as Record<string, unknown>)['chamberParam'] = origParam;
+    }
+  });
+
+  it('excludes a row whose type is not selected, and one whose type is unknown', () => {
+    // txToRow renders a transaction with no txType as 'B', but the server's Buy
+    // filter matches stored 'B' and legacy 'P' only — so a NULL tx_type row is
+    // absent from the feed and must be absent here too. Matching on r.type
+    // alone admitted and counted it, and it vanished on the next reload.
+    const origParam = win['selectedSideParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['selectedSideParam'] = () => 'B';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'B', typeKnown: true })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'S', typeKnown: true })).toBe(false);
+      // Renders as a buy, is not a buy to the server.
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'B', typeKnown: false })).toBe(false);
+      // And with no side chip selected there is nothing to reject it on.
+      (win as Record<string, unknown>)['selectedSideParam'] = () => '';
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'B', typeKnown: false })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['selectedSideParam'] = origParam;
+    }
+  });
+
+  it('keeps a legacy P transaction a known buy, and only an absent type unknown', () => {
+    // Driven through the real txToRow rather than by hand-writing the row the
+    // matcher consumes: a matcher test that spells the row the same way the
+    // producer does only proves the two halves of this file agree with each
+    // other. The producer is the thing that has to be right.
+    // one that would have gone green for the wrong reason. In-window, because
+    // txToRow's output is spread over the shared fixture and an empty txdate
+    // would otherwise be rejected by the rolling window instead of the side
+    // filter this test is about.
+    const today = new Date().toISOString().slice(0, 10);
+    const legacy = client.txToRow({ txType: 'P', txDate: today } as Partial<Transaction>);
+    const absent = client.txToRow({ txDate: today } as Partial<Transaction>);
+    const modern = client.txToRow({ txType: 'B', txDate: today } as Partial<Transaction>);
+
+    expect([legacy.type, legacy.typeKnown]).toEqual(['B', true]);
+    // No txType: renders as a buy (the historical display default) but is not
+    // one to the server, which reads stored 'B' and legacy 'P' only.
+    expect([absent.type, absent.typeKnown]).toEqual(['B', false]);
+    expect([modern.type, modern.typeKnown]).toEqual(['B', true]);
+
+    const origParam = win['selectedSideParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['selectedSideParam'] = () => 'B';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, ...legacy })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, ...modern })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, ...absent })).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['selectedSideParam'] = origParam;
     }
   });
 
