@@ -1407,6 +1407,20 @@ function makeTradesFilterMatcher() {
   // a comma, exactly like selectedSideParam does.
   var pa = partyParam('qPartyGroup');
   var parties = pa ? pa.split(',') : [];
+  // The chips carry BUCKET codes ('D'/'R'/'O') but a streamed row carries the
+  // raw filer label: mapFeedTransaction() copies fl.party through unchanged and
+  // the feed SELECT aliases the full name, so rows arrive as 'Democratic' /
+  // 'Republican'. Comparing those directly against 'D' would reject every row
+  // while a chip is selected. partyBucketClass() does the first-letter mapping
+  // the server's PARTY_BUCKET_SQL_LOCAL does, with one difference that matters:
+  // the SQL's ELSE branch is 'O', never NULL, so empty/NULL party lands in the
+  // "Other / No party" chip. partyBucketClass('') returns '' instead, so the
+  // empty case is mapped to 'O' here to keep the two filters identical — which
+  // is what makes D+R+O equal the unfiltered result on both sides.
+  function rowPartyBucket(r) {
+    var raw = r.party || r.partyBucket || '';
+    return raw ? partyBucketClass(raw) : 'O';
+  }
   // Same bounds the HTTP query string uses, from the one shared definition. A
   // late-filed disclosure whose txdate falls outside the selected window must
   // not be appended into a narrowed table. ISO dates compare as strings.
@@ -1420,7 +1434,7 @@ function makeTradesFilterMatcher() {
   return function (r) {
     if (!chDefault && chs.indexOf(r.chamber) < 0) return false;
     if (sides.length && sides.indexOf(r.type) < 0) return false;
-    if (parties.length && parties.indexOf(r.party || r.partyBucket || '') < 0) return false;
+    if (parties.length && parties.indexOf(rowPartyBucket(r)) < 0) return false;
     var d = r.txdate || '';
     if (d) {
       if (db.from && d < db.from) return false;

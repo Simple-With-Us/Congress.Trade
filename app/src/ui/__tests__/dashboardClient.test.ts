@@ -328,6 +328,39 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
     }
   });
 
+  // The test above only ever used bucket codes, which is exactly why it passed
+  // while the real feed would have failed. mapFeedTransaction() copies
+  // fl.party through unchanged (delivery/rows.ts:322) and the feed SELECT
+  // aliases the full label, so a streamed row arrives as 'Democratic', not 'D'.
+  // Comparing that against the chip's 'D' rejects every row while a chip is on.
+  it('matches the chip bucket against the row\'s full party label', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => 'D';
+    try {
+      // The failure this pins: with 'D' selected, a Democratic row must PASS.
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Democratic' })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Republican' })).toBe(false);
+      // Minor parties and Independents are 'O' on both sides of the filter.
+      (win as Record<string, unknown>)['partyParam'] = () => 'O';
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Independent' })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Democratic' })).toBe(false);
+      // The server's PARTY_BUCKET_SQL_LOCAL ELSE branch is 'O', never NULL, so a
+      // row with no party on file belongs to the "Other / No party" chip.
+      (win as Record<string, unknown>)['partyParam'] = () => 'O';
+      expect(client.makeTradesFilterMatcher()({ ...row, party: '' })).toBe(true);
+      (win as Record<string, unknown>)['partyParam'] = () => 'D';
+      expect(client.makeTradesFilterMatcher()({ ...row, party: '' })).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+    }
+  });
+
   it('accepts any party when no party is selected', () => {
     const origChip = win['chipSel'] as (id: string) => string[];
     const origParam = win['chamberParam'] as (id: string) => string;
