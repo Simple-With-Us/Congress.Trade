@@ -268,7 +268,18 @@ describe('applySearchToServerParams — filter-to-query builder', () => {
 });
 
 describe('makeTradesFilterMatcher — the live-push filter', () => {
-  const row = { chamber: 'house', type: 'Purchase', member: 'Ro Khanna', st: 'CA' };
+  // txdate is today's UTC date so the date window is never the reason a
+  // dimension-specific assertion below fails. These tests isolate chamber,
+  // side, party and search; the real document ships a live rolling-window
+  // select, so without a date the matcher would reject the row for an unrelated
+  // reason (a bound is active and an undated row cannot satisfy it).
+  const row = {
+    chamber: 'house',
+    type: 'Purchase',
+    member: 'Ro Khanna',
+    st: 'CA',
+    txdate: new Date().toISOString().slice(0, 10),
+  };
 
   it('accepts everything when no filter is active', () => {
     const match = client.makeTradesFilterMatcher();
@@ -469,14 +480,31 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
       }
     });
 
-    it('lets an undated row through even when a bound is set', () => {
-      // txToRow() documents that historic seed rows often carry no txdate, and
-      // the file keeps that missing state visible rather than substituting one.
-      // An absent date is a data gap, not proof of being out of window.
+    it('rejects an undated row once a bound is active, matching the server', () => {
+      // delivery/rows.ts pushes `t.tx_date >= ?` / `<= ?`, and its comment says a
+      // null tx_date "can't satisfy a date comparison, so it's naturally
+      // excluded once a bound is set". The predicate has to agree, or a streamed
+      // row appears and increments totalRows and then vanishes on reload.
       const restore = withWindow('2026-01-01', '');
       try {
+        expect(client.makeTradesFilterMatcher()({ ...base })).toBe(false);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '' })).toBe(false);
+        // And a dated row inside the same bounds still passes, so this is the
+        // date filter rejecting an undated row and not the fixture failing.
+        expect(
+          client.makeTradesFilterMatcher()({ ...base, txdate: '2026-05-01' }),
+        ).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    it('accepts an undated row when no bound is active', () => {
+      // With the window controls blanked there is nothing to compare against,
+      // so an undated row is not "outside" any window and survives.
+      const restore = withWindow('', '');
+      try {
         expect(client.makeTradesFilterMatcher()({ ...base })).toBe(true);
-        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '' })).toBe(true);
       } finally {
         restore();
       }

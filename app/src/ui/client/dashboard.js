@@ -1395,18 +1395,21 @@ function makeTradesFilterMatcher() {
   // late-filed disclosure whose txdate falls outside the selected window must
   // not be appended into a narrowed table. ISO dates compare as strings.
   //
-  // A row with no txdate is NOT rejected. txToRow() documents that historic
-  // seed rows often do not carry one, and the file's standing choice is to keep
-  // that missing state visible rather than substitute a stand-in — so an absent
-  // date is a data gap, not evidence of being out of window. Only a date that
-  // is present and outside the bounds is filtered.
+  // A row with NO txdate IS rejected once a bound is active, because the server
+  // rejects it: delivery/rows.ts pushes "t.tx_date >= ?" / "<= ?", and the
+  // comment there says so outright — "a row with a null tx_date can't satisfy a
+  // date comparison, so it's naturally excluded once a bound is set (the
+  // comparison is NULL -> not true), which is the intended behavior". Letting
+  // undated rows through here would make a streamed row appear and increment
+  // totalRows, then vanish on the next reload.
   var db = tradesDateBounds();
   return function (r) {
     if (!chDefault && chs.indexOf(r.chamber) < 0) return false;
     if (sides.length && sides.indexOf(r.type) < 0) return false;
     if (parties.length && parties.indexOf(rowPartyBucket(r)) < 0) return false;
     var d = r.txdate || '';
-    if (d) {
+    if (db.from || db.to) {
+      if (!d) return false;
       if (db.from && d < db.from) return false;
       if (db.to && d > db.to) return false;
     }
