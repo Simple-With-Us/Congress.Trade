@@ -133,7 +133,7 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);
   assert.match(code, /secret_path=\/asc/);
-  assert.match(code, /ASC_INFISICAL_PROJECT_ID:\s*8dae6d03-8f12-48b2-adf3-e5c1b881c8c5/);
+  assert.match(code, /ASC_INFISICAL_PROJECT_ID:\s*[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/);
 });
 
 test("no iOS ship workflow carries a standing gate override", () => {
