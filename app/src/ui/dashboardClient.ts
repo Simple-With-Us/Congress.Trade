@@ -1389,16 +1389,23 @@ function tradeRowMatchesSearch(r, q) {
     if (entry.field === 'party') {
       return typeof peoplePartyMatches === 'function' && peoplePartyMatches(tok, party);
     }
-    // memberName: the server matches it against the FILER's name only --
-    // "LOWER(COALESCE(fl.full_name, t.filer_id, '')) LIKE ? OR LOWER(
-    // COALESCE(fl.display_name, '')) LIKE ?" (delivery/rows.ts). It never looks
-    // at asset, ticker or state, so a token that happens to appear in the asset
-    // name must NOT pass here or the row is inserted and counted, then removed
-    // by the next reload. Substring on the whole name mirrors the LIKE exactly;
-    // splitting on punctuation and matching parts would match LESS than the
-    // server does, which is the opposite error.
-    return name.indexOf(tok) >= 0;
-  });
+    // Name-bound tokens are NOT decided here — they travel as one joined
+    // memberName phrase and are matched as one phrase below.
+    return true;
+  }) && matchesMemberNamePhrase(name, parsed.memberName);
+}
+
+/** Does the filer's name satisfy the single memberName phrase the server got?
+ *
+ *  The server applies memberName as one contiguous LIKE, not as a set of
+ *  independent terms: "Khanna Ro" becomes LIKE '%khanna ro%', which "Ro Khanna"
+ *  does NOT satisfy. Testing the tokens one at a time made the client more
+ *  permissive than the feed — the row was inserted and counted, then removed by
+ *  the next reload. */
+function matchesMemberNamePhrase(name, phrase) {
+  if (!phrase) return true;
+  // The server lower-cases memberName before the LIKE; match the same way.
+  return name.indexOf(String(phrase).toLowerCase()) >= 0;
 }
 /* Builds a predicate for "does this row match the CURRENTLY ACTIVE
    member/ticker/side/chamber filters" — snapshotting the filter values once
@@ -1526,15 +1533,20 @@ function searchTokenPlan(q) {
   var raw = String(q || '').trim();
   var tokens = raw.split(/\\s+/).filter(Boolean);
   var plan = [];
-  var tickerClaimed = false;
+  var nameBits = [];
+  var tickerHint = '';
   for (var i = 0; i < tokens.length; i++) {
     var kind = classifySearchToken(tokens[i]);
-    var claimsTicker = kind === 'ticker' && !tickerClaimed;
-    if (kind === 'ticker') tickerClaimed = true;
+    var claimsTicker = kind === 'ticker' && !tickerHint;
     // field is the row attribute the token's own server parameter filters, which
     // is what the live-push predicate has to check. state and party have no
     // server param on the public feed, so those stay client-side filters.
     var field = claimsTicker ? 'ticker' : (kind === 'state' ? 'state' : (kind === 'party' ? 'party' : 'name'));
+    if (claimsTicker) {
+      tickerHint = tokens[i].toUpperCase();
+    } else if (field === 'name') {
+      nameBits.push(tokens[i]);
+    }
     plan.push({
       token: tokens[i],
       // Lower-cased copy for matching; the original casing is kept because
@@ -1545,29 +1557,17 @@ function searchTokenPlan(q) {
       exactTicker: claimsTicker,
     });
   }
-  return { raw: raw, plan: plan };
+  // The exact memberName the request carries, so the predicate applies the same
+  // phrase the server will. If nothing classified, the whole query goes across
+  // as memberName so the server still narrows.
+  var memberName = nameBits.length ? nameBits.join(' ') : (tickerHint ? '' : raw);
+  return { raw: raw, plan: plan, tickerHint: tickerHint, memberName: memberName };
 }
 function applySearchToServerParams(p, q) {
   var parsed = searchTokenPlan(q);
   if (!parsed.raw) return;
-  var nameBits = [];
-  var tickerHint = '';
-  for (var i = 0; i < parsed.plan.length; i++) {
-    var entry = parsed.plan[i];
-    if (entry.exactTicker) {
-      tickerHint = entry.token.toUpperCase();
-      continue;
-    }
-    if (entry.kind === 'state' || entry.kind === 'party') {
-      // state / party — client filter only (server has no state= on public feed)
-      continue;
-    }
-    nameBits.push(entry.token);
-  }
-  if (tickerHint) p.set('ticker', tickerHint);
-  if (nameBits.length) p.set('memberName', nameBits.join(' '));
-  // If nothing classified, send whole string as memberName so server still narrows
-  if (!tickerHint && !nameBits.length) p.set('memberName', parsed.raw);
+  if (parsed.tickerHint) p.set('ticker', parsed.tickerHint);
+  if (parsed.memberName) p.set('memberName', parsed.memberName);
 }
 // See the .row-open-btn CSS comment above for why this exists: a real,
 // named control dropped into a clickable table row's first cell, invisible
@@ -2424,8 +2424,21 @@ function startStream() {
           rememberTradeRow(row);
           if (!matchesActiveFilters(row)) continue; // out-of-filter push: doesn't belong in this view
           var alreadyDoc = TRADES.some(function (r) { return r.docId && r.docId === row.docId; });
-          TRADES.unshift(row);
-          TRADES = sortRows(TRADES).slice(0, tradesPageSize);
+          // The stream is at-least-once: a reconnect replays from the resume
+          // cursor, so the same transaction can arrive twice. isNewId only
+          // guarded the COUNTER, and unshift was unconditional — a replay added
+          // a second copy of the row, showing it twice and, at the page-size
+          // limit, evicting a legitimate row.
+          //
+          // Checked against TRADES, not isNewId: TRADE_BY_ID also holds mini-list
+          // rows cached from drawers, so a row we have "seen" may not be listed,
+          // and skipping it there would drop a trade that belongs in the feed.
+          var alreadyListed = TRADES.some(function (r) { return r.id === row.id; });
+          if (!alreadyListed) {
+            TRADES.unshift(row);
+            TRADES = sortRows(TRADES).slice(0, tradesPageSize);
+            changed = true;
+          }
           if (isNewId) {
             // De-duped: a redelivered event for a row we already knew about
             // must not bump the total again. A future poll/reload still
@@ -2433,7 +2446,6 @@ function startStream() {
             if (typeof totalRows === 'number') totalRows += 1;
             if ((row.imported || '').slice(0, 10) === today && row.docId && !alreadyDoc) filingsImportedToday += 1;
           }
-          changed = true;
         }
         if (changed) {
           setTradesKpis();

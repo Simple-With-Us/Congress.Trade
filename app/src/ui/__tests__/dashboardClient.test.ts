@@ -258,7 +258,33 @@ describe('tradeRowMatchesSearch — multi-token AND matching', () => {
   it('matches a token against the field its own server parameter filters', () => {
     expect(client.tradeRowMatchesSearch(row, 'khanna')).toBe(true);   // memberName -> filer name
     expect(client.tradeRowMatchesSearch(row, 'MSFT')).toBe(true);     // ticker=     -> exact ticker
-    expect(client.tradeRowMatchesSearch(row, 'CA')).toBe(true);       // no param    -> client state filter
+  });
+
+  it('mirrors the query the builder actually sends, including where it is odd', () => {
+    // A state-only query is the interesting case. classifySearchToken reads "CA"
+    // as a state, but the builder's fallback fires on "no ticker and no name
+    // bits" rather than on "nothing classified", so it sends memberName=CA and
+    // the server filters it against FILER NAMES. This row is in California and
+    // its filer is not named anything containing "ca", so the feed excludes it
+    // and so must the live path.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'CA');
+    expect(p.get('memberName')).toBe('CA');
+    expect(p.get('ticker')).toBeNull();
+    expect(client.tradeRowMatchesSearch(row, 'CA')).toBe(false);
+    // The same query when the filer's name does contain the token.
+    expect(client.tradeRowMatchesSearch({ ...row, member: 'Carson Vacar' }, 'CA')).toBe(true);
+  });
+
+  it('matches multiple name tokens as ONE phrase, the way the server does', () => {
+    // "Khanna Ro" becomes a single LIKE '%khanna ro%'. "Ro Khanna" does not
+    // satisfy that phrase even though it contains both words, so testing the
+    // tokens one at a time made the client accept rows the feed excludes.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'Khanna Ro');
+    expect(p.get('memberName')).toBe('Khanna Ro');
+    expect(client.tradeRowMatchesSearch(row, 'Khanna Ro')).toBe(false);
+    expect(client.tradeRowMatchesSearch(row, 'Ro Khanna')).toBe(true);
   });
 
   it('does NOT let a name-bound token match the asset name', () => {
@@ -280,7 +306,7 @@ describe('tradeRowMatchesSearch — multi-token AND matching', () => {
   });
 
   it('is order-independent', () => {
-    expect(client.tradeRowMatchesSearch(row, 'CA khanna')).toBe(true);
+    expect(client.tradeRowMatchesSearch(row, 'khanna ca')).toBe(true);
   });
 
   it('matches on a name part, not only a prefix of the whole name', () => {
@@ -417,7 +443,7 @@ describe('the congress.trade handler is wired to the envelope (end to end)', () 
    * the result has to be captured INSIDE the try — reading it afterwards would
    * just re-read the original empty array the restore put back.
    */
-  function pushFrame(payload: unknown): PushResult {
+  function pushFrames(payloads: unknown[]): PushResult {
     const listeners: Record<string, Handler> = {};
     class FakeEventSource {
       readyState = 1;
@@ -446,7 +472,11 @@ describe('the congress.trade handler is wired to the envelope (end to end)', () 
     try {
       (client.startStream as () => void)();
       expect(typeof listeners['congress.trade'], 'handler registered').toBe('function');
-      listeners['congress.trade']({ data: JSON.stringify(payload) });
+      // All frames go through ONE connection and ONE TRADES list, so a repeat
+      // sees the row the previous frame inserted.
+      for (const payload of payloads) {
+        listeners['congress.trade']({ data: JSON.stringify(payload) });
+      }
       result = {
         trades: s['TRADES'] as Array<Record<string, unknown>>,
         totalRows: s['totalRows'] as number,
@@ -462,6 +492,11 @@ describe('the congress.trade handler is wired to the envelope (end to end)', () 
       (client.stopStream as () => void)();
     }
     return result;
+  }
+
+  /** Convenience for the single-frame cases. */
+  function pushFrame(payload: unknown): PushResult {
+    return pushFrames([payload]);
   }
 
   it('adds a row to TRADES from a canonical data.trades frame', () => {
@@ -488,6 +523,34 @@ describe('the congress.trade handler is wired to the envelope (end to end)', () 
     const out = pushFrame({ nothing: 'useful' });
     expect(out.trades).toEqual([]);
     expect(out.totalRows).toBe(0);
+  });
+
+  it('does not list a replayed transaction twice', () => {
+    // The stream is at-least-once: a reconnect replays from the resume cursor, so
+    // the same transaction arrives again. The counter was guarded but the
+    // unshift was not, so the row appeared twice in the table.
+    const out = pushFrames([SERVER_FRAME, SERVER_FRAME]);
+    expect(out.trades).toHaveLength(1);
+    // And the total must still move exactly once.
+    expect(out.totalRows).toBe(1);
+  });
+
+  it('still lists a transaction that is new to the feed', () => {
+    // The dedupe has to be against TRADES, not "have we seen this id": a row
+    // cached from a drawer is in TRADE_BY_ID but not yet in the feed, and
+    // skipping it there would drop a trade that belongs in the table.
+    const other = {
+      type: 'congress.trade', id: '1', emittedAt: new Date().toISOString(),
+      data: {
+        trades: [{
+          id: 'tx_second', cursorSeq: 100, ticker: 'MSFT', txType: 'sell',
+          txDate: new Date().toISOString(),
+        }],
+      },
+    };
+    const out = pushFrames([SERVER_FRAME, other]);
+    expect(out.trades).toHaveLength(2);
+    expect(out.totalRows).toBe(2);
   });
 });
 

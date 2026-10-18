@@ -1110,7 +1110,10 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain("p.set('sort', apiSort)");
     // Unified search maps the single query into memberName/ticker server params.
     expect(DASHBOARD_SOURCE).toContain('function applySearchToServerParams(');
-    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', nameBits.join(' '))");
+    // The joined phrase is built once in searchTokenPlan() and both the query
+    // string and the live-push predicate read it, so they cannot drift.
+    expect(DASHBOARD_SOURCE).toContain('function searchTokenPlan(');
+    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', parsed.memberName)");
     expect(DASHBOARD_SOURCE).toContain('function handleTradesTextFilter(');
     expect(DASHBOARD_SOURCE).toContain('tradesRequestSeq');
     expect(DASHBOARD_SOURCE).toContain("arr.textContent = '↕'");
@@ -3612,7 +3615,10 @@ describe('UX P0 review fixes (web)', () => {
   it('gates CSV export as Premium with memberName+from filters and export pricing intent', () => {
     // Unified search → memberName/ticker via applySearchToServerParams (not dual fields).
     expect(DASHBOARD_SOURCE).toContain('applySearchToServerParams(p, tradesSearchQuery())');
-    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', nameBits.join(' '))");
+    // The joined phrase is built once in searchTokenPlan() and both the query
+    // string and the live-push predicate read it, so they cannot drift.
+    expect(DASHBOARD_SOURCE).toContain('function searchTokenPlan(');
+    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', parsed.memberName)");
     // The from/to arithmetic moved into a shared tradesDateBounds() so the HTTP
     // query string and the live-push filter predicate cannot drift apart again.
     expect(DASHBOARD_SOURCE).toContain('function tradesDateBounds()');
