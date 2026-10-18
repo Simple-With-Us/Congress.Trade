@@ -4471,13 +4471,14 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
       expect(feedView![0]).not.toContain('adminLatencySection');
     });
 
-    it('renders a gated link at the BOTTOM of the Trends view', () => {
+    it('renders the gated public scoreboard inline at the BOTTOM of the Trends view (no link to Delivery)', () => {
       const trendsView = DASHBOARD_SOURCE.match(/<section class="view active" id="view-trends"[\s\S]*?\n  <\/section>/);
       expect(trendsView).not.toBeNull();
-      expect(trendsView![0]).toContain('id="trLatencyLink"');
+      expect(trendsView![0]).toContain('id="trLatencySectionTrends"');
+      expect(trendsView![0]).not.toContain('id="trLatencyLink"');
       expect(trendsView![0]).not.toContain('id="trLatencySection"');
       expect(trendsView![0]).not.toContain('id="adminLatencySection"');
-      const idx = trendsView![0].indexOf('id="trLatencyLink"');
+      const idx = trendsView![0].indexOf('id="trLatencySectionTrends"');
       const rest = trendsView![0].slice(idx);
       expect(rest.trim().endsWith('</section>')).toBe(true);
     });
@@ -4506,15 +4507,15 @@ describe('owner UX work order (LANE A2 — latency placement + entity click-thro
       expect(latencyIdx).toBeLessThan(accessIdx);
     });
 
-    it('paints the Admin copy unconditionally and gates Delivery + the Trends link on isLatencyAhead()', () => {
+    it('paints the Admin copy unconditionally and gates Delivery + the inline Trends copy on isLatencyAhead()', () => {
       expect(DASHBOARD_SOURCE).toContain('function renderSpeedProof() {');
       expect(DASHBOARD_SOURCE).toContain("var publicBox = el('trLatencySection');");
-      expect(DASHBOARD_SOURCE).toContain("var publicLink = el('trLatencyLink');");
+      expect(DASHBOARD_SOURCE).toContain("var trendsBox = el('trLatencySectionTrends');");
       expect(DASHBOARD_SOURCE).toContain("var adminBox = el('adminLatencySection');");
       expect(DASHBOARD_SOURCE).toContain('adminBox.hidden = !hasAdminData;');
       expect(DASHBOARD_SOURCE).toContain('var ahead = hasPublicData && isLatencyAhead({ providers: publicProvs });');
       expect(DASHBOARD_SOURCE).toContain('publicBox.hidden = !ahead;');
-      expect(DASHBOARD_SOURCE).toContain('publicLink.hidden = !ahead;');
+      expect(DASHBOARD_SOURCE).toContain('trendsBox.hidden = !ahead;');
       // Admin kicks off the fetch/paint itself as soon as the tab opens (both
       // the click handler and the boot-time restore-saved-tab path) instead
       // of relying only on the Trends-tab intersection observer.
