@@ -75,6 +75,7 @@ test("ios-appstore-gm.yml ships with notes, Sentry, and a per-run gate override"
   assert.match(yml, /actions: read/);
   assert.match(yml, /Seed last-ship state/);
   assert.match(yml, /last-ship-congress\.txt/);
+  assert.match(yml, /prev_at="\$\{prev_at%%\.\*\}"/);
   // A gate skip must not look like a shipped build.
   assert.match(yml, /Assert this checkout was uploaded/);
   assert.match(yml, /fetch-depth: 0/);
