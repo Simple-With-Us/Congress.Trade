@@ -25,7 +25,7 @@
  */
 
 import { assetVersion } from '../src/ui/assets.ts';
-import { escapeForTemplateLiteral, inject } from './dashboard-client-escape.ts';
+import { escapeForTemplateLiteral, findUnescapedDelimiter, inject } from './dashboard-client-escape.ts';
 
 const SOURCE_PATH = new URL('../src/ui/client/dashboard.js', import.meta.url);
 const TARGET_PATH = new URL('../src/ui/dashboardClient.ts', import.meta.url);
@@ -65,14 +65,18 @@ export const DASHBOARD_APP_JS = /* js */ \``;
 /** Builds the full generated file content. */
 function build(source: string): string {
   const injected = escapeForTemplateLiteral(inject(source));
-  // Belt and braces: after escaping, no bare backtick or ${ may survive. A
+  // Belt and braces: after escaping, no UNESCAPED backtick or ${ may survive. A
   // silent corruption here is exactly the failure mode CT-1500 is about — the
   // old template literal could swallow one and only a browser would find out.
-  for (const [needle, what] of [['`', 'backtick'], ['${', 'interpolation']] as const) {
-    if (injected.includes(needle)) {
-      const line = injected.slice(0, injected.indexOf(needle)).split('\n').length;
-      throw new Error(`dashboard.js still contains a bare ${what} at line ${line} after escaping`);
-    }
+  //
+  // This checks for unescaped delimiters, not for the characters at all: the
+  // escaper turns a backtick into \` and ${ into \${, so a plain includes() would
+  // fire on those perfectly valid escaped forms and reject any template literal
+  // in the browser source. Parity is decided by findUnescapedDelimiter.
+  const stray = findUnescapedDelimiter(injected);
+  if (stray) {
+    const line = injected.slice(0, stray.offset).split('\n').length;
+    throw new Error(`dashboard.js still contains an unescaped ${stray.what} at line ${line} after escaping`);
   }
   // DASHBOARD_APP_JS_VERSION must come after the literal: assetVersion() reads
   // the string, so referencing it earlier would be a temporal-dead-zone error.

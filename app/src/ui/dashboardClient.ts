@@ -1407,10 +1407,25 @@ function makeTradesFilterMatcher() {
   // a comma, exactly like selectedSideParam does.
   var pa = partyParam('qPartyGroup');
   var parties = pa ? pa.split(',') : [];
+  // Same bounds the HTTP query string uses, from the one shared definition. A
+  // late-filed disclosure whose txdate falls outside the selected window must
+  // not be appended into a narrowed table. ISO dates compare as strings.
+  //
+  // A row with no txdate is NOT rejected. txToRow() documents that historic
+  // seed rows often do not carry one, and the file's standing choice is to keep
+  // that missing state visible rather than substitute a stand-in — so an absent
+  // date is a data gap, not evidence of being out of window. Only a date that
+  // is present and outside the bounds is filtered.
+  var db = tradesDateBounds();
   return function (r) {
     if (!chDefault && chs.indexOf(r.chamber) < 0) return false;
     if (sides.length && sides.indexOf(r.type) < 0) return false;
     if (parties.length && parties.indexOf(r.party || r.partyBucket || '') < 0) return false;
+    var d = r.txdate || '';
+    if (d) {
+      if (db.from && d < db.from) return false;
+      if (db.to && d > db.to) return false;
+    }
     return tradeRowMatchesSearch(r, q);
   };
 }
@@ -1945,6 +1960,34 @@ function syncPageSizeControl() {
    (chamber/party/side) or the ticker/politician fields would visibly narrow
    the page on the next full reload, then silently widen back out on the next
    30s poll (owner report #2: filtering doesn't change the count). */
+/* Effective date bounds for the trades feed, as {from, to} ISO strings, either
+   of which may be ''.  One definition, two callers: the HTTP query string and
+   the live-push filter predicate have to agree, and keeping two copies of the
+   window arithmetic is how they drifted apart in the first place. */
+function tradesDateBounds() {
+  // Explicit export-dialog dates win over the shared timeframe control.
+  var fromEl = el('qFrom'); var from = (fromEl && fromEl.value) || '';
+  var toEl = el('qTo'); var to = (toEl && toEl.value) || '';
+  var winEl = el('tradesGlobalWindow') || el('trGlobalWindow');
+  var win = (winEl && winEl.value) || '';
+  if (!from && win === 'this_cy') from = new Date().getUTCFullYear() + '-01-01';
+  if (!from && win === 'last_cy') {
+    var y0 = new Date().getUTCFullYear() - 1;
+    from = y0 + '-01-01';
+    if (!to) to = y0 + '-12-31';
+  }
+  // Rolling windows: approximate via from for feed (tx_date)
+  if (!from && win && /^\\d+d$/.test(win)) {
+    var days = parseInt(win, 10);
+    if (days > 0 && days < 40000) {
+      var d = new Date();
+      d.setUTCDate(d.getUTCDate() - days);
+      from = d.toISOString().slice(0, 10);
+    }
+  }
+  return { from: from, to: to };
+}
+
 function tradesFilterParams() {
   var p = new URLSearchParams();
   applySearchToServerParams(p, tradesSearchQuery());
@@ -1958,27 +2001,9 @@ function tradesFilterParams() {
   // Owner follow-up batch #21: the $ threshold UI pill is gone (no $/size
   // dropdown on any platform) — minAmount is no longer sent from here. The
   // server still accepts ?minAmount= for direct API consumers.
-  var fromEl = el('qFrom'); var from = fromEl && fromEl.value; if (from) p.set('from', from);
-  // Shared timeframe → from/to when calendar year (export dialog dates win if set)
-  var winEl = el('tradesGlobalWindow') || el('trGlobalWindow');
-  var win = winEl && winEl.value;
-  if (!from && win === 'this_cy') p.set('from', new Date().getUTCFullYear() + '-01-01');
-  if (!from && win === 'last_cy') {
-    var y0 = new Date().getUTCFullYear() - 1;
-    p.set('from', y0 + '-01-01');
-    var toEl2 = el('qTo');
-    if (!(toEl2 && toEl2.value)) p.set('to', y0 + '-12-31');
-  }
-  // Rolling windows: approximate via from for feed (tx_date)
-  if (!from && win && /^\\d+d$/.test(win)) {
-    var days = parseInt(win, 10);
-    if (days > 0 && days < 40000) {
-      var d = new Date();
-      d.setUTCDate(d.getUTCDate() - days);
-      p.set('from', d.toISOString().slice(0, 10));
-    }
-  }
-  var toEl = el('qTo'); var to = toEl && toEl.value; if (to) p.set('to', to);
+  var db = tradesDateBounds();
+  if (db.from) p.set('from', db.from);
+  if (db.to) p.set('to', db.to);
   return p;
 }
 function tradesQueryParams() {

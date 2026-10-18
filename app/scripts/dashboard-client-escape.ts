@@ -38,6 +38,40 @@ export function escapeForTemplateLiteral(text: string): string {
 }
 
 /**
+ * Finds a template-literal delimiter that escaping FAILED to neutralise.
+ *
+ * Codex review of CT-1500 caught the obvious version of this check being wrong:
+ * it tested `text.includes('`')`, which is also true of a correctly escaped
+ * ``\` ``, so it rejected every input the escaper is built to support. A
+ * template literal in the browser source is perfectly ordinary JavaScript.
+ *
+ * The correct test is backslash parity: a delimiter is escaped when the run of
+ * backslashes immediately before it is ODD, and unescaped when that run is
+ * even (including zero). After `escapeForTemplateLiteral` doubles every
+ * backslash first, so an escaped backtick is always preceded by exactly one
+ * unpaired backslash.
+ */
+export function findUnescapedDelimiter(
+  text: string,
+): { what: 'backtick' | 'interpolation'; offset: number } | null {
+  const needles = [['`', 'backtick'], ['${', 'interpolation']] as const;
+  let best: { what: 'backtick' | 'interpolation'; offset: number } | null = null;
+  for (const [needle, what] of needles) {
+    let i = text.indexOf(needle);
+    while (i !== -1) {
+      let backslashes = 0;
+      for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) backslashes++;
+      if (backslashes % 2 === 0) {
+        if (!best || i < best.offset) best = { what, offset: i };
+        break;
+      }
+      i = text.indexOf(needle, i + 1);
+    }
+  }
+  return best;
+}
+
+/**
  * Sentinel -> replacement. Values are serialized exactly as the old template
  * literal serialized them, so the generated asset is byte-identical to the one
  * PR #2775 shipped apart from the four sentinels becoming real values again.

@@ -3613,8 +3613,11 @@ describe('UX P0 review fixes (web)', () => {
     // Unified search → memberName/ticker via applySearchToServerParams (not dual fields).
     expect(DASHBOARD_SOURCE).toContain('applySearchToServerParams(p, tradesSearchQuery())');
     expect(DASHBOARD_SOURCE).toContain("p.set('memberName', nameBits.join(' '))");
-    expect(DASHBOARD_SOURCE).toContain("if (from) p.set('from', from)");
-    expect(DASHBOARD_SOURCE).toContain("if (to) p.set('to', to)");
+    // The from/to arithmetic moved into a shared tradesDateBounds() so the HTTP
+    // query string and the live-push filter predicate cannot drift apart again.
+    expect(DASHBOARD_SOURCE).toContain('function tradesDateBounds()');
+    expect(DASHBOARD_SOURCE).toContain("if (db.from) p.set('from', db.from)");
+    expect(DASHBOARD_SOURCE).toContain("if (db.to) p.set('to', db.to)");
     expect(DASHBOARD_SOURCE).toContain("window.location.href = '/api/export/transactions.csv'");
     expect(DASHBOARD_SOURCE).toContain("openPricing('export')");
     expect(DASHBOARD_SOURCE).toContain("intent === 'export'");
@@ -5443,6 +5446,7 @@ describe('Trades-tab count correctness (LANE: trades-count-fix)', () => {
       'partyParam',
       'tradesSearchQuery',
       'applySearchToServerParams',
+      'tradesDateBounds',
       'tradesFilterParams',
       'fetchUpdates',
     ]);
@@ -5602,6 +5606,7 @@ describe('Trades-tab count correctness (LANE: trades-count-fix)', () => {
       'partyParam',
       'tradesSearchQuery',
       'applySearchToServerParams',
+      'tradesDateBounds',
       'tradesFilterParams',
       'tradesQueryParams',
     ]);

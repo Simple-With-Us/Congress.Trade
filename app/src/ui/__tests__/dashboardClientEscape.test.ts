@@ -14,7 +14,11 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { escapeForTemplateLiteral, inject } from '../../../scripts/dashboard-client-escape.ts';
+import {
+  escapeForTemplateLiteral,
+  findUnescapedDelimiter,
+  inject,
+} from '../../../scripts/dashboard-client-escape.ts';
 
 /** Evaluate a template literal the way a browser evaluating the asset would. */
 function evalTemplate(literalBody: string): string {
@@ -69,10 +73,58 @@ describe('escapeForTemplateLiteral — round trip', () => {
     expect(roundTrip(input)).toBe(input);
   });
 
-  it('leaves no bare backtick or interpolation in the escaped output', () => {
+  it('leaves no UNESCAPED backtick or interpolation in the escaped output', () => {
     const escaped = escapeForTemplateLiteral('a `b ${c} d');
-    expect(escaped).not.toMatch(/(?<!\\)`/);
-    expect(escaped).not.toMatch(/(?<!\\)\$\{/);
+    expect(findUnescapedDelimiter(escaped)).toBeNull();
+  });
+});
+
+describe('findUnescapedDelimiter — the guard that was wrong', () => {
+  it('does NOT flag correctly escaped delimiters', () => {
+    // The bug Codex found: the old check was `includes()`, which is also true
+    // of these valid escaped forms, so it rejected any template literal in the
+    // browser source even though the escaper handles it.
+    expect(findUnescapedDelimiter(escapeForTemplateLiteral('`a`'))).toBeNull();
+    expect(findUnescapedDelimiter(escapeForTemplateLiteral('${a}'))).toBeNull();
+    expect(findUnescapedDelimiter(escapeForTemplateLiteral('`a${b}c`'))).toBeNull();
+  });
+
+  it('flags a delimiter the escaper never saw, with its offset', () => {
+    const bad = 'ok\nthen `unescaped`';
+    const found = findUnescapedDelimiter(bad);
+    expect(found).not.toBeNull();
+    expect(found?.what).toBe('backtick');
+    expect(bad.slice(found!.offset, found!.offset + 1)).toBe('`');
+  });
+
+  it('flags an unescaped interpolation', () => {
+    const found = findUnescapedDelimiter('a ${b} c');
+    expect(found?.what).toBe('interpolation');
+  });
+
+  it('uses backslash parity, not adjacency', () => {
+    // One backslash escapes it; two backslashes then a backtick do not, because
+    // the pair is itself an escaped backslash.
+    expect(findUnescapedDelimiter('a \\` b')).toBeNull();
+    expect(findUnescapedDelimiter('a \\\\` b')?.what).toBe('backtick');
+  });
+
+  it('reports the earliest offending offset', () => {
+    const found = findUnescapedDelimiter('` first ${second}');
+    expect(found?.what).toBe('backtick');
+    expect(found?.offset).toBe(0);
+  });
+
+  it('returns null for ordinary JavaScript with no delimiters', () => {
+    expect(findUnescapedDelimiter('var x = 1;\nif (a === b) { c(); }')).toBeNull();
+  });
+
+  it('round-trips a source containing a template literal through the whole build step', () => {
+    // The end-to-end property the fix is for: a template literal in the
+    // browser source now builds at all, and still survives evaluation intact.
+    const source = 'var t = `a ${1 + 1} b`;';
+    expect(findUnescapedDelimiter(escapeForTemplateLiteral(source))).toBeNull();
+    expect(evalTemplate(escapeForTemplateLiteral(source))).toBe(source);
   });
 });
 

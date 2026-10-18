@@ -344,6 +344,95 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
       (win as Record<string, unknown>)['partyParam'] = origParty;
     }
   });
+
+  // Codex's second finding, on the same function: the predicate checked
+  // chamber, side, party and search but not the date window that
+  // tradesFilterParams() applies to the HTTP feed. A late filing outside the
+  // window would be appended into a narrowed table.
+  describe('the active date window', () => {
+    const base = { chamber: 'house', type: 'Purchase', member: 'Ro Khanna', st: 'CA' };
+
+    /* Pin every OTHER filter open so only the date bounds are under test, and
+       set the explicit from/to values. The real document supplies real chip and
+       window state, which would otherwise decide these assertions. */
+    function withWindow(from: string, to: string): () => void {
+      const origChip = win['chipSel'] as (id: string) => string[];
+      const origParam = win['chamberParam'] as (id: string) => string;
+      const origParty = win['partyParam'] as (id: string) => string;
+      const origSide = win['selectedSideParam'] as (id: string) => string;
+      (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+      (win as Record<string, unknown>)['chamberParam'] = () => '';
+      (win as Record<string, unknown>)['partyParam'] = () => '';
+      (win as Record<string, unknown>)['selectedSideParam'] = () => '';
+
+      // The real document carries a rolling-window control with a live value,
+      // which would supply a `from` whenever the explicit one is blank and make
+      // a to-only test fail for an unrelated reason. Blank it too, and restore.
+      const made: string[] = [];
+      const restoreValues: Array<() => void> = [];
+      const setValue = (id: string, value: string) => {
+        const existing = win.document.getElementById(id) as HTMLInputElement | null;
+        if (existing) {
+          const prior = existing.value;
+          existing.value = value;
+          restoreValues.push(() => {
+            existing.value = prior;
+          });
+          return;
+        }
+        const input = win.document.createElement('input');
+        input.id = id;
+        input.value = value;
+        win.document.body.appendChild(input);
+        made.push(id);
+      };
+      setValue('qFrom', from);
+      setValue('qTo', to);
+      setValue('tradesGlobalWindow', '');
+      setValue('trGlobalWindow', '');
+      return () => {
+        for (const id of made) win.document.getElementById(id)?.remove();
+        for (const undo of restoreValues) undo();
+        (win as Record<string, unknown>)['chipSel'] = origChip;
+        (win as Record<string, unknown>)['chamberParam'] = origParam;
+        (win as Record<string, unknown>)['partyParam'] = origParty;
+        (win as Record<string, unknown>)['selectedSideParam'] = origSide;
+      };
+    }
+
+    it('rejects a dated row older than the from bound', () => {
+      const restore = withWindow('2026-01-01', '');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2025-06-01' })).toBe(false);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2026-05-01' })).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    it('rejects a dated row after the to bound', () => {
+      const restore = withWindow('', '2026-06-30');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2026-09-01' })).toBe(false);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2026-01-05' })).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    it('lets an undated row through even when a bound is set', () => {
+      // txToRow() documents that historic seed rows often carry no txdate, and
+      // the file keeps that missing state visible rather than substituting one.
+      // An absent date is a data gap, not proof of being out of window.
+      const restore = withWindow('2026-01-01', '');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base })).toBe(true);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '' })).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+  });
 });
 
 describe('resolveViewId — the view alias map', () => {
