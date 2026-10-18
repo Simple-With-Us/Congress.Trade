@@ -1,6 +1,9 @@
 #!/bin/bash
-source /Users/jay/.secrets/global-api-keys.env
-export CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN
+# CLOUDFLARE_API_TOKEN: environment first, else `fleet-secrets get` (Infisical Fleet-OPS).
+if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+  CLOUDFLARE_API_TOKEN="$(fleet-secrets get CLOUDFLARE_API_TOKEN 2>/dev/null || true)"
+fi
+export CLOUDFLARE_API_TOKEN
 # Use the correct old account ID where the bucket lives for now
 export CLOUDFLARE_ACCOUNT_ID="254301ba6b6323381932ddbca9608c73"
 

@@ -790,7 +790,7 @@ export interface Env {
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   /** Unusual Whales API key for recent Congress trades (latency probe). */
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias (global-api-keys / Infisical) without underscores in the vendor name. */
+  /** Alias (Infisical) without underscores in the vendor name. */
   UNUSUALWHALES_API_KEY?: string;
   /** Distinct filed dates the UW disclosure-latency deep-match pass may query
    *  per probe run (recent-trades?date=<filedDate>), for pending observations

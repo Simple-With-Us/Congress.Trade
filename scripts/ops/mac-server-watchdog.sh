@@ -11,17 +11,23 @@ log() {
   echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG_FILE"
 }
 
-SECRETS_FILE="${HOME}/.secrets/global-api-keys"
-
-# Read INGEST_TOKEN & COOLIFY token if present
-INGEST_TOKEN=""
-COOLIFY_TOKEN=""
-if [[ -f "$SECRETS_FILE" ]]; then
-  INGEST_TOKEN="$(grep -E '^INGEST_TOKEN=' "$SECRETS_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)"
-  COOLIFY_TOKEN="$(grep -E '^COOLIFY_AGENTS=' "$SECRETS_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)"
-  if [[ -z "$COOLIFY_TOKEN" ]]; then
-    COOLIFY_TOKEN="$(grep -E '^COOLIFY_TOKEN=' "$SECRETS_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)"
+# Tokens come from the environment first, then `fleet-secrets get NAME`
+# (Infisical Fleet-OPS).  Never printed.
+fleet_secret() {
+  local name="$1"
+  if [[ -n "${!name:-}" ]]; then
+    printf '%s' "${!name}"
+    return 0
   fi
+  if command -v fleet-secrets >/dev/null 2>&1; then
+    fleet-secrets get "$name" 2>/dev/null || true
+  fi
+}
+
+INGEST_TOKEN="$(fleet_secret INGEST_TOKEN)"
+COOLIFY_TOKEN="$(fleet_secret COOLIFY_AGENTS)"
+if [[ -z "$COOLIFY_TOKEN" ]]; then
+  COOLIFY_TOKEN="$(fleet_secret COOLIFY_TOKEN)"
 fi
 
 TARGET_URL="${TARGET_URL:-https://congress.trade}"
