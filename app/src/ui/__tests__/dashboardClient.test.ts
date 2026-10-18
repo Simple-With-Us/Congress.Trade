@@ -304,6 +304,46 @@ describe('makeTradesFilterMatcher — the live-push filter', () => {
       (win as Record<string, unknown>)['chamberParam'] = origParam;
     }
   });
+
+  // Codex found this on the restored function: the matcher filtered chamber and
+  // side but not party, while the HTTP feed does pass partyParam('qPartyGroup').
+  // It predates this change, but the function is being re-enabled here.
+  it('excludes a row whose party is not selected', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => 'D';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'R' })).toBe(false);
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'D' })).toBe(true);
+      // Rows that only carry the bucket spelling must still be filtered.
+      expect(client.makeTradesFilterMatcher()({ ...row, partyBucket: 'R' })).toBe(false);
+      expect(client.makeTradesFilterMatcher()({ ...row, partyBucket: 'D' })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+    }
+  });
+
+  it('accepts any party when no party is selected', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => '';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'R' })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, chamber: 'executive' })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+    }
+  });
 });
 
 describe('resolveViewId — the view alias map', () => {

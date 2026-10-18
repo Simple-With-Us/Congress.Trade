@@ -1370,9 +1370,17 @@ function makeTradesFilterMatcher() {
   // branches, including unresolved-chamber rows. Explicit chips filter exactly.
   var chDefault = chamberParam('qChamber') === '';
   var sides = ty ? ty.split(',') : [];
+  // Party too, for the same reason the HTTP feed passes partyParam('qPartyGroup')
+  // at the query-string build: a live broadcast carries every trade, so without
+  // this a streamed row from an unselected party would be appended into a table
+  // the visitor has narrowed, and counted in totalRows. partyParam() joins with
+  // a comma, exactly like selectedSideParam does.
+  var pa = partyParam('qPartyGroup');
+  var parties = pa ? pa.split(',') : [];
   return function (r) {
     if (!chDefault && chs.indexOf(r.chamber) < 0) return false;
     if (sides.length && sides.indexOf(r.type) < 0) return false;
+    if (parties.length && parties.indexOf(r.party || r.partyBucket || '') < 0) return false;
     return tradeRowMatchesSearch(r, q);
   };
 }
