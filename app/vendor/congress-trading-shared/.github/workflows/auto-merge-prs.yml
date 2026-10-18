@@ -1,0 +1,63 @@
+name: Auto-merge PRs
+
+# Enable GitHub auto-merge on every non-draft, same-repo PR so green CI
+# lands without a human click (owner fleet policy: always auto-merge).
+#
+# WHY THIS WORKFLOW DOES NOT ARM AUTO-MERGE
+# ----------------------------------------
+# Arming auto-merge with GITHUB_TOKEN makes github-actions[bot] the
+# MERGING identity, and GitHub's recursion guard means events produced by the
+# GITHUB_TOKEN never start a workflow run. The resulting push to main therefore
+# dispatches NOTHING -- no CI, no Security, no Effort Issues Sync.
+#
+# Do not add GH_PAT or SHEPHERD_TOKEN to "fix" that. congress-trading-shared
+# is public. Land PRs under the owner's credentials:
+#
+#     gh pr merge <n> --squash --auto
+#
+# pull_request (not pull_request_target) plus a same-repo guard: fork PRs
+# never run this job. Hold label `do-not-automerge` also skips.
+#
+# Board 8bff5ca2 / 417fe5e2: the previous pull_request_target job armed
+# squash auto-merge on every non-draft PR, including public forks, with
+# contents:write and no required review.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, ready_for_review, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.labels.*.name, 'do-not-automerge')
+    steps:
+      - name: Do not arm auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -uo pipefail
+          echo "::notice::Not arming auto-merge (GITHUB_TOKEN merge would suppress post-merge workflows)."
+          echo "::notice::Land it with: gh pr merge $PR_URL --squash --auto"
+          {
+            echo "### Auto-merge not armed"
+            echo
+            echo "This workflow does not arm GitHub auto-merge and does not"
+            echo "read \`GH_PAT\` / \`SHEPHERD_TOKEN\`."
+            echo
+            echo "A \`GITHUB_TOKEN\` merge would merge as \`github-actions[bot]\`"
+            echo "and GitHub's recursion guard would suppress **every** post-merge"
+            echo "workflow on main."
+            echo
+            echo "Land this PR with the owner's own credentials instead:"
+            echo
+            echo '```'
+            echo "gh pr merge $PR_URL --squash --auto"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
