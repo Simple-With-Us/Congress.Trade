@@ -119,7 +119,7 @@ jobs:
             fi
             val="$(
               INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
-                --plain --silent --telemetry=false --expand=false \
+                --plain --silent --telemetry=false --expand=true \
                 --projectId="$secret_project" --env=prod --path="$secret_path" \
                 2>/dev/null || true
             )"
@@ -132,6 +132,10 @@ jobs:
             fi
             if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
               echo "::error::Signing field $name must be single-line; correct Infisical formatting." >&2
+              exit 1
+            fi
+            if [[ "$val" =~ ^\$\{[^}]+\}$ ]]; then
+              echo "::error::$name is still an unresolved Infisical secret reference; check the target exists and the CI identity can read the referenced folder."
               exit 1
             fi
             printf '::add-mask::%s\n' "${val//'%'/'%25'}"
