@@ -7340,7 +7340,7 @@ function speedUpdatedText() {
 function refreshSpeedUpdated() {
   if (!LATENCY.data) return;
   var txt = speedUpdatedText();
-  ['speedUpdated', 'speedUpdatedAdmin'].forEach(function (id) {
+  ['speedUpdated', 'speedUpdatedTrends', 'speedUpdatedAdmin'].forEach(function (id) {
     var n = el(id); if (n) n.textContent = txt;
   });
 }
@@ -7578,19 +7578,23 @@ function paintSpeedSection(gridId, tableBodyId, noteId, provs, totals, priceEdge
     note.hidden = !html;
   }
 }
-/* Filing Latency Comparison placement (owner 2026-08-17): paints BOTH
-   copies from a single fetch —
+/* Filing Latency Comparison placement: paints ALL copies from a single
+   fetch —
      - Delivery (#trLatencySection, bottom of the tab): only when
-       isLatencyAhead() says we are not behind on most providers.
-     - Trends (#trLatencyLink): same gate; a link to the Delivery section.
+       isLatencyAhead() says we are not behind on most providers (owner
+       2026-08-17).
+     - Trends (#trLatencySectionTrends, bottom of the tab): the same public
+       scoreboard inline under the same gate (owner 2026-10-17: the filing
+       latency info itself at the bottom of Trends, replacing the old link
+       to the Delivery copy).
      - Admin (#adminLatencySection, top of the tab): always the full
        comparison (incl. BEHIND) whenever there's any raced data.
    Never rendered on the Trades tab. */
 function renderSpeedProof() {
   var publicBox = el('trLatencySection');
-  var publicLink = el('trLatencyLink');
+  var trendsBox = el('trLatencySectionTrends');
   var adminBox = el('adminLatencySection');
-  if (!publicBox && !adminBox && !publicLink) return;
+  if (!publicBox && !adminBox && !trendsBox) return;
   fetchLatencySummary().then(function (d) {
     function byMatched(a, b) { return b.matched - a.matched; }
     var adminProvs = (d.adminProviders && d.adminProviders.length ? d.adminProviders : (d.providers || [])).slice().sort(byMatched);
@@ -7607,13 +7611,16 @@ function renderSpeedProof() {
       publicBox.hidden = !ahead;
       if (ahead) paintSpeedSection('spGrid', 'speedTableBody', 'spScopeNote', publicProvs, speedScopeFromSummary(d), d.priceEdge, false);
     }
-    if (publicLink) publicLink.hidden = !ahead;
+    if (trendsBox) {
+      trendsBox.hidden = !ahead;
+      if (ahead) paintSpeedSection('spGridTrends', 'speedTableBodyTrends', 'spScopeNoteTrends', publicProvs, speedScopeFromSummary(d), d.priceEdge, false);
+    }
 
     refreshSpeedUpdated();
     renderAlertsMini();
   }).catch(function () {
     if (publicBox) publicBox.hidden = true;
-    if (publicLink) publicLink.hidden = true;
+    if (trendsBox) trendsBox.hidden = true;
     if (adminBox) adminBox.hidden = true;
   });
 }
@@ -9724,16 +9731,11 @@ document.querySelectorAll('nav.tabs a').forEach(function (b) {
   };
 });
 
-/* Speed-proof section: fetch just before the Trends copy scrolls into view
-   (it now sits at the BOTTOM of the Trends tab — owner UX work order item 1
-   — so this defers the fetch rather than firing it during first paint).
-   observe() is safe to call even while #trLatencySection's ancestor .view
-   isn't the active tab yet (e.g. a returning visitor lands on a different
-   tab): the element still has no box until its tab becomes active, and
-   IntersectionObserver naturally starts evaluating intersection once it
-   does. Browsers without IntersectionObserver render it right away. The
-   Admin copy is independent: it renders immediately (not lazily) as soon as
-   the Admin tab opens, from the two call sites near the tab-switch handlers. */
+/* Speed-proof sections: one fetch paints every copy — the public scoreboard
+   at the bottom of Delivery, the same public scoreboard inline at the
+   bottom of Trends, and the always-on full comparison at the top of Admin.
+   The Admin copy is independent: it also renders as soon as the Admin tab
+   opens, from the two call sites near the tab-switch handlers. */
 (function () {
   var s = el('trLatencySection'); if (!s) return;
   renderSpeedProof();

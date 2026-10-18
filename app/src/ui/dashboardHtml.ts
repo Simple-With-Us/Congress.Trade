@@ -36,28 +36,33 @@ import { DASHBOARD_APP_JS_VERSION } from './dashboardClient.ts';
 
 /**
  * Filing Latency Comparison ("speed proof") section markup, shared between its
- * two placements (owner 2026-08-17):
+ * three placements:
  *   - Delivery tab: rendered at the BOTTOM, only when isLatencyAhead() says
- *     we are not behind on most adequately-covered providers. Trends keeps a
- *     link to this section under the same gate. Never shown on Trades.
+ *     we are not behind on most adequately-covered providers (owner
+ *     2026-08-17). Never shown on Trades.
+ *   - Trends tab: the SAME public scoreboard, inline at the BOTTOM under the
+ *     same gate (owner 2026-10-17: show the filing latency info itself at the
+ *     bottom of Trends instead of a link to the Delivery copy).
  *   - Admin tab: rendered at the TOP, ALWAYS (full comparison incl. BEHIND),
  *     an operator diagnostic rather than a marketing module.
- * Both copies are painted by the same renderSpeedProof() client function
+ * All copies are painted by the same renderSpeedProof() client function
  * against distinct element ids so they can render independently.
  */
-function speedProofSectionHtml(admin: boolean): string {
-  const sectionId = admin ? 'adminLatencySection' : 'trLatencySection';
-  const gridId = admin ? 'spGridAdmin' : 'spGrid';
-  const tableBodyId = admin ? 'speedTableBodyAdmin' : 'speedTableBody';
-  const updatedId = admin ? 'speedUpdatedAdmin' : 'speedUpdated';
+function speedProofSectionHtml(placement: 'delivery' | 'trends' | 'admin'): string {
+  const admin = placement === 'admin';
+  const idSuffix = placement === 'admin' ? 'Admin' : placement === 'trends' ? 'Trends' : '';
+  const sectionId = admin ? 'adminLatencySection' : placement === 'trends' ? 'trLatencySectionTrends' : 'trLatencySection';
+  const gridId = `spGrid${idSuffix}`;
+  const tableBodyId = `speedTableBody${idSuffix}`;
+  const updatedId = `speedUpdated${idSuffix}`;
   // "N of M matched" + what M counts. Filled by paintSpeedSection(); stays
   // hidden until the matcher lane ships the scope counts (see the
   // SPEED_SCOPE_NOTE_DEFAULT contract block in the client script).
-  const scopeNoteId = admin ? 'spScopeNoteAdmin' : 'spScopeNote';
+  const scopeNoteId = `spScopeNote${idSuffix}`;
   const infoTip = admin
     ? 'Full operator scorecard: every configured provider, including where we are behind. Each card is marked Shown Publicly or Hidden From Public. Lead and win stats use live new imports only (seed and historical backfills are excluded). We match each live trade to provider feeds even if the gap is minutes or up to about two weeks either way. Provider-only rows stay in the coverage denominator.'
     : 'Lead and win stats use live new imports only (seed and historical backfills are excluded). We match each live trade to provider feeds even if the gap is minutes or up to about two weeks either way. Provider-only rows stay in the coverage denominator, and no overall speed claim appears until coverage is adequate in both directions.';
-  return `  <!-- Provider speed scorecard (filter-independent live latency proof). ${admin ? 'Admin: always full comparison, incl. BEHIND.' : "Delivery: only when we are not behind on most providers."} -->
+  return `  <!-- Provider speed scorecard (filter-independent live latency proof). ${admin ? 'Admin: always full comparison, incl. BEHIND.' : "Delivery + Trends: only when we are not behind on most providers."} -->
   <div class="section speed-proof" id="${sectionId}"${admin ? '' : ' hidden'} style="margin-top:24px; padding:24px 20px;">
     <div class="speed-head">
       <div>
@@ -568,9 +573,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       </table></div>
     </details>
 
-    <div class="section" id="trLatencyLink" hidden>
-      <p class="sub" style="margin:0"><a href="#trLatencySection" onclick="openSpeedProof();return false;">Filing latency comparison</a> lives at the end of Delivery.</p>
-    </div>
+${speedProofSectionHtml('trends')}
   </section>
 
   <!-- ================= DIRECTORY (politician directory) ================= -->
@@ -741,12 +744,12 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           <button class="btn sm" onclick="openPricing('alerts')">Start Free Trial</button></span>
       </div>
     </div>
-${speedProofSectionHtml(false)}
+${speedProofSectionHtml('delivery')}
   </section>
 
   <!-- ================= ADMIN · CADENCE ================= -->
   <section class="view" id="view-admin" role="tabpanel" aria-labelledby="tab-admin" aria-hidden="true">
-${speedProofSectionHtml(true)}
+${speedProofSectionHtml('admin')}
     <div class="section">
       <h3>Admin Access</h3>
       <p class="sub">Admin tools (poll cadence, review queue, backfill) are available when you are signed in with an email that has admin access.&nbsp; Premium does not grant admin access.</p>
@@ -976,9 +979,6 @@ ${speedProofSectionHtml(true)}
   </section>
 
   <footer class="site-footer">
-    <a href="https://simplewithus.com" target="_blank" rel="noopener noreferrer">
-      <img src="/assets/simple-with-us.webp" alt="Simple With Us - Jay Wedgeworth" style="height: 18px; margin-bottom: 6px; opacity: 0.9;" />
-    </a>
     <span>Congress.Trade  ·  educational tool for public STOCK Act (2012) disclosures  ·  not financial advice  ·  $ estimated from brackets  ·  independent/private service not affiliated with or endorsed/sponsored by any government agency</span>
     <span class="footer-links">
       <a href="/privacy-policy">Privacy</a>
@@ -989,7 +989,7 @@ ${speedProofSectionHtml(true)}
       <a href="mailto:support@congress.trade">Support</a>
       <a href="#" onclick="if(window.openSentryFeedback){window.openSentryFeedback();}else if(window.Sentry&amp;&amp;window.Sentry.getFeedback){try{window.Sentry.getFeedback().createForm().then(function(f){f.appendToDom();f.open();});}catch(e){}}return false;">Report a Problem</a>
     </span>
-    <a class="swu-attribution" href="https://simplewithus.com/" aria-label="From Simple With Us"><span>From</span><img src="/swu-logo-wide.webp" alt="Simple With Us by Jay Wedgeworth" width="288" height="30"></a>
+    <a class="swu-attribution" href="https://simplewithus.com/" aria-label="From Simple With Us"><span>From</span><img src="/assets/simple-with-us.webp" alt="Simple With Us by Jay Wedgeworth" width="1024" height="106"></a>
   </footer>
 </main>
 
