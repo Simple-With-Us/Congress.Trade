@@ -1358,35 +1358,46 @@ function resetCols() {
   renderColChooser(); renderTradesHeader(); renderTrades();
 }
 
-/** Multi-token AND trade search: any order; each token matches politician
- *  name, ticker, asset name, state (abbr or full), or party synonyms. */
+/** Does a streamed row belong in the currently filtered view?
+ *  Multi-token AND, mirroring the server query the page was fetched with: every
+ *  token must satisfy the field its own parameter filters, so nothing passes
+ *  here that a reload would drop. Sole caller is makeTradesFilterMatcher(); the
+ *  rows already in the table came from the server and are not re-filtered. */
 function tradeRowMatchesSearch(r, q) {
   var parsed = searchTokenPlan(q);
   if (!parsed.raw) return true;
   var name = String(r.member || '').toLowerCase();
-  var nameParts = name.split(/[\\s,.\\-']+/).filter(Boolean);
   var ticker = String(r.ticker || '').toLowerCase();
-  var asset = String(r.asset || r.company || '').toLowerCase();
   var state = String(r.st || r.state || '').toLowerCase();
   var party = String(r.party || r.partyBucket || '');
   return parsed.plan.every(function (entry) {
     var tok = entry.lower;
-    // Only the token that became ticker= is an EXACT match here, because the
-    // server compares that one with "t.ticker = ?" (exact, upper-cased).
-    // Substring matching let a streamed AAPLX through an AAPL search and counted
-    // it in totalRows. Later ticker-shaped tokens are NOT exact: they travel as
-    // part of memberName and are matched as substrings there.
-    if (entry.exactTicker) return !!ticker && ticker === tok;
-    if (name.indexOf(tok) >= 0) return true;
-    for (var i = 0; i < nameParts.length; i++) {
-      if (nameParts[i].indexOf(tok) === 0 || nameParts[i].indexOf(tok) >= 0) return true;
+    // Each token is checked ONLY against the field its own server parameter
+    // filters, because this predicate's sole caller is the live-push matcher and
+    // the HTTP results it shadows are already filtered by the server.
+    if (entry.field === 'ticker') {
+      // Exact: the server compares this one with "t.ticker = ?". Substring
+      // matching let a streamed AAPLX through an AAPL search and counted it in
+      // totalRows.
+      return !!ticker && ticker === tok;
     }
-    if (ticker && ticker.indexOf(tok) >= 0) return true;
-    if (asset && asset.indexOf(tok) >= 0) return true;
-    if (typeof peopleStateMatches === 'function' && peopleStateMatches(tok, state)) return true;
-    if (typeof peoplePartyMatches === 'function' && peoplePartyMatches(tok, party)) return true;
-    if (state && state.indexOf(tok) >= 0) return true;
-    return false;
+    if (entry.field === 'state') {
+      // state has no server param on the public feed, so the client filters it.
+      return (typeof peopleStateMatches === 'function' && peopleStateMatches(tok, state)) ||
+        (!!state && state.indexOf(tok) >= 0);
+    }
+    if (entry.field === 'party') {
+      return typeof peoplePartyMatches === 'function' && peoplePartyMatches(tok, party);
+    }
+    // memberName: the server matches it against the FILER's name only --
+    // "LOWER(COALESCE(fl.full_name, t.filer_id, '')) LIKE ? OR LOWER(
+    // COALESCE(fl.display_name, '')) LIKE ?" (delivery/rows.ts). It never looks
+    // at asset, ticker or state, so a token that happens to appear in the asset
+    // name must NOT pass here or the row is inserted and counted, then removed
+    // by the next reload. Substring on the whole name mirrors the LIKE exactly;
+    // splitting on punctuation and matching parts would match LESS than the
+    // server does, which is the opposite error.
+    return name.indexOf(tok) >= 0;
   });
 }
 /* Builds a predicate for "does this row match the CURRENTLY ACTIVE
@@ -1518,15 +1529,20 @@ function searchTokenPlan(q) {
   var tickerClaimed = false;
   for (var i = 0; i < tokens.length; i++) {
     var kind = classifySearchToken(tokens[i]);
-    var exactTicker = kind === 'ticker' && !tickerClaimed;
+    var claimsTicker = kind === 'ticker' && !tickerClaimed;
     if (kind === 'ticker') tickerClaimed = true;
+    // field is the row attribute the token's own server parameter filters, which
+    // is what the live-push predicate has to check. state and party have no
+    // server param on the public feed, so those stay client-side filters.
+    var field = claimsTicker ? 'ticker' : (kind === 'state' ? 'state' : (kind === 'party' ? 'party' : 'name'));
     plan.push({
       token: tokens[i],
       // Lower-cased copy for matching; the original casing is kept because
       // classifySearchToken() has to see what the user typed to spot a ticker.
       lower: tokens[i].toLowerCase(),
       kind: kind,
-      exactTicker: exactTicker,
+      field: field,
+      exactTicker: claimsTicker,
     });
   }
   return { raw: raw, plan: plan };

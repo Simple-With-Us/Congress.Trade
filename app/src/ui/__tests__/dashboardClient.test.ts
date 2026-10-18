@@ -255,20 +255,32 @@ describe('tradeRowMatchesSearch — multi-token AND matching', () => {
     expect(client.tradeRowMatchesSearch(row, '   ')).toBe(true);
   });
 
-  it('matches a single token against any field, in any case', () => {
-    expect(client.tradeRowMatchesSearch(row, 'khanna')).toBe(true);
-    expect(client.tradeRowMatchesSearch(row, 'MSFT')).toBe(true);
-    expect(client.tradeRowMatchesSearch(row, 'microsoft')).toBe(true);
-    expect(client.tradeRowMatchesSearch(row, 'CA')).toBe(true);
+  it('matches a token against the field its own server parameter filters', () => {
+    expect(client.tradeRowMatchesSearch(row, 'khanna')).toBe(true);   // memberName -> filer name
+    expect(client.tradeRowMatchesSearch(row, 'MSFT')).toBe(true);     // ticker=     -> exact ticker
+    expect(client.tradeRowMatchesSearch(row, 'CA')).toBe(true);       // no param    -> client state filter
+  });
+
+  it('does NOT let a name-bound token match the asset name', () => {
+    // The regression this predicate used to have. memberName filters the FILER's
+    // name on the server and never looks at the asset, so "microsoft" finds
+    // nothing in the HTTP feed — but it matched this row's asset here, so a
+    // streamed trade was inserted and counted, then removed on the next reload.
+    expect(client.tradeRowMatchesSearch(row, 'microsoft')).toBe(false);
+    // Nor the ticker: a lower-cased "msft" is a name-bound token, so it is
+    // matched against the filer's name and not against this row's ticker.
+    // (Upper-case "MSFT" is the ticker token and DOES match — that is correct.)
+    expect(client.tradeRowMatchesSearch({ ...row, member: 'Jane Doe' }, 'msft')).toBe(false);
+    expect(client.tradeRowMatchesSearch({ ...row, member: 'Jane Doe' }, 'MSFT')).toBe(true);
   });
 
   it('requires EVERY token to match (AND, not OR)', () => {
-    expect(client.tradeRowMatchesSearch(row, 'khanna microsoft')).toBe(true);
+    expect(client.tradeRowMatchesSearch(row, 'khanna CA')).toBe(true);
     expect(client.tradeRowMatchesSearch(row, 'khanna tesla')).toBe(false);
   });
 
   it('is order-independent', () => {
-    expect(client.tradeRowMatchesSearch(row, 'microsoft khanna')).toBe(true);
+    expect(client.tradeRowMatchesSearch(row, 'CA khanna')).toBe(true);
   });
 
   it('matches on a name part, not only a prefix of the whole name', () => {
@@ -296,15 +308,15 @@ describe('tradeRowMatchesSearch — multi-token AND matching', () => {
 
   it('keys exact matching on the FIRST ticker-shaped token, whichever it is', () => {
     // Not order-independent for ticker-shaped tokens, and deliberately so:
-    // "RO AAPL" asks the server for ticker=RO as well, so the client has to
-    // agree with that rather than be cleverer than the request it is filtering.
+    // "RO KHANNA" asks the server for ticker=RO, so the client has to agree with
+    // that rather than be cleverer than the request it is filtering.
     const p = new URLSearchParams();
-    client.applySearchToServerParams(p, 'RO AAPL');
+    client.applySearchToServerParams(p, 'RO KHANNA');
     expect(p.get('ticker')).toBe('RO');
-    expect(p.get('memberName')).toBe('AAPL');
-    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'AAPL' }, 'RO AAPL')).toBe(false);
-    // An RO-ticker row matches on the exact token, then on AAPL as a substring.
-    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'RO', asset: 'AAPL Holding' }, 'RO AAPL')).toBe(true);
+    expect(p.get('memberName')).toBe('KHANNA');
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'AAPL' }, 'RO KHANNA')).toBe(false);
+    // An RO-ticker row matches on the exact token, then on the filer's name.
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'RO' }, 'RO KHANNA')).toBe(true);
   });
 
   it('builds the same query the matcher assumes', () => {
