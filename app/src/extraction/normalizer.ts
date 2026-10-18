@@ -234,6 +234,7 @@ export const HARD_FAILURE_FLAGS = [
   'no_amount',
   'invalid_amount',
   'bad_tx_type',
+  'suspected_constant_tx_type',
   'bad_asset_name',
   'unreadable_is_option',
   'unreadable_cap_gains',
@@ -904,7 +905,7 @@ function buildTransaction(
     flags: [
       ...s.flags,
       ...(p.extractionWarnings ?? []).filter((flag) =>
-        flag === 'unreadable_is_option' || flag === 'unreadable_cap_gains'),
+        flag === 'unreadable_is_option' || flag === 'unreadable_cap_gains' || flag === 'suspected_constant_tx_type'),
     ],
   };
 }

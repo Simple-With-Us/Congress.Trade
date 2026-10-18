@@ -1,12 +1,24 @@
 name: iOS TestFlight ship (Mac runner)
 
-# Archive + upload on the owned Mac runner so TestFlight (the phone) actually
-# updates when iOS code lands on main. Unsigned compile stays in ios-build.yml.
+# Archive + upload on GitHub-hosted macos-latest so TestFlight (the phone)
+# actually updates when iOS code lands on main. Unsigned compile stays in
+# ios-build.yml. Fork PRs never run here.
 #
-# XCODE BUILDS ONLY (owner 2026-08-12): this workflow may target mac-runner
-# labels. Backend jobs stay off this host. Fork PRs never run here.
+# AUTO-SHIP CONTRACT (owner 2026-10-17): a merge to main that touches
+# clients/ios/** (the `push:` paths filter below) uploads a fresh TestFlight
+# build with no human step and publishes What to Test (IOS_TF_RELEASE_NOTES=1).
+# `workflow_dispatch` is the manual path.  scripts/ios-ship-workflow.test.mjs
+# pins these pieces in CI.  The rate gate and the same-HEAD skip are the ship
+# script's defaults: never set IOS_TF_MIN_INTERVAL_SEC or --force-ship in this
+# file (a one-off override belongs on a dispatch input for that run only).
 #
-# Signing material from Infisical prod; identity on GitHub only.
+# RUNNER: macos-latest on purpose, not the owned Mac.  The owned Mac runner is a
+# macOS 27 beta and App Store review rejects binaries built there as
+# INVALID_BINARY even when TestFlight accepts them (see ios-appstore-gm.yml).
+#
+# Signing material from Infisical prod; identity on GitHub only.  ASC key and
+# issuer come from Fleet Secrets prod /asc, certificates from the Congress.Trade
+# project.
 #
 # WHY THERE IS A `schedule:` TRIGGER (2026-08-13)
 # ----------------------------------------------
@@ -39,6 +51,10 @@ name: iOS TestFlight ship (Mac runner)
 # A scheduled tick with no last-ship file now skips.  Real ships are a push
 # that passed paths: or an explicit workflow_dispatch.  To force one run,
 # dispatch the workflow or run the wrapper locally with --force-ship.
+# For the same reason the ship script's rate gate and same-HEAD skip have no
+# state to read on this runner: every push that passes paths: ships once, and
+# the cron is a no-op until last-ship state is seeded (ios-appstore-gm.yml seeds
+# it from its previous successful run).
 
 on:
   push:
