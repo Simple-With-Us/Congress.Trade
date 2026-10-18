@@ -26,6 +26,8 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { JSDOM, VirtualConsole } from 'jsdom';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
 import { DASHBOARD_APP_JS } from '../dashboardClient.ts';
+import { formatTradeEvent } from '../../delivery/sse.ts';
+import type { Transaction } from '../../shared/types.ts';
 
 /** The subset of window the tests actually call. Kept narrow on purpose: a
  *  broad `any` here would let a typo in a function name pass as a test. */
@@ -43,6 +45,9 @@ type Client = {
   tradeRowMatchesSearch: (row: Record<string, string>, query: string) => boolean;
   applySearchToServerParams: (params: URLSearchParams, query: string) => void;
   makeTradesFilterMatcher: () => (row: Record<string, string>) => boolean;
+  tradesFromEventPayload: (payload: unknown) => Array<Record<string, unknown>>;
+  startStream: () => void;
+  stopStream: () => void;
   resolveViewId: (raw: string) => string;
   windowLabel: (v: string) => string;
   amountTier: (amount: number) => string;
@@ -112,6 +117,33 @@ afterAll(() => {
   dom?.window.close();
 });
 
+/**
+ * One trade as the SERVER actually frames it: run the real producer
+ * (delivery/sse.ts formatTradeEvent) and parse its data: line.
+ *
+ * Deliberately not a hand-written fixture. Writing the envelope out by hand here
+ * would put the same spelling on both sides of the assertion and test the
+ * fixture rather than the wire — the exact trap that let the party filter
+ * compare a raw label against a bucket code, and that would let this client
+ * drift from the producer again the moment either side changed.
+ */
+const SERVER_FRAME = (() => {
+  const frame = formatTradeEvent({
+    id: 'tx_envelope_1',
+    cursorSeq: 99,
+    ticker: 'AAPL',
+    txType: 'buy',
+    // Dated today on purpose: the shipped document has a rolling window select
+    // active, so an undated trade is correctly rejected by the matcher. Leaving
+    // the date off would make this test assert the rejection instead of the
+    // read, and go green even with the old top-level-only handler.
+    txDate: new Date().toISOString(),
+  } as unknown as Transaction);
+  const dataLine = frame.split('\n').find((l) => l.startsWith('data: '));
+  if (!dataLine) throw new Error('formatTradeEvent produced no data: line');
+  return JSON.parse(dataLine.slice('data: '.length)) as Record<string, unknown>;
+})();
+
 describe('dashboard client boots as a classic script (CT-1500)', () => {
   it('evaluates the whole script without throwing', () => {
     // If this fails, the document would ship a blank page. Every other test in
@@ -134,6 +166,13 @@ describe('dashboard client boots as a classic script (CT-1500)', () => {
     // congress.trade handler kept calling it. PUBLIC_STREAM_ENABLED is false
     // today so the line never ran, which is why nothing noticed.
     expect(typeof client.makeTradesFilterMatcher).toBe('function');
+  });
+
+  it('defines tradesFromEventPayload, which the congress.trade handler calls', () => {
+    // Same shape of bug as makeTradesFilterMatcher: the handler calls it, so it
+    // has to exist. PUBLIC_STREAM_ENABLED is false today so the call never
+    // runs in the browser, which is exactly how a missing one goes unnoticed.
+    expect(typeof client.tradesFromEventPayload).toBe('function');
   });
 
   it('defines stampWindowChips, which replaced the never-defined updateTrWindowLabels', () => {
@@ -264,6 +303,138 @@ describe('applySearchToServerParams — filter-to-query builder', () => {
     client.applySearchToServerParams(p, 'Khanna MSFT');
     expect(p.get('ticker')).toBe('MSFT');
     expect(p.get('memberName')).toBeTruthy();
+  });
+});
+
+describe('tradesFromEventPayload — the congress.trade envelope', () => {
+  it('reads the rows out of a real server frame', () => {
+    // The regression guard: the handler used to read a top-level trades array,
+    // which is [] for every frame formatTradeEvent emits, so the live feed was
+    // silently starved. Asserting against the producer's own output means this
+    // test fails if the envelope moves again.
+    const trades = client.tradesFromEventPayload(SERVER_FRAME);
+    expect(Array.isArray(trades)).toBe(true);
+    expect(trades).toHaveLength(1);
+    expect(trades[0].id).toBe('tx_envelope_1');
+  });
+
+  it('still accepts the flattened top-level shape', () => {
+    // Compatibility fallback for older frames, mirroring the superset payload
+    // delivery/webhook.ts posts.
+    expect(client.tradesFromEventPayload({ trades: [{ id: 'flat' }] })).toEqual([{ id: 'flat' }]);
+  });
+
+  it('prefers the canonical envelope when a frame carries both', () => {
+    // A superset payload really does carry both shapes. Reading both would
+    // double-count the row, so the canonical path has to win outright.
+    const both = { data: { trades: [{ id: 'canonical' }] }, trades: [{ id: 'flattened' }] };
+    expect(client.tradesFromEventPayload(both)).toEqual([{ id: 'canonical' }]);
+  });
+
+  it('returns [] instead of throwing on frames it cannot read', () => {
+    // Malformed frames must not kill the handler; it is one live push among
+    // many and the page is still usable without it.
+    for (const bad of [
+      null, undefined, {}, 'raw', 42,
+      { data: null }, { data: {} }, { data: { trades: null } }, { data: { trades: 'nope' } },
+      { trades: null }, { trades: {} }, { trades: 7 },
+    ]) {
+      expect(client.tradesFromEventPayload(bad)).toEqual([]);
+    }
+  });
+});
+
+describe('the congress.trade handler is wired to the envelope (end to end)', () => {
+  // tradesFromEventPayload being correct does not prove the handler CALLS it.
+  // That distinction is the whole bug: a correct helper wired to nothing, or a
+  // handler reading a different path, both look green here and starve the feed.
+  // PUBLIC_STREAM_ENABLED is false in production, so the wiring has to be forced
+  // open for any of this to be observable at all.
+  // A function, not a const: describe bodies run before beforeAll, so a
+  // module-level alias would capture win while it is still undefined.
+  const w = () => win as unknown as Record<string, unknown>;
+  type Handler = (e: { data: string }) => void;
+  type PushResult = { trades: Array<Record<string, unknown>>; totalRows: number };
+
+  /**
+   * Drive one congress.trade frame through the real handler and report what the
+   * page ended up holding.
+   *
+   * The globals are saved and restored so each case starts clean, which means
+   * the result has to be captured INSIDE the try — reading it afterwards would
+   * just re-read the original empty array the restore put back.
+   */
+  function pushFrame(payload: unknown): PushResult {
+    const listeners: Record<string, Handler> = {};
+    class FakeEventSource {
+      readyState = 1;
+      close() {}
+      addEventListener(type: string, fn: Handler) { listeners[type] = fn; }
+    }
+    const s = w();
+    const saved = {
+      flag: s['PUBLIC_STREAM_ENABLED'],
+      src: win['EventSource'],
+      es: s['es'],
+      TRADES: s['TRADES'],
+      TRADE_BY_ID: s['TRADE_BY_ID'],
+      totalRows: s['totalRows'],
+      tradesPage: s['tradesPage'],
+      cursor: s['cursor'],
+    };
+    s['PUBLIC_STREAM_ENABLED'] = true;
+    s['EventSource'] = FakeEventSource;
+    s['TRADES'] = [];
+    s['TRADE_BY_ID'] = {};
+    s['totalRows'] = 0;
+    s['tradesPage'] = 0;
+    s['cursor'] = 0;
+    let result: PushResult = { trades: [], totalRows: 0 };
+    try {
+      (client.startStream as () => void)();
+      expect(typeof listeners['congress.trade'], 'handler registered').toBe('function');
+      listeners['congress.trade']({ data: JSON.stringify(payload) });
+      result = {
+        trades: s['TRADES'] as Array<Record<string, unknown>>,
+        totalRows: s['totalRows'] as number,
+      };
+    } finally {
+      s['PUBLIC_STREAM_ENABLED'] = saved.flag;
+      s['EventSource'] = saved.src;
+      s['TRADES'] = saved.TRADES;
+      s['TRADE_BY_ID'] = saved.TRADE_BY_ID;
+      s['totalRows'] = saved.totalRows;
+      s['tradesPage'] = saved.tradesPage;
+      s['cursor'] = saved.cursor;
+      (client.stopStream as () => void)();
+    }
+    return result;
+  }
+
+  it('adds a row to TRADES from a canonical data.trades frame', () => {
+    const out = pushFrame(SERVER_FRAME);
+    expect(out.trades).toHaveLength(1);
+    expect(out.trades[0].ticker).toBe('AAPL');
+    // The displayed total moves too — this is the second half of "live rows are
+    // never updated", which a row-only assertion would miss.
+    expect(out.totalRows).toBe(1);
+  });
+
+  it('accepts a flattened frame through the same path', () => {
+    const out = pushFrame({
+      trades: [{
+        id: 'tx_flat_1', cursorSeq: 5, ticker: 'MSFT', txType: 'sell',
+        txDate: new Date().toISOString(),
+      }],
+    });
+    expect(out.trades).toHaveLength(1);
+    expect(out.trades[0].ticker).toBe('MSFT');
+  });
+
+  it('survives a frame it cannot read without touching TRADES', () => {
+    const out = pushFrame({ nothing: 'useful' });
+    expect(out.trades).toEqual([]);
+    expect(out.totalRows).toBe(0);
   });
 });
 

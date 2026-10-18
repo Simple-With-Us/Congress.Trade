@@ -2294,6 +2294,23 @@ function startPolling() {
   }, POLL_INTERVAL_MS);
 }
 
+/* Pull the trade rows out of one congress.trade frame.
+
+   The producer (src/delivery/sse.ts formatTradeEvent) emits the shared
+   CongressEvent envelope from createCongressEvent, so the rows live at
+   data.trades — pinned by src/delivery/__tests__/sse.test.ts and consumed the
+   same way by the sibling app. Reading a top-level trades array instead yields
+   [] for every canonical frame, which silently starves the live feed.
+
+   The flattened top-level shape is kept as a fallback for older frames, mirroring
+   the superset payload delivery/webhook.ts sends. The canonical path is tried
+   first so a frame carrying both is not read twice. */
+function tradesFromEventPayload(payload) {
+  if (!payload) return [];
+  if (payload.data && Array.isArray(payload.data.trades)) return payload.data.trades;
+  return Array.isArray(payload.trades) ? payload.trades : [];
+}
+
 function stopStream() {
   if (es) { try { es.close(); } catch (e) {} es = null; }
 }
@@ -2307,12 +2324,12 @@ function startStream() {
   try {
     es = new EventSource('/api/stream?subscription=dashboard');
     es.onopen = function () { setLivePill('live', 'Live'); };
-    // Canonical cross-app event is congress.trade carrying { trades: [...] }
-    // (see congress-trading-shared and src/delivery/sse.ts formatTradeEvent).
+    // Rows arrive inside the shared CongressEvent envelope (see
+    // tradesFromEventPayload above and src/delivery/sse.ts formatTradeEvent).
     es.addEventListener('congress.trade', function (e) {
       try {
         var payload = JSON.parse(e.data);
-        var trades = (payload && payload.trades) || [];
+        var trades = tradesFromEventPayload(payload);
         var changed = false;
         // The stream is a shared broadcast — it carries every new trade
         // regardless of which chamber/party/side/ticker/politician THIS
