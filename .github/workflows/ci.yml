@@ -260,6 +260,17 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # CT-1500: the dashboard's ~546 KB of browser JavaScript used to live only
+      # in a TypeScript template literal, so `deno check` saw a string and eslint
+      # saw nothing — an undefined global shipped without anything failing. These
+      # two steps make that code a real lintable source file and keep the served
+      # string generated from it.
+      - name: Lint the dashboard client (no-undef, browser globals)
+        run: npm run lint:client
+
+      - name: Verify the served dashboard client matches its source
+        run: npm run check:client
+
       - name: Test with coverage thresholds
         run: npm run coverage
 

@@ -536,10 +536,16 @@ export async function drainSseBacklog(
       FeedTransactionRow & { __chamber: string | null; __sector: string | null; __bucket: string | null }
     >(
       env.DB,
+      // `filer_party` is the column mapFeedTransaction reads for Transaction.party.
+      // It was missing here while the HTTP feed selected the same alias, so every
+      // streamed row reached the client with no party and bucketed as 'O' — which
+      // the dashboard's D/R party chips then rejected wholesale. The filers join
+      // was already present for display_name/state/photo_url; only the projection
+      // was absent.
       `SELECT t.*, f.chamber AS __chamber,
               sr.sector AS __sector, sr.market_cap_bucket AS __bucket,
               COALESCE(fl.display_name, fl.full_name) AS filer_full_name, fl.state AS filer_state,
-              fl.photo_url AS filer_photo_url
+              fl.photo_url AS filer_photo_url, fl.party AS filer_party
          FROM (
            SELECT t.* FROM transactions t INDEXED BY idx_tx_cursor
             WHERE t.cursor_seq > ? AND t.deprecated_at IS NULL

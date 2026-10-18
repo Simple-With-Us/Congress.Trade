@@ -246,13 +246,29 @@ export async function dispatchWebhook(
   }
   const tx = stampDeliveryFreshness(mapTransaction(txRow));
 
-  // Resolve chamber via the owning filing (Transaction carries no chamber col).
-  const chamberRow = await get<{ chamber: string | null }>(
+  // Resolve chamber via the owning filing (Transaction carries no chamber col),
+  // and the filer's party, which Transaction does carry but `SELECT * FROM
+  // transactions` cannot supply. Both live on this one join: filings holds
+  // filer_id and filers keys party by bioguide_id.
+  //
+  // Party has to be on the transaction rather than only in ctx, because ctx is
+  // consumed for subscription matching and never serialized — formatTradeEvent
+  // sends the transaction alone, so a party held in ctx would be dropped before
+  // the frame reaches the client.
+  const filingRow = await get<{ chamber: string | null; party: string | null }>(
     env.DB,
-    'SELECT chamber FROM filings WHERE doc_id = ?',
+    `SELECT f.chamber AS chamber, fl.party AS party
+       FROM filings f
+       LEFT JOIN filers fl ON fl.bioguide_id = f.filer_id
+      WHERE f.doc_id = ?`,
     [tx.docId],
   );
-  const chamber = chamberRow?.chamber ?? null;
+  const chamber = filingRow?.chamber ?? null;
+  // The backlog path gets this from mapFeedTransaction; this is the push path's
+  // equivalent, so both producers now emit the same shape.
+  if (tx.party === undefined || tx.party === null) {
+    tx.party = filingRow?.party ?? null;
+  }
 
   // Resolve sector + market-cap bucket for sector/cap subscription filters.
   const refRow = tx.ticker

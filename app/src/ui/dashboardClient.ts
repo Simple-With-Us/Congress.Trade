@@ -9,6 +9,12 @@
  * deploy. Extracted verbatim and served `immutable`, which turns the repeat-visit
  * cost of the app's JavaScript into a cache hit.
  *
+ * CT-1500: GENERATED FILE, DO NOT EDIT. The source of truth is
+ * `src/ui/client/dashboard.js`, which is real JavaScript that eslint parses
+ * with browser globals and `no-undef` enabled. Regenerate with
+ * `deno run -A scripts/build-dashboard-client.ts`; `--check` is wired into CI
+ * and fails if this file and the source have drifted apart.
+ *
  * It is loaded as a CLASSIC script at the exact position the inline block used
  * to occupy (after the boot markup it queries, before the trailing dialogs),
  * never `type="module"` and never `async`:
@@ -18,19 +24,8 @@
  *     handlers in the body markup resolve those names as globals at dispatch
  *     time. Every handler would die silently.
  *   - `async` could execute the block before the markup it queries exists.
- *
- * The four module-load values it interpolates (executive title forms, the
- * public transaction offset cap, the benchmark model catalog, and the released
- * App Store URL) are serialized here exactly as they were in the document, so
- * the client stays tied to its server-side definitions.
- *
- * Editing rule: this is a template literal. Do not add a backtick inside it.
  */
 
-import { APP_STORE_URL } from './appLinks.ts';
-import { benchmarkSelectableCatalog } from '../benchmark/settings.ts';
-import { executiveTitleForms } from '../shared/executiveTitles.ts';
-import { MAX_PUBLIC_TX_OFFSET } from '../security/botDefense.ts';
 import { assetVersion } from './assets.ts';
 
 export const DASHBOARD_APP_JS = /* js */ `
@@ -272,7 +267,7 @@ function chamberLabel(c) {
    nothing else: no 'Exec' branch word in front of it, and no state/district
    (they hold an office, not a seat). EXEC_TITLE_FALLBACK stands alone for an
    uncurated filer — it is never a prefix. */
-var EXEC_TITLE_FORMS = ${JSON.stringify(executiveTitleForms())};
+var EXEC_TITLE_FORMS = {"titles":{"EXEC-DJT":"President","EXEC-BESSENT":"Treasury Secretary","EXEC-CWRIGHT":"Energy Secretary","EXEC-MCMAHON":"Education Secretary","EXEC-BARBARA-M-BARRETT-2021-ERM":"Secretary of the Air Force","EXEC-BARBARA-M-BARRETT":"Secretary of the Air Force","EXEC-BABARA-M-BARRETT":"Secretary of the Air Force","EXEC-ALEX-M-AZAR-2021-ERM":"HHS Secretary","EXEC-ANTHONY-J-BLINKEN-2025-ERM":"Secretary of State","EXEC-ANTHONY-J-BLINKEN":"Secretary of State","EXEC-LLOYD-AUSTIN-2025-ERM":"Defense Secretary","EXEC-LLOYD-AUSTIN":"Defense Secretary","EXEC-ERIC-S-LANDER-2022-ERM":"OSTP Director","EXEC-ERIC-S-LANDER":"OSTP Director","EXEC-MICHAEL-J-KRATSIOS":"OSTP Director","EXEC-MICHAEL-KRATSIOS":"OSTP Director","EXEC-ADEWALE-ADEYEMO":"Deputy Treasury Secretary","EXEC-ADEWALE-ADEYEMO-2025-ERM":"Deputy Treasury Secretary","EXEC-TOMMY-BEAUDREAU":"Deputy Interior Secretary","EXEC-TOMMY-BEAUDREAU-2023-ERM":"Deputy Interior Secretary","EXEC-FRANK-J-BISIGNANO":"Social Security Commissioner","EXEC-SEAN-DUFFY":"Transportation Secretary","EXEC-MCCORMICK":"U.S. Senator (PA)","EXEC-CHRISTINE-ABIZAID":"NCTC Director","EXEC-SCOTT-A-KUPOR":"OPM Director","EXEC-ALICE-ALBRIGHT-10-24-2022":"MCC Chief Executive Officer","EXEC-ALICE-ALBRIGHT":"MCC Chief Executive Officer","EXEC-ALICE-ALBRIGHT-2025-ERM":"MCC Chief Executive Officer","EXEC-DEANNE-CRISWELL":"FEMA Administrator","EXEC-DEANNE-CRISWELL-2025-ERM":"FEMA Administrator","EXEC-DEANNE-CHRISWELL":"FEMA Administrator","EXEC-DIANNE-CRISWELL":"FEMA Administrator","EXEC-DOUGLAS-J-BURGUM":"Interior Secretary","EXEC-DOUG-BURGUM":"Interior Secretary","EXEC-SARA-BAILEY":"ONDCP Director"},"short":{"President":"President","Treasury Secretary":"Treasury Sec.","Energy Secretary":"Energy Sec.","Education Secretary":"Education Sec.","Secretary of the Air Force":"Air Force Sec.","HHS Secretary":"HHS Sec.","Secretary of State":"Sec. of State","Defense Secretary":"Defense Sec.","OSTP Director":"OSTP Dir.","Deputy Treasury Secretary":"Dep. Treasury Sec.","Deputy Interior Secretary":"Dep. Interior Sec.","Social Security Commissioner":"SSA Commissioner","Transportation Secretary":"Transportation Sec.","U.S. Senator (PA)":"Sen. (PA)","NCTC Director":"NCTC Dir.","OPM Director":"OPM Dir.","MCC Chief Executive Officer":"MCC CEO","FEMA Administrator":"FEMA Admin.","Interior Secretary":"Interior Sec.","ONDCP Director":"ONDCP Dir.","Executive Branch":"Executive"},"fallback":"Executive Branch","fallbackShort":"Executive"};
 var EXEC_TITLES = EXEC_TITLE_FORMS.titles;
 var EXEC_TITLES_SHORT = EXEC_TITLE_FORMS.short;
 var EXEC_TITLE_FALLBACK = EXEC_TITLE_FORMS.fallback;
@@ -624,9 +619,9 @@ function isJunkAssetString(s) {
   ) {
     return true;
   }
-  var stripped = str.replace(/[\\.\\s\\-\\_\\:\\;\\,\\?\\!]/g, '');
+  var stripped = str.replace(/[.\\s_?:;,!-]/g, '');
   if (stripped.length === 0) return true;
-  if (/[\\.\\_\\-]{2,}/.test(str) && stripped.length <= 2) return true;
+  if (/[._-]{2,}/.test(str) && stripped.length <= 2) return true;
   return false;
 }
 function isScannedPdfPlaceholder(s) {
@@ -641,7 +636,7 @@ function cleanAsset(s) {
 
   if (isJunkAssetString(t)) return '';
 
-  t = t.replace(/[\\/\\-\\s]+$/, '');
+  t = t.replace(/[\\s/-]+$/, '');
   t = t.replace(/\\s*\\(\\s*(?:NASDAQ|NYSE|AMEX|OTC|BATS|ARCA|ASX|LSE|TSX)[^)]*\\)\\s*$/i, '');
 
   if (t === t.toUpperCase() && /[A-Z]{4,}/.test(t)) {
@@ -1363,37 +1358,121 @@ function resetCols() {
   renderColChooser(); renderTradesHeader(); renderTrades();
 }
 
-/* Builds a predicate for "does this row match the CURRENTLY ACTIVE
-   member/ticker/side/chamber filters" — snapshotting the filter values once
-   so filtering many rows doesn't re-read the DOM per row. Shared by
-   renderTrades() below and the SSE congress.trade handler, which must apply
-   the SAME check before letting a pushed row affect this view's rows/total —
-   a live broadcast carries every new trade, not just ones matching what THIS
-   visitor is currently filtered to. */
-/** Multi-token AND trade search: any order; each token matches politician
- *  name, ticker, asset name, state (abbr or full), or party synonyms. */
+/** Does a streamed row belong in the currently filtered view?
+ *  Multi-token AND, mirroring the server query the page was fetched with: every
+ *  token must satisfy the field its own parameter filters, so nothing passes
+ *  here that a reload would drop. Sole caller is makeTradesFilterMatcher(); the
+ *  rows already in the table came from the server and are not re-filtered. */
 function tradeRowMatchesSearch(r, q) {
-  var raw = String(q || '').trim().toLowerCase();
-  if (!raw) return true;
-  var tokens = raw.split(/\\s+/).filter(Boolean);
+  var parsed = searchTokenPlan(q);
+  if (!parsed.raw) return true;
   var name = String(r.member || '').toLowerCase();
-  var nameParts = name.split(/[\\s,.\\-']+/).filter(Boolean);
   var ticker = String(r.ticker || '').toLowerCase();
-  var asset = String(r.asset || r.company || '').toLowerCase();
   var state = String(r.st || r.state || '').toLowerCase();
   var party = String(r.party || r.partyBucket || '');
-  return tokens.every(function (tok) {
-    if (name.indexOf(tok) >= 0) return true;
-    for (var i = 0; i < nameParts.length; i++) {
-      if (nameParts[i].indexOf(tok) === 0 || nameParts[i].indexOf(tok) >= 0) return true;
+  return parsed.plan.every(function (entry) {
+    var tok = entry.lower;
+    // Each token is checked ONLY against the field its own server parameter
+    // filters, because this predicate's sole caller is the live-push matcher and
+    // the HTTP results it shadows are already filtered by the server.
+    if (entry.field === 'ticker') {
+      // Exact: the server compares this one with "t.ticker = ?". Substring
+      // matching let a streamed AAPLX through an AAPL search and counted it in
+      // totalRows.
+      return !!ticker && ticker === tok;
     }
-    if (ticker && ticker.indexOf(tok) >= 0) return true;
-    if (asset && asset.indexOf(tok) >= 0) return true;
-    if (typeof peopleStateMatches === 'function' && peopleStateMatches(tok, state)) return true;
-    if (typeof peoplePartyMatches === 'function' && peoplePartyMatches(tok, party)) return true;
-    if (state && state.indexOf(tok) >= 0) return true;
-    return false;
-  });
+    if (entry.field === 'state') {
+      // state has no server param on the public feed, so the client filters it.
+      return (typeof peopleStateMatches === 'function' && peopleStateMatches(tok, state)) ||
+        (!!state && state.indexOf(tok) >= 0);
+    }
+    if (entry.field === 'party') {
+      return typeof peoplePartyMatches === 'function' && peoplePartyMatches(tok, party);
+    }
+    // Name-bound tokens are NOT decided here — they travel as one joined
+    // memberName phrase and are matched as one phrase below.
+    return true;
+  }) && matchesMemberNamePhrase(name, parsed.memberName);
+}
+
+/** Does the filer's name satisfy the single memberName phrase the server got?
+ *
+ *  The server applies memberName as one contiguous LIKE, not as a set of
+ *  independent terms: "Khanna Ro" becomes LIKE '%khanna ro%', which "Ro Khanna"
+ *  does NOT satisfy. Testing the tokens one at a time made the client more
+ *  permissive than the feed — the row was inserted and counted, then removed by
+ *  the next reload. */
+function matchesMemberNamePhrase(name, phrase) {
+  if (!phrase) return true;
+  // The server lower-cases memberName before the LIKE; match the same way.
+  return name.indexOf(String(phrase).toLowerCase()) >= 0;
+}
+/* Builds a predicate for "does this row match the CURRENTLY ACTIVE
+   member/ticker/side/chamber filters" — snapshotting the filter values once
+   so filtering many rows doesn't re-read the DOM per row.
+   CT-1500: this function was deleted in 06993059 together with its only
+   caller in renderTrades(), but the SSE congress.trade handler below still
+   calls it, so the reference survived and eslint's no-undef caught it. It is
+   restored here because that handler still needs it: a live broadcast carries
+   every new trade, not just the ones matching what THIS visitor is filtered
+   to, so a pushed row must pass the same check before it touches TRADES or
+   the displayed total (owner report #1/#2). */
+function makeTradesFilterMatcher() {
+  var q = tradesSearchQuery();
+  var ty = selectedSideParam('qSideGroup'), chs = chipSel('qChamber');
+  // Mirror the server's semantics: no chamber selection (empty param) = all
+  // branches, including unresolved-chamber rows. Explicit chips filter exactly.
+  var chDefault = chamberParam('qChamber') === '';
+  var sides = ty ? ty.split(',') : [];
+  // Party too, for the same reason the HTTP feed passes partyParam('qPartyGroup')
+  // at the query-string build: a live broadcast carries every trade, so without
+  // this a streamed row from an unselected party would be appended into a table
+  // the visitor has narrowed, and counted in totalRows. partyParam() joins with
+  // a comma, exactly like selectedSideParam does.
+  var pa = partyParam('qPartyGroup');
+  var parties = pa ? pa.split(',') : [];
+  // The chips carry BUCKET codes ('D'/'R'/'O') but a streamed row carries the
+  // raw filer label: mapFeedTransaction() copies fl.party through unchanged and
+  // the feed SELECT aliases the full name, so rows arrive as 'Democratic' /
+  // 'Republican'. Comparing those directly against 'D' would reject every row
+  // while a chip is selected. partyBucketClass() does the first-letter mapping
+  // the server's PARTY_BUCKET_SQL_LOCAL does, with one difference that matters:
+  // the SQL's ELSE branch is 'O', never NULL, so empty/NULL party lands in the
+  // "Other / No party" chip. partyBucketClass('') returns '' instead, so the
+  // empty case is mapped to 'O' here to keep the two filters identical — which
+  // is what makes D+R+O equal the unfiltered result on both sides.
+  function rowPartyBucket(r) {
+    var raw = r.party || r.partyBucket || '';
+    return raw ? partyBucketClass(raw) : 'O';
+  }
+  // Same bounds the HTTP query string uses, from the one shared definition. A
+  // late-filed disclosure whose txdate falls outside the selected window must
+  // not be appended into a narrowed table. ISO dates compare as strings.
+  //
+  // A row with NO txdate IS rejected once a bound is active, because the server
+  // rejects it: delivery/rows.ts pushes "t.tx_date >= ?" / "<= ?", and the
+  // comment there says so outright — "a row with a null tx_date can't satisfy a
+  // date comparison, so it's naturally excluded once a bound is set (the
+  // comparison is NULL -> not true), which is the intended behavior". Letting
+  // undated rows through here would make a streamed row appear and increment
+  // totalRows, then vanish on the next reload.
+  var db = tradesDateBounds();
+  return function (r) {
+    if (!chDefault && chs.indexOf(r.chamber) < 0) return false;
+    // typeKnown === false means the transaction carried no txType. txToRow still
+    // renders that as 'B', but the server's Buy filter matches stored 'B' and
+    // legacy 'P' only, so the row is absent from the feed and must be absent
+    // here. Testing r.type alone would admit and count it.
+    if (sides.length && (r.typeKnown === false || sides.indexOf(r.type) < 0)) return false;
+    if (parties.length && parties.indexOf(rowPartyBucket(r)) < 0) return false;
+    var d = r.txdate || '';
+    if (db.from || db.to) {
+      if (!d) return false;
+      if (db.from && d < db.from) return false;
+      if (db.to && d > db.to) return false;
+    }
+    return tradeRowMatchesSearch(r, q);
+  };
 }
 function tradesSearchQuery() {
   var s = el('qSearch');
@@ -1418,37 +1497,91 @@ var COMMON_POLITICIAN_NAMES = {
   wood: 1, wright: 1, young: 1
 };
 /** Heuristic server params from unified query (OR-ish fetch; client re-filters). */
-function applySearchToServerParams(p, q) {
+// ONE classifier for both consumers of the search box. applySearchToServerParams()
+// below builds the HTTP query from it and tradeRowMatchesSearch() applies the
+// same meaning to a streamed row. They had drifted: the server filters a ticker
+// with "t.ticker = ?" (exact, upper-cased) while the client used indexOf, so an
+// "AAPL" view accepted a streamed AAPLX that a reload would remove. One
+// definition, so the two cannot disagree about what a token means again.
+function classifySearchToken(tok) {
+  var tokL = tok.toLowerCase();
+  var polDict = (typeof COMMON_POLITICIAN_NAMES !== 'undefined') ? COMMON_POLITICIAN_NAMES : {};
+  var isState = (typeof US_STATE_ABBR !== 'undefined' && US_STATE_ABBR[tokL]) ||
+    (typeof US_STATE_NAME_TO_ABBR !== 'undefined' && US_STATE_NAME_TO_ABBR[tokL]);
+  var isParty = /^(dem|rep|ind|gop|other|democrat|republican|independent)s?$/i.test(tok);
+  var isPolitician = !!polDict[tokL];
+  // isAllUpper needs the token as the user typed it: 'aapl' is not a ticker
+  // hint, and lower-casing before this test would turn every word into one.
+  var isAllUpper = tok === tok.toUpperCase() && /^[A-Z0-9]{1,5}$/.test(tok);
+  if (isAllUpper && !isState && !isParty && !isPolitician) return 'ticker';
+  if (isState) return 'state';
+  if (isParty) return 'party';
+  if (isPolitician) return 'politician';
+  return 'name';
+}
+/* Classify the query ONCE and hand both consumers the same answer.
+ *
+ * classifySearchToken() says what each token is; this also says which one is the
+ * ticker the request is actually keyed on. Only the FIRST ticker-shaped token
+ * becomes ticker=, and that is the only one the server compares exactly — every
+ * later ticker-shaped token falls into memberName and is matched as a substring
+ * there.
+ *
+ * The two consumers drifted on exactly that point. The row predicate treated
+ * every ticker-shaped token as exact, so "AAPL RO" demanded the row's ticker
+ * equal BOTH AAPL and RO: no row can, so a search that the HTTP feed happily
+ * returns matched nothing on the live path — a row that would appear on reload
+ * and vanish after it. Extracting the decision, rather than patching the
+ * comparison, is what keeps them from disagreeing again. */
+function searchTokenPlan(q) {
   var raw = String(q || '').trim();
-  if (!raw) return;
   var tokens = raw.split(/\\s+/).filter(Boolean);
+  var plan = [];
   var nameBits = [];
   var tickerHint = '';
-  var polDict = (typeof COMMON_POLITICIAN_NAMES !== 'undefined') ? COMMON_POLITICIAN_NAMES : {};
   for (var i = 0; i < tokens.length; i++) {
-    var tok = tokens[i];
-    var up = tok.toUpperCase();
-    var tokL = tok.toLowerCase();
-    var isState = (typeof US_STATE_ABBR !== 'undefined' && US_STATE_ABBR[tokL]) ||
-      (typeof US_STATE_NAME_TO_ABBR !== 'undefined' && US_STATE_NAME_TO_ABBR[tokL]);
-    var isParty = /^(dem|rep|ind|gop|other|democrat|republican|independent)s?$/i.test(tok);
-    var isPolitician = !!polDict[tokL];
-    var isAllUpper = tok === up && /^[A-Z0-9]{1,5}$/.test(tok);
-    if (isAllUpper && !isState && !isParty && !isPolitician) {
-      if (!tickerHint) tickerHint = up;
-      else nameBits.push(tok);
-    } else if (isState) {
-      // state — client filter only (server has no state= on public feed)
-    } else if (isParty) {
-      // party — client filter
-    } else {
-      nameBits.push(tok);
+    var kind = classifySearchToken(tokens[i]);
+    var claimsTicker = kind === 'ticker' && !tickerHint;
+    // field is the row attribute the token's own server parameter filters, which
+    // is what the live-push predicate has to check. state and party have no
+    // server param on the public feed, so those stay client-side filters.
+    var field = claimsTicker ? 'ticker' : (kind === 'state' ? 'state' : (kind === 'party' ? 'party' : 'name'));
+    if (claimsTicker) {
+      tickerHint = tokens[i].toUpperCase();
+    } else if (field === 'name') {
+      nameBits.push(tokens[i]);
+    }
+    plan.push({
+      token: tokens[i],
+      // Lower-cased copy for matching; the original casing is kept because
+      // classifySearchToken() has to see what the user typed to spot a ticker.
+      lower: tokens[i].toLowerCase(),
+      kind: kind,
+      field: field,
+      exactTicker: claimsTicker,
+    });
+  }
+  // The exact memberName the request carries, so the predicate applies the same
+  // phrase the server will. If nothing classified, the whole query goes across
+  // as memberName so the server still narrows.
+  var memberName = nameBits.length ? nameBits.join(' ') : (tickerHint ? '' : raw);
+  // That fallback swallows state and party tokens into the phrase, because they
+  // classified successfully but contributed no name bits. Once they are part of
+  // memberName they are filer-name terms, NOT client-side filters — applying
+  // both would add a constraint the request never expressed and make the
+  // predicate narrower than the feed it shadows.
+  if (memberName === raw && raw) {
+    for (var j = 0; j < plan.length; j++) {
+      if (plan[j].field === 'state' || plan[j].field === 'party') plan[j].field = 'name';
     }
   }
-  if (tickerHint) p.set('ticker', tickerHint);
-  if (nameBits.length) p.set('memberName', nameBits.join(' '));
-  // If nothing classified, send whole string as memberName so server still narrows
-  if (!tickerHint && !nameBits.length) p.set('memberName', raw);
+  return { raw: raw, plan: plan, tickerHint: tickerHint, memberName: memberName };
+}
+function applySearchToServerParams(p, q) {
+  var parsed = searchTokenPlan(q);
+  if (!parsed.raw) return;
+  if (parsed.tickerHint) p.set('ticker', parsed.tickerHint);
+  if (parsed.memberName) p.set('memberName', parsed.memberName);
 }
 // See the .row-open-btn CSS comment above for why this exists: a real,
 // named control dropped into a clickable table row's first cell, invisible
@@ -1743,7 +1876,7 @@ function sortVal(r, key) {
   var v = key === 'published' ? seenRaw(r) : r[key];
   if (NUMERIC_SORT[key]) return (v == null ? -Infinity : Number(v));
   if (key === 'txdate' || key === 'traded' || key === 'filed' || key === 'imported' || key === 'published') {
-    if (!v) return sortDir > 0 ? '\uFFFF' : '';
+    if (!v) return sortDir > 0 ? '￿' : '';
     var today = new Date().toISOString().slice(0, 10);
     var dateValue = String(v).toLowerCase();
     return dateValue.slice(0, 10) > today ? today + dateValue.slice(10) : dateValue;
@@ -1849,6 +1982,13 @@ function txToRow(tx) {
     assetType: tx.assetType || '',
     assetTypeName: tx.assetTypeName || '',
     type: (tx.txType === 'P' ? 'B' : tx.txType) || 'B',
+    // A transaction with no txType renders as a buy, which is the historical
+    // display default, but it is NOT a buy to the server: buildTxFilters matches
+    // Buy against stored 'B' and legacy 'P' only, so a NULL tx_type row is
+    // excluded from the feed. Keep the missing state visible so the live-push
+    // matcher can mirror that instead of admitting and counting a row that the
+    // next reload drops.
+    typeKnown: !!(tx.txType === 'P' || tx.txType),
     min: tx.amountMin, max: tx.amountMax,
     txdate: toISODate(tx.txDate) || '',
     owner: tx.owner || '',
@@ -1926,6 +2066,34 @@ function syncPageSizeControl() {
    (chamber/party/side) or the ticker/politician fields would visibly narrow
    the page on the next full reload, then silently widen back out on the next
    30s poll (owner report #2: filtering doesn't change the count). */
+/* Effective date bounds for the trades feed, as {from, to} ISO strings, either
+   of which may be ''.  One definition, two callers: the HTTP query string and
+   the live-push filter predicate have to agree, and keeping two copies of the
+   window arithmetic is how they drifted apart in the first place. */
+function tradesDateBounds() {
+  // Explicit export-dialog dates win over the shared timeframe control.
+  var fromEl = el('qFrom'); var from = (fromEl && fromEl.value) || '';
+  var toEl = el('qTo'); var to = (toEl && toEl.value) || '';
+  var winEl = el('tradesGlobalWindow') || el('trGlobalWindow');
+  var win = (winEl && winEl.value) || '';
+  if (!from && win === 'this_cy') from = new Date().getUTCFullYear() + '-01-01';
+  if (!from && win === 'last_cy') {
+    var y0 = new Date().getUTCFullYear() - 1;
+    from = y0 + '-01-01';
+    if (!to) to = y0 + '-12-31';
+  }
+  // Rolling windows: approximate via from for feed (tx_date)
+  if (!from && win && /^\\d+d$/.test(win)) {
+    var days = parseInt(win, 10);
+    if (days > 0 && days < 40000) {
+      var d = new Date();
+      d.setUTCDate(d.getUTCDate() - days);
+      from = d.toISOString().slice(0, 10);
+    }
+  }
+  return { from: from, to: to };
+}
+
 function tradesFilterParams() {
   var p = new URLSearchParams();
   applySearchToServerParams(p, tradesSearchQuery());
@@ -1939,27 +2107,9 @@ function tradesFilterParams() {
   // Owner follow-up batch #21: the $ threshold UI pill is gone (no $/size
   // dropdown on any platform) — minAmount is no longer sent from here. The
   // server still accepts ?minAmount= for direct API consumers.
-  var fromEl = el('qFrom'); var from = fromEl && fromEl.value; if (from) p.set('from', from);
-  // Shared timeframe → from/to when calendar year (export dialog dates win if set)
-  var winEl = el('tradesGlobalWindow') || el('trGlobalWindow');
-  var win = winEl && winEl.value;
-  if (!from && win === 'this_cy') p.set('from', new Date().getUTCFullYear() + '-01-01');
-  if (!from && win === 'last_cy') {
-    var y0 = new Date().getUTCFullYear() - 1;
-    p.set('from', y0 + '-01-01');
-    var toEl2 = el('qTo');
-    if (!(toEl2 && toEl2.value)) p.set('to', y0 + '-12-31');
-  }
-  // Rolling windows: approximate via from for feed (tx_date)
-  if (!from && win && /^\\d+d$/.test(win)) {
-    var days = parseInt(win, 10);
-    if (days > 0 && days < 40000) {
-      var d = new Date();
-      d.setUTCDate(d.getUTCDate() - days);
-      p.set('from', d.toISOString().slice(0, 10));
-    }
-  }
-  var toEl = el('qTo'); var to = toEl && toEl.value; if (to) p.set('to', to);
+  var db = tradesDateBounds();
+  if (db.from) p.set('from', db.from);
+  if (db.to) p.set('to', db.to);
   return p;
 }
 function tradesQueryParams() {
@@ -2090,7 +2240,7 @@ function syncFilterUrl() {
       if (kv[1] && !(kv[0] === 'fw' && kv[1] === '90d')) u.searchParams.set(kv[0], kv[1]);
       else u.searchParams.delete(kv[0]);
     });
-    window.history.pushState({ view: b.dataset.view }, '', u.pathname + u.search + u.hash);
+    window.history.replaceState({}, '', u.pathname + u.search + u.hash);
   } catch (e) {}
 }
 function restoreFiltersFromUrl() {
@@ -2154,7 +2304,7 @@ function prevTradesPage() { if (tradesPage <= 0 || loadingPage) return; tradesPa
    MAX_PUBLIC_TX_OFFSET in src/security/botDefense.ts, enforced
    unconditionally in delivery/rest.ts). Interpolated, not hand-copied, so
    the pager can never 400. Deeper history is the Premium CSV export. */
-var MAX_PUBLIC_TRADES_OFFSET = ${MAX_PUBLIC_TX_OFFSET};
+var MAX_PUBLIC_TRADES_OFFSET = 2000;
 function nextTradesPage() {
   if (loadingPage) return;
   if ((tradesPage + 1) * tradesPageSize >= totalRows) return;
@@ -2239,6 +2389,23 @@ function startPolling() {
   }, POLL_INTERVAL_MS);
 }
 
+/* Pull the trade rows out of one congress.trade frame.
+
+   The producer (src/delivery/sse.ts formatTradeEvent) emits the shared
+   CongressEvent envelope from createCongressEvent, so the rows live at
+   data.trades — pinned by src/delivery/__tests__/sse.test.ts and consumed the
+   same way by the sibling app. Reading a top-level trades array instead yields
+   [] for every canonical frame, which silently starves the live feed.
+
+   The flattened top-level shape is kept as a fallback for older frames, mirroring
+   the superset payload delivery/webhook.ts sends. The canonical path is tried
+   first so a frame carrying both is not read twice. */
+function tradesFromEventPayload(payload) {
+  if (!payload) return [];
+  if (payload.data && Array.isArray(payload.data.trades)) return payload.data.trades;
+  return Array.isArray(payload.trades) ? payload.trades : [];
+}
+
 function stopStream() {
   if (es) { try { es.close(); } catch (e) {} es = null; }
 }
@@ -2252,12 +2419,12 @@ function startStream() {
   try {
     es = new EventSource('/api/stream?subscription=dashboard');
     es.onopen = function () { setLivePill('live', 'Live'); };
-    // Canonical cross-app event is congress.trade carrying { trades: [...] }
-    // (see congress-trading-shared and src/delivery/sse.ts formatTradeEvent).
+    // Rows arrive inside the shared CongressEvent envelope (see
+    // tradesFromEventPayload above and src/delivery/sse.ts formatTradeEvent).
     es.addEventListener('congress.trade', function (e) {
       try {
         var payload = JSON.parse(e.data);
-        var trades = (payload && payload.trades) || [];
+        var trades = tradesFromEventPayload(payload);
         var changed = false;
         // The stream is a shared broadcast — it carries every new trade
         // regardless of which chamber/party/side/ticker/politician THIS
@@ -2278,8 +2445,21 @@ function startStream() {
           rememberTradeRow(row);
           if (!matchesActiveFilters(row)) continue; // out-of-filter push: doesn't belong in this view
           var alreadyDoc = TRADES.some(function (r) { return r.docId && r.docId === row.docId; });
-          TRADES.unshift(row);
-          TRADES = sortRows(TRADES).slice(0, tradesPageSize);
+          // The stream is at-least-once: a reconnect replays from the resume
+          // cursor, so the same transaction can arrive twice. isNewId only
+          // guarded the COUNTER, and unshift was unconditional — a replay added
+          // a second copy of the row, showing it twice and, at the page-size
+          // limit, evicting a legitimate row.
+          //
+          // Checked against TRADES, not isNewId: TRADE_BY_ID also holds mini-list
+          // rows cached from drawers, so a row we have "seen" may not be listed,
+          // and skipping it there would drop a trade that belongs in the feed.
+          var alreadyListed = TRADES.some(function (r) { return r.id === row.id; });
+          if (!alreadyListed) {
+            TRADES.unshift(row);
+            TRADES = sortRows(TRADES).slice(0, tradesPageSize);
+            changed = true;
+          }
           if (isNewId) {
             // De-duped: a redelivered event for a row we already knew about
             // must not bump the total again. A future poll/reload still
@@ -2287,7 +2467,6 @@ function startStream() {
             if (typeof totalRows === 'number') totalRows += 1;
             if ((row.imported || '').slice(0, 10) === today && row.docId && !alreadyDoc) filingsImportedToday += 1;
           }
-          changed = true;
         }
         if (changed) {
           setTradesKpis();
@@ -2778,7 +2957,7 @@ function statusBadge(status) {
    select, and the Custom Model Selection checkbox grid — only ever offers
    models Jay actually holds a key for, and derives from the ONE backend source
    of truth instead of a hand-maintained copy. */
-var BENCHMARK_CATALOG = ${JSON.stringify(benchmarkSelectableCatalog())};
+var BENCHMARK_CATALOG = [{"provider":"openrouter","model":"mistral/mistral-ocr-latest"},{"provider":"openrouter","model":"openai/gpt-5.6-terra"},{"provider":"openrouter","model":"openai/gpt-5.6-luna"},{"provider":"openrouter","model":"anthropic/claude-sonnet-5"},{"provider":"openrouter","model":"anthropic/claude-haiku-4.5"},{"provider":"openrouter","model":"anthropic/claude-opus-5"},{"provider":"openrouter","model":"x-ai/grok-4.6"},{"provider":"openrouter","model":"deepseek/deepseek-v4-pro"},{"provider":"openrouter","model":"deepseek/deepseek-v4-flash"},{"provider":"openrouter","model":"qwen/qwen3-vl-30b-a3b-instruct"},{"provider":"openrouter","model":"qwen/qwen3-vl-8b-instruct"},{"provider":"openrouter","model":"google/gemini-3.5-flash-lite"},{"provider":"openrouter","model":"amazon/nova-lite-v1"},{"provider":"openrouter","model":"z-ai/glm-4.6v"},{"provider":"openrouter","model":"google/gemini-3.8-flash"},{"provider":"openrouter","model":"~google/gemini-flash-latest"},{"provider":"openrouter","model":"qwen/qwen-2.5-72b-instruct"},{"provider":"llamaparse","model":"fast"},{"provider":"llamaparse","model":"cost-effective"},{"provider":"llamaparse","model":"agentic"}];
 var REREAD_MODELS = BENCHMARK_CATALOG;
 /* <optgroup> per provider for the "Re-read with model…" multi-select. */
 function rereadModelOptionsHtml() {
@@ -3886,7 +4065,7 @@ function createSubscription() {
       function renderResult(dataObj) {
         var result = (dataObj && dataObj.command && dataObj.command.result) || dataObj.result || dataObj;
         var sub = (result && result.subscription) || (dataObj && dataObj.subscription) || null;
-        var secretHtml = '';
+        var secretHtml;
         if (sub && sub.secret) {
           var stream = sub.streamUrl || '';
           secretHtml =
@@ -5935,7 +6114,7 @@ async function runBenchmarkCell(runId, docId, model) {
     } catch (error) {
       if (error.status === 409 && error.details && error.details.code === 'benchmark_attempt_outcome_unknown') {
         if (body.confirmRetryAfterUnknownOutcome === true) {
-          throw new Error('The paid-attempt outcome remained unknown after a confirmed retry; no automatic retry was made.');
+          throw new Error('The paid-attempt outcome remained unknown after a confirmed retry; no automatic retry was made.', { cause: error });
         }
         if (!confirmBenchmarkUnknownOutcomeRetry(docId, model)) {
           var declined = new Error('Retry was not confirmed after an unknown paid-attempt outcome; this saved run remains resumable and may include prior billing.');
@@ -6217,8 +6396,8 @@ function clientBuildMajorityRows(reads) {
       grouped[key].push(tx);
     }
     var hasAmbiguous = false;
-    for (var key in grouped) {
-      if (grouped[key].length > 1) hasAmbiguous = true;
+    for (var groupKey in grouped) {
+      if (grouped[groupKey].length > 1) hasAmbiguous = true;
     }
     return { grouped: grouped, hasAmbiguous: hasAmbiguous };
   });
@@ -6382,7 +6561,7 @@ function runMarketBackfill(dryRun) {
 	var EST_VOLUME_TIP = 'Approximate stock volume from STOCK Act amount ranges.  Option premiums are excluded.  Closed ranges use the midpoint; the open $50M+ range uses its $50,000,001 floor.  Treat as a rough order of magnitude, not an exact figure.';
 	var BUY_PRESSURE_TIP = 'Share of buys among buy+sell trades in the window (buy count / (buys + sells)).  A simple trade-count tilt, not dollar-weighted.';
 	var NET_FLOW_TIP = 'Buy dollars minus sell dollars in the selected window, using STOCK Act bracket midpoints on common stock only ($50M+ uses its floor).  Option premiums are excluded.  A very rough estimate of net direction, not an exact figure.';
-	var NET_FLOW_TIP_ALLTIME = 'Buy dollars minus sell dollars across this asset\u2019s disclosed common-stock trades, using STOCK Act bracket midpoints.  Option premiums are excluded.  A very rough estimate of net direction, not exact.';
+	var NET_FLOW_TIP_ALLTIME = 'Buy dollars minus sell dollars across this asset’s disclosed common-stock trades, using STOCK Act bracket midpoints.  Option premiums are excluded.  A very rough estimate of net direction, not exact.';
 	// Trends "Trades" answers a different question than the Trades tab's own
 	// "N total": this counts trades in the Trends TIME WINDOW + chamber/party/side
 	// chips above (default: past 90 days, all parties, all sides), while the Trades tab
@@ -6476,7 +6655,7 @@ function usdC(n) {
 function netHtml(n) {
   n = Number(n || 0);
   var cls = n > 0 ? 'pos' : n < 0 ? 'neg' : '';
-  var sign = n > 0 ? '+' : n < 0 ? '\u2212' : '';
+  var sign = n > 0 ? '+' : n < 0 ? '−' : '';
   return '<span class="net kpi-money ' + cls + '">' + sign + usdC(Math.abs(n)) + '</span>';
 }
 function splitBar(buys, sells) {
@@ -6968,7 +7147,7 @@ function renderPeopleDirectory(all) {
   // Say what the Trades column counts. It is the politician's FULL record, so
   // it deliberately disagrees with the Trades tab, whose count is scoped to the
   // active time window (Ro Khanna: 22,832 here, 988 in a 3-month window).
-  if (countEl) countEl.textContent = fmtCount(rows.length) + ' of ' + fmtCount((all || []).length) + ' politicians\u00a0\u00a0\u2022\u00a0\u00a0trade counts are all time';
+  if (countEl) countEl.textContent = fmtCount(rows.length) + ' of ' + fmtCount((all || []).length) + ' politicians  •  trade counts are all time';
 }
 /* Single-letter party for the compact Branch • Party • State cell. */
 function dirPartyLetter(p) {
@@ -7163,7 +7342,7 @@ function renderAssetsDirectory(all) {
   }).join('');
   // Same scope note as the People table: these are whole-record totals, not the
   // Trends/Trades time window.
-  if (countEl) countEl.textContent = fmtCount(rows.length) + ' of ' + fmtCount((all || []).length) + ' assets\u00a0\u00a0\u2022\u00a0\u00a0trade counts are all time';
+  if (countEl) countEl.textContent = fmtCount(rows.length) + ' of ' + fmtCount((all || []).length) + ' assets  •  trade counts are all time';
 }
 function filterAssetsDirectory() {
   if (!ASSETS_CACHE || !ASSETS_CACHE.assets) {
@@ -7457,7 +7636,7 @@ function spCardHtml(p, admin) {
   }
 
   /* Lead stat — prefer average (matches human mean lead/lag), show median secondary. */
-  var leadHtml = '';
+  var leadHtml;
   if (!hasTiming) {
     var need = Math.max(0, SPEED_LANE_MIN_MATCHED - (p.matched || 0));
     leadHtml = '<div class="sp-gathering">' +
@@ -8217,7 +8396,7 @@ function seeAllTradesLinkHtml(total, filterQuery) {
   var n = Number(total) || 0;
   var q = String(filterQuery || '').trim();
   if (!n || !q) return '';
-  var label = 'See all ' + fmtCount(n) + ' trade' + (n === 1 ? '' : 's') + ' \u2192';
+  var label = 'See all ' + fmtCount(n) + ' trade' + (n === 1 ? '' : 's') + ' →';
   var href = seeAllTradesHref(q);
   return '<p class="drawer-see-all"><a class="drawer-see-all-link" href="' + esc(href) + '" data-trades-fq="' + esc(q) + '" onclick="return navigateTradesFromDrawer(event, this.dataset.tradesFq)">' + esc(label) + '</a></p>';
 }
@@ -8372,7 +8551,7 @@ function isExtractionNoteKey(k) {
 }
 function looksLikeRawExtractionPayload(text) {
   var t = String(text || '').toLowerCase();
-  if (!/^\\s*[\\[{]/.test(t)) return false;
+  if (!/^\\s*[{[]/.test(t)) return false;
   var hits = 0;
   ['txdate', 'owner', 'ticker', 'txtype', 'amountrange'].forEach(function (k) { if (t.indexOf(k) >= 0) hits++; });
   if (t.indexOf('assetname') >= 0 || t.indexOf('a etname') >= 0 || t.indexOf('asset name') >= 0) hits++;
@@ -9037,7 +9216,7 @@ function renderAccount() {
     // Theme stays out of the signed-out top bar (owner: it dumped Light/Dark/System
     // into the header).  Default is light; theme lives in the hamburger.
     var authGroup = '<span class="acct-auth-group">' +
-      '<a class="btn ghost sm" href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:inline-flex;align-items:center;">iOS app</a>' +
+      '<a class="btn ghost sm" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:inline-flex;align-items:center;">iOS app</a>' +
       '<button class="btn ghost sm" type="button" onclick="openLogin()">Sign In</button>' +
       (checkoutConfigured() ? '<button class="btn sm" type="button" onclick="openPricing()">Upgrade</button>' : '') +
       '</span>';
@@ -9047,7 +9226,7 @@ function renderAccount() {
       (checkoutConfigured() ? '<button class="btn sm" type="button" onclick="closeAcctMobileMenu();openPricing()">Upgrade</button>' : '') +
       '</span>' +
       '<div class="menu-section-label">Mobile App</div>' +
-      '<a class="btn ghost sm" href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" style="width:100%;justify-content:center;text-decoration:none;">iOS app</a>' +
+      '<a class="btn ghost sm" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" style="width:100%;justify-content:center;text-decoration:none;">iOS app</a>' +
       '<div class="menu-section-label">Appearance</div>' +
       themeRowHtml(null, true) +
       adminMenuHtml('closeAcctMobileMenu();') +
@@ -9079,7 +9258,7 @@ function renderAccount() {
           '<div class="menu-section-label">Account</div>' +
           '<button type="button" onclick="closeAcctMenu();openExportCsvDialog()">Export CSV</button>' +
           '<button type="button" onclick="closeAcctMenu();showView(\\'subs\\')">Delivery</button>' +
-          '<a href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" onclick="closeAcctMenu()">iOS app</a>' +
+          '<a href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" onclick="closeAcctMenu()">iOS app</a>' +
           (canManageSubscription()
             ? '<button type="button" onclick="manageBilling()">Manage Subscription</button>'
             : '') +
@@ -9098,7 +9277,7 @@ function renderAccount() {
       '<div class="menu-section-label">Account</div>' +
       '<button type="button" onclick="closeAcctMobileMenu();openExportCsvDialog()">Export CSV</button>' +
       '<button type="button" onclick="closeAcctMobileMenu();showView(\\'subs\\')">Delivery</button>' +
-      '<a class="btn ghost" href="${APP_STORE_URL}" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
+      '<a class="btn ghost" href="https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4" target="_blank" rel="noopener noreferrer" onclick="closeAcctMobileMenu()">iOS app</a>' +
       upgrade +
       (canManageSubscription()
         ? '<button type="button" onclick="closeAcctMobileMenu();manageBilling()">Manage Subscription</button>'
@@ -9434,7 +9613,7 @@ function manageBilling() {
   fetch('/billing/portal', { method: 'POST', credentials: 'same-origin', headers: { 'Idempotency-Key': portalRequestId } })
     .then(function (r) {
       return r.text().then(function (t) {
-        var j = {};
+        var j;
         try { j = t ? JSON.parse(t) : {}; } catch (e) { j = { error: 'Could not open billing portal.' }; }
         return { ok: r.ok, status: r.status, j: j };
       });
@@ -9457,7 +9636,11 @@ function onSharedWindowChange(src) {
   document.querySelectorAll('select.shared-window').forEach(function (sel) {
     if (sel !== src && sel.value !== v) sel.value = v;
   });
-  if (typeof updateTrWindowLabels === 'function') updateTrWindowLabels();
+  // CT-1500: this called updateTrWindowLabels, which does not exist. The real
+  // function is stampWindowChips (see its comment: headings no longer stamp
+  // the window, it refreshes leftover .tr-window-label nodes). The typeof guard
+  // meant the missing call was silent, so no test or lint ever noticed.
+  stampWindowChips();
   if (typeof loadTrends === 'function') loadTrends();
   if (typeof resetTradesPage === 'function') resetTradesPage();
   if (typeof refreshIosFilterSummaries === 'function') refreshIosFilterSummaries();
@@ -9658,7 +9841,7 @@ window.addEventListener('popstate', function (e) {
 /* ============================ TABS + BOOT ============================ */
 function showView(name, scrollId) {
   var aliases = { feed: 'trades', delivery: 'subs', alerts: 'subs', push: 'subs' };
-  var view = aliases.hasOwnProperty(name) ? aliases[name] : name;
+  var view = Object.prototype.hasOwnProperty.call(aliases, name) ? aliases[name] : name;
   var btn = document.querySelector('nav.tabs a[data-view="' + view + '"]');
   if (!btn) return;
   // Premium alone never grants Admin / Review Queue — this is the same
@@ -10588,6 +10771,7 @@ document.addEventListener('mouseover', function(e) {
   chartTt.style.top = (window.scrollY + r.top) + 'px';
   chartTt.classList.add('visible');
 });
+
 
 
 `;

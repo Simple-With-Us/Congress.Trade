@@ -1110,7 +1110,10 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain("p.set('sort', apiSort)");
     // Unified search maps the single query into memberName/ticker server params.
     expect(DASHBOARD_SOURCE).toContain('function applySearchToServerParams(');
-    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', nameBits.join(' '))");
+    // The joined phrase is built once in searchTokenPlan() and both the query
+    // string and the live-push predicate read it, so they cannot drift.
+    expect(DASHBOARD_SOURCE).toContain('function searchTokenPlan(');
+    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', parsed.memberName)");
     expect(DASHBOARD_SOURCE).toContain('function handleTradesTextFilter(');
     expect(DASHBOARD_SOURCE).toContain('tradesRequestSeq');
     expect(DASHBOARD_SOURCE).toContain("arr.textContent = '↕'");
@@ -3612,9 +3615,15 @@ describe('UX P0 review fixes (web)', () => {
   it('gates CSV export as Premium with memberName+from filters and export pricing intent', () => {
     // Unified search → memberName/ticker via applySearchToServerParams (not dual fields).
     expect(DASHBOARD_SOURCE).toContain('applySearchToServerParams(p, tradesSearchQuery())');
-    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', nameBits.join(' '))");
-    expect(DASHBOARD_SOURCE).toContain("if (from) p.set('from', from)");
-    expect(DASHBOARD_SOURCE).toContain("if (to) p.set('to', to)");
+    // The joined phrase is built once in searchTokenPlan() and both the query
+    // string and the live-push predicate read it, so they cannot drift.
+    expect(DASHBOARD_SOURCE).toContain('function searchTokenPlan(');
+    expect(DASHBOARD_SOURCE).toContain("p.set('memberName', parsed.memberName)");
+    // The from/to arithmetic moved into a shared tradesDateBounds() so the HTTP
+    // query string and the live-push filter predicate cannot drift apart again.
+    expect(DASHBOARD_SOURCE).toContain('function tradesDateBounds()');
+    expect(DASHBOARD_SOURCE).toContain("if (db.from) p.set('from', db.from)");
+    expect(DASHBOARD_SOURCE).toContain("if (db.to) p.set('to', db.to)");
     expect(DASHBOARD_SOURCE).toContain("window.location.href = '/api/export/transactions.csv'");
     expect(DASHBOARD_SOURCE).toContain("openPricing('export')");
     expect(DASHBOARD_SOURCE).toContain("intent === 'export'");
@@ -5442,7 +5451,10 @@ describe('Trades-tab count correctness (LANE: trades-count-fix)', () => {
       'partySel',
       'partyParam',
       'tradesSearchQuery',
+      'searchTokenPlan',
+      'classifySearchToken',
       'applySearchToServerParams',
+      'tradesDateBounds',
       'tradesFilterParams',
       'fetchUpdates',
     ]);
@@ -5601,7 +5613,10 @@ describe('Trades-tab count correctness (LANE: trades-count-fix)', () => {
       'partySel',
       'partyParam',
       'tradesSearchQuery',
+      'searchTokenPlan',
+      'classifySearchToken',
       'applySearchToServerParams',
+      'tradesDateBounds',
       'tradesFilterParams',
       'tradesQueryParams',
     ]);
@@ -7005,11 +7020,19 @@ describe('web frontend bug fixes, accessibility enhancements, and mobile polish'
     const chamberAll = DASHBOARD_SOURCE.match(/var CHAMBER_ALL = \[[^\]]*\];/);
     const polDict = DASHBOARD_SOURCE.match(/var COMMON_POLITICIAN_NAMES = \{[\s\S]*?\n\};/);
     if (!chamberAll || !polDict) throw new Error('Declarations not found in DASHBOARD_SOURCE');
-    const [applySearchToServerParamsSrc] = loadDashboardFunctions(['applySearchToServerParams']);
+    // searchTokenPlan carries the token rules and is called by
+    // applySearchToServerParams, so both have to be in the same evaluated scope.
+    const [classifySearchTokenSrc, searchTokenPlanSrc, applySearchToServerParamsSrc] =
+      loadDashboardFunctions([
+        'classifySearchToken',
+        'searchTokenPlan',
+        'applySearchToServerParams',
+      ]);
     const factory = new Function(
       'US_STATE_ABBR',
       'US_STATE_NAME_TO_ABBR',
-      [chamberAll[0], polDict[0], applySearchToServerParamsSrc].join('\n\n') + '\nreturn applySearchToServerParams;',
+      [chamberAll[0], polDict[0], classifySearchTokenSrc, searchTokenPlanSrc, applySearchToServerParamsSrc].join('\n\n') +
+        '\nreturn applySearchToServerParams;',
     );
     const applySearchToServerParams = factory({}, {}) as (p: URLSearchParams, q: string) => void;
 

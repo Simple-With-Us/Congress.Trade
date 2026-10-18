@@ -13,3 +13,11 @@
 # introducing commit stays inside the PR base..head range gitleaks scans, so
 # its finding has to be ignored by fingerprint.
 20e2cd408ebe9d17020cc284aafea19a8c506c0c:app/src/ingestion/__tests__/providerMissingStubClose.test.ts:generic-api-key:398
+#
+# PR #2789 dashboard client lint: same executive-title data family as the
+# executiveTitles.ts entries above, one line lower in the generated client. The rule
+# keys on the word 'secret', and this 2,485-char line is a table of congressional
+# title forms containing 'Secretary of ...'. Longest token is 31 chars at 4.06
+# bits/char (English), and there is no hex or base64 run of 32+ chars anywhere on
+# the line. Not a secret -- and the table is already on main, unchanged.
+f8e29727fd0d58fc76f6b74a1f83b59ad37278f1:app/src/ui/dashboardClient.ts:generic-api-key:270

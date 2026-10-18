@@ -17,7 +17,10 @@
     "preview:provision": "bash scripts/provision-preview.sh",
     "preview:deploy": "bash scripts/deploy-preview.sh",
     "sentry:sourcemaps": "node ../scripts/sentry-upload-browser-sourcemaps.mjs",
-    "postdeploy": "if [ -n \"$SENTRY_AUTH_TOKEN\" ] && [ -n \"${SENTRY_RELEASE:-$CT_BUILD_SHA$SOURCE_COMMIT}\" ]; then npm run sentry:sourcemaps || echo '::warning::sentry sourcemaps upload failed (non-fatal)'; else echo '::warning::SENTRY_AUTH_TOKEN or release SHA not set; skipping sentry sourcemaps upload'; fi"
+    "postdeploy": "if [ -n \"$SENTRY_AUTH_TOKEN\" ] && [ -n \"${SENTRY_RELEASE:-$CT_BUILD_SHA$SOURCE_COMMIT}\" ]; then npm run sentry:sourcemaps || echo '::warning::sentry sourcemaps upload failed (non-fatal)'; else echo '::warning::SENTRY_AUTH_TOKEN or release SHA not set; skipping sentry sourcemaps upload'; fi",
+    "build:client": "deno run -A scripts/build-dashboard-client.ts",
+    "check:client": "deno run -A scripts/build-dashboard-client.ts --check",
+    "lint:client": "eslint src/ui/client/dashboard.js"
   },
   "imports": {
     "#sentry": {
@@ -40,16 +43,19 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@fontsource/zilla-slab": "^5.3.0",
-        "@sentry/cli": "^3.8.0",
-        "@types/node": "26.6.5",
+    "@sentry/cli": "^3.8.0",
+    "@types/node": "26.6.5",
     "@typescript-eslint/eslint-plugin": "^8.71.0",
     "@typescript-eslint/parser": "^8.71.0",
     "@vitest/coverage-v8": "^5.0.3",
     "eslint": "^10.12.0",
+    "globals": "^17.13.0",
+    "jsdom": "^30.1.3",
     "typescript": "^5.6.3",
-    "vitest": "^5.0.3",
-    "vite": "^8.3.2"
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
   },
   "overrides": {
     "undici": "^8.0.0"

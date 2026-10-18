@@ -1,0 +1,998 @@
+/**
+ * src/ui/__tests__/dashboardClient.test.ts
+ *
+ * CT-1500: the first tests that actually RUN the dashboard's browser JavaScript.
+ *
+ * The 546 KB of client code shipped as a TypeScript template literal, so `tsc`
+ * saw a string and eslint saw nothing. dashboardHtml.test.ts closes part of that
+ * gap by asserting on `toContain` patterns and compiling individual functions
+ * with `new Function` (which parses without executing). This file takes the
+ * other half: it boots the whole script inside a jsdom window built from the
+ * real document, then calls the pure functions and asserts on their return
+ * values. Behaviour, not markup.
+ *
+ * Why the whole script and not more `new Function` extraction: `new Function`
+ * can only reach one function at a time and needs its dependencies hand-fed, so
+ * it structurally cannot catch a broken dependency — which is exactly how
+ * `makeTradesFilterMatcher` stayed referenced-but-undefined for months. Booting
+ * the real script means every top-level declaration exists, so a call that
+ * resolves here resolves in the browser too.
+ *
+ * What is NOT asserted here: rendering, network calls, and interaction. Those
+ * need a real browser (Playwright), which this file deliberately does not fake.
+ */
+
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { JSDOM, VirtualConsole } from 'jsdom';
+import { DASHBOARD_HTML } from '../dashboardHtml.ts';
+import { DASHBOARD_APP_JS } from '../dashboardClient.ts';
+import { formatTradeEvent } from '../../delivery/sse.ts';
+import type { Transaction } from '../../shared/types.ts';
+
+/** The subset of window the tests actually call. Kept narrow on purpose: a
+ *  broad `any` here would let a typo in a function name pass as a test. */
+type Client = {
+  fmtCount: (n: number | string | null) => string;
+  ordinalSuffix: (n: number) => string;
+  fmtDistrictOrdinal: (n: number | null) => string;
+  fmtBracketAmount: (n: number | null) => string;
+  fmtName: (raw: string) => string;
+  fmtCompany: (raw: string) => string;
+  fmtDuration: (seconds: number) => string;
+  fmtMs: (ms: number) => string;
+  pctText: (v: number) => string;
+  pluralCount: (n: number, one: string, many?: string) => string;
+  tradeRowMatchesSearch: (row: Record<string, string>, query: string) => boolean;
+  applySearchToServerParams: (params: URLSearchParams, query: string) => void;
+  makeTradesFilterMatcher: () => (row: Record<string, string>) => boolean;
+  tradesFromEventPayload: (payload: unknown) => Array<Record<string, unknown>>;
+  startStream: () => void;
+  stopStream: () => void;
+  resolveViewId: (raw: string) => string;
+  windowLabel: (v: string) => string;
+  amountTier: (amount: number) => string;
+  parsePx: (raw: string) => number;
+  clampNum: (v: number, lo: number, hi: number) => number;
+  entityFingerprint: (s: string) => string;
+  isJunkAssetString: (s: string) => boolean;
+  cleanAsset: (s: string) => string;
+  esc: (s: string) => string;
+  sortRows: (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+  txToRow: (tx: Partial<Transaction>) => Record<string, unknown>;
+};
+
+let dom: JSDOM;
+let win: Window & typeof globalThis & Record<string, unknown>;
+let client: Client;
+let timers: Array<ReturnType<typeof setInterval>> = [];
+
+/**
+ * The script ends with `setInterval(refreshSpeedUpdated, 60000)` and starts
+ * polling. Vitest would wait for those handles forever, so they are captured
+ * and cleared rather than left to hang the run.
+ */
+function trackTimer<T extends (...args: never[]) => unknown>(fn: T, ms: number): T {
+  const wrapped = ((...args: Parameters<T>) => {
+    // Never actually fire: these are UI refresh loops, not logic under test.
+    return undefined;
+  }) as unknown as T;
+  timers.push(setInterval(wrapped, ms) as ReturnType<typeof setInterval>);
+  return wrapped;
+}
+
+beforeAll(() => {
+  // The script logs through these; swallow rather than pollute test output.
+  const virtualConsole = new VirtualConsole();
+  virtualConsole.on('jsdomError', () => {});
+
+  dom = new JSDOM(DASHBOARD_HTML, {
+    runScripts: 'outside-only',
+    url: 'http://localhost/',
+    pretendToBeVisual: true,
+    virtualConsole,
+  });
+
+  win = dom.window as unknown as Window & typeof globalThis & Record<string, unknown>;
+
+  // jsdom has no matchMedia; the script already guards every use with
+  // `window.matchMedia &&`, so leaving it undefined exercises the real guard.
+  win.fetch = vi.fn(() => Promise.resolve(new Response('{}', {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  }))) as unknown as typeof fetch;
+  win.setInterval = trackTimer as unknown as typeof setInterval;
+  win.clearInterval = ((h?: ReturnType<typeof setInterval>) => {
+    if (h) clearInterval(h as unknown as NodeJS.Timeout);
+  }) as typeof clearInterval;
+
+  // The real boot. `runScripts: 'outside-only'` means the document's own inline
+  // boot script did not execute, so the DOM is the served markup untouched.
+  win.eval(DASHBOARD_APP_JS);
+
+  client = win as unknown as Client;
+}, 120_000);
+
+afterAll(() => {
+  for (const t of timers) clearInterval(t as unknown as NodeJS.Timeout);
+  timers = [];
+  dom?.window.close();
+});
+
+/**
+ * One trade as the SERVER actually frames it: run the real producer
+ * (delivery/sse.ts formatTradeEvent) and parse its data: line.
+ *
+ * Deliberately not a hand-written fixture. Writing the envelope out by hand here
+ * would put the same spelling on both sides of the assertion and test the
+ * fixture rather than the wire — the exact trap that let the party filter
+ * compare a raw label against a bucket code, and that would let this client
+ * drift from the producer again the moment either side changed.
+ */
+const SERVER_FRAME = (() => {
+  const frame = formatTradeEvent({
+    id: 'tx_envelope_1',
+    cursorSeq: 99,
+    ticker: 'AAPL',
+    txType: 'buy',
+    // Dated today on purpose: the shipped document has a rolling window select
+    // active, so an undated trade is correctly rejected by the matcher. Leaving
+    // the date off would make this test assert the rejection instead of the
+    // read, and go green even with the old top-level-only handler.
+    txDate: new Date().toISOString(),
+  } as unknown as Transaction);
+  const dataLine = frame.split('\n').find((l) => l.startsWith('data: '));
+  if (!dataLine) throw new Error('formatTradeEvent produced no data: line');
+  return JSON.parse(dataLine.slice('data: '.length)) as Record<string, unknown>;
+})();
+
+describe('dashboard client boots as a classic script (CT-1500)', () => {
+  it('evaluates the whole script without throwing', () => {
+    // If this fails, the document would ship a blank page. Every other test in
+    // this file is downstream of it.
+    expect(() => win.eval(DASHBOARD_APP_JS)).not.toThrow();
+  });
+
+  it('puts the declarations inline handlers depend on on window', () => {
+    // ~163 inline onclick/onchange attributes in the markup resolve these as bare
+    // globals at dispatch time. If any of these is missing, a handler dies
+    // silently on click — which is why the boot being a CLASSIC script matters.
+    for (const name of ['esc', 'el', 'fmtCount', 'loadTrades', 'setTickerSort', 'showView']) {
+      expect(typeof win[name], name).toBe('function');
+    }
+  });
+
+  it('defines makeTradesFilterMatcher, which the SSE handler calls', () => {
+    // Regression guard for the exact bug eslint's no-undef found: the function
+    // was deleted in 06993059 along with its renderTrades() caller, but the SSE
+    // congress.trade handler kept calling it. PUBLIC_STREAM_ENABLED is false
+    // today so the line never ran, which is why nothing noticed.
+    expect(typeof client.makeTradesFilterMatcher).toBe('function');
+  });
+
+  it('defines tradesFromEventPayload, which the congress.trade handler calls', () => {
+    // Same shape of bug as makeTradesFilterMatcher: the handler calls it, so it
+    // has to exist. PUBLIC_STREAM_ENABLED is false today so the call never
+    // runs in the browser, which is exactly how a missing one goes unnoticed.
+    expect(typeof client.tradesFromEventPayload).toBe('function');
+  });
+
+  it('defines stampWindowChips, which replaced the never-defined updateTrWindowLabels', () => {
+    expect(typeof win['stampWindowChips']).toBe('function');
+    expect(win['updateTrWindowLabels']).toBeUndefined();
+  });
+});
+
+describe('formatters', () => {
+  it('fmtCount groups thousands and renders an em dash for nothing', () => {
+    // fmtCount is a grouped-number formatter, not an abbreviator: 1,500,000 is
+    // the correct output, and abbreviating a trade count would be a lie about
+    // precision on the number that IS displayed.
+    expect(client.fmtCount(999)).toBe('999');
+    expect(client.fmtCount(1000)).toBe('1,000');
+    expect(client.fmtCount(1_500_000)).toBe('1,500,000');
+    expect(client.fmtCount(null)).toBe('—');
+    expect(client.fmtCount('')).toBe('—');
+    expect(client.fmtCount('not a number')).toBe('not a number');
+  });
+
+  it('ordinalSuffix handles the 11/12/13 exception', () => {
+    expect(client.ordinalSuffix(1)).toBe('st');
+    expect(client.ordinalSuffix(2)).toBe('nd');
+    expect(client.ordinalSuffix(3)).toBe('rd');
+    expect(client.ordinalSuffix(4)).toBe('th');
+    // The classic trap: 11th/12th/13th, not 11st/12nd/13rd.
+    expect(client.ordinalSuffix(11)).toBe('th');
+    expect(client.ordinalSuffix(12)).toBe('th');
+    expect(client.ordinalSuffix(13)).toBe('th');
+    expect(client.ordinalSuffix(21)).toBe('st');
+    expect(client.ordinalSuffix(111)).toBe('th');
+  });
+
+  it('fmtDistrictOrdinal renders 0 and null distinctly from a real district', () => {
+    expect(client.fmtDistrictOrdinal(null)).not.toContain('0');
+    expect(client.fmtDistrictOrdinal(1)).toMatch(/1st/);
+    expect(client.fmtDistrictOrdinal(12)).toMatch(/12th/);
+  });
+
+  it('fmtBracketAmount abbreviates by magnitude and keeps the sign', () => {
+    // One amount, not a range: the caller formats the two bounds of a
+    // transaction's disclosed bracket separately.
+    expect(client.fmtBracketAmount(999)).toBe('$999');
+    expect(client.fmtBracketAmount(1_500)).toBe('$1.5k');
+    expect(client.fmtBracketAmount(2_500_000)).toBe('$2.5m');
+    expect(client.fmtBracketAmount(3_620_000_000_000)).toBe('$3.62t');
+    // A negative amount keeps its sign rather than reading as a magnitude.
+    expect(client.fmtBracketAmount(-1_500)).toBe('-$1.5k');
+    expect(client.fmtBracketAmount(null)).toBe('—');
+  });
+
+  it('pluralCount picks singular or plural', () => {
+    expect(client.pluralCount(1, 'trade')).toBe('1 trade');
+    expect(client.pluralCount(2, 'trade')).toBe('2 trades');
+  });
+
+  it('windowLabel maps window codes to human labels and passes unknown ones through', () => {
+    expect(client.windowLabel('90d')).toBe('3 Months');
+    expect(client.windowLabel('this_cy')).toBe('This Year');
+    // Unknown input must not become undefined text in the UI.
+    expect(client.windowLabel('nonsense')).toBe('nonsense');
+  });
+
+  it('esc escapes the characters that would break out of an attribute', () => {
+    expect(client.esc('a"b')).toBe('a&quot;b');
+    expect(client.esc('a<b')).not.toContain('<b');
+    expect(client.esc('a&b')).toMatch(/&/);
+  });
+});
+
+describe('tradeRowMatchesSearch — multi-token AND matching', () => {
+  const row = {
+    member: 'Ro Khanna', ticker: 'MSFT', asset: 'Microsoft Corp',
+    st: 'CA', state: 'California', party: 'D',
+  };
+
+  it('matches everything on an empty query', () => {
+    expect(client.tradeRowMatchesSearch(row, '')).toBe(true);
+    expect(client.tradeRowMatchesSearch(row, '   ')).toBe(true);
+  });
+
+  it('matches a token against the field its own server parameter filters', () => {
+    expect(client.tradeRowMatchesSearch(row, 'khanna')).toBe(true);   // memberName -> filer name
+    expect(client.tradeRowMatchesSearch(row, 'MSFT')).toBe(true);     // ticker=     -> exact ticker
+  });
+
+  it('mirrors the query the builder actually sends, including where it is odd', () => {
+    // A state-only query is the interesting case. classifySearchToken reads "CA"
+    // as a state, but the builder's fallback fires on "no ticker and no name
+    // bits" rather than on "nothing classified", so it sends memberName=CA and
+    // the server filters it against FILER NAMES. This row is in California and
+    // its filer is not named anything containing "ca", so the feed excludes it
+    // and so must the live path.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'CA');
+    expect(p.get('memberName')).toBe('CA');
+    expect(p.get('ticker')).toBeNull();
+    expect(client.tradeRowMatchesSearch(row, 'CA')).toBe(false);
+    // The same query when the filer's name does contain the token.
+    expect(client.tradeRowMatchesSearch({ ...row, member: 'Carson Vacar' }, 'CA')).toBe(true);
+  });
+
+  it('does not also apply a state filter the request swallowed into memberName', () => {
+    // "CA" classified as a state, but the fallback folds the whole query into
+    // memberName, so the server filters filer NAMES and the state token is not
+    // a constraint the request expressed. Applying it anyway made the predicate
+    // narrower than the feed: the Ohio filer "Carey" that memberName=CA returns
+    // would never be admitted live.
+    const ohioCarey = { ...row, member: 'Carey', st: 'OH', state: 'Ohio' };
+    expect(client.tradeRowMatchesSearch(ohioCarey, 'CA')).toBe(true);
+    // When a name token is present the fallback does NOT fire, so the state
+    // token stays a real client-side filter — that is the documented behaviour
+    // and the only narrowing for it.
+    expect(client.tradeRowMatchesSearch({ ...row, st: 'OH', state: 'Ohio' }, 'khanna CA')).toBe(false);
+    expect(client.tradeRowMatchesSearch(row, 'khanna CA')).toBe(true);
+  });
+
+  it('matches multiple name tokens as ONE phrase, the way the server does', () => {
+    // "Khanna Ro" becomes a single LIKE '%khanna ro%'. "Ro Khanna" does not
+    // satisfy that phrase even though it contains both words, so testing the
+    // tokens one at a time made the client accept rows the feed excludes.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'Khanna Ro');
+    expect(p.get('memberName')).toBe('Khanna Ro');
+    expect(client.tradeRowMatchesSearch(row, 'Khanna Ro')).toBe(false);
+    expect(client.tradeRowMatchesSearch(row, 'Ro Khanna')).toBe(true);
+  });
+
+  it('does NOT let a name-bound token match the asset name', () => {
+    // The regression this predicate used to have. memberName filters the FILER's
+    // name on the server and never looks at the asset, so "microsoft" finds
+    // nothing in the HTTP feed — but it matched this row's asset here, so a
+    // streamed trade was inserted and counted, then removed on the next reload.
+    expect(client.tradeRowMatchesSearch(row, 'microsoft')).toBe(false);
+    // Nor the ticker: a lower-cased "msft" is a name-bound token, so it is
+    // matched against the filer's name and not against this row's ticker.
+    // (Upper-case "MSFT" is the ticker token and DOES match — that is correct.)
+    expect(client.tradeRowMatchesSearch({ ...row, member: 'Jane Doe' }, 'msft')).toBe(false);
+    expect(client.tradeRowMatchesSearch({ ...row, member: 'Jane Doe' }, 'MSFT')).toBe(true);
+  });
+
+  it('requires EVERY token to match (AND, not OR)', () => {
+    expect(client.tradeRowMatchesSearch(row, 'khanna CA')).toBe(true);
+    expect(client.tradeRowMatchesSearch(row, 'khanna tesla')).toBe(false);
+  });
+
+  it('is order-independent', () => {
+    expect(client.tradeRowMatchesSearch(row, 'khanna ca')).toBe(true);
+  });
+
+  it('matches on a name part, not only a prefix of the whole name', () => {
+    expect(client.tradeRowMatchesSearch(row, 'kha')).toBe(true);
+  });
+
+  // The HTTP feed is the reference: applySearchToServerParams keys the request
+  // on the FIRST ticker-shaped token and folds the rest into memberName, which
+  // the server matches as a substring. The live path has to agree or a row
+  // shows up live and disappears on reload.
+  const aaplRo = {
+    member: 'Ro Khanna', ticker: 'AAPL', asset: 'Apple Inc',
+    st: 'CA', state: 'California', party: 'D',
+  };
+
+  it('matches a second ticker-shaped token as a substring, not an exact ticker', () => {
+    expect(client.tradeRowMatchesSearch(aaplRo, 'AAPL RO')).toBe(true);
+    expect(client.tradeRowMatchesSearch(aaplRo, 'AAPL Khanna')).toBe(true);
+  });
+
+  it('still applies exact matching to the token the request is keyed on', () => {
+    // AAPL is the ticker= token, so it stays exact: AAPLX must not slip in.
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'AAPLX' }, 'AAPL RO')).toBe(false);
+  });
+
+  it('keys exact matching on the FIRST ticker-shaped token, whichever it is', () => {
+    // Not order-independent for ticker-shaped tokens, and deliberately so:
+    // "RO KHANNA" asks the server for ticker=RO, so the client has to agree with
+    // that rather than be cleverer than the request it is filtering.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'RO KHANNA');
+    expect(p.get('ticker')).toBe('RO');
+    expect(p.get('memberName')).toBe('KHANNA');
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'AAPL' }, 'RO KHANNA')).toBe(false);
+    // An RO-ticker row matches on the exact token, then on the filer's name.
+    expect(client.tradeRowMatchesSearch({ ...aaplRo, ticker: 'RO' }, 'RO KHANNA')).toBe(true);
+  });
+
+  it('builds the same query the matcher assumes', () => {
+    // The two halves of the parity: if this ever stops being ticker=AAPL +
+    // memberName=RO, the exact-match rule above is pinned to the wrong token.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'AAPL RO');
+    expect(p.get('ticker')).toBe('AAPL');
+    expect(p.get('memberName')).toBe('RO');
+  });
+});
+
+describe('applySearchToServerParams — filter-to-query builder', () => {
+  it('leaves the params untouched for an empty query', () => {
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, '');
+    expect([...p.keys()]).toEqual([]);
+  });
+
+  it('classifies a bare ticker as a ticker, not a name', () => {
+    // A bare all-caps token is the shape of a ticker; treating it as a member
+    // name would send a query the server answers with nothing.
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'AAPL');
+    expect(p.get('ticker')).toBe('AAPL');
+    expect(p.get('memberName')).toBeNull();
+  });
+
+  it('classifies a two-word name as memberName', () => {
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'Ro Khanna');
+    expect(p.get('memberName')).toBeTruthy();
+  });
+
+  it('splits a mixed query into both a name and a ticker hint', () => {
+    const p = new URLSearchParams();
+    client.applySearchToServerParams(p, 'Khanna MSFT');
+    expect(p.get('ticker')).toBe('MSFT');
+    expect(p.get('memberName')).toBeTruthy();
+  });
+});
+
+describe('tradesFromEventPayload — the congress.trade envelope', () => {
+  it('reads the rows out of a real server frame', () => {
+    // The regression guard: the handler used to read a top-level trades array,
+    // which is [] for every frame formatTradeEvent emits, so the live feed was
+    // silently starved. Asserting against the producer's own output means this
+    // test fails if the envelope moves again.
+    const trades = client.tradesFromEventPayload(SERVER_FRAME);
+    expect(Array.isArray(trades)).toBe(true);
+    expect(trades).toHaveLength(1);
+    expect(trades[0].id).toBe('tx_envelope_1');
+  });
+
+  it('still accepts the flattened top-level shape', () => {
+    // Compatibility fallback for older frames, mirroring the superset payload
+    // delivery/webhook.ts posts.
+    expect(client.tradesFromEventPayload({ trades: [{ id: 'flat' }] })).toEqual([{ id: 'flat' }]);
+  });
+
+  it('prefers the canonical envelope when a frame carries both', () => {
+    // A superset payload really does carry both shapes. Reading both would
+    // double-count the row, so the canonical path has to win outright.
+    const both = { data: { trades: [{ id: 'canonical' }] }, trades: [{ id: 'flattened' }] };
+    expect(client.tradesFromEventPayload(both)).toEqual([{ id: 'canonical' }]);
+  });
+
+  it('returns [] instead of throwing on frames it cannot read', () => {
+    // Malformed frames must not kill the handler; it is one live push among
+    // many and the page is still usable without it.
+    for (const bad of [
+      null, undefined, {}, 'raw', 42,
+      { data: null }, { data: {} }, { data: { trades: null } }, { data: { trades: 'nope' } },
+      { trades: null }, { trades: {} }, { trades: 7 },
+    ]) {
+      expect(client.tradesFromEventPayload(bad)).toEqual([]);
+    }
+  });
+});
+
+describe('the congress.trade handler is wired to the envelope (end to end)', () => {
+  // tradesFromEventPayload being correct does not prove the handler CALLS it.
+  // That distinction is the whole bug: a correct helper wired to nothing, or a
+  // handler reading a different path, both look green here and starve the feed.
+  // PUBLIC_STREAM_ENABLED is false in production, so the wiring has to be forced
+  // open for any of this to be observable at all.
+  // A function, not a const: describe bodies run before beforeAll, so a
+  // module-level alias would capture win while it is still undefined.
+  const w = () => win as unknown as Record<string, unknown>;
+  type Handler = (e: { data: string }) => void;
+  type PushResult = { trades: Array<Record<string, unknown>>; totalRows: number };
+
+  /**
+   * Drive one congress.trade frame through the real handler and report what the
+   * page ended up holding.
+   *
+   * The globals are saved and restored so each case starts clean, which means
+   * the result has to be captured INSIDE the try — reading it afterwards would
+   * just re-read the original empty array the restore put back.
+   */
+  function pushFrames(payloads: unknown[]): PushResult {
+    const listeners: Record<string, Handler> = {};
+    class FakeEventSource {
+      readyState = 1;
+      close() {}
+      addEventListener(type: string, fn: Handler) { listeners[type] = fn; }
+    }
+    const s = w();
+    const saved = {
+      flag: s['PUBLIC_STREAM_ENABLED'],
+      src: win['EventSource'],
+      es: s['es'],
+      TRADES: s['TRADES'],
+      TRADE_BY_ID: s['TRADE_BY_ID'],
+      totalRows: s['totalRows'],
+      tradesPage: s['tradesPage'],
+      cursor: s['cursor'],
+    };
+    s['PUBLIC_STREAM_ENABLED'] = true;
+    s['EventSource'] = FakeEventSource;
+    s['TRADES'] = [];
+    s['TRADE_BY_ID'] = {};
+    s['totalRows'] = 0;
+    s['tradesPage'] = 0;
+    s['cursor'] = 0;
+    let result: PushResult = { trades: [], totalRows: 0 };
+    try {
+      (client.startStream as () => void)();
+      expect(typeof listeners['congress.trade'], 'handler registered').toBe('function');
+      // All frames go through ONE connection and ONE TRADES list, so a repeat
+      // sees the row the previous frame inserted.
+      for (const payload of payloads) {
+        listeners['congress.trade']({ data: JSON.stringify(payload) });
+      }
+      result = {
+        trades: s['TRADES'] as Array<Record<string, unknown>>,
+        totalRows: s['totalRows'] as number,
+      };
+    } finally {
+      s['PUBLIC_STREAM_ENABLED'] = saved.flag;
+      s['EventSource'] = saved.src;
+      s['TRADES'] = saved.TRADES;
+      s['TRADE_BY_ID'] = saved.TRADE_BY_ID;
+      s['totalRows'] = saved.totalRows;
+      s['tradesPage'] = saved.tradesPage;
+      s['cursor'] = saved.cursor;
+      (client.stopStream as () => void)();
+    }
+    return result;
+  }
+
+  /** Convenience for the single-frame cases. */
+  function pushFrame(payload: unknown): PushResult {
+    return pushFrames([payload]);
+  }
+
+  it('adds a row to TRADES from a canonical data.trades frame', () => {
+    const out = pushFrame(SERVER_FRAME);
+    expect(out.trades).toHaveLength(1);
+    expect(out.trades[0].ticker).toBe('AAPL');
+    // The displayed total moves too — this is the second half of "live rows are
+    // never updated", which a row-only assertion would miss.
+    expect(out.totalRows).toBe(1);
+  });
+
+  it('accepts a flattened frame through the same path', () => {
+    const out = pushFrame({
+      trades: [{
+        id: 'tx_flat_1', cursorSeq: 5, ticker: 'MSFT', txType: 'sell',
+        txDate: new Date().toISOString(),
+      }],
+    });
+    expect(out.trades).toHaveLength(1);
+    expect(out.trades[0].ticker).toBe('MSFT');
+  });
+
+  it('survives a frame it cannot read without touching TRADES', () => {
+    const out = pushFrame({ nothing: 'useful' });
+    expect(out.trades).toEqual([]);
+    expect(out.totalRows).toBe(0);
+  });
+
+  it('does not list a replayed transaction twice', () => {
+    // The stream is at-least-once: a reconnect replays from the resume cursor, so
+    // the same transaction arrives again. The counter was guarded but the
+    // unshift was not, so the row appeared twice in the table.
+    const out = pushFrames([SERVER_FRAME, SERVER_FRAME]);
+    expect(out.trades).toHaveLength(1);
+    // And the total must still move exactly once.
+    expect(out.totalRows).toBe(1);
+  });
+
+  it('still lists a transaction that is new to the feed', () => {
+    // The dedupe has to be against TRADES, not "have we seen this id": a row
+    // cached from a drawer is in TRADE_BY_ID but not yet in the feed, and
+    // skipping it there would drop a trade that belongs in the table.
+    const other = {
+      type: 'congress.trade', id: '1', emittedAt: new Date().toISOString(),
+      data: {
+        trades: [{
+          id: 'tx_second', cursorSeq: 100, ticker: 'MSFT', txType: 'sell',
+          txDate: new Date().toISOString(),
+        }],
+      },
+    };
+    const out = pushFrames([SERVER_FRAME, other]);
+    expect(out.trades).toHaveLength(2);
+    expect(out.totalRows).toBe(2);
+  });
+});
+
+describe('makeTradesFilterMatcher — the live-push filter', () => {
+  // txdate is today's UTC date so the date window is never the reason a
+  // dimension-specific assertion below fails. These tests isolate chamber,
+  // side, party and search; the real document ships a live rolling-window
+  // select, so without a date the matcher would reject the row for an unrelated
+  // reason (a bound is active and an undated row cannot satisfy it).
+  const row = {
+    chamber: 'house',
+    type: 'Purchase',
+    member: 'Ro Khanna',
+    st: 'CA',
+    txdate: new Date().toISOString().slice(0, 10),
+  };
+
+  it('accepts everything when no filter is active', () => {
+    const match = client.makeTradesFilterMatcher();
+    expect(match(row)).toBe(true);
+  });
+
+  it('excludes a row whose chamber is not selected', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    // Stand in the DOM-derived filter state; the real one depends on the
+    // chip markup, which this document does have but with nothing selected.
+    (win as Record<string, unknown>)['chipSel'] = () => ['senate'];
+    (win as Record<string, unknown>)['chamberParam'] = () => 'senate';
+    try {
+      expect(client.makeTradesFilterMatcher()(row)).toBe(false);
+      expect(client.makeTradesFilterMatcher()({ ...row, chamber: 'senate' })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+    }
+  });
+
+  it('honours the empty-selection-means-all semantics', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    try {
+      // No chamber selected = ALL branches, including unresolved-chamber rows.
+      expect(client.makeTradesFilterMatcher()({ ...row, chamber: 'executive' })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+    }
+  });
+
+  it('excludes a row whose type is not selected, and one whose type is unknown', () => {
+    // txToRow renders a transaction with no txType as 'B', but the server's Buy
+    // filter matches stored 'B' and legacy 'P' only — so a NULL tx_type row is
+    // absent from the feed and must be absent here too. Matching on r.type
+    // alone admitted and counted it, and it vanished on the next reload.
+    const origParam = win['selectedSideParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['selectedSideParam'] = () => 'B';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'B', typeKnown: true })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'S', typeKnown: true })).toBe(false);
+      // Renders as a buy, is not a buy to the server.
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'B', typeKnown: false })).toBe(false);
+      // And with no side chip selected there is nothing to reject it on.
+      (win as Record<string, unknown>)['selectedSideParam'] = () => '';
+      expect(client.makeTradesFilterMatcher()({ ...row, type: 'B', typeKnown: false })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['selectedSideParam'] = origParam;
+    }
+  });
+
+  it('keeps a legacy P transaction a known buy, and only an absent type unknown', () => {
+    // Driven through the real txToRow rather than by hand-writing the row the
+    // matcher consumes: a matcher test that spells the row the same way the
+    // producer does only proves the two halves of this file agree with each
+    // other. The producer is the thing that has to be right.
+    // one that would have gone green for the wrong reason. In-window, because
+    // txToRow's output is spread over the shared fixture and an empty txdate
+    // would otherwise be rejected by the rolling window instead of the side
+    // filter this test is about.
+    const today = new Date().toISOString().slice(0, 10);
+    const legacy = client.txToRow({ txType: 'P', txDate: today } as Partial<Transaction>);
+    const absent = client.txToRow({ txDate: today } as Partial<Transaction>);
+    const modern = client.txToRow({ txType: 'B', txDate: today } as Partial<Transaction>);
+
+    expect([legacy.type, legacy.typeKnown]).toEqual(['B', true]);
+    // No txType: renders as a buy (the historical display default) but is not
+    // one to the server, which reads stored 'B' and legacy 'P' only.
+    expect([absent.type, absent.typeKnown]).toEqual(['B', false]);
+    expect([modern.type, modern.typeKnown]).toEqual(['B', true]);
+
+    const origParam = win['selectedSideParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['selectedSideParam'] = () => 'B';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, ...legacy })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, ...modern })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, ...absent })).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['selectedSideParam'] = origParam;
+    }
+  });
+
+  // Codex found this on the restored function: the matcher filtered chamber and
+  // side but not party, while the HTTP feed does pass partyParam('qPartyGroup').
+  // It predates this change, but the function is being re-enabled here.
+  it('excludes a row whose party is not selected', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => 'D';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'R' })).toBe(false);
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'D' })).toBe(true);
+      // Rows that only carry the bucket spelling must still be filtered.
+      expect(client.makeTradesFilterMatcher()({ ...row, partyBucket: 'R' })).toBe(false);
+      expect(client.makeTradesFilterMatcher()({ ...row, partyBucket: 'D' })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+    }
+  });
+
+  // The test above only ever used bucket codes, which is exactly why it passed
+  // while the real feed would have failed. mapFeedTransaction() copies
+  // fl.party through unchanged (delivery/rows.ts:322) and the feed SELECT
+  // aliases the full label, so a streamed row arrives as 'Democratic', not 'D'.
+  // Comparing that against the chip's 'D' rejects every row while a chip is on.
+  it('matches the chip bucket against the row\'s full party label', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => 'D';
+    try {
+      // The failure this pins: with 'D' selected, a Democratic row must PASS.
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Democratic' })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Republican' })).toBe(false);
+      // Minor parties and Independents are 'O' on both sides of the filter.
+      (win as Record<string, unknown>)['partyParam'] = () => 'O';
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Independent' })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'Democratic' })).toBe(false);
+      // The server's PARTY_BUCKET_SQL_LOCAL ELSE branch is 'O', never NULL, so a
+      // row with no party on file belongs to the "Other / No party" chip.
+      (win as Record<string, unknown>)['partyParam'] = () => 'O';
+      expect(client.makeTradesFilterMatcher()({ ...row, party: '' })).toBe(true);
+      (win as Record<string, unknown>)['partyParam'] = () => 'D';
+      expect(client.makeTradesFilterMatcher()({ ...row, party: '' })).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+    }
+  });
+
+  it('accepts any party when no party is selected', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => '';
+    try {
+      expect(client.makeTradesFilterMatcher()({ ...row, party: 'R' })).toBe(true);
+      expect(client.makeTradesFilterMatcher()({ ...row, chamber: 'executive' })).toBe(true);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+    }
+  });
+
+  // Codex's second finding, on the same function: the predicate checked
+  // chamber, side, party and search but not the date window that
+  // tradesFilterParams() applies to the HTTP feed. A late filing outside the
+  // window would be appended into a narrowed table.
+  // Codex, on the same function again: the server sends `ticker=` for an
+  // all-caps token and filters it with "t.ticker = ?" — exact — while the client
+  // used indexOf, so an AAPL view accepted a streamed AAPLX and counted it.
+  it('matches a ticker token exactly, the way the server does', () => {
+    const origChip = win['chipSel'] as (id: string) => string[];
+    const origParam = win['chamberParam'] as (id: string) => string;
+    const origParty = win['partyParam'] as (id: string) => string;
+    const origQuery = win['tradesSearchQuery'] as () => string;
+    (win as Record<string, unknown>)['chipSel'] = () => [];
+    (win as Record<string, unknown>)['chamberParam'] = () => '';
+    (win as Record<string, unknown>)['partyParam'] = () => '';
+    (win as Record<string, unknown>)['tradesSearchQuery'] = () => 'AAPL';
+    try {
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, ticker: 'AAPL', asset: '' }),
+      ).toBe(true);
+      // The failure this pins: a longer ticker must NOT satisfy an AAPL search.
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, ticker: 'AAPLX', asset: '' }),
+      ).toBe(false);
+      // Case is irrelevant — the server upper-cases before comparing.
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, ticker: 'aapl', asset: '' }),
+      ).toBe(true);
+      // An exact ticker row with no ticker at all is excluded, same as the feed.
+      expect(client.makeTradesFilterMatcher()({ ...row, asset: '' })).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['chipSel'] = origChip;
+      (win as Record<string, unknown>)['chamberParam'] = origParam;
+      (win as Record<string, unknown>)['partyParam'] = origParty;
+      (win as Record<string, unknown>)['tradesSearchQuery'] = origQuery;
+    }
+  });
+
+  // The classification must be case-sensitive in the way the server's is: a
+  // lower-case word is a name, not a ticker, so it keeps substring matching.
+  it('still matches a lower-case token as a name, not an exact ticker', () => {
+    const origQuery = win['tradesSearchQuery'] as () => string;
+    (win as Record<string, unknown>)['tradesSearchQuery'] = () => 'khanna';
+    try {
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, member: 'Ro Khanna', ticker: '' }),
+      ).toBe(true);
+      // Substring still applies to the ticker field for a non-ticker token.
+      expect(
+        client.makeTradesFilterMatcher()({ ...row, member: '', ticker: 'AAPL' }),
+      ).toBe(false);
+    } finally {
+      (win as Record<string, unknown>)['tradesSearchQuery'] = origQuery;
+    }
+  });
+
+  describe('the active date window', () => {
+    const base = { chamber: 'house', type: 'Purchase', member: 'Ro Khanna', st: 'CA' };
+
+    /* Pin every OTHER filter open so only the date bounds are under test, and
+       set the explicit from/to values. The real document supplies real chip and
+       window state, which would otherwise decide these assertions. */
+    function withWindow(from: string, to: string): () => void {
+      const origChip = win['chipSel'] as (id: string) => string[];
+      const origParam = win['chamberParam'] as (id: string) => string;
+      const origParty = win['partyParam'] as (id: string) => string;
+      const origSide = win['selectedSideParam'] as (id: string) => string;
+      (win as Record<string, unknown>)['chipSel'] = () => ['house'];
+      (win as Record<string, unknown>)['chamberParam'] = () => '';
+      (win as Record<string, unknown>)['partyParam'] = () => '';
+      (win as Record<string, unknown>)['selectedSideParam'] = () => '';
+
+      // The real document carries a rolling-window control with a live value,
+      // which would supply a `from` whenever the explicit one is blank and make
+      // a to-only test fail for an unrelated reason. Blank it too, and restore.
+      const made: string[] = [];
+      const restoreValues: Array<() => void> = [];
+      const setValue = (id: string, value: string) => {
+        const existing = win.document.getElementById(id) as
+          | (HTMLInputElement & { selectedIndex?: number })
+          | null;
+        if (existing) {
+          const prior = existing.value;
+          const priorIndex = existing.selectedIndex;
+          // A <select> carrying no empty <option> cannot hold the value ''.
+          // Assigning '' already deselects every option (measured in jsdom:
+          // selectedIndex goes to -1 and the value reads back as '', it does NOT
+          // fall back to the first option), but relying on that subtle rule
+          // would leave the intent implicit. State it instead.
+          if (existing.tagName === 'SELECT' && value === '') {
+            existing.selectedIndex = -1;
+          } else {
+            existing.value = value;
+          }
+          restoreValues.push(() => {
+            if (existing.tagName === 'SELECT') {
+              existing.selectedIndex = priorIndex ?? -1;
+            } else {
+              existing.value = prior;
+            }
+          });
+          return;
+        }
+        const input = win.document.createElement('input');
+        input.id = id;
+        input.value = value;
+        win.document.body.appendChild(input);
+        made.push(id);
+      };
+      setValue('qFrom', from);
+      setValue('qTo', to);
+      setValue('tradesGlobalWindow', '');
+      setValue('trGlobalWindow', '');
+      return () => {
+        for (const id of made) win.document.getElementById(id)?.remove();
+        for (const undo of restoreValues) undo();
+        (win as Record<string, unknown>)['chipSel'] = origChip;
+        (win as Record<string, unknown>)['chamberParam'] = origParam;
+        (win as Record<string, unknown>)['partyParam'] = origParty;
+        (win as Record<string, unknown>)['selectedSideParam'] = origSide;
+      };
+    }
+
+    it('rejects a dated row older than the from bound', () => {
+      const restore = withWindow('2026-01-01', '');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2025-06-01' })).toBe(false);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2026-05-01' })).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    it('rejects a dated row after the to bound', () => {
+      const restore = withWindow('', '2026-06-30');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2026-09-01' })).toBe(false);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '2026-01-05' })).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    it('rejects an undated row once a bound is active, matching the server', () => {
+      // delivery/rows.ts pushes `t.tx_date >= ?` / `<= ?`, and its comment says a
+      // null tx_date "can't satisfy a date comparison, so it's naturally
+      // excluded once a bound is set". The predicate has to agree, or a streamed
+      // row appears and increments totalRows and then vanishes on reload.
+      const restore = withWindow('2026-01-01', '');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base })).toBe(false);
+        expect(client.makeTradesFilterMatcher()({ ...base, txdate: '' })).toBe(false);
+        // And a dated row inside the same bounds still passes, so this is the
+        // date filter rejecting an undated row and not the fixture failing.
+        expect(
+          client.makeTradesFilterMatcher()({ ...base, txdate: '2026-05-01' }),
+        ).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    it('accepts an undated row when no bound is active', () => {
+      // With the window controls blanked there is nothing to compare against,
+      // so an undated row is not "outside" any window and survives.
+      const restore = withWindow('', '');
+      try {
+        expect(client.makeTradesFilterMatcher()({ ...base })).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+  });
+});
+
+describe('resolveViewId — the view alias map', () => {
+  it('maps legacy aliases onto current tab ids', () => {
+    expect(client.resolveViewId('feed')).toBe('trades');
+    expect(client.resolveViewId('delivery')).toBe('subs');
+    expect(client.resolveViewId('directory')).toBe('people');
+  });
+
+  it('passes a known view through unchanged', () => {
+    expect(client.resolveViewId('trends')).toBe('trends');
+    expect(client.resolveViewId('trades')).toBe('trades');
+  });
+
+  it('does not throw on an unknown view', () => {
+    expect(() => client.resolveViewId('nonsense')).not.toThrow();
+  });
+});
+
+describe('asset-name hygiene', () => {
+  it('isJunkAssetString rejects junk without rejecting real names', () => {
+    expect(client.isJunkAssetString('')).toBe(true);
+    expect(client.isJunkAssetString('  ..  ')).toBe(true);
+    expect(client.isJunkAssetString('Microsoft Corp')).toBe(false);
+    expect(client.isJunkAssetString('Apple Inc.')).toBe(false);
+  });
+
+  it('cleanAsset strips exchange suffixes and trailing noise', () => {
+    expect(client.cleanAsset('Apple Inc.   ')).not.toMatch(/[\s]$/);
+    expect(client.cleanAsset('Apple Inc -')).not.toMatch(/-$/);
+    expect(client.cleanAsset('Apple Inc (NASDAQ)')).not.toContain('NASDAQ');
+  });
+
+  // The two cases below are regressions caught in review of this change: a
+  // mechanical "remove the useless escapes" rewrite silently dropped one
+  // character from each of these two character classes, and the test above had
+  // a comment claiming to cover the separator while asserting only whitespace
+  // and a hyphen. The comment was the false comfort.
+  it('cleanAsset trims a trailing slash, not just whitespace and hyphens', () => {
+    expect(client.cleanAsset('Vanguard Group /')).toBe('Vanguard Group');
+    expect(client.cleanAsset('Berkshire Hathaway //')).toBe('Berkshire Hathaway');
+    expect(client.cleanAsset('Berkshire -/')).toBe('Berkshire');
+    // Normalization runs after the trim, so this is 'Apple Inc' -> 'Apple Inc.'.
+    expect(client.cleanAsset('Apple Inc /')).toBe('Apple Inc.');
+  });
+
+  it('isJunkAssetString treats a semicolon-only value as junk', () => {
+    // OCR extraction noise arrives as punctuation-only runs. `;` must stay in
+    // the stripped character class or these render as real asset names.
+    expect(client.isJunkAssetString(';;;')).toBe(true);
+    expect(client.isJunkAssetString('.,;:!?')).toBe(true);
+    expect(client.cleanAsset(';;;')).toBe('');
+  });
+});
+
+describe('small numeric and identity helpers', () => {
+  it('parsePx reads a CSS pixel value and survives junk', () => {
+    expect(client.parsePx('120px')).toBe(120);
+    expect(Number.isFinite(client.parsePx('auto'))).toBe(true);
+    expect(Number.isFinite(client.parsePx(''))).toBe(true);
+  });
+
+  it('clampNum bounds both ends', () => {
+    expect(client.clampNum(5, 0, 10)).toBe(5);
+    expect(client.clampNum(-1, 0, 10)).toBe(0);
+    expect(client.clampNum(99, 0, 10)).toBe(10);
+  });
+
+  it('entityFingerprint is stable for the same input and differs across entities', () => {
+    expect(client.entityFingerprint('abc')).toBe(client.entityFingerprint('abc'));
+    expect(client.entityFingerprint('abc')).not.toBe(client.entityFingerprint('abd'));
+  });
+
+  it('sortRows does not mutate its input', () => {
+    const rows = [{ n: 3 }, { n: 1 }, { n: 2 }];
+    const before = JSON.stringify(rows);
+    client.sortRows(rows);
+    expect(JSON.stringify(rows)).toBe(before);
+  });
+});
