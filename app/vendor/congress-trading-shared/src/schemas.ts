@@ -33,16 +33,6 @@ export const TxTypeSchema = z
   .transform((v): "B" | "S" | "E" => (v === "P" ? "B" : v));
 export type TxType = "B" | "S" | "E";
 
-/** Provenance values ingestion already writes.  Do not add sources that no writer emits. */
-export const TxSourceSchema = z.enum([
-  "primary",
-  "seed_dataset",
-  "manual",
-  "competitor_backfill",
-  "local_mac",
-  "server_cpu",
-]);
-
 export const AssetTypeCategorySchema = z.enum([
   "public_equity",
   "private_equity",
@@ -143,7 +133,7 @@ export const CongressTransactionSchema = z.object({
   description: z.string().nullable().optional(),
   supplementalText: z.string().nullable().optional(),
   confidence: z.number().optional(),
-  source: TxSourceSchema.optional(),
+  source: z.enum(["primary", "seed_dataset", "manual"]).optional(),
   rowKey: z.string().nullable().optional(),
   createdAt: z.string().optional(),
   cursorSeq: z.number().int().nonnegative().optional(),
@@ -162,36 +152,13 @@ export const CongressTransactionSchema = z.object({
   refCountry: z.string().nullable().optional(),
   refExchangeShort: z.string().nullable().optional(),
   refAssetClass: z.string().nullable().optional(),
-  /** Raw `filers.party`.  Not a display label. */
-  party: z.string().nullable().optional(),
-  bioguideId: z.string().nullable().optional(),
-  pdfUrl: z.string().nullable().optional(),
-  disclosureLagDays: z.number().nullable().optional(),
-  stockActStatus: z.enum(["on_time", "late", "severely_late"]).nullable().optional(),
-  priceAtTrade: z.number().nullable().optional(),
-  spxAtTrade: z.number().nullable().optional(),
-  priceAtFiling: z.number().nullable().optional(),
-  spxAtFiling: z.number().nullable().optional(),
-  /**
-   * One `trade_latency_candidates` row for this trade.  `observedAt` is
-   * `provider_first_seen_at`.  The delta fields are computed, not stored columns.
-   */
-  latency: z.object({
-    provider: z.string().nullable(),
-    observedAt: z.string().nullable(),
-    providerPublishedAt: z.string().nullable(),
-    congressFirstSeenAt: z.string().nullable(),
-    providerDeltaSec: z.number().nullable(),
-    providerPublishedDeltaSec: z.number().nullable(),
-    status: z.string().nullable(),
-  }).nullable().optional(),
 });
 export type CongressTransaction = z.infer<typeof CongressTransactionSchema>;
 
 /** Full transaction row returned by the cursor-paginated REST read endpoint. */
 export const CongressTransactionReadSchema = CongressTransactionSchema.extend({
   confidence: z.number(),
-  source: TxSourceSchema,
+  source: z.enum(["primary", "seed_dataset", "manual"]),
   createdAt: z.string(),
   cursorSeq: z.number().int().nonnegative(),
 });
@@ -594,7 +561,7 @@ export const ClientTradeSchema = z.object({
   transaction: ClientTransactionSchema,
   filing: ClientFilingSchema,
   confidence: z.number(),
-  source: TxSourceSchema,
+  source: z.enum(["primary", "seed_dataset", "manual"]),
 });
 export type ClientTrade = z.infer<typeof ClientTradeSchema>;
 

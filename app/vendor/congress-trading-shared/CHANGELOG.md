@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `.github/workflows/codex-autofix-reusable.yml` no longer uses the org secret `GH_PAT` (owner 2026-10-11).  GitHub rejected the stored token, so checkout failed with `could not read Username for 'https://github.com'`.  Checkout and claude-code-action now use the built-in `GITHUB_TOKEN`.  `GH_PAT` stays declared as an optional, ignored `workflow_call` secret so callers that still pass it do not error;  the caller template and the local caller no longer pass it.  Accepted cost:  pushes made with `GITHUB_TOKEN` do not re-trigger CI or reviewers, so re-push before arming auto-merge.  Callers need `contents: write` and `pull-requests: write`.  claude-code-action (`ed670b4`) needs nothing else when `github_token` is passed:  no OIDC `id-token: write`, and `use_commit_signing` defaults to false.
+
+### Changed
+- `.github/workflows/codex-autofix-reusable.yml` (display name "Claude Code Autofix (Reusable)") now routes claude-code-action to MiniMax (`https://api.minimax.io/anthropic`, org secret `MINIMAX_API_KEY`) instead of DeepSeek, adds a `model` input (default `MiniMax-M3.1-Flash-Preview`), and acts on Codex, Kody and Cursor reviews by default.  Callers must pass `MINIMAX_API_KEY` and use the shared `pr-autofix-${{ github.repository }}-<PR>` concurrency group (see the workflow header).
+
+## [2.8.1] — 2026-10-17
+
+### Fixed
+- `buildAiUsage` ignores an explicit `undefined` in `tokens` instead of throwing a ZodError or erasing the count read from the SDK usage (review finding on #378).
+
+## [2.8.0] — 2026-10-17
+
+### Added
+- Canonical AI usage block for usage telemetry v2 (UM-1592):  an optional, strict `ai` field on every v2 event with `model.{requested,served}`, `harness`, `seat`, `tokens.{input,output,cacheRead,cacheWrite5m,cacheWrite1h,reasoning}`, `durationMs`, `ttftMs`, `billingMode` (`subscription`/`payg`/`free`) and `costSource` (`billed`/`estimated`).  Additive:  events without `ai` are unchanged.  Schemas and types in `src/aiUsage.ts`.
+- `buildAiUsage` and `aiTokensFromAnthropicUsage` / `aiTokensFromOpenAiUsage` / `aiTokensFromGeminiUsage` / `aiTokensFromSdkUsage` build the block from Anthropic `usage` (with the `cache_creation` 5-minute/1-hour split), OpenAI Chat Completions and Responses `usage` (cached and reasoning tokens, DeepSeek cache hits) and Gemini `usageMetadata`.  `aiUsageTotalTokens` sums the billed buckets.
+- `docs/ai-usage-schema.md`:  field semantics and per-producer migration instructions.
+
+### Changed
+- `USAGE_TELEMETRY_PRODUCERS` now lists every fleet producer id (botfleet, codecaps, claude-code, openai-codex, grok-build, github-copilot, minimax-code, deepseek-dsh, opencode, fx, antigravity-cli, antigravity-statusline, cursor-agent, cursor-admin, muse, muse-code, gbu, mac-host, fleet-usage-collector, admin-usage-poller, manual-billing-adjustment).
+- `USAGE_TELEMETRY_KNOWN_PROVIDERS` adds minimax, deepseek, xai, moonshot, github-copilot and cursor.
+
 ## [2.7.0] — 2026-09-15
 
 ### Added

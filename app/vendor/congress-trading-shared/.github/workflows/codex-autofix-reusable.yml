@@ -1,18 +1,76 @@
-name: Codex Autofix (Reusable)
+name: Claude Code Autofix (Reusable)
 
-# Shared infrastructure for the Codex autofix loop — called by individual repos
-# that want the same triggers / permissions / concurrency / Claude action config.
-# Each repo supplies its own prompt so behaviour stays auditable in-repo.
+# Shared infrastructure for the PR autofix loop - called by individual repos that
+# want the same triggers / permissions / Claude action config.  Each repo supplies
+# its own prompt so behaviour stays auditable in-repo.  The filename still says
+# "codex" on purpose:  callers pin this file by SHA and path, so renaming it would
+# break every pin.  The display name is what changed.
+#
+# The agent runs claude-code-action against MiniMax's Anthropic-compatible
+# endpoint (https://api.minimax.io/anthropic), billed to the org secret
+# MINIMAX_API_KEY.  It acts on reviews from Codex, Kody and Cursor.
 #
 # To onboard a new repo:
-#   1. Make sure the repo has DEEPSEEK_API_KEY and (optionally) GH_PAT secrets.
-#      (Routed through DeepSeek's Anthropic-compatible endpoint — see the action step.)
-#   2. Create .github/workflows/codex-autofix.yml following the caller template in
-#      this repo's AGENTS.md or the existing Socratic Trade / Congress.Trade examples.
-#   3. Caller workflows should trigger on `pull_request_review` with
-#      `types: [submitted]` plus `workflow_dispatch` only. Do not trigger on
-#      pull_request_review_comment or issue_comment; one Codex review can contain
-#      many comments, and comment events can fan out into autofix storms.
+#   1. No per-repo model key is needed:  MINIMAX_API_KEY is an organization secret
+#      visible to every repo.  The caller only has to pass it through
+#      (`secrets: MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}`).  Do not pass
+#      GH_PAT:  the workflow ignores it and uses the built-in GITHUB_TOKEN for
+#      checkout, the push, and claude-code-action (owner 2026-10-11).  The org
+#      GH_PAT was rejected by GitHub, which broke checkout, and nothing in the fleet
+#      should act as the owner's account.  Consequence:  a push made with
+#      GITHUB_TOKEN does not trigger other workflows, so CI and the reviewers do not
+#      re-run on an autofix commit.  Re-push (an empty commit is enough) to
+#      re-trigger them before arming auto-merge.
+#   2. Create .github/workflows/claude-autofix.yml (or keep an existing
+#      codex-autofix.yml) from the caller template below.
+#   3. Caller workflows must trigger on `pull_request_review` with
+#      `types: [submitted]` plus `workflow_dispatch` only.  Do not trigger on
+#      pull_request_review_comment or issue_comment;  one review can contain many
+#      comments, and comment events can fan out into autofix storms.
+#   4. Callers MUST set this concurrency block, and the group name must be exactly
+#      this string.  It is shared on purpose with the fleet's other autofix caller
+#      (AI-Fleet-Coordinator pr-autofix-reusable.yml), so two bots never push to
+#      one PR branch at once:
+#
+#        concurrency:
+#          group: pr-autofix-${{ github.repository }}-${{ github.event.pull_request.number }}
+#          cancel-in-progress: false
+#
+#      (A reusable workflow cannot set this for its caller, so it lives in the
+#      caller.  For workflow_dispatch runs, use the dispatched PR number input in
+#      place of github.event.pull_request.number.)
+#
+# Caller template:
+#
+#   name: Claude Code Autofix
+#   on:
+#     pull_request_review:
+#       types: [submitted]
+#     workflow_dispatch:
+#       inputs:
+#         pr:
+#           description: "PR number to run the autofix loop on"
+#           required: true
+#   permissions:          # GITHUB_TOKEN needs both, the reusable cannot raise them
+#     contents: write
+#     pull-requests: write
+#   concurrency:
+#     group: pr-autofix-${{ github.repository }}-${{ github.event.pull_request.number || github.event.inputs.pr }}
+#     cancel-in-progress: false
+#   jobs:
+#     autofix:
+#       if: >-
+#         github.event_name == 'workflow_dispatch' ||
+#         (github.event_name == 'pull_request_review' &&
+#          github.event.review.user.type == 'Bot' &&
+#          github.event.pull_request.head.repo.full_name == github.repository)
+#       uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@<merge sha>
+#       secrets:
+#         MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+#         USAGE_INGEST_TOKEN: ${{ secrets.USAGE_INGEST_TOKEN }}   # optional:  meters spend in Usage Monitor
+#       with:
+#         prompt: |
+#           <repo-specific fixer policy>
 #
 # Org-level alternative (preferred):
 #   Move this file to jaywedgeworth22/.github/workflows/codex-autofix-reusable.yml
@@ -30,19 +88,28 @@ on:
         required: false
         type: string
         default: |
-          --max-turns 60
+          --max-turns 120
           --allowedTools "Edit,Write,Read,Bash"
         description: "Extra CLI args passed to claude-code-action"
       allowed_bots:
         required: false
         type: string
-        default: "chatgpt-codex-connector,chatgpt-codex-connector[bot]"
+        default: "chatgpt-codex-connector,chatgpt-codex-connector[bot],kody-ai,kody-ai[bot],cursor,cursor[bot]"
         description: "Allowed bot actors (normalised by the action: lowercased, [bot] stripped)"
+      model:
+        required: false
+        type: string
+        default: "MiniMax-M3.1-Flash-Preview"
+        description: "MiniMax model id sent as ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL"
     secrets:
-      DEEPSEEK_API_KEY:
+      MINIMAX_API_KEY:
         required: true
+      USAGE_INGEST_TOKEN:
+        required: false
+        description: "Usage Monitor ingest token scoped to the ci-autofix producer.  Optional:  when it is absent the usage report is skipped."
       GH_PAT:
         required: false
+        description: "Ignored (owner 2026-10-11).  Kept declared only so callers that still pass it do not fail;  the workflow uses the built-in GITHUB_TOKEN."
 
 permissions:
   contents: write
@@ -60,31 +127,65 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e # v1
-        # Routed to DeepSeek via its Anthropic-compatible endpoint to control cost:
-        # claude-code-action drives the Claude Code CLI, which honors
-        # ANTHROPIC_BASE_URL / _AUTH_TOKEN / _MODEL, so this bills the DeepSeek key
-        # instead of Anthropic. Revert by removing this env block and pointing
-        # anthropic_api_key back at an ANTHROPIC_API_KEY secret.
+      - name: Run Claude Autofix
+        id: claude
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1
+        # Routed to MiniMax via its Anthropic-compatible endpoint:  claude-code-action
+        # drives the Claude Code CLI, which honors ANTHROPIC_BASE_URL / _AUTH_TOKEN /
+        # _MODEL, so this bills the org MINIMAX_API_KEY instead of Anthropic.  Same
+        # endpoint and key wiring as the fleet's other autofix workflows.  The model
+        # id comes from the `model` input (MiniMax-M3.1-Flash-Preview, the id the
+        # fleet's Harness route already uses over api anthropic-messages).
         env:
-          ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.DEEPSEEK_API_KEY }}
-          ANTHROPIC_MODEL: deepseek-v4-flash
-          ANTHROPIC_SMALL_FAST_MODEL: deepseek-v4-flash
+          ANTHROPIC_BASE_URL: https://api.minimax.io/anthropic
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.MINIMAX_API_KEY }}
+          ANTHROPIC_MODEL: ${{ inputs.model }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ inputs.model }}
         with:
-          anthropic_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
-          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.MINIMAX_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           allowed_bots: ${{ inputs.allowed_bots }}
           prompt: ${{ inputs.prompt }}
           claude_args: ${{ inputs.claude_args }}
+          # Keep raw SDK messages out of logs; retain only the bounded summary below.
+          show_full_output: "false"
           # claude-code-action's buffered-inline-comment classifier hardcodes
           # https://api.anthropic.com and reads anthropic_api_key directly,
-          # ignoring ANTHROPIC_BASE_URL — with a DeepSeek key it would 401 and
+          # ignoring ANTHROPIC_BASE_URL - with a MiniMax key it would 401 and
           # fall back to posting every buffered comment unfiltered. Disable the
           # feature rather than rely on a classifier that can't authenticate.
           classify_inline_comments: "false"
+
+      - name: Summarize Autofix Diagnostics
+        if: ${{ always() }}
+        id: diagnostics
+        uses: Simple-With-Us/congress-trading-shared/.github/actions/autofix-diagnostics@58e3d9504e458b259d065789034f0d625e66324b
+
+      - name: Report Usage To Usage Monitor
+        # Best-effort metering (UM-1593).  Reads the SDK transcript the action wrote, posts one usage
+        # event, and never fails the job:  an absent USAGE_INGEST_TOKEN makes it a quiet no-op.
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: Simple-With-Us/congress-trading-shared/.github/actions/ci-usage-report@d06ac2d47bc3b9182ea43deee9f0a91ffdf33ab0
+        with:
+          token: ${{ secrets.USAGE_INGEST_TOKEN }}
+          harness: claude-code-ci
+          input-file: ${{ runner.temp }}/claude-execution-output.json
+          input-kind: claude
+          model: ${{ inputs.model }}
+          pr-number: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+          workflow: codex-autofix-reusable
+
+      - name: Retain Sanitized Autofix Diagnostics
+        if: ${{ always() && steps.diagnostics.outputs.summary-path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claude-autofix-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.diagnostics.outputs.summary-path }}
+          if-no-files-found: error
+          retention-days: 7
