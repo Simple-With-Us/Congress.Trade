@@ -1526,7 +1526,7 @@ export const DASHBOARD_CSS = /* css */ `
   footer .swu-attribution { display:inline-flex; align-items:center; gap:5px; color:var(--text-dim); text-decoration:none; font-size:10px; }
   footer .swu-attribution:hover { color:var(--accent); }
   footer .swu-attribution:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
-  footer .swu-attribution img { display:block; width:min(288px, calc(100vw - 105px)); height:auto; border-radius:2px; background:#fff; }
+  footer .swu-attribution img { display:block; width:min(288px, calc(100vw - 105px)); height:auto; }
   /* ---- account control + auth/billing modals ---- */
   .acct { display:flex; align-items:center; gap:8px; }
   .acct-desktop { display:flex; align-items:center; gap:10px; }
