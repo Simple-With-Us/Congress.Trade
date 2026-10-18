@@ -276,6 +276,21 @@ describe('tradeRowMatchesSearch — multi-token AND matching', () => {
     expect(client.tradeRowMatchesSearch({ ...row, member: 'Carson Vacar' }, 'CA')).toBe(true);
   });
 
+  it('does not also apply a state filter the request swallowed into memberName', () => {
+    // "CA" classified as a state, but the fallback folds the whole query into
+    // memberName, so the server filters filer NAMES and the state token is not
+    // a constraint the request expressed. Applying it anyway made the predicate
+    // narrower than the feed: the Ohio filer "Carey" that memberName=CA returns
+    // would never be admitted live.
+    const ohioCarey = { ...row, member: 'Carey', st: 'OH', state: 'Ohio' };
+    expect(client.tradeRowMatchesSearch(ohioCarey, 'CA')).toBe(true);
+    // When a name token is present the fallback does NOT fire, so the state
+    // token stays a real client-side filter — that is the documented behaviour
+    // and the only narrowing for it.
+    expect(client.tradeRowMatchesSearch({ ...row, st: 'OH', state: 'Ohio' }, 'khanna CA')).toBe(false);
+    expect(client.tradeRowMatchesSearch(row, 'khanna CA')).toBe(true);
+  });
+
   it('matches multiple name tokens as ONE phrase, the way the server does', () => {
     // "Khanna Ro" becomes a single LIKE '%khanna ro%'. "Ro Khanna" does not
     // satisfy that phrase even though it contains both words, so testing the

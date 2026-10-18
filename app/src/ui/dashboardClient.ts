@@ -1561,6 +1561,16 @@ function searchTokenPlan(q) {
   // phrase the server will. If nothing classified, the whole query goes across
   // as memberName so the server still narrows.
   var memberName = nameBits.length ? nameBits.join(' ') : (tickerHint ? '' : raw);
+  // That fallback swallows state and party tokens into the phrase, because they
+  // classified successfully but contributed no name bits. Once they are part of
+  // memberName they are filer-name terms, NOT client-side filters — applying
+  // both would add a constraint the request never expressed and make the
+  // predicate narrower than the feed it shadows.
+  if (memberName === raw && raw) {
+    for (var j = 0; j < plan.length; j++) {
+      if (plan[j].field === 'state' || plan[j].field === 'party') plan[j].field = 'name';
+    }
+  }
   return { raw: raw, plan: plan, tickerHint: tickerHint, memberName: memberName };
 }
 function applySearchToServerParams(p, q) {
