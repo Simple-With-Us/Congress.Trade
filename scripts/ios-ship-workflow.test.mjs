@@ -57,3 +57,32 @@ test("ios ship workflows quote ASC name comparisons", () => {
     assert.doesNotMatch(yml, /== SENTRY_DSN(?!")/);
   }
 });
+
+test("ios-appstore-gm.yml ships with notes, Sentry, and a per-run gate override", () => {
+  const yml = read(".github/workflows/ios-appstore-gm.yml");
+
+  // What to Test is mandatory on every upload (owner 2026-09-08): publish, never dry-log.
+  assert.match(yml, /IOS_TF_RELEASE_NOTES:\s*"1"/);
+  // A mute archive is refused by ship-testflight.sh, so the DSN must be loaded here too.
+  assert.match(yml, /Infisical prod SENTRY_DSN is missing/);
+  assert.match(yml, /"\$name" == "SENTRY_DSN"/);
+  // No standing gate override.  The only bypass is the per-run force_ship input.
+  assert.doesNotMatch(yml, /IOS_TF_MIN_INTERVAL_SEC/);
+  assert.doesNotMatch(yml, /ios-ship-testflight\.sh["'\s].*--force-ship/);
+  assert.match(yml, /force_ship:\s*\n\s+description:[^\n]*\n\s+type: boolean\s*\n\s+default: false/);
+  assert.match(yml, /FORCE_SHIP:\s*\$\{\{ inputs\.force_ship \}\}/);
+  // Hosted runners start empty, so the gate and the notes range are seeded.
+  assert.match(yml, /actions: read/);
+  assert.match(yml, /Seed last-ship state/);
+  assert.match(yml, /last-ship-congress\.txt/);
+  // A gate skip must not look like a shipped build.
+  assert.match(yml, /Assert this checkout was uploaded/);
+  assert.match(yml, /fetch-depth: 0/);
+});
+
+test("release notes timestamp uses the owner clock without a timezone abbreviation", () => {
+  const src = read("scripts/ios-fleet/asc-api.mjs");
+  const fn = src.match(/function centralTimestamp[\s\S]*?\n}\n/)[0];
+  assert.doesNotMatch(fn, /\bCT\b[`"']/);
+  assert.match(fn, /toLowerCase\(\)/);
+});
