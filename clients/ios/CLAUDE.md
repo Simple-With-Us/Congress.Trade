@@ -66,4 +66,4 @@ clients/ios/
 - Two spaces between sentences in user-visible copy.
 - Never hand-edit `.pbxproj`, `.entitlements`, `.xib`, `.storyboard`.
 - Do not take down a whole screen because one JSON field is null.
-- Secrets stay in `~/.secrets/` / Infisical. Never print them.
+- Secrets stay in Infisical (`fleet-secrets get`); nothing reads `~/.secrets`. Never print them.

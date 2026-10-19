@@ -375,6 +375,9 @@ jobs:
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs
 
+      - name: ASC credentials helper (offline)
+        run: python3 scripts/asc/test_asc_creds.py
+
       - name: iOS signing key-file handoff
         run: bash scripts/test-ios-stage-asc-key.sh
 

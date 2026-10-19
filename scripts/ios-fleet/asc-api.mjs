@@ -3,9 +3,10 @@
  * Minimal App Store Connect API client. No dependencies beyond Node's
  * built-in crypto (ES256 JWT signing) and fetch (Node 18+).
  *
- * Auth: reads ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from
- * ~/.secrets/appstore-connect.env (never prints values -- see
- * scripts/infisical-secrets-safe.sh pattern used elsewhere in the fleet).
+ * Auth: resolveAscCredentials() reads ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH
+ * from process.env first, then `fleet-secrets get` (Infisical /asc: ASC_KEY_ID,
+ * ASC_ISSUER_ID, ASC_KEY_P8) when env is missing or the key file does not exist.
+ * Nothing reads ~/.secrets (AFC-359).  Never prints values.
  *
  * Usage:
  *   node asc-api.mjs GET /v1/apps
@@ -17,23 +18,57 @@
  * echoing anything secret-shaped from the response (ASC responses don't
  * carry credentials, only app metadata, so this is safe to print as-is).
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-function loadEnvFile(path) {
-  const text = readFileSync(path, "utf8");
-  const env = {};
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+const INFISICAL_ASC_FOLDER = "/asc";
+
+/**
+ * Read one value from Infisical Fleet-OPS through `fleet-secrets get`.  FLEET_SECRETS
+ * overrides the binary (tests inject a fake).  Returns "" when the CLI is absent,
+ * the key is absent, or the call fails.  Never logs stdout or stderr.
+ */
+function fleetSecret(name, folder = INFISICAL_ASC_FOLDER) {
+  // The explicit/installed binary first, then fleet-secrets on PATH.
+  const candidates = [process.env.FLEET_SECRETS || join(homedir(), ".local", "bin", "fleet-secrets")];
+  if (!process.env.FLEET_SECRETS) candidates.push("fleet-secrets");
+  for (const bin of candidates) {
+    try {
+      return execFileSync(bin, ["get", name, "--path", folder], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 30000
+      })
+        .replace(/\r?\n$/, "")
+        .trim();
+    } catch {
+      // try the next candidate
+    }
   }
-  return env;
+  return "";
+}
+
+/**
+ * Prefer process.env, then Infisical `/asc` through fleet-secrets.  Hosted CI uses
+ * process.env ASC_* only (no fleet-secrets there).  keyPem is the .p8 contents,
+ * set only when ASC_KEY_PATH is unset or names a missing file.
+ */
+export function resolveAscCredentials() {
+  const fromEnv = (name) => {
+    const v = process.env[name];
+    return v != null && String(v).trim() !== "" ? String(v).trim() : "";
+  };
+  const keyId = fromEnv("ASC_KEY_ID") || fleetSecret("ASC_KEY_ID");
+  const issuerId = fromEnv("ASC_ISSUER_ID") || fleetSecret("ASC_ISSUER_ID");
+  const keyPath = fromEnv("ASC_KEY_PATH");
+  let keyPem = "";
+  if (!keyPath || !existsSync(keyPath)) {
+    keyPem = (fromEnv("ASC_KEY_P8") || fleetSecret("ASC_KEY_P8")).replace(/\\n/g, "\n");
+  }
+  return { keyId, issuerId, keyPath, keyPem };
 }
 
 function base64url(input) {
@@ -314,16 +349,18 @@ async function setWhatToTest({ api, buildId, appId, marketing }) {
 }
 
 async function main() {
-  const envPath = join(homedir(), ".secrets", "appstore-connect.env");
-  const env = loadEnvFile(envPath);
-  const keyId = env.ASC_KEY_ID;
-  const issuerId = env.ASC_ISSUER_ID;
-  const keyPath = env.ASC_KEY_PATH;
-  if (!keyId || !issuerId || !keyPath) {
-    console.error("Missing ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH in ~/.secrets/appstore-connect.env");
+  const { keyId, issuerId, keyPath, keyPem } = resolveAscCredentials();
+  if (!keyId || !issuerId || (!keyPath && !keyPem)) {
+    console.error(
+      "Missing ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH in process env, and Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8) is unavailable via fleet-secrets"
+    );
     process.exit(1);
   }
-  const privateKeyPem = readFileSync(keyPath, "utf8");
+  if (!keyPem && !existsSync(keyPath)) {
+    console.error("ASC_KEY_PATH is set but the key file is missing");
+    process.exit(1);
+  }
+  const privateKeyPem = keyPem || readFileSync(keyPath, "utf8");
   const token = signJwt({ keyId, issuerId, privateKeyPem });
 
   const [method, path, body, arg4] = process.argv.slice(2);

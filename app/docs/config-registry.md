@@ -71,7 +71,7 @@ safe only while a strong client secret exists.
 ### Fleet coordination (shared-at-ct ONLY)
 `AGENT_SYNC_TOKEN`, `AGENT_SYNC_POST_TOKEN` — one pair for every app.
 Rotate in the shared project; never duplicate onto `socratic-trade` or
-`congress-trade` app projects.  Local Mac copy: `~/.secrets/agent-sync.env`.
+`congress-trade` app projects.  Local Mac copy: Infisical `/agent-sync` (`fleet-secrets get`).
 
 ### Integrations
 `APP_B_IMPORT_URL`, `APP_B_INGEST_TOKEN`, `USAGE_MONITOR_ENABLED`,

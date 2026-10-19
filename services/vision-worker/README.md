@@ -38,7 +38,7 @@ Kimi CLI was retired (hard provider billing 403). Do not reintroduce it.
 | `OPENROUTER_CASCADE_MODELS` | `qwen/qwen3-vl-8b-instruct,qwen/qwen3-vl-30b-a3b-instruct,google/gemini-3.8-flash` | Tried after a missed Grok CLI solo pass, before `OPENROUTER_MODEL`. Qwen VL slugs receive raster pages. |
 | `OPENROUTER_CASCADE_MAX_PAGES` | `8` | Cap images sent to VL models |
 | `CONGRESS_TRADE_API_URL` | `http://localhost:8787` | Use `https://congress.trade` in launchd |
-| `ADMIN_TOKEN` | — | `CT_ADMIN_TOKEN` from `~/.secrets/` |
+| `ADMIN_TOKEN` | — | `CT_ADMIN_TOKEN` from Infisical (`fleet-secrets get CT_ADMIN_TOKEN`) |
 | `WORKER_ID` | `local_mac_1` | |
 | `MAX_DOCS_PER_POLL` | `2` | Log line when pending > cap |
 | `MAX_PAGES` | `12` | Cap page images sent to local CLI.  Auto engine skips CLI when the PDF is longer and goes PDF-native. |
