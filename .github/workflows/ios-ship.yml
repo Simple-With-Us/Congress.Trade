@@ -269,4 +269,47 @@ jobs:
           # Wrapper resolves the in-repo fleet script (scripts/ios-fleet/) and
           # enforces the stable-Xcode rule; it falls back to the host copy only
           # if the repo copy is missing, and logs loudly when it does.
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh"
+          #
+          # CT-2434: keep the log.  The external beta promotion below has to
+          # name the build THIS run uploaded -- "the newest build" is the
+          # previous ship for the first minutes after an upload, and the
+          # vendored client is explicit that a newest-build fallback is the
+          # defect it removed (scripts/ios-fleet/asc-api.mjs, ensure-tf-ready).
+          set -o pipefail
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
+
+      # Name the build this run uploaded, for the external promotion below.
+      # The fleet script resolves the version before it uploads and logs it as
+      # "marketing=1.0.<n> build=<n>";  the extractor reads that, and falls back
+      # to the checkout's commit count -- the number the ship starts from.
+      - name: Name the build this ship uploaded
+        id: buildnum
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          build_num="$(bash "$GITHUB_WORKSPACE/scripts/ios-ship-build-number.sh" \
+            "$RUNNER_TEMP/congress-ship.log" "$GITHUB_WORKSPACE")"
+          echo "build_num=${build_num}" >> "$GITHUB_OUTPUT"
+          echo "shipped build number: ${build_num}"
+
+      # CT-2434:  the external TestFlight group (Public Beta, public link) is
+      # what a tester outside the team actually reaches, and it only ever sees
+      # a build someone assigns to it.  It was created 2026-08-31 and never
+      # refreshed, so it served one Aug-2026 build that expired 2026-11-29
+      # while the internal group tracked every ship.  BotFleet and Clutch
+      # promote on every ship;  this repo did not, and that is the gap.
+      #
+      # --build names the build this ship uploaded.  It is not optional
+      # politeness:  picking "the newest build" instead would promote the
+      # PREVIOUS ship for the first minutes after an upload, which is the
+      # same defect the vendored ASC client documents and removed.
+      #
+      # continue-on-error, always:  a promotion problem is a warning on a ship
+      # that already succeeded, never a red run that blocks the next deploy.
+      - name: Refresh the public TestFlight beta
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        run: |
+          node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs" \
+            --build "${{ steps.buildnum.outputs.build_num }}"
+
