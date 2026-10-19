@@ -261,8 +261,8 @@ private enum WidgetDate {
         formatter.timeZone = TimeZone(identifier: "America/Chicago")
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = formatter.timeZone
-        formatter.dateFormat = calendar.isDateInToday(date) ? "h:mma" : "MMM d, h:mma"
-        return formatter.string(from: date).lowercased()
+        formatter.dateFormat = calendar.isDateInToday(date) ? "h:mm a" : "MMM d, h:mm a"
+        return formatter.string(from: date)
     }
 }
 
