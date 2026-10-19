@@ -130,7 +130,13 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // What to Test is mandatory and published, never dry-rendered.
   assert.match(code, /IOS_TF_RELEASE_NOTES:\s*"1"/);
   // Ship through the wrapper that runs ship-testflight.sh (ensure-tf-ready inside).
-  assert.match(code, /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"\s*$/m);
+  // CT-2434: the ship log is kept so the external-beta promotion can name the
+  // exact build this run uploaded, so the invocation may carry a tee -- but it
+  // must still be the wrapper, and still be the last thing in the step.
+  assert.match(
+    code,
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+  );
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);

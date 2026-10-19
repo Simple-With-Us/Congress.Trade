@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Promote the newest TestFlight build into the app's EXTERNAL beta group.
+ * Promote the build THIS SHIP uploaded into the app's EXTERNAL beta group.
  *
  * WHY THIS EXISTS (CT-2434, 2026-10-19):  the Congress.Trade Public Beta group
  * (external, public link, three testers) served build 202608311519, uploaded
@@ -12,8 +12,36 @@
  *
  * WHAT IT DOES, in order:
  *   1. find the app's external beta group,
- *   2. add the newest processed build to it (idempotent),
- *   3. submit that build for Beta App Review when Apple wants a submission.
+ *   2. find the ONE build it was asked to promote -- by build number, exactly,
+ *   3. add that build to the group (idempotent),
+ *   4. submit that build for Beta App Review when Apple wants a submission.
+ *
+ * WHY IT MATCHES A BUILD NUMBER AND NEVER "THE NEWEST BUILD"
+ * -------------------------------------------------------
+ * The repo's own vendored client says this out loud, in
+ * scripts/ios-fleet/asc-api.mjs (ensure-tf-ready):
+ *
+ *   "CFBundleVersion is known exactly at archive time (ship-testflight.sh
+ *    passes it to xcodebuild as CURRENT_PROJECT_VERSION) and ASC ingests it
+ *    verbatim as builds[].attributes.version, so it is an exact key.  There is
+ *    deliberately NO 'newest build' fallback: that fallback IS the defect."
+ *
+ * "Newest" is wrong for the first minutes after an upload:  the newest build
+ * App Store Connect knows about is then the PREVIOUS ship.  A promotion that
+ * picks "the newest" therefore promotes a build nobody asked it to promote,
+ * and a promotion that waits for "the newest" waits for the wrong build.
+ *
+ * So this script takes a build number -- the CFBundleVersion the ship used --
+ * and looks it up by that exact key.  When the build is not there yet, or is
+ * still processing, it says so loudly and promotes nothing.  It never falls
+ * back to a different build:  a wrong promotion is worse than a late one,
+ * because the wrong one looks like success.
+ *
+ * The build number normally comes from the ship itself:  the fleet script
+ * numbers a build as the checkout's commit count and logs it as
+ * "marketing=1.0.<n> build=<n>", so the ship workflow hands that number over.
+ * Without one, this script falls back to the same commit count, which is what
+ * the ship starts from.
  *
  * Auth:  every App Store Connect call goes through the vendored
  * scripts/ios-fleet/asc-api.mjs, which owns credential handling.  This file
@@ -22,6 +50,7 @@
  *
  * Usage:
  *   node scripts/promote-external-beta.mjs [--apple-id <id>] [--group <name>]
+ *                                           [--build <n>]
  *
  * Exit codes:  0 done or nothing to do  |  3 partial (warnings printed).
  * The ship workflow treats a non-zero exit as a warning and never lets it fail
@@ -76,16 +105,87 @@ export function chooseExternalGroup(groups, groupName = null) {
 }
 
 /**
+ * The build number this promotion is for.
+ *
+ * `explicit` is what the ship handed over.  Without it, the checkout's commit
+ * count is used:  that is exactly how the fleet script numbers a build
+ * (scripts/ios-fleet/ship-testflight.sh, BUILD_NUM="$(git rev-list --count
+ * HEAD)"), and the promotion runs in the same checkout as the ship.
+ *
+ * A build number is a positive integer.  Number("0"), Number("-1") and
+ * Number("nope") are all rejected here rather than being allowed through as a
+ * number that silently matches nothing.
+ */
+export function resolveExpectedBuildNumber({ explicit = null, repoRoot = ROOT } = {}) {
+  const raw = explicit == null ? "" : String(explicit).trim();
+  if (raw !== "") {
+    // A build number is a plain integer, the way the fleet script words it:
+    // "N must be a plain integer above every build already shipped".  So the
+    // digits only --  "1e3" and "2320.5" are not build numbers, even though
+    // Number() would happily turn them into numbers.
+    if (!/^\d+$/.test(raw)) return null;
+    const n = Number(raw);
+    if (!Number.isSafeInteger(n) || n <= 0) return null;
+    return n;
+  }
+  const res = spawnSync("git", ["-C", repoRoot, "rev-list", "--count", "HEAD"], { encoding: "utf8" });
+  if (res.status !== 0) return null;
+  const n = Number((res.stdout || "").trim());
+  if (!Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Look the target build up by its exact build number.
+ *
+ * The query is the same one the vendored client uses for ensure-tf-ready:
+ * filter[version] is CFBundleVersion, which ASC ingests verbatim.  Two rows
+ * matching one build number is ambiguous, and the vendored client refuses to
+ * guess there ("N builds match version X -- ambiguous, refusing to guess");
+ * so does this.
+ */
+export function findExactBuild(asc, appId, buildNumber) {
+  const res = asc(
+    "GET",
+    `/v1/builds?filter[app]=${appId}&filter[version]=${buildNumber}` +
+      `&limit=2&include=buildBetaDetail,preReleaseVersion` +
+      `&fields[builds]=version,processingState,uploadedDate`
+  );
+  if (!res.ok) return { ok: false, error: ascErrorText(res), rows: [], build: null };
+  const rows = res.parsed?.data || [];
+  if (rows.length > 1) return { ok: true, rows, build: null, ambiguous: true };
+  return { ok: true, rows, build: rows[0] || null, ambiguous: false };
+}
+
+/**
+ * The newest build App Store Connect knows about, for diagnostics only.
+ *
+ * This is never used to choose what to promote -- see the header.  It exists
+ * so a failed promotion can say what IS there, which is the difference between
+ * "the build has not been ingested yet" and "the promotion is broken".
+ */
+export function newestKnownBuild(asc, appId) {
+  const res = asc(
+    "GET",
+    `/v1/builds?filter[app]=${appId}&sort=-uploadedDate&limit=1&fields[builds]=version,processingState`
+  );
+  if (!res.ok) return null;
+  return res.parsed?.data?.[0] || null;
+}
+
+/**
  * Do the promotion.  `asc` is injected so the test can drive it without a
  * network or a credential;  the real one shells out to the vendored client.
  *
  * Returns a summary object.  Never throws:  a failure is a warning, because
- * this runs inside a ship that already succeeded.
+ * this runs inside a ship that already succeeded.  `outcome` says what
+ * actually happened, so a no-op can never be mistaken for a promotion.
  */
 export function promoteExternalBeta({
   asc,
   appId,
   groupName = null,
+  buildNumber = null,
   log = () => {},
   warn = () => {},
 }) {
@@ -93,8 +193,10 @@ export function promoteExternalBeta({
     appId: appId || null,
     groupId: null,
     groupName: null,
+    targetBuildNumber: buildNumber ?? null,
     buildId: null,
     buildVersion: null,
+    outcome: "unknown",
     added: false,
     submitted: false,
     alreadyPresent: false,
@@ -107,7 +209,15 @@ export function promoteExternalBeta({
   };
 
   if (!appId) {
+    out.outcome = "no-app-id";
     note("no App Store Connect app id; nothing promoted");
+    return out;
+  }
+  if (!Number.isInteger(buildNumber) || buildNumber <= 0) {
+    out.outcome = "no-target-build";
+    note(
+      "no build number to promote; pass --build <n> with the CFBundleVersion the ship uploaded"
+    );
     return out;
   }
 
@@ -117,11 +227,13 @@ export function promoteExternalBeta({
     `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled`
   );
   if (!groupsRes.ok) {
+    out.outcome = "asc-error";
     note(`could not list beta groups: ${ascErrorText(groupsRes)}`);
     return out;
   }
   const group = chooseExternalGroup(groupsRes.parsed?.data, groupName);
   if (!group) {
+    out.outcome = "no-external-group";
     note(
       groupName
         ? `no external beta group named "${groupName}" for app ${appId}; create it in App Store Connect > TestFlight > External Testing`
@@ -132,43 +244,50 @@ export function promoteExternalBeta({
   out.groupId = group.id;
   out.groupName = group.attributes?.name || null;
 
-  // 2. The newest build.  A build that is still processing cannot be
-  //    distributed, and promoting it would put the group in a half state.
-  //    Ask App Store Connect for VALID builds only:  right after a ship the
-  //    newest upload is still PROCESSING, so without the filter this query
-  //    returns that build, the guard below bails, and the public group never
-  //    gets refreshed.  The guard stays as a safety net.
-  const buildsRes = asc(
-    "GET",
-    `/v1/builds?filter[app]=${appId}&filter[processingState]=VALID&sort=-uploadedDate&limit=1&fields[builds]=version,processingState,uploadedDate`
-  );
-  if (!buildsRes.ok) {
-    note(`could not list builds: ${ascErrorText(buildsRes)}`);
+  // 2. THE build -- by number, never by recency.
+  const found = findExactBuild(asc, appId, buildNumber);
+  if (!found.ok) {
+    out.outcome = "asc-error";
+    note(`could not look up build ${buildNumber}: ${found.error}`);
     return out;
   }
-  const build = buildsRes.parsed?.data?.[0];
-  if (!build) {
-    note(`app ${appId} has no TestFlight build to promote`);
+  if (found.ambiguous) {
+    out.outcome = "ambiguous";
+    note(
+      `${found.rows.length} builds match build number ${buildNumber}; refusing to guess which one to promote`
+    );
     return out;
   }
+  if (!found.build) {
+    const newest = newestKnownBuild(asc, appId);
+    out.outcome = "not-visible";
+    note(
+      `build ${buildNumber} (the one this ship uploaded) is not in App Store Connect yet; ` +
+        `the public beta was NOT refreshed` +
+        (newest?.attributes?.version ? `; the newest build present is ${newest.attributes.version}` : "")
+    );
+    return out;
+  }
+  const build = found.build;
   const state = build.attributes?.processingState;
   if (state !== "VALID") {
-    note(`newest build ${build.attributes?.version} is still ${state}; not promoted yet`);
+    out.outcome = "not-ready";
+    note(`build ${buildNumber} is still ${state}; the public beta was NOT refreshed`);
     return out;
   }
   out.buildId = build.id;
-  out.buildVersion = build.attributes?.version || null;
+  out.buildVersion = build.attributes?.version || String(buildNumber);
 
   // 3. Idempotence:  a build already in the group needs no second link.
-  //    Match on the immutable build `id`, never on `version`:  that is the
-  //    marketing version, which two distinct build numbers can share, and a
-  //    false match here would skip the POST and leave the group stale.
+  //    Match on the immutable build `id`, never on `version`:  an id is
+  //    unique for the life of the build, and JSON:API always returns it.
   const inGroupRes = asc("GET", `/v1/betaGroups/${group.id}/builds?limit=200&fields[builds]=version`);
   const already = inGroupRes.ok
     ? (inGroupRes.parsed?.data || []).some((b) => b.id === out.buildId)
     : false;
   if (already) {
     out.alreadyPresent = true;
+    out.outcome = "already-present";
     log(`build ${out.buildVersion} is already in "${out.groupName}"`);
   } else {
     const linkRes = asc(
@@ -177,10 +296,12 @@ export function promoteExternalBeta({
       JSON.stringify({ data: [{ type: "builds", id: build.id }] })
     );
     if (!linkRes.ok) {
+      out.outcome = "asc-error";
       note(`could not add build ${out.buildVersion} to "${out.groupName}": ${ascErrorText(linkRes)}`);
       return out;
     }
     out.added = true;
+    out.outcome = "promoted";
     log(`build ${out.buildVersion} added to "${out.groupName}"`);
   }
 
@@ -256,11 +377,12 @@ export function readAppleId(root = ROOT, appKey = DEFAULT_APP_KEY) {
 }
 
 function parseArgs(argv) {
-  const out = { appleId: null, group: null, appKey: DEFAULT_APP_KEY };
+  const out = { appleId: null, group: null, appKey: DEFAULT_APP_KEY, build: null };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--apple-id") out.appleId = argv[++i] || null;
     else if (argv[i] === "--group") out.group = argv[++i] || null;
     else if (argv[i] === "--app") out.appKey = argv[++i] || DEFAULT_APP_KEY;
+    else if (argv[i] === "--build") out.build = argv[++i] || null;
   }
   return out;
 }
@@ -285,11 +407,19 @@ function main() {
     console.error("promote-external-beta: no App Store Connect app id; pass --apple-id");
     process.exit(3);
   }
+  const buildNumber = resolveExpectedBuildNumber({ explicit: args.build, repoRoot: ROOT });
+  if (!buildNumber) {
+    console.error(
+      "promote-external-beta: could not determine the build number to promote; pass --build <n>"
+    );
+    process.exit(3);
+  }
   const asc = makeAscClient(ROOT);
   const result = promoteExternalBeta({
     asc,
     appId,
     groupName: args.group,
+    buildNumber,
     log: (m) => console.error(`promote-external-beta: ${m}`),
     warn: (m) => console.error(`promote-external-beta: warning: ${m}`),
   });
