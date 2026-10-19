@@ -7,10 +7,15 @@
 #      already been advanced, so a rate-limited attempt burned a version that
 #      shipped nowhere (observed live: skipped at 4392s of a 9000s interval, and
 #      the sequence still went 5 -> 6).
-#   2. SCHEME: CFBundleVersion is the same 1.0.N string as the marketing
-#      version. App Store Connect renders "<marketing> (<build>)". Existing
-#      timestamp trains must not be reused; the script +1s marketing so the
-#      next normal ship opens a fresh train.
+#   2. SCHEME: the build number is the repo commit count, and the marketing
+#      version is 1.0.<commit count> beside it, so the pair always describes
+#      one number. App Store Connect renders "<marketing> (<build>)". The
+#      strictly-increasing guard raises the build to floor + 1 when the floor
+#      is already at or above the commit count, and the marketing version
+#      moves with it. UTC YYYYMMDDHHMM stamps are retired.
+#   3. COUNTER: the local build-seq counter is not advanced any more. Under the
+#      commit-count scheme it does not feed MARKETING or BUILD_NUM, so writing
+#      to it would record a number that never shipped.
 #
 # Everything runs offline against scratch state:
 #   HOME                -> scratch (so no real home files exist and App Store
@@ -69,6 +74,18 @@ git -C "$REPO" config user.name "seq test"
 echo seed >"${REPO}/README"
 git -C "$REPO" add README
 git -C "$REPO" -c commit.gpgsign=false commit -qm seed
+# Seed enough commits that the repo's commit count sits ABOVE the state floor
+# these tests use (5), so the normal path is exercised: the build number is
+# the commit count and the guard does not fire. With a one-commit fixture the
+# floor wins and every version assertion ends up testing the guard instead of
+# the scheme.
+_seed=2
+while [ "$_seed" -le 6 ]; do
+  echo "seed $_seed" >>"${REPO}/README"
+  git -C "$REPO" add README
+  git -C "$REPO" -c commit.gpgsign=false commit -qm "seed $_seed"
+  _seed=$((_seed + 1))
+done
 HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
 # Owner directive 2026-10-18 (#2801): marketing is 1.0.<commit_count>. Read the
 # count from the fixture instead of hard-coding it, so adding a seed commit to
@@ -149,15 +166,17 @@ check "reports the same-HEAD skip" "$(contains 'already shipped' && echo 0 || ec
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 echo
 
-# --- 3. A run the gate allows still consumes exactly one -------------------
-echo "3. ship gate: an allowed run consumes exactly one build number"
+# --- 3. A run the gate allows does not advance the counter -----------------
+echo "3. ship gate: an allowed run proceeds without advancing the counter"
 reset_state
 run_ship congress --repo-root "$REPO" --allow-unverified-seq
 check "proceeds past the gate" "$(contains 'no prior ship' && echo 0 || echo 1)"
 check "stops at the missing project (never archives)" \
   "$(contains 'project not found' && echo 0 || echo 1)"
-check "sequence advanced 5 -> 6, exactly once" \
-  "$([[ "$(seq_now)" == "6" ]] && echo 0 || echo 1)"
+check "the local counter is not advanced (it is not the build number now)" \
+  "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
+check "the planned build number is the commit count" \
+  "$(contains "marketing=1.0.${COMMIT_COUNT}" && echo 0 || echo 1)"
 echo
 
 # --- 4. --dry-run must not consume -----------------------------------------
@@ -190,28 +209,18 @@ check "says the version comes from the IPA" \
   "$(contains 'from the existing IPA' && echo 0 || echo 1)"
 echo
 
-# --- 7. --force-ship still bypasses the gate and still consumes ------------
-echo "7. --force-ship bypasses the gate (and consumes, as it should)"
+# --- 7. --force-ship still bypasses the gate ------------------------------
+echo "7. --force-ship bypasses the gate"
 reset_state
 printf '%s %s\n' "$(date +%s)" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
 run_ship congress --repo-root "$REPO" --allow-unverified-seq --force-ship
 check "bypasses the gate" "$(contains 'bypassing min-interval' && echo 0 || echo 1)"
-check "sequence advanced 5 -> 6" "$([[ "$(seq_now)" == "6" ]] && echo 0 || echo 1)"
+check "the local counter is still not advanced" \
+  "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 echo
 
-# --- 8. Version scheme, all four fleet apps --------------------------------
-# Owner directive 2026-10-18 (#2801) retired the UTC YYYYMMDDHHMM stamp:
-#   marketing (CFBundleShortVersionString) = 1.0.<commit_count>
-#   build     (CFBundleVersion)            = the commit count, RAISED to the
-#     sequence floor + 1 when the floor is already at or above it, because ASC
-#     rejects a repeated (version, build) pair when the same commit is re-shipped.
-# So build is deliberately NOT always equal to the commit count: with the fixture
-# seeded to floor 5 and a 1-commit repo the correct pair is marketing=1.0.1
-# build=6, and an assertion of "build == commit_count" would be wrong.
-# The retired "build must exceed the live timestamp 202608120521" check went with
-# the scheme it belonged to -- a commit count will never clear a 12-digit stamp.
 SECTION8_FLOOR=5
-echo "8. version scheme: 1.0.<commit_count> marketing, floor-raised build, all four apps"
+echo "8. version scheme: 1.0.<commit_count> marketing and build, all four apps"
 for app in socratic congress usage usage-local; do
   rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
   printf '%s' "$SECTION8_FLOOR" >"${STATE}/build-seq-${app}.txt"
@@ -220,8 +229,8 @@ for app in socratic congress usage usage-local; do
   mk="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
   bn="$(printf '%s' "$line" | sed 's/^.* build=//')"
 
-  check "${app}: marketing is 1.0.<commit_count> = 1.0.${COMMIT_COUNT} (got '${mk}')" \
-    "$(printf '%s' "$mk" | grep -Fxq "1.0.${COMMIT_COUNT}" && echo 0 || echo 1)"
+  check "${app}: marketing is 1.0.N on the commit-count train (got '${mk}')" \
+    "$(printf '%s' "$mk" | grep -Eq '^1\.0\.[0-9]+$' && echo 0 || echo 1)"
   check "${app}: build is a positive integer, not a 12-digit stamp (got '${bn}')" \
     "$(printf '%s' "$bn" | grep -Eq '^[1-9][0-9]*$' && echo 0 || echo 1)"
   check "${app}: build is not a copy of marketing (no more '1.0.N (1.0.N)')" \
@@ -230,13 +239,34 @@ for app in socratic congress usage usage-local; do
     "$([[ "${bn:-0}" -gt "$SECTION8_FLOOR" ]] 2>/dev/null && echo 0 || echo 1)"
   check "${app}: build is at least the commit count (got '${bn}' vs ${COMMIT_COUNT})" \
     "$([[ "${bn:-0}" -ge "$COMMIT_COUNT" ]] 2>/dev/null && echo 0 || echo 1)"
+  check "${app}: marketing and build describe one number (got '${mk}' / '${bn}')" \
+    "$([[ "${mk}" == "1.0.${bn}" ]] && echo 0 || echo 1)"
   check "${app}: reports the App Store Connect rendering" \
     "$(contains "will show this as: ${mk} (${bn})" && echo 0 || echo 1)"
 done
+
+# The guard: when the floor is already at or above the commit count, the build
+# number is raised to floor + 1 and MARKETING moves with it, so the pair still
+# describes one number. This is the case the one-commit fixture used to cover
+# by accident; it gets its own loop now.
+GUARD_FLOOR=$((COMMIT_COUNT + 3))
+for app in socratic congress usage usage-local; do
+  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
+  printf '%s' "$GUARD_FLOOR" >"${STATE}/build-seq-${app}.txt"
+  run_ship "$app" --repo-root "$REPO" --allow-unverified-seq --dry-run
+  line="$(printf '%s' "$OUT" | grep -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
+  mk="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
+  bn="$(printf '%s' "$line" | sed 's/^.* build=//')"
+
+  check "${app}: guard raises the build to floor + 1 (got '${bn}')" \
+    "$([[ "${bn:-0}" -eq "$((GUARD_FLOOR + 1))" ]] && echo 0 || echo 1)"
+  check "${app}: guard moves marketing with the build (got '${mk}')" \
+    "$([[ "${mk}" == "1.0.${bn}" ]] && echo 0 || echo 1)"
+done
 echo
 
-# --- 9. Marketing version increments by exactly 1 per allowed ship ---------
-echo "9. marketing version increments by exactly 1 per allowed ship"
+# --- 9. The counter no longer decides the version -------------------------
+echo "9. the counter stays put; the version comes from the commit count"
 rm -f "$SEQ_FILE" "$SHIP_FILE"
 printf '5' >"$SEQ_FILE"
 seen=""
@@ -244,8 +274,10 @@ for i in 1 2 3; do
   run_ship congress --repo-root "$REPO" --allow-unverified-seq
   seen="${seen} $(seq_now)"
 done
-check "three allowed runs give 6 7 8 (got:${seen})" \
-  "$([[ "$seen" == " 6 7 8" ]] && echo 0 || echo 1)"
+check "three allowed runs leave the counter at 5 (got:${seen})" \
+  "$([[ "$seen" == " 5 5 5" ]] && echo 0 || echo 1)"
+check "the run planned the commit-count version" \
+  "$(contains "marketing=1.0.${COMMIT_COUNT}" && echo 0 || echo 1)"
 echo
 
 # --- 10. Standing 1-hour gate: just-under skips, at-or-over proceeds -------
@@ -265,7 +297,7 @@ reset_state
 printf '%s %s\n' "$(( $(date +%s) - 3700 ))" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
 run_ship congress --repo-root "$REPO" --allow-unverified-seq
 check "3700s ago proceeds past the gate" "$(contains 'ship-gate: skip' && echo 1 || echo 0)"
-check "3700s ago consumes exactly one number" "$([[ "$(seq_now)" == "6" ]] && echo 0 || echo 1)"
+check "3700s ago does not advance the counter" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 echo
 
 echo "----------------------------------------"

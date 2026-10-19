@@ -44,8 +44,16 @@ settings:
     # The ship script passes MARKETING_VERSION / CURRENT_PROJECT_VERSION on the
     # xcodebuild command line. Keep these honest so anyone can answer "what
     # version is this repo at?" without an ASC round trip.
-    MARKETING_VERSION: "1.0.2319"
-    CURRENT_PROJECT_VERSION: "2319"
+    #
+    # This record is also a build-number FLOOR: resolve_seq_floor takes the
+    # highest of the local cache, App Store Connect and this value, and the
+    # strictly-increasing guard then ships max(commit count, floor + 1).
+    # A commit count is large enough to dominate that floor, so a record set
+    # to the count of the commit carrying it would push every later build
+    # above the commit count it is meant to name. Keep it below the count of
+    # any commit that can ship.
+    MARKETING_VERSION: "1.0.2317"
+    CURRENT_PROJECT_VERSION: "2317"
     DEVELOPMENT_TEAM: CC8UTF7ATG
     CODE_SIGN_STYLE: Automatic
     TARGETED_DEVICE_FAMILY: "1,2"
