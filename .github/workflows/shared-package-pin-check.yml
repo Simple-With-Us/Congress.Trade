@@ -45,7 +45,7 @@ jobs:
       - name: Check out upstream tagged release
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          repository: jaywedgeworth22/congress-trading-shared
+          repository: Simple-With-Us/congress-trading-shared
           ref: v${{ steps.vendored.outputs.version }}
           path: .upstream-shared
           persist-credentials: false

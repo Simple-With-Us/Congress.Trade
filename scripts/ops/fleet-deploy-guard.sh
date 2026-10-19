@@ -51,7 +51,7 @@ if [[ -z "$RELEVANCE_PY" ]]; then
     RELEVANCE_PY=/usr/local/lib/congress/deploy_relevance.py
   fi
 fi
-GITHUB_REPO="${GITHUB_REPO:-jaywedgeworth22/Congress.Trade}"
+GITHUB_REPO="${GITHUB_REPO:-Simple-With-Us/Congress.Trade}"
 GITHUB_API="${GITHUB_API:-https://api.github.com}"
 
 CONF="/etc/fleet-deploy-guard.d/${APP_KEY}.env"
