@@ -33,12 +33,12 @@ Edit the runtime copy only through this repo: change the file here, land the PR,
 
 | Field | Value | Example |
 | --- | --- | --- |
-| `MARKETING_VERSION` (`CFBundleShortVersionString`) | `1.0.<seq>`, +1 on every rebuild | `1.0.8` |
-| `CURRENT_PROJECT_VERSION` (`CFBundleVersion`) | UTC timestamp `YYYYMMDDHHMM` | `202608270145` |
+| `MARKETING_VERSION` (`CFBundleShortVersionString`) | `1.0.<commit count>` (`git rev-list --count HEAD`) | `1.0.148` |
+| `CURRENT_PROJECT_VERSION` (`CFBundleVersion`) | the same commit count | `148` |
 
-App Store Connect renders these as `<marketing> (<build>)`, e.g. **`1.0.8 (202608270145)`**.
+App Store Connect renders these as `<marketing> (<build>)`, e.g. **`1.0.148 (148)`**.
 
-Marketing versions increment monotonically (`1.0.#`), and `CFBundleVersion` contains the build timestamp so every archive and build is timestamped and uniquely distinguishable in App Store Connect and TestFlight.
+Unified 2026-10-18 (#2801): the commit count is monotonic and names the exact commit a build came from, so the old UTC timestamp build is retired.  If the sequence floor is already at or above the commit count (a re-ship of the same commit), the build is bumped to floor + 1 so App Store Connect never sees a repeated version and build pair.
 
 `--dry-run` only peeks at the next value and does not consume it, and the sequence file is guarded by an atomic-`mkdir` lock (not `flock(1)`, which does not exist on macOS) so concurrent ships cannot race the counter.
 
