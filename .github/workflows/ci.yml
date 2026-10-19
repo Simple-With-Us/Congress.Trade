@@ -375,6 +375,9 @@ jobs:
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs
 
+      - name: External TestFlight beta promotion
+        run: node --test scripts/promote-external-beta.node-test.mjs
+
       - name: ASC credentials helper (offline)
         run: python3 scripts/asc/test_asc_creds.py
 

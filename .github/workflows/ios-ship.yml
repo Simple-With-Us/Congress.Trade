@@ -270,3 +270,18 @@ jobs:
           # enforces the stable-Xcode rule; it falls back to the host copy only
           # if the repo copy is missing, and logs loudly when it does.
           bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh"
+
+      # CT-2434:  the external TestFlight group (Public Beta, public link) is
+      # what a tester outside the team actually reaches, and it only ever sees
+      # a build someone assigns to it.  It was created 2026-08-31 and never
+      # refreshed, so it served one Aug-2026 build that expired 2026-11-29
+      # while the internal group tracked every ship.  BotFleet and Clutch
+      # promote on every ship;  this repo did not, and that is the gap.
+      #
+      # continue-on-error, always:  a promotion problem is a warning on a ship
+      # that already succeeded, never a red run that blocks the next deploy.
+      - name: Refresh the public TestFlight beta
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        run: node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs"
+
