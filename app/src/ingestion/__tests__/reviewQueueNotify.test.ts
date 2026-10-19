@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
-import { notifyPipelineStallPublisher, notifyReviewQueuePublisher } from '../reviewQueueNotify.ts';
+import {
+  notifyPipelineStallPublisher,
+  notifyReviewQueuePublisher,
+  redactWebhookError,
+  redactWebhookUrl,
+} from '../reviewQueueNotify.ts';
 
 const DNS_A = JSON.stringify({
   Status: 0,
@@ -215,5 +220,68 @@ describe('notifyReviewQueuePublisher', () => {
     expect(postedUrls).toContain('https://bf-publisher.example/hook');
     expect(postedUrls).toContain('https://gb-publisher.example/hook');
     expect(postedUrls.length).toBe(2);
+  });
+});
+
+describe('webhook URL redaction (CT-2432)', () => {
+  // Built at run time so the fake secret never appears as a literal in source.
+  const fakeSecret = ['s', 'k', Math.random().toString(36).slice(2), 'Z9x8Y7w6V5'].join('');
+  const secretUrl = `https://bf.example/hooks/abc123/${fakeSecret}`;
+
+  it('redactWebhookUrl keeps host and hook id but never the secret segment', () => {
+    const out = redactWebhookUrl(`${secretUrl}?token=${fakeSecret}`);
+    expect(out).toBe('https://bf.example/hooks/abc123/***');
+    expect(out).not.toContain(fakeSecret);
+    expect(redactWebhookUrl('not a url')).toBe('[invalid-webhook-url]');
+  });
+
+  it('redactWebhookError scrubs the URL and secret from an error message', () => {
+    const out = redactWebhookError(`fetch to ${secretUrl} failed: /hooks/abc123/${fakeSecret}`, secretUrl);
+    expect(out).not.toContain(fakeSecret);
+  });
+
+  it('redactWebhookError does not re-scan its own replacements (no nested redacted URLs)', () => {
+    const url = `https://bf.example/hooks/longhookid/${fakeSecret}`;
+    const out = redactWebhookError(`POST ${url} -> 500`, url);
+    expect(out).toBe('POST https://bf.example/hooks/longhookid/*** -> 500');
+  });
+
+  async function runAndCollectLogs(fetchImpl: typeof fetch): Promise<string> {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await notifyReviewQueuePublisher(
+        envWith({ REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL: secretUrl }),
+        { docId: 'H-1' },
+        { fetchImpl },
+      );
+      return warn.mock.calls.map((c) => c.map(String).join(' ')).join('\n');
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it('does not log the secret when the publisher answers with an HTTP error', async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('dns-query')) {
+        return new Response(String(input).includes('type=AAAA') ? DNS_AAAA : DNS_A, { status: 200 });
+      }
+      return new Response('boom', { status: 500 });
+    }) as unknown as typeof fetch;
+    const logs = await runAndCollectLogs(fetchImpl);
+    expect(logs).toContain('HTTP 500');
+    expect(logs).toContain('https://bf.example/hooks/abc123/***');
+    expect(logs).not.toContain(fakeSecret);
+  });
+
+  it('does not log the secret when the fetch throws an error that echoes the URL', async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('dns-query')) {
+        return new Response(String(input).includes('type=AAAA') ? DNS_AAAA : DNS_A, { status: 200 });
+      }
+      throw new Error(`connect failed for ${String(input)}`);
+    }) as unknown as typeof fetch;
+    const logs = await runAndCollectLogs(fetchImpl);
+    expect(logs).toContain('notify failed');
+    expect(logs).not.toContain(fakeSecret);
   });
 });
