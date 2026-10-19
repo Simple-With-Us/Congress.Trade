@@ -7,10 +7,10 @@
 #      already been advanced, so a rate-limited attempt burned a version that
 #      shipped nowhere (observed live: skipped at 4392s of a 9000s interval, and
 #      the sequence still went 5 -> 6).
-#   2. SCHEME: CFBundleVersion is the same 1.0.N string as the marketing
-#      version. App Store Connect renders "<marketing> (<build>)". Existing
-#      timestamp trains must not be reused; the script +1s marketing so the
-#      next normal ship opens a fresh train.
+#   2. SCHEME (unified 2026-10-18, #2801): MARKETING_VERSION is 1.0.<commit
+#      count> and CFBundleVersion is the same integer commit count. App Store
+#      Connect renders "<marketing> (<build>)", e.g. "1.0.148 (148)". The old
+#      UTC YYYYMMDDHHMM build stamp is retired.
 #
 # Everything runs offline against scratch state:
 #   HOME                -> scratch (so no real home files exist and App Store
@@ -69,6 +69,14 @@ git -C "$REPO" config user.name "seq test"
 echo seed >"${REPO}/README"
 git -C "$REPO" add README
 git -C "$REPO" -c commit.gpgsign=false commit -qm seed
+# The version is the repo commit count, so give the scratch repo a known count
+# that sits above the sequence floor the tests seed (5): 12 commits.  The re-ship
+# guard (floor >= commit count) is exercised separately in section 8b.
+COMMIT_COUNT=12
+for i in 2 3 4 5 6 7 8 9 10 11 12; do
+  echo "c${i}" >>"${REPO}/README"
+  git -C "$REPO" -c commit.gpgsign=false commit -qam "c${i}"
+done
 HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
 
 SEQ_FILE="${STATE}/build-seq-congress.txt"
@@ -162,7 +170,8 @@ reset_state
 run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "exits 0" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
-check "plans the next version 1.0.6" "$(contains 'marketing=1.0.6' && echo 0 || echo 1)"
+check "plans the commit-count version 1.0.${COMMIT_COUNT} (${COMMIT_COUNT})" \
+  "$(contains "marketing=1.0.${COMMIT_COUNT} build=${COMMIT_COUNT}" && echo 0 || echo 1)"
 echo
 
 # --- 5. --dry-run reports a gated run without consuming --------------------
@@ -195,11 +204,11 @@ check "sequence advanced 5 -> 6" "$([[ "$(seq_now)" == "6" ]] && echo 0 || echo 
 echo
 
 # --- 8. Version scheme, all four fleet apps --------------------------------
-# The highest CFBundleVersion already live on trade.congress.ios (15 timestamp
-# builds run 202608070253 .. 202608120521). A new stamp must exceed it, or a
-# ship that lands back in the 1.0.0 train is rejected by Apple.
-HIGHEST_LIVE_TIMESTAMP_BUILD=202608120521
-echo "8. version scheme: 1.0.N marketing + UTC YYYYMMDDHHMM build, all four apps"
+# Unified 2026-10-18: marketing 1.0.<commit count>, build = commit count.  The
+# new marketing train is never the legacy 1.0.0 train that holds the timestamp
+# builds (202608070253 .. 202608120521), and Apple's strictly-increasing rule
+# is per train, so the old timestamps cannot constrain a new build.
+echo "8. version scheme: 1.0.<commit count> marketing + commit-count build, all four apps"
 for app in socratic congress usage usage-local; do
   rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
   printf '5' >"${STATE}/build-seq-${app}.txt"
@@ -208,17 +217,33 @@ for app in socratic congress usage usage-local; do
   mk="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
   bn="$(printf '%s' "$line" | sed 's/^.* build=//')"
 
-  check "${app}: marketing is a 1.0.N train value (got '${mk}')" \
-    "$(printf '%s' "$mk" | grep -Eq '^1\.0\.[0-9]+$' && echo 0 || echo 1)"
-  check "${app}: build is a 12-digit UTC stamp (got '${bn}')" \
-    "$(printf '%s' "$bn" | grep -Eq '^[0-9]{12}$' && echo 0 || echo 1)"
-  check "${app}: build is not a copy of marketing (no more '1.0.N (1.0.N)')" \
-    "$([[ "$bn" != "$mk" ]] && echo 0 || echo 1)"
-  check "${app}: build exceeds the highest live legacy build ${HIGHEST_LIVE_TIMESTAMP_BUILD}" \
-    "$([[ "${bn:-0}" -gt "$HIGHEST_LIVE_TIMESTAMP_BUILD" ]] 2>/dev/null && echo 0 || echo 1)"
+  check "${app}: marketing is 1.0.<commit count> (got '${mk}')" \
+    "$([[ "$mk" == "1.0.${COMMIT_COUNT}" ]] && echo 0 || echo 1)"
+  check "${app}: build is the commit count (got '${bn}')" \
+    "$([[ "$bn" == "${COMMIT_COUNT}" ]] && echo 0 || echo 1)"
+  check "${app}: build is not a legacy 12-digit UTC stamp" \
+    "$(printf '%s' "$bn" | grep -Eq '^[0-9]{12}$' && echo 1 || echo 0)"
+  check "${app}: build equals the marketing patch number ('1.0.N (N)')" \
+    "$([[ "$mk" == "1.0.${bn}" ]] && echo 0 || echo 1)"
   check "${app}: reports the App Store Connect rendering" \
     "$(contains "will show this as: ${mk} (${bn})" && echo 0 || echo 1)"
 done
+echo
+
+# --- 8b. Re-ship guard: never at or below the known floor ------------------
+# When the sequence floor is already at or above the commit count (a re-ship of
+# the same commit, or a counter that ran ahead), the build is bumped to
+# floor + 1 so ASC does not reject a repeated (version, build) pair.
+echo "8b. re-ship guard: build stays strictly above the sequence floor"
+reset_state
+printf '20' >"$SEQ_FILE"
+run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
+line="$(printf '%s' "$OUT" | grep -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
+bn="$(printf '%s' "$line" | sed 's/^.* build=//')"
+check "floor 20 >= commit count ${COMMIT_COUNT}: build is 21 (got '${bn}')" \
+  "$([[ "$bn" == "21" ]] && echo 0 || echo 1)"
+check "says why the build was moved" \
+  "$(contains "commit count ${COMMIT_COUNT} already shipped; using 21 instead" && echo 0 || echo 1)"
 echo
 
 # --- 9. Marketing version increments by exactly 1 per allowed ship ---------
