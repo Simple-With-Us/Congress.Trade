@@ -90,6 +90,45 @@ async function loadPublisherConfig(env: Env): Promise<ReviewQueuePublisherConfig
   return { targets, secret };
 }
 
+/**
+ * Publisher targets are BotFleet capability URLs (`https://HOST/hooks/ID/SECRET`), so the
+ * URL itself is a credential.  Never log it raw: keep the host and `/hooks/ID/***` only,
+ * and drop userinfo, query and fragment.
+ */
+export function redactWebhookUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    const hooks = /^\/hooks\/([^/]+)\/.+/.exec(u.pathname);
+    const path = hooks ? `/hooks/${hooks[1]}/***` : u.pathname.length > 1 ? '/***' : '';
+    return `${u.protocol}//${u.host}${path}`;
+  } catch {
+    return '[invalid-webhook-url]';
+  }
+}
+
+/** Redact the target URL (and its secret path segment) from an error message before logging. */
+export function redactWebhookError(message: string, rawUrl: string): string {
+  let out = message;
+  const redacted = redactWebhookUrl(rawUrl);
+  const needles = new Set<string>([rawUrl]);
+  try {
+    const u = new URL(rawUrl);
+    needles.add(u.href);
+    needles.add(u.pathname + u.search);
+    for (const seg of u.pathname.split('/')) {
+      if (seg.length >= 8) needles.add(seg);
+    }
+    if (u.search.length > 1) needles.add(u.search.slice(1));
+    if (u.password) needles.add(u.password);
+  } catch {
+    // unparseable: only the raw string is known
+  }
+  for (const needle of [...needles].sort((a, b) => b.length - a.length)) {
+    if (needle) out = out.split(needle).join(redacted);
+  }
+  return out;
+}
+
 async function postSignedPublisherWebhook(
   env: Env,
   cfg: ReviewQueuePublisherConfig,
@@ -110,7 +149,10 @@ async function postSignedPublisherWebhook(
       fetchImpl: deps.fetchImpl,
     });
     if (targetError) {
-      console.warn(`review_queue notify: blocked target (${logLabel}) —`, targetError);
+      console.warn(
+        `review_queue notify: blocked target (${logLabel} → ${redactWebhookUrl(url)}) —`,
+        redactWebhookError(targetError, url),
+      );
       continue;
     }
     const headers: Record<string, string> = {
@@ -144,11 +186,14 @@ async function postSignedPublisherWebhook(
       }
       if (!response.ok) {
         console.warn(
-          `review_queue notify: publisher returned HTTP ${response.status} for ${logLabel} → ${url}`,
+          `review_queue notify: publisher returned HTTP ${response.status} for ${logLabel} → ${redactWebhookUrl(url)}`,
         );
       }
     } catch (err) {
-      console.warn(`review_queue notify failed (${logLabel} → ${url}):`, (err as Error).message);
+      console.warn(
+        `review_queue notify failed (${logLabel} → ${redactWebhookUrl(url)}):`,
+        redactWebhookError((err as Error).message, url),
+      );
     }
   }
 }
