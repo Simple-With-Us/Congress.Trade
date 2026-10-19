@@ -108,7 +108,7 @@ struct WidgetTrade: Codable, Identifiable {
     }
 
     var accessibleDescription: String {
-        "\(symbol), \(direction.title), \(memberName), \(amountText).  Traded \(WidgetDate.day(transaction?.date)).  Filed \(WidgetDate.day(filing?.filedDate))."
+        "\(symbol), \(direction.title), \(memberName), \(amountText).  Traded \(WidgetDate.day(transaction?.date)).  Filed \(WidgetDate.day(filing?.filedDate))."
     }
 
     private static func clean(_ value: String?) -> String? {
@@ -116,12 +116,17 @@ struct WidgetTrade: Codable, Identifiable {
         return text
     }
 
-    private static func dollars(_ value: Double) -> String {
+    // Hoisted so a five-row render does not rebuild a NumberFormatter per amount.
+    private static let currencyFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.numberStyle = .currency
         formatter.locale = Locale(identifier: "en_US")
-        formatter.maximumFractionDigits = value.rounded() == value ? 0 : 2
-        return formatter.string(from: NSNumber(value: value)) ?? "Amount unavailable"
+        return formatter
+    }()
+
+    private static func dollars(_ value: Double) -> String {
+        currencyFormatter.maximumFractionDigits = value.rounded() == value ? 0 : 2
+        return currencyFormatter.string(from: NSNumber(value: value)) ?? "Amount unavailable"
     }
 }
 
@@ -235,34 +240,54 @@ struct Provider: TimelineProvider {
 }
 
 private enum WidgetDate {
+    // Formatters are hoisted: SwiftUI rebuilds these views per render, and
+    // DateFormatter allocation is one of Foundation's costlier paths.
+    private static let parser: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.isLenient = false
+        return formatter
+    }()
+
+    private static let dayDisplay: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter
+    }()
+
+    private static let displayCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)
+        return calendar
+    }()
+
     static func day(_ raw: String?) -> String {
         guard let raw else { return "—" }
         let text = String(raw.prefix(10))
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.calendar = Calendar(identifier: .gregorian)
-        parser.timeZone = TimeZone(secondsFromGMT: 0)
-        parser.dateFormat = "yyyy-MM-dd"
-        parser.isLenient = false
         guard let date = parser.date(from: text), parser.string(from: date) == text else { return "—" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US")
-        formatter.calendar = parser.calendar
-        formatter.timeZone = parser.timeZone
-        let year = parser.calendar.component(.year, from: date)
-        let currentYear = parser.calendar.component(.year, from: Date())
-        formatter.dateFormat = year == currentYear ? "MMM d" : "MMM d, yy"
-        return formatter.string(from: date)
+        let year = displayCalendar.component(.year, from: date)
+        let currentYear = displayCalendar.component(.year, from: Date())
+        dayDisplay.dateFormat = year == currentYear ? "MMM d" : "MMM d, yy"
+        return dayDisplay.string(from: date)
     }
 
-    static func refresh(_ date: Date) -> String {
+    private static let refreshDisplay: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US")
         formatter.timeZone = TimeZone(identifier: "America/Chicago")
+        return formatter
+    }()
+
+    static func refresh(_ date: Date) -> String {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = formatter.timeZone
-        formatter.dateFormat = calendar.isDateInToday(date) ? "h:mm a" : "MMM d, h:mm a"
-        return formatter.string(from: date)
+        calendar.timeZone = refreshDisplay.timeZone
+        refreshDisplay.dateFormat = calendar.isDateInToday(date) ? "h:mm a" : "MMM d, h:mm a"
+        return refreshDisplay.string(from: date)
     }
 }
 
@@ -450,7 +475,7 @@ struct CongressTradeWidgetEntryView: View {
                 .foregroundStyle(brand)
             Text(entry.isPlaceholder ? "Latest Disclosures" : entry.refreshFailed ? "Feed Unavailable" : entry.snapshot == nil ? "Loading Disclosures" : "No Disclosures Yet")
                 .font(.system(size: 14, weight: .semibold))
-            Text(entry.isPlaceholder ? "Fetching public filings" : entry.refreshFailed ? "We’ll try again soon.  Tap to open the feed." : entry.snapshot == nil ? "The public feed will refresh shortly." : "New filings will appear here.")
+            Text(entry.isPlaceholder ? "Fetching public filings" : entry.refreshFailed ? "We’ll try again soon.  Tap to open the feed." : entry.snapshot == nil ? "The public feed will refresh shortly." : "New filings will appear here.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
@@ -504,7 +529,7 @@ struct CongressTradeWidget: Widget {
             CongressTradeWidgetEntryView(entry: entry)
         }
         .configurationDisplayName("Latest Disclosures")
-        .description("See recently added disclosures, who bought or sold, reported amount ranges, and trade and filing dates.  Tap a disclosure for the details.")
+        .description("See recently added disclosures, who bought or sold, reported amount ranges, and trade and filing dates.  Tap a disclosure for the details.")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
