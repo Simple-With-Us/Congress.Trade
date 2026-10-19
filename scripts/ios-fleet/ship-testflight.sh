@@ -193,6 +193,12 @@ load_secrets() {
     ASC_ISSUER_ID="$(fleet_secret_get ASC_ISSUER_ID /asc || true)"
   fi
   if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" ]]; then
+    # ASC_KEY_ID is interpolated into file paths below; Apple key ids are always
+    # 10 uppercase alphanumerics, so reject anything else before it can traverse.
+    if [[ ! "$ASC_KEY_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+      log "ASC_KEY_ID must be 10 uppercase alphanumeric chars (Apple App Store Connect key id)"
+      return 0
+    fi
     export ASC_KEY_ID ASC_ISSUER_ID
     local _kp="${ASC_KEY_PATH:-}"
     _kp="${_kp/#\~/$HOME}"
