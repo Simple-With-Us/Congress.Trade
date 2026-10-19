@@ -37,4 +37,4 @@ python3 -m venv /tmp/ascvenv && /tmp/ascvenv/bin/pip install PyJWT cryptography
 Each script gets `ASC_KEY_ID`, `ASC_ISSUER_ID` and the key from `asc_creds.py`:  process env
 first (`ASC_KEY_PATH` or `ASC_KEY_P8`), then Infisical `/asc` through `fleet-secrets get`
 (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`).  It signs a short-lived JWT and never prints them.
-Nothing reads `~/.secrets` (AFC-359).  Offline tests:  `python3 scripts/asc/test_asc_creds.py`.  No key material is stored in this repo.
+No local secrets folder is read (AFC-359).  Offline tests:  `python3 scripts/asc/test_asc_creds.py`.  No key material is stored in this repo.

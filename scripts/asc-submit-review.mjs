@@ -7,7 +7,7 @@
  * submission with the app version plus both Premium subscriptions, and submits.
  *
  * Auth: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from env, else Infisical /asc through
- * fleet-secrets (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8).  Never printed.  Nothing reads ~/.secrets.
+ * fleet-secrets (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8).  Never printed.  No local secrets folder is read.
  * Usage:
  *   node scripts/asc-submit-review.mjs            # dry run
  *   node scripts/asc-submit-review.mjs --apply    # write to App Store Connect
