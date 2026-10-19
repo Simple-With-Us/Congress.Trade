@@ -2,7 +2,7 @@
 
 Env first (ASC_KEY_ID, ASC_ISSUER_ID, then ASC_KEY_PATH or ASC_KEY_P8), then Infisical
 Fleet-OPS folder /asc through `fleet-secrets get` (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8).
-Nothing reads ~/.secrets (AFC-359).  Values are never printed or logged.  FLEET_SECRETS
+No local secrets folder is read (AFC-359).  Values are never printed or logged.  FLEET_SECRETS
 overrides the fleet-secrets binary (tests inject a fake).
 """
 import os
