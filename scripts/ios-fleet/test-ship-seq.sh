@@ -13,9 +13,11 @@
 #      strictly-increasing guard raises the build to floor + 1 when the floor
 #      is already at or above the commit count, and the marketing version
 #      moves with it. UTC YYYYMMDDHHMM stamps are retired.
-#   3. COUNTER: the local build-seq counter is not advanced any more. Under the
-#      commit-count scheme it does not feed MARKETING or BUILD_NUM, so writing
-#      to it would record a number that never shipped.
+#   3. COUNTER: the local build-seq counter is retired. Under the commit-count
+#      scheme it is never advanced and it no longer feeds the floor, so a
+#      leftover from the retired timestamp scheme cannot push the build number
+#      above the commit count it names. The committed version record is the
+#      floor input instead.
 #
 # Everything runs offline against scratch state:
 #   HOME                -> scratch (so no real home files exist and App Store
@@ -136,6 +138,31 @@ reset_state() {
   printf '5' >"$SEQ_FILE"
 }
 
+# The committed version record is the floor input the guard tests drive.  Under
+# the commit-count scheme the local build-seq counter is retired, so the record
+# in project.pbxproj is what resolve_seq_floor() reads.  The paths below are
+# the projectRel entries in this repo's scripts/ios-fleet/apps.json.
+project_rel() { # <app key>
+  case "$1" in
+    socratic)          printf '%s' 'ios/Socratic Trade.xcodeproj' ;;
+    congress)          printf '%s' 'clients/ios/CongressTrade.xcodeproj' ;;
+    usage|usage-local) printf '%s' 'ios/UsageMonitor/UsageMonitor.xcodeproj' ;;
+    *)                 return 1 ;;
+  esac
+}
+
+write_record() { # <app key> <record N>
+  local rel dir
+  rel="$(project_rel "$1")" || return 1
+  dir="${REPO}/${rel}"
+  mkdir -p "$dir"
+  {
+    echo '/* fixture project.pbxproj */'
+    echo "        CURRENT_PROJECT_VERSION = ${2};"
+    echo "        MARKETING_VERSION = 1.0.${2};"
+  } >"${dir}/project.pbxproj"
+}
+
 echo "ship-testflight.sh build-sequence tests"
 echo "state=${STATE}"
 echo
@@ -252,7 +279,7 @@ done
 GUARD_FLOOR=$((COMMIT_COUNT + 3))
 for app in socratic congress usage usage-local; do
   rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  printf '%s' "$GUARD_FLOOR" >"${STATE}/build-seq-${app}.txt"
+  write_record "$app" "$GUARD_FLOOR"
   run_ship "$app" --repo-root "$REPO" --allow-unverified-seq --dry-run
   line="$(printf '%s' "$OUT" | grep -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
   mk="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
@@ -261,7 +288,12 @@ for app in socratic congress usage usage-local; do
   check "${app}: guard raises the build to floor + 1 (got '${bn}')" \
     "$([[ "${bn:-0}" -eq "$((GUARD_FLOOR + 1))" ]] && echo 0 || echo 1)"
   check "${app}: guard moves marketing with the build (got '${mk}')" \
-    "$([[ "${mk}" == "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "1.0.${bn}" ]] && echo 0 || echo 1)"
+  # Leave the fixture as the earlier sections found it:  the record is the only
+  # floor source left, and the sections after this loop expect the plain
+  # commit-count version.
+  rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
+  rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
 
 # Regression guard (2026-10-19): the operator-override path must floor against
