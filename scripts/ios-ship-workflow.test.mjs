@@ -39,7 +39,8 @@ test("ios-ship.yml keeps the ship gate and never uses secrets in if", () => {
   assert.match(ship, /refusing to archive a mute TestFlight build/);
   assert.match(ship, /SENTRY_DSN present for archive/);
 
-  assert.match(prepare, /ASC_KEY_P8 or ASC_KEY_PATH required/);
+  assert.match(prepare, /ASC_KEY_PATH required/);
+  assert.doesNotMatch(prepare, /\.secrets"/);
   assert.doesNotMatch(prepare, /echo "\$ASC_KEY_P8"/);
   assert.doesNotMatch(prepare, /echo "\$IOS_DIST_P12/);
 });

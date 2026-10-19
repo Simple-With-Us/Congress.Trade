@@ -113,4 +113,4 @@ bash scripts/ios-ship-testflight.sh --export-only
 Fleet driver (all three apps): `/Users/jay/apps/ios-fleet/README.md`.
 
 Bundle ID: `trade.congress.ios`. Team: `CC8UTF7ATG`. Requires App Store Connect
-app record + Xcode session or `~/.secrets/appstore-connect.env`.
+app record + Xcode session or ASC credentials (env, else Infisical `/asc` via `fleet-secrets`).

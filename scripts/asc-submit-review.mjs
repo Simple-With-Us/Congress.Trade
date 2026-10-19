@@ -6,12 +6,14 @@
  * cancels the stale UNRESOLVED_ISSUES submission, creates a new IOS review
  * submission with the app version plus both Premium subscriptions, and submits.
  *
- * Auth: ~/.secrets/appstore-connect.env (never printed).
+ * Auth: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from env, else Infisical /asc through
+ * fleet-secrets (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8).  Never printed.  Nothing reads ~/.secrets.
  * Usage:
  *   node scripts/asc-submit-review.mjs            # dry run
  *   node scripts/asc-submit-review.mjs --apply    # write to App Store Connect
  */
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createHash, createSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -32,16 +34,28 @@ const VIDEO_NAME = "account-deletion-physical-device.mp4";
 const NOTES_PATH = process.env.ASC_REVIEW_NOTES
   || join(homedir(), "Code/Congress.Trade/docs/asc/REVIEW-NOTES.txt");
 
-function loadEnvFile(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+function fleetSecret(name) {
+  const bin = process.env.FLEET_SECRETS || join(homedir(), ".local", "bin", "fleet-secrets");
+  try {
+    return execFileSync(bin, ["get", name, "--path", "/asc"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 30000
+    }).replace(/\r?\n$/, "").trim();
+  } catch {
+    return "";
   }
-  return env;
+}
+
+function resolveAscCredentials() {
+  const fromEnv = (n) => String(process.env[n] ?? "").trim();
+  const keyId = fromEnv("ASC_KEY_ID") || fleetSecret("ASC_KEY_ID");
+  const issuerId = fromEnv("ASC_ISSUER_ID") || fleetSecret("ASC_ISSUER_ID");
+  const keyPath = fromEnv("ASC_KEY_PATH");
+  const privateKeyPem = keyPath && existsSync(keyPath)
+    ? readFileSync(keyPath, "utf8")
+    : (fromEnv("ASC_KEY_P8") || fleetSecret("ASC_KEY_P8")).replace(/\\n/g, "\n");
+  return { keyId, issuerId, privateKeyPem };
 }
 
 function base64url(input) {
@@ -72,13 +86,12 @@ function sleep(ms) {
 }
 
 async function main() {
-  const env = loadEnvFile(join(homedir(), ".secrets/appstore-connect.env"));
-  if (!env.ASC_KEY_ID || !env.ASC_ISSUER_ID || !env.ASC_KEY_PATH) {
-    console.error("missing ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH");
+  const { keyId, issuerId, privateKeyPem } = resolveAscCredentials();
+  if (!keyId || !issuerId || !privateKeyPem) {
+    console.error("missing ASC_KEY_ID / ASC_ISSUER_ID / key: set them in env or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)");
     process.exit(1);
   }
-  const privateKeyPem = readFileSync(env.ASC_KEY_PATH, "utf8");
-  const token = signJwt({ keyId: env.ASC_KEY_ID, issuerId: env.ASC_ISSUER_ID, privateKeyPem });
+  const token = signJwt({ keyId, issuerId, privateKeyPem });
 
   async function api(method, apiPath, jsonBody) {
     const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;

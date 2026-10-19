@@ -13,7 +13,7 @@
  *
  * Usage (from app/) — note the DELIBERATE absence of --allow-write, which makes
  * the process incapable of touching the filesystem at all:
- *   CT_ADMIN_TOKEN_FILE=~/.secrets/ct-admin-token \
+ *   CT_ADMIN_TOKEN_FILE=<0600 file holding the token, from Infisical CT_ADMIN_TOKEN> \
  *     deno run --allow-net --allow-env --allow-read \
  *     scripts/dry-run-asset-name-cleanup.ts [options]
  *

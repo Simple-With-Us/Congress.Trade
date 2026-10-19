@@ -516,7 +516,7 @@ bash scripts/ios-ship-testflight.sh
 ```
 
 Fleet: `/Users/jay/apps/ios-fleet/README.md`. Bundle `trade.congress.ios`, team `CC8UTF7ATG`.
-Secrets only via `~/.secrets/appstore-connect.env` (never print).
+Secrets only via env or Infisical `/asc` (`fleet-secrets get`;  never print;  nothing reads `~/.secrets`).
 
 ## Bundle identifiers (canonical table — 2026-09-22)
 

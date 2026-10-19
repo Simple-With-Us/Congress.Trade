@@ -54,7 +54,7 @@ app/.prod.vars.local
 .prod.vars.local
 .upstream-shared/
 
-# Apple Auth Keys (APNs / DeviceCheck / Sign in with Apple) — canonical copy in ~/.secrets/
+# Apple Auth Keys (APNs / DeviceCheck / Sign in with Apple) — canonical copy in Infisical (`fleet-secrets get`)
 *.p8
 
 # Merge/patch leftovers. app/docker-compose.yml.orig and two .patch files
