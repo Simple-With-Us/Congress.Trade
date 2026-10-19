@@ -134,9 +134,13 @@ export function promoteExternalBeta({
 
   // 2. The newest build.  A build that is still processing cannot be
   //    distributed, and promoting it would put the group in a half state.
+  //    Ask App Store Connect for VALID builds only:  right after a ship the
+  //    newest upload is still PROCESSING, so without the filter this query
+  //    returns that build, the guard below bails, and the public group never
+  //    gets refreshed.  The guard stays as a safety net.
   const buildsRes = asc(
     "GET",
-    `/v1/builds?filter[app]=${appId}&sort=-uploadedDate&limit=1&fields[builds]=version,processingState,uploadedDate`
+    `/v1/builds?filter[app]=${appId}&filter[processingState]=VALID&sort=-uploadedDate&limit=1&fields[builds]=version,processingState,uploadedDate`
   );
   if (!buildsRes.ok) {
     note(`could not list builds: ${ascErrorText(buildsRes)}`);
@@ -156,9 +160,12 @@ export function promoteExternalBeta({
   out.buildVersion = build.attributes?.version || null;
 
   // 3. Idempotence:  a build already in the group needs no second link.
+  //    Match on the immutable build `id`, never on `version`:  that is the
+  //    marketing version, which two distinct build numbers can share, and a
+  //    false match here would skip the POST and leave the group stale.
   const inGroupRes = asc("GET", `/v1/betaGroups/${group.id}/builds?limit=200&fields[builds]=version`);
   const already = inGroupRes.ok
-    ? (inGroupRes.parsed?.data || []).some((b) => b.attributes?.version === out.buildVersion)
+    ? (inGroupRes.parsed?.data || []).some((b) => b.id === out.buildId)
     : false;
   if (already) {
     out.alreadyPresent = true;
@@ -260,7 +267,20 @@ function parseArgs(argv) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const appId = args.appleId || readAppleId(ROOT, args.appKey);
+  let appId = args.appleId;
+  if (!appId) {
+    // A missing or malformed apps.json throws out of readAppleId.  This runs
+    // inside a ship that already succeeded, so that is a warning on the
+    // documented exit 3, never an unhandled throw and exit 1.
+    try {
+      appId = readAppleId(ROOT, args.appKey);
+    } catch (err) {
+      console.error(
+        `promote-external-beta: warning: could not read the app id from apps.json (${err?.message || err})`
+      );
+      process.exit(3);
+    }
+  }
   if (!appId) {
     console.error("promote-external-beta: no App Store Connect app id; pass --apple-id");
     process.exit(3);

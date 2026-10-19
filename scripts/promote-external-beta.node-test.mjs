@@ -27,6 +27,8 @@ function fakeAsc(state = {}) {
       id: "b1",
       attributes: { version: "2320", processingState: "VALID", uploadedDate: "2026-10-19T11:54:52-07:00" },
     },
+    // The build list, newest first.  Defaults to the single `build` above.
+    builds: state.builds || null,
     inGroup: state.inGroup || [],
     externalState: state.externalState || "READY_FOR_BETA_SUBMISSION",
     linkOk: state.linkOk !== false,
@@ -55,7 +57,13 @@ function fakeAsc(state = {}) {
     }
     if (p === "/v1/builds" && path.includes("filter[app]")) {
       if (!s.buildsOk) return fail("build list failed", 500);
-      return ok({ data: s.build ? [s.build] : [] });
+      const all = s.builds || (s.build ? [s.build] : []);
+      // App Store Connect honours filter[processingState]; the fake does too,
+      // so a test can prove which build the script actually selects.
+      if (path.includes("filter[processingState]=VALID")) {
+        return ok({ data: all.filter((b) => b.attributes?.processingState === "VALID") });
+      }
+      return ok({ data: all });
     }
     if (/^\/v1\/betaGroups\/[^/]+\/builds$/.test(p)) {
       return ok({ data: s.inGroup });
@@ -135,6 +143,43 @@ test("refuses to promote a build that is still processing", () => {
   assert.equal(result.added, false);
   assert.equal(result.warnings, 1);
   assert.equal(asc.calls.some((c) => c.method === "POST"), false);
+});
+
+test("promotes the newest VALID build when the newest upload is still processing", () => {
+  // The shape right after a ship: the build just uploaded is PROCESSING and the
+  // previous one is VALID.  Without filter[processingState]=VALID the script
+  // sees only the PROCESSING build and never refreshes the public group.
+  const asc = fakeAsc({
+    builds: [
+      { id: "b2", attributes: { version: "2321", processingState: "PROCESSING" } },
+      { id: "b1", attributes: { version: "2320", processingState: "VALID" } },
+    ],
+  });
+  const result = promoteExternalBeta({ asc, appId: "6798076688", log: noop, warn: noop });
+
+  assert.equal(result.added, true);
+  assert.equal(result.buildId, "b1");
+  assert.equal(result.buildVersion, "2320");
+
+  const list = asc.calls.find((c) => c.path.startsWith("/v1/builds?"));
+  assert.match(list.path, /filter\[processingState\]=VALID/);
+});
+
+test("links a build that shares a marketing version with an in-group build", () => {
+  // `version` is the marketing version, which two build numbers can share.
+  // Matching on it made this look already-present and skipped the POST.
+  const asc = fakeAsc({
+    build: { id: "b2", attributes: { version: "1.0.0", processingState: "VALID" } },
+    inGroup: [{ id: "b1", attributes: { version: "1.0.0" } }],
+  });
+  const result = promoteExternalBeta({ asc, appId: "6798076688", log: noop, warn: noop });
+
+  assert.equal(result.alreadyPresent, false);
+  assert.equal(result.added, true);
+
+  const link = asc.calls.find((c) => c.method === "POST" && c.path.includes("/relationships/builds"));
+  assert.ok(link, "a distinct build id must be linked even with the same version");
+  assert.deepEqual(JSON.parse(link.body).data, [{ type: "builds", id: "b2" }]);
 });
 
 test("warns and does nothing when the app has no external beta group", () => {
