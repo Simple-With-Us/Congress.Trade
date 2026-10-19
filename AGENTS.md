@@ -278,7 +278,9 @@ Public rules that belong in this file:
   overrides. Do not re-export Infisical into a tracked `.prod.vars`.
 - Never commit `.dev.vars`, real API keys, tokens, or generated local state, and
   never print or paste secret values into chat, code, logs, or PR bodies.  For
-  iOS, secrets stay in Infisical or the macOS Keychain and are never printed.
+  iOS, secrets stay in Infisical or the macOS Keychain and are never printed;
+  the one documented exception is the App Store Connect credentials file named
+  in the iOS native ship section below, which tooling reads and never prints.
 - The shared package is a tokenless public git dependency.  Do not reintroduce
   registry auth (`NODE_AUTH_TOKEN`, scoped-registry `.npmrc`) unless the user
   explicitly asks for a private registry again.
