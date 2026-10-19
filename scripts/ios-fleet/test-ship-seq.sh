@@ -70,6 +70,10 @@ echo seed >"${REPO}/README"
 git -C "$REPO" add README
 git -C "$REPO" -c commit.gpgsign=false commit -qm seed
 HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
+# Owner directive 2026-10-18 (#2801): marketing is 1.0.<commit_count>. Read the
+# count from the fixture instead of hard-coding it, so adding a seed commit to
+# the harness cannot silently stale section 4 a second time.
+COMMIT_COUNT="$(git -C "$REPO" rev-list --count HEAD)"
 
 SEQ_FILE="${STATE}/build-seq-congress.txt"
 SHIP_FILE="${STATE}/last-ship-congress.txt"
@@ -162,7 +166,8 @@ reset_state
 run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "exits 0" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
-check "plans the next version 1.0.6" "$(contains 'marketing=1.0.6' && echo 0 || echo 1)"
+check "plans the next version 1.0.${COMMIT_COUNT}" \
+  "$(contains "marketing=1.0.${COMMIT_COUNT}" && echo 0 || echo 1)"
 echo
 
 # --- 5. --dry-run reports a gated run without consuming --------------------
@@ -195,27 +200,36 @@ check "sequence advanced 5 -> 6" "$([[ "$(seq_now)" == "6" ]] && echo 0 || echo 
 echo
 
 # --- 8. Version scheme, all four fleet apps --------------------------------
-# The highest CFBundleVersion already live on trade.congress.ios (15 timestamp
-# builds run 202608070253 .. 202608120521). A new stamp must exceed it, or a
-# ship that lands back in the 1.0.0 train is rejected by Apple.
-HIGHEST_LIVE_TIMESTAMP_BUILD=202608120521
-echo "8. version scheme: 1.0.N marketing + UTC YYYYMMDDHHMM build, all four apps"
+# Owner directive 2026-10-18 (#2801) retired the UTC YYYYMMDDHHMM stamp:
+#   marketing (CFBundleShortVersionString) = 1.0.<commit_count>
+#   build     (CFBundleVersion)            = the commit count, RAISED to the
+#     sequence floor + 1 when the floor is already at or above it, because ASC
+#     rejects a repeated (version, build) pair when the same commit is re-shipped.
+# So build is deliberately NOT always equal to the commit count: with the fixture
+# seeded to floor 5 and a 1-commit repo the correct pair is marketing=1.0.1
+# build=6, and an assertion of "build == commit_count" would be wrong.
+# The retired "build must exceed the live timestamp 202608120521" check went with
+# the scheme it belonged to -- a commit count will never clear a 12-digit stamp.
+SECTION8_FLOOR=5
+echo "8. version scheme: 1.0.<commit_count> marketing, floor-raised build, all four apps"
 for app in socratic congress usage usage-local; do
   rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  printf '5' >"${STATE}/build-seq-${app}.txt"
+  printf '%s' "$SECTION8_FLOOR" >"${STATE}/build-seq-${app}.txt"
   run_ship "$app" --repo-root "$REPO" --allow-unverified-seq --dry-run
   line="$(printf '%s' "$OUT" | grep -o 'marketing=[^ ]* build=[^ ]*' | head -1)"
   mk="$(printf '%s' "$line" | sed 's/^marketing=//; s/ build=.*$//')"
   bn="$(printf '%s' "$line" | sed 's/^.* build=//')"
 
-  check "${app}: marketing is a 1.0.N train value (got '${mk}')" \
-    "$(printf '%s' "$mk" | grep -Eq '^1\.0\.[0-9]+$' && echo 0 || echo 1)"
-  check "${app}: build is a 12-digit UTC stamp (got '${bn}')" \
-    "$(printf '%s' "$bn" | grep -Eq '^[0-9]{12}$' && echo 0 || echo 1)"
+  check "${app}: marketing is 1.0.<commit_count> = 1.0.${COMMIT_COUNT} (got '${mk}')" \
+    "$(printf '%s' "$mk" | grep -Fxq "1.0.${COMMIT_COUNT}" && echo 0 || echo 1)"
+  check "${app}: build is a positive integer, not a 12-digit stamp (got '${bn}')" \
+    "$(printf '%s' "$bn" | grep -Eq '^[1-9][0-9]*$' && echo 0 || echo 1)"
   check "${app}: build is not a copy of marketing (no more '1.0.N (1.0.N)')" \
     "$([[ "$bn" != "$mk" ]] && echo 0 || echo 1)"
-  check "${app}: build exceeds the highest live legacy build ${HIGHEST_LIVE_TIMESTAMP_BUILD}" \
-    "$([[ "${bn:-0}" -gt "$HIGHEST_LIVE_TIMESTAMP_BUILD" ]] 2>/dev/null && echo 0 || echo 1)"
+  check "${app}: build strictly exceeds the sequence floor ${SECTION8_FLOOR} (got '${bn}')" \
+    "$([[ "${bn:-0}" -gt "$SECTION8_FLOOR" ]] 2>/dev/null && echo 0 || echo 1)"
+  check "${app}: build is at least the commit count (got '${bn}' vs ${COMMIT_COUNT})" \
+    "$([[ "${bn:-0}" -ge "$COMMIT_COUNT" ]] 2>/dev/null && echo 0 || echo 1)"
   check "${app}: reports the App Store Connect rendering" \
     "$(contains "will show this as: ${mk} (${bn})" && echo 0 || echo 1)"
 done
