@@ -118,11 +118,17 @@ describe('pipelineLoudAlerts', () => {
 
   it('alerts terminal ingest failure once per doc via webhook + Sentry', async () => {
     const { env } = kvEnv();
+    // The dedup window is 7 days, so the first alert has to sit inside it.
+    // A hardcoded timestamp ages out of that window and makes this test fail
+    // from the day the window passed, with no code change at all:  the second
+    // call carries no `at`, so it lands on the real clock and is then outside
+    // the window of a timestamp written in the past.
+    const firstAlertAt = new Date(Date.now() - 60_000).toISOString();
     await alertPipelineTerminalFailure(env, {
       docId: 'H-2026-9116355',
       stage: 'ingest',
       lastError: 'consumer retry budget exhausted',
-      at: '2026-10-12T12:00:00.000Z',
+      at: firstAlertAt,
     });
     expect(notifyReviewSpy).toHaveBeenCalledTimes(1);
     expect(notifyReviewSpy.mock.calls[0][1]).toMatchObject({
