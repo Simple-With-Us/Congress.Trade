@@ -364,9 +364,24 @@ asc_latest_seq() {
     return 1
   fi
   set +e
-  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" 2>/dev/null)
+  # Capture stderr to a temp file rather than sending it to /dev/null: the
+  # latest-build-seq: lines carry Apple's HTTP status and error code, which is
+  # the only thing that explains a failed sequence lookup.  Clean up with the
+  # redirect on every path -- a bare `rm` can be a wrapper that prints to
+  # stdout, and this function's stdout IS the sequence number.
+  local errf rc
+  errf="$(mktemp "${TMPDIR:-/tmp}/asc-seq-err.XXXXXX")"
+  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" 2>"$errf")
   rc=$?
   set -e
+  if [[ -s "$errf" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        latest-build-seq:*) logerr "asc-seq: ${line}" ;;
+      esac
+    done <"$errf"
+  fi
+  rm -f "$errf" >/dev/null 2>&1 || true
   if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
     logerr "asc-seq: query failed (rc=${rc}); cannot verify against App Store Connect"
     return 1
@@ -786,9 +801,14 @@ else
   BUILD_NUM="${COMMIT_COUNT}"
   # Strictly-increasing guard for a re-ship of the same commit: ASC rejects a
   # repeated (version, build) pair, so never ship at or below the known floor.
+  #
+  # When the guard fires, MARKETING moves with BUILD_NUM.  The invariant is
+  # that the two always describe the same commit count, so leaving MARKETING
+  # at the raw count would record a version whose build does not match it.
   if [[ "$SEQ_FLOOR" -ge "$BUILD_NUM" ]]; then
     BUILD_NUM="$((SEQ_FLOOR + 1))"
-    log "build: commit count ${COMMIT_COUNT} already shipped; using ${BUILD_NUM} instead"
+    MARKETING="${MARKETING_PREFIX}.${BUILD_NUM}"
+    log "build: commit count ${COMMIT_COUNT} already shipped; shipping ${MARKETING} (${BUILD_NUM}) instead"
   fi
 fi
 
