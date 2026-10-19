@@ -24,7 +24,7 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.type == 'Bot' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@070fdbfacadbd9e90cbb54098123df7d3fef737f
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       USAGE_INGEST_TOKEN: ${{ secrets.USAGE_INGEST_TOKEN }}
