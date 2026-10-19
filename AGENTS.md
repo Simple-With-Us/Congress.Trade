@@ -248,7 +248,10 @@ and `docs/rollouts/2026-09-09-retire-mac-scout-folder.md`):
 
 The private attack map (credential inventory, Infisical project ids, Coolify
 UUIDs, which token maps to which zone) lives in the **private** repo
-`jaywedgeworth22/fleet-ops` → `ATTACK-MAP.md`. Do not copy it here.
+`jaywedgeworth22/fleet-ops` → `ATTACK-MAP.md`.  Do not copy secret values or the
+full map into public files.  Naming a documented fleet tool or project, such as
+`fleet-secrets` or the Infisical project name Fleet-OPS, is fine;  project IDs,
+host IPs, and server UUIDs are not.
 
 Public rules that belong in this file:
 
@@ -259,16 +262,28 @@ Public rules that belong in this file:
 - **`congress.trade` admin routes sit behind a Cloudflare managed challenge.**
   Default curl User-Agents often get an edge 502/403 that looks like a dead
   credential. Use a browser UA. Never paste tokens into chat.
-- **Never print secret values.** Names only:
-  `fleet-secrets names` (values: `fleet-secrets get NAME` into a variable, never
-  echoed; `fleet-secrets run -- CMD` for env). The old flat handoff file is
-  retired and nothing reads it any more (OPS-818). Canonical:
-  `~/apps/AGENT-SYNC.md` § secret-safety and AI-Fleet-Coordinator `INFISICAL.md`
-  § fleet-secrets.
+- **Never print secret values, and never read the retired flat key file.**
+  Names only: `fleet-secrets names`.  The flat key file
+  `~/.secrets/global-api-keys` is RETIRED and a FORBIDDEN source:  flag any new
+  read, grep, `cat`, or source of it.  Fleet keys come from the environment first,
+  then `fleet-secrets get NAME` into a variable, never echoed (Infisical Fleet-OPS;
+  `fleet-secrets run --only A,B -- CMD` for env), and the macOS Keychain may hold
+  machine-identity bootstrap credentials only.  Never `cat` or open any handoff
+  file with a Read tool, and never pass a secret value on argv (visible in `ps`).
+  Canonical: `~/apps/AGENT-SYNC.md` § secret-safety and AI-Fleet-Coordinator
+  `INFISICAL.md` § fleet-secrets.
 - **Never run bare `infisical secrets`.** It table-prints every value. Use
   `scripts/infisical-secrets-safe.sh` (`set` / `has` / `names`).
 - Runtime secrets live in Infisical (app prod). Coolify env is bootstrap +
   overrides. Do not re-export Infisical into a tracked `.prod.vars`.
+- Never commit `.dev.vars`, real API keys, tokens, or generated local state, and
+  never print or paste secret values into chat, code, logs, or PR bodies.  For
+  iOS, secrets stay in Infisical or the macOS Keychain and are never printed;
+  the one documented exception is the App Store Connect credentials file named
+  in the iOS native ship section below, which tooling reads and never prints.
+- The shared package is a tokenless public git dependency.  Do not reintroduce
+  registry auth (`NODE_AUTH_TOKEN`, scoped-registry `.npmrc`) unless the user
+  explicitly asks for a private registry again.
 
 ## Migrations & deploy (READ THIS — the remote path is a trap)
 
