@@ -813,12 +813,36 @@ if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   BUILD_NUM="(from IPA)"
   log "version: taken from the existing IPA (--upload-only); sequence neither consulted nor consumed"
 elif [[ -n "$FORCE_BUILD" || -n "$FORCE_VERSION" ]]; then
-  # Explicit operator override: honour exactly what was asked. A bare --version
-  # still gets an auto timestamp build number, which is always higher than
-  # anything already uploaded — that is the whole point of the scheme, so an
+  # Explicit operator override: honour exactly what was asked.  A bare --version
+  # still gets an auto build number from the repo commit count, which is higher
+  # than anything already uploaded — that is the whole point of the scheme, so an
   # operator picking the marketing version does not have to reason about it.
   MARKETING="${FORCE_VERSION:-$DEFAULT_MARKETING}"
   BUILD_NUM="${FORCE_BUILD:-$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || date -u +%Y%m%d%H%M)}"
+  # An explicit --build is honoured exactly.  The auto-fill still needs the
+  # floor: --version against an already-shipped HEAD would otherwise ship a
+  # build at or below what App Store Connect already holds for that train.
+  if [[ -z "$FORCE_BUILD" ]]; then
+    # Propagate the floor failure.  Coercing it to 0 would let an
+    # unreachable App Store Connect pass as "floor 0", so the build number
+    # would stay at the commit count and could repeat a pair ASC already
+    # holds.  The auto path below already refuses to ship in that case.
+    _of_floor="$(resolve_seq_floor "$MARKETING_PREFIX" "$PBXPROJ" "$PLATFORM")" \
+      || die "override path could not resolve the build floor; refusing to ship"
+    [[ "$_of_floor" =~ ^[0-9]+$ ]] || die "override floor is not a number: ${_of_floor}"
+    if [[ "$_of_floor" -ge "$BUILD_NUM" ]]; then
+      BUILD_NUM="$((_of_floor + 1))"
+      log "build: override would repeat an already-shipped build; using ${BUILD_NUM} instead"
+    fi
+  fi
+  # The shipped pair must describe one number.  Unless the operator pinned
+  # a marketing version, MARKETING follows the build, so the ship is
+  # 1.0.N (N) rather than a version and a build that disagree.  An explicit
+  # --version names a train and is honoured exactly; the floor above still
+  # keeps the build unique inside that train.
+  if [[ -z "$FORCE_VERSION" ]]; then
+    MARKETING="${MARKETING_PREFIX}.${BUILD_NUM}"
+  fi
   log "version: operator override (--build/--version); sequence not consulted"
 else
   # resolve_seq_floor runs in a subshell, so its die() cannot exit this script
@@ -834,14 +858,15 @@ else
     # run that is really about to archive, and by exactly 1.
     SEQ="$(next_build_seq "$SEQ_FLOOR")"
   fi
-  COMMIT_COUNT="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo "$SEQ")"
+  COMMIT_COUNT="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo "$((SEQ_FLOOR + 1))")"
   MARKETING="${MARKETING_PREFIX}.${COMMIT_COUNT}"
   BUILD_NUM="${COMMIT_COUNT}"
   # Strictly-increasing guard for a re-ship of the same commit: ASC rejects a
   # repeated (version, build) pair, so never ship at or below the known floor.
   if [[ "$SEQ_FLOOR" -ge "$BUILD_NUM" ]]; then
     BUILD_NUM="$((SEQ_FLOOR + 1))"
-    log "build: commit count ${COMMIT_COUNT} already shipped; using ${BUILD_NUM} instead"
+    MARKETING="${MARKETING_PREFIX}.${BUILD_NUM}"
+    log "build: commit count ${COMMIT_COUNT} already shipped; shipping ${MARKETING} (${BUILD_NUM}) instead"
   fi
 fi
 
