@@ -240,6 +240,12 @@ describe('webhook URL redaction (CT-2432)', () => {
     expect(out).not.toContain(fakeSecret);
   });
 
+  it('redactWebhookError does not re-scan its own replacements (no nested redacted URLs)', () => {
+    const url = `https://bf.example/hooks/longhookid/${fakeSecret}`;
+    const out = redactWebhookError(`POST ${url} -> 500`, url);
+    expect(out).toBe('POST https://bf.example/hooks/longhookid/*** -> 500');
+  });
+
   async function runAndCollectLogs(fetchImpl: typeof fetch): Promise<string> {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {

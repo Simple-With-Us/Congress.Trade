@@ -108,25 +108,29 @@ export function redactWebhookUrl(raw: string): string {
 
 /** Redact the target URL (and its secret path segment) from an error message before logging. */
 export function redactWebhookError(message: string, rawUrl: string): string {
-  let out = message;
   const redacted = redactWebhookUrl(rawUrl);
-  const needles = new Set<string>([rawUrl]);
+  // needle -> replacement.  Whole-URL forms become the redacted URL; bare fragments become `***`.
+  const replacements = new Map<string, string>([[rawUrl, redacted]]);
   try {
     const u = new URL(rawUrl);
-    needles.add(u.href);
-    needles.add(u.pathname + u.search);
+    replacements.set(u.href, redacted);
+    if (u.pathname.length > 1) replacements.set(u.pathname + u.search, '***');
     for (const seg of u.pathname.split('/')) {
-      if (seg.length >= 8) needles.add(seg);
+      if (seg.length >= 8) replacements.set(seg, '***');
     }
-    if (u.search.length > 1) needles.add(u.search.slice(1));
-    if (u.password) needles.add(u.password);
+    if (u.search.length > 1) replacements.set(u.search.slice(1), '***');
+    if (u.password) replacements.set(u.password, '***');
   } catch {
     // unparseable: only the raw string is known
   }
-  for (const needle of [...needles].sort((a, b) => b.length - a.length)) {
-    if (needle) out = out.split(needle).join(redacted);
-  }
-  return out;
+  const needles = [...replacements.keys()].filter(Boolean).sort((a, b) => b.length - a.length);
+  if (needles.length === 0) return message;
+  // One pass over the original text, so a replacement is never re-scanned by a later needle.
+  const pattern = new RegExp(
+    needles.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'),
+    'g',
+  );
+  return message.replace(pattern, (m) => replacements.get(m) ?? '***');
 }
 
 async function postSignedPublisherWebhook(
