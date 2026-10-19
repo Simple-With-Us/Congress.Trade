@@ -75,13 +75,32 @@ const BLOCKED_EXTERNAL_STATES = [
   "REMOVED",
 ];
 
-/** Pull a short, human-readable reason out of an App Store Connect error body. */
+/**
+ * Pull a short, human-readable reason out of an App Store Connect error body.
+ *
+ * The body is untrusted external data, so it is checked before it is read:
+ * `errors` has to be an array, and every element has to be an object whose
+ * fields are strings.  A malformed element is skipped rather than believed,
+ * because this runs inside a script that must never throw --  and `e.code`
+ * on a null element would throw.
+ */
 export function ascErrorText(res) {
   const errors = res?.parsed?.errors;
-  if (Array.isArray(errors) && errors.length) {
-    return errors
-      .map((e) => `${e.code || e.status || "ERROR"}: ${e.detail || e.title || "request failed"}`)
-      .join(" | ");
+  if (Array.isArray(errors)) {
+    const parts = [];
+    for (const e of errors) {
+      if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+      const code =
+        typeof e.code === "string" ? e.code : typeof e.status === "string" ? e.status : "ERROR";
+      const detail =
+        typeof e.detail === "string"
+          ? e.detail
+          : typeof e.title === "string"
+            ? e.title
+            : "request failed";
+      parts.push(`${code}: ${detail}`);
+    }
+    if (parts.length) return parts.join(" | ");
   }
   const text = (res?.text || "").trim();
   if (text) return text.slice(0, 300);

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  ascErrorText,
   chooseExternalGroup,
   promoteExternalBeta,
   resolveExpectedBuildNumber,
@@ -274,6 +275,28 @@ test("a build Apple refuses is reported, not silently dropped", () => {
   assert.equal(result.added, true);
   assert.equal(result.submitted, false);
   assert.equal(result.warnings, 1);
+});
+
+test("a malformed App Store Connect error body is never believed and never throws", () => {
+  // The error body is untrusted external data.  A null element would make
+  // `e.code` throw, and this script must never throw.
+  assert.equal(ascErrorText({ parsed: { errors: [null] }, status: 500, text: "" }), "HTTP 500");
+  assert.equal(ascErrorText({ parsed: { errors: ["boom"] }, status: 500, text: "" }), "HTTP 500");
+  assert.equal(ascErrorText({ parsed: { errors: "not-an-array" }, status: 500, text: "" }), "HTTP 500");
+  assert.equal(
+    ascErrorText({ parsed: { errors: [{ code: 42, detail: { deep: true } }] }, status: 500, text: "" }),
+    "ERROR: request failed"
+  );
+  // A well-formed error is still reported.
+  assert.equal(
+    ascErrorText({ parsed: { errors: [{ code: "ENTITY_ERROR", detail: "nope" }] }, status: 409, text: "" }),
+    "ENTITY_ERROR: nope"
+  );
+  // Malformed elements are skipped; the good ones still come through.
+  assert.equal(
+    ascErrorText({ parsed: { errors: [null, { status: "409", title: "conflict" }] }, status: 409, text: "" }),
+    "409: conflict"
+  );
 });
 
 test("a build number that is not a positive integer is refused, not guessed at", () => {
