@@ -248,8 +248,14 @@ export async function dispatchWebhook(
 
   // Resolve chamber via the owning filing (Transaction carries no chamber col),
   // and the filer's party, which Transaction does carry but `SELECT * FROM
-  // transactions` cannot supply. Both live on this one join: filings holds
-  // filer_id and filers keys party by bioguide_id.
+  // transactions` cannot supply. Both live on this one query.
+  //
+  // Party keys on the TRANSACTION's filer_id, not the filing's. filings.filer_id
+  // is nullable and written on its own schedule (extraction inserts filings with
+  // doc_id alone), so keying off it resolved NULL for rows whose transactions do
+  // carry a filer — while the SSE backlog (sse.ts) and the HTTP feed (rows.ts)
+  // both key the same party on t.filer_id. Binding the transaction's filer keeps
+  // all three delivery paths on one spelling, which is what this path is for.
   //
   // Party has to be on the transaction rather than only in ctx, because ctx is
   // consumed for subscription matching and never serialized — formatTradeEvent
@@ -259,9 +265,9 @@ export async function dispatchWebhook(
     env.DB,
     `SELECT f.chamber AS chamber, fl.party AS party
        FROM filings f
-       LEFT JOIN filers fl ON fl.bioguide_id = f.filer_id
+       LEFT JOIN filers fl ON fl.bioguide_id = ?
       WHERE f.doc_id = ?`,
-    [tx.docId],
+    [tx.filerId ?? null, tx.docId],
   );
   const chamber = filingRow?.chamber ?? null;
   // The backlog path gets this from mapFeedTransaction; this is the push path's

@@ -30,8 +30,14 @@ const txRow = {
  * A minimal env for dispatchWebhook. The party comes from the filings+filers
  * join, so that is the only query whose answer matters here; the rest exist
  * just to get past the subscription fanout.
+ *
+ * The party is returned only for the filer the join actually keys on. That is
+ * what makes the filing-vs-transaction drift detectable: filings.filer_id and
+ * transactions.filer_id are written independently and filings.filer_id is
+ * nullable, so a join keying off the filing resolves NULL while the SSE backlog
+ * and HTTP feed — which key off the transaction — return the real party.
  */
-function partyEnv(filerParty: string | null) {
+function partyEnv(filerParty: string | null, filingFilerId: string | null = txRow.filer_id) {
   const sqls: string[] = [];
   const subRow = {
     id: 'sub_1', client_id: 'integration:ops', delivery: 'webhook',
@@ -45,7 +51,13 @@ function partyEnv(filerParty: string | null) {
       sqls.push(sql);
       if (/FROM transactions WHERE id = \?/i.test(sql)) return txRow as T;
       if (/FROM filings f/i.test(sql)) {
-        return { chamber: 'house', party: filerParty } as T;
+        // Mirror the real join: party is whatever the filers row for the keyed
+        // bioguide_id holds, which is NULL when that key matches no filer.
+        const keyedFiler = /bioguide_id = f\.filer_id/i.test(sql)
+          ? filingFilerId
+          : (this.params[0] as string | null);
+        const party = keyedFiler === txRow.filer_id ? filerParty : null;
+        return { chamber: 'house', party } as T;
       }
       if (/FROM users WHERE id/i.test(sql)) return null as T | null;
       if (/FROM securities_ref/i.test(sql)) return { sector: 'Technology', market_cap_bucket: 'mega' } as T;
@@ -68,17 +80,31 @@ function partyEnv(filerParty: string | null) {
   return { env, sqls };
 }
 
+/** The broadcast frame dispatchWebhook posts to the live SSE streams. */
+type BroadcastFrame = {
+  type?: string;
+  transaction?: { party?: string | null };
+};
+
 /** Capture what dispatchWebhook broadcasts to the live SSE streams. */
 function captureBroadcast() {
-  const posted: Array<Record<string, any>> = [];
+  const posted: BroadcastFrame[] = [];
   class FakeBroadcastChannel {
     constructor(public name: string) {}
-    postMessage(message: Record<string, any>) { posted.push(message); }
+    postMessage(message: BroadcastFrame) { posted.push(message); }
     close() {}
     addEventListener() {}
   }
   vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel);
   return posted;
+}
+
+/** The transaction on the broadcast NEW_TRANSACTION frame, asserted present. */
+function broadcastedTransaction(posted: BroadcastFrame[]): { party?: string | null } {
+  const frame = posted.find((m) => m?.type === 'NEW_TRANSACTION');
+  expect(frame, 'a live frame was broadcast').toBeDefined();
+  expect(frame?.transaction, 'the frame carries a transaction').toBeDefined();
+  return frame!.transaction!;
 }
 
 function stubFetch() {
@@ -106,7 +132,10 @@ describe('dispatchWebhook puts the filer party on the broadcast transaction', ()
       // party column, so `SELECT * FROM transactions` can never supply one.
       const join = sqls.find((s) => /FROM filings f/i.test(s));
       expect(join, 'the filing lookup was issued').toBeDefined();
-      expect(join).toMatch(/LEFT JOIN filers fl ON fl\.bioguide_id = f\.filer_id/i);
+      // Keyed on the transaction's filer, matching sse.ts and rows.ts. Keying on
+      // f.filer_id instead silently resolves NULL for the rows whose filing never
+      // got a filer_id, which is the drift this file exists to prevent.
+      expect(join).toMatch(/LEFT JOIN filers fl ON fl\.bioguide_id = \?/i);
       expect(join).toMatch(/fl\.party AS party/i);
     } finally {
       vi.unstubAllGlobals();
@@ -119,9 +148,23 @@ describe('dispatchWebhook puts the filer party on the broadcast transaction', ()
     stubFetch();
     try {
       await dispatchWebhook(env, 'tx_1');
-      const frame = posted.find((m) => m?.type === 'NEW_TRANSACTION');
-      expect(frame, 'a live frame was broadcast').toBeDefined();
-      expect(frame.transaction.party).toBe('D');
+      expect(broadcastedTransaction(posted).party).toBe('D');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("resolves party from the transaction's filer when the filing has none", async () => {
+    // filings.filer_id is nullable and extraction inserts filings with doc_id
+    // alone, so a filing-keyed join returns NULL here while the SSE backlog and
+    // the HTTP feed — both keyed on t.filer_id — return 'D'. The push path has to
+    // agree with them.
+    const { env } = partyEnv('D', null);
+    const posted = captureBroadcast();
+    stubFetch();
+    try {
+      await dispatchWebhook(env, 'tx_1');
+      expect(broadcastedTransaction(posted).party).toBe('D');
     } finally {
       vi.unstubAllGlobals();
     }
@@ -133,12 +176,11 @@ describe('dispatchWebhook puts the filer party on the broadcast transaction', ()
     stubFetch();
     try {
       await dispatchWebhook(env, 'tx_1');
-      const frame = posted.find((m) => m?.type === 'NEW_TRANSACTION');
-      expect(frame, 'a live frame was broadcast').toBeDefined();
+      const tx = broadcastedTransaction(posted);
       // Null says "known, and it is genuinely unknown". An empty string or a
       // pre-bucketed 'O' would read as a value the server actually sent.
-      expect(frame.transaction.party).toBeNull();
-      expect(frame.transaction.party).not.toBe('');
+      expect(tx.party).toBeNull();
+      expect(tx.party).not.toBe('');
     } finally {
       vi.unstubAllGlobals();
     }
