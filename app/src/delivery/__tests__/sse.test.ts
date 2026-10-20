@@ -218,7 +218,31 @@ describe('the streamed trade carries the filer party', () => {
     return { DB: { prepare } as unknown as D1Database } as unknown as Env;
   }
 
-  async function firstFrame(sqls: string[], rows: unknown[]): Promise<any> {
+  /**
+   * The congress.trade frame, narrowed from whatever JSON.parse returned.
+   *
+   * `any` here would let a renamed or dropped field compile and then fail as a
+   * confusing runtime undefined, which is the same class of bug this file
+   * exists to catch. Narrowing at the boundary keeps the assertions honest.
+   */
+  type TradeFrame = { data?: { trades?: Array<Record<string, unknown>> } };
+
+  function asTradeFrame(value: unknown): TradeFrame {
+    expect(value, 'the frame parses as an object').toBeTypeOf('object');
+    const trades = (value as TradeFrame).data?.trades;
+    expect(trades, 'the frame carries data.trades').toBeInstanceOf(Array);
+    return value as TradeFrame;
+  }
+
+  /** The first trade on the frame, or a thrown assertion if there is none. */
+  function firstTrade(frame: TradeFrame): Record<string, unknown> {
+    const trades = frame.data?.trades;
+    expect(trades, 'the frame carries data.trades').toBeInstanceOf(Array);
+    expect(trades!.length, 'the frame carries at least one trade').toBeGreaterThan(0);
+    return trades![0];
+  }
+
+  async function firstFrame(sqls: string[], rows: unknown[]): Promise<TradeFrame> {
     // 80ms is enough for the catch-up drain to emit one frame and for the
     // stream to close. Longer streams here would add load to the same worker as
     // the timing-sensitive drain test above, which asserts on a deadline event.
@@ -238,7 +262,7 @@ describe('the streamed trade carries the filer party', () => {
     }
     const line = text.split('\n').find((l) => l.startsWith('data: {"type":"congress.trade"'));
     expect(line, 'a congress.trade frame was emitted').toBeDefined();
-    return JSON.parse(line!.slice('data: '.length));
+    return asTradeFrame(JSON.parse(line!.slice('data: '.length)));
   }
 
   it('projects filer_party in the backlog query, like the HTTP feed does', async () => {
@@ -249,15 +273,15 @@ describe('the streamed trade carries the filer party', () => {
   });
 
   it('carries party on the emitted transaction, so the client party filter can read it', async () => {
-    const payload = await firstFrame([], [{ ...partyRow, filer_party: 'D' }]);
-    expect(payload.data.trades[0].party).toBe('D');
+    const frame = await firstFrame([], [{ ...partyRow, filer_party: 'D' }]);
+    expect(firstTrade(frame).party).toBe('D');
   });
 
   it('reports a filer with no party as null rather than omitting the field', async () => {
-    const payload = await firstFrame([], [{ ...partyRow, filer_party: null }]);
+    const frame = await firstFrame([], [{ ...partyRow, filer_party: null }]);
     // Absent and null both bucket as 'O' client-side, but null says "known, and
     // it is genuinely unknown" while an absent key reads as "nobody populated
     // this", which is how the original omission stayed invisible.
-    expect(payload.data.trades[0].party).toBeNull();
+    expect(firstTrade(frame).party).toBeNull();
   });
 });
