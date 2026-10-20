@@ -299,6 +299,10 @@ to report the HEAD SHA and POSTs `/api/admin/migrate` (idempotent;
 aliases `ship.sh`; `npm run migrate:remote` is intentionally disabled (it
 errors with guidance).  `npm run migrate` is a local leftover helper only.
 
+**New production runtimes:** New Cloudflare Workers or other new production
+runtimes are discouraged.  Exceptions are allowed case by case;  Jay must
+approve each exception before the change merges or deploys.
+
 If you add or change a migration:
 
 - Add the SQL file under `app/migrations/` (used by `npm run migrate` for LOCAL dev).
