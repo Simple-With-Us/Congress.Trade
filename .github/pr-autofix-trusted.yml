@@ -2,7 +2,19 @@
 # PR-branch .autofix.yml may still narrow allowed_bots; it must not change model,
 # turn budget, iteration cap, or verify commands.
 
-model: MiniMax-M3.1-Flash-Preview
+# Owner ruling 2026-10-20: all fleet MiniMax use goes to MiniMax-M3.1-Flash.
+#
+# Two spellings of the M3.1 Flash row exist in the wild and they are not
+# interchangeable across routes.  MiniMax-M3.1-Flash-Preview was dropped from
+# the MiniMax Code runtime catalog and from dsh's llm-pi-ai catalog on
+# 2026-10-18 (BF-2494), while api.minimax.io still served it for a while
+# afterwards.  A model id absent from the runtime catalog can still answer over
+# the public API, so an id must never be rewritten from one route's evidence;
+# see contrib/MM/2026-10-19/f11f7046.  This policy is read only from the default
+# branch and sends the id to https://api.minimax.io/anthropic, so it is pinned
+# to the stable id the owner chose rather than to a preview spelling the vendor
+# has already begun removing.
+model: MiniMax-M3.1-Flash
 max_turns: 60
 max_iterations: 5
 verify_command: |
