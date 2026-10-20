@@ -246,9 +246,13 @@ export async function dispatchWebhook(
   }
   const tx = stampDeliveryFreshness(mapTransaction(txRow));
 
-  // Resolve chamber via the owning filing (Transaction carries no chamber col),
-  // and the filer's party, which Transaction does carry but `SELECT * FROM
-  // transactions` cannot supply. Both live on this one query.
+  // Resolve chamber + the filer's party in one query, keyed off the transaction.
+  //
+  // Base is `transactions` with LEFT JOINs, exactly like the replay paths
+  // (rows.ts TX_FROM_JOINS): competitor_backfill / seed rows are written by
+  // persistTransactions() with no `filings` row behind them, so a filings-driven
+  // base returned zero rows for them and both fields fell out as null — dropping
+  // them from every chamber-filtered subscription that the feed resolves.
   //
   // Party keys on the TRANSACTION's filer_id, not the filing's. filings.filer_id
   // is nullable and written on its own schedule (extraction inserts filings with
@@ -263,11 +267,12 @@ export async function dispatchWebhook(
   // the frame reaches the client.
   const filingRow = await get<{ chamber: string | null; party: string | null }>(
     env.DB,
-    `SELECT f.chamber AS chamber, fl.party AS party
-       FROM filings f
-       LEFT JOIN filers fl ON fl.bioguide_id = ?
-      WHERE f.doc_id = ?`,
-    [tx.filerId ?? null, tx.docId],
+    `SELECT COALESCE(fl.chamber, f.chamber) AS chamber, fl.party AS party
+       FROM transactions t
+       LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id
+       LEFT JOIN filings f ON f.doc_id = t.doc_id
+      WHERE t.id = ?`,
+    [tx.id],
   );
   const chamber = filingRow?.chamber ?? null;
   // The backlog path gets this from mapFeedTransaction; this is the push path's
