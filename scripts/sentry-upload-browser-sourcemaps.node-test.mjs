@@ -226,3 +226,13 @@ test('a spawn failure is collapsed onto one line like any other child output', (
   assert.ok(!message.includes('\n'), 'the annotation must stay single-line');
   assert.match(message, /%0A/);
 });
+
+// Self-review found this while Codex was unavailable:  at a threshold of 12,
+// first-eight plus last-four of a 13-character value discloses nearly all of it.
+test('maskToken withholds a preview that would disclose most of a short value', () => {
+  const thirteen = 'abcdefghijklm';
+  assert.equal(thirteen.length, 13);
+  assert.equal(maskToken(thirteen), '[redacted]');
+  assert.equal(maskToken('a'.repeat(23)), '[redacted]');
+  assert.notEqual(maskToken('a'.repeat(24)), '[redacted]');
+});

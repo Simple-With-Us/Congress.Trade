@@ -31,11 +31,14 @@ export function resolveBrowserRelease(env = process.env) {
 
 // A rejected credential is the one failure nobody can diagnose from a fully
 // redacted log, so the preview is required:  first eight, last four, never the
-// whole value.  Anything short enough that a preview would leak most of it is
-// not previewed at all.
+// whole value.  The threshold is deliberately well above 12, because first-eight
+// plus last-four of a 13-character value would disclose nearly all of it.  A real
+// Sentry auth token is far longer than this, so anything short of it is not one.
+const MIN_PREVIEW_LENGTH = 24;
+
 export function maskToken(token) {
   const value = String(token ?? '').trim();
-  if (value.length <= 12) return '[redacted]';
+  if (value.length < MIN_PREVIEW_LENGTH) return '[redacted]';
   return `${value.slice(0, 8)}…${value.slice(-4)}`;
 }
 
