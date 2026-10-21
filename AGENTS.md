@@ -86,11 +86,10 @@ Effort logs are standardized across all apps: protocol at
 ## Branch And Worktree Policy
 
 - Create or switch to a separate branch before non-trivial edits.
-- Codex branches: `codex/<short-topic>`.
-- Claude branches: `claude/<short-topic>`.
-- Cursor/Cursor Cloud branches: `cursor/<short-topic>`.
-- Copilot branches: `copilot/<short-topic>`.
-- Antigravity branches: `antigravity/<short-topic>`.
+- Branch prefix: `<seat>/<short-topic>` using your own assigned seat prefix.
+  Current seats include codex, claude, cursor, copilot, antigravity, wise,
+  echo, and instinct; the list grows, so use your assigned prefix rather than
+  copying this list.
 - Shared feature or integration branches are acceptable when explicitly
   coordinated.
 - Do not edit another agent's branch unless asked.
