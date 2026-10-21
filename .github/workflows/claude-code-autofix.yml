@@ -29,6 +29,8 @@ jobs:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       USAGE_INGEST_TOKEN: ${{ secrets.USAGE_INGEST_TOKEN }}
     with:
+      # Pinned reusable SHAs can drift behind the owner ruling; pass the live id explicitly (2026-10-20: all fleet MiniMax use goes to MiniMax-M3.1-Flash).
+      model: MiniMax-M3.1-Flash
       prompt: |
         You are the fleet's autofix bot.  A review bot (Codex, Kody, or Cursor) just reviewed this pull request.
         1. Read every unresolved review comment from that review.  For each, decide against the current code whether it is a real defect.
