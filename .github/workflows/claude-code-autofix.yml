@@ -24,9 +24,10 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.type == 'Bot' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@e37a3e3055fb616dbc0aaa1c2f127d8b34edbf46
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      META_MODEL_API_TOKEN: ${{ secrets.META_MODEL_API_TOKEN }}
       USAGE_INGEST_TOKEN: ${{ secrets.USAGE_INGEST_TOKEN }}
     with:
       # Pinned reusable SHAs can drift behind the owner ruling; pass the live id explicitly (2026-10-20: all fleet MiniMax use goes to MiniMax-M3.1-Flash).
