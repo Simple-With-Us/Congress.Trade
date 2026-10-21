@@ -4,11 +4,15 @@
 
 All `swu-*` fleet bots are trusted CI actors, alongside the review bots below.
 The authoritative list is the `allowed_bots` value the autofix callers pass
-(`.github/workflows/autofix.yml`, `.github/workflows/claude-code-autofix.yml`);
-every trusted-bot gate must be derived from that one list so the sets cannot
-diverge.  `.github/workflows/security.yml` now enumerates the same set
-(`kody-ai[bot]`, `claude[bot]`, and one `swu-*` entry for the whole fleet),
-so the gitleaks gate and the autofix allowlists name the same trusted actors.
+(`.github/workflows/autofix.yml`, `.github/workflows/claude-code-autofix.yml`).
+The two gates are related but NOT the same set (Kody on #2823):
+`.github/workflows/security.yml` matches an unbounded `swu-*` glob and
+additionally admits `dependabot[bot]`, `renovate[bot]`, `codex[bot]`, and
+`github-actions[bot]`, which the autofix callers do not; the autofix
+`allowed_bots` enumerates the specific installed `swu-*` bots and adds
+`sentry` (no `[bot]` suffix), which the glob does not match.  The gitleaks
+gate trusts broadly to avoid blocking security scans; the autofix callers
+trust narrowly because they run code on the fleet.
 
 The `swu-*` entry has to keep its glob unquoted and its suffix quoted
 (`swu-*'[bot]'`): quoting the whole pattern makes bash match it literally, so

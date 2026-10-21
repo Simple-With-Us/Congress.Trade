@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { callerGrantsIssuesWrite } from "./workflow-permissions.mjs";
 import { readdir, readFile } from "node:fs/promises";
 
 /** default-main-protection ruleset on Simple-With-Us/Congress.Trade */
@@ -84,9 +85,11 @@ for (const name of workflowNames) {
   // IOSENGINEERING-14: iOS compile + XCTest must fail the job.  Advisory
   // continue-on-error let red Mac builds merge.  Do not skip tests.
   for (const reusable of reusablesRequiringIssuesWrite) {
-    if (text.includes(reusable) && !/^\s*issues:\s*write\s*$/m.test(text)) {
+    // Job-scoped: a file-wide match can accept an unrelated grant while the
+    // calling job receives no issues scope (Kody on #2823).
+    if (text.includes(reusable) && !callerGrantsIssuesWrite(text, reusable)) {
       errors.push(
-        `${name}: ${reusable} writes a per-bot marker comment, so its job must grant issues: write`,
+        `${name}: ${reusable} writes a per-bot marker comment, so its calling job must grant issues: write`,
       );
       break;
     }
