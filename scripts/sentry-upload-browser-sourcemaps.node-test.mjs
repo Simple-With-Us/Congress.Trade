@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DASHBOARD_SOURCE,
   SENTRY_CLI,
+  formatUploadSuccess,
   maskToken,
   scrubChildOutput,
   toSingleLine,
@@ -200,10 +201,29 @@ test('caps a runaway diagnostic', () => {
   assert.ok(out.length <= 2100, `expected a capped diagnostic, got ${out.length}`);
   assert.ok(out.startsWith('...'));
 });
-// Kody finding: the previous target was a TypeScript module with no generated
-// map, so a green step could imply symbolication that cannot happen.
-test('the upload target is the shipped bundle, not the TypeScript module', () => {
-  assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/client\/dashboard\.js$/);
+// Kody finding: routes.ts serves DASHBOARD_APP_JS from the GENERATED
+// dashboardClient.ts at /assets/dashboard.js, while dashboard.js is the
+// hand-edited source the generator reads.  Uploading the pre-generation source
+// lets the release artifact drift from the served bytes, so the target is the
+// generated file Sentry must hold against the release.
+test('the upload target is the generated file production serves', () => {
+  assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/dashboardClient\.ts$/);
+  assert.ok(existsSync(DASHBOARD_SOURCE), 'the upload target must exist in the repo');
+});
+
+test('a missing upload target names the resolved path, not a stale filename', () => {
+  assert.throws(
+    () => uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn: () => assert.fail('must not spawn'), source: '/nonexistent/dashboardClient.ts', cli: SELF }),
+    /nonexistent\/dashboardClient\.ts is missing/,
+  );
+});
+
+// Kody finding: the success gate read stdout only, so a stderr-only upload
+// summary failed the deploy despite a successful upload.
+test('a stderr-only upload summary still confirms success', () => {
+  const spawn = () => ({ status: 0, stdout: '', stderr: 'sourcemaps upload complete, 1 artifact uploaded' });
+  const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
+  assert.match(result.detail, /artifact uploaded/);
 });
 
 test('a green upload still says so when there is no source map to symbolicate', () => {
@@ -211,6 +231,16 @@ test('a green upload still says so when there is no source map to symbolicate', 
   const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
   assert.ok(result.warning, 'a missing source map must not pass unnoticed');
   assert.match(result.warning, /will not symbolicate/);
+});
+
+// Kody finding: the success log claimed source maps were uploaded even when
+// the run proved no map exists.  The message is derived from the warning.
+test('the success message is honest about a missing source map', () => {
+  assert.match(formatUploadSuccess({ release: sha, warning: null }), /Uploaded browser source maps/);
+  assert.match(
+    formatUploadSuccess({ release: sha, warning: 'no source map' }),
+    /Uploaded browser dashboard artifact \(no source map\)/,
+  );
 });
 
 test('a spawn failure is collapsed onto one line like any other child output', () => {

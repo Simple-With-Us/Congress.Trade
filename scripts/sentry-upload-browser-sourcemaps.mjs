@@ -2,14 +2,16 @@
 // Never prints SENTRY_AUTH_TOKEN in full.  Release is the verified Coolify SHA.
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-// The generated client bundle is what actually ships, so it is what Sentry should
-// hold against the release.  The TypeScript module it is generated from is not an
-// ingestible source map and was the previous target.
-export const DASHBOARD_SOURCE = resolve(ROOT, 'app/src/ui/client/dashboard.js');
+// app/scripts/build-dashboard-client.ts generates src/ui/dashboardClient.ts FROM
+// src/ui/client/dashboard.js: dashboard.js is the hand-edited source, and
+// dashboardClient.ts is the generated file whose DASHBOARD_APP_JS export is
+// what routes.ts serves at /assets/dashboard.js.  Sentry must hold the bytes
+// that are actually served, not the pre-generation source.
+export const DASHBOARD_SOURCE = resolve(ROOT, 'app/src/ui/dashboardClient.ts');
 
 // The CLI is a pinned devDependency of app/, not a global install.  Resolving it
 // directly is deliberate:  `npx --yes @sentry/cli` asks npx for a binary named
@@ -76,7 +78,7 @@ export function uploadBrowserSourcemaps({
 } = {}) {
   if (!token?.trim()) throw new Error('SENTRY_AUTH_TOKEN is required');
   if (!SHA.test(release || '')) throw new Error('release must be a full SHA');
-  if (!existsSync(source)) throw new Error('dashboardHtml.ts is missing');
+  if (!existsSync(source)) throw new Error(`${relative(ROOT, source)} is missing`);
   if (!existsSync(cli)) {
     throw new Error(`@sentry/cli is not installed at ${cli} - run \`npm ci\` in app/ before uploading`);
   }
@@ -112,8 +114,11 @@ export function uploadBrowserSourcemaps({
   }
   // A zero exit with nothing to say is not proof of an upload.  Treat silence as
   // failure, because the cost of a silent success here is browser errors that
-  // never map back to source and nothing in any log says so.
-  const detail = scrubChildOutput(result.stdout, token);
+  // never map back to source and nothing in any log says so.  sentry-cli may
+  // report on either stream, and the failure branch above already prefers
+  // stderr, so the success gate reads both: a stderr-only summary with an
+  // empty stdout is still proof of an upload.
+  const detail = scrubChildOutput([result.stdout, result.stderr].filter(Boolean).join('\n'), token);
   if (!detail) {
     throw new Error(`sentry-cli sourcemaps upload produced no output for release ${release}; refusing to report success`);
   }
@@ -131,12 +136,21 @@ export function uploadBrowserSourcemaps({
   return { release, uploaded: source, detail, warning };
 }
 
+// A green step must not claim source maps were uploaded when the run just
+// proved none exist.  With a map alongside the target this reports the source
+// maps; without one it reports the artifact upload honestly.
+export function formatUploadSuccess(result) {
+  return result.warning
+    ? `Uploaded browser dashboard artifact (no source map) for release ${result.release}`
+    : `Uploaded browser source maps for release ${result.release}`;
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const release = resolveBrowserRelease();
     if (!process.env.SENTRY_AUTH_TOKEN?.trim()) throw new Error('SENTRY_AUTH_TOKEN is required');
     const result = uploadBrowserSourcemaps({ release, token: process.env.SENTRY_AUTH_TOKEN });
-    console.log(`Uploaded browser source maps for release ${result.release}`);
+    console.log(formatUploadSuccess(result));
     console.log(`sentry-cli output: ${toSingleLine(result.detail)}`);
     if (result.warning) console.warn(`::warning::${result.warning}`);
   } catch (error) {
