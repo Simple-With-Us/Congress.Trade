@@ -23,10 +23,10 @@
 f8e29727fd0d58fc76f6b74a1f83b59ad37278f1:app/src/ui/dashboardClient.ts:generic-api-key:270
 #
 # CT-2437 browser source-map scrub test, not a secret: the scrubber test seeds a
-# fake bearer credential ('token=abcdef123456') to prove the forwarded child
-# output is redacted before it reaches a CI log.  The fixture was changed to
-# 'PLACEHOLDER_VALUE' in a follow-up commit because the scrub redacts by pattern
-# rather than by how realistic the value looks, but the introducing commit stays
-# inside the PR base..head range gitleaks scans, so its finding has to be ignored
-# by fingerprint.  No Sentry token was ever committed.
+# fake bearer credential as a key/value assignment, to prove the forwarded child
+# output is redacted before it reaches a CI log.  The fixture was changed to a
+# placeholder in a follow-up commit, because the scrub redacts by pattern rather
+# than by how realistic the value looks, but the introducing commit stays inside
+# the PR base..head range gitleaks scans, so its finding has to be ignored by
+# fingerprint.  No Sentry token was ever committed.
 0d1d5d284a0da6d303aba59d246da8662a20a7f6:scripts/sentry-upload-browser-sourcemaps.node-test.mjs:generic-api-key:91
