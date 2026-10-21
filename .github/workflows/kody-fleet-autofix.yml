@@ -1,10 +1,10 @@
 # Enabled fleet wide by the owner on 2026-10-11 (boards 04b963b7 and 99e559ea).
-# MiniMax M3 via its direct OpenAI-compatible endpoint, paid; at most 5 attempts per UTC day in this repository.
+# MiniMax M3.1 Flash via its direct OpenAI-compatible endpoint, paid; at most 5 attempts per UTC day in this repository.
 # The generation step reads the org secret MINIMAX_API_KEY directly as MODEL_API_KEY.
 # Local job definitions preserve this repository's auditable runner policy.
 # Mirrors congress-trading-shared kody-autofix-reusable.yml at e28fefcd12d4747e3ed66cb5c5b3f3dd7ea2db88.
 # Full checkout is restricted to the trusted public helper commit; no target PR checkout.
-name: Kody MiniMax M3 Fix Proposals
+name: Kody MiniMax M3.1 Flash Fix Proposals
 
 on:
   check_run:
@@ -182,7 +182,7 @@ jobs:
         run: node trusted-helper/.github/kody-autofix/fleet.mjs generate "$RUNNER_TEMP/kody-autofix"
         env:
           MODEL_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          KODY_MODEL: 'MiniMax-M3'
+          KODY_MODEL: 'MiniMax-M3.1-Flash'
           KODY_MODEL_BASE_URL: 'https://api.minimax.io/v1'
       - name: Reject Secret-Bearing Generated Results
         run: node trusted-helper/.github/kody-autofix/fleet.mjs scan-answer "$RUNNER_TEMP/kody-autofix"

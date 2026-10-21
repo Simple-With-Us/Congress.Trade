@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 
 /** default-main-protection ruleset on Simple-With-Us/Congress.Trade */
@@ -124,6 +125,19 @@ for (const name of workflowNames) {
   if (/\bsecrets\.GH_PAT\b/.test(uncommented) || /\bsecrets\.SHEPHERD_TOKEN\b/.test(uncommented)) {
     errors.push(`${name}: GH_PAT / SHEPHERD_TOKEN must not appear; congress-trading-shared is public and vendored`);
   }
+}
+
+// A root .autofix.yml is read by the pinned pr-autofix-reusable out of the PR
+// branch checkout, and there it REPLACES the caller's allowed_bots list
+// wholesale - it is not a narrowing-only override.  A same-repo branch that
+// ships one could therefore swap the trusted fleet for an arbitrary actor list
+// on a contents:write autofix session, while the caller still believes its own
+// list is in force.  The authoritative list lives in the caller workflow, so
+// this repository carries no root .autofix.yml.
+if (existsSync(new URL("../.autofix.yml", import.meta.url))) {
+  errors.push(
+    "root .autofix.yml: not allowed - it replaces the caller's allowed_bots list on every PR branch; pass allowed_bots from the autofix caller workflow instead",
+  );
 }
 
 const xctestPath = new URL("./ios-ci-xctest.sh", import.meta.url);

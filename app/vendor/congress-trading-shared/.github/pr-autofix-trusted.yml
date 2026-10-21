@@ -1,8 +1,14 @@
 # Trusted autofix policy for this repository (read from the default branch only).
-# PR-branch .autofix.yml may still narrow allowed_bots; it must not change model,
-# turn budget, iteration cap, or verify commands.
+#
+# allowed_bots is NOT read from this file - the caller passes it in the autofix
+# caller workflow.  A root .autofix.yml in a PR branch REPLACES that caller
+# list wholesale in the reusable that implements the trusted-policy loader; it
+# is not a narrowing-only override, so a same-repo branch can widen the trusted
+# set as well as narrow it.  The authoritative list therefore stays in the
+# caller workflow.  Model, turn budget, iteration cap, and verify commands
+# always come from this file.
 
-model: MiniMax-M3.1-Flash-Preview
+model: MiniMax-M3.1-Flash
 max_turns: 60
 max_iterations: 5
 verify_command: |
