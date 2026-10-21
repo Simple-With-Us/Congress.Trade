@@ -8,12 +8,21 @@ This directory is the **source of truth** for the fleet-wide TestFlight ship scr
 - `ship-all.sh` — ship all three fleet apps sequentially.
 - `apps.json` — per-app registry (bundle id, scheme, project paths, team id).  Live DealDex is `net.dealdex` / appleId `6802474288`.
 - `AppUpdatePrompt.swift` — pinned first-launch update prompt.  Copy into each iOS target.  Apple IDs stay in `apps.json` / `versions.json`, not in this file.
-- `asc-api.mjs` — minimal App Store Connect API client (ES256 JWT, no dependencies).  Used by `ship-testflight.sh` for export-compliance (`ensure-tf-ready`) and for build-number verification (`latest-build-seq`).
+- `asc-api.mjs` — minimal App Store Connect API client (ES256 JWT, no dependencies).  Used by `ship-testflight.sh` for export-compliance (`ensure-tf-ready`) and for build-number verification (`latest-build-seq`).  It takes the private key from the environment only; it never reads a key file.
+- `asc-key.mjs` — the hardened App Store Connect key reader (AFC-459, Kody rule 42).  It validates a staged key file, reads it once with `O_NOFOLLOW`, and hands the key to a child process in the child's environment as `ASC_KEY_P8`.  The key is never an argument, never on stdout, never in a log line.
 - `ExportOptions-appstore.plist` — export options for `destination=upload`.
 - `ExportOptions-export-ipa.plist` — export options for `destination=export` (local IPA only).
 - `test-ship-seq.sh` — offline tests for the build-number rules (see **Tests**).  Repo-only; not installed to the runtime location.
+- `test-asc-key.test.mjs` — offline tests for the key reader.  Repo-only; not installed to the runtime location.
+- `test-asc-credentials.sh` — offline tests for the credential resolution in `ship-testflight.sh`.  Repo-only; not installed to the runtime location.
 
-Secrets (ASC API key id/issuer/path) come from process env `ASC_KEY_ID` / `ASC_ISSUER_ID` / `ASC_KEY_PATH`, else from Infisical Fleet-OPS folder `/asc` through `fleet-secrets get` (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`;  the `.p8` is written to a 0600 temp file for the run and removed on exit).  No local secrets folder is read (AFC-359).  None of the files here contain secret values.
+Secrets come from the first source that is present, in this order:
+
+1. `ASC_KEY_ID` / `ASC_ISSUER_ID` / `ASC_KEY_P8` in the process environment (the client also accepts `APPLE_API_KEY_ID` / `APPLE_API_ISSUER_ID` / `APPLE_API_KEY_P8_BASE64`).
+2. A key file named in `ASC_KEY_PATH` — a **file**, read through `asc-key.mjs`, never treated as a variable.
+3. Infisical Fleet-OPS folder `/asc` through `fleet-secrets get` (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`;  the `.p8` is written to a 0600 temp file for the run and removed on exit).
+
+A path on disk is **not** a credential source (Kody rule 42, AFC-459):  the shell layer that owns the credential hands the key to the node client in the child's environment, so `asc-api.mjs` never reads a key file.  No local secrets folder is read (AFC-359).  None of the files here contain secret values.
 
 ## Install (sync repo copy -> runtime location)
 
@@ -22,6 +31,7 @@ install -m 0755 scripts/ios-fleet/ship-testflight.sh /Users/jay/apps/ios-fleet/s
 install -m 0755 scripts/ios-fleet/ship-all.sh /Users/jay/apps/ios-fleet/ship-all.sh
 install -m 0644 scripts/ios-fleet/apps.json /Users/jay/apps/ios-fleet/apps.json
 install -m 0644 scripts/ios-fleet/asc-api.mjs /Users/jay/apps/ios-fleet/asc-api.mjs
+install -m 0644 scripts/ios-fleet/asc-key.mjs /Users/jay/apps/ios-fleet/asc-key.mjs
 install -m 0644 scripts/ios-fleet/ExportOptions-appstore.plist /Users/jay/apps/ios-fleet/ExportOptions-appstore.plist
 install -m 0644 scripts/ios-fleet/ExportOptions-export-ipa.plist /Users/jay/apps/ios-fleet/ExportOptions-export-ipa.plist
 install -m 0644 scripts/ios-fleet/AppUpdatePrompt.swift /Users/jay/apps/ios-fleet/AppUpdatePrompt.swift
@@ -76,6 +86,8 @@ The skip message names the value, its source, and both overrides, so the limit i
 
 ```bash
 bash scripts/ios-fleet/test-ship-seq.sh
+bash scripts/ios-fleet/test-asc-credentials.sh
+node --test scripts/ios-fleet/test-asc-key.test.mjs
 ```
 
 47 assertions, fully offline — no network, no Xcode, no credentials.  It runs `ship-testflight.sh` with `HOME`, `PATH` and `IOS_FLEET_STATE_DIR` pointed at a scratch sandbox (a fake `xcodebuild` refuses to archive), so it cannot touch real ship state or App Store Connect.  It pins:
@@ -87,6 +99,8 @@ bash scripts/ios-fleet/test-ship-seq.sh
 - for **all four apps**: marketing and build are both `1.0.N` and equal;
 - the skip message names the 3600s default and both overrides;
 - a last-ship 3000s ago is still gated (sequence untouched); at 3700s the gate proceeds.
+
+The credential suites are offline too:  `test-asc-credentials.sh` drives `load_secrets` with a fake `fleet-secrets` and throwaway keys generated at test time, and `test-asc-key.test.mjs` generates its own key pair.  Neither commits a key, and neither reaches the network.
 
 ## Drift check
 

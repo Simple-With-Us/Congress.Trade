@@ -364,13 +364,22 @@ jobs:
           bash -n scripts/ios-ci-xctest.sh
           bash -n scripts/ios-assert-stable-xcode.sh
           bash -n scripts/ios-fleet/publish-ios-versions.sh
+          bash -n scripts/ios-fleet/test-asc-credentials.sh
           node --check scripts/ios-fleet/asc-api.mjs
+          node --check scripts/ios-fleet/asc-key.mjs
+          node --check scripts/ios-fleet/test-asc-key.test.mjs
 
       - name: Fleet version publish guard
         run: node --test scripts/ios-fleet/publish-ios-versions.test.mjs
 
       - name: AppUpdatePrompt pin copy
         run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs
+
+      - name: ASC key reader (offline)
+        run: node --test scripts/ios-fleet/test-asc-key.test.mjs
+
+      - name: ASC credential resolution (offline)
+        run: bash scripts/ios-fleet/test-asc-credentials.sh
 
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs

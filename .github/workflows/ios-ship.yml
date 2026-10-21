@@ -310,6 +310,11 @@ jobs:
         if: success() && steps.gate.outputs.should_ship == '1'
         continue-on-error: true
         run: |
-          node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs" \
-            --build "${{ steps.buildnum.outputs.build_num }}"
+          # The node client never reads a key file (Kody rule 42):  the shell
+          # layer that owns the credential hands the key over in the child's
+          # environment, through the hardened reader.  The key is never an
+          # argument of any command.
+          node "$GITHUB_WORKSPACE/scripts/ios-fleet/asc-key.mjs" exec "$ASC_KEY_PATH" -- \
+            node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs" \
+              --build "${{ steps.buildnum.outputs.build_num }}"
 
