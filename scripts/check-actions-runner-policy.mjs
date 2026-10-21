@@ -40,9 +40,9 @@ const allowedReusableWorkflows = new Set([
   // comment.  The pin itself is a workflow edit, which autofix agents must not
   // make; it is allowlisted here so the owner-side pin in
   // .github/workflows/autofix.yml does not trip this required check.
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@a4c48f013a2108be517ee933dccb1b37e9403920",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@a4c48f013a2108be517ee933dccb1b37e9403920",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@a4c48f013a2108be517ee933dccb1b37e9403920",
   "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11",
 ]);
 
@@ -52,7 +52,7 @@ const allowedReusableWorkflows = new Set([
 // issues: write itself - otherwise the marker write is refused and the whole
 // autofix lane fails.
 const reusablesRequiringIssuesWrite = new Set([
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@a4c48f013a2108be517ee933dccb1b37e9403920",
 ]);
 
 // Kody on #2823 asked for a `node --test` regression that pins the job-scoped
