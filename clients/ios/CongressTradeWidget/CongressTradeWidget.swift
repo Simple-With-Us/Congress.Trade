@@ -262,7 +262,9 @@ private enum WidgetDate {
 
     private static let displayCalendar: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)
+        // Calendar.timeZone is non-optional; TimeZone(secondsFromGMT:) is not.
+        // Same force-unwrap the app's own date helpers use (Models.swift).
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         return calendar
     }()
 
