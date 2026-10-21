@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DASHBOARD_SOURCE,
+  DASHBOARD_URL_PREFIX,
   SENTRY_CLI,
   formatUploadSuccess,
   maskToken,
@@ -15,7 +18,32 @@ import {
 
 const sha = 'a'.repeat(40);
 const SELF = fileURLToPath(import.meta.url);
-const ok = { status: 0, stdout: 'sourcemaps upload complete, 1 artifact uploaded' };
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+// What the CLI prints when it found a map and stored it.
+const ok = {
+  status: 0,
+  stdout: [
+    '> File upload complete (processing pending on server)',
+    'Source Map Upload Report',
+    '  Scripts',
+    '    ~/assets/dashboard.js (sourcemap at dashboard.js.map)',
+  ].join('\n'),
+};
+
+// What the CLI prints when there was no map to store.  The release then holds
+// no artifact at all, which is why the report has to be read rather than the
+// exit code.
+const nothingStored = {
+  status: 0,
+  stdout: [
+    '> File upload complete (processing pending on server)',
+    'Source Map Upload Report',
+    '  Scripts',
+    '    ~/assets/dashboard.js (no sourcemap found)',
+    '      - warning: could not determine a source map reference',
+  ].join('\n'),
+};
 
 test('requires a full SHA release from env', () => {
   assert.equal(resolveBrowserRelease({ SENTRY_RELEASE: sha }), sha);
@@ -142,7 +170,7 @@ test('output that never mentions an upload is not reported as success', () => {
 test('the success path returns the scrubbed CLI detail', () => {
   const spawn = () => ok;
   const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
-  assert.match(result.detail, /artifact uploaded/);
+  assert.match(result.detail, /sourcemap at/);
 });
 
 // Kody finding: raw multi-line child output inside a single `::error::`
@@ -201,14 +229,47 @@ test('caps a runaway diagnostic', () => {
   assert.ok(out.length <= 2100, `expected a capped diagnostic, got ${out.length}`);
   assert.ok(out.startsWith('...'));
 });
-// Kody finding: routes.ts serves DASHBOARD_APP_JS from the GENERATED
-// dashboardClient.ts at /assets/dashboard.js, while dashboard.js is the
-// hand-edited source the generator reads.  Uploading the pre-generation source
-// lets the release artifact drift from the served bytes, so the target is the
-// generated file Sentry must hold against the release.
-test('the upload target is the generated file production serves', () => {
-  assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/dashboardClient\.ts$/);
+// Kody finding: the comment above DASHBOARD_SOURCE had the direction of truth
+// inverted.  The durable guard is the generator's own declaration of which file
+// it reads and which it writes, so the invariant is asserted against that
+// instead of against a filename that either side could change independently.
+test('the upload target is the file the generator reads, not the file it writes', () => {
+  const generator = readFileSync(resolve(ROOT, 'app/scripts/build-dashboard-client.ts'), 'utf8');
+  const source = generator.match(/SOURCE_PATH = new URL\('([^']+)'/)?.[1];
+  const target = generator.match(/TARGET_PATH = new URL\('([^']+)'/)?.[1];
+  assert.ok(source, 'the generator must declare a SOURCE_PATH');
+  assert.ok(target, 'the generator must declare a TARGET_PATH');
+  assert.ok(
+    DASHBOARD_SOURCE.endsWith(source.replace(/^\.\.\//, 'app/')),
+    `the release must hold the generator's source (${source}), got ${DASHBOARD_SOURCE}`,
+  );
+  assert.ok(
+    !DASHBOARD_SOURCE.endsWith(target.replace(/^\.\.\//, 'app/')),
+    `the release must not hold the generator's output (${target})`,
+  );
+});
+
+test('the upload target is browser JavaScript, not a TypeScript module', () => {
+  assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/client\/dashboard\.js$/);
   assert.ok(existsSync(DASHBOARD_SOURCE), 'the upload target must exist in the repo');
+});
+
+// Sentry matches a browser stack frame to its artifact by NAME, and the frame
+// reports the path the browser requested.  An artifact named after anything but
+// the served path matches no frame at all.
+test('the artifact is named for the path the browser requests', () => {
+  assert.equal(DASHBOARD_URL_PREFIX, '~/assets');
+  const calls = [];
+  uploadBrowserSourcemaps({
+    release: sha,
+    token: 'test-only-token',
+    cli: SELF,
+    spawn: (cmd, args) => { calls.push(args); return ok; },
+  });
+  const args = calls[0];
+  assert.ok(args.includes('--url-prefix'), 'the upload must name the artifact');
+  assert.equal(args[args.indexOf('--url-prefix') + 1], '~/assets');
+  assert.match(DASHBOARD_URL_PREFIX, /^\~\/assets$/);
 });
 
 test('a missing upload target names the resolved path, not a stale filename', () => {
@@ -221,25 +282,71 @@ test('a missing upload target names the resolved path, not a stale filename', ()
 // Kody finding: the success gate read stdout only, so a stderr-only upload
 // summary failed the deploy despite a successful upload.
 test('a stderr-only upload summary still confirms success', () => {
-  const spawn = () => ({ status: 0, stdout: '', stderr: 'sourcemaps upload complete, 1 artifact uploaded' });
+  const spawn = () => ({
+    status: 0,
+    stdout: '',
+    stderr: 'Source Map Upload Report\n  ~/assets/dashboard.js (sourcemap at dashboard.js.map)',
+  });
   const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
-  assert.match(result.detail, /artifact uploaded/);
+  assert.match(result.detail, /sourcemap at/);
 });
 
-test('a green upload still says so when there is no source map to symbolicate', () => {
-  const spawn = () => ok;
-  const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
-  assert.ok(result.warning, 'a missing source map must not pass unnoticed');
-  assert.match(result.warning, /will not symbolicate/);
+// The CLI exits 0 and prints "File upload complete" whether or not it stored
+// anything, so its own artifact report is the only evidence.
+test('the CLI report decides whether a source map was stored', () => {
+  const stored = uploadBrowserSourcemaps({
+    release: sha,
+    token: 'tok',
+    cli: SELF,
+    spawn: () => ok,
+  });
+  assert.equal(stored.stored, true);
+  assert.equal(stored.warning, null);
+
+  const empty = uploadBrowserSourcemaps({
+    release: sha,
+    token: 'tok',
+    cli: SELF,
+    spawn: () => nothingStored,
+  });
+  assert.equal(empty.stored, false);
+  assert.ok(empty.warning, 'a run that stored nothing must not pass unnoticed');
+  assert.match(empty.warning, /will not symbolicate/);
+});
+
+test('output that does not say what was stored is not reported as success', () => {
+  assert.throws(
+    () => uploadBrowserSourcemaps({ release: sha, token: 'tok', cli: SELF, spawn: () => ({ status: 0, stdout: 'sourcemaps upload complete' }) }),
+    /did not report what it stored/,
+  );
+});
+
+// A map on disk that the CLI did not store is a misconfiguration:  the bundle
+// does not reference the map beside it, so the upload silently stores nothing.
+test('a map on disk that the CLI did not store is a misconfiguration and fails', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'sentry-upload-'));
+  try {
+    const bundle = resolve(dir, 'bundle.js');
+    writeFileSync(bundle, 'console.log(1)\n');
+    writeFileSync(`${bundle}.map`, '{"version":3,"sources":[],"mappings":""}\n');
+    assert.throws(
+      () => uploadBrowserSourcemaps({ release: sha, token: 'tok', cli: SELF, source: bundle, spawn: () => nothingStored }),
+      /does not reference it/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // Kody finding: the success log claimed source maps were uploaded even when
-// the run proved no map exists.  The message is derived from the warning.
+// the run proved it stored nothing.  The message follows what was stored.
 test('the success message is honest about a missing source map', () => {
-  assert.match(formatUploadSuccess({ release: sha, warning: null }), /Uploaded browser source maps/);
-  assert.match(
-    formatUploadSuccess({ release: sha, warning: 'no source map' }),
-    /Uploaded browser dashboard artifact \(no source map\)/,
+  assert.match(formatUploadSuccess({ release: sha, stored: true }), /Uploaded browser source maps/);
+  const honest = formatUploadSuccess({ release: sha, stored: false });
+  assert.match(honest, /No browser source maps stored/);
+  assert.ok(
+    !/Uploaded browser source maps/.test(honest),
+    `the message must not claim an upload that never happened: ${honest}`,
   );
 });
 
