@@ -6,7 +6,7 @@ export const BUDGET_LIMITS = Object.freeze({ inputTokens: 1_048_576, outputToken
   requestBytes: 256_000, responseBytes: 512_000, budgetResponseBytes: 16_000 });
 const PROVIDERS = Object.freeze({
   deepseek: { model: 'deepseek-flash', url: 'https://api.deepseek.com/anthropic/v1/messages', key: 'DEEPSEEK_API_KEY' },
-  minimax: { model: 'MiniMax-M2.7', url: 'https://api.minimax.io/anthropic/v1/messages', key: 'MINIMAX_API_KEY' },
+  minimax: { model: 'MiniMax-M3.1-Flash', url: 'https://api.minimax.io/anthropic/v1/messages', key: 'MINIMAX_API_KEY' },
 });
 const sha = value => createHash('sha256').update(value).digest('hex');
 const serverClock = Symbol('budget-server-clock');
