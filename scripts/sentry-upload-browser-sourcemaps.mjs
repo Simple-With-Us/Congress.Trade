@@ -6,9 +6,32 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-// The generated client bundle is what actually ships, so it is what Sentry should
-// hold against the release.  The TypeScript module it is generated from is not an
-// ingestible source map and was the previous target.
+// The browser source, and the artifact the release holds.
+//
+// Direction of truth:  `app/src/ui/client/dashboard.js` is the SOURCE;
+// `app/src/ui/dashboardClient.ts` is the GENERATED file, written by
+// `app/scripts/build-dashboard-client.ts`.  routes.ts serves the generated
+// `DASHBOARD_APP_JS` string at /assets/dashboard.js, and that string is
+// `escapeForTemplateLiteral(inject(dashboard.js))`.
+//
+// The release holds dashboard.js rather than dashboardClient.ts:
+//   - dashboardClient.ts is a TypeScript module the browser never loads.  Its
+//     template literal CONTAINS the served bytes; the file does not ARE them.
+//     A `.ts` artifact cannot match a browser frame for /assets/dashboard.js,
+//     and a map beside it would describe TypeScript positions, not the
+//     positions the browser reports.
+//   - The transformation is line-aligned.  The escaper doubles backslashes and
+//     the injector substitutes four sentinels, and neither adds or removes a
+//     line, so the served bundle has exactly as many lines as dashboard.js and
+//     a line number in one is the same line in the other.
+//   - CI enforces the correspondence:  `npm run check:client` runs
+//     `build-dashboard-client.ts --check`, which fails the build when
+//     dashboardClient.ts drifts from dashboard.js.  The artifact therefore
+//     cannot silently drift from what production serves.
+//
+// No file on disk IS the served bytes, and none of them carries a source map,
+// so browser stack traces still will not symbolicate.  That is the build gap in
+// CT-2438:  the generator has to emit the served bundle and its map.
 export const DASHBOARD_SOURCE = resolve(ROOT, 'app/src/ui/client/dashboard.js');
 
 // The CLI is a pinned devDependency of app/, not a global install.  Resolving it
@@ -76,7 +99,7 @@ export function uploadBrowserSourcemaps({
 } = {}) {
   if (!token?.trim()) throw new Error('SENTRY_AUTH_TOKEN is required');
   if (!SHA.test(release || '')) throw new Error('release must be a full SHA');
-  if (!existsSync(source)) throw new Error('dashboardHtml.ts is missing');
+  if (!existsSync(source)) throw new Error(`dashboard upload target is missing: ${source}`);
   if (!existsSync(cli)) {
     throw new Error(`@sentry/cli is not installed at ${cli} - run \`npm ci\` in app/ before uploading`);
   }
@@ -113,7 +136,12 @@ export function uploadBrowserSourcemaps({
   // A zero exit with nothing to say is not proof of an upload.  Treat silence as
   // failure, because the cost of a silent success here is browser errors that
   // never map back to source and nothing in any log says so.
-  const detail = scrubChildOutput(result.stdout, token);
+  //
+  // The gate reads BOTH streams.  The failure path above prefers stderr, so a
+  // CLI that writes its upload summary to stderr would leave stdout empty and
+  // turn a successful upload into a "produced no output" failure.  Both streams
+  // are scrubbed by the same call.
+  const detail = scrubChildOutput([result.stdout, result.stderr].filter(Boolean).join('\n'), token);
   if (!detail) {
     throw new Error(`sentry-cli sourcemaps upload produced no output for release ${release}; refusing to report success`);
   }
@@ -128,7 +156,15 @@ export function uploadBrowserSourcemaps({
   const warning = existsSync(map)
     ? null
     : `no source map at ${map} - the release now holds the bundle as an artifact, but browser stack traces will not symbolicate`;
-  return { release, uploaded: source, detail, warning };
+  // The success line must not claim source maps that do not exist.  When the
+  // warning is set, this very run proved there is no map, so saying "uploaded
+  // source maps" would put a false claim in the same log that says stack traces
+  // will not symbolicate.  The line is built here rather than in the entrypoint
+  // so the two cannot disagree.
+  const summary = warning
+    ? `Uploaded browser dashboard artifact (no source map) for release ${release}`
+    : `Uploaded browser source maps for release ${release}`;
+  return { release, uploaded: source, detail, warning, summary };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -136,7 +172,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const release = resolveBrowserRelease();
     if (!process.env.SENTRY_AUTH_TOKEN?.trim()) throw new Error('SENTRY_AUTH_TOKEN is required');
     const result = uploadBrowserSourcemaps({ release, token: process.env.SENTRY_AUTH_TOKEN });
-    console.log(`Uploaded browser source maps for release ${result.release}`);
+    console.log(result.summary);
     console.log(`sentry-cli output: ${toSingleLine(result.detail)}`);
     if (result.warning) console.warn(`::warning::${result.warning}`);
   } catch (error) {

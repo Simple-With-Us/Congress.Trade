@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DASHBOARD_SOURCE,
@@ -14,6 +16,7 @@ import {
 
 const sha = 'a'.repeat(40);
 const SELF = fileURLToPath(import.meta.url);
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ok = { status: 0, stdout: 'sourcemaps upload complete, 1 artifact uploaded' };
 
 test('requires a full SHA release from env', () => {
@@ -202,8 +205,28 @@ test('caps a runaway diagnostic', () => {
 });
 // Kody finding: the previous target was a TypeScript module with no generated
 // map, so a green step could imply symbolication that cannot happen.
-test('the upload target is the shipped bundle, not the TypeScript module', () => {
+test('the upload target is the browser source, not the generated TypeScript module', () => {
   assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/client\/dashboard\.js$/);
+});
+
+// Kody round-3 finding: the code comment had the direction of truth inverted.
+// The durable guard is the generator's own declaration of which file it reads
+// and which it writes, so the invariant is asserted against that instead of
+// against a filename that could be changed on either side independently.
+test('the upload target is the file the generator reads, not the file it writes', () => {
+  const generator = readFileSync(resolve(ROOT, 'app/scripts/build-dashboard-client.ts'), 'utf8');
+  const source = generator.match(/SOURCE_PATH = new URL\('([^']+)'/)?.[1];
+  const target = generator.match(/TARGET_PATH = new URL\('([^']+)'/)?.[1];
+  assert.ok(source, 'the generator must declare a SOURCE_PATH');
+  assert.ok(target, 'the generator must declare a TARGET_PATH');
+  assert.ok(
+    DASHBOARD_SOURCE.endsWith(source.replace(/^\.\.\//, 'app/')),
+    `the release must hold the generator's source (${source}), got ${DASHBOARD_SOURCE}`,
+  );
+  assert.ok(
+    !DASHBOARD_SOURCE.endsWith(target.replace(/^\.\.\//, 'app/')),
+    `the release must not hold the generator's output (${target})`,
+  );
 });
 
 test('a green upload still says so when there is no source map to symbolicate', () => {
@@ -235,4 +258,85 @@ test('maskToken withholds a preview that would disclose most of a short value', 
   assert.equal(maskToken(thirteen), '[redacted]');
   assert.equal(maskToken('a'.repeat(23)), '[redacted]');
   assert.notEqual(maskToken('a'.repeat(24)), '[redacted]');
+});
+
+// Kody round-3 finding:  the success gate read stdout only while the failure
+// path prefers stderr, so a CLI that writes its upload summary to stderr made
+// a successful upload look like a silent one and failed the deploy job.
+test('a stderr-only upload summary still satisfies the success gate', () => {
+  const spawn = () => ({
+    status: 0,
+    stdout: '',
+    stderr: 'sourcemaps upload complete, 1 artifact uploaded',
+  });
+  const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
+  assert.match(result.detail, /artifact uploaded/);
+});
+
+test('a summary on either stream satisfies the success gate', () => {
+  const spawn = () => ({
+    status: 0,
+    stdout: 'sourcemaps upload complete',
+    stderr: '1 artifact uploaded',
+  });
+  const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
+  assert.match(result.detail, /artifact uploaded/);
+});
+
+// Kody round-3 finding:  the success log claimed source maps were uploaded
+// while the same run had proven there are none.  The summary has to follow the
+// warning, in both directions.
+test('the success summary never claims source maps that do not exist', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'sentry-upload-'));
+  try {
+    const bare = resolve(dir, 'bundle.js');
+    writeFileSync(bare, 'console.log(1)\n');
+    const mapped = resolve(dir, 'mapped.js');
+    writeFileSync(mapped, 'console.log(1)\n');
+    writeFileSync(`${mapped}.map`, '{"version":3,"sources":[],"mappings":""}\n');
+
+    const noMap = uploadBrowserSourcemaps({
+      release: sha,
+      token: 'tok',
+      spawn: () => ok,
+      cli: SELF,
+      source: bare,
+    });
+    assert.ok(noMap.warning, 'a missing source map must not pass unnoticed');
+    assert.match(noMap.summary, /no source map/);
+    assert.ok(
+      !/Uploaded browser source maps/.test(noMap.summary),
+      `the summary must not claim source maps when there is none: ${noMap.summary}`,
+    );
+
+    const withMap = uploadBrowserSourcemaps({
+      release: sha,
+      token: 'tok',
+      spawn: () => ok,
+      cli: SELF,
+      source: mapped,
+    });
+    assert.equal(withMap.warning, null);
+    assert.match(withMap.summary, /Uploaded browser source maps/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Kody round-3 finding:  the missing-target error still named dashboardHtml.ts
+// after the target had moved, sending the operator to the wrong file.
+test('the missing-target error names the target that is actually missing', () => {
+  const missing = '/nonexistent/app/src/ui/client/dashboard.js';
+  assert.throws(
+    () =>
+      uploadBrowserSourcemaps({
+        release: sha,
+        token: 'tok',
+        spawn: () => assert.fail('must not spawn when the target is absent'),
+        cli: SELF,
+        source: missing,
+      }),
+    (error) =>
+      error.message.includes(missing) && !error.message.includes('dashboardHtml.ts'),
+  );
 });
