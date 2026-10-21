@@ -6,7 +6,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const DASHBOARD_SOURCE = resolve(ROOT, 'app/src/ui/dashboardHtml.ts');
+// The generated client bundle is what actually ships, so it is what Sentry should
+// hold against the release.  The TypeScript module it is generated from is not an
+// ingestible source map and was the previous target.
+export const DASHBOARD_SOURCE = resolve(ROOT, 'app/src/ui/client/dashboard.js');
 
 // The CLI is a pinned devDependency of app/, not a global install.  Resolving it
 // directly is deliberate:  `npx --yes @sentry/cli` asks npx for a binary named
@@ -93,7 +96,8 @@ export function uploadBrowserSourcemaps({
     env: { ...process.env, SENTRY_AUTH_TOKEN: token },
   });
   if (result.error) {
-    throw new Error(`sentry-cli sourcemaps upload failed to start: ${scrubChildOutput(result.error.message, token)}`);
+    const detail = toSingleLine(scrubChildOutput(result.error.message, token));
+    throw new Error(`sentry-cli sourcemaps upload failed to start: ${detail}`);
   }
   if (result.status !== 0) {
     const raw = result.stderr || result.stdout || '';
@@ -113,7 +117,15 @@ export function uploadBrowserSourcemaps({
   if (!UPLOAD_CONFIRMED.test(detail)) {
     throw new Error(`sentry-cli did not confirm an upload for release ${release}: ${toSingleLine(detail)}`);
   }
-  return { release, uploaded: source, detail };
+  // Holding the bundle gives Sentry the real artifact for the release, but it is
+  // NOT symbolication: a source map has to exist beside it for a browser frame to
+  // resolve back to source.  Say that outright rather than let a green step imply
+  // mapped stack traces.
+  const map = `${source}.map`;
+  const warning = existsSync(map)
+    ? null
+    : `no source map at ${map} - the release now holds the bundle as an artifact, but browser stack traces will not symbolicate`;
+  return { release, uploaded: source, detail, warning };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -123,6 +135,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const result = uploadBrowserSourcemaps({ release, token: process.env.SENTRY_AUTH_TOKEN });
     console.log(`Uploaded browser source maps for release ${result.release}`);
     console.log(`sentry-cli output: ${toSingleLine(result.detail)}`);
+    if (result.warning) console.warn(`::warning::${result.warning}`);
   } catch (error) {
     console.error(`::error::${error.message}`);
     process.exitCode = 1;

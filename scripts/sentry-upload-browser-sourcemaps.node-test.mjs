@@ -200,3 +200,29 @@ test('caps a runaway diagnostic', () => {
   assert.ok(out.length <= 2100, `expected a capped diagnostic, got ${out.length}`);
   assert.ok(out.startsWith('...'));
 });
+// Kody finding: the previous target was a TypeScript module with no generated
+// map, so a green step could imply symbolication that cannot happen.
+test('the upload target is the shipped bundle, not the TypeScript module', () => {
+  assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/client\/dashboard\.js$/);
+});
+
+test('a green upload still says so when there is no source map to symbolicate', () => {
+  const spawn = () => ok;
+  const result = uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
+  assert.ok(result.warning, 'a missing source map must not pass unnoticed');
+  assert.match(result.warning, /will not symbolicate/);
+});
+
+test('a spawn failure is collapsed onto one line like any other child output', () => {
+  const spawn = () => ({ error: new Error('ENOENT\n::set-output name=x::1'), status: null });
+  let message = '';
+  try {
+    uploadBrowserSourcemaps({ release: sha, token: 'tok', spawn, cli: SELF });
+    assert.fail('expected a throw');
+  } catch (error) {
+    message = error.message;
+  }
+  assert.match(message, /failed to start/);
+  assert.ok(!message.includes('\n'), 'the annotation must stay single-line');
+  assert.match(message, /%0A/);
+});
