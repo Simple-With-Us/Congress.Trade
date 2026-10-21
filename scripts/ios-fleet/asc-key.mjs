@@ -1,44 +1,41 @@
 #!/usr/bin/env node
 /**
- * The App Store Connect private key: how it is validated, and how a staged
- * key file is read.
+ * The App Store Connect private key: how it is validated, and how it is
+ * staged for the Apple tools that need a key file.
  *
  * WHY THIS IS ITS OWN MODULE (2026-10-21, Kody rule 42 on PR #271):
  * The private key is a secret, and the fleet's approved secret sources are the
  * process environment, a captured `fleet-secrets get NAME`, and bootstrap-only
  * Keychain credentials.  A caller-supplied local file is not one of them, so
- * the node client never reads a key file.  The shell layer that already owns
- * the credential reads the staged key and hands it to the client through the
- * environment; this module is the part of that handoff the shell needs.
+ * nothing here reads a key file:  the only approved sources of the key are
+ * process.env.ASC_KEY_P8 and `fleet-secrets get ASC_KEY_P8`.
  *
- * The file read opens the path ONCE with O_NOFOLLOW and inspects and reads the
- * descriptor it got, so a path that is swapped for a symlink between the check
- * and the read cannot be followed.  ENOENT is reported apart from every other
- * failure, because a path that names nothing is not a credential and the
- * caller falls through to the next source, while a path that names the wrong
- * file is a hard stop.
+ * ASC_KEY_PATH IS NOT A CREDENTIAL SOURCE (2026-10-21, Kody rule 42 on PR
+ * #271):  not as a fallback, not as a lower priority, not at all.  A named
+ * path is ignored wherever it appears, so a stale or foreign path in an
+ * operator's shell can never decide which credential signs a request.
  *
  * The command line never carries key material:
- *   read <path>    check that a staged key file holds a usable key
  *   validate       check that a key on stdin holds a usable key
  *   write <path>   read a key on stdin and write it to a mode-600 file
- *   exec <path> -- <command> [args...]
- *                  run a command with the staged key in its environment
  *
  * WHY NOTHING PRINTS THE KEY (2026-10-21, Kody rule 42 on PR #271):
- * A key on stdout is a key in a log, in a CI transcript, in a process
- * listing and in whatever captures that output next.  So `read` and
- * `validate` report the STATUS of a key and never the key itself, and the
- * only way the key reaches a consumer is `exec`, which puts it in the
- * child's environment as ASC_KEY_P8:  never in an argument, never on
- * stdout, never in a log line.
+ * A key on stdout is a key in a log, in a CI transcript and in whatever
+ * captures that output next.  So `validate` reports the STATUS of a key and
+ * never the key itself, and the key reaches a consumer through the process
+ * environment:  never in an argument, never on stdout, never in a log line.
+ *
+ * WHAT THE ENVIRONMENT IS NOT (2026-10-21, audit on PR #271):
+ * The key is not in argv, not on stdout and not in a log line, and a child
+ * is given an allowlist of variables instead of a copy of the parent's
+ * environment.  The environment of a process is still readable by another
+ * process of the same user on this platform:  `ps eww` and `ps -E` show it,
+ * and the PEM envelope is in the listing of the key-bearing child.  So the
+ * handoff keeps the key out of the places a process listing is read for (the
+ * command line) and out of every log, and it does not claim more than that.
  */
-import { closeSync, constants, fstatSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { createPrivateKey } from "node:crypto";
-
-// A private key is a few kilobytes.  Anything larger is not one.
-const MAX_KEY_BYTES = 64 * 1024;
 
 // Normalizes a PEM private key and refuses anything that is not one.
 //
@@ -60,50 +57,13 @@ export function normalizePrivateKey(value) {
   return pem.endsWith("\n") ? pem : `${pem}\n`;
 }
 
-// Reads a staged key file.
-//
-// Returns { pem } when the file holds a usable private key, { missing: true }
-// when the path names nothing at all, and { error } for every other problem.
-//
-// The open, the inspection and the read all use one descriptor, so nothing
-// that happens to the path afterwards can change what is read.
-export function readPrivateKeyFile(keyPath) {
-  let fd;
-  try {
-    fd = openSync(keyPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch (err) {
-    if (err && err.code === "ENOENT") return { missing: true };
-    if (err && err.code === "ELOOP") {
-      return { error: `the key path ${keyPath} is a symbolic link, which is not read` };
-    }
-    return { error: `the key file ${keyPath} could not be read` };
-  }
-  try {
-    const info = fstatSync(fd);
-    if (!info.isFile()) {
-      return { error: `the key path ${keyPath} is not a regular file` };
-    }
-    if ((info.mode & 0o077) !== 0) {
-      const mode = (info.mode & 0o777).toString(8).padStart(3, "0");
-      return { error: `the key file ${keyPath} is readable by others (mode ${mode}); a private key has to be owner-only (chmod 600)` };
-    }
-    if (info.size > MAX_KEY_BYTES) {
-      return { error: `the key file ${keyPath} is ${info.size} bytes, which is not a private key` };
-    }
-    const pem = normalizePrivateKey(readFileSync(fd, "utf8"));
-    if (!pem) {
-      return { error: `the key file ${keyPath} does not hold a PEM private key` };
-    }
-    return { pem };
-  } finally {
-    closeSync(fd);
-  }
-}
-
 // Writes a key to a file only its owner can read.
 //
 // The key arrives on stdin, so it never becomes a command argument, and the
-// file is created with mode 600 whatever the umask of the caller says.
+// file is created with mode 600 whatever the umask of the caller says.  The
+// file is a staging copy for the Apple tools that need a key on disk, and it
+// is never read back as a credential:  the credential comes from the
+// environment or from fleet-secrets.
 export function writePrivateKeyFile(keyPath, value) {
   const pem = normalizePrivateKey(value);
   if (!pem) return { error: "the value is not a PEM private key" };
@@ -115,71 +75,59 @@ export function writePrivateKeyFile(keyPath, value) {
   return { pem };
 }
 
+// The variables the App Store Connect client needs from the environment.
+//
+// The child's environment is an allowlist, never a copy of the parent's:  a
+// wholesale copy hands every credential on the operator's machine to the
+// child, including the ones that have nothing to do with App Store Connect.
+// These are the variables the client reads (see resolveCredential in
+// asc-api.mjs), plus PATH and HOME, which it needs to find fleet-secrets and
+// to reach the bootstrap Keychain.
+export const CLIENT_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "ASC_API_BASE",
+  "ASC_REQUEST_TIMEOUT_MS",
+  "ASC_KEY_ID",
+  "ASC_ISSUER_ID",
+  "APPLE_API_KEY_ID",
+  "APPLE_API_ISSUER_ID",
+  "APPLE_API_KEY_P8_BASE64",
+  "FLEET_SECRETS_BIN",
+  "FLEET_SECRETS"
+];
+
+// Builds the environment a child of the key handoff runs with.
+//
+// Only the allowlisted variables cross over, and the key is added
+// separately:  it goes in as ASC_KEY_P8 and in no other variable.
+export function clientEnvironment(env = process.env, extra = {}) {
+  const child = {};
+  for (const name of CLIENT_ENV_ALLOWLIST) {
+    const value = env[name];
+    if (typeof value === "string" && value.length > 0) child[name] = value;
+  }
+  return { ...child, ...extra };
+}
+
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
 
-// Runs a command with the staged key in its environment.
-//
-// The key goes into the child's environment as ASC_KEY_P8, which is where the
-// client looks for it.  It is never an argument, never reaches this process's
-// stdout or stderr, and never reaches a log line.
-//
-// The child's exit code is returned, so a caller that runs the client through
-// this keeps the client's own result.
-export function execWithKey(keyPath, command, args) {
-  const read = readPrivateKeyFile(keyPath);
-  if (read.missing) return { missing: true };
-  if (read.error) return { error: read.error };
-  const child = spawnSync(command, args, {
-    stdio: "inherit",
-    env: { ...process.env, ASC_KEY_P8: read.pem }
-  });
-  if (child.error) {
-    return { error: `the command could not be started: ${child.error.message}` };
-  }
-  if (child.signal) {
-    return { error: `the command was killed by ${child.signal}` };
-  }
-  return { status: typeof child.status === "number" ? child.status : 1 };
-}
-
-// The exit codes the shell layer reads:
-//   0  the key was read
-//   1  the path names something that is not a usable key
-//   3  the path names nothing at all
-export const EXIT_MISSING = 3;
-
 async function main() {
   const [command, target] = process.argv.slice(2);
-  if (command === "read") {
-    if (!target) {
-      console.error("asc-key: usage: asc-key.mjs read <path>");
-      return 1;
-    }
-    const read = readPrivateKeyFile(target);
-    if (read.missing) {
-      console.error(`asc-key: the key file ${target} does not exist`);
-      return EXIT_MISSING;
-    }
-    if (read.error) {
-      console.error(`asc-key: ${read.error}`);
-      return 1;
-    }
-    //  The status is reported and the key is not:  a key on stdout is a key
-    //  in every log that captures it.
-    console.log(`asc-key: ${target} holds a PEM private key`);
-    return 0;
-  }
   if (command === "validate") {
     const pem = normalizePrivateKey(await readStdin());
     if (!pem) {
       console.error("asc-key: the value is not a PEM private key");
       return 1;
     }
-    //  The key is not printed here either:  see the read command.
+    //  The key is not printed here either:  see the module header.
     console.log("asc-key: the value is a PEM private key");
     return 0;
   }
@@ -195,25 +143,7 @@ async function main() {
     }
     return 0;
   }
-  if (command === "exec") {
-    const rest = process.argv.slice(3);
-    const separator = rest.indexOf("--");
-    if (!target || separator < 0 || separator === rest.length - 1) {
-      console.error("asc-key: usage: asc-key.mjs exec <path> -- <command> [args...]");
-      return 1;
-    }
-    const child = execWithKey(target, rest[separator + 1], rest.slice(separator + 2));
-    if (child.missing) {
-      console.error(`asc-key: the key file ${target} does not exist`);
-      return EXIT_MISSING;
-    }
-    if (child.error) {
-      console.error(`asc-key: ${child.error}`);
-      return 1;
-    }
-    return child.status;
-  }
-  console.error("asc-key: usage: asc-key.mjs read <path> | validate | write <path> | exec <path> -- <command> [args...]");
+  console.error("asc-key: usage: asc-key.mjs validate | write <path>");
   return 1;
 }
 
