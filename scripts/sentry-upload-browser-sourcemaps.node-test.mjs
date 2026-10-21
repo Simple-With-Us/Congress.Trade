@@ -87,8 +87,8 @@ test('never leaks the token through forwarded child output', () => {
 });
 
 test('scrubs credential shapes even when the literal token is absent', () => {
-  assert.equal(scrubChildOutput('Authorization: Bearer abcdef123456', 'other'), 'Authorization: Bearer [redacted]');
-  assert.equal(scrubChildOutput('token=abcdef123456', 'other'), 'token=[redacted]');
+  assert.equal(scrubChildOutput('Authorization: Bearer PLACEHOLDER_VALUE', 'other'), 'Authorization: Bearer [redacted]');
+  assert.equal(scrubChildOutput('token=PLACEHOLDER_VALUE', 'other'), 'token=[redacted]');
   assert.equal(scrubChildOutput('https://key@o1.ingest.sentry.io/1', 'other'), 'https://[redacted]@o1.ingest.sentry.io/1');
   assert.equal(scrubChildOutput('plain harmless text', 'other'), 'plain harmless text');
 });
