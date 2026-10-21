@@ -375,7 +375,7 @@ jobs:
       - name: AppUpdatePrompt pin copy
         run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs
 
-      - name: ASC key reader (offline)
+      - name: ASC key module (offline)
         run: node --test scripts/ios-fleet/test-asc-key.test.mjs
 
       - name: ASC credential resolution (offline)

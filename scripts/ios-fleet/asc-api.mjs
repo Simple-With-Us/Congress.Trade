@@ -10,11 +10,12 @@
  *   2. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8 in process.env,
  *   3. `fleet-secrets get` (Infisical /asc: ASC_KEY_ID, ASC_ISSUER_ID,
  *      ASC_KEY_P8).
- * A path on disk is NOT a credential source (Kody rule 42, AFC-459):  the
- * private key is a secret, and the approved sources are the process
+ * A path on disk is NOT a credential source (AFC-459, revision 2, Kody rule
+ * 42):  the private key is a secret, and the approved sources are the process
  * environment and a captured `fleet-secrets get`.  ASC_KEY_PATH is never read
- * here:  the shell layer that owns the credential reads a staged key file and
- * hands the key over in the environment (scripts/ios-fleet/asc-key.mjs).
+ * here:  the shell layer that owns the credential writes the staging copy the
+ * Apple tools need and hands the key over in the environment
+ * (scripts/ios-fleet/asc-key.mjs).
  * No local secrets folder is read (AFC-359).
  *
  * Usage:
@@ -36,14 +37,17 @@ import { normalizePrivateKey } from "./asc-key.mjs";
 const INFISICAL_ASC_FOLDER = "/asc";
 
 /**
- * Read one value from Infisical Fleet-OPS through `fleet-secrets get`.  FLEET_SECRETS
- * overrides the binary (tests inject a fake).  Returns "" when the CLI is absent,
- * the key is absent, or the call fails.  Never logs stdout or stderr.
+ * Read one value from Infisical Fleet-OPS through `fleet-secrets get`.
+ * FLEET_SECRETS_BIN, then FLEET_SECRETS (tests inject a fake), override the
+ * installed binary.  Returns "" when the CLI is absent, the key is absent, or
+ * the call fails.  Never logs stdout or stderr.
  */
 function fleetSecret(name, folder = INFISICAL_ASC_FOLDER) {
   // The explicit/installed binary first, then fleet-secrets on PATH.
-  const candidates = [process.env.FLEET_SECRETS || join(homedir(), ".local", "bin", "fleet-secrets")];
-  if (!process.env.FLEET_SECRETS) candidates.push("fleet-secrets");
+  const candidates = [
+    process.env.FLEET_SECRETS_BIN || process.env.FLEET_SECRETS || join(homedir(), ".local", "bin", "fleet-secrets")
+  ];
+  if (!process.env.FLEET_SECRETS_BIN && !process.env.FLEET_SECRETS) candidates.push("fleet-secrets");
   for (const bin of candidates) {
     try {
       return execFileSync(bin, ["get", name, "--path", folder], {

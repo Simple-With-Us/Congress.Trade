@@ -9,20 +9,20 @@ This directory is the **source of truth** for the fleet-wide TestFlight ship scr
 - `apps.json` — per-app registry (bundle id, scheme, project paths, team id).  Live DealDex is `net.dealdex` / appleId `6802474288`.
 - `AppUpdatePrompt.swift` — pinned first-launch update prompt.  Copy into each iOS target.  Apple IDs stay in `apps.json` / `versions.json`, not in this file.
 - `asc-api.mjs` — minimal App Store Connect API client (ES256 JWT, no dependencies).  Used by `ship-testflight.sh` for export-compliance (`ensure-tf-ready`) and for build-number verification (`latest-build-seq`).  It takes the private key from the environment only; it never reads a key file.
-- `asc-key.mjs` — the hardened App Store Connect key reader (AFC-459, Kody rule 42).  It validates a staged key file, reads it once with `O_NOFOLLOW`, and hands the key to a child process in the child's environment as `ASC_KEY_P8`.  The key is never an argument, never on stdout, never in a log line.
+- `asc-key.mjs` — the App Store Connect key module (AFC-459, revision 2, Kody rule 42).  It never reads a file:  a path on disk is not an approved credential source at all.  It validates a key, writes a mode-600 staging copy for altool and Xcode, and builds the allowlisted environment a child process runs with.  The key is never an argument, never on stdout, never in a log line.
 - `ExportOptions-appstore.plist` — export options for `destination=upload`.
 - `ExportOptions-export-ipa.plist` — export options for `destination=export` (local IPA only).
 - `test-ship-seq.sh` — offline tests for the build-number rules (see **Tests**).  Repo-only; not installed to the runtime location.
-- `test-asc-key.test.mjs` — offline tests for the key reader.  Repo-only; not installed to the runtime location.
+- `test-asc-key.test.mjs` — offline tests for the key module.  Repo-only; not installed to the runtime location.
 - `test-asc-credentials.sh` — offline tests for the credential resolution in `ship-testflight.sh`.  Repo-only; not installed to the runtime location.
 
 Secrets come from the first source that is present, in this order:
 
-1. `ASC_KEY_ID` / `ASC_ISSUER_ID` / `ASC_KEY_P8` in the process environment (the client also accepts `APPLE_API_KEY_ID` / `APPLE_API_ISSUER_ID` / `APPLE_API_KEY_P8_BASE64`).
-2. A key file named in `ASC_KEY_PATH` — a **file**, read through `asc-key.mjs`, never treated as a variable.
+1. `APPLE_API_KEY_ID` / `APPLE_API_ISSUER_ID` / `APPLE_API_KEY_P8_BASE64` in the process environment (the hosted form; the key is base64, so it is one line and can cross a CI step boundary).
+2. `ASC_KEY_ID` / `ASC_ISSUER_ID` / `ASC_KEY_P8` in the process environment.
 3. Infisical Fleet-OPS folder `/asc` through `fleet-secrets get` (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`;  the `.p8` is written to a 0600 temp file for the run and removed on exit).
 
-A path on disk is **not** a credential source (Kody rule 42, AFC-459):  the shell layer that owns the credential hands the key to the node client in the child's environment, so `asc-api.mjs` never reads a key file.  No local secrets folder is read (AFC-359).  None of the files here contain secret values.
+A path on disk is **not** a credential source (AFC-459, revision 2, Kody rule 42):  a named `ASC_KEY_PATH` is ignored wherever it appears.  The shell layer that owns the credential resolves it, hands it to the node client in the child's environment, and writes the only file that may exist — a short-lived, owner-only staging copy for altool and Xcode, which can only read a key from disk.  That file is written *from* the credential and is never read back as one, so `asc-api.mjs` never reads a key file.  No local secrets folder is read (AFC-359).  None of the files here contain secret values.
 
 ## Install (sync repo copy -> runtime location)
 

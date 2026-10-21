@@ -145,6 +145,17 @@ jobs:
             if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" || "$name" == "SENTRY_DSN" ]]; then
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
             fi
+            # The hosted form of the ASC credential:  the key id and the issuer
+            # under the names the shell layer and the client read.  A path on
+            # disk is not an approved credential source (AFC-459), so the
+            # credential itself crosses the step boundary in the environment
+            # (as base64 below), never as a file path.
+            if [[ "$name" == "ASC_KEY_ID" ]]; then
+              printf 'APPLE_API_KEY_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
+            if [[ "$name" == "ASC_ISSUER_ID" ]]; then
+              printf 'APPLE_API_ISSUER_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
           done
           if [ -z "${SENTRY_DSN:-}" ]; then
             echo "::error::Infisical prod SENTRY_DSN is missing; refusing a mute TestFlight archive."
@@ -165,8 +176,19 @@ jobs:
           printf '%s\n' "$key_material" | bash "$GITHUB_WORKSPACE/scripts/ios-stage-asc-key.sh"
           ASC_KEY_PATH="$(sed -n 's/^ASC_KEY_PATH=//p' "$GITHUB_ENV" | tail -n 1)"
           export ASC_KEY_PATH
+
+          # The hosted form of the credential:  the key id, the issuer and the
+          # key as base64.  Base64 is one line, so the runner's environment
+          # file stays well formed and the raw PEM never enters GITHUB_ENV.
+          # The shell layer and the client both read the trio from the
+          # environment, because a path on disk is not an approved credential
+          # source (AFC-459).
+          key_b64="$(printf '%s' "$key_material" | base64 | tr -d '\n')"
+          printf '::add-mask::%s\n' "${key_b64//'%'/'%25'}"
+          printf 'APPLE_API_KEY_P8_BASE64=%s\n' "$key_b64" >> "$GITHUB_ENV"
+
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
-          unset key_material TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
+          unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
       # Hosted runners have an empty home each job, and this repo forbids
       # actions/cache.  Without a state file the ship gate reads "never shipped"
