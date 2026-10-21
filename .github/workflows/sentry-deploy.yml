@@ -50,6 +50,12 @@ jobs:
           node-version: '24'
       - name: Test deployment evidence and reporting
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
+      # The source-map uploader spawns app/node_modules/.bin/sentry-cli, which is a
+      # pinned devDependency of app/.  Without this the job had no node_modules at
+      # all, and the upload resolved to no executable and failed in under two seconds.
+      - name: Install the pinned Sentry CLI
+        working-directory: app
+        run: npm ci --no-audit --no-fund
       - name: Verify live revision and record Sentry deployment
         id: record
         env:
