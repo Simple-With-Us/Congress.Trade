@@ -175,9 +175,13 @@ jobs:
             echo "::notice::$author is exempt from the one-run-per-bot rule"
             exit 0
           fi
+          # Anchored exact marker text, github-actions[bot] comments only: an
+          # unanchored contains() lets bot=swu-cursor match bot=swu-cursor-cloud's
+          # marker, and without an author filter any commenter could forge a
+          # marker to block a bot's one run (Sentry on CT #2828).
           marker="swu-autofix-run: bot=$requester"
           prior=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=100" --paginate \
-            --jq ".[].body | select(contains(\"$marker\"))" 2> /dev/null | head -1 || true)
+            --jq ".[] | select(.user.login == \"github-actions[bot]\") | .body | select(contains(\"<!-- $marker -->\"))" 2> /dev/null | head -1 || true)
           accepted=true
           if [ -n "$prior" ]; then accepted=false; fi
           if [ -n "${NOTIFY_URL:-}" ]; then
