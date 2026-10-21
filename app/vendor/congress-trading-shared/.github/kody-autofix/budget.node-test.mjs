@@ -13,7 +13,7 @@ const env = () => ({ SWU_KODY_FLEET_BUDGET_ENABLED: 'true',
   DEEPSEEK_API_KEY: 'synthetic-deepseek-only', MINIMAX_API_KEY: 'synthetic-minimax-only' });
 function fixture(provider = 'deepseek', change = () => {}) {
   const commands = [], calls = [], rows = new Map();
-  const model = provider === 'deepseek' ? 'deepseek-flash' : 'MiniMax-M2.7';
+  const model = provider === 'deepseek' ? 'deepseek-flash' : 'MiniMax-M3.1-Flash';
   const settings = { lose: null, loseAlways: false, providerError: false, status: 200, usage: {},
     lease: 60_000, malformed: false, noDate: false, contentType: 'application/json', stream: null };
   const fetcher = async (url, options) => {
@@ -68,7 +68,7 @@ test('one-shot reserve and dispatch precede each provider call, then complete us
     const f = fixture(provider); assert.equal((await f.gateway.request(body())).status, 200);
     assert.deepEqual(f.commands.map(c => c.action), ['reserve', 'dispatch', 'reconcile']);
     assert.equal(f.commands[0].maxInputTokens, 1_048_576); assert.equal(f.commands[0].maxOutputTokens, 4096);
-    assert.equal(f.calls[0].max_tokens, 4096); assert.equal(f.calls[0].model, provider === 'deepseek' ? 'deepseek-flash' : 'MiniMax-M2.7');
+    assert.equal(f.calls[0].max_tokens, 4096); assert.equal(f.calls[0].model, provider === 'deepseek' ? 'deepseek-flash' : 'MiniMax-M3.1-Flash');
     assert(!JSON.stringify(f.calls[0]).includes('cache_control'));
     assert.deepEqual(f.commands[2].usage, { inputTokens: 100, cachedInputTokens: 0, outputTokens: 20 });
   }
@@ -151,7 +151,7 @@ test('genuine reported token overruns are not clamped away before reconciliation
 });
 test('stream accounting requires start, terminal cumulative output, and message_stop', () => {
   const events = [
-    { type: 'message_start', message: { model: 'MiniMax-M2.7', usage: { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 7, cache_creation_input_tokens: 0 } } },
+    { type: 'message_start', message: { model: 'MiniMax-M3.1-Flash', usage: { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 7, cache_creation_input_tokens: 0 } } },
     { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 11 } },
     { type: 'message_stop' },
   ];
