@@ -42,7 +42,7 @@ jobs:
               # The swu-* glob is the owner ruling of 2026-10-20: all swu-* bots
               # are trusted CI actors.  It replaces a 40-entry enumeration that
               # would drift from the autofix allowlists on every new install.
-              'cursor[bot]'|'dependabot[bot]'|'renovate[bot]'|'sentry[bot]'|'codex[bot]'|'chatgpt-codex-connector[bot]'|'kody-ai[bot]'|'claude[bot]'|'github-actions[bot]'|'swu-*[bot]')
+              'cursor[bot]'|'dependabot[bot]'|'renovate[bot]'|'sentry[bot]'|'codex[bot]'|'chatgpt-codex-connector[bot]'|'kody-ai[bot]'|'claude[bot]'|'github-actions[bot]'|swu-*'[bot]')
                 echo "Trusted same-repo bot: $actor"
                 ;;
               *)
