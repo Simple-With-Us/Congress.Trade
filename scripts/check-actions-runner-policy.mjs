@@ -30,9 +30,9 @@ const fullCommitSha = /^[0-9a-f]{40}$/;
 // both run on ubuntu-latest, so the hosted-runner policy still holds.  A caller
 // may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
 const allowedReusableWorkflows = new Set([
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@b634b5113a3293e3b6f7f534abc3594f92c3c900",
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34",
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@e37a3e3055fb616dbc0aaa1c2f127d8b34edbf46",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@e37a3e3055fb616dbc0aaa1c2f127d8b34edbf46",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@e37a3e3055fb616dbc0aaa1c2f127d8b34edbf46",
   "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11",
 ]);
 
