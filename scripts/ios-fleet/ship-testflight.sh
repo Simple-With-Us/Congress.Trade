@@ -524,7 +524,10 @@ asc_latest_seq() {
     logerr "asc-seq: node not on PATH; cannot verify against App Store Connect"
     return 1
   fi
-  if [[ -z "${ASC_KEY_ID:-}" && ! -x "$FLEET_SECRETS_BIN" ]] && ! command -v fleet-secrets >/dev/null 2>&1; then
+  # The hosted trio is a credential source too (AFC-459), so the guard has to
+  # know about it:  a run that carries only APPLE_API_KEY_ID can still be
+  # verified against App Store Connect.
+  if [[ -z "${ASC_KEY_ID:-}" && -z "${APPLE_API_KEY_ID:-}" && ! -x "$FLEET_SECRETS_BIN" ]] && ! command -v fleet-secrets >/dev/null 2>&1; then
     logerr "asc-seq: no ASC_* in env and no fleet-secrets; cannot verify against App Store Connect"
     return 1
   fi
