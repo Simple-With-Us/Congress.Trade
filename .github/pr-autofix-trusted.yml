@@ -12,6 +12,15 @@
 # check if one appears).  Model, turn budget, iteration cap, and verify
 # commands always come from this file.
 #
+# Upstream, AI-Fleet-Coordinator #776 (merged 2f7d5b1) changed the reusable:
+# the trusted list is read from the default branch and a PR branch's
+# .autofix.yml may only narrow it.  This repository still pins the pre-fix
+# reusable (b634b511), so the REPLACE semantics described above are the ones
+# in force here until the owner bumps the pin.  That bump is a
+# .github/workflows edit, which autofix agents must not make; the new pin is
+# allowlisted in scripts/check-actions-runner-policy.mjs so the bump does not
+# fail the required check.
+#
 # The claude-code caller does not read this file at all - that reusable has no
 # trusted-policy loader and no iteration cap - so its turn budget is whatever
 # claude_args the caller passes (the pinned reusable's default is

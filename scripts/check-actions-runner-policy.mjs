@@ -32,9 +32,25 @@ const fullCommitSha = /^[0-9a-f]{40}$/;
 // may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
 const allowedReusableWorkflows = new Set([
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@b634b5113a3293e3b6f7f534abc3594f92c3c900",
+  // AI-Fleet-Coordinator #776 (merged 2f7d5b1): the trust-boundary fix.  The
+  // trusted list is read from the default branch, a PR branch's .autofix.yml
+  // may only narrow it, and each bot's one run per PR is recorded in a marker
+  // comment.  Allowed here so the owner-side pin bump in
+  // .github/workflows/autofix.yml does not trip this required check; the pin
+  // itself is a workflow edit, which autofix agents must not make.
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2f7d5b15de8385aff93ff559e3430c5bce9346a8",
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34",
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34",
   "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11",
+]);
+
+// AFC #776 records each bot's one accepted run per PR in a marker comment on
+// the PR, written through the issues API.  A called workflow's permissions can
+// only narrow the caller's, so a caller pinned to that reusable has to grant
+// issues: write itself - otherwise the marker write is refused and the whole
+// autofix lane fails.
+const reusablesRequiringIssuesWrite = new Set([
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2f7d5b15de8385aff93ff559e3430c5bce9346a8",
 ]);
 
 for (const name of workflowNames) {
@@ -67,6 +83,15 @@ for (const name of workflowNames) {
 
   // IOSENGINEERING-14: iOS compile + XCTest must fail the job.  Advisory
   // continue-on-error let red Mac builds merge.  Do not skip tests.
+  for (const reusable of reusablesRequiringIssuesWrite) {
+    if (text.includes(reusable) && !/^\s*issues:\s*write\s*$/m.test(text)) {
+      errors.push(
+        `${name}: ${reusable} writes a per-bot marker comment, so its job must grant issues: write`,
+      );
+      break;
+    }
+  }
+
   if (name === "ios-build.yml") {
     if (/\bcontinue-on-error\s*:/.test(text)) {
       errors.push(`${name}: iOS compile+test must fail the job (no continue-on-error)`);
@@ -134,6 +159,13 @@ for (const name of workflowNames) {
 // on a contents:write autofix session, while the caller still believes its own
 // list is in force.  The authoritative list lives in the caller workflow, so
 // this repository carries no root .autofix.yml.
+//
+// Upstream, AI-Fleet-Coordinator #776 (merged 2f7d5b1) changed the reusable so
+// the trusted list is read from the default branch and a PR branch's
+// .autofix.yml may only narrow it.  This repository still pins the pre-fix
+// reusable (b634b511), so the replace semantics above are the ones in force
+// here and the ban stays until the pin moves; the new pin is allowlisted
+// above so the owner's bump does not fail this check.
 if (existsSync(new URL("../.autofix.yml", import.meta.url))) {
   errors.push(
     "root .autofix.yml: not allowed - it replaces the caller's allowed_bots list on every PR branch; pass allowed_bots from the autofix caller workflow instead",

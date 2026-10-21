@@ -22,6 +22,20 @@ no trusted-policy loader and no iteration cap, so the caller passes
 `max_turns: 60` recorded in `.github/pr-autofix-trusted.yml` instead of the
 reusable's 120-turn default.
 
+The trust-boundary fix for the PR-branch `.autofix.yml` override landed
+upstream in `AI-Fleet-Coordinator` #776 (`2f7d5b1`): the trusted list is read
+from the default branch, and a PR branch's `.autofix.yml` may only narrow it.
+This repository still pins the pre-fix reusable (`b634b511`), so the branch
+file can still replace the list here and the root-`.autofix.yml` ban in
+`scripts/check-actions-runner-policy.mjs` remains the protection until the pin
+moves.  The pin bump is owner-side (a `.github/workflows` edit, which autofix
+agents do not make) and comes with a second lockstep requirement: the
+post-#776 reusable records each bot's one run per PR in a marker comment on
+the PR, so the caller has to grant `issues: write` — a called workflow's
+permissions can only narrow the caller's, so without that grant the marker
+write is refused and the autofix lane fails.  The policy script already
+allowlists the new pin and fails a caller that forgets the grant.
+
 ## The gate
 
 The Security/gitleaks workflow admits same-repository PR runs triggered by the
