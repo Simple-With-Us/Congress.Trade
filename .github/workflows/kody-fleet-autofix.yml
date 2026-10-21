@@ -2,7 +2,7 @@
 # MiniMax M3.1 Flash via its direct OpenAI-compatible endpoint, paid; at most 5 attempts per UTC day in this repository.
 # The generation step reads the org secret MINIMAX_API_KEY directly as MODEL_API_KEY.
 # Local job definitions preserve this repository's auditable runner policy.
-# Mirrors congress-trading-shared kody-autofix-reusable.yml at e28fefcd12d4747e3ed66cb5c5b3f3dd7ea2db88.
+# Mirrors congress-trading-shared kody-autofix-reusable.yml at 917a49dfb77e4fce307a985510ab814a6f684ef6.
 # Full checkout is restricted to the trusted public helper commit; no target PR checkout.
 name: Kody MiniMax M3.1 Flash Fix Proposals
 
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
+          ref: 'cb956e7a81f657b50acc71de9956548addd9ad6b'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -102,7 +102,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
+          ref: 'cb956e7a81f657b50acc71de9956548addd9ad6b'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -142,7 +142,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
+          ref: 'cb956e7a81f657b50acc71de9956548addd9ad6b'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -214,7 +214,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Simple-With-Us/congress-trading-shared
-          ref: 'b1503884e547a8fb5d1449a94e03cae8c496da4c'
+          ref: 'cb956e7a81f657b50acc71de9956548addd9ad6b'
           path: trusted-helper
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
