@@ -300,7 +300,10 @@ errors with guidance).  `npm run migrate` is a local leftover helper only.
 
 **New production runtimes:** New Cloudflare Workers or other new production
 runtimes are discouraged.  Exceptions are allowed case by case;  Jay must
-approve each exception before the change merges or deploys.
+approve each exception before the change merges or deploys.  This gate is an
+explicit exception to the blanket merge pre-approval above and to the
+NO HOLDING OFF PRODUCTION rule: for a new production runtime, green CI is not
+enough - hold the merge until Jay approves the runtime itself.
 
 If you add or change a migration:
 
