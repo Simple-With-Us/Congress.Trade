@@ -1,5 +1,5 @@
 // Upload the inline dashboard source as a Sentry release artifact.
-// Never prints SENTRY_AUTH_TOKEN.  Release is the verified Coolify SHA.
+// Never prints SENTRY_AUTH_TOKEN in full.  Release is the verified Coolify SHA.
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -16,11 +16,24 @@ export const SENTRY_CLI = resolve(ROOT, 'app/node_modules/.bin/sentry-cli');
 
 const SHA = /^[0-9a-f]{40}$/;
 const MAX_DIAGNOSTIC = 2000;
+const AUTH_FAILURE =
+  /\b(?:401|403)\b|unauthor|forbidden|invalid\s+(?:auth\s+)?token|authentication\s+(?:failed|error)|api\s+key/i;
+const UPLOAD_CONFIRMED = /upload|artifact|release/i;
 
 export function resolveBrowserRelease(env = process.env) {
   const raw = (env.SENTRY_RELEASE || env.CT_BUILD_SHA || env.SOURCE_COMMIT || '').trim().toLowerCase();
   if (!SHA.test(raw)) throw new Error('SENTRY_RELEASE (or CT_BUILD_SHA / SOURCE_COMMIT) must be a full SHA');
   return raw;
+}
+
+// A rejected credential is the one failure nobody can diagnose from a fully
+// redacted log, so the preview is required:  first eight, last four, never the
+// whole value.  Anything short enough that a preview would leak most of it is
+// not previewed at all.
+export function maskToken(token) {
+  const value = String(token ?? '').trim();
+  if (value.length <= 12) return '[redacted]';
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
 }
 
 // Child output is forwarded into an error that lands in a CI log, so it has to
@@ -35,6 +48,17 @@ export function scrubChildOutput(text, token) {
   out = out.replace(/(https:\/\/)([A-Za-z0-9._~+/=-]+)@/g, '$1[redacted]@');
   out = out.trim();
   return out.length > MAX_DIAGNOSTIC ? `...${out.slice(-MAX_DIAGNOSTIC)}` : out;
+}
+
+// The entrypoint prints this as a single `::error::` annotation.  A raw newline
+// would truncate the annotation, and a continuation line starting with `::`
+// would be parsed as a workflow command, so child output is collapsed onto one
+// line using the escapes Actions documents for exactly this.
+export function toSingleLine(text) {
+  return String(text ?? '')
+    .replace(/%/g, '%25')
+    .replace(/\r/g, '%0D')
+    .replace(/\n/g, '%0A');
 }
 
 export function uploadBrowserSourcemaps({
@@ -72,12 +96,24 @@ export function uploadBrowserSourcemaps({
     throw new Error(`sentry-cli sourcemaps upload failed to start: ${scrubChildOutput(result.error.message, token)}`);
   }
   if (result.status !== 0) {
-    const detail = scrubChildOutput(result.stderr || result.stdout, token);
+    const raw = result.stderr || result.stdout || '';
+    const detail = toSingleLine(scrubChildOutput(raw, token));
+    const rejected = AUTH_FAILURE.test(raw) ? ` (rejected credential ${maskToken(token)})` : '';
     throw new Error(
-      `sentry-cli sourcemaps upload failed (exit ${result.status})${detail ? `: ${detail}` : ''}`,
+      `sentry-cli sourcemaps upload failed (exit ${result.status})${rejected}${detail ? `: ${detail}` : ''}`,
     );
   }
-  return { release, uploaded: source, detail: scrubChildOutput(result.stdout, token) };
+  // A zero exit with nothing to say is not proof of an upload.  Treat silence as
+  // failure, because the cost of a silent success here is browser errors that
+  // never map back to source and nothing in any log says so.
+  const detail = scrubChildOutput(result.stdout, token);
+  if (!detail) {
+    throw new Error(`sentry-cli sourcemaps upload produced no output for release ${release}; refusing to report success`);
+  }
+  if (!UPLOAD_CONFIRMED.test(detail)) {
+    throw new Error(`sentry-cli did not confirm an upload for release ${release}: ${toSingleLine(detail)}`);
+  }
+  return { release, uploaded: source, detail };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -86,6 +122,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     if (!process.env.SENTRY_AUTH_TOKEN?.trim()) throw new Error('SENTRY_AUTH_TOKEN is required');
     const result = uploadBrowserSourcemaps({ release, token: process.env.SENTRY_AUTH_TOKEN });
     console.log(`Uploaded browser source maps for release ${result.release}`);
+    console.log(`sentry-cli output: ${toSingleLine(result.detail)}`);
   } catch (error) {
     console.error(`::error::${error.message}`);
     process.exitCode = 1;
