@@ -1,6 +1,6 @@
 # Core (CPU-only, Linux ARM64 + amd64) — pinned to avoid pip ResolutionImpossible on Coolify
 numpy==2.5.4
-pillow==12.3.0
+pillow==13.0.0
 opencv-python-headless==5.0.0.93
 pytesseract==0.3.13
 packaging>=24.0
