@@ -1,6 +1,27 @@
 # Trusted autofix policy for this repository (read from the default branch only).
-# PR-branch .autofix.yml may still narrow allowed_bots; it must not change model,
-# turn budget, iteration cap, or verify commands.
+#
+# The pinned pr-autofix-reusable reads exactly four keys from this file: model,
+# max_turns, max_iterations, and verify_command.  allowed_bots is NOT read from
+# here - the caller passes it in the autofix caller workflow.
+#
+# A root .autofix.yml in a PR branch is read by the pinned reusable out of the
+# PR branch checkout.  Before AI-Fleet-Coordinator #776 it REPLACED the
+# caller's allowed_bots list wholesale - not a narrowing-only override - so a
+# same-repo branch could widen the trusted set as well as narrow it.  #776
+# (merged 2f7d5b1) changed the reusable: the trusted list is read from the
+# default branch and a PR branch's .autofix.yml may only narrow it, and the
+# caller now pins the post-fix reusable (c97a2dae), so narrowing is the
+# semantics in force here.  The authoritative list still stays in the caller
+# workflow, and this repository still ships no root .autofix.yml
+# (scripts/check-actions-runner-policy.mjs fails the required check if one
+# appears): any root .autofix.yml - even a narrowing one - is a fleet-trust
+# change that needs an owner decision, not a PR branch edit.  Model, turn
+# budget, iteration cap, and verify commands always come from this file.
+#
+# The claude-code caller does not read this file at all - that reusable has no
+# trusted-policy loader and no iteration cap - so its turn budget is whatever
+# claude_args the caller passes (the pinned reusable's default is
+# --max-turns 120).  The budget of record is max_turns below.
 
 # Owner ruling 2026-10-20: all fleet MiniMax use goes to MiniMax-M3.1-Flash.
 #

@@ -21,3 +21,5 @@ This provider change preserves the existing gates, profile, source paths, budget
 ## Native M3 Answer Mode
 
 The helper pin `b1503884e547a8fb5d1449a94e03cae8c496da4c` disables thinking for native `MiniMax-M3`, using the documented API mode to avoid upstream MiniMax-M3 issue 28, where reasoning boundaries can truncate the answer.  A live synthetic edit canary passed against this exact revision; all 71 offline helper tests passed.  The model, endpoint, key, source scope, and budget stay unchanged.
+
+Update 2026-10-21: `KODY_MODEL` moved to `MiniMax-M3.1-Flash` (the `MiniMax-M3` pin retired).  At the helper pin above, native non-M3 MiniMax models answer in `reasoning_split` mode; the M3-only thinking-disabled branch no longer applies.  The helper pin advances to a congress-trading-shared revision with native M3.1-Flash handling once cts #393 lands (tracked on CT #2823).

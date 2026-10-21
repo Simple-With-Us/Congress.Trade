@@ -1,4 +1,8 @@
+import { existsSync } from "node:fs";
+import { callerGrantsIssuesWrite } from "./workflow-permissions.mjs";
 import { readdir, readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 /** default-main-protection ruleset on Simple-With-Us/Congress.Trade */
 const MAIN_RULESET_ID = "20961339";
@@ -30,11 +34,56 @@ const fullCommitSha = /^[0-9a-f]{40}$/;
 // both run on ubuntu-latest, so the hosted-runner policy still holds.  A caller
 // may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
 const allowedReusableWorkflows = new Set([
+  // AFC main pin c97a2dae (past the #776 trust-boundary fix 2f7d5b1): the
+  // trusted list is read from the default branch, a PR branch's .autofix.yml
+  // may only narrow it, and each bot's one run per PR is recorded in a marker
+  // comment.  The pin itself is a workflow edit, which autofix agents must not
+  // make; it is allowlisted here so the owner-side pin in
+  // .github/workflows/autofix.yml does not trip this required check.
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
   "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11",
 ]);
+
+// AFC #776 records each bot's one accepted run per PR in a marker comment on
+// the PR, written through the issues API.  A called workflow's permissions can
+// only narrow the caller's, so a caller pinned to that reusable has to grant
+// issues: write itself - otherwise the marker write is refused and the whole
+// autofix lane fails.
+const reusablesRequiringIssuesWrite = new Set([
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@c97a2dae96762eb9ffc122c753f0dfb0a7840650",
+]);
+
+// Kody on #2823 asked for a `node --test` regression that pins the job-scoped
+// `issues: write` grant.  The regression lives in
+// scripts/workflow-permissions.test.mjs, but every scripts/*.test.mjs file
+// needs its own step in .github/workflows/ci.yml to run, and ci.yml is a
+// workflow this bot must not edit - so on its own the regression would never
+// execute and a regression in the guard itself would stay invisible to CI.
+// This script is the one policy check the required `typecheck + test` job
+// runs, so it executes the regression here: a guard that regresses fails the
+// required check instead of sitting unread.
+const permissionsRegression = new URL("./workflow-permissions.test.mjs", import.meta.url);
+// Fail closed (Kody on #2823): a renamed or deleted regression file must not
+// turn this check green - without the regression the guard itself is
+// unverified, so treat a missing file as a policy error.
+if (!existsSync(permissionsRegression)) {
+  errors.push(
+    "scripts/workflow-permissions.test.mjs: missing - the job-scoped `issues: write` guard regression cannot run",
+  );
+} else {
+  const regression = spawnSync(
+    process.execPath,
+    ["--test", fileURLToPath(permissionsRegression)],
+    { stdio: "inherit" },
+  );
+  if (regression.status !== 0) {
+    errors.push(
+      "scripts/workflow-permissions.test.mjs: the job-scoped `issues: write` guard regression failed",
+    );
+  }
+}
 
 for (const name of workflowNames) {
   const text = await readFile(new URL(name, workflowsDir), "utf8");
@@ -66,6 +115,17 @@ for (const name of workflowNames) {
 
   // IOSENGINEERING-14: iOS compile + XCTest must fail the job.  Advisory
   // continue-on-error let red Mac builds merge.  Do not skip tests.
+  for (const reusable of reusablesRequiringIssuesWrite) {
+    // Job-scoped: a file-wide match can accept an unrelated grant while the
+    // calling job receives no issues scope (Kody on #2823).
+    if (text.includes(reusable) && !callerGrantsIssuesWrite(text, reusable)) {
+      errors.push(
+        `${name}: ${reusable} writes a per-bot marker comment, so its calling job must grant issues: write`,
+      );
+      break;
+    }
+  }
+
   if (name === "ios-build.yml") {
     if (/\bcontinue-on-error\s*:/.test(text)) {
       errors.push(`${name}: iOS compile+test must fail the job (no continue-on-error)`);
@@ -124,6 +184,27 @@ for (const name of workflowNames) {
   if (/\bsecrets\.GH_PAT\b/.test(uncommented) || /\bsecrets\.SHEPHERD_TOKEN\b/.test(uncommented)) {
     errors.push(`${name}: GH_PAT / SHEPHERD_TOKEN must not appear; congress-trading-shared is public and vendored`);
   }
+}
+
+// A root .autofix.yml is read by the pinned pr-autofix-reusable out of the PR
+// branch checkout, and there it REPLACES the caller's allowed_bots list
+// wholesale - it is not a narrowing-only override.  A same-repo branch that
+// ships one could therefore swap the trusted fleet for an arbitrary actor list
+// on a contents:write autofix session, while the caller still believes its own
+// list is in force.  The authoritative list lives in the caller workflow, so
+// this repository carries no root .autofix.yml.
+//
+// Upstream, AI-Fleet-Coordinator #776 (merged 2f7d5b1) changed the reusable so
+// the trusted list is read from the default branch and a PR branch's
+// .autofix.yml may only narrow it, and the pinned reusable (c97a2dae)
+// includes that fix, so the wholesale-replace risk is gone.  The ban stays
+// anyway: the authoritative bot list belongs in the caller workflow, and any
+// root .autofix.yml - even a narrowing one - is a fleet-trust change that
+// needs an owner decision, not a PR branch edit.
+if (existsSync(new URL("../.autofix.yml", import.meta.url))) {
+  errors.push(
+    "root .autofix.yml: not allowed - it replaces the caller's allowed_bots list on every PR branch; pass allowed_bots from the autofix caller workflow instead",
+  );
 }
 
 const xctestPath = new URL("./ios-ci-xctest.sh", import.meta.url);
