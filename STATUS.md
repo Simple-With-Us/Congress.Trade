@@ -6,7 +6,7 @@
 
 ## 2026-10-11 CODEX — Kody Direct MiniMax (CTS-330)
 
-Kody uses `MiniMax-M3.1-Flash` through MiniMax’s direct OpenAI-compatible endpoint with the existing MiniMax key (repinned 2026-10-21).  The helper answers in `reasoning_split` mode for M3.1-Flash (the native M3 thinking-disabled mode applied to the retired `MiniMax-M3` pin) and passed a synthetic live edit canary plus 71 offline tests.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
+Kody uses `MiniMax-M3.1-Flash` through MiniMax's direct OpenAI-compatible endpoint with the existing MiniMax key (repinned 2026-10-21).  The helper answers in `reasoning_split` mode for M3.1-Flash; the native-M3 thinking-disabled mode and its passing synthetic live edit canary applied to the retired `MiniMax-M3` pin, and no live canary has been recorded for the M3.1-Flash id on this route yet - the native-handling cure is upstream congress-trading-shared #393, tracked on PR #2823.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
 
 
 ## 2026-09-24 BF-PUBLISHER — Disputed agreement vision vs unreadable 278-T
