@@ -149,8 +149,8 @@ jobs:
         env:
           # Owner switch 2026-10-21:  org/repo Actions variables retarget every caller at
           # once;  unset,  the MiniMax pins below are exactly what ran before.
-          ANTHROPIC_BASE_URL: ${{ vars.SWU_AUTOFIX_MODEL_BASE_URL || 'https://api.minimax.io/anthropic' }}
-          ANTHROPIC_AUTH_TOKEN: ${{ contains(vars.SWU_AUTOFIX_MODEL_BASE_URL, 'meta.ai') && secrets.META_MODEL_API_TOKEN || secrets.MINIMAX_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.SWU_AUTOFIX_MODEL_BASE_URL == 'https://api.meta.ai' && 'https://api.meta.ai' || 'https://api.minimax.io/anthropic' }}
+          ANTHROPIC_AUTH_TOKEN: ${{ vars.SWU_AUTOFIX_MODEL_BASE_URL == 'https://api.meta.ai' && (secrets.META_MODEL_API_TOKEN || 'MISSING-META-MODEL-API-TOKEN') || secrets.MINIMAX_API_KEY }}
           ANTHROPIC_MODEL: ${{ vars.SWU_AUTOFIX_MODEL || inputs.model }}
           ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.SWU_AUTOFIX_MODEL || inputs.model }}
         with:
