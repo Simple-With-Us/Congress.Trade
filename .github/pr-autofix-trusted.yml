@@ -10,7 +10,7 @@
 # 2026-10-18 (BF-2494), while api.minimax.io still served it for a while
 # afterwards.  A model id absent from the runtime catalog can still answer over
 # the public API, so an id must never be rewritten from one route's evidence;
-# see contrib/MM/2026-10-19/f11f7046.  This policy is read only from the default
+# see AI-Fleet-Coordinator contrib/MM/2026-10-19/f11f7046.  This policy is read only from the default
 # branch and sends the id to https://api.minimax.io/anthropic, so it is pinned
 # to the stable id the owner chose rather than to a preview spelling the vendor
 # has already begun removing.
