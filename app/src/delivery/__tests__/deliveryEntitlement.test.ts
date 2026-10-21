@@ -50,11 +50,11 @@ function webhookEnv(clientId: string, owner: OwnerState | null) {
     async first<T>() {
       if (/FROM transactions WHERE id = \?/i.test(sql)) return txRow as T;
       if (/FROM users WHERE id/i.test(sql)) return (owner ? userRow(owner) : null) as T;
-      // The chamber lookup became a filings+filers join when it also started
-      // resolving the filer party for the SSE broadcast. Matching the old
+      // The chamber lookup became a transactions+filers+filings join when it also
+      // started resolving the filer party for the SSE broadcast. Matching the old
       // 'SELECT chamber FROM filings' spelling here left this mock silently
       // returning null, so ctx.chamber went empty and nothing asserted on it.
-      if (/FROM filings f/i.test(sql)) return { chamber: 'house', party: 'D' } as T;
+      if (/AS chamber, fl\.party AS party/i.test(sql)) return { chamber: 'house', party: 'D' } as T;
       if (/FROM securities_ref/i.test(sql)) return { sector: 'Technology', market_cap_bucket: 'mega' } as T;
       if (/FROM subscriptions/i.test(sql)) return subRow as T;
       return null as T | null;

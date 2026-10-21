@@ -246,10 +246,20 @@ export async function dispatchWebhook(
   }
   const tx = stampDeliveryFreshness(mapTransaction(txRow));
 
-  // Resolve chamber via the owning filing (Transaction carries no chamber col),
-  // and the filer's party, which Transaction does carry but `SELECT * FROM
-  // transactions` cannot supply. Both live on this one join: filings holds
-  // filer_id and filers keys party by bioguide_id.
+  // Resolve chamber + the filer's party in one query, keyed off the transaction.
+  //
+  // Base is `transactions` with LEFT JOINs, exactly like the replay paths
+  // (rows.ts TX_FROM_JOINS): competitor_backfill / seed rows are written by
+  // persistTransactions() with no `filings` row behind them, so a filings-driven
+  // base returned zero rows for them and both fields fell out as null — dropping
+  // them from every chamber-filtered subscription that the feed resolves.
+  //
+  // Party keys on the TRANSACTION's filer_id, not the filing's. filings.filer_id
+  // is nullable and written on its own schedule (extraction inserts filings with
+  // doc_id alone), so keying off it resolved NULL for rows whose transactions do
+  // carry a filer — while the SSE backlog (sse.ts) and the HTTP feed (rows.ts)
+  // both key the same party on t.filer_id. Binding the transaction's filer keeps
+  // all three delivery paths on one spelling, which is what this path is for.
   //
   // Party has to be on the transaction rather than only in ctx, because ctx is
   // consumed for subscription matching and never serialized — formatTradeEvent
@@ -257,11 +267,12 @@ export async function dispatchWebhook(
   // the frame reaches the client.
   const filingRow = await get<{ chamber: string | null; party: string | null }>(
     env.DB,
-    `SELECT f.chamber AS chamber, fl.party AS party
-       FROM filings f
-       LEFT JOIN filers fl ON fl.bioguide_id = f.filer_id
-      WHERE f.doc_id = ?`,
-    [tx.docId],
+    `SELECT COALESCE(fl.chamber, f.chamber) AS chamber, fl.party AS party
+       FROM transactions t
+       LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id
+       LEFT JOIN filings f ON f.doc_id = t.doc_id
+      WHERE t.id = ?`,
+    [tx.id],
   );
   const chamber = filingRow?.chamber ?? null;
   // The backlog path gets this from mapFeedTransaction; this is the push path's
