@@ -1,5 +1,19 @@
 # Bot-authored pull requests
 
+## Trusted bot set (owner ruling 2026-10-20)
+
+All `swu-*` fleet bots are trusted CI actors, alongside the review bots below.
+The authoritative list is the `allowed_bots` value the autofix callers pass
+(`.github/workflows/autofix.yml`, `.github/workflows/claude-code-autofix.yml`);
+every trusted-bot gate must be derived from that one list so the sets cannot
+diverge. `.github/workflows/security.yml` still carries the older, narrower
+`case` list, so a `swu-*` bot PR (and `kody-ai[bot]`) is rejected today by the
+gitleaks gate even though the same identity may drive an autofix session.
+Extending that list is an owner-side workflow edit: autofix agents do not
+change `.github/workflows`.
+
+## The gate
+
 The Security/gitleaks workflow admits same-repository PR runs triggered by
 `cursor[bot]`, `dependabot[bot]`, `sentry[bot]`, `codex[bot]`, and
 `chatgpt-codex-connector[bot]` (Congress.Trade also retains `github-actions[bot]`). They still run normal secret scanning and
