@@ -34,16 +34,15 @@ const fullCommitSha = /^[0-9a-f]{40}$/;
 // both run on ubuntu-latest, so the hosted-runner policy still holds.  A caller
 // may not pass GH_PAT (checked below), so these pushes use GITHUB_TOKEN.
 const allowedReusableWorkflows = new Set([
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@b634b5113a3293e3b6f7f534abc3594f92c3c900",
-  // AI-Fleet-Coordinator #776 (merged 2f7d5b1): the trust-boundary fix.  The
+  // AFC main pin, 20 commits past the #776 trust-boundary fix (2f7d5b1): the
   // trusted list is read from the default branch, a PR branch's .autofix.yml
   // may only narrow it, and each bot's one run per PR is recorded in a marker
-  // comment.  Allowed here so the owner-side pin bump in
-  // .github/workflows/autofix.yml does not trip this required check; the pin
-  // itself is a workflow edit, which autofix agents must not make.
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2f7d5b15de8385aff93ff559e3430c5bce9346a8",
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34",
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34",
+  // comment.  The pin itself is a workflow edit, which autofix agents must not
+  // make; it is allowlisted here so the owner-side pin in
+  // .github/workflows/autofix.yml does not trip this required check.
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@a652e46755412be2201a2f406e50a422c1376b4c",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@a652e46755412be2201a2f406e50a422c1376b4c",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/codex-autofix-reusable.yml@a652e46755412be2201a2f406e50a422c1376b4c",
   "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11",
 ]);
 
@@ -53,7 +52,7 @@ const allowedReusableWorkflows = new Set([
 // issues: write itself - otherwise the marker write is refused and the whole
 // autofix lane fails.
 const reusablesRequiringIssuesWrite = new Set([
-  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2f7d5b15de8385aff93ff559e3430c5bce9346a8",
+  "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@a652e46755412be2201a2f406e50a422c1376b4c",
 ]);
 
 // Kody on #2823 asked for a `node --test` regression that pins the job-scoped
@@ -66,7 +65,14 @@ const reusablesRequiringIssuesWrite = new Set([
 // runs, so it executes the regression here: a guard that regresses fails the
 // required check instead of sitting unread.
 const permissionsRegression = new URL("./workflow-permissions.test.mjs", import.meta.url);
-if (existsSync(permissionsRegression)) {
+// Fail closed (Kody on #2823): a renamed or deleted regression file must not
+// turn this check green - without the regression the guard itself is
+// unverified, so treat a missing file as a policy error.
+if (!existsSync(permissionsRegression)) {
+  errors.push(
+    "scripts/workflow-permissions.test.mjs: missing - the job-scoped `issues: write` guard regression cannot run",
+  );
+} else {
   const regression = spawnSync(
     process.execPath,
     ["--test", fileURLToPath(permissionsRegression)],
@@ -190,10 +196,11 @@ for (const name of workflowNames) {
 //
 // Upstream, AI-Fleet-Coordinator #776 (merged 2f7d5b1) changed the reusable so
 // the trusted list is read from the default branch and a PR branch's
-// .autofix.yml may only narrow it.  This repository still pins the pre-fix
-// reusable (b634b511), so the replace semantics above are the ones in force
-// here and the ban stays until the pin moves; the new pin is allowlisted
-// above so the owner's bump does not fail this check.
+// .autofix.yml may only narrow it, and the pinned reusable (a652e467)
+// includes that fix, so the wholesale-replace risk is gone.  The ban stays
+// anyway: the authoritative bot list belongs in the caller workflow, and any
+// root .autofix.yml - even a narrowing one - is a fleet-trust change that
+// needs an owner decision, not a PR branch edit.
 if (existsSync(new URL("../.autofix.yml", import.meta.url))) {
   errors.push(
     "root .autofix.yml: not allowed - it replaces the caller's allowed_bots list on every PR branch; pass allowed_bots from the autofix caller workflow instead",

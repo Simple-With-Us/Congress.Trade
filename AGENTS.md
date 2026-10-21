@@ -86,11 +86,10 @@ Effort logs are standardized across all apps: protocol at
 ## Branch And Worktree Policy
 
 - Create or switch to a separate branch before non-trivial edits.
-- Codex branches: `codex/<short-topic>`.
-- Claude branches: `claude/<short-topic>`.
-- Cursor/Cursor Cloud branches: `cursor/<short-topic>`.
-- Copilot branches: `copilot/<short-topic>`.
-- Antigravity branches: `antigravity/<short-topic>`.
+- Branch prefix: `<seat>/<short-topic>` using your own assigned seat prefix.
+  Current seats include codex, claude, cursor, copilot, antigravity, wise,
+  echo, and instinct; the list grows, so use your assigned prefix rather than
+  copying this list.
 - Shared feature or integration branches are acceptable when explicitly
   coordinated.
 - Do not edit another agent's branch unless asked.
@@ -298,6 +297,13 @@ to report the HEAD SHA and POSTs `/api/admin/migrate` (idempotent;
 `npm run deploy` is a reminder, not a Worker publish.  `npm run deploy:full`
 aliases `ship.sh`; `npm run migrate:remote` is intentionally disabled (it
 errors with guidance).  `npm run migrate` is a local leftover helper only.
+
+**New production runtimes:** New Cloudflare Workers or other new production
+runtimes are discouraged.  Exceptions are allowed case by case;  Jay must
+approve each exception before the change merges or deploys.  This gate is an
+explicit exception to the blanket merge pre-approval above and to the
+NO HOLDING OFF PRODUCTION rule: for a new production runtime, green CI is not
+enough - hold the merge until Jay approves the runtime itself.
 
 If you add or change a migration:
 
