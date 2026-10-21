@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
 import { callerGrantsIssuesWrite } from "./workflow-permissions.mjs";
 import { readdir, readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 /** default-main-protection ruleset on Simple-With-Us/Congress.Trade */
 const MAIN_RULESET_ID = "20961339";
@@ -53,6 +55,29 @@ const allowedReusableWorkflows = new Set([
 const reusablesRequiringIssuesWrite = new Set([
   "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2f7d5b15de8385aff93ff559e3430c5bce9346a8",
 ]);
+
+// Kody on #2823 asked for a `node --test` regression that pins the job-scoped
+// `issues: write` grant.  The regression lives in
+// scripts/workflow-permissions.test.mjs, but every scripts/*.test.mjs file
+// needs its own step in .github/workflows/ci.yml to run, and ci.yml is a
+// workflow this bot must not edit - so on its own the regression would never
+// execute and a regression in the guard itself would stay invisible to CI.
+// This script is the one policy check the required `typecheck + test` job
+// runs, so it executes the regression here: a guard that regresses fails the
+// required check instead of sitting unread.
+const permissionsRegression = new URL("./workflow-permissions.test.mjs", import.meta.url);
+if (existsSync(permissionsRegression)) {
+  const regression = spawnSync(
+    process.execPath,
+    ["--test", fileURLToPath(permissionsRegression)],
+    { stdio: "inherit" },
+  );
+  if (regression.status !== 0) {
+    errors.push(
+      "scripts/workflow-permissions.test.mjs: the job-scoped `issues: write` guard regression failed",
+    );
+  }
+}
 
 for (const name of workflowNames) {
   const text = await readFile(new URL(name, workflowsDir), "utf8");
