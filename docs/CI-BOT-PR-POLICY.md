@@ -3,8 +3,10 @@
 ## Trusted bot set (owner ruling 2026-10-20)
 
 All `swu-*` fleet bots are trusted CI actors, alongside the review bots below.
-The authoritative list is the `allowed_bots` value the autofix callers pass
-(`.github/workflows/autofix.yml`, `.github/workflows/claude-code-autofix.yml`).
+The autofix lists are the `allowed_bots` value the claude-code caller passes
+(`.github/workflows/claude-code-autofix.yml`) and, for the pr-autofix caller
+(`.github/workflows/autofix.yml`), the pinned reusable's own default, which
+enumerates the installed `swu-*` bots.
 The two gates are related but NOT the same set (Kody on #2823):
 `.github/workflows/security.yml` matches an unbounded `swu-*` glob and
 additionally admits `dependabot[bot]`, `renovate[bot]`, `codex[bot]`, and
@@ -29,16 +31,18 @@ reusable's 120-turn default.
 The trust-boundary fix for the PR-branch `.autofix.yml` override landed
 upstream in `AI-Fleet-Coordinator` #776 (`2f7d5b1`): the trusted list is read
 from the default branch, and a PR branch's `.autofix.yml` may only narrow it.
-This repository still pins the pre-fix reusable (`b634b511`), so the branch
-file can still replace the list here and the root-`.autofix.yml` ban in
-`scripts/check-actions-runner-policy.mjs` remains the protection until the pin
-moves.  The pin bump is owner-side (a `.github/workflows` edit, which autofix
-agents do not make) and comes with a second lockstep requirement: the
+This repository pins `AI-Fleet-Coordinator` `c97a2dae`, which includes that
+fix, so a branch file can no longer replace the list; the root-`.autofix.yml`
+ban in `scripts/check-actions-runner-policy.mjs` stays anyway, because even a
+narrowing list is a fleet-trust change that needs an owner decision.  The
 post-#776 reusable records each bot's one run per PR in a marker comment on
 the PR, so the caller has to grant `issues: write` — a called workflow's
 permissions can only narrow the caller's, so without that grant the marker
-write is refused and the autofix lane fails.  The policy script already
-allowlists the new pin and fails a caller that forgets the grant.
+write is refused and the autofix lane fails.  `autofix.yml` grants it, and the
+policy script fails a pr-autofix caller pinned to the allowlisted reusable that
+forgets the grant.  Any later pin bump is owner-side (a `.github/workflows`
+edit, which autofix agents do not make) and has to be added to the policy
+script's allowlist first.
 
 ## The gate
 

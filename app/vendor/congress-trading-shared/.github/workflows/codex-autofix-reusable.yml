@@ -117,6 +117,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Marker comments record which bot already used its one run on a PR.
+  issues: write
 
 jobs:
   autofix:
@@ -132,13 +134,85 @@ jobs:
     outputs:
       usage: ${{ steps.usage.outputs.json }}
     steps:
+      - name: Autofix Request Gate
+        id: request_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          NOTIFY_URL: ${{ vars.SWU_AUTOFIX_NOTIFY_URL }}
+        run: |
+          set -euo pipefail
+          # Owner rule 2026-10-20:  one autofix run per bot per PR;  the owner
+          # (jaywedgeworth22) is unlimited,  and Sentry is exempt from the limit and the
+          # notification.  The record is a marker comment the accepted run leaves on the PR —
+          # deleting that comment is the manual reset.
+          # Owner rule 2026-10-20:  a review is an autofix request only when it carries the
+          # @codex-autofix tag — an untagged bot review is discussion, not a request.  A
+          # workflow_dispatch run IS the request,  so it needs no tag.  Sentry is exempt
+          # from the tag,  the once-per-PR cap,  and the notification ("Sentry can request
+          # all you want").
+          case "$GITHUB_EVENT_NAME" in
+            pull_request_review)
+              author=$(jq -r '.review.user.login' "$GITHUB_EVENT_PATH")
+              jq -r '.review.body // empty' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/request_body.txt"
+              needs_tag=true ;;
+            workflow_dispatch)
+              author="$TRIGGERING_ACTOR"
+              needs_tag=false ;;
+            *) author=$(jq -r '.sender.login' "$GITHUB_EVENT_PATH")
+              needs_tag=false ;;
+          esac
+          requester=$(printf '%s' "$author" | tr 'A-Z' 'a-z' | sed 's/\[bot\]$//')
+          if [ "$requester" != "sentry" ] && [ "$needs_tag" = "true" ] && \
+             ! grep -qiE '(^|[^A-Za-z0-9_-])@codex-autofix([^A-Za-z0-9_-]|$)' "$RUNNER_TEMP/request_body.txt"; then
+            echo "::notice::No @codex-autofix tag in the review, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$requester" = "jaywedgeworth22" ] || [ "$requester" = "sentry" ]; then
+            echo "::notice::$author is exempt from the one-run-per-bot rule"
+            exit 0
+          fi
+          # Anchored exact marker text, github-actions[bot] comments only: an
+          # unanchored contains() lets bot=swu-cursor match bot=swu-cursor-cloud's
+          # marker, and without an author filter any commenter could forge a
+          # marker to block a bot's one run (Sentry on CT #2828).
+          marker="swu-autofix-run: bot=$requester"
+          prior=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=100" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\") | .body | select(contains(\"<!-- $marker -->\"))" 2> /dev/null | head -1 || true)
+          accepted=true
+          if [ -n "$prior" ]; then accepted=false; fi
+          if [ -n "${NOTIFY_URL:-}" ]; then
+            jq -n --arg repo "$GH_REPO" --arg pr "$PR_NUMBER" --arg bot "$requester" \
+              --arg event "$GITHUB_EVENT_NAME" --arg accepted "$accepted" \
+              --arg run "$GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID" \
+              '{repo:$repo, pr:$pr, bot:$bot, event:$event, accepted:$accepted, run:$run}' \
+            | curl -sfS -m 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$NOTIFY_URL" \
+              || echo "::notice::owner notification for $requester's request failed (non-blocking)"
+          else
+            echo "::notice::SWU_AUTOFIX_NOTIFY_URL is not set, owner notification for $requester's request skipped"
+          fi
+          if [ "$accepted" = "false" ]; then
+            echo "::notice::$author already used its one autofix run on this PR, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
+            -f body="<!-- $marker --> Autofix run $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID started for \`$author\`'s tagged request.  One autofix run per bot per PR (owner rule 2026-10-20);  delete this comment to reset." \
+            > /dev/null
+
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: ${{ steps.request_gate.outputs.skip != 'true' }}
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Claude Autofix
         id: claude
+        if: ${{ steps.request_gate.outputs.skip != 'true' }}
         uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1
         # Routed to MiniMax via its Anthropic-compatible endpoint:  claude-code-action
         # drives the Claude Code CLI, which honors ANTHROPIC_BASE_URL / _AUTH_TOKEN /

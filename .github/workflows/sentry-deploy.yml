@@ -56,6 +56,15 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: node scripts/sentry-report-deploy.mjs
+      # Deliberately AFTER record, and gated on the same condition as the upload.
+      # The deploy receipt is the valuable output; the source-map upload is
+      # optional garnish.  An install or registry failure here must never
+      # suppress a production deploy receipt.  Installs only the pinned CLI
+      # rather than the whole app tree, which exists solely to obtain one binary.
+      - name: Install the pinned Sentry CLI
+        if: steps.record.outputs.release != ''
+        working-directory: app
+        run: npm install --no-save --no-audit --no-fund "@sentry/cli@$(node -p "require('./package.json').devDependencies['@sentry/cli']")"
       - name: Upload browser dashboard source maps
         if: steps.record.outputs.release != ''
         env:
