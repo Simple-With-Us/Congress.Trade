@@ -109,6 +109,8 @@ export interface PipelineHealth {
   signals?: {
     filingSkips24h: number | null;
     filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'];
+    /** Doc ids behind `oge_text_unreadable` in the same 24h window. */
+    unreadableExecutiveDocIds?: string[] | null;
     fmpLatency: PipelineSignals['fmpLatency'];
     priceEodLatestDate: string | null;
     spxEodLatestDate: string | null;
@@ -164,6 +166,11 @@ export interface PipelineSignals {
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
   filingSkipsByAction24h: Record<FilingSkipAction, number> | null;
+  /**
+   * Up to five doc ids behind `oge_text_unreadable` in the same 24h window.
+   * Absent when the ids were not collected.
+   */
+  unreadableExecutiveDocIds?: string[] | null;
   /**
    * 2026-09-21: FMP-family latency summary for both admin and user surfaces.
    * The user-facing dashboard renders `lastObservationAgeSec` + `observationCount24h`
@@ -769,10 +776,14 @@ export function evaluatePipelineSignals(
         .filter(([, v]) => typeof v === 'number' && v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(', ') || 'unknown';
+      const named = (byAction.oge_text_unreadable ?? 0) > 0
+        ? (s.unreadableExecutiveDocIds ?? []).filter((id) => id.length > 0).slice(0, 5)
+        : [];
+      const namedSuffix = named.length > 0 ? `  Unreadable docs: ${named.join(', ')}.` : '';
       checks.push({
         id: 'filing_skips',
         status: 'critical',
-        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.`,
+        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.${namedSuffix}`,
         value: { total: s.filingSkips24h, byAction, threshold },
       });
     } else {
@@ -1368,6 +1379,7 @@ export function evaluatePipelineSignals(
     signals: {
       filingSkips24h: s.filingSkips24h,
       filingSkipsByAction24h: s.filingSkipsByAction24h,
+      unreadableExecutiveDocIds: s.unreadableExecutiveDocIds ?? null,
       fmpLatency: s.fmpLatency,
       priceEodLatestDate: s.priceEodLatestDate,
       spxEodLatestDate: s.spxEodLatestDate,
@@ -1495,6 +1507,7 @@ export async function checkPipelineHealth(
   // Filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
+  let unreadableExecutiveDocIds: string[] | null = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
   let fmpLatency: PipelineSignals['fmpLatency'] = null;
 
@@ -1540,6 +1553,17 @@ export async function checkPipelineHealth(
       doc_quarantined: dq,
       oge_text_unreadable: unread,
     };
+    if (unread > 0) {
+      try {
+        const rows = await all<{ doc_id: string | null }>(
+          env.DB,
+          `SELECT DISTINCT doc_id FROM ingestion_decisions
+           WHERE action = ? AND created_at >= ? ORDER BY doc_id LIMIT 5`,
+          [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
+        );
+        unreadableExecutiveDocIds = rows.map((r) => r.doc_id ?? '').filter((id) => id.length > 0);
+      } catch {}
+    }
   } catch {}
 
   // 2026-09-21: FMP-family latency. Two parts: trade_provider_observations
@@ -1996,6 +2020,7 @@ export async function checkPipelineHealth(
     spxEodLatestDate,
     filingSkips24h,
     filingSkipsByAction24h,
+    unreadableExecutiveDocIds,
     fmpLatency,
     deliveryParked,
     deliveryQuarantined,
