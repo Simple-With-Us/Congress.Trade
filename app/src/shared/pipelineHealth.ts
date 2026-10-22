@@ -60,7 +60,7 @@ export interface PipelineCheck {
     | { worstBehind: number; legs: Record<string, { date: string | null; behind: number | null }> }
     | {
         total: number;
-        byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number>>;
+        byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined' | 'oge_text_unreadable', number>>;
         threshold: number;
       }
     | {
@@ -82,6 +82,8 @@ export interface PipelineHealth {
   signals?: {
     filingSkips24h: number | null;
     filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'];
+    /** Doc ids for `rejected` + `oge_text_unreadable` in the same 24h window. */
+    unreadableExecutiveDocIds?: string[] | null;
     fmpLatency: PipelineSignals['fmpLatency'];
     priceEodLatestDate: string | null;
     spxEodLatestDate: string | null;
@@ -128,7 +130,8 @@ export interface PipelineSignals {
   /**
    * 2026-09-21: count of filings in the last 24h whose extract produced zero
    * usable transactions (`extract_empty_failure`, `auto_resolved_empty`,
-   * `doc_quarantined`). These outcomes are almost-always an app error
+   * `doc_quarantined`, plus `rejected` with reason `oge_text_unreadable`).
+   * These outcomes are almost-always an app error
    * (corrupt parse, OCR failure, model dead-letter) — not a real "this
    * filing was blank". A non-zero count is the loud red flag the admin
    * surface and Pushover liveness alarm look for. Tunable via env
@@ -136,7 +139,15 @@ export interface PipelineSignals {
    */
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
-  filingSkipsByAction24h: Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number> | null;
+  filingSkipsByAction24h: (Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number> & {
+    /** `action='rejected' AND reason='oge_text_unreadable'`.  Not explicit-None. */
+    oge_text_unreadable?: number;
+  }) | null;
+  /**
+   * Up to five doc ids behind `oge_text_unreadable` in the same 24h window.
+   * Absent when the count was not collected.
+   */
+  unreadableExecutiveDocIds?: string[] | null;
   /**
    * 2026-09-21: FMP-family latency summary for both admin and user surfaces.
    * The user-facing dashboard renders `lastObservationAgeSec` + `observationCount24h`
@@ -666,14 +677,15 @@ export function evaluatePipelineSignals(
     }
   }
 
-  // 4. Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined).
+  // 4. Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined
+  // plus a rejected oge_text_unreadable).
   // Owner 2026-09-21 ask: "big red flag ... anytime a filing is skipped or
   // considered empty or blank or unreadable since that is almost always
-  // false and app error." These three outcomes are the "almost always an
-  // app error" set: real blank filings are vanishingly rare (the docs are
-  // PDFs from official sources). Default threshold is 0 (page on the first
-  // occurrence); tunable via CT_FILING_SKIP_THRESHOLD_24H for owners who
-  // want a small noise floor.
+  // false and app error." Explicit Part 7 None stays auto_resolved_empty.
+  // A refused 278-T is action rejected / reason oge_text_unreadable, and
+  // that reject used to miss this counter, so the row closed with no alarm.
+  // Default threshold is 0 (page on the first occurrence); tunable via
+  // CT_FILING_SKIP_THRESHOLD_24H for owners who want a small noise floor.
   // Env access is guarded so vitest (Node) tests don't ReferenceError on Deno.
   const envGet = (k: string): string | undefined => {
     try { return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k); }
@@ -685,16 +697,24 @@ export function evaluatePipelineSignals(
       return Number.isFinite(n) && n >= 0 ? Math.min(n, 100) : 0;
     })();
     if (s.filingSkips24h > threshold) {
-      const byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined', number>> =
+      const byAction: Partial<Record<'extract_empty_failure' | 'auto_resolved_empty' | 'doc_quarantined' | 'oge_text_unreadable', number>> =
         s.filingSkipsByAction24h ?? {};
       const breakdown = Object.entries(byAction)
         .filter(([, v]) => typeof v === 'number' && v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(', ') || 'unknown';
+      const unreadableCount = byAction.oge_text_unreadable ?? 0;
+      const named = unreadableCount > 0
+        ? (s.unreadableExecutiveDocIds ?? []).filter((id) => id.length > 0).slice(0, 5)
+        : [];
+      const namedSuffix = named.length > 0 ? `  Unreadable docs: ${named.join(', ')}.` : '';
+      const reopenNote = unreadableCount > 0
+        ? '  A rejected unreadable 278-T reopens with the existing admin reopen-rejected route; explicit Part 7 None stays verified_empty.'
+        : '';
       checks.push({
         id: 'filing_skips',
         status: 'critical',
-        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.`,
+        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.${namedSuffix}${reopenNote}`,
         value: { total: s.filingSkips24h, byAction, threshold },
       });
     } else {
@@ -1172,6 +1192,7 @@ export function evaluatePipelineSignals(
     signals: {
       filingSkips24h: s.filingSkips24h,
       filingSkipsByAction24h: s.filingSkipsByAction24h,
+      unreadableExecutiveDocIds: s.unreadableExecutiveDocIds ?? null,
       fmpLatency: s.fmpLatency,
       priceEodLatestDate: s.priceEodLatestDate,
       spxEodLatestDate: s.spxEodLatestDate,
@@ -1220,8 +1241,11 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   let priceEodLatestDate: string | null = null;
   let spxEodLatestDate: string | null = null;
   // 2026-09-21: filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined).
+  // 2026-10-08: also count rejected + reason oge_text_unreadable.  That close is
+  // a fact about our OCR, not an explicit Part 7 None, and it used to miss this counter.
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
+  let unreadableExecutiveDocIds: string[] | null = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
   let fmpLatency: PipelineSignals['fmpLatency'] = null;
 
@@ -1240,12 +1264,18 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // parse, OCR failure, vision model dead-letter). Real blank filings are
   // vanishingly rare — the docs are PDFs from official sources.
   try {
-    const res = await get<{ extract_empty_failure: number | null; auto_resolved_empty: number | null; doc_quarantined: number | null }>(
+    const res = await get<{
+      extract_empty_failure: number | null;
+      auto_resolved_empty: number | null;
+      doc_quarantined: number | null;
+      oge_text_unreadable: number | null;
+    }>(
       env.DB,
       `SELECT
          SUM(CASE WHEN action = 'extract_empty_failure' THEN 1 ELSE 0 END) AS extract_empty_failure,
          SUM(CASE WHEN action = 'auto_resolved_empty'   THEN 1 ELSE 0 END) AS auto_resolved_empty,
-         SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined
+         SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined,
+         SUM(CASE WHEN action = 'rejected' AND reason = 'oge_text_unreadable' THEN 1 ELSE 0 END) AS oge_text_unreadable
        FROM ingestion_decisions
        WHERE created_at >= ?`,
       [iso24hAgo],
@@ -1253,12 +1283,35 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     const ee = Number(res?.extract_empty_failure ?? 0);
     const ar = Number(res?.auto_resolved_empty ?? 0);
     const dq = Number(res?.doc_quarantined ?? 0);
-    filingSkips24h = ee + ar + dq;
+    const ou = Number(res?.oge_text_unreadable ?? 0);
+    filingSkips24h = ee + ar + dq + ou;
     filingSkipsByAction24h = {
       extract_empty_failure: ee,
       auto_resolved_empty: ar,
       doc_quarantined: dq,
+      oge_text_unreadable: ou,
     };
+  } catch {}
+
+  // Names for the alarm.  A failure here must not blank the counts above.
+  try {
+    const rows = await all<{ doc_id: string | null }>(
+      env.DB,
+      `SELECT doc_id
+         FROM ingestion_decisions
+        WHERE created_at >= ?
+          AND action = 'rejected'
+          AND reason = 'oge_text_unreadable'
+          AND doc_id IS NOT NULL
+          AND doc_id != ''
+        GROUP BY doc_id
+        ORDER BY MAX(created_at) DESC
+        LIMIT 5`,
+      [iso24hAgo],
+    );
+    unreadableExecutiveDocIds = rows
+      .map((row) => (typeof row.doc_id === 'string' ? row.doc_id : ''))
+      .filter((id) => id.length > 0);
   } catch {}
 
   // 2026-09-21: FMP-family latency. Two parts: trade_provider_observations
@@ -1669,6 +1722,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     spxEodLatestDate,
     filingSkips24h,
     filingSkipsByAction24h,
+    unreadableExecutiveDocIds,
     fmpLatency,
     deliveryParked,
     deliveryQuarantined,
