@@ -223,6 +223,9 @@ describe('evaluatePipelineSignals', () => {
     expect(check?.status).toBe('degraded');
     expect(check?.value).toBe(57_321);
     expect(check?.detail).toContain('delivery-requeue-quarantined');
+    // Live-row recovery is gated (default off), so the detail must not promise it.
+    expect(check?.detail).toContain('DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER');
+    expect(check?.detail).not.toContain('recover when the target circuit closes');
     expect(res.status).toBe('degraded');
   });
 

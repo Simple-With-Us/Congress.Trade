@@ -605,8 +605,8 @@ export function evaluatePipelineSignals(
         status: 'degraded',
         detail:
           `${s.deliveryQuarantined} webhook delivery(ies) quarantined after parked cap overflow ` +
-          `(${parkedDeliveries} still parked). Rows recover when the target circuit closes and parked ` +
-          `headroom opens, or via POST /api/admin/delivery-requeue-quarantined`,
+          `(${parkedDeliveries} still parked). Live rows recover only when DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER ` +
+          `is on, or via an explicit POST /api/admin/delivery-requeue-quarantined`,
         value: s.deliveryQuarantined,
       });
     } else {

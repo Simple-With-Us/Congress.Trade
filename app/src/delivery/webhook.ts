@@ -25,7 +25,7 @@ import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { all, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
 import { mapSubscription, mapTransaction, type SubscriptionRow, type TransactionRow } from './rows.ts';
-import { stampDeliveryFreshness } from './deliveryFreshness.ts';
+import { deliveryFreshnessJudgedAtMs, stampDeliveryFreshness } from './deliveryFreshness.ts';
 import { matchesFiltersWithContext, subscriptionOwnerEntitled, webhookTargetLengthError } from './subscriptions.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from './webhookTarget.ts';
@@ -34,10 +34,12 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import {
   checkTargetCircuit,
+  markParkedDeliveryTerminal,
   parkDelivery,
   recordTargetFailure,
   recordTargetSuccess,
   targetKeyForUrl,
+  UNDELIVERABLE_REASONS,
 } from './targetCircuit.ts';
 import {
   releaseSubscriberWebhookResponseBody,
@@ -238,13 +240,28 @@ export async function dispatchWebhook(
     // Debug, not warn: this miss path is expected for stale outbox rows and
     // was ~2.3k Datadog warn events/hour.  Real dispatch failures still warn.
     console.debug('dispatchWebhook: transaction not found', msg.txId);
+    // A targeted retry of a row whose transaction was swept can never deliver.
+    // Left parked with its old updated_at, the flush would re-release it at the
+    // head of its oldest-first page every tick, forever.
+    if (msg.subscriptionId) {
+      await markParkedDeliveryTerminal(env, msg.subscriptionId, msg.txId, UNDELIVERABLE_REASONS.txMissing);
+    }
     return { outboxComplete: !msg.subscriptionId };
   }
   // Don't push a retracted (un-published) row, e.g. on a retry after unpublish.
   if ((txRow as { deprecated_at?: string | null }).deprecated_at) {
+    if (msg.subscriptionId) {
+      await markParkedDeliveryTerminal(env, msg.subscriptionId, msg.txId, UNDELIVERABLE_REASONS.txRetracted);
+    }
     return { outboxComplete: !msg.subscriptionId };
   }
-  const tx = stampDeliveryFreshness(mapTransaction(txRow));
+  const mapped = mapTransaction(txRow);
+  // Fan-out judges freshness as of now.  A targeted retry re-sends a row that
+  // already matched at fan-out and then waited behind the target circuit, so it
+  // judges freshness as of when fan-out first did: a delivery that was fresh
+  // when it parked still goes out, one that was already backfill still skips.
+  const freshnessAtMs = msg.subscriptionId ? deliveryFreshnessJudgedAtMs(mapped) ?? undefined : undefined;
+  const tx = stampDeliveryFreshness(mapped, freshnessAtMs);
 
   // Resolve chamber + the filer's party in one query, keyed off the transaction.
   //
@@ -293,6 +310,7 @@ export async function dispatchWebhook(
     chamber,
     sector: refRow?.sector ?? null,
     marketCapBucket: refRow?.market_cap_bucket ?? null,
+    freshnessAtMs,
   };
 
   // Broadcast the transaction to any live SSE streams exactly once (on the
@@ -311,17 +329,20 @@ export async function dispatchWebhook(
     }
   }
 
+  // flushParkedDeliveries targets one subscription; a targeted no-op (no
+  // target, filter miss) must not leave the row parked at the head of
+  // ORDER BY updated_at ASC forever.
+  const targeted = Boolean(msg.subscriptionId);
   const visit = async (sub: Subscription): Promise<void> => {
-    if (!sub.targetUrl) return;
-    if (!matchesFiltersWithContext(tx, sub.filters, ctx)) {
-      // flushParkedDeliveries targets one subscription; a filter miss must not
-      // leave the row parked at the head of ORDER BY updated_at ASC forever.
-      if (msg.subscriptionId) {
-        await markParkedDeliveryFilterSkipped(env, sub.id, tx.id);
-      }
+    if (!sub.targetUrl) {
+      if (targeted) await markParkedDeliveryTerminal(env, sub.id, tx.id, UNDELIVERABLE_REASONS.noTarget);
       return;
     }
-    await deliverToSubscription(env, sub, tx, lease);
+    if (!matchesFiltersWithContext(tx, sub.filters, ctx)) {
+      if (targeted) await markParkedDeliveryTerminal(env, sub.id, tx.id, UNDELIVERABLE_REASONS.filterMiss);
+      return;
+    }
+    await deliverToSubscription(env, sub, tx, lease, targeted);
   };
 
   // Legacy targeted messages remain bounded to one subscription. Normal fanout
@@ -385,13 +406,15 @@ export async function dispatchWebhook(
 
 /**
  * Deliver one transaction to one subscription, recording the attempt and
- * scheduling a backoff retry on failure (up to MAX_ATTEMPTS).
+ * scheduling a backoff retry on failure (up to MAX_ATTEMPTS). `targeted` marks
+ * a flushParkedDeliveries retry of an existing parked row.
  */
 async function deliverToSubscription(
   env: Env,
   sub: Subscription,
   tx: Transaction,
   lease?: DurableQueueLeaseContext,
+  targeted = false,
 ): Promise<void> {
   await lease?.assertOwned();
   // A queued fanout can outlive a subscriber opt-out. Re-check immediately
@@ -412,6 +435,9 @@ async function deliverToSubscription(
   // this one can still claim the 'skipped' row).
   if (!(await subscriptionOwnerEntitled(env, sub.clientId))) {
     await markDeliverySkipped(env, sub.id, tx.id);
+    // The insert above leaves an existing row alone, so a targeted retry's
+    // parked row would stay parked and be re-released every flush.
+    if (targeted) await markParkedDeliveryTerminal(env, sub.id, tx.id, UNDELIVERABLE_REASONS.ownerInactive);
     return;
   }
 
@@ -577,28 +603,6 @@ async function markDeliverySkipped(env: Env, subscriptionId: string, txId: strin
     [prefixedId('dlv'), subscriptionId, txId, new Date().toISOString()],
   ).catch((err) =>
     console.warn('markDeliverySkipped failed', (err as Error).message),
-  );
-}
-
-/** Parked rows re-dispatched after a filter miss must not block flushParkedDeliveries forever. */
-async function markParkedDeliveryFilterSkipped(
-  env: Env,
-  subscriptionId: string,
-  txId: string,
-): Promise<void> {
-  const nowIso = new Date().toISOString();
-  await run(
-    env.DB,
-    `UPDATE deliveries
-        SET status = 'skipped',
-            last_error = 'subscription filters no longer match transaction',
-            updated_at = ?,
-            claim_token = NULL,
-            lease_until = NULL
-      WHERE subscription_id = ? AND tx_id = ? AND status = 'parked'`,
-    [nowIso, subscriptionId, txId],
-  ).catch((err) =>
-    console.warn('markParkedDeliveryFilterSkipped failed', (err as Error).message),
   );
 }
 

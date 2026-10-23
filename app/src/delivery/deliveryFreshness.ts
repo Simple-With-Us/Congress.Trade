@@ -45,14 +45,35 @@ function isStaleCalendarDay(day: string | null | undefined, nowMs: number): bool
 /** True when the trade is older than the fresh window (or has no anchor). */
 export function isDeliveryBackfill(tx: FreshnessInput, nowMs = Date.now()): boolean {
   // Late-discovered rows still carry an old official filing date — treat as backfill.
-  if (isStaleCalendarDay(tx.filedDate, nowMs) || isStaleCalendarDay(tx.txDate, nowMs)) {
-    return true;
-  }
+  if (isStaleCalendarDay(tx.filedDate, nowMs)) return true;
+  // The trade date stands in only when there is no filed date.  Disclosures
+  // are filed weeks after the trade (median ~52 days, observed 9-74), so an
+  // old trade date on a freshly filed disclosure is normal, not backfill.
+  if (!isoDatePrefix(tx.filedDate) && isStaleCalendarDay(tx.txDate, nowMs)) return true;
   const anchor = deliveryFreshnessAnchorMs(tx);
   if (anchor == null) return true;
   return nowMs - anchor > DELIVERY_FRESH_WINDOW_DAYS * MS_PER_DAY;
 }
 
-export function stampDeliveryFreshness<T extends Transaction>(tx: T): T & { isBackfill: boolean } {
-  return { ...tx, isBackfill: isDeliveryBackfill(tx) };
+/**
+ * The instant fan-out first judged this trade's freshness: the freshness
+ * anchor, but never before the row was persisted (no delivery exists before
+ * its transaction does, and a seed row with no first-seen stamp anchors on its
+ * filed date).  A targeted retry of a parked delivery judges freshness here
+ * instead of now, so a delivery that was fresh when it parked still goes out
+ * once the target circuit closes, and one that was already backfill still
+ * skips.  Null when the row carries no usable stamp.
+ */
+export function deliveryFreshnessJudgedAtMs(tx: FreshnessInput): number | null {
+  const anchor = deliveryFreshnessAnchorMs(tx);
+  const persisted = parseInstantMs(tx.createdAt);
+  if (anchor == null) return persisted;
+  return persisted != null && persisted > anchor ? persisted : anchor;
+}
+
+export function stampDeliveryFreshness<T extends Transaction>(
+  tx: T,
+  nowMs?: number,
+): T & { isBackfill: boolean } {
+  return { ...tx, isBackfill: isDeliveryBackfill(tx, nowMs) };
 }
