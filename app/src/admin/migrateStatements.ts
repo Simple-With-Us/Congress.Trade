@@ -193,45 +193,14 @@ export function buildAdminMigrateStatements(): readonly string[] {
       'CREATE INDEX IF NOT EXISTS idx_ingestion_decisions_action ON ingestion_decisions (action, created_at DESC)',
       // 0020_disclosure_available_generated.sql — generated column for disclosure availability.
       ...DISCLOSURE_AVAILABLE_SCHEMA_STATEMENTS,
-      // 0021_disclosure_latency_watch.sql — congress.trade-vs-FMP disclosure race monitor.
-      `CREATE TABLE IF NOT EXISTS disclosure_latency_candidates (
-         doc_id TEXT NOT NULL,
-         provider TEXT NOT NULL DEFAULT 'fmp',
-         chamber TEXT NOT NULL,
-         source_url TEXT,
-         filed_date TEXT,
-         filer_name TEXT,
-         congress_first_seen_at TEXT NOT NULL,
-         provider_key TEXT,
-         provider_first_seen_at TEXT,
-         provider_published_at TEXT,
-         match_method TEXT,
-         status TEXT NOT NULL DEFAULT 'pending',
-         attempts INTEGER NOT NULL DEFAULT 0,
-         last_checked_at TEXT,
-         error TEXT,
-         payload TEXT,
-         created_at TEXT NOT NULL,
-         updated_at TEXT NOT NULL,
-         PRIMARY KEY (doc_id, provider)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_disc_latency_candidates_status
-         ON disclosure_latency_candidates (provider, status, created_at DESC)`,
-      `CREATE TABLE IF NOT EXISTS disclosure_provider_observations (
-         provider TEXT NOT NULL,
-         chamber TEXT NOT NULL,
-         provider_key TEXT NOT NULL,
-         first_observed_at TEXT NOT NULL,
-         last_observed_at TEXT NOT NULL,
-         provider_published_at TEXT,
-         source_url TEXT,
-         filed_date TEXT,
-         filer_name TEXT,
-         payload TEXT,
-         PRIMARY KEY (provider, chamber, provider_key)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_disc_provider_seen
-         ON disclosure_provider_observations (provider, chamber, first_observed_at DESC)`,
+      // NOTE: 0021_disclosure_latency_watch.sql (disclosure_latency_candidates,
+      // disclosure_provider_observations and their indexes) and the 0023
+      // provider_published_at ALTERs on those tables are deliberately NOT
+      // replayed here.  0059 (TRADE_LATENCY_WATCH_SCHEMA_STATEMENTS, later in
+      // this list) drops both tables, so replaying them only created two
+      // tables and two indexes under the boot write lock on every deploy to
+      // throw them away.  The 0059 DROP TABLE IF EXISTS statements stay to
+      // clean databases that still have them.
       // 0022_stripe_webhook_events.sql — durable Stripe webhook idempotency ledger.
       `CREATE TABLE IF NOT EXISTS stripe_webhook_events (
          event_id TEXT PRIMARY KEY,
@@ -241,9 +210,7 @@ export function buildAdminMigrateStatements(): readonly string[] {
        )`,
       `CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_received
          ON stripe_webhook_events (received_at DESC)`,
-      // 0023_disclosure_provider_timestamps.sql — provider-side publish/upload timestamp when available.
-      'ALTER TABLE disclosure_latency_candidates ADD COLUMN provider_published_at TEXT',
-      'ALTER TABLE disclosure_provider_observations ADD COLUMN provider_published_at TEXT',
+      // 0023_disclosure_provider_timestamps.sql — not replayed; see the 0021 NOTE above.
       // 0024_dead_letter_events.sql — operator log for terminally-failed queue messages.
       `CREATE TABLE IF NOT EXISTS dead_letter_events (
          id INTEGER PRIMARY KEY AUTOINCREMENT,

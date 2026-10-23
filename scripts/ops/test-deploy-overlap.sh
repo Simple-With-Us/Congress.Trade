@@ -1,5 +1,5 @@
 #!/bin/bash
-# Offline tests for #1537 overlap + Traefik render.
+# Offline tests for #1537 overlap, the hold env, and the Traefik render.
 # No Docker, no Coolify, no network.
 #
 #   bash scripts/ops/test-deploy-overlap.sh
@@ -85,6 +85,34 @@ if parse_ok '{"0":{"application_uuid":"other","status":"in_progress"}}'; then
 else
   echo "ok   parse ignores other apps"
 fi
+
+# --- hold env --------------------------------------------------------------
+render_env() {
+  printf '%s' "$1" | bash "$OVERLAP" --render-env
+}
+
+# Lines of $1 that start with $2 (a KEY= prefix).
+count_prefix() {
+  printf '%s\n' "$1" | grep -c "^$2" || true
+}
+
+app_env=$'PATH=/usr/local/bin:/usr/bin\nCT_SKIP_LITESTREAM=0\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=0\nTURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=false\nCT_SKIP_LITESTREAM_NOTE=keep\n'
+hold_env="$(render_env "$app_env")"
+assert_eq "$(count_prefix "$hold_env" 'CT_SKIP_LITESTREAM=')" "1" "hold env has CT_SKIP_LITESTREAM once"
+assert_eq "$(count_prefix "$hold_env" 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=')" "1" "hold env has CT_DISABLE_STARTUP_SCHEMA_MIGRATE once"
+assert_contains "$hold_env" "CT_SKIP_LITESTREAM=1" "hold env skips Litestream"
+assert_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1" "hold env skips the boot schema migrate"
+assert_not_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=0" "hold env drops the app's migrate value"
+assert_contains "$hold_env" "TURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite" "hold env keeps the app env"
+assert_contains "$hold_env" "CT_SKIP_LITESTREAM_NOTE=keep" "hold env keeps keys that only share a prefix"
+
+bare_env="$(render_env '')"
+assert_eq "$(count_prefix "$bare_env" 'CT_SKIP_LITESTREAM=')" "1" "empty env still gets CT_SKIP_LITESTREAM once"
+assert_eq "$(count_prefix "$bare_env" 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=')" "1" "empty env still gets CT_DISABLE_STARTUP_SCHEMA_MIGRATE once"
+
+# last-env is a rendered env; rendering it again must not add a second copy.
+again_env="$(render_env "$hold_env")"
+assert_eq "$again_env" "$hold_env" "re-rendering a hold env is a no-op"
 
 # --- Traefik render --------------------------------------------------------
 plain="$(bash "$REATTACH" --render plain)"

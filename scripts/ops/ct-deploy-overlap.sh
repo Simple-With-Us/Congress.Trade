@@ -20,7 +20,12 @@
 #
 #   Hold is deliberately NOT in the main Coolify project, so
 #   `docker compose ... up` cannot stop it.  It runs the Deno app directly
-#   (no Litestream) so a second replicator does not fight the live one.
+#   (no Litestream) so a second replicator does not fight the live one, and
+#   with the boot schema migrate off (CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1):
+#   main.ts awaits that ~400-statement replay before Deno.serve, so a hold
+#   that replays it is still not serving /health when Coolify stops the old
+#   app.  The live app already migrated this schema; the replacement migrates
+#   again when it boots.
 #
 # INSTALL (root on the Coolify host — does not take the site down):
 #   install -m 0755 scripts/ops/ct-deploy-overlap.sh /usr/local/bin/
@@ -34,7 +39,8 @@
 #   /usr/local/bin/ct-reattach-proxy.sh
 #
 # This script never talks to production from a developer laptop.  It is a
-# host unit.  `--decide` / `--render` are offline and used by tests.
+# host unit.  `--decide` / `--parse-active` / `--render-env` are offline and
+# used by tests.
 
 set -euo pipefail
 
@@ -136,6 +142,18 @@ raise SystemExit(0 if active else 1)
 '
 }
 
+# stdin: KEY=VALUE env lines copied from the live app.  stdout: the hold's env,
+# with each hold-only key set exactly once (any earlier value is dropped).
+#   CT_SKIP_LITESTREAM=1                 never start a second Litestream
+#                                        replicator against the live B2 target.
+#   CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1  serve /health without replaying the
+#                                        boot schema migrate (see WHAT above).
+render_hold_env() {
+  grep -v -e '^CT_SKIP_LITESTREAM=' -e '^CT_DISABLE_STARTUP_SCHEMA_MIGRATE=' || true
+  printf 'CT_SKIP_LITESTREAM=1\n'
+  printf 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n'
+}
+
 if [[ "${1:-}" == "--decide" ]]; then
   decide_overlap_action \
     "${DEPLOY_ACTIVE:-0}" \
@@ -153,8 +171,13 @@ if [[ "${1:-}" == "--parse-active" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "--render-env" ]]; then
+  render_hold_env
+  exit 0
+fi
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,40p' "$0"
+  sed -n '2,43p' "$0"
   exit 0
 fi
 
@@ -218,9 +241,7 @@ write_hold_env() {
   else
     return 1
   fi
-  # Never start a second Litestream replicator against the live B2 target.
-  grep -v '^CT_SKIP_LITESTREAM=' "$dest" > "${dest}.tmp" || true
-  printf 'CT_SKIP_LITESTREAM=1\n' >> "${dest}.tmp"
+  render_hold_env < "$dest" > "${dest}.tmp"
   mv "${dest}.tmp" "$dest"
   if [[ -n "$app" ]]; then
     mkdir -p "$STATE_DIR"
@@ -350,5 +371,5 @@ if [[ "${1:-}" == "--loop" ]]; then
   done
 fi
 
-echo "usage: $0 [--once|--loop|--decide|--help]" >&2
+echo "usage: $0 [--once|--loop|--decide|--parse-active|--render-env|--help]" >&2
 exit 2

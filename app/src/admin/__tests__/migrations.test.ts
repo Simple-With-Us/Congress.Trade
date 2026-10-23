@@ -78,6 +78,8 @@ import {
   FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
   FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
+import { buildAdminMigrateStatements } from '../migrateStatements.ts';
+import { applyGuardedAppleSubscriptionsNullableUserMigration } from '../schemaMigrationRunner.ts';
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../../benchmark/schema.ts';
 import {
   beginBenchmarkRun,
@@ -127,7 +129,7 @@ function applyMigrationFiles(db: SqliteDatabase, files: string[]): void {
   }
 }
 
-function applyAdminTail(db: SqliteDatabase): void {
+async function applyAdminTail(db: SqliteDatabase): Promise<void> {
   for (const sql of POST_0024_SCHEMA_STATEMENTS) {
     try {
       db.exec(sql);
@@ -135,6 +137,8 @@ function applyAdminTail(db: SqliteDatabase): void {
       if (!/duplicate column|already exists/i.test((error as Error).message)) throw error;
     }
   }
+  // executeAdminSchemaMigrations runs the 0091 rebuild outside the list.
+  await applyGuardedAppleSubscriptionsNullableUserMigration(d1Database(db));
 }
 
 function d1Database(db: SqliteDatabase): D1Database {
@@ -296,7 +300,7 @@ describe('admin migration bootstrap', () => {
       ...TWIN_SEEK_INDEX_SCHEMA_STATEMENTS,
       ...PROBE_RUN_BRACKET_SCHEMA_STATEMENTS,
       ...ADMIN_ALLOWLIST_SCHEMA_STATEMENTS,
-      ...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
+      // 0091 is a guarded one-batch rebuild outside this list (schemaMigrationRunner.ts).
       ...LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS,
       ...PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS,
       ...X_AUTH_SCHEMA_STATEMENTS,
@@ -417,8 +421,8 @@ describe('admin migration bootstrap', () => {
     // statement list, tolerating "duplicate column"/"already exists" the way
     // the real route does — see applyAdminTail), so applying the tail twice
     // more must change nothing further than the first reopen pass.
-    applyAdminTail(db);
-    applyAdminTail(db);
+    await applyAdminTail(db);
+    await applyAdminTail(db);
 
     const rows = db
       .prepare('SELECT event, captured_at, error FROM latency_price_snapshots ORDER BY event')
@@ -589,7 +593,7 @@ describe('admin migration bootstrap', () => {
     try {
       applyMigrationFiles(fileDb, files);
       applyMigrationFiles(adminDb, priorFiles);
-      applyAdminTail(adminDb);
+      await applyAdminTail(adminDb);
 
       expect(schemaSnapshot(adminDb)).toEqual(schemaSnapshot(fileDb));
       expect(await checkReadiness(d1Database(fileDb))).toEqual({
@@ -896,20 +900,31 @@ describe('admin migration bootstrap', () => {
   // statements contributed by other modules (e.g. src/benchmark/schema.ts).
   it('mirrors every object declared by migrations/*.sql into the production migrate list', async () => {
     const statements: string[] = [];
+    // Answer as a pre-0091 database (apple_subscriptions.user_id NOT NULL) so
+    // the route's guarded one-batch 0091 rebuild runs and reaches the mirror.
     const db = {
       prepare(sql: string) {
+        let params: unknown[] = [];
         const stmt = {
-          bind() { return stmt; },
+          bind(...values: unknown[]) { params = values; return stmt; },
           async run() { statements.push(sql); return { success: true, meta: { changes: 1 } }; },
           async all() {
+            if (/PRAGMA table_info\("apple_subscriptions"\)/i.test(sql)) {
+              return { results: [{ name: 'user_id', notnull: 1 }], success: true };
+            }
             return { results: [], success: true };
           },
           async first() {
-            if (/sqlite_master/i.test(sql)) return null;
+            if (/sqlite_master/i.test(sql)) return params[0] === 'apple_subscriptions' ? { ok: 1 } : null;
             return null;
           },
         };
         return stmt;
+      },
+      async batch(prepared: Array<{ run(): Promise<unknown> }>) {
+        const results: unknown[] = [];
+        for (const stmt of prepared) results.push(await stmt.run());
+        return results;
       },
     } as unknown as D1Database;
 
@@ -934,8 +949,20 @@ describe('admin migration bootstrap', () => {
     ];
 
     // Objects a migration creates and then deliberately retires, so the prod
-    // mirror correctly never carries them.
-    const RETIRED = new Set(['trg_transactions_cursor']);
+    // mirror correctly never carries them.  0059 drops the 0021/0023
+    // disclosure_* tables; 0058 and 0062 drop the 0052/0056 queue indexes.
+    const RETIRED = new Set([
+      'trg_transactions_cursor',
+      'disclosure_latency_candidates',
+      'disclosure_provider_observations',
+      'idx_disc_latency_candidates_status',
+      'idx_disc_provider_seen',
+      'disclosure_latency_candidates.provider_published_at',
+      'disclosure_provider_observations.provider_published_at',
+      'idx_deno_runtime_queue_ready',
+      'idx_deno_runtime_queue_pending',
+      'idx_deno_runtime_queue_processing',
+    ]);
 
     const missing: string[] = [];
     for (const name of migrationFiles()) {
@@ -958,5 +985,80 @@ describe('admin migration bootstrap', () => {
         'because POST /api/admin/migrate does not create them. Mirror them into ' +
         'the statement list in src/admin/routes.ts (see AGENTS.md "Migrations & deploy").',
     ).toEqual([]);
+  });
+
+  // ---- boot replay churn (CT-2442) ----------------------------------------
+  // main.ts awaits this whole list before Deno.serve on every boot, holding
+  // the write lock statement by statement.  A table or index that a later
+  // statement in the same list drops is rebuilt and thrown away on every
+  // deploy (the deno_runtime_queue indexes cover millions of rows).  Leave
+  // the CREATE out of the replay and keep the DROP ... IF EXISTS, which is a
+  // cheap no-op that still cleans old databases.
+  function replayChurn(list: readonly string[]): string[] {
+    const statements = list.map((sql) => sql.replace(/\s+/g, ' ').trim());
+    const createRe = /^CREATE (?:UNIQUE )?(TABLE|INDEX) (?:IF NOT EXISTS )?([a-z0-9_]+)(?: ON ([a-z0-9_]+))?/i;
+    const alterRe = /^ALTER TABLE ([a-z0-9_]+) /i;
+    const dropRe = /^DROP (TABLE|INDEX) (?:IF EXISTS )?([a-z0-9_]+)/i;
+    const churn: string[] = [];
+    statements.forEach((sql, dropAt) => {
+      const drop = sql.match(dropRe);
+      if (!drop) return;
+      const kind = drop[1].toUpperCase();
+      const name = drop[2].toLowerCase();
+      statements.slice(0, dropAt).forEach((earlier, at) => {
+        const create = earlier.match(createRe);
+        const alter = earlier.match(alterRe);
+        const createsIt = create != null
+          && create[1].toUpperCase() === kind
+          && create[2].toLowerCase() === name;
+        const buildsOnDroppedTable = kind === 'TABLE' && (
+          (create != null && create[1].toUpperCase() === 'INDEX' && create[3]?.toLowerCase() === name)
+          || alter?.[1].toLowerCase() === name
+        );
+        if (createsIt || buildsOnDroppedTable) {
+          churn.push(`#${at} ${earlier.slice(0, 90)} ... dropped by #${dropAt} ${sql}`);
+        }
+      });
+    });
+    return churn;
+  }
+
+  it('detects a create that a later statement drops', () => {
+    expect(replayChurn([
+      'CREATE INDEX IF NOT EXISTS idx_q_ready ON q(status, id)',
+      'CREATE TABLE IF NOT EXISTS old_t (id TEXT PRIMARY KEY)',
+      'CREATE INDEX IF NOT EXISTS idx_old_t_id ON old_t (id)',
+      'ALTER TABLE old_t ADD COLUMN note TEXT',
+      'DROP INDEX IF EXISTS idx_q_ready',
+      'DROP TABLE IF EXISTS old_t',
+    ])).toHaveLength(4);
+    expect(replayChurn([
+      'DROP INDEX IF EXISTS idx_q_ready',
+      'CREATE INDEX IF NOT EXISTS idx_q_ready_id ON q (status, id)',
+    ])).toEqual([]);
+  });
+
+  it('never creates a table or index that a later replay statement drops', () => {
+    expect(
+      replayChurn(buildAdminMigrateStatements()),
+      'The boot replay rebuilds these objects under the write lock only to drop them. ' +
+        'Remove the CREATE (and any ALTER/INDEX on a dropped table) from the replay list; keep the DROP ... IF EXISTS.',
+    ).toEqual([]);
+  });
+
+  it('keeps the 0091 apple_subscriptions table swap out of the replay list', () => {
+    const replay = buildAdminMigrateStatements().join('\n');
+    expect(replay).not.toContain('apple_subscriptions_new');
+    expect(replay).not.toMatch(/DROP TABLE (?:IF EXISTS )?apple_subscriptions\b/i);
+    // The guarded rebuild still carries the 0091 statements, in file order.
+    expect(APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.map((sql) => sql.split(/\s+/).slice(0, 3).join(' ')))
+      .toEqual([
+        'CREATE TABLE IF',
+        'INSERT INTO apple_subscriptions_new',
+        'DROP TABLE apple_subscriptions',
+        'ALTER TABLE apple_subscriptions_new',
+        'CREATE INDEX IF',
+        'CREATE INDEX IF',
+      ]);
   });
 });

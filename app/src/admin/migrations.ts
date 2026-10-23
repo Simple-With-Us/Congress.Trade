@@ -397,7 +397,15 @@ export const RESOURCE_GOVERNOR_SCHEMA_STATEMENTS = [
 )`,
 ] as const;
 
-/** 0052_deno_runtime_queue.sql — durable queue for Deno KV Connect runtimes. */
+/**
+ * 0052_deno_runtime_queue.sql — durable queue for Deno KV Connect runtimes.
+ * The file's idx_deno_runtime_queue_ready is deliberately NOT replayed here:
+ * 0062 (FIX_DENO_RUNTIME_QUEUE_INDEX_SCHEMA_STATEMENTS, later in this list)
+ * drops it again.  The Deno boot replays this list before Deno.serve, so
+ * the pair rebuilt and dropped an index over the whole queue
+ * (~3.4M rows) under the write lock on every deploy.  The DROP ... IF EXISTS
+ * stays to clean databases that still have it.
+ */
 export const DENO_RUNTIME_QUEUE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS deno_runtime_queue (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,8 +422,6 @@ export const DENO_RUNTIME_QUEUE_SCHEMA_STATEMENTS = [
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL
    )`,
-  `CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_ready
-     ON deno_runtime_queue(status, available_at, id)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_deno_runtime_queue_active_dedupe
      ON deno_runtime_queue(queue_name, dedupe_key)
      WHERE dedupe_key IS NOT NULL AND status IN ('pending', 'processing')`,
@@ -538,10 +544,15 @@ export const ACCOUNTING_PROJECTION_RESYNC_SCHEMA_STATEMENTS = [
 
 /**
  * tests. Keep this in the same order as file migrations 0029 through 0055.
+ *
+ * 0056_query_optimizations.sql.  The file's idx_deno_runtime_queue_pending
+ * and idx_deno_runtime_queue_processing are deliberately NOT replayed: 0058
+ * (TURSO_QUERY_EFFICIENCY_SCHEMA_STATEMENTS) replaces them with the _id
+ * twins and drops them a few statements later, so replaying the CREATEs only
+ * rebuilt two full-queue indexes under the boot write lock to throw them
+ * away.  The 0058 DROP ... IF EXISTS statements stay.
  */
 export const QUERY_OPTIMIZATIONS_SCHEMA_STATEMENTS = [
-  'CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_pending ON deno_runtime_queue (queue_name, status, available_at)',
-  'CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_processing ON deno_runtime_queue (queue_name, status, lease_until)',
   'CREATE INDEX IF NOT EXISTS idx_ingestion_outbox_enqueued ON ingestion_outbox (status, updated_at)',
   'CREATE INDEX IF NOT EXISTS idx_delivery_outbox_enqueued ON delivery_outbox (status, updated_at)',
 ] as const;
@@ -1249,15 +1260,16 @@ export const ADMIN_ALLOWLIST_SCHEMA_STATEMENTS = [
  * device purchases (`POST /api/client/v1/entitlements/apple/redeem`) write a
  * `apple_subscriptions` row with `user_id = NULL`; SQLite cannot ALTER COLUMN
  * to drop a NOT NULL constraint, so this rebuilds the table. Keep in exact
- * lockstep with migrations/0091_apple_subscriptions_nullable_user.sql. Safe
- * to replay: each run copies the CURRENT table (already migrated after the
- * first run) into a fresh shadow, drops, and renames back — a no-op in
- * effect, not just idempotent-without-erroring, at the cost of a full-table
- * copy on every deploy. apple_subscriptions is small (one row per
- * subscriber/device, not per trade), so that cost is accepted rather than
- * building one-shot migration scripting this route doesn't otherwise have —
- * same tradeoff already made for the `deliveries` dedupe statement above
- * (see its comment under 0008_idempotency_keys.sql in routes.ts).
+ * lockstep with migrations/0091_apple_subscriptions_nullable_user.sql.
+ *
+ * NOT part of POST_0024_SCHEMA_STATEMENTS.  The replay used to run these as
+ * separate autocommit statements on every boot, and the runner moves on
+ * after a failed statement: a SQLITE_BUSY on CREATE/INSERT followed by a
+ * successful DROP deleted the table, and a BUSY on DROP left a filled
+ * apple_subscriptions_new that a later boot swapped over newer rows.
+ * applyGuardedAppleSubscriptionsNullableUserMigration
+ * (schemaMigrationRunner.ts) now runs them only while user_id is still NOT
+ * NULL, as ONE write batch that rolls back whole.
  */
 export const APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS apple_subscriptions_new (
@@ -1614,8 +1626,9 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...PROBE_RUN_BRACKET_SCHEMA_STATEMENTS,
   // 0090_admin_allowlist.sql
   ...ADMIN_ALLOWLIST_SCHEMA_STATEMENTS,
-  // 0091_apple_subscriptions_nullable_user.sql — Guideline 5.1.1(v).
-  ...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
+  // 0091_apple_subscriptions_nullable_user.sql — Guideline 5.1.1(v).  A
+  // guarded one-batch table rebuild run by executeAdminSchemaMigrations, not
+  // replayed here (see APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS).
   // 0092_latency_snapshot_repair.sql
   ...LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS,
   // 0093_premium_activation_alerts.sql

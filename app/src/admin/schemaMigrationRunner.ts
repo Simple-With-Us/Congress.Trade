@@ -1,4 +1,5 @@
-import { all, get, run } from '../shared/db.ts';
+import { all, batchPrepared, get, run } from '../shared/db.ts';
+import { APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS } from './migrations.ts';
 
 export const MIGRATE_IDEMPOTENT_ERROR_PATTERNS: readonly RegExp[] = [
   /duplicate column name/i,
@@ -62,6 +63,85 @@ export async function applyGuardedSecuritiesRefColumnMigrations(db: D1Database):
   return 'applied';
 }
 
+/** Label for the guarded 0091 rebuild in `failed[]` and the logs. */
+export const APPLE_SUBSCRIPTIONS_GUARD_LABEL = '(guarded 0091 apple_subscriptions rebuild)';
+
+/**
+ * Run statements as ONE libsql write batch (BEGIN IMMEDIATE, rolled back
+ * whole on any error).  batchPrepared falls back to one autocommit statement
+ * at a time when db.batch is missing; a table swap must never run that way.
+ */
+async function runAtomicSchemaBatch(db: D1Database, statements: readonly string[]): Promise<void> {
+  if (typeof db.batch !== 'function') {
+    throw new Error('guarded schema rebuild needs db.batch (one write transaction)');
+  }
+  await batchPrepared(db, statements.map((sql) => db.prepare(sql)));
+}
+
+/** CREATE INDEX / CREATE TRIGGER text from sqlite_master (which drops IF NOT EXISTS), made replay-safe. */
+function createIfNotExists(sql: string): string {
+  return sql.replace(
+    /^\s*CREATE\s+(UNIQUE\s+)?(INDEX|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?/i,
+    (_match, unique: string | undefined, kind: string) =>
+      `CREATE ${unique ? 'UNIQUE ' : ''}${kind.toUpperCase()} IF NOT EXISTS `,
+  );
+}
+
+/**
+ * Guarded apply for migration 0091 (`apple_subscriptions.user_id` drops NOT
+ * NULL).  Runs the rebuild only while PRAGMA table_info still shows user_id
+ * NOT NULL, and as one write batch: DROP any leftover shadow first, then
+ * CREATE / INSERT / DROP / RENAME / indexes.  A BUSY anywhere rolls the whole
+ * swap back, so the live table is never dropped without its replacement and
+ * a stale shadow never replaces live rows.
+ */
+export async function applyGuardedAppleSubscriptionsNullableUserMigration(
+  db: D1Database,
+): Promise<'applied' | 'recovered' | 'skipped'> {
+  if (!(await sqliteTableExists(db, 'apple_subscriptions'))) {
+    // The pre-guard replay could land its DROP and miss its RENAME, leaving
+    // the copied rows only in the shadow.  Finish that rename before the
+    // replay's 0081 CREATE TABLE IF NOT EXISTS makes an empty live table,
+    // which the rebuild below would keep while dropping the shadow's rows.
+    if (!(await sqliteTableExists(db, 'apple_subscriptions_new'))) return 'skipped';
+    const renameAt = APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.findIndex((sql) =>
+      /RENAME\s+TO\s+apple_subscriptions\b/i.test(sql)
+    );
+    await runAtomicSchemaBatch(db, APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.slice(renameAt));
+    return 'recovered';
+  }
+  const columns = await all<{ name: string; notnull: number }>(db, 'PRAGMA table_info("apple_subscriptions")');
+  const userId = columns.find((col) => col.name === 'user_id');
+  if (!userId || Number(userId.notnull) !== 1) return 'skipped';
+  // DROP TABLE takes the old table's indexes and triggers with it.  Recreate
+  // the ones a later migration added (0093's status index on a fresh
+  // database) after the rename, per SQLite's documented table-rebuild steps.
+  const dependents = await all<{ sql: string }>(
+    db,
+    `SELECT sql FROM sqlite_master
+      WHERE tbl_name = 'apple_subscriptions' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+      ORDER BY rowid`,
+  );
+  await runAtomicSchemaBatch(db, [
+    'DROP TABLE IF EXISTS apple_subscriptions_new',
+    ...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
+    ...dependents.map((row) => createIfNotExists(row.sql)),
+  ]);
+  return 'applied';
+}
+
+/** One guarded 0091 attempt; returns the error message instead of throwing. */
+async function tryGuardedAppleSubscriptionsRebuild(db: D1Database): Promise<string | null> {
+  try {
+    await applyGuardedAppleSubscriptionsNullableUserMigration(db);
+    return null;
+  } catch (err) {
+    const msg = (err as Error).message || String(err);
+    console.error(`[schema-migrate] ${msg} on statement: ${APPLE_SUBSCRIPTIONS_GUARD_LABEL}`);
+    return msg;
+  }
+}
+
 export interface SchemaMigrationRunResult {
   applied: string[];
   skipped: string[];
@@ -85,6 +165,9 @@ export async function executeAdminSchemaMigrations(
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
   }
+  // Pre-loop so a legacy table is rebuilt before the replay indexes it.  A
+  // failure here is retried post-loop, which decides what failed[] reports.
+  await tryGuardedAppleSubscriptionsRebuild(db);
 
   for (const sql of statements) {
     let attempts = 0;
@@ -121,6 +204,11 @@ export async function executeAdminSchemaMigrations(
   // Post-loop: after CREATE TABLE runs on a clean DB, add any columns the replay missed.
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
+  }
+  // Post-loop: a clean DB gets apple_subscriptions from the 0081 CREATE in the loop.
+  const appleRebuildError = await tryGuardedAppleSubscriptionsRebuild(db);
+  if (appleRebuildError) {
+    failed.push({ sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: appleRebuildError });
   }
 
   return { applied, skipped, failed };
