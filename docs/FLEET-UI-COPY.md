@@ -102,9 +102,9 @@ Same open icon source as ST: `ticker-logos` / app logo proxy.
 - Code identifiers, API enums, log lines, internal “live stream” engineering labels
   (SSE, live snapshot) unless user-facing product chrome.
 
-## Two spaces between sentences (owner rule 2026-08-08, strengthened 2026-08-10 and 2026-08-14 — ALL agents, ALL contexts)
+## Two spaces between sentences: U+00A0 plus a space (owner rule 2026-08-08, strengthened 2026-08-10 and 2026-08-14 — ALL agents, ALL contexts)
 
-Owner: **two spaces between sentences everywhere, including App Store
+Owner: **two spaces between sentences everywhere (written as a real U+00A0 plus a normal space; commit messages included), including App Store
 submission fields.**  Not optional.  Not “web only.”  Not “UI only.”
 **Every single agent, every app, every surface, forever.**
 
@@ -113,7 +113,7 @@ Caught live 2026-08-14: Congress.Trade App Store **review notes** still said
 already said 2 weeks.  Agents had treated review notes as exempt.  They are
 not.
 
-**Where it applies (non-exhaustive — if a human reads it, use two spaces):**
+**Where it applies (non-exhaustive — if a human reads it, use the gap):**
 - In-app UI strings (web, PWA, iOS native, widgets)
 - **App Store Connect — all of it:** description, promotional text, What’s New,
   **App Review notes**, **subscription / IAP review notes**, subscription
@@ -124,14 +124,12 @@ not.
 
 **How:**
 - Between sentences in a paragraph: a real U+00A0 plus a space after `.` `!` `?` (owner ruling 2026-10-23, every surface).  Never the `&nbsp;` entity, and never two plain ASCII spaces, which collapse.
-- HTML/JSX/SwiftUI source: write the U+00A0 as
-  `{"\u00A0 "}` / `\u00A0 ` or use a shared helper (ST: `SENTENCE_GAP`), never `&nbsp; `
+- HTML/JSX/SwiftUI source, by language:  Swift string literals `"\u{00A0} "`;  JS/TS string literals `"\u00A0 "`;  JSX text `{'\u00A0'}` followed by a space, or `&#160;` inside JSX text;  HTML markup source `&#160;` (markup only, never prose);  or a shared helper (ST: `SENTENCE_GAP`).  Never `&nbsp; ` in prose.
 - Prefer ONE paragraph for short related sentences over stacked one-liners when
   the owner asked for density (see Socratic proposals empty-state, 2026-08-08)
 - Do not insert spaces after brand periods (`Congress.Trade`), URLs, emails, or `U.S.`
 
-**Does NOT apply:** code identifiers, commit messages (normal spacing is fine
-for git), log lines, API enums, pure bullet lists of fragments with no
+**Does NOT apply:** code identifiers, log lines, API enums, pure bullet lists of fragments with no
 sentence terminator.
 
 **Agent failure mode:** shipping App Store description, review notes, or UI
