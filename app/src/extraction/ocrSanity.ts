@@ -219,6 +219,22 @@ export function fixOcrDateToken(token: string): { iso: string; fixed: string } |
         }
       }
     }
+    // Interpretation 5: month/year ("08/2030"), confusables mapped.  A clean
+    // MM/YYYY is a complete reading, not garble, so it must validate (and
+    // therefore never hold).  The iso pins day 01 as a month-precision
+    // placeholder; only `fixed` is ever written back into the name.
+    const monthYear = /^([\dlI|SOoB]{1,2})\/([\dlI|SOoB]{4})$/.exec(trimmed);
+    if (monthYear) {
+      const m = applyDateCharFixes(monthYear[1]);
+      const y = applyDateCharFixes(monthYear[2]);
+      if (/^\d{1,2}$/.test(m) && /^\d{4}$/.test(y)) {
+        const month = Number(m);
+        const year = Number(y);
+        if (year >= 1900 && year <= 2100 && month >= 1 && month <= 12) {
+          candidates.push({ month, day: 1, year, fixed: `${m}/${y}` });
+        }
+      }
+    }
   }
 
   // Deduplicate identical readings, then require uniqueness.

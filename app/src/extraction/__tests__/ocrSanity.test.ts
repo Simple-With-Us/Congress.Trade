@@ -99,6 +99,12 @@ describe('fixOcrDateToken', () => {
     expect(fixOcrDateToken('08/15/2030')).toEqual({ iso: '2030-08-15', fixed: '08/15/2030' });
   });
 
+  it('accepts month/year tokens without holding them', () => {
+    expect(fixOcrDateToken('08/2030')).toEqual({ iso: '2030-08-01', fixed: '08/2030' });
+    expect(fixOcrDateToken('O8/2O3O')).toEqual({ iso: '2030-08-01', fixed: '08/2030' });
+    expect(fixOcrDateToken('13/2030')).toBeNull();
+  });
+
   it('refuses impossible dates even after mapping', () => {
     expect(fixOcrDateToken('02/30/2026')).toBeNull();
     expect(fixOcrDateToken('13/01/2026')).toBeNull();
@@ -137,6 +143,7 @@ describe('normalizeEmbeddedOcrDates', () => {
       'Louisville Rev Bie 5.00 % Due Oct 1, 2047',
       'US TREASURY DUE 08/15/2030 0.625%',
       'King Cnty Wash Ltd 4.00% 12/1/32',
+      'Muni Bond Due 08/2030',
     ]) {
       const result = normalizeEmbeddedOcrDates(clean);
       expect(result.changed).toBe(false);
