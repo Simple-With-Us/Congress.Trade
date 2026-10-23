@@ -61,13 +61,33 @@ jobs:
       # optional garnish.  An install or registry failure here must never
       # suppress a production deploy receipt.  Installs only the pinned CLI
       # rather than the whole app tree, which exists solely to obtain one binary.
+      #
+      # Both steps also need a source map beside dashboard.js (dashboard.js.map,
+      # the file the upload script looks for).  None is built yet (CT-2438), and
+      # without one the upload stores nothing.  It also cannot authenticate
+      # today:  the SENTRY_AUTH_TOKEN org token predates the Sep 28 org rename
+      # (jays-services -> simple-with-us), and sentry-cli prefers the org
+      # embedded in the token over --org.  The upload failed on every production
+      # deploy since it was added on Oct 11, with "organization not found" once
+      # the CLI's output was surfaced (CT-2442).  The REST deploy reporter above
+      # is unaffected.  Until a map exists the upload is skipped with a notice
+      # instead of failing.
       - name: Install the pinned Sentry CLI
-        if: steps.record.outputs.release != ''
+        if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
         working-directory: app
         run: npm install --no-save --no-audit --no-fund "@sentry/cli@$(node -p "require('./package.json').devDependencies['@sentry/cli']")"
       - name: Upload browser dashboard source maps
-        if: steps.record.outputs.release != ''
+        if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_RELEASE: ${{ steps.record.outputs.release }}
         run: node scripts/sentry-upload-browser-sourcemaps.mjs
+      - name: Skip browser source map upload (no source map built)
+        if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') == ''
+        run: >-
+          echo '::notice title=Sentry source map upload skipped::No dashboard source
+          map is built (app/src/ui/client/dashboard.js.map, CT-2438), so the browser
+          source map upload was skipped.  sentry-cli uploads (browser source maps and
+          iOS dSYMs) also need a new Sentry org token minted in simple-with-us,
+          because the current SENTRY_AUTH_TOKEN predates the Sep 28 org rename from
+          jays-services (CT-2442).'
