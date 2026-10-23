@@ -14,7 +14,8 @@
  *   2. normalizeEmbeddedOcrDates: date-like tokens inside descriptions are
  *      fixed only when exactly one interpretation is valid, else held.
  *   3. normalizeOcrAssetName: conservative name fixes (stray backslashes,
- *      lowercase l in all-caps words, "Duo" before a maturity date, rate
+ *      lowercase l in all-caps words only when exactly one confusable
+ *      substitution yields a known token, "Duo" before a maturity date, rate
  *      letters, known-issuer fuzzy matches), else held for review.
  *
  * A fix is applied only when confident.  Anything else is reported through
@@ -445,6 +446,28 @@ export function matchKnownIssuer(name: string): IssuerMatch | null {
   return best;
 }
 
+/**
+ * Curated muni-market abbreviations (lowercase) that an all-caps confusable
+ * may resolve to.  In all-caps words a stray `l` is as often I or T as L
+ * (NVlOIACORP, MOBIUlY, PPlYS, MLTl), so a caps-l fix is trusted only when
+ * exactly one substitution yields a known token.  Deliberately small: every
+ * entry is a new fix target, while anything absent safely holds the row for
+ * review instead of guessing.
+ */
+export const OCR_MUNI_ABBREVS: ReadonlySet<string> = new Set([
+  'settlmt', // SETTLEMENT (tobacco MSTR settlement payments)
+  'mlti', // MULTI ("Mlti" school-building issuer spelling)
+  'pptys', // PROPERTIES (JBG Smith PPTYS)
+  'bldg', // BUILDING
+  'rfdg', // REFUNDING
+  'cnty', // COUNTY (Miami-Dade CNTY)
+]);
+
+/** Normalized curated issuer names, for exact whole-name evidence. */
+const NORMALIZED_ISSUERS: ReadonlySet<string> = new Set(
+  OCR_KNOWN_ISSUERS.map(normalizeForCompare),
+);
+
 /** Long words from the curated list, for word-level fuzzy repair. */
 const KNOWN_WORDS: ReadonlySet<string> = (() => {
   const words = new Set<string>();
@@ -518,6 +541,63 @@ const CAPS_L_WORD_GLOBAL_RE = new RegExp(CAPS_L_WORD_RE.source, 'g');
 
 function capsLWords(name: string): string[] {
   return name.match(CAPS_L_WORD_GLOBAL_RE) ?? [];
+}
+
+export interface CapsLFix {
+  winner: string;
+  /** Why the winner is trusted: a known word, abbreviation, or issuer name. */
+  kind: 'word' | 'abbreviation' | 'issuer';
+}
+
+const CAPS_L_SUBSTITUTES = ['L', 'I', 'T'];
+
+/**
+ * Resolve one all-caps word containing stray lowercase l's.  Every confusable
+ * substitution (l->L/I/T, plus l->1 when the word already contains a digit,
+ * where a digit reading is sensible) is tried at every l position; the fix
+ * applies only when EXACTLY ONE candidate is a known word (curated list or
+ * securities_ref extras), a curated muni abbreviation, or completes a known
+ * issuer name.  Zero matches (NVlOIACORP, MOBIUlY) or several (genuine
+ * ambiguity) both return null so the caller holds the row instead of
+ * guessing.  Words with more than three l's are deep garble and always hold.
+ */
+export function fixCapsLWord(
+  word: string,
+  fullText: string,
+  pool: ReadonlySet<string>,
+): CapsLFix | null {
+  const positions: number[] = [];
+  for (let i = 0; i < word.length; i += 1) {
+    if (word[i] === 'l') positions.push(i);
+  }
+  if (positions.length === 0 || positions.length > 3) return null;
+  const substitutes = /\d/.test(word) ? [...CAPS_L_SUBSTITUTES, '1'] : CAPS_L_SUBSTITUTES;
+  let best: CapsLFix | null = null;
+  const total = substitutes.length ** positions.length;
+  for (let combo = 0; combo < total; combo += 1) {
+    const chars = word.split('');
+    let rest = combo;
+    for (const pos of positions) {
+      chars[pos] = substitutes[rest % substitutes.length];
+      rest = Math.floor(rest / substitutes.length);
+    }
+    const candidate = chars.join('');
+    const lower = candidate.toLowerCase();
+    let kind: CapsLFix['kind'] | null = null;
+    if (pool.has(lower)) {
+      kind = 'word';
+    } else if (OCR_MUNI_ABBREVS.has(lower)) {
+      kind = 'abbreviation';
+    } else if (
+      NORMALIZED_ISSUERS.has(normalizeForCompare(fullText.split(word).join(candidate)))
+    ) {
+      kind = 'issuer';
+    }
+    if (!kind) continue;
+    if (best) return null;
+    best = { winner: candidate, kind };
+  }
+  return best;
 }
 
 /** Characters no legit asset name contains.  Colons inside known "Label:" tokens are exempt. */
@@ -658,14 +738,23 @@ export function normalizeOcrAssetName(input: string, opts: OcrNameOptions = {}):
     }
   }
   CAPS_L_WORD_GLOBAL_RE.lastIndex = 0;
-  const capsFixed = text.replace(CAPS_L_WORD_GLOBAL_RE, (word) => word.replace(/l/g, 'L'));
+  const capsWords = text.match(CAPS_L_WORD_GLOBAL_RE) ?? [];
   const touchedByCapsFix = new Set<string>();
-  if (capsFixed !== text) {
-    notes.push('uppercased stray lowercase l in all-caps word');
-    for (const word of capsFixed.split(/[^A-Za-z0-9]+/)) {
-      if (word.length >= 4 && /^[A-Z0-9]+$/.test(word)) touchedByCapsFix.add(word);
+  if (capsWords.length > 0) {
+    const capsPool = wordPoolFor(opts.extraKnownWords);
+    const seenCaps = new Set<string>();
+    for (const word of capsWords) {
+      if (seenCaps.has(word)) continue;
+      seenCaps.add(word);
+      const fix = fixCapsLWord(word, text, capsPool);
+      if (!fix) continue;
+      text = text.split(word).join(fix.winner);
+      touchedByCapsFix.add(fix.winner);
+      let evidence = `known word '${fix.winner}'`;
+      if (fix.kind === 'abbreviation') evidence = `known abbreviation '${fix.winner}'`;
+      if (fix.kind === 'issuer') evidence = 'a known issuer name';
+      notes.push(`fixed stray lowercase l in '${word}' to ${evidence}`);
     }
-    text = capsFixed;
   }
 
   // 4. Word-level repair for still-triggering (or just-touched) long words.
@@ -702,9 +791,9 @@ export function normalizeOcrAssetName(input: string, opts: OcrNameOptions = {}):
     }
   }
 
-  // 5. Anything still triggering is held, never silently saved.  A caps fix
-  // that left a clean all-caps token (e.g. SETTLMT) no longer triggers, so
-  // only genuinely unresolved garble lands here.
+  // 5. Anything still triggering is held, never silently saved.  An
+  // unfixed caps-l word keeps its trigger ("lowercase l in all-caps word"),
+  // so ambiguous garble (NVlOIACORP, MOBIUlY) lands here for review.
   for (const trigger of ocrTriggers(text, opts.extraKnownWords)) {
     nameHolds.push(trigger);
   }

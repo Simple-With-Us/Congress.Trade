@@ -28,7 +28,7 @@
  *   --doc <id>     Filing to cover (repeatable; default the Sep 17 Trump 278-T).
  *   --base <url>   API origin (default https://congress.trade).  --apply
  *                  refuses non-HTTPS origins except loopback dev targets.
- *   --samples <n>  Before->after samples to print (default 20).
+ *   --samples <n>  Rows to print per section (default all; pass <n> to cap).
  *   --json <path>  Also write the full machine-readable report here (needs
  *                  --allow-write=<path>).
  *   --apply        Write via POST /api/admin/clean-asset-names (admin token).
@@ -149,7 +149,7 @@ async function dryRun(base: string, docs: string[], samples: number, jsonPath: s
   console.log(`rows changed:       ${changed.length}`);
   console.log(`rows held:          ${held.length}`);
   console.log(`rows clean:         ${clean}`);
-  console.log(`\n=== SAMPLES — before -> after (${Math.min(samples, changed.length)} of ${changed.length}) ===`);
+  console.log(`\n=== CHANGED — before -> after (${Math.min(samples, changed.length)} of ${changed.length}) ===`);
   for (const row of changed.slice(0, samples)) {
     console.log(`  before: ${row.before}`);
     console.log(`  after:  ${row.after}`);
@@ -288,7 +288,10 @@ async function apply(base: string, docs: string[], allRows: boolean, pageSize: n
 
 async function main(): Promise<void> {
   const base = (arg('base', 'https://congress.trade') as string).replace(/\/+$/, '');
-  const samples = Math.max(1, Number(arg('samples', '20')));
+  const samplesArg = arg('samples');
+  const samples = samplesArg === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(1, Number(samplesArg));
   const pageSize = Math.max(100, Math.min(2000, Number(arg('page', '500'))));
   const jsonPath = arg('json');
   if (flag('apply')) {

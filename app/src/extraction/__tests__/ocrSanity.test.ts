@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  fixCapsLWord,
   fixOcrDateToken,
   isValidCalendarDateYMD,
   matchKnownIssuer,
@@ -236,9 +237,61 @@ describe('normalizeOcrAssetName — Sep 17 rows', () => {
     expect(result.nameHolds.length).toBeGreaterThan(0);
   });
 
-  it('applies the safe caps fix without over-holding unknown abbreviations', () => {
-    expect(normalizeOcrAssetName('NVlOIACORP').name).toBe('NVLOIACORP');
-    expect(normalizeOcrAssetName('JBG Smith PPlYS').name).toBe('JBG Smith PPLYS');
+  it('holds caps-l words with no known resolution instead of guessing L', () => {
+    // Truth is NVIDIA CORP / unknown: no substitution yields a known token.
+    const nv = normalizeOcrAssetName('NVlOIACORP');
+    expect(nv.name).not.toBe('NVLOIACORP');
+    expect(nv.name).toBe('NVlOIACORP');
+    expect(nv.changed).toBe(false);
+    expect(nv.nameHolds.length).toBeGreaterThan(0);
+    const mob = normalizeOcrAssetName('MOBIUlY Global Inc.');
+    expect(mob.name).not.toBe('MOBIULY Global Inc.');
+    expect(mob.name).toBe('MOBIUlY Global Inc.');
+    expect(mob.changed).toBe(false);
+    expect(mob.nameHolds.length).toBeGreaterThan(0);
+  });
+
+  it('fixes caps-l words only when exactly one substitution is known', () => {
+    // Truth is PPTYS (l->T) and MLTI (l->I): the uniquely known candidates.
+    const pptys = normalizeOcrAssetName('JBG Smith PPlYS');
+    expect(pptys.name).toBe('JBG Smith PPTYS');
+    expect(pptys.name).not.toContain('PPLYS');
+    expect(pptys.nameHolds).toHaveLength(0);
+    const mlti = normalizeOcrAssetName(
+      'Columbus in MLTl SCH BLDG Corp. Pptytax 1ST MTG Rev Bie ST Intrcpt 5.00 % Due Jul 15 2027',
+    );
+    expect(mlti.name).toContain('Columbus in MLTI SCH BLDG Corp.');
+    expect(mlti.name).not.toContain('MLTL');
+    expect(mlti.nameHolds).toHaveLength(0);
+    const cnty = normalizeOcrAssetName('Miami-Dade CNlY');
+    expect(cnty.name).toBe('Miami-Dade CNTY');
+    expect(cnty.nameHolds).toHaveLength(0);
+  });
+
+  it('keeps the trusted caps-l fixes working', () => {
+    expect(normalizeOcrAssetName('Commonwealth Pa Fing Auth Tob MSTR SETTlMT').name).toContain(
+      'SETTLMT',
+    );
+    expect(normalizeOcrAssetName('BLACKSlONE MTG TR Inc. REIT').name).toBe(
+      'BLACKSTONE MTG TR Inc. REIT',
+    );
+  });
+
+  it('holds when two substitutions both yield known words', () => {
+    expect(fixCapsLWord('TAlL', 'TAlL', new Set(['tall', 'tail']))).toBeNull();
+    expect(fixCapsLWord('TAlL', 'TAlL', new Set(['tail']))).toEqual({
+      winner: 'TAIL',
+      kind: 'word',
+    });
+  });
+
+  it('tries l->1 only where a digit reading is sensible', () => {
+    expect(fixCapsLWord('ABl1', 'ABl1', new Set(['ab11']))).toEqual({
+      winner: 'AB11',
+      kind: 'word',
+    });
+    expect(fixCapsLWord('ABlC', 'ABlC', new Set(['ab1c']))).toBeNull();
+    expect(fixCapsLWord('ABllll', 'ABllll', new Set(['abllll']))).toBeNull();
   });
 });
 
