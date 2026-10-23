@@ -71,7 +71,10 @@ jobs:
       # deploy since it was added on Oct 11, with "organization not found" once
       # the CLI's output was surfaced (CT-2442).  The REST deploy reporter above
       # is unaffected.  Until a map exists the upload is skipped with a notice
-      # instead of failing.
+      # instead of failing.  Once SENTRY_AUTH_TOKEN is replaced with a
+      # simple-with-us org token, drop the token sentence from the notice.  The
+      # upload script's node test checks these hashFiles() paths against
+      # DASHBOARD_SOURCE.
       - name: Install the pinned Sentry CLI
         if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
         working-directory: app

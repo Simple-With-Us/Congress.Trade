@@ -33,6 +33,13 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // No file on disk IS the served bytes, and none of them carries a source map,
 // so browser stack traces still will not symbolicate.  That is the build gap in
 // CT-2438:  the generator has to emit the served bundle and its map.
+//
+// The Sentry Deploy workflow (.github/workflows/sentry-deploy.yml) runs this
+// upload only when `${DASHBOARD_SOURCE}.map` exists in its `main` checkout, and
+// that job builds nothing.  So the CT-2438 fix has to commit the map at that
+// path or add a build step before the gate, and moving DASHBOARD_SOURCE means
+// moving the workflow's hashFiles() paths with it.  The node test checks that
+// the two agree.
 export const DASHBOARD_SOURCE = resolve(ROOT, 'app/src/ui/client/dashboard.js');
 
 // The artifact name has to be the path the browser requests, because that is

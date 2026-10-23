@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DASHBOARD_SOURCE,
@@ -252,6 +252,22 @@ test('the upload target is the file the generator reads, not the file it writes'
 test('the upload target is browser JavaScript, not a TypeScript module', () => {
   assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/client\/dashboard\.js$/);
   assert.ok(existsSync(DASHBOARD_SOURCE), 'the upload target must exist in the repo');
+});
+
+// Review finding:  the Sentry Deploy workflow gates the CLI install, the upload
+// and the skip notice on a literal map path, and nothing else ties that literal
+// to DASHBOARD_SOURCE.  A moved source would leave the gate shut with no error,
+// and the notice would keep naming a map that is no longer the one uploaded.
+test('the Sentry Deploy gate keys on the map beside the upload target', () => {
+  const workflow = readFileSync(resolve(ROOT, '.github/workflows/sentry-deploy.yml'), 'utf8');
+  const expected = `${relative(ROOT, DASHBOARD_SOURCE)}.map`;
+  const gated = [...workflow.matchAll(/hashFiles\('([^']+\.map)'\)/g)].map((match) => match[1]);
+  assert.deepEqual(
+    gated,
+    [expected, expected, expected],
+    'the CLI install, the upload and the skip notice must each be gated on the map beside DASHBOARD_SOURCE',
+  );
+  assert.ok(workflow.includes(`(${expected}, CT-2438)`), `the skip notice must name ${expected}`);
 });
 
 // Sentry matches a browser stack frame to its artifact by NAME, and the frame
