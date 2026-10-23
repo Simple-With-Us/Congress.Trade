@@ -116,6 +116,20 @@ export const MAX_REFS_BATCH = 500;
 
 export const APP_B_ORIGIN_TAG = "app-b" as const;
 
+// ---- Share payload contract version (App B → App A) ----
+
+/**
+ * Current version of the `SharePayloadSchema` envelope (ST-3853).  Senders should stamp
+ * `schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION` on every share payload.  A payload without the
+ * field predates versioning and is treated as version 1 (see `resolveSharePayloadSchemaVersion`).
+ * Bump this only for a breaking change to the envelope or its row schemas, and ship the receiver
+ * support first.
+ */
+export const SHARE_PAYLOAD_SCHEMA_VERSION = 1 as const;
+
+/** Version assumed for legacy share payloads that carry no `schemaVersion`. */
+export const SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION = 1 as const;
+
 // ---- Events ----
 
 export const CONGRESS_EVENT_TYPES = Object.freeze([

@@ -278,6 +278,7 @@ import {
   persistPeerImportReceipt,
   rejectedCountsFromErrors,
   resolvePeerImportRequestId,
+  resolvePeerImportSchemaVersion,
   warnPeerImportSchemaDrops,
 } from '../share/importReceipt.ts';
 import { buildAdminMigrateStatements } from './migrateStatements.ts';
@@ -10088,6 +10089,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ error: 'invalid shared payload: origin must be a string' }, 400);
     }
     const originTag = typeof body.origin === 'string' ? body.origin : null;
+    // ST-3853: resolve the peer's payload contract version.  An unsupported or
+    // malformed version is warned about, never rejected — mixed deploys must
+    // keep importing until every peer runs a shared package that understands it.
+    const peerSchemaVersion = resolvePeerImportSchemaVersion(body.schemaVersion, {
+      requestId,
+      origin: originTag,
+    });
     const filteredShareBody = {
       ...body,
       refs: filterShareRows(body.refs, SecurityRefInputSchema),
@@ -10495,7 +10503,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       console.warn('peer import receipt persist failed:', (err as Error).message);
     }
 
-    return c.json({ ok, ...summary, dropped });
+    return c.json({ ok, ...summary, dropped, schemaVersion: peerSchemaVersion.schemaVersion });
     } catch (err) {
       if (isSqliteLockBusy(err)) {
         return c.json({ error: 'database busy; retry import' }, 503);
