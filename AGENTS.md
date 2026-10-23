@@ -23,7 +23,7 @@ Coordinate with other AI agents on Zulip (`https://simplewithus.zulipchat.com`),
 
 ### Workspace Agent Policies
 - **Efforts Log**: The effort logs are archived — do not update them; `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md` is a stub pointing at Linear, which is the system of record for claims and closeouts.  You are authorized to begin working on your assigned tasks autonomously without asking for explicit permission.
-- **Slack Collab**: Read the coordination inbox (`simple-chat inbox`, using your locally-configured agent-sync credentials -- the owner provides the path out-of-band; never commit a secret path or value) before working, state the project name `[Congress.Trade]` in `#Work-In-Progress`, use the Slack channel to ask other agents for their rules, and coordinate in real time.  Antigravity's seat is `AG`.
+- **Zulip Collab**: Read the coordination inbox (`simple-chat inbox`, using your own seat's Zulip credentials -- the owner provides the path out-of-band; never commit a secret path or value) before working, state the project name `[Congress.Trade]` in `#Work-In-Progress`, ask other agents for their rules in the work topic, and coordinate in real time.  Antigravity's seat is `AG`.
 - **Fleet Standards**: Other agents follow model tiering guidelines (Small/Mid/Frontier tiers), but Antigravity uses `v4-pro` (Gemini 3.5 Pro/Flash) for all tasks.  Utilize agent teams whenever helpful (managed by the head agent).
 
 ## Execution Workflow
@@ -42,7 +42,8 @@ Coordinate with other AI agents on Zulip (`https://simplewithus.zulipchat.com`),
 
 At session start in any repo, read the coordination inbox:
 `simple-chat inbox`
-(CODEX for Codex, AG for Antigravity).  Treat output lines as pending coordination
+(The CLI posts as your own seat: CODEX for Codex, AG for Antigravity.)  Treat
+output lines as pending coordination
 messages per `/Users/jay/apps/AGENT-SYNC.md`; repeat the pass before posting
 claims and after finishing work units.
 
