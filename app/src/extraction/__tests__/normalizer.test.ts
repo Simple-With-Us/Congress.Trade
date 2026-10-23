@@ -649,6 +649,30 @@ describe('normalize', () => {
     expect(cap.insertedTx).toHaveLength(1);
   });
 
+  it('publishes the OCR-repaired name and resolves its ticker from the repair', async () => {
+    const { env, cap } = makeEnv([{ ticker: 'UBER', name: 'Uber Technologies Inc.', aliases: '[]' }]);
+    const result = await normalize(env, filing(), [
+      tx({ ticker: null, assetName: 'Uber Technolo1des Inc.' }),
+    ]);
+    expect(result.needsReview).toBe(false);
+    expect(result.published).toBe(true);
+    expect(cap.insertedTx).toHaveLength(1);
+    expect(cap.insertedTx[0].assetName).toBe('Uber Technologies Inc.');
+    expect(cap.insertedTx[0].ticker).toBe('UBER');
+    expect(String(cap.insertedTx[0].cleaningNote)).toContain('normalized OCR artifacts');
+  });
+
+  it('holds a row whose OCR garble has no confident fix', async () => {
+    const { env, cap } = makeEnv([{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }]);
+    const result = await normalize(env, filing(), [
+      tx({ ticker: null, assetName: 'Legal200m Com Inc.' }),
+    ]);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(String(cap.reviewRows[0][1])).toContain('ocr_name_hold');
+  });
+
   it('routes empty extraction to review', async () => {
     const { env, cap } = makeEnv([]);
     const result = await normalize(env, filing(), []);

@@ -457,6 +457,23 @@ const KNOWN_WORDS: ReadonlySet<string> = (() => {
 })();
 
 /**
+ * Merged word pools, memoized per extras set.  The machine path passes the
+ * same securities_ref-derived set for every row of a filing, so without this
+ * each garbled row would rebuild a ~10k-entry set on the hot ingest path.
+ */
+const mergedPoolCache = new WeakMap<ReadonlySet<string>, ReadonlySet<string>>();
+
+function wordPoolFor(extra: ReadonlySet<string> | undefined): ReadonlySet<string> {
+  if (!extra) return KNOWN_WORDS;
+  let merged = mergedPoolCache.get(extra);
+  if (!merged) {
+    merged = new Set([...KNOWN_WORDS, ...extra]);
+    mergedPoolCache.set(extra, merged);
+  }
+  return merged;
+}
+
+/**
  * Derive matchable words from extra known names (securities_ref company
  * names in the machine path).  Callers with many rows derive this ONCE and
  * pass the set down, so per-row work stays proportional to the row.
@@ -659,9 +676,8 @@ export function normalizeOcrAssetName(input: string, opts: OcrNameOptions = {}):
     const lower = word.toLowerCase();
     if (triggeredWords.has(lower) || touchedByCapsFix.has(word)) candidates.add(word);
   }
-  const poolExtra = opts.extraKnownWords;
-  const wordPool: ReadonlySet<string> = poolExtra && candidates.size > 0
-    ? new Set([...KNOWN_WORDS, ...poolExtra])
+  const wordPool: ReadonlySet<string> = candidates.size > 0
+    ? wordPoolFor(opts.extraKnownWords)
     : KNOWN_WORDS;
   for (const word of candidates) {
     const lower = word.toLowerCase();

@@ -24,12 +24,13 @@ const ROWS: TxRow[] = [
   { id: 'row-apple', asset_name: 'Apple Inc.', ticker: 'AAPL', cleaning_note: null },
 ];
 
-function fakeDb(captured: { runs: unknown[][]; selects: string[] }) {
+function fakeDb(captured: { runs: unknown[][]; selects: string[]; selectParams: unknown[][] }) {
   const db = {
     prepare(sql: string) {
       return {
         bind(...args: unknown[]) {
           if (/^UPDATE transactions/i.test(sql.trim())) captured.runs.push([sql, ...args]);
+          else captured.selectParams.push(args);
           return this;
         },
         async all<T>() {
@@ -55,7 +56,7 @@ function env(db: D1Database) {
 
 describe('POST /clean-asset-names — OCR cleanup', () => {
   it('dry run proposes fixes and holds without writing', async () => {
-    const captured = { runs: [] as unknown[][], selects: [] as string[] };
+    const captured = { runs: [] as unknown[][], selects: [] as string[], selectParams: [] as unknown[][] };
     const res = await app.request(
       '/clean-asset-names?docId=E-sep17&dryRun=1',
       { method: 'POST', headers: AUTH },
@@ -76,7 +77,7 @@ describe('POST /clean-asset-names — OCR cleanup', () => {
   });
 
   it('apply writes confident fixes with an audit note', async () => {
-    const captured = { runs: [] as unknown[][], selects: [] as string[] };
+    const captured = { runs: [] as unknown[][], selects: [] as string[], selectParams: [] as unknown[][] };
     const res = await app.request(
       '/clean-asset-names?docId=E-sep17',
       { method: 'POST', headers: AUTH },
@@ -94,7 +95,7 @@ describe('POST /clean-asset-names — OCR cleanup', () => {
   });
 
   it('sweeps the full table without a doc filter', async () => {
-    const captured = { runs: [] as unknown[][], selects: [] as string[] };
+    const captured = { runs: [] as unknown[][], selects: [] as string[], selectParams: [] as unknown[][] };
     const res = await app.request(
       '/clean-asset-names?dryRun=1',
       { method: 'POST', headers: AUTH },
@@ -102,5 +103,16 @@ describe('POST /clean-asset-names — OCR cleanup', () => {
     );
     expect(res.status).toBe(200);
     expect(captured.selects.some((sql) => /WHERE doc_id/i.test(sql))).toBe(false);
+  });
+
+  it('falls back to default paging on non-numeric input', async () => {
+    const captured = { runs: [] as unknown[][], selects: [] as string[], selectParams: [] as unknown[][] };
+    const res = await app.request(
+      '/clean-asset-names?dryRun=1&limit=abc&offset=xyz',
+      { method: 'POST', headers: AUTH },
+      env(fakeDb(captured)),
+    );
+    expect(res.status).toBe(200);
+    expect(captured.selectParams).toEqual([[500, 0]]);
   });
 });

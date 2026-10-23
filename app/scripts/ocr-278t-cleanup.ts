@@ -26,7 +26,8 @@
  *
  * Options:
  *   --doc <id>     Filing to cover (repeatable; default the Sep 17 Trump 278-T).
- *   --base <url>   API origin (default https://congress.trade).
+ *   --base <url>   API origin (default https://congress.trade).  --apply
+ *                  refuses non-HTTPS origins except loopback dev targets.
  *   --samples <n>  Before->after samples to print (default 20).
  *   --json <path>  Also write the full machine-readable report here (needs
  *                  --allow-write=<path>).
@@ -69,14 +70,44 @@ function docArgs(): string[] {
   return docs.length > 0 ? docs : [DEFAULT_DOC];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 async function fetchDocTransactions(base: string, docId: string): Promise<FilingTx[]> {
   const res = await fetch(`${base}/api/filings/${encodeURIComponent(docId)}`, {
     headers: { 'User-Agent': BROWSER_UA },
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`GET /api/filings/${docId}: HTTP ${res.status}: ${text.slice(0, 160)}`);
-  const parsed = JSON.parse(text) as { transactions?: FilingTx[] };
-  return parsed.transactions ?? [];
+  // Runtime-shape the response instead of asserting it: a drifted API must
+  // degrade to skipped rows, never crash the normalizer on a non-string.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`GET /api/filings/${docId}: response is not JSON`);
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.transactions)) {
+    throw new Error(`GET /api/filings/${docId}: response has no transactions array`);
+  }
+  const rows: FilingTx[] = [];
+  let skipped = 0;
+  for (const entry of parsed.transactions) {
+    if (!isRecord(entry) || typeof entry.id !== 'string' || typeof entry.assetName !== 'string') {
+      skipped += 1;
+      continue;
+    }
+    rows.push({
+      id: entry.id,
+      assetName: entry.assetName,
+      ticker: typeof entry.ticker === 'string' ? entry.ticker : null,
+      txDate: typeof entry.txDate === 'string' ? entry.txDate : null,
+      source: typeof entry.source === 'string' ? entry.source : '',
+    });
+  }
+  if (skipped > 0) console.error(`warning: skipped ${skipped} malformed rows in ${docId}`);
+  return rows;
 }
 
 function assess(rows: FilingTx[]): { changed: RowResult[]; held: RowResult[]; clean: number } {
@@ -160,6 +191,48 @@ interface ApplyPage {
   error?: string;
 }
 
+function parseApplyPage(text: string): ApplyPage {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('apply response is not JSON');
+  }
+  if (!isRecord(parsed)) throw new Error('apply response is not an object');
+  const numberOrUndefined = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return {
+    ok: parsed.ok === true,
+    cleaned: numberOrUndefined(parsed.cleaned),
+    ocrCleaned: numberOrUndefined(parsed.ocrCleaned),
+    processed: numberOrUndefined(parsed.processed),
+    nextOffset: numberOrUndefined(parsed.nextOffset),
+    done: parsed.done === true,
+    held: numberOrUndefined(parsed.held),
+    error: typeof parsed.error === 'string' ? parsed.error : undefined,
+  };
+}
+
+/**
+ * The admin token must never travel to a plaintext or unexpected origin: a
+ * typo'd --base would otherwise receive full write credentials.  HTTPS
+ * everywhere, with plain HTTP allowed only for loopback dev targets.
+ */
+function assertSafeApplyBase(base: string): string {
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    throw new Error(`refusing --apply against malformed base '${base}'`);
+  }
+  const host = url.hostname.toLowerCase();
+  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  if (url.protocol !== 'https:' && !loopback) {
+    throw new Error(`refusing --apply against non-HTTPS base '${base}' (https or localhost only)`);
+  }
+  return base;
+}
+
 async function applyPage(
   base: string,
   token: string,
@@ -177,7 +250,7 @@ async function applyPage(
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': BROWSER_UA },
     });
     const text = await res.text();
-    if (res.ok) return JSON.parse(text) as ApplyPage;
+    if (res.ok) return parseApplyPage(text);
     lastError = `HTTP ${res.status}: ${text.slice(0, 200)}`;
     await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
   }
@@ -185,6 +258,7 @@ async function applyPage(
 }
 
 async function apply(base: string, docs: string[], allRows: boolean, pageSize: number): Promise<void> {
+  assertSafeApplyBase(base);
   const token = await adminToken();
   const targets = allRows ? [null] : docs;
   if (!allRows && docs.length === 0) throw new Error('--apply needs --doc <id> or --all-rows');

@@ -1065,6 +1065,7 @@ type ValidatedEditedTx = EditedTx & {
 function validateReviewEdits(
   rawEdits: unknown[],
   filedDate: string | null,
+  opts: { acknowledgeStaleTxDate?: boolean } = {},
 ): { edits: ValidatedEditedTx[] } | { error: string } {
   // The live backlog contains filings with more than 200 disclosed lots. Keep
   // those reviewable while still bounding request and D1 work.
@@ -1090,10 +1091,18 @@ function validateReviewEdits(
     // Shared strict check: real calendar date, not future, not older than
     // the lookback below the filing date.  After-filed trades stay allowed
     // per the tested rule (signature-stamp skew).  Same contract the machine
-    // path enforces in scoreFields.
+    // path enforces in scoreFields, except a reviewer can explicitly confirm
+    // a genuinely stale trade (late disclosure) via acknowledgeStaleTxDate —
+    // impossible dates, future dates, and OCR garble have no such bypass.
     const dateCheck = validateTxDate(txDate, { filedDate });
-    if (dateCheck.ok === false) {
-      return { error: `edits[${index}].txDate ${dateCheck.message}` };
+    const staleAcknowledged = dateCheck.ok === false
+      && dateCheck.code === 'tx_date_too_old'
+      && opts.acknowledgeStaleTxDate === true;
+    if (dateCheck.ok === false && !staleAcknowledged) {
+      const hint = dateCheck.code === 'tx_date_too_old'
+        ? ' — pass acknowledgeStaleTxDate: true to confirm a genuinely old trade anyway'
+        : '';
+      return { error: `edits[${index}].txDate ${dateCheck.message}${hint}` };
     }
     const ticker = typeof e.ticker === 'string' ? e.ticker.trim() : '';
     const assetName = typeof e.assetName === 'string' ? e.assetName.trim() : '';
@@ -1142,7 +1151,9 @@ function validateReviewEdits(
         return { error: `edits[${index}].${field} must be a boolean` };
       }
     }
-    edits.push({ ...e, ticker: ticker || null, assetName: finalAssetName, txDate, owner: owner as any, txType, cleaningNote });
+    // The owner guard above already proved this value; the cast only tells the
+    // checker the union it cannot infer from the !== chain (never `any`).
+    edits.push({ ...e, ticker: ticker || null, assetName: finalAssetName, txDate, owner: owner as ValidatedEditedTx['owner'], txType, cleaningNote });
   }
   return { edits };
 }
@@ -2781,7 +2792,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- POST /review/:docId ------------------------------------------------
-  // Body: { decision: 'confirm'|'reject'|'manual', reviewRevision, edits?: EditedTx[] }
+  // Body: { decision: 'confirm'|'reject'|'manual', reviewRevision, edits?: EditedTx[],
+  //         acknowledgeUnderTranscription?: boolean, acknowledgeStaleTxDate?: boolean }
   //   confirm -> insert corrected transactions (source='primary'), mark review
   //              resolved, set filing persisted, enqueue delivery.dispatch each.
   //   manual  -> same as confirm but recorded as source='manual' — the admin
@@ -2974,7 +2986,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ docId, decision: 'orphan_resolved', resolved: true });
     }
     const filingFilerId = filing?.filer_id ?? null;
-    const validated = validateReviewEdits(confirmedEdits, filing.filed_date);
+    const validated = validateReviewEdits(confirmedEdits, filing.filed_date, {
+      acknowledgeStaleTxDate: body.acknowledgeStaleTxDate === true,
+    });
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
@@ -3203,6 +3217,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           inserted: insertedCount,
           deprecatedPredecessors,
           ocrNormalized: edits.filter((e) => e.cleaningNote).length,
+          acknowledgedStaleTxDate: body.acknowledgeStaleTxDate === true,
           reviewCreatedAt: review.created_at,
         },
         createdAt: nowIso,
@@ -10637,16 +10652,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // audit fragment in cleaning_note; unfixable rows are reported as held
     // and left untouched.  Re-running is a no-op once names are fixed.
     const query = c.req.query() as { offset?: string | number; limit?: string | number; docId?: string; dryRun?: string };
-    const numOffset = Number(query.offset ?? 0);
-    const numLimit = Math.max(1, Math.min(2000, Number(query.limit ?? 500)));
+    // Non-numeric paging input falls back to the defaults instead of reaching
+    // SQL as NaN (a malformed request must not become a 500).
+    const rawOffset = Number(query.offset ?? 0);
+    const rawLimit = Number(query.limit ?? 500);
+    const numOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
+    const numLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(2000, Math.floor(rawLimit))) : 500;
     const docId = typeof query.docId === 'string' && query.docId ? query.docId : null;
     const dryRun = query.dryRun === '1';
 
     const rows = await all<{ id: string; asset_name: string; ticker: string | null; cleaning_note: string | null }>(
       c.env.DB,
+      // The id tiebreaker keeps paging deterministic: batch inserts share one
+      // created_at, so offset windows over created_at alone could skip rows.
       docId
-        ? 'SELECT id, asset_name, ticker, cleaning_note FROM transactions WHERE doc_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
-        : 'SELECT id, asset_name, ticker, cleaning_note FROM transactions ORDER BY created_at DESC LIMIT ? OFFSET ?',
+        ? 'SELECT id, asset_name, ticker, cleaning_note FROM transactions WHERE doc_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
+        : 'SELECT id, asset_name, ticker, cleaning_note FROM transactions ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
       docId ? [docId, numLimit, numOffset] : [numLimit, numOffset],
     );
 

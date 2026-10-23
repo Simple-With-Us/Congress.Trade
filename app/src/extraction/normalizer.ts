@@ -77,6 +77,7 @@ import {
 } from '../enrichment/nameTickerBackfill.ts';
 import { parseAmountRange } from './amounts.ts';
 import { issuerWords, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
+import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
 import {
   PIPELINE_TX_SOURCES_SQL,
@@ -840,7 +841,9 @@ function buildTransaction(
     p.confidence,
     {
       ticker: rawTicker,
-      assetName: cleanedAssetName,
+      // Score the OCR-repaired name so ticker resolution and the consistency
+      // checks see the canonical issuer, not the garble.
+      assetName: ocrAssetName,
       amountMin: p.amountMin,
       amountMax: p.amountMax,
       txType: p.txType,
@@ -851,6 +854,7 @@ function buildTransaction(
     resolve,
     nameIndex,
     ocrExtraWords,
+    ocr,
   );
   // Models (and local_mac OCR) often leave assetType null even when the PTR
   // line says "Common Stock" or carries a House [ST] code. Infer before
@@ -964,6 +968,7 @@ export function scoreFields(
   resolve: TickerResolver,
   nameIndex?: NameIndex,
   ocrExtraWords?: ReadonlySet<string>,
+  precomputedOcr?: OcrNameResult,
 ): ScoredFields {
   const flags: string[] = [];
   let confidence = clamp01(base);
@@ -1111,8 +1116,9 @@ export function scoreFields(
   // --- OCR sanity on the asset name -----------------------------------------
   // Confident fixes are applied by the caller (buildTransaction); unfixable
   // garble is a hard failure so the row is held, never published.  Reference
-  // names from securities_ref feed word-level evidence only.
-  const ocr = normalizeOcrAssetName(assetName, { extraKnownWords: ocrExtraWords });
+  // names from securities_ref feed word-level evidence only.  buildTransaction
+  // passes its already-computed result so the scan runs once per row.
+  const ocr = precomputedOcr ?? normalizeOcrAssetName(assetName, { extraKnownWords: ocrExtraWords });
   if (ocr.dateHolds.length > 0) {
     flags.push('ocr_date_hold');
     confidence *= PENALTY_OCR_HOLD;

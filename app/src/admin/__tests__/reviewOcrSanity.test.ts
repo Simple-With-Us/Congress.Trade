@@ -136,6 +136,28 @@ describe('POST /review/:docId — OCR sanity', () => {
     expect(rows[0].cleaningNote).toContain('normalized OCR artifacts');
   });
 
+  it('confirms a genuinely old trade only with acknowledgeStaleTxDate', async () => {
+    const denied = { binds: [] as unknown[][] };
+    const refused = await postReview(fakeDb(denied), {
+      decision: 'manual',
+      reviewRevision: 1,
+      edits: [{ ...BASE_EDIT, txDate: '2020-01-01' }],
+    });
+    expect(refused.status).toBe(400);
+    expect(String(refused.body.error)).toContain('acknowledgeStaleTxDate');
+    expect(denied.binds).toHaveLength(0);
+
+    const allowed = { binds: [] as unknown[][] };
+    const confirmed = await postReview(fakeDb(allowed), {
+      decision: 'manual',
+      reviewRevision: 1,
+      acknowledgeStaleTxDate: true,
+      edits: [{ ...BASE_EDIT, txDate: '2020-01-01' }],
+    });
+    expect(confirmed.status).toBe(200);
+    expect(allowed.binds).toHaveLength(1);
+  });
+
   it('accepts after-filed trades per the tested soft rule', async () => {
     const captured = { binds: [] as unknown[][] };
     const { status } = await postReview(fakeDb(captured), {
