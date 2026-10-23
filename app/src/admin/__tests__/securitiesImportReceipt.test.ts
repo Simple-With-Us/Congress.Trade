@@ -129,4 +129,26 @@ describe('POST /securities/import — import receipts', () => {
     expect(body.refs).toBe(0);
     expect(body.dropped).toEqual({});
   });
+
+  it('reports an unsupported peer schema version without rejecting the batch', async () => {
+    const { db } = fakeDb();
+    const res = await importReq(
+      { origin: 'app-b', schemaVersion: 99, refs: [{ ticker: 'AAPL' }] },
+      { ...env, DB: db },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; refs: number; schemaVersion: number | null };
+    expect(body.ok).toBe(true);
+    expect(body.refs).toBe(1);
+    expect(body.schemaVersion).toBe(99);
+  });
+
+  it('treats a payload without schemaVersion as legacy version 1', async () => {
+    const { db } = fakeDb();
+    const res = await importReq({ origin: 'app-b', refs: [{ ticker: 'AAPL' }] }, { ...env, DB: db });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; schemaVersion: number | null };
+    expect(body.ok).toBe(true);
+    expect(body.schemaVersion).toBe(1);
+  });
 });
