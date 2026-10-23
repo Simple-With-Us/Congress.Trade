@@ -2611,15 +2611,6 @@ function renderOwnerHealthBanner(pipeline, admin) {
         ' · recover via POST /admin/recover-pipeline' + '</span>' +
     '</div>');
   }
-  // st_peer_prices — ST → CT EOD/current price drain
-  var stp = checks.filter(function (c) { return c.id === 'st_peer_prices'; })[0];
-  if (stp && (stp.status === 'critical' || stp.status === 'stalled')) {
-    rows.push('<div class="owner-alert-row owner-alert-orange">' +
-      '<span class="owner-alert-icon">⏱</span>' +
-      '<span class="owner-alert-title">ST → CT PEER PRICES — EOD/current refresh stalled</span>' +
-      '<span class="owner-alert-detail">' + esc(stp.detail || '') + '</span>' +
-    '</div>');
-  }
   // fmp_latency — silent probe or high 429 rate
   var fp = checks.filter(function (c) { return c.id === 'fmp_latency'; })[0];
   if (fp && (fp.status === 'critical' || fp.status === 'stalled' || fp.status === 'degraded')) {
