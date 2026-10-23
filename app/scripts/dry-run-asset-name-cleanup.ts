@@ -89,17 +89,21 @@ export function assertReadOnly(sql: string): string {
 // Transport
 // ---------------------------------------------------------------------------
 
-function arg(name: string, fallback?: string): string | undefined {
+export function arg(name: string, fallback?: string): string | undefined {
   const index = Deno.args.indexOf(`--${name}`);
   if (index === -1) return fallback;
   return Deno.args[index + 1] ?? fallback;
 }
 
-function flag(name: string): boolean {
+export function flag(name: string): boolean {
   return Deno.args.includes(`--${name}`);
 }
 
-async function adminToken(): Promise<string> {
+/** Browser User-Agent: the edge serves a managed challenge to unrecognised agents. */
+export const BROWSER_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+export async function adminToken(): Promise<string> {
   const inline = Deno.env.get('CT_ADMIN_TOKEN')?.trim();
   if (inline) return inline;
   const path = Deno.env.get('CT_ADMIN_TOKEN_FILE')?.trim();
@@ -124,9 +128,7 @@ async function query<T>(base: string, token: string, sql: string): Promise<T[]> 
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        // The edge serves a managed challenge to unrecognised agents.
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'User-Agent': BROWSER_UA,
       },
       body,
     });

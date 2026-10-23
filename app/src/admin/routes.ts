@@ -119,6 +119,7 @@ import { buildPremiumRoster, localPremiumCounts } from './premiumRoster.ts';
 import { getLogoDisplay, setLogoDisplay } from '../shared/settings.ts';
 import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
+import { normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
 import {
   MEMBER_FILER_MERGES,
   MEMBER_NAME_ALIASES,
@@ -1057,17 +1058,9 @@ type ValidatedEditedTx = EditedTx & {
   txDate: string;
   owner: 'self' | 'spouse' | 'joint' | 'dependent' | null;
   txType: TxType;
+  /** Set when confident OCR normalization rewrote assetName; stored in cleaning_note. */
+  cleaningNote: string | null;
 };
-
-function validCalendarDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const [year, month, day] = value.split('-').map(Number);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  return parsed.getUTCFullYear() === year
-    && parsed.getUTCMonth() === month - 1
-    && parsed.getUTCDate() === day
-    && value <= new Date().toISOString().slice(0, 10);
-}
 
 function validateReviewEdits(
   rawEdits: unknown[],
@@ -1094,11 +1087,14 @@ function validateReviewEdits(
       return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
     }
     const txDate = typeof e.txDate === 'string' ? e.txDate.trim() : '';
-    if (!validCalendarDate(txDate)) {
-      return { error: `edits[${index}].txDate must be a valid non-future YYYY-MM-DD date` };
+    // Shared strict check: real calendar date, not future, not older than
+    // the lookback below the filing date.  After-filed trades stay allowed
+    // per the tested rule (signature-stamp skew).  Same contract the machine
+    // path enforces in scoreFields.
+    const dateCheck = validateTxDate(txDate, { filedDate });
+    if (dateCheck.ok === false) {
+      return { error: `edits[${index}].txDate ${dateCheck.message}` };
     }
-    // Allow a disclosed trade a few days after Clerk's filed_date (signature
-    // stamp).  Still refuse dates that have not happened yet.
     const ticker = typeof e.ticker === 'string' ? e.ticker.trim() : '';
     const assetName = typeof e.assetName === 'string' ? e.assetName.trim() : '';
     if (!ticker && !assetName) {
@@ -1106,6 +1102,21 @@ function validateReviewEdits(
     }
     if (assetName.length > 500) {
       return { error: `edits[${index}].assetName must be at most 500 characters` };
+    }
+    // Confident OCR fixes apply silently with an audit note; unfixable garble
+    // is a 400 naming the row, never a saved wrong name.
+    let finalAssetName = assetName;
+    let cleaningNote: string | null = null;
+    if (assetName) {
+      const ocr = normalizeOcrAssetName(assetName);
+      const holds = [...ocr.dateHolds, ...ocr.nameHolds];
+      if (holds.length > 0) {
+        return { error: `edits[${index}].assetName looks like unreadable OCR text (${holds.join('; ')}); fix the name and retry` };
+      }
+      if (ocr.changed) {
+        finalAssetName = ocr.name;
+        cleaningNote = `normalized OCR artifacts: ${ocr.notes.join('; ')}`;
+      }
     }
     if (ticker && (ticker.length > 20 || !/^[A-Za-z0-9.^$-]+$/.test(ticker))) {
       return { error: `edits[${index}].ticker is invalid` };
@@ -1131,7 +1142,7 @@ function validateReviewEdits(
         return { error: `edits[${index}].${field} must be a boolean` };
       }
     }
-    edits.push({ ...e, ticker: ticker || null, assetName, txDate, owner: owner as any, txType });
+    edits.push({ ...e, ticker: ticker || null, assetName: finalAssetName, txDate, owner: owner as any, txType, cleaningNote });
   }
   return { edits };
 }
@@ -3023,6 +3034,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         firstSeenAt: filing.first_seen_at ?? null,
         filedDate: filing.filed_date ?? null,
         estValue: estimateTransactionValue(e.amountMin, e.amountMax),
+        cleaningNote: e.cleaningNote ?? null,
       });
     }
 
@@ -3045,7 +3057,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              tx_type, amount_min, amount_max, is_option, cap_gains_over_200,
              raw_text, asset_type_name, filing_status, subholding, location,
              description, supplemental_text, row_key, confidence, source,
-             created_at, cursor_seq, first_seen_at, filed_date, est_value
+             created_at, cursor_seq, first_seen_at, filed_date, est_value,
+             cleaning_note
            ) SELECT
              json_extract(value, '$.id'), json_extract(value, '$.docId'),
              json_extract(value, '$.filerId'), json_extract(value, '$.txDate'),
@@ -3060,7 +3073,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              json_extract(value, '$.rowKey'), json_extract(value, '$.confidence'),
              json_extract(value, '$.source'), json_extract(value, '$.createdAt'), NULL,
              json_extract(value, '$.firstSeenAt'), json_extract(value, '$.filedDate'),
-             json_extract(value, '$.estValue')
+             json_extract(value, '$.estValue'), json_extract(value, '$.cleaningNote')
            FROM json_each(?)
            WHERE EXISTS (
              SELECT 1 FROM review_queue
@@ -3189,6 +3202,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           editCount: edits.length,
           inserted: insertedCount,
           deprecatedPredecessors,
+          ocrNormalized: edits.filter((e) => e.cleaningNote).length,
           reviewCreatedAt: review.created_at,
         },
         createdAt: nowIso,
@@ -10614,32 +10628,74 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   r.post('/clean-asset-names', async (c) => {
     // Note: D1 query limit is 100 statements or results.
-    // We will page through transactions and clean the asset names.
-    const { offset = 0, limit = 500 } = c.req.query() as { offset?: string | number, limit?: string | number };
-    const numOffset = Number(offset);
-    const numLimit = Number(limit);
-    
-    const rows = await all<{ id: string, asset_name: string, ticker: string | null }>(
+    // We page through transactions and clean the asset names.  Query params:
+    //   offset, limit — paging window (defaults 0, 500).
+    //   docId — restrict the sweep to one filing (CT-2441 Sep 17 cleanup).
+    //   dryRun=1 — report proposed changes without writing.
+    // Each row runs the shared OCR normalizer first (confident fixes only),
+    // then the long-standing cleanAssetString pass.  OCR-fixed rows record an
+    // audit fragment in cleaning_note; unfixable rows are reported as held
+    // and left untouched.  Re-running is a no-op once names are fixed.
+    const query = c.req.query() as { offset?: string | number; limit?: string | number; docId?: string; dryRun?: string };
+    const numOffset = Number(query.offset ?? 0);
+    const numLimit = Math.max(1, Math.min(2000, Number(query.limit ?? 500)));
+    const docId = typeof query.docId === 'string' && query.docId ? query.docId : null;
+    const dryRun = query.dryRun === '1';
+
+    const rows = await all<{ id: string; asset_name: string; ticker: string | null; cleaning_note: string | null }>(
       c.env.DB,
-      'SELECT id, asset_name, ticker FROM transactions ORDER BY created_at DESC LIMIT ? OFFSET ?',
-      [numLimit, numOffset]
+      docId
+        ? 'SELECT id, asset_name, ticker, cleaning_note FROM transactions WHERE doc_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?'
+        : 'SELECT id, asset_name, ticker, cleaning_note FROM transactions ORDER BY created_at DESC LIMIT ? OFFSET ?',
+      docId ? [docId, numLimit, numOffset] : [numLimit, numOffset],
     );
-    
-    if (rows.length === 0) return c.json({ ok: true, cleaned: 0, done: true });
+
+    if (rows.length === 0) return c.json({ ok: true, cleaned: 0, ocrCleaned: 0, held: 0, done: true });
+
+    const { cleanAssetString } = await import('../extraction/nameNormalizer.ts');
 
     let cleaned = 0;
-    const { cleanAssetString } = await import('../extraction/nameNormalizer.ts');
+    let ocrCleaned = 0;
+    const heldRows: Array<{ id: string; before: string; reasons: string[] }> = [];
+    const proposed: Array<{ id: string; before: string; after: string; note: string | null }> = [];
 
     // Run sequentially to avoid D1 limits on concurrent batches
     for (const row of rows) {
-      const cleanName = cleanAssetString(row.asset_name, row.ticker);
-      if (cleanName !== row.asset_name) {
-        await c.env.DB.prepare('UPDATE transactions SET asset_name = ? WHERE id = ?').bind(cleanName, row.id).run();
-        cleaned++;
+      const stored = row.asset_name ?? '';
+      const ocr = normalizeOcrAssetName(stored);
+      const holds = [...ocr.dateHolds, ...ocr.nameHolds];
+      if (holds.length > 0) {
+        heldRows.push({ id: row.id, before: stored, reasons: holds });
+        continue;
       }
+      const cleanName = cleanAssetString(ocr.name, row.ticker);
+      if (cleanName === stored) continue;
+      const note = ocr.changed ? `normalized OCR artifacts: ${ocr.notes.join('; ')}` : null;
+      if (dryRun) {
+        proposed.push({ id: row.id, before: stored, after: cleanName, note });
+        continue;
+      }
+      const mergedNote = note
+        ? (row.cleaning_note ? `${row.cleaning_note}; ${note}` : note)
+        : row.cleaning_note;
+      await c.env.DB.prepare(
+        'UPDATE transactions SET asset_name = ?, cleaning_note = ? WHERE id = ?',
+      ).bind(cleanName, mergedNote, row.id).run();
+      cleaned += 1;
+      if (ocr.changed) ocrCleaned += 1;
     }
 
-    return c.json({ ok: true, cleaned, processed: rows.length, nextOffset: numOffset + numLimit, done: rows.length < numLimit });
+    return c.json({
+      ok: true,
+      cleaned,
+      ocrCleaned,
+      processed: rows.length,
+      nextOffset: numOffset + numLimit,
+      done: rows.length < numLimit,
+      held: heldRows.length,
+      heldSample: heldRows.slice(0, 20),
+      ...(dryRun ? { proposed: proposed.slice(0, 100), proposedCount: proposed.length } : {}),
+    });
   });
 
   r.post('/securities/standardize-names', async (c) => {
