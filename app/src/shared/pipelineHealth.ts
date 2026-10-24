@@ -43,6 +43,11 @@ import {
   formatIngestionDeadLetterIdentityDetail,
   type FailedIngestionOutboxIdentity,
 } from '../ingestion/failedOutboxIdentity.ts';
+import { readPipelineStallHours } from '../ingestion/pipelineStallConfig.ts';
+import {
+  collectStPeerPricesMetrics,
+  stPeerPricesMetricsToCheck,
+} from '../prices/stPeerPricesHealth.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -1128,12 +1133,27 @@ export function evaluatePipelineSignals(
     checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD probe uncollected', value: null });
   } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
     // Missing, or a legacy unproxied direct-GET record (dropped 2026-10-16).
-    checks.push({
-      id: 'senate_efd',
-      status: 'unknown',
-      detail: 'Senate eFD proxied probe not yet run',
-      value: null,
-    });
+    // A legacy datacenter 401/403 while the residential proxy is live is the
+    // expected direct-egress block (#2837): say so as `degraded`.  Anything
+    // else legacy is ignored (unknown) until the proxied probe overwrites it.
+    const legacy = s.senateEfd.probe;
+    const residentialLive = Boolean(s.residentialProxyConfigured && s.residentialProxy?.probe?.ok);
+    if (legacy && !legacy.ok && residentialLive && (legacy.status === 403 || legacy.status === 401)) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe blocked from datacenter (HTTP ${legacy.status})`
+          + ` — expected; Senate ingest uses the residential proxy (live).`,
+        value: legacy.status,
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'unknown',
+        detail: 'Senate eFD proxied probe not yet run',
+        value: null,
+      });
+    }
   } else {
     const probe = s.senateEfd.probe;
     const checkedMs = Date.parse(probe.checkedAt);
@@ -1795,5 +1815,18 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   };
 
   const evaluated = evaluatePipelineSignals(signals, nowMs, DEFAULT_PIPELINE_THRESHOLDS, schedule);
-  return { ...evaluated, reviewQueue };
+
+  const stPeerMetrics = await collectStPeerPricesMetrics(
+    env,
+    now,
+    readPipelineStallHours(env, 'st_peer_prices'),
+  );
+  const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
+  const checks = [...evaluated.checks, stPeerCheck];
+  let status: PipelineStatus = 'ok';
+  for (const c of checks) {
+    status = worstStatus(status, c.status);
+  }
+
+  return { ...evaluated, status, checks, reviewQueue };
 }

@@ -238,9 +238,13 @@ struct AdminPanelView: View {
             pollingSection
             extractionSection
             haltSection
+            marketDataSection
+            senateEgressSection
             freshnessSection
             deadLetterSection
             latencySection
+            infrastructureSection
+            uncoveredPipelineChecksSection
 
             Section {
                 NavigationLink(value: AdminRoute.reviewQueue) {
@@ -274,8 +278,8 @@ struct AdminPanelView: View {
     private var pollingSection: some View {
         Section("Polling Ages") {
             ForEach(["house", "senate", "executive"], id: \.self) { chamber in
-                let check = store.pollingHealth?.checks.first { $0.id == "polling_\(chamber)" }
-                    ?? store.publicHealth?.pipeline?.check(id: "polling_\(chamber)")
+                let check = store.publicHealth?.pipeline?.check(id: "polling_\(chamber)")
+                    ?? store.pollingHealth?.checks.first { $0.id == "polling_\(chamber)" }
                 AdminStatusRow(title: chamber.capitalized, check: check.map(PipelineCheckProxy.init))
             }
         }
@@ -326,12 +330,73 @@ struct AdminPanelView: View {
     }
 
     @ViewBuilder
+    private var marketDataSection: some View {
+        let pipeline = store.publicHealth?.pipeline
+        Section("Market Data") {
+            AdminStatusRow(
+                title: "Price / S&P Freshness",
+                check: pipeline?.check(id: "price_freshness").map(PipelineCheckProxy.init)
+            )
+            AdminStatusRow(
+                title: "ST → CT Peer Prices",
+                check: pipeline?.check(id: "st_peer_prices").map(PipelineCheckProxy.init)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var senateEgressSection: some View {
+        let pipeline = store.publicHealth?.pipeline
+        Section("Senate Egress") {
+            AdminStatusRow(title: "Residential Proxy", check: pipeline?.check(id: "senate_relay").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Senate eFD Direct", check: pipeline?.check(id: "senate_efd").map(PipelineCheckProxy.init))
+        }
+    }
+
+    @ViewBuilder
     private var freshnessSection: some View {
         Section("Data Freshness") {
             AdminStatusRow(
                 title: "Latest Transaction",
                 check: store.publicHealth?.pipeline?.check(id: "data_freshness").map(PipelineCheckProxy.init)
             )
+        }
+    }
+
+    @ViewBuilder
+    private var infrastructureSection: some View {
+        let pipeline = store.publicHealth?.pipeline
+        Section("Infrastructure") {
+            AdminStatusRow(title: "Ingestion Backlog", check: pipeline?.check(id: "ingestion_backlog").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Cron Deadline", check: pipeline?.check(id: "cron_deadline").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Delivery Quarantine", check: pipeline?.check(id: "delivery_quarantine").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Filing Skips", check: pipeline?.check(id: "filing_skips").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "FMP Latency", check: pipeline?.check(id: "fmp_latency").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Review Integrity", check: pipeline?.check(id: "review_resolution_integrity").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Stranded Filings", check: pipeline?.check(id: "stranded_filings").map(PipelineCheckProxy.init))
+        }
+    }
+
+    private static let pinnedPipelineCheckIds: Set<String> = [
+        "polling_house", "polling_senate", "polling_executive", "polling_liveness",
+        "extraction_provider", "extraction_backlog", "autopilot_halt",
+        "data_freshness", "price_freshness", "st_peer_prices",
+        "ingestion_dead_letter", "ingestion_backlog", "cron_deadline", "delivery_quarantine",
+        "filing_skips", "fmp_latency", "review_resolution_integrity", "stranded_filings",
+        "latency_probes", "senate_relay", "senate_efd",
+    ]
+
+    @ViewBuilder
+    private var uncoveredPipelineChecksSection: some View {
+        let checks = store.publicHealth?.pipeline?.checks.filter {
+            !Self.pinnedPipelineCheckIds.contains($0.id)
+        } ?? []
+        if !checks.isEmpty {
+            Section("Other Pipeline Checks") {
+                ForEach(checks, id: \.id) { check in
+                    AdminStatusRow(title: AdminPipelineCheckTitles.title(for: check.id), check: PipelineCheckProxy(check))
+                }
+            }
         }
     }
 
@@ -352,6 +417,19 @@ struct AdminPanelView: View {
                 title: "Latency Probes",
                 check: store.publicHealth?.pipeline?.check(id: "latency_probes").map(PipelineCheckProxy.init)
             )
+        }
+    }
+}
+
+private enum AdminPipelineCheckTitles {
+    static func title(for id: String) -> String {
+        switch id {
+        case "st_peer_prices": return "ST → CT Peer Prices"
+        case "price_freshness": return "Price / S&P Freshness"
+        case "senate_efd": return "Senate eFD Direct"
+        case "senate_relay": return "Residential Proxy"
+        default:
+            return id.split(separator: "_").map { $0.capitalized }.joined(separator: " ")
         }
     }
 }

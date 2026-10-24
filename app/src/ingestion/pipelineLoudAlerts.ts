@@ -24,14 +24,7 @@ import {
   securitiesRefHasEnrichmentUnavailableColumns,
 } from '../enrichment/service.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
-import {
-  isTailOnlyPeerPriceBacklog,
-  readCorpusLatestPriceDate,
-  stPeerPriceNeverPricedPendingFromSql,
-  stPeerPricePendingBindParams,
-  stPeerPricePendingBindsForSubqueries,
-  stPeerPricePendingFromSql,
-} from '../prices/peerPricePending.ts';
+import { evaluateStPeerPricesStall } from '../prices/stPeerPricesHealth.ts';
 import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
@@ -43,10 +36,20 @@ import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 
+import {
+  DEFAULT_PIPELINE_STALL_HOURS,
+  DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS,
+  readPipelineStallHours,
+  stallWindowMs,
+} from './pipelineStallConfig.ts';
+
+export {
+  DEFAULT_PIPELINE_STALL_HOURS,
+  DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS,
+  readPipelineStallHours,
+} from './pipelineStallConfig.ts';
+
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
-export const DEFAULT_PIPELINE_STALL_HOURS = 6;
-/** Default stall window for ST peer enrichment backlog (daily + hourly drain). */
-export const DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS = 30;
 /** Re-alert the same doc+stage after this window if it fails terminally again. */
 export const TERMINAL_REDUP_WINDOW_MS = 7 * 24 * 3_600_000;
 
@@ -67,6 +70,10 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   'polling_house',
   'polling_senate',
   'polling_executive',
+  // Evaluated by the dedicated st_peer_prices condition above (same rules via
+  // evaluateStPeerPricesStall).  Without this skip the generic loop raises a
+  // second health_st_peer_prices episode, so every stall and recovery pages twice.
+  'st_peer_prices',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -81,36 +88,6 @@ interface DedupeEpisode {
 
 interface StallEpisode extends DedupeEpisode {
   active: boolean;
-}
-
-function envGet(key: string): string | undefined {
-  try {
-    return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(key);
-  } catch {
-    return undefined;
-  }
-}
-
-function stallEnvKeyForCondition(condition: string): string {
-  return `CT_PIPELINE_STALL_HOURS_${condition.replace(/[^a-z0-9]+/gi, '_').toUpperCase()}`;
-}
-
-export function readPipelineStallHours(env: Env, condition?: string): number {
-  if (condition) {
-    const specific = Number.parseInt(envGet(stallEnvKeyForCondition(condition)) ?? '', 10);
-    if (Number.isFinite(specific) && specific >= 1) return Math.min(specific, 168);
-  }
-  const fromEnv = envGet('CT_PIPELINE_STALL_HOURS');
-  const n = Number.parseInt(fromEnv ?? '', 10);
-  if (Number.isFinite(n) && n >= 1) return Math.min(n, 168);
-  const legacy = Number.parseInt(envGet('CT_OCR_STALL_HOURS') ?? '', 10);
-  if (Number.isFinite(legacy) && legacy >= 1) return Math.min(legacy, 168);
-  if (condition === 'st_peer_enrichment') return DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS;
-  return DEFAULT_PIPELINE_STALL_HOURS;
-}
-
-function stallWindowMs(hours: number): number {
-  return hours * 3_600_000;
 }
 
 async function readEpisode(env: Env, kvKey: string): Promise<DedupeEpisode | null> {
@@ -392,13 +369,6 @@ function idleBeyondThreshold(lastAt: string | null, now: Date, thresholdMs: numb
   return !Number.isFinite(lastMs) || now.getTime() - lastMs >= thresholdMs;
 }
 
-/** Pending-set progress: ignore tickers that have never been price-checked. */
-function pendingPriceProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
-  const lastMs = lastAt ? Date.parse(lastAt) : NaN;
-  if (!Number.isFinite(lastMs)) return false;
-  return now.getTime() - lastMs >= thresholdMs;
-}
-
 /** Pending-set enrichment progress: ignore tickers never attempted on the backlog. */
 function pendingEnrichmentProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
@@ -515,67 +485,7 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
 }
 
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
-  if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
-    return { stalled: false, detail: 'ST peer prices not configured', skip: true };
-  }
-  const pendingParams = stPeerPricePendingBindParams(now);
-  const pendingFrom = stPeerPricePendingFromSql();
-  const neverPricedFrom = stPeerPriceNeverPricedPendingFromSql();
-  const countAndProgressBinds = stPeerPricePendingBindsForSubqueries(pendingParams, 3);
-  let pending = 0;
-  let neverPricedPending = 0;
-  let lastChecked: string | null = null;
-  let pendingSample: string[] = [];
-  try {
-    const row = await get<{ n: number; never_n: number; last_at: string | null }>(
-      env.DB,
-      `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${pendingFrom}) AS n,
-         (SELECT COUNT(DISTINCT t.ticker) ${neverPricedFrom}) AS never_n,
-         (SELECT MAX(sr.price_checked_at) ${pendingFrom}) AS last_at`,
-      countAndProgressBinds,
-    );
-    pending = Number(row?.n ?? 0);
-    neverPricedPending = Number(row?.never_n ?? 0);
-    lastChecked = row?.last_at ?? null;
-  } catch {
-    return { stalled: false, detail: 'price stall query failed', skip: true };
-  }
-  if (pending <= 0) {
-    return { stalled: false, detail: 'ST price refresh moving' };
-  }
-  const corpusLatest = await readCorpusLatestPriceDate(env);
-  if (isTailOnlyPeerPriceBacklog(pending, neverPricedPending, corpusLatest, now)) {
-    return {
-      stalled: false,
-      detail:
-        `ST price tail backlog only (${pending} pending); corpus EOD current through ${pendingParams.freshThrough}`,
-    };
-  }
-  if (!pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
-    return { stalled: false, detail: 'ST price refresh moving' };
-  }
-  try {
-    const names = await all<{ ticker: string }>(
-      env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${pendingFrom}
-       ORDER BY t.ticker ASC
-       LIMIT 10`,
-      stPeerPricePendingBindsForSubqueries(pendingParams, 1),
-    );
-    pendingSample = names.map((r) => r.ticker);
-  } catch {
-    /* sample is optional detail */
-  }
-  const stallHours = readPipelineStallHours(env, 'st_peer_prices');
-  const sampleSuffix = pendingSample.length
-    ? `; pending sample: ${pendingSample.join(', ')}`
-    : '';
-  const detail =
-    `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
-    sampleSuffix +
-    `; no price_checked_at progress on pending tickers in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
-  return { stalled: true, detail };
+  return evaluateStPeerPricesStall(env, now, thresholdMs);
 }
 
 async function loadFreshnessSnapshot(env: Env): Promise<FreshnessSnapshot | null> {
