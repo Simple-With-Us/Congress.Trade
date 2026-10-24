@@ -120,13 +120,28 @@ describe('refreshSenateEfdProxyProbe', () => {
     expect(calls).toHaveLength(4);
   });
 
-  it('re-dials right away after a relay-down record (no eFD hop was spent)', async () => {
+  it('dials on relay recovery when eFD has never been dialed', async () => {
     const { env } = memEnv();
     const calls: string[] = [];
     const fetchImpl = efdFetch(() => new Response('', { status: 302 }), calls);
     await refreshSenateEfdProxyProbe(env, now, { proxyUrl: PROXY, proxyReachable: false }, fetchImpl);
     await refreshSenateEfdProxyProbe(env, new Date(now.getTime() + 60_000), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(2);
-    expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'ok' });
+    expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'ok', lastDialedAt: new Date(now.getTime() + 60_000).toISOString() });
+  });
+
+  it('a relay flap does not reset the 15-minute throttle', async () => {
+    const { env } = memEnv();
+    const calls: string[] = [];
+    const fetchImpl = efdFetch(() => new Response('', { status: 302 }), calls);
+    const at = (min: number) => new Date(now.getTime() + min * 60_000);
+    await refreshSenateEfdProxyProbe(env, at(0), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    expect(calls).toHaveLength(2);
+    await refreshSenateEfdProxyProbe(env, at(2), { proxyUrl: PROXY, proxyReachable: false }, fetchImpl);
+    expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'degraded', lastDialedAt: at(0).toISOString() });
+    await refreshSenateEfdProxyProbe(env, at(4), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    expect(calls).toHaveLength(2);
+    await refreshSenateEfdProxyProbe(env, at(15), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    expect(calls).toHaveLength(4);
   });
 });

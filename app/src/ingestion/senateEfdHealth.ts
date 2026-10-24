@@ -32,8 +32,10 @@ export interface SenateEfdProbeRecord {
   state?: SenateEfdProbeState;
   /** Which step decided the state, e.g. `POST /search/home/`. */
   step?: string | null;
-  /** True when eFD was actually dialed (drives the 15-minute throttle). */
+  /** True when eFD was actually dialed by the probe that wrote this record. */
   dialed?: boolean;
+  /** When eFD was last dialed (carried across relay-down records; drives the 15-minute throttle). */
+  lastDialedAt?: string | null;
 }
 
 export async function readSenateEfdProbe(env: Env): Promise<SenateEfdProbeRecord | null> {

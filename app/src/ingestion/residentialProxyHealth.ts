@@ -278,7 +278,8 @@ function classifyEfdFailure(
 /**
  * Refresh the cached eFD probe.  Relay down/unconfigured is recorded every
  * call without dialing eFD; otherwise eFD is dialed at most once per
- * SENATE_EFD_PROXY_PROBE_INTERVAL_MS.
+ * SENATE_EFD_PROXY_PROBE_INTERVAL_MS, measured from the last real dial
+ * (`lastDialedAt`), so relay flaps cannot shorten the interval.
  */
 export async function refreshSenateEfdProxyProbe(
   env: Env,
@@ -287,25 +288,26 @@ export async function refreshSenateEfdProxyProbe(
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<void> {
   const checkedAt = now.toISOString();
-  if (!ctx.proxyUrl) {
-    await persistSenateEfdProbe(env, {
-      ok: false, state: 'degraded', status: null, checkedAt, egress: 'proxy', dialed: false,
-      step: null, error: 'residential proxy not configured',
-    });
-    return;
-  }
-  if (!ctx.proxyReachable) {
-    await persistSenateEfdProbe(env, {
-      ok: false, state: 'degraded', status: null, checkedAt, egress: 'proxy', dialed: false,
-      step: null, error: 'residential proxy down',
-    });
-    return;
-  }
   const last = await readSenateEfdProbe(env);
-  const lastMs = last?.dialed ? Date.parse(last.checkedAt) : NaN;
-  if (Number.isFinite(lastMs) && now.getTime() - lastMs < SENATE_EFD_PROXY_PROBE_INTERVAL_MS) return;
+  // Relay-down records must not reset the throttle: carry the last real dial
+  // forward so a flapping relay cannot trigger an eFD hit on every recovery.
+  const lastDialedAt = last?.lastDialedAt ?? (last?.dialed ? last.checkedAt : null);
+  if (!ctx.proxyUrl || !ctx.proxyReachable) {
+    await persistSenateEfdProbe(env, {
+      ok: false, state: 'degraded', status: null, checkedAt, egress: 'proxy', dialed: false, lastDialedAt,
+      step: null, error: ctx.proxyUrl ? 'residential proxy down' : 'residential proxy not configured',
+    });
+    return;
+  }
+  const lastMs = lastDialedAt ? Date.parse(lastDialedAt) : NaN;
+  if (Number.isFinite(lastMs) && now.getTime() - lastMs < SENATE_EFD_PROXY_PROBE_INTERVAL_MS) {
+    // Throttled.  If the stored record is a relay-down one, the relay is back
+    // but eFD state is unknown until the next allowed dial, so leave it as is
+    // (pipelineHealth keeps reporting degraded for at most 15 minutes).
+    return;
+  }
   const rec = await probeSenateEfdThroughProxy(ctx.proxyUrl, fetchImpl, SENATE_EFD_PROBE_TIMEOUT_MS, now);
-  await persistSenateEfdProbe(env, rec);
+  await persistSenateEfdProbe(env, { ...rec, lastDialedAt: checkedAt });
 }
 
 export async function readResidentialProxyProbe(env: Env): Promise<ResidentialProxyProbeRecord | null> {
