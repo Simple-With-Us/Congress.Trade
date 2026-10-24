@@ -49,9 +49,9 @@ function seedTicker(
     enrichedAt?: string | null;
     latestPriceDate?: string | null;
     /** 0=priced, 1=not-found stage 1 (7d recheck), 2=not-found stage 2 (30d
-     *  recheck), 3=stalled listing (30d recheck) — see PRICE_UNAVAILABLE_* in
-     *  prices/service.ts. */
-    priceUnavailable?: 0 | 1 | 2 | 3;
+     *  recheck), 3=stalled listing (30d recheck), 4=not covered by ST
+     *  (unconditional exclusion) — see PRICE_UNAVAILABLE_* in prices/service.ts. */
+    priceUnavailable?: 0 | 1 | 2 | 3 | 4;
     priceCheckedAt?: string | null;
   } = {},
 ): void {
@@ -121,6 +121,16 @@ describe('marketPending — done:true is reachable', () => {
     seedTicker('STALLED', { priceUnavailable: 3, priceCheckedAt: now });
 
     expect((await marketPending(env)).prices).toBe(0);
+  });
+
+  it('excludes stage-4 (not covered by ST) tickers unconditionally, regardless of price_checked_at age', async () => {
+    // CT-2443: even with an ancient price_checked_at (every TTL long expired),
+    // a stage-4 ticker never counts as pending again — only the daily
+    // not-covered re-check retries it.
+    seedTicker('NOTCOV', { priceUnavailable: 4, priceCheckedAt: '2000-01-01T00:00:00Z' });
+    seedTicker('MISS'); // control: still pending
+
+    expect((await marketPending(env)).prices).toBe(1);
   });
 
   it('a stage-2 ticker checked between the 7-day and 30-day cutoffs still counts as pending only once truly expired', async () => {
@@ -196,6 +206,23 @@ describe('selectTickersNeedingPrices — no perpetual re-selection', () => {
     seedTicker('CUR', { latestPriceDate: lastTradingDay() });
     seedPriceRows('CUR', [lastTradingDay()]);
     expect(await selectTickersNeedingPrices(env, 50)).toEqual([]);
+  });
+
+  it('never selects a stage-4 ticker, even with an ancient price_checked_at', async () => {
+    // CT-2443: unconditional exclusion — no TTL expiry re-queues stage 4.
+    seedTicker('NOTCOV', {
+      latestPriceDate: null,
+      priceUnavailable: 4,
+      priceCheckedAt: '2000-01-01T00:00:00Z',
+    });
+    seedTicker('NEVER', { latestPriceDate: null }); // control: still selected
+
+    const picked = await selectTickersNeedingPrices(env, 50, {
+      freshThrough: FRESH_THROUGH,
+      unavailableCutoff: CUTOFF,
+      firstUnavailableCutoff: FIRST_CUTOFF,
+    });
+    expect(picked).toEqual(['NEVER']);
   });
 
   it('returns eligible tickers OLDEST-traded first (cursor_seq ASC), not newest-first', async () => {

@@ -1950,6 +1950,9 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
     let status: String?
     let detail: String?
     let value: Double?
+    /// `st_peer_prices` check only: tickers ST cannot price (CT-2443). Nil for
+    /// scalar values and older servers that do not send it.
+    let notCovered: Int?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1957,6 +1960,11 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
         status = FailSoftJSON.string(c, .status)
         detail = FailSoftJSON.string(c, .detail)
         value = FailSoftJSON.double(c, .value)
+        if let nested = try? c.nestedContainer(keyedBy: CheckValueKeys.self, forKey: .value) {
+            notCovered = FailSoftJSON.int(nested, .notCovered)
+        } else {
+            notCovered = nil
+        }
     }
 
     var statusLabel: String {
@@ -1972,6 +1980,10 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case id, status, detail, value
+    }
+
+    private enum CheckValueKeys: String, CodingKey {
+        case notCovered
     }
 }
 
