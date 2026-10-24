@@ -115,4 +115,16 @@ describe('POST /clean-asset-names — OCR cleanup', () => {
     expect(res.status).toBe(200);
     expect(captured.selectParams).toEqual([[500, 0]]);
   });
+
+  it('clamps out-of-range paging and ignores a blank docId', async () => {
+    const captured = { runs: [] as unknown[][], selects: [] as string[], selectParams: [] as unknown[][] };
+    const res = await app.request(
+      '/clean-asset-names?dryRun=1&limit=99999&offset=-5&docId=',
+      { method: 'POST', headers: AUTH },
+      env(fakeDb(captured)),
+    );
+    expect(res.status).toBe(200);
+    expect(captured.selectParams).toEqual([[2000, 0]]);
+    expect(captured.selects.some((sql) => /WHERE doc_id/i.test(sql))).toBe(false);
+  });
 });

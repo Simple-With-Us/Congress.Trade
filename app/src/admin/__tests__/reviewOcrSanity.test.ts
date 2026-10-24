@@ -136,6 +136,47 @@ describe('POST /review/:docId — OCR sanity', () => {
     expect(rows[0].cleaningNote).toContain('normalized OCR artifacts');
   });
 
+  it('fingerprints the submitted (pre-OCR) name in the row key', async () => {
+    // The machine path keys rows on the pre-OCR name while storing the
+    // repaired one; the admin path must do the same, or an OCR fix would
+    // change the row identity behind the (doc_id, source, row_key) index.
+    const garbled = { binds: [] as unknown[][] };
+    const clean = { binds: [] as unknown[][] };
+    const a = await postReview(fakeDb(garbled), {
+      decision: 'manual',
+      reviewRevision: 1,
+      edits: [{ ...BASE_EDIT, assetName: 'Uber Technolo1des Inc.' }],
+    });
+    const b = await postReview(fakeDb(clean), {
+      decision: 'manual',
+      reviewRevision: 1,
+      edits: [{ ...BASE_EDIT, assetName: 'Uber Technologies Inc.' }],
+    });
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    type Row = { assetName: string; rowKey: string };
+    const [garbledRow] = JSON.parse(String(garbled.binds[0][0])) as Row[];
+    const [cleanRow] = JSON.parse(String(clean.binds[0][0])) as Row[];
+    expect(garbledRow.assetName).toBe('Uber Technologies Inc.');
+    expect(cleanRow.assetName).toBe('Uber Technologies Inc.');
+    expect(garbledRow.rowKey).not.toBe(cleanRow.rowKey);
+  });
+
+  it('rejects a non-boolean acknowledgeStaleTxDate', async () => {
+    for (const value of ['true', 1, null]) {
+      const captured = { binds: [] as unknown[][] };
+      const { status, body } = await postReview(fakeDb(captured), {
+        decision: 'manual',
+        reviewRevision: 1,
+        acknowledgeStaleTxDate: value,
+        edits: [{ ...BASE_EDIT, txDate: '2020-01-01' }],
+      });
+      expect(status).toBe(400);
+      expect(String(body.error)).toContain('acknowledgeStaleTxDate must be a boolean');
+      expect(captured.binds).toHaveLength(0);
+    }
+  });
+
   it('confirms a genuinely old trade only with acknowledgeStaleTxDate', async () => {
     const denied = { binds: [] as unknown[][] };
     const refused = await postReview(fakeDb(denied), {

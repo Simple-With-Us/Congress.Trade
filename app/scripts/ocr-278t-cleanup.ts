@@ -45,7 +45,7 @@
  */
 
 import { normalizeOcrAssetName } from '../src/extraction/ocrSanity.ts';
-import { adminToken, arg, BROWSER_UA, flag } from './dry-run-asset-name-cleanup.ts';
+import { adminToken, arg, assertSafeBase, BROWSER_UA, flag } from './dry-run-asset-name-cleanup.ts';
 
 const DEFAULT_DOC = 'E-2026-donald-j-trump-09-17-2026-278t';
 
@@ -217,26 +217,6 @@ function parseApplyPage(text: string): ApplyPage {
   };
 }
 
-/**
- * The admin token must never travel to a plaintext or unexpected origin: a
- * typo'd --base would otherwise receive full write credentials.  HTTPS
- * everywhere, with plain HTTP allowed only for loopback dev targets.
- */
-function assertSafeApplyBase(base: string): string {
-  let url: URL;
-  try {
-    url = new URL(base);
-  } catch {
-    throw new Error(`refusing --apply against malformed base '${base}'`);
-  }
-  const host = url.hostname.toLowerCase();
-  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-  if (url.protocol !== 'https:' && !loopback) {
-    throw new Error(`refusing --apply against non-HTTPS base '${base}' (https or localhost only)`);
-  }
-  return base;
-}
-
 async function applyPage(
   base: string,
   token: string,
@@ -262,7 +242,8 @@ async function applyPage(
 }
 
 async function apply(base: string, docs: string[], allRows: boolean, pageSize: number): Promise<void> {
-  assertSafeApplyBase(base);
+  // Shared origin guard (same one the dry-run script's debug-sql path uses).
+  assertSafeBase(base);
   const token = await adminToken();
   const targets = allRows ? [null] : docs;
   if (!allRows && docs.length === 0) throw new Error('--apply needs --doc <id> or --all-rows');

@@ -252,8 +252,14 @@ export function fixOcrDateToken(token: string): { iso: string; fixed: string } |
   return { iso, fixed: winner.fixed };
 }
 
-/** Two slashes (M/D/Y shape) or one slash with a glued digit run. */
-const DATE_SHAPED_TOKEN_RE = /^\S{1,4}\/\S{1,8}\/\S{2,5}$|^\d{1,3}\/\d{4,8}$/;
+/**
+ * Two slashes (M/D/Y shape), one slash with a glued digit run, or a month/year
+ * token written with the same confusables fixOcrDateToken maps ("O8/2O3O").
+ * The month/year branch needs at least one real digit in the year so a short
+ * all-letter token is never read as a date.
+ */
+const DATE_SHAPED_TOKEN_RE =
+  /^\S{1,4}\/\S{1,8}\/\S{2,5}$|^\d{1,3}\/\d{4,8}$|^[\dlI|SOoB]{1,2}\/(?=[\dlI|SOoB]*\d)[\dlI|SOoB]{4}$/;
 
 const MONTH_NAMES = new Set([
   'jan', 'january', 'feb', 'february', 'mar', 'march', 'apr', 'april',

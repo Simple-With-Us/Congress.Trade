@@ -1032,6 +1032,17 @@ export const ReviewEditItemSchema = z.object({
   confidence: z.number().nullable().optional(),
 });
 
+// Query params for POST /clean-asset-names.  Every field falls back to its
+// default on bad input (.catch) instead of failing the request: paging that
+// arrives as "abc" must run the default window, never reach SQL as NaN or 500.
+// Unknown params are stripped (Zod's default), like any other query string.
+export const CleanAssetNamesQuerySchema = z.object({
+  offset: z.coerce.number().min(0).catch(0),
+  limit: z.coerce.number().catch(500),
+  docId: z.string().min(1).nullable().catch(null),
+  dryRun: z.literal('1').transform(() => true).catch(false),
+});
+
 interface EditedTx {
   filerId?: string | null;
   txDate?: string | null;
@@ -1060,6 +1071,13 @@ type ValidatedEditedTx = EditedTx & {
   txType: TxType;
   /** Set when confident OCR normalization rewrote assetName; stored in cleaning_note. */
   cleaningNote: string | null;
+  /**
+   * The submitted name before OCR normalization.  The row key fingerprints
+   * this, not the repaired assetName, so an OCR fix never changes a row's
+   * identity: the machine path (buildTransaction) likewise fingerprints the
+   * pre-OCR name while storing the repaired one.
+   */
+  rowKeyAssetName: string;
 };
 
 function validateReviewEdits(
@@ -1153,7 +1171,16 @@ function validateReviewEdits(
         return { error: `edits[${index}].${field} must be a boolean` };
       }
     }
-    edits.push({ ...e, ticker: ticker || null, assetName: finalAssetName, txDate, owner, txType, cleaningNote });
+    edits.push({
+      ...e,
+      ticker: ticker || null,
+      assetName: finalAssetName,
+      rowKeyAssetName: assetName,
+      txDate,
+      owner,
+      txType,
+      cleaningNote,
+    });
   }
   return { edits };
 }
@@ -2917,6 +2944,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       );
     }
     const rawEdits = editsParse.data;
+    // The stale-date bypass is new in CT-2441, so it is schema-checked here:
+    // only a real boolean is accepted ("true", 1 and the like are a 400).
+    const ackStaleParse = z.boolean().optional().safeParse(body.acknowledgeStaleTxDate);
+    if (!ackStaleParse.success) {
+      return c.json({ error: 'acknowledgeStaleTxDate must be a boolean when present' }, 400);
+    }
+    const acknowledgeStaleTxDate = ackStaleParse.data === true;
     if (rawEdits.length === 0) {
       return c.json(
         {
@@ -2987,7 +3021,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     const filingFilerId = filing?.filer_id ?? null;
     const validated = validateReviewEdits(confirmedEdits, filing.filed_date, {
-      acknowledgeStaleTxDate: body.acknowledgeStaleTxDate === true,
+      acknowledgeStaleTxDate,
     });
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
@@ -3002,7 +3036,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       const rowKey = transactionRowKey(source, rowIndex, {
         txDate: e.txDate,
         owner: e.owner,
-        assetName: e.assetName ?? '',
+        // Pre-OCR name: an OCR repair must not change the row's identity
+        // (the (doc_id, source, row_key) unique index and completeLiveSet).
+        assetName: e.rowKeyAssetName,
         ticker: e.ticker ?? null,
         assetType: e.assetType ?? null,
         assetTypeName,
@@ -3217,7 +3253,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           inserted: insertedCount,
           deprecatedPredecessors,
           ocrNormalized: edits.filter((e) => e.cleaningNote).length,
-          acknowledgedStaleTxDate: body.acknowledgeStaleTxDate === true,
+          acknowledgedStaleTxDate: acknowledgeStaleTxDate,
           reviewCreatedAt: review.created_at,
         },
         createdAt: nowIso,
@@ -10653,15 +10689,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // then the long-standing cleanAssetString pass.  OCR-fixed rows record an
     // audit fragment in cleaning_note; unfixable rows are reported as held
     // and left untouched.  Re-running is a no-op once names are fixed.
-    const query = c.req.query() as { offset?: string | number; limit?: string | number; docId?: string; dryRun?: string };
-    // Non-numeric paging input falls back to the defaults instead of reaching
-    // SQL as NaN (a malformed request must not become a 500).
-    const rawOffset = Number(query.offset ?? 0);
-    const rawLimit = Number(query.limit ?? 500);
-    const numOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
-    const numLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(2000, Math.floor(rawLimit))) : 500;
-    const docId = typeof query.docId === 'string' && query.docId ? query.docId : null;
-    const dryRun = query.dryRun === '1';
+    // Parsed, not cast; bad paging input falls back to the defaults (see the
+    // schema), so a malformed request never reaches SQL as NaN.
+    const query = CleanAssetNamesQuerySchema.parse(c.req.query());
+    const numOffset = Math.floor(query.offset);
+    const numLimit = Math.max(1, Math.min(2000, Math.floor(query.limit)));
+    const docId = query.docId;
+    const dryRun = query.dryRun;
 
     const rows = await all<{ id: string; asset_name: string; ticker: string | null; cleaning_note: string | null }>(
       c.env.DB,

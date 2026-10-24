@@ -127,6 +127,25 @@ describe('normalizeEmbeddedOcrDates', () => {
     expect(result.holdReasons).toHaveLength(1);
   });
 
+  it('fixes a confusable month/year maturity instead of letting it through', () => {
+    const result = normalizeEmbeddedOcrDates('Tarrant Rev Bie PTC 5.00 % Due O8/2O3O');
+    expect(result.text).toBe('Tarrant Rev Bie PTC 5.00 % Due 08/2030');
+    expect(result.changed).toBe(true);
+    expect(result.holdReasons).toHaveLength(0);
+  });
+
+  it('holds a confusable month/year maturity with an impossible month', () => {
+    const result = normalizeEmbeddedOcrDates('Muni Bond Due lS/2O3O');
+    expect(result.changed).toBe(false);
+    expect(result.holdReasons.join(' ')).toContain("unreadable embedded date 'lS/2O3O'");
+  });
+
+  it('never reads an all-letter slash token as a month/year date', () => {
+    const result = normalizeEmbeddedOcrDates('Holdings S/BOSS Trust');
+    expect(result.changed).toBe(false);
+    expect(result.holdReasons).toHaveLength(0);
+  });
+
   it('holds an unreadable month in a maturity window', () => {
     const result = normalizeEmbeddedOcrDates('Rev Bie PTC 5.00 % Duo Sao 1 2028');
     expect(result.holdReasons.join(' ')).toContain("unreadable month 'Sao'");
