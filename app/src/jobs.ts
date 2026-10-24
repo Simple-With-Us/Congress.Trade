@@ -486,8 +486,10 @@ export async function maybeRunDailyMarketDataJobs(
     console.warn('current-price backfill failed:', (err as Error).message);
   }
   let priceRefreshFailed = false;
+  let priceRefreshAttemptedAllPending = false;
   try {
     const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });
+    priceRefreshAttemptedAllPending = r.attemptedAllPending;
     errors.push(...r.errors);
     share.prices = r.sharePrices;
     share.spx = r.shareSpx;
@@ -532,9 +534,11 @@ export async function maybeRunDailyMarketDataJobs(
       console.warn('not-covered recheck failed:', (err as Error).message);
     }
   }
-  // Skip the sweep when today's refresh failed or aborted: pending tickers
-  // were not attempted, so a stale price_checked_at says nothing about ST.
-  if (!priceRefreshFailed) {
+  // Sweep only when today's refresh attempted the whole pending set without
+  // failing.  A failed, aborted, budget-truncated, or unconfigured refresh
+  // leaves tickers unattempted, so a stale price_checked_at says nothing
+  // about ST.
+  if (!priceRefreshFailed && priceRefreshAttemptedAllPending) {
     try {
       const swept = await markStuckPeerPriceTickersNotCovered(env, now);
       if (swept.marked > 0) {

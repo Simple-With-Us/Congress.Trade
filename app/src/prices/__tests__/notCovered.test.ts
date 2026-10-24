@@ -156,6 +156,30 @@ describe('stage 4 excluded from the st_peer_prices pending SQL regardless of pri
   });
 });
 
+describe('runPriceRefresh attemptedAllPending (sweep gate)', () => {
+  it('is true when the whole pending set fit in the budget', async () => {
+    for (const t of ['PA', 'PB', 'PC']) seedTrade(`t-g-${t}`, t);
+    const r = await runPriceRefresh(env, { max: 10 });
+    expect(r.aborted).toBe(false);
+    expect(r.attemptedAllPending).toBe(true);
+  });
+
+  it('is false when the budget truncated the pending selection', async () => {
+    for (const t of ['PA', 'PB', 'PC', 'PD']) seedTrade(`t-g-${t}`, t);
+    const r = await runPriceRefresh(env, { max: 3 });
+    expect(r.attemptedAllPending).toBe(false);
+  });
+
+  it('is false on a fatal provider abort', async () => {
+    for (const t of ['PA', 'PB']) seedTrade(`t-g-${t}`, t);
+    h.errors.set('PA', 'PEER_HTTP_401');
+    h.errors.set('PB', 'PEER_HTTP_401');
+    const r = await runPriceRefresh(env, { max: 10 });
+    expect(r.aborted).toBe(true);
+    expect(r.attemptedAllPending).toBe(false);
+  });
+});
+
 describe('rule (a): repeat miss terminates at stage 4', () => {
   it('stage 2 + empty -> 4 with a st_not_covered reason', async () => {
     seedTrade('t-a1', 'REPEAT');

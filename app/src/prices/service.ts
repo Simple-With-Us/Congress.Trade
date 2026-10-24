@@ -348,6 +348,11 @@ export interface PriceRefreshResult {
    *  so a 429 aborts rather than walking the full ticker list.  Remaining
    *  un-attempted tickers are left untouched for the next run. */
   aborted: boolean;
+  /** True only when this run selected the WHOLE pending set (selection was not
+   *  truncated by the budget) and walked it without aborting.  The CT-2443
+   *  not-covered sweep relies on it:  a stale price_checked_at only means "ST
+   *  had a chance and gave nothing" when the ticker was actually attempted. */
+  attemptedAllPending: boolean;
   /** What THIS run actually fetched (for the App B outbound push — our delta only). */
   shareSpx: Close[];
   sharePrices: Array<{ ticker: string; closes: Close[]; currentPrice: number; currentPriceDate: string }>;
@@ -647,6 +652,7 @@ export async function runPriceRefresh(
     dryRun,
     errors: [],
     aborted: false,
+    attemptedAllPending: false,
     shareSpx: [],
     sharePrices: [],
   };
@@ -732,6 +738,7 @@ export async function runPriceRefresh(
     // pending-set clock never moves (CT-2409).
     await ensurePriceUnavailableReasonColumn(env.DB);
   }
+  const selectBudget = budget;
   const tickers = result.aborted ? [] : await selectTickersNeedingPrices(env, budget);
   for (const ticker of tickers) {
     if (opts.signal?.aborted) {
@@ -830,6 +837,8 @@ export async function runPriceRefresh(
     result.tradesComputed += trades.length;
   }
 
+  result.attemptedAllPending =
+    !result.aborted && !dryRun && selectBudget > 0 && tickers.length < selectBudget;
   result.fmpCalls = calls;
   result.budgetRemaining = Math.max(0, budget);
   return result;
