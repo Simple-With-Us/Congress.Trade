@@ -595,3 +595,61 @@ describe('runPriceRefresh — missing price_unavailable_reason column (CT-2409)'
     expect(h.eodCalls.some((c) => c.symbol === 'AAPL')).toBe(false);
   });
 });
+
+describe('runPriceRefresh — rotating cursor for the bounded catch-up (CT-2445)', () => {
+  it('walks the pending set in pages, resuming after the last ticker reached', async () => {
+    seedTrade('r1', 'ERRA', '2026-01-05');
+    seedTrade('r2', 'ERRB', '2026-01-06');
+    seedTrade('r3', 'TAIL', '2026-01-07');
+    // Non-fatal per-ticker errors leave ERRA/ERRB pending at the head of the FIFO.
+    h.errors.set('ERRA', 'PEER_HTTP_500');
+    h.errors.set('ERRB', 'PEER_HTTP_500');
+    h.responses.set('TAIL', [{ date: daysAgo(1), close: 10 }]);
+
+    // max 3 = 1 S&P call + 2 tickers.
+    const first = await runPriceRefresh(env, { max: 3, afterCursorSeq: null });
+    expect(h.eodCalls.filter((c) => c.symbol !== 'SPY').map((c) => c.symbol)).toEqual(['ERRA', 'ERRB']);
+    expect(first.reachedEndOfPending).toBe(false);
+    expect(first.lastCursorSeq).not.toBeNull();
+
+    h.eodCalls.length = 0;
+    const second = await runPriceRefresh(env, { max: 3, afterCursorSeq: first.lastCursorSeq });
+    expect(h.eodCalls.filter((c) => c.symbol !== 'SPY').map((c) => c.symbol)).toEqual(['TAIL']);
+    expect(second.reachedEndOfPending).toBe(true);
+    expect(srRow('TAIL')?.current_price).toBe(10);
+    // A resumed walk skipped the head, so it never attempted the whole set.
+    expect(second.attemptedAllPending).toBe(false);
+  });
+
+  it('resumes at the ticker a fatal error stopped on, not past it', async () => {
+    seedTrade('r1', 'OK1', '2026-01-05');
+    seedTrade('r2', 'FATAL', '2026-01-06');
+    seedTrade('r3', 'LATER', '2026-01-07');
+    h.responses.set('OK1', [{ date: daysAgo(1), close: 5 }]);
+    h.errors.set('FATAL', 'PEER_HTTP_429');
+
+    const res = await runPriceRefresh(env, { max: 10 });
+    expect(res.aborted).toBe(true);
+    expect(res.reachedEndOfPending).toBe(false);
+    // OK1 finished;  FATAL did not, so the resume point stays at OK1.
+    const okSeq = db
+      .prepare('SELECT MAX(cursor_seq) AS s FROM transactions WHERE ticker = ?')
+      .get('OK1') as { s: number };
+    expect(res.lastCursorSeq).toBe(okSeq.s);
+
+    // The next run starts with FATAL, then LATER.
+    h.errors.delete('FATAL');
+    h.eodCalls.length = 0;
+    await runPriceRefresh(env, { max: 10, afterCursorSeq: res.lastCursorSeq });
+    expect(h.eodCalls.filter((c) => c.symbol !== 'SPY').map((c) => c.symbol)).toEqual(['FATAL', 'LATER']);
+  });
+
+  it('keeps no resume point when the first ticker hits a fatal error', async () => {
+    seedTrade('r1', 'FATAL', '2026-01-05');
+    h.errors.set('FATAL', 'PEER_HTTP_429');
+
+    const res = await runPriceRefresh(env, { max: 10, afterCursorSeq: null });
+    expect(res.aborted).toBe(true);
+    expect(res.lastCursorSeq).toBeNull();
+  });
+});
