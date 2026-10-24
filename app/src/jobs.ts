@@ -13,7 +13,7 @@
 import type { Env } from './shared/types.ts';
 import { run, all } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
-import { buildPriceRefreshClient, runPriceRefresh } from './prices/service.ts';
+import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
 import {
   markStuckPeerPriceTickersNotCovered,
   recheckNotCoveredPeerPrices,
@@ -26,11 +26,21 @@ import { runCommitteeSync } from './enrichment/committeeSync.ts';
 import { runIdentitySync } from './enrichment/identitySync.ts';
 import { runBulkSnapshot } from './export/snapshot.ts';
 import { resolveSecrets } from './secrets/infisical.ts';
+import { ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from './shared/pace.ts';
 import { readSetting } from './settings/settingsService.ts';
 import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
 import { backfillCurrentPricesFromEod } from './prices/service.ts';
-import { peerPricesNeedCatchUp } from './prices/peerPriceCatchUp.ts';
+import {
+  PEER_PRICE_CATCHUP_MAX_PER_MINUTE,
+  PEER_PRICE_CATCHUP_MAX_TICKERS,
+  parsePeerPriceCatchUpState,
+  peerPriceCatchUpAfterRun,
+  peerPriceCatchUpGate,
+  peerPriceSnapshotNeedsCatchUp,
+  readPeerPricePending,
+  type PeerPriceCatchUpState,
+} from './prices/peerPriceCatchUp.ts';
 // NOTE: runHouseReconciler (./ingestion/houseReconciler) is intentionally not
 // imported here yet -- it is reserved for future scheduled-job wiring. Importing
 // it unused would trip noUnusedLocals (enabled in this PR).
@@ -59,8 +69,14 @@ import { peerPricesNeedCatchUp } from './prices/peerPriceCatchUp.ts';
  * for tests; dedicated lane crons ignore it.
  */
 const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
-/** Set only after a non-aborted price catch-up.  Separate from the lane stamp. */
-const PRICE_CATCHUP_KEY = LANE_KEY_PREFIX + 'market-data-price-catchup';
+/**
+ * Price catch-up state (CT-2445), a JSON PeerPriceCatchUpState keyed to the
+ * freshThrough session rather than the UTC day.  Replaces the once-per-UTC-day
+ * `jobs:daily:lastok:market-data-price-catchup` stamp.
+ */
+const PRICE_CATCHUP_STATE_KEY = 'jobs:market-data:price-catchup-state';
+/** Survives a long weekend plus a holiday;  a stale session resets anyway. */
+const PRICE_CATCHUP_STATE_TTL_S = 5 * 86_400;
 /** Set only after the daily not-covered re-check runs (CT-2443). At most once per UTC day. */
 const NOT_COVERED_RECHECK_KEY = LANE_KEY_PREFIX + 'market-data-not-covered-recheck';
 const SUBCLAIM_KEY_PREFIX = 'jobs:daily:lastdate:';
@@ -450,6 +466,110 @@ export async function runNotCoveredRecheckLane(
 }
 
 /**
+ * Bounded peer-price catch-up (CT-2445), run from the stamped market-data
+ * fast path on every hourly tick.  Order matters for cost:  the KV-only gate
+ * (session cap, no-progress park, spacing) runs before any D1 read, and the
+ * run is claimed in KV before any Socratic.Trade call, so a throw or a 429
+ * abort still waits out the spacing instead of retrying every tick.
+ *
+ * Each run walks at most PEER_PRICE_CATCHUP_MAX_TICKERS pending tickers from a
+ * rotating cursor, paced at PEER_PRICE_CATCHUP_MAX_PER_MINUTE.  The
+ * not-covered sweep is NOT run here:  it needs a full-set walk, which only the
+ * daily refresh does.  not_covered tickers stay excluded by the pending SQL.
+ */
+export async function maybeRunPeerPriceCatchUp(
+  env: Env,
+  now: Date,
+  opts: { signal?: AbortSignal } = {},
+): Promise<DailyLaneStatus> {
+  const freshThrough = lastTradingDay(now);
+  let state: PeerPriceCatchUpState;
+  try {
+    state = parsePeerPriceCatchUpState(await env.CONFIG_KV.get(PRICE_CATCHUP_STATE_KEY), freshThrough);
+  } catch {
+    return 'stamped'; // no KV → skip rather than risk an unbounded hourly walk
+  }
+  if (peerPriceCatchUpGate(state, now) !== 'ok') return 'stamped';
+  const before = await readPeerPricePending(env, now);
+  if (!before || !peerPriceSnapshotNeedsCatchUp(before)) return 'stamped';
+  if (await dailyBudgetExceeded(env, 'price catch-up')) return 'budget';
+
+  const claimed: PeerPriceCatchUpState = { ...state, runs: state.runs + 1, lastRunAt: now.toISOString() };
+  try {
+    await env.CONFIG_KV.put(PRICE_CATCHUP_STATE_KEY, JSON.stringify(claimed), {
+      expirationTtl: PRICE_CATCHUP_STATE_TTL_S,
+    });
+  } catch {
+    return 'stamped'; // could not record the run → do not run it
+  }
+  console.warn(
+    `market-data lane stamped but peer prices are still behind (${before.pending} pending, ` +
+      `run ${claimed.runs} for ${freshThrough}); retrying price refresh`,
+  );
+  // The EOD -> current-price repair scans securities_ref and only fills NULLs,
+  // so run it on the first catch-up of a session, not on every run (Kody #2859).
+  if (claimed.runs === 1) {
+    try {
+      await backfillCurrentPricesFromEod(env);
+    } catch (err) {
+      console.warn('current-price backfill failed:', (err as Error).message);
+    }
+  }
+
+  let status: DailyLaneStatus = 'ran';
+  let lastCursorSeq: number | null = null;
+  let reachedEndOfPending = false;
+  try {
+    const configured = stPeerMaxPerMinute(await resolveSecrets(env, [...ST_PEER_PACE_SECRET_NAMES]));
+    const maxPerMinute = Math.min(configured ?? PEER_PRICE_CATCHUP_MAX_PER_MINUTE, PEER_PRICE_CATCHUP_MAX_PER_MINUTE);
+    const r = await runPriceRefresh(env, {
+      // +1 for the S&P call, which spends from the same budget.
+      max: PEER_PRICE_CATCHUP_MAX_TICKERS + 1,
+      maxPerMinute,
+      signal: opts.signal,
+      afterCursorSeq: claimed.cursorSeq,
+    });
+    lastCursorSeq = r.lastCursorSeq ?? null;
+    reachedEndOfPending = r.reachedEndOfPending === true;
+    if (r.aborted) status = 'error';
+  } catch (err) {
+    console.warn('daily price refresh failed:', (err as Error).message);
+    status = 'error';
+  }
+
+  // Same clock as the before-count, so both count the same pending set even
+  // when the run crosses the midnight-ET rollover.
+  const after = await readPeerPricePending(env, now);
+  const next = peerPriceCatchUpAfterRun(claimed, {
+    pendingBefore: before.pending,
+    pendingAfter: after?.pending ?? null,
+    lastCursorSeq,
+    reachedEndOfPending,
+    failed: status === 'error',
+  });
+  console.log(
+    'price catch-up:',
+    JSON.stringify({
+      freshThrough,
+      run: next.runs,
+      status,
+      pendingBefore: before.pending,
+      pendingAfter: after?.pending ?? null,
+      noProgressRuns: next.noProgressRuns,
+      cursorSeq: next.cursorSeq,
+    }),
+  );
+  try {
+    await env.CONFIG_KV.put(PRICE_CATCHUP_STATE_KEY, JSON.stringify(next), {
+      expirationTtl: PRICE_CATCHUP_STATE_TTL_S,
+    });
+  } catch (err) {
+    console.warn('price catch-up state write failed:', (err as Error).message);
+  }
+  return status;
+}
+
+/**
  * Daily lane 1 — market data: a TIME-SLICED enrichment pass (so a deep
  * backlog can never starve the rest of the lane), then price refresh, peer
  * share, usage telemetry, FMP-tier alert, and the cross-app freshness
@@ -475,29 +595,9 @@ export async function maybeRunDailyMarketDataJobs(
     await maybeRunNotCoveredRecheck(env, now, day, { signal: opts.signal });
     // The 2026-10-14/15 price refresh threw on a missing column and the
     // catch below still stamped the day, so the corpus sat one session
-    // behind until the next UTC date.  One successful catch-up per UTC day
-    // is enough: lastTradingDay ignores weekday holidays, so a corpus that
-    // can never reach that date must not re-walk the universe every hour.
-    if (await laneHasSucceeded(env, PRICE_CATCHUP_KEY, day)) return 'stamped';
-    if (!(await peerPricesNeedCatchUp(env, now))) return 'stamped';
-    if (await dailyBudgetExceeded(env, 'price catch-up')) return 'budget';
-    console.warn(
-      'market-data lane stamped but peer prices are still behind; retrying price refresh',
-    );
-    try {
-      await backfillCurrentPricesFromEod(env);
-    } catch (err) {
-      console.warn('current-price backfill failed:', (err as Error).message);
-    }
-    try {
-      const caughtUp = await runPriceRefresh(env, { signal: opts.signal });
-      if (caughtUp.aborted) return 'error';
-    } catch (err) {
-      console.warn('daily price refresh failed:', (err as Error).message);
-      return 'error';
-    }
-    await markLaneOk(env, PRICE_CATCHUP_KEY, day);
-    return 'ran';
+    // behind until the next UTC date.  The catch-up retries that, bounded per
+    // freshThrough session (CT-2445):  see maybeRunPeerPriceCatchUp.
+    return await maybeRunPeerPriceCatchUp(env, now, { signal: opts.signal });
   }
 
   // Opt-in D1 spend guard (D1_ROW_BUDGET_ENFORCE): if today's metered D1 rows
@@ -517,7 +617,7 @@ export async function maybeRunDailyMarketDataJobs(
   // falling back to the wrangler.toml env var whenever a name isn't set in Infisical)
   // so the whole daily run only pays for one resolveSecrets round trip.
   const secrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
     'USAGE_MONITOR_ENABLED',
     'USAGE_MONITOR_INGEST_URL',
@@ -529,8 +629,9 @@ export async function maybeRunDailyMarketDataJobs(
     'PUSHOVER_APP_TOKEN',
     'PUSHOVER_USER_KEY',
   ]);
-  // Local burst limit for the Socratic profile walk. Not an FMP budget.
-  const maxPerMinute = parseInt(secrets.FMP_MAX_PER_MINUTE || '', 10) || undefined;
+  // Local burst limit for Socratic.Trade peer reads (profiles and prices).  Not
+  // an FMP budget.  The shared ST pacer clamps it to ST_PEER_SAFE_MAX_PER_MINUTE.
+  const maxPerMinute = stPeerMaxPerMinute(secrets);
   // SEC EDGAR has its own fair-access pacer — configurable via
   // EDGAR_MAX_PER_MINUTE, unset = no pacing.
   const edgarMaxPerMinute = parseInt(secrets.EDGAR_MAX_PER_MINUTE || '', 10) || undefined;
@@ -671,10 +772,10 @@ export async function runHourlyEnrichmentSlice(
 ): Promise<HourlyEnrichmentResult> {
   const day = now.toISOString().slice(0, 10);
   const secrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
   ]);
-  const maxPerMinute = parseInt(secrets.FMP_MAX_PER_MINUTE || '', 10) || undefined;
+  const maxPerMinute = stPeerMaxPerMinute(secrets);
   const edgarMaxPerMinute = parseInt(secrets.EDGAR_MAX_PER_MINUTE || '', 10) || undefined;
   const max = Math.max(0, Math.min(opts.max ?? HOURLY_ENRICHMENT_SLICE_MAX, HOURLY_ENRICHMENT_SLICE_MAX));
   const empty: HourlyEnrichmentResult = {

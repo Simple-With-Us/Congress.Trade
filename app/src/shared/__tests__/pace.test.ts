@@ -1,8 +1,11 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
+  clampStPeerMaxPerMinute,
   createPacer,
-  getSharedFmpPacer,
-  __resetSharedFmpPacerForTests,
+  getSharedStPeerPacer,
+  ST_PEER_SAFE_MAX_PER_MINUTE,
+  stPeerMaxPerMinute,
+  __resetSharedStPeerPacerForTests,
   getSharedEdgarPacer,
   __resetSharedEdgarPacerForTests,
 } from '../pace.ts';
@@ -43,29 +46,70 @@ describe('createPacer', () => {
   });
 });
 
-describe('getSharedFmpPacer', () => {
-  beforeEach(() => __resetSharedFmpPacerForTests());
+describe('getSharedStPeerPacer', () => {
+  beforeEach(() => __resetSharedStPeerPacerForTests());
 
   it('returns the SAME instance across calls with the same maxPerMinute', () => {
-    const a = getSharedFmpPacer(285);
-    const b = getSharedFmpPacer(285);
+    const a = getSharedStPeerPacer(80);
+    const b = getSharedStPeerPacer(80);
     expect(a).toBe(b);
   });
 
   it('is a shared gate: two "consumers" drawing from it are spaced together', async () => {
-    // First init wins; a large-gap pacer proves both consumers share one clock.
-    const enrichmentPace = getSharedFmpPacer(600); // 100ms min gap
-    const pricesPace = getSharedFmpPacer(600); // same instance
-    const t0 = Date.now();
-    await enrichmentPace(); // immediate
-    await pricesPace(); // waits ~100ms because it shares enrichment's last-call time
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(90);
+    vi.useFakeTimers();
+    try {
+      const enrichmentPace = getSharedStPeerPacer(100); // 600ms min gap
+      const pricesPace = getSharedStPeerPacer(100); // same instance
+      let second = false;
+      await enrichmentPace(); // immediate
+      const p = pricesPace().then(() => { second = true; });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(second).toBe(false); // still waiting on the shared clock
+      await vi.advanceTimersByTimeAsync(200);
+      await p;
+      expect(second).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it('rebuilds the pacer if the maxPerMinute ceiling changes (Infisical-live semantics)', () => {
-    const first = getSharedFmpPacer(0); // no-op pacer memoized
-    const second = getSharedFmpPacer(600); // 600 differs from 0, so rebuilds
-    expect(second).not.toBe(first);
+  it('keeps ONE clock across caps, so a slower consumer cannot open a second gate (Kody #2859)', async () => {
+    vi.useFakeTimers();
+    try {
+      const catchUp = getSharedStPeerPacer(60); // 1000ms gap
+      const enrichment = getSharedStPeerPacer(100); // 600ms gap, same clock
+      expect(catchUp).not.toBe(enrichment);
+      let done = false;
+      await catchUp(); // immediate, reserves the next slot 1000ms out
+      const p = enrichment().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(900);
+      expect(done).toBe(false); // waits on the catch-up's reservation
+      await vi.advanceTimersByTimeAsync(150);
+      await p;
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clamps to the ST peerRead-safe ceiling, and paces at it when unset (CT-2445)', () => {
+    expect(clampStPeerMaxPerMinute(285)).toBe(ST_PEER_SAFE_MAX_PER_MINUTE);
+    expect(clampStPeerMaxPerMinute(undefined)).toBe(ST_PEER_SAFE_MAX_PER_MINUTE);
+    expect(clampStPeerMaxPerMinute(0)).toBe(ST_PEER_SAFE_MAX_PER_MINUTE);
+    expect(clampStPeerMaxPerMinute(60)).toBe(60);
+    // 285, 100 and unset all map to one cap, so they share one pacer instance.
+    const a = getSharedStPeerPacer(285);
+    expect(getSharedStPeerPacer(undefined)).toBe(a);
+    expect(getSharedStPeerPacer(100)).toBe(a);
+  });
+});
+
+describe('stPeerMaxPerMinute', () => {
+  it('prefers ST_PEER_MAX_PER_MINUTE and falls back to the deprecated FMP_MAX_PER_MINUTE', () => {
+    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: '90', FMP_MAX_PER_MINUTE: '285' })).toBe(90);
+    expect(stPeerMaxPerMinute({ FMP_MAX_PER_MINUTE: '285' })).toBe(285);
+    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: 'x', FMP_MAX_PER_MINUTE: '40' })).toBe(40);
+    expect(stPeerMaxPerMinute({})).toBeUndefined();
   });
 });
 
@@ -78,10 +122,10 @@ describe('getSharedEdgarPacer', () => {
     expect(a).toBe(b);
   });
 
-  it('paces calls independently of the FMP pacer (separate budget/clock)', async () => {
-    __resetSharedFmpPacerForTests();
+  it('paces calls independently of the ST peer pacer (separate budget/clock)', async () => {
+    __resetSharedStPeerPacerForTests();
     const edgarPace = getSharedEdgarPacer(600); // 100ms min gap
-    const fmpPace = getSharedFmpPacer(600); // 100ms min gap, but a DIFFERENT clock
+    const fmpPace = getSharedStPeerPacer(100); // its own clock (600ms gap)
     const t0 = Date.now();
     await edgarPace(); // immediate
     await new Promise((r) => setTimeout(r, 30));

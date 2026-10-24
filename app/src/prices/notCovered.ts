@@ -12,7 +12,7 @@
 import type { Env } from '../shared/types.ts';
 import { all, run } from '../shared/db.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
-import { getSharedFmpPacer } from '../shared/pace.ts';
+import { getSharedStPeerPacer } from '../shared/pace.ts';
 import type { PriceClient } from './fmp.ts';
 import {
   isFatalPriceProviderError,
@@ -169,7 +169,7 @@ export async function recheckNotCoveredPeerPrices(
   const now = opts.now ?? new Date();
   const nowIso = now.toISOString();
   const max = opts.max ?? NOT_COVERED_RECHECK_MAX_TICKERS;
-  const pace = opts.pace ?? getSharedFmpPacer();
+  const pace = opts.pace ?? getSharedStPeerPacer();
   const result: NotCoveredRecheckResult = {
     checked: 0,
     repriced: 0,
