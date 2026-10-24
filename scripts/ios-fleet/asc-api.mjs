@@ -43,7 +43,7 @@ import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
   isDriftTrain,
-  latestMarketingPatch
+  nextMarketingPatch
 } from "./version-plan.mjs";
 
 const INFISICAL_ASC_FOLDER = "/asc";
@@ -871,7 +871,9 @@ async function main() {
     }
     const trains = trainRes.trains;
 
-    const patch = latestMarketingPatch({ prefix, appStoreVersions, trains });
+    // Print one less than the next FREE patch, so the caller's P + 1 never
+    // lands on a patch a drift train already holds (see nextMarketingPatch).
+    const patch = nextMarketingPatch({ prefix, appStoreVersions, trains }) - 1;
     const drift = trains.filter((t) => isDriftTrain(t.version, t.builds, prefix)).map((t) => t.version);
 
     console.error(
@@ -1021,11 +1023,11 @@ async function main() {
       process.exit(2);
     }
     const storeVersionStrings = appStoreVersions.map((v) => v.versionString);
-    const patch = latestMarketingPatch({
+    const patch = nextMarketingPatch({
       prefix: "1.0",
       appStoreVersions: storeVersionStrings,
       trains: trainRes.trains
-    });
+    }) - 1;
 
     console.log(
       JSON.stringify(
