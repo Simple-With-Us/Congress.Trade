@@ -1,5 +1,16 @@
-import { all, batchPrepared, get, run } from '../shared/db.ts';
-import { APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS } from './migrations.ts';
+import {
+  all,
+  batchPrepared,
+  get,
+  isSqliteLockBusy,
+  run,
+  SQLITE_BUSY_TIMEOUT_MS,
+  SQLITE_BUSY_TIMEOUT_PRAGMA,
+} from '../shared/db.ts';
+import {
+  APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
+  PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS,
+} from './migrations.ts';
 
 export const MIGRATE_IDEMPOTENT_ERROR_PATTERNS: readonly RegExp[] = [
   /duplicate column name/i,
@@ -100,6 +111,32 @@ async function appleShadowRowsMissingFromLive(db: D1Database): Promise<number> {
 }
 
 /**
+ * Indexes later migrations put on apple_subscriptions (0093's status
+ * index).  The missing-live-table branch cannot read them from sqlite_master
+ * the way the rebuild branches do: the interrupted swap's DROP took them
+ * with the old table.
+ */
+const APPLE_SUBSCRIPTIONS_LATER_DEPENDENTS = PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS
+  .filter((sql) => /\bON\s+apple_subscriptions\b/i.test(sql))
+  .map(createIfNotExists);
+
+/**
+ * apple_subscriptions is gone and apple_subscriptions_new is empty: a
+ * pre-guard replay's INSERT copy failed and its DROP landed, so no copy of
+ * the rows is left.  Renaming the empty shadow would report 'recovered'
+ * over a ledger with no entitlements.
+ */
+class AppleSubscriptionsLedgerLostError extends Error {
+  constructor() {
+    super(
+      'apple_subscriptions is missing and apple_subscriptions_new is empty, so the Apple subscription ledger ' +
+        'is lost; restore apple_subscriptions from a backup (left apple_subscriptions_new unchanged)',
+    );
+    this.name = 'AppleSubscriptionsLedgerLostError';
+  }
+}
+
+/**
  * Guarded apply for migration 0091 (`apple_subscriptions.user_id` drops NOT
  * NULL).  Runs the rebuild only while PRAGMA table_info still shows user_id
  * NOT NULL, and as one write batch: CREATE / INSERT / DROP / RENAME /
@@ -113,7 +150,9 @@ async function appleShadowRowsMissingFromLive(db: D1Database): Promise<number> {
  * and the replay's 0081 CREATE TABLE IF NOT EXISTS then made the empty
  * table: the batch finishes that swap and keeps the shadow's rows.  When
  * the shadow holds rows the live table lacks and the live table is not
- * empty, it throws and changes nothing.
+ * empty, it throws and changes nothing.  When the live table is missing and
+ * the shadow is empty, it throws AppleSubscriptionsLedgerLostError and
+ * changes nothing.
  */
 export async function applyGuardedAppleSubscriptionsNullableUserMigration(
   db: D1Database,
@@ -124,10 +163,16 @@ export async function applyGuardedAppleSubscriptionsNullableUserMigration(
     // replay's 0081 CREATE TABLE IF NOT EXISTS makes an empty live table (the
     // shadow check below also recovers from that state).
     if (!(await sqliteTableExists(db, 'apple_subscriptions_new'))) return 'skipped';
+    if (!(await get<{ ok: number }>(db, 'SELECT 1 AS ok FROM apple_subscriptions_new LIMIT 1'))) {
+      throw new AppleSubscriptionsLedgerLostError();
+    }
     const renameAt = APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.findIndex((sql) =>
       /RENAME\s+TO\s+apple_subscriptions\b/i.test(sql)
     );
-    await runAtomicSchemaBatch(db, APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.slice(renameAt));
+    await runAtomicSchemaBatch(db, [
+      ...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.slice(renameAt),
+      ...APPLE_SUBSCRIPTIONS_LATER_DEPENDENTS,
+    ]);
     return 'recovered';
   }
   const columns = await all<{ name: string; notnull: number }>(db, 'PRAGMA table_info("apple_subscriptions")');
@@ -167,15 +212,29 @@ export async function applyGuardedAppleSubscriptionsNullableUserMigration(
   return 'applied';
 }
 
-/** One guarded 0091 attempt; returns the error message instead of throwing. */
-async function tryGuardedAppleSubscriptionsRebuild(db: D1Database): Promise<string | null> {
+interface GuardedRebuildFailure {
+  error: string;
+  /**
+   * True when the post-loop attempt must not run again: a lock error that
+   * already waited out the busy timeout (another attempt would stack a
+   * second full wait on the same connection), or a lost ledger (the retry
+   * would find the empty table the replay's 0081 CREATE makes and rebuild
+   * it as 'applied').
+   */
+  final: boolean;
+}
+
+/** One guarded 0091 attempt; returns the failure instead of throwing. */
+async function tryGuardedAppleSubscriptionsRebuild(db: D1Database): Promise<GuardedRebuildFailure | null> {
+  const startedMs = Date.now();
   try {
     await applyGuardedAppleSubscriptionsNullableUserMigration(db);
     return null;
   } catch (err) {
     const msg = (err as Error).message || String(err);
     console.error(`[schema-migrate] ${msg} on statement: ${APPLE_SUBSCRIPTIONS_GUARD_LABEL}`);
-    return msg;
+    const waitedOutBusyTimeout = isSqliteLockBusy(err) && Date.now() - startedMs >= SQLITE_BUSY_TIMEOUT_MS;
+    return { error: msg, final: waitedOutBusyTimeout || err instanceof AppleSubscriptionsLedgerLostError };
   }
 }
 
@@ -196,15 +255,16 @@ export async function executeAdminSchemaMigrations(
   const skipped: string[] = [];
   const failed: Array<{ sql: string; error: string }> = [];
 
-  await run(db, 'PRAGMA busy_timeout = 10000').catch(() => {});
+  await run(db, SQLITE_BUSY_TIMEOUT_PRAGMA).catch(() => {});
 
   // Pre-loop: heal prod drift when the table already exists (deploy-before-migrate).
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
   }
   // Pre-loop so a legacy table is rebuilt before the replay indexes it.  A
-  // failure here is retried post-loop, which decides what failed[] reports.
-  await tryGuardedAppleSubscriptionsRebuild(db);
+  // failure here is retried post-loop, which decides what failed[] reports,
+  // unless it is final (see GuardedRebuildFailure): then failed[] reports it.
+  const preLoopAppleFailure = await tryGuardedAppleSubscriptionsRebuild(db);
 
   for (const sql of statements) {
     let attempts = 0;
@@ -243,9 +303,11 @@ export async function executeAdminSchemaMigrations(
     await applyGuardedSecuritiesRefColumnMigrations(db);
   }
   // Post-loop: a clean DB gets apple_subscriptions from the 0081 CREATE in the loop.
-  const appleRebuildError = await tryGuardedAppleSubscriptionsRebuild(db);
-  if (appleRebuildError) {
-    failed.push({ sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: appleRebuildError });
+  const appleFailure = preLoopAppleFailure?.final
+    ? preLoopAppleFailure
+    : await tryGuardedAppleSubscriptionsRebuild(db);
+  if (appleFailure) {
+    failed.push({ sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: appleFailure.error });
   }
 
   return { applied, skipped, failed };

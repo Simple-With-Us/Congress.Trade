@@ -44,7 +44,7 @@
 #
 # This script never talks to production from a developer laptop.  It is a
 # host unit.  `--decide` / `--parse-active` / `--render-env` are offline and
-# used by tests.
+# used by tests.  `--render-env` prints every value but the hold flags redacted.
 
 set -euo pipefail
 
@@ -158,6 +158,21 @@ render_hold_env() {
   printf 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n'
 }
 
+# stdin: a rendered hold env.  stdout: the two hold flags in full and every
+# other line as KEY=<redacted>.  The env is the live app's, credentials
+# included, so --render-env never prints a value; write_hold_env does not
+# use this and hands docker the full values.
+redact_hold_env() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      CT_SKIP_LITESTREAM=* | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=* | '') printf '%s\n' "$line" ;;
+      *=*) printf '%s=<redacted>\n' "${line%%=*}" ;;
+      *) printf '<redacted>\n' ;;
+    esac
+  done
+}
+
 if [[ "${1:-}" == "--decide" ]]; then
   decide_overlap_action \
     "${DEPLOY_ACTIVE:-0}" \
@@ -176,7 +191,7 @@ if [[ "${1:-}" == "--parse-active" ]]; then
 fi
 
 if [[ "${1:-}" == "--render-env" ]]; then
-  render_hold_env
+  render_hold_env | redact_hold_env
   exit 0
 fi
 

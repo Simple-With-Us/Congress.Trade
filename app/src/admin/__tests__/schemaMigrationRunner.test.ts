@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createClient, type Client, type InStatement, type TransactionMode } from '@libsql/client';
 import {
   APPLE_SUBSCRIPTIONS_GUARD_LABEL,
@@ -17,6 +17,7 @@ import {
 } from '../migrations.ts';
 import { D1DatabaseShim } from '../../deno/shims.ts';
 import { markTickerPriceUnavailable } from '../../prices/service.ts';
+import { SQLITE_BUSY_TIMEOUT_MS, SQLITE_LOCK_BUSY_RETRY_DELAYS_MS } from '../../shared/db.ts';
 import type { Env } from '../../shared/types.ts';
 import {
   d1Database,
@@ -174,14 +175,16 @@ describe('schemaMigrationRunner', () => {
     afterEach(() => {
       for (const client of opened) client.close();
       opened = [];
+      vi.restoreAllMocks();
     });
 
     /**
      * `busyOn`: every statement whose SQL matches fails with SQLITE_BUSY, in
      * a batch too.  libsql reads the SQL inside its open transaction, so the
-     * failure lands mid-batch and the batch really rolls back.
+     * failure lands mid-batch and the batch really rolls back.  `onBusy` runs
+     * just before each of those failures.
      */
-    function openLib(busyOn?: RegExp): Lib {
+    function openLib(busyOn?: RegExp, onBusy?: () => void): Lib {
       const client = createClient({ url: 'file::memory:' });
       opened.push(client);
       const faulty = (stmt: InStatement): InStatement => {
@@ -189,6 +192,7 @@ describe('schemaMigrationRunner', () => {
         if (!busyOn?.test(sql)) return stmt;
         return {
           get sql(): string {
+            onBusy?.();
             throw new Error(BUSY);
           },
           args: [],
@@ -282,10 +286,35 @@ describe('schemaMigrationRunner', () => {
       expect(result.failed).toEqual([
         { sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: expect.stringContaining('SQLITE_BUSY') },
       ]);
+      // This BUSY returns at once, so the post-loop attempt still runs: two
+      // guarded attempts, each retried by withSqliteLockRetry.
+      expect(lib.batches()).toBe(2 * (SQLITE_LOCK_BUSY_RETRY_DELAYS_MS.length + 1));
       expect(await rows(lib.client)).toEqual(LIVE_ROWS);
       expect(await userIdNotNull(lib.client)).toBe(1);
       expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions']);
       expect(await names(lib.client, 'index')).toEqual(ALL_INDEXES);
+    });
+
+    it('does not run the post-loop attempt after a BUSY that waited out the busy timeout', async () => {
+      // Fake clock: each BUSY costs the full driver busy timeout, as a real
+      // cross-process lock conflict does.
+      let clock = Date.now();
+      vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      const lib = openLib(/CREATE TABLE IF NOT EXISTS apple_subscriptions_new/i, () => {
+        clock += SQLITE_BUSY_TIMEOUT_MS;
+      });
+      await seedLegacy(lib.client);
+
+      const result = await executeAdminSchemaMigrations(lib.d1, []);
+      // The pre-loop failure is the one reported, after one batch: neither
+      // withSqliteLockRetry nor the post-loop pass stacks a second wait.
+      expect(result.failed).toEqual([
+        { sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: expect.stringContaining('SQLITE_BUSY') },
+      ]);
+      expect(lib.batches()).toBe(1);
+      expect(await rows(lib.client)).toEqual(LIVE_ROWS);
+      expect(await userIdNotNull(lib.client)).toBe(1);
+      expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions']);
     });
 
     it('rolls the whole swap back when SQLITE_BUSY lands mid-batch', async () => {
@@ -402,6 +431,51 @@ describe('schemaMigrationRunner', () => {
       expect(await userIdNotNull(lib.client)).toBe(0);
       expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions']);
       expect(await names(lib.client, 'index')).toEqual(ALL_INDEXES);
+    });
+
+    it('restores the 0093 index when a standalone call finishes an interrupted rename', async () => {
+      // No replay runs after this call to re-add the index that the
+      // interrupted swap's DROP took with the old table.
+      const lib = openLib();
+      await exec(lib.client, [
+        SHADOW_DDL,
+        insertRow('apple_subscriptions_new', 'otx-1', 'user-1', 'revoked'),
+        insertRow('apple_subscriptions_new', 'otx-2', 'user-2', 'active'),
+      ]);
+
+      expect(await applyGuardedAppleSubscriptionsNullableUserMigration(lib.d1)).toBe('recovered');
+      expect(lib.batches()).toBe(1);
+      expect(await rows(lib.client)).toEqual(LIVE_ROWS);
+      expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions']);
+      expect(await names(lib.client, 'index')).toEqual(ALL_INDEXES);
+    });
+
+    it('refuses to rename an empty shadow over a missing live table', async () => {
+      // The pre-guard replay's INSERT copy failed and its DROP landed, so no
+      // copy of the rows is left.
+      const lib = openLib();
+      await exec(lib.client, [SHADOW_DDL]);
+
+      await expect(applyGuardedAppleSubscriptionsNullableUserMigration(lib.d1)).rejects.toThrow(
+        /apple_subscriptions is missing and apple_subscriptions_new is empty/,
+      );
+      expect(lib.batches()).toBe(0);
+      expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions_new']);
+    });
+
+    it('reports a lost ledger in failed[] although the replay then makes an empty table', async () => {
+      const lib = openLib();
+      await exec(lib.client, [SHADOW_DDL]);
+
+      const result = await executeAdminSchemaMigrations(lib.d1, [...APPLE_IAP_SCHEMA_STATEMENTS, ...APPLE_STATUS_INDEX]);
+      // The pre-loop failure is final: a post-loop attempt would find the
+      // replay's empty 0081 table and rebuild it as 'applied'.
+      expect(result.failed).toEqual([
+        { sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: expect.stringContaining('apple_subscriptions_new is empty') },
+      ]);
+      expect(lib.batches()).toBe(0);
+      expect(await rows(lib.client)).toEqual([]);
+      expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions', 'apple_subscriptions_new']);
     });
 
     it('rebuilds after the replay on a clean database and keeps the 0093 index', async () => {

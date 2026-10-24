@@ -96,21 +96,34 @@ count_prefix() {
   printf '%s\n' "$1" | grep -c "^$2" || true
 }
 
-app_env=$'PATH=/usr/local/bin:/usr/bin\nCT_SKIP_LITESTREAM=0\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=0\nTURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=false\nCT_SKIP_LITESTREAM_NOTE=keep\n'
+app_env=$'PATH=/usr/local/bin:/usr/bin\nCT_SKIP_LITESTREAM=0\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=0\nTURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite\nCOOLIFY_TOKEN=not-a-real-token\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=false\nCT_SKIP_LITESTREAM_NOTE=keep\n'
 hold_env="$(render_env "$app_env")"
 assert_eq "$(count_prefix "$hold_env" 'CT_SKIP_LITESTREAM=')" "1" "hold env has CT_SKIP_LITESTREAM once"
 assert_eq "$(count_prefix "$hold_env" 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=')" "1" "hold env has CT_DISABLE_STARTUP_SCHEMA_MIGRATE once"
 assert_contains "$hold_env" "CT_SKIP_LITESTREAM=1" "hold env skips Litestream"
 assert_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1" "hold env skips the boot schema migrate"
+assert_not_contains "$hold_env" "CT_SKIP_LITESTREAM=0" "hold env drops the app's Litestream value"
 assert_not_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=0" "hold env drops the app's migrate value"
-assert_contains "$hold_env" "TURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite" "hold env keeps the app env"
-assert_contains "$hold_env" "CT_SKIP_LITESTREAM_NOTE=keep" "hold env keeps keys that only share a prefix"
+assert_not_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=false" "hold env drops the app's later migrate value"
+assert_contains "$hold_env" "TURSO_DATABASE_URL=<redacted>" "hold env keeps the app env (by name)"
+assert_contains "$hold_env" "CT_SKIP_LITESTREAM_NOTE=<redacted>" "hold env keeps keys that only share a prefix"
+assert_eq "$hold_env" $'PATH=<redacted>\nTURSO_DATABASE_URL=<redacted>\nCOOLIFY_TOKEN=<redacted>\nCT_SKIP_LITESTREAM_NOTE=<redacted>\nCT_SKIP_LITESTREAM=1\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=1' "hold env keeps every other key in order"
+
+# --render-env runs on the live app's env, credentials included: it must
+# never print a value other than the two hold flags.
+while IFS= read -r line; do
+  [[ "$line" == *=* ]] || continue
+  case "$line" in CT_SKIP_LITESTREAM=* | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=*) continue ;; esac
+  assert_not_contains "$hold_env" "=${line#*=}" "render-env hides the value of ${line%%=*}"
+done <<< "$app_env"
 
 bare_env="$(render_env '')"
 assert_eq "$(count_prefix "$bare_env" 'CT_SKIP_LITESTREAM=')" "1" "empty env still gets CT_SKIP_LITESTREAM once"
 assert_eq "$(count_prefix "$bare_env" 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=')" "1" "empty env still gets CT_DISABLE_STARTUP_SCHEMA_MIGRATE once"
 
 # last-env is a rendered env; rendering it again must not add a second copy.
+# The render only reads keys, which the redaction keeps, so rendering the
+# redacted output proves the same thing as rendering the full file.
 again_env="$(render_env "$hold_env")"
 assert_eq "$again_env" "$hold_env" "re-rendering a hold env is a no-op"
 

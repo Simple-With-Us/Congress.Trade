@@ -65,7 +65,7 @@ Update 2026-10-23 (CT-2442):  the hold env also sets
 replay before `Deno.serve`, so a hold that replayed it logged "/health not
 ready after 45s" on every deploy and was not serving when Coolify stopped
 the old app.  `ct-deploy-overlap.sh --render-env` prints the hold env
-offline.
+offline, with every value except the two hold flags redacted.
 
 If hold is not running, standby (if installed) is still the fallback.
 
