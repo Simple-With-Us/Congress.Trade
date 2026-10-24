@@ -621,7 +621,7 @@ describe('runPriceRefresh — rotating cursor for the bounded catch-up (CT-2445)
     expect(second.attemptedAllPending).toBe(false);
   });
 
-  it('reports the last ticker reached, not the last selected, when a fatal error aborts mid-page', async () => {
+  it('resumes at the ticker a fatal error stopped on, not past it', async () => {
     seedTrade('r1', 'OK1', '2026-01-05');
     seedTrade('r2', 'FATAL', '2026-01-06');
     seedTrade('r3', 'LATER', '2026-01-07');
@@ -631,10 +631,25 @@ describe('runPriceRefresh — rotating cursor for the bounded catch-up (CT-2445)
     const res = await runPriceRefresh(env, { max: 10 });
     expect(res.aborted).toBe(true);
     expect(res.reachedEndOfPending).toBe(false);
-    // FATAL was reached and LATER was not, so the resume point sits before LATER.
-    const fatalSeq = db
+    // OK1 finished;  FATAL did not, so the resume point stays at OK1.
+    const okSeq = db
       .prepare('SELECT MAX(cursor_seq) AS s FROM transactions WHERE ticker = ?')
-      .get('FATAL') as { s: number };
-    expect(res.lastCursorSeq).toBe(fatalSeq.s);
+      .get('OK1') as { s: number };
+    expect(res.lastCursorSeq).toBe(okSeq.s);
+
+    // The next run starts with FATAL, then LATER.
+    h.errors.delete('FATAL');
+    h.eodCalls.length = 0;
+    await runPriceRefresh(env, { max: 10, afterCursorSeq: res.lastCursorSeq });
+    expect(h.eodCalls.filter((c) => c.symbol !== 'SPY').map((c) => c.symbol)).toEqual(['FATAL', 'LATER']);
+  });
+
+  it('keeps no resume point when the first ticker hits a fatal error', async () => {
+    seedTrade('r1', 'FATAL', '2026-01-05');
+    h.errors.set('FATAL', 'PEER_HTTP_429');
+
+    const res = await runPriceRefresh(env, { max: 10, afterCursorSeq: null });
+    expect(res.aborted).toBe(true);
+    expect(res.lastCursorSeq).toBeNull();
   });
 });

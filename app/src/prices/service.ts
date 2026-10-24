@@ -827,8 +827,11 @@ export async function runPriceRefresh(
       break;
     }
     if (budget <= 0) break;
-    // The resume point is the last ticker this run reached, not the last one
-    // selected, so an abort mid-page does not skip the unattempted rest.
+    // The resume point is the last ticker this run finished, not the last one
+    // selected, so an abort mid-page does not skip the unattempted rest.  A
+    // fatal error on this ticker restores the previous point (see below), so
+    // the failing ticker is retried first next time.
+    const resumeBefore = result.lastCursorSeq;
     result.lastCursorSeq = seq;
     const nowIso = new Date().toISOString();
     const fetchPlan = await planTickerEodFetch(env, ticker);
@@ -848,6 +851,7 @@ export async function runPriceRefresh(
         // ticker — abort the whole run instead of walking thousands of peers
         // that cannot succeed.  Tickers not yet reached this run are left
         // completely untouched (no negative-cache write) for next time.
+        result.lastCursorSeq = resumeBefore;
         result.aborted = true;
         break;
       }
