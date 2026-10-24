@@ -325,12 +325,14 @@ test('the Sentry Deploy gate keys on the map beside the upload target', () => {
   const steps = workflowSteps(workflow);
   const gatedOn = (op) => steps.filter((step) => [...step.text.matchAll(GATE)].some((match) => match[2] === op));
 
-  const upload = steps.find((step) => step.name === 'Upload browser dashboard source maps');
-  assert.ok(upload, 'the workflow must keep a step named "Upload browser dashboard source maps"');
-  assert.ok(
-    gatedOn('!=').includes(upload),
-    `the upload must run only when ${expected} exists (hashFiles(...) != '')`,
-  );
+  for (const name of ['Install the pinned Sentry CLI', 'Upload browser dashboard source maps']) {
+    const step = steps.find((s) => s.name === name);
+    assert.ok(step, `the workflow must keep a step named "${name}"`);
+    assert.ok(
+      gatedOn('!=').includes(step),
+      `"${name}" must run only when ${expected} exists (hashFiles(...) != '')`,
+    );
+  }
 
   const skips = gatedOn('==');
   assert.ok(skips.length > 0, `a skip step must run when ${expected} is missing (hashFiles(...) == '')`);
