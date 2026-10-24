@@ -793,6 +793,61 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.status).toBe('ok');
     expect(check.detail).toContain('Residential proxy live');
   });
+
+  // CT-2416: senate_efd comes from the proxied landing GET + agreement POST.
+  function efdCheck(probe: NonNullable<NonNullable<Parameters<typeof evaluatePipelineSignals>[0]['senateEfd']>['probe']>) {
+    const res = evaluatePipelineSignals({ ...base, senateEfd: { probe } }, nowMs);
+    return res.checks.find((c) => c.id === 'senate_efd')!;
+  }
+
+  it('senate_efd is critical (blocked) on an Akamai anti-bot 403, never stalled', () => {
+    const check = efdCheck({
+      ok: false, state: 'blocked', status: 403, step: 'POST /search/home/', egress: 'proxy',
+      checkedAt: new Date(nowMs - 60_000).toISOString(), error: 'eFD anti-bot block (Akamai Access Denied)',
+    });
+    expect(check.status).toBe('critical');
+    expect(check.detail).toContain('BLOCKED');
+    expect(check.detail).toContain('Akamai');
+    expect(check.detail).toContain('POST /search/home/');
+    expect(check.detail).toContain('not a relay outage');
+  });
+
+  it('senate_efd is degraded (not stalled) when the relay is down', () => {
+    const check = efdCheck({
+      ok: false, state: 'degraded', status: null, step: null, egress: 'proxy',
+      checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'residential proxy down',
+    });
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('residential proxy down');
+  });
+
+  it('senate_efd is ok after a passing proxied probe', () => {
+    const check = efdCheck({
+      ok: true, state: 'ok', status: 302, step: 'POST /search/home/', egress: 'proxy',
+      checkedAt: new Date(nowMs - 10 * 60_000).toISOString(), error: null,
+    });
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('agreement POST ok');
+  });
+
+  it('senate_efd ok goes degraded only after two missed 15m cycles', () => {
+    const fresh = efdCheck({
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 30 * 60_000).toISOString(),
+    });
+    expect(fresh.status).toBe('ok');
+    const stale = efdCheck({
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 60 * 60_000).toISOString(),
+    });
+    expect(stale.status).toBe('degraded');
+    expect(stale.detail).toContain('stale');
+  });
+
+  it('a legacy unproxied direct-GET senate_efd record is ignored (unknown), not stalled', () => {
+    const check = efdCheck({
+      ok: false, status: 403, egress: 'direct', checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'HTTP 403',
+    });
+    expect(check.status).toBe('unknown');
+  });
 });
 
 // Board row 6c05e09b: prod prices sat frozen for 46 days with no health signal.

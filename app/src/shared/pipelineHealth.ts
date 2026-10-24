@@ -258,7 +258,7 @@ export interface PipelineSignals {
       host?: string;
     } | null;
   } | null;
-  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  /** Proxied eFD landing + agreement POST probe (CONFIG_KV, CT-2416). */
   senateEfd?: {
     probe: {
       ok: boolean;
@@ -266,6 +266,8 @@ export interface PipelineSignals {
       checkedAt: string;
       egress?: string | null;
       error?: string | null;
+      state?: 'ok' | 'blocked' | 'degraded';
+      step?: string | null;
     } | null;
   } | null;
   /**
@@ -1116,42 +1118,58 @@ export function evaluatePipelineSignals(
     }
   }
 
+  // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
+  // the residential proxy.  Reported as ok / blocked (Akamai anti-bot 403,
+  // surfaced as `critical`) / degraded (relay down).  Never `stalled`: a dead
+  // ingestion lane is polling_senate's job; this says *why*.
   if (s.senateEfd === undefined) {
-    /* optional — fixtures predating the direct eFD probe omit this signal */
+    /* optional — fixtures predating the eFD probe omit this signal */
   } else if (s.senateEfd == null) {
-    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
-  } else if (!s.senateEfd.probe) {
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD probe uncollected', value: null });
+  } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
+    // Missing, or a legacy unproxied direct-GET record (dropped 2026-10-16).
     checks.push({
       id: 'senate_efd',
       status: 'unknown',
-      detail: 'Senate eFD direct landing not yet probed',
+      detail: 'Senate eFD proxied probe not yet run',
       value: null,
     });
   } else {
     const probe = s.senateEfd.probe;
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
-    if (!probe.ok) {
+    const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
+    // The probe dials eFD at most every 15m, so allow two missed cycles.
+    const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, 45);
+    const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
+    if (probe.state === 'blocked') {
       checks.push({
         id: 'senate_efd',
-        status: 'stalled',
-        detail: `Senate eFD direct landing unreachable`
-          + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-          + `${probe.error ? ` — ${probe.error}` : ''}`,
+        status: 'critical',
+        detail: `Senate eFD BLOCKED: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
+          + ` — Senate ingestion is refused by eFD itself, not a relay outage (probed ${ago})`,
         value: probe.status,
       });
-    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+    } else if (probe.state === 'degraded') {
       checks.push({
         id: 'senate_efd',
         status: 'degraded',
-        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        detail: `Senate eFD probe degraded${probe.step ? ` at ${probe.step}` : ''}${http}`
+          + `${probe.error ? ` — ${probe.error}` : ''} (checked ${ago})`,
+        value: probe.status,
+      });
+    } else if (ageMin > maxAgeMin) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${maxAgeMin}m)`,
         value: Math.round(ageMin),
       });
     } else {
       checks.push({
         id: 'senate_efd',
         status: 'ok',
-        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        detail: `Senate eFD landing + agreement POST ok through ${probe.egress ?? 'proxy'}: probed ${ago}`,
         value: Math.round(ageMin * 10) / 10,
       });
     }

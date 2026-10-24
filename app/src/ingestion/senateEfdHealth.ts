@@ -1,72 +1,39 @@
 /**
- * Direct Senate eFD (efdsearch.senate.gov) reachability probe.
+ * Senate eFD (efdsearch.senate.gov) functional-probe record, cached in
+ * CONFIG_KV so `/api/health` can report eFD state without dialing eFD.
  *
- * Cached in CONFIG_KV so `/api/health` can surface a dead residential proxy
- * without dialing the Mango device on every health request.
+ * The probe itself lives in residentialProxyHealth.ts (CT-2416): it runs the
+ * real landing GET + agreement POST through the same residential proxy as
+ * senateSource.ts.  The old unproxied direct GET was dropped (owner ruling
+ * 2026-10-16) because datacenter egress is a structural 403 that said nothing
+ * about whether ingestion works.
  */
 
-import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import type { Env } from '../shared/types.ts';
-import { BROWSER_HEADERS, SENATE_SEARCH } from './senateSource.ts';
 
 export const SENATE_EFD_HEALTH_KV_KEY = 'senate-efd:health';
 export const SENATE_EFD_PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * ok        landing GET 200 + csrf token, agreement POST 200/302.
+ * blocked   eFD answered with the Akamai "Access Denied" 403 (anti-bot).
+ * degraded  relay/proxy down or unconfigured, or eFD misbehaved otherwise.
+ */
+export type SenateEfdProbeState = 'ok' | 'blocked' | 'degraded';
 
 export interface SenateEfdProbeRecord {
   ok: boolean;
   status: number | null;
   checkedAt: string;
-  /** `direct` or `proxy` — how the last successful watcher poll reached eFD. */
+  /** Egress used by the probe (`proxy`); legacy records carry `direct`. */
   egress?: string | null;
   error?: string | null;
-}
-
-export async function probeSenateEfdLanding(
-  fetchImpl: typeof fetch = globalThis.fetch,
-  timeoutMs = SENATE_EFD_PROBE_TIMEOUT_MS,
-): Promise<SenateEfdProbeRecord> {
-  const checkedAt = new Date().toISOString();
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await trackedFetch(
-      SENATE_SEARCH,
-      {
-        method: 'GET',
-        headers: {
-          ...BROWSER_HEADERS,
-          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        signal: controller.signal,
-      },
-      { service: 'filing-discovery', operation: 'probe-senate-efd-landing' },
-      fetchImpl,
-    );
-    clearTimeout(timeoutId);
-    const ok = res.status >= 200 && res.status < 400;
-    return {
-      ok,
-      status: res.status,
-      checkedAt,
-      egress: 'direct',
-      error: ok ? null : `HTTP ${res.status}`,
-    };
-  } catch (err) {
-    clearTimeout(timeoutId);
-    return {
-      ok: false,
-      status: null,
-      checkedAt,
-      egress: 'direct',
-      error: (err as Error).message,
-    };
-  }
-}
-
-export async function refreshSenateEfdHealth(env: Env, now = new Date()): Promise<void> {
-  const rec = await probeSenateEfdLanding(globalThis.fetch, SENATE_EFD_PROBE_TIMEOUT_MS);
-  rec.checkedAt = now.toISOString();
-  await persistSenateEfdProbe(env, rec);
+  /** Absent on legacy direct-GET records, which pipelineHealth ignores. */
+  state?: SenateEfdProbeState;
+  /** Which step decided the state, e.g. `POST /search/home/`. */
+  step?: string | null;
+  /** True when eFD was actually dialed (drives the 15-minute throttle). */
+  dialed?: boolean;
 }
 
 export async function readSenateEfdProbe(env: Env): Promise<SenateEfdProbeRecord | null> {
