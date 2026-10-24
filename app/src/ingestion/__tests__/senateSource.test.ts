@@ -621,6 +621,46 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       expect(warn.mock.calls.some(([msg]) => /proxy unreachable; the direct fallback reached eFD/.test(String(msg)))).toBe(true);
     });
 
+    it('scrubs proxy URL userinfo and env proxy secrets from the proxy-unreachable warning', async () => {
+      const proxyUrl = 'http://scrub-user:scrub-pass@10.2.3.4:8888';
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.stubEnv('RESIDENTIAL_PROXY_PASSWORD', 'scrub-pass');
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => {
+        if (c.egress === 'proxy') {
+          throw new TypeError('proxy tunnel failed (password scrub-pass in message)');
+        }
+        return undefined;
+      });
+
+      await fetchSenatePtrFilings({ ...searchWindow, proxyUrl }, fetchImpl);
+
+      expect(warn.mock.calls.some(([msg, detail]) =>
+        /proxy unreachable; the direct fallback reached eFD/.test(String(msg))
+        && !/scrub-user|scrub-pass/.test(String(detail)))).toBe(true);
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    });
+
+    it('scrubs proxy URL userinfo and env proxy secrets from SenateProxyEgressError', async () => {
+      const proxyUrl = 'http://scrub-user:scrub-pass@10.2.3.4:8888';
+      vi.stubEnv('RESIDENTIAL_PROXY_PASSWORD', 'scrub-pass');
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => {
+        if (c.egress === 'proxy') {
+          throw new TypeError('proxy tunnel failed (password scrub-pass in message)');
+        }
+        if (c.egress === 'direct' && c.url.endsWith('/search/')) return akamaiDenied();
+        return undefined;
+      });
+
+      const err = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl }, fetchImpl).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SenateProxyEgressError);
+      expect((err as Error).message).not.toMatch(/scrub-user|scrub-pass/);
+      vi.unstubAllEnvs();
+    });
+
     /** A black-holed proxy: no answer, ever, until the request's signal aborts. */
     function hangUntilAborted(signal: AbortSignal | null | undefined): Promise<Response> {
       return new Promise((_resolve, reject) => {

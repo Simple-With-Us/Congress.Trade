@@ -87,6 +87,38 @@ export function isSenateEdgeDeniedError(err: unknown): err is SenateHttpError {
   return err instanceof SenateHttpError && err.failureClass === 'edge_denied';
 }
 
+/** Strip URL userinfo and configured proxy secrets before logging or persisting transport errors. */
+export function sanitizeEfdTransportError(err: unknown, secrets: Array<string | undefined> = []): string {
+  const raw = typeof err === 'string'
+    ? err
+    : err instanceof Error
+      ? err.message
+      : String(err ?? 'unknown');
+  let out = raw.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
+  for (const secret of secrets) {
+    if (secret && secret.length >= 3) out = out.split(secret).join('[redacted]');
+  }
+  return out.slice(0, 200);
+}
+
+/** Proxy URL and credential env values to scrub from Senate eFD transport errors. */
+export function senateEfdTransportScrubSecrets(proxyUrl?: string): string[] {
+  const penv = typeof process !== 'undefined' ? process.env : undefined;
+  const secrets: string[] = [];
+  const url = proxyUrl?.trim();
+  if (url && url.length >= 3) secrets.push(url);
+  for (const v of [
+    penv?.RESIDENTIAL_PROXY_URL,
+    penv?.SENATE_PROXY_URL,
+    penv?.RESIDENTIAL_PROXY_USERNAME,
+    penv?.RESIDENTIAL_PROXY_PASSWORD,
+  ]) {
+    const t = v?.trim();
+    if (t && t.length >= 3) secrets.push(t);
+  }
+  return secrets;
+}
+
 /**
  * The residential proxy gave no answer and the direct fallback failed too.
  * That is an egress fault to act on (the Mango peer), not an eFD edge deny,
@@ -94,8 +126,14 @@ export function isSenateEdgeDeniedError(err: unknown): err is SenateHttpError {
  * backed off nor logged as transient.
  */
 export class SenateProxyEgressError extends Error {
-  constructor(proxyCause: string, directCause: string) {
-    super(`senate proxy egress unreachable (${proxyCause}); direct fallback failed: ${directCause}`);
+  constructor(
+    proxyCause: unknown,
+    directCause: unknown,
+    secrets: Array<string | undefined> = [],
+  ) {
+    const proxy = sanitizeEfdTransportError(proxyCause, secrets);
+    const direct = sanitizeEfdTransportError(directCause, secrets).replace(/ \[edge_denied\]$/, '');
+    super(`senate proxy egress unreachable (${proxy}); direct fallback failed: ${direct}`);
     this.name = 'SenateProxyEgressError';
   }
 }

@@ -37,7 +37,13 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import * as cheerio from 'cheerio';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
-import { SenateHttpError, SenateProxyEgressError, isSenateEdgeDeniedError } from './senateEdgeDeny.ts';
+import {
+  SenateHttpError,
+  SenateProxyEgressError,
+  isSenateEdgeDeniedError,
+  sanitizeEfdTransportError,
+  senateEfdTransportScrubSecrets,
+} from './senateEdgeDeny.ts';
 
 /** Backoff between direct Senate eFD attempts when direct is the only egress. */
 /** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
@@ -151,6 +157,7 @@ export async function withSenateEfdEgress<T>(
   run: (fetchImpl: typeof fetch, egress: 'direct' | 'proxy') => Promise<T>,
 ): Promise<T> {
   const explicitProxy = resolveExplicitSenateProxyUrl(opts);
+  const transportScrubSecrets = senateEfdTransportScrubSecrets(explicitProxy);
   let proxyErr: unknown = null;
   if (explicitProxy) {
     const leg = guardProxyLeg(
@@ -174,7 +181,10 @@ export async function withSenateEfdEgress<T>(
     try {
       const out = await run(baseFetch, 'direct');
       if (proxyErr) {
-        console.warn('senateSource: residential proxy unreachable; the direct fallback reached eFD:', errorMessage(proxyErr));
+        console.warn(
+          'senateSource: residential proxy unreachable; the direct fallback reached eFD:',
+          sanitizeEfdTransportError(proxyErr, transportScrubSecrets),
+        );
       }
       return out;
     } catch (err) {
@@ -183,7 +193,7 @@ export async function withSenateEfdEgress<T>(
       // direct leg's own answer (usually an edge deny) is only the fallback.
       // Its [edge_denied] tag is left off: the whole failure is not one.
       if (proxyErr && !opts.signal?.aborted) {
-        throw new SenateProxyEgressError(errorMessage(proxyErr), errorMessage(err).replace(/ \[edge_denied\]$/, ''));
+        throw new SenateProxyEgressError(proxyErr, err, transportScrubSecrets);
       }
       throw err;
     }

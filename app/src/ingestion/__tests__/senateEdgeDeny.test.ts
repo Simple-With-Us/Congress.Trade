@@ -12,14 +12,51 @@ import { sweepPollingHeartbeat } from '../autonomySweeps.ts';
 import {
   SENATE_EDGE_BACKOFF_GRACE_MS,
   SENATE_EDGE_BACKOFF_KV_KEY,
+  SenateHttpError,
+  SenateProxyEgressError,
   clearSenateEdgeBackoff,
   isSenateEdgeBackoffActive,
   nextSenateEdgeBackoff,
   readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEfdTransportScrubSecrets,
   writeSenateEdgeBackoff,
 } from '../senateEdgeDeny.ts';
 
 const REASON = 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]';
+
+describe('sanitizeEfdTransportError', () => {
+  it('strips URL userinfo and bounds the length', () => {
+    const out = sanitizeEfdTransportError(new Error(`connect http://u:p%40ss@host:1/ ${'x'.repeat(500)}`));
+    expect(out).toContain('http://[redacted]@host:1/');
+    expect(out).not.toContain('p%40ss');
+    expect(out.length).toBeLessThanOrEqual(200);
+  });
+
+  it('replaces configured proxy secrets in the text', () => {
+    const secret = 'http://proxy-user:proxy-pass@10.99.0.2:8888';
+    const out = sanitizeEfdTransportError(`tunnel failed via ${secret}`, [secret, 'proxy-pass']);
+    expect(out).not.toContain('proxy-user');
+    expect(out).not.toContain('proxy-pass');
+    expect(out).toContain('[redacted]');
+  });
+});
+
+describe('SenateProxyEgressError', () => {
+  it('never exposes proxy URL userinfo or scrub secrets in the message', () => {
+    const proxyUrl = 'http://leak-user:leak-pass@10.0.0.9:3128';
+    const secrets = senateEfdTransportScrubSecrets(proxyUrl);
+    const err = new SenateProxyEgressError(
+      new Error(`connect ${proxyUrl}/path refused`),
+      new SenateHttpError('GET /search/', 403, 'AkamaiGHost'),
+      secrets,
+    );
+    expect(err.message).not.toMatch(/leak-user|leak-pass/);
+    expect(err.message).toContain('http://[redacted]@10.0.0.9:3128');
+    expect(err.message).toContain('direct fallback failed: senate GET /search/ -> HTTP 403');
+  });
+});
+
 // Monday 1:00 PM: weekday session caps apply (45 minute poll cap, 240 minute heartbeat).
 const NOW = new Date('2026-10-26T18:00:00.000Z');
 const nowMs = NOW.getTime();
