@@ -72,7 +72,6 @@ type EnvWithWatch = Env & {
   /** @deprecated Latency probes use FMP_LATENCY_API_KEY (+ secondary) only. */
   FMP_API_KEY?: string;
   FMP_DAILY_CALL_CAP?: string;
-  FMP_MAX_PER_MINUTE?: string;
   FMP_DISCLOSURE_WATCH_ENABLED?: string;
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   UNUSUAL_WHALES_API_KEY?: string;
@@ -4019,7 +4018,7 @@ async function runProviderProbe(
 
   if (!capSkipped && apiKey) {
     let fmpCallsMade = 0;
-    // Dedicated latency pacer — do not share enrichment getSharedFmpPacer state
+    // Dedicated latency pacer — do not share the enrichment getSharedStPeerPacer state
     // with free keys (avoids coupling to enrichment cadence). Simple serial wait.
     let lastFmpCallMs = 0;
     const FMP_LATENCY_MIN_GAP_MS = 350;

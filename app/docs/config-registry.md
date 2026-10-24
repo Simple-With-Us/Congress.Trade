@@ -102,8 +102,14 @@ application from this repo; reuse an existing Browser RUM app on the
 current Datadog account.
 
 ### Tunables & flags
-- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `FMP_MAX_PER_MINUTE`,
+- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `ST_PEER_MAX_PER_MINUTE`,
   `EDGAR_MAX_PER_MINUTE`
+  - `ST_PEER_MAX_PER_MINUTE` paces every Socratic.Trade peer read (profiles,
+    EOD prices, the price catch-up, the not-covered re-check).  It is clamped to
+    100/min because ST's `peerRead` limit is 120/min for all peer reads;  unset
+    paces at 100/min.  `FMP_MAX_PER_MINUTE` is its deprecated old name, read only
+    when `ST_PEER_MAX_PER_MINUTE` is unset.  FMP is latency probes only and is
+    never a price source.
 - Providers/routing: `PRICE_PROVIDER`, `APP_BASE_URL`
 - Anti-scrape: `SCRAPE_GUARD_ENABLED`
 - Disclosure-latency race: `DISCLOSURE_LATENCY_WATCH_ENABLED`,

@@ -17,7 +17,7 @@ import {
   excludeCompetitorFixtureTransactionSql,
   tickerHasNonCompetitorFixtureTrade,
 } from '../shared/competitorFixtures.ts';
-import { getSharedFmpPacer } from '../shared/pace.ts';
+import { getSharedStPeerPacer, ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from '../shared/pace.ts';
 import type { PriceClient } from './fmp.ts';
 import { buildPeerPriceClient } from './peer.ts';
 import type { Close } from './compute.ts';
@@ -188,6 +188,8 @@ export async function markTickerPriceUnavailable(
   );
 }
 type EnvX = Env & {
+  ST_PEER_MAX_PER_MINUTE?: string;
+  /** Deprecated name for ST_PEER_MAX_PER_MINUTE. */
   FMP_MAX_PER_MINUTE?: string;
   APP_B_IMPORT_URL?: string;
   /** Bearer token for the peer's bearer-gated read endpoints. */
@@ -236,21 +238,19 @@ export async function buildPriceRefreshClient(
   const runtimeSecrets = await resolveSecrets(env, [
     'APP_B_IMPORT_URL',
     'APP_B_INGEST_TOKEN',
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
   ]);
   const envx = { ...(env as EnvX), ...runtimeSecrets };
   const plan = pricePlan(envx);
   if (!plan) return null;
-  // Shared per-isolate FMP pacer (same instance enrichment + the disclosure
-  // probe use), so concurrent FMP work stays under the per-minute cap together.
-  // Fall back to FMP_MAX_PER_MINUTE when the caller omits it (e.g. an admin
-  // endpoint), so the shared singleton isn't memoized into a no-op.
-  const fmpMaxPerMinute =
-    opts.maxPerMinute ?? (parseInt(envx.FMP_MAX_PER_MINUTE || '', 10) || undefined);
+  // Shared per-isolate ST peer pacer (same instance enrichment uses), so
+  // concurrent peer reads stay under ST's per-minute limit together.  Fall back
+  // to the configured pace when the caller omits it (e.g. an admin endpoint).
+  const peerMaxPerMinute = opts.maxPerMinute ?? stPeerMaxPerMinute(envx);
   return {
     client: plan.client,
     fmpBudgeted: plan.fmpBudgeted,
-    pace: getSharedFmpPacer(fmpMaxPerMinute),
+    pace: getSharedStPeerPacer(peerMaxPerMinute),
   };
 }
 

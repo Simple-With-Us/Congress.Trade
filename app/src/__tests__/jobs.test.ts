@@ -213,6 +213,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
     const [, keys] = mocks.resolveSecrets.mock.calls[0];
     expect(keys).toEqual(
       expect.arrayContaining([
+        'ST_PEER_MAX_PER_MINUTE',
         'FMP_MAX_PER_MINUTE',
         'EDGAR_MAX_PER_MINUTE',
         'USAGE_MONITOR_ENABLED',
@@ -242,7 +243,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
     );
   });
 
-  it('falls back to undefined (no pacing) when resolveSecrets yields nothing for either var, matching prior unset behavior', async () => {
+  it('passes undefined when resolveSecrets yields nothing for either var (the shared ST pacer then applies its 100/min ceiling)', async () => {
     const env = fakeEnv();
     mocks.resolveSecrets.mockResolvedValue({});
 
@@ -542,7 +543,7 @@ describe('staggered daily lanes', () => {
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
   });
 
-  it('caps the catch-up pace at the configured FMP_MAX_PER_MINUTE when that is lower', async () => {
+  it('caps the catch-up pace at the configured pace when lower, reading the deprecated FMP name as a fallback', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
     (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
@@ -550,6 +551,16 @@ describe('staggered daily lanes', () => {
 
     expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
     expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 30 });
+  });
+
+  it('prefers ST_PEER_MAX_PER_MINUTE over the deprecated FMP_MAX_PER_MINUTE', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    mocks.resolveSecrets.mockResolvedValue({ ST_PEER_MAX_PER_MINUTE: '45', FMP_MAX_PER_MINUTE: '285' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 45 });
   });
 
   it('runs again in later hourly slots while pending shrinks, resuming from the cursor', async () => {

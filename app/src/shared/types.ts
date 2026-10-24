@@ -717,6 +717,9 @@ export interface Env {
   /** Daily FMP call budget (stringified int); defaults to 230 when unset. */
   FMP_DAILY_CALL_CAP?: string;
   /** Shared FMP per-minute pacer ceiling (stringified int). Infisical-tunable. */
+  /** Socratic.Trade peer-read pace (clamped to ST_PEER_SAFE_MAX_PER_MINUTE). */
+  ST_PEER_MAX_PER_MINUTE?: string;
+  /** Deprecated name for ST_PEER_MAX_PER_MINUTE;  read only as a fallback. */
   FMP_MAX_PER_MINUTE?: string;
   /** SEC EDGAR per-minute pacer ceiling (stringified int). Infisical-tunable. */
   EDGAR_MAX_PER_MINUTE?: string;

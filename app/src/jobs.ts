@@ -26,6 +26,7 @@ import { runCommitteeSync } from './enrichment/committeeSync.ts';
 import { runIdentitySync } from './enrichment/identitySync.ts';
 import { runBulkSnapshot } from './export/snapshot.ts';
 import { resolveSecrets } from './secrets/infisical.ts';
+import { ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from './shared/pace.ts';
 import { readSetting } from './settings/settingsService.ts';
 import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
@@ -515,11 +516,8 @@ export async function maybeRunPeerPriceCatchUp(
   let lastCursorSeq: number | null = null;
   let reachedEndOfPending = false;
   try {
-    const { FMP_MAX_PER_MINUTE } = await resolveSecrets(env, ['FMP_MAX_PER_MINUTE']);
-    const configured = parseInt(FMP_MAX_PER_MINUTE || '', 10);
-    const maxPerMinute = configured > 0
-      ? Math.min(configured, PEER_PRICE_CATCHUP_MAX_PER_MINUTE)
-      : PEER_PRICE_CATCHUP_MAX_PER_MINUTE;
+    const configured = stPeerMaxPerMinute(await resolveSecrets(env, [...ST_PEER_PACE_SECRET_NAMES]));
+    const maxPerMinute = Math.min(configured ?? PEER_PRICE_CATCHUP_MAX_PER_MINUTE, PEER_PRICE_CATCHUP_MAX_PER_MINUTE);
     const r = await runPriceRefresh(env, {
       // +1 for the S&P call, which spends from the same budget.
       max: PEER_PRICE_CATCHUP_MAX_TICKERS + 1,
@@ -612,7 +610,7 @@ export async function maybeRunDailyMarketDataJobs(
   // falling back to the wrangler.toml env var whenever a name isn't set in Infisical)
   // so the whole daily run only pays for one resolveSecrets round trip.
   const secrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
     'USAGE_MONITOR_ENABLED',
     'USAGE_MONITOR_INGEST_URL',
@@ -624,8 +622,9 @@ export async function maybeRunDailyMarketDataJobs(
     'PUSHOVER_APP_TOKEN',
     'PUSHOVER_USER_KEY',
   ]);
-  // Local burst limit for the Socratic profile walk. Not an FMP budget.
-  const maxPerMinute = parseInt(secrets.FMP_MAX_PER_MINUTE || '', 10) || undefined;
+  // Local burst limit for Socratic.Trade peer reads (profiles and prices).  Not
+  // an FMP budget.  The shared ST pacer clamps it to ST_PEER_SAFE_MAX_PER_MINUTE.
+  const maxPerMinute = stPeerMaxPerMinute(secrets);
   // SEC EDGAR has its own fair-access pacer — configurable via
   // EDGAR_MAX_PER_MINUTE, unset = no pacing.
   const edgarMaxPerMinute = parseInt(secrets.EDGAR_MAX_PER_MINUTE || '', 10) || undefined;
@@ -766,10 +765,10 @@ export async function runHourlyEnrichmentSlice(
 ): Promise<HourlyEnrichmentResult> {
   const day = now.toISOString().slice(0, 10);
   const secrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
   ]);
-  const maxPerMinute = parseInt(secrets.FMP_MAX_PER_MINUTE || '', 10) || undefined;
+  const maxPerMinute = stPeerMaxPerMinute(secrets);
   const edgarMaxPerMinute = parseInt(secrets.EDGAR_MAX_PER_MINUTE || '', 10) || undefined;
   const max = Math.max(0, Math.min(opts.max ?? HOURLY_ENRICHMENT_SLICE_MAX, HOURLY_ENRICHMENT_SLICE_MAX));
   const empty: HourlyEnrichmentResult = {

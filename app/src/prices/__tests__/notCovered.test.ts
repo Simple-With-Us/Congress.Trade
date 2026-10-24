@@ -8,6 +8,15 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The shared ST peer pacer paces at 100/min even when unset (CT-2445), which
+// would make every multi-call test sleep 600ms per call.  Pacing has its own
+// tests in shared/__tests__/pace.test.ts.
+vi.mock('../../shared/pace.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../shared/pace.ts')>()),
+  getSharedStPeerPacer: () => async () => {},
+}));
+
+
 const h = vi.hoisted(() => ({
   eodCalls: [] as Array<{ symbol: string; from: string; to: string }>,
   responses: new Map<string, Array<{ date: string; close: number }>>(),
