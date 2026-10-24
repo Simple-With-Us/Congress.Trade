@@ -318,7 +318,7 @@ describe('schemaMigrationRunner', () => {
       const stale = [
         SHADOW_DDL,
         insertRow('apple_subscriptions_new', 'otx-1', 'user-1', 'active'),
-        insertRow('apple_subscriptions_new', 'otx-9', 'user-9', 'active'),
+        insertRow('apple_subscriptions_new', 'otx-2', 'user-2', 'expired'),
       ];
 
       const legacy = openLib();
@@ -339,6 +339,50 @@ describe('schemaMigrationRunner', () => {
       expect(await applyGuardedAppleSubscriptionsNullableUserMigration(migrated.d1)).toBe('skipped');
       expect(migrated.batches()).toBe(0);
       expect(await rows(migrated.client)).toEqual(['otx-1:user-1:revoked']);
+    });
+
+    it('keeps the shadow when it is the only copy of the rows and the replay made an empty table', async () => {
+      // The reviewed interleaving: an old-code replay (a hold cloned from the
+      // previous image) runs CREATE _new + INSERT + DROP after this run's
+      // pre-loop guard and misses its RENAME; this run's own 0081 CREATE
+      // TABLE IF NOT EXISTS then makes an empty user_id NOT NULL table.
+      const lib = openLib();
+      await exec(lib.client, [
+        SHADOW_DDL.replace('apple_subscriptions_new', 'apple_subscriptions'),
+        insertRow('apple_subscriptions', 'otx-1', 'user-1', 'revoked'),
+        insertRow('apple_subscriptions', 'otx-2', 'user-2', 'active'),
+        insertRow('apple_subscriptions', 'otx-3', null, 'active'),
+      ]);
+      const oldReplayCopyAndDrop = APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.slice(0, 3);
+      expect(oldReplayCopyAndDrop[2]).toBe('DROP TABLE apple_subscriptions');
+
+      const result = await executeAdminSchemaMigrations(lib.d1, [
+        ...oldReplayCopyAndDrop,
+        ...APPLE_IAP_SCHEMA_STATEMENTS,
+        ...APPLE_STATUS_INDEX,
+      ]);
+      expect(result.failed).toEqual([]);
+      expect(await rows(lib.client)).toEqual([...LIVE_ROWS, 'otx-3:null:active']);
+      expect(await userIdNotNull(lib.client)).toBe(0);
+      expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions']);
+      expect(await names(lib.client, 'index')).toEqual(ALL_INDEXES);
+    });
+
+    it('changes nothing when the shadow holds rows that a non-empty live table lacks', async () => {
+      const lib = openLib();
+      await seedLegacy(lib.client);
+      await exec(lib.client, [SHADOW_DDL, insertRow('apple_subscriptions_new', 'otx-9', null, 'active')]);
+
+      const result = await executeAdminSchemaMigrations(lib.d1, []);
+      expect(result.failed).toEqual([
+        { sql: APPLE_SUBSCRIPTIONS_GUARD_LABEL, error: expect.stringContaining('apple_subscriptions_new holds rows') },
+      ]);
+      expect(lib.batches()).toBe(0);
+      expect(await rows(lib.client)).toEqual(LIVE_ROWS);
+      expect(await userIdNotNull(lib.client)).toBe(1);
+      expect(await names(lib.client, 'table')).toEqual(['apple_subscriptions', 'apple_subscriptions_new']);
+      const shadow = await lib.client.execute('SELECT original_transaction_id FROM apple_subscriptions_new');
+      expect(shadow.rows.map((row) => String(row.original_transaction_id))).toEqual(['otx-9']);
     });
 
     it('finishes an interrupted rename when only the shadow holds the rows', async () => {

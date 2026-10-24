@@ -87,22 +87,42 @@ function createIfNotExists(sql: string): string {
   );
 }
 
+/** Rows of apple_subscriptions_new whose key apple_subscriptions does not have. */
+async function appleShadowRowsMissingFromLive(db: D1Database): Promise<number> {
+  const row = await get<{ n: number }>(
+    db,
+    `SELECT COUNT(*) AS n FROM apple_subscriptions_new AS s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM apple_subscriptions AS l WHERE l.original_transaction_id = s.original_transaction_id
+      )`,
+  );
+  return Number(row?.n ?? 0);
+}
+
 /**
  * Guarded apply for migration 0091 (`apple_subscriptions.user_id` drops NOT
  * NULL).  Runs the rebuild only while PRAGMA table_info still shows user_id
- * NOT NULL, and as one write batch: DROP any leftover shadow first, then
- * CREATE / INSERT / DROP / RENAME / indexes.  A BUSY anywhere rolls the whole
- * swap back, so the live table is never dropped without its replacement and
- * a stale shadow never replaces live rows.
+ * NOT NULL, and as one write batch: CREATE / INSERT / DROP / RENAME /
+ * indexes.  A BUSY anywhere rolls the whole swap back, so the live table is
+ * never dropped without its replacement.
+ *
+ * A leftover apple_subscriptions_new is dropped first only when every row in
+ * it is also in the live table (a stale copy), so it never replaces live
+ * rows.  When it holds rows the live table lacks and the live table is
+ * empty, an earlier non-atomic swap landed its DROP and missed its RENAME,
+ * and the replay's 0081 CREATE TABLE IF NOT EXISTS then made the empty
+ * table: the batch finishes that swap and keeps the shadow's rows.  When
+ * the shadow holds rows the live table lacks and the live table is not
+ * empty, it throws and changes nothing.
  */
 export async function applyGuardedAppleSubscriptionsNullableUserMigration(
   db: D1Database,
 ): Promise<'applied' | 'recovered' | 'skipped'> {
   if (!(await sqliteTableExists(db, 'apple_subscriptions'))) {
     // The pre-guard replay could land its DROP and miss its RENAME, leaving
-    // the copied rows only in the shadow.  Finish that rename before the
-    // replay's 0081 CREATE TABLE IF NOT EXISTS makes an empty live table,
-    // which the rebuild below would keep while dropping the shadow's rows.
+    // the copied rows only in the shadow.  Finish that rename now, before the
+    // replay's 0081 CREATE TABLE IF NOT EXISTS makes an empty live table (the
+    // shadow check below also recovers from that state).
     if (!(await sqliteTableExists(db, 'apple_subscriptions_new'))) return 'skipped';
     const renameAt = APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.findIndex((sql) =>
       /RENAME\s+TO\s+apple_subscriptions\b/i.test(sql)
@@ -122,10 +142,27 @@ export async function applyGuardedAppleSubscriptionsNullableUserMigration(
       WHERE tbl_name = 'apple_subscriptions' AND type IN ('index', 'trigger') AND sql IS NOT NULL
       ORDER BY rowid`,
   );
+  const recreateDependents = dependents.map((row) => createIfNotExists(row.sql));
+  if (
+    (await sqliteTableExists(db, 'apple_subscriptions_new')) &&
+    (await appleShadowRowsMissingFromLive(db)) > 0
+  ) {
+    if (await get<{ ok: number }>(db, 'SELECT 1 AS ok FROM apple_subscriptions LIMIT 1')) {
+      throw new Error(
+        'apple_subscriptions_new holds rows that apple_subscriptions lacks, and apple_subscriptions is not empty; ' +
+          'left both tables unchanged for a manual merge',
+      );
+    }
+    // The 0091 list without the shadow DROP: CREATE ... IF NOT EXISTS keeps
+    // the shadow, and its INSERT copies any row the empty table has gained
+    // since this check (a key clash fails the batch and rolls it back).
+    await runAtomicSchemaBatch(db, [...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS, ...recreateDependents]);
+    return 'recovered';
+  }
   await runAtomicSchemaBatch(db, [
     'DROP TABLE IF EXISTS apple_subscriptions_new',
     ...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
-    ...dependents.map((row) => createIfNotExists(row.sql)),
+    ...recreateDependents,
   ]);
   return 'applied';
 }

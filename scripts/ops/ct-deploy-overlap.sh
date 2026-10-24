@@ -24,8 +24,12 @@
 #   with the boot schema migrate off (CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1):
 #   main.ts awaits that ~400-statement replay before Deno.serve, so a hold
 #   that replays it is still not serving /health when Coolify stops the old
-#   app.  The live app already migrated this schema; the replacement migrates
-#   again when it boots.
+#   app.  In the normal path (OVERLAP_EARLY=1) hold clones the old, healthy
+#   app, which already migrated this schema; the replacement migrates again
+#   when it boots.  If hold is ever started later in a deploy, after the
+#   replacement container exists (for example hold died), it clones the
+#   replacement's image and serves that code before the replacement's own
+#   boot migrate has finished.
 #
 # INSTALL (root on the Coolify host — does not take the site down):
 #   install -m 0755 scripts/ops/ct-deploy-overlap.sh /usr/local/bin/
@@ -177,7 +181,7 @@ if [[ "${1:-}" == "--render-env" ]]; then
 fi
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,43p' "$0"
+  sed -n '2,47p' "$0"
   exit 0
 fi
 

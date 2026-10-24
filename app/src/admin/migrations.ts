@@ -953,6 +953,10 @@ export const X_AUTH_SCHEMA_STATEMENTS = [
  * migrations/0081_apple_iap.sql for the full design note (why this table is
  * independent of, not a replacement for, the Stripe-shaped `users` columns
  * the legacy POST /billing/apple/confirm route also writes).
+ *
+ * Before adding a column to apple_subscriptions in a later migration, read
+ * the note on APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS: its
+ * guarded rebuild runs after the whole replay on a fresh database.
  */
 export const APPLE_IAP_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS apple_subscriptions (
@@ -1270,6 +1274,14 @@ export const ADMIN_ALLOWLIST_SCHEMA_STATEMENTS = [
  * applyGuardedAppleSubscriptionsNullableUserMigration
  * (schemaMigrationRunner.ts) now runs them only while user_id is still NOT
  * NULL, as ONE write batch that rolls back whole.
+ *
+ * On a fresh database that guarded rebuild runs after the WHOLE replay, not
+ * at 0091's place in it, and copies with `SELECT *` into the column list
+ * below.  A later migration that adds an apple_subscriptions column would
+ * make that copy fail on every fresh database (column-count mismatch, and
+ * /migrate reports it in failed[]).  Such a migration must also change how
+ * the rebuild runs, for example by running it at its list position.  The
+ * file-vs-admin snapshot test in migrations.test.ts catches the mismatch.
  */
 export const APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS apple_subscriptions_new (
