@@ -119,6 +119,7 @@ import { buildPremiumRoster, localPremiumCounts } from './premiumRoster.ts';
 import { getLogoDisplay, setLogoDisplay } from '../shared/settings.ts';
 import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
+import { normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
 import {
   MEMBER_FILER_MERGES,
   MEMBER_NAME_ALIASES,
@@ -1032,6 +1033,17 @@ export const ReviewEditItemSchema = z.object({
   confidence: z.number().nullable().optional(),
 });
 
+// Query params for POST /clean-asset-names.  Every field falls back to its
+// default on bad input (.catch) instead of failing the request: paging that
+// arrives as "abc" must run the default window, never reach SQL as NaN or 500.
+// Unknown params are stripped (Zod's default), like any other query string.
+export const CleanAssetNamesQuerySchema = z.object({
+  offset: z.coerce.number().min(0).catch(0),
+  limit: z.coerce.number().catch(500),
+  docId: z.string().min(1).nullable().catch(null),
+  dryRun: z.literal('1').transform(() => true).catch(false),
+});
+
 interface EditedTx {
   filerId?: string | null;
   txDate?: string | null;
@@ -1058,21 +1070,21 @@ type ValidatedEditedTx = EditedTx & {
   txDate: string;
   owner: 'self' | 'spouse' | 'joint' | 'dependent' | null;
   txType: TxType;
+  /** Set when confident OCR normalization rewrote assetName; stored in cleaning_note. */
+  cleaningNote: string | null;
+  /**
+   * The submitted name before OCR normalization.  The row key fingerprints
+   * this, not the repaired assetName, so an OCR fix never changes a row's
+   * identity: the machine path (buildTransaction) likewise fingerprints the
+   * pre-OCR name while storing the repaired one.
+   */
+  rowKeyAssetName: string;
 };
-
-function validCalendarDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const [year, month, day] = value.split('-').map(Number);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  return parsed.getUTCFullYear() === year
-    && parsed.getUTCMonth() === month - 1
-    && parsed.getUTCDate() === day
-    && value <= new Date().toISOString().slice(0, 10);
-}
 
 function validateReviewEdits(
   rawEdits: unknown[],
   filedDate: string | null,
+  opts: { acknowledgeStaleTxDate?: boolean } = {},
 ): { edits: ValidatedEditedTx[] } | { error: string } {
   // The live backlog contains filings with more than 200 disclosed lots. Keep
   // those reviewable while still bounding request and D1 work.
@@ -1090,16 +1102,29 @@ function validateReviewEdits(
       return { error: `edits[${index}].txType must be explicitly B (Buy), S (Sell), or E (Exchange); P is accepted as Buy` };
     }
     const ownerRaw = typeof e.owner === 'string' ? e.owner.trim().toLowerCase() : '';
-    const owner = ownerRaw === '' ? null : ownerRaw;
-    if (owner !== null && owner !== 'self' && owner !== 'spouse' && owner !== 'joint' && owner !== 'dependent') {
-      return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
-    }
+    // Positive narrowing, no assertion: only these spellings become the
+    // union (empty/omitted means null); anything else is a 400.
+    let owner: ValidatedEditedTx['owner'];
+    if (ownerRaw === '') owner = null;
+    else if (ownerRaw === 'self' || ownerRaw === 'spouse' || ownerRaw === 'joint' || ownerRaw === 'dependent') owner = ownerRaw;
+    else return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
     const txDate = typeof e.txDate === 'string' ? e.txDate.trim() : '';
-    if (!validCalendarDate(txDate)) {
-      return { error: `edits[${index}].txDate must be a valid non-future YYYY-MM-DD date` };
+    // Shared strict check: real calendar date, not future, not older than
+    // the lookback below the filing date.  After-filed trades stay allowed
+    // per the tested rule (signature-stamp skew).  Same contract the machine
+    // path enforces in scoreFields, except a reviewer can explicitly confirm
+    // a genuinely stale trade (late disclosure) via acknowledgeStaleTxDate —
+    // impossible dates, future dates, and OCR garble have no such bypass.
+    const dateCheck = validateTxDate(txDate, { filedDate });
+    const staleAcknowledged = dateCheck.ok === false
+      && dateCheck.code === 'tx_date_too_old'
+      && opts.acknowledgeStaleTxDate === true;
+    if (dateCheck.ok === false && !staleAcknowledged) {
+      const hint = dateCheck.code === 'tx_date_too_old'
+        ? ' — pass acknowledgeStaleTxDate: true to confirm a genuinely old trade anyway'
+        : '';
+      return { error: `edits[${index}].txDate ${dateCheck.message}${hint}` };
     }
-    // Allow a disclosed trade a few days after Clerk's filed_date (signature
-    // stamp).  Still refuse dates that have not happened yet.
     const ticker = typeof e.ticker === 'string' ? e.ticker.trim() : '';
     const assetName = typeof e.assetName === 'string' ? e.assetName.trim() : '';
     if (!ticker && !assetName) {
@@ -1107,6 +1132,21 @@ function validateReviewEdits(
     }
     if (assetName.length > 500) {
       return { error: `edits[${index}].assetName must be at most 500 characters` };
+    }
+    // Confident OCR fixes apply silently with an audit note; unfixable garble
+    // is a 400 naming the row, never a saved wrong name.
+    let finalAssetName = assetName;
+    let cleaningNote: string | null = null;
+    if (assetName) {
+      const ocr = normalizeOcrAssetName(assetName);
+      const holds = [...ocr.dateHolds, ...ocr.nameHolds];
+      if (holds.length > 0) {
+        return { error: `edits[${index}].assetName looks like unreadable OCR text (${holds.join('; ')}); fix the name and retry` };
+      }
+      if (ocr.changed) {
+        finalAssetName = ocr.name;
+        cleaningNote = `normalized OCR artifacts: ${ocr.notes.join('; ')}`;
+      }
     }
     if (ticker && (ticker.length > 20 || !/^[A-Za-z0-9.^$-]+$/.test(ticker))) {
       return { error: `edits[${index}].ticker is invalid` };
@@ -1132,7 +1172,16 @@ function validateReviewEdits(
         return { error: `edits[${index}].${field} must be a boolean` };
       }
     }
-    edits.push({ ...e, ticker: ticker || null, assetName, txDate, owner: owner as any, txType });
+    edits.push({
+      ...e,
+      ticker: ticker || null,
+      assetName: finalAssetName,
+      rowKeyAssetName: assetName,
+      txDate,
+      owner,
+      txType,
+      cleaningNote,
+    });
   }
   return { edits };
 }
@@ -2771,7 +2820,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- POST /review/:docId ------------------------------------------------
-  // Body: { decision: 'confirm'|'reject'|'manual', reviewRevision, edits?: EditedTx[] }
+  // Body: { decision: 'confirm'|'reject'|'manual', reviewRevision, edits?: EditedTx[],
+  //         acknowledgeUnderTranscription?: boolean, acknowledgeStaleTxDate?: boolean }
   //   confirm -> insert corrected transactions (source='primary'), mark review
   //              resolved, set filing persisted, enqueue delivery.dispatch each.
   //   manual  -> same as confirm but recorded as source='manual' — the admin
@@ -2895,6 +2945,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       );
     }
     const rawEdits = editsParse.data;
+    // The stale-date bypass is new in CT-2441, so it is schema-checked here:
+    // only a real boolean is accepted ("true", 1 and the like are a 400).
+    const ackStaleParse = z.boolean().optional().safeParse(body.acknowledgeStaleTxDate);
+    if (!ackStaleParse.success) {
+      return c.json({ error: 'acknowledgeStaleTxDate must be a boolean when present' }, 400);
+    }
+    const acknowledgeStaleTxDate = ackStaleParse.data === true;
     if (rawEdits.length === 0) {
       return c.json(
         {
@@ -2964,7 +3021,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ docId, decision: 'orphan_resolved', resolved: true });
     }
     const filingFilerId = filing?.filer_id ?? null;
-    const validated = validateReviewEdits(confirmedEdits, filing.filed_date);
+    const validated = validateReviewEdits(confirmedEdits, filing.filed_date, {
+      acknowledgeStaleTxDate,
+    });
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
@@ -2978,7 +3037,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       const rowKey = transactionRowKey(source, rowIndex, {
         txDate: e.txDate,
         owner: e.owner,
-        assetName: e.assetName ?? '',
+        // Pre-OCR name: an OCR repair must not change the row's identity
+        // (the (doc_id, source, row_key) unique index and completeLiveSet).
+        assetName: e.rowKeyAssetName,
         ticker: e.ticker ?? null,
         assetType: e.assetType ?? null,
         assetTypeName,
@@ -3024,6 +3085,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         firstSeenAt: filing.first_seen_at ?? null,
         filedDate: filing.filed_date ?? null,
         estValue: estimateTransactionValue(e.amountMin, e.amountMax),
+        cleaningNote: e.cleaningNote ?? null,
       });
     }
 
@@ -3046,7 +3108,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              tx_type, amount_min, amount_max, is_option, cap_gains_over_200,
              raw_text, asset_type_name, filing_status, subholding, location,
              description, supplemental_text, row_key, confidence, source,
-             created_at, cursor_seq, first_seen_at, filed_date, est_value
+             created_at, cursor_seq, first_seen_at, filed_date, est_value,
+             cleaning_note
            ) SELECT
              json_extract(value, '$.id'), json_extract(value, '$.docId'),
              json_extract(value, '$.filerId'), json_extract(value, '$.txDate'),
@@ -3061,7 +3124,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              json_extract(value, '$.rowKey'), json_extract(value, '$.confidence'),
              json_extract(value, '$.source'), json_extract(value, '$.createdAt'), NULL,
              json_extract(value, '$.firstSeenAt'), json_extract(value, '$.filedDate'),
-             json_extract(value, '$.estValue')
+             json_extract(value, '$.estValue'), json_extract(value, '$.cleaningNote')
            FROM json_each(?)
            WHERE EXISTS (
              SELECT 1 FROM review_queue
@@ -3190,6 +3253,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           editCount: edits.length,
           inserted: insertedCount,
           deprecatedPredecessors,
+          ocrNormalized: edits.filter((e) => e.cleaningNote).length,
+          acknowledgedStaleTxDate: acknowledgeStaleTxDate,
           reviewCreatedAt: review.created_at,
         },
         createdAt: nowIso,
@@ -10617,32 +10682,78 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   r.post('/clean-asset-names', async (c) => {
     // Note: D1 query limit is 100 statements or results.
-    // We will page through transactions and clean the asset names.
-    const { offset = 0, limit = 500 } = c.req.query() as { offset?: string | number, limit?: string | number };
-    const numOffset = Number(offset);
-    const numLimit = Number(limit);
-    
-    const rows = await all<{ id: string, asset_name: string, ticker: string | null }>(
+    // We page through transactions and clean the asset names.  Query params:
+    //   offset, limit — paging window (defaults 0, 500).
+    //   docId — restrict the sweep to one filing (CT-2441 Sep 17 cleanup).
+    //   dryRun=1 — report proposed changes without writing.
+    // Each row runs the shared OCR normalizer first (confident fixes only),
+    // then the long-standing cleanAssetString pass.  OCR-fixed rows record an
+    // audit fragment in cleaning_note; unfixable rows are reported as held
+    // and left untouched.  Re-running is a no-op once names are fixed.
+    // Parsed, not cast; bad paging input falls back to the defaults (see the
+    // schema), so a malformed request never reaches SQL as NaN.
+    const query = CleanAssetNamesQuerySchema.parse(c.req.query());
+    const numOffset = Math.floor(query.offset);
+    const numLimit = Math.max(1, Math.min(2000, Math.floor(query.limit)));
+    const docId = query.docId;
+    const dryRun = query.dryRun;
+
+    const rows = await all<{ id: string; asset_name: string; ticker: string | null; cleaning_note: string | null }>(
       c.env.DB,
-      'SELECT id, asset_name, ticker FROM transactions ORDER BY created_at DESC LIMIT ? OFFSET ?',
-      [numLimit, numOffset]
+      // The id tiebreaker keeps paging deterministic: batch inserts share one
+      // created_at, so offset windows over created_at alone could skip rows.
+      docId
+        ? 'SELECT id, asset_name, ticker, cleaning_note FROM transactions WHERE doc_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
+        : 'SELECT id, asset_name, ticker, cleaning_note FROM transactions ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+      docId ? [docId, numLimit, numOffset] : [numLimit, numOffset],
     );
-    
-    if (rows.length === 0) return c.json({ ok: true, cleaned: 0, done: true });
+
+    if (rows.length === 0) return c.json({ ok: true, cleaned: 0, ocrCleaned: 0, held: 0, done: true });
+
+    const { cleanAssetString } = await import('../extraction/nameNormalizer.ts');
 
     let cleaned = 0;
-    const { cleanAssetString } = await import('../extraction/nameNormalizer.ts');
+    let ocrCleaned = 0;
+    const heldRows: Array<{ id: string; before: string; reasons: string[] }> = [];
+    const proposed: Array<{ id: string; before: string; after: string; note: string | null }> = [];
 
     // Run sequentially to avoid D1 limits on concurrent batches
     for (const row of rows) {
-      const cleanName = cleanAssetString(row.asset_name, row.ticker);
-      if (cleanName !== row.asset_name) {
-        await c.env.DB.prepare('UPDATE transactions SET asset_name = ? WHERE id = ?').bind(cleanName, row.id).run();
-        cleaned++;
+      const stored = row.asset_name ?? '';
+      const ocr = normalizeOcrAssetName(stored);
+      const holds = [...ocr.dateHolds, ...ocr.nameHolds];
+      if (holds.length > 0) {
+        heldRows.push({ id: row.id, before: stored, reasons: holds });
+        continue;
       }
+      const cleanName = cleanAssetString(ocr.name, row.ticker);
+      if (cleanName === stored) continue;
+      const note = ocr.changed ? `normalized OCR artifacts: ${ocr.notes.join('; ')}` : null;
+      if (dryRun) {
+        proposed.push({ id: row.id, before: stored, after: cleanName, note });
+        continue;
+      }
+      const mergedNote = note
+        ? (row.cleaning_note ? `${row.cleaning_note}; ${note}` : note)
+        : row.cleaning_note;
+      await c.env.DB.prepare(
+        'UPDATE transactions SET asset_name = ?, cleaning_note = ? WHERE id = ?',
+      ).bind(cleanName, mergedNote, row.id).run();
+      cleaned += 1;
+      if (ocr.changed) ocrCleaned += 1;
     }
 
-    return c.json({ ok: true, cleaned, processed: rows.length, nextOffset: numOffset + numLimit, done: rows.length < numLimit });
+    return c.json({
+      ok: true,
+      cleaned,
+      ocrCleaned,
+      processed: rows.length,
+      nextOffset: numOffset + numLimit,
+      done: rows.length < numLimit,
+      held: heldRows.length,
+      heldSample: heldRows.slice(0, 20),
+      ...(dryRun ? { proposed: proposed.slice(0, 100), proposedCount: proposed.length } : {}),
+    });
   });
 
   r.post('/securities/standardize-names', async (c) => {

@@ -18,7 +18,9 @@
  *     scripts/dry-run-asset-name-cleanup.ts [options]
  *
  * Options:
- *   --base <url>        API origin (default https://congress.trade)
+ *   --base <url>        API origin (default https://congress.trade).  Non-HTTPS
+ *                       origins are refused except loopback dev targets, so
+ *                       the token never goes to a plaintext or typo'd host.
  *   --candidates-only   Only fetch rows whose text can possibly match, instead
  *                       of every live row. Faster, but cannot prove the
  *                       no-op set — use the default full scan for sign-off.
@@ -89,17 +91,42 @@ export function assertReadOnly(sql: string): string {
 // Transport
 // ---------------------------------------------------------------------------
 
-function arg(name: string, fallback?: string): string | undefined {
+export function arg(name: string, fallback?: string): string | undefined {
   const index = Deno.args.indexOf(`--${name}`);
   if (index === -1) return fallback;
   return Deno.args[index + 1] ?? fallback;
 }
 
-function flag(name: string): boolean {
+export function flag(name: string): boolean {
   return Deno.args.includes(`--${name}`);
 }
 
-async function adminToken(): Promise<string> {
+/** Browser User-Agent: the edge serves a managed challenge to unrecognised agents. */
+export const BROWSER_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+/**
+ * The admin token must never travel to a plaintext or unexpected origin: a
+ * typo'd --base would otherwise receive the bearer token.  HTTPS everywhere,
+ * with plain HTTP allowed only for loopback dev targets.  Call it before the
+ * token is read, so a refused base never even loads the credential.
+ */
+export function assertSafeBase(base: string): string {
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    throw new Error(`refusing admin requests against malformed base '${base}'`);
+  }
+  const host = url.hostname.toLowerCase();
+  const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  if (url.protocol !== 'https:' && !loopback) {
+    throw new Error(`refusing admin requests against non-HTTPS base '${base}' (https or localhost only)`);
+  }
+  return base;
+}
+
+export async function adminToken(): Promise<string> {
   const inline = Deno.env.get('CT_ADMIN_TOKEN')?.trim();
   if (inline) return inline;
   const path = Deno.env.get('CT_ADMIN_TOKEN_FILE')?.trim();
@@ -124,9 +151,7 @@ async function query<T>(base: string, token: string, sql: string): Promise<T[]> 
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        // The edge serves a managed challenge to unrecognised agents.
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'User-Agent': BROWSER_UA,
       },
       body,
     });
@@ -201,6 +226,7 @@ async function main(): Promise<void> {
   const sampleCount = Math.max(1, Number(arg('samples', '8')));
   const candidatesOnly = flag('candidates-only');
   const jsonPath = arg('json');
+  assertSafeBase(base);
   const token = await adminToken();
 
   const where =

@@ -76,6 +76,8 @@ import {
   type IssuerNameIndex,
 } from '../enrichment/nameTickerBackfill.ts';
 import { parseAmountRange } from './amounts.ts';
+import { issuerWords, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
+import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
 import {
   PIPELINE_TX_SOURCES_SQL,
@@ -197,6 +199,8 @@ const PENALTY_FUTURE_TX_DATE = 0.7; //    tx_date after the filing's filed_date 
 const PENALTY_MISSING_TX_DATE = 0.7; //   tx_date is missing entirely
 const PENALTY_BAD_TX_TYPE = 0.5; //       tx_type not in {B,S,E}
 const PENALTY_BAD_ASSET_NAME = 0.4; //    parsed asset contains PTR header chrome
+const PENALTY_BAD_TX_DATE = 0.4; //       tx_date is impossible or wildly out of range
+const PENALTY_OCR_HOLD = 0.4; //          asset name has unfixable OCR garble
 
 /** Outcome of normalizing one filing's extracted rows. */
 export interface NormalizeResult {
@@ -240,6 +244,10 @@ export const HARD_FAILURE_FLAGS = [
   'unreadable_cap_gains',
   'future_tx_date',
   'missing_tx_date',
+  'bad_tx_date',
+  'tx_date_too_old',
+  'ocr_name_hold',
+  'ocr_date_hold',
 ];
 const HARD_FAILURE_FLAG_SET = new Set<string>(HARD_FAILURE_FLAGS);
 
@@ -323,12 +331,15 @@ export async function recomputeTransactions(
 ): Promise<FlaggedTx[]> {
   const nowIso = new Date().toISOString();
   const [resolver, nameIndex] = await Promise.all([loadResolver(env), loadNameIndex(env)]);
+  // Word-level OCR evidence from securities_ref company names, derived once
+  // for the whole filing so per-row scoring stays cheap.
+  const ocrExtraWords = issuerWords(nameIndex.values());
   // An executive 278-T's "#" column arrives glued onto the asset name on the
   // scanned path ("3641 Microsoft Corp. Com"); strip it before the resolver sees
   // the name, when the filing itself shows the pattern (board row 3d31c7b9).
   const rows = filing.chamber === 'executive' ? stripOgeRowIndexes(parsed) : parsed;
   return rows.map((p, rowIndex) =>
-    buildTransaction(p, filing, resolver, nowIso, rowIndex, sourceOverride, nameIndex),
+    buildTransaction(p, filing, resolver, nowIso, rowIndex, sourceOverride, nameIndex, ocrExtraWords),
   );
 }
 
@@ -801,6 +812,7 @@ function buildTransaction(
   rowIndex: number,
   sourceOverride?: TxSource,
   nameIndex?: NameIndex,
+  ocrExtraWords?: ReadonlySet<string>,
 ): FlaggedTx {
   const placeholders = new Set(['NONE', '--', 'N/A', 'NA', 'NULL', '—']);
   const prepared = prepareExtractedTx(p);
@@ -820,11 +832,29 @@ function buildTransaction(
   // the web surfaces as the "Notes" column.
   const assetDetail = splitAssetNameDetail(rawAssetName, rawTicker);
   const cleanedAssetName = assetDetail.name;
+  // Confident OCR fixes apply to the stored name with an audit note; the
+  // scoring below holds rows whose garble has no confident fix.
+  const ocr = normalizeOcrAssetName(cleanedAssetName, { extraKnownWords: ocrExtraWords });
+  // The split above lifts shape-only maturity suffixes ("Due 02/30/2026")
+  // into the cleaning note before the scan, so an impossible maturity date
+  // would escape the guard and publish in the user-visible Notes column
+  // while the admin path (which scans the raw string) 400s the same row.
+  // Merge date holds from the raw name too; dedupe tokens both scans see.
+  const rawDateHolds = normalizeEmbeddedOcrDates(rawAssetName ?? '').holdReasons.filter(
+    (reason) => !ocr.dateHolds.includes(reason),
+  );
+  const ocrResult: OcrNameResult = rawDateHolds.length > 0
+    ? { ...ocr, dateHolds: [...ocr.dateHolds, ...rawDateHolds] }
+    : ocr;
+  const ocrAssetName = ocrResult.name;
+  const ocrNote = ocrResult.notes.length > 0 ? `normalized OCR artifacts: ${ocrResult.notes.join('; ')}` : null;
   const s = scoreFields(
     p.confidence,
     {
       ticker: rawTicker,
-      assetName: cleanedAssetName,
+      // Score the OCR-repaired name so ticker resolution and the consistency
+      // checks see the canonical issuer, not the garble.
+      assetName: ocrAssetName,
       amountMin: p.amountMin,
       amountMax: p.amountMax,
       txType: p.txType,
@@ -834,13 +864,15 @@ function buildTransaction(
     filing.filedDate,
     resolve,
     nameIndex,
+    ocrExtraWords,
+    ocrResult,
   );
   // Models (and local_mac OCR) often leave assetType null even when the PTR
   // line says "Common Stock" or carries a House [ST] code. Infer before
   // category rollup so review UI + feed show ST instead of Unknown.
   const inferredType = inferHouseAssetTypeCode(p.assetType, {
     assetTypeName: p.assetTypeName,
-    assetName: cleanedAssetName,
+    assetName: ocrAssetName,
     rawText: p.rawText,
     isOption: p.isOption,
   });
@@ -854,7 +886,7 @@ function buildTransaction(
     null;
   const assetType = canonicalizeAssetType(resolvedAssetType, resolvedAssetTypeName, {
     isOption: p.isOption,
-    assetName: cleanedAssetName,
+    assetName: ocrAssetName,
     rawText: p.rawText,
   });
 
@@ -866,7 +898,7 @@ function buildTransaction(
     filerId: filing.filerId,
     txDate: p.txDate,
     owner: normalizeOwner(p.owner),
-    assetName: cleanedAssetName || s.ticker || '(unknown)',
+    assetName: ocrAssetName || s.ticker || '(unknown)',
     ticker: s.ticker,
     assetType: resolvedAssetType,
     assetTypeName: resolvedAssetTypeName,
@@ -895,7 +927,7 @@ function buildTransaction(
     firstSeenAt: filing.firstSeenAt,
     filedDate: filing.filedDate,
     createdAt: nowIso,
-    cleaningNote: assetDetail.note,
+    cleaningNote: [assetDetail.note, ocrNote].filter(Boolean).join('; ') || null,
     // cursor_seq is assigned by the DB trigger on insert.
     cursorSeq: 0,
   };
@@ -946,6 +978,8 @@ export function scoreFields(
   filedDate: string | null,
   resolve: TickerResolver,
   nameIndex?: NameIndex,
+  ocrExtraWords?: ReadonlySet<string>,
+  precomputedOcr?: OcrNameResult,
 ): ScoredFields {
   const flags: string[] = [];
   let confidence = clamp01(base);
@@ -1061,20 +1095,48 @@ export function scoreFields(
   }
 
   // --- tx_date sanity -------------------------------------------------------
-  // Hard-fail only dates that have not happened yet.  A PTR can list a trade
-  // a few days after Clerk's filed_date (signature stamp vs transaction
-  // box) — Pete Sessions H-2025-20033330 signed 2025-10-22 with a 10/24/2025
-  // purchase.  Parking that as future_tx_date hid a real disclosed lot.
-  const today = new Date().toISOString().slice(0, 10);
+  // Shared strict check: impossible, future, and far-too-old dates are hard
+  // failures (held for review, never published).  A trade after the filing
+  // date stays soft (tx_after_filed_date penalty only): the tested rule
+  // publishes after-filed trades, since a PTR can list a trade after Clerk's
+  // filed_date (signature stamp vs transaction box) — Pete Sessions
+  // H-2025-20033330 signed 2025-10-22 with a 10/24/2025 purchase, and parking
+  // that as future_tx_date hid a real disclosed lot.
   if (!fields.txDate) {
     flags.push('missing_tx_date');
     confidence *= PENALTY_MISSING_TX_DATE;
-  } else if (fields.txDate > today) {
-    flags.push('future_tx_date');
-    confidence *= PENALTY_FUTURE_TX_DATE;
-  } else if (filedDate && fields.txDate > filedDate) {
-    flags.push('tx_after_filed_date');
-    confidence *= PENALTY_FUTURE_TX_DATE;
+  } else {
+    const dateCheck = validateTxDate(fields.txDate, { filedDate });
+    if (dateCheck.ok === false) {
+      if (dateCheck.code === 'future_tx_date') {
+        flags.push('future_tx_date');
+        confidence *= PENALTY_FUTURE_TX_DATE;
+      } else if (dateCheck.code === 'bad_tx_date') {
+        flags.push('bad_tx_date');
+        confidence *= PENALTY_BAD_TX_DATE;
+      } else {
+        flags.push('tx_date_too_old');
+        confidence *= PENALTY_BAD_TX_DATE;
+      }
+    } else if (filedDate && fields.txDate > filedDate) {
+      flags.push('tx_after_filed_date');
+      confidence *= PENALTY_FUTURE_TX_DATE;
+    }
+  }
+
+  // --- OCR sanity on the asset name -----------------------------------------
+  // Confident fixes are applied by the caller (buildTransaction); unfixable
+  // garble is a hard failure so the row is held, never published.  Reference
+  // names from securities_ref feed word-level evidence only.  buildTransaction
+  // passes its already-computed result so the scan runs once per row.
+  const ocr = precomputedOcr ?? normalizeOcrAssetName(assetName, { extraKnownWords: ocrExtraWords });
+  if (ocr.dateHolds.length > 0) {
+    flags.push('ocr_date_hold');
+    confidence *= PENALTY_OCR_HOLD;
+  }
+  if (ocr.nameHolds.length > 0) {
+    flags.push('ocr_name_hold');
+    confidence *= PENALTY_OCR_HOLD;
   }
 
   return { confidence: clamp01(confidence), flags, ticker, amountMin, amountMax, txType };

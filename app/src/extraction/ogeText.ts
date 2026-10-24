@@ -56,6 +56,7 @@ import { extractText, getDocumentProxy } from 'unpdf';
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Filing, ParsedTx, TxType } from '../shared/types.ts';
 import { OCR_AMOUNT_TOKEN_SRC, parseAmountRange } from './amounts.ts';
+import { isValidCalendarDateYMD } from './ocrSanity.ts';
 import { looksLikeOgePart7ExplicitNone } from './extractRouting.ts';
 import { detectOption } from './senateHtml.ts';
 
@@ -615,5 +616,8 @@ function toIsoDate(mmddyyyy: string): string {
   if (!m) return mmddyyyy;
   const [, mm, dd, yy] = m;
   const year = yy.length === 2 ? `20${yy}` : yy;
-  return `${year}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
+  const iso = `${year}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
+  // A shape match is not a real date ("13/01/2026", "02/30/2026").  Return
+  // blank so the row is flagged incomplete and held, never published.
+  return isValidCalendarDateYMD(iso) ? iso : '';
 }
