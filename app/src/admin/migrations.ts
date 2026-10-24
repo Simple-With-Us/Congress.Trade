@@ -129,9 +129,10 @@ export const RELIABILITY_SCHEMA_STATEMENTS = [
   'CREATE INDEX IF NOT EXISTS idx_sse_leases_client ON sse_leases(client_id, expires_at)',
   `CREATE TRIGGER IF NOT EXISTS trg_sse_subscription_connection_quota BEFORE INSERT ON sse_leases WHEN (SELECT COUNT(*) FROM sse_leases WHERE subscription_id = NEW.subscription_id AND expires_at > NEW.created_at) >= 2 BEGIN SELECT RAISE(ABORT, 'sse subscription connection quota exceeded'); END`,
   `CREATE TRIGGER IF NOT EXISTS trg_sse_client_connection_quota BEFORE INSERT ON sse_leases WHEN (SELECT COUNT(*) FROM sse_leases WHERE client_id = NEW.client_id AND expires_at > NEW.created_at) >= 5 BEGIN SELECT RAISE(ABORT, 'sse client connection quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota BEFORE INSERT ON subscriptions WHEN (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id) >= 20 BEGIN SELECT RAISE(ABORT, 'subscription total quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_active_insert_quota BEFORE INSERT ON subscriptions WHEN NEW.active = 1 AND (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id AND active = 1) >= 10 BEGIN SELECT RAISE(ABORT, 'subscription active quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_active_update_quota BEFORE UPDATE OF active, client_id ON subscriptions WHEN NEW.active = 1 AND (OLD.active != 1 OR OLD.client_id != NEW.client_id) AND (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id AND active = 1 AND id != OLD.id) >= 10 BEGIN SELECT RAISE(ABORT, 'subscription active quota exceeded'); END`,
+  // The subscription quota triggers are intentionally NOT created here: the
+  // replay later drops and redefines them (0047, then the lower-quota set),
+  // so creating them in this list rebuilds and discards them under the write
+  // lock on every deploy.  Their only CREATE is the final definition.
   `CREATE TABLE IF NOT EXISTS source_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, attempted_at TEXT NOT NULL, outcome TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   'CREATE INDEX IF NOT EXISTS idx_source_attempts_source_time ON source_attempts(source, attempted_at DESC)',
 ] as const;
@@ -265,16 +266,13 @@ export const PRICE_BACKFILL_TERMINATION_SCHEMA_STATEMENTS = [
  * migrations/0047_subscription_quota_active_only.sql.
  */
 export const SUBSCRIPTION_QUOTA_ACTIVE_ONLY_SCHEMA_STATEMENTS = [
+  // The CREATE that followed this DROP in 0047 is intentionally left out of
+  // the boot replay: the lower-quota set later drops and redefines the same
+  // trigger, so creating it here rebuilds and discards it under the write
+  // lock on every deploy.  The DROP still migrates old databases; the final
+  // CREATE lives in LOWER_SUBSCRIPTION_QUOTA_SCHEMA_STATEMENTS.  Keep in
+  // lockstep with migrations/0047_subscription_quota_active_only.sql.
   'DROP TRIGGER IF EXISTS trg_subscriptions_total_quota',
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota
-   BEFORE INSERT ON subscriptions
-   WHEN (
-     SELECT COUNT(*) FROM subscriptions
-      WHERE client_id = NEW.client_id AND active = 1
-   ) >= 20
-   BEGIN
-     SELECT RAISE(ABORT, 'subscription total quota exceeded');
-   END`,
 ] as const;
 
 /** Ordered review-queue autonomy schema mirrored by file migrations 0033-0037. */
@@ -397,7 +395,15 @@ export const RESOURCE_GOVERNOR_SCHEMA_STATEMENTS = [
 )`,
 ] as const;
 
-/** 0052_deno_runtime_queue.sql — durable queue for Deno KV Connect runtimes. */
+/**
+ * 0052_deno_runtime_queue.sql — durable queue for Deno KV Connect runtimes.
+ * The file's idx_deno_runtime_queue_ready is deliberately NOT replayed here:
+ * 0062 (FIX_DENO_RUNTIME_QUEUE_INDEX_SCHEMA_STATEMENTS, later in this list)
+ * drops it again.  The Deno boot replays this list before Deno.serve, so
+ * the pair rebuilt and dropped an index over the whole queue
+ * (~3.4M rows) under the write lock on every deploy.  The DROP ... IF EXISTS
+ * stays to clean databases that still have it.
+ */
 export const DENO_RUNTIME_QUEUE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS deno_runtime_queue (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,8 +420,6 @@ export const DENO_RUNTIME_QUEUE_SCHEMA_STATEMENTS = [
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL
    )`,
-  `CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_ready
-     ON deno_runtime_queue(status, available_at, id)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_deno_runtime_queue_active_dedupe
      ON deno_runtime_queue(queue_name, dedupe_key)
      WHERE dedupe_key IS NOT NULL AND status IN ('pending', 'processing')`,
@@ -538,10 +542,15 @@ export const ACCOUNTING_PROJECTION_RESYNC_SCHEMA_STATEMENTS = [
 
 /**
  * tests. Keep this in the same order as file migrations 0029 through 0055.
+ *
+ * 0056_query_optimizations.sql.  The file's idx_deno_runtime_queue_pending
+ * and idx_deno_runtime_queue_processing are deliberately NOT replayed: 0058
+ * (TURSO_QUERY_EFFICIENCY_SCHEMA_STATEMENTS) replaces them with the _id
+ * twins and drops them a few statements later, so replaying the CREATEs only
+ * rebuilt two full-queue indexes under the boot write lock to throw them
+ * away.  The 0058 DROP ... IF EXISTS statements stay.
  */
 export const QUERY_OPTIMIZATIONS_SCHEMA_STATEMENTS = [
-  'CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_pending ON deno_runtime_queue (queue_name, status, available_at)',
-  'CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_processing ON deno_runtime_queue (queue_name, status, lease_until)',
   'CREATE INDEX IF NOT EXISTS idx_ingestion_outbox_enqueued ON ingestion_outbox (status, updated_at)',
   'CREATE INDEX IF NOT EXISTS idx_delivery_outbox_enqueued ON delivery_outbox (status, updated_at)',
 ] as const;
@@ -942,6 +951,10 @@ export const X_AUTH_SCHEMA_STATEMENTS = [
  * migrations/0081_apple_iap.sql for the full design note (why this table is
  * independent of, not a replacement for, the Stripe-shaped `users` columns
  * the legacy POST /billing/apple/confirm route also writes).
+ *
+ * Before adding a column to apple_subscriptions in a later migration, read
+ * the note on APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS: its
+ * guarded rebuild runs after the whole replay on a fresh database.
  */
 export const APPLE_IAP_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS apple_subscriptions (
@@ -1249,15 +1262,24 @@ export const ADMIN_ALLOWLIST_SCHEMA_STATEMENTS = [
  * device purchases (`POST /api/client/v1/entitlements/apple/redeem`) write a
  * `apple_subscriptions` row with `user_id = NULL`; SQLite cannot ALTER COLUMN
  * to drop a NOT NULL constraint, so this rebuilds the table. Keep in exact
- * lockstep with migrations/0091_apple_subscriptions_nullable_user.sql. Safe
- * to replay: each run copies the CURRENT table (already migrated after the
- * first run) into a fresh shadow, drops, and renames back — a no-op in
- * effect, not just idempotent-without-erroring, at the cost of a full-table
- * copy on every deploy. apple_subscriptions is small (one row per
- * subscriber/device, not per trade), so that cost is accepted rather than
- * building one-shot migration scripting this route doesn't otherwise have —
- * same tradeoff already made for the `deliveries` dedupe statement above
- * (see its comment under 0008_idempotency_keys.sql in routes.ts).
+ * lockstep with migrations/0091_apple_subscriptions_nullable_user.sql.
+ *
+ * NOT part of POST_0024_SCHEMA_STATEMENTS.  The replay used to run these as
+ * separate autocommit statements on every boot, and the runner moves on
+ * after a failed statement: a SQLITE_BUSY on CREATE/INSERT followed by a
+ * successful DROP deleted the table, and a BUSY on DROP left a filled
+ * apple_subscriptions_new that a later boot swapped over newer rows.
+ * applyGuardedAppleSubscriptionsNullableUserMigration
+ * (schemaMigrationRunner.ts) now runs them only while user_id is still NOT
+ * NULL, as ONE write batch that rolls back whole.
+ *
+ * On a fresh database that guarded rebuild runs after the WHOLE replay, not
+ * at 0091's place in it, and copies with `SELECT *` into the column list
+ * below.  A later migration that adds an apple_subscriptions column would
+ * make that copy fail on every fresh database (column-count mismatch, and
+ * /migrate reports it in failed[]).  Such a migration must also change how
+ * the rebuild runs, for example by running it at its list position.  The
+ * file-vs-admin snapshot test in migrations.test.ts catches the mismatch.
  */
 export const APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS apple_subscriptions_new (
@@ -1614,8 +1636,9 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...PROBE_RUN_BRACKET_SCHEMA_STATEMENTS,
   // 0090_admin_allowlist.sql
   ...ADMIN_ALLOWLIST_SCHEMA_STATEMENTS,
-  // 0091_apple_subscriptions_nullable_user.sql — Guideline 5.1.1(v).
-  ...APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
+  // 0091_apple_subscriptions_nullable_user.sql — Guideline 5.1.1(v).  A
+  // guarded one-batch table rebuild run by executeAdminSchemaMigrations, not
+  // replayed here (see APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS).
   // 0092_latency_snapshot_repair.sql
   ...LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS,
   // 0093_premium_activation_alerts.sql

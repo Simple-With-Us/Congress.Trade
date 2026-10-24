@@ -60,6 +60,14 @@ Hold runs `deno run … src/deno/main.ts` directly.  It does not start
 Litestream.  Two writers on the SQLite bind mount for the swap window is
 the same risk as a Dockerfile rolling update; WAL serializes it.
 
+Update 2026-10-23 (CT-2442):  the hold env also sets
+`CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1`.  main.ts awaits the boot schema
+replay before `Deno.serve`, so a hold that replayed it logged "/health not
+ready after 45s" on every deploy and was not serving when Coolify stopped
+the old app.  Offline, `ct-deploy-overlap.sh --render-env` prints only the
+two hold flags and a count of the other env lines, and `--render-env-file
+DEST` writes the full hold env to a 0600 file for tests.
+
 If hold is not running, standby (if installed) is still the fallback.
 
 ## Files changed
@@ -69,7 +77,7 @@ If hold is not running, standby (if installed) is still the fallback.
 | `scripts/ops/ct-deploy-overlap.sh` | Start/stop `congress-hold`; `--decide` is the offline policy table |
 | `scripts/ops/ct-deploy-overlap.service` | Always-on host loop (3s) |
 | `scripts/ops/ct-reattach-proxy.sh` | Failover prefers hold, then standby; `--render` for tests |
-| `scripts/ops/test-deploy-overlap.sh` | Offline decide + render pins |
+| `scripts/ops/test-deploy-overlap.sh` | Offline decide + hold env + render pins |
 | `docs/rollouts/2026-08-12-deploy-downtime-gap.md` | Pointer + do not re-enable `ct-deploy-guard.timer` |
 
 ## Host install (does not take the site down)
