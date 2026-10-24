@@ -769,7 +769,7 @@ async function main() {
   // App Store version workflow.  The RULES live in ./version-plan.mjs (pure,
   // no I/O); this client only reads the App Store Connect state they need.
   //
-  //   latest-marketing-patch  the highest patch already used on a train,
+  //   latest-marketing-patch  one less than the next FREE patch on a train (P, so P + 1 is free);
   //                          drift trains (a <prefix>.N train holding build
   //                          "N") ignored
   //   build-floor             the build number the next ship has to exceed
@@ -801,8 +801,67 @@ async function main() {
   // A to-one relationship's data is one { type, id } object (or null), not a list.
   const toOneId = (data) => (data && !Array.isArray(data) ? data.id || null : null);
 
+  // Every App Store Connect read below goes through ascGet:  a throttled (429),
+  // 5xx or network-failed answer is retried with backoff, because these
+  // queries gate every ship and one rate-limit blip must not fail it.
+  async function ascGet(url) {
+    // A dropped connection or DNS failure makes fetch throw rather than
+    // return a status, so a throw counts as a retryable failure too; the last
+    // one is re-thrown.
+    const once = async (last) => {
+      try {
+        return await api("GET", url);
+      } catch (err) {
+        if (last) throw err;
+        return { ok: false, status: 0, networkError: true, parsed: {} };
+      }
+    };
+    let res = await once(false);
+    for (let attempt = 1; attempt <= 3 && !res.ok && (!res.status || res.status === 429 || res.status >= 500); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+      res = await once(attempt === 3);
+    }
+    return res;
+  }
+
+  // A rejected credential (401/403) exits 4, not 2, so the ship script can
+  // refuse it even under --allow-unverified-seq.
+  const failExit = (status) => process.exit(status === 401 || status === 403 ? 4 : 2);
+
+  // App Store Connect data is checked before it is used:  a version string
+  // that is not dotted integers would misclassify drift trains, so a
+  // malformed record fails the query instead of being guessed at.
+  const ASC_VERSION_RE = /^\d+(\.\d+)*$/;
+  // v === String(v) admits only a primitive string (a number or null fails).
+  const validVersion = (v) => v === String(v) && ASC_VERSION_RE.test(v);
+
+  // Every build of one train, page by page.  Used when the train's inline
+  // build list is truncated, so a drift train is never mistaken for an
+  // empty one.
+  async function trainBuildVersions(trainId) {
+    const out = [];
+    let url = `/v1/preReleaseVersions/${encodeURIComponent(trainId)}/builds?limit=200`;
+    for (let page = 0; page < 50 && url; page++) {
+      const res = await ascGet(url);
+      if (!res.ok) return { ok: false, status: res.status, builds: out };
+      for (const b of res.parsed.data || []) {
+        const bv = b?.attributes?.version;
+        if (!validVersion(bv)) return { ok: false, status: `malformed build ${b?.id || "?"}`, builds: out };
+        out.push(bv);
+      }
+      url = res.parsed.links?.next || "";
+    }
+    if (url) return { ok: false, status: "build list longer than 50 pages", builds: out };
+    return { ok: true, status: 200, builds: out };
+  }
+
   async function appIdForBundle(bundleId) {
-    const res = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`);
+    const res = await ascGet(`/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`);
+    // A rejected key is not "app not found":  exit 4 so the ship refuses it.
+    if (res.status === 401 || res.status === 403) {
+      console.error(`${method}: App Store Connect rejected the API key (HTTP ${res.status})`);
+      failExit(res.status);
+    }
     if (!res.ok || !res.parsed.data?.[0]) return null;
     return res.parsed.data[0].id;
   }
@@ -817,20 +876,36 @@ async function main() {
       `&filter[platform]=${encodeURIComponent(platform)}` +
       `&include=builds&limit=200&limit[builds]=50`;
     for (let page = 0; page < 10 && url; page++) {
-      const res = await api("GET", url);
+      const res = await ascGet(url);
       if (!res.ok) return { ok: false, status: res.status, trains };
       for (const inc of res.parsed.included || []) {
-        if (inc && inc.type === "builds" && inc.attributes?.version) {
-          buildVersionById.set(inc.id, String(inc.attributes.version));
+        if (inc && inc.type === "builds") {
+          if (!validVersion(inc.attributes?.version)) {
+            return { ok: false, status: `malformed build ${inc.id || "?"}`, trains };
+          }
+          buildVersionById.set(inc.id, inc.attributes.version);
         }
       }
       for (const v of res.parsed.data || []) {
-        const ids = (v.relationships?.builds?.data || []).map((b) => b && b.id).filter(Boolean);
-        const builds = ids.map((id) => buildVersionById.get(id)).filter((x) => x !== undefined);
-        trains.push({ version: v.attributes?.version || "", builds });
+        if (!validVersion(v?.attributes?.version)) {
+          return { ok: false, status: `malformed preReleaseVersion ${v?.id || "?"}`, trains };
+        }
+        const rel = v.relationships?.builds;
+        const ids = (rel?.data || []).map((b) => b && b.id).filter(Boolean);
+        let builds = ids.map((id) => buildVersionById.get(id)).filter((x) => x !== undefined);
+        // The inline list stops at limit[builds]; when it is cut short (or a
+        // build record is missing from `included`), read the whole train.
+        const total = rel?.meta?.paging?.total;
+        if (builds.length < ids.length || (Number.isInteger(total) && total > ids.length)) {
+          const full = await trainBuildVersions(v.id);
+          if (!full.ok) return { ok: false, status: full.status, trains };
+          builds = full.builds;
+        }
+        trains.push({ version: v.attributes.version, builds });
       }
       url = res.parsed.links?.next || "";
     }
+    if (url) return { ok: false, status: "more than 10 pages of trains", trains };
     return { ok: true, status: 200, trains };
   }
 
@@ -851,23 +926,25 @@ async function main() {
 
     // 1) The App Store versions.  They are never ignored:  a version that is
     //    on sale counts even when no TestFlight train carries it.
-    const storeRes = await api(
-      "GET",
-      `/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}&limit=200`
+    const storeRes = await ascGet(`/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}&limit=200`
     );
     if (!storeRes.ok) {
       console.error(`latest-marketing-patch: appStoreVersions query failed (HTTP ${storeRes.status})`);
-      process.exit(2);
+      failExit(storeRes.status);
     }
     const appStoreVersions = (storeRes.parsed.data || [])
-      .map((v) => v.attributes?.versionString || "")
-      .filter((v) => v !== "");
+      .map((v) => v?.attributes?.versionString);
+    const badStore = appStoreVersions.findIndex((v) => !validVersion(v));
+    if (badStore !== -1) {
+      console.error(`latest-marketing-patch: malformed App Store version ${JSON.stringify(appStoreVersions[badStore] ?? null)}`);
+      process.exit(2);
+    }
 
     // 2) The TestFlight trains and their builds.
     const trainRes = await fetchTrains(appId, platform);
     if (!trainRes.ok) {
       console.error(`latest-marketing-patch: preReleaseVersions query failed (HTTP ${trainRes.status})`);
-      process.exit(2);
+      failExit(trainRes.status);
     }
     const trains = trainRes.trains;
 
@@ -878,7 +955,7 @@ async function main() {
 
     console.error(
       `latest-marketing-patch: ${appStoreVersions.length} App Store version(s) + ${trains.length} train(s) ` +
-      `inspected on ${platform}; highest ${prefix}.N is N=${patch}`
+      `inspected on ${platform}; next free ${prefix}.N is N=${patch + 1} (printed as ${patch}, so the caller's P + 1 lands on it)`
     );
     if (drift.length) {
       const shown = drift.slice(0, 5).join(", ");
@@ -914,13 +991,17 @@ async function main() {
       `&filter[preReleaseVersion.version]=${encodeURIComponent(version)}` +
       `&filter[preReleaseVersion.platform]=${encodeURIComponent(platform)}&limit=200`;
     for (let page = 0; page < 10 && url; page++) {
-      const res = await api("GET", url);
+      const res = await ascGet(url);
       if (!res.ok) {
         console.error(`build-floor: train builds query failed (HTTP ${res.status})`);
-        process.exit(2);
+        failExit(res.status);
       }
       for (const b of res.parsed.data || []) {
-        if (b.attributes?.version) trainBuilds.push(String(b.attributes.version));
+        if (!validVersion(b?.attributes?.version)) {
+          console.error(`build-floor: malformed build ${b?.id || "?"}`);
+          process.exit(2);
+        }
+        trainBuilds.push(b.attributes.version);
       }
       url = res.parsed.links?.next || "";
     }
@@ -931,13 +1012,17 @@ async function main() {
       `&filter[preReleaseVersion.platform]=${encodeURIComponent(platform)}` +
       `&sort=-uploadedDate&limit=200`;
     for (let page = 0; page < 10 && url; page++) {
-      const res = await api("GET", url);
+      const res = await ascGet(url);
       if (!res.ok) {
         console.error(`build-floor: app builds query failed (HTTP ${res.status})`);
-        process.exit(2);
+        failExit(res.status);
       }
       for (const b of res.parsed.data || []) {
-        if (b.attributes?.version) appBuilds.push(String(b.attributes.version));
+        if (!validVersion(b?.attributes?.version)) {
+          console.error(`build-floor: malformed build ${b?.id || "?"}`);
+          process.exit(2);
+        }
+        appBuilds.push(b.attributes.version);
       }
       url = res.parsed.links?.next || "";
     }
@@ -966,9 +1051,7 @@ async function main() {
       process.exit(2);
     }
 
-    const storeRes = await api(
-      "GET",
-      `/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}` +
+    const storeRes = await ascGet(`/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}` +
         `&include=build&limit=200`
     );
     if (!storeRes.ok) {
@@ -991,9 +1074,7 @@ async function main() {
       };
     });
 
-    const buildsRes = await api(
-      "GET",
-      `/v1/builds?filter[app]=${appId}` +
+    const buildsRes = await ascGet(`/v1/builds?filter[app]=${appId}` +
         `&filter[preReleaseVersion.platform]=${encodeURIComponent(platform)}` +
         `&include=preReleaseVersion&sort=-uploadedDate&limit=15`
     );
@@ -1067,9 +1148,7 @@ async function main() {
       process.exit(2);
     }
 
-    const listRes = await api(
-      "GET",
-      `/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}&limit=200`
+    const listRes = await ascGet(`/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}&limit=200`
     );
     if (!listRes.ok) {
       console.error(`appstore-version-prepare: appStoreVersions query failed (HTTP ${listRes.status})`);
@@ -1124,9 +1203,7 @@ async function main() {
     }
 
     const versionId = target.id;
-    const buildsRes = await api(
-      "GET",
-      `/v1/builds?filter[app]=${appId}&filter[version]=${encodeURIComponent(buildNumber)}` +
+    const buildsRes = await ascGet(`/v1/builds?filter[app]=${appId}&filter[version]=${encodeURIComponent(buildNumber)}` +
         `&filter[preReleaseVersion.version]=${encodeURIComponent(version)}` +
         `&filter[preReleaseVersion.platform]=${encodeURIComponent(platform)}&limit=10`
     );
@@ -1164,9 +1241,7 @@ async function main() {
     }
 
     // ---- verify -----------------------------------------------------------
-    const verifyRes = await api(
-      "GET",
-      `/v1/appStoreVersions/${versionId}?include=build`
+    const verifyRes = await ascGet(`/v1/appStoreVersions/${versionId}?include=build`
     );
     if (!verifyRes.ok) {
       console.error(`appstore-version-prepare: could not read the version back (HTTP ${verifyRes.status})`);
@@ -1188,7 +1263,7 @@ async function main() {
     const reference = released[0] || null;
 
     const localizationsFor = async (id) => {
-      const res = await api("GET", `/v1/appStoreVersions/${id}/appStoreVersionLocalizations?limit=200`);
+      const res = await ascGet(`/v1/appStoreVersions/${id}/appStoreVersionLocalizations?limit=200`);
       if (!res.ok) return new Map();
       const map = new Map();
       for (const loc of res.parsed.data || []) {
