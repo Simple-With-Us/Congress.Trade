@@ -9,6 +9,7 @@ import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixt
 import {
   lastTradingDay,
   PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
+  priceNotCoveredExclusionSql,
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
 } from './service.ts';
@@ -76,7 +77,8 @@ export function stPeerPricePendingFromSql(): string {
            WHEN sr.price_unavailable = ${stageFirst} THEN ?
            ELSE ?
          END
-   )`;
+   )
+   AND ${priceNotCoveredExclusionSql('sr')}`;
 }
 
 /** Pending rows that have never received an EOD bar (CT-2408 tail class only). */

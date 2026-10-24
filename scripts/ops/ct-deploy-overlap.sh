@@ -20,7 +20,16 @@
 #
 #   Hold is deliberately NOT in the main Coolify project, so
 #   `docker compose ... up` cannot stop it.  It runs the Deno app directly
-#   (no Litestream) so a second replicator does not fight the live one.
+#   (no Litestream) so a second replicator does not fight the live one, and
+#   with the boot schema migrate off (CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1):
+#   main.ts awaits that ~400-statement replay before Deno.serve, so a hold
+#   that replays it is still not serving /health when Coolify stops the old
+#   app.  In the normal path (OVERLAP_EARLY=1) hold clones the old, healthy
+#   app, which already migrated this schema; the replacement migrates again
+#   when it boots.  If hold is ever started later in a deploy, after the
+#   replacement container exists (for example hold died), it clones the
+#   replacement's image and serves that code before the replacement's own
+#   boot migrate has finished.
 #
 # INSTALL (root on the Coolify host — does not take the site down):
 #   install -m 0755 scripts/ops/ct-deploy-overlap.sh /usr/local/bin/
@@ -34,7 +43,9 @@
 #   /usr/local/bin/ct-reattach-proxy.sh
 #
 # This script never talks to production from a developer laptop.  It is a
-# host unit.  `--decide` / `--render` are offline and used by tests.
+# host unit.  `--decide` / `--parse-active` / `--render-env` /
+# `--render-env-file` are offline and used by tests.  `--render-env` prints
+# only the hold flags; `--render-env-file` writes the full env to a 0600 file.
 
 set -euo pipefail
 
@@ -136,6 +147,34 @@ raise SystemExit(0 if active else 1)
 '
 }
 
+# stdin: KEY=VALUE env lines copied from the live app.  stdout: the hold's env,
+# with each hold-only key set exactly once (any earlier value is dropped).
+#   CT_SKIP_LITESTREAM=1                 never start a second Litestream
+#                                        replicator against the live B2 target.
+#   CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1  serve /health without replaying the
+#                                        boot schema migrate (see WHAT above).
+render_hold_env() {
+  grep -v -e '^CT_SKIP_LITESTREAM=' -e '^CT_DISABLE_STARTUP_SCHEMA_MIGRATE=' || true
+  printf 'CT_SKIP_LITESTREAM=1\n'
+  printf 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n'
+}
+
+# stdin: a rendered hold env.  stdout: the two hold flags and a count of the
+# other lines.  The env is the live app's, credentials included, and docker
+# inspect prints a multi-line value (a PEM key) as several lines, so no part
+# of any other line can be shown safely, not even a KEY= prefix.
+summarize_hold_env() {
+  local line hidden=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      CT_SKIP_LITESTREAM=1 | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1) printf '%s\n' "$line" ;;
+      '') ;;
+      *) hidden=$((hidden + 1)) ;;
+    esac
+  done
+  printf '# %d other env line(s) not shown\n' "$hidden"
+}
+
 if [[ "${1:-}" == "--decide" ]]; then
   decide_overlap_action \
     "${DEPLOY_ACTIVE:-0}" \
@@ -153,8 +192,20 @@ if [[ "${1:-}" == "--parse-active" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "--render-env" ]]; then
+  render_hold_env | summarize_hold_env
+  exit 0
+fi
+
+# Same render write_hold_env hands docker, into a private file (never stdout).
+if [[ "${1:-}" == "--render-env-file" ]]; then
+  [[ -n "${2:-}" ]] || { echo "usage: $0 --render-env-file DEST" >&2; exit 2; }
+  ( umask 077; render_hold_env > "$2" )
+  exit 0
+fi
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,40p' "$0"
+  sed -n '2,48p' "$0"
   exit 0
 fi
 
@@ -218,9 +269,7 @@ write_hold_env() {
   else
     return 1
   fi
-  # Never start a second Litestream replicator against the live B2 target.
-  grep -v '^CT_SKIP_LITESTREAM=' "$dest" > "${dest}.tmp" || true
-  printf 'CT_SKIP_LITESTREAM=1\n' >> "${dest}.tmp"
+  render_hold_env < "$dest" > "${dest}.tmp"
   mv "${dest}.tmp" "$dest"
   if [[ -n "$app" ]]; then
     mkdir -p "$STATE_DIR"
@@ -298,11 +347,14 @@ stop_hold() {
 tick() {
   local app hold_on deploy builder app_on app_ok have_image action
   app="$(find_app_container)"
-  [[ -n "$app" ]] && remember_image "$app"
   hold_on=0
   container_running "$HOLD_NAME" && hold_on=1
   deploy=0
   coolify_deploy_active && deploy=1
+  # Freeze last-image for the whole deploy window: resolve_image prefers it,
+  # and refreshing it after Coolify's container swap would point the hold at
+  # the replacement image, whose boot migrate has not applied its schema yet.
+  [[ -n "$app" && "$deploy" == 0 ]] && remember_image "$app"
   builder=0
   builder_active && builder=1
   app_on=0
@@ -350,5 +402,5 @@ if [[ "${1:-}" == "--loop" ]]; then
   done
 fi
 
-echo "usage: $0 [--once|--loop|--decide|--help]" >&2
+echo "usage: $0 [--once|--loop|--decide|--parse-active|--render-env|--render-env-file DEST|--help]" >&2
 exit 2

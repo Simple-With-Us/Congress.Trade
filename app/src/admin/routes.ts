@@ -163,6 +163,7 @@ import { mergeRefs } from '../enrichment/compute.ts';
 import type { SecurityRef } from '../enrichment/types.ts';
 import {
   runPriceRefresh,
+  priceNotCoveredExclusionSql,
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
   PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
@@ -11319,6 +11320,7 @@ export async function marketPending(env: Env): Promise<{ enrich: number; prices:
                  ELSE ?
                END
          )
+         AND ${priceNotCoveredExclusionSql('sr')}
        GROUP BY t.ticker)`,
     [priceUnavailableFirstRecheckCutoffIso(), priceUnavailableCutoffIso()],
   );

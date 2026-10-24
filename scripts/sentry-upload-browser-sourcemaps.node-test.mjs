@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DASHBOARD_SOURCE,
@@ -252,6 +252,98 @@ test('the upload target is the file the generator reads, not the file it writes'
 test('the upload target is browser JavaScript, not a TypeScript module', () => {
   assert.match(DASHBOARD_SOURCE, /app\/src\/ui\/client\/dashboard\.js$/);
   assert.ok(existsSync(DASHBOARD_SOURCE), 'the upload target must exist in the repo');
+});
+
+// Workflow text with full-line comments dropped, so prose that quotes a gate is
+// never read as one.
+function withoutComments(text) {
+  return text
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n');
+}
+
+// Split every job's `steps:` list into one { name, text } entry per step,
+// without a YAML dependency:  this file runs under a bare `node --test` with no
+// node_modules.  A step starts at a `- ` item on the list's own indent and runs
+// until the next one or until a line outdents past the list.
+function workflowSteps(text) {
+  const steps = [];
+  let stepsIndent = -1;
+  let itemIndent = null;
+  for (const line of withoutComments(text).split('\n')) {
+    if (line.trim() === '') continue;
+    const stepsKey = /^(\s*)steps:\s*$/.exec(line);
+    if (stepsKey) {
+      stepsIndent = stepsKey[1].length;
+      itemIndent = null;
+      continue;
+    }
+    if (stepsIndent === -1) continue;
+    if (itemIndent === null) {
+      const item = /^(\s*)- /.exec(line);
+      if (!item || item[1].length < stepsIndent) {
+        stepsIndent = -1;
+        continue;
+      }
+      itemIndent = item[1];
+    }
+    if (line.startsWith(`${itemIndent}- `)) {
+      steps.push({ name: '', lines: [] });
+    } else if (!line.startsWith(`${itemIndent}  `)) {
+      stepsIndent = -1;
+      itemIndent = null;
+      continue;
+    }
+    const step = steps[steps.length - 1];
+    step.lines.push(line);
+    const name = /^name:\s*(.+)$/.exec(line.slice(itemIndent.length + 2));
+    if (name && !step.name) step.name = name[1].trim().replace(/^(['"])(.*)\1$/, '$2');
+  }
+  return steps.map(({ name, lines }) => ({ name, text: lines.join('\n') }));
+}
+
+// Review findings:  the Sentry Deploy workflow gates the CLI install, the
+// upload and the skip notice on a literal map path, and nothing else ties that
+// literal to DASHBOARD_SOURCE.  A moved source would leave the gate shut with
+// no error, and the notice would keep naming a map that is no longer the one
+// uploaded.  The operator matters as much as the path:  `!= ''` opens a step
+// when the map exists and `== ''` runs the skip notice when it does not.  The
+// checks are count-agnostic and leave the notice wording free, so a routine
+// workflow edit does not fail the deploy job's pre-receipt test step.
+test('the Sentry Deploy gate keys on the map beside the upload target', () => {
+  const workflow = readFileSync(resolve(ROOT, '.github/workflows/sentry-deploy.yml'), 'utf8');
+  const expected = `${relative(ROOT, DASHBOARD_SOURCE)}.map`;
+  const GATE = /hashFiles\('([^']+\.map)'\)\s*(!=|==)\s*''/g;
+
+  const paths = [...withoutComments(workflow).matchAll(/hashFiles\('([^']+\.map)'\)/g)].map((match) => match[1]);
+  assert.ok(paths.length > 0, 'the workflow must gate on a source map');
+  for (const path of paths) {
+    assert.equal(path, expected, 'every source map gate must name the map beside DASHBOARD_SOURCE');
+  }
+
+  const steps = workflowSteps(workflow);
+  const gatedOn = (op) => steps.filter((step) => [...step.text.matchAll(GATE)].some((match) => match[2] === op));
+
+  for (const name of ['Install the pinned Sentry CLI', 'Upload browser dashboard source maps']) {
+    const step = steps.find((s) => s.name === name);
+    assert.ok(step, `the workflow must keep a step named "${name}"`);
+    assert.ok(
+      gatedOn('!=').includes(step),
+      `"${name}" must run only when ${expected} exists (hashFiles(...) != '')`,
+    );
+  }
+
+  const skips = gatedOn('==');
+  assert.ok(skips.length > 0, `a skip step must run when ${expected} is missing (hashFiles(...) == '')`);
+  assert.ok(
+    skips.some((step) => {
+      const rest = step.text.replace(GATE, '');
+      const notice = rest.indexOf('::notice');
+      return notice !== -1 && rest.slice(notice).includes(expected);
+    }),
+    `the skip notice must name ${expected}`,
+  );
 });
 
 // Sentry matches a browser stack frame to its artifact by NAME, and the frame

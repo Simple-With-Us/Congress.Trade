@@ -341,6 +341,11 @@ struct AdminPanelView: View {
                 title: "ST → CT Peer Prices",
                 check: pipeline?.check(id: "st_peer_prices").map(PipelineCheckProxy.init)
             )
+            if let notCovered = pipeline?.check(id: "st_peer_prices")?.notCovered, notCovered > 0 {
+                Text("Not covered by ST: \(notCovered)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

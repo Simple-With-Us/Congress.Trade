@@ -6772,6 +6772,88 @@ describe('iOS language + Capitol Ledger harvest (issues #1529 / #1459)', () => {
   });
 });
 
+describe('owner health banner: not covered by ST (CT-2443, executed)', () => {
+  function extractFn(html: string, name: string): string {
+    const marker = 'function ' + name + '(';
+    const start = html.indexOf(marker);
+    if (start < 0) throw new Error('function not found in DASHBOARD_SOURCE: ' + name);
+    const braceStart = html.indexOf('{', start);
+    let depth = 0;
+    let i = braceStart;
+    for (; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') {
+        depth--;
+        if (depth === 0) return html.slice(start, i + 1);
+      }
+    }
+    throw new Error('unbalanced braces for ' + name);
+  }
+
+  interface BannerNode {
+    innerHTML: string;
+    style: { display: string };
+    attrs: Record<string, string>;
+    setAttribute(k: string, v: string): void;
+    removeAttribute(k: string): void;
+  }
+
+  function renderBanner(pipeline: unknown): BannerNode {
+    const banner: BannerNode = {
+      innerHTML: '',
+      style: { display: '' },
+      attrs: {},
+      setAttribute(k: string, v: string) {
+        this.attrs[k] = v;
+      },
+      removeAttribute(k: string) {
+        delete this.attrs[k];
+      },
+    };
+    const factory = new Function(
+      'nodes',
+      [
+        'function el(id) { return nodes[id] || null; }',
+        extractFn(DASHBOARD_SOURCE, 'esc'),
+        extractFn(DASHBOARD_SOURCE, 'renderOwnerHealthBanner'),
+        'return renderOwnerHealthBanner;',
+      ].join('\n'),
+    ) as (nodes: Record<string, BannerNode>) => (pipeline: unknown, admin: boolean) => void;
+    factory({ ownerHealthBanner: banner })(pipeline, true);
+    return banner;
+  }
+
+  it('shows Not covered by ST with the sample when st_peer_prices has notCovered > 0', () => {
+    const banner = renderBanner({
+      checks: [
+        {
+          id: 'st_peer_prices',
+          status: 'ok',
+          detail: 'ST price refresh moving (no pending tickers); 3 not covered by ST',
+          value: { pending: 0, notCovered: 3, notCoveredSample: ['AAA', 'BBB', 'CCC'] },
+        },
+      ],
+    });
+    expect(banner.innerHTML).toContain('Not covered by ST: 3');
+    expect(banner.innerHTML).toContain('(AAA, BBB, CCC)');
+    expect(banner.innerHTML).toContain('title="AAA, BBB, CCC"');
+    expect(banner.style.display).toBe('block');
+  });
+
+  it('shows no not-covered row when the count is 0 or absent', () => {
+    const zero = renderBanner({
+      checks: [{ id: 'st_peer_prices', status: 'ok', detail: 'ok', value: { pending: 0, notCovered: 0 } }],
+    });
+    expect(zero.innerHTML).not.toContain('Not covered by ST');
+    expect(zero.style.display).toBe('none');
+
+    const legacy = renderBanner({
+      checks: [{ id: 'st_peer_prices', status: 'ok', detail: 'ok', value: { pending: 0 } }],
+    });
+    expect(legacy.innerHTML).not.toContain('Not covered by ST');
+  });
+});
+
 describe('mobile web chrome polish (issue #2016)', () => {
   it('keeps Trends and Trades filters on one nowrap row with a content-sized timeframe', () => {
     expect(DASHBOARD_SOURCE).toContain('#view-trends #trendsSharedFilters[data-filter-mirror] { display: none !important; }');
