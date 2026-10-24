@@ -701,7 +701,7 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
     expect(calls).toHaveLength(1);
   });
 
-  it('HIGH: a failed backfill stops marking the ticker current, so the normal refresh re-selects it', async () => {
+  it('HIGH: a failed backfill writes nothing, keeps stage 4, and the next re-check prices the full window', async () => {
     seedRecoverable('HALF', 't-half');
     const calls: Array<{ from: string; to: string }> = [];
 
@@ -710,23 +710,50 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
       pace: noPace,
     });
 
-    expect(res).toMatchObject({ repriced: 1, backfilled: 0, aborted: false });
+    expect(res).toMatchObject({ repriced: 0, backfilled: 0, restamped: 1, aborted: false });
     const row = srRow('HALF');
-    expect(row?.price_unavailable).toBe(0);
+    expect(row?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
+    expect(row?.price_checked_at).toBe(NOW.toISOString());
     expect(row?.latest_price_date).toBeNull();
+    // No partial cache:  a warm newest close would make later plans skip the gap.
+    expect(db.prepare('SELECT COUNT(*) AS n FROM price_eod WHERE ticker = ?').get('HALF')).toEqual({ n: 0 });
 
-    // The next normal refresh picks it up and fills the gap below the cache.
-    h.responses.set('HALF', [
-      { date: '2026-10-22', close: 42 },
-      { date: '2012-02-29', close: 10 },
-    ]);
-    await runPriceRefresh(env, { max: 10 });
-    expect(h.eodCalls.some((c) => c.symbol === 'HALF' && c.from <= OLD_TRADE)).toBe(true);
+    // Next day's re-check, ST healthy:  full window in one write.
+    const calls2: Array<{ from: string; to: string }> = [];
+    const res2 = await recheckNotCoveredPeerPrices(env, recoveredClient(calls2), {
+      now: new Date(NOW.getTime() + 86_400_000),
+      pace: noPace,
+    });
+    expect(res2).toMatchObject({ repriced: 1, backfilled: 1 });
     expect(priceAtTrade('t-half')).toBe(10);
     expect(srRow('HALF')?.latest_price_date).toBe('2026-10-22');
   });
 
-  it('HIGH: a fatal error on the backfill aborts the re-check and leaves the ticker re-selectable', async () => {
+  it('HIGH: a warm cache with a gap since its last close is filled across the gap, not just the probe window', async () => {
+    seedTrade('t-gap', 'GAPPY', '2025-06-02');
+    seedSr('GAPPY', { priceUnavailable: 4, priceCheckedAt: hoursAgoIso(100), latestPriceDate: '2025-01-31' });
+    seedPrice('GAPPY', '2025-01-31', 5);
+    seedPrice('GAPPY', '2020-01-02', 4);
+    const froms: string[] = [];
+    const client: PriceClient = {
+      eodHistory: async (_s: string, from?: string) => {
+        froms.push(from ?? '');
+        return [
+          { date: '2026-10-22', close: 42 },
+          { date: '2025-05-30', close: 7 },
+        ].filter((r) => r.date >= (from ?? ''));
+      },
+      spxHistory: async () => [],
+    };
+
+    const res = await recheckNotCoveredPeerPrices(env, client, { now: NOW, pace: noPace });
+
+    expect(res).toMatchObject({ repriced: 1, backfilled: 1 });
+    expect(froms[1] <= '2025-01-31').toBe(true);
+    expect(priceAtTrade('t-gap')).toBe(7);
+  });
+
+  it('HIGH: a fatal error on the backfill aborts the re-check without writing the probe', async () => {
     seedRecoverable('FATALB', 't-fb');
     const calls: Array<{ from: string; to: string }> = [];
 
@@ -736,7 +763,8 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
     });
 
     expect(res.aborted).toBe(true);
-    expect(srRow('FATALB')?.latest_price_date).toBeNull();
+    expect(srRow('FATALB')?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM price_eod WHERE ticker = ?').get('FATALB')).toEqual({ n: 0 });
   });
 
   it('the cause never claims an error streak from one marker', async () => {

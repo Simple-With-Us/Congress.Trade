@@ -136,11 +136,6 @@ async function restampNotCovered(env: Env, ticker: string, nowIso: string): Prom
   );
 }
 
-/** Make the normal refresh re-select a ticker whose cached history is incomplete. */
-async function clearLatestPriceDate(env: Env, ticker: string): Promise<void> {
-  await run(env.DB, 'UPDATE securities_ref SET latest_price_date = NULL WHERE ticker = ?', [ticker]);
-}
-
 export interface NotCoveredRecheckResult {
   checked: number;
   repriced: number;
@@ -201,8 +196,8 @@ export async function recheckNotCoveredPeerPrices(
     // Bounded probe:  stage-4 tickers are known-unpriceable, so a recent window
     // is enough to see that ST started pricing one.  A cold cache would
     // otherwise re-request years of daily bars every day.  When a ticker
-    // recovers through a clamped window, its full history is fetched right
-    // after (below), so trades older than the window get priced too.
+    // recovers through a clamped window, its full window is fetched before
+    // anything is written (below), so every trade gets priced.
     const fetchPlan = await planTickerEodFetch(env, ticker, {
       maxLookbackDays: NOT_COVERED_RECHECK_LOOKBACK_DAYS,
     });
@@ -236,32 +231,34 @@ export async function recheckNotCoveredPeerPrices(
       !isStaleListingDate(newest.date, now) &&
       (prevLatest == null || newest.date >= prevLatest);
     if (accepted) {
-      await writeTickerEodHistory(env, ticker, hist, nowIso, { stage: 0, reason: null });
-      result.repriced++;
+      let toWrite = hist;
       if (fetchPlan.fullFrom < fetchPlan.from) {
-        // The probe stopped short of what the trades need, yet the write above
-        // stamped latest_price_date current, so the normal refresh would never
-        // re-select this ticker and trades before the probe window would keep
-        // a NULL price_at_trade.  Fetch the full window now.  This costs one
-        // extra ST call only on the rare day a stage-4 ticker recovers.
+        // The probe stopped short of what the trades need.  Writing it alone
+        // would stamp latest_price_date current and warm the cache's newest
+        // close, so no later plan would reach back across the gap and older
+        // trades would keep a NULL price_at_trade.  Fetch the full window
+        // BEFORE writing anything, and write it in one go.  This costs one
+        // extra ST call only on the day a stage-4 ticker recovers.
         try {
           await pace();
-          const older = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to);
-          if (older.length > 0) {
-            await writeTickerEodHistory(env, ticker, older, nowIso, { stage: 0, reason: null });
-          }
+          const full = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to);
+          if (full.length > 0) toWrite = full;
           result.backfilled++;
         } catch (e) {
           result.errors.push(ticker + ' (backfill): ' + (e as Error).message);
-          // Stop marking it current so selectTickersNeedingPrices re-selects
-          // it and the normal refresh fetches the full window instead.
-          await clearLatestPriceDate(env, ticker);
           if (isFatalPriceProviderError(e, false)) {
             result.aborted = true;
             break;
           }
+          // Nothing written:  the ticker stays stage 4 with no partial cache,
+          // and tomorrow's re-check retries the probe and the full window.
+          await restampNotCovered(env, ticker, nowIso);
+          result.restamped++;
+          continue;
         }
       }
+      await writeTickerEodHistory(env, ticker, toWrite, nowIso, { stage: 0, reason: null });
+      result.repriced++;
     } else {
       await restampNotCovered(env, ticker, nowIso);
       result.restamped++;
