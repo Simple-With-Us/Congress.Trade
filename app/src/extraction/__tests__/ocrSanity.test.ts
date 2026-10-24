@@ -219,6 +219,13 @@ describe('normalizeOcrAssetName — Sep 17 rows', () => {
     expect(result.nameHolds).toHaveLength(0);
   });
 
+  it('repairs every copy of a repeated garbled word, not just the first', () => {
+    const result = normalizeOcrAssetName('Uber Technolo1des Fund Technolo1des Holdings');
+    expect(result.name).not.toContain('Technolo1des');
+    expect(result.name).toBe('Uber Technologies Fund Technologies Holdings');
+    expect(result.nameHolds).toHaveLength(0);
+  });
+
   it('holds rows with no confident fix instead of guessing', () => {
     for (const garbled of [
       'Legal200m Com Inc.',

@@ -785,7 +785,10 @@ export function normalizeOcrAssetName(input: string, opts: OcrNameOptions = {}):
     }
     if (best && secondBest > best.distance) {
       const replacement = matchWordCase(word, best.word);
-      text = text.replace(word, replacement);
+      // Global: a repeated garbled token must not leave a second copy behind
+      // to re-trigger the step-5 hold check (same split/join as the caps-l
+      // path above; also avoids `$`-pattern surprises in the replacement).
+      text = text.split(word).join(replacement);
       notes.push(`matched known word '${replacement}'`);
       touchedByCapsFix.delete(word);
     }

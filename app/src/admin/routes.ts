@@ -1083,10 +1083,12 @@ function validateReviewEdits(
       return { error: `edits[${index}].txType must be explicitly B (Buy), S (Sell), or E (Exchange); P is accepted as Buy` };
     }
     const ownerRaw = typeof e.owner === 'string' ? e.owner.trim().toLowerCase() : '';
-    const owner = ownerRaw === '' ? null : ownerRaw;
-    if (owner !== null && owner !== 'self' && owner !== 'spouse' && owner !== 'joint' && owner !== 'dependent') {
-      return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
-    }
+    // Positive narrowing, no assertion: only these spellings become the
+    // union (empty/omitted means null); anything else is a 400.
+    let owner: ValidatedEditedTx['owner'];
+    if (ownerRaw === '') owner = null;
+    else if (ownerRaw === 'self' || ownerRaw === 'spouse' || ownerRaw === 'joint' || ownerRaw === 'dependent') owner = ownerRaw;
+    else return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
     const txDate = typeof e.txDate === 'string' ? e.txDate.trim() : '';
     // Shared strict check: real calendar date, not future, not older than
     // the lookback below the filing date.  After-filed trades stay allowed
@@ -1151,9 +1153,7 @@ function validateReviewEdits(
         return { error: `edits[${index}].${field} must be a boolean` };
       }
     }
-    // The owner guard above already proved this value; the cast only tells the
-    // checker the union it cannot infer from the !== chain (never `any`).
-    edits.push({ ...e, ticker: ticker || null, assetName: finalAssetName, txDate, owner: owner as ValidatedEditedTx['owner'], txType, cleaningNote });
+    edits.push({ ...e, ticker: ticker || null, assetName: finalAssetName, txDate, owner, txType, cleaningNote });
   }
   return { edits };
 }

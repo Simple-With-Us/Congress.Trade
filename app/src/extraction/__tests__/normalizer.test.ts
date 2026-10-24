@@ -673,6 +673,20 @@ describe('normalize', () => {
     expect(String(cap.reviewRows[0][1])).toContain('ocr_name_hold');
   });
 
+  it('holds an impossible maturity date lifted into the cleaning note', async () => {
+    const { env, cap } = makeEnv([{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }]);
+    // splitAssetNameDetail moves the shape-only "Due 02/30/2026" suffix into
+    // the note before the OCR scan; the machine path must still hold (as the
+    // admin path 400s the same raw string) instead of publishing it in Notes.
+    const result = await normalize(env, filing(), [
+      tx({ ticker: null, assetName: 'Bond Due 02/30/2026' }),
+    ]);
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(String(cap.reviewRows[0][1])).toContain('ocr_date_hold');
+  });
+
   it('routes empty extraction to review', async () => {
     const { env, cap } = makeEnv([]);
     const result = await normalize(env, filing(), []);

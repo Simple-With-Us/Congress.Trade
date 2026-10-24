@@ -76,7 +76,7 @@ import {
   type IssuerNameIndex,
 } from '../enrichment/nameTickerBackfill.ts';
 import { parseAmountRange } from './amounts.ts';
-import { issuerWords, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
+import { issuerWords, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
 import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
 import {
@@ -835,8 +835,19 @@ function buildTransaction(
   // Confident OCR fixes apply to the stored name with an audit note; the
   // scoring below holds rows whose garble has no confident fix.
   const ocr = normalizeOcrAssetName(cleanedAssetName, { extraKnownWords: ocrExtraWords });
-  const ocrAssetName = ocr.name;
-  const ocrNote = ocr.notes.length > 0 ? `normalized OCR artifacts: ${ocr.notes.join('; ')}` : null;
+  // The split above lifts shape-only maturity suffixes ("Due 02/30/2026")
+  // into the cleaning note before the scan, so an impossible maturity date
+  // would escape the guard and publish in the user-visible Notes column
+  // while the admin path (which scans the raw string) 400s the same row.
+  // Merge date holds from the raw name too; dedupe tokens both scans see.
+  const rawDateHolds = normalizeEmbeddedOcrDates(rawAssetName ?? '').holdReasons.filter(
+    (reason) => !ocr.dateHolds.includes(reason),
+  );
+  const ocrResult: OcrNameResult = rawDateHolds.length > 0
+    ? { ...ocr, dateHolds: [...ocr.dateHolds, ...rawDateHolds] }
+    : ocr;
+  const ocrAssetName = ocrResult.name;
+  const ocrNote = ocrResult.notes.length > 0 ? `normalized OCR artifacts: ${ocrResult.notes.join('; ')}` : null;
   const s = scoreFields(
     p.confidence,
     {
@@ -854,7 +865,7 @@ function buildTransaction(
     resolve,
     nameIndex,
     ocrExtraWords,
-    ocr,
+    ocrResult,
   );
   // Models (and local_mac OCR) often leave assetType null even when the PTR
   // line says "Common Stock" or carries a House [ST] code. Infer before

@@ -5,11 +5,14 @@
  * filings (first: E-2026-donald-j-trump-09-17-2026-278t, 517 hand-confirmed
  * rows).  Every row runs through the SAME shared normalizer the write
  * boundaries now enforce (src/extraction/ocrSanity.ts), so the dry run shows
- * exactly what the guards would do.
+ * what the guards would do for the displayed names.
  *
  * Modes:
  *   dry run (default, no auth) — fetch the PUBLIC filing API for --doc,
  *     print counts plus before->after samples and held rows.  Writes nothing.
+ *     The public API serves display-transformed names, so a preview row can
+ *     classify differently from the stored row --apply reads; the report
+ *     states this source every run, and --apply re-reads stored values.
  *   --apply (admin token) — loop the sanctioned
  *     POST /api/admin/clean-asset-names endpoint until done.  That endpoint
  *     reads live stored values (the public API serves display-transformed
@@ -144,7 +147,8 @@ async function dryRun(base: string, docs: string[], samples: number, jsonPath: s
     held.push(...result.held);
   }
   console.log(`\nscanned:  ${scanned} rows (${docs.length} filing${docs.length === 1 ? '' : 's'})`);
-  console.log('mode:     READ-ONLY — this script writes nothing\n');
+  console.log('mode:     READ-ONLY — this script writes nothing');
+  console.log('source:   public display API (display-transformed names; --apply re-reads stored values)\n');
   console.log('=== WOULD CHANGE ===');
   console.log(`rows changed:       ${changed.length}`);
   console.log(`rows held:          ${held.length}`);
@@ -289,10 +293,18 @@ async function apply(base: string, docs: string[], allRows: boolean, pageSize: n
 async function main(): Promise<void> {
   const base = (arg('base', 'https://congress.trade') as string).replace(/\/+$/, '');
   const samplesArg = arg('samples');
-  const samples = samplesArg === undefined
+  // Non-numeric input must fall back to the defaults: Math.max/min propagate
+  // NaN, which would print a "(NaN of N)" header with zero rows and send
+  // limit=NaN to the server (same Number.isFinite pattern as the
+  // /clean-asset-names paging params).
+  const parsedSamples = samplesArg === undefined ? Number.NaN : Number(samplesArg);
+  const samples = samplesArg === undefined || !Number.isFinite(parsedSamples)
     ? Number.POSITIVE_INFINITY
-    : Math.max(1, Number(samplesArg));
-  const pageSize = Math.max(100, Math.min(2000, Number(arg('page', '500'))));
+    : Math.max(1, Math.floor(parsedSamples));
+  const parsedPage = Number(arg('page', '500'));
+  const pageSize = Number.isFinite(parsedPage)
+    ? Math.max(100, Math.min(2000, Math.floor(parsedPage)))
+    : 500;
   const jsonPath = arg('json');
   if (flag('apply')) {
     // Unlike the dry run, --apply never falls back to the default doc: the
