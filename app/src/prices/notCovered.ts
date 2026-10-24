@@ -20,7 +20,7 @@ import {
   lastTradingDay,
   markTickerPriceUnavailable,
   notCoveredReason,
-  NOT_COVERED_CAUSE_STUCK_ERRORING,
+  NOT_COVERED_CAUSE_LAST_ERRORED,
   NOT_COVERED_CAUSE_STUCK_PENDING,
   ST_FETCH_ERROR_REASON_PREFIX,
   planTickerEodFetch,
@@ -105,15 +105,18 @@ export async function markStuckPeerPriceTickersNotCovered(
   }
   const nowIso = now.toISOString();
   for (const { ticker, last_reason } of rows) {
-    // Say WHY:  a ticker whose last recorded outcome is an ST fetch error is
-    // marked as erroring (with the error), not as "no data".  Either way the
+    // Say WHY, and only what is known:  72h without a completed check is the
+    // proven fact;  an error marker adds that the LAST attempt failed (with the
+    // message).  One marker is not an error streak, so the cause never says so.  Either way the
     // daily re-check retries it, so a recovered ST reprices it within a day.
     const lastError = last_reason?.startsWith(ST_FETCH_ERROR_REASON_PREFIX)
       ? last_reason.slice(ST_FETCH_ERROR_REASON_PREFIX.length)
       : null;
     const reason = notCoveredReason(
       now,
-      lastError ? `${NOT_COVERED_CAUSE_STUCK_ERRORING} (${lastError})` : NOT_COVERED_CAUSE_STUCK_PENDING,
+      lastError
+        ? `${NOT_COVERED_CAUSE_STUCK_PENDING}; ${NOT_COVERED_CAUSE_LAST_ERRORED} (${lastError})`
+        : NOT_COVERED_CAUSE_STUCK_PENDING,
     );
     await markTickerPriceUnavailable(env, ticker, reason, {
       checkedAt: nowIso,
@@ -137,6 +140,8 @@ export interface NotCoveredRecheckResult {
   checked: number;
   repriced: number;
   restamped: number;
+  /** Repriced tickers whose full history from the oldest trade was then fetched. */
+  backfilled: number;
   aborted: boolean;
   errors: string[];
 }
@@ -169,6 +174,7 @@ export async function recheckNotCoveredPeerPrices(
     checked: 0,
     repriced: 0,
     restamped: 0,
+    backfilled: 0,
     aborted: false,
     errors: [],
   };
@@ -189,8 +195,9 @@ export async function recheckNotCoveredPeerPrices(
     }
     // Bounded probe:  stage-4 tickers are known-unpriceable, so a recent window
     // is enough to see that ST started pricing one.  A cold cache would
-    // otherwise re-request years of daily bars every day.  After a reprice the
-    // normal refresh backfills older history (gap-below-cache branch).
+    // otherwise re-request years of daily bars every day.  When a ticker
+    // recovers through a clamped window, its full window is fetched before
+    // anything is written (below), so every trade gets priced.
     const fetchPlan = await planTickerEodFetch(env, ticker, {
       maxLookbackDays: NOT_COVERED_RECHECK_LOOKBACK_DAYS,
     });
@@ -224,7 +231,33 @@ export async function recheckNotCoveredPeerPrices(
       !isStaleListingDate(newest.date, now) &&
       (prevLatest == null || newest.date >= prevLatest);
     if (accepted) {
-      await writeTickerEodHistory(env, ticker, hist, nowIso, { stage: 0, reason: null });
+      let toWrite = hist;
+      if (fetchPlan.fullFrom < fetchPlan.from) {
+        // The probe stopped short of what the trades need.  Writing it alone
+        // would stamp latest_price_date current and warm the cache's newest
+        // close, so no later plan would reach back across the gap and older
+        // trades would keep a NULL price_at_trade.  Fetch the full window
+        // BEFORE writing anything, and write it in one go.  This costs one
+        // extra ST call only on the day a stage-4 ticker recovers.
+        try {
+          await pace();
+          const full = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to);
+          if (full.length > 0) toWrite = full;
+          result.backfilled++;
+        } catch (e) {
+          result.errors.push(ticker + ' (backfill): ' + (e as Error).message);
+          if (isFatalPriceProviderError(e, false)) {
+            result.aborted = true;
+            break;
+          }
+          // Nothing written:  the ticker stays stage 4 with no partial cache,
+          // and tomorrow's re-check retries the probe and the full window.
+          await restampNotCovered(env, ticker, nowIso);
+          result.restamped++;
+          continue;
+        }
+      }
+      await writeTickerEodHistory(env, ticker, toWrite, nowIso, { stage: 0, reason: null });
       result.repriced++;
     } else {
       await restampNotCovered(env, ticker, nowIso);

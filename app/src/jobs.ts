@@ -85,11 +85,24 @@ async function stampDaily(env: Env, key: string, day: string): Promise<boolean> 
 }
 
 /**
+ * The only part of KV the daily lane stamps use.  Env's CONFIG_KV satisfies
+ * it, and tests can supply a plain typed in-memory store without casting a
+ * partial Env.
+ */
+export interface LaneStampStore {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+}
+export interface LaneStampEnv {
+  CONFIG_KV: LaneStampStore;
+}
+
+/**
  * Top-level daily lane: only mark "done" once the lane has actually
  * finished successfully. Returns true if the lane has NOT yet succeeded
  * today (so the caller should run it).
  */
-async function laneHasSucceeded(env: Env, key: string, day: string): Promise<boolean> {
+async function laneHasSucceeded(env: LaneStampEnv, key: string, day: string): Promise<boolean> {
   try {
     const last = await env.CONFIG_KV.get(key);
     return last === day;
@@ -103,7 +116,7 @@ async function laneHasSucceeded(env: Env, key: string, day: string): Promise<boo
  * lane ONLY when it returns 'ran'. Best-effort; a KV write failure is
  * non-fatal (next tick will just retry).
  */
-async function markLaneOk(env: Env, key: string, day: string): Promise<void> {
+async function markLaneOk(env: LaneStampEnv, key: string, day: string): Promise<void> {
   try {
     await env.CONFIG_KV.put(key, day, { expirationTtl: 172800 });
   } catch (err) {
@@ -386,14 +399,10 @@ export async function maybeRunNotCoveredRecheck(
   now: Date,
   day: string,
   opts: { maxPerMinute?: number; signal?: AbortSignal } = {},
-): Promise<'stamped' | 'ran' | 'aborted' | 'error'> {
-  if (await laneHasSucceeded(env, NOT_COVERED_RECHECK_KEY, day)) return 'stamped';
-  try {
+): Promise<NotCoveredRecheckLaneStatus> {
+  return await runNotCoveredRecheckLane(env, day, async () => {
     const refreshClient = await buildPriceRefreshClient(env, { maxPerMinute: opts.maxPerMinute });
-    if (!refreshClient) {
-      await markLaneOk(env, NOT_COVERED_RECHECK_KEY, day);
-      return 'ran';
-    }
+    if (!refreshClient) return { aborted: false };
     const r = await recheckNotCoveredPeerPrices(env, refreshClient.client, {
       now,
       pace: refreshClient.pace,
@@ -405,13 +414,33 @@ export async function maybeRunNotCoveredRecheck(
         JSON.stringify({
           checked: r.checked,
           repriced: r.repriced,
+          backfilled: r.backfilled,
           restamped: r.restamped,
           aborted: r.aborted,
           errors: r.errors.slice(0, 3),
         }),
       );
     }
-    if (r.aborted) return 'aborted';
+    return { aborted: r.aborted };
+  });
+}
+
+export type NotCoveredRecheckLaneStatus = 'stamped' | 'ran' | 'aborted' | 'error';
+
+/**
+ * Lane-stamp policy for the not-covered re-check, separated from the ST work
+ * so it can be tested with a typed in-memory stamp store:  skip when already
+ * stamped today;  stamp only after a run that did not abort or throw.
+ */
+export async function runNotCoveredRecheckLane(
+  env: LaneStampEnv,
+  day: string,
+  recheck: () => Promise<{ aborted: boolean }>,
+): Promise<NotCoveredRecheckLaneStatus> {
+  if (await laneHasSucceeded(env, NOT_COVERED_RECHECK_KEY, day)) return 'stamped';
+  try {
+    const { aborted } = await recheck();
+    if (aborted) return 'aborted';
     await markLaneOk(env, NOT_COVERED_RECHECK_KEY, day);
     return 'ran';
   } catch (err) {
