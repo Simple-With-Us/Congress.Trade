@@ -13,7 +13,8 @@ vi.mock('../houseSource', () => ({
   pollHouseLiveSearch: mocks.pollHouseLiveSearch,
 }));
 
-vi.mock('../senateSource', () => ({
+vi.mock('../senateSource', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../senateSource.ts')>()),
   fetchSenatePtrFilings: mocks.fetchSenatePtrFilings,
 }));
 
@@ -129,6 +130,30 @@ describe('runWatcher', () => {
     // Default the OGE source to "nothing due" so tests that don't exercise the
     // executive path leave it skipped instead of tripping the mock.
     mocks.pollOgeExecutive.mockResolvedValue(null);
+  });
+
+  it('logs a live Akamai eFD block as an error (Sentry-visible) and a backoff short-circuit as a warning (CT-2416)', async () => {
+    const { SenateAkamaiBlockError } = await import('../senateSource.ts');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      mocks.fetchHouseIndex.mockResolvedValue([]);
+      mocks.fetchSenatePtrFilings.mockRejectedValueOnce(new SenateAkamaiBlockError('POST report/data/', 403));
+      await runWatcher(fakeEnv().env, new Date('2026-06-30T15:00:00.000Z'));
+      const blocked = error.mock.calls.filter((c) => String(c[0]).includes('senate source blocked'));
+      expect(blocked).toHaveLength(1);
+      expect(String(blocked[0][1])).toContain('senate eFD anti-bot block (Akamai)');
+
+      error.mockClear();
+      warn.mockClear();
+      mocks.fetchSenatePtrFilings.mockRejectedValueOnce(new SenateAkamaiBlockError('POST report/data/', 403, true));
+      await runWatcher(fakeEnv().env, new Date('2026-06-30T15:00:00.000Z'));
+      expect(error.mock.calls.filter((c) => String(c[0]).includes('senate source'))).toHaveLength(0);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('senate source blocked (backoff active)'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
   });
 
   it('does not stamp last-poll state after source failures', async () => {

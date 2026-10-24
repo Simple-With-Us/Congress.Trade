@@ -9,6 +9,9 @@ import {
   establishSenateSession,
   looksLikeSenateAgreementWall,
   SENATE_SESSION_KV_KEY,
+  SENATE_AKAMAI_BLOCK_KV_KEY,
+  SenateAkamaiBlockError,
+  looksLikeAkamaiAccessDenied,
 } from '../senateSource.ts';
 
 describe('parseCsrfMiddlewareToken', () => {
@@ -342,5 +345,114 @@ describe('fetchSenatePtrFilings', () => {
     await expect(
       fetchSenatePtrFilings({ relayUrl: 'https://scout.jays.services', politeDelayMs: 0 }, fetchImpl),
     ).rejects.toThrow(/senate GET \/search\/ -> HTTP 404/);
+  });
+});
+
+// CT-2416: efdsearch.senate.gov fronts POSTs with Akamai Bot Manager.
+describe('Akamai anti-bot block', () => {
+  const AKAMAI_403 = `<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>\n<H1>Access Denied</H1>\n`
+    + `You don't have permission to access "http://efdsearch.senate.gov/search/report/data/" on this server.<P>\n`
+    + `Reference #18.6a2e3e17.1761300000.1a2b3c4d\n<P>https://errors.edgesuite.net/18.6a2e3e17.1761300000.1a2b3c4d</P>\n</BODY></HTML>`;
+  const now = new Date('2026-10-23T23:00:00.000Z');
+
+  function memKv(seed: Record<string, string> = {}) {
+    const m = new Map<string, string>(Object.entries(seed));
+    return {
+      m,
+      async get(key: string, type?: string) {
+        const v = m.get(key);
+        if (v == null) return null;
+        return type === 'json' ? JSON.parse(v) : v;
+      },
+      async put(key: string, value: string) {
+        m.set(key, value);
+      },
+      async delete(key: string) {
+        m.delete(key);
+      },
+    };
+  }
+
+  function efd(opts: { agree?: () => Response; data?: () => Response }, calls: string[]) {
+    return async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> => {
+      const url = String(input);
+      calls.push(`${init?.method ?? 'GET'} ${url.replace('https://efdsearch.senate.gov', '')}`);
+      if (url.endsWith('/search/')) {
+        return new Response(`<input type="hidden" name="csrfmiddlewaretoken" value="t">`, {
+          headers: { 'set-cookie': 'csrftoken=c; Path=/' },
+        });
+      }
+      if (url.endsWith('/search/home/')) return opts.agree ? opts.agree() : new Response('', { status: 302 });
+      if (url.endsWith('/search/report/data/')) {
+        return opts.data
+          ? opts.data()
+          : new Response(JSON.stringify({ data: [] }), { headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    };
+  }
+
+  it('recognises the Akamai Access Denied page but not a plain 403', () => {
+    expect(looksLikeAkamaiAccessDenied(AKAMAI_403)).toBe(true);
+    expect(looksLikeAkamaiAccessDenied('<title>Access Denied</title>')).toBe(true);
+    expect(looksLikeAkamaiAccessDenied('Forbidden')).toBe(false);
+    expect(looksLikeAkamaiAccessDenied('')).toBe(false);
+  });
+
+  it('throws the distinct Akamai error when the agreement POST is refused', async () => {
+    const calls: string[] = [];
+    const fetchImpl = efd({ agree: () => new Response(AKAMAI_403, { status: 403 }) }, calls);
+    await expect(establishSenateSession({ politeDelayMs: 0 }, fetchImpl as typeof fetch)).rejects.toThrow(
+      'senate eFD anti-bot block (Akamai): POST /search/home/ -> HTTP 403',
+    );
+  });
+
+  it('does not redo the handshake when a cached session hits an Akamai 403, and backs off', async () => {
+    const calls: string[] = [];
+    const kv = memKv({ [SENATE_SESSION_KV_KEY]: JSON.stringify({ csrfCookie: 'c', cookieHeader: 'sessionid=s' }) });
+    const fetchImpl = efd({ data: () => new Response(AKAMAI_403, { status: 403 }) }, calls);
+    const err = await fetchSenatePtrFilings({ kv, now, politeDelayMs: 0 }, fetchImpl).catch((e) => e);
+    expect(err).toBeInstanceOf(SenateAkamaiBlockError);
+    expect((err as SenateAkamaiBlockError).cached).toBe(false);
+    expect(String((err as Error).message)).toContain('senate eFD anti-bot block (Akamai)');
+    // One data POST, no landing GET / agreement POST retry, no direct-egress backoff retries.
+    expect(calls).toEqual(['POST /search/report/data/']);
+    const block = JSON.parse(kv.m.get(SENATE_AKAMAI_BLOCK_KV_KEY)!);
+    expect(block.step).toBe('POST report/data/');
+    expect(Date.parse(block.until)).toBe(now.getTime() + 30 * 60_000);
+
+    // Next tick inside the backoff window: no eFD traffic at all.
+    calls.length = 0;
+    const again = await fetchSenatePtrFilings(
+      { kv, now: new Date(now.getTime() + 5 * 60_000), politeDelayMs: 0 },
+      fetchImpl,
+    ).catch((e) => e);
+    expect(again).toBeInstanceOf(SenateAkamaiBlockError);
+    expect((again as SenateAkamaiBlockError).cached).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  it('dials eFD again once the backoff expires', async () => {
+    const calls: string[] = [];
+    const kv = memKv({
+      [SENATE_AKAMAI_BLOCK_KV_KEY]: JSON.stringify({ until: new Date(now.getTime() - 1).toISOString(), step: 'x' }),
+    });
+    const out = await fetchSenatePtrFilings({ kv, now, politeDelayMs: 0 }, efd({}, calls));
+    expect(out).toEqual([]);
+    expect(calls).toContain('POST /search/report/data/');
+  });
+
+  it('still retries a generic (non-Akamai) 403 with a fresh handshake', async () => {
+    const calls: string[] = [];
+    const kv = memKv({ [SENATE_SESSION_KV_KEY]: JSON.stringify({ csrfCookie: 'c', cookieHeader: 'sessionid=s' }) });
+    let n = 0;
+    const fetchImpl = efd({
+      data: () => (n++ === 0
+        ? new Response('Forbidden', { status: 403 })
+        : new Response(JSON.stringify({ data: [] }), { headers: { 'content-type': 'application/json' } })),
+    }, calls);
+    await fetchSenatePtrFilings({ kv, now, politeDelayMs: 0 }, fetchImpl);
+    expect(calls).toEqual(['POST /search/report/data/', 'GET /search/', 'POST /search/home/', 'POST /search/report/data/']);
+    expect(kv.m.has(SENATE_AKAMAI_BLOCK_KV_KEY)).toBe(false);
   });
 });

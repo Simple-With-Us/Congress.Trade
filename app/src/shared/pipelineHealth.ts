@@ -263,7 +263,7 @@ export interface PipelineSignals {
       host?: string;
     } | null;
   } | null;
-  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  /** Proxied eFD landing + agreement POST probe (CONFIG_KV, CT-2416). */
   senateEfd?: {
     probe: {
       ok: boolean;
@@ -271,6 +271,8 @@ export interface PipelineSignals {
       checkedAt: string;
       egress?: string | null;
       error?: string | null;
+      state?: 'ok' | 'blocked' | 'degraded';
+      step?: string | null;
     } | null;
   } | null;
   /**
@@ -1121,53 +1123,76 @@ export function evaluatePipelineSignals(
     }
   }
 
+  // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
+  // the residential proxy.  ok / blocked (Akamai anti-bot 403 → `critical`) /
+  // degraded.  A degraded probe where eFD itself answered wrong (non-Akamai
+  // HTTP error, landing without a csrf token: `status` set) is `stalled`, so it
+  // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
+  // records (`status: null`) stay `degraded`: the residential_proxy check owns
+  // relay outages, and paging twice for one cause is the churn CT-2416 removes.
   if (s.senateEfd === undefined) {
-    /* optional — fixtures predating the direct eFD probe omit this signal */
+    /* optional — fixtures predating the eFD probe omit this signal */
   } else if (s.senateEfd == null) {
-    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
-  } else if (!s.senateEfd.probe) {
-    checks.push({
-      id: 'senate_efd',
-      status: 'unknown',
-      detail: 'Senate eFD direct landing not yet probed',
-      value: null,
-    });
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD probe uncollected', value: null });
+  } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
+    // Missing, or a legacy unproxied direct-GET record (dropped 2026-10-16).
+    // A legacy datacenter 401/403 while the residential proxy is live is the
+    // expected direct-egress block (#2837): say so as `degraded`.  Anything
+    // else legacy is ignored (unknown) until the proxied probe overwrites it.
+    const legacy = s.senateEfd.probe;
+    const residentialLive = Boolean(s.residentialProxyConfigured && s.residentialProxy?.probe?.ok);
+    if (legacy && !legacy.ok && residentialLive && (legacy.status === 403 || legacy.status === 401)) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe blocked from datacenter (HTTP ${legacy.status})`
+          + ` — expected; Senate ingest uses the residential proxy (live).`,
+        value: legacy.status,
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'unknown',
+        detail: 'Senate eFD proxied probe not yet run',
+        value: null,
+      });
+    }
   } else {
     const probe = s.senateEfd.probe;
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
-    if (!probe.ok) {
-      const residentialLive = Boolean(
-        s.residentialProxyConfigured &&
-        s.residentialProxy?.probe?.ok,
-      );
-      const datacenterBlock =
-        residentialLive &&
-        (probe.status === 403 || probe.status === 401);
+    const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
+    // The probe dials eFD at most every 15m, so allow two missed cycles.
+    const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, 45);
+    const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
+    if (probe.state === 'blocked') {
       checks.push({
         id: 'senate_efd',
-        status: datacenterBlock ? 'degraded' : 'stalled',
-        detail: datacenterBlock
-          ? `Senate eFD direct probe blocked from datacenter`
-            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-            + ` — expected; Senate ingest uses the residential proxy (live).`
-          : `Senate eFD direct landing unreachable`
-            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-            + `${probe.error ? ` — ${probe.error}` : ''}`,
+        status: 'critical',
+        detail: `Senate eFD BLOCKED: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
+          + ` — Senate ingestion is refused by eFD itself, not a relay outage (probed ${ago})`,
         value: probe.status,
       });
-    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+    } else if (probe.state === 'degraded') {
+      checks.push({
+        id: 'senate_efd',
+        status: probe.status != null ? 'stalled' : 'degraded',
+        detail: `Senate eFD probe degraded${probe.step ? ` at ${probe.step}` : ''}${http}`
+          + `${probe.error ? ` — ${probe.error}` : ''} (checked ${ago})`,
+        value: probe.status,
+      });
+    } else if (ageMin > maxAgeMin) {
       checks.push({
         id: 'senate_efd',
         status: 'degraded',
-        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        detail: `Senate eFD probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${maxAgeMin}m)`,
         value: Math.round(ageMin),
       });
     } else {
       checks.push({
         id: 'senate_efd',
         status: 'ok',
-        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        detail: `Senate eFD landing + agreement POST ok through ${probe.egress ?? 'proxy'}: probed ${ago}`,
         value: Math.round(ageMin * 10) / 10,
       });
     }
