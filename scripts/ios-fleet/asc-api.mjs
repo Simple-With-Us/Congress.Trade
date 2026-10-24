@@ -1067,12 +1067,39 @@ async function main() {
     const appStoreVersions = (storeRes.parsed.data || []).map((v) => {
       const buildId = toOneId(v.relationships?.build?.data);
       return {
+        id: v.id,
         versionString: v.attributes?.versionString || "",
         appStoreState: v.attributes?.appStoreState || "",
         createdDate: v.attributes?.createdDate || "",
         build: buildId ? includedBuilds.get(buildId) || null : null
       };
     });
+
+    // Read-only:  the promotional text of the editable version and of the
+    // live one, per locale, so a difference can be explained without opening
+    // App Store Connect.  Listing copy is public text, not a secret.
+    const promoVersions = appStoreVersions.filter(
+      (v) => v.appStoreState === "READY_FOR_SALE" || v.appStoreState === "PREPARE_FOR_SUBMISSION"
+    );
+    const promotionalText = [];
+    for (const v of promoVersions) {
+      const locRes = await ascGet(`/v1/appStoreVersions/${v.id}/appStoreVersionLocalizations?limit=200`);
+      if (!locRes.ok) {
+        console.error(`appstore-version-plan: localizations query failed for ${v.versionString} (HTTP ${locRes.status})`);
+        continue;
+      }
+      for (const loc of locRes.parsed.data || []) {
+        const text = loc.attributes?.promotionalText ?? null;
+        promotionalText.push({
+          version: v.versionString,
+          state: v.appStoreState,
+          locale: loc.attributes?.locale || "",
+          length: text === null ? null : String(text).length,
+          text
+        });
+      }
+    }
+    for (const v of appStoreVersions) delete v.id;
 
     const buildsRes = await ascGet(`/v1/builds?filter[app]=${appId}` +
         `&filter[preReleaseVersion.platform]=${encodeURIComponent(platform)}` +
@@ -1117,6 +1144,7 @@ async function main() {
           platform,
           appStoreVersions,
           newestBuilds,
+          promotionalText,
           nextMarketing: `1.0.${patch + 1}`
         },
         null,
