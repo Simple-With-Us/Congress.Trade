@@ -40,6 +40,16 @@ describe('sanitizeEfdTransportError', () => {
     expect(out).not.toContain('proxy-pass');
     expect(out).toContain('[redacted]');
   });
+
+  it('collects the env binding\'s proxy values as scrub secrets, not only process.env', () => {
+    const secrets = senateEfdTransportScrubSecrets('http://10.99.0.2:8888', {
+      RESIDENTIAL_PROXY_USERNAME: 'bind-user',
+      RESIDENTIAL_PROXY_PASSWORD: 'bind-pass',
+    });
+    expect(secrets).toEqual(expect.arrayContaining(['http://10.99.0.2:8888', 'bind-user', 'bind-pass']));
+    const out = sanitizeEfdTransportError(new Error('407 from proxy for bind-user / bind-pass'), secrets);
+    expect(out).not.toMatch(/bind-user|bind-pass/);
+  });
 });
 
 describe('SenateProxyEgressError', () => {

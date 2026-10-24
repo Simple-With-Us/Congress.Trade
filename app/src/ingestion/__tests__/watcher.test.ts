@@ -14,7 +14,8 @@ vi.mock('../houseSource', () => ({
   pollHouseLiveSearch: mocks.pollHouseLiveSearch,
 }));
 
-vi.mock('../senateSource', () => ({
+vi.mock('../senateSource', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../senateSource.ts')>()),
   fetchSenatePtrFilings: mocks.fetchSenatePtrFilings,
 }));
 
@@ -819,18 +820,46 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(warn.mock.calls.some(([msg]) => /senate source degraded/.test(String(msg)))).toBe(false);
   });
 
-  it('throttles the direct eFD health probe to the cached result', async () => {
-    const { env, kvPuts } = fakeEnv();
-    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
-    const probes = () => kvPuts.filter(([key]) => key === 'senate-efd:health').length;
+  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most every 30 minutes', async () => {
+    const PROXY = 'http://10.99.0.2:8888';
+    const { env, kv } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
+    const efdCalls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      // The residential proxy's own liveness hop.
+      if (url === 'http://example.com/') return new Response('ok', { status: 200 });
+      if (url.startsWith('https://efdsearch.senate.gov/')) {
+        efdCalls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
+        if (url.endsWith('/search/home/')) return new Response('', { status: 302 });
+        return new Response('<input type="hidden" name="csrfmiddlewaretoken" value="t">', {
+          status: 200,
+          headers: { 'set-cookie': 'csrftoken=c; Path=/' },
+        });
+      }
+      throw new TypeError('network disabled in tests');
+    }));
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
 
+    // The poll is edge-denied, so the probe that runs after it in the same
+    // tick, and on every tick inside the window, sends eFD nothing.
     await runWatcher(env, T0);
-    expect(probes()).toBe(1);
-    await runWatcher(env, at(1));
-    await runWatcher(env, at(29));
-    expect(probes()).toBe(1);
+    expect(kv.has(BACKOFF_KEY)).toBe(true);
     await runWatcher(env, at(30));
-    expect(probes()).toBe(2);
+    expect(efdCalls).toEqual([]);
+
+    // eFD accepts the poll after the window: the backoff clears and the probe dials.
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, at(61));
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+    expect(efdCalls).toEqual(['GET /search/', 'POST /search/home/']);
+    expect(JSON.parse(kv.get('senate-efd:health')!)).toMatchObject({ state: 'ok', egress: 'proxy' });
+
+    // Then at most every 30 minutes.
+    await runWatcher(env, at(62));
+    await runWatcher(env, at(90));
+    expect(efdCalls).toHaveLength(2);
+    await runWatcher(env, at(91));
+    expect(efdCalls).toHaveLength(4);
   });
 });
 

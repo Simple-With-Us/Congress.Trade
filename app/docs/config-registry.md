@@ -325,6 +325,12 @@ current Datadog account.
   Metered dollars persist per day/provider in the D1 `llm_spend` table
   (migration 0049) and surface in `GET /diagnostics` under
   `resourceGovernors.llmSpend`.
+- Webhook quarantine recovery (`delivery/targetCircuit.ts`, an `APP_SETTINGS`
+  knob with env fallback): `DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER` (default
+  off).  When truthy, the scheduled parked flush re-parks live quarantined
+  deliveries for delivery once the target circuit closes and parked headroom
+  opens.  Off, only rows whose transaction is gone or retracted are skipped,
+  and live rows wait for an explicit `POST /api/admin/delivery-requeue-quarantined`.
 
 ² `USAGE_MONITOR_ENVIRONMENT` is Infisical-tunable on its async read paths
 (admin-open check, usage telemetry); the sync local-webhook-target gate in

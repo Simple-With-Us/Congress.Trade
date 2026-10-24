@@ -4,9 +4,30 @@
  * Probe and health helpers for the residential Tailscale proxy.
  */
 
+import { z } from 'zod';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { createProxiedFetch, DEFAULT_RESIDENTIAL_PROXY_URL, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import type { Env } from '../shared/types.ts';
+import {
+  BROWSER_HEADERS,
+  CookieJar,
+  looksLikeSenateAgreementWall,
+  parseCsrfMiddlewareToken,
+  SENATE_SEARCH,
+} from './senateSource.ts';
+import {
+  classifySenateHttpFailure,
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEfdTransportScrubSecrets,
+} from './senateEdgeDeny.ts';
+import {
+  persistSenateEfdProbe,
+  readSenateEfdProbe,
+  SENATE_EFD_PROBE_TIMEOUT_MS,
+  type SenateEfdProbeRecord,
+} from './senateEfdHealth.ts';
 
 export const RESIDENTIAL_PROXY_HEALTH_KV_KEY = 'residential-proxy:health';
 export const RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS = 5_000;
@@ -135,6 +156,7 @@ export async function refreshResidentialProxyHealth(env: Env, now = new Date()):
   const checkedAt = now.toISOString();
   if (!proxyUrl) {
     await persistResidentialProxyProbe(env, { ok: true, status: null, checkedAt, host: null });
+    await refreshSenateEfdProxyProbe(env, now, { proxyUrl: undefined, proxyReachable: false });
     return;
   }
   const result = await probeResidentialProxyHealth(env, globalThis.fetch, RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS);
@@ -145,6 +167,243 @@ export async function refreshResidentialProxyHealth(env: Env, now = new Date()):
     checkedAt,
     host,
   });
+  await refreshSenateEfdProxyProbe(env, now, { proxyUrl, proxyReachable: result.reachable });
+}
+
+// ---------------------------------------------------------------------------
+// Senate eFD functional probe (CT-2416)
+// ---------------------------------------------------------------------------
+
+/**
+ * Dial eFD at most this often, whatever the last verdict; relay-down records
+ * are written every tick (no eFD hop).  Each dial sends eFD one agreement
+ * POST, the request its edge is refusing for automated clients (CT-2442), so
+ * the probe stays at 30 minutes or slower.  An edge deny gets no shorter or
+ * separate probe backoff: the watcher's edge-deny backoff (senateEdgeDeny.ts)
+ * is the one Senate backoff, and the probe skips while it is active.
+ */
+export const SENATE_EFD_PROXY_PROBE_INTERVAL_MS = 30 * 60_000;
+
+// Literal (not derived from SENATE_SEARCH) so suites that vi.mock senateSource
+// without these exports can still import this module.
+const SENATE_EFD_HOME = 'https://efdsearch.senate.gov/search/home/';
+const SENATE_EFD_ORIGIN = 'https://efdsearch.senate.gov';
+
+/**
+ * Per-step headers on top of BROWSER_HEADERS.  These must match
+ * `establishSenateSession` in senateSource.ts exactly (pinned by a test):
+ * Akamai scores browser fidelity, so a thinner probe could be refused while the
+ * real handshake succeeds (or vice versa).
+ */
+export const SENATE_EFD_LANDING_HEADERS: Readonly<Record<string, string>> = {
+  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'none',
+  'sec-fetch-user': '?1',
+  'upgrade-insecure-requests': '1',
+};
+export const SENATE_EFD_AGREEMENT_HEADERS: Readonly<Record<string, string>> = {
+  'content-type': 'application/x-www-form-urlencoded',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'same-origin',
+};
+
+/** eFD pages we classify are small; cap what we scan and keep. */
+const EFD_BODY_MAX_CHARS = 512 * 1024;
+/**
+ * Trust boundary for eFD response bodies: coerce anything unreadable or
+ * non-string to '' and bound the size before it reaches the classifier.
+ */
+export const SenateEfdResponseBodySchema = z
+  .string()
+  .catch('')
+  .transform((body) => body.slice(0, EFD_BODY_MAX_CHARS));
+
+async function readEfdBody(res: Response): Promise<string> {
+  return SenateEfdResponseBodySchema.parse(await res.text().catch(() => ''));
+}
+
+/**
+ * Exercise the path Senate ingestion actually needs, through the same
+ * residential proxy `senateSource.ts` uses: GET /search/ (200 + csrf token),
+ * then the agreement POST to /search/home/, judged the way
+ * `establishSenateSession` judges it (a 3xx, or a 200 without the agreement
+ * form).  The example.com liveness hop above cannot see an eFD edge deny;
+ * this can.
+ *
+ * Each request gets its own `timeoutMs` budget, so a slow landing GET cannot
+ * starve the agreement POST.  Transport-error text is scrubbed with
+ * senateEdgeDeny's `sanitizeEfdTransportError` before it is persisted.
+ *
+ * Classification:
+ *   ok        both steps passed
+ *   blocked   either step was an edge deny (classifySenateHttpFailure)
+ *   degraded  proxy unreachable / transport error / timeout, or any other failure
+ */
+export async function probeSenateEfdThroughProxy(
+  proxyUrl: string,
+  fetchImpl: typeof fetch = globalThis.fetch,
+  timeoutMs = SENATE_EFD_PROBE_TIMEOUT_MS,
+  now = new Date(),
+  secrets: Array<string | undefined> = [],
+): Promise<SenateEfdProbeRecord> {
+  const checkedAt = now.toISOString();
+  const proxiedFetch = createProxiedFetch(proxyUrl.replace(/\/$/, ''), fetchImpl);
+  const base = { checkedAt, egress: 'proxy', dialed: true } as const;
+  let step = 'GET /search/';
+  let timedOut = false;
+  const withTimeout = async <T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    try {
+      return await run(controller.signal);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+  try {
+    const { landing, landingHtml } = await withTimeout(async (signal) => {
+      const res = await trackedFetch(
+        SENATE_SEARCH,
+        { method: 'GET', headers: { ...BROWSER_HEADERS, ...SENATE_EFD_LANDING_HEADERS }, signal },
+        { service: 'filing-discovery', operation: 'probe-senate-efd-landing' },
+        proxiedFetch,
+      );
+      return { landing: res, landingHtml: await readEfdBody(res) };
+    });
+    if (landing.status !== 200) {
+      return classifyEfdFailure(base, step, landing, landingHtml);
+    }
+    const jar = new CookieJar();
+    jar.absorb(landing);
+    const token = parseCsrfMiddlewareToken(landingHtml);
+    if (!token && !jar.get('csrftoken')) {
+      return { ...base, ok: false, state: 'degraded', status: 200, step, error: 'eFD landing has no csrf token' };
+    }
+
+    step = 'POST /search/home/';
+    const { agree, agreeBody } = await withTimeout(async (signal) => {
+      const res = await trackedFetch(
+        SENATE_EFD_HOME,
+        {
+          method: 'POST',
+          headers: {
+            ...BROWSER_HEADERS,
+            ...SENATE_EFD_AGREEMENT_HEADERS,
+            cookie: jar.header(),
+            referer: SENATE_SEARCH,
+            origin: SENATE_EFD_ORIGIN,
+          },
+          body: new URLSearchParams({
+            prohibition_agreement: '1',
+            csrfmiddlewaretoken: token || jar.get('csrftoken') || '',
+          }).toString(),
+          redirect: 'manual',
+          signal,
+        },
+        { service: 'filing-discovery', operation: 'probe-senate-efd-agreement' },
+        proxiedFetch,
+      );
+      return { agree: res, agreeBody: await readEfdBody(res) };
+    });
+    if (agree.status >= 300 && agree.status < 400) {
+      return { ...base, ok: true, state: 'ok', status: agree.status, step, error: null };
+    }
+    if (agree.status === 200) {
+      if (looksLikeSenateAgreementWall(agreeBody)) {
+        return { ...base, ok: false, state: 'degraded', status: 200, step, error: 'eFD still shows the agreement form' };
+      }
+      return { ...base, ok: true, state: 'ok', status: 200, step, error: null };
+    }
+    return classifyEfdFailure(base, step, agree, agreeBody);
+  } catch (err) {
+    return {
+      ...base,
+      ok: false,
+      state: 'degraded',
+      status: null,
+      step,
+      error: timedOut
+        ? `relay/transport timeout after ${timeoutMs}ms`
+        : `relay/transport error: ${sanitizeEfdTransportError(err, secrets)}`,
+    };
+  }
+}
+
+/** One classifier for every Senate eFD answer: senateEdgeDeny's. */
+function classifyEfdFailure(
+  base: { checkedAt: string; egress: 'proxy'; dialed: true },
+  step: string,
+  res: Response,
+  body: string,
+): SenateEfdProbeRecord {
+  const { status } = res;
+  const server = res.headers.get('server');
+  if (classifySenateHttpFailure(status, server, body) === 'edge_denied') {
+    return {
+      ...base, ok: false, state: 'blocked', status, step,
+      error: `eFD edge denied (Akamai Access Denied, server=${server || 'unknown'})`,
+    };
+  }
+  return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status} (server=${server || 'unknown'})` };
+}
+
+/**
+ * Refresh the cached eFD probe.  Relay down/unconfigured is recorded every
+ * call without dialing eFD.  Otherwise eFD is not dialed while the watcher's
+ * edge-deny backoff is active (CT-2442), and at most once per
+ * SENATE_EFD_PROXY_PROBE_INTERVAL_MS, measured from the last attempted dial
+ * (`lastDialedAt`), so relay flaps cannot shorten the interval.
+ *
+ * An attempt that fails in transport or times out still counts: Akamai can
+ * tarpit or reset a request it has already scored, so re-dialing on the next
+ * tick would bring back the retry churn CT-2416 removes.
+ *
+ * A stored `blocked` record is never overwritten by a relay-down record: the
+ * relay outage is the residential_proxy check's to report, and replacing the
+ * Akamai verdict with `degraded` would silently downgrade a critical alert.
+ */
+export async function refreshSenateEfdProxyProbe(
+  env: Env,
+  now: Date,
+  ctx: { proxyUrl: string | undefined; proxyReachable: boolean },
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  const checkedAt = now.toISOString();
+  const last = await readSenateEfdProbe(env);
+  // Relay-down records must not reset the throttle: carry the last real dial
+  // forward so a flapping relay cannot trigger an eFD hit on every recovery.
+  const lastDialedAt = last?.lastDialedAt ?? (last?.dialed ? last.checkedAt : null);
+  if (!ctx.proxyUrl || !ctx.proxyReachable) {
+    if (last?.state === 'blocked') return;
+    await persistSenateEfdProbe(env, {
+      ok: false, state: 'degraded', status: null, checkedAt, egress: 'proxy', dialed: false, lastDialedAt,
+      step: null, error: ctx.proxyUrl ? 'residential proxy down' : 'residential proxy not configured',
+    });
+    return;
+  }
+  // While Senate polling is backed off after an edge deny, eFD is refusing the
+  // very agreement POST this probe sends.  Leave the record as it is:
+  // pipelineHealth reads the backoff itself and reports the deny.
+  const edgeBackoff = await readSenateEdgeBackoff(env);
+  if (edgeBackoff && isSenateEdgeBackoffActive(edgeBackoff, now)) return;
+  const lastMs = lastDialedAt ? Date.parse(lastDialedAt) : NaN;
+  if (Number.isFinite(lastMs) && now.getTime() - lastMs < SENATE_EFD_PROXY_PROBE_INTERVAL_MS) {
+    // Throttled.  If the stored record is a relay-down one, the relay is back
+    // but eFD state is unknown until the next allowed dial, so leave it as is
+    // (pipelineHealth keeps reporting degraded for at most 30 minutes).
+    return;
+  }
+  const rec = await probeSenateEfdThroughProxy(
+    ctx.proxyUrl, fetchImpl, SENATE_EFD_PROBE_TIMEOUT_MS, now,
+    senateEfdTransportScrubSecrets(ctx.proxyUrl, env),
+  );
+  await persistSenateEfdProbe(env, { ...rec, lastDialedAt: checkedAt });
 }
 
 export async function readResidentialProxyProbe(env: Env): Promise<ResidentialProxyProbeRecord | null> {

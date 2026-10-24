@@ -139,6 +139,35 @@ describe('webhook dispatch entitlement re-check', () => {
     }
   });
 
+  it('skips a targeted retry of a parked row for a lapsed owner instead of leaving it parked', async () => {
+    // The skip marker is insert-only, so on its own it leaves an existing parked
+    // row parked, and flushParkedDeliveries would re-release it every tick.
+    const { env, runs } = webhookEnv('user:user_1', { subscription_status: 'canceled', plan: 'monthly' });
+    const http = targetFetch();
+    vi.stubGlobal('fetch', http.fetchMock);
+    try {
+      await dispatchWebhook(env, { type: 'delivery.dispatch', txId: 'tx_1', subscriptionId: 'sub_1' });
+      expect(http.targetCalls()).toBe(0);
+      const terminal = runs.find((r) => /status IN \('parked', 'quarantined'\)/.test(r.sql));
+      expect(terminal?.params).toEqual([
+        'subscription owner entitlement inactive', expect.any(String), 'sub_1', 'tx_1',
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not rewrite existing rows on a fan-out skip for a lapsed owner', async () => {
+    const { env, runs } = webhookEnv('user:user_1', { subscription_status: 'canceled', plan: 'monthly' });
+    vi.stubGlobal('fetch', targetFetch().fetchMock);
+    try {
+      await dispatchWebhook(env, 'tx_1');
+      expect(runs.some((r) => /status IN \('parked', 'quarantined'\)/.test(r.sql))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('still delivers for an active premium owner', async () => {
     const { env, runs } = webhookEnv('user:user_1', { subscription_status: 'trialing', plan: 'monthly' });
     const http = targetFetch();

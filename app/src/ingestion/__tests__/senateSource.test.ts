@@ -814,4 +814,85 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       expect(warn.mock.calls.some(([msg]) => /cached session invalid \(HTTP 403 text\/html, server=gunicorn\)/.test(String(msg)))).toBe(true);
     });
   });
+
+  // CT-2416 (#2850): the same edge deny told apart by its page alone, for an
+  // edge answer whose Server header is missing or rewritten.  Folded into the
+  // one classifier (classifySenateHttpFailure) and the watcher's one backoff.
+  describe('Akamai deny page without a Server header', () => {
+    const AKAMAI_403 = `<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>\n<H1>Access Denied</H1>\n`
+      + `You don't have permission to access "http://efdsearch.senate.gov/search/report/data/" on this server.<P>\n`
+      + `Reference #18.6a2e3e17.1761300000.1a2b3c4d\n<P>https://errors.edgesuite.net/18.6a2e3e17.1761300000.1a2b3c4d</P>\n</BODY></HTML>`;
+    const now = new Date('2026-10-23T23:00:00.000Z');
+
+    function efdPaths(opts: { agree?: () => Response; data?: () => Response }, calls: string[]) {
+      return async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> => {
+        const url = String(input);
+        calls.push(`${init?.method ?? 'GET'} ${url.replace('https://efdsearch.senate.gov', '')}`);
+        if (url.endsWith('/search/')) {
+          return new Response(`<input type="hidden" name="csrfmiddlewaretoken" value="t">`, {
+            headers: { 'set-cookie': 'csrftoken=c; Path=/' },
+          });
+        }
+        if (url.endsWith('/search/home/')) return opts.agree ? opts.agree() : new Response('', { status: 302 });
+        if (url.endsWith('/search/report/data/')) {
+          return opts.data
+            ? opts.data()
+            : new Response(JSON.stringify({ data: [] }), { headers: { 'content-type': 'application/json' } });
+        }
+        throw new Error(`unexpected URL ${url}`);
+      };
+    }
+
+    it('recognises the Akamai Access Denied page but not a plain 403', () => {
+      expect(looksLikeAkamaiAccessDenied(AKAMAI_403)).toBe(true);
+      expect(looksLikeAkamaiAccessDenied('<title>Access Denied</title>')).toBe(true);
+      expect(looksLikeAkamaiAccessDenied('Forbidden')).toBe(false);
+      expect(looksLikeAkamaiAccessDenied('')).toBe(false);
+    });
+
+    it('classifies a refused agreement POST as edge_denied from the page alone, and caches nothing', async () => {
+      const calls: string[] = [];
+      const kv = memoryKv();
+      const fetchImpl = efdPaths({ agree: () => new Response(AKAMAI_403, { status: 403 }) }, calls);
+
+      const err = await establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl as typeof fetch).catch((e: unknown) => e);
+
+      expect(isSenateEdgeDeniedError(err)).toBe(true);
+      expect((err as Error).message).toBe('senate POST /search/home/ -> HTTP 403 (server=unknown) [edge_denied]');
+      expect(kv.put).not.toHaveBeenCalled();
+    });
+
+    it('does not redo the handshake when a cached session hits the deny page, and writes no backoff of its own', async () => {
+      const calls: string[] = [];
+      const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: JSON.stringify({ csrfCookie: 'c', cookieHeader: 'sessionid=s' }) });
+      const fetchImpl = efdPaths({ data: () => new Response(AKAMAI_403, { status: 403 }) }, calls);
+
+      const err = await fetchSenatePtrFilings({ kv, now, politeDelayMs: 0 }, fetchImpl).catch((e: unknown) => e);
+
+      expect(isSenateEdgeDeniedError(err)).toBe(true);
+      expect((err as Error).message).toBe('senate POST report/data/ -> HTTP 403 (server=unknown) [edge_denied]');
+      // One data POST: no landing GET / agreement POST retry, no direct-egress retries.
+      expect(calls).toEqual(['POST /search/report/data/']);
+      // The source keeps no backoff state: runWatcher owns the one backoff
+      // (CONFIG_KV senate_edge_deny:backoff), and the cached session stays.
+      expect(kv.put).not.toHaveBeenCalled();
+      expect(kv.delete).not.toHaveBeenCalled();
+    });
+
+    it('still retries a generic (non-Akamai) 403 with a fresh handshake', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: string[] = [];
+      const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: JSON.stringify({ csrfCookie: 'c', cookieHeader: 'sessionid=s' }) });
+      let n = 0;
+      const fetchImpl = efdPaths({
+        data: () => (n++ === 0
+          ? new Response('Forbidden', { status: 403 })
+          : new Response(JSON.stringify({ data: [] }), { headers: { 'content-type': 'application/json' } })),
+      }, calls);
+
+      await fetchSenatePtrFilings({ kv, now, politeDelayMs: 0 }, fetchImpl);
+
+      expect(calls).toEqual(['POST /search/report/data/', 'GET /search/', 'POST /search/home/', 'POST /search/report/data/']);
+    });
+  });
 });

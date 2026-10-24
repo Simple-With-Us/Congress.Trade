@@ -60,6 +60,7 @@ export const APP_SETTINGS: readonly SettingDef[] = [
   { key: 'R2_USAGE_DIGEST_UTC_HOUR', source: 'app', description: 'UTC hour for the R2 usage digest lane.' },
   { key: 'RETENTION_DELETE_RAW_OBJECTS', source: 'app', description: 'When truthy, retention sweeps delete raw objects (otherwise keep).' },
   { key: 'CT_UI_LOGO_DISPLAY', source: 'app', description: 'Site-wide logo style: tile | transparent | off (default transparent).' },
+  { key: 'DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER', source: 'app', description: 'When truthy, the scheduled parked flush re-parks live quarantined webhook deliveries for delivery (default off; rows whose transaction is gone are always skipped).' },
 ] as const;
 
 export const APP_SETTING_KEYS = APP_SETTINGS.map((s) => s.key);

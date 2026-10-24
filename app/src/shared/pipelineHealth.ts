@@ -16,7 +16,7 @@ import {
 } from '../extraction/reviewQueueHealth.ts';
 import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
-import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
+import { readResidentialProxyProbe, SENATE_EFD_PROXY_PROBE_INTERVAL_MS } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { readSenateEdgeBackoff, SENATE_EDGE_BACKOFF_GRACE_MS } from '../ingestion/senateEdgeDeny.ts';
@@ -271,7 +271,7 @@ export interface PipelineSignals {
       host?: string;
     } | null;
   } | null;
-  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  /** Proxied eFD landing + agreement POST probe (CONFIG_KV, CT-2416). */
   senateEfd?: {
     probe: {
       ok: boolean;
@@ -279,7 +279,17 @@ export interface PipelineSignals {
       checkedAt: string;
       egress?: string | null;
       error?: string | null;
+      state?: 'ok' | 'blocked' | 'degraded';
+      step?: string | null;
+      /** False on relay-down / unconfigured records, which carry no eFD verdict. */
+      dialed?: boolean;
     } | null;
+    /**
+     * The watcher's eFD edge-deny backoff (CONFIG_KV, CT-2442).  The probe
+     * does not dial while it is active, so a deny newer than the probe is the
+     * freshest word on eFD.  Absent = no backoff.
+     */
+    edgeBackoff?: { until: string; lastDeniedAt: string; reason: string } | null;
   } | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
@@ -618,8 +628,8 @@ export function evaluatePipelineSignals(
         status: 'degraded',
         detail:
           `${s.deliveryQuarantined} webhook delivery(ies) quarantined after parked cap overflow ` +
-          `(${parkedDeliveries} still parked). Rows recover when the target circuit closes and parked ` +
-          `headroom opens, or via POST /api/admin/delivery-requeue-quarantined`,
+          `(${parkedDeliveries} still parked). Live rows recover only when DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER ` +
+          `is on, or via an explicit POST /api/admin/delivery-requeue-quarantined`,
         value: s.deliveryQuarantined,
       });
     } else {
@@ -1152,53 +1162,102 @@ export function evaluatePipelineSignals(
     }
   }
 
+  // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
+  // the residential proxy.  ok / blocked (Akamai anti-bot 403 → `critical`) /
+  // degraded.  A degraded probe where eFD itself answered wrong (non-Akamai
+  // HTTP error, landing without a csrf token: `status` set) is `stalled`, so it
+  // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
+  // records (`status: null`) stay `degraded`: the residential_proxy check owns
+  // relay outages, and paging twice for one cause is the churn CT-2416 removes.
+  //
+  // The probe does not dial while the watcher's edge-deny backoff is active
+  // (CT-2442).  An ingestion edge deny newer than the probe's last eFD verdict
+  // is the same Akamai refusal the probe reports as `blocked`, so it speaks for
+  // eFD until the probe dials again.  Relay-down records (`dialed: false`)
+  // carry no eFD verdict and never outrank it.
+  const efdBackoff = s.senateEfd?.edgeBackoff ?? null;
+  const efdDeniedMs = efdBackoff ? Date.parse(efdBackoff.lastDeniedAt) : NaN;
+  const efdBackoffUntilMs = efdBackoff ? Date.parse(efdBackoff.until) : NaN;
+  const efdProbe = s.senateEfd?.probe ?? null;
+  const efdVerdictMs = efdProbe?.state && efdProbe.dialed !== false ? Date.parse(efdProbe.checkedAt) : NaN;
+  const efdDeniedSinceProbe = Number.isFinite(efdDeniedMs)
+    && nowMs <= efdBackoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS
+    && !(Number.isFinite(efdVerdictMs) && efdVerdictMs >= efdDeniedMs);
   if (s.senateEfd === undefined) {
-    /* optional — fixtures predating the direct eFD probe omit this signal */
+    /* optional — fixtures predating the eFD probe omit this signal */
   } else if (s.senateEfd == null) {
-    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
-  } else if (!s.senateEfd.probe) {
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD probe uncollected', value: null });
+  } else if (efdBackoff && efdDeniedSinceProbe) {
+    const deniedAgoMin = (nowMs - efdDeniedMs) / 60_000;
+    const waitMin = Math.round((efdBackoffUntilMs - nowMs) / 60_000);
     checks.push({
       id: 'senate_efd',
-      status: 'unknown',
-      detail: 'Senate eFD direct landing not yet probed',
-      value: null,
+      status: 'critical',
+      detail: `Senate eFD BLOCKED: Akamai edge deny on Senate ingestion `
+        + `${deniedAgoMin < 1 ? Math.round(deniedAgoMin * 60) + 's' : Math.round(deniedAgoMin) + 'm'} ago (${efdBackoff.reason})`
+        + ` — refused by eFD itself, not a relay outage; the probe is paused for the edge-deny backoff`
+        + ` (${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
+      value: 403,
     });
+  } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
+    // Missing, or a legacy unproxied direct-GET record (dropped 2026-10-16).
+    // A legacy datacenter 401/403 while the residential proxy is live is the
+    // expected direct-egress block (#2837): say so as `degraded`.  Anything
+    // else legacy is ignored (unknown) until the proxied probe overwrites it.
+    const legacy = s.senateEfd.probe;
+    const residentialLive = Boolean(s.residentialProxyConfigured && s.residentialProxy?.probe?.ok);
+    if (legacy && !legacy.ok && residentialLive && (legacy.status === 403 || legacy.status === 401)) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe blocked from datacenter (HTTP ${legacy.status})`
+          + ` — expected; Senate ingest uses the residential proxy (live).`,
+        value: legacy.status,
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'unknown',
+        detail: 'Senate eFD proxied probe not yet run',
+        value: null,
+      });
+    }
   } else {
     const probe = s.senateEfd.probe;
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
-    if (!probe.ok) {
-      const residentialLive = Boolean(
-        s.residentialProxyConfigured &&
-        s.residentialProxy?.probe?.ok,
-      );
-      const datacenterBlock =
-        residentialLive &&
-        (probe.status === 403 || probe.status === 401);
+    const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
+    // The probe dials eFD at most every 30m, so allow two missed cycles.
+    const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, (3 * SENATE_EFD_PROXY_PROBE_INTERVAL_MS) / 60_000);
+    const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
+    if (probe.state === 'blocked') {
       checks.push({
         id: 'senate_efd',
-        status: datacenterBlock ? 'degraded' : 'stalled',
-        detail: datacenterBlock
-          ? `Senate eFD direct probe blocked from datacenter`
-            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-            + ` — expected; Senate ingest uses the residential proxy (live).`
-          : `Senate eFD direct landing unreachable`
-            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-            + `${probe.error ? ` — ${probe.error}` : ''}`,
+        status: 'critical',
+        detail: `Senate eFD BLOCKED: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
+          + ` — Senate ingestion is refused by eFD itself, not a relay outage (probed ${ago})`,
         value: probe.status,
       });
-    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+    } else if (probe.state === 'degraded') {
+      checks.push({
+        id: 'senate_efd',
+        status: probe.status != null ? 'stalled' : 'degraded',
+        detail: `Senate eFD probe degraded${probe.step ? ` at ${probe.step}` : ''}${http}`
+          + `${probe.error ? ` — ${probe.error}` : ''} (checked ${ago})`,
+        value: probe.status,
+      });
+    } else if (ageMin > maxAgeMin) {
       checks.push({
         id: 'senate_efd',
         status: 'degraded',
-        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        detail: `Senate eFD probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${maxAgeMin}m)`,
         value: Math.round(ageMin),
       });
     } else {
       checks.push({
         id: 'senate_efd',
         status: 'ok',
-        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        detail: `Senate eFD landing + agreement POST ok through ${probe.egress ?? 'proxy'}: probed ${ago}`,
         value: Math.round(ageMin * 10) / 10,
       });
     }
@@ -1664,6 +1723,15 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // started writing source_attempts rows) and reads its enable gate — a
   // disabled chamber must be LOUD, never a silent skip.
   let pollSources: PipelineSignals['pollSources'] = null;
+  // Fail-soft (null on any KV fault); shared by polling_senate and senate_efd.
+  const senateEdgeBackoff = await readSenateEdgeBackoff(env);
+  const senateEdgeBackoffSignal = senateEdgeBackoff
+    ? {
+        until: senateEdgeBackoff.until,
+        lastDeniedAt: senateEdgeBackoff.lastDeniedAt,
+        reason: senateEdgeBackoff.reason,
+      }
+    : null;
   try {
     const rows = await all<{ source: string; last_success: string | null; last_attempt: string | null }>(
       env.DB,
@@ -1684,7 +1752,6 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
       const d = await getLastPollAt(env, 'oge');
       ogeLastPollIso = d ? d.toISOString() : null;
     } catch {}
-    const senateEdgeBackoff = await readSenateEdgeBackoff(env);
     pollSources = (['house', 'senate', 'executive'] as const).map((source) => {
       const row = bySource.get(source);
       let lastSuccessAt = row?.last_success ?? null;
@@ -1698,15 +1765,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
         lastSuccessAt,
         lastAttemptAt,
         configDisabled: source === 'executive' ? ogeDisabled : false,
-        ...(source === 'senate' && senateEdgeBackoff
-          ? {
-              edgeBackoff: {
-                until: senateEdgeBackoff.until,
-                lastDeniedAt: senateEdgeBackoff.lastDeniedAt,
-                reason: senateEdgeBackoff.reason,
-              },
-            }
-          : {}),
+        ...(source === 'senate' && senateEdgeBackoffSignal ? { edgeBackoff: senateEdgeBackoffSignal } : {}),
       };
     });
   } catch {}
@@ -1788,9 +1847,9 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   }
 
-  let senateEfd: PipelineSignals['senateEfd'] = { probe: null };
+  let senateEfd: PipelineSignals['senateEfd'] = { probe: null, edgeBackoff: senateEdgeBackoffSignal };
   try {
-    senateEfd = { probe: await readSenateEfdProbe(env) };
+    senateEfd = { probe: await readSenateEfdProbe(env), edgeBackoff: senateEdgeBackoffSignal };
   } catch {
     senateEfd = null;
   }

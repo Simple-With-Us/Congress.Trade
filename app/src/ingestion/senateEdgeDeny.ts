@@ -101,13 +101,26 @@ export function sanitizeEfdTransportError(err: unknown, secrets: Array<string | 
   return out.slice(0, 200);
 }
 
-/** Proxy URL and credential env values to scrub from Senate eFD transport errors. */
-export function senateEfdTransportScrubSecrets(proxyUrl?: string): string[] {
+type SenateProxySecretEnv = Pick<
+  Env,
+  'RESIDENTIAL_PROXY_URL' | 'SENATE_PROXY_URL' | 'RESIDENTIAL_PROXY_USERNAME' | 'RESIDENTIAL_PROXY_PASSWORD'
+>;
+
+/**
+ * Proxy URL and credential values to scrub from Senate eFD transport errors:
+ * the proxy URL in use, the `env` binding's proxy values when the caller has
+ * one (the eFD health probe), and the process env's.
+ */
+export function senateEfdTransportScrubSecrets(proxyUrl?: string, env?: SenateProxySecretEnv): string[] {
   const penv = typeof process !== 'undefined' ? process.env : undefined;
   const secrets: string[] = [];
   const url = proxyUrl?.trim();
   if (url && url.length >= 3) secrets.push(url);
   for (const v of [
+    env?.RESIDENTIAL_PROXY_URL,
+    env?.SENATE_PROXY_URL,
+    env?.RESIDENTIAL_PROXY_USERNAME,
+    env?.RESIDENTIAL_PROXY_PASSWORD,
     penv?.RESIDENTIAL_PROXY_URL,
     penv?.SENATE_PROXY_URL,
     penv?.RESIDENTIAL_PROXY_USERNAME,

@@ -48,7 +48,6 @@ import {
   type SenateEdgeBackoffState,
 } from './senateEdgeDeny.ts';
 import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
-import { refreshSenateEfdHealth } from './senateEfdHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
@@ -1409,14 +1408,14 @@ export async function runWatcher(
     console.warn('watcher: senate relay health probe failed:', (err as Error).message);
   }
   try {
+    // Also refreshes the proxied Senate eFD functional probe (CT-2416).  It
+    // runs after the senate poll on purpose: a deny this tick has already
+    // armed the edge-deny backoff, and the probe skips while that is active,
+    // so a tick whose poll eFD just refused sends it no second agreement POST
+    // (CT-2442).
     await refreshResidentialProxyHealth(env, now);
   } catch (err) {
     console.warn('watcher: residential proxy health probe failed:', (err as Error).message);
-  }
-  try {
-    await refreshSenateEfdHealth(env, now);
-  } catch (err) {
-    console.warn('watcher: senate eFD health probe failed:', (err as Error).message);
   }
   return result;
 }

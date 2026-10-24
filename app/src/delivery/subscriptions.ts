@@ -608,8 +608,14 @@ export async function deleteSubscription(env: Env, id: string): Promise<boolean>
    *                 enforces members/tickers/minAmount. Webhook dispatch resolves
  *                 chamber separately (see webhook.ts).
  *   - minAmount:  tx.amountMin must be >= filter.minAmount.
+ *   - backfill:   dropped unless includeBackfill; freshness is judged as of
+ *                 `freshnessAtMs` (default now).
  */
-export function matchesFilters(tx: Transaction, filters: SubscriptionFilters): boolean {
+export function matchesFilters(
+  tx: Transaction,
+  filters: SubscriptionFilters,
+  freshnessAtMs?: number,
+): boolean {
   if (!filters) return true;
 
   if (filters.members && filters.members.length > 0) {
@@ -636,7 +642,7 @@ export function matchesFilters(tx: Transaction, filters: SubscriptionFilters): b
     if (!side || !filters.sides.includes(side)) return false;
   }
 
-  if (filters.includeBackfill !== true && isDeliveryBackfill(tx)) return false;
+  if (filters.includeBackfill !== true && isDeliveryBackfill(tx, freshnessAtMs)) return false;
 
   return true;
 }
@@ -649,6 +655,12 @@ export interface DeliveryContext {
   sector?: string | null;
   /** securities_ref.market_cap_bucket for the tx ticker. */
   marketCapBucket?: string | null;
+  /**
+   * Instant to judge delivery freshness at (default now).  Targeted webhook
+   * retries pass deliveryFreshnessJudgedAtMs so a parked delivery does not
+   * age into backfill while its target circuit is open.
+   */
+  freshnessAtMs?: number;
 }
 
 /**
@@ -662,7 +674,7 @@ export function matchesFiltersWithContext(
   filters: SubscriptionFilters,
   ctx: DeliveryContext,
 ): boolean {
-  if (!matchesFilters(tx, filters)) return false;
+  if (!matchesFilters(tx, filters, ctx.freshnessAtMs)) return false;
   if (filters.chambers && filters.chambers.length > 0) {
     if (!ctx.chamber || !filters.chambers.includes(ctx.chamber as never)) return false;
   }

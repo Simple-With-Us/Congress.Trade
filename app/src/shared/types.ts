@@ -981,6 +981,11 @@ export interface Env {
   DELIVERY_TARGET_BASE_BACKOFF_SEC?: string;
   /** Parked deliveries allowed per subscription before overflow quarantine (default 500). */
   DELIVERY_TARGET_PARKED_CAP?: string;
+  /**
+   * Env fallback for the Infisical app setting of the same name: when truthy
+   * the scheduled flush re-parks live quarantined rows (default off).
+   */
+  DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER?: string;
   /** Admin + scoped import bearer tokens. */
   ADMIN_TOKEN?: string;
   /** Admin email allowlist for site-session admin access and Cloudflare Access. */
