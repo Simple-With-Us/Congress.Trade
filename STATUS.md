@@ -1,5 +1,9 @@
 # Current Handoff
 
+## 2026-10-23 GB-COMPILER — Share payload schemaVersion (ST-3853)
+
+Vendored `congress-trading-shared` is now `v2.9.0`, which adds the optional `schemaVersion` to `SharePayloadSchema`.  `POST /api/admin/securities/import` resolves the peer's contract version, warns on unsupported or malformed values, and echoes `schemaVersion` in the response; the version is never a rejection reason, so mixed deploys keep importing.  Rollout: `docs/rollouts/2026-10-23-st-3853-share-schema-version.md`.
+
 ## 2026-10-15 CURSOR — Socratic-Trade push receipt (ST-3846)
 
 `shareWithPeer` sends `x-push-id` and reads the delivered and consumed acks.  A 200 without those acks is not a successful push.  Sentry warns and the admin email is throttled (`peer-push-missing-ack`).  The receiver is Socratic-Trade branch `cursor/ct-push-receipt-2155`.  Do not mark ST-3846 completed until both pulls merge.  Rollout: `docs/rollouts/2026-10-15-st-push-receipt.md`.

@@ -1,8 +1,8 @@
 diff --git upstream/.upstream-shared/src/__tests__/schemas.test.ts vendored/app/vendor/congress-trading-shared/src/__tests__/schemas.test.ts
-index 78b921b64919a2a199d7744bd16b221d2ce2d5f3..2f182b276d02a485d395dae8864cde9b144b6b9d 100644
+index f674e465bc15b4da6b741278a510017bc7aac6b9..9bc90bf8852d11525ae8f50cb071084a751d3683 100644
 --- upstream/.upstream-shared/src/__tests__/schemas.test.ts
 +++ vendored/app/vendor/congress-trading-shared/src/__tests__/schemas.test.ts
-@@ -585,6 +585,74 @@ describe("TransactionsPageSchema", () => {
+@@ -589,6 +589,74 @@ describe("TransactionsPageSchema", () => {
      ).toBe(false);
    });
  
@@ -77,7 +77,7 @@ index 78b921b64919a2a199d7744bd16b221d2ce2d5f3..2f182b276d02a485d395dae8864cde9b
    it("rejects read rows missing required cursor provenance", () => {
      const { cursorSeq: _cursorSeq, ...withoutCursor } = validTx;
      expect(TransactionsPageSchema.safeParse({
-@@ -1438,6 +1506,23 @@ describe("ClientTradeSchema", () => {
+@@ -1485,6 +1553,23 @@ describe("ClientTradeSchema", () => {
      };
      expect(ClientTradeSchema.safeParse(valid).success).toBe(false);
    });
@@ -102,10 +102,10 @@ index 78b921b64919a2a199d7744bd16b221d2ce2d5f3..2f182b276d02a485d395dae8864cde9b
  
  // =============================================================================
 diff --git upstream/.upstream-shared/src/schemas.ts vendored/app/vendor/congress-trading-shared/src/schemas.ts
-index 1417c73ef460feaf32941edf69bcbb84238a7581..922eae2eaf4a8ab7db75bd21886b276cfe588b99 100644
+index 864d19dbddb151699a6159c9075b0869556bf691..d93105f2c282d299126f163d277832bdcd3f142c 100644
 --- upstream/.upstream-shared/src/schemas.ts
 +++ vendored/app/vendor/congress-trading-shared/src/schemas.ts
-@@ -33,6 +33,16 @@ export const TxTypeSchema = z
+@@ -37,6 +37,16 @@ export const TxTypeSchema = z
    .transform((v): "B" | "S" | "E" => (v === "P" ? "B" : v));
  export type TxType = "B" | "S" | "E";
  
@@ -122,7 +122,7 @@ index 1417c73ef460feaf32941edf69bcbb84238a7581..922eae2eaf4a8ab7db75bd21886b276c
  export const AssetTypeCategorySchema = z.enum([
    "public_equity",
    "private_equity",
-@@ -133,7 +143,7 @@ export const CongressTransactionSchema = z.object({
+@@ -137,7 +147,7 @@ export const CongressTransactionSchema = z.object({
    description: z.string().nullable().optional(),
    supplementalText: z.string().nullable().optional(),
    confidence: z.number().optional(),
@@ -131,7 +131,7 @@ index 1417c73ef460feaf32941edf69bcbb84238a7581..922eae2eaf4a8ab7db75bd21886b276c
    rowKey: z.string().nullable().optional(),
    createdAt: z.string().optional(),
    cursorSeq: z.number().int().nonnegative().optional(),
-@@ -152,13 +162,36 @@ export const CongressTransactionSchema = z.object({
+@@ -156,13 +166,36 @@ export const CongressTransactionSchema = z.object({
    refCountry: z.string().nullable().optional(),
    refExchangeShort: z.string().nullable().optional(),
    refAssetClass: z.string().nullable().optional(),
@@ -169,7 +169,7 @@ index 1417c73ef460feaf32941edf69bcbb84238a7581..922eae2eaf4a8ab7db75bd21886b276c
    createdAt: z.string(),
    cursorSeq: z.number().int().nonnegative(),
  });
-@@ -561,7 +594,7 @@ export const ClientTradeSchema = z.object({
+@@ -590,7 +623,7 @@ export const ClientTradeSchema = z.object({
    transaction: ClientTransactionSchema,
    filing: ClientFilingSchema,
    confidence: z.number(),
