@@ -1052,7 +1052,7 @@ async function main() {
     const bundleId = path;
     const version = body;
     const buildNumber = arg4;
-    const platform = argv[5] || "IOS";
+    const platform = argv[4] || "IOS";
     if (!bundleId || !version || !buildNumber) {
       console.error(
         "Usage: node asc-api.mjs appstore-version-prepare <bundleId> <version> <buildNumber> [platform=IOS]"
