@@ -373,6 +373,12 @@ export interface PriceRefreshResult {
    *  not-covered sweep relies on it:  a stale price_checked_at only means "ST
    *  had a chance and gave nothing" when the ticker was actually attempted. */
   attemptedAllPending: boolean;
+  /** MAX(cursor_seq) of the last ticker this run selected, or null when it
+   *  selected none.  The bounded catch-up resumes after it (CT-2445). */
+  lastCursorSeq: number | null;
+  /** True when the selection returned fewer tickers than its budget, i.e. it
+   *  reached the end of the pending set (from afterCursorSeq, when given). */
+  reachedEndOfPending: boolean;
   /** What THIS run actually fetched (for the App B outbound push — our delta only). */
   shareSpx: Close[];
   sharePrices: Array<{ ticker: string; closes: Close[]; currentPrice: number; currentPriceDate: string }>;
@@ -402,15 +408,37 @@ export interface PriceRefreshResult {
 export async function selectTickersNeedingPrices(
   env: Env,
   limit: number,
-  opts: { freshThrough?: string; unavailableCutoff?: string; firstUnavailableCutoff?: string } = {},
+  opts: SelectTickersNeedingPricesOpts = {},
 ): Promise<string[]> {
+  return (await selectTickersNeedingPricesPage(env, limit, opts)).map((r) => r.ticker);
+}
+
+export interface SelectTickersNeedingPricesOpts {
+  freshThrough?: string;
+  unavailableCutoff?: string;
+  firstUnavailableCutoff?: string;
+  /** Resume a rotating walk:  only tickers whose newest trade sorts after this
+   *  cursor_seq.  The bounded catch-up (CT-2445) uses it so a block of
+   *  erroring tickers at the head of the FIFO cannot starve the rest. */
+  afterCursorSeq?: number | null;
+}
+
+/** selectTickersNeedingPrices plus each ticker's sort key (MAX(cursor_seq)). */
+export async function selectTickersNeedingPricesPage(
+  env: Env,
+  limit: number,
+  opts: SelectTickersNeedingPricesOpts = {},
+): Promise<Array<{ ticker: string; seq: number | null }>> {
   if (limit <= 0) return [];
+  const after = typeof opts.afterCursorSeq === 'number' && Number.isFinite(opts.afterCursorSeq)
+    ? opts.afterCursorSeq
+    : null;
   const freshThrough = opts.freshThrough ?? lastTradingDay();
   const unavailableCutoff = opts.unavailableCutoff ?? priceUnavailableCutoffIso();
   const firstUnavailableCutoff = opts.firstUnavailableCutoff ?? priceUnavailableFirstRecheckCutoffIso();
-  const rows = await all<{ ticker: string }>(
+  const rows = await all<{ ticker: string; seq: number | null }>(
     env.DB,
-    `SELECT t.ticker AS ticker
+    `SELECT t.ticker AS ticker, MAX(t.cursor_seq) AS seq
        FROM transactions t
        LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
       WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.tx_date IS NOT NULL AND t.tx_date >= '1990-01-01'
@@ -438,11 +466,14 @@ export async function selectTickersNeedingPrices(
         )
         AND ${priceNotCoveredExclusionSql('sr')}
       GROUP BY t.ticker
+      ${after === null ? '' : 'HAVING MAX(t.cursor_seq) > ?'}
       ORDER BY MAX(t.cursor_seq) ASC
       LIMIT ?`,
-    [freshThrough, firstUnavailableCutoff, unavailableCutoff, limit],
+    after === null
+      ? [freshThrough, firstUnavailableCutoff, unavailableCutoff, limit]
+      : [freshThrough, firstUnavailableCutoff, unavailableCutoff, after, limit],
   );
-  return rows.map((r) => r.ticker);
+  return rows.map((r) => ({ ticker: r.ticker, seq: r.seq ?? null }));
 }
 
 /**
@@ -677,7 +708,14 @@ export async function writeTickerEodHistory(
 
 export async function runPriceRefresh(
   env: Env,
-  opts: { max?: number; dryRun?: boolean; maxPerMinute?: number; signal?: AbortSignal } = {},
+  opts: {
+    max?: number;
+    dryRun?: boolean;
+    maxPerMinute?: number;
+    signal?: AbortSignal;
+    /** See SelectTickersNeedingPricesOpts.afterCursorSeq. */
+    afterCursorSeq?: number | null;
+  } = {},
 ): Promise<PriceRefreshResult> {
   const dryRun = opts.dryRun === true;
   const result: PriceRefreshResult = {
@@ -691,6 +729,8 @@ export async function runPriceRefresh(
     errors: [],
     aborted: false,
     attemptedAllPending: false,
+    lastCursorSeq: null,
+    reachedEndOfPending: false,
     shareSpx: [],
     sharePrices: [],
   };
@@ -777,13 +817,19 @@ export async function runPriceRefresh(
     await ensurePriceUnavailableReasonColumn(env.DB);
   }
   const selectBudget = budget;
-  const tickers = result.aborted ? [] : await selectTickersNeedingPrices(env, budget);
-  for (const ticker of tickers) {
+  const page = result.aborted
+    ? []
+    : await selectTickersNeedingPricesPage(env, budget, { afterCursorSeq: opts.afterCursorSeq });
+  const tickers = page.map((r) => r.ticker);
+  for (const { ticker, seq } of page) {
     if (opts.signal?.aborted) {
       result.aborted = true;
       break;
     }
     if (budget <= 0) break;
+    // The resume point is the last ticker this run reached, not the last one
+    // selected, so an abort mid-page does not skip the unattempted rest.
+    result.lastCursorSeq = seq;
     const nowIso = new Date().toISOString();
     const fetchPlan = await planTickerEodFetch(env, ticker);
     if (!fetchPlan) continue;
@@ -881,8 +927,12 @@ export async function runPriceRefresh(
     result.tradesComputed += trades.length;
   }
 
+  result.reachedEndOfPending = !result.aborted && tickers.length < selectBudget;
+  // A walk that resumed from a cursor skipped everything before it, so it never
+  // attempted the whole pending set (the not-covered sweep relies on this).
   result.attemptedAllPending =
-    !result.aborted && !dryRun && selectBudget > 0 && tickers.length < selectBudget;
+    !result.aborted && !dryRun && selectBudget > 0 && tickers.length < selectBudget &&
+    opts.afterCursorSeq == null;
   result.fmpCalls = calls;
   result.budgetRemaining = Math.max(0, budget);
   return result;
