@@ -774,6 +774,35 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('Residential proxy DOWN');
   });
 
+  it('downgrades senate_efd datacenter 403 to degraded when residential proxy is live', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      residentialProxyConfigured: true,
+      residentialProxy: {
+        configured: true,
+        probe: {
+          ok: true,
+          status: 200,
+          checkedAt: new Date(nowMs - 30_000).toISOString(),
+          host: '10.99.0.2:8888',
+        },
+      },
+      senateEfd: {
+        probe: {
+          ok: false,
+          status: 403,
+          checkedAt: new Date(nowMs - 30_000).toISOString(),
+          egress: 'direct',
+          error: 'HTTP 403',
+        },
+      },
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'senate_efd')!;
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('residential proxy');
+    expect(res.status).toBe('degraded');
+  });
+
   it('marks senate_relay ok when residential proxy probe is live', () => {
     const res = evaluatePipelineSignals({
       ...base,
