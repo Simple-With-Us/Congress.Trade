@@ -129,9 +129,10 @@ export const RELIABILITY_SCHEMA_STATEMENTS = [
   'CREATE INDEX IF NOT EXISTS idx_sse_leases_client ON sse_leases(client_id, expires_at)',
   `CREATE TRIGGER IF NOT EXISTS trg_sse_subscription_connection_quota BEFORE INSERT ON sse_leases WHEN (SELECT COUNT(*) FROM sse_leases WHERE subscription_id = NEW.subscription_id AND expires_at > NEW.created_at) >= 2 BEGIN SELECT RAISE(ABORT, 'sse subscription connection quota exceeded'); END`,
   `CREATE TRIGGER IF NOT EXISTS trg_sse_client_connection_quota BEFORE INSERT ON sse_leases WHEN (SELECT COUNT(*) FROM sse_leases WHERE client_id = NEW.client_id AND expires_at > NEW.created_at) >= 5 BEGIN SELECT RAISE(ABORT, 'sse client connection quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota BEFORE INSERT ON subscriptions WHEN (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id) >= 20 BEGIN SELECT RAISE(ABORT, 'subscription total quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_active_insert_quota BEFORE INSERT ON subscriptions WHEN NEW.active = 1 AND (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id AND active = 1) >= 10 BEGIN SELECT RAISE(ABORT, 'subscription active quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_active_update_quota BEFORE UPDATE OF active, client_id ON subscriptions WHEN NEW.active = 1 AND (OLD.active != 1 OR OLD.client_id != NEW.client_id) AND (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id AND active = 1 AND id != OLD.id) >= 10 BEGIN SELECT RAISE(ABORT, 'subscription active quota exceeded'); END`,
+  // The subscription quota triggers are intentionally NOT created here: the
+  // replay later drops and redefines them (0047, then the lower-quota set),
+  // so creating them in this list rebuilds and discards them under the write
+  // lock on every deploy.  Their only CREATE is the final definition.
   `CREATE TABLE IF NOT EXISTS source_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, attempted_at TEXT NOT NULL, outcome TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   'CREATE INDEX IF NOT EXISTS idx_source_attempts_source_time ON source_attempts(source, attempted_at DESC)',
 ] as const;
@@ -265,16 +266,13 @@ export const PRICE_BACKFILL_TERMINATION_SCHEMA_STATEMENTS = [
  * migrations/0047_subscription_quota_active_only.sql.
  */
 export const SUBSCRIPTION_QUOTA_ACTIVE_ONLY_SCHEMA_STATEMENTS = [
+  // The CREATE that followed this DROP in 0047 is intentionally left out of
+  // the boot replay: the lower-quota set later drops and redefines the same
+  // trigger, so creating it here rebuilds and discards it under the write
+  // lock on every deploy.  The DROP still migrates old databases; the final
+  // CREATE lives in LOWER_SUBSCRIPTION_QUOTA_SCHEMA_STATEMENTS.  Keep in
+  // lockstep with migrations/0047_subscription_quota_active_only.sql.
   'DROP TRIGGER IF EXISTS trg_subscriptions_total_quota',
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota
-   BEFORE INSERT ON subscriptions
-   WHEN (
-     SELECT COUNT(*) FROM subscriptions
-      WHERE client_id = NEW.client_id AND active = 1
-   ) >= 20
-   BEGIN
-     SELECT RAISE(ABORT, 'subscription total quota exceeded');
-   END`,
 ] as const;
 
 /** Ordered review-queue autonomy schema mirrored by file migrations 0033-0037. */

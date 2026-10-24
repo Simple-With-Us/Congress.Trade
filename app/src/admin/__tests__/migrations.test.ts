@@ -215,7 +215,6 @@ describe('admin migration bootstrap', () => {
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('dead_letter_cycles');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('claim_token');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('lease_until');
-    expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('trg_subscriptions_total_quota');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('source_attempts');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('trg_sse_subscription_connection_quota');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('trg_sse_client_connection_quota');
@@ -529,9 +528,13 @@ describe('admin migration bootstrap', () => {
   it('counts only active rows toward the total subscription quota trigger (0047)', () => {
     const sql = SUBSCRIPTION_QUOTA_ACTIVE_ONLY_SCHEMA_STATEMENTS.join('\n');
     expect(sql).toContain('DROP TRIGGER IF EXISTS trg_subscriptions_total_quota');
-    expect(sql).toContain('trg_subscriptions_total_quota');
-    expect(sql).toContain('client_id = NEW.client_id AND active = 1');
-    expect(sql).toContain('subscription total quota exceeded');
+    // 0047's CREATE is left out of the replay list (a later list drops and
+    // redefines the same trigger); the active-only predicate survives in the
+    // final definition the replay actually creates.
+    const replay = buildAdminMigrateStatements().join('\n');
+    expect(replay).toContain('trg_subscriptions_total_quota');
+    expect(replay).toContain('client_id = NEW.client_id AND active = 1');
+    expect(replay).toContain('subscription total quota exceeded');
   });
 
   it('adds price_unavailable_reason (0103)', () => {
@@ -996,9 +999,9 @@ describe('admin migration bootstrap', () => {
   // cheap no-op that still cleans old databases.
   function replayChurn(list: readonly string[]): string[] {
     const statements = list.map((sql) => sql.replace(/\s+/g, ' ').trim());
-    const createRe = /^CREATE (?:UNIQUE )?(TABLE|INDEX) (?:IF NOT EXISTS )?([a-z0-9_]+)(?: ON ([a-z0-9_]+))?/i;
+    const createRe = /^CREATE (?:UNIQUE )?(TABLE|INDEX|TRIGGER) (?:IF NOT EXISTS )?([a-z0-9_]+)(?: ON ([a-z0-9_]+))?/i;
     const alterRe = /^ALTER TABLE ([a-z0-9_]+) /i;
-    const dropRe = /^DROP (TABLE|INDEX) (?:IF EXISTS )?([a-z0-9_]+)/i;
+    const dropRe = /^DROP (TABLE|INDEX|TRIGGER) (?:IF EXISTS )?([a-z0-9_]+)/i;
     const churn: string[] = [];
     statements.forEach((sql, dropAt) => {
       const drop = sql.match(dropRe);
@@ -1012,7 +1015,8 @@ describe('admin migration bootstrap', () => {
           && create[1].toUpperCase() === kind
           && create[2].toLowerCase() === name;
         const buildsOnDroppedTable = kind === 'TABLE' && (
-          (create != null && create[1].toUpperCase() === 'INDEX' && create[3]?.toLowerCase() === name)
+          (create != null && (create[1].toUpperCase() === 'INDEX' || create[1].toUpperCase() === 'TRIGGER')
+            && create[3]?.toLowerCase() === name)
           || alter?.[1].toLowerCase() === name
         );
         if (createsIt || buildsOnDroppedTable) {

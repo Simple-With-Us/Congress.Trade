@@ -347,11 +347,14 @@ stop_hold() {
 tick() {
   local app hold_on deploy builder app_on app_ok have_image action
   app="$(find_app_container)"
-  [[ -n "$app" ]] && remember_image "$app"
   hold_on=0
   container_running "$HOLD_NAME" && hold_on=1
   deploy=0
   coolify_deploy_active && deploy=1
+  # Freeze last-image for the whole deploy window: resolve_image prefers it,
+  # and refreshing it after Coolify's container swap would point the hold at
+  # the replacement image, whose boot migrate has not applied its schema yet.
+  [[ -n "$app" && "$deploy" == 0 ]] && remember_image "$app"
   builder=0
   builder_active && builder=1
   app_on=0
