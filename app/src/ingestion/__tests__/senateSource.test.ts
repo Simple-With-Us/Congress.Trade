@@ -1,4 +1,20 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Node has no Deno.createHttpClient, so the real createProxiedFetch hands back
+// the base fetch and a test could not tell the two egresses apart.  Tag
+// proxied calls the way the real wrapper does: an extra `client` on init.
+vi.mock('../../shared/proxyFetch.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../shared/proxyFetch.ts')>();
+  return {
+    ...actual,
+    createProxiedFetch: (proxyUrl?: string, baseFetch: typeof fetch = globalThis.fetch) =>
+      proxyUrl
+        ? ((input: RequestInfo | URL, init?: RequestInit) =>
+            baseFetch(input, { ...init, client: { proxyUrl } } as RequestInit)) as typeof fetch
+        : baseFetch,
+  };
+});
+
 import {
   parseCsrfMiddlewareToken,
   parseReportLink,
@@ -10,6 +26,27 @@ import {
   looksLikeSenateAgreementWall,
   SENATE_SESSION_KV_KEY,
 } from '../senateSource.ts';
+import {
+  SenateHttpError,
+  classifySenateHttpFailure,
+  isSenateEdgeDeniedError,
+  looksLikeAkamaiAccessDenied,
+} from '../senateEdgeDeny.ts';
+
+/** Akamai's deny page as eFD's edge served it on 2026-10-23 (CT-2442). */
+const AKAMAI_ACCESS_DENIED = '<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>\n<H1>Access Denied</H1>\n \n'
+  + 'You don\'t have permission to access "http&#58;&#47;&#47;efdsearch&#46;senate&#46;gov&#47;search&#47;home&#47;" on this server.<P>\n'
+  + 'Reference&#32;&#35;18&#46;c825c017&#46;1792794395&#46;4605aee3\n'
+  + '<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;c825c017&#46;1792794395&#46;4605aee3</P>\n</BODY>\n</HTML>\n';
+
+function akamaiDenied(): Response {
+  return new Response(AKAMAI_ACCESS_DENIED, {
+    status: 403,
+    headers: { server: 'AkamaiGHost', 'content-type': 'text/html' },
+  });
+}
+
+const LANDING_HTML = '<form><input type="hidden" name="csrfmiddlewaretoken" value="csrf-hidden"></form>';
 
 describe('parseCsrfMiddlewareToken', () => {
   it('extracts the hidden token (value after name)', () => {
@@ -342,5 +379,292 @@ describe('fetchSenatePtrFilings', () => {
     await expect(
       fetchSenatePtrFilings({ relayUrl: 'https://scout.jays.services', politeDelayMs: 0 }, fetchImpl),
     ).rejects.toThrow(/senate GET \/search\/ -> HTTP 404/);
+  });
+});
+
+// CT-2442: since 2026-10-23 eFD's Akamai edge refuses the agreement POST and
+// the data POST for automated clients.  These tests pin how the flow reports
+// that, and that it never makes the situation worse.  All requests are mocks.
+describe('Senate eFD edge deny (CT-2442)', () => {
+  type Call = { url: string; method: string; egress: 'proxy' | 'direct'; cookie: string | null };
+
+  function recordCall(calls: Call[], input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Call {
+    const call: Call = {
+      url: String(input),
+      method: (init?.method ?? 'GET').toUpperCase(),
+      egress: (init as { client?: unknown } | undefined)?.client ? 'proxy' : 'direct',
+      cookie: new Headers(init?.headers).get('cookie'),
+    };
+    calls.push(call);
+    return call;
+  }
+
+  function memoryKv(seed: Record<string, string> = {}) {
+    const store = new Map<string, string>(Object.entries(seed));
+    return {
+      store,
+      get: vi.fn(async (key: string, type?: string) => {
+        const v = store.get(key) ?? null;
+        return v !== null && type === 'json' ? JSON.parse(v) : v;
+      }),
+      put: vi.fn(async (key: string, value: string) => {
+        store.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        store.delete(key);
+      }),
+    };
+  }
+
+  function okData(): Response {
+    return new Response(JSON.stringify({
+      data: [['Jane', 'Smith', '<a href="/search/view/ptr/edge-1/">Smith, Jane</a>', 'Periodic Transaction Report', '10/23/2026']],
+      recordsFiltered: 1,
+    }), { headers: { 'content-type': 'application/json' } });
+  }
+
+  const searchWindow = {
+    since: new Date('2026-10-16T00:00:00.000Z'),
+    now: new Date('2026-10-23T23:00:00.000Z'),
+    politeDelayMs: 0,
+  };
+
+  beforeEach(() => {
+    // Direct-only cases must not pick a proxy up from the runner's env.
+    for (const key of ['RESIDENTIAL_PROXY_URL', 'SENATE_PROXY_URL', 'HTTPS_PROXY', 'HTTP_PROXY', 'RESIDENTIAL_PROXY_HOST']) {
+      vi.stubEnv(key, '');
+    }
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  describe('classification', () => {
+    it('classifies a 403 from AkamaiGHost, or with Akamai\'s Access Denied page, as edge_denied', () => {
+      expect(classifySenateHttpFailure(403, 'AkamaiGHost')).toBe('edge_denied');
+      expect(classifySenateHttpFailure(403, null, AKAMAI_ACCESS_DENIED)).toBe('edge_denied');
+      expect(looksLikeAkamaiAccessDenied(AKAMAI_ACCESS_DENIED)).toBe(true);
+    });
+
+    it('keeps an origin 403 and non-403 answers generic', () => {
+      expect(classifySenateHttpFailure(403, 'gunicorn', '<h1>Forbidden (403)</h1><p>CSRF verification failed.</p>')).toBe('http');
+      expect(classifySenateHttpFailure(503, 'AkamaiGHost', AKAMAI_ACCESS_DENIED)).toBe('http');
+      expect(classifySenateHttpFailure(200, 'gunicorn')).toBe('http');
+    });
+
+    it('puts the Server header and the class into the message', () => {
+      const edge = new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost', { body: AKAMAI_ACCESS_DENIED });
+      expect(edge.message).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]');
+      expect(isSenateEdgeDeniedError(edge)).toBe(true);
+
+      const origin = new SenateHttpError('POST report/data/', 403, 'gunicorn');
+      expect(origin.message).toBe('senate POST report/data/ -> HTTP 403 (server=gunicorn)');
+      expect(isSenateEdgeDeniedError(origin)).toBe(false);
+
+      expect(new SenateHttpError('GET /search/', 404, null).message).toBe('senate GET /search/ -> HTTP 404 (server=unknown)');
+      expect(isSenateEdgeDeniedError(new Error('senate POST /search/home/ -> HTTP 403'))).toBe(false);
+    });
+  });
+
+  describe('establishSenateSession agreement check', () => {
+    function handshake(agree: () => Response) {
+      const calls: Call[] = [];
+      const fetchImpl = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const call = recordCall(calls, input, init);
+        if (call.url.endsWith('/search/')) {
+          return new Response(LANDING_HTML, {
+            headers: { 'set-cookie': 'csrftoken=csrf-cookie; Path=/', server: 'gunicorn' },
+          });
+        }
+        if (call.url.endsWith('/search/home/')) return agree();
+        throw new Error(`unexpected URL: ${call.url}`);
+      };
+      return { calls, fetchImpl: fetchImpl as typeof fetch };
+    }
+
+    it('throws on an Akamai 403 agreement refusal and never caches the refused jar', async () => {
+      const kv = memoryKv();
+      const { fetchImpl } = handshake(akamaiDenied);
+
+      const err = await establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SenateHttpError);
+      expect((err as Error).message).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]');
+      expect(isSenateEdgeDeniedError(err)).toBe(true);
+      expect(kv.put).not.toHaveBeenCalled();
+    });
+
+    it('accepts the normal 302 and caches that session', async () => {
+      const kv = memoryKv();
+      const { fetchImpl } = handshake(() =>
+        new Response('', { status: 302, headers: { location: '/search/', 'set-cookie': 'sessionid=sess; Path=/' } }));
+
+      const session = await establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl);
+
+      expect(session.cookieHeader).toContain('sessionid=sess');
+      expect(kv.put).toHaveBeenCalledTimes(1);
+      expect(kv.put.mock.calls[0][0]).toBe(SENATE_SESSION_KV_KEY);
+    });
+
+    it('accepts a 200 only when the agreement form is gone', async () => {
+      const kv = memoryKv();
+      const { fetchImpl } = handshake(() =>
+        new Response('<html><table id="filedReports"></table></html>', {
+          status: 200,
+          headers: { 'set-cookie': 'sessionid=sess; Path=/', server: 'gunicorn' },
+        }));
+
+      const session = await establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl);
+
+      expect(session.cookieHeader).toContain('sessionid=sess');
+      expect(kv.put).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a 200 that still shows the agreement form (form far past the first 4 KB)', async () => {
+      const kv = memoryKv();
+      const wall = `<html><head>${'<meta name="pad">'.repeat(600)}</head><body>`
+        + '<form id="agreement_form"><input type="checkbox" name="prohibition_agreement" value="1"></form></body></html>';
+      const { fetchImpl } = handshake(() =>
+        new Response(wall, { status: 200, headers: { server: 'gunicorn', 'content-type': 'text/html' } }));
+
+      await expect(establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl)).rejects.toThrow(
+        'senate POST /search/home/ -> HTTP 200 still shows the agreement form (server=gunicorn)',
+      );
+      expect(kv.put).not.toHaveBeenCalled();
+    });
+
+    it('names the Server header on a refused landing GET', async () => {
+      const fetchImpl = (async () => new Response('busy', { status: 503, headers: { server: 'gunicorn' } })) as typeof fetch;
+      await expect(establishSenateSession({ politeDelayMs: 0 }, fetchImpl)).rejects.toThrow(
+        'senate GET /search/ -> HTTP 503 (server=gunicorn)',
+      );
+    });
+  });
+
+  describe('egress order', () => {
+    const PROXY = 'http://proxy.test:8888';
+
+    function efd(calls: Call[], route: (call: Call) => Response | Promise<Response> | undefined) {
+      return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const call = recordCall(calls, input, init);
+        const routed = await route(call);
+        if (routed) return routed;
+        if (call.url.endsWith('/search/')) {
+          return new Response(LANDING_HTML, { headers: { 'set-cookie': 'csrftoken=csrf-cookie; Path=/' } });
+        }
+        if (call.url.endsWith('/search/home/')) {
+          return new Response('', { status: 302, headers: { 'set-cookie': 'sessionid=sess; Path=/' } });
+        }
+        if (call.url.endsWith('/search/report/data/')) return okData();
+        throw new Error(`unexpected URL: ${call.url}`);
+      }) as typeof fetch;
+    }
+
+    function connectRefused(): never {
+      throw new TypeError(
+        'error sending request for url (https://efdsearch.senate.gov/search/): client error (Connect): '
+          + 'tcp connect error: Connection refused (os error 111)',
+      );
+    }
+
+    it('goes through the configured proxy first and never dials direct when the proxy works', async () => {
+      const calls: Call[] = [];
+      const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY }, efd(calls, () => undefined));
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls.every((c) => c.egress === 'proxy')).toBe(true);
+    });
+
+    it('does not retry direct when the proxy gets an HTTP answer (the edge deny)', async () => {
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => (c.url.endsWith('/search/home/') ? akamaiDenied() : undefined));
+
+      const err = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY }, fetchImpl).catch((e: unknown) => e);
+
+      expect(isSenateEdgeDeniedError(err)).toBe(true);
+      expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        'proxy GET /search/',
+        'proxy POST /search/home/',
+      ]);
+    });
+
+    it('falls back to direct when the proxy leg fails at the network level', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => (c.egress === 'proxy' ? connectRefused() : undefined));
+
+      const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls[0].egress).toBe('proxy');
+      expect(calls.slice(1).length).toBeGreaterThan(0);
+      expect(calls.slice(1).every((c) => c.egress === 'direct')).toBe(true);
+      expect(warn.mock.calls.some(([msg]) => /proxy unreachable; the direct fallback reached eFD/.test(String(msg)))).toBe(true);
+    });
+
+    it('a direct fallback failure never touches the proxy-made KV session and names the proxy outage', async () => {
+      const proxySession = JSON.stringify({ csrfCookie: 'proxy-csrf', cookieHeader: 'csrftoken=proxy-csrf; sessionid=proxy-made' });
+      const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: proxySession });
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => {
+        if (c.egress === 'proxy') connectRefused();
+        // The box egress: Akamai's SERVE_403 even for GET.
+        return akamaiDenied();
+      });
+
+      const err = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, kv }, fetchImpl).catch((e: unknown) => e);
+
+      expect((err as Error).message).toMatch(
+        /^senate proxy egress unreachable \(error sending request.*Connection refused.*\); direct fallback failed: senate GET \/search\/ -> HTTP 403 \(server=AkamaiGHost\) \[edge_denied\]$/,
+      );
+      // A proxy outage is not an eFD edge deny: no long backoff for it.
+      expect(isSenateEdgeDeniedError(err)).toBe(false);
+      expect(kv.delete).not.toHaveBeenCalled();
+      expect(kv.put).not.toHaveBeenCalled();
+      expect(kv.store.get(SENATE_SESSION_KV_KEY)).toBe(proxySession);
+      const direct = calls.filter((c) => c.egress === 'direct');
+      expect(direct.length).toBeGreaterThan(0);
+      expect(direct.every((c) => !(c.cookie ?? '').includes('sessionid=proxy-made'))).toBe(true);
+    });
+
+    it('an edge deny on the data POST keeps the cached session and does not re-handshake or retry', async () => {
+      const cached = JSON.stringify({ csrfCookie: 'c', cookieHeader: 'csrftoken=c; sessionid=s' });
+      const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: cached });
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => (c.url.endsWith('/search/report/data/') ? akamaiDenied() : undefined));
+
+      const err = await fetchSenatePtrFilings({ ...searchWindow, kv }, fetchImpl).catch((e: unknown) => e);
+
+      expect((err as Error).message).toBe('senate POST report/data/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]');
+      expect(calls.map((c) => new URL(c.url).pathname)).toEqual(['/search/report/data/']);
+      expect(kv.delete).not.toHaveBeenCalled();
+      expect(kv.store.get(SENATE_SESSION_KV_KEY)).toBe(cached);
+    });
+
+    it('still re-negotiates a cached session the origin rejects (not an edge deny)', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: JSON.stringify({ csrfCookie: 'old', cookieHeader: 'sessionid=old' }) });
+      const calls: Call[] = [];
+      let dataPosts = 0;
+      const fetchImpl = efd(calls, (c) => {
+        if (!c.url.endsWith('/search/report/data/')) return undefined;
+        dataPosts += 1;
+        return dataPosts === 1
+          ? new Response('<h1>Forbidden (403)</h1>', { status: 403, headers: { server: 'gunicorn', 'content-type': 'text/html' } })
+          : okData();
+      });
+
+      const out = await fetchSenatePtrFilings({ ...searchWindow, kv }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(kv.delete).toHaveBeenCalledWith(SENATE_SESSION_KV_KEY);
+      expect(calls.map((c) => new URL(c.url).pathname)).toEqual([
+        '/search/report/data/', '/search/', '/search/home/', '/search/report/data/',
+      ]);
+      expect(warn.mock.calls.some(([msg]) => /cached session invalid \(HTTP 403 text\/html, server=gunicorn\)/.test(String(msg)))).toBe(true);
+    });
   });
 });

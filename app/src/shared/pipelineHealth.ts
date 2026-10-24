@@ -19,6 +19,7 @@ import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
 import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
+import { readSenateEdgeBackoff, SENATE_EDGE_BACKOFF_GRACE_MS } from '../ingestion/senateEdgeDeny.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { latencyProvidersWithRejectedCredentials } from '../ingestion/scoutHandoff.ts';
@@ -211,6 +212,13 @@ export interface PipelineSignals {
     lastSuccessAt: string | null;
     lastAttemptAt: string | null;
     configDisabled: boolean;
+    /**
+     * Senate only: the eFD edge-deny backoff the watcher is honoring
+     * (CONFIG_KV, CT-2442).  Its attempts are sparse by design (60 minutes up
+     * to 6 hours apart), so the check names the backoff instead of reading
+     * "NOT RUNNING".  Absent = no backoff.
+     */
+    edgeBackoff?: { until: string; lastDeniedAt: string; reason: string };
   }> | null;
   /**
    * Latency-probe liveness (same directive): newest observation per provider
@@ -921,12 +929,30 @@ export function evaluatePipelineSignals(
       const attemptMs = st.lastAttemptAt ? Date.parse(st.lastAttemptAt) : NaN;
       const successAgeH = Number.isFinite(successMs) ? (nowMs - successMs) / 3_600_000 : Infinity;
       const attemptAgeH = Number.isFinite(attemptMs) ? (nowMs - attemptMs) / 3_600_000 : Infinity;
+      // An edge-deny backoff explains sparse attempts while its deny is newer
+      // than the last success and the next attempt is not overdue.  Still
+      // stalled: discovery is down, and this detail is what the page says.
+      const backoff = st.edgeBackoff;
+      const backoffUntilMs = backoff ? Date.parse(backoff.until) : NaN;
+      const backedOff = backoff !== undefined
+        && !(Number.isFinite(successMs) && Date.parse(backoff.lastDeniedAt) <= successMs)
+        && (attemptAgeH <= maxAgeH || nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS);
       if (successAgeH <= maxAgeH) {
         checks.push({
           id,
           status: 'ok',
           detail: `${src} polling live: last success ${successAgeH < 1 ? Math.round(successAgeH * 60) + 'm' : Math.round(successAgeH) + 'h'} ago`,
           value: Math.round(successAgeH * 10) / 10,
+        });
+      } else if (backoff && backedOff) {
+        const waitMin = Math.round((backoffUntilMs - nowMs) / 60_000);
+        checks.push({
+          id,
+          status: 'stalled',
+          detail: `${src} polling BACKED OFF after an edge deny (${backoff.reason}): `
+            + `${!Number.isFinite(waitMin) ? 'next attempt time unknown' : waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'}; `
+            + `no success in ${successAgeH === Infinity ? 'ever' : Math.round(successAgeH) + 'h'} (threshold ${maxAgeH}h)`,
+          value: successAgeH === Infinity ? null : Math.round(successAgeH),
         });
       } else if (attemptAgeH <= maxAgeH) {
         checks.push({
@@ -1637,6 +1663,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
       const d = await getLastPollAt(env, 'oge');
       ogeLastPollIso = d ? d.toISOString() : null;
     } catch {}
+    const senateEdgeBackoff = await readSenateEdgeBackoff(env);
     pollSources = (['house', 'senate', 'executive'] as const).map((source) => {
       const row = bySource.get(source);
       let lastSuccessAt = row?.last_success ?? null;
@@ -1650,6 +1677,15 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
         lastSuccessAt,
         lastAttemptAt,
         configDisabled: source === 'executive' ? ogeDisabled : false,
+        ...(source === 'senate' && senateEdgeBackoff
+          ? {
+              edgeBackoff: {
+                until: senateEdgeBackoff.until,
+                lastDeniedAt: senateEdgeBackoff.lastDeniedAt,
+                reason: senateEdgeBackoff.reason,
+              },
+            }
+          : {}),
       };
     });
   } catch {}

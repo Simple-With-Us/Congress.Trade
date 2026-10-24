@@ -12,6 +12,17 @@ import { BROWSER_HEADERS, SENATE_SEARCH } from './senateSource.ts';
 export const SENATE_EFD_HEALTH_KV_KEY = 'senate-efd:health';
 export const SENATE_EFD_PROBE_TIMEOUT_MS = 8_000;
 
+/**
+ * Re-probe cadence, read off the cached record.  The box's direct egress has
+ * been edge-denied by eFD's Akamai (SERVE_403) since at least 2026-10-16, so
+ * probing on every watcher minute sent about 1,440 denied requests a day
+ * (CT-2442).  A failed probe is re-checked at most every 30 minutes.  An ok
+ * probe is refreshed every 15, inside pipelineHealth's 20-minute staleness
+ * bar for this check, so a healthy probe never reads as stale.
+ */
+export const SENATE_EFD_PROBE_RETRY_MS = 30 * 60_000;
+export const SENATE_EFD_PROBE_OK_REFRESH_MS = 15 * 60_000;
+
 export interface SenateEfdProbeRecord {
   ok: boolean;
   status: number | null;
@@ -63,8 +74,23 @@ export async function probeSenateEfdLanding(
   }
 }
 
-export async function refreshSenateEfdHealth(env: Env, now = new Date()): Promise<void> {
-  const rec = await probeSenateEfdLanding(globalThis.fetch, SENATE_EFD_PROBE_TIMEOUT_MS);
+/** True when the cached probe is old enough (or missing) to send another request. */
+export function senateEfdProbeDue(prev: SenateEfdProbeRecord | null, now: Date): boolean {
+  if (!prev) return true;
+  const checkedMs = Date.parse(prev.checkedAt);
+  if (!Number.isFinite(checkedMs)) return true;
+  const ageMs = now.getTime() - checkedMs;
+  if (ageMs < 0) return true;
+  return ageMs >= (prev.ok ? SENATE_EFD_PROBE_OK_REFRESH_MS : SENATE_EFD_PROBE_RETRY_MS);
+}
+
+export async function refreshSenateEfdHealth(
+  env: Env,
+  now = new Date(),
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  if (!senateEfdProbeDue(await readSenateEfdProbe(env), now)) return;
+  const rec = await probeSenateEfdLanding(fetchImpl, SENATE_EFD_PROBE_TIMEOUT_MS);
   rec.checkedAt = now.toISOString();
   await persistSenateEfdProbe(env, rec);
 }

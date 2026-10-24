@@ -37,19 +37,41 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import * as cheerio from 'cheerio';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
+import { SenateHttpError, isSenateEdgeDeniedError } from './senateEdgeDeny.ts';
 
-/** Backoff between direct Senate eFD attempts before optional explicit proxy. */
-/** Keep direct retry waits under pollSenate's 7s abort when a proxy fallback exists. */
+/** Backoff between direct Senate eFD attempts when direct is the only egress. */
+/** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
 export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
 export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err ?? '');
+}
+
 function isRetryableSenateTransportError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err ?? '');
+  // An edge deny is persistent: retrying it only asks the edge again.
+  if (isSenateEdgeDeniedError(err)) return false;
+  const message = errorMessage(err);
   if (/HTTP 403/.test(message)) return true;
   if (/HTTP 502|HTTP 503|HTTP 504/.test(message)) return true;
   if (/abort/i.test(message)) return false;
   if (/fetch failed|network|ECONNREFUSED|ETIMEDOUT|timed out/i.test(message)) return true;
   return false;
+}
+
+/**
+ * True when a leg failed before any HTTP answer came back: a connect error,
+ * a network timeout, or an unreachable proxy (fetch rejects with a TypeError).
+ * An HTTP answer, a parse problem, or the source budget's own abort is not.
+ */
+function isSenateNetworkFailure(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  if (err instanceof SenateHttpError) return false;
+  if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) return false;
+  const message = errorMessage(err);
+  if (/\bHTTP \d{3}\b|content-type|csrfmiddlewaretoken|abort/i.test(message)) return false;
+  return err instanceof TypeError
+    || /fetch failed|network|connect|ECONN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|timed out|tunnel|proxy|os error/i.test(message);
 }
 
 function resolveExplicitSenateProxyUrl(opts: FetchSenatePtrFilingsOptions): string | undefined {
@@ -65,10 +87,15 @@ function resolveExplicitSenateProxyUrl(opts: FetchSenatePtrFilingsOptions): stri
 }
 
 /**
- * Run `run` with direct datacenter egress first (with backoff), then an
- * operator-configured residential proxy when direct keeps failing.  The Mango
- * default is never used implicitly — a dead mesh proxy must not block Senate
- * discovery when direct (or backoff) works.
+ * Run `run` through the operator-configured residential proxy first.  Direct
+ * datacenter egress is only a fallback for when the proxy leg fails at the
+ * network level (connect error, network timeout, proxy unreachable), so a
+ * Mango outage still falls back (CT-2361 / #2748).  An HTTP answer through
+ * the proxy, an edge deny included, is the result: it is never retried
+ * direct, because the box's own egress has been edge-denied even for GET
+ * (Akamai SERVE_403) since at least 2026-10-16 (CT-2442).  Without an explicit
+ * proxy, direct is the only egress and keeps its short backoff for transient
+ * answers.  The Mango default is never used implicitly.
  */
 export async function withSenateEfdEgress<T>(
   opts: FetchSenatePtrFilingsOptions,
@@ -76,38 +103,50 @@ export async function withSenateEfdEgress<T>(
   run: (fetchImpl: typeof fetch, egress: 'direct' | 'proxy') => Promise<T>,
 ): Promise<T> {
   const explicitProxy = resolveExplicitSenateProxyUrl(opts);
-  const strategies: Array<{ egress: 'direct' | 'proxy'; fetch: typeof fetch }> = [
-    { egress: 'direct', fetch: baseFetch },
-  ];
+  const strategies: Array<{ egress: 'direct' | 'proxy'; fetch: typeof fetch }> = [];
   if (explicitProxy) {
     strategies.push({
       egress: 'proxy',
       fetch: createProxiedFetch(explicitProxy, baseFetch),
     });
   }
+  strategies.push({ egress: 'direct', fetch: baseFetch });
 
-  let lastErr: unknown;
-  for (let i = 0; i < strategies.length; i++) {
-    const { egress, fetch: fetchImpl } = strategies[i];
-    const directBackoff = explicitProxy
-      ? SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS
-      : SENATE_EFD_DIRECT_BACKOFF_MS;
-    const attempts = egress === 'direct' ? directBackoff.length : 1;
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const waitMs = egress === 'direct' ? directBackoff[attempt] ?? 0 : 0;
+  let proxyErr: unknown = null;
+  for (const { egress, fetch: fetchImpl } of strategies) {
+    const backoff = egress === 'proxy'
+      ? [0]
+      : explicitProxy
+        ? SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS
+        : SENATE_EFD_DIRECT_BACKOFF_MS;
+    for (let attempt = 0; attempt < backoff.length; attempt++) {
+      const waitMs = backoff[attempt] ?? 0;
       if (waitMs > 0) await delay(waitMs, opts.signal);
       try {
-        return await run(fetchImpl, egress);
+        const out = await run(fetchImpl, egress);
+        if (proxyErr) {
+          console.warn('senateSource: residential proxy unreachable; the direct fallback reached eFD:', errorMessage(proxyErr));
+        }
+        return out;
       } catch (err) {
-        lastErr = err;
-        const retryable = isRetryableSenateTransportError(err);
-        const moreDirect = egress === 'direct' && attempt + 1 < attempts;
-        if (retryable && (moreDirect || i + 1 < strategies.length)) continue;
+        if (egress === 'proxy') {
+          if (!isSenateNetworkFailure(err, opts.signal)) throw err;
+          proxyErr = err;
+          break;
+        }
+        if (attempt + 1 < backoff.length && isRetryableSenateTransportError(err)) continue;
+        // Name the proxy outage first: it is the failure to act on, and the
+        // direct leg's own answer (usually an edge deny) is only the fallback.
+        if (proxyErr && !opts.signal?.aborted) {
+          throw new Error(
+            `senate proxy egress unreachable (${errorMessage(proxyErr)}); direct fallback failed: ${errorMessage(err)}`,
+          );
+        }
         throw err;
       }
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'senate egress failed'));
+  throw new Error('senate egress failed');
 }
 
 const SENATE_BASE = 'https://efdsearch.senate.gov';
@@ -364,12 +403,34 @@ export interface SenateSession {
   cookieHeader: string;
 }
 
+/** The response's Server header (AkamaiGHost for the edge, gunicorn for the origin). */
+function senateServer(res: Response): string | null {
+  return res.headers.get('server');
+}
+
+/**
+ * The start of a response body.  The default is enough to recognize Akamai's
+ * deny page (~400 bytes); the agreement form sits past byte 5,000 of eFD's
+ * landing page, so that check reads a larger prefix.
+ */
+async function readSenateBodySnippet(res: Response, maxChars = 4096): Promise<string> {
+  try {
+    return (await res.text()).slice(0, maxChars);
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Run the eFD landing + agreement-acceptance handshake and return a usable
  * session (cookie header + CSRF token). When `kv` is provided the session is
  * cached for 24 hours under SENATE_SESSION_KV_KEY so the discovery poll and the
  * filing fetcher share one session instead of re-negotiating (or, worse,
  * fetching report pages sessionless and receiving the agreement wall).
+ *
+ * Throws SenateHttpError when eFD does not accept the agreement, and then
+ * writes nothing to KV: a refused cookie jar cached for 24 hours would be
+ * replayed by every poll and every document fetch.
  */
 export async function establishSenateSession(
   opts: { kv?: any; politeDelayMs?: number; signal?: AbortSignal } = {},
@@ -391,7 +452,11 @@ export async function establishSenateSession(
     },
     signal: opts.signal,
   }, { service: 'filing-discovery', operation: 'open-senate-search-session' }, fetchImpl);
-  if (!landing.ok) throw new Error(`senate GET /search/ -> HTTP ${landing.status}`);
+  if (!landing.ok) {
+    throw new SenateHttpError('GET /search/', landing.status, senateServer(landing), {
+      body: await readSenateBodySnippet(landing),
+    });
+  }
   jar.absorb(landing);
   const landingHtml = await landing.text();
   const middlewareToken = parseCsrfMiddlewareToken(landingHtml);
@@ -420,7 +485,23 @@ export async function establishSenateSession(
     redirect: 'manual',
     signal: opts.signal,
   }, { service: 'filing-discovery', operation: 'accept-senate-search-terms' }, fetchImpl);
-  // 200 or 302 are both fine; we only care that cookies are refreshed.
+  // A normal acceptance answers with a redirect (302).  A 200 counts only
+  // when the page no longer carries the agreement form.  Anything else is a
+  // refusal (since 2026-10-23 the Akamai edge answers this POST with 403
+  // "Access Denied", CT-2442), and a refused jar must never reach KV.
+  if (agree.status >= 300 && agree.status < 400) {
+    await agree.body?.cancel().catch(() => {});
+  } else if (agree.status === 200) {
+    if (looksLikeSenateAgreementWall(await readSenateBodySnippet(agree, 262_144))) {
+      throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+        detail: 'still shows the agreement form',
+      });
+    }
+  } else {
+    throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+      body: await readSenateBodySnippet(agree),
+    });
+  }
   jar.absorb(agree);
   await delay(politeDelayMs, opts.signal);
 
@@ -485,12 +566,18 @@ export async function fetchSenatePtrFilings(
     );
   }
 
-  return await withSenateEfdEgress(opts, fetchImpl, async (effectiveFetch, _egress) => {
+  const proxyConfigured = Boolean(resolveExplicitSenateProxyUrl(opts));
+  return await withSenateEfdEgress(opts, fetchImpl, async (effectiveFetch, egress) => {
+  // The shared KV session belongs to the primary egress.  A direct leg that
+  // is only the proxy's fallback never reads, writes or deletes it: the
+  // proxy made it, the fetcher replays it through the same proxy, and a
+  // direct failure must not wipe it (CT-2442).
+  const sessionKv = egress === 'direct' && proxyConfigured ? undefined : opts.kv;
   let session: SenateSession | null = null;
 
-  if (opts.kv) {
+  if (sessionKv) {
     try {
-      const cached = await opts.kv.get(SENATE_SESSION_KV_KEY, 'json');
+      const cached = await sessionKv.get(SENATE_SESSION_KV_KEY, 'json');
       if (cached) session = cached as SenateSession;
     } catch (err) {
       console.warn('watcher: Failed to read senate session from KV:', err);
@@ -504,7 +591,7 @@ export async function fetchSenatePtrFilings(
 
   while (true) {
     if (!session && !handshakeDone) {
-      session = await establishSenateSession({ kv: opts.kv, politeDelayMs, signal: opts.signal }, effectiveFetch);
+      session = await establishSenateSession({ kv: sessionKv, politeDelayMs, signal: opts.signal }, effectiveFetch);
       handshakeDone = true;
     }
     if (!session) break;
@@ -548,16 +635,24 @@ export async function fetchSenatePtrFilings(
 
       const contentType = data.headers.get('content-type') || '';
       if (!data.ok || !contentType.includes('application/json')) {
-        if (useCached && !handshakeDone) {
-          console.warn(`watcher: senate cached session invalid (HTTP ${data.status} ${contentType}), retrying handshake`);
-          if (opts.kv) {
-            await opts.kv.delete(SENATE_SESSION_KV_KEY).catch(() => {});
+        const server = senateServer(data);
+        const failure = data.ok
+          ? null
+          : new SenateHttpError('POST report/data/', data.status, server, { body: await readSenateBodySnippet(data) });
+        // An edge deny is not a session problem.  Re-negotiating would only
+        // send the edge another agreement POST, so it surfaces as is.
+        if (useCached && !handshakeDone && !isSenateEdgeDeniedError(failure)) {
+          console.warn(
+            `watcher: senate cached session invalid (HTTP ${data.status} ${contentType}, server=${server || 'unknown'}), retrying handshake`,
+          );
+          if (sessionKv) {
+            await sessionKv.delete(SENATE_SESSION_KV_KEY).catch(() => {});
           }
           pageError = true;
           break;
         }
-        if (!data.ok) throw new Error(`senate POST report/data/ -> HTTP ${data.status}`);
-        throw new Error(`senate POST report/data/ -> unexpected content-type ${contentType}`);
+        if (failure) throw failure;
+        throw new Error(`senate POST report/data/ -> unexpected content-type ${contentType} (server=${server || 'unknown'})`);
       }
 
       const json = (await data.json()) as { data?: unknown; recordsFiltered?: unknown };

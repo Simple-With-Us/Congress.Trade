@@ -380,17 +380,20 @@ export async function fetchFiling(
     if (row.chamber === 'senate' && isSenateAgreementWallBytes(rawBytes)) {
       // On the relay path the relay negotiates its own session (and already
       // retried once internally); a second relay call is the correct retry.
-      // Direct path: negotiate a fresh agreement-accepted session ourselves.
+      // Direct path: negotiate a fresh agreement-accepted session ourselves,
+      // on the same proxied egress as the document GETs above.  Both legs
+      // used to go out on the default (unproxied) fetch, from the box IP the
+      // eFD edge denies.
       let retry: Response;
       if (usedRelay) {
         retry = await fetchSenateDocViaRelay();
       } else {
-        const session = await establishSenateSession({ kv: env.CONFIG_KV });
+        const session = await establishSenateSession({ kv: env.CONFIG_KV }, effectiveFetch);
         retry = await trackedFetch(sourceUrl, {
           headers: { ...headers, cookie: session.cookieHeader },
           redirect: 'follow',
           signal: lease?.signal,
-        }, { service: 'filing-ingestion', operation: 'fetch-filing-document', dynamicTarget: 'filing-source' });
+        }, { service: 'filing-ingestion', operation: 'fetch-filing-document', dynamicTarget: 'filing-source' }, effectiveFetch);
       }
       if (!retry.ok || !retry.body) {
         await retry.body?.cancel().catch(() => {});

@@ -12,11 +12,29 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   establishSenateSession: vi.fn(),
+  proxiedFetches: [] as Array<typeof fetch>,
 }));
 
 vi.mock('../senateSource', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../senateSource.ts')>();
   return { ...actual, establishSenateSession: mocks.establishSenateSession };
+});
+
+// Node has no Deno.createHttpClient, so the real wrapper would return the base
+// fetch.  Tag proxied calls (an extra `client` on init, like the real one) and
+// keep each wrapper so a test can check which fetch a leg was handed.
+vi.mock('../../shared/proxyFetch.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../shared/proxyFetch.ts')>();
+  return {
+    ...actual,
+    createProxiedFetch: (proxyUrl?: string, baseFetch: typeof fetch = globalThis.fetch) => {
+      if (!proxyUrl) return baseFetch;
+      const proxied = ((input: RequestInfo | URL, init?: RequestInit) =>
+        baseFetch(input, { ...init, client: { proxyUrl } } as RequestInit)) as typeof fetch;
+      mocks.proxiedFetches.push(proxied);
+      return proxied;
+    },
+  };
 });
 
 import { fetchFiling, isSenateAgreementWallBytes, IngestRetryError } from '../fetcher.ts';
@@ -101,6 +119,35 @@ describe('fetchFiling senate wall guard', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     mocks.establishSenateSession.mockReset();
+    mocks.proxiedFetches.length = 0;
+  });
+
+  it('negotiates the session and refetches through the proxied fetch (both legs, CT-2442)', async () => {
+    const { env, r2Puts } = envForSenateFetch();
+    mocks.establishSenateSession.mockResolvedValue({ csrfCookie: 'csrf', cookieHeader: 'sessionid=fresh; csrftoken=csrf' });
+    const calls: Array<{ method: string; proxied: boolean; cookie: string | undefined }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({
+        method: (init?.method ?? 'GET').toUpperCase(),
+        proxied: Boolean((init as { client?: unknown } | undefined)?.client),
+        cookie: headers['cookie'],
+      });
+      const body = headers['cookie']?.includes('sessionid=fresh') ? REPORT_HTML : WALL_HTML;
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/html' } });
+    }));
+
+    await fetchFiling(env, 'S-wall-1');
+
+    // The handshake is handed the same proxied fetch as the document GETs.
+    expect(mocks.proxiedFetches).toHaveLength(1);
+    expect(mocks.establishSenateSession).toHaveBeenCalledTimes(1);
+    expect(mocks.establishSenateSession.mock.calls[0][1]).toBe(mocks.proxiedFetches[0]);
+    // HEAD, first GET (the wall) and the refetch all left through the proxy.
+    expect(calls.map((c) => c.method)).toEqual(['HEAD', 'GET', 'GET']);
+    expect(calls.every((c) => c.proxied)).toBe(true);
+    expect(calls[2].cookie).toContain('sessionid=fresh');
+    expect(new TextDecoder().decode(r2Puts[0].bytes)).toContain('filedReports');
   });
 
   it('refreshes the session and stores the REAL report when the first response is the wall', async () => {
