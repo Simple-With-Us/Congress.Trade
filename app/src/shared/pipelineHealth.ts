@@ -44,6 +44,11 @@ import {
   formatIngestionDeadLetterIdentityDetail,
   type FailedIngestionOutboxIdentity,
 } from '../ingestion/failedOutboxIdentity.ts';
+import { readPipelineStallHours } from '../ingestion/pipelineStallConfig.ts';
+import {
+  collectStPeerPricesMetrics,
+  stPeerPricesMetricsToCheck,
+} from '../prices/stPeerPricesHealth.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -1163,12 +1168,23 @@ export function evaluatePipelineSignals(
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
     if (!probe.ok) {
+      const residentialLive = Boolean(
+        s.residentialProxyConfigured &&
+        s.residentialProxy?.probe?.ok,
+      );
+      const datacenterBlock =
+        residentialLive &&
+        (probe.status === 403 || probe.status === 401);
       checks.push({
         id: 'senate_efd',
-        status: 'stalled',
-        detail: `Senate eFD direct landing unreachable`
-          + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-          + `${probe.error ? ` — ${probe.error}` : ''}`,
+        status: datacenterBlock ? 'degraded' : 'stalled',
+        detail: datacenterBlock
+          ? `Senate eFD direct probe blocked from datacenter`
+            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + ` — expected; Senate ingest uses the residential proxy (live).`
+          : `Senate eFD direct landing unreachable`
+            + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + `${probe.error ? ` — ${probe.error}` : ''}`,
         value: probe.status,
       });
     } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
@@ -1818,5 +1834,18 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   };
 
   const evaluated = evaluatePipelineSignals(signals, nowMs, DEFAULT_PIPELINE_THRESHOLDS, schedule);
-  return { ...evaluated, reviewQueue };
+
+  const stPeerMetrics = await collectStPeerPricesMetrics(
+    env,
+    now,
+    readPipelineStallHours(env, 'st_peer_prices'),
+  );
+  const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
+  const checks = [...evaluated.checks, stPeerCheck];
+  let status: PipelineStatus = 'ok';
+  for (const c of checks) {
+    status = worstStatus(status, c.status);
+  }
+
+  return { ...evaluated, status, checks, reviewQueue };
 }
