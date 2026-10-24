@@ -85,7 +85,7 @@ describe('deliveryFreshness', () => {
       // date alone must not class a brand-new filing as backfill.
       const row = tx({ filedDate: day(0), firstSeenAt: todayIso, createdAt: todayIso, txDate: day(52 * DAY_MS) });
       expect(isDeliveryBackfill(row, now)).toBe(false);
-      expect(stampDeliveryFreshness(row, now).isBackfill).toBe(false);
+      expect(stampDeliveryFreshness(row).isBackfill).toBe(false);
     });
 
     it('falls back to the trade date when there is no filed date and no first-seen stamp', () => {

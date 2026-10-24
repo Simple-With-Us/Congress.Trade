@@ -54,6 +54,8 @@ interface FakeStore {
   missingTx: Set<string>;
   /** tx ids whose transactions row is deprecated (retracted). */
   retractedTx: Set<string>;
+  /** SQL of every parked/quarantined scan, in order. */
+  scans: string[];
 }
 
 /** Minimal D1 fake covering the circuit + park/flush SQL shapes. */
@@ -69,6 +71,7 @@ function circuitEnv(extra: { subscriptions?: Array<Record<string, unknown>>; var
     claimDenied: false,
     missingTx: new Set(),
     retractedTx: new Set(),
+    scans: [],
   };
   const queueSends: unknown[] = [];
   const prepare = (sql: string) => ({
@@ -101,9 +104,12 @@ function circuitEnv(extra: { subscriptions?: Array<Record<string, unknown>>; var
         const rows: Array<{ updated_at: string; row: unknown }> = [];
         const wantQuarantined = /status = 'quarantined'/i.test(sql);
         const wantParked = /status = 'parked'/i.test(sql);
-        // LEFT JOIN transactions: the tx_state CASE and the undeliverable-only filter.
+        // LEFT JOIN transactions: the tx_state CASE and the undeliverable-only /
+        // live-only filters.
         const joinsTransactions = /LEFT JOIN transactions t/i.test(sql);
         const undeliverableOnly = /\(t\.id IS NULL OR t\.deprecated_at IS NOT NULL\)/i.test(sql);
+        const liveOnly = /\(t\.id IS NOT NULL AND t\.deprecated_at IS NULL\)/i.test(sql);
+        store.scans.push(sql);
         for (const d of store.deliveries.values()) {
           if (wantQuarantined && d.status !== 'quarantined') continue;
           if (wantParked && d.status !== 'parked') continue;
@@ -117,6 +123,7 @@ function circuitEnv(extra: { subscriptions?: Array<Record<string, unknown>>; var
                 ? 'retracted'
                 : null;
           if (undeliverableOnly && !txState) continue;
+          if (liveOnly && txState) continue;
           rows.push({
             updated_at: d.updated_at ?? '',
             row: { subscription_id: d.subscription_id, tx_id: d.tx_id, target_url: sub.target_url, tx_state: txState },
@@ -567,6 +574,37 @@ describe('recoverQuarantinedDeliveries', () => {
     expect(store.deliveries.get('sub_1:tx_live')!.status).toBe('quarantined');
   });
 
+  it('reaches undeliverable rows behind live rows that cannot recover yet', async () => {
+    const { env, store } = circuitEnv({ subscriptions: [sub] });
+    const now = new Date('2026-07-18T12:00:00.000Z');
+    store.circuits.set(TARGET, {
+      target_key: TARGET,
+      consecutive_failures: 6,
+      open_until: new Date(now.getTime() + 3600_000).toISOString(),
+      failures_day: '2026-07-18',
+      failures_today: 6,
+      last_error: 'HTTP 401',
+      updated_at: now.toISOString(),
+    });
+    // The oldest row is live and the circuit is open, so it is declined and
+    // keeps its updated_at.  A single oldest-first page of one would return it
+    // every pass and never reach the swept row behind it.
+    store.deliveries.set('sub_1:tx_live', {
+      subscription_id: 'sub_1', tx_id: 'tx_live', status: 'quarantined', attempts: 0, last_error: 'overflow',
+      updated_at: '2026-07-20T00:00:00.000Z',
+    });
+    store.deliveries.set('sub_1:tx_gone', {
+      subscription_id: 'sub_1', tx_id: 'tx_gone', status: 'quarantined', attempts: 0, last_error: 'overflow',
+      updated_at: '2026-07-21T00:00:00.000Z',
+    });
+    store.missingTx.add('tx_gone');
+
+    const result = await recoverQuarantinedDeliveries(env, { limit: 1, now });
+    expect(result).toMatchObject({ scanned: 2, terminalized: 1, recovered: 0, skipped: 1 });
+    expect(store.deliveries.get('sub_1:tx_gone')!.status).toBe('skipped');
+    expect(store.deliveries.get('sub_1:tx_live')!.status).toBe('quarantined');
+  });
+
   it('counts undeliverable rows on a dryRun without writing', async () => {
     const { env, store } = circuitEnv({ subscriptions: [sub] });
     store.deliveries.set('sub_1:tx_gone', {
@@ -613,6 +651,44 @@ describe('quarantine auto-recovery gate (DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER
       status: 'skipped', last_error: 'transaction no longer exists',
     });
     expect(queueSends).toHaveLength(0);
+  });
+
+  it('backs the undeliverable scan off for an hour after a pass that skips nothing', async () => {
+    const { env, store } = circuitEnv({ subscriptions: [sub] });
+    const t0 = new Date('2026-10-24T12:00:00.000Z');
+    const at = (minutes: number) => new Date(t0.getTime() + minutes * 60_000);
+    const quarantinedScans = () => store.scans.filter((sql) => /status = 'quarantined'/i.test(sql)).length;
+    const quarantine = (txId: string) => store.deliveries.set(`sub_1:${txId}`, {
+      subscription_id: 'sub_1', tx_id: txId, status: 'quarantined', attempts: 0, last_error: 'overflow',
+      updated_at: '2026-07-21T00:00:00.000Z',
+    });
+    quarantine('tx_gone_1');
+    store.missingTx.add('tx_gone_1');
+
+    // A pass that skips rows keeps the scan running every tick.
+    expect(await flushParkedDeliveries(env, { limit: 10, now: t0 })).toMatchObject({ quarantineTerminalized: 1 });
+    expect(await flushParkedDeliveries(env, { limit: 10, now: at(1) })).toMatchObject({ quarantineTerminalized: 0 });
+    expect(quarantinedScans()).toBe(2);
+
+    // That empty pass backs it off: a row retracted now waits out the hour,
+    // and the ticks in between run no quarantined scan at all.
+    quarantine('tx_gone_2');
+    store.retractedTx.add('tx_gone_2');
+    expect(await flushParkedDeliveries(env, { limit: 10, now: at(2) })).toMatchObject({ quarantineTerminalized: 0 });
+    expect(await flushParkedDeliveries(env, { limit: 10, now: at(60) })).toMatchObject({ quarantineTerminalized: 0 });
+    expect(quarantinedScans()).toBe(2);
+    expect(store.deliveries.get('sub_1:tx_gone_2')!.status).toBe('quarantined');
+
+    // An explicit operator call is never backed off.
+    quarantine('tx_gone_3');
+    store.missingTx.add('tx_gone_3');
+    expect(await recoverQuarantinedDeliveries(env, { limit: 10, now: at(3) })).toMatchObject({ terminalized: 2 });
+
+    // The first scheduled pass after the hour scans again.
+    quarantine('tx_gone_4');
+    store.missingTx.add('tx_gone_4');
+    expect(await flushParkedDeliveries(env, { limit: 10, now: at(61) })).toMatchObject({ quarantineTerminalized: 1 });
+    expect(store.deliveries.get('sub_1:tx_gone_4')!.status).toBe('skipped');
   });
 
   it('re-parks and releases live quarantined rows when on', async () => {

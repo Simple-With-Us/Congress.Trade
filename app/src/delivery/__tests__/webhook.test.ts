@@ -456,7 +456,9 @@ describe('targeted retries of parked deliveries', () => {
     try {
       await dispatchWebhook(env, retry);
       expect(posts).toHaveLength(1);
-      expect(posts[0].transaction?.isBackfill).toBe(false);
+      // Only the filter judges as of fan-out.  The payload still says what the
+      // trade is now, so the receiver sees a 10-day-late retry as backfill.
+      expect(posts[0].transaction?.isBackfill).toBe(true);
       expect(row()).toMatchObject({ status: 'delivered' });
     } finally {
       vi.unstubAllGlobals();

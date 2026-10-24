@@ -32,11 +32,12 @@
  *     without bound.
  *   - Parked or quarantined rows whose transaction is gone (retention sweep)
  *     or retracted are skipped in place by the flush, so they can never pin
- *     the head of the oldest-first page.  LIVE quarantined rows re-park
- *     automatically only when DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER is on
- *     (default off: replaying a large backlog is an owner decision); explicit
- *     operator replay (POST /api/admin/delivery-requeue-quarantined) is not
- *     gated.
+ *     the head of the oldest-first page.  The scheduled quarantine pass for
+ *     them backs off for an hour after a pass that skips nothing.  LIVE
+ *     quarantined rows re-park automatically only when
+ *     DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER is on (default off: replaying a
+ *     large backlog is an owner decision); explicit operator replay
+ *     (POST /api/admin/delivery-requeue-quarantined) is not gated.
  *
  * All circuit knobs are read from the immutable Worker env (like the
  * usage-telemetry circuit limits): they gate the delivery hot path and must
@@ -147,6 +148,18 @@ const TX_STATE_SQL = `CASE WHEN t.id IS NULL THEN 'missing'
                 WHEN t.deprecated_at IS NOT NULL THEN 'retracted'
            END`;
 const TX_UNDELIVERABLE_SQL = '(t.id IS NULL OR t.deprecated_at IS NOT NULL)';
+const TX_LIVE_SQL = '(t.id IS NOT NULL AND t.deprecated_at IS NULL)';
+
+/**
+ * While no undeliverable quarantined rows are left, the scheduled scan for
+ * them still probes transactions for every quarantined row (one SQLite
+ * connection, every minute).  After a pass that skips nothing the flush waits
+ * this long before looking again.  New ones appear only through a retraction
+ * or a sweep, and a quarantined row blocks nothing while it waits.
+ */
+const UNDELIVERABLE_QUARANTINE_IDLE_BACKOFF_MS = 60 * 60_000;
+/** Next scheduled undeliverable-quarantine pass, per DB handle (stable across ticks). */
+const undeliverableQuarantineScanAfterMs = new WeakMap<Env['DB'], number>();
 
 function undeliverableReason(row: DeliveryScanRow): string | null {
   if (row.tx_state === 'missing') return UNDELIVERABLE_REASONS.txMissing;
@@ -459,9 +472,12 @@ async function parkedDepth(env: Env, subscriptionId: string): Promise<number> {
  * headroom, and the subscription still has parked-queue depth under the cap.
  * Oldest quarantined rows are recovered first so a long outage drains in order.
  * Rows whose transaction is gone or retracted are skipped in place instead
- * (they could never deliver).  With `recoverLive: false` (the scheduled flush
- * while DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER is off) only those rows are
- * scanned and touched; live rows stay quarantined.
+ * (they could never deliver).  They get their own scan, which needs no circuit
+ * or headroom check, so live rows that cannot recover yet never hold them
+ * behind the head of an oldest-first page.  Each scan reads at most `limit`
+ * rows.  With `recoverLive: false` (the scheduled flush while
+ * DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER is off) only that scan runs; live
+ * rows stay quarantined.
  */
 export async function recoverQuarantinedDeliveries(
   env: Env,
@@ -473,6 +489,8 @@ export async function recoverQuarantinedDeliveries(
     dryRun?: boolean;
     /** Re-park live rows (default true: an explicit operator replay). */
     recoverLive?: boolean;
+    /** Skip the undeliverable-row scan (the scheduled flush's idle backoff). */
+    skipUndeliverable?: boolean;
   } = {},
 ): Promise<QuarantineRecoveryResult> {
   const now = opts.now ?? new Date();
@@ -482,43 +500,52 @@ export async function recoverQuarantinedDeliveries(
   const subscriptionFilter = opts.subscriptionId?.trim()
     ? ` AND d.subscription_id = ?`
     : '';
-  // Live rows left quarantined would refill every oldest-first page and starve
-  // the undeliverable rows behind them, so without live recovery scan only those.
-  const undeliverableFilter = recoverLive ? '' : ` AND ${TX_UNDELIVERABLE_SQL}`;
   const params: (string | number)[] = opts.subscriptionId?.trim() ? [opts.subscriptionId.trim()] : [];
-  let rows: DeliveryScanRow[] = [];
-  try {
-    rows = await all(
+  const scanQuarantined = (txFilter: string): Promise<DeliveryScanRow[]> =>
+    all<DeliveryScanRow>(
       env.DB,
       `SELECT d.subscription_id, d.tx_id, s.target_url, ${TX_STATE_SQL} AS tx_state
          FROM deliveries d
          JOIN subscriptions s ON s.id = d.subscription_id
          LEFT JOIN transactions t ON t.id = d.tx_id
-        WHERE d.status = 'quarantined' AND s.active = 1 AND s.delivery = 'webhook'${subscriptionFilter}${undeliverableFilter}
+        WHERE d.status = 'quarantined' AND s.active = 1 AND s.delivery = 'webhook'${subscriptionFilter}
+          AND ${txFilter}
         ORDER BY d.updated_at ASC
         LIMIT ${limit}`,
       params,
     );
-  } catch {
-    return { scanned: 0, recovered: 0, skipped: 0, terminalized: 0 };
-  }
-  const result: QuarantineRecoveryResult = { scanned: rows.length, recovered: 0, skipped: 0, terminalized: 0 };
-  const depthCache = new Map<string, number>();
-  const day = dayStr(now);
-  for (const row of rows) {
-    const undeliverable = undeliverableReason(row);
-    if (undeliverable) {
-      if (opts.dryRun || (await markParkedDeliveryTerminal(env, row.subscription_id, row.tx_id, undeliverable, now))) {
+  const result: QuarantineRecoveryResult = { scanned: 0, recovered: 0, skipped: 0, terminalized: 0 };
+  if (!opts.skipUndeliverable) {
+    let undeliverableRows: DeliveryScanRow[] = [];
+    try {
+      undeliverableRows = await scanQuarantined(TX_UNDELIVERABLE_SQL);
+    } catch {
+      /* fail soft: the next pass retries */
+    }
+    result.scanned += undeliverableRows.length;
+    for (const row of undeliverableRows) {
+      const reason = undeliverableReason(row);
+      if (
+        reason &&
+        (opts.dryRun || (await markParkedDeliveryTerminal(env, row.subscription_id, row.tx_id, reason, now)))
+      ) {
         result.terminalized += 1;
       } else {
         result.skipped += 1;
       }
-      continue;
     }
-    if (!recoverLive) {
-      result.skipped += 1;
-      continue;
-    }
+  }
+  if (!recoverLive) return result;
+  let rows: DeliveryScanRow[] = [];
+  try {
+    rows = await scanQuarantined(TX_LIVE_SQL);
+  } catch {
+    return result;
+  }
+  result.scanned += rows.length;
+  const depthCache = new Map<string, number>();
+  const day = dayStr(now);
+  for (const row of rows) {
     const targetKey = targetKeyForUrl(row.target_url);
     if (!targetKey) {
       result.skipped += 1;
@@ -588,7 +615,8 @@ export async function recoverQuarantinedDeliveries(
  * circuit so the next flush releases the rest. Rows stay 'parked' until the
  * targeted dispatch claims them, so duplicate releases are absorbed by the
  * delivery claim CAS.  Rows whose transaction is gone or retracted are
- * skipped in place, whatever the circuit state, and never released.
+ * skipped in place, whatever the circuit state, and never released.  The
+ * quarantine pass for them backs off for an hour after it skips nothing.
  */
 export async function flushParkedDeliveries(
   env: Env,
@@ -596,11 +624,16 @@ export async function flushParkedDeliveries(
 ): Promise<ParkedFlushResult> {
   const now = opts.now ?? new Date();
   const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
+  const undeliverableDue = now.getTime() >= (undeliverableQuarantineScanAfterMs.get(env.DB) ?? 0);
   const quarantineRecovery = await recoverQuarantinedDeliveries(env, {
     limit,
     now,
     recoverLive: quarantineAutoRecoverEnabled(env),
+    skipUndeliverable: !undeliverableDue,
   });
+  if (undeliverableDue && quarantineRecovery.terminalized === 0 && env.DB) {
+    undeliverableQuarantineScanAfterMs.set(env.DB, now.getTime() + UNDELIVERABLE_QUARANTINE_IDLE_BACKOFF_MS);
+  }
   let rows: DeliveryScanRow[] = [];
   try {
     rows = await all(

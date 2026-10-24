@@ -255,13 +255,14 @@ export async function dispatchWebhook(
     }
     return { outboxComplete: !msg.subscriptionId };
   }
-  const mapped = mapTransaction(txRow);
+  const tx = stampDeliveryFreshness(mapTransaction(txRow));
   // Fan-out judges freshness as of now.  A targeted retry re-sends a row that
-  // already matched at fan-out and then waited behind the target circuit, so it
-  // judges freshness as of when fan-out first did: a delivery that was fresh
-  // when it parked still goes out, one that was already backfill still skips.
-  const freshnessAtMs = msg.subscriptionId ? deliveryFreshnessJudgedAtMs(mapped) ?? undefined : undefined;
-  const tx = stampDeliveryFreshness(mapped, freshnessAtMs);
+  // already matched at fan-out and then waited behind the target circuit, so
+  // its filter judges freshness as of when fan-out first did: a delivery that
+  // was fresh when it parked still goes out, one that was already backfill
+  // still skips.  The payload's isBackfill stays stamped as of now, so the
+  // receiver can tell a weeks-late retry from a new disclosure.
+  const freshnessAtMs = msg.subscriptionId ? deliveryFreshnessJudgedAtMs(tx) ?? undefined : undefined;
 
   // Resolve chamber + the filer's party in one query, keyed off the transaction.
   //

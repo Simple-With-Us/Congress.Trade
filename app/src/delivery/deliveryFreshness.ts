@@ -71,9 +71,6 @@ export function deliveryFreshnessJudgedAtMs(tx: FreshnessInput): number | null {
   return persisted != null && persisted > anchor ? persisted : anchor;
 }
 
-export function stampDeliveryFreshness<T extends Transaction>(
-  tx: T,
-  nowMs?: number,
-): T & { isBackfill: boolean } {
-  return { ...tx, isBackfill: isDeliveryBackfill(tx, nowMs) };
+export function stampDeliveryFreshness<T extends Transaction>(tx: T): T & { isBackfill: boolean } {
+  return { ...tx, isBackfill: isDeliveryBackfill(tx) };
 }

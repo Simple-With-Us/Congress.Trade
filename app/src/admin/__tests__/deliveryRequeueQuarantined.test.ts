@@ -134,7 +134,10 @@ describe('POST /delivery-requeue-quarantined', () => {
     const payload = (await res.json()) as { ok: boolean; recovery: { recovered: number }; flushed: { scanned: number } };
     expect(payload.ok).toBe(true);
     expect(payload.recovery.recovered).toBe(1);
-    expect(payload.flushed).toMatchObject({ scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 });
+    // Same keys as a real flush's ParkedFlushResult.
+    expect(payload.flushed).toEqual({
+      scanned: 0, released: 0, skipped: 0, terminalized: 0, quarantineRecovered: 0, quarantineTerminalized: 0,
+    });
     expect(deliveries.get('sub_1:tx_q')!.status).toBe('quarantined');
   });
 
