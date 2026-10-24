@@ -36,9 +36,8 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings } from './senateSource.ts';
+import { fetchSenatePtrFilings, isSenateAkamaiBlockError, SenateAkamaiBlockError } from './senateSource.ts';
 import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
-import { refreshSenateEfdHealth } from './senateEfdHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
@@ -605,7 +604,16 @@ export function isTransientSourceError(message: string): boolean {
 /** Record a source-level failure without presenting it as a successful poll. */
 async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executive', nowIso: string, err: unknown): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
-  if (isTransientSourceError(message)) {
+  if (isSenateAkamaiBlockError(err)) {
+    // CT-2416: an Akamai edge block stops Senate ingestion outright, so it is
+    // Sentry-visible (console.error) on the live refusal.  Ticks short-circuited
+    // by the KV backoff only warn, so one outage is not an error per tick.
+    if (err instanceof SenateAkamaiBlockError && err.cached) {
+      console.warn(`watcher: ${source} source blocked (backoff active):`, message);
+    } else {
+      console.error(`watcher: ${source} source blocked:`, message);
+    }
+  } else if (isTransientSourceError(message)) {
     console.warn(`watcher: ${source} source degraded (transient, bulk path still authoritative):`, message);
   } else {
     console.error(`watcher: ${source} source failed:`, message);
@@ -1331,14 +1339,10 @@ export async function runWatcher(
     console.warn('watcher: senate relay health probe failed:', (err as Error).message);
   }
   try {
+    // Also refreshes the proxied Senate eFD functional probe (CT-2416).
     await refreshResidentialProxyHealth(env, now);
   } catch (err) {
     console.warn('watcher: residential proxy health probe failed:', (err as Error).message);
-  }
-  try {
-    await refreshSenateEfdHealth(env, now);
-  } catch (err) {
-    console.warn('watcher: senate eFD health probe failed:', (err as Error).message);
   }
   return result;
 }

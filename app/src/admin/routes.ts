@@ -5925,7 +5925,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // --- POST /delivery-requeue-quarantined -----------------------------------
   // Recover webhook deliveries quarantined by the per-subscription parked-depth
   // cap (status='quarantined'). Moves rows back to 'parked' when headroom exists,
-  // then flushes a batch. Idempotent. Body (all optional):
+  // then flushes a batch. Rows whose transaction is gone or retracted are
+  // marked 'skipped' in place instead (only counted on dryRun). Idempotent.
+  // Body (all optional):
   //   { subscriptionId?: string, limit?: number (default 500, max 5000),
   //     ignoreCircuit?: boolean, dryRun?: boolean }
   r.post('/delivery-requeue-quarantined', async (c) => {
@@ -5949,7 +5951,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         dryRun: body.dryRun,
       });
       const flushed = body.dryRun
-        ? { scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 }
+        ? { scanned: 0, released: 0, skipped: 0, terminalized: 0, quarantineRecovered: 0, quarantineTerminalized: 0 }
         : await flushParkedDeliveries(c.env, { limit: Math.min(body.limit, 200) });
       return c.json({ ok: true, recovery, flushed });
     } catch (err) {

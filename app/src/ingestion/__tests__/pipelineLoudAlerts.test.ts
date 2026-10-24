@@ -116,6 +116,34 @@ describe('pipelineLoudAlerts', () => {
     expect(readPipelineStallHours({} as Env, 'senate_fetch_success')).toBe(6);
   });
 
+  it('readPipelineStallHours honors the passed env binding (Kody #2)', () => {
+    const env = {
+      CT_PIPELINE_STALL_HOURS_ST_PEER_PRICES: '12',
+      CT_PIPELINE_STALL_HOURS: '9',
+    } as unknown as Env;
+    expect(readPipelineStallHours(env, 'st_peer_prices')).toBe(12);
+    expect(readPipelineStallHours(env, 'senate_fetch_success')).toBe(9);
+    expect(readPipelineStallHours({ CT_PIPELINE_STALL_HOURS: '999' } as unknown as Env)).toBe(168);
+    expect(readPipelineStallHours({ CT_PIPELINE_STALL_HOURS: 'x' } as unknown as Env)).toBe(6);
+  });
+
+  it('does not raise a second health_st_peer_prices episode from the generic health loop (Sentry #1)', async () => {
+    const { checkPipelineHealth } = await import('../../shared/pipelineHealth.ts');
+    vi.mocked(checkPipelineHealth).mockResolvedValueOnce({
+      status: 'stalled',
+      checks: [
+        { id: 'st_peer_prices', status: 'stalled', detail: '15 ticker(s) still need EOD/current prices' },
+        { id: 'price_freshness', status: 'stalled', detail: 'behind' },
+      ],
+    } as never);
+    const { env } = kvEnv();
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-10-12T18:00:00.000Z'));
+    expect(result.evaluated).not.toContain('health_st_peer_prices');
+    expect(result.alerted).not.toContain('health_st_peer_prices');
+    // The generic loop still runs for other checks.
+    expect(result.evaluated).toContain('health_price_freshness');
+  });
+
   it('alerts terminal ingest failure once per doc via webhook + Sentry', async () => {
     const { env } = kvEnv();
     // The dedup window is 7 days, so the first alert has to sit inside it.

@@ -43,7 +43,61 @@ import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyF
 export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
 export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
 
+/** Error-message prefix for an Akamai Bot Manager refusal (CT-2416). */
+export const SENATE_AKAMAI_BLOCK_MESSAGE = 'senate eFD anti-bot block (Akamai)';
+/** CONFIG_KV key holding `{ until, step, at }` while discovery backs off an Akamai block. */
+export const SENATE_AKAMAI_BLOCK_KV_KEY = 'senate_efd:akamai_block_until';
+/** How long discovery stops dialing eFD after an Akamai refusal. */
+export const SENATE_AKAMAI_BLOCK_BACKOFF_MS = 30 * 60_000;
+
+/**
+ * True when a response body is Akamai's edge "Access Denied" page (as opposed
+ * to an app-level 403 or a dead relay).  Signature: the edgesuite error link,
+ * or the bare "Access Denied" title, or "Access Denied" plus an Akamai
+ * `Reference #…` id.
+ */
+export function looksLikeAkamaiAccessDenied(body: string): boolean {
+  if (!body) return false;
+  if (/errors\.edgesuite\.net/i.test(body)) return true;
+  if (/<title>\s*Access Denied\s*<\/title>/i.test(body)) return true;
+  return /Access Denied/i.test(body) && /Reference\s*#\s*[0-9a-f]+\./i.test(body);
+}
+
+/** eFD refused a request at the Akamai edge.  Not a relay outage and not retryable on the same egress. */
+export class SenateAkamaiBlockError extends Error {
+  readonly step: string;
+  readonly status: number;
+  /** True when raised from the KV backoff without dialing eFD. */
+  readonly cached: boolean;
+  constructor(step: string, status: number, cached = false) {
+    super(`${SENATE_AKAMAI_BLOCK_MESSAGE}: ${step} -> HTTP ${status}${cached ? ' (backing off, eFD not dialed)' : ''}`);
+    this.name = 'SenateAkamaiBlockError';
+    this.step = step;
+    this.status = status;
+    this.cached = cached;
+  }
+}
+
+export function isSenateAkamaiBlockError(err: unknown): boolean {
+  if (err instanceof SenateAkamaiBlockError) return true;
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return message.includes(SENATE_AKAMAI_BLOCK_MESSAGE);
+}
+
+/** Throw SenateAkamaiBlockError when `res` is a 403 carrying the Akamai Access Denied page. */
+export async function throwIfAkamaiBlocked(res: Response, step: string): Promise<void> {
+  if (res.status !== 403) return;
+  let body = '';
+  try {
+    body = await res.clone().text();
+  } catch {
+    /* unreadable body: treat as a generic 403 */
+  }
+  if (looksLikeAkamaiAccessDenied(body)) throw new SenateAkamaiBlockError(step, res.status);
+}
+
 function isRetryableSenateTransportError(err: unknown): boolean {
+  if (isSenateAkamaiBlockError(err)) return false;
   const message = err instanceof Error ? err.message : String(err ?? '');
   if (/HTTP 403/.test(message)) return true;
   if (/HTTP 502|HTTP 503|HTTP 504/.test(message)) return true;
@@ -87,6 +141,7 @@ export async function withSenateEfdEgress<T>(
   }
 
   let lastErr: unknown;
+  strategyLoop:
   for (let i = 0; i < strategies.length; i++) {
     const { egress, fetch: fetchImpl } = strategies[i];
     const directBackoff = explicitProxy
@@ -100,6 +155,12 @@ export async function withSenateEfdEgress<T>(
         return await run(fetchImpl, egress);
       } catch (err) {
         lastErr = err;
+        // An Akamai edge block will not clear on a 1–2s retry over the same
+        // egress; skip straight to the next egress (if any) or give up.
+        if (isSenateAkamaiBlockError(err)) {
+          if (i + 1 < strategies.length) continue strategyLoop;
+          throw err;
+        }
         const retryable = isRetryableSenateTransportError(err);
         const moreDirect = egress === 'direct' && attempt + 1 < attempts;
         if (retryable && (moreDirect || i + 1 < strategies.length)) continue;
@@ -391,7 +452,10 @@ export async function establishSenateSession(
     },
     signal: opts.signal,
   }, { service: 'filing-discovery', operation: 'open-senate-search-session' }, fetchImpl);
-  if (!landing.ok) throw new Error(`senate GET /search/ -> HTTP ${landing.status}`);
+  if (!landing.ok) {
+    await throwIfAkamaiBlocked(landing, 'GET /search/');
+    throw new Error(`senate GET /search/ -> HTTP ${landing.status}`);
+  }
   jar.absorb(landing);
   const landingHtml = await landing.text();
   const middlewareToken = parseCsrfMiddlewareToken(landingHtml);
@@ -420,7 +484,9 @@ export async function establishSenateSession(
     redirect: 'manual',
     signal: opts.signal,
   }, { service: 'filing-discovery', operation: 'accept-senate-search-terms' }, fetchImpl);
-  // 200 or 302 are both fine; we only care that cookies are refreshed.
+  // 200 or 302 are both fine; we only care that cookies are refreshed.  An
+  // Akamai 403 here means the agreement never registered (CT-2416).
+  await throwIfAkamaiBlocked(agree, 'POST /search/home/');
   jar.absorb(agree);
   await delay(politeDelayMs, opts.signal);
 
@@ -485,6 +551,46 @@ export async function fetchSenatePtrFilings(
     );
   }
 
+  // CT-2416: after an Akamai edge refusal, stop dialing eFD for a while
+  // instead of re-running the handshake every watcher tick.
+  if (opts.kv) {
+    let block: { until?: unknown; step?: unknown } | null = null;
+    try {
+      block = await opts.kv.get(SENATE_AKAMAI_BLOCK_KV_KEY, 'json');
+    } catch {
+      block = null;
+    }
+    const until = typeof block?.until === 'string' ? Date.parse(block.until) : NaN;
+    if (Number.isFinite(until) && until > now.getTime()) {
+      throw new SenateAkamaiBlockError(typeof block?.step === 'string' ? block.step : 'eFD', 403, true);
+    }
+  }
+
+  try {
+    return await fetchSenatePtrFilingsViaEgress(opts, fetchImpl, { now, since, pageSize, maxPages, politeDelayMs });
+  } catch (err) {
+    if (opts.kv && err instanceof SenateAkamaiBlockError && !err.cached) {
+      const until = new Date(now.getTime() + SENATE_AKAMAI_BLOCK_BACKOFF_MS).toISOString();
+      try {
+        await opts.kv.put(
+          SENATE_AKAMAI_BLOCK_KV_KEY,
+          JSON.stringify({ until, step: err.step, at: now.toISOString() }),
+          { expirationTtl: Math.ceil(SENATE_AKAMAI_BLOCK_BACKOFF_MS / 1000) + 60 },
+        );
+      } catch (kvErr) {
+        console.warn('watcher: Failed to write senate Akamai backoff to KV:', kvErr);
+      }
+    }
+    throw err;
+  }
+}
+
+async function fetchSenatePtrFilingsViaEgress(
+  opts: FetchSenatePtrFilingsOptions,
+  fetchImpl: typeof fetch,
+  w: { now: Date; since: Date; pageSize: number; maxPages: number; politeDelayMs: number },
+): Promise<SenateFiling[]> {
+  const { now, since, pageSize, maxPages, politeDelayMs } = w;
   return await withSenateEfdEgress(opts, fetchImpl, async (effectiveFetch, _egress) => {
   let session: SenateSession | null = null;
 
@@ -548,6 +654,8 @@ export async function fetchSenatePtrFilings(
 
       const contentType = data.headers.get('content-type') || '';
       if (!data.ok || !contentType.includes('application/json')) {
+        // Akamai refusal: re-running the handshake cannot help (CT-2416).
+        if (!data.ok) await throwIfAkamaiBlocked(data, 'POST report/data/');
         if (useCached && !handshakeDone) {
           console.warn(`watcher: senate cached session invalid (HTTP ${data.status} ${contentType}), retrying handshake`);
           if (opts.kv) {
