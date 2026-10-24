@@ -64,8 +64,9 @@ Update 2026-10-23 (CT-2442):  the hold env also sets
 `CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1`.  main.ts awaits the boot schema
 replay before `Deno.serve`, so a hold that replayed it logged "/health not
 ready after 45s" on every deploy and was not serving when Coolify stopped
-the old app.  `ct-deploy-overlap.sh --render-env` prints the hold env
-offline, with every value except the two hold flags redacted.
+the old app.  Offline, `ct-deploy-overlap.sh --render-env` prints only the
+two hold flags and a count of the other env lines, and `--render-env-file
+DEST` writes the full hold env to a 0600 file for tests.
 
 If hold is not running, standby (if installed) is still the fallback.
 

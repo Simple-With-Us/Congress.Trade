@@ -23,7 +23,7 @@ assert_eq() {
 
 assert_contains() {
   local hay="$1" needle="$2" name="$3"
-  if ! printf '%s' "$hay" | grep -qF "$needle"; then
+  if ! printf '%s' "$hay" | grep -qF -- "$needle"; then
     echo "FAIL ${name}: missing '${needle}'"
     fail=1
   else
@@ -33,7 +33,7 @@ assert_contains() {
 
 assert_not_contains() {
   local hay="$1" needle="$2" name="$3"
-  if printf '%s' "$hay" | grep -qF "$needle"; then
+  if printf '%s' "$hay" | grep -qF -- "$needle"; then
     echo "FAIL ${name}: unexpectedly contains '${needle}'"
     fail=1
   else
@@ -87,7 +87,17 @@ else
 fi
 
 # --- hold env --------------------------------------------------------------
-render_env() {
+env_tmp="$(mktemp -d)"
+trap 'rm -rf "$env_tmp"' EXIT
+
+# The full render write_hold_env hands docker, via the private-file mode.
+render_env_full() {
+  printf '%s' "$1" | bash "$OVERLAP" --render-env-file "$env_tmp/hold.env"
+  cat "$env_tmp/hold.env"
+}
+
+# The stdout inspection mode, which must never show an app value.
+render_env_shown() {
   printf '%s' "$1" | bash "$OVERLAP" --render-env
 }
 
@@ -96,8 +106,11 @@ count_prefix() {
   printf '%s\n' "$1" | grep -c "^$2" || true
 }
 
-app_env=$'PATH=/usr/local/bin:/usr/bin\nCT_SKIP_LITESTREAM=0\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=0\nTURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite\nCOOLIFY_TOKEN=not-a-real-token\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=false\nCT_SKIP_LITESTREAM_NOTE=keep\n'
-hold_env="$(render_env "$app_env")"
+# PEM_KEY is a multi-line value: docker inspect prints it as several lines,
+# and one of them is base64 that looks like KEY=.
+app_env=$'PATH=/usr/local/bin:/usr/bin\nCT_SKIP_LITESTREAM=0\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=0\nTURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite\nCOOLIFY_TOKEN=not-a-real-token\nPEM_KEY=-----BEGIN PRIVATE KEY-----\nAbCdEfGhIjKlMnOp0123=\n-----END PRIVATE KEY-----\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=false\nCT_SKIP_LITESTREAM_NOTE=keep\n'
+hold_env="$(render_env_full "$app_env")"
+assert_eq "$(stat -c '%a' "$env_tmp/hold.env")" "600" "render-env-file writes a private file"
 assert_eq "$(count_prefix "$hold_env" 'CT_SKIP_LITESTREAM=')" "1" "hold env has CT_SKIP_LITESTREAM once"
 assert_eq "$(count_prefix "$hold_env" 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=')" "1" "hold env has CT_DISABLE_STARTUP_SCHEMA_MIGRATE once"
 assert_contains "$hold_env" "CT_SKIP_LITESTREAM=1" "hold env skips Litestream"
@@ -105,27 +118,26 @@ assert_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1" "hold env skip
 assert_not_contains "$hold_env" "CT_SKIP_LITESTREAM=0" "hold env drops the app's Litestream value"
 assert_not_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=0" "hold env drops the app's migrate value"
 assert_not_contains "$hold_env" "CT_DISABLE_STARTUP_SCHEMA_MIGRATE=false" "hold env drops the app's later migrate value"
-assert_contains "$hold_env" "TURSO_DATABASE_URL=<redacted>" "hold env keeps the app env (by name)"
-assert_contains "$hold_env" "CT_SKIP_LITESTREAM_NOTE=<redacted>" "hold env keeps keys that only share a prefix"
-assert_eq "$hold_env" $'PATH=<redacted>\nTURSO_DATABASE_URL=<redacted>\nCOOLIFY_TOKEN=<redacted>\nCT_SKIP_LITESTREAM_NOTE=<redacted>\nCT_SKIP_LITESTREAM=1\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=1' "hold env keeps every other key in order"
-
-# --render-env runs on the live app's env, credentials included: it must
-# never print a value other than the two hold flags.
-while IFS= read -r line; do
-  [[ "$line" == *=* ]] || continue
-  case "$line" in CT_SKIP_LITESTREAM=* | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=*) continue ;; esac
-  assert_not_contains "$hold_env" "=${line#*=}" "render-env hides the value of ${line%%=*}"
-done <<< "$app_env"
-
-bare_env="$(render_env '')"
-assert_eq "$(count_prefix "$bare_env" 'CT_SKIP_LITESTREAM=')" "1" "empty env still gets CT_SKIP_LITESTREAM once"
-assert_eq "$(count_prefix "$bare_env" 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=')" "1" "empty env still gets CT_DISABLE_STARTUP_SCHEMA_MIGRATE once"
+assert_contains "$hold_env" "TURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite" "hold env keeps the app env"
+assert_contains "$hold_env" "CT_SKIP_LITESTREAM_NOTE=keep" "hold env keeps keys that only share a prefix"
+assert_eq "$hold_env" $'PATH=/usr/local/bin:/usr/bin\nTURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite\nCOOLIFY_TOKEN=not-a-real-token\nPEM_KEY=-----BEGIN PRIVATE KEY-----\nAbCdEfGhIjKlMnOp0123=\n-----END PRIVATE KEY-----\nCT_SKIP_LITESTREAM_NOTE=keep\nCT_SKIP_LITESTREAM=1\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=1' "hold env keeps every other line in order"
 
 # last-env is a rendered env; rendering it again must not add a second copy.
-# The render only reads keys, which the redaction keeps, so rendering the
-# redacted output proves the same thing as rendering the full file.
-again_env="$(render_env "$hold_env")"
+again_env="$(render_env_full "$hold_env")"
 assert_eq "$again_env" "$hold_env" "re-rendering a hold env is a no-op"
+
+# --render-env runs on the live app's env, credentials included: it prints
+# the two hold flags and a count, and no part of any other line.
+shown_env="$(render_env_shown "$app_env")"
+assert_eq "$shown_env" $'CT_SKIP_LITESTREAM=1\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n# 7 other env line(s) not shown' "render-env shows only the hold flags"
+while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
+  case "$line" in CT_SKIP_LITESTREAM=* | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=*) continue ;; esac
+  assert_not_contains "$shown_env" "$line" "render-env hides the line ${line:0:12}..."
+done <<< "$app_env"
+
+bare_env="$(render_env_shown '')"
+assert_eq "$bare_env" $'CT_SKIP_LITESTREAM=1\nCT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n# 0 other env line(s) not shown' "empty env still gets both hold flags once"
 
 # --- Traefik render --------------------------------------------------------
 plain="$(bash "$REATTACH" --render plain)"

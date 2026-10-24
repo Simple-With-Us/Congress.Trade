@@ -43,8 +43,9 @@
 #   /usr/local/bin/ct-reattach-proxy.sh
 #
 # This script never talks to production from a developer laptop.  It is a
-# host unit.  `--decide` / `--parse-active` / `--render-env` are offline and
-# used by tests.  `--render-env` prints every value but the hold flags redacted.
+# host unit.  `--decide` / `--parse-active` / `--render-env` /
+# `--render-env-file` are offline and used by tests.  `--render-env` prints
+# only the hold flags; `--render-env-file` writes the full env to a 0600 file.
 
 set -euo pipefail
 
@@ -158,19 +159,20 @@ render_hold_env() {
   printf 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n'
 }
 
-# stdin: a rendered hold env.  stdout: the two hold flags in full and every
-# other line as KEY=<redacted>.  The env is the live app's, credentials
-# included, so --render-env never prints a value; write_hold_env does not
-# use this and hands docker the full values.
-redact_hold_env() {
-  local line
+# stdin: a rendered hold env.  stdout: the two hold flags and a count of the
+# other lines.  The env is the live app's, credentials included, and docker
+# inspect prints a multi-line value (a PEM key) as several lines, so no part
+# of any other line can be shown safely, not even a KEY= prefix.
+summarize_hold_env() {
+  local line hidden=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
-      CT_SKIP_LITESTREAM=* | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=* | '') printf '%s\n' "$line" ;;
-      *=*) printf '%s=<redacted>\n' "${line%%=*}" ;;
-      *) printf '<redacted>\n' ;;
+      CT_SKIP_LITESTREAM=1 | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1) printf '%s\n' "$line" ;;
+      '') ;;
+      *) hidden=$((hidden + 1)) ;;
     esac
   done
+  printf '# %d other env line(s) not shown\n' "$hidden"
 }
 
 if [[ "${1:-}" == "--decide" ]]; then
@@ -191,12 +193,19 @@ if [[ "${1:-}" == "--parse-active" ]]; then
 fi
 
 if [[ "${1:-}" == "--render-env" ]]; then
-  render_hold_env | redact_hold_env
+  render_hold_env | summarize_hold_env
+  exit 0
+fi
+
+# Same render write_hold_env hands docker, into a private file (never stdout).
+if [[ "${1:-}" == "--render-env-file" ]]; then
+  [[ -n "${2:-}" ]] || { echo "usage: $0 --render-env-file DEST" >&2; exit 2; }
+  ( umask 077; render_hold_env > "$2" )
   exit 0
 fi
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,47p' "$0"
+  sed -n '2,48p' "$0"
   exit 0
 fi
 
@@ -390,5 +399,5 @@ if [[ "${1:-}" == "--loop" ]]; then
   done
 fi
 
-echo "usage: $0 [--once|--loop|--decide|--parse-active|--render-env|--help]" >&2
+echo "usage: $0 [--once|--loop|--decide|--parse-active|--render-env|--render-env-file DEST|--help]" >&2
 exit 2
