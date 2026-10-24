@@ -8,7 +8,7 @@ vi.mock('../../shared/thirdPartyTelemetry.ts', () => ({
     fetchImpl: typeof fetch = fetch,
   ) => fetchImpl(input, init),
 }));
-import { establishSenateSession, SENATE_SEARCH } from '../senateSource.ts';
+import { establishSenateSession, SENATE_AKAMAI_BLOCK_BACKOFF_MS, SENATE_SEARCH } from '../senateSource.ts';
 import {
   probeSenateEfdThroughProxy,
   refreshSenateEfdProxyProbe,
@@ -162,6 +162,32 @@ describe('refreshSenateEfdProxyProbe', () => {
       env, at(SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS / 60_000), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl,
     );
     expect(calls).toHaveLength(4);
+  });
+
+  it('the blocked probe interval matches ingestion\'s Akamai backoff', () => {
+    // Two literals that must agree: the probe must not POST to a refusing eFD
+    // more often than ingestion itself retries.
+    expect(SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS).toBe(SENATE_AKAMAI_BLOCK_BACKOFF_MS);
+  });
+
+  it('a transport error still counts against the 15-minute throttle', async () => {
+    const { env } = memEnv();
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(`${init?.method ?? 'GET'} ${String(input)}`);
+      throw new Error('connection reset by peer');
+    }) as typeof fetch;
+    const at = (min: number) => new Date(now.getTime() + min * 60_000);
+    await refreshSenateEfdProxyProbe(env, at(0), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    expect(calls).toHaveLength(1);
+    expect(await readSenateEfdProbe(env)).toMatchObject({
+      state: 'degraded', status: null, dialed: true, lastDialedAt: at(0).toISOString(),
+    });
+    await refreshSenateEfdProxyProbe(env, at(1), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(14), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    expect(calls).toHaveLength(1);
+    await refreshSenateEfdProxyProbe(env, at(15), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    expect(calls).toHaveLength(2);
   });
 
   it('a relay-down tick never downgrades a stored Akamai block', async () => {

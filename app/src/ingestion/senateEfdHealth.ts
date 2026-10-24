@@ -32,9 +32,13 @@ export interface SenateEfdProbeRecord {
   state?: SenateEfdProbeState;
   /** Which step decided the state, e.g. `POST /search/home/`. */
   step?: string | null;
-  /** True when eFD was actually dialed by the probe that wrote this record. */
+  /**
+   * True when the probe that wrote this record attempted an eFD dial, including
+   * one that then failed in transport or timed out (it still counts against the
+   * throttle).  False on relay-down / unconfigured records, which never dial.
+   */
   dialed?: boolean;
-  /** When eFD was last dialed (carried across relay-down records; drives the 15-minute throttle). */
+  /** When an eFD dial was last attempted (carried across relay-down records; drives the 15-minute throttle). */
   lastDialedAt?: string | null;
 }
 

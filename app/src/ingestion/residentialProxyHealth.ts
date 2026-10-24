@@ -344,17 +344,7 @@ function classifyEfdFailure(
   return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status}` };
 }
 
-/**
- * Refresh the cached eFD probe.  Relay down/unconfigured is recorded every
- * call without dialing eFD; otherwise eFD is dialed at most once per
- * SENATE_EFD_PROXY_PROBE_INTERVAL_MS (SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS
- * after an Akamai block), measured from the last real dial (`lastDialedAt`),
- * so relay flaps cannot shorten the interval.
- *
- * A stored `blocked` record is never overwritten by a relay-down record: the
- * relay outage is the residential_proxy check's to report, and replacing the
- * Akamai verdict with `degraded` would silently downgrade a critical alert.
- */
+/** Configured proxy credential values, so a transport error can be scrubbed of them. */
 function proxyCredentialSecrets(env: Env): string[] {
   const penv = typeof process !== 'undefined' ? process.env : undefined;
   return [
@@ -363,6 +353,21 @@ function proxyCredentialSecrets(env: Env): string[] {
   ].map((v) => v?.trim()).filter((v): v is string => Boolean(v));
 }
 
+/**
+ * Refresh the cached eFD probe.  Relay down/unconfigured is recorded every
+ * call without dialing eFD; otherwise eFD is dialed at most once per
+ * SENATE_EFD_PROXY_PROBE_INTERVAL_MS (SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS
+ * after an Akamai block), measured from the last attempted dial
+ * (`lastDialedAt`), so relay flaps cannot shorten the interval.
+ *
+ * An attempt that fails in transport or times out still counts: Akamai can
+ * tarpit or reset a request it has already scored, so re-dialing on the next
+ * tick would bring back the retry churn CT-2416 removes.
+ *
+ * A stored `blocked` record is never overwritten by a relay-down record: the
+ * relay outage is the residential_proxy check's to report, and replacing the
+ * Akamai verdict with `degraded` would silently downgrade a critical alert.
+ */
 export async function refreshSenateEfdProxyProbe(
   env: Env,
   now: Date,
