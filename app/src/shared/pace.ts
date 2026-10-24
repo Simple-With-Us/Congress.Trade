@@ -73,26 +73,43 @@ export function clampStPeerMaxPerMinute(maxPerMinute?: number): number {
  * calls against one shared minute-rate gate.  The disclosure-latency probe has
  * its own FMP pacer and does not use this one.
  *
- * Lazily created on first use and memoized at module scope for the lifetime of
- * the isolate. To support Infisical-live updates, the pacer is rebuilt if a new
- * caller requests a different (clamped) ceiling than the one currently cached.
+ * One module-scope clock for the lifetime of the isolate.  Each (clamped) cap
+ * gets its own gap width on that clock, so an Infisical-live change to the
+ * setting takes effect on the next call without resetting the clock.
  *
  * NOTE: this coordinates only calls made within the SAME isolate. Multiple
  * concurrent isolates do not share this closure, so this is NOT a global
  * cross-instance rate limit.
  */
-let sharedStPeerPacer: { pacer: () => Promise<void>; cap: number } | null = null;
+// One clock for every ST consumer.  A caller asking for a slower pace (the
+// catch-up's 60/min) gets a wider gap on the SAME clock, so the combined rate
+// never exceeds the fastest requested cap, which is itself clamped.  The old
+// "rebuild when the cap changes" design gave each cap its own clock (Kody on
+// #2859), so two consumers could jointly exceed ST's limit.
+let stPeerNext = 0;
+const stPeerPacers = new Map<number, () => Promise<void>>();
 export function getSharedStPeerPacer(maxPerMinute?: number): () => Promise<void> {
   const cap = clampStPeerMaxPerMinute(maxPerMinute);
-  if (!sharedStPeerPacer || sharedStPeerPacer.cap !== cap) {
-    sharedStPeerPacer = { pacer: createPacer(cap), cap };
+  let pacer = stPeerPacers.get(cap);
+  if (!pacer) {
+    const minGapMs = Math.ceil(60000 / cap);
+    // Same synchronous slot reservation as createPacer, against the shared clock.
+    pacer = async () => {
+      const now = Date.now();
+      const scheduled = Math.max(now, stPeerNext);
+      stPeerNext = scheduled + minGapMs;
+      const wait = scheduled - now;
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    };
+    stPeerPacers.set(cap, pacer);
   }
-  return sharedStPeerPacer.pacer;
+  return pacer;
 }
 
-/** Test-only: drop the memoized singleton so each test starts from a clean gate. */
+/** Test-only: drop the shared clock so each test starts from a clean gate. */
 export function __resetSharedStPeerPacerForTests(): void {
-  sharedStPeerPacer = null;
+  stPeerNext = 0;
+  stPeerPacers.clear();
 }
 
 /**

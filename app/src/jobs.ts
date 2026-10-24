@@ -506,10 +506,14 @@ export async function maybeRunPeerPriceCatchUp(
     `market-data lane stamped but peer prices are still behind (${before.pending} pending, ` +
       `run ${claimed.runs} for ${freshThrough}); retrying price refresh`,
   );
-  try {
-    await backfillCurrentPricesFromEod(env);
-  } catch (err) {
-    console.warn('current-price backfill failed:', (err as Error).message);
+  // The EOD -> current-price repair scans securities_ref and only fills NULLs,
+  // so run it on the first catch-up of a session, not on every run (Kody #2859).
+  if (claimed.runs === 1) {
+    try {
+      await backfillCurrentPricesFromEod(env);
+    } catch (err) {
+      console.warn('current-price backfill failed:', (err as Error).message);
+    }
   }
 
   let status: DailyLaneStatus = 'ran';
@@ -533,12 +537,15 @@ export async function maybeRunPeerPriceCatchUp(
     status = 'error';
   }
 
-  const after = await readPeerPricePending(env, new Date());
+  // Same clock as the before-count, so both count the same pending set even
+  // when the run crosses the midnight-ET rollover.
+  const after = await readPeerPricePending(env, now);
   const next = peerPriceCatchUpAfterRun(claimed, {
     pendingBefore: before.pending,
     pendingAfter: after?.pending ?? null,
     lastCursorSeq,
     reachedEndOfPending,
+    failed: status === 'error',
   });
   console.log(
     'price catch-up:',

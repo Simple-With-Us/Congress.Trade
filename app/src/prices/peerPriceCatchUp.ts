@@ -4,6 +4,7 @@
  * open #2748) stay the only editors of that file.
  */
 
+import { z } from 'zod';
 import type { Env } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
 import { lastTradingDay } from './service.ts';
@@ -29,8 +30,10 @@ import {
  *   minute for ALL peer reads, so 60 leaves half of it for everything else.
  *   300 tickers at 60/min is about 5 minutes, inside the 10-minute lane deadline.
  * - Stop:  park for the rest of the session after
- *   PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS consecutive runs that did not
- *   shrink the pending count (tickers ST keeps erroring on, or no provider).
+ *   PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS consecutive completed runs that did
+ *   not shrink the pending count (tickers ST keeps erroring on, or no
+ *   provider).  Failed runs do not count toward the park, but they do spend
+ *   the session's run budget, so 429s cannot retry more than 8 times.
  */
 export const PEER_PRICE_CATCHUP_MIN_SPACING_MS = 55 * 60_000;
 export const PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION = 8;
@@ -55,26 +58,41 @@ export function freshPeerPriceCatchUpState(freshThrough: string): PeerPriceCatch
   return { freshThrough, runs: 0, lastRunAt: null, noProgressRuns: 0, cursorSeq: null };
 }
 
+const nonNegativeInt = z.number().int().nonnegative();
+
+/** The persisted KV shape.  KV is outside the trust boundary, so parse, never cast. */
+export const PeerPriceCatchUpStateSchema = z.object({
+  freshThrough: z.string(),
+  runs: nonNegativeInt,
+  lastRunAt: z.string().nullable(),
+  noProgressRuns: nonNegativeInt,
+  cursorSeq: z.number().finite().nullable(),
+});
+
 /** Parse a stored state;  anything malformed or from another session restarts. */
 export function parsePeerPriceCatchUpState(
   raw: string | null,
   freshThrough: string,
 ): PeerPriceCatchUpState {
   if (!raw) return freshPeerPriceCatchUpState(freshThrough);
+  let json: unknown;
   try {
-    const v = JSON.parse(raw) as Partial<PeerPriceCatchUpState>;
-    if (!v || v.freshThrough !== freshThrough) return freshPeerPriceCatchUpState(freshThrough);
-    const int = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0);
-    return {
-      freshThrough,
-      runs: int(v.runs),
-      lastRunAt: typeof v.lastRunAt === 'string' ? v.lastRunAt : null,
-      noProgressRuns: int(v.noProgressRuns),
-      cursorSeq: typeof v.cursorSeq === 'number' && Number.isFinite(v.cursorSeq) ? v.cursorSeq : null,
-    };
+    json = JSON.parse(raw);
   } catch {
     return freshPeerPriceCatchUpState(freshThrough);
   }
+  const parsed = PeerPriceCatchUpStateSchema.safeParse(json);
+  if (!parsed.success || parsed.data.freshThrough !== freshThrough) {
+    return freshPeerPriceCatchUpState(freshThrough);
+  }
+  const v = parsed.data;
+  return {
+    freshThrough: v.freshThrough,
+    runs: v.runs,
+    lastRunAt: v.lastRunAt ?? null,
+    noProgressRuns: v.noProgressRuns,
+    cursorSeq: v.cursorSeq ?? null,
+  };
 }
 
 export type PeerPriceCatchUpGate = 'ok' | 'session-cap' | 'no-progress' | 'spacing';
@@ -98,13 +116,19 @@ export function peerPriceCatchUpAfterRun(
     pendingAfter: number | null;
     lastCursorSeq: number | null;
     reachedEndOfPending: boolean;
+    /** The run aborted (fatal ST error, deadline) or threw. */
+    failed?: boolean;
   },
 ): PeerPriceCatchUpState {
   // An unreadable after-count is not proof of progress.
   const progressed = run.pendingAfter !== null && run.pendingAfter < run.pendingBefore;
+  // A failed run that moved nothing says nothing about whether ST can price the
+  // rest, so it does not count toward the park (Kody #2859).  It still spent one
+  // of the session's runs and waits out the spacing, so failures stay bounded.
+  const noProgressRuns = progressed ? 0 : run.failed ? state.noProgressRuns : state.noProgressRuns + 1;
   return {
     ...state,
-    noProgressRuns: progressed ? 0 : state.noProgressRuns + 1,
+    noProgressRuns,
     // Wrap to the head once the walk reached the end of the pending set.
     cursorSeq: run.reachedEndOfPending ? null : (run.lastCursorSeq ?? state.cursorSeq),
   };

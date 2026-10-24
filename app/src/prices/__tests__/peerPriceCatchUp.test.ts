@@ -25,15 +25,18 @@ describe('parsePeerPriceCatchUpState', () => {
     expect(parsePeerPriceCatchUpState(old, SESSION)).toEqual(freshPeerPriceCatchUpState(SESSION));
   });
 
-  it('keeps a same-session state and sanitizes bad fields', () => {
-    const raw = JSON.stringify({ freshThrough: SESSION, runs: 3, lastRunAt: 'x', noProgressRuns: -1, cursorSeq: 'y' });
-    expect(parsePeerPriceCatchUpState(raw, SESSION)).toEqual({
-      freshThrough: SESSION,
-      runs: 3,
-      lastRunAt: 'x',
-      noProgressRuns: 0,
-      cursorSeq: null,
-    });
+  it('keeps a valid same-session state, and restarts on any malformed field', () => {
+    const good = { freshThrough: SESSION, runs: 3, lastRunAt: NOW.toISOString(), noProgressRuns: 1, cursorSeq: 42 };
+    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION)).toEqual(good);
+    for (const bad of [
+      { ...good, runs: -1 },
+      { ...good, runs: 1.5 },
+      { ...good, cursorSeq: 'y' },
+      { ...good, lastRunAt: 7 },
+      { freshThrough: SESSION },
+    ]) {
+      expect(parsePeerPriceCatchUpState(JSON.stringify(bad), SESSION)).toEqual(freshPeerPriceCatchUpState(SESSION));
+    }
   });
 });
 
@@ -83,6 +86,18 @@ describe('peerPriceCatchUpAfterRun', () => {
     expect(flat.noProgressRuns).toBe(2);
     const unknown = peerPriceCatchUpAfterRun(claimed, { pendingBefore: 20, pendingAfter: null, lastCursorSeq: 7, reachedEndOfPending: false });
     expect(unknown.noProgressRuns).toBe(2);
+  });
+
+  it('does not count a failed run with no progress toward the park', () => {
+    const failed = peerPriceCatchUpAfterRun(claimed, {
+      pendingBefore: 20, pendingAfter: 20, lastCursorSeq: null, reachedEndOfPending: false, failed: true,
+    });
+    expect(failed.noProgressRuns).toBe(1);
+    // A failed run that still shrank pending resets it like any other.
+    const partial = peerPriceCatchUpAfterRun(claimed, {
+      pendingBefore: 20, pendingAfter: 12, lastCursorSeq: 5, reachedEndOfPending: false, failed: true,
+    });
+    expect(partial.noProgressRuns).toBe(0);
   });
 
   it('wraps to the head after reaching the end, and keeps the cursor when nothing was reached', () => {

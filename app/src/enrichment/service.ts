@@ -555,7 +555,7 @@ export async function runEnrichment(
       try {
         // Every provider paces before its call, each against its own budget:
         // EDGAR uses its dedicated gate (free, but still fair-access limited);
-        // everything else shares the FMP per-minute gate.
+        // Socratic.Trade (the only other chain entry) uses the shared ST peer gate.
         await (entry.name === 'edgar' ? edgarPace() : pace());
         const ref = await entry.provider.fetchRef(ticker);
         if (ref) collected.push(ref);

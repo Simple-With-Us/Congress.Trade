@@ -73,10 +73,23 @@ describe('getSharedStPeerPacer', () => {
     }
   });
 
-  it('rebuilds the pacer if the maxPerMinute ceiling changes (Infisical-live semantics)', () => {
-    const first = getSharedStPeerPacer(30);
-    const second = getSharedStPeerPacer(60);
-    expect(second).not.toBe(first);
+  it('keeps ONE clock across caps, so a slower consumer cannot open a second gate (Kody #2859)', async () => {
+    vi.useFakeTimers();
+    try {
+      const catchUp = getSharedStPeerPacer(60); // 1000ms gap
+      const enrichment = getSharedStPeerPacer(100); // 600ms gap, same clock
+      expect(catchUp).not.toBe(enrichment);
+      let done = false;
+      await catchUp(); // immediate, reserves the next slot 1000ms out
+      const p = enrichment().then(() => { done = true; });
+      await vi.advanceTimersByTimeAsync(900);
+      expect(done).toBe(false); // waits on the catch-up's reservation
+      await vi.advanceTimersByTimeAsync(150);
+      await p;
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clamps to the ST peerRead-safe ceiling, and paces at it when unset (CT-2445)', () => {

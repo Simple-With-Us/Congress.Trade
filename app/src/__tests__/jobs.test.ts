@@ -582,6 +582,8 @@ describe('staggered daily lanes', () => {
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
     expect(mocks.runPriceRefresh.mock.calls[1][1]).toMatchObject({ afterCursorSeq: 500 });
     expect(catchUpState(kv)).toMatchObject({ runs: 2, noProgressRuns: 0, cursorSeq: 500 });
+    // The NULL-only EOD -> current-price repair runs on the first catch-up only.
+    expect(mocks.backfillCurrentPricesFromEod).toHaveBeenCalledTimes(1);
   });
 
   it('parks for the session after two catch-ups with no progress', async () => {
@@ -595,6 +597,18 @@ describe('staggered daily lanes', () => {
     expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T15:07:00Z'))).toBe('stamped');
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
     expect(catchUpState(kv)).toMatchObject({ runs: 2, noProgressRuns: 2 });
+  });
+
+  it('does not park on aborted runs (a 429 says nothing about coverage), but they spend the run budget', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    mocks.runPriceRefresh.mockResolvedValue({ aborted: true, errors: [], sharePrices: [], shareSpx: [] });
+
+    for (const h of ['08', '09', '10']) {
+      expect(await maybeRunDailyMarketDataJobs(env, new Date(`2026-10-15T${h}:07:00Z`))).toBe('error');
+    }
+    expect(catchUpState(kv)).toMatchObject({ runs: 3, noProgressRuns: 0 });
   });
 
   it('stops at the per-session run cap, and a new freshThrough session starts over', async () => {
