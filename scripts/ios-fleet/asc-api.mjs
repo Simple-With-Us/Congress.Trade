@@ -43,7 +43,6 @@ import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
   isDriftTrain,
-  latestMarketingPatch,
   nextMarketingPatch
 } from "./version-plan.mjs";
 
