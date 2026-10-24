@@ -367,10 +367,14 @@ jobs:
           bash -n scripts/ios-fleet/test-asc-credentials.sh
           node --check scripts/ios-fleet/asc-api.mjs
           node --check scripts/ios-fleet/asc-key.mjs
+          node --check scripts/ios-fleet/version-plan.mjs
           node --check scripts/ios-fleet/test-asc-key.test.mjs
 
       - name: Fleet version publish guard
         run: node --test scripts/ios-fleet/publish-ios-versions.test.mjs
+
+      - name: Fleet version numbering (offline)
+        run: node --test scripts/ios-fleet/version-plan.test.mjs
 
       - name: AppUpdatePrompt pin copy
         run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs

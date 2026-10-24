@@ -19,6 +19,11 @@ on:
         description: "Bypass the 2.5 hour interval and same-HEAD gate for this run only"
         type: boolean
         default: false
+      marketing_version:
+        description: "Exact App Store version to build, e.g. 1.0.236.  Empty = next patch automatically."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -226,10 +231,22 @@ jobs:
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           FORCE_SHIP: ${{ inputs.force_ship }}
+          # The input is passed through the environment, never interpolated
+          # into the script:  a dispatch input is operator text, and the
+          # script validates it before it is used.
+          MARKETING_VERSION_INPUT: ${{ inputs.marketing_version }}
         run: |
+          set -euo pipefail
           args=()
           if [ "$FORCE_SHIP" = "true" ]; then
             args+=(--force-ship)
+          fi
+          if [ -n "${MARKETING_VERSION_INPUT:-}" ]; then
+            if ! [[ "$MARKETING_VERSION_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::marketing_version must be X.Y.Z (got '${MARKETING_VERSION_INPUT}')."
+              exit 1
+            fi
+            args+=(--version "$MARKETING_VERSION_INPUT")
           fi
           bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" ${args[@]:+"${args[@]}"}
 

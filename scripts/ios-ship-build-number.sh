@@ -13,12 +13,16 @@
 # So the ship hands its build number to the promotion step.  The fleet script
 # resolves the version before it uploads anything and logs it as
 #
-#   [ios-ship] marketing=1.0.<n> build=<n>
+#   [ios-ship] marketing=1.0.<m> build=<b>
 #
-# which is the line this script reads.  The fallback -- the checkout's commit
-# count -- is the very number the ship starts from (BUILD_NUM is
-# "git rev-list --count HEAD" in scripts/ios-fleet/ship-testflight.sh), so the
-# fallback is correct whenever the log line is missing or has moved.
+# which is the line this script reads.  The two numbers are independent
+# (owner directive 2026-10-24, AFC-517):  the marketing version is the next
+# patch on the train, and the build number is the checkout's commit count
+# raised above the App Store Connect floor.  The fallback -- the commit count
+# -- is the number the ship starts from (BUILD_NUM is "git rev-list --count
+# HEAD" in scripts/ios-fleet/ship-testflight.sh), so it is right whenever the
+# log line is missing; when the floor raised the build number, the log line is
+# the only exact source.
 #
 # Usage:  ios-ship-build-number.sh <ship-log-file> [repo-root]
 #
