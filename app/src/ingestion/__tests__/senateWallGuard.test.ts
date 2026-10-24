@@ -12,11 +12,29 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   establishSenateSession: vi.fn(),
+  proxiedFetches: [] as Array<typeof fetch>,
 }));
 
 vi.mock('../senateSource', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../senateSource.ts')>();
   return { ...actual, establishSenateSession: mocks.establishSenateSession };
+});
+
+// Node has no Deno.createHttpClient, so the real wrapper would return the base
+// fetch.  Tag proxied calls (an extra `client` on init, like the real one) and
+// keep each wrapper so a test can check which fetch a leg was handed.
+vi.mock('../../shared/proxyFetch.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../shared/proxyFetch.ts')>();
+  return {
+    ...actual,
+    createProxiedFetch: (proxyUrl?: string, baseFetch: typeof fetch = globalThis.fetch) => {
+      if (!proxyUrl) return baseFetch;
+      const proxied = ((input: RequestInfo | URL, init?: RequestInit) =>
+        baseFetch(input, { ...init, client: { proxyUrl } } as RequestInit)) as typeof fetch;
+      mocks.proxiedFetches.push(proxied);
+      return proxied;
+    },
+  };
 });
 
 import { fetchFiling, isSenateAgreementWallBytes, IngestRetryError } from '../fetcher.ts';
@@ -101,6 +119,124 @@ describe('fetchFiling senate wall guard', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     mocks.establishSenateSession.mockReset();
+    mocks.proxiedFetches.length = 0;
+  });
+
+  it('negotiates the session and refetches through the proxied fetch (both legs, CT-2442)', async () => {
+    const { env, r2Puts } = envForSenateFetch();
+    mocks.establishSenateSession.mockResolvedValue({ csrfCookie: 'csrf', cookieHeader: 'sessionid=fresh; csrftoken=csrf' });
+    const calls: Array<{ method: string; proxied: boolean; cookie: string | undefined }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({
+        method: (init?.method ?? 'GET').toUpperCase(),
+        proxied: Boolean((init as { client?: unknown } | undefined)?.client),
+        cookie: headers['cookie'],
+      });
+      const body = headers['cookie']?.includes('sessionid=fresh') ? REPORT_HTML : WALL_HTML;
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/html' } });
+    }));
+
+    await fetchFiling(env, 'S-wall-1');
+
+    // The handshake is handed the same proxied fetch as the document GETs.
+    expect(mocks.proxiedFetches).toHaveLength(1);
+    expect(mocks.establishSenateSession).toHaveBeenCalledTimes(1);
+    expect(mocks.establishSenateSession.mock.calls[0][1]).toBe(mocks.proxiedFetches[0]);
+    // HEAD, first GET (the wall) and the refetch all left through the proxy.
+    expect(calls.map((c) => c.method)).toEqual(['HEAD', 'GET', 'GET']);
+    expect(calls.every((c) => c.proxied)).toBe(true);
+    expect(calls[2].cookie).toContain('sessionid=fresh');
+    expect(new TextDecoder().decode(r2Puts[0].bytes)).toContain('filedReports');
+  });
+
+  it('hands the queue lease signal to the handshake, so a hung proxy aborts with the lease (CT-2442)', async () => {
+    // The real handshake this time, over a proxy that never answers the landing GET.
+    const actual = await vi.importActual<typeof import('../senateSource.ts')>('../senateSource.ts');
+    mocks.establishSenateSession.mockImplementation(actual.establishSenateSession);
+    const { env, r2Puts } = envForSenateFetch();
+    const leaseController = new AbortController();
+    const lease = {
+      signal: leaseController.signal,
+      assertOwned: vi.fn(async () => {}),
+      renew: vi.fn(async () => {}),
+    };
+    const handshake: Array<{ method: string; path: string; signal: AbortSignal | null | undefined }> = [];
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/search/' || url.pathname === '/search/home/') {
+        handshake.push({ method: (init?.method ?? 'GET').toUpperCase(), path: url.pathname, signal: init?.signal });
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) reject(signal.reason);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }
+      return Promise.resolve(new Response(WALL_HTML, { status: 200, headers: { 'content-type': 'text/html' } }));
+    }));
+    setTimeout(() => leaseController.abort(new Error('durable queue lease is no longer owned')), 20);
+
+    const err = await fetchFiling(env, 'S-wall-1', 1, lease).catch((e: unknown) => e);
+
+    expect(mocks.establishSenateSession.mock.calls[0][0]).toMatchObject({ signal: leaseController.signal });
+    expect(handshake.map((h) => `${h.method} ${h.path}`)).toEqual(['GET /search/']);
+    expect(handshake[0].signal?.aborted).toBe(true);
+    expect(err).toBeInstanceOf(IngestRetryError);
+    expect((err as Error).message).toContain('durable queue lease is no longer owned');
+    expect(r2Puts).toHaveLength(0);
+  });
+
+  it('defers the handshake while the watcher is backed off after an eFD edge deny (CT-2442)', async () => {
+    const { env, kv, r2Puts, dbRuns } = envForSenateFetch();
+    const until = new Date(Date.now() + 30 * 60_000).toISOString();
+    kv.set('senate_edge_deny:backoff', JSON.stringify({
+      consecutive: 1,
+      firstDeniedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+      lastDeniedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+      windowMs: 3_600_000,
+      until,
+      reason: 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]',
+    }));
+    const methods: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      methods.push((init?.method ?? 'GET').toUpperCase());
+      return new Response(WALL_HTML, { status: 200, headers: { 'content-type': 'text/html' } });
+    }));
+
+    const err = await fetchFiling(env, 'S-wall-1').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(IngestRetryError);
+    expect((err as Error).message).toContain(`handshake deferred until ${until} (eFD edge-deny backoff)`);
+    // Retried after the window, not on the 15-minute ingest backoff.
+    expect((err as IngestRetryError).delaySeconds).toBeGreaterThanOrEqual(29 * 60);
+    // No agreement POST: only the document HEAD and GET went out.
+    expect(mocks.establishSenateSession).not.toHaveBeenCalled();
+    expect(methods).toEqual(['HEAD', 'GET']);
+    expect(r2Puts).toHaveLength(0);
+    expect(dbRuns.some((r) => /SET ingest_status = 'error'/i.test(r.sql))).toBe(true);
+  });
+
+  it('negotiates again once the edge-deny window is over', async () => {
+    const { env, kv, r2Puts } = envForSenateFetch();
+    kv.set('senate_edge_deny:backoff', JSON.stringify({
+      consecutive: 1,
+      firstDeniedAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+      lastDeniedAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+      windowMs: 3_600_000,
+      until: new Date(Date.now() - 30 * 60_000).toISOString(),
+      reason: 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]',
+    }));
+    mocks.establishSenateSession.mockResolvedValue({ csrfCookie: 'csrf', cookieHeader: 'sessionid=fresh' });
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const body = headers['cookie']?.includes('sessionid=fresh') ? REPORT_HTML : WALL_HTML;
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/html' } });
+    }));
+
+    await fetchFiling(env, 'S-wall-1');
+
+    expect(mocks.establishSenateSession).toHaveBeenCalledTimes(1);
+    expect(new TextDecoder().decode(r2Puts[0].bytes)).toContain('filedReports');
   });
 
   it('refreshes the session and stores the REAL report when the first response is the wall', async () => {

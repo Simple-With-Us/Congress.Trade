@@ -6,17 +6,22 @@
  * real landing GET + agreement POST through the same residential proxy as
  * senateSource.ts.  The old unproxied direct GET was dropped (owner ruling
  * 2026-10-16) because datacenter egress is a structural 403 that said nothing
- * about whether ingestion works.
+ * about whether ingestion works.  Each probe sends eFD one agreement POST, so
+ * it dials at most every 30 minutes and not at all while the watcher's
+ * edge-deny backoff is active (CT-2442).
  */
 
+import { z } from 'zod';
 import type { Env } from '../shared/types.ts';
 
 export const SENATE_EFD_HEALTH_KV_KEY = 'senate-efd:health';
 export const SENATE_EFD_PROBE_TIMEOUT_MS = 8_000;
 
 /**
- * ok        landing GET 200 + csrf token, agreement POST 200/302.
- * blocked   eFD answered with the Akamai "Access Denied" 403 (anti-bot).
+ * ok        landing GET 200 + csrf token, agreement POST 3xx (or a 200 without
+ *           the agreement form), as establishSenateSession judges it.
+ * blocked   eFD's Akamai edge denied a step (classifySenateHttpFailure
+ *           `edge_denied`: a 403 from AkamaiGHost or with the Access Denied page).
  * degraded  relay/proxy down or unconfigured, or eFD misbehaved otherwise.
  */
 export type SenateEfdProbeState = 'ok' | 'blocked' | 'degraded';
@@ -38,18 +43,34 @@ export interface SenateEfdProbeRecord {
    * throttle).  False on relay-down / unconfigured records, which never dial.
    */
   dialed?: boolean;
-  /** When an eFD dial was last attempted (carried across relay-down records; drives the 15-minute throttle). */
+  /** When an eFD dial was last attempted (carried across relay-down records; drives the 30-minute throttle). */
   lastDialedAt?: string | null;
 }
+
+/**
+ * Trust boundary for the cached probe record in CONFIG_KV.  `ok` and
+ * `checkedAt` are required, as before; a legacy direct-GET record (no
+ * `state`) still parses, and pipelineHealth ignores it.  A record with a
+ * wrong-typed field reads as no record, so the probe dials again (still
+ * subject to the edge-deny backoff).  Unknown fields are dropped.
+ */
+export const SenateEfdProbeRecordSchema = z.object({
+  ok: z.boolean(),
+  status: z.number().int().nullable().catch(null),
+  checkedAt: z.string(),
+  egress: z.string().nullish(),
+  error: z.string().nullish(),
+  state: z.enum(['ok', 'blocked', 'degraded']).optional(),
+  step: z.string().nullish(),
+  dialed: z.boolean().optional(),
+  lastDialedAt: z.string().nullish(),
+});
 
 export async function readSenateEfdProbe(env: Env): Promise<SenateEfdProbeRecord | null> {
   if (!env.CONFIG_KV) return null;
   try {
-    const raw = await env.CONFIG_KV.get(SENATE_EFD_HEALTH_KV_KEY, 'json');
-    if (!raw || typeof raw !== 'object') return null;
-    const rec = raw as SenateEfdProbeRecord;
-    if (typeof rec.ok !== 'boolean' || typeof rec.checkedAt !== 'string') return null;
-    return rec;
+    const parsed = SenateEfdProbeRecordSchema.safeParse(await env.CONFIG_KV.get(SENATE_EFD_HEALTH_KV_KEY, 'json'));
+    return parsed.success ? { ...parsed.data, status: parsed.data.status ?? null } : null;
   } catch {
     return null;
   }

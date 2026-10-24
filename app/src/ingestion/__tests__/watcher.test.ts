@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
+import { SenateHttpError, SenateProxyEgressError } from '../senateEdgeDeny.ts';
 
 const mocks = vi.hoisted(() => ({
   fetchHouseIndex: vi.fn(),
@@ -58,12 +59,16 @@ function fakeEnv(
   const env = {
     ...overrides,
     CONFIG_KV: {
-      async get(key: string) {
-        return kv.get(key) ?? null;
+      async get(key: string, type?: string) {
+        const value = kv.get(key) ?? null;
+        return value !== null && type === 'json' ? JSON.parse(value) : value;
       },
       async put(key: string, value: string) {
         kv.set(key, value);
         kvPuts.push([key, value]);
+      },
+      async delete(key: string) {
+        kv.delete(key);
       },
     },
     DB: {
@@ -130,30 +135,6 @@ describe('runWatcher', () => {
     // Default the OGE source to "nothing due" so tests that don't exercise the
     // executive path leave it skipped instead of tripping the mock.
     mocks.pollOgeExecutive.mockResolvedValue(null);
-  });
-
-  it('logs a live Akamai eFD block as an error (Sentry-visible) and a backoff short-circuit as a warning (CT-2416)', async () => {
-    const { SenateAkamaiBlockError } = await import('../senateSource.ts');
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      mocks.fetchHouseIndex.mockResolvedValue([]);
-      mocks.fetchSenatePtrFilings.mockRejectedValueOnce(new SenateAkamaiBlockError('POST report/data/', 403));
-      await runWatcher(fakeEnv().env, new Date('2026-06-30T15:00:00.000Z'));
-      const blocked = error.mock.calls.filter((c) => String(c[0]).includes('senate source blocked'));
-      expect(blocked).toHaveLength(1);
-      expect(String(blocked[0][1])).toContain('senate eFD anti-bot block (Akamai)');
-
-      error.mockClear();
-      warn.mockClear();
-      mocks.fetchSenatePtrFilings.mockRejectedValueOnce(new SenateAkamaiBlockError('POST report/data/', 403, true));
-      await runWatcher(fakeEnv().env, new Date('2026-06-30T15:00:00.000Z'));
-      expect(error.mock.calls.filter((c) => String(c[0]).includes('senate source'))).toHaveLength(0);
-      expect(warn.mock.calls.some((c) => String(c[0]).includes('senate source blocked (backoff active)'))).toBe(true);
-    } finally {
-      warn.mockRestore();
-      error.mockRestore();
-    }
   });
 
   it('does not stamp last-poll state after source failures', async () => {
@@ -681,6 +662,254 @@ describe('runWatcher', () => {
     mocks.pollHouseLiveSearch.mockResolvedValueOnce([]);
     await runWatcher(second.env, new Date('2026-07-16T16:00:00.000Z'));
     expect(second.kv.get('house_live_search:consecutive_failures')).toBe('0');
+  });
+});
+
+// CT-2442: eFD's Akamai edge refuses the agreement POST for automated clients.
+// The watcher must back off politely, keep that across restarts, and say what
+// is blocked.  fetchSenatePtrFilings is mocked; fetch itself throws, so nothing
+// here can reach the network.
+describe('runWatcher senate eFD edge deny (CT-2442)', () => {
+  // Monday 10:00 AM.  With no senate success on record, senate is due on every tick.
+  const T0 = new Date('2026-10-26T15:00:00.000Z');
+  const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
+  const BACKOFF_KEY = 'senate_edge_deny:backoff';
+  const edgeDeny = () =>
+    new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost', { body: '<TITLE>Access Denied</TITLE>' });
+
+  let warn: ReturnType<typeof vi.spyOn>;
+  let error: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.pollOgeExecutive.mockResolvedValue(null);
+    mocks.fetchHouseIndex.mockResolvedValue([]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new TypeError('network disabled in tests');
+    }));
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const edgeLines = (spy: ReturnType<typeof vi.spyOn>) =>
+    spy.mock.calls.filter(([msg]) => /senate eFD edge denied/.test(String(msg)));
+
+  it('backs off 60 minutes after an edge deny, doubles up to 6 hours, and resets on success', async () => {
+    const { env, kv, dbRuns } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+
+    const first = await runWatcher(env, T0);
+    expect(first.senate).toBe('failure');
+    expect(first.senateEdgeBackoffUntil).toBe(at(60).toISOString());
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 1, windowMs: 3_600_000 });
+    const receipt = dbRuns.filter((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt.map((r) => [r.params[2], r.params[4]])).toEqual([
+      ['failure', 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]'],
+    ]);
+
+    // Past the 600 s failure skip, inside the window: no request.
+    const inside = await runWatcher(env, at(30));
+    expect(inside.senate).toBe('skipped');
+    expect(inside.senateCadence?.poll).toBe(true);
+    expect(inside.senateEdgeBackoffUntil).toBe(at(60).toISOString());
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+
+    const second = await runWatcher(env, at(61));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+    expect(second.senateEdgeBackoffUntil).toBe(at(61 + 120).toISOString());
+    await runWatcher(env, at(61 + 119));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+
+    expect((await runWatcher(env, at(181))).senateEdgeBackoffUntil).toBe(at(181 + 240).toISOString());
+    expect((await runWatcher(env, at(421))).senateEdgeBackoffUntil).toBe(at(421 + 360).toISOString());
+    // Capped at 6 hours.
+    expect((await runWatcher(env, at(781))).senateEdgeBackoffUntil).toBe(at(781 + 360).toISOString());
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(5);
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 5, firstDeniedAt: T0.toISOString() });
+
+    // eFD accepts again: success clears the backoff.
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    const ok = await runWatcher(env, at(1141));
+    expect(ok.senate).toBe('success');
+    expect(ok.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+
+    // The next deny starts over at 60 minutes.
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+    const again = await runWatcher(env, at(1141 + 120));
+    expect(again.senateEdgeBackoffUntil).toBe(at(1141 + 120 + 60).toISOString());
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 1 });
+  });
+
+  it('keeps the backoff across a restart (the state lives in CONFIG_KV)', async () => {
+    const first = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+    await runWatcher(first.env, T0);
+
+    const restarted = fakeEnv({}, {}, Object.fromEntries(first.kv));
+    const result = await runWatcher(restarted.env, at(45));
+
+    expect(result.senate).toBe('skipped');
+    expect(result.senateEdgeBackoffUntil).toBe(at(60).toISOString());
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+  });
+
+  it('says what is blocked, at error once per episode, and never claims a Senate bulk path', async () => {
+    const { env } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+    await runWatcher(env, T0);
+    await runWatcher(env, at(61));
+
+    expect(edgeLines(error)).toHaveLength(1);
+    expect(edgeLines(warn)).toHaveLength(1);
+    // One argument: the line itself, built from the classified fields.
+    expect(edgeLines(error)[0]).toHaveLength(1);
+    const line = String(edgeLines(error)[0][0]);
+    expect(line).toContain('Senate PTR discovery and document fetch are blocked while eFD refuses the agreement');
+    expect(line).toContain(`next senate attempt after ${at(60).toISOString()} (60m backoff)`);
+    expect(line).toContain('[source=senate class=edge_denied step="POST /search/home/" status=403 server=AkamaiGHost]');
+    expect(String(edgeLines(warn)[0][0])).toContain('(2 in a row since');
+    expect(edgeLines(warn)[0]).toHaveLength(1);
+
+    // A transient senate failure no longer claims a bulk path either.
+    const other = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(new Error('senate POST report/data/ -> HTTP 429 (server=gunicorn)'));
+    await runWatcher(other.env, T0);
+    expect(warn).toHaveBeenCalledWith(
+      'watcher: senate source degraded (transient, no alternate Senate discovery path):',
+      'senate POST report/data/ -> HTTP 429 (server=gunicorn)',
+    );
+
+    const lines = [...warn.mock.calls, ...error.mock.calls].map(([msg]) => String(msg));
+    expect(lines.some((msg) => /senate/.test(msg) && /bulk path/.test(msg))).toBe(false);
+  });
+
+  it('logs, stores and backs off on the classified fields only, never the raw error text (Kody, #2846)', async () => {
+    const { env, kv, dbRuns } = fakeEnv();
+    // An edge deny whose message carries upstream text and a credential.
+    const raw = new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost\r\n<x>', {
+      body: '<TITLE>Access Denied</TITLE>',
+      detail: 'via http://mango:hunter22@10.99.0.2:8888 <b>upstream page</b>',
+    });
+    expect(raw.message).toContain('hunter22');
+    mocks.fetchSenatePtrFilings.mockRejectedValue(raw);
+
+    await runWatcher(env, T0);
+    await runWatcher(env, at(61));
+
+    const lines = [...edgeLines(error), ...edgeLines(warn)];
+    expect(lines).toHaveLength(2);
+    for (const args of lines) {
+      expect(args).toHaveLength(1);
+      expect(String(args[0])).not.toMatch(/hunter22|mango|upstream page|<x>|\r/);
+      expect(String(args[0])).toContain('server=AkamaiGHostx');
+    }
+    const receipts = dbRuns
+      .filter((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate')
+      .map((r) => r.params[4]);
+    expect(receipts).toEqual([
+      'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]',
+      'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]',
+    ]);
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!).reason).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]');
+  });
+
+  it('scrubs proxy credentials from other senate failure text before logging or storing it', async () => {
+    const PROXY = 'http://mango-user:s3cr3t-pw@10.99.0.2:8888';
+    const { env, dbRuns } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
+    mocks.fetchSenatePtrFilings.mockRejectedValue(
+      new Error(`senate GET /search/ -> HTTP 429 via ${PROXY}/ (auth s3cr3t-pw rejected)`),
+    );
+
+    await runWatcher(env, T0);
+
+    const logged = [...warn.mock.calls, ...error.mock.calls].filter(([msg]) => /senate source/.test(String(msg)));
+    expect(logged).toHaveLength(1);
+    expect(logged[0][1]).toBe('senate GET /search/ -> HTTP 429 via [redacted]/ (auth [redacted] rejected)');
+    const receipt = dbRuns.find((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt?.params[4]).toBe('senate GET /search/ -> HTTP 429 via [redacted]/ (auth [redacted] rejected)');
+    expect(JSON.stringify([...warn.mock.calls, ...error.mock.calls])).not.toContain('s3cr3t-pw');
+  });
+
+  it('keeps the 600 s failure skip, not the long backoff, for an origin 403', async () => {
+    const { env, kv } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(new SenateHttpError('POST report/data/', 403, 'gunicorn'));
+
+    const first = await runWatcher(env, T0);
+    expect(first.senate).toBe('failure');
+    expect(first.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+
+    await runWatcher(env, at(5));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+    await runWatcher(env, at(11));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs a residential-proxy outage at error, not as a transient 403, and does not back off', async () => {
+    const { env, kv } = fakeEnv();
+    const outage = new SenateProxyEgressError(
+      'senate proxy gave no HTTP answer within 3000ms',
+      'senate GET /search/ -> HTTP 403 (server=AkamaiGHost)',
+    );
+    mocks.fetchSenatePtrFilings.mockRejectedValue(outage);
+
+    const result = await runWatcher(env, T0);
+
+    expect(result.senate).toBe('failure');
+    expect(result.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+    expect(error).toHaveBeenCalledWith('watcher: senate source failed:', outage.message);
+    expect(warn.mock.calls.some(([msg]) => /senate source degraded/.test(String(msg)))).toBe(false);
+  });
+
+  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most every 30 minutes', async () => {
+    const PROXY = 'http://10.99.0.2:8888';
+    const { env, kv } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
+    const efdCalls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      // The residential proxy's own liveness hop.
+      if (url === 'http://example.com/') return new Response('ok', { status: 200 });
+      if (url.startsWith('https://efdsearch.senate.gov/')) {
+        efdCalls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
+        if (url.endsWith('/search/home/')) return new Response('', { status: 302 });
+        return new Response('<input type="hidden" name="csrfmiddlewaretoken" value="t">', {
+          status: 200,
+          headers: { 'set-cookie': 'csrftoken=c; Path=/' },
+        });
+      }
+      throw new TypeError('network disabled in tests');
+    }));
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+
+    // The poll is edge-denied, so the probe that runs after it in the same
+    // tick, and on every tick inside the window, sends eFD nothing.
+    await runWatcher(env, T0);
+    expect(kv.has(BACKOFF_KEY)).toBe(true);
+    await runWatcher(env, at(30));
+    expect(efdCalls).toEqual([]);
+
+    // eFD accepts the poll after the window: the backoff clears and the probe dials.
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, at(61));
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+    expect(efdCalls).toEqual(['GET /search/', 'POST /search/home/']);
+    expect(JSON.parse(kv.get('senate-efd:health')!)).toMatchObject({ state: 'ok', egress: 'proxy' });
+
+    // Then at most every 30 minutes.
+    await runWatcher(env, at(62));
+    await runWatcher(env, at(90));
+    expect(efdCalls).toHaveLength(2);
+    await runWatcher(env, at(91));
+    expect(efdCalls).toHaveLength(4);
   });
 });
 

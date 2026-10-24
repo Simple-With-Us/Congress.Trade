@@ -27,6 +27,11 @@ import { sendPushover } from '../shared/pushover.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
 import {
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  SENATE_EDGE_BACKOFF_GRACE_MS,
+} from './senateEdgeDeny.ts';
+import {
   maybeRunDeterministicReviewDrain,
   sweepRejectedScannedForLocalVision,
   type DeterministicDrainResult,
@@ -671,6 +676,12 @@ export async function sweepPollingHeartbeat(
     );
   } catch {}
   const lastBySource = new Map<string, string | null>(rows.map((r) => [r.source, r.last_attempt]));
+  // A Senate eFD edge-deny backoff (CT-2442) leaves up to 6 hours between
+  // senate attempts by design.  That is not a stuck cron, so it must not page
+  // as one; polling_senate's liveness alarm still pages, naming the backoff.
+  const senateEdgeBackoff = await readSenateEdgeBackoff(env);
+  const senateBackedOff = senateEdgeBackoff !== null
+    && isSenateEdgeBackoffActive(senateEdgeBackoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
 
   const utcHour = now.getUTCHours();
   const isWeekday = now.getUTCDay() >= 1 && now.getUTCDay() <= 5 && WEEKDAY_UTC_HOURS.has(utcHour);
@@ -699,6 +710,7 @@ export async function sweepPollingHeartbeat(
     const ageSec = result.ageBySource[src];
     if (ageSec == null) continue;
     if (ageSec < maxAgeMin * 60) continue; // still within heartbeat window
+    if (src === 'senate' && senateBackedOff) continue; // silent on purpose (edge-deny backoff)
 
     // Heartbeat is broken. Episode semantics: notify on edge, renotify at
     // most every 6h. Same pattern as sweepLivenessAlarms so the operator

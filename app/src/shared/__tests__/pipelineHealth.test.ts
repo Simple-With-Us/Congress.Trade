@@ -883,16 +883,86 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('agreement POST ok');
   });
 
-  it('senate_efd ok goes degraded only after two missed 15m cycles', () => {
+  it('senate_efd ok goes degraded only after two missed 30m cycles', () => {
     const fresh = efdCheck({
-      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 30 * 60_000).toISOString(),
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 60 * 60_000).toISOString(),
     });
     expect(fresh.status).toBe('ok');
     const stale = efdCheck({
-      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 60 * 60_000).toISOString(),
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 100 * 60_000).toISOString(),
     });
     expect(stale.status).toBe('degraded');
     expect(stale.detail).toContain('stale');
+    expect(stale.detail).toContain('threshold 90m');
+  });
+
+  // CT-2442: the probe does not dial while the watcher's edge-deny backoff is
+  // active, so an ingestion deny newer than the probe speaks for eFD.
+  function efdBackoffCheck(
+    probe: Parameters<typeof efdCheck>[0] | null,
+    backoff: { lastDeniedAgoMin: number; untilInMin: number },
+  ) {
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateEfd: {
+        probe,
+        edgeBackoff: {
+          lastDeniedAt: new Date(nowMs - backoff.lastDeniedAgoMin * 60_000).toISOString(),
+          until: new Date(nowMs + backoff.untilInMin * 60_000).toISOString(),
+          reason: 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]',
+        },
+      },
+    }, nowMs);
+    return res.checks.find((c) => c.id === 'senate_efd')!;
+  }
+
+  it('senate_efd is critical (blocked) while an ingestion edge deny is newer than an ok probe', () => {
+    const check = efdBackoffCheck(
+      { ok: true, state: 'ok', status: 302, egress: 'proxy', dialed: true, checkedAt: new Date(nowMs - 20 * 60_000).toISOString() },
+      { lastDeniedAgoMin: 10, untilInMin: 50 },
+    );
+    expect(check.status).toBe('critical');
+    expect(check.detail).toContain('BLOCKED');
+    expect(check.detail).toContain('Akamai edge deny on Senate ingestion 10m ago');
+    expect(check.detail).toContain('[edge_denied]');
+    expect(check.detail).toContain('not a relay outage');
+    expect(check.detail).toContain('probe is paused for the edge-deny backoff (next attempt in 50m)');
+  });
+
+  it('senate_efd names the deny when the probe never ran or only a legacy record exists', () => {
+    expect(efdBackoffCheck(null, { lastDeniedAgoMin: 5, untilInMin: 55 }).status).toBe('critical');
+    const legacy = efdBackoffCheck(
+      { ok: false, status: 403, egress: 'direct', checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'HTTP 403' },
+      { lastDeniedAgoMin: 5, untilInMin: 55 },
+    );
+    expect(legacy.status).toBe('critical');
+    expect(legacy.detail).toContain('Akamai edge deny on Senate ingestion');
+  });
+
+  it('a relay-down record during the backoff does not outrank the deny', () => {
+    const check = efdBackoffCheck(
+      {
+        ok: false, state: 'degraded', status: null, step: null, egress: 'proxy', dialed: false,
+        checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'residential proxy down',
+      },
+      { lastDeniedAgoMin: 10, untilInMin: 50 },
+    );
+    expect(check.status).toBe('critical');
+    expect(check.detail).toContain('Akamai edge deny on Senate ingestion');
+  });
+
+  it('a probe verdict newer than the deny wins, and a spent backoff is ignored', () => {
+    const newer = efdBackoffCheck(
+      { ok: true, state: 'ok', status: 302, egress: 'proxy', dialed: true, checkedAt: new Date(nowMs - 60_000).toISOString() },
+      { lastDeniedAgoMin: 90, untilInMin: -30 },
+    );
+    expect(newer.status).toBe('ok');
+    // The window ended more than the 30-minute grace ago: the probe record speaks again.
+    const spent = efdBackoffCheck(
+      { ok: true, state: 'ok', status: 302, egress: 'proxy', dialed: true, checkedAt: new Date(nowMs - 80 * 60_000).toISOString() },
+      { lastDeniedAgoMin: 70, untilInMin: -31 },
+    );
+    expect(spent.status).toBe('ok');
   });
 
   it('a legacy unproxied direct-GET senate_efd record is ignored (unknown), not stalled', () => {

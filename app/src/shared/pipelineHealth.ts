@@ -16,9 +16,10 @@ import {
 } from '../extraction/reviewQueueHealth.ts';
 import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
-import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
+import { readResidentialProxyProbe, SENATE_EFD_PROXY_PROBE_INTERVAL_MS } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
+import { readSenateEdgeBackoff, SENATE_EDGE_BACKOFF_GRACE_MS } from '../ingestion/senateEdgeDeny.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { latencyProvidersWithRejectedCredentials } from '../ingestion/scoutHandoff.ts';
@@ -216,6 +217,13 @@ export interface PipelineSignals {
     lastSuccessAt: string | null;
     lastAttemptAt: string | null;
     configDisabled: boolean;
+    /**
+     * Senate only: the eFD edge-deny backoff the watcher is honoring
+     * (CONFIG_KV, CT-2442).  Its attempts are sparse by design (60 minutes up
+     * to 6 hours apart), so the check names the backoff instead of reading
+     * "NOT RUNNING".  Absent = no backoff.
+     */
+    edgeBackoff?: { until: string; lastDeniedAt: string; reason: string };
   }> | null;
   /**
    * Latency-probe liveness (same directive): newest observation per provider
@@ -273,7 +281,15 @@ export interface PipelineSignals {
       error?: string | null;
       state?: 'ok' | 'blocked' | 'degraded';
       step?: string | null;
+      /** False on relay-down / unconfigured records, which carry no eFD verdict. */
+      dialed?: boolean;
     } | null;
+    /**
+     * The watcher's eFD edge-deny backoff (CONFIG_KV, CT-2442).  The probe
+     * does not dial while it is active, so a deny newer than the probe is the
+     * freshest word on eFD.  Absent = no backoff.
+     */
+    edgeBackoff?: { until: string; lastDeniedAt: string; reason: string } | null;
   } | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
@@ -928,12 +944,35 @@ export function evaluatePipelineSignals(
       const attemptMs = st.lastAttemptAt ? Date.parse(st.lastAttemptAt) : NaN;
       const successAgeH = Number.isFinite(successMs) ? (nowMs - successMs) / 3_600_000 : Infinity;
       const attemptAgeH = Number.isFinite(attemptMs) ? (nowMs - attemptMs) / 3_600_000 : Infinity;
+      // An edge-deny backoff explains sparse attempts while its deny is newer
+      // than the last success, the latest attempt is that deny (the watcher
+      // stamps both with one instant), and the next attempt is not overdue.
+      // An attempt after the deny means polling resumed and failed for its
+      // own reason, so the generic wording names it.  Still stalled:
+      // discovery is down, and this detail is what the page says.
+      const backoff = st.edgeBackoff;
+      const backoffUntilMs = backoff ? Date.parse(backoff.until) : NaN;
+      const deniedMs = backoff ? Date.parse(backoff.lastDeniedAt) : NaN;
+      const backedOff = backoff !== undefined
+        && !(Number.isFinite(successMs) && deniedMs <= successMs)
+        && !(Number.isFinite(attemptMs) && Number.isFinite(deniedMs) && attemptMs > deniedMs + 60_000)
+        && nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS;
       if (successAgeH <= maxAgeH) {
         checks.push({
           id,
           status: 'ok',
           detail: `${src} polling live: last success ${successAgeH < 1 ? Math.round(successAgeH * 60) + 'm' : Math.round(successAgeH) + 'h'} ago`,
           value: Math.round(successAgeH * 10) / 10,
+        });
+      } else if (backoff && backedOff) {
+        const waitMin = Math.round((backoffUntilMs - nowMs) / 60_000);
+        checks.push({
+          id,
+          status: 'stalled',
+          detail: `${src} polling BACKED OFF after an edge deny (${backoff.reason}): `
+            + `${!Number.isFinite(waitMin) ? 'next attempt time unknown' : waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'}; `
+            + `no success in ${successAgeH === Infinity ? 'ever' : Math.round(successAgeH) + 'h'} (threshold ${maxAgeH}h)`,
+          value: successAgeH === Infinity ? null : Math.round(successAgeH),
         });
       } else if (attemptAgeH <= maxAgeH) {
         checks.push({
@@ -1130,10 +1169,36 @@ export function evaluatePipelineSignals(
   // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
   // records (`status: null`) stay `degraded`: the residential_proxy check owns
   // relay outages, and paging twice for one cause is the churn CT-2416 removes.
+  //
+  // The probe does not dial while the watcher's edge-deny backoff is active
+  // (CT-2442).  An ingestion edge deny newer than the probe's last eFD verdict
+  // is the same Akamai refusal the probe reports as `blocked`, so it speaks for
+  // eFD until the probe dials again.  Relay-down records (`dialed: false`)
+  // carry no eFD verdict and never outrank it.
+  const efdBackoff = s.senateEfd?.edgeBackoff ?? null;
+  const efdDeniedMs = efdBackoff ? Date.parse(efdBackoff.lastDeniedAt) : NaN;
+  const efdBackoffUntilMs = efdBackoff ? Date.parse(efdBackoff.until) : NaN;
+  const efdProbe = s.senateEfd?.probe ?? null;
+  const efdVerdictMs = efdProbe?.state && efdProbe.dialed !== false ? Date.parse(efdProbe.checkedAt) : NaN;
+  const efdDeniedSinceProbe = Number.isFinite(efdDeniedMs)
+    && nowMs <= efdBackoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS
+    && !(Number.isFinite(efdVerdictMs) && efdVerdictMs >= efdDeniedMs);
   if (s.senateEfd === undefined) {
     /* optional — fixtures predating the eFD probe omit this signal */
   } else if (s.senateEfd == null) {
     checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD probe uncollected', value: null });
+  } else if (efdBackoff && efdDeniedSinceProbe) {
+    const deniedAgoMin = (nowMs - efdDeniedMs) / 60_000;
+    const waitMin = Math.round((efdBackoffUntilMs - nowMs) / 60_000);
+    checks.push({
+      id: 'senate_efd',
+      status: 'critical',
+      detail: `Senate eFD BLOCKED: Akamai edge deny on Senate ingestion `
+        + `${deniedAgoMin < 1 ? Math.round(deniedAgoMin * 60) + 's' : Math.round(deniedAgoMin) + 'm'} ago (${efdBackoff.reason})`
+        + ` — refused by eFD itself, not a relay outage; the probe is paused for the edge-deny backoff`
+        + ` (${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
+      value: 403,
+    });
   } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
     // Missing, or a legacy unproxied direct-GET record (dropped 2026-10-16).
     // A legacy datacenter 401/403 while the residential proxy is live is the
@@ -1162,8 +1227,8 @@ export function evaluatePipelineSignals(
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
     const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
-    // The probe dials eFD at most every 15m, so allow two missed cycles.
-    const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, 45);
+    // The probe dials eFD at most every 30m, so allow two missed cycles.
+    const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, (3 * SENATE_EFD_PROXY_PROBE_INTERVAL_MS) / 60_000);
     const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
     if (probe.state === 'blocked') {
       checks.push({
@@ -1658,6 +1723,15 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // started writing source_attempts rows) and reads its enable gate — a
   // disabled chamber must be LOUD, never a silent skip.
   let pollSources: PipelineSignals['pollSources'] = null;
+  // Fail-soft (null on any KV fault); shared by polling_senate and senate_efd.
+  const senateEdgeBackoff = await readSenateEdgeBackoff(env);
+  const senateEdgeBackoffSignal = senateEdgeBackoff
+    ? {
+        until: senateEdgeBackoff.until,
+        lastDeniedAt: senateEdgeBackoff.lastDeniedAt,
+        reason: senateEdgeBackoff.reason,
+      }
+    : null;
   try {
     const rows = await all<{ source: string; last_success: string | null; last_attempt: string | null }>(
       env.DB,
@@ -1691,6 +1765,7 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
         lastSuccessAt,
         lastAttemptAt,
         configDisabled: source === 'executive' ? ogeDisabled : false,
+        ...(source === 'senate' && senateEdgeBackoffSignal ? { edgeBackoff: senateEdgeBackoffSignal } : {}),
       };
     });
   } catch {}
@@ -1772,9 +1847,9 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   }
 
-  let senateEfd: PipelineSignals['senateEfd'] = { probe: null };
+  let senateEfd: PipelineSignals['senateEfd'] = { probe: null, edgeBackoff: senateEdgeBackoffSignal };
   try {
-    senateEfd = { probe: await readSenateEfdProbe(env) };
+    senateEfd = { probe: await readSenateEfdProbe(env), edgeBackoff: senateEdgeBackoffSignal };
   } catch {
     senateEfd = null;
   }

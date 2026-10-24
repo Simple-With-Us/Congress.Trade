@@ -11,10 +11,18 @@ import type { Env } from '../shared/types.ts';
 import {
   BROWSER_HEADERS,
   CookieJar,
-  looksLikeAkamaiAccessDenied,
+  looksLikeSenateAgreementWall,
   parseCsrfMiddlewareToken,
   SENATE_SEARCH,
 } from './senateSource.ts';
+import {
+  classifySenateHttpFailure,
+  isSenateEdgeBackoffActive,
+  logSafeHeaderToken,
+  readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEfdTransportScrubSecrets,
+} from './senateEdgeDeny.ts';
 import {
   persistSenateEfdProbe,
   readSenateEfdProbe,
@@ -167,14 +175,15 @@ export async function refreshResidentialProxyHealth(env: Env, now = new Date()):
 // Senate eFD functional probe (CT-2416)
 // ---------------------------------------------------------------------------
 
-/** Dial eFD at most this often; relay-down records are written every tick (no eFD hop). */
-export const SENATE_EFD_PROXY_PROBE_INTERVAL_MS = 15 * 60_000;
 /**
- * After a recorded Akamai block, wait this long before probing again.  Mirrors
- * senateSource's SENATE_AKAMAI_BLOCK_BACKOFF_MS (30m): no point POSTing to an
- * endpoint that is refusing this egress more often than ingestion itself does.
+ * Dial eFD at most this often, whatever the last verdict; relay-down records
+ * are written every tick (no eFD hop).  Each dial sends eFD one agreement
+ * POST, the request its edge is refusing for automated clients (CT-2442), so
+ * the probe stays at 30 minutes or slower.  An edge deny gets no shorter or
+ * separate probe backoff: the watcher's edge-deny backoff (senateEdgeDeny.ts)
+ * is the one Senate backoff, and the probe skips while it is active.
  */
-export const SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS = 30 * 60_000;
+export const SENATE_EFD_PROXY_PROBE_INTERVAL_MS = 30 * 60_000;
 
 // Literal (not derived from SENATE_SEARCH) so suites that vi.mock senateSource
 // without these exports can still import this module.
@@ -218,31 +227,20 @@ async function readEfdBody(res: Response): Promise<string> {
 }
 
 /**
- * Transport errors can embed the proxy URL (`http://user:pass@host`), and this
- * text is persisted to CONFIG_KV and served on /health/deep.  Strip URL
- * userinfo and any configured proxy credentials, and bound the length.
- */
-export function sanitizeEfdTransportError(err: unknown, secrets: Array<string | undefined> = []): string {
-  const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err ?? 'unknown');
-  let out = raw.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
-  for (const secret of secrets) {
-    if (secret && secret.length >= 3) out = out.split(secret).join('[redacted]');
-  }
-  return out.slice(0, 200);
-}
-
-/**
  * Exercise the path Senate ingestion actually needs, through the same
  * residential proxy `senateSource.ts` uses: GET /search/ (200 + csrf token),
- * then the agreement POST to /search/home/ (200/302).  The example.com
- * liveness hop above cannot see an eFD anti-bot block; this can.
+ * then the agreement POST to /search/home/, judged the way
+ * `establishSenateSession` judges it (a 3xx, or a 200 without the agreement
+ * form).  The example.com liveness hop above cannot see an eFD edge deny;
+ * this can.
  *
  * Each request gets its own `timeoutMs` budget, so a slow landing GET cannot
- * starve the agreement POST.
+ * starve the agreement POST.  Transport-error text is scrubbed with
+ * senateEdgeDeny's `sanitizeEfdTransportError` before it is persisted.
  *
  * Classification:
  *   ok        both steps passed
- *   blocked   either step returned Akamai's "Access Denied" 403
+ *   blocked   either step was an edge deny (classifySenateHttpFailure)
  *   degraded  proxy unreachable / transport error / timeout, or any other failure
  */
 export async function probeSenateEfdThroughProxy(
@@ -280,7 +278,7 @@ export async function probeSenateEfdThroughProxy(
       return { landing: res, landingHtml: await readEfdBody(res) };
     });
     if (landing.status !== 200) {
-      return classifyEfdFailure(base, step, landing.status, landingHtml);
+      return classifyEfdFailure(base, step, landing, landingHtml);
     }
     const jar = new CookieJar();
     jar.absorb(landing);
@@ -314,10 +312,16 @@ export async function probeSenateEfdThroughProxy(
       );
       return { agree: res, agreeBody: await readEfdBody(res) };
     });
-    if (agree.status === 200 || agree.status === 302) {
+    if (agree.status >= 300 && agree.status < 400) {
       return { ...base, ok: true, state: 'ok', status: agree.status, step, error: null };
     }
-    return classifyEfdFailure(base, step, agree.status, agreeBody);
+    if (agree.status === 200) {
+      if (looksLikeSenateAgreementWall(agreeBody)) {
+        return { ...base, ok: false, state: 'degraded', status: 200, step, error: 'eFD still shows the agreement form' };
+      }
+      return { ...base, ok: true, state: 'ok', status: 200, step, error: null };
+    }
+    return classifyEfdFailure(base, step, agree, agreeBody);
   } catch (err) {
     return {
       ...base,
@@ -332,32 +336,29 @@ export async function probeSenateEfdThroughProxy(
   }
 }
 
+/** One classifier for every Senate eFD answer: senateEdgeDeny's. */
 function classifyEfdFailure(
   base: { checkedAt: string; egress: 'proxy'; dialed: true },
   step: string,
-  status: number,
+  res: Response,
   body: string,
 ): SenateEfdProbeRecord {
-  if (status === 403 && looksLikeAkamaiAccessDenied(body)) {
-    return { ...base, ok: false, state: 'blocked', status, step, error: 'eFD anti-bot block (Akamai Access Denied)' };
+  const { status } = res;
+  const server = res.headers.get('server');
+  if (classifySenateHttpFailure(status, server, body) === 'edge_denied') {
+    return {
+      ...base, ok: false, state: 'blocked', status, step,
+      error: `eFD edge denied (Akamai Access Denied, server=${logSafeHeaderToken(server)})`,
+    };
   }
-  return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status}` };
-}
-
-/** Configured proxy credential values, so a transport error can be scrubbed of them. */
-function proxyCredentialSecrets(env: Env): string[] {
-  const penv = typeof process !== 'undefined' ? process.env : undefined;
-  return [
-    env?.RESIDENTIAL_PROXY_USERNAME, env?.RESIDENTIAL_PROXY_PASSWORD,
-    penv?.RESIDENTIAL_PROXY_USERNAME, penv?.RESIDENTIAL_PROXY_PASSWORD,
-  ].map((v) => v?.trim()).filter((v): v is string => Boolean(v));
+  return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status} (server=${logSafeHeaderToken(server)})` };
 }
 
 /**
  * Refresh the cached eFD probe.  Relay down/unconfigured is recorded every
- * call without dialing eFD; otherwise eFD is dialed at most once per
- * SENATE_EFD_PROXY_PROBE_INTERVAL_MS (SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS
- * after an Akamai block), measured from the last attempted dial
+ * call without dialing eFD.  Otherwise eFD is not dialed while the watcher's
+ * edge-deny backoff is active (CT-2442), and at most once per
+ * SENATE_EFD_PROXY_PROBE_INTERVAL_MS, measured from the last attempted dial
  * (`lastDialedAt`), so relay flaps cannot shorten the interval.
  *
  * An attempt that fails in transport or times out still counts: Akamai can
@@ -387,17 +388,21 @@ export async function refreshSenateEfdProxyProbe(
     });
     return;
   }
+  // While Senate polling is backed off after an edge deny, eFD is refusing the
+  // very agreement POST this probe sends.  Leave the record as it is:
+  // pipelineHealth reads the backoff itself and reports the deny.
+  const edgeBackoff = await readSenateEdgeBackoff(env);
+  if (edgeBackoff && isSenateEdgeBackoffActive(edgeBackoff, now)) return;
   const lastMs = lastDialedAt ? Date.parse(lastDialedAt) : NaN;
-  const intervalMs = last?.state === 'blocked' ? SENATE_EFD_BLOCKED_PROBE_INTERVAL_MS : SENATE_EFD_PROXY_PROBE_INTERVAL_MS;
-  if (Number.isFinite(lastMs) && now.getTime() - lastMs < intervalMs) {
+  if (Number.isFinite(lastMs) && now.getTime() - lastMs < SENATE_EFD_PROXY_PROBE_INTERVAL_MS) {
     // Throttled.  If the stored record is a relay-down one, the relay is back
     // but eFD state is unknown until the next allowed dial, so leave it as is
-    // (pipelineHealth keeps reporting degraded for at most 15 minutes).
+    // (pipelineHealth keeps reporting degraded for at most 30 minutes).
     return;
   }
   const rec = await probeSenateEfdThroughProxy(
     ctx.proxyUrl, fetchImpl, SENATE_EFD_PROBE_TIMEOUT_MS, now,
-    proxyCredentialSecrets(env),
+    senateEfdTransportScrubSecrets(ctx.proxyUrl, env),
   );
   await persistSenateEfdProbe(env, { ...rec, lastDialedAt: checkedAt });
 }

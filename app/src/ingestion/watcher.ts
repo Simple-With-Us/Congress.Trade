@@ -36,7 +36,22 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings, isSenateAkamaiBlockError, SenateAkamaiBlockError } from './senateSource.ts';
+import { fetchSenatePtrFilings } from './senateSource.ts';
+import {
+  clearSenateEdgeBackoff,
+  isSenateEdgeBackoffActive,
+  isSenateEdgeDeniedError,
+  nextSenateEdgeBackoff,
+  readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEdgeDenyLogFields,
+  senateEdgeDenyReason,
+  senateEfdTransportScrubSecrets,
+  SenateProxyEgressError,
+  writeSenateEdgeBackoff,
+  type SenateEdgeBackoffState,
+  type SenateHttpError,
+} from './senateEdgeDeny.ts';
 import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
@@ -585,10 +600,13 @@ async function recordSourceAttempt(
 /**
  * A source failure is "transient" when it reflects a recoverable upstream or
  * platform condition rather than a bug: anti-bot blocks (403), rate limits
- * (429), and transient D1/Workers platform limits. These recur on a normal
+ * (429), and transient D1/Workers platform limits.  These recur on a normal
  * cadence (e.g. the Senate efdsearch 403), so logging them at `error` floods
- * observability and buries genuine errors. We log them at `warn` instead; the
- * daily bulk/backfill path keeps history complete regardless.
+ * observability and buries genuine errors.  We log them at `warn` instead; for
+ * the House the daily bulk index keeps history complete regardless.  The
+ * Senate has no bulk path, and a persistent eFD edge deny is not transient:
+ * runWatcher handles that class (SenateHttpError `edge_denied`) before this
+ * check is consulted.
  */
 export function isTransientSourceError(message: string): boolean {
   return (
@@ -601,24 +619,69 @@ export function isTransientSourceError(message: string): boolean {
   );
 }
 
+/**
+ * Senate error text with the proxy secrets and URL userinfo scrubbed, for
+ * the logs and source_attempts (CT-2442).  It can carry proxy transport text
+ * or upstream detail.
+ */
+function scrubSenateErrorText(env: Env, err: unknown): string {
+  const secrets = senateEfdTransportScrubSecrets(env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL, env);
+  return sanitizeEfdTransportError(err, secrets, 1000);
+}
+
 /** Record a source-level failure without presenting it as a successful poll. */
 async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executive', nowIso: string, err: unknown): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
-  if (isSenateAkamaiBlockError(err)) {
-    // CT-2416: an Akamai edge block stops Senate ingestion outright, so it is
-    // Sentry-visible (console.error) on the live refusal.  Ticks short-circuited
-    // by the KV backoff only warn, so one outage is not an error per tick.
-    if (err instanceof SenateAkamaiBlockError && err.cached) {
-      console.warn(`watcher: ${source} source blocked (backoff active):`, message);
-    } else {
-      console.error(`watcher: ${source} source blocked:`, message);
-    }
-  } else if (isTransientSourceError(message)) {
-    console.warn(`watcher: ${source} source degraded (transient, bulk path still authoritative):`, message);
+  const message = source === 'senate'
+    ? scrubSenateErrorText(env, err)
+    : err instanceof Error ? err.message : String(err);
+  // A residential-proxy outage is an egress fault to act on, even when the
+  // wrapped direct-fallback answer carries "HTTP 403".
+  if (!(err instanceof SenateProxyEgressError) && isTransientSourceError(message)) {
+    // eFD search is the only Senate discovery path; there is no Senate bulk index.
+    const fallback = source === 'senate' ? 'no alternate Senate discovery path' : 'bulk path still authoritative';
+    console.warn(`watcher: ${source} source degraded (transient, ${fallback}):`, message);
   } else {
     console.error(`watcher: ${source} source failed:`, message);
   }
   await recordSourceAttempt(env, source, nowIso, 'failure', 0, message);
+}
+
+/**
+ * Record a Senate eFD edge deny (CT-2442): grow and persist the polling
+ * backoff, say plainly what is blocked, and write the failure receipt.
+ * Returns the saved backoff, or null when it could not be saved (the 600 s
+ * failure skip then still applies).
+ *
+ * Log level: console.error for the first deny of an episode, console.warn for
+ * the repeats.  Both levels reach Sentry logs and Datadog (consoleLogging /
+ * the console hook capture warn and error); error is the level this codebase
+ * escalates to once per sustained outage.  The start of a whole-chamber
+ * discovery outage belongs there once, and the repeats, at most one per
+ * backoff window, are already paged by the polling_senate liveness alarm.
+ *
+ * Only the classified fields (source, failure class, step, HTTP status,
+ * Server header, the count and the next attempt) reach the log line, the
+ * receipt and the stored backoff reason, never the error's raw message.
+ */
+async function recordSenateEdgeDenied(
+  env: Env,
+  now: Date,
+  err: SenateHttpError,
+  prev: SenateEdgeBackoffState | null,
+): Promise<SenateEdgeBackoffState | null> {
+  const reason = senateEdgeDenyReason(err);
+  const next = nextSenateEdgeBackoff(prev, now, reason);
+  const saved = await writeSenateEdgeBackoff(env, next);
+  const plan = saved
+    ? `next senate attempt after ${next.until} (${Math.round(next.windowMs / 60_000)}m backoff)`
+    : 'the backoff could not be saved, so the 600s failure skip applies';
+  const line = `watcher: senate eFD edge denied (${next.consecutive} in a row since ${next.firstDeniedAt}): `
+    + 'Senate PTR discovery and document fetch are blocked while eFD refuses the agreement, '
+    + `and there is no alternate Senate discovery path; ${plan} [${senateEdgeDenyLogFields(err)}]`;
+  if (next.consecutive === 1) console.error(line);
+  else console.warn(line);
+  await recordSourceAttempt(env, 'senate', now.toISOString(), 'failure', 0, reason);
+  return saved ? next : null;
 }
 
 /** Days into January during which the previous year's House index is ALSO
@@ -1033,6 +1096,9 @@ export interface WatcherResult {
   houseCadence?: SourcePollDecision;
   senateCadence?: SourcePollDecision;
   executiveCadence?: SourcePollDecision;
+  /** Set while Senate polling is backed off after an eFD edge deny, so a
+   *  `senate: 'skipped'` under a due cadence explains itself. */
+  senateEdgeBackoffUntil?: string;
 }
 
 /**
@@ -1231,6 +1297,9 @@ export async function runWatcher(
   }
 
   // SENATE ----------------------------------------------------------------
+  // eFD edge-deny backoff (CT-2442), read only when a poll is due.  A backoff
+  // whose last deny predates the last success is spent: success resets it.
+  let senateEdgeBackoff: SenateEdgeBackoffState | null = null;
   try {
     throwIfWatcherAborted(options.signal);
     const lastSenate = await getLastPollAt(env, 'senate');
@@ -1257,21 +1326,42 @@ export async function runWatcher(
     );
     result.senateCadence = senateDecision;
     if (senateDecision.poll) {
+      senateEdgeBackoff = await readSenateEdgeBackoff(env);
+      if (senateEdgeBackoff && lastSenate && Date.parse(senateEdgeBackoff.lastDeniedAt) <= lastSenate.getTime()) {
+        senateEdgeBackoff = null;
+      }
       const lastAttempt = await getLastAttemptAt(env, 'senate');
       const elapsedSec = lastAttempt ? (now.getTime() - lastAttempt.getTime()) / 1000 : Infinity;
       const lastAttemptFailed = lastAttempt && (!lastSenate || lastSenate.getTime() < lastAttempt.getTime());
-      if (lastAttemptFailed && elapsedSec < 600) {
+      if (senateEdgeBackoff && isSenateEdgeBackoffActive(senateEdgeBackoff, now)) {
+        // eFD's edge refused the last attempt: stay off until the window ends
+        // instead of the 600 s failure skip.  polling_senate stays stalled
+        // and names the backoff meanwhile.
+        result.senateEdgeBackoffUntil = senateEdgeBackoff.until;
+      } else if (lastAttemptFailed && elapsedSec < 600) {
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'senate', now);
         await pollSenate(env, now, watcherSourceIoSignal(options.signal));
         result.senate = 'success';
+        if (senateEdgeBackoff) {
+          console.log(
+            `watcher: senate eFD accepted the poll again after ${senateEdgeBackoff.consecutive} edge denies `
+              + `since ${senateEdgeBackoff.firstDeniedAt}; backoff cleared`,
+          );
+          await clearSenateEdgeBackoff(env);
+        }
       }
     }
   } catch (err) {
     if (options.signal?.aborted) throwIfWatcherAborted(options.signal);
     if (err instanceof Error && err.name === 'AbortError') throw err;
-    await recordSourceError(env, 'senate', now.toISOString(), err);
+    if (isSenateEdgeDeniedError(err)) {
+      const backoff = await recordSenateEdgeDenied(env, now, err, senateEdgeBackoff);
+      if (backoff) result.senateEdgeBackoffUntil = backoff.until;
+    } else {
+      await recordSourceError(env, 'senate', now.toISOString(), err);
+    }
     result.senate = 'failure';
   }
 
@@ -1339,7 +1429,11 @@ export async function runWatcher(
     console.warn('watcher: senate relay health probe failed:', (err as Error).message);
   }
   try {
-    // Also refreshes the proxied Senate eFD functional probe (CT-2416).
+    // Also refreshes the proxied Senate eFD functional probe (CT-2416).  It
+    // runs after the senate poll on purpose: a deny this tick has already
+    // armed the edge-deny backoff, and the probe skips while that is active,
+    // so a tick whose poll eFD just refused sends it no second agreement POST
+    // (CT-2442).
     await refreshResidentialProxyHealth(env, now);
   } catch (err) {
     console.warn('watcher: residential proxy health probe failed:', (err as Error).message);
