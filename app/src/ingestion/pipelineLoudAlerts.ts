@@ -70,6 +70,10 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   'polling_house',
   'polling_senate',
   'polling_executive',
+  // Evaluated by the dedicated st_peer_prices condition above (same rules via
+  // evaluateStPeerPricesStall).  Without this skip the generic loop raises a
+  // second health_st_peer_prices episode, so every stall and recovery pages twice.
+  'st_peer_prices',
 ]);
 
 export interface PipelineStallAlertResult {

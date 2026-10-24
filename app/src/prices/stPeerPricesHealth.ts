@@ -22,7 +22,6 @@ export interface StPeerPricesMetrics {
   pending: number;
   neverPricedPending: number;
   lastProgressAt: string | null;
-  lastAnyPriceCheckedAt: string | null;
   corpusLatestDate: string | null;
   freshThrough: string;
   pendingSample: string[];
@@ -43,16 +42,10 @@ export function hoursSinceIso(lastAt: string | null, now: Date): string {
   return ((now.getTime() - lastMs) / 3_600_000).toFixed(1);
 }
 
-async function readLastAnyPriceCheckedAt(env: Env): Promise<string | null> {
-  try {
-    const row = await get<{ at: string | null }>(
-      env.DB,
-      `SELECT MAX(price_checked_at) AS at FROM securities_ref WHERE price_checked_at IS NOT NULL`,
-    );
-    return row?.at ?? null;
-  } catch {
-    return null;
-  }
+/** `12.3h ago`, or `never` when there is no parseable timestamp (no `neverh ago`). */
+export function progressAgoLabel(lastAt: string | null, now: Date): string {
+  const h = hoursSinceIso(lastAt, now);
+  return h === 'never' ? 'never' : `${h}h ago`;
 }
 
 /**
@@ -72,7 +65,6 @@ export async function collectStPeerPricesMetrics(
       pending: 0,
       neverPricedPending: 0,
       lastProgressAt: null,
-      lastAnyPriceCheckedAt: null,
       corpusLatestDate: null,
       freshThrough: '',
       pendingSample: [],
@@ -111,7 +103,6 @@ export async function collectStPeerPricesMetrics(
       pending: 0,
       neverPricedPending: 0,
       lastProgressAt: null,
-      lastAnyPriceCheckedAt: null,
       corpusLatestDate: null,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
@@ -122,7 +113,6 @@ export async function collectStPeerPricesMetrics(
   }
 
   const corpusLatestDate = await readCorpusLatestPriceDate(env);
-  const lastAnyPriceCheckedAt = await readLastAnyPriceCheckedAt(env);
 
   if (pending <= 0) {
     return {
@@ -131,7 +121,6 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
-      lastAnyPriceCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
@@ -148,7 +137,6 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
-      lastAnyPriceCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
@@ -179,7 +167,6 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
-      lastAnyPriceCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample,
@@ -187,7 +174,7 @@ export async function collectStPeerPricesMetrics(
       stalled: false,
       detail:
         `${pending} ticker(s) pending ST EOD/current prices${sampleSuffix}; ` +
-        `price_checked_at progress ${hoursSinceIso(lastProgressAt, now)}h ago on pending set (under ${stallThresholdHours}h threshold)`,
+        `price_checked_at progress ${progressAgoLabel(lastProgressAt, now)} on pending set (under ${stallThresholdHours}h threshold)`,
     };
   }
 
@@ -215,7 +202,6 @@ export async function collectStPeerPricesMetrics(
     pending,
     neverPricedPending,
     lastProgressAt,
-    lastAnyPriceCheckedAt,
     corpusLatestDate,
     freshThrough: pendingParams.freshThrough,
     pendingSample,
@@ -231,9 +217,11 @@ export function stPeerPricesMetricsToCheck(metrics: StPeerPricesMetrics): Pipeli
     status = metrics.configured && metrics.detail.includes('failed') ? 'unknown' : 'ok';
   } else if (metrics.stalled) {
     status = 'stalled';
-  } else if (metrics.pending > 0) {
-    status = 'degraded';
   }
+  // A non-stalled backlog (in progress under the threshold, or the tail-only
+  // case with a current corpus) stays ok:  the loud alert treats it as healthy
+  // too, and there is almost always some pending ticker, so 'degraded' here
+  // would pin pipeline.status off ok.  pending stays in value and detail.
 
   return {
     id: 'st_peer_prices',
@@ -245,7 +233,6 @@ export function stPeerPricesMetricsToCheck(metrics: StPeerPricesMetrics): Pipeli
       freshThrough: metrics.freshThrough,
       corpusLatestDate: metrics.corpusLatestDate,
       lastProgressAt: metrics.lastProgressAt,
-      lastAnyPriceCheckedAt: metrics.lastAnyPriceCheckedAt,
       stallThresholdHours: metrics.stallThresholdHours,
       pendingSample: metrics.pendingSample,
     },
