@@ -20,7 +20,7 @@ import {
   lastTradingDay,
   markTickerPriceUnavailable,
   notCoveredReason,
-  NOT_COVERED_CAUSE_STUCK_ERRORING,
+  NOT_COVERED_CAUSE_LAST_ERRORED,
   NOT_COVERED_CAUSE_STUCK_PENDING,
   ST_FETCH_ERROR_REASON_PREFIX,
   planTickerEodFetch,
@@ -105,15 +105,18 @@ export async function markStuckPeerPriceTickersNotCovered(
   }
   const nowIso = now.toISOString();
   for (const { ticker, last_reason } of rows) {
-    // Say WHY:  a ticker whose last recorded outcome is an ST fetch error is
-    // marked as erroring (with the error), not as "no data".  Either way the
+    // Say WHY, and only what is known:  72h without a completed check is the
+    // proven fact;  an error marker adds that the LAST attempt failed (with the
+    // message).  One marker is not an error streak, so the cause never says so.  Either way the
     // daily re-check retries it, so a recovered ST reprices it within a day.
     const lastError = last_reason?.startsWith(ST_FETCH_ERROR_REASON_PREFIX)
       ? last_reason.slice(ST_FETCH_ERROR_REASON_PREFIX.length)
       : null;
     const reason = notCoveredReason(
       now,
-      lastError ? `${NOT_COVERED_CAUSE_STUCK_ERRORING} (${lastError})` : NOT_COVERED_CAUSE_STUCK_PENDING,
+      lastError
+        ? `${NOT_COVERED_CAUSE_STUCK_PENDING}; ${NOT_COVERED_CAUSE_LAST_ERRORED} (${lastError})`
+        : NOT_COVERED_CAUSE_STUCK_PENDING,
     );
     await markTickerPriceUnavailable(env, ticker, reason, {
       checkedAt: nowIso,
@@ -133,10 +136,17 @@ async function restampNotCovered(env: Env, ticker: string, nowIso: string): Prom
   );
 }
 
+/** Make the normal refresh re-select a ticker whose cached history is incomplete. */
+async function clearLatestPriceDate(env: Env, ticker: string): Promise<void> {
+  await run(env.DB, 'UPDATE securities_ref SET latest_price_date = NULL WHERE ticker = ?', [ticker]);
+}
+
 export interface NotCoveredRecheckResult {
   checked: number;
   repriced: number;
   restamped: number;
+  /** Repriced tickers whose full history from the oldest trade was then fetched. */
+  backfilled: number;
   aborted: boolean;
   errors: string[];
 }
@@ -169,6 +179,7 @@ export async function recheckNotCoveredPeerPrices(
     checked: 0,
     repriced: 0,
     restamped: 0,
+    backfilled: 0,
     aborted: false,
     errors: [],
   };
@@ -189,8 +200,9 @@ export async function recheckNotCoveredPeerPrices(
     }
     // Bounded probe:  stage-4 tickers are known-unpriceable, so a recent window
     // is enough to see that ST started pricing one.  A cold cache would
-    // otherwise re-request years of daily bars every day.  After a reprice the
-    // normal refresh backfills older history (gap-below-cache branch).
+    // otherwise re-request years of daily bars every day.  When a ticker
+    // recovers through a clamped window, its full history is fetched right
+    // after (below), so trades older than the window get priced too.
     const fetchPlan = await planTickerEodFetch(env, ticker, {
       maxLookbackDays: NOT_COVERED_RECHECK_LOOKBACK_DAYS,
     });
@@ -226,6 +238,30 @@ export async function recheckNotCoveredPeerPrices(
     if (accepted) {
       await writeTickerEodHistory(env, ticker, hist, nowIso, { stage: 0, reason: null });
       result.repriced++;
+      if (fetchPlan.fullFrom < fetchPlan.from) {
+        // The probe stopped short of what the trades need, yet the write above
+        // stamped latest_price_date current, so the normal refresh would never
+        // re-select this ticker and trades before the probe window would keep
+        // a NULL price_at_trade.  Fetch the full window now.  This costs one
+        // extra ST call only on the rare day a stage-4 ticker recovers.
+        try {
+          await pace();
+          const older = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to);
+          if (older.length > 0) {
+            await writeTickerEodHistory(env, ticker, older, nowIso, { stage: 0, reason: null });
+          }
+          result.backfilled++;
+        } catch (e) {
+          result.errors.push(ticker + ' (backfill): ' + (e as Error).message);
+          // Stop marking it current so selectTickersNeedingPrices re-selects
+          // it and the normal refresh fetches the full window instead.
+          await clearLatestPriceDate(env, ticker);
+          if (isFatalPriceProviderError(e, false)) {
+            result.aborted = true;
+            break;
+          }
+        }
+      }
     } else {
       await restampNotCovered(env, ticker, nowIso);
       result.restamped++;

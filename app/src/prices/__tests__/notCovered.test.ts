@@ -554,7 +554,7 @@ describe('Kody review follow-ups (#2849)', () => {
     const row = srRow('ERRSTUCK');
     expect(row?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
     expect(row?.price_unavailable_reason).toBe(
-      'st_not_covered since 2026-10-23: ST fetch kept erroring for 72h while pending (peer 500 upstream)',
+      'st_not_covered since 2026-10-23: no price_checked_at progress for 72h while pending; last ST fetch errored (peer 500 upstream)',
     );
   });
 
@@ -634,5 +634,163 @@ describe('Kody review follow-ups (#2849)', () => {
     // Rule (a) still terminates the stage-2 repeat miss.
     expect(srRow('NPLUS1')?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
     expect(srRow('NPLUS2')?.price_unavailable).toBe(2);
+  });
+});
+
+describe('Kody follow-ups on #2849 (post-merge)', () => {
+  const noPace = async (): Promise<void> => {};
+  const OLD_TRADE = '2012-03-01';
+
+  function priceAtTrade(txId: string): unknown {
+    return (db.prepare('SELECT price_at_trade FROM tx_performance WHERE tx_id = ?').get(txId) as
+      | { price_at_trade: unknown }
+      | undefined)?.price_at_trade ?? null;
+  }
+
+  /** ST that prices the ticker again:  every requested day it has, newest first. */
+  function recoveredClient(calls: Array<{ from: string; to: string }>, failBackfill?: string): PriceClient {
+    return {
+      eodHistory: async (_symbol: string, from?: string, to?: string) => {
+        calls.push({ from: from ?? '', to: to ?? '' });
+        if (failBackfill && calls.length === 2) throw new Error(failBackfill);
+        const rows = [
+          { date: '2026-10-22', close: 42 },
+          { date: '2026-10-01', close: 40 },
+          { date: '2012-02-29', close: 10 },
+        ];
+        return rows.filter((r) => r.date >= (from ?? ''));
+      },
+      spxHistory: async () => [],
+    };
+  }
+
+  function seedRecoverable(ticker: string, txId: string): void {
+    seedTrade(txId, ticker, OLD_TRADE);
+    seedSr(ticker, {
+      priceUnavailable: 4,
+      priceCheckedAt: hoursAgoIso(100),
+      reason: 'st_not_covered since 2026-10-01: no price_checked_at progress for 72h while pending',
+    });
+  }
+
+  it('HIGH: a recovered ticker gets its full history, so trades older than the 30-day probe are priced', async () => {
+    seedRecoverable('RECOV', 't-old');
+    const calls: Array<{ from: string; to: string }> = [];
+
+    const res = await recheckNotCoveredPeerPrices(env, recoveredClient(calls), { now: NOW, pace: noPace });
+
+    expect(res).toMatchObject({ checked: 1, repriced: 1, backfilled: 1, aborted: false });
+    expect(calls).toHaveLength(2);
+    // First call is the bounded probe, second reaches back to the oldest trade.
+    expect(calls[0].from > '2026-09-01').toBe(true);
+    expect(calls[1].from <= OLD_TRADE).toBe(true);
+    expect(priceAtTrade('t-old')).toBe(10);
+    const row = srRow('RECOV');
+    expect(row?.price_unavailable).toBe(0);
+    expect(row?.latest_price_date).toBe('2026-10-22');
+  });
+
+  it('HIGH: a ticker whose window fits the probe makes no extra backfill call', async () => {
+    seedTrade('t-new', 'RECENT', '2026-10-10');
+    seedSr('RECENT', { priceUnavailable: 4, priceCheckedAt: hoursAgoIso(100) });
+    const calls: Array<{ from: string; to: string }> = [];
+
+    const res = await recheckNotCoveredPeerPrices(env, recoveredClient(calls), { now: NOW, pace: noPace });
+
+    expect(res).toMatchObject({ repriced: 1, backfilled: 0 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('HIGH: a failed backfill stops marking the ticker current, so the normal refresh re-selects it', async () => {
+    seedRecoverable('HALF', 't-half');
+    const calls: Array<{ from: string; to: string }> = [];
+
+    const res = await recheckNotCoveredPeerPrices(env, recoveredClient(calls, 'PEER_HTTP_500'), {
+      now: NOW,
+      pace: noPace,
+    });
+
+    expect(res).toMatchObject({ repriced: 1, backfilled: 0, aborted: false });
+    const row = srRow('HALF');
+    expect(row?.price_unavailable).toBe(0);
+    expect(row?.latest_price_date).toBeNull();
+
+    // The next normal refresh picks it up and fills the gap below the cache.
+    h.responses.set('HALF', [
+      { date: '2026-10-22', close: 42 },
+      { date: '2012-02-29', close: 10 },
+    ]);
+    await runPriceRefresh(env, { max: 10 });
+    expect(h.eodCalls.some((c) => c.symbol === 'HALF' && c.from <= OLD_TRADE)).toBe(true);
+    expect(priceAtTrade('t-half')).toBe(10);
+    expect(srRow('HALF')?.latest_price_date).toBe('2026-10-22');
+  });
+
+  it('HIGH: a fatal error on the backfill aborts the re-check and leaves the ticker re-selectable', async () => {
+    seedRecoverable('FATALB', 't-fb');
+    const calls: Array<{ from: string; to: string }> = [];
+
+    const res = await recheckNotCoveredPeerPrices(env, recoveredClient(calls, 'PEER_HTTP_401'), {
+      now: NOW,
+      pace: noPace,
+    });
+
+    expect(res.aborted).toBe(true);
+    expect(srRow('FATALB')?.latest_price_date).toBeNull();
+  });
+
+  it('the cause never claims an error streak from one marker', async () => {
+    seedTrade('t-corp2', 'CORP2');
+    seedSr('CORP2', { latestPriceDate: FRESH_THROUGH });
+    seedPrice('CORP2', FRESH_THROUGH);
+    seedTrade('t-one', 'ONEERR');
+    seedSr('ONEERR', { priceCheckedAt: hoursAgoIso(120), reason: `${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream` });
+
+    await markStuckPeerPriceTickersNotCovered(env, NOW);
+
+    const reason = String(srRow('ONEERR')?.price_unavailable_reason);
+    expect(reason).not.toMatch(/kept erroring|erroring for/);
+    expect(reason).toBe(
+      'st_not_covered since 2026-10-23: no price_checked_at progress for 72h while pending; last ST fetch errored (peer 500 upstream)',
+    );
+  });
+
+  describe('error marker writes only when it changes', () => {
+    function countUpdates(ticker: string): () => number {
+      db.exec(`CREATE TABLE IF NOT EXISTS _sr_updates (ticker TEXT);
+        CREATE TRIGGER IF NOT EXISTS _sr_upd AFTER UPDATE ON securities_ref
+        BEGIN INSERT INTO _sr_updates (ticker) VALUES (NEW.ticker); END;`);
+      return () =>
+        Number((db.prepare('SELECT COUNT(*) AS n FROM _sr_updates WHERE ticker = ?').get(ticker) as { n: number }).n);
+    }
+
+    it('the same error on the next run writes nothing to securities_ref', async () => {
+      seedTrade('t-w1', 'SAMEERR');
+      seedSr('SAMEERR', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
+      h.errors.set('SAMEERR', 'peer 500 upstream');
+      const updates = countUpdates('SAMEERR');
+
+      await runPriceRefresh(env, { max: 10 });
+      const afterFirst = updates();
+      expect(afterFirst).toBe(1);
+      await runPriceRefresh(env, { max: 10 });
+      expect(updates()).toBe(afterFirst);
+      expect(srRow('SAMEERR')?.price_unavailable_reason).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream`);
+      expect(srRow('SAMEERR')?.price_checked_at).toBe('2000-01-01T00:00:00Z');
+    });
+
+    it('a different error message still updates the marker', async () => {
+      seedTrade('t-w2', 'NEWERR');
+      seedSr('NEWERR', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
+      h.errors.set('NEWERR', 'peer 500 upstream');
+      const updates = countUpdates('NEWERR');
+
+      await runPriceRefresh(env, { max: 10 });
+      h.errors.set('NEWERR', 'peer 502 bad gateway');
+      await runPriceRefresh(env, { max: 10 });
+
+      expect(updates()).toBe(2);
+      expect(srRow('NEWERR')?.price_unavailable_reason).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 502 bad gateway`);
+    });
   });
 });

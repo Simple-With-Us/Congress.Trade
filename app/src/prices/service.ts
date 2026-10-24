@@ -112,8 +112,13 @@ export function stFetchErrorReason(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e ?? 'unknown');
   return (ST_FETCH_ERROR_REASON_PREFIX + msg).slice(0, 200);
 }
-/** Pending 72h+ with every attempt erroring while ST serves the rest (rule b). */
-export const NOT_COVERED_CAUSE_STUCK_ERRORING = 'ST fetch kept erroring for 72h while pending';
+/**
+ * Appended to the rule (b) cause when the LAST recorded outcome was an ST
+ * fetch error.  It says only what is known:  one marker proves the latest
+ * attempt failed, not an error streak, and price_checked_at measures the last
+ * completed check, not when the erroring started.
+ */
+export const NOT_COVERED_CAUSE_LAST_ERRORED = 'last ST fetch errored';
 
 /** `st_not_covered since <ISO date>: <cause>` — the since-date is kept when the daily re-check restamps. */
 export function notCoveredReason(now: Date, cause: string): string {
@@ -487,6 +492,12 @@ export interface TickerEodFetchPlan {
   to: string;
   /** securities_ref.price_unavailable before this fetch (0 when no row). */
   prevStage: number;
+  /**
+   * The window start before any `maxLookbackDays` clamp.  When it is earlier
+   * than `from`, the clamped window does NOT cover what the ticker's trades
+   * need, so a successful probe must be followed by a fetch from here.
+   */
+  fullFrom: string;
 }
 
 /**
@@ -543,11 +554,12 @@ export async function planTickerEodFetch(
   } else {
     from = isoDaysAgo(7, new Date(oldestTrade));
   }
+  const fullFrom = from;
   if (opts.maxLookbackDays != null) {
     const floor = isoDaysAgo(opts.maxLookbackDays);
     if (from < floor) from = floor;
   }
-  return { trades, from, to: today(), prevStage: Number(cached?.pu ?? 0) };
+  return { trades, from, fullFrom, to: today(), prevStage: Number(cached?.pu ?? 0) };
 }
 
 export interface TickerEodWriteOpts {
@@ -797,12 +809,16 @@ export async function runPriceRefresh(
       // stall clock stays honest), but record the error as the last outcome so
       // the not-covered sweep can tell "ST keeps erroring" from "ST had no data"
       // and say which one it was.  A later success or empty result overwrites it.
+      // Write only when the marker changes:  a ticker that keeps failing with
+      // the same error costs a read, not a securities_ref write, every run.
       if (!dryRun) {
+        const marker = stFetchErrorReason(e);
         await run(
           env.DB,
           `UPDATE securities_ref SET price_unavailable_reason = ?
-            WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
-          [stFetchErrorReason(e), ticker],
+            WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}
+              AND price_unavailable_reason IS NOT ?`,
+          [marker, ticker, marker],
         );
       }
       continue;

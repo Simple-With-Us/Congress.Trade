@@ -2,91 +2,63 @@
  * CT-2443:  the daily not-covered re-check keeps its own lane stamp, written
  * only when the re-check finished without aborting, so an abort (fatal ST
  * error or shutdown) retries on the next tick instead of the next UTC day.
+ *
+ * The lane policy is tested through `runNotCoveredRecheckLane` with a typed
+ * in-memory stamp store (no partial-Env cast).  The wiring into the stamped
+ * market-data fast path is covered in jobs.test.ts.
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Env } from '../shared/types.ts';
+import { describe, expect, it, vi } from 'vitest';
+import { type LaneStampEnv, runNotCoveredRecheckLane } from '../jobs.ts';
 
-const mocks = vi.hoisted(() => ({
-  buildPriceRefreshClient: vi.fn(),
-  recheckNotCoveredPeerPrices: vi.fn(),
-}));
+const RECHECK_KEY = 'jobs:daily:lastok:market-data-not-covered-recheck';
+const DAY = '2026-10-23';
 
-vi.mock('../prices/service', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../prices/service.ts')>()),
-  buildPriceRefreshClient: mocks.buildPriceRefreshClient,
-}));
-vi.mock('../prices/notCovered', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../prices/notCovered.ts')>()),
-  recheckNotCoveredPeerPrices: mocks.recheckNotCoveredPeerPrices,
-}));
-
-import { maybeRunDailyMarketDataJobs, maybeRunNotCoveredRecheck } from '../jobs.ts';
-
-function kvEnv(kv = new Map<string, string>()): Env {
+function memoryLaneStamps(kv = new Map<string, string>()): LaneStampEnv & { kv: Map<string, string> } {
   return {
+    kv,
     CONFIG_KV: {
-      async get(key: string) {
-        return kv.get(key) ?? null;
-      },
-      async put(key: string, value: string) {
+      get: async (key: string) => kv.get(key) ?? null,
+      put: async (key: string, value: string) => {
         kv.set(key, value);
       },
     },
-  } as unknown as Env;
+  };
 }
 
-const NOW = new Date('2026-10-23T15:00:00.000Z');
-const DAY = '2026-10-23';
-const result = (aborted: boolean) => ({ checked: 1, repriced: 0, restamped: 1, aborted, errors: [] });
-
-describe('maybeRunNotCoveredRecheck lane stamp', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.buildPriceRefreshClient.mockResolvedValue({
-      client: {},
-      fmpBudgeted: false,
-      pace: async () => {},
-    });
-  });
-
+describe('runNotCoveredRecheckLane stamp policy', () => {
   it('leaves the lane unstamped after an abort, so the next tick retries the same day', async () => {
-    const env = kvEnv();
-    mocks.recheckNotCoveredPeerPrices.mockResolvedValueOnce(result(true));
-    expect(await maybeRunNotCoveredRecheck(env, NOW, DAY)).toBe('aborted');
+    const env = memoryLaneStamps();
+    const recheck = vi.fn<() => Promise<{ aborted: boolean }>>()
+      .mockResolvedValueOnce({ aborted: true })
+      .mockResolvedValueOnce({ aborted: false });
 
-    mocks.recheckNotCoveredPeerPrices.mockResolvedValueOnce(result(false));
-    expect(await maybeRunNotCoveredRecheck(env, NOW, DAY)).toBe('ran');
-    expect(mocks.recheckNotCoveredPeerPrices).toHaveBeenCalledTimes(2);
+    expect(await runNotCoveredRecheckLane(env, DAY, recheck)).toBe('aborted');
+    expect(env.kv.has(RECHECK_KEY)).toBe(false);
+    expect(await runNotCoveredRecheckLane(env, DAY, recheck)).toBe('ran');
+    expect(env.kv.get(RECHECK_KEY)).toBe(DAY);
+    expect(recheck).toHaveBeenCalledTimes(2);
   });
 
   it('runs at most once per UTC day after a clean finish', async () => {
-    const env = kvEnv();
-    mocks.recheckNotCoveredPeerPrices.mockResolvedValue(result(false));
-    expect(await maybeRunNotCoveredRecheck(env, NOW, DAY)).toBe('ran');
-    expect(await maybeRunNotCoveredRecheck(env, NOW, DAY)).toBe('stamped');
-    expect(mocks.recheckNotCoveredPeerPrices).toHaveBeenCalledTimes(1);
+    const env = memoryLaneStamps();
+    const recheck = vi.fn(async () => ({ aborted: false }));
+
+    expect(await runNotCoveredRecheckLane(env, DAY, recheck)).toBe('ran');
+    expect(await runNotCoveredRecheckLane(env, DAY, recheck)).toBe('stamped');
+    expect(recheck).toHaveBeenCalledTimes(1);
+    // A new UTC day runs again.
+    expect(await runNotCoveredRecheckLane(env, '2026-10-24', recheck)).toBe('ran');
+    expect(recheck).toHaveBeenCalledTimes(2);
   });
 
   it('does not stamp when the re-check throws', async () => {
-    const env = kvEnv();
-    mocks.recheckNotCoveredPeerPrices.mockRejectedValueOnce(new Error('boom'));
-    expect(await maybeRunNotCoveredRecheck(env, NOW, DAY)).toBe('error');
-    mocks.recheckNotCoveredPeerPrices.mockResolvedValueOnce(result(false));
-    expect(await maybeRunNotCoveredRecheck(env, NOW, DAY)).toBe('ran');
-  });
+    const env = memoryLaneStamps();
+    const recheck = vi.fn<() => Promise<{ aborted: boolean }>>()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ aborted: false });
 
-  it('retries an aborted re-check from the stamped market-data fast path (Kody: no wait for the next UTC day)', async () => {
-    const kv = new Map<string, string>([
-      ['jobs:daily:lastok:market-data', DAY],
-      ['jobs:daily:lastok:market-data-price-catchup', DAY],
-    ]);
-    const env = kvEnv(kv);
-    mocks.recheckNotCoveredPeerPrices.mockResolvedValueOnce(result(false));
-    expect(await maybeRunDailyMarketDataJobs(env, NOW)).toBe('stamped');
-    expect(mocks.recheckNotCoveredPeerPrices).toHaveBeenCalledTimes(1);
-    expect(kv.get('jobs:daily:lastok:market-data-not-covered-recheck')).toBe(DAY);
-    // Once stamped, later ticks the same day do not re-run it.
-    expect(await maybeRunDailyMarketDataJobs(env, NOW)).toBe('stamped');
-    expect(mocks.recheckNotCoveredPeerPrices).toHaveBeenCalledTimes(1);
+    expect(await runNotCoveredRecheckLane(env, DAY, recheck)).toBe('error');
+    expect(env.kv.has(RECHECK_KEY)).toBe(false);
+    expect(await runNotCoveredRecheckLane(env, DAY, recheck)).toBe('ran');
   });
 });

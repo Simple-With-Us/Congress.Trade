@@ -581,6 +581,19 @@ describe('staggered daily lanes', () => {
     expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBe('2026-10-15');
   });
 
+  it('runs the not-covered re-check from the stamped fast path, so an aborted one retries the same day', async () => {
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-10-15'],
+      ['jobs:daily:lastok:market-data-price-catchup', '2026-10-15'],
+    ]);
+    const env = laneEnv(kv);
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('stamped');
+    // No price provider in this env, so the re-check is a clean no-op and stamps its own lane.
+    expect(kv.get('jobs:daily:lastok:market-data-not-covered-recheck')).toBe('2026-10-15');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+  });
+
   it('stays stamped when the corpus is current and the pending tail is small', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
