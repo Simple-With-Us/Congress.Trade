@@ -89,7 +89,13 @@ export const PRICE_UNAVAILABLE_NOT_COVERED = 4;
  * the exclusion cannot drift between the four copies. Unconditional — no TTL,
  * no binds.
  */
+const PRICE_NOT_COVERED_SQL_ALIASES: ReadonlySet<string> = new Set(['sr']);
+
 export function priceNotCoveredExclusionSql(srAlias = 'sr'): string {
+  // Interpolated into SQL:  only known table aliases, never caller text.
+  if (!PRICE_NOT_COVERED_SQL_ALIASES.has(srAlias)) {
+    throw new Error(`priceNotCoveredExclusionSql: unsupported SQL alias ${JSON.stringify(srAlias)}`);
+  }
   return `COALESCE(${srAlias}.price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`;
 }
 
@@ -99,6 +105,15 @@ export const NOT_COVERED_CAUSE_REPEAT_EMPTY = 'no EOD history after repeat re-ch
 export const NOT_COVERED_CAUSE_REPEAT_STALLED = 'stale listing after repeat re-check';
 /** Pending with no price_checked_at progress for 72h while the corpus is fresh (rule b). */
 export const NOT_COVERED_CAUSE_STUCK_PENDING = 'no price_checked_at progress for 72h while pending';
+
+/** Last-outcome marker for a non-fatal per-ticker ST fetch error (not a stage). */
+export const ST_FETCH_ERROR_REASON_PREFIX = 'st_fetch_error: ';
+export function stFetchErrorReason(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e ?? 'unknown');
+  return (ST_FETCH_ERROR_REASON_PREFIX + msg).slice(0, 200);
+}
+/** Pending 72h+ with every attempt erroring while ST serves the rest (rule b). */
+export const NOT_COVERED_CAUSE_STUCK_ERRORING = 'ST fetch kept erroring for 72h while pending';
 
 /** `st_not_covered since <ISO date>: <cause>` — the since-date is kept when the daily re-check restamps. */
 export function notCoveredReason(now: Date, cause: string): string {
@@ -470,6 +485,8 @@ export interface TickerEodFetchPlan {
   trades: Array<{ id: string; tx_date: string }>;
   from: string;
   to: string;
+  /** securities_ref.price_unavailable before this fetch (0 when no row). */
+  prevStage: number;
 }
 
 /**
@@ -490,6 +507,7 @@ export interface TickerEodFetchPlan {
 export async function planTickerEodFetch(
   env: Env,
   ticker: string,
+  opts: { maxLookbackDays?: number } = {},
 ): Promise<TickerEodFetchPlan | null> {
   const trades = await all<{ id: string; tx_date: string }>(
     env.DB,
@@ -500,10 +518,14 @@ export async function planTickerEodFetch(
   );
   if (trades.length === 0) return null;
 
-  const cached = await get<{ mn: string | null; mx: string | null }>(
+  // One round trip for the cache window AND the current negative-cache stage,
+  // so the refresh loop never re-reads securities_ref per ticker.
+  const cached = await get<{ mn: string | null; mx: string | null; pu: number | null }>(
     env.DB,
-    'SELECT MIN(date) AS mn, MAX(date) AS mx FROM price_eod WHERE ticker = ?',
-    [ticker],
+    `SELECT MIN(date) AS mn, MAX(date) AS mx,
+            (SELECT price_unavailable FROM securities_ref WHERE ticker = ?) AS pu
+       FROM price_eod WHERE ticker = ?`,
+    [ticker, ticker],
   );
   let oldestTrade: string | null = null;
   for (const t of trades) {
@@ -521,7 +543,11 @@ export async function planTickerEodFetch(
   } else {
     from = isoDaysAgo(7, new Date(oldestTrade));
   }
-  return { trades, from, to: today() };
+  if (opts.maxLookbackDays != null) {
+    const floor = isoDaysAgo(opts.maxLookbackDays);
+    if (from < floor) from = floor;
+  }
+  return { trades, from, to: today(), prevStage: Number(cached?.pu ?? 0) };
 }
 
 export interface TickerEodWriteOpts {
@@ -749,7 +775,7 @@ export async function runPriceRefresh(
     const nowIso = new Date().toISOString();
     const fetchPlan = await planTickerEodFetch(env, ticker);
     if (!fetchPlan) continue;
-    const { trades, from, to } = fetchPlan;
+    const { trades, from, to, prevStage } = fetchPlan;
     let hist: Close[] = [];
     try {
       await pace();
@@ -766,6 +792,18 @@ export async function runPriceRefresh(
         // completely untouched (no negative-cache write) for next time.
         result.aborted = true;
         break;
+      }
+      // Non-fatal per-ticker error:  leave stage and price_checked_at alone (the
+      // stall clock stays honest), but record the error as the last outcome so
+      // the not-covered sweep can tell "ST keeps erroring" from "ST had no data"
+      // and say which one it was.  A later success or empty result overwrites it.
+      if (!dryRun) {
+        await run(
+          env.DB,
+          `UPDATE securities_ref SET price_unavailable_reason = ?
+            WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
+          [stFetchErrorReason(e), ticker],
+        );
       }
       continue;
     }
@@ -788,12 +826,7 @@ export async function runPriceRefresh(
       // the 30-day re-check that ended in another miss) terminates at stage 4
       // (not covered by ST) instead of cycling 2 → 2 forever.
       if (!dryRun) {
-        const prev = await get<{ price_unavailable: number | null }>(
-          env.DB,
-          'SELECT price_unavailable FROM securities_ref WHERE ticker = ?',
-          [ticker],
-        );
-        if (Number(prev?.price_unavailable ?? 0) === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) {
+        if (prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) {
           await markTickerPriceUnavailable(
             env,
             ticker,
@@ -822,12 +855,7 @@ export async function runPriceRefresh(
     let stage = priceStalled ? PRICE_UNAVAILABLE_STALLED : 0;
     let reason: string | null = null;
     if (priceStalled) {
-      const prev = await get<{ price_unavailable: number | null }>(
-        env.DB,
-        'SELECT price_unavailable FROM securities_ref WHERE ticker = ?',
-        [ticker],
-      );
-      if (Number(prev?.price_unavailable ?? 0) === PRICE_UNAVAILABLE_STALLED) {
+      if (prevStage === PRICE_UNAVAILABLE_STALLED) {
         stage = PRICE_UNAVAILABLE_NOT_COVERED;
         reason = notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_STALLED);
       }

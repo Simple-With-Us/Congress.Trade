@@ -90,7 +90,8 @@ function unavailableExclusionSql(): string {
  * or current prices are stale for excess-return display.
  */
 export async function buildPriceNeedsExport(
-  env: Env,
+  // Only the D1 binding is read, so callers (and tests) need not build a full Env.
+  env: Pick<Env, 'DB'>,
   query: PriceNeedsQuery,
   now: Date = new Date(),
 ): Promise<PriceNeedsExport> {

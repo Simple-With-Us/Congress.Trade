@@ -5,7 +5,7 @@
  * history for performance-vs-S&P, with pagination and unavailable TTL exclusion.
  */
 import { afterEach, describe, it, expect } from 'vitest';
-import { openMigratedD1 } from '../../prices/__tests__/sqliteD1.ts';
+import { d1OnlyEnv, openMigratedD1 } from '../../prices/__tests__/sqliteD1.ts';
 import { buildPriceNeedsExport, parsePriceNeedsQuery } from '../priceNeeds.ts';
 import { buildExportRouter } from '../routes.ts';
 import { resolveSecrets } from '../../secrets/infisical.ts';
@@ -167,7 +167,7 @@ describe('buildPriceNeedsExport', () => {
 
     seedTrade(db, { id: 'nc2', ticker: 'VISIBLE', txDate: '2020-01-01' });
 
-    const env = { DB: d1 } as never;
+    const env: Parameters<typeof buildPriceNeedsExport>[0] = d1OnlyEnv(d1);
     const out = await buildPriceNeedsExport(env, { limit: 50, cursor: null }, NOW);
     expect(out.tickers.map((t) => t.ticker)).toEqual(['VISIBLE']);
   });

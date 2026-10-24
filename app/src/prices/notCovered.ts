@@ -20,7 +20,9 @@ import {
   lastTradingDay,
   markTickerPriceUnavailable,
   notCoveredReason,
+  NOT_COVERED_CAUSE_STUCK_ERRORING,
   NOT_COVERED_CAUSE_STUCK_PENDING,
+  ST_FETCH_ERROR_REASON_PREFIX,
   planTickerEodFetch,
   PRICE_UNAVAILABLE_NOT_COVERED,
   writeTickerEodHistory,
@@ -37,6 +39,8 @@ import { isCurrentPriceFresh } from './staleness.ts';
 export const ST_NOT_COVERED_STUCK_HOURS = 72;
 /** Sweep safety cap: more qualifiers than this is an outage, not a coverage gap — mark none. */
 export const ST_NOT_COVERED_MAX_BATCH = 50;
+/** Re-check probe window (days) for stage-4 tickers. */
+export const NOT_COVERED_RECHECK_LOOKBACK_DAYS = 30;
 /** Stage-4 tickers retried per daily re-check, oldest price_checked_at first. */
 export const NOT_COVERED_RECHECK_MAX_TICKERS = 200;
 
@@ -84,9 +88,9 @@ export async function markStuckPeerPriceTickersNotCovered(
   }
   const params = stPeerPricePendingBindParams(now);
   const stuckCutoff = new Date(now.getTime() - ST_NOT_COVERED_STUCK_HOURS * 3_600_000).toISOString();
-  const rows = await all<{ ticker: string }>(
+  const rows = await all<{ ticker: string; last_reason: string | null }>(
     env.DB,
-    `SELECT DISTINCT t.ticker AS ticker ${stPeerPricePendingFromSql()}
+    `SELECT DISTINCT t.ticker AS ticker, sr.price_unavailable_reason AS last_reason ${stPeerPricePendingFromSql()}
        AND sr.price_checked_at IS NOT NULL
        AND sr.price_checked_at < ?
      ORDER BY t.ticker ASC
@@ -100,8 +104,17 @@ export async function markStuckPeerPriceTickersNotCovered(
     return { marked: 0, qualified: rows.length };
   }
   const nowIso = now.toISOString();
-  const reason = notCoveredReason(now, NOT_COVERED_CAUSE_STUCK_PENDING);
-  for (const { ticker } of rows) {
+  for (const { ticker, last_reason } of rows) {
+    // Say WHY:  a ticker whose last recorded outcome is an ST fetch error is
+    // marked as erroring (with the error), not as "no data".  Either way the
+    // daily re-check retries it, so a recovered ST reprices it within a day.
+    const lastError = last_reason?.startsWith(ST_FETCH_ERROR_REASON_PREFIX)
+      ? last_reason.slice(ST_FETCH_ERROR_REASON_PREFIX.length)
+      : null;
+    const reason = notCoveredReason(
+      now,
+      lastError ? `${NOT_COVERED_CAUSE_STUCK_ERRORING} (${lastError})` : NOT_COVERED_CAUSE_STUCK_PENDING,
+    );
     await markTickerPriceUnavailable(env, ticker, reason, {
       checkedAt: nowIso,
       stage: PRICE_UNAVAILABLE_NOT_COVERED,
@@ -174,8 +187,20 @@ export async function recheckNotCoveredPeerPrices(
       result.aborted = true;
       break;
     }
-    const fetchPlan = await planTickerEodFetch(env, ticker);
-    if (!fetchPlan) continue;
+    // Bounded probe:  stage-4 tickers are known-unpriceable, so a recent window
+    // is enough to see that ST started pricing one.  A cold cache would
+    // otherwise re-request years of daily bars every day.  After a reprice the
+    // normal refresh backfills older history (gap-below-cache branch).
+    const fetchPlan = await planTickerEodFetch(env, ticker, {
+      maxLookbackDays: NOT_COVERED_RECHECK_LOOKBACK_DAYS,
+    });
+    if (!fetchPlan) {
+      // No dated trade to price from:  rotate the oldest-first window like the
+      // error path, or this row holds one of the daily slots forever.
+      await restampNotCovered(env, ticker, nowIso);
+      result.restamped++;
+      continue;
+    }
     let hist;
     try {
       await pace();

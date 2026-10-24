@@ -46,10 +46,13 @@ import type { PriceClient } from '../fmp.ts';
 import {
   lastTradingDay,
   PRICE_UNAVAILABLE_NOT_COVERED,
+  priceNotCoveredExclusionSql,
   runPriceRefresh,
+  ST_FETCH_ERROR_REASON_PREFIX,
 } from '../service.ts';
 import {
   markStuckPeerPriceTickersNotCovered,
+  NOT_COVERED_RECHECK_LOOKBACK_DAYS,
   recheckNotCoveredPeerPrices,
   ST_NOT_COVERED_MAX_BATCH,
   ST_NOT_COVERED_STUCK_HOURS,
@@ -514,5 +517,122 @@ describe('health metrics carry the not-covered count', () => {
     expect(after.notCovered).toBe(15);
     expect(after.detail).toContain('; 15 not covered by ST');
     expect(stPeerPricesMetricsToCheck(after).status).toBe('ok');
+  });
+});
+
+describe('Kody review follow-ups (#2849)', () => {
+  const noPace = async (): Promise<void> => {};
+  function seedFreshCorpus(): void {
+    seedTrade('t-corp', 'CORP');
+    seedSr('CORP', { latestPriceDate: FRESH_THROUGH });
+    seedPrice('CORP', FRESH_THROUGH);
+  }
+
+  it('#1 a non-fatal ST error records the error as the last outcome, leaving stage and price_checked_at alone', async () => {
+    seedTrade('t-e1', 'ERRS');
+    seedSr('ERRS', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
+    h.errors.set('ERRS', 'peer 500 upstream');
+
+    await runPriceRefresh(env, { max: 10 });
+
+    const row = srRow('ERRS');
+    expect(row?.price_unavailable).toBe(1);
+    expect(row?.price_checked_at).toBe('2000-01-01T00:00:00Z');
+    expect(String(row?.price_unavailable_reason)).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream`);
+  });
+
+  it('#1 the sweep names a persistent ST error as the not-covered cause', async () => {
+    seedFreshCorpus();
+    seedTrade('t-e2', 'ERRSTUCK');
+    seedSr('ERRSTUCK', {
+      priceCheckedAt: hoursAgoIso(80),
+      reason: `${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream`,
+    });
+
+    expect(await markStuckPeerPriceTickersNotCovered(env, NOW)).toEqual({ marked: 1, qualified: 1 });
+
+    const row = srRow('ERRSTUCK');
+    expect(row?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
+    expect(row?.price_unavailable_reason).toBe(
+      'st_not_covered since 2026-10-23: ST fetch kept erroring for 72h while pending (peer 500 upstream)',
+    );
+  });
+
+  it('#1 a later successful fetch clears the error marker', async () => {
+    seedTrade('t-e3', 'RECOVER');
+    seedSr('RECOVER', { reason: `${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream` });
+    h.responses.set('RECOVER', [{ date: FRESH_THROUGH, close: 12 }]);
+
+    await runPriceRefresh(env, { max: 10 });
+
+    const row = srRow('RECOVER');
+    expect(row?.price_unavailable).toBe(0);
+    expect(row?.price_unavailable_reason).toBeNull();
+  });
+
+  it('#2 a stage-4 ticker with no trades to plan is restamped, not left at its old price_checked_at', async () => {
+    seedSr('NOTRADES', { priceUnavailable: 4, priceCheckedAt: hoursAgoIso(100) });
+    const calls: string[] = [];
+    const client: PriceClient = {
+      eodHistory: async (symbol: string) => {
+        calls.push(symbol);
+        return [];
+      },
+      spxHistory: async () => [],
+    };
+
+    const res = await recheckNotCoveredPeerPrices(env, client, { now: NOW, pace: noPace });
+
+    // No ST call is made (checked counts ST probes), but the row still rotates.
+    expect(res).toMatchObject({ checked: 0, repriced: 0, restamped: 1 });
+    expect(calls).toEqual([]);
+    expect(srRow('NOTRADES')?.price_checked_at).toBe(NOW.toISOString());
+    expect(srRow('NOTRADES')?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
+  });
+
+  it('#3 the re-check asks ST for a bounded window, not full history from the first trade', async () => {
+    expect(NOT_COVERED_RECHECK_LOOKBACK_DAYS).toBe(30);
+    seedTrade('t-w1', 'OLDTRADE', '2012-03-01');
+    seedSr('OLDTRADE', { priceUnavailable: 4, priceCheckedAt: hoursAgoIso(100) });
+    const froms: string[] = [];
+    const client: PriceClient = {
+      eodHistory: async (_symbol: string, from?: string) => {
+        froms.push(from ?? '');
+        return [];
+      },
+      spxHistory: async () => [],
+    };
+
+    await recheckNotCoveredPeerPrices(env, client, { now: NOW, pace: noPace });
+
+    expect(froms).toHaveLength(1);
+    const ageDays = (Date.now() - new Date(`${froms[0]}T00:00:00Z`).getTime()) / 86_400_000;
+    expect(ageDays).toBeLessThanOrEqual(NOT_COVERED_RECHECK_LOOKBACK_DAYS + 1);
+  });
+
+  it('#5 the exclusion SQL helper rejects any alias outside the allowlist', () => {
+    expect(priceNotCoveredExclusionSql('sr')).toContain('sr.price_unavailable');
+    expect(() => priceNotCoveredExclusionSql('sr) OR 1=1 --')).toThrow();
+    expect(() => priceNotCoveredExclusionSql('t')).toThrow();
+  });
+
+  it('#6 the refresh loop reads the previous stage from the plan query, with no per-ticker stage lookup', async () => {
+    seedTrade('t-n1', 'NPLUS1');
+    seedSr('NPLUS1', { priceUnavailable: 2, priceCheckedAt: '2000-01-01T00:00:00Z' });
+    seedTrade('t-n2', 'NPLUS2');
+    seedSr('NPLUS2', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
+    const sqls: string[] = [];
+    const realPrepare = env.DB.prepare.bind(env.DB);
+    env.DB.prepare = ((sql: string) => {
+      sqls.push(sql.replace(/\s+/g, ' ').trim());
+      return realPrepare(sql);
+    }) as typeof env.DB.prepare;
+
+    await runPriceRefresh(env, { max: 10 });
+
+    expect(sqls.filter((q) => /^SELECT price_unavailable FROM securities_ref WHERE ticker = \?$/.test(q))).toEqual([]);
+    // Rule (a) still terminates the stage-2 repeat miss.
+    expect(srRow('NPLUS1')?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
+    expect(srRow('NPLUS2')?.price_unavailable).toBe(2);
   });
 });
