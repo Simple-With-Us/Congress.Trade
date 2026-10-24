@@ -47,7 +47,12 @@ export function getDenoHttpClient(proxyUrl?: string): unknown | undefined {
       client = Deno.createHttpClient({ proxy: { url: cleanUrl } });
       clientCache.set(cleanUrl, client);
     } catch (err) {
-      console.warn(`proxyFetch: failed to create Deno HTTP client for ${cleanUrl}:`, (err as Error).message);
+      // The proxy URL can carry credentials as userinfo; never log them.
+      const redact = (s: string) => s.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
+      console.warn(
+        `proxyFetch: failed to create Deno HTTP client for ${redact(cleanUrl)}:`,
+        redact((err as Error).message ?? String(err)),
+      );
       return undefined;
     }
   }

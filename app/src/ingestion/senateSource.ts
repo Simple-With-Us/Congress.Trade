@@ -41,6 +41,7 @@ import {
   SenateHttpError,
   SenateProxyEgressError,
   isSenateEdgeDeniedError,
+  logSafeHeaderToken,
   sanitizeEfdTransportError,
   senateEfdTransportScrubSecrets,
 } from './senateEdgeDeny.ts';
@@ -800,7 +801,7 @@ export async function fetchSenatePtrFilings(
         // send the edge another agreement POST, so it surfaces as is.
         if (useCached && !handshakeDone && !isSenateEdgeDeniedError(failure)) {
           console.warn(
-            `watcher: senate cached session invalid (HTTP ${data.status} ${contentType}, server=${server || 'unknown'}), retrying handshake`,
+            `watcher: senate cached session invalid (HTTP ${data.status} ${logSafeHeaderToken(contentType)}, server=${logSafeHeaderToken(server)}), retrying handshake`,
           );
           if (sessionKv) {
             await sessionKv.delete(SENATE_SESSION_KV_KEY).catch(() => {});
@@ -809,7 +810,7 @@ export async function fetchSenatePtrFilings(
           break;
         }
         if (failure) throw failure;
-        throw new Error(`senate POST report/data/ -> unexpected content-type ${contentType} (server=${server || 'unknown'})`);
+        throw new Error(`senate POST report/data/ -> unexpected content-type ${logSafeHeaderToken(contentType)} (server=${logSafeHeaderToken(server)})`);
       }
 
       const json = (await data.json()) as { data?: unknown; recordsFiltered?: unknown };

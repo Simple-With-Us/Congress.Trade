@@ -435,3 +435,14 @@ describe('sweepPollingHeartbeat during an edge-deny backoff', () => {
     expect(res.alerted).toEqual(['senate']);
   });
 });
+
+describe('SenateHttpError message (CT-2442)', () => {
+  it('reduces the upstream Server header to a short log-safe token', () => {
+    const err = new SenateHttpError('GET /search/', 502, 'evil<script>{"tok":"x"}' + 'A'.repeat(80));
+    const server = /\(server=([^)]*)\)$/.exec(err.message)?.[1] ?? '';
+    expect(server).toMatch(/^evilscripttokxA+$/);
+    expect(server.length).toBe(40);
+    expect(err.message.length).toBeLessThan(90);
+    expect(err.failureClass).toBe('http');
+  });
+});

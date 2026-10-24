@@ -52,6 +52,12 @@ export function classifySenateHttpFailure(
   return 'http';
 }
 
+/** A response header (Server, Content-Type) as a short log-safe token: it is upstream text. */
+export function logSafeHeaderToken(value: string | null): string {
+  const token = (value ?? '').replace(/[^A-Za-z0-9._/ -]/g, '').trim().slice(0, 40);
+  return token || 'unknown';
+}
+
 function formatSenateHttpError(
   step: string,
   status: number,
@@ -59,7 +65,7 @@ function formatSenateHttpError(
   opts: { body?: string; detail?: string },
 ): string {
   const failureClass = classifySenateHttpFailure(status, server, opts.body ?? '');
-  return `senate ${step} -> HTTP ${status}${opts.detail ? ` ${opts.detail}` : ''} (server=${server || 'unknown'})`
+  return `senate ${step} -> HTTP ${status}${opts.detail ? ` ${opts.detail}` : ''} (server=${logSafeHeaderToken(server)})`
     + (failureClass === 'edge_denied' ? ' [edge_denied]' : '');
 }
 
@@ -88,12 +94,6 @@ export function isSenateEdgeDeniedError(err: unknown): err is SenateHttpError {
   return err instanceof SenateHttpError && err.failureClass === 'edge_denied';
 }
 
-/** The Server header as a short log-safe token: it is upstream text. */
-function logSafeServer(server: string | null): string {
-  const token = (server ?? '').replace(/[^A-Za-z0-9._/ -]/g, '').trim().slice(0, 40);
-  return token || 'unknown';
-}
-
 /**
  * An edge deny restated from its classified fields alone, for the logs, the
  * source_attempts receipt and the backoff reason, e.g. `senate POST
@@ -102,12 +102,12 @@ function logSafeServer(server: string | null): string {
  * text; this never does.
  */
 export function senateEdgeDenyReason(err: SenateHttpError): string {
-  return `senate ${err.step} -> HTTP ${err.status} (server=${logSafeServer(err.server)}) [${err.failureClass}]`;
+  return `senate ${err.step} -> HTTP ${err.status} (server=${logSafeHeaderToken(err.server)}) [${err.failureClass}]`;
 }
 
 /** The same classified fields as key=value pairs for a log line. */
 export function senateEdgeDenyLogFields(err: SenateHttpError): string {
-  return `source=senate class=${err.failureClass} step="${err.step}" status=${err.status} server=${logSafeServer(err.server)}`;
+  return `source=senate class=${err.failureClass} step="${err.step}" status=${err.status} server=${logSafeHeaderToken(err.server)}`;
 }
 
 /**

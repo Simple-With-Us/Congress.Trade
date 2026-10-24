@@ -18,6 +18,7 @@ import {
 import {
   classifySenateHttpFailure,
   isSenateEdgeBackoffActive,
+  logSafeHeaderToken,
   readSenateEdgeBackoff,
   sanitizeEfdTransportError,
   senateEfdTransportScrubSecrets,
@@ -347,10 +348,10 @@ function classifyEfdFailure(
   if (classifySenateHttpFailure(status, server, body) === 'edge_denied') {
     return {
       ...base, ok: false, state: 'blocked', status, step,
-      error: `eFD edge denied (Akamai Access Denied, server=${server || 'unknown'})`,
+      error: `eFD edge denied (Akamai Access Denied, server=${logSafeHeaderToken(server)})`,
     };
   }
-  return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status} (server=${server || 'unknown'})` };
+  return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status} (server=${logSafeHeaderToken(server)})` };
 }
 
 /**
