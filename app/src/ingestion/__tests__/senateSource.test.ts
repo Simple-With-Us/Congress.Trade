@@ -3,12 +3,17 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Node has no Deno.createHttpClient, so the real createProxiedFetch hands back
 // the base fetch and a test could not tell the two egresses apart.  Tag
 // proxied calls the way the real wrapper does: an extra `client` on init.
+// getDenoHttpClient gives a client for every proxy URL except NO_CLIENT_PROXY,
+// which stands for a proxy whose client cannot be created.
+const { NO_CLIENT_PROXY } = vi.hoisted(() => ({ NO_CLIENT_PROXY: 'http://no-client.test:8888' }));
 vi.mock('../../shared/proxyFetch.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../shared/proxyFetch.ts')>();
   return {
     ...actual,
+    getDenoHttpClient: (proxyUrl?: string) =>
+      proxyUrl?.trim() && proxyUrl.trim() !== NO_CLIENT_PROXY ? { proxyUrl } : undefined,
     createProxiedFetch: (proxyUrl?: string, baseFetch: typeof fetch = globalThis.fetch) =>
-      proxyUrl
+      proxyUrl && proxyUrl.trim() !== NO_CLIENT_PROXY
         ? ((input: RequestInfo | URL, init?: RequestInit) =>
             baseFetch(input, { ...init, client: { proxyUrl } } as RequestInit)) as typeof fetch
         : baseFetch,
@@ -551,6 +556,49 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       expect(kv.put).not.toHaveBeenCalled();
     });
 
+    it('fails closed on an agreement 200 page too long to check, without reading it all', async () => {
+      const kv = memoryKv();
+      let pulled = 0;
+      let cancelled = false;
+      const chunk = new TextEncoder().encode('<div>'.repeat(16 * 1024));
+      const page = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulled += 1;
+          if (pulled > 100) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }, { highWaterMark: 0 });
+      const { fetchImpl } = handshake(() =>
+        new Response(page, { status: 200, headers: { 'set-cookie': 'sessionid=sess; Path=/', server: 'gunicorn' } }));
+
+      const err = await establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SenateHttpError);
+      expect((err as Error).message).toBe(
+        'senate POST /search/home/ -> HTTP 200 page longer than 262144 chars, not checked (server=gunicorn)',
+      );
+      expect(kv.put).not.toHaveBeenCalled();
+      // 8 MB on offer, 80 KB per chunk: stops just past 256 KB.
+      expect(pulled).toBeLessThanOrEqual(5);
+      expect(cancelled).toBe(true);
+    });
+
+    it('still finds the agreement form deep inside a long page (past the first 4 KB, inside 256 KB)', async () => {
+      const kv = memoryKv();
+      const wall = `<html><head>${'<meta name="pad">'.repeat(8_000)}</head><body>`
+        + '<form id="agreement_form"><input type="checkbox" name="prohibition_agreement" value="1"></form></body></html>';
+      const { fetchImpl } = handshake(() =>
+        new Response(wall, { status: 200, headers: { server: 'gunicorn', 'content-type': 'text/html' } }));
+
+      await expect(establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl)).rejects.toThrow(
+        'senate POST /search/home/ -> HTTP 200 still shows the agreement form (server=gunicorn)',
+      );
+      expect(kv.put).not.toHaveBeenCalled();
+    });
+
     it('names the Server header on a refused landing GET', async () => {
       const fetchImpl = (async () => new Response('busy', { status: 503, headers: { server: 'gunicorn' } })) as typeof fetch;
       await expect(establishSenateSession({ politeDelayMs: 0 }, fetchImpl)).rejects.toThrow(
@@ -694,16 +742,68 @@ describe('Senate eFD edge deny (CT-2442)', () => {
         && /senate proxy gave no HTTP answer within 20ms/.test(String(detail)))).toBe(true);
     });
 
-    it('keeps a slow but answering proxy: the deadline only covers the first answer', async () => {
+    it('falls back to direct when the proxy answers the landing GET and then black-holes the agreement POST', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const calls: Call[] = [];
       const answers = efd(calls, () => undefined);
       const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-        // Every answer after the first takes longer than the first-answer deadline.
-        if (calls.length > 0) await new Promise((resolve) => setTimeout(resolve, 60));
+        const proxied = Boolean((init as { client?: unknown } | undefined)?.client);
+        if (proxied && String(input).endsWith('/search/home/')) {
+          recordCall(calls, input, init);
+          return hangUntilAborted(init?.signal);
+        }
+        return answers(input, init);
+      }) as typeof fetch;
+      const budget = new AbortController();
+
+      const out = await fetchSenatePtrFilings(
+        { ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 20, signal: budget.signal },
+        fetchImpl,
+      );
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        'proxy GET /search/',
+        'proxy POST /search/home/',
+        'direct GET /search/',
+        'direct POST /search/home/',
+        'direct POST /search/report/data/',
+      ]);
+      expect(warn.mock.calls.some(([msg, detail]) =>
+        /proxy unreachable; the direct fallback reached eFD/.test(String(msg))
+        && /senate proxy gave no HTTP answer within 20ms/.test(String(detail)))).toBe(true);
+    });
+
+    it('bounds the data POST through the proxy too', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: Call[] = [];
+      const answers = efd(calls, () => undefined);
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const proxied = Boolean((init as { client?: unknown } | undefined)?.client);
+        if (proxied && String(input).endsWith('/search/report/data/')) {
+          recordCall(calls, input, init);
+          return hangUntilAborted(init?.signal);
+        }
         return answers(input, init);
       }) as typeof fetch;
 
       const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 20 }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.map((c) => c.egress)).toEqual(['proxy', 'proxy', 'proxy', 'direct', 'direct', 'direct']);
+    });
+
+    it('keeps a proxy whose every answer beats the deadline, however long the whole leg takes', async () => {
+      const calls: Call[] = [];
+      const answers = efd(calls, () => undefined);
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        // 25 ms per answer under a 60 ms deadline: the leg takes longer than
+        // one deadline, but no single request does.
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        return answers(input, init);
+      }) as typeof fetch;
+
+      const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 60 }, fetchImpl);
 
       expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
       expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
@@ -711,6 +811,122 @@ describe('Senate eFD edge deny (CT-2442)', () => {
         'proxy POST /search/home/',
         'proxy POST /search/report/data/',
       ]);
+    });
+
+    it('never cuts a proxied body read short: the deadline covers only the wait for headers', async () => {
+      const calls: Call[] = [];
+      const answers = efd(calls, () => undefined);
+      const bytes = new TextEncoder().encode(JSON.stringify({
+        data: [['Jane', 'Smith', '<a href="/search/view/ptr/slow-1/">Smith, Jane</a>', 'Periodic Transaction Report', '10/23/2026']],
+        recordsFiltered: 1,
+      }));
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        if (!String(input).endsWith('/search/report/data/')) return answers(input, init);
+        recordCall(calls, input, init);
+        // Headers at once, the JSON body 80 ms later, past the 20 ms deadline.
+        // Like a real fetch, an abort of the request signal fails the body.
+        const signal = init?.signal;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const timer = setTimeout(() => {
+              controller.enqueue(bytes);
+              controller.close();
+            }, 80);
+            signal?.addEventListener('abort', () => {
+              clearTimeout(timer);
+              controller.error(signal.reason);
+            }, { once: true });
+          },
+        });
+        return new Response(body, { headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch;
+
+      const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 20 }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-slow-1']);
+      expect(calls.every((c) => c.egress === 'proxy')).toBe(true);
+    });
+
+    it('runs direct only, with the shared KV session, when no proxy client can be created', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: JSON.stringify({ csrfCookie: 'c', cookieHeader: 'csrftoken=c; sessionid=shared' }) });
+      const calls: Call[] = [];
+      const answers = efd(calls, () => undefined);
+      // Every answer takes 50 ms, past the 20 ms proxy answer deadline, and a
+      // request aborts as a real fetch would.
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 50);
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(init.signal!.reason);
+          }, { once: true });
+        });
+        return answers(input, init);
+      }) as typeof fetch;
+      const opts = { ...searchWindow, proxyUrl: NO_CLIENT_PROXY, proxyFirstAnswerTimeoutMs: 20, kv };
+
+      const first = await fetchSenatePtrFilings(opts, fetchImpl);
+      await fetchSenatePtrFilings(opts, fetchImpl);
+
+      expect(first.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      // Not a "proxy" leg on the base fetch, which would get the proxy's answer
+      // deadline and then a second, sessionless direct try: direct only,
+      // reusing the shared session as a direct-only egress does.
+      expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        'direct POST /search/report/data/',
+        'direct POST /search/report/data/',
+      ]);
+      expect(calls.every((c) => (c.cookie ?? '').includes('sessionid=shared'))).toBe(true);
+      // Logged once, without the proxy URL.
+      const lines = warn.mock.calls.filter(([msg]) => /proxy HTTP client could not be created/.test(String(msg)));
+      expect(lines).toHaveLength(1);
+      expect(lines[0].join(' ')).not.toContain('no-client.test');
+    });
+
+    it('scrubs a decoded proxy password from the warning using the proxy URL alone (no env)', async () => {
+      // Production resolves the proxy URL from Infisical into the env binding,
+      // so the process env has no username or password to match.
+      const proxyUrl = 'http://scrub-user:p%40ss-w0rd@10.2.3.4:8888';
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => {
+        if (c.egress === 'proxy') throw new TypeError('proxy auth failed for scrub-user with p@ss-w0rd');
+        return undefined;
+      });
+
+      await fetchSenatePtrFilings({ ...searchWindow, proxyUrl }, fetchImpl);
+
+      const line = warn.mock.calls.find(([msg]) => /proxy unreachable; the direct fallback reached eFD/.test(String(msg)));
+      expect(line).toBeDefined();
+      expect(String(line![1])).toBe('proxy auth failed for [redacted] with [redacted]');
+    });
+
+    it('reads only the start of a large error body and cancels the rest', async () => {
+      let pulled = 0;
+      let cancelled = false;
+      const chunk = new TextEncoder().encode(`${'x'.repeat(64 * 1024)}`);
+      const big = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulled += 1;
+          if (pulled > 64) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }, { highWaterMark: 0 });
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => (c.url.endsWith('/search/report/data/')
+        ? new Response(big, { status: 403, headers: { server: 'AkamaiGHost', 'content-type': 'text/html' } })
+        : undefined));
+
+      const err = await fetchSenatePtrFilings(searchWindow, fetchImpl).catch((e: unknown) => e);
+
+      expect(isSenateEdgeDeniedError(err)).toBe(true);
+      // 4 MB on offer; one 64 KB chunk covers the 4,096-char snippet.
+      expect(pulled).toBeLessThanOrEqual(2);
+      expect(cancelled).toBe(true);
     });
 
     it('does not fall back when the source budget itself runs out on the proxy leg', async () => {

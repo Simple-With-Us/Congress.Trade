@@ -11,6 +11,7 @@
  * edge-deny backoff is active (CT-2442).
  */
 
+import { z } from 'zod';
 import type { Env } from '../shared/types.ts';
 
 export const SENATE_EFD_HEALTH_KV_KEY = 'senate-efd:health';
@@ -46,14 +47,30 @@ export interface SenateEfdProbeRecord {
   lastDialedAt?: string | null;
 }
 
+/**
+ * Trust boundary for the cached probe record in CONFIG_KV.  `ok` and
+ * `checkedAt` are required, as before; a legacy direct-GET record (no
+ * `state`) still parses, and pipelineHealth ignores it.  A record with a
+ * wrong-typed field reads as no record, so the probe dials again (still
+ * subject to the edge-deny backoff).  Unknown fields are dropped.
+ */
+export const SenateEfdProbeRecordSchema = z.object({
+  ok: z.boolean(),
+  status: z.number().int().nullable().catch(null),
+  checkedAt: z.string(),
+  egress: z.string().nullish(),
+  error: z.string().nullish(),
+  state: z.enum(['ok', 'blocked', 'degraded']).optional(),
+  step: z.string().nullish(),
+  dialed: z.boolean().optional(),
+  lastDialedAt: z.string().nullish(),
+});
+
 export async function readSenateEfdProbe(env: Env): Promise<SenateEfdProbeRecord | null> {
   if (!env.CONFIG_KV) return null;
   try {
-    const raw = await env.CONFIG_KV.get(SENATE_EFD_HEALTH_KV_KEY, 'json');
-    if (!raw || typeof raw !== 'object') return null;
-    const rec = raw as SenateEfdProbeRecord;
-    if (typeof rec.ok !== 'boolean' || typeof rec.checkedAt !== 'string') return null;
-    return rec;
+    const parsed = SenateEfdProbeRecordSchema.safeParse(await env.CONFIG_KV.get(SENATE_EFD_HEALTH_KV_KEY, 'json'));
+    return parsed.success ? { ...parsed.data, status: parsed.data.status ?? null } : null;
   } catch {
     return null;
   }

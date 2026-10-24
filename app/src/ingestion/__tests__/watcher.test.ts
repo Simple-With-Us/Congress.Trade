@@ -769,11 +769,14 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
 
     expect(edgeLines(error)).toHaveLength(1);
     expect(edgeLines(warn)).toHaveLength(1);
-    const [line, detail] = edgeLines(error)[0];
-    expect(String(line)).toContain('Senate PTR discovery and document fetch are blocked while eFD refuses the agreement');
-    expect(String(line)).toContain(`next senate attempt after ${at(60).toISOString()} (60m backoff)`);
-    expect(detail).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]');
+    // One argument: the line itself, built from the classified fields.
+    expect(edgeLines(error)[0]).toHaveLength(1);
+    const line = String(edgeLines(error)[0][0]);
+    expect(line).toContain('Senate PTR discovery and document fetch are blocked while eFD refuses the agreement');
+    expect(line).toContain(`next senate attempt after ${at(60).toISOString()} (60m backoff)`);
+    expect(line).toContain('[source=senate class=edge_denied step="POST /search/home/" status=403 server=AkamaiGHost]');
     expect(String(edgeLines(warn)[0][0])).toContain('(2 in a row since');
+    expect(edgeLines(warn)[0]).toHaveLength(1);
 
     // A transient senate failure no longer claims a bulk path either.
     const other = fakeEnv();
@@ -786,6 +789,53 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
 
     const lines = [...warn.mock.calls, ...error.mock.calls].map(([msg]) => String(msg));
     expect(lines.some((msg) => /senate/.test(msg) && /bulk path/.test(msg))).toBe(false);
+  });
+
+  it('logs, stores and backs off on the classified fields only, never the raw error text (Kody, #2846)', async () => {
+    const { env, kv, dbRuns } = fakeEnv();
+    // An edge deny whose message carries upstream text and a credential.
+    const raw = new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost\r\n<x>', {
+      body: '<TITLE>Access Denied</TITLE>',
+      detail: 'via http://mango:hunter22@10.99.0.2:8888 <b>upstream page</b>',
+    });
+    expect(raw.message).toContain('hunter22');
+    mocks.fetchSenatePtrFilings.mockRejectedValue(raw);
+
+    await runWatcher(env, T0);
+    await runWatcher(env, at(61));
+
+    const lines = [...edgeLines(error), ...edgeLines(warn)];
+    expect(lines).toHaveLength(2);
+    for (const args of lines) {
+      expect(args).toHaveLength(1);
+      expect(String(args[0])).not.toMatch(/hunter22|mango|upstream page|<x>|\r/);
+      expect(String(args[0])).toContain('server=AkamaiGHostx');
+    }
+    const receipts = dbRuns
+      .filter((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate')
+      .map((r) => r.params[4]);
+    expect(receipts).toEqual([
+      'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]',
+      'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]',
+    ]);
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!).reason).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]');
+  });
+
+  it('scrubs proxy credentials from other senate failure text before logging or storing it', async () => {
+    const PROXY = 'http://mango-user:s3cr3t-pw@10.99.0.2:8888';
+    const { env, dbRuns } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
+    mocks.fetchSenatePtrFilings.mockRejectedValue(
+      new Error(`senate GET /search/ -> HTTP 429 via ${PROXY}/ (auth s3cr3t-pw rejected)`),
+    );
+
+    await runWatcher(env, T0);
+
+    const logged = [...warn.mock.calls, ...error.mock.calls].filter(([msg]) => /senate source/.test(String(msg)));
+    expect(logged).toHaveLength(1);
+    expect(logged[0][1]).toBe('senate GET /search/ -> HTTP 429 via [redacted]/ (auth [redacted] rejected)');
+    const receipt = dbRuns.find((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt?.params[4]).toBe('senate GET /search/ -> HTTP 429 via [redacted]/ (auth [redacted] rejected)');
+    expect(JSON.stringify([...warn.mock.calls, ...error.mock.calls])).not.toContain('s3cr3t-pw');
   });
 
   it('keeps the 600 s failure skip, not the long backoff, for an origin 403', async () => {

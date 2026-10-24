@@ -22,6 +22,7 @@
  *     restart does not reset it.
  */
 
+import { z } from 'zod';
 import type { Env } from '../shared/types.ts';
 
 /** `edge_denied` is persistent (long backoff); `http` is any other answer. */
@@ -87,18 +88,53 @@ export function isSenateEdgeDeniedError(err: unknown): err is SenateHttpError {
   return err instanceof SenateHttpError && err.failureClass === 'edge_denied';
 }
 
-/** Strip URL userinfo and configured proxy secrets before logging or persisting transport errors. */
-export function sanitizeEfdTransportError(err: unknown, secrets: Array<string | undefined> = []): string {
+/** The Server header as a short log-safe token: it is upstream text. */
+function logSafeServer(server: string | null): string {
+  const token = (server ?? '').replace(/[^A-Za-z0-9._/ -]/g, '').trim().slice(0, 40);
+  return token || 'unknown';
+}
+
+/**
+ * An edge deny restated from its classified fields alone, for the logs, the
+ * source_attempts receipt and the backoff reason, e.g. `senate POST
+ * /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]`.  The error's
+ * own message can carry a detail or a Server header with arbitrary upstream
+ * text; this never does.
+ */
+export function senateEdgeDenyReason(err: SenateHttpError): string {
+  return `senate ${err.step} -> HTTP ${err.status} (server=${logSafeServer(err.server)}) [${err.failureClass}]`;
+}
+
+/** The same classified fields as key=value pairs for a log line. */
+export function senateEdgeDenyLogFields(err: SenateHttpError): string {
+  return `source=senate class=${err.failureClass} step="${err.step}" status=${err.status} server=${logSafeServer(err.server)}`;
+}
+
+/**
+ * Scrub Senate eFD error text before it is logged or persisted.  Every
+ * configured secret is replaced first, wherever it appears and longest first,
+ * then any URL userinfo still left (`scheme://user:pass@` becomes
+ * `scheme://[redacted]@`), then the text is bounded.  Secrets go before the
+ * userinfo rewrite because the rewrite changes the text they must match: a
+ * whole proxy URL would no longer match, and a password with a raw `@` in it
+ * would be cut at that `@` and partly kept.
+ */
+export function sanitizeEfdTransportError(
+  err: unknown,
+  secrets: Array<string | undefined> = [],
+  maxChars = 200,
+): string {
   const raw = typeof err === 'string'
     ? err
     : err instanceof Error
       ? err.message
       : String(err ?? 'unknown');
-  let out = raw.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
-  for (const secret of secrets) {
-    if (secret && secret.length >= 3) out = out.split(secret).join('[redacted]');
-  }
-  return out.slice(0, 200);
+  const ordered = [...new Set(secrets.filter((s): s is string => typeof s === 'string' && s.length >= 3))]
+    .sort((a, b) => b.length - a.length);
+  let out = raw;
+  for (const secret of ordered) out = out.split(secret).join('[redacted]');
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
+  return out.slice(0, maxChars);
 }
 
 type SenateProxySecretEnv = Pick<
@@ -106,30 +142,73 @@ type SenateProxySecretEnv = Pick<
   'RESIDENTIAL_PROXY_URL' | 'SENATE_PROXY_URL' | 'RESIDENTIAL_PROXY_USERNAME' | 'RESIDENTIAL_PROXY_PASSWORD'
 >;
 
+function decodedForm(value: string): string | undefined {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return undefined; // A malformed escape: the raw form is the one to match.
+  }
+}
+
 /**
- * Proxy URL and credential values to scrub from Senate eFD transport errors:
- * the proxy URL in use, the `env` binding's proxy values when the caller has
- * one (the eFD health probe), and the process env's.
+ * A proxy URL and the credentials inside it: the URL, its userinfo, and the
+ * username and password each as written (percent-encoded) and decoded, since
+ * an error can echo either form.  The userinfo ends at the last `@` of the
+ * authority, as URL parsers read it, so a raw `@` in a password stays in it.
+ */
+function proxyUrlSecrets(value: string | undefined): string[] {
+  const url = value?.trim();
+  if (!url) return [];
+  const out = [url];
+  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(url)?.[1] ?? '';
+  const at = authority.lastIndexOf('@');
+  if (at > 0) {
+    const userinfo = authority.slice(0, at);
+    const colon = userinfo.indexOf(':');
+    const parts = colon >= 0 ? [userinfo.slice(0, colon), userinfo.slice(colon + 1)] : [userinfo];
+    out.push(userinfo);
+    for (const part of parts) out.push(part, decodedForm(part) ?? part);
+  }
+  try {
+    // The WHATWG parse, which Deno's own messages follow, can re-encode them.
+    const parsed = new URL(url);
+    for (const part of [parsed.username, parsed.password]) {
+      if (part) out.push(part, decodedForm(part) ?? part);
+    }
+  } catch {
+    /* not a URL a client could dial; the raw forms above are what can echo */
+  }
+  return out;
+}
+
+/**
+ * Proxy secrets to scrub from Senate eFD error text.  The main source is the
+ * proxy URL the caller actually dials (`proxyUrl`): production resolves it
+ * from Infisical into the `env` binding (deno/main.ts), not into the process
+ * env, so its parsed username and password are what make the list work.  The
+ * `env` binding's proxy values, when the caller has one, and the process
+ * env's are extras.
  */
 export function senateEfdTransportScrubSecrets(proxyUrl?: string, env?: SenateProxySecretEnv): string[] {
   const penv = typeof process !== 'undefined' ? process.env : undefined;
-  const secrets: string[] = [];
-  const url = proxyUrl?.trim();
-  if (url && url.length >= 3) secrets.push(url);
+  const secrets = [
+    ...proxyUrlSecrets(proxyUrl),
+    ...proxyUrlSecrets(env?.RESIDENTIAL_PROXY_URL),
+    ...proxyUrlSecrets(env?.SENATE_PROXY_URL),
+    ...proxyUrlSecrets(penv?.RESIDENTIAL_PROXY_URL),
+    ...proxyUrlSecrets(penv?.SENATE_PROXY_URL),
+  ];
   for (const v of [
-    env?.RESIDENTIAL_PROXY_URL,
-    env?.SENATE_PROXY_URL,
     env?.RESIDENTIAL_PROXY_USERNAME,
     env?.RESIDENTIAL_PROXY_PASSWORD,
-    penv?.RESIDENTIAL_PROXY_URL,
-    penv?.SENATE_PROXY_URL,
     penv?.RESIDENTIAL_PROXY_USERNAME,
     penv?.RESIDENTIAL_PROXY_PASSWORD,
   ]) {
     const t = v?.trim();
-    if (t && t.length >= 3) secrets.push(t);
+    // formatProxyUrl percent-encodes these into the composed URL.
+    if (t) secrets.push(t, encodeURIComponent(t));
   }
-  return secrets;
+  return [...new Set(secrets.filter((s) => s.length >= 3))];
 }
 
 /**
@@ -218,25 +297,40 @@ export function isSenateEdgeBackoffActive(
   return Number.isFinite(untilMs) && now.getTime() < untilMs + graceMs;
 }
 
+const isoInstant = z.string().refine((value) => Number.isFinite(Date.parse(value)));
+
+/**
+ * Trust boundary for the CONFIG_KV backoff record.  `consecutive`,
+ * `windowMs` and `until` must be valid or the record is no backoff at all;
+ * a bad optional field falls back on its own, as the writer's defaults do.
+ * Unknown fields are dropped.
+ */
+export const SenateEdgeBackoffRecordSchema = z.object({
+  consecutive: z.number().int().positive(),
+  windowMs: z.number().positive(),
+  until: isoInstant,
+  firstDeniedAt: isoInstant.optional().catch(undefined),
+  lastDeniedAt: isoInstant.optional().catch(undefined),
+  reason: z.string().transform((value) => value.slice(0, 300)).optional().catch(undefined),
+});
+
 /** Fail-soft read: a missing, malformed or unreadable key is no backoff. */
 export async function readSenateEdgeBackoff(env: Env): Promise<SenateEdgeBackoffState | null> {
   if (!env.CONFIG_KV) return null;
   try {
     const raw: unknown = await env.CONFIG_KV.get(SENATE_EDGE_BACKOFF_KV_KEY);
     if (!raw) return null;
-    const parsed: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (!parsed || typeof parsed !== 'object') return null;
-    const s = parsed as Partial<SenateEdgeBackoffState>;
-    if (typeof s.until !== 'string' || !Number.isFinite(Date.parse(s.until))) return null;
-    if (typeof s.consecutive !== 'number' || typeof s.windowMs !== 'number') return null;
-    const lastDeniedAt = typeof s.lastDeniedAt === 'string' ? s.lastDeniedAt : s.until;
+    const parsed = SenateEdgeBackoffRecordSchema.safeParse(typeof raw === 'string' ? JSON.parse(raw) : raw);
+    if (!parsed.success) return null;
+    const s = parsed.data;
+    const lastDeniedAt = s.lastDeniedAt ?? s.until;
     return {
       consecutive: s.consecutive,
-      firstDeniedAt: typeof s.firstDeniedAt === 'string' ? s.firstDeniedAt : lastDeniedAt,
+      firstDeniedAt: s.firstDeniedAt ?? lastDeniedAt,
       lastDeniedAt,
       windowMs: s.windowMs,
       until: s.until,
-      reason: typeof s.reason === 'string' ? s.reason : 'edge denied',
+      reason: s.reason ?? 'edge denied',
     };
   } catch {
     return null;

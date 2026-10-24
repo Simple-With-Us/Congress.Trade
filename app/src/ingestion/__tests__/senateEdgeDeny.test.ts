@@ -5,7 +5,7 @@
  * still read stalled (and say why), and the polling heartbeat must not page
  * that deliberate silence as a stuck cron.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import { evaluatePipelineSignals, type PipelineSignals } from '../../shared/pipelineHealth.ts';
 import { sweepPollingHeartbeat } from '../autonomySweeps.ts';
@@ -19,6 +19,8 @@ import {
   nextSenateEdgeBackoff,
   readSenateEdgeBackoff,
   sanitizeEfdTransportError,
+  senateEdgeDenyLogFields,
+  senateEdgeDenyReason,
   senateEfdTransportScrubSecrets,
   writeSenateEdgeBackoff,
 } from '../senateEdgeDeny.ts';
@@ -50,6 +52,64 @@ describe('sanitizeEfdTransportError', () => {
     const out = sanitizeEfdTransportError(new Error('407 from proxy for bind-user / bind-pass'), secrets);
     expect(out).not.toMatch(/bind-user|bind-pass/);
   });
+
+  // Kody on #2846: production resolves the proxy from Infisical into the env
+  // binding, so the process env holds no proxy values, and the userinfo
+  // rewrite used to run first and change the text the URL secret had to match.
+  describe('secrets from the proxy URL in use (CT-2442)', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('takes the username and password out of the proxy URL, raw and decoded, with no env at all', () => {
+      for (const key of ['RESIDENTIAL_PROXY_URL', 'SENATE_PROXY_URL', 'RESIDENTIAL_PROXY_USERNAME', 'RESIDENTIAL_PROXY_PASSWORD']) {
+        vi.stubEnv(key, '');
+      }
+      const secrets = senateEfdTransportScrubSecrets('http://mango-user:p%40ss%3Aw0rd@10.99.0.2:8888');
+      expect(secrets).toEqual(expect.arrayContaining([
+        'http://mango-user:p%40ss%3Aw0rd@10.99.0.2:8888',
+        'mango-user:p%40ss%3Aw0rd',
+        'mango-user',
+        'p%40ss%3Aw0rd',
+        'p@ss:w0rd',
+      ]));
+    });
+
+    it('redacts a password echoed outside a scheme://user:pass@ position', () => {
+      const secrets = senateEfdTransportScrubSecrets('http://mango-user:p%40ss-w0rd@10.99.0.2:8888');
+      const out = sanitizeEfdTransportError(
+        new TypeError('proxy CONNECT refused: 407 for user mango-user (password p@ss-w0rd, sent as p%40ss-w0rd)'),
+        secrets,
+      );
+      expect(out).toBe('proxy CONNECT refused: 407 for user [redacted] (password [redacted], sent as [redacted])');
+    });
+
+    it('redacts the userinfo of a URL, the configured one or any other', () => {
+      const proxyUrl = 'http://mango-user:s3cret-pw@10.99.0.2:8888';
+      const secrets = senateEfdTransportScrubSecrets(proxyUrl);
+      expect(sanitizeEfdTransportError(`tunnel via ${proxyUrl}/ failed`, secrets)).toBe('tunnel via [redacted]/ failed');
+      // Not configured, so not in the list: the userinfo rewrite still catches it.
+      expect(sanitizeEfdTransportError('tunnel via http://other:pw-9@10.0.0.7:3128/ failed', secrets))
+        .toBe('tunnel via http://[redacted]@10.0.0.7:3128/ failed');
+    });
+
+    it('substitutes the secrets before the userinfo rewrite, longest first', () => {
+      // A raw `@` in the password: the rewrite alone stops at that `@` and
+      // keeps the rest of the password.
+      const proxyUrl = 'http://mango-user:pa@ss-w0rd@10.99.0.2:8888';
+      expect(sanitizeEfdTransportError(`connect ${proxyUrl} refused`)).toContain('ss-w0rd');
+      const secrets = senateEfdTransportScrubSecrets(proxyUrl);
+      const out = sanitizeEfdTransportError(`connect ${proxyUrl} refused; retry with pa@ss-w0rd`, secrets);
+      expect(out).toBe('connect [redacted] refused; retry with [redacted]');
+      // Longest first: the whole URL goes as one, not cut up by its own password.
+      expect(sanitizeEfdTransportError(proxyUrl, ['pa@ss-w0rd', proxyUrl])).toBe('[redacted]');
+    });
+
+    it('bounds the text to maxChars, 200 by default', () => {
+      expect(sanitizeEfdTransportError('x'.repeat(5_000))).toHaveLength(200);
+      expect(sanitizeEfdTransportError('x'.repeat(5_000), [], 1_000)).toHaveLength(1_000);
+    });
+  });
 });
 
 describe('SenateProxyEgressError', () => {
@@ -62,8 +122,32 @@ describe('SenateProxyEgressError', () => {
       secrets,
     );
     expect(err.message).not.toMatch(/leak-user|leak-pass/);
-    expect(err.message).toContain('http://[redacted]@10.0.0.9:3128');
+    expect(err.message).toContain('(connect [redacted]/path refused)');
     expect(err.message).toContain('direct fallback failed: senate GET /search/ -> HTTP 403');
+  });
+});
+
+describe('senateEdgeDenyReason / senateEdgeDenyLogFields', () => {
+  it('restate an edge deny from its classified fields only', () => {
+    const err = new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost', {
+      detail: 'echo http://u:hunter22@10.99.0.2:8888 <script>',
+    });
+    expect(err.message).toContain('hunter22');
+    expect(senateEdgeDenyReason(err)).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]');
+    expect(senateEdgeDenyLogFields(err)).toBe(
+      'source=senate class=edge_denied step="POST /search/home/" status=403 server=AkamaiGHost',
+    );
+  });
+
+  it('keep an odd Server header to a short safe token', () => {
+    const err = new SenateHttpError('POST report/data/', 403, `AkamaiGHost\n<img src=x>${'z'.repeat(100)}`, {
+      body: '<TITLE>Access Denied</TITLE>',
+    });
+    const reason = senateEdgeDenyReason(err);
+    // Markup characters and the newline dropped, then cut to 40 characters.
+    expect(reason).toBe(`senate POST report/data/ -> HTTP 403 (server=AkamaiGHostimg srcx${'z'.repeat(21)}) [edge_denied]`);
+    expect(senateEdgeDenyReason(new SenateHttpError('GET /search/', 403, null, { body: '<TITLE>Access Denied</TITLE>' })))
+      .toBe('senate GET /search/ -> HTTP 403 (server=unknown) [edge_denied]');
   });
 });
 
@@ -129,6 +213,53 @@ describe('senate edge backoff state in CONFIG_KV', () => {
     expect(await readSenateEdgeBackoff(env)).toBeNull();
     kv.store.set(SENATE_EDGE_BACKOFF_KV_KEY, JSON.stringify({ until: 'never' }));
     expect(await readSenateEdgeBackoff(env)).toBeNull();
+  });
+
+  it('validates the record with a zod schema: malformed required fields read as no backoff', async () => {
+    const kv = memoryKv();
+    const env = { CONFIG_KV: kv } as unknown as Env;
+    const good = nextSenateEdgeBackoff(null, NOW, REASON);
+    const malformed: unknown[] = [
+      { ...good, consecutive: '1' },
+      { ...good, consecutive: 0 },
+      { ...good, consecutive: 1.5 },
+      { ...good, windowMs: -60_000 },
+      { ...good, windowMs: null },
+      { ...good, until: 12345 },
+      { ...good, until: 'not a date' },
+      [good],
+      'a string',
+      42,
+    ];
+    for (const value of malformed) {
+      kv.store.set(SENATE_EDGE_BACKOFF_KV_KEY, JSON.stringify(value));
+      expect(await readSenateEdgeBackoff(env), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  it('drops unknown fields and lets a bad optional field fall back on its own', async () => {
+    const kv = memoryKv();
+    const env = { CONFIG_KV: kv } as unknown as Env;
+    const good = nextSenateEdgeBackoff(null, NOW, REASON);
+    kv.store.set(SENATE_EDGE_BACKOFF_KV_KEY, JSON.stringify({
+      ...good,
+      lastDeniedAt: 'yesterday',
+      firstDeniedAt: 7,
+      reason: { html: '<b>x</b>' },
+      injected: '<script>',
+    }));
+
+    const read = await readSenateEdgeBackoff(env);
+
+    expect(read).toEqual({
+      consecutive: 1,
+      firstDeniedAt: good.until,
+      lastDeniedAt: good.until,
+      windowMs: good.windowMs,
+      until: good.until,
+      reason: 'edge denied',
+    });
+    expect(read).not.toHaveProperty('injected');
   });
 
   it('reports a failed save instead of pretending the backoff holds', async () => {

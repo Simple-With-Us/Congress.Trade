@@ -401,7 +401,10 @@ export async function fetchFiling(
           await markError(env, docId, message, lease);
           throw new IngestRetryError(message, waitSeconds + ingestBackoffSeconds(queueAttempt));
         }
-        const session = await establishSenateSession({ kv: env.CONFIG_KV }, effectiveFetch);
+        // The lease signal bounds the handshake like every other request
+        // here, so a hung proxy aborts it with the lease instead of holding
+        // the queue consumer.
+        const session = await establishSenateSession({ kv: env.CONFIG_KV, signal: lease?.signal }, effectiveFetch);
         retry = await trackedFetch(sourceUrl, {
           headers: { ...headers, cookie: session.cookieHeader },
           redirect: 'follow',

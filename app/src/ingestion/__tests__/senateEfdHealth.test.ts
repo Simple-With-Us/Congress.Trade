@@ -271,6 +271,50 @@ describe('refreshSenateEfdProxyProbe', () => {
   });
 });
 
+describe('readSenateEfdProbe trust boundary (Kody review, PR #2846)', () => {
+  const good = {
+    ok: true,
+    status: 302,
+    checkedAt: '2026-10-23T23:00:00.000Z',
+    egress: 'proxy',
+    error: null,
+    state: 'ok',
+    step: 'POST /search/home/',
+    dialed: true,
+    lastDialedAt: '2026-10-23T23:00:00.000Z',
+  };
+
+  it('validates the cached record with a zod schema and reads a malformed one as no record', async () => {
+    const { env, kv } = memEnv();
+    kv.set(SENATE_EFD_HEALTH_KV_KEY, JSON.stringify(good));
+    expect(await readSenateEfdProbe(env)).toEqual(good);
+
+    for (const bad of [
+      { ...good, ok: 'yes' },
+      { ...good, checkedAt: 7 },
+      { ...good, state: 'weird' },
+      { ...good, dialed: 'true' },
+      { ...good, error: { html: '<b>x</b>' } },
+      { ...good, lastDialedAt: 0 },
+      [good],
+      'text',
+    ]) {
+      kv.set(SENATE_EFD_HEALTH_KV_KEY, JSON.stringify(bad));
+      expect(await readSenateEfdProbe(env), JSON.stringify(bad)).toBeNull();
+    }
+  });
+
+  it('still reads a legacy direct-GET record and drops unknown fields', async () => {
+    const { env, kv } = memEnv();
+    kv.set(SENATE_EFD_HEALTH_KV_KEY, JSON.stringify({
+      ok: false, status: 403, checkedAt: '2026-10-15T12:00:00.000Z', egress: 'direct', error: 'HTTP 403', injected: '<script>',
+    }));
+    const rec = await readSenateEfdProbe(env);
+    expect(rec).toEqual({ ok: false, status: 403, checkedAt: '2026-10-15T12:00:00.000Z', egress: 'direct', error: 'HTTP 403' });
+    expect(rec).not.toHaveProperty('injected');
+  });
+});
+
 describe('eFD probe hardening (Kody review, PR #2850)', () => {
   it('never persists proxy credentials from a transport error', async () => {
     const { env, kv } = memEnv();

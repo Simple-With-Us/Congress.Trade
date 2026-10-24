@@ -150,6 +150,42 @@ describe('fetchFiling senate wall guard', () => {
     expect(new TextDecoder().decode(r2Puts[0].bytes)).toContain('filedReports');
   });
 
+  it('hands the queue lease signal to the handshake, so a hung proxy aborts with the lease (CT-2442)', async () => {
+    // The real handshake this time, over a proxy that never answers the landing GET.
+    const actual = await vi.importActual<typeof import('../senateSource.ts')>('../senateSource.ts');
+    mocks.establishSenateSession.mockImplementation(actual.establishSenateSession);
+    const { env, r2Puts } = envForSenateFetch();
+    const leaseController = new AbortController();
+    const lease = {
+      signal: leaseController.signal,
+      assertOwned: vi.fn(async () => {}),
+      renew: vi.fn(async () => {}),
+    };
+    const handshake: Array<{ method: string; path: string; signal: AbortSignal | null | undefined }> = [];
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/search/' || url.pathname === '/search/home/') {
+        handshake.push({ method: (init?.method ?? 'GET').toUpperCase(), path: url.pathname, signal: init?.signal });
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) reject(signal.reason);
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      }
+      return Promise.resolve(new Response(WALL_HTML, { status: 200, headers: { 'content-type': 'text/html' } }));
+    }));
+    setTimeout(() => leaseController.abort(new Error('durable queue lease is no longer owned')), 20);
+
+    const err = await fetchFiling(env, 'S-wall-1', 1, lease).catch((e: unknown) => e);
+
+    expect(mocks.establishSenateSession.mock.calls[0][0]).toMatchObject({ signal: leaseController.signal });
+    expect(handshake.map((h) => `${h.method} ${h.path}`)).toEqual(['GET /search/']);
+    expect(handshake[0].signal?.aborted).toBe(true);
+    expect(err).toBeInstanceOf(IngestRetryError);
+    expect((err as Error).message).toContain('durable queue lease is no longer owned');
+    expect(r2Puts).toHaveLength(0);
+  });
+
   it('defers the handshake while the watcher is backed off after an eFD edge deny (CT-2442)', async () => {
     const { env, kv, r2Puts, dbRuns } = envForSenateFetch();
     const until = new Date(Date.now() + 30 * 60_000).toISOString();

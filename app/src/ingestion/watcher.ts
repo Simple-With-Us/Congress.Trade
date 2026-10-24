@@ -43,9 +43,14 @@ import {
   isSenateEdgeDeniedError,
   nextSenateEdgeBackoff,
   readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEdgeDenyLogFields,
+  senateEdgeDenyReason,
+  senateEfdTransportScrubSecrets,
   SenateProxyEgressError,
   writeSenateEdgeBackoff,
   type SenateEdgeBackoffState,
+  type SenateHttpError,
 } from './senateEdgeDeny.ts';
 import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
@@ -595,9 +600,9 @@ async function recordSourceAttempt(
 /**
  * A source failure is "transient" when it reflects a recoverable upstream or
  * platform condition rather than a bug: anti-bot blocks (403), rate limits
- * (429), and transient D1/Workers platform limits. These recur on a normal
+ * (429), and transient D1/Workers platform limits.  These recur on a normal
  * cadence (e.g. the Senate efdsearch 403), so logging them at `error` floods
- * observability and buries genuine errors. We log them at `warn` instead; for
+ * observability and buries genuine errors.  We log them at `warn` instead; for
  * the House the daily bulk index keeps history complete regardless.  The
  * Senate has no bulk path, and a persistent eFD edge deny is not transient:
  * runWatcher handles that class (SenateHttpError `edge_denied`) before this
@@ -614,9 +619,21 @@ export function isTransientSourceError(message: string): boolean {
   );
 }
 
+/**
+ * Senate error text with the proxy secrets and URL userinfo scrubbed, for
+ * the logs and source_attempts (CT-2442).  It can carry proxy transport text
+ * or upstream detail.
+ */
+function scrubSenateErrorText(env: Env, err: unknown): string {
+  const secrets = senateEfdTransportScrubSecrets(env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL, env);
+  return sanitizeEfdTransportError(err, secrets, 1000);
+}
+
 /** Record a source-level failure without presenting it as a successful poll. */
 async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executive', nowIso: string, err: unknown): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = source === 'senate'
+    ? scrubSenateErrorText(env, err)
+    : err instanceof Error ? err.message : String(err);
   // A residential-proxy outage is an egress fault to act on, even when the
   // wrapped direct-fallback answer carries "HTTP 403".
   if (!(err instanceof SenateProxyEgressError) && isTransientSourceError(message)) {
@@ -641,25 +658,29 @@ async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executi
  * escalates to once per sustained outage.  The start of a whole-chamber
  * discovery outage belongs there once, and the repeats, at most one per
  * backoff window, are already paged by the polling_senate liveness alarm.
+ *
+ * Only the classified fields (source, failure class, step, HTTP status,
+ * Server header, the count and the next attempt) reach the log line, the
+ * receipt and the stored backoff reason, never the error's raw message.
  */
 async function recordSenateEdgeDenied(
   env: Env,
   now: Date,
-  err: unknown,
+  err: SenateHttpError,
   prev: SenateEdgeBackoffState | null,
 ): Promise<SenateEdgeBackoffState | null> {
-  const message = err instanceof Error ? err.message : String(err);
-  const next = nextSenateEdgeBackoff(prev, now, message);
+  const reason = senateEdgeDenyReason(err);
+  const next = nextSenateEdgeBackoff(prev, now, reason);
   const saved = await writeSenateEdgeBackoff(env, next);
   const plan = saved
     ? `next senate attempt after ${next.until} (${Math.round(next.windowMs / 60_000)}m backoff)`
     : 'the backoff could not be saved, so the 600s failure skip applies';
   const line = `watcher: senate eFD edge denied (${next.consecutive} in a row since ${next.firstDeniedAt}): `
     + 'Senate PTR discovery and document fetch are blocked while eFD refuses the agreement, '
-    + `and there is no alternate Senate discovery path; ${plan}:`;
-  if (next.consecutive === 1) console.error(line, message);
-  else console.warn(line, message);
-  await recordSourceAttempt(env, 'senate', now.toISOString(), 'failure', 0, message);
+    + `and there is no alternate Senate discovery path; ${plan} [${senateEdgeDenyLogFields(err)}]`;
+  if (next.consecutive === 1) console.error(line);
+  else console.warn(line);
+  await recordSourceAttempt(env, 'senate', now.toISOString(), 'failure', 0, reason);
   return saved ? next : null;
 }
 
