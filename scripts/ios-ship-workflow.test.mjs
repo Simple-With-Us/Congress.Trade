@@ -170,3 +170,53 @@ test("the push paths filter matches the native tree and not backend code", () =>
   assert.ok(!hit("app/src/deno/main.ts"), "backend-only commits must not ship a TestFlight build");
   assert.ok(!hit("docs/rollouts/2026-10-17-ios-autoship-reenable.md"));
 });
+
+// ---- App Store version preparation (AFC-517 / CT-2444) --------------------
+// A version can be prepared and attached to a build by a machine, but the
+// submission for review is a human decision.  Nothing here may create a
+// submission, and the inputs may never be interpolated into the script.
+
+test("the App Store version workflow prepares a version and never submits", () => {
+  const yml = read(".github/workflows/ios-appstore-version.yml");
+
+  assert.match(yml, /name: iOS App Store version \(prepare, never submits\)/);
+  assert.match(yml, /permissions:\s*\n\s+contents: read/);
+  assert.match(yml, /concurrency:\s*\n\s+group: ios-appstore-version-congress/);
+  assert.match(yml, /runs-on:\s*macos-latest/);
+  assert.match(yml, /timeout-minutes:\s*20/);
+  assert.match(yml, /github\.event\.repository\.fork == false/);
+  assert.match(yml, /actions\/checkout@[0-9a-f]{40}/);
+  assert.match(yml, /type: choice/);
+  assert.match(yml, /appstore-version-plan/);
+  assert.match(yml, /appstore-version-prepare/);
+
+  // The dispatch inputs reach the script through the environment.
+  assert.match(yml, /MODE: \$\{\{ inputs\.mode \}\}/);
+  assert.match(yml, /VERSION: \$\{\{ inputs\.version \}\}/);
+  assert.match(yml, /BUILD: \$\{\{ inputs\.build \}\}/);
+  // The inputs are validated before they are used.
+  assert.match(yml, /\^\[0-9\]/);
+  assert.match(yml, /\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+/);
+
+  // No submission endpoint, anywhere.
+  assert.doesNotMatch(yml, /appStoreVersionSubmissions|reviewSubmissions|reviewSubmissionItems/);
+  const api = read("scripts/ios-fleet/asc-api.mjs");
+  assert.doesNotMatch(api, /\/v1\/appStoreVersionSubmissions/);
+  assert.doesNotMatch(api, /\/v1\/reviewSubmissions/);
+  assert.doesNotMatch(api, /\/v1\/reviewSubmissionItems/);
+  // And no localization is written either.
+  assert.doesNotMatch(api, /appStoreVersionLocalizations.*method:\s*"POST"/);
+});
+
+test("ios-appstore-gm.yml can ship one exact marketing version", () => {
+  const yml = read(".github/workflows/ios-appstore-gm.yml");
+
+  assert.match(yml, /marketing_version:/);
+  assert.match(yml, /description: "Exact App Store version to build, e\.g\. 1\.0\.236\.  Empty = next patch automatically\."/);
+  // The input crosses the step boundary in the environment and is never
+  // interpolated into the script.
+  const uses = yml.match(/inputs\.marketing_version/g) || [];
+  assert.equal(uses.length, 1, "the marketing_version input is used exactly once");
+  assert.match(yml, /MARKETING_VERSION_INPUT: \$\{\{ inputs\.marketing_version \}\}/);
+  assert.match(yml, /args\+=\(--version "\$MARKETING_VERSION_INPUT"\)/);
+});
