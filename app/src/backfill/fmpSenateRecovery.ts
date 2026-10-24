@@ -20,7 +20,6 @@ import { estimateTransactionValue } from '../shared/transactionValue.ts';
 import { computeDisclosureLagDays, computeStockActStatus } from '../shared/stockAct.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
-import { getSharedStPeerPacer } from '../shared/pace.ts';
 import { assertFmpTierOk } from '../shared/fmpStatus.ts';
 import { addDailyUsed, getDailyUsed } from '../enrichment/service.ts';
 import { senateFilerId } from '../ingestion/watcher.ts';
