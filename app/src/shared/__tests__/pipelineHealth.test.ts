@@ -850,6 +850,27 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('residential proxy down');
   });
 
+  it('senate_efd escalates (stalled) when eFD itself answers wrong (non-Akamai HTTP error / no csrf)', () => {
+    const http = efdCheck({
+      ok: false, state: 'degraded', status: 503, step: 'GET /search/', egress: 'proxy',
+      checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'HTTP 503',
+    });
+    expect(http.status).toBe('stalled');
+    const noCsrf = efdCheck({
+      ok: false, state: 'degraded', status: 200, step: 'GET /search/', egress: 'proxy',
+      checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'eFD landing has no csrf token',
+    });
+    expect(noCsrf.status).toBe('stalled');
+  });
+
+  it('senate_efd stays degraded (residential_proxy owns it) on a transport error', () => {
+    const check = efdCheck({
+      ok: false, state: 'degraded', status: null, step: 'GET /search/', egress: 'proxy',
+      checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'relay/transport timeout after 8000ms',
+    });
+    expect(check.status).toBe('degraded');
+  });
+
   it('senate_efd is ok after a passing proxied probe', () => {
     const check = efdCheck({
       ok: true, state: 'ok', status: 302, step: 'POST /search/home/', egress: 'proxy',

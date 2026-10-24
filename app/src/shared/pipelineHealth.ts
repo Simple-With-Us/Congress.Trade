@@ -1124,9 +1124,12 @@ export function evaluatePipelineSignals(
   }
 
   // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
-  // the residential proxy.  Reported as ok / blocked (Akamai anti-bot 403,
-  // surfaced as `critical`) / degraded (relay down).  Never `stalled`: a dead
-  // ingestion lane is polling_senate's job; this says *why*.
+  // the residential proxy.  ok / blocked (Akamai anti-bot 403 → `critical`) /
+  // degraded.  A degraded probe where eFD itself answered wrong (non-Akamai
+  // HTTP error, landing without a csrf token: `status` set) is `stalled`, so it
+  // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
+  // records (`status: null`) stay `degraded`: the residential_proxy check owns
+  // relay outages, and paging twice for one cause is the churn CT-2416 removes.
   if (s.senateEfd === undefined) {
     /* optional — fixtures predating the eFD probe omit this signal */
   } else if (s.senateEfd == null) {
@@ -1173,7 +1176,7 @@ export function evaluatePipelineSignals(
     } else if (probe.state === 'degraded') {
       checks.push({
         id: 'senate_efd',
-        status: 'degraded',
+        status: probe.status != null ? 'stalled' : 'degraded',
         detail: `Senate eFD probe degraded${probe.step ? ` at ${probe.step}` : ''}${http}`
           + `${probe.error ? ` — ${probe.error}` : ''} (checked ${ago})`,
         value: probe.status,
