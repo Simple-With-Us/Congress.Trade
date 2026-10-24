@@ -2594,6 +2594,22 @@ function renderOwnerHealthBanner(pipeline, admin) {
         (obs ? ' · ' + esc(obs) : '') +
       '</span></div>');
   }
+  // st_peer_prices — tickers Socratic.Trade cannot price (CT-2443).
+  // Informational only: not-covered tickers never page, but the count stays
+  // visible with the sample on hover and as a short list.
+  var spp = checks.filter(function (c) { return c.id === 'st_peer_prices'; })[0];
+  var sppN = (spp && spp.value && Number(spp.value.notCovered)) || 0;
+  if (spp && sppN > 0) {
+    var sppSample = (spp.value && Array.isArray(spp.value.notCoveredSample))
+      ? spp.value.notCoveredSample.slice(0, 10).join(', ')
+      : '';
+    rows.push('<div class="owner-alert-row">' +
+      '<span class="owner-alert-icon">ℹ</span>' +
+      '<span class="owner-alert-title">NOT COVERED BY ST</span>' +
+      '<span class="owner-alert-detail" title="' + esc(sppSample) + '">Not covered by ST: ' + sppN +
+        (sppSample ? ' (' + esc(sppSample) + ')' : '') + '</span>' +
+    '</div>');
+  }
   if (rows.length === 0) {
     banner.innerHTML = '';
     banner.style.display = 'none';

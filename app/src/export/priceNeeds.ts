@@ -13,6 +13,7 @@ import { all, get } from '../shared/db.ts';
 import {
   lastTradingDay,
   PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
+  priceNotCoveredExclusionSql,
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
 } from '../prices/service.ts';
@@ -69,7 +70,8 @@ export function parsePriceNeedsQuery(q: Record<string, string | undefined>): Pri
 /**
  * Tickers still negative-cached as unavailable are excluded while their TTL is
  * active (same two-stage policy as selectTickersNeedingPrices), so App B does
- * not thrash delisted/foreign names every night.
+ * not thrash delisted/foreign names every night. Stage-4 (not covered by ST)
+ * tickers are excluded unconditionally.
  */
 function unavailableExclusionSql(): string {
   return `NOT (
@@ -79,7 +81,7 @@ function unavailableExclusionSql(): string {
           WHEN sr.price_unavailable = ${PRICE_UNAVAILABLE_NOT_FOUND_FIRST} THEN ?
           ELSE ?
         END
-  )`;
+  ) AND ${priceNotCoveredExclusionSql('sr')}`;
 }
 
 /**

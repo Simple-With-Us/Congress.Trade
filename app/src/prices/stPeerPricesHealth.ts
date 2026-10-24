@@ -14,6 +14,7 @@ import {
   stPeerPricePendingBindsForSubqueries,
   stPeerPricePendingFromSql,
 } from './peerPricePending.ts';
+import { stNotCoveredTickersFromSql } from './notCovered.ts';
 import type { PipelineCheck, PipelineStatus } from '../shared/pipelineHealth.ts';
 
 export interface StPeerPricesMetrics {
@@ -26,6 +27,9 @@ export interface StPeerPricesMetrics {
   corpusLatestDate: string | null;
   freshThrough: string;
   pendingSample: string[];
+  /** Stage-4 tickers (ST cannot price them): visible, but never stall/degrade on their own. */
+  notCovered: number;
+  notCoveredSample: string[];
   stallThresholdHours: number;
   stalled: boolean;
   detail: string;
@@ -76,6 +80,8 @@ export async function collectStPeerPricesMetrics(
       corpusLatestDate: null,
       freshThrough: '',
       pendingSample: [],
+      notCovered: 0,
+      notCoveredSample: [],
       stallThresholdHours,
       stalled: false,
       detail: 'ST peer prices not configured',
@@ -115,6 +121,8 @@ export async function collectStPeerPricesMetrics(
       corpusLatestDate: null,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
+      notCovered: 0,
+      notCoveredSample: [],
       stallThresholdHours,
       stalled: false,
       detail: 'ST price stall query failed',
@@ -123,6 +131,30 @@ export async function collectStPeerPricesMetrics(
 
   const corpusLatestDate = await readCorpusLatestPriceDate(env);
   const lastAnyPriceCheckedAt = await readLastAnyPriceCheckedAt(env);
+
+  // Visibility-only: stage-4 tickers ST cannot price. Best-effort — a failure
+  // here must not fail the whole check, and the count never affects status.
+  let notCovered = 0;
+  let notCoveredSample: string[] = [];
+  try {
+    const ncRow = await get<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n ${stNotCoveredTickersFromSql()}`,
+    );
+    notCovered = Number(ncRow?.n ?? 0);
+    if (notCovered > 0) {
+      const names = await all<{ ticker: string }>(
+        env.DB,
+        `SELECT sr.ticker AS ticker ${stNotCoveredTickersFromSql()}
+         ORDER BY sr.ticker ASC
+         LIMIT 10`,
+      );
+      notCoveredSample = names.map((r) => r.ticker);
+    }
+  } catch {
+    /* optional */
+  }
+  const notCoveredSuffix = notCovered > 0 ? `; ${notCovered} not covered by ST` : '';
 
   if (pending <= 0) {
     return {
@@ -135,9 +167,11 @@ export async function collectStPeerPricesMetrics(
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
+      notCovered,
+      notCoveredSample,
       stallThresholdHours,
       stalled: false,
-      detail: 'ST price refresh moving (no pending tickers)',
+      detail: 'ST price refresh moving (no pending tickers)' + notCoveredSuffix,
     };
   }
 
@@ -152,10 +186,13 @@ export async function collectStPeerPricesMetrics(
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
+      notCovered,
+      notCoveredSample,
       stallThresholdHours,
       stalled: false,
       detail:
-        `ST price tail backlog only (${pending} pending); corpus EOD current through ${pendingParams.freshThrough}`,
+        `ST price tail backlog only (${pending} pending); corpus EOD current through ${pendingParams.freshThrough}` +
+        notCoveredSuffix,
     };
   }
 
@@ -183,11 +220,14 @@ export async function collectStPeerPricesMetrics(
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample,
+      notCovered,
+      notCoveredSample,
       stallThresholdHours,
       stalled: false,
       detail:
         `${pending} ticker(s) pending ST EOD/current prices${sampleSuffix}; ` +
-        `price_checked_at progress ${hoursSinceIso(lastProgressAt, now)}h ago on pending set (under ${stallThresholdHours}h threshold)`,
+        `price_checked_at progress ${hoursSinceIso(lastProgressAt, now)}h ago on pending set (under ${stallThresholdHours}h threshold)` +
+        notCoveredSuffix,
     };
   }
 
@@ -207,7 +247,8 @@ export async function collectStPeerPricesMetrics(
   const detail =
     `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
     sampleSuffix +
-    `; no price_checked_at progress on pending tickers in ${hoursSinceIso(lastProgressAt, now)}h (threshold ${stallThresholdHours}h)`;
+    `; no price_checked_at progress on pending tickers in ${hoursSinceIso(lastProgressAt, now)}h (threshold ${stallThresholdHours}h)` +
+    notCoveredSuffix;
 
   return {
     configured: true,
@@ -219,6 +260,8 @@ export async function collectStPeerPricesMetrics(
     corpusLatestDate,
     freshThrough: pendingParams.freshThrough,
     pendingSample,
+    notCovered,
+    notCoveredSample,
     stallThresholdHours,
     stalled: true,
     detail,
@@ -248,6 +291,8 @@ export function stPeerPricesMetricsToCheck(metrics: StPeerPricesMetrics): Pipeli
       lastAnyPriceCheckedAt: metrics.lastAnyPriceCheckedAt,
       stallThresholdHours: metrics.stallThresholdHours,
       pendingSample: metrics.pendingSample,
+      notCovered: metrics.notCovered,
+      notCoveredSample: metrics.notCoveredSample,
     },
   };
 }

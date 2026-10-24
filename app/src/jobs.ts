@@ -13,7 +13,11 @@
 import type { Env } from './shared/types.ts';
 import { run, all } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
-import { runPriceRefresh } from './prices/service.ts';
+import { buildPriceRefreshClient, runPriceRefresh } from './prices/service.ts';
+import {
+  markStuckPeerPriceTickersNotCovered,
+  recheckNotCoveredPeerPrices,
+} from './prices/notCovered.ts';
 import { notifyAdmin } from './alerts/notify.ts';
 import { shareWithPeer, type PeerShareInput } from './share/outbound.ts';
 import { runFreshnessCheck } from './share/freshness.ts';
@@ -57,6 +61,8 @@ import { peerPricesNeedCatchUp } from './prices/peerPriceCatchUp.ts';
 const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
 /** Set only after a non-aborted price catch-up.  Separate from the lane stamp. */
 const PRICE_CATCHUP_KEY = LANE_KEY_PREFIX + 'market-data-price-catchup';
+/** Set only after the daily not-covered re-check runs (CT-2443). At most once per UTC day. */
+const NOT_COVERED_RECHECK_KEY = LANE_KEY_PREFIX + 'market-data-not-covered-recheck';
 const SUBCLAIM_KEY_PREFIX = 'jobs:daily:lastdate:';
 const DAILY_KEY = 'jobs:daily:lastdate';
 
@@ -490,6 +496,53 @@ export async function maybeRunDailyMarketDataJobs(
     console.warn('daily price refresh failed:', (err as Error).message);
     errors.push('prices: ' + (err as Error).message);
     priceRefreshFailed = true;
+  }
+
+  // Not-covered lane (CT-2443), best-effort: a failure here warns but never
+  // fails the lane. The re-check runs BEFORE the sweep — it retries oldest-
+  // checked first, so running it first avoids pointlessly refetching tickers
+  // the sweep just marked.
+  if (!(await laneHasSucceeded(env, NOT_COVERED_RECHECK_KEY, day))) {
+    try {
+      const refreshClient = await buildPriceRefreshClient(env, { maxPerMinute });
+      if (refreshClient) {
+        const r = await recheckNotCoveredPeerPrices(env, refreshClient.client, {
+          now,
+          pace: refreshClient.pace,
+          signal: opts.signal,
+        });
+        if (r.checked > 0 || r.errors.length > 0) {
+          console.log(
+            'not-covered recheck:',
+            JSON.stringify({
+              checked: r.checked,
+              repriced: r.repriced,
+              restamped: r.restamped,
+              aborted: r.aborted,
+              errors: r.errors.slice(0, 3),
+            }),
+          );
+        }
+        // An aborted re-check (fatal provider error or shutdown) retries next tick.
+        if (!r.aborted) await markLaneOk(env, NOT_COVERED_RECHECK_KEY, day);
+      } else {
+        await markLaneOk(env, NOT_COVERED_RECHECK_KEY, day);
+      }
+    } catch (err) {
+      console.warn('not-covered recheck failed:', (err as Error).message);
+    }
+  }
+  // Skip the sweep when today's refresh failed or aborted: pending tickers
+  // were not attempted, so a stale price_checked_at says nothing about ST.
+  if (!priceRefreshFailed) {
+    try {
+      const swept = await markStuckPeerPriceTickersNotCovered(env, now);
+      if (swept.marked > 0) {
+        console.log(`not-covered sweep marked ${swept.marked} stuck ticker(s)`);
+      }
+    } catch (err) {
+      console.warn('not-covered sweep failed:', (err as Error).message);
+    }
   }
 
   // Return half of the cross-app share: push what WE fetched this run to App B

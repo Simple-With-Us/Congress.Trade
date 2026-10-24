@@ -155,6 +155,23 @@ describe('buildPriceNeedsExport', () => {
     expect(out.tickers.map((t) => t.ticker)).toEqual(['VISIBLE']);
   });
 
+  it('excludes stage-4 (not covered by ST) tickers unconditionally', async () => {
+    const opened = await openMigratedD1();
+    close = opened.close;
+    const { db, d1 } = opened;
+    seedTrade(db, { id: 'nc1', ticker: 'NOTCOV', txDate: '2020-01-01' });
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, price_unavailable, price_checked_at)
+       VALUES ('NOTCOV', 4, '2000-01-01T00:00:00Z')`,
+    ).run(); // ancient check: every TTL expired, still excluded
+
+    seedTrade(db, { id: 'nc2', ticker: 'VISIBLE', txDate: '2020-01-01' });
+
+    const env = { DB: d1 } as never;
+    const out = await buildPriceNeedsExport(env, { limit: 50, cursor: null }, NOW);
+    expect(out.tickers.map((t) => t.ticker)).toEqual(['VISIBLE']);
+  });
+
   it('ignores pre-1990 dates in the oldest-trade window and the missing-anchor counts', async () => {
     const opened = await openMigratedD1();
     close = opened.close;
