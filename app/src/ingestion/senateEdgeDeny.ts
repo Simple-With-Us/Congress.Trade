@@ -5,7 +5,7 @@
  * Senate eFD edge-deny classification and the polling backoff it drives
  * (CT-2442).
  *
- * efdsearch.senate.gov sits behind Akamai.  Since about 6:04 AM CT on
+ * efdsearch.senate.gov sits behind Akamai.  Since about 6:04 AM on
  * 2026-10-23 the edge answers the agreement POST (/search/home/) and the data
  * POST with 403 "Access Denied" (Server: AkamaiGHost) for automated clients on
  * every network, while GETs still reach the origin (Server: gunicorn).  The
@@ -85,6 +85,19 @@ export class SenateHttpError extends Error {
 
 export function isSenateEdgeDeniedError(err: unknown): err is SenateHttpError {
   return err instanceof SenateHttpError && err.failureClass === 'edge_denied';
+}
+
+/**
+ * The residential proxy gave no answer and the direct fallback failed too.
+ * That is an egress fault to act on (the Mango peer), not an eFD edge deny,
+ * even when the direct leg's own answer was Akamai's 403, so it is neither
+ * backed off nor logged as transient.
+ */
+export class SenateProxyEgressError extends Error {
+  constructor(proxyCause: string, directCause: string) {
+    super(`senate proxy egress unreachable (${proxyCause}); direct fallback failed: ${directCause}`);
+    this.name = 'SenateProxyEgressError';
+  }
 }
 
 // ---------------------------------------------------------------------------

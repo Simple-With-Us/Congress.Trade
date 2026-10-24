@@ -25,6 +25,7 @@ import {
   looksLikeSenateAgreementWall,
 } from './senateSource.ts';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
+import { isSenateEdgeBackoffActive, readSenateEdgeBackoff } from './senateEdgeDeny.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 const UA = 'congress-feed/0.1 (+https://congress.trade)';
@@ -388,6 +389,18 @@ export async function fetchFiling(
       if (usedRelay) {
         retry = await fetchSenateDocViaRelay();
       } else {
+        // While the watcher is backed off after an eFD edge deny (CT-2442),
+        // the handshake would send the edge the very agreement POST it is
+        // refusing, now from the residential IP.  Defer the document until
+        // the window ends instead, jittered past the watcher's own attempt.
+        const edgeBackoff = await readSenateEdgeBackoff(env);
+        const now = new Date();
+        if (edgeBackoff && isSenateEdgeBackoffActive(edgeBackoff, now)) {
+          const waitSeconds = Math.max(1, Math.ceil((Date.parse(edgeBackoff.until) - now.getTime()) / 1000));
+          const message = `fetcher: senate agreement wall for ${sourceUrl}; handshake deferred until ${edgeBackoff.until} (eFD edge-deny backoff)`;
+          await markError(env, docId, message, lease);
+          throw new IngestRetryError(message, waitSeconds + ingestBackoffSeconds(queueAttempt));
+        }
         const session = await establishSenateSession({ kv: env.CONFIG_KV }, effectiveFetch);
         retry = await trackedFetch(sourceUrl, {
           headers: { ...headers, cookie: session.cookieHeader },

@@ -150,6 +150,59 @@ describe('fetchFiling senate wall guard', () => {
     expect(new TextDecoder().decode(r2Puts[0].bytes)).toContain('filedReports');
   });
 
+  it('defers the handshake while the watcher is backed off after an eFD edge deny (CT-2442)', async () => {
+    const { env, kv, r2Puts, dbRuns } = envForSenateFetch();
+    const until = new Date(Date.now() + 30 * 60_000).toISOString();
+    kv.set('senate_edge_deny:backoff', JSON.stringify({
+      consecutive: 1,
+      firstDeniedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+      lastDeniedAt: new Date(Date.now() - 30 * 60_000).toISOString(),
+      windowMs: 3_600_000,
+      until,
+      reason: 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]',
+    }));
+    const methods: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      methods.push((init?.method ?? 'GET').toUpperCase());
+      return new Response(WALL_HTML, { status: 200, headers: { 'content-type': 'text/html' } });
+    }));
+
+    const err = await fetchFiling(env, 'S-wall-1').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(IngestRetryError);
+    expect((err as Error).message).toContain(`handshake deferred until ${until} (eFD edge-deny backoff)`);
+    // Retried after the window, not on the 15-minute ingest backoff.
+    expect((err as IngestRetryError).delaySeconds).toBeGreaterThanOrEqual(29 * 60);
+    // No agreement POST: only the document HEAD and GET went out.
+    expect(mocks.establishSenateSession).not.toHaveBeenCalled();
+    expect(methods).toEqual(['HEAD', 'GET']);
+    expect(r2Puts).toHaveLength(0);
+    expect(dbRuns.some((r) => /SET ingest_status = 'error'/i.test(r.sql))).toBe(true);
+  });
+
+  it('negotiates again once the edge-deny window is over', async () => {
+    const { env, kv, r2Puts } = envForSenateFetch();
+    kv.set('senate_edge_deny:backoff', JSON.stringify({
+      consecutive: 1,
+      firstDeniedAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+      lastDeniedAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+      windowMs: 3_600_000,
+      until: new Date(Date.now() - 30 * 60_000).toISOString(),
+      reason: 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]',
+    }));
+    mocks.establishSenateSession.mockResolvedValue({ csrfCookie: 'csrf', cookieHeader: 'sessionid=fresh' });
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const body = headers['cookie']?.includes('sessionid=fresh') ? REPORT_HTML : WALL_HTML;
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/html' } });
+    }));
+
+    await fetchFiling(env, 'S-wall-1');
+
+    expect(mocks.establishSenateSession).toHaveBeenCalledTimes(1);
+    expect(new TextDecoder().decode(r2Puts[0].bytes)).toContain('filedReports');
+  });
+
   it('refreshes the session and stores the REAL report when the first response is the wall', async () => {
     const { env, kv, r2Puts, queueSends } = envForSenateFetch();
     mocks.establishSenateSession.mockImplementation(async (opts: { kv?: { put: (k: string, v: string) => Promise<void> } }) => {

@@ -37,7 +37,7 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import * as cheerio from 'cheerio';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
-import { SenateHttpError, isSenateEdgeDeniedError } from './senateEdgeDeny.ts';
+import { SenateHttpError, SenateProxyEgressError, isSenateEdgeDeniedError } from './senateEdgeDeny.ts';
 
 /** Backoff between direct Senate eFD attempts when direct is the only egress. */
 /** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
@@ -60,18 +60,63 @@ function isRetryableSenateTransportError(err: unknown): boolean {
 }
 
 /**
- * True when a leg failed before any HTTP answer came back: a connect error,
- * a network timeout, or an unreachable proxy (fetch rejects with a TypeError).
- * An HTTP answer, a parse problem, or the source budget's own abort is not.
+ * How long the proxy leg may wait for its first HTTP answer before the proxy
+ * counts as unreachable.  A black-holed proxy (WireGuard peer down, SYNs
+ * dropped) never refuses the connection, so without this deadline it would
+ * spend pollSenate's whole 7 s budget and the direct fallback would never run.
+ * The deadline is cleared at the first answer, so a slow but working proxy
+ * keeps the rest of the budget.
  */
-function isSenateNetworkFailure(err: unknown, signal?: AbortSignal): boolean {
-  if (signal?.aborted) return false;
-  if (err instanceof SenateHttpError) return false;
+export const SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS = 3_000;
+
+/** True for a fetch rejection that is a network failure: no HTTP answer came back. */
+function isNetworkLevelFetchError(err: unknown): boolean {
   if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) return false;
-  const message = errorMessage(err);
-  if (/\bHTTP \d{3}\b|content-type|csrfmiddlewaretoken|abort/i.test(message)) return false;
   return err instanceof TypeError
-    || /fetch failed|network|connect|ECONN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|timed out|tunnel|proxy|os error/i.test(message);
+    || /fetch failed|network|connect|ECONN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|timed out|tunnel|proxy|os error/i.test(errorMessage(err));
+}
+
+/**
+ * The proxy leg's fetch, wrapped so the leg can tell "the proxy never
+ * answered" from everything else.  Only a rejection of this fetch call itself
+ * counts, never a parse or code fault elsewhere in the leg, and the
+ * first-answer deadline turns a hung proxy into such a rejection.
+ */
+function guardProxyLeg(proxyFetch: typeof fetch, firstAnswerTimeoutMs: number) {
+  const deadline = new AbortController();
+  const rejections = new WeakSet<object>();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let answered = false;
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!answered && timer === undefined) {
+      timer = setTimeout(() => deadline.abort(new DOMException(
+        `senate proxy gave no HTTP answer within ${firstAnswerTimeoutMs}ms`,
+        'TimeoutError',
+      )), firstAnswerTimeoutMs);
+    }
+    const signal = init?.signal ? AbortSignal.any([init.signal, deadline.signal]) : deadline.signal;
+    try {
+      const res = await proxyFetch(input, { ...init, signal });
+      answered = true;
+      clearTimeout(timer);
+      return res;
+    } catch (err) {
+      if (err !== null && typeof err === 'object') rejections.add(err);
+      throw err;
+    }
+  }) as typeof fetch;
+  return {
+    fetchImpl,
+    /** True when `err` means the proxy never answered and the budget still has time for direct. */
+    unreachable(err: unknown, budget?: AbortSignal): boolean {
+      if (budget?.aborted) return false;
+      if (err === null || typeof err !== 'object' || !rejections.has(err)) return false;
+      return deadline.signal.aborted || isNetworkLevelFetchError(err);
+    },
+    dispose(): void {
+      clearTimeout(timer);
+    },
+  };
 }
 
 function resolveExplicitSenateProxyUrl(opts: FetchSenatePtrFilingsOptions): string | undefined {
@@ -88,14 +133,17 @@ function resolveExplicitSenateProxyUrl(opts: FetchSenatePtrFilingsOptions): stri
 
 /**
  * Run `run` through the operator-configured residential proxy first.  Direct
- * datacenter egress is only a fallback for when the proxy leg fails at the
- * network level (connect error, network timeout, proxy unreachable), so a
- * Mango outage still falls back (CT-2361 / #2748).  An HTTP answer through
- * the proxy, an edge deny included, is the result: it is never retried
- * direct, because the box's own egress has been edge-denied even for GET
- * (Akamai SERVE_403) since at least 2026-10-16 (CT-2442).  Without an explicit
- * proxy, direct is the only egress and keeps its short backoff for transient
- * answers.  The Mango default is never used implicitly.
+ * datacenter egress is only a fallback for when the proxy never answers: its
+ * fetch is refused or reset, or no HTTP answer arrives within
+ * SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS (a black-holed proxy), so a Mango
+ * outage still falls back (CT-2361 / #2748).  An HTTP answer through the
+ * proxy, an edge deny included, is the result: it is never retried direct,
+ * because the box's own egress has been edge-denied even for GET (Akamai
+ * SERVE_403) since at least 2026-10-16 (CT-2442).  A fault elsewhere in the
+ * leg (a parse or code error) and the source budget's own abort do not fall
+ * back either.  Without an explicit proxy, direct is the only egress and keeps
+ * its short backoff for transient answers.  The Mango default is never used
+ * implicitly.
  */
 export async function withSenateEfdEgress<T>(
   opts: FetchSenatePtrFilingsOptions,
@@ -103,47 +151,41 @@ export async function withSenateEfdEgress<T>(
   run: (fetchImpl: typeof fetch, egress: 'direct' | 'proxy') => Promise<T>,
 ): Promise<T> {
   const explicitProxy = resolveExplicitSenateProxyUrl(opts);
-  const strategies: Array<{ egress: 'direct' | 'proxy'; fetch: typeof fetch }> = [];
-  if (explicitProxy) {
-    strategies.push({
-      egress: 'proxy',
-      fetch: createProxiedFetch(explicitProxy, baseFetch),
-    });
-  }
-  strategies.push({ egress: 'direct', fetch: baseFetch });
-
   let proxyErr: unknown = null;
-  for (const { egress, fetch: fetchImpl } of strategies) {
-    const backoff = egress === 'proxy'
-      ? [0]
-      : explicitProxy
-        ? SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS
-        : SENATE_EFD_DIRECT_BACKOFF_MS;
-    for (let attempt = 0; attempt < backoff.length; attempt++) {
-      const waitMs = backoff[attempt] ?? 0;
-      if (waitMs > 0) await delay(waitMs, opts.signal);
-      try {
-        const out = await run(fetchImpl, egress);
-        if (proxyErr) {
-          console.warn('senateSource: residential proxy unreachable; the direct fallback reached eFD:', errorMessage(proxyErr));
-        }
-        return out;
-      } catch (err) {
-        if (egress === 'proxy') {
-          if (!isSenateNetworkFailure(err, opts.signal)) throw err;
-          proxyErr = err;
-          break;
-        }
-        if (attempt + 1 < backoff.length && isRetryableSenateTransportError(err)) continue;
-        // Name the proxy outage first: it is the failure to act on, and the
-        // direct leg's own answer (usually an edge deny) is only the fallback.
-        if (proxyErr && !opts.signal?.aborted) {
-          throw new Error(
-            `senate proxy egress unreachable (${errorMessage(proxyErr)}); direct fallback failed: ${errorMessage(err)}`,
-          );
-        }
-        throw err;
+  if (explicitProxy) {
+    const leg = guardProxyLeg(
+      createProxiedFetch(explicitProxy, baseFetch),
+      boundedPositiveInt(opts.proxyFirstAnswerTimeoutMs, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS),
+    );
+    try {
+      return await run(leg.fetchImpl, 'proxy');
+    } catch (err) {
+      if (!leg.unreachable(err, opts.signal)) throw err;
+      proxyErr = err;
+    } finally {
+      leg.dispose();
+    }
+  }
+
+  const backoff = explicitProxy ? SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS : SENATE_EFD_DIRECT_BACKOFF_MS;
+  for (let attempt = 0; attempt < backoff.length; attempt++) {
+    const waitMs = backoff[attempt] ?? 0;
+    if (waitMs > 0) await delay(waitMs, opts.signal);
+    try {
+      const out = await run(baseFetch, 'direct');
+      if (proxyErr) {
+        console.warn('senateSource: residential proxy unreachable; the direct fallback reached eFD:', errorMessage(proxyErr));
       }
+      return out;
+    } catch (err) {
+      if (attempt + 1 < backoff.length && isRetryableSenateTransportError(err)) continue;
+      // Name the proxy outage first: it is the failure to act on, and the
+      // direct leg's own answer (usually an edge deny) is only the fallback.
+      // Its [edge_denied] tag is left off: the whole failure is not one.
+      if (proxyErr && !opts.signal?.aborted) {
+        throw new SenateProxyEgressError(errorMessage(proxyErr), errorMessage(err).replace(/ \[edge_denied\]$/, ''));
+      }
+      throw err;
     }
   }
   throw new Error('senate egress failed');
@@ -389,6 +431,8 @@ export interface FetchSenatePtrFilingsOptions {
   relaySecret?: string;
   /** Optional proxy URL for routing Senate requests. */
   proxyUrl?: string;
+  /** Injectable for tests; capped at SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS. */
+  proxyFirstAnswerTimeoutMs?: number;
   /** Cancels active source I/O when the enclosing watcher tick reaches its deadline. */
   signal?: AbortSignal;
 }
@@ -409,9 +453,8 @@ function senateServer(res: Response): string | null {
 }
 
 /**
- * The start of a response body.  The default is enough to recognize Akamai's
- * deny page (~400 bytes); the agreement form sits past byte 5,000 of eFD's
- * landing page, so that check reads a larger prefix.
+ * The start of an error response body, enough to recognize Akamai's deny page
+ * (~400 bytes).  Fail-soft: it only enriches an error that is thrown anyway.
  */
 async function readSenateBodySnippet(res: Response, maxChars = 4096): Promise<string> {
   try {
@@ -492,7 +535,18 @@ export async function establishSenateSession(
   if (agree.status >= 300 && agree.status < 400) {
     await agree.body?.cancel().catch(() => {});
   } else if (agree.status === 200) {
-    if (looksLikeSenateAgreementWall(await readSenateBodySnippet(agree, 262_144))) {
+    // The form sits past byte 5,000 of eFD's landing page, so the whole body
+    // is read.  An unreadable body is no proof of acceptance: fail closed.
+    let page: string;
+    try {
+      page = await agree.text();
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
+      throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+        detail: `body unreadable (${errorMessage(err)})`,
+      });
+    }
+    if (looksLikeSenateAgreementWall(page)) {
       throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
         detail: 'still shows the agreement form',
       });

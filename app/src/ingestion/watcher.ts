@@ -43,6 +43,7 @@ import {
   isSenateEdgeDeniedError,
   nextSenateEdgeBackoff,
   readSenateEdgeBackoff,
+  SenateProxyEgressError,
   writeSenateEdgeBackoff,
   type SenateEdgeBackoffState,
 } from './senateEdgeDeny.ts';
@@ -617,7 +618,9 @@ export function isTransientSourceError(message: string): boolean {
 /** Record a source-level failure without presenting it as a successful poll. */
 async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executive', nowIso: string, err: unknown): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
-  if (isTransientSourceError(message)) {
+  // A residential-proxy outage is an egress fault to act on, even when the
+  // wrapped direct-fallback answer carries "HTTP 403".
+  if (!(err instanceof SenateProxyEgressError) && isTransientSourceError(message)) {
     // eFD search is the only Senate discovery path; there is no Senate bulk index.
     const fallback = source === 'senate' ? 'no alternate Senate discovery path' : 'bulk path still authoritative';
     console.warn(`watcher: ${source} source degraded (transient, ${fallback}):`, message);

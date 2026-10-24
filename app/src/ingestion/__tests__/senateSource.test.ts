@@ -28,6 +28,7 @@ import {
 } from '../senateSource.ts';
 import {
   SenateHttpError,
+  SenateProxyEgressError,
   classifySenateHttpFailure,
   isSenateEdgeDeniedError,
   looksLikeAkamaiAccessDenied,
@@ -535,6 +536,21 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       expect(kv.put).not.toHaveBeenCalled();
     });
 
+    it('fails closed on a 200 whose body cannot be read, and caches nothing', async () => {
+      const kv = memoryKv();
+      const { fetchImpl } = handshake(() =>
+        new Response(new ReadableStream({ start(c) { c.error(new TypeError('connection reset')); } }), {
+          status: 200,
+          headers: { 'set-cookie': 'sessionid=sess; Path=/', server: 'gunicorn' },
+        }));
+
+      const err = await establishSenateSession({ kv, politeDelayMs: 0 }, fetchImpl).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SenateHttpError);
+      expect((err as Error).message).toBe('senate POST /search/home/ -> HTTP 200 body unreadable (connection reset) (server=gunicorn)');
+      expect(kv.put).not.toHaveBeenCalled();
+    });
+
     it('names the Server header on a refused landing GET', async () => {
       const fetchImpl = (async () => new Response('busy', { status: 503, headers: { server: 'gunicorn' } })) as typeof fetch;
       await expect(establishSenateSession({ politeDelayMs: 0 }, fetchImpl)).rejects.toThrow(
@@ -605,6 +621,96 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       expect(warn.mock.calls.some(([msg]) => /proxy unreachable; the direct fallback reached eFD/.test(String(msg)))).toBe(true);
     });
 
+    /** A black-holed proxy: no answer, ever, until the request's signal aborts. */
+    function hangUntilAborted(signal: AbortSignal | null | undefined): Promise<Response> {
+      return new Promise((_resolve, reject) => {
+        if (!signal) return;
+        if (signal.aborted) reject(signal.reason);
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }
+
+    it('falls back to direct when a hung proxy gives no answer before its first-answer deadline', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: Call[] = [];
+      const direct = efd(calls, () => undefined);
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        if (!(init as { client?: unknown } | undefined)?.client) return direct(input, init);
+        recordCall(calls, input, init);
+        return hangUntilAborted(init?.signal);
+      }) as typeof fetch;
+      // pollSenate's 7 s source budget, still running when the proxy deadline fires.
+      const budget = new AbortController();
+
+      const out = await fetchSenatePtrFilings(
+        { ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 20, signal: budget.signal },
+        fetchImpl,
+      );
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.map((c) => c.egress)).toEqual(['proxy', 'direct', 'direct', 'direct']);
+      expect(warn.mock.calls.some(([msg, detail]) =>
+        /proxy unreachable; the direct fallback reached eFD/.test(String(msg))
+        && /senate proxy gave no HTTP answer within 20ms/.test(String(detail)))).toBe(true);
+    });
+
+    it('keeps a slow but answering proxy: the deadline only covers the first answer', async () => {
+      const calls: Call[] = [];
+      const answers = efd(calls, () => undefined);
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        // Every answer after the first takes longer than the first-answer deadline.
+        if (calls.length > 0) await new Promise((resolve) => setTimeout(resolve, 60));
+        return answers(input, init);
+      }) as typeof fetch;
+
+      const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 20 }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        'proxy GET /search/',
+        'proxy POST /search/home/',
+        'proxy POST /search/report/data/',
+      ]);
+    });
+
+    it('does not fall back when the source budget itself runs out on the proxy leg', async () => {
+      const calls: Call[] = [];
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        recordCall(calls, input, init);
+        return hangUntilAborted(init?.signal);
+      }) as typeof fetch;
+      const budget = new AbortController();
+      setTimeout(() => budget.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), 10);
+
+      const err = await fetchSenatePtrFilings(
+        { ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 1_000, signal: budget.signal },
+        fetchImpl,
+      ).catch((e: unknown) => e);
+
+      expect((err as Error).name).toBe('TimeoutError');
+      expect(calls.map((c) => c.egress)).toEqual(['proxy']);
+    });
+
+    it('does not fall back on a TypeError from the leg\'s own code once the proxy answered', async () => {
+      const calls: Call[] = [];
+      const fetchImpl = efd(calls, (c) => {
+        if (!c.url.endsWith('/search/report/data/')) return undefined;
+        // An answer came back; reading it fails in our code, not in the proxy.
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          json: async () => { throw new TypeError("Cannot read properties of undefined (reading 'data')"); },
+        } as unknown as Response;
+      });
+
+      const err = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY }, fetchImpl).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(TypeError);
+      expect(err).not.toBeInstanceOf(SenateProxyEgressError);
+      expect(calls.every((c) => c.egress === 'proxy')).toBe(true);
+    });
+
     it('a direct fallback failure never touches the proxy-made KV session and names the proxy outage', async () => {
       const proxySession = JSON.stringify({ csrfCookie: 'proxy-csrf', cookieHeader: 'csrftoken=proxy-csrf; sessionid=proxy-made' });
       const kv = memoryKv({ [SENATE_SESSION_KV_KEY]: proxySession });
@@ -617,8 +723,9 @@ describe('Senate eFD edge deny (CT-2442)', () => {
 
       const err = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, kv }, fetchImpl).catch((e: unknown) => e);
 
+      expect(err).toBeInstanceOf(SenateProxyEgressError);
       expect((err as Error).message).toMatch(
-        /^senate proxy egress unreachable \(error sending request.*Connection refused.*\); direct fallback failed: senate GET \/search\/ -> HTTP 403 \(server=AkamaiGHost\) \[edge_denied\]$/,
+        /^senate proxy egress unreachable \(error sending request.*Connection refused.*\); direct fallback failed: senate GET \/search\/ -> HTTP 403 \(server=AkamaiGHost\)$/,
       );
       // A proxy outage is not an eFD edge deny: no long backoff for it.
       expect(isSenateEdgeDeniedError(err)).toBe(false);

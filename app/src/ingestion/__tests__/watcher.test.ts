@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
-import { SenateHttpError } from '../senateEdgeDeny.ts';
+import { SenateHttpError, SenateProxyEgressError } from '../senateEdgeDeny.ts';
 
 const mocks = vi.hoisted(() => ({
   fetchHouseIndex: vi.fn(),
@@ -669,7 +669,7 @@ describe('runWatcher', () => {
 // is blocked.  fetchSenatePtrFilings is mocked; fetch itself throws, so nothing
 // here can reach the network.
 describe('runWatcher senate eFD edge deny (CT-2442)', () => {
-  // Monday 10:00 AM CT.  With no senate success on record, senate is due on every tick.
+  // Monday 10:00 AM.  With no senate success on record, senate is due on every tick.
   const T0 = new Date('2026-10-26T15:00:00.000Z');
   const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
   const BACKOFF_KEY = 'senate_edge_deny:backoff';
@@ -800,6 +800,23 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
     await runWatcher(env, at(11));
     expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs a residential-proxy outage at error, not as a transient 403, and does not back off', async () => {
+    const { env, kv } = fakeEnv();
+    const outage = new SenateProxyEgressError(
+      'senate proxy gave no HTTP answer within 3000ms',
+      'senate GET /search/ -> HTTP 403 (server=AkamaiGHost)',
+    );
+    mocks.fetchSenatePtrFilings.mockRejectedValue(outage);
+
+    const result = await runWatcher(env, T0);
+
+    expect(result.senate).toBe('failure');
+    expect(result.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+    expect(error).toHaveBeenCalledWith('watcher: senate source failed:', outage.message);
+    expect(warn.mock.calls.some(([msg]) => /senate source degraded/.test(String(msg)))).toBe(false);
   });
 
   it('throttles the direct eFD health probe to the cached result', async () => {

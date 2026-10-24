@@ -20,7 +20,7 @@ import {
 } from '../senateEdgeDeny.ts';
 
 const REASON = 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]';
-// Monday 1:00 PM CT: weekday session caps apply (45 minute poll cap, 240 minute heartbeat).
+// Monday 1:00 PM: weekday session caps apply (45 minute poll cap, 240 minute heartbeat).
 const NOW = new Date('2026-10-26T18:00:00.000Z');
 const nowMs = NOW.getTime();
 const minutesAgo = (n: number) => new Date(nowMs - n * 60_000).toISOString();
@@ -173,6 +173,28 @@ describe('polling_senate during an edge-deny backoff', () => {
     }));
     expect(c.status).toBe('stalled');
     expect(c.detail).toContain('NOT RUNNING');
+  });
+
+  it('says FAILING, not BACKED OFF, once polling resumed after the window and fails for another reason', () => {
+    // Deny 300 minutes ago, window over 240 minutes ago, attempts every 10
+    // minutes since (a Mango outage, a timeout): the old deny is not the cause.
+    const c = check(senate({
+      lastSuccessAt: minutesAgo(900),
+      lastAttemptAt: minutesAgo(5),
+      edgeBackoff: { until: minutesAgo(240), lastDeniedAt: minutesAgo(300), reason: REASON },
+    }));
+    expect(c.status).toBe('stalled');
+    expect(c.detail).toBe('senate polling FAILING: attempts are running (last 0h ago) but no success in 15h (threshold 0.75h)');
+  });
+
+  it('says FAILING inside the grace too when the attempt after the window was not a deny', () => {
+    const c = check(senate({
+      lastSuccessAt: minutesAgo(900),
+      lastAttemptAt: minutesAgo(8),
+      edgeBackoff: { until: minutesAgo(10), lastDeniedAt: minutesAgo(70), reason: REASON },
+    }));
+    expect(c.status).toBe('stalled');
+    expect(c.detail).toContain('FAILING');
   });
 
   it('ignores a spent backoff whose deny predates the last success', () => {

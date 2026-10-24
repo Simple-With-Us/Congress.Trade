@@ -930,13 +930,18 @@ export function evaluatePipelineSignals(
       const successAgeH = Number.isFinite(successMs) ? (nowMs - successMs) / 3_600_000 : Infinity;
       const attemptAgeH = Number.isFinite(attemptMs) ? (nowMs - attemptMs) / 3_600_000 : Infinity;
       // An edge-deny backoff explains sparse attempts while its deny is newer
-      // than the last success and the next attempt is not overdue.  Still
-      // stalled: discovery is down, and this detail is what the page says.
+      // than the last success, the latest attempt is that deny (the watcher
+      // stamps both with one instant), and the next attempt is not overdue.
+      // An attempt after the deny means polling resumed and failed for its
+      // own reason, so the generic wording names it.  Still stalled:
+      // discovery is down, and this detail is what the page says.
       const backoff = st.edgeBackoff;
       const backoffUntilMs = backoff ? Date.parse(backoff.until) : NaN;
+      const deniedMs = backoff ? Date.parse(backoff.lastDeniedAt) : NaN;
       const backedOff = backoff !== undefined
-        && !(Number.isFinite(successMs) && Date.parse(backoff.lastDeniedAt) <= successMs)
-        && (attemptAgeH <= maxAgeH || nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS);
+        && !(Number.isFinite(successMs) && deniedMs <= successMs)
+        && !(Number.isFinite(attemptMs) && Number.isFinite(deniedMs) && attemptMs > deniedMs + 60_000)
+        && nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS;
       if (successAgeH <= maxAgeH) {
         checks.push({
           id,
