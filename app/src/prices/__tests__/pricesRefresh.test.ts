@@ -46,7 +46,7 @@ const order = vi.hoisted(() => ({ log: [] as string[] }));
 
 vi.mock('../massive', () => ({
   buildMassivePriceClient: () => ({
-    // Default suite records into h.* so assertions on h.eodCalls / h.responses stay stable. Unmetered-provider
+    // Default suite records into h.* so assertions on h.eodCalls / h.responses stay stable.  Unmetered-provider
     // suite below uses m.* overrides when PRICE_PROVIDER=massive with m.errors.
     eodHistory: async (symbol: string, from?: string, to?: string) => {
       order.log.push(`massive:eod:${symbol}`);
