@@ -34,7 +34,7 @@ import {
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
-import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { checkPipelineHealth, collectEmptyFetchHandoffCheck } from '../shared/pipelineHealth.ts';
 
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
@@ -62,6 +62,13 @@ export type PipelineStallCondition =
   | 'st_peer_prices'
   | 'st_inbound_market_data'
   | 'st_outbound_share_push'
+  /**
+   * Filing outside IngestStatus, or a completed fetch hand-off with no raw
+   * object. Same id as the `/api/health` check. Listed in
+   * HEALTH_STALL_SKIP_IDS so the generic health loop does not open a second
+   * `health_empty_fetch_handoff` episode.
+   */
+  | 'empty_fetch_handoff'
   /** `/api/health` check ids (ingest outbox, extract, delivery, probes, …). */
   | `health_${string}`;
 
@@ -74,6 +81,8 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   // evaluateStPeerPricesStall).  Without this skip the generic loop raises a
   // second health_st_peer_prices episode, so every stall and recovery pages twice.
   'st_peer_prices',
+  // Same id as the dedicated empty_fetch_handoff condition and the health check.
+  'empty_fetch_handoff',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -382,6 +391,23 @@ function hoursLabel(lastAt: string | null, now: Date): string {
   return ((now.getTime() - lastMs) / 3_600_000).toFixed(1);
 }
 
+/**
+ * Page when a filing is sitting outside the statuses the other detectors
+ * watch: no raw object, no live transactions, and either an ingest_status
+ * the type union does not allow or a completed outbox that stored nothing.
+ * `ocr_scan_reader` requires a raw object, so this class never reached it.
+ */
+export async function evaluateEmptyFetchHandoff(env: Env, now = new Date()): Promise<StallEval> {
+  const collected = await collectEmptyFetchHandoffCheck(env, now);
+  const uncollected = collected.check.value == null;
+  return {
+    stalled: collected.check.status === 'critical',
+    detail: collected.check.detail,
+    wakeDocId: collected.wakeDocId,
+    skip: uncollected,
+  };
+}
+
 async function evaluateOcrStall(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   const backlog = await countScannedReaderBacklog(env);
   const workUnits = backlog.pending + backlog.failed;
@@ -654,6 +680,21 @@ export async function sweepPipelineStallAlerts(
     deps,
   );
 
+  const emptyFetch = await collectEmptyFetchHandoffCheck(env, now);
+  await processStallCondition(
+    env,
+    'empty_fetch_handoff',
+    {
+      stalled: emptyFetch.check.status === 'critical',
+      detail: emptyFetch.check.detail,
+      wakeDocId: emptyFetch.wakeDocId,
+      skip: emptyFetch.check.value == null,
+    },
+    now,
+    result,
+    deps,
+  );
+
   const enrichThresholdMs = stallWindowMs(readPipelineStallHours(env, 'st_peer_enrichment'));
   await processStallCondition(
     env,
@@ -701,7 +742,7 @@ export async function sweepPipelineStallAlerts(
     const health = await (async () => {
       try {
         return await Promise.race([
-          checkPipelineHealth(env, now),
+          checkPipelineHealth(env, now, { emptyFetch }),
           new Promise<never>((_, reject) => {
             healthTimeoutId = setTimeout(
               () => reject(new Error(`checkPipelineHealth exceeded ${HEALTH_STALL_BUDGET_MS}ms`)),

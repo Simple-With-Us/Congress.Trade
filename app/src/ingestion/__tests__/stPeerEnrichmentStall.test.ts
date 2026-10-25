@@ -45,6 +45,10 @@ vi.mock('../../delivery/targetCircuit.ts', () => ({
 
 vi.mock('../../shared/pipelineHealth.ts', () => ({
   checkPipelineHealth: vi.fn(async () => ({ status: 'ok', checks: [] })),
+  collectEmptyFetchHandoffCheck: vi.fn(async () => ({
+    check: { id: 'empty_fetch_handoff', status: 'ok', detail: 'none', value: 0 },
+    wakeDocId: null,
+  })),
 }));
 
 function createKv() {

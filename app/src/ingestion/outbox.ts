@@ -2,6 +2,10 @@ import type { Env, Chamber } from '../shared/types.ts';
 import { all, run, type SqlParam } from '../shared/db.ts';
 import { maybeAlertTerminalIngestionOutbox } from './pipelineLoudAlerts.ts';
 import { abortIfSignal } from '../shared/signalAbort.ts';
+import {
+  EMPTY_FETCH_HANDOFF_REASON,
+  EMPTY_FETCH_PARKED_ERROR,
+} from './emptyFetchHandoff.ts';
 
 export type IngestionOutboxStatement = [string, SqlParam[]];
 
@@ -185,6 +189,127 @@ export async function requeueFailedIngestionOutbox(
     params,
   );
   return result.meta?.changes ?? 0;
+}
+
+export interface EmptyFetchRefetchDoc {
+  docId: string;
+  chamber: string | null;
+  sourceUrl: string | null;
+  ingestStatus: string | null;
+}
+
+/**
+ * Put a filing back on the discovery hand-off. Mirrors watcher.ts's
+ * not_found/failed upgrade: ingest_status='new', raw_object_key cleared,
+ * doc_kind reset to 'unknown' so a stale label is not trusted, outbox
+ * status='pending', attempts=0, then enqueueIngestionOutboxNow.
+ * When `incrementCycles` is set, a row already at `cycleCap` is left for
+ * the caller to park instead of being re-armed forever.
+ */
+export async function rearmFilingForEmptyFetch(
+  env: Env,
+  doc: EmptyFetchRefetchDoc,
+  now: Date,
+  opts: { incrementCycles: boolean; cycleCap: number },
+): Promise<'rearmed' | 'capped' | 'lost-race'> {
+  const nowIso = now.toISOString();
+  const existing = await all<{ dead_letter_cycles: number | null }>(
+    env.DB,
+    `SELECT dead_letter_cycles FROM ingestion_outbox WHERE doc_id = ?`,
+    [doc.docId],
+  );
+  const cycles = Number(existing[0]?.dead_letter_cycles ?? 0);
+  if (opts.incrementCycles && cycles >= opts.cycleCap) return 'capped';
+
+  const filing = await run(
+    env.DB,
+    `UPDATE filings
+        SET ingest_status = 'new',
+            raw_object_key = NULL,
+            doc_kind = 'unknown',
+            error = NULL,
+            extractor = NULL,
+            model_version = NULL,
+            confidence = NULL
+      WHERE doc_id = ?
+        AND ingest_status IS ?
+        AND (raw_object_key IS NULL OR TRIM(raw_object_key) = '')`,
+    [doc.docId, doc.ingestStatus],
+  );
+  if ((filing.meta?.changes ?? 0) === 0) return 'lost-race';
+
+  const nextCycles = opts.incrementCycles ? cycles + 1 : cycles;
+  await run(
+    env.DB,
+    `INSERT INTO ingestion_outbox
+       (doc_id, chamber, source_url, status, attempts, dead_letter_cycles, available_at, last_error, created_at, updated_at)
+     VALUES (?, ?, ?, 'pending', 0, ?, ?, NULL, ?, ?)
+     ON CONFLICT(doc_id) DO UPDATE SET
+       chamber = excluded.chamber,
+       source_url = excluded.source_url,
+       status = 'pending',
+       attempts = 0,
+       dead_letter_cycles = ?,
+       available_at = excluded.available_at,
+       last_error = NULL,
+       updated_at = excluded.updated_at`,
+    [
+      doc.docId,
+      doc.chamber ?? '',
+      doc.sourceUrl ?? '',
+      nextCycles,
+      nowIso,
+      nowIso,
+      nowIso,
+      nextCycles,
+    ],
+  );
+  await enqueueIngestionOutboxNow(env, doc.docId);
+  return 'rearmed';
+}
+
+/**
+ * Stop retrying a hand-off that completed with no raw object `cycleCap`
+ * times. The open review row is what the normal drain path reads.
+ * `parked:` keeps the failed-row replay from picking it up.
+ */
+export async function parkEmptyFetchHandoff(
+  env: Env,
+  doc: { docId: string; ingestStatus: string | null },
+  now: Date,
+): Promise<boolean> {
+  const nowIso = now.toISOString();
+  const filing = await run(
+    env.DB,
+    `UPDATE filings
+        SET ingest_status = 'needs_review',
+            error = ?
+      WHERE doc_id = ?
+        AND ingest_status IS ?`,
+    [EMPTY_FETCH_HANDOFF_REASON, doc.docId, doc.ingestStatus],
+  );
+  if ((filing.meta?.changes ?? 0) === 0) return false;
+  await run(
+    env.DB,
+    `INSERT INTO review_queue (doc_id, reason, payload, created_at, resolved)
+     VALUES (?, ?, ?, ?, 0)
+     ON CONFLICT(doc_id) DO UPDATE SET
+       reason = excluded.reason,
+       payload = excluded.payload,
+       created_at = excluded.created_at
+     WHERE review_queue.resolved = 0`,
+    [doc.docId, EMPTY_FETCH_HANDOFF_REASON, JSON.stringify({ kind: EMPTY_FETCH_HANDOFF_REASON }), nowIso],
+  );
+  await run(
+    env.DB,
+    `UPDATE ingestion_outbox
+        SET status = 'failed',
+            last_error = ?,
+            updated_at = ?
+      WHERE doc_id = ?`,
+    [EMPTY_FETCH_PARKED_ERROR, nowIso, doc.docId],
+  );
+  return true;
 }
 
 /** Complete the canonical filing.new handoff before ACKing that message. */

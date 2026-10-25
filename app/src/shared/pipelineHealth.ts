@@ -49,6 +49,7 @@ import {
   collectStPeerPricesMetrics,
   stPeerPricesMetricsToCheck,
 } from '../prices/stPeerPricesHealth.ts';
+import { emptyFetchAlertWhere, emptyFetchSeenCutoff } from '../ingestion/emptyFetchHandoff.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -1360,9 +1361,86 @@ export function evaluatePipelineSignals(
 }
 
 /**
+ * `/api/health` check `empty_fetch_handoff`. Same id as the loud-alert
+ * condition, and the same WHERE as that condition (`emptyFetchAlertWhere`).
+ * A positive count is critical: the filing is outside every other detector.
+ * The stall sweep skips this id so the dedicated condition is the only page.
+ */
+export function emptyFetchHandoffHealthCheck(count: number | null): PipelineCheck {
+  if (count == null || !Number.isFinite(count)) {
+    // Optional probe. `unknown` ranks above `ok` in worstStatus and would
+    // drop the whole /api/health response. The miss stays in the detail.
+    return {
+      id: 'empty_fetch_handoff',
+      status: 'ok',
+      detail: 'Empty-fetch handoff count uncollected',
+      value: null,
+    };
+  }
+  if (count > 0) {
+    return {
+      id: 'empty_fetch_handoff',
+      status: 'critical',
+      detail:
+        `${count} filing(s) have no raw object and no live transactions while ` +
+        `ingest_status is outside the valid union or the fetch outbox completed without storing one`,
+      value: count,
+    };
+  }
+  return {
+    id: 'empty_fetch_handoff',
+    status: 'ok',
+    detail: 'No empty-fetch handoff outside a terminal ingest status',
+    value: 0,
+  };
+}
+
+export interface EmptyFetchHandoffSnapshot {
+  check: PipelineCheck;
+  wakeDocId: string | null;
+}
+
+/**
+ * One filings scan: the window count and the earliest wake doc.
+ * `/api/health` and the stall sweep share the snapshot.
+ */
+export async function collectEmptyFetchHandoffCheck(
+  env: Env,
+  now = new Date(),
+): Promise<EmptyFetchHandoffSnapshot> {
+  try {
+    const where = emptyFetchAlertWhere('f', 'o');
+    const row = await get<{ n: number; doc_id: string | null }>(
+      env.DB,
+      `SELECT COUNT(*) OVER () AS n, f.doc_id AS doc_id
+         FROM filings f
+         LEFT JOIN ingestion_outbox o ON o.doc_id = f.doc_id
+        WHERE ${where}
+        ORDER BY f.first_seen_at ASC
+        LIMIT 1`,
+      [emptyFetchSeenCutoff(now)],
+    );
+    if (!row) {
+      return { check: emptyFetchHandoffHealthCheck(0), wakeDocId: null };
+    }
+    const n = Number(row.n);
+    return {
+      check: emptyFetchHandoffHealthCheck(Number.isFinite(n) ? n : null),
+      wakeDocId: row.doc_id,
+    };
+  } catch {
+    return { check: emptyFetchHandoffHealthCheck(null), wakeDocId: null };
+  }
+}
+
+/**
  * Collect signals from DB and evaluate health.
  */
-export async function checkPipelineHealth(env: Env, now = new Date()): Promise<PipelineHealth> {
+export async function checkPipelineHealth(
+  env: Env,
+  now = new Date(),
+  precomputed: { emptyFetch?: EmptyFetchHandoffSnapshot } = {},
+): Promise<PipelineHealth> {
   const nowMs = now.getTime();
   const iso24hAgo = new Date(nowMs - 24 * 3600 * 1000).toISOString();
   // 2026-10-04: read the live probe schedule from env so a legally slower
@@ -1900,7 +1978,8 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     readPipelineStallHours(env, 'st_peer_prices'),
   );
   const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
-  const checks = [...evaluated.checks, stPeerCheck];
+  const emptyFetchCheck = (precomputed.emptyFetch ?? await collectEmptyFetchHandoffCheck(env, now)).check;
+  const checks = [...evaluated.checks, stPeerCheck, emptyFetchCheck];
   let status: PipelineStatus = 'ok';
   for (const c of checks) {
     status = worstStatus(status, c.status);
