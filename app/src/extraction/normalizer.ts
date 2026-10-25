@@ -68,6 +68,7 @@ import { resolveContinuousTicker } from '@jaywedgeworth22/congress-trading-share
 import { flushDeliveryOutbox } from '../delivery/outbox.ts';
 import { deprecatePredecessorFilingTransactions } from './agreement.ts';
 import { stripOgeRowIndexes } from './ogeRowIndex.ts';
+import { assessOgeRowCompleteness } from './ogeText.ts';
 import {
   addIssuerName,
   emptyIssuerNameIndex,
@@ -75,8 +76,8 @@ import {
   resolveTickerByIssuerName,
   type IssuerNameIndex,
 } from '../enrichment/nameTickerBackfill.ts';
-import { parseAmountRange } from './amounts.ts';
-import { issuerWords, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
+import { canonicalizeAmountBounds, parseAmountRange } from './amounts.ts';
+import { issuerWords, junkAssetNameReason, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
 import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
 import {
@@ -233,6 +234,13 @@ export interface FlaggedTx {
   flags: string[];
 }
 
+/**
+ * Review reason when a 278-T reader produced fewer rows than the source
+ * numbers.  The agreement / stored-run publishers refuse filings parked with
+ * it: a single model read cannot prove it recovered the missing rows.
+ */
+export const OGE_ROWS_INCOMPLETE_REASON = 'oge_rows_incomplete';
+
 /** Flags that force a filing to human review regardless of soft confidence. */
 export const HARD_FAILURE_FLAGS = [
   'no_amount',
@@ -246,6 +254,7 @@ export const HARD_FAILURE_FLAGS = [
   'missing_tx_date',
   'bad_tx_date',
   'tx_date_too_old',
+  'tx_date_after_filing_window',
   'ocr_name_hold',
   'ocr_date_hold',
 ];
@@ -460,12 +469,21 @@ export async function normalize(
   // OpenRouter agreement outages cannot strand already-structured rows.
   const confThreshold = confidenceThresholdFor(extractorName, filing.docKind);
 
+  // 278-T completeness: when the source numbers more rows than the reader
+  // produced, publishing would silently drop the unparsed ones (Trump
+  // 09-08-2026 went live with 1,113 of 1,156 rows).  Hold the whole filing.
+  const rowCompleteness = filing.chamber === 'executive' && parsed.length > 0
+    ? assessOgeRowCompleteness(sourceText, parsed)
+    : null;
+  const rowsIncomplete = rowCompleteness !== null && rowCompleteness.missingCount > 0;
+
   let needsReview =
     flagged.length === 0
     || gateMinConfidence < confThreshold
     || hasHardFailure
     || exceedsPublishLimit
-    || ocrUnusable;
+    || ocrUnusable
+    || rowsIncomplete;
 
   const isAmendment =
     /amend|\(2\)|278t\(\d+\)/i.test(filing.docId) ||
@@ -704,6 +722,14 @@ export async function normalize(
         );
       }
     }
+    if (rowsIncomplete && rowCompleteness) {
+      const rest = reason && reason !== 'needs_review' ? `,${reason}` : '';
+      reason = `${OGE_ROWS_INCOMPLETE_REASON}${rest}`;
+      console.warn(
+        `normalize: ${filing.docId} holds ${parsed.length} parsed rows but the source numbers ${rowCompleteness.expectedRows} `
+          + `(${rowCompleteness.missingCount} missing, evidence=${rowCompleteness.evidence}); held for review`,
+      );
+    }
     const routed = await routeToReview(
       env,
       filing,
@@ -719,6 +745,7 @@ export async function normalize(
           || ocrUnusable
           || (filing.chamber === 'executive' && meta?.parseDisposition === 'unreadable')
           || handCheckRequired
+          || rowsIncomplete
             ? reason
             : undefined,
       },
@@ -988,7 +1015,8 @@ export function scoreFields(
   if (
     !assetName ||
     /^(?:\(?unknown\)?|n\/?a|none|null|-|unreadable)$/i.test(assetName) ||
-    looksLikeHeaderContaminatedAsset(assetName)
+    looksLikeHeaderContaminatedAsset(assetName) ||
+    junkAssetNameReason(assetName) !== null
   ) {
     flags.push('bad_asset_name');
     confidence *= PENALTY_BAD_ASSET_NAME;
@@ -1045,6 +1073,13 @@ export function scoreFields(
   // structured brackets (review-queue flood class, 2026-08-10).
   let amountMin = fields.amountMin;
   let amountMax = fields.amountMax;
+  // "$1,000 - $15,000" style off-by-one lower bounds snap to the canonical
+  // bracket ($1,001) before any other check; see canonicalizeAmountBounds.
+  const canonicalAmount = canonicalizeAmountBounds(amountMin, amountMax);
+  if (canonicalAmount?.changed) {
+    amountMin = canonicalAmount.min;
+    amountMax = canonicalAmount.max;
+  }
 
   if (amountMin === null || amountMin === undefined) {
     flags.push('no_amount');
@@ -1080,6 +1115,11 @@ export function scoreFields(
     if (b) {
       amountMin = b.min;
       amountMax = b.max;
+    } else {
+      // No bracket contains the pair (e.g. 1,000 - 20,000 straddles two).
+      // Publishing the raw pair would put a non-canonical amount on the feed.
+      flags.push('invalid_amount');
+      confidence *= PENALTY_INVALID_BRACKET;
     }
   } else {
     flags.push('invalid_amount');
@@ -1113,6 +1153,9 @@ export function scoreFields(
         confidence *= PENALTY_FUTURE_TX_DATE;
       } else if (dateCheck.code === 'bad_tx_date') {
         flags.push('bad_tx_date');
+        confidence *= PENALTY_BAD_TX_DATE;
+      } else if (dateCheck.code === 'tx_date_after_filing_window') {
+        flags.push('tx_date_after_filing_window');
         confidence *= PENALTY_BAD_TX_DATE;
       } else {
         flags.push('tx_date_too_old');

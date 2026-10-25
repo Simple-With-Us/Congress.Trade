@@ -491,6 +491,8 @@ export function parseOgeTransactionRows(text: string): ParsedTx[] {
 
 interface OgeTextScan {
   rows: ParsedTx[];
+  /** The leading "#" token of every matched row, in match order. */
+  rowIndexes: number[];
   refused: boolean;
   /** True when the 278-T transactions table header is present. */
   has278tTable: boolean;
@@ -506,7 +508,7 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
     .replace(/\u00a0/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!normalized) return { rows: [], refused: false, has278tTable: false };
+  if (!normalized) return { rows: [], rowIndexes: [], refused: false, has278tTable: false };
 
   // Prefer scanning only after the table header (see TABLE_HEADER_RE above);
   // fall back to the whole text if the header wasn't found (a format variant
@@ -572,9 +574,9 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
   // the rows are mis-merged guesses.  Callers must keep this distinct from
   // a section that simply had no rows.
   if (!isOgeRowSequenceCoherent(rowIndexes)) {
-    return { rows: [], refused: true, has278tTable: Boolean(headerMatch) };
+    return { rows: [], rowIndexes, refused: true, has278tTable: Boolean(headerMatch) };
   }
-  return { rows, refused: false, has278tTable: Boolean(headerMatch) };
+  return { rows, rowIndexes, refused: false, has278tTable: Boolean(headerMatch) };
 }
 
 /** Text-layer classification for one stored executive PDF. */
@@ -620,4 +622,127 @@ function toIsoDate(mmddyyyy: string): string {
   // A shape match is not a real date ("13/01/2026", "02/30/2026").  Return
   // blank so the row is flagged incomplete and held, never published.
   return isValidCalendarDateYMD(iso) ? iso : '';
+}
+
+// ---------------------------------------------------------------------------
+// Completeness: the source's last row number vs the rows we actually parsed.
+// ---------------------------------------------------------------------------
+
+/** Cap on how many missing row numbers are reported (diagnostics only). */
+const MAX_REPORTED_MISSING_ROWS = 50;
+/**
+ * Share of parsed rows that must carry their own row number before the
+ * parsed rows alone are trusted to say how long the table is.  One stray
+ * "#12" in a description must not hold a 3-row filing.
+ */
+const MIN_NUMBERED_ROW_SHARE = 0.5;
+
+export interface OgeRowCompleteness {
+  /** The highest row number the source shows (the table's last row). */
+  expectedRows: number;
+  /** Where expectedRows came from. */
+  evidence: 'text_layer' | 'parsed_row_numbers';
+  /** Row numbers in 1..expectedRows that no parsed row carries (capped). */
+  missingRowNumbers: number[];
+  /** Total count of missing row numbers (uncapped). */
+  missingCount: number;
+}
+
+/** Row number a parsed row carries itself: "#661 ..." / "661 ..." raw text, or "row 661" supplemental text. */
+function parsedRowNumber(row: Pick<ParsedTx, 'rawText' | 'supplementalText'>): number | null {
+  const supplemental = /\brow\s+#?(\d{1,5})\b/i.exec(row.supplementalText ?? '');
+  if (supplemental) return Number(supplemental[1]);
+  const raw = /^\s*#\s*(\d{1,5})\b/.exec(row.rawText ?? '');
+  if (raw) return Number(raw[1]);
+  return null;
+}
+
+function missingNumbers(seen: ReadonlySet<number>, expected: number): { list: number[]; count: number } {
+  const list: number[] = [];
+  let count = 0;
+  for (let n = 1; n <= expected; n += 1) {
+    if (seen.has(n)) continue;
+    count += 1;
+    if (list.length < MAX_REPORTED_MISSING_ROWS) list.push(n);
+  }
+  return { list, count };
+}
+
+/**
+ * Compare a 278-T's own row numbering against the rows a reader produced.
+ *
+ * A 278-T numbers its rows 1..N in the "#" column.  The text parser's
+ * coherence gate accepts a parse that covers 80% of its span, so a row whose
+ * type word, date or amount failed to parse simply vanished, and the filing
+ * published the rest as if complete (Trump 09-08-2026: 1,113 of 1,156 rows).
+ *
+ * Evidence, strongest first:
+ *   1. The text layer: the highest row number among rows the parser anchored,
+ *      and the line-anchored "#" column count when it is itself coherent.
+ *      A row lost between two parsed rows, or (with line anchors) at the
+ *      tail, shows up as a missing number.
+ *   2. The parsed rows' own numbers ("#661 ..." raw text or "row 661" in the
+ *      supplemental text), when most rows carry one.  This covers vision and
+ *      hand transcriptions, whose raw output is not the PDF text layer.
+ *
+ * Returns null when neither source can say how long the table is (no 278-T
+ * table header, a refused parse, or unnumbered rows).  Null is "unknown",
+ * never "complete": callers keep every other publish gate.
+ */
+export function assessOgeRowCompleteness(
+  sourceText: string | null | undefined,
+  parsedRows: ReadonlyArray<Pick<ParsedTx, 'rawText' | 'supplementalText'>>,
+): OgeRowCompleteness | null {
+  const numbered = parsedRows.map(parsedRowNumber).filter((n): n is number => n !== null && n >= 1);
+  const parsedSeen = new Set(numbered);
+
+  if (sourceText) {
+    const scan = scanOgeTransactionRows(sourceText);
+    if (scan.has278tTable && !scan.refused && scan.rowIndexes.length > 0) {
+      let expected = Math.max(...scan.rowIndexes);
+      const anchors = detectOgeRowAnchors(sourceText);
+      if (
+        anchors.maxIndex !== null
+        && anchors.maxIndex > expected
+        && anchors.anchors >= anchors.maxIndex * MIN_INDEX_SPAN_COVERAGE
+      ) {
+        expected = anchors.maxIndex;
+      }
+      // The reader's own row numbers decide which rows are present.  Text
+      // parser rows carry them ("<n> desc ..."); a vision read usually does
+      // not, and then only the row count can be compared (the parser's own
+      // anchors describe the parser, not this reader).
+      const leadingNumbers = parsedRows
+        .map((r) => {
+          const own = parsedRowNumber(r);
+          if (own !== null) return own;
+          const lead = /^\s*(\d{1,5})\b/.exec(r.rawText ?? '');
+          return lead ? Number(lead[1]) : null;
+        })
+        .filter((n): n is number => n !== null && n >= 1);
+      const readerNumbered = leadingNumbers.length > 0
+        && leadingNumbers.length >= parsedRows.length * MIN_NUMBERED_ROW_SHARE;
+      const missing = readerNumbered
+        ? missingNumbers(new Set(leadingNumbers), expected)
+        : { list: [] as number[], count: 0 };
+      // A reader that produced fewer rows than the table holds is incomplete
+      // even when the numbers it kept look contiguous.
+      const shortBy = Math.max(0, expected - parsedRows.length);
+      const missingCount = Math.max(missing.count, shortBy);
+      return { expectedRows: expected, evidence: 'text_layer', missingRowNumbers: missing.list, missingCount };
+    }
+  }
+
+  if (numbered.length > 0 && numbered.length >= parsedRows.length * MIN_NUMBERED_ROW_SHARE) {
+    const expected = Math.max(...numbered);
+    const missing = missingNumbers(parsedSeen, expected);
+    const shortBy = Math.max(0, expected - parsedRows.length);
+    return {
+      expectedRows: expected,
+      evidence: 'parsed_row_numbers',
+      missingRowNumbers: missing.list,
+      missingCount: Math.max(missing.count, shortBy),
+    };
+  }
+  return null;
 }
