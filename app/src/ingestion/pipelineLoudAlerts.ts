@@ -34,8 +34,7 @@ import {
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
-import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
-import { emptyFetchAlertWhere } from './emptyFetchHandoff.ts';
+import { checkPipelineHealth, collectEmptyFetchHandoffCheck } from '../shared/pipelineHealth.ts';
 
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
@@ -398,34 +397,15 @@ function hoursLabel(lastAt: string | null, now: Date): string {
  * the type union does not allow or a completed outbox that stored nothing.
  * `ocr_scan_reader` requires a raw object, so this class never reached it.
  */
-export async function evaluateEmptyFetchHandoff(env: Env): Promise<StallEval> {
-  try {
-    const where = emptyFetchAlertWhere('f', 'o');
-    const from = `FROM filings f
-         LEFT JOIN ingestion_outbox o ON o.doc_id = f.doc_id
-        WHERE ${where}`;
-    const row = await get<{ n: number }>(
-      env.DB,
-      `SELECT COUNT(*) AS n ${from}`,
-    );
-    const n = Number(row?.n ?? 0);
-    if (!Number.isFinite(n) || n <= 0) {
-      return { stalled: false, detail: 'no empty-fetch handoff outside a terminal ingest status' };
-    }
-    const wake = await get<{ doc_id: string }>(
-      env.DB,
-      `SELECT f.doc_id AS doc_id ${from} ORDER BY f.first_seen_at ASC LIMIT 1`,
-    );
-    return {
-      stalled: true,
-      detail:
-        `${n} filing(s) have no raw object and no live transactions while ` +
-        `ingest_status is outside the valid union or the fetch outbox completed without storing one`,
-      wakeDocId: wake?.doc_id ?? null,
-    };
-  } catch {
-    return { stalled: false, detail: 'empty-fetch handoff count unavailable', skip: true };
-  }
+export async function evaluateEmptyFetchHandoff(env: Env, now = new Date()): Promise<StallEval> {
+  const collected = await collectEmptyFetchHandoffCheck(env, now);
+  const uncollected = collected.check.value == null;
+  return {
+    stalled: collected.check.status === 'critical',
+    detail: collected.check.detail,
+    wakeDocId: collected.wakeDocId,
+    skip: uncollected,
+  };
 }
 
 async function evaluateOcrStall(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
@@ -700,10 +680,16 @@ export async function sweepPipelineStallAlerts(
     deps,
   );
 
+  const emptyFetch = await collectEmptyFetchHandoffCheck(env, now);
   await processStallCondition(
     env,
     'empty_fetch_handoff',
-    await evaluateEmptyFetchHandoff(env),
+    {
+      stalled: emptyFetch.check.status === 'critical',
+      detail: emptyFetch.check.detail,
+      wakeDocId: emptyFetch.wakeDocId,
+      skip: emptyFetch.check.value == null,
+    },
     now,
     result,
     deps,
@@ -756,7 +742,7 @@ export async function sweepPipelineStallAlerts(
     const health = await (async () => {
       try {
         return await Promise.race([
-          checkPipelineHealth(env, now),
+          checkPipelineHealth(env, now, { emptyFetch }),
           new Promise<never>((_, reject) => {
             healthTimeoutId = setTimeout(
               () => reject(new Error(`checkPipelineHealth exceeded ${HEALTH_STALL_BUDGET_MS}ms`)),
