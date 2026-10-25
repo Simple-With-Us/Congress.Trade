@@ -442,7 +442,7 @@ struct TickerDetailView: View {
 }
 
 /// Storage enums are not labels. `securities_ref.asset_class` is written by the
-/// enricher as `equity|etf|adr|fund` (`app/src/enrichment/fmp.ts`) and
+/// enricher as `equity|etf|adr|fund` (`app/src/enrichment/`) and
 /// `market_cap_bucket` as `mega`…`nano`; both were rendered raw or merely
 /// `.capitalized`, so the sheet read "Asset Class: equity" / "Market Cap:
 /// Mega". Wording matches the web board's `CAP_NAMES`

@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { buildFallbackPriceClient } from '../fallback.ts';
-import type { PriceClient } from '../fmp.ts';
+import type { PriceClient } from '../types.ts';
 import type { Close } from '../compute.ts';
 
 function recordingClient(

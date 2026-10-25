@@ -7,7 +7,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { marketCapBucket, sicToSector, remainingBudget, mergeRefs } from '../compute.ts';
-import { parseFmpProfile } from '../fmp.ts';
 import { parseCompanyTickers, parseSecSubmissions, padCik, buildSecProvider } from '../sec.ts';
 import {
   enrichmentNeededSql,
@@ -216,28 +215,6 @@ describe('mergeRefs', () => {
   it('normalizes company names when merging', () => {
     const merged = mergeRefs('CBS', [{ companyName: 'CBS CORPORATION' }]);
     expect(merged.companyName).toBe('CBS Corporation');
-  });
-});
-
-describe('parseFmpProfile', () => {
-  it('parses a profile array into a partial ref', () => {
-    const r = parseFmpProfile([
-      { symbol: 'AAPL', companyName: 'Apple Inc.', sector: 'Technology', industry: 'Consumer Electronics',
-        mktCap: 3200000000000, country: 'US', state: 'CA', exchangeShortName: 'NASDAQ', currency: 'USD',
-        ipoDate: '1980-12-12', cik: '0000320193', isEtf: false, isAdr: false },
-    ]);
-    expect(r).not.toBeNull();
-    expect(r!.sector).toBe('Technology');
-    expect(r!.marketCap).toBe(3200000000000);
-    expect(r!.marketCapBucket).toBe('mega');
-    expect(r!.assetClass).toBe('equity');
-    expect(r!.exchangeShort).toBe('NASDAQ');
-    expect(r!.source).toBe('fmp');
-  });
-  it('flags ETFs and returns null for an empty/unknown response', () => {
-    expect(parseFmpProfile([{ symbol: 'SPY', isEtf: true }])!.assetClass).toBe('etf');
-    expect(parseFmpProfile([])).toBeNull();
-    expect(parseFmpProfile({})).toBeNull();
   });
 });
 

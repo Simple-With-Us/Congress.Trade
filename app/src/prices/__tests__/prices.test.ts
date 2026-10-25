@@ -6,7 +6,6 @@
 
 import { describe, it, expect } from 'vitest';
 import { pctChange, computePerformance, nearestClose, type Close } from '../compute.ts';
-import { parseEodHistory } from '../fmp.ts';
 
 describe('pctChange', () => {
   it('is the fractional change, or null for bad input', () => {
@@ -46,31 +45,5 @@ describe('nearestClose', () => {
   });
   it('is null before all history', () => {
     expect(nearestClose(rows, '2026-06-01')).toBeNull();
-  });
-});
-
-describe('parseEodHistory', () => {
-  it('parses the v3 full shape, prefers adjClose, sorts descending', () => {
-    const out = parseEodHistory({
-      symbol: 'AAPL',
-      historical: [
-        { date: '2026-06-11', adjClose: 204, close: 203 },
-        { date: '2026-06-15', adjClose: 210, close: 209 },
-      ],
-    });
-    expect(out.map((c) => c.date)).toEqual(['2026-06-15', '2026-06-11']);
-    expect(out[0].close).toBe(210); // adjClose preferred
-  });
-  it('parses the stable light array shape and skips malformed rows', () => {
-    const out = parseEodHistory([
-      { date: '2026-06-15', close: 210 },
-      { date: null, close: 1 },
-      { date: '2026-06-12' },
-    ]);
-    expect(out).toEqual([{ date: '2026-06-15', close: 210 }]);
-  });
-  it('returns [] for unknown shapes', () => {
-    expect(parseEodHistory({})).toEqual([]);
-    expect(parseEodHistory(null)).toEqual([]);
   });
 });

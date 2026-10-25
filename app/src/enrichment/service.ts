@@ -9,8 +9,7 @@
  * Direct Massive / Intrinio / Twelve Data / Finnhub / Tiingo keys are not
  * enrichment fallbacks. SEC EDGAR remains the free public CIK/SIC baseline
  * when ST has no profile for a symbol. EDGAR calls use their own per-minute
- * gate. The historical FMP day-counter helpers stay exported so latency and
- * older imports can still read `fmp:calls:*`; this runner does not spend them.
+ * gate.
  */
 
 import type { Env } from '../shared/types.ts';
@@ -373,36 +372,6 @@ function isCovered(partials: Array<Partial<SecurityRef>>): boolean {
     if (p.marketCap != null) mcap = true;
   }
   return name && sector && mcap;
-}
-
-function dayKey(now = new Date()): string {
-  return 'fmp:calls:' + now.toISOString().slice(0, 10);
-}
-
-/** FMP calls already spent today (from the KV day-counter). */
-export async function getDailyUsed(env: Env): Promise<number> {
-  try {
-    const v = await env.CONFIG_KV.get(dayKey());
-    const n = v ? parseInt(v, 10) : 0;
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  } catch {
-    return 0;
-  }
-}
-async function setDailyUsed(env: Env, n: number): Promise<void> {
-  try {
-    await env.CONFIG_KV.put(dayKey(), String(n), { expirationTtl: 172800 });
-  } catch {
-    /* best effort */
-  }
-}
-
-/** Add `n` to today's FMP call counter (shared by enrichment + price refresh). */
-export async function addDailyUsed(env: Env, n: number): Promise<number> {
-  const used = await getDailyUsed(env);
-  const next = used + Math.max(0, Math.floor(n));
-  await setDailyUsed(env, next);
-  return next;
 }
 
 /** A ticker selected for enrichment, plus its current `enrichment_error` (used

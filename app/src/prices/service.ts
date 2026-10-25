@@ -18,7 +18,7 @@ import {
   tickerHasNonCompetitorFixtureTrade,
 } from '../shared/competitorFixtures.ts';
 import { getSharedStPeerPacer, ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from '../shared/pace.ts';
-import type { PriceClient } from './fmp.ts';
+import type { PriceClient } from './types.ts';
 import { buildPeerPriceClient } from './peer.ts';
 import type { Close } from './compute.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
@@ -777,7 +777,7 @@ export async function runPriceRefresh(
     // Count the ATTEMPT (not just a successful outcome) against the shared
     // daily meter: the provider bills/rate-limits every request it receives,
     // whether it 2xxs, 404s, or 429s, so an attempt that throws still spent
-    // real quota and must not be under-reported to addDailyUsed below.
+    // real quota and must not be under-reported.
     calls++;
     budget--;
     spx = await client.spxHistory(spxFrom, today());

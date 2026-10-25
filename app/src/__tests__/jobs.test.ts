@@ -7,10 +7,8 @@ import type { Env } from '../shared/types.ts';
 // business logic (those have their own test suites).
 const mocks = vi.hoisted(() => ({
   resolveSecrets: vi.fn(),
-  getDailyUsed: vi.fn(),
   runEnrichment: vi.fn(),
   runPriceRefresh: vi.fn(),
-  hasFmpTierFailure: vi.fn(),
   notifyAdmin: vi.fn(),
   shareWithPeer: vi.fn(),
   runFreshnessCheck: vi.fn(),
@@ -29,7 +27,6 @@ vi.mock('../secrets/infisical', () => ({
   resolveSecrets: mocks.resolveSecrets,
 }));
 vi.mock('../enrichment/service', () => ({
-  getDailyUsed: mocks.getDailyUsed,
   runEnrichment: mocks.runEnrichment,
   DEFAULT_DAILY_CAP: 230,
 }));
@@ -41,9 +38,6 @@ vi.mock('../prices/service', async (importOriginal) => {
     backfillCurrentPricesFromEod: mocks.backfillCurrentPricesFromEod,
   };
 });
-vi.mock('../shared/fmpStatus', () => ({
-  hasFmpTierFailure: mocks.hasFmpTierFailure,
-}));
 vi.mock('../alerts/notify', () => ({
   notifyAdmin: mocks.notifyAdmin,
 }));
@@ -114,7 +108,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
     vi.clearAllMocks();
     mocks.resolveSecrets.mockResolvedValue({});
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.getDailyUsed.mockResolvedValue(0);
     mocks.runEnrichment.mockResolvedValue({
       hasFmpKey: false,
       dailyCap: null,
@@ -131,7 +124,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
       sharePrices: [],
       shareSpx: [],
     });
-    mocks.hasFmpTierFailure.mockReturnValue(false);
     mocks.shareWithPeer.mockResolvedValue({ sent: false, reason: 'not configured' });
     mocks.runFreshnessCheck.mockResolvedValue([]);
     mocks.runBulkSnapshot.mockResolvedValue({ tables: {} });
@@ -283,7 +275,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
         env,
         expect.not.objectContaining({ max: expect.any(Number) }),
       );
-      expect(mocks.getDailyUsed).not.toHaveBeenCalled();
     });
 
     it('alerts when Socratic profile or price reads fail auth', async () => {
@@ -401,14 +392,12 @@ describe('staggered daily lanes', () => {
     vi.clearAllMocks();
     mocks.resolveSecrets.mockResolvedValue({});
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.getDailyUsed.mockResolvedValue(0);
     mocks.runEnrichment.mockResolvedValue({
       hasFmpKey: false, dailyCap: null, fmpCalls: 0, errors: [], shareRefs: [], scanned: 0, enriched: 0,
     });
     mocks.runPriceRefresh.mockResolvedValue({
       hasFmpKey: false, fmpCalls: 0, errors: [], sharePrices: [], shareSpx: [],
     });
-    mocks.hasFmpTierFailure.mockReturnValue(false);
     mocks.shareWithPeer.mockResolvedValue({ sent: false, reason: 'not configured' });
     mocks.runFreshnessCheck.mockResolvedValue([]);
     mocks.runBulkSnapshot.mockResolvedValue({ tables: {} });
@@ -728,7 +717,6 @@ describe('runHourlyEnrichmentSlice', () => {
     vi.clearAllMocks();
     mocks.resolveSecrets.mockResolvedValue({});
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.getDailyUsed.mockResolvedValue(0);
     mocks.runEnrichment.mockResolvedValue({
       hasFmpKey: true, dailyCap: 5000, fmpCalls: 10, errors: [], shareRefs: [], scanned: 50, enriched: 40,
       budgetRemaining: 4000,
@@ -754,9 +742,7 @@ describe('runHourlyEnrichmentSlice', () => {
 
   it('uses the slice cap even when an FMP key and a spent day counter are present', async () => {
     mocks.resolveSecrets.mockResolvedValue({ FMP_API_KEY: 'k', FMP_DAILY_CALL_CAP: '1000' });
-    mocks.getDailyUsed.mockResolvedValue(950);
     await runHourlyEnrichmentSlice(sliceEnv(), DAY);
-    expect(mocks.getDailyUsed).not.toHaveBeenCalled();
     expect(mocks.runEnrichment).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ max: HOURLY_ENRICHMENT_SLICE_MAX }),

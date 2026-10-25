@@ -80,7 +80,6 @@ import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from '../deli
 import { apnsLaneErrorIsRecent, inspectApnsFanoutDiagnostics, resolveApnsConfig } from '../delivery/apnsFanout.ts';
 import { apnsConfigured } from '../shared/apns.ts';
 import { runSeedBackfillFromEnv } from '../backfill/seed.ts';
-import { runFmpSenateRecovery } from '../backfill/fmpSenateRecovery.ts';
 import { runHouseHistoricalBackfill } from '../backfill/houseCrawler.ts';
 import { runSenateBackfill } from '../backfill/senateCrawler.ts';
 import { extractParsed } from '../extraction/orchestrator.ts';
@@ -151,7 +150,6 @@ import {
 import { buildConsensusRows, type ConsensusRun } from '../extraction/consensus.ts';
 import {
   runEnrichment,
-  getDailyUsed,
   prepareImportSecurityRef,
   enrichmentNeededSql,
   enrichmentUnavailableExcludedSql,
@@ -5492,48 +5490,6 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
   });
 
-  // --- POST /fmp-senate-recovery -----------------------------------------
-  // RETIRED: runFmpSenateRecovery refuses every invocation (FMP is latency-only).
-  // Route kept so operators get a clear error instead of a silent 404.
-  r.post('/fmp-senate-recovery', async (c) => {
-    let body: Record<string, unknown> = {};
-    try {
-      const text = await c.req.text();
-      if (text) body = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return c.json({ error: 'invalid JSON body' }, 400);
-    }
-
-    const fromPage = body.fromPage ?? 0;
-    const toPage = body.toPage ?? fromPage;
-    const dryRun = body.dryRun ?? false;
-    if (!Number.isInteger(fromPage) || !Number.isInteger(toPage)) {
-      return c.json({ error: 'fromPage and toPage must be integers' }, 400);
-    }
-    if (
-      (fromPage as number) < 0 ||
-      (toPage as number) < (fromPage as number) ||
-      (toPage as number) > 100 ||
-      (toPage as number) - (fromPage as number) + 1 > 5
-    ) {
-      return c.json({ error: 'pages must satisfy 0 <= fromPage <= toPage <= 100 with at most 5 pages per run' }, 400);
-    }
-    if (typeof dryRun !== 'boolean') {
-      return c.json({ error: 'dryRun must be a boolean' }, 400);
-    }
-
-    try {
-      const result = await runFmpSenateRecovery(c.env, {
-        fromPage: fromPage as number,
-        toPage: toPage as number,
-        dryRun,
-      });
-      return c.json(result);
-    } catch (err) {
-      return c.json({ error: `FMP Senate recovery failed: ${(err as Error).message}` }, 500);
-    }
-  });
-
   // --- GET /data-recovery/status -----------------------------------------
   // Secret-safe production receipt for migration/backfill work. Counts are
   // grouped server-side so operators can prove live-source progress without
@@ -9844,9 +9800,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- GET /enrich-securities/status --------------------------------------
-  // Today's FMP call usage + how many tickers still need enrichment.
+  // How many tickers still need enrichment and prices.
   r.get('/enrich-securities/status', async (c) => {
-    const used = await getDailyUsed(c.env);
     const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(c.env);
     const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(c.env.DB);
     const row = await first<{ pending: number }>(
@@ -9866,21 +9821,19 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     const pending = await marketPending(c.env);
     const coverage = await marketCoverage(c.env);
     return c.json({
-      fmpCallsToday: used,
       pendingTickers: row?.pending ?? 0,
       pricePendingTickers: pending.prices,
       enrichedTickers: enriched?.n ?? 0,
       coverage,
-      hasFmpKey: false,
       hasSocraticPeer: retryIncomplete,
       hasKeyedEnrichmentProvider: retryIncomplete,
     });
   });
 
   // --- POST /refresh-prices -----------------------------------------------
-  // Budgeted price + performance refresh (FMP-only): updates the S&P series and,
+  // Price + performance refresh from the ST peer:  updates the S&P series and,
   // for tickers needing it, caches daily closes + computes per-trade anchors.
-  // Shares the daily FMP budget with enrichment. Body: { max?, dryRun? }.
+  // Body: { max?, dryRun? }.
   r.post('/refresh-prices', async (c) => {
     let body: Record<string, unknown> = {};
     try {

@@ -13,7 +13,7 @@ import type { Env } from '../shared/types.ts';
 import { all, run } from '../shared/db.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import { getSharedStPeerPacer } from '../shared/pace.ts';
-import type { PriceClient } from './fmp.ts';
+import type { PriceClient } from './types.ts';
 import {
   isFatalPriceProviderError,
   isStaleListingDate,
