@@ -15,7 +15,7 @@
  */
 
 import type { Close } from './compute.ts';
-import type { PriceClient } from './fmp.ts';
+import type { PriceClient } from './types.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 
 export interface PeerPriceClientOptions {

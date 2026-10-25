@@ -51,7 +51,7 @@ vi.mock('../../enrichment/service.ts', async (importOriginal) => {
 });
 
 import type { Env } from '../../shared/types.ts';
-import type { PriceClient } from '../fmp.ts';
+import type { PriceClient } from '../types.ts';
 import {
   lastTradingDay,
   PRICE_UNAVAILABLE_NOT_COVERED,

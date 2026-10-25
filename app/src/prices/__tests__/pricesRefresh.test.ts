@@ -20,7 +20,7 @@ vi.mock('../../shared/pace.ts', async (importOriginal) => ({
 }));
 
 
-// Shared, hoisted state the '../fmp' mock reads/writes (vi.mock is hoisted above
+// Shared, hoisted state the price-client mocks read/write (vi.mock is hoisted above
 // imports, so it can't close over ordinary module-scope locals).
 const h = vi.hoisted(() => ({
   eodCalls: [] as Array<{ symbol: string; from: string; to: string }>,
@@ -35,25 +35,6 @@ vi.mock('../../secrets/infisical', async (importOriginal) => ({
   resolveSecrets: vi.fn(async () => ({})),
 }));
 
-// Replace the real FMP client (network) with a deterministic recorder. The
-// symbol/from/to it receives are exactly what runPriceRefresh asked for.
-vi.mock('../fmp', () => ({
-  buildFmpPriceClient: () => ({
-    eodHistory: async (symbol: string, from: string, to: string) => {
-      h.eodCalls.push({ symbol, from, to });
-      const herr = h.errors.get(symbol);
-      if (herr) throw new Error(herr);
-      return h.responses.get(symbol) ?? [];
-    },
-    spxHistory: async (from: string, to: string) => {
-      h.eodCalls.push({ symbol: 'SPY', from, to });
-      const herr = h.errors.get('SPY');
-      if (herr) throw new Error(herr);
-      return h.responses.get('SPY') ?? [];
-    },
-  }),
-}));
-
 // Same shape for the Massive client, for the unmetered-provider 429 tests
 // below (per-symbol error MESSAGE so a test can pick 429 vs 403).
 const m = vi.hoisted(() => ({
@@ -65,8 +46,7 @@ const order = vi.hoisted(() => ({ log: [] as string[] }));
 
 vi.mock('../massive', () => ({
   buildMassivePriceClient: () => ({
-    // Default suite records into h.* (same shape as the old FMP mock) so
-    // assertions on h.eodCalls / h.responses stay stable. Unmetered-provider
+    // Default suite records into h.* so assertions on h.eodCalls / h.responses stay stable. Unmetered-provider
     // suite below uses m.* overrides when PRICE_PROVIDER=massive with m.errors.
     eodHistory: async (symbol: string, from?: string, to?: string) => {
       order.log.push(`massive:eod:${symbol}`);
