@@ -719,8 +719,6 @@ export interface Env {
   /** Shared FMP per-minute pacer ceiling (stringified int). Infisical-tunable. */
   /** Socratic.Trade peer-read pace (clamped to ST_PEER_SAFE_MAX_PER_MINUTE). */
   ST_PEER_MAX_PER_MINUTE?: string;
-  /** Deprecated name for ST_PEER_MAX_PER_MINUTE;  read only as a fallback. */
-  FMP_MAX_PER_MINUTE?: string;
   /** SEC EDGAR per-minute pacer ceiling (stringified int). Infisical-tunable. */
   EDGAR_MAX_PER_MINUTE?: string;
   /** Local-dev-only escape hatch: opens admin when the environment is not production. */

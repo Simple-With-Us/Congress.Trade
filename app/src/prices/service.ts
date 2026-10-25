@@ -189,8 +189,6 @@ export async function markTickerPriceUnavailable(
 }
 type EnvX = Env & {
   ST_PEER_MAX_PER_MINUTE?: string;
-  /** Deprecated name for ST_PEER_MAX_PER_MINUTE. */
-  FMP_MAX_PER_MINUTE?: string;
   APP_B_IMPORT_URL?: string;
   /** Bearer token for the peer's bearer-gated read endpoints. */
   APP_B_INGEST_TOKEN?: string;
@@ -246,7 +244,7 @@ export async function buildPriceRefreshClient(
   // Shared per-isolate ST peer pacer (same instance enrichment uses), so
   // concurrent peer reads stay under ST's per-minute limit together.  Fall back
   // to the configured pace when the caller omits it (e.g. an admin endpoint).
-  const peerMaxPerMinute = opts.maxPerMinute ?? stPeerMaxPerMinute(envx);
+  const peerMaxPerMinute = opts.maxPerMinute ?? stPeerMaxPerMinute(runtimeSecrets);
   return {
     client: plan.client,
     fmpBudgeted: plan.fmpBudgeted,

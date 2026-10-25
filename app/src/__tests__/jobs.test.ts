@@ -3,7 +3,7 @@ import type { Env } from '../shared/types.ts';
 
 // Every collaborator maybeRunDailyJobs calls out to is mocked so this test is
 // purely about how the daily-jobs entry point resolves + wires
-// FMP_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE, not about enrichment/price/share
+// ST_PEER_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE, not about enrichment/price/share
 // business logic (those have their own test suites).
 const mocks = vi.hoisted(() => ({
   resolveSecrets: vi.fn(),
@@ -201,7 +201,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
     });
   });
 
-  it('folds FMP_MAX_PER_MINUTE and EDGAR_MAX_PER_MINUTE into the market-data lane resolveSecrets call alongside the USAGE_MONITOR_* vars', async () => {
+  it('folds ST_PEER_MAX_PER_MINUTE and EDGAR_MAX_PER_MINUTE into the market-data lane resolveSecrets call alongside the USAGE_MONITOR_* vars', async () => {
     const env = fakeEnv();
 
     await maybeRunDailyJobs(env, new Date('2026-07-10T00:00:00Z'));
@@ -214,7 +214,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
     expect(keys).toEqual(
       expect.arrayContaining([
         'ST_PEER_MAX_PER_MINUTE',
-        'FMP_MAX_PER_MINUTE',
         'EDGAR_MAX_PER_MINUTE',
         'USAGE_MONITOR_ENABLED',
         'USAGE_MONITOR_INGEST_URL',
@@ -224,10 +223,10 @@ describe('maybeRunDailyJobs secret resolution', () => {
     );
   });
 
-  it('passes the resolved FMP_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE through to runEnrichment/runPriceRefresh as maxPerMinute/edgarMaxPerMinute', async () => {
+  it('passes the resolved ST_PEER_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE through to runEnrichment/runPriceRefresh as maxPerMinute/edgarMaxPerMinute', async () => {
     const env = fakeEnv();
     mocks.resolveSecrets.mockResolvedValue({
-      FMP_MAX_PER_MINUTE: '123',
+      ST_PEER_MAX_PER_MINUTE: '123',
       EDGAR_MAX_PER_MINUTE: '456',
     });
 
@@ -543,24 +542,28 @@ describe('staggered daily lanes', () => {
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
   });
 
-  it('caps the catch-up pace at the configured pace when lower, reading the deprecated FMP name as a fallback', async () => {
+  it('caps the catch-up pace at the configured ST_PEER_MAX_PER_MINUTE when that is lower', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    mocks.resolveSecrets.mockResolvedValue({ ST_PEER_MAX_PER_MINUTE: '30' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 30 });
+  });
+
+  it('ignores the retired FMP_MAX_PER_MINUTE name', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
     (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
     mocks.resolveSecrets.mockResolvedValue({ FMP_MAX_PER_MINUTE: '30' });
 
     expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
-    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 30 });
-  });
-
-  it('prefers ST_PEER_MAX_PER_MINUTE over the deprecated FMP_MAX_PER_MINUTE', async () => {
-    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
-    const env = laneEnv(kv);
-    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
-    mocks.resolveSecrets.mockResolvedValue({ ST_PEER_MAX_PER_MINUTE: '45', FMP_MAX_PER_MINUTE: '285' });
-
-    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
-    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 45 });
+    // Not read, so the catch-up keeps its own 60/min default.
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 60 });
+    for (const [, keys] of mocks.resolveSecrets.mock.calls) {
+      expect(keys).not.toContain('FMP_MAX_PER_MINUTE');
+    }
   });
 
   it('runs again in later hourly slots while pending shrinks, resuming from the cursor', async () => {
