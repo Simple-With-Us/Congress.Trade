@@ -1,5 +1,9 @@
 # Current Handoff
 
+## 2026-10-25 GROK — Empty fetch hand-off (CT-2447)
+
+A completed ingestion outbox row that stored no raw object, and a filing whose ingest_status is outside IngestStatus, now re-drive on the autonomy sweep and page as `empty_fetch_handoff`.  The same id is a critical `/api/health` check and is in `HEALTH_STALL_SKIP_IDS`, so it does not page twice.  Evidence for `E-2026-donald-j-trump-08-12-2026-278t` is in `docs/evidence/2026-10-25-orphan-278t.json`.  Part 7 is not empty.  This PR does not publish the filing.  CT-2447 stays open until the filing is recovered and published.  Branch `grok/empty-fetch-handoff`.  No merge from this seat.  Rollout: `docs/rollouts/2026-10-25-empty-fetch-handoff.md`.
+
 ## 2026-10-23 GB-COMPILER — Share payload schemaVersion (ST-3853)
 
 Vendored `congress-trading-shared` is now `v2.9.0`, which adds the optional `schemaVersion` to `SharePayloadSchema`.  `POST /api/admin/securities/import` resolves the peer's contract version, warns on unsupported or malformed values, and echoes `schemaVersion` in the response; the version is never a rejection reason, so mixed deploys keep importing.  Rollout: `docs/rollouts/2026-10-23-st-3853-share-schema-version.md`.

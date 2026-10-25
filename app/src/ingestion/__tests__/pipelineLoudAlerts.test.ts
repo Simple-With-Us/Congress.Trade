@@ -78,7 +78,7 @@ function kvEnv() {
           if (/COUNT\(\*\) AS n[\s\S]*scanned_pdf/i.test(sql) && /filings f/i.test(sql)) {
             return { n: 2 } as T;
           }
-          if (/ingestion_outbox o/i.test(sql)) {
+          if (/FROM ingestion_outbox o/i.test(sql)) {
             return { n: 1 } as T;
           }
           if (/ingestion_decisions/i.test(sql)) {
@@ -133,6 +133,7 @@ describe('pipelineLoudAlerts', () => {
       status: 'stalled',
       checks: [
         { id: 'st_peer_prices', status: 'stalled', detail: '15 ticker(s) still need EOD/current prices' },
+        { id: 'empty_fetch_handoff', status: 'critical', detail: '1 filing(s) stored nothing' },
         { id: 'price_freshness', status: 'stalled', detail: 'behind' },
       ],
     } as never);
@@ -140,6 +141,8 @@ describe('pipelineLoudAlerts', () => {
     const result = await sweepPipelineStallAlerts(env, new Date('2026-10-12T18:00:00.000Z'));
     expect(result.evaluated).not.toContain('health_st_peer_prices');
     expect(result.alerted).not.toContain('health_st_peer_prices');
+    expect(result.evaluated).not.toContain('health_empty_fetch_handoff');
+    expect(result.alerted).not.toContain('health_empty_fetch_handoff');
     // The generic loop still runs for other checks.
     expect(result.evaluated).toContain('health_price_freshness');
   });

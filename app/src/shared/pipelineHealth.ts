@@ -49,6 +49,7 @@ import {
   collectStPeerPricesMetrics,
   stPeerPricesMetricsToCheck,
 } from '../prices/stPeerPricesHealth.ts';
+import { emptyFetchAlertWhere } from '../ingestion/emptyFetchHandoff.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -1360,6 +1361,56 @@ export function evaluatePipelineSignals(
 }
 
 /**
+ * `/api/health` check `empty_fetch_handoff`. Same id as the loud-alert
+ * condition, and the same WHERE as that condition (`emptyFetchAlertWhere`).
+ * A positive count is critical: the filing is outside every other detector.
+ * The stall sweep skips this id so the dedicated condition is the only page.
+ */
+export function emptyFetchHandoffHealthCheck(count: number | null): PipelineCheck {
+  if (count == null || !Number.isFinite(count)) {
+    return {
+      id: 'empty_fetch_handoff',
+      status: 'unknown',
+      detail: 'Empty-fetch handoff count uncollected',
+      value: null,
+    };
+  }
+  if (count > 0) {
+    return {
+      id: 'empty_fetch_handoff',
+      status: 'critical',
+      detail:
+        `${count} filing(s) have no raw object and no live transactions while ` +
+        `ingest_status is outside the valid union or the fetch outbox completed without storing one`,
+      value: count,
+    };
+  }
+  return {
+    id: 'empty_fetch_handoff',
+    status: 'ok',
+    detail: 'No empty-fetch handoff outside a terminal ingest status',
+    value: 0,
+  };
+}
+
+async function collectEmptyFetchHandoffCheck(env: Env): Promise<PipelineCheck> {
+  try {
+    const where = emptyFetchAlertWhere('f', 'o');
+    const row = await get<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n
+         FROM filings f
+         LEFT JOIN ingestion_outbox o ON o.doc_id = f.doc_id
+        WHERE ${where}`,
+    );
+    const n = Number(row?.n ?? 0);
+    return emptyFetchHandoffHealthCheck(Number.isFinite(n) ? n : null);
+  } catch {
+    return emptyFetchHandoffHealthCheck(null);
+  }
+}
+
+/**
  * Collect signals from DB and evaluate health.
  */
 export async function checkPipelineHealth(env: Env, now = new Date()): Promise<PipelineHealth> {
@@ -1900,7 +1951,8 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     readPipelineStallHours(env, 'st_peer_prices'),
   );
   const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
-  const checks = [...evaluated.checks, stPeerCheck];
+  const emptyFetchCheck = await collectEmptyFetchHandoffCheck(env);
+  const checks = [...evaluated.checks, stPeerCheck, emptyFetchCheck];
   let status: PipelineStatus = 'ok';
   for (const c of checks) {
     status = worstStatus(status, c.status);

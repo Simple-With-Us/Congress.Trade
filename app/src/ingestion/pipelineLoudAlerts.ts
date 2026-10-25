@@ -35,6 +35,7 @@ import {
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { emptyFetchAlertWhere } from './emptyFetchHandoff.ts';
 
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
@@ -62,6 +63,13 @@ export type PipelineStallCondition =
   | 'st_peer_prices'
   | 'st_inbound_market_data'
   | 'st_outbound_share_push'
+  /**
+   * Filing outside IngestStatus, or a completed fetch hand-off with no raw
+   * object. Same id as the `/api/health` check. Listed in
+   * HEALTH_STALL_SKIP_IDS so the generic health loop does not open a second
+   * `health_empty_fetch_handoff` episode.
+   */
+  | 'empty_fetch_handoff'
   /** `/api/health` check ids (ingest outbox, extract, delivery, probes, …). */
   | `health_${string}`;
 
@@ -74,6 +82,8 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   // evaluateStPeerPricesStall).  Without this skip the generic loop raises a
   // second health_st_peer_prices episode, so every stall and recovery pages twice.
   'st_peer_prices',
+  // Same id as the dedicated empty_fetch_handoff condition and the health check.
+  'empty_fetch_handoff',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -382,6 +392,42 @@ function hoursLabel(lastAt: string | null, now: Date): string {
   return ((now.getTime() - lastMs) / 3_600_000).toFixed(1);
 }
 
+/**
+ * Page when a filing is sitting outside the statuses the other detectors
+ * watch: no raw object, no live transactions, and either an ingest_status
+ * the type union does not allow or a completed outbox that stored nothing.
+ * `ocr_scan_reader` requires a raw object, so this class never reached it.
+ */
+export async function evaluateEmptyFetchHandoff(env: Env): Promise<StallEval> {
+  try {
+    const where = emptyFetchAlertWhere('f', 'o');
+    const from = `FROM filings f
+         LEFT JOIN ingestion_outbox o ON o.doc_id = f.doc_id
+        WHERE ${where}`;
+    const row = await get<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n ${from}`,
+    );
+    const n = Number(row?.n ?? 0);
+    if (!Number.isFinite(n) || n <= 0) {
+      return { stalled: false, detail: 'no empty-fetch handoff outside a terminal ingest status' };
+    }
+    const wake = await get<{ doc_id: string }>(
+      env.DB,
+      `SELECT f.doc_id AS doc_id ${from} ORDER BY f.first_seen_at ASC LIMIT 1`,
+    );
+    return {
+      stalled: true,
+      detail:
+        `${n} filing(s) have no raw object and no live transactions while ` +
+        `ingest_status is outside the valid union or the fetch outbox completed without storing one`,
+      wakeDocId: wake?.doc_id ?? null,
+    };
+  } catch {
+    return { stalled: false, detail: 'empty-fetch handoff count unavailable', skip: true };
+  }
+}
+
 async function evaluateOcrStall(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   const backlog = await countScannedReaderBacklog(env);
   const workUnits = backlog.pending + backlog.failed;
@@ -649,6 +695,15 @@ export async function sweepPipelineStallAlerts(
     env,
     'ocr_scan_reader',
     await evaluateOcrStall(env, now, ocrThresholdMs),
+    now,
+    result,
+    deps,
+  );
+
+  await processStallCondition(
+    env,
+    'empty_fetch_handoff',
+    await evaluateEmptyFetchHandoff(env),
     now,
     result,
     deps,
