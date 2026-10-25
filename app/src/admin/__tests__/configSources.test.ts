@@ -46,7 +46,7 @@ describe('GET /config-sources (single-source-of-truth audit)', () => {
     expect(body.bootstrap.map((e) => e.key)).toContain('INFISICAL_APP_CLIENT_ID');
     // The knobs consolidated in this change are all in the registry.
     for (const key of [
-      'ST_PEER_MAX_PER_MINUTE', 'FMP_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE', 'DISCLOSURE_LATENCY_PROVIDERS',
+      'ST_PEER_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE', 'DISCLOSURE_LATENCY_PROVIDERS',
       'SEED_HOUSE_URL', 'HOUSE_LIVE_SEARCH_ENABLED', 'ARBITRATION_ENABLED',
       'VISION_PRIMARY_MODEL', 'ADMIN_OPEN_IN_DEV',
     ]) {

@@ -39,24 +39,17 @@ export function createPacer(maxPerMinute?: number): () => Promise<void> {
 export const ST_PEER_SAFE_MAX_PER_MINUTE = 100;
 
 /**
- * The configured ST peer pace:  ST_PEER_MAX_PER_MINUTE, else the deprecated
- * FMP_MAX_PER_MINUTE (the old name, from when FMP was a price source;  FMP is
- * now latency probes only and never paced here).  Undefined when neither is a
- * positive integer.  getSharedStPeerPacer applies the ceiling.
+ * The configured ST peer pace from ST_PEER_MAX_PER_MINUTE, as resolved through
+ * the Infisical-backed settings path (resolveSecrets).  Undefined when it is not
+ * a positive integer.  getSharedStPeerPacer applies the ceiling.
  */
-export function stPeerMaxPerMinute(vars: {
-  ST_PEER_MAX_PER_MINUTE?: string;
-  FMP_MAX_PER_MINUTE?: string;
-}): number | undefined {
-  for (const raw of [vars.ST_PEER_MAX_PER_MINUTE, vars.FMP_MAX_PER_MINUTE]) {
-    const n = parseInt(raw || '', 10);
-    if (n > 0) return n;
-  }
-  return undefined;
+export function stPeerMaxPerMinute(vars: { ST_PEER_MAX_PER_MINUTE?: string }): number | undefined {
+  const n = parseInt(vars.ST_PEER_MAX_PER_MINUTE || '', 10);
+  return n > 0 ? n : undefined;
 }
 
-/** Names to resolve for stPeerMaxPerMinute, new name first. */
-export const ST_PEER_PACE_SECRET_NAMES = ['ST_PEER_MAX_PER_MINUTE', 'FMP_MAX_PER_MINUTE'] as const;
+/** The setting name to resolve for stPeerMaxPerMinute. */
+export const ST_PEER_PACE_SECRET_NAMES = ['ST_PEER_MAX_PER_MINUTE'] as const;
 
 /** A requested pace clamped to (0, ST_PEER_SAFE_MAX_PER_MINUTE];  unset means the ceiling. */
 export function clampStPeerMaxPerMinute(maxPerMinute?: number): number {
