@@ -3,6 +3,7 @@ import {
   clampStPeerMaxPerMinute,
   createPacer,
   getSharedStPeerPacer,
+  ST_PEER_PACE_SECRET_NAMES,
   ST_PEER_SAFE_MAX_PER_MINUTE,
   stPeerMaxPerMinute,
   __resetSharedStPeerPacerForTests,
@@ -105,11 +106,12 @@ describe('getSharedStPeerPacer', () => {
 });
 
 describe('stPeerMaxPerMinute', () => {
-  it('prefers ST_PEER_MAX_PER_MINUTE and falls back to the deprecated FMP_MAX_PER_MINUTE', () => {
-    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: '90', FMP_MAX_PER_MINUTE: '285' })).toBe(90);
-    expect(stPeerMaxPerMinute({ FMP_MAX_PER_MINUTE: '285' })).toBe(285);
-    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: 'x', FMP_MAX_PER_MINUTE: '40' })).toBe(40);
+  it('reads only ST_PEER_MAX_PER_MINUTE', () => {
+    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: '90' })).toBe(90);
+    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: 'x' })).toBeUndefined();
+    expect(stPeerMaxPerMinute({ ST_PEER_MAX_PER_MINUTE: '0' })).toBeUndefined();
     expect(stPeerMaxPerMinute({})).toBeUndefined();
+    expect(ST_PEER_PACE_SECRET_NAMES).toEqual(['ST_PEER_MAX_PER_MINUTE']);
   });
 });
 

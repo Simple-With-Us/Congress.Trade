@@ -38,8 +38,6 @@ export const DEFAULT_DAILY_CAP = 230;
 type EnvX = Env & {
   FMP_DAILY_CALL_CAP?: string;
   ST_PEER_MAX_PER_MINUTE?: string;
-  /** Deprecated name for ST_PEER_MAX_PER_MINUTE. */
-  FMP_MAX_PER_MINUTE?: string;
   EDGAR_MAX_PER_MINUTE?: string;
   APP_B_IMPORT_URL?: string;
   APP_B_INGEST_TOKEN?: string;
@@ -478,10 +476,9 @@ export async function runEnrichment(
   const hasKeyedProvider = chain.some((e) => KEYED_PROVIDER_SOURCE_MARKERS.includes(e.name));
   const candidates = await selectTickersToEnrich(env, selectLimit, hasKeyedProvider);
   // Shared per-isolate ST peer pacer, so a concurrent price refresh can't blow
-  // ST's per-minute limit by pacing only its own calls. Fall back to the
-  // configured pace (ST_PEER_MAX_PER_MINUTE, else the deprecated
-  // FMP_MAX_PER_MINUTE) when a caller passes nothing;  the pacer clamps it.
-  const pace = getSharedStPeerPacer(opts.maxPerMinute ?? stPeerMaxPerMinute(envx));
+  // ST's per-minute limit by pacing only its own calls.  Use the configured
+  // ST_PEER_MAX_PER_MINUTE when a caller passes nothing;  the pacer clamps it.
+  const pace = getSharedStPeerPacer(opts.maxPerMinute ?? stPeerMaxPerMinute(runtimeSecrets));
   // SEC EDGAR's own dedicated pacer — a separate provider with a separate
   // fair-access limit, so it does NOT draw on the ST peer pacer above. Same
   // env fallback so admin-triggered runs don't poison it either.
