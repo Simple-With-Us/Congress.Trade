@@ -29,8 +29,9 @@ interface SqliteRunResult {
   changes: number | bigint;
 }
 interface SqliteStatement {
-  get(...params: unknown[]): Record<string, unknown> | undefined;
-  all(...params: unknown[]): Array<Record<string, unknown>>;
+  // libsql's Statement.get returns unknown. The wrapper casts at the D1 boundary.
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
   run(...params: unknown[]): SqliteRunResult;
 }
 export interface SqliteDatabase {

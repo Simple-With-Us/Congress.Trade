@@ -195,7 +195,7 @@ export interface EmptyFetchRefetchDoc {
   docId: string;
   chamber: string | null;
   sourceUrl: string | null;
-  ingestStatus: string;
+  ingestStatus: string | null;
 }
 
 /**
@@ -232,7 +232,7 @@ export async function rearmFilingForEmptyFetch(
             model_version = NULL,
             confidence = NULL
       WHERE doc_id = ?
-        AND ingest_status = ?
+        AND ingest_status IS ?
         AND (raw_object_key IS NULL OR TRIM(raw_object_key) = '')`,
     [doc.docId, doc.ingestStatus],
   );
@@ -275,7 +275,7 @@ export async function rearmFilingForEmptyFetch(
  */
 export async function parkEmptyFetchHandoff(
   env: Env,
-  doc: { docId: string; ingestStatus: string },
+  doc: { docId: string; ingestStatus: string | null },
   now: Date,
 ): Promise<boolean> {
   const nowIso = now.toISOString();
@@ -285,7 +285,7 @@ export async function parkEmptyFetchHandoff(
         SET ingest_status = 'needs_review',
             error = ?
       WHERE doc_id = ?
-        AND ingest_status = ?`,
+        AND ingest_status IS ?`,
     [EMPTY_FETCH_HANDOFF_REASON, doc.docId, doc.ingestStatus],
   );
   if ((filing.meta?.changes ?? 0) === 0) return false;
@@ -293,7 +293,11 @@ export async function parkEmptyFetchHandoff(
     env.DB,
     `INSERT INTO review_queue (doc_id, reason, payload, created_at, resolved)
      VALUES (?, ?, ?, ?, 0)
-     ON CONFLICT(doc_id) DO NOTHING`,
+     ON CONFLICT(doc_id) DO UPDATE SET
+       reason = excluded.reason,
+       payload = excluded.payload,
+       created_at = excluded.created_at
+     WHERE review_queue.resolved = 0`,
     [doc.docId, EMPTY_FETCH_HANDOFF_REASON, JSON.stringify({ kind: EMPTY_FETCH_HANDOFF_REASON }), nowIso],
   );
   await run(

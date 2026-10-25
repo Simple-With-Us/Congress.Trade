@@ -24,12 +24,13 @@ import { all, batch, run } from '../shared/db.ts';
 import { FETCH_NOT_PUBLISHED_WINDOW_MS } from './fetcher.ts';
 import {
   EMPTY_FETCH_CYCLE_CAP,
-  VALID_INGEST_STATUSES,
   type EmptyFetchSweepResult,
   clampEmptyFetchLimit,
+  completedEmptyIngestStatusSql,
   isCompletedEmptyRawHandoff,
   isPastFetchNotPublishedWindow,
   isUngroundedIngestStatus,
+  ungroundedIngestStatusSql,
 } from './emptyFetchHandoff.ts';
 import { parkEmptyFetchHandoff, rearmFilingForEmptyFetch } from './outbox.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
@@ -191,21 +192,22 @@ interface EmptyFetchCandidate {
   doc_id: string;
   chamber: string | null;
   source_url: string | null;
-  ingest_status: string;
+  ingest_status: string | null;
   raw_object_key: string | null;
   first_seen_at: string | null;
   live_n: number | null;
   outbox_status?: string | null;
 }
 
-const VALID_INGEST_STATUS_SQL = VALID_INGEST_STATUSES.map((status) => `'${status}'`).join(', ');
-
 /**
- * Re-drive a filing whose ingest_status is outside IngestStatus, once it is
- * older than fetcher.ts FETCH_NOT_PUBLISHED_WINDOW_MS (7 days). Inside that
- * window a 404 is still "not yet published", so the sweep waits. The write
- * matches watcher.ts's not_found/failed upgrade: status `new`, raw key
- * cleared, outbox `pending` with attempts 0, then enqueueIngestionOutboxNow.
+ * Re-drive a filing whose ingest_status is outside IngestStatus, including
+ * NULL, once it is older than fetcher.ts FETCH_NOT_PUBLISHED_WINDOW_MS
+ * (7 days). Operational statuses (`not_found`, `failed`, `provider_seeded`)
+ * keep their watcher upgrade path and are not selected. Inside the window a
+ * 404 is still "not yet published", so the sweep waits. The write matches
+ * watcher.ts's not_found/failed upgrade: status `new`, raw key cleared,
+ * outbox `pending` with attempts 0, then enqueueIngestionOutboxNow. Each
+ * pass counts a dead-letter cycle and parks at EMPTY_FETCH_CYCLE_CAP.
  * Bounded. dryRun reports the doc ids and writes nothing.
  */
 export async function sweepUngroundedIngestStatus(
@@ -223,7 +225,7 @@ export async function sweepUngroundedIngestStatus(
               WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL) AS live_n
        FROM filings f
       WHERE f.doc_id NOT LIKE ?
-        AND f.ingest_status NOT IN (${VALID_INGEST_STATUS_SQL})
+        AND ${ungroundedIngestStatusSql('f')}
         AND (f.raw_object_key IS NULL OR TRIM(f.raw_object_key) = '')
         AND f.first_seen_at IS NOT NULL
         AND f.first_seen_at < ?
@@ -268,7 +270,7 @@ export async function sweepCompletedEmptyRawHandoff(
       WHERE o.status = 'completed'
         AND f.doc_id NOT LIKE ?
         AND (f.raw_object_key IS NULL OR TRIM(f.raw_object_key) = '')
-        AND f.ingest_status NOT IN ('persisted', 'verified_empty', 'error', 'needs_review')
+        AND ${completedEmptyIngestStatusSql('f')}
         AND f.first_seen_at IS NOT NULL
         AND f.first_seen_at < ?
         AND NOT EXISTS (
@@ -320,7 +322,7 @@ async function applyEmptyFetchCandidates(
       ingestStatus: row.ingest_status,
     };
     const outcome = await rearmFilingForEmptyFetch(env, doc, now, {
-      incrementCycles: kind === 'completed',
+      incrementCycles: true,
       cycleCap: EMPTY_FETCH_CYCLE_CAP,
     });
     if (outcome === 'rearmed') {
