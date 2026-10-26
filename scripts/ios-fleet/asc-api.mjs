@@ -38,7 +38,9 @@
 import { execFileSync } from "node:child_process";
 import { createSign } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
@@ -47,6 +49,22 @@ import {
 } from "./version-plan.mjs";
 
 const INFISICAL_ASC_FOLDER = "/asc";
+
+// The train an app ships on ("1.1" for marketingVersionDefault "1.1.0"), read
+// from this directory's apps.json by bundle id.  Falls back to "1.0" when the
+// bundle is not listed, which is the train every app used before per-app trains.
+function trainPrefixForBundle(bundleId) {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const apps = JSON.parse(readFileSync(join(here, "apps.json"), "utf8")).apps || {};
+    const entry = Object.values(apps).find((a) => a && a.bundleId === bundleId);
+    const m = entry && /^(\d+)\.(\d+)\./.exec(String(entry.marketingVersionDefault || ""));
+    if (m) return `${m[1]}.${m[2]}`;
+  } catch {
+    // fall through to the default train
+  }
+  return "1.0";
+}
 
 /**
  * Read one value from Infisical Fleet-OPS through `fleet-secrets get`.
@@ -1104,8 +1122,9 @@ async function main() {
       process.exit(2);
     }
     const storeVersionStrings = appStoreVersions.map((v) => v.versionString);
+    const planPrefix = trainPrefixForBundle(bundleId);
     const patch = nextMarketingPatch({
-      prefix: "1.0",
+      prefix: planPrefix,
       appStoreVersions: storeVersionStrings,
       trains: trainRes.trains
     }) - 1;
@@ -1117,7 +1136,7 @@ async function main() {
           platform,
           appStoreVersions,
           newestBuilds,
-          nextMarketing: `1.0.${patch + 1}`
+          nextMarketing: `${planPrefix}.${patch + 1}`
         },
         null,
         2
