@@ -245,7 +245,7 @@ run_ship() { # run_ship <app key> [args...]
     PATH="${FAKE_BIN}:/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="${WORK}/tmp" \
     IOS_FLEET_STATE_DIR="$STATE" \
-    IOS_FLEET_APPS_JSON="$APPS_FIXTURE" \
+    IOS_FLEET_APPS_JSON="${REGISTRY_OVERRIDE:-$APPS_FIXTURE}" \
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     ASC_KEY_ID=fake \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
@@ -450,8 +450,38 @@ FAKE_ASC_PATCH=5
 FAKE_ASC_FLOOR=5
 echo
 
-# --- 7. The shared planner agrees with what the scripts did -----------------
-echo "7. the shared release planner agrees with the real scripts"
+# --- 7. An apps-registry override is validated -------------------------------
+echo "7. an apps-registry override is validated before it steers a ship"
+BAD_JSON="${WORK}/not-a-registry.json"
+printf '%s' '{ this is not json' >"$BAD_JSON"
+REGISTRY_OVERRIDE="$BAD_JSON"
+run_ship ct-ios --dry-run
+check "an override that is not a valid registry is refused (rc ${RC})" \
+  "$([[ $RC -ne 0 && "$OUT" == *"IOS_FLEET_APPS_JSON"* ]] && echo 0 || echo 1)"
+
+WORLD_WRITABLE="${WORK}/world-writable-apps.json"
+cp "$APPS_FIXTURE" "$WORLD_WRITABLE"
+chmod 666 "$WORLD_WRITABLE"
+REGISTRY_OVERRIDE="$WORLD_WRITABLE"
+run_ship ct-ios --dry-run
+check "an override anyone can write is refused (rc ${RC})" \
+  "$([[ $RC -ne 0 && "$OUT" == *"IOS_FLEET_APPS_JSON"* ]] && echo 0 || echo 1)"
+
+SYMLINKED="${WORK}/symlinked-apps.json"
+ln -sf "$APPS_FIXTURE" "$SYMLINKED"
+REGISTRY_OVERRIDE="$SYMLINKED"
+run_ship ct-ios --dry-run
+check "a symlinked override is refused (rc ${RC})" \
+  "$([[ $RC -ne 0 && "$OUT" == *"IOS_FLEET_APPS_JSON"* ]] && echo 0 || echo 1)"
+
+REGISTRY_OVERRIDE=""
+run_ship ct-ios --dry-run
+check "the checked-in override path still works (rc ${RC})" \
+  "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
+echo
+
+# --- 8. The shared planner agrees with what the scripts did -----------------
+echo "8. the shared release planner agrees with the real scripts"
 cat >"${WORK}/plan.json" <<JSON
 {
   "commitCount": ${LATER_COUNT},

@@ -40,6 +40,25 @@ test("a platform with no declared native tree never ships on a path change", () 
   assert.equal(nativePathsChanged([null, "  "], ["clients/ios/App.swift"]), false);
 });
 
+test("a half-empty published record fails closed instead of pretending there is no floor", () => {
+  const halfEmpty = (published) => () => planRelease({
+    platforms: [{ ...IOS, published }],
+    changedPaths: ["clients/ios/App.swift"],
+    commitCount: 130
+  });
+  assert.throws(halfEmpty({ marketing: "1.0.118" }), /incomplete/);
+  assert.throws(halfEmpty({ build: "118" }), /incomplete/);
+  assert.throws(halfEmpty({ marketing: "", build: "" }), /incomplete/);
+  // A platform that has never shipped still has no published release, and
+  // that is not an error.
+  const neverShipped = planRelease({
+    platforms: [{ ...IOS, published: null }],
+    changedPaths: ["clients/ios/App.swift"],
+    commitCount: 130
+  });
+  assert.equal(neverShipped.shipping.length, 1);
+});
+
 test("a native change releases only the platform whose tree changed", () => {
   const iosOnly = planRelease({
     platforms: [IOS, MAC],

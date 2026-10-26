@@ -42,8 +42,7 @@ import { join } from "node:path";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
-  highestPublishedMarketingPatch,
-  nextMarketingPatch
+  highestPublishedMarketingPatch
 } from "./version-plan.mjs";
 
 const INFISICAL_ASC_FOLDER = "/asc";
@@ -769,9 +768,10 @@ async function main() {
   // App Store version workflow.  The RULES live in ./version-plan.mjs (pure,
   // no I/O); this client only reads the App Store Connect state they need.
   //
-  //   latest-marketing-patch  one less than the next FREE patch on a train (P, so P + 1 is free);
-  //                          drift trains (a <prefix>.N train holding build
-  //                          "N") ignored
+  //   latest-marketing-patch  the highest published patch on the train, over
+  //                          App Store versions and TestFlight trains, drift
+  //                          trains (a <prefix>.N train holding build "N")
+  //                          included
   //   build-floor             the build number the next ship has to exceed
   //   appstore-version-plan   READ ONLY report of the App Store versions and
   //                          the newest builds
@@ -825,7 +825,7 @@ async function main() {
   }
 
   // A rejected credential (401/403) exits 4, not 2, so the ship script can
-  // refuse it even under --allow-unverified-seq.
+  // refuse it outright instead of treating it as a generic failure.
   const failExit = (status) => process.exit(status === 401 || status === 403 ? 4 : 2);
 
   // App Store Connect data is checked before it is used:  a version string
@@ -1095,21 +1095,17 @@ async function main() {
       console.error(`appstore-version-plan: preReleaseVersions query failed (HTTP ${trainRes.status})`);
       process.exit(2);
     }
-    const storeVersionStrings = appStoreVersions.map((v) => v.versionString);
-    const patch = nextMarketingPatch({
-      prefix: "1.0",
-      appStoreVersions: storeVersionStrings,
-      trains: trainRes.trains
-    }) - 1;
-
+    // The report describes published state only.  It does not advertise a
+    // next marketing version: the fleet protocol takes that from the
+    // repository commit count, and an independent allocator here would
+    // disagree with the ship validator.
     console.log(
       JSON.stringify(
         {
           bundleId,
           platform,
           appStoreVersions,
-          newestBuilds,
-          nextMarketing: `1.0.${patch + 1}`
+          newestBuilds
         },
         null,
         2

@@ -91,8 +91,15 @@ test("a --version override cannot regress or change the 1.0.N train", () => {
   }), /conflicts with canonical marketing version 1.0.237/);
 });
 
+test("a malformed published build is skipped instead of blocking every ship", () => {
+  // The published state is outside the repository's control, so one bad
+  // value is ignored and the rest of the floor still applies.
+  assert.equal(buildFloor({ trainBuilds: ["not-a-build"], appBuilds: [], platform: "IOS" }), 0);
+  assert.equal(buildFloor({ trainBuilds: ["not-a-build", "225"], appBuilds: ["224"], platform: "IOS" }), 225);
+  assert.equal(buildFloor({ trainBuilds: [], appBuilds: ["not-a-build", "12"], platform: "MAC_OS" }), 12);
+});
+
 test("unknown, malformed, or conflicting published floors fail closed", () => {
-  assert.throws(() => buildFloor({ trainBuilds: ["not-a-build"] }), /unknown build/);
   assert.throws(() => planVersion({ commitCount: 237, ascPatch: 236, floor: Number.NaN }), /unknown or invalid/);
   for (const unknown of [null, undefined, "", "   "]) {
     assert.throws(() => planVersion({ commitCount: 237, ascPatch: 236, floor: unknown }), /unknown or invalid/);

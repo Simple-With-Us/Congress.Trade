@@ -44,7 +44,11 @@ function main() {
     const tracked = execFileSync("git", ["-C", repoRoot, "ls-files", "-z"], { encoding: "utf8" })
       .split("\0").filter(Boolean);
     files = tracked
-      .filter((path) => /(^|\/)(?:ship|publish|release)[^/]*\.(?:sh|mjs|js)$/.test(path))
+      // The App Store Connect helper reads the registry and the published
+      // state, so it carries release decisions too and is scanned with the
+      // ship scripts.
+      .filter((path) => /(^|\/)(?:ship|publish|release)[^/]*\.(?:sh|mjs|js)$/.test(path)
+        || /(^|\/)asc-api\.mjs$/.test(path))
       .map((path) => resolve(repoRoot, path));
   }
   if (!files.includes(canonical)) files.unshift(canonical);

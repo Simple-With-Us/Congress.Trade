@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { inspectReleasePolicy } from "./check-version-policy.mjs";
+
+const ascApiPath = fileURLToPath(new URL("./asc-api.mjs", import.meta.url));
 
 const canonical = `
 const SHALLOW="$(git rev-parse --is-shallow-repository)";
@@ -26,4 +30,11 @@ test("checked-in copies with independent allocation or fallback are rejected", (
 
 test("missing required canonical checks are rejected", () => {
   assert.ok(inspectReleasePolicy("ship-testflight.sh", "MARKETING='1.0.1'", { canonicalSource: true }).length > 0);
+});
+
+test("the App Store Connect helper carries no independent next-marketing allocator", () => {
+  const source = readFileSync(ascApiPath, "utf8");
+  assert.deepEqual(inspectReleasePolicy("asc-api.mjs", source), []);
+  assert.ok(!source.includes("nextMarketingPatch"));
+  assert.ok(!source.includes("nextMarketing"));
 });

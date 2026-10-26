@@ -89,12 +89,18 @@ function publishedFloors(published, prefix) {
   }
   const marketing = String(published.marketing == null ? "" : published.marketing).trim();
   const build = String(published.build == null ? "" : published.build).trim();
-  const ascPatch = marketing ? parsePatch(marketing, prefix) : 0;
-  const floor = build ? integerBuild(build) : 0;
-  if (marketing && ascPatch === null) {
+  // A record that claims a published release but is missing a field is an
+  // inconsistent published state, not "no published release": fail closed
+  // instead of pretending the floor is 0.
+  if (!marketing || !build) {
+    throw new Error(`published release record is incomplete: marketing=${JSON.stringify(marketing)} build=${JSON.stringify(build)}`);
+  }
+  const ascPatch = parsePatch(marketing, prefix);
+  const floor = integerBuild(build);
+  if (ascPatch === null) {
     throw new Error(`published marketing version ${marketing} is not on the ${prefix}.N train`);
   }
-  if (build && floor === null) {
+  if (floor === null) {
     throw new Error(`published build ${build} is unknown or invalid`);
   }
   return { ascPatch, floor, marketing, build };

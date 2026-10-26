@@ -104,8 +104,37 @@ FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 # The apps registry.  IOS_FLEET_APPS_JSON lets an app that keeps its own
 # registry, and the offline cross-platform test that needs a two-platform
 # fixture, point at a different file.  The default is the canonical registry
-# that ships next to this script.
-APPS_JSON="${IOS_FLEET_APPS_JSON:-${FLEET_DIR}/apps.json}"
+# that ships next to this script.  An override steers bundle ids, project
+# paths and uploads, so it is validated before anything reads it: it must be
+# a regular file (not a symlink), not writable by anyone but its owner, and
+# a registry object.
+APPS_JSON="${FLEET_DIR}/apps.json"
+if [[ -n "${IOS_FLEET_APPS_JSON:-}" ]]; then
+  if ! /usr/bin/python3 - "${IOS_FLEET_APPS_JSON}" <<'PYREG'
+import json, os, stat, sys
+path = sys.argv[1]
+try:
+    st = os.lstat(path)
+except OSError:
+    sys.exit(1)
+if not stat.S_ISREG(st.st_mode):
+    sys.exit(1)
+if st.st_mode & 0o022:
+    sys.exit(1)
+try:
+    with open(path) as handle:
+        data = json.load(handle)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict) or not isinstance(data.get("apps"), dict):
+    sys.exit(1)
+PYREG
+  then
+    echo "error: IOS_FLEET_APPS_JSON must be a regular file, not writable by anyone but its owner, and a valid apps registry: ${IOS_FLEET_APPS_JSON}" >&2
+    exit 2
+  fi
+  APPS_JSON="${IOS_FLEET_APPS_JSON}"
+fi
 TEAM_ID="CC8UTF7ATG"
 FLEET_SECRETS_BIN="${FLEET_SECRETS:-${HOME}/.local/bin/fleet-secrets}"
 # Temp dir holding the .p8 read from Infisical /asc (0700 dir, 0600 file), removed on exit.

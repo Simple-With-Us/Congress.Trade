@@ -186,13 +186,15 @@ export function buildFloor({ trainBuilds = [], appBuilds = [], platform = "" } =
 
   for (const build of trainBuilds || []) {
     const parsed = integerBuild(build);
-    if (parsed === null) throw new Error(`unknown build in published marketing train: ${String(build)}`);
+    // A published value outside the repository's control is skipped, never
+    // fatal: one malformed record must not abort every release.
+    if (parsed === null) continue;
     if (parsed > floor) floor = parsed;
   }
 
   for (const build of appBuilds || []) {
     const parsed = integerBuild(build);
-    if (parsed === null) throw new Error(`unknown published app build: ${String(build)}`);
+    if (parsed === null) continue;
     if (isMac) {
       if (parsed > floor) floor = parsed;
     } else if (parsed < 1000000000 && parsed > floor) {
