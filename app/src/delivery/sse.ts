@@ -530,10 +530,13 @@ export async function drainSseBacklog(
   send: (chunk: string) => Promise<void>,
 ): Promise<number> {
   let hwm = cursor;
-  // Subscriber alert pause (CT_DELIVERY_MODE=hold): emit nothing and keep the
-  // cursor where it is, so the stream resumes from here once delivery is
-  // switched back.  'suppress' keeps streaming but skips suppressed rows.
-  if (readDeliveryMode() === 'hold') return hwm;
+  // Subscriber alert pause (CT_DELIVERY_MODE hold or suppress): emit nothing
+  // and keep the cursor where it is, so the stream resumes from here once
+  // delivery is switched back.  Suppress pauses too: the flush marks rows
+  // 'suppressed' only on its next tick, so streaming during suppress would
+  // leak rows written since the last flush.  After resume the drain skips
+  // rows that ended up suppressed.
+  if (readDeliveryMode() !== 'deliver') return hwm;
   // Drain a bounded number of pages. If more history remains, the next poll
   // tick continues from this exact high-water cursor without gaps.
   for (let page = 0; page < MAX_DRAIN_PAGES_PER_TICK; page += 1) {
@@ -573,8 +576,9 @@ export async function drainSseBacklog(
 
     for (const row of rows) {
       const tx: Transaction = mapFeedTransaction(row);
-      // Suppressed (CT_DELIVERY_MODE=suppress) rows are never alerted; still
-      // advance past them so a fully suppressed page cannot stall the stream.
+      // Suppressed (CT_DELIVERY_MODE=suppress) rows are never alerted, also
+      // on catch-up after delivery resumed; still advance past them so a
+      // fully suppressed page cannot stall the stream.
       if (row.__outbox_status === 'suppressed') {
         hwm = Math.max(hwm, tx.cursorSeq);
         continue;

@@ -427,6 +427,43 @@ async function resolveAdminActor(c: Context<{ Bindings: Env }>): Promise<string>
 }
 
 /**
+ * Actor for the delivery_mode_audit trail, from VERIFIED identity only.
+ * Unlike resolveAdminActor(), the client-supplied
+ * Cf-Access-Authenticated-User-Email header is never trusted on its own: a
+ * bearer ADMIN_TOKEN caller can send any value there.  Order: a Cloudflare
+ * Access JWT that verifies (signature + aud + allowlist), then the first-party
+ * session, then the shared token, labelled as such with any claimed email
+ * marked unverified.
+ */
+async function verifiedDeliveryModeActor(c: Context<{ Bindings: Env }>): Promise<string> {
+  const jwt = c.req.header('Cf-Access-Jwt-Assertion');
+  if (jwt) {
+    try {
+      const cfg = await adminRuntimeConfig(c.env);
+      if (cfg.accessAud && cfg.accessTeamDomain && cfg.allow.size > 0) {
+        const res = await verifyAccessJwt(jwt, {
+          aud: cfg.accessAud,
+          allow: cfg.allow,
+          jwksUrl: certsUrl(cfg.accessTeamDomain),
+        });
+        if (res.ok && res.email) return res.email.trim().toLowerCase();
+      }
+    } catch {
+      /* fall through to the next verified identity */
+    }
+  }
+  try {
+    const user = await getCurrentUserFromRequest(c);
+    if (user?.email) return user.email.trim().toLowerCase();
+  } catch {
+    /* fall through to the shared-token label */
+  }
+  const base = c.req.header('authorization') ? 'admin-token' : 'admin';
+  const claimed = c.req.header('Cf-Access-Authenticated-User-Email')?.trim().toLowerCase();
+  return claimed ? `${base} (unverified claim: ${claimed})` : base;
+}
+
+/**
  * PUT /settings for CT_DELIVERY_MODE (subscriber alert pause).  Validates the
  * value, writes Infisical first via the settings service (a failed write
  * fails the save and records nothing), then appends a delivery_mode_audit row
@@ -435,6 +472,13 @@ async function resolveAdminActor(c: Context<{ Bindings: Env }>): Promise<string>
  * know the trail is missing; the delivery_mode health check also turns
  * critical for an unaudited non-default mode.
  */
+/** Strict body for PUT /settings when key is CT_DELIVERY_MODE. */
+const DeliveryModePutBody = z.object({
+  key: z.string().trim().pipe(z.literal(DELIVERY_MODE_SETTING_KEY)),
+  value: z.string().trim().toLowerCase().pipe(z.enum(DELIVERY_MODES)),
+  reason: z.string().max(2000).nullable().optional(),
+}).strict();
+
 async function putDeliveryMode(
   c: Context<{ Bindings: Env }>,
   rawValue: string,
@@ -456,7 +500,20 @@ async function putDeliveryMode(
   } catch (err) {
     return c.json({ ok: false, error: (err as Error).message }, 502);
   }
-  const actor = await resolveAdminActor(c);
+  // The write must be visible to readers in this process: if the post-write
+  // refresh left the snapshot on another mode, report it instead of a
+  // success that leaves subscribers on the old mode.
+  const live = readDeliveryModeDetail();
+  if (live.mode !== value) {
+    return c.json({
+      ok: false,
+      key: DELIVERY_MODE_SETTING_KEY,
+      value: saved,
+      liveMode: live.mode,
+      error: `mode saved to Infisical but the live settings snapshot still reads ${live.mode}; nothing audited`,
+    }, 502);
+  }
+  const actor = await verifiedDeliveryModeActor(c);
   try {
     const audit = await recordDeliveryModeChange(c.env, {
       mode: value,
@@ -464,9 +521,8 @@ async function putDeliveryMode(
       actor,
       reason,
     });
-    console.warn(
-      `delivery_mode.changed ${previous.mode} -> ${value} by ${actor}${reason ? ` (${reason})` : ''} [${audit.id}]`,
-    );
+    // The free-form reason stays in delivery_mode_audit only, never in logs.
+    console.warn(`delivery_mode.changed ${previous.mode} -> ${value} by ${actor} [${audit.id}]`);
     return c.json({ ok: true, key: DELIVERY_MODE_SETTING_KEY, value: saved, previousMode: previous.mode, audit });
   } catch (err) {
     return c.json({
@@ -5384,7 +5440,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ ok: false, error: 'settings not initialized' }, 503);
     }
     if (key === DELIVERY_MODE_SETTING_KEY) {
-      return await putDeliveryMode(c, value, typeof body.reason === 'string' ? body.reason : null);
+      const parsed = DeliveryModePutBody.safeParse(body);
+      if (!parsed.success) {
+        return c.json({ ok: false, error: `invalid ${DELIVERY_MODE_SETTING_KEY} body: ${parsed.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ')}` }, 400);
+      }
+      return await putDeliveryMode(c, parsed.data.value, parsed.data.reason ?? null);
     }
     try {
       const saved = await appSettings().set(c.env, key, value);

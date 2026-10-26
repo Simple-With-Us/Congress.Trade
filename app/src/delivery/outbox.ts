@@ -208,8 +208,10 @@ export async function flushDeliveryOutbox(
 
 /**
  * Mode 'suppress': mark every not-yet-dispatched outbox row terminal
- * 'suppressed' (never sent) with an audit reason.  Rows a flush already
- * handed to the queue are caught by the consumer gate (queueHandlers.ts).
+ * 'suppressed' (never sent) with an audit reason, including 'enqueued' rows
+ * whose message is still in the queue: the consumer acks a suppressed row
+ * without sending (queueHandlers.ts), even after delivery has resumed, so a
+ * suppressed alert never fires late.
  */
 async function suppressPendingOutbox(env: Env, nowIso: string): Promise<number> {
   if (consumeGovernedD1Writes(env, 'delivery-outbox-suppress', 1) < 1) {
@@ -223,7 +225,7 @@ async function suppressPendingOutbox(env: Env, nowIso: string): Promise<number> 
         SET status = 'suppressed', last_error = ?, updated_at = ?
       WHERE tx_id IN (
         SELECT tx_id FROM delivery_outbox
-         WHERE status = 'pending' OR (status = 'sending' AND available_at <= ?)
+         WHERE status IN ('pending', 'enqueued') OR (status = 'sending' AND available_at <= ?)
          LIMIT ${DELIVERY_SUPPRESS_BATCH_LIMIT}
       )`,
     [reason, nowIso, nowIso],
@@ -278,7 +280,7 @@ export async function completeDeliveryOutbox(
     env.DB,
     `UPDATE delivery_outbox
         SET status = 'completed', available_at = ?, last_error = NULL, updated_at = ?
-      WHERE tx_id = ? AND status != 'completed'`,
+      WHERE tx_id = ? AND status NOT IN ('completed', 'suppressed')`,
     [nowIso, nowIso, txId],
   );
   if (completed.meta.changes > 0) return 'completed';
@@ -339,4 +341,9 @@ async function getOutboxRow(env: Env, txId: string): Promise<OutboxRow | null> {
     [txId],
   );
   return rows[0] ?? null;
+}
+
+/** True when the tx's outbox row was suppressed (CT_DELIVERY_MODE=suppress). */
+export async function isOutboxSuppressed(env: Env, txId: string): Promise<boolean> {
+  return (await getOutboxRow(env, txId))?.status === 'suppressed';
 }

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import type { Env } from '../../shared/types.ts';
 import {
   __resetSettingsForTests,
@@ -155,6 +156,49 @@ describe('app settings service (Infisical SOT contract)', () => {
     await settings.refresh(e);
 
     expect(settings.getInt('CT_TICK_DEADLINE_MS', 10000)).toBe(45000);
+  });
+
+  it('partial refresh failure keeps last-known-good values for keys the failed source held', async () => {
+    let failApp = false;
+    const appClient = `app-client-${projectSeq + 1}`;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+          const body = z.object({ clientId: z.string() }).passthrough().parse(JSON.parse(String(init?.body ?? '{}')));
+          if (failApp && body.clientId === appClient) return new Response('auth failed', { status: 401 });
+          return Response.json({ accessToken: body.clientId === appClient ? 'app-token' : 'shared-token' });
+        }
+        if (url.includes('/api/v3/secrets/raw?')) {
+          const auth = new Headers(init?.headers).get('authorization') ?? '';
+          return Response.json({
+            secrets: auth.includes('app-token')
+              ? [{ secretKey: 'CT_DELIVERY_MODE', secretValue: 'hold' }]
+              : [{ secretKey: 'CT_TICK_DEADLINE_MS', secretValue: '45000' }],
+          });
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+    const e = env({
+      INFISICAL_SHARED_PROJECT_ID: `shared-project-${projectSeq + 1}`,
+      INFISICAL_SHARED_CLIENT_ID: `shared-client-${projectSeq + 1}`,
+      INFISICAL_SHARED_CLIENT_SECRET: `shared-client-secret-${projectSeq + 1}-long-enough`,
+    } as Partial<Env>);
+    const settings = await initSettings(e);
+    expect(settings.get('CT_DELIVERY_MODE')).toBe('hold');
+    expect(settings.get('CT_TICK_DEADLINE_MS')).toBe('45000');
+
+    failApp = true; // only the app source fails; shared still answers
+    const later = Date.now() + 2 * 3600_000; // past the resolver cache TTL
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+    try {
+      await settings.refresh(e);
+    } finally {
+      clock.mockRestore();
+    }
+    expect(settings.get('CT_TICK_DEADLINE_MS')).toBe('45000');
+    expect(settings.get('CT_DELIVERY_MODE')).toBe('hold');
   });
 
   it('failed write-through rejects and leaves the cache untouched', async () => {

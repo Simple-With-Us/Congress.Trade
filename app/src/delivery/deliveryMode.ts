@@ -18,7 +18,10 @@
  *              to `deliver` releases them in bounded per-tick batches.
  *              Switching from `hold` to `suppress` drops the held backlog.
  *   suppress — outbox rows are written and immediately marked `suppressed`
- *              (terminal, never sent) with an audit reason.  For bulk
+ *              (terminal, never sent) with an audit reason, including rows
+ *              already handed to the queue (the consumer acks a suppressed
+ *              row without sending).  The SSE live feed pauses like `hold`
+ *              and, once delivery resumes, skips suppressed rows.  For bulk
  *              republishes and corrections.  Independent of the per-request
  *              `correction: true` republish mode (PR #2867), which keeps
  *              unchanged rows' ids so they never re-enter the outbox at all.
@@ -228,13 +231,17 @@ export function evaluateDeliveryModeCheck(
   }
   const minutes = Math.max(0, Math.floor((now.getTime() - Date.parse(audited.createdAt)) / 60_000));
   const over = minutes >= warnMinutes;
+  // Public: this check is served on unauthenticated GET /api/health, so it
+  // carries only the mode and its age.  Who changed it and why stay in
+  // delivery_mode_audit and GET /api/admin/delivery-mode.
   return {
     id: 'delivery_mode',
     status: over ? 'critical' : 'degraded',
     detail:
-      `Subscriber alerts ${label} for ${minutes}m by ${audited.actor}` +
-      (audited.reason ? ` (${audited.reason})` : '') +
-      (over ? ` — over ${warnMinutes}m, switch ${DELIVERY_MODE_SETTING_KEY} back to deliver` : ` (warns at ${warnMinutes}m)`),
-    value: { mode: reading.mode, invalid: false, since: audited.createdAt, minutes, warnMinutes, actor: audited.actor, auditId: audited.id },
+      `Subscriber alerts ${label} for ${minutes}m` +
+      (over
+        ? ` — over ${warnMinutes}m, switch ${DELIVERY_MODE_SETTING_KEY} back to deliver (who/why: GET /api/admin/delivery-mode)`
+        : ` (warns at ${warnMinutes}m)`),
+    value: { mode: reading.mode, invalid: false, since: audited.createdAt, minutes, warnMinutes },
   };
 }

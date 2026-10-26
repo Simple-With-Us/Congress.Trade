@@ -13,7 +13,7 @@ import {
   deliverUsageTelemetryEvent,
 } from './shared/thirdPartyTelemetry.ts';
 import { persistUsageTelemetryFallback } from './shared/thirdPartyTelemetry.ts';
-import { gateQueuedDelivery, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { gateQueuedDelivery, isOutboxSuppressed, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
 import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
 import { executeQueuedCommand } from './client/commands.ts';
@@ -107,6 +107,9 @@ export async function handleDeliveryMessage(
         if (!msg.subscriptionId) await gateQueuedDelivery(env, msg.txId, mode);
         return false;
       }
+      // A row suppressed while its message sat in the queue stays unsent
+      // after delivery resumes: ack it without dispatching.
+      if (!msg.subscriptionId && (await isOutboxSuppressed(env, msg.txId))) return false;
       const result = lease
         ? await dispatchWebhook(env, msg, lease)
         : await dispatchWebhook(env, msg);

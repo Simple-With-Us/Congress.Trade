@@ -5,8 +5,9 @@
  * delivery_mode health check.  GB-Publisher.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { Hono } from 'hono';
-import type { Env, Subscription } from '../../shared/types.ts';
+import type { Env, QueueMessage, Subscription } from '../../shared/types.ts';
 import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
 import { __resetSettingsForTests, initSettings, stopSettingsRefresh } from '../../settings/settingsService.ts';
 import {
@@ -19,7 +20,7 @@ import {
   recordDeliveryModeChange,
   type DeliveryMode,
 } from '../deliveryMode.ts';
-import { flushDeliveryOutbox, reconnectDeadLetteredOutbox } from '../outbox.ts';
+import { completeDeliveryOutbox, flushDeliveryOutbox, reconnectDeadLetteredOutbox } from '../outbox.ts';
 import { handleDeliveryMessage } from '../../queueHandlers.ts';
 import { fanOutApnsProductEvents } from '../apnsFanout.ts';
 import { drainSseBacklog } from '../sse.ts';
@@ -42,11 +43,25 @@ function outboxRow(txId: string, status = 'pending', availableAt = '2026-10-25T1
     .run(txId, status, availableAt, availableAt, availableAt);
 }
 
-function statusOf(txId: string): { status: string; last_error: string | null } {
-  return sqlite.prepare('SELECT status, last_error FROM delivery_outbox WHERE tx_id = ?').get(txId) as {
-    status: string;
-    last_error: string | null;
-  };
+const OutboxStatus = z.object({ status: z.string(), last_error: z.string().nullable() });
+
+function statusOf(txId: string): z.infer<typeof OutboxStatus> {
+  return OutboxStatus.parse(sqlite.prepare('SELECT status, last_error FROM delivery_outbox WHERE tx_id = ?').get(txId));
+}
+
+/**
+ * The exact message the outbox producer puts on DELIVERY_QUEUE for this row:
+ * flush it in deliver mode with a capturing queue, so the consumer tests feed
+ * handleDeliveryMessage the producer's real envelope, not a hand-written one.
+ */
+async function producedDispatch(txId: string): Promise<QueueMessage> {
+  const captured: QueueMessage[] = [];
+  const producerEnv = { ...env, DELIVERY_QUEUE: { send: async (m: QueueMessage) => void captured.push(m) } } as unknown as Env;
+  pin('deliver');
+  await flushDeliveryOutbox(producerEnv, { now: NOW, txIds: [txId] });
+  expect(captured).toHaveLength(1);
+  expect(statusOf(txId).status).toBe('enqueued');
+  return captured[0]!;
 }
 
 beforeEach(async () => {
@@ -161,18 +176,20 @@ describe('mode hold', () => {
   });
 
   it('re-opens an already-queued message as pending instead of sending it', async () => {
-    outboxRow('tx_q', 'enqueued');
+    outboxRow('tx_q');
+    const msg = await producedDispatch('tx_q');
     pin('hold');
-    expect(await handleDeliveryMessage(env, { type: 'delivery.dispatch', txId: 'tx_q' })).toBe(false);
+    expect(await handleDeliveryMessage(env, msg)).toBe(false);
     expect(statusOf('tx_q')).toEqual({ status: 'pending', last_error: 'held by CT_DELIVERY_MODE=hold' });
   });
 
   it('leaves targeted parked retries parked and releases none', async () => {
     outboxRow('tx_p', 'completed');
     pin('hold');
-    expect(
-      await handleDeliveryMessage(env, { type: 'delivery.dispatch', txId: 'tx_p', subscriptionId: 'sub_1' } as never),
-    ).toBe(false);
+    // Targeted parked retry: the shape flushParkedDeliveries sends
+    // (targetCircuit.ts), typed against the shared QueueMessage contract.
+    const parked = { type: 'delivery.dispatch', txId: 'tx_p', subscriptionId: 'sub_1' } satisfies QueueMessage;
+    expect(await handleDeliveryMessage(env, parked)).toBe(false);
     expect(statusOf('tx_p').status).toBe('completed');
     expect((await flushParkedDeliveries(env, { now: NOW })).released).toBe(0);
     expect(send).not.toHaveBeenCalled();
@@ -195,8 +212,8 @@ describe('mode hold', () => {
 
   it('pauses the SSE backlog drain without advancing the cursor', async () => {
     sqlite.exec(`INSERT INTO transactions (id, doc_id, created_at) VALUES ('tx_s1', 'doc_s', '2026-10-25T11:00:00Z')`);
-    const seq = (sqlite.prepare(`SELECT cursor_seq FROM transactions WHERE id = 'tx_s1'`).get() as { cursor_seq: number })
-      .cursor_seq;
+    const seq = z.object({ cursor_seq: z.number() })
+      .parse(sqlite.prepare(`SELECT cursor_seq FROM transactions WHERE id = 'tx_s1'`).get()).cursor_seq;
     const sent: string[] = [];
     const sub = { id: 'sub_sse', filters: {} } as unknown as Subscription;
     pin('hold');
@@ -242,9 +259,10 @@ describe('mode suppress', () => {
   });
 
   it('suppresses an already-queued message and a late dead letter cannot re-open it', async () => {
-    outboxRow('tx_q', 'enqueued');
+    outboxRow('tx_q');
+    const msg = await producedDispatch('tx_q');
     pin('suppress');
-    expect(await handleDeliveryMessage(env, { type: 'delivery.dispatch', txId: 'tx_q' })).toBe(false);
+    expect(await handleDeliveryMessage(env, msg)).toBe(false);
     expect(statusOf('tx_q').status).toBe('suppressed');
     expect(statusOf('tx_q').last_error).toMatch(/no audit row/);
     pin('deliver');
@@ -252,25 +270,43 @@ describe('mode suppress', () => {
     expect(statusOf('tx_q').status).toBe('suppressed');
   });
 
-  it('SSE skips suppressed rows but still advances past them', async () => {
+  it('the suppress flush also marks enqueued rows, and the consumer acks them unsent after resume', async () => {
+    outboxRow('tx_q');
+    const msg = await producedDispatch('tx_q');
+    pin('suppress');
+    expect((await flushDeliveryOutbox(env, { now: NOW })).suppressed).toBe(1);
+    expect(statusOf('tx_q').status).toBe('suppressed');
+    // Delivery resumes before the queued message is consumed.
+    pin('deliver');
+    const fetchSpy = vi.fn(async () => new Response('ok'));
+    vi.stubGlobal('fetch', fetchSpy);
+    expect(await handleDeliveryMessage(env, msg)).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(statusOf('tx_q').status).toBe('suppressed');
+    // A late completion can never flip a suppressed row to completed.
+    await completeDeliveryOutbox(env, 'tx_q', NOW);
+    expect(statusOf('tx_q').status).toBe('suppressed');
+  });
+
+  it('SSE pauses during suppress, then skips suppressed rows after resume', async () => {
     sqlite.exec(`
       INSERT INTO transactions (id, doc_id, created_at) VALUES ('tx_s1', 'doc_s', '2026-10-25T11:00:00Z');
       INSERT INTO transactions (id, doc_id, created_at) VALUES ('tx_s2', 'doc_s', '2026-10-25T11:00:01Z');
     `);
-    const seqs = sqlite.prepare(`SELECT id, cursor_seq FROM transactions ORDER BY cursor_seq`).all() as Array<{
-      id: string;
-      cursor_seq: number;
-    }>;
+    const seqs = z.array(z.object({ id: z.string(), cursor_seq: z.number() }))
+      .parse(sqlite.prepare(`SELECT id, cursor_seq FROM transactions ORDER BY cursor_seq`).all());
     outboxRow('tx_s1', 'suppressed');
     outboxRow('tx_s2', 'completed');
     const sent: string[] = [];
+    const sub = { id: 'sub_sse', filters: {} } as unknown as Subscription;
+    const start = seqs[0]!.cursor_seq - 1;
+    // Suppress: nothing streams and the cursor holds, so rows the next flush
+    // has not marked yet cannot leak.
     pin('suppress');
-    const hwm = await drainSseBacklog(
-      env,
-      { id: 'sub_sse', filters: {} } as unknown as Subscription,
-      seqs[0]!.cursor_seq - 1,
-      async (chunk) => void sent.push(chunk),
-    );
+    expect(await drainSseBacklog(env, sub, start, async (chunk) => void sent.push(chunk))).toBe(start);
+    expect(sent).toHaveLength(0);
+    pin('deliver');
+    const hwm = await drainSseBacklog(env, sub, start, async (chunk) => void sent.push(chunk));
     expect(hwm).toBe(seqs[1]!.cursor_seq);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('tx_s2');
@@ -303,7 +339,11 @@ describe('delivery_mode health check', () => {
   it('is degraded (visible, not paging) before the warn window', () => {
     const check = evaluateDeliveryModeCheck({ mode: 'hold', raw: 'hold', invalid: false }, audit('hold', 59), NOW);
     expect(check.status).toBe('degraded');
-    expect(check.detail).toContain('HELD for 59m by jay@example.com');
+    expect(check.detail).toContain('HELD for 59m');
+    // Public /api/health: no actor, reason or audit id.
+    expect(check.detail).not.toContain('jay@example.com');
+    expect(check.detail).not.toContain('republish');
+    expect(check.value).toEqual({ mode: 'hold', invalid: false, since: at(59), minutes: 59, warnMinutes: 60 });
   });
 
   it('turns critical (loud pipeline alert) at 60 minutes', () => {
@@ -328,18 +368,21 @@ describe('delivery_mode health check', () => {
     pin('hold');
     const check = await collectDeliveryModeCheck(env, NOW);
     expect(check.status).toBe('degraded');
-    expect(check.value).toMatchObject({ mode: 'hold', minutes: 10, actor: 'a' });
+    expect(check.value).toMatchObject({ mode: 'hold', minutes: 10 });
+    expect(check.value).not.toHaveProperty('actor');
   });
 });
 
 describe('PUT /api/admin/settings CT_DELIVERY_MODE', () => {
   type Row = { secretKey: string; secretValue: string };
   let rows: Row[];
+  let dropWrites = false;
   let seq = 100;
   let adminEnv: Env;
 
   beforeEach(async () => {
     __setDeliveryModeForTests(null);
+    dropWrites = false;
     rows = [{ secretKey: 'ADMIN_TOKEN', secretValue: 'admin-secret-value-long-enough-0123456789' }];
     vi.stubGlobal(
       'fetch',
@@ -347,8 +390,10 @@ describe('PUT /api/admin/settings CT_DELIVERY_MODE', () => {
         if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json({ accessToken: 'test-token' });
         if (url.includes('/api/v3/secrets/raw?')) return Response.json({ secrets: rows });
         if (url.includes('/api/v3/secrets/raw/')) {
-          const key = url.split('/api/v3/secrets/raw/')[1]!.split('?')[0]!;
-          const body = JSON.parse(String(init?.body || '{}')) as { secretValue?: string };
+          const key = z.string().min(1).parse(url.split('/api/v3/secrets/raw/')[1]?.split('?')[0]);
+          const body = z.object({ secretValue: z.string().optional() }).passthrough()
+            .parse(JSON.parse(String(init?.body || '{}')));
+          if (dropWrites) return Response.json({ ok: true });
           const idx = rows.findIndex((r) => r.secretKey === key);
           if (idx >= 0) rows[idx] = { secretKey: key, secretValue: body.secretValue ?? '' };
           else rows.push({ secretKey: key, secretValue: body.secretValue ?? '' });
@@ -391,19 +436,50 @@ describe('PUT /api/admin/settings CT_DELIVERY_MODE', () => {
   it('writes Infisical, audits who/when/from/to/why, and switches the live mode', async () => {
     const res = await put({ key: 'CT_DELIVERY_MODE', value: 'Suppress', reason: 'bulk Trump republish' });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { ok: boolean; value: string; previousMode: string; audit: { id: string } };
+    const json = z.object({ ok: z.boolean(), value: z.string(), previousMode: z.string(), audit: z.object({ id: z.string() }) })
+      .passthrough().parse(await res.json());
     expect(json).toMatchObject({ ok: true, value: 'suppress', previousMode: 'deliver' });
     expect(rows.find((r) => r.secretKey === 'CT_DELIVERY_MODE')?.secretValue).toBe('suppress');
     expect(readDeliveryMode()).toBe('suppress');
-    const audit = sqlite.prepare('SELECT * FROM delivery_mode_audit').all() as Array<Record<string, unknown>>;
+    const audit = z.array(z.record(z.string(), z.unknown())).parse(sqlite.prepare('SELECT * FROM delivery_mode_audit').all());
     expect(audit).toHaveLength(1);
     expect(audit[0]).toMatchObject({
       id: json.audit.id,
       mode: 'suppress',
       previous_mode: 'deliver',
-      actor: 'jay@example.com',
+      // Bearer ADMIN_TOKEN caller: the Cf-Access email header is client
+      // supplied, so it is recorded only as an unverified claim.
+      actor: 'admin-token (unverified claim: jay@example.com)',
       reason: 'bulk Trump republish',
     });
+  });
+
+  it('never copies the free-form reason into logs', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      expect((await put({ key: 'CT_DELIVERY_MODE', value: 'hold', reason: 'private operator note 7Q' })).status).toBe(200);
+      const logged = warn.mock.calls.map((args) => args.map(String).join(' ')).join('\n');
+      expect(logged).toContain('delivery_mode.changed deliver -> hold');
+      expect(logged).not.toContain('private operator note 7Q');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('rejects a body with unexpected properties or a non-string value (zod, strict)', async () => {
+    expect((await put({ key: 'CT_DELIVERY_MODE', value: 'hold', reason: 'x', actor: 'someone' })).status).toBe(400);
+    expect((await put({ key: 'CT_DELIVERY_MODE', value: 'hold', reason: 7 })).status).toBe(400);
+    expect(rows.some((r) => r.secretKey === 'CT_DELIVERY_MODE')).toBe(false);
+    expect(readDeliveryMode()).toBe('deliver');
+  });
+
+  it('returns 502 and audits nothing when the live snapshot does not show the saved mode', async () => {
+    // Infisical accepts the write but the refreshed list does not carry it.
+    dropWrites = true;
+    const res = await put({ key: 'CT_DELIVERY_MODE', value: 'hold', reason: 'check' });
+    expect(res.status).toBe(502);
+    expect(z.object({ liveMode: z.string() }).passthrough().parse(await res.json()).liveMode).toBe('deliver');
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM delivery_mode_audit').get()).toEqual({ n: 0 });
   });
 
   it('rejects unknown modes and a pause without a reason, changing nothing', async () => {
