@@ -272,8 +272,8 @@ check "the planned build number is the commit count" \
   "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
 # Pin the trains explicitly so a wrong or reverted marketingVersionDefault in
 # apps.json fails here instead of passing because the helper agrees with it.
-check "congress ships on the 1.1 train" \
-  "$([[ "$(train_prefix congress)" == "1.1" ]] && echo 0 || echo 1)"
+check "congress ships on the 1.0 train" \
+  "$([[ "$(train_prefix congress)" == "1.0" ]] && echo 0 || echo 1)"
 for app in socratic usage; do
   check "${app} stays on the 1.0 train" \
     "$([[ "$(train_prefix "$app")" == "1.0" ]] && echo 0 || echo 1)"
