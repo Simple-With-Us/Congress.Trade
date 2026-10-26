@@ -14,8 +14,7 @@
     },
     "congress": {
       "displayName": "Congress.Trade",
-      "fixedMarketingVersion": "1.1.0",
-      "buildCountSeed": "239",
+      "fixedMarketingVersion": "1.1.2",
       "bundleId": "trade.congress.ios",
       "appleId": 6798076688,
       "scheme": "CongressTrade",
