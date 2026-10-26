@@ -120,7 +120,13 @@ import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { junkAssetNameReason, normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
 import { canonicalizeAmountBounds } from '../extraction/amounts.ts';
-import { planCorrection, type CorrectionPlan, type PriorTxRow } from './reviewCorrection.ts';
+import {
+  planCorrection,
+  REVIVE_COMPARED_COLUMNS_SQL,
+  reviveChangedIds,
+  type CorrectionPlan,
+  type PriorTxRow,
+} from './reviewCorrection.ts';
 import {
   MEMBER_FILER_MERGES,
   MEMBER_NAME_ALIASES,
@@ -3071,9 +3077,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // and never re-enter the delivery outbox.  Only unmatched rows insert and
     // deliver.  A first publish has no prior rows, so every row is new.
     const reviveByEdit = new Map<number, string>();
-    const prior = await all<PriorTxRow>(
+    const prior = await all<PriorTxRow & Record<string, string | number | null>>(
       c.env.DB,
-      `SELECT id, tx_date, owner, asset_name, ticker, tx_type, amount_min, amount_max, deprecated_at
+      `SELECT id, deprecated_at, ${REVIVE_COMPARED_COLUMNS_SQL}
          FROM transactions
         WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
           AND deprecated_at IS NOT NULL`,
@@ -3207,28 +3213,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
           )`;
     const reviveRowsJson = JSON.stringify(reviveRows);
+    const changedReviveIds = reviveChangedIds(new Map(prior.map((row) => [row.id, row])), reviveRows);
+    const changedReviveIdsJson = changedReviveIds.length === 0 ? null : JSON.stringify(changedReviveIds);
     const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [
-      [
+      // Only the rows whose stored fields change (diffed in JS against the
+      // prior SELECT) are bound here, as an id list, so the batch never
+      // carries the revive payload twice.
+      ...(changedReviveIdsJson === null ? [] : [[
         `INSERT INTO tx_cursor_seq (tx_id)
            SELECT transactions.id FROM transactions
-             JOIN ${reviveRowsSql} AS j ON transactions.id = j.id
-            WHERE ${reviveGate}
-              AND (transactions.filer_id IS NOT j.filer_id OR transactions.tx_date IS NOT j.tx_date
-                OR transactions.owner IS NOT j.owner OR transactions.asset_name IS NOT j.asset_name
-                OR transactions.ticker IS NOT j.ticker OR transactions.asset_type IS NOT j.asset_type
-                OR transactions.tx_type IS NOT j.tx_type OR transactions.amount_min IS NOT j.amount_min
-                OR transactions.amount_max IS NOT j.amount_max OR transactions.is_option IS NOT j.is_option
-                OR transactions.cap_gains_over_200 IS NOT j.cap_gains_over_200
-                OR transactions.raw_text IS NOT j.raw_text
-                OR transactions.asset_type_name IS NOT j.asset_type_name
-                OR transactions.filing_status IS NOT j.filing_status
-                OR transactions.subholding IS NOT j.subholding OR transactions.location IS NOT j.location
-                OR transactions.description IS NOT j.description
-                OR transactions.supplemental_text IS NOT j.supplemental_text
-                OR transactions.filed_date IS NOT j.filed_date OR transactions.est_value IS NOT j.est_value)
+            WHERE transactions.id IN (SELECT value FROM json_each(?))
+              AND ${reviveGate}
             ORDER BY transactions.cursor_seq ASC, transactions.id ASC`,
-        [reviveRowsJson, docId, docId, reviewRevision],
-      ],
+        [changedReviveIdsJson, docId, docId, reviewRevision],
+      ] as [string, SqlParam[]]]),
       [
         `UPDATE transactions
             SET filer_id = j.filer_id, tx_date = j.tx_date, owner = j.owner,

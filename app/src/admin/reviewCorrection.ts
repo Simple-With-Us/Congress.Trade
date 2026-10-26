@@ -212,3 +212,64 @@ export function planCorrection(
   const retired = live.filter((row) => !claimed.has(row.id)).map((row) => row.id);
   return { ok: true, matches, added, retired };
 }
+
+/**
+ * Stored `transactions` columns a revive rewrites, paired with the key the
+ * route's revive row carries for each.  A revived row whose stored value
+ * differs in ANY of these takes a new cursor_seq, because each one reaches
+ * cursor consumers (GET /api/transactions?since=, SSE catch-up): the
+ * delivery row exposes source, confidence, row_key and the cleaning note too.
+ */
+export const REVIVE_COMPARED_COLUMNS = [
+  ['filer_id', 'filerId'],
+  ['tx_date', 'txDate'],
+  ['owner', 'owner'],
+  ['asset_name', 'assetName'],
+  ['ticker', 'ticker'],
+  ['asset_type', 'assetType'],
+  ['tx_type', 'txType'],
+  ['amount_min', 'amountMin'],
+  ['amount_max', 'amountMax'],
+  ['is_option', 'isOption'],
+  ['cap_gains_over_200', 'capGainsOver200'],
+  ['raw_text', 'rawText'],
+  ['asset_type_name', 'assetTypeName'],
+  ['filing_status', 'filingStatus'],
+  ['subholding', 'subholding'],
+  ['location', 'location'],
+  ['description', 'description'],
+  ['supplemental_text', 'supplementalText'],
+  ['row_key', 'rowKey'],
+  ['confidence', 'confidence'],
+  ['source', 'source'],
+  ['filed_date', 'filedDate'],
+  ['est_value', 'estValue'],
+  ['cleaning_note', 'cleaningNote'],
+] as const;
+
+/** SELECT list for the stored values `reviveChangedIds` compares. */
+export const REVIVE_COMPARED_COLUMNS_SQL = REVIVE_COMPARED_COLUMNS.map(([column]) => column).join(', ');
+
+type StoredValue = string | number | null | undefined;
+
+/**
+ * Ids of the revive rows whose stored columns would change (SQL `IS NOT`
+ * semantics: null equals null, otherwise strict equality).  Only these get a
+ * new cursor_seq; a byte-identical revive keeps its cursor.  A revive id with
+ * no stored row counts as changed.  Computed here so the cursor-allocation
+ * statement binds a short id list instead of a second copy of the revive
+ * payload.
+ */
+export function reviveChangedIds(
+  stored: ReadonlyMap<string, Readonly<Record<string, StoredValue>>>,
+  reviveRows: ReadonlyArray<Readonly<Record<string, StoredValue>>>,
+): string[] {
+  const changed: string[] = [];
+  for (const next of reviveRows) {
+    const id = String(next.id);
+    const current = stored.get(id);
+    const differs = !current || REVIVE_COMPARED_COLUMNS.some(([column, key]) => (current[column] ?? null) !== (next[key] ?? null));
+    if (differs) changed.push(id);
+  }
+  return changed;
+}
