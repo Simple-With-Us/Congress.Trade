@@ -77,6 +77,7 @@ import {
   ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
   FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
   FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+  DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { buildAdminMigrateStatements } from '../migrateStatements.ts';
 import { applyGuardedAppleSubscriptionsNullableUserMigration } from '../schemaMigrationRunner.ts';
@@ -315,6 +316,7 @@ describe('admin migration bootstrap', () => {
       ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
       ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
       ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+      ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
     ]);
   });
 

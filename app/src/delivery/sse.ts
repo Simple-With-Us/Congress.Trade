@@ -63,6 +63,7 @@ import { createCongressEvent } from '@jaywedgeworth22/congress-trading-shared';
 import { prefixedId } from '../shared/ids.ts';
 import { rateLimit } from '../shared/rateLimit.ts';
 import { flushD1Budget } from '../shared/d1Budget.ts';
+import { readDeliveryMode } from './deliveryMode.ts';
 
 /** How often to poll D1 for new rows. */
 const POLL_INTERVAL_MS = 5_000;
@@ -529,11 +530,20 @@ export async function drainSseBacklog(
   send: (chunk: string) => Promise<void>,
 ): Promise<number> {
   let hwm = cursor;
+  // Subscriber alert pause (CT_DELIVERY_MODE=hold): emit nothing and keep the
+  // cursor where it is, so the stream resumes from here once delivery is
+  // switched back.  'suppress' keeps streaming but skips suppressed rows.
+  if (readDeliveryMode() === 'hold') return hwm;
   // Drain a bounded number of pages. If more history remains, the next poll
   // tick continues from this exact high-water cursor without gaps.
   for (let page = 0; page < MAX_DRAIN_PAGES_PER_TICK; page += 1) {
     const rows = await all<
-      FeedTransactionRow & { __chamber: string | null; __sector: string | null; __bucket: string | null }
+      FeedTransactionRow & {
+        __chamber: string | null;
+        __sector: string | null;
+        __bucket: string | null;
+        __outbox_status?: string | null;
+      }
     >(
       env.DB,
       // `filer_party` is the column mapFeedTransaction reads for Transaction.party.
@@ -545,7 +555,8 @@ export async function drainSseBacklog(
       `SELECT t.*, f.chamber AS __chamber,
               sr.sector AS __sector, sr.market_cap_bucket AS __bucket,
               COALESCE(fl.display_name, fl.full_name) AS filer_full_name, fl.state AS filer_state,
-              fl.photo_url AS filer_photo_url, fl.party AS filer_party
+              fl.photo_url AS filer_photo_url, fl.party AS filer_party,
+              o.status AS __outbox_status
          FROM (
            SELECT t.* FROM transactions t INDEXED BY idx_tx_cursor
             WHERE t.cursor_seq > ? AND t.deprecated_at IS NULL
@@ -554,13 +565,20 @@ export async function drainSseBacklog(
          ) t
          LEFT JOIN filings f ON f.doc_id = t.doc_id
          LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
-         LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id`,
+         LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id
+         LEFT JOIN delivery_outbox o ON o.tx_id = t.id`,
       [hwm, PAGE_SIZE],
     );
     if (rows.length === 0) break;
 
     for (const row of rows) {
       const tx: Transaction = mapFeedTransaction(row);
+      // Suppressed (CT_DELIVERY_MODE=suppress) rows are never alerted; still
+      // advance past them so a fully suppressed page cannot stall the stream.
+      if (row.__outbox_status === 'suppressed') {
+        hwm = Math.max(hwm, tx.cursorSeq);
+        continue;
+      }
       const ctx = {
         chamber: row.__chamber ?? null,
         sector: row.__sector ?? null,

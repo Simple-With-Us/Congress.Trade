@@ -1498,6 +1498,23 @@ export const FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS = [
   'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
 ] as const;
 
+/**
+ * 0108_delivery_mode_audit.sql — who switched CT_DELIVERY_MODE (subscriber
+ * alert pause) and when; read by the delivery_mode health check and stamped
+ * on suppressed outbox rows.  Keep in lockstep with the .sql file.
+ */
+export const DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS delivery_mode_audit (
+     id            TEXT PRIMARY KEY,
+     mode          TEXT NOT NULL,
+     previous_mode TEXT,
+     actor         TEXT NOT NULL,
+     reason        TEXT,
+     created_at    TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_delivery_mode_audit_created ON delivery_mode_audit (created_at DESC)',
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1669,6 +1686,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
   // 0106_filings_discovered_via.sql
   ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+  // 0108_delivery_mode_audit.sql (0107 is reserved for 0107_filings_filing_status.sql, open PR #2867)
+  ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

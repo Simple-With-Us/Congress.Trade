@@ -208,7 +208,7 @@ export const RETENTION_POLICIES: readonly RetentionPolicy[] = [
   // unique idx_deliveries_subscription_tx plus claimDelivery's constraint
   // retry (delivery/webhook.ts:544-553), NOT the outbox row; and `deliveries`
   // rows survive until the 5-year filing sweep.
-  { name: 'delivery_outbox_completed', table: 'delivery_outbox', key: 'tx_id', column: 'updated_at', days: 90, where: "status = 'completed'" },
+  { name: 'delivery_outbox_completed', table: 'delivery_outbox', key: 'tx_id', column: 'updated_at', days: 90, where: "status IN ('completed', 'suppressed')" },
 ];
 
 /** Total rows one daily sweep may delete across ALL policies. Bounds the

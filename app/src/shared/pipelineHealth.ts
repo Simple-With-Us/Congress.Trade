@@ -50,6 +50,7 @@ import {
   stPeerPricesMetricsToCheck,
 } from '../prices/stPeerPricesHealth.ts';
 import { emptyFetchAlertWhere, emptyFetchSeenCutoff } from '../ingestion/emptyFetchHandoff.ts';
+import { collectDeliveryModeCheck } from '../delivery/deliveryMode.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -1979,7 +1980,9 @@ export async function checkPipelineHealth(
   );
   const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
   const emptyFetchCheck = (precomputed.emptyFetch ?? await collectEmptyFetchHandoffCheck(env, now)).check;
-  const checks = [...evaluated.checks, stPeerCheck, emptyFetchCheck];
+  // Subscriber alert pause: never let CT_DELIVERY_MODE sit off silently.
+  const deliveryModeCheck = await collectDeliveryModeCheck(env, now);
+  const checks = [...evaluated.checks, stPeerCheck, emptyFetchCheck, deliveryModeCheck];
   let status: PipelineStatus = 'ok';
   for (const c of checks) {
     status = worstStatus(status, c.status);

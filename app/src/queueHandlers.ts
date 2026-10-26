@@ -13,7 +13,8 @@ import {
   deliverUsageTelemetryEvent,
 } from './shared/thirdPartyTelemetry.ts';
 import { persistUsageTelemetryFallback } from './shared/thirdPartyTelemetry.ts';
-import { reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { gateQueuedDelivery, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
 import { executeQueuedCommand } from './client/commands.ts';
 import { updateCommandStatus } from './client/state.ts';
@@ -97,6 +98,15 @@ export async function handleDeliveryMessage(
   await lease?.assertOwned();
   switch (msg.type) {
     case 'delivery.dispatch': {
+      // Subscriber alert pause (CT_DELIVERY_MODE) for messages queued before
+      // the switch or by another producer.  Returning false acks the message
+      // without completing the outbox row (gateQueuedDelivery re-opens or
+      // suppresses it).  Throws if settings never booted, so it retries.
+      const mode = readDeliveryMode();
+      if (mode !== 'deliver') {
+        if (!msg.subscriptionId) await gateQueuedDelivery(env, msg.txId, mode);
+        return false;
+      }
       const result = lease
         ? await dispatchWebhook(env, msg, lease)
         : await dispatchWebhook(env, msg);

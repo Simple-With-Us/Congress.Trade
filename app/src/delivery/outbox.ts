@@ -2,6 +2,7 @@ import type { Env } from '../shared/types.ts';
 import { all, run, type SqlParam } from '../shared/db.ts';
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
 import { abortIfSignal } from '../shared/signalAbort.ts';
+import { latestDeliveryModeChange, readDeliveryMode, suppressionReason, type DeliveryMode } from './deliveryMode.ts';
 
 export type SqlStatement = [string, SqlParam[]];
 
@@ -17,6 +18,10 @@ export interface OutboxFlushResult {
   claimed: number;
   enqueued: number;
   failed: number;
+  /** Set only when CT_DELIVERY_MODE is not 'deliver' and this flush dispatched nothing. */
+  mode?: Exclude<DeliveryMode, 'deliver'>;
+  /** Rows marked 'suppressed' by this flush (mode 'suppress' only). */
+  suppressed?: number;
 }
 
 export interface DeadLetterReconnectResult {
@@ -37,6 +42,12 @@ const MAX_LIMIT = 500;
 export const DELIVERY_TARGETED_ID_LIMIT = 40;
 const LEASE_SECONDS = 60;
 const MAX_DEAD_LETTER_CYCLES = 5;
+/**
+ * Rows marked suppressed per flush in mode 'suppress'.  One UPDATE statement,
+ * so this can be large: a bulk republish should be fully marked by the inline
+ * flush before anyone switches the mode back to 'deliver'.
+ */
+export const DELIVERY_SUPPRESS_BATCH_LIMIT = 5000;
 /** Finite fallback when a Queue message and every DLQ recovery attempt vanish. */
 export const DELIVERY_ENQUEUED_STALE_MS = 2 * 60 * 60 * 1000;
 
@@ -89,6 +100,19 @@ export async function flushDeliveryOutbox(
   const staleEnqueuedBefore = new Date(now.getTime() - DELIVERY_ENQUEUED_STALE_MS).toISOString();
   const limit = Math.min(Math.max(Math.floor(opts.limit ?? DEFAULT_LIMIT), 1), MAX_LIMIT);
   const txIds = Array.from(new Set((opts.txIds ?? []).filter(Boolean))).slice(0, DELIVERY_TARGETED_ID_LIMIT);
+
+  // Subscriber alert pause (CT_DELIVERY_MODE).  Throws when the settings
+  // snapshot never booted, so nothing is dispatched on a guess.
+  const mode = readDeliveryMode();
+  if (mode === 'hold') {
+    // Rows stay 'pending'; switching back to 'deliver' drains them through
+    // the normal bounded per-tick flush below.
+    return { claimed: 0, enqueued: 0, failed: 0, mode };
+  }
+  if (mode === 'suppress') {
+    return { claimed: 0, enqueued: 0, failed: 0, mode, suppressed: await suppressPendingOutbox(env, nowIso) };
+  }
+
   const idClause = txIds.length ? ` AND tx_id IN (${txIds.map(() => '?').join(',')})` : '';
   const rows = await all<OutboxRow>(
     env.DB,
@@ -182,6 +206,67 @@ export async function flushDeliveryOutbox(
   return result;
 }
 
+/**
+ * Mode 'suppress': mark every not-yet-dispatched outbox row terminal
+ * 'suppressed' (never sent) with an audit reason.  Rows a flush already
+ * handed to the queue are caught by the consumer gate (queueHandlers.ts).
+ */
+async function suppressPendingOutbox(env: Env, nowIso: string): Promise<number> {
+  if (consumeGovernedD1Writes(env, 'delivery-outbox-suppress', 1) < 1) {
+    console.warn('suppressPendingOutbox skipped: D1 write governor cap reached');
+    return 0;
+  }
+  const reason = suppressionReason(await latestDeliveryModeChange(env));
+  const result = await run(
+    env.DB,
+    `UPDATE delivery_outbox
+        SET status = 'suppressed', last_error = ?, updated_at = ?
+      WHERE tx_id IN (
+        SELECT tx_id FROM delivery_outbox
+         WHERE status = 'pending' OR (status = 'sending' AND available_at <= ?)
+         LIMIT ${DELIVERY_SUPPRESS_BATCH_LIMIT}
+      )`,
+    [reason, nowIso, nowIso],
+  );
+  const suppressed = result.meta?.changes ?? 0;
+  if (suppressed > 0) console.warn(`delivery outbox: suppressed ${suppressed} row(s) — ${reason}`);
+  return suppressed;
+}
+
+/**
+ * Consumer-side gate for a delivery message that was already queued when the
+ * mode left 'deliver'.  'hold' re-opens the outbox row as pending (released
+ * again on resume); 'suppress' marks it suppressed.  Targeted parked retries
+ * (subscriptionId) need nothing: their deliveries row stays 'parked' and the
+ * parked flush re-releases it after resume.
+ */
+export async function gateQueuedDelivery(
+  env: Env,
+  txId: string,
+  mode: Exclude<DeliveryMode, 'deliver'>,
+  now: Date = new Date(),
+): Promise<void> {
+  const nowIso = now.toISOString();
+  if (mode === 'hold') {
+    await run(
+      env.DB,
+      `UPDATE delivery_outbox
+          SET status = 'pending', available_at = ?, last_error = ?, updated_at = ?
+        WHERE tx_id = ? AND status IN ('sending', 'enqueued')`,
+      [nowIso, 'held by CT_DELIVERY_MODE=hold', nowIso, txId],
+    );
+    return;
+  }
+  const reason = suppressionReason(await latestDeliveryModeChange(env));
+  await run(
+    env.DB,
+    `UPDATE delivery_outbox
+        SET status = 'suppressed', last_error = ?, updated_at = ?
+      WHERE tx_id = ? AND status NOT IN ('completed', 'suppressed', 'failed')`,
+    [reason, nowIso, txId],
+  );
+}
+
 /** Mark a fully processed fanout chain before its Queue message is ACKed. */
 export async function completeDeliveryOutbox(
   env: Env,
@@ -214,7 +299,9 @@ export async function reconnectDeadLetteredOutbox(
   const row = await getOutboxRow(env, txId);
   if (!row) return { status: 'missing', deadLetterCycles: 0 };
   const nowIso = now.toISOString();
-  if (row.status === 'completed') {
+  // 'suppressed' (CT_DELIVERY_MODE=suppress) is terminal like 'completed':
+  // a dead-lettered message must never re-open it for delivery.
+  if (row.status === 'completed' || row.status === 'suppressed') {
     return { status: 'completed', deadLetterCycles: row.dead_letter_cycles };
   }
   if (row.status === 'pending' || row.status === 'sending') {

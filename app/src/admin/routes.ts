@@ -198,6 +198,15 @@ import {
 import { estimateTransactionValue } from '../shared/transactionValue.ts';
 import { isValidBracket } from '../shared/brackets.ts';
 import { flushDeliveryOutbox } from '../delivery/outbox.ts';
+import {
+  collectDeliveryModeCheck,
+  DELIVERY_MODE_SETTING_KEY,
+  DELIVERY_MODES,
+  isDeliveryMode,
+  listDeliveryModeAudit,
+  readDeliveryModeDetail,
+  recordDeliveryModeChange,
+} from '../delivery/deliveryMode.ts';
 import { resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { createRuntimeQueueHandlers } from '../deno/runtimeHandlers.ts';
 import { runScheduledTick } from '../deno/scheduledTick.ts';
@@ -415,6 +424,58 @@ async function resolveAdminActor(c: Context<{ Bindings: Env }>): Promise<string>
     /* fall through to the generic actor label */
   }
   return adminActor(c);
+}
+
+/**
+ * PUT /settings for CT_DELIVERY_MODE (subscriber alert pause).  Validates the
+ * value, writes Infisical first via the settings service (a failed write
+ * fails the save and records nothing), then appends a delivery_mode_audit row
+ * with who/when/from/to/reason.  An audit insert failure after a successful
+ * Infisical write is reported (502) — the mode did change, so the caller must
+ * know the trail is missing; the delivery_mode health check also turns
+ * critical for an unaudited non-default mode.
+ */
+async function putDeliveryMode(
+  c: Context<{ Bindings: Env }>,
+  rawValue: string,
+  rawReason: string | null,
+): Promise<Response> {
+  const value = rawValue.trim().toLowerCase();
+  if (!isDeliveryMode(value)) {
+    return c.json({ ok: false, error: `${DELIVERY_MODE_SETTING_KEY} must be one of ${DELIVERY_MODES.join(', ')}` }, 400);
+  }
+  const reason = rawReason?.trim() ? rawReason.trim().slice(0, 500) : null;
+  if (value !== 'deliver' && !reason) {
+    return c.json({ ok: false, error: `reason is required when setting ${DELIVERY_MODE_SETTING_KEY} to ${value}` }, 400);
+  }
+  const { appSettings } = await import('../settings/settingsService.ts');
+  const previous = readDeliveryModeDetail();
+  let saved: string;
+  try {
+    saved = await appSettings().set(c.env, DELIVERY_MODE_SETTING_KEY, value);
+  } catch (err) {
+    return c.json({ ok: false, error: (err as Error).message }, 502);
+  }
+  const actor = await resolveAdminActor(c);
+  try {
+    const audit = await recordDeliveryModeChange(c.env, {
+      mode: value,
+      previousMode: previous.mode,
+      actor,
+      reason,
+    });
+    console.warn(
+      `delivery_mode.changed ${previous.mode} -> ${value} by ${actor}${reason ? ` (${reason})` : ''} [${audit.id}]`,
+    );
+    return c.json({ ok: true, key: DELIVERY_MODE_SETTING_KEY, value: saved, previousMode: previous.mode, audit });
+  } catch (err) {
+    return c.json({
+      ok: false,
+      key: DELIVERY_MODE_SETTING_KEY,
+      value: saved,
+      error: `mode saved to Infisical but the audit row failed: ${(err as Error).message}`,
+    }, 502);
+  }
 }
 
 /**
@@ -5322,12 +5383,48 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!isSettingsInitialized()) {
       return c.json({ ok: false, error: 'settings not initialized' }, 503);
     }
+    if (key === DELIVERY_MODE_SETTING_KEY) {
+      return await putDeliveryMode(c, value, typeof body.reason === 'string' ? body.reason : null);
+    }
     try {
       const saved = await appSettings().set(c.env, key, value);
       return c.json({ ok: true, key, value: saved });
     } catch (err) {
       return c.json({ ok: false, error: (err as Error).message }, /Unknown app setting/.test((err as Error).message) ? 400 : 502);
     }
+  });
+
+  // --- GET /delivery-mode -------------------------------------------------
+  // Subscriber alert pause status (CT_DELIVERY_MODE): current mode, the
+  // delivery_mode health check, outbox counts that a resume would release or
+  // that were suppressed, and the change audit trail.  Change the mode with
+  // PUT /settings { key: 'CT_DELIVERY_MODE', value, reason }.
+  r.get('/delivery-mode', async (c) => {
+    const { isSettingsInitialized } = await import('../settings/settingsService.ts');
+    if (!isSettingsInitialized()) {
+      return c.json({ ok: false, error: 'settings not initialized' }, 503);
+    }
+    const reading = readDeliveryModeDetail();
+    const [check, audit, outbox] = await Promise.all([
+      collectDeliveryModeCheck(c.env),
+      listDeliveryModeAudit(c.env, 50).catch(() => []),
+      all<{ status: string; n: number }>(
+        c.env.DB,
+        `SELECT status, COUNT(*) AS n FROM delivery_outbox
+          WHERE status IN ('pending', 'sending', 'enqueued', 'suppressed') GROUP BY status`,
+        [],
+      ).catch(() => []),
+    ]);
+    return c.json({
+      ok: true,
+      mode: reading.mode,
+      raw: reading.raw ?? null,
+      invalid: reading.invalid,
+      modes: DELIVERY_MODES,
+      check,
+      outbox: Object.fromEntries(outbox.map((row) => [row.status, Number(row.n)])),
+      audit,
+    });
   });
 
   // --- GET /ui-settings ---------------------------------------------------
