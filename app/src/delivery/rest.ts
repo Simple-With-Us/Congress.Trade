@@ -86,6 +86,13 @@ import {
   webhookTargetLengthError,
 } from './subscriptions.ts';
 import { openSseStream } from './sse.ts';
+import {
+  isMissingRetractionsTable,
+  listRetractions,
+  RETRACTIONS_DEFAULT_LIMIT,
+  RETRACTIONS_MAX_LIMIT,
+} from './retractions.ts';
+import { z } from 'zod';
 import { handleTickerLogoRequest } from '../ui/tickerLogos.ts';
 import { readLogoPolicyOverlay } from '../ui/tickerLogoPolicy.ts';
 import { handleMemberPhotoRequest } from '../enrichment/memberPhotoPack.ts';
@@ -98,6 +105,28 @@ import { checkReadiness, type ReadinessResult } from '../shared/readiness.ts';
 import { costProfilePublicSummary, resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { readLocalLitestreamAge } from '../shared/litestreamAge.ts';
 import { readR2WeeklyArchiveStatus } from '../shared/r2WeeklyArchive.ts';
+
+/** Optional non-negative integer query param ('' counts as absent). */
+const queryUint = z.preprocess(
+  (v) => (v === '' ? undefined : v),
+  z.string().regex(/^\d{1,16}$/).transform(Number).optional(),
+);
+
+/**
+ * GET /transactions/retractions query.  Unknown params are ignored (stripped),
+ * like the other public feed endpoints, so cache-busters keep working.
+ * `limit` above RETRACTIONS_MAX_LIMIT is clamped, as listRetractions did.
+ */
+export const RetractionsQuerySchema = z.object({
+  since: queryUint.transform((v) => v ?? 0),
+  limit: queryUint
+    .transform((v) => v ?? RETRACTIONS_DEFAULT_LIMIT)
+    .pipe(z.number().int().min(1))
+    .transform((v) => Math.min(v, RETRACTIONS_MAX_LIMIT)),
+});
+
+/** GET /stream retraction resume cursor (?retractSince=). */
+export const SseRetractQuerySchema = z.object({ retractSince: queryUint });
 
 function parseIntOrUndef(v: string | undefined): number | undefined {
   if (v === undefined || v === '') return undefined;
@@ -156,6 +185,7 @@ const PUBLIC_STABLE_CACHE = 'public, s-maxage=300, stale-while-revalidate=600';
  */
 function isPublicReadPath(path: string): boolean {
   return path === '/transactions'
+    || path === '/transactions/retractions'
     || path === '/members'
     || path === '/health'
     || path === '/feed.xml'
@@ -616,6 +646,47 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     return c.json(check, check.ok ? 200 : 503);
   });
 
+  // --- GET /transactions/retractions --------------------------------------
+  // trade.retract poll feed (retractions.ts): transactions taken off the feed
+  // (unpublish, reject, republish retirement, amendment supersede).  Same
+  // access as /transactions: public, CORS-readable, same daily row budget.
+  // Keyset on the retraction cursor: pass the returned `cursor` back as
+  // `since`.  A retraction whose row was later revived is omitted; the row
+  // comes back through /transactions with a new cursorSeq.
+  r.get('/transactions/retractions', async (c) => {
+    const parsed = RetractionsQuerySchema.safeParse(c.req.query());
+    if (!parsed.success) {
+      return c.json({ error: 'since must be an integer >= 0 and limit an integer from 1 to ' + RETRACTIONS_MAX_LIMIT }, 400);
+    }
+    const { since, limit } = parsed.data;
+    const ip = clientIp(c.req.raw);
+    const budget = await checkRowBudget(c.env, ip);
+    if (!budget.ok) {
+      return c.json(
+        { error: 'daily feed row budget reached' },
+        429,
+        { 'Retry-After': String(budget.retryAfterSec) },
+      );
+    }
+    let page: Awaited<ReturnType<typeof listRetractions>>;
+    try {
+      page = await listRetractions(c.env, since, limit);
+    } catch (err) {
+      // Deploy-before-migrate: 0108 not applied yet.  Same degradation as the
+      // SSE path (retractions off), surfaced as a retryable 503, not a 500.
+      if (!isMissingRetractionsTable(err)) throw err;
+      c.header('Retry-After', '60');
+      return c.json({ error: 'retraction feed not available yet (migration 0108 pending)' }, 503);
+    }
+    await spendRowBudget(c.env, ip, page.retractions.length);
+    c.header('Cache-Control', 'no-store');
+    return c.json({
+      retractions: page.retractions,
+      cursor: page.cursor,
+      hasMore: page.hasMore,
+    });
+  });
+
   // --- GET /transactions --------------------------------------------------
   // Reconciliation backstop: rows with cursor_seq > since, ASC, plus the max
   // cursor in the page so clients can poll forward deterministically.
@@ -923,6 +994,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // at the current cursor high-water mark (live tail only). Resume / catch-up
   // uses ?since=<cursor_seq> or the Last-Event-ID header (each trade event
   // carries id:<cursorSeq>); replay is gap-free from the transactions table.
+  // Retractions resume from ?retractSince=; a resume without it replays the
+  // last 24h of retractions (native auto-reconnect cannot resend the query
+  // param), while a fresh open starts at the retraction high-water mark.
   //
   // Token transport: prefer `Authorization: Bearer <secret>` (or
   // X-Subscription-Secret) so the secret stays out of URLs (browser history,
@@ -941,7 +1015,10 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     }
     const since = resolveResumeCursor(c.req.query('since'), c.req.header('Last-Event-ID'));
     const token = subscriptionSecretFromRequest(c, true) ?? undefined;
-    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw));
+    const resume = SseRetractQuerySchema.safeParse(c.req.query());
+    if (!resume.success) return c.json({ error: 'retractSince must be an integer >= 0' }, 400);
+    const retractSince = resume.data.retractSince;
+    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw), {}, retractSince);
   });
 
   // --- GET /logos/ticker --------------------------------------------------

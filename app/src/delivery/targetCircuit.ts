@@ -145,11 +145,16 @@ interface DeliveryScanRow {
 }
 
 /** Classifies the delivery's transaction in the parked/quarantined scans. */
-const TX_STATE_SQL = `CASE WHEN t.id IS NULL THEN 'missing'
+// A 'retract:<seq>' delivery key (trade.retract, see retractions.ts) has no
+// transactions row by design; it is judged live here and dispatch itself
+// drops it if the retraction was revived.
+const RETRACT_KEY_SQL = "d.tx_id LIKE 'retract:%'";
+const TX_STATE_SQL = `CASE WHEN ${RETRACT_KEY_SQL} THEN NULL
+                WHEN t.id IS NULL THEN 'missing'
                 WHEN t.deprecated_at IS NOT NULL THEN 'retracted'
            END`;
-const TX_UNDELIVERABLE_SQL = '(t.id IS NULL OR t.deprecated_at IS NOT NULL)';
-const TX_LIVE_SQL = '(t.id IS NOT NULL AND t.deprecated_at IS NULL)';
+const TX_UNDELIVERABLE_SQL = `(NOT ${RETRACT_KEY_SQL} AND (t.id IS NULL OR t.deprecated_at IS NOT NULL))`;
+const TX_LIVE_SQL = `(${RETRACT_KEY_SQL} OR (t.id IS NOT NULL AND t.deprecated_at IS NULL))`;
 
 /**
  * While no undeliverable quarantined rows are left, the scheduled scan for
