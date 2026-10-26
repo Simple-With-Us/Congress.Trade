@@ -1,6 +1,6 @@
 /**
- * Correction mode for admin republish (POST /review/:docId, correction: true)
- * plus the admin-side halves of the pipeline hardening (GB-Publisher):
+ * Republish-never-resends for admin manual decisions (POST /review/:docId,
+ * the default for any previously published filing; there is no flag) plus the admin-side halves of the pipeline hardening (GB-Publisher):
  * junk asset names, off-by-one bracket lower bounds, and the after-filing
  * date window.
  *
@@ -9,6 +9,7 @@
  * row_key index, the cursor_seq trigger and the outbox insert all execute.
  */
 import { afterEach, describe, expect, it } from 'vitest';
+import { z } from 'zod';
 
 import { buildAdminRouter } from '../routes.ts';
 import { latestLiveSet, planCorrection, type CorrectionEdit, type PriorTxRow } from '../reviewCorrection.ts';
@@ -97,17 +98,41 @@ describe('planCorrection', () => {
     expect(twice).toMatchObject({ ok: false });
   });
 
-  it('only implicitly matches the latest deprecation batch', () => {
+  it('revives an unchanged trade from an older publish cycle instead of re-sending it', () => {
     expect(latestLiveSet([prior({ id: 'old', deprecated_at: OLDER_DEPRECATED_AT }), prior({ id: 'new' })]).map((r) => r.id))
       .toEqual(['new']);
-    // The identical row only exists in an older cycle; the latest live set
-    // held something else, so the edit is new rather than a silent revive.
+    // The identical trade was delivered in an older cycle only; it must come
+    // back under its old id, never as a new (alerting) row.
     const plan = planCorrection(
       [edit()],
       [prior({ id: 'old', deprecated_at: OLDER_DEPRECATED_AT }), prior({ id: 'new', asset_name: 'Oracle Corporation' })],
     );
-    expect(plan.ok && plan.added).toEqual([0]);
+    expect(plan.ok && plan.matches).toEqual([{ editIndex: 0, txId: 'old', kind: 'unchanged_older_cycle' }]);
+    expect(plan.ok && plan.added).toEqual([]);
     expect(plan.ok && plan.retired).toEqual(['new']);
+  });
+
+  it('prefers the latest cycle over an older one for an unchanged trade', () => {
+    const plan = planCorrection(
+      [edit()],
+      [prior({ id: 'old', deprecated_at: OLDER_DEPRECATED_AT }), prior({ id: 'new' })],
+    );
+    expect(plan.ok && plan.matches).toEqual([{ editIndex: 0, txId: 'new', kind: 'unchanged' }]);
+  });
+
+  it('does not fuzzy-correct against an older cycle', () => {
+    // Same asset with a changed date exists only in an older cycle: that is
+    // not a safe "corrected" pairing, so the edit is a new row.
+    const plan = planCorrection(
+      [edit({ txDate: '2026-07-30' })],
+      [prior({ id: 'old', deprecated_at: OLDER_DEPRECATED_AT }), prior({ id: 'new', asset_name: 'Oracle Corporation' })],
+    );
+    expect(plan.ok && plan.added).toEqual([0]);
+  });
+
+  it('treats a first publish (no prior rows) as all new', () => {
+    const plan = planCorrection([edit(), edit({ assetName: 'PLEXUS CORP' })], []);
+    expect(plan).toEqual({ ok: true, matches: [], added: [0, 1], retired: [] });
   });
 });
 
@@ -124,10 +149,6 @@ afterEach(() => {
 async function seededDb() {
   const { db, d1, close } = await openMigratedD1();
   closeDb = close;
-  // filings.filing_status is added by the runtime migration runner
-  // (admin/migrations.ts), not a numbered .sql file.
-  const filingCols = db.prepare('PRAGMA table_info(filings)').all() as Array<{ name: string }>;
-  if (!filingCols.some((c) => c.name === 'filing_status')) db.exec('ALTER TABLE filings ADD COLUMN filing_status TEXT');
   db.prepare(
     `INSERT INTO filings (doc_id, chamber, filer_id, filing_type, filed_date, ingest_status, first_seen_at)
      VALUES (?, 'executive', 'EXEC-DJT', 'P', '2026-09-08', 'needs_review', '2026-09-22T12:14:00.001Z')`,
@@ -166,9 +187,29 @@ function env(d1: unknown) {
   } as never;
 }
 
+const RepublishSummary = z.object({
+  revived: z.number(),
+  unchanged: z.number(),
+  unchangedOlderCycle: z.number(),
+  corrected: z.number(),
+  explicit: z.number(),
+  added: z.number(),
+  retired: z.number(),
+  correctedTxIds: z.array(z.string()),
+  retiredTxIds: z.array(z.string()),
+});
+const ReviewResponse = z.object({
+  error: z.string().optional(),
+  republish: RepublishSummary.optional(),
+}).passthrough();
+
 async function post(d1: unknown, body: Record<string, unknown>) {
   const res = await app.request(`/review/${DOC}`, { method: 'POST', headers: AUTH, body: JSON.stringify(body) }, env(d1));
-  return { status: res.status, body: (await res.json()) as Record<string, any> };
+  return { status: res.status, body: ReviewResponse.parse(await res.json()) };
+}
+
+function undeliveredCount(db: SqliteDatabase): number {
+  return (db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed'").get() as { n: number }).n;
 }
 
 const EDITS = [
@@ -184,17 +225,18 @@ function live(db: SqliteDatabase) {
   ).all(DOC) as Array<Record<string, unknown>>;
 }
 
-describe('POST /review/:docId — correction mode', () => {
-  it('revives matching rows in place and only enqueues delivery for added rows', async () => {
+describe('POST /review/:docId — republish never re-sends', () => {
+  it('by default revives matching rows in place and only enqueues delivery for added rows', async () => {
     const { db, d1 } = await seededDb();
     const before = new Map(
       (db.prepare('SELECT id, cursor_seq, created_at FROM transactions WHERE doc_id = ?').all(DOC) as Array<Record<string, unknown>>)
         .map((r) => [r.id, r]),
     );
-    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, correction: true, edits: EDITS });
+    // No flag of any kind: correction semantics are the default.
+    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, edits: EDITS });
     expect(status).toBe(200);
-    expect(body.correction).toMatchObject({ revived: 2, unchanged: 1, corrected: 1, explicit: 0, added: 1, retired: 1 });
-    expect(body.correction.retiredTxIds).toEqual(['tx-oracle']);
+    expect(body.republish).toMatchObject({ revived: 2, unchanged: 1, corrected: 1, explicit: 0, added: 1, retired: 1 });
+    expect(body.republish?.retiredTxIds).toEqual(['tx-oracle']);
 
     const rows = live(db);
     expect(rows).toHaveLength(3);
@@ -219,27 +261,70 @@ describe('POST /review/:docId — correction mode', () => {
     expect(review).toMatchObject({ resolved: 1, resolution_reason: 'admin_manual' });
   });
 
-  it('without correction, republish keeps the old behaviour: every row new and enqueued', async () => {
+  it('ignores a legacy correction: false field; matched rows still never re-enqueue', async () => {
     const { db, d1 } = await seededDb();
-    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, edits: EDITS });
+    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, correction: false, edits: EDITS });
     expect(status).toBe(200);
-    expect(body.correction).toBeUndefined();
-    const rows = live(db);
-    expect(rows).toHaveLength(3);
-    expect(rows.some((r) => String(r.id).startsWith('tx-'))).toBe(false);
-    const pending = db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE status = 'pending' OR status = 'enqueued' OR status = 'sending' OR status = 'failed'").get() as { n: number };
-    expect(pending.n).toBe(3);
+    expect(body.republish).toMatchObject({ revived: 2, added: 1 });
+    expect(undeliveredCount(db)).toBe(1);
   });
 
-  it('validates the correction fields', async () => {
+  it('revives a trade delivered in an older cycle without re-enqueueing it', async () => {
+    const { db, d1 } = await seededDb();
+    // Plexus was last live two cycles ago; the latest Unpublish never saw it.
+    db.prepare('UPDATE transactions SET deprecated_at = ? WHERE id = ?').run(OLDER_DEPRECATED_AT, 'tx-plexus');
+    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, edits: [EDITS[0]] });
+    expect(status).toBe(200);
+    expect(body.republish).toMatchObject({ revived: 1, unchangedOlderCycle: 1, added: 0 });
+    expect(live(db).map((r) => r.id)).toEqual(['tx-plexus']);
+    expect(undeliveredCount(db)).toBe(0);
+  });
+
+  it('an all-revived republish skips the flush and leaves other filings\' pending rows alone', async () => {
+    const { db, d1 } = await seededDb();
+    // An unrelated filing's row waiting in the outbox.  flushDeliveryOutbox
+    // with an empty id list would claim it.
+    db.prepare(
+      `INSERT INTO filings (doc_id, chamber, filer_id, filing_type, filed_date, ingest_status, first_seen_at)
+       VALUES ('H-2026-OTHER', 'house', 'H-OTHER', 'P', '2026-10-20', 'published', '2026-10-20T12:00:00.000Z')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO transactions (id, doc_id, filer_id, tx_date, owner, asset_name, ticker, tx_type,
+         amount_min, amount_max, is_option, cap_gains_over_200, raw_text, confidence, source, row_key, created_at)
+       VALUES ('tx-other', 'H-2026-OTHER', 'H-OTHER', '2026-10-01', NULL, 'Apple Inc.', 'AAPL', 'P',
+         1001, 15000, 0, 0, '', 1, 'pdf', 'v1:pdf:0:other', '2026-10-20T12:00:00.000Z')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO delivery_outbox (tx_id, status, attempts, available_at, created_at, updated_at)
+       VALUES ('tx-other', 'pending', 0, '2026-10-20T12:00:00.000Z', '2026-10-20T12:00:00.000Z', '2026-10-20T12:00:00.000Z')`,
+    ).run();
+    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, edits: EDITS.slice(0, 2) });
+    expect(status).toBe(200);
+    expect(body.republish).toMatchObject({ revived: 2, added: 0 });
+    expect(body.delivery ?? null).toBeNull();
+    const other = db.prepare("SELECT status, attempts FROM delivery_outbox WHERE tx_id = 'tx-other'").get();
+    expect(other).toEqual({ status: 'pending', attempts: 0 });
+  });
+
+  it('a first publish (no prior rows) inserts and enqueues every row', async () => {
+    const { db, d1 } = await seededDb();
+    db.prepare('DELETE FROM delivery_outbox').run();
+    db.prepare('DELETE FROM transactions WHERE doc_id = ?').run(DOC);
+    const { status, body } = await post(d1, { decision: 'manual', reviewRevision: 3, edits: EDITS });
+    expect(status).toBe(200);
+    expect(body.republish).toMatchObject({ revived: 0, added: 3, retired: 0 });
+    expect(live(db)).toHaveLength(3);
+    expect(undeliveredCount(db)).toBe(3);
+  });
+
+  it('validates correctsTxId', async () => {
     const { d1 } = await seededDb();
-    expect((await post(d1, { decision: 'manual', reviewRevision: 3, correction: 'yes', edits: EDITS })).status).toBe(400);
-    const stray = await post(d1, { decision: 'manual', reviewRevision: 3, edits: [{ ...EDITS[0], correctsTxId: 'tx-plexus' }] });
-    expect(stray.status).toBe(400);
-    expect(String(stray.body.error)).toContain('correction: true');
-    const unknown = await post(d1, { decision: 'manual', reviewRevision: 3, correction: true, edits: [{ ...EDITS[0], correctsTxId: 'tx-nope' }] });
+    const unknown = await post(d1, { decision: 'manual', reviewRevision: 3, edits: [{ ...EDITS[0], correctsTxId: 'tx-nope' }] });
     expect(unknown.status).toBe(400);
     expect(String(unknown.body.error)).toContain('correctsTxId');
+    const explicit = await post(d1, { decision: 'manual', reviewRevision: 3, edits: [{ ...EDITS[2], correctsTxId: 'tx-oracle' }] });
+    expect(explicit.status).toBe(200);
+    expect(explicit.body.republish).toMatchObject({ explicit: 1, revived: 1, added: 0 });
   });
 });
 

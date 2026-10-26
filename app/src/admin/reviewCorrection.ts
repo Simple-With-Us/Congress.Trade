@@ -1,43 +1,49 @@
 /**
  * src/admin/reviewCorrection.ts
  *
- * Correction mode for an admin manual/confirm republish (POST /review/:docId
- * with `correction: true`).
+ * Republish semantics for an admin manual/confirm decision on a filing that
+ * was published before (POST /review/:docId).  This is the DEFAULT for every
+ * such decision; there is no flag to turn it off (Jay 2026-10-25: "Republish
+ * shouldn't send").
  *
- * The problem: fixing a published filing meant Unpublish (soft-deprecate every
- * live row) and then a manual decision that INSERTs the corrected set with new
- * transaction ids.  Every row then gets a fresh delivery_outbox entry, a fresh
- * cursor_seq and a fresh created_at, so webhooks, APNs and SSE re-announce the
- * whole filing as new trades (Trump 09-08-2026: 1,156 rows re-alerted to fix
- * 7 dates and add 43 missing rows).
+ * The problem it fixes: correcting a published filing meant Unpublish
+ * (soft-deprecate every live row) and then a manual decision that INSERTed
+ * the corrected set with new transaction ids.  Every row got a fresh
+ * delivery_outbox entry, cursor_seq and created_at, so webhooks, APNs and SSE
+ * re-announced the whole filing (Trump 09-08-2026: 1,156 rows re-alerted to
+ * fix 7 dates and add 43 missing rows).
  *
- * Correction mode keeps transaction identity instead.  Each submitted row is
- * matched against the rows that were live just before the republish (the most
- * recent deprecation batch for this doc) and, when it matches, the old row is
- * revived in place with the corrected fields: same id, same cursor_seq, same
- * created_at, no new outbox entry.  Only rows with no match are inserted, and
+ * Instead, each submitted row is matched against the doc's previously
+ * published (now deprecated) rows.  A match is revived in place with the
+ * corrected fields: same id, same cursor_seq, same created_at, and it never
+ * re-enters the delivery outbox.  Only rows with no match are inserted, and
  * only those deliver.
  *
  * Matching, in order (each prior row is claimed at most once):
- *   1. explicit  — the edit names `correctsTxId`, any previously published
+ *   1. explicit  - the edit names `correctsTxId`, any previously published
  *                  (deprecated) row of this doc.  The caller's word wins.
- *   2. unchanged — same tx date, owner, type and amount bracket, and the same
+ *   2. unchanged - same tx date, owner, type and amount bracket, and the same
  *                  asset (ticker, or the simplified company name).  Case and
  *                  punctuation changes ("Plexus Corp." vs "PLEXUS CORP") are
- *                  still "unchanged".
- *   3. corrected — same asset, type and owner, with the date and/or amount
- *                  changed, and the pairing is unique BOTH ways among the rows
- *                  still unmatched.  Anything ambiguous (two lots of the same
- *                  stock) is left unmatched and inserts as a new row rather
- *                  than risk folding a real new trade into an old one.
+ *                  still "unchanged".  Tried against the live set the
+ *                  Unpublish removed first, then against older publish
+ *                  cycles, so a trade delivered in ANY earlier cycle is never
+ *                  re-sent.
+ *   3. corrected - same asset, type and owner, with the date and/or amount
+ *                  changed, and the pairing is unique BOTH ways among the
+ *                  latest live set's still-unmatched rows.  Anything ambiguous
+ *                  (two lots of the same stock) is left unmatched and inserts
+ *                  as a new row rather than risk folding a real new trade into
+ *                  an old one.
  *
  * Prior rows that match nothing stay deprecated (they were wrong or removed).
+ * A first publish has no prior rows, so every row is new and delivers.
  * Pure: no I/O here; the route loads candidates and writes the result.
  */
 
 import { simplifyCompanyName } from '../extraction/nameNormalizer.ts';
 
-export type CorrectionMatchKind = 'explicit' | 'unchanged' | 'corrected';
+export type CorrectionMatchKind = 'explicit' | 'unchanged' | 'unchanged_older_cycle' | 'corrected';
 
 /** A previously published row of the doc (deprecated by the unpublish). */
 export interface PriorTxRow {
@@ -111,8 +117,8 @@ function coreKey(date: string | null, owner: string | null, type: string | null,
 /**
  * The rows that were live just before this republish: the latest
  * deprecation batch.  Unpublish deprecates the whole live set with one
- * timestamp, so older cycles (already superseded before) are excluded from
- * implicit matching; `correctsTxId` may still name any of them.
+ * timestamp.  Only this set is eligible for the fuzzy "corrected" pass; older
+ * cycles still match as unchanged, and `correctsTxId` may name any of them.
  */
 export function latestLiveSet(prior: readonly PriorTxRow[]): PriorTxRow[] {
   let latest: string | null = null;
@@ -148,25 +154,37 @@ export function planCorrection(
   const live = latestLiveSet(prior);
   const liveKeys = new Map(live.map((row) => [row.id, assetKeys(row.asset_name, row.ticker)]));
 
-  // 2. unchanged: bucket the live set by core fields, newest first within.
-  const buckets = new Map<string, PriorTxRow[]>();
-  for (const row of live) {
-    if (claimed.has(row.id)) continue;
-    const key = coreKey(row.tx_date, row.owner, row.tx_type, row.amount_min, row.amount_max);
-    const list = buckets.get(key) ?? [];
-    list.push(row);
-    buckets.set(key, list);
-  }
-  for (const [editIndex, edit] of edits.entries()) {
-    if (matched.has(editIndex)) continue;
-    const key = coreKey(edit.txDate, edit.owner, edit.txType, edit.amountMin ?? null, edit.amountMax ?? null);
-    const candidates = buckets.get(key);
-    if (!candidates) continue;
-    const keys = assetKeys(edit.assetName, edit.ticker);
-    const hit = candidates.find((row) => !claimed.has(row.id) && sameAsset(keys, liveKeys.get(row.id) ?? []));
-    if (!hit) continue;
-    claimed.add(hit.id);
-    matched.set(editIndex, { editIndex, txId: hit.id, kind: 'unchanged' });
+  // 2. unchanged: the latest live set first, then older cycles (newest
+  // deprecation first), each bucketed by core fields.
+  const liveIds = new Set(live.map((row) => row.id));
+  const older = prior
+    .filter((row) => !liveIds.has(row.id))
+    .sort((a, b) => String(b.deprecated_at ?? '').localeCompare(String(a.deprecated_at ?? '')));
+  const allKeys = new Map(prior.map((row) => [row.id, assetKeys(row.asset_name, row.ticker)]));
+  const bucketize = (rows: readonly PriorTxRow[]) => {
+    const buckets = new Map<string, PriorTxRow[]>();
+    for (const row of rows) {
+      if (claimed.has(row.id)) continue;
+      const key = coreKey(row.tx_date, row.owner, row.tx_type, row.amount_min, row.amount_max);
+      const list = buckets.get(key) ?? [];
+      list.push(row);
+      buckets.set(key, list);
+    }
+    return buckets;
+  };
+  for (const [pool, kind] of [[live, 'unchanged'], [older, 'unchanged_older_cycle']] as const) {
+    const buckets = bucketize(pool);
+    for (const [editIndex, edit] of edits.entries()) {
+      if (matched.has(editIndex)) continue;
+      const key = coreKey(edit.txDate, edit.owner, edit.txType, edit.amountMin ?? null, edit.amountMax ?? null);
+      const candidates = buckets.get(key);
+      if (!candidates) continue;
+      const keys = assetKeys(edit.assetName, edit.ticker);
+      const hit = candidates.find((row) => !claimed.has(row.id) && sameAsset(keys, allKeys.get(row.id) ?? []));
+      if (!hit) continue;
+      claimed.add(hit.id);
+      matched.set(editIndex, { editIndex, txId: hit.id, kind });
+    }
   }
 
   // 3. corrected: same asset + type + owner, unique both ways.

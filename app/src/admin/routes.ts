@@ -1031,7 +1031,7 @@ export const ReviewEditItemSchema = z.object({
   description: z.string().nullable().optional(),
   supplementalText: z.string().nullable().optional(),
   confidence: z.number().nullable().optional(),
-  /** Correction mode only: the previously published transaction this row fixes. */
+  /** Republish only: the previously published (deprecated) transaction this row fixes. */
   correctsTxId: z.string().min(1).max(64).nullable().optional(),
 });
 
@@ -1084,17 +1084,18 @@ type ValidatedEditedTx = EditedTx & {
   rowKeyAssetName: string;
 };
 
-/** Counts (and capped id lists) describing one correction-mode republish. */
+/** Counts (and capped id lists) describing one republish (all zero on a first publish). */
 function correctionSummary(plan: Extract<CorrectionPlan, { ok: true }>) {
   const count = (kind: string) => plan.matches.filter((m) => m.kind === kind).length;
   return {
     revived: plan.matches.length,
     unchanged: count('unchanged'),
+    unchangedOlderCycle: count('unchanged_older_cycle'),
     corrected: count('corrected'),
     explicit: count('explicit'),
     added: plan.added.length,
     retired: plan.retired.length,
-    correctedTxIds: plan.matches.filter((m) => m.kind !== 'unchanged').map((m) => m.txId).slice(0, 200),
+    correctedTxIds: plan.matches.filter((m) => m.kind === 'corrected' || m.kind === 'explicit').map((m) => m.txId).slice(0, 200),
     retiredTxIds: plan.retired.slice(0, 200),
   };
 }
@@ -2989,17 +2990,6 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ error: 'acknowledgeStaleTxDate must be a boolean when present' }, 400);
     }
     const acknowledgeStaleTxDate = ackStaleParse.data === true;
-    // Correction mode (see admin/reviewCorrection.ts): an explicit request
-    // field, never inferred, so a plain manual decision keeps today's
-    // behaviour byte for byte.
-    const correctionParse = z.boolean().optional().safeParse(body.correction);
-    if (!correctionParse.success) {
-      return c.json({ error: 'correction must be a boolean when present' }, 400);
-    }
-    const correction = correctionParse.data === true;
-    if (!correction && rawEdits.some((e) => e.correctsTxId)) {
-      return c.json({ error: 'correctsTxId is only accepted with correction: true' }, 400);
-    }
     if (rawEdits.length === 0) {
       return c.json(
         {
@@ -3075,25 +3065,24 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
-    // Correction mode: revive matching previously published rows in place
-    // (same id, cursor_seq and created_at; no new outbox entry) and insert
-    // only the rows that match nothing.
+    // Republish never re-sends (default, no opt-out; see
+    // admin/reviewCorrection.ts): rows matching a previously published trade
+    // of this doc are revived in place (same id, cursor_seq and created_at)
+    // and never re-enter the delivery outbox.  Only unmatched rows insert and
+    // deliver.  A first publish has no prior rows, so every row is new.
     const reviveByEdit = new Map<number, string>();
-    let correctionPlan: Extract<CorrectionPlan, { ok: true }> | null = null;
-    if (correction) {
-      const prior = await all<PriorTxRow>(
-        c.env.DB,
-        `SELECT id, tx_date, owner, asset_name, ticker, tx_type, amount_min, amount_max, deprecated_at
-           FROM transactions
-          WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
-            AND deprecated_at IS NOT NULL`,
-        [docId],
-      );
-      const plan = planCorrection(edits, prior);
-      if (plan.ok === false) return c.json({ error: plan.error }, 400);
-      correctionPlan = plan;
-      for (const m of plan.matches) reviveByEdit.set(m.editIndex, m.txId);
-    }
+    const prior = await all<PriorTxRow>(
+      c.env.DB,
+      `SELECT id, tx_date, owner, asset_name, ticker, tx_type, amount_min, amount_max, deprecated_at
+         FROM transactions
+        WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
+          AND deprecated_at IS NOT NULL`,
+      [docId],
+    );
+    const plan = planCorrection(edits, prior);
+    if (plan.ok === false) return c.json({ error: plan.error }, 400);
+    const correctionPlan = plan;
+    for (const m of plan.matches) reviveByEdit.set(m.editIndex, m.txId);
 
     const nowIso = new Date().toISOString();
     const insertRows: Array<Record<string, string | number | null>> = [];
@@ -3169,7 +3158,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       AND (SELECT COUNT(*) FROM transactions
         WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
           AND deprecated_at IS NULL) = ?`;
-    // Revive statement (correction mode only).  Placed after the INSERT so
+    // Revive statement (republish of previously published rows).  Placed after the INSERT so
     // persistResults[0] stays the insert count; the integrity check below
     // runs after both and rolls the whole batch back if either fell short.
     const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [[
@@ -3346,16 +3335,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
     // Best-effort immediate flush; the independent delivery-outbox cron owns
     // durable recovery for any enqueue failure or rows beyond this pass.
-    // Revived (correction) rows were never re-enqueued, so only new ids flush.
+    // Revived rows were never re-enqueued, so only new ids flush.  An empty
+    // id list must skip the flush: flushDeliveryOutbox drops its tx_id filter
+    // when handed no ids and would claim unrelated filings' pending rows.
     const revivedSet = new Set(revivedIds);
     const deliveryIds = transactionIds.filter((id) => !revivedSet.has(id));
-    const delivery = await flushDeliveryOutbox(c.env, {
-      txIds: deliveryIds,
-      limit: Math.max(deliveryIds.length, 1),
-    }).catch((err) => {
-      console.warn('review confirm: delivery outbox flush failed', docId, (err as Error).message);
-      return null;
-    });
+    const delivery = deliveryIds.length === 0
+      ? null
+      : await flushDeliveryOutbox(c.env, {
+        txIds: deliveryIds,
+        limit: deliveryIds.length,
+      }).catch((err) => {
+        console.warn('review confirm: delivery outbox flush failed', docId, (err as Error).message);
+        return null;
+      });
 
     let deprecatedPredecessors = 0;
     const isAmendment = /amend|\(2\)|278t\(\d+\)/i.test(docId) || (filing.filing_status && /amend/i.test(filing.filing_status));
@@ -3385,7 +3378,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           ocrNormalized: edits.filter((e) => e.cleaningNote).length,
           acknowledgedStaleTxDate: acknowledgeStaleTxDate,
           reviewCreatedAt: review.created_at,
-          ...(correctionPlan ? { correction: correctionSummary(correctionPlan) } : {}),
+          republish: correctionSummary(correctionPlan),
         },
         createdAt: nowIso,
       });
@@ -3401,7 +3394,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       inserted: insertedCount,
       transactionIds,
       delivery,
-      ...(correctionPlan ? { correction: correctionSummary(correctionPlan) } : {}),
+      republish: correctionSummary(correctionPlan),
     });
   });
 

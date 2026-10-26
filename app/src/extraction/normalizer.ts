@@ -472,8 +472,10 @@ export async function normalize(
   // 278-T completeness: when the source numbers more rows than the reader
   // produced, publishing would silently drop the unparsed ones (Trump
   // 09-08-2026 went live with 1,113 of 1,156 rows).  Hold the whole filing.
-  const rowCompleteness = filing.chamber === 'executive' && parsed.length > 0
-    ? assessOgeRowCompleteness(sourceText, parsed)
+  // Measured on usableParsed (the rows that would actually publish), so a
+  // dropped form-chrome/sample row cannot mask a missing real one.
+  const rowCompleteness = filing.chamber === 'executive' && usableParsed.length > 0
+    ? assessOgeRowCompleteness(sourceText, usableParsed)
     : null;
   const rowsIncomplete = rowCompleteness !== null && rowCompleteness.missingCount > 0;
 

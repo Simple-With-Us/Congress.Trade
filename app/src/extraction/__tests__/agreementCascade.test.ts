@@ -140,7 +140,7 @@ function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; pr
           if (/SELECT review_revision FROM review_queue/i.test(sql)) {
             return { review_revision: review.revision } as T;
           }
-          if (opts.reviewReason !== undefined && /SELECT reason FROM review_queue WHERE doc_id/i.test(sql)) {
+          if (opts.reviewReason !== undefined && /SELECT reason FROM review_queue WHERE doc_id = \? AND resolved = 0/i.test(sql)) {
             return { reason: opts.reviewReason } as T;
           }
           return null as T | null;

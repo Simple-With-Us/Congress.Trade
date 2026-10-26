@@ -1102,9 +1102,10 @@ export async function finalizePublish(
     const completeness = assessOgeRowCompleteness(null, parsed);
     let parkedIncomplete = false;
     try {
+      // Only an OPEN parking counts: a resolved row's reason is history.
       const review = await get<{ reason: string | null }>(
         env.DB,
-        'SELECT reason FROM review_queue WHERE doc_id = ?',
+        'SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0',
         [docId],
       );
       parkedIncomplete = String(review?.reason ?? '').split(',').map((t) => t.trim())
