@@ -541,6 +541,18 @@ project_marketing_seq() {
 # Prints the integer on stdout.  Returns 1 (and prints nothing) when ASC
 # cannot be consulted -- the caller must distinguish "no patch yet" (0) from
 # "unknown" (failure).
+asc_released_store_version() {
+  local plat="${1:-}" out rc
+  command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
+  load_secrets >/dev/null || return 1
+  set +e
+  out=$(asc_client released-store-version "$BUNDLE_ID" "$plat" 2>/dev/null)
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || return 1
+  printf '%s' "$out"
+}
+
 asc_latest_marketing_patch() {
   local prefix="$1" plat="${2:-}" out rc
   if ! command -v "$ASC_NODE" >/dev/null 2>&1; then
@@ -838,6 +850,13 @@ PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
 PROJECT_REL_ALT="$(json_get "$APP_KEY" projectRelAlt)"
 XCODEGEN_DIR="$(json_get "$APP_KEY" xcodegenDir)"
 DEFAULT_MARKETING="$(json_get "$APP_KEY" marketingVersionDefault)"
+# Optional fixed-version policy (owner, 2026-10-26): the marketing version does
+# not count up per TestFlight ship; CFBundleVersion is a short count that does.
+# apps.json keys: fixedMarketingVersion ("1.1.0") and buildCountSeed (the first
+# count on an empty train, or "auto" = the latest patch the app has shipped).
+# Absent keys keep the older next-patch behaviour.
+FIXED_MARKETING="$(json_get "$APP_KEY" fixedMarketingVersion)"
+BUILD_COUNT_SEED="$(json_get "$APP_KEY" buildCountSeed)"
 
 if [[ -z "$PLATFORM" ]]; then
   if [[ "$APP_KEY" == *-mac || "$SCHEME" == *[Mm]ac* ]]; then
@@ -935,6 +954,7 @@ PLAN_FLOOR="n/a"
 PLAN_TRAIN_FLOOR="n/a"
 PLAN_APP_FLOOR="n/a"
 PLAN_COMMIT_COUNT="n/a"
+FIXED_MODE=0
 PLAN_READY=0
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
@@ -963,6 +983,23 @@ else
   # ---- the marketing version ---------------------------------------------
   # --version is an exact override.  Otherwise the version is the next patch
   # on the default train, and P comes from App Store Connect.
+  FIXED_MODE=0
+  if [[ -z "$FORCE_VERSION" && -n "$FIXED_MARKETING" ]]; then
+    FORCE_VERSION="$FIXED_MARKETING"
+    FIXED_MODE=1
+    log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
+    # A released App Store version closes its train:  a fixed version at or
+    # below one is refused, never silently bumped.
+    _rel="$(asc_released_store_version "$ASC_PLATFORM" 2>/dev/null || true)"
+    if [[ -n "$_rel" ]]; then
+      if ! python3 -c 'import sys
+a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
+n=max(len(a),len(b)); a+= [0]*(n-len(a)); b+=[0]*(n-len(b))
+sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
+        die "fixedMarketingVersion ${FIXED_MARKETING} is at or below the released App Store version ${_rel}.  Apple requires each new version to be greater than the last released one.  Nothing was bumped.  Pick a version above ${_rel} in apps.json."
+      fi
+    fi
+  fi
   if [[ -n "$FORCE_VERSION" ]]; then
     MARKETING="$FORCE_VERSION"
     # The patch the operator pinned, on its own train ("2.0.5" -> 5).
@@ -1065,8 +1102,34 @@ else
     # already holds it, or because a shallow checkout understates the commit
     # count — so the log line names the floor rather than asserting the
     # commit count was shipped.
+    if [[ "$FIXED_MODE" -eq 1 ]]; then
+      # A short count that goes up inside the fixed train:  one more than the
+      # highest build the train holds (on macOS, the highest build of any
+      # train), or the seed on an empty train.  Never wrapped, truncated or
+      # reset:  a count that cannot be a valid three-digit number stops the
+      # run with the reason.
+      _count_floor="$PLAN_TRAIN_FLOOR"
+      if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then _count_floor="$PLAN_FLOOR"; fi
+      if [[ "$_count_floor" -gt 0 ]]; then
+        BUILD_NUM="$((_count_floor + 1))"
+      else
+        _seed="$BUILD_COUNT_SEED"
+        if [[ "$_seed" == "auto" ]]; then
+          _seed="$(asc_latest_marketing_patch "$MARKETING_PREFIX" "$ASC_PLATFORM" 2>/dev/null || true)"
+          [[ "$_seed" =~ ^[0-9]+$ ]] || die "buildCountSeed is auto but the latest shipped patch could not be read from App Store Connect.  Nothing was guessed."
+          [[ "$_seed" -ge 1 ]] || _seed=1
+        fi
+        [[ "$_seed" =~ ^[0-9]{1,3}$ ]] || die "buildCountSeed for ${APP_KEY} must be 1-3 digits or auto (got '${_seed}')"
+        BUILD_NUM="$_seed"
+      fi
+      if [[ "$BUILD_NUM" -gt 999 ]]; then
+        die "the next build count for ${MARKETING} would be ${BUILD_NUM}, which is not a three-digit count (the floor is ${_count_floor}).  Nothing was reset or truncated.  Decide how the count continues, or pass --build <N> explicitly."
+      fi
+      log "build: fixed-version count ${BUILD_NUM} (floor ${_count_floor})"
+    else
     BUILD_NUM="$PLAN_COMMIT_COUNT"
-    if [[ "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
+    fi
+    if [[ "$FIXED_MODE" -ne 1 && "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
       BUILD_NUM="$((PLAN_FLOOR + 1))"
       log "build: floor ${PLAN_FLOOR} is at or above the commit count ${PLAN_COMMIT_COUNT}; using ${BUILD_NUM} instead"
     fi

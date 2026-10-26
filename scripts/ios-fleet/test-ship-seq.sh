@@ -42,7 +42,21 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SHIP="${SCRIPT_DIR}/ship-testflight.sh"
+# Sections 1-11 test the unchanged next-patch behaviour, so they run a copy of
+# the fleet dir whose apps.json carries no fixed-version keys.  Section 12 tests
+# the keys on their own copy.
+LEGACY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-legacy.XXXXXX")"
+cp -R "$SCRIPT_DIR/." "$LEGACY_DIR/"
+python3 - "$LEGACY_DIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for a in d["apps"].values():
+    a.pop("fixedMarketingVersion", None)
+    a.pop("buildCountSeed", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+SHIP="${LEGACY_DIR}/ship-testflight.sh"
 [[ -f "$SHIP" ]] || { echo "missing $SHIP"; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-seq-test.XXXXXX")"
@@ -78,7 +92,7 @@ cmd=""
 for a in "$@"; do
   case "$a" in
     */asc-api.mjs) cmd="asc-api" ;;
-    latest-marketing-patch|build-floor)
+    latest-marketing-patch|build-floor|released-store-version)
       if [[ "$cmd" == "asc-api" ]]; then cmd="${cmd}:${a}"; fi
       ;;
   esac
@@ -90,6 +104,10 @@ case "$cmd" in
     [[ "${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
     [[ -n "${FAKE_ASC_PATCH:-}" ]] || exit 2
     printf '%s\n' "$FAKE_ASC_PATCH"
+    exit 0
+    ;;
+  asc-api:released-store-version)
+    printf '%s\n' "${FAKE_RELEASED:-}"
     exit 0
     ;;
   asc-api:build-floor)
@@ -156,6 +174,7 @@ run_ship() {
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
+    FAKE_RELEASED="${FAKE_RELEASED:-}" \
     bash "$SHIP" "$@" 2>&1)"
   RC=$?
   return 0
@@ -483,6 +502,46 @@ check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || 
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
 FAKE_ASC_PATCH=236
+echo
+
+echo "12. fixed marketing version + short build count (apps.json fixedMarketingVersion / buildCountSeed)"
+FIXDIR="${WORK}/fleet-fixed"
+rm -rf "$FIXDIR"; cp -R "$SCRIPT_DIR" "$FIXDIR"
+python3 - "$FIXDIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+a = d["apps"]
+for k in list(a)[:1]:
+    a[k]["fixedMarketingVersion"] = "0.1.0"
+    a[k]["buildCountSeed"] = "239"
+json.dump(d, open(p, "w"), indent=2)
+PY
+FIXAPP="$(python3 -c 'import json,sys; print(list(json.load(open(sys.argv[1]))["apps"])[0])' "$FIXDIR/apps.json")"
+SHIP_REAL="$SHIP"; SHIP="${FIXDIR}/ship-testflight.sh"
+rm -f "${STATE}/build-seq-${FIXAPP}.txt" "${STATE}/last-ship-${FIXAPP}.txt"
+write_record "$FIXAPP" 5
+FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "fixed: marketing stays 0.1.0 even though ASC holds patch 239 (got '${PLANNED_MARKETING}')" \
+  "$([[ "$PLANNED_MARKETING" == "0.1.0" ]] && echo 0 || echo 1)"
+check "fixed: an empty train starts at the seed (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "239" ]] && echo 0 || echo 1)"
+FAKE_ASC_FLOOR=239
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "fixed: a train holding 239 goes to 240, not a commit count (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "240" ]] && echo 0 || echo 1)"
+FAKE_ASC_FLOOR=999
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: past 999 stops, nothing reset or truncated" \
+  "$(contains 'not a three-digit count' && echo 0 || echo 1)"
+FAKE_ASC_FLOOR=0; FAKE_RELEASED="1.0.235"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a version below the released App Store version is refused, not bumped" \
+  "$(contains 'at or below the released App Store version 1.0.235' && echo 0 || echo 1)"
+SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_ASC_PATCH=236
 echo
 
 echo "----------------------------------------"
