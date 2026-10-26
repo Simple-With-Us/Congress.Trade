@@ -20,7 +20,7 @@
       "projectRel": "clients/ios/CongressTrade.xcodeproj",
       "xcodegenDir": null,
       "worktreeHint": "~/apps/congress-grok-ios-tf",
-      "marketingVersionDefault": "1.1.0",
+      "marketingVersionDefault": "1.0.0",
       "projectRelAlt": "clients/ios/Congress.Trade.xcodeproj"
     },
     "usage": {
