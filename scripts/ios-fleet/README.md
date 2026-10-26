@@ -116,6 +116,10 @@ limit / same-HEAD) is evaluated **before** any App Store Connect query, and
 
 `IOS_FLEET_STATE_DIR` relocates the ship-gate state, for testing against a scratch directory.
 
+### Changing the train needs a dispatch
+
+`ios-ship.yml` runs on a push only when `clients/ios/**` or the workflow file changes.  A change that touches only release config (for example `marketingVersionDefault` in `apps.json`, which every app shares, or the ship scripts) does not start a ship, and the cron backstop only ships when `clients/ios/**` changed since the last recorded ship.  This is deliberate: a path trigger on shared config or tooling would ship a TestFlight build on unrelated edits.  After a train change merges, ship it on purpose with **Run workflow** (`workflow_dispatch`) on `main`, then confirm `marketing=<train>.N build=<n>` in the "version plan" log line.  A train move ships only when someone dispatches the workflow; do not rely on the merge.
+
 ## Rate limit — what holds back automatic shipping
 
 Uploads are throttled to **one successful ship per app per `DEFAULT_MIN_INTERVAL_SEC` = 3600 seconds (1 hour)**.  The constant lives near the top of `ship-testflight.sh`.  This is the main reason a merge to `main` does not become a TestFlight build: `.github/workflows/ios-ship.yml` fires on every push touching `clients/ios/**`, and most of those runs land inside the window, print `ship-gate: skip`, and exit 0.  A run whose git HEAD already shipped skips for the same reason.  Cron ticks twice an hour, so an unbuilt merge is picked up on the next eligible hour.
