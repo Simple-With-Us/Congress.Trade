@@ -74,6 +74,19 @@ export async function applyGuardedSecuritiesRefColumnMigrations(db: D1Database):
   return 'applied';
 }
 
+/**
+ * Guarded apply for migration 0107 (`filings.filing_status`).  SQLite has no
+ * `ADD COLUMN IF NOT EXISTS`, so the column is added only when
+ * `PRAGMA table_info("filings")` shows it missing; the replay's plain ALTER
+ * then lands on the "duplicate column name" skip instead of being the only
+ * guard.
+ */
+export async function applyGuardedFilingsColumnMigrations(db: D1Database): Promise<'applied' | 'skipped'> {
+  if (!(await sqliteTableExists(db, 'filings'))) return 'skipped';
+  await ensureSqliteColumn(db, 'filings', 'filing_status', 'TEXT');
+  return 'applied';
+}
+
 /** Label for the guarded 0091 rebuild in `failed[]` and the logs. */
 export const APPLE_SUBSCRIPTIONS_GUARD_LABEL = '(guarded 0091 apple_subscriptions rebuild)';
 
@@ -260,6 +273,7 @@ export async function executeAdminSchemaMigrations(
   // Pre-loop: heal prod drift when the table already exists (deploy-before-migrate).
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
+    await applyGuardedFilingsColumnMigrations(db);
   }
   // Pre-loop so a legacy table is rebuilt before the replay indexes it.  A
   // failure here is retried post-loop, which decides what failed[] reports,
@@ -301,6 +315,7 @@ export async function executeAdminSchemaMigrations(
   // Post-loop: after CREATE TABLE runs on a clean DB, add any columns the replay missed.
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
+    await applyGuardedFilingsColumnMigrations(db);
   }
   // Post-loop: a clean DB gets apple_subscriptions from the 0081 CREATE in the loop.
   const appleFailure = preLoopAppleFailure?.final

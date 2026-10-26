@@ -12,7 +12,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import { buildAdminRouter } from '../routes.ts';
-import { latestLiveSet, planCorrection, type CorrectionEdit, type PriorTxRow } from '../reviewCorrection.ts';
+import {
+  latestLiveSet,
+  planCorrection,
+  REVIVE_COMPARED_COLUMNS,
+  reviveChangedIds,
+  type CorrectionEdit,
+  type PriorTxRow,
+} from '../reviewCorrection.ts';
 import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
 
 const app = buildAdminRouter();
@@ -209,7 +216,7 @@ async function post(d1: unknown, body: Record<string, unknown>) {
 }
 
 function undeliveredCount(db: SqliteDatabase): number {
-  return (db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed'").get() as { n: number }).n;
+  return z.object({ n: z.number() }).parse(db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed'").get()).n;
 }
 
 const EDITS = [
@@ -218,18 +225,65 @@ const EDITS = [
   { assetName: 'AT&T INC', ticker: null, txType: 'B', txDate: '2026-07-17', owner: null, amountMin: 1001, amountMax: 15000, rawText: '#77 AT&T INC purchase 7/17/2026 No $1,001 - $15,000' },
 ];
 
+const TxRow = z.object({
+  id: z.string(),
+  tx_date: z.string().nullable(),
+  asset_name: z.string().nullable(),
+  cursor_seq: z.number().nullable(),
+  created_at: z.string().nullable(),
+  deprecated_at: z.string().nullable(),
+});
+const TxRows = z.array(TxRow);
+const OutboxRows = z.array(z.object({ tx_id: z.string(), status: z.string() }));
+
 function live(db: SqliteDatabase) {
-  return db.prepare(
+  return TxRows.parse(db.prepare(
     `SELECT id, tx_date, asset_name, cursor_seq, created_at, deprecated_at FROM transactions
       WHERE doc_id = ? AND deprecated_at IS NULL ORDER BY id`,
-  ).all(DOC) as Array<Record<string, unknown>>;
+  ).all(DOC));
 }
+
+/** The one live row with this asset name (throws a zod error if absent). */
+function liveIdByName(db: SqliteDatabase, assetName: string): string {
+  return z.array(TxRow).length(1).parse(live(db).filter((r) => r.asset_name === assetName))[0].id;
+}
+
+describe('reviveChangedIds', () => {
+  const stored = (over: Record<string, string | number | null> = {}) => ({
+    filer_id: 'F', tx_date: '2026-07-29', owner: null, asset_name: 'X', ticker: null, asset_type: null,
+    tx_type: 'S', amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0, raw_text: '',
+    asset_type_name: null, filing_status: null, subholding: null, location: null, description: null,
+    supplemental_text: null, row_key: 'v1:manual:0:h', confidence: 1, source: 'manual', filed_date: null,
+    est_value: 8000, cleaning_note: null, ...over,
+  });
+  const next = (over: Record<string, string | number | null> = {}) => {
+    const base: Record<string, string | number | null> = { id: 'a' };
+    for (const [column, key] of REVIVE_COMPARED_COLUMNS) base[key] = stored()[column];
+    return { ...base, ...over };
+  };
+
+  it('treats null and undefined as equal and keeps byte-identical revives', () => {
+    expect(reviveChangedIds(new Map([['a', stored()]]), [{ ...next(), ticker: undefined }])).toEqual([]);
+  });
+
+  it('flags every compared column, including source, row_key, confidence and cleaning note', () => {
+    for (const [column, key] of REVIVE_COMPARED_COLUMNS) {
+      const value = typeof stored()[column] === 'number' ? 7 : 'changed';
+      expect(reviveChangedIds(new Map([['a', stored()]]), [next({ [key]: value })]), column).toEqual(['a']);
+    }
+  });
+
+  it('counts a revive with no stored row as changed', () => {
+    expect(reviveChangedIds(new Map(), [next()])).toEqual(['a']);
+  });
+});
 
 describe('POST /review/:docId — republish never re-sends', () => {
   it('by default revives matching rows in place and only enqueues delivery for added rows', async () => {
     const { db, d1 } = await seededDb();
     const before = new Map(
-      (db.prepare('SELECT id, cursor_seq, created_at FROM transactions WHERE doc_id = ?').all(DOC) as Array<Record<string, unknown>>)
+      z.array(TxRow.pick({ id: true, cursor_seq: true, created_at: true }))
+        .parse(db.prepare('SELECT id, cursor_seq, created_at FROM transactions WHERE doc_id = ?').all(DOC))
         .map((r) => [r.id, r]),
     );
     // No flag of any kind: correction semantics are the default.
@@ -256,12 +310,13 @@ describe('POST /review/:docId — republish never re-sends', () => {
 
     // Delivery: the revived rows keep their completed outbox rows; only the
     // added row gets a new one.
-    const outbox = db.prepare('SELECT tx_id, status FROM delivery_outbox ORDER BY tx_id').all() as Array<{ tx_id: string; status: string }>;
-    const added = rows.find((r) => !['tx-plexus', 'tx-badger'].includes(String(r.id)))!;
+    const outbox = OutboxRows.parse(db.prepare('SELECT tx_id, status FROM delivery_outbox ORDER BY tx_id').all());
+    const added = z.array(TxRow).length(1).parse(rows.filter((r) => !['tx-plexus', 'tx-badger'].includes(r.id)))[0];
     expect(outbox.filter((o) => o.status === 'completed').map((o) => o.tx_id).sort()).toEqual(['tx-badger', 'tx-oracle', 'tx-plexus']);
     expect(outbox.filter((o) => o.status !== 'completed').map((o) => o.tx_id)).toEqual([added.id]);
 
-    const review = db.prepare('SELECT resolved, resolution_reason FROM review_queue WHERE doc_id = ?').get(DOC) as Record<string, unknown>;
+    const review = z.object({ resolved: z.number(), resolution_reason: z.string().nullable() })
+      .parse(db.prepare('SELECT resolved, resolution_reason FROM review_queue WHERE doc_id = ?').get(DOC));
     expect(review).toMatchObject({ resolved: 1, resolution_reason: 'admin_manual' });
   });
 
@@ -269,8 +324,8 @@ describe('POST /review/:docId — republish never re-sends', () => {
     const { db, d1 } = await seededDb();
     db.prepare('DELETE FROM delivery_outbox').run();
     db.prepare('DELETE FROM transactions WHERE doc_id = ?').run(DOC);
-    const revision = () => (db.prepare('SELECT review_revision AS r FROM review_queue WHERE doc_id = ?').get(DOC) as { r: number }).r;
-    const cursors = () => new Map(live(db).map((r) => [String(r.id), Number(r.cursor_seq)]));
+    const revision = () => z.object({ r: z.number() }).parse(db.prepare('SELECT review_revision AS r FROM review_queue WHERE doc_id = ?').get(DOC)).r;
+    const cursors = () => new Map(live(db).map((r) => [r.id, Number(r.cursor_seq)]));
     const unpublish = async () => {
       const res = await app.request(`/review/${DOC}/unpublish`, {
         method: 'POST', headers: AUTH, body: JSON.stringify({ reviewRevision: revision(), reason: 'correction' }),
@@ -297,12 +352,38 @@ describe('POST /review/:docId — republish never re-sends', () => {
     expect(corrected.body.republish).toMatchObject({ revived: 3, unchanged: 2, corrected: 1, added: 0 });
     const after = cursors();
     expect([...after.keys()].sort()).toEqual([...first.keys()].sort());
-    const badgerId = live(db).find((r) => r.asset_name === 'BADGER METER INC')!.id as string;
+    const badgerId = liveIdByName(db, 'BADGER METER INC');
     for (const [id, seq] of after) {
       if (id === badgerId) expect(seq).toBeGreaterThan(Math.max(...first.values()));
       else expect(seq).toBe(first.get(id));
     }
     // Still no alert: nothing re-entered the outbox.
+    expect(undeliveredCount(db)).toBe(0);
+  });
+
+  it('a provenance-only change (source, row_key, confidence, cleaning note) still takes a new cursor', async () => {
+    const { db, d1 } = await seededDb();
+    db.prepare('DELETE FROM delivery_outbox').run();
+    db.prepare('DELETE FROM transactions WHERE doc_id = ?').run(DOC);
+    const revision = () => z.object({ r: z.number() }).parse(db.prepare('SELECT review_revision AS r FROM review_queue WHERE doc_id = ?').get(DOC)).r;
+    expect((await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS })).status).toBe(200);
+    db.prepare("UPDATE delivery_outbox SET status = 'completed'").run();
+    const first = new Map(live(db).map((r) => [r.id, Number(r.cursor_seq)]));
+    // Simulate a pipeline-published Plexus row: only its provenance differs
+    // from what the manual republish writes.
+    const plexusId = liveIdByName(db, 'PLEXUS CORP');
+    db.prepare("UPDATE transactions SET confidence = 0.5, cleaning_note = 'ocr' WHERE id = ?").run(plexusId);
+    const res = await app.request(`/review/${DOC}/unpublish`, {
+      method: 'POST', headers: AUTH, body: JSON.stringify({ reviewRevision: revision(), reason: 'correction' }),
+    }, env(d1));
+    expect(res.status).toBe(200);
+    const again = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
+    expect(again.body.republish).toMatchObject({ revived: 3, unchanged: 3, added: 0 });
+    const after = new Map(live(db).map((r) => [r.id, Number(r.cursor_seq)]));
+    for (const [id, seq] of after) {
+      if (id === plexusId) expect(seq).toBeGreaterThan(Math.max(...first.values()));
+      else expect(seq).toBe(first.get(id));
+    }
     expect(undeliveredCount(db)).toBe(0);
   });
 

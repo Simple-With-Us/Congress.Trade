@@ -3,6 +3,7 @@ import { createClient, type Client, type InStatement, type TransactionMode } fro
 import {
   APPLE_SUBSCRIPTIONS_GUARD_LABEL,
   applyGuardedAppleSubscriptionsNullableUserMigration,
+  applyGuardedFilingsColumnMigrations,
   applyGuardedSecuritiesRefColumnMigrations,
   ensureSqliteColumn,
   executeAdminSchemaMigrations,
@@ -12,6 +13,7 @@ import {
   APPLE_IAP_SCHEMA_STATEMENTS,
   APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
   BASE_SCHEMA_STATEMENTS,
+  FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
   PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS,
   PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
@@ -124,6 +126,23 @@ describe('schemaMigrationRunner', () => {
       const cols = db.prepare('PRAGMA table_info(securities_ref)').all() as Array<{ name: string }>;
       expect(cols.some((c) => c.name === 'price_unavailable_reason')).toBe(true);
       expect(result.skipped.length + result.applied.length).toBeGreaterThan(0);
+    });
+
+    it('guards 0107 filings.filing_status with PRAGMA table_info so repeated runs never fail', async () => {
+      db.exec('CREATE TABLE filings (doc_id TEXT PRIMARY KEY)');
+      const statusCol = () =>
+        (db.prepare('PRAGMA table_info(filings)').all() as Array<{ name: string }>)
+          .filter((c) => c.name === 'filing_status').length;
+      // Pre-loop guard adds the column; the replay's plain ALTER then skips.
+      const first = await executeAdminSchemaMigrations(d1, [...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS]);
+      expect(first.failed).toHaveLength(0);
+      expect(first.skipped).toEqual([...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS]);
+      expect(statusCol()).toBe(1);
+      const second = await executeAdminSchemaMigrations(d1, [...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS]);
+      expect(second.failed).toHaveLength(0);
+      expect(statusCol()).toBe(1);
+      expect(await applyGuardedFilingsColumnMigrations(d1)).toBe('applied');
+      expect(statusCol()).toBe(1);
     });
 
     it('skips guarded securities_ref preflight on an empty database then applies CREATE/ALTER', async () => {
