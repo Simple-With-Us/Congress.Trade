@@ -63,6 +63,12 @@ import { createCongressEvent } from '@jaywedgeworth22/congress-trading-shared';
 import { prefixedId } from '../shared/ids.ts';
 import { rateLimit } from '../shared/rateLimit.ts';
 import { flushD1Budget } from '../shared/d1Budget.ts';
+import {
+  formatRetractFrame,
+  listRetractions,
+  readRetractionHighWater,
+  readRetractionResumeFloor,
+} from './retractions.ts';
 
 /** How often to poll D1 for new rows. */
 const POLL_INTERVAL_MS = 5_000;
@@ -221,6 +227,9 @@ export async function openSseStream(
   streamToken?: string,
   requestIp = 'unknown',
   timingOptions: SseStreamTimingOptions = {},
+  /** Resume point for trade.retract frames (?retractSince=). Fresh opens default
+      to the live tail; a resume without one replays from 0. */
+  retractSince?: number,
 ): Promise<Response> {
   const subRow = await get<SubscriptionRow>(
     env.DB,
@@ -329,15 +338,49 @@ export async function openSseStream(
       }
     }
 
+    // trade.retract frames (retractions.ts) resume from their own cursor; a
+    // missing table (migration 0108 not applied yet) just disables them.
+    // A native EventSource auto-reconnect replays the original URL, so it
+    // carries Last-Event-ID (the trade cursor) but no ?retractSince=.
+    // Falling back to the high-water mark there would skip every retraction
+    // that landed mid-disconnect, so a resume without a retract cursor
+    // replays the last SSE_RETRACT_RESUME_LOOKBACK_MS of retractions
+    // (at-least-once; receivers dedupe by retractSeq).  Replaying from 0
+    // would re-send the whole history on every 25-minute reconnect.  Fresh
+    // opens with no resume point stay live-tail.
+    let retractCursor: number | null = null;
+    try {
+      retractCursor = retractSince !== undefined && Number.isFinite(retractSince) && retractSince >= 0
+        ? Math.floor(retractSince)
+        : liveTailDefault
+          ? await readRetractionHighWater(env)
+          : await readRetractionResumeFloor(env);
+    } catch {
+      retractCursor = null;
+    }
+    const emitRetractions = async (): Promise<void> => {
+      if (retractCursor === null) return;
+      for (let page = 0; page < MAX_DRAIN_PAGES_PER_TICK; page += 1) {
+        const batch = await listRetractions(env, retractCursor, PAGE_SIZE);
+        // Unfiltered on purpose, like the webhook: a retract for a trade this
+        // subscriber never saw is a no-op for it.
+        for (const r of batch.retractions) await send(formatRetractFrame(r));
+        retractCursor = batch.cursor;
+        if (!batch.hasMore) break;
+      }
+    };
+
     // Opening comment + initial cursor so clients know the resume point.
     await send(`: connected\n`);
     await send(`event: cursor\ndata: ${cursor}\n\n`);
+    if (retractCursor !== null) await send(`event: retract-cursor\ndata: ${retractCursor}\n\n`);
 
     // 1) Catch-up replay when the client asked for history (?since= / header).
     // Fresh opens at the HWM skip this — they are already on the live tail.
     if (!liveTailDefault) {
       cursor = await drainSseBacklog(env, sub, cursor, send);
     }
+    await emitRetractions();
     // The HTTP handler's waitUntil settles when this Response is created, but
     // the producer continues querying D1 in the background. Flush those rows
     // while the stream is alive instead of leaving them in the isolate until
@@ -419,6 +462,8 @@ export async function openSseStream(
       // push path is healthy (drainSseBacklog never re-emits below the HWM).
       if (Date.now() - lastBacklogDrain >= backlogDrainIntervalMs) {
         cursor = await drainSseBacklog(env, sub, cursor, send);
+        // Retractions are not alerts, so the slow durable cadence is enough.
+        await emitRetractions();
         await flushD1Budget(env);
         lastBacklogDrain = Date.now();
       }
@@ -430,7 +475,9 @@ export async function openSseStream(
     channel?.close();
 
     if (!closed && Date.now() < deadlineAt) {
-      await send(`event: reconnect\ndata: ${JSON.stringify({ since: cursor })}\n\n`);
+      await send(`event: reconnect\ndata: ${JSON.stringify(
+        retractCursor === null ? { since: cursor } : { since: cursor, retractSince: retractCursor },
+      )}\n\n`);
     }
   };
 

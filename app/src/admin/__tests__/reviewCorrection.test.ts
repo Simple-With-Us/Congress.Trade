@@ -215,8 +215,11 @@ async function post(d1: unknown, body: Record<string, unknown>) {
   return { status: res.status, body: ReviewResponse.parse(await res.json()) };
 }
 
+/** Undelivered trade.new outbox rows (an Unpublish also enqueues trade.retract events). */
 function undeliveredCount(db: SqliteDatabase): number {
-  return z.object({ n: z.number() }).parse(db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed'").get()).n;
+  return z.object({ n: z.number() }).parse(db.prepare(
+    "SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed' AND event_kind = 'trade.new'",
+  ).get()).n;
 }
 
 const EDITS = [
@@ -254,7 +257,7 @@ describe('reviveChangedIds', () => {
     tx_type: 'S', amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0, raw_text: '',
     asset_type_name: null, filing_status: null, subholding: null, location: null, description: null,
     supplemental_text: null, row_key: 'v1:manual:0:h', confidence: 1, source: 'manual', filed_date: null,
-    est_value: 8000, cleaning_note: null, ...over,
+    est_value: 8000, disclosure_lag_days: null, stock_act_status: null, cleaning_note: null, ...over,
   });
   const next = (over: Record<string, string | number | null> = {}) => {
     const base: Record<string, string | number | null> = { id: 'a' };
@@ -271,6 +274,13 @@ describe('reviveChangedIds', () => {
       const value = typeof stored()[column] === 'number' ? 7 : 'changed';
       expect(reviveChangedIds(new Map([['a', stored()]]), [next({ [key]: value })]), column).toEqual(['a']);
     }
+  });
+
+  it('flags a revive that only changes the stored STOCK Act lag fields', () => {
+    const lagged = stored({ filed_date: '2026-09-30', disclosure_lag_days: 63, stock_act_status: 'late' });
+    const same = next({ filedDate: '2026-09-30', disclosureLagDays: 63, stockActStatus: 'late' });
+    expect(reviveChangedIds(new Map([['a', lagged]]), [same])).toEqual([]);
+    expect(reviveChangedIds(new Map([['a', lagged]]), [{ ...same, disclosureLagDays: null, stockActStatus: null }])).toEqual(['a']);
   });
 
   it('counts a revive with no stored row as changed', () => {
@@ -320,7 +330,7 @@ describe('POST /review/:docId — republish never re-sends', () => {
     expect(review).toMatchObject({ resolved: 1, resolution_reason: 'admin_manual' });
   });
 
-  it('Unpublish then an identical republish keeps every cursor; a date fix bumps only that row', async () => {
+  it('Unpublish then republish: retracted rows take new cursors, never-retracted identical rows keep theirs', async () => {
     const { db, d1 } = await seededDb();
     db.prepare('DELETE FROM delivery_outbox').run();
     db.prepare('DELETE FROM transactions WHERE doc_id = ?').run(DOC);
@@ -338,14 +348,31 @@ describe('POST /review/:docId — republish never re-sends', () => {
     const first = cursors();
     expect(first.size).toBe(3);
 
+    // The Unpublish emitted a trade.retract for every row, so pollers may have
+    // dropped them: each identical revive takes a new cursor so they re-add it.
     await unpublish();
+    expect((db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE event_kind = 'trade.retract'").get() as { n: number }).n).toBe(3);
     const same = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
     expect(same.status).toBe(200);
     expect(same.body.republish).toMatchObject({ revived: 3, unchanged: 3, added: 0 });
-    expect(cursors()).toEqual(first);
+    const second = cursors();
+    expect([...second.keys()].sort()).toEqual([...first.keys()].sort());
+    expect(Math.min(...second.values())).toBeGreaterThan(Math.max(...first.values()));
+    expect(db.prepare('SELECT COUNT(*) AS n FROM tx_retractions WHERE revived_at IS NULL').get()).toEqual({ n: 0 });
+    // Still no alert: no trade.new outbox row for any revived row.
     expect(undeliveredCount(db)).toBe(0);
 
+    // Rows deprecated before retractions existed were never exposed as
+    // retracted: an identical revive keeps the cursor, a date fix bumps only
+    // the corrected row.
     await unpublish();
+    db.prepare('DELETE FROM tx_retractions').run();
+    const keep = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
+    expect(keep.status).toBe(200);
+    expect(cursors()).toEqual(second);
+
+    await unpublish();
+    db.prepare('DELETE FROM tx_retractions').run();
     const fixed = EDITS.map((e, i) => (i === 1 ? { ...e, txDate: '2026-07-30' } : e));
     const corrected = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: fixed });
     expect(corrected.status).toBe(200);
@@ -354,10 +381,9 @@ describe('POST /review/:docId — republish never re-sends', () => {
     expect([...after.keys()].sort()).toEqual([...first.keys()].sort());
     const badgerId = liveIdByName(db, 'BADGER METER INC');
     for (const [id, seq] of after) {
-      if (id === badgerId) expect(seq).toBeGreaterThan(Math.max(...first.values()));
-      else expect(seq).toBe(first.get(id));
+      if (id === badgerId) expect(seq).toBeGreaterThan(Math.max(...second.values()));
+      else expect(seq).toBe(second.get(id));
     }
-    // Still no alert: nothing re-entered the outbox.
     expect(undeliveredCount(db)).toBe(0);
   });
 
@@ -377,6 +403,9 @@ describe('POST /review/:docId — republish never re-sends', () => {
       method: 'POST', headers: AUTH, body: JSON.stringify({ reviewRevision: revision(), reason: 'correction' }),
     }, env(d1));
     expect(res.status).toBe(200);
+    // Isolate the provenance diff from the retraction re-add bump
+    // (trg_transactions_unretract), as in the cursor test above.
+    db.prepare('DELETE FROM tx_retractions').run();
     const again = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
     expect(again.body.republish).toMatchObject({ revived: 3, unchanged: 3, added: 0 });
     const after = new Map(live(db).map((r) => [r.id, Number(r.cursor_seq)]));

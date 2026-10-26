@@ -120,6 +120,7 @@ import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { junkAssetNameReason, normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
 import { canonicalizeAmountBounds } from '../extraction/amounts.ts';
+import { computeDisclosureLagDays, computeStockActStatus } from '../shared/stockAct.ts';
 import {
   planCorrection,
   REVIVE_COMPARED_COLUMNS_SQL,
@@ -3150,6 +3151,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         firstSeenAt: filing.first_seen_at ?? null,
         filedDate: filing.filed_date ?? null,
         estValue: estimateTransactionValue(e.amountMin, e.amountMax),
+        // Recomputed from the corrected dates (same rule as the normalizer
+        // insert path) so a revive never leaves these NULL or stale.
+        disclosureLagDays: computeDisclosureLagDays(e.txDate, filing.filed_date ?? null),
+        stockActStatus: computeStockActStatus(e.txDate, filing.filed_date ?? null),
         cleaningNote: e.cleaningNote ?? null,
       });
     }
@@ -3176,6 +3181,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // delivery_outbox row, and created_at is untouched, so no webhook or APNs
     // alert fires.  Step 1 allocates the new sequence values (the same
     // tx_cursor_seq table the insert trigger uses); step 2 adopts them.
+    // A row that was exposed as retracted (an open tx_retractions row, i.e.
+    // a trade.retract went out at Unpublish) also takes a new cursor even
+    // when byte-identical: trg_transactions_unretract (migration 0108) does
+    // that on the same UPDATE and closes the retraction.
     const reviveRowsSql = `(SELECT json_extract(value, '$.id') AS id,
                       json_extract(value, '$.filerId') AS filer_id,
                       json_extract(value, '$.txDate') AS tx_date,
@@ -3200,6 +3209,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                       json_extract(value, '$.source') AS source,
                       json_extract(value, '$.filedDate') AS filed_date,
                       json_extract(value, '$.estValue') AS est_value,
+                      json_extract(value, '$.disclosureLagDays') AS disclosure_lag_days,
+                      json_extract(value, '$.stockActStatus') AS stock_act_status,
                       json_extract(value, '$.cleaningNote') AS cleaning_note
                  FROM json_each(?))`;
     const reviveGate = `transactions.doc_id = ?
@@ -3235,7 +3246,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                 supplemental_text = j.supplemental_text, row_key = j.row_key,
                 confidence = j.confidence, source = j.source, filed_date = j.filed_date,
                 est_value = j.est_value, cleaning_note = j.cleaning_note,
-                disclosure_lag_days = NULL, stock_act_status = NULL,
+                disclosure_lag_days = j.disclosure_lag_days, stock_act_status = j.stock_act_status,
                 deprecated_at = NULL, deprecated_reason = NULL,
                 cursor_seq = MAX(COALESCE(transactions.cursor_seq, 0), COALESCE(
                   (SELECT MAX(s.seq) FROM tx_cursor_seq s WHERE s.tx_id = transactions.id), 0))
@@ -3257,7 +3268,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              raw_text, asset_type_name, filing_status, subholding, location,
              description, supplemental_text, row_key, confidence, source,
              created_at, cursor_seq, first_seen_at, filed_date, est_value,
-             cleaning_note
+             disclosure_lag_days, stock_act_status, cleaning_note
            ) SELECT
              json_extract(value, '$.id'), json_extract(value, '$.docId'),
              json_extract(value, '$.filerId'), json_extract(value, '$.txDate'),
@@ -3272,7 +3283,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              json_extract(value, '$.rowKey'), json_extract(value, '$.confidence'),
              json_extract(value, '$.source'), json_extract(value, '$.createdAt'), NULL,
              json_extract(value, '$.firstSeenAt'), json_extract(value, '$.filedDate'),
-             json_extract(value, '$.estValue'), json_extract(value, '$.cleaningNote')
+             json_extract(value, '$.estValue'), json_extract(value, '$.disclosureLagDays'),
+             json_extract(value, '$.stockActStatus'), json_extract(value, '$.cleaningNote')
            FROM json_each(?)
            WHERE EXISTS (
              SELECT 1 FROM review_queue
