@@ -241,10 +241,14 @@ describe('POST /review/:docId — republish never re-sends', () => {
     const rows = live(db);
     expect(rows).toHaveLength(3);
     const byId = new Map(rows.map((r) => [r.id, r]));
-    // Stable identity: same id, cursor_seq and created_at; corrected fields.
+    // Stable identity: same id and created_at, corrected fields.  Both rows
+    // changed stored fields (Badger's date; Plexus's name and raw text), so
+    // both take a fresh cursor_seq above everything seeded: cursor pollers
+    // re-read the fix under the same id.
+    const seededMax = Math.max(...[...before.values()].map((r) => Number(r.cursor_seq)));
     for (const id of ['tx-plexus', 'tx-badger']) {
-      expect(byId.get(id)?.cursor_seq).toBe(before.get(id)?.cursor_seq);
       expect(byId.get(id)?.created_at).toBe(before.get(id)?.created_at);
+      expect(Number(byId.get(id)?.cursor_seq)).toBeGreaterThan(seededMax);
     }
     expect(byId.get('tx-badger')?.tx_date).toBe('2026-07-29');
     expect(byId.get('tx-plexus')?.asset_name).toBe('PLEXUS CORP');
@@ -259,6 +263,47 @@ describe('POST /review/:docId — republish never re-sends', () => {
 
     const review = db.prepare('SELECT resolved, resolution_reason FROM review_queue WHERE doc_id = ?').get(DOC) as Record<string, unknown>;
     expect(review).toMatchObject({ resolved: 1, resolution_reason: 'admin_manual' });
+  });
+
+  it('Unpublish then an identical republish keeps every cursor; a date fix bumps only that row', async () => {
+    const { db, d1 } = await seededDb();
+    db.prepare('DELETE FROM delivery_outbox').run();
+    db.prepare('DELETE FROM transactions WHERE doc_id = ?').run(DOC);
+    const revision = () => (db.prepare('SELECT review_revision AS r FROM review_queue WHERE doc_id = ?').get(DOC) as { r: number }).r;
+    const cursors = () => new Map(live(db).map((r) => [String(r.id), Number(r.cursor_seq)]));
+    const unpublish = async () => {
+      const res = await app.request(`/review/${DOC}/unpublish`, {
+        method: 'POST', headers: AUTH, body: JSON.stringify({ reviewRevision: revision(), reason: 'correction' }),
+      }, env(d1));
+      expect(res.status).toBe(200);
+    };
+
+    expect((await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS })).status).toBe(200);
+    db.prepare("UPDATE delivery_outbox SET status = 'completed'").run();
+    const first = cursors();
+    expect(first.size).toBe(3);
+
+    await unpublish();
+    const same = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
+    expect(same.status).toBe(200);
+    expect(same.body.republish).toMatchObject({ revived: 3, unchanged: 3, added: 0 });
+    expect(cursors()).toEqual(first);
+    expect(undeliveredCount(db)).toBe(0);
+
+    await unpublish();
+    const fixed = EDITS.map((e, i) => (i === 1 ? { ...e, txDate: '2026-07-30' } : e));
+    const corrected = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: fixed });
+    expect(corrected.status).toBe(200);
+    expect(corrected.body.republish).toMatchObject({ revived: 3, unchanged: 2, corrected: 1, added: 0 });
+    const after = cursors();
+    expect([...after.keys()].sort()).toEqual([...first.keys()].sort());
+    const badgerId = live(db).find((r) => r.asset_name === 'BADGER METER INC')!.id as string;
+    for (const [id, seq] of after) {
+      if (id === badgerId) expect(seq).toBeGreaterThan(Math.max(...first.values()));
+      else expect(seq).toBe(first.get(id));
+    }
+    // Still no alert: nothing re-entered the outbox.
+    expect(undeliveredCount(db)).toBe(0);
   });
 
   it('ignores a legacy correction: false field; matched rows still never re-enqueue', async () => {

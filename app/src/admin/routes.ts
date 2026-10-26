@@ -3158,24 +3158,19 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       AND (SELECT COUNT(*) FROM transactions
         WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
           AND deprecated_at IS NULL) = ?`;
-    // Revive statement (republish of previously published rows).  Placed after the INSERT so
-    // persistResults[0] stays the insert count; the integrity check below
-    // runs after both and rolls the whole batch back if either fell short.
-    const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [[
-      `UPDATE transactions
-          SET filer_id = j.filer_id, tx_date = j.tx_date, owner = j.owner,
-              asset_name = j.asset_name, ticker = j.ticker, asset_type = j.asset_type,
-              tx_type = j.tx_type, amount_min = j.amount_min, amount_max = j.amount_max,
-              is_option = j.is_option, cap_gains_over_200 = j.cap_gains_over_200,
-              raw_text = j.raw_text, asset_type_name = j.asset_type_name,
-              filing_status = j.filing_status, subholding = j.subholding,
-              location = j.location, description = j.description,
-              supplemental_text = j.supplemental_text, row_key = j.row_key,
-              confidence = j.confidence, source = j.source, filed_date = j.filed_date,
-              est_value = j.est_value, cleaning_note = j.cleaning_note,
-              disclosure_lag_days = NULL, stock_act_status = NULL,
-              deprecated_at = NULL, deprecated_reason = NULL
-         FROM (SELECT json_extract(value, '$.id') AS id,
+    // Revive statements (republish of previously published rows).  Placed
+    // after the INSERT so persistResults[0] stays the insert count; the
+    // integrity check below runs after both and rolls the whole batch back if
+    // either fell short.
+    //
+    // Cursor: a revived row whose stored fields actually change (a corrected
+    // date or amount, a cleaned name) takes a NEW cursor_seq so cursor pollers
+    // (GET /api/transactions?since=, SSE catch-up) re-read the fix under the
+    // same id.  A byte-identical revive keeps its cursor.  Neither gets a
+    // delivery_outbox row, and created_at is untouched, so no webhook or APNs
+    // alert fires.  Step 1 allocates the new sequence values (the same
+    // tx_cursor_seq table the insert trigger uses); step 2 adopts them.
+    const reviveRowsSql = `(SELECT json_extract(value, '$.id') AS id,
                       json_extract(value, '$.filerId') AS filer_id,
                       json_extract(value, '$.txDate') AS tx_date,
                       json_extract(value, '$.owner') AS owner,
@@ -3200,16 +3195,58 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                       json_extract(value, '$.filedDate') AS filed_date,
                       json_extract(value, '$.estValue') AS est_value,
                       json_extract(value, '$.cleaningNote') AS cleaning_note
-                 FROM json_each(?)) AS j
-        WHERE transactions.id = j.id
-          AND transactions.doc_id = ?
+                 FROM json_each(?))`;
+    const reviveGate = `transactions.doc_id = ?
           AND transactions.deprecated_at IS NOT NULL
           AND EXISTS (
             SELECT 1 FROM review_queue
              WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
-          )`,
-      [JSON.stringify(reviveRows), docId, docId, reviewRevision],
-    ]];
+          )`;
+    const reviveRowsJson = JSON.stringify(reviveRows);
+    const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [
+      [
+        `INSERT INTO tx_cursor_seq (tx_id)
+           SELECT transactions.id FROM transactions
+             JOIN ${reviveRowsSql} AS j ON transactions.id = j.id
+            WHERE ${reviveGate}
+              AND (transactions.filer_id IS NOT j.filer_id OR transactions.tx_date IS NOT j.tx_date
+                OR transactions.owner IS NOT j.owner OR transactions.asset_name IS NOT j.asset_name
+                OR transactions.ticker IS NOT j.ticker OR transactions.asset_type IS NOT j.asset_type
+                OR transactions.tx_type IS NOT j.tx_type OR transactions.amount_min IS NOT j.amount_min
+                OR transactions.amount_max IS NOT j.amount_max OR transactions.is_option IS NOT j.is_option
+                OR transactions.cap_gains_over_200 IS NOT j.cap_gains_over_200
+                OR transactions.raw_text IS NOT j.raw_text
+                OR transactions.asset_type_name IS NOT j.asset_type_name
+                OR transactions.filing_status IS NOT j.filing_status
+                OR transactions.subholding IS NOT j.subholding OR transactions.location IS NOT j.location
+                OR transactions.description IS NOT j.description
+                OR transactions.supplemental_text IS NOT j.supplemental_text
+                OR transactions.filed_date IS NOT j.filed_date OR transactions.est_value IS NOT j.est_value)
+            ORDER BY transactions.cursor_seq ASC, transactions.id ASC`,
+        [reviveRowsJson, docId, docId, reviewRevision],
+      ],
+      [
+        `UPDATE transactions
+            SET filer_id = j.filer_id, tx_date = j.tx_date, owner = j.owner,
+                asset_name = j.asset_name, ticker = j.ticker, asset_type = j.asset_type,
+                tx_type = j.tx_type, amount_min = j.amount_min, amount_max = j.amount_max,
+                is_option = j.is_option, cap_gains_over_200 = j.cap_gains_over_200,
+                raw_text = j.raw_text, asset_type_name = j.asset_type_name,
+                filing_status = j.filing_status, subholding = j.subholding,
+                location = j.location, description = j.description,
+                supplemental_text = j.supplemental_text, row_key = j.row_key,
+                confidence = j.confidence, source = j.source, filed_date = j.filed_date,
+                est_value = j.est_value, cleaning_note = j.cleaning_note,
+                disclosure_lag_days = NULL, stock_act_status = NULL,
+                deprecated_at = NULL, deprecated_reason = NULL,
+                cursor_seq = MAX(COALESCE(transactions.cursor_seq, 0), COALESCE(
+                  (SELECT MAX(s.seq) FROM tx_cursor_seq s WHERE s.tx_id = transactions.id), 0))
+           FROM ${reviveRowsSql} AS j
+          WHERE transactions.id = j.id
+            AND ${reviveGate}`,
+        [reviveRowsJson, docId, docId, reviewRevision],
+      ],
+    ];
     let persistResults: D1Result[];
     try {
       persistResults = await batch(c.env.DB, [
