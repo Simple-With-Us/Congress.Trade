@@ -1498,6 +1498,15 @@ export const FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS = [
   'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
 ] as const;
 
+/**
+ * 0107_filings_filing_status.sql — filings.filing_status, read by the admin
+ * manual-review and agreement publish paths since #1098 but never declared
+ * in a numbered migration.
+ */
+export const FILINGS_FILING_STATUS_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filings ADD COLUMN filing_status TEXT',
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1669,6 +1678,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
   // 0106_filings_discovered_via.sql
   ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+  // 0107_filings_filing_status.sql
+  ...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

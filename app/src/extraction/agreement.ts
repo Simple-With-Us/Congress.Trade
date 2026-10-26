@@ -95,9 +95,10 @@ import {
   MAX_PUBLISH_TRANSACTIONS_PER_FILING,
   loadResolver,
   normalize,
+  OGE_ROWS_INCOMPLETE_REASON,
   resolveVerifiedEmpty,
 } from './normalizer.ts';
-import { classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import { assessOgeRowCompleteness, classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
 import { cleanAssetString } from './nameNormalizer.ts';
 import { prepareExtractedTx } from './prepareTx.ts';
 import { mapFiling, type FilingRow } from '../delivery/rows.ts';
@@ -1094,6 +1095,35 @@ export async function finalizePublish(
     };
   }
   parsed = withoutSamples;
+  // 278-T completeness: a filing parked because the reader dropped numbered
+  // rows is not publishable by a cascade/stored-run read, which cannot prove
+  // it recovered them; neither is a candidate set whose own row numbers skip.
+  if (filing.chamber === 'executive') {
+    const completeness = assessOgeRowCompleteness(null, parsed);
+    let parkedIncomplete = false;
+    try {
+      // Only an OPEN parking counts: a resolved row's reason is history.
+      const review = await get<{ reason: string | null }>(
+        env.DB,
+        'SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0',
+        [docId],
+      );
+      parkedIncomplete = String(review?.reason ?? '').split(',').map((t) => t.trim())
+        .includes(OGE_ROWS_INCOMPLETE_REASON);
+    } catch {
+      // Fail closed: an unreadable review row must not let a partial set publish.
+      parkedIncomplete = true;
+    }
+    if (parkedIncomplete || (completeness !== null && completeness.missingCount > 0)) {
+      return {
+        docId,
+        outcome: 'agree_but_hardfail',
+        tier: audit.tier,
+        rowCount: parsed.length,
+        flags: [OGE_ROWS_INCOMPLETE_REASON],
+      };
+    }
+  }
   const filedDate = frow.filed_date?.slice(0, 10) ?? null;
   if (parsed.some((tx) => !isValidTransactionDate(tx.txDate) || (filedDate !== null && tx.txDate! > filedDate))) {
     return {
