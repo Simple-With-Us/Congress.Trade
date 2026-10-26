@@ -60,7 +60,7 @@ SHIP="${LEGACY_DIR}/ship-testflight.sh"
 [[ -f "$SHIP" ]] || { echo "missing $SHIP"; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-seq-test.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK" "$LEGACY_DIR"' EXIT
 
 FAKE_HOME="${WORK}/home"
 FAKE_BIN="${WORK}/bin"
