@@ -99,6 +99,11 @@ export async function listRetractions(
   };
 }
 
+/** True for the D1/SQLite error a read gets before migration 0108 created tx_retractions. */
+export function isMissingRetractionsTable(err: unknown): boolean {
+  return /no such table:\s*tx_retractions/i.test((err as Error)?.message ?? String(err));
+}
+
 /** Current retraction high-water mark (0 when none). */
 export async function readRetractionHighWater(env: Env): Promise<number> {
   const row = await get<{ hwm: number | null }>(env.DB, 'SELECT MAX(seq) AS hwm FROM tx_retractions', []);
@@ -117,12 +122,14 @@ export const SSE_RETRACT_RESUME_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 /** Retraction cursor just before the first retraction recorded in the lookback window. */
 export async function readRetractionResumeFloor(env: Env, now = new Date()): Promise<number> {
   const windowStart = new Date(now.getTime() - SSE_RETRACT_RESUME_LOOKBACK_MS).toISOString();
-  const first = await get<{ seq: number }>(
+  // MIN(seq), not the earliest created_at: the floor must sit below every
+  // in-window retraction whatever order their timestamps are in.
+  const first = await get<{ seq: number | null }>(
     env.DB,
-    `SELECT seq FROM tx_retractions WHERE created_at >= ? ORDER BY created_at ASC, seq ASC LIMIT 1`,
+    `SELECT MIN(seq) AS seq FROM tx_retractions WHERE created_at >= ?`,
     [windowStart],
   );
-  if (first) return Math.max(0, Number(first.seq) - 1);
+  if (first?.seq != null) return Math.max(0, Number(first.seq) - 1);
   return readRetractionHighWater(env);
 }
 

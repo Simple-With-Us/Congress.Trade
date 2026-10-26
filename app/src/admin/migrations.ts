@@ -1530,6 +1530,11 @@ export const TRADE_RETRACTIONS_SCHEMA_STATEMENTS = [
 AFTER UPDATE OF deprecated_at ON transactions
 FOR EACH ROW
 WHEN OLD.deprecated_at IS NULL AND NEW.deprecated_at IS NOT NULL
+  -- Only rows the public feed could have served (buildTxFilters in
+  -- delivery/rows.ts): never expose ids of hidden placeholder/competitor rows.
+  AND NEW.filer_id IS NOT NULL
+  AND SUBSTR(NEW.doc_id, 1, 17) != 'provider-missing-'
+  AND NOT (NEW.source = 'competitor_backfill' AND NEW.filer_id LIKE 'EXEC-%' AND NEW.doc_id LIKE 'COMPETITOR%')
 BEGIN
   INSERT INTO tx_retractions (tx_id, doc_id, retracted_at, reason)
   VALUES (NEW.id, NEW.doc_id, NEW.deprecated_at, NEW.deprecated_reason);

@@ -86,7 +86,13 @@ import {
   webhookTargetLengthError,
 } from './subscriptions.ts';
 import { openSseStream } from './sse.ts';
-import { listRetractions, RETRACTIONS_DEFAULT_LIMIT } from './retractions.ts';
+import {
+  isMissingRetractionsTable,
+  listRetractions,
+  RETRACTIONS_DEFAULT_LIMIT,
+  RETRACTIONS_MAX_LIMIT,
+} from './retractions.ts';
+import { z } from 'zod';
 import { handleTickerLogoRequest } from '../ui/tickerLogos.ts';
 import { readLogoPolicyOverlay } from '../ui/tickerLogoPolicy.ts';
 import { handleMemberPhotoRequest } from '../enrichment/memberPhotoPack.ts';
@@ -99,6 +105,28 @@ import { checkReadiness, type ReadinessResult } from '../shared/readiness.ts';
 import { costProfilePublicSummary, resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { readLocalLitestreamAge } from '../shared/litestreamAge.ts';
 import { readR2WeeklyArchiveStatus } from '../shared/r2WeeklyArchive.ts';
+
+/** Optional non-negative integer query param ('' counts as absent). */
+const queryUint = z.preprocess(
+  (v) => (v === '' ? undefined : v),
+  z.string().regex(/^\d{1,16}$/).transform(Number).optional(),
+);
+
+/**
+ * GET /transactions/retractions query.  Unknown params are ignored (stripped),
+ * like the other public feed endpoints, so cache-busters keep working.
+ * `limit` above RETRACTIONS_MAX_LIMIT is clamped, as listRetractions did.
+ */
+export const RetractionsQuerySchema = z.object({
+  since: queryUint.transform((v) => v ?? 0),
+  limit: queryUint
+    .transform((v) => v ?? RETRACTIONS_DEFAULT_LIMIT)
+    .pipe(z.number().int().min(1))
+    .transform((v) => Math.min(v, RETRACTIONS_MAX_LIMIT)),
+});
+
+/** GET /stream retraction resume cursor (?retractSince=). */
+export const SseRetractQuerySchema = z.object({ retractSince: queryUint });
 
 function parseIntOrUndef(v: string | undefined): number | undefined {
   if (v === undefined || v === '') return undefined;
@@ -626,10 +654,11 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // `since`.  A retraction whose row was later revived is omitted; the row
   // comes back through /transactions with a new cursorSeq.
   r.get('/transactions/retractions', async (c) => {
-    const q = c.req.query();
-    const since = parseIntOrUndef(q.since) ?? 0;
-    const limit = parseIntOrUndef(q.limit) ?? RETRACTIONS_DEFAULT_LIMIT;
-    if (since < 0 || limit < 1) return c.json({ error: 'since must be >= 0 and limit >= 1' }, 400);
+    const parsed = RetractionsQuerySchema.safeParse(c.req.query());
+    if (!parsed.success) {
+      return c.json({ error: 'since must be an integer >= 0 and limit an integer from 1 to ' + RETRACTIONS_MAX_LIMIT }, 400);
+    }
+    const { since, limit } = parsed.data;
     const ip = clientIp(c.req.raw);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
@@ -639,7 +668,16 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         { 'Retry-After': String(budget.retryAfterSec) },
       );
     }
-    const page = await listRetractions(c.env, since, limit);
+    let page: Awaited<ReturnType<typeof listRetractions>>;
+    try {
+      page = await listRetractions(c.env, since, limit);
+    } catch (err) {
+      // Deploy-before-migrate: 0108 not applied yet.  Same degradation as the
+      // SSE path (retractions off), surfaced as a retryable 503, not a 500.
+      if (!isMissingRetractionsTable(err)) throw err;
+      c.header('Retry-After', '60');
+      return c.json({ error: 'retraction feed not available yet (migration 0108 pending)' }, 503);
+    }
     await spendRowBudget(c.env, ip, page.retractions.length);
     c.header('Cache-Control', 'no-store');
     return c.json({
@@ -977,7 +1015,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     }
     const since = resolveResumeCursor(c.req.query('since'), c.req.header('Last-Event-ID'));
     const token = subscriptionSecretFromRequest(c, true) ?? undefined;
-    const retractSince = parseIntOrUndef(c.req.query('retractSince'));
+    const resume = SseRetractQuerySchema.safeParse(c.req.query());
+    if (!resume.success) return c.json({ error: 'retractSince must be an integer >= 0' }, 400);
+    const retractSince = resume.data.retractSince;
     return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw), {}, retractSince);
   });
 

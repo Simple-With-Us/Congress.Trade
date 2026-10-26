@@ -13,7 +13,7 @@ import { dispatchWebhook } from '../webhook.ts';
 import { openSseStream } from '../sse.ts';
 import { flushParkedDeliveries } from '../targetCircuit.ts';
 import { APNS_FANOUT_TRADE_SQL } from '../apnsFanout.ts';
-import { listRetractions, parseRetractKey, retractKey } from '../retractions.ts';
+import { listRetractions, parseRetractKey, readRetractionResumeFloor, retractKey } from '../retractions.ts';
 
 let db: SqliteDatabase;
 let d1: D1Database;
@@ -81,6 +81,24 @@ describe('deprecation trigger', () => {
     deprecate('tx-a', '2026-10-26T00:00:00.000Z');
     db.prepare("UPDATE transactions SET asset_name = 'APPLE INC' WHERE id = 'tx-a'").run();
     expect((db.prepare('SELECT COUNT(*) AS n FROM tx_retractions').get() as { n: number }).n).toBe(1);
+  });
+
+  it('records nothing for rows the public feed never served (no filer, placeholders, competitor injects)', () => {
+    seedTx('tx-nofiler');
+    db.prepare("UPDATE transactions SET filer_id = NULL WHERE id = 'tx-nofiler'").run();
+    db.prepare(
+      `INSERT INTO transactions (id, doc_id, filer_id, tx_date, owner, asset_name, ticker, tx_type,
+         amount_min, amount_max, is_option, cap_gains_over_200, raw_text, confidence, source, row_key, created_at)
+       VALUES ('tx-stub', 'provider-missing-abc', 'K000388', '2026-10-01', NULL, 'Apple Inc.', 'AAPL', 'P',
+         1001, 15000, 0, 0, '', 1, 'pdf', 'v1:pdf:stub', ?),
+              ('tx-comp', 'COMPETITOR-1', 'EXEC-X', '2026-10-01', NULL, 'Apple Inc.', 'AAPL', 'P',
+         1001, 15000, 0, 0, '', 1, 'competitor_backfill', 'v1:cb:comp', ?)`,
+    ).run(CREATED, CREATED);
+    for (const id of ['tx-nofiler', 'tx-stub', 'tx-comp']) deprecate(id);
+    expect(z.object({ n: z.number() }).parse(db.prepare('SELECT COUNT(*) AS n FROM tx_retractions').get()).n).toBe(0);
+    expect(z.object({ n: z.number() }).parse(
+      db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE event_kind = 'trade.retract'").get(),
+    ).n).toBe(0);
   });
 
   it('never feeds a retract event to the APNs trade fan-out', () => {
@@ -172,6 +190,24 @@ describe('GET /transactions/retractions', () => {
 
   it('rejects a negative cursor', async () => {
     expect((await poll('?since=-1')).status).toBe(400);
+  });
+
+  it('validates the whole query with zod: non-integer or zero values are 400, extras ignored, limit clamped', async () => {
+    for (const q of ['?since=1.5', '?since=abc', '?limit=0', '?limit=-3', '?since=1e3']) {
+      expect((await poll(q)).status, q).toBe(400);
+    }
+    seedTx('tx-a');
+    deprecate('tx-a');
+    const ok = await poll('?since=&limit=99999&_=123');
+    expect(ok.status).toBe(200);
+    expect(ok.body?.retractions.map((r) => r.txId)).toEqual(['tx-a']);
+  });
+
+  it('answers 503 (retryable), not 500, before migration 0108 created tx_retractions', async () => {
+    db.exec('DROP TABLE tx_retractions');
+    const res = await poll('?since=0');
+    expect(res.status).toBe(503);
+    expect(res.res.headers.get('retry-after')).toBe('60');
   });
 });
 
@@ -313,6 +349,28 @@ describe('SSE trade.retract', () => {
     const body = await readAll(res);
     expect(body).toContain('event: retract-cursor\ndata: 0\n');
     expect(body).toContain('event: trade.retract');
+  });
+
+  it('rejects an invalid ?retractSince with 400', async () => {
+    for (const q of ['-1', '2.5', 'abc']) {
+      const res = await buildRestRouter().request(`http://localhost/stream?subscription=sub_s&retractSince=${q}`, {}, env);
+      expect(res.status, q).toBe(400);
+    }
+  });
+
+  it('takes the resume floor from MIN(seq) in the window, whatever the created_at order', async () => {
+    seedTx('tx-a');
+    seedTx('tx-b');
+    deprecate('tx-a');
+    deprecate('tx-b');
+    const now = new Date();
+    // seq 2 carries the earlier timestamp; both are inside the window.
+    db.prepare("UPDATE tx_retractions SET created_at = ? WHERE seq = 1").run(new Date(now.getTime() - 60_000).toISOString());
+    db.prepare("UPDATE tx_retractions SET created_at = ? WHERE seq = 2").run(new Date(now.getTime() - 120_000).toISOString());
+    expect(await readRetractionResumeFloor(env, now)).toBe(0);
+    // An empty window falls back to the high-water mark.
+    db.prepare("UPDATE tx_retractions SET created_at = '2000-01-01T00:00:00.000Z'").run();
+    expect(await readRetractionResumeFloor(env, now)).toBe(2);
   });
 
   it('does not replay retractions older than the resume window', async () => {

@@ -87,6 +87,17 @@ export async function applyGuardedFilingsColumnMigrations(db: D1Database): Promi
   return 'applied';
 }
 
+/**
+ * Guarded apply for migration 0108's `delivery_outbox.event_kind`: added only
+ * when `PRAGMA table_info("delivery_outbox")` shows it missing, so the
+ * replay's plain ALTER is never the only guard.
+ */
+export async function applyGuardedRetractionColumnMigrations(db: D1Database): Promise<'applied' | 'skipped'> {
+  if (!(await sqliteTableExists(db, 'delivery_outbox'))) return 'skipped';
+  await ensureSqliteColumn(db, 'delivery_outbox', 'event_kind', "TEXT NOT NULL DEFAULT 'trade.new'");
+  return 'applied';
+}
+
 /** Label for the guarded 0091 rebuild in `failed[]` and the logs. */
 export const APPLE_SUBSCRIPTIONS_GUARD_LABEL = '(guarded 0091 apple_subscriptions rebuild)';
 
@@ -274,6 +285,7 @@ export async function executeAdminSchemaMigrations(
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
     await applyGuardedFilingsColumnMigrations(db);
+    await applyGuardedRetractionColumnMigrations(db);
   }
   // Pre-loop so a legacy table is rebuilt before the replay indexes it.  A
   // failure here is retried post-loop, which decides what failed[] reports,
@@ -316,6 +328,7 @@ export async function executeAdminSchemaMigrations(
   if (runGuarded) {
     await applyGuardedSecuritiesRefColumnMigrations(db);
     await applyGuardedFilingsColumnMigrations(db);
+    await applyGuardedRetractionColumnMigrations(db);
   }
   // Post-loop: a clean DB gets apple_subscriptions from the 0081 CREATE in the loop.
   const appleFailure = preLoopAppleFailure?.final

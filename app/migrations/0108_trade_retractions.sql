@@ -11,7 +11,13 @@
 -- tx_cursor_seq unless the reviving UPDATE already moved it (the admin
 -- republish bumps rows whose fields changed), and closes the retraction.
 -- Rows deprecated before this migration have no retraction, so a
--- byte-identical revive of one keeps its cursor.
+-- byte-identical revive of one keeps its cursor.  Rows the public feed never
+-- serves (no filer, provider-missing placeholders, competitor-only executive
+-- injects) get no retraction either, so their ids are never exposed.
+--
+-- POST /api/admin/migrate adds delivery_outbox.event_kind only when PRAGMA
+-- table_info shows it missing (applyGuardedRetractionColumnMigrations); the
+-- ALTER below then lands on the runner's duplicate-column skip.
 --
 -- delivery_outbox stays keyed by tx_id.  A retract event uses the key
 -- 'retract:<seq>' with event_kind 'trade.retract', so it never collides with
@@ -39,6 +45,11 @@ CREATE TRIGGER IF NOT EXISTS trg_transactions_retract
 AFTER UPDATE OF deprecated_at ON transactions
 FOR EACH ROW
 WHEN OLD.deprecated_at IS NULL AND NEW.deprecated_at IS NOT NULL
+  -- Only rows the public feed could have served (buildTxFilters in
+  -- delivery/rows.ts): never expose ids of hidden placeholder/competitor rows.
+  AND NEW.filer_id IS NOT NULL
+  AND SUBSTR(NEW.doc_id, 1, 17) != 'provider-missing-'
+  AND NOT (NEW.source = 'competitor_backfill' AND NEW.filer_id LIKE 'EXEC-%' AND NEW.doc_id LIKE 'COMPETITOR%')
 BEGIN
   INSERT INTO tx_retractions (tx_id, doc_id, retracted_at, reason)
   VALUES (NEW.id, NEW.doc_id, NEW.deprecated_at, NEW.deprecated_reason);

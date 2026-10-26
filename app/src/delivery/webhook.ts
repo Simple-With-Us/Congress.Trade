@@ -548,7 +548,8 @@ async function deliverToSubscription(
   if (targetKey) {
     const gate = await checkTargetCircuit(env, targetKey);
     if (!gate.allowed) {
-      await parkDelivery(env, sub.id, event.key, (gate as any).reason);
+      // Narrowed without a cast: only the not-allowed gate shape has `reason`.
+      await parkDelivery(env, sub.id, event.key, 'reason' in gate ? gate.reason : 'circuit-open');
       return;
     }
   }
