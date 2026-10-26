@@ -63,6 +63,11 @@ on:
       - 'clients/ios/**'
       - '.github/workflows/ios-ship.yml'
   workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: 'Optional exact marketing version (e.g. 1.0.239) to ship as a replacement build in an existing train. Leave empty for the next patch.'
+        required: false
+        default: ''
   schedule:
     # Twice an hour, offset from Socratic.Trade's '*/30' so the shared Mac
     # runner is not asked to start three fleet ships on the same minute.
@@ -287,6 +292,7 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          INPUT_MARKETING_VERSION: ${{ github.event.inputs.marketing_version }}
         run: |
           # Wrapper resolves the in-repo fleet script (scripts/ios-fleet/) and
           # enforces the stable-Xcode rule; it falls back to the host copy only
@@ -298,7 +304,15 @@ jobs:
           # vendored client is explicit that a newest-build fallback is the
           # defect it removed (scripts/ios-fleet/asc-api.mjs, ensure-tf-ready).
           set -o pipefail
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
+          # A manual dispatch may pin the marketing version; the build number
+          # is still the UTC ship stamp.  The expansion form is safe for an
+          # empty array under bash 3.2.
+          ship_args=()
+          if [[ -n "${INPUT_MARKETING_VERSION:-}" ]]; then
+            [[ "$INPUT_MARKETING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::marketing_version must look like 1.0.239"; exit 1; }
+            ship_args+=(--version "$INPUT_MARKETING_VERSION")
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" ${ship_args[@]+"${ship_args[@]}"} 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
 
       # Name the build this run uploaded, for the external promotion below.
       # The fleet script resolves the version before it uploads and logs it as

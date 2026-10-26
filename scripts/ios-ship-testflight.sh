@@ -16,7 +16,7 @@
 #
 # VERSION NUMBERS: MARKETING_VERSION is the next patch on the app's train
 # (1.0.<P+1>, where P is the highest patch App Store Connect already holds on
-# that train) and CURRENT_PROJECT_VERSION is the repo commit count, raised
+# that train) and CURRENT_PROJECT_VERSION is the UTC ship stamp (YYYYMMDDHHMM), raised
 # above the App Store Connect floor.  The two numbers are independent, so
 # App Store Connect shows "1.0.237 (2360)" instead of "1.0.237 (237)".
 # Owner directive 2026-10-24 (AFC-517); see scripts/ios-fleet/README.md.

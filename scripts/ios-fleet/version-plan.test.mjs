@@ -266,3 +266,14 @@ test("planVersion refuses a forced build that recreates 1.0.N (N) (Kody, AFC-517
     { marketing: "1.0.237", build: "999" }
   );
 });
+
+test("planVersion: the normal build starts from the UTC ship stamp, not the commit count", () => {
+  const plan = planVersion({ prefix: "1.0", ascPatch: 238, forcedVersion: "1.0.239", stamp: "202610261545", commitCount: 2383, floor: 2383 });
+  assert.equal(plan.marketing, "1.0.239");
+  assert.equal(plan.build, "202610261545");
+});
+
+test("planVersion: a stamp at or below the floor is raised to floor + 1", () => {
+  const plan = planVersion({ prefix: "1.0", ascPatch: 238, stamp: "202610261545", commitCount: 2383, floor: 202610261545 });
+  assert.equal(plan.build, "202610261546");
+});

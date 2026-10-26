@@ -213,7 +213,8 @@ export function buildFloor({ trainBuilds = [], appBuilds = [], platform = "" } =
  *   ascPatch      the highest patch already used on that train (0 if none)
  *   forcedVersion an exact --version override, or ""
  *   forcedBuild   an exact --build override, or ""
- *   commitCount   the repo commit count
+ *   commitCount   the repo commit count (fallback start when no stamp)
+ *   stamp         the UTC ship time, YYYYMMDDHHMM, the normal start
  *   floor         the build floor (see buildFloor)
  *
  * Returns { marketing, build } as strings.
@@ -224,6 +225,7 @@ export function planVersion({
   forcedVersion = "",
   forcedBuild = "",
   commitCount = 0,
+  stamp = "",
   floor = 0
 } = {}) {
   const train = String(prefix || "1.0");
@@ -249,9 +251,12 @@ export function planVersion({
       throw new Error(`--build ${build} equals the patch of ${marketing}; that is the retired 1.0.N (N) form`);
     }
   } else {
+    // The starting point is the UTC ship stamp (YYYYMMDDHHMM) when one is
+    // given; the commit count is only the fallback for callers without a clock.
+    const stampNumber = /^\d{12}$/.test(String(stamp || "")) ? parseInt(String(stamp), 10) : null;
     const commits = Number.isFinite(commitCount) ? Math.trunc(commitCount) : 0;
     const known = Number.isFinite(floor) ? Math.trunc(floor) : 0;
-    let candidate = commits;
+    let candidate = stampNumber !== null ? stampNumber : commits;
     if (candidate <= known) candidate = known + 1;
     // A ship must never look like "1.0.N (N)":  if the build number happens to
     // be the patch number, move it one up.

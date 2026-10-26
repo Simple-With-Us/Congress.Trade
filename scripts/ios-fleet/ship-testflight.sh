@@ -7,7 +7,7 @@
 # Options:
 #   --repo-root PATH   Repo root (default: cwd)
 #   --build N          Force CURRENT_PROJECT_VERSION (exact; default: the repo
-#                      commit count, raised above the App Store Connect floor)
+#                      UTC ship stamp YYYYMMDDHHMM, raised above the App Store Connect floor)
 #   --version X.Y.Z    Force MARKETING_VERSION (exact; default: the next patch
 #                      on the app's train)
 #   --export-only      Build IPA only; do not upload
@@ -935,6 +935,7 @@ PLAN_FLOOR="n/a"
 PLAN_TRAIN_FLOOR="n/a"
 PLAN_APP_FLOOR="n/a"
 PLAN_COMMIT_COUNT="n/a"
+PLAN_BUILD_STAMP="n/a"
 PLAN_READY=0
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
@@ -959,6 +960,14 @@ else
   if [[ "$COMMIT_COUNT" =~ ^[0-9]+$ ]]; then
     PLAN_COMMIT_COUNT="$COMMIT_COUNT"
   fi
+
+  # The build stamp:  CFBundleVersion starts from the UTC time of this ship,
+  # YYYYMMDDHHMM (12 digits).  The owner chose this over the repo commit count
+  # on 2026-10-26, so App Store Connect shows "1.0.239 (202610261545)" and not
+  # a four-digit counter.  IOS_FLEET_BUILD_STAMP pins it for tests only.
+  BUILD_STAMP="${IOS_FLEET_BUILD_STAMP:-$(date -u +%Y%m%d%H%M)}"
+  [[ "$BUILD_STAMP" =~ ^[0-9]{12}$ ]] || die "build stamp '${BUILD_STAMP}' is not 12 digits (YYYYMMDDHHMM)"
+  PLAN_BUILD_STAMP="$BUILD_STAMP"
 
   # ---- the marketing version ---------------------------------------------
   # --version is an exact override.  Otherwise the version is the next patch
@@ -1017,7 +1026,6 @@ else
     fi
     log "version: operator override (--build/--version); the local build-seq counter is not consulted"
   else
-    [[ "$PLAN_COMMIT_COUNT" =~ ^[0-9]+$ ]] || die "could not read the commit count from ${REPO_ROOT}; CFBundleVersion is the repo commit count and UTC timestamps are retired"
 
     # The floor:  every build already in the TARGET train, plus the app's own
     # plain-integer builds.  It is per-train, so it is read from the train
@@ -1065,10 +1073,10 @@ else
     # already holds it, or because a shallow checkout understates the commit
     # count — so the log line names the floor rather than asserting the
     # commit count was shipped.
-    BUILD_NUM="$PLAN_COMMIT_COUNT"
+    BUILD_NUM="$PLAN_BUILD_STAMP"
     if [[ "$BUILD_NUM" -le "$PLAN_FLOOR" ]]; then
       BUILD_NUM="$((PLAN_FLOOR + 1))"
-      log "build: floor ${PLAN_FLOOR} is at or above the commit count ${PLAN_COMMIT_COUNT}; using ${BUILD_NUM} instead"
+      log "build: floor ${PLAN_FLOOR} is at or above the build stamp ${PLAN_BUILD_STAMP}; using ${BUILD_NUM} instead"
     fi
     # A ship must never look like "1.0.N (N)":  if the build number happens
     # to be the patch number of the marketing version, move it one up.
@@ -1133,7 +1141,7 @@ log "bundleId=${BUNDLE_ID}"
 log "scheme=${SCHEME}"
 log "repo=${REPO_ROOT}"
 if [[ "$PLAN_READY" -eq 1 ]]; then
-  log "version plan: asc_patch=${PLAN_ASC_PATCH} -> marketing=${MARKETING}; build floors: train=${PLAN_TRAIN_FLOOR} app=${PLAN_APP_FLOOR} commit_count=${PLAN_COMMIT_COUNT} -> build=${BUILD_NUM}"
+  log "version plan: asc_patch=${PLAN_ASC_PATCH} -> marketing=${MARKETING}; build floors: train=${PLAN_TRAIN_FLOOR} app=${PLAN_APP_FLOOR} build_stamp=${PLAN_BUILD_STAMP} commit_count=${PLAN_COMMIT_COUNT} -> build=${BUILD_NUM}"
 fi
 log "marketing=${MARKETING} build=${BUILD_NUM}"
 log "App Store Connect will show this as: ${MARKETING} (${BUILD_NUM})"

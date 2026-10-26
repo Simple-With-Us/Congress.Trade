@@ -135,8 +135,11 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // must still be the wrapper, and still be the last thing in the step.
   assert.match(
     code,
-    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"( \$\{ship_args\[@\]\+"\$\{ship_args\[@\]\}"\})?(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
   );
+  // The only argument a dispatch may add is an exact --version; never --force-ship.
+  assert.doesNotMatch(code, /--force-ship/);
+  assert.match(code, /ship_args\+=\(--version "\$INPUT_MARKETING_VERSION"\)/);
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);

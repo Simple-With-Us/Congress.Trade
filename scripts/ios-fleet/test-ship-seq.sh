@@ -131,6 +131,9 @@ HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
 # count.  Read the count from the fixture instead of hard-coding it, so adding
 # a seed commit to the harness cannot silently stale the assertions.
 COMMIT_COUNT="$(git -C "$REPO" rev-list --count HEAD)"
+# The build number starts from the UTC ship stamp (YYYYMMDDHHMM), pinned here.
+BUILD_STAMP_PIN=202610261500
+export IOS_FLEET_BUILD_STAMP="$BUILD_STAMP_PIN"
 
 SEQ_FILE="${STATE}/build-seq-congress.txt"
 SHIP_FILE="${STATE}/last-ship-congress.txt"
@@ -156,6 +159,7 @@ run_ship() {
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
+    IOS_FLEET_BUILD_STAMP="$BUILD_STAMP_PIN" \
     bash "$SHIP" "$@" 2>&1)"
   RC=$?
   return 0
@@ -268,8 +272,8 @@ check "stops at the missing project (never archives)" \
   "$(contains 'project not found' && echo 0 || echo 1)"
 check "the local counter is not advanced (it is not the build number now)" \
   "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
-check "the planned build number is the commit count" \
-  "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
+check "the planned build number is the ship stamp" \
+  "$(contains "build=${BUILD_STAMP_PIN}" && echo 0 || echo 1)"
 # Pin the trains explicitly so a wrong or reverted marketingVersionDefault in
 # apps.json fails here instead of passing because the helper agrees with it.
 check "congress ships on the 1.0 train" \
@@ -293,7 +297,7 @@ run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
 check "exits 0" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 check "plans the build number without shipping it" \
-  "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
+  "$(contains "build=${BUILD_STAMP_PIN}" && echo 0 || echo 1)"
 echo
 
 # --- 5. --dry-run reports a gated run without consuming --------------------
@@ -340,8 +344,8 @@ for app in socratic congress usage usage-local; do
 
   check "${app}: the marketing version is the next patch on the train (got '${mk}')" \
     "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
-  check "${app}: the build number is the repo commit count (got '${bn}')" \
-    "$([[ "$bn" == "$COMMIT_COUNT" ]] && echo 0 || echo 1)"
+  check "${app}: the build number is the UTC ship stamp (got '${bn}')" \
+    "$([[ "$bn" == "$BUILD_STAMP_PIN" ]] && echo 0 || echo 1)"
   check "${app}: the build number is not the patch number (no '1.0.N (N)')" \
     "$([[ "$bn" != "237" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
@@ -357,7 +361,7 @@ done
 # The floor above the commit count:  the build number moves to floor + 1 and
 # the marketing version stays the next patch.  The two numbers are
 # independent, so the floor never moves the version.
-FLOOR_HIGH=202610180036
+FLOOR_HIGH=202610270000
 for app in socratic congress usage usage-local; do
   rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
   write_record "$app" 5
@@ -367,7 +371,7 @@ for app in socratic congress usage usage-local; do
   mk="$PLANNED_MARKETING"
   bn="$PLANNED_BUILD"
 
-  check "${app}: a floor above the commit count raises the build to floor + 1 (got '${bn}')" \
+  check "${app}: a floor above the ship stamp raises the build to floor + 1 (got '${bn}')" \
     "$([[ "$bn" == "$((FLOOR_HIGH + 1))" ]] && echo 0 || echo 1)"
   check "${app}: the floor does not move the marketing version (got '${mk}')" \
     "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
@@ -383,7 +387,7 @@ FAKE_ASC_FLOOR=0
 for app in socratic congress usage usage-local; do
   rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
   write_record "$app" 5
-  FAKE_ASC_FLOOR=202610180036
+  FAKE_ASC_FLOOR=202610261500
   run_ship "$app" --repo-root "$REPO" --dry-run --version 1.0.236
   planned_pair
   mk="$PLANNED_MARKETING"
@@ -392,7 +396,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: --version is honoured exactly (got '${mk}')" \
     "$([[ "$mk" == "1.0.236" ]] && echo 0 || echo 1)"
   check "${app}: the build is floored against the pinned train (got '${bn}')" \
-    "$([[ "$bn" == "202610180037" ]] && echo 0 || echo 1)"
+    "$([[ "$bn" == "202610261501" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
     "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
