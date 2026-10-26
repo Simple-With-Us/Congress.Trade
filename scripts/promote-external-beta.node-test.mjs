@@ -400,3 +400,13 @@ test("the promotion never falls back to the newest build", () => {
   assert.doesNotMatch(src, /sort=-uploadedDate[^\n]*\n[^\n]*build\s*=\s*buildsRes/);
   assert.match(src, /newestKnownBuild/);
 });
+
+test("a known marketing version pins the build lookup to its train", () => {
+  const asc = fakeAsc({
+    builds: [{ id: "b9", attributes: { version: "1.1.2", processingState: "VALID" } }],
+  });
+  promoteExternalBeta({ asc, appId: "6798076688", buildNumber: "1.1.2", marketingVersion: "1.1.2", log: noop, warn: noop });
+  const q = asc.calls.find((c) => c.method === "GET" && c.path.includes("/v1/builds?"));
+  assert.ok(q.path.includes("filter[version]=1.1.2"));
+  assert.ok(q.path.includes("filter[preReleaseVersion.version]=1.1.2"));
+});

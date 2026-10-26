@@ -1048,6 +1048,12 @@ async function main() {
   // train that holds any build of another shape stops the run with the reason,
   // because the ordering between shapes (239 is 239.0.0, above 1.1.2) is not
   // something to guess.  READ ONLY.
+  //
+  // Two ships at once would read the same train and pick the same n.  The CI
+  // ship is serialised (ios-ship.yml concurrency group, cancel-in-progress
+  // false), and a duplicate CFBundleVersion is refused by App Store Connect at
+  // upload, so the loser fails loudly and nothing is promoted.  Do not run a
+  // local ship while the workflow is running.
   if (method === "next-dotted-build") {
     const bundleId = path;
     const version = body;

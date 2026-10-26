@@ -312,6 +312,8 @@ jobs:
           build_num="$(bash "$GITHUB_WORKSPACE/scripts/ios-ship-build-number.sh" \
             "$RUNNER_TEMP/congress-ship.log" "$GITHUB_WORKSPACE")"
           echo "build_num=${build_num}" >> "$GITHUB_OUTPUT"
+          marketing="$(grep -o 'marketing=[0-9][0-9.]* build=' "$RUNNER_TEMP/congress-ship.log" | tail -1 | sed 's/^marketing=//; s/ build=$//' || true)"
+          echo "marketing=${marketing}" >> "$GITHUB_OUTPUT"
           echo "shipped build number: ${build_num}"
 
       # CT-2434:  the external TestFlight group (Public Beta, public link) is
@@ -338,5 +340,6 @@ jobs:
           # crossed this step boundary.  The key is never an argument of any
           # command.
           node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs" \
-            --build "${{ steps.buildnum.outputs.build_num }}"
+            --build "${{ steps.buildnum.outputs.build_num }}" \
+            ${{ steps.buildnum.outputs.marketing && format('--marketing "{0}"', steps.buildnum.outputs.marketing) || '' }}
 

@@ -176,10 +176,15 @@ export function resolveExpectedBuildNumber({ explicit = null, repoRoot = ROOT } 
  * guess there ("N builds match version X -- ambiguous, refusing to guess");
  * so does this.
  */
-export function findExactBuild(asc, appId, buildNumber) {
+export function findExactBuild(asc, appId, buildNumber, marketingVersion = null) {
+  // A marketing version, when the ship knows it, pins the lookup to that train:
+  // a dotted build string is only unique inside its train.
+  const trainFilter = marketingVersion && /^\d+(\.\d+)*$/.test(String(marketingVersion))
+    ? `&filter[preReleaseVersion.version]=${encodeURIComponent(marketingVersion)}`
+    : "";
   const res = asc(
     "GET",
-    `/v1/builds?filter[app]=${appId}&filter[version]=${buildNumber}` +
+    `/v1/builds?filter[app]=${appId}&filter[version]=${buildNumber}${trainFilter}` +
       `&limit=2&include=buildBetaDetail,preReleaseVersion` +
       `&fields[builds]=version,processingState,uploadedDate`
   );
@@ -218,6 +223,7 @@ export function promoteExternalBeta({
   appId,
   groupName = null,
   buildNumber = null,
+  marketingVersion = null,
   log = () => {},
   warn = () => {},
 }) {
@@ -280,7 +286,7 @@ export function promoteExternalBeta({
   out.groupName = group.attributes?.name || null;
 
   // 2. THE build -- by number, never by recency.
-  const found = findExactBuild(asc, appId, buildNumber);
+  const found = findExactBuild(asc, appId, buildNumber, marketingVersion);
   if (!found.ok) {
     out.outcome = "asc-error";
     note(`could not look up build ${buildNumber}: ${found.error}`);
@@ -418,6 +424,7 @@ function parseArgs(argv) {
     else if (argv[i] === "--group") out.group = argv[++i] || null;
     else if (argv[i] === "--app") out.appKey = argv[++i] || DEFAULT_APP_KEY;
     else if (argv[i] === "--build") out.build = argv[++i] || null;
+    else if (argv[i] === "--marketing") out.marketing = argv[++i] || null;
   }
   return out;
 }
@@ -455,6 +462,7 @@ function main() {
     appId,
     groupName: args.group,
     buildNumber,
+    marketingVersion: args.marketing || null,
     log: (m) => console.error(`promote-external-beta: ${m}`),
     warn: (m) => console.error(`promote-external-beta: warning: ${m}`),
   });
