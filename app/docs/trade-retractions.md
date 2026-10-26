@@ -48,10 +48,11 @@ independent of the transaction `cursorSeq`.
 - Resume with `?retractSince=<retractSeq>`.  The stream opens with
   `event: retract-cursor` (the starting point), and the `reconnect` frame
   carries `retractSince`.  A fresh open without `?retractSince=` starts at the
-  current high-water mark (live tail); a resume (via `?since=` or
-  `Last-Event-ID`) without one replays from 0, so a native auto-reconnect —
-  which cannot resend the query param — never skips a mid-disconnect
-  retraction.
+  current high-water mark (live tail).  A resume (via `?since=` or
+  `Last-Event-ID`) without one replays the last 24 hours of retractions, so
+  a native auto-reconnect (which cannot resend the query param) never skips
+  a mid-disconnect retraction.  For longer gaps, pass `?retractSince=` or
+  use the poll feed.  Frames are at-least-once, so dedupe on `retractSeq`.
 - Like the webhook, frames are not filtered.  They are emitted on the durable
   backlog cadence (about 45 s).
 

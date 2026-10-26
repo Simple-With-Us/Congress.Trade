@@ -63,7 +63,12 @@ import { createCongressEvent } from '@jaywedgeworth22/congress-trading-shared';
 import { prefixedId } from '../shared/ids.ts';
 import { rateLimit } from '../shared/rateLimit.ts';
 import { flushD1Budget } from '../shared/d1Budget.ts';
-import { formatRetractFrame, listRetractions, readRetractionHighWater } from './retractions.ts';
+import {
+  formatRetractFrame,
+  listRetractions,
+  readRetractionHighWater,
+  readRetractionResumeFloor,
+} from './retractions.ts';
 
 /** How often to poll D1 for new rows. */
 const POLL_INTERVAL_MS = 5_000;
@@ -339,15 +344,17 @@ export async function openSseStream(
     // carries Last-Event-ID (the trade cursor) but no ?retractSince=.
     // Falling back to the high-water mark there would skip every retraction
     // that landed mid-disconnect, so a resume without a retract cursor
-    // replays from 0 instead (bounded per tick, at-least-once — receivers
-    // dedupe by retractSeq). Fresh opens with no resume point stay live-tail.
+    // replays the last SSE_RETRACT_RESUME_LOOKBACK_MS of retractions
+    // (at-least-once; receivers dedupe by retractSeq).  Replaying from 0
+    // would re-send the whole history on every 25-minute reconnect.  Fresh
+    // opens with no resume point stay live-tail.
     let retractCursor: number | null = null;
     try {
       retractCursor = retractSince !== undefined && Number.isFinite(retractSince) && retractSince >= 0
         ? Math.floor(retractSince)
         : liveTailDefault
           ? await readRetractionHighWater(env)
-          : 0;
+          : await readRetractionResumeFloor(env);
     } catch {
       retractCursor = null;
     }

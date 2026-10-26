@@ -25,10 +25,13 @@ CREATE TABLE IF NOT EXISTS tx_retractions (
   doc_id       TEXT NOT NULL,
   retracted_at TEXT NOT NULL,
   reason       TEXT,
-  revived_at   TEXT
+  revived_at   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_tx_retractions_tx ON tx_retractions (tx_id, revived_at);
+
+CREATE INDEX IF NOT EXISTS idx_tx_retractions_created ON tx_retractions (created_at);
 
 ALTER TABLE delivery_outbox ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'trade.new';
 

@@ -105,6 +105,27 @@ export async function readRetractionHighWater(env: Env): Promise<number> {
   return Number(row?.hwm ?? 0);
 }
 
+/**
+ * How far back an SSE resume without ?retractSince= replays retractions.  A
+ * native EventSource auto-reconnect resends Last-Event-ID but not the query
+ * string, so it cannot name its retract cursor; replaying the recent window
+ * covers any disconnect gap without re-sending the whole history on every
+ * 25-minute reconnect.  Longer outages: use ?retractSince= or the poll feed.
+ */
+export const SSE_RETRACT_RESUME_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+
+/** Retraction cursor just before the first retraction recorded in the lookback window. */
+export async function readRetractionResumeFloor(env: Env, now = new Date()): Promise<number> {
+  const windowStart = new Date(now.getTime() - SSE_RETRACT_RESUME_LOOKBACK_MS).toISOString();
+  const first = await get<{ seq: number }>(
+    env.DB,
+    `SELECT seq FROM tx_retractions WHERE created_at >= ? ORDER BY created_at ASC, seq ASC LIMIT 1`,
+    [windowStart],
+  );
+  if (first) return Math.max(0, Number(first.seq) - 1);
+  return readRetractionHighWater(env);
+}
+
 /** SSE frame.  No `id:` line: Last-Event-ID stays the trade cursor_seq. */
 export function formatRetractFrame(r: TradeRetraction): string {
   return `event: ${RETRACT_EVENT}\ndata: ${JSON.stringify({ type: RETRACT_EVENT, ...r })}\n\n`;

@@ -298,7 +298,7 @@ describe('SSE trade.retract', () => {
     expect(body).not.toContain('event: trade.retract');
   });
 
-  it('replays retractions from 0 when resuming without ?retractSince', async () => {
+  it('replays the recent retraction window when resuming without ?retractSince', async () => {
     db.prepare(
       `INSERT INTO subscriptions (id, client_id, delivery, target_url, secret, filters, cursor, active, created_at)
        VALUES ('sub_s', 'ops-integration', 'sse', NULL, 'stream-secret', '{}', 0, 1, '2026-01-01T00:00:00.000Z')`,
@@ -313,6 +313,25 @@ describe('SSE trade.retract', () => {
     const body = await readAll(res);
     expect(body).toContain('event: retract-cursor\ndata: 0\n');
     expect(body).toContain('event: trade.retract');
+  });
+
+  it('does not replay retractions older than the resume window', async () => {
+    db.prepare(
+      `INSERT INTO subscriptions (id, client_id, delivery, target_url, secret, filters, cursor, active, created_at)
+       VALUES ('sub_s', 'ops-integration', 'sse', NULL, 'stream-secret', '{}', 0, 1, '2026-01-01T00:00:00.000Z')`,
+    ).run();
+    seedTx('tx-old');
+    seedTx('tx-new');
+    deprecate('tx-old');
+    db.prepare("UPDATE tx_retractions SET created_at = '2000-01-01T00:00:00.000Z' WHERE tx_id = 'tx-old'").run();
+    deprecate('tx-new');
+    const res = await openSseStream(env, 'sub_s', 0, 'stream-secret', '127.0.0.1', {
+      maxStreamMs: 100, pollIntervalMs: 10, backlogDrainIntervalMs: 1000, reconnectGraceMs: 20,
+    });
+    const body = await readAll(res);
+    expect(body).toContain('event: retract-cursor\ndata: 1\n');
+    const frames = body.split('\n\n').filter((f) => f.startsWith('event: trade.retract'));
+    expect(frames.map((f) => JSON.parse(f.split('data: ')[1]).txId)).toEqual(['tx-new']);
   });
 });
 
