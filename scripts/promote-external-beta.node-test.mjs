@@ -410,3 +410,11 @@ test("a known marketing version pins the build lookup to its train", () => {
   assert.ok(q.path.includes("filter[version]=1.1.2"));
   assert.ok(q.path.includes("filter[preReleaseVersion.version]=1.1.2"));
 });
+
+test("a malformed marketing version is refused, not dropped", () => {
+  const asc = fakeAsc({ builds: [{ id: "b9", attributes: { version: "1.1.2", processingState: "VALID" } }] });
+  const result = promoteExternalBeta({ asc, appId: "6798076688", buildNumber: "1.1.2", marketingVersion: "1.1.x", log: noop, warn: noop });
+  assert.equal(result.outcome, "asc-error");
+  assert.equal(result.added, false);
+  assert.equal(asc.calls.some((c) => c.path.includes("/v1/builds?")), false);
+});

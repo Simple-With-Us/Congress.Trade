@@ -179,9 +179,16 @@ export function resolveExpectedBuildNumber({ explicit = null, repoRoot = ROOT } 
 export function findExactBuild(asc, appId, buildNumber, marketingVersion = null) {
   // A marketing version, when the ship knows it, pins the lookup to that train:
   // a dotted build string is only unique inside its train.
-  const trainFilter = marketingVersion && /^\d+(\.\d+)*$/.test(String(marketingVersion))
-    ? `&filter[preReleaseVersion.version]=${encodeURIComponent(marketingVersion)}`
-    : "";
+  let trainFilter = "";
+  if (marketingVersion != null && String(marketingVersion).trim() !== "") {
+    // Given but malformed:  refuse rather than quietly look the build up
+    // across every train, which is the ambiguity the pin exists to avoid.
+    const mv = String(marketingVersion).trim();
+    if (!/^\d+(\.\d+)*$/.test(mv)) {
+      return { ok: false, error: `invalid marketing version ${JSON.stringify(mv)}; refusing an unpinned lookup`, rows: [], build: null };
+    }
+    trainFilter = `&filter[preReleaseVersion.version]=${encodeURIComponent(mv)}`;
+  }
   const res = asc(
     "GET",
     `/v1/builds?filter[app]=${appId}&filter[version]=${buildNumber}${trainFilter}` +
