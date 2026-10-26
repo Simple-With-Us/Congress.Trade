@@ -209,7 +209,12 @@ project_rel() { # <app key>
 # so moving one app to a new train (Congress.Trade -> 1.1) does not need the
 # other apps' assertions to change.
 train_prefix() { # <app key>
-  awk -v k="\"$1\":" '$1==k{f=1} f&&/marketingVersionDefault/{gsub(/[",]/,"",$2); split($2,a,"."); print a[1]"."a[2]; exit}' "${SCRIPT_DIR}/apps.json"
+  node -e '
+    const a = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).apps[process.argv[2]];
+    const m = /^(\d+)\.(\d+)\./.exec(String(a && a.marketingVersionDefault));
+    if (!m) process.exit(1);
+    console.log(m[1] + "." + m[2]);
+  ' "${SCRIPT_DIR}/apps.json" "$1"
 }
 
 write_record() { # <app key> <record N>
@@ -265,6 +270,16 @@ check "the local counter is not advanced (it is not the build number now)" \
   "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 check "the planned build number is the commit count" \
   "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
+# Pin the trains explicitly so a wrong or reverted marketingVersionDefault in
+# apps.json fails here instead of passing because the helper agrees with it.
+check "congress ships on the 1.1 train" \
+  "$([[ "$(train_prefix congress)" == "1.1" ]] && echo 0 || echo 1)"
+for app in socratic usage; do
+  check "${app} stays on the 1.0 train" \
+    "$([[ "$(train_prefix "$app")" == "1.0" ]] && echo 0 || echo 1)"
+done
+check "the plan report reads the congress train from apps.json" \
+  "$([[ "$(node -e 'import("./asc-api.mjs").catch(()=>{})' >/dev/null 2>&1; grep -c trainPrefixForBundle "${SCRIPT_DIR}/asc-api.mjs")" -ge 2 ]] && echo 0 || echo 1)"
 check "an unverified patch plans the first patch of the train" \
   "$(contains "marketing=$(train_prefix congress).1 build=" && echo 0 || echo 1)"
 check "says loudly that the patch was unverified" \
