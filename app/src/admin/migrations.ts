@@ -1564,6 +1564,23 @@ BEGIN
 END`,
 ] as const;
 
+/**
+ * 0109_delivery_mode_audit.sql — who switched CT_DELIVERY_MODE (subscriber
+ * alert pause) and when; read by the delivery_mode health check and stamped
+ * on suppressed outbox rows.  Keep in lockstep with the .sql file.
+ */
+export const DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS delivery_mode_audit (
+     id            TEXT PRIMARY KEY,
+     mode          TEXT NOT NULL,
+     previous_mode TEXT,
+     actor         TEXT NOT NULL,
+     reason        TEXT,
+     created_at    TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_delivery_mode_audit_created ON delivery_mode_audit (created_at DESC)',
+] as const;
+
 export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
   `DELETE FROM ingestion_outbox
    WHERE doc_id IN (
@@ -1739,6 +1756,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
   // 0108_trade_retractions.sql
   ...TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
+  // 0109_delivery_mode_audit.sql
+  ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

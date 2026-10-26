@@ -60,6 +60,7 @@ export const APP_SETTINGS: readonly SettingDef[] = [
   { key: 'R2_USAGE_DIGEST_UTC_HOUR', source: 'app', description: 'UTC hour for the R2 usage digest lane.' },
   { key: 'RETENTION_DELETE_RAW_OBJECTS', source: 'app', description: 'When truthy, retention sweeps delete raw objects (otherwise keep).' },
   { key: 'CT_UI_LOGO_DISPLAY', source: 'app', description: 'Site-wide logo style: tile | transparent | off (default transparent).' },
+  { key: 'CT_DELIVERY_MODE', source: 'app', description: 'Subscriber alert delivery (webhooks, APNs push, SSE live feed): deliver (default) | hold (write outbox rows, dispatch nothing until switched back) | suppress (mark new and queued outbox rows suppressed, never sent; SSE pauses; for bulk republishes). Non-default for 60m+ raises a critical delivery_mode health check. See delivery/deliveryMode.ts.' },
   { key: 'DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER', source: 'app', description: 'When truthy, the scheduled parked flush re-parks live quarantined webhook deliveries for delivery (default off; rows whose transaction is gone are always skipped).' },
 ] as const;
 
@@ -144,6 +145,25 @@ async function refreshSnapshot(env: Env, keepLastKnownGood: boolean): Promise<vo
       `settings.refresh failed (${status.errors.join('; ') || 'unknown error'}) — keeping last-known-good snapshot (${previous.size} keys)`,
     );
     return;
+  }
+  // Partial failure (one source errored, another answered): a key missing
+  // from `next` may only be missing because its source failed, so keep its
+  // last-known-good value instead of letting it fall back to a default (for
+  // example CT_DELIVERY_MODE=hold silently reverting to deliver).  A key
+  // really deleted in Infisical drops out on the next error-free refresh.
+  if (status.errors.length > 0) {
+    const kept: string[] = [];
+    for (const [key, value] of previous) {
+      if (!next.has(key)) {
+        next.set(key, value);
+        kept.push(key);
+      }
+    }
+    if (kept.length > 0) {
+      console.error(
+        `settings.refresh partially failed (${status.errors.join('; ')}) — keeping last-known-good values for ${kept.length} key(s): ${kept.join(', ')}`,
+      );
+    }
   }
   snapshot = next;
 }

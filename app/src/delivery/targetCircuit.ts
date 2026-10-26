@@ -52,6 +52,7 @@ import { prefixedId } from '../shared/ids.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
 import { abortIfSignal } from '../shared/signalAbort.ts';
 import { readSetting } from '../settings/settingsService.ts';
+import { readDeliveryMode } from './deliveryMode.ts';
 
 export const DEFAULT_TARGET_FAILURE_THRESHOLD = 5;
 export const DEFAULT_TARGET_DAILY_ATTEMPT_CAP = 50;
@@ -627,6 +628,11 @@ export async function flushParkedDeliveries(
   env: Env,
   opts: { limit?: number; now?: Date; signal?: AbortSignal } = {},
 ): Promise<ParkedFlushResult> {
+  // Subscriber alert pause (CT_DELIVERY_MODE): parked rows stay parked and
+  // are released by the first flush after delivery is switched back.
+  if (readDeliveryMode() !== 'deliver') {
+    return { scanned: 0, released: 0, skipped: 0, terminalized: 0, quarantineRecovered: 0, quarantineTerminalized: 0 };
+  }
   const now = opts.now ?? new Date();
   const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
   const undeliverableDue = now.getTime() >= (undeliverableQuarantineScanAfterMs.get(env.DB) ?? 0);
