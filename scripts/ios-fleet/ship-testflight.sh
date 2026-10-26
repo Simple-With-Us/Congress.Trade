@@ -990,7 +990,8 @@ else
     log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
     # A released App Store version closes its train:  a fixed version at or
     # below one is refused, never silently bumped.
-    _rel="$(asc_released_store_version "$ASC_PLATFORM" 2>/dev/null || true)"
+    _rel="$(asc_released_store_version "$ASC_PLATFORM" 2>/dev/null)" \
+      || die "cannot read the released App Store version for ${BUNDLE_ID}, so fixedMarketingVersion ${FIXED_MARKETING} cannot be checked against a closed train.  Nothing was shipped or bumped."
     if [[ -n "$_rel" ]]; then
       if ! python3 -c 'import sys
 a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
@@ -1115,11 +1116,11 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
       else
         _seed="$BUILD_COUNT_SEED"
         if [[ "$_seed" == "auto" ]]; then
-          _seed="$(asc_latest_marketing_patch "$MARKETING_PREFIX" "$ASC_PLATFORM" 2>/dev/null || true)"
+          _seed="$(asc_latest_marketing_patch "${MARKETING%.*}" "$ASC_PLATFORM" 2>/dev/null || true)"
           [[ "$_seed" =~ ^[0-9]+$ ]] || die "buildCountSeed is auto but the latest shipped patch could not be read from App Store Connect.  Nothing was guessed."
           [[ "$_seed" -ge 1 ]] || _seed=1
         fi
-        [[ "$_seed" =~ ^[0-9]{1,3}$ ]] || die "buildCountSeed for ${APP_KEY} must be 1-3 digits or auto (got '${_seed}')"
+        [[ "$_seed" =~ ^[0-9]{1,3}$ && "$((10#$_seed))" -ge 1 ]] || die "buildCountSeed for ${APP_KEY} must be 1-999 or auto (got '${_seed}')"
         BUILD_NUM="$_seed"
       fi
       if [[ "$BUILD_NUM" -gt 999 ]]; then
@@ -1135,7 +1136,9 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
     fi
     # A ship must never look like "1.0.N (N)":  if the build number happens
     # to be the patch number of the marketing version, move it one up.
-    if [[ -n "$PLAN_TARGET_PATCH" && "$BUILD_NUM" -eq "$PLAN_TARGET_PATCH" ]]; then
+    # Not in fixed mode:  the count is its own sequence and a bump here could
+    # push it past the three-digit cap checked above.
+    if [[ "$FIXED_MODE" -ne 1 && -n "$PLAN_TARGET_PATCH" && "$BUILD_NUM" -eq "$PLAN_TARGET_PATCH" ]]; then
       _bumped="$((BUILD_NUM + 1))"
       log "build: ${BUILD_NUM} equals the patch number; using ${_bumped} so the ship does not read ${MARKETING} (${BUILD_NUM})"
       BUILD_NUM="$_bumped"

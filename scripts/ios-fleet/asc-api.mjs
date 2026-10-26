@@ -1001,10 +1001,20 @@ async function main() {
       console.error(`released-store-version: app not found for bundle ${bundleId}`);
       process.exit(2);
     }
-    const storeRes = await ascGet(`/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}&limit=200`);
-    if (!storeRes.ok) {
-      console.error(`released-store-version: appStoreVersions query failed (HTTP ${storeRes.status})`);
-      failExit(storeRes.status);
+    const storeData = [];
+    let storeUrl = `/v1/apps/${appId}/appStoreVersions?filter[platform]=${encodeURIComponent(platform)}&limit=200`;
+    for (let page = 0; page < 10 && storeUrl; page += 1) {
+      const storeRes = await ascGet(storeUrl);
+      if (!storeRes.ok) {
+        console.error(`released-store-version: appStoreVersions query failed (HTTP ${storeRes.status})`);
+        failExit(storeRes.status);
+      }
+      storeData.push(...(storeRes.parsed.data || []));
+      storeUrl = storeRes.parsed.links?.next || "";
+    }
+    if (storeUrl) {
+      console.error("released-store-version: more than 10 pages of App Store versions; refusing to guess");
+      process.exit(2);
     }
     const RELEASED = new Set([
       "READY_FOR_SALE", "READY_FOR_DISTRIBUTION", "REPLACED_WITH_NEW_VERSION",
@@ -1021,13 +1031,13 @@ async function main() {
       return 0;
     };
     let best = "";
-    for (const v of storeRes.parsed.data || []) {
+    for (const v of storeData) {
       const a = v?.attributes || {};
       if (!a.versionString) continue;
       if (!RELEASED.has(a.appVersionState) && !RELEASED.has(a.appStoreState)) continue;
       if (!best || cmp(a.versionString, best) > 0) best = a.versionString;
     }
-    console.error(`released-store-version: ${(storeRes.parsed.data || []).length} App Store version(s) inspected on ${platform}; highest released = ${best || "none"}`);
+    console.error(`released-store-version: ${storeData.length} App Store version(s) inspected on ${platform}; highest released = ${best || "none"}`);
     console.log(best);
     process.exit(0);
   }

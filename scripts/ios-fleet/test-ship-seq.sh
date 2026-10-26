@@ -107,6 +107,7 @@ case "$cmd" in
     exit 0
     ;;
   asc-api:released-store-version)
+    [[ "${FAKE_RELEASED:-}" == "fail" ]] && exit 2
     printf '%s\n' "${FAKE_RELEASED:-}"
     exit 0
     ;;
@@ -541,6 +542,18 @@ FAKE_ASC_FLOOR=0; FAKE_RELEASED="1.0.235"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: a version below the released App Store version is refused, not bumped" \
   "$(contains 'at or below the released App Store version 1.0.235' && echo 0 || echo 1)"
+FAKE_RELEASED="fail"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: an unreadable released App Store version stops the run (fail closed)" \
+  "$(contains 'cannot read the released App Store version' && echo 0 || echo 1)"
+FAKE_RELEASED=""; FAKE_ASC_FLOOR=998
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "fixed: floor 998 plans 999 (got '${PLANNED_BUILD}')" "$([[ "$PLANNED_BUILD" == "999" ]] && echo 0 || echo 1)"
+sed -i 's/"buildCountSeed": "239"/"buildCountSeed": "000"/' "$FIXDIR/apps.json"
+FAKE_ASC_FLOOR=0
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a zero seed is refused" "$(contains 'must be 1-999 or auto' && echo 0 || echo 1)"
 SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_ASC_PATCH=236
 echo
 
