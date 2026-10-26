@@ -204,6 +204,14 @@ project_rel() { # <app key>
   esac
 }
 
+# The train prefix an app ships on, read from this repo's apps.json
+# (marketingVersionDefault, first two components).  Expectations below use it
+# so moving one app to a new train (Congress.Trade -> 1.1) does not need the
+# other apps' assertions to change.
+train_prefix() { # <app key>
+  awk -v k="\"$1\":" '$1==k{f=1} f&&/marketingVersionDefault/{gsub(/[",]/,"",$2); split($2,a,"."); print a[1]"."a[2]; exit}' "${SCRIPT_DIR}/apps.json"
+}
+
 write_record() { # <app key> <record N>
   local rel dir
   rel="$(project_rel "$1")" || return 1
@@ -258,7 +266,7 @@ check "the local counter is not advanced (it is not the build number now)" \
 check "the planned build number is the commit count" \
   "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
 check "an unverified patch plans the first patch of the train" \
-  "$(contains 'marketing=1.0.1 build=' && echo 0 || echo 1)"
+  "$(contains "marketing=$(train_prefix congress).1 build=" && echo 0 || echo 1)"
 check "says loudly that the patch was unverified" \
   "$(contains 'UNVERIFIED' && echo 0 || echo 1)"
 echo
@@ -316,17 +324,17 @@ for app in socratic congress usage usage-local; do
   bn="$PLANNED_BUILD"
 
   check "${app}: the marketing version is the next patch on the train (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
   check "${app}: the build number is the repo commit count (got '${bn}')" \
     "$([[ "$bn" == "$COMMIT_COUNT" ]] && echo 0 || echo 1)"
   check "${app}: the build number is not the patch number (no '1.0.N (N)')" \
     "$([[ "$bn" != "237" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   check "${app}: reports the App Store Connect rendering" \
     "$(contains "will show this as: ${mk} (${bn})" && echo 0 || echo 1)"
   check "${app}: prints the version plan line" \
-    "$(contains 'version plan: asc_patch=236 -> marketing=1.0.237' && echo 0 || echo 1)"
+    "$(contains "version plan: asc_patch=236 -> marketing=$(train_prefix "$app").237" && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -347,9 +355,9 @@ for app in socratic congress usage usage-local; do
   check "${app}: a floor above the commit count raises the build to floor + 1 (got '${bn}')" \
     "$([[ "$bn" == "$((FLOOR_HIGH + 1))" ]] && echo 0 || echo 1)"
   check "${app}: the floor does not move the marketing version (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -371,7 +379,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: the build is floored against the pinned train (got '${bn}')" \
     "$([[ "$bn" == "202610180037" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -390,7 +398,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: --build is honoured exactly (got '${bn}')" \
     "$([[ "$bn" == "999" ]] && echo 0 || echo 1)"
   check "${app}: --build does not move the marketing version (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -407,7 +415,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: says what could not be determined" \
     "$(contains 'cannot determine the next marketing version' && echo 0 || echo 1)"
   check "${app}: does not ship a version it could not verify" \
-    "$(contains 'marketing=1.0.' && echo 1 || echo 0)"
+    "$(contains "marketing=$(train_prefix "$app")." && echo 1 || echo 0)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -426,7 +434,7 @@ done
 check "three allowed runs leave the counter at 5 (got:${seen})" \
   "$([[ "$seen" == " 5 5 5" ]] && echo 0 || echo 1)"
 check "the run planned the next patch on the train" \
-  "$(contains 'marketing=1.0.237' && echo 0 || echo 1)"
+  "$(contains "marketing=$(train_prefix congress).237" && echo 0 || echo 1)"
 echo
 
 # --- 10. Standing 1-hour gate: just-under skips, at-or-over proceeds -------
