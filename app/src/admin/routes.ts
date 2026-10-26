@@ -118,7 +118,15 @@ import { buildPremiumRoster, localPremiumCounts } from './premiumRoster.ts';
 import { getLogoDisplay, setLogoDisplay } from '../shared/settings.ts';
 import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
-import { normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
+import { junkAssetNameReason, normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
+import { canonicalizeAmountBounds } from '../extraction/amounts.ts';
+import {
+  planCorrection,
+  REVIVE_COMPARED_COLUMNS_SQL,
+  reviveChangedIds,
+  type CorrectionPlan,
+  type PriorTxRow,
+} from './reviewCorrection.ts';
 import {
   MEMBER_FILER_MERGES,
   MEMBER_NAME_ALIASES,
@@ -1146,6 +1154,8 @@ export const ReviewEditItemSchema = z.object({
   description: z.string().nullable().optional(),
   supplementalText: z.string().nullable().optional(),
   confidence: z.number().nullable().optional(),
+  /** Republish only: the previously published (deprecated) transaction this row fixes. */
+  correctsTxId: z.string().min(1).max(64).nullable().optional(),
 });
 
 // Query params for POST /clean-asset-names.  Every field falls back to its
@@ -1160,6 +1170,7 @@ export const CleanAssetNamesQuerySchema = z.object({
 });
 
 interface EditedTx {
+  correctsTxId?: string | null;
   filerId?: string | null;
   txDate?: string | null;
   owner?: string | null;
@@ -1195,6 +1206,22 @@ type ValidatedEditedTx = EditedTx & {
    */
   rowKeyAssetName: string;
 };
+
+/** Counts (and capped id lists) describing one republish (all zero on a first publish). */
+function correctionSummary(plan: Extract<CorrectionPlan, { ok: true }>) {
+  const count = (kind: string) => plan.matches.filter((m) => m.kind === kind).length;
+  return {
+    revived: plan.matches.length,
+    unchanged: count('unchanged'),
+    unchangedOlderCycle: count('unchanged_older_cycle'),
+    corrected: count('corrected'),
+    explicit: count('explicit'),
+    added: plan.added.length,
+    retired: plan.retired.length,
+    correctedTxIds: plan.matches.filter((m) => m.kind === 'corrected' || m.kind === 'explicit').map((m) => m.txId).slice(0, 200),
+    retiredTxIds: plan.retired.slice(0, 200),
+  };
+}
 
 function validateReviewEdits(
   rawEdits: unknown[],
@@ -1248,6 +1275,12 @@ function validateReviewEdits(
     if (assetName.length > 500) {
       return { error: `edits[${index}].assetName must be at most 500 characters` };
     }
+    // A submitted name must be real text: a blank-with-ticker row is fine
+    // (ticker carries it), but leading junk glyphs ("••• APPLE", a stray
+    // quote) are OCR residue and are a 400, never a published name.
+    if (assetName && junkAssetNameReason(assetName) === 'junk_leading_glyph') {
+      return { error: `edits[${index}].assetName starts with junk characters ('${assetName.slice(0, 12)}'); fix the name and retry` };
+    }
     // Confident OCR fixes apply silently with an audit note; unfixable garble
     // is a 400 naming the row, never a saved wrong name.
     let finalAssetName = assetName;
@@ -1273,7 +1306,18 @@ function validateReviewEdits(
     if (e.amountMax != null && (typeof e.amountMax !== 'number' || !Number.isFinite(e.amountMax))) {
       return { error: `edits[${index}].amountMax must be a number or null` };
     }
-    if (!amountOmitted && !isValidBracket(e.amountMin as number, e.amountMax ?? null)) {
+    // "$1,000 - $15,000" is the $1,001 bracket read without its trailing 1;
+    // store the canonical bounds instead of rejecting or publishing 1,000.
+    let amountMin = e.amountMin ?? null;
+    let amountMax = e.amountMax ?? null;
+    if (!amountOmitted) {
+      const canonical = canonicalizeAmountBounds(amountMin, amountMax);
+      if (canonical?.changed) {
+        amountMin = canonical.min;
+        amountMax = canonical.max;
+      }
+    }
+    if (!amountOmitted && !isValidBracket(amountMin as number, amountMax)) {
       return { error: `edits[${index}] amount must be a canonical STOCK Act bracket` };
     }
     if (e.confidence != null && (
@@ -1289,6 +1333,8 @@ function validateReviewEdits(
     }
     edits.push({
       ...e,
+      amountMin,
+      amountMax,
       ticker: ticker || null,
       assetName: finalAssetName,
       rowKeyAssetName: assetName,
@@ -3142,12 +3188,33 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
+    // Republish never re-sends (default, no opt-out; see
+    // admin/reviewCorrection.ts): rows matching a previously published trade
+    // of this doc are revived in place (same id, cursor_seq and created_at)
+    // and never re-enter the delivery outbox.  Only unmatched rows insert and
+    // deliver.  A first publish has no prior rows, so every row is new.
+    const reviveByEdit = new Map<number, string>();
+    const prior = await all<PriorTxRow & Record<string, string | number | null>>(
+      c.env.DB,
+      `SELECT id, deprecated_at, ${REVIVE_COMPARED_COLUMNS_SQL}
+         FROM transactions
+        WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
+          AND deprecated_at IS NOT NULL`,
+      [docId],
+    );
+    const plan = planCorrection(edits, prior);
+    if (plan.ok === false) return c.json({ error: plan.error }, 400);
+    const correctionPlan = plan;
+    for (const m of plan.matches) reviveByEdit.set(m.editIndex, m.txId);
+
     const nowIso = new Date().toISOString();
     const insertRows: Array<Record<string, string | number | null>> = [];
+    const reviveRows: Array<Record<string, string | number | null>> = [];
     const rowKeys: string[] = [];
     const proposedIds: string[] = [];
     for (const [rowIndex, e] of edits.entries()) {
-      const id = uuid();
+      const reviveId = reviveByEdit.get(rowIndex);
+      const id = reviveId ?? uuid();
       const assetTypeName = reviewAssetTypeName(e);
       const rowKey = transactionRowKey(source, rowIndex, {
         txDate: e.txDate,
@@ -3171,8 +3238,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         supplementalText: e.supplementalText ?? null,
       });
       rowKeys.push(rowKey);
-      proposedIds.push(id);
-      insertRows.push({
+      if (!reviveId) proposedIds.push(id);
+      (reviveId ? reviveRows : insertRows).push({
         id,
         docId,
         filerId: e.filerId ?? filingFilerId,
@@ -3206,12 +3273,95 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
     const rowKeysJson = JSON.stringify(rowKeys);
     const insertRowsJson = JSON.stringify(insertRows);
+    const revivedIds = reviveRows.map((row) => String(row.id));
+    const revivedIdsJson = JSON.stringify(revivedIds);
     const completeLiveSet = `(SELECT COUNT(*) FROM transactions
       WHERE doc_id = ? AND source = ? AND deprecated_at IS NULL
         AND row_key IN (SELECT value FROM json_each(?))) = ?
       AND (SELECT COUNT(*) FROM transactions
         WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
           AND deprecated_at IS NULL) = ?`;
+    // Revive statements (republish of previously published rows).  Placed
+    // after the INSERT so persistResults[0] stays the insert count; the
+    // integrity check below runs after both and rolls the whole batch back if
+    // either fell short.
+    //
+    // Cursor: a revived row whose stored fields actually change (a corrected
+    // date or amount, a cleaned name) takes a NEW cursor_seq so cursor pollers
+    // (GET /api/transactions?since=, SSE catch-up) re-read the fix under the
+    // same id.  A byte-identical revive keeps its cursor.  Neither gets a
+    // delivery_outbox row, and created_at is untouched, so no webhook or APNs
+    // alert fires.  Step 1 allocates the new sequence values (the same
+    // tx_cursor_seq table the insert trigger uses); step 2 adopts them.
+    const reviveRowsSql = `(SELECT json_extract(value, '$.id') AS id,
+                      json_extract(value, '$.filerId') AS filer_id,
+                      json_extract(value, '$.txDate') AS tx_date,
+                      json_extract(value, '$.owner') AS owner,
+                      json_extract(value, '$.assetName') AS asset_name,
+                      json_extract(value, '$.ticker') AS ticker,
+                      json_extract(value, '$.assetType') AS asset_type,
+                      json_extract(value, '$.txType') AS tx_type,
+                      json_extract(value, '$.amountMin') AS amount_min,
+                      json_extract(value, '$.amountMax') AS amount_max,
+                      json_extract(value, '$.isOption') AS is_option,
+                      json_extract(value, '$.capGainsOver200') AS cap_gains_over_200,
+                      json_extract(value, '$.rawText') AS raw_text,
+                      json_extract(value, '$.assetTypeName') AS asset_type_name,
+                      json_extract(value, '$.filingStatus') AS filing_status,
+                      json_extract(value, '$.subholding') AS subholding,
+                      json_extract(value, '$.location') AS location,
+                      json_extract(value, '$.description') AS description,
+                      json_extract(value, '$.supplementalText') AS supplemental_text,
+                      json_extract(value, '$.rowKey') AS row_key,
+                      json_extract(value, '$.confidence') AS confidence,
+                      json_extract(value, '$.source') AS source,
+                      json_extract(value, '$.filedDate') AS filed_date,
+                      json_extract(value, '$.estValue') AS est_value,
+                      json_extract(value, '$.cleaningNote') AS cleaning_note
+                 FROM json_each(?))`;
+    const reviveGate = `transactions.doc_id = ?
+          AND transactions.deprecated_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM review_queue
+             WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
+          )`;
+    const reviveRowsJson = JSON.stringify(reviveRows);
+    const changedReviveIds = reviveChangedIds(new Map(prior.map((row) => [row.id, row])), reviveRows);
+    const changedReviveIdsJson = changedReviveIds.length === 0 ? null : JSON.stringify(changedReviveIds);
+    const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [
+      // Only the rows whose stored fields change (diffed in JS against the
+      // prior SELECT) are bound here, as an id list, so the batch never
+      // carries the revive payload twice.
+      ...(changedReviveIdsJson === null ? [] : [[
+        `INSERT INTO tx_cursor_seq (tx_id)
+           SELECT transactions.id FROM transactions
+            WHERE transactions.id IN (SELECT value FROM json_each(?))
+              AND ${reviveGate}
+            ORDER BY transactions.cursor_seq ASC, transactions.id ASC`,
+        [changedReviveIdsJson, docId, docId, reviewRevision],
+      ] as [string, SqlParam[]]]),
+      [
+        `UPDATE transactions
+            SET filer_id = j.filer_id, tx_date = j.tx_date, owner = j.owner,
+                asset_name = j.asset_name, ticker = j.ticker, asset_type = j.asset_type,
+                tx_type = j.tx_type, amount_min = j.amount_min, amount_max = j.amount_max,
+                is_option = j.is_option, cap_gains_over_200 = j.cap_gains_over_200,
+                raw_text = j.raw_text, asset_type_name = j.asset_type_name,
+                filing_status = j.filing_status, subholding = j.subholding,
+                location = j.location, description = j.description,
+                supplemental_text = j.supplemental_text, row_key = j.row_key,
+                confidence = j.confidence, source = j.source, filed_date = j.filed_date,
+                est_value = j.est_value, cleaning_note = j.cleaning_note,
+                disclosure_lag_days = NULL, stock_act_status = NULL,
+                deprecated_at = NULL, deprecated_reason = NULL,
+                cursor_seq = MAX(COALESCE(transactions.cursor_seq, 0), COALESCE(
+                  (SELECT MAX(s.seq) FROM tx_cursor_seq s WHERE s.tx_id = transactions.id), 0))
+           FROM ${reviveRowsSql} AS j
+          WHERE transactions.id = j.id
+            AND ${reviveGate}`,
+        [reviveRowsJson, docId, docId, reviewRevision],
+      ],
+    ];
     let persistResults: D1Result[];
     try {
       persistResults = await batch(c.env.DB, [
@@ -3247,6 +3397,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
            )`,
           [insertRowsJson, docId, reviewRevision],
         ],
+        ...reviveStatements,
         // Force a primary-key error when the post-insert live set is not exact.
         // D1 then rolls back the whole batch; a zero-change final UPDATE alone
         // would still commit preceding inserts.
@@ -3270,11 +3421,12 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
             SELECT id, 'pending', 0, ?, NULL, ?, ? FROM transactions
              WHERE doc_id = ? AND source = ? AND deprecated_at IS NULL
                AND row_key IN (SELECT value FROM json_each(?))
+               AND id NOT IN (SELECT value FROM json_each(?))
                AND EXISTS (
                  SELECT 1 FROM review_queue
                   WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
                )`,
-          [nowIso, nowIso, nowIso, docId, source, rowKeysJson, docId, reviewRevision],
+          [nowIso, nowIso, nowIso, docId, source, rowKeysJson, revivedIdsJson, docId, reviewRevision],
         ],
         [
           `UPDATE filings SET ingest_status = ?
@@ -3335,13 +3487,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
     // Best-effort immediate flush; the independent delivery-outbox cron owns
     // durable recovery for any enqueue failure or rows beyond this pass.
-    const delivery = await flushDeliveryOutbox(c.env, {
-      txIds: transactionIds,
-      limit: Math.max(transactionIds.length, 1),
-    }).catch((err) => {
-      console.warn('review confirm: delivery outbox flush failed', docId, (err as Error).message);
-      return null;
-    });
+    // Revived rows were never re-enqueued, so only new ids flush.  An empty
+    // id list must skip the flush: flushDeliveryOutbox drops its tx_id filter
+    // when handed no ids and would claim unrelated filings' pending rows.
+    const revivedSet = new Set(revivedIds);
+    const deliveryIds = transactionIds.filter((id) => !revivedSet.has(id));
+    const delivery = deliveryIds.length === 0
+      ? null
+      : await flushDeliveryOutbox(c.env, {
+        txIds: deliveryIds,
+        limit: deliveryIds.length,
+      }).catch((err) => {
+        console.warn('review confirm: delivery outbox flush failed', docId, (err as Error).message);
+        return null;
+      });
 
     let deprecatedPredecessors = 0;
     const isAmendment = /amend|\(2\)|278t\(\d+\)/i.test(docId) || (filing.filing_status && /amend/i.test(filing.filing_status));
@@ -3371,6 +3530,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           ocrNormalized: edits.filter((e) => e.cleaningNote).length,
           acknowledgedStaleTxDate: acknowledgeStaleTxDate,
           reviewCreatedAt: review.created_at,
+          republish: correctionSummary(correctionPlan),
         },
         createdAt: nowIso,
       });
@@ -3386,6 +3546,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       inserted: insertedCount,
       transactionIds,
       delivery,
+      republish: correctionSummary(correctionPlan),
     });
   });
 
