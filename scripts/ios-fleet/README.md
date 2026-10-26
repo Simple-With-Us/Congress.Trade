@@ -118,7 +118,7 @@ limit / same-HEAD) is evaluated **before** any App Store Connect query, and
 
 ### Changing the train needs a dispatch
 
-`ios-ship.yml` runs on a push only when `clients/ios/**` or the workflow file changes.  A change that touches only release config (for example `marketingVersionDefault` in `apps.json`, which every app shares, or the ship scripts) does not start a ship, and the cron backstop only ships when `clients/ios/**` changed since the last recorded ship.  This is deliberate: a path trigger on shared config or tooling would ship a TestFlight build on unrelated edits.  After a train change merges, ship it on purpose with **Run workflow** (`workflow_dispatch`) on `main`, then confirm `marketing=<train>.N build=<n>` in the "version plan" log line.  Congress.Trade moved to the `1.1` train this way (first ship 1.1.1, build 2382).
+`ios-ship.yml` runs on a push only when `clients/ios/**` or the workflow file changes.  A change that touches only release config (for example `marketingVersionDefault` in `apps.json`, which every app shares, or the ship scripts) does not start a ship, and the cron backstop only ships when `clients/ios/**` changed since the last recorded ship.  This is deliberate: a path trigger on shared config or tooling would ship a TestFlight build on unrelated edits.  After a train change merges, ship it on purpose with **Run workflow** (`workflow_dispatch`) on `main`, then confirm `marketing=<train>.N build=<n>` in the "version plan" log line.  A train move ships only when someone dispatches the workflow; do not rely on the merge.
 
 ## Rate limit — what holds back automatic shipping
 
