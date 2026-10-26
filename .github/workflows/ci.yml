@@ -368,6 +368,7 @@ jobs:
           node --check scripts/ios-fleet/asc-api.mjs
           node --check scripts/ios-fleet/asc-key.mjs
           node --check scripts/ios-fleet/version-plan.mjs
+          node --check scripts/ios-fleet/release-platform-plan.mjs
           node --check scripts/ios-fleet/test-asc-key.test.mjs
 
       - name: Fleet version publish guard
@@ -375,6 +376,18 @@ jobs:
 
       - name: Fleet version numbering (offline)
         run: node --test scripts/ios-fleet/version-plan.test.mjs
+
+      - name: Fleet cross-platform release plan (offline)
+        run: node --test scripts/ios-fleet/release-platform-plan.test.mjs
+
+      - name: Fleet cross-platform ship integration (offline)
+        run: bash scripts/ios-fleet/test-release-platforms.sh
+
+      - name: Checked-in fleet release policy (offline)
+        run: |
+          node --check scripts/ios-fleet/check-version-policy.mjs
+          node --test scripts/ios-fleet/check-version-policy.test.mjs
+          node scripts/ios-fleet/check-version-policy.mjs
 
       - name: AppUpdatePrompt pin copy
         run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs
