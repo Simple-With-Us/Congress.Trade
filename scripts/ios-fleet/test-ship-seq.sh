@@ -554,6 +554,9 @@ sed -i 's/"buildCountSeed": "239"/"buildCountSeed": "000"/' "$FIXDIR/apps.json"
 FAKE_ASC_FLOOR=0
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: a zero seed is refused" "$(contains 'must be 1-999 or auto' && echo 0 || echo 1)"
+sed -i 's/"buildCountSeed": "000"/"buildCountSeed": "abc"/' "$FIXDIR/apps.json"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a non-numeric seed gets the friendly error, not an arithmetic crash" "$(contains 'must be 1-999 or auto' && echo 0 || echo 1)"
 SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_ASC_PATCH=236
 echo
 

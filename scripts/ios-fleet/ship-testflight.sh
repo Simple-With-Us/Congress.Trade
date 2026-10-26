@@ -1120,7 +1120,8 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
           [[ "$_seed" =~ ^[0-9]+$ ]] || die "buildCountSeed is auto but the latest shipped patch could not be read from App Store Connect.  Nothing was guessed."
           [[ "$_seed" -ge 1 ]] || _seed=1
         fi
-        [[ "$_seed" =~ ^[0-9]{1,3}$ && "$((10#$_seed))" -ge 1 ]] || die "buildCountSeed for ${APP_KEY} must be 1-999 or auto (got '${_seed}')"
+        [[ "$_seed" =~ ^[0-9]{1,3}$ ]] || die "buildCountSeed for ${APP_KEY} must be 1-999 or auto (got '${_seed}')"
+        [[ "$((10#$_seed))" -ge 1 ]] || die "buildCountSeed for ${APP_KEY} must be 1-999 or auto (got '${_seed}')"
         BUILD_NUM="$_seed"
       fi
       if [[ "$BUILD_NUM" -gt 999 ]]; then
