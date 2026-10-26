@@ -208,8 +208,11 @@ async function post(d1: unknown, body: Record<string, unknown>) {
   return { status: res.status, body: ReviewResponse.parse(await res.json()) };
 }
 
+/** Undelivered trade.new outbox rows (an Unpublish also enqueues trade.retract events). */
 function undeliveredCount(db: SqliteDatabase): number {
-  return (db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed'").get() as { n: number }).n;
+  return (db.prepare(
+    "SELECT COUNT(*) AS n FROM delivery_outbox WHERE status <> 'completed' AND event_kind = 'trade.new'",
+  ).get() as { n: number }).n;
 }
 
 const EDITS = [
@@ -265,7 +268,7 @@ describe('POST /review/:docId — republish never re-sends', () => {
     expect(review).toMatchObject({ resolved: 1, resolution_reason: 'admin_manual' });
   });
 
-  it('Unpublish then an identical republish keeps every cursor; a date fix bumps only that row', async () => {
+  it('Unpublish then republish: retracted rows take new cursors, never-retracted identical rows keep theirs', async () => {
     const { db, d1 } = await seededDb();
     db.prepare('DELETE FROM delivery_outbox').run();
     db.prepare('DELETE FROM transactions WHERE doc_id = ?').run(DOC);
@@ -283,26 +286,41 @@ describe('POST /review/:docId — republish never re-sends', () => {
     const first = cursors();
     expect(first.size).toBe(3);
 
+    // The Unpublish emitted a trade.retract for every row, so pollers may have
+    // dropped them: each identical revive takes a new cursor so they re-add it.
     await unpublish();
+    expect((db.prepare("SELECT COUNT(*) AS n FROM delivery_outbox WHERE event_kind = 'trade.retract'").get() as { n: number }).n).toBe(3);
     const same = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
     expect(same.status).toBe(200);
     expect(same.body.republish).toMatchObject({ revived: 3, unchanged: 3, added: 0 });
-    expect(cursors()).toEqual(first);
+    const second = cursors();
+    expect([...second.keys()].sort()).toEqual([...first.keys()].sort());
+    expect(Math.min(...second.values())).toBeGreaterThan(Math.max(...first.values()));
+    expect(db.prepare('SELECT COUNT(*) AS n FROM tx_retractions WHERE revived_at IS NULL').get()).toEqual({ n: 0 });
+    // Still no alert: no trade.new outbox row for any revived row.
     expect(undeliveredCount(db)).toBe(0);
 
+    // Rows deprecated before retractions existed were never exposed as
+    // retracted: an identical revive keeps the cursor, a date fix bumps only
+    // the corrected row.
     await unpublish();
+    db.prepare('DELETE FROM tx_retractions').run();
+    const keep = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: EDITS });
+    expect(keep.status).toBe(200);
+    expect(cursors()).toEqual(second);
+
+    await unpublish();
+    db.prepare('DELETE FROM tx_retractions').run();
     const fixed = EDITS.map((e, i) => (i === 1 ? { ...e, txDate: '2026-07-30' } : e));
     const corrected = await post(d1, { decision: 'manual', reviewRevision: revision(), edits: fixed });
     expect(corrected.status).toBe(200);
     expect(corrected.body.republish).toMatchObject({ revived: 3, unchanged: 2, corrected: 1, added: 0 });
     const after = cursors();
-    expect([...after.keys()].sort()).toEqual([...first.keys()].sort());
     const badgerId = live(db).find((r) => r.asset_name === 'BADGER METER INC')!.id as string;
     for (const [id, seq] of after) {
-      if (id === badgerId) expect(seq).toBeGreaterThan(Math.max(...first.values()));
-      else expect(seq).toBe(first.get(id));
+      if (id === badgerId) expect(seq).toBeGreaterThan(Math.max(...second.values()));
+      else expect(seq).toBe(second.get(id));
     }
-    // Still no alert: nothing re-entered the outbox.
     expect(undeliveredCount(db)).toBe(0);
   });
 

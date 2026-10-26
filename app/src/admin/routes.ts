@@ -3170,6 +3170,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // delivery_outbox row, and created_at is untouched, so no webhook or APNs
     // alert fires.  Step 1 allocates the new sequence values (the same
     // tx_cursor_seq table the insert trigger uses); step 2 adopts them.
+    // A row that was exposed as retracted (an open tx_retractions row, i.e.
+    // a trade.retract went out at Unpublish) also takes a new cursor even
+    // when byte-identical: trg_transactions_unretract (migration 0108) does
+    // that on the same UPDATE and closes the retraction.
     const reviveRowsSql = `(SELECT json_extract(value, '$.id') AS id,
                       json_extract(value, '$.filerId') AS filer_id,
                       json_extract(value, '$.txDate') AS tx_date,

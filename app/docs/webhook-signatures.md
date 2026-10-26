@@ -9,7 +9,7 @@ Two signature headers are sent. **Verify `X-CT-Signature`.**
 ```
 X-CT-Signature: t=1785600000,v1=6b1f…c4
 X-Signature:    sha256=9ad2…7e      <- legacy, deprecated
-X-CT-Event:     transaction.created
+X-CT-Event:     transaction.created   (transaction.retracted for trade.retract)
 X-Tx-Id:        <transaction id>
 X-Subscription-Id: <subscription id>
 X-Delivery-Attempt: <n>

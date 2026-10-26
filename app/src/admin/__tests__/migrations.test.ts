@@ -78,6 +78,7 @@ import {
   FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
   FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
   FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
+  TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { buildAdminMigrateStatements } from '../migrateStatements.ts';
 import { applyGuardedAppleSubscriptionsNullableUserMigration } from '../schemaMigrationRunner.ts';
@@ -317,6 +318,7 @@ describe('admin migration bootstrap', () => {
       ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
       ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
       ...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
+      ...TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
     ]);
   });
 

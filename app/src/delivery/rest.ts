@@ -86,6 +86,7 @@ import {
   webhookTargetLengthError,
 } from './subscriptions.ts';
 import { openSseStream } from './sse.ts';
+import { listRetractions, RETRACTIONS_DEFAULT_LIMIT } from './retractions.ts';
 import { handleTickerLogoRequest } from '../ui/tickerLogos.ts';
 import { readLogoPolicyOverlay } from '../ui/tickerLogoPolicy.ts';
 import { handleMemberPhotoRequest } from '../enrichment/memberPhotoPack.ts';
@@ -156,6 +157,7 @@ const PUBLIC_STABLE_CACHE = 'public, s-maxage=300, stale-while-revalidate=600';
  */
 function isPublicReadPath(path: string): boolean {
   return path === '/transactions'
+    || path === '/transactions/retractions'
     || path === '/members'
     || path === '/health'
     || path === '/feed.xml'
@@ -616,6 +618,37 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     return c.json(check, check.ok ? 200 : 503);
   });
 
+  // --- GET /transactions/retractions --------------------------------------
+  // trade.retract poll feed (retractions.ts): transactions taken off the feed
+  // (unpublish, reject, republish retirement, amendment supersede).  Same
+  // access as /transactions: public, CORS-readable, same daily row budget.
+  // Keyset on the retraction cursor: pass the returned `cursor` back as
+  // `since`.  A retraction whose row was later revived is omitted; the row
+  // comes back through /transactions with a new cursorSeq.
+  r.get('/transactions/retractions', async (c) => {
+    const q = c.req.query();
+    const since = parseIntOrUndef(q.since) ?? 0;
+    const limit = parseIntOrUndef(q.limit) ?? RETRACTIONS_DEFAULT_LIMIT;
+    if (since < 0 || limit < 1) return c.json({ error: 'since must be >= 0 and limit >= 1' }, 400);
+    const ip = clientIp(c.req.raw);
+    const budget = await checkRowBudget(c.env, ip);
+    if (!budget.ok) {
+      return c.json(
+        { error: 'daily feed row budget reached' },
+        429,
+        { 'Retry-After': String(budget.retryAfterSec) },
+      );
+    }
+    const page = await listRetractions(c.env, since, limit);
+    await spendRowBudget(c.env, ip, page.retractions.length);
+    c.header('Cache-Control', 'no-store');
+    return c.json({
+      retractions: page.retractions,
+      cursor: page.cursor,
+      hasMore: page.hasMore,
+    });
+  });
+
   // --- GET /transactions --------------------------------------------------
   // Reconciliation backstop: rows with cursor_seq > since, ASC, plus the max
   // cursor in the page so clients can poll forward deterministically.
@@ -941,7 +974,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     }
     const since = resolveResumeCursor(c.req.query('since'), c.req.header('Last-Event-ID'));
     const token = subscriptionSecretFromRequest(c, true) ?? undefined;
-    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw));
+    const retractSince = parseIntOrUndef(c.req.query('retractSince'));
+    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw), {}, retractSince);
   });
 
   // --- GET /logos/ticker --------------------------------------------------
