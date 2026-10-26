@@ -1016,13 +1016,17 @@ async function main() {
       console.error("released-store-version: more than 10 pages of App Store versions; refusing to guess");
       process.exit(2);
     }
+    // AppStoreVersionState enum:  every state must land in one set, or the
+    // run refuses to guess (exit 3 below) rather than misread the floor.
     const RELEASED = new Set([
       "READY_FOR_SALE", "READY_FOR_DISTRIBUTION", "REPLACED_WITH_NEW_VERSION",
-      "REMOVED_FROM_SALE", "PENDING_DEVELOPER_RELEASE", "PENDING_APPLE_RELEASE",
+      "REMOVED_FROM_SALE", "DEVELOPER_REMOVED_FROM_SALE", "PREORDER_READY_FOR_SALE",
+      "PENDING_DEVELOPER_RELEASE", "PENDING_APPLE_RELEASE", "ACCEPTED",
       "PROCESSING_FOR_DISTRIBUTION", "PROCESSING_FOR_APP_STORE"
     ]);
     const NOT_RELEASED = new Set([
       "PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW",
+      "WAITING_FOR_EXPORT_COMPLIANCE", "PENDING_CONTRACT",
       "UNRESOLVED_ISSUES", "REJECTED", "METADATA_REJECTED", "DEVELOPER_REJECTED", "INVALID_BINARY"
     ]);
     const parse = (v) => String(v).split(".").map((n) => parseInt(n, 10) || 0);
