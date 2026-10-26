@@ -92,8 +92,12 @@ const TABLE_HEADER_RE = /#\s*[\.,:;]?\s*DESCRIPTION\s+TYPE\s+DATE\s+NOTIFICATION
 // anchor (e.g. scanning without TABLE_HEADER_RE found) fails fast instead of
 // swallowing hundreds of characters of prose to reach a later real row.
 const OCR_AMOUNT = `(?:${OCR_AMOUNT_TOKEN_SRC})`;
+// Capture groups: 1 description, 2 type word, 3 date, 4 notification
+// flag, 5 amount.  The notification flag is captured (not just consumed) so
+// the local-OCR reader keeps it alongside the row for the park payload —
+// the two reads reconcile on type, date and amount only, see ogeLocalOcr.ts.
 const ROW_RE = new RegExp(
-  String.raw`(?<![\d,.])\d{1,5}[\.,:;]?\s+(.{1,200}?)\s+(Purchase|Sale|Exchange)\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(?:Yes|No)\s+(\$` +
+  String.raw`(?<![\d,.])\d{1,5}[\.,:;]?\s+(.{1,200}?)\s+(Purchase|Sale|Exchange)\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(Yes|No)\s+(\$` +
     OCR_AMOUNT +
     String.raw`(?:\s*(?:-|–|—|−|•|·|to|\.(?=\s*\$))\s*\$?` +
     OCR_AMOUNT +
@@ -498,7 +502,50 @@ interface OgeTextScan {
   has278tTable: boolean;
 }
 
-function scanOgeTransactionRows(text: string): OgeTextScan {
+/**
+ * One matched 278-T row, with the raw fields kept alongside the parsed
+ * transaction.  The local-OCR reader (ogeLocalOcr.ts) needs the raw type
+ * word, date and amount text so it can compare two independent reads of the
+ * same page and keep only the rows where all three agree.  The notification
+ * flag rides along for the park payload; it is not part of the comparison.
+ */
+export interface OgeScannedRow {
+  /** The "#" column value, or null when the row's leading index was not captured. */
+  index: number | null;
+  /** The parsed transaction. */
+  tx: ParsedTx;
+  /** The type word as it appeared (Purchase / Sale / Exchange). */
+  typeWord: string;
+  /** The date as it appeared (M/D/YYYY). */
+  dateRaw: string;
+  /** The notification flag as it appeared (Yes / No). */
+  notification: string | null;
+  /** The amount text as it appeared. */
+  amountRaw: string;
+  /** The full matched source text. */
+  rawText: string;
+}
+
+/** Result of scanning one blob of 278-T text for table rows. */
+export interface OgeRowScan {
+  rows: OgeScannedRow[];
+  /** The leading "#" token of every matched row, in match order. */
+  rowIndexes: number[];
+  /** True when the matched "#" tokens are not a plausible table index. */
+  refused: boolean;
+  /** True when the 278-T transactions table header is present. */
+  has278tTable: boolean;
+}
+
+/**
+ * Scan text for 278-T table rows and keep the raw fields.
+ *
+ * Unlike the internal classifier this never refuses: the caller decides what
+ * an incoherent index means.  The local-OCR reader needs the per-row detail
+ * even when one page of a scan lost a row, so it can report which rows did
+ * not reconcile instead of losing the whole page.
+ */
+export function scanOgeRows(text: string): OgeRowScan {
   // Fold NUL bytes, non-breaking spaces, and every run of whitespace
   // (including real newlines, when the runtime's pdf.js DOES emit them) down
   // to single spaces, so the same global scan below is correct regardless of
@@ -519,21 +566,22 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
     ? normalized.slice(headerMatch.index + headerMatch[0].length)
     : normalized;
 
-  const rows: ParsedTx[] = [];
+  const rows: OgeScannedRow[] = [];
   const rowIndexes: number[] = [];
   ROW_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = ROW_RE.exec(searchText)) !== null) {
-    const amountSpan = amountPrefixLength(m[4]);
-    if (amountSpan < m[4].length) {
-      const extra = m[4].length - amountSpan;
+    const amountSpan = amountPrefixLength(m[5]);
+    if (amountSpan < m[5].length) {
+      const extra = m[5].length - amountSpan;
       m[0] = m[0].slice(0, m[0].length - extra);
-      m[4] = m[4].slice(0, amountSpan);
+      m[5] = m[5].slice(0, amountSpan);
       ROW_RE.lastIndex -= extra;
     }
-    const [matchText, descriptionRaw, typeWord, dateRaw, amountRaw] = m;
+    const [matchText, descriptionRaw, typeWord, dateRaw, notification, amountRaw] = m;
     const indexMatch = /^(\d{1,5})/.exec(matchText);
-    if (indexMatch) rowIndexes.push(Number(indexMatch[1]));
+    const index = indexMatch ? Number(indexMatch[1]) : null;
+    if (index !== null) rowIndexes.push(index);
     const description = descriptionRaw.trim();
     const tickerMatch = TICKER_SUFFIX_RE.exec(description);
     const ticker = tickerMatch ? normalizeTicker(tickerMatch[1]) : null;
@@ -550,33 +598,56 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
     const confidence = hasDate && hasAmount ? COMPLETE_ROW_CONFIDENCE : INCOMPLETE_ROW_CONFIDENCE;
 
     rows.push({
-      txDate: hasDate ? txDate : null,
-      owner: null, // 278-T has no per-row owner column (unlike House SP/DC/JT codes)
-      assetName,
-      ticker,
-      assetType: null,
-      assetTypeName: null,
-      txType,
-      amountMin: min,
-      amountMax: max,
-      isOption: detectOption(matchText),
-      capGainsOver200: false,
+      index,
+      typeWord,
+      dateRaw,
+      notification: notification ?? null,
+      amountRaw,
       rawText: matchText.trim(),
-      confidence,
+      tx: {
+        txDate: hasDate ? txDate : null,
+        owner: null, // 278-T has no per-row owner column (unlike House SP/DC/JT codes)
+        assetName,
+        ticker,
+        assetType: null,
+        assetTypeName: null,
+        txType,
+        amountMin: min,
+        amountMax: max,
+        isOption: detectOption(matchText),
+        capGainsOver200: false,
+        rawText: matchText.trim(),
+        confidence,
+      },
     });
     // Avoid an infinite loop on a zero-length match (shouldn't happen given
     // ROW_RE always consumes at least the row-number + suffix, but a global
     // regex with a zero-width overall match would otherwise stall exec()).
     if (m.index === ROW_RE.lastIndex) ROW_RE.lastIndex += 1;
   }
+  return {
+    rows,
+    rowIndexes,
+    refused: !isOgeRowSequenceCoherent(rowIndexes),
+    has278tTable: Boolean(headerMatch),
+  };
+}
+
+function scanOgeTransactionRows(text: string): OgeTextScan {
+  const scanned = scanOgeRows(text);
   // Refuse a garbled-OCR parse: if the matched "#" tokens are not a plausible
   // unique/increasing table index, ROW_RE was latching onto years/amounts and
   // the rows are mis-merged guesses.  Callers must keep this distinct from
   // a section that simply had no rows.
-  if (!isOgeRowSequenceCoherent(rowIndexes)) {
-    return { rows: [], rowIndexes, refused: true, has278tTable: Boolean(headerMatch) };
+  if (scanned.refused) {
+    return { rows: [], rowIndexes: scanned.rowIndexes, refused: true, has278tTable: scanned.has278tTable };
   }
-  return { rows, rowIndexes, refused: false, has278tTable: Boolean(headerMatch) };
+  return {
+    rows: scanned.rows.map((r) => r.tx),
+    rowIndexes: scanned.rowIndexes,
+    refused: false,
+    has278tTable: scanned.has278tTable,
+  };
 }
 
 /** Text-layer classification for one stored executive PDF. */

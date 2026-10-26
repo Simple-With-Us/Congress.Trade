@@ -393,6 +393,12 @@ export async function normalize(
     sourceText?: string | null;
     /** Set by ogeText.  `empty` and `unreadable` are different zero-row outcomes. */
     parseDisposition?: ExtractorParseDisposition;
+    /**
+     * Extra JSON for the review_queue payload when this filing parks.
+     * Used by the local OGE OCR pass to record which rows did not reconcile
+     * (CT-2448) so the parked filing shows what the scan did and did not yield.
+     */
+    reviewPayload?: Record<string, unknown> | null;
   },
 ): Promise<NormalizeResult> {
   const nowIso = new Date().toISOString();
@@ -597,6 +603,9 @@ export async function normalize(
         // Close only the review version we read: a human revision that lands
         // after the snapshot must win over this stale zero-row parse.
         reviewRevision: reviewSnapshot?.review_revision ?? null,
+        // CT-2448: carry the local OCR attempt (and the rows it could not
+        // reconcile) into the parked payload so a human sees what was tried.
+        payload: meta?.reviewPayload ?? null,
       });
       if (closed) {
         return {
@@ -1829,8 +1838,18 @@ async function routeToReview(
   // them. Leave the row untouched instead.
   if (flagged.length === 0 && review && review.resolved !== 1) {
     try {
-      const staged = JSON.parse(review.payload ?? '{}') as { transactionCount?: unknown };
-      if (typeof staged.transactionCount === 'number' && staged.transactionCount > 0) {
+      const staged = JSON.parse(review.payload ?? '{}') as {
+        transactionCount?: unknown;
+        localOcr?: unknown;
+      };
+      // A payload with a localOcr section records a local OCR attempt and the
+      // rows it could not reconcile (CT-2448).  Preserve it for the same
+      // reason staged candidates are preserved: a later zero-row pass must
+      // not erase what the scan actually found.
+      if (
+        (typeof staged.transactionCount === 'number' && staged.transactionCount > 0)
+        || staged.localOcr
+      ) {
         console.warn(
           'routeToReview: zero-row pass preserves staged payload candidates:',
           filing.docId,
