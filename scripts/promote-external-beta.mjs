@@ -135,17 +135,30 @@ export function chooseExternalGroup(groups, groupName = null) {
  * Number("nope") are all rejected here rather than being allowed through as a
  * number that silently matches nothing.
  */
+/** One to three dot-separated integers, not all zero ("1.1.2", "0.1.0"). */
+export function isDottedBuild(raw) {
+  if (!/^\d+(\.\d+){1,2}$/.test(raw)) return false;
+  const parts = raw.split(".").map(Number);
+  if (!parts.every((x) => Number.isSafeInteger(x))) return false;
+  return parts.some((x) => x > 0);
+}
+
 export function resolveExpectedBuildNumber({ explicit = null, repoRoot = ROOT } = {}) {
   const raw = explicit == null ? "" : String(explicit).trim();
   if (raw !== "") {
-    // A build number is a plain integer, the way the fleet script words it:
-    // "N must be a plain integer above every build already shipped".  So the
-    // digits only --  "1e3" and "2320.5" are not build numbers, even though
-    // Number() would happily turn them into numbers.
-    if (!/^\d+$/.test(raw)) return null;
-    const n = Number(raw);
-    if (!Number.isSafeInteger(n) || n <= 0) return null;
-    return n;
+    // A plain integer ("239") or one to three dot-separated integers
+    // ("1.1.2"):  the two forms Apple's CFBundleVersion takes.  "1e3", "1..2",
+    // ".1", "1." and a fourth component are not build numbers, even though
+    // Number() would turn some of them into numbers.  A plain integer comes
+    // back as a number, a dotted build as the exact string, because "1.1.2"
+    // must reach App Store Connect character for character.
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n <= 0) return null;
+      return n;
+    }
+    if (isDottedBuild(raw)) return raw;
+    return null;
   }
   const res = spawnSync("git", ["-C", repoRoot, "rev-list", "--count", "HEAD"], { encoding: "utf8" });
   if (res.status !== 0) return null;
@@ -232,7 +245,10 @@ export function promoteExternalBeta({
     note("no App Store Connect app id; nothing promoted");
     return out;
   }
-  if (!Number.isInteger(buildNumber) || buildNumber <= 0) {
+  const buildOk =
+    (Number.isInteger(buildNumber) && buildNumber > 0) ||
+    (typeof buildNumber === "string" && isDottedBuild(buildNumber));
+  if (!buildOk) {
     out.outcome = "no-target-build";
     note(
       "no build number to promote; pass --build <n> with the CFBundleVersion the ship uploaded"

@@ -300,11 +300,15 @@ test("a malformed App Store Connect error body is never believed and never throw
 });
 
 test("a build number that is not a positive integer is refused, not guessed at", () => {
-  for (const junk of ["0", "-1", "-2320", "nope", "2320.5", "1e3"]) {
+  for (const junk of ["0", "-1", "-2320", "nope", "1e3", "1..2", ".1", "1.", "1.2.3.4", "0.0.0", "1.1.x"]) {
     assert.equal(resolveExpectedBuildNumber({ explicit: junk }), null, `refused: ${JSON.stringify(junk)}`);
   }
   assert.equal(resolveExpectedBuildNumber({ explicit: "2320" }), 2320);
   assert.equal(resolveExpectedBuildNumber({ explicit: " 2320 " }), 2320);
+  // Dotted builds (1.1.2) pass through as the exact string.
+  assert.equal(resolveExpectedBuildNumber({ explicit: "1.1.2" }), "1.1.2");
+  assert.equal(resolveExpectedBuildNumber({ explicit: "0.1.0" }), "0.1.0");
+  assert.equal(resolveExpectedBuildNumber({ explicit: "2320.5" }), "2320.5");
 });
 
 test("an absent build number falls back to the checkout's commit count", () => {

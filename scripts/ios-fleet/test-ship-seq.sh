@@ -92,7 +92,7 @@ cmd=""
 for a in "$@"; do
   case "$a" in
     */asc-api.mjs) cmd="asc-api" ;;
-    latest-marketing-patch|build-floor|released-store-version)
+    latest-marketing-patch|build-floor|released-store-version|next-dotted-build)
       if [[ "$cmd" == "asc-api" ]]; then cmd="${cmd}:${a}"; fi
       ;;
   esac
@@ -109,6 +109,12 @@ case "$cmd" in
   asc-api:released-store-version)
     [[ "${FAKE_RELEASED:-}" == "fail" ]] && exit 2
     printf '%s\n' "${FAKE_RELEASED:-}"
+    exit 0
+    ;;
+  asc-api:next-dotted-build)
+    [[ "${FAKE_DOTTED:-}" == "fail" ]] && exit 3
+    [[ -n "${FAKE_DOTTED:-}" ]] || exit 2
+    printf '%s\n' "$FAKE_DOTTED"
     exit 0
     ;;
   asc-api:build-floor)
@@ -176,6 +182,7 @@ run_ship() {
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     FAKE_RELEASED="${FAKE_RELEASED:-}" \
+    FAKE_DOTTED="${FAKE_DOTTED:-}" \
     bash "$SHIP" "$@" 2>&1)"
   RC=$?
   return 0
@@ -505,7 +512,7 @@ check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || e
 FAKE_ASC_PATCH=236
 echo
 
-echo "12. fixed marketing version + short build count (apps.json fixedMarketingVersion / buildCountSeed)"
+echo "12. fixed marketing version + dotted build (apps.json fixedMarketingVersion)"
 FIXDIR="${WORK}/fleet-fixed"
 rm -rf "$FIXDIR"; cp -R "$SCRIPT_DIR" "$FIXDIR"
 python3 - "$FIXDIR/apps.json" <<'PY'
@@ -514,50 +521,45 @@ p = sys.argv[1]
 d = json.load(open(p))
 a = d["apps"]
 for k in list(a)[:1]:
-    a[k]["fixedMarketingVersion"] = "0.1.0"
-    a[k]["buildCountSeed"] = "239"
+    a[k]["fixedMarketingVersion"] = "1.1.2"
+    a[k].pop("buildCountSeed", None)
 json.dump(d, open(p, "w"), indent=2)
 PY
 FIXAPP="$(python3 -c 'import json,sys; print(list(json.load(open(sys.argv[1]))["apps"])[0])' "$FIXDIR/apps.json")"
 SHIP_REAL="$SHIP"; SHIP="${FIXDIR}/ship-testflight.sh"
 rm -f "${STATE}/build-seq-${FIXAPP}.txt" "${STATE}/last-ship-${FIXAPP}.txt"
 write_record "$FIXAPP" 5
-FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""
+FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=2383; FAKE_RELEASED=""; FAKE_DOTTED="1.1.2"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 planned_pair
-check "fixed: marketing stays 0.1.0 even though ASC holds patch 239 (got '${PLANNED_MARKETING}')" \
-  "$([[ "$PLANNED_MARKETING" == "0.1.0" ]] && echo 0 || echo 1)"
-check "fixed: an empty train starts at the seed (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "239" ]] && echo 0 || echo 1)"
-FAKE_ASC_FLOOR=239
+check "fixed: marketing stays 1.1.2 even though ASC holds patch 239 (got '${PLANNED_MARKETING}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" ]] && echo 0 || echo 1)"
+check "fixed: an empty train plans the first build as the version (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "1.1.2" ]] && echo 0 || echo 1)"
+check "fixed: the integer floor and commit count play no part" \
+  "$(contains 'dotted build 1.1.2 for fixed version 1.1.2' && echo 0 || echo 1)"
+FAKE_DOTTED="1.1.3"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 planned_pair
-check "fixed: a train holding 239 goes to 240, not a commit count (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "240" ]] && echo 0 || echo 1)"
-FAKE_ASC_FLOOR=999
+check "fixed: a train holding 1.1.2 goes to 1.1.3 (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "1.1.3" ]] && echo 0 || echo 1)"
+FAKE_DOTTED="fail"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: past 999 stops, nothing reset or truncated" \
-  "$(contains 'not a three-digit count' && echo 0 || echo 1)"
-FAKE_ASC_FLOOR=0; FAKE_RELEASED="1.0.235"
+check "fixed: a train with a build of another shape stops the run, nothing guessed" \
+  "$(contains 'cannot work out the next dotted build' && echo 0 || echo 1)"
+FAKE_DOTTED=""
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: a version below the released App Store version is refused, not bumped" \
-  "$(contains 'at or below the released App Store version 1.0.235' && echo 0 || echo 1)"
+check "fixed: an unreadable train stops the run" \
+  "$(contains 'cannot work out the next dotted build' && echo 0 || echo 1)"
+FAKE_DOTTED="1.1.2"; FAKE_RELEASED="1.1.2"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a version at the released App Store version is refused, not bumped" \
+  "$(contains 'at or below the released App Store version 1.1.2' && echo 0 || echo 1)"
 FAKE_RELEASED="fail"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: an unreadable released App Store version stops the run (fail closed)" \
   "$(contains 'cannot read the released App Store version' && echo 0 || echo 1)"
-FAKE_RELEASED=""; FAKE_ASC_FLOOR=998
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-planned_pair
-check "fixed: floor 998 plans 999 (got '${PLANNED_BUILD}')" "$([[ "$PLANNED_BUILD" == "999" ]] && echo 0 || echo 1)"
-sed -i 's/"buildCountSeed": "239"/"buildCountSeed": "000"/' "$FIXDIR/apps.json"
-FAKE_ASC_FLOOR=0
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: a zero seed is refused" "$(contains 'must be 1-999 or auto' && echo 0 || echo 1)"
-sed -i 's/"buildCountSeed": "000"/"buildCountSeed": "abc"/' "$FIXDIR/apps.json"
-run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: a non-numeric seed gets the friendly error, not an arithmetic crash" "$(contains 'must be 1-999 or auto' && echo 0 || echo 1)"
-SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_ASC_PATCH=236
+SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_DOTTED=""; FAKE_ASC_PATCH=236
 echo
 
 echo "----------------------------------------"
