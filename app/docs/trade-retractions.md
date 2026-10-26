@@ -32,7 +32,10 @@ independent of the transaction `cursorSeq`.
 - Delivered to every active webhook subscription.  It is not filtered by
   subscription filters, so ignore an unknown `txId`.
 - Headers are the same as trade deliveries, except `X-CT-Event: transaction.retracted`.
-  `X-Tx-Id` is the retracted transaction.
+  `X-Tx-Id` is the retraction key (`retract:<retractSeq>`), not the retracted
+  transaction id, so header-based dedupe (`X-Subscription-Id` + `X-Tx-Id`)
+  never mistakes a retract for the original `trade.new`. The retracted trade
+  is in the body (`retraction.txId`).
 - Body: `{ "type": "trade.retract", "id": "ct-retract-<retractSeq>", "event": "trade.retract", "retraction": TradeRetraction, "deliveredAt": "..." }`.
   There is no `data.trades`.
 - Dedupe on `id`.  Retries and signatures work exactly as for `trade.new`.
@@ -44,8 +47,11 @@ independent of the transaction `cursorSeq`.
   The frame has no `id:` line, so `Last-Event-ID` stays the trade `cursorSeq`.
 - Resume with `?retractSince=<retractSeq>`.  The stream opens with
   `event: retract-cursor` (the starting point), and the `reconnect` frame
-  carries `retractSince`.  Without `?retractSince=` the stream starts at the
-  current high-water mark (live tail).
+  carries `retractSince`.  A fresh open without `?retractSince=` starts at the
+  current high-water mark (live tail); a resume (via `?since=` or
+  `Last-Event-ID`) without one replays from 0, so a native auto-reconnect —
+  which cannot resend the query param — never skips a mid-disconnect
+  retraction.
 - Like the webhook, frames are not filtered.  They are emitted on the durable
   backlog cadence (about 45 s).
 

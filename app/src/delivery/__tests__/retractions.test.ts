@@ -207,7 +207,7 @@ describe('webhook trade.retract', () => {
     expect(result.outboxComplete).toBe(true);
     expect(posts).toHaveLength(1);
     expect(posts[0].headers.get('X-CT-Event')).toBe('transaction.retracted');
-    expect(posts[0].headers.get('X-Tx-Id')).toBe('tx-a');
+    expect(posts[0].headers.get('X-Tx-Id')).toBe('retract:1');
     expect(posts[0].body).toMatchObject({
       type: 'trade.retract',
       id: 'ct-retract-1',
@@ -296,6 +296,23 @@ describe('SSE trade.retract', () => {
     const body = await readAll(res);
     expect(body).toContain('event: retract-cursor\ndata: 1\n');
     expect(body).not.toContain('event: trade.retract');
+  });
+
+  it('replays retractions from 0 when resuming without ?retractSince', async () => {
+    db.prepare(
+      `INSERT INTO subscriptions (id, client_id, delivery, target_url, secret, filters, cursor, active, created_at)
+       VALUES ('sub_s', 'ops-integration', 'sse', NULL, 'stream-secret', '{}', 0, 1, '2026-01-01T00:00:00.000Z')`,
+    ).run();
+    seedTx('tx-a');
+    deprecate('tx-a');
+    // since=0 with no retractSince: like a native EventSource auto-reconnect,
+    // which replays Last-Event-ID but cannot resend ?retractSince=.
+    const res = await openSseStream(env, 'sub_s', 0, 'stream-secret', '127.0.0.1', {
+      maxStreamMs: 100, pollIntervalMs: 10, backlogDrainIntervalMs: 1000, reconnectGraceMs: 20,
+    });
+    const body = await readAll(res);
+    expect(body).toContain('event: retract-cursor\ndata: 0\n');
+    expect(body).toContain('event: trade.retract');
   });
 });
 

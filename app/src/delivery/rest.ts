@@ -956,6 +956,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // at the current cursor high-water mark (live tail only). Resume / catch-up
   // uses ?since=<cursor_seq> or the Last-Event-ID header (each trade event
   // carries id:<cursorSeq>); replay is gap-free from the transactions table.
+  // Retractions resume from ?retractSince=; a resume without it replays from
+  // 0 (native auto-reconnect cannot resend the query param), while a fresh
+  // open starts at the retraction high-water mark.
   //
   // Token transport: prefer `Authorization: Bearer <secret>` (or
   // X-Subscription-Secret) so the secret stays out of URLs (browser history,

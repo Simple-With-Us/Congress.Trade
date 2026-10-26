@@ -358,6 +358,7 @@ export async function dispatchWebhook(
 interface WebhookEvent {
   /** deliveries.tx_id / outbox key: the tx id, or 'retract:<seq>'. */
   key: string;
+  /** X-Tx-Id header value: the tx id, or 'retract:<seq>' so a retract never dedupes against the original trade.new. */
   txId: string;
   /** X-CT-Event header value. */
   ctEvent: string;
@@ -408,7 +409,11 @@ async function dispatchRetraction(
   }
   const event: WebhookEvent = {
     key: msg.txId,
-    txId: retraction.txId,
+    // X-Tx-Id must not reuse the retracted trade's id: recipients dedupe on
+    // X-Subscription-Id + X-Tx-Id, so the retract would read as a duplicate
+    // of the original trade.new. The outbox/deliveries key ('retract:<seq>')
+    // is already unique per retraction; the body still names the trade.
+    txId: msg.txId,
     ctEvent: 'transaction.retracted',
     cursorSeq: null,
     payload: (deliveredAt) => ({

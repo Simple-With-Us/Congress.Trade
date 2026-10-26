@@ -222,7 +222,8 @@ export async function openSseStream(
   streamToken?: string,
   requestIp = 'unknown',
   timingOptions: SseStreamTimingOptions = {},
-  /** Resume point for trade.retract frames (?retractSince=); default live tail. */
+  /** Resume point for trade.retract frames (?retractSince=). Fresh opens default
+      to the live tail; a resume without one replays from 0. */
   retractSince?: number,
 ): Promise<Response> {
   const subRow = await get<SubscriptionRow>(
@@ -334,11 +335,19 @@ export async function openSseStream(
 
     // trade.retract frames (retractions.ts) resume from their own cursor; a
     // missing table (migration 0108 not applied yet) just disables them.
+    // A native EventSource auto-reconnect replays the original URL, so it
+    // carries Last-Event-ID (the trade cursor) but no ?retractSince=.
+    // Falling back to the high-water mark there would skip every retraction
+    // that landed mid-disconnect, so a resume without a retract cursor
+    // replays from 0 instead (bounded per tick, at-least-once — receivers
+    // dedupe by retractSeq). Fresh opens with no resume point stay live-tail.
     let retractCursor: number | null = null;
     try {
       retractCursor = retractSince !== undefined && Number.isFinite(retractSince) && retractSince >= 0
         ? Math.floor(retractSince)
-        : await readRetractionHighWater(env);
+        : liveTailDefault
+          ? await readRetractionHighWater(env)
+          : 0;
     } catch {
       retractCursor = null;
     }
