@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   fetchFiling,
+  IngestRetryError,
   shouldRetryFetchStatus,
 } from '../fetcher.ts';
 
@@ -103,6 +104,123 @@ describe('fetcherRetry', () => {
     // The limit trips while buffering, before R2 is ever touched.
     expect(put).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('does not stamp error when a fetch fails after the filing is already published', async () => {
+    const runs: string[] = [];
+    let publishedChecks = 0;
+    const fetchMock = vi.fn(async () => new Response('denied', { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = {
+      RAW_FILES: { put: vi.fn(async () => {}) },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              runs.push(sql);
+              return { success: true, meta: { changes: 0 } };
+            },
+            first: async () => {
+              if (/AS published/i.test(sql)) {
+                publishedChecks += 1;
+                // The pre-fetch check misses; the failure path must still refuse.
+                return publishedChecks === 1 ? null : { published: 1 };
+              }
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'http://test/doc.pdf',
+                chamber: 'house',
+                ingest_status: 'persisted',
+                first_seen_at: '2020-01-01T00:00:00.000Z',
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send: vi.fn(async () => {}) },
+    } as any;
+
+    await expect(fetchFiling(env, 'H-published')).rejects.toBeInstanceOf(IngestRetryError);
+    expect(fetchMock).toHaveBeenCalled();
+    expect(publishedChecks).toBeGreaterThanOrEqual(2);
+    expect(runs.some((sql) => /ingest_status = 'error'/i.test(sql))).toBe(false);
+    expect(env.INGEST_QUEUE.send).not.toHaveBeenCalled();
+    expect(env.RAW_FILES.put).not.toHaveBeenCalled();
+  });
+
+  it('still records a fetch error, with the published guard, when the filing is not published', async () => {
+    const runs: string[] = [];
+    const env = {
+      RAW_FILES: { put: vi.fn(async () => {}) },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              runs.push(sql);
+              return { success: true, meta: { changes: 1 } };
+            },
+            first: async () => {
+              if (/AS published/i.test(sql)) return null;
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'http://test/doc.pdf',
+                chamber: 'house',
+                ingest_status: 'new',
+                first_seen_at: '2020-01-01T00:00:00.000Z',
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send: vi.fn(async () => {}) },
+    } as any;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('missing', { status: 404 })));
+
+    await expect(fetchFiling(env, 'H-missing')).resolves.toBeUndefined();
+
+    const errorSql = runs.find((sql) => /ingest_status = 'error'/i.test(sql));
+    expect(errorSql).toBeTruthy();
+    expect(errorSql).toMatch(/deprecated_at IS NULL/);
+    expect(errorSql).toMatch(/ingestion_decisions/);
+    expect(errorSql).toMatch(/NOT \(/);
+  });
+
+  it('leaves an already-published filing alone instead of re-fetching', async () => {
+    const runs: string[] = [];
+    const fetchMock = vi.fn(async () => new Response('nope', { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const put = vi.fn(async () => {});
+    const send = vi.fn(async () => {});
+    const env = {
+      RAW_FILES: { put },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              runs.push(sql);
+              return { success: true, meta: { changes: 0 } };
+            },
+            first: async () => {
+              if (/AS published/i.test(sql)) return { published: 1 };
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'https://efdsearch.senate.gov/search/view/ptr/already/',
+                chamber: 'senate',
+                ingest_status: 'error',
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send },
+    } as any;
+
+    await expect(fetchFiling(env, 'S-already-published')).resolves.toBeUndefined();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(runs.some((sql) => /ingest_status = 'error'/i.test(sql))).toBe(false);
   });
 
   it('no-ops without touching R2/DB/queue when the doc is already review-resolved', async () => {

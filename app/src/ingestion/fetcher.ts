@@ -20,6 +20,11 @@ import { get, run } from '../shared/db.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { isReviewResolved } from './reviewQueueGuard.ts';
 import {
+  alreadyPublishedPredicate,
+  isFilingAlreadyPublished,
+  PUBLISH_DECISION_ACTIONS,
+} from './reviewStatusReconcile.ts';
+import {
   SENATE_SESSION_KV_KEY,
   establishSenateSession,
   looksLikeSenateAgreementWall,
@@ -176,7 +181,12 @@ export function isSenateAgreementWallBytes(bytes: Uint8Array): boolean {
   return looksLikeSenateAgreementWall(prefix);
 }
 
-/** Mark a filing as errored (does not throw). */
+/**
+ * Mark a filing as errored (does not throw).
+ * An already-published filing (live transactions + a latest publish
+ * decision) keeps its ingest_status. A later fetch failure must not
+ * rewrite that stamp to `error` (CT-2453).
+ */
 async function markError(
   env: Env,
   docId: string,
@@ -185,10 +195,17 @@ async function markError(
 ): Promise<void> {
   try {
     await lease?.assertOwned();
+    if (await isFilingAlreadyPublished(env.DB, docId)) {
+      console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
+      return;
+    }
     await run(
       env.DB,
-      `UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?`,
-      [message.slice(0, 1000), docId],
+      `UPDATE filings
+          SET ingest_status = 'error', error = ?
+        WHERE doc_id = ?
+          AND NOT (${alreadyPublishedPredicate('filings')})`,
+      [message.slice(0, 1000), docId, ...PUBLISH_DECISION_ACTIONS],
     );
   } catch (e) {
     console.error(`fetcher: failed to record error for ${docId}:`, e);
@@ -219,6 +236,14 @@ export async function fetchFiling(
   // already stamped for this doc_id.
   if (await isReviewResolved(env.DB, docId)) {
     console.warn(`fetcher: ${docId} already review-resolved; skipping re-fetch (no-op)`);
+    return;
+  }
+  // Same idea for a filing that never had a review row: live transactions
+  // plus a publish decision are the terminal truth. Re-fetching would
+  // either stamp `error` on failure or `fetched` on success and re-drive
+  // extraction of data that is already published (CT-2453).
+  if (await isFilingAlreadyPublished(env.DB, docId)) {
+    console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
     return;
   }
   const sourceUrl = row.source_url;
@@ -434,12 +459,19 @@ export async function fetchFiling(
       httpMetadata: { contentType: contentType || 'application/octet-stream' },
     });
     await lease?.assertOwned();
+    // A publish can land while this fetch is in flight. Do not walk a
+    // published filing back to `fetched` or enqueue another extraction.
+    if (await isFilingAlreadyPublished(env.DB, docId)) {
+      console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
+      return;
+    }
     await run(
       env.DB,
       `UPDATE filings
           SET raw_object_key = ?, ingest_status = 'fetched', error = NULL
-        WHERE doc_id = ?`,
-      [key, docId],
+        WHERE doc_id = ?
+          AND NOT (${alreadyPublishedPredicate('filings')})`,
+      [key, docId, ...PUBLISH_DECISION_ACTIONS],
     );
 
     await lease?.assertOwned();

@@ -270,6 +270,108 @@ describe('reconcileResolvedReviewStatus', () => {
     expect(row.ingest_status).toBe('persisted');
   });
 
+  it('reconciles a published filing that never had a review_queue row', async () => {
+    const { raw, env } = makeDb();
+    raw.prepare(
+      `INSERT INTO filings (doc_id, ingest_status, error) VALUES (?, 'error', ?)`,
+    ).run('S-published', 'fetcher: source https://efdsearch.senate.gov/x -> HTTP 403');
+    raw.prepare(
+      `INSERT INTO transactions (id, doc_id, deprecated_at) VALUES ('tx-pub', 'S-published', NULL)`,
+    ).run();
+    raw.prepare(
+      `INSERT INTO ingestion_decisions (id, doc_id, action, created_at)
+       VALUES ('d-pub', 'S-published', 'auto_published', '2026-08-01T00:00:00.000Z')`,
+    ).run();
+
+    const preview = await reconcileResolvedReviewStatus(env, { apply: false });
+    expect(preview.scanned).toBe(1);
+    expect(preview.updated).toBe(0);
+    expect(preview.sample[0]).toMatchObject({
+      docId: 'S-published',
+      currentStatus: 'error',
+      targetStatus: 'persisted',
+      via: 'published_truth',
+      basis: 'ingestion_decisions.action=auto_published',
+    });
+    const before = raw.prepare(
+      'SELECT ingest_status, error FROM filings WHERE doc_id = ?',
+    ).get('S-published') as { ingest_status: string; error: string | null };
+    expect(before.ingest_status).toBe('error');
+    expect(before.error).toContain('fetcher:');
+
+    const applied = await reconcileResolvedReviewStatus(env, { apply: true });
+    expect(applied.updated).toBe(1);
+    const after = raw.prepare(
+      'SELECT ingest_status, error FROM filings WHERE doc_id = ?',
+    ).get('S-published') as { ingest_status: string; error: string | null };
+    expect(after).toEqual({ ingest_status: 'persisted', error: null });
+
+    const again = await reconcileResolvedReviewStatus(env, { apply: true });
+    expect(again.scanned).toBe(0);
+    expect(again.updated).toBe(0);
+  });
+
+  it('leaves errored filings alone when they are not published', async () => {
+    const { raw, env } = makeDb();
+    raw.exec(`
+      INSERT INTO filings (doc_id, ingest_status, error) VALUES
+        ('S-no-tx', 'error', 'fetcher: HTTP 403'),
+        ('S-no-decision', 'error', 'fetcher: HTTP 403'),
+        ('S-deprecated', 'error', 'fetcher: HTTP 403'),
+        ('S-rejected-later', 'error', 'fetcher: HTTP 403'),
+        ('provider-missing-live', 'error', 'fetcher: HTTP 403');
+      INSERT INTO ingestion_decisions (id, doc_id, action, created_at) VALUES
+        ('d-no-tx', 'S-no-tx', 'auto_published', '2026-08-01T00:00:00.000Z'),
+        ('d-dep', 'S-deprecated', 'auto_published', '2026-08-01T00:00:00.000Z'),
+        ('d-rej-old', 'S-rejected-later', 'auto_published', '2026-08-01T00:00:00.000Z'),
+        ('d-rej-new', 'S-rejected-later', 'rejected', '2026-08-02T00:00:00.000Z'),
+        ('d-prov', 'provider-missing-live', 'auto_published', '2026-08-01T00:00:00.000Z');
+      INSERT INTO transactions (id, doc_id, deprecated_at) VALUES
+        ('tx-nodec', 'S-no-decision', NULL),
+        ('tx-dep', 'S-deprecated', '2026-08-03T00:00:00.000Z'),
+        ('tx-rej', 'S-rejected-later', NULL),
+        ('tx-prov', 'provider-missing-live', NULL);
+    `);
+
+    const applied = await reconcileResolvedReviewStatus(env, { apply: true });
+    expect(applied.updated).toBe(0);
+    expect(applied.scanned).toBe(0);
+    const rows = raw.prepare(
+      'SELECT doc_id, ingest_status FROM filings ORDER BY doc_id',
+    ).all() as Array<{ doc_id: string; ingest_status: string }>;
+    expect(rows).toEqual([
+      { doc_id: 'S-deprecated', ingest_status: 'error' },
+      { doc_id: 'S-no-decision', ingest_status: 'error' },
+      { doc_id: 'S-no-tx', ingest_status: 'error' },
+      { doc_id: 'S-rejected-later', ingest_status: 'error' },
+      { doc_id: 'provider-missing-live', ingest_status: 'error' },
+    ]);
+  });
+
+  it('reconciles an errored published filing that also has a review row', async () => {
+    const { raw, env } = makeDb();
+    raw.exec(`
+      INSERT INTO filings (doc_id, ingest_status, error) VALUES
+        ('S-with-queue', 'error', 'fetcher: HTTP 403');
+      INSERT INTO review_queue (doc_id, reason, resolved, resolution_kind, resolution_reason)
+        VALUES ('S-with-queue', 'low_confidence', 0, NULL, NULL);
+      INSERT INTO transactions (id, doc_id, deprecated_at) VALUES
+        ('tx-q', 'S-with-queue', NULL);
+      INSERT INTO ingestion_decisions (id, doc_id, action, created_at) VALUES
+        ('d-q', 'S-with-queue', 'confirmed', '2026-08-01T00:00:00.000Z');
+    `);
+    const applied = await reconcileResolvedReviewStatus(env, { apply: true });
+    expect(applied.updated).toBe(1);
+    const row = raw.prepare(
+      'SELECT ingest_status FROM filings WHERE doc_id = ?',
+    ).get('S-with-queue') as { ingest_status: string };
+    expect(row.ingest_status).toBe('persisted');
+    const queue = raw.prepare(
+      'SELECT resolved FROM review_queue WHERE doc_id = ?',
+    ).get('S-with-queue') as { resolved: number };
+    expect(queue.resolved).toBe(0);
+  });
+
   it('is a no-op on a second apply', async () => {
     const { raw, env } = makeDb();
     seedFiling(raw, 'H-1', {

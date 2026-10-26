@@ -6,6 +6,10 @@
  *            `S-grok-probe-should-not-exist-zzzz`
  *   #1574 — stamp filings.ingest_status to match an already-resolved
  *            review_queue row (the 547-row desync from 2026-08-09)
+ *   CT-2453 — stamp filings.ingest_status='persisted' when the filing
+ *            itself is already published (live transactions + a publish
+ *            decision), even if it never had a review_queue row. A later
+ *            fetch failure can leave ingest_status='error' on that filing.
  *
  * Both operations are idempotent.  Writes happen only when `apply: true`.
  * The probe delete is exact-doc_id and refuses if any transaction rows
@@ -21,6 +25,71 @@ import { all, get, run, type SqlParam } from '../shared/db.ts';
 export const MANUAL_TEST_PROBE_DOC_ID = 'S-grok-probe-should-not-exist-zzzz';
 
 const PROVIDER_MISSING_PREFIX = 'provider-missing-%';
+
+/**
+ * ingestion_decisions.action values that mean the filing was published.
+ * The latest decision must be one of these. An older publish followed by
+ * a rejection is not still published.
+ */
+export const PUBLISH_DECISION_ACTIONS = [
+  'auto_published',
+  'confirmed',
+  'manual',
+  'agreement_published',
+] as const;
+
+/**
+ * SQL predicate: this filing has at least one live transaction and its
+ * latest ingestion decision is a publish. `filingAlias` is a trusted
+ * identifier, never user input. Bind `PUBLISH_DECISION_ACTIONS` after the
+ * caller's own placeholders.
+ */
+export function alreadyPublishedPredicate(filingAlias: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(filingAlias)) {
+    throw new Error(`alreadyPublishedPredicate: bad alias ${filingAlias}`);
+  }
+  const actions = PUBLISH_DECISION_ACTIONS.map(() => '?').join(', ');
+  return `EXISTS (
+            SELECT 1 FROM transactions t
+             WHERE t.doc_id = ${filingAlias}.doc_id
+               AND t.deprecated_at IS NULL
+          )
+          AND (
+            SELECT d.action FROM ingestion_decisions d
+             WHERE d.doc_id = ${filingAlias}.doc_id
+             ORDER BY d.created_at DESC, d.id DESC
+             LIMIT 1
+          ) IN (${actions})`;
+}
+
+/**
+ * True when the filing's own rows say it is already published.
+ * Fails open (returns false) on a query error so a broken check cannot
+ * wedge every fetch. Callers that write ingest_status must also keep the
+ * predicate in the UPDATE.
+ */
+export async function isFilingAlreadyPublished(
+  db: D1Database,
+  docId: string,
+): Promise<boolean> {
+  try {
+    const row = await get<{ published: number }>(
+      db,
+      `SELECT 1 AS published FROM filings
+        WHERE doc_id = ?
+          AND ${alreadyPublishedPredicate('filings')}
+        LIMIT 1`,
+      [docId, ...PUBLISH_DECISION_ACTIONS],
+    );
+    return Number(row?.published) === 1;
+  } catch (err) {
+    console.warn(
+      `reviewStatusReconcile: published-check failed for ${docId}; failing open:`,
+      (err as Error).message,
+    );
+    return false;
+  }
+}
 
 /** Mid-pipeline statuses plus the invalid leftover the #1579 sweep wrote. */
 export const DESYNCED_INGEST_STATUSES = [
@@ -133,6 +202,12 @@ export interface DesyncCandidate {
   hasLiveTx: boolean;
   resolutionKind: string | null;
   decisionAction: string | null;
+  /**
+   * review_queue: the resolved-queue desync path.
+   * published_truth: live transactions + a publish decision, no dependence
+   * on a review_queue row (CT-2453).
+   */
+  via: 'review_queue' | 'published_truth';
 }
 
 export interface DesyncReconcileResult {
@@ -312,7 +387,10 @@ async function loadDesyncRows(
   );
 }
 
-function candidateFromRow(row: DesyncRow): DesyncCandidate {
+function candidateFromRow(
+  row: DesyncRow,
+  via: DesyncCandidate['via'],
+): DesyncCandidate {
   const decision = terminalStatusForResolvedReview({
     resolutionKind: row.resolution_kind,
     resolutionReason: row.resolution_reason,
@@ -328,7 +406,59 @@ function candidateFromRow(row: DesyncRow): DesyncCandidate {
     hasLiveTx: Number(row.has_tx) > 0,
     resolutionKind: row.resolution_kind,
     decisionAction: row.decision_action,
+    via,
   };
+}
+
+/**
+ * Filings the resolved-queue query cannot see: ingest_status is already
+ * `error` (not in DESYNCED_INGEST_STATUSES), or there is no review_queue
+ * row at all. Live transactions plus a latest publish decision are enough
+ * to call the filing persisted. Filings with no live transaction are not
+ * selected. Rows the resolved-queue query already owns stay on that path.
+ */
+async function loadPublishedTruthRows(
+  db: D1Database,
+  limit: number,
+): Promise<DesyncRow[]> {
+  const desynced = DESYNCED_INGEST_STATUSES.map(() => '?').join(',');
+  return await all<DesyncRow>(
+    db,
+    `SELECT f.doc_id,
+            f.ingest_status,
+            1 AS has_tx,
+            NULL AS resolution_kind,
+            NULL AS resolution_reason,
+            NULL AS review_reason,
+            (
+              SELECT d.action FROM ingestion_decisions d
+               WHERE d.doc_id = f.doc_id
+               ORDER BY d.created_at DESC, d.id DESC
+               LIMIT 1
+            ) AS decision_action
+       FROM filings f
+      WHERE f.ingest_status IS NOT NULL
+        AND f.ingest_status != 'persisted'
+        AND f.doc_id NOT LIKE ?
+        AND f.doc_id != ?
+        AND ${alreadyPublishedPredicate('f')}
+        AND NOT (
+          f.ingest_status IN (${desynced})
+          AND EXISTS (
+            SELECT 1 FROM review_queue rq
+             WHERE rq.doc_id = f.doc_id AND rq.resolved = 1
+          )
+        )
+      ORDER BY f.doc_id
+      LIMIT ?`,
+    [
+      PROVIDER_MISSING_PREFIX,
+      MANUAL_TEST_PROBE_DOC_ID,
+      ...PUBLISH_DECISION_ACTIONS,
+      ...DESYNCED_INGEST_STATUSES,
+      limit,
+    ],
+  );
 }
 
 export async function reconcileResolvedReviewStatus(
@@ -338,51 +468,72 @@ export async function reconcileResolvedReviewStatus(
   const limit = Math.min(Math.max(opts.limit ?? 600, 1), 2000);
   const nowIso = (opts.now ?? new Date()).toISOString();
   const rows = await loadDesyncRows(env.DB, limit);
+  const publishedRows = await loadPublishedTruthRows(env.DB, limit);
   const sample: DesyncCandidate[] = [];
   let updated = 0;
   let alreadyTerminal = 0;
 
-  for (const row of rows) {
-    const candidate = candidateFromRow(row);
+  const candidates = [
+    ...rows.map((row) => candidateFromRow(row, 'review_queue')),
+    ...publishedRows.map((row) => candidateFromRow(row, 'published_truth')),
+  ];
+
+  for (const candidate of candidates) {
     if (sample.length < 25) sample.push(candidate);
     if (candidate.currentStatus === candidate.targetStatus) {
       alreadyTerminal += 1;
+      continue;
+    }
+    // The truth path only ever means "this filing is published".
+    if (candidate.via === 'published_truth' && candidate.targetStatus !== 'persisted') {
       continue;
     }
     if (!opts.apply) continue;
     const errorNote = candidate.targetStatus === 'error'
       ? `review-status-reconcile: ${candidate.basis} as of ${nowIso}`
       : null;
-    const res = await run(
-      env.DB,
-      `UPDATE filings
-          SET ingest_status = ?,
-              error = CASE
-                        WHEN ? = 'error' THEN COALESCE(error, ?)
-                        WHEN ? IN ('persisted', 'verified_empty') THEN NULL
-                        ELSE error
-                      END
-        WHERE doc_id = ?
-          AND ingest_status = ?
-          AND EXISTS (
-            SELECT 1 FROM review_queue
-             WHERE doc_id = ? AND resolved = 1
-          )`,
-      [
-        candidate.targetStatus,
-        candidate.targetStatus,
-        errorNote,
-        candidate.targetStatus,
-        candidate.docId,
-        candidate.currentStatus,
-        candidate.docId,
-      ],
-    );
+    const res = candidate.via === 'published_truth'
+      ? await run(
+        env.DB,
+        `UPDATE filings
+            SET ingest_status = 'persisted',
+                error = NULL
+          WHERE doc_id = ?
+            AND ingest_status = ?
+            AND ingest_status != 'persisted'
+            AND ${alreadyPublishedPredicate('filings')}`,
+        [candidate.docId, candidate.currentStatus, ...PUBLISH_DECISION_ACTIONS],
+      )
+      : await run(
+        env.DB,
+        `UPDATE filings
+            SET ingest_status = ?,
+                error = CASE
+                          WHEN ? = 'error' THEN COALESCE(error, ?)
+                          WHEN ? IN ('persisted', 'verified_empty') THEN NULL
+                          ELSE error
+                        END
+          WHERE doc_id = ?
+            AND ingest_status = ?
+            AND EXISTS (
+              SELECT 1 FROM review_queue
+               WHERE doc_id = ? AND resolved = 1
+            )`,
+        [
+          candidate.targetStatus,
+          candidate.targetStatus,
+          errorNote,
+          candidate.targetStatus,
+          candidate.docId,
+          candidate.currentStatus,
+          candidate.docId,
+        ],
+      );
     if ((res.meta?.changes ?? 0) > 0) updated += 1;
   }
 
   return {
-    scanned: rows.length,
+    scanned: candidates.length,
     updated: opts.apply ? updated : 0,
     alreadyTerminal,
     sample,
