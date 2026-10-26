@@ -228,7 +228,7 @@ export async function openSseStream(
   streamToken?: string,
   requestIp = 'unknown',
   timingOptions: SseStreamTimingOptions = {},
-  /** Resume point for trade.retract frames (?retractSince=). Fresh opens default
+  /** Resume point for trade.retract frames (?retractSince=).  Fresh opens default
       to the live tail; a resume without one replays from 0. */
   retractSince?: number,
 ): Promise<Response> {
