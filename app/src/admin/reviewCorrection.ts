@@ -244,6 +244,8 @@ export const REVIVE_COMPARED_COLUMNS = [
   ['source', 'source'],
   ['filed_date', 'filedDate'],
   ['est_value', 'estValue'],
+  ['disclosure_lag_days', 'disclosureLagDays'],
+  ['stock_act_status', 'stockActStatus'],
   ['cleaning_note', 'cleaningNote'],
 ] as const;
 

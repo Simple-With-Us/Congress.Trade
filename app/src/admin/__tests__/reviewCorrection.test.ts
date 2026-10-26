@@ -257,7 +257,7 @@ describe('reviveChangedIds', () => {
     tx_type: 'S', amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0, raw_text: '',
     asset_type_name: null, filing_status: null, subholding: null, location: null, description: null,
     supplemental_text: null, row_key: 'v1:manual:0:h', confidence: 1, source: 'manual', filed_date: null,
-    est_value: 8000, cleaning_note: null, ...over,
+    est_value: 8000, disclosure_lag_days: null, stock_act_status: null, cleaning_note: null, ...over,
   });
   const next = (over: Record<string, string | number | null> = {}) => {
     const base: Record<string, string | number | null> = { id: 'a' };
@@ -274,6 +274,13 @@ describe('reviveChangedIds', () => {
       const value = typeof stored()[column] === 'number' ? 7 : 'changed';
       expect(reviveChangedIds(new Map([['a', stored()]]), [next({ [key]: value })]), column).toEqual(['a']);
     }
+  });
+
+  it('flags a revive that only changes the stored STOCK Act lag fields', () => {
+    const lagged = stored({ filed_date: '2026-09-30', disclosure_lag_days: 63, stock_act_status: 'late' });
+    const same = next({ filedDate: '2026-09-30', disclosureLagDays: 63, stockActStatus: 'late' });
+    expect(reviveChangedIds(new Map([['a', lagged]]), [same])).toEqual([]);
+    expect(reviveChangedIds(new Map([['a', lagged]]), [{ ...same, disclosureLagDays: null, stockActStatus: null }])).toEqual(['a']);
   });
 
   it('counts a revive with no stored row as changed', () => {
