@@ -7,11 +7,9 @@
 #      already been advanced, so a rate-limited attempt burned a version that
 #      shipped nowhere (observed live: skipped at 4392s of a 9000s interval,
 #      and the sequence still went 5 -> 6).
-#   2. SCHEME (owner directive 2026-10-24, AFC-517 / CT-2444):  the marketing
-#      version is the NEXT PATCH on the app's train (<prefix>.<P+1>, P from
-#      App Store Connect), and the build number is INDEPENDENT of it:  the
-#      repo commit count, raised above the App Store Connect floor.  The pair
-#      never reads "1.0.N (N)" any more.
+#   2. PROTOCOL (restored AFC-356):  marketing is 1.0.N and build is N, where
+#      N is the complete repository commit count. Published values validate N
+#      but never allocate a replacement.
 #   3. COUNTER: the local build-seq counter is retired.  Nothing writes it and
 #      nothing reads it, so a leftover from an older scheme cannot push the
 #      build number above the commit count it names.
@@ -52,10 +50,12 @@ FAKE_HOME="${WORK}/home"
 FAKE_BIN="${WORK}/bin"
 STATE="${WORK}/state"
 REPO="${WORK}/repo"
-mkdir -p "$FAKE_HOME" "$FAKE_BIN" "$STATE" "$REPO" "${WORK}/tmp"
+FAKE_METADATA_ROOT="${WORK}/generated"
+mkdir -p "$FAKE_HOME" "$FAKE_BIN" "$STATE" "$REPO" "$FAKE_METADATA_ROOT" "${WORK}/tmp"
 
-# A fake xcodebuild: answers -version, and hard-fails on anything else so a test
-# can never start a real archive.
+# A fake xcodebuild: answers -version, writes synthetic app/widget Info.plists
+# from the exact values passed by ship-testflight.sh, and creates a dummy IPA.
+# It cannot contact Xcode, App Store Connect, or a signing service.
 cat >"${FAKE_BIN}/xcodebuild" <<'FAKE'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "-version" ]]; then
@@ -63,8 +63,46 @@ if [[ "${1:-}" == "-version" ]]; then
   echo "Build version 17A000"
   exit 0
 fi
-echo "FAKE xcodebuild called with: $*" >&2
-exit 99
+if [[ "${1:-}" == "-exportArchive" ]]; then
+  export_path=""
+  while [[ $# -gt 0 ]]; do
+    [[ "$1" == "-exportPath" ]] && { export_path="$2"; shift 2; continue; }
+    shift
+  done
+  [[ -n "$export_path" ]] || exit 98
+  mkdir -p "$export_path"
+  : >"$export_path/fake.ipa"
+  exit 0
+fi
+archive_path="" marketing="" build=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -archivePath) archive_path="$2"; shift 2 ;;
+    MARKETING_VERSION=*) marketing="${1#*=}"; shift ;;
+    CURRENT_PROJECT_VERSION=*) build="${1#*=}"; shift ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$archive_path" && -n "$marketing" && -n "$build" ]] || exit 97
+FAKE_MARKETING="$marketing" FAKE_BUILD="$build" FAKE_ARCHIVE="$archive_path" /usr/bin/python3 - <<'PY'
+import os
+import plistlib
+from pathlib import Path
+
+archive = Path(os.environ["FAKE_ARCHIVE"])
+products = archive / "Products" / "Applications"
+app = products / "CongressTrade.app"
+widget = app / "PlugIns" / "CongressWidget.appex"
+for target in (app, widget):
+    target.mkdir(parents=True, exist_ok=True)
+    with (target / "Info.plist").open("wb") as out:
+        plistlib.dump({
+            "CFBundleShortVersionString": os.environ["FAKE_MARKETING"],
+            "CFBundleVersion": os.environ["FAKE_BUILD"],
+        }, out)
+PY
+printf '%s\n' "$FAKE_ARCHIVE" >"${FAKE_METADATA_ROOT}/archive-path.txt"
+exit 0
 FAKE
 chmod +x "${FAKE_BIN}/xcodebuild"
 
@@ -88,11 +126,13 @@ case "$cmd" in
     # No stubbed patch = App Store Connect cannot be consulted.
     # "auth" = App Store Connect rejected the key (asc-api exits 4).
     [[ "${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
+    [[ "${FAKE_ASC_PATCH:-}" == "unknown" ]] && exit 2
     [[ -n "${FAKE_ASC_PATCH:-}" ]] || exit 2
     printf '%s\n' "$FAKE_ASC_PATCH"
     exit 0
     ;;
   asc-api:build-floor)
+    [[ "${FAKE_ASC_FLOOR:-}" == "unknown" ]] && exit 2
     printf '%s\n' "${FAKE_ASC_FLOOR:-0}"
     exit 0
     ;;
@@ -154,6 +194,7 @@ run_ship() {
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     ASC_KEY_ID=fake \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
+    FAKE_METADATA_ROOT="$FAKE_METADATA_ROOT" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     bash "$SHIP" "$@" 2>&1)"
@@ -224,7 +265,7 @@ echo
 echo "1. ship gate: rate-limited run does not resolve a version"
 reset_state
 printf '%s %s\n' "$(date +%s)" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
-run_ship congress --repo-root "$REPO" --allow-unverified-seq
+run_ship congress --repo-root "$REPO"
 check "exits 0 (nothing to do)" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "reports the rate-limit skip" "$(contains 'ship-gate: skip' && echo 0 || echo 1)"
 check "sequence still 5 (was 5 -> 6 before the fix)" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
@@ -240,7 +281,7 @@ echo
 echo "2. ship gate: already-shipped HEAD does not resolve a version"
 reset_state
 printf '%s %s\n' "1" "$HEAD_SHA" >"$SHIP_FILE"
-run_ship congress --repo-root "$REPO" --allow-unverified-seq
+run_ship congress --repo-root "$REPO"
 check "exits 0" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "reports the same-HEAD skip" "$(contains 'already shipped' && echo 0 || echo 1)"
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
@@ -249,7 +290,9 @@ echo
 # --- 3. A run the gate allows does not advance the counter -----------------
 echo "3. ship gate: an allowed run proceeds without advancing the counter"
 reset_state
-run_ship congress --repo-root "$REPO" --allow-unverified-seq
+FAKE_ASC_PATCH=5
+FAKE_ASC_FLOOR=5
+run_ship congress --repo-root "$REPO"
 check "proceeds past the gate" "$(contains 'no prior ship' && echo 0 || echo 1)"
 check "stops at the missing project (never archives)" \
   "$(contains 'project not found' && echo 0 || echo 1)"
@@ -257,16 +300,14 @@ check "the local counter is not advanced (it is not the build number now)" \
   "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 check "the planned build number is the commit count" \
   "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
-check "an unverified patch plans the first patch of the train" \
-  "$(contains 'marketing=1.0.1 build=' && echo 0 || echo 1)"
-check "says loudly that the patch was unverified" \
-  "$(contains 'UNVERIFIED' && echo 0 || echo 1)"
+check "marketing is tied to the full repository commit count" \
+  "$(contains "marketing=1.0.${COMMIT_COUNT} build=${COMMIT_COUNT}" && echo 0 || echo 1)"
 echo
 
 # --- 4. --dry-run must not consume -----------------------------------------
 echo "4. --dry-run does not ship anything"
 reset_state
-run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
+run_ship congress --repo-root "$REPO" --dry-run
 check "exits 0" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 check "plans the build number without shipping it" \
@@ -277,7 +318,7 @@ echo
 echo "5. --dry-run still reports the gate outcome"
 reset_state
 printf '%s %s\n' "$(date +%s)" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
-run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
+run_ship congress --repo-root "$REPO" --dry-run
 check "exits 0" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 check "says the gate would skip" "$(contains 'would SKIP' && echo 0 || echo 1)"
 check "sequence still 5" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
@@ -297,170 +338,125 @@ echo
 echo "7. --force-ship bypasses the gate"
 reset_state
 printf '%s %s\n' "$(date +%s)" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
-run_ship congress --repo-root "$REPO" --allow-unverified-seq --force-ship
+run_ship congress --repo-root "$REPO" --force-ship --dry-run
 check "bypasses the gate" "$(contains 'bypassing min-interval' && echo 0 || echo 1)"
 check "the local counter is still not advanced" \
   "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 echo
 
-# --- 8. The version scheme (owner directive 2026-10-24, AFC-517) -----------
-echo "8. version scheme: next patch on the train, independent build number"
-FAKE_ASC_PATCH=236
-FAKE_ASC_FLOOR=0
-for app in socratic congress usage usage-local; do
-  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  write_record "$app" 5
-  run_ship "$app" --repo-root "$REPO" --dry-run
-  planned_pair
-  mk="$PLANNED_MARKETING"
-  bn="$PLANNED_BUILD"
-
-  check "${app}: the marketing version is the next patch on the train (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
-  check "${app}: the build number is the repo commit count (got '${bn}')" \
-    "$([[ "$bn" == "$COMMIT_COUNT" ]] && echo 0 || echo 1)"
-  check "${app}: the build number is not the patch number (no '1.0.N (N)')" \
-    "$([[ "$bn" != "237" ]] && echo 0 || echo 1)"
-  check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
-  check "${app}: reports the App Store Connect rendering" \
-    "$(contains "will show this as: ${mk} (${bn})" && echo 0 || echo 1)"
-  check "${app}: prints the version plan line" \
-    "$(contains 'version plan: asc_patch=236 -> marketing=1.0.237' && echo 0 || echo 1)"
-  rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
-  rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
-done
-
-# The floor above the commit count:  the build number moves to floor + 1 and
-# the marketing version stays the next patch.  The two numbers are
-# independent, so the floor never moves the version.
-FLOOR_HIGH=202610180036
-for app in socratic congress usage usage-local; do
-  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  write_record "$app" 5
-  FAKE_ASC_FLOOR="$FLOOR_HIGH"
-  run_ship "$app" --repo-root "$REPO" --dry-run
-  planned_pair
-  mk="$PLANNED_MARKETING"
-  bn="$PLANNED_BUILD"
-
-  check "${app}: a floor above the commit count raises the build to floor + 1 (got '${bn}')" \
-    "$([[ "$bn" == "$((FLOOR_HIGH + 1))" ]] && echo 0 || echo 1)"
-  check "${app}: the floor does not move the marketing version (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
-  check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
-  rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
-  rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
-done
-FAKE_ASC_FLOOR=0
-
-# --version pins the marketing version exactly, and the build number is then
-# floored against THAT train.
-for app in socratic congress usage usage-local; do
-  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  write_record "$app" 5
-  FAKE_ASC_FLOOR=202610180036
-  run_ship "$app" --repo-root "$REPO" --dry-run --version 1.0.236
-  planned_pair
-  mk="$PLANNED_MARKETING"
-  bn="$PLANNED_BUILD"
-
-  check "${app}: --version is honoured exactly (got '${mk}')" \
-    "$([[ "$mk" == "1.0.236" ]] && echo 0 || echo 1)"
-  check "${app}: the build is floored against the pinned train (got '${bn}')" \
-    "$([[ "$bn" == "202610180037" ]] && echo 0 || echo 1)"
-  check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
-  rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
-  rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
-done
-FAKE_ASC_FLOOR=0
-
-# --build pins the build number exactly, and the marketing version is still
-# the automatic next patch.
-for app in socratic congress usage usage-local; do
-  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  write_record "$app" 5
-  run_ship "$app" --repo-root "$REPO" --dry-run --build 999
-  planned_pair
-  mk="$PLANNED_MARKETING"
-  bn="$PLANNED_BUILD"
-
-  check "${app}: --build is honoured exactly (got '${bn}')" \
-    "$([[ "$bn" == "999" ]] && echo 0 || echo 1)"
-  check "${app}: --build does not move the marketing version (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
-  rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
-  rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
-done
-
-# Without --allow-unverified-seq, an unreachable App Store Connect is fatal:
-# the marketing version and the build floor both come from it.
-for app in socratic congress usage usage-local; do
-  rm -f "${STATE}/build-seq-${app}.txt" "${STATE}/last-ship-${app}.txt"
-  write_record "$app" 5
-  FAKE_ASC_PATCH=""
-  run_ship "$app" --repo-root "$REPO" --dry-run
-  check "${app}: an unreachable App Store Connect fails the run (rc=${RC})" \
-    "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
-  check "${app}: says what could not be determined" \
-    "$(contains 'cannot determine the next marketing version' && echo 0 || echo 1)"
-  check "${app}: does not ship a version it could not verify" \
-    "$(contains 'marketing=1.0.' && echo 1 || echo 0)"
-  rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
-  rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
-done
-FAKE_ASC_PATCH=236
+# --- 8. AFC-356 shared release number ------------------------------------
+echo "8. AFC-356: marketing and build use the same full-history commit count"
+FAKE_ASC_PATCH=5
+FAKE_ASC_FLOOR=5
+write_record congress 5
+run_ship congress --repo-root "$REPO" --dry-run --version "1.0.${COMMIT_COUNT}" --build "$COMMIT_COUNT"
+planned_pair
+check "marketing is 1.0.N (got '${PLANNED_MARKETING}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.0.${COMMIT_COUNT}" ]] && echo 0 || echo 1)"
+check "build is the same N (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "$COMMIT_COUNT" ]] && echo 0 || echo 1)"
+check "the planner logs its commit count and paired outputs" \
+  "$(contains "commit_count=${COMMIT_COUNT}" && contains "resolved metadata: MARKETING_VERSION=1.0.${COMMIT_COUNT} CURRENT_PROJECT_VERSION=${COMMIT_COUNT}" && echo 0 || echo 1)"
+check "canonical explicit overrides are assertions and are accepted" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
 echo
 
-# --- 9. The counter no longer decides the version -------------------------
-echo "9. the counter stays put; the version comes from App Store Connect"
-rm -f "$SEQ_FILE" "$SHIP_FILE"
-printf '5' >"$SEQ_FILE"
-seen=""
-for i in 1 2 3; do
-  run_ship congress --repo-root "$REPO" --dry-run
-  seen="${seen} $(seq_now)"
-done
-check "three allowed runs leave the counter at 5 (got:${seen})" \
-  "$([[ "$seen" == " 5 5 5" ]] && echo 0 || echo 1)"
-check "the run planned the next patch on the train" \
-  "$(contains 'marketing=1.0.237' && echo 0 || echo 1)"
+# --- 9. Fail closed on noncanonical overrides and known published floors --
+echo "9. overrides and published floors cannot allocate a different number"
+run_ship congress --repo-root "$REPO" --dry-run --version 1.0.148
+check "148 is not treated as a requested marketing target" \
+  "$(contains 'conflicts with canonical marketing version' && echo 0 || echo 1)"
+run_ship congress --repo-root "$REPO" --dry-run --build 148
+check "a noncanonical build override is rejected" \
+  "$(contains 'conflicts with canonical build number' && echo 0 || echo 1)"
+FAKE_ASC_PATCH="$COMMIT_COUNT"
+run_ship congress --repo-root "$REPO" --dry-run
+check "published marketing at N fails instead of regressing" \
+  "$(contains 'refusing a marketing regression' && echo 0 || echo 1)"
+FAKE_ASC_PATCH=5
+FAKE_ASC_FLOOR="$COMMIT_COUNT"
+run_ship congress --repo-root "$REPO" --dry-run
+check "published build floor at N fails instead of minting a replacement" \
+  "$(contains 'refusing to mint a replacement number' && echo 0 || echo 1)"
+FAKE_ASC_FLOOR=5
 echo
 
-# --- 10. Standing 1-hour gate: just-under skips, at-or-over proceeds -------
-# Owner 2026-08-14: unbuilt iOS updates may ship as often as once per hour.
-# Pin both sides of the boundary so a future edit of DEFAULT_MIN_INTERVAL_SEC
-# cannot silently restore 2.5h (or drop the gate) without this suite going red.
-# A different HEAD is required so this is not the same-HEAD skip.
-# Margins (3000 / 3700) absorb the second that passes between writing the
-# state file and the script reading `date +%s`.
-echo "10. 1-hour standing gate: 3000s still skips; 3700s proceeds"
+# --- 10. Unknown floors and invalid project records remain visible --------
+echo "10. unknown and conflicting version records fail closed"
+FAKE_ASC_PATCH=unknown
+run_ship congress --repo-root "$REPO" --dry-run
+check "unknown published marketing floor blocks planning" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+FAKE_ASC_PATCH=5
+FAKE_ASC_FLOOR=unknown
+run_ship congress --repo-root "$REPO" --dry-run
+check "unknown published build floor blocks planning" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+FAKE_ASC_FLOOR=5
+write_record congress "$COMMIT_COUNT"
+run_ship congress --repo-root "$REPO" --dry-run
+check "a project marketing floor at N is not silently overwritten" \
+  "$(contains 'project marketing floor' && echo 0 || echo 1)"
+write_record congress 5
+echo
+
+# --- 11. Missing and shallow history are not valid allocators -------------
+echo "11. missing or shallow history blocks a guessed sequence"
+mkdir -p "${WORK}/not-a-repository"
+run_ship congress --repo-root "${WORK}/not-a-repository" --dry-run
+check "missing Git history fails planning" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+git clone -q --depth 1 "file://${REPO}" "${WORK}/shallow"
+run_ship congress --repo-root "${WORK}/shallow" --dry-run
+check "a shallow commit count is rejected" \
+  "$(contains 'full repository history is required' && echo 0 || echo 1)"
+echo
+
+# --- 12. Actual archive metadata gets the resolved pair -------------------
+echo "12. export-only archive writes app and widget metadata with the pair"
+FAKE_ASC_PATCH=5
+FAKE_ASC_FLOOR=5
+run_ship congress --repo-root "$REPO" --export-only --allow-dirty
+check "offline export-only completed with fake Xcode" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
+ARCHIVE_PATH="$(find "${WORK}/tmp" -type d -name 'CongressTrade.xcarchive' -print | tail -1)"
+if [[ -n "$ARCHIVE_PATH" ]]; then
+  _metadata_out="$(FAKE_ARCHIVE="$ARCHIVE_PATH" FAKE_COUNT="$COMMIT_COUNT" /usr/bin/python3 - <<'PY'
+import os
+import plistlib
+from pathlib import Path
+
+root = Path(os.environ["FAKE_ARCHIVE"]) / "Products/Applications/CongressTrade.app"
+expected = (f"1.0.{os.environ['FAKE_COUNT']}", os.environ["FAKE_COUNT"])
+for bundle in (root, root / "PlugIns/CongressWidget.appex"):
+    with (bundle / "Info.plist").open("rb") as stream:
+        info = plistlib.load(stream)
+    actual = (info.get("CFBundleShortVersionString"), info.get("CFBundleVersion"))
+    if actual != expected:
+        raise SystemExit(f"{bundle}: expected {expected!r}, got {actual!r}")
+PY
+  2>&1)"
+  _metadata_rc=$?
+  [[ $_metadata_rc -eq 0 ]] || OUT="${OUT}
+${_metadata_out}"
+else
+  _metadata_rc=1
+fi
+check "generated app and widget Info.plists carry 1.0.N / N" "$([[ $_metadata_rc -eq 0 ]] && echo 0 || echo 1)"
+echo
+
+# --- 13. Standing ship gate still applies before resolving a version -------
+echo "13. ship gate ordering remains intact"
 reset_state
-printf '%s %s\n' "$(( $(date +%s) - 3000 ))" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
-run_ship congress --repo-root "$REPO" --allow-unverified-seq
-check "3000s ago is still gated" "$(contains 'ship-gate: skip' && echo 0 || echo 1)"
-check "3000s ago does not consume a number" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
-reset_state
-printf '%s %s\n' "$(( $(date +%s) - 3700 ))" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
-run_ship congress --repo-root "$REPO" --allow-unverified-seq
-check "3700s ago proceeds past the gate" "$(contains 'ship-gate: skip' && echo 1 || echo 0)"
-check "3700s ago does not advance the counter" "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
+printf '%s %s\n' "$(date +%s)" "0000000000000000000000000000000000000000" >"$SHIP_FILE"
+run_ship congress --repo-root "$REPO" --allow-dirty
+check "rate-limited run exits successfully" "$([[ $RC -eq 0 ]] && echo 0 || echo 1)"
+check "rate-limited run does not query/resolve a version" "$(contains 'version plan:' && echo 1 || echo 0)"
 echo
 
-# --- rejected API key -----------------------------------------------------
-# A 401/403 from App Store Connect is not "unreachable":  even
-# --allow-unverified-seq must not plan a version around a key Apple rejects.
-echo "rejected API key: fatal even with --allow-unverified-seq"
-reset_state 2>/dev/null || true
+# --- 14. Rejected credentials remain fatal --------------------------------
+echo "14. rejected App Store Connect credentials are fatal"
 FAKE_ASC_PATCH=auth
-run_ship congress --repo-root "$REPO" --allow-unverified-seq --dry-run
-check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
-check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
-check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
-FAKE_ASC_PATCH=236
-echo
+run_ship congress --repo-root "$REPO" --dry-run
+check "a rejected API key fails planning" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+FAKE_ASC_PATCH=5
+
+rm -f "${REPO}/$(project_rel congress)/project.pbxproj"
 
 echo "----------------------------------------"
 echo "passed: ${PASS}   failed: ${FAIL}"

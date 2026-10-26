@@ -42,7 +42,7 @@ import { join } from "node:path";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
-  isDriftTrain,
+  highestPublishedMarketingPatch,
   nextMarketingPatch
 } from "./version-plan.mjs";
 
@@ -909,7 +909,9 @@ async function main() {
     return { ok: true, status: 200, trains };
   }
 
-  // Highest patch already used on the <prefix> train, drift trains ignored.
+  // Highest published patch on the <prefix> train. Drift-shaped trains still
+  // count as published floors; this value validates repository N and never
+  // allocates a replacement.
   if (method === "latest-marketing-patch") {
     const bundleId = path;
     const prefix = body;
@@ -948,22 +950,12 @@ async function main() {
     }
     const trains = trainRes.trains;
 
-    // Print one less than the next FREE patch, so the caller's P + 1 never
-    // lands on a patch a drift train already holds (see nextMarketingPatch).
-    const patch = nextMarketingPatch({ prefix, appStoreVersions, trains }) - 1;
-    const drift = trains.filter((t) => isDriftTrain(t.version, t.builds, prefix)).map((t) => t.version);
+    const patch = highestPublishedMarketingPatch({ prefix, appStoreVersions, trains });
 
     console.error(
       `latest-marketing-patch: ${appStoreVersions.length} App Store version(s) + ${trains.length} train(s) ` +
-      `inspected on ${platform}; next free ${prefix}.N is N=${patch + 1} (printed as ${patch}, so the caller's P + 1 lands on it)`
+      `inspected on ${platform}; highest published ${prefix}.N is N=${patch}`
     );
-    if (drift.length) {
-      const shown = drift.slice(0, 5).join(", ");
-      console.error(
-        `latest-marketing-patch: ignored ${drift.length} drift train(s) (a ${prefix}.N train holding build "N"): ${shown}` +
-        (drift.length > 5 ? ", ..." : "")
-      );
-    }
     console.log(String(patch));
     process.exit(0);
   }

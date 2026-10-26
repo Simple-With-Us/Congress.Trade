@@ -1,39 +1,19 @@
 /**
  * version-plan.mjs - the pure rules behind the fleet's version numbering.
  *
- * Owner directive 2026-10-24 (AFC-517 / CT-2444).  This replaces the
- * 1.0.<commit_count> scheme unified in #2801 (2026-10-18), which made App
- * Store Connect show "1.0.2358 (2358)".
+ * Restored owner protocol (AFC-356): MARKETING_VERSION is 1.0.<full repo
+ * commit count> and CURRENT_PROJECT_VERSION is that same integer. A platform
+ * only ships when its own native files changed.
  *
  * The rules, in one place:
  *
- *   MARKETING_VERSION       = <prefix>.<P+1>
- *       <prefix> is the train from marketingVersionDefault ("1.0").
- *       P is the highest patch already used on that train in App Store
- *       Connect, counting BOTH App Store versions (appStoreVersions
- *       .versionString) AND TestFlight trains (preReleaseVersions.version)
- *       for the app's platform -- IGNORING any TestFlight train that is a
- *       "drift train":  a <prefix>.N train that holds a build whose
- *       CFBundleVersion is exactly the string "N".  Those are the
- *       1.0.N (N) uploads the retired scheme produced (1.0.2358 holding
- *       build 2358).  App Store versions are never ignored.
+ *   MARKETING_VERSION = 1.0.N
+ *   CURRENT_PROJECT_VERSION = N
  *
- *   CURRENT_PROJECT_VERSION = the repo commit count, raised when needed so it
- *       is strictly greater than
- *         (a) every build already in the TARGET marketing train (any value,
- *             including the old 12-digit UTC stamps, because Apple requires
- *             build numbers to increase inside one version train), and
- *         (b) the highest plain-integer build below 1000000000 the app has on
- *             that platform (so the number stays monotonic on a shallow
- *             checkout).
- *       For platform MAC_OS, (b) also includes every build of any size,
- *       because macOS build numbers must increase across all trains.
- *
- *   The build number is INDEPENDENT of the marketing version.  It is never
- *   derived from it, and the marketing version is never derived from it.
- *   The only coupling is a safety rule:  a ship must never look like
- *   "1.0.N (N)", so a build that happens to equal the patch number is bumped
- *   by one.
+ * N is the full repository commit count. Published floors validate N; they
+ * never allocate a replacement. Shallow/missing history, unknown floors, and
+ * conflicting published numbers fail closed. Explicit overrides are accepted
+ * only when they equal the canonical pair.
  *
  * This module is PURE:  no I/O, no network, no environment.  The bash ship
  * script implements the same rules; this module is the readable reference
@@ -132,6 +112,22 @@ export function latestMarketingPatch({ prefix, appStoreVersions = [], trains = [
   return best;
 }
 
+/** Highest actually published marketing patch; drift-shaped uploads are still floors. */
+export function highestPublishedMarketingPatch({ prefix, appStoreVersions = [], trains = [] } = {}) {
+  let best = 0;
+  const consider = (version) => {
+    const patch = parsePatch(version, prefix);
+    if (patch !== null && patch > best) best = patch;
+  };
+  for (const version of appStoreVersions || []) {
+    consider(typeof version === "string" ? version : version?.versionString);
+  }
+  for (const train of trains || []) {
+    consider(typeof train === "string" ? train : train?.version);
+  }
+  return best;
+}
+
 /**
  * The next free patch on a train:  one past latestMarketingPatch, skipping
  * every patch a TestFlight train already holds.  Drift trains are ignored for
@@ -159,12 +155,12 @@ export function nextMarketingPatch({ prefix, appStoreVersions = [], trains = [] 
 }
 
 /** A plain integer build number, or null when the value is not one. */
-function integerBuild(value) {
+export function integerBuild(value) {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
   if (!/^\d+$/.test(text)) return null;
   const parsed = parseInt(text, 10);
-  return Number.isFinite(parsed) ? parsed : null;
+  return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 /** The macOS platform key used by the App Store Connect API. */
@@ -190,12 +186,13 @@ export function buildFloor({ trainBuilds = [], appBuilds = [], platform = "" } =
 
   for (const build of trainBuilds || []) {
     const parsed = integerBuild(build);
-    if (parsed !== null && parsed > floor) floor = parsed;
+    if (parsed === null) throw new Error(`unknown build in published marketing train: ${String(build)}`);
+    if (parsed > floor) floor = parsed;
   }
 
   for (const build of appBuilds || []) {
     const parsed = integerBuild(build);
-    if (parsed === null) continue;
+    if (parsed === null) throw new Error(`unknown published app build: ${String(build)}`);
     if (isMac) {
       if (parsed > floor) floor = parsed;
     } else if (parsed < 1000000000 && parsed > floor) {
@@ -209,55 +206,54 @@ export function buildFloor({ trainBuilds = [], appBuilds = [], platform = "" } =
 /**
  * The marketing version and the build number for one ship.
  *
- *   prefix        the default train, e.g. "1.0"
- *   ascPatch      the highest patch already used on that train (0 if none)
- *   forcedVersion an exact --version override, or ""
- *   forcedBuild   an exact --build override, or ""
- *   commitCount   the repo commit count
- *   floor         the build floor (see buildFloor)
+ *   prefix          the only supported train, "1.0"
+ *   commitCount     the full repository commit count
+ *   ascPatch        the highest published patch, used only to detect regression
+ *   floor           the published build floor for the canonical marketing version
+ *   forcedVersion   accepted only when exactly equal to 1.0.<commitCount>
+ *   forcedBuild     accepted only when exactly equal to <commitCount>
  *
  * Returns { marketing, build } as strings.
  */
 export function planVersion({
   prefix = "1.0",
-  ascPatch = 0,
+  ascPatch,
   forcedVersion = "",
   forcedBuild = "",
-  commitCount = 0,
-  floor = 0
+  commitCount,
+  floor,
+  historyIsShallow = false,
+  projectMarketing = ""
 } = {}) {
   const train = String(prefix || "1.0");
-  const patch = Number.isFinite(ascPatch) ? Math.max(0, Math.trunc(ascPatch)) : 0;
-
-  let marketing;
-  let targetPatch;
-  if (forcedVersion) {
-    marketing = String(forcedVersion);
-    targetPatch = ownPatch(marketing);
-  } else {
-    marketing = `${train}.${patch + 1}`;
-    targetPatch = patch + 1;
+  const commits = Number(commitCount);
+  if (train !== "1.0") throw new Error(`fleet releases must use the 1.0.N marketing train (received ${train})`);
+  if (historyIsShallow) throw new Error("full repository history is required to select the release number");
+  if (!Number.isSafeInteger(commits) || commits < 1) throw new Error("full repository commit count is unavailable");
+  const publishedPatch = integerBuild(ascPatch);
+  if (publishedPatch === null) throw new Error("published marketing version is unknown or invalid");
+  if (publishedPatch >= commits) {
+    throw new Error(`published marketing patch ${publishedPatch} conflicts with repository commit count ${commits}; refusing a marketing regression`);
   }
-
-  let build;
-  if (forcedBuild !== "" && forcedBuild !== null && forcedBuild !== undefined) {
-    // An explicit --build is honoured exactly, except that it may not recreate
-    // the retired "1.0.N (N)" pair:  the ship script refuses that, so the
-    // reference copy of the rules refuses it too.
-    build = String(forcedBuild);
-    if (targetPatch !== null && build === String(targetPatch)) {
-      throw new Error(`--build ${build} equals the patch of ${marketing}; that is the retired 1.0.N (N) form`);
-    }
-  } else {
-    const commits = Number.isFinite(commitCount) ? Math.trunc(commitCount) : 0;
-    const known = Number.isFinite(floor) ? Math.trunc(floor) : 0;
-    let candidate = commits;
-    if (candidate <= known) candidate = known + 1;
-    // A ship must never look like "1.0.N (N)":  if the build number happens to
-    // be the patch number, move it one up.
-    if (targetPatch !== null && candidate === targetPatch) candidate += 1;
-    build = String(candidate);
+  const knownFloor = integerBuild(floor);
+  if (knownFloor === null) throw new Error("published build floor is unknown or invalid");
+  if (knownFloor >= commits) {
+    throw new Error(`published build floor ${knownFloor} conflicts with repository commit count ${commits}; refusing to mint a replacement number`);
   }
-
+  const marketing = `${train}.${commits}`;
+  const build = String(commits);
+  if (forcedVersion && String(forcedVersion) !== marketing) {
+    throw new Error(`--version ${forcedVersion} conflicts with canonical marketing version ${marketing}`);
+  }
+  if (forcedBuild !== "" && forcedBuild !== null && forcedBuild !== undefined && String(forcedBuild) !== build) {
+    throw new Error(`--build ${forcedBuild} conflicts with canonical build number ${build}`);
+  }
+  const recordedPatch = parsePatch(projectMarketing, train);
+  if (projectMarketing && recordedPatch === null) {
+    throw new Error(`project marketing version ${projectMarketing} is not on the ${train}.N train`);
+  }
+  if (recordedPatch !== null && recordedPatch >= commits) {
+    throw new Error(`project marketing version ${projectMarketing} conflicts with canonical version ${marketing}`);
+  }
   return { marketing, build };
 }
