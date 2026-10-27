@@ -122,4 +122,29 @@ describe('ogeLocalOcrRuntime probe caching', () => {
     expect(second).not.toBe(first);
     expect(fake.calls).toHaveLength(2);
   });
+
+  it('shares one in-flight probe across concurrent callers (no duplicate spawns)', async () => {
+    const fake = installFakeDeno(pdftoppmMissingHandler);
+    restoreFake = fake.restore;
+    const backend = createDenoLocalOcrBackend({ now: () => 3_000_000 });
+
+    const results = await Promise.all([backend.probe(), backend.probe(), backend.probe()]);
+
+    expect(results.every((r) => r.ok === false)).toBe(true);
+    expect(results[1]).toBe(results[0]);
+    expect(results[2]).toBe(results[0]);
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  it('shares one in-flight successful probe across concurrent callers', async () => {
+    const fake = installFakeDeno(successHandler);
+    restoreFake = fake.restore;
+    const backend = createDenoLocalOcrBackend();
+
+    const [a, b] = await Promise.all([backend.probe(), backend.probe()]);
+
+    expect(a.ok).toBe(true);
+    expect(b).toBe(a);
+    expect(fake.calls).toHaveLength(3);
+  });
 });

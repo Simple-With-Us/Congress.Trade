@@ -109,47 +109,60 @@ export function createDenoLocalOcrBackend(
   const now = options.now ?? Date.now;
   let probeCache: OgeLocalOcrProbe | null = null;
   let probeFailure: { probe: OgeLocalOcrProbe; cachedAtMs: number } | null = null;
+  // Concurrent callers on a cold instance share one in-flight probe, so a
+  // burst of OCR-eligible filings spawns the probe binaries once rather than
+  // once per filing before either cache is populated.
+  let inflightProbe: Promise<OgeLocalOcrProbe> | null = null;
+
+  const runProbe = async (): Promise<OgeLocalOcrProbe> => {
+    // A successful probe is cached for the life of the instance.  A failure
+    // is cached only briefly: without a negative cache a persistently
+    // missing binary would re-spawn up to three processes on every
+    // OCR-eligible filing, but a failure may be transient (a spawn timeout
+    // under cold-container load, resource exhaustion), so the cache must
+    // expire and self-heal instead of disabling the pass for the life of
+    // the process.
+    const cacheFailure = (probe: OgeLocalOcrProbe): OgeLocalOcrProbe => {
+      probeFailure = { probe, cachedAtMs: now() };
+      return probe;
+    };
+    const pdftoppm = await runBinary(PDFTOPPM, ['-v'], probeTimeoutMs);
+    if (pdftoppm.code !== 0) {
+      return cacheFailure({ ok: false, reason: 'pdftoppm_not_available' });
+    }
+    const tesseract = await runBinary(TESSERACT, ['--version'], probeTimeoutMs);
+    if (tesseract.code !== 0) {
+      return cacheFailure({ ok: false, reason: 'tesseract_not_available' });
+    }
+    // The English traineddata ships in its own package on Alpine
+    // (tesseract-ocr-data-eng).  Without it tesseract exits 0 but prints
+    // "Failed loading language 'eng'" and returns no text, which would look
+    // like a clean scan with zero rows.  Fail closed instead.
+    const langs = await runBinary(TESSERACT, ['--list-langs'], probeTimeoutMs);
+    if (langs.code === 0 && !/\beng\b/.test(langs.stdout)) {
+      return cacheFailure({ ok: false, reason: 'tesseract_english_data_missing' });
+    }
+    probeCache = {
+      ok: true,
+      pdftoppm: (pdftoppm.stderr || pdftoppm.stdout).trim().split('\n')[0],
+      tesseract: (tesseract.stdout || tesseract.stderr).trim().split('\n')[0],
+    };
+    probeFailure = null;
+    return probeCache;
+  };
 
   return {
     async probe(): Promise<OgeLocalOcrProbe> {
       if (probeCache) return probeCache;
-      // A successful probe is cached for the life of the instance.  A failure
-      // is cached only briefly: without a negative cache a persistently
-      // missing binary would re-spawn up to three processes on every
-      // OCR-eligible filing, but a failure may be transient (a spawn timeout
-      // under cold-container load, resource exhaustion), so the cache must
-      // expire and self-heal instead of disabling the pass for the life of
-      // the process.
       if (probeFailure && (now() - probeFailure.cachedAtMs) < probeFailureCacheTtlMs) {
         return probeFailure.probe;
       }
-      const cacheFailure = (probe: OgeLocalOcrProbe): OgeLocalOcrProbe => {
-        probeFailure = { probe, cachedAtMs: now() };
-        return probe;
-      };
-      const pdftoppm = await runBinary(PDFTOPPM, ['-v'], probeTimeoutMs);
-      if (pdftoppm.code !== 0) {
-        return cacheFailure({ ok: false, reason: 'pdftoppm_not_available' });
+      if (!inflightProbe) {
+        inflightProbe = runProbe().finally(() => {
+          inflightProbe = null;
+        });
       }
-      const tesseract = await runBinary(TESSERACT, ['--version'], probeTimeoutMs);
-      if (tesseract.code !== 0) {
-        return cacheFailure({ ok: false, reason: 'tesseract_not_available' });
-      }
-      // The English traineddata ships in its own package on Alpine
-      // (tesseract-ocr-data-eng).  Without it tesseract exits 0 but prints
-      // "Failed loading language 'eng'" and returns no text, which would look
-      // like a clean scan with zero rows.  Fail closed instead.
-      const langs = await runBinary(TESSERACT, ['--list-langs'], probeTimeoutMs);
-      if (langs.code === 0 && !/\beng\b/.test(langs.stdout)) {
-        return cacheFailure({ ok: false, reason: 'tesseract_english_data_missing' });
-      }
-      probeCache = {
-        ok: true,
-        pdftoppm: (pdftoppm.stderr || pdftoppm.stdout).trim().split('\n')[0],
-        tesseract: (tesseract.stdout || tesseract.stderr).trim().split('\n')[0],
-      };
-      probeFailure = null;
-      return probeCache;
+      return inflightProbe;
     },
 
     async readPages(
