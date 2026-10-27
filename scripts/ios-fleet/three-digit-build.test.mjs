@@ -13,3 +13,8 @@ test('integer component above999 is unsafe even if expired',()=>assert.throws(()
 test('missing/incomplete/malformed inventory refuses',()=>{
  for(const patch of [{complete:false},{platform:'TV_OS'},{trainBuilds:['NaN']},{trainBuilds:[null]},{allPlatformBuilds:null}]) assert.throws(()=>next({...input,...patch}));
 });
+
+test('iOS validates unused cross-train inventory without applying its floor',()=>{
+ for(const value of [null,'NaN','1.2.3.4',42,'']) assert.throws(()=>next({...input,allPlatformBuilds:[value]}),/malformed/);
+ assert.equal(next({...input,allPlatformBuilds:['202610180127']}),'100');
+});

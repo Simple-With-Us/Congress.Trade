@@ -2,6 +2,11 @@
 // Single-component three-digit builds must exceed the platform's upload floor.
 export function nextThreeDigitBuild({platform, trainBuilds, allPlatformBuilds, complete}) {
   if (!['IOS','MAC_OS'].includes(platform) || complete !== true || !Array.isArray(trainBuilds) || !Array.isArray(allPlatformBuilds)) throw new Error('complete platform build inventory required');
+  // Validate all supplied evidence before choosing the platform-specific floor.
+  // Other iOS trains do not set its floor, but malformed evidence is never ignored.
+  for (const value of [...trainBuilds, ...allPlatformBuilds]) {
+    if (typeof value !== 'string' || !/^[0-9]+(?:\.[0-9]+){0,2}$/.test(value)) throw new Error('malformed build inventory');
+  }
   const builds = platform === 'MAC_OS' ? [...trainBuilds,...allPlatformBuilds] : trainBuilds;
   let next=100;
   for (const value of builds) {

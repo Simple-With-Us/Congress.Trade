@@ -1065,7 +1065,7 @@ async function main() {
 
   // Read-only, fully paged target-train inventory for the requested ### format.
   if (method === "next-three-digit-build") {
-    const bundleId=path, version=body, platform=arg4 || "IOS";
+    const bundleId=path, version=body, platform=String(arg4 || "IOS").toUpperCase();
     if (!bundleId || !/^\d+\.\d+\.\d+$/.test(version || "") || !["IOS","MAC_OS"].includes(platform)) {
       console.error("next-three-digit-build: exact bundle/version/platform required"); process.exit(2);
     }
