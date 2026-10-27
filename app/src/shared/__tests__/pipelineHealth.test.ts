@@ -373,6 +373,44 @@ describe('evaluatePipelineSignals', () => {
     expect(providerCheck?.detail).toContain('review backlog clear');
   });
 
+  it('does not mark extraction_provider stalled when the backlog is terminal rows only (CT-2448)', () => {
+    // Parked unreadable 278-Ts, rejected rows and attempt-capped cascades
+    // are work no extraction attempt can help.  The provider is idle, not
+    // stalled; the extraction_backlog check still reports the queue.
+    const terminalOnly: PipelineSignals = {
+      ...cleanSignals,
+      reviewBacklog: 7,
+      reviewEligible: 0,
+      reviewSuppressed: 0,
+      reviewTerminal: 7,
+      extractionAttempts24h: 0,
+      extractionOk24h: 0,
+    };
+    const res = evaluatePipelineSignals(terminalOnly, nowMs);
+    const providerCheck = res.checks.find((c) => c.id === 'extraction_provider');
+    expect(providerCheck?.status).toBe('ok');
+    expect(providerCheck?.detail).toContain('terminal rows only');
+    const backlogCheck = res.checks.find((c) => c.id === 'extraction_backlog');
+    expect(backlogCheck?.status).not.toBe('ok');
+  });
+
+  it('marks extraction_provider ok with local activity and no eligible backlog (CT-2448)', () => {
+    const localTerminalOnly: PipelineSignals = {
+      ...cleanSignals,
+      reviewBacklog: 4,
+      reviewEligible: 0,
+      reviewSuppressed: 1,
+      reviewTerminal: 3,
+      extractionAttempts24h: 0,
+      extractionOk24h: 0,
+      localWorkerActivity24h: 2,
+    };
+    const res = evaluatePipelineSignals(localTerminalOnly, nowMs);
+    const providerCheck = res.checks.find((c) => c.id === 'extraction_provider');
+    expect(providerCheck?.status).toBe('ok');
+    expect(providerCheck?.detail).toContain('no eligible review backlog');
+  });
+
   it('flags stalled when outbox pending items exceed max age threshold', () => {
     const oldestMs = nowMs - (120 * 60 * 1000); // 120m old, > 90m limit
     const outboxStallSignals: PipelineSignals = {

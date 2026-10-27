@@ -99,6 +99,12 @@ import {
   resolveVerifiedEmpty,
 } from './normalizer.ts';
 import { assessOgeRowCompleteness, classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import {
+  maybeRecoverOgeRowsViaLocalOcr,
+  ogeLocalOcrAlreadyAttempted,
+  ogeLocalOcrReviewPayload,
+  OGE_LOCAL_OCR_EXTRACTOR,
+} from './ogeLocalOcr.ts';
 import { cleanAssetString } from './nameNormalizer.ts';
 import { prepareExtractedTx } from './prepareTx.ts';
 import { mapFiling, type FilingRow } from '../delivery/rows.ts';
@@ -1846,7 +1852,55 @@ async function maybeSettleExecutiveZeroRead(
     }
   }
   if (classified.disposition === 'unreadable') {
-    const closed = await closeUnreadableExecutive(env, docId, { respectSuppression: true, claimToken });
+    // CT-2448: try the local tesseract pass before parking.  The stored PDF
+    // bytes are already in hand here, so the pass costs no extra fetch.  When
+    // both reads agree the rows go through normalization exactly like the
+    // deterministic recovery above; when they do not, the filing parks as it
+    // does today with the unreconciled rows listed in the payload.
+    let ocrOutcome = null;
+    try {
+      if (!(await ogeLocalOcrAlreadyAttempted(env, docId))) {
+        ocrOutcome = await maybeRecoverOgeRowsViaLocalOcr(
+          env,
+          {
+            docId,
+            chamber: filing.chamber ?? '',
+            filingType: filing.filing_type ?? null,
+          },
+          bytes,
+          'unreadable',
+        );
+      }
+    } catch (err) {
+      console.warn('executive zero-read: local OCR retry failed:', docId, (err as Error).message);
+    }
+    if (ocrOutcome?.status === 'rows') {
+      try {
+        const norm = await normalize(env, mapFiling(filing), ocrOutcome.rows, {
+          extractor: OGE_LOCAL_OCR_EXTRACTOR,
+          parseDisposition: 'rows',
+        });
+        return {
+          kind: 'rows',
+          needsReview: norm.needsReview,
+          published: norm.published,
+          settled: norm.settled === true,
+          rowCount: norm.transactions.length,
+          reason: norm.reviewReason,
+        };
+      } catch (err) {
+        console.warn(
+          'executive zero-read: local OCR rows failed normalization:',
+          docId,
+          (err as Error).message,
+        );
+      }
+    }
+    const closed = await closeUnreadableExecutive(env, docId, {
+      respectSuppression: true,
+      claimToken,
+      payload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
+    });
     return closed ? { kind: 'unreadable' } : null;
   }
   const closed = await closeVerifiedEmptyExecutive(env, docId, { respectSuppression: true, claimToken });

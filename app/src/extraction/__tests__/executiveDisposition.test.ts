@@ -1064,3 +1064,44 @@ describe('recoverExpiredCappedReviews', () => {
     expect(row.agreement_claim_token).toEqual(expect.any(String));
   });
 });
+
+describe('unreadable re-park payload (CT-2448)', () => {
+  it('persists a second OCR attempt payload on an already-parked row', async () => {
+    const db = await sqliteDatabase();
+    seedReview(db, TRUMP_UNREADABLE_DOC_ID, 'agreement_cascade_unresolved');
+    const env = envFor(db);
+    const first = {
+      extractor: 'ogeLocalOcr',
+      transactionCount: 0,
+      truncated: false,
+      localOcr: {
+        attempted: true,
+        reason: 'oge_local_ocr_not_reconciled',
+        pagesRead: 3,
+        cropped: true,
+        unreconciled: [],
+      },
+    };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: first })).toBe(true);
+
+    // A second attempt (e.g. the agreement lane after an earlier pass parked
+    // without a payload) must record its own localOcr section even though the
+    // row already carries the unreadable reason.
+    const second = {
+      ...first,
+      localOcr: { ...first.localOcr, reason: 'reconciled' },
+    };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: second })).toBe(true);
+    const row = db.prepare(`SELECT payload FROM review_queue WHERE doc_id = ?`)
+      .get(TRUMP_UNREADABLE_DOC_ID) as { payload: string };
+    expect((JSON.parse(row.payload) as { localOcr: { reason: string } }).localOcr.reason)
+      .toBe('reconciled');
+
+    // A payload-less re-park still matches nothing and preserves the payload.
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID)).toBe(false);
+    const kept = db.prepare(`SELECT payload FROM review_queue WHERE doc_id = ?`)
+      .get(TRUMP_UNREADABLE_DOC_ID) as { payload: string };
+    expect((JSON.parse(kept.payload) as { localOcr: { reason: string } }).localOcr.reason)
+      .toBe('reconciled');
+  });
+});

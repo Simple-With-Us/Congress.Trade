@@ -22,7 +22,7 @@
  */
 
 import type { Env } from '../shared/types.ts';
-import { all, batch, get, type SqlParam } from '../shared/db.ts';
+import { all, batch, get, run, type SqlParam } from '../shared/db.ts';
 import { AGREEMENT_CLAIM_LEASE_MS } from './agreement.ts';
 import {
   OGE_TEXT_UNREADABLE_DECISION_ACTION,
@@ -137,6 +137,12 @@ export interface ExecutiveCloseOptions {
    * matching nothing (which would let routeToReview park an unresolved row).
    */
   insertIfAbsent?: boolean;
+  /**
+   * Extra JSON for the review_queue payload.  Used by the local OGE OCR pass
+   * to record which rows did not reconcile (CT-2448), so the parked filing
+   * shows the operator what the scan did and did not yield.
+   */
+  payload?: Record<string, unknown> | null;
 }
 
 async function hasLiveTransactions(env: Env, docId: string): Promise<boolean> {
@@ -370,7 +376,8 @@ const UNREADABLE_DECISION_PAYLOAD = JSON.stringify({
  * Leave the review open with the unreadable reason, move the filing to
  * needs_review, and write one filing-skip decision.  `reviewSql` is the
  * review_queue write (park an open row, or reopen a pipeline auto-reject).
- * A second pass matches nothing.
+ * A second pass matches nothing — unless it carries a new payload, in which
+ * case only the payload is refreshed (see below).
  */
 async function commitUnreadablePark(
   env: Env,
@@ -385,7 +392,7 @@ async function commitUnreadablePark(
     ? [[
         `INSERT OR IGNORE INTO review_queue (
             doc_id, reason, payload, created_at, resolved, agreement_attempts
-          ) SELECT ?, ?, '{}', ?, 0, ?
+          ) SELECT ?, ?, ?, ?, 0, ?
              WHERE NOT EXISTS (SELECT 1 FROM review_queue WHERE doc_id = ?)
                AND EXISTS (
                  SELECT 1 FROM filings WHERE doc_id = ? AND ingest_status <> 'persisted'
@@ -397,6 +404,7 @@ async function commitUnreadablePark(
         [
           docId,
           OGE_TEXT_UNREADABLE_REASON,
+          parkPayloadJson(opts),
           nowIso,
           UNREADABLE_PARK_ATTEMPT_FLOOR,
           docId,
@@ -468,7 +476,28 @@ async function commitUnreadablePark(
       at: nowIso,
     });
   }
-  return changed;
+  // CT-2448 re-park: the review UPDATE above excludes rows already parked as
+  // unreadable, so without this a second OCR attempt's payload would be
+  // dropped on the floor.  When the caller supplied a payload and neither the
+  // INSERT nor the UPDATE wrote the row, refresh the payload on the
+  // already-parked row under the same lease guards.  Metadata-only: no
+  // revision bump and no re-notify — the filing was already parked and
+  // already announced.
+  let payloadRefreshed = false;
+  const payloadJson = opts.payload ? parkPayloadJson(opts) : '{}';
+  if (opts.payload && payloadJson !== '{}' && !reviewChanged) {
+    const where = reviewWhere(opts);
+    const refresh = await run(
+      env.DB,
+      `UPDATE review_queue
+          SET payload = ?
+        WHERE ${where.sql}
+          AND COALESCE(reason, '') LIKE '%oge_text_unreadable%'`,
+      [payloadJson, docId, ...where.params],
+    );
+    payloadRefreshed = (refresh?.meta?.changes ?? 0) > 0;
+  }
+  return changed || payloadRefreshed;
 }
 
 function openUnreadableParkSql(
@@ -476,10 +505,17 @@ function openUnreadableParkSql(
   opts: ExecutiveCloseOptions,
 ): { sql: string; params: SqlParam[] } {
   const where = reviewWhere(opts);
+  // The payload column is only rewritten when the caller supplied one.  An
+  // unconditional write would wipe a previous payload (staged candidates,
+  // an earlier OCR attempt) back to '{}' on every re-park.
+  const setPayload = opts.payload ? 'payload = ?,' : '';
+  const params: SqlParam[] = [OGE_TEXT_UNREADABLE_REASON];
+  if (opts.payload) params.push(parkPayloadJson(opts));
   return {
     sql: `UPDATE review_queue
             SET resolved = 0,
                 reason = ?,
+                ${setPayload}
                 agreement_claim_token = NULL,
                 agreement_claimed_at = NULL,
                 agreement_next_attempt_at = NULL,
@@ -496,13 +532,27 @@ function openUnreadableParkSql(
             AND NOT ${SUCCESSFUL_NONEMPTY_READ_SQL}
             AND NOT (COALESCE(json_extract(payload, '$.transactionCount'), 0) > 0)`,
     params: [
-      OGE_TEXT_UNREADABLE_REASON,
+      ...params,
       docId,
       ...where.params,
       docId,
       ...successfulNonemptyReadParams(docId),
     ],
   };
+}
+
+/**
+ * Serialize the optional review_queue payload.  A payload that cannot be
+ * serialized falls back to '{}' — a parked filing must still park.
+ */
+function parkPayloadJson(opts: ExecutiveCloseOptions): string {
+  if (!opts.payload) return '{}';
+  try {
+    const json = JSON.stringify(opts.payload);
+    return json && json !== '{}' ? json : '{}';
+  } catch {
+    return '{}';
+  }
 }
 
 /** Garbled / refused deterministic read.  Not an empty filing, and not a terminal reject. */

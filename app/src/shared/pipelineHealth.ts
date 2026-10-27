@@ -674,24 +674,31 @@ export function evaluatePipelineSignals(
   } else {
     const halted = Boolean(s.autopilotHaltReason);
     const backlog = s.reviewBacklog ?? 0;
+    // CT-2448: a terminal-only backlog is work no extraction attempt can
+    // help — parked unreadable 278-Ts, rejected rows, attempt-capped
+    // cascades.  Those rows must never mark the provider stalled, so the
+    // stall signal counts only the rows that are still ELIGIBLE for a read.
+    // reviewEligible is collected together with reviewBacklog; when it is
+    // missing, fall back to the backlog count rather than going quiet.
+    const eligibleBacklog = s.reviewEligible ?? s.reviewBacklog ?? 0;
     const localActive = (s.localWorkerActivity24h ?? 0) > 0;
-    if (halted || (backlog > 0 && !localActive)) {
+    if (halted || (eligibleBacklog > 0 && !localActive)) {
       checks.push({
         id: 'extraction_provider',
         status: 'stalled',
         detail: halted
           ? `No extraction attempts in 24h while autopilot is halted (${s.autopilotHaltReason})`
-          : `No extraction attempts in 24h while review backlog is ${backlog}`,
+          : `No extraction attempts in 24h while review backlog is ${eligibleBacklog}`,
         value: 0,
       });
-    } else if (localActive && backlog > 0) {
+    } else if (localActive && eligibleBacklog > 0) {
       // The Mac/server local-vision workers publish scans without writing
       // extraction_runs; a busy local drain with backlog is activity, not a
       // stall — but still degraded while provider extractors stay idle.
       checks.push({
         id: 'extraction_provider',
         status: 'degraded',
-        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) while review backlog is ${backlog}`,
+        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) while review backlog is ${eligibleBacklog}`,
         value: s.localWorkerActivity24h ?? 0,
       });
     } else if (localActive) {
@@ -699,7 +706,9 @@ export function evaluatePipelineSignals(
       checks.push({
         id: 'extraction_provider',
         status: 'ok',
-        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and review backlog clear`,
+        detail: backlog > 0
+          ? `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and no eligible review backlog`
+          : `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and review backlog clear`,
         value: s.localWorkerActivity24h ?? 0,
       });
     } else {
@@ -708,10 +717,16 @@ export function evaluatePipelineSignals(
         weekday: 'short',
       }).format(new Date(nowMs));
       const isWeekend = weekdayEt === 'Sat' || weekdayEt === 'Sun';
+      // A backlog made only of terminal rows (parked unreadable 278-Ts,
+      // rejected rows) is reported by the extraction_backlog check; the
+      // provider itself is idle, not stalled.
+      const terminalOnly = backlog > 0 && eligibleBacklog === 0;
       checks.push({
         id: 'extraction_provider',
         status: 'ok',
-        detail: isWeekend
+        detail: terminalOnly
+          ? 'No extraction attempts in 24h (review backlog is terminal rows only)'
+          : isWeekend
           ? 'No extraction attempts in 24h (expected on weekend)'
           : 'No extraction attempts in 24h',
         value: 0
