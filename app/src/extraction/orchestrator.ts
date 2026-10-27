@@ -25,6 +25,7 @@ import {
 } from '../extractors/types.ts';
 import { isDeterministicExtractor, normalize } from './normalizer.ts';
 import {
+  isOgeLocalOcrCandidate,
   maybeRecoverOgeRowsViaLocalOcr,
   ogeLocalOcrReviewPayload,
   OGE_LOCAL_OCR_EXTRACTOR,
@@ -419,8 +420,11 @@ export async function extractParsed(
   // CT-2448: copy the PDF for the local OCR retry before the extractor runs.
   // An extractor may detach the buffer it is handed (pdf.js takes ownership),
   // which would leave the retry with an empty document.  Only copied when
-  // asked for, so the admin reprocess path keeps its current memory profile.
-  const ocrBytes = options?.keepBytes ? bytes.slice(0) : undefined;
+  // asked for AND the filing is an executive 278-T the pass can actually
+  // retry — every other extraction skips the duplicate buffer.  Readability
+  // is known only after extraction, so a 278-T with a text layer still pays
+  // for one unused copy; the admin reprocess path (no keepBytes) copies never.
+  const ocrBytes = options?.keepBytes && isOgeLocalOcrCandidate(filing) ? bytes.slice(0) : undefined;
 
   let result;
   try {

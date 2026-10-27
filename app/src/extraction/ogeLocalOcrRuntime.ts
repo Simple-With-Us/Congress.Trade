@@ -100,15 +100,17 @@ export function createDenoLocalOcrBackend(
   return {
     async probe(): Promise<OgeLocalOcrProbe> {
       if (probeCache) return probeCache;
+      // Only a successful probe is cached.  A failure may be transient (a
+      // spawn timeout under cold-container load, resource exhaustion), and a
+      // permanently cached failure would disable the pass for the life of the
+      // process instead of self-healing on the next filing.
       const pdftoppm = await runBinary(PDFTOPPM, ['-v'], probeTimeoutMs);
       if (pdftoppm.code !== 0) {
-        probeCache = { ok: false, reason: 'pdftoppm_not_available' };
-        return probeCache;
+        return { ok: false, reason: 'pdftoppm_not_available' };
       }
       const tesseract = await runBinary(TESSERACT, ['--version'], probeTimeoutMs);
       if (tesseract.code !== 0) {
-        probeCache = { ok: false, reason: 'tesseract_not_available' };
-        return probeCache;
+        return { ok: false, reason: 'tesseract_not_available' };
       }
       // The English traineddata ships in its own package on Alpine
       // (tesseract-ocr-data-eng).  Without it tesseract exits 0 but prints
@@ -116,8 +118,7 @@ export function createDenoLocalOcrBackend(
       // like a clean scan with zero rows.  Fail closed instead.
       const langs = await runBinary(TESSERACT, ['--list-langs'], probeTimeoutMs);
       if (langs.code === 0 && !/\beng\b/.test(langs.stdout)) {
-        probeCache = { ok: false, reason: 'tesseract_english_data_missing' };
-        return probeCache;
+        return { ok: false, reason: 'tesseract_english_data_missing' };
       }
       probeCache = {
         ok: true,
@@ -220,7 +221,7 @@ export function createDenoLocalOcrBackend(
 
 let singleton: OgeLocalOcrBackend | null = null;
 
-/** The shared backend instance (the probe result is cached per instance). */
+/** The shared backend instance (a successful probe is cached per instance). */
 export function denoLocalOcrBackend(): OgeLocalOcrBackend {
   if (!singleton) singleton = createDenoLocalOcrBackend();
   return singleton;

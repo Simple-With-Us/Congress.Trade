@@ -588,8 +588,20 @@ export function isOgeLocalOcrCandidate(filing: {
   const chamber = (filing.chamber ?? '').trim().toLowerCase();
   if (chamber !== 'executive') return false;
   const filingType = (filing.filingType ?? '').trim().toLowerCase();
-  if (filingType) return filingType === '278t' || filingType.includes('278-t');
-  // Fall back to the doc id shape: E-2026-donald-j-trump-08-12-2026-278t.
+  // Annual and termination markers win over the 278-T match: '278-term'
+  // contains '278-t' as a prefix (same precedence as executiveDisclosureForm
+  // in ogeText.ts).
+  if (
+    filingType.includes('278term') || filingType.includes('278-term')
+    || filingType.includes('278 term')
+  ) return false;
+  if (filingType.includes('278e') || filingType.includes('278-e')) return false;
+  if (filingType === '278t' || filingType.includes('278-t')) return true;
+  // Otherwise the doc id decides.  The watcher stores every filing —
+  // executive 278-Ts included — with the generic filing_type 'P', which says
+  // nothing about the OGE form, so a truthy but uninformative type must not
+  // rule the filing out.  Executive 278-T ids end in '-278t':
+  // E-2026-donald-j-trump-08-12-2026-278t.
   const docId = (filing.docId ?? '').trim().toLowerCase();
   return docId.endsWith('-278t');
 }
@@ -713,7 +725,10 @@ export async function attemptOgeLocalOcr(
   const unreconciled = [...reconciliation.unreconciled, ...gate.rejected];
   const pagesRead = Math.max(primaryPages.length, secondaryPages.length);
 
-  if (!gate.ok) {
+  // A dropped trailing row leaves the survivors 1..N-1, which still look
+  // contiguous — so the gate alone cannot tell a complete read from a
+  // truncated one.  Any unreconciled or rejected row parks the filing.
+  if (!gate.ok || unreconciled.length > 0) {
     return {
       status: 'unreadable',
       reason: `oge_local_ocr_${gate.reason ?? 'not_reconciled'}`,
@@ -846,7 +861,11 @@ export async function ogeLocalOcrAlreadyAttempted(env: Env, docId: string): Prom
     );
     if (!row?.payload) return false;
     const parsed = JSON.parse(row.payload) as { localOcr?: unknown; extractor?: unknown };
-    return Boolean(parsed?.localOcr) || parsed?.extractor === OGE_LOCAL_OCR_EXTRACTOR;
+    // A skipped pass records localOcr with attempted:false — that is not an
+    // attempt, and the agreement lane must still be free to run a real retry.
+    const localOcr = parsed?.localOcr as { attempted?: unknown } | null | undefined;
+    const attempted = typeof localOcr === 'object' && localOcr !== null && localOcr.attempted === true;
+    return attempted || parsed?.extractor === OGE_LOCAL_OCR_EXTRACTOR;
   } catch {
     // A read failure must not block the park; treat it as "not attempted".
     return false;

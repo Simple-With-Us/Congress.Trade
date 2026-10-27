@@ -22,7 +22,7 @@
  */
 
 import type { Env } from '../shared/types.ts';
-import { all, batch, get, type SqlParam } from '../shared/db.ts';
+import { all, batch, get, run, type SqlParam } from '../shared/db.ts';
 import { AGREEMENT_CLAIM_LEASE_MS } from './agreement.ts';
 import {
   OGE_TEXT_UNREADABLE_DECISION_ACTION,
@@ -376,7 +376,8 @@ const UNREADABLE_DECISION_PAYLOAD = JSON.stringify({
  * Leave the review open with the unreadable reason, move the filing to
  * needs_review, and write one filing-skip decision.  `reviewSql` is the
  * review_queue write (park an open row, or reopen a pipeline auto-reject).
- * A second pass matches nothing.
+ * A second pass matches nothing — unless it carries a new payload, in which
+ * case only the payload is refreshed (see below).
  */
 async function commitUnreadablePark(
   env: Env,
@@ -475,7 +476,28 @@ async function commitUnreadablePark(
       at: nowIso,
     });
   }
-  return changed;
+  // CT-2448 re-park: the review UPDATE above excludes rows already parked as
+  // unreadable, so without this a second OCR attempt's payload would be
+  // dropped on the floor.  When the caller supplied a payload and neither the
+  // INSERT nor the UPDATE wrote the row, refresh the payload on the
+  // already-parked row under the same lease guards.  Metadata-only: no
+  // revision bump and no re-notify — the filing was already parked and
+  // already announced.
+  let payloadRefreshed = false;
+  const payloadJson = opts.payload ? parkPayloadJson(opts) : '{}';
+  if (opts.payload && payloadJson !== '{}' && !reviewChanged) {
+    const where = reviewWhere(opts);
+    const refresh = await run(
+      env.DB,
+      `UPDATE review_queue
+          SET payload = ?
+        WHERE ${where.sql}
+          AND COALESCE(reason, '') LIKE '%oge_text_unreadable%'`,
+      [payloadJson, docId, ...where.params],
+    );
+    payloadRefreshed = (refresh?.meta?.changes ?? 0) > 0;
+  }
+  return changed || payloadRefreshed;
 }
 
 function openUnreadableParkSql(

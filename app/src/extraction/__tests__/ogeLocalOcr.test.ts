@@ -66,6 +66,23 @@ const NON_CANONICAL_BODY = [
   '3 Invesco QQQ Trust, Series 1 (QQQ) Purchase 06/13/2022 No $15,001 - $50,000',
 ].join('\n');
 
+// Same rows as CLEAN_BODY except the LAST row's date drifted: the surviving
+// 1..2 still look contiguous, so only the unreconciled row stops publication.
+const TRAILING_DATE_DRIFT_BODY = [
+  '1 Amazon.com, Inc. (AMZN) Sale 06/10/2022 No $1,001 - $15,000',
+  '2 SPDR S&P 500 ETF Trust (SPY) Purchase 06/13/2022 No $1,001 - $15,000',
+  '3 Invesco QQQ Trust, Series 1 (QQQ) Purchase 06/14/2022 No $15,001 - $50,000',
+].join('\n');
+
+// Same shape, but the last row fails the gate instead of reconciliation: the
+// amount spans two STOCK Act brackets, so rows 1..2 survive while row 3 is
+// rejected.  Publishing the survivors would silently drop a transaction.
+const TRAILING_NON_CANONICAL_BODY = [
+  '1 Amazon.com, Inc. (AMZN) Sale 06/10/2022 No $1,001 - $15,000',
+  '2 SPDR S&P 500 ETF Trust (SPY) Purchase 06/13/2022 No $1,001 - $15,000',
+  '3 Invesco QQQ Trust, Series 1 (QQQ) Purchase 06/13/2022 No $1,001 - $50,000',
+].join('\n');
+
 function testSettings(overrides: Partial<OgeLocalOcrSettings> = {}): OgeLocalOcrSettings {
   return {
     enabled: true,
@@ -181,6 +198,31 @@ describe('attemptOgeLocalOcr', () => {
     expect(outcome.status).toBe('unreadable');
     if (outcome.status !== 'unreadable') throw new Error('expected park');
     const bad = outcome.unreconciled.find((r) => r.index === 2);
+    expect(bad?.reason).toBe(OGE_LOCAL_OCR_REASONS.nonCanonicalBracket);
+  });
+
+  it('parks instead of publishing a truncated set when the trailing row disagrees', async () => {
+    const backend = fakeBackend({ 400: [page(CLEAN_BODY)], 600: [page(TRAILING_DATE_DRIFT_BODY)] });
+    const outcome = await attemptOgeLocalOcr(request(), { backend, settings: testSettings() });
+
+    // Rows 1..2 reconcile and look contiguous, but row 3 did not: publishing
+    // the survivors would silently drop a transaction.
+    expect(outcome.status).toBe('unreadable');
+    if (outcome.status !== 'unreadable') throw new Error('expected park');
+    const drift = outcome.unreconciled.find((r) => r.index === 3);
+    expect(drift?.reason).toBe(OGE_LOCAL_OCR_REASONS.dateDisagreement);
+  });
+
+  it('parks instead of publishing a truncated set when the trailing row fails the gate', async () => {
+    const backend = fakeBackend({
+      400: [page(TRAILING_NON_CANONICAL_BODY)],
+      600: [page(TRAILING_NON_CANONICAL_BODY)],
+    });
+    const outcome = await attemptOgeLocalOcr(request(), { backend, settings: testSettings() });
+
+    expect(outcome.status).toBe('unreadable');
+    if (outcome.status !== 'unreadable') throw new Error('expected park');
+    const bad = outcome.unreconciled.find((r) => r.index === 3);
     expect(bad?.reason).toBe(OGE_LOCAL_OCR_REASONS.nonCanonicalBracket);
   });
 
@@ -342,6 +384,29 @@ describe('isOgeLocalOcrCandidate', () => {
     expect(isOgeLocalOcrCandidate({ chamber: 'executive', filingType: '278e' })).toBe(false);
     expect(isOgeLocalOcrCandidate({ chamber: 'executive' })).toBe(false);
   });
+
+  it('falls back to the doc id when the stored filing type is the generic P', () => {
+    // The watcher stores every filing — executive 278-Ts included — with
+    // filing_type 'P', which says nothing about the OGE form.
+    expect(
+      isOgeLocalOcrCandidate({
+        chamber: 'executive',
+        filingType: 'P',
+        docId: 'E-2026-donald-j-trump-08-12-2026-278t',
+      }),
+    ).toBe(true);
+    expect(
+      isOgeLocalOcrCandidate({ chamber: 'executive', filingType: 'P', docId: 'E-2026-jane-doe-278e' }),
+    ).toBe(false);
+    expect(isOgeLocalOcrCandidate({ chamber: 'executive', filingType: 'P' })).toBe(false);
+  });
+
+  it('lets an explicit annual or termination marker win over the 278-T match', () => {
+    // '278-term' contains '278-t' as a prefix; the exclusion must come first
+    // (same precedence as executiveDisclosureForm in ogeText.ts).
+    expect(isOgeLocalOcrCandidate({ chamber: 'executive', filingType: '278-term' })).toBe(false);
+    expect(isOgeLocalOcrCandidate({ chamber: 'executive', filingType: '278e' })).toBe(false);
+  });
 });
 
 describe('ogeLocalOcrSettings', () => {
@@ -433,6 +498,17 @@ describe('ogeLocalOcrAlreadyAttempted', () => {
       ),
     ).toBe(false);
   });
+
+  it('does not treat a skipped pass as an attempt', async () => {
+    // A skipped park records localOcr with attempted:false; the agreement lane
+    // must still be free to run a real retry on the same filing.
+    expect(
+      await ogeLocalOcrAlreadyAttempted(
+        envWithPayload(JSON.stringify({ localOcr: { attempted: false, reason: 'no_pdf_bytes' } })),
+        'E-1',
+      ),
+    ).toBe(false);
+  });
 });
 
 // Optional real-binary coverage: renders one synthetic 278-T page with the
@@ -476,5 +552,33 @@ describe.runIf(REAL_BINARIES)('local OCR toolchain (real binaries)', () => {
     const rec = reconcileOgeLocalOcrReads(primary, secondary);
     expect(rec.unreconciled).toHaveLength(0);
     expect(gateOgeLocalOcrRows(rec.rows).ok).toBe(true);
+  }, 120_000);
+
+  it('OCRs a list file of rendered pages in one invocation (production argv shape)', async () => {
+    // readPages passes a pages.txt list file as tesseract's input image and
+    // splits the joined output on form feeds.  This pins that contract against
+    // the installed binary: the run must exit 0 with one \f-separated part
+    // per listed page.  (The tesseract FAQ documents the same list mode.)
+    const dir = mkdtempSync(join(tmpdir(), 'oge-ocr-list-'));
+    const pdf = await PDFDocument.create();
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    for (const line of CLEAN_BODY.split('\n')) {
+      const page = pdf.addPage([612, 792]);
+      page.drawText(line, { x: 40, y: 740, size: 12, font });
+    }
+    const path = join(dir, 'scan.pdf');
+    writeFileSync(path, await pdf.save());
+
+    execSync(`pdftoppm -png -r 400 -f 1 -l 3 ${path} ${dir}/page`, { stdio: 'pipe' });
+    const listPath = join(dir, 'pages.txt');
+    writeFileSync(listPath, [1, 2, 3].map((n) => join(dir, `page-${n}.png`)).join('\n') + '\n');
+    execSync(`tesseract ${listPath} ${dir}/ocr --psm 4`, { stdio: 'pipe' });
+    const { readFileSync } = await import('node:fs');
+    const parts = readFileSync(join(dir, 'ocr.txt'), 'utf8').split('\f');
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0]).toContain('Amazon');
+    expect(parts[1]).toContain('SPDR');
+    expect(parts[2]).toContain('QQQ');
   }, 120_000);
 });
