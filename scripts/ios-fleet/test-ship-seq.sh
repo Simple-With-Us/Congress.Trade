@@ -42,11 +42,25 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SHIP="${SCRIPT_DIR}/ship-testflight.sh"
+# Sections 1-11 test the unchanged next-patch behaviour, so they run a copy of
+# the fleet dir whose apps.json carries no fixed-version keys.  Section 12 tests
+# the keys on their own copy.
+LEGACY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-legacy.XXXXXX")"
+cp -R "$SCRIPT_DIR/." "$LEGACY_DIR/"
+python3 - "$LEGACY_DIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+for a in d["apps"].values():
+    a.pop("fixedMarketingVersion", None)
+    a.pop("buildCountSeed", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+SHIP="${LEGACY_DIR}/ship-testflight.sh"
 [[ -f "$SHIP" ]] || { echo "missing $SHIP"; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ios-fleet-seq-test.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK" "$LEGACY_DIR"' EXIT
 
 FAKE_HOME="${WORK}/home"
 FAKE_BIN="${WORK}/bin"
@@ -78,7 +92,7 @@ cmd=""
 for a in "$@"; do
   case "$a" in
     */asc-api.mjs) cmd="asc-api" ;;
-    latest-marketing-patch|build-floor)
+    latest-marketing-patch|build-floor|released-store-version|next-dotted-build)
       if [[ "$cmd" == "asc-api" ]]; then cmd="${cmd}:${a}"; fi
       ;;
   esac
@@ -90,6 +104,17 @@ case "$cmd" in
     [[ "${FAKE_ASC_PATCH:-}" == "auth" ]] && exit 4
     [[ -n "${FAKE_ASC_PATCH:-}" ]] || exit 2
     printf '%s\n' "$FAKE_ASC_PATCH"
+    exit 0
+    ;;
+  asc-api:released-store-version)
+    [[ "${FAKE_RELEASED:-}" == "fail" ]] && exit 2
+    printf '%s\n' "${FAKE_RELEASED:-}"
+    exit 0
+    ;;
+  asc-api:next-dotted-build)
+    [[ "${FAKE_DOTTED:-}" == "fail" ]] && exit 3
+    [[ -n "${FAKE_DOTTED:-}" ]] || exit 2
+    printf '%s\n' "$FAKE_DOTTED"
     exit 0
     ;;
   asc-api:build-floor)
@@ -156,6 +181,8 @@ run_ship() {
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
+    FAKE_RELEASED="${FAKE_RELEASED:-}" \
+    FAKE_DOTTED="${FAKE_DOTTED:-}" \
     bash "$SHIP" "$@" 2>&1)"
   RC=$?
   return 0
@@ -202,6 +229,19 @@ project_rel() { # <app key>
     usage|usage-local) printf '%s' 'ios/UsageMonitor/UsageMonitor.xcodeproj' ;;
     *)                 return 1 ;;
   esac
+}
+
+# The train prefix an app ships on, read from this repo's apps.json
+# (marketingVersionDefault, first two components).  Expectations below use it
+# so moving one app to a new train (Congress.Trade -> 1.1) does not need the
+# other apps' assertions to change.
+train_prefix() { # <app key>
+  node -e '
+    const a = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).apps[process.argv[2]];
+    const m = /^(\d+)\.(\d+)\./.exec(String(a && a.marketingVersionDefault));
+    if (!m) process.exit(1);
+    console.log(m[1] + "." + m[2]);
+  ' "${SCRIPT_DIR}/apps.json" "$1"
 }
 
 write_record() { # <app key> <record N>
@@ -257,8 +297,18 @@ check "the local counter is not advanced (it is not the build number now)" \
   "$([[ "$(seq_now)" == "5" ]] && echo 0 || echo 1)"
 check "the planned build number is the commit count" \
   "$(contains "build=${COMMIT_COUNT}" && echo 0 || echo 1)"
+# Pin the trains explicitly so a wrong or reverted marketingVersionDefault in
+# apps.json fails here instead of passing because the helper agrees with it.
+check "congress ships on the 1.0 train" \
+  "$([[ "$(train_prefix congress)" == "1.0" ]] && echo 0 || echo 1)"
+for app in socratic usage; do
+  check "${app} stays on the 1.0 train" \
+    "$([[ "$(train_prefix "$app")" == "1.0" ]] && echo 0 || echo 1)"
+done
+check "the plan report reads the congress train from apps.json" \
+  "$([[ "$(node -e 'import("./asc-api.mjs").catch(()=>{})' >/dev/null 2>&1; grep -c trainPrefixForBundle "${SCRIPT_DIR}/asc-api.mjs")" -ge 2 ]] && echo 0 || echo 1)"
 check "an unverified patch plans the first patch of the train" \
-  "$(contains 'marketing=1.0.1 build=' && echo 0 || echo 1)"
+  "$(contains "marketing=$(train_prefix congress).1 build=" && echo 0 || echo 1)"
 check "says loudly that the patch was unverified" \
   "$(contains 'UNVERIFIED' && echo 0 || echo 1)"
 echo
@@ -316,17 +366,17 @@ for app in socratic congress usage usage-local; do
   bn="$PLANNED_BUILD"
 
   check "${app}: the marketing version is the next patch on the train (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
   check "${app}: the build number is the repo commit count (got '${bn}')" \
     "$([[ "$bn" == "$COMMIT_COUNT" ]] && echo 0 || echo 1)"
   check "${app}: the build number is not the patch number (no '1.0.N (N)')" \
     "$([[ "$bn" != "237" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   check "${app}: reports the App Store Connect rendering" \
     "$(contains "will show this as: ${mk} (${bn})" && echo 0 || echo 1)"
   check "${app}: prints the version plan line" \
-    "$(contains 'version plan: asc_patch=236 -> marketing=1.0.237' && echo 0 || echo 1)"
+    "$(contains "version plan: asc_patch=236 -> marketing=$(train_prefix "$app").237" && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -347,9 +397,9 @@ for app in socratic congress usage usage-local; do
   check "${app}: a floor above the commit count raises the build to floor + 1 (got '${bn}')" \
     "$([[ "$bn" == "$((FLOOR_HIGH + 1))" ]] && echo 0 || echo 1)"
   check "${app}: the floor does not move the marketing version (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -371,7 +421,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: the build is floored against the pinned train (got '${bn}')" \
     "$([[ "$bn" == "202610180037" ]] && echo 0 || echo 1)"
   check "${app}: the marketing version is not 1.0.<build> (got '${mk}' / '${bn}')" \
-    "$([[ "$mk" != "1.0.${bn}" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" != "$(train_prefix "$app").${bn}" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -390,7 +440,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: --build is honoured exactly (got '${bn}')" \
     "$([[ "$bn" == "999" ]] && echo 0 || echo 1)"
   check "${app}: --build does not move the marketing version (got '${mk}')" \
-    "$([[ "$mk" == "1.0.237" ]] && echo 0 || echo 1)"
+    "$([[ "$mk" == "$(train_prefix "$app").237" ]] && echo 0 || echo 1)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -407,7 +457,7 @@ for app in socratic congress usage usage-local; do
   check "${app}: says what could not be determined" \
     "$(contains 'cannot determine the next marketing version' && echo 0 || echo 1)"
   check "${app}: does not ship a version it could not verify" \
-    "$(contains 'marketing=1.0.' && echo 1 || echo 0)"
+    "$(contains "marketing=$(train_prefix "$app")." && echo 1 || echo 0)"
   rm -f "${REPO}/$(project_rel "$app")/project.pbxproj"
   rmdir "${REPO}/$(project_rel "$app")" 2>/dev/null || true
 done
@@ -426,7 +476,7 @@ done
 check "three allowed runs leave the counter at 5 (got:${seen})" \
   "$([[ "$seen" == " 5 5 5" ]] && echo 0 || echo 1)"
 check "the run planned the next patch on the train" \
-  "$(contains 'marketing=1.0.237' && echo 0 || echo 1)"
+  "$(contains "marketing=$(train_prefix congress).237" && echo 0 || echo 1)"
 echo
 
 # --- 10. Standing 1-hour gate: just-under skips, at-or-over proceeds -------
@@ -460,6 +510,56 @@ check "a rejected key fails the run (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || 
 check "says the key was rejected" "$(contains 'rejected the API key' && echo 0 || echo 1)"
 check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || echo 0)"
 FAKE_ASC_PATCH=236
+echo
+
+echo "12. fixed marketing version + dotted build (apps.json fixedMarketingVersion)"
+FIXDIR="${WORK}/fleet-fixed"
+rm -rf "$FIXDIR"; cp -R "$SCRIPT_DIR" "$FIXDIR"
+python3 - "$FIXDIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+a = d["apps"]
+for k in list(a)[:1]:
+    a[k]["fixedMarketingVersion"] = "1.1.2"
+    a[k].pop("buildCountSeed", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+FIXAPP="$(python3 -c 'import json,sys; print(list(json.load(open(sys.argv[1]))["apps"])[0])' "$FIXDIR/apps.json")"
+SHIP_REAL="$SHIP"; SHIP="${FIXDIR}/ship-testflight.sh"
+rm -f "${STATE}/build-seq-${FIXAPP}.txt" "${STATE}/last-ship-${FIXAPP}.txt"
+write_record "$FIXAPP" 5
+FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=2383; FAKE_RELEASED=""; FAKE_DOTTED="1.1.2"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "fixed: marketing stays 1.1.2 even though ASC holds patch 239 (got '${PLANNED_MARKETING}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" ]] && echo 0 || echo 1)"
+check "fixed: an empty train plans the first build as the version (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "1.1.2" ]] && echo 0 || echo 1)"
+check "fixed: the integer floor and commit count play no part" \
+  "$(contains 'dotted build 1.1.2 for fixed version 1.1.2' && echo 0 || echo 1)"
+FAKE_DOTTED="1.1.3"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+planned_pair
+check "fixed: a train holding 1.1.2 goes to 1.1.3 (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "1.1.3" ]] && echo 0 || echo 1)"
+FAKE_DOTTED="fail"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a train with a build of another shape stops the run, nothing guessed" \
+  "$(contains 'cannot work out the next dotted build' && echo 0 || echo 1)"
+FAKE_DOTTED=""
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: an unreadable train stops the run" \
+  "$(contains 'cannot work out the next dotted build' && echo 0 || echo 1)"
+FAKE_DOTTED="1.1.2"; FAKE_RELEASED="1.1.2"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a version at the released App Store version is refused, not bumped" \
+  "$(contains 'at or below the released App Store version 1.1.2' && echo 0 || echo 1)"
+FAKE_RELEASED="fail"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: an unreadable released App Store version stops the run (fail closed)" \
+  "$(contains 'cannot read the released App Store version' && echo 0 || echo 1)"
+SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_DOTTED=""; FAKE_ASC_PATCH=236
 echo
 
 echo "----------------------------------------"
