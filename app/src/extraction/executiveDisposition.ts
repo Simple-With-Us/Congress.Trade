@@ -124,6 +124,25 @@ function successfulNonemptyReadParams(docId: string): SqlParam[] {
   return [docId, docId, docId];
 }
 
+/**
+ * Evidence guards shared by the unreadable park UPDATE and the CT-2448
+ * re-park payload-only refresh.  A second OCR payload must not overwrite
+ * review evidence: live transactions, a successful nonempty read, or staged
+ * candidates in the row's existing payload.  One fragment so the two writes
+ * cannot drift.
+ */
+function unreadableParkEvidenceGuardSql(): string {
+  return `AND NOT EXISTS (
+              SELECT 1 FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL
+            )
+            AND NOT ${SUCCESSFUL_NONEMPTY_READ_SQL}
+            AND NOT (COALESCE(json_extract(payload, '$.transactionCount'), 0) > 0)`;
+}
+
+function unreadableParkEvidenceGuardParams(docId: string): SqlParam[] {
+  return [docId, ...successfulNonemptyReadParams(docId)];
+}
+
 export interface ExecutiveCloseOptions {
   nowIso?: string;
   /** When set, only the holder of this lease (or an unclaimed row) may close. */
@@ -492,8 +511,9 @@ async function commitUnreadablePark(
       `UPDATE review_queue
           SET payload = ?
         WHERE ${where.sql}
-          AND COALESCE(reason, '') LIKE '%oge_text_unreadable%'`,
-      [payloadJson, docId, ...where.params],
+          AND COALESCE(reason, '') LIKE '%oge_text_unreadable%'
+          ${unreadableParkEvidenceGuardSql()}`,
+      [payloadJson, docId, ...where.params, ...unreadableParkEvidenceGuardParams(docId)],
     );
     payloadRefreshed = (refresh?.meta?.changes ?? 0) > 0;
   }
@@ -526,17 +546,12 @@ function openUnreadableParkSql(
                 review_revision = review_revision + 1
           WHERE ${where.sql}
             AND COALESCE(reason, '') NOT LIKE '%oge_text_unreadable%'
-            AND NOT EXISTS (
-              SELECT 1 FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL
-            )
-            AND NOT ${SUCCESSFUL_NONEMPTY_READ_SQL}
-            AND NOT (COALESCE(json_extract(payload, '$.transactionCount'), 0) > 0)`,
+            ${unreadableParkEvidenceGuardSql()}`,
     params: [
       ...params,
       docId,
       ...where.params,
-      docId,
-      ...successfulNonemptyReadParams(docId),
+      ...unreadableParkEvidenceGuardParams(docId),
     ],
   };
 }
