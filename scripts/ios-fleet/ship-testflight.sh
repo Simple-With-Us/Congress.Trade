@@ -541,15 +541,15 @@ project_marketing_seq() {
 # Prints the integer on stdout.  Returns 1 (and prints nothing) when ASC
 # cannot be consulted -- the caller must distinguish "no patch yet" (0) from
 # "unknown" (failure).
-asc_next_dotted_build() {
+asc_next_three_digit_build() {
   local version="$1" plat="${2:-}" out rc
   command -v "$ASC_NODE" >/dev/null 2>&1 || return 1
   load_secrets >/dev/null || return 1
   set +e
-  out=$(asc_client next-dotted-build "$BUNDLE_ID" "$version" "$plat")
+  out=$(asc_client next-three-digit-build "$BUNDLE_ID" "$version" "$plat")
   rc=$?
   set -e
-  [[ $rc -eq 0 && "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ $rc -eq 0 && "$out" =~ ^[1-9][0-9]{2}$ ]] || return 1
   printf '%s' "$out"
 }
 
@@ -995,7 +995,12 @@ else
   # --version is an exact override.  Otherwise the version is the next patch
   # on the default train, and P comes from App Store Connect.
   FIXED_MODE=0
-  if [[ -z "$FORCE_VERSION" && -n "$FIXED_MARKETING" ]]; then
+  if [[ -n "$FIXED_MARKETING" && ( -z "$FORCE_VERSION" || "$FORCE_VERSION" == "$FIXED_MARKETING" ) ]]; then
+    [[ "$FIXED_MARKETING" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+      || die "fixedMarketingVersion '${FIXED_MARKETING}' for ${APP_KEY} in apps.json is not M.m.p (three dot-separated integers).  Nothing was shipped."
+    if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then
+      die "fixedMarketingVersion is not supported on macOS:  Mac builds must grow across every train, so a dotted build under a fixed version cannot be ordered safely.  Nothing was shipped."
+    fi
     FORCE_VERSION="$FIXED_MARKETING"
     FIXED_MODE=1
     log "version: fixed marketing version ${FIXED_MARKETING} from apps.json; it does not count up per ship"
@@ -1056,6 +1061,11 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
 
   # ---- the build number ---------------------------------------------------
   if [[ -n "$FORCE_BUILD" ]]; then
+    if [[ "$FIXED_MODE" -eq 1 ]]; then
+      [[ "$FORCE_BUILD" =~ ^[1-9][0-9]{2}$ ]] || die "fixed mode requires a three-digit build100..999; nothing shipped"
+      _minimum="$(asc_next_three_digit_build "$MARKETING" "$ASC_PLATFORM")" || die "cannot verify three-digit build floor; nothing shipped"
+      [[ "$FORCE_BUILD" -ge "$_minimum" ]] || die "requested build is below the current train floor; nothing shipped"
+    fi
     # An explicit --build is honoured exactly, and it does NOT move the
     # marketing version:  the two numbers are independent.
     BUILD_NUM="$FORCE_BUILD"
@@ -1069,12 +1079,8 @@ sys.exit(0 if a>b else 1)' "$FIXED_MARKETING" "$_rel"; then
     if [[ "$(printf '%s' "${ASC_PLATFORM:-}" | tr a-z A-Z)" == "MAC_OS" ]]; then
       die "fixedMarketingVersion is not supported on macOS:  Mac builds must grow across every train, so a dotted build under a fixed version cannot be ordered safely.  Nothing was shipped."
     fi
-    # The build reads like the version it ships under (1.1.2 (1.1.2)) and goes
-    # up inside the fixed train (1.1.3, 1.1.4, ...).  No floor, seed, count or
-    # patch bump applies:  the train itself is the only record.
-    BUILD_NUM="$(asc_next_dotted_build "$MARKETING" "$ASC_PLATFORM")" \
-      || die "cannot work out the next dotted build for ${MARKETING}: App Store Connect could not be read, or the train holds a build that is not ${MARKETING%.*}.<n>.  Nothing was shipped or guessed."
-    log "build: dotted build ${BUILD_NUM} for fixed version ${MARKETING}"
+    BUILD_NUM="$(asc_next_three_digit_build "$MARKETING" "$ASC_PLATFORM")"       || die "cannot work out the next three-digit build: incomplete inventory or floor outside100..999; nothing shipped"
+    log "build: three-digit build ${BUILD_NUM} for fixed version ${MARKETING}"
   else
     [[ "$PLAN_COMMIT_COUNT" =~ ^[0-9]+$ ]] || die "could not read the commit count from ${REPO_ROOT}; CFBundleVersion is the repo commit count and UTC timestamps are retired"
 

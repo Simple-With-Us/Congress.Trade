@@ -41,6 +41,7 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nextThreeDigitBuild } from "./three-digit-build.mjs";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
@@ -991,7 +992,7 @@ async function main() {
   // or nothing when the app has none.  READ ONLY.
   if (method === "released-store-version") {
     const bundleId = path;
-    const platform = body || "IOS";
+    const platform = String(body || "IOS").toUpperCase();
     if (!bundleId) {
       console.error("Usage: node asc-api.mjs released-store-version <bundleId> [platform=IOS]");
       process.exit(2);
@@ -1016,10 +1017,20 @@ async function main() {
       console.error("released-store-version: more than 10 pages of App Store versions; refusing to guess");
       process.exit(2);
     }
+    // AppStoreVersionState enum:  every state must land in one set, or the
+    // run refuses to guess (exit 3 below) rather than misread the floor.
     const RELEASED = new Set([
       "READY_FOR_SALE", "READY_FOR_DISTRIBUTION", "REPLACED_WITH_NEW_VERSION",
-      "REMOVED_FROM_SALE", "PENDING_DEVELOPER_RELEASE", "PENDING_APPLE_RELEASE",
+      "REMOVED_FROM_SALE", "DEVELOPER_REMOVED_FROM_SALE", "PREORDER_READY_FOR_SALE",
+      "PENDING_DEVELOPER_RELEASE", "PENDING_APPLE_RELEASE", "ACCEPTED",
+      // post-review, waiting on contract or export compliance: the version is approved
+      // and holds its train, so it counts as released (fail closed)
+      "PENDING_CONTRACT", "WAITING_FOR_EXPORT_COMPLIANCE",
       "PROCESSING_FOR_DISTRIBUTION", "PROCESSING_FOR_APP_STORE"
+    ]);
+    const NOT_RELEASED = new Set([
+      "PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW",
+      "UNRESOLVED_ISSUES", "REJECTED", "METADATA_REJECTED", "DEVELOPER_REJECTED", "INVALID_BINARY"
     ]);
     const parse = (v) => String(v).split(".").map((n) => parseInt(n, 10) || 0);
     const cmp = (a, b) => {
@@ -1034,11 +1045,45 @@ async function main() {
     for (const v of storeData) {
       const a = v?.attributes || {};
       if (!a.versionString) continue;
-      if (!RELEASED.has(a.appVersionState) && !RELEASED.has(a.appStoreState)) continue;
+      const st = [a.appVersionState, a.appStoreState].filter(Boolean);
+      if (st.length === 0 || st.some((x) => !RELEASED.has(x) && !NOT_RELEASED.has(x))) {
+        console.error("released-store-version: unknown state; refusing to guess"); process.exit(3);
+      }
+      if (!st.some((x) => RELEASED.has(x))) {
+        if (st.length === 0 || !st.every((x) => NOT_RELEASED.has(x))) {
+          console.error(`released-store-version: version ${a.versionString} has state ${JSON.stringify(st)}, which is not a known released or not-released state; not guessing`);
+          process.exit(3);
+        }
+        continue;
+      }
       if (!best || cmp(a.versionString, best) > 0) best = a.versionString;
     }
     console.error(`released-store-version: ${storeData.length} App Store version(s) inspected on ${platform}; highest released = ${best || "none"}`);
     console.log(best);
+    process.exit(0);
+  }
+
+  // Read-only, fully paged target-train inventory for the requested ### format.
+  if (method === "next-three-digit-build") {
+    const bundleId=path, version=body, platform=String(arg4 || "IOS").toUpperCase();
+    if (!bundleId || !/^\d+\.\d+\.\d+$/.test(version || "") || !["IOS","MAC_OS"].includes(platform)) {
+      console.error("next-three-digit-build: exact bundle/version/platform required"); process.exit(2);
+    }
+    const appId=await appIdForBundle(bundleId);
+    if(!appId) { console.error("next-three-digit-build: app not found");process.exit(2); }
+    let url=`/v1/builds?filter[app]=${appId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
+    if(platform === "IOS") url+=`&filter[preReleaseVersion.version]=${encodeURIComponent(version)}`;
+    const builds=[];
+    for(let page=0;page<100 && url;page++) {
+      const res=await ascGet(url);
+      if(!res.ok || !Array.isArray(res.parsed?.data)) {console.error("next-three-digit-build: inventory unavailable");process.exit(2);}
+      for(const b of res.parsed.data) builds.push(b?.attributes?.version);
+      url=res.parsed.links?.next || "";
+    }
+    if(url) {console.error("next-three-digit-build: incomplete pagination");process.exit(2);}
+    try {
+      console.log(nextThreeDigitBuild({platform,trainBuilds:platform==="IOS"?builds:[],allPlatformBuilds:platform==="MAC_OS"?builds:[],complete:true}));
+    } catch(error) {console.error(`next-three-digit-build: ${error.message}`);process.exit(3);}
     process.exit(0);
   }
 
@@ -1057,7 +1102,7 @@ async function main() {
   if (method === "next-dotted-build") {
     const bundleId = path;
     const version = body;
-    const platform = arg4 || "IOS";
+    const platform = String(arg4 || "IOS").toUpperCase();
     const vm = /^(\d+)\.(\d+)\.(\d+)$/.exec(version || "");
     if (!bundleId || !vm) {
       console.error("Usage: node asc-api.mjs next-dotted-build <bundleId> <M.m.p> [platform=IOS]");
@@ -1097,7 +1142,7 @@ async function main() {
       console.error("next-dotted-build: more than 10 pages of builds in one train; refusing to guess");
       process.exit(2);
     }
-    const next = max < 0 ? parseInt(vm[3], 10) : max + 1;
+    const next = Math.max(max + 1, parseInt(vm[3], 10));
     console.error(`next-dotted-build: ${seen} build(s) in train ${version}; next is ${prefix}${next}`);
     console.log(`${prefix}${next}`);
     process.exit(0);
