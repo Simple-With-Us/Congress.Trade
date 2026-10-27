@@ -6,6 +6,11 @@
   "tasks": {
     "start": "deno run --unstable-kv --unstable-cron --unstable-ffi --allow-ffi --allow-net --allow-env --allow-read src/deno/main.ts"
   },
+  "lint": {
+    "rules": {
+      "exclude": ["no-irregular-whitespace"]
+    }
+  },
   "imports": {
     "#sentry": "./src/deno/sentry.ts",
     "@sentry/deno": "npm:@sentry/deno@^11.0.0",

@@ -8,7 +8,20 @@ WORKDIR /app
 # bash/tar/ca-certificates are for scripts/start-with-litestream.sh (Litestream
 # continuous B2 backup, rebuilt 2026-08-12 after the Oracle->Hetzner migration
 # dropped the old host-level systemd unit) and scripts/fetch-litestream.sh.
-RUN apk add --no-cache curl bash tar ca-certificates
+#
+# poppler-utils (pdftoppm) and tesseract-ocr (+ its English traineddata
+# package) are the local OCR toolchain behind the OGE 278-T retry
+# (src/extraction/ogeLocalOcr.ts, CT-2448).  The app runs with
+# --allow-run=pdftoppm,tesseract and shells out to these binaries when
+# a 278-T has no usable text layer.  When they are missing the pass fails
+# closed — the filing parks exactly as it did before — but adding them here is
+# what makes the retry work at all.
+RUN apk add --no-cache curl bash tar ca-certificates \
+      poppler-utils \
+      tesseract-ocr \
+      tesseract-ocr-data-eng \
+    && pdftoppm -v \
+    && tesseract --list-langs | grep -qx eng
 
 # Litestream binary (pinned + sha256-verified) for continuous SQLite -> B2
 # replication. See scripts/fetch-litestream.sh for the pin rationale (0.5.13,
