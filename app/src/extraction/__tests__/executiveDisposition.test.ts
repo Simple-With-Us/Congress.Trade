@@ -1104,4 +1104,80 @@ describe('unreadable re-park payload (CT-2448)', () => {
     expect((JSON.parse(kept.payload) as { localOcr: { reason: string } }).localOcr.reason)
       .toBe('reconciled');
   });
+
+  it('skips the payload refresh when a live transaction lands between the guard and the refresh', async () => {
+    const db = await sqliteDatabase();
+    seedReview(db, TRUMP_UNREADABLE_DOC_ID, 'agreement_cascade_unresolved');
+    const env = envFor(db);
+    const first = { extractor: 'ogeLocalOcr', transactionCount: 0, localOcr: { attempted: true, reason: 'first' } };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: first })).toBe(true);
+
+    // Race: a concurrent worker persists a live transaction after the outer
+    // guards pass but before the payload-only refresh runs.
+    const realPrepare = env.DB.prepare.bind(env.DB);
+    let injected = false;
+    (env.DB as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+      if (!injected && /SET\s+payload\s*=\s*\?/i.test(sql)) {
+        injected = true;
+        db.prepare(
+          `INSERT INTO transactions (doc_id, source, deprecated_at) VALUES (?, 'primary', NULL)`,
+        ).run(TRUMP_UNREADABLE_DOC_ID);
+      }
+      return realPrepare(sql);
+    };
+
+    const second = { extractor: 'ogeLocalOcr', transactionCount: 0, localOcr: { attempted: true, reason: 'second' } };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: second })).toBe(false);
+    expect(injected).toBe(true);
+    const row = db.prepare(`SELECT payload FROM review_queue WHERE doc_id = ?`)
+      .get(TRUMP_UNREADABLE_DOC_ID) as { payload: string };
+    expect((JSON.parse(row.payload) as { localOcr: { reason: string } }).localOcr.reason).toBe('first');
+  });
+
+  it('skips the payload refresh when a successful nonempty read lands between the guard and the refresh', async () => {
+    const db = await sqliteDatabase();
+    seedReview(db, TRUMP_UNREADABLE_DOC_ID, 'agreement_cascade_unresolved');
+    const env = envFor(db);
+    const first = { extractor: 'ogeLocalOcr', transactionCount: 0, localOcr: { attempted: true, reason: 'first' } };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: first })).toBe(true);
+
+    const realPrepare = env.DB.prepare.bind(env.DB);
+    let injected = false;
+    (env.DB as { prepare: (sql: string) => unknown }).prepare = (sql: string) => {
+      if (!injected && /SET\s+payload\s*=\s*\?/i.test(sql)) {
+        injected = true;
+        db.prepare(
+          `INSERT INTO extraction_runs (doc_id, ok, row_count, result_json) VALUES (?, 1, 9, '[{}]')`,
+        ).run(TRUMP_UNREADABLE_DOC_ID);
+      }
+      return realPrepare(sql);
+    };
+
+    const second = { extractor: 'ogeLocalOcr', transactionCount: 0, localOcr: { attempted: true, reason: 'second' } };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: second })).toBe(false);
+    expect(injected).toBe(true);
+    const row = db.prepare(`SELECT payload FROM review_queue WHERE doc_id = ?`)
+      .get(TRUMP_UNREADABLE_DOC_ID) as { payload: string };
+    expect((JSON.parse(row.payload) as { localOcr: { reason: string } }).localOcr.reason).toBe('first');
+  });
+
+  it('skips the payload refresh when the parked row holds staged candidates', async () => {
+    const db = await sqliteDatabase();
+    seedReview(db, TRUMP_UNREADABLE_DOC_ID, 'agreement_cascade_unresolved');
+    const env = envFor(db);
+    const first = { extractor: 'ogeLocalOcr', transactionCount: 0, localOcr: { attempted: true, reason: 'first' } };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: first })).toBe(true);
+
+    // routeToReview staged candidates only in the payload after the park.
+    db.prepare(`UPDATE review_queue SET payload = ? WHERE doc_id = ?`).run(
+      JSON.stringify({ transactionCount: 2, transactions: [{}, {}] }),
+      TRUMP_UNREADABLE_DOC_ID,
+    );
+
+    const second = { extractor: 'ogeLocalOcr', transactionCount: 0, localOcr: { attempted: true, reason: 'second' } };
+    expect(await closeUnreadableExecutive(env, TRUMP_UNREADABLE_DOC_ID, { payload: second })).toBe(false);
+    const row = db.prepare(`SELECT payload FROM review_queue WHERE doc_id = ?`)
+      .get(TRUMP_UNREADABLE_DOC_ID) as { payload: string };
+    expect((JSON.parse(row.payload) as { transactionCount: number }).transactionCount).toBe(2);
+  });
 });
