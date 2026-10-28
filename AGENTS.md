@@ -560,9 +560,9 @@ Owner copy rules (Title Case headings/buttons; sentence-case values; lowercase c
 ## Apple Notes close-out (all agents, all apps — 2026-08-09)
 
 **Title:** `[APP, Agent] short topic` — app acronym(s) + agent **first**.
-Examples: `[UM, Grok] TestFlight first ship` · `[ST, CT, Monet] R2 peer digests`.
+Examples: `[UM, Grok] TestFlight first ship` · `[ST, CT, Claude] R2 peer digests`.
 Acronyms: `UM` `ST` `CT` `CTS` `FLEET`. Multi-app: list each (`[ST, CT, Grok] …`).
-Agent display Title Case (`Grok`/`Monet`/`Claude`/…), not ALL-CAPS Zulip tags.
+Agent display Title Case (`Grok`/`Claude`/…), not ALL-CAPS Zulip tags.
 
 **Second body row:** local stamp `Sun, Aug 9, 3:52pm` (create **or** last update —
 refresh on every change). Helper auto-injects/refreshes it.
