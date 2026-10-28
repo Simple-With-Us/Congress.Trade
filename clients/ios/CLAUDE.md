@@ -9,7 +9,7 @@
 **Sentry Cocoa:** `SentryTelemetry.swift` reads plist-only `SENTRY_DSN` (no hardcoded fallback). Pass `SENTRY_DSN=...` on xcodebuild/CI for release archives. Errors + crashes + hangs only — no Replay, screenshots, view hierarchy, or default PII. dSYM upload is the existing ios-ship lane.
 **Ship:** `bash scripts/ios-ship-testflight.sh` — fleet: `/Users/jay/apps/ios-fleet/README.md`
 
-Binding fleet rule: `/Users/jay/apps/AGENT-SYNC.md` § iOS agent build loop. `xcodebuild` / `xcrun simctl` via bash are pre-approved. Do not ask. Do not stand up or narrate Xcode MCP.
+Binding fleet rule: `/Users/jay/apps/FLEET-PROTOCOL.md` § iOS agent build loop. `xcodebuild` / `xcrun simctl` via bash are pre-approved. Do not ask. Do not stand up or narrate Xcode MCP.
 
 ## Build & test
 
