@@ -34,7 +34,7 @@ Key reminders:
   command/status model; do not create client-only scraping, provider-secret, or
   MCP orchestration paths.
 - iOS build loop: `xcodebuild` via bash is pre-approved. Do not stand up or
-  narrate Xcode MCP. See `clients/ios/CLAUDE.md` and AGENT-SYNC § iOS agent
+  narrate Xcode MCP. See `clients/ios/CLAUDE.md` and FLEET-PROTOCOL § iOS agent
   build loop.
 - Use a separate branch, normally `claude/<short-topic>`, before non-trivial
   edits.
