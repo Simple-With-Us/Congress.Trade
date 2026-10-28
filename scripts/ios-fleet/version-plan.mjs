@@ -261,3 +261,94 @@ export function planVersion({
 
   return { marketing, build };
 }
+
+/**
+ * App Store Connect version states that already hold a released train slot.
+ * Covers both deprecated appStoreState and current appVersionState values.
+ */
+export const ASC_RELEASED_STORE_VERSION_STATES = new Set([
+  "READY_FOR_SALE",
+  "READY_FOR_DISTRIBUTION",
+  "REPLACED_WITH_NEW_VERSION",
+  "REMOVED_FROM_SALE",
+  "DEVELOPER_REMOVED_FROM_SALE",
+  "PREORDER_READY_FOR_SALE",
+  "PENDING_DEVELOPER_RELEASE",
+  "PENDING_APPLE_RELEASE",
+  "ACCEPTED",
+  // Post-review contract / export compliance: approved and holding the train.
+  "PENDING_CONTRACT",
+  "WAITING_FOR_EXPORT_COMPLIANCE",
+  "PROCESSING_FOR_DISTRIBUTION",
+  "PROCESSING_FOR_APP_STORE"
+]);
+
+/** App Store Connect states that are clearly not on the released floor yet. */
+export const ASC_NOT_RELEASED_STORE_VERSION_STATES = new Set([
+  "PREPARE_FOR_SUBMISSION",
+  "READY_FOR_REVIEW",
+  "WAITING_FOR_REVIEW",
+  "IN_REVIEW",
+  "UNRESOLVED_ISSUES",
+  "REJECTED",
+  "METADATA_REJECTED",
+  "DEVELOPER_REJECTED",
+  "INVALID_BINARY",
+  "NOT_APPLICABLE"
+]);
+
+function compareDottedVersionStrings(a, b) {
+  const parse = (v) => String(v).split(".").map((n) => parseInt(n, 10) || 0);
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+/**
+ * Classify the paired appVersionState / appStoreState fields ASC returns.
+ *
+ * @returns {{ kind: "released" | "not_released" | "unknown", states: string[] }}
+ */
+export function classifyReleasedStoreVersionStates(appVersionState, appStoreState) {
+  const states = [appVersionState, appStoreState].filter(Boolean);
+  if (
+    states.length === 0
+    || states.some((x) => !ASC_RELEASED_STORE_VERSION_STATES.has(x) && !ASC_NOT_RELEASED_STORE_VERSION_STATES.has(x))
+  ) {
+    return { kind: "unknown", states };
+  }
+  if (states.some((x) => ASC_RELEASED_STORE_VERSION_STATES.has(x))) {
+    return { kind: "released", states };
+  }
+  return { kind: "not_released", states };
+}
+
+/**
+ * Pick the highest versionString among App Store versions in a released state.
+ *
+ * @param {Array<{ attributes?: { versionString?: string, appVersionState?: string, appStoreState?: string } }>} rows
+ * @returns {string} highest released marketing version, or "" when none
+ * @throws {Error & { code: 3, versionString: string, states: string[] }} on unknown states
+ */
+export function highestReleasedStoreVersion(rows) {
+  let best = "";
+  for (const row of rows) {
+    const attrs = row?.attributes || {};
+    if (!attrs.versionString) continue;
+    const classification = classifyReleasedStoreVersionStates(attrs.appVersionState, attrs.appStoreState);
+    if (classification.kind === "unknown") {
+      const err = new Error("released-store-version state not in allowlist");
+      err.code = 3;
+      err.versionString = attrs.versionString;
+      err.states = classification.states;
+      throw err;
+    }
+    if (classification.kind === "not_released") continue;
+    if (!best || compareDottedVersionStrings(attrs.versionString, best) > 0) best = attrs.versionString;
+  }
+  return best;
+}

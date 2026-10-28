@@ -44,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
+  highestReleasedStoreVersion,
   isDriftTrain,
   nextMarketingPatch
 } from "./version-plan.mjs";
@@ -1016,43 +1017,17 @@ async function main() {
       console.error("released-store-version: more than 10 pages of App Store versions; refusing to guess");
       process.exit(2);
     }
-    // AppStoreVersionState enum:  every state must land in one set, or the
-    // run refuses to guess (exit 3 below) rather than misread the floor.
-    const RELEASED = new Set([
-      "READY_FOR_SALE", "READY_FOR_DISTRIBUTION", "REPLACED_WITH_NEW_VERSION",
-      "REMOVED_FROM_SALE", "DEVELOPER_REMOVED_FROM_SALE", "PREORDER_READY_FOR_SALE",
-      "PENDING_DEVELOPER_RELEASE", "PENDING_APPLE_RELEASE", "ACCEPTED",
-      // post-review, waiting on contract or export compliance: the version is approved
-      // and holds its train, so it counts as released (fail closed)
-      "PENDING_CONTRACT", "WAITING_FOR_EXPORT_COMPLIANCE",
-      "PROCESSING_FOR_DISTRIBUTION", "PROCESSING_FOR_APP_STORE"
-    ]);
-    const NOT_RELEASED = new Set([
-      "PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW",
-      "UNRESOLVED_ISSUES", "REJECTED", "METADATA_REJECTED", "DEVELOPER_REJECTED", "INVALID_BINARY"
-    ]);
-    const parse = (v) => String(v).split(".").map((n) => parseInt(n, 10) || 0);
-    const cmp = (a, b) => {
-      const x = parse(a), y = parse(b);
-      for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
-        const d = (x[i] || 0) - (y[i] || 0);
-        if (d) return d;
-      }
-      return 0;
-    };
     let best = "";
-    for (const v of storeData) {
-      const a = v?.attributes || {};
-      if (!a.versionString) continue;
-      const st = [a.appVersionState, a.appStoreState].filter(Boolean);
-      if (!st.some((x) => RELEASED.has(x))) {
-        if (st.length === 0 || !st.every((x) => NOT_RELEASED.has(x))) {
-          console.error(`released-store-version: version ${a.versionString} has state ${JSON.stringify(st)}, which is not a known released or not-released state; not guessing`);
-          process.exit(3);
-        }
-        continue;
+    try {
+      best = highestReleasedStoreVersion(storeData);
+    } catch (e) {
+      if (e?.code === 3) {
+        console.error(
+          `released-store-version: version ${e.versionString} has state ${JSON.stringify(e.states)}, which is not a known released or not-released state; not guessing`
+        );
+        process.exit(3);
       }
-      if (!best || cmp(a.versionString, best) > 0) best = a.versionString;
+      throw e;
     }
     console.error(`released-store-version: ${storeData.length} App Store version(s) inspected on ${platform}; highest released = ${best || "none"}`);
     console.log(best);

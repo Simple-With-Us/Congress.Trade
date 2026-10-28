@@ -19,6 +19,8 @@ import test from "node:test";
 
 import {
   buildFloor,
+  classifyReleasedStoreVersionStates,
+  highestReleasedStoreVersion,
   isDriftTrain,
   latestMarketingPatch,
   ownPatch,
@@ -264,5 +266,31 @@ test("planVersion refuses a forced build that recreates 1.0.N (N) (Kody, AFC-517
   assert.deepEqual(
     planVersion({ prefix: "1.0", ascPatch: 236, forcedBuild: "999", commitCount: 10, floor: 0 }),
     { marketing: "1.0.237", build: "999" }
+  );
+});
+
+test("classifyReleasedStoreVersionStates treats post-review ASC states as released", () => {
+  assert.equal(classifyReleasedStoreVersionStates("PENDING_CONTRACT", undefined).kind, "released");
+  assert.equal(classifyReleasedStoreVersionStates(undefined, "WAITING_FOR_EXPORT_COMPLIANCE").kind, "released");
+  assert.equal(classifyReleasedStoreVersionStates("ACCEPTED", "IN_REVIEW").kind, "released");
+});
+
+test("classifyReleasedStoreVersionStates treats NOT_APPLICABLE as not released", () => {
+  assert.equal(classifyReleasedStoreVersionStates("NOT_APPLICABLE", undefined).kind, "not_released");
+});
+
+test("highestReleasedStoreVersion ignores in-flight trains and picks the max released", () => {
+  const rows = [
+    { attributes: { versionString: "1.1.1", appVersionState: "PREPARE_FOR_SUBMISSION" } },
+    { attributes: { versionString: "1.1.2", appVersionState: "READY_FOR_DISTRIBUTION" } },
+    { attributes: { versionString: "1.1.0", appStoreState: "REPLACED_WITH_NEW_VERSION" } }
+  ];
+  assert.equal(highestReleasedStoreVersion(rows), "1.1.2");
+});
+
+test("highestReleasedStoreVersion refuses unknown ASC states", () => {
+  assert.throws(
+    () => highestReleasedStoreVersion([{ attributes: { versionString: "9.9.9", appVersionState: "FUTURE_STATE" } }]),
+    (err) => err.code === 3 && err.versionString === "9.9.9"
   );
 });
