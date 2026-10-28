@@ -56,7 +56,7 @@ Key reminders:
   on the old branch without first checking current `main`.
 - **Always commit + land finished work** (owner preference): commit → push
   branch → open/update PR → merge when CI green. Do not leave finished work
-  only local. Canonical: `/Users/jay/apps/AGENT-SYNC.md`.
+  only local. Canonical: `/Users/jay/apps/FLEET-PROTOCOL.md`.
 - Still require production intent for: production schema/migrate, production
   backfills, queue drains, production ingestion crawlers, `scripts/provision.sh`,
   and any force-push / data wipe.  For finished safe app code, follow PR →
