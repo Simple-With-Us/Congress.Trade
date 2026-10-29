@@ -207,6 +207,108 @@ function expandHousePtrLayout(text: string): string {
     .replace(/\bS\s+O\s*:\s*/gi, 'Subholding Of: ');
 }
 
+/**
+ * House PTR detail lines — "Filing Status: ...", "Subholding Of: ...",
+ * "Location: ...", "Description: ..." — plus the letter-spaced forms the form
+ * generator prints ("F S:", "S O:", "L:", "D:").
+ *
+ * The House form prints a row's detail lines UNDER that row, so in the merged
+ * page text they sit after the row's `[ST] P/S/E date $amount` tail and before
+ * the next row's asset line.  A blank Owner column removes the owner code that
+ * used to mark where the next row starts, which glued "Filing Status: New
+ * Subholding Of: ..." onto the next row's asset name and shifted every
+ * subholding one row down.  Split each gap between two tails on the detail
+ * lines themselves instead of on owner codes.
+ */
+const HOUSE_DETAIL_LINE_RE =
+  /^\s*(?:Filing\s+Status|Subholding\s+Of|Location|Description|F\s+S|S\s+O|L|D)\s*:/i;
+
+/**
+ * A House PTR document collapsed to one line, plus the line bookkeeping the
+ * detail-block split needs.
+ */
+interface HousePtrDoc {
+  /** Whole document with every whitespace run collapsed to a single space. */
+  text: string;
+  /** Non-empty source lines, each whitespace-collapsed. */
+  lines: string[];
+  /** Offset of the first character of each line inside `text`. */
+  lineStart: number[];
+  /** Offset just past the last character of each line inside `text`. */
+  lineEnd: number[];
+  /** Index of the line that owns each character of `text`. */
+  lineOf: number[];
+}
+
+function collapseHousePtrLines(text: string): HousePtrDoc {
+  const lines: string[] = [];
+  const lineStart: number[] = [];
+  const lineEnd: number[] = [];
+  const lineOf: number[] = [];
+  let out = '';
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    if (out) {
+      out += ' ';
+      // The separator belongs to the line before it, so a gap that opens at a
+      // line boundary still resolves to the content of the next line.
+      lineOf.push(lines.length - 1);
+      lineEnd[lines.length - 1] = out.length;
+    }
+    lineStart.push(out.length);
+    out += line;
+    lineEnd.push(out.length);
+    for (let i = 0; i < line.length; i += 1) lineOf.push(lines.length);
+    lines.push(line);
+  }
+  return { text: out, lines, lineStart, lineEnd, lineOf };
+}
+
+/** Full House detail label anywhere in a string (asset-name sanity check). */
+const HOUSE_DETAIL_LABEL_IN_NAME_RE = /\b(?:Filing\s+Status|Subholding\s+Of|Location|Description)\s*:/i;
+
+/** A source line that opens a new holding with an explicit owner code. */
+const HOUSE_OWNER_LINE_RE = /^(?:SP|DC|JT|SELF)\s/;
+
+/**
+ * End offset (exclusive) of the run of detail lines at the head of
+ * `gapStart..gapEnd`.  Those lines belong to the row whose tail precedes the
+ * gap, so the text after the run is the next row's asset line.
+ * Returns `gapStart` when the gap holds no detail line at all, and never
+ * returns more than `gapEnd`.
+ */
+function houseDetailBlockEnd(gapStart: number, gapEnd: number, doc: HousePtrDoc): number {
+  if (gapStart >= gapEnd) return gapStart;
+  let end = gapStart;
+  let li = doc.lineOf[gapStart] ?? 0;
+  const lastLine = doc.lineOf[gapEnd - 1] ?? li;
+  // A gap can open mid-line (a tail that stopped at "$344" inside
+  // "$344.99"); that remainder belongs to the tail, not to a detail line.
+  if (gapStart > (doc.lineStart[li] ?? 0)) li += 1;
+  for (; li <= lastLine; li += 1) {
+    // A line that runs into the next tail carries that row's identity, so it
+    // can never be part of this row's detail block.
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (!HOUSE_DETAIL_LINE_RE.test(doc.lines[li] ?? '')) break;
+    end = doc.lineEnd[li] ?? end;
+  }
+  if (end > gapStart) {
+    // A long detail value ("D: ...") can wrap onto unlabeled lines.  When the
+    // next holding opens with an owner code, every line before that one is
+    // still this row's detail block.  Blank-owner (self) rows have no such
+    // anchor, so their block stays at the last labeled line.
+    for (let lj = li; lj <= lastLine; lj += 1) {
+      if ((doc.lineStart[lj] ?? Infinity) >= gapEnd) break;
+      if (HOUSE_OWNER_LINE_RE.test(doc.lines[lj] ?? '')) {
+        end = doc.lineStart[lj] ?? end;
+        break;
+      }
+    }
+  }
+  return Math.min(end, gapEnd);
+}
+
 function joinWrappedAmountRanges(text: string): string {
   return text.replace(
     /(\$[\d,]+)\s*-\s+((?:(?!\$)[\s\S]{0,80}?))(\$[\d,]+)/g,
@@ -220,7 +322,7 @@ function stripHouseTableHeaders(text: string): string {
     .replace(HOUSE_TABLE_HEADER_GLOBAL_RE, ' ');
 }
 
-function stripHousePtrPreamble(prefix: string): string {
+function stripHousePtrPreamble(prefix: string, stripColumnMarker = true): string {
   let s = stripHouseTableHeaders(prefix).replace(/\s+/g, ' ').trim();
   let cut = 0;
   HOUSE_PTR_PREAMBLE_RE.lastIndex = 0;
@@ -230,7 +332,9 @@ function stripHousePtrPreamble(prefix: string): string {
   }
   if (cut > 0) s = s.slice(cut);
   // Leftover column marker from "T ID Owner Asset …" after the header strip.
-  s = s.replace(/^\s*T\s+/, '').trim();
+  // Only a prefix that can still hold the page preamble has one; a row that
+  // starts at its own asset line would lose the "T" of "T Rowe Price …".
+  if (stripColumnMarker) s = s.replace(/^\s*T\s+/, '').trim();
   // Stop before an owner code or a two-token ALL-CAPS asset (munis). Never
   // run to end-of-string — that ate "JT Abbott … (ABT)" on filer-name lines.
   return s.replace(
@@ -248,7 +352,11 @@ function calculateRowConfidence(row: {
   amountMin: number | null;
 }): number {
   const hasOwner = Boolean(row.owner);
-  const hasAsset = Boolean((row.assetName && row.assetName !== '(unknown)') || row.ticker);
+  // A detail label inside the asset name means the row split failed (e.g. a
+  // blank-owner row in a text layer with no line breaks); keep it out of
+  // auto-publish instead of shipping a corrupted name.
+  const gluedDetail = Boolean(row.assetName && HOUSE_DETAIL_LABEL_IN_NAME_RE.test(row.assetName));
+  const hasAsset = !gluedDetail && Boolean((row.assetName && row.assetName !== '(unknown)') || row.ticker);
   const hasTxType = Boolean(row.txType);
   const hasDate = Boolean(row.txDate && /^\d{4}-\d{2}-\d{2}$/.test(row.txDate));
   const hasAmount = row.amountMin !== null;
@@ -270,30 +378,45 @@ function calculateRowConfidence(row: {
 }
 
 function parseTailRecords(text: string): ParsedTx[] {
-  const normalized = stripHouseTableHeaders(cleanPdfText(text)).replace(/\s+/g, ' ').trim();
+  const doc = collapseHousePtrLines(stripHouseTableHeaders(cleanPdfText(text)));
+  const normalized = doc.text;
   const matches = [...normalized.matchAll(ptrTailRe())];
   if (matches.length === 0) return [];
 
+  // Tail i owns [tailStart_i, tailEnd_i).  The gap after it holds that row's
+  // detail lines followed by the next row's asset line; split the gap on the
+  // detail lines so each row keeps its own Filing Status / Subholding Of and
+  // its asset name stays free of the previous row's details.
+  const count = matches.length;
+  const tailStart = matches.map((m) => m.index ?? 0);
+  const tailEnd = matches.map((m, i) => (m.index ?? 0) + (matches[i][0]?.length ?? 0));
+  const gapStart: number[] = [0];
+  for (let i = 1; i <= count; i += 1) gapStart.push(tailEnd[i - 1]);
+  const gapEnd: number[] = [...tailStart, normalized.length];
+  const detailEnd = gapStart.map((s, j) => houseDetailBlockEnd(s, gapEnd[j], doc));
+
   const rows: ParsedTx[] = [];
-  for (let i = 0; i < matches.length; i += 1) {
+  for (let i = 0; i < count; i += 1) {
     const m = matches[i];
-    const next = matches[i + 1];
-    const start = m.index ?? 0;
-    const end = next?.index ?? normalized.length;
-    const prevEnd = i > 0
-      ? (matches[i - 1].index ?? 0) + matches[i - 1][0].length
-      : 0;
-    const prefix = normalized.slice(prevEnd, start);
-    const rawText = normalized.slice(prevEnd, end).trim();
+    // Identity: this row's asset line, with any leading detail block removed.
+    const identityStart = detailEnd[i] > gapStart[i] ? detailEnd[i] : gapStart[i];
+    const prefix = normalized.slice(identityStart, tailStart[i]);
+    // Details: this row's own detail block, which the form prints after the
+    // row's tail.  Rows whose block has no "Subholding Of" line get null.
+    const detailsEnd = detailEnd[i + 1] > gapStart[i + 1] ? detailEnd[i + 1] : gapEnd[i + 1];
+    const detailsText = normalized.slice(tailEnd[i], detailsEnd);
+    const rawText = normalized.slice(identityStart, i + 1 < count ? tailStart[i + 1] : normalized.length);
     const groups = m.groups ?? {};
     // Blank Owner is Self on the House form — not "same as the previous row".
     // Carrying SP/DC/JT forward mis-attributes later unmarked (filer) trades.
-    const identity = identityFromPrefix(prefix);
+    // Only the first row's prefix can still hold the preamble and its "T"
+    // column marker; later rows start at their own asset line.
+    const identity = identityFromPrefix(prefix, i === 0);
     const assetType = groups.assetType?.toUpperCase() ?? null;
     const txType = parseTxType(groups.txType ?? '') ?? 'B';
     const txDate = toIsoDate(groups.txDate ?? '');
     const { min, max } = parseAmountRange(groups.amount ?? '');
-    const details = parseHouseRowDetails(rawText);
+    const details = parseHouseRowDetails(detailsText);
     const confidence = calculateRowConfidence({
       owner: identity.owner,
       assetName: identity.assetName,
@@ -394,8 +517,9 @@ function parseColumnTailRecords(text: string): ParsedTx[] {
 
 function identityFromPrefix(
   prefix: string,
+  stripColumnMarker = true,
 ): { owner: Owner | null; ticker: string | null; assetName: string } {
-  let s = stripHousePtrPreamble(prefix);
+  let s = stripHousePtrPreamble(prefix, stripColumnMarker);
   s = s.replace(/^\d{7,}\s+/, '');
   const ownerMatches = [...s.matchAll(/\b(SP|DC|JT|SELF)\b/gi)];
   const ownerTok = ownerMatches.at(-1);
