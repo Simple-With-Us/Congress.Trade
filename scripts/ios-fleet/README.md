@@ -93,6 +93,33 @@ Every run prints the plan it resolved:
 [ios-ship] App Store Connect will show this as: 1.0.237 (2360)
 ```
 
+### Fixed marketing version (Congress.Trade)
+
+An app with `fixedMarketingVersion` in `apps.json` (Congress.Trade: `1.1.2`)
+does not count its marketing version up per ship. Its build is one shared
+merge-timestamp build across iOS and macOS (owner directive 2026-10-29):
+
+- `MARKETING_VERSION` is the fixed value, verbatim.
+- `CURRENT_PROJECT_VERSION` is `max(S, M + 1)`: `S` is the committer date of
+  the commit being built (HEAD) in America/Chicago as `YYYYMMDDHHMM`
+  (`TZ=America/Chicago git show -s --format=%cd
+  --date=format-local:%Y%m%d%H%M HEAD`), and `M` is the highest first numeric
+  component among every build of the app on iOS and of its paired macOS app
+  (expired included, all trains, timestamp-style builds included) plus every
+  extra floor. There is no floor, but the plan is capped at 12 digits: a
+  result above 999999999999 fails instead of emitting a build the ship's
+  12-digit gate would reject. A rebuild of the same commit still goes up.
+- The rule lives in `shared-build.mjs` (pure, unit-tested); the App Store
+  Connect inventory behind it is read by `asc-api.mjs plan-release-build
+  <bundleId> [pairedBundleId] [floor...] --merge-stamp <S>`
+  (`next-shared-build` is the same command under its earlier name).
+- Each release computes the value ONCE, in the one upstream `plan-build` step
+  of `.github/workflows/ios-ship.yml`, and hands it to the ship as `--build`.
+  Without `--build` (an operator running locally), fixed mode plans through
+  the same code path. A `--build` passed to fixed mode must be 12 digits and
+  greater than every existing build of that app and platform only, so the
+  paired platform can reuse the same value; anything else fails closed.
+
 ### Where the number comes from
 
 App Store Connect is the only record that shipping advances, so it is the only
@@ -136,6 +163,7 @@ The skip message names the value, its source, and both overrides, so the limit i
 bash scripts/ios-fleet/test-ship-seq.sh
 bash scripts/ios-fleet/test-asc-credentials.sh
 node --test scripts/ios-fleet/version-plan.test.mjs
+node --test scripts/ios-fleet/shared-build.test.mjs
 node --test scripts/ios-fleet/test-asc-key.test.mjs
 ```
 
@@ -149,7 +177,10 @@ Fully offline — no network, no Xcode, no credentials.  `test-ship-seq.sh` runs
 - `--version 1.0.236` is honoured exactly and floors the build against *that* train; `--build 999` is honoured exactly and does not move the marketing version;
 - an unreachable App Store Connect fails the run unless `--allow-unverified-seq` is passed;
 - the skip message names the 3600s default and both overrides;
-- a last-ship 3000s ago is still gated (sequence untouched); at 3700s the gate proceeds.
+- a last-ship 3000s ago is still gated (sequence untouched); at 3700s the gate proceeds;
+- in fixed mode: the marketing version stays fixed, the plan passes the merge
+  stamp of HEAD, a `--build` must be 12 digits and above this platform's max,
+  and feed floors stay https-only, numeric, >= 1 and at most 12 digits.
 
 The credential suites are offline too:  `test-asc-credentials.sh` drives `load_secrets` with a fake `fleet-secrets` and throwaway keys generated at test time, and `test-asc-key.test.mjs` generates its own key pair.  Neither commits a key, and neither reaches the network.
 

@@ -98,7 +98,7 @@ cmd=""
 for a in "$@"; do
   case "$a" in
     */asc-api.mjs) cmd="asc-api" ;;
-    latest-marketing-patch|build-floor|released-store-version|next-shared-build)
+    latest-marketing-patch|build-floor|released-store-version|next-shared-build|plan-release-build|max-build)
       if [[ "$cmd" == "asc-api" ]]; then cmd="${cmd}:${a}"; fi
       ;;
   esac
@@ -117,10 +117,15 @@ case "$cmd" in
     printf '%s\n' "${FAKE_RELEASED:-}"
     exit 0
     ;;
-  asc-api:next-shared-build)
+  asc-api:next-shared-build|asc-api:plan-release-build)
     [[ "${FAKE_SHARED:-}" == "fail" ]] && exit 3
     [[ -n "${FAKE_SHARED:-}" ]] || exit 2
     printf '%s\n' "$FAKE_SHARED"
+    exit 0
+    ;;
+  asc-api:max-build)
+    [[ "${FAKE_THIS_MAX:-}" == "fail" ]] && exit 2
+    printf '%s\n' "${FAKE_THIS_MAX:-0}"
     exit 0
     ;;
   asc-api:build-floor)
@@ -178,6 +183,10 @@ export FLEET_SECRETS="${FAKE_BIN}/fleet-secrets"
 git -C "$REPO" init -q 2>/dev/null || git -C "$REPO" init >/dev/null
 git -C "$REPO" config user.email test@example.invalid
 git -C "$REPO" config user.name "seq test"
+# Fixed seed dates, so the fixed-mode merge stamp is deterministic:  every
+# seed commit lands on 2026-10-29 00:00 America/Chicago, hence S=202610290000.
+export GIT_AUTHOR_DATE="2026-10-29T00:00:00-05:00"
+export GIT_COMMITTER_DATE="2026-10-29T00:00:00-05:00"
 echo seed >"${REPO}/README"
 git -C "$REPO" add README
 git -C "$REPO" -c commit.gpgsign=false commit -qm seed
@@ -193,6 +202,8 @@ while [ "$_seed" -le 6 ]; do
   git -C "$REPO" -c commit.gpgsign=false commit -qm "seed $_seed"
   _seed=$((_seed + 1))
 done
+unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+FIXTURE_STAMP="202610290000"
 HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
 # Owner directive 2026-10-24 (AFC-517): the build number starts from the commit
 # count.  Read the count from the fixture instead of hard-coding it, so adding
@@ -227,6 +238,7 @@ run_ship() {
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     FAKE_RELEASED="${FAKE_RELEASED:-}" \
     FAKE_SHARED="${FAKE_SHARED:-}" \
+    FAKE_THIS_MAX="${FAKE_THIS_MAX:-}" \
     FAKE_CURL="${FAKE_CURL:-}" \
     FAKE_FEED_FILE="${FAKE_FEED_FILE:-${WORK}/feed.xml}" \
     FAKE_CALL_LOG="$CALL_LOG" \
@@ -561,7 +573,7 @@ check "plans no version around it" "$(contains 'UNVERIFIED patch' && echo 1 || e
 FAKE_ASC_PATCH=236
 echo
 
-echo "12. fixed marketing version + shared four-digit build (apps.json fixedMarketingVersion)"
+echo "12. fixed marketing version + shared merge-timestamp build (apps.json fixedMarketingVersion)"
 FIXDIR="${WORK}/fleet-fixed"
 rm -rf "$FIXDIR"; cp -R "$SCRIPT_DIR" "$FIXDIR"
 python3 - "$FIXDIR/apps.json" <<'PY'
@@ -578,32 +590,40 @@ for k in list(a)[:1]:
 json.dump(d, open(p, "w"), indent=2)
 PY
 FIXAPP="$(python3 -c 'import json,sys; print(list(json.load(open(sys.argv[1]))["apps"])[0])' "$FIXDIR/apps.json")"
+FIXAPP_BUNDLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"][sys.argv[2]]["bundleId"])' "$FIXDIR/apps.json" "$FIXAPP")"
 SHIP_REAL="$SHIP"; SHIP="${FIXDIR}/ship-testflight.sh"
 rm -f "${STATE}/build-seq-${FIXAPP}.txt" "${STATE}/last-ship-${FIXAPP}.txt"
 write_record "$FIXAPP" 5
-FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=2383; FAKE_RELEASED=""; FAKE_SHARED="1000"
+FAKE_ASC_PATCH=239; FAKE_ASC_FLOOR=2383; FAKE_RELEASED=""; FAKE_SHARED="202610290000"
+: >"$CALL_LOG"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 planned_pair
 check "fixed: marketing stays 1.1.2 even though ASC holds patch 239 (got '${PLANNED_MARKETING}')" \
   "$([[ "$PLANNED_MARKETING" == "1.1.2" ]] && echo 0 || echo 1)"
-check "fixed: an empty inventory plans the first shared four-digit build (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
+check "fixed: an empty inventory plans the merge stamp (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
 check "fixed: the integer floor and commit count play no part" \
-  "$(contains 'shared four-digit build 1000 for fixed version 1.1.2' && echo 0 || echo 1)"
-FAKE_SHARED="1001"
+  "$(contains 'shared merge-timestamp build 202610290000 for fixed version 1.1.2' && echo 0 || echo 1)"
+check "fixed: the plan passes the fixture merge stamp ${FIXTURE_STAMP}" \
+  "$(calls_contain "plan-release-build ${FIXAPP_BUNDLE} --merge-stamp ${FIXTURE_STAMP}" && echo 0 || echo 1)"
+FAKE_SHARED="202610290001"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 planned_pair
-check "fixed: a counter holding 1000 goes to 1001 (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1001" ]] && echo 0 || echo 1)"
+check "fixed: an inventory holding the stamp goes one up (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290001" ]] && echo 0 || echo 1)"
 FAKE_SHARED="fail"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
-check "fixed: an unreadable or exhausted inventory stops the run, nothing guessed" \
-  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+check "fixed: an unreadable inventory stops the run, nothing guessed" \
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
 FAKE_SHARED=""
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: an unreadable inventory stops the run" \
-  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
-FAKE_SHARED="1000"; FAKE_RELEASED="1.1.2"
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+FAKE_SHARED="2394"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
+check "fixed: a non-12-digit plan is refused, nothing guessed" \
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+FAKE_SHARED="202610290000"; FAKE_RELEASED="1.1.2"
 run_ship "$FIXAPP" --repo-root "$REPO" --dry-run
 check "fixed: a version at the released App Store version is refused, not bumped" \
   "$(contains 'at or below the released App Store version 1.1.2' && echo 0 || echo 1)"
@@ -626,16 +646,16 @@ d["apps"]["fixmac"] = {
 }
 json.dump(d, open(p, "w"), indent=2)
 PY
-FAKE_SHARED="1000"; FAKE_RELEASED=""
+FAKE_SHARED="202610290000"; FAKE_RELEASED=""
 rm -f "${STATE}/build-seq-fixmac.txt" "${STATE}/last-ship-fixmac.txt"
 run_ship "fixmac" --repo-root "$REPO" --dry-run
 planned_pair
 check "fixed macOS: marketing stays 1.1.2 (got '${PLANNED_MARKETING}')" \
   "$([[ "$PLANNED_MARKETING" == "1.1.2" ]] && echo 0 || echo 1)"
-check "fixed macOS: plans the shared four-digit build instead of refusing (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
-check "fixed macOS: logs the shared counter line" \
-  "$(contains 'shared four-digit build 1000 for fixed version 1.1.2' && echo 0 || echo 1)"
+check "fixed macOS: plans the shared merge-timestamp build instead of refusing (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
+check "fixed macOS: logs the shared build line" \
+  "$(contains 'shared merge-timestamp build 202610290000 for fixed version 1.1.2' && echo 0 || echo 1)"
 echo
 
 echo "13. fixed feed floors + paired bundle passthrough"
@@ -679,14 +699,14 @@ FEED_URL="https://example.invalid/feed.xml"
 rm -f "${STATE}/build-seq-fixfeed.txt" "${STATE}/last-ship-fixfeed.txt"
 # A feed timeout is a feed failure: fail closed and name the feed, so it is
 # never reported as an App Store Connect failure.
-FAKE_SHARED="1000"; FAKE_RELEASED=""; FAKE_CURL="timeout"
+FAKE_SHARED="202610290000"; FAKE_RELEASED=""; FAKE_CURL="timeout"
 : >"$CALL_LOG"
 run_ship "fixfeed" --repo-root "$REPO" --dry-run
 check "feed timeout fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "feed timeout names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
 check "feed timeout is reported as a feed failure" "$(contains 'paired build feed' && echo 0 || echo 1)"
 check "feed timeout stops the run without guessing" \
-  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
 check "the feed fetch is hardened (proto, timeouts, max filesize)" \
   "$(calls_contain '--proto =https --proto-redir =https --connect-timeout 10 --max-time 30 --max-filesize 5000000' && echo 0 || echo 1)"
 # An unreachable feed fails the same way, with curl's reason attached.
@@ -707,43 +727,55 @@ check "feed without a numeric version names the feed URL" "$(contains "$FEED_URL
 check "says the feed holds no numeric version" "$(contains 'no numeric' && echo 0 || echo 1)"
 check "the empty-feed message names the sparkle tag" "$(contains '<sparkle:version>' && echo 0 || echo 1)"
 check "empty feed stops the run without guessing" \
-  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
-# A good feed contributes its max as an extra floor to next-shared-build.
-printf '%s\n' '<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1600</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
-FAKE_SHARED="1601"
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
+# A good feed contributes its max as an extra floor to plan-release-build.
+printf '%s\n' '<rss><channel><item><sparkle:version>202610170000</sparkle:version></item><item><sparkle:version>202610180000</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
+FAKE_SHARED="202610290000"
 : >"$CALL_LOG"
 run_ship "fixfeed" --repo-root "$REPO" --dry-run
 planned_pair
-check "feed max 1600 plans 1601 (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1601" ]] && echo 0 || echo 1)"
-check "the feed floor reaches next-shared-build" \
-  "$(calls_contain 'next-shared-build trade.example.fixfeed 1600' && echo 0 || echo 1)"
+check "feed max below the stamp still plans the stamp (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
+check "the feed floor reaches plan-release-build" \
+  "$(calls_contain 'plan-release-build trade.example.fixfeed 202610180000' && echo 0 || echo 1)"
 # Whitespace around the version digits still scrapes: the feed is XML and
 # pretty-printers pad the text node.
-printf '%b\n' '<rss><channel><item><sparkle:version>  1500  </sparkle:version></item><item><sparkle:version>\t1600\t</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
-FAKE_SHARED="1601"
+printf '%b\n' '<rss><channel><item><sparkle:version>  202610170000  </sparkle:version></item><item><sparkle:version>\t202610180000\t</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
+FAKE_SHARED="202610290000"
 : >"$CALL_LOG"
 run_ship "fixfeed" --repo-root "$REPO" --dry-run
 planned_pair
-check "whitespace-padded feed max 1600 plans 1601 (got '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_BUILD" == "1601" ]] && echo 0 || echo 1)"
-check "the padded feed floor reaches next-shared-build" \
-  "$(calls_contain 'next-shared-build trade.example.fixfeed 1600' && echo 0 || echo 1)"
-# A feed max outside 1..9998 cannot yield a valid four-digit build: fail
-# closed with the feed URL and the reason, on both sides of the range.
-for _bad in 0 9999 202610190645; do
+check "whitespace-padded feed max still plans the stamp (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
+check "the padded feed floor reaches plan-release-build" \
+  "$(calls_contain 'plan-release-build trade.example.fixfeed 202610180000' && echo 0 || echo 1)"
+# A small feed max still passes through as a floor.  Past 12 digits the floor
+# is rejected: the planner caps the shared build at 12 digits, so a larger
+# floor could never plan a shippable build.
+printf '%s\n' '<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1600</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
+FAKE_SHARED="202610290000"
+: >"$CALL_LOG"
+run_ship "fixfeed" --repo-root "$REPO" --dry-run
+check "a small feed max still reaches plan-release-build" \
+  "$(calls_contain 'plan-release-build trade.example.fixfeed 1600' && echo 0 || echo 1)"
+# A feed floor of 0 or past 12 digits is rejected: fail closed with the feed
+# URL, the value and the range, on both sides of the range and at the
+# 13-digit boundary.
+for _bad in 0 9999999999999 999999999999999999; do
   printf '%s\n' "<rss><channel><item><sparkle:version>${_bad}</sparkle:version></item></channel></rss>" >"${WORK}/feed.xml"
-  FAKE_SHARED="1000"
+  FAKE_SHARED="202610290000"
   : >"$CALL_LOG"
   run_ship "fixfeed" --repo-root "$REPO" --dry-run
   check "out-of-range feed floor ${_bad} fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
   check "out-of-range feed floor ${_bad} names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
-  check "out-of-range feed floor ${_bad} names the range" "$(contains 'outside 1..9998' && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} names the value" "$(contains "floor ${_bad} rejected" && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} names the range" "$(contains 'at most 12 digits' && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} never reaches plan-release-build" "$(calls_contain 'plan-release-build' && echo 1 || echo 0)"
   check "out-of-range feed floor ${_bad} stops the run without guessing" \
-    "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+    "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
 done
 # A non-https feed is rejected before curl runs: fail closed with the URL.
-FAKE_SHARED="1000"
+FAKE_SHARED="202610290000"
 : >"$CALL_LOG"
 run_ship "fixhttp" --repo-root "$REPO" --dry-run
 check "http feed fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
@@ -751,51 +783,93 @@ check "http feed names the feed URL" "$(contains 'http://example.invalid/feed.xm
 check "http feed says https is required" "$(contains 'must start with https' && echo 0 || echo 1)"
 check "http feed never reaches curl" "$(calls_contain 'curl ' && echo 1 || echo 0)"
 check "http feed stops the run without guessing" \
-  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+  "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
 : >"$CALL_LOG"
 run_ship "fixfile" --repo-root "$REPO" --dry-run
 check "file feed fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
 check "file feed names the feed URL" "$(contains 'file:///tmp/never-served.xml' && echo 0 || echo 1)"
 check "file feed says https is required" "$(contains 'must start with https' && echo 0 || echo 1)"
 check "file feed never reaches curl" "$(calls_contain 'curl ' && echo 1 || echo 0)"
-# The paired bundle id reaches next-shared-build: preferred key, alias key,
+# The paired bundle id reaches plan-release-build: preferred key, alias key,
 # and a macOS entry naming its iOS pair.
-FAKE_SHARED="1000"
+FAKE_SHARED="202610290000"
 : >"$CALL_LOG"
 run_ship "fixpair" --repo-root "$REPO" --dry-run
-check "pairedBundleId reaches next-shared-build" \
-  "$(calls_contain 'next-shared-build trade.example.fixpair trade.example.fixpair.mac' && echo 0 || echo 1)"
+check "pairedBundleId reaches plan-release-build" \
+  "$(calls_contain 'plan-release-build trade.example.fixpair trade.example.fixpair.mac' && echo 0 || echo 1)"
 : >"$CALL_LOG"
 run_ship "fixalias" --repo-root "$REPO" --dry-run
-check "macBundleId alias still reaches next-shared-build" \
-  "$(calls_contain 'next-shared-build trade.example.fixalias trade.example.fixalias.mac' && echo 0 || echo 1)"
+check "macBundleId alias still reaches plan-release-build" \
+  "$(calls_contain 'plan-release-build trade.example.fixalias trade.example.fixalias.mac' && echo 0 || echo 1)"
 : >"$CALL_LOG"
 run_ship "fixboth" --repo-root "$REPO" --dry-run
 check "pairedBundleId wins over macBundleId" \
-  "$(calls_contain 'next-shared-build trade.example.fixboth trade.example.preferred' && echo 0 || echo 1)"
+  "$(calls_contain 'plan-release-build trade.example.fixboth trade.example.preferred' && echo 0 || echo 1)"
 check "macBundleId is ignored when pairedBundleId is set" \
   "$(calls_contain 'trade.example.legacy' && echo 1 || echo 0)"
 : >"$CALL_LOG"
 run_ship "fixmacpair" --repo-root "$REPO" --dry-run
 planned_pair
 check "macOS entry plans the fixed version (got '${PLANNED_MARKETING}' / '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
-check "the iOS pair reaches next-shared-build" \
-  "$(calls_contain 'next-shared-build trade.example.fixmacpair.mac trade.example.fixmacpair.ios' && echo 0 || echo 1)"
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
+check "the iOS pair reaches plan-release-build" \
+  "$(calls_contain 'plan-release-build trade.example.fixmacpair.mac trade.example.fixmacpair.ios' && echo 0 || echo 1)"
 # A macOS entry with no paired keys finds its iOS peer by reverse lookup: the
 # entry whose pairedBundleId or macBundleId names this mac bundle.
 : >"$CALL_LOG"
 run_ship "fixrevmac" --repo-root "$REPO" --dry-run
 planned_pair
 check "macOS reverse lookup plans the fixed version (got '${PLANNED_MARKETING}' / '${PLANNED_BUILD}')" \
-  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
 check "reverse lookup passes the iOS peer as the paired id" \
-  "$(calls_contain 'next-shared-build trade.example.rev.mac trade.example.rev.ios' && echo 0 || echo 1)"
+  "$(calls_contain 'plan-release-build trade.example.rev.mac trade.example.rev.ios' && echo 0 || echo 1)"
 : >"$CALL_LOG"
 run_ship "fixrevaliasmac" --repo-root "$REPO" --dry-run
 check "reverse lookup also follows the macBundleId alias" \
-  "$(calls_contain 'next-shared-build trade.example.revalias.mac trade.example.revalias.ios' && echo 0 || echo 1)"
-SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_SHARED=""; FAKE_ASC_PATCH=236; FAKE_CURL=""
+  "$(calls_contain 'plan-release-build trade.example.revalias.mac trade.example.revalias.ios' && echo 0 || echo 1)"
+echo
+
+echo "14. fixed --build: 12-digit shape, above this platform only"
+FAKE_SHARED="202610290000"; FAKE_RELEASED=""
+# Above this platform's max: honoured exactly, marketing untouched.  The check
+# queries max-build for THIS app and platform only -- no plan-release-build
+# call -- so the paired platform may reuse the same value.
+FAKE_THIS_MAX="202610290000"
+: >"$CALL_LOG"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290005
+planned_pair
+check "fixed --build above this platform's max is honoured (got '${PLANNED_MARKETING}' / '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "202610290005" ]] && echo 0 || echo 1)"
+check "the check queries this app and platform only" \
+  "$(calls_contain "max-build ${FIXAPP_BUNDLE} IOS" && echo 0 || echo 1)"
+check "the check does not consult the paired inventory" \
+  "$(calls_contain 'plan-release-build' && echo 1 || echo 0)"
+# At or below this platform's max: refused, naming the max.
+for _bad in 202610290000 202610180000; do
+  : >"$CALL_LOG"
+  run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build "$_bad"
+  check "fixed --build ${_bad} at or below this platform's max fails (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+  check "fixed --build ${_bad} names this platform's max" "$(contains 'at or below the highest existing build 202610290000' && echo 0 || echo 1)"
+done
+# Past 64-bit the length comparison still orders: a 19-digit max beats any
+# 12-digit --build.
+FAKE_THIS_MAX="9999999999999999999"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290005
+check "fixed --build below a 19-digit max fails (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+# Not a 12-digit stamp: refused without consulting the build inventory.
+for _bad in 1234 012345678901 20261029000 2026102900000 v202610290000; do
+  : >"$CALL_LOG"
+  run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build "$_bad"
+  check "fixed --build ${_bad} fails the shape check (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+  check "fixed --build ${_bad} says 12 digits are required" "$(contains 'requires a 12-digit merge-timestamp build' && echo 0 || echo 1)"
+  check "fixed --build ${_bad} never reaches max-build" "$(calls_contain 'max-build' && echo 1 || echo 0)"
+done
+# An unreadable this-platform slice fails closed.
+FAKE_THIS_MAX="fail"
+run_ship "$FIXAPP" --repo-root "$REPO" --dry-run --build 202610290005
+check "fixed --build with an unreadable slice fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "says the existing builds could not be verified" "$(contains 'cannot verify the existing builds' && echo 0 || echo 1)"
+SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_SHARED=""; FAKE_THIS_MAX=""; FAKE_ASC_PATCH=236; FAKE_CURL=""
 echo
 
 echo "----------------------------------------"
