@@ -1,0 +1,26 @@
+P T R
+Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+F I
+Name: Hon. Max Miller
+Status: Member
+State/District: OH07
+T
+ID Owner Asset Transaction
+Type
+Date Notification
+Date
+Amount Cap.
+Gains >
+$200?
+AIX Ventures Fund II, LP (GLAS
+Funds, LP) [HN]
+S (partial) 10/01/2026 10/27/2026 $1,001 - $15,000
+F S: New
+S O: 2012 Trust
+D: Distribution of $6,923.58
+Mercato Partners Traverse IV QP, LP
+(GLAS Funds, LP) [HN]
+S (partial) 09/30/2026 10/27/2026 $1,001 - $15,000
+F S: New
+S O: 2012 Trust
+D: Distribution of $2,375.01
