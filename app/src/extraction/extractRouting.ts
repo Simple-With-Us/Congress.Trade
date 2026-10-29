@@ -204,7 +204,7 @@ export function looksLikePlausibleTradeTable(text: string): boolean {
  */
 export function looksLikeHeaderContaminatedAsset(assetName: string | null): boolean {
   if (!assetName) return false;
-  return /(?:\bClerk of the House of Representatives\b|\bLegislative Resource Center\b|\bB-?81 Cannon Building\b|\bCannon Building\b|\bID Owner Asset Transaction Type\b|\bTransaction Type Date Notification Date Amount\b|\bPeriodic Transaction Report\b|Name:\s*Hon\.|Status:\s*Member|State\/District:|\bMember of the U\.?S\.?\s+House\b|\bOfficer or Employee\b|\bOffice Telephone\b|\bEmploying Off(?:ice)?\b|\bunreadable asset\b|HOUSE OF\s+REP|\bCfficar\b|\bDiotict\b|Use oSucem|I certify that|Signature of Reporting|\bFULL ASSET NAME\b|\bif you answered\b|\bfiled in error\b|\bpreviously and erroneously filed\b|\bplease contact\b|\bChief of Staff\b|\bServing the .+ Valley\b|\bbro[a-z]{1,4}r\s+acted\s+as\b)/i.test(
+  return /(?:\bClerk of the House of Representatives\b|\bLegislative Resource Center\b|\bB-?81 Cannon Building\b|\bCannon Building\b|\bID Owner Asset Transaction Type\b|\bTransaction Type Date Notification Date Amount\b|\bPeriodic Transaction Report\b|Name:\s*Hon\.|Status:\s*Member|State\/District:|\bMember of the U\.?S\.?\s+House\b|\bOfficer or Employee\b|\bOffice Telephone\b|\bEmploying Off(?:ice)?\b|\bunreadable asset\b|HOUSE OF\s+REP|\bCfficar\b|\bDiotict\b|Use oSucem|I certify that|Signature of Reporting|\bFULL ASSET NAME\b|\bpro\w{0,4}\s+(?:\w{1,2}\s+)?full\b.{0,30}?(?:symb|ymbol|ticker)|\bif you answered\b|\bfiled in error\b|\bpreviously and erroneously filed\b|\bplease contact\b|\bChief of Staff\b|\bServing the .+ Valley\b|\bbro[a-z]{1,4}r\s+acted\s+as\b)/i.test(
     assetName,
   ) || looksLikePtrFormSampleAsset(assetName);
 }
