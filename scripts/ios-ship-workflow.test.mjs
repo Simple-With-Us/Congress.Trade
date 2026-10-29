@@ -157,6 +157,12 @@ test("ios-ship.yml plans the release build once and hands it to the ship", () =>
   assert.match(code, /plan-release-build/);
   assert.match(code, /--merge-stamp/);
   assert.match(code, /TZ=America\/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD/);
+  // The one plan covers the same inventory as the ship script's own
+  // fixed-mode plan: pairedBundleId first, then the macBundleId alias
+  // (ship-testflight.sh asc_next_shared_build), and a pairedBuildFeed
+  // floor fails the run instead of planning without it.
+  assert.match(code, /get\("pairedBundleId"\) or e\.get\("macBundleId"\)/);
+  assert.match(code, /pairedBuildFeed floor that this plan step does not fetch/);
   // The value leaves the job as a job output, so every ship job of the
   // release takes the same number.
   assert.match(code, /outputs:\s*\n\s+build: \$\{\{ steps\.plan-build\.outputs\.build \}\}/);

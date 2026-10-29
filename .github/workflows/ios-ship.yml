@@ -270,7 +270,9 @@ jobs:
       # build max(S, M + 1) is computed here, once, and handed to the ship
       # step below as --build. The ship script's own fixed-mode plan is the
       # same code path (the same node command with the same merge stamp), for
-      # operators running locally without --build. Runs only when the gate
+      # operators running locally without --build. The paired lookup mirrors
+      # the ship script (pairedBundleId, then the macBundleId alias), so the
+      # one plan covers the same inventory. Runs only when the gate
       # says ship, so a gated tick plans nothing. Credentials are the ASC
       # trio the previous step loaded into the environment; they are never
       # echoed (only the planned build number is printed, which is not
@@ -287,7 +289,7 @@ jobs:
           fi
           registry="$GITHUB_WORKSPACE/scripts/ios-fleet/apps.json"
           bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"]["bundleId"])' "$registry")"
-          paired="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"].get("pairedBundleId") or "")' "$registry")"
+          paired="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["apps"]["congress"]; print(e.get("pairedBundleId") or e.get("macBundleId") or "")' "$registry")"
           feed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"].get("pairedBuildFeed") or "")' "$registry")"
           if [ -n "$feed" ]; then
             echo "::error::congress has a pairedBuildFeed floor that this plan step does not fetch; extend it before shipping."
