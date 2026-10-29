@@ -225,5 +225,16 @@ describe('textPdf House PTR row segmentation', () => {
       expect(hd?.assetName).toMatch(/Subholding Of/);
       expect(hd?.confidence ?? 1).toBeLessThan(0.95);
     });
+
+    it('keeps a row with a glued Location label out of auto-publish', () => {
+      const rows = parseHousePtrText(
+        doc().replace(/\n/g, ' ') +
+          ' SP Apple Inc. - Common Stock (AAPL) [ST] S 10/02/2026 10/05/2026 $1,001 - $15,000' +
+          ' Location: US Home Depot, Inc. (HD) [ST] S 10/22/2026 10/22/2026 $1,001 - $15,000',
+      );
+      const hd = rows.find((r) => r.ticker === 'HD');
+      expect(hd?.assetName).toMatch(/Location/);
+      expect(hd?.confidence ?? 1).toBeLessThan(0.95);
+    });
   });
 });

@@ -266,7 +266,7 @@ function collapseHousePtrLines(text: string): HousePtrDoc {
 }
 
 /** Full House detail label anywhere in a string (asset-name sanity check). */
-const HOUSE_DETAIL_LABEL_IN_NAME_RE = /\b(?:Filing\s+Status|Subholding\s+Of)\s*:/i;
+const HOUSE_DETAIL_LABEL_IN_NAME_RE = /\b(?:Filing\s+Status|Subholding\s+Of|Location|Description)\s*:/i;
 
 /** A source line that opens a new holding with an explicit owner code. */
 const HOUSE_OWNER_LINE_RE = /^(?:SP|DC|JT|SELF)\s/;
