@@ -1,0 +1,67 @@
+P T R
+Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+F I
+Name: Hon. Pete Sessions
+Status: Member
+State/District: TX17
+T
+ID Owner Asset Transaction
+Type
+Date Notification
+Date
+Amount Cap.
+Gains >
+$200?
+SP Abbott Laboratories Common Stock
+(ABT) [ST]
+S 10/02/2026 10/05/2026 $50,001 -
+$100,000
+F S: New
+S O: Trust One
+SP Amazon.com, Inc. - Common Stock
+(AMZN) [ST]
+S 10/02/2026 10/05/2026 $100,001 -
+$250,000
+F S: New
+S O: Trust One
+Amazon.com, Inc. - Common Stock
+(AMZN) [ST]
+S 10/27/2026 10/27/2026 $15,001 -
+$50,000
+F S: New
+SP Apple Inc. - Common Stock (AAPL)
+[ST]
+S 10/02/2026 10/05/2026 $250,001 -
+$500,000
+F S: New
+S O: Trust One
+SP NVIDIA Corporation - Common Stock
+(NVDA) [ST]
+S 10/02/2026 10/02/2026 $15,001 -
+$50,000
+F S: New
+S O: IRA One
+SP McDonald's Corporation Common
+Stock (MCD) [ST]
+S 10/02/2026 10/05/2026 $15,001 -
+$50,000
+F S: New
+S O: Trust One
+SP McDonald's Corporation Common
+Stock (MCD) [ST]
+S 10/27/2026 10/27/2026 $1,001 - $15,000
+F S: New
+S O: IRA Two
+SP Mastercard Incorporated Common
+Stock (MA) [ST]
+S 10/02/2026 10/05/2026 $15,001 -
+$50,000
+ID Owner Asset Transaction
+Type
+Date Notification
+Date
+Amount Cap.
+Gains >
+$200?
+F S: New
+S O: Trust One
