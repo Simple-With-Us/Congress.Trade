@@ -58,6 +58,12 @@ const CASES: { docId: string; text: string; rows: string }[] = [
     text: 'H-2026-20035715-text-layer.txt',
     rows: 'H-2026-20035715-parsed-rows.json',
   },
+  {
+    // Kevin Hern OK01, 2026-10-29: blank-owner IRA row between two JT rows.
+    docId: 'H-2026-20035710',
+    text: 'H-2026-20035710-text-layer.txt',
+    rows: 'H-2026-20035710-parsed-rows.json',
+  },
 ];
 
 describe('textPdf House PTR row segmentation', () => {
