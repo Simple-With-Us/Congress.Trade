@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { normalizePrivateKey, writePrivateKeyFile, CLIENT_ENV_ALLOWLIST, clientEnvironment } from "./asc-key.mjs";
+import { nextSharedBuild } from "./shared-build.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const helper = join(here, "asc-key.mjs");
@@ -273,4 +274,188 @@ test("the client source never reads a key path", () => {
   const source = readFileSync(client, "utf8");
   assert.doesNotMatch(source, /process\.env\.ASC_KEY_PATH/, "the client reads a named key path");
   assert.doesNotMatch(source, /fromFile/, "the client still has a file reader");
+});
+
+// ---- next-shared-build contract ------------------------------------------
+// The client pages every build of the app (and of its paired app) and prints
+// nextSharedBuild's result. These cases drive the real client against a stub
+// App Store Connect on loopback through ASC_API_BASE: generated key, nothing
+// beyond 127.0.0.1.
+
+function stubAsc(handler) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url || "");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(handler(req.url || "")));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({
+      base: `http://127.0.0.1:${server.address().port}`,
+      seen,
+      close: () => server.close()
+    }));
+  });
+}
+
+function stubInventory({ apps, builds, linksFor } = {}) {
+  // apps: { bundleId: appId }; builds: { "appId|PLATFORM": [versions] }.
+  // linksFor: optional ("builds", key) => links object attached to a page.
+  return (rawUrl) => {
+    const url = new URL(rawUrl, "http://stub.invalid");
+    if (url.pathname === "/v1/apps") {
+      const id = (apps || {})[url.searchParams.get("filter[bundleId]")];
+      return id ? { data: [{ id, type: "apps", attributes: {} }] } : { data: [] };
+    }
+    if (url.pathname === "/v1/builds") {
+      const key = `${url.searchParams.get("filter[app]")}|${url.searchParams.get("filter[preReleaseVersion.platform]")}`;
+      const versions = (builds || {})[key] || [];
+      const page = {
+        data: versions.map((v, i) => ({ id: `b-${i}`, type: "builds", attributes: { version: v } }))
+      };
+      if (linksFor) {
+        const links = linksFor("builds", key);
+        if (links !== undefined) page.links = links;
+      }
+      return page;
+    }
+    return { data: [] };
+  };
+}
+
+function stubClientEnv(server, home) {
+  return {
+    PATH: safePath,
+    HOME: home,
+    FLEET_SECRETS_BIN: join(root, "no-fleet-secrets"),
+    ASC_API_BASE: server.base,
+    ASC_KEY_ID: "SYNTHETICKEYID1",
+    ASC_ISSUER_ID: "synthetic-issuer",
+    ASC_KEY_P8: keyPem
+  };
+}
+
+test("next-shared-build prints nextSharedBuild's result for an iOS build, a macOS build and a floor", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["1200"], "app-1|MAC_OS": ["1300"] }
+  }));
+  try {
+    const expected = nextSharedBuild({
+      iosBuilds: ["1200"], macBuilds: ["1300"], extraFloors: [1400], complete: true
+    });
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.app", "1400"],
+      stubClientEnv(server, join(root, "home-shared"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), expected.build);
+    assert.match(result.stderr, /next-shared-build: 1 iOS build\(s\) \+ 1 macOS build\(s\) inspected/);
+  } finally {
+    server.close();
+  }
+});
+
+test("next-shared-build collects both platforms for the paired app too", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-a", "trade.example.mac": "app-b" },
+    builds: {
+      "app-a|IOS": ["1100"],
+      "app-a|MAC_OS": [],
+      "app-b|IOS": ["1500"],
+      "app-b|MAC_OS": ["1200"]
+    }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.app", "trade.example.mac"],
+      stubClientEnv(server, join(root, "home-paired"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "1501");
+    const queried = (app, platform) => server.seen.some(
+      (u) => u.includes(`filter[app]=${app}`) && u.includes(`platform]=${platform}`)
+    );
+    assert.ok(queried("app-a", "IOS") && queried("app-a", "MAC_OS"),
+      `the client did not query both platforms for the app:\n${server.seen.join("\n")}`);
+    assert.ok(queried("app-b", "IOS") && queried("app-b", "MAC_OS"),
+      `the client did not query both platforms for the paired app:\n${server.seen.join("\n")}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("next-shared-build refuses malformed pagination", async () => {
+  for (const links of [{ next: 12345 }, { next: { href: "x" } }, "not-an-object", ["x"]]) {
+    const server = await stubAsc(stubInventory({
+      apps: { "trade.example.app": "app-1" },
+      builds: { "app-1|IOS": ["1200"], "app-1|MAC_OS": [] },
+      linksFor: () => links
+    }));
+    try {
+      const result = await spawnNode(
+        [client, "next-shared-build", "trade.example.app"],
+        stubClientEnv(server, join(root, "home-page"))
+      );
+      assert.equal(result.code, 2,
+        `expected exit 2 for links ${JSON.stringify(links)}, got ${result.code}: ${result.stderr}`);
+      assert.match(result.stderr, /next-shared-build: malformed pagination/);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("next-shared-build unions both platforms across both apps", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.ios": "app-ios", "trade.example.mac": "app-mac" },
+    builds: {
+      "app-ios|IOS": ["1100"],
+      "app-ios|MAC_OS": ["1150"],
+      "app-mac|IOS": ["1200"],
+      "app-mac|MAC_OS": ["1300"]
+    }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.ios", "trade.example.mac"],
+      stubClientEnv(server, join(root, "home-union"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "1301");
+    assert.match(result.stderr, /next-shared-build: 2 iOS build\(s\) \+ 2 macOS build\(s\) inspected/);
+    const queried = (app, platform) => server.seen.some(
+      (u) => u.includes(`filter[app]=${app}`) && u.includes(`platform]=${platform}`)
+    );
+    assert.ok(queried("app-ios", "IOS") && queried("app-ios", "MAC_OS"),
+      `the client did not query both platforms for the app:\n${server.seen.join("\n")}`);
+    assert.ok(queried("app-mac", "IOS") && queried("app-mac", "MAC_OS"),
+      `the client did not query both platforms for the paired app:\n${server.seen.join("\n")}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("next-shared-build fails closed when pagination exceeds the page cap", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["1200"], "app-1|MAC_OS": [] },
+    linksFor: (kind, key) => {
+      if (kind === "builds" && key === "app-1|IOS") {
+        return { next: "/v1/builds?filter[app]=app-1&filter[preReleaseVersion.platform]=IOS&limit=200&cursor=x" };
+      }
+      return undefined;
+    }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.app"],
+      stubClientEnv(server, join(root, "home-cap"))
+    );
+    assert.equal(result.code, 2,
+      `expected exit 2 for a truncated inventory, got ${result.code}: ${result.stderr}`);
+    assert.match(result.stderr, /next-shared-build: incomplete pagination/);
+  } finally {
+    server.close();
+  }
 });
