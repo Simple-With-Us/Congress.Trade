@@ -163,6 +163,12 @@ describe('evaluateExtractQuality — hard-stops', () => {
     expect(looksLikeHeaderContaminatedAsset('Pro d full m tu k r symb l')).toBe(true);
     expect(looksLikeHeaderContaminatedAsset('Prov d full m ttick ymbol')).toBe(true);
     expect(looksLikeHeaderContaminatedAsset('Provide full name, not ticker symbol')).toBe(true);
+  });
+
+  it('keeps real Pro-prefixed holdings whose notes mention full name and ticker symbol', () => {
+    expect(looksLikeHeaderContaminatedAsset('Procter full year note, ticker symbol PG')).toBe(false);
+    expect(looksLikeHeaderContaminatedAsset('Procter & Gamble Co (PG) full position, see ticker symbol')).toBe(false);
+    expect(looksLikeHeaderContaminatedAsset('Prospect Capital full redemption; symbol PSEC')).toBe(false);
     expect(looksLikeHeaderContaminatedAsset('Prudential Financial Inc')).toBe(false);
     expect(looksLikeHeaderContaminatedAsset('Procter & Gamble full year note')).toBe(false);
   });
