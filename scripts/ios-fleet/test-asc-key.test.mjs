@@ -276,11 +276,11 @@ test("the client source never reads a key path", () => {
   assert.doesNotMatch(source, /fromFile/, "the client still has a file reader");
 });
 
-// ---- next-shared-build contract ------------------------------------------
+// ---- plan-release-build / next-shared-build / max-build contract ---------
 // The client pages every build of the app (and of its paired app) and prints
-// nextSharedBuild's result. These cases drive the real client against a stub
-// App Store Connect on loopback through ASC_API_BASE: generated key, nothing
-// beyond 127.0.0.1.
+// nextSharedBuild's result; max-build prints this app and platform's max.
+// These cases drive the real client against a stub App Store Connect on
+// loopback through ASC_API_BASE: generated key, nothing beyond 127.0.0.1.
 
 function stubAsc(handler) {
   const seen = [];
@@ -342,15 +342,59 @@ test("next-shared-build prints nextSharedBuild's result for an iOS build, a macO
   }));
   try {
     const expected = nextSharedBuild({
-      iosBuilds: ["1200"], macBuilds: ["1300"], extraFloors: [1400], complete: true
+      iosBuilds: ["1200"],
+      macBuilds: ["1300"],
+      extraFloors: [1400],
+      complete: true,
+      mergeStamp: "202610290000"
     });
     const result = await spawnNode(
-      [client, "next-shared-build", "trade.example.app", "1400"],
+      [client, "next-shared-build", "trade.example.app", "1400", "--merge-stamp", "202610290000"],
       stubClientEnv(server, join(root, "home-shared"))
     );
     assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
     assert.equal(result.stdout.trim(), expected.build);
     assert.match(result.stderr, /next-shared-build: 1 iOS build\(s\) \+ 1 macOS build\(s\) inspected/);
+  } finally {
+    server.close();
+  }
+});
+
+test("plan-release-build is the same command under the canonical name", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["202610190645"], "app-1|MAC_OS": [] }
+  }));
+  try {
+    for (const stampArg of [["--merge-stamp", "202610180000"], ["--merge-stamp=202610180000"]]) {
+      const result = await spawnNode(
+        [client, "plan-release-build", "trade.example.app", ...stampArg],
+        stubClientEnv(server, join(root, "home-plan"))
+      );
+      assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+      assert.equal(result.stdout.trim(), "202610190646");
+      assert.match(result.stderr, /plan-release-build: 1 iOS build\(s\) \+ 0 macOS build\(s\) inspected/);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("plan-release-build refuses a missing or malformed merge stamp", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": [], "app-1|MAC_OS": [] }
+  }));
+  try {
+    for (const args of [
+      [client, "plan-release-build", "trade.example.app"],
+      [client, "plan-release-build", "trade.example.app", "--merge-stamp", "2394"],
+      [client, "plan-release-build", "trade.example.app", "--merge-stamp=012345678901"],
+      [client, "next-shared-build", "trade.example.app", "--merge-stamp", "not-a-stamp"]
+    ]) {
+      const result = await spawnNode(args, stubClientEnv(server, join(root, "home-stamp")));
+      assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stderr}`);
+    }
   } finally {
     server.close();
   }
@@ -362,17 +406,17 @@ test("next-shared-build collects both platforms for the paired app too", async (
     builds: {
       "app-a|IOS": ["1100"],
       "app-a|MAC_OS": [],
-      "app-b|IOS": ["1500"],
+      "app-b|IOS": ["202610190645"],
       "app-b|MAC_OS": ["1200"]
     }
   }));
   try {
     const result = await spawnNode(
-      [client, "next-shared-build", "trade.example.app", "trade.example.mac"],
+      [client, "next-shared-build", "trade.example.app", "trade.example.mac", "--merge-stamp", "202610180000"],
       stubClientEnv(server, join(root, "home-paired"))
     );
     assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
-    assert.equal(result.stdout.trim(), "1501");
+    assert.equal(result.stdout.trim(), "202610190646");
     const queried = (app, platform) => server.seen.some(
       (u) => u.includes(`filter[app]=${app}`) && u.includes(`platform]=${platform}`)
     );
@@ -394,7 +438,7 @@ test("next-shared-build refuses malformed pagination", async () => {
     }));
     try {
       const result = await spawnNode(
-        [client, "next-shared-build", "trade.example.app"],
+        [client, "next-shared-build", "trade.example.app", "--merge-stamp", "202610290000"],
         stubClientEnv(server, join(root, "home-page"))
       );
       assert.equal(result.code, 2,
@@ -413,16 +457,16 @@ test("next-shared-build unions both platforms across both apps", async () => {
       "app-ios|IOS": ["1100"],
       "app-ios|MAC_OS": ["1150"],
       "app-mac|IOS": ["1200"],
-      "app-mac|MAC_OS": ["1300"]
+      "app-mac|MAC_OS": ["202610190645"]
     }
   }));
   try {
     const result = await spawnNode(
-      [client, "next-shared-build", "trade.example.ios", "trade.example.mac"],
+      [client, "next-shared-build", "trade.example.ios", "trade.example.mac", "--merge-stamp", "202610180000"],
       stubClientEnv(server, join(root, "home-union"))
     );
     assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
-    assert.equal(result.stdout.trim(), "1301");
+    assert.equal(result.stdout.trim(), "202610190646");
     assert.match(result.stderr, /next-shared-build: 2 iOS build\(s\) \+ 2 macOS build\(s\) inspected/);
     const queried = (app, platform) => server.seen.some(
       (u) => u.includes(`filter[app]=${app}`) && u.includes(`platform]=${platform}`)
@@ -449,12 +493,78 @@ test("next-shared-build fails closed when pagination exceeds the page cap", asyn
   }));
   try {
     const result = await spawnNode(
-      [client, "next-shared-build", "trade.example.app"],
+      [client, "next-shared-build", "trade.example.app", "--merge-stamp", "202610290000"],
       stubClientEnv(server, join(root, "home-cap"))
     );
     assert.equal(result.code, 2,
       `expected exit 2 for a truncated inventory, got ${result.code}: ${result.stderr}`);
     assert.match(result.stderr, /next-shared-build: incomplete pagination/);
+  } finally {
+    server.close();
+  }
+});
+
+test("max-build prints this app and platform's max first component", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: {
+      "app-1|IOS": ["100", "202610190645.1", "1.1.2"],
+      "app-1|MAC_OS": ["209912312359"]
+    }
+  }));
+  try {
+    // The iOS slice only: the higher macOS build is not counted, and the
+    // dotted build counts by its first component.
+    const ios = await spawnNode(
+      [client, "max-build", "trade.example.app", "IOS"],
+      stubClientEnv(server, join(root, "home-max-ios"))
+    );
+    assert.equal(ios.code, 0, `the client failed: ${ios.stderr}`);
+    assert.equal(ios.stdout.trim(), "202610190645");
+    assert.match(ios.stderr, /max-build: 3 build\(s\) inspected on IOS/);
+    const mac = await spawnNode(
+      [client, "max-build", "trade.example.app", "MAC_OS"],
+      stubClientEnv(server, join(root, "home-max-mac"))
+    );
+    assert.equal(mac.code, 0, `the client failed: ${mac.stderr}`);
+    assert.equal(mac.stdout.trim(), "209912312359");
+  } finally {
+    server.close();
+  }
+});
+
+test("max-build prints 0 for an empty slice", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": [], "app-1|MAC_OS": ["1300"] }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "max-build", "trade.example.app", "IOS"],
+      stubClientEnv(server, join(root, "home-max-empty"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "0");
+  } finally {
+    server.close();
+  }
+});
+
+test("max-build fails closed on a bad platform, a missing app or a malformed build", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["NaN"], "app-1|MAC_OS": [] }
+  }));
+  try {
+    for (const args of [
+      [client, "max-build", "trade.example.app", "TVOS"],
+      [client, "max-build", "trade.example.app"],
+      [client, "max-build", "trade.example.missing", "IOS"],
+      [client, "max-build", "trade.example.app", "IOS"]
+    ]) {
+      const result = await spawnNode(args, stubClientEnv(server, join(root, "home-max-bad")));
+      assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stderr}`);
+    }
   } finally {
     server.close();
   }

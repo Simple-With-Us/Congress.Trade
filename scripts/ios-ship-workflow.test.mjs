@@ -133,15 +133,41 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // CT-2434: the ship log is kept so the external-beta promotion can name the
   // exact build this run uploaded, so the invocation may carry a tee -- but it
   // must still be the wrapper, and still be the last thing in the step.
+  // Owner 2026-10-29: the one planned build of the release is handed to the
+  // ship as --build, so every ship of the release uploads the same number.
   assert.match(
     code,
-    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
   );
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);
   assert.match(code, /secret_path=\/asc/);
   assert.match(code, /ASC_INFISICAL_PROJECT_ID:\s*[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/);
+});
+
+test("ios-ship.yml plans the release build once and hands it to the ship", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const code = withoutComments(yml);
+
+  // ONE upstream plan per release: a plan-build step that runs the shared
+  // plan command with the merge stamp of HEAD, and only when the gate says
+  // ship -- so a gated tick plans nothing and uploads nothing.
+  assert.match(code, /id: plan-build\n\s+if: steps\.gate\.outputs\.should_ship == '1'/);
+  assert.match(code, /plan-release-build/);
+  assert.match(code, /--merge-stamp/);
+  assert.match(code, /TZ=America\/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD/);
+  // The one plan covers the same inventory as the ship script's own
+  // fixed-mode plan: pairedBundleId first, then the macBundleId alias
+  // (ship-testflight.sh asc_next_shared_build), and a pairedBuildFeed
+  // floor fails the run instead of planning without it.
+  assert.match(code, /get\("pairedBundleId"\) or e\.get\("macBundleId"\)/);
+  assert.match(code, /pairedBuildFeed floor that this plan step does not fetch/);
+  // The value leaves the job as a job output, so every ship job of the
+  // release takes the same number.
+  assert.match(code, /outputs:\s*\n\s+build: \$\{\{ steps\.plan-build\.outputs\.build \}\}/);
+  // A malformed plan fails the run instead of shipping a guessed number.
+  assert.match(code, /\^?\[1-9\]\[0-9\]\{11\}\$/);
 });
 
 test("no iOS ship workflow carries a standing gate override", () => {

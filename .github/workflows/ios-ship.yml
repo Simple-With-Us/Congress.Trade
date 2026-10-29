@@ -81,6 +81,11 @@ jobs:
     if: github.event.repository.fork == false
     runs-on: macos-latest
     timeout-minutes: 90
+    # The one planned build of this release, computed once by the plan-build
+    # step below and handed to the ship step as --build. A single-platform
+    # release plans the same way: one plan, every ship job takes it.
+    outputs:
+      build: ${{ steps.plan-build.outputs.build }}
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -261,6 +266,46 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
           unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
+      # ONE plan per release (owner 2026-10-29): the shared merge-timestamp
+      # build max(S, M + 1) is computed here, once, and handed to the ship
+      # step below as --build. The ship script's own fixed-mode plan is the
+      # same code path (the same node command with the same merge stamp), for
+      # operators running locally without --build. The paired lookup mirrors
+      # the ship script (pairedBundleId, then the macBundleId alias), so the
+      # one plan covers the same inventory. Runs only when the gate
+      # says ship, so a gated tick plans nothing. Credentials are the ASC
+      # trio the previous step loaded into the environment; they are never
+      # echoed (only the planned build number is printed, which is not
+      # secret).
+      - name: Plan the shared merge-timestamp build (once per release)
+        id: plan-build
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=America/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD)"
+          if [[ ! "$stamp" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::merge stamp is not a 12-digit YYYYMMDDHHMM: ${stamp}"
+            exit 1
+          fi
+          registry="$GITHUB_WORKSPACE/scripts/ios-fleet/apps.json"
+          bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"]["bundleId"])' "$registry")"
+          paired="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["apps"]["congress"]; print(e.get("pairedBundleId") or e.get("macBundleId") or "")' "$registry")"
+          feed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"].get("pairedBuildFeed") or "")' "$registry")"
+          if [ -n "$feed" ]; then
+            echo "::error::congress has a pairedBuildFeed floor that this plan step does not fetch; extend it before shipping."
+            exit 1
+          fi
+          args=(plan-release-build "$bundle")
+          if [ -n "$paired" ]; then args+=("$paired"); fi
+          args+=(--merge-stamp "$stamp")
+          build="$(node "$GITHUB_WORKSPACE/scripts/ios-fleet/asc-api.mjs" "${args[@]}")"
+          if [[ ! "$build" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::planned build is not a 12-digit YYYYMMDDHHMM: ${build}"
+            exit 1
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "planned build ${build} for merge stamp ${stamp}"
+
       - name: Report runtime ios-fleet drift (advisory)
         if: steps.gate.outputs.should_ship == '1'
         run: |
@@ -297,13 +342,16 @@ jobs:
           # previous ship for the first minutes after an upload, and the
           # vendored client is explicit that a newest-build fallback is the
           # defect it removed (scripts/ios-fleet/asc-api.mjs, ensure-tf-ready).
+          # The --build below is the release's one planned build from the
+          # plan-build step above: every ship of this release uploads it.
           set -o pipefail
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --build "${{ steps.plan-build.outputs.build }}" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
 
       # Name the build this run uploaded, for the external promotion below.
       # The fleet script resolves the version before it uploads and logs it as
-      # "marketing=1.0.<n> build=<n>";  the extractor reads that, and falls back
-      # to the checkout's commit count -- the number the ship starts from.
+      # "marketing=1.1.2 build=<12-digit>";  the extractor reads that, and
+      # falls back to the checkout's commit count -- the number a next-patch
+      # ship starts from.
       - name: Name the build this ship uploaded
         id: buildnum
         if: steps.gate.outputs.should_ship == '1'
