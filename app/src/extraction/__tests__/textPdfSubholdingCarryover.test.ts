@@ -85,6 +85,7 @@ describe('textPdf House PTR row segmentation', () => {
             amountMax: want.amountMax,
             filingStatus: want.filingStatus,
             subholding: want.subholding,
+            description: want.description ?? null,
           });
         }
       });
@@ -134,5 +135,89 @@ describe('textPdf House PTR row segmentation', () => {
       'Mercato Partners Traverse IV QP, LP (GLAS Funds, LP)',
     ]);
     expect(rows.every((r) => r.subholding === '2012 Trust')).toBe(true);
+  });
+
+  describe('synthetic House text layers', () => {
+    const HEADER = [
+      'P T R',
+      'Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515',
+      'F I',
+      'Name: Hon. Test Member',
+      'Status: Member',
+      'State/District: TX01',
+      'T',
+      'ID Owner Asset Transaction',
+      'Type',
+      'Date Notification',
+      'Date',
+      'Amount Cap.',
+      'Gains >',
+      '$200?',
+    ];
+    const doc = (...lines: string[]) => [...HEADER, ...lines].join('\n');
+
+    it('keeps the leading "T" of a blank-owner asset after the first row', () => {
+      const rows = parseHousePtrText(doc(
+        'SP Apple Inc. - Common Stock (AAPL) [ST]',
+        'S 10/02/2026 10/05/2026 $1,001 - $15,000',
+        'F S: New',
+        'T Rowe Price Group, Inc. (TROW) [ST]',
+        'P 10/03/2026 10/05/2026 $1,001 - $15,000',
+        'F S: New',
+      ));
+      expect(rows).toHaveLength(2);
+      expect(rows[1]).toMatchObject({ owner: 'self', ticker: 'TROW', assetName: 'T Rowe Price Group, Inc.' });
+    });
+
+    it('still drops the "T" column marker before a blank-owner first row', () => {
+      const rows = parseHousePtrText(doc(
+        'Apple Inc. - Common Stock (AAPL) [ST]',
+        'S 10/02/2026 10/05/2026 $1,001 - $15,000',
+      ));
+      expect(rows[0]).toMatchObject({ owner: 'self', ticker: 'AAPL', assetName: 'Apple Inc. - Common Stock' });
+    });
+
+    it('keeps a wrapped description on its own row when the next row has an owner code', () => {
+      const rows = parseHousePtrText(doc(
+        'SP Apple Inc. - Common Stock (AAPL) [ST]',
+        'S 10/02/2026 10/05/2026 $1,001 - $15,000',
+        'F S: New',
+        'D: Rebalanced by the trustee after the',
+        'annual review',
+        'SP NVIDIA Corporation - Common Stock (NVDA) [ST]',
+        'P 10/03/2026 10/05/2026 $1,001 - $15,000',
+        'F S: New',
+      ));
+      expect(rows).toHaveLength(2);
+      expect(rows[0].description).toBe('Rebalanced by the trustee after the annual review');
+      expect(rows[1]).toMatchObject({ owner: 'spouse', ticker: 'NVDA', assetName: 'NVIDIA Corporation - Common Stock', description: null });
+    });
+
+    it('never lets a detail block reach into the next row tail line', () => {
+      // "D:" opens the line that also carries the next row's [ST] tail. That
+      // line is the next row's identity, not this row's description.
+      const rows = parseHousePtrText(doc(
+        'SP Apple Inc. - Common Stock (AAPL) [ST]',
+        'S 10/02/2026 10/05/2026 $1,001 - $15,000',
+        'F S: New',
+        'D: Dell Technologies Inc. (DELL) [ST] P 10/03/2026 10/05/2026 $1,001 - $15,000',
+      ));
+      expect(rows).toHaveLength(2);
+      expect(rows[0].description).toBeNull();
+      expect(rows[1]).toMatchObject({ ticker: 'DELL', assetName: 'Dell Technologies Inc.' });
+    });
+
+    it('keeps a row with a glued detail label out of auto-publish', () => {
+      // No line breaks: a blank-owner row cannot be split from the previous
+      // row's free-text Subholding Of value, so it must go to review.
+      const rows = parseHousePtrText(
+        doc().replace(/\n/g, ' ') +
+          ' SP Apple Inc. - Common Stock (AAPL) [ST] S 10/02/2026 10/05/2026 $1,001 - $15,000' +
+          ' Filing Status: New Subholding Of: ET IRA Home Depot, Inc. (HD) [ST] S 10/22/2026 10/22/2026 $1,001 - $15,000',
+      );
+      const hd = rows.find((r) => r.ticker === 'HD');
+      expect(hd?.assetName).toMatch(/Subholding Of/);
+      expect(hd?.confidence ?? 1).toBeLessThan(0.95);
+    });
   });
 });
