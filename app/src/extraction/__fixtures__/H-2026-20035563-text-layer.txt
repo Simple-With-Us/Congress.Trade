@@ -29,6 +29,9 @@ Amazon.com, Inc. - Common Stock
 S 10/27/2026 10/27/2026 $15,001 -
 $50,000
 F S: New
+Home Depot, Inc. (HD) [ST] S 10/22/2026 10/22/2026 $1,001 - $15,000
+F S: New
+S O: ET IRA
 SP Apple Inc. - Common Stock (AAPL)
 [ST]
 S 10/02/2026 10/05/2026 $250,001 -

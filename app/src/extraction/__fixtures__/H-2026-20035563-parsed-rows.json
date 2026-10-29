@@ -36,6 +36,18 @@
     "subholding": null
   },
   {
+    "assetName": "Home Depot, Inc.",
+    "ticker": "HD",
+    "assetType": "ST",
+    "txDate": "2026-10-22",
+    "txType": "S",
+    "owner": "self",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "filingStatus": "New",
+    "subholding": "ET IRA"
+  },
+  {
     "assetName": "Apple Inc. - Common Stock",
     "ticker": "AAPL",
     "assetType": "ST",
