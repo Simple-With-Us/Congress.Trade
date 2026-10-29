@@ -41,7 +41,7 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { nextThreeDigitBuild } from "./three-digit-build.mjs";
+import { nextSharedBuild } from "./shared-build.mjs";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
@@ -498,8 +498,14 @@ async function main() {
     process.exit(1);
   }
 
+  // Test seam: the offline contract tests point the client at a stub server
+  // through ASC_API_BASE (already allowlisted for the child environment in
+  // asc-key.mjs). Unset everywhere else, so production always talks to
+  // App Store Connect.
+  const apiBase = process.env.ASC_API_BASE || "https://api.appstoreconnect.apple.com";
+
   async function api(methodName, apiPath, jsonBody) {
-    const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;
+    const url = apiPath.startsWith("http") ? apiPath : `${apiBase}${apiPath}`;
     const res = await fetch(url, {
       method: methodName,
       headers: {
@@ -1041,27 +1047,84 @@ async function main() {
     process.exit(0);
   }
 
-  // Read-only, fully paged target-train inventory for the requested ### format.
-  if (method === "next-three-digit-build") {
-    const bundleId=path, version=body, platform=String(arg4 || "IOS").toUpperCase();
-    if (!bundleId || !/^\d+\.\d+\.\d+$/.test(version || "") || !["IOS","MAC_OS"].includes(platform)) {
-      console.error("next-three-digit-build: exact bundle/version/platform required"); process.exit(2);
+  // Read-only, fully paged shared four-digit counter (owner, Oct 28 2026):
+  // next = max(every iOS build on ALL trains, every macOS build on ALL trains,
+  // every extra floor, 999) + 1, floored at 1000.  iOS UTC timestamp builds are
+  // ignored by the planner (those trains are closed); macOS builds all count.
+  if (method === "next-shared-build") {
+    const restArgs = argv.slice(1);
+    const bundleId = restArgs[0] || "";
+    const rest = restArgs.slice(1);
+    if (!bundleId) {
+      console.error("Usage: node asc-api.mjs next-shared-build <bundleId> [macBundleId] [floor...]"); process.exit(2);
     }
-    const appId=await appIdForBundle(bundleId);
-    if(!appId) { console.error("next-three-digit-build: app not found");process.exit(2); }
-    let url=`/v1/builds?filter[app]=${appId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
-    if(platform === "IOS") url+=`&filter[preReleaseVersion.version]=${encodeURIComponent(version)}`;
-    const builds=[];
-    for(let page=0;page<100 && url;page++) {
-      const res=await ascGet(url);
-      if(!res.ok || !Array.isArray(res.parsed?.data)) {console.error("next-three-digit-build: inventory unavailable");process.exit(2);}
-      for(const b of res.parsed.data) builds.push(b?.attributes?.version);
-      url=res.parsed.links?.next || "";
+    // A pure-integer second arg is a floor, not a bundle id (bundle ids are
+    // never bare integers), so a caller with no mac app passes only floors.
+    let macBundleId = "";
+    let floorArgs = [];
+    if (rest.length > 0) {
+      if (/^[0-9]+$/.test(rest[0])) floorArgs = rest;
+      else { macBundleId = rest[0] || ""; floorArgs = rest.slice(1); }
     }
-    if(url) {console.error("next-three-digit-build: incomplete pagination");process.exit(2);}
+    const extraFloors = [];
+    for (const f of floorArgs) {
+      if (!/^[0-9]+$/.test(f) || !Number.isSafeInteger(Number(f))) {
+        console.error(`next-shared-build: floor ${JSON.stringify(f)} is not a non-negative safe integer`); process.exit(2);
+      }
+      extraFloors.push(Number(f));
+    }
+    const appId = await appIdForBundle(bundleId);
+    if (!appId) { console.error("next-shared-build: app not found"); process.exit(2); }
+    let macAppId = "";
+    if (macBundleId && macBundleId !== bundleId) {
+      macAppId = await appIdForBundle(macBundleId);
+      if (!macAppId) { console.error("next-shared-build: mac app not found"); process.exit(2); }
+    }
+    async function allBuilds(forAppId, platform) {
+      const out = [];
+      const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+      let url = `/v1/builds?filter[app]=${forAppId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
+      for (let page = 0; page < 100 && url; page++) {
+        const res = await ascGet(url);
+        if (!res.ok || !Array.isArray(res.parsed?.data)) { console.error("next-shared-build: inventory unavailable"); process.exit(2); }
+        if (!isRecord(res.parsed)) { console.error("next-shared-build: malformed pagination"); process.exit(2); }
+        const links = res.parsed.links;
+        if (links !== undefined && links !== null && !isRecord(links)) { console.error("next-shared-build: malformed pagination"); process.exit(2); }
+        const next = (links === undefined || links === null) ? null : links.next;
+        if (next !== undefined && next !== null && typeof next !== "string") { console.error("next-shared-build: malformed pagination"); process.exit(2); }
+        for (const b of res.parsed.data) out.push(b?.attributes?.version);
+        url = typeof next === "string" ? next : "";
+      }
+      if (url) { console.error("next-shared-build: incomplete pagination"); process.exit(2); }
+      return out;
+    }
+    // One counter per app across iOS and macOS: when a paired app is named
+    // (an iOS ship names its Mac pair, a macOS ship its iOS pair), both
+    // platforms of both apps join the counter.
+    let iosBuilds;
+    let macBuilds;
+    if (macAppId) {
+      const [iosA, macA, iosB, macB] = await Promise.all([
+        allBuilds(appId, "IOS"),
+        allBuilds(appId, "MAC_OS"),
+        allBuilds(macAppId, "IOS"),
+        allBuilds(macAppId, "MAC_OS")
+      ]);
+      iosBuilds = iosA.concat(iosB);
+      macBuilds = macA.concat(macB);
+    } else {
+      const [iosA, macA] = await Promise.all([
+        allBuilds(appId, "IOS"),
+        allBuilds(appId, "MAC_OS")
+      ]);
+      iosBuilds = iosA;
+      macBuilds = macA;
+    }
     try {
-      console.log(nextThreeDigitBuild({platform,trainBuilds:platform==="IOS"?builds:[],allPlatformBuilds:platform==="MAC_OS"?builds:[],complete:true}));
-    } catch(error) {console.error(`next-three-digit-build: ${error.message}`);process.exit(3);}
+      const planned = nextSharedBuild({iosBuilds, macBuilds, extraFloors, complete: true});
+      console.error(`next-shared-build: ${iosBuilds.length} iOS build(s) + ${macBuilds.length} macOS build(s) inspected; ignored ${planned.ignoredIos} iOS timestamp build(s); next is ${planned.build}`);
+      console.log(planned.build);
+    } catch (error) { console.error(`next-shared-build: ${error.message}`); process.exit(3); }
     process.exit(0);
   }
 
@@ -1471,7 +1534,7 @@ async function main() {
     process.exit(0);
   }
 
-  const url = path.startsWith("http") ? path : `https://api.appstoreconnect.apple.com${path}`;
+  const url = path.startsWith("http") ? path : `${apiBase}${path}`;
   const res = await fetch(url, {
     method,
     headers: {
