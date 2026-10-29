@@ -121,8 +121,17 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // A scheduled catch-up is allowed only behind the scheduled path gate.
   if (/^\s+schedule:/m.test(on)) {
     assert.match(code, /scheduled-ship-gate\.sh/);
-    assert.match(code, /--path-prefix 'clients\/ios\/'/);
     assert.match(code, /--event "\$\{\{ github\.event_name \}\}"/);
+    // The gate must watch every push path, so a missed push still ships.
+    const pushGlobs = [...on.matchAll(/^\s+-\s+'([^']+)'$/gm)].map((m) => m[1]);
+    assert.ok(pushGlobs.length > 0, "push paths must list at least one glob");
+    const gatePrefixes = [...code.matchAll(/--path-prefix '([^']+)'/g)].map((m) => m[1]);
+    for (const g of pushGlobs) {
+      assert.ok(gatePrefixes.includes(g), `gate must watch push path '${g}'`);
+    }
+    const gate = read("scripts/ios-fleet/scheduled-ship-gate.sh");
+    assert.match(gate, /repeatable/);
+    assert.match(gate, /:!/);
   }
 
   // The gate diffs against an older sha, and the notes need the commit range.
