@@ -293,12 +293,14 @@ export const ASC_NOT_RELEASED_STORE_VERSION_STATES = new Set([
   "REJECTED",
   "METADATA_REJECTED",
   "DEVELOPER_REJECTED",
-  "INVALID_BINARY",
-  "NOT_APPLICABLE"
+  "INVALID_BINARY"
 ]);
 
+/** Same shape asc-api.mjs's validVersion accepts for App Store versions. */
+const ASC_VERSION_RE = /^\d+(\.\d+)*$/;
+
 function compareDottedVersionStrings(a, b) {
-  const parse = (v) => String(v).split(".").map((n) => parseInt(n, 10) || 0);
+  const parse = (v) => String(v).split(".").map((n) => Number(n));
   const x = parse(a);
   const y = parse(b);
   for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
@@ -333,6 +335,7 @@ export function classifyReleasedStoreVersionStates(appVersionState, appStoreStat
  * @param {Array<{ attributes?: { versionString?: string, appVersionState?: string, appStoreState?: string } }>} rows
  * @returns {string} highest released marketing version, or "" when none
  * @throws {Error & { code: 3, versionString: string, states: string[] }} on unknown states
+ * @throws {Error & { code: 2, versionString: unknown, states: string[] }} on a malformed released versionString
  */
 export function highestReleasedStoreVersion(rows) {
   let best = "";
@@ -348,6 +351,15 @@ export function highestReleasedStoreVersion(rows) {
       throw err;
     }
     if (classification.kind === "not_released") continue;
+    // A malformed released version would be coerced into a wrong floor:
+    // refuse it like every other App Store version path does.
+    if (typeof attrs.versionString !== "string" || !ASC_VERSION_RE.test(attrs.versionString)) {
+      const err = new Error("released-store-version versionString is not dotted integers");
+      err.code = 2;
+      err.versionString = attrs.versionString;
+      err.states = classification.states;
+      throw err;
+    }
     if (!best || compareDottedVersionStrings(attrs.versionString, best) > 0) best = attrs.versionString;
   }
   return best;

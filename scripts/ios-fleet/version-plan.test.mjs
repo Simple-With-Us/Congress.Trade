@@ -275,8 +275,8 @@ test("classifyReleasedStoreVersionStates treats post-review ASC states as releas
   assert.equal(classifyReleasedStoreVersionStates("ACCEPTED", "IN_REVIEW").kind, "released");
 });
 
-test("classifyReleasedStoreVersionStates treats NOT_APPLICABLE as not released", () => {
-  assert.equal(classifyReleasedStoreVersionStates("NOT_APPLICABLE", undefined).kind, "not_released");
+test("classifyReleasedStoreVersionStates fails closed on NOT_APPLICABLE until its ASC meaning is confirmed", () => {
+  assert.equal(classifyReleasedStoreVersionStates("NOT_APPLICABLE", undefined).kind, "unknown");
 });
 
 test("highestReleasedStoreVersion ignores in-flight trains and picks the max released", () => {
@@ -292,5 +292,38 @@ test("highestReleasedStoreVersion refuses unknown ASC states", () => {
   assert.throws(
     () => highestReleasedStoreVersion([{ attributes: { versionString: "9.9.9", appVersionState: "FUTURE_STATE" } }]),
     (err) => err.code === 3 && err.versionString === "9.9.9"
+  );
+});
+
+test("a released leg beside an unknown leg is still unknown and aborts the query", () => {
+  const c = classifyReleasedStoreVersionStates("READY_FOR_DISTRIBUTION", "FUTURE_STATE");
+  assert.equal(c.kind, "unknown");
+  assert.deepEqual(c.states, ["READY_FOR_DISTRIBUTION", "FUTURE_STATE"]);
+  assert.throws(
+    () => highestReleasedStoreVersion([
+      { attributes: { versionString: "1.1.2", appVersionState: "READY_FOR_DISTRIBUTION", appStoreState: "FUTURE_STATE" } }
+    ]),
+    (err) => err.code === 3 && err.versionString === "1.1.2"
+  );
+});
+
+test("highestReleasedStoreVersion refuses a malformed released versionString", () => {
+  for (const versionString of ["1.1.x", "1.1.2-beta", " 1.1.2", 112]) {
+    assert.throws(
+      () => highestReleasedStoreVersion([
+        { attributes: { versionString: "1.1.1", appVersionState: "READY_FOR_DISTRIBUTION" } },
+        { attributes: { versionString, appVersionState: "READY_FOR_DISTRIBUTION" } }
+      ]),
+      (err) => err.code === 2,
+      JSON.stringify(versionString)
+    );
+  }
+  // A malformed version on a train that is not released yet never reaches the floor.
+  assert.equal(
+    highestReleasedStoreVersion([
+      { attributes: { versionString: "1.1.1", appVersionState: "READY_FOR_DISTRIBUTION" } },
+      { attributes: { versionString: "1.2.0-beta", appVersionState: "PREPARE_FOR_SUBMISSION" } }
+    ]),
+    "1.1.1"
   );
 });

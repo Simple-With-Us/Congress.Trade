@@ -1028,6 +1028,12 @@ async function main() {
         );
         process.exit(3);
       }
+      if (e?.code === 2) {
+        console.error(
+          `released-store-version: released version ${JSON.stringify(e.versionString)} is not dotted integers; not guessing`
+        );
+        process.exit(2);
+      }
       throw e;
     }
     console.error(`released-store-version: ${storeData.length} App Store version(s) inspected on ${platform}; highest released = ${best || "none"}`);
