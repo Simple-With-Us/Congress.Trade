@@ -50,7 +50,7 @@ snapshot:
   interval: 24h
   # B2 is paid capacity, not R2 free-tier-capped storage — keep 7d of LTX
   # history for restore headroom, matching Socratic.Trade's B2 target.
-  retention: 168h
+  retention: 72h
 
 # Product compaction is L0 + bounded L1 + 24h snapshots.  L2 and L3 are OFF.
 # Mirror ST litestream.coolify.yml / UM litestream.yml.  Do NOT add a second
