@@ -497,8 +497,14 @@ async function main() {
     process.exit(1);
   }
 
+  // Test seam: the offline contract tests point the client at a stub server
+  // through ASC_API_BASE (already allowlisted for the child environment in
+  // asc-key.mjs). Unset everywhere else, so production always talks to
+  // App Store Connect.
+  const apiBase = process.env.ASC_API_BASE || "https://api.appstoreconnect.apple.com";
+
   async function api(methodName, apiPath, jsonBody) {
-    const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;
+    const url = apiPath.startsWith("http") ? apiPath : `${apiBase}${apiPath}`;
     const res = await fetch(url, {
       method: methodName,
       headers: {
@@ -1098,19 +1104,44 @@ async function main() {
     }
     async function allBuilds(forAppId, platform) {
       const out = [];
+      const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
       let url = `/v1/builds?filter[app]=${forAppId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
       for (let page = 0; page < 100 && url; page++) {
         const res = await ascGet(url);
         if (!res.ok || !Array.isArray(res.parsed?.data)) { console.error("next-shared-build: inventory unavailable"); process.exit(2); }
+        if (!isRecord(res.parsed)) { console.error("next-shared-build: malformed pagination"); process.exit(2); }
+        const links = res.parsed.links;
+        if (links !== undefined && links !== null && !isRecord(links)) { console.error("next-shared-build: malformed pagination"); process.exit(2); }
+        const next = (links === undefined || links === null) ? null : links.next;
+        if (next !== undefined && next !== null && typeof next !== "string") { console.error("next-shared-build: malformed pagination"); process.exit(2); }
         for (const b of res.parsed.data) out.push(b?.attributes?.version);
-        url = res.parsed.links?.next || "";
+        url = typeof next === "string" ? next : "";
       }
       if (url) { console.error("next-shared-build: incomplete pagination"); process.exit(2); }
       return out;
     }
-    const iosBuilds = await allBuilds(appId, "IOS");
-    let macBuilds = await allBuilds(appId, "MAC_OS");
-    if (macAppId) macBuilds = macBuilds.concat(await allBuilds(macAppId, "MAC_OS"));
+    // One counter per app across iOS and macOS: when a paired app is named
+    // (an iOS ship names its Mac pair, a macOS ship its iOS pair), both
+    // platforms of both apps join the counter.
+    let iosBuilds;
+    let macBuilds;
+    if (macAppId) {
+      const [iosA, macA, iosB, macB] = await Promise.all([
+        allBuilds(appId, "IOS"),
+        allBuilds(appId, "MAC_OS"),
+        allBuilds(macAppId, "IOS"),
+        allBuilds(macAppId, "MAC_OS")
+      ]);
+      iosBuilds = iosA.concat(iosB);
+      macBuilds = macA.concat(macB);
+    } else {
+      const [iosA, macA] = await Promise.all([
+        allBuilds(appId, "IOS"),
+        allBuilds(appId, "MAC_OS")
+      ]);
+      iosBuilds = iosA;
+      macBuilds = macA;
+    }
     try {
       const planned = nextSharedBuild({iosBuilds, macBuilds, extraFloors, complete: true});
       console.error(`next-shared-build: ${iosBuilds.length} iOS build(s) + ${macBuilds.length} macOS build(s) inspected; ignored ${planned.ignoredIos} iOS timestamp build(s); next is ${planned.build}`);
@@ -1525,7 +1556,7 @@ async function main() {
     process.exit(0);
   }
 
-  const url = path.startsWith("http") ? path : `https://api.appstoreconnect.apple.com${path}`;
+  const url = path.startsWith("http") ? path : `${apiBase}${path}`;
   const res = await fetch(url, {
     method,
     headers: {

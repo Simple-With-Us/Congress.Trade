@@ -17,6 +17,22 @@ test('shared counter takes the max across iOS and macOS', () => {
   assert.deepEqual(next({...input, iosBuilds: ['1100'], macBuilds: ['1200']}), {build: '1201', ignoredIos: 0});
   assert.deepEqual(next({...input, iosBuilds: ['1300'], macBuilds: ['1200']}), {build: '1301', ignoredIos: 0});
 });
+test('dotted builds count by their first component on either platform', () => {
+  assert.deepEqual(next({...input, iosBuilds: ['1200.1']}), {build: '1201', ignoredIos: 0});
+  assert.deepEqual(next({...input, macBuilds: ['1200.3.4']}), {build: '1201', ignoredIos: 0});
+  assert.deepEqual(next({...input, iosBuilds: ['1200.1'], macBuilds: ['1200.9']}), {build: '1201', ignoredIos: 0});
+});
+test('the counter is max(iOS, macOS, floors, 999) + 1', () => {
+  assert.deepEqual(next({...input, extraFloors: [999]}), {build: '1000', ignoredIos: 0});
+  assert.deepEqual(
+    next({...input, iosBuilds: ['1100'], macBuilds: ['1200'], extraFloors: [1500]}),
+    {build: '1501', ignoredIos: 0}
+  );
+  assert.deepEqual(
+    next({...input, iosBuilds: ['1600'], macBuilds: ['1200'], extraFloors: [1500]}),
+    {build: '1601', ignoredIos: 0}
+  );
+});
 test('extra floors raise the counter above 999', () => {
   assert.deepEqual(next({...input, extraFloors: [986]}), {build: '1000', ignoredIos: 0});
   assert.deepEqual(next({...input, extraFloors: [1500]}), {build: '1501', ignoredIos: 0});

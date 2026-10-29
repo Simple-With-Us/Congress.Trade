@@ -55,6 +55,7 @@ for a in d["apps"].values():
     a.pop("fixedMarketingVersion", None)
     a.pop("buildCountSeed", None)
     a.pop("macBundleId", None)
+    a.pop("pairedBundleId", None)
     a.pop("pairedBuildFeed", None)
 json.dump(d, open(p, "w"), indent=2)
 PY
@@ -68,6 +69,7 @@ FAKE_HOME="${WORK}/home"
 FAKE_BIN="${WORK}/bin"
 STATE="${WORK}/state"
 REPO="${WORK}/repo"
+CALL_LOG="${WORK}/calls.log"
 mkdir -p "$FAKE_HOME" "$FAKE_BIN" "$STATE" "$REPO" "${WORK}/tmp"
 
 # A fake xcodebuild: answers -version, and hard-fails on anything else so a test
@@ -87,9 +89,11 @@ chmod +x "${FAKE_BIN}/xcodebuild"
 # A stub `node`:  answers the two App Store Connect version queries from the
 # environment and exits 2 for everything else.  Exiting 2 is what the ship
 # script sees when App Store Connect cannot be consulted, so a test can drive
-# the unreachable-App-Store-Connect path without a network.
+# the unreachable-App-Store-Connect path without a network.  Every invocation
+# is appended to FAKE_CALL_LOG so passthrough tests can see the exact argv.
 cat >"${FAKE_BIN}/node" <<'FAKE'
 #!/usr/bin/env bash
+printf 'node %s\n' "$*" >>"${FAKE_CALL_LOG:-/dev/null}"
 cmd=""
 for a in "$@"; do
   case "$a" in
@@ -128,6 +132,42 @@ exit 2
 FAKE
 chmod +x "${FAKE_BIN}/node"
 
+# A fake `curl`:  offline stand-in for the pairedBuildFeed appcast fetch.
+# Serves https:// fixtures from FAKE_FEED_FILE, answers FAKE_CURL=timeout
+# with curl's own timeout exit (28), and fails anything else like an
+# unresolvable host (6).  Every invocation is appended to FAKE_CALL_LOG so
+# tests can assert the hardening flags the ship script passes.  Existing
+# sections never set a feed, so they never reach this stub.
+cat >"${FAKE_BIN}/curl" <<'FAKE'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"${FAKE_CALL_LOG:-/dev/null}"
+url=""
+for a in "$@"; do url="$a"; done
+if [[ "${FAKE_CURL:-}" == "timeout" ]]; then
+  echo "curl: (28) Operation timed out after 30000 milliseconds" >&2
+  exit 28
+fi
+case "$url" in
+  https://*)
+    src="${FAKE_FEED_FILE:-}"
+    if [[ -n "$src" && -f "$src" ]]; then cat "$src"; exit 0; fi
+    echo "curl: (37) Couldn't open file $src" >&2
+    exit 37
+    ;;
+  file://*)
+    path="${url#file://}"
+    if [[ -f "$path" ]]; then cat "$path"; exit 0; fi
+    echo "curl: (37) Couldn't open file $path" >&2
+    exit 37
+    ;;
+  *)
+    echo "curl: (6) Could not resolve host" >&2
+    exit 6
+    ;;
+esac
+FAKE
+chmod +x "${FAKE_BIN}/curl"
+
 # A stub fleet-secrets that always reports "absent", so ASC credentials stay unset and no test
 # can reach the real Infisical (the script falls back to fleet-secrets on PATH).
 printf '#!/usr/bin/env bash\nexit 3\n' >"${FAKE_BIN}/fleet-secrets"
@@ -165,6 +205,8 @@ SHIP_FILE="${STATE}/last-ship-congress.txt"
 # The App Store Connect answers the stub gives.  Unset = unreachable.
 FAKE_ASC_PATCH=""
 FAKE_ASC_FLOOR=""
+FAKE_CURL=""
+: >"$CALL_LOG"
 
 PASS=0
 FAIL=0
@@ -185,6 +227,9 @@ run_ship() {
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     FAKE_RELEASED="${FAKE_RELEASED:-}" \
     FAKE_SHARED="${FAKE_SHARED:-}" \
+    FAKE_CURL="${FAKE_CURL:-}" \
+    FAKE_FEED_FILE="${FAKE_FEED_FILE:-${WORK}/feed.xml}" \
+    FAKE_CALL_LOG="$CALL_LOG" \
     bash "$SHIP" "$@" 2>&1)"
   RC=$?
   return 0
@@ -208,6 +253,8 @@ seq_now() { cat "$SEQ_FILE" 2>/dev/null || echo MISSING; }
 # (C-locale grep then treats the stream as binary) and marketing/build
 # needles contain '.' / '()'.
 contains() { [[ "$OUT" == *"$1"* ]]; }
+# Substring over the stub-invocation log (pure ASCII argv, so grep -F is safe).
+calls_contain() { grep -q -F -- "$1" "$CALL_LOG" 2>/dev/null; }
 
 # The planned pair, read out of the "marketing=<m> build=<b>" log line.
 planned_pair() {
@@ -526,6 +573,7 @@ for k in list(a)[:1]:
     a[k]["fixedMarketingVersion"] = "1.1.2"
     a[k].pop("buildCountSeed", None)
     a[k].pop("macBundleId", None)
+    a[k].pop("pairedBundleId", None)
     a[k].pop("pairedBuildFeed", None)
 json.dump(d, open(p, "w"), indent=2)
 PY
@@ -588,7 +636,166 @@ check "fixed macOS: plans the shared four-digit build instead of refusing (got '
   "$([[ "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
 check "fixed macOS: logs the shared counter line" \
   "$(contains 'shared four-digit build 1000 for fixed version 1.1.2' && echo 0 || echo 1)"
-SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_SHARED=""; FAKE_ASC_PATCH=236
+echo
+
+echo "13. fixed feed floors + paired bundle passthrough"
+python3 - "$FIXDIR/apps.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+def mk(bundle, **kw):
+    e = {"displayName": bundle, "fixedMarketingVersion": "1.1.2",
+         "bundleId": bundle, "scheme": "FixFeed",
+         "projectRel": "mac/FixFeed.xcodeproj",
+         "marketingVersionDefault": "1.0.0"}
+    e.update(kw)
+    return e
+d["apps"]["fixfeed"] = mk("trade.example.fixfeed",
+    pairedBuildFeed="https://example.invalid/feed.xml")
+d["apps"]["fixhttp"] = mk("trade.example.fixhttp",
+    pairedBuildFeed="http://example.invalid/feed.xml")
+d["apps"]["fixfile"] = mk("trade.example.fixfile",
+    pairedBuildFeed="file:///tmp/never-served.xml")
+d["apps"]["fixpair"] = mk("trade.example.fixpair",
+    pairedBundleId="trade.example.fixpair.mac")
+d["apps"]["fixalias"] = mk("trade.example.fixalias",
+    macBundleId="trade.example.fixalias.mac")
+d["apps"]["fixboth"] = mk("trade.example.fixboth",
+    pairedBundleId="trade.example.preferred",
+    macBundleId="trade.example.legacy")
+d["apps"]["fixmacpair"] = mk("trade.example.fixmacpair.mac",
+    platform="macOS", pairedBundleId="trade.example.fixmacpair.ios")
+d["apps"]["fixrevios"] = mk("trade.example.rev.ios",
+    pairedBundleId="trade.example.rev.mac")
+d["apps"]["fixrevmac"] = mk("trade.example.rev.mac",
+    platform="macOS")
+d["apps"]["fixrevaliasios"] = mk("trade.example.revalias.ios",
+    macBundleId="trade.example.revalias.mac")
+d["apps"]["fixrevaliasmac"] = mk("trade.example.revalias.mac",
+    platform="macOS")
+json.dump(d, open(p, "w"), indent=2)
+PY
+FEED_URL="https://example.invalid/feed.xml"
+rm -f "${STATE}/build-seq-fixfeed.txt" "${STATE}/last-ship-fixfeed.txt"
+# A feed timeout is a feed failure: fail closed and name the feed, so it is
+# never reported as an App Store Connect failure.
+FAKE_SHARED="1000"; FAKE_RELEASED=""; FAKE_CURL="timeout"
+: >"$CALL_LOG"
+run_ship "fixfeed" --repo-root "$REPO" --dry-run
+check "feed timeout fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed timeout names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
+check "feed timeout is reported as a feed failure" "$(contains 'paired build feed' && echo 0 || echo 1)"
+check "feed timeout stops the run without guessing" \
+  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+check "the feed fetch is hardened (proto, timeouts, max filesize)" \
+  "$(calls_contain '--proto =https --proto-redir =https --connect-timeout 10 --max-time 30 --max-filesize 5000000' && echo 0 || echo 1)"
+# An unreachable feed fails the same way, with curl's reason attached.
+FAKE_CURL=""
+rm -f "${WORK}/feed.xml"
+: >"$CALL_LOG"
+run_ship "fixfeed" --repo-root "$REPO" --dry-run
+check "missing feed fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "missing feed names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
+check "missing feed carries curl's reason" "$(contains "Couldn't open file" && echo 0 || echo 1)"
+# A feed with no numeric version has no floor to contribute: fail closed,
+# naming the feed.  It stays a failure, never a silent "no floor".
+printf '%s\n' '<?xml version="1.0"?><rss><channel><item><title>x</title></item></channel></rss>' >"${WORK}/feed.xml"
+: >"$CALL_LOG"
+run_ship "fixfeed" --repo-root "$REPO" --dry-run
+check "feed without a numeric version fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "feed without a numeric version names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
+check "says the feed holds no numeric version" "$(contains 'no numeric' && echo 0 || echo 1)"
+check "the empty-feed message names the sparkle tag" "$(contains '<sparkle:version>' && echo 0 || echo 1)"
+check "empty feed stops the run without guessing" \
+  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+# A good feed contributes its max as an extra floor to next-shared-build.
+printf '%s\n' '<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1600</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
+FAKE_SHARED="1601"
+: >"$CALL_LOG"
+run_ship "fixfeed" --repo-root "$REPO" --dry-run
+planned_pair
+check "feed max 1600 plans 1601 (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "1601" ]] && echo 0 || echo 1)"
+check "the feed floor reaches next-shared-build" \
+  "$(calls_contain 'next-shared-build trade.example.fixfeed 1600' && echo 0 || echo 1)"
+# Whitespace around the version digits still scrapes: the feed is XML and
+# pretty-printers pad the text node.
+printf '%b\n' '<rss><channel><item><sparkle:version>  1500  </sparkle:version></item><item><sparkle:version>\t1600\t</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
+FAKE_SHARED="1601"
+: >"$CALL_LOG"
+run_ship "fixfeed" --repo-root "$REPO" --dry-run
+planned_pair
+check "whitespace-padded feed max 1600 plans 1601 (got '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_BUILD" == "1601" ]] && echo 0 || echo 1)"
+check "the padded feed floor reaches next-shared-build" \
+  "$(calls_contain 'next-shared-build trade.example.fixfeed 1600' && echo 0 || echo 1)"
+# A feed max outside 1..9998 cannot yield a valid four-digit build: fail
+# closed with the feed URL and the reason, on both sides of the range.
+for _bad in 0 9999 202610190645; do
+  printf '%s\n' "<rss><channel><item><sparkle:version>${_bad}</sparkle:version></item></channel></rss>" >"${WORK}/feed.xml"
+  FAKE_SHARED="1000"
+  : >"$CALL_LOG"
+  run_ship "fixfeed" --repo-root "$REPO" --dry-run
+  check "out-of-range feed floor ${_bad} fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} names the range" "$(contains 'outside 1..9998' && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} stops the run without guessing" \
+    "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+done
+# A non-https feed is rejected before curl runs: fail closed with the URL.
+FAKE_SHARED="1000"
+: >"$CALL_LOG"
+run_ship "fixhttp" --repo-root "$REPO" --dry-run
+check "http feed fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "http feed names the feed URL" "$(contains 'http://example.invalid/feed.xml' && echo 0 || echo 1)"
+check "http feed says https is required" "$(contains 'must start with https' && echo 0 || echo 1)"
+check "http feed never reaches curl" "$(calls_contain 'curl ' && echo 1 || echo 0)"
+check "http feed stops the run without guessing" \
+  "$(contains 'cannot work out the next shared four-digit build' && echo 0 || echo 1)"
+: >"$CALL_LOG"
+run_ship "fixfile" --repo-root "$REPO" --dry-run
+check "file feed fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
+check "file feed names the feed URL" "$(contains 'file:///tmp/never-served.xml' && echo 0 || echo 1)"
+check "file feed says https is required" "$(contains 'must start with https' && echo 0 || echo 1)"
+check "file feed never reaches curl" "$(calls_contain 'curl ' && echo 1 || echo 0)"
+# The paired bundle id reaches next-shared-build: preferred key, alias key,
+# and a macOS entry naming its iOS pair.
+FAKE_SHARED="1000"
+: >"$CALL_LOG"
+run_ship "fixpair" --repo-root "$REPO" --dry-run
+check "pairedBundleId reaches next-shared-build" \
+  "$(calls_contain 'next-shared-build trade.example.fixpair trade.example.fixpair.mac' && echo 0 || echo 1)"
+: >"$CALL_LOG"
+run_ship "fixalias" --repo-root "$REPO" --dry-run
+check "macBundleId alias still reaches next-shared-build" \
+  "$(calls_contain 'next-shared-build trade.example.fixalias trade.example.fixalias.mac' && echo 0 || echo 1)"
+: >"$CALL_LOG"
+run_ship "fixboth" --repo-root "$REPO" --dry-run
+check "pairedBundleId wins over macBundleId" \
+  "$(calls_contain 'next-shared-build trade.example.fixboth trade.example.preferred' && echo 0 || echo 1)"
+check "macBundleId is ignored when pairedBundleId is set" \
+  "$(calls_contain 'trade.example.legacy' && echo 1 || echo 0)"
+: >"$CALL_LOG"
+run_ship "fixmacpair" --repo-root "$REPO" --dry-run
+planned_pair
+check "macOS entry plans the fixed version (got '${PLANNED_MARKETING}' / '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
+check "the iOS pair reaches next-shared-build" \
+  "$(calls_contain 'next-shared-build trade.example.fixmacpair.mac trade.example.fixmacpair.ios' && echo 0 || echo 1)"
+# A macOS entry with no paired keys finds its iOS peer by reverse lookup: the
+# entry whose pairedBundleId or macBundleId names this mac bundle.
+: >"$CALL_LOG"
+run_ship "fixrevmac" --repo-root "$REPO" --dry-run
+planned_pair
+check "macOS reverse lookup plans the fixed version (got '${PLANNED_MARKETING}' / '${PLANNED_BUILD}')" \
+  "$([[ "$PLANNED_MARKETING" == "1.1.2" && "$PLANNED_BUILD" == "1000" ]] && echo 0 || echo 1)"
+check "reverse lookup passes the iOS peer as the paired id" \
+  "$(calls_contain 'next-shared-build trade.example.rev.mac trade.example.rev.ios' && echo 0 || echo 1)"
+: >"$CALL_LOG"
+run_ship "fixrevaliasmac" --repo-root "$REPO" --dry-run
+check "reverse lookup also follows the macBundleId alias" \
+  "$(calls_contain 'next-shared-build trade.example.revalias.mac trade.example.revalias.ios' && echo 0 || echo 1)"
+SHIP="$SHIP_REAL"; FAKE_ASC_FLOOR=0; FAKE_RELEASED=""; FAKE_SHARED=""; FAKE_ASC_PATCH=236; FAKE_CURL=""
 echo
 
 echo "----------------------------------------"
