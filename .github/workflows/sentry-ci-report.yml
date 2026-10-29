@@ -18,7 +18,7 @@ name: Sentry CI Report
 #      copy): the fleet-infra project is shared across repos, and this repo
 #      shares workflow names ("CI", "Deploy", "Security") with Socratic.Trade,
 #      so without `app` a "CI" failure here would dedup into the same Sentry
-#      issue as a "CI" failure there. See AGENT-SYNC.md "Observability".
+#      issue as a "CI" failure there. See FLEET-PROTOCOL.md "Observability".
 #   2. On event == schedule (i.e. the completed run was a cron-triggered
 #      run of a workflow that defines `schedule:`): a Sentry Crons check-in
 #      (ok on success, error on failure) with an upsert monitor_config whose

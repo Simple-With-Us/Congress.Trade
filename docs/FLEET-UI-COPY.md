@@ -63,7 +63,7 @@ Use **sentence case or lowercase** — not Title Case:
 - **Always label the zone** when a time could be read in more than one (`2:41 PM CT`,
   `9:30 AM ET`).  Relative times (`3m ago`) need no label.
 - Owner-facing agent writing (boards, rollouts, Slack, Notes, release notes) is **Central Time,
-  labeled** — that is a coordination rule, not a UI one.  See `/Users/jay/apps/AGENT-SYNC.md`
+  labeled** — that is a coordination rule, not a UI one.  See `/Users/jay/apps/FLEET-PROTOCOL.md`
   § Timestamps: Central Time.
 
 ## Money
@@ -134,7 +134,7 @@ sentence terminator.
 
 **Agent failure mode:** shipping App Store description, review notes, or UI
 paragraphs with single spaces after periods, or stale trial/corpus copy.
-Fix on sight.  Protocol: `/Users/jay/apps/AGENT-SYNC.md` § Two spaces.
+Fix on sight.  Protocol: `/Users/jay/apps/FLEET-PROTOCOL.md` § Two spaces.
 
 ## Run-once glyph = emoji bolt (owner preference 2026-08-08, Socratic.Trade)
 The Run-once affordance uses the colored emoji ⚡ (U+26A1), not a line-icon Zap —

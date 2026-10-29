@@ -41,6 +41,7 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nextThreeDigitBuild } from "./three-digit-build.mjs";
 import { normalizePrivateKey } from "./asc-key.mjs";
 import {
   buildFloor,
@@ -1031,6 +1032,30 @@ async function main() {
     }
     console.error(`released-store-version: ${storeData.length} App Store version(s) inspected on ${platform}; highest released = ${best || "none"}`);
     console.log(best);
+    process.exit(0);
+  }
+
+  // Read-only, fully paged target-train inventory for the requested ### format.
+  if (method === "next-three-digit-build") {
+    const bundleId=path, version=body, platform=String(arg4 || "IOS").toUpperCase();
+    if (!bundleId || !/^\d+\.\d+\.\d+$/.test(version || "") || !["IOS","MAC_OS"].includes(platform)) {
+      console.error("next-three-digit-build: exact bundle/version/platform required"); process.exit(2);
+    }
+    const appId=await appIdForBundle(bundleId);
+    if(!appId) { console.error("next-three-digit-build: app not found");process.exit(2); }
+    let url=`/v1/builds?filter[app]=${appId}&filter[preReleaseVersion.platform]=${platform}&limit=200`;
+    if(platform === "IOS") url+=`&filter[preReleaseVersion.version]=${encodeURIComponent(version)}`;
+    const builds=[];
+    for(let page=0;page<100 && url;page++) {
+      const res=await ascGet(url);
+      if(!res.ok || !Array.isArray(res.parsed?.data)) {console.error("next-three-digit-build: inventory unavailable");process.exit(2);}
+      for(const b of res.parsed.data) builds.push(b?.attributes?.version);
+      url=res.parsed.links?.next || "";
+    }
+    if(url) {console.error("next-three-digit-build: incomplete pagination");process.exit(2);}
+    try {
+      console.log(nextThreeDigitBuild({platform,trainBuilds:platform==="IOS"?builds:[],allPlatformBuilds:platform==="MAC_OS"?builds:[],complete:true}));
+    } catch(error) {console.error(`next-three-digit-build: ${error.message}`);process.exit(3);}
     process.exit(0);
   }
 
