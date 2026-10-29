@@ -749,30 +749,28 @@ check "whitespace-padded feed max still plans the stamp (got '${PLANNED_BUILD}')
   "$([[ "$PLANNED_BUILD" == "202610290000" ]] && echo 0 || echo 1)"
 check "the padded feed floor reaches plan-release-build" \
   "$(calls_contain 'plan-release-build trade.example.fixfeed 202610180000' && echo 0 || echo 1)"
-# No cap any more: a small feed max and an 18-digit feed max both pass
-# through as floors.
+# A small feed max still passes through as a floor.  Past 12 digits the floor
+# is rejected: the planner caps the shared build at 12 digits, so a larger
+# floor could never plan a shippable build.
 printf '%s\n' '<rss><channel><item><sparkle:version>1500</sparkle:version></item><item><sparkle:version>1600</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
 FAKE_SHARED="202610290000"
 : >"$CALL_LOG"
 run_ship "fixfeed" --repo-root "$REPO" --dry-run
 check "a small feed max still reaches plan-release-build" \
   "$(calls_contain 'plan-release-build trade.example.fixfeed 1600' && echo 0 || echo 1)"
-printf '%s\n' '<rss><channel><item><sparkle:version>999999999999999999</sparkle:version></item></channel></rss>' >"${WORK}/feed.xml"
-FAKE_SHARED="202610290000"
-: >"$CALL_LOG"
-run_ship "fixfeed" --repo-root "$REPO" --dry-run
-check "an 18-digit feed max reaches plan-release-build" \
-  "$(calls_contain 'plan-release-build trade.example.fixfeed 999999999999999999' && echo 0 || echo 1)"
-# A feed floor of 0 or past 18 digits is rejected: fail closed with the feed
-# URL and the reason, on both sides of the range.
-for _bad in 0 9999999999999999999; do
+# A feed floor of 0 or past 12 digits is rejected: fail closed with the feed
+# URL, the value and the range, on both sides of the range and at the
+# 13-digit boundary.
+for _bad in 0 9999999999999 999999999999999999; do
   printf '%s\n' "<rss><channel><item><sparkle:version>${_bad}</sparkle:version></item></channel></rss>" >"${WORK}/feed.xml"
   FAKE_SHARED="202610290000"
   : >"$CALL_LOG"
   run_ship "fixfeed" --repo-root "$REPO" --dry-run
   check "out-of-range feed floor ${_bad} fails closed (rc=${RC})" "$([[ $RC -ne 0 ]] && echo 0 || echo 1)"
   check "out-of-range feed floor ${_bad} names the feed URL" "$(contains "$FEED_URL" && echo 0 || echo 1)"
-  check "out-of-range feed floor ${_bad} names the range" "$(contains 'at most 18 digits' && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} names the value" "$(contains "floor ${_bad} rejected" && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} names the range" "$(contains 'at most 12 digits' && echo 0 || echo 1)"
+  check "out-of-range feed floor ${_bad} never reaches plan-release-build" "$(calls_contain 'plan-release-build' && echo 1 || echo 0)"
   check "out-of-range feed floor ${_bad} stops the run without guessing" \
     "$(contains 'cannot work out the next shared merge-timestamp build' && echo 0 || echo 1)"
 done

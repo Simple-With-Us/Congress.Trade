@@ -5,8 +5,10 @@
 // YYYYMMDDHHMM, and M is the highest first numeric component among every
 // build of the app on iOS and macOS (expired included, all version trains)
 // plus every extra floor.  Every build counts, iOS timestamp-style builds
-// included.  There is no floor and no cap, so a rebuild of the same commit
-// still goes up:  the first ship of a commit plans S, the next one M + 1.
+// included.  There is no floor, but the plan is capped at 12 digits:  a
+// result above 999999999999 throws instead of emitting a build the ship's
+// 12-digit gate would reject.  A rebuild of the same commit still goes up:
+// the first ship of a commit plans S, the next one M + 1.
 export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complete, mergeStamp}) {
   if (complete !== true || !Array.isArray(iosBuilds) || !Array.isArray(macBuilds)) {
     throw new Error('complete build inventory required');
@@ -36,5 +38,7 @@ export function nextSharedBuild({iosBuilds, macBuilds, extraFloors = [], complet
     const candidate = BigInt(floor) + 1n;
     if (candidate > next) next = candidate;
   }
-  return {build: String(next)};
+  const build = String(next);
+  if (build.length > 12) throw new Error('planned build exceeds 12 digits');
+  return {build};
 }

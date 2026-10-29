@@ -49,17 +49,24 @@ test('extra floors accept plain integers and numeric strings', () => {
   assert.deepEqual(next({...input, extraFloors: [1500]}), {build: '202610290000'});
   assert.deepEqual(next({...input, extraFloors: [202610290005]}), {build: '202610290006'});
   assert.deepEqual(next({...input, extraFloors: ['202610290005']}), {build: '202610290006'});
-  assert.deepEqual(next({...input, extraFloors: ['999999999999999999']}), {build: '1000000000000000000'});
 });
-test('no floor and no cap', () => {
+test('a plan above 12 digits fails instead of emitting a build the ship gate rejects', () => {
+  // The ship's 12-digit gate would refuse these, so the planner fails closed
+  // with a clear error rather than emitting them.
+  assert.throws(() => next({...input, extraFloors: ['999999999999999999']}), /planned build exceeds 12 digits/);
+  assert.throws(() => next({...input, iosBuilds: ['999999999999']}), /planned build exceeds 12 digits/);
+  assert.throws(
+    () => next({...input, mergeStamp: '999999999999', iosBuilds: ['999999999999']}),
+    /planned build exceeds 12 digits/
+  );
+  // The boundary itself still plans: 12 digits is the cap, not 11.
+  assert.deepEqual(next({...input, iosBuilds: ['999999999998']}), {build: '999999999999'});
+});
+test('no floor', () => {
   assert.deepEqual(next({...input, iosBuilds: ['101']}), {build: '202610290000'});
   assert.deepEqual(next({...input, iosBuilds: ['9999']}), {build: '202610290000'});
   assert.deepEqual(next({...input, macBuilds: ['9999']}), {build: '202610290000'});
   assert.deepEqual(next({...input, extraFloors: [9999]}), {build: '202610290000'});
-  assert.deepEqual(
-    next({...input, mergeStamp: '999999999999', iosBuilds: ['999999999999']}),
-    {build: '1000000000000'}
-  );
 });
 test('malformed inventory throws before computing', () => {
   for (const bad of [null, 'NaN', '1.2.3.4', 42, '', ' 1000', 'v1']) {

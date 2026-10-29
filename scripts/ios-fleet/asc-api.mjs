@@ -1104,7 +1104,9 @@ async function main() {
   // of the commit being built, in America/Chicago as YYYYMMDDHHMM) and M is
   // the highest first numeric component among every build of the app on iOS
   // and macOS plus every extra floor.  Every build counts, iOS
-  // timestamp-style builds included.  plan-release-build is the canonical
+  // timestamp-style builds included.  The plan is capped at 12 digits:
+  // anything above fails (exit 3) instead of emitting a build the ship's
+  // 12-digit gate would reject.  plan-release-build is the canonical
   // name; next-shared-build is the same command under its earlier name, kept
   // so existing callers keep working.  The rule itself lives in
   // ./shared-build.mjs (pure, no I/O); this only fetches the inventory.

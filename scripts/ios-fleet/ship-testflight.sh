@@ -627,8 +627,10 @@ PY
     fi
     max="$(printf '%s' "$max" | sed 's/^0*//')"
     [[ -z "$max" ]] && max="0"
-    if [[ "$max" == "0" || "${#max}" -gt 18 ]]; then
-      logerr "shared-build: paired build feed ${feed} floor ${max} rejected: expected numeric, >= 1, at most 18 digits"
+    # Capped at 12 digits:  the planner caps the shared build at 12 digits,
+    # so a larger floor could never plan a shippable build.
+    if [[ "$max" == "0" || "${#max}" -gt 12 ]]; then
+      logerr "shared-build: paired build feed ${feed} floor ${max} rejected: expected numeric, >= 1, at most 12 digits"
       return 1
     fi
     floor="$max"

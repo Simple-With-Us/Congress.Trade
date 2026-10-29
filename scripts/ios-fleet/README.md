@@ -106,8 +106,9 @@ merge-timestamp build across iOS and macOS (owner directive 2026-10-29):
   --date=format-local:%Y%m%d%H%M HEAD`), and `M` is the highest first numeric
   component among every build of the app on iOS and of its paired macOS app
   (expired included, all trains, timestamp-style builds included) plus every
-  extra floor. There is no floor and no cap: a rebuild of the same commit
-  still goes up.
+  extra floor. There is no floor, but the plan is capped at 12 digits: a
+  result above 999999999999 fails instead of emitting a build the ship's
+  12-digit gate would reject. A rebuild of the same commit still goes up.
 - The rule lives in `shared-build.mjs` (pure, unit-tested); the App Store
   Connect inventory behind it is read by `asc-api.mjs plan-release-build
   <bundleId> [pairedBundleId] [floor...] --merge-stamp <S>`
@@ -179,7 +180,7 @@ Fully offline — no network, no Xcode, no credentials.  `test-ship-seq.sh` runs
 - a last-ship 3000s ago is still gated (sequence untouched); at 3700s the gate proceeds;
 - in fixed mode: the marketing version stays fixed, the plan passes the merge
   stamp of HEAD, a `--build` must be 12 digits and above this platform's max,
-  and feed floors stay https-only, numeric, >= 1 and at most 18 digits.
+  and feed floors stay https-only, numeric, >= 1 and at most 12 digits.
 
 The credential suites are offline too:  `test-asc-credentials.sh` drives `load_secrets` with a fake `fleet-secrets` and throwaway keys generated at test time, and `test-asc-key.test.mjs` generates its own key pair.  Neither commits a key, and neither reaches the network.
 
