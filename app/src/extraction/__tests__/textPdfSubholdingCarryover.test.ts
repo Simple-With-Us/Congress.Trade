@@ -8,7 +8,7 @@
  * next row's asset name and shifted every subholding one row down.
  *
  * A blank Owner column means "filer" (self), not "no row here", so the
- * owner code is not a usable row boundary. The House form prints each
+ * owner code is not a usable row boundary.  The House form prints each
  * holding's detail lines ("Filing Status: New", "Subholding Of: Trust One")
  * on their own lines under the holding; those line breaks are the row
  * boundary the extractor has to use.
@@ -194,7 +194,7 @@ describe('textPdf House PTR row segmentation', () => {
     });
 
     it('never lets a detail block reach into the next row tail line', () => {
-      // "D:" opens the line that also carries the next row's [ST] tail. That
+      // "D:" opens the line that also carries the next row's [ST] tail.  That
       // line is the next row's identity, not this row's description.
       const rows = parseHousePtrText(doc(
         'SP Apple Inc. - Common Stock (AAPL) [ST]',

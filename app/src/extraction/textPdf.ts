@@ -214,10 +214,10 @@ function expandHousePtrLayout(text: string): string {
  *
  * The House form prints a row's detail lines UNDER that row, so in the merged
  * page text they sit after the row's `[ST] P/S/E date $amount` tail and before
- * the next row's asset line. A blank Owner column removes the owner code that
+ * the next row's asset line.  A blank Owner column removes the owner code that
  * used to mark where the next row starts, which glued "Filing Status: New
  * Subholding Of: ..." onto the next row's asset name and shifted every
- * subholding one row down. Split each gap between two tails on the detail
+ * subholding one row down.  Split each gap between two tails on the detail
  * lines themselves instead of on owner codes.
  */
 const HOUSE_DETAIL_LINE_RE =
@@ -273,7 +273,7 @@ const HOUSE_OWNER_LINE_RE = /^(?:SP|DC|JT|SELF)\s/;
 
 /**
  * End offset (exclusive) of the run of detail lines at the head of
- * `gapStart..gapEnd`. Those lines belong to the row whose tail precedes the
+ * `gapStart..gapEnd`.  Those lines belong to the row whose tail precedes the
  * gap, so the text after the run is the next row's asset line.
  * Returns `gapStart` when the gap holds no detail line at all, and never
  * returns more than `gapEnd`.
@@ -294,9 +294,9 @@ function houseDetailBlockEnd(gapStart: number, gapEnd: number, doc: HousePtrDoc)
     end = doc.lineEnd[li] ?? end;
   }
   if (end > gapStart) {
-    // A long detail value ("D: ...") can wrap onto unlabeled lines. When the
+    // A long detail value ("D: ...") can wrap onto unlabeled lines.  When the
     // next holding opens with an owner code, every line before that one is
-    // still this row's detail block. Blank-owner (self) rows have no such
+    // still this row's detail block.  Blank-owner (self) rows have no such
     // anchor, so their block stays at the last labeled line.
     for (let lj = li; lj <= lastLine; lj += 1) {
       if ((doc.lineStart[lj] ?? Infinity) >= gapEnd) break;
@@ -383,7 +383,7 @@ function parseTailRecords(text: string): ParsedTx[] {
   const matches = [...normalized.matchAll(ptrTailRe())];
   if (matches.length === 0) return [];
 
-  // Tail i owns [tailStart_i, tailEnd_i). The gap after it holds that row's
+  // Tail i owns [tailStart_i, tailEnd_i).  The gap after it holds that row's
   // detail lines followed by the next row's asset line; split the gap on the
   // detail lines so each row keeps its own Filing Status / Subholding Of and
   // its asset name stays free of the previous row's details.
@@ -402,7 +402,7 @@ function parseTailRecords(text: string): ParsedTx[] {
     const identityStart = detailEnd[i] > gapStart[i] ? detailEnd[i] : gapStart[i];
     const prefix = normalized.slice(identityStart, tailStart[i]);
     // Details: this row's own detail block, which the form prints after the
-    // row's tail. Rows whose block has no "Subholding Of" line get null.
+    // row's tail.  Rows whose block has no "Subholding Of" line get null.
     const detailsEnd = detailEnd[i + 1] > gapStart[i + 1] ? detailEnd[i + 1] : gapEnd[i + 1];
     const detailsText = normalized.slice(tailEnd[i], detailsEnd);
     const rawText = normalized.slice(identityStart, i + 1 < count ? tailStart[i + 1] : normalized.length);
