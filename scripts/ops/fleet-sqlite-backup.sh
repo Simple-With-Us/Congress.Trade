@@ -151,7 +151,7 @@ backup_one() {
   fi
   # integrity + checksum: sha256 is the completeness marker for retention
   if sqlite3 "$dest" "PRAGMA integrity_check;" | head -1 | grep -qx ok; then
-    echo "[fleet-backup] OK $name -> $dest ($(du -h "$dest" | awk '{print $1}'))"
+    echo "[fleet-backup] OK $name -> $dest ($(du -h "$dest" | awk '{print $1}')) at $(fleet_ct_label)"
     sha256sum "$dest" > "${dest}.sha256"
   else
     echo "[fleet-backup] FAIL $name integrity not clean: $dest"
@@ -172,7 +172,7 @@ prune_incomplete_dumps() {
       if dump_is_complete "$f"; then
         continue
       fi
-      echo "[fleet-backup] prune-incomplete $f"
+      echo "[fleet-backup] prune-incomplete $f at $(fleet_ct_label)"
       rm -f "$f" "${f}.sha256" "${f}-journal" "${f}-wal"
     done
   done
@@ -195,14 +195,14 @@ prune_by_age() {
     [ -d "$dir" ] || continue
     find "$dir" -type f -name '*.db' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r f; do
       dump_is_complete "$f" || continue
-      echo "[fleet-backup] prune-age $f"
+      echo "[fleet-backup] prune-age $f at $(fleet_ct_label)"
       rm -f "$f" "${f}.sha256"
     done || true
     find "$dir" -type f -name '*.sqlite' -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null || true
     find "$dir" -type f -name '*.sha256' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r s; do
       db="${s%.sha256}"
       if [ ! -f "$db" ]; then
-        echo "[fleet-backup] prune-age-orphan $s"
+        echo "[fleet-backup] prune-age-orphan $s at $(fleet_ct_label)"
         rm -f "$s"
       fi
     done || true
@@ -233,7 +233,7 @@ prune_by_keep_count() {
       dump_is_complete "$f" || continue
       n=$((n + 1))
       if [ "$n" -gt "$KEEP_COUNT" ]; then
-        echo "[fleet-backup] prune-count $f"
+        echo "[fleet-backup] prune-count $f at $(fleet_ct_label)"
         rm -f "$f" "${f}.sha256"
       fi
     done || true
@@ -287,6 +287,21 @@ B2_MAX_AGE_DAYS="${B2_MAX_AGE_DAYS:-14}"
 b2_stamp_epoch() {
   local st="$1"
   date -u -d "${st:0:4}-${st:4:2}-${st:6:2} ${st:9:2}:${st:11:2}:${st:13:2}" +%s 2>/dev/null || true
+}
+# Log label (Jay 2026-10-30): UTC stamp plus Central wall time with offset,
+# e.g. "20261030T113000Z (6:30am CDT, -05:00)".  Log lines only; file and
+# object names stay plain UTC ...Z stamps.  $1 = stamp (default: now).
+fleet_ct_label() {
+  local st="${1:-}" epoch
+  if [ -z "$st" ]; then
+    st="$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  epoch="$(b2_stamp_epoch "$st")"
+  if [ -z "$epoch" ]; then
+    printf '%s' "$st"
+    return 0
+  fi
+  printf '%s (%s)' "$st" "$(TZ=America/Chicago date -d "@${epoch}" '+%-I:%M%P %Z, %:z' 2>/dev/null || echo 'Central n/a')"
 }
 prune_b2_sets() {
   local app="$1" bucket="$2" current_stamp="$3"
@@ -414,7 +429,7 @@ prune_b2_sets() {
     if [ $((now_epoch - stamp_epoch)) -gt "$max_age_secs" ]; then
       unset "KEEP_STAMPS[$stamp]"
       kept_count=$((kept_count - 1))
-      echo "[fleet-backup] B2 prune age-cap: $stamp older than ${max_age_days}d for $app"
+      echo "[fleet-backup] B2 prune age-cap: $(fleet_ct_label "$stamp") older than ${max_age_days}d for $app"
     fi
   done <<< "$stamps_all"
 
@@ -439,7 +454,7 @@ prune_b2_sets() {
       deleted_count=$((deleted_count + 1))
     fi
   done <<< "$stamps_all"
-  echo "[fleet-backup] B2 prune OK: $app kept=${kept_count} deleted=${deleted_count} (daily=${keep_daily} weekly=${keep_weekly} max_age_days=${max_age_days})"
+  echo "[fleet-backup] B2 prune OK: $app kept=${kept_count} deleted=${deleted_count} (daily=${keep_daily} weekly=${keep_weekly} max_age_days=${max_age_days}) at $(fleet_ct_label)"
   return 0
 }
 
@@ -500,7 +515,7 @@ BACKUP_FAILED=0
 LOG="/var/log/fleet-backup/sqlite-${STAMP}.log"
 mkdir -p "$ROOT" /var/log/fleet-backup
 exec > >(tee -a "$LOG") 2>&1
-echo "[fleet-backup] start $STAMP apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-} b2_max_age_days=${B2_MAX_AGE_DAYS:-} ct_hours=${FLEET_BACKUP_CT_HOURS:-}"
+echo "[fleet-backup] start $(fleet_ct_label "$STAMP") apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-} b2_max_age_days=${B2_MAX_AGE_DAYS:-} ct_hours=${FLEET_BACKUP_CT_HOURS:-}"
 
 if ! backup_apps_selected; then
   exit 1
@@ -570,7 +585,7 @@ fi
 # default 2d) AND keep-count (FLEET_BACKUP_KEEP_COUNT, default 2 newest COMPLETE
 # .db per app dir)
 apply_local_retention
-echo "[fleet-backup] done $STAMP"
+echo "[fleet-backup] done $(fleet_ct_label "$STAMP") finished $(fleet_ct_label)"
 df -h /data / | tail -5
 
 # ---- Off-host replication (MONET 2026-08-09) --------------------------------
@@ -603,10 +618,10 @@ for app in congress socratic usage-monitor; do
   files=$(ls -1 "$dir" 2>/dev/null | grep "$STAMP" || true)
   [ -n "$files" ] || continue
   if rclone copy "$dir" "b2:${B2_BUCKET[$app]}/hetzner/" --include "*${STAMP}*" --transfers 2 -q; then
-    echo "[fleet-backup] B2 offsite OK: $app ($STAMP)"
+    echo "[fleet-backup] B2 offsite OK: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
     prune_b2_sets "$app" "${B2_BUCKET[$app]}" "$STAMP" || true
   else
-    echo "[fleet-backup] B2 offsite FAIL: $app"
+    echo "[fleet-backup] B2 offsite FAIL: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
     fleet_backup_alert "B2 offsite FAIL: $app"
     BACKUP_FAILED=1
   fi
@@ -621,7 +636,7 @@ for app in congress socratic usage-monitor; do
       echo "[fleet-backup] R2 weekly SKIP: already succeeded today"
     elif rclone listremotes 2>/dev/null | grep -q "^r2:"; then
       if rclone copy "$dir" "r2:${r2bucket}/weekly/" --include "*${STAMP}*" --transfers 2 -q; then
-        echo "[fleet-backup] R2 weekly OK: $app"
+        echo "[fleet-backup] R2 weekly OK: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
         # Receipt so congress.trade /api/health can say R2 weekly is fine
         # without listing the bucket (no secrets on the health path).
         if [ "$app" = "congress" ]; then
@@ -638,12 +653,12 @@ for app in congress socratic usage-monitor; do
             [ -n "$name" ] || continue
             case "$name" in
               *"${stamp_keep}"*) ;;
-              *) rclone deletefile "r2:${r2bucket}/weekly/${name}" && echo "[fleet-backup] R2 weekly pruned: $name" || true ;;
+              *) rclone deletefile "r2:${r2bucket}/weekly/${name}" && echo "[fleet-backup] R2 weekly pruned: $name at $(fleet_ct_label)" || true ;;
             esac
           done
         fi
       else
-        echo "[fleet-backup] R2 weekly FAIL: $app"
+        echo "[fleet-backup] R2 weekly FAIL: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
         fleet_backup_alert "R2 weekly FAIL: $app"
         if [ "$app" = "congress" ]; then
           printf '{"ok":false,"reason":"rclone_failed","checkedAt":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

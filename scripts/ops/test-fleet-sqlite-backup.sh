@@ -312,6 +312,25 @@ grep -q 'FLEET_BACKUP_APPS=usage-monitor .*FLEET_BACKUP_KEEP_DAYS=2 FLEET_BACKUP
 assert_eq "$r" yes "cron UM local keep 2 / 2 days"
 assert_eq "$(grep -c 'B2_KEEP_DAILY=3 B2_KEEP_WEEKLY=2 B2_MAX_AGE_DAYS=14' "$CRON_FILE")" 3 "cron all lanes B2 3+2 with 14d cap"
 
+# --- Log labels: UTC stamp + Central time with offset (Jay 2026-10-30) -----
+assert_eq "$(fleet_ct_label 20261030T113000Z)" "20261030T113000Z (6:30am CDT, -05:00)" "log label CDT"
+assert_eq "$(fleet_ct_label 20261102T123000Z)" "20261102T123000Z (6:30am CST, -06:00)" "log label CST after DST"
+assert_eq "$(fleet_ct_label 20261101T063000Z)" "20261101T063000Z (1:30am CDT, -05:00)" "log label first 1:30am on fall-back night"
+assert_eq "$(fleet_ct_label 20261101T073000Z)" "20261101T073000Z (1:30am CST, -06:00)" "log label second 1:30am on fall-back night"
+assert_eq "$(fleet_ct_label not-a-stamp)" "not-a-stamp" "log label falls back to raw stamp"
+now_label="$(fleet_ct_label)"
+case "$now_label" in
+  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\ \(*\ C[DS]T,\ -0[56]:00\)) r=ok ;;
+  *) r="$now_label" ;;
+esac
+assert_eq "$r" ok "log label default is now"
+grep -q 'start \$(fleet_ct_label "\$STAMP")' "$SCRIPT" && r=yes || r=no
+assert_eq "$r" yes "start line carries Central label"
+grep -q 'done \$(fleet_ct_label "\$STAMP")' "$SCRIPT" && r=yes || r=no
+assert_eq "$r" yes "done line carries Central label"
+grep -q 'STAMP="\$(date -u +%Y%m%dT%H%M%SZ)"' "$SCRIPT" && r=yes || r=no
+assert_eq "$r" yes "file/object stamp stays UTC Z"
+
 # The current set is never deleted even if its stamp parses oddly old.
 b2_seed 20261130T064500Z
 prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
