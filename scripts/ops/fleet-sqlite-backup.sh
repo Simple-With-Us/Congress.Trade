@@ -3,7 +3,7 @@
 # Complements Hetzner daily host backups (RPO ~24h host-level).
 #
 # Per-app split (Jay 2026-10-05 correction): Usage-Monitor alone is daily with
-# 7+4 B2 retention.  Socratic.Trade and Congress.Trade stay on the previous
+# daily+weekly B2 retention (default 3+2 since Jay 2026-10-29: at most ~2 weeks).  Socratic.Trade and Congress.Trade stay on the previous
 # 6-hourly keep-2 cadence until Jay decides separately.  Select apps with
 # FLEET_BACKUP_APPS=socratic,congress,usage-monitor (comma-separated).
 # Cron: /etc/cron.d/fleet-backups (two dump lines + weekly UM-only verify).
@@ -343,8 +343,9 @@ else
   echo "[fleet-backup] SKIP usage-monitor (not in FLEET_BACKUP_APPS)"
 fi
 
-# retention: drop incomplete dumps first, then age-based (default 7d) AND
-# keep-count (default 3 newest COMPLETE .db per app dir)
+# retention: drop incomplete dumps first, then age-based (FLEET_BACKUP_KEEP_DAYS,
+# default 2d) AND keep-count (FLEET_BACKUP_KEEP_COUNT, default 2 newest COMPLETE
+# .db per app dir)
 apply_local_retention
 echo "[fleet-backup] done $STAMP"
 df -h /data / | tail -5
@@ -360,8 +361,9 @@ declare -A B2_BUCKET=( [congress]="jays-congress-trade-eu" [socratic]="jays-socr
 # bucket name that only exists on B2, so the R2 weekly leg silently failed).
 declare -A R2_BUCKET=( [congress]="congress-trade-bucket" )
 
-# B2-side prune (CLAUDE 2026-08-31; retention rewrite Jay 2026-10-05):
-# keep ~7 daily + ~4 weekly dump sets under hetzner/ and delete older dump
+# B2-side prune (CLAUDE 2026-08-31; retention rewrite Jay 2026-10-05; defaults
+# 3+2 Jay 2026-10-29 to match the fleet "3 days short-term, at most 2 weeks"
+# privacy copy): keep ~3 daily + ~2 weekly dump sets under hetzner/ and delete older dump
 # sets.  NEVER touches Litestream prefixes (trading-live/, congress-trade/,
 # api-usage-monitor/) or qdrant/ under hetzner/.  A set = the .db/.sqlite
 # files + .sha256 sidecars sharing one YYYYMMDDTHHMMSSZ stamp.
@@ -370,11 +372,14 @@ declare -A R2_BUCKET=( [congress]="congress-trade-bucket" )
 # run (callers append "|| true").
 #
 # Env:
-#   B2_KEEP_DAILY   newest N dump sets to keep (default 7)
-#   B2_KEEP_WEEKLY  additional Sunday-UTC dump sets to keep (default 4)
-#   B2_KEEP_SETS    legacy total-newest fallback; if set, keep newest N only
-B2_KEEP_DAILY="${B2_KEEP_DAILY:-7}"
-B2_KEEP_WEEKLY="${B2_KEEP_WEEKLY:-4}"
+#   B2_KEEP_DAILY   newest N dump sets to keep (default 3)
+#   B2_KEEP_WEEKLY  additional Sunday-UTC dump sets to keep (default 2)
+#   B2_KEEP_SETS    legacy total-newest fallback; if set, keep newest N only and
+#                   ignore B2_KEEP_DAILY / B2_KEEP_WEEKLY (ST+CT cron sets 2)
+# Host env/cron values override these defaults; a default change here does
+# nothing for a lane whose cron line sets its own values.
+B2_KEEP_DAILY="${B2_KEEP_DAILY:-3}"
+B2_KEEP_WEEKLY="${B2_KEEP_WEEKLY:-2}"
 B2_KEEP_SETS="${B2_KEEP_SETS:-}"
 prune_b2_sets() {
   local app="$1" bucket="$2" current_stamp="$3"
