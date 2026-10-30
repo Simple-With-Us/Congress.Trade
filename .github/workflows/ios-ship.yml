@@ -108,7 +108,8 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ios-fleet/scheduled-ship-gate.sh" \
             --event "${{ github.event_name }}" \
-            --path-prefix 'clients/ios/' \
+            --path-prefix 'clients/ios/**' \
+            --path-prefix '.github/workflows/ios-ship.yml' \
             --repo-root "$GITHUB_WORKSPACE" \
             congress
 

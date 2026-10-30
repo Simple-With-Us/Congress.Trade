@@ -54,10 +54,27 @@ check() {
 
 run_gate() {
   # run_gate <event> [extra args...] -> prints "key=value" lines
+  # Single --path-prefix: the old call form, which must keep working.
   local event="$1"; shift
   bash "$GATE" \
     --event "$event" \
     --path-prefix "ios/" \
+    --repo-root "$REPO" \
+    --state-dir "$STATE" \
+    "$@" 2>&1
+}
+
+run_gate_multi() {
+  # run_gate_multi <event> [extra args...] -> prints "key=value" lines
+  # Repeatable --path-prefix, mirroring ios-ship.yml: the app tree plus the
+  # workflow file itself. This repo's push paths do not list
+  # scripts/ios-fleet/, so the workflow file is the non-app-tree push path
+  # under test here.
+  local event="$1"; shift
+  bash "$GATE" \
+    --event "$event" \
+    --path-prefix "ios/" \
+    --path-prefix ".github/workflows/ios-ship.yml" \
     --repo-root "$REPO" \
     --state-dir "$STATE" \
     "$@" 2>&1
@@ -140,6 +157,38 @@ set_state demo "$(git -C "$REPO" rev-parse HEAD)"
 echo "== 8. deciding 'skip' is never an error exit =="
 run_gate schedule demo >/dev/null
 check "exit code on skip" 0 "$?"
+
+echo "== 9. a merge touching only the workflow file still ships (every push path) =="
+# The cron backstop must catch what push would have shipped. A merge that
+# only touched .github/workflows/ios-ship.yml passed push's paths filter,
+# so a missed push event must still ship on the next tick.
+set_state multi "$(git -C "$REPO" rev-parse HEAD)"
+commit ".github/workflows/ios-ship.yml" "workflow change" "ci: touch ship workflow" >/dev/null
+out="$(run_gate_multi schedule multi)"
+check "workflow-only -> should_ship" 1 "$(field "$out" should_ship)"
+# The old single-prefix call would have missed it; prove the regression.
+out="$(run_gate schedule multi)"
+check "single app-tree prefix misses workflow-only" 0 "$(field "$out" should_ship)"
+
+echo "== 10. unrelated-only commits still skip with every push path watched =="
+set_state multi "$(git -C "$REPO" rev-parse HEAD)"
+commit "README.md" "readme tweak" "docs: readme" >/dev/null
+commit "server/api.ts" "backend again" "feat(server): unrelated" >/dev/null
+out="$(run_gate_multi schedule multi)"
+check "unrelated-only (multi) -> should_ship" 0 "$(field "$out" should_ship)"
+
+echo "== 11. HEAD already shipped still skips with every push path watched =="
+set_state multi "$(git -C "$REPO" rev-parse HEAD)"
+out="$(run_gate_multi schedule multi)"
+check "HEAD already shipped (multi) -> should_ship" 0 "$(field "$out" should_ship)"
+
+echo "== 12. glob prefixes and ! exclusions behave like push =="
+set_state multi "$(git -C "$REPO" rev-parse HEAD)"
+commit "ios/project.yml" "project" "fix(ios): project file" >/dev/null
+out="$(bash "$GATE" --event schedule --path-prefix "ios/**" --repo-root "$REPO" --state-dir "$STATE" multi 2>&1)"
+check "glob ios/** sees project.yml" 1 "$(field "$out" should_ship)"
+out="$(bash "$GATE" --event schedule --path-prefix "ios/**" --path-prefix "!ios/project.yml" --repo-root "$REPO" --state-dir "$STATE" multi 2>&1)"
+check "excluded file does not ship" 0 "$(field "$out" should_ship)"
 
 echo
 echo "passed=${PASS} failed=${FAIL}"
