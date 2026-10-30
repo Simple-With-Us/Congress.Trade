@@ -114,7 +114,7 @@ function extractPushPaths(onText) {
   const push = onText.match(/^\s*push:\s*\n((?:^(?:\s{3,}.*|\s*)\n?)*)/m);
   const paths = push?.[1].match(/^\s*paths:\s*\n((?:^\s+-\s+.*\n?)*)/m);
   const list = paths?.[1] ?? "";
-  return [...list.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*$/gm)].map((m) => m[1]);
+  return [...list.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*(?:#.*)?$/gm)].map((m) => m[1]);
 }
 
 // Scheduled gate step only, so other --path-prefix uses are not picked up.
@@ -125,7 +125,7 @@ function gateStepBlock(code) {
 }
 
 function extractGatePrefixes(code) {
-  return [...gateStepBlock(code).matchAll(/--path-prefix\s+['"]?([^'"\s]+)['"]?/g)].map((m) => m[1]);
+  return [...gateStepBlock(code).matchAll(/--path-prefix\s+['"]?([^'"\s]+)['"]?(?:\s*#.*)?/g)].map((m) => m[1]);
 }
 
 test("ios-ship.yml ships automatically on a merge that touches the native tree", () => {
@@ -219,13 +219,14 @@ test("ship-gate coverage extractors accept any quote style", () => {
     "      - 'a/**'",
     '      - "b/**"',
     "      - c/**",
+    "      - 'd/**' # trailing comment",
     "    paths-ignore:",
     "      - 'ignored/**'",
     "  schedule:",
     "    - cron: '7,37 * * * *'",
     "",
   ].join("\n");
-  assert.deepEqual(extractPushPaths(sampleOn), ["a/**", "b/**", "c/**"]);
+  assert.deepEqual(extractPushPaths(sampleOn), ["a/**", "b/**", "c/**", "d/**"]);
 
   const sampleGate = [
     "      - name: Scheduled ship gate",
@@ -235,13 +236,14 @@ test("ship-gate coverage extractors accept any quote style", () => {
     "            --path-prefix 'a/**' \\",
     '            --path-prefix "b/**" \\',
     "            --path-prefix c/** \\",
+    "            --path-prefix 'd/**' # trailing comment \\",
     "            congress",
     "      - name: Other",
     "        run: |",
     "          echo --path-prefix 'ignored/**'",
     "",
   ].join("\n");
-  assert.deepEqual(extractGatePrefixes(sampleGate), ["a/**", "b/**", "c/**"]);
+  assert.deepEqual(extractGatePrefixes(sampleGate), ["a/**", "b/**", "c/**", "d/**"]);
 });
 
 test("the push paths filter matches the native tree and not backend code", () => {
