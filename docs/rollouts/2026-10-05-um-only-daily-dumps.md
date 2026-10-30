@@ -10,8 +10,8 @@ until he decides separately.
 
 | Lane | Cron | Apps | Local keep | B2 dump retention | Weekly restore |
 |---|---|---|---|---|---|
-| ST+CT | `15 */6 * * *` | socratic,congress | 2 / 2d | `B2_KEEP_SETS=2` | no |
-| UM | `45 6 * * *` | usage-monitor | 11 / 40d | `B2_KEEP_DAILY=3` + `B2_KEEP_WEEKLY=2` (was 7+4 until 2026-10-29) | yes (Pushover) |
+| ST+CT | `15 */6 * * *` | socratic,congress | 2 / 2d | `B2_KEEP_SETS=2` (14-day cap applies too) | no |
+| UM | `45 6 * * *` | usage-monitor | 11 / 40d | `B2_KEEP_DAILY=3` + `B2_KEEP_WEEKLY=2` + `B2_MAX_AGE_DAYS=14` (was 7+4 until 2026-10-29; 14-day cap since 2026-10-30) | yes (Pushover) |
 
 Env: `FLEET_BACKUP_APPS`, `FLEET_BACKUP_VERIFY_APPS`, `FLEET_BACKUP_DRY_RUN=1`.
 

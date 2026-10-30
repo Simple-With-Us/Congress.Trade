@@ -151,6 +151,128 @@ KEEP_DAYS=7
 prune_by_age
 assert_missing "$old_kv" "KEEP_DAYS deletes aged kv.sqlite copies"
 
+# --- B2 prune: daily + weekly + hard 14-day age cap (Jay 2026-10-30) -------
+# rclone stub backed by a local dir standing in for b2:<bucket>/hetzner/.
+B2_FAKE="$TMP/b2-hetzner"
+rclone() {
+  case "$1" in
+    lsf) ls -1 "$B2_FAKE" 2>/dev/null ;;
+    delete)
+      local inc=""
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--include" ]; then inc="${2#/}"; shift; fi
+        shift
+      done
+      [ -n "$inc" ] && rm -f "$B2_FAKE/$inc"
+      ;;
+    *) return 0 ;;
+  esac
+}
+# Seed one dump set (db + sha256) per stamp.
+b2_seed() {
+  rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+  local st
+  for st in "$@"; do
+    : > "$B2_FAKE/usage-monitor-${st}.db"
+    : > "$B2_FAKE/usage-monitor-${st}.db.sha256"
+  done
+  # Litestream / qdrant style names must be ignored.
+  : > "$B2_FAKE/generation.snapshot"
+}
+b2_has() { [ -e "$B2_FAKE/usage-monitor-$1.db" ] && echo yes || echo no; }
+b2_stamps_for_days() {
+  # Daily 06:45Z stamps for the N days ending on $1 (YYYY-MM-DD), newest first.
+  local end="$1" n="$2" i
+  for i in $(seq 0 $((n - 1))); do
+    date -u -d "$end - $i days" +%Y%m%dT064500Z
+  done
+}
+
+B2_KEEP_SETS=""
+B2_KEEP_DAILY=3
+B2_KEEP_WEEKLY=2
+B2_MAX_AGE_DAYS=14
+
+# Monday 2026-11-16: Sundays are 11-15 (1d), 11-08 (8d), 11-01 (15d).
+# Pre-cap behaviour kept 11-08 + 11-01 as weeklies (11-15 is a daily) -> 15d.
+# shellcheck disable=SC2046
+b2_seed $(b2_stamps_for_days 2026-11-16 20)
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261116T064500Z >/dev/null
+assert_eq "$(b2_has 20261116T064500Z)" yes "B2 Monday keeps today (daily)"
+assert_eq "$(b2_has 20261115T064500Z)" yes "B2 Monday keeps Sunday 1d (daily)"
+assert_eq "$(b2_has 20261114T064500Z)" yes "B2 Monday keeps Saturday 2d (daily)"
+assert_eq "$(b2_has 20261108T064500Z)" yes "B2 Monday keeps Sunday 8d (weekly)"
+assert_eq "$(b2_has 20261101T064500Z)" no "B2 Monday age-caps Sunday 15d"
+assert_eq "$(ls -1 "$B2_FAKE" | grep -c '\.db$')" 4 "B2 Monday leaves 4 sets"
+assert_exists "$B2_FAKE/generation.snapshot" "B2 prune never touches snapshot files"
+
+# Sunday 2026-11-15: weeklies land at 7d (11-08) and exactly 14d (11-01).
+# shellcheck disable=SC2046
+b2_seed $(b2_stamps_for_days 2026-11-15 20)
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261115T064500Z >/dev/null
+assert_eq "$(b2_has 20261108T064500Z)" yes "B2 Sunday keeps 7d weekly"
+assert_eq "$(b2_has 20261101T064500Z)" yes "B2 Sunday keeps 14d weekly (cap is > 14d)"
+assert_eq "$(b2_has 20261025T064500Z)" no "B2 Sunday drops 21d Sunday"
+assert_eq "$(ls -1 "$B2_FAKE" | grep -c '\.db$')" 5 "B2 Sunday leaves 3 daily + 2 weekly"
+
+# Every day for 6 weeks of daily runs: nothing on B2 is ever > 14 days old,
+# and there are always 3 sets from the last 3 days.
+rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+cap_ok=yes; daily_ok=yes
+for i in $(seq 0 41); do
+  day="$(date -u -d "2026-11-01 + $i days" +%Y-%m-%d)"
+  st="$(date -u -d "$day" +%Y%m%dT064500Z)"
+  : > "$B2_FAKE/usage-monitor-${st}.db"; : > "$B2_FAKE/usage-monitor-${st}.db.sha256"
+  prune_b2_sets usage-monitor jays-usage-monitor-eu "$st" >/dev/null
+  now_e="$(b2_stamp_epoch "$st")"
+  for f in "$B2_FAKE"/*.db; do
+    s2="$(basename "$f" .db)"; s2="${s2#usage-monitor-}"
+    if [ $((now_e - $(b2_stamp_epoch "$s2"))) -gt $((14 * 86400)) ]; then cap_ok=no; fi
+  done
+  if [ "$i" -ge 2 ]; then
+    for d in 0 1 2; do
+      [ "$(b2_has "$(date -u -d "$day - $d days" +%Y%m%dT064500Z)")" = yes ] || daily_ok=no
+    done
+  fi
+done
+assert_eq "$cap_ok" yes "B2 6-week simulation never keeps a set older than 14d"
+assert_eq "$daily_ok" yes "B2 6-week simulation always has the last 3 days"
+
+# 6-hourly lane with daily/weekly mode: two weeklies must be two different Sundays.
+rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+for st in 20261115T181500Z 20261115T121500Z 20261115T061500Z 20261115T001500Z \
+          20261108T181500Z 20261108T121500Z 20261101T181500Z; do
+  : > "$B2_FAKE/usage-monitor-${st}.db"
+done
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261115T181500Z >/dev/null
+assert_eq "$(b2_has 20261115T001500Z)" no "B2 weekly does not reuse a Sunday already kept"
+assert_eq "$(b2_has 20261108T181500Z)" yes "B2 weekly picks newest stamp of previous Sunday"
+assert_eq "$(b2_has 20261108T121500Z)" no "B2 weekly keeps one set per Sunday"
+assert_eq "$(b2_has 20261101T181500Z)" yes "B2 second weekly is the Sunday 14d back"
+
+# Legacy B2_KEEP_SETS mode is capped too.
+b2_seed 20261130T064500Z 20261101T064500Z
+B2_KEEP_SETS=2
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+assert_eq "$(b2_has 20261130T064500Z)" yes "B2_KEEP_SETS keeps current set"
+assert_eq "$(b2_has 20261101T064500Z)" no "B2_KEEP_SETS set older than 14d is age-capped"
+B2_KEEP_SETS=""
+
+# Bad B2_MAX_AGE_DAYS never disables the cap.
+for bad in abc 0; do
+  b2_seed 20261130T064500Z 20261115T064500Z
+  B2_MAX_AGE_DAYS="$bad"
+  prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+  assert_eq "$(b2_has 20261115T064500Z)" no "B2_MAX_AGE_DAYS=$bad falls back to 14"
+done
+B2_MAX_AGE_DAYS=14
+
+# The current set is never deleted even if its stamp parses oddly old.
+b2_seed 20261130T064500Z
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+assert_eq "$(b2_has 20261130T064500Z)" yes "B2 prune never deletes the current set"
+unset -f rclone
+
 if [ "$fail" -ne 0 ]; then
   echo "FAILED"
   exit 1
