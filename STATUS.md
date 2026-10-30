@@ -2,7 +2,7 @@
 
 ## 2026-10-30 CODEX — Reports index (AFC-580)
 
-Added docs/reports/README.md to index eligible documentation and reports.  The index links existing canonical files without moving or renaming them.  Central placement under Code/Docs/Congress.Trade/ is pending the native guard exception; this in-repo index is the repository entry point.
+Added docs/reports/README.md to index eligible documentation and reports.  The index links existing canonical files without moving or renaming them.  Central collection under Code/Docs/Congress.Trade/ is populated under the owner-approved docs-only exception.  The collector and protocol are live in AI-Fleet-Coordinator main at `691f4a3c`; the 16-repo collection check reported zero planned changes, and protected Git checkouts remain unchanged.  This in-repo index is the repository entry point.
 
 ## 2026-10-25 GROK — Empty fetch hand-off (CT-2447)
 
