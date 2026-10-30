@@ -108,6 +108,26 @@ function onBlock(yml) {
   return m[1];
 }
 
+// on.push.paths list only: not paths-ignore, branches, schedule, or other lists.
+// Each entry may be single-quoted, double-quoted, or unquoted.
+function extractPushPaths(onText) {
+  const push = onText.match(/^\s*push:\s*\n((?:^(?:\s{3,}.*|\s*)\n?)*)/m);
+  const paths = push?.[1].match(/^\s*paths:\s*\n((?:^\s+-\s+.*\n?)*)/m);
+  const list = paths?.[1] ?? "";
+  return [...list.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*$/gm)].map((m) => m[1]);
+}
+
+// Scheduled gate step only, so other --path-prefix uses are not picked up.
+// Each prefix may be single-quoted, double-quoted, or unquoted.
+function gateStepBlock(code) {
+  const step = code.match(/-\s*name:\s*Scheduled ship gate[\s\S]*?(?=\n\s+-\s*name:|\n\S|$)/);
+  return step?.[0] ?? "";
+}
+
+function extractGatePrefixes(code) {
+  return [...gateStepBlock(code).matchAll(/--path-prefix\s+['"]?([^'"\s]+)['"]?/g)].map((m) => m[1]);
+}
+
 test("ios-ship.yml ships automatically on a merge that touches the native tree", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const code = withoutComments(yml);
@@ -123,9 +143,9 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
     assert.match(code, /scheduled-ship-gate\.sh/);
     assert.match(code, /--event "\$\{\{ github\.event_name \}\}"/);
     // The gate must watch every push path, so a missed push still ships.
-    const pushGlobs = [...on.matchAll(/^\s+-\s+'([^']+)'$/gm)].map((m) => m[1]);
+    const pushGlobs = extractPushPaths(on);
     assert.ok(pushGlobs.length > 0, "push paths must list at least one glob");
-    const gatePrefixes = [...code.matchAll(/--path-prefix '([^']+)'/g)].map((m) => m[1]);
+    const gatePrefixes = extractGatePrefixes(code);
     for (const g of pushGlobs) {
       assert.ok(gatePrefixes.includes(g), `gate must watch push path '${g}'`);
     }
@@ -191,9 +211,42 @@ test("no iOS ship workflow carries a standing gate override", () => {
   }
 });
 
+test("ship-gate coverage extractors accept any quote style", () => {
+  const sampleOn = [
+    "  push:",
+    "    branches: [main]",
+    "    paths:",
+    "      - 'a/**'",
+    '      - "b/**"',
+    "      - c/**",
+    "    paths-ignore:",
+    "      - 'ignored/**'",
+    "  schedule:",
+    "    - cron: '7,37 * * * *'",
+    "",
+  ].join("\n");
+  assert.deepEqual(extractPushPaths(sampleOn), ["a/**", "b/**", "c/**"]);
+
+  const sampleGate = [
+    "      - name: Scheduled ship gate",
+    "        id: gate",
+    "        run: |",
+    '          bash foo/scheduled-ship-gate.sh \\',
+    "            --path-prefix 'a/**' \\",
+    '            --path-prefix "b/**" \\',
+    "            --path-prefix c/** \\",
+    "            congress",
+    "      - name: Other",
+    "        run: |",
+    "          echo --path-prefix 'ignored/**'",
+    "",
+  ].join("\n");
+  assert.deepEqual(extractGatePrefixes(sampleGate), ["a/**", "b/**", "c/**"]);
+});
+
 test("the push paths filter matches the native tree and not backend code", () => {
   const on = withoutComments(onBlock(read(".github/workflows/ios-ship.yml")));
-  const globs = [...on.matchAll(/^\s+-\s+'([^']+)'$/gm)].map((m) => m[1]);
+  const globs = extractPushPaths(on);
   // GitHub's `dir/**` matches anything under dir/.
   const matches = (glob, file) => glob.endsWith("/**")
     ? file.startsWith(glob.slice(0, -2))
