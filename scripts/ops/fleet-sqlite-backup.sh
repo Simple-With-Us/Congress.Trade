@@ -19,6 +19,12 @@
 #   4) VACUUM INTO instead of sqlite3 .backup -- online backup never converges on
 #      the ~11 GB ST DB under continuous writers
 #   5) a timed-out or failed dump ALERTS and returns non-zero (never return 0)
+# B2 compression (Jay 2026-10-30): each run's dump set is zstd-compressed for
+#   the B2 upload only (`<name>-<STAMP>.db.zst`, plus the raw-db `.db.sha256`).
+#   Local dumps stay plain `.db` (weekly verify + local restore unchanged).
+#   Restore from B2:  zstd -d X-<STAMP>.db.zst -o X-<STAMP>.db, then
+#   PRAGMA integrity_check.  Older B2 sets stay plain `.db`; prune handles both.
+#   FLEET_BACKUP_B2_COMPRESS=0, or no zstd on PATH, uploads raw (old behavior).
 # Host install after merge: /usr/local/sbin/fleet-sqlite-backup.sh on
 # fleet-hetzner-nbg1 (apply on top of the UUID-pinned host copy; do not
 # overwrite wholesale).  Not a Coolify image bake.
@@ -365,9 +371,10 @@ prune_b2_sets() {
       echo "[fleet-backup] B2 prune WARN: unparseable name skipped: $name"
     fi
   done <<< "$listing"
-  # Newest-first distinct stamps from dump-like names only.
+  # Newest-first distinct stamps from dump-like names only (plain .db/.sqlite
+  # sets from before 2026-10-30 and .db.zst/.sqlite.zst sets after).
   stamps_all="$(printf '%s\n' "$listing" \
-    | grep -E '\.(db|sqlite)(\.sha256)?$' \
+    | grep -E '\.(db|sqlite)(\.zst)?(\.sha256)?$' \
     | grep -oE '[0-9]{8}T[0-9]{6}Z' \
     | sort -u -r)"
   if [ -z "$stamps_all" ]; then
@@ -479,6 +486,55 @@ fleet_backup_ct_gate() {
     *",${hour},"*) return 0 ;;
   esac
   return 1
+}
+
+# zstd the current run's dumps for the B2 upload (Jay 2026-10-30).  Writes
+# <file>.zst next to each <file> (via .zst.partial + zstd -t, so a torn file
+# never gets the final name).  Returns 0 only if every file compressed and
+# tested clean; on any failure it removes its .zst output and returns 1 so the
+# caller uploads the raw set instead.  nice + 2 threads: the box also runs ST.
+FLEET_BACKUP_B2_COMPRESS="${FLEET_BACKUP_B2_COMPRESS:-1}"
+FLEET_BACKUP_ZSTD_LEVEL="${FLEET_BACKUP_ZSTD_LEVEL:-3}"
+compress_offsite_set() {
+  local dir="$1" stamp="$2" f lvl made=()
+  [ "$FLEET_BACKUP_B2_COMPRESS" = "1" ] || return 1
+  if ! command -v zstd >/dev/null 2>&1; then
+    echo "[fleet-backup] WARN zstd missing; uploading raw dumps"
+    return 1
+  fi
+  lvl="$FLEET_BACKUP_ZSTD_LEVEL"
+  case "$lvl" in ''|*[!0-9]*) lvl=3 ;; esac
+  for f in "$dir"/*"${stamp}".db "$dir"/*"${stamp}".sqlite; do
+    [ -f "$f" ] || continue
+    rm -f "${f}.zst" "${f}.zst.partial"
+    if nice -n 10 zstd -q -T2 -"$lvl" "$f" -o "${f}.zst.partial" \
+      && zstd -q -t "${f}.zst.partial" \
+      && mv -f "${f}.zst.partial" "${f}.zst"; then
+      made+=("${f}.zst")
+      echo "[fleet-backup] zstd $(basename "$f") $(du -h "$f" | awk '{print $1}') -> $(du -h "${f}.zst" | awk '{print $1}') at $(fleet_ct_label)"
+    else
+      echo "[fleet-backup] WARN zstd failed for $(basename "$f"); uploading raw dumps"
+      rm -f "${f}.zst.partial" "${made[@]}"
+      return 1
+    fi
+  done
+  [ "${#made[@]}" -gt 0 ] || return 1
+  return 0
+}
+
+# Upload this run's set to b2:<bucket>/hetzner/.  Compressed: only .zst files
+# plus the raw-db .sha256 sidecars.  Raw fallback: the whole set as before.
+# Local .zst copies are removed afterwards (local retention keeps plain .db).
+upload_b2_set() {
+  local dir="$1" bucket="$2" stamp="$3" rc=0
+  if compress_offsite_set "$dir" "$stamp"; then
+    rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*.zst" --include "*${stamp}*.sha256" --transfers 2 -q || rc=$?
+    rm -f "$dir"/*"${stamp}"*.zst
+  else
+    # compress_offsite_set already removed any partial .zst output.
+    rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*" --transfers 2 -q || rc=$?
+  fi
+  return "$rc"
 }
 
 if [ "${FLEET_BACKUP_LIB_ONLY:-0}" = "1" ]; then
@@ -617,7 +673,7 @@ for app in congress socratic usage-monitor; do
   dir="$ROOT/$app"; [ -d "$dir" ] || continue
   files=$(ls -1 "$dir" 2>/dev/null | grep "$STAMP" || true)
   [ -n "$files" ] || continue
-  if rclone copy "$dir" "b2:${B2_BUCKET[$app]}/hetzner/" --include "*${STAMP}*" --transfers 2 -q; then
+  if upload_b2_set "$dir" "${B2_BUCKET[$app]}" "$STAMP"; then
     echo "[fleet-backup] B2 offsite OK: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
     prune_b2_sets "$app" "${B2_BUCKET[$app]}" "$STAMP" || true
   else
