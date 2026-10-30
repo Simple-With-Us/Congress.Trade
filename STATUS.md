@@ -1,5 +1,9 @@
 # Current Handoff
 
+## 2026-10-30 CODEX — Reports index (AFC-580)
+
+Added docs/reports/README.md to index eligible documentation and reports.  The index links existing canonical files without moving or renaming them.  Central placement under Code/Docs/Congress.Trade/ is pending the native guard exception; this in-repo index is the repository entry point.
+
 ## 2026-10-25 GROK — Empty fetch hand-off (CT-2447)
 
 A completed ingestion outbox row that stored no raw object, and a filing whose ingest_status is outside IngestStatus, now re-drive on the autonomy sweep and page as `empty_fetch_handoff`.  The same id is a critical `/api/health` check and is in `HEALTH_STALL_SKIP_IDS`, so it does not page twice.  Evidence for `E-2026-donald-j-trump-08-12-2026-278t` is in `docs/evidence/2026-10-25-orphan-278t.json`.  Part 7 is not empty.  This PR does not publish the filing.  CT-2447 stays open until the filing is recovered and published.  Branch `grok/empty-fetch-handoff`.  No merge from this seat.  Rollout: `docs/rollouts/2026-10-25-empty-fetch-handoff.md`.
