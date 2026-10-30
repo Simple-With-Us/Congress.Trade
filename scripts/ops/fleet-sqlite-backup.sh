@@ -6,8 +6,9 @@
 # (ST 6:30am + 7:30pm, CT 6:00am + 8:00pm, UM 8:30pm), local keep 2 days
 # (ST 4, CT 4, UM 2), B2 3 dailies + 2 weeklies with a hard 14-day max age.
 # Select apps with FLEET_BACKUP_APPS=socratic,congress,usage-monitor.
-# Cron: /etc/cron.d/fleet-backups (three dump lines + weekly UM-only verify);
-# FLEET_BACKUP_CT_HOURS gates each line to its Central-time slot across DST.
+# Cron: /etc/cron.d/fleet-backups (three dump lines + weekly UM-only verify).
+# The host runs on America/Chicago, so cron times are Central directly.
+# FLEET_BACKUP_CT_HOURS is an optional extra gate (unset in the shipped cron).
 #
 # Hardening (2026-09-06, board e1f66898):
 #   1) in-script flock -n single-flight (same path as the host cron wrapper)
@@ -442,10 +443,10 @@ prune_b2_sets() {
   return 0
 }
 
-# Central-time gate (Jay 2026-10-30).  Debian/Ubuntu cron has no CRON_TZ, so
-# each cron line fires at BOTH UTC candidates for its Central-time slot (CDT
-# and CST) and this gate lets through only the one whose America/Chicago hour
-# is listed.  FLEET_BACKUP_CT_HOURS is a comma list of 2-digit hours, e.g.
+# Optional Central-time gate (Jay 2026-10-30).  Originally each cron line fired
+# at both UTC candidates (CDT and CST) and this gate let only the matching
+# America/Chicago hour through.  The host now runs on America/Chicago, so the
+# shipped cron leaves it unset; kept for UTC hosts and manual use.  FLEET_BACKUP_CT_HOURS is a comma list of 2-digit hours, e.g.
 # "06,19".  Unset = no gate (manual runs).  If the zoneinfo file is missing
 # the gate fails OPEN (runs) so a tzdata problem cannot silently stop backups.
 FLEET_BACKUP_CT_HOURS="${FLEET_BACKUP_CT_HOURS:-}"

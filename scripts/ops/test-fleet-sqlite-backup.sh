@@ -290,26 +290,20 @@ fleet_backup_ct_gate 20 && r=run || r=skip; assert_eq "$r" skip "CT gate skips o
 FLEET_BACKUP_CT_HOURS=""
 fleet_backup_ct_gate 05 && r=run || r=skip; assert_eq "$r" run "CT gate unset always runs"
 
-# Each cron line fires exactly once per Central slot across CDT and CST.
+# Host runs on America/Chicago: each lane is one Central-time cron line.
 CRON_FILE="${ROOT_DIR}/scripts/ops/fleet-backups.cron"
 cron_ct_runs() {
-  # $1 = lock name, $2 = UTC offset hours (5 CDT, 6 CST).  Prints CT HH:MM runs.
-  local line min hours gate h ct
+  # $1 = lock name.  Prints Central HH:MM runs from the line's minute/hour fields.
+  local line min hours h
   line="$(grep "fleet-sqlite-backup-$1.lock" "$CRON_FILE")"
   min="$(echo "$line" | awk '{print $1}')"
   hours="$(echo "$line" | awk '{print $2}')"
-  gate="$(echo "$line" | grep -oE 'FLEET_BACKUP_CT_HOURS=[0-9,]+' | cut -d= -f2)"
-  for h in ${hours//,/ }; do
-    ct=$(( (10#$h - $2 + 24) % 24 ))
-    ct="$(printf '%02d' "$ct")"
-    case ",$gate," in *",$ct,"*) printf '%s:%02d\n' "$ct" "$min" ;; esac
-  done | sort | tr '\n' ' '
+  for h in ${hours//,/ }; do printf '%02d:%02d\n' "$((10#$h))" "$((10#$min))"; done | sort | tr '\n' ' '
 }
-for off in 5 6; do
-  assert_eq "$(cron_ct_runs st "$off")" "06:30 19:30 " "cron ST runs 6:30am+7:30pm CT (UTC-$off)"
-  assert_eq "$(cron_ct_runs ct "$off")" "06:00 20:00 " "cron CT runs 6:00am+8:00pm CT (UTC-$off)"
-  assert_eq "$(cron_ct_runs um "$off")" "20:30 " "cron UM runs 8:30pm CT (UTC-$off)"
-done
+assert_eq "$(cron_ct_runs st)" "06:30 19:30 " "cron ST runs 6:30am+7:30pm CT"
+assert_eq "$(cron_ct_runs ct)" "06:00 20:00 " "cron CT runs 6:00am+8:00pm CT"
+assert_eq "$(cron_ct_runs um)" "20:30 " "cron UM runs 8:30pm CT"
+assert_eq "$(grep -c 'FLEET_BACKUP_CT_HOURS=' "$CRON_FILE")" 0 "cron lines carry no UTC-era CT gate"
 grep -q 'FLEET_BACKUP_APPS=socratic .*FLEET_BACKUP_KEEP_COUNT=4' "$CRON_FILE" && r=yes || r=no
 assert_eq "$r" yes "cron ST local keep 4"
 grep -q 'FLEET_BACKUP_APPS=congress .*FLEET_BACKUP_KEEP_COUNT=4' "$CRON_FILE" && r=yes || r=no
