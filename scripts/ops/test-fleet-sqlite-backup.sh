@@ -352,6 +352,14 @@ assert_missing "$B2_FAKE/usage-monitor-20261110T064500Z.db.sha256" "B2 prune dro
 assert_eq "$(ls -1 "$B2_FAKE" | grep -cE '\.db(\.zst)?$')" 4 "B2 mixed prune leaves 3 daily + 1 weekly"
 unset -f rclone
 
+# --- stale .zst from an interrupted run is pruned locally ------------------
+mkdir -p "$ROOT/socratic"
+: > "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst"
+: > "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial"
+prune_incomplete_dumps >/dev/null
+assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst" "stale local .zst pruned"
+assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial" "stale local .zst.partial pruned"
+
 # --- zstd upload + restore round trip (needs sqlite3 + zstd) ----------------
 if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
   ZD="$TMP/zstd-app"; ZB="$TMP/zstd-b2"; mkdir -p "$ZD" "$ZB"
@@ -393,6 +401,27 @@ if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
   want_sha="$(awk '{print $1}' "$ZB/socratic-app-${zst_stamp}.db.sha256")"
   got_sha="$(sha256sum "$RD/socratic-app-${zst_stamp}.db" | awk '{print $1}')"
   assert_eq "$got_sha" "$want_sha" "restored .zst matches raw-db sha256"
+  # A failed upload keeps the verified .zst for a manual retry.
+  rclone() { return 1; }
+  upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null || true
+  assert_exists "$ZD/out/socratic-app-${zst_stamp}.db.zst" "failed upload keeps local .zst"
+  rm -f "$ZD/out"/*.zst
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$ZB/$n"; break; fi
+      done
+    done
+  }
   # Disabled or failed compression falls back to the raw set.
   rm -f "$ZB"/*
   FLEET_BACKUP_B2_COMPRESS=0 upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null

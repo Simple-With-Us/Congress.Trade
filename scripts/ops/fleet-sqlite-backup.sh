@@ -181,6 +181,14 @@ prune_incomplete_dumps() {
       echo "[fleet-backup] prune-incomplete $f at $(fleet_ct_label)"
       rm -f "$f" "${f}.sha256" "${f}-journal" "${f}-wal"
     done
+    # .zst / .zst.partial are transient B2-upload copies (upload_b2_set removes
+    # them after each upload).  Any left here came from an interrupted run;
+    # this runs before the current run compresses anything, so drop them all.
+    for f in "$dir"/*.zst "$dir"/*.zst.partial; do
+      [ -f "$f" ] || continue
+      echo "[fleet-backup] prune-stale-zst $f at $(fleet_ct_label)"
+      rm -f "$f"
+    done
   done
 }
 
@@ -508,7 +516,7 @@ compress_offsite_set() {
     [ -f "$f" ] || continue
     rm -f "${f}.zst" "${f}.zst.partial"
     if nice -n 10 zstd -q -T2 -"$lvl" "$f" -o "${f}.zst.partial" \
-      && zstd -q -t "${f}.zst.partial" \
+      && nice -n 10 zstd -q -t "${f}.zst.partial" \
       && mv -f "${f}.zst.partial" "${f}.zst"; then
       made+=("${f}.zst")
       echo "[fleet-backup] zstd $(basename "$f") $(du -h "$f" | awk '{print $1}') -> $(du -h "${f}.zst" | awk '{print $1}') at $(fleet_ct_label)"
@@ -524,12 +532,17 @@ compress_offsite_set() {
 
 # Upload this run's set to b2:<bucket>/hetzner/.  Compressed: only .zst files
 # plus the raw-db .sha256 sidecars.  Raw fallback: the whole set as before.
-# Local .zst copies are removed afterwards (local retention keeps plain .db).
+# Local .zst copies are removed after a successful upload (local retention
+# keeps plain .db; prune_incomplete_dumps clears any leftover .zst).
 upload_b2_set() {
   local dir="$1" bucket="$2" stamp="$3" rc=0
   if compress_offsite_set "$dir" "$stamp"; then
     rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*.zst" --include "*${stamp}*.sha256" --transfers 2 -q || rc=$?
-    rm -f "$dir"/*"${stamp}"*.zst
+    # Keep the verified .zst after a failed upload for a manual retry; the next
+    # run's prune_incomplete_dumps removes it, so at most one set lingers.
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$dir"/*"${stamp}"*.zst
+    fi
   else
     # compress_offsite_set already removed any partial .zst output.
     rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*" --transfers 2 -q || rc=$?
