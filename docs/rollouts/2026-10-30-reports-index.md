@@ -12,8 +12,12 @@ Added an in-repo reports index at docs/reports/README.md.  It links existing el
 
 ## Verification
 
-- `scripts/check-doc-links.py` is absent from the repository.  This inline check ran from the repository root: `python3 -c 'from pathlib import Path; f=Path("docs/reports/README.md"); s=f.read_text(); ts=[x.split(")",1)[0] for x in s.split("](")[1:]]; rel=[t for t in ts if not t.startswith(("http","mailto:"))]; print(len(ts),len(rel),sum(not (f.parent/t.split("#",1)[0]).exists() for t in rel))'`.
-- Its output was `328 326 0` (total links, relative links, missing links).  `git diff --exit-code -- docs/reports/2026-10-15-CT-2408-verification.md` exited 0, so the existing report is unchanged.
+- `scripts/check-doc-links.py` is absent from the repository, so the documented inline check was run from the repository root instead:
+  ```sh
+  python3 -c 'from pathlib import Path; f=Path("docs/reports/README.md"); s=f.read_text(); ts=[x.split(")",1)[0] for x in s.split("](")[1:]]; rel=[t for t in ts if not t.startswith(("http","mailto:"))]; print(len(ts),len(rel),sum(not (f.parent/t.split("#",1)[0]).exists() for t in rel))'
+  ```
+- The command output was `328 326 0`: 328 total links, 326 relative links, and 0 missing relative links.
+- `git diff --exit-code -- docs/reports/2026-10-15-CT-2408-verification.md` exited `0`, confirming the existing report has no diff.
 
 ## Follow-ups
 
