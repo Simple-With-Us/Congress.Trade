@@ -2,11 +2,12 @@
 # Consistent SQLite snapshots for fleet apps + optional off-host copy.
 # Complements Hetzner daily host backups (RPO ~24h host-level).
 #
-# Per-app split (Jay 2026-10-05 correction): Usage-Monitor alone is daily with
-# daily+weekly B2 retention (default 3+2 since Jay 2026-10-29: at most ~2 weeks).  Socratic.Trade and Congress.Trade stay on the previous
-# 6-hourly keep-2 cadence until Jay decides separately.  Select apps with
-# FLEET_BACKUP_APPS=socratic,congress,usage-monitor (comma-separated).
-# Cron: /etc/cron.d/fleet-backups (two dump lines + weekly UM-only verify).
+# Per-app lanes (Jay 2026-10-30): one cron lane per app, Central-time slots
+# (ST 6:30am + 7:30pm, CT 6:00am + 8:00pm, UM 8:30pm), local keep 2 days
+# (ST 4, CT 4, UM 2), B2 3 dailies + 2 weeklies with a hard 14-day max age.
+# Select apps with FLEET_BACKUP_APPS=socratic,congress,usage-monitor.
+# Cron: /etc/cron.d/fleet-backups (three dump lines + weekly UM-only verify);
+# FLEET_BACKUP_CT_HOURS gates each line to its Central-time slot across DST.
 #
 # Hardening (2026-09-06, board e1f66898):
 #   1) in-script flock -n single-flight (same path as the host cron wrapper)
@@ -260,7 +261,8 @@ apply_local_retention() {
 # run (callers append "|| true").
 #
 # Env:
-#   B2_KEEP_DAILY   newest N dump sets to keep (default 3)
+#   B2_KEEP_DAILY   newest N UTC days to keep one dump set from (newest set of
+#                   each day; default 3)
 #   B2_KEEP_WEEKLY  additional Sunday-UTC dump sets to keep (default 2)
 #   B2_KEEP_SETS    legacy total-newest fallback; if set, keep newest N only and
 #                   ignore B2_KEEP_DAILY / B2_KEEP_WEEKLY (ST+CT cron sets 2)
@@ -290,7 +292,8 @@ prune_b2_sets() {
   local listing stamps_all stamp name kept_count deleted_count set_fail
   local keep_daily="$B2_KEEP_DAILY" keep_weekly="$B2_KEEP_WEEKLY"
   local dow weekly_kept stamp_day max_age_days now_epoch stamp_epoch max_age_secs
-  local -A WEEKLY_DAYS=()
+  local -A WEEKLY_DAYS=() DAILY_DAYS=()
+  local daily_kept
   # Only ever touch the hetzner/ prefix of the three known fleet buckets.
   case "$bucket" in
     jays-congress-trade-eu|jays-socratic-trade-eu|jays-usage-monitor-eu) ;;
@@ -323,6 +326,7 @@ prune_b2_sets() {
     echo "[fleet-backup] B2 prune WARN: B2_MAX_AGE_DAYS must be >= 1 (got $max_age_days); using 14"
     max_age_days=14
   fi
+  max_age_days=$((10#$max_age_days))
   max_age_secs=$((max_age_days * 86400))
   # Age is measured from the current run's stamp (the set just uploaded), so
   # tests are deterministic and a slow run cannot shift the cutoff.
@@ -365,13 +369,20 @@ prune_b2_sets() {
       [ "$kept_count" -ge "$B2_KEEP_SETS" ] && break
     done <<< "$stamps_all"
   else
+    # Dailies: the newest set of each of the newest N distinct UTC dates, so a
+    # lane that dumps twice a day still keeps ~N days, not N/2.
+    daily_kept=0
     while read -r stamp; do
       [ -n "$stamp" ] || continue
+      stamp_day="${stamp:0:8}"
+      [ -n "${DAILY_DAYS[$stamp_day]:-}" ] && continue
+      DAILY_DAYS["$stamp_day"]=1
       KEEP_STAMPS["$stamp"]=1
       # A Sunday already covered by a daily does not need a weekly too.
-      WEEKLY_DAYS["${stamp:0:8}"]=1
+      WEEKLY_DAYS["$stamp_day"]=1
       kept_count=$((kept_count + 1))
-      [ "$kept_count" -ge "$keep_daily" ] && break
+      daily_kept=$((daily_kept + 1))
+      [ "$daily_kept" -ge "$keep_daily" ] && break
     done <<< "$stamps_all"
     weekly_kept=0
     while read -r stamp; do
@@ -400,7 +411,7 @@ prune_b2_sets() {
     stamp_epoch="$(b2_stamp_epoch "$stamp")"
     [ -n "$stamp_epoch" ] || continue
     if [ $((now_epoch - stamp_epoch)) -gt "$max_age_secs" ]; then
-      unset 'KEEP_STAMPS[$stamp]'
+      unset "KEEP_STAMPS[$stamp]"
       kept_count=$((kept_count - 1))
       echo "[fleet-backup] B2 prune age-cap: $stamp older than ${max_age_days}d for $app"
     fi
@@ -431,8 +442,36 @@ prune_b2_sets() {
   return 0
 }
 
+# Central-time gate (Jay 2026-10-30).  Debian/Ubuntu cron has no CRON_TZ, so
+# each cron line fires at BOTH UTC candidates for its Central-time slot (CDT
+# and CST) and this gate lets through only the one whose America/Chicago hour
+# is listed.  FLEET_BACKUP_CT_HOURS is a comma list of 2-digit hours, e.g.
+# "06,19".  Unset = no gate (manual runs).  If the zoneinfo file is missing
+# the gate fails OPEN (runs) so a tzdata problem cannot silently stop backups.
+FLEET_BACKUP_CT_HOURS="${FLEET_BACKUP_CT_HOURS:-}"
+fleet_backup_ct_gate() {
+  local hour="${1:-}"
+  [ -n "$FLEET_BACKUP_CT_HOURS" ] || return 0
+  if [ -z "$hour" ]; then
+    if [ ! -e /usr/share/zoneinfo/America/Chicago ]; then
+      echo "[fleet-backup] WARN: no America/Chicago zoneinfo; CT gate open" >&2
+      return 0
+    fi
+    hour="$(TZ=America/Chicago date +%H)"
+  fi
+  case ",${FLEET_BACKUP_CT_HOURS// /}," in
+    *",${hour},"*) return 0 ;;
+  esac
+  return 1
+}
+
 if [ "${FLEET_BACKUP_LIB_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
+fi
+
+if ! fleet_backup_ct_gate; then
+  # Off-slot UTC candidate (other side of DST): nothing to do.
+  exit 0
 fi
 
 # Single-flight: same inode as the host cron wrapper
@@ -460,7 +499,7 @@ BACKUP_FAILED=0
 LOG="/var/log/fleet-backup/sqlite-${STAMP}.log"
 mkdir -p "$ROOT" /var/log/fleet-backup
 exec > >(tee -a "$LOG") 2>&1
-echo "[fleet-backup] start $STAMP apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-} b2_max_age_days=${B2_MAX_AGE_DAYS:-}"
+echo "[fleet-backup] start $STAMP apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-} b2_max_age_days=${B2_MAX_AGE_DAYS:-} ct_hours=${FLEET_BACKUP_CT_HOURS:-}"
 
 if ! backup_apps_selected; then
   exit 1

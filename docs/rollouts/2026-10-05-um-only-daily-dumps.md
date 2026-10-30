@@ -6,7 +6,7 @@ Jay clarified after #2647: the new backup setup applies **only to Usage-Monitor*
 Socratic.Trade and Congress.Trade stay on the previous 6-hourly keep-2 cadence
 until he decides separately.
 
-## Live shape
+## Live shape (superseded 2026-10-30 — see `2026-10-30-b2-max-age-14d.md`)
 
 | Lane | Cron | Apps | Local keep | B2 dump retention | Weekly restore |
 |---|---|---|---|---|---|

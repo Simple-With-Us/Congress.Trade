@@ -238,17 +238,24 @@ done
 assert_eq "$cap_ok" yes "B2 6-week simulation never keeps a set older than 14d"
 assert_eq "$daily_ok" yes "B2 6-week simulation always has the last 3 days"
 
-# 6-hourly lane with daily/weekly mode: two weeklies must be two different Sundays.
+# Twice-daily lane (ST/CT): dailies are one set per UTC date (3 days, not 1.5),
+# and the two weeklies are two different Sundays.
 rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
-for st in 20261115T181500Z 20261115T121500Z 20261115T061500Z 20261115T001500Z \
-          20261108T181500Z 20261108T121500Z 20261101T181500Z; do
+for st in 20261115T113000Z 20261115T003000Z 20261114T113000Z 20261114T003000Z \
+          20261113T113000Z 20261113T003000Z 20261108T113000Z 20261108T003000Z \
+          20261101T113000Z 20261101T003000Z; do
   : > "$B2_FAKE/usage-monitor-${st}.db"
 done
-prune_b2_sets usage-monitor jays-usage-monitor-eu 20261115T181500Z >/dev/null
-assert_eq "$(b2_has 20261115T001500Z)" no "B2 weekly does not reuse a Sunday already kept"
-assert_eq "$(b2_has 20261108T181500Z)" yes "B2 weekly picks newest stamp of previous Sunday"
-assert_eq "$(b2_has 20261108T121500Z)" no "B2 weekly keeps one set per Sunday"
-assert_eq "$(b2_has 20261101T181500Z)" yes "B2 second weekly is the Sunday 14d back"
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261115T113000Z >/dev/null
+assert_eq "$(b2_has 20261115T113000Z)" yes "B2 2x/day daily keeps newest of day 0"
+assert_eq "$(b2_has 20261114T113000Z)" yes "B2 2x/day daily keeps newest of day 1"
+assert_eq "$(b2_has 20261113T113000Z)" yes "B2 2x/day daily keeps newest of day 2"
+assert_eq "$(b2_has 20261115T003000Z)" no "B2 2x/day drops older same-day set"
+assert_eq "$(b2_has 20261114T003000Z)" no "B2 2x/day drops older set of day 1"
+assert_eq "$(b2_has 20261108T113000Z)" yes "B2 weekly picks newest stamp of previous Sunday"
+assert_eq "$(b2_has 20261108T003000Z)" no "B2 weekly keeps one set per Sunday"
+assert_eq "$(b2_has 20261101T113000Z)" yes "B2 second weekly is the Sunday 14d back"
+assert_eq "$(b2_has 20261101T003000Z)" no "B2 drops Sunday set older than 14d"
 
 # Legacy B2_KEEP_SETS mode is capped too.
 b2_seed 20261130T064500Z 20261101T064500Z
@@ -266,6 +273,50 @@ for bad in abc 0; do
   assert_eq "$(b2_has 20261115T064500Z)" no "B2_MAX_AGE_DAYS=$bad falls back to 14"
 done
 B2_MAX_AGE_DAYS=14
+
+# Leading-zero B2_MAX_AGE_DAYS is decimal, not octal (Kody #2900).
+b2_seed 20261130T064500Z 20261115T064500Z
+B2_MAX_AGE_DAYS=08
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+assert_eq "$(b2_has 20261115T064500Z)" no "B2_MAX_AGE_DAYS=08 caps at 8 days"
+B2_MAX_AGE_DAYS=14
+
+# --- Central-time gate (Jay 2026-10-30 schedule) -------------------------
+FLEET_BACKUP_CT_HOURS="06,19"
+fleet_backup_ct_gate 06 && r=run || r=skip; assert_eq "$r" run "CT gate runs at 06 CT"
+fleet_backup_ct_gate 19 && r=run || r=skip; assert_eq "$r" run "CT gate runs at 19 CT"
+fleet_backup_ct_gate 05 && r=run || r=skip; assert_eq "$r" skip "CT gate skips off-slot 05 CT"
+fleet_backup_ct_gate 20 && r=run || r=skip; assert_eq "$r" skip "CT gate skips off-slot 20 CT"
+FLEET_BACKUP_CT_HOURS=""
+fleet_backup_ct_gate 05 && r=run || r=skip; assert_eq "$r" run "CT gate unset always runs"
+
+# Each cron line fires exactly once per Central slot across CDT and CST.
+CRON_FILE="${ROOT_DIR}/scripts/ops/fleet-backups.cron"
+cron_ct_runs() {
+  # $1 = lock name, $2 = UTC offset hours (5 CDT, 6 CST).  Prints CT HH:MM runs.
+  local line min hours gate h ct
+  line="$(grep "fleet-sqlite-backup-$1.lock" "$CRON_FILE")"
+  min="$(echo "$line" | awk '{print $1}')"
+  hours="$(echo "$line" | awk '{print $2}')"
+  gate="$(echo "$line" | grep -oE 'FLEET_BACKUP_CT_HOURS=[0-9,]+' | cut -d= -f2)"
+  for h in ${hours//,/ }; do
+    ct=$(( (10#$h - $2 + 24) % 24 ))
+    ct="$(printf '%02d' "$ct")"
+    case ",$gate," in *",$ct,"*) printf '%s:%02d\n' "$ct" "$min" ;; esac
+  done | sort | tr '\n' ' '
+}
+for off in 5 6; do
+  assert_eq "$(cron_ct_runs st "$off")" "06:30 19:30 " "cron ST runs 6:30am+7:30pm CT (UTC-$off)"
+  assert_eq "$(cron_ct_runs ct "$off")" "06:00 20:00 " "cron CT runs 6:00am+8:00pm CT (UTC-$off)"
+  assert_eq "$(cron_ct_runs um "$off")" "20:30 " "cron UM runs 8:30pm CT (UTC-$off)"
+done
+grep -q 'FLEET_BACKUP_APPS=socratic .*FLEET_BACKUP_KEEP_COUNT=4' "$CRON_FILE" && r=yes || r=no
+assert_eq "$r" yes "cron ST local keep 4"
+grep -q 'FLEET_BACKUP_APPS=congress .*FLEET_BACKUP_KEEP_COUNT=4' "$CRON_FILE" && r=yes || r=no
+assert_eq "$r" yes "cron CT local keep 4"
+grep -q 'FLEET_BACKUP_APPS=usage-monitor .*FLEET_BACKUP_KEEP_DAYS=2 FLEET_BACKUP_KEEP_COUNT=2' "$CRON_FILE" && r=yes || r=no
+assert_eq "$r" yes "cron UM local keep 2 / 2 days"
+assert_eq "$(grep -c 'B2_KEEP_DAILY=3 B2_KEEP_WEEKLY=2 B2_MAX_AGE_DAYS=14' "$CRON_FILE")" 3 "cron all lanes B2 3+2 with 14d cap"
 
 # The current set is never deleted even if its stamp parses oddly old.
 b2_seed 20261130T064500Z
