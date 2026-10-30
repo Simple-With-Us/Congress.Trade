@@ -341,3 +341,4 @@ Private evidence stays in private Fleet-OPS and is excluded from public indexes.
 - [2026-10-25-empty-fetch-handoff](../rollouts/2026-10-25-empty-fetch-handoff.md)
 - [2026-10-26-local-ocr-278t-retry](../rollouts/2026-10-26-local-ocr-278t-retry.md)
 - [2026-10-30-b2-max-age-14d](../rollouts/2026-10-30-b2-max-age-14d.md)
+- [2026-10-30-reports-index](../rollouts/2026-10-30-reports-index.md)
