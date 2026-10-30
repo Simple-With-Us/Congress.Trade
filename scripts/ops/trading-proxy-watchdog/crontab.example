@@ -1,8 +1,13 @@
 # Trading-proxy watchdog schedule: run every 2 minutes.
 # Adjust the checkout path to the deployment.  Configuration comes from
-# watchdog.env in the checkout root (see watchdog.env.example).
+# watchdog.env in the watchdog root, scripts/ops/ (see watchdog.env.example).
 #
 # */2 * * * *  $HOME/apps/Congress.Trade/scripts/ops/trading-proxy-watchdog/public-liveness-watch.sh
+#
+# Dispatch is the runner's step: after each run, if the alert file
+# scripts/ops/state/trading-proxy-alert.txt exists, post it with
+# scripts/ops/trading-proxy-watchdog/zulip-trading-alert.sh and that path.
+# The watcher only writes the file; it never posts itself.
 #
 # Production today: the VM instance runs under the fleet scheduler with
 # PUBLIC_FAIL_THRESHOLD=5, and a second instance on the home Mac runs

@@ -21,6 +21,21 @@ if [ ! -f "$ALERT_FILE" ]; then
   exit 2
 fi
 
+# The alert file's contents are posted verbatim to two streams, so confine
+# it to the watchdog state directory and cap its size -- an arbitrary local
+# path must never be postable (Kody review finding, 2026-10-30).
+STATE_DIR="${WATCHDOG_STATE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)/state}"
+alert_dir="$(cd "$(dirname "$ALERT_FILE")" 2>/dev/null && pwd)"
+if [ "$alert_dir" != "$STATE_DIR" ]; then
+  echo "alert file must live in the watchdog state dir ($STATE_DIR): $ALERT_FILE" >&2
+  exit 2
+fi
+alert_bytes="$(wc -c < "$ALERT_FILE" | tr -d ' ')"
+if [ "$alert_bytes" -gt 8192 ]; then
+  echo "alert file too large ($alert_bytes bytes): $ALERT_FILE" >&2
+  exit 2
+fi
+
 pyout=$(python3 - "$ALERT_FILE" "$DRY_RUN" <<'PYEOF'
 import configparser, json, sys, urllib.request, urllib.parse, datetime
 

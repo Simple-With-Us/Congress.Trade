@@ -65,7 +65,8 @@
 #   - Cooldown: at most one restart per RESTART_COOLDOWN_S (default 1800).
 #   - Network sanity check: if a control probe (example.com, normal egress)
 #     also fails, the outage is on OUR side -- do not restart production.
-#   - Kill switch: PUBLIC_LIVENESS_WATCH=0 or a DISABLED file next to this script.
+#   - Kill switch: PUBLIC_LIVENESS_WATCH=0 or a DISABLED file in the
+#     watchdog root (the directory above the folder holding this script).
 #
 # State: <script-dir>/../state/public-liveness.state  (consecutive_failures,
 #   consecutive_proxy_failures, last_restart_epoch)
@@ -85,8 +86,9 @@ LOG_FILE="$LOG_DIR/public-liveness.log"
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
 # Local configuration (host addresses, credential file paths) lives in
-# watchdog.env in the checkout root -- never committed.  See
-# watchdog.env.example for the full list.  Values there win over the
+# watchdog.env in the watchdog root (the parent directory of the folder
+# holding the scripts) -- never committed.  See watchdog.env.example for
+# the full list.  Values there win over the
 # defaults below because every assignment uses the ${VAR:-default} form.
 if [ -f "$ROOT_DIR/watchdog.env" ]; then
   # shellcheck disable=SC1091
@@ -123,7 +125,14 @@ tailnet_proxy() {
   # through it as an HTTP CONNECT tunnel.
   local hp="${HTTPS_PROXY:-${https_proxy:-}}"
   [ -n "$hp" ] || return 1
-  echo "${hp%:*}:3130"
+  hp="${hp#*://}"
+  hp="${hp%%/*}"
+  case "$hp" in
+    *:*)
+      hp="${hp%:*}"
+      ;;
+  esac
+  echo "http://${hp}:3130"
 }
 
 # --- hop decomposition (2026-10-09) ------------------------------------------
@@ -192,11 +201,11 @@ tailscale_note() {
 #             it can reach the Mango itself.
 # Retry: a leg miss sleeps 10s and retries that leg once.  A miss that clears
 # on retry is transient (logged, silent).  A miss that fails twice is a
-# confirmed failure: exactly one Slack alert per incident, naming the hop and
+# confirmed failure: exactly one Zulip alert per incident, naming the hop and
 # carrying the latest proxy-use reading.  State: trading_proxy_incident
 # ("leg:epoch" while an incident is open), trading_proxy_last_resolve,
 # trading_proxy_flaps.  The alert payload is written to
-# $TPX_ALERT_FILE for the cron worker to post to Slack.
+# $TPX_ALERT_FILE for the runner to post via zulip-trading-alert.sh.
 TPX_ALERT_FILE="$STATE_DIR/trading-proxy-alert.txt"
 TPX_RETRY_SLEEP=10
 TPX_FLAP_WINDOW_S=1800
@@ -297,7 +306,7 @@ else:
 " 2>/dev/null || echo "unknown"
 }
 
-# build_tpx_alert hop detail flap_note: write the ready-to-post Slack message.
+# build_tpx_alert hop detail flap_note: write the ready-to-post alert message.
 build_tpx_alert() {
   local hop="$1" detail="$2" flap_note="$3" hop_name
   if [ "$hop" = "leg1" ]; then
@@ -376,8 +385,7 @@ check_trading_proxy_path() {
     if [ "$rc" = "0" ]; then
       :
     elif [ "$rc" = "2" ]; then
-      log "trading-proxy: leg2 not assessable (endpoint unavailable); skipping"
-      handle_tpx_recovery
+      log "trading-proxy: leg2 not assessable (endpoint unavailable); skipping, incident left open"
       return 0
     else
       sleep "$TPX_RETRY_SLEEP"
@@ -386,8 +394,7 @@ check_trading_proxy_path() {
       if [ "$rc" = "0" ]; then
         log "trading-proxy: leg2 (Coolify->Mango) miss cleared on retry; transient, silent"
       elif [ "$rc" = "2" ]; then
-        log "trading-proxy: leg2 not assessable on retry; skipping"
-        handle_tpx_recovery
+        log "trading-proxy: leg2 not assessable on retry; skipping, incident left open"
         return 0
       else
         failed_hop="leg2"
@@ -413,16 +420,30 @@ read_state() {
   tpx_last_resolve=0
   tpx_flaps=0
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$STATE_FILE" 2>/dev/null || true
-    consec="${consecutive_failures:-0}"
-    consec_dest="${consecutive_dest_transport_failures:-0}"
-    proxy_consec="${consecutive_proxy_failures:-0}"
-    last_restart="${last_restart_epoch:-0}"
-    last_hop="${last_proxy_hop:-}"
-    tpx_incident="${trading_proxy_incident:-}"
-    tpx_last_resolve="${trading_proxy_last_resolve:-0}"
-    tpx_flaps="${trading_proxy_flaps:-0}"
+    # Parse fixed key=value lines; never source the state file -- a poisoned
+    # state file must not become code execution in the watchdog user.
+    local key value
+    while IFS='=' read -r key value; do
+      case "$key" in
+        consecutive_failures) consec="$value" ;;
+        consecutive_dest_transport_failures) consec_dest="$value" ;;
+        consecutive_proxy_failures) proxy_consec="$value" ;;
+        last_restart_epoch) last_restart="$value" ;;
+        last_proxy_hop) last_hop="$value" ;;
+        trading_proxy_incident) tpx_incident="$value" ;;
+        trading_proxy_last_resolve) tpx_last_resolve="$value" ;;
+        trading_proxy_flaps) tpx_flaps="$value" ;;
+      esac
+    done < "$STATE_FILE"
+    # Sanitize: counters and epochs are numeric; hop and incident are enums.
+    case "$consec" in *[!0-9]*|"") consec=0 ;; esac
+    case "$consec_dest" in *[!0-9]*|"") consec_dest=0 ;; esac
+    case "$proxy_consec" in *[!0-9]*|"") proxy_consec=0 ;; esac
+    case "$last_restart" in *[!0-9]*|"") last_restart=0 ;; esac
+    case "$tpx_last_resolve" in *[!0-9]*|"") tpx_last_resolve=0 ;; esac
+    case "$tpx_flaps" in *[!0-9]*|"") tpx_flaps=0 ;; esac
+    case "$last_hop" in hop1|hop2) ;; *) last_hop="" ;; esac
+    case "$tpx_incident" in leg1:*|leg2:*) ;; *) tpx_incident="" ;; esac
   fi
 }
 
@@ -499,7 +520,7 @@ hop="$last_hop"
 
 # The trading-proxy (VM->Coolify->Mango) check runs once per invocation, after
 # the liveness logic below has written its state.  It is independent of the
-# liveness result and owns its own alerting (one Slack alert per incident).
+# liveness result and owns its own alerting (one Zulip alert per incident).
 trap 'check_trading_proxy_path' EXIT
 
 if probe_target; then
@@ -512,8 +533,11 @@ if probe_target; then
   if [ "$proxy_consec" -gt 0 ]; then
     log "recovered: tailnet proxy path healthy again after $proxy_consec consecutive proxy-path failures"
   fi
+  consec=0
   consec_dest=0
-  write_state 0 0 "$last_restart" ""
+  proxy_consec=0
+  hop=""
+  write_state "$consec" "$proxy_consec" "$last_restart" ""
   exit 0
 fi
 
@@ -594,12 +618,19 @@ proxy="$(tailnet_proxy)" || {
 }
 
 log "RESTARTING Coolify app $APP_UUID after $consec consecutive site failures"
+# The bearer token travels in a mode-600 curl config file, never in argv
+# (argv is visible to other users on the host in ps).
+auth_cfg="$(mktemp)"
+chmod 600 "$auth_cfg"
+printf 'header = "Authorization: Bearer %s"\n' "$token" > "$auth_cfg"
 resp="$(curl -s -m 30 -X POST \
   --proxy "$proxy" \
-  -H "Authorization: Bearer $token" \
+  -K "$auth_cfg" \
   -H "Accept: application/json" \
   "$COOLIFY_API/applications/$APP_UUID/restart" 2>&1 || echo "CURL_FAILED")"
+rm -f "$auth_cfg"
 log "restart API response: $(echo "$resp" | head -c 300)"
-write_state 0 "$proxy_consec" "$now" "$hop"
+consec=0
+write_state "$consec" "$proxy_consec" "$now" "$hop"
 log "restart issued; site-failure counter reset, cooldown until +${COOLDOWN_S}s"
 exit 0
