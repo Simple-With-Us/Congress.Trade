@@ -354,7 +354,7 @@ struct AdminPanelView: View {
         let pipeline = store.publicHealth?.pipeline
         Section("Senate Egress") {
             AdminStatusRow(title: "Residential Proxy", check: pipeline?.check(id: "senate_relay").map(PipelineCheckProxy.init))
-            AdminStatusRow(title: "Senate eFD Direct", check: pipeline?.check(id: "senate_efd").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Senate eFD", check: pipeline?.check(id: "senate_efd").map(PipelineCheckProxy.init))
         }
     }
 
@@ -431,7 +431,7 @@ private enum AdminPipelineCheckTitles {
         switch id {
         case "st_peer_prices": return "ST → CT Peer Prices"
         case "price_freshness": return "Price / S&P Freshness"
-        case "senate_efd": return "Senate eFD Direct"
+        case "senate_efd": return "Senate eFD"
         case "senate_relay": return "Residential Proxy"
         default:
             return id.split(separator: "_").map { $0.capitalized }.joined(separator: " ")
