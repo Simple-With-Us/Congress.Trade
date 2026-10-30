@@ -2,7 +2,7 @@
 
 ## Summary
 
-Added an in-repo reports index at docs/reports/README.md.  It links existing eligible reports in their canonical paths; docs/reports/2026-10-15-CT-2408-verification.md remains unchanged.  Central placement under Code/Docs/Congress.Trade/ is pending the native guard exception.
+Added an in-repo reports index at docs/reports/README.md.  It links existing eligible reports in their canonical paths; docs/reports/2026-10-15-CT-2408-verification.md remains unchanged.  At publication time, central placement under Code/Docs/Congress.Trade/ was pending; the dated update below records the completed placement.
 
 ## Files Changed
 
@@ -21,4 +21,6 @@ Added an in-repo reports index at docs/reports/README.md.  It links existing el
 
 ## Follow-ups
 
-- Central placement remains pending the native guard exception.
+### Placement update — 2026-10-30
+
+The owner-approved docs-only exception is installed, and central collection under Code/Docs/Congress.Trade/ is populated.  The collector and protocol are live in AI-Fleet-Coordinator main at `691f4a3c`.  The 16-repo collection check reported zero planned changes; protected Git checkouts remain unchanged.  No placement follow-up remains.
