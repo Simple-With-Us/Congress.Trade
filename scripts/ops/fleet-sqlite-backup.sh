@@ -2,11 +2,13 @@
 # Consistent SQLite snapshots for fleet apps + optional off-host copy.
 # Complements Hetzner daily host backups (RPO ~24h host-level).
 #
-# Per-app split (Jay 2026-10-05 correction): Usage-Monitor alone is daily with
-# daily+weekly B2 retention (default 3+2 since Jay 2026-10-29: at most ~2 weeks).  Socratic.Trade and Congress.Trade stay on the previous
-# 6-hourly keep-2 cadence until Jay decides separately.  Select apps with
-# FLEET_BACKUP_APPS=socratic,congress,usage-monitor (comma-separated).
-# Cron: /etc/cron.d/fleet-backups (two dump lines + weekly UM-only verify).
+# Per-app lanes (Jay 2026-10-30): one cron lane per app, Central-time slots
+# (ST 6:30am + 7:30pm, CT 6:00am + 8:00pm, UM 8:30pm), local keep 2 days
+# (ST 4, CT 4, UM 2), B2 3 dailies + 2 weeklies with a hard 14-day max age.
+# Select apps with FLEET_BACKUP_APPS=socratic,congress,usage-monitor.
+# Cron: /etc/cron.d/fleet-backups (three dump lines + weekly UM-only verify).
+# The host runs on America/Chicago, so cron times are Central directly.
+# FLEET_BACKUP_CT_HOURS is an optional extra gate (unset in the shipped cron).
 #
 # Hardening (2026-09-06, board e1f66898):
 #   1) in-script flock -n single-flight (same path as the host cron wrapper)
@@ -17,6 +19,12 @@
 #   4) VACUUM INTO instead of sqlite3 .backup -- online backup never converges on
 #      the ~11 GB ST DB under continuous writers
 #   5) a timed-out or failed dump ALERTS and returns non-zero (never return 0)
+# B2 compression (Jay 2026-10-30): each run's dump set is zstd-compressed for
+#   the B2 upload only (`<name>-<STAMP>.db.zst`, plus the raw-db `.db.sha256`).
+#   Local dumps stay plain `.db` (weekly verify + local restore unchanged).
+#   Restore from B2:  zstd -d X-<STAMP>.db.zst -o X-<STAMP>.db, then
+#   PRAGMA integrity_check.  Older B2 sets stay plain `.db`; prune handles both.
+#   FLEET_BACKUP_B2_COMPRESS=0, or no zstd on PATH, uploads raw (old behavior).
 # Host install after merge: /usr/local/sbin/fleet-sqlite-backup.sh on
 # fleet-hetzner-nbg1 (apply on top of the UUID-pinned host copy; do not
 # overwrite wholesale).  Not a Coolify image bake.
@@ -149,7 +157,7 @@ backup_one() {
   fi
   # integrity + checksum: sha256 is the completeness marker for retention
   if sqlite3 "$dest" "PRAGMA integrity_check;" | head -1 | grep -qx ok; then
-    echo "[fleet-backup] OK $name -> $dest ($(du -h "$dest" | awk '{print $1}'))"
+    echo "[fleet-backup] OK $name -> $dest ($(du -h "$dest" | awk '{print $1}')) at $(fleet_ct_label)"
     sha256sum "$dest" > "${dest}.sha256"
   else
     echo "[fleet-backup] FAIL $name integrity not clean: $dest"
@@ -170,8 +178,16 @@ prune_incomplete_dumps() {
       if dump_is_complete "$f"; then
         continue
       fi
-      echo "[fleet-backup] prune-incomplete $f"
+      echo "[fleet-backup] prune-incomplete $f at $(fleet_ct_label)"
       rm -f "$f" "${f}.sha256" "${f}-journal" "${f}-wal"
+    done
+    # .zst / .zst.partial are transient B2-upload copies (upload_b2_set removes
+    # them after each upload).  Any left here came from an interrupted run;
+    # this runs before the current run compresses anything, so drop them all.
+    for f in "$dir"/*.zst "$dir"/*.zst.partial; do
+      [ -f "$f" ] || continue
+      echo "[fleet-backup] prune-stale-zst $f at $(fleet_ct_label)"
+      rm -f "$f"
     done
   done
 }
@@ -193,14 +209,14 @@ prune_by_age() {
     [ -d "$dir" ] || continue
     find "$dir" -type f -name '*.db' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r f; do
       dump_is_complete "$f" || continue
-      echo "[fleet-backup] prune-age $f"
+      echo "[fleet-backup] prune-age $f at $(fleet_ct_label)"
       rm -f "$f" "${f}.sha256"
     done || true
     find "$dir" -type f -name '*.sqlite' -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null || true
     find "$dir" -type f -name '*.sha256' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r s; do
       db="${s%.sha256}"
       if [ ! -f "$db" ]; then
-        echo "[fleet-backup] prune-age-orphan $s"
+        echo "[fleet-backup] prune-age-orphan $s at $(fleet_ct_label)"
         rm -f "$s"
       fi
     done || true
@@ -231,7 +247,7 @@ prune_by_keep_count() {
       dump_is_complete "$f" || continue
       n=$((n + 1))
       if [ "$n" -gt "$KEEP_COUNT" ]; then
-        echo "[fleet-backup] prune-count $f"
+        echo "[fleet-backup] prune-count $f at $(fleet_ct_label)"
         rm -f "$f" "${f}.sha256"
       fi
     done || true
@@ -248,8 +264,299 @@ apply_local_retention() {
   prune_by_keep_count
 }
 
+# B2-side prune (defined above the LIB_ONLY return so the offline test can
+# source it; CLAUDE 2026-08-31; retention rewrite Jay 2026-10-05; defaults
+# 3+2 Jay 2026-10-29 to match the fleet "3 days short-term, at most 2 weeks"
+# privacy copy): keep ~3 daily + ~2 weekly dump sets under hetzner/ and delete older dump
+# sets.  NEVER touches Litestream prefixes (trading-live/, congress-trade/,
+# api-usage-monitor/) or qdrant/ under hetzner/.  A set = the .db/.sqlite
+# files + .sha256 sidecars sharing one YYYYMMDDTHHMMSSZ stamp.
+# Deletes go through rclone delete --include against the native [b2] remote
+# (Class A, free).  Best-effort: a prune failure must never fail the backup
+# run (callers append "|| true").
+#
+# Env:
+#   B2_KEEP_DAILY   newest N UTC days to keep one dump set from (newest set of
+#                   each day; default 3)
+#   B2_KEEP_WEEKLY  additional Sunday-UTC dump sets to keep (default 2)
+#   B2_KEEP_SETS    legacy total-newest fallback; if set, keep newest N only and
+#                   ignore B2_KEEP_DAILY / B2_KEEP_WEEKLY (ST+CT cron sets 2)
+#   B2_MAX_AGE_DAYS hard age cap (default 14, Jay 2026-10-30: "the 2 weeks
+#                   counts from day 1").  Any dump set whose stamp is more than
+#                   N days older than the current run's stamp is deleted no
+#                   matter what the keep counts say, so the ~2-week weekly copy
+#                   is never more than 14 days old.  Applies to every mode,
+#                   including B2_KEEP_SETS.  Must be an integer >= 1; anything
+#                   else falls back to 14 (the cap is never disabled).
+# Weekly picks are one set per distinct Sunday (UTC) date, newest stamp of that
+# day, skipping Sunday dates already covered by a daily.  With daily runs that lands the
+# weekly copies at roughly 1-7 and 8-14 days old.
+# Host env/cron values override these defaults; a default change here does
+# nothing for a lane whose cron line sets its own values.
+B2_KEEP_DAILY="${B2_KEEP_DAILY:-3}"
+B2_KEEP_WEEKLY="${B2_KEEP_WEEKLY:-2}"
+B2_KEEP_SETS="${B2_KEEP_SETS:-}"
+B2_MAX_AGE_DAYS="${B2_MAX_AGE_DAYS:-14}"
+# Epoch seconds for a YYYYMMDDTHHMMSSZ stamp; empty on parse failure.
+b2_stamp_epoch() {
+  local st="$1"
+  date -u -d "${st:0:4}-${st:4:2}-${st:6:2} ${st:9:2}:${st:11:2}:${st:13:2}" +%s 2>/dev/null || true
+}
+# Log label (Jay 2026-10-30): UTC stamp plus Central wall time with offset,
+# e.g. "20261030T113000Z (6:30am CDT, -05:00)".  Log lines only; file and
+# object names stay plain UTC ...Z stamps.  $1 = stamp (default: now).
+fleet_ct_label() {
+  local st="${1:-}" epoch
+  if [ -z "$st" ]; then
+    st="$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  epoch="$(b2_stamp_epoch "$st")"
+  if [ -z "$epoch" ]; then
+    printf '%s' "$st"
+    return 0
+  fi
+  printf '%s (%s)' "$st" "$(TZ=America/Chicago date -d "@${epoch}" '+%-I:%M%P %Z, %:z' 2>/dev/null || echo 'Central n/a')"
+}
+prune_b2_sets() {
+  local app="$1" bucket="$2" current_stamp="$3"
+  local listing stamps_all stamp name kept_count deleted_count set_fail
+  local keep_daily="$B2_KEEP_DAILY" keep_weekly="$B2_KEEP_WEEKLY"
+  local dow weekly_kept stamp_day max_age_days now_epoch stamp_epoch max_age_secs
+  local -A WEEKLY_DAYS=() DAILY_DAYS=()
+  local daily_kept
+  # Only ever touch the hetzner/ prefix of the three known fleet buckets.
+  case "$bucket" in
+    jays-congress-trade-eu|jays-socratic-trade-eu|jays-usage-monitor-eu) ;;
+    *) echo "[fleet-backup] B2 prune SKIP: unexpected bucket $bucket for $app"; return 0 ;;
+  esac
+  if [ -n "$B2_KEEP_SETS" ]; then
+    case "$B2_KEEP_SETS" in
+      ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_SETS=$B2_KEEP_SETS"; return 0 ;;
+    esac
+    if [ "$B2_KEEP_SETS" -lt 1 ]; then
+      echo "[fleet-backup] B2 prune SKIP: B2_KEEP_SETS must be >= 1 (got $B2_KEEP_SETS)"
+      return 0
+    fi
+  fi
+  case "$keep_daily" in
+    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_DAILY=$keep_daily"; return 0 ;;
+  esac
+  case "$keep_weekly" in
+    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_WEEKLY=$keep_weekly"; return 0 ;;
+  esac
+  if [ "$keep_daily" -lt 1 ]; then
+    echo "[fleet-backup] B2 prune SKIP: B2_KEEP_DAILY must be >= 1 (got $keep_daily)"
+    return 0
+  fi
+  max_age_days="$B2_MAX_AGE_DAYS"
+  case "$max_age_days" in
+    ''|*[!0-9]*) echo "[fleet-backup] B2 prune WARN: non-numeric B2_MAX_AGE_DAYS=$max_age_days; using 14"; max_age_days=14 ;;
+  esac
+  if [ "$max_age_days" -lt 1 ]; then
+    echo "[fleet-backup] B2 prune WARN: B2_MAX_AGE_DAYS must be >= 1 (got $max_age_days); using 14"
+    max_age_days=14
+  fi
+  max_age_days=$((10#$max_age_days))
+  max_age_secs=$((max_age_days * 86400))
+  # Age is measured from the current run's stamp (the set just uploaded), so
+  # tests are deterministic and a slow run cannot shift the cutoff.
+  now_epoch="$(b2_stamp_epoch "$current_stamp")"
+  [ -n "$now_epoch" ] || now_epoch="$(date -u +%s)"
+  if ! listing="$(rclone lsf "b2:${bucket}/hetzner/" --files-only 2>/dev/null)"; then
+    echo "[fleet-backup] B2 prune SKIP: listing failed for $app"
+    return 0
+  fi
+  if [ -z "$listing" ]; then
+    echo "[fleet-backup] B2 prune SKIP: empty listing for $app"
+    return 0
+  fi
+  while read -r name; do
+    [ -n "$name" ] || continue
+    case "$name" in
+      *.snapshot|*.snapshot.sha256) continue ;;
+    esac
+    if ! printf '%s\n' "$name" | grep -qE '[0-9]{8}T[0-9]{6}Z'; then
+      echo "[fleet-backup] B2 prune WARN: unparseable name skipped: $name"
+    fi
+  done <<< "$listing"
+  # Newest-first distinct stamps from dump-like names only (plain .db/.sqlite
+  # sets from before 2026-10-30 and .db.zst/.sqlite.zst sets after).
+  stamps_all="$(printf '%s\n' "$listing" \
+    | grep -E '\.(db|sqlite)(\.zst)?(\.sha256)?$' \
+    | grep -oE '[0-9]{8}T[0-9]{6}Z' \
+    | sort -u -r)"
+  if [ -z "$stamps_all" ]; then
+    echo "[fleet-backup] B2 prune SKIP: no parseable snapshot sets for $app"
+    return 0
+  fi
+
+  declare -A KEEP_STAMPS=()
+  kept_count=0
+  if [ -n "$B2_KEEP_SETS" ]; then
+    while read -r stamp; do
+      [ -n "$stamp" ] || continue
+      KEEP_STAMPS["$stamp"]=1
+      kept_count=$((kept_count + 1))
+      [ "$kept_count" -ge "$B2_KEEP_SETS" ] && break
+    done <<< "$stamps_all"
+  else
+    # Dailies: the newest set of each of the newest N distinct UTC dates, so a
+    # lane that dumps twice a day still keeps ~N days, not N/2.
+    daily_kept=0
+    while read -r stamp; do
+      [ -n "$stamp" ] || continue
+      stamp_day="${stamp:0:8}"
+      [ -n "${DAILY_DAYS[$stamp_day]:-}" ] && continue
+      DAILY_DAYS["$stamp_day"]=1
+      KEEP_STAMPS["$stamp"]=1
+      # A Sunday already covered by a daily does not need a weekly too.
+      WEEKLY_DAYS["$stamp_day"]=1
+      kept_count=$((kept_count + 1))
+      daily_kept=$((daily_kept + 1))
+      [ "$daily_kept" -ge "$keep_daily" ] && break
+    done <<< "$stamps_all"
+    weekly_kept=0
+    while read -r stamp; do
+      [ -n "$stamp" ] || continue
+      [ -n "${KEEP_STAMPS[$stamp]:-}" ] && continue
+      dow="$(date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}" +%u 2>/dev/null || true)"
+      [ "$dow" = "7" ] || continue
+      # One weekly per Sunday date: 6-hourly lanes would otherwise spend both
+      # weekly slots on the same Sunday.
+      stamp_day="${stamp:0:8}"
+      [ -n "${WEEKLY_DAYS[$stamp_day]:-}" ] && continue
+      WEEKLY_DAYS["$stamp_day"]=1
+      KEEP_STAMPS["$stamp"]=1
+      weekly_kept=$((weekly_kept + 1))
+      kept_count=$((kept_count + 1))
+      [ "$weekly_kept" -ge "$keep_weekly" ] && break
+    done <<< "$stamps_all"
+  fi
+
+  # Hard age cap: drop any kept set older than max_age_days (never the
+  # current set; the delete loop below also refuses that).
+  while read -r stamp; do
+    [ -n "$stamp" ] || continue
+    [ -n "${KEEP_STAMPS[$stamp]:-}" ] || continue
+    [ "$stamp" = "$current_stamp" ] && continue
+    stamp_epoch="$(b2_stamp_epoch "$stamp")"
+    [ -n "$stamp_epoch" ] || continue
+    if [ $((now_epoch - stamp_epoch)) -gt "$max_age_secs" ]; then
+      unset "KEEP_STAMPS[$stamp]"
+      kept_count=$((kept_count - 1))
+      echo "[fleet-backup] B2 prune age-cap: $(fleet_ct_label "$stamp") older than ${max_age_days}d for $app"
+    fi
+  done <<< "$stamps_all"
+
+  deleted_count=0
+  while read -r stamp; do
+    [ -n "$stamp" ] || continue
+    [ -n "${KEEP_STAMPS[$stamp]:-}" ] && continue
+    if [ "$stamp" = "$current_stamp" ]; then
+      echo "[fleet-backup] B2 prune SKIP: refusing to delete current set $stamp for $app"
+      continue
+    fi
+    set_fail=0
+    while read -r name; do
+      [ -n "$name" ] || continue
+      rclone delete "b2:${bucket}/hetzner/" --include "/${name}" 2>/dev/null || true
+      if rclone lsf "b2:${bucket}/hetzner/" --files-only 2>/dev/null | grep -qxF "$name"; then
+        echo "[fleet-backup] B2 prune WARN: delete failed: $name"
+        set_fail=1
+      fi
+    done <<< "$(printf '%s\n' "$listing" | grep -F "$stamp" || true)"
+    if [ "$set_fail" = "0" ]; then
+      deleted_count=$((deleted_count + 1))
+    fi
+  done <<< "$stamps_all"
+  echo "[fleet-backup] B2 prune OK: $app kept=${kept_count} deleted=${deleted_count} (daily=${keep_daily} weekly=${keep_weekly} max_age_days=${max_age_days}) at $(fleet_ct_label)"
+  return 0
+}
+
+# Optional Central-time gate (Jay 2026-10-30).  Originally each cron line fired
+# at both UTC candidates (CDT and CST) and this gate let only the matching
+# America/Chicago hour through.  The host now runs on America/Chicago, so the
+# shipped cron leaves it unset; kept for UTC hosts and manual use.  FLEET_BACKUP_CT_HOURS is a comma list of 2-digit hours, e.g.
+# "06,19".  Unset = no gate (manual runs).  If the zoneinfo file is missing
+# the gate fails OPEN (runs) so a tzdata problem cannot silently stop backups.
+FLEET_BACKUP_CT_HOURS="${FLEET_BACKUP_CT_HOURS:-}"
+fleet_backup_ct_gate() {
+  local hour="${1:-}"
+  [ -n "$FLEET_BACKUP_CT_HOURS" ] || return 0
+  if [ -z "$hour" ]; then
+    if [ ! -e /usr/share/zoneinfo/America/Chicago ]; then
+      echo "[fleet-backup] WARN: no America/Chicago zoneinfo; CT gate open" >&2
+      return 0
+    fi
+    hour="$(TZ=America/Chicago date +%H)"
+  fi
+  case ",${FLEET_BACKUP_CT_HOURS// /}," in
+    *",${hour},"*) return 0 ;;
+  esac
+  return 1
+}
+
+# zstd the current run's dumps for the B2 upload (Jay 2026-10-30).  Writes
+# <file>.zst next to each <file> (via .zst.partial + zstd -t, so a torn file
+# never gets the final name).  Returns 0 only if every file compressed and
+# tested clean; on any failure it removes its .zst output and returns 1 so the
+# caller uploads the raw set instead.  nice + 2 threads: the box also runs ST.
+FLEET_BACKUP_B2_COMPRESS="${FLEET_BACKUP_B2_COMPRESS:-1}"
+FLEET_BACKUP_ZSTD_LEVEL="${FLEET_BACKUP_ZSTD_LEVEL:-3}"
+compress_offsite_set() {
+  local dir="$1" stamp="$2" f lvl made=()
+  [ "$FLEET_BACKUP_B2_COMPRESS" = "1" ] || return 1
+  if ! command -v zstd >/dev/null 2>&1; then
+    echo "[fleet-backup] WARN zstd missing; uploading raw dumps"
+    return 1
+  fi
+  lvl="$FLEET_BACKUP_ZSTD_LEVEL"
+  case "$lvl" in ''|*[!0-9]*) lvl=3 ;; esac
+  for f in "$dir"/*"${stamp}".db "$dir"/*"${stamp}".sqlite; do
+    [ -f "$f" ] || continue
+    rm -f "${f}.zst" "${f}.zst.partial"
+    if nice -n 10 zstd -q -T2 -"$lvl" "$f" -o "${f}.zst.partial" \
+      && nice -n 10 zstd -q -t "${f}.zst.partial" \
+      && mv -f "${f}.zst.partial" "${f}.zst"; then
+      made+=("${f}.zst")
+      echo "[fleet-backup] zstd $(basename "$f") $(du -h "$f" | awk '{print $1}') -> $(du -h "${f}.zst" | awk '{print $1}') at $(fleet_ct_label)"
+    else
+      echo "[fleet-backup] WARN zstd failed for $(basename "$f"); uploading raw dumps"
+      rm -f "${f}.zst.partial" "${made[@]}"
+      return 1
+    fi
+  done
+  [ "${#made[@]}" -gt 0 ] || return 1
+  return 0
+}
+
+# Upload this run's set to b2:<bucket>/hetzner/.  Compressed: only .zst files
+# plus the raw-db .sha256 sidecars.  Raw fallback: the whole set as before.
+# Local .zst copies are removed after a successful upload (local retention
+# keeps plain .db; prune_incomplete_dumps clears any leftover .zst).
+upload_b2_set() {
+  local dir="$1" bucket="$2" stamp="$3" rc=0
+  if compress_offsite_set "$dir" "$stamp"; then
+    rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*.zst" --include "*${stamp}*.sha256" --transfers 2 -q || rc=$?
+    # Keep the verified .zst after a failed upload for a manual retry; the next
+    # run's prune_incomplete_dumps removes it, so at most one set lingers.
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$dir"/*"${stamp}"*.zst
+    fi
+  else
+    # compress_offsite_set already removed any partial .zst output.
+    rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*" --transfers 2 -q || rc=$?
+  fi
+  return "$rc"
+}
+
 if [ "${FLEET_BACKUP_LIB_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
+fi
+
+if ! fleet_backup_ct_gate; then
+  # Off-slot UTC candidate (other side of DST): nothing to do.
+  exit 0
 fi
 
 # Single-flight: same inode as the host cron wrapper
@@ -277,7 +584,7 @@ BACKUP_FAILED=0
 LOG="/var/log/fleet-backup/sqlite-${STAMP}.log"
 mkdir -p "$ROOT" /var/log/fleet-backup
 exec > >(tee -a "$LOG") 2>&1
-echo "[fleet-backup] start $STAMP apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-}"
+echo "[fleet-backup] start $(fleet_ct_label "$STAMP") apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-} b2_max_age_days=${B2_MAX_AGE_DAYS:-} ct_hours=${FLEET_BACKUP_CT_HOURS:-}"
 
 if ! backup_apps_selected; then
   exit 1
@@ -347,7 +654,7 @@ fi
 # default 2d) AND keep-count (FLEET_BACKUP_KEEP_COUNT, default 2 newest COMPLETE
 # .db per app dir)
 apply_local_retention
-echo "[fleet-backup] done $STAMP"
+echo "[fleet-backup] done $(fleet_ct_label "$STAMP") finished $(fleet_ct_label)"
 df -h /data / | tail -5
 
 # ---- Off-host replication (MONET 2026-08-09) --------------------------------
@@ -360,136 +667,6 @@ declare -A B2_BUCKET=( [congress]="jays-congress-trade-eu" [socratic]="jays-socr
 # (fixed 2026-08-12: previous code pushed to "r2:<b2-bucket-name>/weekly/", a
 # bucket name that only exists on B2, so the R2 weekly leg silently failed).
 declare -A R2_BUCKET=( [congress]="congress-trade-bucket" )
-
-# B2-side prune (CLAUDE 2026-08-31; retention rewrite Jay 2026-10-05; defaults
-# 3+2 Jay 2026-10-29 to match the fleet "3 days short-term, at most 2 weeks"
-# privacy copy): keep ~3 daily + ~2 weekly dump sets under hetzner/ and delete older dump
-# sets.  NEVER touches Litestream prefixes (trading-live/, congress-trade/,
-# api-usage-monitor/) or qdrant/ under hetzner/.  A set = the .db/.sqlite
-# files + .sha256 sidecars sharing one YYYYMMDDTHHMMSSZ stamp.
-# Deletes go through rclone delete --include against the native [b2] remote
-# (Class A, free).  Best-effort: a prune failure must never fail the backup
-# run (callers append "|| true").
-#
-# Env:
-#   B2_KEEP_DAILY   newest N dump sets to keep (default 3)
-#   B2_KEEP_WEEKLY  additional Sunday-UTC dump sets to keep (default 2)
-#   B2_KEEP_SETS    legacy total-newest fallback; if set, keep newest N only and
-#                   ignore B2_KEEP_DAILY / B2_KEEP_WEEKLY (ST+CT cron sets 2)
-# Host env/cron values override these defaults; a default change here does
-# nothing for a lane whose cron line sets its own values.
-B2_KEEP_DAILY="${B2_KEEP_DAILY:-3}"
-B2_KEEP_WEEKLY="${B2_KEEP_WEEKLY:-2}"
-B2_KEEP_SETS="${B2_KEEP_SETS:-}"
-prune_b2_sets() {
-  local app="$1" bucket="$2" current_stamp="$3"
-  local listing stamps_all stamp name kept_count deleted_count set_fail
-  local keep_daily="$B2_KEEP_DAILY" keep_weekly="$B2_KEEP_WEEKLY"
-  local dow weekly_kept
-  # Only ever touch the hetzner/ prefix of the three known fleet buckets.
-  case "$bucket" in
-    jays-congress-trade-eu|jays-socratic-trade-eu|jays-usage-monitor-eu) ;;
-    *) echo "[fleet-backup] B2 prune SKIP: unexpected bucket $bucket for $app"; return 0 ;;
-  esac
-  if [ -n "$B2_KEEP_SETS" ]; then
-    case "$B2_KEEP_SETS" in
-      ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_SETS=$B2_KEEP_SETS"; return 0 ;;
-    esac
-    if [ "$B2_KEEP_SETS" -lt 1 ]; then
-      echo "[fleet-backup] B2 prune SKIP: B2_KEEP_SETS must be >= 1 (got $B2_KEEP_SETS)"
-      return 0
-    fi
-  fi
-  case "$keep_daily" in
-    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_DAILY=$keep_daily"; return 0 ;;
-  esac
-  case "$keep_weekly" in
-    ''|*[!0-9]*) echo "[fleet-backup] B2 prune SKIP: non-numeric B2_KEEP_WEEKLY=$keep_weekly"; return 0 ;;
-  esac
-  if [ "$keep_daily" -lt 1 ]; then
-    echo "[fleet-backup] B2 prune SKIP: B2_KEEP_DAILY must be >= 1 (got $keep_daily)"
-    return 0
-  fi
-  if ! listing="$(rclone lsf "b2:${bucket}/hetzner/" --files-only 2>/dev/null)"; then
-    echo "[fleet-backup] B2 prune SKIP: listing failed for $app"
-    return 0
-  fi
-  if [ -z "$listing" ]; then
-    echo "[fleet-backup] B2 prune SKIP: empty listing for $app"
-    return 0
-  fi
-  while read -r name; do
-    [ -n "$name" ] || continue
-    case "$name" in
-      *.snapshot|*.snapshot.sha256) continue ;;
-    esac
-    if ! printf '%s\n' "$name" | grep -qE '[0-9]{8}T[0-9]{6}Z'; then
-      echo "[fleet-backup] B2 prune WARN: unparseable name skipped: $name"
-    fi
-  done <<< "$listing"
-  # Newest-first distinct stamps from dump-like names only.
-  stamps_all="$(printf '%s\n' "$listing" \
-    | grep -E '\.(db|sqlite)(\.sha256)?$' \
-    | grep -oE '[0-9]{8}T[0-9]{6}Z' \
-    | sort -u -r)"
-  if [ -z "$stamps_all" ]; then
-    echo "[fleet-backup] B2 prune SKIP: no parseable snapshot sets for $app"
-    return 0
-  fi
-
-  declare -A KEEP_STAMPS=()
-  kept_count=0
-  if [ -n "$B2_KEEP_SETS" ]; then
-    while read -r stamp; do
-      [ -n "$stamp" ] || continue
-      KEEP_STAMPS["$stamp"]=1
-      kept_count=$((kept_count + 1))
-      [ "$kept_count" -ge "$B2_KEEP_SETS" ] && break
-    done <<< "$stamps_all"
-  else
-    while read -r stamp; do
-      [ -n "$stamp" ] || continue
-      KEEP_STAMPS["$stamp"]=1
-      kept_count=$((kept_count + 1))
-      [ "$kept_count" -ge "$keep_daily" ] && break
-    done <<< "$stamps_all"
-    weekly_kept=0
-    while read -r stamp; do
-      [ -n "$stamp" ] || continue
-      [ -n "${KEEP_STAMPS[$stamp]:-}" ] && continue
-      dow="$(date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}" +%u 2>/dev/null || true)"
-      [ "$dow" = "7" ] || continue
-      KEEP_STAMPS["$stamp"]=1
-      weekly_kept=$((weekly_kept + 1))
-      kept_count=$((kept_count + 1))
-      [ "$weekly_kept" -ge "$keep_weekly" ] && break
-    done <<< "$stamps_all"
-  fi
-
-  deleted_count=0
-  while read -r stamp; do
-    [ -n "$stamp" ] || continue
-    [ -n "${KEEP_STAMPS[$stamp]:-}" ] && continue
-    if [ "$stamp" = "$current_stamp" ]; then
-      echo "[fleet-backup] B2 prune SKIP: refusing to delete current set $stamp for $app"
-      continue
-    fi
-    set_fail=0
-    while read -r name; do
-      [ -n "$name" ] || continue
-      rclone delete "b2:${bucket}/hetzner/" --include "/${name}" 2>/dev/null || true
-      if rclone lsf "b2:${bucket}/hetzner/" --files-only 2>/dev/null | grep -qxF "$name"; then
-        echo "[fleet-backup] B2 prune WARN: delete failed: $name"
-        set_fail=1
-      fi
-    done <<< "$(printf '%s\n' "$listing" | grep -F "$stamp" || true)"
-    if [ "$set_fail" = "0" ]; then
-      deleted_count=$((deleted_count + 1))
-    fi
-  done <<< "$stamps_all"
-  echo "[fleet-backup] B2 prune OK: $app kept=${kept_count} deleted=${deleted_count} (daily=${keep_daily} weekly=${keep_weekly})"
-  return 0
-}
 
 # R2 weekly receipt guard (CLAUDE 2026-08-31): the Sunday leg is gated only by
 # day-of-week, so it re-ran on all four Sunday cron ticks.  Success when the
@@ -509,11 +686,11 @@ for app in congress socratic usage-monitor; do
   dir="$ROOT/$app"; [ -d "$dir" ] || continue
   files=$(ls -1 "$dir" 2>/dev/null | grep "$STAMP" || true)
   [ -n "$files" ] || continue
-  if rclone copy "$dir" "b2:${B2_BUCKET[$app]}/hetzner/" --include "*${STAMP}*" --transfers 2 -q; then
-    echo "[fleet-backup] B2 offsite OK: $app ($STAMP)"
+  if upload_b2_set "$dir" "${B2_BUCKET[$app]}" "$STAMP"; then
+    echo "[fleet-backup] B2 offsite OK: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
     prune_b2_sets "$app" "${B2_BUCKET[$app]}" "$STAMP" || true
   else
-    echo "[fleet-backup] B2 offsite FAIL: $app"
+    echo "[fleet-backup] B2 offsite FAIL: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
     fleet_backup_alert "B2 offsite FAIL: $app"
     BACKUP_FAILED=1
   fi
@@ -528,7 +705,7 @@ for app in congress socratic usage-monitor; do
       echo "[fleet-backup] R2 weekly SKIP: already succeeded today"
     elif rclone listremotes 2>/dev/null | grep -q "^r2:"; then
       if rclone copy "$dir" "r2:${r2bucket}/weekly/" --include "*${STAMP}*" --transfers 2 -q; then
-        echo "[fleet-backup] R2 weekly OK: $app"
+        echo "[fleet-backup] R2 weekly OK: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
         # Receipt so congress.trade /api/health can say R2 weekly is fine
         # without listing the bucket (no secrets on the health path).
         if [ "$app" = "congress" ]; then
@@ -545,12 +722,12 @@ for app in congress socratic usage-monitor; do
             [ -n "$name" ] || continue
             case "$name" in
               *"${stamp_keep}"*) ;;
-              *) rclone deletefile "r2:${r2bucket}/weekly/${name}" && echo "[fleet-backup] R2 weekly pruned: $name" || true ;;
+              *) rclone deletefile "r2:${r2bucket}/weekly/${name}" && echo "[fleet-backup] R2 weekly pruned: $name at $(fleet_ct_label)" || true ;;
             esac
           done
         fi
       else
-        echo "[fleet-backup] R2 weekly FAIL: $app"
+        echo "[fleet-backup] R2 weekly FAIL: $app set=$(fleet_ct_label "$STAMP") at $(fleet_ct_label)"
         fleet_backup_alert "R2 weekly FAIL: $app"
         if [ "$app" = "congress" ]; then
           printf '{"ok":false,"reason":"rclone_failed","checkedAt":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
