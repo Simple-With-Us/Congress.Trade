@@ -335,7 +335,102 @@ assert_eq "$r" yes "file/object stamp stays UTC Z"
 b2_seed 20261130T064500Z
 prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
 assert_eq "$(b2_has 20261130T064500Z)" yes "B2 prune never deletes the current set"
+
+# --- B2 prune handles mixed plain .db and .db.zst sets (2026-10-30) --------
+rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+for st in $(b2_stamps_for_days 2026-11-16 10); do
+  if [ "$st" \> 20261112T000000Z ]; then ext=db.zst; else ext=db; fi
+  : > "$B2_FAKE/usage-monitor-${st}.${ext}"; : > "$B2_FAKE/usage-monitor-${st}.db.sha256"
+done
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261116T064500Z >/dev/null
+assert_exists "$B2_FAKE/usage-monitor-20261116T064500Z.db.zst" "B2 prune keeps newest .zst daily"
+assert_exists "$B2_FAKE/usage-monitor-20261114T064500Z.db.zst" "B2 prune keeps 3rd .zst daily"
+assert_missing "$B2_FAKE/usage-monitor-20261113T064500Z.db.zst" "B2 prune drops 4th .zst set"
+assert_exists "$B2_FAKE/usage-monitor-20261108T064500Z.db" "B2 prune keeps plain .db weekly"
+assert_missing "$B2_FAKE/usage-monitor-20261110T064500Z.db" "B2 prune drops old plain .db set"
+assert_missing "$B2_FAKE/usage-monitor-20261110T064500Z.db.sha256" "B2 prune drops old sha256 sidecar"
+assert_eq "$(ls -1 "$B2_FAKE" | grep -cE '\.db(\.zst)?$')" 4 "B2 mixed prune leaves 3 daily + 1 weekly"
 unset -f rclone
+
+# --- stale .zst from an interrupted run is pruned locally ------------------
+mkdir -p "$ROOT/socratic"
+: > "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst"
+: > "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial"
+prune_incomplete_dumps >/dev/null
+assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst" "stale local .zst pruned"
+assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial" "stale local .zst.partial pruned"
+
+# --- zstd upload + restore round trip (needs sqlite3 + zstd) ----------------
+if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+  ZD="$TMP/zstd-app"; ZB="$TMP/zstd-b2"; mkdir -p "$ZD" "$ZB"
+  zst_stamp=20261130T113000Z
+  sqlite3 "$ZD/live.db" "PRAGMA journal_mode=WAL; CREATE TABLE t(x TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<20000) INSERT INTO t SELECT printf('row-%08d', i) FROM c;" >/dev/null
+  STAMP="$zst_stamp"
+  fleet_backup_alert() { :; }
+  backup_one "socratic-app" "$ZD/live.db" "$ZD/out" >/dev/null
+  : > "$ZD/out/socratic-app-20261129T113000Z.db"   # older raw dump: never uploaded
+  rclone() {
+    # copy <dir> <remote> --include A [--include B] ...: copy matching basenames.
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$ZB/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null
+  assert_exists "$ZB/socratic-app-${zst_stamp}.db.zst" "zstd upload sends .db.zst"
+  assert_exists "$ZB/socratic-app-${zst_stamp}.db.sha256" "zstd upload sends raw sha256"
+  assert_missing "$ZB/socratic-app-${zst_stamp}.db" "zstd upload does not send raw .db"
+  assert_missing "$ZB/socratic-app-20261129T113000Z.db" "zstd upload only sends this run's set"
+  assert_missing "$ZD/out/socratic-app-${zst_stamp}.db.zst" "local .zst removed after upload"
+  assert_exists "$ZD/out/socratic-app-${zst_stamp}.db" "local raw dump kept"
+  # Restore exactly like an operator would from B2.
+  RD="$TMP/zstd-restore"; mkdir -p "$RD"
+  zstd -q -d "$ZB/socratic-app-${zst_stamp}.db.zst" -o "$RD/socratic-app-${zst_stamp}.db"
+  assert_eq "$(sqlite3 "$RD/socratic-app-${zst_stamp}.db" 'PRAGMA integrity_check;')" ok "restored .zst passes integrity_check"
+  assert_eq "$(sqlite3 "$RD/socratic-app-${zst_stamp}.db" 'SELECT count(*) FROM t;')" 20000 "restored .zst has every row"
+  want_sha="$(awk '{print $1}' "$ZB/socratic-app-${zst_stamp}.db.sha256")"
+  got_sha="$(sha256sum "$RD/socratic-app-${zst_stamp}.db" | awk '{print $1}')"
+  assert_eq "$got_sha" "$want_sha" "restored .zst matches raw-db sha256"
+  # A failed upload keeps the verified .zst for a manual retry.
+  rclone() { return 1; }
+  upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null || true
+  assert_exists "$ZD/out/socratic-app-${zst_stamp}.db.zst" "failed upload keeps local .zst"
+  rm -f "$ZD/out"/*.zst
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$ZB/$n"; break; fi
+      done
+    done
+  }
+  # Disabled or failed compression falls back to the raw set.
+  rm -f "$ZB"/*
+  FLEET_BACKUP_B2_COMPRESS=0 upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null
+  assert_exists "$ZB/socratic-app-${zst_stamp}.db" "compress off uploads raw .db"
+  assert_missing "$ZB/socratic-app-${zst_stamp}.db.zst" "compress off sends no .zst"
+  unset -f rclone
+else
+  echo "skip zstd round trip (sqlite3 or zstd not installed)"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "FAILED"
