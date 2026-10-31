@@ -1005,6 +1005,8 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Scoped token for the idempotent admin maintenance endpoints only (backlog requeue/retry). */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /** Scoped token for POST /api/admin/senate-ptr-intake only (Mac eFD fetcher, CT-2442). */
+  SENATE_INTAKE_TOKEN?: string;
   LLAMAPARSE_API_KEY?: string;
 
   // --- Billing (Stripe) ---
