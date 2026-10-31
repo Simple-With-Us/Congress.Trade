@@ -24,6 +24,7 @@ import {
   parseCsrfMiddlewareToken,
   parseReportLink,
   parseSenateRows,
+  senateFilingFromFetcherRow,
   formatSenateDate,
   CookieJar,
   fetchSenatePtrFilings,
@@ -140,6 +141,68 @@ describe('parseSenateRows', () => {
     expect(f.filedDate).toBe('06/30/2026');
     expect(f.filingTypeLabel).toBe('Periodic Transaction Report');
     expect(f.sourceUrl).toBe('https://efdsearch.senate.gov/search/view/ptr/96d0794e/');
+  });
+});
+
+
+describe('senateFilingFromFetcherRow', () => {
+  const REAL_ROW = {
+    first_name: 'David H',
+    last_name: 'McCormick',
+    filer: 'McCormick, David H. (Senator)',
+    report_title: 'Periodic Transaction Report for 10/29/2026',
+    report_url: 'https://efdsearch.senate.gov/search/view/ptr/3ab689df-21ae-44c5-85ac-1f5e4bc8464d/',
+    date_received: '10/29/2026',
+    is_paper: false,
+    raw: [
+      'David H',
+      'McCormick',
+      'McCormick, David H. (Senator)',
+      '<a href="/search/view/ptr/3ab689df-21ae-44c5-85ac-1f5e4bc8464d/" target="_blank">Periodic Transaction Report for 10/29/2026</a>',
+      '10/29/2026',
+    ],
+  };
+
+  it('converts a real Mac fetcher row to the canonical SenateFiling', () => {
+    const f = senateFilingFromFetcherRow(REAL_ROW);
+    expect(f).not.toBeNull();
+    expect(f!.reportId).toBe('3ab689df-21ae-44c5-85ac-1f5e4bc8464d');
+    expect(f!.pipelineDocId).toBe('S-3ab689df-21ae-44c5-85ac-1f5e4bc8464d');
+    expect(f!.first).toBe('David H');
+    expect(f!.last).toBe('McCormick');
+    expect(f!.fullName).toBe('McCormick, David H. (Senator)');
+    expect(f!.filingTypeLabel).toBe('Periodic Transaction Report for 10/29/2026');
+    expect(f!.filedDate).toBe('10/29/2026');
+    expect(f!.sourceUrl).toBe(
+      'https://efdsearch.senate.gov/search/view/ptr/3ab689df-21ae-44c5-85ac-1f5e4bc8464d/',
+    );
+  });
+
+  it('falls back to the extracted fields when no raw row was preserved', () => {
+    const { raw: _raw, ...extracted } = REAL_ROW;
+    const f = senateFilingFromFetcherRow(extracted);
+    expect(f).not.toBeNull();
+    expect(f!.reportId).toBe('3ab689df-21ae-44c5-85ac-1f5e4bc8464d');
+    expect(f!.pipelineDocId).toBe('S-3ab689df-21ae-44c5-85ac-1f5e4bc8464d');
+    expect(f!.fullName).toBe('McCormick, David H. (Senator)');
+    expect(f!.filedDate).toBe('10/29/2026');
+    expect(f!.sourceUrl).toBe(REAL_ROW.report_url);
+  });
+
+  it('rejects rows without a usable official link or filed date', () => {
+    expect(senateFilingFromFetcherRow({})).toBeNull();
+    expect(senateFilingFromFetcherRow({ ...REAL_ROW, raw: undefined, report_url: '' })).toBeNull();
+    // A lookalike path on another host must never become a pipeline sourceUrl.
+    expect(
+      senateFilingFromFetcherRow({
+        ...REAL_ROW,
+        raw: undefined,
+        report_url: 'https://example.com/search/view/ptr/3ab689df-21ae-44c5-85ac-1f5e4bc8464d/',
+      }),
+    ).toBeNull();
+    expect(
+      senateFilingFromFetcherRow({ ...REAL_ROW, raw: undefined, date_received: '2026-10-29' }),
+    ).toBeNull();
   });
 });
 

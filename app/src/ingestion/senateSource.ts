@@ -431,6 +431,77 @@ export function parseSenateRows(rows: string[][]): SenateFiling[] {
   return out;
 }
 
+
+/** One row from the Mac eFD fetcher's output file (~/efd-fetcher/out/*.json). */
+export interface EfdFetcherRow {
+  first_name?: string | null;
+  last_name?: string | null;
+  filer?: string | null;
+  report_title?: string | null;
+  report_url?: string | null;
+  date_received?: string | null;
+  is_paper?: boolean;
+  /** The original DataTables row, when the fetcher preserved it. */
+  raw?: string[];
+}
+
+function fetcherRowText(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Convert one Mac eFD fetcher row into a SenateFiling, or null when the row
+ * does not carry a usable official eFD report link and filed date.  When the
+ * fetcher preserved the original DataTables row, parseSenateRows is the
+ * primary path so intake filings are parsed identically to polled filings.
+ * The extracted fields are the fallback for rows without a usable raw row.
+ * A report URL on any host other than efdsearch.senate.gov is rejected: the
+ * pipeline fetches sourceUrl server-side, so intake must never become a way
+ * to point it at an arbitrary URL.
+ */
+export function senateFilingFromFetcherRow(row: EfdFetcherRow): SenateFiling | null {
+  if (!row || typeof row !== 'object') return null;
+  if (Array.isArray(row.raw)) {
+    const parsed = parseSenateRows([row.raw])[0];
+    if (parsed && parsed.sourceUrl.startsWith(`${SENATE_BASE}/search/view/`)) return parsed;
+  }
+  const reportUrl = fetcherRowText(row.report_url);
+  if (!reportUrl) return null;
+  let reportPath = '';
+  if (reportUrl.startsWith('/')) {
+    reportPath = reportUrl.split(/[?#]/, 1)[0];
+  } else {
+    try {
+      const url = new URL(reportUrl);
+      if (url.origin !== SENATE_BASE) return null;
+      reportPath = url.pathname;
+    } catch {
+      return null;
+    }
+  }
+  if (!/^\/search\/view\/(?:ptr|paper)\//i.test(reportPath)) return null;
+  const segments = reportPath.split('/').filter((s) => s.length > 0);
+  const reportId = segments[segments.length - 1] ?? '';
+  if (!reportId) return null;
+  const filedDate = fetcherRowText(row.date_received);
+  if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(filedDate)) return null;
+  const first = fetcherRowText(row.first_name);
+  const last = fetcherRowText(row.last_name);
+  const fullName = fetcherRowText(row.filer) || `${first} ${last}`.trim();
+  if (!fullName) return null;
+  return {
+    reportId,
+    first,
+    last,
+    fullName,
+    filingTypeLabel: fetcherRowText(row.report_title),
+    filedDate,
+    reportPath,
+    sourceUrl: `${SENATE_BASE}${reportPath}`,
+    pipelineDocId: `S-${reportId}`,
+  };
+}
+
 /** Format a Date as the "MM/DD/YYYY HH:MM:SS" string efdsearch expects. */
 export function formatSenateDate(d: Date): string {
   const p2 = (n: number) => String(n).padStart(2, '0');
