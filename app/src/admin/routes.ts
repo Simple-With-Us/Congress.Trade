@@ -82,6 +82,10 @@ import { apnsConfigured } from '../shared/apns.ts';
 import { runSeedBackfillFromEnv } from '../backfill/seed.ts';
 import { runHouseHistoricalBackfill } from '../backfill/houseCrawler.ts';
 import { runSenateBackfill } from '../backfill/senateCrawler.ts';
+import {
+  senateFilingFromFetcherRow,
+  type SenateFiling,
+} from '../ingestion/senateSource.ts';
 import { extractParsed } from '../extraction/orchestrator.ts';
 import {
   normalize,
@@ -184,7 +188,7 @@ import {
   rematchAndHealLatencyRaces,
   runDisclosureLatencyProbe,
 } from '../ingestion/tradeLatency.ts';
-import { pollExecutive } from '../ingestion/watcher.ts';
+import { ingestSenateFilings, pollExecutive } from '../ingestion/watcher.ts';
 import { verifyRawFilesStorage } from './storageSmoke.ts';
 
 function isObjectStoreAuthError(message: string): boolean {
@@ -342,6 +346,16 @@ type EnvWithAdmin = Env & {
    * unset. Worst case if leaked: someone re-runs an idempotent requeue.
    */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /**
+   * Scoped bearer token that unlocks ONLY POST /senate-ptr-intake (the
+   * Mac eFD fetcher's filing intake, CT-2442).  Lets that one caller
+   * submit official eFD report rows without holding the full
+   * ADMIN_TOKEN.  Same pattern as INGEST_TOKEN.  Optional; ignored if
+   * unset.  Worst case if leaked: someone submits eFD report rows,
+   * which the pipeline dedupes against the canonical doc ids and
+   * fetches only from efdsearch.senate.gov.
+   */
+  SENATE_INTAKE_TOKEN?: string;
 };
 
 /** The ONLY admin paths ADMIN_MAINTENANCE_TOKEN unlocks. Keep this list to
@@ -382,6 +396,21 @@ async function isAuthorizedMaintenance(
   return (
     !!token &&
     MAINTENANCE_PATH_SUFFIXES.some((suffix) => path.endsWith(suffix)) &&
+    (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
+  );
+}
+
+
+/** True when the request is a bearer-authenticated call to the Senate PTR intake. */
+async function isAuthorizedSenateIntake(
+  env: EnvWithAdmin,
+  path: string,
+  authorization?: string,
+): Promise<boolean> {
+  const token = (await resolveSecret(env, 'SENATE_INTAKE_TOKEN')).value;
+  return (
+    !!token &&
+    path.endsWith('/senate-ptr-intake') &&
     (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
   );
 }
@@ -2505,6 +2534,28 @@ export const EnrichmentUnavailableBodySchema = z.object({
 }).strict();
 export type EnrichmentUnavailableBody = z.infer<typeof EnrichmentUnavailableBodySchema>;
 
+const SenatePtrIntakeRowSchema = z.object({
+  first_name: z.string().nullable().optional(),
+  last_name: z.string().nullable().optional(),
+  filer: z.string().nullable().optional(),
+  report_title: z.string().nullable().optional(),
+  report_url: z.string().nullable().optional(),
+  date_received: z.string().nullable().optional(),
+  is_paper: z.boolean().optional(),
+  raw: z.array(z.string()).optional(),
+});
+
+export const SenatePtrIntakeBodySchema = z.object({
+  rows: z.array(SenatePtrIntakeRowSchema).max(500),
+  dryRun: z.boolean().optional(),
+  // The Mac fetcher's out-file envelope; accepted so the fetcher can POST
+  // its output file verbatim.  Unknown keys are stripped by the schema.
+  source: z.string().optional(),
+  fetched_at: z.string().optional(),
+  since: z.string().optional(),
+});
+export type SenatePtrIntakeBody = z.infer<typeof SenatePtrIntakeBodySchema>;
+
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   const r = new Hono<{ Bindings: Env }>();
@@ -2514,12 +2565,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Cloudflare Access), or one of the SCOPED tokens — INGEST_TOKEN for
   // /securities/import only (sibling app pushes shared data), and
   // ADMIN_MAINTENANCE_TOKEN for the idempotent backlog-drain endpoints only
-  // (agent/automation sessions never hold the full ADMIN_TOKEN).
+  // (agent/automation sessions never hold the full ADMIN_TOKEN), and
+  // SENATE_INTAKE_TOKEN for /senate-ptr-intake only (the Mac eFD fetcher).
   r.use('*', async (c, next) => {
     const env = c.env as EnvWithAdmin;
     const authorization = c.req.header('Authorization');
     if (await isAuthorizedIngest(env, c.req.path, authorization)) return next();
     if (await isAuthorizedMaintenance(env, c.req.path, authorization)) return next();
+    if (await isAuthorizedSenateIntake(env, c.req.path, authorization)) return next();
     // Always resolve the session email, even when an Authorization header is
     // present. Cookie `ct_session` covers the website; native iOS sends the
     // same opaque session as `Authorization: Bearer <session>`. A stale
@@ -4353,7 +4406,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         'OPENROUTER_API_KEY', 'LLAMAPARSE_API_KEY', 'ARBITRATION_API_KEY',
       ],
       'auth-billing': [
-        'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
+        'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'SENATE_INTAKE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
@@ -6196,6 +6249,72 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
+    }
+  });
+
+
+  // --- POST /senate-ptr-intake --------------------------------------------
+  // Accept Senate PTR rows discovered out-of-band by the Mac eFD fetcher
+  // (CT-2442) and hand them to the same dedupe + durable-outbox path as
+  // pollSenate, so intake filings land in the review queue exactly like
+  // polled ones.  Body: { rows: EfdFetcherRow[], dryRun?: boolean } (the
+  // fetcher's out-file envelope keys are also accepted).  Auth: full admin,
+  // or the scoped SENATE_INTAKE_TOKEN (this path only).  Idempotent: rows
+  // whose canonical doc id already exists are counted in `received`, not
+  // reinserted or re-enqueued.
+  r.post('/senate-ptr-intake', async (c) => {
+    let raw = '';
+    try {
+      raw = await c.req.text();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+    // Size ceiling before JSON.parse: a capped 500-row fetcher file is well
+    // under this; anything larger is not a fetcher file.
+    if (raw.length > 1_000_000) {
+      return c.json({ error: 'request body too large' }, 413);
+    }
+    let json: unknown = {};
+    try {
+      if (raw) json = JSON.parse(raw);
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = SenatePtrIntakeBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
+    const filings = body.rows
+      .map((row) => senateFilingFromFetcherRow(row))
+      .filter((f): f is SenateFiling => f !== null);
+    const converted = filings.length;
+    const rejected = body.rows.length - converted;
+    if (body.dryRun === true) {
+      return c.json({
+        ok: true,
+        dryRun: true,
+        received: body.rows.length,
+        converted,
+        rejected,
+        docIds: filings.map((f) => f.pipelineDocId),
+      });
+    }
+    try {
+      const result = await ingestSenateFilings(c.env, filings, new Date());
+      return c.json({
+        ok: true,
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: result.count,
+        insertedDocIds: result.inserted.map((f) => f.docId),
+      });
+    } catch (err) {
+      // The scoped intake caller is low-privilege: log the detail
+      // server-side and return a generic error, never DB internals.
+      console.error('senate-ptr-intake: ingest failed:', err);
+      return c.json({ error: 'senate intake failed' }, 500);
     }
   });
 
