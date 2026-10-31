@@ -2164,6 +2164,20 @@ function rawFetchAliases(ast: ts.SourceFile): Set<string> {
   return aliases;
 }
 
+function insidePageEvaluateCallback(node: ts.Node): boolean {
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) {
+      const call = current.parent;
+      return !!call
+        && ts.isCallExpression(call)
+        && call.arguments[0] === current
+        && ts.isPropertyAccessExpression(call.expression)
+        && call.expression.name.text === 'evaluate';
+    }
+  }
+  return false;
+}
+
 function rawFetchViolations(relative: string, source: string): string[] {
   const ast = ts.createSourceFile(relative, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const aliases = rawFetchAliases(ast);
@@ -2191,11 +2205,21 @@ function rawFetchViolations(relative: string, source: string): string[] {
         && ts.isIdentifier(callee.expression)
         && callee.expression.text === 'app'
         && callee.name.text === 'fetch';
+      // The Senate browser transport runs its fetch inside a Chromium page via
+      // page.evaluate.  That code executes in the browser, and the request is
+      // already metered by the trackedFetch call in senateSource that invoked
+      // the transport, so only fetch calls inside an evaluate callback pass.
+      const isInPageBrowserFetch =
+        relative === 'ingestion/senateBrowserFetch.ts'
+        && ts.isIdentifier(callee)
+        && callee.text === 'fetch'
+        && insidePageEvaluateCallback(node);
       if (
         !isTelemetryPrimitive
         && !isOperatorTelemetryPrimitive
         && !isDatadogIntakePrimitive
         && !isInternalHonoDispatch
+        && !isInPageBrowserFetch
       ) {
         const pos = ast.getLineAndCharacterOfPosition(node.getStart(ast));
         violations.push(`${relative}:${pos.line + 1}:${callee.getText(ast)}`);
@@ -2268,6 +2292,21 @@ describe('outbound-call inventory enforcement', () => {
       'shared/datadogTransport.ts',
       'async function transport(fetchImpl: typeof fetch) { return fetchImpl("https://example.test"); }',
     )).toEqual([]);
+  });
+
+  it('scopes the Senate browser transport exemption to in-page evaluate callbacks', () => {
+    expect(rawFetchViolations(
+      'ingestion/senateBrowserFetch.ts',
+      'await page.evaluate(async () => { await fetch("/search/report/data/"); });',
+    )).toEqual([]);
+    expect(rawFetchViolations(
+      'ingestion/senateBrowserFetch.ts',
+      'await fetch("https://example.test");',
+    )).toEqual(['ingestion/senateBrowserFetch.ts:1:fetch']);
+    expect(rawFetchViolations(
+      'ingestion/other.ts',
+      'await page.evaluate(async () => { await fetch("/x"); });',
+    )).toEqual(['ingestion/other.ts:1:fetch']);
   });
 
   it('keeps the Usage Monitor ingest transport centralized and non-recursive', () => {

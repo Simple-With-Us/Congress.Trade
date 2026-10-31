@@ -106,6 +106,36 @@ function headersToRecord(headers: HeadersInit | undefined): Record<string, strin
   return { ...(headers as Record<string, string>) };
 }
 
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('Aborted', 'AbortError');
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+/** Settle with the caller's abort as soon as it fires, so a watcher deadline
+ *  is not held open by a slow Playwright call.  The browser itself is closed
+ *  by the caller's finally block in senateSource. */
+function abortable<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) {
+    work.catch(() => {});
+    return Promise.reject(abortReason(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      work.catch(() => {});
+      reject(abortReason(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
+    );
+  });
+}
+
 export async function createSenateBrowserFetch(
   opts: SenateBrowserFetchOptions = {},
 ): Promise<SenateBrowserFetchHandle> {
@@ -130,12 +160,19 @@ export async function createSenateBrowserFetch(
     args: opts.hideAutomation ? ['--disable-blink-features=AutomationControlled'] : [],
     proxy: opts.proxyUrl ? { server: opts.proxyUrl } : undefined,
   });
-  const page = await browser.newPage();
-
-  // Establish the eFD origin so in-page fetch() runs same-origin and the
-  // browser cookie jar applies. senateSource's own landing GET below repeats
-  // this navigation and reads the fresh page HTML.
-  await page.goto(SENATE_SEARCH, { timeout: timeoutMs });
+  let page: PwPage;
+  try {
+    page = await browser.newPage();
+    // Establish the eFD origin so in-page fetch() runs same-origin and the
+    // browser cookie jar applies. senateSource's own landing GET below repeats
+    // this navigation and reads the fresh page HTML.
+    await page.goto(SENATE_SEARCH, { timeout: timeoutMs });
+  } catch (err) {
+    // The caller only gets a handle to close on success, so a failed warm-up
+    // must close the browser here or the Chromium process leaks.
+    await browser.close().catch(() => {});
+    throw err;
+  }
 
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string'
@@ -144,10 +181,17 @@ export async function createSenateBrowserFetch(
         ? input.toString()
         : input.url;
     const method = (init?.method ?? (typeof input === 'object' && 'method' in input ? input.method : 'GET')).toUpperCase();
+    const signal = init?.signal ?? undefined;
+    throwIfAborted(signal);
+    if (init?.body !== undefined && init.body !== null && typeof init.body !== 'string') {
+      // senateSource serializes every body it sends; refuse anything else
+      // rather than silently posting an empty body from the page.
+      throw new TypeError('senateBrowserFetch: only string request bodies are supported');
+    }
 
     if (method === 'GET' && url === SENATE_SEARCH) {
-      const res = await page.goto(url, { timeout: timeoutMs });
-      const html = await page.content();
+      const res = await abortable(page.goto(url, { timeout: timeoutMs }), signal);
+      const html = await abortable(page.content(), signal);
       return new Response(html, {
         status: res?.status() ?? 200,
         headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -159,33 +203,40 @@ export async function createSenateBrowserFetch(
       // page in place. A refusal leaves the agreement form on the page, and
       // senateSource's agreement-wall check on this 200 body fails closed.
       const box = page.locator('#agree_statement');
-      if (await box.count()) {
-        await box.check({ timeout: timeoutMs });
-        await page
-          .waitForFunction("() => document.title.includes('Find Reports')", undefined, { timeout: timeoutMs })
-          .catch(() => {});
+      if (await abortable(box.count(), signal)) {
+        await abortable(box.check({ timeout: timeoutMs }), signal);
+        await abortable(
+          page
+            .waitForFunction("() => document.title.includes('Find Reports')", undefined, { timeout: timeoutMs })
+            .catch(() => {}),
+          signal,
+        );
       }
-      const html = await page.content();
+      const html = await abortable(page.content(), signal);
       return new Response(html, {
         status: 200,
         headers: { 'content-type': 'text/html; charset=utf-8' },
       });
     }
 
-    const result = (await page.evaluate(
-      async ([u, m, h, b]: [string, string, Record<string, string>, string | null]) => {
+    // This fetch runs inside the Chromium page, not in the Worker: the request
+    // is already metered by the trackedFetch call in senateSource that invoked
+    // this fetchImpl.  The in-page timeout bounds a hung edge response.
+    const result = (await abortable(page.evaluate(
+      async ([u, m, h, b, t]: [string, string, Record<string, string>, string | null, number]) => {
         const r = await fetch(u, {
           method: m,
           headers: h,
           body: b ?? undefined,
           credentials: 'include',
+          signal: AbortSignal.timeout(t),
         });
         const headers: Record<string, string> = {};
         r.headers.forEach((v: string, k: string) => { headers[k] = v; });
         return { status: r.status, headers, text: await r.text() };
       },
-      [url, method, headersToRecord(init?.headers), typeof init?.body === 'string' ? init.body : null],
-    )) as InPageFetchResult;
+      [url, method, headersToRecord(init?.headers), typeof init?.body === 'string' ? init.body : null, timeoutMs],
+    ), signal)) as InPageFetchResult;
     return new Response(result.text, { status: result.status, headers: result.headers });
   }) as typeof fetch;
 
