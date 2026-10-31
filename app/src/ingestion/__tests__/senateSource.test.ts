@@ -189,6 +189,20 @@ describe('senateFilingFromFetcherRow', () => {
     expect(f!.sourceUrl).toBe(REAL_ROW.report_url);
   });
 
+  it('does not let a raw row bypass the filed-date validation', () => {
+    // Raw row with the date cell missing: parseSenateRows would yield
+    // filedDate '', so the converter must fall back to the extracted
+    // fields (which carry a valid date_received) instead of returning it.
+    const rawNoDate = REAL_ROW.raw.slice(0, 4);
+    const f = senateFilingFromFetcherRow({ ...REAL_ROW, raw: rawNoDate });
+    expect(f).not.toBeNull();
+    expect(f!.filedDate).toBe('10/29/2026');
+    // And with no valid date anywhere, the row is rejected outright.
+    expect(
+      senateFilingFromFetcherRow({ ...REAL_ROW, raw: rawNoDate, date_received: '' }),
+    ).toBeNull();
+  });
+
   it('rejects rows without a usable official link or filed date', () => {
     expect(senateFilingFromFetcherRow({})).toBeNull();
     expect(senateFilingFromFetcherRow({ ...REAL_ROW, raw: undefined, report_url: '' })).toBeNull();

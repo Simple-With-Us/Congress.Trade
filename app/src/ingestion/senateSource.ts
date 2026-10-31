@@ -463,7 +463,17 @@ export function senateFilingFromFetcherRow(row: EfdFetcherRow): SenateFiling | n
   if (!row || typeof row !== 'object') return null;
   if (Array.isArray(row.raw)) {
     const parsed = parseSenateRows([row.raw])[0];
-    if (parsed && parsed.sourceUrl.startsWith(`${SENATE_BASE}/search/view/`)) return parsed;
+    // parseSenateRows tolerates a missing date or name cell (it yields '');
+    // intake must not.  A raw parse without a valid filed date and filer
+    // name falls through to the extracted-fields path, which validates both.
+    if (
+      parsed &&
+      parsed.sourceUrl.startsWith(`${SENATE_BASE}/search/view/`) &&
+      parsed.fullName &&
+      /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(parsed.filedDate)
+    ) {
+      return parsed;
+    }
   }
   const reportUrl = fetcherRowText(row.report_url);
   if (!reportUrl) return null;
