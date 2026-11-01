@@ -11,6 +11,10 @@ import {
 import { SENATE_EDGE_BACKOFF_KV_KEY } from '../senateEdgeDeny.ts';
 import { FMP_LATENCY_SILENCE_PENDING_KV_KEY } from '../../shared/fmpLatencyProbeHealth.ts';
 
+function fmpLatencyEvaluatedCount(result: { evaluated: string[] }): number {
+  return result.evaluated.filter((c) => c === 'health_fmp_latency').length;
+}
+
 const notifyReviewSpy = vi.fn(async () => {});
 const notifyStallSpy = vi.fn(async () => {});
 vi.mock('../reviewQueueNotify.ts', () => ({
@@ -431,6 +435,7 @@ describe('pipelineLoudAlerts', () => {
     const now = new Date('2026-11-01T18:00:00.000Z');
     const first = await sweepPipelineStallAlerts(env, now);
     expect(first.evaluated).toContain('health_fmp_latency');
+    expect(fmpLatencyEvaluatedCount(first)).toBe(1);
     expect(first.alerted).not.toContain('health_fmp_latency');
     expect(store.has(FMP_LATENCY_SILENCE_PENDING_KV_KEY)).toBe(true);
     expect(notifyStallSpy).not.toHaveBeenCalledWith(
@@ -458,6 +463,7 @@ describe('pipelineLoudAlerts', () => {
     });
     notifyStallSpy.mockClear();
     const second = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
+    expect(fmpLatencyEvaluatedCount(second)).toBe(1);
     expect(second.alerted).toContain('health_fmp_latency');
     // Pending stays while critical so the next sweep stays on the alerting path.
     expect(store.has(FMP_LATENCY_SILENCE_PENDING_KV_KEY)).toBe(true);
@@ -481,6 +487,7 @@ describe('pipelineLoudAlerts', () => {
     });
     notifyStallSpy.mockClear();
     const result = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
+    expect(fmpLatencyEvaluatedCount(result)).toBe(1);
     expect(result.alerted).not.toContain('health_fmp_latency');
     const mark = JSON.parse(store.get(FMP_LATENCY_SILENCE_PENDING_KV_KEY) as string);
     expect(mark.firstSeenAt).toBe('2026-11-01T18:00:00.000Z');
@@ -508,6 +515,7 @@ describe('pipelineLoudAlerts', () => {
     });
     notifyStallSpy.mockClear();
     const result = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
+    expect(fmpLatencyEvaluatedCount(result)).toBe(1);
     expect(result.alerted).toContain('health_fmp_latency');
     const mark = JSON.parse(store.get(FMP_LATENCY_SILENCE_PENDING_KV_KEY) as string);
     expect(mark.firstSeenAt).toBe('2026-11-01T13:00:00.000Z');
@@ -532,6 +540,7 @@ describe('pipelineLoudAlerts', () => {
     });
     notifyStallSpy.mockClear();
     const result = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
+    expect(fmpLatencyEvaluatedCount(result)).toBe(1);
     expect(result.alerted).not.toContain('health_fmp_latency');
     expect(store.has(FMP_LATENCY_SILENCE_PENDING_KV_KEY)).toBe(false);
   });

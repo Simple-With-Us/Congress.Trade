@@ -27,7 +27,7 @@ vi.mock('../../ingestion/probeLease.ts', () => ({
   readProbeLease: vi.fn(async () => null),
 }));
 
-import { isFmpSlotHttp429DayBan } from '../../ingestion/tradeLatency.ts';
+import { isFmpSlotHttp429DayBan, listConfiguredFmpLatencySlots } from '../../ingestion/tradeLatency.ts';
 import { readProbeLease } from '../../ingestion/probeLease.ts';
 
 describe('evaluateFmpLatencyCheck', () => {
@@ -189,5 +189,23 @@ describe('enrichFmpLatencySelfHealingSilence', () => {
       () => undefined,
     );
     expect(sh).toBeNull();
+  });
+
+  it('day-ban checks every slot from listConfiguredFmpLatencySlots', async () => {
+    const envDual = {
+      FMP_LATENCY_API_KEY: 'k1',
+      FMP_API_KEY: 'k2',
+      CONFIG_KV: { get: async () => null, put: async () => {}, delete: async () => {} },
+      DB: {},
+    } as Env;
+    expect(await listConfiguredFmpLatencySlots(envDual)).toEqual(['1', '2']);
+    const slotsChecked: string[] = [];
+    vi.mocked(isFmpSlotHttp429DayBan).mockImplementation(async (_env, slot) => {
+      slotsChecked.push(slot);
+      return true;
+    });
+    const sh = await enrichFmpLatencySelfHealingSilence(envDual, silentFmp, now, () => undefined);
+    expect(sh?.cause).toBe('fmp_day_ban');
+    expect(slotsChecked).toEqual(['1', '2']);
   });
 });

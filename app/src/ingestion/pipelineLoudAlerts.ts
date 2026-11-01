@@ -670,7 +670,6 @@ async function processFmpLatencySilenceAlert(
   deps: { fetchImpl?: typeof fetch },
 ): Promise<void> {
   const condition = 'health_fmp_latency' satisfies PipelineStallCondition;
-  result.evaluated.push(condition);
   const pendingKey = FMP_LATENCY_SILENCE_PENDING_KV_KEY;
 
   if (check.status !== 'critical') {
@@ -707,6 +706,7 @@ async function processFmpLatencySilenceAlert(
     } catch {
       /* fail-soft */
     }
+    result.evaluated.push(condition);
     return;
   }
 

@@ -4,9 +4,8 @@
  */
 
 import type { Env } from './types.ts';
-import { isFmpSlotHttp429DayBan } from '../ingestion/tradeLatency.ts';
+import { isFmpSlotHttp429DayBan, listConfiguredFmpLatencySlots } from '../ingestion/tradeLatency.ts';
 import { readProbeLease } from '../ingestion/probeLease.ts';
-import { resolveSecret } from '../secrets/infisical.ts';
 
 export const FMP_LATENCY_CRITICAL_AGE_SEC_DEFAULT = 3 * 3600;
 export const FMP_LATENCY_SELF_HEALING_GRACE_SEC_DEFAULT = 2 * 3600;
@@ -141,22 +140,6 @@ export function evaluateFmpLatencyCheck(
   return { status: tier, detail, value: baseValue };
 }
 
-async function configuredFmpLatencySlots(env: Env): Promise<Array<'1' | '2'>> {
-  const envx = env as unknown as Record<string, string | undefined>;
-  const slots: Array<'1' | '2'> = [];
-  const primary =
-    (await resolveSecret(env, 'FMP_LATENCY_API_KEY' as keyof Env & string)).value?.trim()
-    ?? envx.FMP_LATENCY_API_KEY?.trim();
-  if (primary) slots.push('1');
-  for (const name of ['FMP_LATENCY_API_KEY_2', 'FMP_API_KEY'] as const) {
-    const value = (await resolveSecret(env, name as keyof Env & string)).value?.trim() ?? envx[name]?.trim();
-    if (!value || value === primary) continue;
-    slots.push('2');
-    break;
-  }
-  return slots;
-}
-
 /** Populate `selfHealingSilence` when probe silence is explained by day-ban or Mac lease. */
 export async function enrichFmpLatencySelfHealingSilence(
   env: Env,
@@ -175,7 +158,7 @@ export async function enrichFmpLatencySelfHealingSilence(
   }
 
   try {
-    const slots = await configuredFmpLatencySlots(env);
+    const slots = await listConfiguredFmpLatencySlots(env);
     if (slots.length > 0) {
       let allBanned = true;
       for (const slot of slots) {

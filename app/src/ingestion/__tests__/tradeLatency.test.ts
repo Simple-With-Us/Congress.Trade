@@ -21,6 +21,7 @@ import {
   disclosurePublishYieldWeight,
   budgetedProbeIntervalSec,
   selectFmpLatencyKey,
+  listConfiguredFmpLatencySlots,
   selectRotatedAvenue,
   selectFmpLatencyPathForCycle,
   selectLatencySourceProbe,
@@ -562,6 +563,34 @@ describe('tradeLatency', () => {
       const fleet = await getFmpLatencyFleetRemaining(env, now);
       expect(fleet.freeTierKeysConfigured).toBe(2);
       expect(fleet.freeTierCap).toBe(FMP_LATENCY_DAILY_CAP_PER_KEY * 2);
+    });
+
+    it('listConfiguredFmpLatencySlots mirrors key material (incl. FMP_API_KEY slot-2 fallback)', async () => {
+      const kv = new Map<string, string>();
+      const configKv = {
+        get: async (k: string) => kv.get(k) ?? null,
+        put: async (k: string, v: string) => {
+          kv.set(k, v);
+        },
+      };
+      const dual = {
+        FMP_LATENCY_API_KEY: 'free-key-a',
+        FMP_API_KEY: 'free-key-b',
+        CONFIG_KV: configKv,
+      } as never;
+      expect(await listConfiguredFmpLatencySlots(dual)).toEqual(['1', '2']);
+      const same = {
+        FMP_LATENCY_API_KEY: 'same',
+        FMP_API_KEY: 'same',
+        CONFIG_KV: configKv,
+      } as never;
+      expect(await listConfiguredFmpLatencySlots(same)).toEqual(['1']);
+      const secondaryOnly = {
+        FMP_LATENCY_API_KEY_2: 'k2',
+        FMP_LATENCY_API_KEY: 'k1',
+        CONFIG_KV: configKv,
+      } as never;
+      expect(await listConfiguredFmpLatencySlots(secondaryOnly)).toEqual(['1', '2']);
     });
 
     it('getFmpLatencyFleetRemaining sums dual free keys + RapidAPI path budget', async () => {

@@ -1186,6 +1186,16 @@ async function resolveFmpLatencyKeyMaterial(
   return null;
 }
 
+/** Key slots with configured material (same resolution as {@link selectFmpLatencyKey}). */
+export async function listConfiguredFmpLatencySlots(env: Env): Promise<FmpLatencyKeySlot[]> {
+  const slots: FmpLatencyKeySlot[] = [];
+  const primary = await resolveFmpLatencyKeyMaterial(env, '1');
+  if (primary) slots.push('1');
+  const secondary = await resolveFmpLatencyKeyMaterial(env, '2', primary?.apiKey ?? null);
+  if (secondary) slots.push('2');
+  return slots;
+}
+
 /**
  * Pick a configured free-tier latency key that still has budget and whose poll
  * spacing has elapsed. **Alternates** among eligible keys (round-robin) so dual
