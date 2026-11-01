@@ -65,6 +65,12 @@ async function producedDispatch(txId: string): Promise<QueueMessage> {
 }
 
 beforeEach(async () => {
+  // Every fixture here is dated around NOW.  The SSE drain judges delivery
+  // freshness against the wall clock (DELIVERY_FRESH_WINDOW_DAYS), so without
+  // pinning Date the SSE tests start failing once real time is more than a
+  // week past NOW.  Only Date is faked; timers and microtasks stay real.
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
   const opened = await openMigratedD1();
   sqlite = opened.db;
   close = opened.close;
@@ -73,6 +79,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  // Restore the real clock first so a throwing close() cannot leak fake Date.
+  vi.useRealTimers();
   close();
   vi.unstubAllGlobals();
   stopSettingsRefresh();
