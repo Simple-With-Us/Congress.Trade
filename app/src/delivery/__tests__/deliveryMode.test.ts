@@ -79,8 +79,9 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  close();
+  // Restore the real clock first so a throwing close() cannot leak fake Date.
   vi.useRealTimers();
+  close();
   vi.unstubAllGlobals();
   stopSettingsRefresh();
   __resetSettingsForTests();
