@@ -310,6 +310,19 @@ describe('rule (b): stuck-while-pending sweep', () => {
     expect(pendingCount()).toBe(1);
   });
 
+  it('does not mark a pending ticker whose price_checked_at is still NULL', async () => {
+    seedFreshCorpus();
+    seedTrade('t-s-null', 'NEVERCHK');
+    seedSr('NEVERCHK', { priceUnavailable: 0, priceCheckedAt: null });
+
+    const res = await markStuckPeerPriceTickersNotCovered(env, NOW);
+
+    expect(res).toEqual({ marked: 0, qualified: 0 });
+    expect(srRow('NEVERCHK')?.price_unavailable).toBe(0);
+    expect(srRow('NEVERCHK')?.price_checked_at).toBeNull();
+    expect(pendingCount()).toBe(1);
+  });
+
   it('marks nothing when the corpus is stale (ST outage, not a coverage gap)', async () => {
     seedTrade('t-corp', 'CORP');
     seedSr('CORP', { latestPriceDate: '2020-01-01' });
@@ -612,6 +625,23 @@ describe('ST stale HTTP answers (CT-2443 drain)', () => {
     await runPriceRefresh(env, { max: 10 });
     expect(srRow('SHORT')?.price_unavailable).toBe(1);
     expect(String(srRow('SHORT')?.price_unavailable_reason)).toBe('socratic_no_eod_history');
+  });
+
+  it('counts stale hits for a pending ticker with no pre-existing securities_ref row', async () => {
+    seedFreshCorpus();
+    seedTrade('t-nosr', 'NOSR');
+    h.staleResponses.set('NOSR', [{ date: FRESH_THROUGH, close: 9 }]);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(srRow('NOSR')).toBeDefined();
+    expect(parsePeerStaleHitCount(String(srRow('NOSR')?.price_unavailable_reason))).toBe(1);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(parsePeerStaleHitCount(String(srRow('NOSR')?.price_unavailable_reason))).toBe(2);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(srRow('NOSR')?.price_unavailable).toBe(1);
+    expect(String(srRow('NOSR')?.price_unavailable_reason)).toBe('socratic_no_eod_history');
   });
 
   it('treats stale as transient when the corpus is behind (ST outage)', async () => {

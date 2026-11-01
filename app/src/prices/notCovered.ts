@@ -106,7 +106,7 @@ export async function markStuckPeerPriceTickersNotCovered(
   const params = stPeerPricePendingBindParams(now);
   const stuckCutoff = new Date(now.getTime() - ST_NOT_COVERED_STUCK_HOURS * 3_600_000).toISOString();
   const stuckWhere = `${stPeerPricePendingFromSql()}
-       AND (sr.price_checked_at IS NULL OR sr.price_checked_at < ?)`;
+       AND sr.price_checked_at IS NOT NULL AND sr.price_checked_at < ?`;
   const bindTail = [...stPeerPricePendingBindsForSubqueries(params, 1), stuckCutoff];
   const qualifiedRow = await get<{ n: number }>(
     env.DB,

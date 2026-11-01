@@ -940,9 +940,13 @@ export async function runPriceRefresh(
           if (!dryRun) {
             await run(
               env.DB,
-              `UPDATE securities_ref SET price_checked_at = ?, price_unavailable_reason = ?
-                WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
-              [nowIso, peerStaleHitReason(resolution.hits), ticker],
+              `INSERT INTO securities_ref (ticker, price_checked_at, price_unavailable_reason)
+                 VALUES (?, ?, ?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                 price_checked_at = excluded.price_checked_at,
+                 price_unavailable_reason = excluded.price_unavailable_reason
+               WHERE COALESCE(securities_ref.price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
+              [ticker, nowIso, peerStaleHitReason(resolution.hits)],
             );
           }
           continue;

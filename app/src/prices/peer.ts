@@ -14,9 +14,17 @@
  *    simply has no history on the peer; last-resort Massive may then run).
  */
 
+import { z } from 'zod';
 import type { Close } from './compute.ts';
 import type { PriceClient } from './types.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
+
+/** Untrusted ST 502 JSON body (strict mode stale signal). */
+const peerStale502BodySchema = z.object({
+  ok: z.boolean().optional(),
+  error: z.string().optional(),
+  closes: z.unknown().optional(),
+});
 
 /** Thrown in strict mode when ST answers `{ error: "stale" }` (usually HTTP 502). */
 export class PeerStaleResponseError extends Error {
@@ -97,9 +105,10 @@ export function buildPeerPriceClient(
       if (!res.ok) {
         if (strict && res.status === 502) {
           try {
-            const data = await res.json() as { ok?: boolean; error?: string; closes?: unknown };
-            if (data?.error === 'stale') {
-              throw new PeerStaleResponseError(descending(parsePeerCloses(data.closes)));
+            const json: unknown = await res.json();
+            const parsed = peerStale502BodySchema.safeParse(json);
+            if (parsed.success && parsed.data.error === 'stale') {
+              throw new PeerStaleResponseError(descending(parsePeerCloses(parsed.data.closes)));
             }
           } catch (e) {
             if (isPeerStaleResponseError(e)) throw e;
