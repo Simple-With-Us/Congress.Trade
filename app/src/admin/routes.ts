@@ -1211,7 +1211,7 @@ interface ReviewQueueTotals {
  */
 async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): Promise<ReviewQueueTotals> {
   const matchingWhere = reviewQueueFilterWhere(filters);
-  const [unresolvedRow, matchingRow, reasonRows, chamberRows] = await Promise.all([
+  const [unresolvedRow, matchingRow, reasonRows, chamberRows, ingestCounts] = await Promise.all([
     get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM review_queue WHERE resolved = 0`),
     get<{ n: number }>(
       db,
@@ -1231,6 +1231,7 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
         GROUP BY f.chamber`,
       [filters.resolved],
     ),
+    ingestFailureCounts(db, null),
   ]);
 
   const byReason: Record<string, number> = {};
@@ -1243,6 +1244,7 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
     matching: matchingRow?.n ?? 0,
     byReason,
     byChamber,
+    ...ingestCounts,
   };
 }
 
@@ -2895,6 +2897,21 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // per-model payload silently degraded to `[]` for every row, with no error
   // surfaced anywhere. Chunking fixes that; each chunk still degrades
   // independently (and harmlessly) if extraction_runs doesn't exist yet.
+  r.get('/review-queue/ingest-failures', async (c) => {
+    const chamber = c.req.query('chamber') || null;
+    const limit = parseIngestLimit(c.req.query('limit'));
+    let cursor: IngestFailureCursor | null = null;
+    if (c.req.query('cursor') !== undefined) {
+      cursor = decodeIngestFailureCursor(c.req.query('cursor') || '');
+      if (!cursor) return c.json({ error: 'invalid cursor' }, 400);
+    }
+    const [{ items, nextCursor }, totals] = await Promise.all([
+      listIngestFailures(c.env.DB, { chamber, limit, cursor }),
+      ingestFailureCounts(c.env.DB, chamber),
+    ]);
+    return c.json({ items, count: items.length, nextCursor, totals });
+  });
+
   r.get('/review-queue', async (c) => {
     const resolved = c.req.query('resolved') === '1' ? 1 : 0;
     const chamber = c.req.query('chamber') || null;
@@ -3080,6 +3097,16 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       nextCursor,
       totals,
     };
+    const includeRaw = c.req.query('include') || '';
+    if (includeRaw.split(',').map((s) => s.trim()).includes('ingest_failures')) {
+      const embedded = await listIngestFailures(c.env.DB, {
+        chamber: null,
+        limit: parseIngestLimit(c.req.query('ingestLimit') ?? c.req.query('limit')),
+        cursor: null,
+      });
+      body.ingestFailures = embedded.items;
+      body.ingestFailuresNextCursor = embedded.nextCursor;
+    }
     // Only surface `truncated` on the legacy unbounded call shape — an
     // explicit limit/cursor caller asked for a bounded page on purpose, that
     // isn't "truncation".
