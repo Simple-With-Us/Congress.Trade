@@ -11086,7 +11086,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Snap live (non-deprecated) non-competitor rows whose stored amount bounds
   // sit one dollar below a STOCK Act bracket (e.g. 1000–15000 → 1001–15000).
   // DRY RUN BY DEFAULT: pass ?dryRun=0 to write.  ?limit caps rows (default 500,
-  // max 5000).  In-place fix only — no delivery republish.
+  // max 1000).  In-place fix only — no delivery republish.
   r.post('/amount-bounds-canonicalize', async (c) => {
     try {
       const { canonicalizePublishedAmountBounds } = await import('./amountBoundsCanonicalize.ts');

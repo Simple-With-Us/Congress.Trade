@@ -13,9 +13,9 @@
 
 import { bracketMidpoint } from '../analytics/compute.ts';
 import { canonicalizeAmountBounds } from '../extraction/amounts.ts';
-import { recordIngestionDecision } from '../shared/ingestionDecisions.ts';
 import { STOCK_ACT_BRACKETS } from '../shared/brackets.ts';
-import { all, run } from '../shared/db.ts';
+import { all, batch, first, type SqlParam } from '../shared/db.ts';
+import { uuid } from '../shared/ids.ts';
 import type { Env, TxSource } from '../shared/types.ts';
 
 interface CandidateRow {
@@ -30,9 +30,13 @@ export interface AmountBoundsCanonicalizeResult {
   dryRun: boolean;
   limit: number;
   matched: number;
+  /** Rows in the candidate backlog (same predicate as the page query). */
+  totalCandidates: number;
+  /** True when totalCandidates exceeds matched (operator should rerun). */
+  hasMore: boolean;
   /** Rows that would change (dry run) or did change (apply). */
   changed: number;
-  /** Counts keyed by canonical bracket label, e.g. "1001-15000". */
+  /** Candidate-row counts keyed by canonical bracket label, e.g. "1001-15000". */
   byBracket: Record<string, number>;
   sample: Array<{
     id: string;
@@ -67,8 +71,18 @@ export async function canonicalizePublishedAmountBounds(
   opts: { dryRun?: boolean; limit?: number; actor?: string | null } = {},
 ): Promise<AmountBoundsCanonicalizeResult> {
   const dryRun = opts.dryRun !== false;
-  const limit = Math.max(1, Math.min(opts.limit ?? 500, 5000));
+  const limit = Math.max(1, Math.min(opts.limit ?? 500, 1000));
   const predicate = offByOneAmountPredicate('t');
+  const countRow = await first<{ n: number }>(
+    env.DB,
+    `SELECT COUNT(*) AS n
+       FROM transactions t
+      WHERE t.deprecated_at IS NULL
+        AND t.source <> 'competitor_backfill'
+        AND ${predicate}`,
+  );
+  const totalCandidates = Number(countRow?.n ?? 0);
+
   const rows = await all<CandidateRow>(
     env.DB,
     `SELECT t.id, t.doc_id, t.amount_min, t.amount_max, t.source
@@ -85,12 +99,17 @@ export async function canonicalizePublishedAmountBounds(
     dryRun,
     limit,
     matched: rows.length,
+    totalCandidates,
+    hasMore: totalCandidates > rows.length,
     changed: 0,
     byBracket: {},
     sample: [],
   };
 
-  const auditByDoc = new Map<string, { txIds: string[]; changes: Array<Record<string, unknown>> }>();
+  const pendingByDoc = new Map<
+    string,
+    Array<{ row: CandidateRow; afterMin: number; afterMax: number | null }>
+  >();
 
   for (const row of rows) {
     const canonical = canonicalizeAmountBounds(row.amount_min, row.amount_max);
@@ -116,41 +135,53 @@ export async function canonicalizePublishedAmountBounds(
       continue;
     }
 
-    const estValue = bracketMidpoint(canonical.min, canonical.max);
-    // Guard on the old bounds so a concurrent edit is never overwritten.
-    const update = await run(
-      env.DB,
-      `UPDATE transactions SET amount_min = ?, amount_max = ?, est_value = ?
-        WHERE id = ? AND deprecated_at IS NULL AND amount_min = ? AND amount_max IS ?`,
-      [canonical.min, canonical.max, estValue, row.id, row.amount_min, row.amount_max],
-    );
-    if ((update.meta?.changes ?? 0) === 0) continue;
-    result.changed += 1;
-
-    const bucket = auditByDoc.get(row.doc_id) ?? { txIds: [], changes: [] };
-    bucket.txIds.push(row.id);
-    bucket.changes.push({
-      txId: row.id,
-      before: { amountMin: row.amount_min, amountMax: row.amount_max },
-      after: { amountMin: canonical.min, amountMax: canonical.max },
+    const bucket = pendingByDoc.get(row.doc_id) ?? [];
+    bucket.push({
+      row,
+      afterMin: canonical.min,
+      afterMax: canonical.max,
     });
-    auditByDoc.set(row.doc_id, bucket);
+    pendingByDoc.set(row.doc_id, bucket);
   }
 
-  if (!dryRun) {
+  if (!dryRun && pendingByDoc.size > 0) {
     const nowIso = new Date().toISOString();
-    for (const [docId, audit] of auditByDoc) {
-      await recordIngestionDecision(env.DB, {
-        docId,
-        // Not confirmed/manual — benchmark ground truth ignores this reason (see routes.ts).
-        action: 'auto_published',
-        source: 'admin',
-        actor: opts.actor ?? null,
-        reason: 'amount_bounds_canonicalize',
-        payload: { repair: 'amount_bounds_canonicalize', changes: audit.changes },
-        transactionIds: audit.txIds,
-        createdAt: nowIso,
+    for (const [docId, pending] of pendingByDoc) {
+      const auditChanges = pending.map(({ row, afterMin, afterMax }) => ({
+        txId: row.id,
+        before: { amountMin: row.amount_min, amountMax: row.amount_max },
+        after: { amountMin: afterMin, amountMax: afterMax },
+      }));
+      const txIds = pending.map(({ row }) => row.id);
+      const statements: Array<[string, SqlParam[]]> = pending.map(({ row, afterMin, afterMax }) => {
+        const estValue = bracketMidpoint(afterMin, afterMax);
+        return [
+          `UPDATE transactions SET amount_min = ?, amount_max = ?, est_value = ?
+            WHERE id = ? AND deprecated_at IS NULL AND amount_min = ? AND amount_max IS ?`,
+          [afterMin, afterMax, estValue, row.id, row.amount_min, row.amount_max],
+        ];
       });
+      statements.push([
+        `INSERT INTO ingestion_decisions
+           (id, doc_id, action, source, actor, reason, payload, transaction_ids, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          uuid(),
+          docId,
+          'auto_published',
+          'admin',
+          opts.actor ?? null,
+          'amount_bounds_canonicalize',
+          JSON.stringify({ repair: 'amount_bounds_canonicalize', changes: auditChanges }),
+          JSON.stringify(txIds),
+          nowIso,
+        ],
+      ]);
+      // Guarded UPDATEs: a concurrent bounds edit makes that row a no-op (meta.changes=0).
+      const results = await batch(env.DB, statements);
+      for (const r of results.slice(0, pending.length)) {
+        result.changed += r?.meta?.changes ?? 0;
+      }
     }
   }
 

@@ -149,5 +149,40 @@ describe('canonicalizePublishedAmountBounds', () => {
     const again = await canonicalizePublishedAmountBounds(env, { dryRun: false });
     expect(again.matched).toBe(0);
     expect(again.changed).toBe(0);
+    expect(again.totalCandidates).toBe(0);
+    expect(again.hasMore).toBe(false);
+  });
+
+  it('reports totalCandidates and hasMore when limit is below the backlog', async () => {
+    for (let i = 0; i < 5; i += 1) {
+      insertTx(`H-page-${i}`, 'primary', 1000, 15000);
+    }
+
+    const page = await canonicalizePublishedAmountBounds(env, { dryRun: true, limit: 2 });
+
+    expect(page.matched).toBe(2);
+    expect(page.totalCandidates).toBe(5);
+    expect(page.hasMore).toBe(true);
+    expect(page.changed).toBe(2);
+  });
+
+  it('writes ingestion_decisions in the same batch pass as row updates per filing', async () => {
+    const offA = insertTx('H-batch-a', 'primary', 1000, 15000);
+    const offB = insertTx('H-batch-b', 'primary', 1000, 15000);
+
+    const result = await canonicalizePublishedAmountBounds(env, { dryRun: false, actor: 'admin@test' });
+
+    expect(result.changed).toBe(2);
+    expect(amounts(offA).amount_min).toBe(1001);
+    expect(amounts(offB).amount_min).toBe(1001);
+
+    const decisions = db.prepare(
+      'SELECT doc_id, transaction_ids FROM ingestion_decisions WHERE reason = ?',
+    ).all('amount_bounds_canonicalize') as Array<{ doc_id: string; transaction_ids: string }>;
+    expect(decisions).toHaveLength(2);
+    expect(decisions.map((d) => d.doc_id).sort()).toEqual(['H-batch-a', 'H-batch-b']);
+    for (const d of decisions) {
+      expect(JSON.parse(d.transaction_ids)).toHaveLength(1);
+    }
   });
 });
