@@ -1,7 +1,6 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:@aws-sdk/client-s3@3.1157.0": "3.1157.0",
     "npm:@aws-sdk/client-s3@3.1158.0": "3.1158.0",
     "npm:@cloudflare/workers-types@5": "5.20261007.1",
     "npm:@eslint/js@^10.0.1": "10.0.1_eslint@10.12.0",
@@ -64,22 +63,6 @@
         "@aws-sdk/core",
         "@aws-sdk/types",
         "@smithy/core",
-        "@smithy/types",
-        "tslib@2.8.1"
-      ]
-    },
-    "@aws-sdk/client-s3@3.1157.0": {
-      "integrity": "sha512-fbZIxqZVzK/PMLj9az3+ieAcYdZhzpTrfIVAnrE4PnRc1C6SokMDnaxAJycKTNmzLlY1fvmlItZWBDPUEFlGLQ==",
-      "dependencies": [
-        "@aws-sdk/checksums",
-        "@aws-sdk/core",
-        "@aws-sdk/credential-provider-node",
-        "@aws-sdk/middleware-sdk-s3",
-        "@aws-sdk/signature-v4-multi-region",
-        "@aws-sdk/types",
-        "@smithy/core",
-        "@smithy/fetch-http-handler",
-        "@smithy/node-http-handler",
         "@smithy/types",
         "tslib@2.8.1"
       ]
@@ -2473,7 +2456,7 @@
     ],
     "packageJson": {
       "dependencies": [
-        "npm:@aws-sdk/client-s3@3.1157.0",
+        "npm:@aws-sdk/client-s3@3.1158.0",
         "npm:@eslint/js@^10.0.1",
         "npm:@fontsource/zilla-slab@^5.3.0",
         "npm:@google/genai@^2.27.0",
