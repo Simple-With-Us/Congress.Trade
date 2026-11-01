@@ -459,7 +459,31 @@ describe('pipelineLoudAlerts', () => {
     notifyStallSpy.mockClear();
     const second = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
     expect(second.alerted).toContain('health_fmp_latency');
-    expect(store.has(FMP_LATENCY_SILENCE_PENDING_KV_KEY)).toBe(false);
+    // Pending stays while critical so the next sweep stays on the alerting path.
+    expect(store.has(FMP_LATENCY_SILENCE_PENDING_KV_KEY)).toBe(true);
+  });
+
+  it('fmp_latency: a stale pending mark restarts the confirm window instead of alerting', async () => {
+    const { env, store } = kvEnv();
+    store.set(
+      FMP_LATENCY_SILENCE_PENDING_KV_KEY,
+      JSON.stringify({ firstSeenAt: '2026-10-31T09:00:00.000Z' }),
+    );
+    const { checkPipelineHealth } = await import('../../shared/pipelineHealth.ts');
+    vi.mocked(checkPipelineHealth).mockResolvedValue({
+      status: 'critical',
+      checks: [{
+        id: 'fmp_latency',
+        status: 'critical',
+        detail: 'FMP latency probe silent for 240 min',
+        value: null,
+      }],
+    });
+    notifyStallSpy.mockClear();
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
+    expect(result.alerted).not.toContain('health_fmp_latency');
+    expect(JSON.parse(store.get(FMP_LATENCY_SILENCE_PENDING_KV_KEY) as string).firstSeenAt)
+      .toBe('2026-11-01T18:00:00.000Z');
   });
 
   it('fmp_latency: degraded self-healing clears pending without paging', async () => {

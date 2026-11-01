@@ -659,6 +659,9 @@ async function processStallCondition(
   result.alerted.push(condition);
 }
 
+/** Two hourly sweeps plus slack; older pending marks restart the confirm window. */
+const FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS = 150 * 60 * 1000;
+
 async function processFmpLatencySilenceAlert(
   env: Env,
   check: { status: string; detail: string; value?: unknown },
@@ -693,7 +696,10 @@ async function processFmpLatencySilenceAlert(
   } catch {
     pending = null;
   }
-  if (!pending) {
+  // A pending mark older than two sweeps is stale (sweeps were skipped or the
+  // check cleared without a sweep seeing it); start the confirm window over.
+  const pendingAgeMs = pending ? now.getTime() - Date.parse(pending.firstSeenAt) : Number.NaN;
+  if (!pending || !Number.isFinite(pendingAgeMs) || pendingAgeMs > FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS) {
     try {
       await env.CONFIG_KV.put(pendingKey, JSON.stringify({ firstSeenAt: now.toISOString() } satisfies FmpLatencySilencePending));
     } catch {
@@ -714,11 +720,8 @@ async function processFmpLatencySilenceAlert(
     result,
     deps,
   );
-  try {
-    await env.CONFIG_KV.delete(pendingKey);
-  } catch {
-    /* fail-soft */
-  }
+  // Keep the pending mark while still critical so every later sweep stays on
+  // the alerting path; it is cleared when the check leaves critical.
 }
 
 /**
