@@ -71,8 +71,7 @@ notify() {
   [[ $(( $(now) - last )) -lt 3600 ]] && return 0
   now > "$NOTIFY_FILE"
   curl -sS -m 15 -o /dev/null \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$PUSHOVER_APP_TOKEN" "$PUSHOVER_USER_KEY") \
     --form-string "title=congress.trade deploy guard" \
     --form-string "message=$1" \
     --form-string "priority=1" \

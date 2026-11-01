@@ -42,8 +42,7 @@ alert_pushover() {
     return 0
   fi
   curl -sS -m 15 -o /dev/null \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$PUSHOVER_APP_TOKEN" "$PUSHOVER_USER_KEY") \
     --form-string "title=fleet-backup-verify-weekly FAIL" \
     --form-string "message=${msg}" \
     --form-string "priority=1" \

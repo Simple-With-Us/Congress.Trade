@@ -36,7 +36,7 @@ TARGET_URL="${TARGET_URL:-https://congress.trade}"
 if [[ -n "$INGEST_TOKEN" ]]; then
   UPTIME_SEC="$(sysctl -n kern.boottime 2>/dev/null | awk '{print $4}' | tr -d ',' | awk -v now="$(date +%s)" '{print now - $1}' || echo 0)"
   curl -s -X POST "${TARGET_URL}/api/ingest/mac-heartbeat" \
-    -H "Authorization: Bearer ${INGEST_TOKEN}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$INGEST_TOKEN") \
     -H "Content-Type: application/json" \
     -d "{\"worker\":\"mac-scout\",\"status\":\"ok\",\"uptimeSeconds\":${UPTIME_SEC}}" >/dev/null 2>&1 || log "Failed to post Mac heartbeat"
 fi
@@ -49,7 +49,7 @@ if [[ "$HTTP_CODE" != "200" ]]; then
   
   if [[ -n "$COOLIFY_TOKEN" ]]; then
     RESTART_RESP="$(curl -s -X POST "${COOLIFY_BASE_URL:-https://host.jays.services}/api/v1/applications/congress-trade/restart" \
-      -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+      -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
       -H "Content-Type: application/json" --insecure || echo '{"error":"request failed"}')"
     log "Coolify API restart triggered: ${RESTART_RESP}"
   else

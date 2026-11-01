@@ -92,8 +92,7 @@ notify() {
   [[ $(( $(now) - last )) -lt 3600 ]] && return 0
   now > "$NOTIFY_FILE"
   curl -sS -m 15 -o /dev/null \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$PUSHOVER_APP_TOKEN" "$PUSHOVER_USER_KEY") \
     --form-string "title=${APP_NAME} deploy guard" \
     --form-string "message=$1" \
     --form-string "priority=1" \
@@ -144,7 +143,7 @@ print(sha.lower())') || return 2
   [[ "$live" =~ ^[0-9a-f]{7,40}$ ]] || return 2
 
   head=$(curl -sS -m 20 -H 'Accept: application/vnd.github+json' \
-    ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
+    -K <(if [[ -n "${GH_TOKEN:-}" ]]; then printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN"; fi) \
     "${GITHUB_API}/repos/${GITHUB_REPO}/commits/main" 2>/dev/null \
     | python3 -c 'import json,sys
 try:
@@ -159,7 +158,7 @@ except Exception:
   fi
 
   files=$(curl -sS -m 30 -H 'Accept: application/vnd.github+json' \
-    ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
+    -K <(if [[ -n "${GH_TOKEN:-}" ]]; then printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN"; fi) \
     "${GITHUB_API}/repos/${GITHUB_REPO}/compare/${live}...${head}" 2>/dev/null \
     | python3 -c 'import json,sys
 try:
