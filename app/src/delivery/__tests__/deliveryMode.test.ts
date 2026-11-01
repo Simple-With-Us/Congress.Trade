@@ -64,6 +64,17 @@ async function producedDispatch(txId: string): Promise<QueueMessage> {
   return captured[0]!;
 }
 
+/**
+ * Pin the wall clock to NOW for tests whose rows carry fixed timestamps.  The
+ * SSE drain drops trades older than DELIVERY_FRESH_WINDOW_DAYS against
+ * Date.now(), so without this the fixtures age out a week after they were
+ * written.  Only Date is faked; timers and promises run normally.
+ */
+function pinClock(): void {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
+}
+
 beforeEach(async () => {
   // Every fixture here is dated around NOW.  The SSE drain judges delivery
   // freshness against the wall clock (DELIVERY_FRESH_WINDOW_DAYS), so without
@@ -82,6 +93,7 @@ afterEach(() => {
   // Restore the real clock first so a throwing close() cannot leak fake Date.
   vi.useRealTimers();
   close();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   stopSettingsRefresh();
   __resetSettingsForTests();
@@ -219,6 +231,7 @@ describe('mode hold', () => {
   });
 
   it('pauses the SSE backlog drain without advancing the cursor', async () => {
+    pinClock();
     sqlite.exec(`INSERT INTO transactions (id, doc_id, created_at) VALUES ('tx_s1', 'doc_s', '2026-10-25T11:00:00Z')`);
     const seq = z.object({ cursor_seq: z.number() })
       .parse(sqlite.prepare(`SELECT cursor_seq FROM transactions WHERE id = 'tx_s1'`).get()).cursor_seq;
@@ -297,6 +310,7 @@ describe('mode suppress', () => {
   });
 
   it('SSE pauses during suppress, then skips suppressed rows after resume', async () => {
+    pinClock();
     sqlite.exec(`
       INSERT INTO transactions (id, doc_id, created_at) VALUES ('tx_s1', 'doc_s', '2026-10-25T11:00:00Z');
       INSERT INTO transactions (id, doc_id, created_at) VALUES ('tx_s2', 'doc_s', '2026-10-25T11:00:01Z');
