@@ -256,8 +256,8 @@ export async function withSenateEfdEgress<T>(
 
 const SENATE_BASE = 'https://efdsearch.senate.gov';
 export const SENATE_SEARCH = `${SENATE_BASE}/search/`;
-const SENATE_HOME = `${SENATE_BASE}/search/home/`;
-const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
+export const SENATE_HOME = `${SENATE_BASE}/search/home/`;
+export const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
 
 /** PTR report type code in the efdsearch DataTables API. */
 export const SENATE_PTR_REPORT_TYPE = 11;
@@ -579,6 +579,28 @@ export interface FetchSenatePtrFilingsOptions {
   proxyFirstAnswerTimeoutMs?: number;
   /** Cancels active source I/O when the enclosing watcher tick reaches its deadline. */
   signal?: AbortSignal;
+  /**
+   * Run the eFD flow through a real Chromium page (senateBrowserFetch.ts)
+   * instead of plain HTTP.  Opt-in; default off (env SENATE_EFD_BROWSER_FETCH).
+   * The plain-HTTP flow has been edge-denied at the agreement POST since
+   * 2026-10-23 (CT-2442), and the browser is the only automated client class
+   * observed to pass.  Requires the playwright package and a Chromium build
+   * in the deployment image.
+   */
+  browserFetch?: boolean;
+  /**
+   * With browserFetch, launch Chromium with
+   * --disable-blink-features=AutomationControlled, so navigator.webdriver
+   * reads false (owner decision, 2026-10-30).  Default off (env
+   * SENATE_EFD_HIDE_AUTOMATION).
+   */
+  hideAutomation?: boolean;
+  /**
+   * With browserFetch, launch Chromium headless.  Default true (env
+   * SENATE_EFD_BROWSER_HEADLESS); the verified eFD passes were headed (Mac)
+   * or a managed browser, so headless is unverified against the edge.
+   */
+  browserHeadless?: boolean;
 }
 
 /** KV key holding the cached, agreement-accepted eFD session. Shared with the
@@ -806,7 +828,7 @@ export async function fetchSenatePtrFilings(
     );
   }
 
-  return await withSenateEfdEgress(opts, fetchImpl, async (effectiveFetch, leg) => {
+  const runFlow = async (effectiveFetch: typeof fetch, leg: SenateEfdEgressLeg): Promise<SenateFiling[]> => {
   // The shared KV session belongs to the primary egress.  A direct leg that
   // is only the proxy's fallback never reads, writes or deletes it: the
   // proxy made it, the fetcher replays it through the same proxy, and a
@@ -915,6 +937,30 @@ export async function fetchSenatePtrFilings(
   }
 
   return parseSenateRows(rows);
-  });
+  };
+
+  const browserFetchEnabled = opts.browserFetch ??
+    (typeof process !== 'undefined' && process.env?.SENATE_EFD_BROWSER_FETCH === 'true');
+  if (browserFetchEnabled) {
+    const { createSenateBrowserFetch } = await import('./senateBrowserFetch.ts');
+    const browser = await createSenateBrowserFetch({
+      hideAutomation: opts.hideAutomation ??
+        (typeof process !== 'undefined' && process.env?.SENATE_EFD_HIDE_AUTOMATION === 'true'),
+      headless: opts.browserHeadless ??
+        (typeof process !== 'undefined' ? process.env?.SENATE_EFD_BROWSER_HEADLESS !== 'false' : true),
+      proxyUrl: resolveExplicitSenateProxyUrl(opts),
+    });
+    try {
+      // The browser owns its egress and its cookie jar, so the egress legs do
+      // not apply.  fallback: true keeps the browser-negotiated session out
+      // of the shared KV cache: its cookie header cannot be replayed by the
+      // plain-HTTP path, and the browser context is rebuilt on every run.
+      return await runFlow(browser.fetchImpl, { egress: 'direct', fallback: true });
+    } finally {
+      await browser.close();
+    }
+  }
+
+  return await withSenateEfdEgress(opts, fetchImpl, runFlow);
 }
 // Senate Scraper Hardening applied
