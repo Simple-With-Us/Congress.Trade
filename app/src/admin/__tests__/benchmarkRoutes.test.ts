@@ -896,6 +896,7 @@ describe('durable benchmark admin routes', () => {
     expect(groundTruthQueried).toBe(false);
     expect(selectionSql).toContain("d.source = 'admin'");
     expect(selectionSql).toContain("d.action IN ('confirmed', 'manual')");
+    expect(selectionSql).toContain("'amount_bounds_canonicalize'");
     expect(selectionSql).toContain('ORDER BY d.created_at DESC, d.id DESC');
   });
 

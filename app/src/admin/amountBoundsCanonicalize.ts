@@ -142,7 +142,8 @@ export async function canonicalizePublishedAmountBounds(
     for (const [docId, audit] of auditByDoc) {
       await recordIngestionDecision(env.DB, {
         docId,
-        action: 'manual',
+        // Not confirmed/manual — benchmark ground truth ignores this reason (see routes.ts).
+        action: 'auto_published',
         source: 'admin',
         actor: opts.actor ?? null,
         reason: 'amount_bounds_canonicalize',

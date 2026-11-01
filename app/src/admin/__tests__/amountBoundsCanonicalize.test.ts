@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openMigratedD1, type D1Database, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
+import { benchmarkDocumentIsHumanResolved } from '../routes.ts';
 import { canonicalizePublishedAmountBounds } from '../amountBoundsCanonicalize.ts';
 import type { Env } from '../../shared/types.ts';
 
@@ -92,8 +93,54 @@ describe('canonicalizePublishedAmountBounds', () => {
       "SELECT action, source, reason, transaction_ids FROM ingestion_decisions WHERE doc_id = 'H-a'",
     ).all() as Array<{ action: string; source: string; reason: string; transaction_ids: string }>;
     expect(decisions).toHaveLength(1);
-    expect(decisions[0]).toMatchObject({ action: 'manual', source: 'admin', reason: 'amount_bounds_canonicalize' });
+    expect(decisions[0]).toMatchObject({
+      action: 'auto_published',
+      source: 'admin',
+      reason: 'amount_bounds_canonicalize',
+    });
     expect(JSON.parse(decisions[0].transaction_ids)).toEqual(expect.arrayContaining([off, off2]));
+  });
+
+  it('does not promote machine-resolved filings to benchmark ground truth', async () => {
+    db.prepare(
+      `INSERT INTO filings (doc_id, chamber, filer_id, filing_type, filed_date, ingest_status, first_seen_at, raw_object_key)
+       VALUES ('H-gt-auto', 'house', 'F1', 'P', '2026-01-10', 'persisted', '2026-01-10T00:00:00.000Z', 'raw/H-gt-auto')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO review_queue (doc_id, reason, payload, created_at, resolved)
+       VALUES ('H-gt-auto', 'agreement', '{}', '2026-01-10T00:00:00.000Z', 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO ingestion_decisions
+         (id, doc_id, action, source, actor, reason, payload, transaction_ids, created_at)
+       VALUES ('dec-auto', 'H-gt-auto', 'auto_published', 'pipeline', NULL, 'agreement', NULL, '[]', '2026-01-11T00:00:00.000Z')`,
+    ).run();
+    insertTx('H-gt-auto', 'primary', 1000, 15000);
+
+    await canonicalizePublishedAmountBounds(env, { dryRun: false, actor: 'admin@test' });
+
+    expect(await benchmarkDocumentIsHumanResolved(env, 'H-gt-auto')).toBe(false);
+  });
+
+  it('preserves human-confirmed benchmark ground truth after repair audit', async () => {
+    db.prepare(
+      `INSERT INTO filings (doc_id, chamber, filer_id, filing_type, filed_date, ingest_status, first_seen_at, raw_object_key)
+       VALUES ('H-gt-human', 'house', 'F1', 'P', '2026-01-10', 'persisted', '2026-01-10T00:00:00.000Z', 'raw/H-gt-human')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO review_queue (doc_id, reason, payload, created_at, resolved)
+       VALUES ('H-gt-human', 'low_confidence', '{}', '2026-01-10T00:00:00.000Z', 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO ingestion_decisions
+         (id, doc_id, action, source, actor, reason, payload, transaction_ids, created_at)
+       VALUES ('dec-human', 'H-gt-human', 'confirmed', 'admin', 'reviewer', NULL, NULL, '[]', '2026-01-11T00:00:00.000Z')`,
+    ).run();
+    insertTx('H-gt-human', 'primary', 1000, 15000);
+
+    await canonicalizePublishedAmountBounds(env, { dryRun: false, actor: 'admin@test' });
+
+    expect(await benchmarkDocumentIsHumanResolved(env, 'H-gt-human')).toBe(true);
   });
 
   it('is idempotent on a second apply pass', async () => {
