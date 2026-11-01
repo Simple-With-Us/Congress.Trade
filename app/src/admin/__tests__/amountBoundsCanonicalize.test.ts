@@ -72,6 +72,8 @@ describe('canonicalizePublishedAmountBounds', () => {
     const subThousand = insertTx('H-a', 'primary', 0, 1000);
     const competitor = insertTx('H-a', 'competitor_backfill', 1000, 15000);
     const off2 = insertTx('H-a', 'server_cpu', 15000, 50000);
+    const unmappable = insertTx('H-a', 'primary', 1000, 20000);
+    const rowKeyBefore = (db.prepare('SELECT row_key FROM transactions WHERE id = ?').get(off) as { row_key: string }).row_key;
 
     const result = await canonicalizePublishedAmountBounds(env, { dryRun: false });
 
@@ -81,6 +83,10 @@ describe('canonicalizePublishedAmountBounds', () => {
     expect(amounts(subThousand)).toEqual({ amount_min: 0, amount_max: 1000, est_value: 500 });
     expect(amounts(competitor)).toEqual({ amount_min: 1000, amount_max: 15000, est_value: 8000 });
     expect(amounts(off2)).toEqual({ amount_min: 15001, amount_max: 50000, est_value: 32500.5 });
+    expect(amounts(unmappable)).toEqual({ amount_min: 1000, amount_max: 20000, est_value: 10500 });
+    // row_key is the durable identity (outbox, re-ingest dedupe) and must not move.
+    expect((db.prepare('SELECT row_key FROM transactions WHERE id = ?').get(off) as { row_key: string }).row_key)
+      .toBe(rowKeyBefore);
 
     const decisions = db.prepare(
       "SELECT action, source, reason, transaction_ids FROM ingestion_decisions WHERE doc_id = 'H-a'",
