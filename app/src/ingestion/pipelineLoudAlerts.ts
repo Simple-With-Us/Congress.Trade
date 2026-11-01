@@ -40,6 +40,11 @@ import {
   readSenateEdgeBackoff,
   SENATE_EDGE_BACKOFF_GRACE_MS,
 } from './senateEdgeDeny.ts';
+import {
+  FMP_LATENCY_SILENCE_PENDING_KV_KEY,
+  type FmpLatencyCheckValue,
+  type FmpLatencySilencePending,
+} from '../shared/fmpLatencyProbeHealth.ts';
 
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
@@ -88,6 +93,8 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   'st_peer_prices',
   // Same id as the dedicated empty_fetch_handoff condition and the health check.
   'empty_fetch_handoff',
+  // CT-2335: fmp_latency uses a dedicated silence confirm + self-healing grace path.
+  'fmp_latency',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -652,6 +659,68 @@ async function processStallCondition(
   result.alerted.push(condition);
 }
 
+async function processFmpLatencySilenceAlert(
+  env: Env,
+  check: { status: string; detail: string; value?: unknown },
+  now: Date,
+  result: PipelineStallAlertResult,
+  deps: { fetchImpl?: typeof fetch },
+): Promise<void> {
+  const condition = 'health_fmp_latency' satisfies PipelineStallCondition;
+  result.evaluated.push(condition);
+  const pendingKey = FMP_LATENCY_SILENCE_PENDING_KV_KEY;
+
+  if (check.status !== 'critical') {
+    try {
+      await env.CONFIG_KV.delete(pendingKey);
+    } catch {
+      /* fail-soft */
+    }
+    await processStallCondition(
+      env,
+      condition,
+      { stalled: false, detail: check.detail || `${condition} cleared` },
+      now,
+      result,
+      deps,
+    );
+    return;
+  }
+
+  let pending: FmpLatencySilencePending | null = null;
+  try {
+    pending = await env.CONFIG_KV.get<FmpLatencySilencePending>(pendingKey, 'json');
+  } catch {
+    pending = null;
+  }
+  if (!pending) {
+    try {
+      await env.CONFIG_KV.put(pendingKey, JSON.stringify({ firstSeenAt: now.toISOString() } satisfies FmpLatencySilencePending));
+    } catch {
+      /* fail-soft */
+    }
+    return;
+  }
+
+  const value = check.value as FmpLatencyCheckValue | null | undefined;
+  const detail = value?.selfHealingSilence
+    ? `[health/critical past self-healing grace] ${check.detail}`
+    : `[health/critical confirmed x2 hourly sweeps since ${pending.firstSeenAt}] ${check.detail}`;
+  await processStallCondition(
+    env,
+    condition,
+    { stalled: true, detail },
+    now,
+    result,
+    deps,
+  );
+  try {
+    await env.CONFIG_KV.delete(pendingKey);
+  } catch {
+    /* fail-soft */
+  }
+}
+
 /**
  * Stall detector: ingest chambers, OCR/scan-reader, and Socratic.Trade sharing.
  * Runs on the hourly autonomy sweep (deduped per condition per window).
@@ -809,6 +878,10 @@ export async function sweepPipelineStallAlerts(
         result,
         deps,
       );
+    }
+    const fmpCheck = health.checks.find((c) => c.id === 'fmp_latency');
+    if (fmpCheck) {
+      await processFmpLatencySilenceAlert(env, fmpCheck, now, result, deps);
     }
   } catch {
     /* health collection must not break the stall sweep */
