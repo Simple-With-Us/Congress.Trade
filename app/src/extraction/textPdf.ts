@@ -16,8 +16,6 @@
  * transaction-type code, one or two dates, and an amount bracket.
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
-
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { HOUSE_ASSET_TYPE_NAMES, houseAssetTypeCodePattern } from '../shared/assetTypes.ts';
@@ -88,6 +86,7 @@ async function extractPdfText(bytes: ArrayBuffer): Promise<PdfTextExtraction> {
   // which reuses the same ArrayBuffer after text extraction. Do not remove the copy
   // (regression guard for Sentry CONGRESS-TRADE-2).
   try {
+    const { extractText, getDocumentProxy } = await import('unpdf');
     const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0)));
     const { text } = await extractText(pdf, { mergePages: true });
     const pageCount = typeof pdf.numPages === 'number' && Number.isFinite(pdf.numPages) ? pdf.numPages : null;

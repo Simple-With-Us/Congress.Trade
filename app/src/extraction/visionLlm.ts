@@ -20,12 +20,10 @@ import { jsonrepair } from 'jsonrepair';
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Env, Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { parseAmountRange } from './amounts.ts';
-import { PDFDocument } from 'pdf-lib';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { get } from '../shared/db.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { assertLlmSpendWithinCeiling, settleLlmSpend } from '../shared/llmSpend.ts';
-import { GoogleGenAI } from '@google/genai';
 import { candidateSpendUsd } from './bakeoff.ts';
 
 /**
@@ -169,6 +167,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
       lowerModel.includes('openrouter');
 
     try {
+      const { PDFDocument } = await import('pdf-lib');
       const pdfDoc = await PDFDocument.load(input.bytes, { ignoreEncryption: true });
       pageCount = pdfDoc.getPageCount();
       const MAX_PAGES = 50;
@@ -212,6 +211,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
         let lastError: Error | null = null;
         let jsonText = '';
 
+        const { GoogleGenAI } = await import('@google/genai');
         for (const k of keys) {
           try {
             await geminiRateLimiter.wait(this.env.GEMINI_RPM_LIMIT);
@@ -829,6 +829,7 @@ export function markSalvaged(tx: ParsedTx): ParsedTx {
  * any provider call.
  */
 export async function validatePdfForAnthropic(bytes: ArrayBuffer): Promise<ArrayBuffer> {
+  const { PDFDocument } = await import('pdf-lib');
   try {
     await PDFDocument.load(bytes, { ignoreEncryption: true });
     return bytes;
@@ -849,6 +850,7 @@ export async function validatePdfForAnthropic(bytes: ArrayBuffer): Promise<Array
  * (see {@link isAnthropicInvalidPdfError}), never as the primary bytes sent.
  */
 export async function resavePdfForAnthropic(bytes: ArrayBuffer): Promise<ArrayBuffer> {
+  const { PDFDocument } = await import('pdf-lib');
   try {
     const pdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const saved = await pdfDoc.save();
