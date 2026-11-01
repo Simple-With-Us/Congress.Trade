@@ -51,6 +51,14 @@ import {
 } from '../prices/stPeerPricesHealth.ts';
 import { emptyFetchAlertWhere, emptyFetchSeenCutoff } from '../ingestion/emptyFetchHandoff.ts';
 import { collectDeliveryModeCheck } from '../delivery/deliveryMode.ts';
+import {
+  enrichFmpLatencySelfHealingSilence,
+  evaluateFmpLatencyCheck,
+  readFmpLatencyCriticalAgeSec,
+  readFmpLatencySelfHealingGraceMs,
+  fmpLatencyProbeExpected,
+  type FmpLatencySelfHealingSilence,
+} from './fmpLatencyProbeHealth.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -170,6 +178,8 @@ export interface PipelineSignals {
     http429s24h: number | null;
     /** Per-provider last-observation age (seconds) when trade_provider_observations is reachable. */
     byProvider: Record<string, { lastObservationAt: string | null; ageSec: number | null; count24h: number | null }> | null;
+    /** Set during signal collection when silence is a known self-healing state (CT-2335). */
+    selfHealingSilence?: FmpLatencySelfHealingSilence | null;
   } | null;
   lastExtractionSuccessAt: string | null;
   /**
@@ -784,32 +794,27 @@ export function evaluatePipelineSignals(
   // starts returning 401/403 (which would silently stall the price refresh
   // lane — the 2026-09-20 outage class).
   if (s.fmpLatency != null) {
-    const ageSec = s.fmpLatency.lastObservationAgeSec;
-    const count = s.fmpLatency.observationCount24h;
-    const f429 = s.fmpLatency.http429s24h;
-    const probeExpected = (() => {
-      const on = envGet('FMP_LATENCY_PROBE_ENABLED');
-      return on !== 'false' && on !== '0';
-    })();
-    const isCritical = probeExpected && (ageSec == null || ageSec > 3 * 3600 || (count ?? 0) === 0);
-    const isDegraded = !isCritical && (ageSec == null || ageSec > 3600 || (f429 ?? 0) > 5);
-    const tier: PipelineStatus = isCritical ? 'critical' : isDegraded ? 'degraded' : 'ok';
-    const detail = isCritical
-      ? `FMP latency probe silent for ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'no observation in 48h'} (${count ?? 0} obs/24h). Observations are not committing.  Check SQLITE_BUSY / WAL checkpoint before rotating FMP_LATENCY_API_KEY.`
-      : isDegraded
-        ? `FMP latency probe lagging (last age ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'unknown'}, ${f429 ?? 0} HTTP 429s in 24h).`
-        : `FMP latency probe live (last observation ${ageSec != null ? Math.round(ageSec / 60) + ' min ago' : 'unknown'}, ${count ?? 0} obs in 24h, ${f429 ?? 0} 429s).`;
+    const envGet = (k: string): string | undefined => {
+      try {
+        return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k);
+      } catch {
+        return undefined;
+      }
+    };
+    const probeExpected = fmpLatencyProbeExpected(envGet);
+    const criticalAgeSec = readFmpLatencyCriticalAgeSec(envGet);
+    const graceMs = readFmpLatencySelfHealingGraceMs(envGet);
+    const evaluated = evaluateFmpLatencyCheck(s.fmpLatency, nowMs, {
+      probeExpected,
+      criticalAgeSec,
+      graceMs,
+      selfHealing: s.fmpLatency.selfHealingSilence,
+    });
     checks.push({
       id: 'fmp_latency',
-      status: tier,
-      detail,
-      value: {
-        observationCount24h: count,
-        lastObservationAt: s.fmpLatency.lastObservationAt,
-        lastObservationAgeSec: ageSec,
-        http429s24h: f429,
-        byProvider: s.fmpLatency.byProvider,
-      },
+      status: evaluated.status,
+      detail: evaluated.detail,
+      value: evaluated.value,
     });
   } else {
     checks.push({ id: 'fmp_latency', status: 'unknown', detail: 'FMP latency telemetry uncollected', value: null });
@@ -1618,6 +1623,22 @@ export async function checkPipelineHealth(
     }
     if (fmpLatency) fmpLatency.http429s24h = total;
   } catch {}
+
+  if (fmpLatency) {
+    try {
+      const envGet = (k: string): string | undefined => {
+        try {
+          return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k);
+        } catch {
+          return undefined;
+        }
+      };
+      const selfHealing = await enrichFmpLatencySelfHealingSilence(env, fmpLatency, now, envGet);
+      if (selfHealing) fmpLatency = { ...fmpLatency, selfHealingSilence: selfHealing };
+    } catch {
+      /* fail-soft */
+    }
+  }
 
   try {
     const res = await get<{ n: number; oldest: string | null }>(

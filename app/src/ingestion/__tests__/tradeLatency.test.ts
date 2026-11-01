@@ -21,6 +21,7 @@ import {
   disclosurePublishYieldWeight,
   budgetedProbeIntervalSec,
   selectFmpLatencyKey,
+  listConfiguredFmpLatencySlots,
   selectRotatedAvenue,
   selectFmpLatencyPathForCycle,
   selectLatencySourceProbe,
@@ -31,6 +32,8 @@ import {
   addFmpLatencyUsed,
   markFmpSlotHttp429,
   isFmpSlotHttp429,
+  isFmpSlotHttp429DayBan,
+  readFmpSlotHttp429Cause,
   addLatencySourceUsed,
   getLatencySourceUsed,
   LATENCY_SOURCE_BUDGETS,
@@ -562,6 +565,34 @@ describe('tradeLatency', () => {
       expect(fleet.freeTierCap).toBe(FMP_LATENCY_DAILY_CAP_PER_KEY * 2);
     });
 
+    it('listConfiguredFmpLatencySlots mirrors key material (incl. FMP_API_KEY slot-2 fallback)', async () => {
+      const kv = new Map<string, string>();
+      const configKv = {
+        get: async (k: string) => kv.get(k) ?? null,
+        put: async (k: string, v: string) => {
+          kv.set(k, v);
+        },
+      };
+      const dual = {
+        FMP_LATENCY_API_KEY: 'free-key-a',
+        FMP_API_KEY: 'free-key-b',
+        CONFIG_KV: configKv,
+      } as never;
+      expect(await listConfiguredFmpLatencySlots(dual)).toEqual(['1', '2']);
+      const same = {
+        FMP_LATENCY_API_KEY: 'same',
+        FMP_API_KEY: 'same',
+        CONFIG_KV: configKv,
+      } as never;
+      expect(await listConfiguredFmpLatencySlots(same)).toEqual(['1']);
+      const secondaryOnly = {
+        FMP_LATENCY_API_KEY_2: 'k2',
+        FMP_LATENCY_API_KEY: 'k1',
+        CONFIG_KV: configKv,
+      } as never;
+      expect(await listConfiguredFmpLatencySlots(secondaryOnly)).toEqual(['1', '2']);
+    });
+
     it('getFmpLatencyFleetRemaining sums dual free keys + RapidAPI path budget', async () => {
       const kv = new Map<string, string>();
       const env = {
@@ -663,9 +694,32 @@ describe('tradeLatency', () => {
         },
       } as never;
       const now = new Date('2026-08-05T15:00:00.000Z');
-      await markFmpSlotHttp429(env, '1', now);
+      await markFmpSlotHttp429(env, '1', now, '429');
       const picked = await selectFmpLatencyKey(env, now, { force: true });
       expect(picked?.slot).toBe('2');
+    });
+
+    it('isFmpSlotHttp429DayBan is true only for 429 cause, not unauthorized or legacy', async () => {
+      const kv = new Map<string, string>();
+      const env = {
+        CONFIG_KV: {
+          get: async (k: string) => kv.get(k) ?? null,
+          put: async (k: string, v: string) => {
+            kv.set(k, v);
+          },
+        },
+      } as never;
+      const now = new Date('2026-08-05T15:00:00.000Z');
+      await markFmpSlotHttp429(env, '1', now, '429');
+      expect(await readFmpSlotHttp429Cause(env, '1', now)).toBe('429');
+      expect(await isFmpSlotHttp429DayBan(env, '1', now)).toBe(true);
+      await markFmpSlotHttp429(env, '2', now, 'unauthorized');
+      expect(await readFmpSlotHttp429Cause(env, '2', now)).toBe('unauthorized');
+      expect(await isFmpSlotHttp429DayBan(env, '2', now)).toBe(false);
+      expect(await isFmpSlotHttp429(env, '2', now)).toBe(true);
+      kv.set('fmp-latency:http429:key1:2026-08-05', '1');
+      expect(await isFmpSlotHttp429DayBan(env, '1', now)).toBe(false);
+      expect(await isFmpSlotHttp429(env, '1', now)).toBe(true);
     });
 
     it('retries the other FMP free-tier key in the same cycle after HTTP 401', async () => {

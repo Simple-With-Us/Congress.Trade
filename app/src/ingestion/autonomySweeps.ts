@@ -981,6 +981,9 @@ export async function sweepLivenessAlarms(
   const nowIso = now.toISOString();
   for (const check of health.checks) {
     if (!LIVENESS_ALARM_CHECK_IDS.has(check.id)) continue;
+    if ((check.value as { suppressLivenessNotification?: boolean } | undefined)?.suppressLivenessNotification) {
+      continue;
+    }
     result.evaluated += 1;
     const kvKey = `${LIVENESS_ALARM_KV_PREFIX}${check.id}`;
     let episode: LivenessAlarmEpisode | null = null;

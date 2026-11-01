@@ -692,16 +692,42 @@ function fmpHttp429DayKey(slot: FmpLatencyKeySlot, now = new Date()): string {
  * Used for FMP 429 (bandwidth cap) and for 401/403 (unauthorized / wrong plan)
  * so the other key keeps winning selection instead of the dead one.
  */
+export type FmpSlotDaySkipCause = '429' | 'unauthorized';
+
 export async function markFmpSlotHttp429(
   env: Env,
   slot: FmpLatencyKeySlot,
   now = new Date(),
+  cause: FmpSlotDaySkipCause = '429',
 ): Promise<void> {
   try {
-    await env.CONFIG_KV.put(fmpHttp429DayKey(slot, now), '1', { expirationTtl: 172800 });
+    await env.CONFIG_KV.put(fmpHttp429DayKey(slot, now), cause, { expirationTtl: 172800 });
   } catch {
     /* best effort */
   }
+}
+
+export async function readFmpSlotHttp429Cause(
+  env: Env,
+  slot: FmpLatencyKeySlot,
+  now = new Date(),
+): Promise<FmpSlotDaySkipCause | null> {
+  try {
+    const raw = await env.CONFIG_KV.get(fmpHttp429DayKey(slot, now));
+    if (raw === '429' || raw === 'unauthorized') return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** True only for bandwidth-cap (429) day marks — used for self-healing silence, not slot skip. */
+export async function isFmpSlotHttp429DayBan(
+  env: Env,
+  slot: FmpLatencyKeySlot,
+  now = new Date(),
+): Promise<boolean> {
+  return (await readFmpSlotHttp429Cause(env, slot, now)) === '429';
 }
 
 export async function isFmpSlotHttp429(
@@ -1158,6 +1184,16 @@ async function resolveFmpLatencyKeyMaterial(
     return { apiKey, secretName };
   }
   return null;
+}
+
+/** Key slots with configured material (same resolution as {@link selectFmpLatencyKey}). */
+export async function listConfiguredFmpLatencySlots(env: Env): Promise<FmpLatencyKeySlot[]> {
+  const slots: FmpLatencyKeySlot[] = [];
+  const primary = await resolveFmpLatencyKeyMaterial(env, '1');
+  if (primary) slots.push('1');
+  const secondary = await resolveFmpLatencyKeyMaterial(env, '2', primary?.apiKey ?? null);
+  if (secondary) slots.push('2');
+  return slots;
 }
 
 /**
@@ -4070,7 +4106,7 @@ async function runProviderProbe(
           const is429 = /FMP_HTTP_429|HTTP_429/.test(msg);
           const isUnauthorized = /FMP_HTTP_(401|403)|HTTP_(401|403)/.test(msg);
           if ((!is429 && !isUnauthorized) || !isFmpStable || !fmpSelection) break;
-          await markFmpSlotHttp429(env, fmpSelection.slot, now);
+          await markFmpSlotHttp429(env, fmpSelection.slot, now, is429 ? '429' : 'unauthorized');
           if (attempt === 0) {
             const retry = await selectFmpLatencyKey(env, now, { force: true, schedule });
             if (retry && retry.slot !== fmpSelection.slot) {
