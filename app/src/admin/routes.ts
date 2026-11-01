@@ -7,6 +7,7 @@
  *   PUT   /poll-config              -> update schedule / aggressiveMode (setConfig)
  *   GET   /poll-config/aggressive   -> aggressiveMode toggle convenience read
  *   GET   /review-queue             -> list unresolved review items
+ *   GET   /review-queue/ingest-failures -> filings stuck at ingest (read-only)
  *   POST  /review/:docId            -> {decision:'confirm'|'reject', edits?}
  *   GET   /sources/health           -> ingest_log aggregates per source
  *   GET   /instrument-pricing       -> equities/crypto/options/event-contract capability matrix
@@ -968,11 +969,232 @@ function reviewQueueFilterWhere(f: ReviewQueueFilters): { clause: string; params
   return { clause: clauses.join(' AND '), params };
 }
 
+// --- Ingest failures (filings stuck at ingest_status='error') ---------------
+//
+// Some filings fail at fetch/extract before a review_queue row is ever
+// written, so the queue listing below cannot see them and "0 pending"
+// misreads as "healthy". This read-only view surfaces those filings without
+// changing the queue itself (no writes, no re-drive, no auto-retry).
+//
+// A filing counts as an ingest failure when:
+//   - ingest_status = 'error' (uses idx_filings_status),
+//   - it has no OPEN (resolved=0) review_queue row (an open row is already
+//     listed in the queue — listing it twice would double-count),
+//   - it was not honestly rejected through review (resolved=1 +
+//     resolution_kind='rejected' is a terminal decision, already visible
+//     under ?resolved=1), and
+//   - it has no live (deprecated_at IS NULL) transactions.
+// The last condition keeps CT-2453 rows out: a published filing whose stamp
+// flipped back to 'error' on a later fetch-stage failure has correct data
+// and must not be presented as needing review/re-extraction. Those rows
+// are counted separately as `publishedStatusStale` (count only, never
+// listed). Both EXISTS probes key off indexed doc_id lookups (review_queue
+// PK, idx_tx_doc), so neither scans transactions per row.
+
+const INGEST_FAILURE_ERROR_MAX = 300;
+
+interface IngestFailureCursor {
+  seenAt: string;
+  docId: string;
+}
+
+function encodeIngestFailureCursor(cur: IngestFailureCursor): string {
+  return btoa(JSON.stringify(cur));
+}
+
+function decodeIngestFailureCursor(raw: string): IngestFailureCursor | null {
+  try {
+    const parsed = JSON.parse(atob(raw)) as Partial<IngestFailureCursor>;
+    if (typeof parsed.seenAt === 'string' && typeof parsed.docId === 'string') {
+      return { seenAt: parsed.seenAt, docId: parsed.docId };
+    }
+  } catch {
+    /* malformed cursor — caller treats this as null (400) */
+  }
+  return null;
+}
+
+/** Bounded page size shared by the ingest-failure listing (default 50, max 200). */
+function parseIngestLimit(raw: string | undefined): number {
+  const n = parseInt(raw || '', 10);
+  const limit = Number.isFinite(n) && n > 0 ? n : REVIEW_QUEUE_DEFAULT_LIMIT;
+  return Math.min(limit, REVIEW_QUEUE_MAX_LIMIT);
+}
+
+/** Shared WHERE for the ingest-failure page query and its COUNT. */
+function ingestFailureWhere(chamber: string | null): { clause: string; params: SqlParam[] } {
+  const clauses = [
+    `f.ingest_status = 'error'`,
+    `NOT EXISTS (SELECT 1 FROM review_queue rq WHERE rq.doc_id = f.doc_id AND rq.resolved = 0)`,
+    `NOT EXISTS (SELECT 1 FROM review_queue rq WHERE rq.doc_id = f.doc_id AND rq.resolved = 1 AND rq.resolution_kind = 'rejected')`,
+    `NOT EXISTS (SELECT 1 FROM transactions t WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL)`,
+  ];
+  const params: SqlParam[] = [];
+  if (chamber) {
+    clauses.push('f.chamber = ?');
+    params.push(chamber);
+  }
+  return { clause: clauses.join(' AND '), params };
+}
+
+interface IngestFailureCounts {
+  ingestFailures: number;
+  publishedStatusStale: number;
+}
+
+async function ingestFailureCounts(db: D1Database, chamber: string | null): Promise<IngestFailureCounts> {
+  const where = ingestFailureWhere(chamber);
+  const staleClauses = [
+    `f.ingest_status = 'error'`,
+    `EXISTS (SELECT 1 FROM transactions t WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL)`,
+  ];
+  const staleParams: SqlParam[] = [];
+  if (chamber) {
+    staleClauses.push('f.chamber = ?');
+    staleParams.push(chamber);
+  }
+  const [failRow, staleRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM filings f WHERE ${where.clause}`, where.params),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM filings f WHERE ${staleClauses.join(' AND ')}`, staleParams),
+  ]);
+  return {
+    ingestFailures: Number(failRow?.n ?? 0) || 0,
+    publishedStatusStale: Number(staleRow?.n ?? 0) || 0,
+  };
+}
+
+interface IngestFailureRow {
+  doc_id: string;
+  chamber: string | null;
+  filer_id: string | null;
+  filing_type: string | null;
+  filed_date: string | null;
+  source_url: string | null;
+  raw_object_key: string | null;
+  doc_kind: string | null;
+  ingest_status: string | null;
+  error: string | null;
+  first_seen_at: string | null;
+  source_updated_at: string | null;
+  review_resolved: number | null;
+  review_resolution_kind: string | null;
+}
+
+/**
+ * One page of ingest-failure filings, newest first. Keyset-paginated on
+ * (COALESCE(first_seen_at,''), doc_id), mirroring the review-queue cursor:
+ * filings has no queue-style created_at, and first_seen_at is the closest
+ * stored "when did this get stuck" stamp (error writes touch no timestamp
+ * column). Filer names and the ingestion_outbox last-attempt stamp are
+ * enriched per page in chunked IN (...) lookups and degrade to null when
+ * those tables are absent, exactly like the extraction_runs enrichment in
+ * GET /review-queue.
+ */
+async function listIngestFailures(
+  db: D1Database,
+  opts: { chamber: string | null; limit: number; cursor: IngestFailureCursor | null },
+): Promise<{ items: Array<Record<string, unknown>>; nextCursor: string | null }> {
+  const where = ingestFailureWhere(opts.chamber);
+  const clauses = [where.clause];
+  const params: SqlParam[] = [...where.params];
+  if (opts.cursor) {
+    clauses.push(`(COALESCE(f.first_seen_at, '') < ? OR (COALESCE(f.first_seen_at, '') = ? AND f.doc_id < ?))`);
+    params.push(opts.cursor.seenAt, opts.cursor.seenAt, opts.cursor.docId);
+  }
+
+  const rows = await all<IngestFailureRow>(
+    db,
+    `SELECT
+        f.doc_id, f.chamber, f.filer_id, f.filing_type, f.filed_date,
+        f.source_url, f.raw_object_key, f.doc_kind, f.ingest_status,
+        f.error, f.first_seen_at, f.source_updated_at,
+        rq.resolved AS review_resolved,
+        rq.resolution_kind AS review_resolution_kind
+      FROM filings f
+      LEFT JOIN review_queue rq ON rq.doc_id = f.doc_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY COALESCE(f.first_seen_at, '') DESC, f.doc_id DESC
+      LIMIT ?`,
+    [...params, opts.limit + 1],
+  );
+
+  const hasMore = rows.length > opts.limit;
+  const pageRows = hasMore ? rows.slice(0, opts.limit) : rows;
+  const lastRow = pageRows[pageRows.length - 1];
+  const nextCursor = hasMore && lastRow
+    ? encodeIngestFailureCursor({ seenAt: lastRow.first_seen_at ?? '', docId: lastRow.doc_id })
+    : null;
+
+  const nameByFiler = new Map<string, string>();
+  const filerIds = [...new Set(pageRows.map((r) => r.filer_id).filter((v): v is string => !!v))];
+  for (const idChunk of chunkArray(filerIds, REVIEW_QUEUE_IN_CHUNK)) {
+    if (!idChunk.length) continue;
+    try {
+      const placeholders = idChunk.map(() => '?').join(',');
+      const filers = await all<{ bioguide_id: string; full_name: string | null }>(
+        db,
+        `SELECT bioguide_id, full_name FROM filers WHERE bioguide_id IN (${placeholders})`,
+        idChunk,
+      );
+      for (const f of filers) if (f.full_name) nameByFiler.set(f.bioguide_id, f.full_name);
+    } catch {
+      /* filers not migrated yet — filerName stays null for this page. */
+    }
+  }
+
+  const attemptByDoc = new Map<string, string>();
+  for (const idChunk of chunkArray(pageRows.map((r) => r.doc_id), REVIEW_QUEUE_IN_CHUNK)) {
+    if (!idChunk.length) continue;
+    try {
+      const placeholders = idChunk.map(() => '?').join(',');
+      const outbox = await all<{ doc_id: string; updated_at: string | null }>(
+        db,
+        `SELECT doc_id, updated_at FROM ingestion_outbox WHERE doc_id IN (${placeholders})`,
+        idChunk,
+      );
+      for (const o of outbox) if (o.updated_at) attemptByDoc.set(o.doc_id, o.updated_at);
+    } catch {
+      /* ingestion_outbox not migrated yet — lastAttemptAt falls back below. */
+    }
+  }
+
+  const items = pageRows.map((row) => {
+    const rawError = row.error ?? null;
+    return {
+      kind: 'ingest_failure' as const,
+      docId: row.doc_id,
+      chamber: row.chamber ?? '',
+      filerId: row.filer_id ?? null,
+      filerName: row.filer_id ? (nameByFiler.get(row.filer_id) ?? null) : null,
+      filingType: row.filing_type ?? null,
+      filedDate: row.filed_date ?? null,
+      ingestStatus: row.ingest_status ?? '',
+      error: rawError == null ? null : rawError.slice(0, INGEST_FAILURE_ERROR_MAX),
+      errorTruncated: rawError != null && rawError.length > INGEST_FAILURE_ERROR_MAX,
+      firstSeenAt: row.first_seen_at ?? null,
+      sourceUpdatedAt: row.source_updated_at ?? null,
+      lastAttemptAt: attemptByDoc.get(row.doc_id) ?? row.source_updated_at ?? row.first_seen_at ?? null,
+      sourceUrl: row.source_url ?? '',
+      pdfUrl: `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`,
+      storedDocumentUrl: `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`,
+      rawObjectKey: row.raw_object_key ?? '',
+      docKind: row.doc_kind ?? '',
+      hasResolvedReview: row.review_resolved === 1,
+      resolutionKind: row.review_resolution_kind ?? null,
+    };
+  });
+  return { items, nextCursor };
+}
+
 interface ReviewQueueTotals {
   unresolved: number;
   matching: number;
   byReason: Record<string, number>;
   byChamber: Record<string, number>;
+  /** Filings stuck at ingest (see listIngestFailures); global like `unresolved`. */
+  ingestFailures: number;
+  /** CT-2453 stale stamps: published data, wrong 'error' status. Count only. */
+  publishedStatusStale: number;
 }
 
 /**
