@@ -8,6 +8,7 @@ import {
   PIPELINE_LOUD_ALERT_KV_PREFIX,
   TERMINAL_REDUP_WINDOW_MS,
 } from '../pipelineLoudAlerts.ts';
+import { SENATE_EDGE_BACKOFF_KV_KEY } from '../senateEdgeDeny.ts';
 
 const notifyReviewSpy = vi.fn(async () => {});
 const notifyStallSpy = vi.fn(async () => {});
@@ -255,6 +256,117 @@ describe('pipelineLoudAlerts', () => {
     const later = new Date('2026-10-13T01:00:00.000Z');
     const third = await sweepPipelineStallAlerts(env, later);
     expect(third.alerted).toContain('ocr_scan_reader');
+  });
+
+  const EDGE_DENY_HEALTH_DETAIL =
+    'Senate eFD BLOCKED: Akamai edge deny on Senate ingestion 30m ago '
+    + '(senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]) '
+    + '— refused by eFD itself, not a relay outage; the probe is paused for the '
+    + 'edge-deny backoff (next attempt in 60m)';
+
+  function seedEdgeDenyBackoff(store: Map<string, string>) {
+    store.set(SENATE_EDGE_BACKOFF_KV_KEY, JSON.stringify({
+      consecutive: 3,
+      firstDeniedAt: '2026-10-12T12:00:00.000Z',
+      lastDeniedAt: '2026-10-12T17:30:00.000Z',
+      windowMs: 3_600_000,
+      until: '2026-10-12T19:00:00.000Z',
+      reason: 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]',
+    }));
+  }
+
+  async function mockSenateEfdHealth(status: string, detail: string) {
+    const { checkPipelineHealth } = await import('../../shared/pipelineHealth.ts');
+    vi.mocked(checkPipelineHealth).mockResolvedValueOnce({
+      status: status === 'ok' ? 'ok' : 'critical',
+      checks: [{ id: 'senate_efd', status, detail, value: 403 }],
+    } as never);
+  }
+
+  function senateStallCalls() {
+    return notifyStallSpy.mock.calls.filter(
+      (c) => c[1]?.pipeline === 'senate_fetch_success' || c[1]?.pipeline === 'health_senate_efd',
+    );
+  }
+
+  it('edge-deny active: one alert (health_senate_efd) carrying the fetch-stall fact', async () => {
+    const { env, store } = kvEnv();
+    seedEdgeDenyBackoff(store);
+    await mockSenateEfdHealth('critical', EDGE_DENY_HEALTH_DETAIL);
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-10-12T18:00:00.000Z'));
+    expect(result.alerted).toContain('health_senate_efd');
+    expect(result.alerted).not.toContain('senate_fetch_success');
+    const calls = senateStallCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1].pipeline).toBe('health_senate_efd');
+    expect(calls[0][1].detail).toContain('edge deny');
+    expect(calls[0][1].detail).toContain('No successful Senate fetch in 282.0h');
+    // No separate senate_fetch_success episode is opened for the same root cause.
+    expect(store.has(`${PIPELINE_LOUD_ALERT_KV_PREFIX}stall:senate_fetch_success`)).toBe(false);
+  });
+
+  it('edge-deny fold keeps an existing senate_fetch_success episode so its recovery still fires', async () => {
+    const { env, store } = kvEnv();
+    seedEdgeDenyBackoff(store);
+    const kvKey = `${PIPELINE_LOUD_ALERT_KV_PREFIX}stall:senate_fetch_success`;
+    const episode = JSON.stringify({ notifiedAt: '2026-10-12T17:00:00.000Z', active: true });
+    store.set(kvKey, episode);
+    await mockSenateEfdHealth('critical', EDGE_DENY_HEALTH_DETAIL);
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-10-12T18:00:00.000Z'));
+    expect(result.evaluated).toContain('senate_fetch_success');
+    expect(result.alerted).not.toContain('senate_fetch_success');
+    expect(result.recovered).not.toContain('senate_fetch_success');
+    expect(store.get(kvKey)).toBe(episode);
+  });
+
+  it('no edge deny + fetch stall: senate_fetch_success still alerts on its own', async () => {
+    const { env } = kvEnv();
+    await mockSenateEfdHealth('ok', 'Senate eFD landing + agreement POST ok through proxy: probed 1m ago');
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-10-12T18:00:00.000Z'));
+    expect(result.alerted).toContain('senate_fetch_success');
+    expect(result.alerted).not.toContain('health_senate_efd');
+    const calls = senateStallCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1].pipeline).toBe('senate_fetch_success');
+    expect(calls[0][1].detail).toContain('No successful Senate fetch in 282.0h');
+  });
+
+  it('edge deny only, fetch OK: one alert (health_senate_efd), no folded fetch fact', async () => {
+    const { env, store } = kvEnv();
+    seedEdgeDenyBackoff(store);
+    await mockSenateEfdHealth('critical', EDGE_DENY_HEALTH_DETAIL);
+    const envFreshSenate = {
+      ...env,
+      DB: {
+        prepare: (sql: string) => ({
+          bind(...params: unknown[]) {
+            this.params = params;
+            return this;
+          },
+          params: [] as unknown[],
+          async first<T>() {
+            if (/source_attempts/i.test(sql)) {
+              return { last_success: '2026-10-12T17:00:00.000Z' } as T;
+            }
+            if (/ingestion_decisions/i.test(sql)) {
+              return { last_at: '2026-10-12T17:00:00.000Z' } as T;
+            }
+            if (/scanned_pdf/i.test(sql) && /COUNT/i.test(sql)) {
+              return { n: 0 } as T;
+            }
+            return null as T;
+          },
+        }),
+      },
+    } as unknown as Env;
+    const result = await sweepPipelineStallAlerts(envFreshSenate, new Date('2026-10-12T18:00:00.000Z'));
+    expect(result.evaluated).toContain('senate_fetch_success');
+    expect(result.alerted).toContain('health_senate_efd');
+    expect(result.alerted).not.toContain('senate_fetch_success');
+    const calls = senateStallCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1].pipeline).toBe('health_senate_efd');
+    expect(calls[0][1].detail).not.toContain('No successful Senate fetch');
   });
 
   it('emits recovery webhook when a stall clears', async () => {
