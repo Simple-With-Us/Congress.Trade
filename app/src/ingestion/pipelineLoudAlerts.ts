@@ -35,6 +35,11 @@ import {
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
 import { checkPipelineHealth, collectEmptyFetchHandoffCheck } from '../shared/pipelineHealth.ts';
+import {
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  SENATE_EDGE_BACKOFF_GRACE_MS,
+} from './senateEdgeDeny.ts';
 
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
@@ -664,9 +669,17 @@ export async function sweepPipelineStallAlerts(
     { condition: 'executive_fetch_success', source: 'executive' },
   ];
 
+  // Senate is deferred until the health loop below: when the eFD edge deny
+  // (CT-2442) is what stalls health_senate_efd, that alert is the single
+  // surviving page and carries the fetch-success fact (see health loop).
+  let senateFetchEval: StallEval | null = null;
   for (const { condition, source } of chamberChecks) {
     const thresholdMs = stallWindowMs(readPipelineStallHours(env, condition));
     const evalResult = await evaluateChamberFetchStall(env, source, now, thresholdMs);
+    if (condition === 'senate_fetch_success') {
+      senateFetchEval = evalResult;
+      continue;
+    }
     await processStallCondition(env, condition, evalResult, now, result, deps);
   }
 
@@ -737,6 +750,7 @@ export async function sweepPipelineStallAlerts(
   );
 
   const HEALTH_STALL_BUDGET_MS = 20_000;
+  let senateFetchFolded = false;
   try {
     let healthTimeoutId: ReturnType<typeof setTimeout> | undefined;
     const health = await (async () => {
@@ -754,17 +768,41 @@ export async function sweepPipelineStallAlerts(
         if (healthTimeoutId !== undefined) clearTimeout(healthTimeoutId);
       }
     })();
+    // One alert per root cause: an active Senate edge-deny backoff stalls
+    // health_senate_efd (critical in pipelineHealth) and starves Senate
+    // fetches, so the senate_fetch_success stall is the same incident.  Fold
+    // its detail into the surviving health_senate_efd alert instead of
+    // paging twice.  Only stalled/critical health pages here, so a degraded
+    // senate_efd never silences a fetch stall with no surviving alert.
+    const senateEfdCheck = health.checks.find((c) => c.id === 'senate_efd');
+    const senateEfdStalled = senateEfdCheck?.status === 'stalled' || senateEfdCheck?.status === 'critical';
+    if (senateEfdStalled && senateFetchEval?.stalled && !senateFetchEval.skip) {
+      const backoff = await readSenateEdgeBackoff(env);
+      senateFetchFolded = backoff !== null
+        && isSenateEdgeBackoffActive(backoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
+    }
+    if (senateFetchFolded && senateFetchEval) {
+      // No separate page while folded: health_senate_efd speaks for both.
+      // Record the evaluation, but leave any existing senate_fetch_success
+      // episode untouched, so its recovery webhook still fires once Senate
+      // fetches succeed again, and a fetch stall that outlives the deny keeps
+      // its own dedup window.
+      result.evaluated.push('senate_fetch_success');
+    }
     for (const check of health.checks) {
       if (HEALTH_STALL_SKIP_IDS.has(check.id)) continue;
       const stalled = check.status === 'stalled' || check.status === 'critical';
       const condition = `health_${check.id}` satisfies PipelineStallCondition;
+      const folded = senateFetchFolded && stalled && check.id === 'senate_efd' && senateFetchEval
+        ? `; folded senate_fetch_success: ${senateFetchEval.detail}`
+        : '';
       await processStallCondition(
         env,
         condition,
         {
           stalled,
           detail: stalled
-            ? `[health/${check.status}] ${check.detail}`
+            ? `[health/${check.status}] ${check.detail}${folded}`
             : (check.detail || `${check.id} ok`),
         },
         now,
@@ -774,6 +812,10 @@ export async function sweepPipelineStallAlerts(
     }
   } catch {
     /* health collection must not break the stall sweep */
+  }
+
+  if (!senateFetchFolded && senateFetchEval) {
+    await processStallCondition(env, 'senate_fetch_success', senateFetchEval, now, result, deps);
   }
 
   return result;
