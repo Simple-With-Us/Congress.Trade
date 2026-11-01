@@ -225,8 +225,7 @@ alert_pushover() {
   fi
   local title="Coolify disk ${severity}"
   curl -fsS -m 15 \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$PUSHOVER_APP_TOKEN" "$PUSHOVER_USER_KEY") \
     --form-string "title=${title}" \
     --form-string "message=${body}" \
     --form-string "priority=$([[ "$severity" == crit ]] && echo 1 || echo 0)" \

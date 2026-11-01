@@ -80,8 +80,7 @@ notify() {
   fi
   now > "$stamp_file"
   curl -sS -m 15 -o /dev/null \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$PUSHOVER_APP_TOKEN" "$PUSHOVER_USER_KEY") \
     --form-string "title=${title}" \
     --form-string "message=${msg}" \
     --form-string "priority=1" \
@@ -96,7 +95,7 @@ is_coolify_deploy_active() {
   command -v python3 >/dev/null 2>&1 || return 1
   local json
   json=$(curl -fsS -m 8 \
-    -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
     -H "Accept: application/json" \
     "${COOLIFY_BASE_URL%/}/api/v1/deployments" 2>/dev/null) || return 1
   printf '%s' "$json" | APP_UUID="$APP_UUID" python3 -c '
@@ -271,14 +270,14 @@ restart_via_coolify_api() {
   local code
   code=$(curl -sS -m 30 -o /tmp/ct-coolify-restart.out -w '%{http_code}' \
     -X GET \
-    -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
     -H "Accept: application/json" \
     "$url" 2>/dev/null || echo 000)
   # Some Coolify builds use POST; retry once on 405/404.
   if [[ "$code" == "405" || "$code" == "404" ]]; then
     code=$(curl -sS -m 30 -o /tmp/ct-coolify-restart.out -w '%{http_code}' \
       -X POST \
-      -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+      -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
       -H "Accept: application/json" \
       "$url" 2>/dev/null || echo 000)
   fi
