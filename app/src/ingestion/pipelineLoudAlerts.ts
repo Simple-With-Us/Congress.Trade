@@ -698,10 +698,12 @@ async function processFmpLatencySilenceAlert(
   }
   // A pending mark older than two sweeps is stale (sweeps were skipped or the
   // check cleared without a sweep seeing it); start the confirm window over.
-  const pendingAgeMs = pending ? now.getTime() - Date.parse(pending.firstSeenAt) : Number.NaN;
+  const staleAnchor = pending?.lastSeenAt ?? pending?.firstSeenAt;
+  const pendingAgeMs = pending && staleAnchor ? now.getTime() - Date.parse(staleAnchor) : Number.NaN;
   if (!pending || !Number.isFinite(pendingAgeMs) || pendingAgeMs > FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS) {
+    const mark: FmpLatencySilencePending = { firstSeenAt: now.toISOString(), lastSeenAt: now.toISOString() };
     try {
-      await env.CONFIG_KV.put(pendingKey, JSON.stringify({ firstSeenAt: now.toISOString() } satisfies FmpLatencySilencePending));
+      await env.CONFIG_KV.put(pendingKey, JSON.stringify(mark));
     } catch {
       /* fail-soft */
     }
@@ -720,8 +722,17 @@ async function processFmpLatencySilenceAlert(
     result,
     deps,
   );
-  // Keep the pending mark while still critical so every later sweep stays on
-  // the alerting path; it is cleared when the check leaves critical.
+  try {
+    await env.CONFIG_KV.put(
+      pendingKey,
+      JSON.stringify({
+        firstSeenAt: pending.firstSeenAt,
+        lastSeenAt: now.toISOString(),
+      } satisfies FmpLatencySilencePending),
+    );
+  } catch {
+    /* fail-soft */
+  }
 }
 
 /**

@@ -4,7 +4,7 @@
  */
 
 import type { Env } from './types.ts';
-import { isFmpSlotHttp429 } from '../ingestion/tradeLatency.ts';
+import { isFmpSlotHttp429DayBan } from '../ingestion/tradeLatency.ts';
 import { readProbeLease } from '../ingestion/probeLease.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 
@@ -53,6 +53,22 @@ export function readFmpLatencySelfHealingGraceMs(envGet: (k: string) => string |
 
 export function nextUtcMidnightIso(now: Date): string {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+}
+
+/** Next UTC midnight strictly after the given observation timestamp. */
+export function nextUtcMidnightAfter(isoTimestamp: string): string {
+  const d = new Date(isoTimestamp);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1)).toISOString();
+}
+
+export function selfHealingResetAtUtc(
+  cause: FmpLatencySelfHealingSilence['cause'],
+  lastObservationAt: string,
+): string {
+  if (cause === 'fmp_day_ban') {
+    return nextUtcMidnightAfter(lastObservationAt);
+  }
+  return new Date(Date.parse(lastObservationAt) + 3600_000).toISOString();
 }
 
 export function fmpLatencyProbeExpected(envGet: (k: string) => string | undefined): boolean {
@@ -153,18 +169,26 @@ export async function enrichFmpLatencySelfHealingSilence(
     return null;
   }
 
+  const lastObservationAt = fmp.lastObservationAt;
+  if (!lastObservationAt) {
+    return null;
+  }
+
   try {
     const slots = await configuredFmpLatencySlots(env);
     if (slots.length > 0) {
       let allBanned = true;
       for (const slot of slots) {
-        if (!(await isFmpSlotHttp429(env, slot, now))) {
+        if (!(await isFmpSlotHttp429DayBan(env, slot, now))) {
           allBanned = false;
           break;
         }
       }
       if (allBanned) {
-        return { cause: 'fmp_day_ban', resetAtUtc: nextUtcMidnightIso(now) };
+        return {
+          cause: 'fmp_day_ban',
+          resetAtUtc: selfHealingResetAtUtc('fmp_day_ban', lastObservationAt),
+        };
       }
     }
   } catch {
@@ -174,7 +198,10 @@ export async function enrichFmpLatencySelfHealingSilence(
   try {
     const lease = await readProbeLease(env, 'fmp', now);
     if (lease && lease.holder === 'mac' && !lease.expired) {
-      return { cause: 'probe_lease_handoff', resetAtUtc: lease.expiresAt };
+      return {
+        cause: 'probe_lease_handoff',
+        resetAtUtc: selfHealingResetAtUtc('probe_lease_handoff', lastObservationAt),
+      };
     }
   } catch {
     /* fail-soft */
@@ -185,4 +212,5 @@ export async function enrichFmpLatencySelfHealingSilence(
 
 export interface FmpLatencySilencePending {
   firstSeenAt: string;
+  lastSeenAt?: string;
 }
