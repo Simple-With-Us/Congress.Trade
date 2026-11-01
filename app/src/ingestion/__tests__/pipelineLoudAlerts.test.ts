@@ -305,6 +305,20 @@ describe('pipelineLoudAlerts', () => {
     expect(store.has(`${PIPELINE_LOUD_ALERT_KV_PREFIX}stall:senate_fetch_success`)).toBe(false);
   });
 
+  it('edge-deny fold keeps an existing senate_fetch_success episode so its recovery still fires', async () => {
+    const { env, store } = kvEnv();
+    seedEdgeDenyBackoff(store);
+    const kvKey = `${PIPELINE_LOUD_ALERT_KV_PREFIX}stall:senate_fetch_success`;
+    const episode = JSON.stringify({ notifiedAt: '2026-10-12T17:00:00.000Z', active: true });
+    store.set(kvKey, episode);
+    await mockSenateEfdHealth('critical', EDGE_DENY_HEALTH_DETAIL);
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-10-12T18:00:00.000Z'));
+    expect(result.evaluated).toContain('senate_fetch_success');
+    expect(result.alerted).not.toContain('senate_fetch_success');
+    expect(result.recovered).not.toContain('senate_fetch_success');
+    expect(store.get(kvKey)).toBe(episode);
+  });
+
   it('no edge deny + fetch stall: senate_fetch_success still alerts on its own', async () => {
     const { env } = kvEnv();
     await mockSenateEfdHealth('ok', 'Senate eFD landing + agreement POST ok through proxy: probed 1m ago');

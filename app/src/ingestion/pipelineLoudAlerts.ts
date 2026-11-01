@@ -781,10 +781,13 @@ export async function sweepPipelineStallAlerts(
       senateFetchFolded = backoff !== null
         && isSenateEdgeBackoffActive(backoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
     }
-    if (senateFetchFolded) {
-      // No separate episode: health_senate_efd dedup/recovery speaks for both,
-      // and a fetch stall that outlives the deny re-alerts on its own.
-      await clearStallEpisode(env, `${PIPELINE_LOUD_ALERT_KV_PREFIX}stall:senate_fetch_success`);
+    if (senateFetchFolded && senateFetchEval) {
+      // No separate page while folded: health_senate_efd speaks for both.
+      // Record the evaluation, but leave any existing senate_fetch_success
+      // episode untouched, so its recovery webhook still fires once Senate
+      // fetches succeed again, and a fetch stall that outlives the deny keeps
+      // its own dedup window.
+      result.evaluated.push('senate_fetch_success');
     }
     for (const check of health.checks) {
       if (HEALTH_STALL_SKIP_IDS.has(check.id)) continue;
