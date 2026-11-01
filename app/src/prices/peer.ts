@@ -18,6 +18,35 @@ import type { Close } from './compute.ts';
 import type { PriceClient } from './types.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 
+/** Thrown in strict mode when ST answers `{ error: "stale" }` (usually HTTP 502). */
+export class PeerStaleResponseError extends Error {
+  readonly closes: Close[];
+  constructor(closes: Close[]) {
+    super('PEER_STALE_RESPONSE');
+    this.name = 'PeerStaleResponseError';
+    this.closes = closes;
+  }
+}
+
+export function isPeerStaleResponseError(e: unknown): e is PeerStaleResponseError {
+  if (e instanceof PeerStaleResponseError) return true;
+  if (typeof e !== 'object' || e === null) return false;
+  const err = e as { message?: unknown; closes?: unknown };
+  return err.message === 'PEER_STALE_RESPONSE' && Array.isArray(err.closes);
+}
+
+function parsePeerCloses(raw: unknown): Close[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (c): c is Close =>
+      Boolean(c) &&
+      typeof c.date === 'string' &&
+      typeof c.close === 'number' &&
+      Number.isFinite(c.close) &&
+      c.close > 0,
+  );
+}
+
 export interface PeerPriceClientOptions {
   /**
    * When true, non-2xx (except 404) and network failures throw PEER_HTTP_* so a
@@ -47,6 +76,15 @@ export function buildPeerPriceClient(
   };
   if (authToken) headers['authorization'] = `Bearer ${authToken}`;
 
+  /** Normalize to date-descending so service.ts can treat closes[0] as latest
+   *  even if a peer revision ships ascending bars. */
+  function descending(closes: Close[]): Close[] {
+    if (closes.length < 2) return closes;
+    const out = closes.slice();
+    out.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    return out;
+  }
+
   async function getCloses(
     url: string,
     operation: 'fetch-peer-price-history' | 'fetch-peer-spx-history',
@@ -57,6 +95,16 @@ export function buildPeerPriceClient(
       }, { service: 'market-prices', operation, dynamicTarget: 'peer-app' }, fetchImpl);
       if (res.status === 404) return [];
       if (!res.ok) {
+        if (strict && res.status === 502) {
+          try {
+            const data = await res.json() as { ok?: boolean; error?: string; closes?: unknown };
+            if (data?.error === 'stale') {
+              throw new PeerStaleResponseError(descending(parsePeerCloses(data.closes)));
+            }
+          } catch (e) {
+            if (isPeerStaleResponseError(e)) throw e;
+          }
+        }
         if (strict) throw new Error(`PEER_HTTP_${res.status}`);
         return [];
       }
@@ -71,6 +119,7 @@ export function buildPeerPriceClient(
           c.close > 0,
       );
     } catch (e) {
+      if (isPeerStaleResponseError(e)) throw e;
       if (e instanceof Error && e.message.startsWith('PEER_HTTP_')) throw e;
       if (strict) {
         const msg = e instanceof Error ? e.message : String(e ?? 'network');
@@ -78,15 +127,6 @@ export function buildPeerPriceClient(
       }
       return [];
     }
-  }
-
-  /** Normalize to date-descending so service.ts can treat closes[0] as latest
-   *  even if a peer revision ships ascending bars. */
-  function descending(closes: Close[]): Close[] {
-    if (closes.length < 2) return closes;
-    const out = closes.slice();
-    out.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
-    return out;
   }
 
   async function eodHistory(symbol: string, from: string, to: string): Promise<Close[]> {

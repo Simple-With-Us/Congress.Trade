@@ -10,7 +10,7 @@
  */
 
 import type { Env } from '../shared/types.ts';
-import { all, run } from '../shared/db.ts';
+import { all, get, run } from '../shared/db.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import { getSharedStPeerPacer } from '../shared/pace.ts';
 import type { PriceClient } from './types.ts';
@@ -43,6 +43,23 @@ export const ST_NOT_COVERED_MAX_BATCH = 50;
 export const NOT_COVERED_RECHECK_LOOKBACK_DAYS = 30;
 /** Stage-4 tickers retried per daily re-check, oldest price_checked_at first. */
 export const NOT_COVERED_RECHECK_MAX_TICKERS = 200;
+
+/** Delisted / fund / preferred symbols the stuck sweep may mark in daily batches when the corpus is fresh. */
+export function isTerminalPeerPriceTicker(
+  ticker: string,
+  latestPriceDate: string | null,
+  now: Date,
+): boolean {
+  const sym = ticker.trim().toUpperCase();
+  if (!sym) return false;
+  if (sym.includes('^')) return true;
+  if (/^[A-Z]{5}$/.test(sym) && sym.endsWith('X')) return true;
+  if (latestPriceDate != null && latestPriceDate.length >= 10) {
+    const cutoff = new Date(now.getTime() - 30 * 86400000).toISOString().slice(0, 10);
+    if (latestPriceDate.slice(0, 10) < cutoff) return true;
+  }
+  return false;
+}
 
 /**
  * SQL fragment: `FROM securities_ref sr WHERE …` (no binds) over tickers marked
@@ -88,23 +105,50 @@ export async function markStuckPeerPriceTickersNotCovered(
   }
   const params = stPeerPricePendingBindParams(now);
   const stuckCutoff = new Date(now.getTime() - ST_NOT_COVERED_STUCK_HOURS * 3_600_000).toISOString();
-  const rows = await all<{ ticker: string; last_reason: string | null }>(
+  const stuckWhere = `${stPeerPricePendingFromSql()}
+       AND (sr.price_checked_at IS NULL OR sr.price_checked_at < ?)`;
+  const bindTail = [...stPeerPricePendingBindsForSubqueries(params, 1), stuckCutoff];
+  const qualifiedRow = await get<{ n: number }>(
     env.DB,
-    `SELECT DISTINCT t.ticker AS ticker, sr.price_unavailable_reason AS last_reason ${stPeerPricePendingFromSql()}
-       AND sr.price_checked_at IS NOT NULL
-       AND sr.price_checked_at < ?
-     ORDER BY t.ticker ASC
-     LIMIT ${ST_NOT_COVERED_MAX_BATCH + 1}`,
-    [...stPeerPricePendingBindsForSubqueries(params, 1), stuckCutoff],
+    `SELECT COUNT(DISTINCT t.ticker) AS n ${stuckWhere}`,
+    bindTail,
   );
-  if (rows.length > ST_NOT_COVERED_MAX_BATCH) {
-    console.warn(
-      `not-covered sweep skipped: ${rows.length}+ tickers stuck while pending (cap ${ST_NOT_COVERED_MAX_BATCH}) — looks like an outage, not a coverage gap`,
+  const qualified = Number(qualifiedRow?.n ?? 0);
+  if (qualified <= 0) return { marked: 0, qualified: 0 };
+  const fetchLimit = qualified > ST_NOT_COVERED_MAX_BATCH
+    ? Math.min(qualified, 500)
+    : ST_NOT_COVERED_MAX_BATCH + 1;
+  const rows = await all<{
+    ticker: string;
+    last_reason: string | null;
+    latest_price_date: string | null;
+    price_checked_at: string | null;
+  }>(
+    env.DB,
+    `SELECT DISTINCT t.ticker AS ticker,
+            sr.price_unavailable_reason AS last_reason,
+            sr.latest_price_date AS latest_price_date,
+            sr.price_checked_at AS price_checked_at
+       ${stuckWhere}
+     ORDER BY sr.price_checked_at ASC, t.ticker ASC
+     LIMIT ${fetchLimit}`,
+    bindTail,
+  );
+  let toMark = rows;
+  if (qualified > ST_NOT_COVERED_MAX_BATCH) {
+    const terminal = rows.filter((r) =>
+      isTerminalPeerPriceTicker(r.ticker, r.latest_price_date, now),
     );
-    return { marked: 0, qualified: rows.length };
+    if (terminal.length === 0) {
+      console.warn(
+        `not-covered sweep skipped: ${rows.length}+ tickers stuck while pending (cap ${ST_NOT_COVERED_MAX_BATCH}) — looks like an outage, not a coverage gap`,
+      );
+      return { marked: 0, qualified: rows.length };
+    }
+    toMark = terminal.slice(0, ST_NOT_COVERED_MAX_BATCH);
   }
   const nowIso = now.toISOString();
-  for (const { ticker, last_reason } of rows) {
+  for (const { ticker, last_reason } of toMark) {
     // Say WHY, and only what is known:  72h without a completed check is the
     // proven fact;  an error marker adds that the LAST attempt failed (with the
     // message).  One marker is not an error streak, so the cause never says so.  Either way the
@@ -123,7 +167,7 @@ export async function markStuckPeerPriceTickersNotCovered(
       stage: PRICE_UNAVAILABLE_NOT_COVERED,
     });
   }
-  return { marked: rows.length, qualified: rows.length };
+  return { marked: toMark.length, qualified: rows.length };
 }
 
 /** Advance price_checked_at only; stage 4 and the since-dated reason stay. */

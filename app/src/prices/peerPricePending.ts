@@ -8,7 +8,7 @@ import { get } from '../shared/db.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import {
   lastTradingDay,
-  PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
+  priceNegativeCacheActiveExclusionSql,
   priceNotCoveredExclusionSql,
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
@@ -57,7 +57,6 @@ export function stPeerPricePendingBindsForSubqueries(
  * freshThrough, firstUnavailableCutoff, unavailableCutoff (third reused in CASE).
  */
 export function stPeerPricePendingFromSql(): string {
-  const stageFirst = PRICE_UNAVAILABLE_NOT_FOUND_FIRST;
   return `
   FROM transactions t
   LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
@@ -70,14 +69,7 @@ export function stPeerPricePendingFromSql(): string {
      OR sr.latest_price_date < ?
      OR NOT EXISTS (SELECT 1 FROM price_eod pe WHERE pe.ticker = t.ticker)
    )
-   AND NOT (
-     COALESCE(sr.price_unavailable, 0) <> 0
-     AND sr.price_checked_at IS NOT NULL
-     AND sr.price_checked_at >= CASE
-           WHEN sr.price_unavailable = ${stageFirst} THEN ?
-           ELSE ?
-         END
-   )
+   AND ${priceNegativeCacheActiveExclusionSql('sr')}
    AND ${priceNotCoveredExclusionSql('sr')}`;
 }
 

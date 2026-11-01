@@ -12,16 +12,18 @@
 
 import type { Env } from '../shared/types.ts';
 import { ensurePriceUnavailableReasonColumn } from '../admin/ensurePeerSchema.ts';
-import { all, batchPrepared, get, run } from '../shared/db.ts';
+import { all, batchPrepared, first, get, run } from '../shared/db.ts';
 import {
   excludeCompetitorFixtureTransactionSql,
   tickerHasNonCompetitorFixtureTrade,
 } from '../shared/competitorFixtures.ts';
 import { getSharedStPeerPacer, ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from '../shared/pace.ts';
 import type { PriceClient } from './types.ts';
-import { buildPeerPriceClient } from './peer.ts';
+import { buildPeerPriceClient, isPeerStaleResponseError } from './peer.ts';
 import type { Close } from './compute.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
+import { readCorpusLatestPriceDate } from './peerPricePending.ts';
+import { isCurrentPriceFresh } from './staleness.ts';
 
 /**
  * Per-run ticker cap. Socratic.Trade serves EOD from its own database — no
@@ -99,6 +101,27 @@ export function priceNotCoveredExclusionSql(srAlias = 'sr'): string {
   return `COALESCE(${srAlias}.price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`;
 }
 
+/**
+ * Shared `NOT ( … )` guard: a ticker still inside its negative-cache TTL is
+ * excluded from pending counts and from selectTickersNeedingPrices.  Expects
+ * two `?` binds after the freshThrough bind: firstUnavailableCutoff, then
+ * unavailableCutoff (the CASE reuses the second for non-first stages).
+ */
+export function priceNegativeCacheActiveExclusionSql(srAlias = 'sr'): string {
+  if (!PRICE_NOT_COVERED_SQL_ALIASES.has(srAlias)) {
+    throw new Error(`priceNegativeCacheActiveExclusionSql: unsupported SQL alias ${JSON.stringify(srAlias)}`);
+  }
+  const stageFirst = PRICE_UNAVAILABLE_NOT_FOUND_FIRST;
+  return `NOT (
+  COALESCE(${srAlias}.price_unavailable, 0) <> 0
+  AND ${srAlias}.price_checked_at IS NOT NULL
+  AND ${srAlias}.price_checked_at >= CASE
+        WHEN ${srAlias}.price_unavailable = ${stageFirst} THEN ?
+        ELSE ?
+      END
+)`;
+}
+
 /** Repeat empty-history miss on a ticker already at stage 2 (rule a). */
 export const NOT_COVERED_CAUSE_REPEAT_EMPTY = 'no EOD history after repeat re-check';
 /** Repeat stale-listing result on a ticker already at stage 3 (rule a). */
@@ -108,6 +131,20 @@ export const NOT_COVERED_CAUSE_STUCK_PENDING = 'no price_checked_at progress for
 
 /** Last-outcome marker for a non-fatal per-ticker ST fetch error (not a stage). */
 export const ST_FETCH_ERROR_REASON_PREFIX = 'st_fetch_error: ';
+/** Incremented when ST returns `{ error: "stale" }` with a short-lag series (corpus fresh). */
+export const ST_PEER_STALE_HIT_PREFIX = 'st_peer_stale_hits:';
+/** Short-lag stale answers that keep repeating terminate at this count (CT-2443). */
+export const ST_PEER_STALE_HIT_TERMINATE = 3;
+
+export function parsePeerStaleHitCount(reason: string | null | undefined): number {
+  if (!reason?.startsWith(ST_PEER_STALE_HIT_PREFIX)) return 0;
+  const n = parseInt(reason.slice(ST_PEER_STALE_HIT_PREFIX.length), 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+export function peerStaleHitReason(hits: number): string {
+  return `${ST_PEER_STALE_HIT_PREFIX}${hits}`;
+}
 export function stFetchErrorReason(e: unknown): string {
   const msg = e instanceof Error ? e.message : String(e ?? 'unknown');
   return (ST_FETCH_ERROR_REASON_PREFIX + msg).slice(0, 200);
@@ -274,6 +311,43 @@ export function isFatalPriceProviderError(e: unknown, _fmpBudgeted: boolean): bo
   const message = e instanceof Error ? e.message : String(e ?? '');
   if (FATAL_PRICE_PROVIDER_ERROR.test(message)) return true;
   return RATE_LIMIT_PROVIDER_ERROR.test(message);
+}
+
+type PeerStaleSignal = { closes: Close[] };
+
+function readPeerStaleSignal(e: unknown): PeerStaleSignal | null {
+  if (isPeerStaleResponseError(e)) return { closes: e.closes };
+  if (typeof e !== 'object' || e === null) return null;
+  const err = e as { message?: unknown; closes?: unknown };
+  if (err.message !== 'PEER_STALE_RESPONSE' || !Array.isArray(err.closes)) return null;
+  return { closes: err.closes as Close[] };
+}
+
+type PeerStaleResolution =
+  | { kind: 'transient' }
+  | { kind: 'stale_hit'; hits: number }
+  | { kind: 'empty' }
+  | { kind: 'hist'; closes: Close[] };
+
+/** ST `{ error: "stale" }` when the corpus is fresh: terminal series or repeat hits advance stages; corpus lag stays transient. */
+async function resolvePeerStaleResponse(
+  now: Date,
+  staleCloses: Close[],
+  prevReason: string | null,
+  corpusFresh: boolean,
+): Promise<PeerStaleResolution> {
+  if (!corpusFresh) {
+    return { kind: 'transient' };
+  }
+  const newest = staleCloses[0];
+  if (newest != null && isStaleListingDate(newest.date, now)) {
+    return { kind: 'hist', closes: staleCloses };
+  }
+  const hits = parsePeerStaleHitCount(prevReason) + 1;
+  if (hits >= ST_PEER_STALE_HIT_TERMINATE) {
+    return { kind: 'empty' };
+  }
+  return { kind: 'stale_hit', hits };
 }
 
 function isoDaysAgo(days: number, from = new Date()): string {
@@ -454,14 +528,7 @@ export async function selectTickersNeedingPricesPage(
           -- fresh but there is no local price_eod — otherwise two tickers can
           -- sit forever with a stamped latest_price_date and never re-price.
         )
-        AND NOT (
-          COALESCE(sr.price_unavailable, 0) <> 0
-          AND sr.price_checked_at IS NOT NULL
-          AND sr.price_checked_at >= CASE
-                WHEN sr.price_unavailable = ${PRICE_UNAVAILABLE_NOT_FOUND_FIRST} THEN ?
-                ELSE ?
-              END
-        )
+        AND ${priceNegativeCacheActiveExclusionSql('sr')}
         AND ${priceNotCoveredExclusionSql('sr')}
       GROUP BY t.ticker
       ${after === null ? '' : 'HAVING MAX(t.cursor_seq) > ?'}
@@ -521,6 +588,8 @@ export interface TickerEodFetchPlan {
   to: string;
   /** securities_ref.price_unavailable before this fetch (0 when no row). */
   prevStage: number;
+  /** securities_ref.price_unavailable_reason before this fetch (when present). */
+  prevReason: string | null;
   /**
    * The window start before any `maxLookbackDays` clamp.  When it is earlier
    * than `from`, the clamped window does NOT cover what the ticker's trades
@@ -560,12 +629,15 @@ export async function planTickerEodFetch(
 
   // One round trip for the cache window AND the current negative-cache stage,
   // so the refresh loop never re-reads securities_ref per ticker.
-  const cached = await get<{ mn: string | null; mx: string | null; pu: number | null }>(
+  const cached = await first<{ mn: string | null; mx: string | null }>(
     env.DB,
-    `SELECT MIN(date) AS mn, MAX(date) AS mx,
-            (SELECT price_unavailable FROM securities_ref WHERE ticker = ?) AS pu
-       FROM price_eod WHERE ticker = ?`,
-    [ticker, ticker],
+    `SELECT MIN(date) AS mn, MAX(date) AS mx FROM price_eod WHERE ticker = ?`,
+    [ticker],
+  );
+  const refMeta = await get<{ pu: number | null; pr: string | null }>(
+    env.DB,
+    `SELECT price_unavailable AS pu, price_unavailable_reason AS pr FROM securities_ref WHERE ticker = ?`,
+    [ticker],
   );
   let oldestTrade: string | null = null;
   for (const t of trades) {
@@ -588,7 +660,14 @@ export async function planTickerEodFetch(
     const floor = isoDaysAgo(opts.maxLookbackDays);
     if (from < floor) from = floor;
   }
-  return { trades, from, fullFrom, to: today(), prevStage: Number(cached?.pu ?? 0) };
+  return {
+    trades,
+    from,
+    fullFrom,
+    to: today(),
+    prevStage: Number(refMeta?.pu ?? 0),
+    prevReason: refMeta?.pr ?? null,
+  };
 }
 
 export interface TickerEodWriteOpts {
@@ -819,6 +898,8 @@ export async function runPriceRefresh(
     ? []
     : await selectTickersNeedingPricesPage(env, budget, { afterCursorSeq: opts.afterCursorSeq });
   const tickers = page.map((r) => r.ticker);
+  const runCorpusLatest = await readCorpusLatestPriceDate(env);
+  const runCorpusFresh = isCurrentPriceFresh(runCorpusLatest, lastTradingDay());
   for (const { ticker, seq } of page) {
     if (opts.signal?.aborted) {
       result.aborted = true;
@@ -834,7 +915,7 @@ export async function runPriceRefresh(
     const nowIso = new Date().toISOString();
     const fetchPlan = await planTickerEodFetch(env, ticker);
     if (!fetchPlan) continue;
-    const { trades, from, to, prevStage } = fetchPlan;
+    const { trades, from, to, prevStage, prevReason } = fetchPlan;
     let hist: Close[] = [];
     try {
       await pace();
@@ -843,6 +924,43 @@ export async function runPriceRefresh(
       budget--;
       hist = await client.eodHistory(ticker, from, to);
     } catch (e) {
+      const staleSignal = readPeerStaleSignal(e);
+      if (staleSignal) {
+        const resolution = await resolvePeerStaleResponse(
+          new Date(nowIso),
+          staleSignal.closes,
+          prevReason,
+          runCorpusFresh,
+        );
+        if (resolution.kind === 'hist') {
+          hist = resolution.closes;
+        } else if (resolution.kind === 'empty') {
+          hist = [];
+        } else if (resolution.kind === 'stale_hit') {
+          if (!dryRun) {
+            await run(
+              env.DB,
+              `UPDATE securities_ref SET price_checked_at = ?, price_unavailable_reason = ?
+                WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
+              [nowIso, peerStaleHitReason(resolution.hits), ticker],
+            );
+          }
+          continue;
+        } else {
+          result.errors.push(ticker + ': PEER_STALE_RESPONSE (corpus not fresh)');
+          if (!dryRun) {
+            const marker = stFetchErrorReason(new Error('PEER_HTTP_502 stale (corpus lag)'));
+            await run(
+              env.DB,
+              `UPDATE securities_ref SET price_unavailable_reason = ?
+                WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}
+                  AND price_unavailable_reason IS NOT ?`,
+              [marker, ticker, marker],
+            );
+          }
+          continue;
+        }
+      } else {
       result.errors.push(ticker + ': ' + (e as Error).message);
       if (isFatalPriceProviderError(e, fmpBudgeted)) {
         // Same auth/plan/rate-limit will fail identically for every remaining
@@ -870,6 +988,7 @@ export async function runPriceRefresh(
         );
       }
       continue;
+      }
     }
     if (hist.length === 0) {
       // Reaching here means the provider returned a CONFIRMED empty result (a 2xx
