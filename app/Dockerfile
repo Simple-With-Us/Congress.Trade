@@ -1,4 +1,6 @@
-FROM denoland/deno:alpine
+# Pinned to match CI's Deno (npm deno@2.9.3 in .github/workflows/ci.yml) so
+# the tested runtime and the shipped runtime cannot drift (CT-2459).
+FROM denoland/deno:alpine-2.9.3
 
 WORKDIR /app
 
@@ -49,15 +51,38 @@ RUN wget -qO- 'https://artifacts-cli.infisical.com/setup.apk.sh' | sh \
   && apk add --no-cache infisical \
   && infisical --version
 
-# Cache dependencies
-COPY package.json ./
-RUN deno install || true
+# Cache dependencies: manifests + lockfiles first (no ||true -- a failed
+# install must fail the build, not ship a broken image). vendor shared src
+# rides along because deno.json maps an import to it.
+# NOT --frozen yet: `deno install --frozen` fails on main today because the
+# committed deno.lock is stale (e.g. it pins @aws-sdk/client-s3@3.1157.0
+# while deno.json asks for 3.1158.0). Regen the lock (`cd app && deno
+# install`, commit deno.lock), then add --frozen back (CT-2459 follow-up).
+COPY package.json package-lock.json deno.json deno.lock ./
+COPY vendor/congress-trading-shared/src ./vendor/congress-trading-shared/src
+RUN deno install
 
-# Copy source
-COPY . .
+# Copy only what the runtime reads (CT-2459): src, public (ui/assets.ts
+# reads ../../public at module load), migrations, the entrypoint scripts,
+# litestream config. Tests/docs/ops scripts stay out (see .dockerignore).
+# .prod.vars is kept on purpose: src/deno/main.ts reads it as an env
+# fallback; removing it from the image is an owner-gated decision.
+COPY src ./src
+COPY public ./public
+COPY migrations ./migrations
+COPY litestream.yml ./
+COPY .prod.vars ./
+COPY scripts/start-with-litestream.sh ./scripts/start-with-litestream.sh
 
-# Cache source files
-RUN deno cache src/deno/main.ts
+# Cache source files, including lazily dynamic-imported entries that a
+# main-only cache pass can miss at first tick.
+RUN deno cache src/deno/main.ts \
+      src/ingestion/latencyPriceSnapshots.ts \
+      src/extraction/storedRunPublish.ts \
+      src/prices/service.ts \
+      src/ingestion/scoutHandoff.ts \
+      src/ingestion/senateBrowserFetch.ts \
+      src/settings/settingsService.ts
 
 # Build revision, so /api/health can report which commit is actually running.
 # Coolify supplies SOURCE_COMMIT; any other builder can pass --build-arg.
