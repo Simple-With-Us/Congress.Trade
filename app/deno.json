@@ -29,7 +29,8 @@
     "@google/genai": "npm:@google/genai@^2.27.0",
     "@libsql/client": "npm:@libsql/client@^0.18.0",
     "@libsql/client/web": "npm:@libsql/client@^0.18.0/web",
-    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^5.0.0"
+    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^5.0.0",
+    "esbuild": "npm:esbuild@0.25.9"
   },
   "exclude": [
     "node_modules",

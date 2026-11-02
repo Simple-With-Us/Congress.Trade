@@ -15,8 +15,8 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { Env } from '../shared/types.ts';
 import { DASHBOARD_HTML } from './dashboardHtml.ts';
-import { DASHBOARD_CSS, DASHBOARD_CSS_VERSION } from './dashboardStyles.ts';
-import { DASHBOARD_APP_JS, DASHBOARD_APP_JS_VERSION } from './dashboardClient.ts';
+import { DASHBOARD_CSS_SERVED, DASHBOARD_CSS_VERSION } from './dashboardStyles.ts';
+import { DASHBOARD_APP_JS_SERVED, DASHBOARD_APP_JS_VERSION } from './dashboardClient.ts';
 import { TOS_HTML, PRIVACY_HTML } from './legalHtml.ts';
 import { getLogoDisplay } from '../shared/settings.ts';
 import {
@@ -394,11 +394,30 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   // Binary assets live under app/public/ (loaded by assets.ts) and are served
   // here with long cache headers. HTML references these URL paths — never
   // inline base64 — so documents stay small and assets are CSP-safe (`'self'`).
-  const serveAsset = (a: StaticAsset, cacheControl: string) => (c: any) =>
-    c.body(a.bytes, 200, {
-      'content-type': a.contentType,
-      'cache-control': cacheControl,
-    });
+  // CT-2459: ETags so daily-cache (LONG) assets revalidate as a 304
+  // instead of re-downloading image bytes. Weak validators over the same
+  // FNV fingerprint family as assetVersion().
+  const etagForBytes = (bytes: Uint8Array): string => {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    return `W/"${hash.toString(16).padStart(8, '0')}-${bytes.length}"`;
+  };
+  const serveAsset = (a: StaticAsset, cacheControl: string) => {
+    const etag = etagForBytes(a.bytes);
+    return (c: Context<{ Bindings: Env }>) => {
+      if (c.req.header('if-none-match') === etag) {
+        return c.body(null, 304, { etag, 'cache-control': cacheControl });
+      }
+      return c.body(a.bytes, 200, {
+        'content-type': a.contentType,
+        'cache-control': cacheControl,
+        etag,
+      });
+    };
+  };
   /**
    * Same contract as serveAsset, but for text built at module load and carrying a
    * content digest. The digest is what makes `immutable` safe: a stale `?v=` means
@@ -414,7 +433,11 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
       if (requested && requested !== version) {
         return c.redirect(`${new URL(c.req.url).pathname}?v=${version}`, 302);
       }
-      return c.body(body, 200, { 'content-type': contentType, 'cache-control': cacheControl });
+      const etag = `W/"${version}"`;
+      if (c.req.header('if-none-match') === etag) {
+        return c.body(null, 304, { etag, 'cache-control': cacheControl });
+      }
+      return c.body(body, 200, { 'content-type': contentType, 'cache-control': cacheControl, etag });
     };
   const IMMUTABLE = 'public, max-age=31536000, immutable';
   const LONG = 'public, max-age=86400';
@@ -434,12 +457,12 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   // version URL (which is the failure mode Sentry flagged in review).
   r.get(
     '/assets/dashboard.css',
-    serveText(DASHBOARD_CSS, 'text/css; charset=utf-8', DASHBOARD_CSS_VERSION, IMMUTABLE),
+    serveText(DASHBOARD_CSS_SERVED, 'text/css; charset=utf-8', DASHBOARD_CSS_VERSION, IMMUTABLE),
   );
   r.get(
     '/assets/dashboard.js',
     serveText(
-      DASHBOARD_APP_JS,
+      DASHBOARD_APP_JS_SERVED,
       'application/javascript; charset=utf-8',
       DASHBOARD_APP_JS_VERSION,
       IMMUTABLE,

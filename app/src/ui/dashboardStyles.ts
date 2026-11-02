@@ -21,6 +21,7 @@
 
 import { SEMANTIC_DARK, SEMANTIC_DARK_NEG, SEMANTIC_LIGHT } from './semanticThemeTokens.ts';
 import { assetVersion } from './assets.ts';
+import { minifyCss } from './minifyCss.ts';
 
 export const DASHBOARD_CSS = /* css */ `
 
@@ -3217,5 +3218,14 @@ export const DASHBOARD_CSS = /* css */ `
   }
 `;
 
+/**
+ * CT-2459: what browsers actually download — DASHBOARD_CSS minified at
+ * module load (comments/whitespace stripped by minifyCss). DASHBOARD_CSS
+ * stays the readable source so stylesheet tests/tooling keep working
+ * against authored text; routes serve SERVED and the `?v=` fingerprint
+ * below is taken over the served bytes.
+ */
+export const DASHBOARD_CSS_SERVED = minifyCss(DASHBOARD_CSS);
+
 /** `?v=` cache-busting fingerprint; see assetVersion(). */
-export const DASHBOARD_CSS_VERSION = assetVersion(DASHBOARD_CSS);
+export const DASHBOARD_CSS_VERSION = assetVersion(DASHBOARD_CSS_SERVED);

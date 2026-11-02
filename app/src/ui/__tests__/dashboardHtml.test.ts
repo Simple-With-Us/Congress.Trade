@@ -13,8 +13,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { parse } from 'node-html-parser';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
-import { DASHBOARD_CSS, DASHBOARD_CSS_VERSION } from '../dashboardStyles.ts';
-import { DASHBOARD_APP_JS, DASHBOARD_APP_JS_VERSION } from '../dashboardClient.ts';
+import { DASHBOARD_CSS, DASHBOARD_CSS_SERVED, DASHBOARD_CSS_VERSION } from '../dashboardStyles.ts';
+import {
+  DASHBOARD_APP_JS,
+  DASHBOARD_APP_JS_SERVED,
+  DASHBOARD_APP_JS_VERSION,
+} from '../dashboardClient.ts';
 import {
   SEMANTIC_DARK_NEG,
   SEMANTIC_LIGHT,
@@ -4907,7 +4911,11 @@ describe('static UI assets (issue #1040)', () => {
       const res = await app.request(`http://localhost${path}?v=${version}`, {}, {} as never);
       expect(res.status, path).toBe(200);
       expect(res.headers.get('cache-control') ?? '', path).toContain('immutable');
-      expect(await res.text(), path).toBe(path.endsWith('.css') ? DASHBOARD_CSS : DASHBOARD_APP_JS);
+      // CT-2459: served bytes are the minified variants; the readable
+      // DASHBOARD_CSS / DASHBOARD_APP_JS remain the authored sources.
+      expect(await res.text(), path).toBe(
+        path.endsWith('.css') ? DASHBOARD_CSS_SERVED : DASHBOARD_APP_JS_SERVED,
+      );
     }
   });
 
