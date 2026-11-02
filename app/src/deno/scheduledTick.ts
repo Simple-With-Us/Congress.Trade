@@ -77,6 +77,34 @@ export function tickLockErrorShouldFailOpen(err: unknown): boolean {
 }
 
 /**
+ * CT-2459: the eligibleReview probe (review_queue JOIN filings + NOT EXISTS
+ * transactions) is by far the priciest of the five idle probes. Cache a
+ * POSITIVE result for 5 minutes: "work exists" only makes lanes run and
+ * self-check, so a stale true costs one empty lane pass; a negative is
+ * never cached, so newly claimable work is still seen on the next tick.
+ */
+const ELIGIBLE_REVIEW_POSITIVE_CACHE_MS = 5 * 60_000;
+// Keyed by DB binding (like the pipeline-health cache): one shim per prod
+// process, while per-test fake DBs stay isolated from each other.
+const eligibleReviewPositiveAtMs = new WeakMap<object, number>();
+let eligibleReviewPositiveFallbackMs = 0;
+function eligibleReviewCachedPositive(env: Env, nowMs: number): boolean {
+  const key = (env as { DB?: unknown }).DB;
+  const at = key && (typeof key === 'object' || typeof key === 'function')
+    ? (eligibleReviewPositiveAtMs.get(key as object) ?? 0)
+    : eligibleReviewPositiveFallbackMs;
+  return nowMs - at < ELIGIBLE_REVIEW_POSITIVE_CACHE_MS;
+}
+function markEligibleReviewPositive(env: Env, nowMs: number): void {
+  const key = (env as { DB?: unknown }).DB;
+  if (key && (typeof key === 'object' || typeof key === 'function')) {
+    eligibleReviewPositiveAtMs.set(key as object, nowMs);
+  } else {
+    eligibleReviewPositiveFallbackMs = nowMs;
+  }
+}
+
+/**
  * Cheap EXISTS-style probes so idle ticks avoid multi-statement outbox flushes
  * and empty claim loops. Fail-open: any probe error returns true (do the work).
  */
@@ -142,7 +170,9 @@ export async function probePendingWork(env: Env, now = new Date()): Promise<Pend
     // Selector due-now, not health `eligible`.  Conservative defaults
     // (attempt cap 3, skip senate_html) so a quiet paid tick cannot skip
     // claimable House filings.
-    existsOrFalse(
+    eligibleReviewCachedPositive(env, now.getTime())
+      ? Promise.resolve(true)
+      : existsOrFalse(
       `SELECT 1 AS ok
          FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
         WHERE rq.resolved = 0
@@ -160,7 +190,10 @@ export async function probePendingWork(env: Env, now = new Date()): Promise<Pend
           )
         LIMIT 1`,
       [nowIso, leaseExpired],
-    ),
+    ).then((found) => {
+      if (found) markEligibleReviewPositive(env, now.getTime());
+      return found;
+    }),
   ]);
 
   return { ingestQueue, deliveryQueue, ingestionOutbox, deliveryOutbox, eligibleReview };

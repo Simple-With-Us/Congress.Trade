@@ -196,7 +196,9 @@ describe('GET /export/transactions.csv', () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/csv');
-    expect(res.headers.get('X-Export-Complete')).toBe('true');
+    // No completeness claim: headers precede the stream, so a mid-stream
+    // abort must not carry a promise the body did not keep.
+    expect(res.headers.get('X-Export-Complete')).toBeNull();
     expect(res.headers.get('X-Export-Row-Count')).toBe('0');
     const csv = await res.text();
     expect(csv).toContain('filed_at');

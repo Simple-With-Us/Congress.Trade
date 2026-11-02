@@ -142,6 +142,16 @@ export function resolveDailyLaneDeadlineMs(
   return parseDeadlineMs(read('CT_DAILY_LANE_DEADLINE_MS') ?? read('DENO_DAILY_LANE_DEADLINE_MS'));
 }
 
+/** How long the runner holds a lane singleton after abort while the lane
+ *  promise is still unsettled (zombie fence, CT-2459). */
+export const ZOMBIE_GRACE_MS = 30_000;
+
+let zombieLaneCount = 0;
+/** Process-lifetime count of lanes that outlived their abort (CT-2459). */
+export function getZombieLaneCount(): number {
+  return zombieLaneCount;
+}
+
 export interface DailyLaneRunResult {
   /** Lane's own return value, or a runner outcome marker. */
   status: unknown;
@@ -152,8 +162,16 @@ export interface DailyLaneRunResult {
  * Run one daily lane with overlap guard, DB-backed cross-isolate singleton,
  * and an abort deadline that is THREADED INTO the lane (lanes check the
  * signal at slice boundaries and stop starting new work). Exported for
- * tests; the cron closures below delegate here. Fail-open on lock-table
- * errors (a KV problem must not park daily work).
+ * tests; the cron closures below delegate here.
+ *
+ * CT-2459: fail-CLOSED on lock-table errors. Every lane here writes, and
+ * running unguarded on a KV/DB hiccup allowed duplicate concurrent lanes
+ * on the single SQLite connection; lanes refire hourly, so skipping one
+ * firing is cheap insurance. (The minute tick's watcher keeps its own
+ * fail-open rule in scheduledTick.ts.)
+ * CT-2459: on deadline abort the singleton is held until the lane's inner
+ * promise actually settles (bounded grace), instead of releasing the lock
+ * while a zombie lane may still be writing.
  */
 export async function runDailyLane(
   lane: DailyLaneCron,
@@ -163,22 +181,29 @@ export async function runDailyLane(
 ): Promise<DailyLaneRunResult> {
   const started = Date.now();
   let lock: TickSingletonLock | null = null;
-  let lockUnavailable = false;
   try {
     lock = await acquireDenoCronSingleton(env, lane.name, now, deadlineMs + 30_000);
   } catch (err) {
-    lockUnavailable = true;
-    console.warn(`daily lane ${lane.name}: singleton lock unavailable; running unguarded:`, (err as Error).message);
+    // Fail closed (CT-2459): never run a write lane unguarded.
+    console.error(`daily lane ${lane.name}: singleton lock unavailable; skipping firing:`, (err as Error).message);
+    return { status: 'skipped-lock-unavailable', durationMs: Date.now() - started };
   }
-  if (!lock && !lockUnavailable) {
+  if (!lock) {
     return { status: 'skipped-overlap', durationMs: Date.now() - started };
   }
 
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(new Error(`daily lane ${lane.name} exceeded ${deadlineMs}ms deadline`)), deadlineMs);
+  const inner = withThirdPartyTelemetry(env, () => lane.run(env, now, abort.signal));
+  // Observe settlement without ever leaving a floating rejection behind.
+  let innerSettled = false;
+  const innerDone = inner.then(
+    () => { innerSettled = true; },
+    () => { innerSettled = true; },
+  );
   try {
     const status = await Promise.race([
-      withThirdPartyTelemetry(env, () => lane.run(env, now, abort.signal)),
+      inner,
       new Promise<never>((_, reject) => {
         abort.signal.addEventListener('abort', () => reject(abort.signal.reason));
       }),
@@ -194,6 +219,21 @@ export async function runDailyLane(
     return { status: 'error', durationMs: Date.now() - started };
   } finally {
     clearTimeout(timer);
+    if (abort.signal.aborted && !innerSettled) {
+      // Zombie fence (CT-2459): the lane ignored the abort and may still be
+      // writing. Hold the singleton until it settles, bounded by a grace
+      // window scaled to the lane deadline; past that, count it and let
+      // the lock TTL be the backstop.
+      zombieLaneCount += 1;
+      const graceMs = Math.min(ZOMBIE_GRACE_MS, Math.max(deadlineMs, 1_000));
+      console.error(
+        `daily lane ${lane.name}: still running ${Date.now() - started}ms after abort (zombie #${zombieLaneCount}); holding singleton up to ${graceMs}ms`,
+      );
+      await Promise.race([
+        innerDone,
+        new Promise((resolve) => setTimeout(resolve, graceMs)),
+      ]);
+    }
     if (lock) {
       try {
         await lock.release();

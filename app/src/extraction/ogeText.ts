@@ -51,7 +51,7 @@
  * not treat a refusal as "nothing to report".
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Filing, ParsedTx, TxType } from '../shared/types.ts';
@@ -283,6 +283,7 @@ async function extractPdfText(
   // Copy the buffer first: getDocumentProxy/pdf.js transfers and detaches the
   // ArrayBuffer it is handed (same regression guard as textPdf.ts's
   // extractPdfText — see its comment referencing Sentry CONGRESS-TRADE-2).
+  const { extractText, getDocumentProxy } = await import('unpdf');
   const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0)));
   const { text } = await extractText(pdf, { mergePages: true });
   const pageCount =

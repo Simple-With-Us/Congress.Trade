@@ -73,6 +73,10 @@ export const EAGLE_SPLASH_PNG = loadAsset('assets/eagle-splash.png', 'image/png'
 export const BRAND_LOGO_PNG = loadAsset('assets/brand-logo.png', 'image/png');
 export const BRAND_LOGO_DARK_PNG = loadAsset('assets/brand-logo-dark.png', 'image/png');
 export const BRAND_LOGO_LIGHT_PNG = loadAsset('assets/brand-logo-light.png', 'image/png');
+// CT-2459: header serves 920w lossless WebP (161 KB PNG -> ~43 KB). The PNG
+// routes stay for any external/hotlinked references.
+export const BRAND_LOGO_DARK_WEBP = loadAsset('assets/brand-logo-dark.webp', 'image/webp');
+export const BRAND_LOGO_LIGHT_WEBP = loadAsset('assets/brand-logo-light.webp', 'image/webp');
 export const SWU_LOGO_WEBP = loadAsset('swu-logo-wide.webp', 'image/webp');
 export const SIMPLE_WITH_US_WEBP = loadAsset('assets/simple-with-us.webp', 'image/webp');
 

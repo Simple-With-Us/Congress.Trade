@@ -1,5 +1,9 @@
 # Current Handoff
 
+## 2026-11-01 MC — Full-stack perf + UI/UX audit and fix sweep (CT-2459)
+
+Fleet-mode audit (6 auditors + adversarial critic; 27/28 P1s verified) landed as 10 fix batches on `muse-code/perf-ux-audit`: minified web payloads (JS 157 KB gz to 105 KB gz, CSS 205 KB to 128 KB), WebP header logo, skip link/h1/tablist keys, cached health scans, streaming CSV, queue abort-release + jitter, bulk outbox, cache tiers everywhere, client Cache-Control, lazy PDF/LLM imports, cheerio removed, iOS snapshot publishing + image cache.  Typecheck clean; 5,278 tests pass; iOS builds clean (tests compile-verified, no local simulator).  Owner-gated follow-ups (sqlite read connection, queue priority column, VACUUM, image secrets) are listed in the rollout.  Rollout: `docs/rollouts/2026-11-01-ct-2459-perf-ux-audit.md`.
+
 ## 2026-10-30 CODEX — Reports index (AFC-580)
 
 Added docs/reports/README.md to index eligible documentation and reports.  The index links existing canonical files without moving or renaming them.  Central collection under Code/Docs/Congress.Trade/ is populated under the owner-approved docs-only exception.  The collector and protocol are live in AI-Fleet-Coordinator main at `691f4a3c`; the 16-repo collection check reported zero planned changes, and protected Git checkouts remain unchanged.  This in-repo index is the repository entry point.

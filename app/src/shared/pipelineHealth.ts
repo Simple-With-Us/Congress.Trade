@@ -2020,3 +2020,67 @@ export async function checkPipelineHealth(
 
   return { ...evaluated, status, checks, reviewQueue };
 }
+
+export interface PipelineHealthCache {
+  get(env: Env, now?: Date): Promise<PipelineHealth>;
+  reset(): void;
+}
+
+/**
+ * Short-TTL singleflight cache around a pipeline-health fetcher.
+ *
+ * checkPipelineHealth runs dozens of sequential probes; the public health
+ * endpoints are monitor targets, so uncached hits amplify into full scans.
+ * Entries are keyed by the DB binding object: the Deno runtime reuses one
+ * shim per process (deno/main.ts), while tests that build a fresh fake DB
+ * per case stay isolated. Errors are never cached — a rejected fetch clears
+ * the in-flight slot so the next caller retries immediately.
+ */
+export function createPipelineHealthCache(
+  fetcher: (env: Env, now: Date) => Promise<PipelineHealth>,
+  ttlMs = 60_000,
+): PipelineHealthCache {
+  interface Entry {
+    at: number;
+    result?: PipelineHealth;
+    pending?: Promise<PipelineHealth>;
+  }
+  const entries = new WeakMap<object, Entry>();
+  let fallback: Entry | null = null;
+  const entryFor = (env: Env): Entry => {
+    const key = (env as { DB?: unknown }).DB;
+    if (key && (typeof key === 'object' || typeof key === 'function')) {
+      let entry = entries.get(key as object);
+      if (!entry) {
+        entry = { at: 0 };
+        entries.set(key as object, entry);
+      }
+      return entry;
+    }
+    fallback ??= { at: 0 };
+    return fallback;
+  };
+  return {
+    async get(env: Env, now = new Date()): Promise<PipelineHealth> {
+      const entry = entryFor(env);
+      const nowMs = now.getTime();
+      if (entry.result && nowMs - entry.at < ttlMs) return entry.result;
+      if (entry.pending) return entry.pending;
+      const pending = (async () => {
+        const result = await fetcher(env, now);
+        entry.at = nowMs;
+        entry.result = result;
+        return result;
+      })();
+      entry.pending = pending;
+      try {
+        return await pending;
+      } finally {
+        if (entry.pending === pending) entry.pending = undefined;
+      }
+    },
+    reset(): void {
+      fallback = null;
+    },
+  };
+}

@@ -378,6 +378,10 @@ if (!costProfile.disableInternalCron) {
           signal: tickAbort.signal,
           includeDailyJobs: false,
           includeLatencyLanes: false,
+          // CT-2459: the singleton must outlive the longest legal tick, or a
+          // raised CT_TICK_DEADLINE_MS lets the lock expire mid-tick and a
+          // second tick runs concurrently on the single connection.
+          lockTtlMs: tickDeadlineMs + 30_000,
         },
       ));
       let softTimeoutId: ReturnType<typeof setTimeout> | undefined;

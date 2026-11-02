@@ -18,7 +18,7 @@
  * idempotent self-healing sweep that re-picks up anything stranded [here].
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 import type { Env } from '../shared/types.ts';
 import { all, batch, run } from '../shared/db.ts';
 import { FETCH_NOT_PUBLISHED_WINDOW_MS } from './fetcher.ts';
@@ -525,6 +525,7 @@ export async function sweepOgeUndatedFilingDates(
       const obj = await env.RAW_FILES.get(row.raw_object_key);
       if (!obj) continue;
       const bytes = new Uint8Array(await obj.arrayBuffer());
+      const { extractText, getDocumentProxy } = await import('unpdf');
       const pdf = await getDocumentProxy(bytes);
       const { text } = await extractText(pdf, { mergePages: true });
       if (typeof (pdf as unknown as { destroy?: () => void }).destroy === 'function') {

@@ -20,12 +20,12 @@ import { jsonrepair } from 'jsonrepair';
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Env, Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { parseAmountRange } from './amounts.ts';
-import { PDFDocument } from 'pdf-lib';
+// CT-2459: pdf-lib + @google/genai are dynamic-imported at first use so
+// server startup (and /health) does not pay for the PDF/LLM stacks.
 import { resolveSecret } from '../secrets/infisical.ts';
 import { get } from '../shared/db.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { assertLlmSpendWithinCeiling, settleLlmSpend } from '../shared/llmSpend.ts';
-import { GoogleGenAI } from '@google/genai';
 import { candidateSpendUsd } from './bakeoff.ts';
 
 /**
@@ -169,6 +169,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
       lowerModel.includes('openrouter');
 
     try {
+      const { PDFDocument } = await import('pdf-lib');
       const pdfDoc = await PDFDocument.load(input.bytes, { ignoreEncryption: true });
       pageCount = pdfDoc.getPageCount();
       const MAX_PAGES = 50;
@@ -215,6 +216,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
         for (const k of keys) {
           try {
             await geminiRateLimiter.wait(this.env.GEMINI_RPM_LIMIT);
+            const { GoogleGenAI } = await import('@google/genai');
             const ai = new GoogleGenAI({ apiKey: k });
             
             res = await ai.models.generateContent({
@@ -830,6 +832,7 @@ export function markSalvaged(tx: ParsedTx): ParsedTx {
  */
 export async function validatePdfForAnthropic(bytes: ArrayBuffer): Promise<ArrayBuffer> {
   try {
+    const { PDFDocument } = await import('pdf-lib');
     await PDFDocument.load(bytes, { ignoreEncryption: true });
     return bytes;
   } catch {
@@ -850,6 +853,7 @@ export async function validatePdfForAnthropic(bytes: ArrayBuffer): Promise<Array
  */
 export async function resavePdfForAnthropic(bytes: ArrayBuffer): Promise<ArrayBuffer> {
   try {
+    const { PDFDocument } = await import('pdf-lib');
     const pdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const saved = await pdfDoc.save();
     return (saved.buffer as ArrayBuffer).slice(saved.byteOffset, saved.byteOffset + saved.byteLength);
