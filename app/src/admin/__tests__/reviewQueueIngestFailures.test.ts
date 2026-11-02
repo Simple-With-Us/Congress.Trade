@@ -205,6 +205,21 @@ describe('GET /review-queue totals + include', () => {
 });
 
 describe('review-queue ingest-failure input validation', () => {
+  it('round-trips a cursor minted on a NULL first_seen_at row', async () => {
+    const db = makeReviewQueueTestDb([
+      { docId: 'H-NULL-A', createdAt: tsAt(2), noReview: true, chamber: 'house', ingestStatus: 'error', error: 'a' },
+      { docId: 'H-NULL-B', createdAt: tsAt(1), noReview: true, chamber: 'house', ingestStatus: 'error', error: 'b' },
+    ]);
+    await db.prepare('UPDATE filings SET first_seen_at = NULL').run();
+    const first = await fetchIngest(db, '?limit=1');
+    expect(first.status).toBe(200);
+    expect(first.body.nextCursor).toBeTruthy();
+    const second = await fetchIngest(db, `?limit=1&cursor=${encodeURIComponent(first.body.nextCursor ?? '')}`);
+    expect(second.status).toBe(200);
+    expect(second.body.items).toHaveLength(1);
+    expect(second.body.items[0]?.docId).not.toBe(first.body.items[0]?.docId);
+  });
+
   it('rejects an invalid ingest-failure limit or cursor with 400', async () => {
     const db = makeReviewQueueTestDb(mixedFixture());
     for (const q of ['?limit=abc', '?limit=0', '?limit=-3', '?cursor=not-base64-json']) {
