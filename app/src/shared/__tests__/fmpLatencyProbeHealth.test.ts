@@ -92,6 +92,23 @@ describe('evaluateFmpLatencyCheck', () => {
     expect(fmpLatencySilenceWouldBeCritical(silent, true, 3 * 3600)).toBe(true);
   });
 
+  it('malformed resetAtUtc does not suppress a critical silence', () => {
+    const silent = {
+      ...base,
+      observationCount24h: 0,
+      lastObservationAgeSec: 20 * 3600,
+      lastObservationAt: new Date(nowMs - 20 * 3600_000).toISOString(),
+      selfHealingSilence: { cause: 'fmp_day_ban' as const, resetAtUtc: 'not-a-date' },
+    };
+    const r = evaluateFmpLatencyCheck(silent, nowMs, {
+      probeExpected: true,
+      criticalAgeSec: 3 * 3600,
+      graceMs,
+      selfHealing: silent.selfHealingSilence,
+    });
+    expect(r.status).toBe('critical');
+  });
+
   it('day-ban self-healing past midnight-after-last-obs plus grace → critical', () => {
     const lastObservationAt = '2026-10-30T12:00:00.000Z';
     const resetAtUtc = selfHealingResetAtUtc('fmp_day_ban', lastObservationAt);

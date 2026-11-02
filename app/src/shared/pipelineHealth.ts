@@ -794,13 +794,7 @@ export function evaluatePipelineSignals(
   // starts returning 401/403 (which would silently stall the price refresh
   // lane — the 2026-09-20 outage class).
   if (s.fmpLatency != null) {
-    const envGet = (k: string): string | undefined => {
-      try {
-        return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k);
-      } catch {
-        return undefined;
-      }
-    };
+    // Reuses this function's guarded `envGet` (defined above for filing skips).
     const probeExpected = fmpLatencyProbeExpected(envGet);
     const criticalAgeSec = readFmpLatencyCriticalAgeSec(envGet);
     const graceMs = readFmpLatencySelfHealingGraceMs(envGet);

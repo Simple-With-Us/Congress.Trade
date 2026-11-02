@@ -672,6 +672,13 @@ async function processFmpLatencySilenceAlert(
   const condition = 'health_fmp_latency' satisfies PipelineStallCondition;
   const pendingKey = FMP_LATENCY_SILENCE_PENDING_KV_KEY;
 
+  // Missing telemetry is neither silence nor recovery: keep the confirm
+  // window (and any active stall) as-is until a real reading arrives.
+  if (check.status === 'unknown') {
+    result.evaluated.push(condition);
+    return;
+  }
+
   if (check.status !== 'critical') {
     try {
       await env.CONFIG_KV.delete(pendingKey);

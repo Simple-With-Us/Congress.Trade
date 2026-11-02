@@ -522,6 +522,22 @@ describe('pipelineLoudAlerts', () => {
     expect(mark.lastSeenAt).toBe('2026-11-01T18:00:00.000Z');
   });
 
+  it('fmp_latency: unknown telemetry keeps the pending confirm window', async () => {
+    const { env, store } = kvEnv();
+    const mark = JSON.stringify({ firstSeenAt: '2026-11-01T17:00:00.000Z', lastSeenAt: '2026-11-01T17:00:00.000Z' });
+    store.set(FMP_LATENCY_SILENCE_PENDING_KV_KEY, mark);
+    const { checkPipelineHealth } = await import('../../shared/pipelineHealth.ts');
+    vi.mocked(checkPipelineHealth).mockResolvedValue({
+      status: 'unknown',
+      checks: [{ id: 'fmp_latency', status: 'unknown', detail: 'FMP latency telemetry uncollected', value: null }],
+    });
+    notifyStallSpy.mockClear();
+    const result = await sweepPipelineStallAlerts(env, new Date('2026-11-01T18:00:00.000Z'));
+    expect(fmpLatencyEvaluatedCount(result)).toBe(1);
+    expect(result.alerted).not.toContain('health_fmp_latency');
+    expect(store.get(FMP_LATENCY_SILENCE_PENDING_KV_KEY)).toBe(mark);
+  });
+
   it('fmp_latency: degraded self-healing clears pending without paging', async () => {
     const { env, store } = kvEnv();
     store.set(

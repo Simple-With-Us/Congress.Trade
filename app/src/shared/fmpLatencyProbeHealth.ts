@@ -119,7 +119,8 @@ export function evaluateFmpLatencyCheck(
   const selfHealing = baseValue.selfHealingSilence;
   if (silenceCritical && selfHealing) {
     const resetMs = Date.parse(selfHealing.resetAtUtc);
-    const pastGrace = Number.isFinite(resetMs) && nowMs >= resetMs + opts.graceMs;
+    // A malformed reset stamp must not hide the outage: treat it as past grace.
+    const pastGrace = !Number.isFinite(resetMs) || nowMs >= resetMs + opts.graceMs;
     if (!pastGrace) {
       return {
         status: 'degraded',
