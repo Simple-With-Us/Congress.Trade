@@ -19,7 +19,7 @@ import {
 } from '../shared/competitorFixtures.ts';
 import { getSharedStPeerPacer, ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from '../shared/pace.ts';
 import type { PriceClient } from './types.ts';
-import { buildPeerPriceClient, isPeerStaleResponseError } from './peer.ts';
+import { buildPeerPriceClient, readPeerStaleCloses } from './peer.ts';
 import type { Close } from './compute.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { readCorpusLatestPriceDate } from './peerPricePending.ts';
@@ -316,11 +316,8 @@ export function isFatalPriceProviderError(e: unknown, _fmpBudgeted: boolean): bo
 type PeerStaleSignal = { closes: Close[] };
 
 function readPeerStaleSignal(e: unknown): PeerStaleSignal | null {
-  if (isPeerStaleResponseError(e)) return { closes: e.closes };
-  if (typeof e !== 'object' || e === null) return null;
-  const err = e as { message?: unknown; closes?: unknown };
-  if (err.message !== 'PEER_STALE_RESPONSE' || !Array.isArray(err.closes)) return null;
-  return { closes: err.closes as Close[] };
+  const closes = readPeerStaleCloses(e);
+  return closes ? { closes } : null;
 }
 
 type PeerStaleResolution =

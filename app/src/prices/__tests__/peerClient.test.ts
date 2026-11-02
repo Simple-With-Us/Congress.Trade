@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildPeerPriceClient, isPeerStaleResponseError } from '../peer.ts';
+import { buildPeerPriceClient, isPeerStaleResponseError, readPeerStaleCloses } from '../peer.ts';
 
 const DUMMY_TOKEN = 'test-dummy-token';
 
@@ -56,6 +56,14 @@ describe('buildPeerPriceClient — bearer auth', () => {
       closes: [{ date: '2026-06-01', close: 2 }],
     });
     expect(isPeerStaleResponseError(err)).toBe(true);
+  });
+
+  it('rejects plain PEER_STALE_RESPONSE errors whose closes fail zod', () => {
+    const err = Object.assign(new Error('PEER_STALE_RESPONSE'), {
+      closes: [{ date: '2026-06-01', close: 'nope' }],
+    });
+    expect(isPeerStaleResponseError(err)).toBe(false);
+    expect(readPeerStaleCloses(err)).toBeNull();
   });
 
   it('throws PeerStaleResponseError on HTTP 502 with error stale', async () => {

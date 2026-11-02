@@ -36,11 +36,34 @@ export class PeerStaleResponseError extends Error {
   }
 }
 
+/** Plain-error stale signal (e.g. rethrown across a module boundary): closes must pass zod. */
+const peerStalePlainErrorSchema = z.object({
+  message: z.literal('PEER_STALE_RESPONSE'),
+  closes: z.array(
+    z.object({
+      date: z.string(),
+      close: z.number().finite().positive(),
+    }),
+  ),
+});
+
+/**
+ * Single source of truth for the stale-response signal.  Returns the validated
+ * closes for a PeerStaleResponseError (already filtered at construction) or a
+ * plain error whose `closes` pass zod; null for anything else.
+ */
+export function readPeerStaleCloses(e: unknown): Close[] | null {
+  if (e instanceof PeerStaleResponseError) return e.closes;
+  if (typeof e !== 'object' || e === null) return null;
+  const parsed = peerStalePlainErrorSchema.safeParse({
+    message: (e as { message?: unknown }).message,
+    closes: (e as { closes?: unknown }).closes,
+  });
+  return parsed.success ? parsed.data.closes : null;
+}
+
 export function isPeerStaleResponseError(e: unknown): e is PeerStaleResponseError {
-  if (e instanceof PeerStaleResponseError) return true;
-  if (typeof e !== 'object' || e === null) return false;
-  const err = e as { message?: unknown; closes?: unknown };
-  return err.message === 'PEER_STALE_RESPONSE' && Array.isArray(err.closes);
+  return readPeerStaleCloses(e) !== null;
 }
 
 function parsePeerCloses(raw: unknown): Close[] {
