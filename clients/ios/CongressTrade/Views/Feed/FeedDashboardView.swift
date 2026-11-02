@@ -68,20 +68,24 @@ struct FeedDashboardView: View {
     }
 
     /// Everything `computeFilteredTrades` reads, as one comparable token.
+    /// Built by concatenation in small steps — the single array literal
+    /// version timed out CI's Swift type checker (CT-2459).
     private var filterSignature: String {
-        [
-            String(cachedTrades.count),
-            cachedTrades.first?.id ?? "",
-            cachedTrades.last?.id ?? "",
-            searchText,
-            store.feedSortKey.rawValue,
-            store.feedSortDirection.rawValue,
-            store.selectedChambers.map(\.rawValue).sorted().joined(separator: ","),
-            store.selectedParties.map(\.rawValue).sorted().joined(separator: ","),
-            store.selectedTradeTypes.map(\.rawValue).sorted().joined(separator: ","),
-            store.selectedTimeRange.rawValue,
-            String(store.feed?.cursor ?? -1),
-        ].joined(separator: "|")
+        var sig = String(cachedTrades.count)
+        sig += "|" + (cachedTrades.first?.id ?? "")
+        sig += "|" + (cachedTrades.last?.id ?? "")
+        sig += "|" + searchText
+        sig += "|" + store.feedSortKey.rawValue
+        sig += "|" + store.feedSortDirection.rawValue
+        let chambers: [String] = store.selectedChambers.map(\.rawValue).sorted()
+        sig += "|" + chambers.joined(separator: ",")
+        let parties: [String] = store.selectedParties.map(\.rawValue).sorted()
+        sig += "|" + parties.joined(separator: ",")
+        let types: [String] = store.selectedTradeTypes.map(\.rawValue).sorted()
+        sig += "|" + types.joined(separator: ",")
+        sig += "|" + store.selectedTimeRange.rawValue
+        sig += "|" + String(store.feed?.cursor ?? -1)
+        return sig
     }
 
     private func computeFilteredTrades() -> [ClientTrade] {
