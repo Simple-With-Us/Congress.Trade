@@ -83,6 +83,16 @@ export async function cached<T>(
   ttlSec: number,
   fn: () => Promise<T>,
 ): Promise<T> {
+  // No KV binding at all (some test envs): preserve the historical
+  // always-recompute behavior exactly — the memory tier must not invent
+  // staleness where the KV fall-through previously guaranteed freshness.
+  if (typeof (env as { CONFIG_KV?: unknown }).CONFIG_KV !== 'object' || env.CONFIG_KV === null) {
+    try {
+      const hit = await env.CONFIG_KV.get(key);
+      if (hit) return JSON.parse(hit) as T;
+    } catch { /* recompute below */ }
+    return fn();
+  }
   const tier = tierFor(env);
   const mem = memoryGet(tier, key, Date.now());
   if (mem !== null) return JSON.parse(mem) as T;
