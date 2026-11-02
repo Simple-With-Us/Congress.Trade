@@ -1624,19 +1624,16 @@ final class CongressTradeTests: XCTestCase {
         var splitURL: URL?
         var leaderboardURL: URL?
         MockURLProtocol.handler = { request in
-            if request.url?.path.hasSuffix("/bootstrap") == true {
-                return Self.response(for: request, json: Self.bootstrapJSON)
-            }
             if request.url?.path.contains("/api/analytics/party-split") == true {
                 splitURL = request.url
             }
             if request.url?.path.contains("/api/analytics/ticker-leaderboard") == true {
                 leaderboardURL = request.url
             }
-            if request.url?.path.contains("/feed") == true {
-                return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
-            }
-            return Self.response(for: request, json: "{}")
+            // Valid fan-out envelopes: a bare "{}" fails member-leaderboard
+            // decode, the fan-out throws, and its still-queued sibling tasks
+            // are cancelled before firing — racing this capture on slow CI.
+            return Self.trendsEndpointResponse(for: request)
         }
 
         await store.setPartySelection([.democrat])
