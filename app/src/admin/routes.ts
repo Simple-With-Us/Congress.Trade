@@ -1002,24 +1002,42 @@ function encodeIngestFailureCursor(cur: IngestFailureCursor): string {
   return btoa(JSON.stringify(cur));
 }
 
+const ingestFailureCursorSchema = z.object({
+  seenAt: z.string().min(1),
+  docId: z.string().min(1),
+});
+
 function decodeIngestFailureCursor(raw: string): IngestFailureCursor | null {
+  let json: unknown;
   try {
-    const parsed = JSON.parse(atob(raw)) as Partial<IngestFailureCursor>;
-    if (typeof parsed.seenAt === 'string' && typeof parsed.docId === 'string') {
-      return { seenAt: parsed.seenAt, docId: parsed.docId };
-    }
+    json = JSON.parse(atob(raw));
   } catch {
-    /* malformed cursor — caller treats this as null (400) */
+    return null; // malformed cursor — caller answers 400
   }
-  return null;
+  const parsed = ingestFailureCursorSchema.safeParse(json);
+  return parsed.success ? parsed.data : null;
 }
 
-/** Bounded page size shared by the ingest-failure listing (default 50, max 200). */
-function parseIngestLimit(raw: string | undefined): number {
-  const n = parseInt(raw || '', 10);
-  const limit = Number.isFinite(n) && n > 0 ? n : REVIEW_QUEUE_DEFAULT_LIMIT;
-  return Math.min(limit, REVIEW_QUEUE_MAX_LIMIT);
+/** Ingest-failure page size: positive integer, clamped to REVIEW_QUEUE_MAX_LIMIT. */
+const ingestLimitSchema = z.coerce
+  .number()
+  .int()
+  .positive()
+  .transform((n) => Math.min(n, REVIEW_QUEUE_MAX_LIMIT));
+
+/** `?ingestLimit=` / `?limit=` for the ingest-failure listing; undefined → default (50), invalid → null (400). */
+function parseIngestLimit(raw: string | undefined): number | null {
+  if (raw === undefined) return REVIEW_QUEUE_DEFAULT_LIMIT;
+  const parsed = ingestLimitSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
 }
+
+/** `?include=` on GET /review-queue: comma-separated, only known sections allowed. */
+const reviewQueueIncludeSchema = z
+  .string()
+  .optional()
+  .transform((raw) => (raw ?? '').split(',').map((v) => v.trim()).filter((v) => v.length > 0))
+  .pipe(z.array(z.enum(['ingest_failures'])).max(4));
 
 /** Shared WHERE for the ingest-failure page query and its COUNT. */
 function ingestFailureWhere(chamber: string | null): { clause: string; params: SqlParam[] } {
@@ -2900,6 +2918,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   r.get('/review-queue/ingest-failures', async (c) => {
     const chamber = c.req.query('chamber') || null;
     const limit = parseIngestLimit(c.req.query('limit'));
+    if (limit === null) return c.json({ error: 'invalid limit' }, 400);
     let cursor: IngestFailureCursor | null = null;
     if (c.req.query('cursor') !== undefined) {
       cursor = decodeIngestFailureCursor(c.req.query('cursor') || '');
@@ -2928,6 +2947,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     limit = Math.min(limit, REVIEW_QUEUE_MAX_LIMIT);
     if (legacyUnbounded) limit = REVIEW_QUEUE_MAX_LIMIT;
+
+    const includeParsed = reviewQueueIncludeSchema.safeParse(c.req.query('include'));
+    if (!includeParsed.success) return c.json({ error: 'invalid include' }, 400);
+    const includeValues = includeParsed.data;
+    // Embedded ingest-failure page: explicit ?ingestLimit= is zod-validated
+    // (400 on garbage); otherwise follow the queue's own sanitized ?limit=.
+    const ingestLimitRaw = c.req.query('ingestLimit');
+    const ingestLimit =
+      ingestLimitRaw !== undefined
+        ? parseIngestLimit(ingestLimitRaw)
+        : hasLimitParam
+          ? limit
+          : REVIEW_QUEUE_DEFAULT_LIMIT;
+    if (ingestLimit === null) return c.json({ error: 'invalid ingestLimit' }, 400);
 
     let cursor: ReviewQueueCursor | null = null;
     if (hasCursorParam) {
@@ -3097,11 +3130,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       nextCursor,
       totals,
     };
-    const includeRaw = c.req.query('include') || '';
-    if (includeRaw.split(',').map((s) => s.trim()).includes('ingest_failures')) {
+    if (includeValues.includes('ingest_failures')) {
       const embedded = await listIngestFailures(c.env.DB, {
         chamber: null,
-        limit: parseIngestLimit(c.req.query('ingestLimit') ?? c.req.query('limit')),
+        limit: ingestLimit,
         cursor: null,
       });
       body.ingestFailures = embedded.items;

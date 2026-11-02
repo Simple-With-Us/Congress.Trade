@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildAdminRouter } from '../routes.ts';
 import { makeReviewQueueTestDb, type ReviewQueueFixtureRow } from './reviewQueueTestDb.ts';
+import type { Env } from '../../shared/types.ts';
 
 /**
  * Ingest-failure visibility for the admin review queue: filings stuck at
@@ -17,8 +18,10 @@ function tsAt(i: number): string {
   return new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0) + i * 60_000).toISOString();
 }
 
-function env(db: ReturnType<typeof makeReviewQueueTestDb>) {
-  return { ADMIN_TOKEN: 'admin-secret', DB: db } as never;
+/** Partial Env: the admin router reads only ADMIN_TOKEN and DB in these tests. */
+function env(db: ReturnType<typeof makeReviewQueueTestDb>): Env {
+  // @ts-expect-error -- SQLite D1 stand-in implements only the query surface (no exec/withSession/dump) and the rest of Env is intentionally unbound.
+  return { ADMIN_TOKEN: 'admin-secret', DB: db };
 }
 
 interface IngestItem {
@@ -200,3 +203,22 @@ describe('GET /review-queue totals + include', () => {
     expect(ingest.body.totals).toMatchObject({ ingestFailures: 0, publishedStatusStale: 0 });
   });
 });
+
+describe('review-queue ingest-failure input validation', () => {
+  it('rejects an invalid ingest-failure limit or cursor with 400', async () => {
+    const db = makeReviewQueueTestDb(mixedFixture());
+    for (const q of ['?limit=abc', '?limit=0', '?limit=-3', '?cursor=not-base64-json']) {
+      const res = await app.request(`/review-queue/ingest-failures${q}`, { headers: AUTH }, env(db));
+      expect(res.status, q).toBe(400);
+    }
+  });
+
+  it('rejects unknown include sections and a bad ingestLimit with 400', async () => {
+    const db = makeReviewQueueTestDb(mixedFixture());
+    for (const q of ['include=bogus', 'include=ingest_failures&ingestLimit=x']) {
+      const res = await app.request(`/review-queue?limit=50&${q}`, { headers: AUTH }, env(db));
+      expect(res.status, q).toBe(400);
+    }
+  });
+});
+
