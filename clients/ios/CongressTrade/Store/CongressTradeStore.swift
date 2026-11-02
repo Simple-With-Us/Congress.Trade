@@ -21,6 +21,30 @@ final class CongressTradeStore: ObservableObject {
     @Published private(set) var partySplit: PartySplitResponse?
     @Published private(set) var filingLag: FilingLagResponse?
     @Published private(set) var conflicts: [ConflictCandidateItem] = []
+    /// One Trends fan-out, published as a single value. The individual
+    /// properties above stay as the view-facing mirrors (31 read sites), but
+    /// they are now assigned in one synchronous block from this snapshot —
+    /// previously each of the ~13 awaits published separately and invalidated
+    /// every `@EnvironmentObject` reader per endpoint.
+    struct TrendsSnapshot {
+        var summary: AnalyticsSummary?
+        var tickers: [TickerLeaderboardItem] = []
+        var volume: [VolumeOverTimePoint] = []
+        var sectors: [SectorFlowItem] = []
+        var members: [MemberLeaderboardItem] = []
+        var clusters: [ClusterBuyItem] = []
+        var trending: [TrendingItem] = []
+        var topPerformers: [TopPerformerItem] = []
+        var marketCap: [MarketCapItem] = []
+        var partySplit: PartySplitResponse?
+        var filingLag: FilingLagResponse?
+        var conflicts: [ConflictCandidateItem] = []
+        var latency: LatencySummary?
+    }
+    @Published private(set) var trendsSnapshot: TrendsSnapshot?
+    /// Bumped exactly once per completed fan-out (test hook for the
+    /// single-assign guarantee; not UI-bound).
+    private(set) var trendsSnapshotRevision = 0
     /// Multi-select party filter (owner directive 2026-08-09: Chamber/Party/
     /// Trade Type pills must support one-or-many, matching the web's CSV
     /// multi-select semantics). Empty = all parties (default). Forwarded as
