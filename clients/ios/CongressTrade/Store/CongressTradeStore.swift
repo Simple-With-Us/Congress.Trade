@@ -972,36 +972,56 @@ final class CongressTradeStore: ObservableObject {
         // slow/failed scoreboard never blanks the rest of Trends.
         async let latencyTask = api.latencySummary()
 
-        analyticsSummary = try await summaryTask
-        tickerLeaderboard = try await tickersTask.tickers
-        volumeSeries = try await volumeTask.series
-        sectorFlow = try await sectorsTask.sectors
-        memberLeaderboard = try await membersTask.members
-        clusterBuys = try await clustersTask.clusters
-        trendingAssets = await trendingTask
-        topPerformers = (try? await topPerformersTask)?.members ?? []
-        marketCapBuckets = (try? await marketCapTask)?.buckets ?? []
-        partySplit = try? await partySplitTask
-        filingLag = try? await filingLagTask
+        // CT-2459: collect into locals, then publish once. Previously each
+        // await assigned its @Published property separately (~13
+        // objectWillChange waves per fan-out to every observing view).
+        var snapshot = TrendsSnapshot()
+        snapshot.summary = try await summaryTask
+        snapshot.tickers = try await tickersTask.tickers
+        snapshot.volume = try await volumeTask.series
+        snapshot.sectors = try await sectorsTask.sectors
+        snapshot.members = try await membersTask.members
+        snapshot.clusters = try await clustersTask.clusters
+        snapshot.trending = await trendingTask
+        snapshot.topPerformers = (try? await topPerformersTask)?.members ?? []
+        snapshot.marketCap = (try? await marketCapTask)?.buckets ?? []
+        snapshot.partySplit = try? await partySplitTask
+        snapshot.filingLag = try? await filingLagTask
         // Not `try?`: a decode mismatch here is a contract break, and swallowing
         // it is exactly how this section stayed invisible on iOS for weeks.
         // Still fail-soft for the user — an empty Conflicts section must never
         // blank the rest of Trends — but it now reports itself.
         do {
-            conflicts = (try await conflictsTask).conflicts ?? []
+            snapshot.conflicts = (try await conflictsTask).conflicts ?? []
         } catch {
-            conflicts = []
+            snapshot.conflicts = []
             SentryTelemetry.captureDecodeFailure(endpoint: "/api/analytics/conflicts", error: error)
         }
         do {
-            latencySummary = try await latencyTask
+            snapshot.latency = try await latencyTask
         } catch {
             if let apiError = error as? APIError, apiError.isCancellation {
-                // ignore
+                snapshot.latency = latencySummary
             } else {
-                latencySummary = nil
+                snapshot.latency = nil
             }
         }
+        // Single synchronous publish block: one view-invalidation wave.
+        analyticsSummary = snapshot.summary
+        tickerLeaderboard = snapshot.tickers
+        volumeSeries = snapshot.volume
+        sectorFlow = snapshot.sectors
+        memberLeaderboard = snapshot.members
+        clusterBuys = snapshot.clusters
+        trendingAssets = snapshot.trending
+        topPerformers = snapshot.topPerformers
+        marketCapBuckets = snapshot.marketCap
+        partySplit = snapshot.partySplit
+        filingLag = snapshot.filingLag
+        conflicts = snapshot.conflicts
+        latencySummary = snapshot.latency
+        trendsSnapshot = snapshot
+        trendsSnapshotRevision += 1
     }
 
     /// Shared 429 / 5xx / transport retry used by Trades and Trends.
@@ -1033,7 +1053,14 @@ final class CongressTradeStore: ObservableObject {
     /// poll and left the store empty between the delete and the insert).
     private func replaceCache(with response: ClientFeedResponse) throws {
         guard let context = modelContext else { return }
-        let existing = try context.fetch(FetchDescriptor<ClientTrade>())
+        // CT-2459: two predicate fetches (upsert candidates by id, stale
+        // rows by exclusion) instead of materializing the whole cache on
+        // the main actor every poll just to upsert one page.
+        let seenIDs = response.items.map(\.id)
+        let upsertDescriptor = FetchDescriptor<ClientTrade>(
+            predicate: #Predicate { seenIDs.contains($0.id) }
+        )
+        let existing = try context.fetch(upsertDescriptor)
         let byID = Dictionary(existing.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var seen = Set<String>()
         for item in response.items {
@@ -1044,7 +1071,10 @@ final class CongressTradeStore: ObservableObject {
                 context.insert(item)
             }
         }
-        for trade in existing where !seen.contains(trade.id) {
+        let staleDescriptor = FetchDescriptor<ClientTrade>(
+            predicate: #Predicate { !seenIDs.contains($0.id) }
+        )
+        for trade in try context.fetch(staleDescriptor) {
             context.delete(trade)
         }
         if context.hasChanges {
@@ -1215,25 +1245,38 @@ final class CongressTradeStore: ObservableObject {
     /// (mirrors the web's `PEOPLE_CACHE`/`PEOPLE_TTL_MS`, `dashboardHtml.ts`)
     /// so switching to the People tab repeatedly doesn't re-fetch the whole
     /// roster every time; pass `force: true` for pull-to-refresh.
+    /// CT-2459: in-flight coalescing (Directory tab + DeliveryView could
+    /// previously issue duplicate whole-roster fetches back to back).
+    private var membersLoadTask: Task<Void, Never>?
+
     func loadMembersDirectory(force: Bool = false) async {
         if !force, let lastLoadedAt = membersLastLoadedAt,
            Date().timeIntervalSince(lastLoadedAt) < Self.membersCacheTTL, !members.isEmpty {
             return
         }
-        isLoadingMembers = true
-        membersNotice = nil
-        do {
-            let response = try await api.membersDirectory()
-            members = response.members
-            membersLastLoadedAt = Date()
-        } catch {
-            if let apiError = error as? APIError, apiError.isCancellation {
-                // ignore
-            } else {
-                membersNotice = error.localizedDescription
-            }
+        if let membersLoadTask {
+            await membersLoadTask.value
+            return
         }
-        isLoadingMembers = false
+        let task = Task { @MainActor in
+            isLoadingMembers = true
+            membersNotice = nil
+            do {
+                let response = try await api.membersDirectory()
+                members = response.members
+                membersLastLoadedAt = Date()
+            } catch {
+                if let apiError = error as? APIError, apiError.isCancellation {
+                    // ignore
+                } else {
+                    membersNotice = error.localizedDescription
+                }
+            }
+            isLoadingMembers = false
+        }
+        membersLoadTask = task
+        await task.value
+        membersLoadTask = nil
     }
 
     func refreshSignedInState() async {

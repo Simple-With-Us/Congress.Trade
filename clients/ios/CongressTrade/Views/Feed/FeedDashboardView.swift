@@ -4,7 +4,13 @@ import UIKit
 
 struct FeedDashboardView: View {
     @EnvironmentObject private var store: CongressTradeStore
-    @Query private var cachedTrades: [ClientTrade]
+    // CT-2459: cursor-desc is the server's feed order — let SwiftData
+    // maintain it instead of starting every view sort from arbitrary order.
+    @Query(sort: \ClientTrade.cursor, order: .reverse) private var cachedTrades: [ClientTrade]
+    /// Memoized sort+filter output (CT-2459). Recomputed only when
+    /// `filterSignature` changes (see `.task(id:)` in body), not on every
+    /// body pass / unrelated store publish.
+    @State private var tradesSnapshot: [ClientTrade] = []
     @State private var searchText = ""
     @State private var filterTask: Task<Void, Never>?
     @State private var selectedTrade: ClientTrade?
@@ -61,7 +67,24 @@ struct FeedDashboardView: View {
         }
     }
 
-    var filteredTrades: [ClientTrade] {
+    /// Everything `computeFilteredTrades` reads, as one comparable token.
+    private var filterSignature: String {
+        [
+            String(cachedTrades.count),
+            cachedTrades.first?.id ?? "",
+            cachedTrades.last?.id ?? "",
+            searchText,
+            store.feedSortKey.rawValue,
+            store.feedSortDirection.rawValue,
+            store.selectedChambers.map(\.rawValue).sorted().joined(separator: ","),
+            store.selectedParties.map(\.rawValue).sorted().joined(separator: ","),
+            store.selectedTradeTypes.map(\.rawValue).sorted().joined(separator: ","),
+            store.selectedTimeRange.rawValue,
+            String(store.feed?.cursor ?? -1),
+        ].joined(separator: "|")
+    }
+
+    private func computeFilteredTrades() -> [ClientTrade] {
         let searchNeedle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let chambers = store.selectedChambers
         let filteringChambers = !chambers.isEmpty
@@ -170,10 +193,10 @@ struct FeedDashboardView: View {
     }
 
     var body: some View {
-        // Read once per render. `filteredTrades` re-sorts the whole loaded page
-        // every time it is touched, and the body needs it for the count, the
-        // empty state and the list — three full sorts per frame before this.
-        let trades = filteredTrades
+        // CT-2459: memoized snapshot, recomputed by the `.task(id:)` below
+        // only when an actual filter/sort/cache input changes — not on
+        // every body pass.
+        let trades = tradesSnapshot
         return NavigationStack {
             VStack(spacing: 0) {
                 FeedDisclaimerHeader(disclaimerExpanded: $disclaimerExpanded) {
@@ -384,6 +407,9 @@ struct FeedDashboardView: View {
             .simultaneousGesture(
                 TapGesture().onEnded { searchFocused = false }
             )
+            .task(id: filterSignature) {
+                tradesSnapshot = computeFilteredTrades()
+            }
         }
     }
 

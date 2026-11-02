@@ -1,4 +1,5 @@
 import AuthenticationServices
+import ImageIO
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -310,15 +311,85 @@ extension String {
 }
 
 enum MemberPhotoURL {
-    /// First usable absolute URL among the API profile, a Directory-row seed,
-    /// and any already-loaded roster entry. Relative `/api/photos/...` paths
-    /// are ignored: SwiftUI `AsyncImage` cannot resolve them.
+    /// First usable URL among the API profile, a Directory-row seed, and any
+    /// already-loaded roster entry. CT-2459: relative `/api/photos/...`
+    /// paths now resolve against the site origin instead of being dropped
+    /// (rows silently fell back to initials). Non-http(s) results are still
+    /// rejected after resolution.
     static func resolve(_ candidates: String?...) -> URL? {
+        let origin = CongressTradeAPIClient.defaultBaseURL
+            .deletingLastPathComponent() // v1
+            .deletingLastPathComponent() // client
+            .deletingLastPathComponent() // api
         for raw in candidates {
-            guard let raw, !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else { continue }
-            return url
+            guard let raw, !raw.isEmpty else { continue }
+            if let url = URL(string: raw), let scheme = url.scheme,
+               scheme == "http" || scheme == "https" {
+                return url
+            }
+            if raw.hasPrefix("/"), let url = URL(string: raw, relativeTo: origin)?.absoluteURL,
+               url.scheme == "http" || url.scheme == "https" {
+                return url
+            }
         }
         return nil
+    }
+}
+
+/// CT-2459: shared downsampling image cache. Bare `AsyncImage` re-decoded
+/// full-size assets on every scroll-back with no memory cache. This loads
+/// once per URL, thumbnail-decodes at display pixels via ImageIO, and
+/// keeps results in a cost-capped NSCache. A previously cached image
+/// renders synchronously (no placeholder flash).
+enum CachedImageLoader {
+    static let cache: NSCache<NSURL, UIImage> = {
+        let c = NSCache<NSURL, UIImage>()
+        c.totalCostLimit = 20 * 1024 * 1024
+        return c
+    }()
+
+    static func cachedImage(for url: URL) -> UIImage? {
+        cache.object(forKey: url as NSURL)
+    }
+
+    static func load(url: URL, maxPixelSize: CGFloat) async -> UIImage? {
+        if let hit = cachedImage(for: url) { return hit }
+        guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maxPixelSize)),
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        let image = UIImage(cgImage: cg)
+        cache.setObject(image, forKey: url as NSURL, cost: data.count)
+        return image
+    }
+}
+
+struct CachedAsyncImage: View {
+    let url: URL
+    var pointSize: CGFloat = 48
+    @State private var image: UIImage?
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable()
+            } else {
+                Color.clear
+            }
+        }
+        .task(id: url) {
+            if let hit = CachedImageLoader.cachedImage(for: url) {
+                image = hit
+                return
+            }
+            image = await CachedImageLoader.load(url: url, maxPixelSize: pointSize * displayScale)
+        }
     }
 }
 
@@ -337,12 +408,9 @@ struct MemberAvatar: View {
                 .frame(width: size, height: size)
                 .background(AppTheme.card, in: Circle())
             if let photoURL {
-                AsyncImage(url: photoURL) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    }
-                }
-                .frame(width: size, height: size)
+                CachedAsyncImage(url: photoURL, pointSize: size)
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: size, height: size)
             }
         }
         .frame(width: size, height: size)
@@ -356,17 +424,21 @@ struct MetricTile: View {
     let title: String
     let value: String
     var tint: Color? = nil
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+            // CT-2459: at accessibility sizes the value wraps instead of
+            // shrinking below legibility via minimumScaleFactor.
             Text(value)
                 .font(.subheadline.weight(.bold))
                 .foregroundStyle(tint ?? .primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                .minimumScaleFactor(dynamicTypeSize.isAccessibilitySize ? 1 : 0.75)
+                .fixedSize(horizontal: false, vertical: dynamicTypeSize.isAccessibilitySize)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
@@ -409,11 +481,13 @@ struct FilterChip: View {
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
+                .frame(minHeight: 44)
                 .foregroundStyle(isSelected ? Color.white : Color.primary)
                 .background(
                     isSelected ? Color.accentColor : Color(uiColor: .systemGray5),
                     in: Capsule()
                 )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }
@@ -448,30 +522,38 @@ struct AssetMark: View {
         return components.url
     }
 
+    @State private var logoImage: UIImage?
+    @Environment(\.displayScale) private var displayScale
+
     var body: some View {
         // No monogram / blue-square placeholders: when there is no real logo,
         // take zero space so asset + politician names get the width.
-        if let url = themedLogoURL {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .padding(size * 0.12)
-                        .frame(width: size, height: size)
-                        .background(
-                            AppTheme.card,
-                            in: RoundedRectangle(cornerRadius: size * 0.22)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: size * 0.22)
-                                .stroke(AppTheme.borderColor, lineWidth: 1)
-                        )
-                default:
-                    EmptyView()
-                }
+        // CT-2459: served from the shared downsampling cache; a cached logo
+        // appears synchronously on scroll-back instead of re-decoding.
+        Group {
+            if let logoImage {
+                Image(uiImage: logoImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .padding(size * 0.12)
+                    .frame(width: size, height: size)
+                    .background(
+                        AppTheme.card,
+                        in: RoundedRectangle(cornerRadius: size * 0.22)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: size * 0.22)
+                            .stroke(AppTheme.borderColor, lineWidth: 1)
+                    )
             }
+        }
+        .task(id: themedLogoURL) {
+            guard let url = themedLogoURL else { logoImage = nil; return }
+            if let hit = CachedImageLoader.cachedImage(for: url) {
+                logoImage = hit
+                return
+            }
+            logoImage = await CachedImageLoader.load(url: url, maxPixelSize: size * displayScale)
         }
     }
 }

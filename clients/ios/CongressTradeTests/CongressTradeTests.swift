@@ -3450,3 +3450,36 @@ private final class MockURLProtocol: URLProtocol {
 
     override func stopLoading() {}
 }
+
+/// CT-2459: Trader identity is stable across decodes (it used to mint a
+/// fresh UUID per `id` access when filerId/fullName were nil).
+final class TraderIdentityTests: XCTestCase {
+    private func decodeTrader(_ json: String) throws -> ClientTickerAnalytics.Trader {
+        try JSONDecoder().decode(
+            ClientTickerAnalytics.Trader.self, from: Data(json.utf8)
+        )
+    }
+
+    func testIDStableAcrossRepeatedAccessAndDecodes() throws {
+        let json = #"{"partyBucket":"D","tradeCount":3,"estVolumeUsd":12345.0}"#
+        let a = try decodeTrader(json)
+        let b = try decodeTrader(json)
+        XCTAssertEqual(a.id, a.id)
+        XCTAssertEqual(a.id, b.id)
+        XCTAssertTrue(a.id.hasPrefix("anon:"))
+    }
+
+    func testIDPrefersFilerIDThenName() throws {
+        let byFiler = try decodeTrader(#"{"filerId":"P000197","fullName":"Nancy Pelosi"}"#)
+        XCTAssertEqual(byFiler.id, "P000197")
+        let byName = try decodeTrader(#"{"fullName":"  Nancy Pelosi "}"#)
+        XCTAssertEqual(byName.id, "name:nancy pelosi")
+    }
+
+    func testRelativePhotoPathResolvesAgainstOrigin() {
+        let resolved = MemberPhotoURL.resolve("/api/photos/P000197.jpg")
+        XCTAssertEqual(resolved?.absoluteString, "https://congress.trade/api/photos/P000197.jpg")
+        XCTAssertNil(MemberPhotoURL.resolve("javascript:alert(1)"))
+        XCTAssertNil(MemberPhotoURL.resolve(nil, ""))
+    }
+}
