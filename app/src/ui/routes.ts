@@ -23,6 +23,8 @@ import {
   APPLE_TOUCH_ICON_PNG,
   BRAND_LOGO_DARK_PNG,
   BRAND_LOGO_LIGHT_PNG,
+  BRAND_LOGO_DARK_WEBP,
+  BRAND_LOGO_LIGHT_WEBP,
   BRAND_LOGO_PNG,
   EAGLE_SPLASH_PNG,
   FAVICON_PNG,
@@ -479,6 +481,8 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   r.get('/assets/brand-logo.png', serveAsset(BRAND_LOGO_PNG, IMMUTABLE));
   r.get('/assets/brand-logo-dark.png', serveAsset(BRAND_LOGO_DARK_PNG, IMMUTABLE));
   r.get('/assets/brand-logo-light.png', serveAsset(BRAND_LOGO_LIGHT_PNG, IMMUTABLE));
+  r.get('/assets/brand-logo-dark.webp', serveAsset(BRAND_LOGO_DARK_WEBP, IMMUTABLE));
+  r.get('/assets/brand-logo-light.webp', serveAsset(BRAND_LOGO_LIGHT_WEBP, IMMUTABLE));
   r.get('/assets/simple-with-us.webp', serveAsset(SIMPLE_WITH_US_WEBP, IMMUTABLE));
   r.get('/swu-logo-wide.webp', serveAsset(SWU_LOGO_WEBP, LONG));
   r.get('/og-image.png', serveAsset(OG_IMAGE_PNG, LONG));

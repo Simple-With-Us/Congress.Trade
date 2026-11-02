@@ -140,6 +140,7 @@ function shell(title: string, body: string): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#eff3f8" />
+<meta name="description" content="${title} for Congress.Trade — STOCK Act disclosure tracking for the House, Senate, and Executive Branch." />
 <title>${title} · Congress.Trade</title>
 ${LEGAL_THEME_BOOT}
 <style>
@@ -159,7 +160,8 @@ ${LEGAL_THEME_BOOT}
          background:rgba(10,16,30,.6);position:sticky;top:0;backdrop-filter:blur(8px)}
   html[data-theme="light"] header{background:#fff;-webkit-backdrop-filter:none;backdrop-filter:none}
   .brand{font-weight:700;font-size:16px;font-family:var(--sans)}.brand .dot{color:var(--accent)}
-  a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+  a{color:var(--accent);text-decoration:underline}
+  a:focus-visible,.theme-seg-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
   main{max-width:820px;margin:0 auto;padding:32px 35px 64px}
   h1{font-size:26px;font-weight:700;margin:0 0 4px;font-family:var(--sans)}
   .eff{color:var(--dim);font-size:13px;margin:0 0 28px;font-family:var(--sans)}
