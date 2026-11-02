@@ -54,13 +54,11 @@ RUN wget -qO- 'https://artifacts-cli.infisical.com/setup.apk.sh' | sh \
 # Cache dependencies: manifests + lockfiles first (no ||true -- a failed
 # install must fail the build, not ship a broken image). vendor shared src
 # rides along because deno.json maps an import to it.
-# NOT --frozen yet: `deno install --frozen` fails on main today because the
-# committed deno.lock is stale (e.g. it pins @aws-sdk/client-s3@3.1157.0
-# while deno.json asks for 3.1158.0). Regen the lock (`cd app && deno
-# install`, commit deno.lock), then add --frozen back (CT-2459 follow-up).
+# --frozen: deno.lock was regenerated against the aligned deno.json in
+# CT-2459; a stale lock now fails the build instead of drifting silently.
 COPY package.json package-lock.json deno.json deno.lock ./
 COPY vendor/congress-trading-shared/src ./vendor/congress-trading-shared/src
-RUN deno install
+RUN deno install --frozen
 
 # Copy only what the runtime reads (CT-2459): src, public (ui/assets.ts
 # reads ../../public at module load), migrations, the entrypoint scripts,
