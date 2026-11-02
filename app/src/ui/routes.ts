@@ -413,7 +413,7 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
       if (c.req.header('if-none-match') === etag) {
         return c.body(null, 304, { etag, 'cache-control': cacheControl });
       }
-      return c.body(a.bytes, 200, {
+      return c.body(a.bytes as Uint8Array<ArrayBuffer>, 200, {
         'content-type': a.contentType,
         'cache-control': cacheControl,
         etag,

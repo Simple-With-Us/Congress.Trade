@@ -11,7 +11,7 @@
  */
 
 import type { Env } from './shared/types.ts';
-import { run, all, batch } from './shared/db.ts';
+import { run, all, batch as batchStatements } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
 import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
 import {
@@ -386,7 +386,7 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
         [`DELETE FROM ingestion_outbox WHERE doc_id IN (${placeholders})`, docIds],
         [`DELETE FROM filings WHERE doc_id IN (${placeholders})`, docIds],
       );
-      await batch(env.DB, statements);
+      await batchStatements(env.DB, statements);
       
       totalDeleted += rows.length;
     }
