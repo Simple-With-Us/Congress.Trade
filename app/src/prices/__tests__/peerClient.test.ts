@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildPeerPriceClient } from '../peer.ts';
+import { buildPeerPriceClient, isPeerStaleResponseError, readPeerStaleCloses } from '../peer.ts';
 
 const DUMMY_TOKEN = 'test-dummy-token';
 
@@ -51,7 +51,39 @@ describe('buildPeerPriceClient — bearer auth', () => {
     expect(await client.eodHistory('AAPL', '2024-01-01', '2024-02-01')).toEqual([]);
   });
 
-  it('throws PEER_HTTP_401 in strict mode so peer-only runs fail closed on auth', async () => {
+  it('recognizes plain errors carrying PEER_STALE_RESPONSE closes', () => {
+    const err = Object.assign(new Error('PEER_STALE_RESPONSE'), {
+      closes: [{ date: '2026-06-01', close: 2 }],
+    });
+    expect(isPeerStaleResponseError(err)).toBe(true);
+  });
+
+  it('rejects plain PEER_STALE_RESPONSE errors whose closes fail zod', () => {
+    const err = Object.assign(new Error('PEER_STALE_RESPONSE'), {
+      closes: [{ date: '2026-06-01', close: 'nope' }],
+    });
+    expect(isPeerStaleResponseError(err)).toBe(false);
+    expect(readPeerStaleCloses(err)).toBeNull();
+  });
+
+  it('throws PeerStaleResponseError on HTTP 502 with error stale', async () => {
+    const { PeerStaleResponseError } = await import('../peer.ts');
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ ok: false, error: 'stale', closes: [{ date: '2020-01-01', close: 1 }] }), {
+        status: 502,
+      })) as unknown as typeof fetch;
+    const client = buildPeerPriceClient('https://peer.example', fetchImpl, DUMMY_TOKEN, { strict: true });
+    await expect(client.eodHistory('AAPL', '2024-01-01', '2024-02-01')).rejects.toBeInstanceOf(PeerStaleResponseError);
+  });
+
+  it('throws PEER_HTTP_502 when strict mode gets a 502 body the schema cannot parse as stale', async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ error: 123, closes: [] }), { status: 502 })) as unknown as typeof fetch;
+    const client = buildPeerPriceClient('https://peer.example', fetchImpl, DUMMY_TOKEN, { strict: true });
+    await expect(client.eodHistory('AAPL', '2024-01-01', '2024-02-01')).rejects.toThrow(/PEER_HTTP_502/);
+  });
+
+  it('still throws PEER_HTTP_401 in strict mode so peer-only runs fail closed on auth', async () => {
     const unauthorized = (async () => new Response('', { status: 401 })) as unknown as typeof fetch;
     const client = buildPeerPriceClient('https://peer.example', unauthorized, DUMMY_TOKEN, { strict: true });
     await expect(client.eodHistory('AAPL', '2024-01-01', '2024-02-01')).rejects.toThrow(/PEER_HTTP_401/);

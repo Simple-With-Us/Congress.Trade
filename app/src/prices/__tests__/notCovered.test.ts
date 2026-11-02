@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   eodCalls: [] as Array<{ symbol: string; from: string; to: string }>,
   responses: new Map<string, Array<{ date: string; close: number }>>(),
   errors: new Map<string, string>(),
+  staleResponses: new Map<string, Array<{ date: string; close: number }>>(),
 }));
 
 vi.mock('../../secrets/infisical', async (importOriginal) => ({
@@ -28,22 +29,30 @@ vi.mock('../../secrets/infisical', async (importOriginal) => ({
   resolveSecrets: vi.fn(async () => ({})),
 }));
 
-vi.mock('../peer', () => ({
-  buildPeerPriceClient: () => ({
-    eodHistory: async (symbol: string, from?: string, to?: string) => {
-      h.eodCalls.push({ symbol, from: from ?? '', to: to ?? '' });
-      const herr = h.errors.get(symbol);
-      if (herr) throw new Error(herr);
-      return h.responses.get(symbol) ?? [];
-    },
-    spxHistory: async (from?: string, to?: string) => {
-      h.eodCalls.push({ symbol: 'SPY', from: from ?? '', to: to ?? '' });
-      const herr = h.errors.get('SPY');
-      if (herr) throw new Error(herr);
-      return h.responses.get('SPY') ?? [];
-    },
-  }),
-}));
+vi.mock('../peer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../peer.ts')>();
+  return {
+    ...actual,
+    buildPeerPriceClient: () => ({
+      eodHistory: async (symbol: string, from?: string, to?: string) => {
+        h.eodCalls.push({ symbol, from: from ?? '', to: to ?? '' });
+        const stale = h.staleResponses.get(symbol);
+        if (stale) {
+          throw Object.assign(new Error('PEER_STALE_RESPONSE'), { closes: stale });
+        }
+        const herr = h.errors.get(symbol);
+        if (herr) throw new Error(herr);
+        return h.responses.get(symbol) ?? [];
+      },
+      spxHistory: async (from?: string, to?: string) => {
+        h.eodCalls.push({ symbol: 'SPY', from: from ?? '', to: to ?? '' });
+        const herr = h.errors.get('SPY');
+        if (herr) throw new Error(herr);
+        return h.responses.get('SPY') ?? [];
+      },
+    }),
+  };
+});
 
 vi.mock('../../enrichment/service.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../enrichment/service.ts')>();
@@ -58,6 +67,9 @@ import {
   priceNotCoveredExclusionSql,
   runPriceRefresh,
   ST_FETCH_ERROR_REASON_PREFIX,
+  ST_PEER_STALE_HIT_PREFIX,
+  ST_PEER_STALE_HIT_TERMINATE,
+  parsePeerStaleHitCount,
 } from '../service.ts';
 import {
   markStuckPeerPriceTickersNotCovered,
@@ -65,6 +77,7 @@ import {
   recheckNotCoveredPeerPrices,
   ST_NOT_COVERED_MAX_BATCH,
   ST_NOT_COVERED_STUCK_HOURS,
+  isTerminalPeerPriceTicker,
 } from '../notCovered.ts';
 import {
   stPeerPricePendingBindParams,
@@ -87,9 +100,12 @@ const FRESH_THROUGH = lastTradingDay(NOW);
 const hoursAgoIso = (n: number): string => new Date(NOW.getTime() - n * 3_600_000).toISOString();
 
 beforeEach(async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(NOW);
   h.eodCalls.length = 0;
   h.responses.clear();
   h.errors.clear();
+  h.staleResponses.clear();
   const opened = await openMigratedD1();
   db = opened.db;
   close = opened.close;
@@ -100,7 +116,10 @@ beforeEach(async () => {
     CONFIG_KV: { get: async () => null, put: async () => {} },
   } as unknown as Env;
 });
-afterEach(() => close());
+afterEach(() => {
+  vi.useRealTimers();
+  close();
+});
 
 function seedTrade(id: string, ticker: string, txDate = '2026-01-05'): void {
   db.prepare(
@@ -291,6 +310,19 @@ describe('rule (b): stuck-while-pending sweep', () => {
     expect(pendingCount()).toBe(1);
   });
 
+  it('does not mark a pending ticker whose price_checked_at is still NULL', async () => {
+    seedFreshCorpus();
+    seedTrade('t-s-null', 'NEVERCHK');
+    seedSr('NEVERCHK', { priceUnavailable: 0, priceCheckedAt: null });
+
+    const res = await markStuckPeerPriceTickersNotCovered(env, NOW);
+
+    expect(res).toEqual({ marked: 0, qualified: 0 });
+    expect(srRow('NEVERCHK')?.price_unavailable).toBe(0);
+    expect(srRow('NEVERCHK')?.price_checked_at).toBeNull();
+    expect(pendingCount()).toBe(1);
+  });
+
   it('marks nothing when the corpus is stale (ST outage, not a coverage gap)', async () => {
     seedTrade('t-corp', 'CORP');
     seedSr('CORP', { latestPriceDate: '2020-01-01' });
@@ -304,13 +336,17 @@ describe('rule (b): stuck-while-pending sweep', () => {
     expect(srRow('STUCK')?.price_unavailable).toBe(0);
   });
 
-  it('marks none when more than ST_NOT_COVERED_MAX_BATCH qualify', async () => {
+  it('marks none when more than ST_NOT_COVERED_MAX_BATCH qualify and none look terminal', async () => {
     expect(ST_NOT_COVERED_MAX_BATCH).toBe(50);
     seedFreshCorpus();
     for (let i = 0; i < 51; i++) {
       const ticker = `STUCK${i}`;
       seedTrade(`t-many-${i}`, ticker);
-      seedSr(ticker, { priceUnavailable: 0, priceCheckedAt: hoursAgoIso(73) });
+      seedSr(ticker, {
+        priceUnavailable: 0,
+        priceCheckedAt: hoursAgoIso(73),
+        latestPriceDate: FRESH_THROUGH,
+      });
     }
 
     const res = await markStuckPeerPriceTickersNotCovered(env, NOW);
@@ -321,6 +357,29 @@ describe('rule (b): stuck-while-pending sweep', () => {
       .prepare('SELECT COUNT(*) AS n FROM securities_ref WHERE price_unavailable = 4')
       .get() as { n: number };
     expect(marked.n).toBe(0);
+  });
+
+  it('marks the oldest 50 terminal tickers when more than the cap qualify', async () => {
+    seedFreshCorpus();
+    for (let i = 0; i < 55; i++) {
+      const ticker = `PREF^${i}`;
+      seedTrade(`t-term-${i}`, ticker);
+      seedSr(ticker, {
+        priceUnavailable: 0,
+        priceCheckedAt: hoursAgoIso(73 + i),
+        latestPriceDate: '2020-01-01',
+      });
+    }
+
+    const res = await markStuckPeerPriceTickersNotCovered(env, NOW);
+
+    expect(res).toEqual({ marked: 50, qualified: 55 });
+    const marked = db
+      .prepare('SELECT COUNT(*) AS n FROM securities_ref WHERE price_unavailable = 4')
+      .get() as { n: number };
+    expect(marked.n).toBe(50);
+    expect(isTerminalPeerPriceTicker('ABQCX', '2020-01-01', NOW)).toBe(true);
+    expect(isTerminalPeerPriceTicker('AAPL', FRESH_THROUGH, NOW)).toBe(false);
   });
 
   it('marks all 50 when exactly the batch cap qualifies', async () => {
@@ -526,6 +585,88 @@ describe('health metrics carry the not-covered count', () => {
     expect(after.notCovered).toBe(15);
     expect(after.detail).toContain('; 15 not covered by ST');
     expect(stPeerPricesMetricsToCheck(after).status).toBe('ok');
+  });
+});
+
+describe('ST stale HTTP answers (CT-2443 drain)', () => {
+  function seedFreshCorpus(): void {
+    seedTrade('t-corp', 'CORP');
+    seedSr('CORP', { latestPriceDate: FRESH_THROUGH });
+    seedPrice('CORP', FRESH_THROUGH);
+  }
+
+  it('advances stalled-listing stages when stale payload newest bar is weeks old', async () => {
+    seedFreshCorpus();
+    seedTrade('t-del', 'DELIST');
+    seedSr('DELIST', { priceUnavailable: 3, priceCheckedAt: '2000-01-01T00:00:00Z' });
+    h.staleResponses.set('DELIST', [{ date: '2026-06-01', close: 3 }]);
+
+    await runPriceRefresh(env, { max: 10 });
+
+    const row = srRow('DELIST');
+    expect(row?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
+    expect(String(row?.price_unavailable_reason)).toContain('stale listing after repeat re-check');
+  });
+
+  it('records short-lag stale hits then escalates on the third stale answer', async () => {
+    expect(ST_PEER_STALE_HIT_TERMINATE).toBe(3);
+    seedFreshCorpus();
+    seedTrade('t-sl', 'SHORT');
+    seedSr('SHORT', { priceCheckedAt: '2000-01-01T00:00:00Z' });
+    h.staleResponses.set('SHORT', [{ date: FRESH_THROUGH, close: 9 }]);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(parsePeerStaleHitCount(String(srRow('SHORT')?.price_unavailable_reason))).toBe(1);
+    expect(srRow('SHORT')?.price_unavailable).toBe(0);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(parsePeerStaleHitCount(String(srRow('SHORT')?.price_unavailable_reason))).toBe(2);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(srRow('SHORT')?.price_unavailable).toBe(1);
+    expect(String(srRow('SHORT')?.price_unavailable_reason)).toBe('socratic_no_eod_history');
+  });
+
+  it('counts stale hits for a pending ticker with no pre-existing securities_ref row', async () => {
+    seedFreshCorpus();
+    seedTrade('t-nosr', 'NOSR');
+    h.staleResponses.set('NOSR', [{ date: FRESH_THROUGH, close: 9 }]);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(srRow('NOSR')).toBeDefined();
+    expect(parsePeerStaleHitCount(String(srRow('NOSR')?.price_unavailable_reason))).toBe(1);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(parsePeerStaleHitCount(String(srRow('NOSR')?.price_unavailable_reason))).toBe(2);
+
+    await runPriceRefresh(env, { max: 10 });
+    expect(srRow('NOSR')?.price_unavailable).toBe(1);
+    expect(String(srRow('NOSR')?.price_unavailable_reason)).toBe('socratic_no_eod_history');
+  });
+
+  it('treats stale as transient when the corpus is behind (ST outage)', async () => {
+    seedTrade('t-sl2', 'LAG');
+    seedSr('LAG', { priceCheckedAt: '2000-01-01T00:00:00Z', latestPriceDate: '2026-07-01' });
+    h.staleResponses.set('LAG', []);
+
+    await runPriceRefresh(env, { max: 10 });
+
+    expect(srRow('LAG')?.price_checked_at).toBe('2000-01-01T00:00:00Z');
+    expect(String(srRow('LAG')?.price_unavailable_reason)).toContain(ST_FETCH_ERROR_REASON_PREFIX);
+    expect(String(srRow('LAG')?.price_unavailable_reason)).not.toContain(ST_PEER_STALE_HIT_PREFIX);
+  });
+
+  it('excludes negative-cached tickers from pending counts until TTL expires', async () => {
+    seedFreshCorpus();
+    seedTrade('t-back', 'BACKOFF');
+    seedSr('BACKOFF', {
+      priceUnavailable: 1,
+      priceCheckedAt: NOW.toISOString(),
+      latestPriceDate: '2026-07-01',
+    });
+
+    const metrics = await collectStPeerPricesMetrics(env, NOW, 6);
+    expect(metrics.pending).toBe(0);
   });
 });
 
