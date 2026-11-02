@@ -220,12 +220,16 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertFalse(line.contains("in this window"))
     }
 
-    func testMemberPhotoURLPrefersAPIThenSeedAndIgnoresRelativePaths() {
+    func testMemberPhotoURLPrefersAPIThenSeedAndResolvesRelativePaths() {
         let api = "https://congress.trade/api/photos/member?key=K000389"
         let seed = "https://example.test/seed.jpg"
         XCTAssertEqual(MemberPhotoURL.resolve(api, seed)?.absoluteString, api)
         XCTAssertEqual(MemberPhotoURL.resolve(nil, seed)?.absoluteString, seed)
-        XCTAssertNil(MemberPhotoURL.resolve("/api/photos/member?key=K000389", ""))
+        // CT-2459: relative paths resolve against the site origin instead of
+        // being dropped (Directory rows silently fell back to initials).
+        XCTAssertEqual(
+            MemberPhotoURL.resolve("/api/photos/member?key=K000389", "")?.absoluteString, api
+        )
         XCTAssertNil(MemberPhotoURL.resolve(nil, nil))
     }
 
