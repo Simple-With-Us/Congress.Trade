@@ -1254,9 +1254,12 @@ final class CongressTradeStore: ObservableObject {
            Date().timeIntervalSince(lastLoadedAt) < Self.membersCacheTTL, !members.isEmpty {
             return
         }
-        if let membersLoadTask {
-            await membersLoadTask.value
-            return
+        if let inFlight = membersLoadTask {
+            await inFlight.value
+            // A plain caller coalesces onto the in-flight load; a forced
+            // pull-to-refresh must revalidate, not settle for that load.
+            if !force { return }
+            membersLoadTask = nil
         }
         let task = Task { @MainActor in
             isLoadingMembers = true

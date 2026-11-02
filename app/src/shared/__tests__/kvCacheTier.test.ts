@@ -48,6 +48,18 @@ describe('cached() memory tier + singleflight (CT-2459)', () => {
     expect(second.n).toBe(1);
   });
 
+  it('recomputes instead of throwing on a corrupt KV entry', async () => {
+    const { env, store } = fakeEnv(new Map([['k5', '{not json']]));
+    const fn = vi.fn(async () => ({ fresh: true }));
+    await expect(cached(env, 'k5', 300, fn)).resolves.toEqual({ fresh: true });
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(store.get('k5')).toBe('{"fresh":true}');
+    // The corrupt value must not linger in the memory tier either.
+    const again = await cached(env, 'k5', 300, fn);
+    expect(again).toEqual({ fresh: true });
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
   it('falls back to KV after the memory tier is reset', async () => {
     const store = new Map<string, string>();
     const { env } = fakeEnv(store);

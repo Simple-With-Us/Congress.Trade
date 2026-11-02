@@ -1675,6 +1675,23 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(components.queryItems?.first(where: { $0.name == "window" })?.value, "90d")
     }
 
+    /// CT-2459 review fix: the feed memo signature must notice in-place
+    /// row edits (poll upserts mutate cached rows), not just id churn.
+    func testFeedContentDigestChangesOnInPlaceRowEdit() {
+        let trade = Self.makeTrade(id: "tx_digest", cursor: 1)
+        let before = FeedDashboardView.feedContentDigest([trade])
+        trade.transaction.amountMax = 999_000
+        XCTAssertNotEqual(before, FeedDashboardView.feedContentDigest([trade]))
+        trade.member.chamber = "senate"
+        XCTAssertNotEqual(before, FeedDashboardView.feedContentDigest([trade]))
+    }
+
+    func testCachedImageLoaderSessionCarriesSafariUA() {
+        let headers = CachedImageLoader.session.configuration.httpAdditionalHeaders
+        let ua = headers?["User-Agent"] as? String
+        XCTAssertTrue(ua?.contains("Safari") == true)
+    }
+
     /// Multi-select Trade Type pill: `type=` is CSV-capable (`asTxTypes`).
     @MainActor
     func testSetTradeTypeSelectionSendsTypeCSVWhenMultipleSidesSelected() async throws {

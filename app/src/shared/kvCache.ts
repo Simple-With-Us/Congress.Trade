@@ -104,8 +104,19 @@ export async function cached<T>(
     try {
       const hit = await env.CONFIG_KV.get(key);
       if (hit) {
-        memorySet(tier, key, hit, ttlSec);
-        return hit;
+        // Validate before trusting or tiering: a corrupt entry must fall
+        // through to recompute, not throw at the caller or poison the
+        // memory tier until TTL expiry.
+        let valid = true;
+        try {
+          JSON.parse(hit);
+        } catch {
+          valid = false;
+        }
+        if (valid) {
+          memorySet(tier, key, hit, ttlSec);
+          return hit;
+        }
       }
     } catch {
       /* fall through to compute */

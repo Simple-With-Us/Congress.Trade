@@ -85,7 +85,33 @@ struct FeedDashboardView: View {
         sig += "|" + types.joined(separator: ",")
         sig += "|" + store.selectedTimeRange.rawValue
         sig += "|" + String(store.feed?.cursor ?? -1)
+        // Content version: `@Query` rows are mutated in place by poll
+        // upserts, so count/first/last ids alone miss edited amounts,
+        // dates, chambers — the memo would serve the stale arrangement.
+        sig += "|v" + String(Self.feedContentDigest(cachedTrades))
         return sig
+    }
+
+    /// Digest over every field `computeFilteredTrades` and the sorts read.
+    /// `Hasher` is process-randomized, which is fine here: the digest is
+    /// only ever compared within one run.
+    static func feedContentDigest(_ trades: [ClientTrade]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(trades.count)
+        for trade in trades {
+            hasher.combine(trade.id)
+            hasher.combine(trade.transaction.date)
+            hasher.combine(trade.transaction.type)
+            hasher.combine(trade.transaction.amountMin)
+            hasher.combine(trade.transaction.amountMax)
+            hasher.combine(trade.asset.ticker)
+            hasher.combine(trade.asset.name)
+            hasher.combine(trade.member.name)
+            hasher.combine(trade.member.party)
+            hasher.combine(trade.member.chamber)
+            hasher.combine(trade.member.state)
+        }
+        return hasher.finalize()
     }
 
     private func computeFilteredTrades() -> [ClientTrade] {

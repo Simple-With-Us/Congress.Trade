@@ -959,9 +959,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         'content-type': 'text/csv; charset=utf-8',
         'content-disposition': `attachment; filename="congress-trades-${day}.csv"`,
         'X-Export-Row-Count': String(totalRows),
-        'X-Export-Complete': 'true',
         'Access-Control-Expose-Headers':
-          'X-Export-Row-Count, X-Export-Complete, Content-Disposition',
+          'X-Export-Row-Count, Content-Disposition',
       },
     });
   });

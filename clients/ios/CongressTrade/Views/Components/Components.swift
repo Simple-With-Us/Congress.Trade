@@ -352,9 +352,20 @@ enum CachedImageLoader {
         cache.object(forKey: url as NSURL)
     }
 
+    /// Image hosts sit behind the same Cloudflare managed challenge as the
+    /// API; a default `URLSession.shared` UA can be 502'd. Carry the Safari
+    /// iOS UA the API client uses.
+    static let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        ]
+        return URLSession(configuration: configuration)
+    }()
+
     static func load(url: URL, maxPixelSize: CGFloat) async -> UIImage? {
         if let hit = cachedImage(for: url) { return hit }
-        guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
+        guard let (data, _) = try? await session.data(from: url) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
