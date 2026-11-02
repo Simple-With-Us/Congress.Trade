@@ -1272,6 +1272,22 @@ class UsageTelemetryDeliveryTimeoutError extends Error {
   }
 }
 
+/**
+ * The drain budget cut this delivery short before the receiver's own
+ * configured timeout elapsed. This is still a transient timeout for
+ * retention (retained, not quarantined — same as
+ * UsageTelemetryDeliveryTimeoutError), but it must not be recorded as a
+ * receiver failure: the receiver never got its full timeout window, so
+ * counting it toward the circuit breaker would let our own lane budget
+ * trip the breaker and suppress healthy deliveries.
+ */
+class UsageTelemetryDeliveryBudgetTimeoutError extends UsageTelemetryDeliveryTimeoutError {
+  constructor() {
+    super();
+    this.name = 'UsageTelemetryDeliveryBudgetTimeoutError';
+  }
+}
+
 /** Explicit unmetered receiver primitive; telemetry must never meter itself. */
 async function fetchUsageTelemetryReceiver(
   input: RequestInfo | URL,
@@ -1293,8 +1309,15 @@ export async function deliverUsageTelemetryEvent(
   env: Env,
   event: DeliverableUsageTelemetryEvent,
   signal?: AbortSignal,
+  timeoutMsOrOptions?: number | { timeoutMs?: number },
 ): Promise<void> {
+  const callerTimeoutMs = typeof timeoutMsOrOptions === 'number'
+    ? timeoutMsOrOptions
+    : timeoutMsOrOptions?.timeoutMs;
   signal?.throwIfAborted();
+  if (callerTimeoutMs != null && callerTimeoutMs <= 0) {
+    throw new UsageTelemetryDeliveryBudgetTimeoutError();
+  }
   let circuitState = await readUsageTelemetryCircuitState(env);
   if (!circuitState) throw new UsageTelemetryCircuitOpenError();
   if (circuitState.openUntil != null && Date.now() < circuitState.openUntil) {
@@ -1352,10 +1375,20 @@ export async function deliverUsageTelemetryEvent(
     await withoutThirdPartyTelemetry(env, async () => {
       const { baseUrl, token } = receiverConfig
         ?? await resolveUsageTelemetryReceiverConfig(env);
+      const configuredTimeoutMs = usageTelemetryDeliveryTimeoutMs(env);
+      // Bound the receiver call by the caller's remaining budget when one
+      // is supplied (the fallback drain passes its remaining lane budget),
+      // floored so a nearly-spent budget still gets one short attempt
+      // instead of an instant abort. Callers that pass no override keep
+      // the existing configured-timeout behaviour.
+      const effectiveTimeoutMs = callerTimeoutMs == null
+        ? configuredTimeoutMs
+        : Math.max(250, Math.min(configuredTimeoutMs, Math.floor(callerTimeoutMs)));
+      const budgetLimited = callerTimeoutMs != null && effectiveTimeoutMs < configuredTimeoutMs;
       const controller = new AbortController();
       const timer = setTimeout(
         () => controller.abort(),
-        usageTelemetryDeliveryTimeoutMs(env),
+        effectiveTimeoutMs,
       );
       let receiverStatus: number | null = null;
       let eventRejected = false;
@@ -1401,7 +1434,11 @@ export async function deliverUsageTelemetryEvent(
         if (signal?.aborted) {
           throw signal.reason ?? new Error('durable queue lease lost');
         }
-        if (controller.signal.aborted) throw new UsageTelemetryDeliveryTimeoutError();
+        if (controller.signal.aborted) {
+          throw budgetLimited
+            ? new UsageTelemetryDeliveryBudgetTimeoutError()
+            : new UsageTelemetryDeliveryTimeoutError();
+        }
         if (receiverStatus != null && receiverStatus >= 200 && receiverStatus < 300) {
           // Do not expose response bytes, or let a response-schema error
           // match the terminal-event classifier's schema/idempotency words.
@@ -1434,6 +1471,15 @@ export async function deliverUsageTelemetryEvent(
   } catch (error) {
     if (signal?.aborted) {
       throw signal.reason ?? new Error('durable queue lease lost');
+    }
+    if (error instanceof UsageTelemetryDeliveryBudgetTimeoutError) {
+      // Our own drain/lane budget cut the call short, not the receiver:
+      // the receiver never saw its full configured timeout, so this must
+      // not count toward the circuit breaker. Rethrow as a transient
+      // timeout so the drain retains the event for the next tick. The
+      // half-open probe lease (if any) is left to expire — no receiver
+      // health signal was observed either way.
+      throw error;
     }
     if (error instanceof UsageTelemetryDeliveryEventRejectedError || isTerminalUsageTelemetryDeliveryError(error)) {
       // A fully validated per-event rejection proves the receiver is healthy.
@@ -1557,13 +1603,14 @@ async function drainUsageTelemetryFallbackPage(
   // whole tick (CONGRESS-TRADE-1S).
   const drainStartedMs = Date.now();
   const drainBudgetMs = 6_500;
+  const remainingDrainBudgetMs = () => drainBudgetMs - (Date.now() - drainStartedMs);
   // Publish the next page token only after every object on this page is
   // visited.  listed.cursor points past this page; saving it on a budget
   // break skips the objects not yet processed until wrap-around.
   let r2PageFinished = true;
   for (const object of listed.objects) {
     abortIfSignal(options.signal);
-    if (Date.now() - drainStartedMs > drainBudgetMs) {
+    if (remainingDrainBudgetMs() <= 0) {
       r2PageFinished = false;
       break;
     }
@@ -1582,7 +1629,8 @@ async function drainUsageTelemetryFallbackPage(
       let event: DeliverableUsageTelemetryEvent | null = null;
       try {
         event = parseUsageTelemetryFallback(raw);
-        await deliverUsageTelemetryEvent(env, event);
+        // Re-read the budget: the R2 get/body read above also spends it.
+        await deliverUsageTelemetryEvent(env, event, options.signal, remainingDrainBudgetMs());
         await storage?.delete(object.key);
         r2Removed += 1;
         delivered += 1;
@@ -1626,9 +1674,13 @@ async function drainUsageTelemetryFallbackPage(
       await adjustUsageTelemetryOutboxCount(env, -r2Removed);
     }
   }
+  abortIfSignal(options.signal);
   const remainingLimit = Math.max(0, limit - listed.objects.length);
   const d1DrainComplete = await isUsageTelemetryD1DrainComplete(env);
-  if (remainingLimit > 0 && db?.prepare && !d1DrainComplete) {
+  // Share the R2 drain budget: do not start the legacy phase (not even its
+  // page read) once the budget is spent. The D1 cursor is left untouched so
+  // the next tick resumes exactly where this one stopped.
+  if (remainingLimit > 0 && db?.prepare && !d1DrainComplete && remainingDrainBudgetMs() > 0) {
     try {
       type LegacyRow = { idempotency_key: string; event_json: string; attempts: number; updated_at: string };
       const readPage = async (after?: UsageTelemetryDrainCursor['d1']) => {
@@ -1650,10 +1702,20 @@ async function drainUsageTelemetryFallbackPage(
         rows = await readPage();
       }
       const results = rows.results ?? [];
-      const lastRow = results.at(-1);
-      if (lastRow) cursor.d1 = { updatedAt: lastRow.updated_at, idempotencyKey: lastRow.idempotency_key };
-      else delete cursor.d1;
+      // Advance the D1 cursor incrementally below, only past rows actually
+      // visited. Pre-setting it to the page tail (the old behaviour) would
+      // skip unvisited rows when the shared drain budget breaks the loop
+      // early; the finally in flushUsageTelemetryFallback persists whatever
+      // partial progress was made.
+      if (results.length === 0) delete cursor.d1;
       for (const row of results) {
+        abortIfSignal(options.signal);
+        const remainingMs = remainingDrainBudgetMs();
+        if (remainingMs <= 0) break;
+        // This row is now visited: advance the cursor past it (and only it)
+        // before attempting delivery, so a later budget break never skips
+        // rows that were not reached.
+        cursor.d1 = { updatedAt: row.updated_at, idempotencyKey: row.idempotency_key };
         let event: DeliverableUsageTelemetryEvent | null = null;
         try {
           event = parseUsageTelemetryFallback(row.event_json);
@@ -1665,7 +1727,7 @@ async function drainUsageTelemetryFallbackPage(
           continue;
         }
         try {
-          await deliverUsageTelemetryEvent(env, event);
+          await deliverUsageTelemetryEvent(env, event, options.signal, remainingMs);
           await db.prepare(
             'DELETE FROM usage_telemetry_fallback_events WHERE idempotency_key = ?',
           )
@@ -1699,7 +1761,10 @@ async function drainUsageTelemetryFallbackPage(
       }
       if (results.length === 0) await markUsageTelemetryD1DrainComplete(env);
       return { listed: listed.objects.length + results.length, delivered, failed, expired, skipped: false };
-    } catch {
+    } catch (error) {
+      // A lane abort is not a D1 read failure: let it propagate so the
+      // caller observes the cancellation (the cursor finally still runs).
+      if (options.signal?.aborted) throw error;
       return { listed: listed.objects.length, delivered, failed: failed + 1, expired, skipped: false };
     }
   }
