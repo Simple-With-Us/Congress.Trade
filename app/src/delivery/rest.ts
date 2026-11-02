@@ -822,12 +822,16 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     if (!isIncrementalNoOp) {
       // Total = ALL rows matching the same ticker/member/type/chamber filters,
       // ignoring the cursor backstop (so the UI can show "showing X of N").
+      // CT-2459: the two aggregate reads are independent — issue them
+      // together instead of serially awaiting each handler-side.
       const countQuery = buildTransactionsCountQuery(params);
-      const countRow = await first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params);
-      total = countRow?.total ?? transactions.length;
       const today = new Date().toISOString().slice(0, 10);
       const todayQuery = buildTransactionsTodayFilingsQuery(params, today);
-      const todayRow = await first<{ total: number }>(c.env.DB, todayQuery.sql, todayQuery.params);
+      const [countRow, todayRow] = await Promise.all([
+        first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params),
+        first<{ total: number }>(c.env.DB, todayQuery.sql, todayQuery.params),
+      ]);
+      total = countRow?.total ?? transactions.length;
       filingsImportedToday = todayRow?.total ?? 0;
     }
     // Count served rows against the caller's daily budget. Incremental polls
@@ -1377,11 +1381,14 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const from = c.req.query('from');
     const to = c.req.query('to');
     const limit = marketLimit(c.req.query('limit'));
-    const refRow = await get<SecurityRefRow>(c.env.DB, 'SELECT * FROM securities_ref WHERE ticker = ?', [ticker]);
     const pq = priceRangeQuery('price_eod', ticker, from, to, limit);
-    const closes = await all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params);
     const sq = priceRangeQuery('spx_eod', null, from, to, limit);
-    const spx = await all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params);
+    // CT-2459: three independent reads, issued together (was sequential).
+    const [refRow, closes, spx] = await Promise.all([
+      get<SecurityRefRow>(c.env.DB, 'SELECT * FROM securities_ref WHERE ticker = ?', [ticker]),
+      all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params),
+      all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params),
+    ]);
     const staleness = currentPriceStalenessFields(refRow?.current_price_date ?? null);
     return c.json({
       ticker,
