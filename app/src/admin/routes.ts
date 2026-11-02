@@ -1879,7 +1879,13 @@ interface BenchmarkDocumentSnapshot {
  * resolved review's latest decision receipt is an admin confirm/manual action.
  * Pipeline/autopublish/agreement receipts therefore cannot score themselves.
  */
+/** Machine amount-bounds backfill audit — not a human review receipt. */
+const BENCHMARK_IGNORED_INGESTION_DECISION_REASONS = ['amount_bounds_canonicalize'] as const;
+
 function benchmarkHumanResolvedSql(docIdSql: string): string {
+  const ignoredReasons = BENCHMARK_IGNORED_INGESTION_DECISION_REASONS
+    .map((reason) => `'${reason}'`)
+    .join(', ');
   return `COALESCE(rq.resolved, 0) = 1
     AND COALESCE((
       SELECT CASE
@@ -1888,12 +1894,13 @@ function benchmarkHumanResolvedSql(docIdSql: string): string {
       END
         FROM ingestion_decisions d
        WHERE d.doc_id = ${docIdSql}
+         AND COALESCE(d.reason, '') NOT IN (${ignoredReasons})
        ORDER BY d.created_at DESC, d.id DESC
        LIMIT 1
     ), 0) = 1`;
 }
 
-async function benchmarkDocumentIsHumanResolved(env: Env, docId: string): Promise<boolean> {
+export async function benchmarkDocumentIsHumanResolved(env: Env, docId: string): Promise<boolean> {
   const row = await get<{ resolved: number }>(
     env.DB,
     `SELECT CASE WHEN ${benchmarkHumanResolvedSql('f.doc_id')} THEN 1 ELSE 0 END AS resolved
@@ -11070,6 +11077,30 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       const dryRun = c.req.query('dryRun') !== '0';
       const docLimit = Number(c.req.query('limit')) || undefined;
       return c.json({ ok: true, ...(await cleanOgeRowIndexes(c.env, { dryRun, docLimit })) });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  // --- POST /amount-bounds-canonicalize ------------------------------------
+  // Snap live (non-deprecated) non-competitor rows whose stored amount bounds
+  // sit one dollar below a STOCK Act bracket (e.g. 1000–15000 → 1001–15000).
+  // DRY RUN BY DEFAULT: pass ?dryRun=0 to write.  ?limit caps rows (default 500,
+  // max 1000).  In-place fix only — no delivery republish.
+  r.post('/amount-bounds-canonicalize', async (c) => {
+    try {
+      const { canonicalizePublishedAmountBounds } = await import('./amountBoundsCanonicalize.ts');
+      const dryRun = c.req.query('dryRun') !== '0';
+      const rawLimit = Number(c.req.query('limit'));
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+      return c.json({
+        ok: true,
+        ...(await canonicalizePublishedAmountBounds(c.env, {
+          dryRun,
+          limit,
+          actor: adminActor(c),
+        })),
+      });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }
