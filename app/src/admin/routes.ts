@@ -1003,7 +1003,8 @@ function encodeIngestFailureCursor(cur: IngestFailureCursor): string {
 }
 
 const ingestFailureCursorSchema = z.object({
-  seenAt: z.string().min(1),
+  // '' is a legitimate keyset value: the page query orders on COALESCE(first_seen_at, '').
+  seenAt: z.string(),
   docId: z.string().min(1),
 });
 
