@@ -1629,8 +1629,12 @@ async function drainUsageTelemetryFallbackPage(
       let event: DeliverableUsageTelemetryEvent | null = null;
       try {
         event = parseUsageTelemetryFallback(raw);
-        // Re-read the budget: the R2 get/body read above also spends it.
-        await deliverUsageTelemetryEvent(env, event, options.signal, remainingDrainBudgetMs());
+        // Re-read the budget (the R2 get/body read above also spends it), but
+        // an object whose read started inside the budget still gets one short
+        // attempt instead of being dropped as a budget timeout.
+        await deliverUsageTelemetryEvent(
+          env, event, options.signal, Math.max(250, remainingDrainBudgetMs()),
+        );
         await storage?.delete(object.key);
         r2Removed += 1;
         delivered += 1;
