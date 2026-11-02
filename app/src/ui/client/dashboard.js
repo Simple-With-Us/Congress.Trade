@@ -2996,7 +2996,15 @@ function renderReview() {
   if (canUseAdmin()) setTabBadge('reviewTabBadge', unresolvedTotal);
   if (el('kpiReview') && REVIEW_RESOLVED === 0) el('kpiReview').textContent = fmtCount(unresolvedTotal);
   if (REVIEW.length === 0) {
-    body.innerHTML = stateRow(6, REVIEW_RESOLVED ? 'No reviewed documents yet.' : 'Nothing awaiting review — queue is clear.');
+    var ingestFailN = REVIEW_TOTALS && typeof REVIEW_TOTALS.ingestFailures === 'number'
+      ? REVIEW_TOTALS.ingestFailures
+      : 0;
+    var emptyMsg = REVIEW_RESOLVED
+      ? 'No reviewed documents yet.'
+      : ingestFailN > 0
+        ? 'Nothing in the review queue. Ingest failures (' + fmtCount(ingestFailN) + ') — use GET /api/admin/review-queue/ingest-failures.'
+        : 'Nothing awaiting review — queue is clear.';
+    body.innerHTML = stateRow(6, emptyMsg);
     return;
   }
   body.innerHTML = REVIEW.map(function (r) {
