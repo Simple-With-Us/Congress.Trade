@@ -16,7 +16,7 @@ Optional coordination variables:
 - `SLACK_CHANNEL_ID=C0BEZDJDNKV`
 - `SLACK_PROJECT=Congress.Trade`
 - `SLACK_AGENT_NAME=Codex`
-- `AG***_S**C_TOKEN`
+- `<fleet shared sync token — see app/docs/config-registry.md>`
 
 Secret-category variables are available only during setup and are removed before the agent phase. Setup scripts therefore validate presence but do not persist secrets into dotfiles.
 
