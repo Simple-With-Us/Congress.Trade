@@ -518,7 +518,7 @@ read_state
 now="$(date +%s)"
 hop="$last_hop"
 
-# The restart request's curl config contains the Coolify bearer token.  Track
+# The restart request's curl config contains the Coolify bearer token.  Track
 # only its path; cleanup never opens or logs the file.
 auth_cfg=""
 cleanup_auth_cfg() {
