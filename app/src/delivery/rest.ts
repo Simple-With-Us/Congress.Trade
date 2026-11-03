@@ -554,8 +554,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const storage = await readLocalLitestreamAge();
     const r2Weekly = await readR2WeeklyArchiveStatus();
     // Public-safe Infisical view: source names, counts, errors.  Never values.
-    // Shared-project keys (AGENT_SYNC_*) live only in shared-at-ct; app
-    // projects must not duplicate them (app merge would shadow shared).
+    // Shared-project keys live only in shared-at-ct; app projects must not
+    // duplicate them (app merge would shadow shared).
     const secrets = getSecretResolverStatus(c.env);
     return c.json(
       {
