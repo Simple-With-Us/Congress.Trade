@@ -65,6 +65,7 @@ import { tickerAnalytics, wantsAnalytics } from './tickerAnalytics.ts';
 import { checkRowBudget, spendRowBudget, MAX_PUBLIC_TX_OFFSET } from '../security/botDefense.ts';
 import { clientIp } from '../shared/rateLimit.ts';
 import { get, all } from '../shared/db.ts';
+import { cached, cacheKey } from '../shared/kvCache.ts';
 import { resolveFilerCommittees } from '../shared/committeeNames.ts';
 import { buildMemberPerformanceQuery } from '../analytics/builders.ts';
 import { asWindow } from '../analytics/sql.ts';
@@ -77,6 +78,30 @@ import { mergePeeledQuery, peelEncodedQueryFromPathParam } from '../shared/membe
 
 export function buildClientRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
+
+  // CT-2459: public, user-independent GETs (feed/trade/ticker/member — none
+  // of them read the session, verified in this file) previously sent ZERO
+  // Cache-Control, so neither the edge nor the iOS URLCache could ever
+  // serve a repeat view. Account-scoped routes (/bootstrap, /me,
+  // /preferences, /subscriptions, /commands, the Premium document PDF) are
+  // deliberately excluded. Policies mirror delivery/rest.ts
+  // (PUBLIC_FEED_CACHE / PUBLIC_STABLE_CACHE).
+  r.use('*', async (c, next) => {
+    await next();
+    if (c.req.method !== 'GET' || c.res.status !== 200) return;
+    if (c.res.headers.has('Cache-Control')) return;
+    const path = new URL(c.req.url).pathname;
+    const rel = path.slice('/api/client/v1'.length);
+    if (rel === '/feed') {
+      c.res.headers.set('Cache-Control', 'public, s-maxage=15, stale-while-revalidate=45');
+    } else if (
+      rel.startsWith('/trade/') ||
+      rel.startsWith('/ticker/') ||
+      rel.startsWith('/member/')
+    ) {
+      c.res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
+    }
+  });
 
   r.get('/bootstrap', async (c) => {
     const user = await getCurrentUserFromRequest(c);
@@ -280,22 +305,34 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
       order: asOrder(q.order) ?? 'desc',
     };
     const summaryQ = memberSummarySql(resolved.id, filters);
-    const perfQ = buildMemberPerformanceQuery(resolved.id, {
+    const perfFilters = {
       window: asWindow(q.window, 'all'),
       chambers: filters.chambers,
       parties: filters.partyBuckets,
       txTypes: filters.types ?? (filters.type ? [filters.type] : undefined),
-    });
-    const [list, summaryRow, perfRowsRaw, currentSpx] = await Promise.all([
+    };
+    const perfQ = buildMemberPerformanceQuery(resolved.id, perfFilters);
+    const [list, summaryRow] = await Promise.all([
       readClientTradeList(c.env, params),
       get<TradeSummaryRow>(c.env.DB, summaryQ.sql, summaryQ.params),
-      all<Record<string, unknown>>(c.env.DB, perfQ.sql, perfQ.params),
-      latestSpxClose(c.env),
     ]);
     if (!resolved.profile && list.total === 0) return c.json({ error: 'member not found' }, 404);
     await spendRowBudget(c.env, ip, list.count);
 
-    const perfRows = perfRowsRaw.map((row) => ({
+    // CT-2459: the performance block (per-trade anchors over the member's
+    // whole windowed history) was recomputed on every /member hit while the
+    // analytics twin (/member/:id/performance) already caches 600s. Same
+    // key inputs, same TTL.
+    const performance = await cached(
+      c.env,
+      cacheKey(`client-member-perf-v1:${resolved.id}`, perfFilters as never),
+      600,
+      async () => {
+        const [perfRowsRaw, currentSpx] = await Promise.all([
+          all<Record<string, unknown>>(c.env.DB, perfQ.sql, perfQ.params),
+          latestSpxClose(c.env),
+        ]);
+        const perfRows = perfRowsRaw.map((row) => ({
       isOption: num(row.is_option) === 1,
       txType: str(row.tx_type),
       priceAtTrade: row.price_at_trade == null ? null : num(row.price_at_trade),
@@ -308,24 +345,26 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
       currentPriceDate: str(row.current_price_date),
       spxNow: row.spx_now == null ? null : num(row.spx_now),
     }));
-    const dual = aggregateMemberDualPerformance(perfRows, currentSpx, {
-      priceFreshThrough: currentPriceFreshThrough(),
-    });
-    // Flat `performance` stays trade-date buy skill for older iOS decoders;
-    // nested legs expose both anchors for new clients.
-    const performance = {
-      ...dual.tradeDate,
-      side: dual.side,
-      buyCount: dual.buyCount,
-      tradeDate: dual.tradeDate,
-      filingDate: dual.filingDate,
-      // Newest price date behind any scored trade: every return above ends on it
-      // (the S&P leg is aligned per ticker to the same day) — clients print "Prices as of".
-      pricesAsOf: perfRows.reduce<string | null>(
-        (best, r) => (r.currentPriceDate && (!best || r.currentPriceDate > best) ? r.currentPriceDate : best),
-        null,
-      ),
-    };
+        const dual = aggregateMemberDualPerformance(perfRows, currentSpx, {
+          priceFreshThrough: currentPriceFreshThrough(),
+        });
+        // Flat `performance` stays trade-date buy skill for older iOS decoders;
+        // nested legs expose both anchors for new clients.
+        return {
+          ...dual.tradeDate,
+          side: dual.side,
+          buyCount: dual.buyCount,
+          tradeDate: dual.tradeDate,
+          filingDate: dual.filingDate,
+          // Newest price date behind any scored trade: every return above ends on it
+          // (the S&P leg is aligned per ticker to the same day) — clients print "Prices as of".
+          pricesAsOf: perfRows.reduce<string | null>(
+            (best, r) => (r.currentPriceDate && (!best || r.currentPriceDate > best) ? r.currentPriceDate : best),
+            null,
+          ),
+        };
+      },
+    );
 
     const member = memberProfile(resolved.profile, resolved.id);
     if (!member.committees.length) {

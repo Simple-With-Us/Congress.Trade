@@ -34,7 +34,9 @@
  */
 
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
-import * as cheerio from 'cheerio';
+// CT-2459: node-html-parser only (cheerio removed — it was a whole second
+// HTML parser stack for these three small extractions).
+import { parse } from 'node-html-parser';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { createProxiedFetch, getDenoHttpClient, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import {
@@ -366,8 +368,9 @@ export function looksLikeSenateAgreementWall(html: string): boolean {
  * Returns '' if not found.
  */
 export function parseCsrfMiddlewareToken(html: string): string {
-  const $ = cheerio.load(html);
-  const token = $('input[name="csrfmiddlewaretoken"]').val();
+  const token = parse(html)
+    .querySelector('input[name="csrfmiddlewaretoken"]')
+    ?.getAttribute('value');
   return typeof token === 'string' ? token : '';
 }
 
@@ -377,8 +380,7 @@ export function parseCsrfMiddlewareToken(html: string): string {
  * Returns { reportPath, reportId } or null if no parseable href.
  */
 export function parseReportLink(cellHtml: string): { reportPath: string; reportId: string } | null {
-  const $ = cheerio.load(cellHtml);
-  const href = $('a').attr('href');
+  const href = parse(cellHtml).querySelector('a')?.getAttribute('href');
   if (!href) return null;
   const reportPath = href;
   // id is the last non-empty path segment (handles trailing slash).
@@ -404,7 +406,7 @@ export function parseSenateRows(rows: string[][]): SenateFiling[] {
   for (const row of rows) {
     if (!Array.isArray(row)) continue;
     const cells = row.map((c) => (typeof c === 'string' ? c : ''));
-    const textCells = cells.map((c) => cheerio.load(c).text().trim());
+    const textCells = cells.map((c) => parse(c).text.trim());
     const linkCell = cells.find((c) => /\/search\/view\/(?:ptr|paper)\//i.test(c)) ?? '';
     const parsed = parseReportLink(linkCell);
     if (!parsed) continue;

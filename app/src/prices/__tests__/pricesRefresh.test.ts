@@ -76,26 +76,30 @@ const p = vi.hoisted(() => ({
   errors: new Map<string, string>(),
   responses: new Map<string, Array<{ date: string; close: number }>>(),
 }));
-vi.mock('../peer', () => ({
-  buildPeerPriceClient: () => ({
-    eodHistory: async (symbol: string, from?: string, to?: string) => {
-      order.log.push(`peer:eod:${symbol}`);
-      p.eodCalls.push({ symbol });
-      h.eodCalls.push({ symbol, from: from ?? '', to: to ?? '' });
-      const err = p.errors.get(symbol) ?? h.errors.get(symbol);
-      if (err) throw new Error(err);
-      return p.responses.get(symbol) ?? h.responses.get(symbol) ?? [];
-    },
-    spxHistory: async (from?: string, to?: string) => {
-      order.log.push('peer:spx');
-      p.eodCalls.push({ symbol: 'SPY' });
-      h.eodCalls.push({ symbol: 'SPY', from: from ?? '', to: to ?? '' });
-      const err = p.errors.get('SPY') ?? h.errors.get('SPY');
-      if (err) throw new Error(err);
-      return p.responses.get('SPY') ?? h.responses.get('SPY') ?? [];
-    },
-  }),
-}));
+vi.mock('../peer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../peer.ts')>();
+  return {
+    ...actual,
+    buildPeerPriceClient: () => ({
+      eodHistory: async (symbol: string, from?: string, to?: string) => {
+        order.log.push(`peer:eod:${symbol}`);
+        p.eodCalls.push({ symbol });
+        h.eodCalls.push({ symbol, from: from ?? '', to: to ?? '' });
+        const err = p.errors.get(symbol) ?? h.errors.get(symbol);
+        if (err) throw new Error(err);
+        return p.responses.get(symbol) ?? h.responses.get(symbol) ?? [];
+      },
+      spxHistory: async (from?: string, to?: string) => {
+        order.log.push('peer:spx');
+        p.eodCalls.push({ symbol: 'SPY' });
+        h.eodCalls.push({ symbol: 'SPY', from: from ?? '', to: to ?? '' });
+        const err = p.errors.get('SPY') ?? h.errors.get('SPY');
+        if (err) throw new Error(err);
+        return p.responses.get('SPY') ?? h.responses.get('SPY') ?? [];
+      },
+    }),
+  };
+});
 
 import type { Env } from '../../shared/types.ts';
 import { runPriceRefresh } from '../service.ts';

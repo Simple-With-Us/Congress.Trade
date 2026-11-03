@@ -117,46 +117,69 @@ export async function flushIngestionOutbox(
     [nowIso, ...docIds, staleEnqueuedBefore, ...docIds],
   );
   const result: IngestionOutboxFlushResult = { claimed: 0, enqueued: 0, failed: 0 };
-  for (const row of rows) {
+  // CT-2459: bulk claim + sendBatch + bulk completion (was 3 writes/row).
+  // Crash-after-send duplication semantics are unchanged: the queue's
+  // active-dedupe index absorbs a repeated filing.new.
+  const leaseUntil = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
+  const CHUNK = 80;
+  for (let i = 0; i < rows.length; i += CHUNK) {
     abortIfSignal(opts.signal);
-    const leaseUntil = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
-    const claim = await run(
+    const slice = rows.slice(i, i + CHUNK);
+    const ids = slice.map((r) => r.doc_id);
+    const placeholders = ids.map(() => '?').join(',');
+    const claimedRows = await all<{ doc_id: string; attempts: number }>(
       env.DB,
       `UPDATE ingestion_outbox
           SET status = 'sending', attempts = attempts + 1, available_at = ?,
               last_error = NULL, updated_at = ?
-        WHERE doc_id = ? AND (
+        WHERE doc_id IN (${placeholders}) AND (
           (status IN ('pending', 'sending') AND available_at <= ?)
           OR (status = 'enqueued' AND updated_at <= ?)
-        )`,
-      [leaseUntil, nowIso, row.doc_id, nowIso, staleEnqueuedBefore],
+        )
+        RETURNING doc_id, attempts`,
+      [leaseUntil, nowIso, ...ids, nowIso, staleEnqueuedBefore],
     );
-    if ((claim.meta?.changes ?? 0) === 0) continue;
-    result.claimed += 1;
+    if (claimedRows.length === 0) continue;
+    result.claimed += claimedRows.length;
+    const byId = new Map(slice.map((r) => [r.doc_id, r]));
+    const claimedIds = claimedRows.map((r) => r.doc_id);
+    const claimedPlaceholders = claimedIds.map(() => '?').join(',');
     try {
-      await env.INGEST_QUEUE.send({
-        type: 'filing.new', docId: row.doc_id, chamber: row.chamber, sourceUrl: row.source_url,
+      const messages = claimedIds.map((docId) => {
+        const row = byId.get(docId)!;
+        return {
+          body: {
+            type: 'filing.new', docId: row.doc_id, chamber: row.chamber, sourceUrl: row.source_url,
+          } as const,
+        };
       });
+      if (typeof env.INGEST_QUEUE.sendBatch === 'function') {
+        await env.INGEST_QUEUE.sendBatch(messages);
+      } else {
+        for (const m of messages) await env.INGEST_QUEUE.send(m.body);
+      }
       await run(
         env.DB,
         `UPDATE ingestion_outbox
             SET status = 'enqueued', available_at = ?, last_error = NULL, updated_at = ?
-          WHERE doc_id = ? AND status = 'sending'`,
-        [nowIso, nowIso, row.doc_id],
+          WHERE doc_id IN (${claimedPlaceholders}) AND status = 'sending'`,
+        [nowIso, nowIso, ...claimedIds],
       );
-      result.enqueued += 1;
+      result.enqueued += claimedRows.length;
     } catch (err) {
-      const availableAt = new Date(
-        now.getTime() + retryDelaySeconds(row.attempts + 1) * 1000,
-      ).toISOString();
-      await run(
-        env.DB,
-        `UPDATE ingestion_outbox
-            SET status = 'pending', available_at = ?, last_error = ?, updated_at = ?
-          WHERE doc_id = ? AND status = 'sending'`,
-        [availableAt, String((err as Error).message ?? err).slice(0, 1000), nowIso, row.doc_id],
-      );
-      result.failed += 1;
+      for (const claimed of claimedRows) {
+        const availableAt = new Date(
+          now.getTime() + retryDelaySeconds(claimed.attempts) * 1000,
+        ).toISOString();
+        await run(
+          env.DB,
+          `UPDATE ingestion_outbox
+              SET status = 'pending', available_at = ?, last_error = ?, updated_at = ?
+            WHERE doc_id = ? AND status = 'sending'`,
+          [availableAt, String((err as Error).message ?? err).slice(0, 1000), nowIso, claimed.doc_id],
+        );
+        result.failed += 1;
+      }
     }
   }
   return result;

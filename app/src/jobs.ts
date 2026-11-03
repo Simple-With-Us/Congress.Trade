@@ -11,7 +11,7 @@
  */
 
 import type { Env } from './shared/types.ts';
-import { run, all } from './shared/db.ts';
+import { run, all, batch as batchStatements } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
 import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
 import {
@@ -320,13 +320,21 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
   let rawKept = 0;
   try {
     for (let batch = 0; batch < RETENTION_MAX_BATCHES_PER_TABLE; batch++) {
+      // CT-2459: two disjoint indexed branches instead of
+      // COALESCE(filed_date, ...) < cutoff, whose function-wrapped column
+      // defeated idx_filings_filed_date and scanned the whole table per
+      // batch. Semantics are identical (COALESCE picks filed_date when
+      // present, else the first_seen date).
       const rows = await all<{ doc_id: string; raw_object_key: string | null }>(
         env.DB,
-        `SELECT doc_id, raw_object_key FROM filings
-          WHERE COALESCE(filed_date, substr(first_seen_at, 1, 10)) < ?
-            AND first_seen_at < ?
-          LIMIT ?`,
-        [cutoff, minAge, RETENTION_DELETE_BATCH]
+        `SELECT doc_id, raw_object_key FROM (
+           SELECT doc_id, raw_object_key FROM filings
+            WHERE filed_date IS NOT NULL AND filed_date < ? AND first_seen_at < ?
+           UNION ALL
+           SELECT doc_id, raw_object_key FROM filings
+            WHERE filed_date IS NULL AND substr(first_seen_at, 1, 10) < ? AND first_seen_at < ?
+         ) LIMIT ?`,
+        [cutoff, minAge, cutoff, minAge, RETENTION_DELETE_BATCH]
       );
 
       if (rows.length === 0) break;
@@ -348,47 +356,37 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
 
       const docIds = rows.map(r => r.doc_id);
       const placeholders = docIds.map(() => '?').join(',');
-      
-      // Delivery bookkeeping first: deliveries/delivery_outbox reference
-      // transactions by tx_id and must not be orphaned when the batch's
-      // transactions are removed below.
-      await run(
-        env.DB,
-        `DELETE FROM deliveries WHERE tx_id IN (SELECT id FROM transactions WHERE doc_id IN (${placeholders}))`,
-        docIds
-      );
 
-      await run(
+      // CT-2459: resolve the batch's transaction ids ONCE (the old code
+      // re-ran the same IN subquery inside three separate deletes), then
+      // run all six deletes as one atomic batch so a crash mid-batch can
+      // no longer orphan delivery/cursor rows. Delivery bookkeeping first:
+      // deliveries/delivery_outbox reference transactions by tx_id.
+      const txRows = await all<{ id: string }>(
         env.DB,
-        `DELETE FROM delivery_outbox WHERE tx_id IN (SELECT id FROM transactions WHERE doc_id IN (${placeholders}))`,
+        `SELECT id FROM transactions WHERE doc_id IN (${placeholders})`,
         docIds
       );
-
-      await run(
-        env.DB,
-        `DELETE FROM tx_cursor_seq WHERE tx_id IN (SELECT id FROM transactions WHERE doc_id IN (${placeholders}))`,
-        docIds
+      const txIds = txRows.map(r => r.id);
+      const statements: Array<[string, Array<string | number>]> = [];
+      // Chunk tx-keyed deletes to stay under SQLite bind limits.
+      for (let i = 0; i < txIds.length; i += 400) {
+        const slice = txIds.slice(i, i + 400);
+        const txPlaceholders = slice.map(() => '?').join(',');
+        statements.push(
+          [`DELETE FROM deliveries WHERE tx_id IN (${txPlaceholders})`, slice],
+          [`DELETE FROM delivery_outbox WHERE tx_id IN (${txPlaceholders})`, slice],
+          [`DELETE FROM tx_cursor_seq WHERE tx_id IN (${txPlaceholders})`, slice],
+        );
+      }
+      statements.push(
+        [`DELETE FROM transactions WHERE doc_id IN (${placeholders})`, docIds],
+        // ingestion_outbox keys on doc_id and is NOT reachable from any of
+        // the deletes above; without this it retains a row per pruned filing.
+        [`DELETE FROM ingestion_outbox WHERE doc_id IN (${placeholders})`, docIds],
+        [`DELETE FROM filings WHERE doc_id IN (${placeholders})`, docIds],
       );
-      
-      await run(
-        env.DB,
-        `DELETE FROM transactions WHERE doc_id IN (${placeholders})`,
-        docIds
-      );
-      
-      // ingestion_outbox keys on doc_id and is NOT reachable from any of the
-      // deletes above; without this it retains a row per pruned filing forever.
-      await run(
-        env.DB,
-        `DELETE FROM ingestion_outbox WHERE doc_id IN (${placeholders})`,
-        docIds
-      );
-
-      await run(
-        env.DB,
-        `DELETE FROM filings WHERE doc_id IN (${placeholders})`,
-        docIds
-      );
+      await batchStatements(env.DB, statements);
       
       totalDeleted += rows.length;
     }
@@ -974,9 +972,12 @@ export async function maybeRunDailyRetentionJobs(env: Env, now = new Date()): Pr
     }
   }
 
-  if (!(await stampDaily(env, SUBCLAIM_KEY_PREFIX + 'retention', day))) return 'stamped';
-
+  // CT-2459: budget check BEFORE the day stamp. Stamping first consumed the
+  // day even when the budget trip skipped the sweep, silently losing a full
+  // day of retention; now a budget-skipped day retries on the next firing.
   if (await dailyBudgetExceeded(env, 'retention sweep')) return 'budget';
+
+  if (!(await stampDaily(env, SUBCLAIM_KEY_PREFIX + 'retention', day))) return 'stamped';
 
   // Prune unbounded operational tables (dead_letter_events / ingest_log /
   // source_attempts). Bounded batches + per-run cap; never blocks the cron.
@@ -997,10 +998,9 @@ export async function maybeRunDailyRetentionJobs(env: Env, now = new Date()): Pr
   } catch (err) {
     console.warn('5-year filing retention sweep failed:', (err as Error).message);
   }
-  // Note: retention keeps the stamp-before semantic (SUBCLAIM_KEY_PREFIX)
-  // because its work is cheap, idempotent, and only ever shrinks the DB;
-  // skipping it on a budget trip is safe and a missed sweep never risks
-  // data loss (older rows are deleted on the NEXT successful sweep).
+  // Note: the day stamp is taken after the budget gate (CT-2459) so a
+  // budget trip no longer consumes the day; the sweep work itself stays
+  // cheap, idempotent, and only ever shrinks the DB.
   return 'ran';
 }
 

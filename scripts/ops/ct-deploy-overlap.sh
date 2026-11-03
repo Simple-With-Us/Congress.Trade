@@ -230,7 +230,7 @@ coolify_deploy_active() {
   command -v python3 >/dev/null 2>&1 || return 1
   local json
   json=$(curl -fsS -m 8 \
-    -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
     -H "Accept: application/json" \
     "${COOLIFY_BASE_URL%/}/api/v1/deployments" 2>/dev/null) || return 1
   printf '%s' "$json" | parse_deploy_active

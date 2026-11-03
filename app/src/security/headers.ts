@@ -123,6 +123,19 @@ export function browserSecurityHeaders(requestUrl: string, opts: {
 
 export const browserSecurityHeadersMiddleware: MiddlewareHandler = async (c, next) => {
   await next();
+  // CT-2459: JSON API responses don't execute scripts, load workers, or
+  // render documents — resolving Datadog RUM + Sentry browser config and
+  // building a CSP string for every /api/* hit was pure per-request waste.
+  // APIs keep the transport-level protections (nosniff, frame denial, HSTS).
+  if (new URL(c.req.url).pathname.startsWith('/api/')) {
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('X-Frame-Options', 'DENY');
+    c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+    if (isSecureRequest(c)) {
+      c.header('Strict-Transport-Security', 'max-age=31536000');
+    }
+    return;
+  }
   const env = (c.env ?? {}) as Env;
   let rumScriptSrc: string | undefined;
   let rumConnectOrigins: readonly string[] | undefined;

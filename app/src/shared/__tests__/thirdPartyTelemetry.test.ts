@@ -605,6 +605,143 @@ describe('third-party usage telemetry', () => {
     expect(cursors).toEqual(['start-cursor', 'start-cursor']);
   });
 
+  it('forwards the drain signal to the receiver fetch so a lane abort cuts an in-flight delivery', async () => {
+    const key = '_ops/usage-telemetry/ct-third-party%3Adelivery-test.json';
+    const fallback = fallbackBucket({ [key]: JSON.stringify(deliveryEvent) });
+    const { kv } = fakeConfigKv();
+    let observedSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const env = {
+      RAW_FILES: fallback.bucket, CONFIG_KV: kv,
+      USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token', USAGE_TELEMETRY_CIRCUIT_FAILURE_THRESHOLD: '1',
+    } as unknown as Env;
+    const controller = new AbortController();
+    const flushPromise = flushUsageTelemetryFallback(env, { signal: controller.signal });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(observedSignal).toBeDefined();
+    const rejection = expect(flushPromise).rejects.toThrow('lane aborted for test');
+    controller.abort(new Error('lane aborted for test'));
+    await rejection;
+    expect(observedSignal?.aborted).toBe(true);
+    // The aborted event is retained (not deleted, not quarantined) and the
+    // abort is not a receiver failure, so the breaker stays closed.
+    expect(fallback.objects.has(key)).toBe(true);
+    expect(fallback.put).not.toHaveBeenCalled();
+    expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+  });
+
+  it('cuts a slow R2 delivery at the remaining drain budget instead of the 15s receiver timeout', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T00:00:00.000Z'));
+    const startMs = Date.now();
+    const key = '_ops/usage-telemetry/ct-third-party%3Adelivery-test.json';
+    const fallback = fallbackBucket({ [key]: JSON.stringify(deliveryEvent) });
+    const { kv } = fakeConfigKv();
+    let observedSignal: AbortSignal | undefined;
+    let abortedAt: number | undefined;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        observedSignal?.addEventListener('abort', () => {
+          abortedAt = Date.now();
+          reject(new DOMException('Aborted', 'AbortError'));
+        });
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const env = {
+      RAW_FILES: fallback.bucket, CONFIG_KV: kv,
+      USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token', USAGE_TELEMETRY_CIRCUIT_FAILURE_THRESHOLD: '1',
+    } as unknown as Env;
+
+    const flushPromise = flushUsageTelemetryFallback(env);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // The drain budget is 6.5s; the default receiver timeout is 15s. Advancing
+    // only the budget must already cut the call.
+    await vi.advanceTimersByTimeAsync(6_500);
+    const result = await flushPromise;
+    expect(result).toMatchObject({ delivered: 0, failed: 1 });
+    expect(observedSignal?.aborted).toBe(true);
+    expect(abortedAt).toBeDefined();
+    expect(abortedAt! - startMs).toBeLessThan(15_000);
+    expect(abortedAt! - startMs).toBeLessThanOrEqual(6_500);
+    // Budget-cut timeouts are transient: retained, not quarantined, and they
+    // must not trip the circuit breaker (threshold is 1 here).
+    expect(fallback.objects.has(key)).toBe(true);
+    expect(fallback.objects.has('_ops/usage-telemetry-quarantine/ct-third-party%3Adelivery-test.json')).toBe(false);
+    expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+  });
+
+  it('stops the legacy D1 drain at the shared budget and leaves the cursor at the last visited row', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T00:00:00.000Z'));
+    const first = { ...legacyDeliveryEvent, idempotencyKey: 'ct-third-party:d1-budget-first' };
+    const second = { ...legacyDeliveryEvent, idempotencyKey: 'ct-third-party:d1-budget-second' };
+    const fallback = fallbackD1({
+      [first.idempotencyKey]: JSON.stringify(first),
+      [second.idempotencyKey]: JSON.stringify(second),
+    });
+    const firstUpdatedAt = fallback.rows.get(first.idempotencyKey)!.updated_at;
+    const secondUpdatedAt = fallback.rows.get(second.idempotencyKey)!.updated_at;
+    expect(firstUpdatedAt < secondUpdatedAt).toBe(true);
+    const { kv, store } = fakeConfigKv();
+    let fetchCalls = 0;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        const signal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        });
+      }
+      return Promise.resolve(new Response(JSON.stringify(acceptedAck), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const env = {
+      RAW_FILES: fallbackBucket().bucket, DB: fallback.db, CONFIG_KV: kv,
+      USAGE_MONITOR_ENABLED: 'true', USAGE_MONITOR_INGEST_URL: 'https://usage.example.test',
+      USAGE_MONITOR_INGEST_TOKEN: 'test-token', USAGE_TELEMETRY_CIRCUIT_FAILURE_THRESHOLD: '1',
+    } as unknown as Env;
+
+    const flushPromise = flushUsageTelemetryFallback(env);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(6_500);
+    const firstResult = await flushPromise;
+    // Only the first row was visited; the second was never attempted.
+    expect(firstResult).toMatchObject({ delivered: 0, failed: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fallback.rows.has(first.idempotencyKey)).toBe(true);
+    expect(fallback.rows.has(second.idempotencyKey)).toBe(true);
+    expect(JSON.parse(store.get('usage_telemetry_drain_cursor')!)).toEqual({
+      d1: { updatedAt: firstUpdatedAt, idempotencyKey: first.idempotencyKey },
+    });
+    expect(store.has('usage_telemetry_d1_drain_complete')).toBe(false);
+    expect(await isUsageTelemetryCircuitOpen(env)).toBe(false);
+
+    // The next tick resumes at the second row, proving it was not skipped.
+    vi.setSystemTime(new Date('2026-10-14T00:02:00.000Z'));
+    const secondResult = await flushUsageTelemetryFallback(env);
+    expect(secondResult).toMatchObject({ delivered: 1, failed: 0 });
+    expect(fallback.rows.has(second.idempotencyKey)).toBe(false);
+    expect(fallback.rows.has(first.idempotencyKey)).toBe(true);
+    expect(JSON.parse(store.get('usage_telemetry_drain_cursor')!)).toEqual({
+      d1: { updatedAt: secondUpdatedAt, idempotencyKey: second.idempotencyKey },
+    });
+  });
+
   it('ends the receiver deadline before slow quarantine storage', async () => {
     vi.useFakeTimers();
     const { kv } = fakeConfigKv();
