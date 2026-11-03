@@ -518,10 +518,37 @@ read_state
 now="$(date +%s)"
 hop="$last_hop"
 
+# The restart request's curl config contains the Coolify bearer token.  Track
+# only its path; cleanup never opens or logs the file.
+auth_cfg=""
+cleanup_auth_cfg() {
+  if [ -n "$auth_cfg" ]; then
+    rm -f "$auth_cfg"
+    auth_cfg=""
+  fi
+}
+
+watchdog_exit() {
+  local exit_status=$?
+  trap - EXIT
+  cleanup_auth_cfg
+  check_trading_proxy_path
+  exit "$exit_status"
+}
+
+watchdog_signal() {
+  local exit_status="$1"
+  cleanup_auth_cfg
+  exit "$exit_status"
+}
+
 # The trading-proxy (VM->Coolify->Mango) check runs once per invocation, after
 # the liveness logic below has written its state.  It is independent of the
 # liveness result and owns its own alerting (one Zulip alert per incident).
-trap 'check_trading_proxy_path' EXIT
+trap watchdog_exit EXIT
+trap 'watchdog_signal 129' HUP
+trap 'watchdog_signal 130' INT
+trap 'watchdog_signal 143' TERM
 
 if probe_target; then
   if [ "$consec" -gt 0 ]; then
@@ -620,7 +647,11 @@ proxy="$(tailnet_proxy)" || {
 log "RESTARTING Coolify app $APP_UUID after $consec consecutive site failures"
 # The bearer token travels in a mode-600 curl config file, never in argv
 # (argv is visible to other users on the host in ps).
-auth_cfg="$(mktemp)"
+auth_cfg="$(mktemp)" || {
+  log "ERROR: could not create temporary Coolify curl config; cannot restart"
+  write_state "$consec" "$proxy_consec" "$last_restart" "$hop"
+  exit 1
+}
 chmod 600 "$auth_cfg"
 printf 'header = "Authorization: Bearer %s"\n' "$token" > "$auth_cfg"
 resp="$(curl -s -m 30 -X POST \
@@ -628,7 +659,7 @@ resp="$(curl -s -m 30 -X POST \
   -K "$auth_cfg" \
   -H "Accept: application/json" \
   "$COOLIFY_API/applications/$APP_UUID/restart" 2>&1 || echo "CURL_FAILED")"
-rm -f "$auth_cfg"
+cleanup_auth_cfg
 log "restart API response: $(echo "$resp" | head -c 300)"
 consec=0
 write_state "$consec" "$proxy_consec" "$now" "$hop"
