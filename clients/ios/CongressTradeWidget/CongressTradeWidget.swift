@@ -211,6 +211,13 @@ struct Provider: TimelineProvider {
                 request.timeoutInterval = 15
                 request.cachePolicy = .reloadIgnoringLocalCacheData
                 request.setValue("application/json", forHTTPHeaderField: "Accept")
+                // congress.trade's Cloudflare managed challenge 502s some
+                // non-browser UAs (see APIClient.makeRequest). Without this
+                // the widget silently serves its on-disk cache forever.
+                request.setValue(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+                    forHTTPHeaderField: "User-Agent"
+                )
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                     throw WidgetFeedError.invalidResponse

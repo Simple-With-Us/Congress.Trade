@@ -30,7 +30,7 @@
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Env, Filing, ParsedTx } from '../shared/types.ts';
-import { getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 import { resolveSecret } from '../secrets/infisical.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import type { OpenRouterRequestEnrichment } from '@jaywedgeworth22/congress-trading-shared';
@@ -433,6 +433,7 @@ export class OpenRouterVisionExtractor implements Extractor {
     let pagesProcessed: number | undefined = undefined;
     if (model.toLowerCase().includes('mistral-ocr')) {
       try {
+        const { getDocumentProxy } = await import('unpdf');
         const pdf = await getDocumentProxy(new Uint8Array(input.bytes.slice(0)));
         pagesProcessed = typeof pdf.numPages === 'number' && Number.isFinite(pdf.numPages) ? pdf.numPages : undefined;
       } catch {

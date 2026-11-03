@@ -147,18 +147,18 @@ struct SettingsView: View {
         if store.signedIn, let user = store.signedInUser {
             HStack(spacing: 12) {
                 if let picture = user.picture, let url = URL(string: picture) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image.resizable().scaledToFill()
-                        default:
+                    // CT-2459: shared downsampling cache + decorative label
+                    // (the name/email beside it carry the meaning).
+                    CachedAsyncImage(url: url, pointSize: 44)
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 44, height: 44)
+                        .background(
                             Image(systemName: "person.crop.circle.fill")
                                 .resizable()
                                 .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(width: 44, height: 44)
-                    .clipShape(Circle())
+                        )
+                        .clipShape(Circle())
+                        .accessibilityHidden(true)
                 } else {
                     Image(systemName: "person.crop.circle.fill")
                         .font(.system(size: 40))

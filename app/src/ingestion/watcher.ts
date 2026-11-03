@@ -36,7 +36,7 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings } from './senateSource.ts';
+import { fetchSenatePtrFilings, type SenateFiling } from './senateSource.ts';
 import {
   clearSenateEdgeBackoff,
   isSenateEdgeBackoffActive,
@@ -1008,6 +1008,37 @@ export function computeSenateLookbackDays(
   return Math.min(max, Math.max(baseDays, gapDays));
 }
 
+/** Map Senate filings to watcher discovery rows.  Shared by pollSenate and
+ * the out-of-band intake so both paths mint identical filer identities. */
+export function senateDiscoveredFilings(filings: SenateFiling[]): DiscoveredFiling[] {
+  return filings.map((f) => {
+    const filerName = cleanFilerName(f.fullName || [f.first, f.last].filter(Boolean).join(' ').trim()) || null;
+    return {
+      docId: f.pipelineDocId,
+      chamber: 'senate' as const,
+      sourceUrl: f.sourceUrl,
+      filedDate: f.filedDate,
+      filerId: senateFilerId(filerName),
+      filerName,
+    };
+  });
+}
+
+/**
+ * Persist Senate filings discovered outside the poller (the Mac eFD fetcher
+ * intake, CT-2442) through the same insert + durable-outbox path as
+ * pollSenate.  This deliberately writes no poll log, no last-poll state, and
+ * no source-attempt health: an intake must not make a still-failing Senate
+ * poller look healthy.
+ */
+export async function ingestSenateFilings(
+  env: Env,
+  filings: SenateFiling[],
+  now: Date,
+): Promise<{ count: number; inserted: DiscoveredFiling[] }> {
+  return persistAndEnqueue(env, senateDiscoveredFilings(filings), now.toISOString());
+}
+
 /**
  * Poll the Senate efdsearch DataTables API, diff against D1, enqueue new PTRs.
  * Throws on any failure (caught by the per-source guard in runWatcher).
@@ -1049,17 +1080,7 @@ async function pollSenate(env: Env, now: Date, signal?: AbortSignal): Promise<nu
     proxyUrl: env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL,
     signal,
   });
-  const discovered: DiscoveredFiling[] = filings.map((f) => {
-    const filerName = cleanFilerName(f.fullName || [f.first, f.last].filter(Boolean).join(' ').trim()) || null;
-    return {
-      docId: f.pipelineDocId,
-      chamber: 'senate' as const,
-      sourceUrl: f.sourceUrl,
-      filedDate: f.filedDate,
-      filerId: senateFilerId(filerName),
-      filerName,
-    };
-  });
+  const discovered = senateDiscoveredFilings(filings);
   const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'senate', nowIso);
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))

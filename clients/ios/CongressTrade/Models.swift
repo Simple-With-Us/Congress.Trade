@@ -705,13 +705,58 @@ struct ClientTickerAnalytics: Decodable {
     }
 
     struct Trader: Decodable, Identifiable {
-        var id: String { filerId ?? (fullName ?? UUID().uuidString) }
+        /// Stored at decode time, never recomputed per access. The old
+        /// computed form minted a fresh UUID on every read when both
+        /// `filerId` and `fullName` were nil, so SwiftUI saw a new identity
+        /// each render (row churn, lost state).
+        let id: String
         let filerId: String?
         let fullName: String?
         let partyBucket: String?
         let photoUrl: String?
         let tradeCount: Int?
         let estVolumeUsd: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case filerId, fullName, partyBucket, photoUrl, tradeCount, estVolumeUsd
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            filerId = try container.decodeIfPresent(String.self, forKey: .filerId)
+            fullName = try container.decodeIfPresent(String.self, forKey: .fullName)
+            partyBucket = try container.decodeIfPresent(String.self, forKey: .partyBucket)
+            photoUrl = try container.decodeIfPresent(String.self, forKey: .photoUrl)
+            tradeCount = try container.decodeIfPresent(Int.self, forKey: .tradeCount)
+            estVolumeUsd = try container.decodeIfPresent(Double.self, forKey: .estVolumeUsd)
+            id = Self.stableID(
+                filerId: filerId, fullName: fullName, partyBucket: partyBucket,
+                photoUrl: photoUrl, tradeCount: tradeCount, estVolumeUsd: estVolumeUsd
+            )
+        }
+
+        /// Deterministic across decodes and processes: filer id wins, then a
+        /// normalized name, then an FNV-1a hash of the remaining fields.
+        /// `Hasher` is per-process randomized and must not be used here.
+        static func stableID(
+            filerId: String?, fullName: String?, partyBucket: String?,
+            photoUrl: String?, tradeCount: Int?, estVolumeUsd: Double?
+        ) -> String {
+            if let filerId = filerId?.trimmingCharacters(in: .whitespacesAndNewlines), !filerId.isEmpty {
+                return filerId
+            }
+            if let name = fullName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return "name:\(name.lowercased())"
+            }
+            let seed = [partyBucket ?? "", photoUrl ?? "", tradeCount.map(String.init) ?? "",
+                        estVolumeUsd.map { String($0) } ?? ""].joined(separator: "|")
+            var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+            for byte in seed.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 0x0000_0100_0000_01b3
+            }
+            return "anon:\(String(hash, radix: 16))"
+        }
     }
 
     struct Backtest: Decodable {

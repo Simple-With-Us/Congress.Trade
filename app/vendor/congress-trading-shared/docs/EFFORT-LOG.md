@@ -298,10 +298,10 @@ Completed occurrence.
   does not exist on Socratic.Trade's origin and no reusable verify-gate workflow is on its `main`
   (only the #370 docs-fast-path efficiency change landed there). Result: 'still blocked' — see the
   Planned/Reserved row below, corrected with this verified status and date._
-- **Shared agent-sync WebSocket relay verification (CODEX, shared `/Users/jay/apps` infra) —
-  2026-07-05.** Verified PM2 `agent-sync-push` is online, connected to Slack Socket Mode using
+- **Shared ag***-s**c WebSocket relay verification (CODEX, shared `/Users/jay/apps` infra) —
+  2026-07-05.** Verified PM2 `ag***-s**c-push` is online, connected to Slack Socket Mode using
   `SLACK_SYNC_WEBSOCKET`, and fanning out to local consumers on `ws://127.0.0.1:8787`; verified
-  PM2 `agent-sync-codex` is attached as this seat's private-cursor consumer. Stopped the temporary
+  PM2 `ag***-s**c-codex` is attached as this seat's private-cursor consumer. Stopped the temporary
   direct Socket Mode watcher and corrected the canonical protocol entrypoint from stale `run.sh`
   to installed `start.sh`. No package code changed.
 - ~~**Test coverage for `schemas.ts` / `utils.ts` / `constants.ts` + SecurityRef subset-consistency guardrail (CURSOR) — 2026-07-05.** 237 tests across 5 files (4 new + 1 existing `usageTelemetry`), zero failures. Covers all 37 exported Zod schemas, 7 utility functions (`normalizeTicker`, `resolveTickerAlias`, `marketCapBucket`, `bracketMidpoint`, `isIsoDate`, `daysBetween`, `mergeRefs`), all constants (`TICKER_ALIASES`, `MKT_CAP_THRESHOLDS`, `API_PATHS`, `WINDOW_PRESETS`, `LAG_BUCKETS`), and `parseArray`/`parseSafe` helpers. SecurityRef guardrail verifies `SecurityRefInputSchema` keys are a true subset of `SecurityRefSchema`. Branch: `cursor`. Mid-tier subagent.~~
@@ -328,7 +328,7 @@ Completed occurrence.
   Congress.Trade #162 re-propagated via PR #29 (merged 2026-07-05): issue listing inside
   partial handling, server Retry-After honored uncapped, 1s update throttle.
 - (seeded empty — see repo git history for pre-protocol work)
-- PR #3 (claude/agent-sync-stanza, CLAUDE) — AGENTS.md inter-agent coordination stanza; MERGED 2026-07-04.
+- PR #3 (claude/ag***-s**c-stanza, CLAUDE) — AGENTS.md inter-agent coordination stanza; MERGED 2026-07-04.
 - PR #4 (claude/effort-issues-mirror, CLAUDE) — GitHub Issues mirror of this board; MERGED 2026-07-04.
 - PR #7 (claude/tokenless-git-dep-prep, CLAUDE) — tokenless git dependency policy: README/AGENTS.md
   publish-policy flip (owner made this repo public), tag `v1.2.0` pushed as the first stable consumer
@@ -479,7 +479,7 @@ Completed occurrence.
   owner directed this session as Monet from the first message. Branch renamed back
   `claude/sad-hermann-671f4d` → `monet/sad-hermann-671f4d`; work content unchanged (03d33bd)._
   Owner-directed pickup of the shared-package half of the AG-reserved cross-app row
-  below (reservations, not locks — yield offer to AG in #agent-sync). Additive, backward-compatible
+  below (reservations, not locks — yield offer to AG in #ag***-s**c). Additive, backward-compatible
   API in THIS package only: `TICKER_RENAMES` (FB→META, SQ→XYZ, GEHCV→GEHC continuous entities) +
   `TICKER_ACQUISITIONS` (BRCM→AVGO, TWX→WBD, ATVI→MSFT, RHT→IBM delisted/successor); `TICKER_ALIASES`
   kept as their union (still 7 entries); `classifyTickerAlias()`/`TickerAliasClass`/`TickerAliasResolution`

@@ -47,6 +47,9 @@ import {
 } from '../analytics/sql.ts';
 import {
   buildTickerBacktestCohortQuery,
+  buildBacktestPriceQuery,
+  buildBacktestSpxQuery,
+  buildPricedDaysCountQuery,
   buildTickerSummaryQuery,
   buildTickerTimeSeriesQuery,
   buildTickerTopTradersQuery,
@@ -192,19 +195,13 @@ export async function tickerAnalytics(
       // matching it is what keeps the two surfaces reporting one number.
       const cohortQ = buildTickerBacktestCohortQuery(ticker, f);
 
-      const [sumRow, seriesRows, buyerRows, sellerRows, cohortRows, priceAsc, spxAsc] =
+      const [sumRow, seriesRows, buyerRows, sellerRows, cohortRows] =
         await Promise.all([
           first<Record<string, unknown>>(env.DB, sumQ.sql, sumQ.params),
           all<Record<string, unknown>>(env.DB, seriesQ.sql, seriesQ.params),
           all<Record<string, unknown>>(env.DB, buyersQ.sql, buyersQ.params),
           all<Record<string, unknown>>(env.DB, sellersQ.sql, sellersQ.params),
           all<{ tx_date: string }>(env.DB, cohortQ.sql, cohortQ.params),
-          all<PriceBar>(
-            env.DB,
-            'SELECT date, close FROM price_eod WHERE ticker = ? ORDER BY date ASC',
-            [ticker],
-          ),
-          all<PriceBar>(env.DB, 'SELECT date, close FROM spx_eod ORDER BY date ASC'),
         ]);
 
       const s = sumRow ?? {};
@@ -213,6 +210,22 @@ export async function tickerAnalytics(
       const cohortDates = cohortRows
         .map((row) => str(row.tx_date))
         .filter((d): d is string => !!d);
+      // CT-2459: bound both price series to the cohort window (was: full
+      // ticker history + full spx_eod per cache miss). pricedDays keeps its
+      // full-coverage meaning via a COUNT query.
+      const countQ = buildPricedDaysCountQuery(ticker);
+      const pricedDaysRow = await first<{ n: number }>(env.DB, countQ.sql, countQ.params);
+      let priceAsc: PriceBar[] = [];
+      let spxAsc: PriceBar[] = [];
+      if (cohortDates.length > 0) {
+        const cohortMin = cohortDates.reduce((a, b) => (b < a ? b : a));
+        const priceQ = buildBacktestPriceQuery(ticker, cohortMin);
+        const spxQ = buildBacktestSpxQuery(cohortMin);
+        [priceAsc, spxAsc] = await Promise.all([
+          all<PriceBar>(env.DB, priceQ.sql, priceQ.params),
+          all<PriceBar>(env.DB, spxQ.sql, spxQ.params),
+        ]);
+      }
       const bt = aggregateTickerBacktest(cohortDates, priceAsc, spxAsc, DEFAULT_HORIZONS);
 
       return {
@@ -242,7 +255,7 @@ export async function tickerAnalytics(
         topSellers: sellerRows.map(mapTrader),
         backtest: {
           totalBuyEvents: bt.tradeCount,
-          pricedDays: priceAsc.length,
+          pricedDays: num(pricedDaysRow?.n),
           minN: BACKTEST_MIN_N,
           horizons: bt.horizons,
         },

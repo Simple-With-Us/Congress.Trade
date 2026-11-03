@@ -72,6 +72,19 @@ PUSHOVER_APP_TOKEN="${PUSHOVER_USAGE_API_TOKEN:-${PUSHOVER_APP_TOKEN:-}}"
 
 mkdir -p "$STATE_DIR"
 
+# Build a curl -K config for Pushover creds.  Values are escaped for curl's
+# quoted config syntax (backslash, then double quote); values with CR/LF are
+# rejected because they cannot be represented safely on one config line.
+pushover_curl_config() {
+  local t="${PUSHOVER_APP_TOKEN:-}" u="${PUSHOVER_USER_KEY:-}"
+  case "$t$u" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  t=${t//\\/\\\\}; t=${t//\"/\\\"}
+  u=${u//\\/\\\\}; u=${u//\"/\\\"}
+  printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$t" "$u"
+}
+
 log() {
   local msg="$*"
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg"
@@ -224,14 +237,18 @@ alert_pushover() {
     return 0
   fi
   local title="Coolify disk ${severity}"
+  local _po_cfg
+  if ! _po_cfg=$(pushover_curl_config); then
+    log "warn: pushover config rejected (token/user contains CR/LF); notify skipped"
+    return 0
+  fi
   curl -fsS -m 15 \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf '%s\n' "$_po_cfg") \
     --form-string "title=${title}" \
     --form-string "message=${body}" \
     --form-string "priority=$([[ "$severity" == crit ]] && echo 1 || echo 0)" \
     https://api.pushover.net/1/messages.json >/dev/null 2>&1 \
-    || log "warn: pushover notify failed"
+    || log "warn: pushover notify failed (curl exit $?; bad config or network)"
 }
 
 alert_warn() {

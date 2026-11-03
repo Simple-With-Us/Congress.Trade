@@ -123,11 +123,32 @@ function makeEnv(fx: Fixture): { env: Env; seen: string[] } {
 
   function rows(sql: string, params: unknown[]): Row[] {
     // --- price history -----------------------------------------------------
+    // CT-2459 bounded backtest series: honor the cohort-min bound (params
+    // carry [ticker, min, ticker, min] / [min, min]) plus the one
+    // on-or-before bar, exactly as SQLite would.
+    if (/COUNT\(\*\) AS n FROM price_eod/i.test(sql)) {
+      fail('price');
+      return [{ n: fx.priceEod.length }];
+    }
     if (/FROM price_eod/i.test(sql)) {
       fail('price');
+      if (/MAX\(date\)/i.test(sql)) {
+        const min = String(params[1] ?? '');
+        const before = fx.priceEod.filter((b) => String(b.date) <= min);
+        const anchor = before.length ? [before[before.length - 1]] : [];
+        return [...anchor, ...fx.priceEod.filter((b) => String(b.date) > min)];
+      }
       return fx.priceEod;
     }
-    if (/FROM spx_eod/i.test(sql)) return fx.spxEod;
+    if (/FROM spx_eod/i.test(sql)) {
+      if (/MAX\(date\)/i.test(sql)) {
+        const min = String(params[0] ?? '');
+        const before = fx.spxEod.filter((b) => String(b.date) <= min);
+        const anchor = before.length ? [before[before.length - 1]] : [];
+        return [...anchor, ...fx.spxEod.filter((b) => String(b.date) > min)];
+      }
+      return fx.spxEod;
+    }
 
     // --- securities_ref ----------------------------------------------------
     if (/FROM securities_ref WHERE ticker = \?/i.test(sql)) {

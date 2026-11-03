@@ -116,7 +116,10 @@ check_live_revision() {
     return 0
   fi
   attempts="${DEPLOY_REVISION_ATTEMPTS:-30}"
-  delay="${DEPLOY_REVISION_DELAY_SECONDS:-20}"
+  # Gentle ramp (CT-2459): poll eagerly at first (Coolify usually lands in
+  # well under a minute), then back off to the old fixed 20s cadence.
+  # Setting DEPLOY_REVISION_DELAY_SECONDS pins a fixed delay instead.
+  delay="${DEPLOY_REVISION_DELAY_SECONDS:-5}"
 
   for ((i = 1; i <= attempts; i++)); do
     body="$(curl -sS -A "$UA" "$base/api/health" || true)"
@@ -143,6 +146,9 @@ check_live_revision() {
     echo "   waiting for deploy: live ${live:0:12} != HEAD ${expected:0:12} (attempt $i/$attempts)"
     if [ "$i" -lt "$attempts" ]; then
       sleep "$delay"
+      if [ -z "${DEPLOY_REVISION_DELAY_SECONDS:-}" ] && [ "$delay" -lt 20 ]; then
+        delay=$((delay + 5))
+      fi
     fi
   done
 
@@ -260,8 +266,20 @@ if [ "$DEPLOY_ONLY" = true ]; then
   exit 0
 fi
 
-# Always ensure the schema is current (idempotent), via the Worker binding.
-post migrate
+# Ensure the schema is current (idempotent). The app already applies the
+# same statement list at startup (src/deno/main.ts), and /api/health spreads
+# checkReadiness() ({ok, db, schema, missing[]}); when the just-verified
+# live build reports schema=true with nothing missing, the extra migrate
+# POST is a duplicate replay -- skip it (CT-2459). SHIP_FORCE_MIGRATE=1
+# always POSTs; the live-SHA assertion above still runs either way.
+health_body="$(curl -sS -A "$UA" "$ADMIN_BASE/api/health" || true)"
+if [ "${SHIP_FORCE_MIGRATE:-0}" != "1" ] \
+  && [[ "$health_body" == *'"schema":true'* ]] \
+  && [[ "$health_body" == *'"missing":[]'* ]]; then
+  echo "==> /api/health reports schema current (schema=true, missing=[]) -- skipping duplicate migrate POST."
+else
+  post migrate
+fi
 
 echo "==> Live API readiness check"
 check_api_health "$ADMIN_BASE/api/health" "$ADMIN_BASE"

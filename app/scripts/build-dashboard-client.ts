@@ -24,6 +24,7 @@
  * the build instead of being silently overwritten by the next generation.
  */
 
+import { stop, transform } from 'esbuild';
 import { assetVersion } from '../src/ui/assets.ts';
 import { escapeForTemplateLiteral, findUnescapedDelimiter, inject } from './dashboard-client-escape.ts';
 
@@ -62,9 +63,52 @@ import { assetVersion } from './assets.ts';
 
 export const DASHBOARD_APP_JS = /* js */ \``;
 
+/** Top-level function declarations — the global surface inline handlers
+ *  resolve at dispatch time. Minification must preserve every one. */
+function topLevelFunctionNames(code: string, minified: boolean): string[] {
+  // Source: declarations at column 0. Minified (single line): declarations
+  // right after a statement boundary. IIFE-internal names like
+  // `(function foo(){})()` are excluded on purpose — esbuild may drop
+  // those unused expression names, and no handler can reference them.
+  const re = minified
+    ? /(?:^|[;}])\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g
+    : /^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm;
+  return [...code.matchAll(re)].map((m) => m[1]).sort();
+}
+
 /** Builds the full generated file content. */
-function build(source: string): string {
-  const injected = escapeForTemplateLiteral(inject(source));
+async function build(source: string): Promise<string> {
+  const injectedJs = inject(source);
+  // CT-2459: DASHBOARD_APP_JS_SERVED is what browsers download (minified);
+  // DASHBOARD_APP_JS stays verbatim for tests/tooling. Identifiers are
+  // never minified (inline handlers resolve them as globals), asserted below.
+  const minified = (
+    await transform(injectedJs, {
+      loader: 'js',
+      minifyWhitespace: true,
+      minifySyntax: true,
+      minifyIdentifiers: false,
+    })
+  ).code;
+  // Distinct-name subset (not exact multiset): the regex also sees
+  // `function` inside comments/strings in the source, which minification
+  // legitimately strips. What must never happen is a real declaration
+  // name disappearing — inline handlers resolve those as globals.
+  const before = new Set(topLevelFunctionNames(injectedJs, false));
+  const after = new Set(topLevelFunctionNames(minified, true));
+  const lost = [...before].filter((n) => !after.has(n));
+  if (lost.length > 0) {
+    throw new Error(
+      'minified dashboard.js lost/renamed functions: ' + lost.slice(0, 10).join(', ') +
+        ' — inline handlers would break',
+    );
+  }
+  const minifiedEscaped = escapeForTemplateLiteral(minified);
+  const strayMin = findUnescapedDelimiter(minifiedEscaped);
+  if (strayMin) {
+    throw new Error('minified dashboard.js contains an unescaped ' + strayMin.what + ' after escaping');
+  }
+  const injected = escapeForTemplateLiteral(injectedJs);
   // Belt and braces: after escaping, no UNESCAPED backtick or ${ may survive. A
   // silent corruption here is exactly the failure mode CT-1500 is about — the
   // old template literal could swallow one and only a browser would find out.
@@ -83,11 +127,18 @@ function build(source: string): string {
   // No separator before the body: dashboard.js already opens with the same two
   // newlines the old template literal had, and adding one more would change the
   // served bytes for no reason.
-  return `${HEADER}${injected}\n\`;\n\n/** \`?v=\` cache-busting fingerprint; see assetVersion(). */\nexport const DASHBOARD_APP_JS_VERSION = assetVersion(DASHBOARD_APP_JS);\n`;
+  return (
+    `${HEADER}${injected}\n\`;\n\n` +
+    '/** CT-2459: minified bytes browsers download (identifiers preserved). */\n' +
+    'export const DASHBOARD_APP_JS_SERVED = /* js */ `' + minifiedEscaped + '`;\n\n' +
+    '/** `?v=` cache-busting fingerprint over the SERVED bytes; see assetVersion(). */\n' +
+    'export const DASHBOARD_APP_JS_VERSION = assetVersion(DASHBOARD_APP_JS_SERVED);\n'
+  );
 }
 
 const source = await Deno.readTextFile(SOURCE_PATH);
-const next = build(source);
+const next = await build(source);
+stop();
 
 if (Deno.args.includes('--check')) {
   const current = await Deno.readTextFile(TARGET_PATH);

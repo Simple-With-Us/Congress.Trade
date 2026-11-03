@@ -34,7 +34,9 @@
  */
 
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
-import * as cheerio from 'cheerio';
+// CT-2459: node-html-parser only (cheerio removed — it was a whole second
+// HTML parser stack for these three small extractions).
+import { parse } from 'node-html-parser';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { createProxiedFetch, getDenoHttpClient, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import {
@@ -256,8 +258,8 @@ export async function withSenateEfdEgress<T>(
 
 const SENATE_BASE = 'https://efdsearch.senate.gov';
 export const SENATE_SEARCH = `${SENATE_BASE}/search/`;
-const SENATE_HOME = `${SENATE_BASE}/search/home/`;
-const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
+export const SENATE_HOME = `${SENATE_BASE}/search/home/`;
+export const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
 
 /** PTR report type code in the efdsearch DataTables API. */
 export const SENATE_PTR_REPORT_TYPE = 11;
@@ -366,8 +368,9 @@ export function looksLikeSenateAgreementWall(html: string): boolean {
  * Returns '' if not found.
  */
 export function parseCsrfMiddlewareToken(html: string): string {
-  const $ = cheerio.load(html);
-  const token = $('input[name="csrfmiddlewaretoken"]').val();
+  const token = parse(html)
+    .querySelector('input[name="csrfmiddlewaretoken"]')
+    ?.getAttribute('value');
   return typeof token === 'string' ? token : '';
 }
 
@@ -377,8 +380,7 @@ export function parseCsrfMiddlewareToken(html: string): string {
  * Returns { reportPath, reportId } or null if no parseable href.
  */
 export function parseReportLink(cellHtml: string): { reportPath: string; reportId: string } | null {
-  const $ = cheerio.load(cellHtml);
-  const href = $('a').attr('href');
+  const href = parse(cellHtml).querySelector('a')?.getAttribute('href');
   if (!href) return null;
   const reportPath = href;
   // id is the last non-empty path segment (handles trailing slash).
@@ -404,7 +406,7 @@ export function parseSenateRows(rows: string[][]): SenateFiling[] {
   for (const row of rows) {
     if (!Array.isArray(row)) continue;
     const cells = row.map((c) => (typeof c === 'string' ? c : ''));
-    const textCells = cells.map((c) => cheerio.load(c).text().trim());
+    const textCells = cells.map((c) => parse(c).text.trim());
     const linkCell = cells.find((c) => /\/search\/view\/(?:ptr|paper)\//i.test(c)) ?? '';
     const parsed = parseReportLink(linkCell);
     if (!parsed) continue;
@@ -429,6 +431,87 @@ export function parseSenateRows(rows: string[][]): SenateFiling[] {
     });
   }
   return out;
+}
+
+
+/** One row from the Mac eFD fetcher's output file (~/efd-fetcher/out/*.json). */
+export interface EfdFetcherRow {
+  first_name?: string | null;
+  last_name?: string | null;
+  filer?: string | null;
+  report_title?: string | null;
+  report_url?: string | null;
+  date_received?: string | null;
+  is_paper?: boolean;
+  /** The original DataTables row, when the fetcher preserved it. */
+  raw?: string[];
+}
+
+function fetcherRowText(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Convert one Mac eFD fetcher row into a SenateFiling, or null when the row
+ * does not carry a usable official eFD report link and filed date.  When the
+ * fetcher preserved the original DataTables row, parseSenateRows is the
+ * primary path so intake filings are parsed identically to polled filings.
+ * The extracted fields are the fallback for rows without a usable raw row.
+ * A report URL on any host other than efdsearch.senate.gov is rejected: the
+ * pipeline fetches sourceUrl server-side, so intake must never become a way
+ * to point it at an arbitrary URL.
+ */
+export function senateFilingFromFetcherRow(row: EfdFetcherRow): SenateFiling | null {
+  if (!row || typeof row !== 'object') return null;
+  if (Array.isArray(row.raw)) {
+    const parsed = parseSenateRows([row.raw])[0];
+    // parseSenateRows tolerates a missing date or name cell (it yields '');
+    // intake must not.  A raw parse without a valid filed date and filer
+    // name falls through to the extracted-fields path, which validates both.
+    if (
+      parsed &&
+      parsed.sourceUrl.startsWith(`${SENATE_BASE}/search/view/`) &&
+      parsed.fullName &&
+      /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(parsed.filedDate)
+    ) {
+      return parsed;
+    }
+  }
+  const reportUrl = fetcherRowText(row.report_url);
+  if (!reportUrl) return null;
+  let reportPath = '';
+  if (reportUrl.startsWith('/')) {
+    reportPath = reportUrl.split(/[?#]/, 1)[0];
+  } else {
+    try {
+      const url = new URL(reportUrl);
+      if (url.origin !== SENATE_BASE) return null;
+      reportPath = url.pathname;
+    } catch {
+      return null;
+    }
+  }
+  if (!/^\/search\/view\/(?:ptr|paper)\//i.test(reportPath)) return null;
+  const segments = reportPath.split('/').filter((s) => s.length > 0);
+  const reportId = segments[segments.length - 1] ?? '';
+  if (!reportId) return null;
+  const filedDate = fetcherRowText(row.date_received);
+  if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(filedDate)) return null;
+  const first = fetcherRowText(row.first_name);
+  const last = fetcherRowText(row.last_name);
+  const fullName = fetcherRowText(row.filer) || `${first} ${last}`.trim();
+  if (!fullName) return null;
+  return {
+    reportId,
+    first,
+    last,
+    fullName,
+    filingTypeLabel: fetcherRowText(row.report_title),
+    filedDate,
+    reportPath,
+    sourceUrl: `${SENATE_BASE}${reportPath}`,
+    pipelineDocId: `S-${reportId}`,
+  };
 }
 
 /** Format a Date as the "MM/DD/YYYY HH:MM:SS" string efdsearch expects. */
@@ -498,6 +581,28 @@ export interface FetchSenatePtrFilingsOptions {
   proxyFirstAnswerTimeoutMs?: number;
   /** Cancels active source I/O when the enclosing watcher tick reaches its deadline. */
   signal?: AbortSignal;
+  /**
+   * Run the eFD flow through a real Chromium page (senateBrowserFetch.ts)
+   * instead of plain HTTP.  Opt-in; default off (env SENATE_EFD_BROWSER_FETCH).
+   * The plain-HTTP flow has been edge-denied at the agreement POST since
+   * 2026-10-23 (CT-2442), and the browser is the only automated client class
+   * observed to pass.  Requires the playwright package and a Chromium build
+   * in the deployment image.
+   */
+  browserFetch?: boolean;
+  /**
+   * With browserFetch, launch Chromium with
+   * --disable-blink-features=AutomationControlled, so navigator.webdriver
+   * reads false (owner decision, 2026-10-30).  Default off (env
+   * SENATE_EFD_HIDE_AUTOMATION).
+   */
+  hideAutomation?: boolean;
+  /**
+   * With browserFetch, launch Chromium headless.  Default true (env
+   * SENATE_EFD_BROWSER_HEADLESS); the verified eFD passes were headed (Mac)
+   * or a managed browser, so headless is unverified against the edge.
+   */
+  browserHeadless?: boolean;
 }
 
 /** KV key holding the cached, agreement-accepted eFD session. Shared with the
@@ -725,7 +830,7 @@ export async function fetchSenatePtrFilings(
     );
   }
 
-  return await withSenateEfdEgress(opts, fetchImpl, async (effectiveFetch, leg) => {
+  const runFlow = async (effectiveFetch: typeof fetch, leg: SenateEfdEgressLeg): Promise<SenateFiling[]> => {
   // The shared KV session belongs to the primary egress.  A direct leg that
   // is only the proxy's fallback never reads, writes or deletes it: the
   // proxy made it, the fetcher replays it through the same proxy, and a
@@ -834,6 +939,30 @@ export async function fetchSenatePtrFilings(
   }
 
   return parseSenateRows(rows);
-  });
+  };
+
+  const browserFetchEnabled = opts.browserFetch ??
+    (typeof process !== 'undefined' && process.env?.SENATE_EFD_BROWSER_FETCH === 'true');
+  if (browserFetchEnabled) {
+    const { createSenateBrowserFetch } = await import('./senateBrowserFetch.ts');
+    const browser = await createSenateBrowserFetch({
+      hideAutomation: opts.hideAutomation ??
+        (typeof process !== 'undefined' && process.env?.SENATE_EFD_HIDE_AUTOMATION === 'true'),
+      headless: opts.browserHeadless ??
+        (typeof process !== 'undefined' ? process.env?.SENATE_EFD_BROWSER_HEADLESS !== 'false' : true),
+      proxyUrl: resolveExplicitSenateProxyUrl(opts),
+    });
+    try {
+      // The browser owns its egress and its cookie jar, so the egress legs do
+      // not apply.  fallback: true keeps the browser-negotiated session out
+      // of the shared KV cache: its cookie header cannot be replayed by the
+      // plain-HTTP path, and the browser context is rebuilt on every run.
+      return await runFlow(browser.fetchImpl, { egress: 'direct', fallback: true });
+    } finally {
+      await browser.close();
+    }
+  }
+
+  return await withSenateEfdEgress(opts, fetchImpl, runFlow);
 }
 // Senate Scraper Hardening applied

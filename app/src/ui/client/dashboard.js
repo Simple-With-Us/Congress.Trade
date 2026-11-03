@@ -552,6 +552,7 @@ function setDocumentTitle(label) {
    whatever title was already showing). */
 var TAB_PAGE_TITLES = { trends: 'Trends', trades: 'Trades', people: 'Directory', subs: 'Delivery' };
 function el(id) { return document.getElementById(id); }
+function scrollBehavior() { try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'; } catch (e) { return 'smooth'; } }
 function clipTextHtml(value, fallback, title) {
   var text = String(value == null || value === '' ? (fallback || '—') : value);
   var cls = text === '—' ? 'clip-text muted' : 'clip-text';
@@ -1559,19 +1560,38 @@ function applySearchToServerParams(p, q) {
 function rowOpenBtnHtml(attrName, attrValue, label) {
   return '<button type="button" class="row-open-btn" ' + attrName + '="' + esc(attrValue) + '">' + esc(label) + '</button>';
 }
+var __tradesLayoutWatchInstalled = false;
+function tradesCardsActive(cards) {
+  // CT-2459: the stylesheet swaps table <-> cards at the phone breakpoints
+  // (max-width:768px / coarse-pointer blocks). Ask the cascade which one is
+  // live instead of duplicating that media-query list here.
+  if (!cards) return false;
+  try { return window.getComputedStyle(cards).display !== 'none'; } catch (e) { return false; }
+}
 function renderTrades() {
-  
+
   var body = el('tradesBody');
   var cards = el('tradesCards');
+  // CT-2459: build only the visible layout. Both used to render on every
+  // poll (a 50-row table AND 50 cards, ~2,000 nodes, one always
+  // display:none). A breakpoint-crossing resize re-renders the other one.
+  var cardsActive = tradesCardsActive(cards);
+  if (!__tradesLayoutWatchInstalled && window.matchMedia) {
+    __tradesLayoutWatchInstalled = true;
+    try {
+      window.matchMedia('(max-width: 768px), (hover: none) and (pointer: coarse)')
+        .addEventListener('change', function () { renderTrades(); });
+    } catch (e) {}
+  }
   var cols = visibleCols();
   if (!cols.length) {
-    body.innerHTML = stateRow(1, 'No columns are visible. Open Columns and enable at least one column.');
-    if (cards) cards.innerHTML = stateCards('No columns are visible. Open Columns and enable at least one column.');
+    if (!cardsActive) body.innerHTML = stateRow(1, 'No columns are visible. Open Columns and enable at least one column.');
+    if (cards && cardsActive) cards.innerHTML = stateCards('No columns are visible. Open Columns and enable at least one column.');
     updateTradesCountMsg(0); return;
   }
   if (!realDataLoaded) {
-    body.innerHTML = stateRow(cols.length, 'Loading live feed…');
-    if (cards) cards.innerHTML = stateCards('Loading live feed…');
+    if (!cardsActive) body.innerHTML = stateRow(cols.length, 'Loading live feed…');
+    if (cards && cardsActive) cards.innerHTML = stateCards('Loading live feed…');
     return;
   }
   var primaryOnly = tradesSourceMode() === 'primary';
@@ -1583,19 +1603,24 @@ function renderTrades() {
   });
   rows = sortRows(rows);
   if (rows.length === 0) {
-    body.innerHTML = stateRow(cols.length, 'No transactions match these filters.');
-    if (cards) cards.innerHTML = stateCards('No transactions match these filters.');
+    if (!cardsActive) body.innerHTML = stateRow(cols.length, 'No transactions match these filters.');
+    if (cards && cardsActive) cards.innerHTML = stateCards('No transactions match these filters.');
     updateTradesCountMsg(0); maybeInitResize(); syncTradesTableWidth(); return;
   }
-  body.innerHTML = rows.map(function (r) {
-    var tds = cols.map(function (c, i) {
-      var cell = c.cell(r);
-      if (i === 0) cell = rowOpenBtnHtml('data-txid', r.id, 'Open trade details') + cell;
-      return '<td class="c-' + c.id + (c.cls ? ' ' + c.cls : '') + '">' + cell + '</td>';
+  if (cardsActive) {
+    if (cards) cards.innerHTML = rows.map(tradesCardHtml).join('');
+    if (body.innerHTML) body.innerHTML = '';
+  } else {
+    body.innerHTML = rows.map(function (r) {
+      var tds = cols.map(function (c, i) {
+        var cell = c.cell(r);
+        if (i === 0) cell = rowOpenBtnHtml('data-txid', r.id, 'Open trade details') + cell;
+        return '<td class="c-' + c.id + (c.cls ? ' ' + c.cls : '') + '">' + cell + '</td>';
+      }).join('');
+      return '<tr class="row clickable" data-txid="' + esc(r.id) + '" title="Open trade details">' + tds + '</tr>';
     }).join('');
-    return '<tr class="row clickable" data-txid="' + esc(r.id) + '" title="Open trade details">' + tds + '</tr>';
-  }).join('');
-  if (cards) cards.innerHTML = rows.map(tradesCardHtml).join('');
+    if (cards && cards.innerHTML) cards.innerHTML = '';
+  }
   updateTradesCountMsg(rows.length);
   maybeInitResize();
   syncTradesTableWidth();
@@ -2996,7 +3021,15 @@ function renderReview() {
   if (canUseAdmin()) setTabBadge('reviewTabBadge', unresolvedTotal);
   if (el('kpiReview') && REVIEW_RESOLVED === 0) el('kpiReview').textContent = fmtCount(unresolvedTotal);
   if (REVIEW.length === 0) {
-    body.innerHTML = stateRow(6, REVIEW_RESOLVED ? 'No reviewed documents yet.' : 'Nothing awaiting review — queue is clear.');
+    var ingestFailN = REVIEW_TOTALS && typeof REVIEW_TOTALS.ingestFailures === 'number'
+      ? REVIEW_TOTALS.ingestFailures
+      : 0;
+    var emptyMsg = REVIEW_RESOLVED
+      ? 'No reviewed documents yet.'
+      : ingestFailN > 0
+        ? 'Nothing in the review queue. Ingest failures (' + fmtCount(ingestFailN) + ') — use GET /api/admin/review-queue/ingest-failures.'
+        : 'Nothing awaiting review — queue is clear.';
+    body.innerHTML = stateRow(6, emptyMsg);
     return;
   }
   body.innerHTML = REVIEW.map(function (r) {
@@ -3872,14 +3905,14 @@ function beginEditSubscription(id) {
   var cancel = el('subsEditCancel');
   if (cancel) cancel.hidden = false;
   if (el('subsMsg')) el('subsMsg').textContent = 'Editing ' + id + ' — update filters/target and save.';
-  try { el('subsCreateRow').scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+  try { el('subsCreateRow').scrollIntoView({ behavior: scrollBehavior(), block: 'center' }); } catch (e) {}
 }
 function saveSubscriptionEdits() {
   if (!EDITING_SUB_ID) return createSubscription();
   if (!isPremium()) { el('subsMsg').textContent = 'Premium required to edit Delivery.'; openPricing('alerts'); return; }
   var delivery = el('newDelivery').value;
   var targetUrl = el('newTarget').value.trim();
-  if (delivery === 'webhook' && !targetUrl) { el('subsMsg').textContent = 'webhook needs a target URL.'; return; }
+  if (delivery === 'webhook' && !targetUrl) { el('subsMsg').textContent = 'webhook needs a target URL.'; var __tgt = el('newTarget'); if (__tgt) { __tgt.setAttribute('aria-invalid', 'true'); __tgt.focus(); } return; }
   var filters = {};
   var tickersRaw = (el('newTickers') && el('newTickers').value || '').split(',').map(function (t) { return t.trim().toUpperCase(); }).filter(Boolean);
   if (tickersRaw.length) filters.tickers = tickersRaw;
@@ -4011,7 +4044,7 @@ function createSubscription() {
   if (!isPremium()) { el('subsMsg').textContent = 'Premium required to create Delivery.'; openPricing('alerts'); return; }
   var delivery = el('newDelivery').value;
   var targetUrl = el('newTarget').value.trim();
-  if (delivery === 'webhook' && !targetUrl) { el('subsMsg').textContent = 'webhook needs a target URL.'; return; }
+  if (delivery === 'webhook' && !targetUrl) { el('subsMsg').textContent = 'webhook needs a target URL.'; var __tgt = el('newTarget'); if (__tgt) { __tgt.setAttribute('aria-invalid', 'true'); __tgt.focus(); } return; }
   var filters = {};
   var tickersRaw = (el('newTickers') && el('newTickers').value || '').split(',').map(function (t) { return t.trim().toUpperCase(); }).filter(Boolean);
   if (tickersRaw.length) filters.tickers = tickersRaw;
@@ -6693,7 +6726,7 @@ function buySellText(buys, sells) {
 	  return '<span class="k-label"><span class="k-full">' + fullHtml + '</span><span class="k-mid">' + esc(mid) + '</span><span class="k-short">' + esc(short) + '</span></span>';
 	}
 	function infoLabel(text, tip) {
-	  return esc(text) + ' <span class="info-tip" tabindex="0" aria-label="' + esc(tip) + '" title="' + esc(tip) + '">ⓘ</span>';
+	  return esc(text) + ' <button type="button" class="info-tip" aria-label="' + esc(tip) + '" title="' + esc(tip) + '">ⓘ</button>';
 	}
 	function kpiInfo(k, v, tip, onClickStr, extraHtml) {
 	  var attr = onClickStr ? ' class="card clickable" onclick="' + esc(onClickStr) + '"' : ' class="card"';
@@ -6740,7 +6773,7 @@ function sparklineHtml(series, metric) {
 function scrollToChart(id) {
   var chart = el(id);
   if (chart) {
-    chart.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    chart.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
     var oldTransition = chart.style.transition;
     var oldOutline = chart.style.outline;
     var oldOffset = chart.style.outlineOffset;
@@ -6812,7 +6845,7 @@ function timeChartHtml(series, labelStep, metric) {
     var sh = vS > 0 ? Math.max(3, Math.round(100 * vS / max)) : 0;
     var lbl = (i % step === 0) ? esc(fmtPeriod(p.period || '')) : '';
 
-    return '<div class="tcol" tabindex="0" data-period="'+esc(p.period||'')+'" ' +
+    return '<div class="tcol" tabindex="0" role="img" aria-label="' + esc(fmtPeriod(p.period || '')) + ': ' + (p.buys || 0) + ' buys, ' + (p.sells || 0) + ' sells" data-period="'+esc(p.period||'')+'" ' +
       'data-b="'+(p.buys||0)+'" data-s="'+(p.sells||0)+'" ' +
       'data-bv="'+(p.estBuyVolUsd||0)+'" data-sv="'+(p.estSellVolUsd||0)+'">' +
       '<div class="tbars">' +
@@ -6821,13 +6854,55 @@ function timeChartHtml(series, labelStep, metric) {
   }).join('') + '</div>';
 }
 
+// CT-2459: Trends used to fire all 13 section requests on view open.
+// Above-the-fold sections load immediately; the rest wait until their
+// container scrolls near the viewport (400px margin). Once a section has
+// loaded once, later filter changes refresh it immediately as before.
+// Errors stay isolated per section because each loader keeps its own
+// .then/.catch exactly as when loadTrends called them directly.
+var __trLoadedOnce = {};
+var __trObserver = null;
+var __trPending = {};
+function loadTrSectionNearViewport(id, fn) {
+  var node = el(id);
+  if (!node || __trLoadedOnce[id] || !('IntersectionObserver' in window)) {
+    __trLoadedOnce[id] = true;
+    fn();
+    return;
+  }
+  __trPending[id] = fn;
+  if (!__trObserver) {
+    __trObserver = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        var pendingId = entry.target.id;
+        var pendingFn = __trPending[pendingId];
+        if (!pendingFn) return;
+        delete __trPending[pendingId];
+        __trLoadedOnce[pendingId] = true;
+        __trObserver.unobserve(entry.target);
+        pendingFn();
+      });
+    }, { rootMargin: '400px 0px' });
+  }
+  __trObserver.observe(node);
+}
 function loadTrends() {
   stampWindowChips();
   syncRisingActivityVisibility();
-  loadTrSummary(); loadTrTickers(); loadTrTrending(); loadTrClusters();
-  loadTrTime(); loadTrSectorFlow(); loadTrCapFlow(); loadTrPerformers();
-  loadTrMembers(); loadTrParties(); loadTrSectors(); loadTrLag();
-  loadTrConflicts();
+  loadTrSummary();
+  loadTrSectionNearViewport('trTickers', loadTrTickers);
+  loadTrSectionNearViewport('trTrending', loadTrTrending);
+  loadTrSectionNearViewport('trClusters', loadTrClusters);
+  loadTrSectionNearViewport('trTime', loadTrTime);
+  loadTrSectionNearViewport('trSectorFlow', loadTrSectorFlow);
+  loadTrSectionNearViewport('trCapFlow', loadTrCapFlow);
+  loadTrSectionNearViewport('trPerformers', loadTrPerformers);
+  loadTrSectionNearViewport('trMembers', loadTrMembers);
+  loadTrSectionNearViewport('trParties', loadTrParties);
+  loadTrSectionNearViewport('trSectors', loadTrSectors);
+  loadTrSectionNearViewport('trLagDist', loadTrLag);
+  loadTrSectionNearViewport('trConflicts', loadTrConflicts);
 }
 function syncRisingActivityVisibility() {
   var fold = el('trRisingFold');
@@ -9683,6 +9758,7 @@ function updateGateRow() {
 }
 
 /* Options menu (Columns + Export CSV) on top/bottom pagers. */
+var __feedOptionsReturnFocus = null;
 function closeFeedOptions() {
   setAll('[data-feed-options-menu]', function (m) { m.classList.remove('open'); });
   setAll('[data-feed-options-btn]', function (b) { b.setAttribute('aria-expanded', 'false'); });
@@ -9696,8 +9772,20 @@ function toggleFeedOptions(btn) {
   if (open) {
     menu.classList.add('open');
     if (btn) btn.setAttribute('aria-expanded', 'true');
+    // CT-2459: move focus into the menu; Escape (below) returns it.
+    __feedOptionsReturnFocus = btn;
+    var first = menu.querySelector('button');
+    if (first) first.focus();
   }
 }
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  var openMenu = document.querySelector('[data-feed-options-menu].open');
+  if (!openMenu) return;
+  closeFeedOptions();
+  if (__feedOptionsReturnFocus) __feedOptionsReturnFocus.focus();
+  __feedOptionsReturnFocus = null;
+});
 document.addEventListener('click', function (e) {
   if (!e.target || !e.target.closest) return;
   if (e.target.closest('.feed-options')) return;
@@ -9843,7 +9931,7 @@ function showView(name, scrollId) {
   if (scrollId) {
     var node = el(scrollId);
     if (node && node.scrollIntoView) {
-      setTimeout(function () { node.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 40);
+      setTimeout(function () { node.scrollIntoView({ behavior: scrollBehavior(), block: 'start' }); }, 40);
     }
   }
 }
@@ -9862,13 +9950,17 @@ document.querySelectorAll('nav.tabs a').forEach(function (b) {
     }
     // Re-tapping the active tab scrolls back to the top instead of
     // re-running the view's loaders.
-    if (b.classList.contains('active') && e && e.isTrusted) { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
-    document.querySelectorAll('nav.tabs a').forEach(function (x) { x.classList.remove('active'); x.setAttribute('aria-selected', 'false'); x.removeAttribute('aria-current'); });
+    if (b.classList.contains('active') && e && e.isTrusted) { window.scrollTo({ top: 0, behavior: scrollBehavior() }); return; }
+    document.querySelectorAll('nav.tabs a').forEach(function (x) { x.classList.remove('active'); x.setAttribute('aria-selected', 'false'); x.removeAttribute('aria-current'); x.setAttribute('tabindex', '-1'); });
     document.querySelectorAll('.view').forEach(function (v) { v.classList.remove('active'); v.setAttribute('aria-hidden', 'true'); });
     b.classList.add('active');
     b.setAttribute('aria-selected', 'true');
     b.setAttribute('aria-current', 'page');
+    b.removeAttribute('tabindex');
     if (TAB_PAGE_TITLES[b.dataset.view]) setDocumentTitle(TAB_PAGE_TITLES[b.dataset.view]);
+    // CT-2459: keep the visually-hidden <h1> in step with the active view.
+    var viewH1 = el('viewH1');
+    if (viewH1) viewH1.textContent = 'Congress.Trade — ' + (TAB_PAGE_TITLES[b.dataset.view] || b.getAttribute('aria-label') || '');
     try { localStorage.setItem('ct-active-tab', b.dataset.view); } catch (e) {}
     /* header.top pads out to the active view's content column (--ct-col-max). */
     document.documentElement.setAttribute('data-view', b.dataset.view);
@@ -9910,6 +10002,32 @@ document.querySelectorAll('nav.tabs a').forEach(function (b) {
   renderSpeedProof();
 })();
 setInterval(refreshSpeedUpdated, 60000);
+
+// CT-2459: complete the tablist keyboard model — roving tabindex (set in
+// the click handler above) plus Arrow/Home/End navigation between visible
+// tabs. Ctrl/cmd-click still opens the real href in a new tab.
+(function initTablistKeys() {
+  var nav = document.querySelector('nav.tabs');
+  if (!nav) return;
+  nav.addEventListener('keydown', function (e) {
+    if (['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) === -1) return;
+    var tabs = Array.prototype.filter.call(
+      nav.querySelectorAll('a[role="tab"]'),
+      function (t) { return !t.hidden && t.offsetParent !== null; },
+    );
+    if (!tabs.length) return;
+    var idx = tabs.indexOf(document.activeElement);
+    if (idx === -1) return;
+    e.preventDefault();
+    var next;
+    if (e.key === 'Home') next = tabs[0];
+    else if (e.key === 'End') next = tabs[tabs.length - 1];
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = tabs[(idx + 1) % tabs.length];
+    else next = tabs[(idx - 1 + tabs.length) % tabs.length];
+    next.focus();
+    next.click();
+  });
+})();
 
 /* Trends controls: re-run on change; ticker rows/cards open the asset drawer. */
 /* no longer binding trWindow/trSource here */ [].forEach(function (id) {
@@ -10005,12 +10123,20 @@ function initBranchInfo(groupId) {
   var canHover = window.matchMedia && window.matchMedia('(hover: hover)').matches;
   if (canHover) {
     btn.addEventListener('mouseenter', function () { setOpen(true); });
-    g.addEventListener('mouseleave', function () { setOpen(false); });
+    g.addEventListener('mouseleave', function () {
+      // CT-2459: never close from under keyboard focus inside the pop.
+      if (pop.contains(document.activeElement)) return;
+      setOpen(false);
+    });
   }
   document.addEventListener('click', function (e) {
     if (!pop.hidden && !g.contains(e.target)) setOpen(false);
   });
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') setOpen(false); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || pop.hidden) return;
+    setOpen(false);
+    btn.focus();
+  });
 }
 initBranchInfo('qFiltersInfo');
 initBranchInfo('trFiltersInfo');

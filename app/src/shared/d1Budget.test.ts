@@ -116,4 +116,33 @@ describe('D1 row budgets', () => {
     expect(totals).toEqual({ read: 7, written: 4 });
     expect(statements.join('\n')).toMatch(/ON CONFLICT\(day\) DO UPDATE SET/);
   });
+
+  it('throttles meter flushes inside the interval but not past the row threshold (CT-2459)', async () => {
+    const { flushD1Budget, recordD1Meta, D1_BUDGET_FLUSH_ROW_THRESHOLD } = await loadBudget({
+      D1_DAILY_ROWS_READ_BUDGET: '100000000',
+      D1_DAILY_ROWS_WRITTEN_BUDGET: '100000000',
+    });
+    const { db, totals } = fakeD1();
+    const env = { DB: db, CONFIG_KV: fakeKv() } as unknown as Env;
+    const t0 = new Date('2036-01-06T00:00:00.000Z');
+
+    recordD1Meta({ rows_read: 5 });
+    await flushD1Budget(env, t0);
+    expect(totals.read).toBe(5);
+
+    // Second flush 1s later with a few rows: throttled, nothing written,
+    // and the pending rows are NOT dropped.
+    recordD1Meta({ rows_read: 3 });
+    await flushD1Budget(env, new Date(t0.getTime() + 1_000));
+    expect(totals.read).toBe(5);
+
+    // After the interval the accumulated rows land.
+    await flushD1Budget(env, new Date(t0.getTime() + 31_000));
+    expect(totals.read).toBe(8);
+
+    // A big pending batch flushes immediately even inside the interval.
+    recordD1Meta({ rows_read: D1_BUDGET_FLUSH_ROW_THRESHOLD });
+    await flushD1Budget(env, new Date(t0.getTime() + 32_000));
+    expect(totals.read).toBe(8 + D1_BUDGET_FLUSH_ROW_THRESHOLD);
+  });
 });
