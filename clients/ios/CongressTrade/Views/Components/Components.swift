@@ -407,7 +407,9 @@ struct CachedAsyncImage: View {
                 image = hit
                 return
             }
-            image = await CachedImageLoader.load(url: url, maxPixelSize: maxPixelSize)
+            image = nil
+            let loaded = await CachedImageLoader.load(url: url, maxPixelSize: maxPixelSize)
+            if !Task.isCancelled { image = loaded }
         }
     }
 }
@@ -578,6 +580,8 @@ struct AssetMark: View {
                     logoImage = hit
                     return
                 }
+                // Never leave one company's logo on a row reused for another.
+                logoImage = nil
                 let loaded = await CachedImageLoader.load(url: themedLogoURL, maxPixelSize: maxPixelSize)
                 // A cancelled load must not blank a logo a newer task has set.
                 if !Task.isCancelled { logoImage = loaded }
