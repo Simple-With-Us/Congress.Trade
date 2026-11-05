@@ -1547,21 +1547,24 @@ export async function checkPipelineHealth(
       auto_resolved_empty: number | null;
       doc_quarantined: number | null;
       oge_text_unreadable: number | null;
+      oge_text_unreadable_docs: number | null;
     }>(
       env.DB,
       `SELECT
          SUM(CASE WHEN action = 'extract_empty_failure' THEN 1 ELSE 0 END) AS extract_empty_failure,
          SUM(CASE WHEN action = 'auto_resolved_empty'   THEN 1 ELSE 0 END) AS auto_resolved_empty,
          SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined,
-         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable
+         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable,
+         COUNT(DISTINCT CASE WHEN action = ? THEN doc_id END) AS oge_text_unreadable_docs
        FROM ingestion_decisions
        WHERE created_at >= ?`,
-      [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
+      [OGE_TEXT_UNREADABLE_DECISION_ACTION, OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
     );
     const ee = Number(res?.extract_empty_failure ?? 0);
     const ar = Number(res?.auto_resolved_empty ?? 0);
     const dq = Number(res?.doc_quarantined ?? 0);
     const unread = Number(res?.oge_text_unreadable ?? 0);
+    const unreadDocs = Number(res?.oge_text_unreadable_docs ?? 0);
     filingSkips24h = ee + ar + dq + unread;
     filingSkipsByAction24h = {
       extract_empty_failure: ee,
@@ -1569,7 +1572,9 @@ export async function checkPipelineHealth(
       doc_quarantined: dq,
       oge_text_unreadable: unread,
     };
-    unreadableExecutiveDocCount = unread;
+    // Distinct unreadable DOCS, not decisions: duplicate unreadable
+    // decisions for the same doc must not inflate the public count.
+    unreadableExecutiveDocCount = unreadDocs;
     if (unread > 0 && includeUnreadableDocIds) {
       try {
         // Most recent failure first: GROUP BY doc_id collapses duplicate
