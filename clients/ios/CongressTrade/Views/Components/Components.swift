@@ -338,24 +338,31 @@ enum MemberPhotoURL {
 
 /// CT-2459: shared downsampling image cache. Bare `AsyncImage` re-decoded
 /// full-size assets on every scroll-back with no memory cache. This loads
-/// once per URL, thumbnail-decodes at display pixels via ImageIO, and
-/// keeps results in a cost-capped NSCache. A previously cached image
-/// renders synchronously (no placeholder flash).
+/// once per URL and pixel size, thumbnail-decodes at display pixels via
+/// ImageIO, and keeps results in a cost-capped NSCache. A previously cached
+/// image renders synchronously (no placeholder flash).
 enum CachedImageLoader {
-    static let cache: NSCache<NSURL, UIImage> = {
-        let c = NSCache<NSURL, UIImage>()
+    static let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
         c.totalCostLimit = 20 * 1024 * 1024
         return c
     }()
 
-    static func cachedImage(for url: URL) -> UIImage? {
-        cache.object(forKey: url as NSURL)
+    /// CT-2461: the pixel size is part of the key. The same logo shows at
+    /// 22-48pt, so a URL-only key upscaled a small Trends thumbnail in the
+    /// larger feed and detail views.
+    private static func cacheKey(url: URL, maxPixelSize: CGFloat) -> NSString {
+        "\(max(1, Int(maxPixelSize)))|\(url.absoluteString)" as NSString
+    }
+
+    static func cachedImage(for url: URL, maxPixelSize: CGFloat) -> UIImage? {
+        cache.object(forKey: cacheKey(url: url, maxPixelSize: maxPixelSize))
     }
 
     /// Image hosts sit behind the same Cloudflare managed challenge as the
     /// API; a default `URLSession.shared` UA can be 502'd. Carry the Safari
     /// iOS UA the API client uses.
-    static let session: URLSession = {
+    static var session: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
@@ -364,7 +371,7 @@ enum CachedImageLoader {
     }()
 
     static func load(url: URL, maxPixelSize: CGFloat) async -> UIImage? {
-        if let hit = cachedImage(for: url) { return hit }
+        if let hit = cachedImage(for: url, maxPixelSize: maxPixelSize) { return hit }
         guard let (data, _) = try? await session.data(from: url) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -375,7 +382,7 @@ enum CachedImageLoader {
               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
         else { return nil }
         let image = UIImage(cgImage: cg)
-        cache.setObject(image, forKey: url as NSURL, cost: data.count)
+        cache.setObject(image, forKey: cacheKey(url: url, maxPixelSize: maxPixelSize), cost: data.count)
         return image
     }
 }
@@ -395,11 +402,14 @@ struct CachedAsyncImage: View {
             }
         }
         .task(id: url) {
-            if let hit = CachedImageLoader.cachedImage(for: url) {
+            let maxPixelSize = pointSize * displayScale
+            if let hit = CachedImageLoader.cachedImage(for: url, maxPixelSize: maxPixelSize) {
                 image = hit
                 return
             }
-            image = await CachedImageLoader.load(url: url, maxPixelSize: pointSize * displayScale)
+            image = nil
+            let loaded = await CachedImageLoader.load(url: url, maxPixelSize: maxPixelSize)
+            if !Task.isCancelled { image = loaded }
         }
     }
 }
@@ -541,30 +551,41 @@ struct AssetMark: View {
         // take zero space so asset + politician names get the width.
         // CT-2459: served from the shared downsampling cache; a cached logo
         // appears synchronously on scroll-back instead of re-decoding.
-        Group {
-            if let logoImage {
-                Image(uiImage: logoImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .padding(size * 0.12)
-                    .frame(width: size, height: size)
-                    .background(
-                        AppTheme.card,
-                        in: RoundedRectangle(cornerRadius: size * 0.22)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: size * 0.22)
-                            .stroke(AppTheme.borderColor, lineWidth: 1)
-                    )
+        // CT-2461: `.task` needs a view that exists before the image does. On
+        // a `Group` holding only `if let logoImage`, it has no child to attach
+        // to, so the load never starts and no logo ever appears.
+        if let themedLogoURL {
+            ZStack {
+                if let logoImage {
+                    Image(uiImage: logoImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding(size * 0.12)
+                        .frame(width: size, height: size)
+                        .background(
+                            AppTheme.card,
+                            in: RoundedRectangle(cornerRadius: size * 0.22)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: size * 0.22)
+                                .stroke(AppTheme.borderColor, lineWidth: 1)
+                        )
+                } else {
+                    Color.clear.frame(width: 0, height: 0)
+                }
             }
-        }
-        .task(id: themedLogoURL) {
-            guard let url = themedLogoURL else { logoImage = nil; return }
-            if let hit = CachedImageLoader.cachedImage(for: url) {
-                logoImage = hit
-                return
+            .task(id: themedLogoURL) {
+                let maxPixelSize = size * displayScale
+                if let hit = CachedImageLoader.cachedImage(for: themedLogoURL, maxPixelSize: maxPixelSize) {
+                    logoImage = hit
+                    return
+                }
+                // Never leave one company's logo on a row reused for another.
+                logoImage = nil
+                let loaded = await CachedImageLoader.load(url: themedLogoURL, maxPixelSize: maxPixelSize)
+                // A cancelled load must not blank a logo a newer task has set.
+                if !Task.isCancelled { logoImage = loaded }
             }
-            logoImage = await CachedImageLoader.load(url: url, maxPixelSize: size * displayScale)
         }
     }
 }
