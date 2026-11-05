@@ -109,7 +109,10 @@ export interface PipelineHealth {
   signals?: {
     filingSkips24h: number | null;
     filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'];
-    /** Doc ids behind `oge_text_unreadable` in the same 24h window. */
+    /** Count of docs behind `oge_text_unreadable` in the same 24h window. */
+    unreadableExecutiveDocCount?: number | null;
+    /** Doc ids behind `oge_text_unreadable` in the same 24h window. Only
+     *  collected for operator-private callers; null in public responses. */
     unreadableExecutiveDocIds?: string[] | null;
     fmpLatency: PipelineSignals['fmpLatency'];
     priceEodLatestDate: string | null;
@@ -166,9 +169,13 @@ export interface PipelineSignals {
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
   filingSkipsByAction24h: Record<FilingSkipAction, number> | null;
+  /** Count of docs behind `oge_text_unreadable` in the same 24h window. */
+  unreadableExecutiveDocCount?: number | null;
   /**
-   * Up to five doc ids behind `oge_text_unreadable` in the same 24h window.
-   * Absent when the ids were not collected.
+   * Up to five doc ids behind `oge_text_unreadable` in the same 24h window,
+   * most recently failed first. Absent when the ids were not collected;
+   * collection is gated on `includeUnreadableDocIds` so public health
+   * responses never carry raw filing identifiers.
    */
   unreadableExecutiveDocIds?: string[] | null;
   /**
@@ -1379,6 +1386,7 @@ export function evaluatePipelineSignals(
     signals: {
       filingSkips24h: s.filingSkips24h,
       filingSkipsByAction24h: s.filingSkipsByAction24h,
+      unreadableExecutiveDocCount: s.unreadableExecutiveDocCount ?? null,
       unreadableExecutiveDocIds: s.unreadableExecutiveDocIds ?? null,
       fmpLatency: s.fmpLatency,
       priceEodLatestDate: s.priceEodLatestDate,
@@ -1467,7 +1475,14 @@ export async function checkPipelineHealth(
   env: Env,
   now = new Date(),
   precomputed: { emptyFetch?: EmptyFetchHandoffSnapshot } = {},
+  opts: { includeUnreadableDocIds?: boolean } = {},
 ): Promise<PipelineHealth> {
+  // Raw unreadable-filing doc ids are operator-private diagnostics: public
+  // /health responses must not disclose them, so callers serving
+  // unauthenticated traffic pass includeUnreadableDocIds: false and get
+  // unreadableExecutiveDocCount only. Defaults to true so existing
+  // operator-private callers (loud alerts, admin surface) keep the names.
+  const includeUnreadableDocIds = opts.includeUnreadableDocIds ?? true;
   const nowMs = now.getTime();
   const iso24hAgo = new Date(nowMs - 24 * 3600 * 1000).toISOString();
   // 2026-10-04: read the live probe schedule from env so a legally slower
@@ -1508,6 +1523,7 @@ export async function checkPipelineHealth(
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
   let unreadableExecutiveDocIds: string[] | null = null;
+  let unreadableExecutiveDocCount: number | null = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
   let fmpLatency: PipelineSignals['fmpLatency'] = null;
 
@@ -1553,12 +1569,17 @@ export async function checkPipelineHealth(
       doc_quarantined: dq,
       oge_text_unreadable: unread,
     };
-    if (unread > 0) {
+    unreadableExecutiveDocCount = unread;
+    if (unread > 0 && includeUnreadableDocIds) {
       try {
+        // Most recent failure first: GROUP BY doc_id collapses duplicate
+        // decisions for the same doc, and ordering by MAX(created_at)
+        // surfaces the filing that just failed instead of alphabetically
+        // early ids.
         const rows = await all<{ doc_id: string | null }>(
           env.DB,
-          `SELECT DISTINCT doc_id FROM ingestion_decisions
-           WHERE action = ? AND created_at >= ? ORDER BY doc_id LIMIT 5`,
+          `SELECT doc_id, MAX(created_at) AS latest_at FROM ingestion_decisions
+           WHERE action = ? AND created_at >= ? GROUP BY doc_id ORDER BY latest_at DESC LIMIT 5`,
           [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
         );
         unreadableExecutiveDocIds = rows.map((r) => r.doc_id ?? '').filter((id) => id.length > 0);
@@ -2020,6 +2041,7 @@ export async function checkPipelineHealth(
     spxEodLatestDate,
     filingSkips24h,
     filingSkipsByAction24h,
+    unreadableExecutiveDocCount,
     unreadableExecutiveDocIds,
     fmpLatency,
     deliveryParked,
