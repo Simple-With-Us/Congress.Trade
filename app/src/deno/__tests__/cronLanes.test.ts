@@ -5,7 +5,7 @@ import { D1DatabaseShim } from '../shims.ts';
 
 const mocks = vi.hoisted(() => ({
   marketData: vi.fn(async () => 'ran' as const),
-  peerPriceCatchUp: vi.fn(async () => 'ran' as const),
+  peerPriceCatchUp: vi.fn(async (): Promise<'ran' | 'stamped'> => 'ran'),
   snapshot: vi.fn(async () => 'ran' as const),
   filer: vi.fn(async () => 'ran' as const),
   retention: vi.fn(async () => 'ran' as const),
@@ -114,6 +114,18 @@ describe('daily lane cron windows', () => {
     expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
     expect(mocks.peerPriceCatchUp.mock.calls[0][2]).toHaveProperty('signal');
     expect(mocks.marketData).not.toHaveBeenCalled();
+  });
+
+  it('reports a gated catch-up firing as skipped-gated, so the firing is visible in the lane log', async () => {
+    const { env } = await makeEnv();
+    mocks.peerPriceCatchUp.mockResolvedValueOnce('stamped');
+    const lane = DAILY_LANE_CRONS.find((l) => l.name === 'peer-price-catchup')!;
+    const result = await runDailyLane(lane, env, new Date(), 10_000);
+    // registerDailyLaneCrons suppresses the 'stamped' status line;  the lane
+    // maps the catch-up's gate refusal so a parked or capped drain still
+    // leaves a log line.
+    expect(result.status).toBe('skipped-gated');
+    expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
   });
 
   it('skips the catch-up lane when another isolate holds its singleton lock', async () => {

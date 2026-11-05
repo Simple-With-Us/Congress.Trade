@@ -5,7 +5,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   freshPeerPriceCatchUpState,
+  isProviderLevelPriceError,
   parsePeerPriceCatchUpState,
+  PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION,
   PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS,
   PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
   PEER_PRICE_CATCHUP_MIN_SPACING_MS,
@@ -27,10 +29,15 @@ describe('parsePeerPriceCatchUpState', () => {
 
   it('keeps a valid same-session state, and restarts on any malformed field', () => {
     const good = { freshThrough: SESSION, runs: 3, lastRunAt: NOW.toISOString(), noProgressRuns: 1, cursorSeq: 42 };
-    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION)).toEqual(good);
+    // A state stored before the attempts bound has no attempts field;  it
+    // parses with attempts approximated by the spent-run count.
+    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION)).toEqual({ ...good, attempts: 3 });
+    const withAttempts = { ...good, attempts: 11 };
+    expect(parsePeerPriceCatchUpState(JSON.stringify(withAttempts), SESSION)).toEqual(withAttempts);
     for (const bad of [
       { ...good, runs: -1 },
       { ...good, runs: 1.5 },
+      { ...good, attempts: -2 },
       { ...good, cursorSeq: 'y' },
       { ...good, lastRunAt: 7 },
       { freshThrough: SESSION },
@@ -57,6 +64,14 @@ describe('peerPriceCatchUpGate', () => {
 
   it('stops at the per-session run cap', () => {
     expect(peerPriceCatchUpGate({ ...base, runs: PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION }, NOW)).toBe('session-cap');
+  });
+
+  it('stops at the per-session attempt cap even when every run was refunded', () => {
+    // The no-engagement loop bound:  runs handed back, attempts never are.
+    const refundedDry = { ...base, runs: 0, attempts: PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION };
+    expect(peerPriceCatchUpGate(refundedDry, NOW)).toBe('session-cap');
+    const oneLeft = { ...base, runs: 0, attempts: PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION - 1 };
+    expect(peerPriceCatchUpGate(oneLeft, NOW)).toBe('ok');
   });
 
   it('parks after consecutive runs with no progress', () => {
@@ -115,6 +130,18 @@ describe('peerPriceCatchUpAfterRun', () => {
     expect(peerPriceCatchUpGate(refunded, new Date(Date.parse(claimed.lastRunAt!) + 56 * 60_000))).toBe('ok');
   });
 
+  it('never hands the attempt count back, so refunded runs still reach the attempt cap', () => {
+    const claimedAttempt = { ...claimed, attempts: PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION };
+    const refunded = peerPriceCatchUpAfterRun(claimedAttempt, {
+      pendingBefore: 20, pendingAfter: 20, lastCursorSeq: null, reachedEndOfPending: false,
+      failed: true, spendRun: false,
+    });
+    expect(refunded.runs).toBe(0);
+    expect(refunded.attempts).toBe(PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION);
+    const later = new Date(Date.parse(claimed.lastRunAt!) + 56 * 60_000);
+    expect(peerPriceCatchUpGate(refunded, later)).toBe('session-cap');
+  });
+
   it('wraps to the head after reaching the end, and keeps the cursor when nothing was reached', () => {
     const wrapped = peerPriceCatchUpAfterRun({ ...claimed, cursorSeq: 400 }, {
       pendingBefore: 20, pendingAfter: 10, lastCursorSeq: 900, reachedEndOfPending: true,
@@ -132,5 +159,20 @@ describe('peerPriceSnapshotNeedsCatchUp', () => {
     expect(peerPriceSnapshotNeedsCatchUp({ freshThrough: SESSION, corpusFresh: false, pending: 0 })).toBe(true);
     expect(peerPriceSnapshotNeedsCatchUp({ freshThrough: SESSION, corpusFresh: true, pending: 1427 })).toBe(true);
     expect(peerPriceSnapshotNeedsCatchUp({ freshThrough: SESSION, corpusFresh: true, pending: 5 })).toBe(false);
+  });
+});
+
+describe('isProviderLevelPriceError', () => {
+  it('recognizes provider outages: 5xx, network failure, and corpus lag', () => {
+    expect(isProviderLevelPriceError('ASGN: PEER_HTTP_503')).toBe(true);
+    expect(isProviderLevelPriceError('spx: PEER_HTTP_500')).toBe(true);
+    expect(isProviderLevelPriceError('ASGN: PEER_HTTP_0:fetch failed')).toBe(true);
+    expect(isProviderLevelPriceError('ASGN: PEER_STALE_RESPONSE (corpus not fresh)')).toBe(true);
+  });
+
+  it('treats anything else as a ticker-level failure, including fatal-class statuses that abort before classification', () => {
+    expect(isProviderLevelPriceError('ASGN: unexpected payload shape')).toBe(false);
+    expect(isProviderLevelPriceError('ASGN: PEER_HTTP_400')).toBe(false);
+    expect(isProviderLevelPriceError('ASGN: PEER_HTTP_429')).toBe(false);
   });
 });

@@ -26,3 +26,13 @@ The fix has two parts.  The catch-up now also runs from its own hourly cron lane
 
 - The market-data stamped fast path still calls the catch-up as well.  It is redundant with the dedicated lane but harmless (the KV gate dedupes), and removing it is a separate cleanup.
 - No-engagement runs still run the first-claim EOD-to-current-price backfill scan, because the claim presents as run 1 each time until a run engages.  The scan is NULL-only and idempotent; revisit if it shows up in lane timings.
+
+## Review follow-up (2026-11-05)
+
+PR review (Kody, Sentry) found that the no-engagement exemption, as first written, disabled both of the catch-up's bounds for any zero-priced run with errors: a pending set the provider errors on at the ticker level would have retried hourly without ever parking or spending budget.  The exemption is now narrowed and bounded, and the gated lane is observable:
+
+- Classification: a run counts as no-engagement only when it priced zero tickers and EVERY recorded error is provider-level (`PEER_HTTP_5xx`, `PEER_HTTP_0` network failure, or the corpus-lag stale-response entry).  Any ticker-level failure in the run makes it engaged — it spends a run and counts toward the park.
+- Bound: the persisted catch-up state carries an `attempts` count, incremented on every claim and never handed back.  The gate stops the session at 24 attempts, so even a genuine all-day outage is hard-bounded per session while still recovering on the first tick after the provider returns (attempts span a full session day at the 55-minute spacing).
+- Observability: the `peer-price-catchup` lane maps the gate's `stamped` result to `skipped-gated`, so a parked or capped firing leaves a line in the lane log instead of being suppressed with the date-stamped lanes.
+
+One review item was declined with reasoning on the PR: gating the hourly lane behind a per-run operator flag would re-create the failure this change fixes (recovery depended on a human noticing); the catch-up's autonomous operation predates this PR — it already ran from the market-data lane's stamped fast path — and this change only decouples its trigger and bounds it.
