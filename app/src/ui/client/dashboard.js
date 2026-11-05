@@ -5,6 +5,8 @@ var TRADES = [];          // live transactions (newest first)
 var TRADE_BY_ID = {};     // trade id -> row, including mini-list rows cached from drawers
 var REVIEW = [];          // review-queue items
 var REVIEW_TOTALS = null; // aggregate queue counts returned with the current page
+var REVIEW_FAILURES = null; // failure sections embedded by GET /review-queue?include=… (pending tab only)
+var REVIEW_SENATE_INTAKE = null; // Senate intake relay heartbeat carried by every /review-queue response
 var DECISIONS = [];       // ingestion decision audit rows
 var REVIEW_RUNS = {};     // docId -> full extraction runs loaded on demand
 var REVIEW_CONSENSUS = {}; // docId -> { rows, summary } | null, loaded alongside REVIEW_RUNS
@@ -2677,14 +2679,34 @@ function loadReview() {
   if (!canUseAdmin()) {
     REVIEW = [];
     REVIEW_TOTALS = null;
+    REVIEW_FAILURES = null;
+    REVIEW_SENATE_INTAKE = null;
+    if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
+    if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
     if (el('reviewTabBadge')) { el('reviewTabBadge').hidden = true; el('reviewTabBadge').textContent = ''; el('reviewTabBadge').classList.remove('is-on'); }
     if (el('kpiReview')) el('kpiReview').textContent = '—';
     return Promise.resolve();
   }
   // API HOOK: GET /api/admin/review-queue?resolved=
-  return fetch('/api/admin/review-queue?resolved=' + REVIEW_RESOLVED, { headers: adminHeaders() })
+  // The pending tab also embeds the pipeline failure sections; the Senate
+  // intake relay heartbeat rides on every response either way.
+  var reviewUrl = '/api/admin/review-queue?resolved=' + REVIEW_RESOLVED +
+    (REVIEW_RESOLVED === 0 ? '&include=ingest_failures,dead_letters,dlq_failed' : '');
+  return fetch(reviewUrl, { headers: adminHeaders() })
     .then(okOrThrow)
-    .then(function (data) { REVIEW = data.items || []; REVIEW_TOTALS = data.totals || null; renderReview(); loadDecisionHistory(); })
+    .then(function (data) {
+      REVIEW = data.items || [];
+      REVIEW_TOTALS = data.totals || null;
+      REVIEW_SENATE_INTAKE = data.senateIntake || null;
+      REVIEW_FAILURES = REVIEW_RESOLVED === 0 ? {
+        ingestFailures: data.ingestFailures || null,
+        deadLetters: data.deadLetters || null,
+        dlqFailed: data.dlqFailed || null,
+        dlqFailedAvailable: data.dlqFailedAvailable !== false,
+      } : null;
+      renderReview();
+      loadDecisionHistory();
+    })
     .catch(function (e) {
       el('reviewBody').innerHTML = stateRow(6, isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load review queue: ' + e.message));
     });
@@ -3020,15 +3042,11 @@ function renderReview() {
   var unresolvedTotal = REVIEW_TOTALS && typeof REVIEW_TOTALS.unresolved === 'number' ? REVIEW_TOTALS.unresolved : REVIEW.length;
   if (canUseAdmin()) setTabBadge('reviewTabBadge', unresolvedTotal);
   if (el('kpiReview') && REVIEW_RESOLVED === 0) el('kpiReview').textContent = fmtCount(unresolvedTotal);
+  renderReviewPanels();
   if (REVIEW.length === 0) {
-    var ingestFailN = REVIEW_TOTALS && typeof REVIEW_TOTALS.ingestFailures === 'number'
-      ? REVIEW_TOTALS.ingestFailures
-      : 0;
     var emptyMsg = REVIEW_RESOLVED
       ? 'No reviewed documents yet.'
-      : ingestFailN > 0
-        ? 'Nothing in the review queue. Ingest failures (' + fmtCount(ingestFailN) + ') — use GET /api/admin/review-queue/ingest-failures.'
-        : 'Nothing awaiting review — queue is clear.';
+      : 'Nothing awaiting review — queue is clear.';
     body.innerHTML = stateRow(6, emptyMsg);
     return;
   }
@@ -3068,6 +3086,139 @@ function renderReview() {
     '</tr>';
   }).join('');
 }
+/* ============================ REVIEW FAILURE PANELS ============================
+   The pending tab embeds the pipeline failure sections the queue used to
+   hide: ingest failures (grouped by what actually went wrong), ingestion
+   outbox dead letters, and durable-queue rows in terminal failed state.
+   The Senate intake relay heartbeat renders above them — it is the
+   headless automation feed the Senate half of this queue depends on. */
+
+function reviewAgoText(ageMs) {
+  if (ageMs == null || !Number.isFinite(ageMs) || ageMs < 0) return '—';
+  var sec = Math.floor(ageMs / 1000);
+  if (sec < 60) return 'just now';
+  var min = Math.floor(sec / 60);
+  if (min < 60) return min + 'm ago';
+  var hr = Math.floor(min / 60);
+  if (hr < 48) { var remMin = min % 60; return hr + 'h' + (remMin ? ' ' + remMin + 'm' : '') + ' ago'; }
+  return Math.floor(hr / 24) + 'd ago';
+}
+
+function reviewAgeMs(iso) {
+  var t = iso ? Date.parse(iso) : NaN;
+  return Number.isFinite(t) ? Math.max(0, Date.now() - t) : null;
+}
+
+/* Buckets an ingest-failure error string by what the operator should
+   expect next: the pipeline retries retry-in-flight rows on its own; the
+   rest need a human. Grounded in fetcher.ts's markError message shapes. */
+function classifyIngestFailure(error) {
+  var e = String(error || '');
+  if (!e) return 'ingest error';
+  if (/agreement wall|edge[- ]deny/i.test(e)) return 'retry-in-flight';
+  if (/-> HTTP (404|410)\b/.test(e)) return 'retry-in-flight';
+  if (/^fetcher:/i.test(e)) return 'download failed';
+  return 'ingest error';
+}
+
+var FAILURE_CLASS_LABELS = {
+  'download failed': 'Download Failed',
+  'ingest error': 'Ingest Error',
+  'retry-in-flight': 'Retry in Flight',
+};
+
+function failureSectionHtml(title, rowsHtml) {
+  return '<div style="margin-top:14px"><h4 style="margin:0 0 6px">' + esc(title) + '</h4>' +
+    '<div class="review-table-wrap"><table><tbody>' + rowsHtml + '</tbody></table></div></div>';
+}
+
+function ingestFailureRowHtml(f) {
+  var doc = f.sourceUrl
+    ? '<a href="' + esc(f.sourceUrl) + '" target="_blank" rel="noopener">' + esc(f.docId) + '</a>'
+    : esc(f.docId);
+  return '<tr class="row">' +
+    '<td>' + doc + '<div class="muted">' + esc(f.chamber || '') + (f.filingType ? ' · ' + esc(f.filingType) : '') + '</div></td>' +
+    '<td class="muted">' + esc(f.filerName || f.filerId || '—') + '</td>' +
+    '<td class="muted" style="max-width:420px">' + esc(f.error || '—') + (f.errorTruncated ? '…' : '') + '</td>' +
+    '<td class="muted">' + esc(reviewAgoText(reviewAgeMs(f.lastAttemptAt))) + '</td>' +
+  '</tr>';
+}
+
+function deadLetterRowHtml(d) {
+  return '<tr class="row">' +
+    '<td>' + esc(d.docId) + '<div class="muted">' + esc(d.chamber || '') + '</div></td>' +
+    '<td class="muted">' + fmtCount(d.attempts) + ' attempts · ' + fmtCount(d.deadLetterCycles) + ' dead-letter cycles</td>' +
+    '<td class="muted" style="max-width:420px">' + esc(d.error || '—') + (d.errorTruncated ? '…' : '') + '</td>' +
+    '<td class="muted">' + esc(reviewAgoText(reviewAgeMs(d.updatedAt))) + '</td>' +
+  '</tr>';
+}
+
+function dlqFailedRowHtml(d) {
+  return '<tr class="row">' +
+    '<td>' + esc(d.queueName || '—') + '<div class="muted">' + esc(d.type || '') + (d.dedupeKey ? ' · ' + esc(d.dedupeKey) : '') + '</div></td>' +
+    '<td class="muted">' + fmtCount(d.attempts) + ' attempts · ' + fmtCount(d.deadLetterCycles) + ' dead-letter cycles</td>' +
+    '<td class="muted" style="max-width:420px">' + esc(d.error || '—') + (d.errorTruncated ? '…' : '') + '</td>' +
+    '<td class="muted">' + esc(reviewAgoText(reviewAgeMs(d.updatedAt))) + '</td>' +
+  '</tr>';
+}
+
+function renderReviewPanels() {
+  var relayEl = el('reviewRelayStatus');
+  if (relayEl) {
+    var s = REVIEW_SENATE_INTAKE;
+    if (!s) {
+      relayEl.innerHTML = '<p class="note">Senate Intake Relay: no relay recorded yet. The Mac eFD fetcher has not called the intake endpoint since this status began recording.</p>';
+    } else {
+      var bits = ['last relay ' + reviewAgoText(typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt))];
+      bits.push(fmtCount(s.received) + ' rows received');
+      bits.push(fmtCount(s.newCount) + ' new filings');
+      if (s.rejected) bits.push(fmtCount(s.rejected) + ' rejected');
+      if (s.dryRun) bits.push('dry run');
+      var staleWarn = s.stale
+        ? ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes, so a relay this old means the Mac fetcher is down or blocked.</strong>'
+        : '';
+      relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(bits.join(' · ')) + staleWarn + '</p>';
+    }
+  }
+  var failEl = el('reviewFailures');
+  if (!failEl) return;
+  if (REVIEW_RESOLVED !== 0) { failEl.innerHTML = ''; return; }
+  var totals = REVIEW_TOTALS || {};
+  var f = REVIEW_FAILURES;
+  var sections = [];
+  if (f && f.ingestFailures) {
+    var groups = { 'download failed': [], 'ingest error': [], 'retry-in-flight': [] };
+    f.ingestFailures.forEach(function (row) { groups[classifyIngestFailure(row.error)].push(row); });
+    ['download failed', 'ingest error', 'retry-in-flight'].forEach(function (cls) {
+      if (!groups[cls].length) return;
+      sections.push(failureSectionHtml(
+        'Ingest Failures — ' + FAILURE_CLASS_LABELS[cls] + ' (' + fmtCount(groups[cls].length) + ')',
+        groups[cls].map(ingestFailureRowHtml).join('')));
+    });
+    var totalIngest = typeof totals.ingestFailures === 'number' ? totals.ingestFailures : f.ingestFailures.length;
+    if (totalIngest > f.ingestFailures.length) {
+      sections.push('<p class="note">Showing the ' + fmtCount(f.ingestFailures.length) + ' most recent of ' + fmtCount(totalIngest) + ' ingest failures.</p>');
+    }
+  }
+  if (typeof totals.publishedStatusStale === 'number' && totals.publishedStatusStale > 0) {
+    sections.push('<p class="note">' + fmtCount(totals.publishedStatusStale) + ' published filings still carry a stale error status (counted only — the filings themselves are live).</p>');
+  }
+  if (f && f.deadLetters && f.deadLetters.length) {
+    sections.push(failureSectionHtml(
+      'Dead Letters — Ingestion Outbox (' + fmtCount(f.deadLetters.length) + ')',
+      f.deadLetters.map(deadLetterRowHtml).join('')));
+  }
+  if (f && f.dlqFailedAvailable === false) {
+    sections.push('<p class="note">Durable queue table unavailable — its failed rows cannot be listed.</p>');
+  } else if (f && f.dlqFailed && f.dlqFailed.length) {
+    sections.push(failureSectionHtml(
+      'Dead Letters — Durable Queue (' + fmtCount(f.dlqFailed.length) + ')',
+      f.dlqFailed.map(dlqFailedRowHtml).join('')));
+  }
+  if (!sections.length && f) sections.push('<p class="note">No pipeline failures.</p>');
+  failEl.innerHTML = sections.join('');
+}
+
 /* Expand/collapse a per-document model-comparison panel beneath its row. */
 function toggleModels(docId) {
   var existing = el('mdl-' + docId);

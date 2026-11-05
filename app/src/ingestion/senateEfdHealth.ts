@@ -7,7 +7,7 @@
  * senateSource.ts.  The old unproxied direct GET was dropped (owner ruling
  * 2026-10-16) because datacenter egress is a structural 403 that said nothing
  * about whether ingestion works.  Each probe sends eFD one agreement POST, so
- * it dials at most every 30 minutes and not at all while the watcher's
+ * it dials at most twice a day and not at all while the watcher's
  * edge-deny backoff is active (CT-2442).
  */
 
