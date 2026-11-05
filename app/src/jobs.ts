@@ -465,7 +465,12 @@ export async function runNotCoveredRecheckLane(
 
 /**
  * Bounded peer-price catch-up (CT-2445), run from the stamped market-data
- * fast path on every hourly tick.  Order matters for cost:  the KV-only gate
+ * fast path on every hourly tick AND from its own `peer-price-catchup` cron
+ * lane (deno/cronLanes.ts), so the drain does not depend on the market-data
+ * lane's daily stamp:  a full lane that cannot complete (deadline abort on a
+ * deep backlog) never stamps, and a stamp-gated drain would never engage.
+ * The KV gate below makes the extra entry point a cheap no-op when a run is
+ * not due.  Order matters for cost:  the KV-only gate
  * (session cap, no-progress park, spacing) runs before any D1 read, and the
  * run is claimed in KV before any Socratic.Trade call, so a throw or a 429
  * abort still waits out the spacing instead of retrying every tick.
@@ -517,6 +522,7 @@ export async function maybeRunPeerPriceCatchUp(
   let status: DailyLaneStatus = 'ran';
   let lastCursorSeq: number | null = null;
   let reachedEndOfPending = false;
+  let refresh: { aborted?: boolean; tickersPriced?: number; errors: string[] } | null = null;
   try {
     const configured = stPeerMaxPerMinute(await resolveSecrets(env, [...ST_PEER_PACE_SECRET_NAMES]));
     const maxPerMinute = Math.min(configured ?? PEER_PRICE_CATCHUP_MAX_PER_MINUTE, PEER_PRICE_CATCHUP_MAX_PER_MINUTE);
@@ -527,6 +533,7 @@ export async function maybeRunPeerPriceCatchUp(
       signal: opts.signal,
       afterCursorSeq: claimed.cursorSeq,
     });
+    refresh = r;
     lastCursorSeq = r.lastCursorSeq ?? null;
     reachedEndOfPending = r.reachedEndOfPending === true;
     if (r.aborted) status = 'error';
@@ -534,6 +541,18 @@ export async function maybeRunPeerPriceCatchUp(
     console.warn('daily price refresh failed:', (err as Error).message);
     status = 'error';
   }
+
+  // No-engagement run (the outage signature):  the refresh completed without
+  // pricing a single ticker and its attempts recorded provider errors.  A 503
+  // from ST is non-fatal per ticker, so an ST outage produces exactly this —
+  // a "completed" run that never engaged ST's data path.  It must not count
+  // toward the no-progress park, and it hands its session claim back, or an
+  // outage eats the whole session budget and the drain stays gated for hours
+  // after ST recovers (observed 2026-11-04:  ST back at 7:42 PM, the 8:07 PM
+  // tick still gated, 712 tickers pending, no progress since Nov 3 12:59 AM).
+  const providerNeverEngaged =
+    status !== 'error' && refresh !== null && !refresh.aborted &&
+    (refresh.tickersPriced ?? 0) === 0 && refresh.errors.length > 0;
 
   // Same clock as the before-count, so both count the same pending set even
   // when the run crosses the midnight-ET rollover.
@@ -543,7 +562,8 @@ export async function maybeRunPeerPriceCatchUp(
     pendingAfter: after?.pending ?? null,
     lastCursorSeq,
     reachedEndOfPending,
-    failed: status === 'error',
+    failed: status === 'error' || providerNeverEngaged,
+    spendRun: !providerNeverEngaged,
   });
   console.log(
     'price catch-up:',
@@ -555,6 +575,7 @@ export async function maybeRunPeerPriceCatchUp(
       pendingAfter: after?.pending ?? null,
       noProgressRuns: next.noProgressRuns,
       cursorSeq: next.cursorSeq,
+      providerNeverEngaged,
     }),
   );
   try {

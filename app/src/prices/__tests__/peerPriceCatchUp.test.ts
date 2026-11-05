@@ -93,11 +93,26 @@ describe('peerPriceCatchUpAfterRun', () => {
       pendingBefore: 20, pendingAfter: 20, lastCursorSeq: null, reachedEndOfPending: false, failed: true,
     });
     expect(failed.noProgressRuns).toBe(1);
+    expect(failed.runs).toBe(1);
     // A failed run that still shrank pending resets it like any other.
     const partial = peerPriceCatchUpAfterRun(claimed, {
       pendingBefore: 20, pendingAfter: 12, lastCursorSeq: 5, reachedEndOfPending: false, failed: true,
     });
     expect(partial.noProgressRuns).toBe(0);
+  });
+
+  it('hands the session claim back for a no-engagement run (spendRun false)', () => {
+    const refunded = peerPriceCatchUpAfterRun(claimed, {
+      pendingBefore: 20, pendingAfter: 20, lastCursorSeq: null, reachedEndOfPending: false,
+      failed: true, spendRun: false,
+    });
+    // The claim (runs 1, stamped before the run) is handed back, so the
+    // session budget survives an outage; the park count is untouched, and
+    // lastRunAt stays stamped so spacing still throttles the retry.
+    expect(refunded.runs).toBe(0);
+    expect(refunded.noProgressRuns).toBe(1);
+    expect(refunded.lastRunAt).toBe(claimed.lastRunAt);
+    expect(peerPriceCatchUpGate(refunded, new Date(Date.parse(claimed.lastRunAt!) + 56 * 60_000))).toBe('ok');
   });
 
   it('wraps to the head after reaching the end, and keeps the cursor when nothing was reached', () => {

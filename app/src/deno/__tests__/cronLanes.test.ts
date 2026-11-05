@@ -5,6 +5,7 @@ import { D1DatabaseShim } from '../shims.ts';
 
 const mocks = vi.hoisted(() => ({
   marketData: vi.fn(async () => 'ran' as const),
+  peerPriceCatchUp: vi.fn(async () => 'ran' as const),
   snapshot: vi.fn(async () => 'ran' as const),
   filer: vi.fn(async () => 'ran' as const),
   retention: vi.fn(async () => 'ran' as const),
@@ -20,6 +21,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../jobs.ts', () => ({
   maybeRunDailyMarketDataJobs: mocks.marketData,
+  maybeRunPeerPriceCatchUp: mocks.peerPriceCatchUp,
   maybeRunDailySnapshotJob: mocks.snapshot,
   maybeRunDailyFilerJobs: mocks.filer,
   maybeRunDailyRetentionJobs: mocks.retention,
@@ -63,10 +65,10 @@ describe('daily lane cron windows', () => {
     vi.clearAllMocks();
   });
 
-  it('has six lanes with unique names, hourly schedules, off-peak minutes, and snapshot after market data', () => {
-    expect(DAILY_LANE_CRONS).toHaveLength(6);
+  it('has seven lanes with unique names, hourly schedules, off-peak minutes, and snapshot after market data', () => {
+    expect(DAILY_LANE_CRONS).toHaveLength(7);
     const names = DAILY_LANE_CRONS.map((l) => l.name);
-    expect(new Set(names).size).toBe(6);
+    expect(new Set(names).size).toBe(7);
     const minuteOf = (schedule: string) => Number(schedule.split(' ')[0]);
     const minutes = DAILY_LANE_CRONS.map((l) => minuteOf(l.schedule));
     // Every lane is hourly with a fixed minute.
@@ -79,7 +81,7 @@ describe('daily lane cron windows', () => {
     }
     // Snapshot must fire after the market-data lane it captures.
     expect(minuteOf('22 * * * *')).toBeGreaterThan(minuteOf('7 * * * *'));
-    const order = ['daily-market-data', 'daily-snapshot', 'daily-filer', 'hourly-enrichment', 'autonomy-sweeps', 'daily-retention'];
+    const order = ['daily-market-data', 'peer-price-catchup', 'daily-snapshot', 'daily-filer', 'hourly-enrichment', 'autonomy-sweeps', 'daily-retention'];
     expect(names).toEqual(order);
   });
 
@@ -92,6 +94,8 @@ describe('daily lane cron windows', () => {
     }
     expect(mocks.marketData).toHaveBeenCalledTimes(1);
     expect(mocks.marketData.mock.calls[0][2]).toHaveProperty('signal');
+    expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
+    expect(mocks.peerPriceCatchUp.mock.calls[0][2]).toHaveProperty('signal');
     expect(mocks.snapshot).toHaveBeenCalledTimes(1);
     expect(mocks.filer).toHaveBeenCalledTimes(1);
     expect(mocks.retention).toHaveBeenCalledTimes(1);
@@ -99,6 +103,29 @@ describe('daily lane cron windows', () => {
     expect(mocks.hourlyEnrichment.mock.calls[0][2]).toMatchObject({ deadlineMs: 480_000 });
     expect(mocks.autonomySweeps).toHaveBeenCalledTimes(1);
     expect(mocks.autonomySweeps.mock.calls[0][2]).toHaveProperty('signal');
+  });
+
+  it('runs the peer-price catch-up on its own lane, independent of the market-data lane', async () => {
+    const { env } = await makeEnv();
+    const lane = DAILY_LANE_CRONS.find((l) => l.name === 'peer-price-catchup')!;
+    expect(lane.schedule).toBe('17 * * * *');
+    const result = await runDailyLane(lane, env, new Date(), 10_000);
+    expect(result.status).toBe('ran');
+    expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
+    expect(mocks.peerPriceCatchUp.mock.calls[0][2]).toHaveProperty('signal');
+    expect(mocks.marketData).not.toHaveBeenCalled();
+  });
+
+  it('skips the catch-up lane when another isolate holds its singleton lock', async () => {
+    const { env, client } = await makeEnv();
+    await client.execute({
+      sql: `INSERT INTO deno_runtime_kv (namespace, key, value, expires_at) VALUES ('locks', 'peer-price-catchup', 'other-token', ?)`,
+      args: [Date.now() + 60_000],
+    });
+    const lane = DAILY_LANE_CRONS.find((l) => l.name === 'peer-price-catchup')!;
+    const result = await runDailyLane(lane, env, new Date(), 10_000);
+    expect(result.status).toBe('skipped-overlap');
+    expect(mocks.peerPriceCatchUp).not.toHaveBeenCalled();
   });
 });
 

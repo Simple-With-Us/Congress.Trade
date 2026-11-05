@@ -34,6 +34,15 @@ import {
  *   not shrink the pending count (tickers ST keeps erroring on, or no
  *   provider).  Failed runs do not count toward the park, but they do spend
  *   the session's run budget, so 429s cannot retry more than 8 times.
+ * - No-engagement runs (CT-2445 follow-up, 2026-11-04):  a completed run that
+ *   priced zero tickers and recorded provider errors on its attempts never
+ *   engaged ST's data path at all — the outage signature (ST answering 503
+ *   is non-fatal per ticker, so the walk "completes").  Such a run says
+ *   nothing about coverage, so it does not count toward the park, and it
+ *   hands its session claim back instead of spending the run budget.
+ *   Without this, an outage eats the session's park and budget, and the
+ *   drain stays gated for hours after ST recovers.  Spacing still applies,
+ *   so the retry cadence stays at one attempt per hourly slot.
  */
 export const PEER_PRICE_CATCHUP_MIN_SPACING_MS = 55 * 60_000;
 export const PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION = 8;
@@ -108,7 +117,10 @@ export function peerPriceCatchUpGate(state: PeerPriceCatchUpState, now: Date): P
   return 'ok';
 }
 
-/** State after a finished (or aborted) run. */
+/** State after a finished (or aborted) run.  `state` is the CLAIMED state:
+ *  the caller already incremented `runs` and stamped `lastRunAt` in KV before
+ *  any provider call, so a run that hands its claim back (spendRun false)
+ *  decrements `runs` here. */
 export function peerPriceCatchUpAfterRun(
   state: PeerPriceCatchUpState,
   run: {
@@ -118,6 +130,11 @@ export function peerPriceCatchUpAfterRun(
     reachedEndOfPending: boolean;
     /** The run aborted (fatal ST error, deadline) or threw. */
     failed?: boolean;
+    /** False only for a no-engagement run:  it priced zero tickers and every
+     *  attempt failed with a provider error, so it never engaged ST's data
+     *  path and hands its session claim back.  Default true — aborted and
+     *  engaged runs spend one of the session's runs as before. */
+    spendRun?: boolean;
   },
 ): PeerPriceCatchUpState {
   // An unreadable after-count is not proof of progress.
@@ -128,6 +145,7 @@ export function peerPriceCatchUpAfterRun(
   const noProgressRuns = progressed ? 0 : run.failed ? state.noProgressRuns : state.noProgressRuns + 1;
   return {
     ...state,
+    runs: run.spendRun === false ? Math.max(0, state.runs - 1) : state.runs,
     noProgressRuns,
     // Wrap to the head once the walk reached the end of the pending set.
     cursorSeq: run.reachedEndOfPending ? null : (run.lastCursorSeq ?? state.cursorSeq),
