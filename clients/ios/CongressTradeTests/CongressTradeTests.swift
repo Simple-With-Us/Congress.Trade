@@ -1692,6 +1692,81 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertTrue(ua?.contains("Safari") == true)
     }
 
+    /// CT-2461: `AssetMark` must start its own load while it has no image.
+    /// Its `.task` once sat on a childless `Group`, so it never ran and every
+    /// ticker logo vanished with no error and no request.
+    @MainActor
+    func testAssetMarkRequestsAndShowsLogoFromEmptyState() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+        let requested = expectation(description: "logo requested")
+        requested.assertForOverFulfill = false
+        MockURLProtocol.handler = { request in
+            requested.fulfill()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "image/png"]
+            )
+            return (try XCTUnwrap(response), png)
+        }
+        let host = hostAssetMark(symbol: "AAPL", size: 40)
+        defer { host.teardown() }
+
+        await fulfillment(of: [requested], timeout: 5)
+        let width = await host.settledWidth(until: { $0 > 0 })
+        XCTAssertEqual(width, 40, accuracy: 0.5)
+    }
+
+    /// CT-2461: a ticker with no logo still takes no width (no placeholder).
+    @MainActor
+    func testAssetMarkTakesNoWidthWhenLogoIsMissing() async throws {
+        let requested = expectation(description: "logo requested")
+        requested.assertForOverFulfill = false
+        MockURLProtocol.handler = { request in
+            requested.fulfill()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 404, httpVersion: nil, headerFields: nil
+            )
+            return (try XCTUnwrap(response), Data())
+        }
+        let host = hostAssetMark(symbol: "NOLOGO", size: 40)
+        defer { host.teardown() }
+
+        await fulfillment(of: [requested], timeout: 5)
+        let width = await host.settledWidth(until: { _ in false })
+        XCTAssertEqual(width, 0, accuracy: 0.5)
+    }
+
+    /// CT-2461: one logo at two sizes must not share a decoded thumbnail.
+    func testCachedImageLoaderKeysOnPixelSize() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 200)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
+        }
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil
+            )
+            return (try XCTUnwrap(response), png)
+        }
+        let original = CachedImageLoader.session
+        CachedImageLoader.session = makeSession()
+        CachedImageLoader.cache.removeAllObjects()
+        defer {
+            CachedImageLoader.session = original
+            CachedImageLoader.cache.removeAllObjects()
+        }
+        let url = try XCTUnwrap(URL(string: "https://example.test/api/logos/ticker?symbol=SIZE"))
+
+        let small = await CachedImageLoader.load(url: url, maxPixelSize: 20)
+        let large = await CachedImageLoader.load(url: url, maxPixelSize: 100)
+
+        XCTAssertEqual(small?.cgImage?.width, 20)
+        XCTAssertEqual(large?.cgImage?.width, 100)
+    }
+
     /// Multi-select Trade Type pill: `type=` is CSV-capable (`asTxTypes`).
     @MainActor
     func testSetTradeTypeSelectionSendsTypeCSVWhenMultipleSidesSelected() async throws {
@@ -3116,6 +3191,26 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(result.analytics?.window, "1y")
     }
 
+    /// Puts an `AssetMark` on screen so SwiftUI really runs its `.task`,
+    /// loading through the mock protocol from an empty image cache.
+    @MainActor
+    private func hostAssetMark(symbol: String, size: CGFloat) -> AssetMarkHost {
+        let original = CachedImageLoader.session
+        CachedImageLoader.session = makeSession()
+        CachedImageLoader.cache.removeAllObjects()
+        let controller = UIHostingController(rootView: AssetMark(symbol: symbol, size: size))
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let frame = CGRect(x: 0, y: 0, width: 200, height: 200)
+        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: frame)
+        window.frame = frame
+        window.rootViewController = controller
+        window.isHidden = false
+        return AssetMarkHost(controller: controller, window: window) {
+            CachedImageLoader.session = original
+            CachedImageLoader.cache.removeAllObjects()
+        }
+    }
+
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -3391,6 +3486,32 @@ private final class MemoryTokenStore: SessionTokenStore {
     func load() throws -> String? { token }
     func save(_ token: String) throws { self.token = token }
     func clear() throws { token = nil }
+}
+
+@MainActor
+private struct AssetMarkHost {
+    let controller: UIHostingController<AssetMark>
+    let window: UIWindow
+    let restore: () -> Void
+
+    var width: CGFloat {
+        controller.sizeThatFits(in: CGSize(width: 200, height: 200)).width
+    }
+
+    /// Lets the load finish and SwiftUI re-render, returning early only once
+    /// `done` is true.  Otherwise it returns the width after the full wait.
+    func settledWidth(until done: (CGFloat) -> Bool) async -> CGFloat {
+        for _ in 0..<40 {
+            if done(width) { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return width
+    }
+
+    func teardown() {
+        window.isHidden = true
+        restore()
+    }
 }
 
 private final class MockURLProtocol: URLProtocol {
