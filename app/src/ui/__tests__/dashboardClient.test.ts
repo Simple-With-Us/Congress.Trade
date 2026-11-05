@@ -58,6 +58,8 @@ type Client = {
   cleanAsset: (s: string) => string;
   esc: (s: string) => string;
   sortRows: (rows: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+  classifyIngestFailure: (error: string | null) => string;
+  reviewAgoText: (ageMs: number | null) => string;
   txToRow: (tx: Partial<Transaction>) => Record<string, unknown>;
 };
 
@@ -242,6 +244,44 @@ describe('formatters', () => {
     expect(client.esc('a"b')).toBe('a&quot;b');
     expect(client.esc('a<b')).not.toContain('<b');
     expect(client.esc('a&b')).toMatch(/&/);
+  });
+});
+
+describe('review failure panels — classifyIngestFailure and reviewAgoText', () => {
+  it('classifies the agreement wall and edge-deny backoff as retry-in-flight', () => {
+    expect(client.classifyIngestFailure(
+      'fetcher: senate agreement wall for https://efdsearch.senate.gov/search/view/ptr/x; handshake deferred until 2026-11-05T22:00:00Z (eFD edge-deny backoff)',
+    )).toBe('retry-in-flight');
+    expect(client.classifyIngestFailure(
+      'fetcher: senate agreement wall persisted after session refresh for https://efdsearch.senate.gov/search/view/ptr/x',
+    )).toBe('retry-in-flight');
+  });
+
+  it('classifies a not-yet-published 404 as retry-in-flight', () => {
+    expect(client.classifyIngestFailure(
+      'fetcher: HEAD source https://disclosures-clerk.house.gov/public_disc/financial-pdfs/2026/x.pdf -> HTTP 404 (not yet published; will retry)',
+    )).toBe('retry-in-flight');
+  });
+
+  it('classifies other fetcher errors as download failures', () => {
+    expect(client.classifyIngestFailure('fetcher: source https://example.com/x.pdf -> HTTP 500')).toBe('download failed');
+    expect(client.classifyIngestFailure('fetcher: filing exceeds 52428800 byte limit')).toBe('download failed');
+  });
+
+  it('classifies non-fetcher and empty errors as ingest errors', () => {
+    expect(client.classifyIngestFailure('extraction: no tables found')).toBe('ingest error');
+    expect(client.classifyIngestFailure('')).toBe('ingest error');
+    expect(client.classifyIngestFailure(null)).toBe('ingest error');
+  });
+
+  it('reviewAgoText renders compact relative ages', () => {
+    expect(client.reviewAgoText(30_000)).toBe('just now');
+    expect(client.reviewAgoText(12 * 60_000)).toBe('12m ago');
+    expect(client.reviewAgoText(3 * 3_600_000 + 20 * 60_000)).toBe('3h 20m ago');
+    expect(client.reviewAgoText(3 * 3_600_000)).toBe('3h ago');
+    expect(client.reviewAgoText(5 * 86_400_000)).toBe('5d ago');
+    expect(client.reviewAgoText(null)).toBe('—');
+    expect(client.reviewAgoText(-1)).toBe('—');
   });
 });
 

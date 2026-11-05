@@ -201,6 +201,7 @@ import {
   buildFailedIngestionOutboxIdentity,
   loadFailedIngestionOutboxRows,
 } from '../ingestion/failedOutboxIdentity.ts';
+import { readSenateIntakeStatus, recordSenateIntake } from '../ingestion/senateIntakeStatus.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
@@ -1039,7 +1040,7 @@ const reviewQueueIncludeSchema = z
   .string()
   .optional()
   .transform((raw) => (raw ?? '').split(',').map((v) => v.trim()).filter((v) => v.length > 0))
-  .pipe(z.array(z.enum(['ingest_failures'])).max(4));
+  .pipe(z.array(z.enum(['ingest_failures', 'dead_letters', 'dlq_failed'])).max(4));
 
 /** Shared WHERE for the ingest-failure page query and its COUNT. */
 function ingestFailureWhere(chamber: string | null): { clause: string; params: SqlParam[] } {
@@ -1206,6 +1207,138 @@ async function listIngestFailures(
   return { items, nextCursor };
 }
 
+
+/** Error text cap for the pipeline-failure listings (matches the ingest-failure cap). */
+const PIPELINE_FAILURE_ERROR_MAX = INGEST_FAILURE_ERROR_MAX;
+
+interface DeadLetterRow {
+  doc_id: string;
+  chamber: string | null;
+  status: string | null;
+  attempts: number | null;
+  dead_letter_cycles: number | null;
+  last_error: string | null;
+  available_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * One page of ingestion-outbox dead letters: rows whose delivery failed
+ * terminally (status 'failed').  These filings never reach the review queue
+ * and are not ingest failures either — the filing exists, but its outbox
+ * delivery died — so the queue view needs this listing to see them at all.
+ */
+async function listDeadLetters(
+  db: D1Database,
+  limit: number,
+): Promise<{ items: Array<Record<string, unknown>>; count: number }> {
+  try {
+    const rows = await all<DeadLetterRow>(
+      db,
+      `SELECT doc_id, chamber, status, attempts, dead_letter_cycles, last_error, available_at, updated_at
+         FROM ingestion_outbox
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, doc_id DESC
+        LIMIT ?`,
+      [limit + 1],
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => {
+      const rawError = row.last_error ?? null;
+      return {
+        kind: 'dead_letter' as const,
+        docId: row.doc_id,
+        chamber: row.chamber ?? '',
+        attempts: row.attempts ?? 0,
+        deadLetterCycles: row.dead_letter_cycles ?? 0,
+        error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
+        errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        availableAt: row.available_at ?? null,
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+    return { items, count: items.length };
+  } catch {
+    /* ingestion_outbox not migrated yet — the section reads empty. */
+    return { items: [], count: 0 };
+  }
+}
+
+interface DlqFailedRow {
+  id: number;
+  queue_name: string | null;
+  type: string | null;
+  dedupe_key: string | null;
+  attempts: number | null;
+  dead_letter_cycles: number | null;
+  last_error: string | null;
+  available_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * One page of durable-queue rows in terminal failed state
+ * (deno_runtime_queue).  Like the outbox dead letters, these are pipeline
+ * failures no other queue surface lists.  `available` is false when the
+ * table does not exist yet, so the dashboard can say so instead of
+ * implying the queue is healthy.
+ */
+async function listDlqFailedRows(
+  db: D1Database,
+  limit: number,
+): Promise<{ items: Array<Record<string, unknown>>; count: number; available: boolean }> {
+  try {
+    const rows = await all<DlqFailedRow>(
+      db,
+      `SELECT id, queue_name, json_extract(payload, '$.type') AS type, dedupe_key, attempts, dead_letter_cycles, last_error, available_at, updated_at
+         FROM deno_runtime_queue
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?`,
+      [limit + 1],
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => {
+      const rawError = row.last_error ?? null;
+      return {
+        kind: 'dlq_failed' as const,
+        id: row.id,
+        queueName: row.queue_name ?? '',
+        type: row.type ?? '',
+        dedupeKey: row.dedupe_key ?? null,
+        attempts: row.attempts ?? 0,
+        deadLetterCycles: row.dead_letter_cycles ?? 0,
+        error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
+        errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        availableAt: row.available_at ?? null,
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+    return { items, count: items.length, available: true };
+  } catch {
+    return { items: [], count: 0, available: false };
+  }
+}
+
+interface PipelineFailureCounts {
+  deadLetters: number;
+  dlqFailed: number;
+}
+
+/** Counts for the two pipeline-failure stores the review totals carry. */
+async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCounts> {
+  const [deadRow, dlqRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed'`).catch(() => null),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
+  ]);
+  return {
+    deadLetters: Number(deadRow?.n ?? 0) || 0,
+    dlqFailed: Number(dlqRow?.n ?? 0) || 0,
+  };
+}
+
 interface ReviewQueueTotals {
   unresolved: number;
   matching: number;
@@ -1215,6 +1348,10 @@ interface ReviewQueueTotals {
   ingestFailures: number;
   /** CT-2453 stale stamps: published data, wrong 'error' status. Count only. */
   publishedStatusStale: number;
+  /** Ingestion-outbox dead letters (status 'failed'); global like `unresolved`. */
+  deadLetters: number;
+  /** Durable-queue rows in terminal failed state; global like `unresolved`. */
+  dlqFailed: number;
 }
 
 /**
@@ -1231,7 +1368,7 @@ interface ReviewQueueTotals {
  */
 async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): Promise<ReviewQueueTotals> {
   const matchingWhere = reviewQueueFilterWhere(filters);
-  const [unresolvedRow, matchingRow, reasonRows, chamberRows, ingestCounts] = await Promise.all([
+  const [unresolvedRow, matchingRow, reasonRows, chamberRows, ingestCounts, failureCounts] = await Promise.all([
     get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM review_queue WHERE resolved = 0`),
     get<{ n: number }>(
       db,
@@ -1252,6 +1389,7 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
       [filters.resolved],
     ),
     ingestFailureCounts(db, null),
+    pipelineFailureCounts(db),
   ]);
 
   const byReason: Record<string, number> = {};
@@ -1265,6 +1403,7 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
     byReason,
     byChamber,
     ...ingestCounts,
+    ...failureCounts,
   };
 }
 
@@ -3148,6 +3287,16 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       body.ingestFailures = embedded.items;
       body.ingestFailuresNextCursor = embedded.nextCursor;
     }
+    if (includeValues.includes('dead_letters')) {
+      const dead = await listDeadLetters(c.env.DB, ingestLimit);
+      body.deadLetters = dead.items;
+    }
+    if (includeValues.includes('dlq_failed')) {
+      const dlq = await listDlqFailedRows(c.env.DB, ingestLimit);
+      body.dlqFailed = dlq.items;
+      body.dlqFailedAvailable = dlq.available;
+    }
+    body.senateIntake = await readSenateIntakeStatus(c.env);
     // Only surface `truncated` on the legacy unbounded call shape — an
     // explicit limit/cursor caller asked for a bounded page on purpose, that
     // isn't "truncation".
@@ -6597,6 +6746,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     const converted = filings.length;
     const rejected = body.rows.length - converted;
     if (body.dryRun === true) {
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: 0,
+        dryRun: true,
+      });
       return c.json({
         ok: true,
         dryRun: true,
@@ -6608,6 +6765,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     try {
       const result = await ingestSenateFilings(c.env, filings, new Date());
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: result.count,
+        dryRun: false,
+      });
       return c.json({
         ok: true,
         received: body.rows.length,
