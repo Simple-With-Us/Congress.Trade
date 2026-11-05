@@ -1291,7 +1291,7 @@ async function listDlqFailedRows(
   try {
     const rows = await all<DlqFailedRow>(
       db,
-      `SELECT id, queue_name, json_extract(payload, '$.type') AS type, dedupe_key, attempts, dead_letter_cycles, last_error, available_at, updated_at
+      `SELECT id, queue_name, CASE WHEN json_valid(payload) THEN json_extract(payload, '$.type') END AS type, dedupe_key, attempts, dead_letter_cycles, last_error, available_at, updated_at
          FROM deno_runtime_queue
         WHERE status = 'failed'
         ORDER BY updated_at DESC, id DESC
@@ -6782,6 +6782,17 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         insertedDocIds: result.inserted.map((f) => f.docId),
       });
     } catch (err) {
+      // The relay did call in — record that before answering, so a
+      // server-side ingest failure does not read as a dead fetcher on the
+      // review surface.  newCount stays 0: nothing was ingested.
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: 0,
+        dryRun: false,
+      });
       // The scoped intake caller is low-privilege: log the detail
       // server-side and return a generic error, never DB internals.
       console.error('senate-ptr-intake: ingest failed:', err);

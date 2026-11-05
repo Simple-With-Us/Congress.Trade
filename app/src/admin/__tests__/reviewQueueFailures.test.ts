@@ -123,6 +123,22 @@ describe('GET /review-queue pipeline failures', () => {
     expect(body.totals.dlqFailed).toBe(2);
   });
 
+  it('lists durable-queue failures even when one payload is malformed JSON', async () => {
+    const db = makeReviewQueueTestDb(fixture());
+    await seedFailures(db, true);
+    await db.prepare(`INSERT INTO deno_runtime_queue
+      (queue_name, dedupe_key, payload, status, attempts, dead_letter_cycles, available_at, last_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind('ingest', 'filing.new:S-3', 'not json at all', 'failed', 1, 0, tsAt(21), 'corrupt payload', tsAt(18), tsAt(21)).run();
+    const res = await app.request('/review-queue?include=dlq_failed', { headers: AUTH }, env(db));
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, any>;
+    expect(body.dlqFailedAvailable).toBe(true);
+    expect(body.dlqFailed).toHaveLength(3);
+    expect(body.dlqFailed[0]).toMatchObject({ dedupeKey: 'filing.new:S-3', type: '' });
+    expect(body.totals.dlqFailed).toBe(3);
+  });
+
   it('omits the listings without include but keeps the totals and a null relay status', async () => {
     const db = makeReviewQueueTestDb(fixture());
     await seedFailures(db, true);

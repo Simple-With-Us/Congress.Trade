@@ -1263,7 +1263,8 @@ export function evaluatePipelineSignals(
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
     const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
-    // The probe dials eFD at most every 30m, so allow two missed cycles.
+    // The probe dials eFD at most twice a day, so allow three cycles
+    // before a resting ok record is even called stale (it still reads ok).
     const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, (3 * SENATE_EFD_PROXY_PROBE_INTERVAL_MS) / 60_000);
     const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
     if (probe.state === 'blocked') {
