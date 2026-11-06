@@ -172,8 +172,11 @@ let readinessCache: { at: number; result: ReadinessResult } | null = null;
 // endpoints. Previously only /health was cached while /health/deep,
 // /health/polling and /health/latency each paid the full 30+-probe scan per
 // unauthenticated monitor hit.
+// Public health endpoints serve unauthenticated traffic, so the shared
+// cache collects counts only: raw unreadable-filing doc ids stay on the
+// operator-private surfaces (loud alerts, GET /api/admin/pipeline-health/filing-skips).
 const pipelineHealthCache = createPipelineHealthCache(
-  (env) => checkPipelineHealth(env),
+  (env) => checkPipelineHealth(env, new Date(), {}, { includeUnreadableDocIds: false }),
   READINESS_CACHE_TTL_MS,
 );
 

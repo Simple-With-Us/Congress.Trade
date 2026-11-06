@@ -497,6 +497,45 @@ describe('evaluatePipelineSignals', () => {
       expect(check?.status).toBe('unknown');
     });
   });
+
+  it('pages filing_skips on an unreadable 278-T and names the doc (board 5235c003)', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 0,
+        doc_quarantined: 0,
+        oge_text_unreadable: 1,
+      },
+      unreadableExecutiveDocIds: ['E-2026-donald-j-trump-09-17-2026-278t'],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(res.status).toBe('critical');
+    expect(check?.detail).toContain('oge_text_unreadable=1');
+    expect(check?.detail).toContain('E-2026-donald-j-trump-09-17-2026-278t');
+    expect(res.signals?.unreadableExecutiveDocIds).toEqual(['E-2026-donald-j-trump-09-17-2026-278t']);
+  });
+
+  it('keeps explicit Part 7 None in auto_resolved_empty and does not call it an unreadable doc', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 1,
+        doc_quarantined: 0,
+        oge_text_unreadable: 0,
+      },
+      unreadableExecutiveDocIds: [],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(check?.detail).toContain('auto_resolved_empty=1');
+    expect(check?.detail).not.toContain('oge_text_unreadable=');
+    expect(check?.detail).not.toContain('Unreadable docs');
+  });
 });
 
 describe('polling + latency liveness (owner 2026-08-10: never silently off)', () => {
