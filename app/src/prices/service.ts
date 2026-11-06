@@ -789,6 +789,14 @@ export async function runPriceRefresh(
     signal?: AbortSignal;
     /** See SelectTickersNeedingPricesOpts.afterCursorSeq. */
     afterCursorSeq?: number | null;
+    /**
+     * Per-ticker fetches in flight at once (default 1 = the serial walk).
+     * Fetches still await the shared pacer one by one, so the aggregate
+     * request rate is unchanged;  concurrency only hides fetch latency.
+     * Results are processed in page order regardless.  Only the bounded
+     * peer-price catch-up opts in (PEER_PRICE_CATCHUP_FETCH_CONCURRENCY).
+     */
+    concurrency?: number;
   } = {},
 ): Promise<PriceRefreshResult> {
   const dryRun = opts.dryRun === true;
@@ -897,7 +905,100 @@ export async function runPriceRefresh(
   const tickers = page.map((r) => r.ticker);
   const runCorpusLatest = await readCorpusLatestPriceDate(env);
   const runCorpusFresh = isCurrentPriceFresh(runCorpusLatest, lastTradingDay());
-  for (const { ticker, seq } of page) {
+
+  // Bounded-concurrency fetch stage (CT-2445 follow-up, 2026-11-06).  A cold
+  // Socratic.Trade history fetch takes ~10s (30s for an unknown symbol), so
+  // the old fully serial walk spent its whole lane deadline on latency:  the
+  // catch-up priced ~50 tickers per 600s run and the backlog never drained.
+  // Fetching is the only stage that waits on the network, so it is the only
+  // stage parallelized:  a small pool plans + paces + fetches ahead of the
+  // processor, which still consumes outcomes strictly in page order and does
+  // every write itself, so the cursor, error, and negative-cache semantics
+  // below are byte-for-byte the serial ones.  Two guards keep the pool
+  // honest:
+  //  - Rate:  every fetch still awaits the SAME shared pacer immediately
+  //    before firing.  The pacer claims its minute slots synchronously, so
+  //    concurrent callers are handed staggered slots and the aggregate
+  //    request rate never exceeds the configured per-minute cap —
+  //    concurrency hides latency, it does not multiply request rate.
+  //  - Lookahead:  a worker may claim index i only once the processor has
+  //    finished index i - concurrency, so a fatal error or an abort stops
+  //    new fetches within one pool width and at most (concurrency - 1)
+  //    already-started fetches settle unused.  Their attempts still count
+  //    against `calls`/`budget` — Socratic.Trade was actually called — but
+  //    nothing is written for a ticker the processor never reached.  At
+  //    concurrency 1 (the default;  only the catch-up opts in) the gate
+  //    admits exactly one unprocessed fetch at a time, which reproduces the
+  //    old serial walk exactly.
+  // The fetch window needs no narrowing here:  planTickerEodFetch already
+  // scopes `from` to the ticker's missing window (7-day incremental off the
+  // cached max;  a gap below the cache starts at the oldest uncovered trade).
+  // The one wide case is a never-priced ticker, whose missing window IS its
+  // full trade span — every trade anchor is computed from the fetched
+  // series, so a narrower first fetch would strand the older trades (the
+  // trap the not-covered re-check pays a second full fetch to avoid).
+  const fetchConcurrency = Math.max(1, Math.min(16, Math.floor(opts.concurrency ?? 1) || 1));
+  type TickerFetchOutcome =
+    | { kind: 'noplan'; nowIso: string }
+    | { kind: 'throw'; error: unknown }
+    | { kind: 'fetched'; plan: TickerEodFetchPlan; nowIso: string; hist: Close[] }
+    | { kind: 'error'; plan: TickerEodFetchPlan; nowIso: string; error: unknown };
+  const outcomes = page.map(() => {
+    let resolve!: (o: TickerFetchOutcome) => void;
+    const promise = new Promise<TickerFetchOutcome>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  });
+  let fetchHalted = false;
+  let processedCount = 0;
+  const gateWaiters: Array<() => void> = [];
+  const notifyGate = (): void => {
+    for (const w of gateWaiters.splice(0)) w();
+  };
+  async function fetchTicker(ticker: string): Promise<TickerFetchOutcome> {
+    const nowIso = new Date().toISOString();
+    let plan: TickerEodFetchPlan | null;
+    try {
+      plan = await planTickerEodFetch(env, ticker);
+    } catch (error) {
+      // The serial walk let a plan failure (local DB) throw out of the run;
+      // the processor rethrows it in page order, preserving that.
+      return { kind: 'throw', error };
+    }
+    if (!plan) return { kind: 'noplan', nowIso };
+    try {
+      await pace();
+      // Count the attempt regardless of outcome (see the SPX comment above).
+      calls++;
+      budget--;
+      const hist = await client.eodHistory(ticker, plan.from, plan.to);
+      return { kind: 'fetched', plan, nowIso, hist };
+    } catch (error) {
+      return { kind: 'error', plan, nowIso, error };
+    }
+  }
+  let nextFetchIndex = 0;
+  async function fetchWorker(): Promise<void> {
+    while (!fetchHalted && !opts.signal?.aborted) {
+      const i = nextFetchIndex;
+      if (i >= page.length) return;
+      if (i >= processedCount + fetchConcurrency) {
+        // Lookahead gate:  wait until the processor finishes another ticker
+        // (or halts the pool) before starting a new fetch.
+        await new Promise<void>((r) => gateWaiters.push(r));
+        continue;
+      }
+      nextFetchIndex++;
+      outcomes[i].resolve(await fetchTicker(page[i].ticker));
+    }
+  }
+  const workers: Array<Promise<void>> = [];
+  for (let w = 0; w < Math.min(fetchConcurrency, page.length); w++) workers.push(fetchWorker());
+  const poolDone = Promise.all(workers).then(() => undefined);
+
+  for (let pageIndex = 0; pageIndex < page.length; pageIndex++) {
+    const { ticker, seq } = page[pageIndex];
     if (opts.signal?.aborted) {
       result.aborted = true;
       break;
@@ -909,145 +1010,169 @@ export async function runPriceRefresh(
     // the failing ticker is retried first next time.
     const resumeBefore = result.lastCursorSeq;
     result.lastCursorSeq = seq;
-    const nowIso = new Date().toISOString();
-    const fetchPlan = await planTickerEodFetch(env, ticker);
-    if (!fetchPlan) continue;
-    const { trades, from, to, prevStage, prevReason } = fetchPlan;
-    let hist: Close[] = [];
-    try {
-      await pace();
-      // Count the attempt regardless of outcome (see the SPX comment above).
-      calls++;
-      budget--;
-      hist = await client.eodHistory(ticker, from, to);
-    } catch (e) {
-      const staleSignal = readPeerStaleSignal(e);
-      if (staleSignal) {
-        const resolution = await resolvePeerStaleResponse(
-          new Date(nowIso),
-          staleSignal.closes,
-          prevReason,
-          runCorpusFresh,
-        );
-        if (resolution.kind === 'hist') {
-          hist = resolution.closes;
-        } else if (resolution.kind === 'empty') {
-          hist = [];
-        } else if (resolution.kind === 'stale_hit') {
-          if (!dryRun) {
-            await run(
-              env.DB,
-              `INSERT INTO securities_ref (ticker, price_checked_at, price_unavailable_reason)
+    // The awaited index is always claimable (see the lookahead gate), so a
+    // null race result means the pool stopped early — the lane signal fired
+    // and every worker exited before claiming this index.
+    const outcome = await Promise.race([outcomes[pageIndex].promise, poolDone.then(() => null)]);
+    if (outcome === null) {
+      result.aborted = true;
+      break;
+    }
+    if (outcome.kind === 'throw') {
+      fetchHalted = true;
+      notifyGate();
+      throw outcome.error;
+    }
+    let stopWalk = false;
+    if (outcome.kind !== 'noplan') {
+      const { trades, prevStage, prevReason } = outcome.plan;
+      const nowIso = outcome.nowIso;
+      let hist: Close[] = [];
+      let skipTicker = false;
+      if (outcome.kind === 'error') {
+        const e = outcome.error;
+        const staleSignal = readPeerStaleSignal(e);
+        if (staleSignal) {
+          const resolution = await resolvePeerStaleResponse(
+            new Date(nowIso),
+            staleSignal.closes,
+            prevReason,
+            runCorpusFresh,
+          );
+          if (resolution.kind === 'hist') {
+            hist = resolution.closes;
+          } else if (resolution.kind === 'empty') {
+            hist = [];
+          } else if (resolution.kind === 'stale_hit') {
+            if (!dryRun) {
+              await run(
+                env.DB,
+                `INSERT INTO securities_ref (ticker, price_checked_at, price_unavailable_reason)
                  VALUES (?, ?, ?)
                ON CONFLICT(ticker) DO UPDATE SET
                  price_checked_at = excluded.price_checked_at,
                  price_unavailable_reason = excluded.price_unavailable_reason
                WHERE COALESCE(securities_ref.price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
-              [ticker, nowIso, peerStaleHitReason(resolution.hits)],
-            );
-          }
-          continue;
-        } else {
-          result.errors.push(ticker + ': PEER_STALE_RESPONSE (corpus not fresh)');
-          if (!dryRun) {
-            const marker = stFetchErrorReason(new Error('PEER_HTTP_502 stale (corpus lag)'));
-            await run(
-              env.DB,
-              `UPDATE securities_ref SET price_unavailable_reason = ?
+                [ticker, nowIso, peerStaleHitReason(resolution.hits)],
+              );
+            }
+            skipTicker = true;
+          } else {
+            result.errors.push(ticker + ': PEER_STALE_RESPONSE (corpus not fresh)');
+            if (!dryRun) {
+              const marker = stFetchErrorReason(new Error('PEER_HTTP_502 stale (corpus lag)'));
+              await run(
+                env.DB,
+                `UPDATE securities_ref SET price_unavailable_reason = ?
                 WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}
                   AND price_unavailable_reason IS NOT ?`,
-              [marker, ticker, marker],
-            );
+                [marker, ticker, marker],
+              );
+            }
+            skipTicker = true;
           }
-          continue;
-        }
-      } else {
-      result.errors.push(ticker + ': ' + (e as Error).message);
-      if (isFatalPriceProviderError(e, fmpBudgeted)) {
-        // Same auth/plan/rate-limit will fail identically for every remaining
-        // ticker — abort the whole run instead of walking thousands of peers
-        // that cannot succeed.  Tickers not yet reached this run are left
-        // completely untouched (no negative-cache write) for next time.
-        result.lastCursorSeq = resumeBefore;
-        result.aborted = true;
-        break;
-      }
-      // Non-fatal per-ticker error:  leave stage and price_checked_at alone (the
-      // stall clock stays honest), but record the error as the last outcome so
-      // the not-covered sweep can tell "ST keeps erroring" from "ST had no data"
-      // and say which one it was.  A later success or empty result overwrites it.
-      // Write only when the marker changes:  a ticker that keeps failing with
-      // the same error costs a read, not a securities_ref write, every run.
-      if (!dryRun) {
-        const marker = stFetchErrorReason(e);
-        await run(
-          env.DB,
-          `UPDATE securities_ref SET price_unavailable_reason = ?
+        } else {
+          result.errors.push(ticker + ': ' + (e as Error).message);
+          if (isFatalPriceProviderError(e, fmpBudgeted)) {
+            // Same auth/plan/rate-limit will fail identically for every remaining
+            // ticker — abort the whole run instead of walking thousands of peers
+            // that cannot succeed.  Tickers not yet reached this run are left
+            // completely untouched (no negative-cache write) for next time.
+            result.lastCursorSeq = resumeBefore;
+            result.aborted = true;
+            stopWalk = true;
+          } else {
+            // Non-fatal per-ticker error:  leave stage and price_checked_at alone (the
+            // stall clock stays honest), but record the error as the last outcome so
+            // the not-covered sweep can tell "ST keeps erroring" from "ST had no data"
+            // and say which one it was.  A later success or empty result overwrites it.
+            // Write only when the marker changes:  a ticker that keeps failing with
+            // the same error costs a read, not a securities_ref write, every run.
+            if (!dryRun) {
+              const marker = stFetchErrorReason(e);
+              await run(
+                env.DB,
+                `UPDATE securities_ref SET price_unavailable_reason = ?
             WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}
               AND price_unavailable_reason IS NOT ?`,
-          [marker, ticker, marker],
-        );
+                [marker, ticker, marker],
+              );
+            }
+            skipTicker = true;
+          }
+        }
+      } else {
+        hist = outcome.hist;
       }
-      continue;
-      }
-    }
-    if (hist.length === 0) {
-      // Reaching here means the provider returned a CONFIRMED empty result (a 2xx
-      // with no rows, or a 404 "unknown symbol") — the price clients THROW on
-      // transient/global failures (401/402/403/429/5xx), which are caught above
-      // and skip the ticker without marking it. So an empty here is a genuine
-      // "no closes for this ticker" (delisted, foreign, or non-equity), never a
-      // rate-limit/outage. Negative-cache it: without this, the backfill loop's
-      // done:true — which requires "traded tickers with no price_eod row == 0" —
-      // is unreachable for the ~544 such tickers, so the loop (and its D1
-      // write/read spend) never stopped. Two-stage backoff: the FIRST
-      // consecutive miss gets a fast 7-day recheck (PRICE_UNAVAILABLE_NOT_
-      // FOUND_FIRST); a SECOND (or later) consecutive miss escalates to the
-      // slower 30-day cadence (PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) — see
-      // selectTickersNeedingPrices. A ticker that was previously priced or
-      // stalled (not already in a not-found streak) always restarts at stage 1.
-      // CT-2443 rule (a): a repeat miss on a ticker ALREADY at stage 2 (i.e.
-      // the 30-day re-check that ended in another miss) terminates at stage 4
-      // (not covered by ST) instead of cycling 2 → 2 forever.
-      if (!dryRun) {
-        if (prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) {
-          await markTickerPriceUnavailable(
-            env,
-            ticker,
-            notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_EMPTY),
-            { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
-          );
+      if (!skipTicker && !stopWalk) {
+        if (hist.length === 0) {
+          // Reaching here means the provider returned a CONFIRMED empty result (a 2xx
+          // with no rows, or a 404 "unknown symbol") — the price clients THROW on
+          // transient/global failures (401/402/403/429/5xx), which are caught above
+          // and skip the ticker without marking it. So an empty here is a genuine
+          // "no closes for this ticker" (delisted, foreign, or non-equity), never a
+          // rate-limit/outage. Negative-cache it: without this, the backfill loop's
+          // done:true — which requires "traded tickers with no price_eod row == 0" —
+          // is unreachable for the ~544 such tickers, so the loop (and its D1
+          // write/read spend) never stopped. Two-stage backoff: the FIRST
+          // consecutive miss gets a fast 7-day recheck (PRICE_UNAVAILABLE_NOT_
+          // FOUND_FIRST); a SECOND (or later) consecutive miss escalates to the
+          // slower 30-day cadence (PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) — see
+          // selectTickersNeedingPrices. A ticker that was previously priced or
+          // stalled (not already in a not-found streak) always restarts at stage 1.
+          // CT-2443 rule (a): a repeat miss on a ticker ALREADY at stage 2 (i.e.
+          // the 30-day re-check that ended in another miss) terminates at stage 4
+          // (not covered by ST) instead of cycling 2 → 2 forever.
+          if (!dryRun) {
+            if (prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) {
+              await markTickerPriceUnavailable(
+                env,
+                ticker,
+                notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_EMPTY),
+                { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
+              );
+            } else {
+              await markTickerPriceUnavailable(env, ticker, PRICE_UNAVAILABLE_REASON_PEER_NO_EOD, {
+                checkedAt: nowIso,
+              });
+            }
+          }
         } else {
-          await markTickerPriceUnavailable(env, ticker, PRICE_UNAVAILABLE_REASON_PEER_NO_EOD, {
-            checkedAt: nowIso,
-          });
+          result.tickersPriced++;
+          if (!dryRun) {
+            // If the newest available close is weeks stale, the series has stopped
+            // (delisted/halted) even though the fetch wasn't empty — negative-cache it
+            // (TTL-bounded) so it isn't re-selected + re-fetched daily forever;
+            // otherwise clear any prior negative-cache. CT-2443 rule (a): a stale
+            // result on a ticker ALREADY at stage 3 terminates at stage 4 (not
+            // covered by ST) instead of cycling 3 → 3 forever.
+            const latest = hist[0];
+            const priceStalled = isStaleListingDate(latest.date);
+            let stage = priceStalled ? PRICE_UNAVAILABLE_STALLED : 0;
+            let reason: string | null = null;
+            if (priceStalled) {
+              if (prevStage === PRICE_UNAVAILABLE_STALLED) {
+                stage = PRICE_UNAVAILABLE_NOT_COVERED;
+                reason = notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_STALLED);
+              }
+            }
+            await writeTickerEodHistory(env, ticker, hist, nowIso, { stage, reason });
+            result.sharePrices.push({ ticker, closes: hist, currentPrice: latest.close, currentPriceDate: latest.date });
+            result.tradesComputed += trades.length;
+          }
         }
       }
-      continue;
     }
-    result.tickersPriced++;
-    if (dryRun) continue;
-
-    // If the newest available close is weeks stale, the series has stopped
-    // (delisted/halted) even though the fetch wasn't empty — negative-cache it
-    // (TTL-bounded) so it isn't re-selected + re-fetched daily forever;
-    // otherwise clear any prior negative-cache. CT-2443 rule (a): a stale
-    // result on a ticker ALREADY at stage 3 terminates at stage 4 (not
-    // covered by ST) instead of cycling 3 → 3 forever.
-    const latest = hist[0];
-    const priceStalled = isStaleListingDate(latest.date);
-    let stage = priceStalled ? PRICE_UNAVAILABLE_STALLED : 0;
-    let reason: string | null = null;
-    if (priceStalled) {
-      if (prevStage === PRICE_UNAVAILABLE_STALLED) {
-        stage = PRICE_UNAVAILABLE_NOT_COVERED;
-        reason = notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_STALLED);
-      }
-    }
-    await writeTickerEodHistory(env, ticker, hist, nowIso, { stage, reason });
-    result.sharePrices.push({ ticker, closes: hist, currentPrice: latest.close, currentPriceDate: latest.date });
-    result.tradesComputed += trades.length;
+    processedCount++;
+    notifyGate();
+    if (stopWalk) break;
   }
+  // Stop the pool and let in-flight fetches settle before the final
+  // accounting, so `calls`/`budget` below count every attempt actually made
+  // and no fetch is still running when the caller reads the result.
+  fetchHalted = true;
+  notifyGate();
+  await Promise.all(workers);
 
   result.reachedEndOfPending = !result.aborted && tickers.length < selectBudget;
   // A walk that resumed from a cursor skipped everything before it, so it never

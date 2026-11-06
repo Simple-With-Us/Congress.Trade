@@ -32,6 +32,7 @@ import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
 import { backfillCurrentPricesFromEod } from './prices/service.ts';
 import {
+  PEER_PRICE_CATCHUP_FETCH_CONCURRENCY,
   PEER_PRICE_CATCHUP_MAX_PER_MINUTE,
   PEER_PRICE_CATCHUP_MAX_TICKERS,
   parsePeerPriceCatchUpState,
@@ -538,6 +539,9 @@ export async function maybeRunPeerPriceCatchUp(
       maxPerMinute,
       signal: opts.signal,
       afterCursorSeq: claimed.cursorSeq,
+      // Hide Socratic.Trade's ~10s cold-fetch latency behind a small pool;
+      // the shared pacer still caps the aggregate rate at maxPerMinute.
+      concurrency: PEER_PRICE_CATCHUP_FETCH_CONCURRENCY,
     });
     refresh = r;
     lastCursorSeq = r.lastCursorSeq ?? null;
