@@ -51,6 +51,42 @@ describe('senate intake relay heartbeat', () => {
     expect(status?.stale).toBe(true);
   });
 
+  it('round-trips the failure marker', async () => {
+    const { env } = memEnv();
+    const at = new Date('2026-11-05T18:00:00.000Z');
+    await recordSenateIntake(env, { ...record(at.toISOString()), failed: true });
+    const status = await readSenateIntakeStatus(env, new Date(at.getTime() + 60_000));
+    expect(status?.failed).toBe(true);
+  });
+
+  it('does not read overnight silence inside the fetcher window gap as stale', async () => {
+    const { env } = memEnv();
+    // Last relay 21:50 Mac time (Nov 4), read back at 03:00 Mac time.
+    await recordSenateIntake(env, record('2026-11-05T03:50:00.000Z'));
+    const status = await readSenateIntakeStatus(env, new Date('2026-11-05T09:00:00.000Z'));
+    expect(status?.stale).toBe(false);
+  });
+
+  it('keeps a relay that went stale before the window closed stale overnight', async () => {
+    const { env } = memEnv();
+    // Last relay 20:00 Mac time (Nov 4) — already past the threshold by the
+    // 22:00 close — read back at 03:00 Mac time.
+    await recordSenateIntake(env, record('2026-11-05T02:00:00.000Z'));
+    const status = await readSenateIntakeStatus(env, new Date('2026-11-05T09:00:00.000Z'));
+    expect(status?.stale).toBe(true);
+  });
+
+  it('applies the threshold from the 06:00 window open, not from the last evening relay', async () => {
+    const { env } = memEnv();
+    await recordSenateIntake(env, record('2026-11-05T03:50:00.000Z'));
+    // 06:30 Mac time: two missed runs, still inside the grace.
+    const early = await readSenateIntakeStatus(env, new Date('2026-11-05T12:30:00.000Z'));
+    expect(early?.stale).toBe(false);
+    // 06:46 Mac time: past the threshold measured from the open.
+    const later = await readSenateIntakeStatus(env, new Date('2026-11-05T12:46:00.000Z'));
+    expect(later?.stale).toBe(true);
+  });
+
   it('reads a malformed record as never-run', async () => {
     const { env, kv } = memEnv();
     kv.set(SENATE_INTAKE_STATUS_KV_KEY, JSON.stringify({ receivedAt: 'x', received: 'many' }));

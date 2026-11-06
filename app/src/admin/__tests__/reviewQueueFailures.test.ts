@@ -17,6 +17,37 @@ const app = buildAdminRouter();
 const TOKEN = 'test-admin-token';
 const AUTH = { Authorization: `Bearer ${TOKEN}` };
 
+interface DeadLetterItem {
+  kind: string;
+  docId: string;
+  chamber: string;
+  attempts: number;
+  error: string | null;
+  errorTruncated: boolean;
+  parked: boolean;
+}
+
+interface DlqFailedItem {
+  kind: string;
+  queueName: string;
+  type: string;
+  dedupeKey: string | null;
+  attempts: number;
+  deadLetterCycles: number;
+}
+
+interface ReviewQueueBody {
+  ingestFailures: Array<{ docId: string }>;
+  deadLetters: DeadLetterItem[];
+  deadLettersAvailable: boolean;
+  dlqFailed: DlqFailedItem[];
+  dlqFailedAvailable: boolean;
+  totals: { deadLetters: number; deadLettersParked: number; dlqFailed: number };
+  senateIntake: {
+    received: number; newCount: number; dryRun: boolean; stale: boolean; failed?: boolean;
+  } | null;
+}
+
 function tsAt(i: number): string {
   return new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 0) + i * 60_000).toISOString();
 }
@@ -104,23 +135,43 @@ describe('GET /review-queue pipeline failures', () => {
     await seedFailures(db, true);
     const res = await app.request('/review-queue?include=ingest_failures,dead_letters,dlq_failed', { headers: AUTH }, env(db));
     expect(res.status).toBe(200);
-    const body = await res.json() as Record<string, any>;
+    const body = await res.json() as ReviewQueueBody;
 
-    expect(body.ingestFailures.map((i: any) => i.docId)).toContain('IF-1');
+    expect(body.ingestFailures.map((i) => i.docId)).toContain('IF-1');
 
     expect(body.deadLetters).toHaveLength(2);
     expect(body.deadLetters[0]).toMatchObject({ kind: 'dead_letter', docId: 'DL-1', chamber: 'senate', attempts: 5, error: 'delivery exploded', errorTruncated: false });
-    const dl2 = body.deadLetters.find((i: any) => i.docId === 'DL-2');
+    const dl2 = body.deadLetters.find((i) => i.docId === 'DL-2');
+    if (!dl2) throw new Error('DL-2 dead letter missing from the response');
     expect(dl2.errorTruncated).toBe(true);
-    expect(dl2.error.length).toBeLessThanOrEqual(300);
+    expect(dl2.error?.length ?? 0).toBeLessThanOrEqual(300);
 
     expect(body.dlqFailed).toHaveLength(2);
     expect(body.dlqFailed[0]).toMatchObject({ kind: 'dlq_failed', queueName: 'ingest', type: 'filing.new', dedupeKey: 'filing.new:S-1', attempts: 4, deadLetterCycles: 1 });
     expect(body.dlqFailed[1]).toMatchObject({ type: 'webhook.deliver', dedupeKey: null });
     expect(body.dlqFailedAvailable).toBe(true);
+    expect(body.deadLettersAvailable).toBe(true);
 
     expect(body.totals.deadLetters).toBe(2);
     expect(body.totals.dlqFailed).toBe(2);
+  });
+
+  it('splits parked dead letters out of the active total and flags them in the listing', async () => {
+    const rows = [...fixture(), {
+      docId: 'DL-3', createdAt: tsAt(6), noReview: true, chamber: 'senate',
+      ingestStatus: 'persisted', outboxUpdatedAt: tsAt(13), error: 'parked:empty_fetch_handoff',
+    }];
+    const db = makeReviewQueueTestDb(rows);
+    await seedFailures(db, true);
+    await db.prepare("UPDATE ingestion_outbox SET status = 'failed', attempts = 1 WHERE doc_id = ?").bind('DL-3').run();
+    const res = await app.request('/review-queue?include=dead_letters', { headers: AUTH }, env(db));
+    expect(res.status).toBe(200);
+    const body = await res.json() as ReviewQueueBody;
+    expect(body.deadLetters).toHaveLength(3);
+    expect(body.deadLetters.find((i) => i.docId === 'DL-3')?.parked).toBe(true);
+    expect(body.deadLetters.find((i) => i.docId === 'DL-1')?.parked).toBe(false);
+    expect(body.totals.deadLetters).toBe(2);
+    expect(body.totals.deadLettersParked).toBe(1);
   });
 
   it('lists durable-queue failures even when one payload is malformed JSON', async () => {
@@ -132,7 +183,7 @@ describe('GET /review-queue pipeline failures', () => {
       .bind('ingest', 'filing.new:S-3', 'not json at all', 'failed', 1, 0, tsAt(21), 'corrupt payload', tsAt(18), tsAt(21)).run();
     const res = await app.request('/review-queue?include=dlq_failed', { headers: AUTH }, env(db));
     expect(res.status).toBe(200);
-    const body = await res.json() as Record<string, any>;
+    const body = await res.json() as ReviewQueueBody;
     expect(body.dlqFailedAvailable).toBe(true);
     expect(body.dlqFailed).toHaveLength(3);
     expect(body.dlqFailed[0]).toMatchObject({ dedupeKey: 'filing.new:S-3', type: '' });
@@ -144,7 +195,7 @@ describe('GET /review-queue pipeline failures', () => {
     await seedFailures(db, true);
     const res = await app.request('/review-queue', { headers: AUTH }, env(db));
     expect(res.status).toBe(200);
-    const body = await res.json() as Record<string, any>;
+    const body = await res.json() as ReviewQueueBody;
     expect(body.deadLetters).toBeUndefined();
     expect(body.dlqFailed).toBeUndefined();
     expect(body.totals.deadLetters).toBe(2);
@@ -157,7 +208,7 @@ describe('GET /review-queue pipeline failures', () => {
     await seedFailures(db, false);
     const res = await app.request('/review-queue?include=dlq_failed', { headers: AUTH }, env(db));
     expect(res.status).toBe(200);
-    const body = await res.json() as Record<string, any>;
+    const body = await res.json() as ReviewQueueBody;
     expect(body.dlqFailed).toEqual([]);
     expect(body.dlqFailedAvailable).toBe(false);
     expect(body.totals.dlqFailed).toBe(0);
@@ -170,14 +221,21 @@ describe('GET /review-queue pipeline failures', () => {
       receivedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
       received: 12, converted: 11, rejected: 1, newCount: 3, dryRun: false,
     }));
-    const fresh = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as Record<string, any>;
+    const fresh = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as ReviewQueueBody;
     expect(fresh.senateIntake).toMatchObject({ received: 12, newCount: 3, stale: false });
 
     kv.map.set(SENATE_INTAKE_STATUS_KV_KEY, JSON.stringify({
       receivedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
       received: 4, converted: 4, rejected: 0, newCount: 0, dryRun: true,
     }));
-    const stale = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as Record<string, any>;
+    const stale = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as ReviewQueueBody;
     expect(stale.senateIntake).toMatchObject({ received: 4, dryRun: true, stale: true });
+
+    kv.map.set(SENATE_INTAKE_STATUS_KV_KEY, JSON.stringify({
+      receivedAt: new Date(Date.now() - 60_000).toISOString(),
+      received: 4, converted: 4, rejected: 0, newCount: 0, dryRun: false, failed: true,
+    }));
+    const failed = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as ReviewQueueBody;
+    expect(failed.senateIntake).toMatchObject({ failed: true, stale: false });
   });
 });

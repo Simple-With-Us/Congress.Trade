@@ -2701,6 +2701,7 @@ function loadReview() {
       REVIEW_FAILURES = REVIEW_RESOLVED === 0 ? {
         ingestFailures: data.ingestFailures || null,
         deadLetters: data.deadLetters || null,
+        deadLettersAvailable: data.deadLettersAvailable !== false,
         dlqFailed: data.dlqFailed || null,
         dlqFailedAvailable: data.dlqFailedAvailable !== false,
       } : null;
@@ -2708,6 +2709,10 @@ function loadReview() {
       loadDecisionHistory();
     })
     .catch(function (e) {
+      REVIEW_FAILURES = null;
+      REVIEW_SENATE_INTAKE = null;
+      if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
+      if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
       el('reviewBody').innerHTML = stateRow(6, isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load review queue: ' + e.message));
     });
 }
@@ -3133,8 +3138,9 @@ function failureSectionHtml(title, rowsHtml) {
 }
 
 function ingestFailureRowHtml(f) {
-  var doc = f.sourceUrl
-    ? '<a href="' + esc(f.sourceUrl) + '" target="_blank" rel="noopener">' + esc(f.docId) + '</a>'
+  var safeUrl = safeDocUrl(f.sourceUrl);
+  var doc = safeUrl
+    ? '<a href="' + esc(safeUrl) + '" target="_blank" rel="noopener">' + esc(f.docId) + '</a>'
     : esc(f.docId);
   return '<tr class="row">' +
     '<td>' + doc + '<div class="muted">' + esc(f.chamber || '') + (f.filingType ? ' · ' + esc(f.filingType) : '') + '</div></td>' +
@@ -3174,10 +3180,13 @@ function renderReviewPanels() {
       bits.push(fmtCount(s.newCount) + ' new filings');
       if (s.rejected) bits.push(fmtCount(s.rejected) + ' rejected');
       if (s.dryRun) bits.push('dry run');
-      var staleWarn = s.stale
-        ? ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes, so a relay this old means the Mac fetcher is down or blocked.</strong>'
+      var failedWarn = s.failed
+        ? ' <strong style="color:#c0362c">The last relay call failed to ingest — nothing was written.</strong>'
         : '';
-      relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(bits.join(' · ')) + staleWarn + '</p>';
+      var staleWarn = s.stale
+        ? ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes from 6:00 AM to 10:00 PM, so a relay this old means the Mac fetcher is down or blocked.</strong>'
+        : '';
+      relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(bits.join(' · ')) + failedWarn + staleWarn + '</p>';
     }
   }
   var failEl = el('reviewFailures');
@@ -3203,10 +3212,26 @@ function renderReviewPanels() {
   if (typeof totals.publishedStatusStale === 'number' && totals.publishedStatusStale > 0) {
     sections.push('<p class="note">' + fmtCount(totals.publishedStatusStale) + ' published filings still carry a stale error status (counted only — the filings themselves are live).</p>');
   }
-  if (f && f.deadLetters && f.deadLetters.length) {
-    sections.push(failureSectionHtml(
-      'Dead Letters — Ingestion Outbox (' + fmtCount(f.deadLetters.length) + ')',
-      f.deadLetters.map(deadLetterRowHtml).join('')));
+  if (f && f.deadLettersAvailable === false) {
+    sections.push('<p class="note">Ingestion outbox table unavailable — its dead letters cannot be listed.</p>');
+  } else if (f && f.deadLetters && f.deadLetters.length) {
+    var activeDead = f.deadLetters.filter(function (d) { return !d.parked; });
+    var parkedDead = f.deadLetters.filter(function (d) { return d.parked; });
+    if (activeDead.length) {
+      var totalDead = typeof totals.deadLetters === 'number' ? totals.deadLetters : activeDead.length;
+      sections.push(failureSectionHtml(
+        'Dead Letters — Ingestion Outbox (' + fmtCount(totalDead) + ')',
+        activeDead.map(deadLetterRowHtml).join('')));
+      if (totalDead > activeDead.length) {
+        sections.push('<p class="note">Showing the ' + fmtCount(activeDead.length) + ' most recent of ' + fmtCount(totalDead) + ' dead letters.</p>');
+      }
+    }
+    if (parkedDead.length) {
+      var totalParked = typeof totals.deadLettersParked === 'number' ? totals.deadLettersParked : parkedDead.length;
+      sections.push(failureSectionHtml(
+        'Dead Letters — Parked, Human Review (' + fmtCount(totalParked) + ')',
+        parkedDead.map(deadLetterRowHtml).join('')));
+    }
   }
   if (f && f.dlqFailedAvailable === false) {
     sections.push('<p class="note">Durable queue table unavailable — its failed rows cannot be listed.</p>');

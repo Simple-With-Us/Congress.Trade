@@ -208,6 +208,7 @@ import {
   sweepAlreadyPublishedReviewRows,
 } from '../ingestion/autonomySweeps.ts';
 import {
+  isParkedDlqError,
   requeueTransientFailedDurableJobs,
   requeueTransientFailedIngestionOutbox,
 } from '../ingestion/transientDlq.ts';
@@ -1231,7 +1232,7 @@ interface DeadLetterRow {
 async function listDeadLetters(
   db: D1Database,
   limit: number,
-): Promise<{ items: Array<Record<string, unknown>>; count: number }> {
+): Promise<{ items: Array<Record<string, unknown>>; count: number; available: boolean }> {
   try {
     const rows = await all<DeadLetterRow>(
       db,
@@ -1254,14 +1255,15 @@ async function listDeadLetters(
         deadLetterCycles: row.dead_letter_cycles ?? 0,
         error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
         errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        parked: isParkedDlqError(rawError),
         availableAt: row.available_at ?? null,
         updatedAt: row.updated_at ?? null,
       };
     });
-    return { items, count: items.length };
+    return { items, count: items.length, available: true };
   } catch {
-    /* ingestion_outbox not migrated yet — the section reads empty. */
-    return { items: [], count: 0 };
+    /* ingestion_outbox not migrated yet — the dashboard says unavailable. */
+    return { items: [], count: 0, available: false };
   }
 }
 
@@ -1324,17 +1326,20 @@ async function listDlqFailedRows(
 
 interface PipelineFailureCounts {
   deadLetters: number;
+  deadLettersParked: number;
   dlqFailed: number;
 }
 
 /** Counts for the two pipeline-failure stores the review totals carry. */
 async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCounts> {
-  const [deadRow, dlqRow] = await Promise.all([
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed'`).catch(() => null),
+  const [deadRow, parkedRow, dlqRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') NOT LIKE 'parked:%'`).catch(() => null),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') LIKE 'parked:%'`).catch(() => null),
     get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
   ]);
   return {
     deadLetters: Number(deadRow?.n ?? 0) || 0,
+    deadLettersParked: Number(parkedRow?.n ?? 0) || 0,
     dlqFailed: Number(dlqRow?.n ?? 0) || 0,
   };
 }
@@ -1350,6 +1355,8 @@ interface ReviewQueueTotals {
   publishedStatusStale: number;
   /** Ingestion-outbox dead letters (status 'failed'); global like `unresolved`. */
   deadLetters: number;
+  /** Ingestion-outbox dead letters a human parked (`parked:`); triaged, not active failures. */
+  deadLettersParked: number;
   /** Durable-queue rows in terminal failed state; global like `unresolved`. */
   dlqFailed: number;
 }
@@ -3290,6 +3297,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (includeValues.includes('dead_letters')) {
       const dead = await listDeadLetters(c.env.DB, ingestLimit);
       body.deadLetters = dead.items;
+      body.deadLettersAvailable = dead.available;
     }
     if (includeValues.includes('dlq_failed')) {
       const dlq = await listDlqFailedRows(c.env.DB, ingestLimit);
@@ -6792,10 +6800,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         rejected,
         newCount: 0,
         dryRun: false,
+        failed: true,
       });
       // The scoped intake caller is low-privilege: log the detail
       // server-side and return a generic error, never DB internals.
-      console.error('senate-ptr-intake: ingest failed:', err);
+      console.error('senate-ptr-intake: ingest failed:', (err as Error).message);
       return c.json({ error: 'senate intake failed' }, 500);
     }
   });
