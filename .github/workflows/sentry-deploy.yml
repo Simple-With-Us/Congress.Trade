@@ -56,11 +56,22 @@ jobs:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: node scripts/sentry-report-deploy.mjs
+      # The steps below read and upload files, so they run against the released
+      # revision rather than the main HEAD this job checked out.  SENTRY_RELEASE
+      # is the verified live revision, which can be older or newer than that
+      # HEAD, and the bundle and map stored under a release have to be that
+      # revision's bytes.  The record step refreshed origin/main and proved the
+      # release is on it, so the commit is present in this full-history clone.
+      - name: Check out the released revision
+        if: steps.record.outputs.release != ''
+        env:
+          RELEASE: ${{ steps.record.outputs.release }}
+        run: git checkout --quiet --detach "$RELEASE"
       # Deliberately AFTER record, and gated on the same condition as the upload.
-      # The deploy receipt is the valuable output; the source-map upload is
-      # optional garnish.  An install or registry failure here must never
-      # suppress a production deploy receipt, so both steps are
-      # continue-on-error:  a failure shows on the step and never fails the job.
+      # The deploy receipt is the valuable output and it is already recorded
+      # before these steps run, so a failure here cannot suppress it.  Both
+      # steps fail the job on purpose once a source map exists:  a quietly
+      # green run would hide a broken credential or a failed upload.
       # Installs only the pinned CLI rather than the whole app tree, which exists
       # solely to obtain one binary.
       #
@@ -73,16 +84,18 @@ jobs:
       # deploy since it was added on Oct 11, with "organization not found" once
       # the CLI's output was surfaced (CT-2442).  The REST deploy reporter above
       # is unaffected.  Until a map exists the upload is skipped with a notice
-      # instead of failing.  The upload script's node test checks these
-      # hashFiles() paths against DASHBOARD_SOURCE.
+      # instead of failing.  The notice names only the missing map:  the token's
+      # state is tracked in CT-2442 and is kept out of workflow output.  Once a
+      # map exists, a failed upload fails this job on purpose.  The receipt above
+      # is already recorded by then, and a quietly green run would hide a broken
+      # credential.  The upload script's node test checks these hashFiles()
+      # paths and their operators against DASHBOARD_SOURCE.
       - name: Install the pinned Sentry CLI
         if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
-        continue-on-error: true
         working-directory: app
         run: npm install --no-save --no-audit --no-fund "@sentry/cli@$(node -p "require('./package.json').devDependencies['@sentry/cli']")"
       - name: Upload browser dashboard source maps
         if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
-        continue-on-error: true
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_RELEASE: ${{ steps.record.outputs.release }}

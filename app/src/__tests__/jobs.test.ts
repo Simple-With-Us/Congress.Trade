@@ -603,6 +603,74 @@ describe('staggered daily lanes', () => {
     expect(catchUpState(kv)).toMatchObject({ runs: 3, noProgressRuns: 0 });
   });
 
+  it('does not park or spend the session budget on catch-up runs where ST never engaged (503 outage)', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    // The outage signature: the refresh completes (a 503 is non-fatal per
+    // ticker), prices nothing, and records provider errors.
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, tickersPriced: 0,
+      errors: ['spx: PEER_HTTP_503', 'ASGN: PEER_HTTP_503'],
+      sharePrices: [], shareSpx: [], lastCursorSeq: null, reachedEndOfPending: false,
+    });
+
+    // Three hourly slots during the outage: each run executes (spacing is
+    // honored) but none parks the session or spends its run budget.
+    for (const h of ['08', '09', '10']) {
+      expect(await maybeRunDailyMarketDataJobs(env, new Date(`2026-10-15T${h}:07:00Z`))).toBe('ran');
+    }
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(3);
+    expect(catchUpState(kv)).toMatchObject({ runs: 0, noProgressRuns: 0, attempts: 3, lastRunAt: '2026-10-15T10:07:00.000Z' });
+
+    // A slot inside the spacing still does not walk.
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T10:32:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(3);
+
+    // ST recovers: the next due slot drains immediately — it is not gated by
+    // a park or a spent budget — and engaged runs spend budget as before.
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, tickersPriced: 300, errors: [],
+      sharePrices: [], shareSpx: [], lastCursorSeq: 500, reachedEndOfPending: false,
+    });
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T11:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(4);
+    expect(mocks.runPriceRefresh.mock.calls[3][1]).toMatchObject({ max: 301 });
+    expect(catchUpState(kv)).toMatchObject({ runs: 1, noProgressRuns: 1, attempts: 4 });
+  });
+
+  it('counts zero-priced runs with ticker-level errors as engaged:  they spend the budget and park', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    // ST engaged and answered, but every attempt failed at the ticker level
+    // (no provider-level error in the run) — that is information about the
+    // pending set, not an outage, so the normal park and budget apply.
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, tickersPriced: 0,
+      errors: ['ASGN: unexpected payload shape', 'XYZ: no series available'],
+      sharePrices: [], shareSpx: [], lastCursorSeq: null, reachedEndOfPending: false,
+    });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T10:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
+    expect(catchUpState(kv)).toMatchObject({ runs: 2, noProgressRuns: 2, attempts: 2 });
+  });
+
+  it('stops walking at the per-session attempt cap even when no run ever spent the budget', async () => {
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-10-15'],
+      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 0, attempts: 24, lastRunAt: '2026-10-15T01:07:00Z', noProgressRuns: 0, cursorSeq: null })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T20:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+  });
+
   it('stops at the per-session run cap, and a new freshThrough session starts over', async () => {
     const kv = new Map([
       ['jobs:daily:lastok:market-data', '2026-10-15'],
