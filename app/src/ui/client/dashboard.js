@@ -237,7 +237,7 @@ function chamberLabel(c) {
    nothing else: no 'Exec' branch word in front of it, and no state/district
    (they hold an office, not a seat). EXEC_TITLE_FALLBACK stands alone for an
    uncurated filer — it is never a prefix. */
-var EXEC_TITLE_FORMS = __CT_EXEC_TITLE_FORMS__;
+var EXEC_TITLE_FORMS = __CT_EXEC_TITLE_FORMS__; /*! gitleaks:allow — executive title labels; "Secretary" trips generic-api-key */
 var EXEC_TITLES = EXEC_TITLE_FORMS.titles;
 var EXEC_TITLES_SHORT = EXEC_TITLE_FORMS.short;
 var EXEC_TITLE_FALLBACK = EXEC_TITLE_FORMS.fallback;
