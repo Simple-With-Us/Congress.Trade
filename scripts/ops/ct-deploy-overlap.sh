@@ -63,10 +63,12 @@ STATE_DIR="${STATE_DIR:-/var/lib/ct-deploy-overlap}"
 REATTACH="${REATTACH:-/usr/local/bin/ct-reattach-proxy.sh}"
 LOG_TAG="${LOG_TAG:-ct-deploy-overlap}"
 LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-3}"
-# While no deploy is in flight and no hold clone is running there is nothing
-# to race, so poll slowly.  Each idle tick costs three `docker ps` calls and
-# one Coolify API call; at 3s that was about 16 of each per minute for nothing.
-IDLE_SLEEP_SEC="${IDLE_SLEEP_SEC:-10}"
+# While no deploy is in flight and no hold clone is running, poll a little slower.  The big
+# saving is skipping the discarded `docker exec` health probe (about 16 a minute); this only trims
+# the `docker ps` and Coolify API calls per tick.  Kept at 5s, not longer: a fully cached deploy can
+# reach Coolify's stop_running_container within seconds of starting, and the hold clone must already
+# be serving by then, so detection of a deploy start must stay close to the old 3s cadence.
+IDLE_SLEEP_SEC="${IDLE_SLEEP_SEC:-5}"
 # Default ON: a 3s poll after the builder exits often misses Coolify's
 # immediate stop_running_container.  Start hold when the deploy begins so
 # it is already serving before the in-project container is deleted.
@@ -403,7 +405,12 @@ tick() {
       stop_hold
       ;;
     keep-hold)
-      log "action=keep-hold deploy=${deploy} app=${app:-none} healthy=${app_ok}"
+      # app_ok is probed only with no deploy and the hold up, so say n/a rather than a false 0.
+      if [[ "$deploy" == 1 ]]; then
+        log "action=keep-hold deploy=${deploy} app=${app:-none} healthy=n/a"
+      else
+        log "action=keep-hold deploy=${deploy} app=${app:-none} healthy=${app_ok}"
+      fi
       ;;
     noop)
       ;;

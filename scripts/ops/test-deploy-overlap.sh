@@ -63,7 +63,7 @@ assert_eq "$(decide 0 0 1 0 1 0 1)" "noop" "steady state"
 assert_eq "$(decide 0 0 1 0 0 0 1)" "noop" "idle result does not depend on app health"
 
 # --- loop cadence ----------------------------------------------------------
-assert_eq "$(DEPLOY_ACTIVE=0 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "10" "idle polls slowly"
+assert_eq "$(DEPLOY_ACTIVE=0 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "5" "idle polls a little slower, never beyond 5s by default"
 assert_eq "$(DEPLOY_ACTIVE=1 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "3" "deploy in flight polls fast"
 assert_eq "$(DEPLOY_ACTIVE=0 HOLD_RUNNING=1 bash "$OVERLAP" --sleep-for)" "3" "hold up polls fast"
 assert_eq "$(IDLE_SLEEP_SEC=20 LOOP_SLEEP_SEC=2 DEPLOY_ACTIVE=0 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "20" "idle sleep is overridable"
