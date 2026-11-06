@@ -59,6 +59,14 @@ assert_eq "$(decide 0 0 1 1 1 0 1)" "stop-hold" "drop hold once replacement is h
 assert_eq "$(decide 0 0 1 1 0 0 1)" "keep-hold" "keep hold while new app is not healthy"
 assert_eq "$(decide 0 0 0 1 0 0 1)" "keep-hold" "keep hold in the zero-container gap"
 assert_eq "$(decide 0 0 1 0 1 0 1)" "noop" "steady state"
+# app_healthy is ignored when idle, which is why tick() skips the probe then.
+assert_eq "$(decide 0 0 1 0 0 0 1)" "noop" "idle result does not depend on app health"
+
+# --- loop cadence ----------------------------------------------------------
+assert_eq "$(DEPLOY_ACTIVE=0 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "10" "idle polls slowly"
+assert_eq "$(DEPLOY_ACTIVE=1 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "3" "deploy in flight polls fast"
+assert_eq "$(DEPLOY_ACTIVE=0 HOLD_RUNNING=1 bash "$OVERLAP" --sleep-for)" "3" "hold up polls fast"
+assert_eq "$(IDLE_SLEEP_SEC=20 LOOP_SLEEP_SEC=2 DEPLOY_ACTIVE=0 HOLD_RUNNING=0 bash "$OVERLAP" --sleep-for)" "20" "idle sleep is overridable"
 
 # --- Coolify deployments parse --------------------------------------------
 parse_ok() {

@@ -63,6 +63,10 @@ STATE_DIR="${STATE_DIR:-/var/lib/ct-deploy-overlap}"
 REATTACH="${REATTACH:-/usr/local/bin/ct-reattach-proxy.sh}"
 LOG_TAG="${LOG_TAG:-ct-deploy-overlap}"
 LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-3}"
+# While no deploy is in flight and no hold clone is running there is nothing
+# to race, so poll slowly.  Each idle tick costs three `docker ps` calls and
+# one Coolify API call; at 3s that was about 16 of each per minute for nothing.
+IDLE_SLEEP_SEC="${IDLE_SLEEP_SEC:-10}"
 # Default ON: a 3s poll after the builder exits often misses Coolify's
 # immediate stop_running_container.  Start hold when the deploy begins so
 # it is already serving before the in-project container is deleted.
@@ -110,6 +114,17 @@ decide_overlap_action() {
     return 0
   fi
   printf '%s\n' keep-hold
+}
+
+# Offline: seconds to sleep after a tick.  Busy (deploy in flight or hold up)
+# keeps the fast LOOP_SLEEP_SEC; idle uses IDLE_SLEEP_SEC.
+loop_sleep_for() {
+  local deploy="${1:-0}" hold_running="${2:-0}"
+  if [[ "$deploy" == 1 || "$hold_running" == 1 ]]; then
+    printf '%s\n' "$LOOP_SLEEP_SEC"
+  else
+    printf '%s\n' "$IDLE_SLEEP_SEC"
+  fi
 }
 
 parse_deploy_active() {
@@ -184,6 +199,11 @@ if [[ "${1:-}" == "--decide" ]]; then
     "${APP_HEALTHY:-0}" \
     "${OVERLAP_EARLY:-1}" \
     "${HAVE_IMAGE:-0}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--sleep-for" ]]; then
+  loop_sleep_for "${DEPLOY_ACTIVE:-0}" "${HOLD_RUNNING:-0}"
   exit 0
 fi
 
@@ -359,10 +379,16 @@ tick() {
   builder_active && builder=1
   app_on=0
   [[ -n "$app" ]] && app_on=1
+  # decide_overlap_action reads app_ok only when no deploy is active and the
+  # hold clone is running (stop-hold vs keep-hold), so probe only then.  Probing
+  # on every idle tick was a docker exec every few seconds whose result was
+  # always discarded.
   app_ok=0
-  if [[ "$app_on" == 1 ]] && probe_health "$app"; then
+  if [[ "$app_on" == 1 && "$deploy" == 0 && "$hold_on" == 1 ]] && probe_health "$app"; then
     app_ok=1
   fi
+  TICK_DEPLOY="$deploy"
+  TICK_HOLD="$hold_on"
   have_image=0
   [[ -s "$STATE_DIR/last-image" || -n "$app" ]] && have_image=1
 
@@ -395,10 +421,15 @@ fi
 
 if [[ "${1:-}" == "--loop" ]]; then
   mkdir -p "$STATE_DIR"
-  log "loop start sleep=${LOOP_SLEEP_SEC}s early=${OVERLAP_EARLY}"
+  log "loop start sleep=${LOOP_SLEEP_SEC}s idle_sleep=${IDLE_SLEEP_SEC}s early=${OVERLAP_EARLY}"
+  TICK_DEPLOY=0
+  TICK_HOLD=0
   while true; do
     tick || log "tick failed"
-    sleep "$LOOP_SLEEP_SEC"
+    # A hold started or a deploy seen by this tick counts as busy.  Re-read the
+    # hold state because start_hold may have just launched it.
+    container_running "$HOLD_NAME" && TICK_HOLD=1
+    sleep "$(loop_sleep_for "$TICK_DEPLOY" "$TICK_HOLD")"
   done
 fi
 
