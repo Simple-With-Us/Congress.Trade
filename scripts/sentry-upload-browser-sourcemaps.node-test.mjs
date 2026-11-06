@@ -346,6 +346,29 @@ test('the Sentry Deploy gate keys on the map beside the upload target', () => {
   );
 });
 
+// Review finding:  SENTRY_RELEASE is the verified live revision, which can be
+// older or newer than the main HEAD the job checked out.  The gate and the
+// uploaded bytes have to come from the released tree, so that checkout must
+// happen before any of them.
+test('the Sentry Deploy upload reads the released revision, not main HEAD', () => {
+  const workflow = readFileSync(resolve(ROOT, '.github/workflows/sentry-deploy.yml'), 'utf8');
+  const steps = workflowSteps(workflow);
+  const names = steps.map((step) => step.name);
+  const checkoutName = 'Check out the released revision';
+  const checkout = steps.find((step) => step.name === checkoutName);
+  assert.ok(checkout, `the Sentry Deploy workflow must keep the "${checkoutName}" step`);
+  assert.match(checkout.text, /RELEASE: \$\{\{ steps\.record\.outputs\.release \}\}/);
+  assert.match(checkout.text, /git checkout --quiet --detach "\$RELEASE"/);
+  for (const name of [
+    'Install the pinned Sentry CLI',
+    'Upload browser dashboard source maps',
+    'Skip browser source map upload (no source map built)',
+  ]) {
+    assert.ok(names.includes(name), `the Sentry Deploy workflow must keep the "${name}" step`);
+    assert.ok(names.indexOf(checkoutName) < names.indexOf(name), `"${checkoutName}" must run before "${name}"`);
+  }
+});
+
 // Sentry matches a browser stack frame to its artifact by NAME, and the frame
 // reports the path the browser requested.  An artifact named after anything but
 // the served path matches no frame at all.

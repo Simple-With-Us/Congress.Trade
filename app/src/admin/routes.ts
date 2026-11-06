@@ -51,6 +51,7 @@ import {
 import type { Env, ParsedTx, PollConfig, PollWindow, TxType, TxSource, Subscription, DocKind, Chamber, Filing } from '../shared/types.ts';
 import { all, batch, batchPrepared, chunkArray, first, get, isSqliteLockBusy, run, type SqlParam } from '../shared/db.ts';
 import { checkReadiness } from '../shared/readiness.ts';
+import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
 import { listIngestionDecisions, recordIngestionDecision } from '../shared/ingestionDecisions.ts';
 import { activeWindow, effectiveInterval, getConfig, setConfig } from '../shared/config.ts';
@@ -4858,6 +4859,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Admin operational snapshot: provider/source connection status, usage counts,
   // and recent errors collected from existing D1 tables. This intentionally
   // reports only whether secrets are configured, never their values.
+  // Operator-private filing-skip diagnostics: the public /health payload
+  // carries counts only, so the raw unreadable 278-T doc ids behind
+  // `oge_text_unreadable` (most recent failure first) are exposed here,
+  // behind the admin router's deny-by-default auth.
+  r.get('/pipeline-health/filing-skips', async (c) => {
+    const pipeline = await checkPipelineHealth(c.env);
+    const filingSkips = pipeline.checks.find((check) => check.id === 'filing_skips') ?? null;
+    return c.json({
+      status: pipeline.status,
+      filingSkips,
+      unreadableExecutiveDocCount: pipeline.signals?.unreadableExecutiveDocCount ?? null,
+      unreadableExecutiveDocIds: pipeline.signals?.unreadableExecutiveDocIds ?? [],
+      time: new Date().toISOString(),
+    });
+  });
+
   r.get('/diagnostics', async (c) => {
     const now = new Date();
     const last24 = hoursAgoIso(24, now);

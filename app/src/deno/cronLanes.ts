@@ -21,6 +21,7 @@
 import type { Env } from '../shared/types.ts';
 import {
   maybeRunDailyMarketDataJobs,
+  maybeRunPeerPriceCatchUp,
   maybeRunDailySnapshotJob,
   maybeRunDailyFilerJobs,
   maybeRunDailyRetentionJobs,
@@ -51,6 +52,28 @@ export const DAILY_LANE_CRONS: readonly DailyLaneCron[] = [
     name: 'daily-market-data',
     schedule: '7 * * * *',
     run: (env, now, signal) => maybeRunDailyMarketDataJobs(env, now, { signal }),
+  },
+  // Peer-price catch-up (CT-2445) on its OWN lane, decoupled from the
+  // market-data lane's daily stamp. The catch-up used to be reachable only
+  // from that lane's stamped fast path, so a backlog the full lane could not
+  // clear inside its deadline (which leaves the day unstamped) also kept the
+  // bounded drain from ever engaging. This lane gets its own singleton lock
+  // and deadline via runDailyLane; the catch-up's KV gate (55-minute spacing,
+  // per-session bounds) makes a tick with nothing due a cheap no-op, and the
+  // stamped fast path still calls the same function.
+  {
+    name: 'peer-price-catchup',
+    schedule: '17 * * * *',
+    // Map the gate's 'stamped' to a lane-specific status:  registerDailyLaneCrons
+    // suppresses 'stamped' lines, which is right for the date-stamped lanes but
+    // would leave a parked or capped catch-up completely invisible — the exact
+    // diagnostic gap CT-2445 set out to close.  'skipped-gated' logs the firing
+    // without changing the gate's own vocabulary (the market-data fast path
+    // still returns 'stamped' from the same function).
+    run: async (env, now, signal) => {
+      const status = await maybeRunPeerPriceCatchUp(env, now, { signal });
+      return status === 'stamped' ? 'skipped-gated' : status;
+    },
   },
   // Snapshot after market data so it captures today's freshest data.
   { name: 'daily-snapshot', schedule: '22 * * * *', run: maybeRunDailySnapshotJob },

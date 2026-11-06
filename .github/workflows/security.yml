@@ -82,6 +82,22 @@ jobs:
           esac
           if [ -n "$lo" ] && [ "$lo" != "0000000000000000000000000000000000000000" ] && [ -n "$hi" ]; then
             git fetch --no-tags origin "$lo" "$hi"
+            # Depth-1 checkout leaves hi without parents. Without an ancestry
+            # link, gitleaks 8.24.3 cannot walk lo..hi and falls back to a
+            # full-tree tip scan, attributing every pre-existing finding to
+            # the tip SHA (seen on main after #2943). Deepen until lo is an
+            # ancestor of hi; unshallow only if deepen cannot bridge them.
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              for _ in 1 2 3 4 5 6 7 8; do
+                git fetch --no-tags --deepen=50 origin || true
+                if git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+                  break
+                fi
+              done
+            fi
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+            fi
           else
             # No usable range (new branch / first push): the scan falls back
             # to full history, so restore it rather than silently scanning
