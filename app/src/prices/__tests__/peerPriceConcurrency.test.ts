@@ -305,6 +305,28 @@ describe('runPriceRefresh — bounded-concurrency fetch stage (CT-2445)', () => 
     }
   });
 
+  it('processes the whole page when the page exactly spends the budget — no dropped tail', async () => {
+    const tickers = ['BUD1', 'BUD2', 'BUD3', 'BUD4'];
+    tickers.forEach((t, i) => {
+      seedTrade(`b${i}`, t, `2026-06-${String(i + 1).padStart(2, '0')}`);
+      // All four fetches start (and spend the budget down to zero) long
+      // before the first one completes and the processor moves on.
+      h.delaysMs.set(t, 100);
+      h.responses.set(t, freshCloses());
+    });
+
+    // max 5 = the S&P call + exactly these 4 tickers, so the last fetch
+    // spends the final budget unit mid-page.
+    const res = await runPriceRefresh(env, { max: 5, concurrency: 4, maxPerMinute: 100_000 });
+
+    // Every claimed ticker was already paid for;  dropping the tail here
+    // would waste the fetches and re-pay them next run.
+    expect(res.tickersPriced).toBe(4);
+    expect(res.fmpCalls).toBe(5);
+    expect(res.budgetRemaining).toBe(0);
+    for (const t of tickers) expect(eodCount(t)).toBeGreaterThan(0);
+  });
+
   it('fetches the scoped missing window under concurrency', async () => {
     // Covered cache:  narrow 7-day incremental off the cached max.
     seedTrade('w1', 'WARM', '2026-06-10');

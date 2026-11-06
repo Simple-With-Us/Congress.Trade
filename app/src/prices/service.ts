@@ -1003,7 +1003,12 @@ export async function runPriceRefresh(
       result.aborted = true;
       break;
     }
-    if (budget <= 0) break;
+    // The page was selected within the budget, so a ticker the pool has
+    // already claimed has also already paid for its attempt — processing it
+    // spends nothing more, and breaking here would drop a fetched ticker.
+    // The budget guard only bites for a ticker not yet claimed (defensive;
+    // selection bounds the page to the budget, so it cannot fire today).
+    if (budget <= 0 && pageIndex >= nextFetchIndex) break;
     // The resume point is the last ticker this run finished, not the last one
     // selected, so an abort mid-page does not skip the unattempted rest.  A
     // fatal error on this ticker restores the previous point (see below), so
