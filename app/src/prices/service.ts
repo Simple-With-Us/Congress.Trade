@@ -996,6 +996,9 @@ export async function runPriceRefresh(
   const workers: Array<Promise<void>> = [];
   for (let w = 0; w < Math.min(fetchConcurrency, page.length); w++) workers.push(fetchWorker());
   const poolDone = Promise.all(workers).then(() => undefined);
+  // Set when a ticker's plan threw;  rethrown only after the pool shutdown
+  // below, so no fetch worker is left running detached past the throw.
+  let pendingThrow: { error: unknown } | null = null;
 
   for (let pageIndex = 0; pageIndex < page.length; pageIndex++) {
     const { ticker, seq } = page[pageIndex];
@@ -1024,9 +1027,8 @@ export async function runPriceRefresh(
       break;
     }
     if (outcome.kind === 'throw') {
-      fetchHalted = true;
-      notifyGate();
-      throw outcome.error;
+      pendingThrow = { error: outcome.error };
+      break;
     }
     let stopWalk = false;
     if (outcome.kind !== 'noplan') {
@@ -1174,10 +1176,14 @@ export async function runPriceRefresh(
   }
   // Stop the pool and let in-flight fetches settle before the final
   // accounting, so `calls`/`budget` below count every attempt actually made
-  // and no fetch is still running when the caller reads the result.
+  // and no fetch is still running when the caller reads the result — or when
+  // a plan error is rethrown:  the throw path comes through here too, so a
+  // failed run never leaves workers pacing and calling Socratic.Trade with
+  // no consumer.
   fetchHalted = true;
   notifyGate();
   await Promise.all(workers);
+  if (pendingThrow) throw pendingThrow.error;
 
   result.reachedEndOfPending = !result.aborted && tickers.length < selectBudget;
   // A walk that resumed from a cursor skipped everything before it, so it never
