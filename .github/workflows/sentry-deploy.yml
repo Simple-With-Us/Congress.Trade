@@ -68,10 +68,10 @@ jobs:
           RELEASE: ${{ steps.record.outputs.release }}
         run: git checkout --quiet --detach "$RELEASE"
       # Deliberately AFTER record, and gated on the same condition as the upload.
-      # The deploy receipt is the valuable output; the source-map upload is
-      # optional garnish.  An install or registry failure here must never
-      # suppress a production deploy receipt, so both steps are
-      # continue-on-error:  a failure shows on the step and never fails the job.
+      # The deploy receipt is the valuable output and it is already recorded
+      # before these steps run, so a failure here cannot suppress it.  Both
+      # steps fail the job on purpose once a source map exists:  a quietly
+      # green run would hide a broken credential or a failed upload.
       # Installs only the pinned CLI rather than the whole app tree, which exists
       # solely to obtain one binary.
       #
@@ -92,12 +92,10 @@ jobs:
       # paths and their operators against DASHBOARD_SOURCE.
       - name: Install the pinned Sentry CLI
         if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
-        continue-on-error: true
         working-directory: app
         run: npm install --no-save --no-audit --no-fund "@sentry/cli@$(node -p "require('./package.json').devDependencies['@sentry/cli']")"
       - name: Upload browser dashboard source maps
         if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
-        continue-on-error: true
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_RELEASE: ${{ steps.record.outputs.release }}
