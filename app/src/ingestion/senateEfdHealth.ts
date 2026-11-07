@@ -7,7 +7,7 @@
  * senateSource.ts.  The old unproxied direct GET was dropped (owner ruling
  * 2026-10-16) because datacenter egress is a structural 403 that said nothing
  * about whether ingestion works.  Each probe sends eFD one agreement POST, so
- * it dials at most every 30 minutes and not at all while the watcher's
+ * it dials at most twice a day and not at all while the watcher's
  * edge-deny backoff is active (CT-2442).
  */
 
@@ -43,7 +43,7 @@ export interface SenateEfdProbeRecord {
    * throttle).  False on relay-down / unconfigured records, which never dial.
    */
   dialed?: boolean;
-  /** When an eFD dial was last attempted (carried across relay-down records; drives the 30-minute throttle). */
+  /** When an eFD dial was last attempted (carried across relay-down records; drives the twice-a-day throttle). */
   lastDialedAt?: string | null;
 }
 
@@ -80,7 +80,10 @@ export async function persistSenateEfdProbe(env: Env, rec: SenateEfdProbeRecord)
   if (!env.CONFIG_KV) return;
   try {
     await env.CONFIG_KV.put(SENATE_EFD_HEALTH_KV_KEY, JSON.stringify(rec), {
-      expirationTtl: 86_400,
+      // Four days, not one: the health check's stale threshold is three
+      // probe intervals (36h), and a record that expires at 24h would make
+      // that branch unreachable — the record must outlive the threshold.
+      expirationTtl: 4 * 86_400,
     });
   } catch {
     /* best-effort */

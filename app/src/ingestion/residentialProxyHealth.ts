@@ -178,12 +178,15 @@ export async function refreshResidentialProxyHealth(env: Env, now = new Date()):
 /**
  * Dial eFD at most this often, whatever the last verdict; relay-down records
  * are written every tick (no eFD hop).  Each dial sends eFD one agreement
- * POST, the request its edge is refusing for automated clients (CT-2442), so
- * the probe stays at 30 minutes or slower.  An edge deny gets no shorter or
- * separate probe backoff: the watcher's edge-deny backoff (senateEdgeDeny.ts)
- * is the one Senate backoff, and the probe skips while it is active.
+ * POST, the request its edge is refusing for automated clients (CT-2442).  
+ * The probe is a twice-a-day canary now, not a live status feed: Senate
+ * filings arrive through the Mac eFD fetcher's intake relay, and this dial
+ * only watches for the proxy path ever opening again (owner direction,
+ * 2026-11-05).  An edge deny gets no shorter or separate probe backoff: the
+ * watcher's edge-deny backoff (senateEdgeDeny.ts) is the one Senate
+ * backoff, and the probe skips while it is active.
  */
-export const SENATE_EFD_PROXY_PROBE_INTERVAL_MS = 30 * 60_000;
+export const SENATE_EFD_PROXY_PROBE_INTERVAL_MS = 12 * 60 * 60_000;
 
 // Literal (not derived from SENATE_SEARCH) so suites that vi.mock senateSource
 // without these exports can still import this module.
@@ -397,7 +400,7 @@ export async function refreshSenateEfdProxyProbe(
   if (Number.isFinite(lastMs) && now.getTime() - lastMs < SENATE_EFD_PROXY_PROBE_INTERVAL_MS) {
     // Throttled.  If the stored record is a relay-down one, the relay is back
     // but eFD state is unknown until the next allowed dial, so leave it as is
-    // (pipelineHealth keeps reporting degraded for at most 30 minutes).
+    // (pipelineHealth reads that record as the canary state until the next scheduled dial).
     return;
   }
   const rec = await probeSenateEfdThroughProxy(

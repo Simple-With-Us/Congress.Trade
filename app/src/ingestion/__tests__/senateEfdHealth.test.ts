@@ -142,7 +142,7 @@ describe('refreshSenateEfdProxyProbe', () => {
     expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'degraded', error: 'residential proxy down', dialed: false });
   });
 
-  it('dials eFD at most once per 30 minutes', async () => {
+  it('dials eFD at most once per probe interval', async () => {
     // Each dial is one agreement POST, the request eFD's edge refuses for
     // automated clients (CT-2442), so the interval never drops below 30m.
     expect(SENATE_EFD_PROXY_PROBE_INTERVAL_MS).toBeGreaterThanOrEqual(30 * 60_000);
@@ -176,7 +176,7 @@ describe('refreshSenateEfdProxyProbe', () => {
     expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'ok', lastDialedAt: new Date(now.getTime() + 60_000).toISOString() });
   });
 
-  it('a relay flap does not reset the 30-minute throttle', async () => {
+  it('a relay flap does not reset the 12-hour throttle', async () => {
     const { env } = memEnv();
     const calls: string[] = [];
     const fetchImpl = efdFetch(() => new Response('', { status: 302 }), calls);
@@ -186,13 +186,13 @@ describe('refreshSenateEfdProxyProbe', () => {
     await refreshSenateEfdProxyProbe(env, at(2), { proxyUrl: PROXY, proxyReachable: false }, fetchImpl);
     expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'degraded', lastDialedAt: at(0).toISOString() });
     await refreshSenateEfdProxyProbe(env, at(4), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
-    await refreshSenateEfdProxyProbe(env, at(29), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(11 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(2);
-    await refreshSenateEfdProxyProbe(env, at(30), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(12 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(4);
   });
 
-  it('an Akamai block keeps the same 30-minute interval (no separate probe backoff)', async () => {
+  it('an Akamai block keeps the same 12-hour interval (no separate probe backoff)', async () => {
     const { env } = memEnv();
     const calls: string[] = [];
     const fetchImpl = efdFetch(() => new Response(AKAMAI_403, { status: 403 }), calls);
@@ -200,10 +200,10 @@ describe('refreshSenateEfdProxyProbe', () => {
     await refreshSenateEfdProxyProbe(env, at(0), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(2);
     expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'blocked' });
-    await refreshSenateEfdProxyProbe(env, at(15), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
-    await refreshSenateEfdProxyProbe(env, at(29), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(6 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(11 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(2);
-    await refreshSenateEfdProxyProbe(env, at(30), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(12 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(4);
   });
 
@@ -239,7 +239,7 @@ describe('refreshSenateEfdProxyProbe', () => {
     expect(await readSenateEfdProbe(env)).toMatchObject({ state: 'degraded', error: 'residential proxy down', dialed: false });
   });
 
-  it('a transport error still counts against the 30-minute throttle', async () => {
+  it('a transport error still counts against the 12-hour throttle', async () => {
     const { env } = memEnv();
     const calls: string[] = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -252,10 +252,10 @@ describe('refreshSenateEfdProxyProbe', () => {
     expect(await readSenateEfdProbe(env)).toMatchObject({
       state: 'degraded', status: null, dialed: true, lastDialedAt: at(0).toISOString(),
     });
-    await refreshSenateEfdProxyProbe(env, at(1), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
-    await refreshSenateEfdProxyProbe(env, at(29), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(11 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(1);
-    await refreshSenateEfdProxyProbe(env, at(30), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
+    await refreshSenateEfdProxyProbe(env, at(12 * 60), { proxyUrl: PROXY, proxyReachable: true }, fetchImpl);
     expect(calls).toHaveLength(2);
   });
 
