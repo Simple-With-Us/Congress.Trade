@@ -26,6 +26,7 @@
     "npm:node-html-parser@^9.0.4": "9.0.4",
     "npm:pdf-lib@^1.17.1": "1.17.1",
     "npm:typescript@^5.6.3": "5.9.3",
+    "npm:unpdf@2": "2.1.0",
     "npm:unpdf@^1.8.1": "1.9.1",
     "npm:vite@^8.3.2": "8.3.3_@types+node@26.6.6_esbuild@0.28.2",
     "npm:vitest@^5.0.3": "5.0.3_@types+node@26.6.6_@vitest+coverage-v8@5.0.3_jsdom@30.1.3_vite@8.3.3__@types+node@26.6.6__esbuild@0.28.2",
@@ -2312,6 +2313,9 @@
     "unpdf@1.9.1": {
       "integrity": "sha512-nO1npM2kNyd4hj1fKzUVU6bvnWjDSxI97eycM/DgzI83dYyW+pNRI9NeMQVEfef8fI3Q06i9lkMeE1HxrQqKoA=="
     },
+    "unpdf@2.1.0": {
+      "integrity": "sha512-G/Hsrm++g0EoubUhV8TDFItq6oQ+FUu9EMvIRtHUwseKXB0iJoCvaLvBGOpYUBqyvggv/XfxhYYtohL2QpE3xQ=="
+    },
     "uri-js@4.4.1": {
       "integrity": "sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg==",
       "dependencies": [
@@ -2476,7 +2480,7 @@
       "npm:jsonrepair@^3.15.0",
       "npm:node-html-parser@^9.0.4",
       "npm:pdf-lib@^1.17.1",
-      "npm:unpdf@^1.8.1",
+      "npm:unpdf@2",
       "npm:zod@^4.6.5"
     ],
     "packageJson": {

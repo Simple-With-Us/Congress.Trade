@@ -628,6 +628,8 @@ ${speedProofSectionHtml('trends')}
         <button class="btn sm" id="revTabPending" onclick="setReviewTab(0)">Pending</button>
         <button class="btn ghost sm" id="revTabReviewed" onclick="setReviewTab(1)">Resolved Reviews</button>
       </div>
+      <div id="reviewRelayStatus"></div>
+      <div id="reviewFailures"></div>
       <div class="review-table-wrap" id="reviewTableWrap" role="region" aria-label="Review queue table">
         <table>
           <thead><tr><th>Filed</th><th>Doc</th><th>Status</th><th>Reason</th><th>Payload</th><th></th></tr></thead>
