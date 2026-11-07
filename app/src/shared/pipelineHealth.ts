@@ -1197,7 +1197,9 @@ export function evaluatePipelineSignals(
   }
 
   // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
-  // the residential proxy.  ok / blocked (Akamai anti-bot 403 → `critical`) /
+  // the residential proxy.  ok / blocked (an Akamai anti-bot 403 reads
+  // `degraded` since the 2026-11-05 canary redesign: the deny is the expected
+  // state of this path and Senate data flows via the Mac fetcher relay) /
   // degraded.  A degraded probe where eFD itself answered wrong (non-Akamai
   // HTTP error, landing without a csrf token: `status` set) is `stalled`, so it
   // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
@@ -1226,11 +1228,11 @@ export function evaluatePipelineSignals(
     const waitMin = Math.round((efdBackoffUntilMs - nowMs) / 60_000);
     checks.push({
       id: 'senate_efd',
-      status: 'critical',
-      detail: `Senate eFD BLOCKED: Akamai edge deny on Senate ingestion `
+      status: 'degraded',
+      detail: `Senate eFD canary: Akamai edge deny on Senate ingestion `
         + `${deniedAgoMin < 1 ? Math.round(deniedAgoMin * 60) + 's' : Math.round(deniedAgoMin) + 'm'} ago (${efdBackoff.reason})`
-        + ` — refused by eFD itself, not a relay outage; the probe is paused for the edge-deny backoff`
-        + ` (${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
+        + ` — refused by eFD itself, not a relay outage; the twice-a-day canary tracks this path and Senate filings arrive via the Mac fetcher relay`
+        + ` (ingestion backoff: ${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
       value: 403,
     });
   } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
@@ -1261,15 +1263,16 @@ export function evaluatePipelineSignals(
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
     const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
-    // The probe dials eFD at most every 30m, so allow two missed cycles.
+    // The probe dials eFD at most twice a day, so allow three cycles
+    // before a resting ok record is even called stale (it still reads ok).
     const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, (3 * SENATE_EFD_PROXY_PROBE_INTERVAL_MS) / 60_000);
     const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
     if (probe.state === 'blocked') {
       checks.push({
         id: 'senate_efd',
-        status: 'critical',
-        detail: `Senate eFD BLOCKED: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
-          + ` — Senate ingestion is refused by eFD itself, not a relay outage (probed ${ago})`,
+        status: 'degraded',
+        detail: `Senate eFD canary blocked: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
+          + ` — expected for this path, not a relay outage; Senate filings arrive via the Mac fetcher relay (probed ${ago})`,
         value: probe.status,
       });
     } else if (probe.state === 'degraded') {
@@ -1281,10 +1284,13 @@ export function evaluatePipelineSignals(
         value: probe.status,
       });
     } else if (ageMin > maxAgeMin) {
+      // A stale ok is the canary resting between its twice-a-day dials, not a
+      // stall: the dial schedule plus missed-cycle tolerance puts this
+      // threshold far past any healthy gap.
       checks.push({
         id: 'senate_efd',
-        status: 'degraded',
-        detail: `Senate eFD probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${maxAgeMin}m)`,
+        status: 'ok',
+        detail: `Senate eFD canary: last dial ok ${Math.round(ageMin)}m ago — the probe dials twice a day by design; Senate filings arrive via the Mac fetcher relay`,
         value: Math.round(ageMin),
       });
     } else {

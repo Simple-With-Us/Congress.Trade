@@ -64,6 +64,16 @@ export const PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION = 8;
 export const PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION = 24;
 export const PEER_PRICE_CATCHUP_MAX_TICKERS = 300;
 export const PEER_PRICE_CATCHUP_MAX_PER_MINUTE = 60;
+/**
+ * Per-ticker fetches in flight at once inside one catch-up run (CT-2445
+ * follow-up, 2026-11-06).  A cold Socratic.Trade fetch takes ~10s, so the
+ * serial walk spent the 10-minute lane deadline on latency and priced only
+ * ~50 of its 300-ticker page.  Four in flight over the same 60/min pacer
+ * lets a run finish its full page in about 5 minutes of pacing;  the pacer
+ * still governs the aggregate request rate, so this changes no rate,
+ * deadline, session-cap, or schedule bound above.
+ */
+export const PEER_PRICE_CATCHUP_FETCH_CONCURRENCY = 4;
 export const PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS = 2;
 
 /** Persisted between hourly ticks.  Reset whenever freshThrough changes. */
