@@ -238,17 +238,53 @@ export function buildAdminMigrateStatements(): readonly string[] {
          PRIMARY KEY (trade_hash, provider, event)
        )`,
       `CREATE INDEX IF NOT EXISTS idx_latency_price_due ON latency_price_snapshots (captured_at, due_at)`,
-      // 0025_amendment_trump_deprecation.sql — soft-deprecate unamended Trump report rows superseded by amendment.
+      // 0025_amendment_trump_deprecation.sql — soft-deprecate the rows of the
+      // filing the amendment ACTUALLY amends, and only when that filing's own
+      // transaction dates overlap the amended filing's period.
+      //
+      // CT-2452: this statement used to deprecate E-2025-…-278t-3 (period
+      // 2025-07-25 + 2025-08-01) because the amendment
+      // E-2025-…-278t-2-amended (period 2025-07-01 .. 2025-07-23) was filed on
+      // the same date.  Those periods are DISJOINT: the amendment supersedes
+      // neither sibling, and the -3 rows were wrongly unpublished (38 of the
+      // 545 lost rows in that incident).  The amended filing is
+      // E-2025-…-278t-2, and the overlap test below is the same rule
+      // extraction/amendmentPredecessor.ts applies at runtime.  A NULL from
+      // either side (a filing with no live rows) leaves the comparison NULL,
+      // which is not TRUE, so nothing is deprecated.
       `UPDATE transactions
           SET deprecated_at = '2026-07-28T17:00:00.000Z',
               deprecated_reason = 'superseded by amendment E-2025-donald-j-trump-08-12-2025-278t-2-amended'
-        WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-3'
+        WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2'
           AND deprecated_at IS NULL
           AND EXISTS (
             SELECT 1 FROM transactions WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND deprecated_at IS NULL
-          )`,
+          )
+          AND (SELECT MIN(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL)
+              <= (SELECT MAX(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL)
+          AND (SELECT MAX(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL)
+              >= (SELECT MIN(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL)`,
       `CREATE INDEX IF NOT EXISTS idx_filings_filer_amend ON filings(filer_id, ingest_status, filed_date)`,
-      // 0026_retroactive_amendment_deprecation_sweep.sql — soft-deprecate all historical predecessor filing transactions superseded by amended filings across all chambers (indexed and bounded to 50 per run for instant response).
+      // 0026_retroactive_amendment_deprecation_sweep.sql — soft-deprecate the
+      // transactions of filings that an amended filing actually supersedes,
+      // across all chambers (bounded to 50 per run for instant response).
+      //
+      // CT-2452: this sweep joined the amended filing to its "predecessor" on
+      // filer_id + filed_date, so it deprecated every sibling report filed the
+      // same day (345 rows of the 2025-08-12 Trump 278-T base, whose period
+      // Jan 21 - Jun 13 is disjoint from the July amendment).  The join is now
+      // the REAL amended-document relationship: the amended filing's doc id
+      // minus its trailing amendment marker (-amended / -amendment / -amend)
+      // IS the amended filing's doc id, exactly as OGE names an amendment
+      // after the document it amends ("278T(2) AMENDED.pdf" amends
+      // "278T(2).pdf").  The period-overlap test is the same rule
+      // extraction/amendmentPredecessor.ts applies at runtime, and a filing
+      // whose doc id carries no amendment marker yields NULL and matches
+      // nothing.
       `UPDATE transactions
           SET deprecated_at = '2026-07-28T17:15:00.000Z',
               deprecated_reason = 'retroactive amendment cleanup: superseded by newer amended filing'
@@ -257,12 +293,24 @@ export function buildAdminMigrateStatements(): readonly string[] {
             SELECT f_orig.doc_id
               FROM filings f_amend
               JOIN filings f_orig
-                ON f_amend.filer_id = f_orig.filer_id
-               AND f_amend.filed_date = f_orig.filed_date
-               AND f_amend.doc_id <> f_orig.doc_id
-             WHERE f_amend.ingest_status = 'persisted'
+                ON f_orig.doc_id = CASE
+                     WHEN f_amend.doc_id LIKE '%-amended'  THEN SUBSTR(f_amend.doc_id, 1, LENGTH(f_amend.doc_id) - LENGTH('-amended'))
+                     WHEN f_amend.doc_id LIKE '%-amendment' THEN SUBSTR(f_amend.doc_id, 1, LENGTH(f_amend.doc_id) - LENGTH('-amendment'))
+                     WHEN f_amend.doc_id LIKE '%-amend'     THEN SUBSTR(f_amend.doc_id, 1, LENGTH(f_amend.doc_id) - LENGTH('-amend'))
+                     ELSE NULL
+                   END
                AND f_orig.ingest_status = 'persisted'
+             WHERE f_amend.ingest_status = 'persisted'
                AND (f_amend.filing_status = 'Amended' OR f_amend.doc_id LIKE '%amend%' OR f_amend.source_url LIKE '%amend%')
+               AND (SELECT MIN(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL)
+                   <= (SELECT MAX(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL)
+               AND (SELECT MAX(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL)
+                   >= (SELECT MIN(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL)
+             ORDER BY f_amend.doc_id, f_orig.doc_id
              LIMIT 50
           )`,
       // 0029-0039 — canonical value, reliability, Stripe, review, and benchmark tail.
