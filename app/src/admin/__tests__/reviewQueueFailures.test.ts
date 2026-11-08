@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { buildAdminRouter } from '../routes.ts';
 import { makeReviewQueueTestDb, type ReviewQueueFixtureRow } from './reviewQueueTestDb.ts';
 import { SENATE_INTAKE_STATUS_KV_KEY } from '../../ingestion/senateIntakeStatus.ts';
@@ -214,7 +214,16 @@ describe('GET /review-queue pipeline failures', () => {
     expect(body.totals.dlqFailed).toBe(0);
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('carries the Senate intake relay heartbeat, fresh and stale', async () => {
+    // Staleness is judged against the fetcher's 06:00-22:00 America/Chicago window, so a
+    // heartbeat two hours old reads fresh when the suite runs overnight.  Pin the clock to
+    // midday Chicago (a Tuesday) so the result does not depend on when CI happens to run.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-03-03T18:00:00Z'));
     const db = makeReviewQueueTestDb(fixture());
     const kv = fakeKv();
     kv.map.set(SENATE_INTAKE_STATUS_KV_KEY, JSON.stringify({
