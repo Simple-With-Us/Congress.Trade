@@ -93,7 +93,7 @@ describe('parsePeerPriceCatchUpState day roll', () => {
     expect(peerPriceCatchUpGate(parsed, SATURDAY)).toBe('session-cap');
   });
 
-  it('treats a legacy state without budgetDay as belonging to the current day', () => {
+  it('derives a legacy state\'s budget day from lastRunAt, so a spent one rolls on a later ET day', () => {
     const legacy = {
       freshThrough: FRIDAY_SESSION,
       runs: PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
@@ -103,16 +103,19 @@ describe('parsePeerPriceCatchUpState day roll', () => {
       cursorSeq: 102624,
     };
     const parsed = parsePeerPriceCatchUpState(JSON.stringify(legacy), FRIDAY_SESSION, SATURDAY);
-    // No free reset:  the spent budget still caps today, and the day is
-    // stamped so the state the caller writes back rolls normally after.
-    expect(parsed.runs).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    // Last run was Friday 6 PM ET, so the budget is Friday's and Saturday
+    // rolls it (the gate must not stay session-capped, since a capped tick
+    // never rewrites KV to stamp the day).
+    expect(parsed.runs).toBe(0);
+    expect(parsed.cursorSeq).toBe(102624);
     expect(parsed.budgetDay).toBe('2026-11-07');
-    expect(peerPriceCatchUpGate(parsed, SATURDAY)).toBe('session-cap');
-    const SUNDAY = new Date('2026-11-08T14:07:00Z');
-    const rolled = parsePeerPriceCatchUpState(JSON.stringify(parsed), FRIDAY_SESSION, SUNDAY);
-    expect(rolled.runs).toBe(0);
-    expect(rolled.budgetDay).toBe('2026-11-08');
-    expect(peerPriceCatchUpGate(rolled, SUNDAY)).toBe('ok');
+    expect(peerPriceCatchUpGate(parsed, SATURDAY)).toBe('ok');
+    // A legacy state last run the same ET day keeps its spent budget.
+    const sameDay = { ...legacy, lastRunAt: '2026-11-07T12:17:00.000Z' };
+    const capped = parsePeerPriceCatchUpState(JSON.stringify(sameDay), FRIDAY_SESSION, SATURDAY);
+    expect(capped.runs).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    expect(capped.budgetDay).toBe('2026-11-07');
+    expect(peerPriceCatchUpGate(capped, SATURDAY)).toBe('session-cap');
   });
 });
 

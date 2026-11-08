@@ -140,7 +140,7 @@ export const PeerPriceCatchUpStateSchema = z.object({
   noProgressRuns: nonNegativeInt,
   cursorSeq: z.number().finite().nullable(),
   // Optional so states written before the day roll still parse;  the reader
-  // treats those as belonging to the current ET day.
+  // derives the day from lastRunAt.
   budgetDay: z.string().optional(),
 });
 
@@ -163,10 +163,14 @@ export function parsePeerPriceCatchUpState(
   }
   const v = parsed.data;
   const today = easternDateString(now);
-  // States written before the day roll have no budgetDay;  they belong to
-  // today, so the budget they carry still applies (no free reset), and the
-  // first write under the new code stamps the day.
-  const budgetDay = v.budgetDay ?? today;
+  // States written before the day roll have no budgetDay.  Derive it from the
+  // ET day of the last run so a legacy state spent on an earlier day rolls
+  // like a stamped one (defaulting to today would carry the spent budget
+  // forward, and a session-capped tick never rewrites KV to stamp the day).
+  // With no usable lastRunAt there is no earlier day to blame, so it
+  // belongs to today.
+  const lastRunMs = v.lastRunAt ? Date.parse(v.lastRunAt) : Number.NaN;
+  const budgetDay = v.budgetDay ?? (Number.isNaN(lastRunMs) ? today : easternDateString(new Date(lastRunMs)));
   if (budgetDay !== today) {
     // ET day roll inside one session:  freshThrough does not roll over a
     // weekend, so without this the Friday session's budget — spent by

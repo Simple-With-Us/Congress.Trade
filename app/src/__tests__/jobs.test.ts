@@ -662,7 +662,7 @@ describe('staggered daily lanes', () => {
   it('stops walking at the per-session attempt cap even when no run ever spent the budget', async () => {
     const kv = new Map([
       ['jobs:daily:lastok:market-data', '2026-10-15'],
-      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 0, attempts: 24, lastRunAt: '2026-10-15T01:07:00Z', noProgressRuns: 0, cursorSeq: null })],
+      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 0, attempts: 24, lastRunAt: '2026-10-15T14:07:00Z', noProgressRuns: 0, cursorSeq: null })],
     ]);
     const env = laneEnv(kv);
     (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
@@ -674,7 +674,7 @@ describe('staggered daily lanes', () => {
   it('stops at the per-session run cap, and a new freshThrough session starts over', async () => {
     const kv = new Map([
       ['jobs:daily:lastok:market-data', '2026-10-15'],
-      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 8, lastRunAt: '2026-10-15T01:07:00Z', noProgressRuns: 0, cursorSeq: 42 })],
+      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 8, lastRunAt: '2026-10-15T14:07:00Z', noProgressRuns: 0, cursorSeq: 42 })],
     ]);
     const env = laneEnv(kv);
     (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
@@ -709,6 +709,25 @@ describe('staggered daily lanes', () => {
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
     expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ afterCursorSeq: 102624 });
     expect(catchUpState(kv)).toMatchObject({ freshThrough: '2026-11-06', runs: 1, budgetDay: '2026-11-07', cursorSeq: 102624 });
+  });
+
+  it('rolls a pre-budgetDay legacy state spent on an earlier ET day', async () => {
+    // The state KV actually held at the incident: written by the code before
+    // this field existed, so no budgetDay, runs at the cap.
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-11-08'],
+      [CATCHUP_STATE_KEY, JSON.stringify({
+        freshThrough: '2026-11-06', runs: 8, attempts: 8,
+        lastRunAt: '2026-11-07T12:17:00.000Z', noProgressRuns: 0,
+        cursorSeq: 102624,
+      })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-11-05' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-11-08T14:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ afterCursorSeq: 102624 });
+    expect(catchUpState(kv)).toMatchObject({ runs: 1, budgetDay: '2026-11-08', cursorSeq: 102624 });
   });
 
   it('skips a catch-up when the D1 budget is spent, and spaces out a retry after an aborted one', async () => {
