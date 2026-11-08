@@ -247,7 +247,7 @@ function parseTable(table: HTMLElement): { rows: ParsedTx[]; usedHeader: boolean
     if (tx) {
       const detail = splitAssetDetail(trs[i], map.assetName);
       if (detail) {
-        tx.assetName = detail.name || tx.assetName;
+        tx.assetName = detail.name || tx.ticker || '(unknown)';
         tx.description = detail.description;
       }
       rows.push(tx);
@@ -393,8 +393,11 @@ export function splitAssetDetail(
   if (details.length === 0) return null;
   const clean = (t: string): string => t.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').replace(/\s+\(/g, ' (').trim();
   const lines = details.map((d) => clean(d.text)).filter(Boolean);
-  for (const d of details) d.remove();
-  return { name: clean(cell.text), description: lines.join('; ') };
+  // Strip the muted nodes from a clone so the parsed tree (and the table
+  // serialized into ExtractorResult.raw) keeps the original detail lines.
+  const nameCell = cell.clone() as HTMLElement;
+  for (const d of nameCell.querySelectorAll('.text-muted')) d.remove();
+  return { name: clean(nameCell.text), description: lines.join('; ') };
 }
 
 function looksLikeHeader(cells: string[]): boolean {

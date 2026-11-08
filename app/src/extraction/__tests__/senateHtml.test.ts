@@ -118,6 +118,29 @@ describe('SenateHtmlExtractor', () => {
     expect(r.amountMin).toBe(500001);
     expect(r.rawText).toContain('Company:');
     expect(normalizeOcrAssetName(r.assetName).nameHolds).toEqual([]);
+    // The split must not mutate the tree that is serialized into raw.
+    expect(result.raw).toContain('Company:');
+    expect(result.raw).toContain('Description:');
+    expect(result.raw).toContain('Media Company');
+  });
+
+  it('does not restore the polluted name when the cell holds only muted detail lines', async () => {
+    const html = `<table class="table report-data"><thead><tr>
+      <th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th>
+      <th>Asset Name</th><th>Asset Type</th><th>Type</th><th>Amount</th><th>Comment</th>
+    </tr></thead><tbody><tr>
+      <td>9</td><td>09/21/2026</td><td>Spouse</td><td>--</td>
+      <td>
+        <div class="text-muted"><em>Company:</em> Only Detail Co (Austin, TX)</div>
+        <div class="text-muted"><em>Description:</em> Partnership</div>
+      </td>
+      <td>Other</td><td>Sale (Full)</td><td>$1,001 - $15,000</td><td>--</td>
+    </tr></tbody></table>`;
+    const result = await new SenateHtmlExtractor().extract({ filing: filing(), html });
+    expect(result.transactions).toHaveLength(1);
+    const [r] = result.transactions;
+    expect(r.assetName).not.toContain(':');
+    expect(r.description).toBe('Company: Only Detail Co (Austin, TX); Description: Partnership');
   });
 
   it('returns low confidence when no transaction table is present', async () => {
