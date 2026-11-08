@@ -261,13 +261,13 @@ export function buildAdminMigrateStatements(): readonly string[] {
             SELECT 1 FROM transactions WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND deprecated_at IS NULL
           )
           AND (SELECT MIN(t.tx_date) FROM transactions t
-                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL)
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
               <= (SELECT MAX(t.tx_date) FROM transactions t
-                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL)
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
           AND (SELECT MAX(t.tx_date) FROM transactions t
-                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL)
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
               >= (SELECT MIN(t.tx_date) FROM transactions t
-                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL)`,
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')`,
       `CREATE INDEX IF NOT EXISTS idx_filings_filer_amend ON filings(filer_id, ingest_status, filed_date)`,
       // 0026_retroactive_amendment_deprecation_sweep.sql — soft-deprecate the
       // transactions of filings that an amended filing actually supersedes,
@@ -284,32 +284,42 @@ export function buildAdminMigrateStatements(): readonly string[] {
       // "278T(2).pdf").  The period-overlap test is the same rule
       // extraction/amendmentPredecessor.ts applies at runtime, and a filing
       // whose doc id carries no amendment marker yields NULL and matches
-      // nothing.
+      // nothing.  A trailing -N sequence (a second amendment) is stripped
+      // first, and empty tx_date rows are ignored, both as at runtime.
       `UPDATE transactions
           SET deprecated_at = '2026-07-28T17:15:00.000Z',
               deprecated_reason = 'retroactive amendment cleanup: superseded by newer amended filing'
         WHERE deprecated_at IS NULL
           AND doc_id IN (
             SELECT f_orig.doc_id
-              FROM filings f_amend
+              FROM (
+                SELECT f.*,
+                       CASE
+                         WHEN RTRIM(f.doc_id, '0123456789') <> f.doc_id
+                          AND SUBSTR(RTRIM(f.doc_id, '0123456789'), -1) = '-'
+                         THEN SUBSTR(f.doc_id, 1, LENGTH(RTRIM(f.doc_id, '0123456789')) - 1)
+                         ELSE f.doc_id
+                       END AS base_id
+                  FROM filings f
+              ) f_amend
               JOIN filings f_orig
                 ON f_orig.doc_id = CASE
-                     WHEN f_amend.doc_id LIKE '%-amended'  THEN SUBSTR(f_amend.doc_id, 1, LENGTH(f_amend.doc_id) - LENGTH('-amended'))
-                     WHEN f_amend.doc_id LIKE '%-amendment' THEN SUBSTR(f_amend.doc_id, 1, LENGTH(f_amend.doc_id) - LENGTH('-amendment'))
-                     WHEN f_amend.doc_id LIKE '%-amend'     THEN SUBSTR(f_amend.doc_id, 1, LENGTH(f_amend.doc_id) - LENGTH('-amend'))
+                     WHEN f_amend.base_id LIKE '%-amended'  THEN SUBSTR(f_amend.base_id, 1, LENGTH(f_amend.base_id) - LENGTH('-amended'))
+                     WHEN f_amend.base_id LIKE '%-amendment' THEN SUBSTR(f_amend.base_id, 1, LENGTH(f_amend.base_id) - LENGTH('-amendment'))
+                     WHEN f_amend.base_id LIKE '%-amend'     THEN SUBSTR(f_amend.base_id, 1, LENGTH(f_amend.base_id) - LENGTH('-amend'))
                      ELSE NULL
                    END
                AND f_orig.ingest_status = 'persisted'
              WHERE f_amend.ingest_status = 'persisted'
                AND (f_amend.filing_status = 'Amended' OR f_amend.doc_id LIKE '%amend%' OR f_amend.source_url LIKE '%amend%')
                AND (SELECT MIN(t.tx_date) FROM transactions t
-                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL)
+                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
                    <= (SELECT MAX(t.tx_date) FROM transactions t
-                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL)
+                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
                AND (SELECT MAX(t.tx_date) FROM transactions t
-                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL)
+                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
                    >= (SELECT MIN(t.tx_date) FROM transactions t
-                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL)
+                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
              ORDER BY f_amend.doc_id, f_orig.doc_id
              LIMIT 50
           )`,

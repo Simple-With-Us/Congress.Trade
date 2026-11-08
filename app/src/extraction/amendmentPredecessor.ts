@@ -181,6 +181,25 @@ export async function deprecatePredecessorFilingTransactions(
   filedDate: string | null,
   nowIso: string = new Date().toISOString(),
 ): Promise<number> {
+  try {
+    return await deprecatePredecessorRows(db, docId, filerId, filedDate, nowIso);
+  } catch (err) {
+    console.warn(
+      'amendment deprecation skipped: database error',
+      docId,
+      err instanceof Error ? err.message : String(err),
+    );
+    return 0;
+  }
+}
+
+async function deprecatePredecessorRows(
+  db: D1Database,
+  docId: string,
+  filerId: string | null,
+  filedDate: string | null,
+  nowIso: string,
+): Promise<number> {
   if (!filerId) return 0;
 
   // 1. The amended filing's own reporting period.
@@ -215,8 +234,8 @@ export async function deprecatePredecessorFilingTransactions(
   }
 
   // An amendment never supersedes another filer's filing, whatever the
-  // doc id says.
-  if (predecessor.filer_id && predecessor.filer_id !== filerId) {
+  // doc id says, and a predecessor with no filer on record is not proof.
+  if (predecessor.filer_id !== filerId) {
     console.warn(
       'amendment deprecation skipped: predecessor belongs to another filer',
       docId,
