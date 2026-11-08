@@ -21,19 +21,21 @@ const NOW = new Date('2026-10-24T15:07:00Z');
 
 describe('parsePeerPriceCatchUpState', () => {
   it('starts fresh when nothing is stored, the JSON is bad, or the session changed', () => {
-    expect(parsePeerPriceCatchUpState(null, SESSION)).toEqual(freshPeerPriceCatchUpState(SESSION));
-    expect(parsePeerPriceCatchUpState('{not json', SESSION)).toEqual(freshPeerPriceCatchUpState(SESSION));
+    expect(parsePeerPriceCatchUpState(null, SESSION, NOW)).toEqual(freshPeerPriceCatchUpState(SESSION, NOW));
+    expect(parsePeerPriceCatchUpState('{not json', SESSION, NOW)).toEqual(freshPeerPriceCatchUpState(SESSION, NOW));
     const old = JSON.stringify({ freshThrough: '2026-10-22', runs: 8, lastRunAt: NOW.toISOString(), noProgressRuns: 2, cursorSeq: 9 });
-    expect(parsePeerPriceCatchUpState(old, SESSION)).toEqual(freshPeerPriceCatchUpState(SESSION));
+    expect(parsePeerPriceCatchUpState(old, SESSION, NOW)).toEqual(freshPeerPriceCatchUpState(SESSION, NOW));
   });
 
   it('keeps a valid same-session state, and restarts on any malformed field', () => {
     const good = { freshThrough: SESSION, runs: 3, lastRunAt: NOW.toISOString(), noProgressRuns: 1, cursorSeq: 42 };
     // A state stored before the attempts bound has no attempts field;  it
-    // parses with attempts approximated by the spent-run count.
-    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION)).toEqual({ ...good, attempts: 3 });
+    // parses with attempts approximated by the spent-run count.  A state
+    // stored before the day roll has no budgetDay;  it parses as belonging
+    // to the current ET day (NOW is 2026-10-24 in ET).
+    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION, NOW)).toEqual({ ...good, attempts: 3, budgetDay: '2026-10-24' });
     const withAttempts = { ...good, attempts: 11 };
-    expect(parsePeerPriceCatchUpState(JSON.stringify(withAttempts), SESSION)).toEqual(withAttempts);
+    expect(parsePeerPriceCatchUpState(JSON.stringify(withAttempts), SESSION, NOW)).toEqual({ ...withAttempts, budgetDay: '2026-10-24' });
     for (const bad of [
       { ...good, runs: -1 },
       { ...good, runs: 1.5 },
@@ -42,8 +44,75 @@ describe('parsePeerPriceCatchUpState', () => {
       { ...good, lastRunAt: 7 },
       { freshThrough: SESSION },
     ]) {
-      expect(parsePeerPriceCatchUpState(JSON.stringify(bad), SESSION)).toEqual(freshPeerPriceCatchUpState(SESSION));
+      expect(parsePeerPriceCatchUpState(JSON.stringify(bad), SESSION, NOW)).toEqual(freshPeerPriceCatchUpState(SESSION, NOW));
     }
+  });
+});
+
+describe('parsePeerPriceCatchUpState day roll', () => {
+  // The 2026-11-07 incident shape:  the Friday session (freshThrough
+  // 2026-11-06, current through Monday) spent its whole run budget on
+  // Friday's ET day, cursor mid-set.
+  const FRIDAY_SESSION = '2026-11-06';
+  const spentFriday = {
+    freshThrough: FRIDAY_SESSION,
+    runs: PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
+    attempts: PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
+    lastRunAt: '2026-11-06T23:07:00.000Z',
+    noProgressRuns: 0,
+    cursorSeq: 102624,
+    budgetDay: '2026-11-06',
+  };
+  const SATURDAY = new Date('2026-11-07T14:07:00Z'); // 09:07 EST
+
+  it('opens the gate on a new ET day with the budget exhausted under the same freshThrough', () => {
+    const rolled = parsePeerPriceCatchUpState(JSON.stringify(spentFriday), FRIDAY_SESSION, SATURDAY);
+    expect(rolled.runs).toBe(0);
+    expect(rolled.attempts).toBe(0);
+    expect(rolled.budgetDay).toBe('2026-11-07');
+    expect(peerPriceCatchUpGate(rolled, SATURDAY)).toBe('ok');
+  });
+
+  it('keeps freshThrough and the cursor across the roll, and clears the park', () => {
+    const parked = { ...spentFriday, noProgressRuns: PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS };
+    const rolled = parsePeerPriceCatchUpState(JSON.stringify(parked), FRIDAY_SESSION, SATURDAY);
+    expect(rolled.freshThrough).toBe(FRIDAY_SESSION);
+    expect(rolled.cursorSeq).toBe(102624);
+    expect(rolled.noProgressRuns).toBe(0);
+    // Spacing is a rate bound, not a budget:  the Friday-evening stamp
+    // survives the roll and still throttles early-morning ticks.
+    expect(rolled.lastRunAt).toBe(spentFriday.lastRunAt);
+  });
+
+  it('does not reset within the same ET day', () => {
+    const spentSaturday = { ...spentFriday, budgetDay: '2026-11-07', lastRunAt: '2026-11-07T12:17:00.000Z' };
+    const parsed = parsePeerPriceCatchUpState(JSON.stringify(spentSaturday), FRIDAY_SESSION, SATURDAY);
+    expect(parsed.runs).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    expect(parsed.attempts).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    expect(parsed.budgetDay).toBe('2026-11-07');
+    expect(peerPriceCatchUpGate(parsed, SATURDAY)).toBe('session-cap');
+  });
+
+  it('treats a legacy state without budgetDay as belonging to the current day', () => {
+    const legacy = {
+      freshThrough: FRIDAY_SESSION,
+      runs: PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
+      attempts: PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
+      lastRunAt: '2026-11-06T23:07:00.000Z',
+      noProgressRuns: 0,
+      cursorSeq: 102624,
+    };
+    const parsed = parsePeerPriceCatchUpState(JSON.stringify(legacy), FRIDAY_SESSION, SATURDAY);
+    // No free reset:  the spent budget still caps today, and the day is
+    // stamped so the state the caller writes back rolls normally after.
+    expect(parsed.runs).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    expect(parsed.budgetDay).toBe('2026-11-07');
+    expect(peerPriceCatchUpGate(parsed, SATURDAY)).toBe('session-cap');
+    const SUNDAY = new Date('2026-11-08T14:07:00Z');
+    const rolled = parsePeerPriceCatchUpState(JSON.stringify(parsed), FRIDAY_SESSION, SUNDAY);
+    expect(rolled.runs).toBe(0);
+    expect(rolled.budgetDay).toBe('2026-11-08');
+    expect(peerPriceCatchUpGate(rolled, SUNDAY)).toBe('ok');
   });
 });
 

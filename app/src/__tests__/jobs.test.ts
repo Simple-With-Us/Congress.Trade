@@ -689,6 +689,28 @@ describe('staggered daily lanes', () => {
     expect(catchUpState(kv)).toMatchObject({ freshThrough: '2026-10-15', runs: 1 });
   });
 
+  it('resumes a weekend tail on a new ET day even when Friday spent the whole run budget', async () => {
+    // The 2026-11-07 incident:  freshThrough is Friday 2026-11-06 and does
+    // not roll until Tuesday, but the run budget belonged to Friday's ET
+    // day — Saturday's tick gets a fresh budget and resumes from the
+    // cursor instead of staying session-capped all weekend.
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-11-07'],
+      [CATCHUP_STATE_KEY, JSON.stringify({
+        freshThrough: '2026-11-06', runs: 8, attempts: 8,
+        lastRunAt: '2026-11-07T12:17:00.000Z', noProgressRuns: 0,
+        cursorSeq: 102624, budgetDay: '2026-11-06',
+      })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-11-05' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-11-07T14:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ afterCursorSeq: 102624 });
+    expect(catchUpState(kv)).toMatchObject({ freshThrough: '2026-11-06', runs: 1, budgetDay: '2026-11-07', cursorSeq: 102624 });
+  });
+
   it('skips a catch-up when the D1 budget is spent, and spaces out a retry after an aborted one', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
