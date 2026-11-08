@@ -11,7 +11,7 @@
     "npm:@sentry/cli@^3.8.0": "3.8.0",
     "npm:@sentry/deno@^11.4.0": "11.10.0",
     "npm:@types/node@26.6.6": "26.6.6",
-    "npm:@typescript-eslint/eslint-plugin@^8.71.0": "8.71.1_@typescript-eslint+parser@8.71.1_eslint@10.12.0_typescript@5.9.3",
+    "npm:@typescript-eslint/eslint-plugin@^8.71.0": "8.71.1_@typescript-eslint+parser@8.71.1__eslint@10.12.0__typescript@5.9.3_eslint@10.12.0_typescript@5.9.3",
     "npm:@typescript-eslint/parser@^8.71.0": "8.71.1_eslint@10.12.0_typescript@5.9.3",
     "npm:@vitest/coverage-v8@^5.0.3": "5.0.3_vitest@5.0.3_@types+node@26.6.6",
     "npm:dd-trace@*": "6.12.0",
@@ -27,7 +27,6 @@
     "npm:pdf-lib@^1.17.1": "1.17.1",
     "npm:typescript@^5.6.3": "5.9.3",
     "npm:unpdf@2": "2.1.0",
-    "npm:unpdf@^1.8.1": "1.9.1",
     "npm:vite@^8.3.2": "8.3.3_@types+node@26.6.6_esbuild@0.28.2",
     "npm:vitest@^5.0.3": "5.0.3_@types+node@26.6.6_@vitest+coverage-v8@5.0.3_jsdom@30.1.3_vite@8.3.3__@types+node@26.6.6__esbuild@0.28.2",
     "npm:zod@^4.6.5": "4.6.7"
@@ -304,14 +303,14 @@
     "@csstools/color-helpers@6.1.2": {
       "integrity": "sha512-grhRy3OKmniaAEKXMjua5z/EODX0MSqBGjunw8+j/3HQjOnahs2AGhvEOIYVUWcU6ScApbhLhVrQTX8XqrMrow=="
     },
-    "@csstools/css-calc@3.4.3_@csstools+css-parser-algorithms@4.0.2_@csstools+css-tokenizer@4.0.2": {
+    "@csstools/css-calc@3.4.3_@csstools+css-parser-algorithms@4.0.2__@csstools+css-tokenizer@4.0.2_@csstools+css-tokenizer@4.0.2": {
       "integrity": "sha512-iex20d8CHVkyvg6B7UKV7uHnI2Bqo9g+EFfT9E0y+GvTvhZ/DwONJ+9aKb1dlqm0ZiGsL5RXjp0fCoJYnkeDjA==",
       "dependencies": [
         "@csstools/css-parser-algorithms",
         "@csstools/css-tokenizer"
       ]
     },
-    "@csstools/css-color-parser@4.2.6_@csstools+css-parser-algorithms@4.0.2_@csstools+css-tokenizer@4.0.2": {
+    "@csstools/css-color-parser@4.2.6_@csstools+css-parser-algorithms@4.0.2__@csstools+css-tokenizer@4.0.2_@csstools+css-tokenizer@4.0.2": {
       "integrity": "sha512-iiPQ3iRWwnJkeEn6RIu6SJPr7hYrLz6XZ9s/QZl+2/LI5KQVjpl2fdmDSZKuD4xP6GMmMPgHFFXg6k1Wkz0Trg==",
       "dependencies": [
         "@csstools/color-helpers",
@@ -1146,7 +1145,7 @@
         "@types/node"
       ]
     },
-    "@typescript-eslint/eslint-plugin@8.71.1_@typescript-eslint+parser@8.71.1_eslint@10.12.0_typescript@5.9.3": {
+    "@typescript-eslint/eslint-plugin@8.71.1_@typescript-eslint+parser@8.71.1__eslint@10.12.0__typescript@5.9.3_eslint@10.12.0_typescript@5.9.3": {
       "integrity": "sha512-nNlBf6HuotqMgZvSkWD5hNdemiBIxQ2NmrlgfcUIeZRs+BbakjscCQRq/Hb74EFVnFiSWWdL12JruqwBy3ERDw==",
       "dependencies": [
         "@eslint-community/regexpp",
@@ -2310,9 +2309,6 @@
     "undici@8.12.2": {
       "integrity": "sha512-XtuDWVdqTLr3NAxm2ly9/hU6kUsJOgGh1RASzMBbsw6aWCOaQzHdW+QQDfdERjfJ2V5vL5pRPa4RetO9UfivDg=="
     },
-    "unpdf@1.9.1": {
-      "integrity": "sha512-nO1npM2kNyd4hj1fKzUVU6bvnWjDSxI97eycM/DgzI83dYyW+pNRI9NeMQVEfef8fI3Q06i9lkMeE1HxrQqKoA=="
-    },
     "unpdf@2.1.0": {
       "integrity": "sha512-G/Hsrm++g0EoubUhV8TDFItq6oQ+FUu9EMvIRtHUwseKXB0iJoCvaLvBGOpYUBqyvggv/XfxhYYtohL2QpE3xQ=="
     },
@@ -2505,7 +2501,7 @@
         "npm:node-html-parser@^9.0.4",
         "npm:pdf-lib@^1.17.1",
         "npm:typescript@^5.6.3",
-        "npm:unpdf@^1.8.1",
+        "npm:unpdf@2",
         "npm:vite@^8.3.2",
         "npm:vitest@^5.0.3",
         "npm:zod@^4.6.5"
