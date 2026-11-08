@@ -7,7 +7,7 @@
 import { z } from 'zod';
 import type { Env } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
-import { lastTradingDay } from './service.ts';
+import { easternDateString, lastTradingDay } from './service.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
 import {
   ST_PEER_PRICE_TAIL_STALL_MAX_PENDING,
@@ -23,21 +23,33 @@ import {
  *
  * - Cadence:  at most one run per PEER_PRICE_CATCHUP_MIN_SPACING_MS, which is
  *   one per hourly :07 slot (55 minutes leaves room for cron jitter).
- * - Per session:  at most PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION engaged
- *   runs for one freshThrough, so at most 8 x 300 = 2,400 Socratic.Trade
- *   price reads from runs that engage the provider.  Total attempts
- *   (engaged plus no-engagement) are separately capped at
- *   PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION, so a provider that never
- *   engages cannot turn the drain into an unbounded hourly loop either.
+ * - Per day:  at most PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION engaged runs
+ *   per ET calendar day within one freshThrough session, so at most
+ *   8 x 300 = 2,400 Socratic.Trade price reads per day from runs that
+ *   engage the provider.  Total attempts (engaged plus no-engagement) are
+ *   separately capped at PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION per
+ *   day, so a provider that never engages cannot turn the drain into an
+ *   unbounded hourly loop either.
+ * - Day roll (2026-11-08):  the budgets used to be keyed to freshThrough
+ *   alone, but freshThrough does not roll over a weekend — the Friday
+ *   session spans Friday through Monday — so on Sat 2026-11-07 the walk
+ *   spent all 8 runs by 12:17Z and stayed session-capped until Tuesday
+ *   with ~319 tickers still pending (cursor stuck at 102624 of 126424).
+ *   The budgets and the no-progress park now reset when the ET calendar
+ *   day changes inside a session (see budgetDay on the state);  the
+ *   session itself, the cursor, and the spacing stamp survive the roll.
+ *   One visible side effect:  the NULL-only current-price backfill is
+ *   keyed to the first claimed run, so it now runs on the first catch-up
+ *   of each ET day instead of the first of each session.
  * - Per run:  at most PEER_PRICE_CATCHUP_MAX_TICKERS tickers, paced at
  *   PEER_PRICE_CATCHUP_MAX_PER_MINUTE.  ST's peerRead limit is 120 requests a
  *   minute for ALL peer reads, so 60 leaves half of it for everything else.
  *   300 tickers at 60/min is about 5 minutes, inside the 10-minute lane deadline.
- * - Stop:  park for the rest of the session after
+ * - Stop:  park for the rest of the ET day after
  *   PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS consecutive completed runs that did
  *   not shrink the pending count (tickers ST keeps erroring on, or no
  *   provider).  Failed runs do not count toward the park, but they do spend
- *   the session's run budget, so 429s cannot retry more than 8 times.
+ *   the day's run budget, so 429s cannot retry more than 8 times a day.
  * - No-engagement runs (CT-2445 follow-up, 2026-11-04):  a completed run that
  *   priced zero tickers and recorded provider errors on its attempts never
  *   engaged ST's data path at all — the outage signature (ST answering 503
@@ -51,16 +63,17 @@ import {
  *   only runs whose recorded errors are ALL provider-level qualify (a
  *   zero-priced run with any ticker-level failure counts as engaged, so it
  *   spends a run and can park), and every claimed run — engaged or not —
- *   increments the session's attempt count, which the gate caps.  An
+ *   increments the day's attempt count, which the gate caps.  An
  *   engaged run also resets nothing about attempts:  the cap is a
- *   per-session total, reset only when freshThrough rolls.
+ *   per-day total, reset when the ET day rolls or when freshThrough rolls.
  */
 export const PEER_PRICE_CATCHUP_MIN_SPACING_MS = 55 * 60_000;
 export const PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION = 8;
-/** Total claimed runs per session, engaged plus no-engagement.  At the
- *  55-minute spacing, 24 attempts span a full session day, so a genuine
- *  outage of any length still recovers on the first tick after the provider
- *  returns, while a permanently erroring pending set is hard-bounded. */
+/** Total claimed runs per ET day within a session, engaged plus
+ *  no-engagement.  At the 55-minute spacing, 24 attempts span a full day,
+ *  so a genuine outage of any length still recovers on the first tick
+ *  after the provider returns, while a permanently erroring pending set
+ *  is hard-bounded. */
 export const PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION = 24;
 export const PEER_PRICE_CATCHUP_MAX_TICKERS = 300;
 export const PEER_PRICE_CATCHUP_MAX_PER_MINUTE = 60;
@@ -76,25 +89,42 @@ export const PEER_PRICE_CATCHUP_MAX_PER_MINUTE = 60;
 export const PEER_PRICE_CATCHUP_FETCH_CONCURRENCY = 4;
 export const PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS = 2;
 
-/** Persisted between hourly ticks.  Reset whenever freshThrough changes. */
+/** Persisted between hourly ticks.  Reset whenever freshThrough changes;
+ *  the budgets inside it also reset when the ET day rolls (see budgetDay). */
 export interface PeerPriceCatchUpState {
   freshThrough: string;
   runs: number;
-  /** Total runs claimed this session, including no-engagement runs that
-   *  handed their run claim back.  Never refunded; the gate caps it, which
-   *  is what bounds the no-engagement retry loop. */
+  /** Total runs claimed this budget day, including no-engagement runs that
+   *  handed their run claim back.  Never refunded within the day; the gate
+   *  caps it, which is what bounds the no-engagement retry loop. */
   attempts: number;
   /** ISO time the last run STARTED.  Set before the run, so a throw or an
-   *  abort still counts toward spacing and the session cap. */
+   *  abort still counts toward spacing and the day's run budget. */
   lastRunAt: string | null;
   noProgressRuns: number;
   /** Rotating resume point (MAX(cursor_seq) of the last ticker reached).  Null
    *  starts from the head of the oldest-first pending set. */
   cursorSeq: number | null;
+  /** ET calendar day (YYYY-MM-DD) the runs / attempts / noProgressRuns
+   *  budgets belong to.  freshThrough does not roll over a weekend, so a
+   *  session alone can span three-plus days;  the budgets reset when this
+   *  differs from the current ET day.  Absent in states written before the
+   *  day roll existed — the reader treats those as belonging to the
+   *  current day (their budget still applies;  no free reset) and the
+   *  first write under the new code stamps the day. */
+  budgetDay: string;
 }
 
-export function freshPeerPriceCatchUpState(freshThrough: string): PeerPriceCatchUpState {
-  return { freshThrough, runs: 0, attempts: 0, lastRunAt: null, noProgressRuns: 0, cursorSeq: null };
+export function freshPeerPriceCatchUpState(freshThrough: string, now = new Date()): PeerPriceCatchUpState {
+  return {
+    freshThrough,
+    runs: 0,
+    attempts: 0,
+    lastRunAt: null,
+    noProgressRuns: 0,
+    cursorSeq: null,
+    budgetDay: easternDateString(now),
+  };
 }
 
 const nonNegativeInt = z.number().int().nonnegative();
@@ -109,25 +139,52 @@ export const PeerPriceCatchUpStateSchema = z.object({
   lastRunAt: z.string().nullable(),
   noProgressRuns: nonNegativeInt,
   cursorSeq: z.number().finite().nullable(),
+  // Optional so states written before the day roll still parse;  the reader
+  // treats those as belonging to the current ET day.
+  budgetDay: z.string().optional(),
 });
 
 /** Parse a stored state;  anything malformed or from another session restarts. */
 export function parsePeerPriceCatchUpState(
   raw: string | null,
   freshThrough: string,
+  now = new Date(),
 ): PeerPriceCatchUpState {
-  if (!raw) return freshPeerPriceCatchUpState(freshThrough);
+  if (!raw) return freshPeerPriceCatchUpState(freshThrough, now);
   let json: unknown;
   try {
     json = JSON.parse(raw);
   } catch {
-    return freshPeerPriceCatchUpState(freshThrough);
+    return freshPeerPriceCatchUpState(freshThrough, now);
   }
   const parsed = PeerPriceCatchUpStateSchema.safeParse(json);
   if (!parsed.success || parsed.data.freshThrough !== freshThrough) {
-    return freshPeerPriceCatchUpState(freshThrough);
+    return freshPeerPriceCatchUpState(freshThrough, now);
   }
   const v = parsed.data;
+  const today = easternDateString(now);
+  // States written before the day roll have no budgetDay;  they belong to
+  // today, so the budget they carry still applies (no free reset), and the
+  // first write under the new code stamps the day.
+  const budgetDay = v.budgetDay ?? today;
+  if (budgetDay !== today) {
+    // ET day roll inside one session:  freshThrough does not roll over a
+    // weekend, so without this the Friday session's budget — spent by
+    // Saturday noon in the 2026-11-07 incident — would gate the walk until
+    // Tuesday.  Reset the budgets and the park;  keep the cursor (the walk
+    // resumes mid-set) and lastRunAt (spacing is a rate bound, not a
+    // budget, so a late-evening run still throttles the first tick of the
+    // new day).
+    return {
+      freshThrough,
+      runs: 0,
+      attempts: 0,
+      lastRunAt: v.lastRunAt ?? null,
+      noProgressRuns: 0,
+      cursorSeq: v.cursorSeq ?? null,
+      budgetDay: today,
+    };
+  }
   return {
     freshThrough: v.freshThrough,
     runs: v.runs,
@@ -135,6 +192,7 @@ export function parsePeerPriceCatchUpState(
     lastRunAt: v.lastRunAt ?? null,
     noProgressRuns: v.noProgressRuns,
     cursorSeq: v.cursorSeq ?? null,
+    budgetDay,
   };
 }
 
@@ -184,8 +242,8 @@ export function peerPriceCatchUpAfterRun(
     /** False only for a no-engagement run:  it priced zero tickers and every
      *  attempt failed with a provider-level error, so it never engaged ST's
      *  data path and hands its session claim back.  Default true — aborted
-     *  and engaged runs spend one of the session's runs as before.  The
-     *  session's attempt count is never handed back either way. */
+     *  and engaged runs spend one of the day's runs as before.  The
+     *  day's attempt count is never handed back either way. */
     spendRun?: boolean;
   },
 ): PeerPriceCatchUpState {
@@ -193,7 +251,7 @@ export function peerPriceCatchUpAfterRun(
   const progressed = run.pendingAfter !== null && run.pendingAfter < run.pendingBefore;
   // A failed run that moved nothing says nothing about whether ST can price the
   // rest, so it does not count toward the park (Kody #2859).  It still spent one
-  // of the session's runs and waits out the spacing, so failures stay bounded.
+  // of the day's runs and waits out the spacing, so failures stay bounded.
   const noProgressRuns = progressed ? 0 : run.failed ? state.noProgressRuns : state.noProgressRuns + 1;
   return {
     ...state,
