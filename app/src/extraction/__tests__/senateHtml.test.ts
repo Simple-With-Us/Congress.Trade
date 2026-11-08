@@ -8,6 +8,7 @@ import {
   detectOption,
   detectCapGains,
 } from '../senateHtml.ts';
+import { normalizeOcrAssetName } from '../ocrSanity.ts';
 import type { ExtractorInput } from '../../extractors/types.ts';
 import type { Filing } from '../../shared/types.ts';
 
@@ -88,6 +89,35 @@ describe('SenateHtmlExtractor', () => {
     expect(r2.amountMin).toBe(15001);
     expect(r2.amountMax).toBe(50000);
     expect(r2.isOption).toBe(true);
+  });
+
+  it('splits eFD Company:/Description: detail lines out of assetName', async () => {
+    // Shape of Senate PTR e67780bf (Blumenthal, filed 2026-10-26): private
+    // partnership rows carry muted detail lines inside the Asset Name cell.
+    const html = `<table class="table report-data"><thead><tr>
+      <th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th>
+      <th>Asset Name</th><th>Asset Type</th><th>Type</th><th>Amount</th><th>Comment</th>
+    </tr></thead><tbody><tr>
+      <td>8</td><td>09/21/2026</td><td>Spouse</td><td>--</td>
+      <td>
+        GCP Captivate Secondary LP
+        <div class="text-muted"><em>Company:</em> Captivate Network
+          &nbsp;(New York, NY)
+        </div>
+        <div class="text-muted"><em>Description:</em>&nbsp;Media Company</div>
+      </td>
+      <td>Other</td><td>Sale (Full)</td><td>$500,001 - $1,000,000</td>
+      <td>Underlying Asset of Peter L. Malkin Family 2000 LLC</td>
+    </tr></tbody></table>`;
+    const result = await new SenateHtmlExtractor().extract({ filing: filing(), html });
+    expect(result.transactions).toHaveLength(1);
+    const [r] = result.transactions;
+    expect(r.assetName).toBe('GCP Captivate Secondary LP');
+    expect(r.description).toBe('Company: Captivate Network (New York, NY); Description: Media Company');
+    expect(r.txType).toBe('S');
+    expect(r.amountMin).toBe(500001);
+    expect(r.rawText).toContain('Company:');
+    expect(normalizeOcrAssetName(r.assetName).nameHolds).toEqual([]);
   });
 
   it('returns low confidence when no transaction table is present', async () => {
