@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  readSenateFetcherRunStatus,
   readSenateIntakeStatus,
+  recordSenateFetcherRun,
   recordSenateIntake,
+  SENATE_FETCHER_RUN_KV_KEY,
   SENATE_INTAKE_STALE_AFTER_MS,
   SENATE_INTAKE_STATUS_KV_KEY,
+  type SenateFetcherRunRecord,
   type SenateIntakeRecord,
 } from '../senateIntakeStatus.ts';
 import type { Env } from '../../shared/types.ts';
@@ -105,5 +109,80 @@ describe('senate intake relay heartbeat', () => {
     } as unknown as Env;
     await expect(recordSenateIntake(failing, record(new Date().toISOString()))).resolves.toBeUndefined();
     expect(await readSenateIntakeStatus(failing)).toBeNull();
+  });
+});
+
+describe('senate fetcher run heartbeat', () => {
+  function runRecord(ranAt: string, receivedAt = ranAt): SenateFetcherRunRecord {
+    return { ranAt, receivedAt, status: 'ok', rows: 7, newCount: 0, role: 'agents' };
+  }
+
+  it('reads as no-runs when the fetcher has never reported', async () => {
+    const { env } = memEnv();
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
+  });
+
+  it('round-trips a recorded run and computes freshness from receipt', async () => {
+    const { env, kv } = memEnv();
+    const at = new Date('2026-11-05T12:00:00.000Z');
+    await recordSenateFetcherRun(env, runRecord(at.toISOString()));
+    expect(kv.has(SENATE_FETCHER_RUN_KV_KEY)).toBe(true);
+    const status = await readSenateFetcherRunStatus(env, new Date(at.getTime() + 10 * 60_000));
+    expect(status).toMatchObject({ status: 'ok', rows: 7, newCount: 0, role: 'agents', stale: false });
+    expect(status?.ageMs).toBe(10 * 60_000);
+  });
+
+  it('flags a fetcher silent past the stale threshold', async () => {
+    const { env } = memEnv();
+    const at = new Date('2026-11-05T12:00:00.000Z');
+    await recordSenateFetcherRun(env, runRecord(at.toISOString()));
+    const status = await readSenateFetcherRunStatus(env, new Date(at.getTime() + SENATE_INTAKE_STALE_AFTER_MS + 1));
+    expect(status?.stale).toBe(true);
+  });
+
+  it('round-trips blocked runs from the standby copy', async () => {
+    const { env } = memEnv();
+    const at = new Date('2026-11-05T18:00:00.000Z');
+    await recordSenateFetcherRun(env, { ...runRecord(at.toISOString()), status: 'blocked', rows: 0, role: 'jay' });
+    const status = await readSenateFetcherRunStatus(env, new Date(at.getTime() + 60_000));
+    expect(status).toMatchObject({ status: 'blocked', rows: 0, role: 'jay' });
+  });
+
+  it('keeps runs and deliveries apart: a run is not a delivery', async () => {
+    const { env, kv } = memEnv();
+    await recordSenateFetcherRun(env, runRecord(new Date().toISOString()));
+    expect(kv.has(SENATE_FETCHER_RUN_KV_KEY)).toBe(true);
+    expect(kv.has(SENATE_INTAKE_STATUS_KV_KEY)).toBe(false);
+    expect(await readSenateIntakeStatus(env)).toBeNull();
+  });
+
+  it('keeps runs and deliveries apart: a delivery is not a run', async () => {
+    const { env, kv } = memEnv();
+    await recordSenateIntake(env, record(new Date().toISOString()));
+    expect(kv.has(SENATE_INTAKE_STATUS_KV_KEY)).toBe(true);
+    expect(kv.has(SENATE_FETCHER_RUN_KV_KEY)).toBe(false);
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
+  });
+
+  it('rejects malformed run records instead of rendering them', async () => {
+    const { env, kv } = memEnv();
+    const at = new Date().toISOString();
+    kv.set(SENATE_FETCHER_RUN_KV_KEY, JSON.stringify({ ...runRecord(at), status: 'weird' }));
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
+    kv.set(SENATE_FETCHER_RUN_KV_KEY, JSON.stringify({ ...runRecord(at), role: 'nobody' }));
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
+    kv.set(SENATE_FETCHER_RUN_KV_KEY, JSON.stringify({ ...runRecord(at), rows: '7' }));
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
+  });
+
+  it('treats the run heartbeat as best-effort when KV is down', async () => {
+    const failing = {
+      CONFIG_KV: {
+        async get() { throw new Error('kv down'); },
+        async put() { throw new Error('kv down'); },
+      },
+    } as unknown as Env;
+    await expect(recordSenateFetcherRun(failing, runRecord(new Date().toISOString()))).resolves.toBeUndefined();
+    expect(await readSenateFetcherRunStatus(failing)).toBeNull();
   });
 });

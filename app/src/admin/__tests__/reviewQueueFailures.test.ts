@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { buildAdminRouter } from '../routes.ts';
 import { makeReviewQueueTestDb, type ReviewQueueFixtureRow } from './reviewQueueTestDb.ts';
-import { SENATE_INTAKE_STATUS_KV_KEY } from '../../ingestion/senateIntakeStatus.ts';
+import { SENATE_FETCHER_RUN_KV_KEY, SENATE_INTAKE_STATUS_KV_KEY } from '../../ingestion/senateIntakeStatus.ts';
 import type { Env } from '../../shared/types.ts';
 
 /**
@@ -45,6 +45,9 @@ interface ReviewQueueBody {
   totals: { deadLetters: number; deadLettersParked: number; dlqFailed: number };
   senateIntake: {
     received: number; newCount: number; dryRun: boolean; stale: boolean; failed?: boolean;
+  } | null;
+  senateFetcherRun: {
+    status: string; rows: number; newCount: number; role: string; stale: boolean;
   } | null;
 }
 
@@ -201,6 +204,7 @@ describe('GET /review-queue pipeline failures', () => {
     expect(body.totals.deadLetters).toBe(2);
     expect(body.totals.dlqFailed).toBe(2);
     expect(body.senateIntake).toBeNull();
+    expect(body.senateFetcherRun).toBeNull();
   });
 
   it('reports the durable queue as unavailable when its table does not exist yet', async () => {
@@ -247,4 +251,68 @@ describe('GET /review-queue pipeline failures', () => {
     const failed = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as ReviewQueueBody;
     expect(failed.senateIntake).toMatchObject({ failed: true, stale: false });
   });
+
+  it('carries the fetcher run heartbeat separately from deliveries', async () => {
+    // Same midday-Chicago pin as the delivery heartbeat test above.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-03-03T18:00:00Z'));
+    const db = makeReviewQueueTestDb(fixture());
+    const kv = fakeKv();
+    kv.map.set(SENATE_FETCHER_RUN_KV_KEY, JSON.stringify({
+      ranAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+      receivedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+      status: 'ok', rows: 7, newCount: 0, role: 'agents',
+    }));
+    const fresh = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as ReviewQueueBody;
+    expect(fresh.senateFetcherRun).toMatchObject({ status: 'ok', rows: 7, newCount: 0, role: 'agents', stale: false });
+    // A reported run is not a delivery: the delivery heartbeat stays null.
+    expect(fresh.senateIntake).toBeNull();
+
+    kv.map.set(SENATE_FETCHER_RUN_KV_KEY, JSON.stringify({
+      ranAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+      receivedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+      status: 'blocked', rows: 0, newCount: 0, role: 'jay',
+    }));
+    const stale = await (await app.request('/review-queue', { headers: AUTH }, env(db, kv))).json() as ReviewQueueBody;
+    expect(stale.senateFetcherRun).toMatchObject({ status: 'blocked', role: 'jay', stale: true });
+  });
+
+  it('accepts fetcher run reports from the scoped intake token and records them', async () => {
+    const db = makeReviewQueueTestDb(fixture());
+    const kv = fakeKv();
+    const scoped = env(db, kv) as Env & { SENATE_INTAKE_TOKEN?: string };
+    scoped.SENATE_INTAKE_TOKEN = 'test-senate-intake-token';
+    const res = await app.request('/senate-fetcher-run', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-senate-intake-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ranAt: '2026-03-03T17:45:00.000Z', status: 'ok', rows: 7, newCount: 0, role: 'agents' }),
+    }, scoped);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    const stored = JSON.parse(kv.map.get(SENATE_FETCHER_RUN_KV_KEY)!) as Record<string, unknown>;
+    expect(stored).toMatchObject({ ranAt: '2026-03-03T17:45:00.000Z', status: 'ok', rows: 7, newCount: 0, role: 'agents' });
+    expect(typeof stored.receivedAt).toBe('string');
+    // Recording a run must not fabricate a delivery.
+    expect(kv.map.has(SENATE_INTAKE_STATUS_KV_KEY)).toBe(false);
+  });
+
+  it('rejects run reports without auth, and invalid bodies without recording', async () => {
+    const db = makeReviewQueueTestDb(fixture());
+    const kv = fakeKv();
+    const noAuth = await app.request('/senate-fetcher-run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'ok', rows: 1, newCount: 0, role: 'agents' }),
+    }, env(db, kv));
+    expect(noAuth.status).toBe(401);
+
+    const bad = await app.request('/senate-fetcher-run', {
+      method: 'POST',
+      headers: { ...AUTH, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'weird', rows: 1, newCount: 0, role: 'agents' }),
+    }, env(db, kv));
+    expect(bad.status).toBe(400);
+    expect(kv.map.has(SENATE_FETCHER_RUN_KV_KEY)).toBe(false);
+  });
+
 });
