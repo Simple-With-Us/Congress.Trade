@@ -3203,8 +3203,16 @@ function renderReviewPanels() {
       var failedWarn = s.failed
         ? ' <strong style="color:#c0362c">The last relay call failed to ingest — nothing was written.</strong>'
         : '';
+      var rAgeMs = r ? (typeof r.ageMs === 'number' ? r.ageMs : reviewAgeMs(r.receivedAt)) : null;
+      var sAgeMs = typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt);
+      // Broken-relay signal: a fresh run found filings the delivery line
+      // should already show.  The run must postdate the last delivery and
+      // be past a 5-minute grace window, so normal relay lag (the run
+      // reports after its intake post, but the panel can render in
+      // between) does not read as breakage.
+      var undelivered = !!(r && !r.stale && r.newCount > 0 && rAgeMs !== null && rAgeMs > 5 * 60 * 1000 && rAgeMs < sAgeMs);
       var staleWarn = s.stale
-        ? ((r && !r.stale && r.newCount > 0)
+        ? (undelivered
           ? ' <strong style="color:#c0362c">Stale — the last run found new filings but the last delivery is old, so the intake relay may be broken.</strong>'
           : ' Deliveries only happen when a run finds new filings, so an old delivery is expected in quiet stretches — the run line above is the fetcher health signal.')
         : '';
