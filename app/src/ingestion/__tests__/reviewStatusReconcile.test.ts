@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import {
   MANUAL_TEST_PROBE_DOC_ID,
+  PUBLISH_DECISION_ACTIONS,
+  alreadyPublishedPredicate,
   deleteManualTestProbe,
   reconcileResolvedReviewStatus,
   runFilingsHygiene,
@@ -346,6 +348,39 @@ describe('reconcileResolvedReviewStatus', () => {
       { doc_id: 'S-rejected-later', ingest_status: 'error' },
       { doc_id: 'provider-missing-live', ingest_status: 'error' },
     ]);
+  });
+
+  it('NOT-guard still matches a filing with live tx and no decision row', () => {
+    const { raw } = makeDb();
+    raw.exec(`
+      INSERT INTO filings (doc_id, ingest_status, error) VALUES ('S-tx-no-dec', 'new', NULL);
+      INSERT INTO transactions (id, doc_id, deprecated_at) VALUES ('tx-1', 'S-tx-no-dec', NULL);
+    `);
+    const info = raw.prepare(
+      `UPDATE filings SET ingest_status = 'error'
+        WHERE doc_id = ? AND NOT (${alreadyPublishedPredicate('filings')})`,
+    ).run('S-tx-no-dec', ...PUBLISH_DECISION_ACTIONS);
+    expect(Number(info.changes)).toBe(1);
+  });
+
+  it('refuses an alias outside the allowlist', () => {
+    expect(() => alreadyPublishedPredicate('x' as never)).toThrow(/bad alias/);
+  });
+
+  it('keeps one sweep within the row limit across both sources', async () => {
+    const { raw, env } = makeDb();
+    for (let i = 0; i < 3; i++) {
+      seedFiling(raw, `S-desync-${i}`, { ingestStatus: 'needs_review', resolutionKind: 'published' });
+    }
+    for (let i = 0; i < 3; i++) {
+      raw.prepare('INSERT INTO filings (doc_id, ingest_status, error) VALUES (?, ?, NULL)').run(`S-pub-${i}`, 'error');
+      raw.prepare('INSERT INTO transactions (id, doc_id, deprecated_at) VALUES (?, ?, NULL)').run(`tx-pub-${i}`, `S-pub-${i}`);
+      raw.prepare(
+        'INSERT INTO ingestion_decisions (id, doc_id, action, created_at) VALUES (?, ?, ?, ?)',
+      ).run(`d-pub-${i}`, `S-pub-${i}`, 'auto_published', '2026-08-01T00:00:00.000Z');
+    }
+    const res = await reconcileResolvedReviewStatus(env, { apply: false, limit: 4 });
+    expect(res.scanned).toBeLessThanOrEqual(4);
   });
 
   it('reconciles an errored published filing that also has a review row', async () => {

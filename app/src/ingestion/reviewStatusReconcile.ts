@@ -42,24 +42,32 @@ export const PUBLISH_DECISION_ACTIONS = [
  * SQL predicate: this filing has at least one live transaction and its
  * latest ingestion decision is a publish. `filingAlias` is a trusted
  * identifier, never user input. Bind `PUBLISH_DECISION_ACTIONS` after the
- * caller's own placeholders.
+ * caller's own placeholders.  Only the aliases in ALREADY_PUBLISHED_ALIASES
+ * are accepted.
  */
-export function alreadyPublishedPredicate(filingAlias: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(filingAlias)) {
-    throw new Error(`alreadyPublishedPredicate: bad alias ${filingAlias}`);
+const ALREADY_PUBLISHED_ALIASES = ['filings', 'f'] as const;
+type AlreadyPublishedAlias = (typeof ALREADY_PUBLISHED_ALIASES)[number];
+
+export function alreadyPublishedPredicate(filingAlias: AlreadyPublishedAlias): string {
+  const alias = ALREADY_PUBLISHED_ALIASES.find((a) => a === filingAlias);
+  if (!alias) {
+    throw new Error(`alreadyPublishedPredicate: bad alias ${String(filingAlias)}`);
   }
   const actions = PUBLISH_DECISION_ACTIONS.map(() => '?').join(', ');
-  return `EXISTS (
+  // COALESCE keeps the predicate two-valued:  a filing with no decision row
+  // is "not published" (FALSE), never NULL, so `NOT (...)` guards still let
+  // the UPDATE through.
+  return `(EXISTS (
             SELECT 1 FROM transactions t
-             WHERE t.doc_id = ${filingAlias}.doc_id
+             WHERE t.doc_id = ${alias}.doc_id
                AND t.deprecated_at IS NULL
           )
-          AND (
+          AND COALESCE((
             SELECT d.action FROM ingestion_decisions d
-             WHERE d.doc_id = ${filingAlias}.doc_id
+             WHERE d.doc_id = ${alias}.doc_id
              ORDER BY d.created_at DESC, d.id DESC
              LIMIT 1
-          ) IN (${actions})`;
+          ), '') IN (${actions}))`;
 }
 
 /**
@@ -468,7 +476,10 @@ export async function reconcileResolvedReviewStatus(
   const limit = Math.min(Math.max(opts.limit ?? 600, 1), 2000);
   const nowIso = (opts.now ?? new Date()).toISOString();
   const rows = await loadDesyncRows(env.DB, limit);
-  const publishedRows = await loadPublishedTruthRows(env.DB, limit);
+  // One sweep stays within `limit` rows in total across both sources.
+  const publishedRows = rows.length < limit
+    ? await loadPublishedTruthRows(env.DB, limit - rows.length)
+    : [];
   const sample: DesyncCandidate[] = [];
   let updated = 0;
   let alreadyTerminal = 0;

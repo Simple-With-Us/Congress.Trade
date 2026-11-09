@@ -459,13 +459,10 @@ export async function fetchFiling(
       httpMetadata: { contentType: contentType || 'application/octet-stream' },
     });
     await lease?.assertOwned();
-    // A publish can land while this fetch is in flight. Do not walk a
-    // published filing back to `fetched` or enqueue another extraction.
-    if (await isFilingAlreadyPublished(env.DB, docId)) {
-      console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
-      return;
-    }
-    await run(
+    // A publish can land while this fetch is in flight. The guarded UPDATE
+    // refuses to walk a published filing back to `fetched`;  when it matched
+    // no row, do not enqueue another extraction either (CT-2453).
+    const fetchedRes = await run(
       env.DB,
       `UPDATE filings
           SET raw_object_key = ?, ingest_status = 'fetched', error = NULL
@@ -473,6 +470,10 @@ export async function fetchFiling(
           AND NOT (${alreadyPublishedPredicate('filings')})`,
       [key, docId, ...PUBLISH_DECISION_ACTIONS],
     );
+    if (fetchedRes?.meta?.changes === 0) {
+      console.warn(`fetcher: ${docId} already published; not enqueuing extraction`);
+      return;
+    }
 
     await lease?.assertOwned();
     await env.INGEST_QUEUE.send({ type: 'filing.fetched', docId });

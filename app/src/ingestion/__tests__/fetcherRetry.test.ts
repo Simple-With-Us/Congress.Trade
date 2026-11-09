@@ -185,6 +185,36 @@ describe('fetcherRetry', () => {
     expect(errorSql).toMatch(/NOT \(/);
   });
 
+  it('does not enqueue extraction when a publish lands mid-fetch', async () => {
+    const put = vi.fn(async () => {});
+    const send = vi.fn(async () => {});
+    const env = {
+      RAW_FILES: { put },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            // The guarded UPDATE matches no row:  the filing was published
+            // between the pre-fetch check and the write.
+            run: async () => ({ success: true, meta: { changes: 0 } }),
+            first: async () => {
+              if (/AS published/i.test(sql)) return null;
+              if (/review_queue/i.test(sql)) return null;
+              return { source_url: 'http://test/doc.pdf', chamber: 'house', ingest_status: 'new' };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send },
+    } as any;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('small filing', {
+      status: 200, headers: { 'content-type': 'application/pdf', 'content-length': '12' },
+    })));
+
+    await expect(fetchFiling(env, 'H-raced')).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('leaves an already-published filing alone instead of re-fetching', async () => {
     const runs: string[] = [];
     const fetchMock = vi.fn(async () => new Response('nope', { status: 403 }));
