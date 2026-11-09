@@ -57,9 +57,10 @@ describe('publisher row fixtures', () => {
       tx({ owner: 'dependent', amountMin: 1001, amountMax: 15000 }),
       tx({ owner: 'spouse', amountMin: 15001, amountMax: 50000 }),
     ];
+    // Each read owns distinct row objects, as two real model reads would.
     const reads = [
-      read(rows, 'H-2026-9116376'),
-      read(rows, 'H-2026-9116376'),
+      read(rows.map((r) => ({ ...r })), 'H-2026-9116376'),
+      read(rows.map((r) => ({ ...r })), 'H-2026-9116376'),
     ];
     const built = buildMajorityRows(reads, 2, true);
     expect(built.ok).toBe(true);

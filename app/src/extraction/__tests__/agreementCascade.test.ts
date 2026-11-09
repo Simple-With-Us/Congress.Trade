@@ -439,6 +439,23 @@ describe('agreement cascade — tier 2 / tier 3', () => {
     expect(decision?.payload?.votes).toBeTruthy(); // per-field vote summary present
   });
 
+  it('2-of-3 owner majority on a single lot publishes the majority owner (tier 3)', async () => {
+    // Owner disagreement alone: tier-2 unanimity fails, the lot still meets under
+    // the owner-aware key back-compat, and tier 3 votes owner 2-of-3.  A split of
+    // the lot into two keys, or a collapse that drops the vote, fails here.
+    stub(
+      asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
+      asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
+      asJson([row('AAPL', 'B', AB, { owner: 'spouse' })]),
+    );
+    const { env, cap } = makeEnv();
+    const res = await processAgreementCascadeTier2(env, MODELS_C, 'H-owner-majority', 'raw/x', false);
+    expect(res).toMatchObject({ outcome: 'published', tier: 3 });
+    expect(cap.inserted).toHaveLength(1);
+    const insertedRows = JSON.parse(cap.inserted[0][0] as string) as Array<{ owner: string | null }>;
+    expect(insertedRows.map((r) => r.owner)).toEqual(['self']);
+  });
+
   it('does not drop a minority-only extra row', async () => {
     stub(
       asJson([row('AAPL', 'B', AB)]),
