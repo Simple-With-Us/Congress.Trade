@@ -134,7 +134,7 @@ overlapping work:
 
 ```bash
 # PR detail + files: relay gr_wf_pr_get
-# check status: relay gr_wf_checks
+# check status: relay gr_wf_checks (a point-in-time snapshot — re-read for fresher state; it does not watch or wait)
 ```
 
 If checks are failing, fix them on the owning branch only when explicitly asked;
@@ -159,13 +159,15 @@ while the PR sits there with conflicts or comments/issues unresolved."
     merge origin/main`, resolve, push;
   - a failing required check (`typecheck + test`, `gitleaks`) — read the log, fix the
     cause, push;
-  - a check that never dispatched (relay `gr_wf_checks` on the branch) — re-run or
-    re-trigger it;
+  - a check that never dispatched (relay `gr_wf_checks` on the branch) — re-run it
+    with relay `gr_wf_run_rerun`, or re-trigger it;
   - auto-merge never armed (relay `gr_wf_pr_get` shows it) — arm it with
     `gr_wf_automerge_enable`.
 - **The loop to run:** open the PR, arm auto-merge immediately, then go do the next
   useful thing.  If you truly need the result first, take ONE **bounded** wait
-  (one bounded relay `gr_wf_checks` read); when it ends still unmerged, diagnose from the list
+  (one bounded relay `gr_wf_checks` read — `gr_wf_checks` returns a point-in-time
+  snapshot, not a watch like `gh pr checks --watch`, so re-read later rather than
+  polling); when it ends still unmerged, diagnose from the list
   above — do **not** start another wait.
 - **Review-bot threads block the merge forever** (`required_conversation_resolution`
   is on).  Triage the whole batch against current HEAD in one pass: fix the real
