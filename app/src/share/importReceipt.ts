@@ -3,6 +3,12 @@
  * Outbound CT->ST pushes use share/outbound.ts; this module is inbound-only.
  */
 
+import {
+  SHARE_PAYLOAD_SCHEMA_VERSION,
+  SharePayloadSchemaVersionSchema,
+  isSupportedSharePayloadSchemaVersion,
+  resolveSharePayloadSchemaVersion,
+} from '@jaywedgeworth22/congress-trading-shared';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import type { Env } from '../shared/types.ts';
 
@@ -127,6 +133,54 @@ export function warnPeerImportSchemaDrops(input: {
     droppedJson: JSON.stringify(input.dropped),
   };
   sentryLoggerWarn('peer.import.schema_drops', attrs);
+}
+
+export interface PeerImportSchemaVersion {
+  schemaVersion: number | null;
+  supported: boolean;
+}
+
+/**
+ * Resolve the contract version of an inbound peer share payload (ST-3853).
+ *
+ * Never throws and never rejects: an unsupported or malformed version is warned
+ * about and reported back to the peer, but the batch is still imported so mixed
+ * deploys keep working.  A payload without `schemaVersion` predates versioning
+ * and resolves to the legacy version.
+ */
+export function resolvePeerImportSchemaVersion(
+  raw: unknown,
+  ctx: { requestId: string; origin: string | null },
+): PeerImportSchemaVersion {
+  const origin = ctx.origin ?? 'unknown';
+  try {
+    if (raw === undefined) {
+      return { schemaVersion: resolveSharePayloadSchemaVersion({}), supported: true };
+    }
+    const parsed = SharePayloadSchemaVersionSchema.safeParse(raw);
+    if (parsed.success) {
+      const schemaVersion = parsed.data;
+      const supported = isSupportedSharePayloadSchemaVersion({ schemaVersion });
+      if (!supported) {
+        sentryLoggerWarn('peer.import.unsupported_schema_version', {
+          requestId: ctx.requestId,
+          origin,
+          schemaVersion,
+          supportedMax: SHARE_PAYLOAD_SCHEMA_VERSION,
+        });
+      }
+      return { schemaVersion, supported };
+    }
+    // Never log the raw value — only its type.
+    sentryLoggerWarn('peer.import.malformed_schema_version', {
+      requestId: ctx.requestId,
+      origin,
+      receivedType: typeof raw,
+    });
+    return { schemaVersion: null, supported: false };
+  } catch {
+    return { schemaVersion: null, supported: false };
+  }
 }
 
 export interface PersistPeerImportReceiptInput {

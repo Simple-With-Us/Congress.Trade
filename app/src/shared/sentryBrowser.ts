@@ -11,6 +11,8 @@
  */
 
 import { readBuildInfo } from './buildInfo.ts';
+import { renderSentryBrowserScrubInline } from './sentryBrowserScrubInline.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from './sentryDataCollection.ts';
 import { SENTRY_BROWSER_IGNORE_ERRORS } from './sentryNoise.ts';
 
 export const SENTRY_BROWSER_SCRIPT_ORIGIN = 'https://browser.sentry-cdn.com';
@@ -102,6 +104,7 @@ export function renderSentryBrowserScript(env: SentryBrowserInput | undefined): 
     dsn: resolved.dsn,
     environment: resolved.environment,
     sendDefaultPii: false,
+    dataCollection: NOT_LINKED_SENTRY_DATA_COLLECTION,
     tracesSampleRate: resolved.tracesSampleRate,
     replaysSessionSampleRate: resolved.replaysSessionSampleRate,
     replaysOnErrorSampleRate: resolved.replaysOnErrorSampleRate,
@@ -144,7 +147,13 @@ export function renderSentryBrowserScript(env: SentryBrowserInput | undefined): 
     'window.__ctSentryInitialized=1;',
     'var integrations=[' + integrations.join(',') + '];',
     'if(window.Sentry.consoleLoggingIntegration)integrations.push(window.Sentry.consoleLoggingIntegration({levels:["warn","error"]}));',
-    'window.Sentry.init(Object.assign(' + JSON.stringify(init) + ',{integrations:integrations}));',
+    renderSentryBrowserScrubInline(),
+    'window.Sentry.init(Object.assign(' + JSON.stringify(init) + ',{integrations:integrations,'
+    + 'beforeSend:function(e){return window.__ctScrubSentry(e);},'
+    + 'beforeSendLog:function(l){return window.__ctScrubSentry(l);},'
+    + 'beforeSendSpan:function(s){return window.__ctScrubSentry(s);},'
+    + 'beforeSendMetric:function(m){return window.__ctScrubSentry(m);}'
+    + '}));',
     '};',
     'document.head.appendChild(n);',
     '})();',

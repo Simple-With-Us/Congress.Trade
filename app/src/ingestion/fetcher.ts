@@ -25,6 +25,7 @@ import {
   looksLikeSenateAgreementWall,
 } from './senateSource.ts';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
+import { isSenateEdgeBackoffActive, readSenateEdgeBackoff } from './senateEdgeDeny.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 const UA = 'congress-feed/0.1 (+https://congress.trade)';
@@ -380,17 +381,35 @@ export async function fetchFiling(
     if (row.chamber === 'senate' && isSenateAgreementWallBytes(rawBytes)) {
       // On the relay path the relay negotiates its own session (and already
       // retried once internally); a second relay call is the correct retry.
-      // Direct path: negotiate a fresh agreement-accepted session ourselves.
+      // Direct path: negotiate a fresh agreement-accepted session ourselves,
+      // on the same proxied egress as the document GETs above.  Both legs
+      // used to go out on the default (unproxied) fetch, from the box IP the
+      // eFD edge denies.
       let retry: Response;
       if (usedRelay) {
         retry = await fetchSenateDocViaRelay();
       } else {
-        const session = await establishSenateSession({ kv: env.CONFIG_KV });
+        // While the watcher is backed off after an eFD edge deny (CT-2442),
+        // the handshake would send the edge the very agreement POST it is
+        // refusing, now from the residential IP.  Defer the document until
+        // the window ends instead, jittered past the watcher's own attempt.
+        const edgeBackoff = await readSenateEdgeBackoff(env);
+        const now = new Date();
+        if (edgeBackoff && isSenateEdgeBackoffActive(edgeBackoff, now)) {
+          const waitSeconds = Math.max(1, Math.ceil((Date.parse(edgeBackoff.until) - now.getTime()) / 1000));
+          const message = `fetcher: senate agreement wall for ${sourceUrl}; handshake deferred until ${edgeBackoff.until} (eFD edge-deny backoff)`;
+          await markError(env, docId, message, lease);
+          throw new IngestRetryError(message, waitSeconds + ingestBackoffSeconds(queueAttempt));
+        }
+        // The lease signal bounds the handshake like every other request
+        // here, so a hung proxy aborts it with the lease instead of holding
+        // the queue consumer.
+        const session = await establishSenateSession({ kv: env.CONFIG_KV, signal: lease?.signal }, effectiveFetch);
         retry = await trackedFetch(sourceUrl, {
           headers: { ...headers, cookie: session.cookieHeader },
           redirect: 'follow',
           signal: lease?.signal,
-        }, { service: 'filing-ingestion', operation: 'fetch-filing-document', dynamicTarget: 'filing-source' });
+        }, { service: 'filing-ingestion', operation: 'fetch-filing-document', dynamicTarget: 'filing-source' }, effectiveFetch);
       }
       if (!retry.ok || !retry.body) {
         await retry.body?.cancel().catch(() => {});

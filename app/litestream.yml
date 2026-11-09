@@ -33,7 +33,7 @@
 #
 # Destination (2026-08-12, owner): Backblaze B2 EU Central, bucket
 # jays-congress-trade-eu, endpoint s3.eu-central-003.backblazeb2.com — verified
-# against ~/.secrets/backblaze-app-keys.env (B2_CT_* keys), NOT guessed.
+# against Infisical /backblaze-app-keys (B2_CT_* keys), NOT guessed.
 #
 # Sync interval (5m): the 2026-08-05 R2 Class A incident
 # (docs/rollouts/2026-08-05-r2-freetier-class-a-survival.md) showed Litestream
@@ -50,7 +50,7 @@ snapshot:
   interval: 24h
   # B2 is paid capacity, not R2 free-tier-capped storage — keep 7d of LTX
   # history for restore headroom, matching Socratic.Trade's B2 target.
-  retention: 168h
+  retention: 72h
 
 # Product compaction is L0 + bounded L1 + 24h snapshots.  L2 and L3 are OFF.
 # Mirror ST litestream.coolify.yml / UM litestream.yml.  Do NOT add a second

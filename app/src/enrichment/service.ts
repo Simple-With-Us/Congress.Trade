@@ -9,8 +9,7 @@
  * Direct Massive / Intrinio / Twelve Data / Finnhub / Tiingo keys are not
  * enrichment fallbacks. SEC EDGAR remains the free public CIK/SIC baseline
  * when ST has no profile for a symbol. EDGAR calls use their own per-minute
- * gate. The historical FMP day-counter helpers stay exported so latency and
- * older imports can still read `fmp:calls:*`; this runner does not spend them.
+ * gate.
  */
 
 import type { Env } from '../shared/types.ts';
@@ -23,7 +22,12 @@ import type { SqlParam } from '../shared/db.ts';
 import { mergeRefs } from './compute.ts';
 import { buildSecProvider } from './sec.ts';
 import { buildSocraticProvider, isTickerShapedSymbol } from './socratic.ts';
-import { getSharedFmpPacer, getSharedEdgarPacer } from '../shared/pace.ts';
+import {
+  getSharedEdgarPacer,
+  getSharedStPeerPacer,
+  ST_PEER_PACE_SECRET_NAMES,
+  stPeerMaxPerMinute,
+} from '../shared/pace.ts';
 import type { EnrichmentProvider, SecurityRef } from './types.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 
@@ -33,7 +37,7 @@ export const DEFAULT_DAILY_CAP = 230;
 
 type EnvX = Env & {
   FMP_DAILY_CALL_CAP?: string;
-  FMP_MAX_PER_MINUTE?: string;
+  ST_PEER_MAX_PER_MINUTE?: string;
   EDGAR_MAX_PER_MINUTE?: string;
   APP_B_IMPORT_URL?: string;
   APP_B_INGEST_TOKEN?: string;
@@ -368,36 +372,6 @@ function isCovered(partials: Array<Partial<SecurityRef>>): boolean {
   return name && sector && mcap;
 }
 
-function dayKey(now = new Date()): string {
-  return 'fmp:calls:' + now.toISOString().slice(0, 10);
-}
-
-/** FMP calls already spent today (from the KV day-counter). */
-export async function getDailyUsed(env: Env): Promise<number> {
-  try {
-    const v = await env.CONFIG_KV.get(dayKey());
-    const n = v ? parseInt(v, 10) : 0;
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  } catch {
-    return 0;
-  }
-}
-async function setDailyUsed(env: Env, n: number): Promise<void> {
-  try {
-    await env.CONFIG_KV.put(dayKey(), String(n), { expirationTtl: 172800 });
-  } catch {
-    /* best effort */
-  }
-}
-
-/** Add `n` to today's FMP call counter (shared by enrichment + price refresh). */
-export async function addDailyUsed(env: Env, n: number): Promise<number> {
-  const used = await getDailyUsed(env);
-  const next = used + Math.max(0, Math.floor(n));
-  await setDailyUsed(env, next);
-  return next;
-}
-
 /** A ticker selected for enrichment, plus its current `enrichment_error` (used
  *  to honor a still-pending transient-retry backoff before spending a call). */
 export interface EnrichCandidate {
@@ -462,7 +436,7 @@ export async function runEnrichment(
   opts: { max?: number; dryRun?: boolean; maxPerMinute?: number; edgarMaxPerMinute?: number; signal?: AbortSignal; deadlineMs?: number } = {},
 ): Promise<EnrichResult> {
   const runtimeSecrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
     'APP_B_IMPORT_URL',
     'APP_B_INGEST_TOKEN',
@@ -501,16 +475,12 @@ export async function runEnrichment(
   // making the rows appear perpetually "not yet tried by a keyed provider."
   const hasKeyedProvider = chain.some((e) => KEYED_PROVIDER_SOURCE_MARKERS.includes(e.name));
   const candidates = await selectTickersToEnrich(env, selectLimit, hasKeyedProvider);
-  // Shared per-isolate FMP pacer, so a concurrent price refresh or disclosure
-  // probe can't blow the per-minute cap by pacing only its own calls. Fall back
-  // to FMP_MAX_PER_MINUTE when a caller (e.g. an admin endpoint whose body omits
-  // it) passes nothing, so the memoized singleton is never poisoned into a
-  // permanent no-op just because an unconfigured caller happened to run first.
-  const fmpMaxPerMinute =
-    opts.maxPerMinute ?? (parseInt(envx.FMP_MAX_PER_MINUTE || '', 10) || undefined);
-  const pace = getSharedFmpPacer(fmpMaxPerMinute);
+  // Shared per-isolate ST peer pacer, so a concurrent price refresh can't blow
+  // ST's per-minute limit by pacing only its own calls.  Use the configured
+  // ST_PEER_MAX_PER_MINUTE when a caller passes nothing;  the pacer clamps it.
+  const pace = getSharedStPeerPacer(opts.maxPerMinute ?? stPeerMaxPerMinute(runtimeSecrets));
   // SEC EDGAR's own dedicated pacer — a separate provider with a separate
-  // fair-access limit, so it does NOT draw on the FMP budget/pacer above. Same
+  // fair-access limit, so it does NOT draw on the ST peer pacer above. Same
   // env fallback so admin-triggered runs don't poison it either.
   const edgarMaxPerMinute =
     opts.edgarMaxPerMinute ?? (parseInt(envx.EDGAR_MAX_PER_MINUTE || '', 10) || undefined);
@@ -551,7 +521,7 @@ export async function runEnrichment(
       try {
         // Every provider paces before its call, each against its own budget:
         // EDGAR uses its dedicated gate (free, but still fair-access limited);
-        // everything else shares the FMP per-minute gate.
+        // Socratic.Trade (the only other chain entry) uses the shared ST peer gate.
         await (entry.name === 'edgar' ? edgarPace() : pace());
         const ref = await entry.provider.fetchRef(ticker);
         if (ref) collected.push(ref);

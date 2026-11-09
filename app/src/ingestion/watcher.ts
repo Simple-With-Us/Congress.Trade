@@ -36,7 +36,22 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings } from './senateSource.ts';
+import { fetchSenatePtrFilings, type SenateFiling } from './senateSource.ts';
+import {
+  clearSenateEdgeBackoff,
+  isSenateEdgeBackoffActive,
+  isSenateEdgeDeniedError,
+  nextSenateEdgeBackoff,
+  readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEdgeDenyLogFields,
+  senateEdgeDenyReason,
+  senateEfdTransportScrubSecrets,
+  SenateProxyEgressError,
+  writeSenateEdgeBackoff,
+  type SenateEdgeBackoffState,
+  type SenateHttpError,
+} from './senateEdgeDeny.ts';
 import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
@@ -102,6 +117,10 @@ export interface DiscoveredFiling {
   party?: string | null;
   photoUrl?: string | null;
   docKind?: string | null;
+  /** Which discovery path first surfaced this filing: intraday live-search
+   *  or the daily bulk index. Set by pollHouse(); used for the bulk-window
+   *  discovery alert. Undefined for non-House sources. */
+  discoveredVia?: 'live' | 'bulk';
 }
 
 export function preclassifyDocKind(
@@ -338,10 +357,11 @@ export async function insertFilingIfNew(
       `INSERT OR IGNORE INTO filings
        (doc_id, chamber, filer_id, filing_type, filed_date, source_url,
         raw_object_key, ingest_status, doc_kind, extractor, model_version,
-        confidence, first_seen_at, source_updated_at, error, prev_probe_at, probe_interval_sec)
+        confidence, first_seen_at, source_updated_at, error, prev_probe_at, probe_interval_sec,
+        discovered_via)
      VALUES (?, ?, ?, 'P', ?, ?, NULL, 'new', ?, NULL, NULL,
-             NULL, ?, NULL, NULL, ?, ?)`,
-      [f.docId, f.chamber, filerId ?? null, filedDate, f.sourceUrl, docKind, nowIso, opts?.prevProbeAt ?? null, opts?.probeIntervalSec ?? null],
+             NULL, ?, NULL, NULL, ?, ?, ?)`,
+      [f.docId, f.chamber, filerId ?? null, filedDate, f.sourceUrl, docKind, nowIso, opts?.prevProbeAt ?? null, opts?.probeIntervalSec ?? null, f.discoveredVia ?? null],
     ],
     ingestionOutboxInsertForDoc(f.docId, nowIso),
   ]);
@@ -511,8 +531,9 @@ async function persistAndEnqueue(
   filings: DiscoveredFiling[],
   nowIso: string,
   opts: { maxNew?: number; prevProbeAt?: string | null; probeIntervalSec?: number | null } = {},
-): Promise<number> {
+): Promise<{ count: number; inserted: DiscoveredFiling[] }> {
   let newCount = 0;
+  const inserted: DiscoveredFiling[] = [];
   for (const f of filings) {
     if (opts.maxNew !== undefined && newCount >= opts.maxNew) break;
     const insertResult = await insertFilingIfNew(env, f, nowIso, {
@@ -523,9 +544,10 @@ async function persistAndEnqueue(
       await recordDisclosureLatencyCandidate(env, f, nowIso);
       await enqueueFilingNew(env, f);
       newCount += 1;
+      inserted.push(f);
     }
   }
-  return newCount;
+  return { count: newCount, inserted };
 }
 
 /** Write one ingest_log row recording the cadence + yield of a poll. */
@@ -578,10 +600,13 @@ async function recordSourceAttempt(
 /**
  * A source failure is "transient" when it reflects a recoverable upstream or
  * platform condition rather than a bug: anti-bot blocks (403), rate limits
- * (429), and transient D1/Workers platform limits. These recur on a normal
+ * (429), and transient D1/Workers platform limits.  These recur on a normal
  * cadence (e.g. the Senate efdsearch 403), so logging them at `error` floods
- * observability and buries genuine errors. We log them at `warn` instead; the
- * daily bulk/backfill path keeps history complete regardless.
+ * observability and buries genuine errors.  We log them at `warn` instead; for
+ * the House the daily bulk index keeps history complete regardless.  The
+ * Senate has no bulk path, and a persistent eFD edge deny is not transient:
+ * runWatcher handles that class (SenateHttpError `edge_denied`) before this
+ * check is consulted.
  */
 export function isTransientSourceError(message: string): boolean {
   return (
@@ -594,15 +619,69 @@ export function isTransientSourceError(message: string): boolean {
   );
 }
 
+/**
+ * Senate error text with the proxy secrets and URL userinfo scrubbed, for
+ * the logs and source_attempts (CT-2442).  It can carry proxy transport text
+ * or upstream detail.
+ */
+function scrubSenateErrorText(env: Env, err: unknown): string {
+  const secrets = senateEfdTransportScrubSecrets(env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL, env);
+  return sanitizeEfdTransportError(err, secrets, 1000);
+}
+
 /** Record a source-level failure without presenting it as a successful poll. */
 async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executive', nowIso: string, err: unknown): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
-  if (isTransientSourceError(message)) {
-    console.warn(`watcher: ${source} source degraded (transient, bulk path still authoritative):`, message);
+  const message = source === 'senate'
+    ? scrubSenateErrorText(env, err)
+    : err instanceof Error ? err.message : String(err);
+  // A residential-proxy outage is an egress fault to act on, even when the
+  // wrapped direct-fallback answer carries "HTTP 403".
+  if (!(err instanceof SenateProxyEgressError) && isTransientSourceError(message)) {
+    // eFD search is the only Senate discovery path; there is no Senate bulk index.
+    const fallback = source === 'senate' ? 'no alternate Senate discovery path' : 'bulk path still authoritative';
+    console.warn(`watcher: ${source} source degraded (transient, ${fallback}):`, message);
   } else {
     console.error(`watcher: ${source} source failed:`, message);
   }
   await recordSourceAttempt(env, source, nowIso, 'failure', 0, message);
+}
+
+/**
+ * Record a Senate eFD edge deny (CT-2442): grow and persist the polling
+ * backoff, say plainly what is blocked, and write the failure receipt.
+ * Returns the saved backoff, or null when it could not be saved (the 600 s
+ * failure skip then still applies).
+ *
+ * Log level: console.error for the first deny of an episode, console.warn for
+ * the repeats.  Both levels reach Sentry logs and Datadog (consoleLogging /
+ * the console hook capture warn and error); error is the level this codebase
+ * escalates to once per sustained outage.  The start of a whole-chamber
+ * discovery outage belongs there once, and the repeats, at most one per
+ * backoff window, are already paged by the polling_senate liveness alarm.
+ *
+ * Only the classified fields (source, failure class, step, HTTP status,
+ * Server header, the count and the next attempt) reach the log line, the
+ * receipt and the stored backoff reason, never the error's raw message.
+ */
+async function recordSenateEdgeDenied(
+  env: Env,
+  now: Date,
+  err: SenateHttpError,
+  prev: SenateEdgeBackoffState | null,
+): Promise<SenateEdgeBackoffState | null> {
+  const reason = senateEdgeDenyReason(err);
+  const next = nextSenateEdgeBackoff(prev, now, reason);
+  const saved = await writeSenateEdgeBackoff(env, next);
+  const plan = saved
+    ? `next senate attempt after ${next.until} (${Math.round(next.windowMs / 60_000)}m backoff)`
+    : 'the backoff could not be saved, so the 600s failure skip applies';
+  const line = `watcher: senate eFD edge denied (${next.consecutive} in a row since ${next.firstDeniedAt}): `
+    + 'Senate PTR discovery and document fetch are blocked while eFD refuses the agreement, '
+    + `and there is no alternate Senate discovery path; ${plan} [${senateEdgeDenyLogFields(err)}]`;
+  if (next.consecutive === 1) console.error(line);
+  else console.warn(line);
+  await recordSourceAttempt(env, 'senate', now.toISOString(), 'failure', 0, reason);
+  return saved ? next : null;
 }
 
 /** Days into January during which the previous year's House index is ALSO
@@ -644,7 +723,12 @@ export function inHousePriorYearWindow(now: Date, overlapDays: number): boolean 
  * Poll the House yearly bulk index, diff against D1, enqueue new PTRs.
  * Throws on any failure (caught by the per-source guard in runWatcher).
  */
-async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<number> {
+async function pollHouse(
+  env: Env,
+  now: Date,
+  signal?: AbortSignal,
+  tickSignal?: AbortSignal,
+): Promise<number> {
   const nowIso = now.toISOString();
   const year = Number(
     new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric' }).format(now),
@@ -655,14 +739,15 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
 
   const byDoc = new Map<string, DiscoveredFiling>();
   for (const f of ptrs) {
-    byDoc.set(f.pipelineDocId, houseDiscovery(f));
+    byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'bulk' });
   }
 
   // YEAR-BOUNDARY GAP: for the first N days of a new ET year, also sweep the
-  // PRIOR year's index (hourly, not every poll). A PTR filed Dec 30 can enter
+  // PRIOR year's index (hourly, not every poll).  A PTR filed Dec 30 can enter
   // the {YEAR-1}FD index days later — after we've switched to polling {YEAR} —
-  // and would otherwise never be discovered. Fail-soft: a prior-year fetch
-  // problem must not fail the current-year poll.
+  // and would otherwise never be discovered.  Fail-soft: a prior-year fetch
+  // problem (including a per-source 7s timeout after current-year succeeded)
+  // must not fail the current-year poll unless the outer tickSignal aborted.
   const overlapDays = await tunableInt(
     env,
     'HOUSE_PRIOR_YEAR_OVERLAP_DAYS',
@@ -677,77 +762,213 @@ async function pollHouse(env: Env, now: Date, signal?: AbortSignal): Promise<num
       if (!Number.isFinite(lastMs) || now.getTime() - lastMs >= HOUSE_PRIOR_YEAR_FETCH_INTERVAL_MS) {
         const prior = (await fetchHouseIndex(year - 1, { relayUrl: houseRelayUrl, signal })).filter((f) => f.isPtr);
         for (const f of prior) {
-          if (!byDoc.has(f.pipelineDocId)) byDoc.set(f.pipelineDocId, houseDiscovery(f));
+          if (!byDoc.has(f.pipelineDocId)) byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'bulk' });
         }
         if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_PRIOR_YEAR_KV_KEY, nowIso);
       }
     } catch (err) {
-      if (signal?.aborted) throw err;
+      if (tickSignal?.aborted) throw err;
       console.warn('watcher: house prior-year index poll failed (current year unaffected):', (err as Error).message);
     }
   }
 
-  // Intraday overlay: catch same-day PTRs that the daily XML hasn't picked up
-  // yet. Fail-soft — a flaky/anti-bot live endpoint must never break the stable
-  // bulk path. INSERT OR IGNORE de-dupes the overlap with the bulk rows above.
+  // Intraday live-search overlay: runs on each scheduled House poll (following
+  // the adaptive cadence: 60s in the morning burst, 4 min shoulder, ~10 min
+  // midday, 30 min overnight).  Fail-soft — a flaky live endpoint or per-source
+  // timeout after the current-year bulk XML has already been fetched must never
+  // discard the bulk rows above unless the outer tickSignal aborted.
   if (await houseLiveSearchEnabled(env)) {
     let liveErr: Error | null = null;
     try {
       const live = await pollHouseLiveSearch(year, fetch, { env, signal });
       for (const f of live) {
-        if (!byDoc.has(f.pipelineDocId)) {
-          byDoc.set(f.pipelineDocId, houseDiscovery(f));
+        const existing = byDoc.get(f.pipelineDocId);
+        if (!existing) {
+          byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'live' });
+        } else if (existing.discoveredVia === 'bulk') {
+          // Seen by BOTH the bulk index and live search this poll: live search
+          // did surface it, so attribute it to 'live' (otherwise the stale
+          // bulk-discovery alert would false-positive).  Keep the bulk record
+          // itself: the live-search HTML carries no FilingDate, so replacing it
+          // would insert filed_date NULL.
+          byDoc.set(f.pipelineDocId, { ...existing, discoveredVia: 'live' });
         }
       }
     } catch (err) {
-      if (signal?.aborted) throw err;
+      if (tickSignal?.aborted) throw err;
       liveErr = err as Error;
     }
-    // Consecutive-failure counter — fully isolated in its own try/catch. A KV
-    // blip here must never (a) fall into the poll's failure path and record a
-    // live-search *success* as a failure, nor (b) escape and abort the
-    // authoritative bulk persist/enqueue below. The observability overlay is
-    // strictly best-effort; the bulk path is not.
-    let fails = liveErr ? 1 : 0;
-    try {
-      if (env.CONFIG_KV) {
-        if (!liveErr) {
-          const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
-          if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
+      // Consecutive-failure counter — fully isolated in its own try/catch. A KV
+      // blip here must never (a) fall into the poll's failure path and record a
+      // live-search *success* as a failure, nor (b) escape and abort the
+      // authoritative bulk persist/enqueue below. The observability overlay is
+      // strictly best-effort; the bulk path is not.
+      let fails = liveErr ? 1 : 0;
+      try {
+        if (env.CONFIG_KV) {
+          if (!liveErr) {
+            const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
+            if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
+          } else {
+            fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
+            await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+          }
+        }
+      } catch (counterErr) {
+        console.warn(
+          'watcher: house live-search failure-counter update failed (ignored):',
+          (counterErr as Error).message,
+        );
+      }
+      if (liveErr) {
+        if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
+          console.error(
+            `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
+            liveErr.message,
+          );
         } else {
-          fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
-          await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+          console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
         }
       }
-    } catch (counterErr) {
-      console.warn(
-        'watcher: house live-search failure-counter update failed (ignored):',
-        (counterErr as Error).message,
-      );
     }
-    if (liveErr) {
-      if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
-        console.error(
-          `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
-          liveErr.message,
-        );
-      } else {
-        console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
-      }
-    }
-  }
 
   const discovered: DiscoveredFiling[] = Array.from(byDoc.values());
   const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'house', nowIso);
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
     : null;
-  const newCount = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  const { count: newCount, inserted } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  await alertOnStaleBulkDiscoveries(env, inserted, nowIso);
   await logPoll(env, 'house', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'house', now);
   await recordSourceAttempt(env, 'house', nowIso, 'success', newCount, null);
   return newCount;
 }
+
+/**
+ * Bulk-window discovery alert (Jay directive 2026-10-16).
+ *
+ *  A filing first discovered via the daily bulk XML whose filed_date is more
+ *  than BULK_DISCOVERY_ALERT_THRESHOLD_MS old means live-search missed it
+ *  intraday across a full window of polls. Logs via console.error (Sentry-visible,
+ *  matching the watcher's existing escalation pattern) with the doc id, member,
+ *  filed/discovered timestamps, hours late, and live-search health.
+ */
+export interface StaleBulkDiscoveryAlert {
+  docId: string;
+  filerName: string | null;
+  filedDate: string;
+  discoveredAt: string;
+  hoursLate: number;
+  liveSearchFails: string;
+}
+
+/**
+ * Latest instant a filed_date can denote, so the filing's age is a lower bound.
+ * The House bulk XML reports a
+ * day-granularity `M/D/YYYY` (normalized rows hold `YYYY-MM-DD`), which says
+ * nothing about the time of day.  Reading it as midnight UTC would make a
+ * filing filed earlier the same day look ~13h old at the morning bulk refresh,
+ * so a date-only value counts as filed at the END of that calendar day on the
+ * Clerk's ET clock: lateness is then a lower bound and a same-day discovery is
+ * never late.  A value that carries a time of day is parsed as given.
+ * Returns null for empty or unparseable input.
+ */
+export function filedInstantUpperBoundMs(filedDate: string | null | undefined): number | null {
+  const s = (filedDate ?? '').trim();
+  if (!s) return null;
+  const dayOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s) ?? /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  if (!dayOnly) {
+    const ms = Date.parse(s);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const iso = s.includes('-');
+  const y = Number(iso ? dayOnly[1] : dayOnly[3]);
+  const m = Number(iso ? dayOnly[2] : dayOnly[1]);
+  const d = Number(iso ? dayOnly[3] : dayOnly[2]);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  // Midnight ET starting the NEXT day is 04:00Z (EDT) or 05:00Z (EST).
+  const nextDayUtc = Date.UTC(y, m - 1, d + 1);
+  const etHour = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    hourCycle: 'h23',
+  });
+  for (const offsetHours of [4, 5]) {
+    const t = nextDayUtc + offsetHours * 3600000;
+    if (Number(etHour.format(t)) === 0) return t;
+  }
+  return nextDayUtc + 5 * 3600000;
+}
+
+/**
+ * Pure helper: returns alerts for bulk-discovered filings older than the threshold.
+ * Exported for testing; the console.error side effect lives in alertOnStaleBulkDiscoveries.
+ * `hoursLate` is measured from the end of the filed day in ET for day-only
+ * filed dates (see filedInstantUpperBoundMs).
+ */
+export function findStaleBulkDiscoveries(
+  inserted: DiscoveredFiling[],
+  nowIso: string,
+  liveSearchFails: string = 'unknown',
+): StaleBulkDiscoveryAlert[] {
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs)) return [];
+  const alerts: StaleBulkDiscoveryAlert[] = [];
+  for (const f of inserted) {
+    if (f.discoveredVia !== 'bulk') continue;
+    if (!f.filedDate) continue;
+    const filedMs = filedInstantUpperBoundMs(f.filedDate);
+    if (filedMs === null) continue;
+    const lateMs = nowMs - filedMs;
+    if (lateMs <= BULK_DISCOVERY_ALERT_THRESHOLD_MS) continue;
+    alerts.push({
+      docId: f.docId,
+      filerName: f.filerName ?? null,
+      filedDate: f.filedDate,
+      discoveredAt: nowIso,
+      hoursLate: Math.round((lateMs / 3600000) * 10) / 10,
+      liveSearchFails,
+    });
+  }
+  return alerts;
+}
+
+export async function alertOnStaleBulkDiscoveries(
+  env: Env,
+  inserted: DiscoveredFiling[],
+  nowIso: string,
+): Promise<void> {
+  let liveSearchFails: string = 'unknown';
+  try {
+    if (env.CONFIG_KV) {
+      liveSearchFails = (await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0';
+    }
+  } catch {
+    // best-effort only; never block the alert on a KV read
+  }
+  for (const a of findStaleBulkDiscoveries(inserted, nowIso, liveSearchFails)) {
+    console.error(
+      `watcher: house filing ${a.docId} (${a.filerName ?? 'unknown member'}) ` +
+      `filed ${a.filedDate} but first discovered via BULK index at ${a.discoveredAt} ` +
+      `(${a.hoursLate}h late, measured from the end of the filed day in ET) — live-search missed it intraday ` +
+      `(live-search consecutive failures: ${a.liveSearchFails})`,
+    );
+  }
+}
+
+/** Bulk-window discovery alert threshold.
+ *
+ *  When a House filing is first discovered via the daily bulk XML (not intraday
+ *  live-search) and its filed_date is older than this, something is wrong: the
+ *  filing survived a full window of live-search polls (~12 polls at the 20-min
+ *  off-hours cadence, ~48 at the 5-min weekday cadence) without intraday
+ *  discovery. Either live-search is failing/missing it, or the Clerk published
+ *  very late — both warrant a look. Under the threshold stays silent (normal
+ *  Clerk publication lag). Set per Jay 2026-10-16: he'd rather investigate a
+ *  false positive than miss a live-search failure.
+ */
+export const BULK_DISCOVERY_ALERT_THRESHOLD_MS = 4 * 3600 * 1000;
 
 /** Default / max lookback windows for the Senate submitted-date filter.
  *  Tunable via SENATE_LOOKBACK_DAYS / SENATE_MAX_LOOKBACK_DAYS. */
@@ -785,6 +1006,37 @@ export function computeSenateLookbackDays(
   if (deepSweepDue || !lastSuccessAt) return max;
   const gapDays = Math.ceil((now.getTime() - lastSuccessAt.getTime()) / 86_400_000) + 1;
   return Math.min(max, Math.max(baseDays, gapDays));
+}
+
+/** Map Senate filings to watcher discovery rows.  Shared by pollSenate and
+ * the out-of-band intake so both paths mint identical filer identities. */
+export function senateDiscoveredFilings(filings: SenateFiling[]): DiscoveredFiling[] {
+  return filings.map((f) => {
+    const filerName = cleanFilerName(f.fullName || [f.first, f.last].filter(Boolean).join(' ').trim()) || null;
+    return {
+      docId: f.pipelineDocId,
+      chamber: 'senate' as const,
+      sourceUrl: f.sourceUrl,
+      filedDate: f.filedDate,
+      filerId: senateFilerId(filerName),
+      filerName,
+    };
+  });
+}
+
+/**
+ * Persist Senate filings discovered outside the poller (the Mac eFD fetcher
+ * intake, CT-2442) through the same insert + durable-outbox path as
+ * pollSenate.  This deliberately writes no poll log, no last-poll state, and
+ * no source-attempt health: an intake must not make a still-failing Senate
+ * poller look healthy.
+ */
+export async function ingestSenateFilings(
+  env: Env,
+  filings: SenateFiling[],
+  now: Date,
+): Promise<{ count: number; inserted: DiscoveredFiling[] }> {
+  return persistAndEnqueue(env, senateDiscoveredFilings(filings), now.toISOString());
 }
 
 /**
@@ -828,22 +1080,12 @@ async function pollSenate(env: Env, now: Date, signal?: AbortSignal): Promise<nu
     proxyUrl: env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL,
     signal,
   });
-  const discovered: DiscoveredFiling[] = filings.map((f) => {
-    const filerName = cleanFilerName(f.fullName || [f.first, f.last].filter(Boolean).join(' ').trim()) || null;
-    return {
-      docId: f.pipelineDocId,
-      chamber: 'senate' as const,
-      sourceUrl: f.sourceUrl,
-      filedDate: f.filedDate,
-      filerId: senateFilerId(filerName),
-      filerName,
-    };
-  });
+  const discovered = senateDiscoveredFilings(filings);
   const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'senate', nowIso);
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
     : null;
-  const newCount = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  const { count: newCount } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
   await logPoll(env, 'senate', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'senate', now);
   await recordSourceAttempt(env, 'senate', nowIso, 'success', newCount, null);
@@ -875,6 +1117,9 @@ export interface WatcherResult {
   houseCadence?: SourcePollDecision;
   senateCadence?: SourcePollDecision;
   executiveCadence?: SourcePollDecision;
+  /** Set while Senate polling is backed off after an eFD edge deny, so a
+   *  `senate: 'skipped'` under a due cadence explains itself. */
+  senateEdgeBackoffUntil?: string;
 }
 
 /**
@@ -896,7 +1141,7 @@ export async function pollExecutive(
   const probeIntervalSec = prevAttemptAt
     ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
     : null;
-  const newCount = await persistAndEnqueue(env, filings, nowIso, { maxNew: maxFilings, prevProbeAt: prevAttemptAt, probeIntervalSec });
+  const { count: newCount } = await persistAndEnqueue(env, filings, nowIso, { maxNew: maxFilings, prevProbeAt: prevAttemptAt, probeIntervalSec });
   await setLastPollAt(env, 'oge', now);
   await logPoll(env, 'oge', nowIso, newCount, nowIso);
   // Liveness receipt (owner 2026-08-10: polling must never be silently off
@@ -1061,7 +1306,7 @@ export async function runWatcher(
         await setLastAttemptAt(env, 'house', now);
         // Fresh 7s budget per source.  A timer created once at tick entry
         // would already be spent by the time Senate and OGE run.
-        await pollHouse(env, now, watcherSourceIoSignal(options.signal));
+        await pollHouse(env, now, watcherSourceIoSignal(options.signal), options.signal);
         result.house = 'success';
       }
     }
@@ -1073,6 +1318,9 @@ export async function runWatcher(
   }
 
   // SENATE ----------------------------------------------------------------
+  // eFD edge-deny backoff (CT-2442), read only when a poll is due.  A backoff
+  // whose last deny predates the last success is spent: success resets it.
+  let senateEdgeBackoff: SenateEdgeBackoffState | null = null;
   try {
     throwIfWatcherAborted(options.signal);
     const lastSenate = await getLastPollAt(env, 'senate');
@@ -1099,21 +1347,42 @@ export async function runWatcher(
     );
     result.senateCadence = senateDecision;
     if (senateDecision.poll) {
+      senateEdgeBackoff = await readSenateEdgeBackoff(env);
+      if (senateEdgeBackoff && lastSenate && Date.parse(senateEdgeBackoff.lastDeniedAt) <= lastSenate.getTime()) {
+        senateEdgeBackoff = null;
+      }
       const lastAttempt = await getLastAttemptAt(env, 'senate');
       const elapsedSec = lastAttempt ? (now.getTime() - lastAttempt.getTime()) / 1000 : Infinity;
       const lastAttemptFailed = lastAttempt && (!lastSenate || lastSenate.getTime() < lastAttempt.getTime());
-      if (lastAttemptFailed && elapsedSec < 600) {
+      if (senateEdgeBackoff && isSenateEdgeBackoffActive(senateEdgeBackoff, now)) {
+        // eFD's edge refused the last attempt: stay off until the window ends
+        // instead of the 600 s failure skip.  polling_senate stays stalled
+        // and names the backoff meanwhile.
+        result.senateEdgeBackoffUntil = senateEdgeBackoff.until;
+      } else if (lastAttemptFailed && elapsedSec < 600) {
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'senate', now);
         await pollSenate(env, now, watcherSourceIoSignal(options.signal));
         result.senate = 'success';
+        if (senateEdgeBackoff) {
+          console.log(
+            `watcher: senate eFD accepted the poll again after ${senateEdgeBackoff.consecutive} edge denies `
+              + `since ${senateEdgeBackoff.firstDeniedAt}; backoff cleared`,
+          );
+          await clearSenateEdgeBackoff(env);
+        }
       }
     }
   } catch (err) {
     if (options.signal?.aborted) throwIfWatcherAborted(options.signal);
     if (err instanceof Error && err.name === 'AbortError') throw err;
-    await recordSourceError(env, 'senate', now.toISOString(), err);
+    if (isSenateEdgeDeniedError(err)) {
+      const backoff = await recordSenateEdgeDenied(env, now, err, senateEdgeBackoff);
+      if (backoff) result.senateEdgeBackoffUntil = backoff.until;
+    } else {
+      await recordSourceError(env, 'senate', now.toISOString(), err);
+    }
     result.senate = 'failure';
   }
 
@@ -1181,6 +1450,11 @@ export async function runWatcher(
     console.warn('watcher: senate relay health probe failed:', (err as Error).message);
   }
   try {
+    // Also refreshes the proxied Senate eFD functional probe (CT-2416).  It
+    // runs after the senate poll on purpose: a deny this tick has already
+    // armed the edge-deny backoff, and the probe skips while that is active,
+    // so a tick whose poll eFD just refused sends it no second agreement POST
+    // (CT-2442).
     await refreshResidentialProxyHealth(env, now);
   } catch (err) {
     console.warn('watcher: residential proxy health probe failed:', (err as Error).message);

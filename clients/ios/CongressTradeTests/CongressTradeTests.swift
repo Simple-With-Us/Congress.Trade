@@ -135,6 +135,35 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(UIColor(AppTheme.card).resolvedColor(with: darkTraits).cgColor.alpha, 1.0, accuracy: 0.001)
     }
 
+    func testLightSemanticTextMeetsWcagAaOnCardBackgroundCT1356() {
+        let lightTraits = UITraitCollection(userInterfaceStyle: .light)
+        let card = UIColor(AppTheme.card).resolvedColor(with: lightTraits)
+        let positive = UIColor(AppTheme.semanticPositive).resolvedColor(with: lightTraits)
+        let negative = UIColor(AppTheme.semanticNegative).resolvedColor(with: lightTraits)
+        let caution = UIColor(AppTheme.semanticCaution).resolvedColor(with: lightTraits)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: positive, background: card), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: negative, background: card), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: caution, background: card), 4.5)
+        // Regression: system green on white is well below 4.5:1.
+        XCTAssertLessThan(Self.wcagContrast(foreground: .systemGreen, background: .white), 4.5)
+    }
+
+    private static func wcagContrast(foreground: UIColor, background: UIColor) -> CGFloat {
+        func relativeLuminance(_ color: UIColor) -> CGFloat {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            color.getRed(&r, green: &g, blue: &b, alpha: &a)
+            func channel(_ c: CGFloat) -> CGFloat {
+                c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        let l1 = relativeLuminance(foreground)
+        let l2 = relativeLuminance(background)
+        let lighter = max(l1, l2)
+        let darker = min(l1, l2)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
     func testSignedFlowFormatUsesUnicodeMinusOnOneLine() {
         XCTAssertEqual(SignedFlowFormat.usd(1_200_000), "+$1.2m")
         XCTAssertEqual(SignedFlowFormat.usd(-178_300_000), "\u{2212}$178.3m")
@@ -191,12 +220,16 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertFalse(line.contains("in this window"))
     }
 
-    func testMemberPhotoURLPrefersAPIThenSeedAndIgnoresRelativePaths() {
+    func testMemberPhotoURLPrefersAPIThenSeedAndResolvesRelativePaths() {
         let api = "https://congress.trade/api/photos/member?key=K000389"
         let seed = "https://example.test/seed.jpg"
         XCTAssertEqual(MemberPhotoURL.resolve(api, seed)?.absoluteString, api)
         XCTAssertEqual(MemberPhotoURL.resolve(nil, seed)?.absoluteString, seed)
-        XCTAssertNil(MemberPhotoURL.resolve("/api/photos/member?key=K000389", ""))
+        // CT-2459: relative paths resolve against the site origin instead of
+        // being dropped (Directory rows silently fell back to initials).
+        XCTAssertEqual(
+            MemberPhotoURL.resolve("/api/photos/member?key=K000389", "")?.absoluteString, api
+        )
         XCTAssertNil(MemberPhotoURL.resolve(nil, nil))
     }
 
@@ -1591,19 +1624,16 @@ final class CongressTradeTests: XCTestCase {
         var splitURL: URL?
         var leaderboardURL: URL?
         MockURLProtocol.handler = { request in
-            if request.url?.path.hasSuffix("/bootstrap") == true {
-                return Self.response(for: request, json: Self.bootstrapJSON)
-            }
             if request.url?.path.contains("/api/analytics/party-split") == true {
                 splitURL = request.url
             }
             if request.url?.path.contains("/api/analytics/ticker-leaderboard") == true {
                 leaderboardURL = request.url
             }
-            if request.url?.path.contains("/feed") == true {
-                return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
-            }
-            return Self.response(for: request, json: "{}")
+            // Valid fan-out envelopes: a bare "{}" fails member-leaderboard
+            // decode, the fan-out throws, and its still-queued sibling tasks
+            // are cancelled before firing — racing this capture on slow CI.
+            return Self.trendsEndpointResponse(for: request)
         }
 
         await store.setPartySelection([.democrat])
@@ -1643,6 +1673,98 @@ final class CongressTradeTests: XCTestCase {
         let components = try XCTUnwrap(URLComponents(url: XCTUnwrap(tickerURL), resolvingAgainstBaseURL: false))
         XCTAssertEqual(components.queryItems?.first(where: { $0.name == "type" })?.value, "B")
         XCTAssertEqual(components.queryItems?.first(where: { $0.name == "window" })?.value, "90d")
+    }
+
+    /// CT-2459 review fix: the feed memo signature must notice in-place
+    /// row edits (poll upserts mutate cached rows), not just id churn.
+    func testFeedContentDigestChangesOnInPlaceRowEdit() {
+        let trade = Self.makeTrade(id: "tx_digest", cursor: 1)
+        let before = FeedDashboardView.feedContentDigest([trade])
+        trade.transaction.amountMax = 999_000
+        XCTAssertNotEqual(before, FeedDashboardView.feedContentDigest([trade]))
+        trade.member.chamber = "senate"
+        XCTAssertNotEqual(before, FeedDashboardView.feedContentDigest([trade]))
+    }
+
+    func testCachedImageLoaderSessionCarriesSafariUA() {
+        let headers = CachedImageLoader.session.configuration.httpAdditionalHeaders
+        let ua = headers?["User-Agent"] as? String
+        XCTAssertTrue(ua?.contains("Safari") == true)
+    }
+
+    /// CT-2461: `AssetMark` must start its own load while it has no image.
+    /// Its `.task` once sat on a childless `Group`, so it never ran and every
+    /// ticker logo vanished with no error and no request.
+    @MainActor
+    func testAssetMarkRequestsAndShowsLogoFromEmptyState() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+        let requested = expectation(description: "logo requested")
+        requested.assertForOverFulfill = false
+        MockURLProtocol.handler = { request in
+            requested.fulfill()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "image/png"]
+            )
+            return (try XCTUnwrap(response), png)
+        }
+        let host = hostAssetMark(symbol: "AAPL", size: 40)
+        defer { host.teardown() }
+
+        await fulfillment(of: [requested], timeout: 5)
+        let width = await host.settledWidth(until: { $0 > 0 })
+        XCTAssertEqual(width, 40, accuracy: 0.5)
+    }
+
+    /// CT-2461: a ticker with no logo still takes no width (no placeholder).
+    @MainActor
+    func testAssetMarkTakesNoWidthWhenLogoIsMissing() async throws {
+        let requested = expectation(description: "logo requested")
+        requested.assertForOverFulfill = false
+        MockURLProtocol.handler = { request in
+            requested.fulfill()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 404, httpVersion: nil, headerFields: nil
+            )
+            return (try XCTUnwrap(response), Data())
+        }
+        let host = hostAssetMark(symbol: "NOLOGO", size: 40)
+        defer { host.teardown() }
+
+        await fulfillment(of: [requested], timeout: 5)
+        let width = await host.settledWidth(until: { _ in false })
+        XCTAssertEqual(width, 0, accuracy: 0.5)
+    }
+
+    /// CT-2461: one logo at two sizes must not share a decoded thumbnail.
+    func testCachedImageLoaderKeysOnPixelSize() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 200)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
+        }
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil
+            )
+            return (try XCTUnwrap(response), png)
+        }
+        let original = CachedImageLoader.session
+        CachedImageLoader.session = makeSession()
+        CachedImageLoader.cache.removeAllObjects()
+        defer {
+            CachedImageLoader.session = original
+            CachedImageLoader.cache.removeAllObjects()
+        }
+        let url = try XCTUnwrap(URL(string: "https://example.test/api/logos/ticker?symbol=SIZE"))
+
+        let small = await CachedImageLoader.load(url: url, maxPixelSize: 20)
+        let large = await CachedImageLoader.load(url: url, maxPixelSize: 100)
+
+        XCTAssertEqual(small?.cgImage?.width, 20)
+        XCTAssertEqual(large?.cgImage?.width, 100)
     }
 
     /// Multi-select Trade Type pill: `type=` is CSV-capable (`asTxTypes`).
@@ -3069,6 +3191,26 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(result.analytics?.window, "1y")
     }
 
+    /// Puts an `AssetMark` on screen so SwiftUI really runs its `.task`,
+    /// loading through the mock protocol from an empty image cache.
+    @MainActor
+    private func hostAssetMark(symbol: String, size: CGFloat) -> AssetMarkHost {
+        let original = CachedImageLoader.session
+        CachedImageLoader.session = makeSession()
+        CachedImageLoader.cache.removeAllObjects()
+        let controller = UIHostingController(rootView: AssetMark(symbol: symbol, size: size))
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let frame = CGRect(x: 0, y: 0, width: 200, height: 200)
+        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: frame)
+        window.frame = frame
+        window.rootViewController = controller
+        window.isHidden = false
+        return AssetMarkHost(controller: controller, window: window) {
+            CachedImageLoader.session = original
+            CachedImageLoader.cache.removeAllObjects()
+        }
+    }
+
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -3346,6 +3488,32 @@ private final class MemoryTokenStore: SessionTokenStore {
     func clear() throws { token = nil }
 }
 
+@MainActor
+private struct AssetMarkHost {
+    let controller: UIHostingController<AssetMark>
+    let window: UIWindow
+    let restore: () -> Void
+
+    var width: CGFloat {
+        controller.sizeThatFits(in: CGSize(width: 200, height: 200)).width
+    }
+
+    /// Lets the load finish and SwiftUI re-render, returning early only once
+    /// `done` is true.  Otherwise it returns the width after the full wait.
+    func settledWidth(until done: (CGFloat) -> Bool) async -> CGFloat {
+        for _ in 0..<40 {
+            if done(width) { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return width
+    }
+
+    func teardown() {
+        window.isHidden = true
+        restore()
+    }
+}
+
 private final class MockURLProtocol: URLProtocol {
     typealias Handler = (URLRequest) throws -> (HTTPURLResponse, Data)
 
@@ -3420,4 +3588,37 @@ private final class MockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+/// CT-2459: Trader identity is stable across decodes (it used to mint a
+/// fresh UUID per `id` access when filerId/fullName were nil).
+final class TraderIdentityTests: XCTestCase {
+    private func decodeTrader(_ json: String) throws -> ClientTickerAnalytics.Trader {
+        try JSONDecoder().decode(
+            ClientTickerAnalytics.Trader.self, from: Data(json.utf8)
+        )
+    }
+
+    func testIDStableAcrossRepeatedAccessAndDecodes() throws {
+        let json = #"{"partyBucket":"D","tradeCount":3,"estVolumeUsd":12345.0}"#
+        let a = try decodeTrader(json)
+        let b = try decodeTrader(json)
+        XCTAssertEqual(a.id, a.id)
+        XCTAssertEqual(a.id, b.id)
+        XCTAssertTrue(a.id.hasPrefix("anon:"))
+    }
+
+    func testIDPrefersFilerIDThenName() throws {
+        let byFiler = try decodeTrader(#"{"filerId":"P000197","fullName":"Nancy Pelosi"}"#)
+        XCTAssertEqual(byFiler.id, "P000197")
+        let byName = try decodeTrader(#"{"fullName":"  Nancy Pelosi "}"#)
+        XCTAssertEqual(byName.id, "name:nancy pelosi")
+    }
+
+    func testRelativePhotoPathResolvesAgainstOrigin() {
+        let resolved = MemberPhotoURL.resolve("/api/photos/P000197.jpg")
+        XCTAssertEqual(resolved?.absoluteString, "https://congress.trade/api/photos/P000197.jpg")
+        XCTAssertNil(MemberPhotoURL.resolve("javascript:alert(1)"))
+        XCTAssertNil(MemberPhotoURL.resolve(nil, ""))
+    }
 }

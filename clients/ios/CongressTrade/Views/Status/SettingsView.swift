@@ -147,18 +147,18 @@ struct SettingsView: View {
         if store.signedIn, let user = store.signedInUser {
             HStack(spacing: 12) {
                 if let picture = user.picture, let url = URL(string: picture) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image.resizable().scaledToFill()
-                        default:
+                    // CT-2459: shared downsampling cache + decorative label
+                    // (the name/email beside it carry the meaning).
+                    CachedAsyncImage(url: url, pointSize: 44)
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 44, height: 44)
+                        .background(
                             Image(systemName: "person.crop.circle.fill")
                                 .resizable()
                                 .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(width: 44, height: 44)
-                    .clipShape(Circle())
+                        )
+                        .clipShape(Circle())
+                        .accessibilityHidden(true)
                 } else {
                     Image(systemName: "person.crop.circle.fill")
                         .font(.system(size: 40))
@@ -238,9 +238,13 @@ struct AdminPanelView: View {
             pollingSection
             extractionSection
             haltSection
+            marketDataSection
+            senateEgressSection
             freshnessSection
             deadLetterSection
             latencySection
+            infrastructureSection
+            uncoveredPipelineChecksSection
 
             Section {
                 NavigationLink(value: AdminRoute.reviewQueue) {
@@ -274,8 +278,8 @@ struct AdminPanelView: View {
     private var pollingSection: some View {
         Section("Polling Ages") {
             ForEach(["house", "senate", "executive"], id: \.self) { chamber in
-                let check = store.pollingHealth?.checks.first { $0.id == "polling_\(chamber)" }
-                    ?? store.publicHealth?.pipeline?.check(id: "polling_\(chamber)")
+                let check = store.publicHealth?.pipeline?.check(id: "polling_\(chamber)")
+                    ?? store.pollingHealth?.checks.first { $0.id == "polling_\(chamber)" }
                 AdminStatusRow(title: chamber.capitalized, check: check.map(PipelineCheckProxy.init))
             }
         }
@@ -326,12 +330,78 @@ struct AdminPanelView: View {
     }
 
     @ViewBuilder
+    private var marketDataSection: some View {
+        let pipeline = store.publicHealth?.pipeline
+        Section("Market Data") {
+            AdminStatusRow(
+                title: "Price / S&P Freshness",
+                check: pipeline?.check(id: "price_freshness").map(PipelineCheckProxy.init)
+            )
+            AdminStatusRow(
+                title: "ST → CT Peer Prices",
+                check: pipeline?.check(id: "st_peer_prices").map(PipelineCheckProxy.init)
+            )
+            if let notCovered = pipeline?.check(id: "st_peer_prices")?.notCovered, notCovered > 0 {
+                Text("Not covered by ST: \(notCovered)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var senateEgressSection: some View {
+        let pipeline = store.publicHealth?.pipeline
+        Section("Senate Egress") {
+            AdminStatusRow(title: "Residential Proxy", check: pipeline?.check(id: "senate_relay").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Senate eFD", check: pipeline?.check(id: "senate_efd").map(PipelineCheckProxy.init))
+        }
+    }
+
+    @ViewBuilder
     private var freshnessSection: some View {
         Section("Data Freshness") {
             AdminStatusRow(
                 title: "Latest Transaction",
                 check: store.publicHealth?.pipeline?.check(id: "data_freshness").map(PipelineCheckProxy.init)
             )
+        }
+    }
+
+    @ViewBuilder
+    private var infrastructureSection: some View {
+        let pipeline = store.publicHealth?.pipeline
+        Section("Infrastructure") {
+            AdminStatusRow(title: "Ingestion Backlog", check: pipeline?.check(id: "ingestion_backlog").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Cron Deadline", check: pipeline?.check(id: "cron_deadline").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Delivery Quarantine", check: pipeline?.check(id: "delivery_quarantine").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Filing Skips", check: pipeline?.check(id: "filing_skips").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "FMP Latency", check: pipeline?.check(id: "fmp_latency").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Review Integrity", check: pipeline?.check(id: "review_resolution_integrity").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Stranded Filings", check: pipeline?.check(id: "stranded_filings").map(PipelineCheckProxy.init))
+        }
+    }
+
+    private static let pinnedPipelineCheckIds: Set<String> = [
+        "polling_house", "polling_senate", "polling_executive", "polling_liveness",
+        "extraction_provider", "extraction_backlog", "autopilot_halt",
+        "data_freshness", "price_freshness", "st_peer_prices",
+        "ingestion_dead_letter", "ingestion_backlog", "cron_deadline", "delivery_quarantine",
+        "filing_skips", "fmp_latency", "review_resolution_integrity", "stranded_filings",
+        "latency_probes", "senate_relay", "senate_efd",
+    ]
+
+    @ViewBuilder
+    private var uncoveredPipelineChecksSection: some View {
+        let checks = store.publicHealth?.pipeline?.checks.filter {
+            !Self.pinnedPipelineCheckIds.contains($0.id)
+        } ?? []
+        if !checks.isEmpty {
+            Section("Other Pipeline Checks") {
+                ForEach(checks, id: \.id) { check in
+                    AdminStatusRow(title: AdminPipelineCheckTitles.title(for: check.id), check: PipelineCheckProxy(check))
+                }
+            }
         }
     }
 
@@ -352,6 +422,19 @@ struct AdminPanelView: View {
                 title: "Latency Probes",
                 check: store.publicHealth?.pipeline?.check(id: "latency_probes").map(PipelineCheckProxy.init)
             )
+        }
+    }
+}
+
+private enum AdminPipelineCheckTitles {
+    static func title(for id: String) -> String {
+        switch id {
+        case "st_peer_prices": return "ST → CT Peer Prices"
+        case "price_freshness": return "Price / S&P Freshness"
+        case "senate_efd": return "Senate eFD"
+        case "senate_relay": return "Residential Proxy"
+        default:
+            return id.split(separator: "_").map { $0.capitalized }.joined(separator: " ")
         }
     }
 }
@@ -398,9 +481,9 @@ struct AdminStatusRow: View {
 
     static func color(for status: String?) -> Color {
         switch (status ?? "").lowercased() {
-        case "ok": return .green
-        case "degraded": return .orange
-        case "stalled", "down": return .red
+        case "ok": return AppTheme.semanticPositive
+        case "degraded": return AppTheme.semanticCaution
+        case "stalled", "down": return AppTheme.semanticNegative
         default: return .secondary
         }
     }
@@ -596,7 +679,7 @@ struct ReviewDetailView: View {
                                 Spacer()
                                 Text(run.ok == true ? "ok" : "error")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(run.ok == true ? .green : .red)
+                                    .foregroundStyle(run.ok == true ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                             }
                             if let provider = run.provider, !provider.isEmpty {
                                 Text("Provider \(provider)")
@@ -606,7 +689,7 @@ struct ReviewDetailView: View {
                             if let error = run.error, !error.isEmpty {
                                 Text(error)
                                     .font(.caption)
-                                    .foregroundStyle(.red)
+                                    .foregroundStyle(AppTheme.semanticNegative)
                             }
                             ForEach(Array(run.rows.prefix(8).enumerated()), id: \.offset) { _, row in
                                 ReviewExtractedRowView(row: row)

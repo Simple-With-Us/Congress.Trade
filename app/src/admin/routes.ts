@@ -7,6 +7,7 @@
  *   PUT   /poll-config              -> update schedule / aggressiveMode (setConfig)
  *   GET   /poll-config/aggressive   -> aggressiveMode toggle convenience read
  *   GET   /review-queue             -> list unresolved review items
+ *   GET   /review-queue/ingest-failures -> filings stuck at ingest (read-only)
  *   POST  /review/:docId            -> {decision:'confirm'|'reject', edits?}
  *   GET   /sources/health           -> ingest_log aggregates per source
  *   GET   /instrument-pricing       -> equities/crypto/options/event-contract capability matrix
@@ -50,6 +51,7 @@ import {
 import type { Env, ParsedTx, PollConfig, PollWindow, TxType, TxSource, Subscription, DocKind, Chamber, Filing } from '../shared/types.ts';
 import { all, batch, batchPrepared, chunkArray, first, get, isSqliteLockBusy, run, type SqlParam } from '../shared/db.ts';
 import { checkReadiness } from '../shared/readiness.ts';
+import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
 import { listIngestionDecisions, recordIngestionDecision } from '../shared/ingestionDecisions.ts';
 import { activeWindow, effectiveInterval, getConfig, setConfig } from '../shared/config.ts';
@@ -80,9 +82,12 @@ import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from '../deli
 import { apnsLaneErrorIsRecent, inspectApnsFanoutDiagnostics, resolveApnsConfig } from '../delivery/apnsFanout.ts';
 import { apnsConfigured } from '../shared/apns.ts';
 import { runSeedBackfillFromEnv } from '../backfill/seed.ts';
-import { runFmpSenateRecovery } from '../backfill/fmpSenateRecovery.ts';
 import { runHouseHistoricalBackfill } from '../backfill/houseCrawler.ts';
 import { runSenateBackfill } from '../backfill/senateCrawler.ts';
+import {
+  senateFilingFromFetcherRow,
+  type SenateFiling,
+} from '../ingestion/senateSource.ts';
 import { extractParsed } from '../extraction/orchestrator.ts';
 import {
   normalize,
@@ -94,6 +99,11 @@ import {
   hasHardFailureFlags,
 } from '../extraction/normalizer.ts';
 import { storedReviewBlocksSmallerVisionSubmit, storedReviewTransactionCount } from '../extraction/visionSubmitGuard.ts';
+import { collapseDuplicateSpans } from '../extraction/localVisionDupeGuard.ts';
+import {
+  refuseIllegibleBandAmounts,
+  rejectConstantColumnReads,
+} from '../extraction/visionIntegrityGuards.ts';
 import { PIPELINE_TX_SOURCES_SQL, VISION_SUPERSEDE_REASON } from '../extraction/sourceSupersede.ts';
 import { EXTRACTION_PROMPT_VERSION } from '../extraction/visionLlm.ts';
 import { deprecatePredecessorFilingTransactions, duplicateLineupReason, enqueueAgreementCheck, processAgreementDoc, loadDocBytes, loadFilingRow, sameRowSet, type AgreementModels } from '../extraction/agreement.ts';
@@ -114,6 +124,16 @@ import { buildPremiumRoster, localPremiumCounts } from './premiumRoster.ts';
 import { getLogoDisplay, setLogoDisplay } from '../shared/settings.ts';
 import { normalizeCompanyName } from '../shared/companyName.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
+import { junkAssetNameReason, normalizeOcrAssetName, validateTxDate } from '../extraction/ocrSanity.ts';
+import { canonicalizeAmountBounds } from '../extraction/amounts.ts';
+import { computeDisclosureLagDays, computeStockActStatus } from '../shared/stockAct.ts';
+import {
+  planCorrection,
+  REVIVE_COMPARED_COLUMNS_SQL,
+  reviveChangedIds,
+  type CorrectionPlan,
+  type PriorTxRow,
+} from './reviewCorrection.ts';
 import {
   MEMBER_FILER_MERGES,
   MEMBER_NAME_ALIASES,
@@ -145,7 +165,6 @@ import {
 import { buildConsensusRows, type ConsensusRun } from '../extraction/consensus.ts';
 import {
   runEnrichment,
-  getDailyUsed,
   prepareImportSecurityRef,
   enrichmentNeededSql,
   enrichmentUnavailableExcludedSql,
@@ -157,6 +176,7 @@ import { mergeRefs } from '../enrichment/compute.ts';
 import type { SecurityRef } from '../enrichment/types.ts';
 import {
   runPriceRefresh,
+  priceNotCoveredExclusionSql,
   priceUnavailableCutoffIso,
   priceUnavailableFirstRecheckCutoffIso,
   PRICE_UNAVAILABLE_NOT_FOUND_FIRST,
@@ -170,7 +190,7 @@ import {
   rematchAndHealLatencyRaces,
   runDisclosureLatencyProbe,
 } from '../ingestion/tradeLatency.ts';
-import { pollExecutive } from '../ingestion/watcher.ts';
+import { ingestSenateFilings, pollExecutive } from '../ingestion/watcher.ts';
 import { verifyRawFilesStorage } from './storageSmoke.ts';
 
 function isObjectStoreAuthError(message: string): boolean {
@@ -181,18 +201,29 @@ import {
   buildFailedIngestionOutboxIdentity,
   loadFailedIngestionOutboxRows,
 } from '../ingestion/failedOutboxIdentity.ts';
+import { readSenateIntakeStatus, recordSenateIntake } from '../ingestion/senateIntakeStatus.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
   sweepAlreadyPublishedReviewRows,
 } from '../ingestion/autonomySweeps.ts';
 import {
+  isParkedDlqError,
   requeueTransientFailedDurableJobs,
   requeueTransientFailedIngestionOutbox,
 } from '../ingestion/transientDlq.ts';
 import { estimateTransactionValue } from '../shared/transactionValue.ts';
 import { isValidBracket } from '../shared/brackets.ts';
 import { flushDeliveryOutbox } from '../delivery/outbox.ts';
+import {
+  collectDeliveryModeCheck,
+  DELIVERY_MODE_SETTING_KEY,
+  DELIVERY_MODES,
+  isDeliveryMode,
+  listDeliveryModeAudit,
+  readDeliveryModeDetail,
+  recordDeliveryModeChange,
+} from '../delivery/deliveryMode.ts';
 import { resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { createRuntimeQueueHandlers } from '../deno/runtimeHandlers.ts';
 import { runScheduledTick } from '../deno/scheduledTick.ts';
@@ -273,14 +304,12 @@ import {
   persistPeerImportReceipt,
   rejectedCountsFromErrors,
   resolvePeerImportRequestId,
+  resolvePeerImportSchemaVersion,
   warnPeerImportSchemaDrops,
 } from '../share/importReceipt.ts';
-import {
-  BASE_SCHEMA_STATEMENTS,
-  DISCLOSURE_AVAILABLE_SCHEMA_STATEMENTS,
-  POST_0024_SCHEMA_STATEMENTS,
-  CLEAN_PLACEHOLDER_TICKERS_SCHEMA_STATEMENTS,
-} from './migrations.ts';
+import { buildAdminMigrateStatements } from './migrateStatements.ts';
+import { executeAdminSchemaMigrations } from './schemaMigrationRunner.ts';
+import { ensurePeerImportSchemaColumns } from './ensurePeerSchema.ts';
 import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
@@ -321,6 +350,16 @@ type EnvWithAdmin = Env & {
    * unset. Worst case if leaked: someone re-runs an idempotent requeue.
    */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /**
+   * Scoped bearer token that unlocks ONLY POST /senate-ptr-intake (the
+   * Mac eFD fetcher's filing intake, CT-2442).  Lets that one caller
+   * submit official eFD report rows without holding the full
+   * ADMIN_TOKEN.  Same pattern as INGEST_TOKEN.  Optional; ignored if
+   * unset.  Worst case if leaked: someone submits eFD report rows,
+   * which the pipeline dedupes against the canonical doc ids and
+   * fetches only from efdsearch.senate.gov.
+   */
+  SENATE_INTAKE_TOKEN?: string;
 };
 
 /** The ONLY admin paths ADMIN_MAINTENANCE_TOKEN unlocks. Keep this list to
@@ -361,6 +400,21 @@ async function isAuthorizedMaintenance(
   return (
     !!token &&
     MAINTENANCE_PATH_SUFFIXES.some((suffix) => path.endsWith(suffix)) &&
+    (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
+  );
+}
+
+
+/** True when the request is a bearer-authenticated call to the Senate PTR intake. */
+async function isAuthorizedSenateIntake(
+  env: EnvWithAdmin,
+  path: string,
+  authorization?: string,
+): Promise<boolean> {
+  const token = (await resolveSecret(env, 'SENATE_INTAKE_TOKEN')).value;
+  return (
+    !!token &&
+    path.endsWith('/senate-ptr-intake') &&
     (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
   );
 }
@@ -412,6 +466,114 @@ async function resolveAdminActor(c: Context<{ Bindings: Env }>): Promise<string>
     /* fall through to the generic actor label */
   }
   return adminActor(c);
+}
+
+/**
+ * Actor for the delivery_mode_audit trail, from VERIFIED identity only.
+ * Unlike resolveAdminActor(), the client-supplied
+ * Cf-Access-Authenticated-User-Email header is never trusted on its own: a
+ * bearer ADMIN_TOKEN caller can send any value there.  Order: a Cloudflare
+ * Access JWT that verifies (signature + aud + allowlist), then the first-party
+ * session, then the shared token, labelled as such with any claimed email
+ * marked unverified.
+ */
+async function verifiedDeliveryModeActor(c: Context<{ Bindings: Env }>): Promise<string> {
+  const jwt = c.req.header('Cf-Access-Jwt-Assertion');
+  if (jwt) {
+    try {
+      const cfg = await adminRuntimeConfig(c.env);
+      if (cfg.accessAud && cfg.accessTeamDomain && cfg.allow.size > 0) {
+        const res = await verifyAccessJwt(jwt, {
+          aud: cfg.accessAud,
+          allow: cfg.allow,
+          jwksUrl: certsUrl(cfg.accessTeamDomain),
+        });
+        if (res.ok && res.email) return res.email.trim().toLowerCase();
+      }
+    } catch {
+      /* fall through to the next verified identity */
+    }
+  }
+  try {
+    const user = await getCurrentUserFromRequest(c);
+    if (user?.email) return user.email.trim().toLowerCase();
+  } catch {
+    /* fall through to the shared-token label */
+  }
+  const base = c.req.header('authorization') ? 'admin-token' : 'admin';
+  const claimed = c.req.header('Cf-Access-Authenticated-User-Email')?.trim().toLowerCase();
+  return claimed ? `${base} (unverified claim: ${claimed})` : base;
+}
+
+/**
+ * PUT /settings for CT_DELIVERY_MODE (subscriber alert pause).  Validates the
+ * value, writes Infisical first via the settings service (a failed write
+ * fails the save and records nothing), then appends a delivery_mode_audit row
+ * with who/when/from/to/reason.  An audit insert failure after a successful
+ * Infisical write is reported (502) — the mode did change, so the caller must
+ * know the trail is missing; the delivery_mode health check also turns
+ * critical for an unaudited non-default mode.
+ */
+/** Strict body for PUT /settings when key is CT_DELIVERY_MODE. */
+const DeliveryModePutBody = z.object({
+  key: z.string().trim().pipe(z.literal(DELIVERY_MODE_SETTING_KEY)),
+  value: z.string().trim().toLowerCase().pipe(z.enum(DELIVERY_MODES)),
+  reason: z.string().max(2000).nullable().optional(),
+}).strict();
+
+async function putDeliveryMode(
+  c: Context<{ Bindings: Env }>,
+  rawValue: string,
+  rawReason: string | null,
+): Promise<Response> {
+  const value = rawValue.trim().toLowerCase();
+  if (!isDeliveryMode(value)) {
+    return c.json({ ok: false, error: `${DELIVERY_MODE_SETTING_KEY} must be one of ${DELIVERY_MODES.join(', ')}` }, 400);
+  }
+  const reason = rawReason?.trim() ? rawReason.trim().slice(0, 500) : null;
+  if (value !== 'deliver' && !reason) {
+    return c.json({ ok: false, error: `reason is required when setting ${DELIVERY_MODE_SETTING_KEY} to ${value}` }, 400);
+  }
+  const { appSettings } = await import('../settings/settingsService.ts');
+  const previous = readDeliveryModeDetail();
+  let saved: string;
+  try {
+    saved = await appSettings().set(c.env, DELIVERY_MODE_SETTING_KEY, value);
+  } catch (err) {
+    return c.json({ ok: false, error: (err as Error).message }, 502);
+  }
+  // The write must be visible to readers in this process: if the post-write
+  // refresh left the snapshot on another mode, report it instead of a
+  // success that leaves subscribers on the old mode.
+  const live = readDeliveryModeDetail();
+  if (live.mode !== value) {
+    return c.json({
+      ok: false,
+      key: DELIVERY_MODE_SETTING_KEY,
+      value: saved,
+      liveMode: live.mode,
+      error: `mode saved to Infisical but the live settings snapshot still reads ${live.mode}; nothing audited`,
+    }, 502);
+  }
+  const actor = await verifiedDeliveryModeActor(c);
+  try {
+    const audit = await recordDeliveryModeChange(c.env, {
+      mode: value,
+      previousMode: previous.mode,
+      actor,
+      reason,
+    });
+    // The free-form reason stays in delivery_mode_audit only, never in logs.
+    console.warn(`delivery_mode.changed ${previous.mode} -> ${value} by ${actor} [${audit.id}]`);
+    return c.json({ ok: true, key: DELIVERY_MODE_SETTING_KEY, value: saved, previousMode: previous.mode, audit });
+  } catch (err) {
+    return c.json({
+      ok: false,
+      key: DELIVERY_MODE_SETTING_KEY,
+      value: saved,
+      error: `mode saved to Infisical but the audit row failed: ${(err as Error).message}`,
+    }, 502);
+  }
 }
 
 /**
@@ -810,11 +972,393 @@ function reviewQueueFilterWhere(f: ReviewQueueFilters): { clause: string; params
   return { clause: clauses.join(' AND '), params };
 }
 
+// --- Ingest failures (filings stuck at ingest_status='error') ---------------
+//
+// Some filings fail at fetch/extract before a review_queue row is ever
+// written, so the queue listing below cannot see them and "0 pending"
+// misreads as "healthy". This read-only view surfaces those filings without
+// changing the queue itself (no writes, no re-drive, no auto-retry).
+//
+// A filing counts as an ingest failure when:
+//   - ingest_status = 'error' (uses idx_filings_status),
+//   - it has no OPEN (resolved=0) review_queue row (an open row is already
+//     listed in the queue — listing it twice would double-count),
+//   - it was not honestly rejected through review (resolved=1 +
+//     resolution_kind='rejected' is a terminal decision, already visible
+//     under ?resolved=1), and
+//   - it has no live (deprecated_at IS NULL) transactions.
+// The last condition keeps CT-2453 rows out: a published filing whose stamp
+// flipped back to 'error' on a later fetch-stage failure has correct data
+// and must not be presented as needing review/re-extraction. Those rows
+// are counted separately as `publishedStatusStale` (count only, never
+// listed). Both EXISTS probes key off indexed doc_id lookups (review_queue
+// PK, idx_tx_doc), so neither scans transactions per row.
+
+const INGEST_FAILURE_ERROR_MAX = 300;
+
+interface IngestFailureCursor {
+  seenAt: string;
+  docId: string;
+}
+
+function encodeIngestFailureCursor(cur: IngestFailureCursor): string {
+  return btoa(JSON.stringify(cur));
+}
+
+const ingestFailureCursorSchema = z.object({
+  // '' is a legitimate keyset value: the page query orders on COALESCE(first_seen_at, '').
+  seenAt: z.string(),
+  docId: z.string().min(1),
+});
+
+function decodeIngestFailureCursor(raw: string): IngestFailureCursor | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(atob(raw));
+  } catch {
+    return null; // malformed cursor — caller answers 400
+  }
+  const parsed = ingestFailureCursorSchema.safeParse(json);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Ingest-failure page size: positive integer, clamped to REVIEW_QUEUE_MAX_LIMIT. */
+const ingestLimitSchema = z.coerce
+  .number()
+  .int()
+  .positive()
+  .transform((n) => Math.min(n, REVIEW_QUEUE_MAX_LIMIT));
+
+/** `?ingestLimit=` / `?limit=` for the ingest-failure listing; undefined → default (50), invalid → null (400). */
+function parseIngestLimit(raw: string | undefined): number | null {
+  if (raw === undefined) return REVIEW_QUEUE_DEFAULT_LIMIT;
+  const parsed = ingestLimitSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+/** `?include=` on GET /review-queue: comma-separated, only known sections allowed. */
+const reviewQueueIncludeSchema = z
+  .string()
+  .optional()
+  .transform((raw) => (raw ?? '').split(',').map((v) => v.trim()).filter((v) => v.length > 0))
+  .pipe(z.array(z.enum(['ingest_failures', 'dead_letters', 'dlq_failed'])).max(4));
+
+/** Shared WHERE for the ingest-failure page query and its COUNT. */
+function ingestFailureWhere(chamber: string | null): { clause: string; params: SqlParam[] } {
+  const clauses = [
+    `f.ingest_status = 'error'`,
+    `NOT EXISTS (SELECT 1 FROM review_queue rq WHERE rq.doc_id = f.doc_id AND rq.resolved = 0)`,
+    `NOT EXISTS (SELECT 1 FROM review_queue rq WHERE rq.doc_id = f.doc_id AND rq.resolved = 1 AND rq.resolution_kind = 'rejected')`,
+    `NOT EXISTS (SELECT 1 FROM transactions t WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL)`,
+  ];
+  const params: SqlParam[] = [];
+  if (chamber) {
+    clauses.push('f.chamber = ?');
+    params.push(chamber);
+  }
+  return { clause: clauses.join(' AND '), params };
+}
+
+interface IngestFailureCounts {
+  ingestFailures: number;
+  publishedStatusStale: number;
+}
+
+async function ingestFailureCounts(db: D1Database, chamber: string | null): Promise<IngestFailureCounts> {
+  const where = ingestFailureWhere(chamber);
+  const staleClauses = [
+    `f.ingest_status = 'error'`,
+    `EXISTS (SELECT 1 FROM transactions t WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL)`,
+  ];
+  const staleParams: SqlParam[] = [];
+  if (chamber) {
+    staleClauses.push('f.chamber = ?');
+    staleParams.push(chamber);
+  }
+  const [failRow, staleRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM filings f WHERE ${where.clause}`, where.params),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM filings f WHERE ${staleClauses.join(' AND ')}`, staleParams),
+  ]);
+  return {
+    ingestFailures: Number(failRow?.n ?? 0) || 0,
+    publishedStatusStale: Number(staleRow?.n ?? 0) || 0,
+  };
+}
+
+interface IngestFailureRow {
+  doc_id: string;
+  chamber: string | null;
+  filer_id: string | null;
+  filing_type: string | null;
+  filed_date: string | null;
+  source_url: string | null;
+  raw_object_key: string | null;
+  doc_kind: string | null;
+  ingest_status: string | null;
+  error: string | null;
+  first_seen_at: string | null;
+  source_updated_at: string | null;
+  review_resolved: number | null;
+  review_resolution_kind: string | null;
+}
+
+/**
+ * One page of ingest-failure filings, newest first. Keyset-paginated on
+ * (COALESCE(first_seen_at,''), doc_id), mirroring the review-queue cursor:
+ * filings has no queue-style created_at, and first_seen_at is the closest
+ * stored "when did this get stuck" stamp (error writes touch no timestamp
+ * column). Filer names and the ingestion_outbox last-attempt stamp are
+ * enriched per page in chunked IN (...) lookups and degrade to null when
+ * those tables are absent, exactly like the extraction_runs enrichment in
+ * GET /review-queue.
+ */
+async function listIngestFailures(
+  db: D1Database,
+  opts: { chamber: string | null; limit: number; cursor: IngestFailureCursor | null },
+): Promise<{ items: Array<Record<string, unknown>>; nextCursor: string | null }> {
+  const where = ingestFailureWhere(opts.chamber);
+  const clauses = [where.clause];
+  const params: SqlParam[] = [...where.params];
+  if (opts.cursor) {
+    clauses.push(`(COALESCE(f.first_seen_at, '') < ? OR (COALESCE(f.first_seen_at, '') = ? AND f.doc_id < ?))`);
+    params.push(opts.cursor.seenAt, opts.cursor.seenAt, opts.cursor.docId);
+  }
+
+  const rows = await all<IngestFailureRow>(
+    db,
+    `SELECT
+        f.doc_id, f.chamber, f.filer_id, f.filing_type, f.filed_date,
+        f.source_url, f.raw_object_key, f.doc_kind, f.ingest_status,
+        f.error, f.first_seen_at, f.source_updated_at,
+        rq.resolved AS review_resolved,
+        rq.resolution_kind AS review_resolution_kind
+      FROM filings f
+      LEFT JOIN review_queue rq ON rq.doc_id = f.doc_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY COALESCE(f.first_seen_at, '') DESC, f.doc_id DESC
+      LIMIT ?`,
+    [...params, opts.limit + 1],
+  );
+
+  const hasMore = rows.length > opts.limit;
+  const pageRows = hasMore ? rows.slice(0, opts.limit) : rows;
+  const lastRow = pageRows[pageRows.length - 1];
+  const nextCursor = hasMore && lastRow
+    ? encodeIngestFailureCursor({ seenAt: lastRow.first_seen_at ?? '', docId: lastRow.doc_id })
+    : null;
+
+  const nameByFiler = new Map<string, string>();
+  const filerIds = [...new Set(pageRows.map((r) => r.filer_id).filter((v): v is string => !!v))];
+  for (const idChunk of chunkArray(filerIds, REVIEW_QUEUE_IN_CHUNK)) {
+    if (!idChunk.length) continue;
+    try {
+      const placeholders = idChunk.map(() => '?').join(',');
+      const filers = await all<{ bioguide_id: string; full_name: string | null }>(
+        db,
+        `SELECT bioguide_id, full_name FROM filers WHERE bioguide_id IN (${placeholders})`,
+        idChunk,
+      );
+      for (const f of filers) if (f.full_name) nameByFiler.set(f.bioguide_id, f.full_name);
+    } catch {
+      /* filers not migrated yet — filerName stays null for this page. */
+    }
+  }
+
+  const attemptByDoc = new Map<string, string>();
+  for (const idChunk of chunkArray(pageRows.map((r) => r.doc_id), REVIEW_QUEUE_IN_CHUNK)) {
+    if (!idChunk.length) continue;
+    try {
+      const placeholders = idChunk.map(() => '?').join(',');
+      const outbox = await all<{ doc_id: string; updated_at: string | null }>(
+        db,
+        `SELECT doc_id, updated_at FROM ingestion_outbox WHERE doc_id IN (${placeholders})`,
+        idChunk,
+      );
+      for (const o of outbox) if (o.updated_at) attemptByDoc.set(o.doc_id, o.updated_at);
+    } catch {
+      /* ingestion_outbox not migrated yet — lastAttemptAt falls back below. */
+    }
+  }
+
+  const items = pageRows.map((row) => {
+    const rawError = row.error ?? null;
+    return {
+      kind: 'ingest_failure' as const,
+      docId: row.doc_id,
+      chamber: row.chamber ?? '',
+      filerId: row.filer_id ?? null,
+      filerName: row.filer_id ? (nameByFiler.get(row.filer_id) ?? null) : null,
+      filingType: row.filing_type ?? null,
+      filedDate: row.filed_date ?? null,
+      ingestStatus: row.ingest_status ?? '',
+      error: rawError == null ? null : rawError.slice(0, INGEST_FAILURE_ERROR_MAX),
+      errorTruncated: rawError != null && rawError.length > INGEST_FAILURE_ERROR_MAX,
+      firstSeenAt: row.first_seen_at ?? null,
+      sourceUpdatedAt: row.source_updated_at ?? null,
+      lastAttemptAt: attemptByDoc.get(row.doc_id) ?? row.source_updated_at ?? row.first_seen_at ?? null,
+      sourceUrl: row.source_url ?? '',
+      pdfUrl: `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`,
+      storedDocumentUrl: `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`,
+      rawObjectKey: row.raw_object_key ?? '',
+      docKind: row.doc_kind ?? '',
+      hasResolvedReview: row.review_resolved === 1,
+      resolutionKind: row.review_resolution_kind ?? null,
+    };
+  });
+  return { items, nextCursor };
+}
+
+
+/** Error text cap for the pipeline-failure listings (matches the ingest-failure cap). */
+const PIPELINE_FAILURE_ERROR_MAX = INGEST_FAILURE_ERROR_MAX;
+
+interface DeadLetterRow {
+  doc_id: string;
+  chamber: string | null;
+  status: string | null;
+  attempts: number | null;
+  dead_letter_cycles: number | null;
+  last_error: string | null;
+  available_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * One page of ingestion-outbox dead letters: rows whose delivery failed
+ * terminally (status 'failed').  These filings never reach the review queue
+ * and are not ingest failures either — the filing exists, but its outbox
+ * delivery died — so the queue view needs this listing to see them at all.
+ */
+async function listDeadLetters(
+  db: D1Database,
+  limit: number,
+): Promise<{ items: Array<Record<string, unknown>>; count: number; available: boolean }> {
+  try {
+    const rows = await all<DeadLetterRow>(
+      db,
+      `SELECT doc_id, chamber, status, attempts, dead_letter_cycles, last_error, available_at, updated_at
+         FROM ingestion_outbox
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, doc_id DESC
+        LIMIT ?`,
+      [limit + 1],
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => {
+      const rawError = row.last_error ?? null;
+      return {
+        kind: 'dead_letter' as const,
+        docId: row.doc_id,
+        chamber: row.chamber ?? '',
+        attempts: row.attempts ?? 0,
+        deadLetterCycles: row.dead_letter_cycles ?? 0,
+        error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
+        errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        parked: isParkedDlqError(rawError),
+        availableAt: row.available_at ?? null,
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+    return { items, count: items.length, available: true };
+  } catch {
+    /* ingestion_outbox not migrated yet — the dashboard says unavailable. */
+    return { items: [], count: 0, available: false };
+  }
+}
+
+interface DlqFailedRow {
+  id: number;
+  queue_name: string | null;
+  type: string | null;
+  dedupe_key: string | null;
+  attempts: number | null;
+  dead_letter_cycles: number | null;
+  last_error: string | null;
+  available_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * One page of durable-queue rows in terminal failed state
+ * (deno_runtime_queue).  Like the outbox dead letters, these are pipeline
+ * failures no other queue surface lists.  `available` is false when the
+ * table does not exist yet, so the dashboard can say so instead of
+ * implying the queue is healthy.
+ */
+async function listDlqFailedRows(
+  db: D1Database,
+  limit: number,
+): Promise<{ items: Array<Record<string, unknown>>; count: number; available: boolean }> {
+  try {
+    const rows = await all<DlqFailedRow>(
+      db,
+      `SELECT id, queue_name, CASE WHEN json_valid(payload) THEN json_extract(payload, '$.type') END AS type, dedupe_key, attempts, dead_letter_cycles, last_error, available_at, updated_at
+         FROM deno_runtime_queue
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?`,
+      [limit + 1],
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => {
+      const rawError = row.last_error ?? null;
+      return {
+        kind: 'dlq_failed' as const,
+        id: row.id,
+        queueName: row.queue_name ?? '',
+        type: row.type ?? '',
+        dedupeKey: row.dedupe_key ?? null,
+        attempts: row.attempts ?? 0,
+        deadLetterCycles: row.dead_letter_cycles ?? 0,
+        error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
+        errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        availableAt: row.available_at ?? null,
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+    return { items, count: items.length, available: true };
+  } catch {
+    return { items: [], count: 0, available: false };
+  }
+}
+
+interface PipelineFailureCounts {
+  deadLetters: number;
+  deadLettersParked: number;
+  dlqFailed: number;
+}
+
+/** Counts for the two pipeline-failure stores the review totals carry. */
+async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCounts> {
+  const [deadRow, parkedRow, dlqRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') NOT LIKE 'parked:%'`).catch(() => null),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') LIKE 'parked:%'`).catch(() => null),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
+  ]);
+  return {
+    deadLetters: Number(deadRow?.n ?? 0) || 0,
+    deadLettersParked: Number(parkedRow?.n ?? 0) || 0,
+    dlqFailed: Number(dlqRow?.n ?? 0) || 0,
+  };
+}
+
 interface ReviewQueueTotals {
   unresolved: number;
   matching: number;
   byReason: Record<string, number>;
   byChamber: Record<string, number>;
+  /** Filings stuck at ingest (see listIngestFailures); global like `unresolved`. */
+  ingestFailures: number;
+  /** CT-2453 stale stamps: published data, wrong 'error' status. Count only. */
+  publishedStatusStale: number;
+  /** Ingestion-outbox dead letters (status 'failed'); global like `unresolved`. */
+  deadLetters: number;
+  /** Ingestion-outbox dead letters a human parked (`parked:`); triaged, not active failures. */
+  deadLettersParked: number;
+  /** Durable-queue rows in terminal failed state; global like `unresolved`. */
+  dlqFailed: number;
 }
 
 /**
@@ -831,7 +1375,7 @@ interface ReviewQueueTotals {
  */
 async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): Promise<ReviewQueueTotals> {
   const matchingWhere = reviewQueueFilterWhere(filters);
-  const [unresolvedRow, matchingRow, reasonRows, chamberRows] = await Promise.all([
+  const [unresolvedRow, matchingRow, reasonRows, chamberRows, ingestCounts, failureCounts] = await Promise.all([
     get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM review_queue WHERE resolved = 0`),
     get<{ n: number }>(
       db,
@@ -851,6 +1395,8 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
         GROUP BY f.chamber`,
       [filters.resolved],
     ),
+    ingestFailureCounts(db, null),
+    pipelineFailureCounts(db),
   ]);
 
   const byReason: Record<string, number> = {};
@@ -863,6 +1409,8 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
     matching: matchingRow?.n ?? 0,
     byReason,
     byChamber,
+    ...ingestCounts,
+    ...failureCounts,
   };
 }
 
@@ -999,7 +1547,50 @@ function auditAdminSubscriptionAction(
   }
 }
 
+// The declared fields are the allow-list for review edits.  Zod's default
+// strip mode drops any other key at the boundary, so nothing undeclared reaches
+// collapseDuplicateSpans, validateReviewEdits or the transaction writer.  Not
+// .strict(): a stored review payload row (which also carries flags, rowKey and
+// similar derived fields) is a valid edit shape, and those rows must confirm
+// rather than 400.  The console's meSubmit sends confidence: null for a row
+// with no stored confidence, and the writer already falls back to 1.
+export const ReviewEditItemSchema = z.object({
+  filerId: z.string().nullable().optional(),
+  txDate: z.string().nullable().optional(),
+  owner: z.string().nullable().optional(),
+  assetName: z.string().optional(),
+  ticker: z.string().nullable().optional(),
+  assetType: z.string().nullable().optional(),
+  assetTypeName: z.string().nullable().optional(),
+  txType: z.string().optional(),
+  amountMin: z.number().nullable().optional(),
+  amountMax: z.number().nullable().optional(),
+  isOption: z.boolean().optional(),
+  capGainsOver200: z.boolean().optional(),
+  rawText: z.string().optional(),
+  filingStatus: z.string().nullable().optional(),
+  subholding: z.string().nullable().optional(),
+  location: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  supplementalText: z.string().nullable().optional(),
+  confidence: z.number().nullable().optional(),
+  /** Republish only: the previously published (deprecated) transaction this row fixes. */
+  correctsTxId: z.string().min(1).max(64).nullable().optional(),
+});
+
+// Query params for POST /clean-asset-names.  Every field falls back to its
+// default on bad input (.catch) instead of failing the request: paging that
+// arrives as "abc" must run the default window, never reach SQL as NaN or 500.
+// Unknown params are stripped (Zod's default), like any other query string.
+export const CleanAssetNamesQuerySchema = z.object({
+  offset: z.coerce.number().min(0).catch(0),
+  limit: z.coerce.number().catch(500),
+  docId: z.string().min(1).nullable().catch(null),
+  dryRun: z.literal('1').transform(() => true).catch(false),
+});
+
 interface EditedTx {
+  correctsTxId?: string | null;
   filerId?: string | null;
   txDate?: string | null;
   owner?: string | null;
@@ -1018,28 +1609,44 @@ interface EditedTx {
   location?: string | null;
   description?: string | null;
   supplementalText?: string | null;
-  confidence?: number;
+  confidence?: number | null;
 }
 
 type ValidatedEditedTx = EditedTx & {
   txDate: string;
   owner: 'self' | 'spouse' | 'joint' | 'dependent' | null;
   txType: TxType;
+  /** Set when confident OCR normalization rewrote assetName; stored in cleaning_note. */
+  cleaningNote: string | null;
+  /**
+   * The submitted name before OCR normalization.  The row key fingerprints
+   * this, not the repaired assetName, so an OCR fix never changes a row's
+   * identity: the machine path (buildTransaction) likewise fingerprints the
+   * pre-OCR name while storing the repaired one.
+   */
+  rowKeyAssetName: string;
 };
 
-function validCalendarDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const [year, month, day] = value.split('-').map(Number);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  return parsed.getUTCFullYear() === year
-    && parsed.getUTCMonth() === month - 1
-    && parsed.getUTCDate() === day
-    && value <= new Date().toISOString().slice(0, 10);
+/** Counts (and capped id lists) describing one republish (all zero on a first publish). */
+function correctionSummary(plan: Extract<CorrectionPlan, { ok: true }>) {
+  const count = (kind: string) => plan.matches.filter((m) => m.kind === kind).length;
+  return {
+    revived: plan.matches.length,
+    unchanged: count('unchanged'),
+    unchangedOlderCycle: count('unchanged_older_cycle'),
+    corrected: count('corrected'),
+    explicit: count('explicit'),
+    added: plan.added.length,
+    retired: plan.retired.length,
+    correctedTxIds: plan.matches.filter((m) => m.kind === 'corrected' || m.kind === 'explicit').map((m) => m.txId).slice(0, 200),
+    retiredTxIds: plan.retired.slice(0, 200),
+  };
 }
 
 function validateReviewEdits(
   rawEdits: unknown[],
   filedDate: string | null,
+  opts: { acknowledgeStaleTxDate?: boolean } = {},
 ): { edits: ValidatedEditedTx[] } | { error: string } {
   // The live backlog contains filings with more than 200 disclosed lots. Keep
   // those reviewable while still bounding request and D1 work.
@@ -1057,16 +1664,29 @@ function validateReviewEdits(
       return { error: `edits[${index}].txType must be explicitly B (Buy), S (Sell), or E (Exchange); P is accepted as Buy` };
     }
     const ownerRaw = typeof e.owner === 'string' ? e.owner.trim().toLowerCase() : '';
-    const owner = ownerRaw === '' ? null : ownerRaw;
-    if (owner !== null && owner !== 'self' && owner !== 'spouse' && owner !== 'joint' && owner !== 'dependent') {
-      return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
-    }
+    // Positive narrowing, no assertion: only these spellings become the
+    // union (empty/omitted means null); anything else is a 400.
+    let owner: ValidatedEditedTx['owner'];
+    if (ownerRaw === '') owner = null;
+    else if (ownerRaw === 'self' || ownerRaw === 'spouse' || ownerRaw === 'joint' || ownerRaw === 'dependent') owner = ownerRaw;
+    else return { error: `edits[${index}].owner must be self, spouse, joint, dependent, or null` };
     const txDate = typeof e.txDate === 'string' ? e.txDate.trim() : '';
-    if (!validCalendarDate(txDate)) {
-      return { error: `edits[${index}].txDate must be a valid non-future YYYY-MM-DD date` };
+    // Shared strict check: real calendar date, not future, not older than
+    // the lookback below the filing date.  After-filed trades stay allowed
+    // per the tested rule (signature-stamp skew).  Same contract the machine
+    // path enforces in scoreFields, except a reviewer can explicitly confirm
+    // a genuinely stale trade (late disclosure) via acknowledgeStaleTxDate —
+    // impossible dates, future dates, and OCR garble have no such bypass.
+    const dateCheck = validateTxDate(txDate, { filedDate });
+    const staleAcknowledged = dateCheck.ok === false
+      && dateCheck.code === 'tx_date_too_old'
+      && opts.acknowledgeStaleTxDate === true;
+    if (dateCheck.ok === false && !staleAcknowledged) {
+      const hint = dateCheck.code === 'tx_date_too_old'
+        ? ' — pass acknowledgeStaleTxDate: true to confirm a genuinely old trade anyway'
+        : '';
+      return { error: `edits[${index}].txDate ${dateCheck.message}${hint}` };
     }
-    // Allow a disclosed trade a few days after Clerk's filed_date (signature
-    // stamp).  Still refuse dates that have not happened yet.
     const ticker = typeof e.ticker === 'string' ? e.ticker.trim() : '';
     const assetName = typeof e.assetName === 'string' ? e.assetName.trim() : '';
     if (!ticker && !assetName) {
@@ -1074,6 +1694,27 @@ function validateReviewEdits(
     }
     if (assetName.length > 500) {
       return { error: `edits[${index}].assetName must be at most 500 characters` };
+    }
+    // A submitted name must be real text: a blank-with-ticker row is fine
+    // (ticker carries it), but leading junk glyphs ("••• APPLE", a stray
+    // quote) are OCR residue and are a 400, never a published name.
+    if (assetName && junkAssetNameReason(assetName) === 'junk_leading_glyph') {
+      return { error: `edits[${index}].assetName starts with junk characters ('${assetName.slice(0, 12)}'); fix the name and retry` };
+    }
+    // Confident OCR fixes apply silently with an audit note; unfixable garble
+    // is a 400 naming the row, never a saved wrong name.
+    let finalAssetName = assetName;
+    let cleaningNote: string | null = null;
+    if (assetName) {
+      const ocr = normalizeOcrAssetName(assetName);
+      const holds = [...ocr.dateHolds, ...ocr.nameHolds];
+      if (holds.length > 0) {
+        return { error: `edits[${index}].assetName looks like unreadable OCR text (${holds.join('; ')}); fix the name and retry` };
+      }
+      if (ocr.changed) {
+        finalAssetName = ocr.name;
+        cleaningNote = `normalized OCR artifacts: ${ocr.notes.join('; ')}`;
+      }
     }
     if (ticker && (ticker.length > 20 || !/^[A-Za-z0-9.^$-]+$/.test(ticker))) {
       return { error: `edits[${index}].ticker is invalid` };
@@ -1085,7 +1726,18 @@ function validateReviewEdits(
     if (e.amountMax != null && (typeof e.amountMax !== 'number' || !Number.isFinite(e.amountMax))) {
       return { error: `edits[${index}].amountMax must be a number or null` };
     }
-    if (!amountOmitted && !isValidBracket(e.amountMin as number, e.amountMax ?? null)) {
+    // "$1,000 - $15,000" is the $1,001 bracket read without its trailing 1;
+    // store the canonical bounds instead of rejecting or publishing 1,000.
+    let amountMin = e.amountMin ?? null;
+    let amountMax = e.amountMax ?? null;
+    if (!amountOmitted) {
+      const canonical = canonicalizeAmountBounds(amountMin, amountMax);
+      if (canonical?.changed) {
+        amountMin = canonical.min;
+        amountMax = canonical.max;
+      }
+    }
+    if (!amountOmitted && !isValidBracket(amountMin as number, amountMax)) {
       return { error: `edits[${index}] amount must be a canonical STOCK Act bracket` };
     }
     if (e.confidence != null && (
@@ -1099,7 +1751,18 @@ function validateReviewEdits(
         return { error: `edits[${index}].${field} must be a boolean` };
       }
     }
-    edits.push({ ...e, ticker: ticker || null, assetName, txDate, owner: owner as any, txType });
+    edits.push({
+      ...e,
+      amountMin,
+      amountMax,
+      ticker: ticker || null,
+      assetName: finalAssetName,
+      rowKeyAssetName: assetName,
+      txDate,
+      owner,
+      txType,
+      cleaningNote,
+    });
   }
   return { edits };
 }
@@ -1606,7 +2269,13 @@ interface BenchmarkDocumentSnapshot {
  * resolved review's latest decision receipt is an admin confirm/manual action.
  * Pipeline/autopublish/agreement receipts therefore cannot score themselves.
  */
+/** Machine amount-bounds backfill audit — not a human review receipt. */
+const BENCHMARK_IGNORED_INGESTION_DECISION_REASONS = ['amount_bounds_canonicalize'] as const;
+
 function benchmarkHumanResolvedSql(docIdSql: string): string {
+  const ignoredReasons = BENCHMARK_IGNORED_INGESTION_DECISION_REASONS
+    .map((reason) => `'${reason}'`)
+    .join(', ');
   return `COALESCE(rq.resolved, 0) = 1
     AND COALESCE((
       SELECT CASE
@@ -1615,12 +2284,13 @@ function benchmarkHumanResolvedSql(docIdSql: string): string {
       END
         FROM ingestion_decisions d
        WHERE d.doc_id = ${docIdSql}
+         AND COALESCE(d.reason, '') NOT IN (${ignoredReasons})
        ORDER BY d.created_at DESC, d.id DESC
        LIMIT 1
     ), 0) = 1`;
 }
 
-async function benchmarkDocumentIsHumanResolved(env: Env, docId: string): Promise<boolean> {
+export async function benchmarkDocumentIsHumanResolved(env: Env, docId: string): Promise<boolean> {
   const row = await get<{ resolved: number }>(
     env.DB,
     `SELECT CASE WHEN ${benchmarkHumanResolvedSql('f.doc_id')} THEN 1 ELSE 0 END AS resolved
@@ -2261,6 +2931,28 @@ export const EnrichmentUnavailableBodySchema = z.object({
 }).strict();
 export type EnrichmentUnavailableBody = z.infer<typeof EnrichmentUnavailableBodySchema>;
 
+const SenatePtrIntakeRowSchema = z.object({
+  first_name: z.string().nullable().optional(),
+  last_name: z.string().nullable().optional(),
+  filer: z.string().nullable().optional(),
+  report_title: z.string().nullable().optional(),
+  report_url: z.string().nullable().optional(),
+  date_received: z.string().nullable().optional(),
+  is_paper: z.boolean().optional(),
+  raw: z.array(z.string()).optional(),
+});
+
+export const SenatePtrIntakeBodySchema = z.object({
+  rows: z.array(SenatePtrIntakeRowSchema).max(500),
+  dryRun: z.boolean().optional(),
+  // The Mac fetcher's out-file envelope; accepted so the fetcher can POST
+  // its output file verbatim.  Unknown keys are stripped by the schema.
+  source: z.string().optional(),
+  fetched_at: z.string().optional(),
+  since: z.string().optional(),
+});
+export type SenatePtrIntakeBody = z.infer<typeof SenatePtrIntakeBodySchema>;
+
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   const r = new Hono<{ Bindings: Env }>();
@@ -2270,12 +2962,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Cloudflare Access), or one of the SCOPED tokens — INGEST_TOKEN for
   // /securities/import only (sibling app pushes shared data), and
   // ADMIN_MAINTENANCE_TOKEN for the idempotent backlog-drain endpoints only
-  // (agent/automation sessions never hold the full ADMIN_TOKEN).
+  // (agent/automation sessions never hold the full ADMIN_TOKEN), and
+  // SENATE_INTAKE_TOKEN for /senate-ptr-intake only (the Mac eFD fetcher).
   r.use('*', async (c, next) => {
     const env = c.env as EnvWithAdmin;
     const authorization = c.req.header('Authorization');
     if (await isAuthorizedIngest(env, c.req.path, authorization)) return next();
     if (await isAuthorizedMaintenance(env, c.req.path, authorization)) return next();
+    if (await isAuthorizedSenateIntake(env, c.req.path, authorization)) return next();
     // Always resolve the session email, even when an Authorization header is
     // present. Cookie `ct_session` covers the website; native iOS sends the
     // same opaque session as `Authorization: Bearer <session>`. A stale
@@ -2376,6 +3070,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // per-model payload silently degraded to `[]` for every row, with no error
   // surfaced anywhere. Chunking fixes that; each chunk still degrades
   // independently (and harmlessly) if extraction_runs doesn't exist yet.
+  r.get('/review-queue/ingest-failures', async (c) => {
+    const chamber = c.req.query('chamber') || null;
+    const limit = parseIngestLimit(c.req.query('limit'));
+    if (limit === null) return c.json({ error: 'invalid limit' }, 400);
+    let cursor: IngestFailureCursor | null = null;
+    if (c.req.query('cursor') !== undefined) {
+      cursor = decodeIngestFailureCursor(c.req.query('cursor') || '');
+      if (!cursor) return c.json({ error: 'invalid cursor' }, 400);
+    }
+    const [{ items, nextCursor }, totals] = await Promise.all([
+      listIngestFailures(c.env.DB, { chamber, limit, cursor }),
+      ingestFailureCounts(c.env.DB, chamber),
+    ]);
+    return c.json({ items, count: items.length, nextCursor, totals });
+  });
+
   r.get('/review-queue', async (c) => {
     const resolved = c.req.query('resolved') === '1' ? 1 : 0;
     const chamber = c.req.query('chamber') || null;
@@ -2392,6 +3102,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     limit = Math.min(limit, REVIEW_QUEUE_MAX_LIMIT);
     if (legacyUnbounded) limit = REVIEW_QUEUE_MAX_LIMIT;
+
+    const includeParsed = reviewQueueIncludeSchema.safeParse(c.req.query('include'));
+    if (!includeParsed.success) return c.json({ error: 'invalid include' }, 400);
+    const includeValues = includeParsed.data;
+    // Embedded ingest-failure page: explicit ?ingestLimit= is zod-validated
+    // (400 on garbage); otherwise follow the queue's own sanitized ?limit=.
+    const ingestLimitRaw = c.req.query('ingestLimit');
+    const ingestLimit =
+      ingestLimitRaw !== undefined
+        ? parseIngestLimit(ingestLimitRaw)
+        : hasLimitParam
+          ? limit
+          : REVIEW_QUEUE_DEFAULT_LIMIT;
+    if (ingestLimit === null) return c.json({ error: 'invalid ingestLimit' }, 400);
 
     let cursor: ReviewQueueCursor | null = null;
     if (hasCursorParam) {
@@ -2561,6 +3285,26 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       nextCursor,
       totals,
     };
+    if (includeValues.includes('ingest_failures')) {
+      const embedded = await listIngestFailures(c.env.DB, {
+        chamber: null,
+        limit: ingestLimit,
+        cursor: null,
+      });
+      body.ingestFailures = embedded.items;
+      body.ingestFailuresNextCursor = embedded.nextCursor;
+    }
+    if (includeValues.includes('dead_letters')) {
+      const dead = await listDeadLetters(c.env.DB, ingestLimit);
+      body.deadLetters = dead.items;
+      body.deadLettersAvailable = dead.available;
+    }
+    if (includeValues.includes('dlq_failed')) {
+      const dlq = await listDlqFailedRows(c.env.DB, ingestLimit);
+      body.dlqFailed = dlq.items;
+      body.dlqFailedAvailable = dlq.available;
+    }
+    body.senateIntake = await readSenateIntakeStatus(c.env);
     // Only surface `truncated` on the legacy unbounded call shape — an
     // explicit limit/cursor caller asked for a bounded page on purpose, that
     // isn't "truncation".
@@ -2738,7 +3482,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- POST /review/:docId ------------------------------------------------
-  // Body: { decision: 'confirm'|'reject'|'manual', reviewRevision, edits?: EditedTx[] }
+  // Body: { decision: 'confirm'|'reject'|'manual', reviewRevision, edits?: EditedTx[],
+  //         acknowledgeUnderTranscription?: boolean, acknowledgeStaleTxDate?: boolean }
   //   confirm -> insert corrected transactions (source='primary'), mark review
   //              resolved, set filing persisted, enqueue delivery.dispatch each.
   //   manual  -> same as confirm but recorded as source='manual' — the admin
@@ -2845,18 +3590,30 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // confirm/manual: insert the (corrected or hand-entered) transactions.
     // 'manual' tags provenance so admins can tell hand-entered rows from machine reads.
     const source: TxSource = decision === 'manual' ? 'manual' : 'primary';
-    if (!Array.isArray(body.edits)) {
+    const editsParse = z.array(ReviewEditItemSchema).safeParse(body.edits);
+    if (!editsParse.success) {
       return c.json(
         {
-          error:
-            decision === 'confirm'
+          error: !Array.isArray(body.edits)
+            ? (decision === 'confirm'
               ? 'confirm requires explicit transaction edits; choose a model, edit the queued rows, or reject the item'
-              : 'manual review requires explicit transaction edits',
+              : 'manual review requires explicit transaction edits')
+            : 'one or more edits have the wrong field types; fix the listed rows and retry',
+          ...(Array.isArray(body.edits) ? { issues: editsParse.error.issues.map((issue) => ({
+            path: issue.path, code: issue.code, message: issue.message,
+          })) } : {}),
         },
         400,
       );
     }
-    const rawEdits = body.edits as unknown[];
+    const rawEdits = editsParse.data;
+    // The stale-date bypass is new in CT-2441, so it is schema-checked here:
+    // only a real boolean is accepted ("true", 1 and the like are a 400).
+    const ackStaleParse = z.boolean().optional().safeParse(body.acknowledgeStaleTxDate);
+    if (!ackStaleParse.success) {
+      return c.json({ error: 'acknowledgeStaleTxDate must be a boolean when present' }, 400);
+    }
+    const acknowledgeStaleTxDate = ackStaleParse.data === true;
     if (rawEdits.length === 0) {
       return c.json(
         {
@@ -2868,16 +3625,39 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         400,
       );
     }
+    // CT-2415 Guard 1b: the confirm gate had NO duplicate check, so a review
+    // payload carrying a re-emitted-row flood could be published verbatim with
+    // one operator action. Collapse the same contiguous runs the ingest path
+    // collapses, BEFORE the N-of-M comparison below — so the under-transcription
+    // guard sees the true row count and refuses the flood by name instead of
+    // letting 286 rows through as a legitimate confirm.
+    //
+    // The edits carry exactly the fields transactionRowKey fingerprints
+    // (txDate/owner/asset/ticker/type/amount/rawText/…), so the same real
+    // fingerprint applies; RowKeyFields is narrower than ParsedTx, hence the cast.
+    const confirmedDeduped = collapseDuplicateSpans(
+      rawEdits as unknown as ParsedTx[],
+      source,
+    );
+    const confirmedEdits = confirmedDeduped.rows as unknown[];
+
     // N-of-M under-transcription guard: don't let confirm/manual silently
     // shrink a filing to fewer rows than the stored extraction itself
     // claimed/held. This is what let Kupor (E-2026-scott-a-kupor-01-09-2026-278t)
     // get manually confirmed with 1 of 3 real transactions — nothing compared
     // the confirm against the extraction's own completeness signal.
     const storedCount = storedReviewTransactionCount(review.payload);
-    if (storedCount > rawEdits.length && body.acknowledgeUnderTranscription !== true) {
+    if (storedCount > confirmedEdits.length && body.acknowledgeUnderTranscription !== true) {
       return c.json(
         {
-          error: `confirm has fewer transactions (${rawEdits.length}) than the stored extraction found (${storedCount}) — pass acknowledgeUnderTranscription: true to confirm anyway, or add the missing rows`,
+          error: `confirm has fewer transactions (${confirmedEdits.length}) than the stored extraction found (${storedCount}) — pass acknowledgeUnderTranscription: true to confirm anyway, or add the missing rows`,
+          duplicateSpanCollapsed: confirmedDeduped.removed,
+          duplicateSpanRuns: confirmedDeduped.runs.map((r) => ({
+            contentHash: r.contentHash,
+            count: r.count,
+            firstIndex: r.firstIndex,
+            lastIndex: r.lastIndex,
+          })),
         },
         409,
       );
@@ -2903,21 +3683,46 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ docId, decision: 'orphan_resolved', resolved: true });
     }
     const filingFilerId = filing?.filer_id ?? null;
-    const validated = validateReviewEdits(rawEdits, filing.filed_date);
+    const validated = validateReviewEdits(confirmedEdits, filing.filed_date, {
+      acknowledgeStaleTxDate,
+    });
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const edits = validated.edits;
 
+    // Republish never re-sends (default, no opt-out; see
+    // admin/reviewCorrection.ts): rows matching a previously published trade
+    // of this doc are revived in place (same id, cursor_seq and created_at)
+    // and never re-enter the delivery outbox.  Only unmatched rows insert and
+    // deliver.  A first publish has no prior rows, so every row is new.
+    const reviveByEdit = new Map<number, string>();
+    const prior = await all<PriorTxRow & Record<string, string | number | null>>(
+      c.env.DB,
+      `SELECT id, deprecated_at, ${REVIVE_COMPARED_COLUMNS_SQL}
+         FROM transactions
+        WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
+          AND deprecated_at IS NOT NULL`,
+      [docId],
+    );
+    const plan = planCorrection(edits, prior);
+    if (plan.ok === false) return c.json({ error: plan.error }, 400);
+    const correctionPlan = plan;
+    for (const m of plan.matches) reviveByEdit.set(m.editIndex, m.txId);
+
     const nowIso = new Date().toISOString();
     const insertRows: Array<Record<string, string | number | null>> = [];
+    const reviveRows: Array<Record<string, string | number | null>> = [];
     const rowKeys: string[] = [];
     const proposedIds: string[] = [];
     for (const [rowIndex, e] of edits.entries()) {
-      const id = uuid();
+      const reviveId = reviveByEdit.get(rowIndex);
+      const id = reviveId ?? uuid();
       const assetTypeName = reviewAssetTypeName(e);
       const rowKey = transactionRowKey(source, rowIndex, {
         txDate: e.txDate,
         owner: e.owner,
-        assetName: e.assetName ?? '',
+        // Pre-OCR name: an OCR repair must not change the row's identity
+        // (the (doc_id, source, row_key) unique index and completeLiveSet).
+        assetName: e.rowKeyAssetName,
         ticker: e.ticker ?? null,
         assetType: e.assetType ?? null,
         assetTypeName,
@@ -2934,8 +3739,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         supplementalText: e.supplementalText ?? null,
       });
       rowKeys.push(rowKey);
-      proposedIds.push(id);
-      insertRows.push({
+      if (!reviveId) proposedIds.push(id);
+      (reviveId ? reviveRows : insertRows).push({
         id,
         docId,
         filerId: e.filerId ?? filingFilerId,
@@ -2963,17 +3768,111 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         firstSeenAt: filing.first_seen_at ?? null,
         filedDate: filing.filed_date ?? null,
         estValue: estimateTransactionValue(e.amountMin, e.amountMax),
+        // Recomputed from the corrected dates (same rule as the normalizer
+        // insert path) so a revive never leaves these NULL or stale.
+        disclosureLagDays: computeDisclosureLagDays(e.txDate, filing.filed_date ?? null),
+        stockActStatus: computeStockActStatus(e.txDate, filing.filed_date ?? null),
+        cleaningNote: e.cleaningNote ?? null,
       });
     }
 
     const rowKeysJson = JSON.stringify(rowKeys);
     const insertRowsJson = JSON.stringify(insertRows);
+    const revivedIds = reviveRows.map((row) => String(row.id));
+    const revivedIdsJson = JSON.stringify(revivedIds);
     const completeLiveSet = `(SELECT COUNT(*) FROM transactions
       WHERE doc_id = ? AND source = ? AND deprecated_at IS NULL
         AND row_key IN (SELECT value FROM json_each(?))) = ?
       AND (SELECT COUNT(*) FROM transactions
         WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL})
           AND deprecated_at IS NULL) = ?`;
+    // Revive statements (republish of previously published rows).  Placed
+    // after the INSERT so persistResults[0] stays the insert count; the
+    // integrity check below runs after both and rolls the whole batch back if
+    // either fell short.
+    //
+    // Cursor: a revived row whose stored fields actually change (a corrected
+    // date or amount, a cleaned name) takes a NEW cursor_seq so cursor pollers
+    // (GET /api/transactions?since=, SSE catch-up) re-read the fix under the
+    // same id.  A byte-identical revive keeps its cursor.  Neither gets a
+    // delivery_outbox row, and created_at is untouched, so no webhook or APNs
+    // alert fires.  Step 1 allocates the new sequence values (the same
+    // tx_cursor_seq table the insert trigger uses); step 2 adopts them.
+    // A row that was exposed as retracted (an open tx_retractions row, i.e.
+    // a trade.retract went out at Unpublish) also takes a new cursor even
+    // when byte-identical: trg_transactions_unretract (migration 0108) does
+    // that on the same UPDATE and closes the retraction.
+    const reviveRowsSql = `(SELECT json_extract(value, '$.id') AS id,
+                      json_extract(value, '$.filerId') AS filer_id,
+                      json_extract(value, '$.txDate') AS tx_date,
+                      json_extract(value, '$.owner') AS owner,
+                      json_extract(value, '$.assetName') AS asset_name,
+                      json_extract(value, '$.ticker') AS ticker,
+                      json_extract(value, '$.assetType') AS asset_type,
+                      json_extract(value, '$.txType') AS tx_type,
+                      json_extract(value, '$.amountMin') AS amount_min,
+                      json_extract(value, '$.amountMax') AS amount_max,
+                      json_extract(value, '$.isOption') AS is_option,
+                      json_extract(value, '$.capGainsOver200') AS cap_gains_over_200,
+                      json_extract(value, '$.rawText') AS raw_text,
+                      json_extract(value, '$.assetTypeName') AS asset_type_name,
+                      json_extract(value, '$.filingStatus') AS filing_status,
+                      json_extract(value, '$.subholding') AS subholding,
+                      json_extract(value, '$.location') AS location,
+                      json_extract(value, '$.description') AS description,
+                      json_extract(value, '$.supplementalText') AS supplemental_text,
+                      json_extract(value, '$.rowKey') AS row_key,
+                      json_extract(value, '$.confidence') AS confidence,
+                      json_extract(value, '$.source') AS source,
+                      json_extract(value, '$.filedDate') AS filed_date,
+                      json_extract(value, '$.estValue') AS est_value,
+                      json_extract(value, '$.disclosureLagDays') AS disclosure_lag_days,
+                      json_extract(value, '$.stockActStatus') AS stock_act_status,
+                      json_extract(value, '$.cleaningNote') AS cleaning_note
+                 FROM json_each(?))`;
+    const reviveGate = `transactions.doc_id = ?
+          AND transactions.deprecated_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM review_queue
+             WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
+          )`;
+    const reviveRowsJson = JSON.stringify(reviveRows);
+    const changedReviveIds = reviveChangedIds(new Map(prior.map((row) => [row.id, row])), reviveRows);
+    const changedReviveIdsJson = changedReviveIds.length === 0 ? null : JSON.stringify(changedReviveIds);
+    const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [
+      // Only the rows whose stored fields change (diffed in JS against the
+      // prior SELECT) are bound here, as an id list, so the batch never
+      // carries the revive payload twice.
+      ...(changedReviveIdsJson === null ? [] : [[
+        `INSERT INTO tx_cursor_seq (tx_id)
+           SELECT transactions.id FROM transactions
+            WHERE transactions.id IN (SELECT value FROM json_each(?))
+              AND ${reviveGate}
+            ORDER BY transactions.cursor_seq ASC, transactions.id ASC`,
+        [changedReviveIdsJson, docId, docId, reviewRevision],
+      ] as [string, SqlParam[]]]),
+      [
+        `UPDATE transactions
+            SET filer_id = j.filer_id, tx_date = j.tx_date, owner = j.owner,
+                asset_name = j.asset_name, ticker = j.ticker, asset_type = j.asset_type,
+                tx_type = j.tx_type, amount_min = j.amount_min, amount_max = j.amount_max,
+                is_option = j.is_option, cap_gains_over_200 = j.cap_gains_over_200,
+                raw_text = j.raw_text, asset_type_name = j.asset_type_name,
+                filing_status = j.filing_status, subholding = j.subholding,
+                location = j.location, description = j.description,
+                supplemental_text = j.supplemental_text, row_key = j.row_key,
+                confidence = j.confidence, source = j.source, filed_date = j.filed_date,
+                est_value = j.est_value, cleaning_note = j.cleaning_note,
+                disclosure_lag_days = j.disclosure_lag_days, stock_act_status = j.stock_act_status,
+                deprecated_at = NULL, deprecated_reason = NULL,
+                cursor_seq = MAX(COALESCE(transactions.cursor_seq, 0), COALESCE(
+                  (SELECT MAX(s.seq) FROM tx_cursor_seq s WHERE s.tx_id = transactions.id), 0))
+           FROM ${reviveRowsSql} AS j
+          WHERE transactions.id = j.id
+            AND ${reviveGate}`,
+        [reviveRowsJson, docId, docId, reviewRevision],
+      ],
+    ];
     let persistResults: D1Result[];
     try {
       persistResults = await batch(c.env.DB, [
@@ -2985,7 +3884,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              tx_type, amount_min, amount_max, is_option, cap_gains_over_200,
              raw_text, asset_type_name, filing_status, subholding, location,
              description, supplemental_text, row_key, confidence, source,
-             created_at, cursor_seq, first_seen_at, filed_date, est_value
+             created_at, cursor_seq, first_seen_at, filed_date, est_value,
+             disclosure_lag_days, stock_act_status, cleaning_note
            ) SELECT
              json_extract(value, '$.id'), json_extract(value, '$.docId'),
              json_extract(value, '$.filerId'), json_extract(value, '$.txDate'),
@@ -3000,7 +3900,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              json_extract(value, '$.rowKey'), json_extract(value, '$.confidence'),
              json_extract(value, '$.source'), json_extract(value, '$.createdAt'), NULL,
              json_extract(value, '$.firstSeenAt'), json_extract(value, '$.filedDate'),
-             json_extract(value, '$.estValue')
+             json_extract(value, '$.estValue'), json_extract(value, '$.disclosureLagDays'),
+             json_extract(value, '$.stockActStatus'), json_extract(value, '$.cleaningNote')
            FROM json_each(?)
            WHERE EXISTS (
              SELECT 1 FROM review_queue
@@ -3008,6 +3909,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
            )`,
           [insertRowsJson, docId, reviewRevision],
         ],
+        ...reviveStatements,
         // Force a primary-key error when the post-insert live set is not exact.
         // D1 then rolls back the whole batch; a zero-change final UPDATE alone
         // would still commit preceding inserts.
@@ -3031,11 +3933,12 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
             SELECT id, 'pending', 0, ?, NULL, ?, ? FROM transactions
              WHERE doc_id = ? AND source = ? AND deprecated_at IS NULL
                AND row_key IN (SELECT value FROM json_each(?))
+               AND id NOT IN (SELECT value FROM json_each(?))
                AND EXISTS (
                  SELECT 1 FROM review_queue
                   WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
                )`,
-          [nowIso, nowIso, nowIso, docId, source, rowKeysJson, docId, reviewRevision],
+          [nowIso, nowIso, nowIso, docId, source, rowKeysJson, revivedIdsJson, docId, reviewRevision],
         ],
         [
           `UPDATE filings SET ingest_status = ?
@@ -3096,13 +3999,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
     // Best-effort immediate flush; the independent delivery-outbox cron owns
     // durable recovery for any enqueue failure or rows beyond this pass.
-    const delivery = await flushDeliveryOutbox(c.env, {
-      txIds: transactionIds,
-      limit: Math.max(transactionIds.length, 1),
-    }).catch((err) => {
-      console.warn('review confirm: delivery outbox flush failed', docId, (err as Error).message);
-      return null;
-    });
+    // Revived rows were never re-enqueued, so only new ids flush.  An empty
+    // id list must skip the flush: flushDeliveryOutbox drops its tx_id filter
+    // when handed no ids and would claim unrelated filings' pending rows.
+    const revivedSet = new Set(revivedIds);
+    const deliveryIds = transactionIds.filter((id) => !revivedSet.has(id));
+    const delivery = deliveryIds.length === 0
+      ? null
+      : await flushDeliveryOutbox(c.env, {
+        txIds: deliveryIds,
+        limit: deliveryIds.length,
+      }).catch((err) => {
+        console.warn('review confirm: delivery outbox flush failed', docId, (err as Error).message);
+        return null;
+      });
 
     let deprecatedPredecessors = 0;
     const isAmendment = /amend|\(2\)|278t\(\d+\)/i.test(docId) || (filing.filing_status && /amend/i.test(filing.filing_status));
@@ -3129,7 +4039,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           editCount: edits.length,
           inserted: insertedCount,
           deprecatedPredecessors,
+          ocrNormalized: edits.filter((e) => e.cleaningNote).length,
+          acknowledgedStaleTxDate: acknowledgeStaleTxDate,
           reviewCreatedAt: review.created_at,
+          republish: correctionSummary(correctionPlan),
         },
         createdAt: nowIso,
       });
@@ -3145,6 +4058,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       inserted: insertedCount,
       transactionIds,
       delivery,
+      republish: correctionSummary(correctionPlan),
     });
   });
 
@@ -3939,7 +4853,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         'OPENROUTER_API_KEY', 'LLAMAPARSE_API_KEY', 'ARBITRATION_API_KEY',
       ],
       'auth-billing': [
-        'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
+        'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'SENATE_INTAKE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
@@ -3960,7 +4874,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       ],
       tunables: [
         'LLM_DOC_USD_CEILING', 'LLM_DAILY_USD_CEILING', 'OPENROUTER_DAILY_USD_CEILING', 'OPENROUTER_MIN_BALANCE_USD', 'LLAMAPARSE_DAILY_CREDIT_CEILING', 'LLAMAPARSE_DAILY_CREDITS_CEILING', 'LLAMAPARSE_DAILY_USD_CEILING',
-        'APP_BASE_URL', 'PRICE_PROVIDER', 'FMP_DAILY_CALL_CAP', 'FMP_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE',
+        'APP_BASE_URL', 'PRICE_PROVIDER', 'FMP_DAILY_CALL_CAP', 'ST_PEER_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE',
         'SCRAPE_GUARD_ENABLED', 'DISCLOSURE_LATENCY_WATCH_ENABLED', 'DISCLOSURE_LATENCY_PROVIDERS',
         'DISCLOSURE_LATENCY_WATCH_LIMIT', 'FMP_DISCLOSURE_WATCH_ENABLED', 'FMP_DISCLOSURE_WATCH_LIMIT',
         'FMP_LATENCY_PROBE_ENABLED', 'FMP_LATENCY_PATHS', 'FMP_STABLE_BASE_URL',
@@ -4102,6 +5016,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Admin operational snapshot: provider/source connection status, usage counts,
   // and recent errors collected from existing D1 tables. This intentionally
   // reports only whether secrets are configured, never their values.
+  // Operator-private filing-skip diagnostics: the public /health payload
+  // carries counts only, so the raw unreadable 278-T doc ids behind
+  // `oge_text_unreadable` (most recent failure first) are exposed here,
+  // behind the admin router's deny-by-default auth.
+  r.get('/pipeline-health/filing-skips', async (c) => {
+    const pipeline = await checkPipelineHealth(c.env);
+    const filingSkips = pipeline.checks.find((check) => check.id === 'filing_skips') ?? null;
+    return c.json({
+      status: pipeline.status,
+      filingSkips,
+      unreadableExecutiveDocCount: pipeline.signals?.unreadableExecutiveDocCount ?? null,
+      unreadableExecutiveDocIds: pipeline.signals?.unreadableExecutiveDocIds ?? [],
+      time: new Date().toISOString(),
+    });
+  });
+
   r.get('/diagnostics', async (c) => {
     const now = new Date();
     const last24 = hoursAgoIso(24, now);
@@ -5198,12 +6128,52 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!isSettingsInitialized()) {
       return c.json({ ok: false, error: 'settings not initialized' }, 503);
     }
+    if (key === DELIVERY_MODE_SETTING_KEY) {
+      const parsed = DeliveryModePutBody.safeParse(body);
+      if (!parsed.success) {
+        return c.json({ ok: false, error: `invalid ${DELIVERY_MODE_SETTING_KEY} body: ${parsed.error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ')}` }, 400);
+      }
+      return await putDeliveryMode(c, parsed.data.value, parsed.data.reason ?? null);
+    }
     try {
       const saved = await appSettings().set(c.env, key, value);
       return c.json({ ok: true, key, value: saved });
     } catch (err) {
       return c.json({ ok: false, error: (err as Error).message }, /Unknown app setting/.test((err as Error).message) ? 400 : 502);
     }
+  });
+
+  // --- GET /delivery-mode -------------------------------------------------
+  // Subscriber alert pause status (CT_DELIVERY_MODE): current mode, the
+  // delivery_mode health check, outbox counts that a resume would release or
+  // that were suppressed, and the change audit trail.  Change the mode with
+  // PUT /settings { key: 'CT_DELIVERY_MODE', value, reason }.
+  r.get('/delivery-mode', async (c) => {
+    const { isSettingsInitialized } = await import('../settings/settingsService.ts');
+    if (!isSettingsInitialized()) {
+      return c.json({ ok: false, error: 'settings not initialized' }, 503);
+    }
+    const reading = readDeliveryModeDetail();
+    const [check, audit, outbox] = await Promise.all([
+      collectDeliveryModeCheck(c.env),
+      listDeliveryModeAudit(c.env, 50).catch(() => []),
+      all<{ status: string; n: number }>(
+        c.env.DB,
+        `SELECT status, COUNT(*) AS n FROM delivery_outbox
+          WHERE status IN ('pending', 'sending', 'enqueued', 'suppressed') GROUP BY status`,
+        [],
+      ).catch(() => []),
+    ]);
+    return c.json({
+      ok: true,
+      mode: reading.mode,
+      raw: reading.raw ?? null,
+      invalid: reading.invalid,
+      modes: DELIVERY_MODES,
+      check,
+      outbox: Object.fromEntries(outbox.map((row) => [row.status, Number(row.n)])),
+      audit,
+    });
   });
 
   // --- GET /ui-settings ---------------------------------------------------
@@ -5363,48 +6333,6 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ ok: result.errors.length === 0, ...result });
     } catch (err) {
       return c.json({ error: `backfill failed: ${(err as Error).message}` }, 500);
-    }
-  });
-
-  // --- POST /fmp-senate-recovery -----------------------------------------
-  // RETIRED: runFmpSenateRecovery refuses every invocation (FMP is latency-only).
-  // Route kept so operators get a clear error instead of a silent 404.
-  r.post('/fmp-senate-recovery', async (c) => {
-    let body: Record<string, unknown> = {};
-    try {
-      const text = await c.req.text();
-      if (text) body = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return c.json({ error: 'invalid JSON body' }, 400);
-    }
-
-    const fromPage = body.fromPage ?? 0;
-    const toPage = body.toPage ?? fromPage;
-    const dryRun = body.dryRun ?? false;
-    if (!Number.isInteger(fromPage) || !Number.isInteger(toPage)) {
-      return c.json({ error: 'fromPage and toPage must be integers' }, 400);
-    }
-    if (
-      (fromPage as number) < 0 ||
-      (toPage as number) < (fromPage as number) ||
-      (toPage as number) > 100 ||
-      (toPage as number) - (fromPage as number) + 1 > 5
-    ) {
-      return c.json({ error: 'pages must satisfy 0 <= fromPage <= toPage <= 100 with at most 5 pages per run' }, 400);
-    }
-    if (typeof dryRun !== 'boolean') {
-      return c.json({ error: 'dryRun must be a boolean' }, 400);
-    }
-
-    try {
-      const result = await runFmpSenateRecovery(c.env, {
-        fromPage: fromPage as number,
-        toPage: toPage as number,
-        dryRun,
-      });
-      return c.json(result);
-    } catch (err) {
-      return c.json({ error: `FMP Senate recovery failed: ${(err as Error).message}` }, 500);
     }
   });
 
@@ -5787,6 +6715,100 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
   });
 
+
+  // --- POST /senate-ptr-intake --------------------------------------------
+  // Accept Senate PTR rows discovered out-of-band by the Mac eFD fetcher
+  // (CT-2442) and hand them to the same dedupe + durable-outbox path as
+  // pollSenate, so intake filings land in the review queue exactly like
+  // polled ones.  Body: { rows: EfdFetcherRow[], dryRun?: boolean } (the
+  // fetcher's out-file envelope keys are also accepted).  Auth: full admin,
+  // or the scoped SENATE_INTAKE_TOKEN (this path only).  Idempotent: rows
+  // whose canonical doc id already exists are counted in `received`, not
+  // reinserted or re-enqueued.
+  r.post('/senate-ptr-intake', async (c) => {
+    let raw = '';
+    try {
+      raw = await c.req.text();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+    // Size ceiling before JSON.parse: a capped 500-row fetcher file is well
+    // under this; anything larger is not a fetcher file.
+    if (raw.length > 1_000_000) {
+      return c.json({ error: 'request body too large' }, 413);
+    }
+    let json: unknown = {};
+    try {
+      if (raw) json = JSON.parse(raw);
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = SenatePtrIntakeBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
+    const filings = body.rows
+      .map((row) => senateFilingFromFetcherRow(row))
+      .filter((f): f is SenateFiling => f !== null);
+    const converted = filings.length;
+    const rejected = body.rows.length - converted;
+    if (body.dryRun === true) {
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: 0,
+        dryRun: true,
+      });
+      return c.json({
+        ok: true,
+        dryRun: true,
+        received: body.rows.length,
+        converted,
+        rejected,
+        docIds: filings.map((f) => f.pipelineDocId),
+      });
+    }
+    try {
+      const result = await ingestSenateFilings(c.env, filings, new Date());
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: result.count,
+        dryRun: false,
+      });
+      return c.json({
+        ok: true,
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: result.count,
+        insertedDocIds: result.inserted.map((f) => f.docId),
+      });
+    } catch (err) {
+      // The relay did call in — record that before answering, so a
+      // server-side ingest failure does not read as a dead fetcher on the
+      // review surface.  newCount stays 0: nothing was ingested.
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: 0,
+        dryRun: false,
+        failed: true,
+      });
+      // The scoped intake caller is low-privilege: log the detail
+      // server-side and return a generic error, never DB internals.
+      console.error('senate-ptr-intake: ingest failed:', (err as Error).message);
+      return c.json({ error: 'senate intake failed' }, 500);
+    }
+  });
+
   // --- POST /queue-requeue-failed -----------------------------------------
   // Reset terminally-failed deno_runtime_queue rows (status='failed') back to
   // 'pending' after a systemic consumer fix — the durable-queue analogue of
@@ -5836,7 +6858,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // --- POST /delivery-requeue-quarantined -----------------------------------
   // Recover webhook deliveries quarantined by the per-subscription parked-depth
   // cap (status='quarantined'). Moves rows back to 'parked' when headroom exists,
-  // then flushes a batch. Idempotent. Body (all optional):
+  // then flushes a batch. Rows whose transaction is gone or retracted are
+  // marked 'skipped' in place instead (only counted on dryRun). Idempotent.
+  // Body (all optional):
   //   { subscriptionId?: string, limit?: number (default 500, max 5000),
   //     ignoreCircuit?: boolean, dryRun?: boolean }
   r.post('/delivery-requeue-quarantined', async (c) => {
@@ -5860,7 +6884,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         dryRun: body.dryRun,
       });
       const flushed = body.dryRun
-        ? { scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 }
+        ? { scanned: 0, released: 0, skipped: 0, terminalized: 0, quarantineRecovered: 0, quarantineTerminalized: 0 }
         : await flushParkedDeliveries(c.env, { limit: Math.min(body.limit, 200) });
       return c.json({ ok: true, recovery, flushed });
     } catch (err) {
@@ -6460,7 +7484,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if (!docId) {
       return c.json({ error: 'docId is required' }, 400);
     }
-    const parsedTx = Array.isArray(body.transactions) ? (body.transactions as ParsedTx[]) : [];
+    const parsedTxIncoming = Array.isArray(body.transactions) ? (body.transactions as ParsedTx[]) : [];
     const extractor = typeof body.extractor === 'string' ? body.extractor : 'mac_vision_v1';
     const workerId = typeof body.workerId === 'string' ? body.workerId : 'local_mac_1';
     // Mac worker → local_mac; Coolify CPU worker → server_cpu; default local_mac for back-compat.
@@ -6469,6 +7493,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       rawSource === 'server_cpu' || extractor.startsWith('server_cpu')
         ? 'server_cpu'
         : 'local_mac';
+
+    // Collapse contiguous duplicate runs BEFORE the stored-review size comparison
+    // below, so a repeated-row flood cannot present itself as a larger extract
+    // than the one it would replace.  H-2026-9116378 arrived with 286 rows of
+    // which 251 were one trade at contiguous rowIndex 35..285.
+    const deduped = collapseDuplicateSpans(parsedTxIncoming, txSource);
+
+    // CT-2415 Guards 2 and 3. Both run AFTER the flood collapse, so a 286-row
+    // duplicate burst is judged as the handful of real reads underneath it
+    // rather than as 286 rows of apparently-constant data. Neither guard drops
+    // a row: Guard 2 leaves the amount unread, Guard 3 preserves the type with a review warning,
+    // and both route the filing to review instead of publishing an inferred
+    // value.
+    const bandChecked = refuseIllegibleBandAmounts(deduped.rows);
+    const columnChecked = rejectConstantColumnReads(bandChecked.rows);
+    const parsedTx = columnChecked.rows;
 
     try {
       const existingReview = await get<{ reason: string | null; payload: string | null }>(
@@ -6550,6 +7590,25 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         needsReview: result.needsReview,
         minConfidence: result.minConfidence,
         txCount: result.transactions.length,
+        submittedTxCount: parsedTxIncoming.length,
+        duplicateSpanCollapsed: deduped.removed,
+        duplicateSpanRuns: deduped.runs.map((r) => ({
+          contentHash: r.contentHash,
+          count: r.count,
+          firstIndex: r.firstIndex,
+          lastIndex: r.lastIndex,
+        })),
+        illegibleBandAmountsRefused: bandChecked.refusals.length,
+        illegibleBandAmounts: bandChecked.refusals.map((r) => ({
+          rowIndex: r.rowIndex,
+          amountMin: r.amountMin,
+          amountMax: r.amountMax,
+        })),
+        constantColumnReadsRejected: columnChecked.rejections.map((r) => ({
+          field: r.field,
+          value: r.value,
+          rowCount: r.rowIndexes.length,
+        })),
       });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
@@ -9594,356 +10653,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // as already-applied. ANY other SQL error is fatal: the route returns 500 with a
   // structured failed[] list and a checkReadiness() schema postcondition, so
   // scripts/ship.sh aborts the deploy instead of reporting a green migration.
-  const MIGRATE_IDEMPOTENT_ERROR_PATTERNS: readonly RegExp[] = [
-    /duplicate column name/i,
-    /\b(?:table|index|trigger|view)\s+\S+\s+already exists/i,
-  ];
-
-  function isIdempotentMigrationError(message: string): boolean {
-    return MIGRATE_IDEMPOTENT_ERROR_PATTERNS.some((re) => re.test(message));
-  }
-
   r.post('/migrate', async (c) => {
-    const statements = [
-      ...BASE_SCHEMA_STATEMENTS,
-      'ALTER TABLE filers ADD COLUMN photo_url TEXT',
-      // 0003_users.sql — end-user accounts (public-site auth). Idempotent.
-      `CREATE TABLE IF NOT EXISTS users (
-         id             TEXT PRIMARY KEY,
-         email          TEXT NOT NULL UNIQUE,
-         name           TEXT,
-         picture        TEXT,
-         google_sub     TEXT UNIQUE,
-         email_verified INTEGER NOT NULL DEFAULT 0,
-         created_at     TEXT NOT NULL,
-         last_login_at  TEXT
-       )`,
-      'CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)',
-      // 0004_billing.sql — Stripe billing columns on users. Idempotent.
-      'ALTER TABLE users ADD COLUMN stripe_customer_id TEXT',
-      'ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT',
-      'ALTER TABLE users ADD COLUMN subscription_status TEXT',
-      'ALTER TABLE users ADD COLUMN plan TEXT',
-      'ALTER TABLE users ADD COLUMN current_period_end TEXT',
-      'ALTER TABLE users ADD COLUMN cancel_at_period_end INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE users ADD COLUMN trial_end TEXT',
-      'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_stripe_customer ON users (stripe_customer_id)',
-      // 0005_securities_ref.sql — asset reference data (sector, market cap, …).
-      `CREATE TABLE IF NOT EXISTS securities_ref (
-         ticker            TEXT PRIMARY KEY,
-         company_name      TEXT, sector TEXT, industry TEXT, asset_class TEXT,
-         is_etf INTEGER NOT NULL DEFAULT 0, is_adr INTEGER NOT NULL DEFAULT 0,
-         country TEXT, state_hq TEXT, state_of_incorp TEXT,
-         exchange TEXT, exchange_short TEXT, currency TEXT,
-         market_cap INTEGER, market_cap_bucket TEXT, ipo_date TEXT,
-         cik TEXT, sic_code TEXT, sic_description TEXT,
-         source TEXT, enriched_at TEXT, enrichment_error TEXT
-       )`,
-      'CREATE INDEX IF NOT EXISTS idx_secref_sector ON securities_ref (sector)',
-      'CREATE INDEX IF NOT EXISTS idx_secref_bucket ON securities_ref (market_cap_bucket)',
-      'CREATE INDEX IF NOT EXISTS idx_secref_enriched ON securities_ref (enriched_at)',
-      // 0006_prices.sql — price history + per-trade performance vs S&P 500.
-      `CREATE TABLE IF NOT EXISTS price_eod (
-         ticker TEXT NOT NULL, date TEXT NOT NULL, close REAL NOT NULL,
-         PRIMARY KEY (ticker, date)
-       )`,
-      'CREATE INDEX IF NOT EXISTS idx_price_eod_ticker_date ON price_eod (ticker, date DESC)',
-      'CREATE TABLE IF NOT EXISTS spx_eod (date TEXT PRIMARY KEY, close REAL NOT NULL)',
-      `CREATE TABLE IF NOT EXISTS tx_performance (
-         tx_id TEXT PRIMARY KEY, price_at_trade REAL, spx_at_trade REAL, computed_at TEXT
-       )`,
-      'ALTER TABLE securities_ref ADD COLUMN current_price REAL',
-      'ALTER TABLE securities_ref ADD COLUMN current_price_date TEXT',
-      // 0007_market_extras.sql — daily volume + insider / short-volume datasets.
-      'ALTER TABLE price_eod ADD COLUMN volume INTEGER',
-      `CREATE TABLE IF NOT EXISTS insider_eod (
-         ticker TEXT NOT NULL, date TEXT NOT NULL, sentiment REAL,
-         buy_filings INTEGER, sell_filings INTEGER, buy_shares REAL, sell_shares REAL,
-         owners TEXT, PRIMARY KEY (ticker, date)
-       )`,
-      `CREATE TABLE IF NOT EXISTS short_volume_eod (
-         ticker TEXT NOT NULL, date TEXT NOT NULL, short_volume_ratio REAL,
-         elevated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ticker, date)
-       )`,
-      // 0008_idempotency_keys.sql — at-least-once retry guards.
-      'ALTER TABLE transactions ADD COLUMN row_key TEXT',
-      // NOTE: the strict idx_transactions_doc_source_rowkey that 0008 created
-      // is deliberately NOT replayed here. A later statement in this same list
-      // (REVIEW_AGREEMENT_SUPPRESSION_SCHEMA_STATEMENTS) supersedes it with
-      // idx_transactions_live_doc_source_rowkey — which additionally requires
-      // deprecated_at IS NULL — and then DROPs this one. Recreating it on every
-      // run was dead work that also throws "UNIQUE constraint failed" whenever a
-      // deprecated row shares (doc_id, source, row_key) with a live one, which
-      // is precisely why it was superseded. Harmless while /migrate swallowed
-      // errors; since that route fails closed it would 500 the whole migration
-      // and block the deploy.
-      `DELETE FROM deliveries
-         WHERE rowid NOT IN (
-           SELECT MAX(rowid)
-             FROM deliveries
-            GROUP BY subscription_id, tx_id
-         )`,
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_subscription_tx
-         ON deliveries (subscription_id, tx_id)`,
-      // 0009_client_api.sql — shared PWA / SwiftUI client state.
-      `CREATE TABLE IF NOT EXISTS user_preferences (
-         user_id TEXT PRIMARY KEY,
-         saved_filters TEXT NOT NULL DEFAULT '{}',
-         watchlist TEXT NOT NULL DEFAULT '[]',
-         notification_settings TEXT NOT NULL DEFAULT '{}',
-         default_window TEXT,
-         updated_at TEXT NOT NULL
-       )`,
-      `CREATE TABLE IF NOT EXISTS client_commands (
-         id TEXT PRIMARY KEY,
-         user_id TEXT NOT NULL,
-         type TEXT NOT NULL,
-         status TEXT NOT NULL,
-         idempotency_key TEXT,
-         payload TEXT NOT NULL DEFAULT '{}',
-         result TEXT,
-         error TEXT,
-         created_at TEXT NOT NULL,
-         updated_at TEXT NOT NULL,
-         started_at TEXT,
-         finished_at TEXT
-       )`,
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_client_commands_user_idempotency
-         ON client_commands (user_id, idempotency_key)
-         WHERE idempotency_key IS NOT NULL`,
-      `CREATE INDEX IF NOT EXISTS idx_client_commands_user_created
-         ON client_commands (user_id, created_at DESC)`,
-      'CREATE INDEX IF NOT EXISTS idx_client_commands_status ON client_commands (status)',
-      // 0010_fundamentals.sql — sibling-app fundamentals + analyst consensus cache.
-      `CREATE TABLE IF NOT EXISTS fundamentals_eod (
-         ticker TEXT NOT NULL, date TEXT NOT NULL, pe_ratio REAL, eps REAL, beta REAL,
-         dividend_yield REAL, week52_high REAL, week52_low REAL, fcf_yield REAL,
-         debt_to_equity REAL, eps_growth REAL, source TEXT, updated_at TEXT NOT NULL,
-         PRIMARY KEY (ticker, date)
-       )`,
-      `CREATE TABLE IF NOT EXISTS analyst_consensus (
-         ticker TEXT NOT NULL, date TEXT NOT NULL, rating TEXT, target_mean REAL,
-         target_high REAL, target_low REAL, target_median REAL, analyst_count INTEGER,
-         strong_buy INTEGER, buy INTEGER, hold INTEGER, sell INTEGER, strong_sell INTEGER,
-         source TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (ticker, date)
-       )`,
-      // 0011_transaction_row_details.sql — row-specific House PTR details.
-      'ALTER TABLE transactions ADD COLUMN asset_type_name TEXT',
-      'ALTER TABLE transactions ADD COLUMN filing_status TEXT',
-      'ALTER TABLE transactions ADD COLUMN subholding TEXT',
-      'ALTER TABLE transactions ADD COLUMN location TEXT',
-      'ALTER TABLE transactions ADD COLUMN description TEXT',
-      'ALTER TABLE transactions ADD COLUMN supplemental_text TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_tx_asset_type_name ON transactions (asset_type_name)',
-      // 0012_shares_outstanding.sql — keep market cap current off the daily close.
-      'ALTER TABLE securities_ref ADD COLUMN shares_outstanding REAL',
-      `UPDATE securities_ref SET shares_outstanding = market_cap / current_price
-         WHERE shares_outstanding IS NULL AND market_cap IS NOT NULL
-           AND current_price IS NOT NULL AND current_price > 0`,
-      // 0013_tx_deprecation.sql — soft-delete so admins can un-publish filings.
-      'ALTER TABLE transactions ADD COLUMN deprecated_at TEXT',
-      'ALTER TABLE transactions ADD COLUMN deprecated_reason TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_tx_deprecated_at ON transactions (deprecated_at)',
-      // 0014_tx_perf_filing_anchors.sql — disclosure-date performance anchors.
-      'ALTER TABLE tx_performance ADD COLUMN price_at_filing REAL',
-      'ALTER TABLE tx_performance ADD COLUMN spx_at_filing REAL',
-      // 0015_extraction_runs.sql — per-doc per-model extraction results (bake-off + review dashboard).
-      `CREATE TABLE IF NOT EXISTS extraction_runs (
-         id TEXT PRIMARY KEY, batch_id TEXT, doc_id TEXT NOT NULL,
-         provider TEXT NOT NULL, model TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'bakeoff',
-         ok INTEGER NOT NULL DEFAULT 0, error TEXT, row_count INTEGER NOT NULL DEFAULT 0,
-         latency_ms INTEGER, avg_confidence REAL, result_json TEXT, created_at TEXT NOT NULL)`,
-      'CREATE INDEX IF NOT EXISTS idx_extraction_runs_doc ON extraction_runs (doc_id)',
-      'CREATE INDEX IF NOT EXISTS idx_extraction_runs_batch ON extraction_runs (batch_id)',
-      'CREATE INDEX IF NOT EXISTS idx_extraction_runs_created ON extraction_runs (created_at)',
-      // 0016_batch_jobs.sql — async batch reprocessing jobs (cheaper backlog path).
-      `CREATE TABLE IF NOT EXISTS batch_jobs (
-         id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL,
-         provider_batch_id TEXT, doc_ids TEXT NOT NULL, status TEXT NOT NULL,
-         submitted_at TEXT NOT NULL, completed_at TEXT, turnaround_ms INTEGER,
-         result_summary TEXT, error TEXT)`,
-      'CREATE INDEX IF NOT EXISTS idx_batch_jobs_status ON batch_jobs (status)',
-      'CREATE INDEX IF NOT EXISTS idx_batch_jobs_submitted ON batch_jobs (submitted_at)',
-      // 0017_fb_meta_remap.sql — Facebook's old "FB" ticker was reassigned by the
-      // SEC to a ProShares ETF after Meta moved to "META", so congressional FB
-      // trades were showing the ProShares name. Remap stored FB rows to META and
-      // fix the cached names. Idempotent (UPDATEs).
-      "UPDATE transactions SET ticker = 'META' WHERE ticker = 'FB' AND deprecated_at IS NULL",
-      "UPDATE securities_ref SET company_name = 'Meta Platforms, Inc.' WHERE ticker = 'META' AND (company_name IS NULL OR company_name = '' OR company_name LIKE '%ProShares%')",
-      "UPDATE securities_master SET name = 'Meta Platforms, Inc.' WHERE ticker = 'META'",
-      // 0018_agreement_attempted.sql — one autonomous agreement attempt per review doc.
-      'ALTER TABLE review_queue ADD COLUMN agreement_attempted_at TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_review_queue_agreement ON review_queue (agreement_attempted_at)',
-      // 0019_ingestion_decisions.sql — append-only audit trail for publication/review decisions.
-      `CREATE TABLE IF NOT EXISTS ingestion_decisions (
-         id TEXT PRIMARY KEY,
-         doc_id TEXT NOT NULL,
-         action TEXT NOT NULL,
-         source TEXT NOT NULL,
-         actor TEXT,
-         reason TEXT,
-         payload TEXT,
-         transaction_ids TEXT NOT NULL DEFAULT '[]',
-         created_at TEXT NOT NULL
-       )`,
-      'CREATE INDEX IF NOT EXISTS idx_ingestion_decisions_doc ON ingestion_decisions (doc_id, created_at DESC)',
-      'CREATE INDEX IF NOT EXISTS idx_ingestion_decisions_created ON ingestion_decisions (created_at DESC)',
-      'CREATE INDEX IF NOT EXISTS idx_ingestion_decisions_action ON ingestion_decisions (action, created_at DESC)',
-      // 0020_disclosure_available_generated.sql — generated column for disclosure availability.
-      ...DISCLOSURE_AVAILABLE_SCHEMA_STATEMENTS,
-      // 0021_disclosure_latency_watch.sql — congress.trade-vs-FMP disclosure race monitor.
-      `CREATE TABLE IF NOT EXISTS disclosure_latency_candidates (
-         doc_id TEXT NOT NULL,
-         provider TEXT NOT NULL DEFAULT 'fmp',
-         chamber TEXT NOT NULL,
-         source_url TEXT,
-         filed_date TEXT,
-         filer_name TEXT,
-         congress_first_seen_at TEXT NOT NULL,
-         provider_key TEXT,
-         provider_first_seen_at TEXT,
-         provider_published_at TEXT,
-         match_method TEXT,
-         status TEXT NOT NULL DEFAULT 'pending',
-         attempts INTEGER NOT NULL DEFAULT 0,
-         last_checked_at TEXT,
-         error TEXT,
-         payload TEXT,
-         created_at TEXT NOT NULL,
-         updated_at TEXT NOT NULL,
-         PRIMARY KEY (doc_id, provider)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_disc_latency_candidates_status
-         ON disclosure_latency_candidates (provider, status, created_at DESC)`,
-      `CREATE TABLE IF NOT EXISTS disclosure_provider_observations (
-         provider TEXT NOT NULL,
-         chamber TEXT NOT NULL,
-         provider_key TEXT NOT NULL,
-         first_observed_at TEXT NOT NULL,
-         last_observed_at TEXT NOT NULL,
-         provider_published_at TEXT,
-         source_url TEXT,
-         filed_date TEXT,
-         filer_name TEXT,
-         payload TEXT,
-         PRIMARY KEY (provider, chamber, provider_key)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_disc_provider_seen
-         ON disclosure_provider_observations (provider, chamber, first_observed_at DESC)`,
-      // 0022_stripe_webhook_events.sql — durable Stripe webhook idempotency ledger.
-      `CREATE TABLE IF NOT EXISTS stripe_webhook_events (
-         event_id TEXT PRIMARY KEY,
-         event_type TEXT NOT NULL,
-         received_at TEXT NOT NULL,
-         processed_at TEXT
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_received
-         ON stripe_webhook_events (received_at DESC)`,
-      // 0023_disclosure_provider_timestamps.sql — provider-side publish/upload timestamp when available.
-      'ALTER TABLE disclosure_latency_candidates ADD COLUMN provider_published_at TEXT',
-      'ALTER TABLE disclosure_provider_observations ADD COLUMN provider_published_at TEXT',
-      // 0024_dead_letter_events.sql — operator log for terminally-failed queue messages.
-      `CREATE TABLE IF NOT EXISTS dead_letter_events (
-         id INTEGER PRIMARY KEY AUTOINCREMENT,
-         queue TEXT NOT NULL,
-         msg_type TEXT,
-         doc_id TEXT,
-         tx_id TEXT,
-         attempts INTEGER,
-         error TEXT,
-         created_at TEXT NOT NULL
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_dead_letter_created ON dead_letter_events(created_at)`,
-      // 0087_latency_price_snapshots.sql
-      `CREATE TABLE IF NOT EXISTS latency_price_snapshots (
-         trade_hash TEXT NOT NULL,
-         ticker TEXT NOT NULL,
-         provider TEXT NOT NULL,
-         event TEXT NOT NULL,
-         due_at TEXT NOT NULL,
-         captured_at TEXT,
-         price REAL,
-         source TEXT,
-         error TEXT,
-         created_at TEXT NOT NULL,
-         PRIMARY KEY (trade_hash, provider, event)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_latency_price_due ON latency_price_snapshots (captured_at, due_at)`,
-      // 0025_amendment_trump_deprecation.sql — soft-deprecate unamended Trump report rows superseded by amendment.
-      `UPDATE transactions
-          SET deprecated_at = '2026-07-28T17:00:00.000Z',
-              deprecated_reason = 'superseded by amendment E-2025-donald-j-trump-08-12-2025-278t-2-amended'
-        WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-3'
-          AND deprecated_at IS NULL
-          AND EXISTS (
-            SELECT 1 FROM transactions WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND deprecated_at IS NULL
-          )`,
-      `CREATE INDEX IF NOT EXISTS idx_filings_filer_amend ON filings(filer_id, ingest_status, filed_date)`,
-      // 0026_retroactive_amendment_deprecation_sweep.sql — soft-deprecate all historical predecessor filing transactions superseded by amended filings across all chambers (indexed and bounded to 50 per run for instant response).
-      `UPDATE transactions
-          SET deprecated_at = '2026-07-28T17:15:00.000Z',
-              deprecated_reason = 'retroactive amendment cleanup: superseded by newer amended filing'
-        WHERE deprecated_at IS NULL
-          AND doc_id IN (
-            SELECT f_orig.doc_id
-              FROM filings f_amend
-              JOIN filings f_orig
-                ON f_amend.filer_id = f_orig.filer_id
-               AND f_amend.filed_date = f_orig.filed_date
-               AND f_amend.doc_id <> f_orig.doc_id
-             WHERE f_amend.ingest_status = 'persisted'
-               AND f_orig.ingest_status = 'persisted'
-               AND (f_amend.filing_status = 'Amended' OR f_amend.doc_id LIKE '%amend%' OR f_amend.source_url LIKE '%amend%')
-             LIMIT 50
-          )`,
-      // 0029-0039 — canonical value, reliability, Stripe, review, and benchmark tail.
-      ...POST_0024_SCHEMA_STATEMENTS,
-    ];
-    const applied: string[] = [];
-    const skipped: string[] = [];
-    const failed: Array<{ sql: string; error: string }> = [];
-    await run(c.env.DB, 'PRAGMA busy_timeout = 10000').catch(() => {});
-    for (const sql of statements) {
-      let attempts = 0;
-      let lastErr: Error | null = null;
-      while (attempts < 3) {
-        attempts++;
-        try {
-          await run(c.env.DB, sql);
-          applied.push(sql);
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err as Error;
-          const msg = lastErr.message || String(lastErr);
-          if (isIdempotentMigrationError(msg)) {
-            skipped.push(sql);
-            lastErr = null;
-            break;
-          }
-          if (/\bSQLITE_BUSY\b/i.test(msg) && attempts < 3) {
-            await new Promise((r) => setTimeout(r, attempts * 75));
-            continue;
-          }
-          break;
-        }
-      }
-      if (lastErr) {
-        const msg = lastErr.message || String(lastErr);
-        console.error(`[MIGRATE ERROR] ${msg} on statement: ${sql}`);
-        failed.push({ sql, error: msg });
-      }
+    const statements = buildAdminMigrateStatements();
+    let applied: string[] = [];
+    let skipped: string[] = [];
+    let failed: Array<{ sql: string; error: string }> = [];
+    try {
+      ({ applied, skipped, failed } = await executeAdminSchemaMigrations(c.env.DB, statements));
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      failed = [{ sql: '(schema migration bootstrap)', error: msg }];
     }
-
     const body = await c.req.json<{ skipSchemaVerify?: boolean }>().catch(() => ({} as { skipSchemaVerify?: boolean }));
     const skipSchemaVerify = 'skipSchemaVerify' in body && body.skipSchemaVerify === true;
     const readiness = skipSchemaVerify
       ? { ok: true, db: true, schema: true, missing: ['(schema verification skipped)'] }
       : await checkReadiness(c.env.DB);
-    // `!readiness.db` must NOT excuse a failure: checkReadiness reports
-    // db:false precisely when it cannot reach the database, which is the
-    // condition this postcondition exists to catch. Treating it as "fine"
-    // failed open on the worst case.
     const ok = failed.length === 0 && readiness.ok;
     if (!ok) {
       console.error(
@@ -10015,9 +10740,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- GET /enrich-securities/status --------------------------------------
-  // Today's FMP call usage + how many tickers still need enrichment.
+  // How many tickers still need enrichment and prices.
   r.get('/enrich-securities/status', async (c) => {
-    const used = await getDailyUsed(c.env);
     const retryIncomplete = await hasConfiguredKeyedEnrichmentProvider(c.env);
     const has0104 = await securitiesRefHasEnrichmentUnavailableColumns(c.env.DB);
     const row = await first<{ pending: number }>(
@@ -10037,21 +10761,19 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     const pending = await marketPending(c.env);
     const coverage = await marketCoverage(c.env);
     return c.json({
-      fmpCallsToday: used,
       pendingTickers: row?.pending ?? 0,
       pricePendingTickers: pending.prices,
       enrichedTickers: enriched?.n ?? 0,
       coverage,
-      hasFmpKey: false,
       hasSocraticPeer: retryIncomplete,
       hasKeyedEnrichmentProvider: retryIncomplete,
     });
   });
 
   // --- POST /refresh-prices -----------------------------------------------
-  // Budgeted price + performance refresh (FMP-only): updates the S&P series and,
+  // Price + performance refresh from the ST peer:  updates the S&P series and,
   // for tickers needing it, caches daily closes + computes per-trade anchors.
-  // Shares the daily FMP budget with enrichment. Body: { max?, dryRun? }.
+  // Body: { max?, dryRun? }.
   r.post('/refresh-prices', async (c) => {
     let body: Record<string, unknown> = {};
     try {
@@ -10266,6 +10988,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   r.post('/securities/import', async (c) => {
     try {
+      // #2724 / #2638 write columns that Coolify auto-deploy does not add.
+      // Without this, congress-share imports 500 and ST reports the dependency down.
+      await ensurePeerImportSchemaColumns(c.env.DB);
     // This endpoint runs inside a normal Worker request. Keep callers honest.
     // Paid Workers allow larger batches, but the cap remains configurable so
     // the app can be dialed back without code changes.
@@ -10325,6 +11050,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ error: 'invalid shared payload: origin must be a string' }, 400);
     }
     const originTag = typeof body.origin === 'string' ? body.origin : null;
+    // ST-3853: resolve the peer's payload contract version.  An unsupported or
+    // malformed version is warned about, never rejected — mixed deploys must
+    // keep importing until every peer runs a shared package that understands it.
+    const peerSchemaVersion = resolvePeerImportSchemaVersion(body.schemaVersion, {
+      requestId,
+      origin: originTag,
+    });
     const filteredShareBody = {
       ...body,
       refs: filterShareRows(body.refs, SecurityRefInputSchema),
@@ -10732,7 +11464,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       console.warn('peer import receipt persist failed:', (err as Error).message);
     }
 
-    return c.json({ ok, ...summary, dropped });
+    return c.json({ ok, ...summary, dropped, schemaVersion: peerSchemaVersion.schemaVersion });
     } catch (err) {
       if (isSqliteLockBusy(err)) {
         return c.json({ error: 'database busy; retry import' }, 503);
@@ -10834,6 +11566,30 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
   });
 
+  // --- POST /amount-bounds-canonicalize ------------------------------------
+  // Snap live (non-deprecated) non-competitor rows whose stored amount bounds
+  // sit one dollar below a STOCK Act bracket (e.g. 1000–15000 → 1001–15000).
+  // DRY RUN BY DEFAULT: pass ?dryRun=0 to write.  ?limit caps rows (default 500,
+  // max 1000).  In-place fix only — no delivery republish.
+  r.post('/amount-bounds-canonicalize', async (c) => {
+    try {
+      const { canonicalizePublishedAmountBounds } = await import('./amountBoundsCanonicalize.ts');
+      const dryRun = c.req.query('dryRun') !== '0';
+      const rawLimit = Number(c.req.query('limit'));
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+      return c.json({
+        ok: true,
+        ...(await canonicalizePublishedAmountBounds(c.env, {
+          dryRun,
+          limit,
+          actor: adminActor(c),
+        })),
+      });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
   // --- GET /subscriptions -------------------------------------------------
   r.get('/subscriptions', async (c) => {
     const activeOnly = c.req.query('active') === 'true';
@@ -10843,32 +11599,78 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   r.post('/clean-asset-names', async (c) => {
     // Note: D1 query limit is 100 statements or results.
-    // We will page through transactions and clean the asset names.
-    const { offset = 0, limit = 500 } = c.req.query() as { offset?: string | number, limit?: string | number };
-    const numOffset = Number(offset);
-    const numLimit = Number(limit);
-    
-    const rows = await all<{ id: string, asset_name: string, ticker: string | null }>(
+    // We page through transactions and clean the asset names.  Query params:
+    //   offset, limit — paging window (defaults 0, 500).
+    //   docId — restrict the sweep to one filing (CT-2441 Sep 17 cleanup).
+    //   dryRun=1 — report proposed changes without writing.
+    // Each row runs the shared OCR normalizer first (confident fixes only),
+    // then the long-standing cleanAssetString pass.  OCR-fixed rows record an
+    // audit fragment in cleaning_note; unfixable rows are reported as held
+    // and left untouched.  Re-running is a no-op once names are fixed.
+    // Parsed, not cast; bad paging input falls back to the defaults (see the
+    // schema), so a malformed request never reaches SQL as NaN.
+    const query = CleanAssetNamesQuerySchema.parse(c.req.query());
+    const numOffset = Math.floor(query.offset);
+    const numLimit = Math.max(1, Math.min(2000, Math.floor(query.limit)));
+    const docId = query.docId;
+    const dryRun = query.dryRun;
+
+    const rows = await all<{ id: string; asset_name: string; ticker: string | null; cleaning_note: string | null }>(
       c.env.DB,
-      'SELECT id, asset_name, ticker FROM transactions ORDER BY created_at DESC LIMIT ? OFFSET ?',
-      [numLimit, numOffset]
+      // The id tiebreaker keeps paging deterministic: batch inserts share one
+      // created_at, so offset windows over created_at alone could skip rows.
+      docId
+        ? 'SELECT id, asset_name, ticker, cleaning_note FROM transactions WHERE doc_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
+        : 'SELECT id, asset_name, ticker, cleaning_note FROM transactions ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+      docId ? [docId, numLimit, numOffset] : [numLimit, numOffset],
     );
-    
-    if (rows.length === 0) return c.json({ ok: true, cleaned: 0, done: true });
+
+    if (rows.length === 0) return c.json({ ok: true, cleaned: 0, ocrCleaned: 0, held: 0, done: true });
+
+    const { cleanAssetString } = await import('../extraction/nameNormalizer.ts');
 
     let cleaned = 0;
-    const { cleanAssetString } = await import('../extraction/nameNormalizer.ts');
+    let ocrCleaned = 0;
+    const heldRows: Array<{ id: string; before: string; reasons: string[] }> = [];
+    const proposed: Array<{ id: string; before: string; after: string; note: string | null }> = [];
 
     // Run sequentially to avoid D1 limits on concurrent batches
     for (const row of rows) {
-      const cleanName = cleanAssetString(row.asset_name, row.ticker);
-      if (cleanName !== row.asset_name) {
-        await c.env.DB.prepare('UPDATE transactions SET asset_name = ? WHERE id = ?').bind(cleanName, row.id).run();
-        cleaned++;
+      const stored = row.asset_name ?? '';
+      const ocr = normalizeOcrAssetName(stored);
+      const holds = [...ocr.dateHolds, ...ocr.nameHolds];
+      if (holds.length > 0) {
+        heldRows.push({ id: row.id, before: stored, reasons: holds });
+        continue;
       }
+      const cleanName = cleanAssetString(ocr.name, row.ticker);
+      if (cleanName === stored) continue;
+      const note = ocr.changed ? `normalized OCR artifacts: ${ocr.notes.join('; ')}` : null;
+      if (dryRun) {
+        proposed.push({ id: row.id, before: stored, after: cleanName, note });
+        continue;
+      }
+      const mergedNote = note
+        ? (row.cleaning_note ? `${row.cleaning_note}; ${note}` : note)
+        : row.cleaning_note;
+      await c.env.DB.prepare(
+        'UPDATE transactions SET asset_name = ?, cleaning_note = ? WHERE id = ?',
+      ).bind(cleanName, mergedNote, row.id).run();
+      cleaned += 1;
+      if (ocr.changed) ocrCleaned += 1;
     }
 
-    return c.json({ ok: true, cleaned, processed: rows.length, nextOffset: numOffset + numLimit, done: rows.length < numLimit });
+    return c.json({
+      ok: true,
+      cleaned,
+      ocrCleaned,
+      processed: rows.length,
+      nextOffset: numOffset + numLimit,
+      done: rows.length < numLimit,
+      held: heldRows.length,
+      heldSample: heldRows.slice(0, 20),
+      ...(dryRun ? { proposed: proposed.slice(0, 100), proposedCount: proposed.length } : {}),
+    });
   });
 
   r.post('/securities/standardize-names', async (c) => {
@@ -11435,6 +12237,7 @@ export async function marketPending(env: Env): Promise<{ enrich: number; prices:
                  ELSE ?
                END
          )
+         AND ${priceNotCoveredExclusionSql('sr')}
        GROUP BY t.ticker)`,
     [priceUnavailableFirstRecheckCutoffIso(), priceUnavailableCutoffIso()],
   );

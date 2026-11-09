@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """Read-only App Store Connect status for Congress.Trade.
 
-Reads only the three ASC_* values it needs from the handoff file via grep and
-never prints them.  Prints app / version / build / IAP / submission state only.
+Reads ASC credentials from env, else Infisical /asc (asc_creds.py);  never
+prints them.  Prints app / version / build / IAP / submission state only.
 
 Usage: asc_status.py [all|builds|version|iap|submissions]
 """
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.request
 
 import jwt
 
-ENV = os.path.expanduser('~/.secrets/appstore-connect.env')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from asc_creds import load_credentials  # noqa: E402
+
 APP = '6798076688'
 
 
-def val(name: str) -> str:
-    out = subprocess.run(['grep', '-m1', f'^{name}=', ENV], capture_output=True, text=True).stdout
-    return out.split('=', 1)[1].strip().strip('"\'') if '=' in out else ''
-
-
-kid, iss, kp = val('ASC_KEY_ID'), val('ASC_ISSUER_ID'), os.path.expanduser(val('ASC_KEY_PATH'))
+kid, iss, pem = load_credentials()
 tok = jwt.encode(
     {'iss': iss, 'iat': int(time.time()), 'exp': int(time.time()) + 900, 'aud': 'appstoreconnect-v1'},
-    open(kp).read(), algorithm='ES256', headers={'kid': kid, 'typ': 'JWT'})
+    pem, algorithm='ES256', headers={'kid': kid, 'typ': 'JWT'})
 
 
 def api(path: str):

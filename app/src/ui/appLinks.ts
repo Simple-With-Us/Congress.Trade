@@ -24,6 +24,10 @@ import type { Env } from '../shared/types.ts';
  */
 const IOS_APP_ID = 'CC8UTF7ATG.trade.congress.ios';
 
+// Public dashboard links and legacy install redirects share the released listing.
+// Explicit install env overrides remain supported for the legacy redirects.
+export const APP_STORE_URL = 'https://apps.apple.com/us/app/congress-trade/id6798076688?uo=4';
+
 /**
  * Modern `components` format, not the legacy `paths` array: every entity URL
  * on this site is a QUERY STRING on `/` (`?member=`, `?ticker=`, `?trade=`,
@@ -104,7 +108,7 @@ function validAppStoreId(env: Env): string | null {
 /**
  * Resolve the public TestFlight or App Store link for the iOS app.
  * Prefers explicit IOS_TESTFLIGHT_URL or IOS_BETA_URL, falls back to
- * the App Store URL when IOS_APP_STORE_ID is set, or the verified app invitation.
+ * the App Store URL when IOS_APP_STORE_ID is set, or the released Congress.Trade App Store listing.
  */
 export function testFlightUrl(env?: Env): string {
   const custom = (env?.IOS_TESTFLIGHT_URL || env?.IOS_BETA_URL || '').trim();
@@ -120,7 +124,7 @@ export function testFlightUrl(env?: Env): string {
   }
   const appId = env ? validAppStoreId(env) : null;
   if (appId) return `https://apps.apple.com/app/id${appId}`;
-  return 'https://testflight.apple.com/join/VNUEU6Ge';
+  return APP_STORE_URL;
 }
 
 /**

@@ -190,7 +190,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
 
       # package.json typecheck is `deno check`; Coolify runners do not ship Deno.
       - name: Install Deno CLI
@@ -198,6 +198,9 @@ jobs:
 
       - name: Enforce owned-runner workflow policy
         working-directory: .
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
       # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
@@ -218,6 +221,12 @@ jobs:
         run: |
           bash -n scripts/infisical-secrets-safe.sh
           node --test scripts/infisical-secrets-safe.test.mjs
+
+      # Local Infisical bootstrap reads the machine identity from env, then a
+      # fake `fleet-secrets` stub.  Offline: no real CLI, network or credentials.
+      - name: Local dev-vars bootstrap tests
+        working-directory: .
+        run: node --test scripts/merge-local-dev-vars.test.mjs
 
       # Static guard for the class of defect behind the sqlite-web finding: a
       # security-relevant variable given a fail-open default, or a password
@@ -251,13 +260,63 @@ jobs:
 
           exit $status
 
+      # CT-2459: deno.json (what Deno serves) and package.json (what Vitest
+      # tests) version the same packages twice and had drifted (hono, unpdf,
+      # zod). Fail on a MAJOR divergence; warn on minor/patch drift so it is
+      # visible without blocking on the pre-existing drift. Full equality
+      # needs a deno.lock regen, tracked separately.
+      - name: Assert deno.json and package.json version parity
+        run: |
+          node -e "
+          const fs = require('fs');
+          const deno = JSON.parse(fs.readFileSync('deno.json', 'utf8'));
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const deps = pkg.dependencies || {};
+          let fail = 0;
+          for (const spec of Object.values(deno.imports || {})) {
+            const m = /^npm:((?:@[^/]+\/)?[^@/]+)@([^/]+)/.exec(spec);
+            if (!m) continue;
+            const want = deps[m[1]];
+            if (!want) continue;
+            const norm = (s) => s.replace(/^[\^~>=<\s]+/, '');
+            const a = norm(m[2]), b = norm(want);
+            if (a === b) continue;
+            if (a.split('.')[0] !== b.split('.')[0]) {
+              console.log('::error::deno<->package MAJOR drift for ' + m[1] + ': deno.json ' + m[2] + ' vs package.json ' + want);
+              fail = 1;
+            } else {
+              console.log('::warning::deno<->package version drift for ' + m[1] + ': deno.json ' + m[2] + ' vs package.json ' + want);
+            }
+          }
+          process.exit(fail);
+          "
+
       - name: Install dependencies
         run: npm ci
 
       - name: Typecheck
         run: npm run typecheck
 
+      # CT-1500: the dashboard's ~546 KB of browser JavaScript used to live only
+      # in a TypeScript template literal, so `deno check` saw a string and eslint
+      # saw nothing — an undefined global shipped without anything failing. These
+      # two steps make that code a real lintable source file and keep the served
+      # string generated from it.
+      - name: Lint the dashboard client (no-undef, browser globals)
+        run: npm run lint:client
+
+      - name: Verify the served dashboard client matches its source
+        run: npm run check:client
+
+      # CT-2459: coverage instrumentation on every PR was pure overhead.
+      # PRs run the plain suite; thresholds in vitest.config.ts are enforced
+      # by the coverage run on push-to-main (and schedule/dispatch).
+      - name: Test (pull request)
+        if: github.event_name == 'pull_request'
+        run: npm test
+
       - name: Test with coverage thresholds
+        if: github.event_name != 'pull_request'
         run: npm run coverage
 
       - name: Audit
@@ -291,9 +350,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
 
       # The existing worker tests import checkbox/form_chrome, which pull in
       # numpy and OpenCV, so the runtime requirements are needed too — not just
@@ -344,16 +403,38 @@ jobs:
           bash -n scripts/ios-ci-xctest.sh
           bash -n scripts/ios-assert-stable-xcode.sh
           bash -n scripts/ios-fleet/publish-ios-versions.sh
+          bash -n scripts/ios-fleet/test-asc-credentials.sh
           node --check scripts/ios-fleet/asc-api.mjs
+          node --check scripts/ios-fleet/asc-key.mjs
+          node --check scripts/ios-fleet/version-plan.mjs
+          node --check scripts/ios-fleet/test-asc-key.test.mjs
 
       - name: Fleet version publish guard
         run: node --test scripts/ios-fleet/publish-ios-versions.test.mjs
 
+      - name: Fleet version numbering (offline)
+        run: node --test scripts/ios-fleet/version-plan.test.mjs
+
+      - name: Fleet shared build counter (offline)
+        run: node --test scripts/ios-fleet/shared-build.test.mjs
+
       - name: AppUpdatePrompt pin copy
         run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs
 
+      - name: ASC key module (offline)
+        run: node --test scripts/ios-fleet/test-asc-key.test.mjs
+
+      - name: ASC credential resolution (offline)
+        run: bash scripts/ios-fleet/test-asc-credentials.sh
+
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs
+
+      - name: External TestFlight beta promotion
+        run: node --test scripts/promote-external-beta.node-test.mjs
+
+      - name: ASC credentials helper (offline)
+        run: python3 scripts/asc/test_asc_creds.py
 
       - name: iOS signing key-file handoff
         run: bash scripts/test-ios-stage-asc-key.sh

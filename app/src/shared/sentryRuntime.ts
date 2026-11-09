@@ -15,7 +15,8 @@ import {
   SENTRY_PDF_IGNORE_ERRORS,
 } from './pdfParseErrors.ts';
 import { sentryOperationalNoiseShouldDrop } from './sentryNoise.ts';
-import { scrubSentryEvent } from './sentryScrub.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from './sentryDataCollection.ts';
+import { scrubSentryEvent, scrubSentryLogAttributes } from './sentryScrub.ts';
 import type { Env } from './types.ts';
 
 export type SentryLogAttributes = Record<string, string | number | boolean | null>;
@@ -57,16 +58,20 @@ export function flushSentry(timeout = 2000): Promise<boolean> {
  * for local/dev.
  */
 export function sentryLoggerWarn(message: string, attributes?: SentryLogAttributes): void {
+  const scrubbedAttributes = scrubSentryLogAttributes(attributes);
+  const scrubbedMessage = typeof message === 'string'
+    ? String(scrubSentryEvent({ message }).message ?? message)
+    : message;
   if (activeMetricsCount) {
     try {
-      activeMetricsCount(message, 1, attributes ? { attributes } : undefined);
+      activeMetricsCount(scrubbedMessage, 1, scrubbedAttributes ? { attributes: scrubbedAttributes } : undefined);
     } catch {
       // Metrics must never break the warn path.
     }
   }
   if (activeLoggerWarn) {
     try {
-      activeLoggerWarn(message, attributes);
+      activeLoggerWarn(scrubbedMessage, scrubbedAttributes);
       scheduleSentryLogFlush();
       return;
     } catch {
@@ -74,8 +79,8 @@ export function sentryLoggerWarn(message: string, attributes?: SentryLogAttribut
       return;
     }
   }
-  if (attributes) console.warn(message, attributes);
-  else console.warn(message);
+  if (scrubbedAttributes) console.warn(scrubbedMessage, scrubbedAttributes);
+  else console.warn(scrubbedMessage);
 }
 
 export interface SentrySdkLike {
@@ -157,6 +162,7 @@ export function buildSentryInitOptions(
     environment: env.SENTRY_ENVIRONMENT || 'production',
     tracesSampleRate,
     sendDefaultPii: false,
+    dataCollection: NOT_LINKED_SENTRY_DATA_COLLECTION,
     ...(release ? { release } : {}),
     initialScope: {
       tags: { runtime: 'coolify-docker' },
@@ -168,6 +174,8 @@ export function buildSentryInitOptions(
       return scrubbed;
     },
     beforeSendTransaction: <T>(event: T) => scrubSentryEvent(event),
+    beforeSendSpan: <T>(span: T) => scrubSentryEvent(span),
+    beforeSendMetric: <T>(metric: T) => scrubSentryEvent(metric),
     beforeSendLog: <T>(log: T) => scrubSentryEvent(log),
     enableLogs: true,
     // Deno's default 5s unref'd timer never fires if the isolate is quiet

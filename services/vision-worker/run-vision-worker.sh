@@ -1,23 +1,18 @@
 #!/bin/bash
-# launchd wrapper — loads secrets from the owner secrets file (never prints them).
+# launchd wrapper - each secret comes from the environment first, then from
+# `fleet-secrets get NAME` (Infisical Fleet-OPS).  Never prints them.
 set -euo pipefail
 
-SECRETS_FILE="${SECRETS_FILE:-$HOME/.secrets/global-api-keys}"
-if [[ ! -f "$SECRETS_FILE" && -f "$HOME/.secrets/global-api-keys.env" ]]; then
-  SECRETS_FILE="$HOME/.secrets/global-api-keys.env"
-fi
+FLEET_SECRETS_BIN="${FLEET_SECRETS_BIN:-$HOME/.local/bin/fleet-secrets}"
 
+# load_secret NAME: print the value of NAME from `fleet-secrets get`, or nothing
+# when the binary is missing or the key is absent / unreadable.
 load_secret() {
   local key="$1"
-  local file="$2"
-  if [[ ! -f "$file" ]]; then
+  if [[ ! -x "$FLEET_SECRETS_BIN" ]]; then
     return 0
   fi
-  local line
-  line="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -1 || true)"
-  if [[ -n "$line" ]]; then
-    printf '%s' "${line#*=}" | tr -d "\"'"
-  fi
+  "$FLEET_SECRETS_BIN" get "$key" 2>/dev/null || true
 }
 
 export CONGRESS_TRADE_API_URL="${CONGRESS_TRADE_API_URL:-https://congress.trade}"
@@ -46,19 +41,19 @@ export OPENROUTER_TIMEOUT_SEC="${OPENROUTER_TIMEOUT_SEC:-600}"
 export PYTHONUNBUFFERED=1
 
 if [[ -z "${ADMIN_TOKEN:-}" ]]; then
-  export ADMIN_TOKEN="$(load_secret CT_ADMIN_TOKEN "$SECRETS_FILE")"
+  export ADMIN_TOKEN="$(load_secret CT_ADMIN_TOKEN)"
 fi
 if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
-  export OPENROUTER_API_KEY="$(load_secret CT_OPENROUTER_API_KEY "$SECRETS_FILE")"
+  export OPENROUTER_API_KEY="$(load_secret CT_OPENROUTER_API_KEY)"
   if [[ -z "${OPENROUTER_API_KEY}" ]]; then
-    export OPENROUTER_API_KEY="$(load_secret OPENROUTER_API_KEY "$SECRETS_FILE")"
+    export OPENROUTER_API_KEY="$(load_secret OPENROUTER_API_KEY)"
   fi
 fi
 if [[ -z "${PUSHOVER_APP_TOKEN:-}" ]]; then
-  export PUSHOVER_APP_TOKEN="$(load_secret PUSHOVER_APP_TOKEN "$SECRETS_FILE")"
+  export PUSHOVER_APP_TOKEN="$(load_secret PUSHOVER_APP_TOKEN)"
 fi
 if [[ -z "${PUSHOVER_USER_KEY:-}" ]]; then
-  export PUSHOVER_USER_KEY="$(load_secret PUSHOVER_USER_KEY "$SECRETS_FILE")"
+  export PUSHOVER_USER_KEY="$(load_secret PUSHOVER_USER_KEY)"
 fi
 
 if [[ -z "${ADMIN_TOKEN}" ]]; then

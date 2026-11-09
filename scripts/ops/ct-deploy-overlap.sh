@@ -20,7 +20,16 @@
 #
 #   Hold is deliberately NOT in the main Coolify project, so
 #   `docker compose ... up` cannot stop it.  It runs the Deno app directly
-#   (no Litestream) so a second replicator does not fight the live one.
+#   (no Litestream) so a second replicator does not fight the live one, and
+#   with the boot schema migrate off (CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1):
+#   main.ts awaits that ~400-statement replay before Deno.serve, so a hold
+#   that replays it is still not serving /health when Coolify stops the old
+#   app.  In the normal path (OVERLAP_EARLY=1) hold clones the old, healthy
+#   app, which already migrated this schema; the replacement migrates again
+#   when it boots.  If hold is ever started later in a deploy, after the
+#   replacement container exists (for example hold died), it clones the
+#   replacement's image and serves that code before the replacement's own
+#   boot migrate has finished.
 #
 # INSTALL (root on the Coolify host — does not take the site down):
 #   install -m 0755 scripts/ops/ct-deploy-overlap.sh /usr/local/bin/
@@ -34,7 +43,9 @@
 #   /usr/local/bin/ct-reattach-proxy.sh
 #
 # This script never talks to production from a developer laptop.  It is a
-# host unit.  `--decide` / `--render` are offline and used by tests.
+# host unit.  `--decide` / `--parse-active` / `--render-env` /
+# `--render-env-file` are offline and used by tests.  `--render-env` prints
+# only the hold flags; `--render-env-file` writes the full env to a 0600 file.
 
 set -euo pipefail
 
@@ -52,6 +63,12 @@ STATE_DIR="${STATE_DIR:-/var/lib/ct-deploy-overlap}"
 REATTACH="${REATTACH:-/usr/local/bin/ct-reattach-proxy.sh}"
 LOG_TAG="${LOG_TAG:-ct-deploy-overlap}"
 LOOP_SLEEP_SEC="${LOOP_SLEEP_SEC:-3}"
+# While no deploy is in flight and no hold clone is running, poll a little slower.  The big
+# saving is skipping the discarded `docker exec` health probe (about 16 a minute); this only trims
+# the `docker ps` and Coolify API calls per tick.  Kept at 5s, not longer: a fully cached deploy can
+# reach Coolify's stop_running_container within seconds of starting, and the hold clone must already
+# be serving by then, so detection of a deploy start must stay close to the old 3s cadence.
+IDLE_SLEEP_SEC="${IDLE_SLEEP_SEC:-5}"
 # Default ON: a 3s poll after the builder exits often misses Coolify's
 # immediate stop_running_container.  Start hold when the deploy begins so
 # it is already serving before the in-project container is deleted.
@@ -101,6 +118,17 @@ decide_overlap_action() {
   printf '%s\n' keep-hold
 }
 
+# Offline: seconds to sleep after a tick.  Busy (deploy in flight or hold up)
+# keeps the fast LOOP_SLEEP_SEC; idle uses IDLE_SLEEP_SEC.
+loop_sleep_for() {
+  local deploy="${1:-0}" hold_running="${2:-0}"
+  if [[ "$deploy" == 1 || "$hold_running" == 1 ]]; then
+    printf '%s\n' "$LOOP_SLEEP_SEC"
+  else
+    printf '%s\n' "$IDLE_SLEEP_SEC"
+  fi
+}
+
 parse_deploy_active() {
   # stdin: Coolify /api/v1/deployments JSON.  Exit 0 if this app is in flight.
   APP_UUID="$APP_UUID" python3 -c '
@@ -136,6 +164,34 @@ raise SystemExit(0 if active else 1)
 '
 }
 
+# stdin: KEY=VALUE env lines copied from the live app.  stdout: the hold's env,
+# with each hold-only key set exactly once (any earlier value is dropped).
+#   CT_SKIP_LITESTREAM=1                 never start a second Litestream
+#                                        replicator against the live B2 target.
+#   CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1  serve /health without replaying the
+#                                        boot schema migrate (see WHAT above).
+render_hold_env() {
+  grep -v -e '^CT_SKIP_LITESTREAM=' -e '^CT_DISABLE_STARTUP_SCHEMA_MIGRATE=' || true
+  printf 'CT_SKIP_LITESTREAM=1\n'
+  printf 'CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1\n'
+}
+
+# stdin: a rendered hold env.  stdout: the two hold flags and a count of the
+# other lines.  The env is the live app's, credentials included, and docker
+# inspect prints a multi-line value (a PEM key) as several lines, so no part
+# of any other line can be shown safely, not even a KEY= prefix.
+summarize_hold_env() {
+  local line hidden=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      CT_SKIP_LITESTREAM=1 | CT_DISABLE_STARTUP_SCHEMA_MIGRATE=1) printf '%s\n' "$line" ;;
+      '') ;;
+      *) hidden=$((hidden + 1)) ;;
+    esac
+  done
+  printf '# %d other env line(s) not shown\n' "$hidden"
+}
+
 if [[ "${1:-}" == "--decide" ]]; then
   decide_overlap_action \
     "${DEPLOY_ACTIVE:-0}" \
@@ -148,13 +204,30 @@ if [[ "${1:-}" == "--decide" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--sleep-for" ]]; then
+  loop_sleep_for "${DEPLOY_ACTIVE:-0}" "${HOLD_RUNNING:-0}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "--parse-active" ]]; then
   parse_deploy_active
   exit $?
 fi
 
+if [[ "${1:-}" == "--render-env" ]]; then
+  render_hold_env | summarize_hold_env
+  exit 0
+fi
+
+# Same render write_hold_env hands docker, into a private file (never stdout).
+if [[ "${1:-}" == "--render-env-file" ]]; then
+  [[ -n "${2:-}" ]] || { echo "usage: $0 --render-env-file DEST" >&2; exit 2; }
+  ( umask 077; render_hold_env > "$2" )
+  exit 0
+fi
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  sed -n '2,40p' "$0"
+  sed -n '2,48p' "$0"
   exit 0
 fi
 
@@ -179,7 +252,7 @@ coolify_deploy_active() {
   command -v python3 >/dev/null 2>&1 || return 1
   local json
   json=$(curl -fsS -m 8 \
-    -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
     -H "Accept: application/json" \
     "${COOLIFY_BASE_URL%/}/api/v1/deployments" 2>/dev/null) || return 1
   printf '%s' "$json" | parse_deploy_active
@@ -218,9 +291,7 @@ write_hold_env() {
   else
     return 1
   fi
-  # Never start a second Litestream replicator against the live B2 target.
-  grep -v '^CT_SKIP_LITESTREAM=' "$dest" > "${dest}.tmp" || true
-  printf 'CT_SKIP_LITESTREAM=1\n' >> "${dest}.tmp"
+  render_hold_env < "$dest" > "${dest}.tmp"
   mv "${dest}.tmp" "$dest"
   if [[ -n "$app" ]]; then
     mkdir -p "$STATE_DIR"
@@ -298,19 +369,28 @@ stop_hold() {
 tick() {
   local app hold_on deploy builder app_on app_ok have_image action
   app="$(find_app_container)"
-  [[ -n "$app" ]] && remember_image "$app"
   hold_on=0
   container_running "$HOLD_NAME" && hold_on=1
   deploy=0
   coolify_deploy_active && deploy=1
+  # Freeze last-image for the whole deploy window: resolve_image prefers it,
+  # and refreshing it after Coolify's container swap would point the hold at
+  # the replacement image, whose boot migrate has not applied its schema yet.
+  [[ -n "$app" && "$deploy" == 0 ]] && remember_image "$app"
   builder=0
   builder_active && builder=1
   app_on=0
   [[ -n "$app" ]] && app_on=1
+  # decide_overlap_action reads app_ok only when no deploy is active and the
+  # hold clone is running (stop-hold vs keep-hold), so probe only then.  Probing
+  # on every idle tick was a docker exec every few seconds whose result was
+  # always discarded.
   app_ok=0
-  if [[ "$app_on" == 1 ]] && probe_health "$app"; then
+  if [[ "$app_on" == 1 && "$deploy" == 0 && "$hold_on" == 1 ]] && probe_health "$app"; then
     app_ok=1
   fi
+  TICK_DEPLOY="$deploy"
+  TICK_HOLD="$hold_on"
   have_image=0
   [[ -s "$STATE_DIR/last-image" || -n "$app" ]] && have_image=1
 
@@ -325,7 +405,12 @@ tick() {
       stop_hold
       ;;
     keep-hold)
-      log "action=keep-hold deploy=${deploy} app=${app:-none} healthy=${app_ok}"
+      # app_ok is probed only with no deploy and the hold up, so say n/a rather than a false 0.
+      if [[ "$deploy" == 1 ]]; then
+        log "action=keep-hold deploy=${deploy} app=${app:-none} healthy=n/a"
+      else
+        log "action=keep-hold deploy=${deploy} app=${app:-none} healthy=${app_ok}"
+      fi
       ;;
     noop)
       ;;
@@ -343,12 +428,17 @@ fi
 
 if [[ "${1:-}" == "--loop" ]]; then
   mkdir -p "$STATE_DIR"
-  log "loop start sleep=${LOOP_SLEEP_SEC}s early=${OVERLAP_EARLY}"
+  log "loop start sleep=${LOOP_SLEEP_SEC}s idle_sleep=${IDLE_SLEEP_SEC}s early=${OVERLAP_EARLY}"
+  TICK_DEPLOY=0
+  TICK_HOLD=0
   while true; do
     tick || log "tick failed"
-    sleep "$LOOP_SLEEP_SEC"
+    # A hold started or a deploy seen by this tick counts as busy.  Re-read the
+    # hold state because start_hold may have just launched it.
+    container_running "$HOLD_NAME" && TICK_HOLD=1
+    sleep "$(loop_sleep_for "$TICK_DEPLOY" "$TICK_HOLD")"
   done
 fi
 
-echo "usage: $0 [--once|--loop|--decide|--help]" >&2
+echo "usage: $0 [--once|--loop|--decide|--parse-active|--render-env|--render-env-file DEST|--help]" >&2
 exit 2

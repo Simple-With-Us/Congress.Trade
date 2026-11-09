@@ -9,6 +9,7 @@ import {
   sentryLoggerWarn,
   type SentrySdkLike,
 } from '../../shared/sentryRuntime.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from '../../shared/sentryDataCollection.ts';
 import { SENTRY_FILTERED_VALUE, scrubSentryEvent } from '../../shared/sentryScrub.ts';
 
 function fakeSdk(overrides: Partial<SentrySdkLike> = {}): SentrySdkLike & {
@@ -48,6 +49,9 @@ describe('production Sentry init', () => {
     expect(options.environment).toBe('production');
     expect(options.tracesSampleRate).toBe(0.2);
     expect(options.sendDefaultPii).toBe(false);
+    expect(options.dataCollection).toEqual(NOT_LINKED_SENTRY_DATA_COLLECTION);
+    expect(typeof options.beforeSendSpan).toBe('function');
+    expect(typeof options.beforeSendMetric).toBe('function');
     expect(options.enableLogs).toBe(true);
     expect(options._flushInterval).toBe(1000);
     expect(typeof options.beforeSend).toBe('function');

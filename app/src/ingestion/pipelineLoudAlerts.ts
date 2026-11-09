@@ -24,14 +24,7 @@ import {
   securitiesRefHasEnrichmentUnavailableColumns,
 } from '../enrichment/service.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
-import {
-  isTailOnlyPeerPriceBacklog,
-  readCorpusLatestPriceDate,
-  stPeerPriceNeverPricedPendingFromSql,
-  stPeerPricePendingBindParams,
-  stPeerPricePendingBindsForSubqueries,
-  stPeerPricePendingFromSql,
-} from '../prices/peerPricePending.ts';
+import { evaluateStPeerPricesStall } from '../prices/stPeerPricesHealth.ts';
 import {
   evaluateFreshness,
   FRESHNESS_LATEST_SQL,
@@ -41,12 +34,32 @@ import {
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
-import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { checkPipelineHealth, collectEmptyFetchHandoffCheck } from '../shared/pipelineHealth.ts';
+import {
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  SENATE_EDGE_BACKOFF_GRACE_MS,
+} from './senateEdgeDeny.ts';
+import {
+  FMP_LATENCY_SILENCE_PENDING_KV_KEY,
+  type FmpLatencyCheckValue,
+  type FmpLatencySilencePending,
+} from '../shared/fmpLatencyProbeHealth.ts';
+
+import {
+  DEFAULT_PIPELINE_STALL_HOURS,
+  DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS,
+  readPipelineStallHours,
+  stallWindowMs,
+} from './pipelineStallConfig.ts';
+
+export {
+  DEFAULT_PIPELINE_STALL_HOURS,
+  DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS,
+  readPipelineStallHours,
+} from './pipelineStallConfig.ts';
 
 export const PIPELINE_LOUD_ALERT_KV_PREFIX = 'pipeline-loud-alert:';
-export const DEFAULT_PIPELINE_STALL_HOURS = 6;
-/** Default stall window for ST peer enrichment backlog (daily + hourly drain). */
-export const DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS = 30;
 /** Re-alert the same doc+stage after this window if it fails terminally again. */
 export const TERMINAL_REDUP_WINDOW_MS = 7 * 24 * 3_600_000;
 
@@ -59,6 +72,13 @@ export type PipelineStallCondition =
   | 'st_peer_prices'
   | 'st_inbound_market_data'
   | 'st_outbound_share_push'
+  /**
+   * Filing outside IngestStatus, or a completed fetch hand-off with no raw
+   * object. Same id as the `/api/health` check. Listed in
+   * HEALTH_STALL_SKIP_IDS so the generic health loop does not open a second
+   * `health_empty_fetch_handoff` episode.
+   */
+  | 'empty_fetch_handoff'
   /** `/api/health` check ids (ingest outbox, extract, delivery, probes, …). */
   | `health_${string}`;
 
@@ -67,6 +87,14 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   'polling_house',
   'polling_senate',
   'polling_executive',
+  // Evaluated by the dedicated st_peer_prices condition above (same rules via
+  // evaluateStPeerPricesStall).  Without this skip the generic loop raises a
+  // second health_st_peer_prices episode, so every stall and recovery pages twice.
+  'st_peer_prices',
+  // Same id as the dedicated empty_fetch_handoff condition and the health check.
+  'empty_fetch_handoff',
+  // CT-2335: fmp_latency uses a dedicated silence confirm + self-healing grace path.
+  'fmp_latency',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -81,36 +109,6 @@ interface DedupeEpisode {
 
 interface StallEpisode extends DedupeEpisode {
   active: boolean;
-}
-
-function envGet(key: string): string | undefined {
-  try {
-    return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(key);
-  } catch {
-    return undefined;
-  }
-}
-
-function stallEnvKeyForCondition(condition: string): string {
-  return `CT_PIPELINE_STALL_HOURS_${condition.replace(/[^a-z0-9]+/gi, '_').toUpperCase()}`;
-}
-
-export function readPipelineStallHours(env: Env, condition?: string): number {
-  if (condition) {
-    const specific = Number.parseInt(envGet(stallEnvKeyForCondition(condition)) ?? '', 10);
-    if (Number.isFinite(specific) && specific >= 1) return Math.min(specific, 168);
-  }
-  const fromEnv = envGet('CT_PIPELINE_STALL_HOURS');
-  const n = Number.parseInt(fromEnv ?? '', 10);
-  if (Number.isFinite(n) && n >= 1) return Math.min(n, 168);
-  const legacy = Number.parseInt(envGet('CT_OCR_STALL_HOURS') ?? '', 10);
-  if (Number.isFinite(legacy) && legacy >= 1) return Math.min(legacy, 168);
-  if (condition === 'st_peer_enrichment') return DEFAULT_ST_PEER_ENRICHMENT_STALL_HOURS;
-  return DEFAULT_PIPELINE_STALL_HOURS;
-}
-
-function stallWindowMs(hours: number): number {
-  return hours * 3_600_000;
 }
 
 async function readEpisode(env: Env, kvKey: string): Promise<DedupeEpisode | null> {
@@ -392,13 +390,6 @@ function idleBeyondThreshold(lastAt: string | null, now: Date, thresholdMs: numb
   return !Number.isFinite(lastMs) || now.getTime() - lastMs >= thresholdMs;
 }
 
-/** Pending-set progress: ignore tickers that have never been price-checked. */
-function pendingPriceProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
-  const lastMs = lastAt ? Date.parse(lastAt) : NaN;
-  if (!Number.isFinite(lastMs)) return false;
-  return now.getTime() - lastMs >= thresholdMs;
-}
-
 /** Pending-set enrichment progress: ignore tickers never attempted on the backlog. */
 function pendingEnrichmentProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
@@ -410,6 +401,23 @@ function hoursLabel(lastAt: string | null, now: Date): string {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
   if (!Number.isFinite(lastMs)) return 'never';
   return ((now.getTime() - lastMs) / 3_600_000).toFixed(1);
+}
+
+/**
+ * Page when a filing is sitting outside the statuses the other detectors
+ * watch: no raw object, no live transactions, and either an ingest_status
+ * the type union does not allow or a completed outbox that stored nothing.
+ * `ocr_scan_reader` requires a raw object, so this class never reached it.
+ */
+export async function evaluateEmptyFetchHandoff(env: Env, now = new Date()): Promise<StallEval> {
+  const collected = await collectEmptyFetchHandoffCheck(env, now);
+  const uncollected = collected.check.value == null;
+  return {
+    stalled: collected.check.status === 'critical',
+    detail: collected.check.detail,
+    wakeDocId: collected.wakeDocId,
+    skip: uncollected,
+  };
 }
 
 async function evaluateOcrStall(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
@@ -515,67 +523,7 @@ async function evaluateStPeerEnrichment(env: Env, now: Date, thresholdMs: number
 }
 
 async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
-  if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
-    return { stalled: false, detail: 'ST peer prices not configured', skip: true };
-  }
-  const pendingParams = stPeerPricePendingBindParams(now);
-  const pendingFrom = stPeerPricePendingFromSql();
-  const neverPricedFrom = stPeerPriceNeverPricedPendingFromSql();
-  const countAndProgressBinds = stPeerPricePendingBindsForSubqueries(pendingParams, 3);
-  let pending = 0;
-  let neverPricedPending = 0;
-  let lastChecked: string | null = null;
-  let pendingSample: string[] = [];
-  try {
-    const row = await get<{ n: number; never_n: number; last_at: string | null }>(
-      env.DB,
-      `SELECT
-         (SELECT COUNT(DISTINCT t.ticker) ${pendingFrom}) AS n,
-         (SELECT COUNT(DISTINCT t.ticker) ${neverPricedFrom}) AS never_n,
-         (SELECT MAX(sr.price_checked_at) ${pendingFrom}) AS last_at`,
-      countAndProgressBinds,
-    );
-    pending = Number(row?.n ?? 0);
-    neverPricedPending = Number(row?.never_n ?? 0);
-    lastChecked = row?.last_at ?? null;
-  } catch {
-    return { stalled: false, detail: 'price stall query failed', skip: true };
-  }
-  if (pending <= 0) {
-    return { stalled: false, detail: 'ST price refresh moving' };
-  }
-  const corpusLatest = await readCorpusLatestPriceDate(env);
-  if (isTailOnlyPeerPriceBacklog(pending, neverPricedPending, corpusLatest, now)) {
-    return {
-      stalled: false,
-      detail:
-        `ST price tail backlog only (${pending} pending); corpus EOD current through ${pendingParams.freshThrough}`,
-    };
-  }
-  if (!pendingPriceProgressIdle(lastChecked, now, thresholdMs)) {
-    return { stalled: false, detail: 'ST price refresh moving' };
-  }
-  try {
-    const names = await all<{ ticker: string }>(
-      env.DB,
-      `SELECT DISTINCT t.ticker AS ticker ${pendingFrom}
-       ORDER BY t.ticker ASC
-       LIMIT 10`,
-      stPeerPricePendingBindsForSubqueries(pendingParams, 1),
-    );
-    pendingSample = names.map((r) => r.ticker);
-  } catch {
-    /* sample is optional detail */
-  }
-  const stallHours = readPipelineStallHours(env, 'st_peer_prices');
-  const sampleSuffix = pendingSample.length
-    ? `; pending sample: ${pendingSample.join(', ')}`
-    : '';
-  const detail =
-    `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
-    sampleSuffix +
-    `; no price_checked_at progress on pending tickers in ${hoursLabel(lastChecked, now)}h (threshold ${stallHours}h)`;
-  return { stalled: true, detail };
+  return evaluateStPeerPricesStall(env, now, thresholdMs);
 }
 
 async function loadFreshnessSnapshot(env: Env): Promise<FreshnessSnapshot | null> {
@@ -711,6 +659,89 @@ async function processStallCondition(
   result.alerted.push(condition);
 }
 
+/** Two hourly sweeps plus slack; older pending marks restart the confirm window. */
+const FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS = 150 * 60 * 1000;
+
+async function processFmpLatencySilenceAlert(
+  env: Env,
+  check: { status: string; detail: string; value?: unknown },
+  now: Date,
+  result: PipelineStallAlertResult,
+  deps: { fetchImpl?: typeof fetch },
+): Promise<void> {
+  const condition = 'health_fmp_latency' satisfies PipelineStallCondition;
+  const pendingKey = FMP_LATENCY_SILENCE_PENDING_KV_KEY;
+
+  // Missing telemetry is neither silence nor recovery: keep the confirm
+  // window (and any active stall) as-is until a real reading arrives.
+  if (check.status === 'unknown') {
+    result.evaluated.push(condition);
+    return;
+  }
+
+  if (check.status !== 'critical') {
+    try {
+      await env.CONFIG_KV.delete(pendingKey);
+    } catch {
+      /* fail-soft */
+    }
+    await processStallCondition(
+      env,
+      condition,
+      { stalled: false, detail: check.detail || `${condition} cleared` },
+      now,
+      result,
+      deps,
+    );
+    return;
+  }
+
+  let pending: FmpLatencySilencePending | null = null;
+  try {
+    pending = await env.CONFIG_KV.get<FmpLatencySilencePending>(pendingKey, 'json');
+  } catch {
+    pending = null;
+  }
+  // A pending mark older than two sweeps is stale (sweeps were skipped or the
+  // check cleared without a sweep seeing it); start the confirm window over.
+  const staleAnchor = pending?.lastSeenAt ?? pending?.firstSeenAt;
+  const pendingAgeMs = pending && staleAnchor ? now.getTime() - Date.parse(staleAnchor) : Number.NaN;
+  if (!pending || !Number.isFinite(pendingAgeMs) || pendingAgeMs > FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS) {
+    const mark: FmpLatencySilencePending = { firstSeenAt: now.toISOString(), lastSeenAt: now.toISOString() };
+    try {
+      await env.CONFIG_KV.put(pendingKey, JSON.stringify(mark));
+    } catch {
+      /* fail-soft */
+    }
+    result.evaluated.push(condition);
+    return;
+  }
+
+  const value = check.value as FmpLatencyCheckValue | null | undefined;
+  const detail = value?.selfHealingSilence
+    ? `[health/critical past self-healing grace] ${check.detail}`
+    : `[health/critical confirmed x2 hourly sweeps since ${pending.firstSeenAt}] ${check.detail}`;
+  await processStallCondition(
+    env,
+    condition,
+    { stalled: true, detail },
+    now,
+    result,
+    deps,
+  );
+  try {
+    await env.CONFIG_KV.put(
+      pendingKey,
+      JSON.stringify({
+        firstSeenAt: pending.firstSeenAt,
+        lastSeenAt: now.toISOString(),
+      } satisfies FmpLatencySilencePending),
+    );
+  } catch {
+    /* fail-soft */
+  }
+}
+
 /**
  * Stall detector: ingest chambers, OCR/scan-reader, and Socratic.Trade sharing.
  * Runs on the hourly autonomy sweep (deduped per condition per window).
@@ -728,9 +759,17 @@ export async function sweepPipelineStallAlerts(
     { condition: 'executive_fetch_success', source: 'executive' },
   ];
 
+  // Senate is deferred until the health loop below: when the eFD edge deny
+  // (CT-2442) is what stalls health_senate_efd, that alert is the single
+  // surviving page and carries the fetch-success fact (see health loop).
+  let senateFetchEval: StallEval | null = null;
   for (const { condition, source } of chamberChecks) {
     const thresholdMs = stallWindowMs(readPipelineStallHours(env, condition));
     const evalResult = await evaluateChamberFetchStall(env, source, now, thresholdMs);
+    if (condition === 'senate_fetch_success') {
+      senateFetchEval = evalResult;
+      continue;
+    }
     await processStallCondition(env, condition, evalResult, now, result, deps);
   }
 
@@ -739,6 +778,21 @@ export async function sweepPipelineStallAlerts(
     env,
     'ocr_scan_reader',
     await evaluateOcrStall(env, now, ocrThresholdMs),
+    now,
+    result,
+    deps,
+  );
+
+  const emptyFetch = await collectEmptyFetchHandoffCheck(env, now);
+  await processStallCondition(
+    env,
+    'empty_fetch_handoff',
+    {
+      stalled: emptyFetch.check.status === 'critical',
+      detail: emptyFetch.check.detail,
+      wakeDocId: emptyFetch.wakeDocId,
+      skip: emptyFetch.check.value == null,
+    },
     now,
     result,
     deps,
@@ -786,12 +840,13 @@ export async function sweepPipelineStallAlerts(
   );
 
   const HEALTH_STALL_BUDGET_MS = 20_000;
+  let senateFetchFolded = false;
   try {
     let healthTimeoutId: ReturnType<typeof setTimeout> | undefined;
     const health = await (async () => {
       try {
         return await Promise.race([
-          checkPipelineHealth(env, now),
+          checkPipelineHealth(env, now, { emptyFetch }),
           new Promise<never>((_, reject) => {
             healthTimeoutId = setTimeout(
               () => reject(new Error(`checkPipelineHealth exceeded ${HEALTH_STALL_BUDGET_MS}ms`)),
@@ -803,17 +858,41 @@ export async function sweepPipelineStallAlerts(
         if (healthTimeoutId !== undefined) clearTimeout(healthTimeoutId);
       }
     })();
+    // One alert per root cause: an active Senate edge-deny backoff stalls
+    // health_senate_efd (critical in pipelineHealth) and starves Senate
+    // fetches, so the senate_fetch_success stall is the same incident.  Fold
+    // its detail into the surviving health_senate_efd alert instead of
+    // paging twice.  Only stalled/critical health pages here, so a degraded
+    // senate_efd never silences a fetch stall with no surviving alert.
+    const senateEfdCheck = health.checks.find((c) => c.id === 'senate_efd');
+    const senateEfdStalled = senateEfdCheck?.status === 'stalled' || senateEfdCheck?.status === 'critical';
+    if (senateEfdStalled && senateFetchEval?.stalled && !senateFetchEval.skip) {
+      const backoff = await readSenateEdgeBackoff(env);
+      senateFetchFolded = backoff !== null
+        && isSenateEdgeBackoffActive(backoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
+    }
+    if (senateFetchFolded && senateFetchEval) {
+      // No separate page while folded: health_senate_efd speaks for both.
+      // Record the evaluation, but leave any existing senate_fetch_success
+      // episode untouched, so its recovery webhook still fires once Senate
+      // fetches succeed again, and a fetch stall that outlives the deny keeps
+      // its own dedup window.
+      result.evaluated.push('senate_fetch_success');
+    }
     for (const check of health.checks) {
       if (HEALTH_STALL_SKIP_IDS.has(check.id)) continue;
       const stalled = check.status === 'stalled' || check.status === 'critical';
       const condition = `health_${check.id}` satisfies PipelineStallCondition;
+      const folded = senateFetchFolded && stalled && check.id === 'senate_efd' && senateFetchEval
+        ? `; folded senate_fetch_success: ${senateFetchEval.detail}`
+        : '';
       await processStallCondition(
         env,
         condition,
         {
           stalled,
           detail: stalled
-            ? `[health/${check.status}] ${check.detail}`
+            ? `[health/${check.status}] ${check.detail}${folded}`
             : (check.detail || `${check.id} ok`),
         },
         now,
@@ -821,8 +900,16 @@ export async function sweepPipelineStallAlerts(
         deps,
       );
     }
+    const fmpCheck = health.checks.find((c) => c.id === 'fmp_latency');
+    if (fmpCheck) {
+      await processFmpLatencySilenceAlert(env, fmpCheck, now, result, deps);
+    }
   } catch {
     /* health collection must not break the stall sweep */
+  }
+
+  if (!senateFetchFolded && senateFetchEval) {
+    await processStallCondition(env, 'senate_fetch_success', senateFetchEval, now, result, deps);
   }
 
   return result;

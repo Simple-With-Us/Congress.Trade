@@ -8,22 +8,11 @@
  * before relying on them. Update EFFECTIVE_DATE when the text changes.
  */
 
+import { NOT_AFFILIATED_SENTENCE, SITE_FOOTER_DISCLAIMER } from './disclaimers.ts';
+
 const EFFECTIVE_DATE = 'October 9, 2026';
 const ENTITY = 'Jay Wedgeworth, LLC d/b/a Congress.Trade';
 const CONTACT = 'support@congress.trade';
-
-/**
- * LEGALCOMPLIANCE-04: a product named "Congress.Trade" that carries a
- * bald-eagle mark needs an explicit, unmissable non-affiliation statement —
- * shown in the site footer, the legal-page footer, and ToS §1.  Keep this
- * string identical everywhere it appears so the disclaimer cannot drift.
- */
-const NOT_AFFILIATED_SENTENCE =
-  'Congress.Trade is an independent, privately operated service and is not affiliated with, endorsed by, or sponsored by the U.S. Congress, the U.S. House of Representatives, the U.S. Senate, the Office of Government Ethics, or any government agency.';
-
-/** Site-footer combined line (owner 2026-08-20).  Two spaces around each · and no trailing period. */
-const SITE_FOOTER_DISCLAIMER =
-  'Congress.Trade  ·  educational tool for public STOCK Act (2012) disclosures  ·  not financial advice  ·  $ estimated from brackets  ·  independent/private service not affiliated with or endorsed/sponsored by any government agency';
 
 /**
  * Shared legal chrome for /terms-of-service and /privacy-policy.
@@ -31,12 +20,13 @@ const SITE_FOOTER_DISCLAIMER =
  * Dark tokens are the Privacy Policy reference (navy, 26px title, dim
  * "Effective …" subtitle, numbered h2s, system sans).  Light tokens and
  * the Light / Dark / System control are the same path the dashboard uses
- * (`ui-theme` in localStorage, default light).  Do not give one page a
- * second shell.
+ * (`ui-theme` in localStorage, default system — follows prefers-color-scheme
+ * for new visitors; the segmented control in the header is an explicit
+ * override).  Do not give one page a second shell.
  */
 const LEGAL_THEME_BOOT = /* html */ `<script>
   (function () {
-    var pref = 'light';
+    var pref = 'system';
     try {
       var s = localStorage.getItem('ui-theme');
       if (s === 'sepia') {
@@ -91,7 +81,7 @@ const LEGAL_THEME_RUNTIME = /* html */ `<script>
       }
       if (s === 'light' || s === 'dark' || s === 'system') return s;
     } catch (e) {}
-    return 'light';
+    return 'system';
   }
   function resolveTheme(pref) {
     if (pref === 'dark' || pref === 'light') return pref;
@@ -150,6 +140,7 @@ function shell(title: string, body: string): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#eff3f8" />
+<meta name="description" content="${title} for Congress.Trade — STOCK Act disclosure tracking for the House, Senate, and Executive Branch." />
 <title>${title} · Congress.Trade</title>
 ${LEGAL_THEME_BOOT}
 <style>
@@ -160,7 +151,7 @@ ${LEGAL_THEME_BOOT}
   html[data-theme="dark"] { color-scheme: dark; }
   html[data-theme="light"] {
     color-scheme: light;
-    --bg:#eff3f8;--bg2:#e4ebf4;--panel:#ffffff;--border:#c1cde2;--text:#09101c;--dim:#34435b;--body:#34435b;--accent:#2563eb;--warn:#b45309;
+    --bg:#eff3f8;--bg2:#e4ebf4;--panel:#ffffff;--border:#c1cde2;--text:#09101c;--dim:#34435b;--body:#34435b;--accent:#2563eb;--warn:#9a3412;
   }
   *{box-sizing:border-box}
   body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,var(--bg2),var(--bg));color:var(--text);
@@ -169,7 +160,8 @@ ${LEGAL_THEME_BOOT}
          background:rgba(10,16,30,.6);position:sticky;top:0;backdrop-filter:blur(8px)}
   html[data-theme="light"] header{background:#fff;-webkit-backdrop-filter:none;backdrop-filter:none}
   .brand{font-weight:700;font-size:16px;font-family:var(--sans)}.brand .dot{color:var(--accent)}
-  a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+  a{color:var(--accent);text-decoration:underline}
+  a:focus-visible,.theme-seg-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
   main{max-width:820px;margin:0 auto;padding:32px 35px 64px}
   h1{font-size:26px;font-weight:700;margin:0 0 4px;font-family:var(--sans)}
   .eff{color:var(--dim);font-size:13px;margin:0 0 28px;font-family:var(--sans)}

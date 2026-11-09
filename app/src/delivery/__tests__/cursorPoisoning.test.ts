@@ -65,6 +65,20 @@ async function createInMemoryD1(): Promise<D1Database> {
       db.exec(sql);
       return Promise.resolve({ count: 1, duration: 0 });
     },
+    // POST /migrate on a fresh DB runs the guarded 0091 apple_subscriptions
+    // rebuild, which refuses to run without one write transaction.
+    async batch(statements: Array<{ run(): Promise<D1Result> }>) {
+      db.exec('BEGIN');
+      try {
+        const results: D1Result[] = [];
+        for (const statement of statements) results.push(await statement.run());
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
   } as unknown as D1Database;
 }
 

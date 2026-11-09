@@ -28,10 +28,15 @@ function makeEnv(
       return null as T | null;
     },
     async all<T>() {
-      if (/SELECT doc_id, raw_object_key FROM filings/i.test(sql)) {
+      if (/SELECT doc_id, raw_object_key FROM/i.test(sql)) {
         selectSql.push(sql);
         selectCalls += 1;
         return { results: (selectCalls === 1 ? batchRows : []) as T[], meta: {} };
+      }
+      // CT-2459: the sweep resolves the batch's tx ids once, then deletes
+      // delivery rows by tx_id inside one atomic batch.
+      if (/SELECT id FROM transactions WHERE doc_id IN/i.test(sql)) {
+        return { results: (selectCalls >= 1 ? [{ id: 'tx-1' }] : []) as T[], meta: {} };
       }
       return { results: [] as T[], meta: {} };
     },
@@ -56,7 +61,10 @@ describe('runFilingRetentionSweep', () => {
     const { env, selectSql } = makeEnv([{ doc_id: 'H-1', raw_object_key: null }]);
     const deleted = await runFilingRetentionSweep(env, new Date('2026-07-28T00:00:00Z'));
     expect(deleted).toBe(1);
-    expect(selectSql[0]).toContain('COALESCE(filed_date, substr(first_seen_at, 1, 10)) < ?');
+    // CT-2459: two indexed branches replace the COALESCE predicate; the
+    // NULL-filed_date branch keeps the first_seen_at fallback.
+    expect(selectSql[0]).toContain('filed_date IS NULL AND substr(first_seen_at, 1, 10) < ?');
+    expect(selectSql[0]).toContain('filed_date IS NOT NULL AND filed_date < ?');
   });
 
   it('deletes deliveries and delivery_outbox rows for the batch before the transactions', async () => {
@@ -71,9 +79,10 @@ describe('runFilingRetentionSweep', () => {
     expect(txIdx).toBeGreaterThan(deliveriesIdx);
     expect(txIdx).toBeGreaterThan(outboxIdx);
     expect(filingsIdx).toBeGreaterThan(txIdx);
-    // Delivery deletes key off the batch's doc_ids via the transactions subquery.
-    expect(ranSql[deliveriesIdx]).toContain('SELECT id FROM transactions WHERE doc_id IN');
-    expect(ranSql[outboxIdx]).toContain('SELECT id FROM transactions WHERE doc_id IN');
+    // CT-2459: delivery deletes key off tx ids resolved once from the
+    // batch's doc_ids (same rows, no per-delete subquery re-scan).
+    expect(ranSql[deliveriesIdx]).toContain('DELETE FROM deliveries WHERE tx_id IN');
+    expect(ranSql[outboxIdx]).toContain('DELETE FROM delivery_outbox WHERE tx_id IN');
   });
 
   it('is a no-op when nothing is expired', async () => {

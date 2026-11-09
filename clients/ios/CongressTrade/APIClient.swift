@@ -138,11 +138,46 @@ final class CongressTradeAPIClient {
     private let interceptor: RequestInterceptor
     private let decoder: JSONDecoder
 
+    /// Dedicated production session with a sized URLCache so idempotent GETs
+    /// can honor server `Cache-Control`/`ETag` (Batch 4 lands those headers
+    /// server-side; without them responses simply are not stored and every
+    /// request still goes to the network — no behavior change today).
+    /// Tests keep injecting their own MockURLProtocol session.
+    static func makeDefaultSession() -> URLSession {
+        let configuration = URLSessionConfiguration.default
+        configuration.requestCachePolicy = .useProtocolCachePolicy
+        configuration.urlCache = URLCache(
+            memoryCapacity: 10 * 1024 * 1024,
+            diskCapacity: 50 * 1024 * 1024,
+            diskPath: "trade.congress.api-cache"
+        )
+        return URLSession(configuration: configuration)
+    }
+
+    /// Cache policy per request. Only allowlisted idempotent public GETs may
+    /// use the protocol cache; everything account-scoped (`/me` via
+    /// bootstrap, preferences, subscriptions, commands), premium-gated
+    /// (documents), admin, auth, and every mutation bypasses the cache.
+    /// Fail-closed: an unrecognized path is never cached.
+    static func cachePolicy(for url: URL, method: String = "GET") -> URLRequest.CachePolicy {
+        guard method.uppercased() == "GET" else { return .reloadIgnoringLocalCacheData }
+        let path = url.path
+        let cacheable = path.hasSuffix("/feed")
+            || path.contains("/member/")
+            || path.contains("/ticker/")
+            || path.contains("/trade/")
+            || path == "/api/members"
+            || path == "/api/assets"
+            || path.hasPrefix("/api/analytics/")
+            || path.hasPrefix("/api/logos/")
+        return cacheable ? .useProtocolCachePolicy : .reloadIgnoringLocalCacheData
+    }
+
     init(
         baseURL: URL = CongressTradeAPIClient.defaultBaseURL,
         tokenStore: SessionTokenStore = KeychainTokenStore(),
         deviceEntitlementStore: SessionTokenStore = KeychainTokenStore(service: "trade.congress.appleDeviceEntitlement"),
-        session: URLSession = .shared,
+        session: URLSession = CongressTradeAPIClient.makeDefaultSession(),
         interceptor: RequestInterceptor? = nil
     ) {
         self.baseURL = baseURL
@@ -921,6 +956,7 @@ final class CongressTradeAPIClient {
     private func postCommand<T: Decodable>(idempotencyKey: String, body: [String: Any]) async throws -> ClientCommandResponse<T> {
         var request = try makeRequest(endpointURL("commands"))
         request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(idempotencyKey, forHTTPHeaderField: "idempotency-key")
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -986,7 +1022,7 @@ final class CongressTradeAPIClient {
 
     private func makeRequest(_ url: URL) throws -> URLRequest {
         var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.cachePolicy = Self.cachePolicy(for: url)
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "accept")
         // congress.trade sits behind a Cloudflare managed challenge that 502s
@@ -1004,6 +1040,7 @@ final class CongressTradeAPIClient {
     private func makeAdminRequest(_ url: URL, method: String = "GET", body: [String: Any]? = nil) throws -> URLRequest {
         var request = try makeRequest(url)
         request.httpMethod = method
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "content-type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -1051,6 +1088,13 @@ final class CongressTradeAPIClient {
     }
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        // Belt-and-braces: a mutation must never be served from (or stored
+        // in) the URL cache, whatever policy makeRequest picked while the
+        // request still looked like a GET.
+        var request = request
+        if (request.httpMethod ?? "GET").uppercased() != "GET" {
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+        }
         do {
             return try await session.data(for: request)
         } catch let error as URLError {
