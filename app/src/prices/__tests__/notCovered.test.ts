@@ -98,6 +98,12 @@ let close: () => void;
 const NOW = new Date('2026-10-23T15:00:00.000Z');
 const FRESH_THROUGH = lastTradingDay(NOW);
 const hoursAgoIso = (n: number): string => new Date(NOW.getTime() - n * 3_600_000).toISOString();
+/** Inside the 14-day stall window and inside the 90-day terminal window. */
+function weeksStaleDate(): string {
+  const day = new Date(`${FRESH_THROUGH}T00:00:00Z`);
+  day.setUTCDate(day.getUTCDate() - 21);
+  return day.toISOString().slice(0, 10);
+}
 
 beforeEach(async () => {
   vi.useFakeTimers();
@@ -226,12 +232,13 @@ describe('rule (a): repeat miss terminates at stage 4', () => {
 
   it('stage 3 + stalled -> 4 with a st_not_covered reason', async () => {
     seedTrade('t-a2', 'STALLED', '2019-01-05');
+    const stale = weeksStaleDate();
     seedSr('STALLED', {
       priceUnavailable: 3,
       priceCheckedAt: '2000-01-01T00:00:00Z',
-      latestPriceDate: '2020-01-15',
+      latestPriceDate: stale,
     });
-    h.responses.set('STALLED', [{ date: '2020-01-15', close: 50 }]);
+    h.responses.set('STALLED', [{ date: stale, close: 50 }]);
 
     await runPriceRefresh(env, { max: 10 });
 
@@ -239,7 +246,7 @@ describe('rule (a): repeat miss terminates at stage 4', () => {
     expect(row?.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
     expect(row?.price_unavailable_reason).toMatch(/^st_not_covered since \d{4}-\d{2}-\d{2}: /);
     expect(row?.price_unavailable_reason).toContain('stale listing after repeat re-check');
-    expect(row?.latest_price_date).toBe('2020-01-15');
+    expect(row?.latest_price_date).toBe(stale);
   });
 
   it('stage 0 + empty -> 1 (first miss keeps the existing backoff)', async () => {
@@ -261,8 +268,9 @@ describe('rule (a): repeat miss terminates at stage 4', () => {
 
   it('stage 0 + stalled -> 3 (first stalled result keeps the existing stage)', async () => {
     seedTrade('t-a5', 'GONE', '2019-01-05');
-    seedSr('GONE', { latestPriceDate: '2020-01-15' });
-    h.responses.set('GONE', [{ date: '2020-01-15', close: 50 }]);
+    const stale = weeksStaleDate();
+    seedSr('GONE', { latestPriceDate: stale });
+    h.responses.set('GONE', [{ date: stale, close: 50 }]);
 
     await runPriceRefresh(env, { max: 10 });
 
@@ -599,7 +607,7 @@ describe('ST stale HTTP answers (CT-2443 drain)', () => {
     seedFreshCorpus();
     seedTrade('t-del', 'DELIST');
     seedSr('DELIST', { priceUnavailable: 3, priceCheckedAt: '2000-01-01T00:00:00Z' });
-    h.staleResponses.set('DELIST', [{ date: '2026-06-01', close: 3 }]);
+    h.staleResponses.set('DELIST', [{ date: weeksStaleDate(), close: 3 }]);
 
     await runPriceRefresh(env, { max: 10 });
 

@@ -2637,6 +2637,26 @@ function renderOwnerHealthBanner(pipeline, admin) {
         (sppSample ? ' (' + esc(sppSample) + ')' : '') + '</span>' +
     '</div>');
   }
+  // st_peer_prices — tickers confirmed no longer trading (CT-2466).
+  // Informational only: terminal tickers never page. The count, sample, and
+  // reason stay visible the same way not-covered does.
+  var sppTerminal = (spp && spp.value && Number(spp.value.terminal)) || 0;
+  if (spp && sppTerminal > 0) {
+    var sppTerminalSample = (spp.value && Array.isArray(spp.value.terminalSample))
+      ? spp.value.terminalSample.slice(0, 10).map(function (item) {
+          if (item && typeof item === 'object') {
+            return (item.ticker || '') + (item.reason ? ' ' + item.reason : '');
+          }
+          return String(item);
+        }).filter(Boolean).join(', ')
+      : '';
+    rows.push('<div class="owner-alert-row">' +
+      '<span class="owner-alert-icon">ℹ</span>' +
+      '<span class="owner-alert-title">NO LONGER TRADING</span>' +
+      '<span class="owner-alert-detail" title="' + esc(sppTerminalSample) + '">No longer trading: ' + sppTerminal +
+        (sppTerminalSample ? ' (' + esc(sppTerminalSample) + ')' : '') + '</span>' +
+    '</div>');
+  }
   if (rows.length === 0) {
     banner.innerHTML = '';
     banner.style.display = 'none';

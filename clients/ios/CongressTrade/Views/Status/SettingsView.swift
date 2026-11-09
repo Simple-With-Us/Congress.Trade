@@ -346,6 +346,11 @@ struct AdminPanelView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if let terminal = pipeline?.check(id: "st_peer_prices")?.terminal, terminal > 0 {
+                Text("No longer trading: \(terminal)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
