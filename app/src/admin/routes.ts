@@ -201,7 +201,12 @@ import {
   buildFailedIngestionOutboxIdentity,
   loadFailedIngestionOutboxRows,
 } from '../ingestion/failedOutboxIdentity.ts';
-import { evaluateSenateIntakeHealth, readSenateIntakeStatus, recordSenateIntake } from '../ingestion/senateIntakeStatus.ts';
+import {
+  readSenateFetcherRunStatus,
+  readSenateIntakeStatus,
+  recordSenateFetcherRun,
+  recordSenateIntake,
+} from '../ingestion/senateIntakeStatus.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
@@ -351,7 +356,8 @@ type EnvWithAdmin = Env & {
    */
   ADMIN_MAINTENANCE_TOKEN?: string;
   /**
-   * Scoped bearer token that unlocks ONLY POST /senate-ptr-intake (the
+   * Scoped bearer token that unlocks ONLY POST /senate-ptr-intake and
+   * POST /senate-fetcher-run (the
    * Mac eFD fetcher's filing intake, CT-2442).  Lets that one caller
    * submit official eFD report rows without holding the full
    * ADMIN_TOKEN.  Same pattern as INGEST_TOKEN.  Optional; ignored if
@@ -405,7 +411,7 @@ async function isAuthorizedMaintenance(
 }
 
 
-/** True when the request is a bearer-authenticated call to the Senate PTR intake. */
+/** True when the request is a bearer-authenticated call to the Senate PTR intake or the fetcher run heartbeat. */
 async function isAuthorizedSenateIntake(
   env: EnvWithAdmin,
   path: string,
@@ -414,7 +420,7 @@ async function isAuthorizedSenateIntake(
   const token = (await resolveSecret(env, 'SENATE_INTAKE_TOKEN')).value;
   return (
     !!token &&
-    path.endsWith('/senate-ptr-intake') &&
+    (path.endsWith('/senate-ptr-intake') || path.endsWith('/senate-fetcher-run')) &&
     (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
   );
 }
@@ -2953,6 +2959,18 @@ export const SenatePtrIntakeBodySchema = z.object({
 });
 export type SenatePtrIntakeBody = z.infer<typeof SenatePtrIntakeBodySchema>;
 
+export const SenateFetcherRunBodySchema = z.object({
+  // The fetcher's own run timestamp (ISO); the server stamps receivedAt
+  // itself and falls back to it when this is absent or unparseable.
+  ranAt: z.string().optional(),
+  status: z.enum(['ok', 'blocked', 'error']),
+  rows: z.number().int().min(0).max(100_000),
+  newCount: z.number().int().min(0).max(100_000),
+  role: z.enum(['agents', 'jay']),
+});
+export type SenateFetcherRunBody = z.infer<typeof SenateFetcherRunBodySchema>;
+
+
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   const r = new Hono<{ Bindings: Env }>();
@@ -2963,7 +2981,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // /securities/import only (sibling app pushes shared data), and
   // ADMIN_MAINTENANCE_TOKEN for the idempotent backlog-drain endpoints only
   // (agent/automation sessions never hold the full ADMIN_TOKEN), and
-  // SENATE_INTAKE_TOKEN for /senate-ptr-intake only (the Mac eFD fetcher).
+  // SENATE_INTAKE_TOKEN for /senate-ptr-intake and /senate-fetcher-run only
+  // (the Mac eFD fetcher).
   r.use('*', async (c, next) => {
     const env = c.env as EnvWithAdmin;
     const authorization = c.req.header('Authorization');
@@ -3304,10 +3323,8 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       body.dlqFailed = dlq.items;
       body.dlqFailedAvailable = dlq.available;
     }
-    const intakeNow = new Date();
-    const senateIntake = await readSenateIntakeStatus(c.env, intakeNow);
-    body.senateIntake = senateIntake;
-    body.senateIntakeHealth = evaluateSenateIntakeHealth(senateIntake, intakeNow);
+    body.senateIntake = await readSenateIntakeStatus(c.env);
+    body.senateFetcherRun = await readSenateFetcherRunStatus(c.env);
     // Only surface `truncated` on the legacy unbounded call shape — an
     // explicit limit/cursor caller asked for a bounded page on purpose, that
     // isn't "truncation".
@@ -6810,6 +6827,51 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       console.error('senate-ptr-intake: ingest failed:', (err as Error).message);
       return c.json({ error: 'senate intake failed' }, 500);
     }
+  });
+
+  // --- POST /senate-fetcher-run -------------------------------------------
+  // Run heartbeat from the Mac eFD fetcher (CT-2462).  Every completed run
+  // reports its outcome here — including quiet runs that found nothing new
+  // and so never call /senate-ptr-intake, and runs the Senate blocked.
+  // The delivery-only heartbeat made a healthy fetcher read as "never
+  // reported" in the review queue; this record backs the queue's separate
+  // fetcher-run line.  Auth: full admin, or the scoped SENATE_INTAKE_TOKEN
+  // (the same single caller as the intake).  Records only; ingests nothing.
+  // Body: { ranAt?: string, status: 'ok'|'blocked'|'error', rows: number,
+  //         newCount: number, role: 'agents'|'jay' }
+  r.post('/senate-fetcher-run', async (c) => {
+    let raw = '';
+    try {
+      raw = await c.req.text();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+    // A run report is a few hundred bytes; anything larger is not one.
+    if (raw.length > 10_000) {
+      return c.json({ error: 'request body too large' }, 413);
+    }
+    let json: unknown = {};
+    try {
+      if (raw) json = JSON.parse(raw);
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = SenateFetcherRunBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
+    const receivedAt = new Date();
+    const ranAtMs = body.ranAt ? Date.parse(body.ranAt) : NaN;
+    await recordSenateFetcherRun(c.env, {
+      ranAt: Number.isFinite(ranAtMs) ? new Date(ranAtMs).toISOString() : receivedAt.toISOString(),
+      receivedAt: receivedAt.toISOString(),
+      status: body.status,
+      rows: body.rows,
+      newCount: body.newCount,
+      role: body.role,
+    });
+    return c.json({ ok: true });
   });
 
   // --- POST /queue-requeue-failed -----------------------------------------

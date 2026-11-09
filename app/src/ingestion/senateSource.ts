@@ -657,12 +657,11 @@ export interface FetchSenatePtrFilingsOptions {
   /** Cancels active source I/O when the enclosing watcher tick reaches its deadline. */
   signal?: AbortSignal;
   /**
-   * Run the eFD flow through a real Chromium page (senateBrowserFetch.ts)
-   * instead of plain HTTP.  Opt-in; default off (env SENATE_EFD_BROWSER_FETCH).
-   * The plain-HTTP flow has been edge-denied at the agreement POST since
-   * 2026-10-23 (CT-2442), and the browser is the only automated client class
-   * observed to pass.  Requires the playwright package and a Chromium build
-   * in the deployment image.
+   * EXPERIMENTAL.  Run the eFD flow through a real Chromium page
+   * (senateBrowserFetch.ts) instead of plain HTTP.  Opt-in; default off
+   * (env SENATE_EFD_BROWSER_FETCH).  Server-side Chromium from the Hetzner
+   * box is unverified against Akamai.  The browser path that works is the
+   * Mac efd-fetcher.  Requires playwright and a Chromium build in the image.
    */
   browserFetch?: boolean;
   /**
@@ -679,14 +678,14 @@ export interface FetchSenatePtrFilingsOptions {
    */
   browserHeadless?: boolean;
   /**
+   * EXPERIMENTAL and off by default (env SENATE_EFD_BROWSER_FALLBACK).
    * After HTTP egress fails because the residential proxy never answered, or
    * because the leg that did answer was an Akamai edge deny, try
-   * senateBrowserFetch.  Opt-in; default off (env SENATE_EFD_BROWSER_FALLBACK).
-   * The browser uses the proxy only when that proxy returned the HTTP answer,
-   * and goes direct when the proxy was unreachable.  SENATE_EFD_BROWSER_FETCH
-   * still means "browser is the only transport" and wins when both are set.
-   * Requires playwright and a Chromium build, same as browserFetch.
-   * SENATE_EFD_HIDE_AUTOMATION and SENATE_EFD_BROWSER_HEADLESS apply here too.
+   * senateBrowserFetch.  The browser uses the proxy only when that proxy
+   * returned the HTTP answer, and goes direct when the proxy was unreachable.
+   * Unverified against Akamai from the Hetzner IP.  The Mac efd-fetcher is
+   * the browser path.  SENATE_EFD_BROWSER_FETCH still means "browser is the
+   * only transport" and wins when both are set.
    */
   browserFallback?: boolean;
 }

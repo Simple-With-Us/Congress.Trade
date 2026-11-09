@@ -7,7 +7,7 @@ import {
   DEFAULT_PIPELINE_THRESHOLDS,
 } from '../pipelineHealth.ts';
 import { DEFAULT_PROBE_SCHEDULE_CONFIG } from '../../ingestion/probeSchedule.ts';
-import { evaluateSenateIntakeHealth } from '../../ingestion/senateIntakeStatus.ts';
+import { evaluateSenateFetcherHealth } from '../../ingestion/senateIntakeStatus.ts';
 
 describe('evaluatePipelineSignals', () => {
   const nowMs = 1754092800000; // Fixed clock for testing
@@ -822,32 +822,51 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).toContain('via browser-direct');
   });
 
-  it('omits the senate intake check when the signal was not collected', () => {
-    expect(evaluatePipelineSignals(base, nowMs).checks.find((c) => c.id === 'senate_intake')).toBeUndefined();
+  it('omits the senate fetcher check when the signal was not collected', () => {
+    expect(evaluatePipelineSignals(base, nowMs).checks.find((c) => c.id === 'senate_fetcher')).toBeUndefined();
   });
 
-  it('warns on /api/health when the intake relay has never heartbeated inside the window', () => {
+  it('warns on /api/health when the fetcher has not reported a run inside the window', () => {
     const at = new Date('2026-11-09T18:00:00.000Z');
     const res = evaluatePipelineSignals({
       ...base,
-      senateIntake: evaluateSenateIntakeHealth(null, at),
+      senateFetcher: evaluateSenateFetcherHealth(null, at),
     }, at.getTime());
-    const check = res.checks.find((c) => c.id === 'senate_intake')!;
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
     expect(check.status).toBe('degraded');
-    expect(check.detail).toContain('never heartbeated');
-    expect(check.detail).toContain('6:00 AM to 10:00 PM CT');
+    expect(check.detail).toContain('has not reported a run');
+    expect(check.detail).toContain('senate-fetcher:last-run');
     expect(res.status).not.toBe('ok');
   });
 
-  it('stays quiet overnight when the intake relay has never heartbeated', () => {
+  it('stays quiet overnight when the fetcher has not reported a run', () => {
     const at = new Date('2026-11-09T09:00:00.000Z');
     const res = evaluatePipelineSignals({
       ...base,
-      senateIntake: evaluateSenateIntakeHealth(null, at),
+      senateFetcher: evaluateSenateFetcherHealth(null, at),
     }, at.getTime());
-    const check = res.checks.find((c) => c.id === 'senate_intake')!;
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
     expect(check.status).toBe('ok');
     expect(check.detail).toContain('Quiet outside');
+  });
+
+  it('does not warn on a fresh fetcher run that found no new filings', () => {
+    const at = new Date('2026-11-09T18:00:00.000Z');
+    const health = evaluateSenateFetcherHealth({
+      ranAt: '2026-11-09T17:50:00.000Z',
+      receivedAt: '2026-11-09T17:50:00.000Z',
+      status: 'ok',
+      rows: 4,
+      newCount: 0,
+      role: 'agents',
+      ageMs: 10 * 60_000,
+      stale: false,
+    }, at);
+    const res = evaluatePipelineSignals({ ...base, senateFetcher: health }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('0 new rows');
+    expect(check.detail).toContain('not a missed run');
   });
 
   it('an unset Senate relay URL is degraded, not silent', () => {

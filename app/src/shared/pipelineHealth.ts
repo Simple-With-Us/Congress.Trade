@@ -20,7 +20,7 @@ import { readResidentialProxyProbe, SENATE_EFD_PROXY_PROBE_INTERVAL_MS } from '.
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { readSenateEdgeBackoff, SENATE_EDGE_BACKOFF_GRACE_MS } from '../ingestion/senateEdgeDeny.ts';
-import { evaluateSenateIntakeHealth, readSenateIntakeStatus, type SenateIntakeHealth } from '../ingestion/senateIntakeStatus.ts';
+import { evaluateSenateFetcherHealth, readSenateFetcherRunStatus, type SenateFetcherHealth } from '../ingestion/senateIntakeStatus.ts';
 import { parseSenateEfdTransportNote } from '../ingestion/senateSource.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
@@ -325,10 +325,11 @@ export interface PipelineSignals {
     edgeBackoff?: { until: string; lastDeniedAt: string; reason: string } | null;
   } | null;
   /**
-   * Mac eFD fetcher intake heartbeat (CT-2462 record, CT-2465 health).
+   * Mac eFD fetcher run heartbeat (senate-fetcher:last-run, CT-2462).
    * Absent on fixtures that predate the check.  null = uncollected.
+   * Deliveries (senate-intake:last) are not this signal.
    */
-  senateIntake?: SenateIntakeHealth | null;
+  senateFetcher?: SenateFetcherHealth | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
    * an indexed column — price_eod itself is 1.4M rows).  Absent = the signal builder
@@ -1316,38 +1317,39 @@ export function evaluatePipelineSignals(
     }
   }
 
-  // Mac eFD fetcher intake (CT-2462 heartbeat, CT-2465).  A missing record is
-  // not silent: inside 6:00 AM–10:00 PM CT it is a warning, and overnight the
-  // check says why it is quiet.  degraded, not stalled — the uptime target
-  // stays 200 and the loud sweep does not page a standing never-seen relay.
-  if (s.senateIntake === undefined) {
-    /* fixtures that predate the intake signal omit this check */
-  } else if (s.senateIntake == null) {
-    checks.push({ id: 'senate_intake', status: 'unknown', detail: 'Senate intake relay status uncollected', value: null });
+  // Mac eFD fetcher runs (CT-2462 senate-fetcher:last-run, CT-2465).  A missing
+  // run report is not silent: inside 6:00 AM–10:00 PM CT it is a warning, and
+  // overnight the check says why it is quiet.  A fresh run with zero new rows
+  // is healthy.  degraded, not stalled — the uptime target stays 200 and the
+  // loud sweep does not page a standing never-reported fetcher.
+  if (s.senateFetcher === undefined) {
+    /* fixtures that predate the fetcher-run signal omit this check */
+  } else if (s.senateFetcher == null) {
+    checks.push({ id: 'senate_fetcher', status: 'unknown', detail: 'Senate fetcher run status uncollected', value: null });
   } else {
-    switch (s.senateIntake.level) {
+    switch (s.senateFetcher.level) {
       case 'warning':
         checks.push({
-          id: 'senate_intake',
+          id: 'senate_fetcher',
           status: 'degraded',
-          detail: s.senateIntake.detail,
-          value: s.senateIntake.seen ? 1 : 0,
+          detail: s.senateFetcher.detail,
+          value: s.senateFetcher.seen ? 1 : 0,
         });
         break;
       case 'ok':
         checks.push({
-          id: 'senate_intake',
+          id: 'senate_fetcher',
           status: 'ok',
-          detail: s.senateIntake.detail,
-          value: s.senateIntake.seen ? 1 : 0,
+          detail: s.senateFetcher.detail,
+          value: s.senateFetcher.seen ? 1 : 0,
         });
         break;
       default: {
-        const unrecognized: never = s.senateIntake.level;
+        const unrecognized: never = s.senateFetcher.level;
         checks.push({
-          id: 'senate_intake',
+          id: 'senate_fetcher',
           status: 'unknown',
-          detail: `Senate intake relay status unrecognized (${String(unrecognized)})`,
+          detail: `Senate fetcher run status unrecognized (${String(unrecognized)})`,
           value: null,
         });
       }
@@ -2090,12 +2092,12 @@ export async function checkPipelineHealth(
     senateEfd = null;
   }
 
-  let senateIntake: PipelineSignals['senateIntake'] = null;
+  let senateFetcher: PipelineSignals['senateFetcher'] = null;
   try {
-    const intakeNow = new Date(nowMs);
-    senateIntake = evaluateSenateIntakeHealth(await readSenateIntakeStatus(env, intakeNow), intakeNow);
+    const fetcherNow = new Date(nowMs);
+    senateFetcher = evaluateSenateFetcherHealth(await readSenateFetcherRunStatus(env, fetcherNow), fetcherNow);
   } catch {
-    senateIntake = null;
+    senateFetcher = null;
   }
 
   const signals: PipelineSignals = {
@@ -2127,7 +2129,7 @@ export async function checkPipelineHealth(
     residentialProxyConfigured,
     residentialProxy,
     senateEfd,
-    senateIntake,
+    senateFetcher,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,

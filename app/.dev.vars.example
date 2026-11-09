@@ -207,9 +207,10 @@ ACCESS_TEAM_DOMAIN=""
 SEED_HOUSE_URL=""
 SEED_SENATE_URL=""
 
-# Senate eFD browser transport.  Both flags default off.  Production values
-# live in Infisical and stay unset until Jay turns them on.  The image also
-# needs the playwright package and a Chromium build before either flag works.
+# Senate eFD server Chromium.  EXPERIMENTAL and unverified against Akamai
+# from the Hetzner IP.  Both flags default off.  The browser path that works
+# is the Mac efd-fetcher.  The image also needs playwright and Chromium
+# before either flag can succeed.
 # SENATE_EFD_BROWSER_FALLBACK=true  HTTP first; Chromium after a proxy
 #   timeout/unreachable or an Akamai edge deny.  The browser uses the proxy
 #   when that proxy returned the deny, and goes direct when the proxy never
