@@ -240,6 +240,17 @@ describe('runPriceRefresh — bounded-concurrency fetch stage (CT-2445)', () => 
       }
     }
     expect(pricedInDb).toBe(res.tickersPriced);
+    // The resume point is the last ticker actually finished, never an index
+    // the pool stopped before claiming.
+    let lastPricedSeq: number | null = null;
+    for (const t of tickers) {
+      if (eodCount(t) === 0) continue;
+      const row = db
+        .prepare('SELECT MAX(cursor_seq) AS s FROM transactions WHERE ticker = ?')
+        .get(t) as { s: number };
+      lastPricedSeq = Math.max(lastPricedSeq ?? row.s, row.s);
+    }
+    expect(res.lastCursorSeq).toBe(lastPricedSeq);
   });
 
   it('isolates per-ticker failures: one error and one empty among successes', async () => {
