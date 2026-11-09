@@ -27,7 +27,7 @@
     }
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.1159.0",
+    "@aws-sdk/client-s3": "3.1161.0",
     "@google/genai": "^2.27.0",
     "@libsql/client": "^0.18.0",
     "@sentry/deno": "^11.4.0",
@@ -36,7 +36,7 @@
     "jsonrepair": "^3.15.0",
     "node-html-parser": "^9.0.4",
     "pdf-lib": "^1.17.1",
-    "unpdf": "^1.8.1",
+    "unpdf": "^2.0.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {

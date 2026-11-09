@@ -73,8 +73,9 @@ import {
 const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
 /**
  * Price catch-up state (CT-2445), a JSON PeerPriceCatchUpState keyed to the
- * freshThrough session rather than the UTC day.  Replaces the once-per-UTC-day
- * `jobs:daily:lastok:market-data-price-catchup` stamp.
+ * freshThrough session rather than the UTC day;  the budgets inside it roll
+ * on the ET day (see PeerPriceCatchUpState.budgetDay).  Replaces the
+ * once-per-UTC-day `jobs:daily:lastok:market-data-price-catchup` stamp.
  */
 const PRICE_CATCHUP_STATE_KEY = 'jobs:market-data:price-catchup-state';
 /** Survives a long weekend plus a holiday;  a stale session resets anyway. */
@@ -490,7 +491,7 @@ export async function maybeRunPeerPriceCatchUp(
   const freshThrough = lastTradingDay(now);
   let state: PeerPriceCatchUpState;
   try {
-    state = parsePeerPriceCatchUpState(await env.CONFIG_KV.get(PRICE_CATCHUP_STATE_KEY), freshThrough);
+    state = parsePeerPriceCatchUpState(await env.CONFIG_KV.get(PRICE_CATCHUP_STATE_KEY), freshThrough, now);
   } catch {
     return 'stamped'; // no KV → skip rather than risk an unbounded hourly walk
   }
@@ -633,7 +634,8 @@ export async function maybeRunDailyMarketDataJobs(
     // The 2026-10-14/15 price refresh threw on a missing column and the
     // catch below still stamped the day, so the corpus sat one session
     // behind until the next UTC date.  The catch-up retries that, bounded per
-    // freshThrough session (CT-2445):  see maybeRunPeerPriceCatchUp.
+    // ET day within the freshThrough session (CT-2445):  see
+    // maybeRunPeerPriceCatchUp.
     return await maybeRunPeerPriceCatchUp(env, now, { signal: opts.signal });
   }
 

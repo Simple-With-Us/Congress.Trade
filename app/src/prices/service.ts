@@ -400,6 +400,14 @@ function easternYmd(from: Date): { y: number; m: number; d: number } {
   return { y: pick('year'), m: pick('month'), d: pick('day') };
 }
 
+/** The calendar date (YYYY-MM-DD) in US Eastern time containing `from`.  Unlike
+ *  lastTradingDay this is the ET day itself, weekends included — the key the
+ *  peer-price catch-up budgets roll on (peerPriceCatchUp.ts). */
+export function easternDateString(from = new Date()): string {
+  const { y, m, d } = easternYmd(from);
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
 /**
  * The most recent COMPLETED US trading day (YYYY-MM-DD): the latest weekday
  * strictly before *today in US Eastern time*, walking back over Sat/Sun.

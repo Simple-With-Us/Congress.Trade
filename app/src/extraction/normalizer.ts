@@ -451,6 +451,10 @@ export async function normalize(
       && !f.flags.includes('no_amount')
       && !f.flags.includes('missing_tx_date'))
     : flagged;
+  // Sibling-publish only: gate on rows that have amounts.  If every row
+  // omitted the checkbox, use the real min (includes the no_amount penalty)
+  // so the filing stays in review.  Substituting the publish threshold here
+  // auto-published all-null-amount extracts after #2143.
   const gateMinConfidence = gateRows.length
     ? Math.min(...gateRows.map((f) => f.tx.confidence))
     : minConfidence;
