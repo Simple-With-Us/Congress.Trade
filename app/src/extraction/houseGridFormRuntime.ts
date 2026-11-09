@@ -103,7 +103,7 @@ export function parsePgm(bytes: Uint8Array): GrayImage | null {
 /** Group tesseract TSV words into line boxes with conf in 0..1. */
 export function parseTesseractTsv(tsv: string, width: number, height: number): HouseGridOcrBox[] {
   const lines = tsv.split(/\r?\n/);
-  const groups = new Map<string, { x0: number; y0: number; x1: number; y1: number; words: string[]; confs: number[] }>();
+  const boxes: HouseGridOcrBox[] = [];
   for (const line of lines) {
     if (!line || line.startsWith('level\t')) continue;
     const parts = line.split('\t');
@@ -116,39 +116,14 @@ export function parseTesseractTsv(tsv: string, width: number, height: number): H
     const boxWidth = Number(parts[8]);
     const boxHeight = Number(parts[9]);
     if (![conf, left, top, boxWidth, boxHeight].every(Number.isFinite)) continue;
-    const key = `${parts[2]}:${parts[3]}:${parts[4]}`;
-    const existing = groups.get(key);
-    const x1 = left + boxWidth;
-    const y1 = top + boxHeight;
-    if (!existing) {
-      groups.set(key, {
-        x0: left,
-        y0: top,
-        x1,
-        y1,
-        words: [text],
-        confs: [conf],
-      });
-    } else {
-      existing.x0 = Math.min(existing.x0, left);
-      existing.y0 = Math.min(existing.y0, top);
-      existing.x1 = Math.max(existing.x1, x1);
-      existing.y1 = Math.max(existing.y1, y1);
-      existing.words.push(text);
-      existing.confs.push(conf);
-    }
-  }
-  const boxes: HouseGridOcrBox[] = [];
-  for (const group of groups.values()) {
-    const usable = group.confs.filter((value) => value >= 0);
-    const mean = usable.length ? usable.reduce((sum, value) => sum + value, 0) / usable.length : 0;
+    if (boxWidth <= 0 || boxHeight <= 0) continue;
     boxes.push({
-      x0: Math.max(0, group.x0),
-      y0: Math.max(0, group.y0),
-      x1: Math.min(width, group.x1),
-      y1: Math.min(height, group.y1),
-      text: group.words.join(' '),
-      conf: Math.max(0, Math.min(1, mean / 100)),
+      x0: Math.max(0, left),
+      y0: Math.max(0, top),
+      x1: Math.min(width, left + boxWidth),
+      y1: Math.min(height, top + boxHeight),
+      text,
+      conf: Math.max(0, Math.min(1, (conf >= 0 ? conf : 0) / 100)),
     });
   }
   return boxes;

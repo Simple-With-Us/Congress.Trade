@@ -21,7 +21,8 @@ COLUMN_TEMPLATES: Tuple[Tuple[int, ...], ...] = (
     (278, 395, 939, 1037, 1093, 1195, 1300, 1426, 1604, 1777, 1892, 2009, 2104, 2200, 2296, 2405, 2517, 2645, 2771, 2893, 3023),
 )
 
-TYPE_P, TYPE_S, TYPE_PARTIAL, TYPE_E, TYPE_CG = 2, 3, 4, 5, 6
+# Purchase, sale, exchange, capital gains, partial. Printed header order.
+TYPE_P, TYPE_S, TYPE_E, TYPE_CG, TYPE_PARTIAL = 2, 3, 4, 5, 6
 AMOUNT_COLUMNS: Tuple[Tuple[int, str, Optional[int], Optional[int]], ...] = (
     (9, "A", 1001, 15000),
     (10, "B", 15001, 50000),
@@ -92,16 +93,39 @@ class OcrBox:
     conf: float
 
 
+# Printed checkbox x at X_GLYPH_REFERENCE_SCALE of the column templates.
+X_GLYPH = (
+    "#....#.",
+    "##..##.",
+    "######.",
+    ".####..",
+    ".####..",
+    ".####..",
+    ".#####.",
+    "##..###",
+    "#...###",
+    ".....#.",
+)
+X_GLYPH_REFERENCE_SCALE = 0.667
+
+
 def canonical_x_template() -> np.ndarray:
-    width, height = 19, 21
+    height, width = len(X_GLYPH), len(X_GLYPH[0])
     image = np.full((height, width), 255, np.uint8)
-    for y in range(height):
-        x1 = int(round((y / (height - 1)) * (width - 1)))
-        x2 = (width - 1) - x1
-        for x in (x1, x1 - 1, x2, x2 - 1):
-            if 0 <= x < width:
+    for y, row in enumerate(X_GLYPH):
+        for x, ch in enumerate(row):
+            if ch == "#":
                 image[y, x] = 0
     return image
+
+
+def x_template_for_fit(fit_scale: float) -> np.ndarray:
+    clamped = min(1.4, max(0.45, fit_scale))
+    factor = clamped / X_GLYPH_REFERENCE_SCALE
+    src = canonical_x_template()
+    width = max(3, int(round(src.shape[1] * factor)))
+    height = max(3, int(round(src.shape[0] * factor)))
+    return cv2.resize(src, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
 def fit_column_lines(detected: Sequence[int]) -> Optional[ColumnFit]:
@@ -155,7 +179,7 @@ def _best(scores: Sequence[float], indexes: Sequence[int]) -> Optional[Tuple[int
 
 
 def classify_mark_scores(scores: Sequence[float]) -> ClassifiedMarks:
-    type_hit = _best(scores, (0, 1, 3))
+    type_hit = _best(scores, (TYPE_P - 2, TYPE_S - 2, TYPE_E - 2))
     partial_score = scores[TYPE_PARTIAL - 2] if len(scores) > TYPE_PARTIAL - 2 else 0.0
     cg_score = scores[TYPE_CG - 2] if len(scores) > TYPE_CG - 2 else 0.0
     tx_type: Optional[str] = None
@@ -206,16 +230,28 @@ def classify_mark_scores(scores: Sequence[float]) -> ClassifiedMarks:
 
 
 def detect_vertical_lines(gray: np.ndarray, y0: int, y1: int) -> List[int]:
-    top, bot = max(0, y0), min(gray.shape[0], y1)
+    """Thin vertical rules. Broken rules still count; wide text blobs do not."""
+    top, bot = max(0, y0), min(gray.shape[0], max(y0 + 1, y1))
     band = gray[top:bot]
     if band.size == 0:
         return []
-    dark = (band < 150).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    opened = cv2.morphologyEx(dark * 255, cv2.MORPH_OPEN, kernel)
-    covered = (opened > 0).sum(axis=0)
-    hits = np.where(covered > (bot - top) * 0.35)[0]
-    return _cluster([int(v) for v in hits], 8)
+    dark = band < 180
+    cov = dark.mean(axis=0)
+    idx = np.where(cov > 0.18)[0]
+    groups: List[List[int]] = []
+    for x in idx.tolist():
+        if groups and x - groups[-1][-1] <= 6:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    scored: List[Tuple[float, int]] = []
+    for group in groups:
+        if len(group) > 12:
+            continue
+        center = int(round(sum(group) / len(group)))
+        scored.append((float(cov[group].mean()), center))
+    scored.sort(reverse=True)
+    return sorted(center for _, center in scored[:28])
 
 
 def _cluster(values: Sequence[int], gap: int) -> List[int]:
@@ -228,16 +264,62 @@ def _cluster(values: Sequence[int], gap: int) -> List[int]:
     return [int(round(sum(group) / len(group))) for group in groups]
 
 
-def _horizontal_lines(gray: np.ndarray, x0: int, x1: int) -> List[int]:
-    left, right = max(0, x0), min(gray.shape[1], x1)
-    strip = gray[:, left:right]
-    span = max(1, right - left)
-    dark = (strip < 150).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, span // 4), 1))
-    opened = cv2.morphologyEx(dark * 255, cv2.MORPH_OPEN, kernel)
-    covered = (opened > 0).sum(axis=1)
-    hits = np.where(covered > span * 0.35)[0]
-    return _cluster([int(v) for v in hits], 3)
+def row_bands(gray: np.ndarray, xs: Sequence[int]) -> List[Tuple[int, int]]:
+    """Amount-column rules, with section bars and a one-pitch gap fill."""
+    if len(xs) < 12:
+        return []
+    # Date column through the amount rules. Asset text is left of this span,
+    # so a faint rule still counts without turning names into false lines.
+    x0, x1 = int(xs[7]), int(xs[-1])
+    x0, x1 = max(0, x0), min(gray.shape[1], max(x0 + 1, x1))
+    if x1 <= x0:
+        return []
+    strip = gray[:, x0:x1]
+    dark = strip < 200
+    cov = dark.mean(axis=1)
+    idx = np.where(cov > 0.22)[0]
+    groups: List[List[int]] = []
+    for y in idx.tolist():
+        if groups and y - groups[-1][-1] <= 3:
+            groups[-1].append(y)
+        else:
+            groups.append([y])
+    rules: List[int] = []
+    bar_bottoms: List[int] = []
+    for group in groups:
+        if len(group) <= 5:
+            rules.append(int(round(sum(group) / len(group))))
+        elif len(group) >= 12:
+            bar_bottoms.append(group[-1])
+    if len(rules) < 3:
+        return []
+    first_bar = min(bar_bottoms) if bar_bottoms else None
+    data_rules = sorted(rule for rule in rules if first_bar is None or rule > first_bar + 4)
+    if len(data_rules) < 2:
+        return []
+    gaps = [b - a for a, b in zip(data_rules, data_rules[1:]) if 24 <= b - a <= 140]
+    pitch = float(sorted(gaps)[len(gaps) // 2]) if gaps else 64.0
+    edges = list(data_rules)
+    for a, b in zip(data_rules, data_rules[1:]):
+        gap = b - a
+        if pitch * 1.6 < gap < pitch * 2.5:
+            edges.append(int(round(a + gap / 2)))
+    if first_bar is not None:
+        for bottom in bar_bottoms:
+            nxt = min((edge for edge in edges if edge > bottom + 8), default=None)
+            if nxt is not None and abs(nxt - bottom - pitch) <= pitch * 0.45:
+                edges.append(bottom + 1)
+    sorted_edges = sorted(set(edges))
+    bands: List[Tuple[int, int]] = []
+    for top, bot in zip(sorted_edges, sorted_edges[1:]):
+        height = bot - top
+        if height < pitch * 0.55 or height > pitch * 1.8:
+            continue
+        sample = dark[top + 2:bot - 2:2, ::4]
+        if sample.size and float(sample.mean()) > 0.45:
+            continue
+        bands.append((top, bot))
+    return bands
 
 
 def _parse_date(text: str) -> Optional[str]:
@@ -267,6 +349,15 @@ def _owner(text: str) -> Optional[str]:
         return "dependent"
     if re.search(r"\bSELF\b", token):
         return "self"
+    letters = re.sub(r"[^A-Z]", "", token)
+    if len(letters) < 2 or len(letters) > 3:
+        return None
+    if letters in {"OC", "PC", "DO", "OD", "QC", "CG", "CD"}:
+        return "dependent"
+    if letters in {"SD", "SF", "PS"}:
+        return "spouse"
+    if letters in {"JI", "IT", "JF", "TJ"}:
+        return "joint"
     return None
 
 
@@ -289,23 +380,16 @@ def _match_cell(cell: np.ndarray, template: np.ndarray) -> float:
 def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> Optional[List[GridRow]]:
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-    y0, y1 = int(gray.shape[0] * 0.12), int(gray.shape[0] * 0.96)
+    y0, y1 = int(gray.shape[0] * 0.28), int(gray.shape[0] * 0.92)
     detected = detect_vertical_lines(gray, y0, y1)
     fit = fit_column_lines(detected)
     if fit is None or fit.inliers < GRID_MIN_INLIERS or len(fit.xs) < 21:
         return None
-    scale = min(1.4, max(0.45, fit.scale))
-    template = canonical_x_template()
-    template = cv2.resize(
-        template,
-        (max(3, int(round(template.shape[1] * scale))), max(3, int(round(template.shape[0] * scale)))),
-    )
+    template = x_template_for_fit(fit.scale)
     xs = fit.xs
-    lines = _horizontal_lines(gray, xs[1], xs[-1])
+    bands = row_bands(gray, xs)
     rows: List[GridRow] = []
-    for top, bot in zip(lines, lines[1:]):
-        if bot - top < 28 or bot - top > 180:
-            continue
+    for top, bot in bands:
         scores: List[float] = []
         for column in range(2, 20):
             if column in (7, 8):
@@ -316,14 +400,18 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
         marks = classify_mark_scores(scores)
         in_band = [box for box in boxes if top <= (box.y0 + box.y1) / 2 <= bot]
         asset_boxes = [box for box in in_band if xs[1] - 8 <= box.x0 < xs[2] - 4 and box.text.strip()]
-        asset_boxes.sort(key=lambda box: (box.y0, box.x0))
+        asset_boxes.sort(key=lambda box: (round(box.y0 / 12), box.x0))
         asset = " ".join(box.text.strip() for box in asset_boxes)
         asset_conf = sum(box.conf for box in asset_boxes) / len(asset_boxes) if asset_boxes else 0.0
         owners = [owner for owner in (_owner(box.text) for box in in_band if box.x1 <= xs[1] + 12) if owner]
+        date_left, date_right = xs[7], xs[9]
         dates = []
         for box in in_band:
             iso = _parse_date(box.text)
-            if iso:
+            if not iso:
+                continue
+            cx = (box.x0 + box.x1) / 2
+            if date_left - 8 <= cx <= date_right + 8:
                 dates.append((box.x0, iso))
         dates.sort()
         has_mark = marks.type_reason != "unmarked" or marks.amount_reason != "unmarked" or marks.cap_gains

@@ -31,7 +31,8 @@ export const COLUMN_TEMPLATES: readonly (readonly number[])[] = [
 ];
 
 /** Intervals between the 21 rules. Dates sit in 7 and 8 and are not marks. */
-export const TYPE_COLUMN = { p: 2, s: 3, partial: 4, e: 5, cg: 6 } as const;
+/** Purchase, sale, exchange, capital-gains, partial. Header order on the printed grid. */
+export const TYPE_COLUMN = { p: 2, s: 3, e: 4, cg: 5, partial: 6 } as const;
 export const DATE_COLUMNS = [7, 8] as const;
 export const AMOUNT_COLUMNS: readonly {
   index: number;
@@ -128,19 +129,44 @@ export interface HouseGridFormReader {
 const DATE_RE = /^\D{0,2}(\d{1,2})\s*[/l1I|]\s*(\d{1,2})\s*[/l1I|]\s*(\d{2,4})\D{0,3}$/;
 const DARK = 150;
 
+/**
+ * Printed checkbox x at {@link X_GLYPH_REFERENCE_SCALE} of the column templates.
+ * The mark is a small blocky x, not a pair of corner-to-corner diagonals.
+ */
+const X_GLYPH = [
+  '#....#.',
+  '##..##.',
+  '######.',
+  '.####..',
+  '.####..',
+  '.####..',
+  '.#####.',
+  '##..###',
+  '#...###',
+  '.....#.',
+];
+
+/** Fit scale at which {@link X_GLYPH} is already the right pixel size. */
+export const X_GLYPH_REFERENCE_SCALE = 0.667;
+
 export function canonicalXTemplate(): GrayImage {
-  const width = 19;
-  const height = 21;
+  const height = X_GLYPH.length;
+  const width = X_GLYPH[0].length;
   const pixels = new Uint8Array(width * height);
   pixels.fill(255);
   for (let y = 0; y < height; y += 1) {
-    const x1 = Math.round((y / (height - 1)) * (width - 1));
-    const x2 = (width - 1) - x1;
-    for (const x of [x1, x1 - 1, x2, x2 - 1]) {
-      if (x >= 0 && x < width) pixels[y * width + x] = 0;
+    const row = X_GLYPH[y];
+    for (let x = 0; x < width; x += 1) {
+      if (row[x] === '#') pixels[y * width + x] = 0;
     }
   }
   return { width, height, pixels };
+}
+
+/** Scale the checkbox x to a page whose column fit returned `fitScale`. */
+export function xTemplateForFit(fitScale: number): GrayImage {
+  const clamped = Math.min(1.4, Math.max(0.45, fitScale));
+  return scaleGray(canonicalXTemplate(), clamped / X_GLYPH_REFERENCE_SCALE);
 }
 
 export function scaleGray(src: GrayImage, scale: number): GrayImage {
@@ -159,64 +185,43 @@ export function scaleGray(src: GrayImage, scale: number): GrayImage {
   return { width, height, pixels };
 }
 
-function clusterPositions(xs: number[], gap: number): number[] {
-  const groups: number[][] = [];
-  for (const x of xs) {
-    const last = groups[groups.length - 1];
-    if (last && x - last[last.length - 1] <= gap) last.push(x);
-    else groups.push([x]);
-  }
-  return groups.map((group) => Math.round(group.reduce((sum, v) => sum + v, 0) / group.length));
-}
-
-/** Vertical rules in [y0, y1). A column counts when a long dark run covers it. */
+/**
+ * Thin vertical rules in [y0, y1).
+ * Coverage counts a broken rule. A wide text blob is not a rule.
+ * At most 28 candidates go into the column fit, strongest first.
+ */
 export function detectVerticalLines(image: GrayImage, y0: number, y1: number): number[] {
   const top = Math.max(0, Math.min(image.height, y0));
   const bot = Math.max(top, Math.min(image.height, y1));
   const band = Math.max(1, bot - top);
-  const minRun = 40;
   const hits: number[] = [];
   for (let x = 0; x < image.width; x += 1) {
-    let covered = 0;
-    let run = 0;
+    let dark = 0;
     for (let y = top; y < bot; y += 1) {
-      if (image.pixels[y * image.width + x] < DARK) {
-        run += 1;
-      } else {
-        if (run >= minRun) covered += run;
-        run = 0;
+      if (image.pixels[y * image.width + x] < 180) dark += 1;
+    }
+    if (dark > band * 0.18) hits.push(x);
+  }
+  const groups: number[][] = [];
+  for (const x of hits) {
+    const last = groups[groups.length - 1];
+    if (last && x - last[last.length - 1] <= 6) last.push(x);
+    else groups.push([x]);
+  }
+  const scored: Array<{ coverage: number; center: number }> = [];
+  for (const group of groups) {
+    if (group.length > 12) continue;
+    let dark = 0;
+    for (const x of group) {
+      for (let y = top; y < bot; y += 1) {
+        if (image.pixels[y * image.width + x] < 180) dark += 1;
       }
     }
-    if (run >= minRun) covered += run;
-    if (covered > band * 0.35) hits.push(x);
+    const center = Math.round(group.reduce((sum, value) => sum + value, 0) / group.length);
+    scored.push({ coverage: dark / (group.length * band), center });
   }
-  return clusterPositions(hits, 8);
-}
-
-function detectHorizontalLines(image: GrayImage, x0: number, x1: number, y0: number, y1: number): number[] {
-  const left = Math.max(0, Math.min(image.width, x0));
-  const right = Math.max(left, Math.min(image.width, x1));
-  const top = Math.max(0, Math.min(image.height, y0));
-  const bot = Math.max(top, Math.min(image.height, y1));
-  const span = Math.max(1, right - left);
-  const minRun = Math.max(30, Math.floor(span * 0.25));
-  const hits: number[] = [];
-  for (let y = top; y < bot; y += 1) {
-    let covered = 0;
-    let run = 0;
-    const row = y * image.width;
-    for (let x = left; x < right; x += 1) {
-      if (image.pixels[row + x] < DARK) {
-        run += 1;
-      } else {
-        if (run >= minRun) covered += run;
-        run = 0;
-      }
-    }
-    if (run >= minRun) covered += run;
-    if (covered > span * 0.35) hits.push(y);
-  }
-  return clusterPositions(hits, 3);
+  scored.sort((a, b) => b.coverage - a.coverage);
+  return scored.slice(0, 28).map((item) => item.center).sort((a, b) => a - b);
 }
 
 /**
@@ -402,7 +407,7 @@ function bestMark(
  * and an amount. A missing or tied type stays null.
  */
 export function classifyMarkScores(scores: readonly number[]): ClassifiedMarks {
-  const typeIndexes = [0, 1, 3];
+  const typeIndexes = [TYPE_COLUMN.p - 2, TYPE_COLUMN.s - 2, TYPE_COLUMN.e - 2];
   const typeHit = bestMark(scores, typeIndexes);
   const partialScore = scores[TYPE_COLUMN.partial - 2] ?? 0;
   const cgScore = scores[TYPE_COLUMN.cg - 2] ?? 0;
@@ -491,6 +496,12 @@ function ownerFromText(text: string): Owner | null {
   if (/\bSP\b/.test(token) || /\bSPOUSE\b/.test(token)) return 'spouse';
   if (/\bDC\b/.test(token) || /\bDEPENDENT\b/.test(token)) return 'dependent';
   if (/\bSELF\b/.test(token)) return 'self';
+  // The owner cell is a two-letter code. Tesseract often reads DC as OC or PC.
+  const letters = token.replace(/[^A-Z]/g, '');
+  if (letters.length < 2 || letters.length > 3) return null;
+  if (['OC', 'PC', 'DO', 'OD', 'QC', 'CG', 'CD'].includes(letters)) return 'dependent';
+  if (['SD', 'SF', 'PS'].includes(letters)) return 'spouse';
+  if (['JI', 'IT', 'JF', 'TJ'].includes(letters)) return 'joint';
   return null;
 }
 
@@ -505,16 +516,68 @@ function boxesInRow(
   });
 }
 
+/**
+ * Data-row bands from the amount-column rules.
+ * A section title is a thick black bar. Thin rules are the row separators.
+ * A gap of about two pitches gets one inferred rule. Bands above the first
+ * section bar are the column header, not trades.
+ */
 function rowBands(image: GrayImage, xs: readonly number[]): Array<{ y0: number; y1: number }> {
-  const tableLeft = xs[1] ?? 0;
-  const tableRight = xs[xs.length - 1] ?? image.width;
-  const lines = detectHorizontalLines(image, tableLeft, tableRight, 0, image.height);
+  if (xs.length < 12) return [];
+  const x0 = xs[7];
+  const x1 = xs[xs.length - 1];
+  const groups: number[][] = [];
+  for (let y = 0; y < image.height; y += 1) {
+    let dark = 0;
+    const row = y * image.width;
+    for (let x = x0; x < x1; x += 1) {
+      if (image.pixels[row + x] < 200) dark += 1;
+    }
+    if (dark <= (x1 - x0) * 0.22) continue;
+    const last = groups[groups.length - 1];
+    if (last && y - last[last.length - 1] <= 3) last.push(y);
+    else groups.push([y]);
+  }
+  const rules: number[] = [];
+  const barBottoms: number[] = [];
+  for (const group of groups) {
+    if (group.length <= 5) rules.push(Math.round(group.reduce((sum, v) => sum + v, 0) / group.length));
+    else if (group.length >= 12) barBottoms.push(group[group.length - 1]);
+  }
+  if (rules.length < 3) return [];
+  const firstBar = barBottoms.length ? Math.min(...barBottoms) : null;
+  const dataRules = (firstBar === null ? rules : rules.filter((rule) => rule > firstBar + 4)).sort((a, b) => a - b);
+  if (dataRules.length < 2) return [];
+  const gaps = dataRules.slice(1).map((rule, index) => rule - dataRules[index]).filter((gap) => gap >= 24 && gap <= 140);
+  const pitch = gaps.length ? gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : 64;
+  const edges = [...dataRules];
+  for (let i = 0; i < dataRules.length - 1; i += 1) {
+    const gap = dataRules[i + 1] - dataRules[i];
+    if (gap > pitch * 1.6 && gap < pitch * 2.5) edges.push(Math.round(dataRules[i] + gap / 2));
+  }
+  if (firstBar !== null) {
+    for (const bottom of barBottoms) {
+      const next = edges.filter((edge) => edge > bottom + 8).sort((a, b) => a - b)[0];
+      if (next !== undefined && Math.abs(next - bottom - pitch) <= pitch * 0.45) edges.push(bottom + 1);
+    }
+  }
+  const sorted = [...new Set(edges)].sort((a, b) => a - b);
   const bands: Array<{ y0: number; y1: number }> = [];
-  for (let i = 0; i < lines.length - 1; i += 1) {
-    const y0 = lines[i];
-    const y1 = lines[i + 1];
-    if (y1 - y0 < 28) continue;
-    if (y1 - y0 > 180) continue;
+  for (let i = 0; i < sorted.length - 1; i += 1) {
+    const y0 = sorted[i];
+    const y1 = sorted[i + 1];
+    const height = y1 - y0;
+    if (height < pitch * 0.55 || height > pitch * 1.8) continue;
+    let dark = 0;
+    const sample = Math.max(1, x1 - x0);
+    for (let y = y0 + 2; y < y1 - 2; y += 2) {
+      const row = y * image.width;
+      for (let x = x0; x < x1; x += 4) {
+        if (image.pixels[row + x] < DARK) dark += 1;
+      }
+    }
+    const samples = Math.max(1, Math.ceil((y1 - y0) / 2) * Math.ceil(sample / 4));
+    if (dark / samples > 0.45) continue;
     bands.push({ y0, y1 });
   }
   return bands;
@@ -548,7 +611,7 @@ function assetText(boxes: readonly HouseGridOcrBox[], xs: readonly number[]): { 
   const right = (xs[2] ?? 0) - 4;
   const hits = boxes
     .filter((box) => box.x0 >= left && box.x0 < right && box.text.trim())
-    .sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+    .sort((a, b) => Math.round(a.y0 / 12) - Math.round(b.y0 / 12) || a.x0 - b.x0);
   if (hits.length === 0) return { text: '', conf: 0 };
   const conf = hits.reduce((sum, box) => sum + box.conf, 0) / hits.length;
   return { text: hits.map((box) => box.text.trim()).join(' ').replace(/\s+/g, ' '), conf };
@@ -571,19 +634,19 @@ function confidenceFor(marks: ClassifiedMarks, assetConf: number, hasDate: boole
   return Math.min(0.9, score);
 }
 
-function pageRows(page: HouseGridPageInput, template: GrayImage): {
+function pageRows(page: HouseGridPageInput): {
   detected: boolean;
   transactions: ParsedTx[];
   markedCells: number;
   markCells: number;
 } {
   const empty = { detected: false, transactions: [], markedCells: 0, markCells: 0 };
-  const y0 = Math.floor(page.image.height * 0.12);
-  const y1 = Math.floor(page.image.height * 0.96);
+  const y0 = Math.floor(page.image.height * 0.28);
+  const y1 = Math.floor(page.image.height * 0.92);
   const detectedLines = detectVerticalLines(page.image, y0, y1);
   const fit = fitColumnLines(detectedLines);
   if (!fit || fit.inliers < GRID_MIN_INLIERS || fit.xs.length < 21) return empty;
-  const sized = scaleGray(template, Math.min(1.4, Math.max(0.45, fit.scale)));
+  const sized = xTemplateForFit(fit.scale);
   const bands = rowBands(page.image, fit.xs);
   const transactions: ParsedTx[] = [];
   let markedCells = 0;
@@ -600,9 +663,15 @@ function pageRows(page: HouseGridPageInput, template: GrayImage): {
       .filter((box) => box.x1 <= (fit.xs[1] ?? 0) + 12)
       .map((box) => ownerFromText(box.text))
       .filter((owner): owner is Owner => owner !== null);
+    const dateLeft = fit.xs[7] ?? 0;
+    const dateRight = fit.xs[9] ?? dateLeft;
     const dates = inBand
       .map((box) => ({ box, iso: parseLooseDate(box.text) }))
-      .filter((entry): entry is { box: HouseGridOcrBox; iso: string } => entry.iso !== null)
+      .filter((entry): entry is { box: HouseGridOcrBox; iso: string } => {
+        if (!entry.iso) return false;
+        const cx = (entry.box.x0 + entry.box.x1) / 2;
+        return cx >= dateLeft - 8 && cx <= dateRight + 8;
+      })
       .sort((a, b) => a.box.x0 - b.box.x0);
     const chrome = looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text);
     const hasMark = marks.typeReason !== 'unmarked' || marks.amountReason !== 'unmarked' || marks.capGainsOver200;
@@ -642,13 +711,12 @@ function pageRows(page: HouseGridPageInput, template: GrayImage): {
 
 /** Read every supplied page. A filing is a grid form when any page fits. */
 export function readHouseGridForm(pages: readonly HouseGridPageInput[]): HouseGridRead {
-  const template = canonicalXTemplate();
   const transactions: ParsedTx[] = [];
   let gridPages = 0;
   let markedCells = 0;
   let markCells = 0;
   for (const page of pages) {
-    const read = pageRows(page, template);
+    const read = pageRows(page);
     if (!read.detected) continue;
     gridPages += 1;
     markedCells += read.markedCells;

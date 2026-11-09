@@ -15,10 +15,10 @@ from gridform import (  # noqa: E402
     TYPE_PARTIAL,
     TYPE_S,
     OcrBox,
-    canonical_x_template,
     classify_mark_scores,
     fit_column_lines,
     read_grid_page,
+    x_template_for_fit,
 )
 
 
@@ -75,10 +75,7 @@ def test_rendered_page_classifies_x_marks_and_refuses_empty_boxes():
     scale, offset = 0.72, 40.0
     xs = [int(round(offset + scale * value)) for value in COLUMN_TEMPLATES[0]]
     gray = np.full((900, xs[-1] + 30), 255, np.uint8)
-    glyph = cv2.resize(
-        canonical_x_template(),
-        (max(3, int(round(19 * scale))), max(3, int(round(21 * scale)))),
-    )
+    glyph = x_template_for_fit(scale)
     for x in xs:
         cv2.line(gray, (x, 160), (x, 780), 0, 2)
     rows = [

@@ -8,11 +8,10 @@ import {
   COLUMN_TEMPLATES,
   MARK_SCORE_MIN,
   TYPE_COLUMN,
-  canonicalXTemplate,
   classifyMarkScores,
   fitColumnLines,
   readHouseGridForm,
-  scaleGray,
+  xTemplateForFit,
   type GrayImage,
   type HouseGridOcrBox,
 } from '../houseGridForm.ts';
@@ -79,7 +78,7 @@ function drawGrid(scale: number, offset: number, rows: DrawnRow[]): {
   const width = xs[xs.length - 1] + 30;
   const height = 900;
   const image = blank(width, height);
-  const glyph = scaleGray(canonicalXTemplate(), scale);
+  const glyph = xTemplateForFit(scale);
   for (const x of xs) vline(image, x, 160, 780);
   const rules = [200, ...rows.flatMap((row) => [row.y0, row.y1]), 760];
   const unique = [...new Set(rules)].sort((a, b) => a - b);
