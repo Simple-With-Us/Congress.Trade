@@ -7,6 +7,7 @@ var REVIEW = [];          // review-queue items
 var REVIEW_TOTALS = null; // aggregate queue counts returned with the current page
 var REVIEW_FAILURES = null; // failure sections embedded by GET /review-queue?include=… (pending tab only)
 var REVIEW_SENATE_INTAKE = null; // Senate intake relay heartbeat carried by every /review-queue response
+var REVIEW_SENATE_FETCHER_RUN = null; // Last reported Mac fetcher run, carried by every /review-queue response
 var DECISIONS = [];       // ingestion decision audit rows
 var REVIEW_RUNS = {};     // docId -> full extraction runs loaded on demand
 var REVIEW_CONSENSUS = {}; // docId -> { rows, summary } | null, loaded alongside REVIEW_RUNS
@@ -2701,6 +2702,7 @@ function loadReview() {
     REVIEW_TOTALS = null;
     REVIEW_FAILURES = null;
     REVIEW_SENATE_INTAKE = null;
+    REVIEW_SENATE_FETCHER_RUN = null;
     if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
     if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
     if (el('reviewTabBadge')) { el('reviewTabBadge').hidden = true; el('reviewTabBadge').textContent = ''; el('reviewTabBadge').classList.remove('is-on'); }
@@ -2718,6 +2720,7 @@ function loadReview() {
       REVIEW = data.items || [];
       REVIEW_TOTALS = data.totals || null;
       REVIEW_SENATE_INTAKE = data.senateIntake || null;
+      REVIEW_SENATE_FETCHER_RUN = data.senateFetcherRun || null;
       REVIEW_FAILURES = REVIEW_RESOLVED === 0 ? {
         ingestFailures: data.ingestFailures || null,
         deadLetters: data.deadLetters || null,
@@ -2731,6 +2734,7 @@ function loadReview() {
     .catch(function (e) {
       REVIEW_FAILURES = null;
       REVIEW_SENATE_INTAKE = null;
+      REVIEW_SENATE_FETCHER_RUN = null;
       if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
       if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
       el('reviewBody').innerHTML = stateRow(6, isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load review queue: ' + e.message));
@@ -3191,11 +3195,27 @@ function dlqFailedRowHtml(d) {
 function renderReviewPanels() {
   var relayEl = el('reviewRelayStatus');
   if (relayEl) {
+    var runHtml;
+    var r = REVIEW_SENATE_FETCHER_RUN;
+    if (!r) {
+      runHtml = '<p class="note">Mac Fetcher Runs: no runs recorded yet. The Mac eFD fetcher has not reported a run since run reporting began.</p>';
+    } else {
+      var rbits = ['last run ' + reviewAgoText(typeof r.ageMs === 'number' ? r.ageMs : reviewAgeMs(r.receivedAt))];
+      rbits.push('status ' + (r.status || 'ok'));
+      rbits.push(fmtCount(r.rows) + ' rows seen');
+      rbits.push(fmtCount(r.newCount) + ' new');
+      rbits.push(r.role === 'jay' ? 'Jay standby copy' : 'agents copy');
+      var runWarn = '';
+      if (r.status === 'blocked') runWarn = ' <strong style="color:#c0362c">The Senate blocked the last run.</strong>';
+      else if (r.status === 'error') runWarn = ' <strong style="color:#c0362c">The last run errored before completing.</strong>';
+      if (r.stale) runWarn += ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes from 6:00 AM to 10:00 PM, so a last run this old means the Mac fetcher is down or not reporting.</strong>';
+      runHtml = '<p class="note">Mac Fetcher Runs: ' + esc(rbits.join(' · ')) + runWarn + '</p>';
+    }
     var s = REVIEW_SENATE_INTAKE;
     if (!s) {
-      relayEl.innerHTML = '<p class="note">Senate Intake Relay: no relay recorded yet. The Mac eFD fetcher has not called the intake endpoint since this status began recording.</p>';
+      relayEl.innerHTML = runHtml + '<p class="note">Senate Intake Relay (deliveries): no delivery recorded yet. The Mac eFD fetcher has not delivered new filings since this status began recording — deliveries only happen when a run finds new filings.</p>';
     } else {
-      var bits = ['last relay ' + reviewAgoText(typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt))];
+      var bits = ['last delivery ' + reviewAgoText(typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt))];
       bits.push(fmtCount(s.received) + ' rows received');
       bits.push(fmtCount(s.newCount) + ' new filings');
       if (s.rejected) bits.push(fmtCount(s.rejected) + ' rejected');
@@ -3203,10 +3223,20 @@ function renderReviewPanels() {
       var failedWarn = s.failed
         ? ' <strong style="color:#c0362c">The last relay call failed to ingest — nothing was written.</strong>'
         : '';
+      var rAgeMs = r ? (typeof r.ageMs === 'number' ? r.ageMs : reviewAgeMs(r.receivedAt)) : null;
+      var sAgeMs = typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt);
+      // Broken-relay signal: a fresh run found filings the delivery line
+      // should already show.  The run must postdate the last delivery and
+      // be past a 5-minute grace window, so normal relay lag (the run
+      // reports after its intake post, but the panel can render in
+      // between) does not read as breakage.
+      var undelivered = !!(r && !r.stale && r.newCount > 0 && rAgeMs !== null && rAgeMs > 5 * 60 * 1000 && rAgeMs < sAgeMs);
       var staleWarn = s.stale
-        ? ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes from 6:00 AM to 10:00 PM, so a relay this old means the Mac fetcher is down or blocked.</strong>'
+        ? (undelivered
+          ? ' <strong style="color:#c0362c">Stale — the last run found new filings but the last delivery is old, so the intake relay may be broken.</strong>'
+          : ' Deliveries only happen when a run finds new filings, so an old delivery is expected in quiet stretches — the run line above is the fetcher health signal.')
         : '';
-      relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(bits.join(' · ')) + failedWarn + staleWarn + '</p>';
+      relayEl.innerHTML = runHtml + '<p class="note">Senate Intake Relay (deliveries): ' + esc(bits.join(' · ')) + failedWarn + staleWarn + '</p>';
     }
   }
   var failEl = el('reviewFailures');
