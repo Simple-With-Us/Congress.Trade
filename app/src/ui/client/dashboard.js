@@ -3204,7 +3204,9 @@ function renderReviewPanels() {
         ? ' <strong style="color:#c0362c">The last relay call failed to ingest — nothing was written.</strong>'
         : '';
       var staleWarn = s.stale
-        ? ' Deliveries only happen when a run finds new filings, so an old delivery is expected in quiet stretches — the run line above is the fetcher health signal.'
+        ? ((r && !r.stale && r.newCount > 0)
+          ? ' <strong style="color:#c0362c">Stale — the last run found new filings but the last delivery is old, so the intake relay may be broken.</strong>'
+          : ' Deliveries only happen when a run finds new filings, so an old delivery is expected in quiet stretches — the run line above is the fetcher health signal.')
         : '';
       relayEl.innerHTML = runHtml + '<p class="note">Senate Intake Relay (deliveries): ' + esc(bits.join(' · ')) + failedWarn + staleWarn + '</p>';
     }
