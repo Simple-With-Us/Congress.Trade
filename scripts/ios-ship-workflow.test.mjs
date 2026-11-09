@@ -298,6 +298,31 @@ test("the App Store version workflow prepares a version and never submits", () =
   assert.doesNotMatch(api, /appStoreVersionLocalizations.*method:\s*"POST"/);
 });
 
+test("ensure-tf-ready rc=5 and rc=6 are not mislabeled as export compliance", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  const rc5 = ship.slice(ship.indexOf("if [[ $rc -eq 5 ]]"), ship.indexOf("if [[ $rc -eq 6 ]]"));
+  const rc6 = ship.slice(ship.indexOf("if [[ $rc -eq 6 ]]"), ship.indexOf("if [[ $rc -eq 3 ]]"));
+  assert.match(rc5, /no external TestFlight group with testers or a public link/);
+  assert.match(rc5, /::warning title=TestFlight has no reachable external tester::/);
+  assert.doesNotMatch(rc5, /stuck on export compliance/);
+  assert.match(rc6, /external TestFlight installability could not be read/);
+  assert.match(rc6, /::warning title=TestFlight installability unverified::/);
+  assert.doesNotMatch(rc6, /stuck on export compliance/);
+
+});
+
+test("ios-ship.yml re-runs ensure-tf-ready after the external beta refresh", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const promote = yml.indexOf("name: Refresh the public TestFlight beta");
+  const verify = yml.indexOf("name: Re-verify TestFlight readiness after external beta refresh");
+  assert.ok(promote >= 0, "Refresh the public TestFlight beta step must exist");
+  assert.ok(verify > promote, "post-sync ensure-tf-ready must follow the external beta refresh");
+  assert.match(yml, /ios-report-post-sync-tf-ready\.sh/);
+  const report = read("scripts/ios-report-post-sync-tf-ready.sh");
+  assert.match(report, /GITHUB_STEP_SUMMARY/);
+  assert.match(report, /tf_ready_verdict_line/);
+});
+
 test("ios-appstore-gm.yml can ship one exact marketing version", () => {
   const yml = read(".github/workflows/ios-appstore-gm.yml");
 
