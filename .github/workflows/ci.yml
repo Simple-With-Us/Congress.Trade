@@ -211,7 +211,7 @@ jobs:
 
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
-        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
 
       # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
       # stub `infisical` first on PATH records its arguments, so the real CLI,

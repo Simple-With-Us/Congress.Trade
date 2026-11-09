@@ -11,13 +11,17 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+  # The post-merge sentinel (scripts/ops/post-merge-sentinel.mjs) dispatches this
+  # on main when the workflow_run for main HEAD never started (CT-2463).  The
+  # reporter still verifies the live revision before it records anything.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 # Serialize every reporter for this environment, including runs for newer SHAs.
 concurrency:
-  group: sentry-deploy-${{ github.event_name == 'workflow_run' && 'production' || github.ref }}
+  group: sentry-deploy-${{ (github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch') && 'production' || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -33,11 +37,12 @@ jobs:
   record-production-deploy:
     needs: test-reporter
     if: >
-      github.event_name == 'workflow_run' &&
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.id == github.repository_id
+      github.event.workflow_run.head_repository.id == github.repository_id)
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -54,7 +59,7 @@ jobs:
         id: record
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
         run: node scripts/sentry-report-deploy.mjs
       # The steps below read and upload files, so they run against the released
       # revision rather than the main HEAD this job checked out.  SENTRY_RELEASE
