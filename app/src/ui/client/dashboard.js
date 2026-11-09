@@ -7,6 +7,7 @@ var REVIEW = [];          // review-queue items
 var REVIEW_TOTALS = null; // aggregate queue counts returned with the current page
 var REVIEW_FAILURES = null; // failure sections embedded by GET /review-queue?include=… (pending tab only)
 var REVIEW_SENATE_INTAKE = null; // Senate intake relay heartbeat carried by every /review-queue response
+var REVIEW_SENATE_INTAKE_HEALTH = null; // windowed warning for a stale or never-seen heartbeat
 var DECISIONS = [];       // ingestion decision audit rows
 var REVIEW_RUNS = {};     // docId -> full extraction runs loaded on demand
 var REVIEW_CONSENSUS = {}; // docId -> { rows, summary } | null, loaded alongside REVIEW_RUNS
@@ -2681,6 +2682,7 @@ function loadReview() {
     REVIEW_TOTALS = null;
     REVIEW_FAILURES = null;
     REVIEW_SENATE_INTAKE = null;
+    REVIEW_SENATE_INTAKE_HEALTH = null;
     if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
     if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
     if (el('reviewTabBadge')) { el('reviewTabBadge').hidden = true; el('reviewTabBadge').textContent = ''; el('reviewTabBadge').classList.remove('is-on'); }
@@ -2698,6 +2700,7 @@ function loadReview() {
       REVIEW = data.items || [];
       REVIEW_TOTALS = data.totals || null;
       REVIEW_SENATE_INTAKE = data.senateIntake || null;
+      REVIEW_SENATE_INTAKE_HEALTH = data.senateIntakeHealth || null;
       REVIEW_FAILURES = REVIEW_RESOLVED === 0 ? {
         ingestFailures: data.ingestFailures || null,
         deadLetters: data.deadLetters || null,
@@ -2711,6 +2714,7 @@ function loadReview() {
     .catch(function (e) {
       REVIEW_FAILURES = null;
       REVIEW_SENATE_INTAKE = null;
+      REVIEW_SENATE_INTAKE_HEALTH = null;
       if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
       if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
       el('reviewBody').innerHTML = stateRow(6, isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load review queue: ' + e.message));
@@ -3172,8 +3176,18 @@ function renderReviewPanels() {
   var relayEl = el('reviewRelayStatus');
   if (relayEl) {
     var s = REVIEW_SENATE_INTAKE;
+    var health = REVIEW_SENATE_INTAKE_HEALTH;
+    var healthWarn = health && health.level === 'warning' && health.detail
+      ? ' <strong style="color:#c0362c">' + esc(health.detail) + '</strong>'
+      : '';
     if (!s) {
-      relayEl.innerHTML = '<p class="note">Senate Intake Relay: no relay recorded yet. The Mac eFD fetcher has not called the intake endpoint since this status began recording.</p>';
+      if (health && health.level === 'warning' && health.detail) {
+        relayEl.innerHTML = '<p class="note"><strong style="color:#c0362c">' + esc(health.detail) + '</strong></p>';
+      } else if (health && health.detail) {
+        relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(health.detail) + '</p>';
+      } else {
+        relayEl.innerHTML = '<p class="note">Senate Intake Relay: no relay recorded yet. The Mac eFD fetcher has not called the intake endpoint since this status began recording.</p>';
+      }
     } else {
       var bits = ['last relay ' + reviewAgoText(typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt))];
       bits.push(fmtCount(s.received) + ' rows received');
@@ -3183,10 +3197,12 @@ function renderReviewPanels() {
       var failedWarn = s.failed
         ? ' <strong style="color:#c0362c">The last relay call failed to ingest — nothing was written.</strong>'
         : '';
-      var staleWarn = s.stale
-        ? ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes from 6:00 AM to 10:00 PM, so a relay this old means the Mac fetcher is down or blocked.</strong>'
-        : '';
-      relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(bits.join(' · ')) + failedWarn + staleWarn + '</p>';
+      var staleWarn = healthWarn
+        ? ''
+        : (s.stale
+          ? ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes from 6:00 AM to 10:00 PM, so a relay this old means the Mac fetcher is down or blocked.</strong>'
+          : '');
+      relayEl.innerHTML = '<p class="note">Senate Intake Relay: ' + esc(bits.join(' · ')) + failedWarn + healthWarn + staleWarn + '</p>';
     }
   }
   var failEl = el('reviewFailures');

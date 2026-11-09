@@ -7,6 +7,7 @@ import {
   DEFAULT_PIPELINE_THRESHOLDS,
 } from '../pipelineHealth.ts';
 import { DEFAULT_PROBE_SCHEDULE_CONFIG } from '../../ingestion/probeSchedule.ts';
+import { evaluateSenateIntakeHealth } from '../../ingestion/senateIntakeStatus.ts';
 
 describe('evaluatePipelineSignals', () => {
   const nowMs = 1754092800000; // Fixed clock for testing
@@ -809,6 +810,44 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('DOWN');
     expect(check.detail).toContain('scout.jays.services');
     expect(res.checks.find((c) => c.id === 'polling_senate')!.status).toBe('ok');
+  });
+
+  it('names the transport on the latest successful senate poll', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      pollSources: base.pollSources!.map((p) => (
+        p.source === 'senate' ? { ...p, transport: 'browser-direct' } : p
+      )),
+    }, nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).toContain('via browser-direct');
+  });
+
+  it('omits the senate intake check when the signal was not collected', () => {
+    expect(evaluatePipelineSignals(base, nowMs).checks.find((c) => c.id === 'senate_intake')).toBeUndefined();
+  });
+
+  it('warns on /api/health when the intake relay has never heartbeated inside the window', () => {
+    const at = new Date('2026-11-09T18:00:00.000Z');
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateIntake: evaluateSenateIntakeHealth(null, at),
+    }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_intake')!;
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('never heartbeated');
+    expect(check.detail).toContain('6:00 AM to 10:00 PM CT');
+    expect(res.status).not.toBe('ok');
+  });
+
+  it('stays quiet overnight when the intake relay has never heartbeated', () => {
+    const at = new Date('2026-11-09T09:00:00.000Z');
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateIntake: evaluateSenateIntakeHealth(null, at),
+    }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_intake')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('Quiet outside');
   });
 
   it('an unset Senate relay URL is degraded, not silent', () => {

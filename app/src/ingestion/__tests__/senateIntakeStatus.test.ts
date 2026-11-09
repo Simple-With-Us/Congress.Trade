@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  evaluateSenateIntakeHealth,
   readSenateIntakeStatus,
   recordSenateIntake,
   SENATE_INTAKE_STALE_AFTER_MS,
@@ -91,6 +92,45 @@ describe('senate intake relay heartbeat', () => {
     const { env, kv } = memEnv();
     kv.set(SENATE_INTAKE_STATUS_KV_KEY, JSON.stringify({ receivedAt: 'x', received: 'many' }));
     expect(await readSenateIntakeStatus(env)).toBeNull();
+  });
+
+  it('warns when the relay has never heartbeated inside the 6am-10pm window', () => {
+    const health = evaluateSenateIntakeHealth(null, new Date('2026-11-09T18:00:00.000Z'));
+    expect(health).toMatchObject({ level: 'warning', seen: false, inWindow: true });
+    expect(health.detail).toContain('never heartbeated');
+    expect(health.detail).toContain('senate-intake:last');
+  });
+
+  it('stays quiet overnight when the relay has never been seen', () => {
+    const health = evaluateSenateIntakeHealth(null, new Date('2026-11-09T09:00:00.000Z'));
+    expect(health).toMatchObject({ level: 'ok', seen: false, inWindow: false });
+    expect(health.detail).toContain('Quiet outside');
+  });
+
+  it('warns on a stale heartbeat inside the window and keeps a pre-close stale warning overnight', async () => {
+    const { env } = memEnv();
+    await recordSenateIntake(env, record('2026-11-09T16:00:00.000Z'));
+    const midday = await readSenateIntakeStatus(env, new Date('2026-11-09T18:00:00.000Z'));
+    expect(evaluateSenateIntakeHealth(midday, new Date('2026-11-09T18:00:00.000Z')).level).toBe('warning');
+
+    await recordSenateIntake(env, record('2026-11-05T02:00:00.000Z'));
+    const overnight = await readSenateIntakeStatus(env, new Date('2026-11-05T09:00:00.000Z'));
+    const health = evaluateSenateIntakeHealth(overnight, new Date('2026-11-05T09:00:00.000Z'));
+    expect(health.level).toBe('warning');
+    expect(health.detail).toContain('already stale');
+  });
+
+  it('does not warn on a fresh in-window heartbeat or a healthy overnight gap', async () => {
+    const { env } = memEnv();
+    await recordSenateIntake(env, record('2026-11-09T17:50:00.000Z'));
+    const fresh = await readSenateIntakeStatus(env, new Date('2026-11-09T18:00:00.000Z'));
+    expect(evaluateSenateIntakeHealth(fresh, new Date('2026-11-09T18:00:00.000Z')).level).toBe('ok');
+
+    await recordSenateIntake(env, record('2026-11-05T03:50:00.000Z'));
+    const gap = await readSenateIntakeStatus(env, new Date('2026-11-05T09:00:00.000Z'));
+    const health = evaluateSenateIntakeHealth(gap, new Date('2026-11-05T09:00:00.000Z'));
+    expect(health.level).toBe('ok');
+    expect(health.detail).toContain('Quiet outside');
   });
 
   it('never throws into the intake path when KV is absent or failing', async () => {

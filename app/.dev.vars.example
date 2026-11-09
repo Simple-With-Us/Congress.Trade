@@ -207,6 +207,18 @@ ACCESS_TEAM_DOMAIN=""
 SEED_HOUSE_URL=""
 SEED_SENATE_URL=""
 
+# Senate eFD browser transport.  Both flags default off.  Production values
+# live in Infisical and stay unset until Jay turns them on.  The image also
+# needs the playwright package and a Chromium build before either flag works.
+# SENATE_EFD_BROWSER_FALLBACK=true  HTTP first; Chromium after a proxy
+#   timeout/unreachable or an Akamai edge deny.  The browser uses the proxy
+#   when that proxy returned the deny, and goes direct when the proxy never
+#   answered.
+# SENATE_EFD_BROWSER_FETCH=true     Chromium is the only transport.  Wins when
+#   both flags are set.
+# SENATE_EFD_HIDE_AUTOMATION=true   --disable-blink-features=AutomationControlled
+# SENATE_EFD_BROWSER_HEADLESS=false headed Chromium.  Unset means headless.
+
 # Set to "false" to disable the intraday House live-search overlay (the watcher
 # falls back to the daily bulk-XML diff, which is always used regardless).
 HOUSE_LIVE_SEARCH_ENABLED=""

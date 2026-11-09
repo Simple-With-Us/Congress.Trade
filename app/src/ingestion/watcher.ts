@@ -36,7 +36,12 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings, type SenateFiling } from './senateSource.ts';
+import {
+  fetchSenatePtrFilings,
+  formatSenateEfdTransportNote,
+  readSenateEfdTransport,
+  type SenateFiling,
+} from './senateSource.ts';
 import {
   clearSenateEdgeBackoff,
   isSenateEdgeBackoffActive,
@@ -1088,7 +1093,14 @@ async function pollSenate(env: Env, now: Date, signal?: AbortSignal): Promise<nu
   const { count: newCount } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
   await logPoll(env, 'senate', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'senate', now);
-  await recordSourceAttempt(env, 'senate', nowIso, 'success', newCount, null);
+  await recordSourceAttempt(
+    env,
+    'senate',
+    nowIso,
+    'success',
+    newCount,
+    formatSenateEfdTransportNote(readSenateEfdTransport(filings)),
+  );
   // Stamp the deep sweep ONLY after a fully successful poll: a 403 day must
   // not consume the day's widened window.
   if (deepSweepDue && env.CONFIG_KV) {

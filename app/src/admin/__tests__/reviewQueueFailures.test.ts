@@ -46,6 +46,7 @@ interface ReviewQueueBody {
   senateIntake: {
     received: number; newCount: number; dryRun: boolean; stale: boolean; failed?: boolean;
   } | null;
+  senateIntakeHealth?: { level: 'ok' | 'warning'; detail: string; seen: boolean; inWindow: boolean };
 }
 
 function tsAt(i: number): string {
@@ -201,6 +202,16 @@ describe('GET /review-queue pipeline failures', () => {
     expect(body.totals.deadLetters).toBe(2);
     expect(body.totals.dlqFailed).toBe(2);
     expect(body.senateIntake).toBeNull();
+  });
+
+  it('warns on a never-seen intake heartbeat during the fetcher window', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-09T18:00:00.000Z'));
+    const db = makeReviewQueueTestDb(fixture());
+    const body = await (await app.request('/review-queue', { headers: AUTH }, env(db, fakeKv()))).json() as ReviewQueueBody;
+    expect(body.senateIntake).toBeNull();
+    expect(body.senateIntakeHealth).toMatchObject({ level: 'warning', seen: false, inWindow: true });
+    expect(body.senateIntakeHealth?.detail).toContain('never heartbeated');
   });
 
   it('reports the durable queue as unavailable when its table does not exist yet', async () => {

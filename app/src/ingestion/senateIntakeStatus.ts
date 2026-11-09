@@ -102,6 +102,12 @@ function addDays(p: ChicagoParts, days: number): ChicagoParts {
   return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), hour: p.hour, minute: p.minute };
 }
 
+/** True during the fetcher's 06:00–22:00 America/Chicago window. */
+export function senateIntakeInWindow(now: Date): boolean {
+  const p = chicagoParts(now);
+  return p.hour >= FETCHER_WINDOW_START_HOUR && p.hour < FETCHER_WINDOW_END_HOUR;
+}
+
 /**
  * Window-aware staleness.  Inside the 06:00–22:00 window the plain
  * threshold applies, except that silence before today's window opened
@@ -114,7 +120,7 @@ function isStale(receivedMs: number, now: Date): boolean {
   if (!Number.isFinite(receivedMs)) return true;
   const nowMs = now.getTime();
   const p = chicagoParts(now);
-  const inWindow = p.hour >= FETCHER_WINDOW_START_HOUR && p.hour < FETCHER_WINDOW_END_HOUR;
+  const inWindow = senateIntakeInWindow(now);
   if (inWindow) {
     const openMs = chicagoWallToUtcMs(p.year, p.month, p.day, FETCHER_WINDOW_START_HOUR, 0);
     if (receivedMs >= openMs) return nowMs - receivedMs > SENATE_INTAKE_STALE_AFTER_MS;
@@ -127,6 +133,79 @@ function isStale(receivedMs: number, now: Date): boolean {
   const closeMs = chicagoWallToUtcMs(closeDay.year, closeDay.month, closeDay.day, FETCHER_WINDOW_END_HOUR, 0);
   if (receivedMs >= closeMs) return false;
   return closeMs - receivedMs > SENATE_INTAKE_STALE_AFTER_MS;
+}
+
+export interface SenateIntakeHealth {
+  /** warning while the fetcher should have called and has not. */
+  level: 'ok' | 'warning';
+  detail: string;
+  inWindow: boolean;
+  seen: boolean;
+}
+
+function intakeAgePhrase(ageMs: number): string {
+  if (!Number.isFinite(ageMs)) return 'an unknown time ago';
+  const minutes = Math.round(ageMs / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 90) return `${minutes} minutes ago`;
+  const hours = Math.round(ageMs / 3_600_000);
+  return `${hours} hours ago`;
+}
+
+const INTAKE_WINDOW_NOTE = 'The Mac eFD fetcher runs every 15 minutes from 6:00 AM to 10:00 PM CT.';
+
+/**
+ * Health wording for the intake heartbeat.  A missing record stays null from
+ * readSenateIntakeStatus; this is what turns that null into a warning inside
+ * the fetcher window and an explicit quiet note outside it.
+ *
+ * Never-seen does not get the 45-minute grace after 6:00 AM.  That grace
+ * exists so a heartbeat from the previous evening is not called stale before
+ * the first run of the day.  A relay that has never called has no such
+ * heartbeat.
+ */
+export function evaluateSenateIntakeHealth(
+  status: SenateIntakeStatus | null,
+  now = new Date(),
+): SenateIntakeHealth {
+  const inWindow = senateIntakeInWindow(now);
+  if (!status) {
+    if (inWindow) {
+      return {
+        level: 'warning',
+        inWindow,
+        seen: false,
+        detail: `Senate intake relay has never heartbeated.\u00A0 ${INTAKE_WINDOW_NOTE}\u00A0 No senate-intake:last record exists.`,
+      };
+    }
+    return {
+      level: 'ok',
+      inWindow,
+      seen: false,
+      detail: `Senate intake relay has never heartbeated.\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.`,
+    };
+  }
+  const age = intakeAgePhrase(status.ageMs);
+  if (status.stale) {
+    const detail = inWindow
+      ? `Senate intake relay is stale (last heartbeat ${age}).\u00A0 ${INTAKE_WINDOW_NOTE}`
+      : `Senate intake relay was already stale when the 10:00 PM CT window closed (last heartbeat ${age}).\u00A0 It stays a warning overnight.`;
+    return { level: 'warning', inWindow, seen: true, detail };
+  }
+  if (!inWindow) {
+    return {
+      level: 'ok',
+      inWindow,
+      seen: true,
+      detail: `Senate intake relay last heartbeated ${age}.\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.`,
+    };
+  }
+  return {
+    level: 'ok',
+    inWindow,
+    seen: true,
+    detail: `Senate intake relay heartbeated ${age}.`,
+  };
 }
 
 /** The last relay's status, or null when the relay has never called in. */

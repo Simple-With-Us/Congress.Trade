@@ -201,7 +201,7 @@ import {
   buildFailedIngestionOutboxIdentity,
   loadFailedIngestionOutboxRows,
 } from '../ingestion/failedOutboxIdentity.ts';
-import { readSenateIntakeStatus, recordSenateIntake } from '../ingestion/senateIntakeStatus.ts';
+import { evaluateSenateIntakeHealth, readSenateIntakeStatus, recordSenateIntake } from '../ingestion/senateIntakeStatus.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
@@ -3304,7 +3304,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       body.dlqFailed = dlq.items;
       body.dlqFailedAvailable = dlq.available;
     }
-    body.senateIntake = await readSenateIntakeStatus(c.env);
+    const intakeNow = new Date();
+    const senateIntake = await readSenateIntakeStatus(c.env, intakeNow);
+    body.senateIntake = senateIntake;
+    body.senateIntakeHealth = evaluateSenateIntakeHealth(senateIntake, intakeNow);
     // Only surface `truncated` on the legacy unbounded call shape — an
     // explicit limit/cursor caller asked for a bounded page on purpose, that
     // isn't "truncation".
