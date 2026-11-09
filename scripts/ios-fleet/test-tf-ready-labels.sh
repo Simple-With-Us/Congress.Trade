@@ -43,7 +43,7 @@ ensure_end="$(awk -v s="$ensure_start" 'NR > s && /^acquire_archive_lock$/ { pri
 ensure_tmp="$(mktemp)"
 sed -n "${ensure_start},${ensure_end}p" "$SHIP" >"$ensure_tmp"
 
-echo "== ensure_tf_ready has distinct rc=5 and rc=6 branches (BotFleet wording) =="
+echo "== ensure_tf_ready has distinct rc=5 and rc=6 branches (internal-tester contract) =="
 rc5="$(slice_between "$ensure_tmp" 'rc -eq 5' 'rc -eq 6')"
 rc6="$(slice_between "$ensure_tmp" 'rc -eq 6' 'rc -eq 3')"
 rc3="$(slice_between "$ensure_tmp" 'rc -eq 3' 'rc -eq 4')"
@@ -51,12 +51,13 @@ rc4="$(slice_between "$ensure_tmp" 'rc -eq 4' '# rc=2 is')"
 ensure_block="$(cat "$ensure_tmp")"
 rm -f "$ensure_tmp"
 
-contains "rc=5 names external testers" "$rc5" "no external TestFlight group with testers or a public link"
-contains "rc=5 GitHub annotation" "$rc5" "TestFlight has no reachable external tester"
+contains "rc=5 names zero internal testers" "$rc5" "NO internal tester has access to all builds"
+contains "rc=5 GitHub annotation" "$rc5" "no internal tester can install it"
 lacks "rc=5 branch does not blame export compliance" "$rc5" "stuck on export compliance"
+lacks "rc=5 branch does not use external-only labels" "$rc5" "no external TestFlight group"
 
-contains "rc=6 names unreadable installability" "$rc6" "external TestFlight installability could not be read"
-contains "rc=6 GitHub annotation" "$rc6" "TestFlight installability unverified"
+contains "rc=6 names unreadable internal count" "$rc6" "internal tester count could not be read"
+contains "rc=6 GitHub annotation" "$rc6" "internal tester state is unreadable"
 lacks "rc=6 branch does not blame export compliance" "$rc6" "stuck on export compliance"
 
 contains "rc=3 branch" "$rc3" "has not reached IN_BETA_TESTING yet"
@@ -68,8 +69,8 @@ echo "== the five failure codes use different anchor phrases =="
 markers=(
   "has not reached IN_BETA_TESTING yet"
   "ASC never surfaced build"
-  "no external TestFlight group with testers or a public link"
-  "external TestFlight installability could not be read"
+  "NO internal tester has access to all builds"
+  "internal tester count could not be read"
   "stuck on export compliance"
 )
 for i in "${!markers[@]}"; do
@@ -87,8 +88,15 @@ for rc in 2 3 4 5 6; do
   contains "post-sync case for rc=${rc}" "$verdict_fn" "${rc})"
 done
 lacks "post-sync rc=5 does not use export-compliance catch-all" "$verdict_fn" "stuck on export compliance"
-contains "post-sync rc=5 names external path" "$verdict_fn" "no external TestFlight group"
-contains "post-sync rc=6 names unverified installability" "$verdict_fn" "installability is unverified"
+contains "post-sync rc=5 names internal path" "$verdict_fn" "no internal tester"
+contains "post-sync rc=6 names unverified internal read" "$verdict_fn" "internal tester count could not be read"
+
+echo "== asc-api ensure-tf-ready documents 0/2/3/4 only today (rc=5/6 are shell+client contract) =="
+ASC_API="${SCRIPT_DIR}/asc-api.mjs"
+ready_block="$(awk '/Exit codes: 0 ready/,/^  if \(method === "latest-marketing-patch"\)/' "$ASC_API")"
+contains "asc-api documents exit 0/2/3/4" "$ready_block" "Exit codes: 0 ready | 2 usage/API error | 3 readiness timeout"
+lacks "asc-api does not exit 5 in ensure-tf-ready yet" "$ready_block" "process.exit(5)"
+lacks "asc-api does not exit 6 in ensure-tf-ready yet" "$ready_block" "process.exit(6)"
 
 echo
 echo "passed: ${PASS}  failed: ${FAIL}"

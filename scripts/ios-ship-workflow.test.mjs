@@ -302,12 +302,21 @@ test("ensure-tf-ready rc=5 and rc=6 are not mislabeled as export compliance", ()
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
   const rc5 = ship.slice(ship.indexOf("if [[ $rc -eq 5 ]]"), ship.indexOf("if [[ $rc -eq 6 ]]"));
   const rc6 = ship.slice(ship.indexOf("if [[ $rc -eq 6 ]]"), ship.indexOf("if [[ $rc -eq 3 ]]"));
-  assert.match(rc5, /no external TestFlight group with testers or a public link/);
-  assert.match(rc5, /::warning title=TestFlight has no reachable external tester::/);
+  assert.match(rc5, /NO internal tester has access to all builds/);
+  assert.match(rc5, /no internal tester can install it/);
   assert.doesNotMatch(rc5, /stuck on export compliance/);
-  assert.match(rc6, /external TestFlight installability could not be read/);
-  assert.match(rc6, /::warning title=TestFlight installability unverified::/);
+  assert.doesNotMatch(rc5, /no external TestFlight group/);
+  assert.match(rc6, /internal tester count could not be read/);
+  assert.match(rc6, /internal tester state is unreadable/);
   assert.doesNotMatch(rc6, /stuck on export compliance/);
+  assert.doesNotMatch(rc6, /external installability/);
+
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  const readyStart = asc.lastIndexOf("Exit codes: 0 ready", asc.indexOf('if (method === "ensure-tf-ready")'));
+  const ready = asc.slice(readyStart, asc.indexOf('if (method === "latest-marketing-patch"'));
+  assert.match(ready, /Exit codes: 0 ready \| 2 usage\/API error \| 3 readiness timeout/);
+  assert.doesNotMatch(ready, /process\.exit\(5\)/);
+  assert.doesNotMatch(ready, /process\.exit\(6\)/);
 
 });
 

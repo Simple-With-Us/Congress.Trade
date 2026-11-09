@@ -27,8 +27,8 @@ tf_ready_verdict_line() {
     0) printf '%s' "TestFlight readiness: build ${BUILD_NUM} is processed; internal testers can install this build (ensure-tf-ready rc=0)." ;;
     3) printf '%s' "TestFlight readiness: upload succeeded but App Store Connect has not reached IN_BETA_TESTING yet for build ${BUILD_NUM} (ensure-tf-ready rc=3)." ;;
     4) printf '%s' "TestFlight readiness: App Store Connect never surfaced build ${BUILD_NUM} in time; export compliance was NOT declared on it (ensure-tf-ready rc=4)." ;;
-    5) printf '%s' "TestFlight readiness: build ${BUILD_NUM} is processed but ${BUNDLE_ID} has no external TestFlight group with testers or a public link, so no external tester can install it yet (ensure-tf-ready rc=5).  Check the Refresh the public TestFlight beta step." ;;
-    6) printf '%s' "TestFlight readiness: build ${BUILD_NUM} is processed but external installability could not be read for ${BUNDLE_ID}; installability is unverified (ensure-tf-ready rc=6)." ;;
+    5) printf '%s' "TestFlight readiness: build ${BUILD_NUM} is processed and export compliance was declared, but no internal tester with access to all builds can install it (ensure-tf-ready rc=5).  Check TestFlight > Internal Testing in App Store Connect." ;;
+    6) printf '%s' "TestFlight readiness: build ${BUILD_NUM} is processed but the internal tester count could not be read for ${BUNDLE_ID}; internal installability is unverified (ensure-tf-ready rc=6)." ;;
     2) printf '%s' "TestFlight readiness: ensure-tf-ready failed with rc=2 for ${BUNDLE_ID} build ${BUILD_NUM}; export compliance may not be declared (usage or App Store Connect API error)." ;;
     *) printf '%s' "TestFlight readiness: ensure-tf-ready failed with rc=${rc} for ${BUNDLE_ID} build ${BUILD_NUM}; export compliance may not be declared." ;;
   esac
@@ -38,10 +38,10 @@ tf_ready_warn() {
   local rc="${1:-}"
   case "$rc" in
     5)
-      echo "::warning title=TestFlight has no reachable external tester::${BUNDLE_ID} build ${BUILD_NUM} is processed but no external tester can install it.  Check the Refresh the public TestFlight beta step."
+      echo "::warning::ensure-tf-ready: ${BUNDLE_ID} build ${BUILD_NUM} is ready but no internal tester can install it"
       ;;
     6)
-      echo "::warning title=TestFlight installability unverified::${BUNDLE_ID} build ${BUILD_NUM} is processed but the external installability could not be read.  Check TestFlight."
+      echo "::warning::ensure-tf-ready: ${BUNDLE_ID} build ${BUILD_NUM} is ready but the internal tester state is unreadable"
       ;;
     4)
       echo "::warning::ensure-tf-ready could not find uploaded build ${BUILD_NUM} for ${BUNDLE_ID}; export compliance not declared"
