@@ -1031,6 +1031,9 @@ export async function runPriceRefresh(
     // and every worker exited before claiming this index.
     const outcome = await Promise.race([outcomes[pageIndex].promise, poolDone.then(() => null)]);
     if (outcome === null) {
+      // No worker claimed this index, so it was never attempted:  restore the
+      // resume point (as the fatal-error path does) so the next run starts here.
+      result.lastCursorSeq = resumeBefore;
       result.aborted = true;
       break;
     }
