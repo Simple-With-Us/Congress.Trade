@@ -133,7 +133,7 @@ When a PR is open, inspect its changed files and check status before starting
 overlapping work:
 
 ```bash
-# PR detail + files: relay gr_wf_pr_get
+# PR detail + files + mergeability (mergeable, mergeStateStatus): relay gr_wf_pr_get
 # check status: relay gr_wf_checks (a point-in-time snapshot — re-read for fresher state; it does not watch or wait)
 ```
 
@@ -152,9 +152,10 @@ while the PR sits there with conflicts or comments/issues unresolved."
   bot".  Watching costs tokens and wall-clock and changes nothing.
 - **A PR that is not merging is waiting on an ACTION, not on time.**  Exactly one of
   these is true, and you fix every one of them yourself:
-  - unresolved review threads (relay `gr_wf_review_threads`) — triage, reply,
-    resolve;
-  - a merge conflict (`--json mergeable,mergeStateStatus`) — this repo requires
+  - unresolved review threads (relay `gr_wf_review_threads` — walk the cursor
+    until `hasNextPage` is false; a first-page-only read hides threads) — triage,
+    reply, resolve;
+  - a merge conflict (relay `gr_wf_pr_get`: `mergeable`, `mergeStateStatus`) — this repo requires
     branches be kept current with `main` anyway, so `git fetch origin main && git
     merge origin/main`, resolve, push;
   - a failing required check (`typecheck + test`, `gitleaks`) — read the log, fix the
