@@ -27,6 +27,7 @@ import {
   type ApnsTransport,
 } from '../shared/apns.ts';
 import { isDeliveryBackfill } from './deliveryFreshness.ts';
+import { readDeliveryMode } from './deliveryMode.ts';
 
 export const APNS_FANOUT_LOOKBACK_MS = 2 * 60 * 60 * 1000;
 export const APNS_FANOUT_PAGE = 40;
@@ -42,6 +43,7 @@ export const APNS_FANOUT_TRADE_SQL = `SELECT t.id, t.doc_id, t.ticker, t.tx_type
        JOIN transactions t ON t.id = o.tx_id
        LEFT JOIN filers f ON f.bioguide_id = t.filer_id
       WHERE t.deprecated_at IS NULL
+        AND o.status != 'suppressed'
         AND t.created_at > ?
       ORDER BY t.created_at ASC
       LIMIT ${APNS_FANOUT_PAGE}`;
@@ -60,7 +62,8 @@ export const APNS_FANOUT_REVIEW_SQL = `SELECT doc_id, reason, created_at
  */
 export const APNS_FANOUT_TRADE_PENDING_SQL = `SELECT 1 AS ok
        FROM delivery_outbox o
-      WHERE EXISTS (
+      WHERE o.status != 'suppressed'
+        AND EXISTS (
               SELECT 1 FROM transactions t
                WHERE t.id = o.tx_id
                  AND t.deprecated_at IS NULL
@@ -93,7 +96,7 @@ export const APNS_SECRET_KEYS = [
 ] as const;
 
 export interface ApnsFanoutResult {
-  skipped?: 'not_configured' | 'no_devices' | 'no_pending';
+  skipped?: 'not_configured' | 'no_devices' | 'no_pending' | 'delivery_hold' | 'delivery_suppress';
   trades: number;
   reviews: number;
   delivered: number;
@@ -381,6 +384,11 @@ export async function fanOutApnsProductEvents(
   deps: ApnsFanoutDeps = {},
 ): Promise<ApnsFanoutResult> {
   const now = deps.now ?? new Date();
+  // Subscriber alert pause (CT_DELIVERY_MODE).  Skip without advancing the
+  // cursor: on resume, held trades inside the lookback window still push;
+  // suppressed outbox rows are excluded by APNS_FANOUT_TRADE_SQL.
+  const mode = readDeliveryMode();
+  if (mode !== 'deliver') return { skipped: mode === 'hold' ? 'delivery_hold' : 'delivery_suppress', trades: 0, reviews: 0, delivered: 0, retired: 0 };
   const config = await (deps.loadConfig ?? resolveApnsConfig)(env);
   if (!apnsConfigured(config)) return { skipped: 'not_configured', trades: 0, reviews: 0, delivered: 0, retired: 0 };
 

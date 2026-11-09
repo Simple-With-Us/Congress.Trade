@@ -6,6 +6,7 @@ import {
   WCAG_AA_NORMAL_TEXT,
   contrastRatio,
   darkNegativeTextContrastCases,
+  darkSemanticTextContrastCases,
   lightSemanticTextContrastCases,
 } from '../semanticThemeTokens.ts';
 
@@ -31,10 +32,10 @@ describe('semanticThemeTokens (CT-1356)', () => {
     expect(SEMANTIC_LIGHT.good).toBe('#166534');
   });
 
-  it('keeps dark pill chrome hues; --neg is lighter sell ink for status text', () => {
+  it('keeps dark pill chrome hues; sell ink now matches the proven --neg tone (CT-2459)', () => {
     expect(SEMANTIC_DARK.good).toBe('#34d399');
     expect(SEMANTIC_DARK.buy).toBe('#22c55e');
-    expect(SEMANTIC_DARK.sell).toBe('#ef4444');
+    expect(SEMANTIC_DARK.sell).toBe('#f87d80');
     expect(SEMANTIC_DARK.warn).toBe('#f59e0b');
     expect(SEMANTIC_DARK_NEG).toBe('#f87d80');
   });
@@ -43,7 +44,16 @@ describe('semanticThemeTokens (CT-1356)', () => {
     const cases = darkNegativeTextContrastCases();
     const failures = cases.filter((c) => c.ratio < WCAG_AA_NORMAL_TEXT);
     expect(failures).toEqual([]);
-    expect(contrastRatio(SEMANTIC_DARK.sell, '#172440')).toBeLessThan(WCAG_AA_NORMAL_TEXT);
+    // CT-2459: the old dark sell (#ef4444) failed at 4.09:1; the token
+    // itself now passes everywhere --neg does.
+    expect(contrastRatio('#ef4444', '#172440')).toBeLessThan(WCAG_AA_NORMAL_TEXT);
+    expect(contrastRatio(SEMANTIC_DARK.sell, '#172440')).toBeGreaterThanOrEqual(WCAG_AA_NORMAL_TEXT);
     expect(contrastRatio(SEMANTIC_DARK_NEG, '#172440')).toBeGreaterThanOrEqual(WCAG_AA_NORMAL_TEXT);
+  });
+
+  it('keeps every dark-mode semantic text case at or above 4.5:1 (CT-2459)', () => {
+    const cases = darkSemanticTextContrastCases();
+    const failures = cases.filter((c) => c.ratio < WCAG_AA_NORMAL_TEXT);
+    expect(failures).toEqual([]);
   });
 });

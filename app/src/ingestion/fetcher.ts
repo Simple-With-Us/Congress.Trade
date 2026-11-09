@@ -20,11 +20,17 @@ import { get, run } from '../shared/db.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { isReviewResolved } from './reviewQueueGuard.ts';
 import {
+  alreadyPublishedPredicate,
+  isFilingAlreadyPublished,
+  PUBLISH_DECISION_ACTIONS,
+} from './reviewStatusReconcile.ts';
+import {
   SENATE_SESSION_KV_KEY,
   establishSenateSession,
   looksLikeSenateAgreementWall,
 } from './senateSource.ts';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
+import { isSenateEdgeBackoffActive, readSenateEdgeBackoff } from './senateEdgeDeny.ts';
 import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 const UA = 'congress-feed/0.1 (+https://congress.trade)';
@@ -175,7 +181,12 @@ export function isSenateAgreementWallBytes(bytes: Uint8Array): boolean {
   return looksLikeSenateAgreementWall(prefix);
 }
 
-/** Mark a filing as errored (does not throw). */
+/**
+ * Mark a filing as errored (does not throw).
+ * An already-published filing (live transactions + a latest publish
+ * decision) keeps its ingest_status. A later fetch failure must not
+ * rewrite that stamp to `error` (CT-2453).
+ */
 async function markError(
   env: Env,
   docId: string,
@@ -184,10 +195,17 @@ async function markError(
 ): Promise<void> {
   try {
     await lease?.assertOwned();
+    if (await isFilingAlreadyPublished(env.DB, docId)) {
+      console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
+      return;
+    }
     await run(
       env.DB,
-      `UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?`,
-      [message.slice(0, 1000), docId],
+      `UPDATE filings
+          SET ingest_status = 'error', error = ?
+        WHERE doc_id = ?
+          AND NOT (${alreadyPublishedPredicate('filings')})`,
+      [message.slice(0, 1000), docId, ...PUBLISH_DECISION_ACTIONS],
     );
   } catch (e) {
     console.error(`fetcher: failed to record error for ${docId}:`, e);
@@ -218,6 +236,14 @@ export async function fetchFiling(
   // already stamped for this doc_id.
   if (await isReviewResolved(env.DB, docId)) {
     console.warn(`fetcher: ${docId} already review-resolved; skipping re-fetch (no-op)`);
+    return;
+  }
+  // Same idea for a filing that never had a review row: live transactions
+  // plus a publish decision are the terminal truth. Re-fetching would
+  // either stamp `error` on failure or `fetched` on success and re-drive
+  // extraction of data that is already published (CT-2453).
+  if (await isFilingAlreadyPublished(env.DB, docId)) {
+    console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
     return;
   }
   const sourceUrl = row.source_url;
@@ -380,17 +406,35 @@ export async function fetchFiling(
     if (row.chamber === 'senate' && isSenateAgreementWallBytes(rawBytes)) {
       // On the relay path the relay negotiates its own session (and already
       // retried once internally); a second relay call is the correct retry.
-      // Direct path: negotiate a fresh agreement-accepted session ourselves.
+      // Direct path: negotiate a fresh agreement-accepted session ourselves,
+      // on the same proxied egress as the document GETs above.  Both legs
+      // used to go out on the default (unproxied) fetch, from the box IP the
+      // eFD edge denies.
       let retry: Response;
       if (usedRelay) {
         retry = await fetchSenateDocViaRelay();
       } else {
-        const session = await establishSenateSession({ kv: env.CONFIG_KV });
+        // While the watcher is backed off after an eFD edge deny (CT-2442),
+        // the handshake would send the edge the very agreement POST it is
+        // refusing, now from the residential IP.  Defer the document until
+        // the window ends instead, jittered past the watcher's own attempt.
+        const edgeBackoff = await readSenateEdgeBackoff(env);
+        const now = new Date();
+        if (edgeBackoff && isSenateEdgeBackoffActive(edgeBackoff, now)) {
+          const waitSeconds = Math.max(1, Math.ceil((Date.parse(edgeBackoff.until) - now.getTime()) / 1000));
+          const message = `fetcher: senate agreement wall for ${sourceUrl}; handshake deferred until ${edgeBackoff.until} (eFD edge-deny backoff)`;
+          await markError(env, docId, message, lease);
+          throw new IngestRetryError(message, waitSeconds + ingestBackoffSeconds(queueAttempt));
+        }
+        // The lease signal bounds the handshake like every other request
+        // here, so a hung proxy aborts it with the lease instead of holding
+        // the queue consumer.
+        const session = await establishSenateSession({ kv: env.CONFIG_KV, signal: lease?.signal }, effectiveFetch);
         retry = await trackedFetch(sourceUrl, {
           headers: { ...headers, cookie: session.cookieHeader },
           redirect: 'follow',
           signal: lease?.signal,
-        }, { service: 'filing-ingestion', operation: 'fetch-filing-document', dynamicTarget: 'filing-source' });
+        }, { service: 'filing-ingestion', operation: 'fetch-filing-document', dynamicTarget: 'filing-source' }, effectiveFetch);
       }
       if (!retry.ok || !retry.body) {
         await retry.body?.cancel().catch(() => {});
@@ -415,13 +459,21 @@ export async function fetchFiling(
       httpMetadata: { contentType: contentType || 'application/octet-stream' },
     });
     await lease?.assertOwned();
-    await run(
+    // A publish can land while this fetch is in flight. The guarded UPDATE
+    // refuses to walk a published filing back to `fetched`;  when it matched
+    // no row, do not enqueue another extraction either (CT-2453).
+    const fetchedRes = await run(
       env.DB,
       `UPDATE filings
           SET raw_object_key = ?, ingest_status = 'fetched', error = NULL
-        WHERE doc_id = ?`,
-      [key, docId],
+        WHERE doc_id = ?
+          AND NOT (${alreadyPublishedPredicate('filings')})`,
+      [key, docId, ...PUBLISH_DECISION_ACTIONS],
     );
+    if (fetchedRes?.meta?.changes === 0) {
+      console.warn(`fetcher: ${docId} already published; not enqueuing extraction`);
+      return;
+    }
 
     await lease?.assertOwned();
     await env.INGEST_QUEUE.send({ type: 'filing.fetched', docId });

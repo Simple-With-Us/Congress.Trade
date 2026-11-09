@@ -147,18 +147,18 @@ struct SettingsView: View {
         if store.signedIn, let user = store.signedInUser {
             HStack(spacing: 12) {
                 if let picture = user.picture, let url = URL(string: picture) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image.resizable().scaledToFill()
-                        default:
+                    // CT-2459: shared downsampling cache + decorative label
+                    // (the name/email beside it carry the meaning).
+                    CachedAsyncImage(url: url, pointSize: 44)
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 44, height: 44)
+                        .background(
                             Image(systemName: "person.crop.circle.fill")
                                 .resizable()
                                 .foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(width: 44, height: 44)
-                    .clipShape(Circle())
+                        )
+                        .clipShape(Circle())
+                        .accessibilityHidden(true)
                 } else {
                     Image(systemName: "person.crop.circle.fill")
                         .font(.system(size: 40))
@@ -354,7 +354,7 @@ struct AdminPanelView: View {
         let pipeline = store.publicHealth?.pipeline
         Section("Senate Egress") {
             AdminStatusRow(title: "Residential Proxy", check: pipeline?.check(id: "senate_relay").map(PipelineCheckProxy.init))
-            AdminStatusRow(title: "Senate eFD Direct", check: pipeline?.check(id: "senate_efd").map(PipelineCheckProxy.init))
+            AdminStatusRow(title: "Senate eFD", check: pipeline?.check(id: "senate_efd").map(PipelineCheckProxy.init))
         }
     }
 
@@ -431,7 +431,7 @@ private enum AdminPipelineCheckTitles {
         switch id {
         case "st_peer_prices": return "ST → CT Peer Prices"
         case "price_freshness": return "Price / S&P Freshness"
-        case "senate_efd": return "Senate eFD Direct"
+        case "senate_efd": return "Senate eFD"
         case "senate_relay": return "Residential Proxy"
         default:
             return id.split(separator: "_").map { $0.capitalized }.joined(separator: " ")

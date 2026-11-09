@@ -27,6 +27,14 @@
 export const OCR_TX_DATE_LOOKBACK_DAYS = 730;
 /** Absolute floor when no filing date is known (STOCK Act era). */
 export const OCR_TX_DATE_ABSOLUTE_FLOOR = '1990-01-01';
+/**
+ * How far AFTER the filing date a trade date may sit.  A small skew is real
+ * (Sessions H-2025-20033330: signed 10/22, purchase 10/24), so a few weeks
+ * stay a soft penalty.  A month past the filing is never a disclosed trade:
+ * a filing cannot report a trade that had not happened when it was signed,
+ * so a date that far out is an OCR or transcription error and is held.
+ */
+export const OCR_TX_DATE_AFTER_FILED_GRACE_DAYS = 31;
 
 // ---------------------------------------------------------------------------
 // Strict calendar dates.
@@ -64,7 +72,8 @@ function addDaysYMD(iso: string, delta: number): string {
 export type TxDateRejectCode =
   | 'bad_tx_date'
   | 'future_tx_date'
-  | 'tx_date_too_old';
+  | 'tx_date_too_old'
+  | 'tx_date_after_filing_window';
 
 export type TxDateCheck =
   | { ok: true; iso: string }
@@ -74,10 +83,11 @@ export type TxDateCheck =
  * Validate one transaction date.  Rejects impossible dates, future dates, and
  * dates older than the filing date minus the lookback (or the absolute floor
  * when no filing date is known).  String comparison is safe: all values are
- * zero-padded ISO.  A trade AFTER the filing date is deliberately NOT
- * rejected here: the repo's tested rule publishes after-filed trades with a
- * soft penalty (signature-stamp skew plus amendment fixtures), so the upper
- * bound stays soft in scoreFields and open on the admin path.
+ * zero-padded ISO.  A trade a little AFTER the filing date is deliberately
+ * NOT rejected here: the repo's tested rule publishes after-filed trades with
+ * a soft penalty (signature-stamp skew plus amendment fixtures).  Only a date
+ * more than OCR_TX_DATE_AFTER_FILED_GRACE_DAYS past the filing is rejected
+ * (tx_date_after_filing_window), on both the pipeline and the admin path.
  */
 export function validateTxDate(
   txDate: string | null | undefined,
@@ -101,6 +111,13 @@ export function validateTxDate(
   }
   const filed = (opts.filedDate ?? '').trim();
   if (filed && isValidCalendarDateYMD(filed)) {
+    if (raw > addDaysYMD(filed, OCR_TX_DATE_AFTER_FILED_GRACE_DAYS)) {
+      return {
+        ok: false,
+        code: 'tx_date_after_filing_window',
+        message: `is more than ${OCR_TX_DATE_AFTER_FILED_GRACE_DAYS} days after the filing date '${filed}'`,
+      };
+    }
     if (raw < addDaysYMD(filed, -OCR_TX_DATE_LOOKBACK_DAYS)) {
       return {
         ok: false,
@@ -116,6 +133,36 @@ export function validateTxDate(
     };
   }
   return { ok: true, iso: raw };
+}
+
+// ---------------------------------------------------------------------------
+// Junk asset names.
+// ---------------------------------------------------------------------------
+
+/**
+ * Leading glyphs that never start a real security description.  OCR of a
+ * 278-T row reads the bullet / tick column or a stray quote mark into the name
+ * ("••• APPLE INC", "\u201c MICROSOFT", "' NVIDIA").  Digits, letters, "$" and
+ * "(" do start real names ("3M Co", "$ Treasury", "(The) Walt Disney"), so the
+ * list is explicit instead of "anything not alphanumeric".
+ */
+const JUNK_LEADING_GLYPH_RE = /^[\s\u00a0]*[\u2022\u00b7\u25cf\u25aa\u25a0\u25e6\u2219\u22c5\u2023\u2043"'`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u00ab\u00bb|\\~^*_=<>\u00a6\u00a7\u00a4\u2020\u2021\u00b0\u00ac\uFFFD]/u;
+/** Two or more leading dots/dashes/commas ("... Apple", "-- MSFT", ",,Tesla"). */
+const JUNK_LEADING_RUN_RE = /^[\s\u00a0]*[.,\-\u2013\u2014]{2,}/u;
+
+export type JunkAssetNameReason = 'blank_asset_name' | 'junk_leading_glyph';
+
+/**
+ * Why an asset name is unusable as published text, or null when it is fine.
+ * Blank (or whitespace-only) names and names that begin with junk glyphs are
+ * held on the pipeline and rejected on the admin path; the reader of the feed
+ * would otherwise see "••• Apple" or an empty cell.
+ */
+export function junkAssetNameReason(name: string | null | undefined): JunkAssetNameReason | null {
+  const value = (name ?? '').split(String.fromCharCode(0)).join('');
+  if (!value.trim()) return 'blank_asset_name';
+  if (JUNK_LEADING_GLYPH_RE.test(value) || JUNK_LEADING_RUN_RE.test(value)) return 'junk_leading_glyph';
+  return null;
 }
 
 // ---------------------------------------------------------------------------

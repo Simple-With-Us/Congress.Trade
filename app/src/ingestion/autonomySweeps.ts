@@ -18,14 +18,31 @@
  * idempotent self-healing sweep that re-picks up anything stranded [here].
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 import type { Env } from '../shared/types.ts';
 import { all, batch, run } from '../shared/db.ts';
+import { FETCH_NOT_PUBLISHED_WINDOW_MS } from './fetcher.ts';
+import {
+  EMPTY_FETCH_CYCLE_CAP,
+  type EmptyFetchSweepResult,
+  clampEmptyFetchLimit,
+  completedEmptyIngestStatusSql,
+  isCompletedEmptyRawHandoff,
+  isPastFetchNotPublishedWindow,
+  isUngroundedIngestStatus,
+  ungroundedIngestStatusSql,
+} from './emptyFetchHandoff.ts';
+import { parkEmptyFetchHandoff, rearmFilingForEmptyFetch } from './outbox.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
+import {
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  SENATE_EDGE_BACKOFF_GRACE_MS,
+} from './senateEdgeDeny.ts';
 import {
   maybeRunDeterministicReviewDrain,
   sweepRejectedScannedForLocalVision,
@@ -169,6 +186,155 @@ export async function sweepStrandedFilings(
     if ((res.meta?.changes ?? 0) > 0) terminalized += 1;
   }
   return { terminalized };
+}
+
+interface EmptyFetchCandidate {
+  doc_id: string;
+  chamber: string | null;
+  source_url: string | null;
+  ingest_status: string | null;
+  raw_object_key: string | null;
+  first_seen_at: string | null;
+  live_n: number | null;
+  outbox_status?: string | null;
+}
+
+/**
+ * Re-drive a filing whose ingest_status is outside IngestStatus, including
+ * NULL, once it is older than fetcher.ts FETCH_NOT_PUBLISHED_WINDOW_MS
+ * (7 days). Operational statuses (`not_found`, `failed`, `provider_seeded`)
+ * keep their watcher upgrade path and are not selected. Inside the window a
+ * 404 is still "not yet published", so the sweep waits. The write matches
+ * watcher.ts's not_found/failed upgrade: status `new`, raw key cleared,
+ * outbox `pending` with attempts 0, then enqueueIngestionOutboxNow. Each
+ * pass counts a dead-letter cycle and parks at EMPTY_FETCH_CYCLE_CAP.
+ * Bounded. dryRun reports the doc ids and writes nothing.
+ */
+export async function sweepUngroundedIngestStatus(
+  env: Env,
+  now = new Date(),
+  opts: { limit?: number; dryRun?: boolean } = {},
+): Promise<EmptyFetchSweepResult> {
+  const limit = clampEmptyFetchLimit(opts.limit);
+  const dryRun = opts.dryRun === true;
+  const cutoff = new Date(now.getTime() - FETCH_NOT_PUBLISHED_WINDOW_MS).toISOString();
+  const rows = await all<EmptyFetchCandidate>(
+    env.DB,
+    `SELECT f.doc_id, f.chamber, f.source_url, f.ingest_status, f.raw_object_key, f.first_seen_at,
+            (SELECT COUNT(*) FROM transactions t
+              WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL) AS live_n
+       FROM filings f
+      WHERE f.doc_id NOT LIKE ?
+        AND ${ungroundedIngestStatusSql('f')}
+        AND (f.raw_object_key IS NULL OR TRIM(f.raw_object_key) = '')
+        AND f.first_seen_at IS NOT NULL
+        AND f.first_seen_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM transactions t
+           WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM review_queue rq
+           WHERE rq.doc_id = f.doc_id AND rq.resolved = 1
+        )
+      ORDER BY f.first_seen_at ASC
+      LIMIT ?`,
+    [PROVIDER_MISSING_PREFIX, cutoff, limit],
+  );
+  return applyEmptyFetchCandidates(env, rows, now, dryRun, 'ungrounded');
+}
+
+/**
+ * Extend the outbox consistency pass (transientDlq only replays status
+ * `failed`). A completed hand-off whose filing has no raw object did not
+ * finish the fetch. Same re-arm as sweepUngroundedIngestStatus, with the
+ * existing dead-letter cycle cap. At the cap the row is parked onto
+ * review_queue instead of retried forever.
+ */
+export async function sweepCompletedEmptyRawHandoff(
+  env: Env,
+  now = new Date(),
+  opts: { limit?: number; dryRun?: boolean } = {},
+): Promise<EmptyFetchSweepResult> {
+  const limit = clampEmptyFetchLimit(opts.limit);
+  const dryRun = opts.dryRun === true;
+  const cutoff = new Date(now.getTime() - FETCH_NOT_PUBLISHED_WINDOW_MS).toISOString();
+  const rows = await all<EmptyFetchCandidate>(
+    env.DB,
+    `SELECT f.doc_id, f.chamber, f.source_url, f.ingest_status, f.raw_object_key, f.first_seen_at,
+            o.status AS outbox_status,
+            (SELECT COUNT(*) FROM transactions t
+              WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL) AS live_n
+       FROM ingestion_outbox o
+       JOIN filings f ON f.doc_id = o.doc_id
+      WHERE o.status = 'completed'
+        AND f.doc_id NOT LIKE ?
+        AND (f.raw_object_key IS NULL OR TRIM(f.raw_object_key) = '')
+        AND ${completedEmptyIngestStatusSql('f')}
+        AND f.first_seen_at IS NOT NULL
+        AND f.first_seen_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM transactions t
+           WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM review_queue rq
+           WHERE rq.doc_id = f.doc_id AND rq.resolved = 1
+        )
+      ORDER BY f.first_seen_at ASC
+      LIMIT ?`,
+    [PROVIDER_MISSING_PREFIX, cutoff, limit],
+  );
+  return applyEmptyFetchCandidates(env, rows, now, dryRun, 'completed');
+}
+
+async function applyEmptyFetchCandidates(
+  env: Env,
+  rows: EmptyFetchCandidate[],
+  now: Date,
+  dryRun: boolean,
+  kind: 'ungrounded' | 'completed',
+): Promise<EmptyFetchSweepResult> {
+  const chosen = rows.filter((row) => {
+    const facts = {
+      docId: row.doc_id,
+      ingestStatus: row.ingest_status,
+      rawObjectKey: row.raw_object_key,
+      liveTransactionCount: Number(row.live_n ?? 0),
+    };
+    if (!isPastFetchNotPublishedWindow(row.first_seen_at, now, FETCH_NOT_PUBLISHED_WINDOW_MS)) return false;
+    if (kind === 'ungrounded') return isUngroundedIngestStatus(facts);
+    return isCompletedEmptyRawHandoff({ ...facts, outboxStatus: row.outbox_status ?? null });
+  });
+  const result: EmptyFetchSweepResult = {
+    dryRun,
+    matched: chosen.length,
+    rearmed: 0,
+    parked: 0,
+    docIds: chosen.map((row) => row.doc_id),
+  };
+  if (dryRun) return result;
+  for (const row of chosen) {
+    const doc = {
+      docId: row.doc_id,
+      chamber: row.chamber,
+      sourceUrl: row.source_url,
+      ingestStatus: row.ingest_status,
+    };
+    const outcome = await rearmFilingForEmptyFetch(env, doc, now, {
+      incrementCycles: true,
+      cycleCap: EMPTY_FETCH_CYCLE_CAP,
+    });
+    if (outcome === 'rearmed') {
+      result.rearmed += 1;
+      continue;
+    }
+    if (outcome === 'capped') {
+      const parked = await parkEmptyFetchHandoff(env, doc, now);
+      if (parked) result.parked += 1;
+    }
+  }
+  return result;
 }
 
 export interface FiledDateBackfillResult {
@@ -359,6 +525,7 @@ export async function sweepOgeUndatedFilingDates(
       const obj = await env.RAW_FILES.get(row.raw_object_key);
       if (!obj) continue;
       const bytes = new Uint8Array(await obj.arrayBuffer());
+      const { extractText, getDocumentProxy } = await import('unpdf');
       const pdf = await getDocumentProxy(bytes);
       const { text } = await extractText(pdf, { mergePages: true });
       if (typeof (pdf as unknown as { destroy?: () => void }).destroy === 'function') {
@@ -398,10 +565,13 @@ export interface ResolvedDesyncSweepResult {
  * are ALL resolved=1 yet frozen at a pre-resolution status, so they were
  * invisible to every sweep AND to the health check built to surface them.
  *
- * This sweep owns exactly that population: it does NOT re-open, re-fetch, or
- * re-extract anything (the review outcome stands) — it only stamps the terminal
- * status from review_queue.resolution_kind / ingestion_decisions.  Provider-
- * missing placeholder rows are excluded.  Idempotent and bounded.
+ * This sweep owns exactly that population, plus CT-2453: a filing that is
+ * already published (live transactions and a latest publish decision) but
+ * whose ingest_status is still non-persisted, including `error`, even when
+ * it never had a review_queue row. It does NOT re-open, re-fetch, or
+ * re-extract anything — it only stamps the terminal status. Filings with
+ * no live transactions are left alone. Provider-missing placeholder rows
+ * are excluded. Idempotent and bounded.
  */
 export async function sweepResolvedStatusDesync(
   env: Env,
@@ -442,6 +612,10 @@ export interface AutonomySweepResult {
   unreadableReopened: AutoRejectedUnreadableSweepResult | null;
   /** Bounded replay of transient failed outbox / queue rows. */
   transientDlq: TransientDlqSweepResult | null;
+  /** Completed outbox rows whose filing stored no raw object. */
+  completedEmptyRaw: EmptyFetchSweepResult | null;
+  /** ingest_status outside IngestStatus, no raw object, no live transactions. */
+  ungroundedIngest: EmptyFetchSweepResult | null;
   errors: string[];
 }
 
@@ -671,6 +845,12 @@ export async function sweepPollingHeartbeat(
     );
   } catch {}
   const lastBySource = new Map<string, string | null>(rows.map((r) => [r.source, r.last_attempt]));
+  // A Senate eFD edge-deny backoff (CT-2442) leaves up to 6 hours between
+  // senate attempts by design.  That is not a stuck cron, so it must not page
+  // as one; polling_senate's liveness alarm still pages, naming the backoff.
+  const senateEdgeBackoff = await readSenateEdgeBackoff(env);
+  const senateBackedOff = senateEdgeBackoff !== null
+    && isSenateEdgeBackoffActive(senateEdgeBackoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
 
   const utcHour = now.getUTCHours();
   const isWeekday = now.getUTCDay() >= 1 && now.getUTCDay() <= 5 && WEEKDAY_UTC_HOURS.has(utcHour);
@@ -699,6 +879,7 @@ export async function sweepPollingHeartbeat(
     const ageSec = result.ageBySource[src];
     if (ageSec == null) continue;
     if (ageSec < maxAgeMin * 60) continue; // still within heartbeat window
+    if (src === 'senate' && senateBackedOff) continue; // silent on purpose (edge-deny backoff)
 
     // Heartbeat is broken. Episode semantics: notify on edge, renotify at
     // most every 6h. Same pattern as sweepLivenessAlarms so the operator
@@ -804,6 +985,9 @@ export async function sweepLivenessAlarms(
   const nowIso = now.toISOString();
   for (const check of health.checks) {
     if (!LIVENESS_ALARM_CHECK_IDS.has(check.id)) continue;
+    if ((check.value as { suppressLivenessNotification?: boolean } | undefined)?.suppressLivenessNotification) {
+      continue;
+    }
     result.evaluated += 1;
     const kvKey = `${LIVENESS_ALARM_KV_PREFIX}${check.id}`;
     let episode: LivenessAlarmEpisode | null = null;
@@ -1216,6 +1400,8 @@ export async function runAutonomySweeps(
     executiveTerminals: null,
     unreadableReopened: null,
     transientDlq: null,
+    completedEmptyRaw: null,
+    ungroundedIngest: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -1367,6 +1553,22 @@ export async function runAutonomySweeps(
     result.pollingHeartbeat = await sweepPollingHeartbeat(env, now);
   } catch (err) {
     errors.push(`pollingHeartbeat: ${(err as Error).message}`);
+  }
+
+  // Completed-with-no-raw first, then any leftover invalid ingest_status.
+  // Both are no-ops once the filing is back on `new` or parked to review.
+  try {
+    throwIfAborted();
+    result.completedEmptyRaw = await sweepCompletedEmptyRawHandoff(env, now);
+  } catch (err) {
+    errors.push(`completedEmptyRaw: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    result.ungroundedIngest = await sweepUngroundedIngestStatus(env, now);
+  } catch (err) {
+    errors.push(`ungroundedIngest: ${(err as Error).message}`);
   }
 
   try {

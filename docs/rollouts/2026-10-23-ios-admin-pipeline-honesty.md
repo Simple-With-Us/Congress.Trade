@@ -24,4 +24,4 @@ This change adds an explicit `st_peer_prices` pipeline check (shared with the ho
 
 ## Follow-ups
 
-- Link Linear CT issue once Agent-Sync MCP is authenticated in cloud (claim/closeout).
+- Link Linear CT issue once Ag***-S**c MCP is authenticated in cloud (claim/closeout).

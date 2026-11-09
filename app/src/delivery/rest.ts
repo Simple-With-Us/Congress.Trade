@@ -30,7 +30,11 @@ import { cached } from '../shared/kvCache.ts';
 import { readBuildInfo } from '../shared/buildInfo.ts';
 import { datadogPublicStatus } from '../shared/datadogRuntime.ts';
 import { getDatadogInitInput } from '../shared/datadog.ts';
-import { checkPipelineHealth, type PipelineHealth } from '../shared/pipelineHealth.ts';
+import {
+  checkPipelineHealth,
+  createPipelineHealthCache,
+  type PipelineHealth,
+} from '../shared/pipelineHealth.ts';
 import { probeSenateRelay } from '../ingestion/senateRelayHealth.ts';
 import { providerHealthDiagnostics } from '../extraction/providerHealth.ts';
 import { enhanceSenateHtmlDocument } from '../extraction/senatePaperMedia.ts';
@@ -41,7 +45,9 @@ import {
   buildTransactionsQuery,
   buildTransactionsCountQuery,
   buildTransactionsTodayFilingsQuery,
-  buildTransactionsExportQuery,
+  buildTransactionsExportBatchQuery,
+  buildTransactionsExportCountQuery,
+  EXPORT_BATCH_SIZE,
   mapFiling,
   mapTransaction,
   mapFeedTransaction,
@@ -86,6 +92,13 @@ import {
   webhookTargetLengthError,
 } from './subscriptions.ts';
 import { openSseStream } from './sse.ts';
+import {
+  isMissingRetractionsTable,
+  listRetractions,
+  RETRACTIONS_DEFAULT_LIMIT,
+  RETRACTIONS_MAX_LIMIT,
+} from './retractions.ts';
+import { z } from 'zod';
 import { handleTickerLogoRequest } from '../ui/tickerLogos.ts';
 import { readLogoPolicyOverlay } from '../ui/tickerLogoPolicy.ts';
 import { handleMemberPhotoRequest } from '../enrichment/memberPhotoPack.ts';
@@ -98,6 +111,28 @@ import { checkReadiness, type ReadinessResult } from '../shared/readiness.ts';
 import { costProfilePublicSummary, resolveDenoCostProfile } from '../deno/costProfile.ts';
 import { readLocalLitestreamAge } from '../shared/litestreamAge.ts';
 import { readR2WeeklyArchiveStatus } from '../shared/r2WeeklyArchive.ts';
+
+/** Optional non-negative integer query param ('' counts as absent). */
+const queryUint = z.preprocess(
+  (v) => (v === '' ? undefined : v),
+  z.string().regex(/^\d{1,16}$/).transform(Number).optional(),
+);
+
+/**
+ * GET /transactions/retractions query.  Unknown params are ignored (stripped),
+ * like the other public feed endpoints, so cache-busters keep working.
+ * `limit` above RETRACTIONS_MAX_LIMIT is clamped, as listRetractions did.
+ */
+export const RetractionsQuerySchema = z.object({
+  since: queryUint.transform((v) => v ?? 0),
+  limit: queryUint
+    .transform((v) => v ?? RETRACTIONS_DEFAULT_LIMIT)
+    .pipe(z.number().int().min(1))
+    .transform((v) => Math.min(v, RETRACTIONS_MAX_LIMIT)),
+});
+
+/** GET /stream retraction resume cursor (?retractSince=). */
+export const SseRetractQuerySchema = z.object({ retractSince: queryUint });
 
 function parseIntOrUndef(v: string | undefined): number | undefined {
   if (v === undefined || v === '') return undefined;
@@ -133,7 +168,17 @@ type RestContext = Context<{ Bindings: Env }>;
  */
 const READINESS_CACHE_TTL_MS = 60_000;
 let readinessCache: { at: number; result: ReadinessResult } | null = null;
-let pipelineCache: { at: number; result: PipelineHealth } | null = null;
+// CT-2459: one 60s singleflight pipeline-health cache shared by ALL health
+// endpoints. Previously only /health was cached while /health/deep,
+// /health/polling and /health/latency each paid the full 30+-probe scan per
+// unauthenticated monitor hit.
+// Public health endpoints serve unauthenticated traffic, so the shared
+// cache collects counts only: raw unreadable-filing doc ids stay on the
+// operator-private surfaces (loud alerts, GET /api/admin/pipeline-health/filing-skips).
+const pipelineHealthCache = createPipelineHealthCache(
+  (env) => checkPipelineHealth(env, new Date(), {}, { includeUnreadableDocIds: false }),
+  READINESS_CACHE_TTL_MS,
+);
 
 /**
  * Edge-cache policies for public, read-only GETs. These endpoints carry no
@@ -156,6 +201,7 @@ const PUBLIC_STABLE_CACHE = 'public, s-maxage=300, stale-while-revalidate=600';
  */
 function isPublicReadPath(path: string): boolean {
   return path === '/transactions'
+    || path === '/transactions/retractions'
     || path === '/members'
     || path === '/health'
     || path === '/feed.xml'
@@ -500,11 +546,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     if (!readinessCache || now - readinessCache.at >= READINESS_CACHE_TTL_MS) {
       readinessCache = { at: now, result: await checkReadiness(c.env.DB) };
     }
-    if (!pipelineCache || now - pipelineCache.at >= READINESS_CACHE_TTL_MS) {
-      pipelineCache = { at: now, result: await checkPipelineHealth(c.env) };
-    }
     const readiness = readinessCache.result;
-    const pipeline = pipelineCache.result;
+    const pipeline = await pipelineHealthCache.get(c.env);
     const envx = c.env as Env & Record<string, string | undefined>;
     const costProfile = costProfilePublicSummary(resolveDenoCostProfile(envx));
     // `build` identifies the running revision so a deploy can be *verified*
@@ -514,8 +557,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const storage = await readLocalLitestreamAge();
     const r2Weekly = await readR2WeeklyArchiveStatus();
     // Public-safe Infisical view: source names, counts, errors.  Never values.
-    // Shared-project keys (AGENT_SYNC_*) live only in shared-at-ct; app
-    // projects must not duplicate them (app merge would shadow shared).
+    // Shared-project keys live only in shared-at-ct; app projects must not
+    // duplicate them (app merge would shadow shared).
     const secrets = getSecretResolverStatus(c.env);
     return c.json(
       {
@@ -554,7 +597,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // Deep pipeline diagnostics: probes queue backlogs, provider health counters,
   // LLM spend ceilings, and autopilot status without caching KV inspect calls.
   r.get('/health/deep', async (c) => {
-    const pipeline = await checkPipelineHealth(c.env);
+    const pipeline = await pipelineHealthCache.get(c.env);
     const providers = await providerHealthDiagnostics(c.env);
     const spend = await inspectLlmSpend(c.env);
     return c.json(
@@ -577,7 +620,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // free plan caps at 10 monitors, which is why all three chambers aggregate
   // behind a single monitor instead of one each).
   r.get('/health/polling', async (c) => {
-    const pipeline = await checkPipelineHealth(c.env);
+    const pipeline = await pipelineHealthCache.get(c.env);
     const checks = pipeline.checks.filter(
       (ch) => ch.id === 'polling_house' || ch.id === 'polling_senate' || ch.id === 'polling_executive',
     );
@@ -595,7 +638,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // must page. Scoped, public, unauthenticated, and the second (of two) of
   // the UptimeRobot monitors this pair of endpoints exists for.
   r.get('/health/latency', async (c) => {
-    const check = (await checkPipelineHealth(c.env)).checks.find((ch) => ch.id === 'latency_probes') ?? null;
+    const check = (await pipelineHealthCache.get(c.env)).checks.find((ch) => ch.id === 'latency_probes') ?? null;
     // Pages on 'stalled' OR 'degraded': latency_probes already reserves
     // 'degraded' for a specific provider having gone silent rather than a
     // query hiccup, so both states are a real outage worth paging on.
@@ -614,6 +657,47 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const check = await probeSenateRelay(c.env);
     c.header('Cache-Control', 'no-store');
     return c.json(check, check.ok ? 200 : 503);
+  });
+
+  // --- GET /transactions/retractions --------------------------------------
+  // trade.retract poll feed (retractions.ts): transactions taken off the feed
+  // (unpublish, reject, republish retirement, amendment supersede).  Same
+  // access as /transactions: public, CORS-readable, same daily row budget.
+  // Keyset on the retraction cursor: pass the returned `cursor` back as
+  // `since`.  A retraction whose row was later revived is omitted; the row
+  // comes back through /transactions with a new cursorSeq.
+  r.get('/transactions/retractions', async (c) => {
+    const parsed = RetractionsQuerySchema.safeParse(c.req.query());
+    if (!parsed.success) {
+      return c.json({ error: 'since must be an integer >= 0 and limit an integer from 1 to ' + RETRACTIONS_MAX_LIMIT }, 400);
+    }
+    const { since, limit } = parsed.data;
+    const ip = clientIp(c.req.raw);
+    const budget = await checkRowBudget(c.env, ip);
+    if (!budget.ok) {
+      return c.json(
+        { error: 'daily feed row budget reached' },
+        429,
+        { 'Retry-After': String(budget.retryAfterSec) },
+      );
+    }
+    let page: Awaited<ReturnType<typeof listRetractions>>;
+    try {
+      page = await listRetractions(c.env, since, limit);
+    } catch (err) {
+      // Deploy-before-migrate: 0108 not applied yet.  Same degradation as the
+      // SSE path (retractions off), surfaced as a retryable 503, not a 500.
+      if (!isMissingRetractionsTable(err)) throw err;
+      c.header('Retry-After', '60');
+      return c.json({ error: 'retraction feed not available yet (migration 0108 pending)' }, 503);
+    }
+    await spendRowBudget(c.env, ip, page.retractions.length);
+    c.header('Cache-Control', 'no-store');
+    return c.json({
+      retractions: page.retractions,
+      cursor: page.cursor,
+      hasMore: page.hasMore,
+    });
   });
 
   // --- GET /transactions --------------------------------------------------
@@ -741,12 +825,16 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     if (!isIncrementalNoOp) {
       // Total = ALL rows matching the same ticker/member/type/chamber filters,
       // ignoring the cursor backstop (so the UI can show "showing X of N").
+      // CT-2459: the two aggregate reads are independent — issue them
+      // together instead of serially awaiting each handler-side.
       const countQuery = buildTransactionsCountQuery(params);
-      const countRow = await first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params);
-      total = countRow?.total ?? transactions.length;
       const today = new Date().toISOString().slice(0, 10);
       const todayQuery = buildTransactionsTodayFilingsQuery(params, today);
-      const todayRow = await first<{ total: number }>(c.env.DB, todayQuery.sql, todayQuery.params);
+      const [countRow, todayRow] = await Promise.all([
+        first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params),
+        first<{ total: number }>(c.env.DB, todayQuery.sql, todayQuery.params),
+      ]);
+      total = countRow?.total ?? transactions.length;
       filingsImportedToday = todayRow?.total ?? 0;
     }
     // Count served rows against the caller's daily budget. Incremental polls
@@ -798,10 +886,13 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     // already blocked above. Abuse/cost control = auth + per-IP rate limit
     // (not a silent incomplete file).
     const filters = filtersFromQuery(c.req.query());
-    const built = buildTransactionsExportQuery(filters);
-    const rows = await all<
-      FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
-    >(c.env.DB, built.sql, built.params);
+    // CT-2459: stream the export in bounded batches instead of materializing
+    // rows + lines + joined string (~3 copies of an uncapped match set).
+    // The Premium full-match-set rule is unchanged; the pre-count uses the
+    // same filters/dedupe so X-Export-Row-Count stays honest.
+    const countQuery = buildTransactionsExportCountQuery(filters);
+    const countRow = await first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params);
+    const totalRows = Number(countRow?.total ?? 0);
 
     const header = [
       'filed_at',
@@ -818,39 +909,61 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       'confidence',
       'doc_id',
     ];
-    const lines = [header.join(',')];
-    for (const row of rows) {
-      const t = mapFeedTransaction(row);
-      lines.push(
-        [
-          t.createdAt,
-          t.txDate ?? '',
-          t.fullName ?? cleanMemberNameFallback(row.__member_name) ?? t.filerId ?? '',
-          (row.__chamber as string | null) ?? '',
-          t.ticker ?? '',
-          t.assetName ?? '',
-          t.txType,
-          t.amountMin ?? '',
-          t.amountMax ?? '',
-          t.owner ?? '',
-          t.source,
-          t.confidence,
-          t.docId,
-        ]
-          .map(csvCell)
-          .join(','),
-      );
-    }
-    const csv = lines.join('\r\n');
+    const db = c.env.DB;
+    const encoder = new TextEncoder();
+    let offset = 0;
+    let wroteHeader = false;
+    const csv = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (!wroteHeader) {
+          wroteHeader = true;
+          controller.enqueue(encoder.encode(header.join(',')));
+          return;
+        }
+        const batch = buildTransactionsExportBatchQuery(filters, EXPORT_BATCH_SIZE, offset);
+        const rows = await all<
+          FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
+        >(db, batch.sql, batch.params);
+        if (rows.length === 0) {
+          controller.close();
+          return;
+        }
+        offset += rows.length;
+        let chunk = '';
+        for (const row of rows) {
+          const t = mapFeedTransaction(row);
+          chunk +=
+            '\r\n' +
+            [
+              t.createdAt,
+              t.txDate ?? '',
+              t.fullName ?? cleanMemberNameFallback(row.__member_name) ?? t.filerId ?? '',
+              (row.__chamber as string | null) ?? '',
+              t.ticker ?? '',
+              t.assetName ?? '',
+              t.txType,
+              t.amountMin ?? '',
+              t.amountMax ?? '',
+              t.owner ?? '',
+              t.source,
+              t.confidence,
+              t.docId,
+            ]
+              .map(csvCell)
+              .join(',');
+        }
+        controller.enqueue(encoder.encode(chunk));
+        if (rows.length < EXPORT_BATCH_SIZE) controller.close();
+      },
+    });
     const day = isoDateDaysAgo(0);
     return new Response(csv, {
       headers: {
         'content-type': 'text/csv; charset=utf-8',
         'content-disposition': `attachment; filename="congress-trades-${day}.csv"`,
-        'X-Export-Row-Count': String(rows.length),
-        'X-Export-Complete': 'true',
+        'X-Export-Row-Count': String(totalRows),
         'Access-Control-Expose-Headers':
-          'X-Export-Row-Count, X-Export-Complete, Content-Disposition',
+          'X-Export-Row-Count, Content-Disposition',
       },
     });
   });
@@ -923,6 +1036,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // at the current cursor high-water mark (live tail only). Resume / catch-up
   // uses ?since=<cursor_seq> or the Last-Event-ID header (each trade event
   // carries id:<cursorSeq>); replay is gap-free from the transactions table.
+  // Retractions resume from ?retractSince=; a resume without it replays the
+  // last 24h of retractions (native auto-reconnect cannot resend the query
+  // param), while a fresh open starts at the retraction high-water mark.
   //
   // Token transport: prefer `Authorization: Bearer <secret>` (or
   // X-Subscription-Secret) so the secret stays out of URLs (browser history,
@@ -941,7 +1057,10 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     }
     const since = resolveResumeCursor(c.req.query('since'), c.req.header('Last-Event-ID'));
     const token = subscriptionSecretFromRequest(c, true) ?? undefined;
-    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw));
+    const resume = SseRetractQuerySchema.safeParse(c.req.query());
+    if (!resume.success) return c.json({ error: 'retractSince must be an integer >= 0' }, 400);
+    const retractSince = resume.data.retractSince;
+    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw), {}, retractSince);
   });
 
   // --- GET /logos/ticker --------------------------------------------------
@@ -1264,11 +1383,14 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const from = c.req.query('from');
     const to = c.req.query('to');
     const limit = marketLimit(c.req.query('limit'));
-    const refRow = await get<SecurityRefRow>(c.env.DB, 'SELECT * FROM securities_ref WHERE ticker = ?', [ticker]);
     const pq = priceRangeQuery('price_eod', ticker, from, to, limit);
-    const closes = await all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params);
     const sq = priceRangeQuery('spx_eod', null, from, to, limit);
-    const spx = await all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params);
+    // CT-2459: three independent reads, issued together (was sequential).
+    const [refRow, closes, spx] = await Promise.all([
+      get<SecurityRefRow>(c.env.DB, 'SELECT * FROM securities_ref WHERE ticker = ?', [ticker]),
+      all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params),
+      all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params),
+    ]);
     const staleness = currentPriceStalenessFields(refRow?.current_price_date ?? null);
     return c.json({
       ticker,

@@ -34,7 +34,17 @@ import {
 } from '../share/freshness.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
-import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { checkPipelineHealth, collectEmptyFetchHandoffCheck } from '../shared/pipelineHealth.ts';
+import {
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  SENATE_EDGE_BACKOFF_GRACE_MS,
+} from './senateEdgeDeny.ts';
+import {
+  FMP_LATENCY_SILENCE_PENDING_KV_KEY,
+  type FmpLatencyCheckValue,
+  type FmpLatencySilencePending,
+} from '../shared/fmpLatencyProbeHealth.ts';
 
 import {
   DEFAULT_PIPELINE_STALL_HOURS,
@@ -62,6 +72,13 @@ export type PipelineStallCondition =
   | 'st_peer_prices'
   | 'st_inbound_market_data'
   | 'st_outbound_share_push'
+  /**
+   * Filing outside IngestStatus, or a completed fetch hand-off with no raw
+   * object. Same id as the `/api/health` check. Listed in
+   * HEALTH_STALL_SKIP_IDS so the generic health loop does not open a second
+   * `health_empty_fetch_handoff` episode.
+   */
+  | 'empty_fetch_handoff'
   /** `/api/health` check ids (ingest outbox, extract, delivery, probes, …). */
   | `health_${string}`;
 
@@ -74,6 +91,10 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   // evaluateStPeerPricesStall).  Without this skip the generic loop raises a
   // second health_st_peer_prices episode, so every stall and recovery pages twice.
   'st_peer_prices',
+  // Same id as the dedicated empty_fetch_handoff condition and the health check.
+  'empty_fetch_handoff',
+  // CT-2335: fmp_latency uses a dedicated silence confirm + self-healing grace path.
+  'fmp_latency',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -382,6 +403,23 @@ function hoursLabel(lastAt: string | null, now: Date): string {
   return ((now.getTime() - lastMs) / 3_600_000).toFixed(1);
 }
 
+/**
+ * Page when a filing is sitting outside the statuses the other detectors
+ * watch: no raw object, no live transactions, and either an ingest_status
+ * the type union does not allow or a completed outbox that stored nothing.
+ * `ocr_scan_reader` requires a raw object, so this class never reached it.
+ */
+export async function evaluateEmptyFetchHandoff(env: Env, now = new Date()): Promise<StallEval> {
+  const collected = await collectEmptyFetchHandoffCheck(env, now);
+  const uncollected = collected.check.value == null;
+  return {
+    stalled: collected.check.status === 'critical',
+    detail: collected.check.detail,
+    wakeDocId: collected.wakeDocId,
+    skip: uncollected,
+  };
+}
+
 async function evaluateOcrStall(env: Env, now: Date, thresholdMs: number): Promise<StallEval> {
   const backlog = await countScannedReaderBacklog(env);
   const workUnits = backlog.pending + backlog.failed;
@@ -621,6 +659,89 @@ async function processStallCondition(
   result.alerted.push(condition);
 }
 
+/** Two hourly sweeps plus slack; older pending marks restart the confirm window. */
+const FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS = 150 * 60 * 1000;
+
+async function processFmpLatencySilenceAlert(
+  env: Env,
+  check: { status: string; detail: string; value?: unknown },
+  now: Date,
+  result: PipelineStallAlertResult,
+  deps: { fetchImpl?: typeof fetch },
+): Promise<void> {
+  const condition = 'health_fmp_latency' satisfies PipelineStallCondition;
+  const pendingKey = FMP_LATENCY_SILENCE_PENDING_KV_KEY;
+
+  // Missing telemetry is neither silence nor recovery: keep the confirm
+  // window (and any active stall) as-is until a real reading arrives.
+  if (check.status === 'unknown') {
+    result.evaluated.push(condition);
+    return;
+  }
+
+  if (check.status !== 'critical') {
+    try {
+      await env.CONFIG_KV.delete(pendingKey);
+    } catch {
+      /* fail-soft */
+    }
+    await processStallCondition(
+      env,
+      condition,
+      { stalled: false, detail: check.detail || `${condition} cleared` },
+      now,
+      result,
+      deps,
+    );
+    return;
+  }
+
+  let pending: FmpLatencySilencePending | null = null;
+  try {
+    pending = await env.CONFIG_KV.get<FmpLatencySilencePending>(pendingKey, 'json');
+  } catch {
+    pending = null;
+  }
+  // A pending mark older than two sweeps is stale (sweeps were skipped or the
+  // check cleared without a sweep seeing it); start the confirm window over.
+  const staleAnchor = pending?.lastSeenAt ?? pending?.firstSeenAt;
+  const pendingAgeMs = pending && staleAnchor ? now.getTime() - Date.parse(staleAnchor) : Number.NaN;
+  if (!pending || !Number.isFinite(pendingAgeMs) || pendingAgeMs > FMP_LATENCY_SILENCE_PENDING_MAX_AGE_MS) {
+    const mark: FmpLatencySilencePending = { firstSeenAt: now.toISOString(), lastSeenAt: now.toISOString() };
+    try {
+      await env.CONFIG_KV.put(pendingKey, JSON.stringify(mark));
+    } catch {
+      /* fail-soft */
+    }
+    result.evaluated.push(condition);
+    return;
+  }
+
+  const value = check.value as FmpLatencyCheckValue | null | undefined;
+  const detail = value?.selfHealingSilence
+    ? `[health/critical past self-healing grace] ${check.detail}`
+    : `[health/critical confirmed x2 hourly sweeps since ${pending.firstSeenAt}] ${check.detail}`;
+  await processStallCondition(
+    env,
+    condition,
+    { stalled: true, detail },
+    now,
+    result,
+    deps,
+  );
+  try {
+    await env.CONFIG_KV.put(
+      pendingKey,
+      JSON.stringify({
+        firstSeenAt: pending.firstSeenAt,
+        lastSeenAt: now.toISOString(),
+      } satisfies FmpLatencySilencePending),
+    );
+  } catch {
+    /* fail-soft */
+  }
+}
+
 /**
  * Stall detector: ingest chambers, OCR/scan-reader, and Socratic.Trade sharing.
  * Runs on the hourly autonomy sweep (deduped per condition per window).
@@ -638,9 +759,17 @@ export async function sweepPipelineStallAlerts(
     { condition: 'executive_fetch_success', source: 'executive' },
   ];
 
+  // Senate is deferred until the health loop below: when the eFD edge deny
+  // (CT-2442) is what stalls health_senate_efd, that alert is the single
+  // surviving page and carries the fetch-success fact (see health loop).
+  let senateFetchEval: StallEval | null = null;
   for (const { condition, source } of chamberChecks) {
     const thresholdMs = stallWindowMs(readPipelineStallHours(env, condition));
     const evalResult = await evaluateChamberFetchStall(env, source, now, thresholdMs);
+    if (condition === 'senate_fetch_success') {
+      senateFetchEval = evalResult;
+      continue;
+    }
     await processStallCondition(env, condition, evalResult, now, result, deps);
   }
 
@@ -649,6 +778,21 @@ export async function sweepPipelineStallAlerts(
     env,
     'ocr_scan_reader',
     await evaluateOcrStall(env, now, ocrThresholdMs),
+    now,
+    result,
+    deps,
+  );
+
+  const emptyFetch = await collectEmptyFetchHandoffCheck(env, now);
+  await processStallCondition(
+    env,
+    'empty_fetch_handoff',
+    {
+      stalled: emptyFetch.check.status === 'critical',
+      detail: emptyFetch.check.detail,
+      wakeDocId: emptyFetch.wakeDocId,
+      skip: emptyFetch.check.value == null,
+    },
     now,
     result,
     deps,
@@ -696,12 +840,13 @@ export async function sweepPipelineStallAlerts(
   );
 
   const HEALTH_STALL_BUDGET_MS = 20_000;
+  let senateFetchFolded = false;
   try {
     let healthTimeoutId: ReturnType<typeof setTimeout> | undefined;
     const health = await (async () => {
       try {
         return await Promise.race([
-          checkPipelineHealth(env, now),
+          checkPipelineHealth(env, now, { emptyFetch }),
           new Promise<never>((_, reject) => {
             healthTimeoutId = setTimeout(
               () => reject(new Error(`checkPipelineHealth exceeded ${HEALTH_STALL_BUDGET_MS}ms`)),
@@ -713,17 +858,41 @@ export async function sweepPipelineStallAlerts(
         if (healthTimeoutId !== undefined) clearTimeout(healthTimeoutId);
       }
     })();
+    // One alert per root cause: an active Senate edge-deny backoff stalls
+    // health_senate_efd (critical in pipelineHealth) and starves Senate
+    // fetches, so the senate_fetch_success stall is the same incident.  Fold
+    // its detail into the surviving health_senate_efd alert instead of
+    // paging twice.  Only stalled/critical health pages here, so a degraded
+    // senate_efd never silences a fetch stall with no surviving alert.
+    const senateEfdCheck = health.checks.find((c) => c.id === 'senate_efd');
+    const senateEfdStalled = senateEfdCheck?.status === 'stalled' || senateEfdCheck?.status === 'critical';
+    if (senateEfdStalled && senateFetchEval?.stalled && !senateFetchEval.skip) {
+      const backoff = await readSenateEdgeBackoff(env);
+      senateFetchFolded = backoff !== null
+        && isSenateEdgeBackoffActive(backoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
+    }
+    if (senateFetchFolded && senateFetchEval) {
+      // No separate page while folded: health_senate_efd speaks for both.
+      // Record the evaluation, but leave any existing senate_fetch_success
+      // episode untouched, so its recovery webhook still fires once Senate
+      // fetches succeed again, and a fetch stall that outlives the deny keeps
+      // its own dedup window.
+      result.evaluated.push('senate_fetch_success');
+    }
     for (const check of health.checks) {
       if (HEALTH_STALL_SKIP_IDS.has(check.id)) continue;
       const stalled = check.status === 'stalled' || check.status === 'critical';
       const condition = `health_${check.id}` satisfies PipelineStallCondition;
+      const folded = senateFetchFolded && stalled && check.id === 'senate_efd' && senateFetchEval
+        ? `; folded senate_fetch_success: ${senateFetchEval.detail}`
+        : '';
       await processStallCondition(
         env,
         condition,
         {
           stalled,
           detail: stalled
-            ? `[health/${check.status}] ${check.detail}`
+            ? `[health/${check.status}] ${check.detail}${folded}`
             : (check.detail || `${check.id} ok`),
         },
         now,
@@ -731,8 +900,16 @@ export async function sweepPipelineStallAlerts(
         deps,
       );
     }
+    const fmpCheck = health.checks.find((c) => c.id === 'fmp_latency');
+    if (fmpCheck) {
+      await processFmpLatencySilenceAlert(env, fmpCheck, now, result, deps);
+    }
   } catch {
     /* health collection must not break the stall sweep */
+  }
+
+  if (!senateFetchFolded && senateFetchEval) {
+    await processStallCondition(env, 'senate_fetch_success', senateFetchEval, now, result, deps);
   }
 
   return result;

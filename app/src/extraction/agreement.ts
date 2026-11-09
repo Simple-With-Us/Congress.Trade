@@ -95,9 +95,17 @@ import {
   MAX_PUBLISH_TRANSACTIONS_PER_FILING,
   loadResolver,
   normalize,
+  OGE_ROWS_INCOMPLETE_REASON,
   resolveVerifiedEmpty,
 } from './normalizer.ts';
-import { classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import { assessOgeRowCompleteness, classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import {
+  maybeRecoverOgeRowsViaLocalOcr,
+  ogeLocalOcrAlreadyAttempted,
+  ogeLocalOcrReviewPayload,
+  OGE_LOCAL_OCR_EXTRACTOR,
+} from './ogeLocalOcr.ts';
+import { deprecatePredecessorFilingTransactions } from './amendmentPredecessor.ts';
 import { cleanAssetString } from './nameNormalizer.ts';
 import { prepareExtractedTx } from './prepareTx.ts';
 import { mapFiling, type FilingRow } from '../delivery/rows.ts';
@@ -802,40 +810,16 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
     )`;
 
 /**
- * Soft-deprecates live transactions from predecessor filings when an amended filing is published.
+ * Soft-deprecates the live transactions of the filing an amended filing
+ * supersedes.
+ *
+ * CT-2452: the predecessor match used to be "same filer + same filed_date, or
+ * a shared doc-id prefix", which deprecated every sibling PTR filed on the same
+ * day (545 Trump 278-T transactions).  The rule now requires a real
+ * amended-document relationship AND an overlapping reporting period; see
+ * ./amendmentPredecessor.ts for the whole rule and why it fails closed.
  */
-export async function deprecatePredecessorFilingTransactions(
-  db: D1Database,
-  docId: string,
-  filerId: string | null,
-  filedDate: string | null,
-  nowIso: string = new Date().toISOString(),
-): Promise<number> {
-  if (!filerId) return 0;
-  const reason = `superseded by amendment ${docId}`;
-
-  const stmt = `
-    UPDATE transactions
-       SET deprecated_at = ?,
-           deprecated_reason = ?
-     WHERE doc_id IN (
-       SELECT doc_id FROM filings
-        WHERE filer_id = ? AND doc_id <> ?
-          AND ingest_status = 'persisted'
-          AND (
-            (filed_date IS NOT NULL AND filed_date = ?)
-            OR (doc_id LIKE 'E-%' AND SUBSTR(doc_id, 1, 35) = SUBSTR(?, 1, 35))
-          )
-     ) AND deprecated_at IS NULL
-  `;
-  try {
-    const res = await run(db, stmt, [nowIso, reason, filerId, docId, filedDate ?? '', docId]);
-    return res.meta?.changes ?? 0;
-  } catch (err) {
-    console.warn('deprecatePredecessorFilingTransactions failed:', docId, (err as Error).message);
-    return 0;
-  }
-}
+export { deprecatePredecessorFilingTransactions };
 
 /**
  * Persist all rows and resolve the review item in one D1 batch. Every statement
@@ -1094,6 +1078,35 @@ export async function finalizePublish(
     };
   }
   parsed = withoutSamples;
+  // 278-T completeness: a filing parked because the reader dropped numbered
+  // rows is not publishable by a cascade/stored-run read, which cannot prove
+  // it recovered them; neither is a candidate set whose own row numbers skip.
+  if (filing.chamber === 'executive') {
+    const completeness = assessOgeRowCompleteness(null, parsed);
+    let parkedIncomplete = false;
+    try {
+      // Only an OPEN parking counts: a resolved row's reason is history.
+      const review = await get<{ reason: string | null }>(
+        env.DB,
+        'SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0',
+        [docId],
+      );
+      parkedIncomplete = String(review?.reason ?? '').split(',').map((t) => t.trim())
+        .includes(OGE_ROWS_INCOMPLETE_REASON);
+    } catch {
+      // Fail closed: an unreadable review row must not let a partial set publish.
+      parkedIncomplete = true;
+    }
+    if (parkedIncomplete || (completeness !== null && completeness.missingCount > 0)) {
+      return {
+        docId,
+        outcome: 'agree_but_hardfail',
+        tier: audit.tier,
+        rowCount: parsed.length,
+        flags: [OGE_ROWS_INCOMPLETE_REASON],
+      };
+    }
+  }
   const filedDate = frow.filed_date?.slice(0, 10) ?? null;
   if (parsed.some((tx) => !isValidTransactionDate(tx.txDate) || (filedDate !== null && tx.txDate! > filedDate))) {
     return {
@@ -1816,7 +1829,55 @@ async function maybeSettleExecutiveZeroRead(
     }
   }
   if (classified.disposition === 'unreadable') {
-    const closed = await closeUnreadableExecutive(env, docId, { respectSuppression: true, claimToken });
+    // CT-2448: try the local tesseract pass before parking.  The stored PDF
+    // bytes are already in hand here, so the pass costs no extra fetch.  When
+    // both reads agree the rows go through normalization exactly like the
+    // deterministic recovery above; when they do not, the filing parks as it
+    // does today with the unreconciled rows listed in the payload.
+    let ocrOutcome = null;
+    try {
+      if (!(await ogeLocalOcrAlreadyAttempted(env, docId))) {
+        ocrOutcome = await maybeRecoverOgeRowsViaLocalOcr(
+          env,
+          {
+            docId,
+            chamber: filing.chamber ?? '',
+            filingType: filing.filing_type ?? null,
+          },
+          bytes,
+          'unreadable',
+        );
+      }
+    } catch (err) {
+      console.warn('executive zero-read: local OCR retry failed:', docId, (err as Error).message);
+    }
+    if (ocrOutcome?.status === 'rows') {
+      try {
+        const norm = await normalize(env, mapFiling(filing), ocrOutcome.rows, {
+          extractor: OGE_LOCAL_OCR_EXTRACTOR,
+          parseDisposition: 'rows',
+        });
+        return {
+          kind: 'rows',
+          needsReview: norm.needsReview,
+          published: norm.published,
+          settled: norm.settled === true,
+          rowCount: norm.transactions.length,
+          reason: norm.reviewReason,
+        };
+      } catch (err) {
+        console.warn(
+          'executive zero-read: local OCR rows failed normalization:',
+          docId,
+          (err as Error).message,
+        );
+      }
+    }
+    const closed = await closeUnreadableExecutive(env, docId, {
+      respectSuppression: true,
+      claimToken,
+      payload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
+    });
     return closed ? { kind: 'unreadable' } : null;
   }
   const closed = await closeVerifiedEmptyExecutive(env, docId, { respectSuppression: true, claimToken });

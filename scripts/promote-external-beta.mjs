@@ -135,17 +135,30 @@ export function chooseExternalGroup(groups, groupName = null) {
  * Number("nope") are all rejected here rather than being allowed through as a
  * number that silently matches nothing.
  */
+/** One to three dot-separated integers, not all zero ("1.1.2", "0.1.0"). */
+export function isDottedBuild(raw) {
+  if (!/^\d+(\.\d+){1,2}$/.test(raw)) return false;
+  const parts = raw.split(".").map(Number);
+  if (!parts.every((x) => Number.isSafeInteger(x))) return false;
+  return parts.some((x) => x > 0);
+}
+
 export function resolveExpectedBuildNumber({ explicit = null, repoRoot = ROOT } = {}) {
   const raw = explicit == null ? "" : String(explicit).trim();
   if (raw !== "") {
-    // A build number is a plain integer, the way the fleet script words it:
-    // "N must be a plain integer above every build already shipped".  So the
-    // digits only --  "1e3" and "2320.5" are not build numbers, even though
-    // Number() would happily turn them into numbers.
-    if (!/^\d+$/.test(raw)) return null;
-    const n = Number(raw);
-    if (!Number.isSafeInteger(n) || n <= 0) return null;
-    return n;
+    // A plain integer ("239") or one to three dot-separated integers
+    // ("1.1.2"):  the two forms Apple's CFBundleVersion takes.  "1e3", "1..2",
+    // ".1", "1." and a fourth component are not build numbers, even though
+    // Number() would turn some of them into numbers.  A plain integer comes
+    // back as a number, a dotted build as the exact string, because "1.1.2"
+    // must reach App Store Connect character for character.
+    if (/^\d+$/.test(raw)) {
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n <= 0) return null;
+      return n;
+    }
+    if (isDottedBuild(raw)) return raw;
+    return null;
   }
   const res = spawnSync("git", ["-C", repoRoot, "rev-list", "--count", "HEAD"], { encoding: "utf8" });
   if (res.status !== 0) return null;
@@ -163,10 +176,22 @@ export function resolveExpectedBuildNumber({ explicit = null, repoRoot = ROOT } 
  * guess there ("N builds match version X -- ambiguous, refusing to guess");
  * so does this.
  */
-export function findExactBuild(asc, appId, buildNumber) {
+export function findExactBuild(asc, appId, buildNumber, marketingVersion = null) {
+  // A marketing version, when the ship knows it, pins the lookup to that train:
+  // a dotted build string is only unique inside its train.
+  let trainFilter = "";
+  if (marketingVersion != null && String(marketingVersion).trim() !== "") {
+    // Given but malformed:  refuse rather than quietly look the build up
+    // across every train, which is the ambiguity the pin exists to avoid.
+    const mv = String(marketingVersion).trim();
+    if (!/^\d+(\.\d+)*$/.test(mv)) {
+      return { ok: false, error: `invalid marketing version ${JSON.stringify(mv)}; refusing an unpinned lookup`, rows: [], build: null };
+    }
+    trainFilter = `&filter[preReleaseVersion.version]=${encodeURIComponent(mv)}`;
+  }
   const res = asc(
     "GET",
-    `/v1/builds?filter[app]=${appId}&filter[version]=${buildNumber}` +
+    `/v1/builds?filter[app]=${appId}&filter[version]=${buildNumber}${trainFilter}` +
       `&limit=2&include=buildBetaDetail,preReleaseVersion` +
       `&fields[builds]=version,processingState,uploadedDate`
   );
@@ -205,6 +230,7 @@ export function promoteExternalBeta({
   appId,
   groupName = null,
   buildNumber = null,
+  marketingVersion = null,
   log = () => {},
   warn = () => {},
 }) {
@@ -232,7 +258,10 @@ export function promoteExternalBeta({
     note("no App Store Connect app id; nothing promoted");
     return out;
   }
-  if (!Number.isInteger(buildNumber) || buildNumber <= 0) {
+  const buildOk =
+    (Number.isInteger(buildNumber) && buildNumber > 0) ||
+    (typeof buildNumber === "string" && isDottedBuild(buildNumber));
+  if (!buildOk) {
     out.outcome = "no-target-build";
     note(
       "no build number to promote; pass --build <n> with the CFBundleVersion the ship uploaded"
@@ -264,7 +293,7 @@ export function promoteExternalBeta({
   out.groupName = group.attributes?.name || null;
 
   // 2. THE build -- by number, never by recency.
-  const found = findExactBuild(asc, appId, buildNumber);
+  const found = findExactBuild(asc, appId, buildNumber, marketingVersion);
   if (!found.ok) {
     out.outcome = "asc-error";
     note(`could not look up build ${buildNumber}: ${found.error}`);
@@ -402,6 +431,7 @@ function parseArgs(argv) {
     else if (argv[i] === "--group") out.group = argv[++i] || null;
     else if (argv[i] === "--app") out.appKey = argv[++i] || DEFAULT_APP_KEY;
     else if (argv[i] === "--build") out.build = argv[++i] || null;
+    else if (argv[i] === "--marketing") out.marketing = argv[++i] || null;
   }
   return out;
 }
@@ -439,6 +469,7 @@ function main() {
     appId,
     groupName: args.group,
     buildNumber,
+    marketingVersion: args.marketing || null,
     log: (m) => console.error(`promote-external-beta: ${m}`),
     warn: (m) => console.error(`promote-external-beta: warning: ${m}`),
   });

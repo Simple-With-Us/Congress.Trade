@@ -51,9 +51,59 @@ jobs:
                 ;;
             esac
           fi
+      # CT-2459: full history is only needed by the weekly scheduled sweep.
+      # PR/push range scans check out shallow and fetch just the two range
+      # endpoints below, instead of every ref, tag and blob since day one.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'schedule'
         with:
           fetch-depth: 0
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name != 'schedule'
+        with:
+          fetch-depth: 1
+
+      - name: Fetch scan-range endpoints
+        if: github.event_name != 'schedule'
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) lo="$PR_BASE"; hi="$PR_HEAD" ;;
+            push) lo="$PUSH_BEFORE"; hi="$PUSH_AFTER" ;;
+            *) lo=""; hi="" ;;
+          esac
+          if [ -n "$lo" ] && [ "$lo" != "0000000000000000000000000000000000000000" ] && [ -n "$hi" ]; then
+            git fetch --no-tags origin "$lo" "$hi"
+            # Depth-1 checkout leaves hi without parents. Without an ancestry
+            # link, gitleaks 8.24.3 cannot walk lo..hi and falls back to a
+            # full-tree tip scan, attributing every pre-existing finding to
+            # the tip SHA (seen on main after #2943). Deepen until lo is an
+            # ancestor of hi; unshallow only if deepen cannot bridge them.
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              for _ in 1 2 3 4 5 6 7 8; do
+                git fetch --no-tags --deepen=50 origin || true
+                if git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+                  break
+                fi
+              done
+            fi
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+            fi
+          else
+            # No usable range (new branch / first push): the scan falls back
+            # to full history, so restore it rather than silently scanning
+            # a shallow slice.
+            git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+          fi
 
       # gitleaks-action@e0c47f4 was replaced by a direct binary invocation.
       # The scan itself was never the problem: it logged "no leaks found" and

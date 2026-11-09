@@ -496,6 +496,15 @@ struct MainTabView: View {
         .task {
             store.modelContext = modelContext
             if store.feed == nil {
+                // CT-2459: Trends is the landing tab — let its fan-out win
+                // the launch bandwidth instead of racing the feed page +
+                // bootstrap + signed-in probes against it (~17 requests
+                // contended before first useful paint). The SwiftData
+                // cache already paints the Trades list instantly; its
+                // network refresh follows immediately after.
+                if tabRouter.selection == .trends {
+                    await store.refreshTrends()
+                }
                 await store.refresh()
             }
             // Catch-up for a purchase that was charged and finished locally but

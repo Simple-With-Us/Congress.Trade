@@ -15,6 +15,7 @@ import {
   isMostlyGarbageOcrExtraction,
 } from '../normalizer.ts';
 import type { Env, Filing, ParsedTx } from '../../shared/types.ts';
+import { parseOgeTransactionRows } from '../ogeText.ts';
 
 beforeEach(() => {
   clearResolverCache();
@@ -454,6 +455,40 @@ describe('normalize', () => {
     const { env, cap } = makeEnv([{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }]);
     const result = await normalize(env, filing(), [tx({ amountMin: null, amountMax: null })]);
     expect(result.needsReview).toBe(true);
+    expect(cap.reviewRows).toHaveLength(1);
+    expect(String(cap.reviewRows[0][1])).toContain('no_amount');
+  });
+
+  it('local Grok vision holds the filing when every row omitted the amount', async () => {
+    const { env, cap } = makeEnv([]);
+    const result = await normalize(
+      env,
+      filing({ chamber: 'house', docKind: 'scanned_pdf', extractor: 'local_grok_cli_v1' }),
+      [
+        tx({
+          ticker: null,
+          assetName: 'Bridge Builder Sm/Mid Value',
+          txType: 'S',
+          amountMin: null,
+          amountMax: null,
+          confidence: 0.97,
+          rawText: 'Bridge Builder Sm/Mid Value',
+        }),
+        tx({
+          ticker: null,
+          assetName: 'Vng Growth Index',
+          txType: 'S',
+          amountMin: null,
+          amountMax: null,
+          confidence: 0.97,
+          rawText: 'Vng Growth Index',
+        }),
+      ],
+      { extractor: 'local_grok_cli_v1', source: 'local_mac' },
+    );
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
     expect(cap.reviewRows).toHaveLength(1);
     expect(String(cap.reviewRows[0][1])).toContain('no_amount');
   });
@@ -1025,7 +1060,9 @@ describe('normalize', () => {
     );
     const result = await normalize(
       env,
-      filing({ filerId: 'house-ok01-kevin-hern', filingType: 'Amendment' }),
+      // filedDate tracks the trade: a trade more than 31 days after the
+      // filing date is held as tx_date_after_filing_window.
+      filing({ filerId: 'house-ok01-kevin-hern', filingType: 'Amendment', filedDate: '2026-08-20' }),
       [
         tx({
           ticker: 'VSNT',
@@ -1704,5 +1741,50 @@ describe('constant-type vision extraction review round trip', () => {
     expect(response.status).toBe(200);
     expect(cap.insertedTx).toHaveLength(3);
     expect(cap.insertedTx.map((r) => r.txType)).toEqual([type, type, type]);
+  });
+});
+
+describe('normalize — 278-T row completeness gate', () => {
+  const HEADER = 'Transactions # DESCRIPTION TYPE DATE NOTIFICATION RECEIVED OVER 30 DAYS AGO AMOUNT';
+  const NAMES = ['Apple Inc.', 'Microsoft Corp.', 'Badger Meter Inc.', 'Teleflex Inc.', 'Etsy Inc.', 'Lazard Inc.', 'Costco Whsl Corp.', 'Plexus Corp.', 'Cooper Cos Inc.', 'Xencor Inc.'];
+  const text = (garble: number[]) => `Trump, Donald J. - Page 2 ${HEADER} ${NAMES.map((name, i) =>
+    `${i + 1} ${name} ${garble.includes(i + 1) ? 'Salo' : 'Sale'} 07/29/2026 No $1,001 - $15,000`).join(' ')} Endnotes`;
+  const execFiling = () => filing({
+    docId: 'E-2026-test-09-08-2026-278t',
+    chamber: 'executive',
+    filerId: 'EXEC-TEST',
+    filedDate: '2026-09-08',
+    docKind: 'text_pdf',
+    extractor: 'ogeText',
+  });
+
+  it('holds a text-layer parse that dropped a numbered row instead of publishing the rest', async () => {
+    const { env, cap } = makeEnv([]);
+    const sourceText = text([5]);
+    const parsed = parseOgeTransactionRows(sourceText);
+    expect(parsed).toHaveLength(9);
+    const result = await normalize(env, execFiling(), parsed, {
+      extractor: 'ogeText',
+      sourceText,
+      parseDisposition: 'rows',
+    });
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(result.reviewReason?.split(',')[0]).toBe('oge_rows_incomplete');
+    expect(cap.insertedTx).toHaveLength(0);
+    expect(String(cap.reviewRows[0][1])).toContain('oge_rows_incomplete');
+  });
+
+  it('does not hold a complete parse for completeness', async () => {
+    const { env } = makeEnv([]);
+    const sourceText = text([]);
+    const parsed = parseOgeTransactionRows(sourceText);
+    expect(parsed).toHaveLength(10);
+    const result = await normalize(env, execFiling(), parsed, {
+      extractor: 'ogeText',
+      sourceText,
+      parseDisposition: 'rows',
+    });
+    expect(result.reviewReason ?? '').not.toContain('oge_rows_incomplete');
   });
 });

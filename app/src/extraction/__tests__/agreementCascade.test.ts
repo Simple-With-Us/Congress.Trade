@@ -92,7 +92,7 @@ interface Captured {
   decisions: Array<{ action: unknown; source: unknown; reason: unknown; payload: Record<string, unknown> | null }>;
 }
 
-function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; priorAttempts?: number; maxAttempts?: string; env?: Record<string, unknown>; rawDocBytes?: ArrayBuffer } = {}) {
+function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; priorAttempts?: number; maxAttempts?: string; env?: Record<string, unknown>; rawDocBytes?: ArrayBuffer; reviewReason?: string } = {}) {
   const cap: Captured = { inserted: [], resolved: [], sent: [], reviewFlags: [], decisions: [] };
   const review = {
     resolved: 0,
@@ -139,6 +139,9 @@ function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; pr
           }
           if (/SELECT review_revision FROM review_queue/i.test(sql)) {
             return { review_revision: review.revision } as T;
+          }
+          if (opts.reviewReason !== undefined && /SELECT reason FROM review_queue WHERE doc_id = \? AND resolved = 0/i.test(sql)) {
+            return { reason: opts.reviewReason } as T;
           }
           return null as T | null;
         },
@@ -285,6 +288,27 @@ describe('allSuccessfulReadsEmpty', () => {
 describe('agreement cascade — tier 1', () => {
   afterEach(() => vi.unstubAllGlobals());
 
+  it('refuses to publish an executive filing parked as oge_rows_incomplete', async () => {
+    // A unanimous cascade read cannot prove it recovered the numbered rows the
+    // text parser dropped; only a human / full transcription may publish it.
+    stub(asJson([row('AAPL', 'B', AB)]), asJson([row('AAPL', 'B', AB)]));
+    const { env, cap } = makeEnv({ reviewReason: 'oge_rows_incomplete,low_confidence' });
+    const res = await handleAgreementCheck(env, 'E-2026-jane-doe-01-15-2026-278t', 'raw/x');
+    expect(cap.inserted).toHaveLength(0);
+    expect(cap.resolved).toHaveLength(0);
+    expect(res).toMatchObject({ outcome: 'agree_but_hardfail', flags: ['oge_rows_incomplete'] });
+  });
+
+
+  it('refuses an executive candidate set whose own row numbers skip', async () => {
+    const numbered = (n: number) => row('AAPL', 'B', AB, { rawText: `#${n} APPLE INC purchase`, supplementalText: `OGE 278-T row ${n}, page 2 of 2` });
+    stub(asJson([numbered(1), numbered(3)]), asJson([numbered(1), numbered(3)]));
+    const { env, cap } = makeEnv({ reviewReason: 'low_confidence' });
+    const res = await handleAgreementCheck(env, 'E-2026-jane-doe-01-15-2026-278t', 'raw/x');
+    expect(cap.inserted).toHaveLength(0);
+    expect(res).toMatchObject({ outcome: 'agree_but_hardfail', flags: ['oge_rows_incomplete'] });
+  });
+
   it('tier-1 unanimous publishes (regression)', async () => {
     stub(asJson([row('AAPL', 'B', AB)]), asJson([row('AAPL', 'B', AB)]));
     const { env, cap } = makeEnv();
@@ -413,6 +437,23 @@ describe('agreement cascade — tier 2 / tier 3', () => {
     const decision = cap.decisions.find((d) => d.action === 'agreement_published');
     expect(decision?.payload).toMatchObject({ resolvedBy: 'agreement-cascade', tier: 3 });
     expect(decision?.payload?.votes).toBeTruthy(); // per-field vote summary present
+  });
+
+  it('2-of-3 owner majority on a single lot publishes the majority owner (tier 3)', async () => {
+    // Owner disagreement alone: tier-2 unanimity fails, the lot still meets under
+    // the owner-aware key back-compat, and tier 3 votes owner 2-of-3.  A split of
+    // the lot into two keys, or a collapse that drops the vote, fails here.
+    stub(
+      asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
+      asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
+      asJson([row('AAPL', 'B', AB, { owner: 'spouse' })]),
+    );
+    const { env, cap } = makeEnv();
+    const res = await processAgreementCascadeTier2(env, MODELS_C, 'H-owner-majority', 'raw/x', false);
+    expect(res).toMatchObject({ outcome: 'published', tier: 3 });
+    expect(cap.inserted).toHaveLength(1);
+    const insertedRows = JSON.parse(cap.inserted[0][0] as string) as Array<{ owner: string | null }>;
+    expect(insertedRows.map((r) => r.owner)).toEqual(['self']);
   });
 
   it('does not drop a minority-only extra row', async () => {

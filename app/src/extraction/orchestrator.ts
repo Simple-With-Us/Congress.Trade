@@ -24,6 +24,12 @@ import {
   type ExtractorUsage,
 } from '../extractors/types.ts';
 import { isDeterministicExtractor, normalize } from './normalizer.ts';
+import {
+  isOgeLocalOcrCandidate,
+  maybeRecoverOgeRowsViaLocalOcr,
+  ogeLocalOcrReviewPayload,
+  OGE_LOCAL_OCR_EXTRACTOR,
+} from './ogeLocalOcr.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { enqueueAgreementCheck } from './agreement.ts';
 import { ensureDocClass } from './docClassifier.ts';
@@ -183,15 +189,44 @@ export async function extractAndNormalize(
     }
     throw err;
   }
-  const extracted = await extractParsed(env, docId, lease);
+  const extracted = await extractParsed(env, docId, lease, { keepBytes: true });
   if (!extracted) return; // missing row / raw object: already recorded as error.
 
   await lease?.assertOwned();
-  const result = await normalize(env, extracted.filing, extracted.transactions, {
-    extractor: extracted.extractor,
-    modelVersion: extracted.modelVersion ?? null,
-    sourceText: extracted.raw,
-    parseDisposition: extracted.parseDisposition,
+
+  // CT-2448: before the OGE path parks a 278-T as `oge_text_unreadable`,
+  // run the local tesseract pass over the stored PDF.  When both reads agree
+  // the recovered rows go through the same normalize() decision model as any
+  // other extraction; when they do not, the filing parks exactly as it does
+  // today and the park payload lists the rows that did not reconcile.
+  let ocrOutcome = null;
+  try {
+    ocrOutcome = await maybeRecoverOgeRowsViaLocalOcr(
+      env,
+      extracted.filing,
+      extracted.bytes ?? null,
+      extracted.parseDisposition,
+    );
+  } catch (err) {
+    console.warn('orchestrator: local OGE OCR retry failed:', docId, (err as Error).message);
+  }
+
+  const recovered = ocrOutcome?.status === 'rows' ? ocrOutcome : null;
+  const effective = recovered
+    ? {
+      ...extracted,
+      transactions: recovered.rows,
+      extractor: OGE_LOCAL_OCR_EXTRACTOR,
+      parseDisposition: 'rows' as ExtractorParseDisposition,
+    }
+    : extracted;
+
+  const result = await normalize(env, effective.filing, effective.transactions, {
+    extractor: effective.extractor,
+    modelVersion: effective.modelVersion ?? null,
+    sourceText: effective.raw,
+    parseDisposition: effective.parseDisposition,
+    reviewPayload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
   });
 
   // Fast path: a doc that just landed in review gets a cross-vendor agreement
@@ -233,6 +268,8 @@ export interface ExtractedFiling {
   raw: string;
   modelRuns?: ExtractorModelRun[];
   parseDisposition?: ExtractorParseDisposition;
+  /** The stored raw PDF, when the caller asked for it (CT-2448 local OCR retry). */
+  bytes?: ArrayBuffer;
 }
 
 /**
@@ -247,7 +284,7 @@ export async function extractParsed(
   env: Env,
   docId: string,
   lease?: DurableQueueLeaseContext,
-  options?: { forceVision?: boolean }
+  options?: { forceVision?: boolean; keepBytes?: boolean }
 ): Promise<ExtractedFiling | null> {
   await lease?.assertOwned();
   const row = await get<FilingRow>(
@@ -380,6 +417,15 @@ export async function extractParsed(
     throw new Error(message);
   }
 
+  // CT-2448: copy the PDF for the local OCR retry before the extractor runs.
+  // An extractor may detach the buffer it is handed (pdf.js takes ownership),
+  // which would leave the retry with an empty document.  Only copied when
+  // asked for AND the filing is an executive 278-T the pass can actually
+  // retry — every other extraction skips the duplicate buffer.  Readability
+  // is known only after extraction, so a 278-T with a text layer still pays
+  // for one unused copy; the admin reprocess path (no keepBytes) copies never.
+  const ocrBytes = options?.keepBytes && isOgeLocalOcrCandidate(filing) ? bytes.slice(0) : undefined;
+
   let result;
   try {
     await lease?.assertOwned();
@@ -445,5 +491,8 @@ export async function extractParsed(
     raw: result.raw ?? '',
     modelRuns: result.modelRuns,
     parseDisposition: result.parseDisposition,
+    // CT-2448: the pre-extractor copy above, so the retry reads the full PDF
+    // even when an extractor detached the shared buffer it was handed.
+    bytes: ocrBytes,
   };
 }

@@ -38,7 +38,7 @@ Read-only against `main` at `be53b3e5`, plus the open design/UX diffs:
 | Open UX PRs | #1967 (deep-link aliases + primary-only feed), #1965 (directory leftovers) |
 | Merged today | #1963 (iOS language + Capitol Ledger style), #1970 (filter seam / unclipped menus) |
 | Owner rules | `docs/FLEET-UI-COPY.md`, `AGENTS.md` (light default, two spaces, no asset-class dropdown, House + Senate + Executive) |
-| Coordination | `#agent-sync` claims for #1963 / #1965 / #1967 / #1970; keepout on #1959 OCR and the in-flight review-queue *ops* catalog (`cursor/prod-incident-audit-f506`) |
+| Coordination | `#ag***-s**c` claims for #1963 / #1965 / #1967 / #1970; keepout on #1959 OCR and the in-flight review-queue *ops* catalog (`cursor/prod-incident-audit-f506`) |
 
 No live browser, no Xcode, no production writes.  Claims below are code-backed.  Where a finding was only measured in the August 11 audit and not re-measured live, the row says so.
 

@@ -31,7 +31,10 @@ LITESTREAM_CONFIG="${REPO_ROOT}/litestream.yml"
 DB_PATH="/data/congress-trade/db.sqlite"
 
 # Same flags the Dockerfile CMD used to invoke directly.
-DENO_CMD='deno run --allow-net --allow-env --allow-read --allow-write --allow-sys --allow-ffi --unstable-kv --unstable-cron src/deno/main.ts'
+# --allow-run is scoped to the two binaries the local OGE 278-T OCR retry
+# shells out to (poppler's pdftoppm and tesseract) — see
+# src/extraction/ogeLocalOcr.ts.  Nothing else may be spawned.
+DENO_CMD='deno run --allow-net --allow-env --allow-read --allow-write --allow-sys --allow-ffi --allow-run=pdftoppm,tesseract --unstable-kv --unstable-cron src/deno/main.ts'
 
 log() {
   echo "[start-with-litestream] $*"

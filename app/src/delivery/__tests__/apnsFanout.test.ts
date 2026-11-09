@@ -461,7 +461,8 @@ describe('fanOutApnsProductEvents', () => {
 describe('probeApnsPendingEvents', () => {
   it('drives from delivery_outbox, not an unindexed transactions.created_at scan', () => {
     expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/FROM delivery_outbox o/i);
-    expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/WHERE EXISTS/i);
+    expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/AND EXISTS/i);
+    expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/o\.status != 'suppressed'/);
     expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/t\.id = o\.tx_id/i);
     expect(APNS_FANOUT_TRADE_PENDING_SQL).not.toMatch(/ORDER BY t\.created_at/i);
   });

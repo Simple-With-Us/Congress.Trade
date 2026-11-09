@@ -1,4 +1,21 @@
+## 2026-10-26 BF-PUBLISHER — Published filings stuck at ingest_status error (CT-2453)
+
+A filing that already has live transactions and a publish decision can still show `ingest_status` error, because a later fetch failure overwrites the stamp.  The hourly desync reconcile only mapped a resolved `review_queue` row, so a filing that never had one stayed error.  The reconcile now stamps `persisted` from those two facts, and a fetch failure leaves an already-published filing's `ingest_status` alone.  Stored raw for the four Senate filings matches the live published rows: 5, 33, 1, and 1.  No production write from this seat.  Branch `publisher/reconcile-published-errored`.  Refs CT-2453.  Rollout: `docs/rollouts/2026-10-26-reconcile-published-errored.md`.
+
+
 # Current Handoff
+
+## 2026-11-01 MC — Full-stack perf + UI/UX audit and fix sweep (CT-2459)
+
+Fleet-mode audit (6 auditors + adversarial critic; 27/28 P1s verified) landed as 10 fix batches on `muse-code/perf-ux-audit`: minified web payloads (JS 157 KB gz to 105 KB gz, CSS 205 KB to 128 KB), WebP header logo, skip link/h1/tablist keys, cached health scans, streaming CSV, queue abort-release + jitter, bulk outbox, cache tiers everywhere, client Cache-Control, lazy PDF/LLM imports, cheerio removed, iOS snapshot publishing + image cache.  Typecheck clean; 5,278 tests pass; iOS builds clean (tests compile-verified, no local simulator).  Owner-gated follow-ups (sqlite read connection, queue priority column, VACUUM, image secrets) are listed in the rollout.  Rollout: `docs/rollouts/2026-11-01-ct-2459-perf-ux-audit.md`.
+
+## 2026-10-30 CODEX — Reports index (AFC-580)
+
+Added docs/reports/README.md to index eligible documentation and reports.  The index links existing canonical files without moving or renaming them.  Central collection under Code/Docs/Congress.Trade/ is populated under the owner-approved docs-only exception.  The collector and protocol are live in AI-Fleet-Coordinator main at `691f4a3c`; the 16-repo collection check reported zero planned changes, and protected Git checkouts remain unchanged.  This in-repo index is the repository entry point.
+
+## 2026-10-25 GROK — Empty fetch hand-off (CT-2447)
+
+A completed ingestion outbox row that stored no raw object, and a filing whose ingest_status is outside IngestStatus, now re-drive on the autonomy sweep and page as `empty_fetch_handoff`.  The same id is a critical `/api/health` check and is in `HEALTH_STALL_SKIP_IDS`, so it does not page twice.  Evidence for `E-2026-donald-j-trump-08-12-2026-278t` is in `docs/evidence/2026-10-25-orphan-278t.json`.  Part 7 is not empty.  This PR does not publish the filing.  CT-2447 stays open until the filing is recovered and published.  Branch `grok/empty-fetch-handoff`.  No merge from this seat.  Rollout: `docs/rollouts/2026-10-25-empty-fetch-handoff.md`.
 
 ## 2026-10-23 GB-COMPILER — Share payload schemaVersion (ST-3853)
 
@@ -461,9 +478,9 @@ blocked by Apple on this first version.  Did not touch Guideline 2.1
 Resolution Center (`37412b30`).  Receipt:
 `docs/rollouts/2026-08-16-asc-eula-100.md`.
 
-## 2026-08-16 GROK — Health + Infisical shared-only AGENT_SYNC
+## 2026-08-16 GROK — Health + Infisical shared-only AG***_S**C
 
-`AGENT_SYNC_TOKEN` / `AGENT_SYNC_POST_TOKEN` live only in Infisical
+`AG***_S**C_TOKEN` / `AG***_S**C_POST_TOKEN` live only in Infisical
 shared-at-ct.  Deleted the copies that had been written onto the ST and
 CT app projects during the 2026-08-14 rotation.  `GET /api/health` now
 publishes `checks.secrets` (source names and counts, never values).
@@ -506,7 +523,7 @@ capped and now use two spaces; they do not name chambers.  Version remains
 `PREPARE_FOR_SUBMISSION`, not submitted.  Receipt:
 `docs/rollouts/2026-08-14-asc-listing-copy.md`.
 
-Fleet rule strengthened in `~/apps/AGENT-SYNC.md` § Two spaces (all agents,
+Fleet rule strengthened in `~/apps/AG***-S**C.md` § Two spaces (all agents,
 all surfaces, including review notes).
 
 ## 2026-08-14 GROK — App Store 1.0 now has TestFlight 1.0.14 attached
@@ -828,7 +845,7 @@ Last updated: 2026-07-24 (CURSOR)
   on `/api/*`, Infisical single-source config + `GET /api/admin/config-sources`),
   then PR #308 (`b8ce1b4`) made the workerd/Miniflare D1 suite probe-and-skip
   on the deploy runner (its container cannot spawn workerd; failed the gate
-  2×) and set CLAUDE.md defaults (agent-sync coordination + effort-log updates
+  2×) and set CLAUDE.md defaults (ag***-s**c coordination + effort-log updates
   by default). `deploy.yml` run **29177444399 succeeded** on `b8ce1b4`.
 - **Verified live**: all served script blocks parse; `/api/health`
   ok/db/schema true; scoreboard + Alerts tab render with real probe data

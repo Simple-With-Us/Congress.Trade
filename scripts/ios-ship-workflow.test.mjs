@@ -108,6 +108,26 @@ function onBlock(yml) {
   return m[1];
 }
 
+// on.push.paths list only: not paths-ignore, branches, schedule, or other lists.
+// Each entry may be single-quoted, double-quoted, or unquoted.
+function extractPushPaths(onText) {
+  const push = onText.match(/^\s*push:\s*\n((?:^(?:\s{3,}.*|\s*)\n?)*)/m);
+  const paths = push?.[1].match(/^\s*paths:\s*\n((?:^\s+-\s+.*\n?)*)/m);
+  const list = paths?.[1] ?? "";
+  return [...list.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*(?:#.*)?$/gm)].map((m) => m[1]);
+}
+
+// Scheduled gate step only, so other --path-prefix uses are not picked up.
+// Each prefix may be single-quoted, double-quoted, or unquoted.
+function gateStepBlock(code) {
+  const step = code.match(/-\s*name:\s*Scheduled ship gate[\s\S]*?(?=\n\s+-\s*name:|\n\S|$)/);
+  return step?.[0] ?? "";
+}
+
+function extractGatePrefixes(code) {
+  return [...gateStepBlock(code).matchAll(/--path-prefix\s+['"]?([^'"\s]+)['"]?(?:\s*#.*)?/g)].map((m) => m[1]);
+}
+
 test("ios-ship.yml ships automatically on a merge that touches the native tree", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const code = withoutComments(yml);
@@ -121,8 +141,17 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // A scheduled catch-up is allowed only behind the scheduled path gate.
   if (/^\s+schedule:/m.test(on)) {
     assert.match(code, /scheduled-ship-gate\.sh/);
-    assert.match(code, /--path-prefix 'clients\/ios\/'/);
     assert.match(code, /--event "\$\{\{ github\.event_name \}\}"/);
+    // The gate must watch every push path, so a missed push still ships.
+    const pushGlobs = extractPushPaths(on);
+    assert.ok(pushGlobs.length > 0, "push paths must list at least one glob");
+    const gatePrefixes = extractGatePrefixes(code);
+    for (const g of pushGlobs) {
+      assert.ok(gatePrefixes.includes(g), `gate must watch push path '${g}'`);
+    }
+    const gate = read("scripts/ios-fleet/scheduled-ship-gate.sh");
+    assert.match(gate, /repeatable/);
+    assert.match(gate, /:!/);
   }
 
   // The gate diffs against an older sha, and the notes need the commit range.
@@ -133,15 +162,41 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // CT-2434: the ship log is kept so the external-beta promotion can name the
   // exact build this run uploaded, so the invocation may carry a tee -- but it
   // must still be the wrapper, and still be the last thing in the step.
+  // Owner 2026-10-29: the one planned build of the release is handed to the
+  // ship as --build, so every ship of the release uploads the same number.
   assert.match(
     code,
-    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
   );
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);
   assert.match(code, /secret_path=\/asc/);
   assert.match(code, /ASC_INFISICAL_PROJECT_ID:\s*[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/);
+});
+
+test("ios-ship.yml plans the release build once and hands it to the ship", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const code = withoutComments(yml);
+
+  // ONE upstream plan per release: a plan-build step that runs the shared
+  // plan command with the merge stamp of HEAD, and only when the gate says
+  // ship -- so a gated tick plans nothing and uploads nothing.
+  assert.match(code, /id: plan-build\n\s+if: steps\.gate\.outputs\.should_ship == '1'/);
+  assert.match(code, /plan-release-build/);
+  assert.match(code, /--merge-stamp/);
+  assert.match(code, /TZ=America\/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD/);
+  // The one plan covers the same inventory as the ship script's own
+  // fixed-mode plan: pairedBundleId first, then the macBundleId alias
+  // (ship-testflight.sh asc_next_shared_build), and a pairedBuildFeed
+  // floor fails the run instead of planning without it.
+  assert.match(code, /get\("pairedBundleId"\) or e\.get\("macBundleId"\)/);
+  assert.match(code, /pairedBuildFeed floor that this plan step does not fetch/);
+  // The value leaves the job as a job output, so every ship job of the
+  // release takes the same number.
+  assert.match(code, /outputs:\s*\n\s+build: \$\{\{ steps\.plan-build\.outputs\.build \}\}/);
+  // A malformed plan fails the run instead of shipping a guessed number.
+  assert.match(code, /\^?\[1-9\]\[0-9\]\{11\}\$/);
 });
 
 test("no iOS ship workflow carries a standing gate override", () => {
@@ -156,9 +211,44 @@ test("no iOS ship workflow carries a standing gate override", () => {
   }
 });
 
+test("ship-gate coverage extractors accept any quote style", () => {
+  const sampleOn = [
+    "  push:",
+    "    branches: [main]",
+    "    paths:",
+    "      - 'a/**'",
+    '      - "b/**"',
+    "      - c/**",
+    "      - 'd/**' # trailing comment",
+    "    paths-ignore:",
+    "      - 'ignored/**'",
+    "  schedule:",
+    "    - cron: '7,37 * * * *'",
+    "",
+  ].join("\n");
+  assert.deepEqual(extractPushPaths(sampleOn), ["a/**", "b/**", "c/**", "d/**"]);
+
+  const sampleGate = [
+    "      - name: Scheduled ship gate",
+    "        id: gate",
+    "        run: |",
+    '          bash foo/scheduled-ship-gate.sh \\',
+    "            --path-prefix 'a/**' \\",
+    '            --path-prefix "b/**" \\',
+    "            --path-prefix c/** \\",
+    "            --path-prefix 'd/**' # trailing comment \\",
+    "            congress",
+    "      - name: Other",
+    "        run: |",
+    "          echo --path-prefix 'ignored/**'",
+    "",
+  ].join("\n");
+  assert.deepEqual(extractGatePrefixes(sampleGate), ["a/**", "b/**", "c/**", "d/**"]);
+});
+
 test("the push paths filter matches the native tree and not backend code", () => {
   const on = withoutComments(onBlock(read(".github/workflows/ios-ship.yml")));
-  const globs = [...on.matchAll(/^\s+-\s+'([^']+)'$/gm)].map((m) => m[1]);
+  const globs = extractPushPaths(on);
   // GitHub's `dir/**` matches anything under dir/.
   const matches = (glob, file) => glob.endsWith("/**")
     ? file.startsWith(glob.slice(0, -2))

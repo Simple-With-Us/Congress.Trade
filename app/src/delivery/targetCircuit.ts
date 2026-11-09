@@ -52,6 +52,7 @@ import { prefixedId } from '../shared/ids.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
 import { abortIfSignal } from '../shared/signalAbort.ts';
 import { readSetting } from '../settings/settingsService.ts';
+import { readDeliveryMode } from './deliveryMode.ts';
 
 export const DEFAULT_TARGET_FAILURE_THRESHOLD = 5;
 export const DEFAULT_TARGET_DAILY_ATTEMPT_CAP = 50;
@@ -144,11 +145,16 @@ interface DeliveryScanRow {
 }
 
 /** Classifies the delivery's transaction in the parked/quarantined scans. */
-const TX_STATE_SQL = `CASE WHEN t.id IS NULL THEN 'missing'
+// A 'retract:<seq>' delivery key (trade.retract, see retractions.ts) has no
+// transactions row by design; it is judged live here and dispatch itself
+// drops it if the retraction was revived.
+const RETRACT_KEY_SQL = "d.tx_id LIKE 'retract:%'";
+const TX_STATE_SQL = `CASE WHEN ${RETRACT_KEY_SQL} THEN NULL
+                WHEN t.id IS NULL THEN 'missing'
                 WHEN t.deprecated_at IS NOT NULL THEN 'retracted'
            END`;
-const TX_UNDELIVERABLE_SQL = '(t.id IS NULL OR t.deprecated_at IS NOT NULL)';
-const TX_LIVE_SQL = '(t.id IS NOT NULL AND t.deprecated_at IS NULL)';
+const TX_UNDELIVERABLE_SQL = `(NOT ${RETRACT_KEY_SQL} AND (t.id IS NULL OR t.deprecated_at IS NOT NULL))`;
+const TX_LIVE_SQL = `(${RETRACT_KEY_SQL} OR (t.id IS NOT NULL AND t.deprecated_at IS NULL))`;
 
 /**
  * While no undeliverable quarantined rows are left, the scheduled scan for
@@ -622,6 +628,11 @@ export async function flushParkedDeliveries(
   env: Env,
   opts: { limit?: number; now?: Date; signal?: AbortSignal } = {},
 ): Promise<ParkedFlushResult> {
+  // Subscriber alert pause (CT_DELIVERY_MODE): parked rows stay parked and
+  // are released by the first flush after delivery is switched back.
+  if (readDeliveryMode() !== 'deliver') {
+    return { scanned: 0, released: 0, skipped: 0, terminalized: 0, quarantineRecovered: 0, quarantineTerminalized: 0 };
+  }
   const now = opts.now ?? new Date();
   const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 200);
   const undeliverableDue = now.getTime() >= (undeliverableQuarantineScanAfterMs.get(env.DB) ?? 0);

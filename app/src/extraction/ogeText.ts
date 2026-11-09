@@ -51,7 +51,7 @@
  * not treat a refusal as "nothing to report".
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Filing, ParsedTx, TxType } from '../shared/types.ts';
@@ -92,8 +92,12 @@ const TABLE_HEADER_RE = /#\s*[\.,:;]?\s*DESCRIPTION\s+TYPE\s+DATE\s+NOTIFICATION
 // anchor (e.g. scanning without TABLE_HEADER_RE found) fails fast instead of
 // swallowing hundreds of characters of prose to reach a later real row.
 const OCR_AMOUNT = `(?:${OCR_AMOUNT_TOKEN_SRC})`;
+// Capture groups: 1 description, 2 type word, 3 date, 4 notification
+// flag, 5 amount.  The notification flag is captured (not just consumed) so
+// the local-OCR reader keeps it alongside the row for the park payload —
+// the two reads reconcile on type, date and amount only, see ogeLocalOcr.ts.
 const ROW_RE = new RegExp(
-  String.raw`(?<![\d,.])\d{1,5}[\.,:;]?\s+(.{1,200}?)\s+(Purchase|Sale|Exchange)\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(?:Yes|No)\s+(\$` +
+  String.raw`(?<![\d,.])\d{1,5}[\.,:;]?\s+(.{1,200}?)\s+(Purchase|Sale|Exchange)\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+(Yes|No)\s+(\$` +
     OCR_AMOUNT +
     String.raw`(?:\s*(?:-|–|—|−|•|·|to|\.(?=\s*\$))\s*\$?` +
     OCR_AMOUNT +
@@ -279,6 +283,7 @@ async function extractPdfText(
   // Copy the buffer first: getDocumentProxy/pdf.js transfers and detaches the
   // ArrayBuffer it is handed (same regression guard as textPdf.ts's
   // extractPdfText — see its comment referencing Sentry CONGRESS-TRADE-2).
+  const { extractText, getDocumentProxy } = await import('unpdf');
   const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0)));
   const { text } = await extractText(pdf, { mergePages: true });
   const pageCount =
@@ -491,12 +496,57 @@ export function parseOgeTransactionRows(text: string): ParsedTx[] {
 
 interface OgeTextScan {
   rows: ParsedTx[];
+  /** The leading "#" token of every matched row, in match order. */
+  rowIndexes: number[];
   refused: boolean;
   /** True when the 278-T transactions table header is present. */
   has278tTable: boolean;
 }
 
-function scanOgeTransactionRows(text: string): OgeTextScan {
+/**
+ * One matched 278-T row, with the raw fields kept alongside the parsed
+ * transaction.  The local-OCR reader (ogeLocalOcr.ts) needs the raw type
+ * word, date and amount text so it can compare two independent reads of the
+ * same page and keep only the rows where all three agree.  The notification
+ * flag rides along for the park payload; it is not part of the comparison.
+ */
+export interface OgeScannedRow {
+  /** The "#" column value, or null when the row's leading index was not captured. */
+  index: number | null;
+  /** The parsed transaction. */
+  tx: ParsedTx;
+  /** The type word as it appeared (Purchase / Sale / Exchange). */
+  typeWord: string;
+  /** The date as it appeared (M/D/YYYY). */
+  dateRaw: string;
+  /** The notification flag as it appeared (Yes / No). */
+  notification: string | null;
+  /** The amount text as it appeared. */
+  amountRaw: string;
+  /** The full matched source text. */
+  rawText: string;
+}
+
+/** Result of scanning one blob of 278-T text for table rows. */
+export interface OgeRowScan {
+  rows: OgeScannedRow[];
+  /** The leading "#" token of every matched row, in match order. */
+  rowIndexes: number[];
+  /** True when the matched "#" tokens are not a plausible table index. */
+  refused: boolean;
+  /** True when the 278-T transactions table header is present. */
+  has278tTable: boolean;
+}
+
+/**
+ * Scan text for 278-T table rows and keep the raw fields.
+ *
+ * Unlike the internal classifier this never refuses: the caller decides what
+ * an incoherent index means.  The local-OCR reader needs the per-row detail
+ * even when one page of a scan lost a row, so it can report which rows did
+ * not reconcile instead of losing the whole page.
+ */
+export function scanOgeRows(text: string): OgeRowScan {
   // Fold NUL bytes, non-breaking spaces, and every run of whitespace
   // (including real newlines, when the runtime's pdf.js DOES emit them) down
   // to single spaces, so the same global scan below is correct regardless of
@@ -506,7 +556,7 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
     .replace(/\u00a0/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!normalized) return { rows: [], refused: false, has278tTable: false };
+  if (!normalized) return { rows: [], rowIndexes: [], refused: false, has278tTable: false };
 
   // Prefer scanning only after the table header (see TABLE_HEADER_RE above);
   // fall back to the whole text if the header wasn't found (a format variant
@@ -517,21 +567,22 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
     ? normalized.slice(headerMatch.index + headerMatch[0].length)
     : normalized;
 
-  const rows: ParsedTx[] = [];
+  const rows: OgeScannedRow[] = [];
   const rowIndexes: number[] = [];
   ROW_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = ROW_RE.exec(searchText)) !== null) {
-    const amountSpan = amountPrefixLength(m[4]);
-    if (amountSpan < m[4].length) {
-      const extra = m[4].length - amountSpan;
+    const amountSpan = amountPrefixLength(m[5]);
+    if (amountSpan < m[5].length) {
+      const extra = m[5].length - amountSpan;
       m[0] = m[0].slice(0, m[0].length - extra);
-      m[4] = m[4].slice(0, amountSpan);
+      m[5] = m[5].slice(0, amountSpan);
       ROW_RE.lastIndex -= extra;
     }
-    const [matchText, descriptionRaw, typeWord, dateRaw, amountRaw] = m;
+    const [matchText, descriptionRaw, typeWord, dateRaw, notification, amountRaw] = m;
     const indexMatch = /^(\d{1,5})/.exec(matchText);
-    if (indexMatch) rowIndexes.push(Number(indexMatch[1]));
+    const index = indexMatch ? Number(indexMatch[1]) : null;
+    if (index !== null) rowIndexes.push(index);
     const description = descriptionRaw.trim();
     const tickerMatch = TICKER_SUFFIX_RE.exec(description);
     const ticker = tickerMatch ? normalizeTicker(tickerMatch[1]) : null;
@@ -548,33 +599,56 @@ function scanOgeTransactionRows(text: string): OgeTextScan {
     const confidence = hasDate && hasAmount ? COMPLETE_ROW_CONFIDENCE : INCOMPLETE_ROW_CONFIDENCE;
 
     rows.push({
-      txDate: hasDate ? txDate : null,
-      owner: null, // 278-T has no per-row owner column (unlike House SP/DC/JT codes)
-      assetName,
-      ticker,
-      assetType: null,
-      assetTypeName: null,
-      txType,
-      amountMin: min,
-      amountMax: max,
-      isOption: detectOption(matchText),
-      capGainsOver200: false,
+      index,
+      typeWord,
+      dateRaw,
+      notification: notification ?? null,
+      amountRaw,
       rawText: matchText.trim(),
-      confidence,
+      tx: {
+        txDate: hasDate ? txDate : null,
+        owner: null, // 278-T has no per-row owner column (unlike House SP/DC/JT codes)
+        assetName,
+        ticker,
+        assetType: null,
+        assetTypeName: null,
+        txType,
+        amountMin: min,
+        amountMax: max,
+        isOption: detectOption(matchText),
+        capGainsOver200: false,
+        rawText: matchText.trim(),
+        confidence,
+      },
     });
     // Avoid an infinite loop on a zero-length match (shouldn't happen given
     // ROW_RE always consumes at least the row-number + suffix, but a global
     // regex with a zero-width overall match would otherwise stall exec()).
     if (m.index === ROW_RE.lastIndex) ROW_RE.lastIndex += 1;
   }
+  return {
+    rows,
+    rowIndexes,
+    refused: !isOgeRowSequenceCoherent(rowIndexes),
+    has278tTable: Boolean(headerMatch),
+  };
+}
+
+function scanOgeTransactionRows(text: string): OgeTextScan {
+  const scanned = scanOgeRows(text);
   // Refuse a garbled-OCR parse: if the matched "#" tokens are not a plausible
   // unique/increasing table index, ROW_RE was latching onto years/amounts and
   // the rows are mis-merged guesses.  Callers must keep this distinct from
   // a section that simply had no rows.
-  if (!isOgeRowSequenceCoherent(rowIndexes)) {
-    return { rows: [], refused: true, has278tTable: Boolean(headerMatch) };
+  if (scanned.refused) {
+    return { rows: [], rowIndexes: scanned.rowIndexes, refused: true, has278tTable: scanned.has278tTable };
   }
-  return { rows, refused: false, has278tTable: Boolean(headerMatch) };
+  return {
+    rows: scanned.rows.map((r) => r.tx),
+    rowIndexes: scanned.rowIndexes,
+    refused: false,
+    has278tTable: scanned.has278tTable,
+  };
 }
 
 /** Text-layer classification for one stored executive PDF. */
@@ -620,4 +694,127 @@ function toIsoDate(mmddyyyy: string): string {
   // A shape match is not a real date ("13/01/2026", "02/30/2026").  Return
   // blank so the row is flagged incomplete and held, never published.
   return isValidCalendarDateYMD(iso) ? iso : '';
+}
+
+// ---------------------------------------------------------------------------
+// Completeness: the source's last row number vs the rows we actually parsed.
+// ---------------------------------------------------------------------------
+
+/** Cap on how many missing row numbers are reported (diagnostics only). */
+const MAX_REPORTED_MISSING_ROWS = 50;
+/**
+ * Share of parsed rows that must carry their own row number before the
+ * parsed rows alone are trusted to say how long the table is.  One stray
+ * "#12" in a description must not hold a 3-row filing.
+ */
+const MIN_NUMBERED_ROW_SHARE = 0.5;
+
+export interface OgeRowCompleteness {
+  /** The highest row number the source shows (the table's last row). */
+  expectedRows: number;
+  /** Where expectedRows came from. */
+  evidence: 'text_layer' | 'parsed_row_numbers';
+  /** Row numbers in 1..expectedRows that no parsed row carries (capped). */
+  missingRowNumbers: number[];
+  /** Total count of missing row numbers (uncapped). */
+  missingCount: number;
+}
+
+/** Row number a parsed row carries itself: "#661 ..." / "661 ..." raw text, or "row 661" supplemental text. */
+function parsedRowNumber(row: Pick<ParsedTx, 'rawText' | 'supplementalText'>): number | null {
+  const supplemental = /\brow\s+#?(\d{1,5})\b/i.exec(row.supplementalText ?? '');
+  if (supplemental) return Number(supplemental[1]);
+  const raw = /^\s*#\s*(\d{1,5})\b/.exec(row.rawText ?? '');
+  if (raw) return Number(raw[1]);
+  return null;
+}
+
+function missingNumbers(seen: ReadonlySet<number>, expected: number): { list: number[]; count: number } {
+  const list: number[] = [];
+  let count = 0;
+  for (let n = 1; n <= expected; n += 1) {
+    if (seen.has(n)) continue;
+    count += 1;
+    if (list.length < MAX_REPORTED_MISSING_ROWS) list.push(n);
+  }
+  return { list, count };
+}
+
+/**
+ * Compare a 278-T's own row numbering against the rows a reader produced.
+ *
+ * A 278-T numbers its rows 1..N in the "#" column.  The text parser's
+ * coherence gate accepts a parse that covers 80% of its span, so a row whose
+ * type word, date or amount failed to parse simply vanished, and the filing
+ * published the rest as if complete (Trump 09-08-2026: 1,113 of 1,156 rows).
+ *
+ * Evidence, strongest first:
+ *   1. The text layer: the highest row number among rows the parser anchored,
+ *      and the line-anchored "#" column count when it is itself coherent.
+ *      A row lost between two parsed rows, or (with line anchors) at the
+ *      tail, shows up as a missing number.
+ *   2. The parsed rows' own numbers ("#661 ..." raw text or "row 661" in the
+ *      supplemental text), when most rows carry one.  This covers vision and
+ *      hand transcriptions, whose raw output is not the PDF text layer.
+ *
+ * Returns null when neither source can say how long the table is (no 278-T
+ * table header, a refused parse, or unnumbered rows).  Null is "unknown",
+ * never "complete": callers keep every other publish gate.
+ */
+export function assessOgeRowCompleteness(
+  sourceText: string | null | undefined,
+  parsedRows: ReadonlyArray<Pick<ParsedTx, 'rawText' | 'supplementalText'>>,
+): OgeRowCompleteness | null {
+  const numbered = parsedRows.map(parsedRowNumber).filter((n): n is number => n !== null && n >= 1);
+  const parsedSeen = new Set(numbered);
+
+  if (sourceText) {
+    const scan = scanOgeTransactionRows(sourceText);
+    if (scan.has278tTable && !scan.refused && scan.rowIndexes.length > 0) {
+      let expected = Math.max(...scan.rowIndexes);
+      const anchors = detectOgeRowAnchors(sourceText);
+      if (
+        anchors.maxIndex !== null
+        && anchors.maxIndex > expected
+        && anchors.anchors >= anchors.maxIndex * MIN_INDEX_SPAN_COVERAGE
+      ) {
+        expected = anchors.maxIndex;
+      }
+      // The reader's own row numbers decide which rows are present.  Text
+      // parser rows carry them ("<n> desc ..."); a vision read usually does
+      // not, and then only the row count can be compared (the parser's own
+      // anchors describe the parser, not this reader).
+      const leadingNumbers = parsedRows
+        .map((r) => {
+          const own = parsedRowNumber(r);
+          if (own !== null) return own;
+          const lead = /^\s*(\d{1,5})\b/.exec(r.rawText ?? '');
+          return lead ? Number(lead[1]) : null;
+        })
+        .filter((n): n is number => n !== null && n >= 1);
+      const readerNumbered = leadingNumbers.length > 0
+        && leadingNumbers.length >= parsedRows.length * MIN_NUMBERED_ROW_SHARE;
+      const missing = readerNumbered
+        ? missingNumbers(new Set(leadingNumbers), expected)
+        : { list: [] as number[], count: 0 };
+      // A reader that produced fewer rows than the table holds is incomplete
+      // even when the numbers it kept look contiguous.
+      const shortBy = Math.max(0, expected - parsedRows.length);
+      const missingCount = Math.max(missing.count, shortBy);
+      return { expectedRows: expected, evidence: 'text_layer', missingRowNumbers: missing.list, missingCount };
+    }
+  }
+
+  if (numbered.length > 0 && numbered.length >= parsedRows.length * MIN_NUMBERED_ROW_SHARE) {
+    const expected = Math.max(...numbered);
+    const missing = missingNumbers(parsedSeen, expected);
+    const shortBy = Math.max(0, expected - parsedRows.length);
+    return {
+      expectedRows: expected,
+      evidence: 'parsed_row_numbers',
+      missingRowNumbers: missing.list,
+      missingCount: Math.max(missing.count, shortBy),
+    };
+  }
+  return null;
 }
