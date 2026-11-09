@@ -15,13 +15,20 @@
 // workflow_dispatch, the one event a GITHUB_TOKEN may start.  It never touches
 // production:  Sentry Deploy itself checks the live revision before it records.
 
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 export const WATCHED = Object.freeze([
-  { file: 'coolify-watch-paths.yml', requiredJob: null, needsCiSuccess: false },
-  { file: 'shared-package-pin-check.yml', requiredJob: null, needsCiSuccess: false },
+  { file: 'coolify-watch-paths.yml', requiredJob: null, needsCiSuccess: false, shaInput: null },
+  { file: 'shared-package-pin-check.yml', requiredJob: null, needsCiSuccess: false, shaInput: null },
   // Sentry Deploy runs on workflow_run from CI;  only its record job matters, and
-  // it only runs after a successful push CI on main.
-  { file: 'sentry-deploy.yml', requiredJob: 'record-production-deploy', needsCiSuccess: true },
+  // it only runs after a successful push CI on main.  The dispatch pins the SHA
+  // whose CI the sentinel checked, so a main that moved on since can't be
+  // recorded in its place.
+  { file: 'sentry-deploy.yml', requiredJob: 'record-production-deploy', needsCiSuccess: true, shaInput: 'expected_sha' },
 ]);
+
+export const JOB_FETCH_CONCURRENCY = 5;
 
 export const GRACE_MINUTES = 20;
 export const MAX_DISPATCHES = 2;
@@ -35,7 +42,13 @@ export function classifyRun(run, requiredJob) {
   if (run.status !== 'completed') return 'pending';
   if (run.conclusion === 'startup_failure') return 'never_started';
   const jobs = run.jobs ?? [];
-  if (jobs.length === 0) return run.conclusion === 'skipped' ? 'not_relevant' : 'never_started';
+  if (jobs.length === 0) {
+    // Only a failure with no jobs is GitHub failing the run before it started.
+    // Cancelled, timed-out or approval-gated runs were a decision or a limit, so
+    // they count as run and are never resurrected;  skipped runs don't count.
+    if (run.conclusion === 'failure') return 'never_started';
+    return run.conclusion === 'skipped' ? 'not_relevant' : 'ran';
+  }
   if (requiredJob) {
     const job = jobs.find((j) => j.name === requiredJob);
     if (!job || job.conclusion === 'skipped') return 'not_relevant';
@@ -57,46 +70,95 @@ export function decide({ watched, headAgeMinutes, ciSucceeded, runs }) {
   return 'dispatch';
 }
 
+// Shape checks for the GitHub payloads this script reads.  A response that has
+// drifted from these shapes throws instead of feeding a dispatch decision.  The
+// script runs with plain node and no install step, so these are hand-written
+// rather than zod.
+function fail(what) {
+  throw new Error(`GitHub response did not match the expected shape:  ${what}`);
+}
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const nullableString = (v) => v === null || typeof v === 'string';
+
+export function parseCommit(data) {
+  if (!isObject(data) || typeof data.sha !== 'string' || !/^[0-9a-f]{40}$/.test(data.sha)) fail('commit.sha');
+  const date = data.commit?.committer?.date;
+  if (typeof date !== 'string' || Number.isNaN(Date.parse(date))) fail('commit.committer.date');
+  return { sha: data.sha, committedAt: date };
+}
+
+export function parseRuns(data) {
+  if (!isObject(data) || !Array.isArray(data.workflow_runs)) fail('workflow_runs');
+  return data.workflow_runs.map((run) => {
+    if (!isObject(run) || !Number.isInteger(run.id) || typeof run.status !== 'string'
+      || !nullableString(run.conclusion) || typeof run.event !== 'string') fail('workflow_runs[]');
+    return { id: run.id, status: run.status, conclusion: run.conclusion, event: run.event };
+  });
+}
+
+export function parseJobs(data) {
+  if (!isObject(data) || !Array.isArray(data.jobs)) fail('jobs');
+  return data.jobs.map((job) => {
+    if (!isObject(job) || typeof job.name !== 'string' || !nullableString(job.conclusion)) fail('jobs[]');
+    return { name: job.name, conclusion: job.conclusion };
+  });
+}
+
 async function gh(path, { method = 'GET', body } = {}) {
+  const headers = {
+    Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (body) headers['Content-Type'] = 'application/json';
   const res = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}${path}`, {
     method,
-    headers: {
-      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`GitHub ${method} ${path} answered ${res.status}`);
-  return res.status === 204 ? null : res.json();
+  return res.status === 204 ? null : await res.json();
 }
 
-async function runsFor(file, sha) {
-  const page = await gh(`/actions/workflows/${file}/runs?head_sha=${sha}&per_page=30`);
-  const runs = [];
-  for (const run of page.workflow_runs ?? []) {
-    let jobs = [];
-    if (run.status === 'completed' && run.conclusion !== 'startup_failure') {
-      jobs = (await gh(`/actions/runs/${run.id}/jobs?per_page=50`)).jobs ?? [];
-    }
-    runs.push({ ...run, jobs: jobs.map((j) => ({ name: j.name, conclusion: j.conclusion })) });
+/**
+ * Runs for one workflow on `sha`, with jobs filled in only where they decide
+ * the answer.  A pending run already means 'ok', so no jobs are fetched then.
+ * Otherwise jobs are fetched JOB_FETCH_CONCURRENCY runs at a time, stopping at
+ * the first batch that holds a run that ran.  `fetchJobs` is injectable for tests.
+ */
+export async function runsFor(file, sha, requiredJob, {
+  listRuns = async () => parseRuns(await gh(`/actions/workflows/${file}/runs?head_sha=${sha}&per_page=30`)),
+  fetchJobs = async (id) => parseJobs(await gh(`/actions/runs/${id}/jobs?per_page=50`)),
+} = {}) {
+  const runs = (await listRuns()).map((run) => ({ ...run, jobs: [] }));
+  if (runs.some((run) => run.status !== 'completed')) return runs;
+  const needJobs = runs.filter((run) => run.conclusion !== 'startup_failure');
+  for (let i = 0; i < needJobs.length; i += JOB_FETCH_CONCURRENCY) {
+    const batch = needJobs.slice(i, i + JOB_FETCH_CONCURRENCY);
+    const jobs = await Promise.all(batch.map((run) => fetchJobs(run.id)));
+    batch.forEach((run, k) => { run.jobs = jobs[k]; });
+    if (batch.some((run) => classifyRun(run, requiredJob) === 'ran')) break;
   }
   return runs;
 }
 
+/** The workflow_dispatch body for one watched workflow on main. */
+export function dispatchBody(watched, sha) {
+  return watched.shaInput ? { ref: 'main', inputs: { [watched.shaInput]: sha } } : { ref: 'main' };
+}
+
 export async function main(now = Date.now()) {
-  const head = await gh('/commits/main');
-  const sha = head.sha;
-  const headAgeMinutes = (now - Date.parse(head.commit.committer.date)) / 60000;
-  const ci = await gh(`/actions/workflows/ci.yml/runs?head_sha=${sha}&event=push&per_page=10`);
-  const ciSucceeded = (ci.workflow_runs ?? []).some((run) => run.conclusion === 'success');
+  const { sha, committedAt } = parseCommit(await gh('/commits/main'));
+  const headAgeMinutes = (now - Date.parse(committedAt)) / 60000;
+  const ci = parseRuns(await gh(`/actions/workflows/ci.yml/runs?head_sha=${sha}&event=push&per_page=10`));
+  const ciSucceeded = ci.some((run) => run.conclusion === 'success');
   let gaveUp = false;
   for (const watched of WATCHED) {
-    const runs = await runsFor(watched.file, sha);
+    const runs = await runsFor(watched.file, sha, watched.requiredJob);
     const action = decide({ watched, headAgeMinutes, ciSucceeded, runs });
     console.log(`${watched.file} on ${sha.slice(0, 8)}: ${action}`);
     if (action === 'dispatch') {
-      await gh(`/actions/workflows/${watched.file}/dispatches`, { method: 'POST', body: { ref: 'main' } });
+      await gh(`/actions/workflows/${watched.file}/dispatches`, { method: 'POST', body: dispatchBody(watched, sha) });
       console.log(`::notice title=Post-merge run re-dispatched::${watched.file} never ran for ${sha.slice(0, 8)}; dispatched it on main.`);
     }
     if (action === 'give_up') {
@@ -107,7 +169,7 @@ export async function main(now = Date.now()) {
   if (gaveUp) process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   main().catch((error) => {
     console.error(error.message);
     process.exitCode = 1;
