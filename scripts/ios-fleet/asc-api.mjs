@@ -1371,14 +1371,14 @@ async function main() {
     // live one, per locale, so a difference can be explained without opening
     // App Store Connect.  Listing copy is public text, not a secret.
     const promoVersions = appStoreVersions.filter(
-      (v) => v.appStoreState === "READY_FOR_SALE" || v.appStoreState === "PREPARE_FOR_SUBMISSION"
+      (v) => EDITABLE_VERSION_STATES.has(v.appStoreState) || RELEASED_VERSION_STATES.has(v.appStoreState)
     );
     const promotionalText = [];
     for (const v of promoVersions) {
       const locRes = await ascGet(`/v1/appStoreVersions/${v.id}/appStoreVersionLocalizations?limit=200`);
       if (!locRes.ok) {
         console.error(`appstore-version-plan: localizations query failed for ${v.versionString} (HTTP ${locRes.status})`);
-        continue;
+        process.exit(2);
       }
       for (const loc of locRes.parsed.data || []) {
         const text = loc.attributes?.promotionalText ?? null;
