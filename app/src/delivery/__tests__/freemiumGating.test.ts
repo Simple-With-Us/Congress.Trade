@@ -33,7 +33,7 @@ describe('buildTransactionsExportQuery', () => {
   it('drops the cursor backstop, orders newest-first, and has no product LIMIT', () => {
     const q = buildTransactionsExportQuery({ ticker: 'aapl' });
     expect(q.sql).not.toContain('cursor_seq > ?');
-    expect(q.sql).toContain('ORDER BY t.cursor_seq DESC');
+    expect(q.sql).toContain('ORDER BY COALESCE(t.first_seen_at, t.filed_date, t.tx_date, t.cursor_seq) DESC, t.cursor_seq DESC');
     // Premium export is the full match set — no silent row cap.
     expect(q.sql).not.toMatch(/\bLIMIT\b/i);
     expect(q.params).toContain('AAPL');
@@ -196,7 +196,9 @@ describe('GET /export/transactions.csv', () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/csv');
-    expect(res.headers.get('X-Export-Complete')).toBe('true');
+    // No completeness claim: headers precede the stream, so a mid-stream
+    // abort must not carry a promise the body did not keep.
+    expect(res.headers.get('X-Export-Complete')).toBeNull();
     expect(res.headers.get('X-Export-Row-Count')).toBe('0');
     const csv = await res.text();
     expect(csv).toContain('filed_at');

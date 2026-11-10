@@ -8,7 +8,7 @@ This note hands you **everything** from a CLAUDE session that finished the
 investigation but wrote **zero code**. All findings below are verified against
 the tree at `cae2821`; file:line references are accurate as of that commit.
 `AGENTS.md` is policy; `docs/EFFORT-LOG.md` gets the receipts. Coordinate on
-Slack `#agent-sync` (`C0BEZDJDNKV`), tag `[Congress.Trade] AG`.
+Slack `#ag***-s**c` (`C0BEZDJDNKV`), tag `[Congress.Trade] AG`.
 
 ---
 

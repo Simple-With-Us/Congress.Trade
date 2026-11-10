@@ -39,3 +39,6 @@ Left for later slices from the purchases audit (`#1981`):
 - Apple `REFUND` apply + production Sandbox JWS reject
 - Stripe `event.livemode` gate + refund/dispute policy
 - XCTest for StoreKit product load / `finish()` ordering
+
+Website/Stripe Manage Subscription 401 sign-out copy: fixed 2026-09-03
+(`docs/rollouts/2026-09-03-ios-stripe-manage-sub.md`).

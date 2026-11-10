@@ -36,14 +36,20 @@ import {
   fetchPeerRealtimeQuotes,
   nearestBarAtOrAfter,
 } from '../prices/peerMarketData.ts';
+import { canCaptureMinutePricing } from '../prices/instrumentCapabilities.ts';
 
 export const LATENCY_PRICE_EVENTS = [
   'ct_publish',
+  'provider_minus_30m',
+  'provider_minus_15m',
   'provider_publish',
   'provider_plus_5m',
   'provider_plus_15m',
   'provider_plus_30m',
   'provider_plus_60m',
+  'provider_plus_6h',
+  'provider_plus_12h',
+  'provider_plus_24h',
 ] as const;
 
 export type LatencyPriceEvent = (typeof LATENCY_PRICE_EVENTS)[number];
@@ -51,17 +57,27 @@ export type LatencyPriceEvent = (typeof LATENCY_PRICE_EVENTS)[number];
 type FollowUpEvent = Exclude<LatencyPriceEvent, 'ct_publish' | 'provider_publish'>;
 
 const FOLLOW_EVENTS: readonly FollowUpEvent[] = [
+  'provider_minus_30m',
+  'provider_minus_15m',
   'provider_plus_5m',
   'provider_plus_15m',
   'provider_plus_30m',
   'provider_plus_60m',
+  'provider_plus_6h',
+  'provider_plus_12h',
+  'provider_plus_24h',
 ];
 
 const FOLLOW_MS: Record<FollowUpEvent, number> = {
+  provider_minus_30m: -30 * 60_000,
+  provider_minus_15m: -15 * 60_000,
   provider_plus_5m: 5 * 60_000,
   provider_plus_15m: 15 * 60_000,
   provider_plus_30m: 30 * 60_000,
   provider_plus_60m: 60 * 60_000,
+  provider_plus_6h: 6 * 3600_000,
+  provider_plus_12h: 12 * 3600_000,
+  provider_plus_24h: 24 * 3600_000,
 };
 
 /** Do not ask for a live quote for an event that already aged out. */
@@ -86,6 +102,13 @@ const MAX_BACKFILL_ATTEMPTS = 5;
  */
 export type SnapshotConfidence = 'exact' | 'bracketed' | 'unbounded';
 
+/**
+ * Who supplied the timestamp, independent of precision (`confidence`).
+ *  - `observed` — we witnessed it (our publish clock, or a probe first-seen).
+ *  - `claimed`  — we only have the competitor's purported publish time.
+ */
+export type TimeProvenance = 'observed' | 'claimed';
+
 export function addMs(iso: string, ms: number): string {
   return new Date(Date.parse(iso) + ms).toISOString();
 }
@@ -99,6 +122,10 @@ interface MatchRow {
   provider_published_at: string | null;
   provider_window_start: string | null;
   provider_window_end: string | null;
+  is_option?: number | boolean | null;
+  asset_type?: string | null;
+  asset_type_name?: string | null;
+  asset_name?: string | null;
 }
 
 export interface SnapshotPlanEntry {
@@ -106,28 +133,42 @@ export interface SnapshotPlanEntry {
   dueAt: string;
   confidence: SnapshotConfidence;
   uncertaintySec: number | null;
+  timeProvenance: TimeProvenance;
 }
 
 export function snapshotPlan(row: MatchRow): SnapshotPlanEntry[] {
   const ticker = (row.ticker || '').trim().toUpperCase();
-  if (!ticker || ticker.length > 8) return [];
+  if (!canCaptureMinutePricing({
+    ticker,
+    isOption: row.is_option,
+    assetType: row.asset_type,
+    assetTypeName: row.asset_type_name,
+    assetName: row.asset_name,
+  })) return [];
   const out: SnapshotPlanEntry[] = [];
 
   if (row.congress_first_seen_at) {
-    // Our own publish clock — no bracketing question, always exact.
-    out.push({ event: 'ct_publish', dueAt: row.congress_first_seen_at, confidence: 'exact', uncertaintySec: 0 });
+    // Our own publish clock — no bracketing question, always exact + observed.
+    out.push({
+      event: 'ct_publish',
+      dueAt: row.congress_first_seen_at,
+      confidence: 'exact',
+      uncertaintySec: 0,
+      timeProvenance: 'observed',
+    });
   }
 
-  const providerAt = row.provider_published_at || row.provider_first_seen_at;
+  const providerAt = row.provider_first_seen_at || row.provider_published_at;
   if (providerAt) {
     let confidence: SnapshotConfidence;
     let uncertaintySec: number | null;
-    if (row.provider_published_at) {
-      // The provider told us when it went out — exact wins even if a probe
-      // bracket also happens to be recorded.
-      confidence = 'exact';
-      uncertaintySec = 0;
-    } else if (row.provider_window_start) {
+    // Observed if we have a probe first-seen; claimed only when the
+    // competitor's purported stamp is the sole anchor.
+    const timeProvenance: TimeProvenance = row.provider_first_seen_at ? 'observed' : 'claimed';
+
+    // Confidence is about how certain we are of the true publish time.
+    // We use provider_first_seen_at (our observation) for the offsets.
+    if (row.provider_window_start) {
       confidence = 'bracketed';
       const startMs = Date.parse(row.provider_window_start);
       const endMs = Date.parse(row.provider_window_end || providerAt);
@@ -135,13 +176,18 @@ export function snapshotPlan(row: MatchRow): SnapshotPlanEntry[] {
         Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs
           ? Math.round((endMs - startMs) / 1000)
           : null;
+    } else if (row.provider_published_at && providerAt === row.provider_published_at) {
+      // Point timestamp exists, but it is the competitor's claim unless we
+      // also observed it (handled by timeProvenance above).
+      confidence = 'exact';
+      uncertaintySec = 0;
     } else {
       confidence = 'unbounded';
       uncertaintySec = null;
     }
-    out.push({ event: 'provider_publish', dueAt: providerAt, confidence, uncertaintySec });
+    out.push({ event: 'provider_publish', dueAt: providerAt, confidence, uncertaintySec, timeProvenance });
     for (const event of FOLLOW_EVENTS) {
-      out.push({ event, dueAt: addMs(providerAt, FOLLOW_MS[event]), confidence, uncertaintySec });
+      out.push({ event, dueAt: addMs(providerAt, FOLLOW_MS[event]), confidence, uncertaintySec, timeProvenance });
     }
   }
 
@@ -168,7 +214,42 @@ export async function scheduleMissingLatencyPriceSnapshots(
     env.DB,
     `SELECT c.trade_hash, c.ticker, c.provider, c.congress_first_seen_at,
             c.provider_first_seen_at, c.provider_published_at,
-            c.provider_window_start, c.provider_window_end
+            c.provider_window_start, c.provider_window_end,
+            (
+              SELECT MAX(CASE WHEN t.is_option = 1 THEN 1 ELSE 0 END)
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+            ) AS is_option,
+            (
+              SELECT t.asset_type
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+               LIMIT 1
+            ) AS asset_type,
+            (
+              SELECT t.asset_type_name
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+               LIMIT 1
+            ) AS asset_type_name,
+            (
+              SELECT t.asset_name
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+               LIMIT 1
+            ) AS asset_name
        FROM trade_latency_candidates c
       WHERE c.status = 'matched'
         AND c.ticker IS NOT NULL
@@ -190,9 +271,9 @@ export async function scheduleMissingLatencyPriceSnapshots(
       await run(
         env.DB,
         `INSERT OR IGNORE INTO latency_price_snapshots
-           (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [row.trade_hash, ticker, row.provider, plan.event, plan.dueAt, createdAt, plan.confidence, plan.uncertaintySec],
+           (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec, time_provenance)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [row.trade_hash, ticker, row.provider, plan.event, plan.dueAt, createdAt, plan.confidence, plan.uncertaintySec, plan.timeProvenance],
       ).catch(() => {});
       scheduled++;
     }
@@ -208,16 +289,32 @@ export async function scheduleMissingLatencyPriceSnapshots(
  */
 export async function scheduleCtPublishSnapshot(
   env: Env,
-  row: { trade_hash: string; ticker: string | null; provider: string; congress_first_seen_at: string },
+  row: {
+    trade_hash: string;
+    ticker: string | null;
+    provider: string;
+    congress_first_seen_at: string;
+    isOption?: boolean | number | null;
+    assetType?: string | null;
+    assetTypeName?: string | null;
+    assetName?: string | null;
+  },
   createdAtIso: string,
 ): Promise<void> {
   const ticker = (row.ticker || '').trim().toUpperCase();
-  if (!ticker || ticker.length > 8 || !row.congress_first_seen_at) return;
+  if (!row.congress_first_seen_at) return;
+  if (!canCaptureMinutePricing({
+    ticker,
+    isOption: row.isOption,
+    assetType: row.assetType,
+    assetTypeName: row.assetTypeName,
+    assetName: row.assetName,
+  })) return;
   await run(
     env.DB,
     `INSERT OR IGNORE INTO latency_price_snapshots
-       (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec)
-     VALUES (?, ?, ?, 'ct_publish', ?, ?, 'exact', 0)`,
+       (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec, time_provenance)
+     VALUES (?, ?, ?, 'ct_publish', ?, ?, 'exact', 0, 'observed')`,
     [row.trade_hash, ticker, row.provider, row.congress_first_seen_at, createdAtIso],
   ).catch(() => {});
 }
@@ -298,8 +395,26 @@ export async function captureDueLatencyPriceSnapshots(
   env: Env,
   now = new Date(),
   fetchImpl: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<CaptureResult> {
   const nowIso = now.toISOString();
+
+  // Sweep 12h-aged failed snapshots for exactly ONE full retry cycle
+  const sweepThresholdIso = new Date(now.getTime() - 12 * 60 * 60 * 1000).toISOString();
+  await run(
+    env.DB,
+    `UPDATE latency_price_snapshots
+        SET captured_at = NULL,
+            error = NULL,
+            backfill_attempts = 0,
+            swept_12h = 1
+      WHERE error IN ('confirmed_no_bars', 'backfill_exhausted', 'unavailable')
+        AND due_at <= ?
+        AND swept_12h = 0`,
+    [sweepThresholdIso],
+  );
+
+  // Find all pending snapshot rows that are due (or overdue) for capture.
   const nowMs = now.getTime();
   const empty: CaptureResult = { liveCaptured: 0, backfillCaptured: 0, terminalNoData: 0, deferred: 0, errors: 0 };
 
@@ -367,6 +482,7 @@ export async function captureDueLatencyPriceSnapshots(
     }
 
     for (const rows of groups.values()) {
+      if (signal?.aborted) break;
       const ticker = rows[0]!.ticker;
       const dueTimes = rows.map((r) => Date.parse(r.due_at)).filter((n) => Number.isFinite(n));
       if (!dueTimes.length) continue;
@@ -498,7 +614,7 @@ export async function summarizeProviderPublishBump(env: Env): Promise<PriceEdgeB
          ON later.trade_hash = pub.trade_hash
         AND later.provider = pub.provider
       WHERE pub.event = 'provider_publish'
-        AND later.event IN ('provider_plus_5m', 'provider_plus_15m', 'provider_plus_30m', 'provider_plus_60m')
+        AND later.event IN ('provider_minus_30m', 'provider_minus_15m', 'provider_plus_5m', 'provider_plus_15m', 'provider_plus_30m', 'provider_plus_60m')
         AND pub.price IS NOT NULL AND pub.price > 0
         AND later.price IS NOT NULL
         AND pub.market_session = 'regular'
@@ -524,8 +640,9 @@ export async function runLatencyPriceSnapshotTick(
   env: Env,
   now = new Date(),
   fetchImpl: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<{ scheduled: number } & CaptureResult> {
   const scheduled = await scheduleMissingLatencyPriceSnapshots(env, now);
-  const captured = await captureDueLatencyPriceSnapshots(env, now, fetchImpl);
+  const captured = await captureDueLatencyPriceSnapshots(env, now, fetchImpl, signal);
   return { scheduled: scheduled.scheduled, ...captured };
 }

@@ -77,8 +77,28 @@ function parseResponse<T>(schema: z.ZodType<T>, value: unknown, label: string): 
  */
 export function normalizeSecurityRef(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-  const ref = value as Record<string, unknown>;
-  return "sharesOutstanding" in ref ? ref : { ...ref, sharesOutstanding: null };
+  const ref = { ...value } as Record<string, unknown>;
+  if (!("sharesOutstanding" in ref)) {
+    ref.sharesOutstanding = null;
+  }
+  
+  if ("marketCapBucket" in ref) {
+    const validBuckets = ["mega", "large", "mid", "small", "micro", "nano"];
+    if (typeof ref.marketCapBucket === "string" && !validBuckets.includes(ref.marketCapBucket)) {
+      ref.marketCapBucket = null;
+    }
+  }
+
+  if ("currentPriceDate" in ref && typeof ref.currentPriceDate === "string") {
+    const match = ref.currentPriceDate.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (match) {
+      ref.currentPriceDate = match[1];
+    } else {
+      ref.currentPriceDate = null;
+    }
+  }
+
+  return ref;
 }
 
 export class CongressTradeHttpError extends Error {
@@ -142,8 +162,11 @@ export class CongressTradeClient {
    * Current Congress.Trade derives ownership from the user session and ignores
    * `clientId`; the field remains on the wire for compatibility with older servers.
    */
-  async createSubscription(clientId: string, desiredSecret?: string): Promise<Subscription> {
-    const body: Record<string, string> = { delivery: "sse", clientId };
+  async createSubscription(clientId?: string, desiredSecret?: string): Promise<Subscription> {
+    const body: Record<string, string> = { delivery: "sse" };
+    if (clientId) {
+      body.clientId = clientId;
+    }
     if (desiredSecret !== undefined) {
       if (desiredSecret.length < 16 || desiredSecret.length > 256) {
         throw new RangeError("desired subscription secret must be 16-256 characters");

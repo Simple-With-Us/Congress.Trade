@@ -39,7 +39,10 @@ jobs:
           actor="${{ github.actor }}"
           if printf '%s' "$actor" | grep -Eq '\[bot\]$'; then
             case "$actor" in
-              'cursor[bot]'|'dependabot[bot]'|'github-actions[bot]')
+              # The swu-* glob is the owner ruling of 2026-10-20: all swu-* bots
+              # are trusted CI actors.  It replaces a 40-entry enumeration that
+              # would drift from the autofix allowlists on every new install.
+              'cursor[bot]'|'dependabot[bot]'|'renovate[bot]'|'sentry[bot]'|'codex[bot]'|'chatgpt-codex-connector[bot]'|'kody-ai[bot]'|'claude[bot]'|'github-actions[bot]'|swu-*'[bot]')
                 echo "Trusted same-repo bot: $actor"
                 ;;
               *)
@@ -48,9 +51,59 @@ jobs:
                 ;;
             esac
           fi
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # CT-2459: full history is only needed by the weekly scheduled sweep.
+      # PR/push range scans check out shallow and fetch just the two range
+      # endpoints below, instead of every ref, tag and blob since day one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'schedule'
         with:
           fetch-depth: 0
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name != 'schedule'
+        with:
+          fetch-depth: 1
+
+      - name: Fetch scan-range endpoints
+        if: github.event_name != 'schedule'
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) lo="$PR_BASE"; hi="$PR_HEAD" ;;
+            push) lo="$PUSH_BEFORE"; hi="$PUSH_AFTER" ;;
+            *) lo=""; hi="" ;;
+          esac
+          if [ -n "$lo" ] && [ "$lo" != "0000000000000000000000000000000000000000" ] && [ -n "$hi" ]; then
+            git fetch --no-tags origin "$lo" "$hi"
+            # Depth-1 checkout leaves hi without parents. Without an ancestry
+            # link, gitleaks 8.24.3 cannot walk lo..hi and falls back to a
+            # full-tree tip scan, attributing every pre-existing finding to
+            # the tip SHA (seen on main after #2943). Deepen until lo is an
+            # ancestor of hi; unshallow only if deepen cannot bridge them.
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              for _ in 1 2 3 4 5 6 7 8; do
+                git fetch --no-tags --deepen=50 origin || true
+                if git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+                  break
+                fi
+              done
+            fi
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+            fi
+          else
+            # No usable range (new branch / first push): the scan falls back
+            # to full history, so restore it rather than silently scanning
+            # a shallow slice.
+            git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+          fi
 
       # gitleaks-action@e0c47f4 was replaced by a direct binary invocation.
       # The scan itself was never the problem: it logged "no leaks found" and
@@ -143,13 +196,46 @@ jobs:
               ;;
           esac
 
+          # The findings themselves are written to a JSON report rather than
+          # relied on from stdout.  `gitleaks git` only prints the "leaks found:
+          # N" summary line, so before this change a failing run said *how many*
+          # leaks it found and nothing else -- the weekly full-history sweep had
+          # failed every week since 2026-08-17 reporting "leaks found: 6" with
+          # no rule, path, commit or fingerprint anywhere in the log, which is
+          # why nobody could act on it.  --redact still applies, and we print
+          # only structural fields (rule / path / line / commit / fingerprint)
+          # and then delete the report, so no secret value can reach a job log
+          # or an artifact even if redaction ever regressed.
+          report="${RUNNER_TEMP:-/tmp}/gitleaks-report.json"
+          rm -f "$report"
+
           if [ -n "$range" ]; then
             echo "scanning commit range: $range"
-            # --redact so a finding never prints the secret itself into a job
-            # log readable by anyone with repo access.
-            gitleaks git --no-banner --redact --exit-code 1 --log-opts "$range" .
+            gitleaks git --no-banner --redact --exit-code 0 \
+              --report-format json --report-path "$report" --log-opts "$range" .
           else
             echo "scanning full history"
-            gitleaks git --no-banner --redact --exit-code 1 .
+            gitleaks git --no-banner --redact --exit-code 0 \
+              --report-format json --report-path "$report" .
           fi
+
+          count=0
+          if [ -s "$report" ]; then
+            count="$(jq 'length' "$report")"
+          fi
+
+          if [ "$count" -gt 0 ]; then
+            echo "::error::gitleaks found ${count} finding(s).  Structural details below; secret values are never printed."
+            # Explicitly whitelist the fields we emit.  Never emit .Secret or
+            # .Match.
+            jq -r '.[] | "  rule=\(.RuleID) file=\(.File) line=\(.StartLine) commit=\(.Commit[0:12]) date=\(.Date[0:10])\n    fingerprint=\(.Fingerprint)"' "$report"
+            echo
+            echo "A finding that is a confirmed false positive goes in .gitleaksignore as its"
+            echo "fingerprint line, with a comment saying why.  A finding that is a real secret"
+            echo "means ROTATE FIRST, then decide about history -- never the other way round."
+            rm -f "$report"
+            exit 1
+          fi
+
+          rm -f "$report"
           echo "No leaks detected."

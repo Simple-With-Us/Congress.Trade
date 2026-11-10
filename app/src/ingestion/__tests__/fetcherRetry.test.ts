@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   fetchFiling,
+  IngestRetryError,
   shouldRetryFetchStatus,
 } from '../fetcher.ts';
 
@@ -90,8 +91,8 @@ describe('fetcherRetry', () => {
     // Use a ReadableStream without a Content-Length to bypass the initial check
     const body = new ReadableStream({
       start(controller) {
-        // Enqueue chunks that sum to > MAX_RAW_FILING_BYTES
-        const chunk = new Uint8Array(20_000_000);
+        // Enqueue chunks that sum to > MAX_RAW_FILING_BYTES (50MB)
+        const chunk = new Uint8Array(30_000_000);
         controller.enqueue(chunk);
         controller.enqueue(chunk);
         controller.close();
@@ -103,6 +104,153 @@ describe('fetcherRetry', () => {
     // The limit trips while buffering, before R2 is ever touched.
     expect(put).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('does not stamp error when a fetch fails after the filing is already published', async () => {
+    const runs: string[] = [];
+    let publishedChecks = 0;
+    const fetchMock = vi.fn(async () => new Response('denied', { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const env = {
+      RAW_FILES: { put: vi.fn(async () => {}) },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              runs.push(sql);
+              return { success: true, meta: { changes: 0 } };
+            },
+            first: async () => {
+              if (/AS published/i.test(sql)) {
+                publishedChecks += 1;
+                // The pre-fetch check misses; the failure path must still refuse.
+                return publishedChecks === 1 ? null : { published: 1 };
+              }
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'http://test/doc.pdf',
+                chamber: 'house',
+                ingest_status: 'persisted',
+                first_seen_at: '2020-01-01T00:00:00.000Z',
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send: vi.fn(async () => {}) },
+    } as any;
+
+    await expect(fetchFiling(env, 'H-published')).rejects.toBeInstanceOf(IngestRetryError);
+    expect(fetchMock).toHaveBeenCalled();
+    expect(publishedChecks).toBeGreaterThanOrEqual(2);
+    expect(runs.some((sql) => /ingest_status = 'error'/i.test(sql))).toBe(false);
+    expect(env.INGEST_QUEUE.send).not.toHaveBeenCalled();
+    expect(env.RAW_FILES.put).not.toHaveBeenCalled();
+  });
+
+  it('still records a fetch error, with the published guard, when the filing is not published', async () => {
+    const runs: string[] = [];
+    const env = {
+      RAW_FILES: { put: vi.fn(async () => {}) },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              runs.push(sql);
+              return { success: true, meta: { changes: 1 } };
+            },
+            first: async () => {
+              if (/AS published/i.test(sql)) return null;
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'http://test/doc.pdf',
+                chamber: 'house',
+                ingest_status: 'new',
+                first_seen_at: '2020-01-01T00:00:00.000Z',
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send: vi.fn(async () => {}) },
+    } as any;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('missing', { status: 404 })));
+
+    await expect(fetchFiling(env, 'H-missing')).resolves.toBeUndefined();
+
+    const errorSql = runs.find((sql) => /ingest_status = 'error'/i.test(sql));
+    expect(errorSql).toBeTruthy();
+    expect(errorSql).toMatch(/deprecated_at IS NULL/);
+    expect(errorSql).toMatch(/ingestion_decisions/);
+    expect(errorSql).toMatch(/NOT \(/);
+  });
+
+  it('does not enqueue extraction when a publish lands mid-fetch', async () => {
+    const put = vi.fn(async () => {});
+    const send = vi.fn(async () => {});
+    const env = {
+      RAW_FILES: { put },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            // The guarded UPDATE matches no row:  the filing was published
+            // between the pre-fetch check and the write.
+            run: async () => ({ success: true, meta: { changes: 0 } }),
+            first: async () => {
+              if (/AS published/i.test(sql)) return null;
+              if (/review_queue/i.test(sql)) return null;
+              return { source_url: 'http://test/doc.pdf', chamber: 'house', ingest_status: 'new' };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send },
+    } as any;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('small filing', {
+      status: 200, headers: { 'content-type': 'application/pdf', 'content-length': '12' },
+    })));
+
+    await expect(fetchFiling(env, 'H-raced')).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('leaves an already-published filing alone instead of re-fetching', async () => {
+    const runs: string[] = [];
+    const fetchMock = vi.fn(async () => new Response('nope', { status: 403 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const put = vi.fn(async () => {});
+    const send = vi.fn(async () => {});
+    const env = {
+      RAW_FILES: { put },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => {
+              runs.push(sql);
+              return { success: true, meta: { changes: 0 } };
+            },
+            first: async () => {
+              if (/AS published/i.test(sql)) return { published: 1 };
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'https://efdsearch.senate.gov/search/view/ptr/already/',
+                chamber: 'senate',
+                ingest_status: 'error',
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send },
+    } as any;
+
+    await expect(fetchFiling(env, 'S-already-published')).resolves.toBeUndefined();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(runs.some((sql) => /ingest_status = 'error'/i.test(sql))).toBe(false);
   });
 
   it('no-ops without touching R2/DB/queue when the doc is already review-resolved', async () => {
@@ -118,15 +266,21 @@ describe('fetcherRetry', () => {
   });
 });
 
-describe('senate document fetch via relay (2026-08-10 regression)', () => {
-  // Imperva blocks the box's datacenter IP on efdsearch.senate.gov, so when
-  // SENATE_RELAY_URL is set EVERY senate document request must go through the
-  // relay's /fetch-doc — never direct. The historical backfill discovered
-  // ~650 filings whose direct fetches then all 403'd; this suite pins the fix.
+describe('senate document fetch (relay retired 2026-09-09)', () => {
+  // History: Imperva blocks the box's datacenter IP on efdsearch.senate.gov.
+  // The 2026-08-10 fix routed every senate document request through the Mac
+  // relay's /fetch-doc. The Mac is now retired (board `ba810d46`) and the
+  // residential IP comes from the Mango HTTP CONNECT proxy instead, so the
+  // mechanism changed but the invariant did not: a senate document fetch must
+  // never egress from the bare datacenter IP, and a stale SENATE_RELAY_URL
+  // must never be dialled. `resolveResidentialProxyUrl` always resolves now
+  // (Mango default), so these fetches are proxied; outside Deno
+  // `createProxiedFetch` is a transparent pass-through, which is why the mock
+  // still observes the real efdsearch URL.
   const SENATE_DOC = 'https://efdsearch.senate.gov/search/view/ptr/abc-123/';
   const RELAY = 'http://relay.test:8899';
 
-  it('routes the senate document fetch through the relay and never touches efdsearch directly', async () => {
+  it('ignores a stale SENATE_RELAY_URL and fetches the document directly', async () => {
     const { env, put } = envForFetch({ chamber: 'senate', sourceUrl: SENATE_DOC, relayUrl: RELAY });
     const fetchMock = vi.fn(async () => new Response('<html>Periodic Transaction Report</html>', {
       status: 200, headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -135,17 +289,18 @@ describe('senate document fetch via relay (2026-08-10 regression)', () => {
 
     await fetchFiling(env, 'S-doc_1');
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [calledUrl, calledInit] = fetchMock.mock.calls[0];
-    expect(calledUrl).toBe(`${RELAY}/fetch-doc`);
-    expect(calledInit.method).toBe('POST');
-    expect(JSON.parse(calledInit.body as string)).toEqual({ url: SENATE_DOC });
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(0);
+    // The retired relay is never contacted, even though the env still names it.
+    expect(fetchMock.mock.calls.every(([u]) => String(u) === SENATE_DOC)).toBe(true);
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/fetch-doc'))).toBe(false);
     expect(put).toHaveBeenCalledWith('raw/S-doc_1', expect.any(Uint8Array), {
       httpMetadata: { contentType: 'text/html; charset=utf-8' },
     });
   });
 
-  it('sends SENATE_RELAY_SECRET as Bearer on /fetch-doc', async () => {
+  it('never leaks SENATE_RELAY_SECRET onto the direct efdsearch request', async () => {
+    // The bearer belonged to the relay. Now that requests go straight to the
+    // Senate, attaching it would ship a fleet secret to a third-party origin.
     const { env } = envForFetch({
       chamber: 'senate',
       sourceUrl: SENATE_DOC,
@@ -157,26 +312,46 @@ describe('senate document fetch via relay (2026-08-10 regression)', () => {
     }));
     vi.stubGlobal('fetch', fetchMock);
     await fetchFiling(env, 'S-doc_1');
-    const headers = new Headers(fetchMock.mock.calls[0][1].headers);
-    expect(headers.get('authorization')).toBe('Bearer relay-test-secret');
+
+    for (const [, init] of fetchMock.mock.calls) {
+      const headers = new Headers((init as RequestInit)?.headers ?? {});
+      expect(headers.get('authorization')).toBeNull();
+    }
   });
 
-  it('retries through the relay (not direct) when the agreement wall leaks through', async () => {
+  it('negotiates a fresh session and retries directly when the agreement wall leaks through', async () => {
+    // The relay used to hide this: it returned agreement-accepted bytes. Going
+    // direct, the fetcher has to establish the eFD session itself (landing page
+    // for the CSRF token, then POST the prohibition agreement) before retrying.
     const { env, put } = envForFetch({ chamber: 'senate', sourceUrl: SENATE_DOC, relayUrl: RELAY });
     const wall = '<form id="agreement_form"><input name="prohibition_agreement"></form>';
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(wall, { status: 200, headers: { 'content-type': 'text/html' } }))
-      .mockResolvedValueOnce(new Response('<html>Periodic Transaction Report</html>', {
-        status: 200, headers: { 'content-type': 'text/html' },
-      }));
+    let docHits = 0;
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/search/')) {
+        return new Response(
+          `<form><input type="hidden" name="csrfmiddlewaretoken" value="csrf-hidden"></form>`,
+          { headers: { 'set-cookie': 'csrftoken=csrf-cookie; Path=/' } },
+        );
+      }
+      if (url.endsWith('/search/home/')) {
+        return new Response('', { status: 302, headers: { 'set-cookie': 'sessionid=sess; Path=/' } });
+      }
+      docHits += 1;
+      // First look at the document is the wall; after the session is accepted
+      // the retry gets the real report.
+      return docHits === 1
+        ? new Response(wall, { status: 200, headers: { 'content-type': 'text/html' } })
+        : new Response('<html>Periodic Transaction Report</html>', {
+            status: 200, headers: { 'content-type': 'text/html' },
+          });
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     await fetchFiling(env, 'S-doc_1');
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    for (const call of fetchMock.mock.calls) {
-      expect(call[0]).toBe(`${RELAY}/fetch-doc`);
-    }
+    // The retired relay is never dialled on any leg of this flow.
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes('/fetch-doc'))).toBe(false);
     expect(put).toHaveBeenCalledTimes(1);
   });
 
@@ -203,26 +378,22 @@ describe('senate document fetch via relay (2026-08-10 regression)', () => {
     expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit)?.method === 'HEAD')).toBe(true);
   });
 
-  it('falls back to direct eFD when /fetch-doc is a Cloudflare 502', async () => {
-    const { env, put } = envForFetch({ chamber: 'senate', sourceUrl: SENATE_DOC, relayUrl: RELAY });
-    const fetchMock = vi.fn(async (url: string) => {
-      if (String(url) === `${RELAY}/fetch-doc`) {
-        return new Response('error code: 502', { status: 502 });
-      }
-      return new Response('<html>Periodic Transaction Report</html>', {
-        status: 200, headers: { 'content-type': 'text/html' },
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
+  it('warns that a configured SENATE_RELAY_URL is being ignored', async () => {
+    // The operator has to learn the env is stale; the relay is gone and the
+    // request silently changed shape.
+    const { env } = envForFetch({ chamber: 'senate', sourceUrl: SENATE_DOC, relayUrl: RELAY });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>Periodic Transaction Report</html>', {
+      status: 200, headers: { 'content-type': 'text/html' },
+    })));
 
     await fetchFiling(env, 'S-doc_1');
 
-    expect(fetchMock.mock.calls[0][0]).toBe(`${RELAY}/fetch-doc`);
-    expect(fetchMock.mock.calls.some(([u]) => u === SENATE_DOC)).toBe(true);
-    expect(put).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.some(([msg]) => /SENATE_RELAY_URL/.test(String(msg)) && /retired/.test(String(msg)))).toBe(true);
+    warn.mockRestore();
   });
 
-  it('does not fall back on a mirrored upstream 404 from /fetch-doc', async () => {
+  it('treats an upstream 404 as the normal error path (no R2 write)', async () => {
     const { env, put } = envForFetch({ chamber: 'senate', sourceUrl: SENATE_DOC, relayUrl: RELAY });
     const fetchMock = vi.fn(async () => new Response('{"error":"x"}', {
       status: 404, headers: { 'content-type': 'application/json' },
@@ -230,8 +401,7 @@ describe('senate document fetch via relay (2026-08-10 regression)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(fetchFiling(env, 'S-doc_1')).resolves.toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe(`${RELAY}/fetch-doc`);
+    expect(fetchMock.mock.calls.every(([u]) => String(u) === SENATE_DOC)).toBe(true);
     expect(put).not.toHaveBeenCalled();
   });
 });

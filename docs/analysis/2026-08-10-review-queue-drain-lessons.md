@@ -69,7 +69,7 @@
 | B3 | **House Clerk discovery continuity** | House | Avoid 500-cap crawl stops mid-year; checkpoint index position; continuous frontier without scout phantom doc_ids |
 | B4 | **Executive OGE poll never silently off** | Executive | `OGE_WATCH_ENABLED` must default-on in prod config with health “not running” (not just stalled) |
 | B5 | **Priority drain order** | All | Scheduled tick: publish-ready deterministic reviews → local vision → only then paid vision; never reverse |
-| B6 | **Provider gap auto-attach** | H/S | When official filing later arrives for same filer+date+ticker cluster, auto-merge / auto-confirm provider rows or drop synthetic `provider-missing-*` |
+| B6 | **Provider gap auto-attach** | H/S | **Partial (2026-08-25 #2221):** live provider observation pass rejects open `provider-missing-*` stubs when official `S-{key}` / `H-*-{key}` / matching `source_url` is `persisted`.  Does not auto-merge or confirm stub txs.  No historic sweep.  Receipt: `docs/rollouts/2026-08-25-provider-missing-stub-close.md`. |
 
 ### P2 — Accuracy
 

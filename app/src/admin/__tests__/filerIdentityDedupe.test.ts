@@ -514,3 +514,59 @@ describe('curated Dunn merge group (MEMBER_FILER_MERGES)', () => {
     expect(allTx).toEqual([{ filer_id: 'house-fl02-neal-patrick-dunn' }]);
   });
 });
+
+// Board row 591011b9: EXEC-* vs MANUAL-* twins.  Once identitySync labels the
+// MANUAL-* row 'executive' the exec pass can cluster them; the canonical id must
+// be the real EXEC-* one (it carries the curated title) even when the phantom
+// holds more transactions.
+describe('dedupeSplitFilerIdentities: EXEC-* twin of a MANUAL-* phantom', () => {
+  it('merges MANUAL-BURGUM into EXEC-DOUGLAS-J-BURGUM although the phantom has 69 rows to the EXEC row\'s 6', async () => {
+    insertFiler({ id: 'EXEC-DOUGLAS-J-BURGUM', fullName: 'Douglas J Burgum', chamber: 'executive', state: '' });
+    insertFiler({ id: 'MANUAL-BURGUM', fullName: 'Douglas J Burgum', chamber: 'executive', state: '' });
+    for (let i = 0; i < 6; i++) insertTx('EXEC-DOUGLAS-J-BURGUM');
+    for (let i = 0; i < 69; i++) insertTx('MANUAL-BURGUM');
+
+    const result = await dedupeSplitFilerIdentities(env);
+
+    expect(result.clustersFound).toBe(1);
+    expect(result.details[0].canonicalId).toBe('EXEC-DOUGLAS-J-BURGUM');
+    expect(result.details[0].aliasIds).toEqual(['MANUAL-BURGUM']);
+    expect(result.transactionsMoved).toBe(69);
+    const owners = db.prepare('SELECT DISTINCT filer_id FROM transactions').all();
+    expect(owners).toEqual([{ filer_id: 'EXEC-DOUGLAS-J-BURGUM' }]);
+  });
+
+  it('merges "Christopher A Wright" into the curated EXEC-CWRIGHT ("Chris Wright"): their name keys differ, the curated alias joins them', async () => {
+    insertFiler({ id: 'EXEC-CWRIGHT', fullName: 'Chris Wright', chamber: 'executive', state: '' });
+    insertFiler({ id: 'MANUAL-WRIGHT', fullName: 'Christopher A Wright', chamber: 'executive', state: '' });
+    insertTx('EXEC-CWRIGHT');
+    for (let i = 0; i < 4; i++) insertTx('MANUAL-WRIGHT');
+
+    const result = await dedupeSplitFilerIdentities(env);
+
+    expect(result.details[0]?.canonicalId).toBe('EXEC-CWRIGHT');
+    expect(result.details[0]?.aliasIds).toEqual(['MANUAL-WRIGHT']);
+  });
+
+  it('while the phantom is still labelled senate nothing merges (the chamber fix must land first)', async () => {
+    insertFiler({ id: 'EXEC-DOUGLAS-J-BURGUM', fullName: 'Douglas J Burgum', chamber: 'executive', state: '' });
+    insertFiler({ id: 'MANUAL-BURGUM', fullName: 'Douglas J Burgum', chamber: 'senate', state: '' });
+    insertTx('MANUAL-BURGUM');
+
+    const result = await dedupeSplitFilerIdentities(env, { dryRun: true });
+
+    expect(result.clustersFound).toBe(0);
+  });
+
+  it('a real house-* id stays canonical over a MANUAL-* twin that carries more rows', async () => {
+    insertFiler({ id: 'house-ca47-alan-s-lowenthal', fullName: 'Alan S. Lowenthal', chamber: 'house', state: 'CA', resolvedBioguideId: 'L000579' });
+    insertFiler({ id: 'MANUAL-LOWENTHAL', fullName: 'Alan S. Lowenthal', chamber: 'house', state: 'CA', resolvedBioguideId: 'L000579' });
+    for (let i = 0; i < 2; i++) insertTx('house-ca47-alan-s-lowenthal');
+    for (let i = 0; i < 9; i++) insertTx('MANUAL-LOWENTHAL');
+
+    const result = await dedupeSplitFilerIdentities(env);
+
+    expect(result.details.map((d) => d.canonicalId)).toEqual(['house-ca47-alan-s-lowenthal']);
+  });
+});
+

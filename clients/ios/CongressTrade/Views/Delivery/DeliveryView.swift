@@ -4,296 +4,250 @@ import UIKit
 struct DeliveryView: View {
     @EnvironmentObject private var store: CongressTradeStore
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @AppStorage("ct_disclaimer_expanded") private var disclaimerExpanded = false
     @State private var deliveryMode: DeliveryMode = .sse
     @State private var webhookURL = ""
     @State private var filterChambers: Set<ChamberFilter> = []
-    @State private var membersText = ""
-    @State private var watchlistDraft: [String] = []
-    @State private var newTicker = ""
+    @State private var selectedMembers: [MemberDirectoryEntry] = []
+    @State private var showMemberPicker = false
     @State private var showSubscribe = false
     @State private var showExportSheet = false
 
-    // Phone alerts live in TradeDisclosureAlertsToggle (shared with the
-    // header menu).  The old notify_* AppStorage keys were write-only and
-    // are gone.
-
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    TradeDisclosureAlertsToggle()
-                } header: {
-                    Text("Alerts on This Phone")
-                } footer: {
-                    Text("The same controls as in the header menu.  Choose Off, one digest per new filing, or Watchlist tickers with a minimum amount and buys or sells.")
+            VStack(spacing: 0) {
+                if disclaimerExpanded {
+                    DisclaimerBanner()
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                        .padding(.bottom, 4)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                // Export sits beside the upgrade entry point on purpose (owner
-                // asked for that adjacency): the thing you want and the thing
-                // that unlocks it should not be on different screens.
-                Section {
-                    Button {
-                        showExportSheet = true
-                    } label: {
-                        // Split colour: bare-glyph grey on the icon, dark
-                        // legible ink on the word (owner 2026-08-21 — words
-                        // must read dark, glyphs can stay the lighter grey).
-                        // Without this the row inherits the app-wide
-                        // `.tint(.blue)` (App.swift) and renders accent blue.
-                        Label {
-                            Text("Export CSV").foregroundStyle(AppTheme.wordInk)
-                        } icon: {
-                            Image(systemName: "arrow.down.circle").foregroundStyle(AppTheme.glyphGrey)
-                        }
+                Form {
+                    Section {
+                        TradeDisclosureAlertsToggle(isCompact: true)
+                    } footer: {
+                        Text("Customize push alerts in the \(Image(systemName: "line.3.horizontal")) menu at top right.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    if !store.isPremium {
+
+                    // Export sits beside the upgrade entry point on purpose (owner
+                    // asked for that adjacency): the thing you want and the thing
+                    // that unlocks it should not be on different screens.
+                    Section {
                         Button {
-                            showSubscribe = true
+                            showExportSheet = true
                         } label: {
-                            // Owner (2026-08-21): the Apple logo glyph itself
-                            // must be the same near-black as the text, not
-                            // blue — unlike Export CSV above, no split here.
-                            Label("Subscribe with Apple", systemImage: "apple.logo")
-                                .foregroundStyle(AppTheme.wordInk)
+                            Label {
+                                Text("Export CSV").foregroundStyle(AppTheme.wordInk)
+                            } icon: {
+                                Image(systemName: "arrow.down.circle").foregroundStyle(AppTheme.glyphGrey)
+                            }
                         }
+                    } header: {
+                        Text("Premium")
+                    } footer: {
+                        Text("CSV files export according to the filters set on the Trades tab.  Premium plans and any free trial are shown in the App Store purchase sheet.")
                     }
-                } header: {
-                    Text("Premium")
-                } footer: {
-                    Text("CSV export uses the filters set on the Trades tab, plus the dates you pick.  Premium is $5/month or $50/year, with a 2-week free trial.")
-                }
 
-                Section {
-                    if !store.signedIn {
-                        VStack(alignment: .leading, spacing: 10) {
+                    Section {
+                        if !store.signedIn {
+                            VStack(alignment: .leading, spacing: 10) {
+                                DeliveryMethodExplainer()
+                                Text("Sign in to create delivery alerts.")
+                                    .foregroundStyle(.primary)
+                            }
+                            .padding(.vertical, 4)
+                        } else if !store.isPremium {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Label("Premium Feature", systemImage: "star.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(.orange)
+                                Text(PremiumPricing.deliveryUpgradeMessage)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                // Subscribe with Apple prominent button
+                                SubscribeWithAppleProminentButton {
+                                    showSubscribe = true
+                                }
+                                Text("Deliveries connect your server or app to real-time data. Configure push alerts in the \(Image(systemName: "line.3.horizontal")) menu.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 2)
+                            }
+                            .padding(.vertical, 4)
+                        } else {
                             DeliveryMethodExplainer()
-                            Text("Sign in to create delivery alerts.")
-                                .foregroundStyle(.primary)
-                        }
-                        .padding(.vertical, 4)
-                    } else if !store.isPremium {
-                        // Delivery creation is Premium-gated server-side; show
-                        // the paywall up front instead of letting free users
-                        // hit a raw 403 from `create_subscription`.
-                        VStack(alignment: .leading, spacing: 10) {
-                            Label("Premium Feature", systemImage: "star.fill")
-                                .font(.headline)
-                                .foregroundStyle(.orange)
-                            Text(PremiumPricing.deliveryUpgradeMessage)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                            Button {
-                                showSubscribe = true
-                            } label: {
-                                Label("Subscribe with Apple", systemImage: "apple.logo")
-                                    .font(.subheadline.weight(.semibold))
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 10)
+                                .padding(.bottom, 2)
+
+                            Picker("Mode", selection: $deliveryMode) {
+                                ForEach(DeliveryMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
                             }
-                            .buttonStyle(.borderedProminent)
-                            // `.borderedProminent`'s fill comes from `.tint`,
-                            // not `.foregroundStyle` — the app-wide
-                            // `.tint(.blue)` (App.swift) would otherwise
-                            // paint this pill accent blue. Owner (2026-08-21)
-                            // wants near-black here, matching the plain
-                            // "Subscribe with Apple" row above.
-                            .tint(AppTheme.wordInk)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
-                        .padding(.vertical, 4)
-                    } else {
-                        DeliveryMethodExplainer()
-                            .padding(.bottom, 2)
+                            .pickerStyle(.segmented)
+                            .padding(.vertical, 4)
 
-                        Picker("Mode", selection: $deliveryMode) {
-                            ForEach(DeliveryMode.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
+                            if deliveryMode == .webhook {
+                                TextField("https://example.com/webhook", text: $webhookURL)
+                                    .urlKeyboard()
+                                    .neverAutocapitalized()
+                                    .autocorrectionDisabled()
                             }
-                        }
-                        .pickerStyle(.segmented)
-                        .padding(.vertical, 4)
 
-                        if deliveryMode == .webhook {
-                            TextField("https://example.com/webhook", text: $webhookURL)
-                                .urlKeyboard()
-                                .neverAutocapitalized()
-                                .autocorrectionDisabled()
-                        }
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Chambers")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 8) {
+                                    ForEach(ChamberFilter.allCases) { chamber in
+                                        FilterChip(
+                                            title: chamber.shortLabel,
+                                            isSelected: filterChambers.contains(chamber)
+                                        ) {
+                                            if filterChambers.contains(chamber) {
+                                                filterChambers.remove(chamber)
+                                            } else {
+                                                filterChambers.insert(chamber)
+                                            }
+                                        }
+                                        .accessibilityLabel(chamber.label)
+                                    }
+                                }
+                                Text("No selection delivers all chambers.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
 
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Chambers")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            HStack(spacing: 8) {
-                                ForEach(ChamberFilter.allCases) { chamber in
-                                    FilterChip(
-                                        title: chamber.shortLabel,
-                                        isSelected: filterChambers.contains(chamber)
-                                    ) {
-                                        if filterChambers.contains(chamber) {
-                                            filterChambers.remove(chamber)
-                                        } else {
-                                            filterChambers.insert(chamber)
+                            // Members are picked from the directory and sent as filer ids:
+                            // the server matches on ids, so typed names used to save a
+                            // subscription that could never deliver (board a6058af2).
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Members")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                if selectedMembers.isEmpty {
+                                    Text("No selection delivers every member.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    ForEach(selectedMembers) { member in
+                                        HStack {
+                                            Text(member.fullName ?? member.filerId)
+                                                .font(.subheadline)
+                                            Spacer()
+                                            Button {
+                                                selectedMembers.removeAll { $0.filerId == member.filerId }
+                                            } label: {
+                                                Image(systemName: "xmark.circle.fill")
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .accessibilityLabel("Remove \(member.fullName ?? member.filerId)")
                                         }
                                     }
-                                    .accessibilityLabel(chamber.label)
                                 }
-                            }
-                            Text("No selection delivers all chambers.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 4)
-
-                        TextField("Members (comma separated, optional)", text: $membersText)
-                            .neverAutocapitalized()
-                            .autocorrectionDisabled()
-
-                        Button {
-                            Task {
-                                await store.createDelivery(
-                                    mode: deliveryMode,
-                                    webhookURL: webhookURL,
-                                    chambers: filterChambers,
-                                    members: Self.parseMembers(membersText)
-                                )
-                            }
-                        } label: {
-                            if store.isCreatingDelivery {
-                                ProgressView()
-                            } else {
-                                Label("Create Delivery", systemImage: "paperplane.fill")
-                                    .fontWeight(.medium)
-                            }
-                        }
-                        .disabled(store.isCreatingDelivery)
-                    }
-
-                    if let notice = store.deliveryNotice {
-                        NoticeView(message: notice)
-                            .listRowInsets(EdgeInsets())
-                            .listRowBackground(Color.clear)
-                    }
-                } header: {
-                    Text("Create Delivery")
-                } footer: {
-                    // The single line that has to land for a non-developer:
-                    // this whole tab is about machines, not this phone.
-                    Text("Deliveries send filings to a server you run — they are not alerts on this phone.  For those, use Alerts on This Phone above.")
-                }
-
-                Section("Existing Subscriptions") {
-                    if store.subscriptions.isEmpty {
-                        Text(store.signedIn ? "No delivery subscriptions yet." : "Sign in to manage delivery subscriptions.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(store.subscriptions) { subscription in
-                            SubscriptionRow(
-                                subscription: subscription,
-                                onToggle: {
-                                    Task { await store.toggleSubscription(subscription) }
-                                },
-                                onDelete: {
-                                    Task { await store.deleteSubscription(subscription) }
-                                }
-                            )
-                            .disabled(store.subscriptionIDsInFlight.contains(subscription.id))
-                        }
-                    }
-                }
-
-                Section {
-                    if !store.signedIn {
-                        Text("Sign in to manage your watchlist.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        if watchlistDraft.isEmpty {
-                            Text("No tickers yet. An empty watchlist delivers everything.")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                        ForEach(watchlistDraft, id: \.self) { ticker in
-                            HStack {
-                                Text(ticker)
-                                    .font(.body.weight(.semibold).monospaced())
-                                Spacer()
-                                Button(role: .destructive) {
-                                    watchlistDraft.removeAll { $0 == ticker }
+                                Button {
+                                    showMemberPicker = true
                                 } label: {
-                                    Image(systemName: "minus.circle.fill")
-                                        .foregroundStyle(.red)
+                                    Label(
+                                        selectedMembers.isEmpty ? "Choose Members" : "Add or Remove Members",
+                                        systemImage: "person.crop.circle.badge.plus"
+                                    )
                                 }
-                                .accessibilityLabel("Remove \(ticker)")
                             }
-                        }
-                        HStack {
-                            TextField("Add ticker (e.g. NVDA)", text: $newTicker)
-                                .tickerAutocapitalized()
-                                .autocorrectionDisabled()
-                            Button("Add") {
-                                let parsed = CongressTradeStore.parseTickers(newTicker)
-                                for ticker in parsed where !watchlistDraft.contains(ticker) {
-                                    watchlistDraft.append(ticker)
-                                }
-                                newTicker = ""
-                            }
-                            .disabled(CongressTradeStore.parseTickers(newTicker).isEmpty)
-                        }
-                        if watchlistDraft != store.watchlist {
+                            .padding(.vertical, 4)
+
                             Button {
-                                Task { await store.saveWatchlist(watchlistDraft.joined(separator: ",")) }
+                                Task {
+                                    await store.createDelivery(
+                                        mode: deliveryMode,
+                                        webhookURL: webhookURL,
+                                        chambers: filterChambers,
+                                        members: selectedMembers.map(\.filerId)
+                                    )
+                                }
                             } label: {
-                                if store.isSavingWatchlist {
+                                if store.isCreatingDelivery {
                                     ProgressView()
                                 } else {
-                                    Label("Save Watchlist", systemImage: "checkmark.circle")
+                                    Label("Create Delivery", systemImage: "paperplane.fill")
                                         .fontWeight(.medium)
                                 }
                             }
-                            .disabled(store.isSavingWatchlist)
+                            .disabled(store.isCreatingDelivery)
+                        }
+
+                        if let notice = store.deliveryNotice {
+                            NoticeView(message: notice)
+                                .listRowInsets(EdgeInsets())
+                                .listRowBackground(Color.clear)
+                        }
+                    } header: {
+                        Text("Create Delivery")
+                    } footer: {
+                        if store.signedIn && store.isPremium {
+                            Text("Deliveries connect your server or app to real-time data. Configure push alerts in the \(Image(systemName: "line.3.horizontal")) menu.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                } header: {
-                    Text("Watchlist")
-                } footer: {
-                    Text("New deliveries filter to these tickers.  Watchlist push alerts use the same list, with per-symbol amount and side filters under Alerts on This Phone.")
-                }
 
-                if let summary = store.latencySummary,
-                   LatencyScorecardCopy.isPubliclyVisible(summary) {
-                    Section {
-                        LatencyComparisonView(summary: summary)
+                    Section("Existing Subscriptions") {
+                        if store.subscriptions.isEmpty {
+                            Text(store.signedIn ? "No delivery subscriptions yet." : "Sign in to manage delivery subscriptions.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(store.subscriptions) { subscription in
+                                SubscriptionRow(
+                                    subscription: subscription,
+                                    onToggle: {
+                                        Task { await store.toggleSubscription(subscription) }
+                                    },
+                                    onDelete: {
+                                        Task { await store.deleteSubscription(subscription) }
+                                    }
+                                )
+                                .disabled(store.subscriptionIDsInFlight.contains(subscription.id))
+                            }
+                        }
                     }
-                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
-                    .listRowBackground(Color.clear)
-                }
 
-                // Footer links live in their own borderless row rather than a
-                // section footer so they read as page chrome, not as a note
-                // about the watchlist above them.
-                Section {
-                    AppLegalFooter()
-                        .listRowInsets(EdgeInsets())
+                    if let summary = store.latencySummary,
+                       LatencyScorecardCopy.isPubliclyVisible(summary) {
+                        Section {
+                            LatencyComparisonView(summary: summary)
+                        }
+                        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
                         .listRowBackground(Color.clear)
+                    }
                 }
             }
-            // Regular width class only (iPad): cap the Form to a comfortable
-            // reading measure and center it, instead of letting section
-            // footers (e.g. the Premium blurb below) run the full canvas
-            // width — iPad audit P1-3. `AppTheme.background` is
-            // `.systemBackground` in both light and dark, same as the
-            // NavigationStack's own default, so the margin this leaves on
-            // either side is seamless rather than a visible gutter.
+            .animation(.easeInOut(duration: 0.32), value: disclaimerExpanded)
             .frame(maxWidth: horizontalSizeClass == .regular ? 640 : .infinity)
             .frame(maxWidth: .infinity)
             .scrollContentBackground(.hidden)
             .background(AppTheme.background)
-            .navigationTitle("Delivery")
-            .inlineNavigationTitle()
+            .navigationBarTitleDisplayMode(.inline)
+            .ctSolidFeedHeader()
             .toolbar {
-                // Sign-in, appearance, export, and Premium were otherwise
-                // unreachable from this tab — the hamburger menu only lived
-                // on Trends/Trades (iPad audit P2-2).
+                ToolbarItem(placement: .topBarLeading) {
+                    HeaderIconButton(
+                        systemImage: "info.circle",
+                        accessibilityLabel: "About Congress.Trade"
+                    ) {
+                        DisclaimerColdStart.cancelAutoHide()
+                        withAnimation(.easeInOut(duration: 0.32)) {
+                            disclaimerExpanded.toggle()
+                        }
+                    }
+                }
+                ToolbarItem(placement: .principal) {
+                    BrandTitle()
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     HamburgerMenuButton()
                 }
@@ -305,6 +259,13 @@ struct DeliveryView: View {
                 PremiumSheet()
                     .environmentObject(store)
             }
+            .sheet(isPresented: $showMemberPicker) {
+                DeliveryMemberPicker(selection: $selectedMembers)
+                    .environmentObject(store)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                    .iPadFullWidthSheet()
+            }
             .sheet(isPresented: $showExportSheet) {
                 ExportCSVSheet()
                     .environmentObject(store)
@@ -313,7 +274,6 @@ struct DeliveryView: View {
                     .iPadFullWidthSheet()
             }
             .onAppear {
-                watchlistDraft = store.watchlist
                 Task {
                     await store.refreshSignedInState()
                     if store.latencySummary == nil {
@@ -321,18 +281,98 @@ struct DeliveryView: View {
                     }
                 }
             }
-            .onChange(of: store.watchlist) { _, newValue in
-                watchlistDraft = newValue
-            }
         }
     }
 
-    /// Members are free-text names (not symbols), so no uppercasing.
-    private static func parseMembers(_ text: String) -> [String] {
-        text
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+
+/// Multi-select member picker for a delivery's `members` filter, built on the
+/// People directory (`store.members`, `MemberDirectorySearch`).  Selecting a row
+/// keeps the directory entry so the create call sends its `filerId` — the id the
+/// backend matches trades against.
+struct DeliveryMemberPicker: View {
+    @Binding var selection: [MemberDirectoryEntry]
+    @EnvironmentObject private var store: CongressTradeStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    /// Same cap as the server (`validateSubscriptionFilters`: at most 50 members).
+    static let maxMembers = 50
+
+    private var visibleMembers: [MemberDirectoryEntry] {
+        let matching = store.members.filter { MemberDirectorySearch.matches($0, query: query) }
+        return MemberDirectorySearch.sort(matching, key: .name, ascending: true)
+    }
+
+    private var selectedIDs: Set<String> { Set(selection.map(\.filerId)) }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if store.isLoadingMembers && store.members.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Loading members…").foregroundStyle(.secondary)
+                    }
+                } else if let notice = store.membersNotice, store.members.isEmpty {
+                    NoticeView(message: notice)
+                } else if visibleMembers.isEmpty {
+                    Text("No members match \"\(query)\".").foregroundStyle(.secondary)
+                }
+                ForEach(visibleMembers) { member in
+                    let isSelected = selectedIDs.contains(member.filerId)
+                    Button {
+                        toggle(member)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(member.fullName ?? member.filerId)
+                                    .foregroundStyle(.primary)
+                                let detail = Self.detail(for: member)
+                                if !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if isSelected {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(AppTheme.wordInk)
+                            }
+                        }
+                    }
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+            }
+            .searchable(text: $query, prompt: "Search members")
+            .navigationTitle("Members")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: AppToolbarPlacement.trailing) {
+                    Button("Done") { dismiss() }
+                        .fontWeight(.bold)
+                        .foregroundStyle(AppTheme.wordInk)
+                        .tint(AppTheme.wordInk)
+                }
+            }
+            .task { await store.loadMembersDirectory() }
+        }
+    }
+
+    private func toggle(_ member: MemberDirectoryEntry) {
+        if let index = selection.firstIndex(where: { $0.filerId == member.filerId }) {
+            selection.remove(at: index)
+        } else if selection.count < Self.maxMembers {
+            selection.append(member)
+        }
+    }
+
+    private static func detail(for member: MemberDirectoryEntry) -> String {
+        [member.chamber?.capitalized, member.state, member.party]
+            .compactMap { $0 }
             .filter { !$0.isEmpty }
+            .joined(separator: " · ")
     }
 }
 
@@ -343,8 +383,12 @@ struct DeliveryView: View {
 struct DeliveryMethodExplainer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Webhooks: we POST each new filing to your URL, HMAC-signed.")
-            Text("Live stream (SSE): one open connection that pushes filings as they land.")
+            // One POST per transaction, not per filing — a filing with several
+            // trades sends several requests (`app/src/delivery/webhook.ts`
+            // sets X-Tx-Id per POST).  "New filings" read as one-per-filing and
+            // sent integrators dedupe on the wrong key.
+            Text("Webhooks: POST each new trade to your URL (HMAC signed).")
+            Text("SSE: Live stream over an open connection.")
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -366,6 +410,12 @@ struct SubscriptionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                if let members = subscription.memberSummary {
+                    Text(members)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
                 Text("Cursor \(subscription.cursor)")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(.secondary)

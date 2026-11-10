@@ -11,9 +11,16 @@ import {
   resolveExecutiveFilerIdFromName,
 } from "../src/shared/executiveIdentity.ts";
 import {
+  chamberFromMemberType,
   competitorHouseFilerId,
+  competitorQualifiedManualFilerId,
+  competitorReporterNames,
   parseCompetitorReporter,
 } from "../src/shared/competitorAttribution.ts";
+import {
+  findExistingFilerForCompetitorReporter,
+  type ExistingFilerCandidate,
+} from "../src/shared/competitorFilerMatch.ts";
 
 const dataDir = new URL("../../data/hoarded", import.meta.url).pathname;
 
@@ -184,42 +191,87 @@ async function run() {
   // Before looping over competitors, create a set of seen filers to add if missing
   const filersToAdd = new Map<string, { id: string, name: string, chamber: string }>();
 
+  // Live, non-tombstoned filers: the identities a competitor row must attach to
+  // instead of minting a second one (board rows 2c0b428c / 591011b9).
+  const existingFilers: ExistingFilerCandidate[] = (
+    await env.DB.prepare(
+      "SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id FROM filers WHERE merged_into IS NULL",
+    ).all<{
+      bioguide_id: string; full_name: string | null; display_name: string | null;
+      chamber: string | null; state: string | null; resolved_bioguide_id: string | null;
+    }>()
+  ).results.map((f) => ({
+    filerId: f.bioguide_id,
+    fullName: f.full_name,
+    displayName: f.display_name,
+    chamber: f.chamber,
+    state: f.state,
+    resolvedBioguideId: f.resolved_bioguide_id,
+  }));
+  let refusedBareName = 0;
+
   /**
-   * Chamber+state identity guard (verified-in-production bug: the original
-   * injector resolved filers by LAST NAME ONLY, colliding e.g. Rep. Mike
-   * Collins GA-10 with Sen. Susan M. Collins ME — same last name, different
-   * chamber AND state). Prefers the payload's own office metadata
-   * (state+district, parsed via shared/competitorAttribution.ts) to mint a
-   * real house-<state><district>-<slug> id, which can never collide across
-   * chamber or state. Without office metadata, still never collapses two
-   * different chambers onto the same MANUAL-<LASTNAME> id — see
-   * admin/competitorAttributionRepair.ts for the one-shot repair of rows
-   * already poisoned by the old behavior.
+   * Ingest identity guard.  History: the original injector resolved filers by
+   * LAST NAME ONLY (`MANUAL-${lastName}`), which collided Rep. Mike Collins
+   * GA-10 with Sen. Susan M. Collins ME, fused two different "Delaney"s into
+   * one MANUAL-DELANEY, and left MANUAL-ELVIRA / MANUAL-BURGUM / MANUAL-WRIGHT
+   * beside the real Salazar and EXEC-* filers.  Order now:
+   *   1. a curated EXEC-* alias (full-name match only);
+   *   2. an EXISTING real filer the payload's reporter names — first+last name
+   *      (diminutive-aware), payload bioguide id, with a known state/chamber
+   *      conflict a hard miss and an ambiguous match a miss
+   *      (shared/competitorFilerMatch.ts);
+   *   3. a real `house-<state><district>-<slug>` id when the payload carries
+   *      office metadata;
+   *   4. a first-name-qualified `MANUAL-<FIRST>-<LAST>` id;
+   *   5. otherwise REFUSE (null): a bare surname never mints a filer.
+   * See admin/competitorAttributionRepair.ts for the repair of rows already
+   * poisoned by the old behavior.
    */
   function resolveFilerId(
     rawName: string,
     chamber: 'house' | 'senate' | 'executive',
     rawObj: any,
-  ): { filerId: string; resolvedChamber: 'house' | 'senate' | 'executive' } {
+  ): { filerId: string; resolvedChamber: 'house' | 'senate' | 'executive' } | null {
     const execId = resolveExecutiveFilerIdFromName(rawName);
     if (execId) return { filerId: execId, resolvedChamber: 'executive' };
 
     const parsed = parseCompetitorReporter(rawObj);
+    const existing = findExistingFilerForCompetitorReporter({
+      names: [...competitorReporterNames(rawObj), rawName],
+      chamber: parsed.chamber,
+      state: parsed.state,
+      bioguideId: parsed.bioguideId,
+      candidates: existingFilers,
+    });
+    if (existing) {
+      const existingChamber = (existing.chamber ?? '').toLowerCase();
+      const resolvedChamber = existingChamber === 'house' || existingChamber === 'senate' || existingChamber === 'executive'
+        ? existingChamber
+        : (parsed.chamber ?? chamber);
+      return { filerId: existing.filerId, resolvedChamber };
+    }
+
     if (parsed.state && parsed.district) {
       const houseId = competitorHouseFilerId(rawName, parsed.state, parsed.district);
       if (houseId) return { filerId: houseId, resolvedChamber: 'house' };
     }
 
-    const lastName = extractLastName(rawName);
+    // Only a payload-declared chamber is trusted here; the provider default is
+    // NOT — that is how executives ended up labelled 'senate'.
     const resolvedChamber = parsed.chamber ?? chamber;
-    const filerId = resolvedChamber === 'senate'
-      ? `MANUAL-${lastName.toUpperCase()}-S`
-      : `MANUAL-${lastName.toUpperCase()}`;
-    return { filerId, resolvedChamber };
+    const qualified = competitorQualifiedManualFilerId(rawName);
+    if (!qualified) return null;
+    return { filerId: qualified, resolvedChamber };
   }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
-    const { filerId, resolvedChamber } = resolveFilerId(rawName, chamber, rawObj);
+    const resolved = resolveFilerId(rawName, chamber, rawObj);
+    if (!resolved) {
+      refusedBareName += 1;
+      return;
+    }
+    const { filerId, resolvedChamber } = resolved;
     filersToAdd.set(filerId, { id: filerId, name: rawName, chamber: resolvedChamber });
     processTrade(provider, rawName, resolvedChamber, ticker, date, typeStr, rawObj, filerId);
   }
@@ -235,7 +287,9 @@ async function run() {
   // quiver
   for (const t of qqTrades) {
     if (t.Representative) {
-      processTradeWithFiler('quiver', t.Representative, t.House === 'House' ? 'house' : 'senate', t.Ticker, t.TransactionDate, t.Transaction, t);
+      // Quiver's `House` field reads 'Representatives' | 'Senate'; the old `=== 'House'`
+      // test never matched, so every Representative defaulted to 'senate'.
+      processTradeWithFiler('quiver', t.Representative, chamberFromMemberType(t.House) === 'senate' ? 'senate' : 'house', t.Ticker, t.TransactionDate, t.Transaction, t);
     }
   }
 
@@ -255,6 +309,9 @@ async function run() {
   }
   
   console.log(`Found ${novelTrades.length} novel trades across all competitor datasets.`);
+  if (refusedBareName > 0) {
+    console.warn(`Refused ${refusedBareName} rows whose reporter is a bare surname (no filer minted from a last name alone).`);
+  }
 
   console.log("Inserting required filers...");
   for (const f of filersToAdd.values()) {

@@ -52,6 +52,35 @@ const SELL = "SUM(CASE WHEN t.tx_type = 'S' THEN 1 ELSE 0 END)";
 const BUY_VOL = `SUM(CASE WHEN t.tx_type IN ('B', 'P') THEN ${MID} ELSE 0 END)`;
 const SELL_VOL = `SUM(CASE WHEN t.tx_type = 'S' THEN ${MID} ELSE 0 END)`;
 
+/**
+ * S&P 500 close on or before `dateExpr` (a securities_ref.current_price_date),
+ * falling back to the newest close when the date is missing or earlier than the
+ * whole series.  Correlated lookups on spx_eod's primary key.
+ */
+function spxOnOrBeforePriceDateSql(dateExpr: string): string {
+  return (
+    `COALESCE((SELECT s.close FROM spx_eod s WHERE s.date <= ${dateExpr} ORDER BY s.date DESC LIMIT 1), ` +
+    '(SELECT s.close FROM spx_eod s ORDER BY s.date DESC LIMIT 1))'
+  );
+}
+
+/**
+ * One row per priced ticker: its current price, the day that price is from, and
+ * the S&P close on that SAME day — the aligned exit legs of every excess-vs-S&P
+ * figure.  Materialized once per query (securities_ref is small) instead of a
+ * correlated lookup per trade row.
+ */
+/** Materialized once per query; excludes tickers whose current price is too old for excess-return math. */
+export function buildPriceAnchorCteBody(priceFreshThrough: string): string {
+  const through = priceFreshThrough.slice(0, 10);
+  return (
+    'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
+    `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
+    'FROM securities_ref r WHERE r.current_price IS NOT NULL AND r.current_price > 0 ' +
+    `AND r.current_price_date IS NOT NULL AND r.current_price_date >= '${through}'`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 1. Summary — KPI strip
 // ---------------------------------------------------------------------------
@@ -60,6 +89,7 @@ const SELL_VOL = `SUM(CASE WHEN t.tx_type = 'S' THEN ${MID} ELSE 0 END)`;
  *  buy/sell/exchange counts, resolved-ticker count, option count. */
 export function buildSummaryQuery(p: CommonFilters): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
+  const equitySql = canonicalAssetTypeCategorySql('t.asset_type', 't.asset_type_name', 't.is_option');
   const sql =
     'SELECT ' +
     'COUNT(*) AS total_trades, ' +
@@ -71,6 +101,16 @@ export function buildSummaryQuery(p: CommonFilters): BuiltQuery {
     `SUM(${STOCK_MID}) AS est_volume, ` +
     `SUM(${STOCK_SIGNED}) AS est_net_flow, ` +
     `SUM(CASE WHEN ${TICKER_RESOLVED_SQL} THEN 1 ELSE 0 END) AS resolved_ticker_count, ` +
+    `SUM(CASE WHEN ${equitySql} = 'public_equity' THEN 1 ELSE 0 END) AS equity_trade_count, ` +
+    `SUM(CASE WHEN ${equitySql} = 'public_equity' AND ${TICKER_RESOLVED_SQL} THEN 1 ELSE 0 END) AS resolved_equity_ticker_count, ` +
+    // Equity-LIKE population: rows typed public_equity PLUS rows whose type is
+    // still 'unknown'.  A description with no ticker and no [ST] code (the House
+    // scanned form's "Provide full name, not ticker symbol", or an OGE row whose
+    // name starts with a row number) is typed unknown, so counting only
+    // public_equity in the denominator hid exactly the rows that lacked a ticker
+    // (board row 16b46688: 95.6% headline vs 45% of all rows).
+    `SUM(CASE WHEN ${equitySql} IN ('public_equity', 'unknown') THEN 1 ELSE 0 END) AS equity_like_trade_count, ` +
+    `SUM(CASE WHEN ${equitySql} IN ('public_equity', 'unknown') AND ${TICKER_RESOLVED_SQL} THEN 1 ELSE 0 END) AS resolved_equity_like_ticker_count, ` +
     'SUM(CASE WHEN t.is_option = 1 THEN 1 ELSE 0 END) AS option_count ' +
     ANALYTICS_FROM_JOINS +
     whereSql(where);
@@ -316,7 +356,10 @@ export function buildPartySplitQuery(p: CommonFilters): BuiltQuery {
     'COUNT(DISTINCT t.filer_id) AS members ' +
     ANALYTICS_FROM_JOINS +
     whereSql(where) +
-    'GROUP BY party';
+    // Group by the bucket EXPRESSION, not the `party` alias: in SQLite a bare
+    // GROUP BY identifier binds to the joined `fl.party` column first, which
+    // split every raw spelling ("Democrat"/"Democratic"/"D") into its own row.
+    `GROUP BY ${PARTY_BUCKET_SQL}`;
   return { sql, params };
 }
 
@@ -331,7 +374,8 @@ export function buildPartySplitOverTimeQuery(
     `${BUY} AS buys, ${SELL} AS sells ` +
     ANALYTICS_FROM_JOINS +
     whereSql(allWhere) +
-    'GROUP BY period, party ORDER BY period ASC';
+    // Same alias-vs-column trap as buildPartySplitQuery: group by the bucket.
+    `GROUP BY period, ${PARTY_BUCKET_SQL} ORDER BY period ASC`;
   return { sql, params: [granularityFormat(p.granularity), ...params] };
 }
 
@@ -667,14 +711,19 @@ export function buildLateFilersQuery(p: CommonFilters & { limit?: number }): Bui
  * is not. Skipped per perf constraint, not an oversight.
  */
 export function buildMemberPerformanceLeaderboardQuery(
-  p: CommonFilters & { limit?: number; minTrades?: number },
+  p: CommonFilters & { limit?: number; minTrades?: number; priceFreshThrough: string },
 ): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const limit = clampLimit(p.limit, 20, 100);
   const minTrades = clampLimit(p.minTrades, 5, 1000);
-  // Excess return of one buy vs SPX, both legs anchored at the filing date.
+  // Excess return of one buy vs SPX.  The entry legs are anchored at the filing
+  // date; the EXIT legs are aligned to ONE as-of date per ticker: the asset's
+  // current price is the close on securities_ref.current_price_date, so the S&P
+  // leg ends on the S&P close on or before that same date (see PRICE_ANCHOR_CTE).
+  // Board row 6c05e09b: a single "latest S&P close" joined to every ticker's own
+  // price date subtracted up to ten days of market move from stale-priced tickers.
   const EXCESS =
-    '((sr.current_price / p.price_at_filing) - 1.0) - ((sx.spx_now / p.spx_at_filing) - 1.0)';
+    '((px.current_price / p.price_at_filing) - 1.0) - ((px.spx_now / p.spx_at_filing) - 1.0)';
   // Flat winsorization cap: clip each trade's excess to [-200%, +200%] before
   // it feeds any aggregate. See the doc comment above for why flat vs percentile.
   const WINSOR_EXCESS = `MAX(-2.0, MIN(2.0, (${EXCESS})))`;
@@ -689,31 +738,31 @@ export function buildMemberPerformanceLeaderboardQuery(
     `${categorySql} = 'public_equity'`,
     'p.price_at_filing IS NOT NULL AND p.price_at_filing > 0',
     'p.spx_at_filing IS NOT NULL AND p.spx_at_filing > 0',
-    'sr.current_price IS NOT NULL AND sr.current_price > 0',
-    'sx.spx_now IS NOT NULL AND sx.spx_now > 0',
+    'px.current_price IS NOT NULL AND px.current_price > 0',
+    'px.spx_now IS NOT NULL AND px.spx_now > 0',
     `julianday(${ANCHOR_DATE}) IS NOT NULL`,
     `${ELAPSED_DAYS} > 0`,
     't.filer_id IS NOT NULL',
     ...where,
   ];
   const sql =
-    'WITH sx AS MATERIALIZED (SELECT close AS spx_now FROM spx_eod ORDER BY date DESC LIMIT 1) ' +
+    `WITH px AS MATERIALIZED (${buildPriceAnchorCteBody(p.priceFreshThrough)}) ` +
     'SELECT t.filer_id AS filer_id, MAX(COALESCE(fl.display_name, fl.full_name)) AS full_name, MAX(fl.party) AS party, ' +
     'MAX(fl.photo_url) AS photo_url, ' +
+    'MAX(px.price_date) AS prices_as_of, ' +
     'COUNT(*) AS trade_count, ' +
-    `SUM((${ANNUALIZED_EXCESS}) * ${MID}) / NULLIF(SUM(${MID}), 0) AS avg_annualized_excess, ` +
-    `SUM((${WINSOR_EXCESS}) * ${MID}) / NULLIF(SUM(${MID}), 0) AS avg_excess, ` +
+    `COALESCE(SUM((${ANNUALIZED_EXCESS}) * ${MID}) / NULLIF(SUM(${MID}), 0), AVG(${ANNUALIZED_EXCESS})) AS avg_annualized_excess, ` +
+    `COALESCE(SUM((${WINSOR_EXCESS}) * ${MID}) / NULLIF(SUM(${MID}), 0), AVG(${WINSOR_EXCESS})) AS avg_excess, ` +
     `SUM(CASE WHEN ${ANNUALIZED_EXCESS} > 0 THEN 1 ELSE 0 END) AS wins, ` +
     `SUM(${MID}) AS est_volume ` +
     'FROM transactions t ' +
     'JOIN tx_performance p ON p.tx_id = t.id ' +
     'LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id ' +
     'LEFT JOIN filings f ON f.doc_id = t.doc_id ' +
-    'JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    'CROSS JOIN sx ' +
+    'JOIN px ON px.ticker = t.ticker ' +
     whereSql(allWhere) +
     'GROUP BY t.filer_id ' +
-    `HAVING trade_count >= ${minTrades} ` +
+    `HAVING trade_count >= ${minTrades} AND avg_excess IS NOT NULL ` +
     'ORDER BY avg_excess DESC ' +
     `LIMIT ${limit}`;
   return { sql, params };
@@ -752,16 +801,21 @@ export function buildConvictionMemberLinksQuery(tickers: string[], p: CommonFilt
  * ?source=primary won't let seed-dataset buys leak in). Only politicians with >= 5
  * scored buys are returned. Caller must chunk `filerIds` under D1's 100-bind cap.
  */
-export function buildMemberSkillQuery(filerIds: string[], p: CommonFilters): BuiltQuery {
+export function buildMemberSkillQuery(
+  filerIds: string[],
+  p: CommonFilters & { priceFreshThrough: string },
+): BuiltQuery {
+  // Same as-of-aligned exit legs as the performance leaderboard (see PRICE_ANCHOR_CTE_BODY).
   const EXCESS =
-    '((sr.current_price / p.price_at_filing) - 1.0) - ((sx.spx_now / p.spx_at_filing) - 1.0)';
+    '((px.current_price / p.price_at_filing) - 1.0) - ((px.spx_now / p.spx_at_filing) - 1.0)';
   const where = [
     't.deprecated_at IS NULL',
     "t.tx_type IN ('B', 'P')",
     't.is_option = 0',
     'p.price_at_filing IS NOT NULL AND p.price_at_filing > 0',
     'p.spx_at_filing IS NOT NULL AND p.spx_at_filing > 0',
-    'sr.current_price IS NOT NULL',
+    'px.current_price IS NOT NULL',
+    'px.spx_now IS NOT NULL AND px.spx_now > 0',
   ];
   const params: SqlParam[] = [];
   if (p.source && p.source !== 'all') {
@@ -775,14 +829,13 @@ export function buildMemberSkillQuery(filerIds: string[], p: CommonFilters): Bui
   where.push(`t.filer_id IN (${filerIds.map(() => '?').join(', ')})`);
   for (const id of filerIds) params.push(id);
   const sql =
-    'WITH sx AS MATERIALIZED (SELECT close AS spx_now FROM spx_eod ORDER BY date DESC LIMIT 1) ' +
+    `WITH px AS MATERIALIZED (${buildPriceAnchorCteBody(p.priceFreshThrough)}) ` +
     'SELECT t.filer_id AS filer_id, COUNT(*) AS scored, ' +
     `SUM(CASE WHEN ${EXCESS} > 0 THEN 1 ELSE 0 END) AS wins, ` +
     `AVG(${EXCESS}) AS avg_excess ` +
     'FROM transactions t ' +
     'JOIN tx_performance p ON p.tx_id = t.id ' +
-    'JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    'CROSS JOIN sx ' +
+    'JOIN px ON px.ticker = t.ticker ' +
     whereSql(where) +
     'GROUP BY t.filer_id ' +
     'HAVING scored >= 5';
@@ -836,12 +889,47 @@ export function buildTickerBacktestCohortQuery(
 }
 
 /**
+ * CT-2459: price series for a backtest, bounded to the cohort. Entry bars
+ * are "close on or before tx_date", so the only pre-cohort bar ever read is
+ * the last one on/before the earliest cohort date. Previously both call
+ * sites loaded the ticker's ENTIRE price history plus the ENTIRE spx_eod
+ * table on every cache miss. `pricedDays` keeps its full-coverage meaning
+ * via {@link buildPricedDaysCountQuery}.
+ */
+export function buildBacktestPriceQuery(ticker: string, cohortMinDate: string): BuiltQuery {
+  return {
+    sql:
+      'SELECT date, close FROM price_eod WHERE ticker = ? AND (' +
+      'date >= ? OR date = (SELECT MAX(date) FROM price_eod WHERE ticker = ? AND date <= ?)' +
+      ') ORDER BY date ASC',
+    params: [ticker, cohortMinDate, ticker, cohortMinDate],
+  };
+}
+
+export function buildBacktestSpxQuery(cohortMinDate: string): BuiltQuery {
+  return {
+    sql:
+      'SELECT date, close FROM spx_eod WHERE ' +
+      'date >= ? OR date = (SELECT MAX(date) FROM spx_eod WHERE date <= ?) ' +
+      'ORDER BY date ASC',
+    params: [cohortMinDate, cohortMinDate],
+  };
+}
+
+export function buildPricedDaysCountQuery(ticker: string): BuiltQuery {
+  return {
+    sql: 'SELECT COUNT(*) AS n FROM price_eod WHERE ticker = ?',
+    params: [ticker],
+  };
+}
+
+/**
  * Candidate trades for the committee conflict-of-interest signal: trades by a
  * politician WITH committees, in a resolved sector. The route applies the curated
  * committee→sector map (see committeeConflict) to keep only true conflicts, so
  * this just pre-filters to rows that could possibly conflict.
  */
-export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number }): BuiltQuery {
+export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number; offset?: number }): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const allWhere = [
     ...where,
@@ -852,6 +940,7 @@ export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number
     "fl.committees <> '[]'",
   ];
   const limit = clampLimit(p.limit, 200, 2000);
+  const offset = Math.max(0, Math.floor(Number(p.offset) || 0));
   const sql =
     'SELECT t.id AS id, t.ticker AS ticker, t.tx_type AS tx_type, t.tx_date AS tx_date, ' +
     `t.filer_id AS filer_id, COALESCE(fl.display_name, fl.full_name) AS full_name, ${CHAMBER_EXPR} AS chamber, fl.party AS party, ` +
@@ -859,7 +948,9 @@ export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number
     ANALYTICS_FROM_JOINS +
     'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
     whereSql(allWhere) +
-    `ORDER BY t.tx_date DESC LIMIT ${limit}`;
+    // cursor_seq tiebreak: stable order so callers can page candidates
+    // (CT-2459) instead of fetching the full 2000-row window up front.
+    `ORDER BY t.tx_date DESC, t.cursor_seq DESC LIMIT ${limit} OFFSET ${offset}`;
   return { sql, params };
 }
 
@@ -962,19 +1053,39 @@ export function buildMemberStatsQuery(filerId: string, p: CommonFilters): BuiltQ
  */
 export function buildMemberPerformanceQuery(filerId: string, p: CommonFilters): BuiltQuery {
   const { where, params } = memberFilters(filerId, p);
+  // CT-2459: the dual aggregator only ever considers buy rows (isBuyRow in
+  // compute.ts) — sells/exchanges contributed nothing but row materialization
+  // (up to ~22k rows for a prolific filer on every uncached /member hit).
+  // Filter to the exact isBuyRow set in SQL; buyCount/tradeCount outputs are
+  // unchanged. (pricesAsOf now also reflects scored buy rows only, matching
+  // its documented meaning.)
+  const buyWhere = [...where, "UPPER(t.tx_type) IN ('B', 'P', 'PURCHASE', 'BUY')"];
   // Same filing anchor as the member-performance leaderboard.
   const ANCHOR_DATE = 'COALESCE(f.filed_date, f.first_seen_at, t.tx_date)';
+  // CT-2459: materialize the per-ticker price anchor ONCE (like the
+  // leaderboard's PRICE_ANCHOR CTE) instead of 2 correlated spx_eod
+  // subqueries per trade row. No freshness filter here — freshness is
+  // applied in the aggregator, exactly as before; the spx fallback for a
+  // missing price date is the same COALESCE-latest-close expression.
   const sql =
+    'WITH px AS MATERIALIZED (' +
+    'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
+    `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
+    'FROM securities_ref r) ' +
     'SELECT t.is_option AS is_option, t.tx_type AS tx_type, ' +
     'txp.price_at_trade AS price_at_trade, txp.spx_at_trade AS spx_at_trade, ' +
     'txp.price_at_filing AS price_at_filing, txp.spx_at_filing AS spx_at_filing, ' +
-    'sr.current_price AS current_price, ' +
+    'px.current_price AS current_price, px.price_date AS current_price_date, ' +
+    // S&P close on or before the ticker's own current-price date, so both exit
+    // legs end on the same as-of date; falls back to the latest close (old behaviour)
+    // when the ticker has no price date or predates the S&P series.
+    'px.spx_now AS spx_now, ' +
     `(julianday('now') - julianday(${ANCHOR_DATE})) AS elapsed_days_since_filing, ` +
     `${MID} AS est_volume ` +
     ANALYTICS_FROM_JOINS +
     'LEFT JOIN tx_performance txp ON txp.tx_id = t.id ' +
-    'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    whereSql(where);
+    'LEFT JOIN px ON px.ticker = t.ticker ' +
+    whereSql(buyWhere);
   return { sql, params };
 }
 

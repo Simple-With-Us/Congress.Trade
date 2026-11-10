@@ -28,14 +28,14 @@ describe('source health status', () => {
             },
             async first<T>() { return null as T | null; },
             async all<T>() {
-              if (/FROM ingest_log\s+GROUP BY source/i.test(sql)) {
+              if (/FROM ingest_log/i.test(sql) && /GROUP BY/i.test(sql)) {
                 return { results: [
                   { source: 'house', last_polled_at: '2020-01-01T00:00:00.000Z', poll_count: 4, total_new: 2, last_new_at: null },
                   { source: 'senate', last_polled_at: '2020-01-01T00:00:00.000Z', poll_count: 4, total_new: 1, last_new_at: null },
-                  { source: 'oge', last_polled_at: '2020-01-01T00:00:00.000Z', poll_count: 4, total_new: 1, last_new_at: null },
+                  { source: 'executive', last_polled_at: '2020-01-01T00:00:00.000Z', poll_count: 4, total_new: 1, last_new_at: null },
                 ] as T[] };
               }
-              if (/ROW_NUMBER\(\) OVER \(PARTITION BY source/i.test(sql)) {
+              if (/ROW_NUMBER\(\) OVER/i.test(sql)) {
                 return { results: [
                   { id: 1, source: 'house', attempted_at: '2020-01-01T00:00:00.000Z', outcome: 'success', new_count: 0, error: null },
                   { id: 2, source: 'senate', attempted_at: '2020-01-01T00:00:00.000Z', outcome: 'failure', new_count: 0, error: 'upstream blocked' },
@@ -53,12 +53,15 @@ describe('source health status', () => {
     const body = await response.json() as { sources: Array<Record<string, unknown>> };
     const house = body.sources.find((source) => source.source === 'house');
     const senate = body.sources.find((source) => source.source === 'senate');
-    const oge = body.sources.find((source) => source.source === 'oge');
+    const exec = body.sources.find((source) => source.source === 'executive');
     expect(house).toMatchObject({ status: 'stale', stale: true, effectivePollIntervalSec: 300, staleAfterSec: 900 });
     expect(senate).toMatchObject({ status: 'error', stale: true, lastError: 'upstream blocked' });
-    expect(oge).toMatchObject({ stale: true, staleAfterSec: 10800 });
+    expect(exec).toMatchObject({ stale: true, staleAfterSec: 10800 });
+    expect(body.sources.filter((source) => source.source === 'executive' || source.source === 'oge')).toHaveLength(1);
+    const ingestSql = sqlSeen.find((sql) => /FROM ingest_log/i.test(sql) && /GROUP BY/i.test(sql)) ?? '';
+    expect(ingestSql).toMatch(/lower\(source\) IN \('oge', 'exec'\)/);
     const ranked = sqlSeen.find((sql) => /ROW_NUMBER/.test(sql)) ?? '';
-    expect(ranked).toContain('PARTITION BY source');
+    expect(ranked).toMatch(/lower\(source\) IN \('oge', 'exec'\)/);
     expect(ranked).toContain('WHERE rn <= ?');
     expect(paramsSeen.some((params) => params[0] === 'executive')).toBe(true);
   });

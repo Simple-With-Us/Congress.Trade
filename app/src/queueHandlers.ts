@@ -13,10 +13,12 @@ import {
   deliverUsageTelemetryEvent,
 } from './shared/thirdPartyTelemetry.ts';
 import { persistUsageTelemetryFallback } from './shared/thirdPartyTelemetry.ts';
-import { reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { gateQueuedDelivery, isOutboxSuppressed, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
 import { executeQueuedCommand } from './client/commands.ts';
 import { updateCommandStatus } from './client/state.ts';
+import { sentryLoggerWarn } from './shared/sentryRuntime.ts';
 
 export async function handleIngestMessage(
   env: Env,
@@ -96,6 +98,18 @@ export async function handleDeliveryMessage(
   await lease?.assertOwned();
   switch (msg.type) {
     case 'delivery.dispatch': {
+      // Subscriber alert pause (CT_DELIVERY_MODE) for messages queued before
+      // the switch or by another producer.  Returning false acks the message
+      // without completing the outbox row (gateQueuedDelivery re-opens or
+      // suppresses it).  Throws if settings never booted, so it retries.
+      const mode = readDeliveryMode();
+      if (mode !== 'deliver') {
+        if (!msg.subscriptionId) await gateQueuedDelivery(env, msg.txId, mode);
+        return false;
+      }
+      // A row suppressed while its message sat in the queue stays unsent
+      // after delivery resumes: ack it without dispatching.
+      if (!msg.subscriptionId && (await isOutboxSuppressed(env, msg.txId))) return false;
       const result = lease
         ? await dispatchWebhook(env, msg, lease)
         : await dispatchWebhook(env, msg);
@@ -148,7 +162,10 @@ export async function handleDeadLetterMessage(
     // it completed — completing here permanently abandons the webhook.
     const recovered = await reconnectDeadLetteredOutbox(env, msg.txId, recoveryError.message);
     if (recovered.status === 'missing') {
-      console.warn(`delivery outbox missing for ${msg.txId}`);
+      sentryLoggerWarn('ingest.dead_letter', {
+        queue: 'delivery',
+        reason: 'outbox_missing',
+      });
     }
     return;
   }
@@ -171,7 +188,10 @@ export async function handleDeadLetterMessage(
     { reopenCompleted: msg.type !== 'filing.new' },
   );
   if (recovered.status === 'missing') {
-    console.warn(`ingestion outbox missing for ${msg.docId}`);
+    sentryLoggerWarn('ingest.dead_letter', {
+      queue: 'ingest',
+      reason: 'outbox_missing',
+    });
   }
   if (recovered.status === 'failed') {
     // VISIBLE TERMINAL STATE (autonomy diagnosis 2026-08-09, principle b):
@@ -248,7 +268,7 @@ export async function handleLocalWaitCheck(
       await env.INGEST_QUEUE.send({ type: 'filing.extracted', docId });
     } else {
       // LOST-WAKEUP FIX (autonomy diagnosis 2026-08-09): this check fired
-      // early — classifyFiling's own delayed 15-minute message landed before
+      // early — classifyFiling's own delayed message landed before
       // local_wait_expires_at, because a later re-classification pushed the
       // expiry out further. Without this branch the message silently no-ops
       // here and NOTHING is ever scheduled again: the filing is stranded in
@@ -256,7 +276,9 @@ export async function handleLocalWaitCheck(
       // (autonomySweeps.ts, 24h backstop) eventually rescues it. Re-enqueue a
       // follow-up check for the remaining wait instead, so the fast path
       // (local vision worker finishing on time) keeps working within
-      // seconds of the real expiry rather than hours later.
+      // seconds of the real expiry rather than hours later.  The wait
+      // window itself is now `LOCAL_VISION_WAIT_MINUTES` (2 min per
+      // 2026-09-04 owner rule — was 15).
       const remainingMs = expiresMs - Date.now();
       const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
       await lease?.assertOwned();

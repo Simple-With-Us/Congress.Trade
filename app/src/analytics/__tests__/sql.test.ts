@@ -145,11 +145,13 @@ describe('SQL fragments', () => {
     expect(STOCK_MIDPOINT_SQL).toContain('t.is_option = 1');
   });
 
-  it('party bucket classifies known parties and leaves unknown as NULL', () => {
+  it("party bucket classifies D and R and folds everything else (incl. no party) into 'O'", () => {
     expect(PARTY_BUCKET_SQL).toContain("= 'D'");
     expect(PARTY_BUCKET_SQL).toContain("= 'R'");
-    expect(PARTY_BUCKET_SQL).toContain("IN ('I', 'O') THEN 'O'");
-    expect(PARTY_BUCKET_SQL).toContain('ELSE NULL');
+    // Total, never NULL: All must equal D + R + O (board efd94c45; the real-SQL
+    // invariant lives in partyPartition.test.ts).
+    expect(PARTY_BUCKET_SQL).toContain("ELSE 'O' END");
+    expect(PARTY_BUCKET_SQL).not.toContain('NULL END');
   });
 });
 
@@ -194,7 +196,7 @@ describe('buildCommonFilters', () => {
       TWIN_DEDUPE_SQL,
       "t.tx_date >= date('now', ?)",
       'COALESCE(fl.chamber, f.chamber) = ?',
-      "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) IN ('I', 'O') THEN 'O' ELSE NULL END) = ?",
+      "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' ELSE 'O' END) = ?",
       "t.source IN ('primary', 'manual')",
       't.confidence >= ?',
     ]);

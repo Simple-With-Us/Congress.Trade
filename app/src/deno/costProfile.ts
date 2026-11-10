@@ -1,19 +1,13 @@
 /**
- * Runtime cost profile (Coolify Deno-in-Docker).
+ * Runtime tick profile (Coolify Deno-in-Docker).
  *
- * Deno Deploy is retired.  Production is Coolify on Hetzner with
- * `CT_COST_PROFILE=paid` (cron `* * * * *` on `/api/health`).  Do not set
- * these knobs "in Deno Deploy" and do not size live ops around Deploy
- * free-tier quotas (~1M requests / 20GB egress / 15h CPU).  Those limits
- * were why the `free` profile existed (2026-07); they are not the live
- * cost model.
+ * Deno Deploy is retired.  The old free/balanced/paid names described Deploy
+ * quota survival (15-minute cron, tiny drains) and are gone.  Production is
+ * Coolify on Hetzner with aggressive defaults: cron `* * * * *`, larger
+ * batches.  Secrets come from Infisical.  Do not put `CT_COST_PROFILE` in
+ * Coolify env — the knob no longer exists.
  *
- * `CT_*` names are the operator knobs.  Legacy `DENO_*` aliases remain for
- * local tests only (Deploy used to reject custom `DENO_*` keys).
- *
- * Profiles trade discovery/queue latency for tick frequency. Set via
- * `CT_COST_PROFILE=free|balanced|paid` in Infisical / Coolify (code default
- * is still `free` if unset). Optional overrides:
+ * Optional Infisical overrides (not Coolify duplicates):
  *   CT_CRON_SCHEDULE           — crontab expression for Deno.cron
  *   CT_DRAIN_LIMIT             — max durable-queue messages completed per tick
  *   CT_DRAIN_CLAIM_SIZE        — messages claimed per SQL batch
@@ -22,7 +16,7 @@
  *     (POST /api/admin/runtime-tick).  Not the production path.
  */
 
-export type DenoCostProfileName = 'free' | 'balanced' | 'paid';
+export type DenoCostProfileName = 'live';
 
 export interface DenoCostProfile {
   name: DenoCostProfileName;
@@ -43,36 +37,13 @@ export interface DenoCostProfile {
   idleShortCircuit: boolean;
 }
 
-const PROFILES: Record<DenoCostProfileName, Omit<DenoCostProfile, 'disableInternalCron'>> = {
-  // Leftover Deno Deploy free-tier survival profile.  Not production.
-  free: {
-    name: 'free',
-    cronSchedule: '*/15 * * * *',
-    drainLimit: 2,
-    drainClaimSize: 1,
-    outboxLimit: 10,
-    idleShortCircuit: true,
-  },
-  // Middle ground: ~21k ticks/mo, modest drain — good if Pro is temporary.
-  balanced: {
-    name: 'balanced',
-    cronSchedule: '*/2 * * * *',
-    drainLimit: 8,
-    drainClaimSize: 2,
-    outboxLimit: 40,
-    idleShortCircuit: true,
-  },
-  // Live Coolify production: every minute, larger batches.
-  // idleShortCircuit stays on; probePendingWork includes eligible-due
-  // review rows so a quiet tick cannot skip claimable extract work.
-  paid: {
-    name: 'paid',
-    cronSchedule: '* * * * *',
-    drainLimit: 25,
-    drainClaimSize: 10,
-    outboxLimit: 100,
-    idleShortCircuit: true,
-  },
+const LIVE: Omit<DenoCostProfile, 'disableInternalCron'> = {
+  name: 'live',
+  cronSchedule: '* * * * *',
+  drainLimit: 25,
+  drainClaimSize: 10,
+  outboxLimit: 100,
+  idleShortCircuit: true,
 };
 
 function parsePositiveInt(raw: string | undefined, fallback: number, max: number): number {
@@ -82,13 +53,6 @@ function parsePositiveInt(raw: string | undefined, fallback: number, max: number
   return Math.min(n, max);
 }
 
-function parseProfileName(raw: string | undefined): DenoCostProfileName {
-  const v = (raw ?? 'free').trim().toLowerCase();
-  if (v === 'paid' || v === 'pro' || v === 'full') return 'paid';
-  if (v === 'balanced' || v === 'default' || v === 'medium') return 'balanced';
-  return 'free';
-}
-
 function truthy(raw: string | undefined): boolean {
   if (!raw) return false;
   const v = raw.trim().toLowerCase();
@@ -96,10 +60,8 @@ function truthy(raw: string | undefined): boolean {
 }
 
 /**
- * Resolve the active cost profile from environment values (Deno.env or Env).
- * Code default is **free** if unset.  Production must set `CT_COST_PROFILE=paid`
- * in Infisical / Coolify.  Prefer CT_* names.  Legacy DENO_* aliases are
- * accepted for local tests only.
+ * Resolve the active tick profile.  Always starts from aggressive live
+ * defaults.  `CT_COST_PROFILE` / `DENO_COST_PROFILE` are ignored leftovers.
  */
 export function resolveDenoCostProfile(
   env: Record<string, string | undefined> | { get?: (k: string) => string | undefined } = {},
@@ -111,7 +73,6 @@ export function resolveDenoCostProfile(
     return (env as Record<string, string | undefined>)[key];
   };
 
-  // Prefer CT_* keys; fall back to legacy DENO_* for local tests.
   const pick = (...keys: string[]): string | undefined => {
     for (const key of keys) {
       const v = read(key);
@@ -120,24 +81,23 @@ export function resolveDenoCostProfile(
     return undefined;
   };
 
-  const base = PROFILES[parseProfileName(pick('CT_COST_PROFILE', 'DENO_COST_PROFILE'))];
   const cronOverride = pick('CT_CRON_SCHEDULE', 'DENO_CRON_SCHEDULE')?.trim();
   return {
-    ...base,
-    cronSchedule: cronOverride && cronOverride.length > 0 ? cronOverride : base.cronSchedule,
+    ...LIVE,
+    cronSchedule: cronOverride && cronOverride.length > 0 ? cronOverride : LIVE.cronSchedule,
     drainLimit: parsePositiveInt(
       pick('CT_DRAIN_LIMIT', 'DENO_DRAIN_LIMIT'),
-      base.drainLimit,
+      LIVE.drainLimit,
       100,
     ),
     drainClaimSize: parsePositiveInt(
       pick('CT_DRAIN_CLAIM_SIZE', 'DENO_DRAIN_CLAIM_SIZE'),
-      base.drainClaimSize,
+      LIVE.drainClaimSize,
       25,
     ),
     outboxLimit: parsePositiveInt(
       pick('CT_OUTBOX_LIMIT', 'DENO_OUTBOX_LIMIT'),
-      base.outboxLimit,
+      LIVE.outboxLimit,
       200,
     ),
     disableInternalCron: truthy(

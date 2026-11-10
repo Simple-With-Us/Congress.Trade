@@ -23,8 +23,16 @@
  * stable `bulk/{date}/manifest.json`. The manifest's `objectKey`s point at that
  * run's files, and downloads resolve through the manifest — so a same-day rerun
  * (e.g. an inline back-fill racing the cron) can never leave the published
- * manifest pointing at a half-rewritten file. Old run prefixes are orphaned
- * (negligible R2 cost) but the manifest is always internally consistent.
+ * manifest pointing at a half-rewritten file.
+ *
+ * Retention: this file used to say orphaned run prefixes were "negligible R2
+ * cost". That was wrong at steady state — one full run is ~0.28 GiB, nothing
+ * ever deleted them, and by 2026-08 `bulk/` was the largest thing in
+ * `congress-trade-bucket` and the reason the account kept approaching R2's
+ * 10 GB free tier. {@link pruneBulkSnapshots} now runs after each successful
+ * publish and reclaims two things: run prefixes superseded within a date, and
+ * whole dates past the retention window. Deletes are age-gated, bounded, and
+ * best-effort — a prune failure must never fail the snapshot that produced it.
  *
  * The congressional-trade corpus (transactions/filings/filers) is deliberately
  * NOT exported here — it is already served by the cursor-paged /api/transactions
@@ -226,7 +234,236 @@ export async function runBulkSnapshot(
   await env.RAW_FILES.put(manifestObjectKey(date), JSON.stringify(manifest), {
     httpMetadata: { contentType: 'application/json' },
   });
+
+  // Housekeeping runs only AFTER the manifest is published, so the run it is
+  // told to keep is the one readers can actually reach. Wrapped because a
+  // prune problem must never fail an export that already succeeded.
+  try {
+    const pruned = await pruneBulkSnapshots(env, {
+      today: date,
+      keepRunId: runId,
+      keepRunDate: date,
+      now,
+    });
+    if (pruned.deleted > 0 || pruned.failed > 0 || pruned.truncated) {
+      console.log(
+        `bulk snapshot prune: scanned=${pruned.scanned} deleted=${pruned.deleted}` +
+          ` failed=${pruned.failed}${pruned.truncated ? ' (capped; more next run)' : ''}`,
+      );
+    }
+  } catch (err) {
+    console.warn('bulk snapshot prune: unexpected failure:', (err as Error).message);
+  }
   return manifest;
+}
+
+// ---------------------------------------------------------------------------
+// Retention / prune
+// ---------------------------------------------------------------------------
+
+/** Keep whole snapshot dates for this many days back, including today. */
+export const DEFAULT_KEEP_DAYS = 14;
+/**
+ * A superseded run is only deleted once it is this old. A consumer that read
+ * the previous manifest moments before a rerun published may still be streaming
+ * that run's files; the grace window lets those downloads finish rather than
+ * 404 mid-transfer.
+ */
+export const DEFAULT_GRACE_MINUTES = 60;
+/**
+ * Ceiling on deletes per invocation. Each delete is a Class A operation and CT
+ * shares R2's 1M/month free allowance with ingestion, so a first run against a
+ * large backlog spreads over several days instead of spiking the meter.
+ */
+export const DEFAULT_MAX_DELETES = 500;
+/** Ceiling on list pages per invocation (1,000 keys each; also Class A). */
+const MAX_LIST_PAGES = 20;
+
+const DATE_SHAPE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** One listed object, narrowed to the fields the selectors need. */
+export interface BulkListedObject {
+  key: string;
+  uploaded?: Date | string | null;
+}
+
+/**
+ * Parse a run-scoped object key into its date and run id.
+ *
+ * Deliberately strict: the candidate keys come from a ListObjects response,
+ * i.e. from outside this process. Without an exact-shape allowlist a malformed
+ * or hostile listing could steer DELETE at objects this job does not own —
+ * `raw/` filing PDFs and the `weekly/` DB archive live in the same bucket.
+ */
+export function parseRunObjectKey(key: string): { date: string; runId: string } | null {
+  const match = /^bulk\/(\d{4}-\d{2}-\d{2})\/runs\/([A-Za-z0-9-]{1,64})\/[A-Za-z0-9_-]{1,64}\.ndjson$/.exec(key);
+  if (!match) return null;
+  return { date: match[1], runId: match[2] };
+}
+
+/** Parse any key this module owns (run file or manifest) into its date. */
+export function parseBulkObjectDate(key: string): string | null {
+  const run = parseRunObjectKey(key);
+  if (run) return run.date;
+  const manifest = /^bulk\/(\d{4}-\d{2}-\d{2})\/manifest\.json$/.exec(key);
+  return manifest ? manifest[1] : null;
+}
+
+/** `YYYY-MM-DD` this many days before `date` (UTC, no clock read). */
+export function shiftUtcDate(date: string, days: number): string {
+  const [y, m, d] = date.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
+
+function uploadedMs(value: Date | string | null | undefined): number | null {
+  if (!value) return null;
+  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Which listed keys this prune may delete.
+ *
+ * Two independent rules, both restricted to keys matching the shapes above:
+ *   1. superseded runs — a run file on a RETAINED date whose run id is not the
+ *      one the current manifest points at, older than the grace window;
+ *   2. expired dates — every owned key on a date older than the keep window.
+ *
+ * Never returns: the live run's files, the manifest of a retained date, today's
+ * or a future date's keys, or anything that does not parse as an owned key.
+ * Pure so the retention rules are testable without an R2 round trip.
+ */
+export function selectPruneTargets(
+  objects: readonly BulkListedObject[],
+  opts: {
+    today: string;
+    keepRunId: string | null;
+    keepRunDate: string | null;
+    keepDays: number;
+    graceMinutes: number;
+    nowMs: number;
+    maxDeletes: number;
+  },
+): string[] {
+  const { today, keepRunId, keepRunDate, keepDays, graceMinutes, nowMs, maxDeletes } = opts;
+  if (!DATE_SHAPE.test(today) || keepDays < 1 || maxDeletes < 1) return [];
+  const oldestKept = shiftUtcDate(today, -(keepDays - 1));
+  const graceMs = Math.max(0, graceMinutes) * 60_000;
+  const targets: string[] = [];
+
+  for (const object of objects) {
+    const date = parseBulkObjectDate(object.key);
+    if (!date) continue; // not ours — raw/, weekly/, historical-dumps/, _ops/
+    if (date > today) continue; // clock skew; never touch the future
+
+    if (date < oldestKept) {
+      targets.push(object.key); // expired date: manifest and runs both go
+      continue;
+    }
+
+    // Retained date — only superseded run files are eligible.
+    const run = parseRunObjectKey(object.key);
+    if (!run) continue; // a retained date's manifest always stays
+    if (keepRunId && run.date === keepRunDate && run.runId === keepRunId) continue;
+    const age = uploadedMs(object.uploaded);
+    // No usable timestamp means we cannot prove the grace window elapsed.
+    if (age === null || nowMs - age < graceMs) continue;
+    targets.push(object.key);
+  }
+
+  // Oldest first, so a capped run always makes progress on the worst backlog.
+  targets.sort();
+  return targets.slice(0, maxDeletes);
+}
+
+function positiveIntFromEnv(env: Env, name: string, fallback: number): number {
+  const raw = (env as unknown as Record<string, unknown>)[name];
+  const value = Number(typeof raw === 'string' || typeof raw === 'number' ? raw : NaN);
+  return Number.isInteger(value) && value >= 1 ? value : fallback;
+}
+
+export interface BulkPruneResult {
+  scanned: number;
+  deleted: number;
+  failed: number;
+  truncated: boolean;
+  skipped?: 'disabled' | 'unsupported';
+}
+
+/**
+ * Delete superseded runs and expired dates under `bulk/`.
+ *
+ * Best-effort by contract: every failure path returns a result instead of
+ * throwing, because the caller has already published a good manifest and a
+ * housekeeping problem must not turn a successful export into a failed one.
+ * Set `BULK_SNAPSHOT_PRUNE_DISABLED=1` to park it without a deploy.
+ */
+export async function pruneBulkSnapshots(
+  env: Env,
+  opts: {
+    today: string;
+    keepRunId?: string | null;
+    keepRunDate?: string | null;
+    now?: Date;
+  },
+): Promise<BulkPruneResult> {
+  const empty: BulkPruneResult = { scanned: 0, deleted: 0, failed: 0, truncated: false };
+  const flag = (env as unknown as Record<string, unknown>).BULK_SNAPSHOT_PRUNE_DISABLED;
+  if (flag === '1' || flag === 'true' || flag === true) {
+    return { ...empty, skipped: 'disabled' };
+  }
+  // Workers always has list(); a Deno build older than the S3 shim's list()
+  // does not. Degrade quietly rather than throwing inside the export lane.
+  if (typeof (env.RAW_FILES as { list?: unknown })?.list !== 'function') {
+    return { ...empty, skipped: 'unsupported' };
+  }
+
+  const keepDays = positiveIntFromEnv(env, 'BULK_SNAPSHOT_KEEP_DAYS', DEFAULT_KEEP_DAYS);
+  const graceMinutes = positiveIntFromEnv(env, 'BULK_SNAPSHOT_PRUNE_GRACE_MINUTES', DEFAULT_GRACE_MINUTES);
+  const maxDeletes = positiveIntFromEnv(env, 'BULK_SNAPSHOT_MAX_DELETES', DEFAULT_MAX_DELETES);
+  const nowMs = (opts.now ?? new Date()).getTime();
+
+  const objects: BulkListedObject[] = [];
+  let cursor: string | undefined;
+  let truncated = false;
+  try {
+    for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      const result = await env.RAW_FILES.list({ prefix: 'bulk/', cursor });
+      for (const object of result.objects) {
+        objects.push({ key: object.key, uploaded: (object as { uploaded?: Date }).uploaded });
+      }
+      if (!result.truncated) break;
+      cursor = (result as { cursor?: string }).cursor;
+      if (!cursor) break;
+      if (page === MAX_LIST_PAGES - 1) truncated = true;
+    }
+  } catch (err) {
+    console.warn('bulk snapshot prune: listing failed:', (err as Error).message);
+    return { ...empty, scanned: objects.length };
+  }
+
+  const targets = selectPruneTargets(objects, {
+    today: opts.today,
+    keepRunId: opts.keepRunId ?? null,
+    keepRunDate: opts.keepRunDate ?? null,
+    keepDays,
+    graceMinutes,
+    nowMs,
+    maxDeletes,
+  });
+
+  let deleted = 0;
+  let failed = 0;
+  for (const key of targets) {
+    try {
+      await env.RAW_FILES.delete(key);
+      deleted++;
+    } catch (err) {
+      failed++;
+      console.warn(`bulk snapshot prune: delete failed for ${key}:`, (err as Error).message);
+    }
+  }
+  return { scanned: objects.length, deleted, failed, truncated: truncated || targets.length >= maxDeletes };
 }
 
 /** Read a previously-written manifest from R2, or null if absent. */

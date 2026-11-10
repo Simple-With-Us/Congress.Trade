@@ -221,7 +221,10 @@ route, refreshing `bootstrap`'s entitlement on success; product ids are
 centralized in `AppleIAPProduct` (must match `APPLE_PRODUCT_MONTHLY`/
 `APPLE_PRODUCT_ANNUAL`). "Manage Subscription" deep-links to
 `https://apps.apple.com/account/subscriptions` from the hamburger menu and
-from `SubscribeView` once `entitlement.source == "apple"`. Verified: iOS
+from `SubscribeView` once `entitlement.source == "apple"`.  Website/Stripe
+Premium (`source == "stripe"` or `null`) mints `POST /billing/portal` with
+the session Bearer, and on failure opens `https://congress.trade/?billing=manage`
+instead of a sign-out message. Verified: iOS
 Simulator build + unit tests (mocked network) for both new endpoints — NOT
 verified against a real device/sandbox purchase, since that needs live App
 Store Connect products (owner follow-up below).

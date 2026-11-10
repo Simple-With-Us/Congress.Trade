@@ -44,6 +44,17 @@ interface FilingRow {
 
 const PDF_SNIFF_BYTES = 256 * 1024; // bound the scan to the first 256KB
 
+/**
+ * Bounded wait for the local Mac vision worker before the server hands the
+ * filing off to the cloud extractors.  Owner 2026-09-04: cap the wait at
+ * 2 minutes so the slow path does not block a long tail of cloud fallback
+ * attempts; the local Mac still gets a real chance to finish first.  Pair
+ * with `docs/rollouts/2026-09-04-vision-worker-efficiency-checklist.md`
+ * for the known optimisation ideas to revisit when we want to beat other
+ * providers in the short to mid term.
+ */
+export const LOCAL_VISION_WAIT_MINUTES = 2;
+
 /** True if the leading bytes look like a PDF ("%PDF-"). */
 export function looksLikePdf(bytes: Uint8Array): boolean {
   return (
@@ -197,7 +208,7 @@ export async function classifyFiling(
         `UPDATE filings
             SET doc_kind = ?,
                 ingest_status = 'extraction_pending_local',
-                local_wait_expires_at = datetime('now', '+15 minutes'),
+                local_wait_expires_at = datetime('now', '+${LOCAL_VISION_WAIT_MINUTES} minutes'),
                 error = NULL
           WHERE doc_id = ?`,
         [docKind, docId],
@@ -205,7 +216,7 @@ export async function classifyFiling(
       await lease?.assertOwned();
       await env.INGEST_QUEUE.send(
         { type: 'filing.local_wait_check', docId },
-        { delaySeconds: 15 * 60 },
+        { delaySeconds: LOCAL_VISION_WAIT_MINUTES * 60 },
       );
       return docKind;
     }

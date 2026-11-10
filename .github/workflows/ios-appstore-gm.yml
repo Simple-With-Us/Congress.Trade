@@ -4,12 +4,30 @@ name: iOS App Store GM ship
 # The owned Mac runner is macOS 27 beta; App Store review rejects those
 # binaries as INVALID_BINARY even when TestFlight accepts them.
 # Manual only — do not put this on a schedule.
+#
+# Gate (2026-10-17): the 2.5 hour per-app interval and the same-HEAD skip are
+# live here.  A hosted runner starts with an empty home, so the "Seed last-ship
+# state" step reads the previous successful run of this workflow and writes the
+# state file the ship script reads.  There is NO standing gate override: set the
+# force_ship input for one run when the gate would skip a genuinely stale app.
+# The same seed gives the TestFlight What to Test notes their commit range.
 
 on:
   workflow_dispatch:
+    inputs:
+      force_ship:
+        description: "Bypass the 2.5 hour interval and same-HEAD gate for this run only"
+        type: boolean
+        default: false
+      marketing_version:
+        description: "Exact App Store version to build, e.g. 1.0.236.  Empty = next patch automatically."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ios-appstore-gm-congress
@@ -19,13 +37,13 @@ jobs:
   ship:
     name: GM archive + TestFlight upload
     if: github.event.repository.fork == false
-    runs-on: macos-26
+    runs-on: macos-latest
     timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-      IOS_TF_MIN_INTERVAL_SEC: "0"
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
@@ -42,15 +60,207 @@ jobs:
           esac
           echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
 
-      - name: Import signing + ASC key
+
+      # Identity stays on GitHub. ASC uses Fleet Secrets prod /asc; certificates stay in CT prod /.
+      - name: Load Infisical signing secrets
         env:
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
-          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
-          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
-        run: bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          ASC_INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID }}
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+        run: |
+          set +o xtrace
+          set -euo pipefail
+          export INFISICAL_DISABLE_UPDATE_CHECK=true
+
+          if ! command -v infisical >/dev/null 2>&1; then
+            NONINTERACTIVE=1 HOMEBREW_NO_AUTO_UPDATE=1 brew install infisical/get-cli/infisical
+          fi
+          command -v infisical >/dev/null 2>&1 || {
+            echo "::error::Infisical CLI is not installed."
+            exit 1
+          }
+
+          if [ -z "${INFISICAL_PROJECT_ID}" ]; then
+            echo "::error::Missing INFISICAL_PROJECT_ID GitHub secret."
+            exit 1
+          fi
+          CLIENT_ID="${INFISICAL_UNIVERSAL_AUTH_CLIENT_ID}"
+          CLIENT_SECRET="${INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET}"
+          if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+            CLIENT_ID="${INFISICAL_CLIENT_ID}"
+            CLIENT_SECRET="${INFISICAL_CLIENT_SECRET}"
+          fi
+          if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+            echo "::error::Missing Infisical machine identity.  Set INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/SECRET (fallback INFISICAL_CLIENT_ID/SECRET) on the repo."
+            exit 1
+          fi
+
+          TOKEN="$(
+            env -u INFISICAL_CLIENT_ID -u INFISICAL_CLIENT_SECRET -u INFISICAL_TOKEN \
+              INFISICAL_UNIVERSAL_AUTH_CLIENT_ID="$CLIENT_ID" \
+              INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET="$CLIENT_SECRET" \
+              infisical login --method=universal-auth --silent --plain --telemetry=false 2>/dev/null || true
+          )"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Infisical universal-auth login failed."
+            exit 1
+          fi
+          if [[ "$TOKEN" == *$'\n'* || "$TOKEN" == *$'\r'* ]]; then
+            echo '::error::Infisical returned a multiline token.' >&2
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${TOKEN//'%'/'%25'}"
+
+          for name in ASC_KEY_ID ASC_ISSUER_ID SENTRY_DSN \
+                      IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
+            secret_project="$INFISICAL_PROJECT_ID"
+            secret_path=/
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
+              secret_project="$ASC_INFISICAL_PROJECT_ID"
+              secret_path=/asc
+            fi
+            val="$(
+              INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
+                --plain --silent --telemetry=false --expand=true \
+                --projectId="$secret_project" --env=prod --path="$secret_path" \
+                2>/dev/null || true
+            )"
+            if [ -z "$val" ]; then
+              if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" ]]; then
+                echo "::error::Missing $name in Fleet Secrets prod /asc; verify CI identity read access."
+                exit 1
+              fi
+              continue
+            fi
+            if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+              echo "::error::Signing field $name must be single-line; correct Infisical formatting." >&2
+              exit 1
+            fi
+            if [[ "$val" =~ ^\$\{[^}]+\}$ ]]; then
+              echo "::error::$name is still an unresolved Infisical secret reference; check the target exists and the CI identity can read the referenced folder."
+              exit 1
+            fi
+            printf '::add-mask::%s\n' "${val//'%'/'%25'}"
+            printf -v "$name" '%s' "$val"
+            export "$name"
+            # Certificate credentials belong only to this load/import step.
+            if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" || "$name" == "SENTRY_DSN" ]]; then
+              printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
+            fi
+            # The hosted form of the ASC credential:  the key id and the issuer
+            # under the names the shell layer and the client read.  A path on
+            # disk is not an approved credential source (AFC-459), so the
+            # credential itself crosses the step boundary in the environment
+            # (as base64 below), never as a file path.
+            if [[ "$name" == "ASC_KEY_ID" ]]; then
+              printf 'APPLE_API_KEY_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
+            if [[ "$name" == "ASC_ISSUER_ID" ]]; then
+              printf 'APPLE_API_ISSUER_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
+          done
+          if [ -z "${SENTRY_DSN:-}" ]; then
+            echo "::error::Infisical prod SENTRY_DSN is missing; refusing a mute TestFlight archive."
+            exit 1
+          fi
+          # Keep multiline PEM out of GITHUB_ENV and every later step environment.
+          # Only its mode-600 file path crosses the step boundary.
+          key_material="$(
+            INFISICAL_TOKEN="$TOKEN" infisical secrets get ASC_KEY_P8 \
+              --plain --silent --telemetry=false --expand=false \
+              --projectId="$ASC_INFISICAL_PROJECT_ID" --env=prod --path=/asc \
+              2>/dev/null || true
+          )"
+          if [ -z "$key_material" ]; then
+            echo "::error::Missing ASC key material in Fleet Secrets prod /asc; verify CI identity read access."
+            exit 1
+          fi
+          printf '%s\n' "$key_material" | bash "$GITHUB_WORKSPACE/scripts/ios-stage-asc-key.sh"
+          ASC_KEY_PATH="$(sed -n 's/^ASC_KEY_PATH=//p' "$GITHUB_ENV" | tail -n 1)"
+          export ASC_KEY_PATH
+
+          # The hosted form of the credential:  the key id, the issuer and the
+          # key as base64.  Base64 is one line, so the runner's environment
+          # file stays well formed and the raw PEM never enters GITHUB_ENV.
+          # The shell layer and the client both read the trio from the
+          # environment, because a path on disk is not an approved credential
+          # source (AFC-459).
+          key_b64="$(printf '%s' "$key_material" | base64 | tr -d '\n')"
+          printf '::add-mask::%s\n' "${key_b64//'%'/'%25'}"
+          printf 'APPLE_API_KEY_P8_BASE64=%s\n' "$key_b64" >> "$GITHUB_ENV"
+
+          bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
+          unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
+
+      # Hosted runners have an empty home each job, and this repo forbids
+      # actions/cache.  Without a state file the ship gate reads "never shipped"
+      # and the release notes fall back to the HEAD subject only.  Seed both from
+      # the previous successful run of this workflow.
+      - name: Seed last-ship state from the previous successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prev="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-appstore-gm.yml \
+            --status success --limit 1 --json headSha,updatedAt \
+            --jq '.[0] | select(. != null) | "\(.updatedAt) \(.headSha)"' || true)"
+          if [ -z "$prev" ]; then
+            echo "No previous successful run; the ship gate treats this as a first ship."
+            exit 0
+          fi
+          prev_at="${prev%% *}"
+          prev_sha="${prev##* }"
+          # gh prints RFC 3339 without fractions, but drop any fraction so a
+          # format change cannot fail this step under set -e.
+          prev_at="${prev_at%%.*}"
+          prev_at="${prev_at%Z}Z"
+          if ! [[ "$prev_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::Previous run sha is not a full sha; not seeding."
+            exit 0
+          fi
+          prev_ts="$(python3 -c 'import sys,datetime; print(int(datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()))' "$prev_at")"
+          state_dir="${IOS_FLEET_STATE_DIR:-$HOME/.cache/ios-fleet}"
+          mkdir -p "$state_dir"
+          printf '%s %s\n' "$prev_ts" "$prev_sha" > "$state_dir/last-ship-congress.txt"
+          echo "Seeded last ship: ${prev_sha:0:10} at ${prev_at}"
 
       - name: Ship CongressTrade from GM host
+        env:
+          IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          FORCE_SHIP: ${{ inputs.force_ship }}
+          # The input is passed through the environment, never interpolated
+          # into the script:  a dispatch input is operator text, and the
+          # script validates it before it is used.
+          MARKETING_VERSION_INPUT: ${{ inputs.marketing_version }}
         run: |
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --force-ship
+          set -euo pipefail
+          args=()
+          if [ "$FORCE_SHIP" = "true" ]; then
+            args+=(--force-ship)
+          fi
+          if [ -n "${MARKETING_VERSION_INPUT:-}" ]; then
+            if ! [[ "$MARKETING_VERSION_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::marketing_version must be X.Y.Z (got '${MARKETING_VERSION_INPUT}')."
+              exit 1
+            fi
+            args+=(--version "$MARKETING_VERSION_INPUT")
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" ${args[@]:+"${args[@]}"}
+
+      # A gate skip exits 0 inside the ship script.  For a manual dispatch that
+      # must not look like a shipped build, so assert the state file now records
+      # this checkout as shipped.
+      - name: Assert this checkout was uploaded
+        run: |
+          set -euo pipefail
+          state_dir="${IOS_FLEET_STATE_DIR:-$HOME/.cache/ios-fleet}"
+          read -r _ts shipped < "$state_dir/last-ship-congress.txt" || true
+          head_sha="$(git rev-parse HEAD)"
+          if [ "${shipped:-}" != "$head_sha" ]; then
+            echo "::error::Nothing was uploaded for ${head_sha:0:10}; the ship gate skipped this run.  Re-run with force_ship if the app is genuinely stale."
+            exit 1
+          fi
+          echo "Uploaded ${head_sha:0:10} to TestFlight."

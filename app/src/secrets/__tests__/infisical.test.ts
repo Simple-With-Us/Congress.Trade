@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import {
   deleteSecret,
+  INFISICAL_KV_CACHE_MAX_BYTES,
   readSourceSecrets,
   refreshSecrets,
   resolveSecret,
@@ -26,7 +27,104 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('Infisical environment selection is prod-only', () => {
+  function stubInfisical(seenEnvironments: string[]) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json({ accessToken: 'token' });
+        if (url.includes('/api/v3/secrets/raw')) {
+          seenEnvironments.push(new URL(url).searchParams.get('environment') ?? '');
+          return Response.json({ secrets: [] });
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+  }
+
+  it.each([
+    ['unset', undefined],
+    ['blank', '   '],
+    ['prod', 'prod'],
+    ['the production alias', 'production'],
+  ])('reads the prod environment when INFISICAL_ENV is %s', async (_label, value) => {
+    const seen: string[] = [];
+    stubInfisical(seen);
+    const e = env({ INFISICAL_APP_PROJECT_ID: `app-project-env-${_label}` });
+    if (value === undefined) delete (e as { INFISICAL_ENV?: string }).INFISICAL_ENV;
+    else e.INFISICAL_ENV = value;
+    await refreshSecrets(e);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(new Set(seen)).toEqual(new Set(['prod']));
+  });
+
+  it.each(['dev', 'development', 'staging', 'stage', 'preview'])(
+    'refuses INFISICAL_ENV=%s before any network call',
+    async (value) => {
+      const seen: string[] = [];
+      stubInfisical(seen);
+      const e = env({ INFISICAL_ENV: value, INFISICAL_APP_PROJECT_ID: `app-project-refused-${value}` });
+      await expect(refreshSecrets(e)).rejects.toThrow(/INFISICAL_ENV must be "prod"/);
+      await expect(resolveSecret(e, 'FMP_API_KEY')).rejects.toThrow(/INFISICAL_ENV must be "prod"/);
+      await expect(updateSecret(e, 'app', 'FMP_API_KEY', 'v')).rejects.toThrow(/INFISICAL_ENV must be "prod"/);
+      await expect(deleteSecret(e, 'app', 'FMP_API_KEY')).rejects.toThrow(/INFISICAL_ENV must be "prod"/);
+      await expect(readSourceSecrets(e, 'app')).rejects.toThrow(/INFISICAL_ENV must be "prod"/);
+      expect(seen).toEqual([]);
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('Infisical runtime secret resolver', () => {
+  it('skips Infisical network when the in-memory cache is still fresh', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return Response.json({ accessToken: 'token' });
+      }
+      if (url.includes('/api/v3/secrets/raw')) {
+        return Response.json({ secrets: [{ secretKey: 'FMP_API_KEY', secretValue: 'infisical-fmp' }] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-fresh-cache',
+      INFISICAL_CACHE_TTL_SECONDS: '600',
+    });
+    await refreshSecrets(e);
+    expect(fetchMock).toHaveBeenCalled();
+    const callsAfterFirst = fetchMock.mock.calls.length;
+
+    await refreshSecrets(e);
+    expect(fetchMock.mock.calls.length).toBe(callsAfterFirst);
+
+    await refreshSecrets(e, { force: true });
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('does not write KV when the encrypted cache blob would exceed the Deno KV limit', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json({ accessToken: 'token' });
+        if (url.includes('/api/v3/secrets/raw')) {
+          const huge = 'x'.repeat(INFISICAL_KV_CACHE_MAX_BYTES);
+          return Response.json({ secrets: [{ secretKey: 'BLOB', secretValue: huge }] });
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+    const kvPut = vi.fn(async () => {});
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-kv-limit',
+      INFISICAL_APP_CLIENT_SECRET: '01234567890123456789012345678901',
+      CONFIG_KV: { get: vi.fn(), put: kvPut, delete: vi.fn() } as unknown as KVNamespace,
+    });
+    await refreshSecrets(e);
+    expect(kvPut).not.toHaveBeenCalled();
+  });
+
   it('merges shared then app secrets, with app overriding shared', async () => {
     vi.stubGlobal(
       'fetch',

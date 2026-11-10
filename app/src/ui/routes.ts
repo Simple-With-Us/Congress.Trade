@@ -12,14 +12,19 @@
  */
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { Env } from '../shared/types.ts';
 import { DASHBOARD_HTML } from './dashboardHtml.ts';
+import { DASHBOARD_CSS_SERVED, DASHBOARD_CSS_VERSION } from './dashboardStyles.ts';
+import { DASHBOARD_APP_JS_SERVED, DASHBOARD_APP_JS_VERSION } from './dashboardClient.ts';
 import { TOS_HTML, PRIVACY_HTML } from './legalHtml.ts';
 import { getLogoDisplay } from '../shared/settings.ts';
 import {
   APPLE_TOUCH_ICON_PNG,
   BRAND_LOGO_DARK_PNG,
   BRAND_LOGO_LIGHT_PNG,
+  BRAND_LOGO_DARK_WEBP,
+  BRAND_LOGO_LIGHT_WEBP,
   BRAND_LOGO_PNG,
   EAGLE_SPLASH_PNG,
   FAVICON_PNG,
@@ -35,14 +40,20 @@ import {
   OG_IMAGE_POLITICIAN_PNG,
   OG_IMAGE_TRENDS_PNG,
   SITE_WEBMANIFEST,
+  SIMPLE_WITH_US_WEBP,
+  SWU_LOGO_WEBP,
   ZILLA_SLAB_WOFF2,
   type StaticAsset,
 } from './assets.ts';
 import { applyOgMeta, resolveOgMeta, SITE } from './ogMeta.ts';
-import { mountAppLinks } from './appLinks.ts';
+import { mountAppLinks, testFlightUrl } from './appLinks.ts';
 import { DEFAULT_EXECUTIVE_TITLE, executiveTitleFor } from '../shared/executiveTitles.ts';
 import { getSitemapXml } from './sitemap.ts';
 import { TICKER_RESOLVED_SQL } from '../analytics/sql.ts';
+import { getDatadogInitInput } from '../shared/datadog.ts';
+import { resolveDatadogRum } from '../shared/datadogRuntime.ts';
+import { renderDatadogRumScript } from '../shared/datadogRum.ts';
+import { renderSentryBrowserScript } from '../shared/sentryBrowser.ts';
 
 /**
  * Analytics injection was removed (CT-AUD-P1-15).
@@ -160,13 +171,22 @@ const TICKER_QUERY_FORMAT = /^[A-Z][A-Z0-9.\-]{0,9}$/;
 
 /** Whether ?ticker= names a security that has actually traded (never
  *  throws) — gates the company share card so arbitrary query text can't be
- *  echoed back as branded og:title/og:description (SEOSOCIAL-06). */
+ *  echoed back as branded og:title/og:description (SEOSOCIAL-06).
+ *
+ *  CT-2418: the FROM clause needs the `t` alias. TICKER_RESOLVED_SQL qualifies
+ *  every column as `t.<col>`, so selecting `FROM transactions` unaliased raised
+ *  `no such column: t.ticker`, the catch below swallowed it, and this function
+ *  returned false for *every* ticker — the ?ticker= company share card never
+ *  rendered, and the follow-on lookupTradeShareSummary query still ran because
+ *  tickerResolved was permanently false. */
 async function lookupTickerResolved(env: Env, ticker: string): Promise<boolean> {
   const t = ticker.trim().toUpperCase();
   if (!t || !TICKER_QUERY_FORMAT.test(t) || !env.DB) return false;
   try {
     const row = await env.DB
-      .prepare(`SELECT 1 FROM transactions WHERE ${TICKER_RESOLVED_SQL} AND ticker = ? LIMIT 1`)
+      .prepare(
+        `SELECT 1 FROM transactions t WHERE ${TICKER_RESOLVED_SQL} AND t.ticker = ? LIMIT 1`,
+      )
       .bind(t)
       .first();
     return !!row;
@@ -312,13 +332,49 @@ async function renderDashboard(env: Env, requestUrl: string): Promise<string> {
   });
   let html = DASHBOARD_HTML
     .split('%LOGO_DISPLAY%').join(logoDisplay)
-    .split('%GA_SCRIPT%').join('');
+    .split('%GA_SCRIPT%').join(telemetryScripts(env));
   html = applyOgMeta(html, og);
   return html;
 }
 
-function renderLegalHtml(html: string, _env: Env): string {
-  return html.split('%GA_SCRIPT%').join('');
+function datadogRumScript(env: Env): string {
+  return renderDatadogRumScript(resolveDatadogRum({
+    ...(getDatadogInitInput() ?? {}),
+    ...env,
+  }));
+}
+
+function telemetryScripts(env: Env): string {
+  return datadogRumScript(env) + renderSentryBrowserScript(env);
+}
+
+function renderLegalHtml(html: string, env: Env): string {
+  return html.split('%GA_SCRIPT%').join(telemetryScripts(env));
+}
+
+/** CT-2418: let shared/edge caches serve the dashboard document instead of
+ *  re-rendering it at the origin on every hit. Matches the PUBLIC_STABLE_CACHE
+ *  policy already used for daily-grain public reads in delivery/rest.ts.
+ *
+ *  Gated on the entity deep-link params. `?member=`, `?ticker=` and `?trade=`
+ *  each render a *different* og:title/og:description from a DB lookup, and
+ *  Cloudflare's cache key includes the query string, so an ungated header would
+ *  let every distinct crawler URL become its own multi-hundred-KB edge object
+ *  and hand a paid tier an unbounded cache-fill vector. Bare `/`, `/?view=…`
+ *  and friends are pure functions of the build, so those cache normally. */
+const DASHBOARD_CACHE = 'public, s-maxage=300, stale-while-revalidate=600';
+const DASHBOARD_ENTITY_PARAMS = ['member', 'ticker', 'trade'] as const;
+
+function dashboardCacheControl(requestUrl: string): string | null {
+  try {
+    const params = new URL(requestUrl).searchParams;
+    for (const key of DASHBOARD_ENTITY_PARAMS) {
+      if ((params.get(key) || '').trim()) return null;
+    }
+    return DASHBOARD_CACHE;
+  } catch {
+    return null;
+  }
 }
 
 export function buildUiRouter(): Hono<{ Bindings: Env }> {
@@ -328,19 +384,93 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   // Dashboard SPA. Hono's c.html() sets `content-type: text/html; charset=UTF-8`.
   // OG/Twitter meta is filled from the request URL so crawlers unfurl the
   // correct card for ?view=trends / ?ticker= / ?member= deep links.
-  r.get('/', async (c) => c.html(await renderDashboard(c.env, c.req.url)));
-  r.get('/admin', async (c) => c.html(await renderDashboard(c.env, c.req.url)));
+  const serveDashboard = async (c: Context<{ Bindings: Env }>) => {
+    const html = await renderDashboard(c.env, c.req.url);
+    const cache = dashboardCacheControl(c.req.url);
+    if (cache) c.header('Cache-Control', cache);
+    return c.html(html);
+  };
+  r.get('/', serveDashboard);
+  r.get('/admin', serveDashboard);
 
   // Binary assets live under app/public/ (loaded by assets.ts) and are served
   // here with long cache headers. HTML references these URL paths — never
   // inline base64 — so documents stay small and assets are CSP-safe (`'self'`).
-  const serveAsset = (a: StaticAsset, cacheControl: string) => (c: any) =>
-    c.body(a.bytes, 200, {
-      'content-type': a.contentType,
-      'cache-control': cacheControl,
-    });
+  // CT-2459: ETags so daily-cache (LONG) assets revalidate as a 304
+  // instead of re-downloading image bytes. Weak validators over the same
+  // FNV fingerprint family as assetVersion().
+  const etagForBytes = (bytes: Uint8Array): string => {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    return `W/"${hash.toString(16).padStart(8, '0')}-${bytes.length}"`;
+  };
+  const serveAsset = (a: StaticAsset, cacheControl: string) => {
+    const etag = etagForBytes(a.bytes);
+    return (c: Context<{ Bindings: Env }>) => {
+      if (c.req.header('if-none-match') === etag) {
+        return c.body(null, 304, { etag, 'cache-control': cacheControl });
+      }
+      return c.body(a.bytes as Uint8Array<ArrayBuffer>, 200, {
+        'content-type': a.contentType,
+        'cache-control': cacheControl,
+        etag,
+      });
+    };
+  };
+  /**
+   * Same contract as serveAsset, but for text built at module load and carrying a
+   * content digest. The digest is what makes `immutable` safe: a stale `?v=` means
+   * the caller is holding a document cached from an earlier deploy, so redirect it
+   * to the current URL instead of handing it this build's bytes under a URL it
+   * would then pin for a year. The redirect is not itself immutable, so the next
+   * navigation re-checks and settles on the right pair.
+   */
+  const serveText =
+    (body: string, contentType: string, version: string, cacheControl: string) =>
+    (c: Context<{ Bindings: Env }>) => {
+      const requested = c.req.query('v');
+      if (requested && requested !== version) {
+        return c.redirect(`${new URL(c.req.url).pathname}?v=${version}`, 302);
+      }
+      const etag = `W/"${version}"`;
+      if (c.req.header('if-none-match') === etag) {
+        return c.body(null, 304, { etag, 'cache-control': cacheControl });
+      }
+      return c.body(body, 200, { 'content-type': contentType, 'cache-control': cacheControl, etag });
+    };
   const IMMUTABLE = 'public, max-age=31536000, immutable';
   const LONG = 'public, max-age=86400';
+
+  // CT-2418: the dashboard stylesheet and application script are built at module
+  // load (same pattern as the binary assets below) and served as real files so
+  // the HTML document is a small, cacheable shell instead of a ~820 KB response
+  // that re-downloaded everything on every navigation and re-invalidated on
+  // every deploy. Both are same-origin, so CSP `'self'` already covers them.
+  //
+  // Cache busting: the path is stable, which is the whole point, so a deploy has
+  // to change something a client can see. `?v=` carries a digest of the content,
+  // and it is a fresh immutable entry in the URL, so a deploy invalidates exactly
+  // the changed file rather than every returning visitor's year-long cache.
+  // serveText enforces the pairing: a stale `?v=` is redirected to the current
+  // one, so a client holding a cached document never pins new bytes under an old
+  // version URL (which is the failure mode Sentry flagged in review).
+  r.get(
+    '/assets/dashboard.css',
+    serveText(DASHBOARD_CSS_SERVED, 'text/css; charset=utf-8', DASHBOARD_CSS_VERSION, IMMUTABLE),
+  );
+  r.get(
+    '/assets/dashboard.js',
+    serveText(
+      DASHBOARD_APP_JS_SERVED,
+      'application/javascript; charset=utf-8',
+      DASHBOARD_APP_JS_VERSION,
+      IMMUTABLE,
+    ),
+  );
+
   r.get('/assets/zilla-slab-700.woff2', serveAsset(ZILLA_SLAB_WOFF2, IMMUTABLE));
   r.get('/assets/inter-400.woff2', serveAsset(INTER_400_WOFF2, IMMUTABLE));
   r.get('/assets/inter-500.woff2', serveAsset(INTER_500_WOFF2, IMMUTABLE));
@@ -351,6 +481,10 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   r.get('/assets/brand-logo.png', serveAsset(BRAND_LOGO_PNG, IMMUTABLE));
   r.get('/assets/brand-logo-dark.png', serveAsset(BRAND_LOGO_DARK_PNG, IMMUTABLE));
   r.get('/assets/brand-logo-light.png', serveAsset(BRAND_LOGO_LIGHT_PNG, IMMUTABLE));
+  r.get('/assets/brand-logo-dark.webp', serveAsset(BRAND_LOGO_DARK_WEBP, IMMUTABLE));
+  r.get('/assets/brand-logo-light.webp', serveAsset(BRAND_LOGO_LIGHT_WEBP, IMMUTABLE));
+  r.get('/assets/simple-with-us.webp', serveAsset(SIMPLE_WITH_US_WEBP, IMMUTABLE));
+  r.get('/swu-logo-wide.webp', serveAsset(SWU_LOGO_WEBP, LONG));
   r.get('/og-image.png', serveAsset(OG_IMAGE_PNG, LONG));
   r.get('/og-image-trends.png', serveAsset(OG_IMAGE_TRENDS_PNG, LONG));
   r.get('/og-image-company.png', serveAsset(OG_IMAGE_COMPANY_PNG, LONG));
@@ -373,6 +507,11 @@ export function buildUiRouter(): Hono<{ Bindings: Env }> {
   r.get('/terms', (c) => c.redirect('/terms-of-service', 301));
   // Shareable pricing entry — dashboard opens the Premium modal via ?pricing=1.
   r.get('/pricing', (c) => c.redirect('/?pricing=1&view=subs', 302));
+  // Shareable iOS TestFlight / Beta links
+  r.get('/beta', (c) => c.redirect(testFlightUrl(c.env), 302));
+  r.get('/testflight', (c) => c.redirect(testFlightUrl(c.env), 302));
+  r.get('/ios', (c) => c.redirect(testFlightUrl(c.env), 302));
+  r.get('/app', (c) => c.redirect(testFlightUrl(c.env), 302));
 
   // robots.txt — allow search engines, block AI/LLM crawlers and scrapers.
   // Follows the same policy as capitoltrades.com/robots.txt.

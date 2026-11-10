@@ -138,7 +138,7 @@ without a DB (mirroring `src/delivery/rows.ts`).
 | `GET /ticker/:ticker` | Single-ticker deep dive (series, top buyers/sellers, recent) |
 
 **Common query params:** `window=7d\|30d\|90d\|365d\|all` (default `30d`, by
-`tx_date`), `chamber=house\|senate`, `party=D\|R\|O`, `source=all\|primary\|seed_dataset`
+`tx_date`), `chamber=house\|senate`, `party=D\|R\|O` (CSV; `O` = Other / No party, so D+R+O = all), `source=all\|primary\|seed_dataset`
 (default `all`), `minConf=0..1`, plus per-endpoint `limit` / `sort` / `granularity`
 / `minMembers`.
 
@@ -186,10 +186,9 @@ There is no production `wrangler.toml`.  The Deno entrypoint in
 Local development variables are documented in `.dev.vars.example`, but that
 template is reference-only. From the repository root run
 `bash scripts/cloud-setup.sh`; it safely maps the Congress.Trade and shared
-Infisical machine identities from explicit environment variables or the
-optional owner-only `$HOME/.secrets/global-api-keys` file (no group/other
-permission bits) into the gitignored `.dev.vars`. The global file is parsed as
-inert assignments and never sourced.
+Infisical machine identities from explicit environment variables or, on a Mac
+with the CLI installed, `fleet-secrets get NAME` into the gitignored
+`.dev.vars`. Cloud and CI use the environment only.
 The setup also carries forward only the five documented early-init/local
 selectors (`SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE`,
 `ADMIN_OPEN_IN_DEV`, and `USAGE_MONITOR_ENVIRONMENT`) from the explicit process

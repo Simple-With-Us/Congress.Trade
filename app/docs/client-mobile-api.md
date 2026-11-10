@@ -1,6 +1,6 @@
 # Client Mobile API Coordination
 
-Last updated: 2026-08-20
+Last updated: 2026-09-03
 
 This is the working coordination note for the phone-first SwiftUI and the
 SwiftUI iPhone app. Keep it aligned with `app/docs/mobile-app-roadmap.md` and
@@ -66,6 +66,30 @@ The current router implements `update_preferences`, `create_subscription`,
 `update_subscription`, `delete_subscription`, `register_device`,
 `unregister_device`, `redeem_apple_purchase`, and `delete_account`; `start_checkout` and
 `request_export` are defined in the shared type set but still return `501`.
+
+### Delivery `members` filter (`create_subscription` / `update_subscription`)
+
+`filters.members` is matched against the trade's filer id, so the server stores
+**filer ids** and resolves what it is given (2026-09-18, board a6058af2):
+
+- An entry is a filer id (`filerId` from `GET /api/members`; case-insensitive, a
+  merged alias maps to its canonical filer) **or a member name**.  A name must
+  identify exactly one member: an exact full/display-name match wins, then a
+  filer with live trades over a dormant duplicate.
+- An id must exist: on the `filers` roster or on at least one transaction.  A typo
+  is rejected like an unknown name rather than saved as a subscription that never
+  fires.
+- A name that matches nobody, or several people (`"Smith"`), fails the command
+  (`failed`, `error` lists every offending entry; REST `POST/PATCH
+  /api/subscriptions` answers `400` with the same `error` plus
+  `unresolvedMembers: string[]`).  Nothing is saved.  Prefer sending ids — the
+  iOS Delivery screen picks members from the People directory and sends `filerId`.
+- `GET /api/client/v1/subscriptions` adds `memberLabels` (`{ filerId: name }`) to
+  each subscription that filters by member, so clients can show names, and
+  `unresolvedMembers` when the stored filter holds an entry that is not a known
+  filer id.  Subscriptions created before names were resolved may hold raw text
+  such as `"Nancy Pelosi"`: those never delivered anything, are not rewritten by
+  the server, and are fixed by Edit → Save (which resolves or rejects them).
 
 ### Account deletion — `delete_account`
 
@@ -275,6 +299,15 @@ anonymous redeem route's own response body (above) — it is device-scoped, not
 `User`-keyed, so no `resolveEntitlementAsync` response (bootstrap/me/etc.)
 ever returns it.
 
+iOS Manage Subscription: `source == "apple"` opens the App Store
+subscriptions page.  `stripe` or `null` (website Premium) POSTs
+`/billing/portal` with the session Bearer.  That route must accept Bearer
+(`getCurrentUserFromRequest`); cookie-only auth 401s a signed-in iOS user.
+On portal failure other than offline, iOS opens
+`https://congress.trade/?billing=manage` (website `manageBilling()` after
+`/auth/me`) instead of telling the user to sign out.  Native iOS never
+starts `/billing/checkout`.
+
 - Implemented now: bootstrap, `me`, feed, trade detail, ticker detail,
   politician detail (`member` endpoint), `preferences` GET/PUT, subscription listing, and command-backed
   preference/subscription create/update.
@@ -348,7 +381,12 @@ ever returns it.
   and it is CSV multi-select capable (`?party=D,R`), on both this endpoint and
   `/api/transactions`; it narrows `total` like every other server filter.
   Verified in production: unfiltered `total` 89,422 vs `party=D` 48,443 and
-  `party=R` 39,126.
+  `party=R` 39,126.  **`party=O` is "Other / No party"** (2026-09-18, board
+  efd94c45): Independents, minor parties AND filers with no party on file
+  (executive-branch, manual and seed filers, or a transaction with no `filers`
+  row).  The bucket is total, so `party=D,R,O` equals no party filter and the
+  three buckets always sum to `total`.  Row-level `partyBucket` fields stay
+  `null` when no party is on file; those rows are returned by `party=O`.
   - iOS's Chamber/Party/Trade Type filter pills are multi-select (owner
     directive, 2026-08-09), matching the web's own multi-select chip
     semantics: `chamber` is genuinely CSV-capable server-side (`asChambers`),
@@ -561,10 +599,23 @@ were verified live on 2026-08-11 and pinned by
   2026-08-10) is a curated agency/position label for executive-branch filers
   (`filerId` starting `EXEC-`) — e.g. `"Treasury Secretary"` — sourced from
   `shared/executiveTitles.ts`; `null` for House/Senate filers, and
-  `"Executive Branch"` for an `EXEC-*` filer with no curated entry. The same
+  `"Executive Branch"` for an `EXEC-*` filer with no curated entry, and for any
+  other filer filed under `chamber: "executive"` (a competitor-minted `MANUAL-*`
+  official; no title is guessed). The same
   `title` field is on the `member.profile` object from `GET
   /api/client/v1/member/:memberIdOrName` and on `GET /api/analytics/member/
   :filerId`'s `profile`.
+- `performance.pricesAsOf` (added 2026-09-18) on `GET /api/client/v1/member/
+  :memberIdOrName`, and `pricesAsOf` on `GET /api/analytics/member-performance`,
+  `GET /api/analytics/member/:filerId/performance` and `GET
+  /api/analytics/performance/:txId`, is the newest price date (`YYYY-MM-DD`)
+  behind any scored trade.  Every return on the same response ends on that date:
+  the S&P 500 leg is the close on or before each ticker's own
+  `current_price_date`, not one global latest close.  Clients should print
+  "Prices as of <date>" beside performance figures; `null` when nothing was
+  scored.  `GET /api/analytics/summary` `resolvedEquityTickerPct` now uses an
+  equity-like denominator (`public_equity` plus still-`unknown` types); the old
+  public-equity-only figure is `resolvedPublicEquityTickerPct`.
 - Each feed item's `asset` object carries `name` (the disclosed asset text),
   `ticker`, raw disclosure `type`, `typeName`, canonical cross-chamber
   `typeCategory` / `typeCategoryLabel`, `sector`, and `marketCapBucket`, plus

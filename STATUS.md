@@ -1,4 +1,172 @@
+## 2026-10-26 BF-PUBLISHER — Published filings stuck at ingest_status error (CT-2453)
+
+A filing that already has live transactions and a publish decision can still show `ingest_status` error, because a later fetch failure overwrites the stamp.  The hourly desync reconcile only mapped a resolved `review_queue` row, so a filing that never had one stayed error.  The reconcile now stamps `persisted` from those two facts, and a fetch failure leaves an already-published filing's `ingest_status` alone.  Stored raw for the four Senate filings matches the live published rows: 5, 33, 1, and 1.  No production write from this seat.  Branch `publisher/reconcile-published-errored`.  Refs CT-2453.  Rollout: `docs/rollouts/2026-10-26-reconcile-published-errored.md`.
+
+
 # Current Handoff
+
+## 2026-11-01 MC — Full-stack perf + UI/UX audit and fix sweep (CT-2459)
+
+Fleet-mode audit (6 auditors + adversarial critic; 27/28 P1s verified) landed as 10 fix batches on `muse-code/perf-ux-audit`: minified web payloads (JS 157 KB gz to 105 KB gz, CSS 205 KB to 128 KB), WebP header logo, skip link/h1/tablist keys, cached health scans, streaming CSV, queue abort-release + jitter, bulk outbox, cache tiers everywhere, client Cache-Control, lazy PDF/LLM imports, cheerio removed, iOS snapshot publishing + image cache.  Typecheck clean; 5,278 tests pass; iOS builds clean (tests compile-verified, no local simulator).  Owner-gated follow-ups (sqlite read connection, queue priority column, VACUUM, image secrets) are listed in the rollout.  Rollout: `docs/rollouts/2026-11-01-ct-2459-perf-ux-audit.md`.
+
+## 2026-10-30 CODEX — Reports index (AFC-580)
+
+Added docs/reports/README.md to index eligible documentation and reports.  The index links existing canonical files without moving or renaming them.  Central collection under Code/Docs/Congress.Trade/ is populated under the owner-approved docs-only exception.  The collector and protocol are live in AI-Fleet-Coordinator main at `691f4a3c`; the 16-repo collection check reported zero planned changes, and protected Git checkouts remain unchanged.  This in-repo index is the repository entry point.
+
+## 2026-10-25 GROK — Empty fetch hand-off (CT-2447)
+
+A completed ingestion outbox row that stored no raw object, and a filing whose ingest_status is outside IngestStatus, now re-drive on the autonomy sweep and page as `empty_fetch_handoff`.  The same id is a critical `/api/health` check and is in `HEALTH_STALL_SKIP_IDS`, so it does not page twice.  Evidence for `E-2026-donald-j-trump-08-12-2026-278t` is in `docs/evidence/2026-10-25-orphan-278t.json`.  Part 7 is not empty.  This PR does not publish the filing.  CT-2447 stays open until the filing is recovered and published.  Branch `grok/empty-fetch-handoff`.  No merge from this seat.  Rollout: `docs/rollouts/2026-10-25-empty-fetch-handoff.md`.
+
+## 2026-10-23 GB-COMPILER — Share payload schemaVersion (ST-3853)
+
+Vendored `congress-trading-shared` is now `v2.9.0`, which adds the optional `schemaVersion` to `SharePayloadSchema`.  `POST /api/admin/securities/import` resolves the peer's contract version, warns on unsupported or malformed values, and echoes `schemaVersion` in the response; the version is never a rejection reason, so mixed deploys keep importing.  Rollout: `docs/rollouts/2026-10-23-st-3853-share-schema-version.md`.
+
+## 2026-10-15 CURSOR — Socratic-Trade push receipt (ST-3846)
+
+`shareWithPeer` sends `x-push-id` and reads the delivered and consumed acks.  A 200 without those acks is not a successful push.  Sentry warns and the admin email is throttled (`peer-push-missing-ack`).  The receiver is Socratic-Trade branch `cursor/ct-push-receipt-2155`.  Do not mark ST-3846 completed until both pulls merge.  Rollout: `docs/rollouts/2026-10-15-st-push-receipt.md`.
+
+## 2026-10-11 CODEX — Kody Direct MiniMax (CTS-330)
+
+Kody uses `MiniMax-M3.1-Flash` through MiniMax's direct OpenAI-compatible endpoint with the existing MiniMax key (repinned 2026-10-21).  The helper answers in `reasoning_split` mode for M3.1-Flash; the native-M3 thinking-disabled mode and its passing synthetic live edit canary applied to the retired `MiniMax-M3` pin, and no live canary has been recorded for the M3.1-Flash id on this route yet - the native-handling cure is upstream congress-trading-shared #393, tracked on PR #2823.  Caller syntax and hosted CI are checked before landing; current-head review remains required.  See `docs/rollouts/2026-10-11-kody-direct-minimax.md`.
+
+
+## 2026-09-24 BF-PUBLISHER — Disputed agreement vision vs unreadable 278-T
+
+Live Trump `E-2026-donald-j-trump-09-8-2026-278t` rejected at rev 35 (unusable OCR; official 1156 rows; vision 472/66/33).  `#2554` sweep could not close it because disagreed kind=agreement runs counted as a successful nonempty read.  Branch `publisher/oge-disputed-vision-guard`.  No merge/deploy.  House historic backlog untouched.  Rollout: `docs/rollouts/2026-09-24-disputed-agreement-vision-unreadable.md`.
+
+## 2026-09-18 CLAUDE — Map the CI backstop schedule in the Crons reporter (FLEET-INFRA-BJ)
+
+`ci.yml` has an hourly `23 * * * *` backstop tick, but `CRON_SCHEDULES` in
+`scripts/sentry-ci-report.py` had no `"CI"` key, so every scheduled CI run raised an
+`unmapped-schedule` drift warning (`FLEET-INFRA-BJ`, ~400 events, archived forever, which
+hid the drift).  Added `"CI": "23 * * * *"` and `CHECKIN_MARGIN_OVERRIDES["CI"] = 600`
+(GitHub runs the hourly tick every 4-8h: median 260 min, worst 467 min over 60 runs).  Do not
+tighten the margin, and do not copy 600 onto 30-min macos ship crons.  Do not
+`Fixes FLEET-INFRA-BJ` on merge; the monitor upserts on the next scheduled check-in.
+Rollout: `docs/rollouts/2026-09-18-ci-backstop-cron-map.md`.
+
+## 2026-09-18 CURSOR — Effort Issues Sync Crons margin (FLEET-INFRA-23)
+
+Sentry `ci-congress-trade-effort-issues-sync` misses at 06:27Z every day
+because GitHub starts `effort-issues-sync.yml` 4.3-7.4h late.  Reporter
+`CHECKIN_MARGIN_OVERRIDES["Effort Issues Sync"] = 600`.  Cron and sync
+unchanged.  Do not rematch with a second margin PR, in_progress PR, or
+sync dispatch.  Do not copy 600 onto 30-min macos ship crons.  Do not
+`Fixes FLEET-INFRA-23` on merge; wait for the next scheduled upsert.
+Rollout: `docs/rollouts/2026-09-18-effort-issues-sync-monitor-margin.md`.
+Did not touch `docs/EFFORT-LOG.md` (sync-1 holds effort-log-reconcile).
+## 2026-09-16 BF-PUBLISHER — FMP Senate PTR official enqueue
+
+Live queue empty.  Angus King FMP stub closed as duplicate after official `S-e67c6e56-…` persisted.  Pipeline now enqueues `S-{uuid}` from provider PTR view ids instead of parking `provider-missing-*`.  Branch `publisher/fmp-senate-official-enqueue`.  Rollout: `docs/rollouts/2026-09-16-fmp-senate-official-enqueue.md`.
+
+## 2026-09-13 FX — drop hardcoded ADMIN_TOKEN scratch script
+
+Deleted `filed_date_week_latency.ts` from git (hardcoded bearer to `/api/admin/debug-sql`).  Owner must rotate `ADMIN_TOKEN`.  Boards `010936c8` `ab7cf3be`.  Branch `fx/drop-admin-token-script`.
+
+## 2026-09-13 FX — drop free/paid cost tiers; VACUUM INTO host backups
+
+Owner: Infisical is the secret source of truth; the old Deno Deploy free/paid names are misleading.  `costProfile` now always uses aggressive live knobs (cron `* * * * *`).  `CT_COST_PROFILE` is ignored.  Host `fleet-sqlite-backup.sh` uses `VACUUM INTO` and fails loud.  Installed on the box from this lane.  Stripe `charge.refunded` / `charge.dispute.created` end entitlement.  Filing PDF gate is 402 JSON for every client.  Boards `d6226365`, `cbed4f30`, `93c48e00`, `8932ea1f`, `53548457`.  Branch `fx/aggressive-runtime-backups`.  Rollout: `docs/rollouts/2026-09-13-aggressive-runtime-and-backups.md`.
+
+## 2026-09-13 CLAUDE — fleet-sqlite-backup.sh lock composition
+
+The 2026-09-06 in-script flock never composed with the cron wrapper's flock on the same file, so no
+dumps landed from 2026-09-07 to 2026-09-13.  Cron now hands the script a distinct lock path
+(`FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup.inner.lock`) and the script stands down when
+`FLOCKER=$LOCKFILE` is handed down.  The host runs FX's VACUUM INTO script, now in the repo.  Details:
+`docs/rollouts/2026-09-06-sqlite-backup-single-flight.md`, 2026-09-13 follow-up.
+
+## 2026-09-06 GROK — fleet-sqlite-backup.sh single-flight + complete retention + timeout
+
+Housekeeper mitigated overlapping ST `sqlite3 .backup` on the box (no flock;
+KEEP_COUNT preferred incomplete dumps).  Canonical script now flocks
+`/var/lock/fleet-sqlite-backup.lock`, ignores dumps without `.sha256` or with
+a `.db-journal`, and bounds `.backup` with `FLEET_BACKUP_TIMEOUT` (default
+30m).  Host install after merge: `/usr/local/sbin/fleet-sqlite-backup.sh` on
+`fleet-hetzner-nbg1` (diff-on-top of UUID-pinned host copy).  No Coolify bake.
+Board `e1f66898`.  Rollout:
+`docs/rollouts/2026-09-06-sqlite-backup-single-flight.md`.
+
+## 2026-09-05 CLAUDE — Grok usage-cap pickup: full-stack audit landed + debug-sql P0 fixed
+
+GROK hit its usage cap with the 2026-08-31 full-stack audit (board `f74642d0`) staged
+but never committed, and several already-merged PRs still marked IN PR/IN PROGRESS in
+this file and the effort log.  Landed the report (`docs/audits/2026-08-31-full-stack-audit.md`),
+fixed ranked item #1 — `POST /api/admin/debug-sql` had no prod guard (PR #2318, merged) —
+and corrected the stale status lines below.  Remaining ranked items (feed sort contract
+`#2180`, Coolify zero-downtime, manual-confirm N-of-M guard, DLQ drain, etc.) are still open;
+see the audit for the ordered list.  Grok's other Congress.Trade branches were all already
+merged; nothing else was in flight.
+
+## 2026-09-04 GROK — FMP lease reclaim (scout retired deadlock)
+
+#2307 is live (`d4e5cc4a`) but FMP stayed `handed_off` with no Mac scout.
+Server now reclaims when no live Mac lease exists.  Board `d09acd0a`.
+Rollout: `docs/rollouts/2026-09-04-fmp-lease-reclaim.md`.
+
+## 2026-09-04 GROK — FMP latency ERROR + duplicate Exec health rows
+
+Latency · FMP Stable ERROR was 42h without observations while both free-tier
+keys still 200 on house/senate-latest.  Probes go direct; a 429 retries the
+other key then one hop through the Senate residential proxy.  RapidAPI has
+no house/senate-latest (404) and no OGE/executive-latest (400/404) —
+leave `FMP_LATENCY_PATHS=stable`.  Ticker enrichment stays with
+Socratic.Trade.  UW/QQ stay retired until paid/trial.  Source Health had
+two Exec rows (`executive` + `oge`); SQL now canonicalizes to one.
+Rollout: `docs/rollouts/2026-09-04-fmp-exec-health.md`.  Board `d09acd0a`.
+
+## 2026-09-04 GROK — Trends card swap, full-bleed filter, Trades column defaults
+
+Rising Activity and Top Performers swapped so the four-column Rising table
+gets the later equal-width pair.  Sticky Trends/Trades filters break out to
+`100vw` to kill the grey notches under the white header (1280px Trends
+column was shorter than `header.top`).  Public Trades defaults hide Country
+(Confidence / Latency / Source were already admin-only).  Admins keep
+Country / Confidence / Latency on and only hide Source.  Key
+`feed-cols-hidden-v4` (+ `-admin`).  Rollout:
+`docs/rollouts/2026-09-04-trends-layout-cols.md`.  Board `1f0f2bd4`.
+
+## 2026-09-03 BF-Publisher — Senate paper IBM/Microsoft form samples
+
+Live queue 4 → 0. Four Senate paper PTRs (Blumenthal May/Dec 2025, Boozman Oct 2022 / Mar 2023) were parked because printed IBM/Microsoft example rows scored `future_tx_date`. Confirmed 73 official lots from eFD page scans. Pipeline now drops those printed examples so the next paper PTRs can publish. Rollout: `docs/rollouts/2026-09-03-senate-paper-form-samples.md`.
+
+## 2026-09-01 GROK — Sentry fleet adoption leftovers (DSN out of git, PDF ignore, sparse logs)
+
+`SENTRY_DSN` is no longer a live value in `.prod.vars`.  Infisical/Coolify own it.  `ignoreErrors` + `beforeSend` drop expected unpdf XRef noise (CONGRESS-TRADE-1C).  Health warns go to `Sentry.logger.warn` (`ingest.dead_letter`, `webhook-retry`, and siblings).  No browser Replay SDK.  Deno profiling skipped (SDK has no profiler).  Rollout: `docs/rollouts/2026-09-01-sentry-fleet-adoption.md`.
+
+## 2026-09-01 GROK — August ops leftovers (#2180 newest-first, #2182 DLQ health, NTR, stream)
+
+`order=desc` snapshots now rank by `COALESCE(first_seen_at, filed_date, tx_date)` so a 2024 backfill cannot occupy API/RSS page 1.  `/api/health` only degrades on **fresh** outbox failures (24h, not `parked:`); a saturated 81-row DLQ no longer masks new stalls.  NTR detector accepts OCR variants; `/api/stream` 400 includes a subscription hint.  Apple webhook mount already live on main (POST `signedPayload required`).  Rollout: `docs/rollouts/2026-09-01-ops-review-open-items.md`.
+
+## 2026-08-31 CLAUDE — B2 hetzner/ snapshot prune + R2 weekly receipt guard
+
+`scripts/ops/fleet-sqlite-backup.sh` (host cron, 4x/day) was uploading ~52 GB/day of raw snapshots to the three B2 `hetzner/` prefixes with no B2-side prune - only the 15-day bucket lifecycle reclaimed, projecting ~780 GB steady state on the shared capped Backblaze account.  Added `prune_b2_sets()` after each successful offsite upload (keep newest `B2_KEEP_SETS`, default 6, timestamped sets; delete older sets via free Class A `rclone deletefile`; bucket allowlist, strict stamp parsing, never deletes the just-uploaded set, best-effort so a prune failure never fails the backup) and a same-day success receipt guard so the Sunday R2 weekly leg stops re-running on all four Sunday cron ticks.  Post-merge step: install the merged script to `/usr/local/sbin/fleet-sqlite-backup.sh` on fleet-hetzner-nbg1 (backup first); next cron tick exercises it.  Rollout: `docs/rollouts/2026-08-31-b2-hetzner-prune.md`.
+
+## 2026-08-27 CLAUDE — Litestream sync-interval 5m -> 15m (shared B2 account)
+
+Owner confirmed ST/CT/UM share ONE Backblaze account (daily caps are fleet-wide) and asked for a backup-frequency reduction.  CT coarsened to 15m — data is re-ingestable, and this cuts quiet-period object count plus downstream compaction re-reads 3x.  ST deliberately stays at 300s (live trading DB); UM is already 1h.  Burst caveat unchanged (L0 objects per commit during heavy ingestion).  Rollout: `docs/rollouts/2026-08-27-litestream-sync-15m.md`.
+
+## 2026-08-27 CLAUDE — Litestream B2 multipart hardening (part-size 10MB)
+
+Preventive port of the ST fix after Usage-Monitor's identical B2 L1-compaction
+retry storm (119 checksum-mismatch multiparts in ~2h on 2026-08-27) burned the
+shared Backblaze daily transaction caps.  `app/litestream.yml` adds
+`part-size: 10MB` and `concurrency: 2` (was 5MB default / 1).  Config-only;
+no schema change.  Rollout: `docs/rollouts/2026-08-27-litestream-b2-part-size.md`.
+
+## 2026-08-26 CURSOR — Provider-missing stub auto-close is live (#2221)
+
+Live observation path rejects open `provider-missing-*` review stubs when
+the matching official `S-` / `H-` filing is already `persisted`.  It does
+not confirm the stub, merge txs, or sweep historic leftovers.  Creation
+is still the July 22 provider-gap router.  Receipt:
+`docs/rollouts/2026-08-25-provider-missing-stub-close.md`.
+
+## 2026-08-25 CURSOR — Mirror 2026-08-23 full-stack review onto git effort log
+
+Live review already filed on THE BOARD + GH #2180–#2187.  This lane only
+mirrors the Planned children row into `docs/EFFORT-LOG.md` so cloud seats
+see it.  No product code.  Receipt:
+`docs/rollouts/2026-08-25-review-effort-log-mirror.md`.
 
 ## 2026-08-22 GROK — Disclaimer under title, cold-start 3s
 
@@ -310,9 +478,9 @@ blocked by Apple on this first version.  Did not touch Guideline 2.1
 Resolution Center (`37412b30`).  Receipt:
 `docs/rollouts/2026-08-16-asc-eula-100.md`.
 
-## 2026-08-16 GROK — Health + Infisical shared-only AGENT_SYNC
+## 2026-08-16 GROK — Health + Infisical shared-only AG***_S**C
 
-`AGENT_SYNC_TOKEN` / `AGENT_SYNC_POST_TOKEN` live only in Infisical
+`AG***_S**C_TOKEN` / `AG***_S**C_POST_TOKEN` live only in Infisical
 shared-at-ct.  Deleted the copies that had been written onto the ST and
 CT app projects during the 2026-08-14 rotation.  `GET /api/health` now
 publishes `checks.secrets` (source names and counts, never values).
@@ -320,7 +488,7 @@ Public `/api/health` is HTTP 200 on live sha `a50c09e5` (PR #1885
 merged + Coolify auto-deploy).  `checks.secrets`: shared ok/65, app
 ok/145, cacheReady, 0 errors, no values.  Pipeline `status:stalled`
 is the existing autopilot/senate halt, not this change.  Owner: paste
-`CT_ADMIN_TOKEN` from `~/.secrets/global-api-keys` into the
+`CT_ADMIN_TOKEN` (via `fleet-secrets get CT_ADMIN_TOKEN`) into the
 congress.trade admin UI localStorage (do not paste into chat).
 
 ## 2026-08-15 GROK — Trends layout, Directory pager, Khanna recent dates
@@ -355,7 +523,7 @@ capped and now use two spaces; they do not name chambers.  Version remains
 `PREPARE_FOR_SUBMISSION`, not submitted.  Receipt:
 `docs/rollouts/2026-08-14-asc-listing-copy.md`.
 
-Fleet rule strengthened in `~/apps/AGENT-SYNC.md` § Two spaces (all agents,
+Fleet rule strengthened in `~/apps/AG***-S**C.md` § Two spaces (all agents,
 all surfaces, including review notes).
 
 ## 2026-08-14 GROK — App Store 1.0 now has TestFlight 1.0.14 attached
@@ -677,7 +845,7 @@ Last updated: 2026-07-24 (CURSOR)
   on `/api/*`, Infisical single-source config + `GET /api/admin/config-sources`),
   then PR #308 (`b8ce1b4`) made the workerd/Miniflare D1 suite probe-and-skip
   on the deploy runner (its container cannot spawn workerd; failed the gate
-  2×) and set CLAUDE.md defaults (agent-sync coordination + effort-log updates
+  2×) and set CLAUDE.md defaults (ag***-s**c coordination + effort-log updates
   by default). `deploy.yml` run **29177444399 succeeded** on `b8ce1b4`.
 - **Verified live**: all served script blocks parse; `/api/health`
   ok/db/schema true; scoreboard + Alerts tab render with real probe data

@@ -10,6 +10,7 @@ import {
   APNS_FANOUT_TRADE_SQL,
   apnsLaneErrorIsRecent,
   fanOutApnsProductEvents,
+  officialFilingPushData,
   inspectApnsFanoutDiagnostics,
   probeApnsPendingEvents,
   readApnsFanoutLastError,
@@ -460,7 +461,8 @@ describe('fanOutApnsProductEvents', () => {
 describe('probeApnsPendingEvents', () => {
   it('drives from delivery_outbox, not an unindexed transactions.created_at scan', () => {
     expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/FROM delivery_outbox o/i);
-    expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/WHERE EXISTS/i);
+    expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/AND EXISTS/i);
+    expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/o\.status != 'suppressed'/);
     expect(APNS_FANOUT_TRADE_PENDING_SQL).toMatch(/t\.id = o\.tx_id/i);
     expect(APNS_FANOUT_TRADE_PENDING_SQL).not.toMatch(/ORDER BY t\.created_at/i);
   });
@@ -618,6 +620,23 @@ function alertFrom(req: ApnsHttpRequest): { title: string; body: string } {
   return (JSON.parse(req.body) as { aps: { alert: { title: string; body: string } } }).aps.alert;
 }
 
+describe('officialFilingPushData', () => {
+  it('sends snake_case aliases the shipped iOS AppDelegate already reads', () => {
+    expect(officialFilingPushData([
+      { id: 'tx_1', doc_id: 'H-1', ticker: 'NVDA' },
+      { id: 'tx_2', doc_id: 'H-1', ticker: 'AAPL' },
+    ])).toEqual({
+      kind: 'official_filing',
+      docId: 'H-1',
+      doc_id: 'H-1',
+      txIds: ['tx_1', 'tx_2'],
+      tradeId: 'tx_1',
+      trade_id: 'tx_1',
+      tickers: ['NVDA', 'AAPL'],
+    });
+  });
+});
+
 describe('fanOutApnsProductEvents targeting', () => {
   it('collapses two trades on one filing into a single digest', async () => {
     const env = mockEnv({
@@ -670,6 +689,13 @@ describe('fanOutApnsProductEvents targeting', () => {
       title: "Nancy Pelosi, Representative from California's 11th District",
       body: 'Filed 2 trades (1 buy, 1 sell).',
     });
+    const payload = JSON.parse(calls[0]!.body) as Record<string, unknown>;
+    expect(payload.doc_id).toBe('H-1');
+    expect(payload.docId).toBe('H-1');
+    expect(payload.trade_id).toBe('tx_1');
+    expect(payload.tradeId).toBe('tx_1');
+    expect(payload.txIds).toEqual(['tx_1', 'tx_2']);
+    expect(payload.kind).toBe('official_filing');
   });
 
   it('does not push when the account chose Off', async () => {

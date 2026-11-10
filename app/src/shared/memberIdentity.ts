@@ -74,6 +74,12 @@ export const MEMBER_NAME_ALIASES: readonly MemberNameAlias[] = [
     canonicalName: 'Jim Justice',
     aliases: ['james conley justice', 'justice ii james conley', 'justice james conley'],
   },
+  {
+    // FL-27 House: competitor backfill sources sometimes truncate her surname
+    // to "Maria Elvira". Official full is "Maria Elvira Salazar".
+    canonicalName: 'Maria Elvira Salazar',
+    aliases: ['maria elvira', 'elvira maria'],
+  },
 ];
 
 /**
@@ -126,6 +132,20 @@ export const MEMBER_FILER_MERGES: readonly MemberFilerMerge[] = [
     aliasIds: [
       'MANUAL-FACS',
       'MANUAL-',
+    ],
+  },
+  {
+    // FL-27 House: Rep. Maria Elvira Salazar
+    canonicalId: 'house-fl27-maria-elvira-salazar',
+    canonicalName: 'Maria Elvira Salazar',
+    chamber: 'house',
+    state: 'FL',
+    district: '27',
+    resolvedBioguideId: 'S000168',
+    aliasIds: [
+      'MANUAL-ELVIRA',
+      'MANUAL-MARIA-ELVIRA',
+      'house-fl27-maria-elvira',
     ],
   },
 ];

@@ -231,12 +231,25 @@ APP_BASE_URL=""
 # Throttled to at most one alert per 12h.
 ALERT_EMAIL=""
 
-# Sentry error monitoring (Cloudflare Workers SDK).
-# Get this from Sentry → Projects → congress-trade → Settings → Client Keys (DSN).
+# Sentry error monitoring (@sentry/deno). Production DSN lives in Infisical /
+# Coolify only — never commit a live value. Leave blank locally (SDK no-ops).
 SENTRY_DSN=""
 # Tags events/logs with this environment. Defaults to unset in local dev; the
 # production/preview values are already set as wrangler.toml [vars].
 SENTRY_ENVIRONMENT="development"
+
+# Datadog (existing fleet account).  Leave blank locally — missing/partial
+# keys fail closed (no send).  Coolify / Infisical names:
+#   DD_API_KEY + DD_SITE          backend logs + APM (required together)
+#   DD_APP_KEY                    unused for send; fleet registry only
+#   DD_CLIENT_TOKEN               public RUM client token
+#   DD_APPLICATION_ID             public RUM application id
+# Aliases: DD_RUM_*, NEXT_PUBLIC_DD_*
+DD_API_KEY=""
+DD_APP_KEY=""
+DD_SITE=""
+DD_CLIENT_TOKEN=""
+DD_APPLICATION_ID=""
 
 # Billing (Stripe) — freemium paywall. Premium unlocks full history + CSV export.
 #   - STRIPE_SECRET_KEY: sk_live_… / sk_test_… (enables billing; absent => 503)

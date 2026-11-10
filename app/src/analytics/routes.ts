@@ -54,6 +54,9 @@ import {
   buildMemberPerformanceQuery,
   buildMemberStatsQuery,
   buildTickerBacktestCohortQuery,
+  buildBacktestPriceQuery,
+  buildBacktestSpxQuery,
+  buildPricedDaysCountQuery,
   buildMemberTopTickersQuery,
   buildMemberRecentTradesQuery,
   buildPartySplitQuery,
@@ -88,6 +91,7 @@ import {
 import { committeeConflict } from './conflicts.ts';
 import { computePerformance } from '../prices/compute.ts';
 import { latestSpxClose } from '../prices/service.ts';
+import { currentPriceFreshThrough, evaluateCurrentPriceStaleness } from '../prices/staleness.ts';
 import {
   getDisclosureLatencySummary,
   isLatencyComparisonPublic,
@@ -267,6 +271,28 @@ function meta(f: CommonQuery, extra: Record<string, unknown> = {}): Record<strin
 export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
 
+  // CT-2418: every route in this router is public and user-independent (the
+  // router is mounted bare at /api/analytics with no auth middleware), and every
+  // one of them already wraps its work in the server-side `cached()` KV helper.
+  // They just never told Cloudflare, so none of them could ever be served from
+  // the edge and each one re-hit the origin on every repeat view.
+  //
+  // s-maxage=300 / stale-while-revalidate=600 matches PUBLIC_STABLE_CACHE in
+  // delivery/rest.ts, the policy already applied to /api/market/*. Cloudflare's
+  // cache key includes the path, so ?ticker= style path params key naturally and
+  // one entity's response can never be served for another's URL.
+  //
+  // Only sets the header when a route has not already chosen its own, so
+  // /latency-summary keeps its explicit `public, max-age=300`.
+  r.use('*', async (c, next) => {
+    await next();
+    if (c.req.method === 'GET' && c.res.status === 200) {
+      if (!c.res.headers.has('Cache-Control')) {
+        c.res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
+      }
+    }
+  });
+
   // --- GET /summary -------------------------------------------------------
   r.get('/summary', async (c) => {
     const f = commonFromQuery(c.req.query());
@@ -289,6 +315,18 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         dollarsExcludeOptions: true,
         resolvedTickerPct:
           totalTrades > 0 ? round(num(row.resolved_ticker_count) / totalTrades, 4) : null,
+        // Equity-like denominator (public_equity + still-unknown types) so rows that
+        // are probably equities but carry no ticker keep the gap visible.
+        resolvedEquityTickerPct:
+          num(row.equity_like_trade_count) > 0
+            ? round(num(row.resolved_equity_like_ticker_count) / num(row.equity_like_trade_count), 4)
+            : null,
+        equityLikeTradeCount: num(row.equity_like_trade_count),
+        // The narrow, pre-2026-09 definition: only rows already typed public_equity.
+        resolvedPublicEquityTickerPct:
+          num(row.equity_trade_count) > 0
+            ? round(num(row.resolved_equity_ticker_count) / num(row.equity_trade_count), 4)
+            : null,
         netSentiment: netSentiment(buyCount, sellCount),
       });
     });
@@ -432,7 +470,10 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       const memberSkill = new Map<string, { scored: number; wins: number; avgExcess: number }>();
       await Promise.all(
         chunk([...allFilers], D1_IN_CHUNK).map((batch) => {
-          const sq = buildMemberSkillQuery(batch, f);
+          const sq = buildMemberSkillQuery(batch, {
+            ...f,
+            priceFreshThrough: currentPriceFreshThrough(),
+          });
           return all<Record<string, unknown>>(c.env.DB, sq.sql, sq.params).then((rows) => {
             for (const row of rows) {
               const fid = str(row.filer_id);
@@ -821,7 +862,12 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const minTrades = q.minTrades ? Number(q.minTrades) : undefined;
     const key = cacheKey('member-performance', { ...f, limit, minTrades });
     const data = await cached(c.env, key, 900, async () => {
-      const built = buildMemberPerformanceLeaderboardQuery({ ...f, limit, minTrades });
+      const built = buildMemberPerformanceLeaderboardQuery({
+        ...f,
+        limit,
+        minTrades,
+        priceFreshThrough: currentPriceFreshThrough(),
+      });
       const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
       const members = rows.map((row) => {
         const n = num(row.trade_count);
@@ -848,6 +894,11 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       return meta(f, {
         count: members.length,
         members,
+        // Newest price date behind any ranked member's trades; the board prints "Prices as of".
+        pricesAsOf: rows.reduce<string | null>((best, row) => {
+          const d = str(row.prices_as_of);
+          return d && (!best || d > best) ? d : best;
+        }, null),
         anchor: 'filing_date',
         side: 'buys',
         note: 'Size-weighted average excess return vs S&P 500 from the disclosure date (realizable by a follower), winsorized per-trade at ±200% so one outlier trade cannot dominate; 0% means matched the S&P, +3% means about 3 percentage points better. Buys only, options excluded, public equity only.',
@@ -914,19 +965,29 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const key = cacheKey(`backtest:${tickerParam}`, { ...f, filerId, h: useHorizons.join('-') });
     const data = await cached(c.env, key, 600, async () => {
       const cohortQ = buildTickerBacktestCohortQuery(tickerParam, f, filerId);
-      const [cohortRows, priceAsc, spxAsc] = await Promise.all([
-        all<{ tx_date: string }>(c.env.DB, cohortQ.sql, cohortQ.params),
-        all<PriceBar>(c.env.DB, 'SELECT date, close FROM price_eod WHERE ticker = ? ORDER BY date ASC', [tickerParam]),
-        all<PriceBar>(c.env.DB, 'SELECT date, close FROM spx_eod ORDER BY date ASC'),
-      ]);
+      const cohortRows = await all<{ tx_date: string }>(c.env.DB, cohortQ.sql, cohortQ.params);
       const cohortDates = cohortRows.map((row) => str(row.tx_date)).filter((d): d is string => !!d);
+      // CT-2459: bound both series to the cohort window (see builders).
+      const countQ = buildPricedDaysCountQuery(tickerParam);
+      const pricedDaysRow = await first<{ n: number }>(c.env.DB, countQ.sql, countQ.params);
+      let priceAsc: PriceBar[] = [];
+      let spxAsc: PriceBar[] = [];
+      if (cohortDates.length > 0) {
+        const cohortMin = cohortDates.reduce((a, b) => (b < a ? b : a));
+        const priceQ = buildBacktestPriceQuery(tickerParam, cohortMin);
+        const spxQ = buildBacktestSpxQuery(cohortMin);
+        [priceAsc, spxAsc] = await Promise.all([
+          all<PriceBar>(c.env.DB, priceQ.sql, priceQ.params),
+          all<PriceBar>(c.env.DB, spxQ.sql, spxQ.params),
+        ]);
+      }
       const bt = aggregateTickerBacktest(cohortDates, priceAsc, spxAsc, useHorizons);
       return meta(f, {
         ticker: tickerParam,
         filerId: filerId ?? null,
         txType: 'B',
         totalBuyEvents: bt.tradeCount,
-        pricedDays: priceAsc.length,
+        pricedDays: num(pricedDaysRow?.n),
         horizons: bt.horizons,
       });
     });
@@ -1075,6 +1136,10 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   r.get('/performance/:txId', async (c) => {
     const txId = c.req.param('txId') || '';
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(txId)) return c.json({ error: 'invalid id' }, 400);
+    // CT-2459: this was the one analytics route with no cached() wrapper,
+    // yet a drawer renders it per trade (API-level N+1). Anchors are EOD
+    // prices, so the sibling-standard 600s TTL is safe.
+    const data = await cached(c.env, cacheKey(`performance-v1:${txId}`, {}), 600, async () => {
     const row = await get<Record<string, unknown>>(
       c.env.DB,
       `SELECT t.tx_type, t.is_option, t.ticker, t.tx_date, f.filed_date,
@@ -1087,24 +1152,54 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         WHERE t.id = ?`,
       [txId],
     );
-    if (!row) return c.json({ available: false });
+    if (!row) return { available: false };
     const isOption = num(row.is_option) === 1;
     const priceAtTrade = row.price_at_trade == null ? null : num(row.price_at_trade);
     const currentPrice = row.current_price == null ? null : num(row.current_price);
     const spxAtTrade = row.spx_at_trade == null ? null : num(row.spx_at_trade);
     if (isOption || priceAtTrade == null || currentPrice == null) {
-      return c.json({ available: false, isOption });
+      return { available: false, isOption };
     }
-    const currentSpx = await latestSpxClose(c.env);
+    // The asset's current price is the close on current_price_date, so the S&P's
+    // exit leg is the S&P close on or before that SAME day (board row 6c05e09b).
+    // A missing or old price date is stale and returns before these lookups.
+    // latestSpxClose is only the fallback when that day's S&P bar is absent.
+    const currentPriceDate = str(row.current_price_date);
+    const staleness = evaluateCurrentPriceStaleness(currentPriceDate);
+    // Stale responses drop both performance legs, so skip the S&P lookups.
+    if (staleness.stale) {
+      return {
+        available: true,
+        stale: true,
+        staleDataAgeDays: staleness.dataAgeDays,
+        freshThrough: staleness.freshThrough,
+        txType: str(row.tx_type),
+        ticker: str(row.ticker),
+        txDate: str(row.tx_date),
+        filedDate: str(row.filed_date),
+        priceAtTrade,
+        currentPrice,
+        currentPriceDate,
+        pricesAsOf: currentPriceDate,
+        tradeDatePerformance: null,
+        filingDatePerformance: null,
+        estimatedAmounts: true,
+      };
+    }
+    const currentSpx =
+      (currentPriceDate ? await closeOnOrBefore(c.env, 'spx_eod', currentPriceDate) : null) ??
+      (await latestSpxClose(c.env));
     const perf = computePerformance(priceAtTrade, currentPrice, spxAtTrade, currentSpx);
     const filedDate = str(row.filed_date);
-    const priceAtFiling = await closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker));
-    const spxAtFiling = await closeOnOrBefore(c.env, 'spx_eod', filedDate);
+    const [priceAtFiling, spxAtFiling] = await Promise.all([
+      closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker)),
+      closeOnOrBefore(c.env, 'spx_eod', filedDate),
+    ]);
     const filingPerf =
       priceAtFiling == null || currentSpx == null
         ? null
         : computePerformance(priceAtFiling, currentPrice, spxAtFiling, currentSpx);
-    return c.json({
+    return {
       available: true,
       txType: str(row.tx_type),
       ticker: str(row.ticker),
@@ -1112,13 +1207,17 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       filedDate,
       priceAtTrade,
       currentPrice,
-      currentPriceDate: str(row.current_price_date),
+      currentPriceDate,
+      // Every return on this response ends on this date (asset and S&P alike).
+      pricesAsOf: currentPriceDate,
       ...perf,
       tradeDatePerformance: { priceAt: priceAtTrade, spxAt: spxAtTrade, ...perf },
       filingDatePerformance:
         filingPerf == null ? null : { priceAt: priceAtFiling, spxAt: spxAtFiling, ...filingPerf },
       estimatedAmounts: true,
+    };
     });
+    return c.json(data);
   });
 
   // --- GET /member/:filerId (politician deep dive) -----------------------
@@ -1278,10 +1377,19 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         elapsedDaysSinceFiling:
           row.elapsed_days_since_filing == null ? null : num(row.elapsed_days_since_filing),
         estVolume: row.est_volume == null ? null : num(row.est_volume),
+        currentPriceDate: str(row.current_price_date),
+        spxNow: row.spx_now == null ? null : num(row.spx_now),
       }));
-      const dual = aggregateMemberDualPerformance(perfRows, currentSpx);
+      const freshThrough = currentPriceFreshThrough();
+      const dual = aggregateMemberDualPerformance(perfRows, currentSpx, { priceFreshThrough: freshThrough });
       return meta(f, {
         filerId: txFilerId,
+        priceFreshThrough: freshThrough,
+        // Newest price date behind any scored trade: the drawer prints "Prices as of".
+        pricesAsOf: perfRows.reduce<string | null>(
+          (best, r) => (r.currentPriceDate && (!best || r.currentPriceDate > best) ? r.currentPriceDate : best),
+          null,
+        ),
         side: dual.side,
         buyCount: dual.buyCount,
         tradeDate: dual.tradeDate,
@@ -1308,9 +1416,17 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const limit = Math.max(1, Math.min(500, Math.floor(Number(q.limit) || 100)));
     const key = cacheKey('conflicts', { ...f, limit });
     const data = await cached(c.env, key, 900, async () => {
-      const built = buildConflictCandidatesQuery({ ...f, limit: 2000 });
-      const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
+      // CT-2459: page candidates instead of always fetching the full
+      // 2000-row window and JS-filtering — when conflicts are dense in the
+      // newest rows the first page already fills the caller's limit. Same
+      // 2000-candidate scan cap as before.
+      const PAGE = 500;
+      const MAX_SCANNED = 2000;
       const conflicts: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < MAX_SCANNED && conflicts.length < limit; offset += PAGE) {
+      const built = buildConflictCandidatesQuery({ ...f, limit: PAGE, offset });
+      const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
+      if (rows.length === 0) break;
       for (const row of rows) {
         const committees = parseCommitteeNames(row.committees);
         const m = committeeConflict(committees, str(row.sector));
@@ -1329,6 +1445,8 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           estAmountUsd: usd(bracketMidpoint(num(row.amount_min) || null, num(row.amount_max) || null)),
         });
         if (conflicts.length >= limit) break;
+      }
+      if (rows.length < PAGE) break;
       }
       return meta(f, { count: conflicts.length, conflicts });
     });

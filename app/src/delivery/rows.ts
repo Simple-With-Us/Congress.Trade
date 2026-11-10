@@ -20,7 +20,7 @@ import type {
   TxSource,
   TxType,
 } from '../shared/types.ts';
-import { first, get, parseJson, toBool } from '../shared/db.ts';
+import { all, first, get, parseJson, toBool } from '../shared/db.ts';
 import type { StockActStatus } from '../shared/stockAct.ts';
 import {
   canonicalAssetTypeCategorySql,
@@ -107,6 +107,17 @@ export interface FeedTransactionRow extends TransactionRow {
   ref_country?: string | null;
   ref_exchange_short?: string | null;
   ref_asset_class?: string | null;
+  /** Present only when the feed SELECT aliases `fl.party`.  SSE/CSV omit it. */
+  filer_party?: string | null;
+  price_at_trade?: number | null;
+  spx_at_trade?: number | null;
+  price_at_filing?: number | null;
+  spx_at_filing?: number | null;
+  latency_provider?: string | null;
+  latency_observed_at?: string | null;
+  latency_provider_published_at?: string | null;
+  latency_congress_first_seen_at?: string | null;
+  latency_status?: string | null;
 }
 
 export interface SubscriptionRow {
@@ -199,6 +210,7 @@ export function mapTransaction(row: TransactionRow): Transaction {
   return sanitizeCompetitorPublication({
     ...transaction,
     filedDate: row.filed_date ?? null,
+    firstSeenAt: tradeLearnedAt(row.first_seen_at, row.created_at, row.tx_date),
   });
 }
 
@@ -208,6 +220,61 @@ export function mapTransaction(row: TransactionRow): Transaction {
  * mapTransaction so the webhook/normalizer paths (which never join filers) are
  * unaffected.
  */
+function selectedNumber(row: object, key: string): number | null | undefined {
+  if (!Object.prototype.hasOwnProperty.call(row, key)) return undefined;
+  const value = (row as Record<string, unknown>)[key];
+  if (value == null || value === '') return null;
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Later minus earlier, in seconds.  Same rounding as admin disclosure-latency. */
+function deltaSeconds(later: string | null, earlier: string | null): number | null {
+  if (!later || !earlier) return null;
+  const a = Date.parse(later);
+  const b = Date.parse(earlier);
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.round((a - b) / 1000) : null;
+}
+
+const LATENCY_ROW_KEYS = [
+  'latency_provider',
+  'latency_observed_at',
+  'latency_provider_published_at',
+  'latency_congress_first_seen_at',
+  'latency_status',
+] as const;
+
+/**
+ * One latency object, or null when the columns were selected and every one is
+ * null.  Undefined when this query did not select the latency columns.
+ */
+function feedLatency(row: FeedTransactionRow): Transaction['latency'] {
+  if (!LATENCY_ROW_KEYS.some((key) => Object.prototype.hasOwnProperty.call(row, key))) return undefined;
+  const provider = row.latency_provider ?? null;
+  const observedAt = row.latency_observed_at ?? null;
+  const providerPublishedAt = row.latency_provider_published_at ?? null;
+  const congressFirstSeenAt = row.latency_congress_first_seen_at ?? null;
+  const status = row.latency_status ?? null;
+  if (
+    provider == null &&
+    observedAt == null &&
+    providerPublishedAt == null &&
+    congressFirstSeenAt == null &&
+    status == null
+  ) {
+    return null;
+  }
+  return {
+    provider,
+    observedAt,
+    providerPublishedAt,
+    congressFirstSeenAt,
+    providerDeltaSec: deltaSeconds(observedAt, congressFirstSeenAt),
+    providerPublishedDeltaSec: deltaSeconds(providerPublishedAt, congressFirstSeenAt),
+    status,
+  };
+}
+
 export function mapFeedTransaction(row: FeedTransactionRow): Transaction {
   const transaction = mapTransaction(row);
 
@@ -219,7 +286,7 @@ export function mapFeedTransaction(row: FeedTransactionRow): Transaction {
   transaction.assetName =
     resolveAssetDisplayName(row.asset_name, row.ticker, row.ref_company_name) || transaction.assetName;
 
-  return sanitizeCompetitorPublication({
+  const mapped = sanitizeCompetitorPublication({
     ...transaction,
     fullName: row.filer_full_name ? (cleanFilerName(row.filer_full_name) || row.filer_full_name) : null,
     state: row.filer_state,
@@ -252,6 +319,20 @@ export function mapFeedTransaction(row: FeedTransactionRow): Transaction {
     refExchangeShort: row.ref_exchange_short,
     refAssetClass: row.ref_asset_class,
   });
+  if (Object.prototype.hasOwnProperty.call(row, 'filer_party')) {
+    mapped.party = row.filer_party ?? null;
+  }
+  const priceAtTrade = selectedNumber(row, 'price_at_trade');
+  const spxAtTrade = selectedNumber(row, 'spx_at_trade');
+  const priceAtFiling = selectedNumber(row, 'price_at_filing');
+  const spxAtFiling = selectedNumber(row, 'spx_at_filing');
+  if (priceAtTrade !== undefined) mapped.priceAtTrade = priceAtTrade;
+  if (spxAtTrade !== undefined) mapped.spxAtTrade = spxAtTrade;
+  if (priceAtFiling !== undefined) mapped.priceAtFiling = priceAtFiling;
+  if (spxAtFiling !== undefined) mapped.spxAtFiling = spxAtFiling;
+  const latency = feedLatency(row);
+  if (latency !== undefined) mapped.latency = latency;
+  return mapped;
 }
 
 export function mapSubscription(row: SubscriptionRow): Subscription {
@@ -364,6 +445,88 @@ export async function resolveMemberFilerId(env: Env, memberName: string): Promis
   return row?.bioguide_id ?? null;
 }
 
+/** One `filers` row a free-text member name could refer to (see {@link findMemberCandidates}). */
+export interface MemberCandidate {
+  /** Canonical filer id: `COALESCE(merged_into, bioguide_id)`. */
+  filerId: string;
+  name: string | null;
+  /** The name equals the filer's full/display name (case-insensitive) rather than merely containing it. */
+  exact: boolean;
+  /** The canonical filer has at least one live (non-deprecated) transaction. */
+  live: boolean;
+}
+
+/**
+ * Every filer a free-text member name could mean, best first: exact name
+ * matches, then filers with live transactions, then name.  Same WHERE clause as
+ * {@link resolveMemberFilerId}, but it returns several rows so a caller that
+ * must not guess (subscription filters) can tell "one person" from "several".
+ */
+export async function findMemberCandidates(
+  env: Env,
+  memberName: string,
+  limit = 25,
+): Promise<MemberCandidate[]> {
+  const term = memberName.trim();
+  if (!term) return [];
+  const like = `%${escapeLikePattern(term.toLowerCase())}%`;
+  const rows = await all<{ filer_id: string; name: string | null; is_exact: number; is_live: number }>(
+    env.DB,
+    `SELECT COALESCE(f.merged_into, f.bioguide_id) AS filer_id,
+            COALESCE(cf.display_name, cf.full_name, f.display_name, f.full_name) AS name,
+            CASE WHEN LOWER(f.full_name) = LOWER(?) OR LOWER(f.display_name) = LOWER(?) THEN 1 ELSE 0 END AS is_exact,
+            EXISTS(SELECT 1 FROM transactions t
+                    WHERE t.filer_id IN (f.bioguide_id, COALESCE(f.merged_into, f.bioguide_id))
+                      AND t.deprecated_at IS NULL) AS is_live
+       FROM filers f
+       LEFT JOIN filers cf ON cf.bioguide_id = f.merged_into
+      WHERE LOWER(f.full_name) = LOWER(?) OR LOWER(f.full_name) LIKE ? ESCAPE '\\'
+         OR LOWER(f.display_name) = LOWER(?) OR LOWER(f.display_name) LIKE ? ESCAPE '\\'
+      ORDER BY is_exact DESC, is_live DESC, f.full_name
+      LIMIT ?`,
+    [term, term, term, like, term, like, limit],
+  );
+  return rows.map((row) => ({
+    filerId: row.filer_id,
+    name: row.name ? (cleanFilerName(row.name) || row.name) : null,
+    exact: Number(row.is_exact) === 1,
+    live: Number(row.is_live) === 1,
+  }));
+}
+
+export type MemberPick =
+  | { kind: 'match'; filerId: string; name: string | null }
+  | { kind: 'none' }
+  | { kind: 'ambiguous'; candidates: Array<{ filerId: string; name: string | null }> };
+
+/**
+ * Decide whether a name identifies exactly one member.  Duplicate rows of one
+ * canonical filer (an alias tombstone plus its survivor) collapse first; then
+ * exact-name matches win over substring matches, and filers with live trades win
+ * over dormant duplicates (the "Shelley M Capito" seed row).  If more than one
+ * person is still left, the name is ambiguous — never guess.
+ */
+export function pickMemberCandidate(candidates: MemberCandidate[]): MemberPick {
+  const byId = new Map<string, MemberCandidate>();
+  for (const cand of candidates) {
+    const prev = byId.get(cand.filerId);
+    byId.set(
+      cand.filerId,
+      prev
+        ? { ...prev, name: prev.name ?? cand.name, exact: prev.exact || cand.exact, live: prev.live || cand.live }
+        : cand,
+    );
+  }
+  let pool = [...byId.values()];
+  if (pool.length === 0) return { kind: 'none' };
+  const exact = pool.filter((cand) => cand.exact);
+  if (exact.length > 0) pool = exact;
+  const live = pool.filter((cand) => cand.live);
+  if (live.length > 0) pool = live;
+  if (pool.length === 1) return { kind: 'match', filerId: pool[0].filerId, name: pool[0].name };
+  return { kind: 'ambiguous', candidates: pool.map(({ filerId, name }) => ({ filerId, name })) };
+}
+
 // ---------------------------------------------------------------------------
 // Transactions query builder (the REST `?since=` cursor backstop)
 // ---------------------------------------------------------------------------
@@ -404,10 +567,12 @@ export interface TxQueryParams {
    * Multi-select party-bucket filter (D/R/O, bucketed from `filers.party` by
    * first letter — same bucketing as PARTY_BUCKET_SQL in analytics/sql.ts,
    * duplicated locally in {@link PARTY_BUCKET_SQL_LOCAL} so this module stays
-   * dependency-free). ABSENT/empty means no party filter (all parties,
-   * including rows with unknown party). Exposed on the public feed as
-   * `?party=D,R` — the same param shape the Trends analytics endpoints
-   * already accept, so a party chip selection filters both tabs identically.
+   * dependency-free). `O` is "Other / No party": Independents, minor parties
+   * AND rows whose filer has no party on file, so D + R + O always equals the
+   * unfiltered result. ABSENT/empty means no party filter. Exposed on the
+   * public feed as `?party=D,R` — the same param shape the Trends analytics
+   * endpoints already accept, so a party chip selection filters both tabs
+   * identically.
    */
   partyBuckets?: Array<'D' | 'R' | 'O'>;
   type?: TxType;
@@ -471,6 +636,8 @@ export interface TxQueryParams {
    * Sort expression for snapshot reads. Defaults to cursor_seq so incremental
    * consumers keep the forward-cursor contract; the public UI can request
    * `published` to sort by filing/import time instead of insertion order.
+   * `order=desc` with no explicit sort uses {@link NEWEST_SNAPSHOT_ORDER_SQL}
+   * so a historical backfill cannot occupy page 1 (#2180).
    */
   sort?: 'cursor' | 'published' | 'tx_date';
   /**
@@ -574,20 +741,50 @@ const REF_SELECT =
   'sr.market_cap_bucket AS ref_market_cap_bucket, sr.country AS ref_country, ' +
   'sr.exchange_short AS ref_exchange_short, sr.asset_class AS ref_asset_class, ';
 
+/** Price anchors plus one latency candidate.  Outer feed SELECT only. */
+const FEED_ENRICH_SELECT =
+  'txp.price_at_trade AS price_at_trade, txp.spx_at_trade AS spx_at_trade, ' +
+  'txp.price_at_filing AS price_at_filing, txp.spx_at_filing AS spx_at_filing, ' +
+  'tlc.provider AS latency_provider, tlc.provider_first_seen_at AS latency_observed_at, ' +
+  'tlc.provider_published_at AS latency_provider_published_at, ' +
+  'tlc.congress_first_seen_at AS latency_congress_first_seen_at, tlc.status AS latency_status ';
+
+/**
+ * Left joins after the page is already limited.  tx_performance is 1:1 on tx_id.
+ * The latency join is one row: correlated LIMIT 1 on rowid, preferring status
+ * `matched`, then the earliest provider_first_seen_at.  A miss leaves the
+ * latency columns NULL and does not multiply feed rows.
+ */
+const FEED_ENRICH_JOINS =
+  'LEFT JOIN tx_performance txp ON txp.tx_id = t.id ' +
+  'LEFT JOIN trade_latency_candidates tlc ON tlc.rowid = (' +
+  'SELECT c.rowid FROM trade_latency_candidates c ' +
+  'WHERE c.doc_id = t.doc_id ' +
+  "AND c.status = 'matched' " +
+  "AND (c.ticker IS NULL OR c.ticker = '' OR UPPER(c.ticker) = UPPER(COALESCE(t.ticker, ''))) " +
+  "AND (c.tx_date IS NULL OR c.tx_date = '' OR c.tx_date = t.tx_date) " +
+  "AND (c.tx_type IS NULL OR c.tx_type = '' OR c.tx_type = t.tx_type) " +
+  "ORDER BY CASE WHEN c.status = 'matched' THEN 0 ELSE 1 END, " +
+  "CASE WHEN c.provider_first_seen_at IS NULL OR c.provider_first_seen_at = '' THEN 1 ELSE 0 END, " +
+  'c.provider_first_seen_at, c.provider LIMIT 1) ';
+
 /** SQL expression resolving the chamber, preferring the filers table. */
 const CHAMBER_EXPR = 'COALESCE(fl.chamber, f.chamber)';
 
 /**
- * Party bucketed to 'D' | 'R' | 'O' by first letter; unknown stays NULL.
+ * Party bucketed to 'D' | 'R' | 'O' by first letter.  Total: anything that is
+ * not D or R (Independent, minor parties, empty/NULL party, or a transaction
+ * whose filer has no `filers` row) is 'O' ("Other / No party"), never NULL, so
+ * the three buckets partition the feed and `party=D,R,O` equals no filter.
  * Mirrors PARTY_BUCKET_SQL in analytics/sql.ts — duplicated (not imported) so
  * this module stays dependency-free/independently testable, matching this
- * file's existing convention of each surface owning its own filter SQL.
+ * file's existing convention of each surface owning its own filter SQL.  The
+ * two strings are asserted identical in analytics/__tests__/partyPartition.test.ts.
  */
-const PARTY_BUCKET_SQL_LOCAL =
+export const PARTY_BUCKET_SQL_LOCAL =
   "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' " +
   "WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' " +
-  "WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) IN ('I', 'O') THEN 'O' " +
-  'ELSE NULL END)';
+  "ELSE 'O' END)";
 
 /**
  * Canonical instrument-category expression over the transaction row itself
@@ -812,6 +1009,16 @@ export function buildTxFilters(
 }
 
 /**
+ * Newest-first snapshot order for `order=desc` when the caller did not pick
+ * `sort=cursor` / `sort=tx_date` / `sort=published`.  Uses columns that live
+ * on `transactions` so {@link canNestTransactionKeyset} stays true (no
+ * filings join before LIMIT).  A 2024 backfill with a high ingest cursor
+ * cannot outrank a later-seen 2026 row (#2180).
+ */
+export const NEWEST_SNAPSHOT_ORDER_SQL =
+  'COALESCE(t.first_seen_at, t.filed_date, t.tx_date, t.cursor_seq)';
+
+/**
  * True when the feed WHERE/ORDER only touch `transactions` columns (plus the
  * always-on deprecated_at filter). In that case we can keyset+LIMIT first and
  * join filers/filings/securities_ref afterwards — Turso was reading ~20k+ rows
@@ -834,8 +1041,9 @@ function canNestTransactionKeyset(p: TxQueryParams): boolean {
 /**
  * Build the parameterized SQL for `GET /transactions`. Orders by cursor_seq
  * ASC by default (so callers can use the max returned cursor to page forward),
- * or DESC when `order: 'desc'` for a newest-first snapshot; always returns only
- * rows with cursor_seq > since (the reconciliation backstop).
+ * or by {@link NEWEST_SNAPSHOT_ORDER_SQL} DESC when `order: 'desc'` with no
+ * explicit sort (a newest-first snapshot that is not ingest-cursor order).
+ * Always returns only rows with cursor_seq > since (the reconciliation backstop).
  *
  * `chamber` is resolved via the `filers` table (authoritative for seed data),
  * falling back to the owning filing's chamber. The politician's full name and
@@ -860,24 +1068,32 @@ export function buildTransactionsQuery(p: TxQueryParams): BuiltQuery {
 
   // Closed enum -> only the literal 'ASC'/'DESC' is interpolated, never caller
   // text. ASC stays the default to keep the forward-cursor paging contract.
+  // DESC without an explicit sort is a "latest trades" snapshot: order by
+  // when we learned / when it was filed / the trade date, not ingest cursor.
+  // `sort=cursor` keeps the old ingest-newest behavior for callers that want it.
   const direction = p.order === 'desc' ? 'DESC' : 'ASC';
   const orderExpr =
     p.sort === 'published'
       ? 'COALESCE(f.first_seen_at, f.filed_date, t.created_at, t.cursor_seq)'
       : p.sort === 'tx_date'
         ? 't.tx_date'
-        : 't.cursor_seq';
+        : p.sort === 'cursor'
+          ? 't.cursor_seq'
+          : p.order === 'desc'
+            ? NEWEST_SNAPSHOT_ORDER_SQL
+            : 't.cursor_seq';
   const orderClause =
     orderExpr === 't.cursor_seq'
       ? `t.cursor_seq ${direction}`
       : `${orderExpr} ${direction}, t.cursor_seq ${direction}`;
 
   const selectList =
-    `SELECT t.*, ${CHAMBER_EXPR} AS __chamber, COALESCE(fl.display_name, fl.full_name) AS __member_name, fl.party AS __party, ` +
+    `SELECT t.*, ${CHAMBER_EXPR} AS __chamber, COALESCE(fl.display_name, fl.full_name) AS __member_name, fl.party AS __party, fl.party AS filer_party, ` +
     'COALESCE(fl.display_name, fl.full_name) AS filer_full_name, fl.state AS filer_state, ' +
     'fl.photo_url AS filer_photo_url, fl.resolved_bioguide_id AS filer_bioguide_id, ' +
     REF_SELECT +
-    'f.filed_date AS filing_filed_date, f.first_seen_at AS filing_first_seen_at, f.source_url AS filing_source_url, f.raw_object_key AS filing_raw_object_key ';
+    'f.filed_date AS filing_filed_date, f.first_seen_at AS filing_first_seen_at, f.source_url AS filing_source_url, f.raw_object_key AS filing_raw_object_key, ' +
+    FEED_ENRICH_SELECT;
 
   const pageLimitClause =
     `LIMIT ${limit}` + (offset > 0 ? ` OFFSET ${offset}` : '');
@@ -905,25 +1121,37 @@ export function buildTransactionsQuery(p: TxQueryParams): BuiltQuery {
       ') t ' +
       'LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id ' +
       'LEFT JOIN filings f ON f.doc_id = t.doc_id ' +
-      'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker';
+      'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
+      FEED_ENRICH_JOINS;
     return { sql, params, limit, offset };
   }
 
   const sql =
     selectList +
     'FROM (' +
-    'SELECT t.* ' +
+    // The page LIMIT below must apply BEFORE the enrichment joins: the latency
+    // join carries a correlated subquery, and evaluating it once per page row
+    // (<= limit) instead of once per candidate row (up to ~8800 on deep pages)
+    // is the difference between a bounded lookup and a full candidate scan.
+    // The middle ORDER BY re-applies the page order after twin-dedupe; it
+    // sorts on a projected __sort_key because the sort expression can
+    // reference the filings join, which is not in scope at this level.
+    'SELECT t.* FROM (' +
+    'SELECT t.*, ' +
+    `(${orderExpr}) AS __sort_key ` +
     TX_FROM_JOINS_LITE +
     `WHERE ${cheapWhere} ` +
     `ORDER BY ${orderClause} ` +
     `LIMIT ${candidateLimit}` +
     ') t ' +
+    `WHERE ${TWIN_DEDUPE_SQL} ` +
+    `ORDER BY __sort_key ${direction}, t.cursor_seq ${direction} ` +
+    pageLimitClause +
+    ') t ' +
     'LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id ' +
     'LEFT JOIN filings f ON f.doc_id = t.doc_id ' +
     'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    `WHERE ${TWIN_DEDUPE_SQL} ` +
-    `ORDER BY ${orderClause} ` +
-    pageLimitClause;
+    FEED_ENRICH_JOINS;
 
   return { sql, params, limit, offset };
 }
@@ -996,7 +1224,59 @@ export function buildTransactionsExportQuery(
     'f.filed_date AS filing_filed_date, f.first_seen_at AS filing_first_seen_at, f.source_url AS filing_source_url ' +
     TX_FROM_JOINS +
     (where.length ? `WHERE ${where.join(' AND ')} ` : '') +
-    'ORDER BY t.cursor_seq DESC' +
+    `ORDER BY ${NEWEST_SNAPSHOT_ORDER_SQL} DESC, t.cursor_seq DESC` +
     (hasLimit ? ` LIMIT ${limit}` : '');
   return { sql, params, limit, offset: 0 };
+}
+
+/** Rows per streamed CSV batch. Bounds export memory to one batch of rows
+ *  plus its serialized lines instead of the full match set three times over. */
+export const EXPORT_BATCH_SIZE = 1000;
+
+/**
+ * COUNT companion for the CSV export, using the SAME filters as
+ * buildTransactionsExportQuery — including source-twin dedupe, unlike the
+ * feed count (#2062) — so a pre-count taken before streaming honestly
+ * predicts the number of rows the export emits (X-Export-Row-Count).
+ * Joins-lite: no filter references securities_ref.
+ */
+export function buildTransactionsExportCountQuery(
+  p: TxQueryParams,
+): { sql: string; params: Array<string | number> } {
+  const { where, params } = buildTxFilters(p, false);
+  const sql =
+    'SELECT COUNT(*) AS total ' +
+    TX_FROM_JOINS_LITE +
+    (where.length ? `WHERE ${where.join(' AND ')}` : '');
+  return { sql, params };
+}
+
+/**
+ * One bounded batch of the export set, in the export's exact order.
+ * OFFSET paging (not a cursor keyset): the export order is the newest-first
+ * snapshot expression COALESCE(first_seen_at, filed_date, tx_date,
+ * cursor_seq), which has no single stable scalar key to keyset on without
+ * changing which rows sort where. OFFSET preserves the set and order
+ * exactly; the batch size bounds memory, which is the defect being fixed.
+ */
+export function buildTransactionsExportBatchQuery(
+  p: TxQueryParams,
+  batchSize: number,
+  offset: number,
+): BuiltQuery {
+  const size =
+    Number.isFinite(batchSize) && Math.floor(Number(batchSize)) > 0
+      ? Math.floor(Number(batchSize))
+      : EXPORT_BATCH_SIZE;
+  const off =
+    Number.isFinite(offset) && Math.floor(Number(offset)) > 0
+      ? Math.floor(Number(offset))
+      : 0;
+  const built = buildTransactionsExportQuery(p, size);
+  return {
+    sql: built.sql + (off > 0 ? ` OFFSET ${off}` : ''),
+    params: built.params,
+    limit: size,
+    offset: off,
+  };
 }

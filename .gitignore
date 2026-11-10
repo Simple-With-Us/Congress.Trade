@@ -37,6 +37,7 @@ ptr_state/
 prod.env
 
 # Temp / scratch
+filed_date_week_latency.ts
 *.tmp.json
 *.log
 .__probe
@@ -44,13 +45,16 @@ app/tsconfig.*.tmp.json
 app/scripts/securities_master.sql
 app/wrangler.preview.toml
 .tmp-ocr/
+scout/*.err
+scout/*.log
+scout/*state*.json
 
 # Never commit real secrets (2026-08-01 purge; secrets live in Coolify env store)
 app/.prod.vars.local
 .prod.vars.local
 .upstream-shared/
 
-# Apple Auth Keys (APNs / DeviceCheck / Sign in with Apple) — canonical copy in ~/.secrets/
+# Apple Auth Keys (APNs / DeviceCheck / Sign in with Apple) — canonical copy in Infisical (`fleet-secrets get`)
 *.p8
 
 # Merge/patch leftovers. app/docker-compose.yml.orig and two .patch files
@@ -62,3 +66,6 @@ app/.prod.vars.local
 
 # Latency week tracker samples (may contain ops snapshots)
 docs/latency-week/samples/
+
+# Xcode local build output from clients/ios
+clients/ios/build/

@@ -1,0 +1,121 @@
+name: Sentry Deploy
+
+# CI is only the trigger.  The reporter independently verifies production.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/sentry-deploy.yml
+      - scripts/sentry-report-deploy*
+      - scripts/sentry-upload-browser-sourcemaps*
+      - scripts/ops/deploy_relevance.py
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  # The post-merge sentinel (scripts/ops/post-merge-sentinel.mjs) dispatches this
+  # on main when the workflow_run for main HEAD never started (CT-2463).  The
+  # reporter still verifies the live revision before it records anything.
+  # expected_sha pins the commit whose push CI the sentinel saw pass.
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Commit on main to verify and record (defaults to the dispatched main HEAD)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize every reporter for this environment, including runs for newer SHAs.
+# A dispatch from any branch other than main can't record, so it stays off the
+# production group and never queues ahead of a real deploy.
+concurrency:
+  group: sentry-deploy-${{ (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && 'production' || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-reporter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '26'
+      - run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
+
+  record-production-deploy:
+    needs: test-reporter
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.id == github.repository_id)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '26'
+      - name: Test deployment evidence and reporting
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs
+      - name: Verify live revision and record Sentry deployment
+        id: record
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && (inputs.expected_sha || github.sha) || github.event.workflow_run.head_sha }}
+        run: node scripts/sentry-report-deploy.mjs
+      # The steps below read and upload files, so they run against the released
+      # revision rather than the main HEAD this job checked out.  SENTRY_RELEASE
+      # is the verified live revision, which can be older or newer than that
+      # HEAD, and the bundle and map stored under a release have to be that
+      # revision's bytes.  The record step refreshed origin/main and proved the
+      # release is on it, so the commit is present in this full-history clone.
+      - name: Check out the released revision
+        if: steps.record.outputs.release != ''
+        env:
+          RELEASE: ${{ steps.record.outputs.release }}
+        run: git checkout --quiet --detach "$RELEASE"
+      # Deliberately AFTER record, and gated on the same condition as the upload.
+      # The deploy receipt is the valuable output and it is already recorded
+      # before these steps run, so a failure here cannot suppress it.  Both
+      # steps fail the job on purpose once a source map exists:  a quietly
+      # green run would hide a broken credential or a failed upload.
+      # Installs only the pinned CLI rather than the whole app tree, which exists
+      # solely to obtain one binary.
+      #
+      # Both steps also need a source map beside dashboard.js (dashboard.js.map,
+      # the file the upload script looks for).  None is built yet (CT-2438), and
+      # without one the upload stores nothing.  It also cannot authenticate
+      # today:  the SENTRY_AUTH_TOKEN org token predates the Sep 28 org rename
+      # (jays-services -> simple-with-us), and sentry-cli prefers the org
+      # embedded in the token over --org.  The upload failed on every production
+      # deploy since it was added on Oct 11, with "organization not found" once
+      # the CLI's output was surfaced (CT-2442).  The REST deploy reporter above
+      # is unaffected.  Until a map exists the upload is skipped with a notice
+      # instead of failing.  The notice names only the missing map:  the token's
+      # state is tracked in CT-2442 and is kept out of workflow output.  Once a
+      # map exists, a failed upload fails this job on purpose.  The receipt above
+      # is already recorded by then, and a quietly green run would hide a broken
+      # credential.  The upload script's node test checks these hashFiles()
+      # paths and their operators against DASHBOARD_SOURCE.
+      - name: Install the pinned Sentry CLI
+        if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
+        working-directory: app
+        run: npm install --no-save --no-audit --no-fund "@sentry/cli@$(node -p "require('./package.json').devDependencies['@sentry/cli']")"
+      - name: Upload browser dashboard source maps
+        if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') != ''
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_RELEASE: ${{ steps.record.outputs.release }}
+        run: node scripts/sentry-upload-browser-sourcemaps.mjs
+      - name: Skip browser source map upload (no source map built)
+        if: steps.record.outputs.release != '' && hashFiles('app/src/ui/client/dashboard.js.map') == ''
+        run: >-
+          echo '::notice title=Sentry source map upload skipped::No dashboard source
+          map is built (app/src/ui/client/dashboard.js.map, CT-2438), so the browser
+          source map upload was skipped.'

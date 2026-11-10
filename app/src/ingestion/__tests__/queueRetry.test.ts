@@ -94,7 +94,10 @@ describe('ingest queue delayed retry policy', () => {
       env,
       {} as ExecutionContext,
     );
-    expect(warn).toHaveBeenCalledWith('ingestion outbox completion skipped: missing', 'doc_missing');
+    expect(warn).toHaveBeenCalledWith('ingest.dead_letter', {
+      queue: 'ingest',
+      reason: 'outbox_missing',
+    });
     expect(ack).toHaveBeenCalledOnce();
     expect(retry).not.toHaveBeenCalled();
     warn.mockRestore();

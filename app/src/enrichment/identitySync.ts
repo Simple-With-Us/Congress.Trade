@@ -37,6 +37,26 @@
  *   3. Nothing: resolved_bioguide_id is never set on a guess, and an
  *      already-set resolved_bioguide_id is never overwritten.
  *
+ * Chamber authority (board row 85f2170a).  `filers.chamber` was never written
+ * here, so competitor-minted `MANUAL-*` filers kept whatever the injector
+ * guessed — mostly 'senate' — and the chamber filter, the per-chamber KPIs and
+ * the dedupe passes (which key on chamber) all failed closed on them.  For
+ * `MANUAL-*` filers ONLY (a `house-*`/`senate-*`/`EXEC-*` id already carries the
+ * chamber of the filing that minted it, and a member who moved from House to
+ * Senate legitimately has one row per chamber) the chamber is now decided from
+ * evidence, in this order: the competitor payloads' own `member_type`
+ * (executive officials — including former legislators now in the cabinet — say
+ * 'executive'), curated executive data (the photo pack's executive faces, the
+ * curated EXEC-* aliases), the resolved legislator's latest term, the payload's
+ * house/senate, and last an existing `chamber='executive'` twin by name.  No
+ * evidence means no change: 'senate' is never a default.
+ *
+ * A name-only match onto a legislator who could not have filed (last term ended
+ * before the STOCK Act, or more than a year before the filer's latest trade)
+ * is rejected, and a stored resolution that points at one is re-resolved or
+ * cleared — the "Gillis Long" / "Mark Green WI-8" / 1940s "John Delaney"
+ * mis-resolutions came from `middle last` and first-listed-wins keys.
+ *
  * Writes are batched (batchPrepared, 50 statements/D1 batch) the same way
  * committeeSync.ts does. dryRun returns the full plan (counts + first 50
  * sample changes) without writing anything.
@@ -48,12 +68,17 @@ import {
   fetchLegislatorIndexes,
   fallbackNameKeys,
   diminutiveKeyVariants,
+  isDisclosureEraLegislator,
   normName,
   type LegislatorIndexes,
   type LegislatorMatch,
 } from './legislators.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { dedupeSplitFilerIdentities } from '../admin/filerIdentityDedupe.ts';
+import { chamberFromMemberType, type ParsedCompetitorChamber } from '../shared/competitorAttribution.ts';
+import { isMintedCompetitorFilerId } from '../shared/competitorFilerMatch.ts';
+import { resolveExecutiveFilerIdFromName } from '../shared/executiveIdentity.ts';
+import { packFacesWithFilerIds } from './memberPhotoPack.ts';
 
 export interface IdentityFilerRow {
   bioguide_id: string;
@@ -68,7 +93,7 @@ export interface IdentityFilerRow {
 
 export interface IdentityPlanChange {
   filerId: string;
-  kind: 'resolved' | 'display-name' | 'fields' | 'cleaned';
+  kind: 'resolved' | 'display-name' | 'fields' | 'cleaned' | 'chamber' | 'cleared';
   before: Partial<IdentityFilerRow>;
   after: Partial<IdentityFilerRow>;
 }
@@ -81,12 +106,67 @@ export interface IdentityPlan {
   fieldsBackfilled: number;
   cleaned: number;
   unresolved: number;
+  /** MANUAL-* filers whose chamber was corrected from evidence. */
+  chambersCorrected: number;
+  /** Stored resolutions that pointed at a legislator who cannot be the filer, re-resolved or cleared. */
+  staleResolutionsFixed: number;
+}
+
+/**
+ * Evidence gathered from the database (see {@link loadIdentityEvidence}) that
+ * the pure planner cannot derive from the `filers` rows alone.  Every field is
+ * optional: a missing map simply means "no evidence", never a default.
+ */
+export interface IdentityEvidence {
+  /** MANUAL-* filer id -> the chamber its competitor payloads overwhelmingly declare. */
+  payloadChamber?: ReadonlyMap<string, ParsedCompetitorChamber>;
+  /** MANUAL-* filer id -> latest live tx_date (YYYY-MM-DD); bounds which legislators could be the filer. */
+  latestTxDate?: ReadonlyMap<string, string>;
+  /** Filer ids that curated data (the executive photo pack) marks as executive-branch officials. */
+  executiveFilerIds?: ReadonlySet<string>;
+}
+
+/** Share of typed payload rows that must agree before a chamber counts as "declared". */
+const PAYLOAD_CHAMBER_MAJORITY = 0.8;
+
+/** "2019-01-03" -> "2020-01-03" (string math; the roster dates are ISO). */
+function plusOneYear(isoDate: string): string {
+  const year = Number(isoDate.slice(0, 4));
+  return Number.isFinite(year) ? `${year + 1}${isoDate.slice(4)}` : isoDate;
+}
+
+interface Plausibility {
+  /** Latest live trade date on the filer (MANUAL-* only). */
+  latestTxDate: string | null;
+  /** Executive-branch evidence: skip the tx-date bound (a former legislator can be a current official). */
+  executive: boolean;
+}
+
+/**
+ * Could this legislator be the person behind the filer?  Never for someone who
+ * left before the disclosure era; and, for a competitor-minted filer with a
+ * known latest trade, never when their last term ended more than a year before
+ * that trade (executives are exempt — a former Representative can be a
+ * Secretary today).
+ */
+function plausibleLegislator(m: LegislatorMatch, ctx: Plausibility): boolean {
+  if (!isDisclosureEraLegislator(m)) return false;
+  if (ctx.executive || !ctx.latestTxDate || !m.lastTermEnd) return true;
+  return plusOneYear(m.lastTermEnd) >= ctx.latestTxDate;
 }
 
 /** Resolve a filer's bioguide via the primary name map (cleaned name, then raw name). Mirrors runPhotoEnrichment's lookup exactly. */
-function resolvePrimary(fullName: string | null, primary: Map<string, LegislatorMatch>): LegislatorMatch | null {
+function resolvePrimary(
+  fullName: string | null,
+  primary: Map<string, LegislatorMatch>,
+  accept: (m: LegislatorMatch) => boolean,
+): LegislatorMatch | null {
   const cleaned = cleanFilerName(fullName);
-  return primary.get(normName(cleaned || fullName)) ?? primary.get(normName(fullName)) ?? null;
+  for (const key of [normName(cleaned || fullName), normName(fullName)]) {
+    const hit = primary.get(key);
+    if (hit && accept(hit)) return hit;
+  }
+  return null;
 }
 
 /**
@@ -99,9 +179,10 @@ function lookupFallbackKey(
   key: string,
   state: string,
   fallback: Map<string, LegislatorMatch[]>,
+  accept: (m: LegislatorMatch) => boolean,
 ): LegislatorMatch | null {
-  const candidates = fallback.get(key);
-  if (!candidates || candidates.length === 0) return null;
+  const candidates = (fallback.get(key) ?? []).filter(accept);
+  if (candidates.length === 0) return null;
   if (state) {
     const stateMatches = candidates.filter((m) => (m.state ?? '').toUpperCase() === state);
     if (stateMatches.length === 1) return stateMatches[0];
@@ -125,23 +206,40 @@ function resolveFallback(
   fullName: string | null,
   filerState: string | null,
   fallback: Map<string, LegislatorMatch[]>,
+  accept: (m: LegislatorMatch) => boolean,
 ): LegislatorMatch | null {
   const keys = fallbackNameKeys(fullName);
   const state = (filerState ?? '').trim().toUpperCase();
 
   for (const key of keys) {
-    const hit = lookupFallbackKey(key, state, fallback);
+    const hit = lookupFallbackKey(key, state, fallback, accept);
     if (hit) return hit;
   }
 
   for (const key of keys) {
     for (const variant of diminutiveKeyVariants(key)) {
-      const hit = lookupFallbackKey(variant, state, fallback);
+      const hit = lookupFallbackKey(variant, state, fallback, accept);
       if (hit) return hit;
     }
   }
 
   return null;
+}
+
+/** Name-only roster resolution (primary map, then the state-gated fallback), restricted to plausible legislators. */
+function resolveByName(
+  f: IdentityFilerRow,
+  indexes: LegislatorIndexes,
+  accept: (m: LegislatorMatch) => boolean,
+  opts: { ignoreStoredState?: boolean } = {},
+): LegislatorMatch | null {
+  return (
+    resolvePrimary(f.full_name, indexes.primary, accept) ??
+    // When re-resolving a mis-resolution the stored state was itself copied
+    // from the WRONG legislator (Gillis Long's "LA" would veto Billy Long's
+    // "MO"), so it must not gate the retry.
+    resolveFallback(f.full_name, opts.ignoreStoredState ? null : f.state, indexes.fallback, accept)
+  );
 }
 
 /** The legislator's preferred public display name: official_full, else "nickname last", else "first last". */
@@ -240,16 +338,49 @@ export function fallbackCleanDisplayName(fullName: string | null | undefined): s
   return str || null;
 }
 
+/** Filer ids curated as executive-branch officials by the executive photo pack. */
+export function executiveFilerIdsFromPhotoPack(): Set<string> {
+  const ids = new Set<string>();
+  try {
+    for (const face of packFacesWithFilerIds()) {
+      if (face.branch !== 'executive') continue;
+      for (const id of face.filerIds ?? []) ids.add(id);
+    }
+  } catch {
+    // The pack is an optimisation over other evidence; never fail the sync on it.
+  }
+  return ids;
+}
+
+/**
+ * Decide the chamber for a competitor-minted (`MANUAL-*`) filer from evidence,
+ * or null for "no evidence — leave it alone".  See the module doc for the
+ * precedence; the one rule worth repeating is that 'senate' is never a default.
+ */
+export function decideMintedChamber(input: {
+  legislator: LegislatorMatch | null;
+  payloadChamber: ParsedCompetitorChamber | null;
+  curatedExecutive: boolean;
+  executiveTwin: boolean;
+}): ParsedCompetitorChamber | null {
+  if (input.payloadChamber === 'executive' || input.curatedExecutive) return 'executive';
+  if (input.legislator?.chamber) return input.legislator.chamber;
+  if (input.payloadChamber) return input.payloadChamber;
+  if (input.executiveTwin) return 'executive';
+  return null;
+}
+
 /**
  * Pure planning step (no DB/network): decide resolved_bioguide_id backfills,
- * display_name writes, authoritative party/state/district overwrites, and
- * fallback-cleaned display names for unresolved filers. Idempotent — a
- * filer whose computed values already match what's stored produces no
- * change entry.
+ * display_name writes, authoritative party/state/district overwrites, chamber
+ * corrections for competitor-minted filers, and fallback-cleaned display names
+ * for unresolved filers. Idempotent — a filer whose computed values already
+ * match what's stored produces no change entry.
  */
 export function planIdentitySync(
   filers: readonly IdentityFilerRow[],
   indexes: LegislatorIndexes,
+  evidence: IdentityEvidence = {},
 ): IdentityPlan {
   const changes: IdentityPlanChange[] = [];
   let bioguideResolved = 0;
@@ -257,21 +388,70 @@ export function planIdentitySync(
   let fieldsBackfilled = 0;
   let cleaned = 0;
   let unresolved = 0;
+  let chambersCorrected = 0;
+  let staleResolutionsFixed = 0;
+
+  // Name keys of the live executive-branch filers (the OGE-sourced EXEC-* rows):
+  // a MANUAL-* filer sharing one is that same official.
+  const executiveNameKeys = new Set<string>();
+  for (const f of filers) {
+    if (f.chamber === 'executive' && !isMintedCompetitorFilerId(f.bioguide_id)) {
+      const key = normName(fallbackCleanDisplayName(f.full_name));
+      if (key) executiveNameKeys.add(key);
+    }
+  }
 
   for (const f of filers) {
+    const minted = isMintedCompetitorFilerId(f.bioguide_id);
+    const payloadChamber = minted ? evidence.payloadChamber?.get(f.bioguide_id) ?? null : null;
+    const latestTxDate = minted ? evidence.latestTxDate?.get(f.bioguide_id) ?? null : null;
+    const curatedExecutive =
+      minted &&
+      (evidence.executiveFilerIds?.has(f.bioguide_id) === true || resolveExecutiveFilerIdFromName(f.full_name) !== null);
+    const executive = payloadChamber === 'executive' || curatedExecutive;
+    const accept = (m: LegislatorMatch) => plausibleLegislator(m, { latestTxDate, executive });
+    const canResolve = f.chamber === 'house' || f.chamber === 'senate';
+
     let resolvedBioguide = f.resolved_bioguide_id;
     let newlyResolved = false;
+    let staleCleared = false;
 
-    if (!resolvedBioguide && (f.chamber === 'house' || f.chamber === 'senate')) {
-      const match = resolvePrimary(f.full_name, indexes.primary) ?? resolveFallback(f.full_name, f.state, indexes.fallback);
+    // A stored resolution onto a legislator who cannot be this filer is a
+    // mis-resolution: re-resolve to a plausible one, or clear it.
+    if (resolvedBioguide && (canResolve || minted)) {
+      const stored = indexes.byBioguide.get(resolvedBioguide);
+      if (stored && !accept(stored)) {
+        const better = executive ? null : resolveByName(f, indexes, accept, { ignoreStoredState: true });
+        if (better && better.bioguide !== resolvedBioguide) {
+          resolvedBioguide = better.bioguide;
+          newlyResolved = true;
+        } else if (!better) {
+          resolvedBioguide = null;
+          staleCleared = true;
+        }
+        staleResolutionsFixed++;
+      }
+    }
+
+    if (!resolvedBioguide && !staleCleared && !executive && canResolve) {
+      const match = resolveByName(f, indexes, accept);
       if (match) {
         resolvedBioguide = match.bioguide;
         newlyResolved = true;
       }
     }
 
+    const legislator = resolvedBioguide ? indexes.byBioguide.get(resolvedBioguide) ?? null : null;
+    const twin =
+      minted && executiveNameKeys.has(normName(fallbackCleanDisplayName(f.full_name)));
+    const nextChamber = minted
+      ? decideMintedChamber({ legislator, payloadChamber, curatedExecutive, executiveTwin: twin })
+      : null;
+    const chamberChanged = nextChamber !== null && nextChamber !== f.chamber;
+    const effectiveChamber = chamberChanged ? nextChamber : f.chamber;
+    const isExecutive = effectiveChamber === 'executive';
+
     if (resolvedBioguide) {
-      const legislator = indexes.byBioguide.get(resolvedBioguide);
       if (!legislator) {
         // Bioguide known but not present in this fetch of the roster (stale
         // id, or a fetch that failed to include it) — nothing more we can
@@ -289,48 +469,73 @@ export function planIdentitySync(
       }
 
       const displayName = legislatorDisplayName(legislator);
-      const nextParty = legislator.party;
-      const nextState = legislator.state;
-      const nextDistrict = legislator.district;
+      // An executive filer shows a position, never a district; a competitor-
+      // minted executive also drops the geography/party of a FORMER legislative
+      // career (a sitting Secretary is not "D HI-2").
+      const nextParty = isExecutive && minted ? null : legislator.party;
+      const nextState = isExecutive && minted ? null : legislator.state;
+      const nextDistrict = isExecutive ? null : legislator.district;
 
       const displayChanged = displayName !== null && displayName !== f.display_name;
       const fieldsChanged =
         nextParty !== f.party || nextState !== f.state || nextDistrict !== f.district;
 
-      if (newlyResolved || displayChanged || fieldsChanged) {
+      if (newlyResolved || displayChanged || fieldsChanged || chamberChanged) {
+        const after: Partial<IdentityFilerRow> = {
+          resolved_bioguide_id: resolvedBioguide,
+          display_name: displayName ?? f.display_name,
+          party: nextParty,
+          state: nextState,
+          district: nextDistrict,
+        };
+        if (chamberChanged) after.chamber = nextChamber;
         changes.push({
           filerId: f.bioguide_id,
-          kind: newlyResolved ? 'resolved' : displayChanged ? 'display-name' : 'fields',
+          kind: newlyResolved ? 'resolved' : chamberChanged ? 'chamber' : displayChanged ? 'display-name' : 'fields',
           before: {
             resolved_bioguide_id: f.resolved_bioguide_id,
             display_name: f.display_name,
             party: f.party,
             state: f.state,
             district: f.district,
+            ...(chamberChanged ? { chamber: f.chamber } : {}),
           },
-          after: {
-            resolved_bioguide_id: resolvedBioguide,
-            display_name: displayName ?? f.display_name,
-            party: nextParty,
-            state: nextState,
-            district: nextDistrict,
-          },
+          after,
         });
         if (newlyResolved) bioguideResolved++;
         if (displayChanged) displayNamesSet++;
         if (fieldsChanged) fieldsBackfilled++;
+        if (chamberChanged) chambersCorrected++;
       }
     } else {
       unresolved++;
       const next = fallbackCleanDisplayName(f.full_name);
-      if (next !== f.display_name) {
+      const nameChanged = next !== f.display_name;
+      if (nameChanged || chamberChanged || staleCleared) {
+        const before: Partial<IdentityFilerRow> = { display_name: f.display_name };
+        const after: Partial<IdentityFilerRow> = { display_name: next };
+        if (staleCleared) {
+          before.resolved_bioguide_id = f.resolved_bioguide_id;
+          before.party = f.party;
+          before.state = f.state;
+          before.district = f.district;
+          after.resolved_bioguide_id = null;
+          after.party = null;
+          after.state = null;
+          after.district = null;
+        }
+        if (chamberChanged) {
+          before.chamber = f.chamber;
+          after.chamber = nextChamber;
+        }
         changes.push({
           filerId: f.bioguide_id,
-          kind: 'cleaned',
-          before: { display_name: f.display_name },
-          after: { display_name: next },
+          kind: staleCleared ? 'cleared' : chamberChanged ? 'chamber' : 'cleaned',
+          before,
+          after,
         });
-        cleaned++;
+        if (nameChanged) cleaned++;
+        if (chamberChanged) chambersCorrected++;
       }
     }
   }
@@ -343,7 +548,52 @@ export function planIdentitySync(
     fieldsBackfilled,
     cleaned,
     unresolved,
+    chambersCorrected,
+    staleResolutionsFixed,
   };
+}
+
+/**
+ * Read the evidence the planner needs for competitor-minted filers in two
+ * bounded aggregate queries over `MANUAL-*` rows (a few thousand at most):
+ * the chamber their payloads' `member_type` declares, and their latest trade
+ * date.  Never throws — a failed read just means "no evidence".
+ */
+export async function loadIdentityEvidence(env: Env): Promise<IdentityEvidence> {
+  const payloadChamber = new Map<string, ParsedCompetitorChamber>();
+  const latestTxDate = new Map<string, string>();
+  try {
+    const rows = await all<{ filer_id: string; member_type: string | null; n: number; last_tx: string | null }>(
+      env.DB,
+      `SELECT filer_id,
+              CASE WHEN json_valid(raw_text) THEN lower(COALESCE(json_extract(raw_text, '$.member_type'), '')) ELSE '' END AS member_type,
+              COUNT(*) AS n,
+              MAX(tx_date) AS last_tx
+         FROM transactions
+        WHERE filer_id >= 'MANUAL-' AND filer_id < 'MANUAL.'
+          AND deprecated_at IS NULL
+          AND source = 'competitor_backfill'
+        GROUP BY filer_id, member_type`,
+    );
+    const tally = new Map<string, Map<ParsedCompetitorChamber, number>>();
+    for (const r of rows) {
+      if (r.last_tx && (latestTxDate.get(r.filer_id) ?? '') < r.last_tx) latestTxDate.set(r.filer_id, r.last_tx);
+      const chamber = chamberFromMemberType(r.member_type);
+      if (!chamber) continue;
+      const byChamber = tally.get(r.filer_id) ?? new Map<ParsedCompetitorChamber, number>();
+      byChamber.set(chamber, (byChamber.get(chamber) ?? 0) + Number(r.n));
+      tally.set(r.filer_id, byChamber);
+    }
+    for (const [filerId, byChamber] of tally) {
+      const total = [...byChamber.values()].reduce((a, b) => a + b, 0);
+      for (const [chamber, n] of byChamber) {
+        if (total > 0 && n / total >= PAYLOAD_CHAMBER_MAJORITY) payloadChamber.set(filerId, chamber);
+      }
+    }
+  } catch (err) {
+    console.warn('identity sync: competitor payload evidence unavailable:', (err as Error).message);
+  }
+  return { payloadChamber, latestTxDate, executiveFilerIds: executiveFilerIdsFromPhotoPack() };
 }
 
 export interface IdentitySyncResult {
@@ -353,6 +603,8 @@ export interface IdentitySyncResult {
   fieldsBackfilled: number;
   cleaned: number;
   unresolved: number;
+  chambersCorrected: number;
+  staleResolutionsFixed: number;
   dryRun: boolean;
   /** Present only for dryRun: first 50 planned changes. */
   sample?: IdentityPlanChange[];
@@ -368,7 +620,8 @@ export async function runIdentitySync(
     env.DB,
     'SELECT bioguide_id, chamber, full_name, party, state, district, resolved_bioguide_id, display_name FROM filers',
   );
-  const plan = planIdentitySync(filers, indexes);
+  const evidence = await loadIdentityEvidence(env);
+  const plan = planIdentitySync(filers, indexes, evidence);
 
   if (dryRun) {
     return {
@@ -378,29 +631,29 @@ export async function runIdentitySync(
       fieldsBackfilled: plan.fieldsBackfilled,
       cleaned: plan.cleaned,
       unresolved: plan.unresolved,
+      chambersCorrected: plan.chambersCorrected,
+      staleResolutionsFixed: plan.staleResolutionsFixed,
       dryRun: true,
       sample: plan.changes.slice(0, 50),
     };
   }
 
+  // Each change writes exactly the columns its `after` names (a 'cleaned'
+  // change touches display_name only; a chamber correction adds `chamber`).
+  const WRITABLE: ReadonlyArray<keyof IdentityFilerRow> = [
+    'resolved_bioguide_id',
+    'display_name',
+    'party',
+    'state',
+    'district',
+    'chamber',
+  ];
   const statements = plan.changes.map((change) => {
     const after = change.after;
-    if (change.kind === 'cleaned') {
-      return env.DB.prepare('UPDATE filers SET display_name = ? WHERE bioguide_id = ?').bind(
-        after.display_name ?? null,
-        change.filerId,
-      );
-    }
+    const cols = WRITABLE.filter((c) => Object.prototype.hasOwnProperty.call(after, c));
     return env.DB.prepare(
-      'UPDATE filers SET resolved_bioguide_id = ?, display_name = ?, party = ?, state = ?, district = ? WHERE bioguide_id = ?',
-    ).bind(
-      after.resolved_bioguide_id ?? null,
-      after.display_name ?? null,
-      after.party ?? null,
-      after.state ?? null,
-      after.district ?? null,
-      change.filerId,
-    );
+      `UPDATE filers SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE bioguide_id = ?`,
+    ).bind(...cols.map((c) => after[c] ?? null), change.filerId);
   });
   for (let i = 0; i < statements.length; i += 50) {
     await batchPrepared(env.DB, statements.slice(i, i + 50));
@@ -416,6 +669,8 @@ export async function runIdentitySync(
     fieldsBackfilled: plan.fieldsBackfilled,
     cleaned: plan.cleaned,
     unresolved: plan.unresolved,
+    chambersCorrected: plan.chambersCorrected,
+    staleResolutionsFixed: plan.staleResolutionsFixed,
     dryRun: false,
   };
 }

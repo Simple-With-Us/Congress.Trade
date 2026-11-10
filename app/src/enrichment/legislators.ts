@@ -187,6 +187,8 @@ export interface Legislator {
   terms?: LegislatorTerm[];
 }
 
+export type LegislatorChamber = 'house' | 'senate';
+
 export interface LegislatorMatch {
   bioguide: string;
   party: string | null;
@@ -197,10 +199,29 @@ export interface LegislatorMatch {
   nickname: string | null;
   first: string | null;
   last: string | null;
+  /** Chamber of the LATEST term: 'rep' -> house, 'sen' -> senate.  Null when the term type is absent/unknown. */
+  chamber: LegislatorChamber | null;
+  /** End date (YYYY-MM-DD) of the latest term; null when the roster carries none (treated as still serving). */
+  lastTermEnd: string | null;
 }
+
+/**
+ * The earliest date a legislator's last term can end and still be someone who
+ * files periodic transaction reports we would ever ingest.  The STOCK Act
+ * (April 2012) created the PTR duty, so a name-only match onto a legislator
+ * whose service ended before this (Gillis Long d. 1985, the WWII-era John
+ * Delaney, a 2007 Mark Green) is a mis-resolution by construction.
+ */
+export const DISCLOSURE_ERA_START = '2012-01-01';
 
 export function latestLegislatorTerm(terms: LegislatorTerm[] | undefined): LegislatorTerm | undefined {
   return (terms ?? []).slice().sort((a, b) => String(b.start ?? '').localeCompare(String(a.start ?? '')))[0];
+}
+
+function chamberFromTermType(type: string | undefined): LegislatorChamber | null {
+  if (type === 'rep') return 'house';
+  if (type === 'sen') return 'senate';
+  return null;
 }
 
 function toMatch(leg: Legislator): LegislatorMatch | null {
@@ -217,14 +238,28 @@ function toMatch(leg: Legislator): LegislatorMatch | null {
     nickname: n.nickname ?? null,
     first: n.first ?? null,
     last: n.last ?? null,
+    chamber: chamberFromTermType(term?.type),
+    lastTermEnd: term?.end ? String(term.end) : null,
   };
+}
+
+/** True when the legislator's service reaches the STOCK Act / PTR era (a missing end date means still serving). */
+export function isDisclosureEraLegislator(m: LegislatorMatch): boolean {
+  return !m.lastTermEnd || m.lastTermEnd >= DISCLOSURE_ERA_START;
+}
+
+/** Sort key for "who is the more recent holder of this name": a missing end date means still serving. */
+function recencyKey(m: LegislatorMatch): string {
+  return m.lastTermEnd ?? '9999-12-31';
 }
 
 /**
  * Pure: build the normalized-name -> legislator metadata map from an
- * already-fetched legislator list. Earlier entries win ties (callers should
- * pass the current roster before the historical one, as `buildLegislatorMap`
- * does, so active members win over past holders of a similar name).
+ * already-fetched legislator list.  When two legislators normalize to the same
+ * name key the one whose latest term ends LATER wins (so the 2025 Mark Green
+ * beats the 2007 one and John K. Delaney beats John J. Delaney); a tie keeps
+ * the earlier entry, so callers should still pass the current roster before
+ * the historical one, as `buildLegislatorMap` does.
  */
 export function indexLegislators(list: readonly Legislator[]): Map<string, LegislatorMatch> {
   const map = new Map<string, LegislatorMatch>();
@@ -239,7 +274,11 @@ export function indexLegislators(list: readonly Legislator[]): Map<string, Legis
     ];
     for (const raw of candidates) {
       const k = normName(raw);
-      if (k && !map.has(k)) map.set(k, match); // current list is loaded first; it wins
+      if (!k) continue;
+      const existing = map.get(k);
+      if (!existing || (existing.bioguide !== match.bioguide && recencyKey(match) > recencyKey(existing))) {
+        map.set(k, match);
+      }
     }
   }
   return map;

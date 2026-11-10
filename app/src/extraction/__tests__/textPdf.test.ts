@@ -338,6 +338,92 @@ describe('parseHousePtrText', () => {
     expect(rows[0].supplementalText).not.toContain('Hon. Josh');
   });
 
+  it('parses EO.Pdf column layout with wrapped amount and trailing [CS]/[GS] (Cohen H-2026-20035235)', () => {
+    const rows = parseHousePtrText(`
+      Filing ID #20035235
+      Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building
+      Name: Hon. Steve Cohen
+      Status: Member
+      State/District: TN09
+      ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200?
+      JPMorgan Chase BK N A INSTL CTF            P                 08/05/2026 08/11/2026             $100,001 -
+      DEP ACT/365 4.200% Mat                                                                         $250,000
+      8/11/2027 [CS]
+      F      S      : New
+      S            O : Stephens Advantage Account
+      D           : Corporate Bond
+      U.S. Tres Bill Int. Rate 0.00% Mat         P                 08/06/2026 08/11/2026             $100,001 -
+      8/5/2027 [GS]                                                                                  $250,000
+      F      S      : New
+      S            O : Stephens Advantage Account
+    `);
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      owner: 'self',
+      assetType: 'CS',
+      txType: 'B',
+      txDate: '2026-08-05',
+      amountMin: 100001,
+      amountMax: 250000,
+      filingStatus: 'New',
+      subholding: 'Stephens Advantage Account',
+    });
+    expect(rows[0].assetName).toMatch(/JPMorgan Chase/i);
+    expect(rows[1]).toMatchObject({
+      owner: 'self',
+      txType: 'B',
+      txDate: '2026-08-06',
+      amountMin: 100001,
+      amountMax: 250000,
+    });
+    expect(rows[1].assetName).toMatch(/Tres Bill/i);
+    expect(rows[1].assetName).not.toBe('(unknown)');
+    expect(rows[1].assetType === 'GS' || /Tres Bill/i.test(rows[1].assetName)).toBe(true);
+  });
+
+  it('parses electronic PTR rows with a leading line id, JT owner, and [ST] after the amount (Hern H-2026-20035196)', () => {
+    const rows = parseHousePtrText(`
+      Filing ID #20035196
+      Name: Hon. Kevin Hern
+      Status: Member
+      State/District: OK01
+      ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200?
+      2000166537 JT              Organon & Co. Common Stock              S                 08/05/2026 08/05/2026                $1,001 - $15,000
+                                 (OGN) [ST]
+                                 F      S      : Amended
+                                 S            O : Hern Family Revocable Trust
+      2000166538 JT              Versant Media Group, Inc. - Class       S                 08/05/2026 08/05/2026                $1,001 - $15,000
+                                 A Common Stock (VSNT) [ST]
+                                 F      S      : Deleted
+                                 S            O : Hern Family Foundation
+    `);
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      owner: 'joint',
+      ticker: 'OGN',
+      assetType: 'ST',
+      txType: 'S',
+      txDate: '2026-08-05',
+      amountMin: 1001,
+      amountMax: 15000,
+      filingStatus: 'Amended',
+    });
+    expect(rows[0].assetName).toMatch(/Organon/i);
+    expect(rows[1]).toMatchObject({
+      owner: 'joint',
+      ticker: 'VSNT',
+      assetType: 'ST',
+      txType: 'S',
+      txDate: '2026-08-05',
+      amountMin: 1001,
+      amountMax: 15000,
+      filingStatus: 'Deleted',
+    });
+    expect(rows[1].assetName).toMatch(/Versant/i);
+  });
+
   it('runs deterministic textPdf extraction with zero LLM calls', async () => {
     unpdfMocks.getDocumentProxy.mockResolvedValue({ numPages: 1 });
     unpdfMocks.extractText.mockResolvedValue({
@@ -480,6 +566,24 @@ describe('TextPdfExtractor page count', () => {
     })) as { pageCount?: number | null };
 
     expect(result.pageCount).toBeNull();
+  });
+
+  it('fail-softs when unpdf throws XRefEntryException (CONGRESS-TRADE-1C)', async () => {
+    unpdfMocks.getDocumentProxy.mockRejectedValue(
+      Object.assign(new Error('Bad (uncompressed) XRef entry: 13R'), {
+        name: 'XRefEntryException',
+      }),
+    );
+
+    const extractor = new TextPdfExtractor();
+    const result = await extractor.extract({
+      filing: textPdfFiling(),
+      bytes: new ArrayBuffer(8),
+    });
+
+    expect(result.transactions).toEqual([]);
+    expect(result.raw).toBe('');
+    expect((result as { pageCount?: number | null }).pageCount).toBeNull();
   });
 
   it('does not detach the caller-supplied ArrayBuffer (regression guard for Sentry CONGRESS-TRADE-2)', async () => {

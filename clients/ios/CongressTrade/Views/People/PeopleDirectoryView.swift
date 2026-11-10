@@ -5,6 +5,7 @@ import SwiftUI
 struct PeopleDirectoryView: View {
     @EnvironmentObject private var store: CongressTradeStore
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @AppStorage("ct_disclaimer_expanded") private var disclaimerExpanded = false
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
     @State private var selectedMember: MemberSheetTarget?
@@ -17,10 +18,10 @@ struct PeopleDirectoryView: View {
     /// rendering 379 cards at once — it must never become a request.
     @State private var currentPage = 0
     @State private var pageSize = 50
-    @State private var directoryMode: DirectoryMode = .people
+    @State private var directoryMode: DirectoryMode = .politicians
 
     private enum DirectoryMode: String, CaseIterable {
-        case people = "People"
+        case politicians = "Politicians"
         case assets = "Assets"
     }
 
@@ -52,6 +53,14 @@ struct PeopleDirectoryView: View {
         let page = min(currentPage, pages - 1)
         return NavigationStack {
             VStack(spacing: 0) {
+                if disclaimerExpanded {
+                    DisclaimerBanner()
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                        .padding(.bottom, 4)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
                 Picker("Directory", selection: $directoryMode) {
                     ForEach(DirectoryMode.allCases, id: \.self) { mode in
                         Text(mode.rawValue).tag(mode)
@@ -65,16 +74,28 @@ struct PeopleDirectoryView: View {
                 if directoryMode == .assets {
                     AssetDirectoryView(wrapsNavigation: false)
                 } else {
-                peopleDirectoryList(members: members, page: page, pages: pages)
+                    peopleDirectoryList(members: members, page: page, pages: pages)
                 }
             }
+            .animation(.easeInOut(duration: 0.32), value: disclaimerExpanded)
             .background(AppTheme.background)
-            .navigationTitle("Directory")
             .navigationBarTitleDisplayMode(.inline)
+            .ctSolidFeedHeader()
             .toolbar {
-                // Sign-in, appearance, export, and Premium were otherwise
-                // unreachable from this tab — the hamburger menu only lived
-                // on Trends/Trades (iPad audit P2-2).
+                ToolbarItem(placement: .topBarLeading) {
+                    HeaderIconButton(
+                        systemImage: "info.circle",
+                        accessibilityLabel: "About Congress.Trade"
+                    ) {
+                        DisclaimerColdStart.cancelAutoHide()
+                        withAnimation(.easeInOut(duration: 0.32)) {
+                            disclaimerExpanded.toggle()
+                        }
+                    }
+                }
+                ToolbarItem(placement: .principal) {
+                    BrandTitle()
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     HamburgerMenuButton()
                 }
@@ -184,9 +205,6 @@ struct PeopleDirectoryView: View {
                             directoryPager(page: page, pages: pages)
                                 .padding(.top, 4)
                         }
-
-                        AppLegalFooter()
-                            .padding(.top, 8)
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)

@@ -52,6 +52,8 @@
 import type { Env } from '../shared/types.ts';
 import { all, get, run } from '../shared/db.ts';
 import { execNameMatchKey, memberNameMatchKey, sameFilerIdentity } from '../shared/filerIdentityMatch.ts';
+import { isMintedCompetitorFilerId } from '../shared/competitorFilerMatch.ts';
+import { resolveExecutiveFilerIdFromName } from '../shared/executiveIdentity.ts';
 
 interface FilerRow {
   bioguide_id: string;
@@ -86,6 +88,11 @@ export interface FilerIdentityDedupeResult {
 
 /**
  * Deterministic canonical pick within a matched cluster:
+ *   0. Never a competitor-minted `MANUAL-<LAST>` id while a real one exists:
+ *      `EXEC-*`, `house-*` and `senate-*` ids come from the actual filings (and
+ *      `EXEC-*` carries the curated position title), so a MANUAL-* phantom is
+ *      always the alias, even when it holds more transactions.  Its metadata is
+ *      COALESCE-backfilled onto the canonical row by mergeClusterOnto.
  *   1. Prefer a row that already carries resolved_bioguide_id — an
  *      authoritative congress-legislators enrichment match.
  *   2. Otherwise prefer the row with the most live (non-deprecated)
@@ -94,8 +101,10 @@ export interface FilerIdentityDedupeResult {
  *      (and reruns against a snapshot with the same data) always agree.
  */
 function pickCanonical(cluster: FilerRow[], txCounts: Map<string, number>): FilerRow {
-  const withResolved = cluster.filter((r) => r.resolved_bioguide_id);
-  const pool = withResolved.length ? withResolved : cluster;
+  const real = cluster.filter((r) => !isMintedCompetitorFilerId(r.bioguide_id));
+  const base = real.length ? real : cluster;
+  const withResolved = base.filter((r) => r.resolved_bioguide_id);
+  const pool = withResolved.length ? withResolved : base;
   return pool.slice().sort((a, b) => {
     const countDiff = (txCounts.get(b.bioguide_id) ?? 0) - (txCounts.get(a.bioguide_id) ?? 0);
     if (countDiff !== 0) return countDiff;
@@ -279,12 +288,23 @@ function groupByBioguideChamber(filers: readonly FilerRow[]): Map<string, FilerR
  * happening to key exec names distinctly, so this can never reach a House/
  * Senate row even if a name coincidentally cleaned to the same key.
  */
+/**
+ * Cluster key for an executive filer: the curated EXEC-* id when the name is a
+ * known alias ("Christopher A Wright" and "Chris Wright" are one Secretary even
+ * though their name keys differ), else the plain exec name key.  Curated ids
+ * are prefixed so they can never collide with a name key.
+ */
+function execClusterKey(fullName: string | null): string {
+  const curated = resolveExecutiveFilerIdFromName(fullName);
+  return curated ? `curated:${curated}` : execNameMatchKey(fullName);
+}
+
 function groupExecByNameKey(filers: readonly FilerRow[]): Map<string, FilerRow[]> {
   const groups = new Map<string, FilerRow[]>();
   for (const f of filers) {
     const chamber = String(f.chamber ?? '').trim().toLowerCase();
     if (chamber !== 'executive') continue;
-    const key = execNameMatchKey(f.full_name);
+    const key = execClusterKey(f.full_name);
     if (!key) continue;
     const list = groups.get(key);
     if (list) list.push(f);
@@ -400,7 +420,7 @@ export async function dedupeSplitFilerIdentities(
     (canonical, alias) =>
       String(canonical.chamber ?? '').trim().toLowerCase() === 'executive' &&
       String(alias.chamber ?? '').trim().toLowerCase() === 'executive' &&
-      execNameMatchKey(canonical.full_name) === execNameMatchKey(alias.full_name),
+      execClusterKey(canonical.full_name) === execClusterKey(alias.full_name),
   );
 
   const resweptRows = dryRun ? 0 : await resweepRecordedMerges(env);

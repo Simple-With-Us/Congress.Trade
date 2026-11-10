@@ -8,6 +8,7 @@
  * coverage. Mirrors the wrapper proven in admin/__tests__/migrations.test.ts.
  */
 import { readFileSync, readdirSync } from 'node:fs';
+import type { Env } from '../../shared/types.ts';
 
 export interface D1Result {
   success: boolean;
@@ -53,11 +54,15 @@ async function sqliteDatabase(): Promise<SqliteDatabase> {
   return new sqlite.DatabaseSync(':memory:');
 }
 
-function applyMigrationFiles(db: SqliteDatabase): void {
-  const files = readdirSync(migrationsUrl as unknown as string)
+function migrationSqlFiles(beforeExclusive?: string): string[] {
+  return readdirSync(migrationsUrl as unknown as string)
     .filter((name: string) => name.endsWith('.sql'))
-    .sort();
-  for (const name of files) {
+    .sort()
+    .filter((name) => !beforeExclusive || name.localeCompare(beforeExclusive) < 0);
+}
+
+function applyMigrationFiles(db: SqliteDatabase, beforeExclusive?: string): void {
+  for (const name of migrationSqlFiles(beforeExclusive)) {
     db.exec(readFileSync(new URL(name, migrationsUrl) as unknown as string, 'utf8'));
   }
 }
@@ -101,6 +106,17 @@ export function d1Database(db: SqliteDatabase): D1Database {
   } as unknown as D1Database;
 }
 
+/**
+ * Typed env fixture for code that only reads `env.DB`.  The shim implements
+ * the D1 subset the price/export code calls (prepare/bind/first/all/run and
+ * batch), not exec/withSession/dump, so this is the ONE documented adapter
+ * from the shim to the binding type.  Tests use it instead of an inline
+ * `as never` on the whole env object.
+ */
+export function d1OnlyEnv(d1: D1Database): Pick<Env, 'DB'> {
+  return { DB: d1 as unknown as Env['DB'] };
+}
+
 /** Open a fresh in-memory DB with every migration applied. */
 export async function openMigratedD1(): Promise<{
   db: SqliteDatabase;
@@ -109,5 +125,16 @@ export async function openMigratedD1(): Promise<{
 }> {
   const db = await sqliteDatabase();
   applyMigrationFiles(db);
+  return { db, d1: d1Database(db), close: () => db.close() };
+}
+
+/** Open a DB with migrations strictly before 0104 (pre enrichment_unavailable columns). */
+export async function openMigratedD1Before0104(): Promise<{
+  db: SqliteDatabase;
+  d1: D1Database;
+  close: () => void;
+}> {
+  const db = await sqliteDatabase();
+  applyMigrationFiles(db, '0104_enrichment_unavailable.sql');
   return { db, d1: d1Database(db), close: () => db.close() };
 }

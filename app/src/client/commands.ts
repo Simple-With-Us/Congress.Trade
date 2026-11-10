@@ -255,7 +255,7 @@ export async function executeCommand(
         delivery,
         targetUrl: delivery === 'webhook' ? targetUrl : null,
         secret: null,
-        filters: normalizeFilters(input.filters),
+        filters: await normalizeFilters(env, input.filters),
       });
       return { subscription: publicSubscription(sub, true) };
     } catch (err) {
@@ -268,7 +268,7 @@ export async function executeCommand(
     if (!id) throw new ClientInputError('id is required');
     const existing = await getOwnedSubscription(env, user, id);
     const patch: Partial<Pick<Subscription, 'filters' | 'targetUrl' | 'active'>> = {};
-    if (input.filters !== undefined) patch.filters = normalizeFilters(input.filters);
+    if (input.filters !== undefined) patch.filters = await normalizeFilters(env, input.filters);
     if (input.active !== undefined) {
       patch.active = input.active === true;
       if (patch.active && !existing.active) {

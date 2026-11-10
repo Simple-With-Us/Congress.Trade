@@ -112,7 +112,8 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
 
       expect(sentMessages.length).toBe(1);
       expect(sentMessages[0].message).toEqual({ type: 'filing.local_wait_check', docId: 'doc-scan-1' });
-      expect(sentMessages[0].options).toEqual({ delaySeconds: 900 });
+      // 2026-09-04 owner rule: 2-minute cap on the local Mac vision wait (was 15).
+      expect(sentMessages[0].options).toEqual({ delaySeconds: 2 * 60 });
     });
 
     it('sets status to classified and enqueues filing.extracted immediately when worker is offline/stale', async () => {
@@ -187,7 +188,10 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
       // scheduled again, stranding the filing until the hourly ceiling sweep
       // eventually rescued it (up to ~24h later).
       const env = makeEnv();
-      const futureExpires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      // 2026-09-04 owner rule: 2-minute cap on the local Mac vision wait.
+      // Set a future expiry 90s out so the test exercises the same lost-wakeup
+      // re-enqueue path without exceeding the new cap.
+      const futureExpires = new Date(Date.now() + 90 * 1000).toISOString();
       await d1.prepare(
         `INSERT INTO filings (doc_id, chamber, source_url, ingest_status, doc_kind, local_wait_expires_at, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).bind('doc-wait-active', 'house', 'https://example.com/a.pdf', 'extraction_pending_local', 'scanned_pdf', futureExpires, new Date().toISOString()).run();
@@ -202,9 +206,9 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
       expect(sentMessages.length).toBe(1);
       expect(sentMessages[0].message).toEqual({ type: 'filing.local_wait_check', docId: 'doc-wait-active' });
       const options = sentMessages[0].options as { delaySeconds: number };
-      // Remaining wait is ~10 minutes (600s); allow slack for test execution time.
-      expect(options.delaySeconds).toBeGreaterThan(500);
-      expect(options.delaySeconds).toBeLessThanOrEqual(600);
+      // Remaining wait is ~90s; allow slack for test execution time.
+      expect(options.delaySeconds).toBeGreaterThan(30);
+      expect(options.delaySeconds).toBeLessThanOrEqual(90);
     });
   });
 
@@ -378,24 +382,37 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
 
       expect(res.status).toBe(200);
 
-      const json = await res.json() as { ok: boolean; docId: string; published: boolean; txCount: number };
+      const json = await res.json() as {
+        ok: boolean;
+        docId: string;
+        published: boolean;
+        needsReview: boolean;
+        txCount: number;
+      };
       expect(json.ok).toBe(true);
       expect(json.docId).toBe('doc-local-vision-1');
-      expect(json.published).toBe(true);
+      expect(json.published).toBe(false);
+      expect(json.needsReview).toBe(true);
       expect(json.txCount).toBe(1);
 
       const txRow = await d1.prepare(
         `SELECT doc_id, ticker, source FROM transactions WHERE doc_id = ?`
       ).bind('doc-local-vision-1').first<{ doc_id: string; ticker: string; source: string }>();
 
-      expect(txRow?.ticker).toBe('NVDA');
-      expect(txRow?.source).toBe('local_mac');
+      expect(txRow).toBeNull();
 
       const filingRow = await d1.prepare(
         `SELECT ingest_status FROM filings WHERE doc_id = ?`
       ).bind('doc-local-vision-1').first<{ ingest_status: string }>();
 
-      expect(filingRow?.ingest_status).toBe('persisted');
+      expect(filingRow?.ingest_status).toBe('needs_review');
+
+      const review = await d1.prepare(
+        `SELECT reason, payload FROM review_queue WHERE doc_id = ?`
+      ).bind('doc-local-vision-1').first<{ reason: string; payload: string }>();
+      expect(review?.reason).toContain('needs_hand_check:mac_vision');
+      const staged = JSON.parse(review?.payload ?? '{}') as { transactionCount?: number };
+      expect(staged.transactionCount).toBe(1);
     });
 
     it('GET /api/admin/scanned-filings/pending excludes local_vision_exhausted parks', async () => {
@@ -1047,15 +1064,19 @@ describe('Local Vision Worker & Bounded Wait State (M1 / R1)', () => {
         txCount: number;
       };
       expect(json.ok).toBe(true);
-      expect(json.published).toBe(true);
-      expect(json.needsReview).toBe(false);
+      expect(json.published).toBe(false);
+      expect(json.needsReview).toBe(true);
       expect(json.txCount).toBe(1);
 
       const txRow = await d1.prepare(
         `SELECT ticker, source FROM transactions WHERE doc_id = ?`
       ).bind('doc-server-cpu-1').first<{ ticker: string; source: string }>();
-      expect(txRow?.ticker).toBe('NVDA');
-      expect(txRow?.source).toBe('server_cpu');
+      expect(txRow).toBeNull();
+
+      const review = await d1.prepare(
+        `SELECT reason FROM review_queue WHERE doc_id = ?`,
+      ).bind('doc-server-cpu-1').first<{ reason: string }>();
+      expect(review?.reason).toContain('needs_hand_check:scanned_vision');
     });
   });
 });

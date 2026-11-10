@@ -1,6 +1,51 @@
 import UIKit
 import UserNotifications
 
+/// Destination encoded on an APNs payload.  Fan-out historically sent
+/// camelCase (`docId`, `txIds`) while this delegate only read snake_case
+/// (`trade_id`, `doc_id`), so a tap did nothing.  Accept both.
+enum PushNotificationOpen: Equatable {
+    case trade(id: String)
+    case filing(docId: String)
+
+    static func parse(_ userInfo: [AnyHashable: Any]) -> PushNotificationOpen? {
+        if let tradeId = pushUserInfoString(userInfo, keys: ["trade_id", "tradeId"])
+            ?? pushUserInfoFirstString(userInfo["txIds"]) {
+            return .trade(id: tradeId)
+        }
+        if let docId = pushUserInfoString(userInfo, keys: ["doc_id", "docId"]) {
+            return .filing(docId: docId)
+        }
+        return nil
+    }
+}
+
+func pushUserInfoString(_ userInfo: [AnyHashable: Any], keys: [String]) -> String? {
+    for key in keys {
+        if let cleaned = pushUserInfoNonEmptyString(userInfo[key]) {
+            return cleaned
+        }
+    }
+    return nil
+}
+
+func pushUserInfoFirstString(_ value: Any?) -> String? {
+    if let items = value as? [Any] {
+        for item in items {
+            if let cleaned = pushUserInfoNonEmptyString(item) {
+                return cleaned
+            }
+        }
+    }
+    return pushUserInfoNonEmptyString(value)
+}
+
+func pushUserInfoNonEmptyString(_ value: Any?) -> String? {
+    guard let value, let text = value as? String else { return nil }
+    let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return cleaned.isEmpty ? nil : cleaned
+}
+
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(
         _ application: UIApplication,
@@ -46,18 +91,21 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        if let tradeId = userInfo["trade_id"] as? String {
+        switch PushNotificationOpen.parse(userInfo) {
+        case .trade(let tradeId):
             NotificationCenter.default.post(
                 name: NSNotification.Name("OpenTradeFromPush"),
                 object: nil,
                 userInfo: ["trade_id": tradeId]
             )
-        } else if let docId = userInfo["doc_id"] as? String {
+        case .filing(let docId):
             NotificationCenter.default.post(
                 name: NSNotification.Name("OpenFilingFromPush"),
                 object: nil,
                 userInfo: ["doc_id": docId]
             )
+        case nil:
+            break
         }
         completionHandler()
     }

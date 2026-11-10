@@ -7,9 +7,9 @@ const mocks = vi.hoisted(() => ({
     options: (env: Record<string, unknown>) => {
       tracesSampleRate: number;
       transportOptions: { fetch: typeof fetch };
-      beforeSend: (event: Record<string, unknown>) => Record<string, unknown>;
-      beforeSendTransaction: (event: Record<string, unknown>) => Record<string, unknown>;
-      beforeSendLog: (log: Record<string, unknown>) => Record<string, unknown>;
+      beforeSend: (event: Record<string, unknown>) => Record<string, unknown> | null;
+      beforeSendTransaction: (event: Record<string, unknown>) => Record<string, unknown> | null;
+      beforeSendLog: (log: Record<string, unknown>) => Record<string, unknown> | null;
     };
     handlerKeys: string[];
   }>,
@@ -20,9 +20,9 @@ vi.mock('#sentry', () => ({
     options: (env: Record<string, unknown>) => {
       tracesSampleRate: number;
       transportOptions: { fetch: typeof fetch };
-      beforeSend: (event: Record<string, unknown>) => Record<string, unknown>;
-      beforeSendTransaction: (event: Record<string, unknown>) => Record<string, unknown>;
-      beforeSendLog: (log: Record<string, unknown>) => Record<string, unknown>;
+      beforeSend: (event: Record<string, unknown>) => Record<string, unknown> | null;
+      beforeSendTransaction: (event: Record<string, unknown>) => Record<string, unknown> | null;
+      beforeSendLog: (log: Record<string, unknown>) => Record<string, unknown> | null;
     },
     handler: Record<string, unknown>,
   ) => {

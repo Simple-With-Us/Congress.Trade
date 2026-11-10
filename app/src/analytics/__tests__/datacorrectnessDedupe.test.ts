@@ -49,6 +49,7 @@ async function createInMemoryD1(): Promise<D1Database> {
     ALTER TABLE filers ADD COLUMN display_name TEXT;
     ALTER TABLE filings ADD COLUMN filing_status TEXT;
     ALTER TABLE transactions ADD COLUMN deprecated_at TEXT;
+    ALTER TABLE transactions ADD COLUMN asset_type_name TEXT;
   `);
 
   return {

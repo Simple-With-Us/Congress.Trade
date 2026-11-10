@@ -507,9 +507,27 @@ struct PushSettings: Equatable {
     ]
 
     static func amountLabel(_ min: Int?) -> String {
-        guard let min, min > 0 else { return "Any Amount" }
-        let formatted = min.formatted(.number.grouping(.automatic))
-        return "$\(formatted)+"
+        guard let min, min > 0 else { return "None" }
+        switch min {
+        case 1_001: return "$1k"
+        case 15_001: return "$15k"
+        case 50_001: return "$50k"
+        case 100_001: return "$100k"
+        case 250_001: return "$250k"
+        case 500_001: return "$500k"
+        case 1_000_001: return "$1m"
+        case 5_000_001: return "$5m"
+        case 25_000_001: return "$25m"
+        case 50_000_001: return "$50m"
+        default:
+            if min >= 1_000_000 {
+                return "$\(min / 1_000_000)m"
+            } else if min >= 1_000 {
+                return "$\(min / 1_000)k"
+            } else {
+                return "$\(min)"
+            }
+        }
     }
 
     init(mode: PushAlertMode, watchlistRules: [String: TickerAlertRule]) {
@@ -687,13 +705,58 @@ struct ClientTickerAnalytics: Decodable {
     }
 
     struct Trader: Decodable, Identifiable {
-        var id: String { filerId ?? (fullName ?? UUID().uuidString) }
+        /// Stored at decode time, never recomputed per access. The old
+        /// computed form minted a fresh UUID on every read when both
+        /// `filerId` and `fullName` were nil, so SwiftUI saw a new identity
+        /// each render (row churn, lost state).
+        let id: String
         let filerId: String?
         let fullName: String?
         let partyBucket: String?
         let photoUrl: String?
         let tradeCount: Int?
         let estVolumeUsd: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case filerId, fullName, partyBucket, photoUrl, tradeCount, estVolumeUsd
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            filerId = try container.decodeIfPresent(String.self, forKey: .filerId)
+            fullName = try container.decodeIfPresent(String.self, forKey: .fullName)
+            partyBucket = try container.decodeIfPresent(String.self, forKey: .partyBucket)
+            photoUrl = try container.decodeIfPresent(String.self, forKey: .photoUrl)
+            tradeCount = try container.decodeIfPresent(Int.self, forKey: .tradeCount)
+            estVolumeUsd = try container.decodeIfPresent(Double.self, forKey: .estVolumeUsd)
+            id = Self.stableID(
+                filerId: filerId, fullName: fullName, partyBucket: partyBucket,
+                photoUrl: photoUrl, tradeCount: tradeCount, estVolumeUsd: estVolumeUsd
+            )
+        }
+
+        /// Deterministic across decodes and processes: filer id wins, then a
+        /// normalized name, then an FNV-1a hash of the remaining fields.
+        /// `Hasher` is per-process randomized and must not be used here.
+        static func stableID(
+            filerId: String?, fullName: String?, partyBucket: String?,
+            photoUrl: String?, tradeCount: Int?, estVolumeUsd: Double?
+        ) -> String {
+            if let filerId = filerId?.trimmingCharacters(in: .whitespacesAndNewlines), !filerId.isEmpty {
+                return filerId
+            }
+            if let name = fullName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return "name:\(name.lowercased())"
+            }
+            let seed = [partyBucket ?? "", photoUrl ?? "", tradeCount.map(String.init) ?? "",
+                        estVolumeUsd.map { String($0) } ?? ""].joined(separator: "|")
+            var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+            for byte in seed.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 0x0000_0100_0000_01b3
+            }
+            return "anon:\(String(hash, radix: 16))"
+        }
     }
 
     struct Backtest: Decodable {
@@ -730,7 +793,7 @@ enum PartyFilter: String, CaseIterable, Identifiable {
         switch self {
         case .democrat: return "Democrats"
         case .republican: return "Republicans"
-        case .other: return "Other / Ind."
+        case .other: return "Other / No party"
         }
     }
 
@@ -747,13 +810,16 @@ enum PartyFilter: String, CaseIterable, Identifiable {
     var summaryLabel: String { rawValue }
 
     /// Buckets a raw member party string (e.g. "Democratic", "R",
-    /// "Independent") the same way the server's `asPartyBucket` does
+    /// "Independent") the same way the server's `PARTY_BUCKET_SQL` does
     /// (`app/src/analytics/sql.ts`): first letter D→Democrat, R→Republican,
-    /// anything else non-empty→Other. `nil` for an empty/unresolved value.
-    /// Still used as a local belt-and-suspenders pass; the feed now also
-    /// accepts `party=` CSV (`asPartyBuckets`).
-    static func bucket(for raw: String?) -> PartyFilter? {
-        guard let first = raw?.trimmingCharacters(in: .whitespacesAndNewlines).first else { return nil }
+    /// EVERYTHING else — Independent, minor parties and an empty or missing
+    /// party (executive-branch / manual / seed filers) — → Other, labelled
+    /// "Other / No party".  Total on purpose: the server's `party=O` returns
+    /// the no-party rows (board efd94c45), so this local belt-and-suspenders
+    /// pass must never drop them.  The feed also accepts `party=` CSV
+    /// (`asPartyBuckets`).
+    static func bucket(for raw: String?) -> PartyFilter {
+        guard let first = raw?.trimmingCharacters(in: .whitespacesAndNewlines).first else { return .other }
         switch first.uppercased() {
         case "D": return .democrat
         case "R": return .republican
@@ -1038,6 +1104,31 @@ struct Subscription: Decodable, Identifiable {
     let hasSecret: Bool
     let secret: String?
     let streamUrl: String?
+    /// filer id -> display name for `filters.members`; sent by
+    /// `GET /api/client/v1/subscriptions` (absent on the create response).
+    let memberLabels: [String: String]?
+    /// `filters.members` entries that are not a known filer id: free text saved
+    /// before the server resolved member names.  They can never match a trade.
+    let unresolvedMembers: [String]?
+
+    /// One-line members-filter description for the Delivery list, `nil` when the
+    /// subscription does not filter by member.
+    var memberSummary: String? {
+        let ids = filters.members ?? []
+        guard !ids.isEmpty else { return nil }
+        let dead = Set(unresolvedMembers ?? [])
+        let names = ids.filter { !dead.contains($0) }.map { memberLabels?[$0] ?? $0 }
+        var parts: [String] = []
+        if !names.isEmpty {
+            let shown = names.prefix(2).joined(separator: ", ")
+            parts.append(names.count > 2 ? "\(shown) +\(names.count - 2) more" : shown)
+        }
+        let unmatched = ids.filter { dead.contains($0) }
+        if !unmatched.isEmpty {
+            parts.append("Not matched: \(unmatched.joined(separator: ", ")) (delete and recreate this delivery)")
+        }
+        return "Members: " + parts.joined(separator: " · ")
+    }
 }
 
 struct DeliveryCredential: Identifiable, Equatable {
@@ -1289,16 +1380,34 @@ enum TimeRange: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
+    /// Owner 2026-09-21 ask: surface set excludes `.thirtyDays` (1 Month
+    /// has <10% of the 3-Month count and is misleading given the 45-day
+    /// STOCK Act reporting window) and `.all` ("All Time" timed out on
+    /// iOS even when it returned the same count as 5 Years; 5-year
+    /// retention is now the longest available window). The enum cases
+    /// stay in place so persisted UserDefaults values from older builds
+    /// still decode cleanly; this computed set is what the picker UI
+    /// iterates over.
+    static var surfaceCases: [TimeRange] {
+        [.ninetyDays, .sixMonths, .oneYear, .fiveYears, .thisCalendarYear, .lastCalendarYear]
+    }
+
     var label: String {
         switch self {
-        case .thirtyDays: return "Month"
+        case .thirtyDays: return "1 Month" // Owner 2026-09-21 ask: 1-month view has
+        // less than 10% of the 3-month count and is actively misleading
+        // given the 45-day STOCK Act reporting window. Kept as a legacy
+        // enum case for backward compat with persisted UserDefaults, but
+        // no longer surfaced in the picker UI (see TradesFilterSheet).
         case .ninetyDays: return "3 Months"
         case .sixMonths: return "6 Months"
-        case .oneYear: return "Year"
+        case .oneYear: return "1 Year" // Owner 2026-09-21 ask: rename from "Year"
         case .fiveYears: return "5 Years"
         case .thisCalendarYear: return "This Year"
         case .lastCalendarYear: return "Last Year"
-        case .all: return "All Time"
+        case .all: return "All Time" // Owner 2026-09-21 ask: "All Time" timed out
+        // on iOS even when it returned the same count as 5 Years; the 5-year
+        // retention cap is now the longest available window.
         }
     }
 
@@ -1314,13 +1423,22 @@ enum TimeRange: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// Window string for analytics endpoints. Calendar-year cases map to a
-    /// day-count window large enough to cover the range; the feed still uses
-    /// exact `from`/`to` ISO bounds below.
+    /// Window string for analytics endpoints.
+    ///
+    /// The calendar-year cases used to be flattened to `"365d"` on the theory
+    /// that the analytics API only understood day counts.  It does not:
+    /// `app/src/analytics/sql.ts:43` has `CALENDAR_WINDOWS = new Set(['this_cy',
+    /// 'last_cy'])` and validates both as first-class windows, which is what the
+    /// web app sends.  The substitution made two of the ten range chips show
+    /// trailing-365-day figures under a calendar-year label — and disagree with
+    /// the Trades list directly underneath, which has always used the exact
+    /// `from`/`to` bounds from `fromDateISO`/`toDateISO` on this same enum.
     var analyticsWindow: String {
         switch self {
-        case .thisCalendarYear, .lastCalendarYear:
-            return "365d"
+        case .thisCalendarYear:
+            return "this_cy"
+        case .lastCalendarYear:
+            return "last_cy"
         case .all:
             return "all"
         default:
@@ -1472,6 +1590,7 @@ struct MemberLeaderboardItem: Decodable, Identifiable {
     let party: String?
     let chamber: String?
     let state: String?
+    let photoUrl: String?
     let tradeCount: Int?
     let buyCount: Int?
     let sellCount: Int?
@@ -1640,22 +1759,41 @@ struct ConflictCandidateResponse: Decodable {
     let count: Int?
 }
 
+/// Mirrors `GET /api/analytics/conflicts` exactly (`app/src/analytics/routes.ts`
+/// `r.get('/conflicts')`, documented in `app/docs/client-mobile-api.md`).
+///
+/// The previous shape was invented against an endpoint that never existed: it
+/// required `bioguideId`, `committeeCode` and `date`, none of which the route
+/// emits, so every decode threw and `try?` turned the whole Committee Sector
+/// Conflicts section into "empty" — silently, on every launch, since #1832.
+/// Only `id` is required now; anything the route can null out is optional, so a
+/// single null field can never blank the section again.
 struct ConflictCandidateItem: Decodable, Identifiable {
-    var id: String { "\(bioguideId)_\(committeeCode)_\(ticker)_\(date)" }
-    let bioguideId: String
+    /// The trade id — unique per conflict row, since the route emits at most
+    /// one row per trade.
+    let id: String
+    let ticker: String?
+    let sector: String?
+    let txType: String?
+    let txDate: String?
+    let filerId: String?
     let memberName: String?
+    let chamber: String?
     let partyBucket: String?
-    let photoUrl: String?
-    let committeeCode: String
-    let committeeName: String?
-    let sector: String
-    let ticker: String
-    let companyName: String?
-    let date: String
-    let txType: String
-    let amountMin: Double?
-    let amountMax: Double?
-    let estVolumeUsd: Double?
+    /// Committee names that triggered the flag. The route always sends a
+    /// non-empty array here (rows with none are filtered out server-side).
+    let viaCommittees: [String]?
+    let estAmountUsd: Double?
+
+    /// Stable id for the member sheet: the filer id, falling back to the row id
+    /// so a row missing `filerId` still opens something rather than crashing.
+    var memberTargetId: String { filerId ?? id }
+    var displayName: String { memberName ?? filerId ?? "Unknown filer" }
+    var committees: [String] { viaCommittees ?? [] }
+    /// "Committee · Sector" subtitle, skipping whichever half is absent.
+    var contextLine: String {
+        [committees.first, sector].compactMap { $0 }.joined(separator: " · ")
+    }
 }
 
 // MARK: - Company Name Normalization Helper
@@ -1857,6 +1995,9 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
     let status: String?
     let detail: String?
     let value: Double?
+    /// `st_peer_prices` check only: tickers ST cannot price (CT-2443). Nil for
+    /// scalar values and older servers that do not send it.
+    let notCovered: Int?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1864,6 +2005,11 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
         status = FailSoftJSON.string(c, .status)
         detail = FailSoftJSON.string(c, .detail)
         value = FailSoftJSON.double(c, .value)
+        if let nested = try? c.nestedContainer(keyedBy: CheckValueKeys.self, forKey: .value) {
+            notCovered = FailSoftJSON.int(nested, .notCovered)
+        } else {
+            notCovered = nil
+        }
     }
 
     var statusLabel: String {
@@ -1879,6 +2025,10 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case id, status, detail, value
+    }
+
+    private enum CheckValueKeys: String, CodingKey {
+        case notCovered
     }
 }
 

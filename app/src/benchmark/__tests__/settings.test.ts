@@ -58,7 +58,7 @@ const OLD = {
 
 const NEW = {
   a: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-  b: { provider: 'openrouter', model: 'google/gemini-3.7-flash' },
+  b: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
   c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
 };
 
@@ -69,7 +69,7 @@ const OLD_ROLES = {
 
 const NEW_ROLES = {
   primary: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-  failover: { provider: 'openrouter', model: 'google/gemini-3.7-flash' },
+  failover: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
 };
 
 function dependencies(state: Record<string, string>, options: { failOnce?: string } = {}) {
@@ -176,7 +176,7 @@ describe('benchmark lineup settings', () => {
       ],
     });
     expect(state.AGREEMENT_SENATE_MODEL_C).toBe('openrouter:openai/gpt-5.6-terra');
-    expect(state.AGREEMENT_SENATE_MODEL_D).toBe('openrouter:google/gemini-3.7-flash');
+    expect(state.AGREEMENT_SENATE_MODEL_D).toBe('openrouter:google/gemini-3.8-flash');
     expect(state.AGREEMENT_SENATE_MODEL_E).toBe('openrouter:anthropic/claude-sonnet-5');
   });
 
@@ -195,7 +195,7 @@ describe('benchmark lineup settings', () => {
     expect(saved.settings).toMatchObject({ lineup: NEW, valid: true });
     expect(saved.audit).toMatchObject({ readbackVerified: true, rollbackAttempted: false });
     expect(state.AGREEMENT_HOUSE_MODEL_C).toBe('openrouter:openai/gpt-5.6-terra');
-    expect(state.AGREEMENT_HOUSE_MODEL_D).toBe('openrouter:google/gemini-3.7-flash');
+    expect(state.AGREEMENT_HOUSE_MODEL_D).toBe('openrouter:google/gemini-3.8-flash');
     expect(state.AGREEMENT_HOUSE_MODEL_E).toBe('openrouter:anthropic/claude-sonnet-5');
   });
 
@@ -391,7 +391,7 @@ describe('benchmark primary/failover role settings', () => {
       writtenKeys: ['AGREEMENT_SENATE_MODEL_A', 'AGREEMENT_SENATE_MODEL_B'],
     });
     expect(state.AGREEMENT_SENATE_MODEL_A).toBe('openrouter:openai/gpt-5.6-terra');
-    expect(state.AGREEMENT_SENATE_MODEL_B).toBe('openrouter:google/gemini-3.7-flash');
+    expect(state.AGREEMENT_SENATE_MODEL_B).toBe('openrouter:google/gemini-3.8-flash');
   });
 
   it('rejects a stale optimistic version before any write', async () => {

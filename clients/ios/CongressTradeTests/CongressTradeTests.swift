@@ -1,5 +1,6 @@
 import AuthenticationServices
 import Foundation
+import StoreKit
 import SwiftData
 import SwiftUI
 import UIKit
@@ -106,7 +107,7 @@ final class CongressTradeTests: XCTestCase {
     }
 
     func testTimeRangeLabelsMatchWebsiteWithoutPastPrefix() {
-        XCTAssertEqual(TimeRange.thirtyDays.label, "Month")
+        XCTAssertEqual(TimeRange.thirtyDays.label, "1 Month")
         XCTAssertEqual(TimeRange.ninetyDays.label, "3 Months")
         XCTAssertEqual(TimeRange.all.label, "All Time")
         for range in TimeRange.allCases {
@@ -124,15 +125,43 @@ final class CongressTradeTests: XCTestCase {
     }
 
     func testHeaderChromeIsOpaqueCardNotTranslucentPanel() {
-        AppTheme.currentPalette = .light
-        // Solid white header/filter chrome.  panel is 92% white and composites
-        // over the cool page as a blue wash (owner screenshots 2026-08-22).
-        XCTAssertEqual(UIColor(AppTheme.headerChrome).cgColor.alpha, 1.0, accuracy: 0.001)
-        XCTAssertEqual(UIColor(AppTheme.card).cgColor.alpha, 1.0, accuracy: 0.001)
-        XCTAssertLessThan(UIColor(AppTheme.panel).cgColor.alpha, 0.99)
-        AppTheme.currentPalette = .dark
-        XCTAssertEqual(UIColor(AppTheme.headerChrome).cgColor.alpha, 1.0, accuracy: 0.001)
-        AppTheme.currentPalette = .light
+        let lightTraits = UITraitCollection(userInterfaceStyle: .light)
+        let darkTraits = UITraitCollection(userInterfaceStyle: .dark)
+        // Solid header/filter chrome in both light and dark.
+        XCTAssertEqual(UIColor(AppTheme.headerChrome).resolvedColor(with: lightTraits).cgColor.alpha, 1.0, accuracy: 0.001)
+        XCTAssertEqual(UIColor(AppTheme.card).resolvedColor(with: lightTraits).cgColor.alpha, 1.0, accuracy: 0.001)
+        XCTAssertLessThan(UIColor(AppTheme.panel).resolvedColor(with: lightTraits).cgColor.alpha, 0.99)
+        XCTAssertEqual(UIColor(AppTheme.headerChrome).resolvedColor(with: darkTraits).cgColor.alpha, 1.0, accuracy: 0.001)
+        XCTAssertEqual(UIColor(AppTheme.card).resolvedColor(with: darkTraits).cgColor.alpha, 1.0, accuracy: 0.001)
+    }
+
+    func testLightSemanticTextMeetsWcagAaOnCardBackgroundCT1356() {
+        let lightTraits = UITraitCollection(userInterfaceStyle: .light)
+        let card = UIColor(AppTheme.card).resolvedColor(with: lightTraits)
+        let positive = UIColor(AppTheme.semanticPositive).resolvedColor(with: lightTraits)
+        let negative = UIColor(AppTheme.semanticNegative).resolvedColor(with: lightTraits)
+        let caution = UIColor(AppTheme.semanticCaution).resolvedColor(with: lightTraits)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: positive, background: card), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: negative, background: card), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.wcagContrast(foreground: caution, background: card), 4.5)
+        // Regression: system green on white is well below 4.5:1.
+        XCTAssertLessThan(Self.wcagContrast(foreground: .systemGreen, background: .white), 4.5)
+    }
+
+    private static func wcagContrast(foreground: UIColor, background: UIColor) -> CGFloat {
+        func relativeLuminance(_ color: UIColor) -> CGFloat {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            color.getRed(&r, green: &g, blue: &b, alpha: &a)
+            func channel(_ c: CGFloat) -> CGFloat {
+                c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        let l1 = relativeLuminance(foreground)
+        let l2 = relativeLuminance(background)
+        let lighter = max(l1, l2)
+        let darker = min(l1, l2)
+        return (lighter + 0.05) / (darker + 0.05)
     }
 
     func testSignedFlowFormatUsesUnicodeMinusOnOneLine() {
@@ -191,12 +220,16 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertFalse(line.contains("in this window"))
     }
 
-    func testMemberPhotoURLPrefersAPIThenSeedAndIgnoresRelativePaths() {
+    func testMemberPhotoURLPrefersAPIThenSeedAndResolvesRelativePaths() {
         let api = "https://congress.trade/api/photos/member?key=K000389"
         let seed = "https://example.test/seed.jpg"
         XCTAssertEqual(MemberPhotoURL.resolve(api, seed)?.absoluteString, api)
         XCTAssertEqual(MemberPhotoURL.resolve(nil, seed)?.absoluteString, seed)
-        XCTAssertNil(MemberPhotoURL.resolve("/api/photos/member?key=K000389", ""))
+        // CT-2459: relative paths resolve against the site origin instead of
+        // being dropped (Directory rows silently fell back to initials).
+        XCTAssertEqual(
+            MemberPhotoURL.resolve("/api/photos/member?key=K000389", "")?.absoluteString, api
+        )
         XCTAssertNil(MemberPhotoURL.resolve(nil, nil))
     }
 
@@ -285,8 +318,8 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(settings.mode, .watchlist)
         XCTAssertEqual(settings.watchlistRules["NVDA"]?.minAmount, 50001)
         XCTAssertEqual(settings.watchlistRules["NVDA"]?.sides, .buys)
-        XCTAssertEqual(PushSettings.amountLabel(nil), "Any Amount")
-        XCTAssertEqual(PushSettings.amountLabel(15001), "$15,001+")
+        XCTAssertEqual(PushSettings.amountLabel(nil), "None")
+        XCTAssertEqual(PushSettings.amountLabel(15001), "$15k")
         XCTAssertEqual(PushSettings.amountCutoffs.first, 1001)
         XCTAssertEqual(PushAlertMode.allCases.map(\.label), ["Off", "New Filings", "Watchlist"])
     }
@@ -327,6 +360,41 @@ final class CongressTradeTests: XCTestCase {
         let data = try JSONEncoder().encode(filters)
         let decoded = try JSONDecoder().decode(SubscriptionFilters.self, from: data)
         XCTAssertEqual(decoded, filters, "Every documented SubscriptionFilters field must survive an encode/decode round trip")
+    }
+
+    func testSubscriptionMemberSummaryNamesMembersAndFlagsUnmatchedEntries() throws {
+        // `GET /api/client/v1/subscriptions` adds memberLabels (filer id -> name) and
+        // unresolvedMembers (free text saved before names were resolved; board a6058af2).
+        let json = """
+        {"id":"sub_1","delivery":"sse","targetUrl":null,
+         "filters":{"members":["P000197","S000510","C001047","Nancy Pelosii"]},
+         "cursor":0,"active":true,"createdAt":"2026-01-01T00:00:00.000Z","hasSecret":true,
+         "memberLabels":{"P000197":"Nancy Pelosi","S000510":"Adam Smith","C001047":"Shelley Moore Capito"},
+         "unresolvedMembers":["Nancy Pelosii"]}
+        """
+        let sub = try JSONDecoder().decode(Subscription.self, from: Data(json.utf8))
+        XCTAssertEqual(
+            sub.memberSummary,
+            "Members: Nancy Pelosi, Adam Smith +1 more · Not matched: Nancy Pelosii (delete and recreate this delivery)"
+        )
+
+        // No members filter, or an old server that sends no labels, must not break decoding.
+        let plain = try JSONDecoder().decode(
+            Subscription.self,
+            from: Data("""
+            {"id":"sub_2","delivery":"sse","filters":{},"cursor":0,"active":true,
+             "createdAt":"2026-01-01T00:00:00.000Z","hasSecret":true}
+            """.utf8)
+        )
+        XCTAssertNil(plain.memberSummary)
+        let unlabeled = try JSONDecoder().decode(
+            Subscription.self,
+            from: Data("""
+            {"id":"sub_3","delivery":"sse","filters":{"members":["EXEC-FRANK-J-BISIGNANO"]},"cursor":0,
+             "active":true,"createdAt":"2026-01-01T00:00:00.000Z","hasSecret":true}
+            """.utf8)
+        )
+        XCTAssertEqual(unlabeled.memberSummary, "Members: EXEC-FRANK-J-BISIGNANO")
     }
 
     func testSubscriptionFiltersDecodeDoesNotDropBackendOnlyFields() throws {
@@ -732,6 +800,91 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(feedAttempts, 2, "A transient 503 should be retried once before succeeding")
         XCTAssertEqual(recordedDelays.count, 1)
         XCTAssertNil(store.feedNotice)
+    }
+
+    @MainActor
+    func testTrendsTransient502IsRetriedThenSucceeds() async throws {
+        var summaryAttempts = 0
+        var recordedDelays: [Double] = []
+        MockURLProtocol.handler = { request in
+            if request.url?.path.contains("/api/analytics/summary") == true {
+                summaryAttempts += 1
+                if summaryAttempts == 1 {
+                    let response = HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 502,
+                        httpVersion: nil,
+                        headerFields: [:]
+                    )!
+                    return (response, Data("{\"error\":\"Request failed\"}".utf8))
+                }
+                return Self.response(for: request, json: #"{"totalTrades":4}"#)
+            }
+            return Self.trendsEndpointResponse(for: request)
+        }
+
+        let store = CongressTradeStore(
+            api: CongressTradeAPIClient(baseURL: Self.baseURL, tokenStore: MemoryTokenStore(token: nil), session: makeSession()),
+            cursorStore: InMemorySyncCursorStore(),
+            sleeper: { seconds in recordedDelays.append(seconds) }
+        )
+        await store.refreshTrends()
+
+        XCTAssertEqual(summaryAttempts, 2, "A transient Trends 502 should be retried once before succeeding")
+        XCTAssertEqual(recordedDelays.count, 1)
+        XCTAssertNil(store.trendsNotice)
+        XCTAssertEqual(store.analyticsSummary?.totalTrades, 4)
+    }
+
+    @MainActor
+    func testTrendsExhausted502UsesHumanCopyNotRequestFailed() async throws {
+        var summaryAttempts = 0
+        MockURLProtocol.handler = { request in
+            if request.url?.path.contains("/api/analytics/summary") == true {
+                summaryAttempts += 1
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 502,
+                    httpVersion: nil,
+                    headerFields: [:]
+                )!
+                return (response, Data("{\"error\":\"Request failed\"}".utf8))
+            }
+            return Self.trendsEndpointResponse(for: request)
+        }
+
+        let store = CongressTradeStore(
+            api: CongressTradeAPIClient(baseURL: Self.baseURL, tokenStore: MemoryTokenStore(token: nil), session: makeSession()),
+            cursorStore: InMemorySyncCursorStore(),
+            sleeper: { _ in }
+        )
+        await store.refreshTrends()
+
+        XCTAssertEqual(summaryAttempts, 3)
+        XCTAssertEqual(store.trendsNotice, "The site is updating (502).  Pull to refresh.")
+        XCTAssertFalse((store.trendsNotice ?? "").contains("Request failed"))
+    }
+
+    @MainActor
+    func testInboundTrade404UsesHonestNotFoundCopy() async throws {
+        MockURLProtocol.handler = { request in
+            XCTAssertTrue(request.url?.path.hasSuffix("/trade/missing") == true)
+            let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: [:])!
+            return (response, Data("{\"error\":\"trade not found\"}".utf8))
+        }
+
+        let store = CongressTradeStore(
+            api: CongressTradeAPIClient(baseURL: Self.baseURL, tokenStore: MemoryTokenStore(token: nil), session: makeSession()),
+            cursorStore: InMemorySyncCursorStore(),
+            sleeper: { _ in }
+        )
+        let trade = await store.fetchInboundTrade(id: "missing")
+
+        XCTAssertNil(trade)
+        XCTAssertEqual(
+            store.feedNotice,
+            "That trade was not found.  It may have been retracted or the share link is outdated."
+        )
     }
 
     @MainActor
@@ -1224,15 +1377,19 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertFalse(TradeTypeFilter.exchange.matches(txType: "B"))
     }
 
-    func testPartyFilterBucketsMirrorServerAsPartyBucket() {
-        // Mirrors `asPartyBucket` in `app/src/analytics/sql.ts`: first
-        // letter D/R, anything else non-empty is Other, empty/nil unresolved.
+    func testPartyFilterBucketsMirrorServerPartyBucketSQL() {
+        // Mirrors `PARTY_BUCKET_SQL` in `app/src/analytics/sql.ts`: first
+        // letter D/R, EVERYTHING else (incl. empty/nil = no party on file) is
+        // Other, so D + R + O partitions the feed (board efd94c45).
         XCTAssertEqual(PartyFilter.bucket(for: "Democratic"), .democrat)
         XCTAssertEqual(PartyFilter.bucket(for: "d"), .democrat)
         XCTAssertEqual(PartyFilter.bucket(for: "Republican"), .republican)
         XCTAssertEqual(PartyFilter.bucket(for: "Independent"), .other)
-        XCTAssertNil(PartyFilter.bucket(for: ""))
-        XCTAssertNil(PartyFilter.bucket(for: nil))
+        XCTAssertEqual(PartyFilter.bucket(for: "Libertarian"), .other)
+        XCTAssertEqual(PartyFilter.bucket(for: ""), .other)
+        XCTAssertEqual(PartyFilter.bucket(for: "   "), .other)
+        XCTAssertEqual(PartyFilter.bucket(for: nil), .other)
+        XCTAssertEqual(PartyFilter.other.label, "Other / No party")
     }
 
     func testTimeRangeCalendarYearBounds() {
@@ -1260,6 +1417,106 @@ final class CongressTradeTests: XCTestCase {
         let offline = APIError.transport(URLError(.notConnectedToInternet))
         XCTAssertFalse(offline.isCancellation)
         XCTAssertTrue(offline.isOffline)
+    }
+
+    func testAPIErrorUserFacingMessageHidesRawTransportPhrase() {
+        let updating = APIError.server(status: 502, message: "Request failed", retryAfterSeconds: nil)
+        XCTAssertEqual(updating.userFacingMessage, "The site is updating (502).  Pull to refresh.")
+        XCTAssertEqual(
+            APIError.server(status: 503, message: "try again", retryAfterSeconds: nil).userFacingMessage,
+            "The site is updating (503).  Pull to refresh."
+        )
+        XCTAssertEqual(
+            APIError.server(status: 429, message: "Request failed", retryAfterSeconds: 2).userFacingMessage,
+            "Too many requests.  Pull to refresh."
+        )
+        XCTAssertEqual(
+            APIError.server(status: 400, message: "bad request", retryAfterSeconds: nil).userFacingMessage,
+            "bad request"
+        )
+        XCTAssertEqual(
+            APIError.server(status: 400, message: "Request failed", retryAfterSeconds: nil).userFacingMessage,
+            "Could not load this page (400).  Pull to refresh."
+        )
+        XCTAssertEqual(
+            APIError.transport(URLError(.notConnectedToInternet)).userFacingMessage,
+            "You are offline."
+        )
+        XCTAssertEqual(
+            APIError.transport(URLError(.timedOut)).userFacingMessage,
+            "Could not reach the server.  Pull to refresh."
+        )
+        XCTAssertNotEqual(
+            APIError.transport(URLError(.timedOut)).userFacingMessage,
+            URLError(.timedOut).localizedDescription
+        )
+    }
+
+    func testAppDeepLinkParsesWebsiteQueryAndCustomSchemeEquivalents() {
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "https://congress.trade/?trade=tx_1")!),
+            .trade(id: "tx_1")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "https://congress.trade/?member=P000197")!),
+            .member(id: "P000197")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "https://www.congress.trade/?ticker=nvda")!),
+            .ticker(symbol: "NVDA")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "congresstrade://?trade=tx_1")!),
+            .trade(id: "tx_1")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "congresstrade://member/P000197")!),
+            .member(id: "P000197")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "congresstrade://ticker/msft")!),
+            .ticker(symbol: "MSFT")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "congresstrade://auth?token=abc")!),
+            .auth(token: "abc")
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "https://congress.trade/?view=directory")!),
+            .tab(.people)
+        )
+        XCTAssertEqual(
+            AppDeepLink.parse(URL(string: "https://congress.trade/?ticker=NVDA&trade=tx_1")!),
+            .ticker(symbol: "NVDA")
+        )
+    }
+
+    func testPushNotificationOpenReadsShippedFanoutCamelCaseAndSnakeCase() {
+        XCTAssertEqual(
+            PushNotificationOpen.parse(["docId": "H-1", "txIds": ["tx_1", "tx_2"]]),
+            .trade(id: "tx_1")
+        )
+        XCTAssertEqual(
+            PushNotificationOpen.parse(["trade_id": "tx_9", "doc_id": "H-2"]),
+            .trade(id: "tx_9")
+        )
+        XCTAssertEqual(
+            PushNotificationOpen.parse(["docId": "H-3"]),
+            .filing(docId: "H-3")
+        )
+        XCTAssertNil(PushNotificationOpen.parse(["kind": "official_filing"]))
+        XCTAssertNil(PushNotificationOpen.parse(["docId": "  "]))
+    }
+
+    func testAppDeepLinkStaysHonestOnMissingOrUnknownQueries() {
+        XCTAssertNil(AppDeepLink.parse(URL(string: "https://congress.trade/")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "https://congress.trade/?trade=")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "https://congress.trade/?member=%20")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "https://congress.trade/?foo=bar")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "https://congress.trade/?view=review")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "congresstrade://auth")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "congresstrade://unknown/xyz")!))
+        XCTAssertNil(AppDeepLink.parse(URL(string: "mailto:support@congress.trade")!))
     }
 
     func testTradePerformanceResponseDecodesAvailableAndEmpty() throws {
@@ -1367,19 +1624,16 @@ final class CongressTradeTests: XCTestCase {
         var splitURL: URL?
         var leaderboardURL: URL?
         MockURLProtocol.handler = { request in
-            if request.url?.path.hasSuffix("/bootstrap") == true {
-                return Self.response(for: request, json: Self.bootstrapJSON)
-            }
             if request.url?.path.contains("/api/analytics/party-split") == true {
                 splitURL = request.url
             }
             if request.url?.path.contains("/api/analytics/ticker-leaderboard") == true {
                 leaderboardURL = request.url
             }
-            if request.url?.path.contains("/feed") == true {
-                return Self.response(for: request, json: Self.feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
-            }
-            return Self.response(for: request, json: "{}")
+            // Valid fan-out envelopes: a bare "{}" fails member-leaderboard
+            // decode, the fan-out throws, and its still-queued sibling tasks
+            // are cancelled before firing — racing this capture on slow CI.
+            return Self.trendsEndpointResponse(for: request)
         }
 
         await store.setPartySelection([.democrat])
@@ -1419,6 +1673,98 @@ final class CongressTradeTests: XCTestCase {
         let components = try XCTUnwrap(URLComponents(url: XCTUnwrap(tickerURL), resolvingAgainstBaseURL: false))
         XCTAssertEqual(components.queryItems?.first(where: { $0.name == "type" })?.value, "B")
         XCTAssertEqual(components.queryItems?.first(where: { $0.name == "window" })?.value, "90d")
+    }
+
+    /// CT-2459 review fix: the feed memo signature must notice in-place
+    /// row edits (poll upserts mutate cached rows), not just id churn.
+    func testFeedContentDigestChangesOnInPlaceRowEdit() {
+        let trade = Self.makeTrade(id: "tx_digest", cursor: 1)
+        let before = FeedDashboardView.feedContentDigest([trade])
+        trade.transaction.amountMax = 999_000
+        XCTAssertNotEqual(before, FeedDashboardView.feedContentDigest([trade]))
+        trade.member.chamber = "senate"
+        XCTAssertNotEqual(before, FeedDashboardView.feedContentDigest([trade]))
+    }
+
+    func testCachedImageLoaderSessionCarriesSafariUA() {
+        let headers = CachedImageLoader.session.configuration.httpAdditionalHeaders
+        let ua = headers?["User-Agent"] as? String
+        XCTAssertTrue(ua?.contains("Safari") == true)
+    }
+
+    /// CT-2461: `AssetMark` must start its own load while it has no image.
+    /// Its `.task` once sat on a childless `Group`, so it never ran and every
+    /// ticker logo vanished with no error and no request.
+    @MainActor
+    func testAssetMarkRequestsAndShowsLogoFromEmptyState() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+        let requested = expectation(description: "logo requested")
+        requested.assertForOverFulfill = false
+        MockURLProtocol.handler = { request in
+            requested.fulfill()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "image/png"]
+            )
+            return (try XCTUnwrap(response), png)
+        }
+        let host = hostAssetMark(symbol: "AAPL", size: 40)
+        defer { host.teardown() }
+
+        await fulfillment(of: [requested], timeout: 5)
+        let width = await host.settledWidth(until: { $0 > 0 })
+        XCTAssertEqual(width, 40, accuracy: 0.5)
+    }
+
+    /// CT-2461: a ticker with no logo still takes no width (no placeholder).
+    @MainActor
+    func testAssetMarkTakesNoWidthWhenLogoIsMissing() async throws {
+        let requested = expectation(description: "logo requested")
+        requested.assertForOverFulfill = false
+        MockURLProtocol.handler = { request in
+            requested.fulfill()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 404, httpVersion: nil, headerFields: nil
+            )
+            return (try XCTUnwrap(response), Data())
+        }
+        let host = hostAssetMark(symbol: "NOLOGO", size: 40)
+        defer { host.teardown() }
+
+        await fulfillment(of: [requested], timeout: 5)
+        let width = await host.settledWidth(until: { _ in false })
+        XCTAssertEqual(width, 0, accuracy: 0.5)
+    }
+
+    /// CT-2461: one logo at two sizes must not share a decoded thumbnail.
+    func testCachedImageLoaderKeysOnPixelSize() async throws {
+        let png = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 200)).pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
+        }
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url), statusCode: 200, httpVersion: nil, headerFields: nil
+            )
+            return (try XCTUnwrap(response), png)
+        }
+        let original = CachedImageLoader.session
+        CachedImageLoader.session = makeSession()
+        CachedImageLoader.cache.removeAllObjects()
+        defer {
+            CachedImageLoader.session = original
+            CachedImageLoader.cache.removeAllObjects()
+        }
+        let url = try XCTUnwrap(URL(string: "https://example.test/api/logos/ticker?symbol=SIZE"))
+
+        let small = await CachedImageLoader.load(url: url, maxPixelSize: 20)
+        let large = await CachedImageLoader.load(url: url, maxPixelSize: 100)
+
+        XCTAssertEqual(small?.cgImage?.width, 20)
+        XCTAssertEqual(large?.cgImage?.width, 100)
     }
 
     /// Multi-select Trade Type pill: `type=` is CSV-capable (`asTxTypes`).
@@ -1878,6 +2224,25 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertFalse(PremiumPricing.deliveryUpgradeMessage.localizedCaseInsensitiveContains("congress.trade"))
         XCTAssertTrue(PremiumPricing.deliveryUpgradeMessage.localizedCaseInsensitiveContains("in-app purchase"))
 
+        let purchaseMsg = PremiumPricing.purchaseFailureMessage(
+            APIError.transport(URLError(.notConnectedToInternet))
+        )
+        XCTAssertTrue(purchaseMsg.localizedCaseInsensitiveContains("offline"))
+        XCTAssertFalse(purchaseMsg.localizedCaseInsensitiveContains("Apple took the purchase"))
+
+        let redeemMsg = PremiumPricing.redeemFailureMessage(
+            APIError.server(status: 400, message: "Command failed", retryAfterSeconds: nil)
+        )
+        XCTAssertTrue(redeemMsg.localizedCaseInsensitiveContains("Apple took the purchase"))
+        XCTAssertTrue(redeemMsg.localizedCaseInsensitiveContains("Restore Purchases"))
+
+        XCTAssertTrue(PremiumPricing.isQuietPurchaseCancellation(
+            NSError(domain: SKErrorDomain, code: SKError.paymentCancelled.rawValue)
+        ))
+        XCTAssertFalse(PremiumPricing.isQuietPurchaseCancellation(
+            APIError.server(status: 400, message: "nope", retryAfterSeconds: nil)
+        ))
+
         let pricing = AppLegal.destinations.first { $0.id == "pricing" }
         XCTAssertEqual(pricing?.id, "pricing")
         XCTAssertFalse(AppLegal.opensSafari(pricing!))
@@ -1890,6 +2255,297 @@ final class CongressTradeTests: XCTestCase {
             AppLegal.footerDestinations(includePricing: true, canOpenInAppPurchase: true)
                 .contains { $0.id == "pricing" }
         )
+    }
+
+    // MARK: - StoreKit-driven Premium copy (no hardcoded prices/trial lengths)
+
+    /// Reference numbers kept here as XCTest fixtures only — never used as
+    /// UI copy.  US storefront (2026-10-04): $8.99/mo, $79.99/yr, 1-week
+    /// free-trial intro offer.  Other storefronts localize differently.
+    private static let referenceUSDMonthly = "$8.99"
+    private static let referenceUSDAnnual = "$79.99"
+
+    func testPremiumCopyHasNoHardcodedPrices() {
+        let noDollar = { (s: String) in !s.contains("$") }
+        let noDecimalAmount = { (s: String) in
+            // Any "\d+[.,]\d{2}" — matches "$8.99", "8,99 €", "79.99".
+            s.range(of: #"\d+[.,]\d{2}"#, options: .regularExpression) == nil
+        }
+        let noTrialLength = { (s: String) in
+            let needles = ["-week free trial", "-day free trial", "-month free trial", "-year free trial"]
+            return needles.allSatisfy { !s.localizedCaseInsensitiveContains($0) }
+        }
+
+        let headline = PremiumPricing.fallbackHeadline
+        let delivery = PremiumPricing.deliveryUpgradeMessage
+        for (label, str) in [("fallbackHeadline", headline), ("deliveryUpgradeMessage", delivery)] {
+            XCTAssertTrue(noDollar(str), "\(label) unexpectedly contains a $: \(str)")
+            XCTAssertTrue(noDecimalAmount(str), "\(label) unexpectedly contains a decimal amount: \(str)")
+            XCTAssertTrue(noTrialLength(str), "\(label) unexpectedly contains a trial-length phrase: \(str)")
+        }
+
+        XCTAssertEqual(
+            PremiumPricing.headline(for: []),
+            PremiumPricing.fallbackHeadline,
+            "headline(for: []) must fall back to the price-free fallback"
+        )
+    }
+
+    func testPremiumHeadlineUsesStoreKitDisplayPrice() {
+        // US storefront reference numbers — these are fixtures, not UI strings.
+        let usdMonthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: PremiumFreeTrial(unit: .week, value: 1)
+        )
+        let usdAnnual = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDAnnual,
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let usHeadline = PremiumPricing.headline(for: [usdMonthly, usdAnnual])
+        XCTAssertTrue(usHeadline.contains(Self.referenceUSDMonthly))
+        XCTAssertTrue(usHeadline.contains(Self.referenceUSDAnnual))
+        XCTAssertTrue(usHeadline.localizedCaseInsensitiveContains("1-week free trial"))
+
+        // Localized (non-USD) storefront with no intro offer — must show the
+        // localized prices verbatim and must not invent a trial.
+        let eurMonthly = PremiumPlanQuote(
+            displayPrice: "8,99 €",
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let eurAnnual = PremiumPlanQuote(
+            displayPrice: "79,99 €",
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let eurHeadline = PremiumPricing.headline(for: [eurMonthly, eurAnnual])
+        XCTAssertTrue(eurHeadline.contains("8,99 €"))
+        XCTAssertTrue(eurHeadline.contains("79,99 €"))
+        XCTAssertFalse(eurHeadline.contains("$"))
+        XCTAssertFalse(eurHeadline.localizedCaseInsensitiveContains("free trial"))
+    }
+
+    func testAnnualSavingsIsComputedFromQuotes() {
+        // 12 * $8.99 = $107.88/mo if you paid monthly.  $79.99/yr saves
+        // ($107.88 - $79.99) / $107.88 ≈ 0.2586 → 25% rounded down.  This
+        // formula lives in PremiumPricing and is the only place the % claim
+        // appears, so the test pins both the formula and the rounding.
+        let monthly = PremiumPlanQuote(
+            displayPrice: "$8.99",
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let annual = PremiumPlanQuote(
+            displayPrice: "$79.99",
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let pct = PremiumPricing.savingsPercent(monthly: monthly, annual: annual)
+        XCTAssertEqual(pct, 25, "expected 25% savings (rounded down from 25.86%)")
+    }
+
+    func testMonthlySubtitleWithTrialUsesNaturalPerPeriodSuffix() {
+        // Per-period price suffix should drop the hyphen and read as
+        // "$8.99/month" (not "$8.99/1-month").  Trial phrase stays
+        // "1-week free trial" so users see the length Apple will charge.
+        let monthlyWithTrial = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: PremiumFreeTrial(unit: .week, value: 1)
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: monthlyWithTrial, allQuotes: [monthlyWithTrial]),
+            "1-week free trial, then \(Self.referenceUSDMonthly)/month"
+        )
+    }
+
+    func testMonthlySubtitleWithoutTrialUsesBillingAdverb() {
+        // No intro offer → no "X-week free trial" wording, just the
+        // billing adverb ("monthly") so the cadence reads naturally.
+        let monthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: monthly, allQuotes: [monthly]),
+            "Billed monthly.  Cancel anytime."
+        )
+    }
+
+    func testYearlySubtitleWithoutTrialIncludesSavings() {
+        // 12 * $8.99 = $107.88.  $79.99/yr saves ~25.86% → 25% rounded down.
+        // The annual subtitle should append that claim vs. the monthly
+        // product so the user can see why the yearly plan is recommended;
+        // "Cancel anytime" is replaced by the savings tail so the line
+        // still reads naturally.
+        let monthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let annual = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDAnnual,
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: annual, allQuotes: [monthly, annual]),
+            "Billed yearly.  Save 25% vs. monthly."
+        )
+    }
+
+    func testYearlySubtitleWithTrialIncludesSavings() {
+        // Trial copy stays in front when eligible; the savings tail goes
+        // after the price so the user still sees both the trial and the
+        // yearly discount vs. monthly.
+        let monthly = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDMonthly,
+            price: Decimal(string: "8.99")!,
+            periodUnit: .month,
+            periodValue: 1,
+            freeTrial: nil
+        )
+        let annualWithTrial = PremiumPlanQuote(
+            displayPrice: Self.referenceUSDAnnual,
+            price: Decimal(string: "79.99")!,
+            periodUnit: .year,
+            periodValue: 1,
+            freeTrial: PremiumFreeTrial(unit: .week, value: 1)
+        )
+        XCTAssertEqual(
+            PremiumPricing.subtitle(for: annualWithTrial, allQuotes: [monthly, annualWithTrial]),
+            "1-week free trial, then \(Self.referenceUSDAnnual)/year.  Save 25% vs. monthly."
+        )
+    }
+
+    // MARK: - Manage Subscription (Apple vs website/Stripe)
+
+    func testWebManageSubscriptionURLIsBillingManageOnOrigin() {
+        let client = CongressTradeAPIClient(
+            baseURL: URL(string: "https://example.test/api/client/v1")!,
+            tokenStore: MemoryTokenStore(token: nil)
+        )
+        XCTAssertEqual(client.webManageSubscriptionURL.absoluteString, "https://example.test/?billing=manage")
+        XCTAssertFalse(client.webManageSubscriptionURL.absoluteString.contains("checkout"))
+        XCTAssertFalse(client.webManageSubscriptionURL.absoluteString.contains("pricing"))
+    }
+
+    @MainActor
+    func testManageSubscriptionAppleStaysOnAppStoreEvenIfPortalWould401() {
+        let web = URL(string: "https://example.test/?billing=manage")!
+        let outcome = CongressTradeStore.outcome(
+            entitlementSource: "apple",
+            webFallbackURL: web,
+            portalResult: .failure(
+                APIError.server(status: 401, message: "sign in first", retryAfterSeconds: nil)
+            )
+        )
+        XCTAssertEqual(outcome, .url(CongressTradeAPIClient.appStoreManageSubscriptionsURL))
+    }
+
+    @MainActor
+    func testManageSubscriptionStripeOpensMintedPortalURL() {
+        let portal = URL(string: "https://billing.stripe.com/p/session/live")!
+        let web = URL(string: "https://example.test/?billing=manage")!
+        let outcome = CongressTradeStore.outcome(
+            entitlementSource: "stripe",
+            webFallbackURL: web,
+            portalResult: .success(portal)
+        )
+        XCTAssertEqual(outcome, .url(portal))
+    }
+
+    @MainActor
+    func testManageSubscriptionStripe401OpensWebsiteNotSignOutCopy() {
+        let web = URL(string: "https://example.test/?billing=manage")!
+        let error = APIError.server(status: 401, message: "sign in first", retryAfterSeconds: nil)
+        let outcome = CongressTradeStore.outcome(
+            entitlementSource: "stripe",
+            webFallbackURL: web,
+            portalResult: .failure(error)
+        )
+        XCTAssertEqual(outcome, .url(web))
+        XCTAssertTrue(CongressTradeStore.shouldOpenWebManageFallback(for: error))
+
+        let message = CongressTradeStore.portalFailureMessage(for: error)
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("sign out"))
+        XCTAssertTrue(message.contains(".  "))
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("congress.trade"))
+    }
+
+    @MainActor
+    func testManageSubscriptionNilSource401OpensWebsite() {
+        let web = URL(string: "https://example.test/?billing=manage")!
+        let outcome = CongressTradeStore.outcome(
+            entitlementSource: nil,
+            webFallbackURL: web,
+            portalResult: .failure(
+                APIError.server(status: 401, message: "sign in first", retryAfterSeconds: nil)
+            )
+        )
+        XCTAssertEqual(outcome, .url(web))
+    }
+
+    @MainActor
+    func testManageSubscriptionStripeOfflineStaysInApp() {
+        let web = URL(string: "https://example.test/?billing=manage")!
+        let error = APIError.transport(URLError(.notConnectedToInternet))
+        XCTAssertFalse(CongressTradeStore.shouldOpenWebManageFallback(for: error))
+        let outcome = CongressTradeStore.outcome(
+            entitlementSource: "stripe",
+            webFallbackURL: web,
+            portalResult: .failure(error)
+        )
+        guard case .failed(let message) = outcome else {
+            return XCTFail("offline Stripe manage should stay in-app, not open Safari")
+        }
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("offline"))
+        XCTAssertTrue(message.contains(".  "))
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("sign out"))
+    }
+
+    func testBillingPortalURLPostsBearerToOriginPortal() async throws {
+        let session = makeSession()
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: "native-session"),
+            session: session
+        )
+        let sawExpected = XCTestExpectation(description: "portal POST carried the session Bearer")
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/billing/portal")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Bearer native-session")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "idempotency-key"), "portal-key-1")
+            sawExpected.fulfill()
+            return Self.response(for: request, json: #"{"url":"https://billing.stripe.com/p/session/test"}"#)
+        }
+        let url = try await client.billingPortalURL(idempotencyKey: "portal-key-1")
+        XCTAssertEqual(url.absoluteString, "https://billing.stripe.com/p/session/test")
+        await fulfillment(of: [sawExpected], timeout: 1)
     }
 
     func testFilingPDFNeverOpensSafariCheckout() throws {
@@ -2535,6 +3191,26 @@ final class CongressTradeTests: XCTestCase {
         XCTAssertEqual(result.analytics?.window, "1y")
     }
 
+    /// Puts an `AssetMark` on screen so SwiftUI really runs its `.task`,
+    /// loading through the mock protocol from an empty image cache.
+    @MainActor
+    private func hostAssetMark(symbol: String, size: CGFloat) -> AssetMarkHost {
+        let original = CachedImageLoader.session
+        CachedImageLoader.session = makeSession()
+        CachedImageLoader.cache.removeAllObjects()
+        let controller = UIHostingController(rootView: AssetMark(symbol: symbol, size: size))
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let frame = CGRect(x: 0, y: 0, width: 200, height: 200)
+        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: frame)
+        window.frame = frame
+        window.rootViewController = controller
+        window.isHidden = false
+        return AssetMarkHost(controller: controller, window: window) {
+            CachedImageLoader.session = original
+            CachedImageLoader.cache.removeAllObjects()
+        }
+    }
+
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -2550,6 +3226,33 @@ final class CongressTradeTests: XCTestCase {
 
     private static func feedJSON(items: [String], cursor: Int, count: Int, total: Int, limit: Int) -> String {
         "{\"items\":[\(items.joined(separator: ","))],\"cursor\":\(cursor),\"count\":\(count),\"total\":\(total),\"limit\":\(limit),\"nextPollAfterSec\":30}"
+    }
+
+    /// Enough empty analytics envelopes for the Trends fan-out `try await`s.
+    private static func trendsEndpointResponse(for request: URLRequest) -> (HTTPURLResponse, Data) {
+        let path = request.url?.path ?? ""
+        if path.hasSuffix("/bootstrap") {
+            return response(for: request, json: bootstrapJSON)
+        }
+        if path.contains("/feed") {
+            return response(for: request, json: feedJSON(items: [], cursor: 0, count: 0, total: 0, limit: 50))
+        }
+        if path.contains("/api/analytics/ticker-leaderboard") {
+            return response(for: request, json: #"{"tickers":[]}"#)
+        }
+        if path.contains("/api/analytics/volume-over-time") {
+            return response(for: request, json: #"{"series":[]}"#)
+        }
+        if path.contains("/api/analytics/sector-flow") {
+            return response(for: request, json: #"{"sectors":[]}"#)
+        }
+        if path.contains("/api/analytics/member-leaderboard") {
+            return response(for: request, json: #"{"members":[]}"#)
+        }
+        if path.contains("/api/analytics/cluster-buys") {
+            return response(for: request, json: #"{"clusters":[]}"#)
+        }
+        return response(for: request, json: "{}")
     }
 
     private static func tradeJSON(id: String, cursor: Int) -> String {
@@ -2616,6 +3319,154 @@ final class CongressTradeTests: XCTestCase {
         )!
         return (response, Data(json.utf8))
     }
+
+    // MARK: - Trades search slot (board 341d17d2)
+
+    /// The bug: one keystroke set `isApplyingFilters`, which flipped the slot to
+    /// `.updating`, which swapped the `TextField` out of the hierarchy and
+    /// cleared focus — so Trades search was one character per tap.
+    func testSearchSlotDoesNotShowUpdatingWhileFocused() {
+        XCTAssertNil(
+            FeedDashboardView.searchSlotStatus(
+                notice: nil,
+                isOffline: false,
+                isTradesUpdating: true,
+                isSearchFocused: true
+            ),
+            "A refresh in flight must not replace the field while the user is typing in it."
+        )
+    }
+
+    func testSearchSlotShowsUpdatingWhenNotFocused() {
+        XCTAssertEqual(
+            FeedDashboardView.searchSlotStatus(
+                notice: nil,
+                isOffline: false,
+                isTradesUpdating: true,
+                isSearchFocused: false
+            ),
+            .updating
+        )
+    }
+
+    /// `.reload` must still win over focus: it is the only recovery control on
+    /// the tab, so swallowing it to save a keystroke would strand a failed load.
+    func testSearchSlotReloadStillWinsWhileFocused() {
+        XCTAssertEqual(
+            FeedDashboardView.searchSlotStatus(
+                notice: "Request failed",
+                isOffline: false,
+                isTradesUpdating: true,
+                isSearchFocused: true
+            ),
+            .reload(message: "Request failed")
+        )
+    }
+
+    func testSearchSlotOfflineReportsOfflineNotTheRawNotice() {
+        XCTAssertEqual(
+            FeedDashboardView.searchSlotStatus(
+                notice: "",
+                isOffline: true,
+                isTradesUpdating: false,
+                isSearchFocused: true
+            ),
+            .reload(message: "You are offline.")
+        )
+    }
+
+    // MARK: - Conflicts decode (board bf27125a)
+
+    /// Captured verbatim from `GET /api/analytics/conflicts?window=365d&limit=2`
+    /// — the shape `app/src/analytics/routes.ts` actually emits.  The previous
+    /// model required `bioguideId`, `committeeCode` and `date`, none of which
+    /// appear here, so every decode threw and the whole section stayed hidden.
+    private static let conflictsJSON = """
+    {
+      "count": 2,
+      "conflicts": [
+        {
+          "id": "abc123",
+          "ticker": "NVDA",
+          "sector": "Information Technology",
+          "txType": "B",
+          "txDate": "2026-05-04",
+          "filerId": "P000197",
+          "memberName": "Nancy Pelosi",
+          "chamber": "house",
+          "partyBucket": "D",
+          "viaCommittees": ["Committee on Science, Space, and Technology"],
+          "estAmountUsd": 500000
+        },
+        {
+          "id": "def456",
+          "ticker": "XOM",
+          "sector": null,
+          "txType": "S",
+          "txDate": null,
+          "filerId": "S000033",
+          "memberName": null,
+          "chamber": null,
+          "partyBucket": null,
+          "viaCommittees": [],
+          "estAmountUsd": null
+        }
+      ]
+    }
+    """
+
+    func testConflictsDecodeAgainstLiveResponseShape() throws {
+        let decoded = try JSONDecoder().decode(
+            ConflictCandidateResponse.self,
+            from: Data(Self.conflictsJSON.utf8)
+        )
+        let items = try XCTUnwrap(decoded.conflicts)
+        XCTAssertEqual(items.count, 2)
+
+        let first = items[0]
+        XCTAssertEqual(first.id, "abc123")
+        XCTAssertEqual(first.memberTargetId, "P000197")
+        XCTAssertEqual(first.displayName, "Nancy Pelosi")
+        XCTAssertEqual(first.contextLine, "Committee on Science, Space, and Technology · Information Technology")
+
+        // Every nullable field null at once must still decode — one null used to
+        // be enough to blank the entire section.
+        let second = items[1]
+        XCTAssertEqual(second.memberTargetId, "S000033")
+        XCTAssertEqual(second.displayName, "S000033")
+        XCTAssertEqual(second.contextLine, "")
+        XCTAssertTrue(second.committees.isEmpty)
+    }
+
+    // MARK: - Calendar-year analytics window (board d2c4a15e)
+
+    /// Both calendar-year chips used to send `365d`, so "Last Calendar Year"
+    /// showed trailing-365-day analytics — and disagreed with the Trades list
+    /// underneath it, which filters on the exact `from`/`to` bounds.
+    /// `app/src/analytics/sql.ts:43` accepts these two as first-class windows.
+    func testCalendarYearRangesSendCalendarWindows() {
+        XCTAssertEqual(TimeRange.thisCalendarYear.analyticsWindow, "this_cy")
+        XCTAssertEqual(TimeRange.lastCalendarYear.analyticsWindow, "last_cy")
+    }
+
+    func testNonCalendarRangesStillSendDayCounts() {
+        XCTAssertEqual(TimeRange.all.analyticsWindow, "all")
+        XCTAssertNotEqual(TimeRange.thisCalendarYear.analyticsWindow, TimeRange.lastCalendarYear.analyticsWindow)
+    }
+
+    // MARK: - Error copy (board 5c1c9706)
+
+    /// A support report has to be able to say which failure it was.
+    func testServerErrorMessageCarriesStatusCode() {
+        XCTAssertTrue(
+            APIError.server(status: 502, message: "", retryAfterSeconds: nil).userFacingMessage.contains("502"),
+            "5xx copy must name the status code."
+        )
+        XCTAssertTrue(
+            APIError.server(status: 418, message: "Request failed", retryAfterSeconds: nil).userFacingMessage.contains("418"),
+            "The generic fallback must name the status code."
+        )
+    }
 }
 
 private final class InMemorySyncCursorStore: SyncCursorStore {
@@ -2635,6 +3486,32 @@ private final class MemoryTokenStore: SessionTokenStore {
     func load() throws -> String? { token }
     func save(_ token: String) throws { self.token = token }
     func clear() throws { token = nil }
+}
+
+@MainActor
+private struct AssetMarkHost {
+    let controller: UIHostingController<AssetMark>
+    let window: UIWindow
+    let restore: () -> Void
+
+    var width: CGFloat {
+        controller.sizeThatFits(in: CGSize(width: 200, height: 200)).width
+    }
+
+    /// Lets the load finish and SwiftUI re-render, returning early only once
+    /// `done` is true.  Otherwise it returns the width after the full wait.
+    func settledWidth(until done: (CGFloat) -> Bool) async -> CGFloat {
+        for _ in 0..<40 {
+            if done(width) { break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return width
+    }
+
+    func teardown() {
+        window.isHidden = true
+        restore()
+    }
 }
 
 private final class MockURLProtocol: URLProtocol {
@@ -2711,4 +3588,37 @@ private final class MockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+/// CT-2459: Trader identity is stable across decodes (it used to mint a
+/// fresh UUID per `id` access when filerId/fullName were nil).
+final class TraderIdentityTests: XCTestCase {
+    private func decodeTrader(_ json: String) throws -> ClientTickerAnalytics.Trader {
+        try JSONDecoder().decode(
+            ClientTickerAnalytics.Trader.self, from: Data(json.utf8)
+        )
+    }
+
+    func testIDStableAcrossRepeatedAccessAndDecodes() throws {
+        let json = #"{"partyBucket":"D","tradeCount":3,"estVolumeUsd":12345.0}"#
+        let a = try decodeTrader(json)
+        let b = try decodeTrader(json)
+        XCTAssertEqual(a.id, a.id)
+        XCTAssertEqual(a.id, b.id)
+        XCTAssertTrue(a.id.hasPrefix("anon:"))
+    }
+
+    func testIDPrefersFilerIDThenName() throws {
+        let byFiler = try decodeTrader(#"{"filerId":"P000197","fullName":"Nancy Pelosi"}"#)
+        XCTAssertEqual(byFiler.id, "P000197")
+        let byName = try decodeTrader(#"{"fullName":"  Nancy Pelosi "}"#)
+        XCTAssertEqual(byName.id, "name:nancy pelosi")
+    }
+
+    func testRelativePhotoPathResolvesAgainstOrigin() {
+        let resolved = MemberPhotoURL.resolve("/api/photos/P000197.jpg")
+        XCTAssertEqual(resolved?.absoluteString, "https://congress.trade/api/photos/P000197.jpg")
+        XCTAssertNil(MemberPhotoURL.resolve("javascript:alert(1)"))
+        XCTAssertNil(MemberPhotoURL.resolve(nil, ""))
+    }
 }

@@ -3,8 +3,11 @@
 # cloud/remote sandbox, GitHub Codespaces, devcontainer, or any throwaway clone).
 # Idempotent — safe to re-run.
 #
-# Point your environment's "setup script" field at this file:
-#   bash scripts/cloud-setup.sh
+# IMPORTANT (Claude Code Cloud): Setup script cwd is the PARENT of the clone
+# (`/home/user`), not the repo root. A bare `bash scripts/cloud-setup.sh` fails
+# with exit 127. Use the fleet locator from
+# ai-fleet-coordinator/docs/CLAUDE-CODE-CLOUD-ENVIRONMENTS.md, or:
+#   cd Congress.Trade && bash scripts/cloud-setup.sh
 #
 # The runnable app lives in app/ (Coolify Deno process), NOT the repo root — so a
 # plain `npm ci` from the root fails.  This script cd's into app/ for you.
@@ -22,16 +25,19 @@ cd "$SCRIPT_DIR/../app"
 
 echo "==> Node: $(node --version 2>/dev/null || echo 'not found')  npm: $(npm --version 2>/dev/null || echo 'not found')"
 
-# Parse the optional machine-level key file as inert data (never source it),
-# validate complete identity pairs, map canonical CT names to the runtime names,
+# Read the Infisical machine identities from the explicit environment (cloud and
+# CI use only this) or, on a Mac with the CLI installed, from `fleet-secrets get`.
+# Validate complete identity pairs, map canonical CT names to the runtime names,
 # preserve non-empty managed app/.dev.vars values, and retain only the documented
 # early-init/local selectors from the explicit environment. This runs before the
 # expensive install so malformed bootstrap state fails closed immediately.
 unset CT_LOCAL_BOOTSTRAP_TEST_MODE
 unset CT_LOCAL_BOOTSTRAP_TEST_APP_DIR
 unset CT_LOCAL_BOOTSTRAP_TEST_DEV_VARS_FILE
-unset CT_LOCAL_BOOTSTRAP_TEST_GLOBAL_KEYS_FILE
-node "$SCRIPT_DIR/merge-local-dev-vars.mjs"
+unset CT_LOCAL_BOOTSTRAP_TEST_FLEET_SECRETS_BIN
+# Cloud VMs have no fleet-secrets CLI. Missing identities are
+# expected; do not fail the whole session setup for a keyless checkout.
+node "$SCRIPT_DIR/merge-local-dev-vars.mjs" || echo "==> Infisical local bootstrap skipped (ok in keyless cloud)"
 
 # @jaywedgeworth22/congress-trading-shared is a public repo consumed as a
 # tokenless git dependency. The vendored local copy at app/vendor/ is the

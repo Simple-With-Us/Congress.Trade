@@ -70,6 +70,8 @@ async function createCorpus(): Promise<SqliteDatabase> {
     ALTER TABLE filers ADD COLUMN display_name TEXT;
     ALTER TABLE filings ADD COLUMN filing_status TEXT;
     ALTER TABLE transactions ADD COLUMN deprecated_at TEXT;
+    ALTER TABLE transactions ADD COLUMN first_seen_at TEXT;
+    ALTER TABLE transactions ADD COLUMN filed_date TEXT;
   `);
 
   db.exec('BEGIN');

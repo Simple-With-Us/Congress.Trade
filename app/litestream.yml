@@ -33,7 +33,7 @@
 #
 # Destination (2026-08-12, owner): Backblaze B2 EU Central, bucket
 # jays-congress-trade-eu, endpoint s3.eu-central-003.backblazeb2.com — verified
-# against ~/.secrets/backblaze-app-keys.env (B2_CT_* keys), NOT guessed.
+# against Infisical /backblaze-app-keys (B2_CT_* keys), NOT guessed.
 #
 # Sync interval (5m): the 2026-08-05 R2 Class A incident
 # (docs/rollouts/2026-08-05-r2-freetier-class-a-survival.md) showed Litestream
@@ -50,10 +50,40 @@ snapshot:
   interval: 24h
   # B2 is paid capacity, not R2 free-tier-capped storage — keep 7d of LTX
   # history for restore headroom, matching Socratic.Trade's B2 target.
-  retention: 168h
+  retention: 72h
+
+# Product compaction is L0 + bounded L1 + 24h snapshots.  L2 and L3 are OFF.
+# Mirror ST litestream.coolify.yml / UM litestream.yml.  Do NOT add a second
+# or third item unless L2/L3 are intentionally product-on again.
+# Do NOT add verify-compaction: true.
+# Litestream 0.5.x has no disable-L2 flag — one levels entry makes MaxLevel()=1
+# so NextLevel(1) is snapshot.  Removing L2/L3 is the backoff against mega-
+# compaction retry storms that burn shared Backblaze Class B/C caps.
+levels:
+  - interval: 30s
 
 dbs:
   - path: /data/congress-trade/db.sqlite
+    # CONGRESS-TRADE-1M / 1J (2026-10-01, sibling of the 2026-09-29 ~500MB
+    # truncate storm). Litestream 0.5.13 holds a long read transaction so only
+    # it can checkpoint, then at truncate-page-n (default ~500MB / 121359
+    # pages) it runs wal_checkpoint(TRUNCATE). That exclusive lock waits on
+    # every reader while the app's writes return SQLITE_BUSY; the cron tick
+    # skips, and house/senate polling stays dark until someone stops the
+    # process and truncates by hand.
+    #
+    # On THIS pin, truncate-page-n: 0 disables that blocking checkpoint.
+    # Later Litestream releases changed 0 to mean "keep the default" — do not
+    # bump scripts/fetch-litestream.sh off 0.5.13 without revisiting this.
+    # PASSIVE checkpoints stay on: ~4MB (min-checkpoint-page-count) and every
+    # 30s after a real write. busy-timeout is Litestream's own wait for short
+    # app writes (PASSIVE itself does not block). The app must not hold a
+    # second connection's read snapshot across those attempts — see
+    # src/deno/sqliteClient.ts.
+    busy-timeout: 5s
+    checkpoint-interval: 30s
+    min-checkpoint-page-count: 1000
+    truncate-page-n: 0
     replica:
       type: s3
       # Expected production values (Infisical congress-trade prod project):
@@ -67,7 +97,21 @@ dbs:
       endpoint: ${LITESTREAM_S3_ENDPOINT}
       access-key-id: ${LITESTREAM_S3_ACCESS_KEY_ID}
       secret-access-key: ${LITESTREAM_S3_SECRET_ACCESS_KEY}
-      # One multipart part at a time — reliability over throughput for a
-      # backup replica, matching Usage-Monitor's B2 config.
-      concurrency: 1
-      sync-interval: 5m
+      # Large L1-compaction multiparts against B2 fail with "read multipart
+      # upload data failed ... checksum mismatch" on the default 5MB part size,
+      # and each abort restarts the whole multipart.  Usage-Monitor's retry
+      # storm of exactly this class (2026-08-27, 119 failed compactions in ~2h)
+      # burned the shared Backblaze daily transaction caps; Socratic.Trade hit
+      # it 2026-08-07/22.  Mirror ST's proven pair (litestream.coolify.yml):
+      # larger parts cut request count, concurrency 2 keeps memory modest.
+      part-size: 10MB
+      concurrency: 2
+      # 15m (owner 2026-08-27): all three fleet apps share ONE Backblaze
+      # account, so its daily Class B/C caps are fleet-wide — UM's corrupt-L0
+      # retry storm froze every app's backups at once.  CT's data is
+      # re-ingestable, so a coarser RPO costs little while cutting quiet-period
+      # object count (and the downstream compaction re-reads) 3x vs 5m.  Note
+      # the burst caveat above still applies: heavy ingestion writes produce
+      # L0 objects per commit regardless of this interval.  ST deliberately
+      # stays at 300s (live trading DB); UM is 1h.
+      sync-interval: 15m

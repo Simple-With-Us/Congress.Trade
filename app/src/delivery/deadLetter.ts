@@ -14,6 +14,7 @@ import type { Env, QueueMessage } from '../shared/types.ts';
 import { run } from '../shared/db.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
+import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 
 async function insertDeadLetterReceipt(
   env: Env,
@@ -53,7 +54,10 @@ async function alertDeadLetter(
       throttleSec: 3600,
     });
   } catch (e) {
-    console.warn('recordDeadLetter: alert failed:', (e as Error).message);
+    sentryLoggerWarn('ingest.dead_letter', {
+      queue,
+      reason: 'alert_failed',
+    });
   }
 }
 
@@ -70,12 +74,12 @@ export async function recordDeadLetter(
   // so past the per-invocation governed-write cap the D1 insert is skipped —
   // the throttled admin alert below still fires.
   if (consumeGovernedD1Writes(env, 'dead-letter', 1) < 1) {
-    console.warn('recordDeadLetter: receipt insert skipped (D1 write governor cap reached)', queue);
+    sentryLoggerWarn('ingest.dead_letter', { queue, reason: 'governor_cap' });
   } else {
     try {
       await insertDeadLetterReceipt(env, queue, msg, attempts, err);
     } catch (e) {
-      console.warn('recordDeadLetter: D1 insert failed:', (e as Error).message);
+      sentryLoggerWarn('ingest.dead_letter', { queue, reason: 'd1_insert_failed' });
     }
   }
   await alertDeadLetter(env, queue, msg, attempts, err);

@@ -9,8 +9,79 @@
  */
 
 import { readBuildInfo } from './buildInfo.ts';
-import { scrubSentryEvent } from './sentryScrub.ts';
+import {
+  isExpectedPdfParseNoise,
+  sentryEventLooksLikePdfParseNoise,
+  SENTRY_PDF_IGNORE_ERRORS,
+} from './pdfParseErrors.ts';
+import { sentryOperationalNoiseShouldDrop } from './sentryNoise.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from './sentryDataCollection.ts';
+import { scrubSentryEvent, scrubSentryLogAttributes } from './sentryScrub.ts';
 import type { Env } from './types.ts';
+
+export type SentryLogAttributes = Record<string, string | number | boolean | null>;
+
+type LoggerWarn = (message: string, attributes?: SentryLogAttributes) => void;
+
+let activeLoggerWarn: LoggerWarn | undefined;
+let activeMetricsCount:
+  | ((name: string, value?: number, options?: { attributes?: SentryLogAttributes }) => unknown)
+  | undefined;
+let activeFlush: ((timeout?: number) => Promise<boolean>) | undefined;
+let logFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+const LOG_FLUSH_DELAY_MS = 250;
+
+function scheduleSentryLogFlush(): void {
+  if (!activeFlush || logFlushTimer) return;
+  logFlushTimer = setTimeout(() => {
+    logFlushTimer = undefined;
+    void activeFlush?.(2000);
+  }, LOG_FLUSH_DELAY_MS);
+}
+
+/**
+ * Flush buffered Sentry Logs / envelopes.  Deno's SDK only auto-flushes logs
+ * on `beforeExit` / `unload` or after 100 items; a long-lived Coolify process
+ * never exits, so sparse `sentryLoggerWarn` lines sat in the buffer (0 logs
+ * in 7d after the last hourly heartbeat on 2026-09-22).
+ */
+export function flushSentry(timeout = 2000): Promise<boolean> {
+  if (!activeFlush) return Promise.resolve(false);
+  return activeFlush(timeout);
+}
+
+/**
+ * Sparse operational log for Sentry Logs.  After a successful SDK init this
+ * goes to `Sentry.logger.warn` only (no console), so Datadog's console hook
+ * does not dual-ship the same line.  Before init, falls back to console.warn
+ * for local/dev.
+ */
+export function sentryLoggerWarn(message: string, attributes?: SentryLogAttributes): void {
+  const scrubbedAttributes = scrubSentryLogAttributes(attributes);
+  const scrubbedMessage = typeof message === 'string'
+    ? String(scrubSentryEvent({ message }).message ?? message)
+    : message;
+  if (activeMetricsCount) {
+    try {
+      activeMetricsCount(scrubbedMessage, 1, scrubbedAttributes ? { attributes: scrubbedAttributes } : undefined);
+    } catch {
+      // Metrics must never break the warn path.
+    }
+  }
+  if (activeLoggerWarn) {
+    try {
+      activeLoggerWarn(scrubbedMessage, scrubbedAttributes);
+      scheduleSentryLogFlush();
+      return;
+    } catch {
+      // SDK logger threw; do not also console.warn (that would dual-ship).
+      return;
+    }
+  }
+  if (scrubbedAttributes) console.warn(scrubbedMessage, scrubbedAttributes);
+  else console.warn(scrubbedMessage);
+}
 
 export interface SentrySdkLike {
   init: (options: Record<string, unknown>) => unknown;
@@ -20,6 +91,14 @@ export interface SentrySdkLike {
   setTag?: (key: string, value: string) => void;
   withMonitor?: (name: string, fn: () => unknown, options?: unknown) => unknown;
   consoleLoggingIntegration?: (options?: { levels?: string[] }) => unknown;
+  logger?: { warn?: (message: string, attributes?: SentryLogAttributes) => unknown };
+  metrics?: {
+    count?: (
+      name: string,
+      value?: number,
+      options?: { attributes?: SentryLogAttributes },
+    ) => unknown;
+  };
   flush?: (timeout?: number) => Promise<boolean>;
 }
 
@@ -50,6 +129,7 @@ export interface ProductionSentryBindings {
   setTags: (tags: Record<string, unknown>) => void;
   consoleLoggingIntegration: (options?: { levels?: string[] }) => unknown;
   isInitialized: () => boolean;
+  flush: (timeout?: number) => Promise<boolean>;
 }
 
 export function resolveSentryDsn(env: SentryInitInput | undefined): string | undefined {
@@ -82,14 +162,27 @@ export function buildSentryInitOptions(
     environment: env.SENTRY_ENVIRONMENT || 'production',
     tracesSampleRate,
     sendDefaultPii: false,
+    dataCollection: NOT_LINKED_SENTRY_DATA_COLLECTION,
     ...(release ? { release } : {}),
     initialScope: {
       tags: { runtime: 'coolify-docker' },
     },
-    beforeSend: <T>(event: T) => scrubSentryEvent(event),
+    beforeSend: <T>(event: T) => {
+      const scrubbed = scrubSentryEvent(event);
+      if (sentryEventLooksLikePdfParseNoise(scrubbed)) return null;
+      if (sentryOperationalNoiseShouldDrop(scrubbed)) return null;
+      return scrubbed;
+    },
     beforeSendTransaction: <T>(event: T) => scrubSentryEvent(event),
+    beforeSendSpan: <T>(span: T) => scrubSentryEvent(span),
+    beforeSendMetric: <T>(metric: T) => scrubSentryEvent(metric),
     beforeSendLog: <T>(log: T) => scrubSentryEvent(log),
     enableLogs: true,
+    // Deno's default 5s unref'd timer never fires if the isolate is quiet
+    // and the process never exits.  1s plus an explicit flush after warns
+    // and cron/request boundaries is what actually delivers Logs.
+    _flushInterval: 1000,
+    ignoreErrors: SENTRY_PDF_IGNORE_ERRORS,
     tracePropagationTargets: [/^https:\/\/([\w-]+\.)?congress\.trade/],
     ...extras,
   };
@@ -114,10 +207,17 @@ function extractEnvFromHandlerArgs(args: unknown[]): Env | undefined {
 
 export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindings {
   let initialized = false;
+  activeLoggerWarn = undefined;
+  activeMetricsCount = undefined;
+  activeFlush = undefined;
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = undefined;
+  }
 
   const initProductionSentry = (
     env: SentryInitInput,
-    tracesSampleRate = resolveSentryTracesSampleRate(env, 0.1),
+    tracesSampleRate = resolveSentryTracesSampleRate(env, 0.2),
   ): SentryInitResult => {
     if (initialized) return { initialized: true, reason: 'dsn' };
     const dsn = resolveSentryDsn(env);
@@ -129,6 +229,25 @@ export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindin
       }
       sdk.init(buildSentryInitOptions(env, tracesSampleRate, extras));
       initialized = true;
+      if (typeof sdk.logger?.warn === 'function') {
+        const warn = sdk.logger.warn.bind(sdk.logger);
+        activeLoggerWarn = (message, attributes) => {
+          warn(message, attributes);
+        };
+      }
+      if (typeof sdk.metrics?.count === 'function') {
+        activeMetricsCount = sdk.metrics.count.bind(sdk.metrics);
+      }
+      if (typeof sdk.flush === 'function') {
+        const flushFn = sdk.flush.bind(sdk);
+        activeFlush = async (timeout) => {
+          try {
+            return Boolean(await flushFn(timeout));
+          } catch {
+            return false;
+          }
+        };
+      }
       return { initialized: true, reason: 'dsn' };
     } catch (err) {
       console.warn(
@@ -189,6 +308,7 @@ export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindin
 
   const captureException = (err: unknown, options?: unknown): unknown => {
     if (!initialized) return undefined;
+    if (isExpectedPdfParseNoise(err)) return undefined;
     try {
       return sdk.captureException(err, options);
     } catch {
@@ -238,6 +358,7 @@ export function createSentryBindings(sdk: SentrySdkLike): ProductionSentryBindin
     setTags,
     consoleLoggingIntegration,
     isInitialized: () => initialized,
+    flush: flushSentry,
   };
 }
 

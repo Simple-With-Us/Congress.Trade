@@ -118,7 +118,7 @@ struct TickerDetailView: View {
                                         if let netSentiment = winSummary.netSentiment {
                                             Text(String(format: "%.0f%%", netSentiment * 100))
                                                 .font(.subheadline.weight(.bold))
-                                                .foregroundStyle(netSentiment >= 0.5 ? Color.green : Color.red)
+                                                .foregroundStyle(netSentiment >= 0.5 ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                                         } else {
                                             Text("—")
                                                 .font(.subheadline)
@@ -141,11 +141,11 @@ struct TickerDetailView: View {
                                     HStack {
                                         Text("\(winSummary.buyCount ?? 0) Buys")
                                             .font(.caption2)
-                                            .foregroundStyle(Color.green)
+                                            .foregroundStyle(AppTheme.semanticPositive)
                                         Spacer()
                                         Text("\(winSummary.sellCount ?? 0) Sells")
                                             .font(.caption2)
-                                            .foregroundStyle(Color.red)
+                                            .foregroundStyle(AppTheme.semanticNegative)
                                     }
                                 }
                                 .padding(.vertical, 4)
@@ -257,7 +257,7 @@ struct TickerDetailView: View {
                                         if let medRet = h.medianReturn {
                                             Text(String(format: "%+.1f%%", medRet * 100))
                                                 .font(.subheadline.weight(.semibold))
-                                                .foregroundStyle(medRet >= 0 ? Color.green : Color.red)
+                                                .foregroundStyle(medRet >= 0 ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                                         } else {
                                             Text("—")
                                                 .font(.subheadline)
@@ -266,7 +266,7 @@ struct TickerDetailView: View {
                                         if let excess = h.medianExcess {
                                             Text(String(format: "(%+.1f%% vs SPX)", excess * 100))
                                                 .font(.caption)
-                                                .foregroundStyle(excess >= 0 ? Color.green : Color.red)
+                                                .foregroundStyle(excess >= 0 ? AppTheme.semanticPositive : AppTheme.semanticNegative)
                                         }
                                     }
                                 }
@@ -290,16 +290,19 @@ struct TickerDetailView: View {
                                 }
                             }
                             .padding(.horizontal, 16)
+
+                            SeeAllTradesHandoff(
+                                totalTrades: summary?.totalTrades ?? 0,
+                                displayedCount: trades.count,
+                                filter: .ticker(ticker)
+                            )
                         }
                     }
                 }
                 .padding(.bottom, 24)
             }
             .background(AppTheme.background)
-            // Nav bar carries the entity CLASS, the hero carries the identity.
-            // The bar used to read "KO" directly above a hero that already said
-            // KO — owner: "the ticker appears twice ... across four lines".
-            .navigationTitle("Ticker")
+            .navigationTitle(heroTitle)
             .inlineNavigationTitle()
             .sheet(item: $selectedPolitician) { target in
                 PoliticianDetailView(
@@ -308,6 +311,8 @@ struct TickerDetailView: View {
                     seedPhotoUrl: target.photoUrl
                 )
                 .presentationDetents([.medium, .large])
+                .presentationContentInteraction(.resizes)
+                .iPadFullWidthSheet()
             }
             .toolbar {
                 ToolbarItem(placement: AppToolbarPlacement.trailing) {
@@ -349,28 +354,26 @@ struct TickerDetailView: View {
     /// when the provider filed the same string as the sector (KO shipped
     /// "KO · NYSE · Beverages · Beverages").
     private var headerMetaLine: String {
-        let symbol = ticker.uppercased()
-        return [
-            heroTitle == symbol ? nil : symbol,
-            asset?.exchangeShort,
-            sectorValue,
-            distinctIndustryValue
-        ]
-        .compactMap { $0 }
-        .filter { !$0.isEmpty }
-        .joined(separator: "  •  ")
+        let symbol = heroTitle == ticker.uppercased() ? nil : ticker.uppercased()
+        let exchange = asset?.exchangeShort?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let sector = sectorValue
+        let industry = distinctIndustryValue
+        return [symbol, exchange, sector, industry].compactMap { $0 }.joined(separator: "  •  ")
     }
 
     private var sectorValue: String? {
         asset?.sector?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
-    /// Industry only when it says something the sector row does not.
+    /// Drops the industry when it matches the sector case-insensitively (FMP
+    /// filed KO as sector=Beverages, industry=Beverages - Non-Alcoholic, which
+    /// both trimmed to "Beverages" under simple normalization).
     private var distinctIndustryValue: String? {
-        guard let industry = asset?.industry?
-            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else { return nil }
-        guard let sector = sectorValue else { return industry }
-        return sector.caseInsensitiveCompare(industry) == .orderedSame ? nil : industry
+        guard let ind = asset?.industry?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else { return nil }
+        if let sec = sectorValue, ind.localizedCaseInsensitiveContains(sec) || sec.localizedCaseInsensitiveContains(ind) {
+            return nil
+        }
+        return ind
     }
 
     /// One Market Cap row, not a bucket row plus a "Market Cap ($)" row: the
@@ -418,10 +421,12 @@ struct TickerDetailView: View {
 
     private func fetchTicker() async throws -> ClientTickerResponse {
         do {
-            return try await store.fetchTicker(ticker)
-        } catch let error as APIError where error.isRetryable {
-            try await Task.sleep(for: .milliseconds(400))
-            return try await store.fetchTicker(ticker)
+            return try await store.fetchTicker(ticker, includeAnalytics: true)
+        } catch {
+            if Task.isCancelled { throw error }
+            // If the analytics payload fails, fallback to basic ticker profile
+            // without analytics so the drawer still displays gracefully.
+            return try await store.fetchTicker(ticker, includeAnalytics: false)
         }
     }
 
@@ -437,7 +442,7 @@ struct TickerDetailView: View {
 }
 
 /// Storage enums are not labels. `securities_ref.asset_class` is written by the
-/// enricher as `equity|etf|adr|fund` (`app/src/enrichment/fmp.ts`) and
+/// enricher as `equity|etf|adr|fund` (`app/src/enrichment/`) and
 /// `market_cap_bucket` as `mega`…`nano`; both were rendered raw or merely
 /// `.capitalized`, so the sheet read "Asset Class: equity" / "Market Cap:
 /// Mega". Wording matches the web board's `CAP_NAMES`

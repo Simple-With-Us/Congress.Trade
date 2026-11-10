@@ -7,7 +7,10 @@ import { parseCommitteeNames } from '../shared/committeeNames.ts';
 import type { Context } from 'hono';
 import type { Env } from '../shared/types.ts';
 import { getCurrentUserFromRequest } from '../auth/session.ts';
-import { validateSubscriptionFilters } from '../delivery/subscriptions.ts';
+import {
+  validateAndResolveSubscriptionFilters,
+  type SubscriptionMemberInfo,
+} from '../delivery/subscriptions.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { executiveTitleFor } from '../shared/executiveTitles.ts';
 import { memberPhotoUrl, normalizeMemberPhotoKey } from '../enrichment/memberPhotoPack.ts';
@@ -142,13 +145,22 @@ export function arrayOfStrings(value: unknown, opts: { upper?: boolean } = {}): 
   return Array.from(new Set(out));
 }
 
-export function normalizeFilters(value: unknown): SubscriptionFilters {
-  const result = validateSubscriptionFilters(value);
-  if (!result.ok) throw new ClientInputError((result as any).error);
+/**
+ * Validate a subscription filter set for create/update_subscription.  Member
+ * names are resolved to filer ids here (a name that matches no one, or several
+ * people, is a 400 that lists it) so a saved subscription can actually match.
+ */
+export async function normalizeFilters(env: Env, value: unknown): Promise<SubscriptionFilters> {
+  const result = await validateAndResolveSubscriptionFilters(env, value);
+  if (!result.ok) throw new ClientInputError(result.error);
   return result.filters;
 }
 
-export function publicSubscription(sub: Subscription, includeSecret = false): Record<string, unknown> {
+export function publicSubscription(
+  sub: Subscription,
+  includeSecret = false,
+  members?: SubscriptionMemberInfo,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {
     id: sub.id,
     delivery: sub.delivery,
@@ -159,6 +171,12 @@ export function publicSubscription(sub: Subscription, includeSecret = false): Re
     createdAt: sub.createdAt,
     hasSecret: Boolean(sub.secret),
   };
+  if (members) {
+    // Names for the stored filer ids, and entries that can never match (free-text
+    // names saved before member resolution existed) so the owner can fix them.
+    out.memberLabels = members.memberLabels;
+    if (members.unresolvedMembers.length > 0) out.unresolvedMembers = members.unresolvedMembers;
+  }
   if (includeSecret && sub.secret) {
     out.secret = sub.secret;
     if (sub.delivery === 'sse') {
@@ -363,6 +381,6 @@ export function memberProfile(row: MemberProfileRow | null, id: string) {
     photoUrl: profilePhotoUrl(row),
     // Curated agency/position label for executive-branch filers (see
     // shared/executiveTitles.ts); null for House/Senate filers.
-    title: executiveTitleFor(row.bioguide_id),
+    title: executiveTitleFor(row.bioguide_id, row.chamber),
   };
 }

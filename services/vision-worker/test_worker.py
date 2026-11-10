@@ -51,12 +51,12 @@ class CascadeHelpersTest(unittest.TestCase):
         previous_model = worker.OPENROUTER_MODEL
         try:
             worker.OPENROUTER_CASCADE_MODELS = worker.DEFAULT_CASCADE_MODELS
-            worker.OPENROUTER_MODEL = "x-ai/grok-4.5"
+            worker.OPENROUTER_MODEL = "x-ai/grok-4.6"
             models = worker.cascade_model_list()
             self.assertEqual(models[0], "qwen/qwen3-vl-8b-instruct")
             self.assertEqual(models[1], "qwen/qwen3-vl-30b-a3b-instruct")
-            self.assertIn("google/gemini-3.7-flash", models)
-            self.assertEqual(models[-1], "x-ai/grok-4.5")
+            self.assertIn("google/gemini-3.8-flash", models)
+            self.assertEqual(models[-1], "x-ai/grok-4.6")
             self.assertEqual(len(models), len(set(models)))
         finally:
             worker.OPENROUTER_CASCADE_MODELS = previous
@@ -65,17 +65,17 @@ class CascadeHelpersTest(unittest.TestCase):
     def test_cascade_env_override_dedupes_and_appends_grok(self):
         previous = worker.OPENROUTER_CASCADE_MODELS
         try:
-            worker.OPENROUTER_CASCADE_MODELS = "qwen/qwen3-vl-8b-instruct, x-ai/grok-4.5, qwen/qwen3-vl-8b-instruct"
+            worker.OPENROUTER_CASCADE_MODELS = "qwen/qwen3-vl-8b-instruct, x-ai/grok-4.6, qwen/qwen3-vl-8b-instruct"
             models = worker.cascade_model_list()
-            self.assertEqual(models, ["qwen/qwen3-vl-8b-instruct", "x-ai/grok-4.5"])
+            self.assertEqual(models, ["qwen/qwen3-vl-8b-instruct", "x-ai/grok-4.6"])
         finally:
             worker.OPENROUTER_CASCADE_MODELS = previous
 
     def test_qwen_uses_page_images_grok_and_gemini_do_not(self):
         self.assertTrue(worker.model_uses_page_images("qwen/qwen3-vl-8b-instruct"))
         self.assertTrue(worker.model_uses_page_images("qwen/qwen3-vl-30b-a3b-instruct"))
-        self.assertFalse(worker.model_uses_page_images("x-ai/grok-4.5"))
-        self.assertFalse(worker.model_uses_page_images("google/gemini-3.7-flash"))
+        self.assertFalse(worker.model_uses_page_images("x-ai/grok-4.6"))
+        self.assertFalse(worker.model_uses_page_images("google/gemini-3.8-flash"))
 
     def test_truncated_qwen_hit_is_not_terminal(self):
         # 10-page PTR, Qwen only receives OPENROUTER_CASCADE_MAX_PAGES (8).
@@ -93,10 +93,10 @@ class CascadeHelpersTest(unittest.TestCase):
             worker.cascade_hit_is_terminal("qwen/qwen3-vl-8b-instruct", 8, 8),
         )
         self.assertTrue(
-            worker.cascade_hit_is_terminal("google/gemini-3.7-flash", 20, 12),
+            worker.cascade_hit_is_terminal("google/gemini-3.8-flash", 20, 12),
         )
         self.assertTrue(
-            worker.cascade_hit_is_terminal("x-ai/grok-4.5", 20, 12),
+            worker.cascade_hit_is_terminal("x-ai/grok-4.6", 20, 12),
         )
 
     def test_extractor_label_is_stable(self):
@@ -128,7 +128,7 @@ class TruncatedCascadeTest(unittest.TestCase):
         worker.OPENROUTER_API_KEY = "test-key"
         worker.VISION_ENGINE = "openrouter"
         worker.OPENROUTER_CASCADE_MODELS = worker.DEFAULT_CASCADE_MODELS
-        worker.OPENROUTER_MODEL = "x-ai/grok-4.5"
+        worker.OPENROUTER_MODEL = "x-ai/grok-4.6"
         original = worker.transcribe_with_openrouter
         worker.transcribe_with_openrouter = fake_openrouter
         try:
@@ -148,10 +148,10 @@ class TruncatedCascadeTest(unittest.TestCase):
 
         self.assertEqual(called[0], "qwen/qwen3-vl-8b-instruct")
         self.assertEqual(called[1], "qwen/qwen3-vl-30b-a3b-instruct")
-        self.assertIn("google/gemini-3.7-flash", called)
+        self.assertIn("google/gemini-3.8-flash", called)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["assetName"], "page-10 bond")
-        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.7-flash"))
+        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.8-flash"))
 
     def test_short_qwen_hit_stays_terminal(self):
         previous_key = worker.OPENROUTER_API_KEY
@@ -210,7 +210,7 @@ class TruncatedLocalCliTest(unittest.TestCase):
         worker.OPENROUTER_API_KEY = "test-key"
         worker.VISION_ENGINE = "auto"
         worker.OPENROUTER_CASCADE_MODELS = worker.DEFAULT_CASCADE_MODELS
-        worker.OPENROUTER_MODEL = "x-ai/grok-4.5"
+        worker.OPENROUTER_MODEL = "x-ai/grok-4.6"
         original_cli = worker.transcribe_with_local_cli
         original_or = worker.transcribe_with_openrouter
         worker.transcribe_with_local_cli = fake_cli
@@ -231,11 +231,11 @@ class TruncatedLocalCliTest(unittest.TestCase):
             worker.OPENROUTER_CASCADE_MODELS = previous_cascade
             worker.OPENROUTER_MODEL = previous_model
 
-        self.assertEqual(called[0], "google/gemini-3.7-flash")
+        self.assertEqual(called[0], "google/gemini-3.8-flash")
         self.assertNotIn("qwen/qwen3-vl-8b-instruct", called)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["assetName"], "page-20 stock")
-        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.7-flash"))
+        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.8-flash"))
 
     def test_complete_local_cli_stays_terminal(self):
         previous_key = worker.OPENROUTER_API_KEY
@@ -327,7 +327,7 @@ class TruncatedLocalCliTest(unittest.TestCase):
         worker.OPENROUTER_API_KEY = "test-key"
         worker.VISION_ENGINE = "auto"
         worker.OPENROUTER_CASCADE_MODELS = worker.DEFAULT_CASCADE_MODELS
-        worker.OPENROUTER_MODEL = "x-ai/grok-4.5"
+        worker.OPENROUTER_MODEL = "x-ai/grok-4.6"
         original_cli = worker.transcribe_with_local_cli
         original_or = worker.transcribe_with_openrouter
         worker.transcribe_with_local_cli = fake_cli
@@ -349,11 +349,11 @@ class TruncatedLocalCliTest(unittest.TestCase):
             worker.OPENROUTER_MODEL = previous_model
 
         self.assertEqual(cli_called["n"], 0)
-        self.assertEqual(called[0], "google/gemini-3.7-flash")
+        self.assertEqual(called[0], "google/gemini-3.8-flash")
         self.assertNotIn("qwen/qwen3-vl-8b-instruct", called)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["assetName"], "page-20 stock")
-        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.7-flash"))
+        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.8-flash"))
 
     def test_pdf_native_chunk_miss_is_not_terminal(self):
         calls = {"n": 0}
@@ -377,7 +377,7 @@ class TruncatedLocalCliTest(unittest.TestCase):
             rows = worker.transcribe_pdf_native_chunked(
                 "/tmp/filing.pdf",
                 {"doc_id": "khanna-24p", "chamber": "house"},
-                "google/gemini-3.7-flash",
+                "google/gemini-3.8-flash",
                 "/tmp",
                 24,
             )
@@ -411,7 +411,7 @@ class TruncatedLocalCliTest(unittest.TestCase):
             rows = worker.transcribe_pdf_native_chunked(
                 "/tmp/filing.pdf",
                 {"doc_id": "khanna-cover", "chamber": "house"},
-                "google/gemini-3.7-flash",
+                "google/gemini-3.8-flash",
                 "/tmp",
                 20,
             )

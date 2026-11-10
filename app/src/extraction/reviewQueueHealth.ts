@@ -40,14 +40,18 @@ const TERMINAL_REASON_RE =
   /^(rejected:)|local_vision_exhausted|extraction_row_limit|ocr_unusable|scanned_pdf_vision_spend|form_chrome_only/i;
 
 /** SQL fragment: row is NOT a parked/rejected terminal class. */
-export const TERMINAL_REVIEW_REASON_EXCLUDE_SQL = `
-  COALESCE(rq.reason, '') NOT LIKE 'rejected:%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%local_vision_exhausted%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%extraction_row_limit%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%ocr_unusable%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%scanned_pdf_vision_spend%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%form_chrome_only%'
+const terminalReviewReasonExcludeSql = (column: string) => `
+  COALESCE(${column}, '') NOT LIKE 'rejected:%'
+  AND COALESCE(${column}, '') NOT LIKE '%local_vision_exhausted%'
+  AND COALESCE(${column}, '') NOT LIKE '%extraction_row_limit%'
+  AND COALESCE(${column}, '') NOT LIKE '%ocr_unusable%'
+  AND COALESCE(${column}, '') NOT LIKE '%scanned_pdf_vision_spend%'
+  AND COALESCE(${column}, '') NOT LIKE '%form_chrome_only%'
 `.trim();
+
+export const TERMINAL_REVIEW_REASON_EXCLUDE_SQL = terminalReviewReasonExcludeSql('rq.reason');
+/** Same terminal list for statements against a bare review_queue (no alias). */
+export const TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED = terminalReviewReasonExcludeSql('reason');
 
 /** Attempt-capped cascade disagreement — health-terminal, not selector-due. */
 export const ATTEMPT_CAPPED_CASCADE_SQL = `

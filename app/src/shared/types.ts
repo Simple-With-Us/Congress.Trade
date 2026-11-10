@@ -112,6 +112,20 @@ export interface Filing {
   localWaitExpiresAt?: string | null;
 }
 
+/** One `trade_latency_candidates` row, already reduced to a single object. */
+export interface TradeLatencyRead {
+  provider: string | null;
+  /** `provider_first_seen_at`.  There is no `observed_at` column. */
+  observedAt: string | null;
+  providerPublishedAt: string | null;
+  congressFirstSeenAt: string | null;
+  /** `observedAt` minus `congressFirstSeenAt`, in seconds.  Not a stored column. */
+  providerDeltaSec: number | null;
+  /** `providerPublishedAt` minus `congressFirstSeenAt`, in seconds.  Not a stored column. */
+  providerPublishedDeltaSec: number | null;
+  status: string | null;
+}
+
 export interface Transaction {
   id: string;
   docId: string;
@@ -176,6 +190,11 @@ export interface Transaction {
    * otherwise the persist time. Never a date before txDate.
    */
   firstSeenAt?: string | null;
+  /**
+   * Delivery-only stamp: true when filed/first-seen is outside the default
+   * fresh window (webhook/SSE payloads). Absent on feed rows until stamped.
+   */
+  isBackfill?: boolean;
   /** Original public disclosure document URL. Feed only. */
   sourceUrl?: string | null;
   /**
@@ -186,6 +205,21 @@ export interface Transaction {
   disclosureLagDays?: number | null;
   /** STOCK Act 45-day classification of the disclosure lag; null = unknown. */
   stockActStatus?: StockActStatus | null;
+  /** Close on/before the trade date (`tx_performance.price_at_trade`).  Feed only. */
+  priceAtTrade?: number | null;
+  /** S&P close on that same trade anchor (`tx_performance.spx_at_trade`). */
+  spxAtTrade?: number | null;
+  /** Close on/before the filing date (`tx_performance.price_at_filing`). */
+  priceAtFiling?: number | null;
+  /** S&P close on that same filing anchor (`tx_performance.spx_at_filing`). */
+  spxAtFiling?: number | null;
+  /**
+   * One provider-race row for this trade.  Null when the feed selected the
+   * latency columns and no candidate matched.  Absent when the query did not
+   * select them (SSE and CSV).  `observedAt` is `provider_first_seen_at`.
+   * Deltas are computed the same way as GET /api/admin/disclosure-latency.
+   */
+  latency?: TradeLatencyRead | null;
   // --- Optional cross-referenced asset data (securities_ref; feed only) ------
   // Populated when the ticker has been enriched; null/absent otherwise.
   refCompanyName?: string | null;
@@ -219,8 +253,14 @@ export interface ParsedTx {
    * Source fields that were explicitly unreadable and were defaulted locally,
    * or provenance markers for the row itself (e.g. recovered from a truncated
    * provider response — see `salvageTruncatedTransactions` in visionLlm.ts).
+   *
+   * `band_amount_inferred` marks an amount bracket that parseAmountRange SNAPPED
+   * onto a canonical STOCK Act tier rather than matching one the document
+   * printed. On a checkbox-band form that means the band legend was not legible
+   * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
+   * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output'>;
+  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type'>;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -250,6 +290,11 @@ export interface SubscriptionFilters {
   sectors?: string[];
   /** Market-cap buckets to include (mega…nano, securities_ref.market_cap_bucket). */
   marketCapBuckets?: string[];
+  /**
+   * When true, deliver historical backfill rows too. Default (omitted/false) is
+   * fresh-only (filed or first-seen within seven days).
+   */
+  includeBackfill?: boolean;
 }
 
 export interface Subscription {
@@ -555,7 +600,7 @@ export interface Env {
   /** Vision/text LLM key (e.g. Gemini) for scanned-PDF extraction. */
   GEMINI_API_KEY?: string;
   GEMINI_RPM_LIMIT?: string;
-  /** Primary vision model override (defaults to 'gemini-3.7-flash'). */
+  /** Primary vision model override (defaults to 'gemini-3.8-flash'). */
   VISION_PRIMARY_MODEL?: string;
   /** Secondary arbitration extractor key. Presence enables arbitration. */
   ARBITRATION_API_KEY?: string;
@@ -567,7 +612,7 @@ export interface Env {
   OPENAI_API_KEY?: string;
   /** Mistral API key — `mistral-ocr-latest` candidate in the extractor bake-off. */
   MISTRAL_API_KEY?: string;
-  /** xAI API key — Grok (Files API → grok-4.3) candidate in the extractor bake-off. */
+  /** xAI API key — Grok (Files API → grok-4.6) candidate in the extractor bake-off. */
   XAI_API_KEY?: string;
   /** OpenRouter API key — the unified transport for ALL live LLM extraction. */
   OPENROUTER_API_KEY?: string;
@@ -671,8 +716,8 @@ export interface Env {
   FMP_RAPIDAPI_DAILY_CAP?: string;
   /** Daily FMP call budget (stringified int); defaults to 230 when unset. */
   FMP_DAILY_CALL_CAP?: string;
-  /** Shared FMP per-minute pacer ceiling (stringified int). Infisical-tunable. */
-  FMP_MAX_PER_MINUTE?: string;
+  /** Socratic.Trade peer-read pace (clamped to ST_PEER_SAFE_MAX_PER_MINUTE).  Infisical-tunable. */
+  ST_PEER_MAX_PER_MINUTE?: string;
   /** SEC EDGAR per-minute pacer ceiling (stringified int). Infisical-tunable. */
   EDGAR_MAX_PER_MINUTE?: string;
   /** Local-dev-only escape hatch: opens admin when the environment is not production. */
@@ -702,6 +747,12 @@ export interface Env {
   INGEST_RELAY_URL?: string;
   /** Proxy gateway URL for routing Senate eFD requests. */
   SENATE_PROXY_URL?: string;
+  /** Residential proxy URL (e.g. Tailscale http://100.113.106.39:3128) for all gov scraping/probing. */
+  RESIDENTIAL_PROXY_URL?: string;
+  RESIDENTIAL_PROXY_HOST?: string;
+  RESIDENTIAL_PROXY_PORT?: string;
+  RESIDENTIAL_PROXY_USERNAME?: string;
+  RESIDENTIAL_PROXY_PASSWORD?: string;
   /** Enable Cloudflare Browser Rendering fallback (strictly capped to free tier). */
   SENATE_USE_BROWSER_RENDERING?: string;
   /** Enables the OGE executive-branch (278-T) filings watcher. Infisical-tunable. */
@@ -739,7 +790,7 @@ export interface Env {
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   /** Unusual Whales API key for recent Congress trades (latency probe). */
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias (global-api-keys / Infisical) without underscores in the vendor name. */
+  /** Alias (Infisical) without underscores in the vendor name. */
   UNUSUALWHALES_API_KEY?: string;
   /** Distinct filed dates the UW disclosure-latency deep-match pass may query
    *  per probe run (recent-trades?date=<filedDate>), for pending observations
@@ -778,6 +829,49 @@ export interface Env {
   PREVIEW_DEPLOYMENT?: string;
   /** Uniform trace sampling rate (0-1) for the Sentry Cloudflare SDK; overrides the code default. */
   SENTRY_TRACES_SAMPLE_RATE?: string;
+  /** Browser SDK kill switch (`false`/`0`/`off`/`no`).  Default on when DSN is set. */
+  SENTRY_BROWSER_ENABLED?: string;
+  /** User Feedback widget kill switch.  Default on. */
+  SENTRY_FEEDBACK_ENABLED?: string;
+  /** Web session Replay sample (Designer 2026-09-04: default 0.1). */
+  SENTRY_REPLAY_SESSION_SAMPLE_RATE?: string;
+  /** Web error Replay sample (default 1). */
+  SENTRY_REPLAY_ERROR_SAMPLE_RATE?: string;
+  /** Datadog API key for agentless logs + APM intake. */
+  DD_API_KEY?: string;
+  DATADOG_API_KEY?: string;
+  /** Datadog application key (fleet registry / synthetics).  Not required to send logs or traces. */
+  DD_APP_KEY?: string;
+  DATADOG_APP_KEY?: string;
+  /** Datadog site, e.g. us5.datadoghq.com. Defaults to us5.datadoghq.com. */
+  DD_SITE?: string;
+  /** Optional APM/log service override.  Default congress-trade. */
+  DD_SERVICE?: string;
+  /** Optional Datadog env tag.  Falls back to SENTRY_ENVIRONMENT / USAGE_MONITOR_ENVIRONMENT. */
+  DD_ENV?: string;
+  /** Optional Datadog Agent host / URL (e.g. 127.0.0.1 or http://127.0.0.1:8126). */
+  DD_AGENT_HOST?: string;
+  DD_TRACE_AGENT_URL?: string;
+  DD_TRACE_AGENT_HOSTNAME?: string;
+  DD_TRACE_URL?: string;
+  /** Optional APM trace sample rate (0.0 to 1.0, defaults to 0.2). */
+  DD_TRACE_SAMPLE_RATE?: string;
+  /** Host tag.  Prefer fleet-hetzner-nbg1 so APM does not mint extra Free hosts. */
+  DD_HOSTNAME?: string;
+  /** RUM kill switch.  false/0/off/no fail-closes even when client tokens exist. */
+  DD_RUM_ENABLED?: string;
+  NEXT_PUBLIC_DD_RUM_ENABLED?: string;
+  /** Public RUM client token.  Aliases: DD_RUM_CLIENT_TOKEN, NEXT_PUBLIC_DD_CLIENT_TOKEN. */
+  DD_CLIENT_TOKEN?: string;
+  DD_RUM_CLIENT_TOKEN?: string;
+  NEXT_PUBLIC_DD_CLIENT_TOKEN?: string;
+  NEXT_PUBLIC_DD_RUM_CLIENT_TOKEN?: string;
+  /** Public RUM application id.  Aliases: DD_RUM_APPLICATION_ID, NEXT_PUBLIC_DD_APPLICATION_ID. */
+  DD_APPLICATION_ID?: string;
+  DD_RUM_APPLICATION_ID?: string;
+  NEXT_PUBLIC_DD_APPLICATION_ID?: string;
+  NEXT_PUBLIC_DD_RUM_APPLICATION_ID?: string;
+  NEXT_PUBLIC_DD_SITE?: string;
   /** Cloudflare Workers version metadata binding; used by Sentry to auto-tag the release. */
   CF_VERSION_METADATA?: { id: string; tag: string; timestamp?: string };
 
@@ -887,10 +981,23 @@ export interface Env {
   DELIVERY_TARGET_BASE_BACKOFF_SEC?: string;
   /** Parked deliveries allowed per subscription before overflow quarantine (default 500). */
   DELIVERY_TARGET_PARKED_CAP?: string;
+  /**
+   * Env fallback for the Infisical app setting of the same name: when truthy
+   * the scheduled flush re-parks live quarantined rows (default off).
+   */
+  DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER?: string;
   /** Admin + scoped import bearer tokens. */
   ADMIN_TOKEN?: string;
   /** Admin email allowlist for site-session admin access and Cloudflare Access. */
   ADMIN_EMAILS?: string;
+  /** HTTPS webhook that wakes Grok Bot Publisher on review_queue entry. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL?: string;
+  /** Optional GB Publisher (Grok Bot) webhook; same secret as BF. Comma-separated URLs also supported on the primary key. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB?: string;
+  /** Optional `Authorization` header for GB Publisher only (value includes `Bearer ` prefix). */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB?: string;
+  /** HMAC secret for REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL payloads. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET?: string;
   /** Cloudflare Access team name/hostname for admin API JWT verification. */
   ACCESS_TEAM_DOMAIN?: string;
   /** Cloudflare Access application AUD tag for admin API JWT verification. */
@@ -898,6 +1005,8 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Scoped token for the idempotent admin maintenance endpoints only (backlog requeue/retry). */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /** Scoped token for POST /api/admin/senate-ptr-intake only (Mac eFD fetcher, CT-2442). */
+  SENATE_INTAKE_TOKEN?: string;
   LLAMAPARSE_API_KEY?: string;
 
   // --- Billing (Stripe) ---
@@ -998,6 +1107,9 @@ export interface Env {
    * this is configured.
    */
   IOS_APP_STORE_ID?: string;
+  /** Public TestFlight join link or beta URL for the iOS app. */
+  IOS_TESTFLIGHT_URL?: string;
+  IOS_BETA_URL?: string;
   /** "true" to force arbitration on when configured. */
   ARBITRATION_ENABLED?: string;
   /** Cross-app import guardrails. Tune down for lean/free-compatible runs. */

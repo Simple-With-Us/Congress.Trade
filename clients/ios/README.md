@@ -29,6 +29,17 @@ basename — that tripped up tooling).  The dotted leftover
 bundle id, scheme, and targets are unchanged (`Congress.Trade` /
 `trade.congress.ios` / `CongressTrade`).
 
+`project.yml` is the XcodeGen source of truth. After changing sources, packages,
+or build settings:
+
+```bash
+cd clients/ios && xcodegen generate
+```
+
+Do not hand-edit `project.pbxproj`. Native Sentry is wired through
+`SentryTelemetry.swift` and plist key `SENTRY_DSN` (empty by default; pass the
+build setting for release archives).
+
 ```bash
 open clients/ios/CongressTrade.xcodeproj
 ```
@@ -102,4 +113,4 @@ bash scripts/ios-ship-testflight.sh --export-only
 Fleet driver (all three apps): `/Users/jay/apps/ios-fleet/README.md`.
 
 Bundle ID: `trade.congress.ios`. Team: `CC8UTF7ATG`. Requires App Store Connect
-app record + Xcode session or `~/.secrets/appstore-connect.env`.
+app record + Xcode session or ASC credentials (env, else Infisical `/asc` via `fleet-secrets`).

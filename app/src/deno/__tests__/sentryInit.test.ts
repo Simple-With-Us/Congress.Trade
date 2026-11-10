@@ -6,8 +6,10 @@ import {
   createSentryBindings,
   resolveProductionSentryEnv,
   resolveSentryDsn,
+  sentryLoggerWarn,
   type SentrySdkLike,
 } from '../../shared/sentryRuntime.ts';
+import { NOT_LINKED_SENTRY_DATA_COLLECTION } from '../../shared/sentryDataCollection.ts';
 import { SENTRY_FILTERED_VALUE, scrubSentryEvent } from '../../shared/sentryScrub.ts';
 
 function fakeSdk(overrides: Partial<SentrySdkLike> = {}): SentrySdkLike & {
@@ -47,8 +49,57 @@ describe('production Sentry init', () => {
     expect(options.environment).toBe('production');
     expect(options.tracesSampleRate).toBe(0.2);
     expect(options.sendDefaultPii).toBe(false);
+    expect(options.dataCollection).toEqual(NOT_LINKED_SENTRY_DATA_COLLECTION);
+    expect(typeof options.beforeSendSpan).toBe('function');
+    expect(typeof options.beforeSendMetric).toBe('function');
+    expect(options.enableLogs).toBe(true);
+    expect(options._flushInterval).toBe(1000);
     expect(typeof options.beforeSend).toBe('function');
+    expect(Array.isArray(options.ignoreErrors)).toBe(true);
+    expect(options.ignoreErrors).toEqual(expect.arrayContaining(['XRefEntryException']));
     expect((options.initialScope as { tags?: { runtime?: string } })?.tags?.runtime).toBe('coolify-docker');
+  });
+
+  it('routes sentryLoggerWarn to the SDK logger after init without console.warn', () => {
+    const warn = vi.fn();
+    const count = vi.fn();
+    const sdk = fakeSdk({ logger: { warn }, metrics: { count } });
+    const sentry = createSentryBindings(sdk);
+    sentry.initProductionSentry({
+      SENTRY_DSN: 'https://key@o1.ingest.us.sentry.io/1',
+    });
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    sentryLoggerWarn('ingest.dead_letter', { queue: 'ingest', reason: 'governor_cap' });
+    expect(warn).toHaveBeenCalledWith('ingest.dead_letter', {
+      queue: 'ingest',
+      reason: 'governor_cap',
+    });
+    expect(count).toHaveBeenCalledWith('ingest.dead_letter', 1, {
+      attributes: { queue: 'ingest', reason: 'governor_cap' },
+    });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('flushes the SDK after init and no-ops before', async () => {
+    const flush = vi.fn(async () => true);
+    const sdk = fakeSdk({ flush });
+    const sentry = createSentryBindings(sdk);
+    expect(await sentry.flush(500)).toBe(false);
+    expect(flush).not.toHaveBeenCalled();
+    sentry.initProductionSentry({
+      SENTRY_DSN: 'https://key@o1.ingest.us.sentry.io/1',
+    });
+    await expect(sentry.flush(1500)).resolves.toBe(true);
+    expect(flush).toHaveBeenCalledWith(1500);
+  });
+
+  it('falls back to console.warn when Sentry is not initialized', () => {
+    createSentryBindings(fakeSdk());
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    sentryLoggerWarn('webhook-retry', { delaySeconds: 5 });
+    expect(spy).toHaveBeenCalledWith('webhook-retry', { delaySeconds: 5 });
+    spy.mockRestore();
   });
 
   it('tags the Coolify image SHA as the Sentry release, not a Deploy id', () => {
@@ -118,6 +169,38 @@ describe('production Sentry init', () => {
     expect(sentry.captureException(new Error('later'))).toBeUndefined();
   });
 
+  it('drops expected pdf.js XRef noise before send (CONGRESS-TRADE-1C)', () => {
+    const options = buildSentryInitOptions(
+      { SENTRY_DSN: 'https://key@o1.ingest.us.sentry.io/1' },
+      0.1,
+    );
+    const beforeSend = options.beforeSend as (event: Record<string, unknown>) => unknown;
+    expect(beforeSend({
+      exception: {
+        values: [{
+          type: 'XRefEntryException',
+          value: 'Bad (uncompressed) XRef entry: 13R',
+        }],
+      },
+    })).toBeNull();
+  });
+
+  it('does not capture expected pdf.js XRef exceptions after init', () => {
+    const sdk = fakeSdk();
+    const sentry = createSentryBindings(sdk);
+    sentry.initProductionSentry({
+      SENTRY_DSN: 'https://key@o1.ingest.us.sentry.io/1',
+    });
+    const err = Object.assign(new Error('Bad (uncompressed) XRef entry: 14R'), {
+      name: 'XRefEntryException',
+    });
+    expect(sentry.captureException(err)).toBeUndefined();
+    expect(sdk.captureException).not.toHaveBeenCalled();
+    const real = new Error('Deno cron tick exceeded 45000ms deadline');
+    sentry.captureException(real);
+    expect(sdk.captureException).toHaveBeenCalledWith(real, undefined);
+  });
+
   it('scrubs secrets from events before send', () => {
     const credential = 'do-not-serialize-this-credential';
     const options = buildSentryInitOptions(
@@ -181,8 +264,21 @@ describe('production entry wiring', () => {
     const src = readFileSync(resolve(process.cwd(), 'src/deno/main.ts'), 'utf8');
     expect(src).toContain('resolveProductionSentryEnv');
     expect(src).toContain('initProductionSentry');
+    expect(src).toContain('flushSentry');
     expect(src).toContain('captureException(err, { tags: { cron: \'deno-tick\' } })');
+    expect(src).toContain('isDenoCronTickHardDeadline(message)');
+    expect(src).not.toContain('/exceeded \\d+ms deadline/');
+    expect(src).toContain('isExpectedPdfParseNoise');
+    expect(src).toContain('sentryLoggerWarn');
     expect(src).not.toContain('sentryDummy');
+  });
+
+  it('boots Datadog from Infisical/env and fail-closes when keys are missing', () => {
+    const src = readFileSync(resolve(process.cwd(), 'src/deno/main.ts'), 'utf8');
+    expect(src).toContain('resolveProductionDatadogEnv');
+    expect(src).toContain('initProductionDatadog');
+    expect(src).toContain('datadogCaptureException');
+    expect(src).not.toContain('dd-trace');
   });
 
   it('does not add Deno Deploy, deployctl, or Deploy-only APIs', () => {

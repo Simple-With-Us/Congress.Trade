@@ -1,7 +1,6 @@
 import SwiftUI
 import SwiftData
 import OSLog
-import StoreKit
 
 /// Tab identity shared with `TabRouter` so any screen can programmatically
 /// switch tabs.
@@ -22,6 +21,126 @@ final class TabRouter: ObservableObject {
         ProcessInfo.processInfo.arguments.contains("-startOnTrades") ? .trades : .trends
 }
 
+/// Inbound share / Universal Link / custom-scheme destinations that already
+/// exist in the app.  Missing or unknown queries stay `nil` — we do not
+/// invent a tab or sheet.  `congresstrade://auth` is session handoff only.
+///
+/// Associated Domains (`applinks:congress.trade`) still has to be flipped on
+/// in Xcode's capability UI — do not hand-edit the entitlements file.
+enum AppDeepLink: Equatable {
+    case auth(token: String)
+    case trade(id: String)
+    case member(id: String)
+    case ticker(symbol: String)
+    case filing(docId: String)
+    case tab(AppTab)
+
+    static func parse(_ url: URL) -> AppDeepLink? {
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "congresstrade" || scheme == "http" || scheme == "https" else {
+            return nil
+        }
+
+        let host = (url.host ?? "").lowercased()
+        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let pathComponents = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+
+        if scheme == "congresstrade" && (host == "auth" || (host.isEmpty && path.hasPrefix("auth"))) {
+            guard let token = queryValue(queryItems, names: "token") else { return nil }
+            return .auth(token: token)
+        }
+
+        // Website open-from-URL priority: ticker, then member, then trade.
+        if let ticker = queryValue(queryItems, names: "ticker", "asset") {
+            return .ticker(symbol: ticker.uppercased())
+        }
+        if let member = queryValue(queryItems, names: "member", "politician") {
+            return .member(id: member.removingPercentEncoding ?? member)
+        }
+        if let trade = queryValue(queryItems, names: "trade", "trade_id") {
+            return .trade(id: trade)
+        }
+        if let docId = queryValue(queryItems, names: "filing", "doc", "doc_id") {
+            return .filing(docId: docId)
+        }
+        if let view = queryValue(queryItems, names: "view") {
+            return tab(fromToken: view)
+        }
+        if queryItems.contains(where: { $0.name.caseInsensitiveCompare("delivery") == .orderedSame }) {
+            return .tab(.delivery)
+        }
+
+        if scheme == "congresstrade" {
+            if let link = entity(host: host, remainder: path) { return link }
+            if let tabLink = tab(fromToken: host) { return tabLink }
+            if host.isEmpty, let first = pathComponents.first {
+                let rest = pathComponents.dropFirst().joined(separator: "/")
+                if let link = entity(host: first.lowercased(), remainder: rest) { return link }
+                if let tabLink = tab(fromToken: first) { return tabLink }
+            }
+            return nil
+        }
+
+        if let firstIdx = pathComponents.firstIndex(where: {
+            Self.recognizedPathTokens.contains($0.lowercased())
+        }) {
+            let section = pathComponents[firstIdx].lowercased()
+            let nextVal = firstIdx + 1 < pathComponents.count ? pathComponents[firstIdx + 1] : ""
+            if let link = entity(host: section, remainder: nextVal) { return link }
+            return tab(fromToken: section)
+        }
+
+        return nil
+    }
+
+    private static let recognizedPathTokens: Set<String> = [
+        "trade", "member", "politician", "ticker", "filing", "doc",
+        "delivery", "trends", "trades", "feed", "people", "directory", "subs"
+    ]
+
+    private static func queryValue(_ items: [URLQueryItem], names: String...) -> String? {
+        for name in names {
+            guard let raw = items.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame })?.value
+            else { continue }
+            let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleaned.isEmpty { return cleaned }
+        }
+        return nil
+    }
+
+    private static func entity(host: String, remainder: String) -> AppDeepLink? {
+        let cleaned = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch host {
+        case "trade":
+            return cleaned.isEmpty ? nil : .trade(id: cleaned)
+        case "member", "politician":
+            return cleaned.isEmpty ? nil : .member(id: cleaned.removingPercentEncoding ?? cleaned)
+        case "ticker":
+            return cleaned.isEmpty ? nil : .ticker(symbol: cleaned.uppercased())
+        case "filing", "doc":
+            return cleaned.isEmpty ? nil : .filing(docId: cleaned)
+        default:
+            return nil
+        }
+    }
+
+    private static func tab(fromToken raw: String) -> AppDeepLink? {
+        switch raw.lowercased() {
+        case "trends":
+            return .tab(.trends)
+        case "trades", "feed":
+            return .tab(.trades)
+        case "people", "directory":
+            return .tab(.people)
+        case "delivery", "subs":
+            return .tab(.delivery)
+        default:
+            return nil
+        }
+    }
+}
+
 @main
 struct CongressTradeApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -36,6 +155,11 @@ struct CongressTradeApp: App {
     /// `makeTradeCacheContainer()`.
     private let tradeCacheContainer = CongressTradeApp.makeTradeCacheContainer()
 
+    init() {
+        // Native crashes / hangs need the Cocoa SDK before first paint.
+        SentryTelemetry.start()
+    }
+
     var body: some Scene {
         WindowGroup {
             MainTabView()
@@ -49,10 +173,27 @@ struct CongressTradeApp: App {
                 .onChange(of: appColorScheme) { _, pref in
                     AppAppearance.apply(pref)
                 }
+                // Owner 2026-09-21 ask: shake-to-report, default OFF. The
+                // hook is wired at the App root so every view inherits the
+                // gesture without per-screen plumbing; the AppStorage key
+                // `shake_to_report_enabled` is what the user toggles in
+                // Settings → Account. Notification fires `presentBugReportSheet`
+                // via the route stored in UserDefaults — see
+                // `ShakeToReportCoordinator`.
+                .modifier(ShakeToReportCoordinator(presenting: shakeToReportSignal))
                 .appUpdatePrompt()
         }
         .modelContainer(tradeCacheContainer)
     }
+
+    /// User opt-in toggle for shake-to-report. Default `false` per owner
+    /// ask — the shake gesture is hidden unless the user turns it on.
+    @AppStorage("shake_to_report_enabled") private var shakeToReportEnabled: Bool = false
+    /// Bumps when shake-to-report fires; the coordinator listens and posts
+    /// `.shakeToReport`. Stored as `Int` (Date().timeIntervalSince1970) so a
+    /// tap on the Account menu "Report a Bug" entry doesn't double-fire the
+    /// shake path; the menu uses `presentBugReportSheet()` directly.
+    @State private var shakeToReportSignal: Int = 0
 
     private var colorScheme: ColorScheme? {
         switch appColorScheme {
@@ -355,15 +496,27 @@ struct MainTabView: View {
         .task {
             store.modelContext = modelContext
             if store.feed == nil {
+                // CT-2459: Trends is the landing tab — let its fan-out win
+                // the launch bandwidth instead of racing the feed page +
+                // bootstrap + signed-in probes against it (~17 requests
+                // contended before first useful paint). The SwiftData
+                // cache already paints the Trades list instantly; its
+                // network refresh follows immediately after.
+                if tabRouter.selection == .trends {
+                    await store.refreshTrends()
+                }
                 await store.refresh()
             }
             // Catch-up for a purchase that was charged and finished locally but
             // never recorded server-side. No-op for everyone already Premium.
             await store.reconcileAppleEntitlementsQuietly()
         }
-        // Pause the nextPollAfterSec poll loop while backgrounded.
-        .onChange(of: scenePhase) { _, phase in
-            store.setAutoRefreshPaused(phase != .active)
+        // Pause the nextPollAfterSec poll loop while backgrounded, and play disclaimer intro on foreground.
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            store.setAutoRefreshPaused(newPhase != .active)
+            if newPhase == .active && oldPhase == .background {
+                DisclaimerColdStart.triggerFromForeground($disclaimerExpanded)
+            }
         }
         // Push notification tap handlers
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("OpenTradeFromPush"))) { notification in
@@ -384,157 +537,39 @@ struct MainTabView: View {
             tabRouter.selection = .trades
             activeFiling = FilingSheetTarget(docId: cleanDoc)
         }
-        // Universal deep links and congresstrade:// links.
+        // Universal Links arrive as a browsing-web activity; custom-scheme
+        // and some https handoffs also hit onOpenURL.  Same parser for both.
+        .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+            if let url = activity.webpageURL {
+                handleOpenURL(url)
+            }
+        }
         .onOpenURL { url in
             handleOpenURL(url)
         }
     }
 
     private func handleOpenURL(_ url: URL) {
-        let scheme = url.scheme?.lowercased() ?? ""
-        guard scheme == "congresstrade" || scheme == "http" || scheme == "https" else { return }
-
-        let host = (url.host ?? "").lowercased()
-        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let pathComponents = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
-        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        let queryItems = components?.queryItems ?? []
-
-        // Auth token handoff: congresstrade://auth?token=…
-        if scheme == "congresstrade" && (host == "auth" || (host.isEmpty && path.hasPrefix("auth"))) {
-            if let token = queryItems.first(where: { $0.name == "token" })?.value, !token.isEmpty {
-                _ = store.saveSessionToken(token)
-            }
-            return
-        }
-
-        // 1. Query-param based universal links (?trade=…, ?member=…, ?ticker=…, ?filing=…, ?delivery)
-        if let tradeId = queryItems.first(where: { $0.name == "trade" || $0.name == "trade_id" })?.value,
-           !tradeId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let cleanId = tradeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let link = AppDeepLink.parse(url) else { return }
+        switch link {
+        case .auth(let token):
+            _ = store.saveSessionToken(token)
+        case .trade(let id):
             tabRouter.selection = .trades
             Task {
-                if let trade = await store.fetchTrade(id: cleanId) {
+                if let trade = await store.fetchInboundTrade(id: id) {
                     activeTradeDetail = trade
                 }
             }
-            return
-        }
-
-        if let memberVal = queryItems.first(where: { $0.name == "member" || $0.name == "politician" })?.value,
-           !memberVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            resolveAndOpenMember(memberVal)
-            return
-        }
-
-        if let tickerVal = queryItems.first(where: { $0.name == "ticker" || $0.name == "asset" })?.value,
-           !tickerVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let symbol = tickerVal.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        case .member(let id):
+            resolveAndOpenMember(id)
+        case .ticker(let symbol):
             activeTicker = TickerSheetTarget(ticker: symbol)
-            return
-        }
-
-        if let docVal = queryItems.first(where: { $0.name == "filing" || $0.name == "doc" || $0.name == "doc_id" })?.value,
-           !docVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let cleanDoc = docVal.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .filing(let docId):
             tabRouter.selection = .trades
-            activeFiling = FilingSheetTarget(docId: cleanDoc)
-            return
-        }
-
-        if queryItems.contains(where: { $0.name == "delivery" }) {
-            tabRouter.selection = .delivery
-            return
-        }
-
-        // 2. Custom scheme path-based: congresstrade://trade/:id, congresstrade://member/:id, etc.
-        if scheme == "congresstrade" {
-            if host == "trade", !path.isEmpty {
-                let cleanId = path.trimmingCharacters(in: .whitespacesAndNewlines)
-                tabRouter.selection = .trades
-                Task {
-                    if let trade = await store.fetchTrade(id: cleanId) {
-                        activeTradeDetail = trade
-                    }
-                }
-                return
-            }
-            if host == "member" || host == "politician", !path.isEmpty {
-                resolveAndOpenMember(path)
-                return
-            }
-            if host == "ticker", !path.isEmpty {
-                let symbol = path.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-                activeTicker = TickerSheetTarget(ticker: symbol)
-                return
-            }
-            if host == "filing" || host == "doc", !path.isEmpty {
-                let cleanDoc = path.trimmingCharacters(in: .whitespacesAndNewlines)
-                tabRouter.selection = .trades
-                activeFiling = FilingSheetTarget(docId: cleanDoc)
-                return
-            }
-            if host == "delivery" {
-                tabRouter.selection = .delivery
-                return
-            }
-            if host == "trends" {
-                tabRouter.selection = .trends
-                return
-            }
-            if host == "trades" {
-                tabRouter.selection = .trades
-                return
-            }
-            if host == "people" || host == "directory" {
-                tabRouter.selection = .people
-                return
-            }
-        }
-
-        // 3. Universal links path-based: https://congress.trade/trade/:id, /member/:idOrName, /ticker/:symbol, /filing/:docId
-        if let firstIdx = pathComponents.firstIndex(where: {
-            ["trade", "member", "politician", "ticker", "filing", "doc", "delivery", "trends", "trades", "people", "directory"].contains($0.lowercased())
-        }) {
-            let section = pathComponents[firstIdx].lowercased()
-            let nextVal = firstIdx + 1 < pathComponents.count ? pathComponents[firstIdx + 1] : nil
-
-            switch section {
-            case "trade":
-                if let id = nextVal, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let cleanId = id.trimmingCharacters(in: .whitespacesAndNewlines)
-                    tabRouter.selection = .trades
-                    Task {
-                        if let trade = await store.fetchTrade(id: cleanId) {
-                            activeTradeDetail = trade
-                        }
-                    }
-                }
-            case "member", "politician":
-                if let val = nextVal, !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    resolveAndOpenMember(val)
-                }
-            case "ticker":
-                if let symbol = nextVal, !symbol.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    activeTicker = TickerSheetTarget(ticker: symbol.uppercased().trimmingCharacters(in: .whitespacesAndNewlines))
-                }
-            case "filing", "doc":
-                if let docId = nextVal, !docId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let cleanDoc = docId.trimmingCharacters(in: .whitespacesAndNewlines)
-                    tabRouter.selection = .trades
-                    activeFiling = FilingSheetTarget(docId: cleanDoc)
-                }
-            case "delivery":
-                tabRouter.selection = .delivery
-            case "trends":
-                tabRouter.selection = .trends
-            case "trades":
-                tabRouter.selection = .trades
-            case "people", "directory":
-                tabRouter.selection = .people
-            default:
-                break
-            }
+            activeFiling = FilingSheetTarget(docId: docId)
+        case .tab(let tab):
+            tabRouter.selection = tab
         }
     }
 
@@ -571,365 +606,69 @@ struct FilingSheetTarget: Identifiable, Hashable {
     var id: String { docId }
 }
 
-// MARK: - AppUpdatePrompt (canonical: /Users/jay/apps/ios-fleet/AppUpdatePrompt.swift)
-//
-//  AppUpdatePrompt.swift
-//
-//  Portable first-launch update check for every fleet iOS app.
-//  Canonical copy: /Users/jay/apps/ios-fleet/AppUpdatePrompt.swift
-//  Copy this file into each app target.  Do not fork behavior.
-//
-//  On the first scene of a cold launch the app:
-//    1. Detects Xcode / TestFlight / App Store (StoreKit AppTransaction).
-//    2. Reads the latest marketing version from the public fleet manifest
-//       (TestFlight source of truth) and the iTunes Lookup API (App Store).
-//    3. If the installed version is older, asks whether to update.
-//    4. Update opens TestFlight (itms-beta) or the App Store (itms-apps).
-//
-//  DEBUG / Xcode / screenshot launches stay silent.  "Not Now" skips that
-//  version until a newer one appears.  Failures are silent (no network
-//  error alerts).  No secrets are fetched or stored.
-//
+// MARK: - Shake-to-report (owner 2026-09-21 ask, default OFF)
 
-enum AppUpdatePrompt {
-
-    static let defaultManifestURL = URL(
-        string: "https://raw.githubusercontent.com/jaywedgeworth22/ios-app-versions/main/versions.json"
-    )!
-
-    /// Numeric Apple IDs for TestFlight / App Store deep links.
-    /// Keep in sync with /Users/jay/apps/ios-fleet/apps.json.
-    static let knownAppleIds: [String: Int] = [
-        "trade.socratic.app": 6_799_238_379,
-        "trade.congress.ios": 6_798_076_688,
-        "services.jays.usage.client.monitor": 6_799_230_435,
-        "services.jays.usage.local.monitor": 6_799_230_729,
-        "online.dealdex": 6_802_474_288,
-    ]
-
-    private static let skippedVersionKeyPrefix = "appUpdatePrompt.skippedVersion."
-
-    struct Config: Equatable {
-        var bundleId: String
-        var appleId: Int?
-        var manifestURL: URL
-        var currentMarketingVersion: String
-        var currentBuild: String
-
-        static func fromBundle(_ bundle: Bundle = .main) -> Config {
-            let info = bundle.infoDictionary ?? [:]
-            let bundleId = bundle.bundleIdentifier ?? ""
-            let plistAppleId = intValue(info["AppUpdateAppleId"])
-            let manifest = (info["AppUpdateManifestURL"] as? String)
-                .flatMap(URL.init(string:)) ?? AppUpdatePrompt.defaultManifestURL
-            return Config(
-                bundleId: bundleId,
-                appleId: plistAppleId ?? knownAppleIds[bundleId],
-                manifestURL: manifest,
-                currentMarketingVersion: (info["CFBundleShortVersionString"] as? String) ?? "0",
-                currentBuild: (info["CFBundleVersion"] as? String) ?? "0"
-            )
-        }
-    }
-
-    struct Version: Comparable, Equatable, CustomStringConvertible {
-        let raw: String
-        let parts: [Int]
-
-        var description: String { raw }
-
-        init(_ raw: String) {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            self.raw = trimmed
-            self.parts = trimmed.split(separator: ".", omittingEmptySubsequences: true).map { segment in
-                Int(segment.filter(\.isNumber)) ?? 0
-            }
-        }
-
-        static func == (lhs: Version, rhs: Version) -> Bool {
-            !(lhs < rhs) && !(rhs < lhs)
-        }
-
-        static func < (lhs: Version, rhs: Version) -> Bool {
-            let count = max(lhs.parts.count, rhs.parts.count)
-            for index in 0..<count {
-                let left = index < lhs.parts.count ? lhs.parts[index] : 0
-                let right = index < rhs.parts.count ? rhs.parts[index] : 0
-                if left != right { return left < right }
-            }
-            return false
-        }
-    }
-
-    enum Channel: Equatable {
-        case xcode
-        case testFlight
-        case appStore
-        case unknown
-    }
-
-    struct Offer: Equatable {
-        var latestVersion: String
-        var currentVersion: String
-        var channel: Channel
-        var storeURL: URL
-        var fallbackURL: URL
-
-        var message: String {
-            "Version \(latestVersion) is available.\u{00A0} You have \(currentVersion)."
-        }
-    }
-
-    static var shouldSkipLaunchChecks: Bool {
-        #if DEBUG
-        if ProcessInfo.processInfo.environment["APP_UPDATE_PROMPT_FORCE"] != "1" {
-            return true
-        }
-        #endif
-        let process = ProcessInfo.processInfo
-        if process.arguments.contains("-ASCScreenshots") { return true }
-        if process.arguments.contains("-ScreenshotDemo") { return true }
-        if process.environment["ASC_SCREENSHOTS"] == "1" { return true }
-        if UserDefaults.standard.bool(forKey: "ascScreenshots") { return true }
-        return false
-    }
-
-    static func detectChannel() async -> Channel {
-        do {
-            let result = try await AppTransaction.shared
-            switch result {
-            case .verified(let transaction):
-                switch transaction.environment {
-                case .xcode: return .xcode
-                case .sandbox: return .testFlight
-                case .production: return .appStore
-                default: break
-                }
-            case .unverified:
-                break
-            }
-        } catch {
-            // Fall through to the receipt path.  StoreKit is unavailable in
-            // some simulator / unsigned CI builds.
-        }
-        return receiptChannel()
-    }
-
-    static func receiptChannel() -> Channel {
-        guard let receiptURL = Bundle.main.appStoreReceiptURL else { return .unknown }
-        if receiptURL.lastPathComponent == "sandboxReceipt" {
-            return .testFlight
-        }
-        if FileManager.default.fileExists(atPath: receiptURL.path) {
-            return .appStore
-        }
-        return .unknown
-    }
-
-    static func isNewer(latestMarketing: String, latestBuild: String?, currentMarketing: String, currentBuild: String) -> Bool {
-        let latest = Version(latestMarketing)
-        let current = Version(currentMarketing)
-        if latest > current { return true }
-        if latest < current { return false }
-        guard let latestBuild, !latestBuild.isEmpty else { return false }
-        return Version(latestBuild) > Version(currentBuild)
-    }
-
-    static func skippedVersion(for bundleId: String, defaults: UserDefaults = .standard) -> String? {
-        defaults.string(forKey: skippedVersionKeyPrefix + bundleId)
-    }
-
-    static func rememberSkip(version: String, bundleId: String, defaults: UserDefaults = .standard) {
-        defaults.set(version, forKey: skippedVersionKeyPrefix + bundleId)
-    }
-
-    static func storeURLs(channel: Channel, appleId: Int, testFlightURL: String?, appStoreURL: String?) -> (primary: URL, fallback: URL)? {
-        switch channel {
-        case .testFlight, .unknown:
-            let primary = testFlightURL.flatMap(URL.init(string:))
-                ?? URL(string: "itms-beta://beta.itunes.apple.com/v1/app/\(appleId)")
-            let fallback = URL(string: "https://beta.itunes.apple.com/v1/app/\(appleId)")
-            if let primary, let fallback { return (primary, fallback) }
-            return nil
-        case .appStore, .xcode:
-            let primary = appStoreURL.flatMap(URL.init(string:))
-                ?? URL(string: "itms-apps://itunes.apple.com/app/id\(appleId)")
-            let fallback = URL(string: "https://apps.apple.com/app/id\(appleId)")
-            if let primary, let fallback { return (primary, fallback) }
-            return nil
-        }
-    }
-
-    static func evaluate(
-        config: Config,
-        channel: Channel,
-        manifest: ManifestFile?,
-        lookup: LookupFile?
-    ) -> Offer? {
-        guard channel != .xcode else { return nil }
-
-        let entry = manifest?.apps[config.bundleId]
-        let lookupResult = lookup?.results.first
-
-        let latestMarketing: String?
-        switch channel {
-        case .appStore:
-            latestMarketing = lookupResult?.version ?? entry?.marketingVersion
-        case .testFlight, .unknown:
-            latestMarketing = entry?.marketingVersion ?? lookupResult?.version
-        case .xcode:
-            return nil
-        }
-
-        guard let latestMarketing, !latestMarketing.isEmpty else { return nil }
-        let latestBuild = entry?.build
-        guard isNewer(
-            latestMarketing: latestMarketing,
-            latestBuild: channel == .appStore ? nil : latestBuild,
-            currentMarketing: config.currentMarketingVersion,
-            currentBuild: config.currentBuild
-        ) else { return nil }
-
-        if let skipped = skippedVersion(for: config.bundleId), Version(skipped) >= Version(latestMarketing) {
-            return nil
-        }
-
-        let appleId = entry?.appleId ?? lookupResult?.trackId ?? config.appleId
-        guard let appleId else { return nil }
-        guard let urls = storeURLs(
-            channel: channel,
-            appleId: appleId,
-            testFlightURL: entry?.testFlightURL,
-            appStoreURL: entry?.appStoreURL ?? lookupResult?.trackViewUrl
-        ) else { return nil }
-
-        return Offer(
-            latestVersion: latestMarketing,
-            currentVersion: config.currentMarketingVersion,
-            channel: channel,
-            storeURL: urls.primary,
-            fallbackURL: urls.fallback
-        )
-    }
-
-    struct ManifestFile: Decodable, Equatable {
-        var apps: [String: ManifestApp]
-    }
-
-    struct ManifestApp: Decodable, Equatable {
-        var marketingVersion: String
-        var build: String?
-        var appleId: Int?
-        var testFlightURL: String?
-        var appStoreURL: String?
-    }
-
-    struct LookupFile: Decodable, Equatable {
-        var resultCount: Int
-        var results: [LookupResult]
-    }
-
-    struct LookupResult: Decodable, Equatable {
-        var version: String
-        var trackId: Int
-        var trackViewUrl: String?
-    }
-
-    static func fetchManifest(from url: URL) async -> ManifestFile? {
-        await fetchJSON(ManifestFile.self, from: url)
-    }
-
-    static func fetchLookup(bundleId: String) async -> LookupFile? {
-        guard let url = URL(string: "https://itunes.apple.com/lookup?bundleId=\(bundleId)") else {
-            return nil
-        }
-        return await fetchJSON(LookupFile.self, from: url)
-    }
-
-    private static func fetchJSON<T: Decodable>(_ type: T.Type, from url: URL) async -> T? {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 8
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                return nil
-            }
-            return try JSONDecoder().decode(T.self, from: data)
-        } catch {
-            return nil
-        }
-    }
-
-    private static func intValue(_ value: Any?) -> Int? {
-        switch value {
-        case let number as Int: return number
-        case let number as NSNumber: return number.intValue
-        case let text as String: return Int(text)
-        default: return nil
-        }
-    }
-}
-
-extension View {
-    func appUpdatePrompt(config: AppUpdatePrompt.Config = .fromBundle()) -> some View {
-        modifier(AppUpdatePromptModifier(config: config))
-    }
-}
-
-private struct AppUpdatePromptModifier: ViewModifier {
-    let config: AppUpdatePrompt.Config
-    @Environment(\.openURL) private var openURL
-    @State private var offer: AppUpdatePrompt.Offer?
+/// View modifier that listens for the iOS shake gesture (motionEnded event
+/// delivered via UIWindow) and, when the user has opted in via the
+/// `shake_to_report_enabled` UserDefaults flag, posts the
+/// `.shakeToReport` notification. The Settings toggle lives in the
+/// Account section; default is OFF.
+///
+/// Wrapped in a UIViewControllerRepresentable so the UIKit motion-end
+/// callback reaches the SwiftUI tree even when no other UIKit responder
+/// is in the responder chain (a SwiftUI-only view tree normally does NOT
+/// become first responder, so `motionBegan/motionEnded` are dropped).
+struct ShakeToReportCoordinator: ViewModifier {
+    /// AppStorage-derived signal: increments whenever the user shakes. The
+    /// coordinator reads this and posts the notification when it changes.
+    /// We bind through this rather than reading UserDefaults directly so
+    /// SwiftUI re-renders when the Settings toggle flips.
+    let presenting: Int
 
     func body(content: Content) -> some View {
         content
-            .task { await checkOnce() }
-            .alert("Update Available", isPresented: offerPresented) {
-                Button("Update") { openStore() }
-                Button("Not Now", role: .cancel) { skipCurrent() }
-            } message: {
-                Text(offer?.message ?? "")
-            }
-    }
-
-    private var offerPresented: Binding<Bool> {
-        Binding(
-            get: { offer != nil },
-            set: { if !$0 { skipCurrent() } }
-        )
-    }
-
-    @MainActor
-    private func checkOnce() async {
-        guard !AppUpdatePrompt.shouldSkipLaunchChecks else { return }
-        let channel = await AppUpdatePrompt.detectChannel()
-        guard channel != .xcode else { return }
-        async let manifest = AppUpdatePrompt.fetchManifest(from: config.manifestURL)
-        async let lookup = AppUpdatePrompt.fetchLookup(bundleId: config.bundleId)
-        offer = AppUpdatePrompt.evaluate(
-            config: config,
-            channel: channel,
-            manifest: await manifest,
-            lookup: await lookup
-        )
-    }
-
-    private func skipCurrent() {
-        if let offer {
-            AppUpdatePrompt.rememberSkip(version: offer.latestVersion, bundleId: config.bundleId)
-        }
-        offer = nil
-    }
-
-    private func openStore() {
-        guard let offer else { return }
-        openURL(offer.storeURL) { accepted in
-            if !accepted {
-                openURL(offer.fallbackURL)
-            }
-        }
-        self.offer = nil
+            .background(ShakeDetectorHost(signal: presenting))
     }
 }
 
+private struct ShakeDetectorHost: UIViewControllerRepresentable {
+    let signal: Int
+
+    func makeUIViewController(context: Context) -> ShakeDetectorViewController {
+        ShakeDetectorViewController()
+    }
+
+    func updateUIViewController(_ vc: ShakeDetectorViewController, context: Context) {
+        // Re-trigger detector wiring on every signal bump so a toggle flip
+        // in Settings takes effect without needing to relaunch the app.
+        vc.isShakeEnabled = UserDefaults.standard.bool(forKey: "shake_to_report_enabled")
+    }
+}
+
+final class ShakeDetectorViewController: UIViewController {
+    /// Mirrors the UserDefaults flag so the responder stays subscribed only
+    /// while the user has opted in. Re-evaluated by updateUIViewController.
+    var isShakeEnabled: Bool = UserDefaults.standard.bool(forKey: "shake_to_report_enabled")
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
+    }
+
+    override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
+        super.motionEnded(motion, with: event)
+        guard motion == .motionShake else { return }
+        guard isShakeEnabled else { return }
+        // Single notification post per shake; the Account sheet listens
+        // and presents `BugReportSheet`. Avoids any per-view re-binding.
+        NotificationCenter.default.post(name: .shakeToReport, object: nil)
+        // Light haptic so the user knows the gesture was caught (they
+        // don't see a visual until the sheet appears ~250ms later).
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+}
+
+// AppUpdatePrompt lives in AppUpdatePrompt.swift, copied from
+// scripts/ios-fleet/AppUpdatePrompt.swift.  Do not inline it here.

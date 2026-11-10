@@ -55,6 +55,7 @@ describe('iOS digital-goods checkout (Guideline 3.1.1)', () => {
     expect(api).toContain('static let allowsWebCheckout = false');
     expect(api).toContain('func redeemApplePurchase');
     expect(api).toContain('func billingPortalURL');
+    expect(api).toContain('webManageSubscriptionURL');
 
     expect(premium).toContain('PremiumPricing.emptyCatalogMessage');
     expect(premium).toContain('restoreButton');
@@ -66,6 +67,14 @@ describe('iOS digital-goods checkout (Guideline 3.1.1)', () => {
     expect(delivery).not.toContain('systemImage: "safari"');
 
     expect(tests).toContain('testIOSNeverOffersWebCheckoutForDigitalGoods');
+    expect(tests).toContain('testManageSubscriptionStripe401OpensWebsiteNotSignOutCopy');
+  });
+
+  it('never tells a website/Stripe subscriber to sign out to manage billing', () => {
+    const manage = readFileSync(join(iosRoot, 'CongressTrade/Store/ManageSubscription.swift'), 'utf8');
+    expect(manage).not.toMatch(/sign out and back in/i);
+    expect(manage).toContain('shouldOpenWebManageFallback');
+    expect(manage).toContain('webFallbackURL');
   });
 
   it('opens Filing PDF in-app or PremiumSheet, never Safari checkout', () => {

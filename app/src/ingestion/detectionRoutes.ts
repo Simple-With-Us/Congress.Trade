@@ -1,7 +1,7 @@
 /**
  * src/ingestion/detectionRoutes.ts
  *
- * Residential scout (scout/congress-scout.mjs) endpoints — all INGEST_TOKEN-gated:
+ * Ingest/detection endpoints (Mac scout/congress-scout.mjs retired #2351) — all INGEST_TOKEN-gated:
  *
  *   POST /api/ingest/detection
  *     Push each filing the scout detects on primary gov sources. Latency
@@ -29,9 +29,7 @@ import { resolveSecret } from '../secrets/infisical.ts';
 import { constantTimeEqual } from '../auth/tokens.ts';
 import { get, run } from '../shared/db.ts';
 import {
-  ingestScoutLatencyPayload,
   recordDisclosureLatencyCandidate,
-  type ProviderId,
 } from './tradeLatency.ts';
 import {
   buildScoutPlan,
@@ -62,7 +60,9 @@ import {
 } from './watcher.ts';
 
 async function requireIngestToken(c: { env: Env; req: { header: (name: string) => string | undefined } }): Promise<Response | null> {
-  const token = (await resolveSecret(c.env, 'INGEST_TOKEN')).value;
+  const token =
+    (await resolveSecret(c.env, 'INGEST_TOKEN')).value ||
+    (await resolveSecret(c.env, 'CT_INGEST_TOKEN' as keyof Env & string)).value;
   if (!token || !(await constantTimeEqual(c.req.header('Authorization') ?? '', `Bearer ${token}`))) {
     return new Response(JSON.stringify({ error: 'unauthorized' }), {
       status: 401,
@@ -200,34 +200,21 @@ export function buildDetectionRouter(): Hono<{ Bindings: Env }> {
   });
 
   r.post('/latency-payload', async (c) => {
-    const denied = await requireIngestToken(c);
-    if (denied) return denied;
-    let body: Record<string, unknown>;
-    try {
-      body = (await c.req.json()) as Record<string, unknown>;
-    } catch {
-      return c.json({ error: 'invalid JSON body' }, 400);
-    }
-    const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
-    if (!provider) return c.json({ error: 'provider is required' }, 400);
-    const chamberJson =
-      body.chamberJson && typeof body.chamberJson === 'object' && !Array.isArray(body.chamberJson)
-        ? (body.chamberJson as Record<string, unknown>)
-        : undefined;
-    const fmpPathId =
-      body.fmpPathId === 'rapidapi' || body.fmpPathId === 'stable' ? body.fmpPathId : undefined;
-    try {
-      const result = await ingestScoutLatencyPayload(c.env, {
-        provider: provider as ProviderId,
-        observedAt: typeof body.observedAt === 'string' ? body.observedAt : undefined,
-        chamberJson: chamberJson as Parameters<typeof ingestScoutLatencyPayload>[1]['chamberJson'],
-        fmpPathId,
-        source: 'scout',
-      });
-      return c.json({ ok: true, ...result });
-    } catch (err) {
-      return c.json({ error: (err as Error).message }, 400);
-    }
+    // Owner 2026-09-09: the Mac scout that used to POST here is retired
+    // (board `ba688ea5`).  Kept as a typed no-op so any in-flight Mac
+    // client gets a clean 410 Gone instead of a 500, and so historical
+    // telemetry replays still land in KV via the underlying call.  New
+    // server-side FMP probes never call this endpoint.
+    return c.json(
+      {
+        ok: false,
+        deprecated: true,
+        error:
+          'POST /api/scout/latency-payload is deprecated — the Mac scout was retired 2026-09-09.  ' +
+          'FMP latency is now probed by the server.  See docs/rollouts/2026-09-09-fmp-server-and-residential-mango.md.',
+      },
+      410,
+    );
   });
 
   r.post('/raw', async (c) => {
@@ -414,7 +401,17 @@ export function buildDetectionRouter(): Hono<{ Bindings: Env }> {
       }
 
       try {
-        insert = await insertFilingIfNew(c.env, filing, detectedAt);
+        const prevProbeAt =
+          typeof body.prevProbeAt === 'string' && body.prevProbeAt.trim()
+            ? body.prevProbeAt.trim()
+            : typeof body.prevCheckedAt === 'string' && body.prevCheckedAt.trim()
+            ? body.prevCheckedAt.trim()
+            : null;
+        const probeIntervalSec =
+          typeof body.probeIntervalSec === 'number' && Number.isFinite(body.probeIntervalSec)
+            ? Math.max(0, Math.round(body.probeIntervalSec))
+            : null;
+        insert = await insertFilingIfNew(c.env, filing, detectedAt, { prevProbeAt, probeIntervalSec });
       } catch (err) {
         return c.json({ error: (err as Error).message }, 500);
       }

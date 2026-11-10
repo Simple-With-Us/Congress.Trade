@@ -62,6 +62,23 @@ struct PoliticianDetailView: View {
                                 ].compactMap { $0 }.joined(separator: " · "))
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
+                                
+                                // Matches on `filerId` and shows committee NAMES.
+                                // `bioguideId`/`committeeCode` never existed on
+                                // this endpoint — the model invented them, so
+                                // every decode threw and `store.conflicts` was
+                                // permanently empty; this filter has been
+                                // matching against nothing since it was written.
+                                let memberConflicts = store.conflicts.filter { $0.filerId == memberId }
+                                let committees = Array(Set(memberConflicts.flatMap { $0.committees })).sorted()
+                                if !committees.isEmpty {
+                                    HStack {
+                                        ForEach(committees, id: \.self) { name in
+                                            StatusPill(text: name, color: .orange, icon: "exclamationmark.triangle.fill", compact: true)
+                                        }
+                                    }
+                                    .padding(.top, 4)
+                                }
                             }
                         }
                         .padding(.top, 16)
@@ -143,16 +160,21 @@ struct PoliticianDetailView: View {
                                 }
                             }
                             .padding(.horizontal, 16)
+
+                            if let polName = member.name, !polName.isEmpty, polName != "Unknown" {
+                                SeeAllTradesHandoff(
+                                    totalTrades: summary?.totalTrades ?? 0,
+                                    displayedCount: trades.count,
+                                    filter: .politician(polName)
+                                )
+                            }
                         }
                     }
                 }
                 .padding(.bottom, 24)
             }
             .background(AppTheme.background)
-            // Nav bar carries the entity CLASS, the hero carries the identity —
-            // titling the bar with the member's name restated the hero one line
-            // below it (owner, on the same duplication in the ticker sheet).
-            .navigationTitle("Politician")
+            .navigationTitle(memberName)
             .inlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: AppToolbarPlacement.trailing) {

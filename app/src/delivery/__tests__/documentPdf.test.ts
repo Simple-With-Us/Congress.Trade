@@ -34,9 +34,17 @@ interface AnonSubOpts {
 }
 
 function pdfEnv(
-  opts: { plan?: 'premium' | 'free'; stored?: boolean; anonSub?: AnonSubOpts | null } = {},
+  opts: {
+    plan?: 'premium' | 'free';
+    stored?: boolean;
+    anonSub?: AnonSubOpts | null;
+    rawType?: string;
+    rawBody?: string | Uint8Array;
+  } = {},
 ): Env {
   const stored = opts.stored !== false;
+  const rawType = opts.rawType || 'application/pdf';
+  const rawBody = opts.rawBody || new Uint8Array([0x25, 0x50, 0x44, 0x46]);
   return {
     APPLE_DEVICE_ENTITLEMENT_SECRET: TEST_DEVICE_ENTITLEMENT_SECRET,
     CONFIG_KV: {
@@ -118,8 +126,8 @@ function pdfEnv(
       get: async (key: string) => {
         if (key !== 'raw/doc.pdf') return null;
         return {
-          body: new Uint8Array([0x25, 0x50, 0x44, 0x46]),
-          httpMetadata: { contentType: 'application/pdf' },
+          body: typeof rawBody === 'string' ? new TextEncoder().encode(rawBody) : rawBody,
+          httpMetadata: { contentType: rawType },
         };
       },
     },
@@ -154,15 +162,16 @@ describe('GET /documents/:docId/pdf (APPSTORECOMPLIANCE-01/02)', () => {
     expect(await res.json()).toEqual(upgrade);
   });
 
-  it('still 302s a browser HTML navigation without Bearer to the web paywall', async () => {
+  it('returns 402 JSON for a browser HTML navigation without Bearer (no Stripe redirect)', async () => {
     const app = buildRestRouter();
     const res = await app.request(
       'http://localhost/documents/H-2026-1/pdf',
       { headers: { accept: 'text/html,application/xhtml+xml,*/*;q=0.8' } },
       pdfEnv(),
     );
-    expect(res.status).toBe(302);
-    expect(res.headers.get('location') ?? '').toMatch(/\/pricing\?feature=pdf/);
+    expect(res.status).toBe(402);
+    expect(res.headers.get('location')).toBeNull();
+    expect(await res.json()).toEqual(documentPdfUpgradePayload());
   });
 
   it('serves the stored PDF for Premium and never redirects to the government source', async () => {
@@ -265,5 +274,27 @@ describe('GET /documents/:docId/pdf — anonymous device entitlement (Guideline 
       env,
     );
     expect(res.status).toBe(402);
+  });
+
+  it('serves Senate paper viewer HTML enhanced as clean multi-page reader with CSP sandbox', async () => {
+    const paperHtml = `<!DOCTYPE HTML><html><body>Page 1 of 2<img class="filingImage" src="https://efd-media-public.senate.gov/media/2026/test.gif" /></body></html>`;
+    const env = pdfEnv({
+      plan: 'premium',
+      rawType: 'text/html',
+      rawBody: paperHtml,
+    });
+    const app = buildRestRouter();
+    const res = await app.request(
+      'http://localhost/documents/S-test-paper/pdf',
+      { headers: { authorization: 'Bearer premium-token' } },
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    expect(res.headers.get('content-security-policy')).toBe('sandbox');
+    const body = await res.text();
+    expect(body).toContain('Senate Paper Disclosure');
+    expect(body).toContain('https://efd-media-public.senate.gov/media/2026/test.gif');
+    expect(body).not.toContain('<script');
   });
 });

@@ -6,11 +6,12 @@ import {
   assertDocLlmSpendAllowed,
   checkDocLlmSpendAllowed,
   docHasExistingTransactions,
+  isLlamaParseProvider,
   readDocLlmSpendUsd,
 } from '../llmSpend.ts';
 
 function envWith(
-  settlements: Array<{ doc_id: string; usd: number }>,
+  settlements: Array<{ doc_id: string; usd: number; provider?: string }>,
   txDocIds: string[] = [],
   vars: Record<string, string> = {},
 ): Env {
@@ -29,6 +30,7 @@ function envWith(
               const docId = String(self.params[0]);
               const usd = settlements
                 .filter((s) => s.doc_id === docId)
+                .filter((s) => !/llamaparse/i.test(sql) || s.provider !== 'llamaparse')
                 .reduce((a, s) => a + s.usd, 0);
               return { usd } as T;
             }
@@ -75,5 +77,68 @@ describe('per-doc LLM spend gates', () => {
     const decision = await checkDocLlmSpendAllowed(env, 'H-9', { reprocess: true });
     expect(decision.allowed).toBe(false);
     expect(decision.reason).toBe('doc_ceiling');
+  });
+
+  it('stops a live call whose estimate would overshoot the remaining ceiling', async () => {
+    const env = envWith(
+      [{ doc_id: 'H-9116328', usd: DEFAULT_LLM_DOC_USD_CEILING - 0.01 }],
+      [],
+    );
+    const overshoot = await checkDocLlmSpendAllowed(env, 'H-9116328', {
+      reprocess: true,
+      estimatedUsd: 0.05,
+    });
+    expect(overshoot.allowed).toBe(false);
+    expect(overshoot.reason).toBe('doc_ceiling');
+
+    const fits = await checkDocLlmSpendAllowed(env, 'H-9116328', {
+      reprocess: true,
+      estimatedUsd: 0.01,
+    });
+    expect(fits.allowed).toBe(true);
+  });
+
+  it('does not let LlamaParse credits latch the OpenRouter per-doc USD meter', async () => {
+    expect(isLlamaParseProvider('llamaparse')).toBe(true);
+    const env = envWith(
+      [
+        { doc_id: 'H-9116328', usd: DEFAULT_LLM_DOC_USD_CEILING, provider: 'openrouter' },
+        { doc_id: 'H-9116328', usd: 0.04, provider: 'llamaparse' },
+      ],
+      [],
+    );
+    const orCall = await checkDocLlmSpendAllowed(env, 'H-9116328', {
+      reprocess: true,
+      estimatedUsd: 0.05,
+      provider: 'openrouter',
+    });
+    expect(orCall.allowed).toBe(false);
+    expect(orCall.reason).toBe('doc_ceiling');
+
+    const llama = await checkDocLlmSpendAllowed(env, 'H-9116328', {
+      reprocess: true,
+      estimatedUsd: 0.05,
+      provider: 'llamaparse',
+    });
+    expect(llama.allowed).toBe(true);
+    expect(llama.reason).toBe('ok');
+  });
+
+  it('excludes LlamaParse settlements from the OpenRouter per-doc USD sum', async () => {
+    const env = envWith(
+      [
+        { doc_id: 'H-1', usd: 0.10, provider: 'openrouter' },
+        { doc_id: 'H-1', usd: 0.20, provider: 'llamaparse' },
+      ],
+      [],
+    );
+    expect(await readDocLlmSpendUsd(env, 'H-1')).toBeCloseTo(0.30);
+    expect(await readDocLlmSpendUsd(env, 'H-1', { excludeLlamaParse: true })).toBeCloseTo(0.10);
+    const nextOr = await checkDocLlmSpendAllowed(env, 'H-1', {
+      reprocess: true,
+      estimatedUsd: 0.10,
+      provider: 'openrouter',
+    });
+    expect(nextOr.allowed).toBe(true);
   });
 });

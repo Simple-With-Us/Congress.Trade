@@ -1,41 +1,32 @@
 What changed since the build you last reviewed
 
-The binary you reviewed was 1.0.15 (202608150702), built Aug 15.  This submission is 1.0.81 (202608220518) with the following changes, all made in response to your notes.
+The previous submission reviewed was 1.0.81 (build 202608220518).  This submission includes targeted fixes for the items noted in your review.
 
-Guideline 5.1.1(v) — registration is no longer required to purchase.
-Premium can now be bought with no Congress.Trade account at all.  Launch the app, open Premium from the ≡ menu, and both plans are purchasable immediately while signed out.  The purchase is recognised on the device from the App Store transaction itself.
+Guideline 2.1(a) — Performance: App Completeness (Login Responsiveness)
+- In SignInPanel, tapping "Sign in with Apple" or "Sign in with Google" now immediately activates a loading spinner overlay and disables input controls with explicit "Signing in…" visual feedback, ensuring the user immediately sees activity.
+- Login failures, network timeouts, or cancellations render clear inline error notices with distinct error styling.
+- Google OAuth presentation context now cleanly resolves to visible windows on iPadOS form sheets.
 
-Signing in remains available and is presented as optional.  We explain what it adds — using the subscription on your other devices, and setting up Delivery alerts — rather than requiring it.
+Guideline 2.1(b) — Performance: In-App Purchases (Error Handling & Subscriptions)
+- In PremiumSheet, StoreKit product catalog load failures and pre-charge transaction errors are separated from post-charge server transaction processing.
+- User-facing error messages provide clear, actionable guidance and always point users to "Restore Purchases" if an entitlement is already active.
+- Both subscription items are submitted with this version in the "Premium" subscription group with localized metadata and screenshots:
+  - trade.congress.premium.monthly — Premium Monthly ($8.99/mo, 1-week free trial)
+  - trade.congress.premium.annual — Premium Annual ($79.99/yr, 1-week free trial)
 
-Two Premium features remain tied to an account, and we believe this is the account-based case your guideline describes:
-- Delivery alerts — a standing, quota-tracked server-side subscription that sends filings to a webhook or SSE stream belonging to one specific person.
-- Push notifications — device registration so the server knows where to deliver.
+Guideline 5.1.1(v) — Registration before purchase & Account deletion
+- Premium can be purchased without an account; browsing and paywall access are fully available without signing in.
+- In-app Account Deletion is accessible from the ≡ menu and deletes all sessions, push tokens, and delivery subscriptions upon confirmation.
+- The 39-second physical-device screen recording demonstrating the complete account deletion flow is attached (account-deletion-physical-device.mp4, COMPLETE).
 
-Everything else Premium unlocks — the original filing PDF and the full-history CSV export — is public disclosure content with nothing person-specific in it, and now requires no registration.
-
-Guideline 5.1.1(v) — account deletion.
-Account deletion is in this build.  Sign in, open the ≡ menu, and choose Delete Account.  It asks for confirmation, then deletes the account, its session, its registered push devices and its delivery subscriptions, and signs the device out.  There is no email, phone call or website step.  A 39-second physical-device screen recording of the full Delete Account flow is attached (portrait, recorded on a TestFlight install of this app).
-
-Guideline 2.1(b) — In-App Purchase products.
-Both subscriptions are submitted with this version:
-- trade.congress.premium.monthly — Premium Monthly
-- trade.congress.premium.annual — Premium Annual
-They are in the "Premium" subscription group with review screenshots and localized descriptions attached.  They were prepared but not attached to the previous submission; that is why you could not review them.
-
-Reviewing on iPad
-
-You reviewed on an iPad Air 11-inch (M3).  This build fixes iPad layout issues we found on that exact device: detail and settings sheets now use the full width instead of a narrow floating card, the Assets directory uses the two-column grid the other lists already used, Delivery's text is capped to a readable measure, and the account menu is reachable from every tab.
+iPad Air 11-inch Layout
+- All detail, paywall, and settings sheets use full width (.iPadFullWidthSheet()), the Assets directory uses a two-column grid, and the ≡ menu is accessible from every tab.
 
 What the app is
-
-Congress.Trade publishes stock-trade disclosures that U.S. House and Senate members, and some executive-branch officials, are required to file publicly under the STOCK Act (2012).  All underlying data comes from public government records.  Dollar figures are estimates derived from the disclosure brackets those filings use, which is stated in the app.  It is an educational and informational tool, not investment advice, and it is not affiliated with the U.S.  Congress or any government agency.
+Congress.Trade publishes stock-trade disclosures that U.S. House and Senate members, and executive-branch officials, file publicly under the STOCK Act (2012).  All underlying data comes from public government records.  Dollar figures are estimates derived from disclosure brackets.  It is an educational and informational tool, not investment advice, and is not affiliated with the U.S. Congress or any government agency.
 
 Demo account
-
-Not required — the app is fully browsable without an account, and Premium can now be purchased without one.
-
-If you would like to exercise the account-based features (Delivery alerts, push) or the deletion flow yourself, sign in with any Apple ID via Sign in with Apple on the Account screen; no invitation or allowlist is needed, and you can delete the account afterwards from the same menu.
+Not required — the app is fully browsable without an account, and Premium can be purchased without one.  To test account-based features (Delivery alerts, push) or deletion, sign in with any Apple ID via Sign in with Apple; no allowlist is needed.
 
 Contact
-
 Reply in App Store Connect and we will respond same day.

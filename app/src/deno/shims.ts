@@ -6,6 +6,7 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
   UploadPartCommand,
@@ -346,6 +347,64 @@ export class S3BucketShim {
       Key: key,
     });
     await this.s3.send(command);
+  }
+
+  /**
+   * ListObjectsV2 mapped onto the Workers `R2Bucket.list()` shape.
+   *
+   * Deno prod previously had no enumeration at all, so anything needing to find
+   * objects whose keys it does not already know (the bulk-snapshot prune) could
+   * not run outside the Workers runtime. Only the fields callers actually read
+   * are mapped: `key`, `size`, `uploaded`, plus `delimitedPrefixes` for
+   * delimiter queries. One S3 call per page; the caller bounds the page count.
+   */
+  async list(
+    options?: {
+      prefix?: string;
+      limit?: number;
+      cursor?: string;
+      delimiter?: string;
+    },
+  ): Promise<
+    {
+      objects: Array<{ key: string; size: number; uploaded: Date }>;
+      truncated: boolean;
+      cursor?: string;
+      delimitedPrefixes: string[];
+    }
+  > {
+    const response = await this.s3.send(
+      new ListObjectsV2Command({
+        Bucket: this.bucketName,
+        Prefix: options?.prefix,
+        MaxKeys: options?.limit,
+        ContinuationToken: options?.cursor,
+        Delimiter: options?.delimiter,
+      }),
+    );
+    const objects = (response.Contents ?? [])
+      .filter((entry): entry is typeof entry & { Key: string } =>
+        typeof entry.Key === "string"
+      )
+      .map((entry) => ({
+        key: entry.Key,
+        size: entry.Size ?? 0,
+        uploaded: entry.LastModified ?? new Date(0),
+      }));
+    const truncated = response.IsTruncated === true;
+    return {
+      objects,
+      truncated,
+      // R2 omits the cursor entirely once a listing is complete; mirror that so
+      // `while (result.truncated)` loops terminate the same way they do on
+      // Workers instead of re-listing page one forever.
+      ...(truncated && response.NextContinuationToken
+        ? { cursor: response.NextContinuationToken }
+        : {}),
+      delimitedPrefixes: (response.CommonPrefixes ?? [])
+        .map((entry) => entry.Prefix)
+        .filter((prefix): prefix is string => typeof prefix === "string"),
+    };
   }
 
   async createMultipartUpload(

@@ -248,6 +248,7 @@ async function indexUrls(env: Env): Promise<string[]> {
 export async function fetchOgeExecutiveFilings(
   env: Env,
   fetchImpl: typeof fetch = fetch,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<DiscoveredFiling[]> {
   const urls = await indexUrls(env);
   const allFilings: DiscoveredFiling[] = [];
@@ -264,6 +265,7 @@ export async function fetchOgeExecutiveFilings(
           'user-agent': 'congress.trade/0.1 (+https://congress.trade)',
           accept: 'text/html',
         },
+        signal: opts.signal,
       }, { service: 'filing-discovery', operation: 'fetch-executive-index', dynamicTarget: 'filing-source' }, fetchImpl);
       if (res.ok) {
         htmlText = await res.text();
@@ -271,6 +273,7 @@ export async function fetchOgeExecutiveFilings(
         directError = new Error(`OGE index HTTP ${res.status}`);
       }
     } catch (err) {
+      if (opts.signal?.aborted) throw err;
       directError = err instanceof Error ? err : new Error(String(err));
     }
 
@@ -279,6 +282,7 @@ export async function fetchOgeExecutiveFilings(
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ url, responseType: 'text' }),
+        signal: opts.signal,
       }, { service: 'filing-discovery', operation: 'fetch-executive-index-relay' }, fetchImpl);
       if (relayRes.ok) {
         const json = (await relayRes.json()) as { body?: string };
@@ -315,11 +319,11 @@ export async function pollOgeExecutive(
   env: Env,
   _now: Date,
   fetchImpl: typeof fetch = fetch,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; signal?: AbortSignal } = {},
 ): Promise<DiscoveredFiling[] | null> {
   if (!(await ogeWatchEnabled(env)) && !opts.force) return null;
   // Checkpoint is written by the caller (pollExecutive) only after
   // persistence succeeds, matching the House/Senate ordering — a failed
   // persist must not advance last_poll:oge and skip the next cycles.
-  return fetchOgeExecutiveFilings(env, fetchImpl);
+  return fetchOgeExecutiveFilings(env, fetchImpl, { signal: opts.signal });
 }

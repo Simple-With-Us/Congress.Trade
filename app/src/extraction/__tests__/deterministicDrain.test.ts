@@ -163,6 +163,24 @@ describe('maybeRunDeterministicReviewDrain', () => {
     expect(r.stillReview).toBe(0);
   });
 
+  it('skips attempt-capped cascade disagreements instead of re-extracting every minute', async () => {
+    const { env } = makeEnv([
+      {
+        doc_id: 'H-2026-20035235',
+        raw_object_key: 'raw/h.pdf',
+        doc_kind: 'text_pdf',
+        extractor: 'textPdf',
+        reason: 'agreement_cascade_unresolved',
+        agreement_attempts: 3,
+      },
+    ]);
+    const r = await maybeRunDeterministicReviewDrain(env, { limit: 5 });
+    expect(mocks.extractAndNormalize).not.toHaveBeenCalled();
+    expect(r.scanned).toBe(1);
+    expect(r.skipped).toBe(1);
+    expect(r.published).toBe(0);
+  });
+
   it('never re-extracts a scanned_pdf even when the extractor string looks deterministic (2026-08-20 ping-pong)', async () => {
     // Regression: H-2024-20025111 carried doc_kind=scanned_pdf with a stale
     // extractor='textPdf'. The old selector matched on the extractor string,

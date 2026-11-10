@@ -92,14 +92,19 @@ export function encodeForm(params: Record<string, unknown>): string {
   return out.toString();
 }
 
+async function stripeSecretKey(env: Env): Promise<string> {
+  const secretKey = (await resolveSecret(env, 'STRIPE_SECRET_KEY')).value;
+  if (!secretKey) throw new Error('STRIPE_SECRET_KEY not configured');
+  return secretKey;
+}
+
 async function stripePost<T>(
   env: Env,
   path: string,
   params: Record<string, unknown>,
   idempotencyKey: string,
 ): Promise<T> {
-  const secretKey = (await resolveSecret(env, 'STRIPE_SECRET_KEY')).value;
-  if (!secretKey) throw new Error('STRIPE_SECRET_KEY not configured');
+  const secretKey = await stripeSecretKey(env);
   const res = await trackedFetch(`${STRIPE_API}${path}`, {
     method: 'POST',
     headers: {
@@ -115,6 +120,91 @@ async function stripePost<T>(
     throw new Error(`stripe ${path} failed: ${body?.error?.message || `HTTP ${res.status}`}`);
   }
   return body as T;
+}
+
+async function stripeGet<T>(env: Env, path: string): Promise<T> {
+  const secretKey = await stripeSecretKey(env);
+  const res = await trackedFetch(`${STRIPE_API}${path}`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${secretKey}`,
+      'Stripe-Version': STRIPE_API_VERSION,
+    },
+  }, { service: 'billing', operation: 'stripe-api-get' });
+  const body = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+  if (!res.ok) {
+    throw new Error(`stripe ${path} failed: ${body?.error?.message || `HTTP ${res.status}`}`);
+  }
+  return body as T;
+}
+
+/** Stripe expandable-id fields may be either an id string or `{ id }`. */
+export function stripeObjectId(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.length > 0) return value;
+  if (!value || typeof value !== 'object') return undefined;
+  const id = (value as Record<string, unknown>).id;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
+}
+
+export interface StripeSubscriptionObject {
+  id?: string;
+  status?: string;
+  customer?: string | { id?: string; email?: string | null; name?: string | null };
+  livemode?: boolean;
+  current_period_end?: number | null;
+  cancel_at_period_end?: boolean;
+  trial_end?: number | null;
+  items?: { data?: Array<{ price?: string | { id?: string }; current_period_end?: number | null }> };
+  metadata?: { userId?: string };
+}
+
+export interface StripeCustomerObject {
+  id?: string;
+  email?: string | null;
+  name?: string | null;
+}
+
+/** Retrieve one Subscription.  Used by the webhook heal and Admin Premium roster. */
+export function retrieveStripeSubscription(
+  env: Env,
+  subscriptionId: string,
+): Promise<StripeSubscriptionObject> {
+  return stripeGet<StripeSubscriptionObject>(
+    env,
+    `/subscriptions/${encodeURIComponent(subscriptionId)}`,
+  );
+}
+
+export interface StripeSubscriptionList {
+  data?: StripeSubscriptionObject[];
+  has_more?: boolean;
+}
+
+/**
+ * List Stripe subscriptions for live Admin reconcile.  Caps at 100 — this
+ * product has a handful of Premium members, not a paging problem.
+ */
+export function listStripeSubscriptions(
+  env: Env,
+  args: { status?: string; limit?: number } = {},
+): Promise<StripeSubscriptionList> {
+  const params = new URLSearchParams();
+  params.set('status', args.status ?? 'all');
+  params.set('limit', String(args.limit ?? 100));
+  params.append('expand[]', 'data.customer');
+  return stripeGet<StripeSubscriptionList>(env, `/subscriptions?${params.toString()}`);
+}
+
+/** Map a Stripe secret-key prefix to the Admin environment label. */
+export function stripeEnvironmentFromKey(secretKey: string | undefined | null): 'Production' | 'Sandbox' {
+  return (secretKey ?? '').trim().startsWith('sk_test') ? 'Sandbox' : 'Production';
+}
+
+/** Map Stripe `livemode` onto the same Sandbox / Production labels Apple uses. */
+export function stripeEnvironmentFromLivemode(livemode: unknown): 'Production' | 'Sandbox' | null {
+  if (livemode === true) return 'Production';
+  if (livemode === false) return 'Sandbox';
+  return null;
 }
 
 export interface StripeCustomer {

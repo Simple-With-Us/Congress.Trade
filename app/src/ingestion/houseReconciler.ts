@@ -2,6 +2,7 @@ import type { Env } from '../shared/types.ts';
 import { fetchHouseIndex } from './houseSource.ts';
 import { run, all } from '../shared/db.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
+import { insertFilingIfNew } from './watcher.ts';
 
 export async function runHouseReconciler(env: Env, now: Date): Promise<void> {
   const year = Number(
@@ -42,10 +43,25 @@ export async function runHouseReconciler(env: Env, now: Date): Promise<void> {
     }
   }
 
-  // Check for missed filings
+  // Check for missed filings (including un-ingested phantoms stuck in not_found)
   for (const bulkFiling of bulkFilings) {
-    if (!dbByDocId.has(bulkFiling.pipelineDocId)) {
+    const existing = dbByDocId.get(bulkFiling.pipelineDocId);
+    if (!existing || existing.ingest_status === 'not_found') {
       missed.push(bulkFiling.pipelineDocId);
+      try {
+        await insertFilingIfNew(env, {
+          docId: bulkFiling.pipelineDocId,
+          chamber: 'house',
+          filerId: null,
+          filerName: `${bulkFiling.first} ${bulkFiling.last}`.trim(),
+          filingType: 'P',
+          filedDate: bulkFiling.filingDate,
+          sourceUrl: bulkFiling.sourceUrl,
+          docKind: 'text_pdf',
+        }, now.toISOString());
+      } catch (err) {
+        console.warn('houseReconciler: auto-recovery insert failed for', bulkFiling.pipelineDocId, err);
+      }
     }
   }
 

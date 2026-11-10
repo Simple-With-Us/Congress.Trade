@@ -383,15 +383,24 @@ describe('probe wiring: lease denial wins regardless of the schedule', () => {
     expect(res.tier ?? null).toBeNull();
   });
 
-  it('never calls runProbe for a provider the server has handed off', async () => {
+  it('never calls runProbe for a provider whose lane another holder still owns', async () => {
+    // Scout retired 2026-09-09: the server never *hands off* a lane any more,
+    // so a stale `needScout` row plus a leftover Mac lease no longer reports
+    // `handed_off` — it reports `blocked`, the ordinary "someone else holds
+    // this lane" denial.  Within the tenure window the server still waits; it
+    // preempts once the window is spent (see probeLease.test.ts).  What this
+    // test guards is unchanged: a lane the server does not hold is never
+    // probed.
     setHandoff(h.kv, 'quiver', true, PEAK);
     setHandoff(h.kv, 'unusual_whales', true, PEAK);
+    await requestMacProbeLease(h.env, { provider: 'quiver', holderId: 'mac-laptop', now: PEAK });
+    await requestMacProbeLease(h.env, { provider: 'unusual_whales', holderId: 'mac-laptop', now: PEAK });
     const runProbe = vi.fn(async () => 'fetched');
     const outcome = await runLeasedLatencyProbe(h.env, runProbe, PEAK);
     expect(runProbe).not.toHaveBeenCalled();
     expect(outcome.result).toBeNull();
     expect(outcome.plan.probeProviders).toEqual([]);
-    expect(outcome.skipped.map((l) => l.action)).toEqual(['handed_off', 'handed_off']);
+    expect(outcome.skipped.map((l) => l.action)).toEqual(['blocked', 'blocked']);
   });
 
   it('hands runProbe ONLY the leased providers, so the schedule sees no others', async () => {
@@ -399,6 +408,7 @@ describe('probe wiring: lease denial wins regardless of the schedule', () => {
     // subset of the set the lease granted, never a union with anything else.
     setHandoff(h.kv, 'quiver', true, PEAK); // mac's lane
     setHandoff(h.kv, 'unusual_whales', false, PEAK); // server's lane
+    await requestMacProbeLease(h.env, { provider: 'quiver', holderId: 'mac-laptop', now: PEAK });
     const seen: string[][] = [];
     await runLeasedLatencyProbe(
       h.env,

@@ -22,15 +22,35 @@ struct TrendsView: View {
                 }
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                // CT-2459: lazy stack — below-fold sections (and their rows
+                // of images/bars) are no longer all built at first paint.
+                LazyVStack(alignment: .leading, spacing: 16) {
                     if store.isLoadingTrends && store.analyticsSummary == nil {
+                        // Redacted skeleton cards give first paint structure
+                        // instead of a lone spinner (hidden from VoiceOver).
+                        VStack(alignment: .leading, spacing: 16) {
+                            ForEach(0..<3, id: \.self) { _ in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Loading section title")
+                                    Text("Loading row one with values")
+                                    Text("Loading row two")
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                            }
+                        }
+                        .redacted(reason: .placeholder)
+                        .accessibilityHidden(true)
                         ProgressView("Loading trends…")
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
+                            .padding(.vertical, 12)
                     } else {
                         if let notice = store.trendsNotice,
                            !Self.isBenignCancellationNotice(notice) {
-                            NoticeView(message: notice)
+                            NoticeView(message: notice) {
+                                Task { await store.refreshTrends() }
+                            }
                         }
 
                         summaryStrip
@@ -41,8 +61,8 @@ struct TrendsView: View {
                                     tickerSection
                                 }
 
-                                if store.selectedTimeRange != .all, !store.trendingAssets.isEmpty {
-                                    trendingSection
+                                if !store.topPerformers.isEmpty {
+                                    performersSection
                                 }
 
                                 if !store.volumeSeries.isEmpty {
@@ -57,8 +77,8 @@ struct TrendsView: View {
 
                                 marketCapCard
 
-                                if !store.topPerformers.isEmpty {
-                                    performersSection
+                                if store.selectedTimeRange != .all, !store.trendingAssets.isEmpty {
+                                    trendingSection
                                 }
 
                                 if !store.memberLeaderboard.isEmpty {
@@ -180,6 +200,8 @@ struct TrendsView: View {
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
                     .presentationCornerRadius(18)
+                    .presentationContentInteraction(.resizes)
+                    .iPadFullWidthSheet()
             }
             .sheet(item: $selectedPolitician) { target in
                 PoliticianDetailView(
@@ -190,6 +212,8 @@ struct TrendsView: View {
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
                     .presentationCornerRadius(18)
+                    .presentationContentInteraction(.resizes)
+                    .iPadFullWidthSheet()
             }
         }
     }
@@ -212,23 +236,30 @@ struct TrendsView: View {
 
     private var summaryStrip: some View {
         let s = store.analyticsSummary
-        return VStack(alignment: .leading, spacing: 10) {
-            trendsHeading("Market Snapshot", extraTop: 0)
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+        return ViewThatFits(in: .horizontal) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
                 TrendKPI(title: "Trades", value: CompactFormat.count(s?.totalTrades))
                 TrendKPI(title: "Politicians", value: CompactFormat.count(s?.uniqueMembers))
                 TrendKPI(title: "Est. Volume", value: CompactFormat.usd(s?.estimatedVolumeUsd))
-                // Signed, not colour-only: red/green alone fails for anyone who
-                // can't separate the two, and the owner asked for the sign to
-                // be readable. `SignedFlowFormat` also keeps a real $0 unsigned
-                // and a missing value an em-dash — two different facts.
                 TrendKPI(
                     title: "Net Flow",
                     value: SignedFlowFormat.usd(s?.estimatedNetFlowUsd),
                     tint: SignedFlowFormat.tint(s?.estimatedNetFlowUsd)
                 )
-                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: .green)
-                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: .red)
+                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: AppTheme.semanticPositive)
+                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: AppTheme.semanticNegative)
+            }
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                TrendKPI(title: "Trades", value: CompactFormat.count(s?.totalTrades))
+                TrendKPI(title: "Politicians", value: CompactFormat.count(s?.uniqueMembers))
+                TrendKPI(title: "Est. Volume", value: CompactFormat.usd(s?.estimatedVolumeUsd))
+                TrendKPI(
+                    title: "Net Flow",
+                    value: SignedFlowFormat.usd(s?.estimatedNetFlowUsd),
+                    tint: SignedFlowFormat.tint(s?.estimatedNetFlowUsd)
+                )
+                TrendKPI(title: "Buys", value: CompactFormat.count(s?.buyCount), tint: AppTheme.semanticPositive)
+                TrendKPI(title: "Sells", value: CompactFormat.count(s?.sellCount), tint: AppTheme.semanticNegative)
             }
         }
     }
@@ -413,7 +444,7 @@ struct TrendsView: View {
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 2)
                                         .background(Color.green.opacity(0.15))
-                                        .foregroundStyle(.green)
+                                        .foregroundStyle(AppTheme.semanticPositive)
                                         .clipShape(Capsule())
                                 }
                             }
@@ -442,7 +473,8 @@ struct TrendsView: View {
                     Button {
                         selectedTicker = TickerSheetTarget(ticker: c.ticker)
                     } label: {
-                        HStack {
+                        HStack(spacing: 10) {
+                            AssetMark(symbol: c.ticker, isTicker: true, size: 28)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(c.ticker)
                                     .font(.subheadline.weight(.bold))
@@ -454,7 +486,7 @@ struct TrendsView: View {
                             Spacer()
                             StatusPill(
                                 text: (c.txType == "B" || c.txType == "P") ? "Buy" : (c.txType == "S" ? "Sell" : (c.txType == "E" ? "Exchange" : c.txType)),
-                                color: (c.txType == "B" || c.txType == "P") ? .green : (c.txType == "S" ? .red : .blue),
+                                color: (c.txType == "B" || c.txType == "P") ? AppTheme.semanticPositive : (c.txType == "S" ? AppTheme.semanticNegative : .blue),
                                 compact: true
                             )
                             Text("\(c.memberCount) \(c.memberCount == 1 ? "politician" : "politicians")")
@@ -615,7 +647,12 @@ struct TrendsView: View {
                     Button {
                         selectedPolitician = MemberSheetTarget(id: p.filerId, name: p.fullName ?? p.filerId, photoUrl: p.photoUrl)
                     } label: {
-                        HStack {
+                        HStack(spacing: 10) {
+                            MemberAvatar(
+                                photoURL: MemberPhotoURL.resolve(p.photoUrl),
+                                name: p.fullName ?? "",
+                                size: 28
+                            )
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(p.fullName ?? p.filerId)
                                     .font(.subheadline.weight(.semibold))
@@ -661,9 +698,14 @@ struct TrendsView: View {
             VStack(spacing: 0) {
                 ForEach(Array(store.memberLeaderboard.prefix(10).enumerated()), id: \.element.id) { idx, m in
                     Button {
-                        selectedPolitician = MemberSheetTarget(id: m.filerId, name: m.fullName ?? m.filerId)
+                        selectedPolitician = MemberSheetTarget(id: m.filerId, name: m.fullName ?? m.filerId, photoUrl: m.photoUrl)
                     } label: {
-                        HStack {
+                        HStack(spacing: 10) {
+                            MemberAvatar(
+                                photoURL: MemberPhotoURL.resolve(m.photoUrl),
+                                name: m.fullName ?? "",
+                                size: 28
+                            )
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(m.fullName ?? m.filerId)
                                     .font(.subheadline.weight(.semibold))
@@ -706,27 +748,37 @@ struct TrendsView: View {
             VStack(spacing: 0) {
                 ForEach(Array(store.conflicts.prefix(8).enumerated()), id: \.element.id) { idx, c in
                     Button {
-                        selectedPolitician = MemberSheetTarget(id: c.bioguideId, name: c.memberName ?? c.bioguideId, photoUrl: c.photoUrl)
+                        // The route sends no photo for conflict rows; the sheet
+                        // resolves one from the roster it already has.
+                        selectedPolitician = MemberSheetTarget(id: c.memberTargetId, name: c.displayName, photoUrl: nil)
                     } label: {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 10) {
+                            MemberAvatar(
+                                photoURL: nil,
+                                name: c.memberName ?? "",
+                                size: 28
+                            )
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(c.memberName ?? c.bioguideId)
+                                Text(c.displayName)
                                     .font(.subheadline.weight(.semibold))
                                     .lineLimit(1)
-                                Text("\(c.committeeName ?? c.committeeCode) · \(c.sector)")
+                                Text(c.contextLine)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             }
                             Spacer()
-                            VStack(alignment: .trailing, spacing: 2) {
-                                Text(c.ticker)
-                                    .font(.caption.weight(.bold))
-                                StatusPill(
-                                    text: c.txType == "B" ? "Buy" : (c.txType == "S" ? "Sell" : "Exchange"),
-                                    color: c.txType == "B" ? .green : (c.txType == "S" ? .red : .blue),
-                                    compact: true
-                                )
+                            HStack(spacing: 6) {
+                                AssetMark(symbol: c.ticker ?? "", isTicker: true, size: 22)
+                                VStack(alignment: .trailing, spacing: 2) {
+                                    Text(c.ticker ?? "—")
+                                        .font(.caption.weight(.bold))
+                                    StatusPill(
+                                        text: c.txType == "B" ? "Buy" : (c.txType == "S" ? "Sell" : "Exchange"),
+                                        color: c.txType == "B" ? AppTheme.semanticPositive : (c.txType == "S" ? AppTheme.semanticNegative : .blue),
+                                        compact: true
+                                    )
+                                }
                             }
                         }
                         .padding(.vertical, 8)
@@ -764,7 +816,7 @@ struct TrendsView: View {
                     TrendKPI(
                         title: "Over 45 Days",
                         value: SignedPercentFormat.plainPercent(s.overFortyFivePct),
-                        tint: (s.overFortyFivePct ?? 0) > 0 ? .orange : .green
+                        tint: (s.overFortyFivePct ?? 0) > 0 ? AppTheme.semanticCaution : AppTheme.semanticPositive
                     )
                 }
                 if let count = s.count, count > 0 {
@@ -783,7 +835,12 @@ struct TrendsView: View {
                         Button {
                             selectedPolitician = MemberSheetTarget(id: f.filerId, name: f.fullName ?? f.filerId, photoUrl: f.photoUrl)
                         } label: {
-                            HStack {
+                            HStack(spacing: 10) {
+                                MemberAvatar(
+                                    photoURL: MemberPhotoURL.resolve(f.photoUrl),
+                                    name: f.fullName ?? "",
+                                    size: 28
+                                )
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(f.fullName ?? f.filerId)
                                         .font(.subheadline.weight(.medium))
@@ -795,7 +852,7 @@ struct TrendsView: View {
                                 Spacer()
                                 Text("\(Int(round(f.avgLagDays ?? 0)))d avg")
                                     .font(.subheadline.weight(.bold))
-                                    .foregroundStyle(.orange)
+                                    .foregroundStyle(AppTheme.semanticCaution)
                             }
                             .padding(.vertical, 6)
                             .frame(minHeight: 44)
@@ -824,6 +881,20 @@ struct TrendsView: View {
         return "\(whole) \(whole == 1 ? "day" : "days")"
     }
 
+    // CT-2459: hoisted — was allocating a DateFormatter + Calendar per
+    // call (2x per volume row per render). Main-actor use only.
+    private static let volumeMonthDayFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d"
+        return fmt
+    }()
+    private static let volumeMonthYearFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM yyyy"
+        return fmt
+    }()
+    private static let volumeCalendar = Calendar(identifier: .gregorian)
+
     private func formatVolumePeriod(_ period: String) -> String {
         let parts = period.split(separator: "-")
         if parts.count == 2, let year = Int(parts[0]) {
@@ -834,22 +905,16 @@ struct TrendsView: View {
                 components.yearForWeekOfYear = year
                 components.weekOfYear = num
                 components.weekday = 2
-                let cal = Calendar(identifier: .gregorian)
-                if let date = cal.date(from: components) {
-                    let fmt = DateFormatter()
-                    fmt.dateFormat = "MMM d"
-                    return fmt.string(from: date)
+                if let date = Self.volumeCalendar.date(from: components) {
+                    return Self.volumeMonthDayFormatter.string(from: date)
                 }
             } else if let num = Int(numStr) {
                 // Month (e.g. 2026-05)
                 var components = DateComponents()
                 components.year = year
                 components.month = num
-                let cal = Calendar(identifier: .gregorian)
-                if let date = cal.date(from: components) {
-                    let fmt = DateFormatter()
-                    fmt.dateFormat = "MMM yyyy"
-                    return fmt.string(from: date)
+                if let date = Self.volumeCalendar.date(from: components) {
+                    return Self.volumeMonthYearFormatter.string(from: date)
                 }
             }
         } else if parts.count == 3, let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]) {
@@ -858,11 +923,8 @@ struct TrendsView: View {
             components.year = year
             components.month = month
             components.day = day
-            let cal = Calendar(identifier: .gregorian)
-            if let date = cal.date(from: components) {
-                let fmt = DateFormatter()
-                fmt.dateFormat = "MMM d"
-                return fmt.string(from: date)
+            if let date = Self.volumeCalendar.date(from: components) {
+                return Self.volumeMonthDayFormatter.string(from: date)
             }
         }
         return period
@@ -895,7 +957,7 @@ enum SignedFlowFormat {
     /// two carry no direction to colour.
     static func tint(_ value: Double?) -> Color {
         guard let value, value != 0 else { return .primary }
-        return value > 0 ? .green : .red
+        return value > 0 ? AppTheme.semanticPositive : AppTheme.semanticNegative
     }
 }
 
@@ -1070,18 +1132,21 @@ struct TrendKPI: View {
     var tint: Color = .primary
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
             Text(value)
                 .font(.headline.weight(.bold))
                 .foregroundStyle(tint)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.65)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 12))
     }
 }
@@ -1276,8 +1341,8 @@ enum LatencyScorecardCopy {
 
     static func leadColor(_ direction: Direction) -> Color {
         switch direction {
-        case .ahead: return .green
-        case .behind: return .red
+        case .ahead: return AppTheme.semanticPositive
+        case .behind: return AppTheme.semanticNegative
         case .even: return .primary
         }
     }
@@ -1298,9 +1363,9 @@ enum LatencyScorecardCopy {
             let stem = token.lowercased().trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
             let piece: Text
             if stem == "earlier" || stem == "lead" {
-                piece = Text(token).foregroundColor(.green).fontWeight(.semibold)
+                piece = Text(token).foregroundColor(AppTheme.semanticPositive).fontWeight(.semibold)
             } else if stem == "later" || stem == "lag" {
-                piece = Text(token).foregroundColor(.red).fontWeight(.semibold)
+                piece = Text(token).foregroundColor(AppTheme.semanticNegative).fontWeight(.semibold)
             } else {
                 piece = Text(token).foregroundColor(base)
             }
@@ -1392,13 +1457,13 @@ struct ProviderScorecard: View {
         switch kind {
         case .mixed:
             bg = Color.orange.opacity(0.15)
-            fg = .orange
+            fg = AppTheme.semanticCaution
         case .ahead:
-            bg = Color.green.opacity(0.2)
-            fg = .green
+            bg = AppTheme.semanticPositive.opacity(0.2)
+            fg = AppTheme.semanticPositive
         case .behind:
-            bg = Color.red.opacity(0.2)
-            fg = .red
+            bg = AppTheme.semanticNegative.opacity(0.2)
+            fg = AppTheme.semanticNegative
         case .muted:
             bg = Color.gray.opacity(0.2)
             fg = Color.secondary

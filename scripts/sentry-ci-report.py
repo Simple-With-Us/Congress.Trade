@@ -1,26 +1,56 @@
 #!/usr/bin/env python3
 """
 sentry-ci-report.py — reports CI workflow outcomes to the shared fleet-infra
-Sentry project (org jays-services), via raw envelope HTTP (no sentry-sdk
+Sentry project (org simple-with-us), via raw envelope HTTP (no sentry-sdk
 dependency, no GitHub Actions marketplace action).
 
 Invoked by .github/workflows/sentry-ci-report.yml, which listens for
-`workflow_run: types: [completed]` across every other workflow in this repo
-and sets the env vars this script reads. This script itself does not know
-about GitHub Actions beyond reading those env vars — all the wiring lives in
-the workflow file.
+`workflow_run: types: [requested, completed]` across every other workflow in
+this repo and sets the env vars this script reads.  This script itself does not
+know about GitHub Actions beyond reading those env vars — all the wiring lives
+in the workflow file.
 
-Two independent signals are sent per completed run:
-  1. If the run's conclusion warrants an alert (failure / timed_out /
-     startup_failure — see ALERT_CONCLUSIONS): a Sentry error event tagged with
-     {app, workflow, branch, actor}, carrying the run URL, fingerprinted on
-     [app, workflow] so every failure of one workflow groups into ONE Sentry
-     issue instead of paging separately every time.
-  2. If the run was schedule-triggered (event == "schedule"): a Sentry Crons
-     check-in (status "ok" on success, "error" otherwise) with an upsert
-     monitor_config whose schedule mirrors that workflow's own cron
-     expression (see CRON_SCHEDULES below) so a nightly/weekly job that
-     silently STOPS running raises a missed-check-in alert.
+Three signals are sent, across the two phases of one observed run:
+  1. REQUESTED phase, schedule-triggered runs only (WORKFLOW_RUN_ACTION ==
+     "requested"): a Sentry Crons check-in with status "in_progress", which
+     OPENS the check-in the moment GitHub creates the run — before a runner is
+     even allocated.  No conclusion-based failure event is sent on this path:
+     at request time the run's conclusion is still null, so there is nothing
+     to alert on there.  A config-drift event CAN still be sent here (the
+     unconditional stale-cron-key guard in section 0, or the
+     unmapped-schedule event raised by resolve_cron_expr()) if this reporter's
+     own CRON_SCHEDULES mapping has fallen out of date.  Before sending the
+     in_progress check-in, this phase also asks the Actions API whether the
+     observed run has already finished (fetch_observed_run_status()) and
+     skips the check-in if so.  GitHub's own concurrency group does not
+     GUARANTEE that this requested-phase reporter run is created before the
+     completed-phase one — a very fast observed run can flip that order — so
+     this check is what actually keeps the two reporter runs from racing to
+     open a check-in the completed phase has already closed.
+  2. COMPLETED phase, if the run's conclusion warrants an alert (failure /
+     timed_out / startup_failure — see ALERT_CONCLUSIONS): a Sentry error event
+     tagged with {app, workflow, branch, actor}, carrying the run URL,
+     fingerprinted on [ci-failure, app, workflow] so every failure of one
+     workflow groups into ONE Sentry issue instead of paging separately every
+     time.
+  3. COMPLETED phase, if the run was schedule-triggered (event == "schedule"):
+     the terminal Sentry Crons check-in (status "error" when the conclusion is
+     in ALERT_CONCLUSIONS, "ok" for every other conclusion — the monitor
+     answers "did this cron fire", and a cancelled/skipped tick is not a
+     failure of the schedule) with an upsert monitor_config whose schedule
+     mirrors that workflow's own cron expression (see CRON_SCHEDULES below) so a
+     nightly/weekly job that silently STOPS running raises a missed-check-in
+     alert.  It carries the SAME check_in_id as (1), which is what CLOSES the
+     in_progress check-in that phase opened.
+
+The two phases are two separate GitHub jobs with no shared state, so the
+check_in_id cannot simply be generated once and passed along: both phases
+DERIVE it from the observed run, via checkin_id_for_run() (a uuid5 over the
+app, the observed run id, and the run attempt).  Sentry closes an in_progress
+check-in only when a terminal check-in arrives bearing the same id, so that
+determinism is the whole mechanism.  See FLEET-INFRA-CB / board c630ceed for
+why the in_progress phase exists at all: without it, checkin_margin had to
+absorb the observed job runtime as well as GitHub's schedule-dispatch delay.
 
 The branch is deliberately NOT part of the fingerprint (it was until
 2026-08-12).  Branch names are unbounded and short-lived, so including one
@@ -30,12 +60,11 @@ line, each one a dead feature branch nobody will ever look at again.  The
 branch is still carried as a per-event TAG (searchable, and visible on every
 event), which is where unbounded-cardinality data belongs.
 
-The `app` tag + fingerprint component are specific to this repo's copy (the
-Socratic.Trade original omits them): fleet-infra is shared across repos, and
-this repo shares workflow names ("CI", "Deploy", "Security") with
-Socratic.Trade, so without `app` a "CI" failure here would dedup into the same
-Sentry issue as one there. Per AGENT-SYNC.md "Observability", every event is
-tagged with `app:<repo>`.
+The `app` tag + fingerprint component are required: fleet-infra is shared
+across repos, and this repo shares workflow names ("CI", "Security",
+"Effort Issues Sync") with Socratic.Trade / Congress.Trade, so without `app`
+a "CI" failure here would dedup into the same Sentry issue as one there.
+Per FLEET-PROTOCOL.md "Observability", every event is tagged with `app:<repo>`.
 
 Secrets: SENTRY_FLEET_DSN is read only from the environment (set by the
 workflow from the repo secret) and is NEVER printed or logged in any form,
@@ -59,36 +88,44 @@ from pathlib import Path
 # one Sentry issue.
 APP = "congress-trade"
 
-# Cron expressions mirrored from each source workflow's own `schedule:` block.
-# Keep in sync if those workflows' schedules ever change. Workflows not
-# listed here have no `schedule:` trigger and will simply be skipped for the
-# check-in step (they can still send a failure event on other trigger types).
-#
-# Note: "Uptime Monitor" (*/5 * * * *) is intentionally NOT observed by the
-# workflow file, so it does not appear here — see the header of
-# .github/workflows/sentry-ci-report.yml for why.
 CRON_SCHEDULES = {
+    "CI": "23 * * * *",
     "Effort Issues Sync": "12 6 * * *",
     "Security": "41 10 * * 1",
     "Shared Package Pin Check": "0 13 * * 1",
 }
-
-# This map is keyed by a workflow's DISPLAY NAME, which is exactly the kind of
-# string that drifts out from under you: shared-package-pin-check.yml was
-# renamed "Shared package pin check" -> "Shared Package Pin Check" in d849720c
-# (2026-07-27) and this map kept the old casing, so that workflow's weekly
-# Sentry Crons check-in silently never fired again — the monitor simply was
-# never upserted, and the only complaint was a ::warning:: annotation inside a
-# reporter job nobody reads.  Two guards make that class of drift non-silent:
-#   1. Lookups go through this case-folded index, so a pure casing change can
-#      never break the mapping again.
-#   2. find_cron_schedule_drift() checks every key against the real `name:` of
-#      the workflow files in this repo, and main() reports a mismatch to Sentry
-#      (a real issue in fleet-infra), not just to the job log.
 _CRON_SCHEDULES_FOLDED = {name.casefold(): expr for name, expr in CRON_SCHEDULES.items()}
 
-# Where the observed workflows live, resolved from this file rather than the
-# process CWD so the guard works regardless of how the script is invoked.
+DEFAULT_CHECKIN_MARGIN = 15
+# GitHub `schedule` delivery is best-effort.  This daily monitor always
+# eventually runs, but the start is hours late, so a 15-minute margin
+# false-pages a healthy job.  600 min matches Socratic.Trade #3194
+# (FLEET-INFRA-C1), #3387 (FLEET-INFRA-C3), #3389 (FLEET-INFRA-BY), and
+# Autorotate #219 (FLEET-INFRA-CD).  Effort Issues Sync typically starts
+# 4.3-7.4h after 06:12Z (worst retained 2026-08-31 13:35Z, ~7h 23m).
+# Do not copy this onto 30-min macos ship crons (FLEET-INFRA-CC / DA / CX):
+# those drop ticks entirely.
+# "CI" is the hourly `23 * * * *` BACKSTOP tick in ci.yml (see the comment at the top of
+# that file), mapped 2026-09-18 for FLEET-INFRA-BJ ("no CRON_SCHEDULES entry for scheduled
+# workflow 'CI'", one drift warning per scheduled run since 2026-08-13).  GitHub does not
+# honour the hourly cadence: across the last 60 scheduled runs (2026-09-08..09-18) the gap
+# between runs had median ~260 min, p90 ~347 min, worst 467 min, and every run succeeded.
+# 600 min covers the worst observed gap with headroom and matches Socratic.Trade #3387 and
+# #3389 (merged); Usage-Monitor uses 480 for the same reason.  The dispatch latency is on
+# GitHub's side, so a tighter margin would only page on healthy runs.
+CHECKIN_MARGIN_OVERRIDES = {
+    "CI": 600,
+    "Effort Issues Sync": 600,
+}
+_CHECKIN_MARGINS_FOLDED = {name.casefold(): margin for name, margin in CHECKIN_MARGIN_OVERRIDES.items()}
+
+DEFAULT_MAX_RUNTIME = 60
+MAX_RUNTIME_OVERRIDES = {}
+_MAX_RUNTIMES_FOLDED = {name.casefold(): runtime for name, runtime in MAX_RUNTIME_OVERRIDES.items()}
+
+FLAP_DEBOUNCE_OVERRIDES = {}
+_FLAP_DEBOUNCE_FOLDED = {name.casefold(): cfg for name, cfg in FLAP_DEBOUNCE_OVERRIDES.items()}
+
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 
 # Terminal workflow_run conclusions that should raise a Sentry error event.
@@ -141,6 +178,155 @@ def find_cron_schedule_drift(known_names: set[str] | None) -> list[str]:
         return []
     folded = {name.casefold() for name in known_names}
     return sorted(key for key in CRON_SCHEDULES if key.casefold() not in folded)
+
+
+def checkin_id_for_run(run_id: str, run_attempt: str) -> str:
+    """Derive the Sentry check_in_id for one observed run attempt, deterministically.
+
+    The requested-phase and completed-phase reporters are two independent
+    GitHub jobs with no shared state — nothing can be handed from one to the
+    other — and Sentry closes an in_progress check-in ONLY when a later
+    check-in arrives carrying the same check_in_id.  So both phases derive the
+    id from the one thing they both observe: the triggering run.
+
+    run_attempt is part of the key on purpose.  GitHub does not fire the
+    `requested` activity type for a re-run, so on attempt >= 2 no in_progress
+    check-in is ever opened; keying on the attempt gives that re-run a fresh
+    id, so its terminal check-in stands alone instead of trying to close
+    attempt 1's check-in, which Sentry already closed.
+    """
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"sentry-ci-report/{APP}/run/{run_id}/attempt/{run_attempt}").hex
+
+
+def build_monitor_config(workflow_name: str, cron_expr: str) -> dict:
+    """The upsert monitor_config sent with BOTH the in_progress and terminal check-ins.
+
+    Factored out so the two phases cannot drift apart: an in_progress check-in
+    upserting a different schedule/margin than the terminal one would leave the
+    monitor's config depending on which envelope Sentry saw last.
+    """
+    folded = workflow_name.casefold()
+    monitor_config = {
+        "schedule": {"type": "crontab", "value": cron_expr},
+        "checkin_margin": _CHECKIN_MARGINS_FOLDED.get(folded, DEFAULT_CHECKIN_MARGIN),
+        "max_runtime": _MAX_RUNTIMES_FOLDED.get(folded, DEFAULT_MAX_RUNTIME),
+        "timezone": "UTC",
+    }
+    # FLEET-INFRA-CB (2026-09-08): only for workflows in
+    # FLAP_DEBOUNCE_OVERRIDES -- require N consecutive FAILED check-ins
+    # (Sentry counts error, missed and timeout check-ins alike toward
+    # failure_issue_threshold) before opening/reopening the Sentry issue, and
+    # one ok check-in to close it again, so a single slow-but-successful tick
+    # can no longer flap the issue the way it did (count 322) under a tight
+    # margin.  Consequence worth knowing on call: a single genuinely failed
+    # ship tick (conclusion in ALERT_CONCLUSIONS, so status="error") no longer
+    # opens or reopens this Crons issue by itself -- that failure still pages
+    # immediately via the separate error-event path in main() section 2, which
+    # is gated on ALERT_CONCLUSIONS and not on this threshold.  One false
+    # max_runtime timeout is likewise absorbed; unlike a conclusion-based
+    # failure a timeout has no error-event path of its own (see the
+    # max_runtime block above), so two consecutive timeouts are needed before
+    # this threshold surfaces one at all.  Every workflow NOT
+    # listed keeps Sentry's own default (alert on the first miss) -- a blanket
+    # threshold here would have meant CodeQL / Security / Shared package pin
+    # check / Weekly Model Pricing Audit each needed to miss TWO consecutive
+    # WEEKLY runs (~2 weeks) before anyone found out.
+    flap_debounce = _FLAP_DEBOUNCE_FOLDED.get(folded)
+    if flap_debounce:
+        monitor_config.update(flap_debounce)
+    return monitor_config
+
+
+def resolve_cron_expr(
+    workflow_name: str,
+    envelope_url: str,
+    auth_header: str,
+    run_url: str,
+    run_id: str,
+) -> str | None:
+    """Look up the mirrored cron expression for a scheduled workflow, or None.
+
+    On a miss this both warns in the job log and raises the `unmapped-schedule`
+    config-drift issue in Sentry, then returns None so the caller skips the
+    check-in.  Shared by the requested and completed phases: duplicating it
+    would let one phase send a check-in the other silently dropped.
+
+    Lookup is case-folded — a workflow rename that only changes capitalisation
+    must never again silently detach a job from its Crons monitor.
+    """
+    cron_expr = _CRON_SCHEDULES_FOLDED.get(workflow_name.casefold())
+    if cron_expr:
+        return cron_expr
+    print(
+        f"::warning::Schedule-triggered run for '{workflow_name}' has no known cron "
+        "expression mapped in CRON_SCHEDULES; skipping check-in."
+    )
+    send_config_drift_event(
+        envelope_url,
+        auth_header,
+        "unmapped-schedule",
+        f"sentry-ci-report has no CRON_SCHEDULES entry for scheduled workflow "
+        f"'{workflow_name}' [{APP}]",
+        ["ci-report-config-drift", APP, "unmapped-schedule", workflow_name],
+        {"workflow": workflow_name, "run_url": run_url, "run_id": run_id},
+    )
+    return None
+
+
+def fetch_observed_run_status(run_id: str) -> str | None:
+    """Ask the Actions API for the observed run's current status, or None.
+
+    Exists for one race: GitHub's `sentry-ci-report-<run id>` concurrency
+    group serializes the requested-phase and completed-phase reporter runs
+    only when the requested-phase run is CREATED first, which is the normal
+    case.  GitHub does not guarantee that order — for a very fast observed
+    run, GitHub can create the completed-phase reporter run before the
+    requested-phase one, so the terminal check-in would reach Sentry before
+    the in_progress one it is meant to close.  Calling this before sending
+    the in_progress check-in lets the requested phase notice that case
+    (status == "completed") and skip its check-in entirely, so the
+    completed phase's terminal check-in simply stands alone exactly as it
+    did before this change, instead of an in_progress update landing after
+    the check-in Sentry already closed.
+
+    Fails open on any problem: returns None (never raises) when
+    GITHUB_TOKEN, GITHUB_REPOSITORY, or run_id is empty, and on any
+    exception while calling the API.  "Fail open" here means "behave as if
+    this function did not exist" — the caller then sends the in_progress
+    check-in as it always has.  That is safe because the worst case is
+    exactly the pre-existing standalone terminal check-in PLUS a stray
+    in_progress update Sentry receives after the fact, which is the same
+    outcome this whole feature is meant to avoid, not a new failure mode.
+    Never includes the token, the API URL, or exception text in output —
+    only the exception's type name, to keep the job log free of anything
+    sensitive.
+    """
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").strip() or "https://api.github.com"
+    run_id = (run_id or "").strip()
+    if not token or not repo or not run_id:
+        return None
+
+    req = urllib.request.Request(
+        f"{api_url}/repos/{repo}/actions/runs/{run_id}",
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "sentry-ci-report",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("status")
+    except Exception as exc:  # noqa: BLE001 — fail open on ANY problem reading the observed run's status
+        print(
+            f"::warning::could not read the observed run's status ({type(exc).__name__}); "
+            "sending the in_progress check-in anyway"
+        )
+        return None
 
 
 def parse_dsn(dsn: str) -> tuple[str, str, str]:
@@ -222,6 +408,16 @@ def main() -> int:
     actor = os.environ.get("WORKFLOW_ACTOR", "unknown")
     run_url = os.environ.get("WORKFLOW_RUN_URL", "")
     run_id = os.environ.get("WORKFLOW_RUN_ID", "")
+    # github.event.action for the workflow_run event: "requested" (the run was
+    # just created — no runner assigned yet, conclusion still null) or
+    # "completed".  Defaults to "completed" so any caller that predates the
+    # requested listener, or that simply does not set this, behaves exactly as
+    # this script did before 2026-09-08.  Anything that is not literally
+    # "requested" takes the completed path.
+    run_action = os.environ.get("WORKFLOW_RUN_ACTION", "completed").strip() or "completed"
+    # Attempt number of the observed run; part of the deterministic
+    # check_in_id.  "1" for a first run, "2"+ for a re-run.
+    run_attempt = os.environ.get("WORKFLOW_RUN_ATTEMPT", "1").strip() or "1"
 
     if not dsn:
         print("::warning::SENTRY_FLEET_DSN secret is not set; skipping Sentry report for this run.")
@@ -261,7 +457,69 @@ def main() -> int:
             {"stale_keys": stale_keys, "run_url": run_url},
         )
 
-    # ── 1. Failure event ────────────────────────────────────────────────────
+    # ── 1. Requested phase: open the in_progress check-in ───────────────────
+    # This runs for schedule-triggered runs only.  It sends no failure event:
+    # at request time github.event.workflow_run.conclusion is null, so there is
+    # nothing yet to alert on.
+    if run_action == "requested":
+        if event != "schedule":
+            print(
+                f"Workflow '{workflow_name}' was requested by '{event}' (not schedule); "
+                "no in_progress check-in sent."
+            )
+            return 0
+
+        cron_expr = resolve_cron_expr(workflow_name, envelope_url, auth_header, run_url, run_id)
+        if not cron_expr:
+            return 0
+
+        if not run_id:
+            # Without the run id the two phases cannot agree on a
+            # check_in_id, so this in_progress check-in could never be closed
+            # by the completed phase — it would sit open until max_runtime and
+            # then fire a timeout alert for a run that was perfectly healthy.
+            # Staying silent here is strictly safer: the completed listener
+            # still sends its own standalone terminal check-in (with a random
+            # id), which is exactly the behavior this reporter had before the
+            # requested phase existed.
+            print(
+                "::warning::Requested-phase check-in skipped for "
+                f"'{workflow_name}': WORKFLOW_RUN_ID is empty, so the completed phase could "
+                "not close this check-in and it would time out into a false alert. "
+                "The completed phase will still send a standalone terminal check-in."
+            )
+            return 0
+
+        observed_status = fetch_observed_run_status(run_id)
+        if observed_status == "completed":
+            print(
+                f"Observed run {run_id} already completed before this requested-phase job ran; "
+                "skipping the in_progress check-in so the completed phase's terminal check-in "
+                "stands alone."
+            )
+            return 0
+
+        monitor_slug = f"ci-{APP}-{slugify(workflow_name)}"
+        check_in_id = checkin_id_for_run(run_id, run_attempt)
+        send_envelope(
+            envelope_url,
+            auth_header,
+            "check_in",
+            {
+                "check_in_id": check_in_id,
+                "monitor_slug": monitor_slug,
+                "status": "in_progress",
+                "monitor_config": build_monitor_config(workflow_name, cron_expr),
+            },
+        )
+        print(
+            f"Sent Sentry Crons check-in 'in_progress' for monitor '{monitor_slug}' "
+            f"(workflow '{workflow_name}', run {run_id} attempt {run_attempt}, "
+            f"check_in_id {check_in_id})."
+        )
+        return 0
+
+    # ── 2. Failure event ────────────────────────────────────────────────────
     if conclusion in ALERT_CONCLUSIONS:
         event_payload = {
             "event_id": uuid.uuid4().hex,
@@ -281,41 +539,54 @@ def main() -> int:
     else:
         print(f"Workflow '{workflow_name}' concluded '{conclusion}' (no alert); no error event sent.")
 
-    # ── 2. Cron check-in (only for schedule-triggered runs) ─────────────────
+    # ── 3. Terminal cron check-in (only for schedule-triggered runs) ────────
     if event == "schedule":
-        # Case-folded lookup: a workflow rename that only changes capitalisation
-        # must never again silently detach a job from its Crons monitor.
-        cron_expr = _CRON_SCHEDULES_FOLDED.get(workflow_name.casefold())
-        if not cron_expr:
-            print(
-                f"::warning::Schedule-triggered run for '{workflow_name}' has no known cron "
-                "expression mapped in CRON_SCHEDULES; skipping check-in."
-            )
-            send_config_drift_event(
-                envelope_url,
-                auth_header,
-                "unmapped-schedule",
-                f"sentry-ci-report has no CRON_SCHEDULES entry for scheduled workflow "
-                f"'{workflow_name}' [{APP}]",
-                ["ci-report-config-drift", APP, "unmapped-schedule", workflow_name],
-                {"workflow": workflow_name, "run_url": run_url, "run_id": run_id},
-            )
-        else:
-            checkin_status = "ok" if conclusion == "success" else "error"
+        cron_expr = resolve_cron_expr(workflow_name, envelope_url, auth_header, run_url, run_id)
+        if cron_expr:
+            # This monitor answers "did this cron fire", NOT "did the job
+            # succeed with the exact conclusion 'success'".  So the terminal
+            # status is keyed on the same ALERT_CONCLUSIONS set the error-event
+            # path uses, which keeps the two signals from contradicting each
+            # other: 'cancelled' / 'skipped' / 'neutral' / 'stale' /
+            # 'action_required' are normally intentional, they deliberately
+            # raise no Sentry error event, and they must not mint a Crons
+            # failure with no explanatory event beside it either.  That is not
+            # hypothetical here -- ios-ship.yml runs `13,43 * * * *` under
+            # `concurrency: {group: ios-ship-usage, cancel-in-progress: false}`,
+            # whose queue holds only one pending run, so any overrun past 30
+            # minutes gets the queued tick cancelled as a matter of routine.
+            # The check-in is still sent for EVERY conclusion, never skipped:
+            # skipping it would leave the requested phase's in_progress
+            # check-in open until max_runtime and turn a benign cancellation
+            # into a false TIMEOUT.
+            checkin_status = "error" if conclusion in ALERT_CONCLUSIONS else "ok"
             monitor_slug = f"ci-{APP}-{slugify(workflow_name)}"
+            # Same deterministic id the requested phase used, which is what
+            # CLOSES that in_progress check-in.  The uuid4 fallback is legacy:
+            # with no run id the two phases cannot correlate, so this becomes a
+            # standalone terminal check-in — exactly the pre-2026-09-08
+            # behavior.
+            check_in_id = checkin_id_for_run(run_id, run_attempt) if run_id else uuid.uuid4().hex
             checkin_payload = {
-                "check_in_id": uuid.uuid4().hex,
+                "check_in_id": check_in_id,
                 "monitor_slug": monitor_slug,
                 "status": checkin_status,
-                "monitor_config": {
-                    "schedule": {"type": "crontab", "value": cron_expr},
-                    "checkin_margin": 15,
-                    "max_runtime": 60,
-                    "timezone": "UTC",
-                },
+                # Sentry's spec says monitor_config SHOULD only be sent on the
+                # first check-in of a pair.  It is sent on both here anyway,
+                # because the terminal check-in may be the ONLY one Sentry ever
+                # sees for a run — the requested-phase reporter can be missed,
+                # cancelled, or skipped entirely (GitHub never fires
+                # `requested` for a re-run) — and a monitor that was never
+                # upserted has no schedule at all.  The upsert is idempotent,
+                # and build_monitor_config() guarantees both phases send byte
+                # -identical config.
+                "monitor_config": build_monitor_config(workflow_name, cron_expr),
             }
             send_envelope(envelope_url, auth_header, "check_in", checkin_payload)
-            print(f"Sent Sentry Crons check-in '{checkin_status}' for monitor '{monitor_slug}' (workflow '{workflow_name}').")
+            print(
+                f"Sent Sentry Crons check-in '{checkin_status}' for monitor '{monitor_slug}' "
+                f"(workflow '{workflow_name}', check_in_id {check_in_id})."
+            )
     else:
         print(f"Workflow '{workflow_name}' was triggered by '{event}' (not schedule); no cron check-in sent.")
 

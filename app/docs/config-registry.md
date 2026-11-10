@@ -47,6 +47,9 @@ surfaced in `GET /api/admin/diagnostics` (`provider:openrouter`) and
 
 ### Auth, billing, email
 `ADMIN_TOKEN`¹, `INGEST_TOKEN`, `ADMIN_MAINTENANCE_TOKEN`², `ADMIN_EMAILS`, `ACCESS_AUD`,
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL`, `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (optional GB Publisher fan-out; same `_SECRET`),
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB` (optional GB-only `Authorization` header; value includes `Bearer `),
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET`,
 `ACCESS_TEAM_DOMAIN`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
 `WEBHOOK_SIGNING_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
 `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_ANNUAL`, `STRIPE_TRIAL_DAYS`,
@@ -68,7 +71,7 @@ safe only while a strong client secret exists.
 ### Fleet coordination (shared-at-ct ONLY)
 `AGENT_SYNC_TOKEN`, `AGENT_SYNC_POST_TOKEN` — one pair for every app.
 Rotate in the shared project; never duplicate onto `socratic-trade` or
-`congress-trade` app projects.  Local Mac copy: `~/.secrets/agent-sync.env`.
+`congress-trade` app projects.  Local Mac copy: Infisical `/agent-sync` (`fleet-secrets get`).
 
 ### Integrations
 `APP_B_IMPORT_URL`, `APP_B_INGEST_TOKEN`, `USAGE_MONITOR_ENABLED`,
@@ -76,25 +79,55 @@ Rotate in the shared project; never duplicate onto `socratic-trade` or
 `USAGE_MONITOR_ENVIRONMENT`², `USAGE_MONITOR_READ_TOKEN` (optional; read-only
 budget-status polling, see Tunables & flags below)
 
+### Datadog (existing fleet account — no new plan)
+Coolify / Infisical names only.  Values are never invented.  Missing or
+partial keys fail closed (the app boots; nothing is sent).
+
+Backend logs + APM (agentless HTTP intake from the Deno container):
+`DD_API_KEY`, `DD_SITE` (required together; known sites only, e.g.
+`us5.datadoghq.com`).  Optional: `DD_SERVICE` (default `congress-trade`),
+`DD_ENV` (falls back to `SENTRY_ENVIRONMENT` / `USAGE_MONITOR_ENVIRONMENT`).
+`DD_APP_KEY` is accepted for fleet registry completeness and is **not**
+required to send logs or traces.
+
+Public RUM (injected into `/`, legal pages, and the shared dashboard document
+via `%GA_SCRIPT%` — not Admin copy).  Requires all three: a client token, an
+application id, and a site.  Canonical: `DD_CLIENT_TOKEN`,
+`DD_APPLICATION_ID`, `DD_SITE`.  Aliases also accepted:
+`DD_RUM_CLIENT_TOKEN`, `NEXT_PUBLIC_DD_CLIENT_TOKEN`,
+`NEXT_PUBLIC_DD_RUM_CLIENT_TOKEN`, `DD_RUM_APPLICATION_ID`,
+`NEXT_PUBLIC_DD_APPLICATION_ID`, `NEXT_PUBLIC_DD_RUM_APPLICATION_ID`,
+`NEXT_PUBLIC_DD_SITE`.  Session Replay stays off.  Do not mint a new RUM
+application from this repo; reuse an existing Browser RUM app on the
+current Datadog account.
+
 ### Tunables & flags
-- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `FMP_MAX_PER_MINUTE`,
+- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `ST_PEER_MAX_PER_MINUTE`,
   `EDGAR_MAX_PER_MINUTE`
+  - `ST_PEER_MAX_PER_MINUTE` paces every Socratic.Trade peer read (profiles,
+    EOD prices, the price catch-up, the not-covered re-check).  It is clamped to
+    100/min because ST's `peerRead` limit is 120/min for all peer reads;  unset
+    paces at 100/min.  It replaces `FMP_MAX_PER_MINUTE`, which is no longer read.
+    FMP is latency probes only and is never a price source.
 - Providers/routing: `PRICE_PROVIDER`, `APP_BASE_URL`
 - Anti-scrape: `SCRAPE_GUARD_ENABLED`
 - Disclosure-latency race: `DISCLOSURE_LATENCY_WATCH_ENABLED`,
   `DISCLOSURE_LATENCY_PROVIDERS`, `DISCLOSURE_LATENCY_WATCH_LIMIT`,
   legacy `FMP_DISCLOSURE_WATCH_ENABLED` / `FMP_DISCLOSURE_WATCH_LIMIT`,
-  **FMP family (default ON for CT when keys present):** `FMP_LATENCY_PROBE_ENABLED`
-  (explicit false/off disables; grey OFF), `FMP_LATENCY_PATHS` (default **`stable`**
-  only — RapidAPI FMP product auth works but **house/senate-latest 404** as of
-  2026-08; opt in `stable,rapidapi` if marketplace gains congress endpoints),
+  **FMP family (latency probes only; default ON for CT when keys present):**
+  `FMP_LATENCY_PROBE_ENABLED` (explicit false/off disables; grey OFF),
+  `FMP_LATENCY_PATHS` (congress probes are **stable only**. RapidAPI
+  house/senate-latest **404** as of 2026-09-04 and is not fetched even if
+  listed — it does not replace stable. Dual keys
+  `FMP_LATENCY_API_KEY` + `FMP_LATENCY_API_KEY_2` fail over on 429 / daily cap
+  / 401 / 403),
   optional `FMP_STABLE_BASE_URL` / `FMP_RAPIDAPI_BASE_URL` / `FMP_RAPIDAPI_HOST`,
   `FMP_RAPIDAPI_KEY` **or shared `RAPIDAPI_KEY`** (ST marketplace convention —
   never free-tier `FMP_LATENCY_*` on the RapidAPI host),
-  `FMP_RAPIDAPI_DAILY_CAP` (default 500 HTTP/day for RapidAPI path if enabled),
+  `FMP_RAPIDAPI_DAILY_CAP` is not spent on house/senate probes (those routes 404),
   `FMP_LATENCY_DAILY_CAP` (per free-tier key, default 235), dual free keys
-  `FMP_LATENCY_API_KEY` + `_2` (or `FMP_API_KEY` as slot-2 fallback) **rotate**
-  for ~2× capacity — no known per-IP limit on free tier,
+  `FMP_LATENCY_API_KEY` + `_2` (or `FMP_API_KEY` as slot-2 fallback) **rotate and
+  fail over** (429 / cap / 401 / 403) for ~2× capacity — no known per-IP limit,
   `UW_LATENCY_DAILY_CAP` (default 240 HTTP/day incl. deep-match),
   `QUIVER_LATENCY_DAILY_CAP` (default 360 HTTP/day; 3 calls per probe),
   `UW_DEEP_MATCH_DATES_PER_RUN` (UW deep-match date budget; default `8`).
@@ -127,7 +160,7 @@ budget-status polling, see Tunables & flags below)
   recesses or the Clerk changes publication times — no redeploy.
   Production should keep these set in Infisical:
   `DISCLOSURE_LATENCY_WATCH_ENABLED=true`,
-  `DISCLOSURE_LATENCY_PROVIDERS=fmp,unusual_whales,quiver` (add `fmp_rapidapi` only if product supports congress),
+  `DISCLOSURE_LATENCY_PROVIDERS=fmp` (add `unusual_whales,quiver` only after paid/trial keys; add `fmp_rapidapi` only if marketplace lists house/senate/executive-latest),
   `DISCLOSURE_LATENCY_WATCH_LIMIT=100`,
   `FMP_LATENCY_PROBE_ENABLED` unset (default ON) or false to disable spend,
   `FMP_LATENCY_PATHS=stable`,
@@ -297,6 +330,12 @@ budget-status polling, see Tunables & flags below)
   Metered dollars persist per day/provider in the D1 `llm_spend` table
   (migration 0049) and surface in `GET /diagnostics` under
   `resourceGovernors.llmSpend`.
+- Webhook quarantine recovery (`delivery/targetCircuit.ts`, an `APP_SETTINGS`
+  knob with env fallback): `DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER` (default
+  off).  When truthy, the scheduled parked flush re-parks live quarantined
+  deliveries for delivery once the target circuit closes and parked headroom
+  opens.  Off, only rows whose transaction is gone or retracted are skipped,
+  and live rows wait for an explicit `POST /api/admin/delivery-requeue-quarantined`.
 
 ² `USAGE_MONITOR_ENVIRONMENT` is Infisical-tunable on its async read paths
 (admin-open check, usage telemetry); the sync local-webhook-target gate in
@@ -308,7 +347,7 @@ path, never active in production).
 | Key | Why |
 |---|---|
 | `INFISICAL_BASE_URL`, `INFISICAL_ENV`, `INFISICAL_CACHE_TTL_SECONDS`, `INFISICAL_ALLOW_ENV_FALLBACK`, `INFISICAL_APP_*`, `INFISICAL_SHARED_*` | Resolver bootstrap — cannot resolve themselves |
-| `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE` | Read synchronously in the `Sentry.withSentry` init factory before any `await` is possible |
+| `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE` | Read synchronously in the `Sentry.withSentry` init factory before any `await` is possible. Live `SENTRY_DSN` is owned by Infisical (canonical) and Coolify runtime env — never a git value |
 | `USAGE_TELEMETRY_CIRCUIT_*`, `USAGE_TELEMETRY_FALLBACK_*`, `USAGE_TELEMETRY_D1_DRAIN_LIMIT`, `USAGE_TELEMETRY_DELIVERY_TIMEOUT_MS` | Operational safety limits read synchronously on the telemetry hot path; must stay available while KV/D1/Infisical are the thing degraded |
 | `D1_WRITE_OPS_PER_INVOCATION_CAP` (default 2000), `D1_WRITE_BATCH_CAP` (default 200) | Resource governor 2 (`shared/d1Budget.ts` write governor): gate the hot D1 write path synchronously — per-invocation soft cap with batch truncation + `d1_write_quarantine` markers at the known storm writers (ingestion discovery, DLQ receipts, delivery-outbox flush, extraction_runs) |
 | `DELIVERY_TARGET_FAILURE_THRESHOLD` (default 5), `DELIVERY_TARGET_DAILY_ATTEMPT_CAP` (default 50 failed attempts/target/day), `DELIVERY_TARGET_BASE_BACKOFF_SEC` (default 60, doubling, capped at 1 probe/hour), `DELIVERY_TARGET_PARKED_CAP` (default 500 parked/subscription before quarantine + alert) | Resource governor 3 (`delivery/targetCircuit.ts`): per-target outbound circuit breaker for webhook + peer-app deliveries; must stay readable mid-incident |

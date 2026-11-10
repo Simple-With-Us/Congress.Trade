@@ -43,7 +43,7 @@ docker run --rm \
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `CONGRESS_TRADE_API_URL` | `http://localhost:8787` | App base URL |
-| `ADMIN_TOKEN` | (required in prod) | Admin bearer |
+| `ADMIN_TOKEN` | (optional env) | Admin bearer; if unset, fetched at boot from Infisical (`INFISICAL_APP_*`) |
 | `WORKER_ID` | `server_cpu_1` | Heartbeat id |
 | `POLL_INTERVAL_SEC` | `30` | Poll loop |
 | `OCR_BACKEND` | `tesseract` | `tesseract` \| `surya` \| `doctr` |

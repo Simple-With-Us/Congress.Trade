@@ -359,9 +359,6 @@ struct AssetDirectoryView: View {
                             assetPager(page: page, pages: pages)
                                 .padding(.top, 4)
                         }
-
-                        AppLegalFooter()
-                            .padding(.top, 8)
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
@@ -378,6 +375,8 @@ struct AssetDirectoryView: View {
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
                     .presentationCornerRadius(18)
+                    .presentationContentInteraction(.resizes)
+                    .iPadFullWidthSheet()
             }
             // Same invalidation rule as PeopleDirectoryView: narrowing or
             // reordering can strand the current page past the new result count.

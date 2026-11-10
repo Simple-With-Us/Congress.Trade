@@ -33,6 +33,7 @@
 import type { Env } from './types.ts';
 import type { SqlParam } from './db.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
+import { sentryLoggerWarn } from './sentryRuntime.ts';
 
 interface RowDelta {
   read: number;
@@ -205,10 +206,26 @@ function warnIfOverSoft(
   }
   if (warnedDay === day) return; // at most once per isolate per day
   warnedDay = day;
-  const msg =
-    `D1 daily row budget >= ${SOFT_RATIO * 100}% soft threshold: ` +
-    `read ${readTotal ?? '?'}/${rB}, written ${writtenTotal ?? '?'}/${wB}`;
-  console.warn(msg);
+  sentryLoggerWarn('d1.budget_soft', {
+    read: readTotal ?? -1,
+    readBudget: rB,
+    written: writtenTotal ?? -1,
+    writtenBudget: wB,
+  });
+}
+
+/** CT-2459 flush throttle: at most one meter write per window (or per row
+ *  threshold) per isolate. Previously every invocation with any metered
+ *  rows did an INSERT+SELECT — a DB write per read request on the single
+ *  libsql connection. Metering is approximate by design (see header), so
+ *  delaying the flush loses nothing but freshness of the day counter. */
+export const D1_BUDGET_FLUSH_INTERVAL_MS = 30_000;
+export const D1_BUDGET_FLUSH_ROW_THRESHOLD = 10_000;
+let lastBudgetFlushMs = 0;
+
+/** Test hook: reset the flush throttle clock. */
+export function resetD1BudgetFlushClockForTests(): void {
+  lastBudgetFlushMs = 0;
 }
 
 /**
@@ -222,6 +239,14 @@ export async function flushD1Budget(env: Env, now = new Date()): Promise<void> {
   resetD1WriteGovernor();
   const snap = pending;
   if (snap.read === 0 && snap.written === 0) return;
+  const nowMs = now.getTime();
+  if (
+    nowMs - lastBudgetFlushMs < D1_BUDGET_FLUSH_INTERVAL_MS &&
+    snap.read + snap.written < D1_BUDGET_FLUSH_ROW_THRESHOLD
+  ) {
+    return; // keep accumulating; a later tail (or the threshold) flushes
+  }
+  lastBudgetFlushMs = nowMs;
   pending = { read: 0, written: 0 };
   try {
     const day = dayStr(now);
@@ -311,10 +336,12 @@ function warnGovernorCap(writer: string, requested: number, allowed: number, cap
   const nowMs = Date.now();
   if (nowMs - governorWarnedAtMs < 60_000) return;
   governorWarnedAtMs = nowMs;
-  const msg =
-    `D1 write governor cap reached: writer=${writer} requested=${requested} ` +
-    `allowed=${allowed} invocationCap=${cap}`;
-  console.warn(msg);
+  sentryLoggerWarn('d1.governor_cap', {
+    writer,
+    requested,
+    allowed,
+    invocationCap: cap,
+  });
 }
 
 /**

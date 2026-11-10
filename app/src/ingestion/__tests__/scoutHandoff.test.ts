@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   computeNeedScout,
+  isLatencyProbeAuthError,
+  LATENCY_PROBE_HEALTH_KV_KEY,
   LATENCY_SCOUT_CONSECUTIVE_ERRORS,
+  latencyProvidersWithRejectedCredentials,
+  shouldThrottleAuthRejectedLatencyProbe,
   recordLatencyProbeOutcome,
   buildScoutPlan,
   refreshLatencySilenceFromDb,
@@ -42,7 +46,10 @@ describe('computeNeedScout (consecutive errors)', () => {
     expect(second.needScout).toBe(false);
   });
 
-  it('hands off on the 3rd successive server error', () => {
+  it('counts the 3rd successive server error but never hands off (scout retired)', () => {
+    // Scout retired 2026-09-09: there is no host to hand the lane to, so
+    // `needScout` is false on every path.  The count and the reason string
+    // survive as observability — the dashboard still surfaces the streak.
     const third = computeNeedScout({
       kind: 'error',
       source: 'server',
@@ -50,7 +57,7 @@ describe('computeNeedScout (consecutive errors)', () => {
       prevConsecutiveServerErrors: 2,
     });
     expect(third.consecutiveServerErrors).toBe(3);
-    expect(third.needScout).toBe(true);
+    expect(third.needScout).toBe(false);
     expect(third.needScoutReason).toMatch(/3 successive/);
     expect(third.needScoutReason).toMatch(/HTTP_429/);
   });
@@ -65,15 +72,18 @@ describe('computeNeedScout (consecutive errors)', () => {
     expect(r.needScout).toBe(false);
   });
 
-  it('keeps handoff open while scout covers (scout success does not reclaim)', () => {
+  it('maps a historical scout record onto a server-owned lane (no phantom handoff)', () => {
+    // `source: 'scout'` can now only arrive from a KV row written before the
+    // 2026-09-09 retirement.  Reading one must not resurrect a handoff flag
+    // on the dashboard, but it must not lose the error streak either.
     const r = computeNeedScout({
       kind: 'success',
       source: 'scout',
       prevConsecutiveServerErrors: LATENCY_SCOUT_CONSECUTIVE_ERRORS,
     });
     expect(r.consecutiveServerErrors).toBe(LATENCY_SCOUT_CONSECUTIVE_ERRORS);
-    expect(r.needScout).toBe(true);
-    expect(r.needScoutReason).toMatch(/scout covering until server recovers/);
+    expect(r.needScout).toBe(false);
+    expect(r.needScoutReason).toBeNull();
   });
 
   it('disabled never opens handoff', () => {
@@ -86,13 +96,16 @@ describe('computeNeedScout (consecutive errors)', () => {
     ).toBe(false);
   });
 
-  it('not_configured opens handoff without requiring 3 errors', () => {
+  it('not_configured reports the gap but cannot hand off (no Mac fallback)', () => {
+    // Previously the one path that opened handoff immediately.  With the scout
+    // retired an unconfigured provider simply logs and skips until keys land
+    // in Infisical; the reason string is what tells the operator that.
     const r = computeNeedScout({
       kind: 'not_configured',
       source: 'server',
       prevConsecutiveServerErrors: 0,
     });
-    expect(r.needScout).toBe(true);
+    expect(r.needScout).toBe(false);
     expect(r.needScoutReason).toMatch(/not configured/);
   });
 });
@@ -125,7 +138,41 @@ describe('recordLatencyProbeOutcome + plan', () => {
     kvStore.clear();
   });
 
-  it('requires 3 successive server errors before needScout', async () => {
+  it('does not resurrect needScout when reading a pre-retirement KV row', async () => {
+    // `computeNeedScout` never writes `needScout: true` any more, but the read
+    // path normalizes every row it loads.  If that normalizer re-derived
+    // handoff from the error count, a legacy row — or any provider three
+    // errors into an outage — would flip back to true on the next read and
+    // route the lane down the retired-Mac branch.
+    kvStore.set(
+      LATENCY_PROBE_HEALTH_KV_KEY,
+      JSON.stringify({
+        fmp: {
+          provider: 'fmp',
+          lastAttemptAt: '2026-09-01T00:00:00.000Z',
+          lastSuccessAt: null,
+          lastError: 'HTTP_403',
+          lastFetchedRows: 0,
+          lastSource: 'scout',
+          consecutiveServerErrors: 5,
+          needScout: true,
+          needScoutReason: 'server probe failed 5 successive times (threshold 3)',
+          updatedAt: '2026-09-01T00:00:00.000Z',
+        },
+      }),
+    );
+
+    const out = await recordLatencyProbeOutcome(env, 'fmp', {
+      kind: 'budget_skip',
+      now: new Date('2026-09-10T12:00:00.000Z'),
+    });
+
+    expect(out.needScout).toBe(false);
+    // The streak itself survives — it is what the dashboard shows.
+    expect(out.consecutiveServerErrors).toBe(5);
+  });
+
+  it('accumulates successive server errors without ever setting needScout', async () => {
     const t0 = new Date('2026-08-11T12:00:00.000Z');
     const e1 = await recordLatencyProbeOutcome(env, 'fmp', {
       kind: 'error',
@@ -148,7 +195,8 @@ describe('recordLatencyProbeOutcome + plan', () => {
       error: 'HTTP_403',
       now: new Date(t0.getTime() + 120_000),
     });
-    expect(e3.needScout).toBe(true);
+    // Streak is still recorded end-to-end through KV; handoff is not.
+    expect(e3.needScout).toBe(false);
     expect(e3.consecutiveServerErrors).toBe(3);
   });
 
@@ -183,7 +231,10 @@ describe('recordLatencyProbeOutcome + plan', () => {
     expect(map.fmp?.consecutiveServerErrors).toBe(0);
   });
 
-  it('buildScoutPlan hints secondary FMP key when covering FMP', async () => {
+  it('buildScoutPlan no longer puts FMP on the scout after a server-error streak', async () => {
+    // The plan is the Mac's work list, and the Mac is retired: a server-error
+    // streak keeps the lane server-owned instead of handing FMP over, so there
+    // is nothing to cover and no secondary-key hint to give.
     for (let i = 0; i < 3; i++) {
       await recordLatencyProbeOutcome(env, 'fmp', {
         kind: 'error',
@@ -192,9 +243,8 @@ describe('recordLatencyProbeOutcome + plan', () => {
       });
     }
     const plan = await buildScoutPlan(env, new Date('2026-08-11T13:10:00.000Z'));
-    expect(plan.fmpPreferSecondaryKey).toBe(true);
-    expect(plan.latencyNeedScout.some((h) => h.provider === 'fmp')).toBe(true);
-    expect(plan.notes.some((n) => /successive server errors/i.test(n))).toBe(true);
+    expect(plan.latencyNeedScout.some((h) => h.provider === 'fmp')).toBe(false);
+    expect(plan.fmpPreferSecondaryKey).toBe(false);
   });
 
   it('never hands off fmp_rapidapi when RapidAPI path is not enabled (default stable-only)', async () => {
@@ -218,5 +268,93 @@ describe('recordLatencyProbeOutcome + plan', () => {
     expect(plan.latencyNeedScout.some((h) => h.provider === 'fmp_rapidapi')).toBe(false);
     const row = plan.latency.find((h) => h.provider === 'fmp_rapidapi');
     expect(row?.needScout).toBe(false);
+  });
+});
+
+describe('isLatencyProbeAuthError', () => {
+  it('matches server and scout auth failure signatures', () => {
+    expect(isLatencyProbeAuthError('HTTP_401:https://api.example')).toBe(true);
+    expect(isLatencyProbeAuthError('UW HTTP 401')).toBe(true);
+    expect(isLatencyProbeAuthError('qq:house: QQ house HTTP 403')).toBe(true);
+    expect(isLatencyProbeAuthError('HTTP_429')).toBe(false);
+  });
+});
+
+describe('latencyProvidersWithRejectedCredentials', () => {
+  it('latches membership providers after consecutive auth errors in KV health', async () => {
+    const kvStore = new Map<string, string>();
+    kvStore.set(
+      LATENCY_PROBE_HEALTH_KV_KEY,
+      JSON.stringify({
+        unusual_whales: {
+          provider: 'unusual_whales',
+          consecutiveServerErrors: 3,
+          lastError: 'HTTP_401:https://api.unusualwhales.com/',
+          lastAttemptAt: '2026-10-01T00:00:00.000Z',
+          lastSuccessAt: null,
+          lastFetchedRows: 0,
+          lastSource: 'server',
+          needScout: false,
+          needScoutReason: null,
+          updatedAt: '2026-10-01T00:00:00.000Z',
+        },
+      }),
+    );
+    const env = {
+      CONFIG_KV: {
+        get: async (key: string, type?: string) => {
+          const v = kvStore.get(key);
+          if (v == null) return null;
+          return type === 'json' ? JSON.parse(v) : v;
+        },
+        put: async () => {},
+      },
+      DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [] }) }) }) },
+    } as never;
+    const rejected = await latencyProvidersWithRejectedCredentials(env);
+    expect(rejected.has('unusual_whales')).toBe(true);
+    expect(rejected.has('fmp')).toBe(false);
+  });
+});
+
+describe('shouldThrottleAuthRejectedLatencyProbe', () => {
+  const kvStore = new Map<string, string>();
+  const baseHealth = {
+    provider: 'unusual_whales' as const,
+    consecutiveServerErrors: 3,
+    lastError: 'HTTP_401:https://api.unusualwhales.com/',
+    lastAttemptAt: '2026-10-15T10:00:00.000Z',
+    lastSuccessAt: null,
+    lastFetchedRows: 0,
+    lastSource: 'server' as const,
+    needScout: false,
+    needScoutReason: null,
+    updatedAt: '2026-10-15T10:00:00.000Z',
+  };
+  const env = {
+    CONFIG_KV: {
+      get: async (key: string, type?: string) => {
+        const v = kvStore.get(key);
+        if (v == null) return null;
+        return type === 'json' ? JSON.parse(v) : v;
+      },
+      put: async () => {},
+    },
+    DB: { prepare: () => ({ bind: () => ({ all: async () => ({ results: [] }) }) }) },
+  } as never;
+
+  beforeEach(() => {
+    kvStore.clear();
+    kvStore.set(LATENCY_PROBE_HEALTH_KV_KEY, JSON.stringify({ unusual_whales: baseHealth }));
+  });
+
+  it('throttles HTTP inside the recovery window but force bypasses', async () => {
+    const inside = new Date('2026-10-15T12:00:00.000Z');
+    expect(await shouldThrottleAuthRejectedLatencyProbe(env, 'unusual_whales', inside, {})).toBe(true);
+    expect(await shouldThrottleAuthRejectedLatencyProbe(env, 'unusual_whales', inside, { force: true })).toBe(
+      false,
+    );
+    const after = new Date('2026-10-15T17:00:00.000Z');
+    expect(await shouldThrottleAuthRejectedLatencyProbe(env, 'unusual_whales', after, {})).toBe(false);
   });
 });

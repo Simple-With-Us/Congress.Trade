@@ -195,7 +195,7 @@ async function applyNotification(
   const writeRefundTombstone = !existing && (notificationType === 'REVOKE' || notificationType === 'REFUND');
   if (!existing && !writeRefundTombstone) {
     console.warn(
-      `apple webhook ${notificationType}: no ledger row for originalTransactionId ${originalTransactionId} yet (redeem has not run) — ignoring`,
+      `apple webhook ${notificationType}: no ledger row yet (redeem has not run) — ignoring`,
     );
     return;
   }
@@ -250,7 +250,7 @@ async function applyNotification(
   });
   if (staleRevokedReplay && notificationType !== 'REVOKE' && notificationType !== 'REFUND') {
     console.warn(
-      `apple webhook ${notificationType}: refusing to overwrite revoked ${originalTransactionId} from a pre-refund retry`,
+      `apple webhook ${notificationType}: refusing to overwrite revoked row from a pre-refund retry`,
     );
     return;
   }

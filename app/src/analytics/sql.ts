@@ -15,9 +15,14 @@
  *     metric uses the bracket MIDPOINT ({@link BRACKET_MIDPOINT_SQL}). The
  *     open-ended top tier ($50,000,001+) has amount_max IS NULL and falls back
  *     to the bracket floor (amount_min). All $ figures are therefore ESTIMATES.
- *   - party is frequently empty in the data (seed filers store party=''), so it
- *     is bucketed into D / R / O(ther) by first letter only when known. Unknown
- *     party stays NULL rather than being treated as Independent.
+ *   - party is frequently empty in the data (seed filers store party='',
+ *     executive-branch and manual filers have none), so it is bucketed into
+ *     D / R / O by first letter: D and R are matched, and EVERYTHING else
+ *     (Independent, minor parties, and no party on file) is 'O' — labelled
+ *     "Other / No party" in the UI.  The bucket is total (never NULL), so a
+ *     party filter always partitions the data: All == D + R + O.  Row-level
+ *     `partyBucket` fields in API responses are separate and still `null` when
+ *     no party is on file.
  */
 
 import { WINDOW_PRESETS as SHARED_WINDOW_PRESETS } from '@jaywedgeworth22/congress-trading-shared';
@@ -76,6 +81,10 @@ export function asSourceFilter(v: unknown, fallback: SourceFilter = 'all'): Sour
     : fallback;
 }
 
+/**
+ * Party bucket filter value.  `O` means "Other / No party": Independents, minor
+ * parties AND filers with no party on file (see {@link PARTY_BUCKET_SQL}).
+ */
 export type PartyBucket = 'D' | 'R' | 'O';
 export function asPartyBucket(v: unknown): PartyBucket | undefined {
   if (typeof v !== 'string' || v.length === 0) return undefined;
@@ -223,12 +232,18 @@ export const STOCK_SIGNED_MIDPOINT_SQL =
 /** Chamber resolved from the filers table, falling back to the owning filing. */
 export const CHAMBER_EXPR = 'COALESCE(fl.chamber, f.chamber)';
 
-/** Party bucketed to 'D' | 'R' | 'O' by first letter; unknown stays NULL. */
+/**
+ * Party bucketed to 'D' | 'R' | 'O' by first letter.  Total: anything that is
+ * not D or R — Independent, minor parties, empty/NULL party (seed, executive
+ * and manual filers) or a transaction whose filer has no `filers` row — is 'O'
+ * ("Other / No party").  Never NULL, so the three buckets partition the data
+ * and `party=D,R,O` returns exactly what no party filter returns.  Keep in sync
+ * with PARTY_BUCKET_SQL_LOCAL in delivery/rows.ts (asserted by a test).
+ */
 export const PARTY_BUCKET_SQL =
   "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' " +
   "WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' " +
-  "WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) IN ('I', 'O') THEN 'O' " +
-  'ELSE NULL END)';
+  "ELSE 'O' END)";
 
 /** A non-null, non-empty ticker (the analytics definition of "a resolved asset"). */
 export const TICKER_RESOLVED_SQL = "(t.ticker IS NOT NULL AND t.ticker <> '' AND t.ticker NOT IN ('NONE', '--', 'N/A', 'NA', 'NULL', '—'))";
@@ -270,7 +285,7 @@ export interface CommonFilters {
    * executive rows excluded (see {@link asChambers}).
    */
   chambers?: Chamber[];
-  /** Party bucket (D/R/O); matched against {@link PARTY_BUCKET_SQL}. */
+  /** Party bucket (D/R/O, O = Other / No party); matched against {@link PARTY_BUCKET_SQL}. */
   party?: PartyBucket;
   /** Multi-party selection (takes precedence over `party`). */
   parties?: PartyBucket[];

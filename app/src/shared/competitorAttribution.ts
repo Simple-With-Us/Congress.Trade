@@ -119,9 +119,9 @@ export function parseCompetitorReporter(raw: unknown): ParsedCompetitorReporter 
   if (district) {
     chamber = 'house';
   } else {
-    const chamberField = firstNonEmptyString(obj.chamber, obj.Chamber, obj.House, obj.house, obj.member_type).toLowerCase();
-    if (chamberField.includes('house') || chamberField.includes('rep')) chamber = 'house';
-    else if (chamberField.includes('senate') || chamberField.includes('sen')) chamber = 'senate';
+    chamber = chamberFromMemberType(
+      firstNonEmptyString(obj.chamber, obj.Chamber, obj.House, obj.house, obj.member_type),
+    );
   }
 
   const bioguideId = firstNonEmptyString(obj.BioGuideID, obj.bioguideId, obj.bioguide_id, obj.Bioguide, obj.bioguide) || null;
@@ -146,6 +146,57 @@ export function competitorReporterMismatch(
   return false;
 }
 
+/**
+ * Chamber declared by a provider's `member_type` / `chamber` string.  Executive
+ * comes first so a "senior executive" style value is never read as Senate.
+ * Returns null for anything unrecognised — never a guess.
+ */
+export function chamberFromMemberType(value: unknown): ParsedCompetitorChamber | null {
+  const s = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!s) return null;
+  if (s.includes('exec')) return 'executive';
+  if (s.includes('house') || s.includes('rep')) return 'house';
+  if (s.includes('senate') || s.includes('sen')) return 'senate';
+  return null;
+}
+
+/**
+ * Every reporter-name string a competitor payload carries, most specific
+ * first ("reporter" carries the full honorific name — "Hon. April McClain
+ * Delaney" — where "name" is often a truncated "April Delaney").  Used to
+ * match a payload onto an EXISTING filer instead of trusting a bare last
+ * name.  Returns [] when nothing is derivable (never throws).
+ */
+export function competitorReporterNames(raw: unknown): string[] {
+  let obj: Record<string, unknown> | null = null;
+  if (raw && typeof raw === 'object') {
+    obj = raw as Record<string, unknown>;
+  } else if (typeof raw === 'string') {
+    try {
+      const parsedJson = JSON.parse(raw) as unknown;
+      if (parsedJson && typeof parsedJson === 'object') obj = parsedJson as Record<string, unknown>;
+    } catch {
+      obj = null;
+    }
+  }
+  if (!obj) return [];
+  const out: string[] = [];
+  const add = (v: unknown) => {
+    const s = typeof v === 'string' ? v.trim() : '';
+    if (s && !out.includes(s)) out.push(s);
+  };
+  for (const key of [
+    'reporter', 'Reporter', 'name', 'Name', 'politician', 'politician_name',
+    'Representative', 'representative', 'Senator', 'senator', 'member', 'Member',
+  ]) {
+    add(obj[key]);
+  }
+  const first = firstNonEmptyString(obj.firstName, obj.FirstName, obj.first_name, obj.First);
+  const last = firstNonEmptyString(obj.lastName, obj.LastName, obj.last_name, obj.Last);
+  if (first && last) add(`${first} ${last}`);
+  return out;
+}
+
 function slugPart(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
@@ -165,11 +216,38 @@ export function competitorHouseFilerId(name: string, state: string, district: st
   return `house-${dst}-${slug}`;
 }
 
-/** Mint the existing `MANUAL-${LASTNAME}` synthetic id convention. */
+/**
+ * Mint the legacy `MANUAL-${LASTNAME}` synthetic id.  Last-name-only ids are
+ * what created the phantom filers (one MANUAL-DELANEY holding two different
+ * people, MANUAL-ELVIRA beside the real Maria Elvira Salazar), so new code
+ * should prefer {@link competitorQualifiedManualFilerId}; this stays for the
+ * existing ids and the repair's last-resort fallback.
+ */
 export function competitorManualFilerId(name: string): string | null {
   const last = extractLastName(name);
   return last ? `MANUAL-${last.toUpperCase()}` : null;
 }
+
+/**
+ * Mint a first-name-qualified `MANUAL-<FIRST>-<LAST>` id.  Returns null for a
+ * bare last name (a single token): the ingest guard refuses to create a filer
+ * from a surname alone.
+ */
+export function competitorQualifiedManualFilerId(name: string): string | null {
+  const cleaned = cleanFilerName(name) || name;
+  const tokens = cleaned
+    .replace(/[.,"']/g, ' ')
+    .split(/\s+/)
+    .map((t) => t.toLowerCase().replace(/[^a-z]/g, ''))
+    .filter((t) => t.length > 1 && !NAME_NOISE_TOKENS.has(t));
+  if (tokens.length < 2) return null;
+  return `MANUAL-${tokens[0].toUpperCase()}-${tokens[tokens.length - 1].toUpperCase()}`;
+}
+
+/** Suffix / honorific tokens ignored when reducing a reporter name to first+last. */
+export const NAME_NOISE_TOKENS: ReadonlySet<string> = new Set([
+  'jr', 'sr', 'ii', 'iii', 'iv', 'md', 'facs', 'phd', 'hon', 'honorable', 'dr', 'mr', 'mrs', 'ms', 'rep', 'sen',
+]);
 
 const CRYPTO_KEYWORDS_RE = /\b(ethereum|bitcoin|sol|sui|usdc|token|coin)\b/i;
 

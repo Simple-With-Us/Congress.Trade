@@ -273,7 +273,7 @@ export function resolveCongressPushoverAppToken(
  */
 export function formatOwnBackupRegimenLine(killEngaged = false): string {
   void killEngaged;
-  return 'Backup: litestream→B2 continuous (5m sync · 24h/168h snapshots) + 6h full-DB snapshots (fleet cron) + Hetzner ~24h volume floor.';
+  return 'Backup: litestream→B2 continuous (15m sync · 24h/168h snapshots) + 6h full-DB snapshots (fleet cron) + Hetzner ~24h volume floor.';
 }
 
 /** Compact message body for the Pushover notification. */

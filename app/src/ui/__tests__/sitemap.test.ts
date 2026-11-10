@@ -41,13 +41,17 @@ function makeEnv(opts: {
 }
 
 describe('staticSitemapUrls', () => {
-  it('always includes the four public views, even before any DB URLs', () => {
+  it('always includes the public views + static pages, even before any DB URLs (CT-2459)', () => {
     const locs = staticSitemapUrls().map((u) => u.loc);
     expect(locs).toEqual([
       'https://congress.trade/',
+      'https://congress.trade/?view=trends',
       'https://congress.trade/?view=trades',
       'https://congress.trade/?view=people',
       'https://congress.trade/?view=subs',
+      'https://congress.trade/pricing',
+      'https://congress.trade/terms-of-service',
+      'https://congress.trade/privacy-policy',
     ]);
   });
 });

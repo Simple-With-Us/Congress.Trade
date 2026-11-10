@@ -512,14 +512,29 @@ export interface DocLlmSpendDecision {
   reason: 'ok' | 'doc_ceiling' | 'already_extracted' | 'meter_unreadable';
 }
 
+/** LlamaParse is a free-credit parser, not an OpenRouter USD call. */
+export function isLlamaParseProvider(provider: string | null | undefined): boolean {
+  return (provider ?? '').trim().toLowerCase() === 'llamaparse';
+}
+
+/** Paid model calls that share the per-doc OpenRouter USD latch. */
+export function isUsdMeteredExtractionProvider(provider: string | null | undefined): boolean {
+  return !isLlamaParseProvider(provider);
+}
+
 /** Lifetime metered USD for one doc_id (all purposes). null when unreadable. */
-export async function readDocLlmSpendUsd(env: Env, docId: string): Promise<number | null> {
+export async function readDocLlmSpendUsd(
+  env: Env,
+  docId: string,
+  opts: { excludeLlamaParse?: boolean } = {},
+): Promise<number | null> {
   const db = (env as Partial<Env>).DB;
   if (!db || typeof db.prepare !== 'function' || !docId.trim()) return null;
   try {
-    const row = await db.prepare(
-      `SELECT COALESCE(SUM(usd), 0) AS usd FROM llm_spend_settlements WHERE doc_id = ?`,
-    ).bind(docId).first<{ usd: number }>();
+    const sql = opts.excludeLlamaParse
+      ? `SELECT COALESCE(SUM(usd), 0) AS usd FROM llm_spend_settlements WHERE doc_id = ? AND lower(provider) != 'llamaparse'`
+      : `SELECT COALESCE(SUM(usd), 0) AS usd FROM llm_spend_settlements WHERE doc_id = ?`;
+    const row = await db.prepare(sql).bind(docId).first<{ usd: number }>();
     return Number(row?.usd) || 0;
   } catch {
     return null;
@@ -544,12 +559,16 @@ export async function docHasExistingTransactions(env: Env, docId: string): Promi
  * Per-doc spend gate + already-extracted skip.
  * - `reprocess: true` (admin / explicit) bypasses the already-extracted skip
  *   but still honors the per-doc USD ceiling.
+ * - `estimatedUsd` (optional) blocks a LIVE call that would overshoot the
+ *   remaining ceiling. Cache hits must not pass this — they cost $0.
+ * - LlamaParse is exempt from the OpenRouter per-doc USD latch (H-2026-9116328).
+ *   Its own daily credit ceiling still applies via checkLlmSpendCeiling.
  * - Meter unreadable → fail open (same as daily ceiling).
  */
 export async function checkDocLlmSpendAllowed(
   env: Env,
   docId: string,
-  opts: { reprocess?: boolean } = {},
+  opts: { reprocess?: boolean; estimatedUsd?: number; provider?: string } = {},
 ): Promise<DocLlmSpendDecision> {
   const ceiling = (await resolveUsdKnob(env, 'LLM_DOC_USD_CEILING', DEFAULT_LLM_DOC_USD_CEILING))
     ?? DEFAULT_LLM_DOC_USD_CEILING;
@@ -564,7 +583,7 @@ export async function checkDocLlmSpendAllowed(
       };
     }
   }
-  const spent = await readDocLlmSpendUsd(env, docId);
+  const spent = await readDocLlmSpendUsd(env, docId, { excludeLlamaParse: true });
   if (spent == null) {
     return {
       allowed: true,
@@ -574,7 +593,19 @@ export async function checkDocLlmSpendAllowed(
       reason: 'meter_unreadable',
     };
   }
-  if (spent >= ceiling) {
+  if (isLlamaParseProvider(opts.provider)) {
+    return {
+      allowed: true,
+      docId,
+      spentUsd: spent,
+      ceilingUsd: ceiling,
+      reason: 'ok',
+    };
+  }
+  const estimated = Number.isFinite(opts.estimatedUsd) && (opts.estimatedUsd ?? 0) > 0
+    ? Number(opts.estimatedUsd)
+    : 0;
+  if (spent >= ceiling || spent + estimated > ceiling) {
     return {
       allowed: false,
       docId,
@@ -616,7 +647,7 @@ export function isLlmDocBudgetHalt(error: unknown): boolean {
 export async function assertDocLlmSpendAllowed(
   env: Env,
   docId: string,
-  opts: { reprocess?: boolean } = {},
+  opts: { reprocess?: boolean; estimatedUsd?: number; provider?: string } = {},
 ): Promise<void> {
   const decision = await checkDocLlmSpendAllowed(env, docId, opts);
   if (!decision.allowed) throw new LlmDocBudgetExceededError(decision);

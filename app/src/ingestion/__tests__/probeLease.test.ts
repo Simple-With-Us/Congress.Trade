@@ -303,11 +303,27 @@ describe('server-preferred lane assignment', () => {
     expect(await readProbeLease(h.env, 'quiver', T0)).toBeNull();
   });
 
+  it('reclaims a handed-off provider when no Mac lease is live (scout retired)', async () => {
+    await planServerLatencyProbe(h.env, T0);
+    setHandoff(h.kv, 'quiver', true);
+    const handoff = await planServerLatencyProbe(h.env, new Date(T0.getTime() + 60_000));
+    expect(handoff.lanes.find((l) => l.provider === 'quiver')?.action).toBe('handed_off');
+    expect(await readProbeLease(h.env, 'quiver', T0)).toBeNull();
+
+    const reclaim = await planServerLatencyProbe(h.env, new Date(T0.getTime() + 120_000));
+    const quiver = reclaim.lanes.find((l) => l.provider === 'quiver');
+    expect(quiver?.probe).toBe(true);
+    expect(quiver?.action).toBe('acquired');
+    expect(reclaim.probeProviders).toEqual(expect.arrayContaining(['quiver']));
+  });
+
   it('never calls the probe with an empty provider list', async () => {
     // An empty `providers` array makes tradeLatency fall back to ALL providers,
     // which would silently undo the exclusion. It must not be called at all.
     setHandoff(h.kv, 'quiver', true);
     setHandoff(h.kv, 'unusual_whales', true);
+    await requestMacProbeLease(h.env, { provider: 'quiver', holderId: 'mac-laptop', now: T0 });
+    await requestMacProbeLease(h.env, { provider: 'unusual_whales', holderId: 'mac-laptop', now: T0 });
     const calls: LatencyProbeProviderId[][] = [];
     const outcome = await runLeasedLatencyProbe(
       h.env,
@@ -324,6 +340,7 @@ describe('server-preferred lane assignment', () => {
 
   it('passes only the leased providers to the probe', async () => {
     setHandoff(h.kv, 'quiver', true);
+    await requestMacProbeLease(h.env, { provider: 'quiver', holderId: 'mac-laptop', now: T0 });
     const calls: LatencyProbeProviderId[][] = [];
     await runLeasedLatencyProbe(
       h.env,
@@ -431,10 +448,16 @@ describe('bounded Mac tenure and handback', () => {
       holderId: 'mac-laptop',
       now: T0,
     });
-    const plan = await planServerLatencyProbe(h.env, new Date(T0.getTime() + 3 * HOUR));
+    const mid = new Date(T0.getTime() + 3 * HOUR);
+    await requestMacProbeLease(h.env, {
+      provider: 'quiver',
+      holderId: 'mac-laptop',
+      now: mid,
+    });
+    const plan = await planServerLatencyProbe(h.env, mid);
     const quiver = plan.lanes.find((l) => l.provider === 'quiver');
     expect(quiver?.probe).toBe(false);
-    expect((await readProbeLease(h.env, 'quiver', T0))?.holder).toBe('mac');
+    expect((await readProbeLease(h.env, 'quiver', mid))?.holder).toBe('mac');
   });
 
   it('drops the Mac lease the moment the server recovers', async () => {

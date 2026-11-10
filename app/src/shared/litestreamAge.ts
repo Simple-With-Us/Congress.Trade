@@ -2,6 +2,9 @@
 
 export const DEFAULT_CT_LTX0_DIR = "/data/congress-trade/.db.sqlite-litestream/ltx/0";
 
+/** Health probe marks replicating while L0 is newer than 2x the 15m sync-interval. */
+export const LITESTREAM_REPLICATING_MAX_AGE_SEC = 30 * 60;
+
 export interface LocalLitestreamAge {
   litestreamAgeSeconds: number | null;
   litestreamLastSyncAt: string | null;
@@ -35,7 +38,7 @@ export async function readLocalLitestreamAge(
     return {
       litestreamAgeSeconds: age,
       litestreamLastSyncAt: new Date(newest).toISOString(),
-      litestreamStatus: age < 15 * 60 ? "replicating" : "unknown",
+      litestreamStatus: age < LITESTREAM_REPLICATING_MAX_AGE_SEC ? "replicating" : "unknown",
     };
   } catch {
     return UNKNOWN;

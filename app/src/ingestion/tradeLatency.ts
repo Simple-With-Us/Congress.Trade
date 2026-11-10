@@ -31,6 +31,12 @@ import {
 import { logProbeCadence } from './probeCadenceLog.ts';
 import { ALL_CHAMBERS, previousSuccessfulProbeAt, recordProbeRun } from './probeRunLog.ts';
 import { scheduleCtPublishSnapshot } from './latencyPriceSnapshots.ts';
+import {
+  closeProviderMissingStubIfOfficialPersisted,
+  enqueueOfficialSenateFromProviderObservation,
+  findOfficialCounterpartDocIdForObservation,
+} from './providerMissingStubClose.ts';
+import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 type Chamber = 'house' | 'senate' | 'executive';
 /**
@@ -66,11 +72,10 @@ type EnvWithWatch = Env & {
   /** @deprecated Latency probes use FMP_LATENCY_API_KEY (+ secondary) only. */
   FMP_API_KEY?: string;
   FMP_DAILY_CALL_CAP?: string;
-  FMP_MAX_PER_MINUTE?: string;
   FMP_DISCLOSURE_WATCH_ENABLED?: string;
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias used in global-api-keys / Infisical (no underscores in “unusualwhales”). */
+  /** Alias used in Infisical (no underscores in “unusualwhales”). */
   UNUSUALWHALES_API_KEY?: string;
   QUIVER_API_KEY?: string;
   QUIVER_API_TOKEN?: string;
@@ -94,10 +99,13 @@ type EnvWithWatch = Env & {
   /**
    * Comma-separated FMP path ids eligible when FMP_LATENCY_PROBE_ENABLED is on:
    * `stable` (id=fmp) and/or `rapidapi` (id=fmp_rapidapi).
-   * Default **stable only** — the RapidAPI FMP product authenticates but does
-   * **not** expose house/senate-latest (HTTP 404 verified 2026-08-06). Opt in
-   * with `stable,rapidapi` if the marketplace product gains those endpoints;
-   * when both are enabled the probe loop **rotates** (one path per cycle).
+   * Default **stable only**. RapidAPI FMP authenticates (`/v3/profile/AAPL`
+   * 200) but has no house/senate-latest (404) and no OGE/executive-latest
+   * (stable 404; RapidAPI 400, same as company key-executives — not an OGE
+   * feed). Rechecked 2026-09-04. Dual free-tier keys on stable are the
+   * congress probe. Opt in with `stable,rapidapi` only if the marketplace
+   * later lists those disclosure endpoints; when both are enabled the probe
+   * loop **rotates** (one path per cycle).
    */
   FMP_LATENCY_PATHS?: string;
   /** Override base for stable FMP disclosures (default financialmodelingprep.com/stable). */
@@ -679,17 +687,47 @@ function fmpHttp429DayKey(slot: FmpLatencyKeySlot, now = new Date()): string {
   return `fmp-latency:http429:key${slot}:` + now.toISOString().slice(0, 10);
 }
 
-/** Mark a free-tier key as FMP-bandwidth-exhausted for the UTC day. */
+/**
+ * Mark a free-tier key unusable for the rest of the UTC day.
+ * Used for FMP 429 (bandwidth cap) and for 401/403 (unauthorized / wrong plan)
+ * so the other key keeps winning selection instead of the dead one.
+ */
+export type FmpSlotDaySkipCause = '429' | 'unauthorized';
+
 export async function markFmpSlotHttp429(
   env: Env,
   slot: FmpLatencyKeySlot,
   now = new Date(),
+  cause: FmpSlotDaySkipCause = '429',
 ): Promise<void> {
   try {
-    await env.CONFIG_KV.put(fmpHttp429DayKey(slot, now), '1', { expirationTtl: 172800 });
+    await env.CONFIG_KV.put(fmpHttp429DayKey(slot, now), cause, { expirationTtl: 172800 });
   } catch {
     /* best effort */
   }
+}
+
+export async function readFmpSlotHttp429Cause(
+  env: Env,
+  slot: FmpLatencyKeySlot,
+  now = new Date(),
+): Promise<FmpSlotDaySkipCause | null> {
+  try {
+    const raw = await env.CONFIG_KV.get(fmpHttp429DayKey(slot, now));
+    if (raw === '429' || raw === 'unauthorized') return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** True only for bandwidth-cap (429) day marks — used for self-healing silence, not slot skip. */
+export async function isFmpSlotHttp429DayBan(
+  env: Env,
+  slot: FmpLatencyKeySlot,
+  now = new Date(),
+): Promise<boolean> {
+  return (await readFmpSlotHttp429Cause(env, slot, now)) === '429';
 }
 
 export async function isFmpSlotHttp429(
@@ -1148,6 +1186,16 @@ async function resolveFmpLatencyKeyMaterial(
   return null;
 }
 
+/** Key slots with configured material (same resolution as {@link selectFmpLatencyKey}). */
+export async function listConfiguredFmpLatencySlots(env: Env): Promise<FmpLatencyKeySlot[]> {
+  const slots: FmpLatencyKeySlot[] = [];
+  const primary = await resolveFmpLatencyKeyMaterial(env, '1');
+  if (primary) slots.push('1');
+  const secondary = await resolveFmpLatencyKeyMaterial(env, '2', primary?.apiKey ?? null);
+  if (secondary) slots.push('2');
+  return slots;
+}
+
 /**
  * Pick a configured free-tier latency key that still has budget and whose poll
  * spacing has elapsed. **Alternates** among eligible keys (round-robin) so dual
@@ -1158,7 +1206,7 @@ async function resolveFmpLatencyKeyMaterial(
 export async function selectFmpLatencyKey(
   env: Env,
   now: Date = new Date(),
-  opts: { force?: boolean; schedule?: ProbeScheduleConfig } = {},
+  opts: { force?: boolean; schedule?: ProbeScheduleConfig; peek?: boolean } = {},
 ): Promise<FmpLatencyKeySelection | null> {
   const cap = await fmpLatencyDailyCap(env);
   const schedule = opts.schedule ?? latencyScheduleConfig(env);
@@ -1216,6 +1264,9 @@ export async function selectFmpLatencyKey(
   if (!candidates.length) return null;
   // Stable order for rotation (slot 1 then 2); round-robin among eligible.
   candidates.sort((a, b) => a.slot.localeCompare(b.slot));
+  // peek: path eligibility must not advance the key rotator. The probe
+  // itself is the only caller that spends a rotation tick.
+  if (opts.peek) return candidates[0]!;
   const pickedSlot = await selectRotatedAvenue(
     env,
     'fmp-key',
@@ -1225,13 +1276,15 @@ export async function selectFmpLatencyKey(
 }
 
 /**
- * Among enabled FMP paths present in the requested provider list, pick exactly
- * one path for this probe cycle (round-robin). Returns null when no path is
- * eligible (probe off / filtered out of FMP_LATENCY_PATHS / not requested).
+ * Congress disclosure probes use the stable host only.
  *
- * RapidAPI is only eligible when a marketplace key is present
- * (`FMP_RAPIDAPI_KEY` or shared `RAPIDAPI_KEY`) AND its daily budget remains —
- * never authenticated with free-tier FMP_LATENCY_* keys (ST pattern).
+ * RapidAPI's FMP product authenticates, but house-latest and senate-latest
+ * return 404 (rechecked 2026-09-04; executive-latest is not an OGE feed).
+ * Rotating a cycle onto that host would skip a working stable probe. A
+ * request that names `fmp_rapidapi` still resolves to `stable` when a
+ * free-tier key can spend — RapidAPI does not replace those probes.
+ * Returns null when the master switch is off, FMP was not requested, or
+ * every free-tier key is capped / marked failed for the UTC day.
  */
 export async function selectFmpLatencyPathForCycle(
   env: Env,
@@ -1239,35 +1292,11 @@ export async function selectFmpLatencyPathForCycle(
   opts: { force?: boolean } = {},
 ): Promise<FmpLatencyPathId | null> {
   if (!(await isFmpProbeEnabled(env))) return null;
-  const enabled = await enabledFmpPathIds(env);
-  const candidates: FmpLatencyPathId[] = [];
-  for (const path of FMP_LATENCY_PATHS) {
-    if (!enabled.has(path.pathId)) continue;
-    if (!requestedProviderIds.includes(path.providerId)) continue;
-    if (path.pathId === 'rapidapi') {
-      const rapidKey = await resolveFmpRapidApiKey(env);
-      if (!rapidKey) continue;
-      // Skip RapidAPI this cycle when its independent daily budget/spacing is exhausted.
-      const rapidBudget = await selectLatencySourceProbe(env, 'fmp_rapidapi', new Date(), {
-        force: opts.force,
-      });
-      if (!rapidBudget && !opts.force) continue;
-      // force still needs remaining budget (cap), only bypasses spacing.
-      if (!rapidBudget && opts.force) {
-        const cap = await latencySourceDailyCap(env, 'fmp_rapidapi');
-        const used = await getLatencySourceUsed(env, 'fmp_rapidapi');
-        if (cap - used < FMP_LATENCY_CALLS_PER_RUN) continue;
-      }
-    } else if (path.pathId === 'stable') {
-      // Free-tier dual keys only on stable host.
-      const keySel = await selectFmpLatencyKey(env, new Date(), { force: opts.force });
-      if (!keySel) continue;
-    }
-    candidates.push(path.pathId);
-  }
-  if (!candidates.length) return null;
-  const picked = await selectRotatedAvenue(env, 'fmp-path', candidates);
-  return (picked as FmpLatencyPathId | null) ?? null;
+  const wantsCongressProbe =
+    requestedProviderIds.includes('fmp') || requestedProviderIds.includes('fmp_rapidapi');
+  if (!wantsCongressProbe) return null;
+  const keySel = await selectFmpLatencyKey(env, new Date(), { force: opts.force, peek: true });
+  return keySel ? 'stable' : null;
 }
 
 /**
@@ -1406,7 +1435,7 @@ const PROVIDERS: ProviderDefinition[] = [
     timestampKind: 'monitor',
     fmpPathId: 'stable',
     reason:
-      'FMP stable host (financialmodelingprep.com). Default ON for CT latency when keys present; set FMP_LATENCY_PROBE_ENABLED=false to disable. Dual free-tier keys (FMP_LATENCY_API_KEY + _2, or FMP_API_KEY as slot-2 fallback) rotate for ~2× capacity — no known per-IP limit. RapidAPI path is opt-in only (congress endpoints not on RapidAPI product as of 2026-08). No provider first-seen timestamp; monitor first-observed is used.',
+      'FMP stable host (financialmodelingprep.com) house-latest + senate-latest. Default ON for CT latency when a free-tier key is present; set FMP_LATENCY_PROBE_ENABLED=false to disable. Dual keys (FMP_LATENCY_API_KEY + FMP_LATENCY_API_KEY_2, or FMP_API_KEY as slot-2 fallback) fail over: a 429, daily cap, or 401/403 on one key leaves the other probing. RapidAPI is not a congress disclosure path (those routes 404). No provider first-seen timestamp; monitor first-observed is used.',
     fetchRows: (apiKey, max, fetchImpl, pace, opts) =>
       fetchFmpRows(apiKey, max, fetchImpl, pace, {
         baseUrl: opts?.baseUrl ?? FMP_LATENCY_PATHS[0]!.defaultBaseUrl,
@@ -1424,7 +1453,7 @@ const PROVIDERS: ProviderDefinition[] = [
     timestampKind: 'monitor',
     fmpPathId: 'rapidapi',
     reason:
-      'FMP via RapidAPI (FMP_RAPIDAPI_KEY or shared RAPIDAPI_KEY). OPT-IN only: RapidAPI FMP product auth works but house/senate-latest return 404 (product gap, not bad key — verified 2026-08-06). Default FMP_LATENCY_PATHS=stable. Enable with FMP_LATENCY_PATHS=stable,rapidapi if marketplace adds congress endpoints.',
+      'Not a congress disclosure probe. RapidAPI FMP house-latest and senate-latest return HTTP 404 (rechecked 2026-09-04); executive-latest is not an OGE feed. Listing rapidapi in FMP_LATENCY_PATHS does not spend marketplace quota on those routes and does not replace the stable dual-key probes. Ticker enrichment stays with Socratic.Trade.',
     fetchRows: (apiKey, max, fetchImpl, pace, opts) =>
       fetchFmpRows(apiKey, max, fetchImpl, pace, {
         baseUrl: opts?.baseUrl ?? FMP_LATENCY_PATHS[1]!.defaultBaseUrl,
@@ -1504,11 +1533,11 @@ export async function isFmpProbeEnabled(env: Env): Promise<boolean> {
 }
 
 /**
- * Which FMP paths are eligible when the master probe switch is on.
- * Default **stable only** — RapidAPI FMP marketplace product does not expose
- * house/senate-latest (HTTP 404; key auth still works for /v3/profile etc.).
- * Opt in with FMP_LATENCY_PATHS=stable,rapidapi; when both are set the probe
- * loop rotates (one path per cycle). Empty/invalid config falls back to stable.
+ * Which FMP paths the operator listed. Congress disclosure probes do **not**
+ * honor `rapidapi` here: house/senate-latest 404 on that product, so selecting
+ * it would skip a stable cycle. `selectFmpLatencyPathForCycle` always returns
+ * `stable` when a free-tier key can spend. Empty/invalid config falls back to
+ * stable. RapidAPI stays in the registry so status can explain the skip.
  */
 export async function enabledFmpPathIds(env: Env): Promise<Set<FmpLatencyPathId>> {
   const envx = env as EnvWithWatch;
@@ -2077,6 +2106,10 @@ export interface FetchFmpRowsOpts {
 /**
  * Fetch house+senate latest disclosures from an FMP path (stable or RapidAPI).
  * Path bases are injectable so alternate hosts can race without code edits.
+ *
+ * FMP has no OGE/executive-latest feed (stable HTTP 404; RapidAPI 400 is the
+ * same gateway rejection as company key-executives, not political 278-T).
+ * Rechecked 2026-09-04. Do not add fetchOne('executive') until that 200s.
  */
 async function fetchFmpRows(
   apiKey: string,
@@ -2174,7 +2207,25 @@ function providerOnlyDocId(row: DisclosureProviderRow): string {
   return `provider-missing-${row.provider}-${row.chamber}-${key}`;
 }
 
-async function routeProviderOnlyObservationsToReview(
+/**
+ * review_queue payload for a provider-only stub, capped at PAYLOAD_LIMIT.
+ * Slicing the whole JSON leaves invalid JSON, which loses provider/providerKey
+ * for the official-side reconcile (providerMissingStubClose.ts).  When the
+ * payload is over the cap, drop the raw provider payload first so the identity
+ * fields stay parseable.  Exported for unit tests.
+ */
+export function providerStubReviewPayload(
+  fields: { payload: unknown } & Record<string, unknown>,
+  limit = PAYLOAD_LIMIT,
+): string {
+  const full = JSON.stringify(fields);
+  if (full.length <= limit) return full;
+  const compact = JSON.stringify({ ...fields, payload: null, payloadTruncated: true });
+  return compact.slice(0, limit);
+}
+
+/** Exported for unit tests. */
+export async function routeProviderOnlyObservationsToReview(
   env: Env,
   provider: ProviderId,
   rows: DisclosureProviderRow[],
@@ -2183,13 +2234,17 @@ async function routeProviderOnlyObservationsToReview(
   for (const row of rows) {
     if (row.chamber !== 'house' && row.chamber !== 'senate') continue;
     const docId = providerOnlyDocId(row);
+    const closeResult = await closeProviderMissingStubIfOfficialPersisted(env, row, docId, nowIso);
+    if (closeResult.officialDocId) continue;
+
+    // Official Senate PTR URL/UUID from the provider feed: enqueue S-{uuid}
+    // and skip the synthetic review stub.  House PDF ids stay on the stub path.
+    if (await enqueueOfficialSenateFromProviderObservation(env, row, nowIso)) continue;
+
+    if (await findOfficialCounterpartDocIdForObservation(env.DB, row)) continue;
+
     const exists1 = await get<{ doc_id: string }>(env.DB, `SELECT doc_id FROM filings WHERE doc_id = ? LIMIT 1`, [docId]);
     if (exists1) continue;
-
-    if (row.sourceUrl) {
-      const exists2 = await get<{ doc_id: string }>(env.DB, `SELECT doc_id FROM filings WHERE source_url = ? LIMIT 1`, [row.sourceUrl]);
-      if (exists2) continue;
-    }
 
     const exists3 = await get<{ doc_id: string }>(
       env.DB,
@@ -2198,7 +2253,7 @@ async function routeProviderOnlyObservationsToReview(
     );
     if (exists3) continue;
 
-    const payload = JSON.stringify({
+    const payload = providerStubReviewPayload({
       reason: 'provider_discovered_missing_official',
       provider,
       providerKey: row.providerKey,
@@ -2207,8 +2262,12 @@ async function routeProviderOnlyObservationsToReview(
       filerName: row.filerName,
       sourceUrl: row.sourceUrl,
       payload: row.payload,
-    }).slice(0, PAYLOAD_LIMIT);
+    });
 
+    // No notifyReviewQueuePublisher here: a provider-only stub is a synthetic
+    // lead that the hourly sweep closes as verified_empty (or rejects as a
+    // duplicate once the official filing persists).  It never needs a human,
+    // so waking the Publisher with review_queue.entered for it is pure noise.
     await batch(env.DB, [
       [
         `INSERT OR IGNORE INTO filings
@@ -2249,18 +2308,30 @@ async function resolveProviderSecret(env: Env, provider: ProviderDefinition): Pr
 async function providerStatus(env: Env, provider: ProviderDefinition): Promise<DisclosureLatencyProviderStatus> {
   const configured = provider.secretNames.length === 0 || Boolean(await resolveProviderSecret(env, provider));
   const fmpProbeOn = isFmpFamilyProvider(provider.id) ? await isFmpProbeEnabled(env) : true;
-  const paths = isFmpFamilyProvider(provider.id) ? await enabledFmpPathIds(env) : null;
-  const pathEnabled =
-    !provider.fmpPathId || !paths ? true : paths.has(provider.fmpPathId);
+  const requested = provider.supportsDirectLatest
+    ? await requestedProviderIds(env as EnvWithWatch)
+    : null;
 
   let operationalStatus: LatencySourceStatus = 'unknown';
   let reason = provider.reason;
-  if (isFmpFamilyProvider(provider.id) && (!fmpProbeOn || !pathEnabled)) {
-    // Intentional disable — grey OFF, not red stopped.
+  if (provider.fmpPathId === 'rapidapi') {
+    // Grey OFF even when FMP_LATENCY_PATHS lists rapidapi. Those congress
+    // routes 404, so this lane must not look "running" or replace stable.
     operationalStatus = 'off';
-    reason = !fmpProbeOn
-      ? 'OFF: FMP_LATENCY_PROBE_ENABLED is false/off (explicit disable)'
-      : `OFF: FMP path "${provider.fmpPathId}" not in FMP_LATENCY_PATHS`;
+    reason =
+      'OFF: RapidAPI FMP has no house/senate-latest (HTTP 404) and no OGE executive feed (rechecked 2026-09-04). Stable dual-key probes are the congress disclosure lane. Marketplace quota is not spent on these routes.';
+  } else if (isFmpFamilyProvider(provider.id) && !fmpProbeOn) {
+    // Intentional disable — grey OFF, not red stopped.
+    // Stable stays eligible when the probe is on even if FMP_LATENCY_PATHS
+    // omitted it (a rapidapi-only list must not silence house/senate).
+    operationalStatus = 'off';
+    reason = 'OFF: FMP_LATENCY_PROBE_ENABLED is false/off (explicit disable)';
+  } else if (requested && !requested.includes(provider.id)) {
+    // Filtered out of the probe set — the documented way to retire a
+    // provider (e.g. a dropped subscription) without deleting its key or
+    // its historical observations. Grey OFF, not red error-by-age.
+    operationalStatus = 'off';
+    reason = `OFF: "${provider.id}" not in DISCLOSURE_LATENCY_PROVIDERS`;
   } else if (!provider.supportsDirectLatest) {
     operationalStatus = 'stopped';
   } else if (!configured) {
@@ -2280,8 +2351,24 @@ async function providerStatus(env: Env, provider: ProviderDefinition): Promise<D
       if (Number.isFinite(ms)) {
         const ageH = (Date.now() - ms) / 3_600_000;
         if (ageH > 24) {
-          operationalStatus = 'error';
-          reason = `${provider.label} last observation ${Math.round(ageH)}h ago (threshold 24h)`;
+          let lastOkMs = NaN;
+          try {
+            const run = await get<{ last_ok: string | null }>(
+              env.DB,
+              'SELECT MAX(ran_at) AS last_ok FROM provider_probe_runs WHERE provider = ? AND ok = 1',
+              [provider.id],
+            );
+            lastOkMs = run?.last_ok ? Date.parse(run.last_ok) : NaN;
+          } catch {
+            /* table may not exist yet */
+          }
+          const lastOkAgeH = Number.isFinite(lastOkMs) ? (Date.now() - lastOkMs) / 3_600_000 : Infinity;
+          if (lastOkAgeH <= 24) {
+            reason = `${provider.label} last new observation ${Math.round(ageH)}h ago; probes still succeeding (${Math.round(lastOkAgeH)}h)`;
+          } else {
+            operationalStatus = 'error';
+            reason = `${provider.label} last observation ${Math.round(ageH)}h ago (threshold 24h)`;
+          }
         }
       }
     } catch {
@@ -2308,6 +2395,49 @@ export async function getDisclosureLatencyProviderStatuses(env: Env): Promise<Di
   return statuses;
 }
 
+/**
+ * Provider ids the current config expects to be producing latency
+ * observations: the requested set (DISCLOSURE_LATENCY_PROVIDERS, default all
+ * direct providers) minus providers whose switches or keys rule them out.
+ * Feeds pipelineHealth's latency_probes check so an intentionally retired
+ * provider (dropped subscription, filtered out or key removed) stops paging,
+ * while a provider that SHOULD run still pages when it goes quiet.
+ *
+ * Membership providers (UW/Quiver) are key-gated: removing the key is a
+ * deliberate retire, matching how dropped subscriptions are handled.  The
+ * FMP family is switch-gated only (FMP_LATENCY_PROBE_ENABLED /
+ * FMP_LATENCY_PATHS) — a missing FMP key with the switch still on is a
+ * misconfiguration that must page, not a retire.
+ *
+ * Empty set when the disclosure-latency watch itself is off — callers decide
+ * how loud "nothing is expected to run" should be.
+ */
+/** Config-intended latency providers (before auth-rejection latch). */
+export async function configExpectedLatencyProviderIds(env: Env): Promise<Set<string>> {
+  const envx = env as EnvWithWatch;
+  const out = new Set<string>();
+  if (!(await enabled(envx))) return out;
+  for (const id of await requestedProviderIds(envx)) {
+    const def = definition(id);
+    if (!def.supportsDirectLatest) continue;
+    if (isFmpFamilyProvider(id)) {
+      if (!(await isFmpProbeEnabled(env))) continue;
+      if (def.fmpPathId && !(await enabledFmpPathIds(env)).has(def.fmpPathId)) continue;
+    } else if (!(await resolveProviderSecret(env, def))) {
+      continue;
+    }
+    out.add(id);
+  }
+  return out;
+}
+
+export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>> {
+  const out = await configExpectedLatencyProviderIds(env);
+  const { latencyProvidersWithRejectedCredentials } = await import('./scoutHandoff.ts');
+  for (const id of await latencyProvidersWithRejectedCredentials(env)) out.delete(id);
+  return out;
+}
+
 
 interface TradeLatencyTxContext {
   id: string;
@@ -2317,6 +2447,7 @@ interface TradeLatencyTxContext {
   tx_type: string | null;
   filed_date: string | null;
   first_seen_at: string | null;
+  prev_probe_at: string | null;
   chamber: Chamber | null;
   source_url: string | null;
   filer_name: string | null;
@@ -2342,6 +2473,7 @@ async function loadTradeLatencyTxContexts(
       `SELECT t.id, t.doc_id, t.ticker, t.tx_date, t.tx_type, t.source AS source,
               COALESCE(t.filed_date, f.filed_date) AS filed_date,
               COALESCE(t.first_seen_at, f.first_seen_at) AS first_seen_at,
+              f.prev_probe_at AS prev_probe_at,
               f.chamber AS chamber,
               f.source_url AS source_url,
               fil.full_name AS filer_name
@@ -2377,7 +2509,16 @@ export async function recordTradeLatencyCandidates(
   // stamp for live imports), so the very next per-minute tick can capture it
   // LIVE instead of it aging into a backfill before a row even exists. See
   // latencyPriceSnapshots.ts's module header.
-  const ctPublishRows: Array<{ trade_hash: string; ticker: string | null; provider: ProviderId; congress_first_seen_at: string }> = [];
+  const ctPublishRows: Array<{
+    trade_hash: string;
+    ticker: string | null;
+    provider: ProviderId;
+    congress_first_seen_at: string;
+    isOption?: boolean | null;
+    assetType?: string | null;
+    assetTypeName?: string | null;
+    assetName?: string | null;
+  }> = [];
   for (const provider of DIRECT_PROVIDER_IDS) {
     for (const tx of transactions) {
       const ctx = contexts.get(tx.id);
@@ -2400,13 +2541,23 @@ export async function recordTradeLatencyCandidates(
       if (!extractLastName(filerName)) continue;
       // Keep the real first_seen for live imports (no clamp-to-now for recent stamps).
       const firstSeen = raceFirstSeenAt(firstSeenRaw, nowIso, LATENCY_PROVIDER_MATCH_LOOKBACK_HOURS);
+      const congressWindowStart = ctx?.prev_probe_at || null;
       mintedHashes.add(trade_hash);
-      ctPublishRows.push({ trade_hash, ticker: tx.ticker || ctx?.ticker || null, provider, congress_first_seen_at: firstSeen });
+      ctPublishRows.push({
+        trade_hash,
+        ticker: tx.ticker || ctx?.ticker || null,
+        provider,
+        congress_first_seen_at: firstSeen,
+        isOption: tx.isOption,
+        assetType: tx.assetType,
+        assetTypeName: tx.assetTypeName ?? null,
+        assetName: tx.assetName,
+      });
       updates.push([
         `INSERT INTO trade_latency_candidates
            (trade_hash, doc_id, provider, chamber, source_url, filed_date, filer_name, ticker, tx_date, tx_type,
-            congress_first_seen_at, status, attempts, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            congress_first_seen_at, congress_window_start, status, attempts, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
          ON CONFLICT(trade_hash, provider) DO UPDATE SET
            doc_id = excluded.doc_id,
            chamber = excluded.chamber,
@@ -2423,6 +2574,7 @@ export async function recordTradeLatencyCandidates(
              THEN excluded.congress_first_seen_at
              ELSE trade_latency_candidates.congress_first_seen_at
            END,
+           congress_window_start = COALESCE(trade_latency_candidates.congress_window_start, excluded.congress_window_start),
            updated_at = excluded.updated_at`,
         [
           trade_hash,
@@ -2436,6 +2588,7 @@ export async function recordTradeLatencyCandidates(
           tx.txDate || ctx?.tx_date || null,
           tx.txType || ctx?.tx_type || null,
           firstSeen,
+          congressWindowStart,
           nowIso,
           nowIso,
         ],
@@ -2526,6 +2679,21 @@ async function matchJustMintedCandidates(
   }
 }
 
+/** Instrument flags the snapshot gate needs. Scan/seed used to drop these. */
+function instrumentFieldsFromPersistedTx(row: {
+  is_option?: number | boolean | null;
+  asset_type?: string | null;
+  asset_type_name?: string | null;
+  asset_name?: string | null;
+}): Pick<Transaction, 'isOption' | 'assetType' | 'assetTypeName' | 'assetName'> {
+  return {
+    isOption: row.is_option === 1 || row.is_option === true,
+    assetType: row.asset_type ?? null,
+    assetTypeName: row.asset_type_name ?? null,
+    assetName: (row.asset_name || '').trim(),
+  };
+}
+
 /** Backfill trade-latency candidates from recent persisted transactions. */
 export async function backfillTradeLatencyCandidates(
   env: Env,
@@ -2547,6 +2715,10 @@ export async function backfillTradeLatencyCandidates(
     source_url: string | null;
     chamber: string | null;
     source: string | null;
+    is_option: number | boolean | null;
+    asset_type: string | null;
+    asset_type_name: string | null;
+    asset_name: string | null;
   }>(
     env.DB,
     `SELECT t.id, t.doc_id, t.ticker, t.tx_date, t.tx_type, t.source AS source,
@@ -2555,7 +2727,8 @@ export async function backfillTradeLatencyCandidates(
             t.created_at AS created_at,
             fil.full_name AS full_name,
             f.source_url AS source_url,
-            f.chamber AS chamber
+            f.chamber AS chamber,
+            t.is_option, t.asset_type, t.asset_type_name, t.asset_name
        FROM transactions t
        LEFT JOIN filings f ON f.doc_id = t.doc_id
        LEFT JOIN filers fil ON fil.bioguide_id = COALESCE(t.filer_id, f.filer_id)
@@ -2590,13 +2763,10 @@ export async function backfillTradeLatencyCandidates(
       filerId: null,
       txDate: row.tx_date,
       owner: null,
-      assetName: '',
       ticker: row.ticker,
-      assetType: null,
       txType: (row.tx_type as Transaction['txType']) || 'E',
       amountMin: null,
       amountMax: null,
-      isOption: false,
       capGainsOver200: false,
       rawText: '',
       confidence: 1,
@@ -2607,6 +2777,7 @@ export async function backfillTradeLatencyCandidates(
       filedDate: row.filed_date,
       firstSeenAt,
       sourceUrl: row.source_url,
+      ...instrumentFieldsFromPersistedTx(row),
     });
   }
   await recordTradeLatencyCandidates(env, asTx, nowIso);
@@ -2765,12 +2936,17 @@ async function seedCandidatesFromRecentObservations(
       chamber: string | null;
       filed_date: string | null;
       source: string | null;
+      is_option: number | boolean | null;
+      asset_type: string | null;
+      asset_type_name: string | null;
+      asset_name: string | null;
     }>(
       env.DB,
       `SELECT t.id, t.doc_id, t.ticker, t.tx_date, t.tx_type, t.created_at, t.source AS source,
               COALESCE(t.first_seen_at, f.first_seen_at, t.created_at) AS first_seen_at,
               fil.full_name AS full_name, f.source_url AS source_url,
-              f.chamber AS chamber, COALESCE(t.filed_date, f.filed_date) AS filed_date
+              f.chamber AS chamber, COALESCE(t.filed_date, f.filed_date) AS filed_date,
+              t.is_option, t.asset_type, t.asset_type_name, t.asset_name
          FROM transactions t
          LEFT JOIN filings f ON f.doc_id = t.doc_id
          LEFT JOIN filers fil ON fil.bioguide_id = COALESCE(t.filer_id, f.filer_id)
@@ -2796,6 +2972,10 @@ async function seedCandidatesFromRecentObservations(
       chamber: string | null;
       filed_date: string | null;
       source: string | null;
+      is_option: number | boolean | null;
+      asset_type: string | null;
+      asset_type_name: string | null;
+      asset_name: string | null;
     }>);
 
     for (const r of rows) {
@@ -2826,13 +3006,10 @@ async function seedCandidatesFromRecentObservations(
         filerId: null,
         txDate: r.tx_date,
         owner: null,
-        assetName: '',
         ticker: r.ticker,
-        assetType: null,
         txType: (r.tx_type as Transaction['txType']) || 'E',
         amountMin: null,
         amountMax: null,
-        isOption: false,
         capGainsOver200: false,
         rawText: '',
         confidence: 1,
@@ -2843,6 +3020,7 @@ async function seedCandidatesFromRecentObservations(
         filedDate: r.filed_date,
         firstSeenAt: firstSeen,
         sourceUrl: r.source_url,
+        ...instrumentFieldsFromPersistedTx(r),
       });
     }
   }
@@ -3678,6 +3856,26 @@ async function runProviderProbe(
     }
   };
 
+  const { shouldThrottleAuthRejectedLatencyProbe } = await import('./scoutHandoff.ts');
+  const membershipId = provider.id === 'unusual_whales' || provider.id === 'quiver'
+    ? provider.id
+    : null;
+  if (
+    membershipId
+    && await shouldThrottleAuthRejectedLatencyProbe(env, membershipId, now, { force: opts.force })
+  ) {
+    return {
+      ...base,
+      enabled: false,
+      operationalStatus: 'stopped',
+      reason: `${provider.label} credentials rejected (401/403); next recovery probe after backoff (admin force bypasses)`,
+      fetchedRows: 0,
+      pending: 0,
+      matched: 0,
+      errors,
+    };
+  }
+
   // FMP family: skip HTTP when explicitly OFF (FMP_LATENCY_PROBE_ENABLED=false)
   // or path filtered out of FMP_LATENCY_PATHS. Default is ON for CT.
   if (isFmpFamilyProvider(provider.id) && base.operationalStatus === 'off') {
@@ -3856,7 +4054,7 @@ async function runProviderProbe(
 
   if (!capSkipped && apiKey) {
     let fmpCallsMade = 0;
-    // Dedicated latency pacer — do not share enrichment getSharedFmpPacer state
+    // Dedicated latency pacer — do not share the enrichment getSharedStPeerPacer state
     // with free keys (avoids coupling to enrichment cadence). Simple serial wait.
     let lastFmpCallMs = 0;
     const FMP_LATENCY_MIN_GAP_MS = 350;
@@ -3881,9 +4079,16 @@ async function runProviderProbe(
         };
       }
       let fetchErr: Error | null = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      let currentFetch = fetchImpl;
+      let usedResidentialProxy = false;
+      // Dual free-tier keys go direct (owner: two keys ≈ 2× daily HTTP).
+      // On 429: other key first, then one retry of the current key through
+      // the Senate residential proxy (IP diversity). Never wrap every FMP
+      // probe in that proxy — that hop is for Clerk/eFD Imperva and silenced
+      // observations for ~42h after 2026-09-02.
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const rows = await provider.fetchRows(apiKey, max, fetchImpl, pace, fetchOpts);
+          const rows = await provider.fetchRows(apiKey, max, currentFetch, pace, fetchOpts);
           fetchedRows = rows.length;
           freshRows = rows;
           await upsertProviderRows(env, provider.id, rows, nowIso);
@@ -3896,14 +4101,28 @@ async function runProviderProbe(
         } catch (err) {
           fetchErr = err as Error;
           const msg = fetchErr.message || '';
+          // 429 = FMP bandwidth cap. 401/403 = key unauthorized or wrong plan.
+          // Either way this key must not silence the other free-tier key.
           const is429 = /FMP_HTTP_429|HTTP_429/.test(msg);
-          if (is429 && isFmpStable && fmpSelection && attempt === 0) {
-            await markFmpSlotHttp429(env, fmpSelection.slot, now);
+          const isUnauthorized = /FMP_HTTP_(401|403)|HTTP_(401|403)/.test(msg);
+          if ((!is429 && !isUnauthorized) || !isFmpStable || !fmpSelection) break;
+          await markFmpSlotHttp429(env, fmpSelection.slot, now, is429 ? '429' : 'unauthorized');
+          if (attempt === 0) {
             const retry = await selectFmpLatencyKey(env, now, { force: true, schedule });
             if (retry && retry.slot !== fmpSelection.slot) {
               fmpSelection = retry;
               apiKey = retry.apiKey;
               await addFmpLatencyUsed(env, retry.slot, FMP_LATENCY_CALLS_PER_RUN, now);
+              continue;
+            }
+          }
+          // A bad key is not an IP block. The residential proxy is only a
+          // last try after both free-tier keys are bandwidth-capped (429).
+          if (is429 && !usedResidentialProxy) {
+            const proxyUrl = resolveResidentialProxyUrl(envx);
+            if (proxyUrl) {
+              currentFetch = createProxiedFetch(proxyUrl, fetchImpl);
+              usedResidentialProxy = true;
               continue;
             }
           }
@@ -4113,6 +4332,12 @@ export async function runDisclosureLatencyProbe(
   opts: { force?: boolean; providers?: string[] } = {},
 ): Promise<DisclosureLatencyProbeResult> {
   const envx = env as EnvWithWatch;
+  // Commercial JSON APIs go direct. The residential proxy is for Clerk/eFD/OGE
+  // HTML (Imperva). After RESIDENTIAL_PROXY_URL was set for Senate/House
+  // scraping (2026-09-02), wrapping FMP in that hop silenced observations
+  // ~42h — live house/senate-latest still 200 without the proxy. Dual free
+  // keys stay on direct fetch; a 429 may retry one key through the proxy.
+  const effectiveFetch = fetchImpl;
   if (!opts.force && !(await enabled(envx))) {
     return {
       enabled: false,
@@ -4142,20 +4367,24 @@ export async function runDisclosureLatencyProbe(
       console.warn('trade latency observation re-hash failed:', (err as Error).message);
     }
   }
-  // One FMP avenue per cycle (stable XOR rapidapi). Same pattern applies to
-  // any multi-path family: selectRotatedAvenue / selectFmpLatencyPathForCycle.
+  // Congress disclosures are stable-host only. RapidAPI is recorded as OFF
+  // and never fetched. If the request names only fmp_rapidapi, still run the
+  // stable probe so that label cannot silence house/senate.
   const selectedFmpPathId = await selectFmpLatencyPathForCycle(env, requested, {
     force: opts.force,
   });
-  for (const providerId of requested) {
+  const probeIds = [...requested];
+  if (selectedFmpPathId === 'stable' && !probeIds.includes('fmp')) {
+    probeIds.unshift('fmp');
+  }
+  for (const providerId of probeIds) {
     runs.push(
-      await runProviderProbe(env, definition(providerId), now, fetchImpl, max, {
+      await runProviderProbe(env, definition(providerId), now, effectiveFetch, max, {
         force: opts.force,
         selectedFmpPathId,
       }),
     );
   }
-  await tickLatencyPriceSnapshots(env, now, fetchImpl);
   return {
     enabled: true,
     fetchedRows: runs.reduce((sum, r) => sum + r.fetchedRows, 0),

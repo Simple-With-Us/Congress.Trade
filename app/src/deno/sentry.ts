@@ -12,6 +12,7 @@
 import * as DenoSentry from '@sentry/deno';
 import {
   createSentryBindings,
+  sentryLoggerWarn,
   type ProductionSentryBindings,
   type SentryInitInput,
   type SentryInitResult,
@@ -28,6 +29,8 @@ export const captureMessage = bindings.captureMessage;
 export const setTags = bindings.setTags;
 export const consoleLoggingIntegration = bindings.consoleLoggingIntegration;
 export const isSentryInitialized = bindings.isInitialized;
+export const flushSentry = bindings.flush;
+export const logger = { warn: sentryLoggerWarn };
 
 export function initProductionSentry(
   env: SentryInitInput,

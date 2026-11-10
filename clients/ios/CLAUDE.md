@@ -5,10 +5,11 @@
 **Scheme / targets:** `CongressTrade` / `CongressTradeTests`
 **Display name:** Congress.Trade
 **Team:** `CC8UTF7ATG`
-**XcodeGen:** none — new `.swift` files must be added to the target in Xcode (or reported for a human). Do not hand-edit `project.pbxproj`.
+**XcodeGen:** `clients/ios/project.yml` is the source of truth. After adding/removing sources or changing packages/settings: `cd clients/ios && xcodegen generate` (runs `xcodegen-post.py` for objectVersion 100). Do not hand-edit `project.pbxproj`.
+**Sentry Cocoa:** `SentryTelemetry.swift` reads plist-only `SENTRY_DSN` (no hardcoded fallback). Pass `SENTRY_DSN=...` on xcodebuild/CI for release archives. Errors + crashes + hangs only — no Replay, screenshots, view hierarchy, or default PII. dSYM upload is the existing ios-ship lane.
 **Ship:** `bash scripts/ios-ship-testflight.sh` — fleet: `/Users/jay/apps/ios-fleet/README.md`
 
-Binding fleet rule: `/Users/jay/apps/AGENT-SYNC.md` § iOS agent build loop. `xcodebuild` / `xcrun simctl` via bash are pre-approved. Do not ask. Do not stand up or narrate Xcode MCP.
+Binding fleet rule: `/Users/jay/apps/FLEET-PROTOCOL.md` § iOS agent build loop. `xcodebuild` / `xcrun simctl` via bash are pre-approved. Do not ask. Do not stand up or narrate Xcode MCP.
 
 ## Build & test
 
@@ -35,6 +36,7 @@ clients/ios/
 ├── CongressTrade.xcodeproj/            # do not hand-edit
 ├── CongressTrade/
 │   ├── App.swift                       # App entry
+│   ├── AppUpdatePrompt.swift           # Copied pin from scripts/ios-fleet/
 │   ├── AppDelegate.swift               # APNs / launch
 │   ├── APIClient.swift                 # /api/client/v1 HTTP
 │   ├── Models.swift                    # Decodable types (fail-soft optionals)
@@ -64,4 +66,4 @@ clients/ios/
 - Two spaces between sentences in user-visible copy.
 - Never hand-edit `.pbxproj`, `.entitlements`, `.xib`, `.storyboard`.
 - Do not take down a whole screen because one JSON field is null.
-- Secrets stay in `~/.secrets/` / Infisical. Never print them.
+- Secrets stay in Infisical (`fleet-secrets get`); nothing reads `~/.secrets`. Never print them.

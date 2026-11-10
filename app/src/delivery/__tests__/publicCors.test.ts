@@ -52,6 +52,11 @@ describe('CORS on public read-only GETs', () => {
     expect(listing.headers.get('Access-Control-Allow-Origin')).toBeNull();
 
     const stream = await app.request('http://localhost/stream', {}, makeEnv());
+    expect(stream.status).toBe(400);
+    expect(await stream.json()).toEqual({
+      error: 'missing ?subscription=',
+      hint: expect.stringContaining('Premium subscription'),
+    });
     expect(stream.headers.get('Access-Control-Allow-Origin')).toBeNull();
 
     const create = await app.request(

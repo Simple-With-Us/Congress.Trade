@@ -1,0 +1,67 @@
+name: CI Autofix Usage Report
+description: >-
+  Post one best-effort v2 usage event for a finished CI autofix run to Usage Monitor.
+  Does nothing when the ingest token is empty, and never fails the calling job.
+inputs:
+  token:
+    description: >-
+      Usage Monitor ingest credential, normally the organization secret USAGE_INGEST_TOKEN.
+      Empty means skip quietly.  Use a scoped producer token for the ci-autofix producer.
+    required: false
+    default: ''
+  harness:
+    description: claude-code-ci, kody, or codex-ci.
+    required: true
+  input-file:
+    description: >-
+      Result file written by the tool.  For claude it is the stream-json transcript or the
+      JSON array of SDK messages;  for kody it is the usage.json sidecar.
+    required: true
+  input-kind:
+    description: claude or kody.
+    required: true
+  provider:
+    description: Billing provider of the model.
+    required: false
+    default: minimax
+  model:
+    description: Requested model id, used when the result does not name the served model.
+    required: false
+    default: ''
+  step:
+    description: Step label inside the run, part of the event id.
+    required: false
+    default: autofix
+  pr-number:
+    description: Pull request the run worked on.
+    required: false
+    default: ''
+  workflow:
+    description: Reusable workflow name, recorded as metadata.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Post Usage Event
+      shell: bash
+      continue-on-error: true
+      env:
+        USAGE_INGEST_TOKEN: ${{ inputs.token }}
+        UM_HARNESS: ${{ inputs.harness }}
+        UM_INPUT_FILE: ${{ inputs.input-file }}
+        UM_INPUT_KIND: ${{ inputs.input-kind }}
+        UM_PROVIDER: ${{ inputs.provider }}
+        UM_REQUESTED_MODEL: ${{ inputs.model }}
+        UM_STEP: ${{ inputs.step }}
+        UM_PR_NUMBER: ${{ inputs.pr-number }}
+        UM_WORKFLOW: ${{ inputs.workflow }}
+      run: |
+        if [ -z "${USAGE_INGEST_TOKEN:-}" ]; then
+          echo "::notice::USAGE_INGEST_TOKEN is not set;  skipping the usage report"
+          exit 0
+        fi
+        echo "::add-mask::$USAGE_INGEST_TOKEN"
+        # Best effort by design:  a metering problem must never fail the autofix job.
+        node "$GITHUB_ACTION_PATH/report.mjs" || echo "::warning::usage report did not complete"
+        exit 0

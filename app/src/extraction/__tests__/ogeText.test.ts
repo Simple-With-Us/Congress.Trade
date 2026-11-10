@@ -13,7 +13,15 @@ vi.mock('unpdf', () => ({
   extractText: unpdfMocks.extractText,
 }));
 
-import { OgeTextExtractor, parseOgeTransactionRows } from '../ogeText.ts';
+import {
+  OgeTextExtractor,
+  classifyOgeTransactionText,
+  detectOgeRowAnchors,
+  executiveDisclosureForm,
+  isOgeRowSequenceCoherent,
+  ogePart7SectionLooksEmpty,
+  parseOgeTransactionRows,
+} from '../ogeText.ts';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -156,6 +164,21 @@ describe('parseOgeTransactionRows', () => {
     }
   });
 
+  it('reads OCR spaced and period-thousands brackets, not the next row number', () => {
+    const rows = parseOgeTransactionRows(
+      [
+        '44 TESLA INC (TSLA) Sale 07/17/2026 No $15 001 - $50 000',
+        '126 QUALCOMM INC Sale 07/17/2026 No $15,001 - $50 000',
+        '127 INTUIT INC Sale 07/17/2026 No $1.000.001 - $5.000.000',
+      ].join(' '),
+    );
+    expect(rows.map((r) => [r.ticker ?? r.assetName, r.amountMin, r.amountMax])).toEqual([
+      ['TSLA', 15001, 50000],
+      ['QUALCOMM INC', 15001, 50000],
+      ['INTUIT INC', 1000001, 5000000],
+    ]);
+  });
+
   it('handles an Exchange row and an open-ended top-tier amount', () => {
     const rows = parseOgeTransactionRows(
       '1 Some Bond Fund (XYZ) Exchange 01/02/2026 Yes $50,000,001 +',
@@ -211,6 +234,325 @@ describe('parseOgeTransactionRows', () => {
 
   it('returns an empty array for text with no matching rows', () => {
     expect(parseOgeTransactionRows('nothing to see here')).toEqual([]);
+  });
+
+  it('rejects a garbled-OCR parse whose matched row indices are not a coherent table sequence', () => {
+    // Production signature (E-2026-donald-j-trump-09-8-2026-278t, 2026-09-23):
+    // on a scanned-then-OCR'd 278-T most type words are corrupted ("salo",
+    // "lourchaso"), so ROW_RE only matched the minority whose type survived and
+    // its leading \d then latched onto bond maturity years / dollar fragments.
+    // The deployed parser emitted 334 "rows" with only 94 distinct leading
+    // numbers and 62% non-increasing steps — mis-merged rows, not transactions.
+    // The same signature (repeated leading index) must now yield zero rows.
+    const garbled = Array.from(
+      { length: 8 },
+      (_, i) => `1 001 - $15 000 ${74 + i} EXAMPLE CORP (EX${i}) Purchase 07/17/2026 No $1,001 - $15,000`,
+    ).join(' ');
+    expect(parseOgeTransactionRows(garbled)).toHaveLength(0);
+    expect(classifyOgeTransactionText(
+      garbled,
+      'E-2026-donald-j-trump-09-8-2026-278t',
+    )).toMatchObject({ disposition: 'unreadable', reason: 'index_incoherent' });
+  });
+
+  it('keeps a coherent multi-row parse (guard against over-eager sequence gating)', () => {
+    const coherent = Array.from(
+      { length: 8 },
+      (_, i) => `${i + 1} Issuer ${i + 1} (T${i + 1}) Purchase 07/17/2026 No $1,001 - $15,000`,
+    ).join('\n');
+    expect(parseOgeTransactionRows(coherent)).toHaveLength(8);
+  });
+});
+
+describe('detectOgeRowAnchors', () => {
+  // Verbatim shape from the parked filing E-2026-donald-j-trump-09-17-2026-278t:
+  // the Type word is garbled and the Date column is OCR-mangled (the printed
+  // 8/4/2026 reads back as "81412026"), but the row-index column is intact and
+  // contiguous. Counting anchors must work without reading any other field.
+  const scannedRows = [
+    '1                COMMONWEALTH PA FING AUTH TOB MSTR SETTlMT PMT REV BIE 5.00 % Duo Jun 1 2027        l ourchase   81412026   Yos $1000001-$5 000 000',
+    '2                LOUISVILLE JEFFERSON KY CNTY METRO GOVT HLTH SER C NORTON HC INC REV BIE 5.00 % Due Oct 1, 2047   oorchase   8/21/2026   No $1,000 001 - $5 000,000',
+    '3                TARRANT CNTY TX HSG FIN CORP REV MLTIFAM REV MERIDIAN APTS B BIE PTC 5.00 % Duo Sao 1 2028   ~ •rchase   8/312026   Yos $1 000 001 - $5 000 000',
+    '36               ELECTRONIC ARTS INC                     salo   8/512026   Yos $15 001 • $50 000',
+  ];
+
+  it('counts the intact row-index column on an otherwise garbled 278-T', () => {
+    const result = classifyOgeTransactionText(
+      scannedRows.join('\n'),
+      'E-2026-donald-j-trump-09-17-2026-278t',
+    );
+    expect(result.disposition).toBe('unreadable');
+    expect(result.rows).toHaveLength(0);
+    expect(result).toMatchObject({
+      detectedRowAnchors: 4,
+      detectedRowMaxIndex: 36,
+    });
+  });
+
+  it('reports the transaction count at stake on the refused path, and changes no behaviour', () => {
+    // Production signature: the leading \d latches onto bond maturity years, so
+    // the matched indexes jump and repeat and the sequence gate refuses.
+    const garbled = Array.from(
+      { length: 10 },
+      (_, i) => `1 001 - $15 000 ${2028 + i} EXAMPLE CORP DUE 06/15/20${28 + i} REV 5.00 % Duo Jun 1 2027  Purchase 07/17/2026 No $1,001 - $15,000`,
+    ).join('\n');
+    const result = classifyOgeTransactionText(garbled, 'E-2026-donald-j-trump-09-17-2026-278t');
+    // Behaviour is unchanged: still zero rows, still unreadable.
+    expect(result).toMatchObject({ disposition: 'unreadable', rows: [] });
+    expect(result.rows).toHaveLength(0);
+  });
+
+  it('leaves a clean parse free of refusal diagnostics', () => {
+    const clean = Array.from(
+      { length: 8 },
+      (_, i) => `${i + 1} Issuer ${i + 1} (T${i + 1}) Purchase 07/17/2026 No $1,001 - $15,000`,
+    ).join('\n');
+    const result = classifyOgeTransactionText(clean, 'E-2026-donald-j-trump-09-17-2026-278t');
+    expect(result.disposition).toBe('rows');
+    expect(result).not.toHaveProperty('detectedRowAnchors');
+  });
+
+  it('rejects tokens above the 278-T row ceiling and counts in-range row indices', () => {
+    // A 278-T can legitimately number past row 3600, so the ceiling stays high
+    // enough to keep real rows; it only drops 5-digit dollar figures and years.
+    const out = detectOgeRowAnchors(
+      ['9999    TOO BIG', '5001    ALSO TOO BIG', '12    A REAL ROW'].join('\n'),
+    );
+    expect(out).toEqual({ anchors: 1, maxIndex: 12 });
+  });
+
+  it('returns nothing for a flattened single-line read instead of guessing', () => {
+    expect(detectOgeRowAnchors('1 ALPHA Purchase 07/17/2026 Yes $1,001 - $15,000 2 BETA Purchase 07/17/2026 Yes $1,001 - $15,000'))
+      .toEqual({ anchors: 0, maxIndex: null });
+  });
+});
+
+describe('classifyOgeTransactionText', () => {
+  it('treats a 278e Part 7 with no table and no rows as empty, including a 278term id', () => {
+    expect(executiveDisclosureForm('E-undated-pam-bondi-2026-278term')).toBe('278e');
+    expect(executiveDisclosureForm('E-2026-jane-doe-278-term')).toBe('278e');
+    expect(executiveDisclosureForm('E-2026-jane-doe-278 term')).toBe('278e');
+    expect(executiveDisclosureForm('E-2026-donald-j-trump-09-8-2026-278t')).toBe('278t');
+    expect(executiveDisclosureForm('E-2026-donald-j-trump-09-8-2026-278-t')).toBe('278t');
+    const text = 'OGE Form 278e Termination Report 7. Transactions 8. Liabilities';
+    expect(classifyOgeTransactionText(text, 'E-undated-pam-bondi-2026-278term')).toEqual({
+      disposition: 'empty',
+      rows: [],
+    });
+  });
+
+  it('does not call a 278e empty without positive Part 7 evidence', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // Blank / garbled text layer: no Part 7 heading at all.
+    expect(classifyOgeTransactionText('', bondi)).toEqual({ disposition: 'unconfirmed', rows: [] });
+    expect(classifyOgeTransactionText('Fobn.iary ~~ l1l1 ##', bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // Real 278e Part 7 rows use a layout ROW_RE does not match (no notification column).
+    const withRows = 'OGE Form 278e 7. Transactions # DESCRIPTION TYPE DATE AMOUNT '
+      + '1 Apple Inc. (AAPL) Purchase 01/05/2026 $1,001 - $15,000 8. Liabilities';
+    expect(classifyOgeTransactionText(withRows, 'E-2026-someone-278e'))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // Part 7 whose end we cannot see is not evidence.
+    expect(classifyOgeTransactionText('OGE Form 278e 7. Transactions # DESCRIPTION TYPE DATE AMOUNT', bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+  });
+
+  it('keeps a bounded header-only Part 7 unconfirmed (row glyphs lost)', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    const headerOnly = 'OGE Form 278e 7. Transactions # DESCRIPTION TYPE DATE AMOUNT 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(headerOnly)).toBe(false);
+    expect(classifyOgeTransactionText(headerOnly, bondi)).toEqual({ disposition: 'unconfirmed', rows: [] });
+    // Header split across lines / partial header still counts as a table.
+    expect(classifyOgeTransactionText('7. Transactions\n#\nDESCRIPTION\n8. Liabilities', bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // Orphan row numbers with no parseable row are not an empty section.
+    expect(classifyOgeTransactionText('7. Transactions 1 2 3 8. Liabilities', bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // The bare bounded heading (real empty 278e) still closes.
+    expect(classifyOgeTransactionText('OGE Form 278e 7. Transactions 8. Liabilities', bondi))
+      .toEqual({ disposition: 'empty', rows: [] });
+  });
+
+  it('does not treat row 8 of a Part 7 table as the section end', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // "8. Apple Inc ..." is row 8 of the table, but the bare "8. <word>"
+    // end alternative used to take it as the Part 8 boundary: the empty
+    // "body" before it then closed the filing verified_empty over a trade.
+    const text = 'OGE Form 278e Part 7. Transactions 8. Apple Inc Purchase 01/05/2026 $1,001 - $15,000 Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(text)).toBe(false);
+    expect(classifyOgeTransactionText(text, bondi)).toEqual({ disposition: 'unconfirmed', rows: [] });
+    // The titled forms still bound the section.
+    expect(ogePart7SectionLooksEmpty('OGE Form 278e 7. Transactions 8. Liabilities')).toBe(true);
+    expect(ogePart7SectionLooksEmpty('OGE Form 278e 7. Transactions Part 8. Liabilities')).toBe(true);
+  });
+
+  it('keeps a short real Part 7 out of the TOC filter (None-bodied neighbors)', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // A real empty 278e whose neighboring parts are also short: "Part 6."
+    // sits in the before-window and "9." in the after-window, but the None
+    // bodies between the entries are real section bodies, not a contents
+    // run.  The heading must still count as positive empty evidence.
+    const text = 'Part 6. Agreements None Part 7. Transactions Part 8. Liabilities None Part 9. Gifts None';
+    expect(ogePart7SectionLooksEmpty(text)).toBe(true);
+    expect(classifyOgeTransactionText(text, bondi)).toEqual({ disposition: 'empty', rows: [] });
+  });
+
+  it('keeps a description-only Part 7 body unconfirmed (asset names, no digits)', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // Asset names with no digits, #, header words, "attach", or transaction
+    // words pass every content guard; they are a read the row parser could
+    // not handle, not positive evidence of an empty section, so the filing
+    // must not close verified_empty.
+    const namesOnly = 'OGE Form 278e 7. Transactions Apple Inc Microsoft Corporation 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(namesOnly)).toBe(false);
+    expect(classifyOgeTransactionText(namesOnly, bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // The whitespace-only body (real empty Part 7) still closes.
+    expect(ogePart7SectionLooksEmpty('OGE Form 278e 7. Transactions 8. Liabilities')).toBe(true);
+  });
+
+  it('does not close on a contents prefix truncated at the Part 8 boundary', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // The extraction ran out of text at the last contents entry: the Part 7
+    // line has part entries before it but none after, so the both-sides TOC
+    // filter does not fire and the empty prefix would close verified_empty
+    // without the real Part 7 ever being read.
+    const truncated =
+      'OGE Form 278e Summary of Contents 5. Other Income 6. Agreements 7. Transactions 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(truncated)).toBe(false);
+    expect(classifyOgeTransactionText(truncated, bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // Same stub with the titled form of the boundary.
+    const truncatedTitled =
+      'OGE Form 278e Summary of Contents 5. Other Income 6. Agreements Part 7. Transactions Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(truncatedTitled)).toBe(false);
+    expect(classifyOgeTransactionText(truncatedTitled, bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+  });
+
+  it('does not let a table-of-contents Part 7 entry hide the real Part 7 further down', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // TOC stub first, then the real Part 7 with a traded row: verified_empty
+    // here would bury trades (same fail-closed class as the header-only guard).
+    const tocThenTrades =
+      'OGE Form 278e Summary of Contents 5. Other Income 6. Agreements 7. Transactions 8. Liabilities 9. Gifts '
+      + 'Part One Filer Information pages of earlier parts follow then the real sections '
+      + 'Part 7. Transactions 1 Apple Inc. (AAPL) Purchase 01/05/2026 $1,001 - $15,000 Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(tocThenTrades)).toBe(false);
+    expect(classifyOgeTransactionText(tocThenTrades, bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // TOC stub + a real, positively-empty Part 7 further down still closes empty.
+    const tocThenEmpty =
+      'OGE Form 278e Summary of Contents 5. Other Income 6. Agreements 7. Transactions 8. Liabilities 9. Gifts '
+      + 'Part One Filer Information pages of earlier parts follow then the real sections '
+      + 'Part 7. Transactions Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(tocThenEmpty)).toBe(true);
+    expect(classifyOgeTransactionText(tocThenEmpty, bondi))
+      .toEqual({ disposition: 'empty', rows: [] });
+    // A TOC alone (the real section is unreadable or lost) is not evidence of empty.
+    const tocOnly =
+      'OGE Form 278e Summary of Contents 5. Other Income 6. Agreements 7. Transactions 8. Liabilities 9. Gifts';
+    expect(ogePart7SectionLooksEmpty(tocOnly)).toBe(false);
+    expect(classifyOgeTransactionText(tocOnly, bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+    // TOC stub + a header-only real Part 7 stays unconfirmed, not empty.
+    const tocThenHeaderOnly =
+      'OGE Form 278e Summary of Contents 5. Other Income 6. Agreements 7. Transactions 8. Liabilities 9. Gifts '
+      + 'Part One Filer Information pages of earlier parts follow then the real sections '
+      + 'Part 7. Transactions # DESCRIPTION TYPE DATE AMOUNT Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(tocThenHeaderOnly)).toBe(false);
+    expect(classifyOgeTransactionText(tocThenHeaderOnly, bondi))
+      .toEqual({ disposition: 'unconfirmed', rows: [] });
+  });
+
+  it('does not end Part 7 at a Summary of Contents marker when a table follows it', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // Flattened extraction can drop the boilerplate BETWEEN the Part 7
+    // heading and its table: ending the section at the marker makes the gap
+    // read as a positively empty section while rows follow.
+    const markerThenTable =
+      'OGE Form 278e Part 7. Transactions Summary of Contents '
+      + '# DESCRIPTION TYPE DATE AMOUNT 1 Apple Inc. (AAPL) Purchase 01/05/2026 $1,001 - $15,000 '
+      + 'Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(markerThenTable)).toBe(false);
+    expect(classifyOgeTransactionText(markerThenTable, bondi).disposition).not.toBe('empty');
+    // The real production 278-T fixture shape: "Endnotes Summary of Contents"
+    // and a long boilerplate paragraph sit between the label and the table.
+    const endnotesThenTable =
+      'OGE Form 278e Part 7. Transactions Page 2 Endnotes Summary of Contents '
+      + 'The 278-T discloses purchases, sales, or exchanges of securities in excess of $1,000. '
+      + 'Privacy Act Statement Title I of the Ethics in Government Act of 1978 '
+      + '# DESCRIPTION TYPE DATE NOTIFICATION RECEIVED OVER 30 DAYS AGO AMOUNT '
+      + '1 Amazon.com, Inc. (AMZN) Sale 06/10/2022 No $1,001 - $15,000';
+    expect(ogePart7SectionLooksEmpty(endnotesThenTable)).toBe(false);
+    expect(classifyOgeTransactionText(endnotesThenTable, bondi).disposition).not.toBe('empty');
+    // Rows whose header glyphs were lost still count: dates, dollar amounts,
+    // and transaction words after the marker mean rows follow.
+    const markerThenBareRows =
+      'OGE Form 278e Part 7. Transactions Summary of Contents '
+      + '1 Apple Inc. (AAPL) Purchase 01/05/2026 $1,001 - $15,000 Part 8. Liabilities';
+    expect(ogePart7SectionLooksEmpty(markerThenBareRows)).toBe(false);
+    expect(classifyOgeTransactionText(markerThenBareRows, bondi).disposition).not.toBe('empty');
+    // A genuinely empty Part 7 whose text ends at the contents page still
+    // closes empty: only boilerplate follows the marker, no table.
+    const markerThenNothing =
+      'OGE Form 278e Part 7. Transactions Summary of Contents '
+      + '5. Other Income 6. Agreements 7. Transactions 8. Liabilities 9. Gifts';
+    expect(ogePart7SectionLooksEmpty(markerThenNothing)).toBe(true);
+    expect(classifyOgeTransactionText(markerThenNothing, bondi))
+      .toEqual({ disposition: 'empty', rows: [] });
+  });
+
+  it('does not call a Part 7 that points at an attachment empty', () => {
+    const bondi = 'E-undated-pam-bondi-2026-278term';
+    // Rows live on the attached schedule; verified_empty would bury them.
+    for (const body of ['See Attachment', 'See attachment', 'See Attached Schedule', 'None. See attachment.']) {
+      const text = `OGE Form 278e 7. Transactions ${body} 8. Liabilities`;
+      expect(ogePart7SectionLooksEmpty(text)).toBe(false);
+      expect(classifyOgeTransactionText(text, bondi))
+        .toEqual({ disposition: 'unconfirmed', rows: [] });
+    }
+  });
+
+  it('treats an explicit Part 7 None as empty', () => {
+    expect(classifyOgeTransactionText(
+      'OGE Form 278e Part 7. Transactions None 8. Liabilities',
+      'E-undated-pam-bondi-2026-278term',
+    )).toEqual({ disposition: 'empty', rows: [] });
+  });
+
+  it('does not call a 278-T with zero matches empty', () => {
+    expect(classifyOgeTransactionText(
+      'Periodic Transaction Report with no readable rows',
+      'E-2026-donald-j-trump-09-8-2026-278t',
+    )).toMatchObject({ disposition: 'unreadable', reason: 'unreadable_278t' });
+  });
+});
+
+describe('isOgeRowSequenceCoherent', () => {
+  it('accepts a short sequence even when it repeats (too few rows to judge)', () => {
+    expect(isOgeRowSequenceCoherent([])).toBe(true);
+    expect(isOgeRowSequenceCoherent([1, 1, 2])).toBe(true);
+  });
+
+  it('accepts a unique, strictly increasing table index', () => {
+    expect(isOgeRowSequenceCoherent([1, 2, 3, 4, 5, 6, 7, 8])).toBe(true);
+    // A few OCR skips/dupes are tolerated.
+    expect(isOgeRowSequenceCoherent([1, 2, 3, 5, 6, 7, 8, 9])).toBe(true);
+  });
+
+  it('rejects repeated or wildly non-monotonic indices (the OCR latched onto years/amounts)', () => {
+    expect(isOgeRowSequenceCoherent([1, 1, 2, 2, 3, 3, 4, 4])).toBe(false);
+    expect(isOgeRowSequenceCoherent([1, 1, 2026, 1, 15000, 89, 15, 5])).toBe(false);
+  });
+
+  it('rejects a sparse parse that only covers a sliver of its own index span', () => {
+    // The production Trump-filing signature: after the amount hardening the
+    // leading numbers were unique-ish and mostly increasing, but only ~300 of
+    // the table's 1156 rows matched (span 0..15000, coverage 0.02) — a partial,
+    // mis-merged transcript that would silently drop real transactions.
+    expect(isOgeRowSequenceCoherent([1, 2, 3, 4, 5, 6, 7, 1156])).toBe(false);
+    expect(isOgeRowSequenceCoherent([0, 1, 2, 3, 4, 5, 6, 15000])).toBe(false);
   });
 });
 

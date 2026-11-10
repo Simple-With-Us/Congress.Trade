@@ -231,6 +231,10 @@ describe('Stripe webhook -> premium activation Pushover notification', () => {
     });
     expect(res.status).toBe(200);
     expect(fetchSpy.mock.calls.filter(([url]) => String(url).includes('api.pushover.net'))).toHaveLength(1);
+    expect(env.__db.prepare('SELECT subscription_status, plan FROM users WHERE id = ?').get('u1')).toMatchObject({
+      subscription_status: 'active',
+      plan: 'monthly',
+    });
   });
 
   it('a Pushover delivery failure never fails the webhook response', async () => {

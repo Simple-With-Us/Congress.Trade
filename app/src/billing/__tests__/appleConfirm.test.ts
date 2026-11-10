@@ -15,6 +15,7 @@ vi.mock('../../billing/appleJws', () => ({
 const getCurrentUser = vi.fn();
 vi.mock('../../auth/session', () => ({
   getCurrentUser: (...args: unknown[]) => getCurrentUser(...args),
+  getCurrentUserFromRequest: (...args: unknown[]) => getCurrentUser(...args),
 }));
 
 import { buildBillingRouter } from '../routes.ts';

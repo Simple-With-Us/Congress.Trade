@@ -6,40 +6,56 @@
  * cancels the stale UNRESOLVED_ISSUES submission, creates a new IOS review
  * submission with the app version plus both Premium subscriptions, and submits.
  *
- * Auth: ~/.secrets/appstore-connect.env (never printed).
+ * Auth: ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from env, else Infisical /asc through
+ * fleet-secrets (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8).  Never printed.  No local secrets folder is read.
  * Usage:
  *   node scripts/asc-submit-review.mjs            # dry run
  *   node scripts/asc-submit-review.mjs --apply    # write to App Store Connect
  */
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createHash, createSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const APPLY = process.argv.includes("--apply");
+const buildArgIdx = process.argv.indexOf("--build");
+const TARGET_BUILD = (buildArgIdx !== -1 && process.argv[buildArgIdx + 1])
+  || process.env.ASC_TARGET_BUILD
+  || "";
 const APP = "6798076688";
 const VERSION_ID = "7824c023-3f0c-41fa-abf6-be24d7fe217b";
 const DETAIL_ID = "6bdc976e-ac42-44fd-9a95-4b33a4c14ac5";
-const STALE_SUBMISSION = "b61e2a4a-ebb3-449d-83c6-170eb33feaa6";
 const MONTHLY_ID = "6798078775";
 const ANNUAL_ID = "6798078776";
-const KEEP_BUILD = "202608202100";
 const VIDEO_PATH = process.env.ASC_DELETION_VIDEO
   || join(homedir(), "apps/ios-fleet/artifacts/ct-account-deletion-2026-08-21.mp4");
 const VIDEO_NAME = "account-deletion-physical-device.mp4";
 const NOTES_PATH = process.env.ASC_REVIEW_NOTES
-  || join(homedir(), "apps/congress-grok-asc-1-0/docs/asc/REVIEW-NOTES.txt");
+  || join(homedir(), "Code/Congress.Trade/docs/asc/REVIEW-NOTES.txt");
 
-function loadEnvFile(path) {
-  const env = {};
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+function fleetSecret(name) {
+  const bin = process.env.FLEET_SECRETS || join(homedir(), ".local", "bin", "fleet-secrets");
+  try {
+    return execFileSync(bin, ["get", name, "--path", "/asc"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 30000
+    }).replace(/\r?\n$/, "").trim();
+  } catch {
+    return "";
   }
-  return env;
+}
+
+function resolveAscCredentials() {
+  const fromEnv = (n) => String(process.env[n] ?? "").trim();
+  const keyId = fromEnv("ASC_KEY_ID") || fleetSecret("ASC_KEY_ID");
+  const issuerId = fromEnv("ASC_ISSUER_ID") || fleetSecret("ASC_ISSUER_ID");
+  const keyPath = fromEnv("ASC_KEY_PATH");
+  const privateKeyPem = keyPath && existsSync(keyPath)
+    ? readFileSync(keyPath, "utf8")
+    : (fromEnv("ASC_KEY_P8") || fleetSecret("ASC_KEY_P8")).replace(/\\n/g, "\n");
+  return { keyId, issuerId, privateKeyPem };
 }
 
 function base64url(input) {
@@ -70,13 +86,12 @@ function sleep(ms) {
 }
 
 async function main() {
-  const env = loadEnvFile(join(homedir(), ".secrets/appstore-connect.env"));
-  if (!env.ASC_KEY_ID || !env.ASC_ISSUER_ID || !env.ASC_KEY_PATH) {
-    console.error("missing ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH");
+  const { keyId, issuerId, privateKeyPem } = resolveAscCredentials();
+  if (!keyId || !issuerId || !privateKeyPem) {
+    console.error("missing ASC_KEY_ID / ASC_ISSUER_ID / key: set them in env or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)");
     process.exit(1);
   }
-  const privateKeyPem = readFileSync(env.ASC_KEY_PATH, "utf8");
-  const token = signJwt({ keyId: env.ASC_KEY_ID, issuerId: env.ASC_ISSUER_ID, privateKeyPem });
+  const token = signJwt({ keyId, issuerId, privateKeyPem });
 
   async function api(method, apiPath, jsonBody) {
     const url = apiPath.startsWith("http") ? apiPath : `https://api.appstoreconnect.apple.com${apiPath}`;
@@ -102,8 +117,6 @@ async function main() {
 
   console.log(APPLY ? "MODE apply" : "MODE dry-run");
 
-  const st = statSync(VIDEO_PATH);
-  console.log(`video bytes=${st.size} name=${VIDEO_NAME}`);
   const notes = readFileSync(NOTES_PATH, "utf8").trim();
   console.log(`notes chars=${notes.length}`);
   if (!notes.includes("physical-device") && !notes.includes("screen recording")) {
@@ -116,13 +129,78 @@ async function main() {
   const vString = version.parsed.data?.attributes?.versionString;
   console.log(`version ${vString} state=${vState}`);
 
-  const attached = needOk("attached-build", await api("GET", `/v1/appStoreVersions/${VERSION_ID}/build?fields[builds]=version,processingState,expired`));
-  const buildVer = attached.parsed.data?.attributes?.version;
-  const buildState = attached.parsed.data?.attributes?.processingState;
-  console.log(`attached build=${buildVer} processing=${buildState}`);
-  if (buildVer !== KEEP_BUILD) {
-    console.error(`refusing: attached build ${buildVer} is not the recorded TestFlight ${KEEP_BUILD}`);
+  // Fetch recent builds with polling if a specific target build was requested
+  let selectedBuild = null;
+  const deadline = Date.now() + (TARGET_BUILD ? 300_000 : 10_000);
+  while (Date.now() < deadline) {
+    const buildsRes = needOk("builds", await api("GET", `/v1/builds?filter[app]=${APP}&sort=-uploadedDate&limit=10`));
+    const validBuilds = (buildsRes.parsed.data || []).filter((b) => b.attributes?.processingState === "VALID");
+    if (TARGET_BUILD) {
+      selectedBuild = validBuilds.find((b) => b.attributes?.version === TARGET_BUILD);
+      if (selectedBuild) break;
+      console.log(`waiting for target build ${TARGET_BUILD} to reach VALID... (visible valid: ${validBuilds.map((b) => b.attributes?.version).join(", ") || "none"})`);
+      await sleep(6000);
+    } else {
+      if (validBuilds.length > 0) {
+        selectedBuild = validBuilds[0];
+        break;
+      }
+      console.log("waiting for a valid build...");
+      await sleep(4000);
+    }
+  }
+  if (!selectedBuild) {
+    console.error(`target build ${TARGET_BUILD || "latest"} not found in VALID state`);
     process.exit(1);
+  }
+  console.log(`selected build version=${selectedBuild.attributes.version} id=${selectedBuild.id} uploaded=${selectedBuild.attributes.uploadedDate}`);
+
+  // Check currently attached build
+  const attached = await api("GET", `/v1/appStoreVersions/${VERSION_ID}/build?fields[builds]=version,processingState,expired`);
+  const curBuildId = attached.parsed.data?.id;
+  const curBuildVer = attached.parsed.data?.attributes?.version;
+  console.log(`currently attached build=${curBuildVer} id=${curBuildId}`);
+
+  async function updateVersionStringIfNeeded() {
+    if (vString === "1.0.177") return;
+    if (!APPLY) {
+      console.log(`DRY RUN — would update versionString from ${vString} to 1.0.177`);
+      return;
+    }
+    const res = await api("PATCH", `/v1/appStoreVersions/${VERSION_ID}`, {
+      data: {
+        type: "appStoreVersions",
+        id: VERSION_ID,
+        attributes: { versionString: "1.0.177" },
+      },
+    });
+    if (!res.ok) {
+      console.error(`update versionString: HTTP ${res.status} ${errSummary(res.parsed)}`);
+      process.exit(2);
+    }
+    console.log(`updated versionString to 1.0.177: HTTP ${res.status}`);
+  }
+
+  async function attachBuildIfNeeded() {
+    if (curBuildId === selectedBuild.id) {
+      console.log(`build ${selectedBuild.attributes.version} already attached`);
+      return;
+    }
+    if (!APPLY) {
+      console.log(`DRY RUN — would attach build ${selectedBuild.attributes.version} (${selectedBuild.id}) to version ${VERSION_ID}`);
+      return;
+    }
+    const res = await api("PATCH", `/v1/appStoreVersions/${VERSION_ID}/relationships/build`, {
+      data: {
+        type: "builds",
+        id: selectedBuild.id,
+      },
+    });
+    if (!res.ok) {
+      console.error(`attach build: HTTP ${res.status} ${errSummary(res.parsed)}`);
+      process.exit(2);
+    }
+    console.log(`attached build ${selectedBuild.attributes.version} (${selectedBuild.id}): HTTP ${res.status}`);
   }
 
   const subs = needOk("subs", await api("GET", `/v1/apps/${APP}/subscriptionGroups?limit=5&include=subscriptions`));
@@ -136,8 +214,9 @@ async function main() {
     console.error("missing Premium subscription ids");
     process.exit(1);
   }
-  if (monthly.attributes.state !== "READY_TO_SUBMIT" || annual.attributes.state !== "READY_TO_SUBMIT") {
-    console.error("subscriptions are not READY_TO_SUBMIT — Guideline 2.1(b) would fail again");
+  const validSubStates = ["READY_TO_SUBMIT", "WAITING_FOR_REVIEW", "IN_REVIEW", "APPROVED"];
+  if (!validSubStates.includes(monthly.attributes.state) || !validSubStates.includes(annual.attributes.state)) {
+    console.error(`subscriptions in unexpected state: monthly=${monthly.attributes.state}, annual=${annual.attributes.state} — Guideline 2.1(b) requirement`);
     process.exit(1);
   }
 
@@ -266,44 +345,35 @@ async function main() {
 
   async function cancelStale() {
     const listed = needOk("submissions-before-cancel", await api("GET", `/v1/reviewSubmissions?filter[app]=${APP}&filter[platform]=IOS&limit=10`));
-    const cur = (listed.parsed.data || []).find((s) => s.id === STALE_SUBMISSION);
-    const state = cur?.attributes?.state;
-    if (!cur) {
-      console.log("stale submission not listed — skip cancel");
-      return;
+    const unres = (listed.parsed.data || []).filter((s) => s.attributes?.state === "UNRESOLVED_ISSUES" || s.attributes?.state === "CANCELING");
+    for (const s of unres) {
+      if (s.attributes?.state !== "CANCELING") {
+        console.log(`canceling unresolved submission ${s.id}`);
+        if (APPLY) {
+          const cancelRes = await api("PATCH", `/v1/reviewSubmissions/${s.id}`, {
+            data: {
+              type: "reviewSubmissions",
+              id: s.id,
+              attributes: { canceled: true },
+            },
+          });
+          if (!cancelRes.ok) {
+            console.error(`cancel submission ${s.id}: HTTP ${cancelRes.status} ${errSummary(cancelRes.parsed)}`);
+            process.exit(2);
+          }
+        }
+      }
+      if (APPLY) {
+        const deadline = Date.now() + 180_000;
+        while (Date.now() < deadline) {
+          const poll = await api("GET", `/v1/reviewSubmissions/${s.id}`);
+          const stt = poll.parsed.data?.attributes?.state;
+          console.log(`submission ${s.id} state=${stt}`);
+          if (stt === "CANCELLED" || stt === "COMPLETE") break;
+          await sleep(4000);
+        }
+      }
     }
-    if (state === "CANCELLED" || state === "COMPLETE") {
-      // After canceled:true, Apple often lands UNRESOLVED_ISSUES on COMPLETE
-      // rather than CANCELLED.  Either way the version is free to resubmit.
-      console.log(`stale submission already ${state} — skip cancel`);
-      return;
-    }
-    if (!APPLY) {
-      console.log(`DRY RUN — would cancel ${STALE_SUBMISSION} (state=${state})`);
-      return;
-    }
-    const res = await api("PATCH", `/v1/reviewSubmissions/${STALE_SUBMISSION}`, {
-      data: {
-        type: "reviewSubmissions",
-        id: STALE_SUBMISSION,
-        attributes: { canceled: true },
-      },
-    });
-    if (!res.ok) {
-      console.error(`cancel: HTTP ${res.status} ${errSummary(res.parsed)}`);
-      process.exit(2);
-    }
-    console.log(`cancel: HTTP ${res.status} now=${res.parsed.data?.attributes?.state}`);
-    const deadline = Date.now() + 180_000;
-    while (Date.now() < deadline) {
-      const poll = await api("GET", `/v1/reviewSubmissions/${STALE_SUBMISSION}`);
-      const stt = poll.parsed.data?.attributes?.state;
-      console.log(`stale state=${stt}`);
-      if (stt === "CANCELLED" || stt === "COMPLETE") return;
-      await sleep(4000);
-    }
-    console.error("stale submission did not reach CANCELLED in 180s");
-    process.exit(2);
   }
 
   async function createAndSubmit() {
@@ -395,6 +465,8 @@ async function main() {
   await uploadVideo();
   await updateNotes();
   await cancelStale();
+  await updateVersionStringIfNeeded();
+  await attachBuildIfNeeded();
   const rsId = await createAndSubmit();
 
   const verAfter = await api("GET", `/v1/appStoreVersions/${VERSION_ID}`);

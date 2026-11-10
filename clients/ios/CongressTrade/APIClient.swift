@@ -138,11 +138,46 @@ final class CongressTradeAPIClient {
     private let interceptor: RequestInterceptor
     private let decoder: JSONDecoder
 
+    /// Dedicated production session with a sized URLCache so idempotent GETs
+    /// can honor server `Cache-Control`/`ETag` (Batch 4 lands those headers
+    /// server-side; without them responses simply are not stored and every
+    /// request still goes to the network — no behavior change today).
+    /// Tests keep injecting their own MockURLProtocol session.
+    static func makeDefaultSession() -> URLSession {
+        let configuration = URLSessionConfiguration.default
+        configuration.requestCachePolicy = .useProtocolCachePolicy
+        configuration.urlCache = URLCache(
+            memoryCapacity: 10 * 1024 * 1024,
+            diskCapacity: 50 * 1024 * 1024,
+            diskPath: "trade.congress.api-cache"
+        )
+        return URLSession(configuration: configuration)
+    }
+
+    /// Cache policy per request. Only allowlisted idempotent public GETs may
+    /// use the protocol cache; everything account-scoped (`/me` via
+    /// bootstrap, preferences, subscriptions, commands), premium-gated
+    /// (documents), admin, auth, and every mutation bypasses the cache.
+    /// Fail-closed: an unrecognized path is never cached.
+    static func cachePolicy(for url: URL, method: String = "GET") -> URLRequest.CachePolicy {
+        guard method.uppercased() == "GET" else { return .reloadIgnoringLocalCacheData }
+        let path = url.path
+        let cacheable = path.hasSuffix("/feed")
+            || path.contains("/member/")
+            || path.contains("/ticker/")
+            || path.contains("/trade/")
+            || path == "/api/members"
+            || path == "/api/assets"
+            || path.hasPrefix("/api/analytics/")
+            || path.hasPrefix("/api/logos/")
+        return cacheable ? .useProtocolCachePolicy : .reloadIgnoringLocalCacheData
+    }
+
     init(
         baseURL: URL = CongressTradeAPIClient.defaultBaseURL,
         tokenStore: SessionTokenStore = KeychainTokenStore(),
         deviceEntitlementStore: SessionTokenStore = KeychainTokenStore(service: "trade.congress.appleDeviceEntitlement"),
-        session: URLSession = .shared,
+        session: URLSession = CongressTradeAPIClient.makeDefaultSession(),
         interceptor: RequestInterceptor? = nil
     ) {
         self.baseURL = baseURL
@@ -180,6 +215,17 @@ final class CongressTradeAPIClient {
     /// `billingPortalURL()` instead; this page would show them nothing to
     /// manage.
     static let appStoreManageSubscriptionsURL = URL(string: "https://apps.apple.com/account/subscriptions")!
+
+    /// Website path that can reach Stripe Customer Portal for an existing
+    /// web/Stripe subscriber.  Guideline 3.1.1: manage existing web billing,
+    /// never start web checkout.  The site honors `?billing=manage` after
+    /// `/auth/me` and runs `manageBilling()`.
+    var webManageSubscriptionURL: URL {
+        var components = URLComponents(url: originURL, resolvingAgainstBaseURL: false) ?? URLComponents()
+        components.path = "/"
+        components.queryItems = [URLQueryItem(name: "billing", value: "manage")]
+        return components.url ?? originURL
+    }
 
     /// Site origin (scheme + host) with the `/api/client/v1` path stripped.
     /// Auth (`/auth/*`), document (`/api/documents/*`), and logo endpoints live
@@ -864,10 +910,11 @@ final class CongressTradeAPIClient {
     /// Mints a short-lived Stripe-hosted Billing Portal URL for the
     /// signed-in user's Stripe customer (`POST /billing/portal`,
     /// `app/src/billing/routes.ts` — web parity; origin-level, not under
-    /// `/api/client/v1/*`). Callers should treat any failure (401 not signed
-    /// in, 503 portal not configured, 400 no Stripe customer yet, offline)
-    /// as "show a helpful message" rather than falling back to the App Store
-    /// URL — a Stripe subscriber has nothing to manage there.
+    /// `/api/client/v1/*`). Sends the same session Bearer as `/api/client/v1`
+    /// (`makeRequest` → `AuthHeaderInterceptor`). The server must accept
+    /// Bearer here (`getCurrentUserFromRequest`); cookie-only auth 401s a
+    /// signed-in iOS user. Callers must not fall back to the App Store URL
+    /// on failure — a Stripe subscriber has nothing to manage there.
     func billingPortalURL(idempotencyKey: String = UUID().uuidString) async throws -> URL {
         var request = try makeRequest(originURL.appendingPathComponent("billing/portal"))
         request.httpMethod = "POST"
@@ -909,6 +956,7 @@ final class CongressTradeAPIClient {
     private func postCommand<T: Decodable>(idempotencyKey: String, body: [String: Any]) async throws -> ClientCommandResponse<T> {
         var request = try makeRequest(endpointURL("commands"))
         request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(idempotencyKey, forHTTPHeaderField: "idempotency-key")
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -974,7 +1022,7 @@ final class CongressTradeAPIClient {
 
     private func makeRequest(_ url: URL) throws -> URLRequest {
         var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.cachePolicy = Self.cachePolicy(for: url)
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "accept")
         // congress.trade sits behind a Cloudflare managed challenge that 502s
@@ -992,6 +1040,7 @@ final class CongressTradeAPIClient {
     private func makeAdminRequest(_ url: URL, method: String = "GET", body: [String: Any]? = nil) throws -> URLRequest {
         var request = try makeRequest(url)
         request.httpMethod = method
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "content-type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -1039,6 +1088,13 @@ final class CongressTradeAPIClient {
     }
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        // Belt-and-braces: a mutation must never be served from (or stored
+        // in) the URL cache, whatever policy makeRequest picked while the
+        // request still looked like a GET.
+        var request = request
+        if (request.httpMethod ?? "GET").uppercased() != "GET" {
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+        }
         do {
             return try await session.data(for: request)
         } catch let error as URLError {
@@ -1127,6 +1183,34 @@ enum APIError: LocalizedError {
             return message
         case .transport(let error):
             return error.localizedDescription
+        }
+    }
+
+    /// Human Trends / inbound-link copy.  Never the raw transport phrase
+    /// (`Request failed`, `The Internet connection appears to be offline.`).
+    var userFacingMessage: String {
+        switch self {
+        case .server(let status, let message, _):
+            if status == 429 {
+                return "Too many requests.  Pull to refresh."
+            }
+            // The status code is carried in the copy so a support report says
+            // which failure it was.  Without it every backend fault reads the
+            // same and "it says the site is updating" is unactionable.
+            if (500...599).contains(status) {
+                return "The site is updating (\(status)).  Pull to refresh."
+            }
+            if message.isEmpty || message == "Request failed" {
+                return "Could not load this page (\(status)).  Pull to refresh."
+            }
+            return message
+        case .transport:
+            if isOffline {
+                return "You are offline."
+            }
+            return "Could not reach the server.  Pull to refresh."
+        case .invalidResponse:
+            return "Invalid server response."
         }
     }
 }

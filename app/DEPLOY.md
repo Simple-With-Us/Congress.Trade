@@ -92,18 +92,35 @@ is configured.  `ADMIN_OPEN_IN_DEV="true"` is local-only, and
 `SENTRY_ENVIRONMENT` / `USAGE_MONITOR_ENVIRONMENT` in `wrangler.toml` `[vars]`
 must be overridden in `.dev.vars` or the run is treated as production.
 
-### Cost profile
+### Tick profile
 
-Live production is **`CT_COST_PROFILE=paid`** (cron `* * * * *` on
-`GET /api/health` → `costProfile`).  The `free` profile (15-minute ticks,
-tiny drains) was sized for retired Deno Deploy free-tier quotas.  Do not
-flip prod back to `free` to "save Deploy quota."  `CT_*` names are the
-operator knobs; leftover `DENO_*` aliases are local-test only.
+Live production always uses aggressive knobs (cron `* * * * *` on
+`GET /api/health` → `costProfile.name=live`).  The old `free` / `balanced` /
+`paid` names described retired Deno Deploy quotas and are ignored if still
+set.  Optional Infisical overrides: `CT_CRON_SCHEDULE`, `CT_DRAIN_LIMIT`,
+`CT_DRAIN_CLAIM_SIZE`, `CT_OUTBOX_LIMIT`.  Do not duplicate those in Coolify
+env.
 
 ## 3a. Sentry
 
 Production Sentry is a Coolify/Infisical `SENTRY_DSN` concern, not a
-`wrangler secret put`.  `SENTRY_ENVIRONMENT=production` is the live value.
+`wrangler secret put` and not a git value in `.prod.vars`.  Infisical is
+canonical; Coolify runtime env is the inject copy.  `SENTRY_ENVIRONMENT=production`
+is the live value.
+
+## 3a.1 Datadog
+
+Reuse the existing fleet Datadog account.  Do not buy a new plan.  Set these
+Coolify / Infisical names (values never belong in git):
+
+- `DD_API_KEY` + `DD_SITE` — required together for Deno logs + APM.  Missing
+  or unknown site fails closed.
+- `DD_APP_KEY` — optional; not used to send.
+- `DD_CLIENT_TOKEN` + `DD_APPLICATION_ID` + `DD_SITE` — required together
+  for public-web RUM.  `NEXT_PUBLIC_DD_*` aliases are accepted.
+
+Session Replay is off.  Host agent collection on `fleet-hetzner-nbg1` is
+unchanged.
 
 ## 3b. Auth + Stripe
 
@@ -186,9 +203,10 @@ Deno.cron (paid: * * * * *) → watcher (House + Senate eFD + OGE)
 
 - **Branch protection** on `main`: PRs required, `typecheck + test` required,
   no force push/deletion.
-- **Senate eFD** depends on the named tunnel `https://scout.jays.services`.
-  Never "fix" an outage by changing `SENATE_RELAY_URL`.  Scraping still uses
-  the agreement-gate + CSRF flow (`src/ingestion/senateSource.ts`).
+- **Senate eFD** uses Coolify + `RESIDENTIAL_PROXY_URL` (physical-device /
+  WireGuard proxy).  Mac `scout/` is retired (#2351).  `SENATE_RELAY_URL` is
+  optional — unset it if the origin is gone; never mint a new URL by hand.
+  Scraping still uses the agreement-gate + CSRF flow (`src/ingestion/senateSource.ts`).
 - **House bulk XML** refreshes ~daily; `pollHouseLiveSearch()` overlays the
   intraday live-search result when enabled.
 - **Vision model** id lives in `src/extraction/visionLlm.ts`; review that

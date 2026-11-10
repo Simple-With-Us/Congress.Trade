@@ -18,19 +18,53 @@
  * idempotent self-healing sweep that re-picks up anything stranded [here].
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 import type { Env } from '../shared/types.ts';
-import { all, run } from '../shared/db.ts';
+import { all, batch, run } from '../shared/db.ts';
+import { FETCH_NOT_PUBLISHED_WINDOW_MS } from './fetcher.ts';
+import {
+  EMPTY_FETCH_CYCLE_CAP,
+  type EmptyFetchSweepResult,
+  clampEmptyFetchLimit,
+  completedEmptyIngestStatusSql,
+  isCompletedEmptyRawHandoff,
+  isPastFetchNotPublishedWindow,
+  isUngroundedIngestStatus,
+  ungroundedIngestStatusSql,
+} from './emptyFetchHandoff.ts';
+import { parkEmptyFetchHandoff, rearmFilingForEmptyFetch } from './outbox.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
+import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
+import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
+import {
+  isSenateEdgeBackoffActive,
+  readSenateEdgeBackoff,
+  SENATE_EDGE_BACKOFF_GRACE_MS,
+} from './senateEdgeDeny.ts';
 import {
   maybeRunDeterministicReviewDrain,
   sweepRejectedScannedForLocalVision,
   type DeterministicDrainResult,
   type LocalVisionRequeueResult,
 } from '../extraction/deterministicDrain.ts';
-import { reconcileResolvedReviewStatus } from './reviewStatusReconcile.ts';
+import { DESYNCED_INGEST_STATUSES, reconcileResolvedReviewStatus } from './reviewStatusReconcile.ts';
+import {
+  PROVIDER_ONLY_LEAD_CLEARED_REASON,
+  reconcileProviderMissingStubsWithOfficial,
+  type ProviderMissingStubReconcileResult,
+} from './providerMissingStubClose.ts';
+import {
+  sweepAutoRejectedUnreadable,
+  sweepKnownParkedExecutiveTerminals,
+  type AutoRejectedUnreadableSweepResult,
+  type ExecutiveTerminalSweepResult,
+} from '../extraction/executiveDisposition.ts';
+import {
+  sweepPipelineStallAlerts,
+  type PipelineStallAlertResult,
+} from './pipelineLoudAlerts.ts';
 
 /** Provider-placeholder bookkeeping rows (tradeLatency.ts
  *  routeProviderOnlyObservationsToReview) are working-as-designed synthetic
@@ -152,6 +186,155 @@ export async function sweepStrandedFilings(
     if ((res.meta?.changes ?? 0) > 0) terminalized += 1;
   }
   return { terminalized };
+}
+
+interface EmptyFetchCandidate {
+  doc_id: string;
+  chamber: string | null;
+  source_url: string | null;
+  ingest_status: string | null;
+  raw_object_key: string | null;
+  first_seen_at: string | null;
+  live_n: number | null;
+  outbox_status?: string | null;
+}
+
+/**
+ * Re-drive a filing whose ingest_status is outside IngestStatus, including
+ * NULL, once it is older than fetcher.ts FETCH_NOT_PUBLISHED_WINDOW_MS
+ * (7 days). Operational statuses (`not_found`, `failed`, `provider_seeded`)
+ * keep their watcher upgrade path and are not selected. Inside the window a
+ * 404 is still "not yet published", so the sweep waits. The write matches
+ * watcher.ts's not_found/failed upgrade: status `new`, raw key cleared,
+ * outbox `pending` with attempts 0, then enqueueIngestionOutboxNow. Each
+ * pass counts a dead-letter cycle and parks at EMPTY_FETCH_CYCLE_CAP.
+ * Bounded. dryRun reports the doc ids and writes nothing.
+ */
+export async function sweepUngroundedIngestStatus(
+  env: Env,
+  now = new Date(),
+  opts: { limit?: number; dryRun?: boolean } = {},
+): Promise<EmptyFetchSweepResult> {
+  const limit = clampEmptyFetchLimit(opts.limit);
+  const dryRun = opts.dryRun === true;
+  const cutoff = new Date(now.getTime() - FETCH_NOT_PUBLISHED_WINDOW_MS).toISOString();
+  const rows = await all<EmptyFetchCandidate>(
+    env.DB,
+    `SELECT f.doc_id, f.chamber, f.source_url, f.ingest_status, f.raw_object_key, f.first_seen_at,
+            (SELECT COUNT(*) FROM transactions t
+              WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL) AS live_n
+       FROM filings f
+      WHERE f.doc_id NOT LIKE ?
+        AND ${ungroundedIngestStatusSql('f')}
+        AND (f.raw_object_key IS NULL OR TRIM(f.raw_object_key) = '')
+        AND f.first_seen_at IS NOT NULL
+        AND f.first_seen_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM transactions t
+           WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM review_queue rq
+           WHERE rq.doc_id = f.doc_id AND rq.resolved = 1
+        )
+      ORDER BY f.first_seen_at ASC
+      LIMIT ?`,
+    [PROVIDER_MISSING_PREFIX, cutoff, limit],
+  );
+  return applyEmptyFetchCandidates(env, rows, now, dryRun, 'ungrounded');
+}
+
+/**
+ * Extend the outbox consistency pass (transientDlq only replays status
+ * `failed`). A completed hand-off whose filing has no raw object did not
+ * finish the fetch. Same re-arm as sweepUngroundedIngestStatus, with the
+ * existing dead-letter cycle cap. At the cap the row is parked onto
+ * review_queue instead of retried forever.
+ */
+export async function sweepCompletedEmptyRawHandoff(
+  env: Env,
+  now = new Date(),
+  opts: { limit?: number; dryRun?: boolean } = {},
+): Promise<EmptyFetchSweepResult> {
+  const limit = clampEmptyFetchLimit(opts.limit);
+  const dryRun = opts.dryRun === true;
+  const cutoff = new Date(now.getTime() - FETCH_NOT_PUBLISHED_WINDOW_MS).toISOString();
+  const rows = await all<EmptyFetchCandidate>(
+    env.DB,
+    `SELECT f.doc_id, f.chamber, f.source_url, f.ingest_status, f.raw_object_key, f.first_seen_at,
+            o.status AS outbox_status,
+            (SELECT COUNT(*) FROM transactions t
+              WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL) AS live_n
+       FROM ingestion_outbox o
+       JOIN filings f ON f.doc_id = o.doc_id
+      WHERE o.status = 'completed'
+        AND f.doc_id NOT LIKE ?
+        AND (f.raw_object_key IS NULL OR TRIM(f.raw_object_key) = '')
+        AND ${completedEmptyIngestStatusSql('f')}
+        AND f.first_seen_at IS NOT NULL
+        AND f.first_seen_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM transactions t
+           WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM review_queue rq
+           WHERE rq.doc_id = f.doc_id AND rq.resolved = 1
+        )
+      ORDER BY f.first_seen_at ASC
+      LIMIT ?`,
+    [PROVIDER_MISSING_PREFIX, cutoff, limit],
+  );
+  return applyEmptyFetchCandidates(env, rows, now, dryRun, 'completed');
+}
+
+async function applyEmptyFetchCandidates(
+  env: Env,
+  rows: EmptyFetchCandidate[],
+  now: Date,
+  dryRun: boolean,
+  kind: 'ungrounded' | 'completed',
+): Promise<EmptyFetchSweepResult> {
+  const chosen = rows.filter((row) => {
+    const facts = {
+      docId: row.doc_id,
+      ingestStatus: row.ingest_status,
+      rawObjectKey: row.raw_object_key,
+      liveTransactionCount: Number(row.live_n ?? 0),
+    };
+    if (!isPastFetchNotPublishedWindow(row.first_seen_at, now, FETCH_NOT_PUBLISHED_WINDOW_MS)) return false;
+    if (kind === 'ungrounded') return isUngroundedIngestStatus(facts);
+    return isCompletedEmptyRawHandoff({ ...facts, outboxStatus: row.outbox_status ?? null });
+  });
+  const result: EmptyFetchSweepResult = {
+    dryRun,
+    matched: chosen.length,
+    rearmed: 0,
+    parked: 0,
+    docIds: chosen.map((row) => row.doc_id),
+  };
+  if (dryRun) return result;
+  for (const row of chosen) {
+    const doc = {
+      docId: row.doc_id,
+      chamber: row.chamber,
+      sourceUrl: row.source_url,
+      ingestStatus: row.ingest_status,
+    };
+    const outcome = await rearmFilingForEmptyFetch(env, doc, now, {
+      incrementCycles: true,
+      cycleCap: EMPTY_FETCH_CYCLE_CAP,
+    });
+    if (outcome === 'rearmed') {
+      result.rearmed += 1;
+      continue;
+    }
+    if (outcome === 'capped') {
+      const parked = await parkEmptyFetchHandoff(env, doc, now);
+      if (parked) result.parked += 1;
+    }
+  }
+  return result;
 }
 
 export interface FiledDateBackfillResult {
@@ -342,10 +525,11 @@ export async function sweepOgeUndatedFilingDates(
       const obj = await env.RAW_FILES.get(row.raw_object_key);
       if (!obj) continue;
       const bytes = new Uint8Array(await obj.arrayBuffer());
+      const { extractText, getDocumentProxy } = await import('unpdf');
       const pdf = await getDocumentProxy(bytes);
       const { text } = await extractText(pdf, { mergePages: true });
-      if (typeof (pdf as { destroy?: () => void }).destroy === 'function') {
-        (pdf as { destroy: () => void }).destroy();
+      if (typeof (pdf as unknown as { destroy?: () => void }).destroy === 'function') {
+        (pdf as unknown as { destroy: () => void }).destroy();
       }
       const flat = typeof text === 'string' ? text : (text as string[]).join('\n');
       const filedDate = extractPrintedDateFromText(flat);
@@ -381,10 +565,13 @@ export interface ResolvedDesyncSweepResult {
  * are ALL resolved=1 yet frozen at a pre-resolution status, so they were
  * invisible to every sweep AND to the health check built to surface them.
  *
- * This sweep owns exactly that population: it does NOT re-open, re-fetch, or
- * re-extract anything (the review outcome stands) — it only stamps the terminal
- * status from review_queue.resolution_kind / ingestion_decisions.  Provider-
- * missing placeholder rows are excluded.  Idempotent and bounded.
+ * This sweep owns exactly that population, plus CT-2453: a filing that is
+ * already published (live transactions and a latest publish decision) but
+ * whose ingest_status is still non-persisted, including `error`, even when
+ * it never had a review_queue row. It does NOT re-open, re-fetch, or
+ * re-extract anything — it only stamps the terminal status. Filings with
+ * no live transactions are left alone. Provider-missing placeholder rows
+ * are excluded. Idempotent and bounded.
  */
 export async function sweepResolvedStatusDesync(
   env: Env,
@@ -403,9 +590,32 @@ export interface AutonomySweepResult {
   ceiling: CeilingSweepResult | null;
   stranded: StrandedSweepResult | null;
   resolvedDesync: ResolvedDesyncSweepResult | null;
+  /** Provider-only placeholder review rows closed to verified_empty. */
+  providerOnlyStubs: ProviderOnlyStubSweepResult | null;
+  /** Open or sweep-closed provider-only stubs rejected because the official filing has since persisted. */
+  providerStubOfficialReconcile: ProviderMissingStubReconcileResult | null;
+  /** Open review rows closed as already-published (orphaned review rows). */
+  alreadyPublished: AlreadyPublishedReviewSweepResult | null;
   filedDateBackfill: FiledDateBackfillResult | null;
   ogeUndated: OgeUndatedBackfillResult | null;
   livenessAlarms: LivenessAlarmResult | null;
+  /** 2026-09-21: per-source polling heartbeat — pages when a chamber has gone
+   *  N hours without ANY source_attempts row (the failure class the liveness
+   *  check cannot see, because a tick that never fires is not a tick that
+   *  failed). */
+  pollingHeartbeat: PollingHeartbeatResult | null;
+  /** Ingest/OCR/ST stall detector (Sentry + dual publisher webhooks + recovery). */
+  pipelineStallAlerts: PipelineStallAlertResult | null;
+  /** Empty 278e → verified_empty; refused 278-T parks open.  Allowlist only. */
+  executiveTerminals: ExecutiveTerminalSweepResult | null;
+  /** Pipeline auto-rejects of oge_text_unreadable, reopened for a human. */
+  unreadableReopened: AutoRejectedUnreadableSweepResult | null;
+  /** Bounded replay of transient failed outbox / queue rows. */
+  transientDlq: TransientDlqSweepResult | null;
+  /** Completed outbox rows whose filing stored no raw object. */
+  completedEmptyRaw: EmptyFetchSweepResult | null;
+  /** ingest_status outside IngestStatus, no raw object, no live transactions. */
+  ungroundedIngest: EmptyFetchSweepResult | null;
   errors: string[];
 }
 
@@ -414,6 +624,13 @@ export interface LivenessAlarmResult {
   bad: number;
   notified: string[];
   recovered: string[];
+}
+
+export interface PollingHeartbeatResult {
+  evaluated: number;
+  alerted: string[];
+  /** Seconds since the last attempt per source — for the health payload. */
+  ageBySource: Record<'house' | 'senate' | 'executive', number | null>;
 }
 
 export interface LocalVisionHostedFallbackResult {
@@ -471,13 +688,273 @@ const LIVENESS_ALARM_CHECK_IDS = new Set([
   'autopilot_halt',
   'extraction_provider',
   'extraction_backlog',
+  // 2026-09-20: include price_freshness in the alarm set so a stale price
+  // cache (>= priceMaxAgeCriticalDays trading days behind) pages the owner.
+  // Previously the check only degraded silently — see board 14dac466 /
+  // prod observation 2026-09-20 with S&P frozen at 2026-08-03 for 46 days
+  // and nobody alerted.
+  'price_freshness',
+  // Filing skips (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
+  // Owner ask: "big red flag ... anytime a filing is skipped or considered
+  // empty or blank or unreadable since that is almost always false and app
+  // error." These three outcomes mean the OCR/vision/model pipeline failed;
+  // they should always page on the first occurrence.
+  'filing_skips',
+  // 2026-09-21: FMP latency probe silence = a free-tier key rotation or
+  // network outage that has been silent for >3h. Owner ask: FMP latency
+  // should be visible everywhere; it is also a hard alarm when silent.
+  'fmp_latency',
+  // Fresh failures and parked / cycle-capped dead letters.  Priority 0 while
+  // degraded, so a standing parked row notifies without hiding a later
+  // critical check.  The hourly sweep requeues safe rows before this runs.
+  'ingestion_dead_letter',
+  // Deadline abort and SQLITE_BUSY tick skip.  Count >= 3 inside 6h is
+  // critical and wakes the phone; a single miss is a silent notify.
+  'cron_deadline',
 ]);
 const LIVENESS_ALARM_KV_PREFIX = 'liveness-alarm:';
 const LIVENESS_RENOTIFY_MS = 6 * 3_600_000;
 
+/**
+ * 2026-09-21: a critical/stalled price_freshness no longer just pages and
+ * waits for an operator. The hourly liveness-alarm sweep ALSO invokes
+ * runPriceRefresh inline (bounded, idempotent) so the cache self-heals the
+ * moment it crosses the threshold — the same way the S&P freeze in
+ * Sep 2026 (frozen for 46 days) gets unstuck without manual intervention.
+ *
+ * The behavior is opt-in via env (default: ON). To turn it off while keeping
+ * the page intact, set `CT_DISABLE_PRICE_AUTO_RECOVER=1`.
+ *
+ * The auto-recover is bounded to a single attempt per alarm sweep, shares the
+ * daily FMP budget via runPriceRefresh's own pacer, and is rate-limited to
+ * one attempt per 6h per check (matches the renotify cadence) so a transient
+ * FMP outage cannot trigger a run-every-hour loop.
+ */
+const AUTO_RECOVER_RENOTIFY_MS = LIVENESS_RENOTIFY_MS;
+
+interface AutoRecoverEpisode {
+  attemptedAt: string;
+  /** True when the last attempt succeeded (caller may want to suppress the
+   *  page on the same hour if so). Optional so old KV entries stay parseable. */
+  ok?: boolean;
+}
+
+async function maybeAutoRecoverPrice(
+  env: Env,
+  now: Date,
+  check: { id: string; status: string; detail: string },
+): Promise<{ attempted: boolean; ok: boolean; error?: string } | null> {
+  // Env access guarded so vitest (Node) tests don't ReferenceError on Deno.
+  const envGet = (k: string): string | undefined => {
+    try { return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k); }
+    catch { return undefined; }
+  };
+  if (envGet('CT_DISABLE_PRICE_AUTO_RECOVER') === '1') return null;
+  if (check.id !== 'price_freshness') return null;
+  if (check.status !== 'critical' && check.status !== 'stalled') return null;
+  const kvKey = `${LIVENESS_ALARM_KV_PREFIX}auto-recover:${check.id}`;
+  let prev: AutoRecoverEpisode | null = null;
+  try {
+    prev = await env.CONFIG_KV.get<AutoRecoverEpisode>(kvKey, 'json');
+  } catch {}
+  if (prev && Number.isFinite(Date.parse(prev.attemptedAt))
+    && now.getTime() - Date.parse(prev.attemptedAt) < AUTO_RECOVER_RENOTIFY_MS) {
+    return null; // already tried in the last 6h
+  }
+  try {
+    // Lazy import keeps the liveness-alarm path cheap when auto-recover is
+    // disabled or not needed; the price service module pulls in the FMP/
+    // Tiingo/Massive clients and the daily FMP pacer.
+    const { runPriceRefresh } = await import('../prices/service.ts');
+    const r = await runPriceRefresh(env, { maxPerMinute: 3 });
+    const ok = r.errors.length === 0;
+    await env.CONFIG_KV.put(kvKey, JSON.stringify({ attemptedAt: now.toISOString(), ok } satisfies AutoRecoverEpisode));
+    return { attempted: true, ok, error: ok ? undefined : r.errors.slice(0, 3).join('; ') };
+  } catch (err) {
+    await env.CONFIG_KV.put(kvKey, JSON.stringify({ attemptedAt: now.toISOString(), ok: false } satisfies AutoRecoverEpisode));
+    return { attempted: true, ok: false, error: (err as Error).message };
+  }
+}
+
 interface LivenessAlarmEpisode {
   status: string;
   notifiedAt: string;
+}
+
+/**
+ * 2026-09-21 — Per-source polling heartbeat watchdog. Companion to
+ * sweepLivenessAlarms. The liveness check fires when the LAST poll attempt
+ * was a success but old, but it CANNOT fire when the tick never gets to
+ * call the watcher in the first place (the 2026-09-20 06:00–13:00 UTC
+ * outage class — all three chambers went dark because the cron tick was
+ * stuck, not because their last attempt failed). This watchdog reads
+ * source_attempts directly: if a chamber has gone >N minutes without ANY
+ * attempt, emit a Pushover alarm (priority 1) AND a Sentry breadcrumb so
+ * the operator sees the failure class immediately.
+ *
+ * Thresholds:
+ *   weekday (UTC Mon-Fri 12:00–24:00 ET): 240 min (4h) — past the hourly
+ *     floor + the FMP retry envelope, so a missed probe is real, not
+ *     transient.
+ *   weekend (UTC Sat-Sun, plus federal holidays): 480 min (8h) — matches
+ *     the documented "Executive follows the same adaptive probeSchedule
+ *     as House/Senate (weekday coverage floor 15 min; weekend hourly)"
+ *     policy so a weekend pause does not page spuriously.
+ *
+ * Episode semantics: same one-notification-per-episode as the liveness
+ * sweep (6h renotify). Re-notifies only when the heartbeat is still
+ * broken; clears the KV key on recovery.
+ *
+ * Tunable via env:
+ *   CT_POLLING_HEARTBEAT_WEEKDAY_MIN (default 240)
+ *   CT_POLLING_HEARTBEAT_WEEKEND_MIN (default 480)
+ */
+const HEARTBEAT_RENOTIFY_MS = LIVENESS_RENOTIFY_MS;
+const HEARTBEAT_KV_PREFIX = 'polling-heartbeat:';
+const WEEKDAY_UTC_HOURS: ReadonlySet<number> = new Set([
+  // 12:00 UTC = 07:00 ET (Mon-Fri market morning) through 24:00 UTC = 19:00 ET.
+  // Federal holidays are not modeled here; if a holiday happens to land on
+  // a weekday, the operator gets a soft alarm that pages the same way
+  // (priority 0 silent-notify path) when the chamber comes back, and they
+  // can mark it manually if needed.
+  12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+]);
+
+export async function sweepPollingHeartbeat(
+  env: Env,
+  now = new Date(),
+  deps: { push?: typeof sendPushover } = {},
+): Promise<PollingHeartbeatResult> {
+  const push = deps.push ?? sendPushover;
+  const result: PollingHeartbeatResult = { evaluated: 0, alerted: [], ageBySource: { house: null, senate: null, executive: null } };
+  const sources: ReadonlyArray<'house' | 'senate' | 'executive'> = ['house', 'senate', 'executive'];
+
+  // Single query: per-source MAX(attempted_at). source_attempts is
+  // append-only and small (bounded by retention sweep); an index on
+  // (source, attempted_at DESC) would make this trivial, but a single
+  // GROUP BY scan on the 24h subset is already cheap.
+  let rows: Array<{ source: string; last_attempt: string | null }> = [];
+  try {
+    rows = await all<{ source: string; last_attempt: string | null }>(
+      env.DB,
+      `SELECT CASE WHEN lower(source) IN ('oge', 'exec') THEN 'executive' ELSE source END AS source,
+              MAX(attempted_at) AS last_attempt
+         FROM source_attempts
+        WHERE attempted_at >= datetime('now', '-48 hours')
+        GROUP BY 1`,
+    );
+  } catch {}
+  const lastBySource = new Map<string, string | null>(rows.map((r) => [r.source, r.last_attempt]));
+  // A Senate eFD edge-deny backoff (CT-2442) leaves up to 6 hours between
+  // senate attempts by design.  That is not a stuck cron, so it must not page
+  // as one; polling_senate's liveness alarm still pages, naming the backoff.
+  const senateEdgeBackoff = await readSenateEdgeBackoff(env);
+  const senateBackedOff = senateEdgeBackoff !== null
+    && isSenateEdgeBackoffActive(senateEdgeBackoff, now, SENATE_EDGE_BACKOFF_GRACE_MS);
+
+  const utcHour = now.getUTCHours();
+  const isWeekday = now.getUTCDay() >= 1 && now.getUTCDay() <= 5 && WEEKDAY_UTC_HOURS.has(utcHour);
+  const maxAgeMinDefault = isWeekday ? 240 : 480;
+  // Env access guarded so vitest (Node) tests don't ReferenceError on Deno.
+  const envGet = (k: string): string | undefined => {
+    try { return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k); }
+    catch { return undefined; }
+  };
+  const maxAgeMin = (() => {
+    const envKey = isWeekday ? 'CT_POLLING_HEARTBEAT_WEEKDAY_MIN' : 'CT_POLLING_HEARTBEAT_WEEKEND_MIN';
+    const n = Number.parseInt(envGet(envKey) || '', 10);
+    return Number.isFinite(n) && n >= 5 ? Math.min(n, 1440) : maxAgeMinDefault;
+  })();
+
+  for (const src of sources) {
+    result.evaluated += 1;
+    const lastAttempt = lastBySource.get(src);
+    if (!lastAttempt) {
+      // No attempt recorded at all in the last 48h — definitely stale.
+      result.ageBySource[src] = 48 * 3600;
+    } else {
+      const ageMs = now.getTime() - Date.parse(lastAttempt);
+      result.ageBySource[src] = Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null;
+    }
+    const ageSec = result.ageBySource[src];
+    if (ageSec == null) continue;
+    if (ageSec < maxAgeMin * 60) continue; // still within heartbeat window
+    if (src === 'senate' && senateBackedOff) continue; // silent on purpose (edge-deny backoff)
+
+    // Heartbeat is broken. Episode semantics: notify on edge, renotify at
+    // most every 6h. Same pattern as sweepLivenessAlarms so the operator
+    // sees a consistent cadence.
+    const kvKey = `${HEARTBEAT_KV_PREFIX}${src}`;
+    let episode: { attemptedAt: string } | null = null;
+    try {
+      episode = await env.CONFIG_KV.get<{ attemptedAt: string }>(kvKey, 'json');
+    } catch {}
+    const lastNotifiedMs = episode ? Date.parse(episode.attemptedAt) : NaN;
+    const renotifyDue = !Number.isFinite(lastNotifiedMs) || now.getTime() - lastNotifiedMs >= HEARTBEAT_RENOTIFY_MS;
+    if (!renotifyDue) continue;
+
+    const hours = (ageSec / 3600).toFixed(1);
+    const isWeekendStr = isWeekday ? 'weekday' : 'weekend';
+    const title = `CT WATCHDOG: ${src} polling silent for ${hours}h`;
+    const message = [
+      `${src} chamber has had ZERO source_attempts rows in the last ${hours} hours`,
+      `(threshold ${maxAgeMin} min, ${isWeekendStr} window).`,
+      `Most likely root cause: Deno cron tick is stuck (force-release via CT_TICK_STUCK_MINUTES=10`,
+      `already shipped, board 14dac466 follow-up).`,
+      ``,
+      `Verify: GET https://congress.trade/api/admin/sources/health`,
+    ].join(' ');
+
+    try {
+      const delivered = await push(env, {
+        title,
+        message,
+        priority: 1, // wake the phone — silent polling is the same class as a crash
+        url: 'https://congress.trade/api/admin/sources/health',
+        urlTitle: 'Source health',
+      });
+      if (delivered.sent) {
+        result.alerted.push(src);
+        await env.CONFIG_KV.put(kvKey, JSON.stringify({ attemptedAt: now.toISOString() }));
+      } else {
+        console.error('sweepPollingHeartbeat: alarm NOT delivered for', src, '-', delivered.reason ?? 'unknown reason');
+      }
+      sentryLoggerWarn('polling.heartbeat_silent', {
+        runtime: 'deno',
+        source: src,
+        ageSec,
+        thresholdMin: maxAgeMin,
+        weekday: isWeekday,
+      });
+    } catch (err) {
+      console.error('sweepPollingHeartbeat: pushover failed for', src, (err as Error).message);
+    }
+  }
+
+  // Recovery: any source whose heartbeat came back inside the window clears
+  // its episode so a future break sends a fresh edge-notify. Done in one
+  // short pass over the KV prefix. (KV doesn't have native prefix listing,
+  // but the source list is bounded to 3 keys so we just GET each.)
+  for (const src of sources) {
+    const ageSec = result.ageBySource[src];
+    if (ageSec == null || ageSec >= maxAgeMin * 60) continue;
+    const kvKey = `${HEARTBEAT_KV_PREFIX}${src}`;
+    let episode: { attemptedAt: string } | null = null;
+    try {
+      episode = await env.CONFIG_KV.get<{ attemptedAt: string }>(kvKey, 'json');
+    } catch {}
+    if (!episode) continue;
+    try {
+      await push(env, {
+        title: `CT recovered: ${src} polling resumed`,
+        message: `${src} has a fresh source_attempts row (age ${ageSec}s, threshold ${maxAgeMin} min).`,
+        priority: 0,
+      });
+    } catch { /* best-effort */ }
+    try { await env.CONFIG_KV.delete(kvKey); } catch {}
+  }
+
+  return result;
 }
 
 /**
@@ -508,6 +985,9 @@ export async function sweepLivenessAlarms(
   const nowIso = now.toISOString();
   for (const check of health.checks) {
     if (!LIVENESS_ALARM_CHECK_IDS.has(check.id)) continue;
+    if ((check.value as { suppressLivenessNotification?: boolean } | undefined)?.suppressLivenessNotification) {
+      continue;
+    }
     result.evaluated += 1;
     const kvKey = `${LIVENESS_ALARM_KV_PREFIX}${check.id}`;
     let episode: LivenessAlarmEpisode | null = null;
@@ -515,9 +995,23 @@ export async function sweepLivenessAlarms(
       episode = await env.CONFIG_KV.get<LivenessAlarmEpisode>(kvKey, 'json');
     } catch {}
 
-    const isBad = check.status === 'stalled' || check.status === 'degraded';
+    const isBad = check.status === 'stalled' || check.status === 'degraded' || check.status === 'critical';
     if (isBad) {
       result.bad += 1;
+
+      // Self-heal path: critical/stalled price_freshness gets an inline
+      // runPriceRefresh attempt before we page. See maybeAutoRecoverPrice.
+      if (check.status === 'critical' || check.status === 'stalled') {
+        try {
+          const recovered = await maybeAutoRecoverPrice(env, now, check);
+          if (recovered?.attempted) {
+            console.log('sweepLivenessAlarms: auto-recover', check.id, recovered.ok ? 'ok' : 'failed', recovered.error ?? '');
+          }
+        } catch (err) {
+          console.error('sweepLivenessAlarms: auto-recover threw', check.id, (err as Error).message);
+        }
+      }
+
       const statusChanged = !episode || episode.status !== check.status;
       const lastNotifiedMs = episode ? Date.parse(episode.notifiedAt) : NaN;
       const renotifyDue = !Number.isFinite(lastNotifiedMs)
@@ -530,10 +1024,14 @@ export async function sweepLivenessAlarms(
         // notified — a silently-dead alarm channel would recreate the exact
         // failure class this sweep exists to kill.
         try {
+          // Tier mapping: critical → priority 1 (same as stalled) so the
+          // phone wakes for a structural break. degraded → priority 0
+          // (silent notify, no sound) so a weekend price lag doesn't page.
+          const isLoud = check.status === 'stalled' || check.status === 'critical';
           const delivered = await push(env, {
-            title: `CT ${check.status === 'stalled' ? 'DOWN' : 'DEGRADED'}: ${check.id.replace(/_/g, ' ')}`,
+            title: `CT ${isLoud ? 'DOWN' : 'DEGRADED'}: ${check.id.replace(/_/g, ' ')}`,
             message: check.detail,
-            priority: check.status === 'stalled' ? 1 : 0,
+            priority: isLoud ? 1 : 0,
             url: 'https://congress.trade/api/health',
             urlTitle: 'Pipeline health',
           });
@@ -572,6 +1070,298 @@ export async function sweepLivenessAlarms(
   return result;
 }
 
+export interface ProviderOnlyStubSweepResult {
+  cleared: number;
+  /** Stub filings moved to verified_empty alongside their review close. */
+  filingsUpdated: number;
+}
+
+/**
+ * Provider-only placeholder review rows (tradeLatency.ts
+ * routeProviderOnlyObservationsToReview) are synthetic leads: the filing row
+ * has raw_object_key IS NULL because nothing was ever fetched to extract, so
+ * such a row can never gain a live transaction. The honest terminal state for
+ * one is verified_empty / provider_only_lead_cleared.
+ *
+ * That close used to live ONLY in the deploy-time migration statement list, so
+ * between deploys every new provider-only observation piled up in the admin
+ * review queue (and fired the Publisher review_queue.entered webhook) until
+ * the next ship re-ran migrations. This sweep applies the exact same terminal
+ * state hourly, bounded and idempotent, so the next similar row closes itself.
+ *
+ * The stub's filing row is moved to verified_empty in the same batch.  Its
+ * filings.error is cleared, except the provider-only raw-key marker on a stub
+ * whose review payload was truncated to invalid JSON: that marker is the only
+ * untruncated raw key the later official-side reconcile can match on.
+ * reviewStatusReconcile.ts deliberately skips provider-missing-* docs, so
+ * nothing else would ever bring the synthetic filing out of needs_review.
+ * The filing step also heals stubs the deploy-time migration closed earlier
+ * without touching their filing.
+ *
+ * The official-counterpart case (an official filing now exists) is left to
+ * providerMissingStubClose.ts, which rejects the stub as a duplicate when the
+ * provider observation is reprocessed or when the hourly
+ * reconcileProviderMissingStubsWithOfficial pass finds a persisted counterpart
+ * — this sweep never invents that verdict, and both paths still override this
+ * sweep's verified_empty close if the official filing lands later. review_revision is bumped so a concurrent
+ * duplicate rejection that read the pre-sweep revision no-ops cleanly.
+ * Rows with stored raw bytes or a live transaction are excluded so a real
+ * filing that happens to carry this reason is never swept.
+ */
+export async function sweepProviderOnlyReviewStubs(
+  env: Env,
+  opts: { limit?: number } = {},
+): Promise<ProviderOnlyStubSweepResult> {
+  const limit = opts.limit ?? 500;
+  const statusPlaceholders = DESYNCED_INGEST_STATUSES.map(() => '?').join(',');
+  const results = await batch(env.DB, [
+    [
+      `UPDATE review_queue
+          SET resolved = 1,
+              resolution_kind = 'verified_empty',
+              resolution_reason = ?,
+              resolved_at = CURRENT_TIMESTAMP,
+              review_revision = review_revision + 1
+        WHERE resolved = 0
+          AND reason = 'provider_discovered_missing_official'
+          AND doc_id IN (
+            SELECT rq.doc_id
+              FROM review_queue rq
+              LEFT JOIN filings f ON f.doc_id = rq.doc_id
+             WHERE rq.resolved = 0
+               AND rq.reason = 'provider_discovered_missing_official'
+               AND (f.raw_object_key IS NULL OR f.raw_object_key = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM transactions t
+                  WHERE t.doc_id = rq.doc_id AND t.deprecated_at IS NULL
+               )
+             ORDER BY rq.created_at ASC
+             LIMIT ?
+          )`,
+      [PROVIDER_ONLY_LEAD_CLEARED_REASON, limit],
+    ],
+    [
+      `UPDATE filings
+          SET ingest_status = 'verified_empty',
+              -- Keep the provider-only:{provider}:{raw key} marker when the
+              -- review payload is truncated (invalid) JSON: it is then the only
+              -- untruncated copy of the raw provider key, and the hourly
+              -- reconcileProviderMissingStubsWithOfficial needs it for the exact
+              -- trade_latency_candidates.provider_key match on hashed keys.
+              error = CASE
+                        WHEN error LIKE 'provider-only:%'
+                          AND EXISTS (
+                            SELECT 1 FROM review_queue rqp
+                             WHERE rqp.doc_id = filings.doc_id
+                               AND rqp.reason = 'provider_discovered_missing_official'
+                               AND NOT json_valid(COALESCE(rqp.payload, ''))
+                          )
+                        THEN error
+                        ELSE NULL
+                      END
+        WHERE doc_id IN (
+          SELECT f.doc_id
+            FROM filings f
+            JOIN review_queue rq ON rq.doc_id = f.doc_id
+           WHERE rq.resolved = 1
+             AND rq.reason = 'provider_discovered_missing_official'
+             AND rq.resolution_kind = 'verified_empty'
+             AND rq.resolution_reason = ?
+             AND f.ingest_status IN (${statusPlaceholders})
+             AND (f.raw_object_key IS NULL OR f.raw_object_key = '')
+             AND NOT EXISTS (
+               SELECT 1 FROM transactions t
+                WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL
+             )
+           LIMIT ?
+        )`,
+      [PROVIDER_ONLY_LEAD_CLEARED_REASON, ...DESYNCED_INGEST_STATUSES, limit],
+    ],
+  ]);
+  return {
+    cleared: results[0]?.meta?.changes ?? 0,
+    filingsUpdated: results[1]?.meta?.changes ?? 0,
+  };
+}
+
+export interface AlreadyPublishedReviewSweepResult {
+  cleared: number;
+  /** Filings stamped to persisted alongside their review close. */
+  filingsUpdated: number;
+}
+
+/** Terminal reason written when an open review row is closed as already published. */
+export const ALREADY_PUBLISHED_REVIEW_REASON = 'reconciled_published';
+
+/** Transaction sources that count as a live published read. */
+const LIVE_PUBLISHED_TX_SOURCES_SQL = `('primary','manual','local_mac','server_cpu')`;
+
+/** Ingestion-decision actions that prove the doc already published. */
+const PUBLISH_DECISION_ACTIONS_SQL = `('auto_published','confirmed','manual','agreement_published')`;
+
+/**
+ * A review row can outlive the publish it was created for: the publish path
+ * records an `auto_published` decision and inserts live transactions, but its
+ * `UPDATE review_queue ... WHERE ... review_revision = ?` no-ops when the
+ * revision drifted between the read and the write (observed 2026-09-24:
+ * H-2026-9116292 auto_published tx:11 on 2026-08-18 yet still pending at
+ * review_revision 4; 15 `form_chrome_only,ocr_unusable` scanned_pdf rows total).
+ *
+ * Such a row can never be honestly re-decided through the admin API: `reject`
+ * deprecates the live published transactions, and `confirm` needs edits the
+ * empty review payload does not have. This sweep closes it the only honest way
+ * — as already published — but ONLY when both independent pieces of evidence
+ * exist: a live non-deprecated transaction AND a recorded publish decision for
+ * the same doc. A row with no live transaction, an explicit `unpublished:`
+ * reopen, an agreement-cascade dispute, or a provider-only placeholder is left
+ * untouched, so this never bulk-resolves real work.
+ *
+ * Bounded, idempotent, safe to run hourly/concurrently; the review_revision
+ * bump makes a concurrent admin decision that read the pre-sweep revision
+ * no-op cleanly.
+ */
+export const ALREADY_PUBLISHED_CASCADE_REASON = 'reconciled_published_after_local_mac';
+
+/** Ingest statuses the already-published close may stamp back to persisted. */
+const ALREADY_PUBLISHED_FILING_STATUSES = [
+  ...DESYNCED_INGEST_STATUSES,
+  // Cascade orphans often sit at filings.ingest_status='error' after a prior
+  // reject, even though local_mac later published live rows.
+  'error',
+] as const;
+
+export async function sweepAlreadyPublishedReviewRows(
+  env: Env,
+  opts: {
+    limit?: number;
+    /** When true, also close agreement_cascade_unresolved rows that still have
+     *  live published txs + a publish decision (local_mac won after cascade). */
+    includeAgreementCascade?: boolean;
+  } = {},
+): Promise<AlreadyPublishedReviewSweepResult> {
+  const limit = opts.limit ?? 500;
+  const includeAgreementCascade = opts.includeAgreementCascade === true;
+  const cascadeClause = includeAgreementCascade
+    ? ''
+    : `AND COALESCE(rq.reason, '') NOT LIKE '%agreement_cascade%'`;
+  const statusPlaceholders = ALREADY_PUBLISHED_FILING_STATUSES.map(() => '?').join(',');
+  // When includeAgreementCascade is on, the same UPDATE can close both
+  // cascade and non-cascade rows. Stamp the cascade-specific audit reason
+  // only on cascade rows so non-cascade closes stay reconciled_published.
+  const filingReasons = includeAgreementCascade
+    ? [ALREADY_PUBLISHED_REVIEW_REASON, ALREADY_PUBLISHED_CASCADE_REASON]
+    : [ALREADY_PUBLISHED_REVIEW_REASON];
+  const filingReasonPlaceholders = filingReasons.map(() => '?').join(',');
+  const results = await batch(env.DB, [
+    [
+      `UPDATE review_queue
+          SET resolved = 1,
+              resolution_kind = 'published',
+              resolution_reason = CASE
+                WHEN COALESCE(reason, '') LIKE '%agreement_cascade%'
+                  THEN ?
+                ELSE ?
+              END,
+              resolved_at = CURRENT_TIMESTAMP,
+              review_revision = review_revision + 1
+        WHERE resolved = 0
+          AND doc_id IN (
+            SELECT rq.doc_id
+              FROM review_queue rq
+             WHERE rq.resolved = 0
+               AND COALESCE(rq.reason, '') NOT LIKE '%unpublished%'
+               ${cascadeClause}
+               AND COALESCE(rq.reason, '') NOT LIKE '%provider_discovered_missing_official%'
+               AND EXISTS (
+                 SELECT 1 FROM transactions t
+                  WHERE t.doc_id = rq.doc_id
+                    AND t.deprecated_at IS NULL
+                    AND t.source IN ${LIVE_PUBLISHED_TX_SOURCES_SQL}
+               )
+               AND EXISTS (
+                 SELECT 1 FROM ingestion_decisions d
+                  WHERE d.doc_id = rq.doc_id
+                    AND d.action IN ${PUBLISH_DECISION_ACTIONS_SQL}
+               )
+             ORDER BY rq.created_at ASC
+             LIMIT ?
+          )`,
+      [ALREADY_PUBLISHED_CASCADE_REASON, ALREADY_PUBLISHED_REVIEW_REASON, limit],
+    ],
+    [
+      `UPDATE filings
+          SET ingest_status = 'persisted',
+              error = NULL
+        WHERE doc_id IN (
+          SELECT f.doc_id
+            FROM filings f
+            JOIN review_queue rq ON rq.doc_id = f.doc_id
+           WHERE rq.resolved = 1
+             AND rq.resolution_kind = 'published'
+             AND rq.resolution_reason IN (${filingReasonPlaceholders})
+             AND f.ingest_status IN (${statusPlaceholders})
+             AND EXISTS (
+               SELECT 1 FROM transactions t
+                WHERE t.doc_id = f.doc_id
+                  AND t.deprecated_at IS NULL
+                  AND t.source IN ${LIVE_PUBLISHED_TX_SOURCES_SQL}
+             )
+           LIMIT ?
+        )`,
+      [...filingReasons, ...ALREADY_PUBLISHED_FILING_STATUSES, limit],
+    ],
+  ]);
+  return {
+    cleared: results[0]?.meta?.changes ?? 0,
+    filingsUpdated: results[1]?.meta?.changes ?? 0,
+  };
+}
+
+/** Read-only preview of docs the already-published sweep would close. */
+export async function listAlreadyPublishedReviewCandidates(
+  env: Env,
+  opts: { limit?: number; includeAgreementCascade?: boolean } = {},
+): Promise<Array<{ docId: string; reason: string | null; liveTxCount: number }>> {
+  const limit = opts.limit ?? 500;
+  const includeAgreementCascade = opts.includeAgreementCascade === true;
+  const cascadeClause = includeAgreementCascade
+    ? ''
+    : `AND COALESCE(rq.reason, '') NOT LIKE '%agreement_cascade%'`;
+  const rows = await all<{ doc_id: string; reason: string | null; live_n: number }>(
+    env.DB,
+    `SELECT rq.doc_id AS doc_id,
+            rq.reason AS reason,
+            (SELECT COUNT(*) FROM transactions t
+              WHERE t.doc_id = rq.doc_id
+                AND t.deprecated_at IS NULL
+                AND t.source IN ${LIVE_PUBLISHED_TX_SOURCES_SQL}) AS live_n
+       FROM review_queue rq
+      WHERE rq.resolved = 0
+        AND COALESCE(rq.reason, '') NOT LIKE '%unpublished%'
+        ${cascadeClause}
+        AND COALESCE(rq.reason, '') NOT LIKE '%provider_discovered_missing_official%'
+        AND EXISTS (
+          SELECT 1 FROM transactions t
+           WHERE t.doc_id = rq.doc_id
+             AND t.deprecated_at IS NULL
+             AND t.source IN ${LIVE_PUBLISHED_TX_SOURCES_SQL}
+        )
+        AND EXISTS (
+          SELECT 1 FROM ingestion_decisions d
+           WHERE d.doc_id = rq.doc_id
+             AND d.action IN ${PUBLISH_DECISION_ACTIONS_SQL}
+        )
+      ORDER BY rq.created_at ASC
+      LIMIT ?`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    docId: r.doc_id,
+    reason: r.reason,
+    liveTxCount: Number(r.live_n) || 0,
+  }));
+}
+
 /**
  * Entry point wired hourly from deno/cronLanes.ts. Each sweep is isolated —
  * one failing does not block the others — and every sweep is itself bounded
@@ -596,12 +1386,22 @@ export async function runAutonomySweeps(
     ceiling: null,
     stranded: null,
     resolvedDesync: null,
+    providerOnlyStubs: null,
+    providerStubOfficialReconcile: null,
+    alreadyPublished: null,
     filedDateBackfill: null,
     ogeUndated: null,
     livenessAlarms: null,
     deterministicDrain: null,
     localVisionRequeue: null,
     hostedFallback: null,
+    pollingHeartbeat: null,
+    pipelineStallAlerts: null,
+    executiveTerminals: null,
+    unreadableReopened: null,
+    transientDlq: null,
+    completedEmptyRaw: null,
+    ungroundedIngest: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -638,6 +1438,36 @@ export async function runAutonomySweeps(
     errors.push(`stranded: ${(err as Error).message}`);
   }
 
+  // Reject stubs whose official filing has persisted since (including ones the
+  // provider feed no longer serves) before the verified_empty sweep below, so a
+  // stub with a known official counterpart gets the duplicate verdict instead.
+  try {
+    throwIfAborted();
+    result.providerStubOfficialReconcile = await reconcileProviderMissingStubsWithOfficial(env, { now });
+  } catch (err) {
+    errors.push(`providerStubOfficialReconcile: ${(err as Error).message}`);
+  }
+
+  // Close provider-only placeholder stubs before the desync reconcile below,
+  // so reconcileResolvedReviewStatus can stamp their synthetic filing's
+  // ingest_status to verified_empty in the same run.
+  try {
+    throwIfAborted();
+    result.providerOnlyStubs = await sweepProviderOnlyReviewStubs(env);
+  } catch (err) {
+    errors.push(`providerOnlyStubs: ${(err as Error).message}`);
+  }
+
+  // Close review rows that outlived the publish they were opened for (the
+  // publish path's review UPDATE no-ops when review_revision drifted), before
+  // the desync reconcile runs. Evidence-gated: live tx + a publish decision.
+  try {
+    throwIfAborted();
+    result.alreadyPublished = await sweepAlreadyPublishedReviewRows(env);
+  } catch (err) {
+    errors.push(`alreadyPublished: ${(err as Error).message}`);
+  }
+
   try {
     throwIfAborted();
     result.resolvedDesync = await sweepResolvedStatusDesync(env, now);
@@ -659,6 +1489,23 @@ export async function runAutonomySweeps(
     errors.push(`ogeUndated: ${(err as Error).message}`);
   }
 
+  // Empty 278e still closes.  Unreadable 278-T parks open.  Allowlist,
+  // idempotent, no PDF refetch.  Then reopen rows the old path already
+  // auto-rejected with no human actor.
+  try {
+    throwIfAborted();
+    result.executiveTerminals = await sweepKnownParkedExecutiveTerminals(env, now);
+  } catch (err) {
+    errors.push(`executiveTerminals: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    result.unreadableReopened = await sweepAutoRejectedUnreadable(env, now);
+  } catch (err) {
+    errors.push(`unreadableReopened: ${(err as Error).message}`);
+  }
+
   // A5/C8: one-shot local-vision requeue for rejected scanned+raw garbage OCR.
   try {
     throwIfAborted();
@@ -674,11 +1521,61 @@ export async function runAutonomySweeps(
     errors.push(`hostedFallback: ${(err as Error).message}`);
   }
 
+  // Requeue SQLITE_BUSY / deadline / 429 failures before the alarm sweep
+  // reads health, so a row that just became pending does not page.  Parked
+  // and poison rows are left failed on purpose.
+  try {
+    throwIfAborted();
+    result.transientDlq = await sweepTransientDeadLetters(env, now);
+  } catch (err) {
+    errors.push(`transientDlq: ${(err as Error).message}`);
+  }
+
   try {
     throwIfAborted();
     result.livenessAlarms = await sweepLivenessAlarms(env, now);
   } catch (err) {
     errors.push(`livenessAlarms: ${(err as Error).message}`);
+  }
+
+  // 2026-09-21: per-source polling heartbeat watchdog. The liveness-alarm
+  // sweep fires Pushover when a check is `stalled`/`critical`/`degraded`,
+  // but the existing `polling_house/senate/executive` checks only look at
+  // whether the LAST poll ATTEMPT was successful — they cannot tell the
+  // difference between "a poll just succeeded with 0 new rows" and "no poll
+  // has been ATTEMPTED in the last 7 hours". This watchdog watches
+  // source_attempts directly: if a chamber has gone 4+ hours (weekday) or
+  // 8+ hours (weekend) without ANY attempt, emit a Sentry alarm AND a
+  // Pushover so the operator sees the failure class BEFORE the next day.
+  // Tunable via CT_POLLING_HEARTBEAT_MAX_AGE_MIN (default: weekday 240 / weekend 480).
+  try {
+    throwIfAborted();
+    result.pollingHeartbeat = await sweepPollingHeartbeat(env, now);
+  } catch (err) {
+    errors.push(`pollingHeartbeat: ${(err as Error).message}`);
+  }
+
+  // Completed-with-no-raw first, then any leftover invalid ingest_status.
+  // Both are no-ops once the filing is back on `new` or parked to review.
+  try {
+    throwIfAborted();
+    result.completedEmptyRaw = await sweepCompletedEmptyRawHandoff(env, now);
+  } catch (err) {
+    errors.push(`completedEmptyRaw: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    result.ungroundedIngest = await sweepUngroundedIngestStatus(env, now);
+  } catch (err) {
+    errors.push(`ungroundedIngest: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    result.pipelineStallAlerts = await sweepPipelineStallAlerts(env, now);
+  } catch (err) {
+    errors.push(`pipelineStallAlerts: ${(err as Error).message}`);
   }
 
   return result;

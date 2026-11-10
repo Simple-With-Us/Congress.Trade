@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const insertFilingIfNew = vi.fn();
 const enqueueFilingNew = vi.fn();
@@ -85,6 +85,14 @@ describe('POST /api/ingest/detection', () => {
     enqueueFilingNew.mockResolvedValue(true);
   });
 
+  // Belt-and-suspenders for every `vi.stubGlobal('fetch', ...)` below: if an
+  // assertion throws between the stub and its manual `vi.unstubAllGlobals()`,
+  // the stub would otherwise leak into the next test. A no-op when nothing
+  // was stubbed.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('401 without a token', async () => {
     expect((await post(null, { source: 'house', docKey: 'H-2026-1' })).status).toBe(401);
   });
@@ -100,6 +108,17 @@ describe('POST /api/ingest/detection', () => {
   });
 
   it('records latency and ingests a new filing by default when link is present', async () => {
+    // Stub HEAD validation instead of hitting the real efdsearch.senate.gov
+    // (same reasoning as the house/403/404 stubs below): this test asserts
+    // ingest wiring, not live reachability of a third-party .gov host. Left
+    // unmocked, three tests here made a genuine outbound HTTPS HEAD request
+    // apiece with no timeout of their own, racing vitest's 5000ms default --
+    // flaky under CI's parallel workers precisely because more workers means
+    // more simultaneous real requests to that one external host.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 200, headers: { 'content-type': 'text/html' } })),
+    );
     const res = await post('ingest-secret', {
       source: 'senate',
       docKey: 'S-abc123',
@@ -187,6 +206,13 @@ describe('POST /api/ingest/detection', () => {
   });
 
   it('does not re-enqueue duplicates', async () => {
+    // See the stub note above -- HEAD validation still runs for this
+    // link-bearing request even though insertFilingIfNew short-circuits it,
+    // so this must not depend on live efdsearch.senate.gov reachability.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 200, headers: { 'content-type': 'text/html' } })),
+    );
     insertFilingIfNew.mockResolvedValueOnce('duplicate');
     const res = await post('ingest-secret', {
       source: 'senate',
@@ -236,6 +262,13 @@ describe('POST /api/ingest/detection', () => {
   });
 
   it('returns 503 when the D1 write governor defers the insert', async () => {
+    // See the stub note above -- HEAD validation still runs before the
+    // governor's deferral is observed, so this must not depend on live
+    // efdsearch.senate.gov reachability.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 200, headers: { 'content-type': 'text/html' } })),
+    );
     insertFilingIfNew.mockResolvedValueOnce('deferred');
     const res = await post('ingest-secret', {
       source: 'senate',
@@ -273,16 +306,21 @@ describe('GET /api/ingest/scout-plan + POST latency-payload + raw', () => {
     expect(body.notes.join(' ')).toMatch(/R2/);
   });
 
-  it('accepts scout latency payloads', async () => {
+  it('rejects scout latency payloads with 410 Gone (scout retired 2026-09-09)', async () => {
+    // The Mac scout that POSTed here is retired and the server probes FMP
+    // itself now.  The route stays mounted so an in-flight Mac client gets a
+    // clean, explanatory 410 rather than a 500 — and, importantly, so a stray
+    // payload can no longer write latency observations into KV.
     const res = await authPost('/latency-payload', 'ingest-secret', {
       provider: 'fmp',
       fmpPathId: 'stable',
       chamberJson: { house: [{ name: 'A' }], senate: [] },
     });
-    expect(res.status).toBe(200);
-    expect(ingestScoutLatencyPayload).toHaveBeenCalledTimes(1);
-    const body = (await res.json()) as { ok: boolean; upserted: number };
-    expect(body).toMatchObject({ ok: true, upserted: 2 });
+    expect(res.status).toBe(410);
+    expect(ingestScoutLatencyPayload).not.toHaveBeenCalled();
+    const body = (await res.json()) as { ok: boolean; deprecated: boolean; error: string };
+    expect(body).toMatchObject({ ok: false, deprecated: true });
+    expect(body.error).toMatch(/retired/);
   });
 
   it('stores residential raw bytes in R2 for a known filing', async () => {

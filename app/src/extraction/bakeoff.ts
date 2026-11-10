@@ -16,7 +16,7 @@
  */
 
 import type { Env, ParsedTx } from '../shared/types.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { arbitrationRowKey, canonicalArbitrationKeyGroups } from '../extractors/types.ts';
 import {
   SYSTEM_PROMPT,
   EXECUTIVE_SYSTEM_PROMPT,
@@ -40,16 +40,18 @@ import {
   classifyProviderFailure,
   type ProviderFailureStatus,
 } from './providerFailure.ts';
-import { priceBenchmarkUsage } from './benchmarkMetrics.ts';
+import { estimateNominalReadCostUsd, priceBenchmarkUsage } from './benchmarkMetrics.ts';
 import {
   assertDocLlmSpendAllowed,
   checkLlmSpendCeiling,
+  isLlamaParseProvider,
   isLlmDocBudgetHalt,
   llmBudgetHaltMessage,
   LlmDocBudgetExceededError,
   LlmSpendSettlementError,
   settleLlmSpend,
 } from '../shared/llmSpend.ts';
+
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
 import { assertOpenRouterBudgetCircuitAllowsCall } from '../shared/openRouterBudgetCircuit.ts';
 import { IngestRetryError } from '../ingestion/fetcher.ts';
@@ -94,7 +96,8 @@ export interface CandidateInvocation {
  * OpenRouter vision adapter (openRouterVision.ts) special-cases it as the
  * mistral-ocr file-parser plugin, so it MUST stay this exact slug. Every other openrouter slug was verified LIVE
  * against the OpenRouter models API (2026-07-16 for the pre-existing set; claude-haiku-4.5
- * verified 2026-07-17, anthropic/claude-opus-4.8 verified 2026-07-19).
+ * verified 2026-07-17, anthropic/claude-opus-4.8 verified 2026-07-19; claude-opus-5,
+ * x-ai/grok-4.6, google/gemini-3.8-flash verified 2026-09-18).
  * openrouter/auto and the higher-tier GPT-5.6 models (terra-pro, sol) were moved to
  * NON_OFFERED_CANDIDATES. Note claude-haiku-4.5 uses a DOT — `anthropic/claude-haiku-4-5`
  * (dash) does not exist on OpenRouter. Slugs confirmed absent from the live API
@@ -102,8 +105,9 @@ export interface CandidateInvocation {
  * mistral-large-2411, grok-2-vision-1212, qwen-2.5-vl-72b:free, qwen-max, yi-large, kimi-chat,
  * minimax-hep-lite, deepseek-chat/-coder) must never reappear — every benchmark
  * cell for a dead slug can only fail. `~google/gemini-flash-latest` is the
- * live OpenRouter Flash seat (currently Gemini 3.7).  `google/gemini-3.7-flash`
- * stays offered as the pinned generation.
+ * live OpenRouter Flash seat (currently Gemini 3.8).  `google/gemini-3.8-flash`
+ * stays offered as the pinned generation (bumped from 3.7 2026-09-18: identical
+ * $0.75/$3.75 per-M price and 1.05M context, so 3.8 strictly dominates the older pin).
  */
 export const DEFAULT_CANDIDATES: BakeoffCandidate[] = [
   // Mistral OCR via the OpenRouter mistral-ocr file-parser plugin (see
@@ -114,8 +118,8 @@ export const DEFAULT_CANDIDATES: BakeoffCandidate[] = [
   { provider: 'openrouter', model: 'openai/gpt-5.6-luna' },
   { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
   { provider: 'openrouter', model: 'anthropic/claude-haiku-4.5' },
-  { provider: 'openrouter', model: 'anthropic/claude-opus-4.8' },
-  { provider: 'openrouter', model: 'x-ai/grok-4.5' },
+  { provider: 'openrouter', model: 'anthropic/claude-opus-5' },
+  { provider: 'openrouter', model: 'x-ai/grok-4.6' },
   { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro' },
   { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
   { provider: 'openrouter', model: 'qwen/qwen3-vl-30b-a3b-instruct' },
@@ -123,7 +127,7 @@ export const DEFAULT_CANDIDATES: BakeoffCandidate[] = [
   { provider: 'openrouter', model: 'google/gemini-3.5-flash-lite' },
   { provider: 'openrouter', model: 'amazon/nova-lite-v1' },
   { provider: 'openrouter', model: 'z-ai/glm-4.6v' },
-  { provider: 'openrouter', model: 'google/gemini-3.7-flash' },
+  { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
   { provider: 'openrouter', model: '~google/gemini-flash-latest' },
   { provider: 'openrouter', model: 'qwen/qwen-2.5-72b-instruct' },
 ];
@@ -185,7 +189,8 @@ export interface CandidateDocResult {
   failure?: ProviderFailureStatus;
   latencyMs: number;
   rowCount: number;
-  /** Stable row keys (ticker/name|date|type) for agreement scoring. */
+  /** Stable row keys (ticker/name|date|type|owner) for agreement scoring.
+   *  A missing owner keeps the historical 3-part key. */
   rowKeys: string[];
   /** Mean per-row extractor confidence in [0,1] (0 when no rows / failed). */
   avgConfidence: number;
@@ -217,6 +222,12 @@ export interface CandidateDocResult {
   };
   /** Indicates if this result was loaded from the extraction_runs cache (prevents duplicate db inserts) */
   cached?: boolean;
+  /**
+   * True when this slot was not invoked because the next live call would
+   * exceed the remaining per-doc USD ceiling or the daily LLM USD/credit
+   * ceiling. Not a provider failure.
+   */
+  skippedUnaffordable?: boolean;
 }
 
 /** Per-model rollup across all documents. */
@@ -797,7 +808,7 @@ export function extractXaiResponseText(payload: unknown): string {
 /**
  * xAI Grok via the Files API. Unlike the inline-base64 providers, Grok needs the
  * PDF uploaded first (`POST /v1/files`), then the returned `file_id` attached to
- * an agentic `/v1/responses` call (grok-4.3), whose server-side OCR+vision reads
+ * an agentic `/v1/responses` call (grok-4.6), whose server-side OCR+vision reads
  * the scan. Two round-trips, so it's the slowest candidate.
  */
 async function runXai(
@@ -1206,6 +1217,75 @@ export function candidateSpendUsd(
   return priced.costUsd;
 }
 
+/** Conservative planning cost when the rate card cannot price a model. */
+const UNPRICEABLE_READ_COST_USD = 0.05;
+
+/**
+ * Load the latest successful extraction_runs row for this provider:model.
+ * Returns null on miss / pre-migration / malformed JSON. $0 — no spend gate.
+ */
+export async function loadCachedCandidateRows(
+  env: Env,
+  candidate: BakeoffCandidate,
+  docId: string,
+): Promise<ParsedTx[] | null> {
+  try {
+    const cachedRunResult = await env.DB?.prepare(
+      `SELECT result_json FROM extraction_runs WHERE doc_id = ? AND provider = ? AND model = ? AND ok = 1 ORDER BY created_at DESC LIMIT 1`,
+    ).bind(docId, candidate.provider, candidate.model).first<{ result_json: string }>();
+    if (!cachedRunResult?.result_json) return null;
+    const parsed = JSON.parse(cachedRunResult.result_json) as ParsedTx[];
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function cachedCandidateResult(
+  candidate: BakeoffCandidate,
+  docId: string,
+  rows: ParsedTx[],
+): CandidateDocResult {
+  return {
+    provider: candidate.provider,
+    model: candidate.model,
+    docId,
+    ok: true,
+    latencyMs: 0,
+    rowCount: rows.length,
+    rowKeys: rows.map(arbitrationRowKey),
+    avgConfidence: meanConfidence(rows),
+    rows,
+    cached: true,
+  };
+}
+
+export function unaffordableCandidateResult(
+  candidate: BakeoffCandidate,
+  docId: string,
+  error: string,
+): CandidateDocResult {
+  return {
+    provider: candidate.provider,
+    model: candidate.model,
+    docId,
+    ok: false,
+    error: error.slice(0, 300),
+    failure: classifyProviderFailure(candidate.provider, candidate.model, error) ?? undefined,
+    latencyMs: 0,
+    rowCount: 0,
+    rowKeys: [],
+    avgConfidence: 0,
+    rows: [],
+    skippedUnaffordable: true,
+  };
+}
+
+/** Planning cost of one live read; unpriceable models get a conservative stand-in. */
+export function estimateLiveReadCostUsd(candidate: BakeoffCandidate): number {
+  return estimateNominalReadCostUsd(candidate.provider, candidate.model) ?? UNPRICEABLE_READ_COST_USD;
+}
+
 /** Run one candidate over one document's bytes, timing it and trapping errors. */
 export async function runCandidateOnDoc(
   env: Env,
@@ -1230,26 +1310,26 @@ export async function runCandidateOnDoc(
       rows: [],
     };
   }
+
+  // Reuse prior rows BEFORE any spend gate. H-2026-9116328 died on the
+  // per-doc ceiling while a good prior extract sat unused because this
+  // lookup used to run after assertDocLlmSpendAllowed.
+  if (!invocation?.skipCache) {
+    const cached = await loadCachedCandidateRows(env, candidate, docId);
+    if (cached) return cachedCandidateResult(candidate, docId, cached);
+  }
+
   // Per-doc cap + skip when rows already exist (unless admin reprocess path
   // calls with a dedicated reprocess flag later). Live extraction never
-  // re-spends on docs that already have transactions.
+  // re-spends on docs that already have transactions. Also refuse a live
+  // call whose estimated cost would overshoot the remaining ceiling.
+  const reprocess = (invocation as { reprocess?: boolean } | undefined)?.reprocess === true;
+  const estimatedUsd = isLlamaParseProvider(provider) ? 0 : estimateLiveReadCostUsd(candidate);
   try {
-    await assertDocLlmSpendAllowed(env, docId, {
-      reprocess: (invocation as { reprocess?: boolean } | undefined)?.reprocess === true,
-    });
+    await assertDocLlmSpendAllowed(env, docId, { reprocess, estimatedUsd, provider });
   } catch (err) {
     if (err instanceof LlmDocBudgetExceededError || isLlmDocBudgetHalt(err)) {
-      return {
-        ...base,
-        ok: false,
-        error: (err as Error).message.slice(0, 300),
-        failure: classifyProviderFailure(provider, model, (err as Error).message) ?? undefined,
-        latencyMs: 0,
-        rowCount: 0,
-        rowKeys: [],
-        avgConfidence: 0,
-        rows: [],
-      };
+      return unaffordableCandidateResult(candidate, docId, (err as Error).message);
     }
     throw err;
   }
@@ -1277,36 +1357,6 @@ export async function runCandidateOnDoc(
     };
   }
 
-  // Reuse prior rows for ordinary repeat reads, but never for benchmark paths
-  // that need fresh provider latency/usage/cost measurements.
-  if (!invocation?.skipCache) {
-    try {
-      const cachedRunResult = await env.DB?.prepare(
-        `SELECT result_json FROM extraction_runs WHERE doc_id = ? AND provider = ? AND model = ? AND ok = 1 ORDER BY created_at DESC LIMIT 1`
-      ).bind(docId, provider, model).first<{ result_json: string }>();
-
-      if (cachedRunResult?.result_json) {
-        const parsed = JSON.parse(cachedRunResult.result_json) as ParsedTx[];
-        // result_json stores JSON.stringify(result.rows), not CandidateDocResult.
-        if (Array.isArray(parsed)) {
-          return {
-            ...base,
-            ok: true,
-            latencyMs: 0,
-            rowCount: parsed.length,
-            rowKeys: parsed.map(arbitrationRowKey),
-            avgConfidence: meanConfidence(parsed),
-            rows: parsed,
-            cached: true,
-          };
-        }
-      }
-    } catch {
-      // extraction_runs may not exist before migration, or an old row may be
-      // malformed. Either case falls through to the provider call.
-    }
-  }
-
   // GOVERNOR 1: hard daily USD ceiling, enforced fail-closed at this single
   // choke point (every extraction/benchmark/bakeoff/agreement provider call
   // dispatches here) BEFORE any money is spent. Budget halts are terminal for
@@ -1315,18 +1365,9 @@ export async function runCandidateOnDoc(
   // ceiling would halt that failover here anyway.
   const spendGate = await checkLlmSpendCeiling(env, provider);
   if (!spendGate.allowed) {
-    const error = llmBudgetHaltMessage(spendGate);
-    return {
-      ...base,
-      ok: false,
-      error,
-      failure: classifyProviderFailure(provider, model, error) ?? undefined,
-      latencyMs: 0,
-      rowCount: 0,
-      rowKeys: [],
-      avgConfidence: 0,
-      rows: [],
-    };
+    // Daily USD/credit ceiling — same unaffordable signal as the per-doc latch so
+    // an earlier quality survivor can still publish instead of model_read_failed.
+    return unaffordableCandidateResult(candidate, docId, llmBudgetHaltMessage(spendGate));
   }
 
   const started = Date.now();
@@ -1573,16 +1614,20 @@ export function computeConsensusAgreement(results: CandidateDocResult[]): Map<st
     if (ok.length < 2) continue; // need ≥2 models to form a consensus
 
     // Tally how many models found each key; consensus = found by > half.
+    // Mixed vintages (historical 3-part keys and owner-qualified keys) are
+    // aligned first so a stored key still counts as the same lot.
+    const aligned = canonicalArbitrationKeyGroups(ok.map((r) => r.rowKeys));
     const keyVotes = new Map<string, number>();
-    for (const r of ok) {
-      for (const k of new Set(r.rowKeys)) keyVotes.set(k, (keyVotes.get(k) ?? 0) + 1);
+    for (const keys of aligned) {
+      for (const k of new Set(keys)) keyVotes.set(k, (keyVotes.get(k) ?? 0) + 1);
     }
     const majority = Math.floor(ok.length / 2) + 1;
     const consensus = new Set([...keyVotes].filter(([, v]) => v >= majority).map(([k]) => k));
     if (consensus.size === 0) continue;
 
-    for (const r of ok) {
-      const have = new Set(r.rowKeys);
+    for (let index = 0; index < ok.length; index += 1) {
+      const r = ok[index];
+      const have = new Set(aligned[index]);
       let hit = 0;
       for (const k of consensus) if (have.has(k)) hit++;
       const m = label(r);

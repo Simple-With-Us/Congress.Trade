@@ -17,6 +17,11 @@ import {
   snapshotObjectKey,
   SNAPSHOT_TABLES,
   SNAPSHOT_SCHEMA,
+  selectPruneTargets,
+  pruneBulkSnapshots,
+  parseRunObjectKey,
+  parseBulkObjectDate,
+  shiftUtcDate,
 } from '../snapshot.ts';
 
 const RUN = 'run-fixed-1';
@@ -230,5 +235,274 @@ describe('runBulkSnapshot', () => {
     expect(read?.snapshotDate).toBe('2026-06-25');
     expect(read?.runId).toBe(RUN);
     expect(await readManifest(envWith(db, r2), '2099-01-01')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retention / prune
+//
+// Regression cover for the growth this module used to call "negligible R2 cost":
+// nothing ever deleted a superseded run or an expired date, so `bulk/` became
+// the largest prefix in congress-trade-bucket and kept pushing the account at
+// R2's 10 GB free tier.
+// ---------------------------------------------------------------------------
+
+const HOUR = 3_600_000;
+/** `nowMs` for the selector tests — every fixture age is relative to this. */
+const PRUNE_NOW = Date.parse('2026-06-25T12:00:00.000Z');
+const old = (hours: number) => new Date(PRUNE_NOW - hours * HOUR);
+
+function selectorOpts(over: Record<string, unknown> = {}) {
+  return {
+    today: '2026-06-25',
+    keepRunId: RUN,
+    keepRunDate: '2026-06-25',
+    keepDays: 14,
+    graceMinutes: 60,
+    nowMs: PRUNE_NOW,
+    maxDeletes: 500,
+    ...over,
+  } as Parameters<typeof selectPruneTargets>[1];
+}
+
+describe('selectPruneTargets', () => {
+  it('deletes a superseded run on a retained date but never the live run', () => {
+    const targets = selectPruneTargets(
+      [
+        { key: `bulk/2026-06-25/runs/${RUN}/price_eod.ndjson`, uploaded: old(5) },
+        { key: 'bulk/2026-06-25/runs/run-stale/price_eod.ndjson', uploaded: old(5) },
+        { key: 'bulk/2026-06-25/runs/run-stale/spx_eod.ndjson', uploaded: old(5) },
+      ],
+      selectorOpts(),
+    );
+    expect(targets).toEqual([
+      'bulk/2026-06-25/runs/run-stale/price_eod.ndjson',
+      'bulk/2026-06-25/runs/run-stale/spx_eod.ndjson',
+    ]);
+  });
+
+  it('leaves a superseded run alone until the grace window elapses', () => {
+    const key = 'bulk/2026-06-25/runs/run-stale/price_eod.ndjson';
+    expect(selectPruneTargets([{ key, uploaded: old(0.25) }], selectorOpts())).toEqual([]);
+    expect(selectPruneTargets([{ key, uploaded: old(2) }], selectorOpts())).toEqual([key]);
+  });
+
+  it('refuses to delete an object whose upload time is unknown', () => {
+    // Without a timestamp we cannot prove the grace window passed, and the
+    // object may belong to a run a consumer is streaming right now.
+    for (const uploaded of [undefined, null, 'not-a-date']) {
+      expect(
+        selectPruneTargets(
+          [{ key: 'bulk/2026-06-25/runs/run-stale/price_eod.ndjson', uploaded }],
+          selectorOpts(),
+        ),
+      ).toEqual([]);
+    }
+  });
+
+  it('deletes an expired date entirely, manifest included, ignoring grace', () => {
+    const targets = selectPruneTargets(
+      [
+        { key: 'bulk/2026-05-01/manifest.json', uploaded: old(0.1) },
+        { key: 'bulk/2026-05-01/runs/run-old/price_eod.ndjson', uploaded: old(0.1) },
+      ],
+      selectorOpts(),
+    );
+    expect(targets).toEqual([
+      'bulk/2026-05-01/manifest.json',
+      'bulk/2026-05-01/runs/run-old/price_eod.ndjson',
+    ]);
+  });
+
+  it('keeps the manifest of every retained date, including the oldest kept day', () => {
+    // keepDays 14 counting today ⇒ oldest kept is 2026-06-12.
+    const targets = selectPruneTargets(
+      [
+        { key: 'bulk/2026-06-12/manifest.json', uploaded: old(200) },
+        { key: 'bulk/2026-06-12/runs/run-a/price_eod.ndjson', uploaded: old(200) },
+        { key: 'bulk/2026-06-11/manifest.json', uploaded: old(224) },
+      ],
+      selectorOpts(),
+    );
+    // 06-12 is retained, so its manifest stays; its run carries no live-run id
+    // for that date and is past grace. 06-11 has expired outright.
+    expect(targets).toEqual([
+      'bulk/2026-06-11/manifest.json',
+      'bulk/2026-06-12/runs/run-a/price_eod.ndjson',
+    ]);
+  });
+
+  it('never touches keys this job does not own', () => {
+    const foreign = [
+      { key: 'raw/1234-abcd', uploaded: old(9000) },
+      { key: 'weekly/congress-trade-20260815T211942Z.db', uploaded: old(9000) },
+      { key: 'historical-dumps/2024.ndjson', uploaded: old(9000) },
+      { key: '_ops/usage-telemetry', uploaded: old(9000) },
+      { key: 'bulk/manifest.json', uploaded: old(9000) },
+      { key: 'bulk/not-a-date/runs/r/price_eod.ndjson', uploaded: old(9000) },
+      { key: 'bulk/2026-05-01/runs/../../raw/escape.ndjson', uploaded: old(9000) },
+      { key: 'bulk/2026-05-01/runs/run-old/price_eod.txt', uploaded: old(9000) },
+    ];
+    expect(selectPruneTargets(foreign, selectorOpts())).toEqual([]);
+  });
+
+  it('never touches a future-dated key (clock skew)', () => {
+    expect(
+      selectPruneTargets(
+        [{ key: 'bulk/2027-01-01/runs/run-x/price_eod.ndjson', uploaded: old(9000) }],
+        selectorOpts(),
+      ),
+    ).toEqual([]);
+  });
+
+  it('caps deletes and takes the oldest dates first so a backlog drains', () => {
+    const fixtures = [
+      { key: 'bulk/2026-06-01/manifest.json', uploaded: old(600) },
+      { key: 'bulk/2026-05-01/manifest.json', uploaded: old(1300) },
+      { key: 'bulk/2026-04-01/manifest.json', uploaded: old(2000) },
+    ];
+    expect(selectPruneTargets(fixtures, selectorOpts({ maxDeletes: 2 }))).toEqual([
+      'bulk/2026-04-01/manifest.json',
+      'bulk/2026-05-01/manifest.json',
+    ]);
+  });
+
+  it('returns nothing for nonsensical retention settings', () => {
+    const fixtures = [{ key: 'bulk/2026-05-01/manifest.json', uploaded: old(2000) }];
+    expect(selectPruneTargets(fixtures, selectorOpts({ keepDays: 0 }))).toEqual([]);
+    expect(selectPruneTargets(fixtures, selectorOpts({ maxDeletes: 0 }))).toEqual([]);
+    expect(selectPruneTargets(fixtures, selectorOpts({ today: 'garbage' }))).toEqual([]);
+  });
+
+  it('parses and rejects key shapes exactly', () => {
+    expect(parseRunObjectKey(`bulk/2026-06-25/runs/${RUN}/price_eod.ndjson`)).toEqual({
+      date: '2026-06-25',
+      runId: RUN,
+    });
+    expect(parseRunObjectKey('bulk/2026-06-25/manifest.json')).toBeNull();
+    expect(parseBulkObjectDate('bulk/2026-06-25/manifest.json')).toBe('2026-06-25');
+    expect(parseBulkObjectDate('raw/anything')).toBeNull();
+  });
+
+  it('shifts dates across month and year boundaries', () => {
+    expect(shiftUtcDate('2026-03-01', -1)).toBe('2026-02-28');
+    expect(shiftUtcDate('2026-01-01', -1)).toBe('2025-12-31');
+    expect(shiftUtcDate('2024-03-01', -1)).toBe('2024-02-29'); // leap year
+  });
+});
+
+/** R2 fake that also supports list()/delete(), which the writer fake omits. */
+function fakeR2WithList(entries: Array<{ key: string; uploaded: Date }>) {
+  const store = new Map(entries.map((e) => [e.key, e.uploaded]));
+  const deleted: string[] = [];
+  return {
+    store,
+    deleted,
+    async put(key: string) { store.set(key, new Date(PRUNE_NOW)); },
+    async get() { return null; },
+    async delete(key: string) {
+      if (key.includes('undeletable')) throw new Error('AccessDenied');
+      deleted.push(key);
+      store.delete(key);
+    },
+    async list({ prefix }: { prefix?: string } = {}) {
+      return {
+        objects: [...store.entries()]
+          .filter(([key]) => !prefix || key.startsWith(prefix))
+          .map(([key, uploaded]) => ({ key, size: 1, uploaded })),
+        truncated: false,
+        delimitedPrefixes: [] as string[],
+      };
+    },
+  };
+}
+
+describe('pruneBulkSnapshots', () => {
+  const base = { today: '2026-06-25', keepRunId: RUN, keepRunDate: '2026-06-25', now: new Date(PRUNE_NOW) };
+
+  it('deletes expired dates and superseded runs, leaving live and foreign keys', async () => {
+    const r2 = fakeR2WithList([
+      { key: 'bulk/2026-01-02/manifest.json', uploaded: old(4000) },
+      { key: 'bulk/2026-01-02/runs/run-ancient/price_eod.ndjson', uploaded: old(4000) },
+      { key: 'bulk/2026-06-25/runs/run-stale/price_eod.ndjson', uploaded: old(6) },
+      { key: `bulk/2026-06-25/runs/${RUN}/price_eod.ndjson`, uploaded: old(0.1) },
+      { key: 'bulk/2026-06-25/manifest.json', uploaded: old(0.1) },
+      { key: 'raw/keep-me', uploaded: old(9999) },
+    ]);
+    const result = await pruneBulkSnapshots(envWith({}, r2), base);
+
+    expect(result.deleted).toBe(3);
+    expect(result.failed).toBe(0);
+    expect([...r2.deleted].sort()).toEqual([
+      'bulk/2026-01-02/manifest.json',
+      'bulk/2026-01-02/runs/run-ancient/price_eod.ndjson',
+      'bulk/2026-06-25/runs/run-stale/price_eod.ndjson',
+    ]);
+    expect(r2.store.has(`bulk/2026-06-25/runs/${RUN}/price_eod.ndjson`)).toBe(true);
+    expect(r2.store.has('bulk/2026-06-25/manifest.json')).toBe(true);
+    expect(r2.store.has('raw/keep-me')).toBe(true);
+  });
+
+  it('honours the kill switch without deleting anything', async () => {
+    const r2 = fakeR2WithList([{ key: 'bulk/2026-01-02/manifest.json', uploaded: old(4000) }]);
+    const env = { DB: {}, RAW_FILES: r2, BULK_SNAPSHOT_PRUNE_DISABLED: '1' } as unknown as Env;
+    const result = await pruneBulkSnapshots(env, base);
+    expect(result.skipped).toBe('disabled');
+    expect(r2.deleted).toEqual([]);
+  });
+
+  it('degrades quietly when the binding has no list()', async () => {
+    const result = await pruneBulkSnapshots(envWith({}, fakeR2()), base);
+    expect(result.skipped).toBe('unsupported');
+    expect(result.deleted).toBe(0);
+  });
+
+  it('counts a failed delete without throwing or blocking the rest', async () => {
+    const r2 = fakeR2WithList([
+      { key: 'bulk/2026-01-02/runs/run-undeletable/price_eod.ndjson', uploaded: old(4000) },
+      { key: 'bulk/2026-01-03/manifest.json', uploaded: old(4000) },
+    ]);
+    const result = await pruneBulkSnapshots(envWith({}, r2), base);
+    expect(result.failed).toBe(1);
+    expect(result.deleted).toBe(1);
+    expect(r2.deleted).toEqual(['bulk/2026-01-03/manifest.json']);
+  });
+
+  it('survives a listing failure', async () => {
+    const r2 = { ...fakeR2WithList([]), async list() { throw new Error('R2 unavailable'); } };
+    await expect(pruneBulkSnapshots(envWith({}, r2), base)).resolves.toMatchObject({ deleted: 0, failed: 0 });
+  });
+
+  it('respects a BULK_SNAPSHOT_KEEP_DAYS override', async () => {
+    // keepDays 2 ⇒ oldest kept is 06-24, so only 06-20 expires.
+    const r2 = fakeR2WithList([
+      { key: 'bulk/2026-06-24/manifest.json', uploaded: old(30) },
+      { key: 'bulk/2026-06-20/manifest.json', uploaded: old(130) },
+    ]);
+    const env = { DB: {}, RAW_FILES: r2, BULK_SNAPSHOT_KEEP_DAYS: '2' } as unknown as Env;
+    await pruneBulkSnapshots(env, base);
+    expect(r2.deleted).toEqual(['bulk/2026-06-20/manifest.json']);
+  });
+});
+
+describe('runBulkSnapshot prune integration', () => {
+  it('prunes a superseded same-day run after publishing the new manifest', async () => {
+    const { db } = fakeDb({ price_eod: [], spx_eod: [], securities_ref: [], fundamentals_eod: [], analyst_consensus: [] });
+    const r2 = fakeR2WithList([
+      { key: 'bulk/2026-06-25/runs/run-previous/price_eod.ndjson', uploaded: old(6) },
+    ]);
+    await runBulkSnapshot(envWith(db, r2), '2026-06-25', new Date(PRUNE_NOW), RUN);
+
+    expect(r2.deleted).toEqual(['bulk/2026-06-25/runs/run-previous/price_eod.ndjson']);
+    // The run just published is intact and still reachable through its manifest.
+    expect(r2.store.has(manifestObjectKey('2026-06-25'))).toBe(true);
+    expect(r2.store.has(snapshotObjectKey('2026-06-25', RUN, 'price_eod'))).toBe(true);
+  });
+
+  it('still returns the manifest when the prune blows up', async () => {
+    const { db } = fakeDb({ price_eod: [], spx_eod: [], securities_ref: [], fundamentals_eod: [], analyst_consensus: [] });
+    const r2 = { ...fakeR2WithList([]), async list() { throw new Error('boom'); } };
+    const manifest = await runBulkSnapshot(envWith(db, r2), '2026-06-25', NOW, RUN);
+    expect(manifest.runId).toBe(RUN);
   });
 });

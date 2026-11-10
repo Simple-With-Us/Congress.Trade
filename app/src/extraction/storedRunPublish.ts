@@ -1,16 +1,16 @@
 /**
  * Publish a held filing from extraction_runs already stored for it.
  * No new LLM calls — the expensive reads already happened.
+ * A single quality survivor is enough (H-2026-9116328).
  */
 import type { Env, ParsedTx } from '../shared/types.ts';
 import { all } from '../shared/db.ts';
 import type { CandidateDocResult } from './bakeoff.ts';
 import {
-  buildMajorityRows,
+  decideAgreementPublish,
   finalizePublish,
   loadFilingRow,
-  resolveAgreedRows,
-  sameRowSet,
+  qualityGateAgreementRead,
 } from './agreement.ts';
 import { prepareExtractedRows } from './prepareTx.ts';
 import { loadResolver } from './normalizer.ts';
@@ -81,7 +81,7 @@ export async function maybePublishFromStoredRuns(
             SELECT COUNT(DISTINCT er.provider || ':' || er.model)
               FROM extraction_runs er
              WHERE er.doc_id = rq.doc_id AND er.ok = 1
-          ) >= 2
+          ) >= 1
         ORDER BY rq.created_at DESC
         LIMIT ?`,
       [limit],
@@ -120,20 +120,19 @@ export async function maybePublishFromStoredRuns(
         });
         if (rows.length > 0) latest.set(id, rows);
       }
-      if (latest.size < 2) {
+      const reads = [...latest.entries()]
+        .map(([model, modelRows]) => asRead(docId, model, modelRows))
+        .map((read) => qualityGateAgreementRead(read))
+        .filter((read): read is NonNullable<ReturnType<typeof qualityGateAgreementRead>> => read != null);
+      if (reads.length < 1) {
         out.skipped += 1;
         continue;
       }
 
-      const reads = [...latest.entries()].map(([model, rows]) => asRead(docId, model, rows));
-      const normalizeText = true;
-      let parsed: ParsedTx[] | null = null;
-      if (reads.length >= 2 && reads.every((read, i) => i === 0 || sameRowSet(reads[0], read, normalizeText))) {
-        parsed = resolveAgreedRows(reads, normalizeText);
-      } else {
-        const majority = buildMajorityRows(reads, reads.length, normalizeText);
-        if (majority.ok) parsed = majority.rows;
-      }
+      // Stored-only sweep: lineup is empty; quality survivors are stored evidence
+      // so decideAgreementPublish admits the single-survivor (>=1) publish path.
+      const decision = decideAgreementPublish([], reads, true);
+      const parsed = decision.action === 'publish' ? decision.rows : null;
       if (!parsed || parsed.length === 0) {
         out.skipped += 1;
         continue;

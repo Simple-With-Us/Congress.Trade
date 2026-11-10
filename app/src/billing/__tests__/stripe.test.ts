@@ -3,6 +3,9 @@ import {
   encodeForm,
   verifyStripeSignature,
   stripeEventLivemodeMatchesKey,
+  stripeObjectId,
+  stripeEnvironmentFromKey,
+  stripeEnvironmentFromLivemode,
   billingCapabilities,
   billingCapabilitiesAsync,
   checkoutConfigured,
@@ -271,5 +274,22 @@ describe('stripeEventLivemodeMatchesKey', () => {
   it('skips the check when the key has no live/test prefix', () => {
     expect(stripeEventLivemodeMatchesKey(undefined, 'sk_abc')).toBe(true);
     expect(stripeEventLivemodeMatchesKey(true, undefined)).toBe(true);
+  });
+});
+
+describe('stripeObjectId / environment labels', () => {
+  it('reads a string id or an expanded object id', () => {
+    expect(stripeObjectId('sub_1')).toBe('sub_1');
+    expect(stripeObjectId({ id: 'cus_1' })).toBe('cus_1');
+    expect(stripeObjectId({})).toBeUndefined();
+    expect(stripeObjectId(null)).toBeUndefined();
+  });
+
+  it('maps Stripe key prefix and livemode onto Sandbox vs Production', () => {
+    expect(stripeEnvironmentFromKey('sk_test_abc')).toBe('Sandbox');
+    expect(stripeEnvironmentFromKey('sk_live_abc')).toBe('Production');
+    expect(stripeEnvironmentFromLivemode(false)).toBe('Sandbox');
+    expect(stripeEnvironmentFromLivemode(true)).toBe('Production');
+    expect(stripeEnvironmentFromLivemode(undefined)).toBeNull();
   });
 });

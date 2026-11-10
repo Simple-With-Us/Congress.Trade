@@ -16,57 +16,10 @@ try {
 
 module.exports = {
   apps: [
-    {
-      name: 'scout',
-      script: './scout/run-scout.sh',
-      interpreter: 'bash',
-      cwd: __dirname,
-      log_date_format: 'YYYY-MM-DD HH:mm Z',
-      out_file: './scout/scout.log',
-      error_file: './scout/scout.err',
-      merge_logs: true
-    },
-    // Residential Senate eFD relay (Imperva blocks datacenter IPs). Reached by
-    // the server through Jay's Tunnel (launchd system service) at the permanent
-    // hostname https://scout.jays.services (Coolify SENATE_RELAY_URL).
-    {
-      name: 'senate-relay',
-      script: './scout/run-senate-relay.sh',
-      interpreter: 'bash',
-      cwd: __dirname,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      out_file: './scout/senate-relay.log',
-      error_file: './scout/senate-relay.err',
-      merge_logs: true,
-      autorestart: true,
-    },
-    {
-      name: 'senate-tunnel',
-      // HEALTH WATCHER only — the tunnel itself is Jay's Tunnel, a launchd
-      // system service.  Permanent hostname
-      // https://scout.jays.services. Restarting this entry is safe and
-      // changes nothing on the server: SENATE_RELAY_URL is set once and never
-      // needs updating again. There is no manual step here anymore.
-      //
-      // It used to be a quick tunnel, which minted a new random hostname on
-      // every start while the server kept dialling the static SENATE_RELAY_URL
-      // — the silent 2026-08-11 outage. This comment used to tell you to go
-      // update SENATE_RELAY_URL by hand; that instruction is dead, and so is
-      // the failure mode behind it.
-      script: './scout/run-senate-tunnel.sh',
-      interpreter: 'bash',
-      cwd: __dirname,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      out_file: './scout/senate-tunnel.log',
-      error_file: './scout/senate-tunnel.err',
-      merge_logs: true,
-      autorestart: true,
-      // The wrapper exits non-zero on purpose (unhealthy probe, missing
-      // credentials, no connection) so pm2 restarts it. Without a delay, the
-      // fail-fast paths return in under a second and pm2 would spin them in a
-      // hot loop; 10s keeps recovery prompt without hammering.
-      restart_delay: 10000,
-    },
+    // Mac scout / senate-relay / senate-tunnel retired 2026-09-09 (#2351).
+    // Coolify owns Senate relay/tunnel; residential egress is the little
+    // physical-device / WireGuard proxy via RESIDENTIAL_PROXY_URL (Infisical).
+    // See docs/rollouts/2026-09-09-retire-mac-scout-folder.md.
     {
       name: 'vision-worker',
       script: 'worker.py',

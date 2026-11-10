@@ -33,6 +33,7 @@ import {
   handleAutopilotTick,
   markAutopilotRunHalted,
 } from './extraction/autopilot.ts';
+import { datadogRequestMiddleware } from './shared/datadog.ts';
 import { browserSecurityHeadersMiddleware } from './security/headers.ts';
 import { publicApiGuard } from './security/botDefense.ts';
 import { mountApiRouters } from './apiRouters.ts';
@@ -54,14 +55,18 @@ import {
   trackedFetch,
   withThirdPartyTelemetry,
 } from './shared/thirdPartyTelemetry.ts';
-import { resolveSentryDsn } from './shared/sentryRuntime.ts';
-import { scrubSentryEvent } from './shared/sentryScrub.ts';
+import {
+  buildSentryInitOptions,
+  resolveSentryTracesSampleRate,
+  sentryLoggerWarn,
+} from './shared/sentryRuntime.ts';
 
 const app = new Hono<{ Bindings: Env }>();
 
 // Attach defense-in-depth browser headers to every Worker-generated response,
 // including error and redirect responses. HSTS is added only for HTTPS.
 app.use('*', browserSecurityHeadersMiddleware);
+app.use('*', datadogRequestMiddleware());
 
 // Anti-scraping guard for the public data API (user-agent blocklist + per-IP
 // request budget + X-Robots-Tag). Runs before the feature routers; token-gated
@@ -132,20 +137,7 @@ export {
 };
 
 function sentryOptions(env: Env, tracesSampleRate: number) {
-  return {
-    dsn: resolveSentryDsn(env),
-    environment: env.SENTRY_ENVIRONMENT || 'production',
-    tracesSampleRate,
-    // Fetch instrumentation records complete provider URLs (including query
-    // credentials). Scrub at the final event hooks so errors, breadcrumbs, and
-    // transaction span attributes are clean before envelope serialization.
-    beforeSend: <T>(event: T) => scrubSentryEvent(event),
-    beforeSendTransaction: <T>(event: T) => scrubSentryEvent(event),
-    beforeSendLog: <T>(log: T) => scrubSentryEvent(log),
-    // Structured logs (Sentry Logs product), plus forward console.warn/error as
-    // logs too — the many existing console.error(...) call sites across the
-    // codebase become searchable in Sentry for free, without touching each one.
-    enableLogs: true,
+  return buildSentryInitOptions(env, tracesSampleRate, {
     integrations: [Sentry.consoleLoggingIntegration({ levels: ['warn', 'error'] })],
     // Meter the SDK-owned Sentry envelope transport too. The explicit Env is
     // required because the SDK can flush after the request callback unwinds.
@@ -159,20 +151,15 @@ function sentryOptions(env: Env, tracesSampleRate: number) {
           { envOverride: env, silentQueueFailure: true },
         ),
     },
-    // Outbound fetch also hits third-party providers (FMP, Stripe, Resend,
-    // Infisical) and arbitrary subscriber webhook URLs (delivery/webhook.ts).
-    // Only attach Sentry trace headers to our own domain.
-    tracePropagationTargets: [/^https:\/\/([\w-]+\.)?congress\.trade/],
-  };
+  });
 }
 
 const requestAndScheduledWorker = Sentry.withSentry(
   (env: Env) => sentryOptions(
     env,
     // Send traces for a sample of requests (0 = off, 1.0 = all). Override via
-    // the SENTRY_TRACES_SAMPLE_RATE var without a redeploy; defaults to a cheap
-    // 10% so HTTP/D1/outbound-fetch spans show up without full tracing cost.
-    env.SENTRY_TRACES_SAMPLE_RATE ? Number(env.SENTRY_TRACES_SAMPLE_RATE) : 0.1,
+    // the SENTRY_TRACES_SAMPLE_RATE var without a redeploy; fleet default is 0.2.
+    resolveSentryTracesSampleRate(env, 0.2),
   ),
   {
     /** HTTP entrypoint. */
@@ -335,7 +322,10 @@ const queueWorker = Sentry.withSentry(
               if (completion === 'missing') {
                 // Legacy/direct queue messages predate the outbox. Their work
                 // is complete, and retrying cannot manufacture an origin row.
-                console.warn('delivery outbox completion skipped: missing', msg.txId);
+                sentryLoggerWarn('ingest.dead_letter', {
+                  queue: 'delivery',
+                  reason: 'outbox_missing',
+                });
               }
             }
           } else {
@@ -343,7 +333,10 @@ const queueWorker = Sentry.withSentry(
             if (msg.type === 'filing.new') {
               const completion = await completeIngestionOutbox(env, msg.docId);
               if (completion === 'missing') {
-                console.warn('ingestion outbox completion skipped: missing', msg.docId);
+                sentryLoggerWarn('ingest.dead_letter', {
+                  queue: 'ingest',
+                  reason: 'outbox_missing',
+                });
               }
             }
           }
@@ -368,19 +361,27 @@ const queueWorker = Sentry.withSentry(
               message.ack();
               continue;
             }
-          } else {
+          } else if (!(err instanceof DeliveryRetryError) && !(err instanceof IngestRetryError)) {
             console.error(`queue ${typedBatch.queue} message failed:`, (err as Error).message);
             // Expected queue retries are control flow (at-least-once delivery /
             // transient ingest). Capturing them creates Sentry storms such as
             // CONGRESS-TRADE-J ("webhook delivery target(s) require retry").
             // Reserve Issues for unexpected failures only.
-            if (!(err instanceof DeliveryRetryError) && !(err instanceof IngestRetryError)) {
-              Sentry.captureException(err as Error, {
-                tags: { queue: typedBatch.queue, messageType },
-              });
-            }
+            Sentry.captureException(err as Error, {
+              tags: { queue: typedBatch.queue, messageType },
+            });
           }
-          if (err instanceof DeliveryRetryError || err instanceof IngestRetryError) {
+          if (err instanceof DeliveryRetryError) {
+            sentryLoggerWarn('webhook-retry', {
+              queue: typedBatch.queue,
+              delaySeconds: err.delaySeconds,
+            });
+            message.retry({ delaySeconds: err.delaySeconds });
+          } else if (err instanceof IngestRetryError) {
+            sentryLoggerWarn('ingest.retry', {
+              queue: typedBatch.queue,
+              delaySeconds: err.delaySeconds,
+            });
             message.retry({ delaySeconds: err.delaySeconds });
           } else if (ingestRetry) {
             message.retry({ delaySeconds: ingestRetry.delaySeconds });

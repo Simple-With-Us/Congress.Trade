@@ -4,12 +4,16 @@
  *
  * Cross-app freshness watchdog (App A's half of the mutual health check). Once a
  * day the cron compares how stale the market-data streams a sibling app keeps
- * current — S&P closes, per-ticker prices, and the fundamentals it pushes — are
- * against generous thresholds. If a stream that WAS being kept current goes
- * stale (App B's nightly push silently broke, or our own price refresh is
- * failing), we email a throttled admin alert via the same path as the FMP-tier
- * alert. Streams that were never populated (null latest) are skipped so a
- * not-yet-wired partner never trips a false alarm.
+ * current — S&P closes, per-ticker prices, fundamentals, insider / short-volume,
+ * and analyst consensus — are against generous thresholds. If a stream that
+ * should be kept current goes stale (App B's nightly push silently broke, or
+ * our own price refresh is failing), we email a throttled admin alert via the
+ * same path as the FMP-tier alert. A never-populated stream (null latest) is
+ * skipped: an empty table is a not-yet-wired partner, and the 12h alert
+ * throttle would otherwise page forever. A timestamp that stops advancing
+ * still pages once it passes its threshold. Reference enrichment is not
+ * watched here. `securities_ref.price_checked_at` is written by our own price
+ * job, and `source` is not an import-received clock.
  *
  * The decision logic (evaluateFreshness) is pure + deterministic so it unit-
  * tests without a database or clock.
@@ -19,13 +23,22 @@ import type { Env } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
 
-export type FreshnessStream = 'spx' | 'prices' | 'fundamentals';
+export type FreshnessStream =
+  | 'spx'
+  | 'prices'
+  | 'fundamentals'
+  | 'insider'
+  | 'shortVolume'
+  | 'analyst';
 
 /** Latest timestamp seen per donated stream (YYYY-MM-DD or ISO; null = never). */
 export interface FreshnessSnapshot {
   spxLatestDate: string | null;
   priceLatestDate: string | null;
   fundamentalsLatest: string | null;
+  insiderLatestDate: string | null;
+  shortVolumeLatestDate: string | null;
+  analystLatest: string | null;
 }
 
 export interface StaleStream {
@@ -37,12 +50,17 @@ export interface StaleStream {
 /**
  * Max age (whole days) before a kept-current stream is considered stale. Roomy
  * enough to absorb weekends + a market holiday (closes don't update Sat/Sun)
- * without false alarms; fundamentals gets extra slack for a nightly cadence.
+ * without false alarms; fundamentals / analyst get extra slack for a nightly
+ * cadence; insider / short-volume follow daily EOD with the same weekend
+ * headroom as prices.
  */
 export const FRESHNESS_MAX_AGE_DAYS: Record<FreshnessStream, number> = {
   spx: 5,
   prices: 5,
   fundamentals: 8,
+  insider: 5,
+  shortVolume: 5,
+  analyst: 8,
 };
 
 const DAY_MS = 86_400_000;
@@ -58,9 +76,9 @@ export function ageInDays(value: string | null, nowMs: number): number | null {
 }
 
 /**
- * Pure: which donated streams are stale beyond their threshold. Never-populated
- * streams (null latest) are skipped — we only flag a stream that was being kept
- * current and then stopped.
+ * Pure: which donated streams are stale beyond their threshold. Null latest
+ * is skipped (not yet observed). A parseable timestamp older than the
+ * stream's max age is stale.
  */
 export function evaluateFreshness(
   snapshot: FreshnessSnapshot,
@@ -71,16 +89,47 @@ export function evaluateFreshness(
     ['spx', snapshot.spxLatestDate],
     ['prices', snapshot.priceLatestDate],
     ['fundamentals', snapshot.fundamentalsLatest],
+    ['insider', snapshot.insiderLatestDate],
+    ['shortVolume', snapshot.shortVolumeLatestDate],
+    ['analyst', snapshot.analystLatest],
   ];
   const stale: StaleStream[] = [];
   for (const [stream, latest] of checks) {
+    if (latest == null) continue;
     const age = ageInDays(latest, nowMs);
-    if (latest != null && age != null && age > max[stream]) {
+    if (age != null && age > max[stream]) {
       stale.push({ stream, latest, ageDays: age });
     }
   }
   return stale;
 }
+
+/**
+ * One round-trip for every watched stream. Static literals only: the
+ * `'imported'` filter is a constant, not bound input. `price_latest` is the
+ * worst (oldest) `latest_price_date` among the 25 most-recently-traded
+ * priceable tickers — the names users actually look at. It used to be
+ * MAX(latest_price_date) across the whole table, which one freshly-priced
+ * quiet ticker keeps green forever (2026-08-10: megacaps sat 12+ sessions
+ * stale while SOFI/RKT masked the backlog). It still reads only the indexed
+ * securities_ref.latest_price_date, never price_eod. Fundamentals freshness
+ * is MAX(received_at): updated_at is the provider as-of, and a backfill must
+ * not keep that alert green. `MAX(date)` / analyst `MAX(updated_at)` use the
+ * indexes in `0102_freshness_stream_indexes.sql`.
+ */
+export const FRESHNESS_LATEST_SQL =
+  'SELECT (SELECT MAX(date) FROM spx_eod) AS spx_latest, ' +
+  '(SELECT MIN(latest_price_date) FROM (' +
+  'SELECT sr.latest_price_date AS latest_price_date FROM transactions t ' +
+  'JOIN securities_ref sr ON sr.ticker = t.ticker ' +
+  "WHERE t.ticker IS NOT NULL AND t.ticker <> '' " +
+  'AND COALESCE(sr.price_unavailable, 0) = 0 AND sr.latest_price_date IS NOT NULL ' +
+  'GROUP BY t.ticker ORDER BY MAX(t.cursor_seq) DESC LIMIT 25' +
+  ')) AS price_latest, ' +
+  '(SELECT MAX(received_at) FROM fundamentals_eod) AS fundamentals_latest, ' +
+  '(SELECT MAX(date) FROM insider_eod) AS insider_latest, ' +
+  '(SELECT MAX(date) FROM short_volume_eod) AS short_volume_latest, ' +
+  "(SELECT MAX(updated_at) FROM analyst_consensus WHERE source = 'imported') AS analyst_latest";
 
 /**
  * Read the latest-seen timestamp for each donated stream and email a throttled
@@ -94,29 +143,20 @@ export async function runFreshnessCheck(env: Env, now = new Date()): Promise<Sta
       spx_latest: string | null;
       price_latest: string | null;
       fundamentals_latest: string | null;
+      insider_latest: string | null;
+      short_volume_latest: string | null;
+      analyst_latest: string | null;
     }>(
       env.DB,
-      // price_latest is the WORST (oldest) latest_price_date among the 25 most-
-      // recently-traded priceable tickers — the names users actually look at.
-      // It used to be MAX(latest_price_date) across the whole table, which one
-      // freshly-priced quiet ticker keeps green forever: in the 2026-08-10
-      // incident most megacaps sat 12+ sessions stale while SOFI/RKT (fresh)
-      // masked the backlog and this alert never fired. Still reads only the
-      // maintained, indexed securities_ref.latest_price_date (never price_eod).
-      'SELECT (SELECT MAX(date) FROM spx_eod) AS spx_latest, ' +
-        '(SELECT MIN(latest_price_date) FROM (' +
-        'SELECT sr.latest_price_date AS latest_price_date FROM transactions t ' +
-        'JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-        "WHERE t.ticker IS NOT NULL AND t.ticker <> '' " +
-        'AND COALESCE(sr.price_unavailable, 0) = 0 AND sr.latest_price_date IS NOT NULL ' +
-        'GROUP BY t.ticker ORDER BY MAX(t.cursor_seq) DESC LIMIT 25' +
-        ')) AS price_latest, ' +
-        '(SELECT MAX(updated_at) FROM fundamentals_eod) AS fundamentals_latest',
+      FRESHNESS_LATEST_SQL,
     );
     snapshot = {
       spxLatestDate: row?.spx_latest ?? null,
       priceLatestDate: row?.price_latest ?? null,
       fundamentalsLatest: row?.fundamentals_latest ?? null,
+      insiderLatestDate: row?.insider_latest ?? null,
+      shortVolumeLatestDate: row?.short_volume_latest ?? null,
+      analystLatest: row?.analyst_latest ?? null,
     };
   } catch {
     return []; // DB unavailable → skip rather than false-alarm

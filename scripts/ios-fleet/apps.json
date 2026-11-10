@@ -14,6 +14,7 @@
     },
     "congress": {
       "displayName": "Congress.Trade",
+      "fixedMarketingVersion": "1.1.2",
       "bundleId": "trade.congress.ios",
       "appleId": 6798076688,
       "scheme": "CongressTrade",
@@ -50,14 +51,14 @@
     },
     "dealdex": {
       "displayName": "DealDex",
-      "bundleId": "online.dealdex",
+      "bundleId": "net.dealdex",
       "appleId": 6802474288,
       "scheme": "DealDex",
       "projectRel": "native/ios/DealDex.xcodeproj",
       "xcodegenDir": "native/ios",
       "worktreeHint": "~/apps/dealdex-grok",
       "marketingVersionDefault": "1.0.1",
-      "notes": "Native iPhone app. Bundle ID online.dealdex (resource R2FAW69NPD, not a team id). Team CC8UTF7ATG. ASC app DealDex SKU dealdex id 6802474288. Do not upload me.grok.dealdex."
+      "notes": "Live App Store / TestFlight bundle is net.dealdex, appleId 6802474288.  online.dealdex is a stale leftover, not live.  Do not upload me.grok.dealdex.  Native iPhone app.  Resource R2FAW69NPD is not a team id.  Team CC8UTF7ATG.  ASC SKU dealdex."
     },
     "autorotate": {
       "displayName": "Autorotate",
