@@ -105,3 +105,40 @@ describe('buildMassivePriceClient — bounded 429 retry', () => {
     expect(calls.n).toBe(1);
   });
 });
+
+describe('buildMassivePriceClient — caller cancellation', () => {
+  it('threads the caller signal into every fetch (eod and spx)', async () => {
+    const seen: Array<AbortSignal | null | undefined> = [];
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      seen.push(init?.signal);
+      return new Response(JSON.stringify(aggs), { status: 200 });
+    }) as unknown as typeof fetch;
+    const controller = new AbortController();
+    const client = buildMassivePriceClient('k', fetchImpl);
+    await client.eodHistory('AAPL', '2024-01-01', '2024-01-05', controller.signal);
+    await client.spxHistory('2024-01-01', '2024-01-05', controller.signal);
+    expect(seen).toEqual([controller.signal, controller.signal]);
+  });
+
+  it('an abort mid-flight rejects the call with the abort reason instead of hanging detached', async () => {
+    // A fetch double with real fetch semantics: it settles only when the
+    // signal fires, rejecting with the signal's reason.  If the client
+    // dropped the signal, this promise would never settle.
+    const fetchImpl = ((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return; // no signal threaded: hangs forever, failing the test by timeout
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      })) as unknown as typeof fetch;
+    const controller = new AbortController();
+    const reason = new Error('lane deadline');
+    const client = buildMassivePriceClient('k', fetchImpl);
+    const pending = client.eodHistory('AAPL', '2024-01-01', '2024-01-05', controller.signal);
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  });
+});

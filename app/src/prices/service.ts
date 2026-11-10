@@ -382,6 +382,22 @@ export function isFatalPriceProviderError(e: unknown, _fmpBudgeted: boolean): bo
   return RATE_LIMIT_PROVIDER_ERROR.test(message);
 }
 
+/**
+ * True when a rejection IS the caller's own cancellation:  the promise
+ * rejected with the lane signal's reason object itself.  That identity is
+ * reliable end to end — fetch rejects with the signal's reason, and the
+ * peer client rethrows a caller's abort reason untouched.  A provider
+ * failure that merely RACES the abort (a fatal 401/402/403/429 or a
+ * per-request timeout settling just before the deadline fires) rejects
+ * with its own error while `signal.aborted` is also true, so classifying
+ * on the aborted flag alone would swallow it:  no error entry, no fatal
+ * handling, an outage misreported as a quiet cancellation.  Identity
+ * against `signal.reason` is the test, never the flag alone.
+ */
+export function isCallerAbortRejection(error: unknown, signal?: AbortSignal): boolean {
+  return signal !== undefined && error === signal.reason;
+}
+
 type PeerStaleSignal = { closes: Close[] };
 
 function readPeerStaleSignal(e: unknown): PeerStaleSignal | null {
@@ -963,8 +979,10 @@ export async function runPriceRefresh(
   } catch (e) {
     // Caller cancellation (lane deadline) is not a provider failure:  record
     // the abort without an error entry, and let the aborted flag below skip
-    // the ticker walk entirely.
-    if (opts.signal?.aborted) {
+    // the ticker walk entirely.  Only the caller's own abort reason counts
+    // as a cancellation — a provider failure that raced the abort still
+    // records its error entry and gets fatal handling below.
+    if (isCallerAbortRejection(e, opts.signal)) {
       result.aborted = true;
     } else {
       result.errors.push('spx: ' + (e as Error).message);
@@ -1071,8 +1089,11 @@ export async function runPriceRefresh(
     } catch (error) {
       // A rejection caused by the caller's own abort is a cancellation, not
       // a per-ticker failure:  the processor stops the walk on it without an
-      // error entry or an error marker for the ticker.
-      if (opts.signal?.aborted) return { kind: 'aborted', nowIso };
+      // error entry or an error marker for the ticker.  Only the abort
+      // reason itself classifies as a cancellation — a fatal provider error
+      // that settled just before the abort fired is an 'error' outcome, so
+      // it still records its entry and gets fatal handling.
+      if (isCallerAbortRejection(error, opts.signal)) return { kind: 'aborted', nowIso };
       return { kind: 'error', plan, nowIso, error };
     }
   }
