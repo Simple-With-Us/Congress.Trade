@@ -49,15 +49,13 @@ export interface CongressPushApplyLike {
   duplicate?: boolean;
 }
 
-const CongressPushApplyLikeSchema = z
-  .object({
-    ok: z.boolean(),
-    applied: nonNegativeInt,
-    type: z.string().trim().min(1).optional(),
-    reason: z.string().trim().min(1).optional(),
-    duplicate: z.boolean().optional(),
-  })
-  .strict();
+const CongressPushApplyLikeSchema = z.object({
+  ok: z.boolean(),
+  applied: nonNegativeInt,
+  type: z.string().trim().min(1).optional(),
+  reason: z.string().trim().min(1).optional(),
+  duplicate: z.boolean().optional(),
+});
 
 /** Legacy shim: strip unknown keys (non-strict) so extra fields do not widen fail-open. */
 const LegacyCongressPushReceiptEnvelopeSchema = z.object({
@@ -103,8 +101,8 @@ function buildReceipt(result: CongressPushApplyLike, eventId?: string): Congress
 
 function buildBatchReceipt(results: CongressPushApplyLike[]): CongressPushReceipt {
   const lines = results.map((result) => buildReceiptEvent(result));
-  const consumed = lines.every((line) => line.consumed);
-  const ok = lines.every((line) => line.ok);
+  const consumed = lines.length > 0 && lines.every((line) => line.consumed);
+  const ok = lines.length > 0 && lines.every((line) => line.ok);
   const applied = lines.reduce((sum, line) => sum + line.applied, 0);
   return CongressPushReceiptSchema.parse({
     receiptVersion: CONGRESS_PUSH_RECEIPT_VERSION,
@@ -135,6 +133,13 @@ export function parseCongressPushReceipt(payload: unknown): ParseCongressPushRec
     return { ok: false, reason: 'push response body was empty or unparseable' };
   }
 
+  // A body that carries receiptVersion is a v1 receipt, however malformed:
+  // never reinterpret it through the legacy envelope, where its batch could
+  // parse as an unrecognized shape and be silently treated as delivered.
+  if ('receiptVersion' in payload) {
+    return { ok: false, reason: 'push response receiptVersion payload failed v1 receipt validation' };
+  }
+
   const legacyEnvelope = LegacyCongressPushReceiptEnvelopeSchema.safeParse(payload);
   if (!legacyEnvelope.success) {
     return { ok: false, reason: PUSH_RECEIPT_UNRECOGNIZED_SHAPE_REASON };
@@ -162,8 +167,8 @@ export function parseCongressPushReceipt(payload: unknown): ParseCongressPushRec
 
 export function congressPushReceiptFailureReason(parsed: ParseCongressPushReceiptResult): string | null {
   if (parsed.ok === false) return parsed.reason;
-  if (parsed.receipt.consumed) return null;
-  const firstBad = parsed.receipt.results?.find((line) => !line.consumed);
+  const firstBad = parsed.receipt.results?.find((line) => !line.consumed || line.ok === false);
+  if (parsed.receipt.consumed && parsed.receipt.ok !== false && !firstBad) return null;
   if (firstBad?.reason) return `consumption failed: ${firstBad.reason}`;
   if (parsed.receipt.reason) return `consumption failed: ${parsed.receipt.reason}`;
   return 'consumption failed: ok=false';
@@ -178,15 +183,55 @@ export async function releaseSubscriberWebhookResponseBody(response: Response): 
   await response.body?.cancel().catch(() => {});
 }
 
+/**
+ * Read a response body with the byte cap enforced DURING the read, so an
+ * oversize body is never fully buffered: a declared content-length over the
+ * cap short-circuits, and a streamed read aborts as soon as the cap is
+ * exceeded. Callers decide what oversize means for their contract.
+ */
+async function readBoundedBody(
+  response: Response,
+): Promise<{ text: string } | { tooLarge: true }> {
+  const contentLength = Number(response.headers.get('content-length') ?? '');
+  if (Number.isFinite(contentLength) && contentLength > WEBHOOK_PUSH_RECEIPT_MAX_BYTES) {
+    return { tooLarge: true };
+  }
+  if (!response.body) {
+    const text = await response.text();
+    return text.length > WEBHOOK_PUSH_RECEIPT_MAX_BYTES ? { tooLarge: true } : { text };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > WEBHOOK_PUSH_RECEIPT_MAX_BYTES) {
+        await reader.cancel().catch(() => {});
+        return { tooLarge: true };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+  return { text };
+}
+
 export async function readWebhookPushReceipt(response: Response): Promise<ParseCongressPushReceiptResult> {
   const contentType = response.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().includes('application/json')) {
     return { ok: false, reason: 'push response missing JSON content-type' };
   }
-  const text = await response.text();
-  if (text.length > WEBHOOK_PUSH_RECEIPT_MAX_BYTES) {
+  const body = await readBoundedBody(response);
+  if ('tooLarge' in body) {
     return { ok: false, reason: 'push response body too large' };
   }
+  const text = body.text;
   if (!text.trim()) {
     return { ok: false, reason: 'push response body was empty or unparseable' };
   }
@@ -208,10 +253,15 @@ export async function webhookSubscriberConsumptionError(response: Response): Pro
     await releaseSubscriberWebhookResponseBody(response);
     return null;
   }
-  const text = await response.text();
-  if (text.length > WEBHOOK_PUSH_RECEIPT_MAX_BYTES) {
-    return 'push response body too large';
+  const body = await readBoundedBody(response);
+  if ('tooLarge' in body) {
+    // Oversize bodies cannot be validated as receipts, and a generic
+    // third-party 2xx body must stay a successful delivery per the
+    // recognized-shape contract — never a retry/quarantine trigger.
+    await releaseSubscriberWebhookResponseBody(response);
+    return null;
   }
+  const text = body.text;
   if (!text.trim()) {
     return null;
   }
@@ -219,7 +269,10 @@ export async function webhookSubscriberConsumptionError(response: Response): Pro
   try {
     payload = JSON.parse(text);
   } catch {
-    return 'push response body was not valid JSON';
+    return null;
+  }
+  if (payload === null || typeof payload !== 'object') {
+    return null;
   }
   const parsed = parseCongressPushReceipt(payload);
   if (parsed.ok === false) {
