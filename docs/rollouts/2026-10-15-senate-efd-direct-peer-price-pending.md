@@ -29,4 +29,4 @@ After deploy: `/api/health` should include `senate_efd` with a recent direct pro
 
 ## Follow-ups
 
-- Enable Agent-Sync Linear tools for the CURSOR seat to claim/post on CT-2361 / CT-2408 from cloud agents.
+- Enable Ag***-S**c Linear tools for the CURSOR seat to claim/post on CT-2361 / CT-2408 from cloud agents.

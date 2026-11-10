@@ -78,3 +78,93 @@ describe('buildFallbackPriceClient — peer-primary / Massive last-resort', () =
     expect(order).toEqual(['peer:eod:AAPL', 'massive:eod:AAPL']);
   });
 });
+
+describe('buildFallbackPriceClient — caller cancellation', () => {
+  it('rethrows the caller abort reason and never calls the secondary', async () => {
+    const order: string[] = [];
+    const reason = new Error('lane deadline');
+    const controller = new AbortController();
+    controller.abort(reason);
+    // A signal-honoring primary rejects with the caller's reason itself
+    // (fetch on an aborted signal does exactly this).
+    const peer: PriceClient = {
+      async eodHistory(_symbol: string, _from: string, _to: string, signal?: AbortSignal) {
+        order.push('peer:eod');
+        throw signal?.reason ?? new Error('primary called without a signal');
+      },
+      async spxHistory() {
+        return [];
+      },
+    };
+    const massive = recordingClient('massive', order, { eod: MASSIVE_BAR });
+    const client = buildFallbackPriceClient(peer, massive, { rethrowFatal: true });
+
+    await expect(
+      client.eodHistory('AAPL', '2026-01-01', '2026-08-01', controller.signal),
+    ).rejects.toBe(reason);
+    expect(order).toEqual(['peer:eod']);
+  });
+
+  it('a fatal primary error that races the abort keeps the fatal, not the abort reason', async () => {
+    const order: string[] = [];
+    const fatal = new Error('PEER_HTTP_401');
+    const reason = new Error('lane deadline');
+    const controller = new AbortController();
+    controller.abort(reason);
+    // The primary settles with its own fatal just as the lane deadline
+    // fires:  the rejection is the fatal error object, not signal.reason.
+    // service.ts classifies caller aborts by identity against
+    // signal.reason, so replacing the fatal with the abort reason here
+    // would misreport an auth outage as a quiet cancellation — no error
+    // entry, no fatal handling.
+    const peer: PriceClient = {
+      async eodHistory() {
+        order.push('peer:eod');
+        throw fatal;
+      },
+      async spxHistory() {
+        order.push('peer:spx');
+        throw fatal;
+      },
+    };
+    const massive = recordingClient('massive', order, { eod: MASSIVE_BAR, spx: MASSIVE_BAR });
+    const client = buildFallbackPriceClient(peer, massive, { rethrowFatal: true });
+
+    await expect(
+      client.eodHistory('AAPL', '2026-01-01', '2026-08-01', controller.signal),
+    ).rejects.toBe(fatal);
+    await expect(client.spxHistory('2026-01-01', '2026-08-01', controller.signal)).rejects.toBe(fatal);
+    expect(order).toEqual(['peer:eod', 'peer:spx']);
+  });
+
+  it('does not invoke the secondary when the abort lands while the primary resolves empty', async () => {
+    const order: string[] = [];
+    const reason = new Error('lane deadline');
+    const controller = new AbortController();
+    controller.abort(reason);
+    // The primary ignores the signal and resolves empty anyway; the
+    // fallback must still refuse to spend a secondary call on the dead
+    // signal — a secondary that ignored it too would run detached past
+    // the caller's deadline.
+    const peer: PriceClient = {
+      async eodHistory() {
+        order.push('peer:eod');
+        return [];
+      },
+      async spxHistory(_from: string, _to: string, signal?: AbortSignal) {
+        order.push('peer:spx');
+        throw signal?.reason ?? new Error('primary called without a signal');
+      },
+    };
+    const massive = recordingClient('massive', order, { eod: MASSIVE_BAR, spx: MASSIVE_BAR });
+    const client = buildFallbackPriceClient(peer, massive, { rethrowFatal: true });
+
+    await expect(
+      client.eodHistory('AAPL', '2026-01-01', '2026-08-01', controller.signal),
+    ).rejects.toBe(reason);
+    // Same contract on the SPX wrapper: the abort rejection is rethrown,
+    // not swallowed into a secondary call.
+    await expect(client.spxHistory('2026-01-01', '2026-08-01', controller.signal)).rejects.toBe(reason);
+    expect(order).toEqual(['peer:eod', 'peer:spx']);
+  });
+});

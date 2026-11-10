@@ -7,6 +7,7 @@
  *   PUT   /poll-config              -> update schedule / aggressiveMode (setConfig)
  *   GET   /poll-config/aggressive   -> aggressiveMode toggle convenience read
  *   GET   /review-queue             -> list unresolved review items
+ *   GET   /review-queue/ingest-failures -> filings stuck at ingest (read-only)
  *   POST  /review/:docId            -> {decision:'confirm'|'reject', edits?}
  *   GET   /sources/health           -> ingest_log aggregates per source
  *   GET   /instrument-pricing       -> equities/crypto/options/event-contract capability matrix
@@ -50,6 +51,7 @@ import {
 import type { Env, ParsedTx, PollConfig, PollWindow, TxType, TxSource, Subscription, DocKind, Chamber, Filing } from '../shared/types.ts';
 import { all, batch, batchPrepared, chunkArray, first, get, isSqliteLockBusy, run, type SqlParam } from '../shared/db.ts';
 import { checkReadiness } from '../shared/readiness.ts';
+import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
 import { listIngestionDecisions, recordIngestionDecision } from '../shared/ingestionDecisions.ts';
 import { activeWindow, effectiveInterval, getConfig, setConfig } from '../shared/config.ts';
@@ -82,6 +84,10 @@ import { apnsConfigured } from '../shared/apns.ts';
 import { runSeedBackfillFromEnv } from '../backfill/seed.ts';
 import { runHouseHistoricalBackfill } from '../backfill/houseCrawler.ts';
 import { runSenateBackfill } from '../backfill/senateCrawler.ts';
+import {
+  senateFilingFromFetcherRow,
+  type SenateFiling,
+} from '../ingestion/senateSource.ts';
 import { extractParsed } from '../extraction/orchestrator.ts';
 import {
   normalize,
@@ -184,7 +190,7 @@ import {
   rematchAndHealLatencyRaces,
   runDisclosureLatencyProbe,
 } from '../ingestion/tradeLatency.ts';
-import { pollExecutive } from '../ingestion/watcher.ts';
+import { ingestSenateFilings, pollExecutive } from '../ingestion/watcher.ts';
 import { verifyRawFilesStorage } from './storageSmoke.ts';
 
 function isObjectStoreAuthError(message: string): boolean {
@@ -195,12 +201,19 @@ import {
   buildFailedIngestionOutboxIdentity,
   loadFailedIngestionOutboxRows,
 } from '../ingestion/failedOutboxIdentity.ts';
+import {
+  readSenateFetcherRunStatus,
+  readSenateIntakeStatus,
+  recordSenateFetcherRun,
+  recordSenateIntake,
+} from '../ingestion/senateIntakeStatus.ts';
 import { PROVIDER_STUB_DUPLICATE_REJECT_PREFIX } from '../ingestion/providerMissingStubClose.ts'
 import {
   listAlreadyPublishedReviewCandidates,
   sweepAlreadyPublishedReviewRows,
 } from '../ingestion/autonomySweeps.ts';
 import {
+  isParkedDlqError,
   requeueTransientFailedDurableJobs,
   requeueTransientFailedIngestionOutbox,
 } from '../ingestion/transientDlq.ts';
@@ -342,6 +355,17 @@ type EnvWithAdmin = Env & {
    * unset. Worst case if leaked: someone re-runs an idempotent requeue.
    */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /**
+   * Scoped bearer token that unlocks ONLY POST /senate-ptr-intake and
+   * POST /senate-fetcher-run (the
+   * Mac eFD fetcher's filing intake, CT-2442).  Lets that one caller
+   * submit official eFD report rows without holding the full
+   * ADMIN_TOKEN.  Same pattern as INGEST_TOKEN.  Optional; ignored if
+   * unset.  Worst case if leaked: someone submits eFD report rows,
+   * which the pipeline dedupes against the canonical doc ids and
+   * fetches only from efdsearch.senate.gov.
+   */
+  SENATE_INTAKE_TOKEN?: string;
 };
 
 /** The ONLY admin paths ADMIN_MAINTENANCE_TOKEN unlocks. Keep this list to
@@ -382,6 +406,21 @@ async function isAuthorizedMaintenance(
   return (
     !!token &&
     MAINTENANCE_PATH_SUFFIXES.some((suffix) => path.endsWith(suffix)) &&
+    (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
+  );
+}
+
+
+/** True when the request is a bearer-authenticated call to the Senate PTR intake or the fetcher run heartbeat. */
+async function isAuthorizedSenateIntake(
+  env: EnvWithAdmin,
+  path: string,
+  authorization?: string,
+): Promise<boolean> {
+  const token = (await resolveSecret(env, 'SENATE_INTAKE_TOKEN')).value;
+  return (
+    !!token &&
+    (path.endsWith('/senate-ptr-intake') || path.endsWith('/senate-fetcher-run')) &&
     (await constantTimeEqual(authorization ?? '', `Bearer ${token}`))
   );
 }
@@ -939,11 +978,393 @@ function reviewQueueFilterWhere(f: ReviewQueueFilters): { clause: string; params
   return { clause: clauses.join(' AND '), params };
 }
 
+// --- Ingest failures (filings stuck at ingest_status='error') ---------------
+//
+// Some filings fail at fetch/extract before a review_queue row is ever
+// written, so the queue listing below cannot see them and "0 pending"
+// misreads as "healthy". This read-only view surfaces those filings without
+// changing the queue itself (no writes, no re-drive, no auto-retry).
+//
+// A filing counts as an ingest failure when:
+//   - ingest_status = 'error' (uses idx_filings_status),
+//   - it has no OPEN (resolved=0) review_queue row (an open row is already
+//     listed in the queue — listing it twice would double-count),
+//   - it was not honestly rejected through review (resolved=1 +
+//     resolution_kind='rejected' is a terminal decision, already visible
+//     under ?resolved=1), and
+//   - it has no live (deprecated_at IS NULL) transactions.
+// The last condition keeps CT-2453 rows out: a published filing whose stamp
+// flipped back to 'error' on a later fetch-stage failure has correct data
+// and must not be presented as needing review/re-extraction. Those rows
+// are counted separately as `publishedStatusStale` (count only, never
+// listed). Both EXISTS probes key off indexed doc_id lookups (review_queue
+// PK, idx_tx_doc), so neither scans transactions per row.
+
+const INGEST_FAILURE_ERROR_MAX = 300;
+
+interface IngestFailureCursor {
+  seenAt: string;
+  docId: string;
+}
+
+function encodeIngestFailureCursor(cur: IngestFailureCursor): string {
+  return btoa(JSON.stringify(cur));
+}
+
+const ingestFailureCursorSchema = z.object({
+  // '' is a legitimate keyset value: the page query orders on COALESCE(first_seen_at, '').
+  seenAt: z.string(),
+  docId: z.string().min(1),
+});
+
+function decodeIngestFailureCursor(raw: string): IngestFailureCursor | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(atob(raw));
+  } catch {
+    return null; // malformed cursor — caller answers 400
+  }
+  const parsed = ingestFailureCursorSchema.safeParse(json);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Ingest-failure page size: positive integer, clamped to REVIEW_QUEUE_MAX_LIMIT. */
+const ingestLimitSchema = z.coerce
+  .number()
+  .int()
+  .positive()
+  .transform((n) => Math.min(n, REVIEW_QUEUE_MAX_LIMIT));
+
+/** `?ingestLimit=` / `?limit=` for the ingest-failure listing; undefined → default (50), invalid → null (400). */
+function parseIngestLimit(raw: string | undefined): number | null {
+  if (raw === undefined) return REVIEW_QUEUE_DEFAULT_LIMIT;
+  const parsed = ingestLimitSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+/** `?include=` on GET /review-queue: comma-separated, only known sections allowed. */
+const reviewQueueIncludeSchema = z
+  .string()
+  .optional()
+  .transform((raw) => (raw ?? '').split(',').map((v) => v.trim()).filter((v) => v.length > 0))
+  .pipe(z.array(z.enum(['ingest_failures', 'dead_letters', 'dlq_failed'])).max(4));
+
+/** Shared WHERE for the ingest-failure page query and its COUNT. */
+function ingestFailureWhere(chamber: string | null): { clause: string; params: SqlParam[] } {
+  const clauses = [
+    `f.ingest_status = 'error'`,
+    `NOT EXISTS (SELECT 1 FROM review_queue rq WHERE rq.doc_id = f.doc_id AND rq.resolved = 0)`,
+    `NOT EXISTS (SELECT 1 FROM review_queue rq WHERE rq.doc_id = f.doc_id AND rq.resolved = 1 AND rq.resolution_kind = 'rejected')`,
+    `NOT EXISTS (SELECT 1 FROM transactions t WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL)`,
+  ];
+  const params: SqlParam[] = [];
+  if (chamber) {
+    clauses.push('f.chamber = ?');
+    params.push(chamber);
+  }
+  return { clause: clauses.join(' AND '), params };
+}
+
+interface IngestFailureCounts {
+  ingestFailures: number;
+  publishedStatusStale: number;
+}
+
+async function ingestFailureCounts(db: D1Database, chamber: string | null): Promise<IngestFailureCounts> {
+  const where = ingestFailureWhere(chamber);
+  const staleClauses = [
+    `f.ingest_status = 'error'`,
+    `EXISTS (SELECT 1 FROM transactions t WHERE t.doc_id = f.doc_id AND t.deprecated_at IS NULL)`,
+  ];
+  const staleParams: SqlParam[] = [];
+  if (chamber) {
+    staleClauses.push('f.chamber = ?');
+    staleParams.push(chamber);
+  }
+  const [failRow, staleRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM filings f WHERE ${where.clause}`, where.params),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM filings f WHERE ${staleClauses.join(' AND ')}`, staleParams),
+  ]);
+  return {
+    ingestFailures: Number(failRow?.n ?? 0) || 0,
+    publishedStatusStale: Number(staleRow?.n ?? 0) || 0,
+  };
+}
+
+interface IngestFailureRow {
+  doc_id: string;
+  chamber: string | null;
+  filer_id: string | null;
+  filing_type: string | null;
+  filed_date: string | null;
+  source_url: string | null;
+  raw_object_key: string | null;
+  doc_kind: string | null;
+  ingest_status: string | null;
+  error: string | null;
+  first_seen_at: string | null;
+  source_updated_at: string | null;
+  review_resolved: number | null;
+  review_resolution_kind: string | null;
+}
+
+/**
+ * One page of ingest-failure filings, newest first. Keyset-paginated on
+ * (COALESCE(first_seen_at,''), doc_id), mirroring the review-queue cursor:
+ * filings has no queue-style created_at, and first_seen_at is the closest
+ * stored "when did this get stuck" stamp (error writes touch no timestamp
+ * column). Filer names and the ingestion_outbox last-attempt stamp are
+ * enriched per page in chunked IN (...) lookups and degrade to null when
+ * those tables are absent, exactly like the extraction_runs enrichment in
+ * GET /review-queue.
+ */
+async function listIngestFailures(
+  db: D1Database,
+  opts: { chamber: string | null; limit: number; cursor: IngestFailureCursor | null },
+): Promise<{ items: Array<Record<string, unknown>>; nextCursor: string | null }> {
+  const where = ingestFailureWhere(opts.chamber);
+  const clauses = [where.clause];
+  const params: SqlParam[] = [...where.params];
+  if (opts.cursor) {
+    clauses.push(`(COALESCE(f.first_seen_at, '') < ? OR (COALESCE(f.first_seen_at, '') = ? AND f.doc_id < ?))`);
+    params.push(opts.cursor.seenAt, opts.cursor.seenAt, opts.cursor.docId);
+  }
+
+  const rows = await all<IngestFailureRow>(
+    db,
+    `SELECT
+        f.doc_id, f.chamber, f.filer_id, f.filing_type, f.filed_date,
+        f.source_url, f.raw_object_key, f.doc_kind, f.ingest_status,
+        f.error, f.first_seen_at, f.source_updated_at,
+        rq.resolved AS review_resolved,
+        rq.resolution_kind AS review_resolution_kind
+      FROM filings f
+      LEFT JOIN review_queue rq ON rq.doc_id = f.doc_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY COALESCE(f.first_seen_at, '') DESC, f.doc_id DESC
+      LIMIT ?`,
+    [...params, opts.limit + 1],
+  );
+
+  const hasMore = rows.length > opts.limit;
+  const pageRows = hasMore ? rows.slice(0, opts.limit) : rows;
+  const lastRow = pageRows[pageRows.length - 1];
+  const nextCursor = hasMore && lastRow
+    ? encodeIngestFailureCursor({ seenAt: lastRow.first_seen_at ?? '', docId: lastRow.doc_id })
+    : null;
+
+  const nameByFiler = new Map<string, string>();
+  const filerIds = [...new Set(pageRows.map((r) => r.filer_id).filter((v): v is string => !!v))];
+  for (const idChunk of chunkArray(filerIds, REVIEW_QUEUE_IN_CHUNK)) {
+    if (!idChunk.length) continue;
+    try {
+      const placeholders = idChunk.map(() => '?').join(',');
+      const filers = await all<{ bioguide_id: string; full_name: string | null }>(
+        db,
+        `SELECT bioguide_id, full_name FROM filers WHERE bioguide_id IN (${placeholders})`,
+        idChunk,
+      );
+      for (const f of filers) if (f.full_name) nameByFiler.set(f.bioguide_id, f.full_name);
+    } catch {
+      /* filers not migrated yet — filerName stays null for this page. */
+    }
+  }
+
+  const attemptByDoc = new Map<string, string>();
+  for (const idChunk of chunkArray(pageRows.map((r) => r.doc_id), REVIEW_QUEUE_IN_CHUNK)) {
+    if (!idChunk.length) continue;
+    try {
+      const placeholders = idChunk.map(() => '?').join(',');
+      const outbox = await all<{ doc_id: string; updated_at: string | null }>(
+        db,
+        `SELECT doc_id, updated_at FROM ingestion_outbox WHERE doc_id IN (${placeholders})`,
+        idChunk,
+      );
+      for (const o of outbox) if (o.updated_at) attemptByDoc.set(o.doc_id, o.updated_at);
+    } catch {
+      /* ingestion_outbox not migrated yet — lastAttemptAt falls back below. */
+    }
+  }
+
+  const items = pageRows.map((row) => {
+    const rawError = row.error ?? null;
+    return {
+      kind: 'ingest_failure' as const,
+      docId: row.doc_id,
+      chamber: row.chamber ?? '',
+      filerId: row.filer_id ?? null,
+      filerName: row.filer_id ? (nameByFiler.get(row.filer_id) ?? null) : null,
+      filingType: row.filing_type ?? null,
+      filedDate: row.filed_date ?? null,
+      ingestStatus: row.ingest_status ?? '',
+      error: rawError == null ? null : rawError.slice(0, INGEST_FAILURE_ERROR_MAX),
+      errorTruncated: rawError != null && rawError.length > INGEST_FAILURE_ERROR_MAX,
+      firstSeenAt: row.first_seen_at ?? null,
+      sourceUpdatedAt: row.source_updated_at ?? null,
+      lastAttemptAt: attemptByDoc.get(row.doc_id) ?? row.source_updated_at ?? row.first_seen_at ?? null,
+      sourceUrl: row.source_url ?? '',
+      pdfUrl: `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`,
+      storedDocumentUrl: `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`,
+      rawObjectKey: row.raw_object_key ?? '',
+      docKind: row.doc_kind ?? '',
+      hasResolvedReview: row.review_resolved === 1,
+      resolutionKind: row.review_resolution_kind ?? null,
+    };
+  });
+  return { items, nextCursor };
+}
+
+
+/** Error text cap for the pipeline-failure listings (matches the ingest-failure cap). */
+const PIPELINE_FAILURE_ERROR_MAX = INGEST_FAILURE_ERROR_MAX;
+
+interface DeadLetterRow {
+  doc_id: string;
+  chamber: string | null;
+  status: string | null;
+  attempts: number | null;
+  dead_letter_cycles: number | null;
+  last_error: string | null;
+  available_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * One page of ingestion-outbox dead letters: rows whose delivery failed
+ * terminally (status 'failed').  These filings never reach the review queue
+ * and are not ingest failures either — the filing exists, but its outbox
+ * delivery died — so the queue view needs this listing to see them at all.
+ */
+async function listDeadLetters(
+  db: D1Database,
+  limit: number,
+): Promise<{ items: Array<Record<string, unknown>>; count: number; available: boolean }> {
+  try {
+    const rows = await all<DeadLetterRow>(
+      db,
+      `SELECT doc_id, chamber, status, attempts, dead_letter_cycles, last_error, available_at, updated_at
+         FROM ingestion_outbox
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, doc_id DESC
+        LIMIT ?`,
+      [limit + 1],
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => {
+      const rawError = row.last_error ?? null;
+      return {
+        kind: 'dead_letter' as const,
+        docId: row.doc_id,
+        chamber: row.chamber ?? '',
+        attempts: row.attempts ?? 0,
+        deadLetterCycles: row.dead_letter_cycles ?? 0,
+        error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
+        errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        parked: isParkedDlqError(rawError),
+        availableAt: row.available_at ?? null,
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+    return { items, count: items.length, available: true };
+  } catch {
+    /* ingestion_outbox not migrated yet — the dashboard says unavailable. */
+    return { items: [], count: 0, available: false };
+  }
+}
+
+interface DlqFailedRow {
+  id: number;
+  queue_name: string | null;
+  type: string | null;
+  dedupe_key: string | null;
+  attempts: number | null;
+  dead_letter_cycles: number | null;
+  last_error: string | null;
+  available_at: string | null;
+  updated_at: string | null;
+}
+
+/**
+ * One page of durable-queue rows in terminal failed state
+ * (deno_runtime_queue).  Like the outbox dead letters, these are pipeline
+ * failures no other queue surface lists.  `available` is false when the
+ * table does not exist yet, so the dashboard can say so instead of
+ * implying the queue is healthy.
+ */
+async function listDlqFailedRows(
+  db: D1Database,
+  limit: number,
+): Promise<{ items: Array<Record<string, unknown>>; count: number; available: boolean }> {
+  try {
+    const rows = await all<DlqFailedRow>(
+      db,
+      `SELECT id, queue_name, CASE WHEN json_valid(payload) THEN json_extract(payload, '$.type') END AS type, dedupe_key, attempts, dead_letter_cycles, last_error, available_at, updated_at
+         FROM deno_runtime_queue
+        WHERE status = 'failed'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?`,
+      [limit + 1],
+    );
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map((row) => {
+      const rawError = row.last_error ?? null;
+      return {
+        kind: 'dlq_failed' as const,
+        id: row.id,
+        queueName: row.queue_name ?? '',
+        type: row.type ?? '',
+        dedupeKey: row.dedupe_key ?? null,
+        attempts: row.attempts ?? 0,
+        deadLetterCycles: row.dead_letter_cycles ?? 0,
+        error: rawError == null ? null : rawError.slice(0, PIPELINE_FAILURE_ERROR_MAX),
+        errorTruncated: rawError != null && rawError.length > PIPELINE_FAILURE_ERROR_MAX,
+        availableAt: row.available_at ?? null,
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+    return { items, count: items.length, available: true };
+  } catch {
+    return { items: [], count: 0, available: false };
+  }
+}
+
+interface PipelineFailureCounts {
+  deadLetters: number;
+  deadLettersParked: number;
+  dlqFailed: number;
+}
+
+/** Counts for the two pipeline-failure stores the review totals carry. */
+async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCounts> {
+  const [deadRow, parkedRow, dlqRow] = await Promise.all([
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') NOT LIKE 'parked:%'`).catch(() => null),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') LIKE 'parked:%'`).catch(() => null),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
+  ]);
+  return {
+    deadLetters: Number(deadRow?.n ?? 0) || 0,
+    deadLettersParked: Number(parkedRow?.n ?? 0) || 0,
+    dlqFailed: Number(dlqRow?.n ?? 0) || 0,
+  };
+}
+
 interface ReviewQueueTotals {
   unresolved: number;
   matching: number;
   byReason: Record<string, number>;
   byChamber: Record<string, number>;
+  /** Filings stuck at ingest (see listIngestFailures); global like `unresolved`. */
+  ingestFailures: number;
+  /** CT-2453 stale stamps: published data, wrong 'error' status. Count only. */
+  publishedStatusStale: number;
+  /** Ingestion-outbox dead letters (status 'failed'); global like `unresolved`. */
+  deadLetters: number;
+  /** Ingestion-outbox dead letters a human parked (`parked:`); triaged, not active failures. */
+  deadLettersParked: number;
+  /** Durable-queue rows in terminal failed state; global like `unresolved`. */
+  dlqFailed: number;
 }
 
 /**
@@ -960,7 +1381,7 @@ interface ReviewQueueTotals {
  */
 async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): Promise<ReviewQueueTotals> {
   const matchingWhere = reviewQueueFilterWhere(filters);
-  const [unresolvedRow, matchingRow, reasonRows, chamberRows] = await Promise.all([
+  const [unresolvedRow, matchingRow, reasonRows, chamberRows, ingestCounts, failureCounts] = await Promise.all([
     get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM review_queue WHERE resolved = 0`),
     get<{ n: number }>(
       db,
@@ -980,6 +1401,8 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
         GROUP BY f.chamber`,
       [filters.resolved],
     ),
+    ingestFailureCounts(db, null),
+    pipelineFailureCounts(db),
   ]);
 
   const byReason: Record<string, number> = {};
@@ -992,6 +1415,8 @@ async function reviewQueueTotals(db: D1Database, filters: ReviewQueueFilters): P
     matching: matchingRow?.n ?? 0,
     byReason,
     byChamber,
+    ...ingestCounts,
+    ...failureCounts,
   };
 }
 
@@ -1850,7 +2275,13 @@ interface BenchmarkDocumentSnapshot {
  * resolved review's latest decision receipt is an admin confirm/manual action.
  * Pipeline/autopublish/agreement receipts therefore cannot score themselves.
  */
+/** Machine amount-bounds backfill audit — not a human review receipt. */
+const BENCHMARK_IGNORED_INGESTION_DECISION_REASONS = ['amount_bounds_canonicalize'] as const;
+
 function benchmarkHumanResolvedSql(docIdSql: string): string {
+  const ignoredReasons = BENCHMARK_IGNORED_INGESTION_DECISION_REASONS
+    .map((reason) => `'${reason}'`)
+    .join(', ');
   return `COALESCE(rq.resolved, 0) = 1
     AND COALESCE((
       SELECT CASE
@@ -1859,12 +2290,13 @@ function benchmarkHumanResolvedSql(docIdSql: string): string {
       END
         FROM ingestion_decisions d
        WHERE d.doc_id = ${docIdSql}
+         AND COALESCE(d.reason, '') NOT IN (${ignoredReasons})
        ORDER BY d.created_at DESC, d.id DESC
        LIMIT 1
     ), 0) = 1`;
 }
 
-async function benchmarkDocumentIsHumanResolved(env: Env, docId: string): Promise<boolean> {
+export async function benchmarkDocumentIsHumanResolved(env: Env, docId: string): Promise<boolean> {
   const row = await get<{ resolved: number }>(
     env.DB,
     `SELECT CASE WHEN ${benchmarkHumanResolvedSql('f.doc_id')} THEN 1 ELSE 0 END AS resolved
@@ -2505,6 +2937,40 @@ export const EnrichmentUnavailableBodySchema = z.object({
 }).strict();
 export type EnrichmentUnavailableBody = z.infer<typeof EnrichmentUnavailableBodySchema>;
 
+const SenatePtrIntakeRowSchema = z.object({
+  first_name: z.string().nullable().optional(),
+  last_name: z.string().nullable().optional(),
+  filer: z.string().nullable().optional(),
+  report_title: z.string().nullable().optional(),
+  report_url: z.string().nullable().optional(),
+  date_received: z.string().nullable().optional(),
+  is_paper: z.boolean().optional(),
+  raw: z.array(z.string()).optional(),
+});
+
+export const SenatePtrIntakeBodySchema = z.object({
+  rows: z.array(SenatePtrIntakeRowSchema).max(500),
+  dryRun: z.boolean().optional(),
+  // The Mac fetcher's out-file envelope; accepted so the fetcher can POST
+  // its output file verbatim.  Unknown keys are stripped by the schema.
+  source: z.string().optional(),
+  fetched_at: z.string().optional(),
+  since: z.string().optional(),
+});
+export type SenatePtrIntakeBody = z.infer<typeof SenatePtrIntakeBodySchema>;
+
+export const SenateFetcherRunBodySchema = z.object({
+  // The fetcher's own run timestamp (ISO); the server stamps receivedAt
+  // itself and falls back to it when this is absent or unparseable.
+  ranAt: z.string().optional(),
+  status: z.enum(['ok', 'blocked', 'error']),
+  rows: z.number().int().min(0).max(100_000),
+  newCount: z.number().int().min(0).max(100_000),
+  role: z.enum(['agents', 'jay']),
+});
+export type SenateFetcherRunBody = z.infer<typeof SenateFetcherRunBodySchema>;
+
+
 export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
   const r = new Hono<{ Bindings: Env }>();
@@ -2514,12 +2980,15 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Cloudflare Access), or one of the SCOPED tokens — INGEST_TOKEN for
   // /securities/import only (sibling app pushes shared data), and
   // ADMIN_MAINTENANCE_TOKEN for the idempotent backlog-drain endpoints only
-  // (agent/automation sessions never hold the full ADMIN_TOKEN).
+  // (agent/automation sessions never hold the full ADMIN_TOKEN), and
+  // SENATE_INTAKE_TOKEN for /senate-ptr-intake and /senate-fetcher-run only
+  // (the Mac eFD fetcher).
   r.use('*', async (c, next) => {
     const env = c.env as EnvWithAdmin;
     const authorization = c.req.header('Authorization');
     if (await isAuthorizedIngest(env, c.req.path, authorization)) return next();
     if (await isAuthorizedMaintenance(env, c.req.path, authorization)) return next();
+    if (await isAuthorizedSenateIntake(env, c.req.path, authorization)) return next();
     // Always resolve the session email, even when an Authorization header is
     // present. Cookie `ct_session` covers the website; native iOS sends the
     // same opaque session as `Authorization: Bearer <session>`. A stale
@@ -2620,6 +3089,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // per-model payload silently degraded to `[]` for every row, with no error
   // surfaced anywhere. Chunking fixes that; each chunk still degrades
   // independently (and harmlessly) if extraction_runs doesn't exist yet.
+  r.get('/review-queue/ingest-failures', async (c) => {
+    const chamber = c.req.query('chamber') || null;
+    const limit = parseIngestLimit(c.req.query('limit'));
+    if (limit === null) return c.json({ error: 'invalid limit' }, 400);
+    let cursor: IngestFailureCursor | null = null;
+    if (c.req.query('cursor') !== undefined) {
+      cursor = decodeIngestFailureCursor(c.req.query('cursor') || '');
+      if (!cursor) return c.json({ error: 'invalid cursor' }, 400);
+    }
+    const [{ items, nextCursor }, totals] = await Promise.all([
+      listIngestFailures(c.env.DB, { chamber, limit, cursor }),
+      ingestFailureCounts(c.env.DB, chamber),
+    ]);
+    return c.json({ items, count: items.length, nextCursor, totals });
+  });
+
   r.get('/review-queue', async (c) => {
     const resolved = c.req.query('resolved') === '1' ? 1 : 0;
     const chamber = c.req.query('chamber') || null;
@@ -2636,6 +3121,20 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     }
     limit = Math.min(limit, REVIEW_QUEUE_MAX_LIMIT);
     if (legacyUnbounded) limit = REVIEW_QUEUE_MAX_LIMIT;
+
+    const includeParsed = reviewQueueIncludeSchema.safeParse(c.req.query('include'));
+    if (!includeParsed.success) return c.json({ error: 'invalid include' }, 400);
+    const includeValues = includeParsed.data;
+    // Embedded ingest-failure page: explicit ?ingestLimit= is zod-validated
+    // (400 on garbage); otherwise follow the queue's own sanitized ?limit=.
+    const ingestLimitRaw = c.req.query('ingestLimit');
+    const ingestLimit =
+      ingestLimitRaw !== undefined
+        ? parseIngestLimit(ingestLimitRaw)
+        : hasLimitParam
+          ? limit
+          : REVIEW_QUEUE_DEFAULT_LIMIT;
+    if (ingestLimit === null) return c.json({ error: 'invalid ingestLimit' }, 400);
 
     let cursor: ReviewQueueCursor | null = null;
     if (hasCursorParam) {
@@ -2805,6 +3304,27 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       nextCursor,
       totals,
     };
+    if (includeValues.includes('ingest_failures')) {
+      const embedded = await listIngestFailures(c.env.DB, {
+        chamber: null,
+        limit: ingestLimit,
+        cursor: null,
+      });
+      body.ingestFailures = embedded.items;
+      body.ingestFailuresNextCursor = embedded.nextCursor;
+    }
+    if (includeValues.includes('dead_letters')) {
+      const dead = await listDeadLetters(c.env.DB, ingestLimit);
+      body.deadLetters = dead.items;
+      body.deadLettersAvailable = dead.available;
+    }
+    if (includeValues.includes('dlq_failed')) {
+      const dlq = await listDlqFailedRows(c.env.DB, ingestLimit);
+      body.dlqFailed = dlq.items;
+      body.dlqFailedAvailable = dlq.available;
+    }
+    body.senateIntake = await readSenateIntakeStatus(c.env);
+    body.senateFetcherRun = await readSenateFetcherRunStatus(c.env);
     // Only surface `truncated` on the legacy unbounded call shape — an
     // explicit limit/cursor caller asked for a bounded page on purpose, that
     // isn't "truncation".
@@ -4353,7 +4873,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         'OPENROUTER_API_KEY', 'LLAMAPARSE_API_KEY', 'ARBITRATION_API_KEY',
       ],
       'auth-billing': [
-        'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
+        'ADMIN_TOKEN', 'INGEST_TOKEN', 'ADMIN_MAINTENANCE_TOKEN', 'SENATE_INTAKE_TOKEN', 'ADMIN_EMAILS', 'ACCESS_AUD', 'ACCESS_TEAM_DOMAIN',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL', 'REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB',
         'REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET',
@@ -4516,6 +5036,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Admin operational snapshot: provider/source connection status, usage counts,
   // and recent errors collected from existing D1 tables. This intentionally
   // reports only whether secrets are configured, never their values.
+  // Operator-private filing-skip diagnostics: the public /health payload
+  // carries counts only, so the raw unreadable 278-T doc ids behind
+  // `oge_text_unreadable` (most recent failure first) are exposed here,
+  // behind the admin router's deny-by-default auth.
+  r.get('/pipeline-health/filing-skips', async (c) => {
+    const pipeline = await checkPipelineHealth(c.env);
+    const filingSkips = pipeline.checks.find((check) => check.id === 'filing_skips') ?? null;
+    return c.json({
+      status: pipeline.status,
+      filingSkips,
+      unreadableExecutiveDocCount: pipeline.signals?.unreadableExecutiveDocCount ?? null,
+      unreadableExecutiveDocIds: pipeline.signals?.unreadableExecutiveDocIds ?? [],
+      time: new Date().toISOString(),
+    });
+  });
+
   r.get('/diagnostics', async (c) => {
     const now = new Date();
     const last24 = hoursAgoIso(24, now);
@@ -6197,6 +6733,145 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
     }
+  });
+
+
+  // --- POST /senate-ptr-intake --------------------------------------------
+  // Accept Senate PTR rows discovered out-of-band by the Mac eFD fetcher
+  // (CT-2442) and hand them to the same dedupe + durable-outbox path as
+  // pollSenate, so intake filings land in the review queue exactly like
+  // polled ones.  Body: { rows: EfdFetcherRow[], dryRun?: boolean } (the
+  // fetcher's out-file envelope keys are also accepted).  Auth: full admin,
+  // or the scoped SENATE_INTAKE_TOKEN (this path only).  Idempotent: rows
+  // whose canonical doc id already exists are counted in `received`, not
+  // reinserted or re-enqueued.
+  r.post('/senate-ptr-intake', async (c) => {
+    let raw = '';
+    try {
+      raw = await c.req.text();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+    // Size ceiling before JSON.parse: a capped 500-row fetcher file is well
+    // under this; anything larger is not a fetcher file.
+    if (raw.length > 1_000_000) {
+      return c.json({ error: 'request body too large' }, 413);
+    }
+    let json: unknown = {};
+    try {
+      if (raw) json = JSON.parse(raw);
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = SenatePtrIntakeBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
+    const filings = body.rows
+      .map((row) => senateFilingFromFetcherRow(row))
+      .filter((f): f is SenateFiling => f !== null);
+    const converted = filings.length;
+    const rejected = body.rows.length - converted;
+    if (body.dryRun === true) {
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: 0,
+        dryRun: true,
+      });
+      return c.json({
+        ok: true,
+        dryRun: true,
+        received: body.rows.length,
+        converted,
+        rejected,
+        docIds: filings.map((f) => f.pipelineDocId),
+      });
+    }
+    try {
+      const result = await ingestSenateFilings(c.env, filings, new Date());
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: result.count,
+        dryRun: false,
+      });
+      return c.json({
+        ok: true,
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: result.count,
+        insertedDocIds: result.inserted.map((f) => f.docId),
+      });
+    } catch (err) {
+      // The relay did call in — record that before answering, so a
+      // server-side ingest failure does not read as a dead fetcher on the
+      // review surface.  newCount stays 0: nothing was ingested.
+      await recordSenateIntake(c.env, {
+        receivedAt: new Date().toISOString(),
+        received: body.rows.length,
+        converted,
+        rejected,
+        newCount: 0,
+        dryRun: false,
+        failed: true,
+      });
+      // The scoped intake caller is low-privilege: log the detail
+      // server-side and return a generic error, never DB internals.
+      console.error('senate-ptr-intake: ingest failed:', (err as Error).message);
+      return c.json({ error: 'senate intake failed' }, 500);
+    }
+  });
+
+  // --- POST /senate-fetcher-run -------------------------------------------
+  // Run heartbeat from the Mac eFD fetcher (CT-2462).  Every completed run
+  // reports its outcome here — including quiet runs that found nothing new
+  // and so never call /senate-ptr-intake, and runs the Senate blocked.
+  // The delivery-only heartbeat made a healthy fetcher read as "never
+  // reported" in the review queue; this record backs the queue's separate
+  // fetcher-run line.  Auth: full admin, or the scoped SENATE_INTAKE_TOKEN
+  // (the same single caller as the intake).  Records only; ingests nothing.
+  // Body: { ranAt?: string, status: 'ok'|'blocked'|'error', rows: number,
+  //         newCount: number, role: 'agents'|'jay' }
+  r.post('/senate-fetcher-run', async (c) => {
+    let raw = '';
+    try {
+      raw = await c.req.text();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+    // A run report is a few hundred bytes; anything larger is not one.
+    if (raw.length > 10_000) {
+      return c.json({ error: 'request body too large' }, 413);
+    }
+    let json: unknown = {};
+    try {
+      if (raw) json = JSON.parse(raw);
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = SenateFetcherRunBodySchema.safeParse(json);
+    if (!parsed.success) {
+      return c.json({ error: 'invalid request body', issues: parsed.error.flatten() }, 400);
+    }
+    const body = parsed.data;
+    const receivedAt = new Date();
+    const ranAtMs = body.ranAt ? Date.parse(body.ranAt) : NaN;
+    await recordSenateFetcherRun(c.env, {
+      ranAt: Number.isFinite(ranAtMs) ? new Date(ranAtMs).toISOString() : receivedAt.toISOString(),
+      receivedAt: receivedAt.toISOString(),
+      status: body.status,
+      rows: body.rows,
+      newCount: body.newCount,
+      role: body.role,
+    });
+    return c.json({ ok: true });
   });
 
   // --- POST /queue-requeue-failed -----------------------------------------
@@ -10951,6 +11626,30 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       const dryRun = c.req.query('dryRun') !== '0';
       const docLimit = Number(c.req.query('limit')) || undefined;
       return c.json({ ok: true, ...(await cleanOgeRowIndexes(c.env, { dryRun, docLimit })) });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
+  // --- POST /amount-bounds-canonicalize ------------------------------------
+  // Snap live (non-deprecated) non-competitor rows whose stored amount bounds
+  // sit one dollar below a STOCK Act bracket (e.g. 1000–15000 → 1001–15000).
+  // DRY RUN BY DEFAULT: pass ?dryRun=0 to write.  ?limit caps rows (default 500,
+  // max 1000).  In-place fix only — no delivery republish.
+  r.post('/amount-bounds-canonicalize', async (c) => {
+    try {
+      const { canonicalizePublishedAmountBounds } = await import('./amountBoundsCanonicalize.ts');
+      const dryRun = c.req.query('dryRun') !== '0';
+      const rawLimit = Number(c.req.query('limit'));
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+      return c.json({
+        ok: true,
+        ...(await canonicalizePublishedAmountBounds(c.env, {
+          dryRun,
+          limit,
+          actor: adminActor(c),
+        })),
+      });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }

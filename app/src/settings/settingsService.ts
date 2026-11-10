@@ -62,6 +62,10 @@ export const APP_SETTINGS: readonly SettingDef[] = [
   { key: 'CT_UI_LOGO_DISPLAY', source: 'app', description: 'Site-wide logo style: tile | transparent | off (default transparent).' },
   { key: 'CT_DELIVERY_MODE', source: 'app', description: 'Subscriber alert delivery (webhooks, APNs push, SSE live feed): deliver (default) | hold (write outbox rows, dispatch nothing until switched back) | suppress (mark new and queued outbox rows suppressed, never sent; SSE pauses; for bulk republishes). Non-default for 60m+ raises a critical delivery_mode health check. See delivery/deliveryMode.ts.' },
   { key: 'DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER', source: 'app', description: 'When truthy, the scheduled parked flush re-parks live quarantined webhook deliveries for delivery (default off; rows whose transaction is gone are always skipped).' },
+  { key: 'CT_OGE_LOCAL_OCR', source: 'app', description: 'Local tesseract retry for OGE 278-T scans with no text layer: on (default) | off. Uses the poppler/tesseract binaries in the app image; when they are missing the pass fails closed and the filing parks as before. See extraction/ogeLocalOcr.ts.' },
+  { key: 'CT_OGE_LOCAL_OCR_MAX_PAGES', source: 'app', description: 'Max pages the local OGE OCR pass renders per filing (default 40; the Trump 278-T scan has 34 pages).' },
+  { key: 'CT_OGE_LOCAL_OCR_MAX_SECONDS', source: 'app', description: 'Wall-clock budget for the local OGE OCR pass per filing, in seconds (default 420; must stay under the durable-queue lease).' },
+  { key: 'CT_OGE_LOCAL_OCR_CROP', source: 'app', description: 'Table-body crop for the local OGE OCR pass as x0,y0,x1,y1 in 300-DPI pixels of the rendered page, or "full" to read the whole page (default 380,380,3060,2480 — a hint measured on the Trump scan, not gospel).' },
 ] as const;
 
 export const APP_SETTING_KEYS = APP_SETTINGS.map((s) => s.key);

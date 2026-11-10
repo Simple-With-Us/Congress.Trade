@@ -18,7 +18,7 @@
  * idempotent self-healing sweep that re-picks up anything stranded [here].
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 import type { Env } from '../shared/types.ts';
 import { all, batch, run } from '../shared/db.ts';
 import { FETCH_NOT_PUBLISHED_WINDOW_MS } from './fetcher.ts';
@@ -525,6 +525,7 @@ export async function sweepOgeUndatedFilingDates(
       const obj = await env.RAW_FILES.get(row.raw_object_key);
       if (!obj) continue;
       const bytes = new Uint8Array(await obj.arrayBuffer());
+      const { extractText, getDocumentProxy } = await import('unpdf');
       const pdf = await getDocumentProxy(bytes);
       const { text } = await extractText(pdf, { mergePages: true });
       if (typeof (pdf as unknown as { destroy?: () => void }).destroy === 'function') {
@@ -564,10 +565,13 @@ export interface ResolvedDesyncSweepResult {
  * are ALL resolved=1 yet frozen at a pre-resolution status, so they were
  * invisible to every sweep AND to the health check built to surface them.
  *
- * This sweep owns exactly that population: it does NOT re-open, re-fetch, or
- * re-extract anything (the review outcome stands) — it only stamps the terminal
- * status from review_queue.resolution_kind / ingestion_decisions.  Provider-
- * missing placeholder rows are excluded.  Idempotent and bounded.
+ * This sweep owns exactly that population, plus CT-2453: a filing that is
+ * already published (live transactions and a latest publish decision) but
+ * whose ingest_status is still non-persisted, including `error`, even when
+ * it never had a review_queue row. It does NOT re-open, re-fetch, or
+ * re-extract anything — it only stamps the terminal status. Filings with
+ * no live transactions are left alone. Provider-missing placeholder rows
+ * are excluded. Idempotent and bounded.
  */
 export async function sweepResolvedStatusDesync(
   env: Env,
@@ -981,6 +985,9 @@ export async function sweepLivenessAlarms(
   const nowIso = now.toISOString();
   for (const check of health.checks) {
     if (!LIVENESS_ALARM_CHECK_IDS.has(check.id)) continue;
+    if ((check.value as { suppressLivenessNotification?: boolean } | undefined)?.suppressLivenessNotification) {
+      continue;
+    }
     result.evaluated += 1;
     const kvKey = `${LIVENESS_ALARM_KV_PREFIX}${check.id}`;
     let episode: LivenessAlarmEpisode | null = null;

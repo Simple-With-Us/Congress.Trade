@@ -38,14 +38,14 @@ if [[ ! -r "$LOG" ]]; then
   exit 3
 fi
 
-n="$(sed -nE 's/^\[ios-ship\] marketing=[0-9]+\.[0-9]+\.[0-9]+ build=([0-9]+)$/\1/p' "$LOG" | tail -n 1)"
+n="$(sed -nE 's/^\[ios-ship\] marketing=[0-9]+\.[0-9]+\.[0-9]+ build=([0-9]+(\.[0-9]+){0,2})$/\1/p' "$LOG" | tail -n 1)"
 
-if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+if [[ ! "$n" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
   echo "ios-ship-build-number: no build number in ${LOG}; falling back to the checkout commit count" >&2
   n="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || true)"
 fi
 
-if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+if [[ ! "$n" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
   echo "ios-ship-build-number: could not determine the uploaded build number" >&2
   exit 3
 fi

@@ -14,10 +14,13 @@ export type SemanticTokenSet = {
   good: string;
 };
 
-/** Dark theme (:root) — pill/fill chrome and general sell ink. */
+/** Dark theme (:root) — pill/fill chrome and general sell ink.
+ *  CT-2459: sell lightened #ef4444 -> #f87d80 (was 4.09:1 on --panel-2,
+ *  3.46:1 on same-hue tints); the new value matches the proven --neg text
+ *  tone and clears 4.5:1 on every dark surface incl. tints. */
 export const SEMANTIC_DARK: SemanticTokenSet = {
   buy: '#22c55e',
-  sell: '#ef4444',
+  sell: '#f87d80',
   exch: '#eab308',
   warn: '#f59e0b',
   good: '#34d399',
@@ -126,6 +129,28 @@ export function darkNegativeTextContrastCases(neg: string = SEMANTIC_DARK_NEG): 
     for (const bg of ['#121b30', '#172440'] as const) {
       const surface = mixSrgb(neg, bg, pct);
       cases.push({ token: 'sell', foreground: neg, background: surface, ratio: contrastRatio(neg, surface) });
+    }
+  }
+  return cases;
+}
+
+/** Every dark-mode semantic text surface we regression-test (CT-2459:
+ *  mirrors the light cases; previously only --neg was covered). */
+export function darkSemanticTextContrastCases(
+  tokens: SemanticTokenSet = SEMANTIC_DARK,
+): SemanticContrastCase[] {
+  const cases: SemanticContrastCase[] = [];
+  const tokenKeys: (keyof SemanticTokenSet)[] = ['buy', 'sell', 'exch', 'warn', 'good'];
+  for (const token of tokenKeys) {
+    const fg = tokens[token];
+    for (const bg of DARK_SEMANTIC_TEXT_SURFACES) {
+      cases.push({ token, foreground: fg, background: bg, ratio: contrastRatio(fg, bg) });
+    }
+    for (const pct of DARK_SEMANTIC_TINT_PERCENTAGES) {
+      for (const bg of ['#121b30', '#172440'] as const) {
+        const surface = mixSrgb(fg, bg, pct);
+        cases.push({ token, foreground: fg, background: surface, ratio: contrastRatio(fg, surface) });
+      }
     }
   }
   return cases;

@@ -51,6 +51,14 @@ import {
 } from '../prices/stPeerPricesHealth.ts';
 import { emptyFetchAlertWhere, emptyFetchSeenCutoff } from '../ingestion/emptyFetchHandoff.ts';
 import { collectDeliveryModeCheck } from '../delivery/deliveryMode.ts';
+import {
+  enrichFmpLatencySelfHealingSilence,
+  evaluateFmpLatencyCheck,
+  readFmpLatencyCriticalAgeSec,
+  readFmpLatencySelfHealingGraceMs,
+  fmpLatencyProbeExpected,
+  type FmpLatencySelfHealingSilence,
+} from './fmpLatencyProbeHealth.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -101,6 +109,11 @@ export interface PipelineHealth {
   signals?: {
     filingSkips24h: number | null;
     filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'];
+    /** Count of docs behind `oge_text_unreadable` in the same 24h window. */
+    unreadableExecutiveDocCount?: number | null;
+    /** Doc ids behind `oge_text_unreadable` in the same 24h window. Only
+     *  collected for operator-private callers; null in public responses. */
+    unreadableExecutiveDocIds?: string[] | null;
     fmpLatency: PipelineSignals['fmpLatency'];
     priceEodLatestDate: string | null;
     spxEodLatestDate: string | null;
@@ -156,6 +169,15 @@ export interface PipelineSignals {
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
   filingSkipsByAction24h: Record<FilingSkipAction, number> | null;
+  /** Count of docs behind `oge_text_unreadable` in the same 24h window. */
+  unreadableExecutiveDocCount?: number | null;
+  /**
+   * Up to five doc ids behind `oge_text_unreadable` in the same 24h window,
+   * most recently failed first. Absent when the ids were not collected;
+   * collection is gated on `includeUnreadableDocIds` so public health
+   * responses never carry raw filing identifiers.
+   */
+  unreadableExecutiveDocIds?: string[] | null;
   /**
    * 2026-09-21: FMP-family latency summary for both admin and user surfaces.
    * The user-facing dashboard renders `lastObservationAgeSec` + `observationCount24h`
@@ -170,6 +192,8 @@ export interface PipelineSignals {
     http429s24h: number | null;
     /** Per-provider last-observation age (seconds) when trade_provider_observations is reachable. */
     byProvider: Record<string, { lastObservationAt: string | null; ageSec: number | null; count24h: number | null }> | null;
+    /** Set during signal collection when silence is a known self-healing state (CT-2335). */
+    selfHealingSilence?: FmpLatencySelfHealingSilence | null;
   } | null;
   lastExtractionSuccessAt: string | null;
   /**
@@ -674,24 +698,31 @@ export function evaluatePipelineSignals(
   } else {
     const halted = Boolean(s.autopilotHaltReason);
     const backlog = s.reviewBacklog ?? 0;
+    // CT-2448: a terminal-only backlog is work no extraction attempt can
+    // help — parked unreadable 278-Ts, rejected rows, attempt-capped
+    // cascades.  Those rows must never mark the provider stalled, so the
+    // stall signal counts only the rows that are still ELIGIBLE for a read.
+    // reviewEligible is collected together with reviewBacklog; when it is
+    // missing, fall back to the backlog count rather than going quiet.
+    const eligibleBacklog = s.reviewEligible ?? s.reviewBacklog ?? 0;
     const localActive = (s.localWorkerActivity24h ?? 0) > 0;
-    if (halted || (backlog > 0 && !localActive)) {
+    if (halted || (eligibleBacklog > 0 && !localActive)) {
       checks.push({
         id: 'extraction_provider',
         status: 'stalled',
         detail: halted
           ? `No extraction attempts in 24h while autopilot is halted (${s.autopilotHaltReason})`
-          : `No extraction attempts in 24h while review backlog is ${backlog}`,
+          : `No extraction attempts in 24h while review backlog is ${eligibleBacklog}`,
         value: 0,
       });
-    } else if (localActive && backlog > 0) {
+    } else if (localActive && eligibleBacklog > 0) {
       // The Mac/server local-vision workers publish scans without writing
       // extraction_runs; a busy local drain with backlog is activity, not a
       // stall — but still degraded while provider extractors stay idle.
       checks.push({
         id: 'extraction_provider',
         status: 'degraded',
-        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) while review backlog is ${backlog}`,
+        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) while review backlog is ${eligibleBacklog}`,
         value: s.localWorkerActivity24h ?? 0,
       });
     } else if (localActive) {
@@ -699,7 +730,9 @@ export function evaluatePipelineSignals(
       checks.push({
         id: 'extraction_provider',
         status: 'ok',
-        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and review backlog clear`,
+        detail: backlog > 0
+          ? `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and no eligible review backlog`
+          : `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and review backlog clear`,
         value: s.localWorkerActivity24h ?? 0,
       });
     } else {
@@ -708,10 +741,16 @@ export function evaluatePipelineSignals(
         weekday: 'short',
       }).format(new Date(nowMs));
       const isWeekend = weekdayEt === 'Sat' || weekdayEt === 'Sun';
+      // A backlog made only of terminal rows (parked unreadable 278-Ts,
+      // rejected rows) is reported by the extraction_backlog check; the
+      // provider itself is idle, not stalled.
+      const terminalOnly = backlog > 0 && eligibleBacklog === 0;
       checks.push({
         id: 'extraction_provider',
         status: 'ok',
-        detail: isWeekend
+        detail: terminalOnly
+          ? 'No extraction attempts in 24h (review backlog is terminal rows only)'
+          : isWeekend
           ? 'No extraction attempts in 24h (expected on weekend)'
           : 'No extraction attempts in 24h',
         value: 0
@@ -744,10 +783,14 @@ export function evaluatePipelineSignals(
         .filter(([, v]) => typeof v === 'number' && v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(', ') || 'unknown';
+      const named = (byAction.oge_text_unreadable ?? 0) > 0
+        ? (s.unreadableExecutiveDocIds ?? []).filter((id) => id.length > 0).slice(0, 5)
+        : [];
+      const namedSuffix = named.length > 0 ? `  Unreadable docs: ${named.join(', ')}.` : '';
       checks.push({
         id: 'filing_skips',
         status: 'critical',
-        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.`,
+        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.${namedSuffix}`,
         value: { total: s.filingSkips24h, byAction, threshold },
       });
     } else {
@@ -769,32 +812,21 @@ export function evaluatePipelineSignals(
   // starts returning 401/403 (which would silently stall the price refresh
   // lane — the 2026-09-20 outage class).
   if (s.fmpLatency != null) {
-    const ageSec = s.fmpLatency.lastObservationAgeSec;
-    const count = s.fmpLatency.observationCount24h;
-    const f429 = s.fmpLatency.http429s24h;
-    const probeExpected = (() => {
-      const on = envGet('FMP_LATENCY_PROBE_ENABLED');
-      return on !== 'false' && on !== '0';
-    })();
-    const isCritical = probeExpected && (ageSec == null || ageSec > 3 * 3600 || (count ?? 0) === 0);
-    const isDegraded = !isCritical && (ageSec == null || ageSec > 3600 || (f429 ?? 0) > 5);
-    const tier: PipelineStatus = isCritical ? 'critical' : isDegraded ? 'degraded' : 'ok';
-    const detail = isCritical
-      ? `FMP latency probe silent for ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'no observation in 48h'} (${count ?? 0} obs/24h). Observations are not committing.  Check SQLITE_BUSY / WAL checkpoint before rotating FMP_LATENCY_API_KEY.`
-      : isDegraded
-        ? `FMP latency probe lagging (last age ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'unknown'}, ${f429 ?? 0} HTTP 429s in 24h).`
-        : `FMP latency probe live (last observation ${ageSec != null ? Math.round(ageSec / 60) + ' min ago' : 'unknown'}, ${count ?? 0} obs in 24h, ${f429 ?? 0} 429s).`;
+    // Reuses this function's guarded `envGet` (defined above for filing skips).
+    const probeExpected = fmpLatencyProbeExpected(envGet);
+    const criticalAgeSec = readFmpLatencyCriticalAgeSec(envGet);
+    const graceMs = readFmpLatencySelfHealingGraceMs(envGet);
+    const evaluated = evaluateFmpLatencyCheck(s.fmpLatency, nowMs, {
+      probeExpected,
+      criticalAgeSec,
+      graceMs,
+      selfHealing: s.fmpLatency.selfHealingSilence,
+    });
     checks.push({
       id: 'fmp_latency',
-      status: tier,
-      detail,
-      value: {
-        observationCount24h: count,
-        lastObservationAt: s.fmpLatency.lastObservationAt,
-        lastObservationAgeSec: ageSec,
-        http429s24h: f429,
-        byProvider: s.fmpLatency.byProvider,
-      },
+      status: evaluated.status,
+      detail: evaluated.detail,
+      value: evaluated.value,
     });
   } else {
     checks.push({ id: 'fmp_latency', status: 'unknown', detail: 'FMP latency telemetry uncollected', value: null });
@@ -1165,7 +1197,9 @@ export function evaluatePipelineSignals(
   }
 
   // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
-  // the residential proxy.  ok / blocked (Akamai anti-bot 403 → `critical`) /
+  // the residential proxy.  ok / blocked (an Akamai anti-bot 403 reads
+  // `degraded` since the 2026-11-05 canary redesign: the deny is the expected
+  // state of this path and Senate data flows via the Mac fetcher relay) /
   // degraded.  A degraded probe where eFD itself answered wrong (non-Akamai
   // HTTP error, landing without a csrf token: `status` set) is `stalled`, so it
   // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
@@ -1194,11 +1228,11 @@ export function evaluatePipelineSignals(
     const waitMin = Math.round((efdBackoffUntilMs - nowMs) / 60_000);
     checks.push({
       id: 'senate_efd',
-      status: 'critical',
-      detail: `Senate eFD BLOCKED: Akamai edge deny on Senate ingestion `
+      status: 'degraded',
+      detail: `Senate eFD canary: Akamai edge deny on Senate ingestion `
         + `${deniedAgoMin < 1 ? Math.round(deniedAgoMin * 60) + 's' : Math.round(deniedAgoMin) + 'm'} ago (${efdBackoff.reason})`
-        + ` — refused by eFD itself, not a relay outage; the probe is paused for the edge-deny backoff`
-        + ` (${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
+        + ` — refused by eFD itself, not a relay outage; the twice-a-day canary tracks this path and Senate filings arrive via the Mac fetcher relay`
+        + ` (ingestion backoff: ${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
       value: 403,
     });
   } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
@@ -1229,15 +1263,16 @@ export function evaluatePipelineSignals(
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
     const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
-    // The probe dials eFD at most every 30m, so allow two missed cycles.
+    // The probe dials eFD at most twice a day, so allow three cycles
+    // before a resting ok record is even called stale (it still reads ok).
     const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, (3 * SENATE_EFD_PROXY_PROBE_INTERVAL_MS) / 60_000);
     const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
     if (probe.state === 'blocked') {
       checks.push({
         id: 'senate_efd',
-        status: 'critical',
-        detail: `Senate eFD BLOCKED: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
-          + ` — Senate ingestion is refused by eFD itself, not a relay outage (probed ${ago})`,
+        status: 'degraded',
+        detail: `Senate eFD canary blocked: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
+          + ` — expected for this path, not a relay outage; Senate filings arrive via the Mac fetcher relay (probed ${ago})`,
         value: probe.status,
       });
     } else if (probe.state === 'degraded') {
@@ -1249,10 +1284,13 @@ export function evaluatePipelineSignals(
         value: probe.status,
       });
     } else if (ageMin > maxAgeMin) {
+      // A stale ok is the canary resting between its twice-a-day dials, not a
+      // stall: the dial schedule plus missed-cycle tolerance puts this
+      // threshold far past any healthy gap.
       checks.push({
         id: 'senate_efd',
-        status: 'degraded',
-        detail: `Senate eFD probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${maxAgeMin}m)`,
+        status: 'ok',
+        detail: `Senate eFD canary: last dial ok ${Math.round(ageMin)}m ago — the probe dials twice a day by design; Senate filings arrive via the Mac fetcher relay`,
         value: Math.round(ageMin),
       });
     } else {
@@ -1354,6 +1392,8 @@ export function evaluatePipelineSignals(
     signals: {
       filingSkips24h: s.filingSkips24h,
       filingSkipsByAction24h: s.filingSkipsByAction24h,
+      unreadableExecutiveDocCount: s.unreadableExecutiveDocCount ?? null,
+      unreadableExecutiveDocIds: s.unreadableExecutiveDocIds ?? null,
       fmpLatency: s.fmpLatency,
       priceEodLatestDate: s.priceEodLatestDate,
       spxEodLatestDate: s.spxEodLatestDate,
@@ -1441,7 +1481,14 @@ export async function checkPipelineHealth(
   env: Env,
   now = new Date(),
   precomputed: { emptyFetch?: EmptyFetchHandoffSnapshot } = {},
+  opts: { includeUnreadableDocIds?: boolean } = {},
 ): Promise<PipelineHealth> {
+  // Raw unreadable-filing doc ids are operator-private diagnostics: public
+  // /health responses must not disclose them, so callers serving
+  // unauthenticated traffic pass includeUnreadableDocIds: false and get
+  // unreadableExecutiveDocCount only. Defaults to true so existing
+  // operator-private callers (loud alerts, admin surface) keep the names.
+  const includeUnreadableDocIds = opts.includeUnreadableDocIds ?? true;
   const nowMs = now.getTime();
   const iso24hAgo = new Date(nowMs - 24 * 3600 * 1000).toISOString();
   // 2026-10-04: read the live probe schedule from env so a legally slower
@@ -1481,6 +1528,8 @@ export async function checkPipelineHealth(
   // Filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
+  let unreadableExecutiveDocIds: string[] | null = null;
+  let unreadableExecutiveDocCount: number | null = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
   let fmpLatency: PipelineSignals['fmpLatency'] = null;
 
@@ -1504,21 +1553,24 @@ export async function checkPipelineHealth(
       auto_resolved_empty: number | null;
       doc_quarantined: number | null;
       oge_text_unreadable: number | null;
+      oge_text_unreadable_docs: number | null;
     }>(
       env.DB,
       `SELECT
          SUM(CASE WHEN action = 'extract_empty_failure' THEN 1 ELSE 0 END) AS extract_empty_failure,
          SUM(CASE WHEN action = 'auto_resolved_empty'   THEN 1 ELSE 0 END) AS auto_resolved_empty,
          SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined,
-         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable
+         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable,
+         COUNT(DISTINCT CASE WHEN action = ? THEN doc_id END) AS oge_text_unreadable_docs
        FROM ingestion_decisions
        WHERE created_at >= ?`,
-      [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
+      [OGE_TEXT_UNREADABLE_DECISION_ACTION, OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
     );
     const ee = Number(res?.extract_empty_failure ?? 0);
     const ar = Number(res?.auto_resolved_empty ?? 0);
     const dq = Number(res?.doc_quarantined ?? 0);
     const unread = Number(res?.oge_text_unreadable ?? 0);
+    const unreadDocs = Number(res?.oge_text_unreadable_docs ?? 0);
     filingSkips24h = ee + ar + dq + unread;
     filingSkipsByAction24h = {
       extract_empty_failure: ee,
@@ -1526,6 +1578,24 @@ export async function checkPipelineHealth(
       doc_quarantined: dq,
       oge_text_unreadable: unread,
     };
+    // Distinct unreadable DOCS, not decisions: duplicate unreadable
+    // decisions for the same doc must not inflate the public count.
+    unreadableExecutiveDocCount = unreadDocs;
+    if (unread > 0 && includeUnreadableDocIds) {
+      try {
+        // Most recent failure first: GROUP BY doc_id collapses duplicate
+        // decisions for the same doc, and ordering by MAX(created_at)
+        // surfaces the filing that just failed instead of alphabetically
+        // early ids.
+        const rows = await all<{ doc_id: string | null }>(
+          env.DB,
+          `SELECT doc_id, MAX(created_at) AS latest_at FROM ingestion_decisions
+           WHERE action = ? AND created_at >= ? GROUP BY doc_id ORDER BY latest_at DESC LIMIT 5`,
+          [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
+        );
+        unreadableExecutiveDocIds = rows.map((r) => r.doc_id ?? '').filter((id) => id.length > 0);
+      } catch {}
+    }
   } catch {}
 
   // 2026-09-21: FMP-family latency. Two parts: trade_provider_observations
@@ -1603,6 +1673,22 @@ export async function checkPipelineHealth(
     }
     if (fmpLatency) fmpLatency.http429s24h = total;
   } catch {}
+
+  if (fmpLatency) {
+    try {
+      const envGet = (k: string): string | undefined => {
+        try {
+          return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k);
+        } catch {
+          return undefined;
+        }
+      };
+      const selfHealing = await enrichFmpLatencySelfHealingSilence(env, fmpLatency, now, envGet);
+      if (selfHealing) fmpLatency = { ...fmpLatency, selfHealingSilence: selfHealing };
+    } catch {
+      /* fail-soft */
+    }
+  }
 
   try {
     const res = await get<{ n: number; oldest: string | null }>(
@@ -1966,6 +2052,8 @@ export async function checkPipelineHealth(
     spxEodLatestDate,
     filingSkips24h,
     filingSkipsByAction24h,
+    unreadableExecutiveDocCount,
+    unreadableExecutiveDocIds,
     fmpLatency,
     deliveryParked,
     deliveryQuarantined,
@@ -1989,4 +2077,68 @@ export async function checkPipelineHealth(
   }
 
   return { ...evaluated, status, checks, reviewQueue };
+}
+
+export interface PipelineHealthCache {
+  get(env: Env, now?: Date): Promise<PipelineHealth>;
+  reset(): void;
+}
+
+/**
+ * Short-TTL singleflight cache around a pipeline-health fetcher.
+ *
+ * checkPipelineHealth runs dozens of sequential probes; the public health
+ * endpoints are monitor targets, so uncached hits amplify into full scans.
+ * Entries are keyed by the DB binding object: the Deno runtime reuses one
+ * shim per process (deno/main.ts), while tests that build a fresh fake DB
+ * per case stay isolated. Errors are never cached — a rejected fetch clears
+ * the in-flight slot so the next caller retries immediately.
+ */
+export function createPipelineHealthCache(
+  fetcher: (env: Env, now: Date) => Promise<PipelineHealth>,
+  ttlMs = 60_000,
+): PipelineHealthCache {
+  interface Entry {
+    at: number;
+    result?: PipelineHealth;
+    pending?: Promise<PipelineHealth>;
+  }
+  const entries = new WeakMap<object, Entry>();
+  let fallback: Entry | null = null;
+  const entryFor = (env: Env): Entry => {
+    const key = (env as { DB?: unknown }).DB;
+    if (key && (typeof key === 'object' || typeof key === 'function')) {
+      let entry = entries.get(key as object);
+      if (!entry) {
+        entry = { at: 0 };
+        entries.set(key as object, entry);
+      }
+      return entry;
+    }
+    fallback ??= { at: 0 };
+    return fallback;
+  };
+  return {
+    async get(env: Env, now = new Date()): Promise<PipelineHealth> {
+      const entry = entryFor(env);
+      const nowMs = now.getTime();
+      if (entry.result && nowMs - entry.at < ttlMs) return entry.result;
+      if (entry.pending) return entry.pending;
+      const pending = (async () => {
+        const result = await fetcher(env, now);
+        entry.at = nowMs;
+        entry.result = result;
+        return result;
+      })();
+      entry.pending = pending;
+      try {
+        return await pending;
+      } finally {
+        if (entry.pending === pending) entry.pending = undefined;
+      }
+    },
+    reset(): void {
+      fallback = null;
+    },
+  };
 }

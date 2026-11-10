@@ -870,7 +870,7 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(warn.mock.calls.some(([msg]) => /senate source degraded/.test(String(msg)))).toBe(false);
   });
 
-  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most every 30 minutes', async () => {
+  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most twice a day', async () => {
     const PROXY = 'http://10.99.0.2:8888';
     const { env, kv } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
     const efdCalls: string[] = [];
@@ -904,11 +904,11 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(efdCalls).toEqual(['GET /search/', 'POST /search/home/']);
     expect(JSON.parse(kv.get('senate-efd:health')!)).toMatchObject({ state: 'ok', egress: 'proxy' });
 
-    // Then at most every 30 minutes.
+    // Then at most twice a day (12h probe interval).
     await runWatcher(env, at(62));
-    await runWatcher(env, at(90));
+    await runWatcher(env, at(61 + 11 * 60));
     expect(efdCalls).toHaveLength(2);
-    await runWatcher(env, at(91));
+    await runWatcher(env, at(61 + 12 * 60));
     expect(efdCalls).toHaveLength(4);
   });
 });

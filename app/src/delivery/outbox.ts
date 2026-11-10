@@ -126,53 +126,73 @@ export async function flushDeliveryOutbox(
   );
 
   const result: OutboxFlushResult = { claimed: 0, enqueued: 0, failed: 0 };
-  for (const row of rows) {
+  // CT-2459: bulk claim + sendBatch + bulk completion. The old loop paid a
+  // claim UPDATE + queue INSERT + completion UPDATE per row (~3 writes/row,
+  // ~600/min at the 100-row cadence); this pays ~3 writes per 80-row chunk.
+  // A crash after sendBatch but before the completion UPDATE duplicates
+  // queue messages after the lease — same as before, absorbed by the
+  // (subscription_id, tx_id) delivery dedupe.
+  // GOVERNOR 2: unchanged accounting (1 governed op per claimed row). Rows
+  // past the cap stay 'pending' for the next scheduled flush.
+  const granted = rows.length === 0
+    ? 0
+    : consumeGovernedD1Writes(env, 'delivery-outbox-flush', rows.length);
+  if (rows.length > 0 && granted < 1) {
+    console.warn('flushDeliveryOutbox stopped early: D1 write governor cap reached');
+  }
+  const leaseUntil = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
+  const CHUNK = 80;
+  for (let i = 0; i < granted; i += CHUNK) {
     abortIfSignal(opts.signal);
-    // GOVERNOR 2: the outbox fan-out performs 2-3 writes per claimed row. Past
-    // the per-invocation governed-write cap, stop this cycle early — the
-    // remaining rows stay 'pending' and the next scheduled flush drains them,
-    // so a storm degrades to bounded batches instead of an unbounded loop.
-    if (consumeGovernedD1Writes(env, 'delivery-outbox-flush', 1) < 1) {
-      console.warn('flushDeliveryOutbox stopped early: D1 write governor cap reached');
-      break;
-    }
-    const leaseUntil = new Date(now.getTime() + LEASE_SECONDS * 1000).toISOString();
-    const claim = await run(
+    const slice = rows.slice(i, i + CHUNK);
+    const ids = slice.map((r) => r.tx_id);
+    const placeholders = ids.map(() => '?').join(',');
+    const claimedRows = await all<{ tx_id: string; attempts: number }>(
       env.DB,
       `UPDATE delivery_outbox
           SET status = 'sending', attempts = attempts + 1,
               available_at = ?, last_error = NULL, updated_at = ?
-        WHERE tx_id = ? AND (
+        WHERE tx_id IN (${placeholders}) AND (
           (status IN ('pending', 'sending') AND available_at <= ?)
           OR (status = 'enqueued' AND updated_at <= ?)
-        )`,
-      [leaseUntil, nowIso, row.tx_id, nowIso, staleEnqueuedBefore],
+        )
+        RETURNING tx_id, attempts`,
+      [leaseUntil, nowIso, ...ids, nowIso, staleEnqueuedBefore],
     );
-    if ((claim.meta?.changes ?? 0) === 0) continue;
-    result.claimed += 1;
-
+    if (claimedRows.length === 0) continue;
+    result.claimed += claimedRows.length;
+    const claimedIds = claimedRows.map((r) => r.tx_id);
+    const claimedPlaceholders = claimedIds.map(() => '?').join(',');
     try {
-      await env.DELIVERY_QUEUE.send({ type: 'delivery.dispatch', txId: row.tx_id });
+      const messages = claimedIds.map((txId) => ({
+        body: { type: 'delivery.dispatch', txId } as const,
+      }));
+      if (typeof env.DELIVERY_QUEUE.sendBatch === 'function') {
+        await env.DELIVERY_QUEUE.sendBatch(messages);
+      } else {
+        for (const m of messages) await env.DELIVERY_QUEUE.send(m.body);
+      }
       await run(
         env.DB,
         `UPDATE delivery_outbox
             SET status = 'enqueued', available_at = ?, last_error = NULL, updated_at = ?
-          WHERE tx_id = ? AND status = 'sending'`,
-        [nowIso, nowIso, row.tx_id],
+          WHERE tx_id IN (${claimedPlaceholders}) AND status = 'sending'`,
+        [nowIso, nowIso, ...claimedIds],
       );
-      result.enqueued += 1;
+      result.enqueued += claimedRows.length;
     } catch (err) {
-      const attempt = row.attempts + 1;
-      const availableAt = new Date(now.getTime() + retryDelaySeconds(attempt) * 1000).toISOString();
       const message = err instanceof Error ? err.message : String(err);
-      await run(
-        env.DB,
-        `UPDATE delivery_outbox
-            SET status = 'pending', available_at = ?, last_error = ?, updated_at = ?
-          WHERE tx_id = ? AND status = 'sending'`,
-        [availableAt, message.slice(0, 1000), nowIso, row.tx_id],
-      );
-      result.failed += 1;
+      for (const claimed of claimedRows) {
+        const availableAt = new Date(now.getTime() + retryDelaySeconds(claimed.attempts) * 1000).toISOString();
+        await run(
+          env.DB,
+          `UPDATE delivery_outbox
+              SET status = 'pending', available_at = ?, last_error = ?, updated_at = ?
+            WHERE tx_id = ? AND status = 'sending'`,
+          [availableAt, message.slice(0, 1000), nowIso, claimed.tx_id],
+        );
+        result.failed += 1;
+      }
     }
   }
 

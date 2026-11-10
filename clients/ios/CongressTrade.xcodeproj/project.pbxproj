@@ -11,7 +11,6 @@
 		0974386EFF6C2D62AE6B4AE3 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000EC5BF9DE684A3C1BBB545 /* Models.swift */; };
 		0CA1E1E87145D83004F92093 /* MemberDirectorySearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF9642633B7915F9C25D4019 /* MemberDirectorySearch.swift */; };
 		0DC3DE29A9E85DA255EC7F8D /* PeopleDirectoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39E422DDE36A2C9EFCD398C7 /* PeopleDirectoryView.swift */; };
-		1600D0C851F916DF1E2DCC6A /* ZillaSlab-Bold.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 55E698A393A955A6C20B0AF2 /* ZillaSlab-Bold.ttf */; };
 		2C4A62E17A2B5A42FB5581C5 /* TickerDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CBD0B7344DF909E5AD17EFB /* TickerDetailView.swift */; };
 		30518D05E57024E89C72E199 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56B13A449C89D5073DF53F09 /* APIClient.swift */; };
 		33255C8B65CE5D57BEA0FD21 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 174A07BA61795B86BDB4680A /* AppDelegate.swift */; };
@@ -90,7 +89,6 @@
 		4C7664CE19D4129836BD2C07 /* CongressTradeWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = CongressTradeWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		4F5EE103A6EDDC2AD3034435 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		55B48D70FD05BF58BF28E110 /* CongressTrade.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CongressTrade.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		55E698A393A955A6C20B0AF2 /* ZillaSlab-Bold.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "ZillaSlab-Bold.ttf"; sourceTree = "<group>"; };
 		56B13A449C89D5073DF53F09 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
 		56FDA85A80BDE2C431CB66F1 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		5CBD0B7344DF909E5AD17EFB /* TickerDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TickerDetailView.swift; sourceTree = "<group>"; };
@@ -143,7 +141,6 @@
 		111920EC6E664F6151D378CA /* Fonts */ = {
 			isa = PBXGroup;
 			children = (
-				55E698A393A955A6C20B0AF2 /* ZillaSlab-Bold.ttf */,
 				F6213C613EEED13D8D90D998 /* ZillaSlab-Regular.ttf */,
 			);
 			path = Fonts;
@@ -404,7 +401,6 @@
 			files = (
 				EEA8085F9159BE7218AE0CEC /* Assets.xcassets in Resources */,
 				E4A9BCCA0D7B029E6BE92CC5 /* PrivacyInfo.xcprivacy in Resources */,
-				1600D0C851F916DF1E2DCC6A /* ZillaSlab-Bold.ttf in Resources */,
 				CD00FC2E35046CCB03370BFE /* ZillaSlab-Regular.ttf in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -558,7 +554,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 2317;
+				CURRENT_PROJECT_VERSION = 202610290000;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = CC8UTF7ATG;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -580,7 +576,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Congress.Trade;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.finance";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.0.2317;
+				MARKETING_VERSION = 1.1.2;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -656,7 +652,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 2317;
+				CURRENT_PROJECT_VERSION = 202610290000;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = CC8UTF7ATG;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -672,7 +668,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Congress.Trade;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.finance";
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.0.2317;
+				MARKETING_VERSION = 1.1.2;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -806,7 +802,7 @@
 			repositoryURL = "https://github.com/getsentry/sentry-cocoa.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 9.30.2;
+				minimumVersion = 9.32.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

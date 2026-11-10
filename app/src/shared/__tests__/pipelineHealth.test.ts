@@ -373,6 +373,44 @@ describe('evaluatePipelineSignals', () => {
     expect(providerCheck?.detail).toContain('review backlog clear');
   });
 
+  it('does not mark extraction_provider stalled when the backlog is terminal rows only (CT-2448)', () => {
+    // Parked unreadable 278-Ts, rejected rows and attempt-capped cascades
+    // are work no extraction attempt can help.  The provider is idle, not
+    // stalled; the extraction_backlog check still reports the queue.
+    const terminalOnly: PipelineSignals = {
+      ...cleanSignals,
+      reviewBacklog: 7,
+      reviewEligible: 0,
+      reviewSuppressed: 0,
+      reviewTerminal: 7,
+      extractionAttempts24h: 0,
+      extractionOk24h: 0,
+    };
+    const res = evaluatePipelineSignals(terminalOnly, nowMs);
+    const providerCheck = res.checks.find((c) => c.id === 'extraction_provider');
+    expect(providerCheck?.status).toBe('ok');
+    expect(providerCheck?.detail).toContain('terminal rows only');
+    const backlogCheck = res.checks.find((c) => c.id === 'extraction_backlog');
+    expect(backlogCheck?.status).not.toBe('ok');
+  });
+
+  it('marks extraction_provider ok with local activity and no eligible backlog (CT-2448)', () => {
+    const localTerminalOnly: PipelineSignals = {
+      ...cleanSignals,
+      reviewBacklog: 4,
+      reviewEligible: 0,
+      reviewSuppressed: 1,
+      reviewTerminal: 3,
+      extractionAttempts24h: 0,
+      extractionOk24h: 0,
+      localWorkerActivity24h: 2,
+    };
+    const res = evaluatePipelineSignals(localTerminalOnly, nowMs);
+    const providerCheck = res.checks.find((c) => c.id === 'extraction_provider');
+    expect(providerCheck?.status).toBe('ok');
+    expect(providerCheck?.detail).toContain('no eligible review backlog');
+  });
+
   it('flags stalled when outbox pending items exceed max age threshold', () => {
     const oldestMs = nowMs - (120 * 60 * 1000); // 120m old, > 90m limit
     const outboxStallSignals: PipelineSignals = {
@@ -458,6 +496,45 @@ describe('evaluatePipelineSignals', () => {
       const check = res.checks.find((c) => c.id === 'review_resolution_integrity');
       expect(check?.status).toBe('unknown');
     });
+  });
+
+  it('pages filing_skips on an unreadable 278-T and names the doc (board 5235c003)', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 0,
+        doc_quarantined: 0,
+        oge_text_unreadable: 1,
+      },
+      unreadableExecutiveDocIds: ['E-2026-donald-j-trump-09-17-2026-278t'],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(res.status).toBe('critical');
+    expect(check?.detail).toContain('oge_text_unreadable=1');
+    expect(check?.detail).toContain('E-2026-donald-j-trump-09-17-2026-278t');
+    expect(res.signals?.unreadableExecutiveDocIds).toEqual(['E-2026-donald-j-trump-09-17-2026-278t']);
+  });
+
+  it('keeps explicit Part 7 None in auto_resolved_empty and does not call it an unreadable doc', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 1,
+        doc_quarantined: 0,
+        oge_text_unreadable: 0,
+      },
+      unreadableExecutiveDocIds: [],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(check?.detail).toContain('auto_resolved_empty=1');
+    expect(check?.detail).not.toContain('oge_text_unreadable=');
+    expect(check?.detail).not.toContain('Unreadable docs');
   });
 });
 
@@ -832,13 +909,13 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     return res.checks.find((c) => c.id === 'senate_efd')!;
   }
 
-  it('senate_efd is critical (blocked) on an Akamai anti-bot 403, never stalled', () => {
+  it('senate_efd is degraded (canary blocked) on an Akamai anti-bot 403, never stalled', () => {
     const check = efdCheck({
       ok: false, state: 'blocked', status: 403, step: 'POST /search/home/', egress: 'proxy',
       checkedAt: new Date(nowMs - 60_000).toISOString(), error: 'eFD anti-bot block (Akamai Access Denied)',
     });
-    expect(check.status).toBe('critical');
-    expect(check.detail).toContain('BLOCKED');
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('canary blocked');
     expect(check.detail).toContain('Akamai');
     expect(check.detail).toContain('POST /search/home/');
     expect(check.detail).toContain('not a relay outage');
@@ -883,17 +960,23 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('agreement POST ok');
   });
 
-  it('senate_efd ok goes degraded only after two missed 30m cycles', () => {
+  it('senate_efd ok reads as the resting canary between twice-a-day dials', () => {
     const fresh = efdCheck({
       ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 60 * 60_000).toISOString(),
     });
     expect(fresh.status).toBe('ok');
-    const stale = efdCheck({
-      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 100 * 60_000).toISOString(),
+    // 13 hours old: past one 12h dial interval, still a healthy resting canary.
+    const resting = efdCheck({
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 13 * 60 * 60_000).toISOString(),
     });
-    expect(stale.status).toBe('degraded');
-    expect(stale.detail).toContain('stale');
-    expect(stale.detail).toContain('threshold 90m');
+    expect(resting.status).toBe('ok');
+    // Past three missed cycles the wording names the canary schedule.
+    const canary = efdCheck({
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 40 * 60 * 60_000).toISOString(),
+    });
+    expect(canary.status).toBe('ok');
+    expect(canary.detail).toContain('canary');
+    expect(canary.detail).toContain('twice a day');
   });
 
   // CT-2442: the probe does not dial while the watcher's edge-deny backoff is
@@ -916,26 +999,26 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     return res.checks.find((c) => c.id === 'senate_efd')!;
   }
 
-  it('senate_efd is critical (blocked) while an ingestion edge deny is newer than an ok probe', () => {
+  it('senate_efd is degraded (canary) while an ingestion edge deny is newer than an ok probe', () => {
     const check = efdBackoffCheck(
       { ok: true, state: 'ok', status: 302, egress: 'proxy', dialed: true, checkedAt: new Date(nowMs - 20 * 60_000).toISOString() },
       { lastDeniedAgoMin: 10, untilInMin: 50 },
     );
-    expect(check.status).toBe('critical');
-    expect(check.detail).toContain('BLOCKED');
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('canary');
     expect(check.detail).toContain('Akamai edge deny on Senate ingestion 10m ago');
     expect(check.detail).toContain('[edge_denied]');
     expect(check.detail).toContain('not a relay outage');
-    expect(check.detail).toContain('probe is paused for the edge-deny backoff (next attempt in 50m)');
+    expect(check.detail).toContain('next attempt in 50m');
   });
 
   it('senate_efd names the deny when the probe never ran or only a legacy record exists', () => {
-    expect(efdBackoffCheck(null, { lastDeniedAgoMin: 5, untilInMin: 55 }).status).toBe('critical');
+    expect(efdBackoffCheck(null, { lastDeniedAgoMin: 5, untilInMin: 55 }).status).toBe('degraded');
     const legacy = efdBackoffCheck(
       { ok: false, status: 403, egress: 'direct', checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'HTTP 403' },
       { lastDeniedAgoMin: 5, untilInMin: 55 },
     );
-    expect(legacy.status).toBe('critical');
+    expect(legacy.status).toBe('degraded');
     expect(legacy.detail).toContain('Akamai edge deny on Senate ingestion');
   });
 
@@ -947,7 +1030,7 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
       },
       { lastDeniedAgoMin: 10, untilInMin: 50 },
     );
-    expect(check.status).toBe('critical');
+    expect(check.status).toBe('degraded');
     expect(check.detail).toContain('Akamai edge deny on Senate ingestion');
   });
 
