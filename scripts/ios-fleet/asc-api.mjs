@@ -192,6 +192,37 @@ export function resolveAscCredentials() {
   return { keyId, issuerId, privateKeyPem: pem, source: "Infisical /asc" };
 }
 
+export const APPSTORE_VERSION_PLAN_LOC_CONCURRENCY = 5;
+export const ASC_GET_TIMEOUT_MS = 30_000;
+
+/** Path segment for an appStoreVersions id in a URL (reserved chars encoded). */
+export function appStoreVersionResourcePath(versionId, suffix = "") {
+  return `/v1/appStoreVersions/${encodeURIComponent(String(versionId))}${suffix}`;
+}
+
+export function appStoreVersionLocalizationsPath(versionId) {
+  return `${appStoreVersionResourcePath(versionId)}/appStoreVersionLocalizations?limit=200`;
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` in flight at once (preserves result order).
+ */
+export async function mapWithConcurrency(items, limit, fn) {
+  if (items.length === 0) return [];
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Math.min(Math.max(1, limit), items.length);
+  async function worker() {
+    for (;;) {
+      const i = nextIndex++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: workers }, worker));
+  return results;
+}
+
 function base64url(input) {
   return Buffer.from(input).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
@@ -511,16 +542,26 @@ async function main() {
   // App Store Connect.
   const apiBase = process.env.ASC_API_BASE || "https://api.appstoreconnect.apple.com";
 
-  async function api(methodName, apiPath, jsonBody) {
+  async function api(methodName, apiPath, jsonBody, opts = {}) {
     const url = apiPath.startsWith("http") ? apiPath : `${apiBase}${apiPath}`;
-    const res = await fetch(url, {
-      method: methodName,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: jsonBody ? jsonBody : undefined
-    });
+    const timeoutMs = opts.timeoutMs ?? ASC_GET_TIMEOUT_MS;
+    let res;
+    try {
+      res = await fetch(url, {
+        method: methodName,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: jsonBody ? jsonBody : undefined,
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+    } catch (err) {
+      if (err && (err.name === "TimeoutError" || err.name === "AbortError")) {
+        return { status: 0, ok: false, timeout: true, parsed: {}, text: "" };
+      }
+      throw err;
+    }
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
@@ -1374,16 +1415,40 @@ async function main() {
       .filter(
         (v) => EDITABLE_VERSION_STATES.has(v.appStoreState) || RELEASED_VERSION_STATES.has(v.appStoreState)
       )
-      // The diagnostic only ever compares the current editable and live
-      // versions; cap the sequential per-version queries to the newest few
-      // so a long version history cannot stall the plan.
-      .sort((a, b) => b.createdDate.localeCompare(a.createdDate))
-      .slice(0, 10);
+      .sort((a, b) => b.createdDate.localeCompare(a.createdDate));
     const promotionalText = [];
-    for (const v of promoVersions) {
-      const locRes = await ascGet(`/v1/appStoreVersions/${encodeURIComponent(v.id)}/appStoreVersionLocalizations?limit=200`);
+    const locRows = await mapWithConcurrency(
+      promoVersions,
+      APPSTORE_VERSION_PLAN_LOC_CONCURRENCY,
+      async (v) => {
+        const locRes = await ascGet(appStoreVersionLocalizationsPath(v.id));
+        return { v, locRes };
+      }
+    );
+    for (const { v, locRes } of locRows) {
+      if (locRes.timeout) {
+        console.error(`appstore-version-plan: localizations query timed out for ${v.versionString}`);
+        promotionalText.push({
+          version: v.versionString,
+          state: v.appStoreState,
+          locale: null,
+          length: null,
+          text: null,
+          error: "timeout"
+        });
+        process.exit(2);
+      }
       if (!locRes.ok) {
-        console.error(`appstore-version-plan: localizations query failed for ${v.versionString} (HTTP ${locRes.status})`);
+        const code = locRes.status || "unknown";
+        console.error(`appstore-version-plan: localizations query failed for ${v.versionString} (HTTP ${code})`);
+        promotionalText.push({
+          version: v.versionString,
+          state: v.appStoreState,
+          locale: null,
+          length: null,
+          text: null,
+          error: `HTTP ${code}`
+        });
         process.exit(2);
       }
       for (const loc of locRes.parsed.data || []) {
@@ -1557,7 +1622,7 @@ async function main() {
 
     const attach = await api(
       "PATCH",
-      `/v1/appStoreVersions/${versionId}/relationships/build`,
+      appStoreVersionResourcePath(versionId, "/relationships/build"),
       JSON.stringify({ data: { type: "builds", id: build.id } })
     );
     if (!attach.ok) {
@@ -1568,7 +1633,7 @@ async function main() {
     }
 
     // ---- verify -----------------------------------------------------------
-    const verifyRes = await ascGet(`/v1/appStoreVersions/${versionId}?include=build`
+    const verifyRes = await ascGet(appStoreVersionResourcePath(versionId, "?include=build")
     );
     if (!verifyRes.ok) {
       console.error(`appstore-version-prepare: could not read the version back (HTTP ${verifyRes.status})`);
@@ -1590,7 +1655,7 @@ async function main() {
     const reference = released[0] || null;
 
     const localizationsFor = async (id) => {
-      const res = await ascGet(`/v1/appStoreVersions/${id}/appStoreVersionLocalizations?limit=200`);
+      const res = await ascGet(appStoreVersionLocalizationsPath(id));
       if (!res.ok) return new Map();
       const map = new Map();
       for (const loc of res.parsed.data || []) {
@@ -1654,7 +1719,11 @@ async function main() {
   if (!res.ok) process.exit(2);
 }
 
-main().catch((err) => {
-  console.error(String(err && err.stack ? err.stack : err));
-  process.exit(1);
-});
+const isDirectAscCli =
+  process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isDirectAscCli) {
+  main().catch((err) => {
+    console.error(String(err && err.stack ? err.stack : err));
+    process.exit(1);
+  });
+}

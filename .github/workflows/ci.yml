@@ -408,6 +408,7 @@ jobs:
           node --check scripts/ios-fleet/asc-key.mjs
           node --check scripts/ios-fleet/version-plan.mjs
           node --check scripts/ios-fleet/test-asc-key.test.mjs
+          node --check scripts/ios-fleet/appstore-version-plan.test.mjs
 
       - name: Fleet version publish guard
         run: node --test scripts/ios-fleet/publish-ios-versions.test.mjs
@@ -417,6 +418,9 @@ jobs:
 
       - name: Fleet shared build counter (offline)
         run: node --test scripts/ios-fleet/shared-build.test.mjs
+
+      - name: App Store version plan promo diagnostics (offline)
+        run: node --test scripts/ios-fleet/appstore-version-plan.test.mjs
 
       - name: AppUpdatePrompt pin copy
         run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs
