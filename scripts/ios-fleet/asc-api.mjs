@@ -1370,12 +1370,18 @@ async function main() {
     // Read-only:  the promotional text of the editable version and of the
     // live one, per locale, so a difference can be explained without opening
     // App Store Connect.  Listing copy is public text, not a secret.
-    const promoVersions = appStoreVersions.filter(
-      (v) => EDITABLE_VERSION_STATES.has(v.appStoreState) || RELEASED_VERSION_STATES.has(v.appStoreState)
-    );
+    const promoVersions = appStoreVersions
+      .filter(
+        (v) => EDITABLE_VERSION_STATES.has(v.appStoreState) || RELEASED_VERSION_STATES.has(v.appStoreState)
+      )
+      // The diagnostic only ever compares the current editable and live
+      // versions; cap the sequential per-version queries to the newest few
+      // so a long version history cannot stall the plan.
+      .sort((a, b) => b.createdDate.localeCompare(a.createdDate))
+      .slice(0, 10);
     const promotionalText = [];
     for (const v of promoVersions) {
-      const locRes = await ascGet(`/v1/appStoreVersions/${v.id}/appStoreVersionLocalizations?limit=200`);
+      const locRes = await ascGet(`/v1/appStoreVersions/${encodeURIComponent(v.id)}/appStoreVersionLocalizations?limit=200`);
       if (!locRes.ok) {
         console.error(`appstore-version-plan: localizations query failed for ${v.versionString} (HTTP ${locRes.status})`);
         process.exit(2);
