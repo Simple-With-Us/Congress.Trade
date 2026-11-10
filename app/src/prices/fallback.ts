@@ -47,15 +47,15 @@ export function buildFallbackPriceClient(
   }
 
   return {
-    eodHistory: (symbol, from, to) =>
+    eodHistory: (symbol, from, to, signal) =>
       tryPrimaryThenSecondary(
-        () => primary.eodHistory(symbol, from, to),
-        () => secondary.eodHistory(symbol, from, to),
+        () => primary.eodHistory(symbol, from, to, signal),
+        () => secondary.eodHistory(symbol, from, to, signal),
       ),
-    spxHistory: (from, to) =>
+    spxHistory: (from, to, signal) =>
       tryPrimaryThenSecondary(
-        () => primary.spxHistory(from, to),
-        () => secondary.spxHistory(from, to),
+        () => primary.spxHistory(from, to, signal),
+        () => secondary.spxHistory(from, to, signal),
       ),
   };
 }

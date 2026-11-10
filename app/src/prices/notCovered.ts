@@ -258,8 +258,15 @@ export async function recheckNotCoveredPeerPrices(
     let hist;
     try {
       await pace();
-      hist = await client.eodHistory(ticker, fetchPlan.from, fetchPlan.to);
+      // Thread the lane signal into the request so a deadline abort cancels
+      // a hanging fetch in-flight instead of leaving this serial loop
+      // stuck on it past the deadline (the refresh walk does the same).
+      hist = await client.eodHistory(ticker, fetchPlan.from, fetchPlan.to, opts.signal);
     } catch (e) {
+      if (opts.signal?.aborted) {
+        result.aborted = true;
+        break;
+      }
       result.errors.push(ticker + ': ' + (e as Error).message);
       if (isFatalPriceProviderError(e, false)) {
         result.aborted = true;
@@ -288,10 +295,14 @@ export async function recheckNotCoveredPeerPrices(
         // extra ST call only on the day a stage-4 ticker recovers.
         try {
           await pace();
-          const full = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to);
+          const full = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to, opts.signal);
           if (full.length > 0) toWrite = full;
           result.backfilled++;
         } catch (e) {
+          if (opts.signal?.aborted) {
+            result.aborted = true;
+            break;
+          }
           result.errors.push(ticker + ' (backfill): ' + (e as Error).message);
           if (isFatalPriceProviderError(e, false)) {
             result.aborted = true;

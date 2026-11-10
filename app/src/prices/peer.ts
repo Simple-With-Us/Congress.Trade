@@ -12,6 +12,10 @@
  *    PEER_HTTP_<status> so the refresh run aborts visibly instead of silently
  *    spending the shared Massive key. Empty series still returns [] (ticker
  *    simply has no history on the peer; last-resort Massive may then run).
+ *
+ * Every request carries a deadline (PEER_PRICE_REQUEST_TIMEOUT_MS) composed
+ * with the caller's AbortSignal, so a hanging peer response is cancelled
+ * in-flight instead of outliving the caller's lane deadline as a zombie.
  */
 
 import { z } from 'zod';
@@ -78,6 +82,19 @@ function parsePeerCloses(raw: unknown): Close[] {
   );
 }
 
+/**
+ * Per-request deadline for one peer price call.  A cold Socratic.Trade
+ * history fetch takes ~10s and an unknown symbol ~30s, so 45s leaves margin
+ * over every healthy response — but it bounds a HANGING response, which
+ * previously had no bound at all:  one stuck fetch held its catch-up worker
+ * forever, the lane deadline aborted around it, and the run's inner promise
+ * never settled (the zombie that kept the lane's state write from landing
+ * and gated later fires).  A timed-out request surfaces as PEER_HTTP_0
+ * (provider-level, like a network failure), so the ticker is deferred to a
+ * later run instead of wedging this one.
+ */
+export const PEER_PRICE_REQUEST_TIMEOUT_MS = 45_000;
+
 export interface PeerPriceClientOptions {
   /**
    * When true, non-2xx (except 404) and network failures throw PEER_HTTP_* so a
@@ -85,6 +102,15 @@ export interface PeerPriceClientOptions {
    * returns [] so a secondary provider can fall through.
    */
   strict?: boolean;
+  /** Per-request deadline override (tests, or a caller with a tighter budget). */
+  timeoutMs?: number;
+  /**
+   * Client-level cancellation, combined with the per-request timeout and
+   * any per-call signal:  aborting it cancels the in-flight fetch.  Callers
+   * that rebuild the client per run (the price lanes) pass their lane
+   * signal per call instead;  this covers long-lived clients.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -119,10 +145,36 @@ export function buildPeerPriceClient(
   async function getCloses(
     url: string,
     operation: 'fetch-peer-price-history' | 'fetch-peer-spx-history',
+    callSignal?: AbortSignal,
   ): Promise<Close[]> {
+    // One deadline per request, composed with the caller's cancellation
+    // (per-call signal first, then the client-level one).  The timer aborts
+    // the underlying fetch — headers AND body — so a peer that accepts the
+    // connection and then stalls cannot hold the caller past the deadline.
+    const timeoutMs = opts.timeoutMs ?? PEER_PRICE_REQUEST_TIMEOUT_MS;
+    const deadline = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      deadline.abort(new Error('PEER_REQUEST_TIMEOUT'));
+    }, timeoutMs);
+    const parts: AbortSignal[] = [deadline.signal];
+    if (callSignal) parts.push(callSignal);
+    if (opts.signal) parts.push(opts.signal);
+    const signal = parts.length === 1 ? parts[0] : AbortSignal.any(parts);
+    // The caller's own cancellation is not a peer failure:  rethrow its
+    // reason untouched so lanes see the abort they issued (and walkers can
+    // tell it apart from a PEER_HTTP_* outcome) instead of a wrapped error.
+    const callerAbortReason = (): unknown => {
+      if (timedOut) return undefined;
+      if (callSignal?.aborted) return callSignal.reason;
+      if (opts.signal?.aborted) return opts.signal.reason;
+      return undefined;
+    };
     try {
       const res = await trackedFetch(url, {
         headers,
+        signal,
       }, { service: 'market-prices', operation, dynamicTarget: 'peer-app' }, fetchImpl);
       if (res.status === 404) return [];
       if (!res.ok) {
@@ -135,6 +187,9 @@ export function buildPeerPriceClient(
             }
           } catch (e) {
             if (isPeerStaleResponseError(e)) throw e;
+            const reason = callerAbortReason();
+            if (reason !== undefined) throw reason;
+            if (timedOut) throw new Error(`PEER_HTTP_0:PEER_REQUEST_TIMEOUT after ${timeoutMs}ms`);
           }
         }
         if (strict) throw new Error(`PEER_HTTP_${res.status}`);
@@ -153,23 +208,28 @@ export function buildPeerPriceClient(
     } catch (e) {
       if (isPeerStaleResponseError(e)) throw e;
       if (e instanceof Error && e.message.startsWith('PEER_HTTP_')) throw e;
+      const reason = callerAbortReason();
+      if (reason !== undefined) throw reason;
       if (strict) {
+        if (timedOut) throw new Error(`PEER_HTTP_0:PEER_REQUEST_TIMEOUT after ${timeoutMs}ms`);
         const msg = e instanceof Error ? e.message : String(e ?? 'network');
         throw new Error(`PEER_HTTP_0:${msg.slice(0, 80)}`);
       }
       return [];
+    } finally {
+      clearTimeout(timer);
     }
   }
 
-  async function eodHistory(symbol: string, from: string, to: string): Promise<Close[]> {
+  async function eodHistory(symbol: string, from: string, to: string, signal?: AbortSignal): Promise<Close[]> {
     const normalizedSymbol = symbol.trim().toUpperCase();
     const url = `${origin}/api/market/prices/${encodeURIComponent(normalizedSymbol)}?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
-    return descending(await getCloses(url, 'fetch-peer-price-history'));
+    return descending(await getCloses(url, 'fetch-peer-price-history', signal));
   }
 
-  async function spxHistory(from: string, to: string): Promise<Close[]> {
+  async function spxHistory(from: string, to: string, signal?: AbortSignal): Promise<Close[]> {
     const url = `${origin}/api/market/spx?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
-    return descending(await getCloses(url, 'fetch-peer-spx-history'));
+    return descending(await getCloses(url, 'fetch-peer-spx-history', signal));
   }
 
   return { eodHistory, spxHistory };
