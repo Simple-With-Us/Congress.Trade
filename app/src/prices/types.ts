@@ -10,8 +10,14 @@
 import type { Close } from './compute.ts';
 
 export interface PriceClient {
-  /** Daily closes for a ticker between two YYYY-MM-DD dates (descending). */
-  eodHistory(symbol: string, from: string, to: string): Promise<Close[]>;
+  /**
+   * Daily closes for a ticker between two YYYY-MM-DD dates (descending).
+   * The optional signal is the caller's cancellation (e.g. a cron lane's
+   * deadline):  implementations that perform network I/O must thread it
+   * into the request so an abort actually cancels the in-flight fetch
+   * instead of leaving it running detached past the caller's deadline.
+   */
+  eodHistory(symbol: string, from: string, to: string, signal?: AbortSignal): Promise<Close[]>;
   /** S&P 500 daily closes (via SPY) between two dates (descending). */
-  spxHistory(from: string, to: string): Promise<Close[]>;
+  spxHistory(from: string, to: string, signal?: AbortSignal): Promise<Close[]>;
 }
