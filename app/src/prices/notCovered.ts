@@ -25,6 +25,7 @@ import {
   ST_FETCH_ERROR_REASON_PREFIX,
   planTickerEodFetch,
   PRICE_UNAVAILABLE_NOT_COVERED,
+  PRICE_UNAVAILABLE_TERMINAL,
   writeTickerEodHistory,
 } from './service.ts';
 import {
@@ -175,7 +176,7 @@ async function restampNotCovered(env: Env, ticker: string, nowIso: string): Prom
   await run(
     env.DB,
     `UPDATE securities_ref SET price_checked_at = ?
-      WHERE ticker = ? AND price_unavailable = ${PRICE_UNAVAILABLE_NOT_COVERED}`,
+      WHERE ticker = ? AND price_unavailable IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})`,
     [nowIso, ticker],
   );
 }
@@ -191,14 +192,16 @@ export interface NotCoveredRecheckResult {
 }
 
 /**
- * Daily re-check: retry up to `max` stage-4 tickers (oldest price_checked_at
- * first) through the given price client. A non-empty result whose newest close
- * is on/after the ticker's previous latest_price_date (any close when null)
- * and not stale per PRICE_STALE_LISTING_DAYS is written through the SAME
- * upsert path runPriceRefresh uses (stage cleared to 0, reason cleared).
- * Anything else restamps price_checked_at only, keeping stage 4 and the
- * original since-date. Fatal provider errors abort without touching tickers.
- * Once-per-UTC-day gating lives with the caller (jobs.ts lane stamp).
+ * Daily re-check: retry up to `max` stage-4 and stage-5 tickers (oldest
+ * price_checked_at first) through the given price client. A non-empty result
+ * whose newest close is on/after the ticker's previous latest_price_date (any
+ * close when null) and not stale per PRICE_STALE_LISTING_DAYS is written
+ * through the SAME upsert path runPriceRefresh uses (stage cleared to 0,
+ * reason cleared). Anything else restamps price_checked_at only, keeping the
+ * stage and the original since-date. A terminal ticker therefore stays off
+ * the stall clock unless Socratic.Trade actually resumes pricing it. Fatal
+ * provider errors abort without touching tickers. Once-per-UTC-day gating
+ * lives with the caller (jobs.ts lane stamp).
  */
 export async function recheckNotCoveredPeerPrices(
   env: Env,
@@ -227,7 +230,7 @@ export async function recheckNotCoveredPeerPrices(
     env.DB,
     `SELECT sr.ticker AS ticker, sr.latest_price_date AS latest_price_date
        FROM securities_ref sr
-      WHERE sr.price_unavailable = ${PRICE_UNAVAILABLE_NOT_COVERED}
+      WHERE sr.price_unavailable IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})
       ORDER BY sr.price_checked_at ASC
       LIMIT ?`,
     [max],
