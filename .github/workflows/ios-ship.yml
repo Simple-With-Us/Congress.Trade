@@ -63,6 +63,11 @@ on:
       - 'clients/ios/**'
       - '.github/workflows/ios-ship.yml'
   workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: 'Exact marketing version to ship. Defaults to 1.1.2, the version pinned for Congress.Trade in scripts/ios-fleet/apps.json (fixedMarketingVersion); change it only to ship a replacement build in another existing train.'
+        required: false
+        default: '1.1.2'
   schedule:
     # Twice an hour, offset from Socratic.Trade's '*/30' so the shared Mac
     # runner is not asked to start three fleet ships on the same minute.
@@ -333,6 +338,7 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          INPUT_MARKETING_VERSION: ${{ github.event.inputs.marketing_version }}
         run: |
           # Wrapper resolves the in-repo fleet script (scripts/ios-fleet/) and
           # enforces the stable-Xcode rule; it falls back to the host copy only
@@ -346,7 +352,16 @@ jobs:
           # The --build below is the release's one planned build from the
           # plan-build step above: every ship of this release uploads it.
           set -o pipefail
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --build "${{ steps.plan-build.outputs.build }}" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
+          # A manual dispatch may pin the marketing version; the build number
+          # is still the release's one planned build from the plan-build step
+          # above.  The expansion form is safe for an empty array under
+          # bash 3.2.
+          ship_args=()
+          if [[ -n "${INPUT_MARKETING_VERSION:-}" ]]; then
+            [[ "$INPUT_MARKETING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::marketing_version must look like 1.1.2"; exit 1; }
+            ship_args+=(--version "$INPUT_MARKETING_VERSION")
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --build "${{ steps.plan-build.outputs.build }}" ${ship_args[@]+"${ship_args[@]}"} 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
 
       # Name the build this run uploaded, for the external promotion below.
       # The fleet script resolves the version before it uploads and logs it as

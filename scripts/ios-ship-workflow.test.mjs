@@ -166,8 +166,11 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // ship as --build, so every ship of the release uploads the same number.
   assert.match(
     code,
-    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"( \$\{ship_args\[@\]\+"\$\{ship_args\[@\]\}"\})?(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
   );
+  // The only argument a dispatch may add is an exact --version; never --force-ship.
+  assert.doesNotMatch(code, /--force-ship/);
+  assert.match(code, /ship_args\+=\(--version "\$INPUT_MARKETING_VERSION"\)/);
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);
