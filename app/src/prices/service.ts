@@ -382,6 +382,22 @@ export function isFatalPriceProviderError(e: unknown, _fmpBudgeted: boolean): bo
   return RATE_LIMIT_PROVIDER_ERROR.test(message);
 }
 
+/**
+ * True when a rejection IS the caller's own cancellation:  the promise
+ * rejected with the lane signal's reason object itself.  That identity is
+ * reliable end to end — fetch rejects with the signal's reason, and the
+ * peer client rethrows a caller's abort reason untouched.  A provider
+ * failure that merely RACES the abort (a fatal 401/402/403/429 or a
+ * per-request timeout settling just before the deadline fires) rejects
+ * with its own error while `signal.aborted` is also true, so classifying
+ * on the aborted flag alone would swallow it:  no error entry, no fatal
+ * handling, an outage misreported as a quiet cancellation.  Identity
+ * against `signal.reason` is the test, never the flag alone.
+ */
+export function isCallerAbortRejection(error: unknown, signal?: AbortSignal): boolean {
+  return signal !== undefined && error === signal.reason;
+}
+
 type PeerStaleSignal = { closes: Close[] };
 
 function readPeerStaleSignal(e: unknown): PeerStaleSignal | null {
@@ -943,7 +959,7 @@ export async function runPriceRefresh(
     // real quota and must not be under-reported.
     calls++;
     budget--;
-    spx = await client.spxHistory(spxFrom, today());
+    spx = await client.spxHistory(spxFrom, today(), opts.signal);
     if (spx.length && !dryRun) {
       for (let i = 0; i < spx.length; i += 100) {
         await batchPrepared(
@@ -961,14 +977,23 @@ export async function runPriceRefresh(
       result.shareSpx = spx;
     }
   } catch (e) {
-    result.errors.push('spx: ' + (e as Error).message);
-    // Auth/plan/rate-limit failure: every subsequent call this run (SPX or any
-    // ticker) would fail the same way, so abort rather than walking the rest of
-    // the ticker list.  Remaining tickers are left untouched for the next run —
-    // no negative-cache writes, no partial state.  Peer EOD treats 429 as fatal
-    // (see RATE_LIMIT_PROVIDER_ERROR) so a rate-limited Socratic.Trade cannot
-    // burn thousands of identical retries in one refresh.
-    if (isFatalPriceProviderError(e, fmpBudgeted)) result.aborted = true;
+    // Caller cancellation (lane deadline) is not a provider failure:  record
+    // the abort without an error entry, and let the aborted flag below skip
+    // the ticker walk entirely.  Only the caller's own abort reason counts
+    // as a cancellation — a provider failure that raced the abort still
+    // records its error entry and gets fatal handling below.
+    if (isCallerAbortRejection(e, opts.signal)) {
+      result.aborted = true;
+    } else {
+      result.errors.push('spx: ' + (e as Error).message);
+      // Auth/plan/rate-limit failure: every subsequent call this run (SPX or any
+      // ticker) would fail the same way, so abort rather than walking the rest of
+      // the ticker list.  Remaining tickers are left untouched for the next run —
+      // no negative-cache writes, no partial state.  Peer EOD treats 429 as fatal
+      // (see RATE_LIMIT_PROVIDER_ERROR) so a rate-limited Socratic.Trade cannot
+      // burn thousands of identical retries in one refresh.
+      if (isFatalPriceProviderError(e, fmpBudgeted)) result.aborted = true;
+    }
   }
 
   // 2) Per-ticker EOD history + per-trade performance anchors. Skipped
@@ -1022,6 +1047,7 @@ export async function runPriceRefresh(
   type TickerFetchOutcome =
     | { kind: 'noplan'; nowIso: string }
     | { kind: 'throw'; error: unknown }
+    | { kind: 'aborted'; nowIso: string }
     | { kind: 'fetched'; plan: TickerEodFetchPlan; nowIso: string; hist: Close[] }
     | { kind: 'error'; plan: TickerEodFetchPlan; nowIso: string; error: unknown };
   const outcomes = page.map(() => {
@@ -1053,9 +1079,21 @@ export async function runPriceRefresh(
       // Count the attempt regardless of outcome (see the SPX comment above).
       calls++;
       budget--;
-      const hist = await client.eodHistory(ticker, plan.from, plan.to);
+      // Thread the lane signal into the request itself:  the peer client
+      // composes it with its per-request deadline, so a lane abort (or the
+      // deadline) cancels this fetch in-flight.  Without it, a hanging peer
+      // response held the worker — and with it this whole run's settlement —
+      // past the lane deadline, and the abort changed nothing on the wire.
+      const hist = await client.eodHistory(ticker, plan.from, plan.to, opts.signal);
       return { kind: 'fetched', plan, nowIso, hist };
     } catch (error) {
+      // A rejection caused by the caller's own abort is a cancellation, not
+      // a per-ticker failure:  the processor stops the walk on it without an
+      // error entry or an error marker for the ticker.  Only the abort
+      // reason itself classifies as a cancellation — a fatal provider error
+      // that settled just before the abort fired is an 'error' outcome, so
+      // it still records its entry and gets fatal handling.
+      if (isCallerAbortRejection(error, opts.signal)) return { kind: 'aborted', nowIso };
       return { kind: 'error', plan, nowIso, error };
     }
   }
@@ -1112,6 +1150,15 @@ export async function runPriceRefresh(
     }
     if (outcome.kind === 'throw') {
       pendingThrow = { error: outcome.error };
+      break;
+    }
+    if (outcome.kind === 'aborted') {
+      // The lane signal fired while this fetch was in flight and the fetch
+      // was actually cancelled (see fetchTicker).  The ticker was never
+      // attempted to completion:  restore the resume point so the next run
+      // starts here, and stop without recording an error for it.
+      result.lastCursorSeq = resumeBefore;
+      result.aborted = true;
       break;
     }
     let stopWalk = false;

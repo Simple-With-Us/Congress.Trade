@@ -117,3 +117,67 @@ describe('buildPeerPriceClient — bearer auth', () => {
   });
 });
 
+/** Fetch mock that never answers;  it only rejects when the request's
+ *  AbortSignal fires, exactly like a real fetch to a stalled peer. */
+const hangingFetch = () =>
+  (async (_input: RequestInfo | URL, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) {
+        reject(new Error('expected the client to pass an AbortSignal'));
+        return;
+      }
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    })) as unknown as typeof fetch;
+
+describe('buildPeerPriceClient — request deadline and cancellation', () => {
+  it('passes an AbortSignal into the fetch init', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const client = buildPeerPriceClient('https://peer.example', recordingFetch(calls), DUMMY_TOKEN);
+    await client.eodHistory('AAPL', '2024-01-01', '2024-02-01');
+    expect(calls[0].init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('times out a hanging request in strict mode as PEER_HTTP_0 (provider-level, deferrable)', async () => {
+    const client = buildPeerPriceClient('https://peer.example', hangingFetch(), DUMMY_TOKEN, {
+      strict: true,
+      timeoutMs: 30,
+    });
+    const started = Date.now();
+    await expect(client.eodHistory('ASHGY', '2024-01-01', '2024-02-01')).rejects.toThrow(
+      /PEER_HTTP_0:PEER_REQUEST_TIMEOUT after 30ms/,
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('returns [] on a timed-out request in soft mode', async () => {
+    const client = buildPeerPriceClient('https://peer.example', hangingFetch(), DUMMY_TOKEN, {
+      timeoutMs: 30,
+    });
+    expect(await client.eodHistory('AAPL', '2024-01-01', '2024-02-01')).toEqual([]);
+  });
+
+  it("propagates the caller's abort reason untouched instead of wrapping it as a peer failure", async () => {
+    const client = buildPeerPriceClient('https://peer.example', hangingFetch(), DUMMY_TOKEN, {
+      strict: true,
+      timeoutMs: 60_000,
+    });
+    const controller = new AbortController();
+    const pending = client.eodHistory('AAPL', '2024-01-01', '2024-02-01', controller.signal);
+    setTimeout(() => controller.abort(new Error('lane deadline exceeded')), 10);
+    await expect(pending).rejects.toThrow('lane deadline exceeded');
+  });
+
+  it('exports a default request deadline above the slowest healthy peer fetch', async () => {
+    const { PEER_PRICE_REQUEST_TIMEOUT_MS } = await import('../peer.ts');
+    // ~10s cold fetch, ~30s for an unknown symbol (see service.ts):  the
+    // deadline must not cut healthy responses, only hangs.
+    expect(PEER_PRICE_REQUEST_TIMEOUT_MS).toBeGreaterThan(30_000);
+    expect(PEER_PRICE_REQUEST_TIMEOUT_MS).toBeLessThan(600_000);
+  });
+});
+

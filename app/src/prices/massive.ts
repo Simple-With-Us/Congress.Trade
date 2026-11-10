@@ -43,7 +43,7 @@ export function buildMassivePriceClient(
   fetchImpl: typeof fetch = fetch,
   retry: Retry429Options = {},
 ): PriceClient {
-  async function aggs(symbol: string, from: string, to: string): Promise<Close[]> {
+  async function aggs(symbol: string, from: string, to: string, signal?: AbortSignal): Promise<Close[]> {
     const url =
       BASE +
       encodeURIComponent(symbol) +
@@ -55,9 +55,16 @@ export function buildMassivePriceClient(
       encodeURIComponent(apiKey);
     // 429s (shared-key per-minute limit) are retried with backoff first — see
     // ./retry429.ts. A 429 that still persists after the retries throws below.
+    // The caller's signal rides every attempt:  an abort cancels the
+    // in-flight fetch instead of leaving it running detached past the
+    // caller's deadline, a retry fired after the abort rejects with the
+    // abort reason immediately rather than spending another request, and
+    // the backoff wait between attempts is bound to the signal too, so an
+    // abort landing mid-wait settles the call at once.
     const res = await with429Retries(() => trackedFetch(url, {
       headers: { 'user-agent': 'congress.trade/0.1 (+https://congress.trade)', accept: 'application/json' },
-    }, { service: 'market-prices', operation: 'fetch-price-history' }, fetchImpl), retry);
+      signal,
+    }, { service: 'market-prices', operation: 'fetch-price-history' }, fetchImpl), { ...retry, signal });
     if (!res.ok) {
       if (res.status === 404) return []; // symbol not found → genuinely no data (safe to negative-cache)
       // Auth/rate/server errors (401/403/429/5xx) fail identically for every
@@ -68,7 +75,7 @@ export function buildMassivePriceClient(
     return parseMassiveAggs(await res.json());
   }
   return {
-    eodHistory: (symbol, from, to) => aggs(symbol, from, to),
-    spxHistory: (from, to) => aggs('SPY', from, to),
+    eodHistory: (symbol, from, to, signal) => aggs(symbol, from, to, signal),
+    spxHistory: (from, to, signal) => aggs('SPY', from, to, signal),
   };
 }
