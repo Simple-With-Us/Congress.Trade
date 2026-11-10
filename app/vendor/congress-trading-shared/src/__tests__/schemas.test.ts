@@ -20,6 +20,9 @@ import {
   ShortVolumeRowSchema,
   PriceSeriesSchema,
   SharePayloadSchema,
+  SharePayloadSchemaVersionSchema,
+  resolveSharePayloadSchemaVersion,
+  isSupportedSharePayloadSchemaVersion,
   CongressEventTypeSchema,
   CongressEventSchema,
   ConvictionTickerSchema,
@@ -43,6 +46,7 @@ import {
   parseArray,
   parseSafe,
 } from "../schemas";
+import { SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION, SHARE_PAYLOAD_SCHEMA_VERSION } from "../constants";
 
 // =============================================================================
 // IoDateSchema
@@ -982,6 +986,49 @@ describe("SharePayloadSchema", () => {
       refs: [{ ticker: "" }],
     });
     expect(result.success).toBe(false);
+  });
+
+  it("accepts the current schemaVersion and keeps it on the parsed payload", () => {
+    const result = SharePayloadSchema.safeParse({
+      schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION,
+      refs: [{ ticker: "AAPL" }],
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.schemaVersion).toBe(SHARE_PAYLOAD_SCHEMA_VERSION);
+  });
+
+  it("accepts a legacy payload without schemaVersion and leaves it unset", () => {
+    const result = SharePayloadSchema.safeParse({ refs: [{ ticker: "AAPL" }] });
+    expect(result.success).toBe(true);
+    expect(result.data).not.toHaveProperty("schemaVersion");
+  });
+
+  it("tolerates a newer schemaVersion so the receiver can decide", () => {
+    const result = SharePayloadSchema.safeParse({ schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION + 1 });
+    expect(result.success).toBe(true);
+  });
+
+  it.each([0, -1, 1.5, "1", null])("rejects malformed schemaVersion %j", (schemaVersion) => {
+    expect(SharePayloadSchema.safeParse({ schemaVersion }).success).toBe(false);
+    expect(SharePayloadSchemaVersionSchema.safeParse(schemaVersion).success).toBe(false);
+  });
+});
+
+describe("share payload schemaVersion helpers", () => {
+  it("exports version 1 as the current and legacy version", () => {
+    expect(SHARE_PAYLOAD_SCHEMA_VERSION).toBe(1);
+    expect(SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION).toBe(1);
+  });
+
+  it("resolves an unversioned payload to the legacy version", () => {
+    expect(resolveSharePayloadSchemaVersion({})).toBe(SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION);
+    expect(resolveSharePayloadSchemaVersion({ schemaVersion: 7 })).toBe(7);
+  });
+
+  it("flags only versions this package understands as supported", () => {
+    expect(isSupportedSharePayloadSchemaVersion({})).toBe(true);
+    expect(isSupportedSharePayloadSchemaVersion({ schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION })).toBe(true);
+    expect(isSupportedSharePayloadSchemaVersion({ schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION + 1 })).toBe(false);
   });
 });
 

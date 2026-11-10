@@ -45,6 +45,18 @@ export interface AmountRange {
   max: number | null;
   /** True when [min,max] is exactly a canonical STOCK Act bracket. */
   exact: boolean;
+  /**
+   * True when the bracket was INFERRED by snapping an approximate read onto a
+   * canonical bracket, rather than matching one the document actually printed.
+   *
+   * `exact` alone cannot carry this: a snapped bracket is byte-identical to a
+   * printed one, so callers had no way to tell "$1,000" (a checkbox band read
+   * with its legend illegible, repaired to 1001-15000) from "$1,001 - $15,000"
+   * printed on the form. That is a plausible wrong number indistinguishable
+   * from a correct read, which is what CT-2415 Guard 2 refuses. Absent means
+   * the bracket was matched verbatim (or the amount is unparseable).
+   */
+  snapped?: boolean;
 }
 
 /**
@@ -110,7 +122,12 @@ export function parseAmountRange(raw: string): AmountRange {
     const lo = nums.length ? Math.min(...nums) : null;
     if (lo !== null) {
       const snapped = snapToBracket(lo, null);
-      return { min: snapped?.min ?? lo, max: snapped?.max ?? null, exact: snapped !== null };
+      return {
+        min: snapped?.min ?? lo,
+        max: snapped?.max ?? null,
+        exact: snapped !== null,
+        snapped: snapped !== null,
+      };
     }
   }
 
@@ -129,7 +146,7 @@ export function parseAmountRange(raw: string): AmountRange {
         const exactB = matchBracket(lo, hi);
         if (exactB) return { min: exactB.min, max: exactB.max, exact: true };
         const snapped = snapToBracket(lo, hi);
-        if (snapped) return { min: snapped.min, max: snapped.max, exact: true };
+        if (snapped) return { min: snapped.min, max: snapped.max, exact: true, snapped: true };
         return { min: lo, max: hi, exact: false };
       }
     }
@@ -148,7 +165,7 @@ export function parseAmountRange(raw: string): AmountRange {
     const byMin = STOCK_ACT_BRACKETS.find((b: AmountBracket) => b.min === single);
     if (byMin) return { min: byMin.min, max: byMin.max, exact: true };
     const snapped = snapToBracket(single, single);
-    if (snapped) return { min: snapped.min, max: snapped.max, exact: true };
+    if (snapped) return { min: snapped.min, max: snapped.max, exact: true, snapped: true };
     return { min: single, max: null, exact: false };
   }
 
@@ -202,7 +219,7 @@ function extractEmbeddedDollarRanges(text: string): AmountRange | null {
     const hi = his[0];
     const snapped = snapToBracket(lo, hi);
     if (snapped) {
-      lastAny = { min: snapped.min, max: snapped.max, exact: true };
+      lastAny = { min: snapped.min, max: snapped.max, exact: true, snapped: true };
     } else {
       lastAny = { min: lo, max: hi, exact: false };
     }
@@ -256,6 +273,39 @@ function exactPair(los: number[], his: number[]): AmountRange | null {
       const exactB = matchBracket(lo, hi);
       if (exactB) return { min: exactB.min, max: exactB.max, exact: true };
     }
+  }
+  return null;
+}
+
+/**
+ * Canonicalize a numeric [min, max] pair onto a STOCK Act / OGE bracket.
+ *
+ * OGE and House bracket lower bounds are 1,001; 15,001; 50,001; 100,001; ...
+ * Readers (vision models, hand transcription) routinely drop the trailing 1
+ * and hand back "$1,000 - $15,000" as {min: 1000, max: 15000}.  That pair is
+ * not a canonical bracket and no containing bracket exists, so it used to
+ * pass through unchanged and publish as a non-canonical amount (2,271 live
+ * rows on 2026-10-25).  Here a lower bound sitting exactly one dollar below
+ * a bracket's lower bound, with that bracket's own upper bound, snaps to the
+ * bracket.  "$50,000,000 +" (min 50,000,000, max null) snaps to the open top
+ * tier.  The product $0 - $1,000 tier is left alone: its lower bound is 0.
+ *
+ * Returns the canonical bracket (with `changed` set when the input differed),
+ * or null when the pair does not identify one bracket.  Null is never
+ * guessed into a bracket here; callers flag it.
+ */
+export function canonicalizeAmountBounds(
+  min: number | null | undefined,
+  max: number | null | undefined,
+): { min: number; max: number | null; changed: boolean } | null {
+  if (min === null || min === undefined || !Number.isFinite(min)) return null;
+  const hi = max === undefined ? null : max;
+  if (hi !== null && !Number.isFinite(hi)) return null;
+  const exact = matchBracket(min, hi);
+  if (exact) return { min: exact.min, max: exact.max, changed: false };
+  for (const b of STOCK_ACT_BRACKETS) {
+    if (b.min === 0) continue;
+    if (min === b.min - 1 && hi === b.max) return { min: b.min, max: b.max, changed: true };
   }
   return null;
 }

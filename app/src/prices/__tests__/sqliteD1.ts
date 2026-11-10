@@ -8,6 +8,7 @@
  * coverage. Mirrors the wrapper proven in admin/__tests__/migrations.test.ts.
  */
 import { readFileSync, readdirSync } from 'node:fs';
+import type { Env } from '../../shared/types.ts';
 
 export interface D1Result {
   success: boolean;
@@ -103,6 +104,17 @@ export function d1Database(db: SqliteDatabase): D1Database {
       }
     },
   } as unknown as D1Database;
+}
+
+/**
+ * Typed env fixture for code that only reads `env.DB`.  The shim implements
+ * the D1 subset the price/export code calls (prepare/bind/first/all/run and
+ * batch), not exec/withSession/dump, so this is the ONE documented adapter
+ * from the shim to the binding type.  Tests use it instead of an inline
+ * `as never` on the whole env object.
+ */
+export function d1OnlyEnv(d1: D1Database): Pick<Env, 'DB'> {
+  return { DB: d1 as unknown as Env['DB'] };
 }
 
 /** Open a fresh in-memory DB with every migration applied. */

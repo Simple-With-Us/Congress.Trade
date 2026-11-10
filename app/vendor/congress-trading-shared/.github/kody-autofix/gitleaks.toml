@@ -1,0 +1,3 @@
+# Fixed trusted policy.  Never load a caller or target-PR gitleaks configuration.
+[extend]
+useDefault = true

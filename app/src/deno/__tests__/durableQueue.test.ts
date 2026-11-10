@@ -9,6 +9,8 @@ import {
   DurableQueueLeaseLostError,
   DURABLE_QUEUE_MAX_DEAD_LETTER_CYCLES,
   requeueFailedDurableJobs,
+  RETRY_DELAY_SECONDS_CAP,
+  retryDelayMs,
   type DurableQueueHandlers,
 } from '../durableQueue.ts';
 import { D1DatabaseShim } from '../shims.ts';
@@ -308,18 +310,23 @@ describe('Deno durable queue', () => {
 
       await expect(drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
         .resolves.toEqual({ claimed: 1, completed: 0, retried: 1, failed: 0 });
-      expect((await harness.rows())[0]).toMatchObject({
+      const retriedRow = (await harness.rows())[0];
+      expect(retriedRow).toMatchObject({
         status: 'pending',
         attempts: 1,
-        available_at: '2026-07-22T16:00:30.000Z',
         last_error: 'provider unavailable',
       });
+      // CT-2459 full jitter: first-retry availability lands in
+      // [START+15s, START+30s] (0.5x-1.0x of the 30s base), not exactly +30s.
+      const availableAt = new Date(String(retriedRow.available_at));
+      expect(availableAt.getTime()).toBeGreaterThanOrEqual(START.getTime() + 15_000);
+      expect(availableAt.getTime()).toBeLessThanOrEqual(START.getTime() + 30_000);
 
-      harness.setNow(new Date('2026-07-22T16:00:29.999Z'));
+      harness.setNow(new Date(availableAt.getTime() - 1));
       expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
         .toEqual({ claimed: 0, completed: 0, retried: 0, failed: 0 });
 
-      harness.setNow(new Date('2026-07-22T16:00:30.000Z'));
+      harness.setNow(availableAt);
       expect(await drainDurableQueue(harness.env, 'ingest', handlers, { now: harness.now }))
         .toEqual({ claimed: 1, completed: 1, retried: 0, failed: 0 });
       expect((await harness.rows())[0]).toMatchObject({ status: 'completed', attempts: 2, last_error: null });
@@ -1329,6 +1336,54 @@ describe('requeueFailedDurableJobs duplicate dedupe keys', () => {
       // Newest (id 2) requeued, oldest stays failed.
       expect(rows[0]).toMatchObject({ status: 'failed' });
       expect(rows[1]).toMatchObject({ status: 'pending', attempts: 0 });
+    } finally {
+      harness.client.close();
+    }
+  });
+
+  it('clamps handler delaySeconds and jitters exponential retries (CT-2459)', () => {
+    const huge = Object.assign(new Error('slow down'), { delaySeconds: 999_999 });
+    expect(retryDelayMs(1, huge)).toBe(RETRY_DELAY_SECONDS_CAP * 1_000);
+    const sane = Object.assign(new Error('slow down'), { delaySeconds: 42 });
+    expect(retryDelayMs(1, sane)).toBe(42_000);
+    // Exponential path: attempt 1 ceiling is the base delay; jittered value
+    // must land in [0.5x, 1.0x] of it, never above and never zero-ish.
+    for (let i = 0; i < 50; i++) {
+      const v = retryDelayMs(1);
+      expect(v).toBeGreaterThanOrEqual(15_000);
+      expect(v).toBeLessThanOrEqual(30_000);
+    }
+  });
+
+  it('releases claimed-but-unstarted rows when the drain aborts (CT-2459)', async () => {
+    const harness = await createHarness();
+    try {
+      for (const docId of ['doc-a', 'doc-b', 'doc-c']) {
+        await harness.ingest.send({
+          type: 'filing.new',
+          docId,
+          chamber: 'house',
+          sourceUrl: `https://example.test/${docId}.pdf`,
+        });
+      }
+      const controller = new AbortController();
+      const handlers = createHandlers({
+        handleIngestMessage: vi.fn(async () => {
+          controller.abort(new Error('tick deadline'));
+        }),
+      });
+      const result = await drainDurableQueue(harness.env, 'ingest', handlers, {
+        now: harness.now,
+        signal: controller.signal,
+      });
+      expect(result.completed).toBe(1);
+      const rows = await harness.rows();
+      // First row completed; the two never-started rows are back to pending
+      // immediately (not stranded in processing until lease expiry), and
+      // the claim's attempts bump was undone.
+      expect(rows[0]).toMatchObject({ status: 'completed' });
+      expect(rows[1]).toMatchObject({ status: 'pending', attempts: 0, lease_until: null });
+      expect(rows[2]).toMatchObject({ status: 'pending', attempts: 0, lease_until: null });
     } finally {
       harness.client.close();
     }

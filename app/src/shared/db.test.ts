@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./d1Budget', () => ({ recordD1Meta: vi.fn() }));
 
 import { batchPrepared, first, run, SQLITE_LOCK_RETRY_ATTEMPT_BUDGET_MS, withSqliteLockRetry } from './db.ts';
 import { recordD1Meta } from './d1Budget.ts';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 describe('batchPrepared', () => {
   it('retries when SQLite reports database is locked', async () => {

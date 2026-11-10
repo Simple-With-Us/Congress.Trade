@@ -71,7 +71,7 @@ safe only while a strong client secret exists.
 ### Fleet coordination (shared-at-ct ONLY)
 `AGENT_SYNC_TOKEN`, `AGENT_SYNC_POST_TOKEN` — one pair for every app.
 Rotate in the shared project; never duplicate onto `socratic-trade` or
-`congress-trade` app projects.  Local Mac copy: `~/.secrets/agent-sync.env`.
+`congress-trade` app projects.  Local Mac copy: Infisical `/agent-sync` (`fleet-secrets get`).
 
 ### Integrations
 `APP_B_IMPORT_URL`, `APP_B_INGEST_TOKEN`, `USAGE_MONITOR_ENABLED`,
@@ -102,8 +102,13 @@ application from this repo; reuse an existing Browser RUM app on the
 current Datadog account.
 
 ### Tunables & flags
-- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `FMP_MAX_PER_MINUTE`,
+- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `ST_PEER_MAX_PER_MINUTE`,
   `EDGAR_MAX_PER_MINUTE`
+  - `ST_PEER_MAX_PER_MINUTE` paces every Socratic.Trade peer read (profiles,
+    EOD prices, the price catch-up, the not-covered re-check).  It is clamped to
+    100/min because ST's `peerRead` limit is 120/min for all peer reads;  unset
+    paces at 100/min.  It replaces `FMP_MAX_PER_MINUTE`, which is no longer read.
+    FMP is latency probes only and is never a price source.
 - Providers/routing: `PRICE_PROVIDER`, `APP_BASE_URL`
 - Anti-scrape: `SCRAPE_GUARD_ENABLED`
 - Disclosure-latency race: `DISCLOSURE_LATENCY_WATCH_ENABLED`,
@@ -325,6 +330,12 @@ current Datadog account.
   Metered dollars persist per day/provider in the D1 `llm_spend` table
   (migration 0049) and surface in `GET /diagnostics` under
   `resourceGovernors.llmSpend`.
+- Webhook quarantine recovery (`delivery/targetCircuit.ts`, an `APP_SETTINGS`
+  knob with env fallback): `DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER` (default
+  off).  When truthy, the scheduled parked flush re-parks live quarantined
+  deliveries for delivery once the target circuit closes and parked headroom
+  opens.  Off, only rows whose transaction is gone or retracted are skipped,
+  and live rows wait for an explicit `POST /api/admin/delivery-requeue-quarantined`.
 
 ² `USAGE_MONITOR_ENVIRONMENT` is Infisical-tunable on its async read paths
 (admin-open check, usage telemetry); the sync local-webhook-target gate in

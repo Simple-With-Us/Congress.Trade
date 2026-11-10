@@ -11,9 +11,14 @@
  */
 
 import type { Env } from './shared/types.ts';
-import { run, all } from './shared/db.ts';
+import { run, all, batch as batchStatements } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
-import { runPriceRefresh } from './prices/service.ts';
+import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
+import {
+  markStuckPeerPriceTickersNotCovered,
+  recheckNotCoveredPeerPrices,
+} from './prices/notCovered.ts';
+import { markTerminalPeerPriceTickers } from './prices/terminalListing.ts';
 import { notifyAdmin } from './alerts/notify.ts';
 import { shareWithPeer, type PeerShareInput } from './share/outbound.ts';
 import { runFreshnessCheck } from './share/freshness.ts';
@@ -22,10 +27,23 @@ import { runCommitteeSync } from './enrichment/committeeSync.ts';
 import { runIdentitySync } from './enrichment/identitySync.ts';
 import { runBulkSnapshot } from './export/snapshot.ts';
 import { resolveSecrets } from './secrets/infisical.ts';
+import { ST_PEER_PACE_SECRET_NAMES, stPeerMaxPerMinute } from './shared/pace.ts';
 import { readSetting } from './settings/settingsService.ts';
 import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
 import { backfillCurrentPricesFromEod } from './prices/service.ts';
+import {
+  PEER_PRICE_CATCHUP_FETCH_CONCURRENCY,
+  PEER_PRICE_CATCHUP_MAX_PER_MINUTE,
+  PEER_PRICE_CATCHUP_MAX_TICKERS,
+  parsePeerPriceCatchUpState,
+  peerPriceCatchUpAfterRun,
+  peerPriceCatchUpGate,
+  peerPriceSnapshotNeedsCatchUp,
+  isProviderLevelPriceError,
+  readPeerPricePending,
+  type PeerPriceCatchUpState,
+} from './prices/peerPriceCatchUp.ts';
 // NOTE: runHouseReconciler (./ingestion/houseReconciler) is intentionally not
 // imported here yet -- it is reserved for future scheduled-job wiring. Importing
 // it unused would trip noUnusedLocals (enabled in this PR).
@@ -54,10 +72,21 @@ import { backfillCurrentPricesFromEod } from './prices/service.ts';
  * for tests; dedicated lane crons ignore it.
  */
 const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
+/**
+ * Price catch-up state (CT-2445), a JSON PeerPriceCatchUpState keyed to the
+ * freshThrough session rather than the UTC day;  the budgets inside it roll
+ * on the ET day (see PeerPriceCatchUpState.budgetDay).  Replaces the
+ * once-per-UTC-day `jobs:daily:lastok:market-data-price-catchup` stamp.
+ */
+const PRICE_CATCHUP_STATE_KEY = 'jobs:market-data:price-catchup-state';
+/** Survives a long weekend plus a holiday;  a stale session resets anyway. */
+const PRICE_CATCHUP_STATE_TTL_S = 5 * 86_400;
+/** Set only after the daily not-covered re-check runs (CT-2443). At most once per UTC day. */
+const NOT_COVERED_RECHECK_KEY = LANE_KEY_PREFIX + 'market-data-not-covered-recheck';
 const SUBCLAIM_KEY_PREFIX = 'jobs:daily:lastdate:';
 const DAILY_KEY = 'jobs:daily:lastdate';
 
-export type DailyLaneStatus = 'ran' | 'stamped' | 'budget';
+export type DailyLaneStatus = 'ran' | 'stamped' | 'budget' | 'error';
 
 /**
  * Sub-feature stamp: claim-before-run. Used by the R2-usage digest nested
@@ -76,11 +105,24 @@ async function stampDaily(env: Env, key: string, day: string): Promise<boolean> 
 }
 
 /**
+ * The only part of KV the daily lane stamps use.  Env's CONFIG_KV satisfies
+ * it, and tests can supply a plain typed in-memory store without casting a
+ * partial Env.
+ */
+export interface LaneStampStore {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+}
+export interface LaneStampEnv {
+  CONFIG_KV: LaneStampStore;
+}
+
+/**
  * Top-level daily lane: only mark "done" once the lane has actually
  * finished successfully. Returns true if the lane has NOT yet succeeded
  * today (so the caller should run it).
  */
-async function laneHasSucceeded(env: Env, key: string, day: string): Promise<boolean> {
+async function laneHasSucceeded(env: LaneStampEnv, key: string, day: string): Promise<boolean> {
   try {
     const last = await env.CONFIG_KV.get(key);
     return last === day;
@@ -94,7 +136,7 @@ async function laneHasSucceeded(env: Env, key: string, day: string): Promise<boo
  * lane ONLY when it returns 'ran'. Best-effort; a KV write failure is
  * non-fatal (next tick will just retry).
  */
-async function markLaneOk(env: Env, key: string, day: string): Promise<void> {
+async function markLaneOk(env: LaneStampEnv, key: string, day: string): Promise<void> {
   try {
     await env.CONFIG_KV.put(key, day, { expirationTtl: 172800 });
   } catch (err) {
@@ -170,7 +212,7 @@ export const RETENTION_POLICIES: readonly RetentionPolicy[] = [
   // unique idx_deliveries_subscription_tx plus claimDelivery's constraint
   // retry (delivery/webhook.ts:544-553), NOT the outbox row; and `deliveries`
   // rows survive until the 5-year filing sweep.
-  { name: 'delivery_outbox_completed', table: 'delivery_outbox', key: 'tx_id', column: 'updated_at', days: 90, where: "status = 'completed'" },
+  { name: 'delivery_outbox_completed', table: 'delivery_outbox', key: 'tx_id', column: 'updated_at', days: 90, where: "status IN ('completed', 'suppressed')" },
 ];
 
 /** Total rows one daily sweep may delete across ALL policies. Bounds the
@@ -282,13 +324,21 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
   let rawKept = 0;
   try {
     for (let batch = 0; batch < RETENTION_MAX_BATCHES_PER_TABLE; batch++) {
+      // CT-2459: two disjoint indexed branches instead of
+      // COALESCE(filed_date, ...) < cutoff, whose function-wrapped column
+      // defeated idx_filings_filed_date and scanned the whole table per
+      // batch. Semantics are identical (COALESCE picks filed_date when
+      // present, else the first_seen date).
       const rows = await all<{ doc_id: string; raw_object_key: string | null }>(
         env.DB,
-        `SELECT doc_id, raw_object_key FROM filings
-          WHERE COALESCE(filed_date, substr(first_seen_at, 1, 10)) < ?
-            AND first_seen_at < ?
-          LIMIT ?`,
-        [cutoff, minAge, RETENTION_DELETE_BATCH]
+        `SELECT doc_id, raw_object_key FROM (
+           SELECT doc_id, raw_object_key FROM filings
+            WHERE filed_date IS NOT NULL AND filed_date < ? AND first_seen_at < ?
+           UNION ALL
+           SELECT doc_id, raw_object_key FROM filings
+            WHERE filed_date IS NULL AND substr(first_seen_at, 1, 10) < ? AND first_seen_at < ?
+         ) LIMIT ?`,
+        [cutoff, minAge, cutoff, minAge, RETENTION_DELETE_BATCH]
       );
 
       if (rows.length === 0) break;
@@ -310,47 +360,37 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
 
       const docIds = rows.map(r => r.doc_id);
       const placeholders = docIds.map(() => '?').join(',');
-      
-      // Delivery bookkeeping first: deliveries/delivery_outbox reference
-      // transactions by tx_id and must not be orphaned when the batch's
-      // transactions are removed below.
-      await run(
-        env.DB,
-        `DELETE FROM deliveries WHERE tx_id IN (SELECT id FROM transactions WHERE doc_id IN (${placeholders}))`,
-        docIds
-      );
 
-      await run(
+      // CT-2459: resolve the batch's transaction ids ONCE (the old code
+      // re-ran the same IN subquery inside three separate deletes), then
+      // run all six deletes as one atomic batch so a crash mid-batch can
+      // no longer orphan delivery/cursor rows. Delivery bookkeeping first:
+      // deliveries/delivery_outbox reference transactions by tx_id.
+      const txRows = await all<{ id: string }>(
         env.DB,
-        `DELETE FROM delivery_outbox WHERE tx_id IN (SELECT id FROM transactions WHERE doc_id IN (${placeholders}))`,
+        `SELECT id FROM transactions WHERE doc_id IN (${placeholders})`,
         docIds
       );
-
-      await run(
-        env.DB,
-        `DELETE FROM tx_cursor_seq WHERE tx_id IN (SELECT id FROM transactions WHERE doc_id IN (${placeholders}))`,
-        docIds
+      const txIds = txRows.map(r => r.id);
+      const statements: Array<[string, Array<string | number>]> = [];
+      // Chunk tx-keyed deletes to stay under SQLite bind limits.
+      for (let i = 0; i < txIds.length; i += 400) {
+        const slice = txIds.slice(i, i + 400);
+        const txPlaceholders = slice.map(() => '?').join(',');
+        statements.push(
+          [`DELETE FROM deliveries WHERE tx_id IN (${txPlaceholders})`, slice],
+          [`DELETE FROM delivery_outbox WHERE tx_id IN (${txPlaceholders})`, slice],
+          [`DELETE FROM tx_cursor_seq WHERE tx_id IN (${txPlaceholders})`, slice],
+        );
+      }
+      statements.push(
+        [`DELETE FROM transactions WHERE doc_id IN (${placeholders})`, docIds],
+        // ingestion_outbox keys on doc_id and is NOT reachable from any of
+        // the deletes above; without this it retains a row per pruned filing.
+        [`DELETE FROM ingestion_outbox WHERE doc_id IN (${placeholders})`, docIds],
+        [`DELETE FROM filings WHERE doc_id IN (${placeholders})`, docIds],
       );
-      
-      await run(
-        env.DB,
-        `DELETE FROM transactions WHERE doc_id IN (${placeholders})`,
-        docIds
-      );
-      
-      // ingestion_outbox keys on doc_id and is NOT reachable from any of the
-      // deletes above; without this it retains a row per pruned filing forever.
-      await run(
-        env.DB,
-        `DELETE FROM ingestion_outbox WHERE doc_id IN (${placeholders})`,
-        docIds
-      );
-
-      await run(
-        env.DB,
-        `DELETE FROM filings WHERE doc_id IN (${placeholders})`,
-        docIds
-      );
+      await batchStatements(env.DB, statements);
       
       totalDeleted += rows.length;
     }
@@ -364,6 +404,224 @@ export async function runFilingRetentionSweep(env: Env, now = new Date()): Promi
     );
   }
   return totalDeleted;
+}
+
+/**
+ * Daily not-covered re-check (CT-2443), best-effort:  a failure warns but never
+ * fails the market-data lane.  Own lane stamp, written only when the re-check
+ * finished without aborting, so an abort retries on the next hourly tick (the
+ * stamped fast path of maybeRunDailyMarketDataJobs calls this too).
+ */
+export async function maybeRunNotCoveredRecheck(
+  env: Env,
+  now: Date,
+  day: string,
+  opts: { maxPerMinute?: number; signal?: AbortSignal } = {},
+): Promise<NotCoveredRecheckLaneStatus> {
+  return await runNotCoveredRecheckLane(env, day, async () => {
+    const refreshClient = await buildPriceRefreshClient(env, { maxPerMinute: opts.maxPerMinute });
+    if (!refreshClient) return { aborted: false };
+    const r = await recheckNotCoveredPeerPrices(env, refreshClient.client, {
+      now,
+      pace: refreshClient.pace,
+      signal: opts.signal,
+    });
+    if (r.checked > 0 || r.errors.length > 0) {
+      console.log(
+        'not-covered recheck:',
+        JSON.stringify({
+          checked: r.checked,
+          repriced: r.repriced,
+          backfilled: r.backfilled,
+          restamped: r.restamped,
+          aborted: r.aborted,
+          errors: r.errors.slice(0, 3),
+        }),
+      );
+    }
+    return { aborted: r.aborted };
+  });
+}
+
+export type NotCoveredRecheckLaneStatus = 'stamped' | 'ran' | 'aborted' | 'error';
+
+/**
+ * Lane-stamp policy for the not-covered re-check, separated from the ST work
+ * so it can be tested with a typed in-memory stamp store:  skip when already
+ * stamped today;  stamp only after a run that did not abort or throw.
+ */
+export async function runNotCoveredRecheckLane(
+  env: LaneStampEnv,
+  day: string,
+  recheck: () => Promise<{ aborted: boolean }>,
+): Promise<NotCoveredRecheckLaneStatus> {
+  if (await laneHasSucceeded(env, NOT_COVERED_RECHECK_KEY, day)) return 'stamped';
+  try {
+    const { aborted } = await recheck();
+    if (aborted) return 'aborted';
+    await markLaneOk(env, NOT_COVERED_RECHECK_KEY, day);
+    return 'ran';
+  } catch (err) {
+    console.warn('not-covered recheck failed:', (err as Error).message);
+    return 'error';
+  }
+}
+
+/**
+ * Bounded peer-price catch-up (CT-2445), run from the stamped market-data
+ * fast path on every hourly tick AND from its own `peer-price-catchup` cron
+ * lane (deno/cronLanes.ts), so the drain does not depend on the market-data
+ * lane's daily stamp:  a full lane that cannot complete (deadline abort on a
+ * deep backlog) never stamps, and a stamp-gated drain would never engage.
+ * The KV gate below makes the extra entry point a cheap no-op when a run is
+ * not due.  Order matters for cost:  the KV-only gate
+ * (session cap, no-progress park, spacing) runs before any D1 read, and the
+ * run is claimed in KV before any Socratic.Trade call, so a throw or a 429
+ * abort still waits out the spacing instead of retrying every tick.
+ *
+ * Each run walks at most PEER_PRICE_CATCHUP_MAX_TICKERS pending tickers from a
+ * rotating cursor, paced at PEER_PRICE_CATCHUP_MAX_PER_MINUTE.  The
+ * not-covered sweep is NOT run here:  it needs a full-set walk, which only the
+ * daily refresh does.  not_covered tickers stay excluded by the pending SQL.
+ */
+/** Local classification only. A failure must not block the price lane. */
+async function sweepTerminalPeerPrices(env: Env, now: Date): Promise<void> {
+  try {
+    const swept = await markTerminalPeerPriceTickers(env, now);
+    if (swept.marked > 0) {
+      console.log(`terminal peer-price sweep marked ${swept.marked} ticker(s)`);
+    }
+  } catch (err) {
+    console.warn('terminal peer-price sweep failed:', (err as Error).message);
+  }
+}
+
+export async function maybeRunPeerPriceCatchUp(
+  env: Env,
+  now: Date,
+  opts: { signal?: AbortSignal } = {},
+): Promise<DailyLaneStatus> {
+  // Stored last-trade evidence only. A parked catch-up still classifies, so a
+  // dead ticker does not keep the stall clock until the next full refresh.
+  // The statement is marked so it does not consume the catch-up's probe.
+  await sweepTerminalPeerPrices(env, now);
+  const freshThrough = lastTradingDay(now);
+  let state: PeerPriceCatchUpState;
+  try {
+    state = parsePeerPriceCatchUpState(await env.CONFIG_KV.get(PRICE_CATCHUP_STATE_KEY), freshThrough, now);
+  } catch {
+    return 'stamped'; // no KV → skip rather than risk an unbounded hourly walk
+  }
+  if (peerPriceCatchUpGate(state, now) !== 'ok') return 'stamped';
+  const before = await readPeerPricePending(env, now);
+  if (!before || !peerPriceSnapshotNeedsCatchUp(before)) return 'stamped';
+  if (await dailyBudgetExceeded(env, 'price catch-up')) return 'budget';
+
+  const claimed: PeerPriceCatchUpState = {
+    ...state,
+    runs: state.runs + 1,
+    attempts: state.attempts + 1,
+    lastRunAt: now.toISOString(),
+  };
+  try {
+    await env.CONFIG_KV.put(PRICE_CATCHUP_STATE_KEY, JSON.stringify(claimed), {
+      expirationTtl: PRICE_CATCHUP_STATE_TTL_S,
+    });
+  } catch {
+    return 'stamped'; // could not record the run → do not run it
+  }
+  console.warn(
+    `market-data lane stamped but peer prices are still behind (${before.pending} pending, ` +
+      `run ${claimed.runs} for ${freshThrough}); retrying price refresh`,
+  );
+  // The EOD -> current-price repair scans securities_ref and only fills NULLs,
+  // so run it on the first catch-up of a session, not on every run (Kody #2859).
+  if (claimed.runs === 1) {
+    try {
+      await backfillCurrentPricesFromEod(env);
+    } catch (err) {
+      console.warn('current-price backfill failed:', (err as Error).message);
+    }
+  }
+
+  let status: DailyLaneStatus = 'ran';
+  let lastCursorSeq: number | null = null;
+  let reachedEndOfPending = false;
+  let refresh: { aborted?: boolean; tickersPriced?: number; errors: string[] } | null = null;
+  try {
+    const configured = stPeerMaxPerMinute(await resolveSecrets(env, [...ST_PEER_PACE_SECRET_NAMES]));
+    const maxPerMinute = Math.min(configured ?? PEER_PRICE_CATCHUP_MAX_PER_MINUTE, PEER_PRICE_CATCHUP_MAX_PER_MINUTE);
+    const r = await runPriceRefresh(env, {
+      // +1 for the S&P call, which spends from the same budget.
+      max: PEER_PRICE_CATCHUP_MAX_TICKERS + 1,
+      maxPerMinute,
+      signal: opts.signal,
+      afterCursorSeq: claimed.cursorSeq,
+      // Hide Socratic.Trade's ~10s cold-fetch latency behind a small pool;
+      // the shared pacer still caps the aggregate rate at maxPerMinute.
+      concurrency: PEER_PRICE_CATCHUP_FETCH_CONCURRENCY,
+    });
+    refresh = r;
+    lastCursorSeq = r.lastCursorSeq ?? null;
+    reachedEndOfPending = r.reachedEndOfPending === true;
+    if (r.aborted) status = 'error';
+  } catch (err) {
+    console.warn('daily price refresh failed:', (err as Error).message);
+    status = 'error';
+  }
+
+  // No-engagement run (the outage signature):  the refresh completed without
+  // pricing a single ticker and every attempt it recorded failed at the
+  // provider level.  A 503 from ST is non-fatal per ticker, so an ST outage
+  // produces exactly this — a "completed" run that never engaged ST's data
+  // path.  It must not count toward the no-progress park, and it hands its
+  // session claim back, or an outage eats the whole session budget and the
+  // drain stays gated for hours after ST recovers (observed 2026-11-04:  ST
+  // back at 7:42 PM, the 8:07 PM tick still gated, 712 tickers pending, no
+  // progress since Nov 3 12:59 AM).  The classification is deliberately
+  // narrow (review follow-up, 2026-11-05):  a zero-priced run whose errors
+  // include ANY ticker-level failure counts as engaged — it spends its run
+  // and can park — and even a genuine outage is bounded, because the claim
+  // above already counted this attempt against the per-session attempt cap
+  // whether or not the run claim is handed back below.
+  const providerNeverEngaged =
+    status !== 'error' && refresh !== null && !refresh.aborted &&
+    (refresh.tickersPriced ?? 0) === 0 && refresh.errors.length > 0 &&
+    refresh.errors.every(isProviderLevelPriceError);
+
+  // Same clock as the before-count, so both count the same pending set even
+  // when the run crosses the midnight-ET rollover.
+  const after = await readPeerPricePending(env, now);
+  const next = peerPriceCatchUpAfterRun(claimed, {
+    pendingBefore: before.pending,
+    pendingAfter: after?.pending ?? null,
+    lastCursorSeq,
+    reachedEndOfPending,
+    failed: status === 'error' || providerNeverEngaged,
+    spendRun: !providerNeverEngaged,
+  });
+  console.log(
+    'price catch-up:',
+    JSON.stringify({
+      freshThrough,
+      run: next.runs,
+      attempts: next.attempts,
+      status,
+      pendingBefore: before.pending,
+      pendingAfter: after?.pending ?? null,
+      noProgressRuns: next.noProgressRuns,
+      cursorSeq: next.cursorSeq,
+      providerNeverEngaged,
+    }),
+  );
+  try {
+    await env.CONFIG_KV.put(PRICE_CATCHUP_STATE_KEY, JSON.stringify(next), {
+      expirationTtl: PRICE_CATCHUP_STATE_TTL_S,
+    });
+  } catch (err) {
+    console.warn('price catch-up state write failed:', (err as Error).message);
+  }
+  return status;
 }
 
 /**
@@ -385,7 +643,18 @@ export async function maybeRunDailyMarketDataJobs(
   // Stamp-on-success: only the LAST successful run suppresses same-day
   // retries. A budget trip today lets the next hourly cron tick try again.
   // See the LANE_KEY_PREFIX comment block at the top of this file.
-  if (await laneHasSucceeded(env, laneKey, day)) return 'stamped';
+  if (await laneHasSucceeded(env, laneKey, day)) {
+    // The not-covered re-check has its own lane stamp.  If it aborted earlier
+    // today (fatal ST error, shutdown), retry it here on the next tick instead
+    // of waiting for the next UTC day.  A no-op once it succeeded today.
+    await maybeRunNotCoveredRecheck(env, now, day, { signal: opts.signal });
+    // The 2026-10-14/15 price refresh threw on a missing column and the
+    // catch below still stamped the day, so the corpus sat one session
+    // behind until the next UTC date.  The catch-up retries that, bounded per
+    // ET day within the freshThrough session (CT-2445):  see
+    // maybeRunPeerPriceCatchUp.
+    return await maybeRunPeerPriceCatchUp(env, now, { signal: opts.signal });
+  }
 
   // Opt-in D1 spend guard (D1_ROW_BUDGET_ENFORCE): if today's metered D1 rows
   // already exceeded the budget, skip this discretionary daily batch — its big
@@ -404,7 +673,7 @@ export async function maybeRunDailyMarketDataJobs(
   // falling back to the wrangler.toml env var whenever a name isn't set in Infisical)
   // so the whole daily run only pays for one resolveSecrets round trip.
   const secrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
     'USAGE_MONITOR_ENABLED',
     'USAGE_MONITOR_INGEST_URL',
@@ -416,8 +685,9 @@ export async function maybeRunDailyMarketDataJobs(
     'PUSHOVER_APP_TOKEN',
     'PUSHOVER_USER_KEY',
   ]);
-  // Local burst limit for the Socratic profile walk. Not an FMP budget.
-  const maxPerMinute = parseInt(secrets.FMP_MAX_PER_MINUTE || '', 10) || undefined;
+  // Local burst limit for Socratic.Trade peer reads (profiles and prices).  Not
+  // an FMP budget.  The shared ST pacer clamps it to ST_PEER_SAFE_MAX_PER_MINUTE.
+  const maxPerMinute = stPeerMaxPerMinute(secrets);
   // SEC EDGAR has its own fair-access pacer — configurable via
   // EDGAR_MAX_PER_MINUTE, unset = no pacing.
   const edgarMaxPerMinute = parseInt(secrets.EDGAR_MAX_PER_MINUTE || '', 10) || undefined;
@@ -450,14 +720,40 @@ export async function maybeRunDailyMarketDataJobs(
   } catch (err) {
     console.warn('current-price backfill failed:', (err as Error).message);
   }
+  let priceRefreshFailed = false;
+  let priceRefreshAttemptedAllPending = false;
+  await sweepTerminalPeerPrices(env, now);
   try {
-    const r = await runPriceRefresh(env, { maxPerMinute });
+    const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });
+    priceRefreshAttemptedAllPending = r.attemptedAllPending;
     errors.push(...r.errors);
     share.prices = r.sharePrices;
     share.spx = r.shareSpx;
+    if (r.aborted) priceRefreshFailed = true;
   } catch (err) {
     console.warn('daily price refresh failed:', (err as Error).message);
     errors.push('prices: ' + (err as Error).message);
+    priceRefreshFailed = true;
+  }
+
+  // Not-covered lane (CT-2443), best-effort: a failure here warns but never
+  // fails the lane. The re-check runs BEFORE the sweep — it retries oldest-
+  // checked first, so running it first avoids pointlessly refetching tickers
+  // the sweep just marked.
+  await maybeRunNotCoveredRecheck(env, now, day, { maxPerMinute, signal: opts.signal });
+  // Sweep only when today's refresh attempted the whole pending set without
+  // failing.  A failed, aborted, budget-truncated, or unconfigured refresh
+  // leaves tickers unattempted, so a stale price_checked_at says nothing
+  // about ST.
+  if (!priceRefreshFailed && priceRefreshAttemptedAllPending) {
+    try {
+      const swept = await markStuckPeerPriceTickersNotCovered(env, now);
+      if (swept.marked > 0) {
+        console.log(`not-covered sweep marked ${swept.marked} stuck ticker(s)`);
+      }
+    } catch (err) {
+      console.warn('not-covered sweep failed:', (err as Error).message);
+    }
   }
 
   // Return half of the cross-app share: push what WE fetched this run to App B
@@ -500,11 +796,11 @@ export async function maybeRunDailyMarketDataJobs(
   } catch (err) {
     console.warn('freshness check failed:', (err as Error).message);
   }
-  // Stamp-on-success: the day stamp only suppresses future ticks when the
-  // lane actually finished all of enrichment, price refresh, peer share, the
-  // FMP tier-failure alert, and the freshness check. If any of those threw
-  // hard enough to skip this point, the stamp stays unset and the next
-  // hourly cron tick will retry the whole lane.
+  // Stamp-on-success: the day stamp only suppresses future ticks when price
+  // refresh finished.  A caught throw used to stamp anyway and park the
+  // lane until the next UTC day (CT-2409).  Leave the stamp unset so the
+  // next hourly tick retries the whole lane.
+  if (priceRefreshFailed) return 'error';
   await markLaneOk(env, laneKey, day);
   return 'ran';
 }
@@ -533,10 +829,10 @@ export async function runHourlyEnrichmentSlice(
 ): Promise<HourlyEnrichmentResult> {
   const day = now.toISOString().slice(0, 10);
   const secrets = await resolveSecrets(env, [
-    'FMP_MAX_PER_MINUTE',
+    ...ST_PEER_PACE_SECRET_NAMES,
     'EDGAR_MAX_PER_MINUTE',
   ]);
-  const maxPerMinute = parseInt(secrets.FMP_MAX_PER_MINUTE || '', 10) || undefined;
+  const maxPerMinute = stPeerMaxPerMinute(secrets);
   const edgarMaxPerMinute = parseInt(secrets.EDGAR_MAX_PER_MINUTE || '', 10) || undefined;
   const max = Math.max(0, Math.min(opts.max ?? HOURLY_ENRICHMENT_SLICE_MAX, HOURLY_ENRICHMENT_SLICE_MAX));
   const empty: HourlyEnrichmentResult = {
@@ -735,9 +1031,12 @@ export async function maybeRunDailyRetentionJobs(env: Env, now = new Date()): Pr
     }
   }
 
-  if (!(await stampDaily(env, SUBCLAIM_KEY_PREFIX + 'retention', day))) return 'stamped';
-
+  // CT-2459: budget check BEFORE the day stamp. Stamping first consumed the
+  // day even when the budget trip skipped the sweep, silently losing a full
+  // day of retention; now a budget-skipped day retries on the next firing.
   if (await dailyBudgetExceeded(env, 'retention sweep')) return 'budget';
+
+  if (!(await stampDaily(env, SUBCLAIM_KEY_PREFIX + 'retention', day))) return 'stamped';
 
   // Prune unbounded operational tables (dead_letter_events / ingest_log /
   // source_attempts). Bounded batches + per-run cap; never blocks the cron.
@@ -758,10 +1057,9 @@ export async function maybeRunDailyRetentionJobs(env: Env, now = new Date()): Pr
   } catch (err) {
     console.warn('5-year filing retention sweep failed:', (err as Error).message);
   }
-  // Note: retention keeps the stamp-before semantic (SUBCLAIM_KEY_PREFIX)
-  // because its work is cheap, idempotent, and only ever shrinks the DB;
-  // skipping it on a budget trip is safe and a missed sweep never risks
-  // data loss (older rows are deleted on the NEXT successful sweep).
+  // Note: the day stamp is taken after the budget gate (CT-2459) so a
+  // budget trip no longer consumes the day; the sweep work itself stays
+  // cheap, idempotent, and only ever shrinks the DB.
   return 'ran';
 }
 

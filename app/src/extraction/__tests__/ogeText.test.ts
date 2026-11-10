@@ -16,6 +16,7 @@ vi.mock('unpdf', () => ({
 import {
   OgeTextExtractor,
   classifyOgeTransactionText,
+  detectOgeRowAnchors,
   executiveDisclosureForm,
   isOgeRowSequenceCoherent,
   ogePart7SectionLooksEmpty,
@@ -260,6 +261,69 @@ describe('parseOgeTransactionRows', () => {
       (_, i) => `${i + 1} Issuer ${i + 1} (T${i + 1}) Purchase 07/17/2026 No $1,001 - $15,000`,
     ).join('\n');
     expect(parseOgeTransactionRows(coherent)).toHaveLength(8);
+  });
+});
+
+describe('detectOgeRowAnchors', () => {
+  // Verbatim shape from the parked filing E-2026-donald-j-trump-09-17-2026-278t:
+  // the Type word is garbled and the Date column is OCR-mangled (the printed
+  // 8/4/2026 reads back as "81412026"), but the row-index column is intact and
+  // contiguous. Counting anchors must work without reading any other field.
+  const scannedRows = [
+    '1                COMMONWEALTH PA FING AUTH TOB MSTR SETTlMT PMT REV BIE 5.00 % Duo Jun 1 2027        l ourchase   81412026   Yos $1000001-$5 000 000',
+    '2                LOUISVILLE JEFFERSON KY CNTY METRO GOVT HLTH SER C NORTON HC INC REV BIE 5.00 % Due Oct 1, 2047   oorchase   8/21/2026   No $1,000 001 - $5 000,000',
+    '3                TARRANT CNTY TX HSG FIN CORP REV MLTIFAM REV MERIDIAN APTS B BIE PTC 5.00 % Duo Sao 1 2028   ~ •rchase   8/312026   Yos $1 000 001 - $5 000 000',
+    '36               ELECTRONIC ARTS INC                     salo   8/512026   Yos $15 001 • $50 000',
+  ];
+
+  it('counts the intact row-index column on an otherwise garbled 278-T', () => {
+    const result = classifyOgeTransactionText(
+      scannedRows.join('\n'),
+      'E-2026-donald-j-trump-09-17-2026-278t',
+    );
+    expect(result.disposition).toBe('unreadable');
+    expect(result.rows).toHaveLength(0);
+    expect(result).toMatchObject({
+      detectedRowAnchors: 4,
+      detectedRowMaxIndex: 36,
+    });
+  });
+
+  it('reports the transaction count at stake on the refused path, and changes no behaviour', () => {
+    // Production signature: the leading \d latches onto bond maturity years, so
+    // the matched indexes jump and repeat and the sequence gate refuses.
+    const garbled = Array.from(
+      { length: 10 },
+      (_, i) => `1 001 - $15 000 ${2028 + i} EXAMPLE CORP DUE 06/15/20${28 + i} REV 5.00 % Duo Jun 1 2027  Purchase 07/17/2026 No $1,001 - $15,000`,
+    ).join('\n');
+    const result = classifyOgeTransactionText(garbled, 'E-2026-donald-j-trump-09-17-2026-278t');
+    // Behaviour is unchanged: still zero rows, still unreadable.
+    expect(result).toMatchObject({ disposition: 'unreadable', rows: [] });
+    expect(result.rows).toHaveLength(0);
+  });
+
+  it('leaves a clean parse free of refusal diagnostics', () => {
+    const clean = Array.from(
+      { length: 8 },
+      (_, i) => `${i + 1} Issuer ${i + 1} (T${i + 1}) Purchase 07/17/2026 No $1,001 - $15,000`,
+    ).join('\n');
+    const result = classifyOgeTransactionText(clean, 'E-2026-donald-j-trump-09-17-2026-278t');
+    expect(result.disposition).toBe('rows');
+    expect(result).not.toHaveProperty('detectedRowAnchors');
+  });
+
+  it('rejects tokens above the 278-T row ceiling and counts in-range row indices', () => {
+    // A 278-T can legitimately number past row 3600, so the ceiling stays high
+    // enough to keep real rows; it only drops 5-digit dollar figures and years.
+    const out = detectOgeRowAnchors(
+      ['9999    TOO BIG', '5001    ALSO TOO BIG', '12    A REAL ROW'].join('\n'),
+    );
+    expect(out).toEqual({ anchors: 1, maxIndex: 12 });
+  });
+
+  it('returns nothing for a flattened single-line read instead of guessing', () => {
+    expect(detectOgeRowAnchors('1 ALPHA Purchase 07/17/2026 Yes $1,001 - $15,000 2 BETA Purchase 07/17/2026 Yes $1,001 - $15,000'))
+      .toEqual({ anchors: 0, maxIndex: null });
   });
 });
 

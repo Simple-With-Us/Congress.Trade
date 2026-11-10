@@ -34,14 +34,232 @@
  */
 
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
-import * as cheerio from 'cheerio';
+// CT-2459: node-html-parser only (cheerio removed — it was a whole second
+// HTML parser stack for these three small extractions).
+import { parse } from 'node-html-parser';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
-import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
+import { createProxiedFetch, getDenoHttpClient, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
+import {
+  SenateHttpError,
+  SenateProxyEgressError,
+  isSenateEdgeDeniedError,
+  logSafeHeaderToken,
+  sanitizeEfdTransportError,
+  senateEfdTransportScrubSecrets,
+} from './senateEdgeDeny.ts';
+
+/** Backoff between direct Senate eFD attempts when direct is the only egress. */
+/** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
+export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
+export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err ?? '');
+}
+
+function isRetryableSenateTransportError(err: unknown): boolean {
+  // An edge deny is persistent: retrying it only asks the edge again.
+  if (isSenateEdgeDeniedError(err)) return false;
+  const message = errorMessage(err);
+  if (/HTTP 403/.test(message)) return true;
+  if (/HTTP 502|HTTP 503|HTTP 504/.test(message)) return true;
+  if (/abort/i.test(message)) return false;
+  if (/fetch failed|network|ECONNREFUSED|ETIMEDOUT|timed out/i.test(message)) return true;
+  return false;
+}
+
+/**
+ * How long each request of the proxy leg may wait for its HTTP answer (the
+ * response headers) before the proxy counts as unreachable.  A black-holed
+ * proxy (WireGuard peer down, SYNs dropped) never refuses the connection, so
+ * without this deadline it would spend pollSenate's whole 7 s budget and the
+ * direct fallback would never run.  Every request gets its own deadline, so a
+ * proxy that answers the landing GET and then black-holes the agreement POST
+ * is caught too.  The deadline covers only the wait for headers: a proxy that
+ * answers each request in time keeps the rest of the budget, however long the
+ * whole leg takes.  (The name predates the per-request deadline.)
+ */
+export const SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS = 3_000;
+
+/** True for a fetch rejection that is a network failure: no HTTP answer came back. */
+function isNetworkLevelFetchError(err: unknown): boolean {
+  if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) return false;
+  return err instanceof TypeError
+    || /fetch failed|network|connect|ECONN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|timed out|tunnel|proxy|os error/i.test(errorMessage(err));
+}
+
+/**
+ * The proxy leg's fetch, wrapped so the leg can tell "the proxy never
+ * answered" from everything else.  Only a rejection of this fetch call itself
+ * counts, never a parse or code fault elsewhere in the leg.  Each request's
+ * own answer deadline turns a hung proxy into such a rejection, at whichever
+ * request it hangs.
+ */
+function guardProxyLeg(proxyFetch: typeof fetch, answerTimeoutMs: number) {
+  const rejections = new WeakSet<object>();
+  const deadlineRejections = new WeakSet<object>();
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(new DOMException(
+      `senate proxy gave no HTTP answer within ${answerTimeoutMs}ms`,
+      'TimeoutError',
+    )), answerTimeoutMs);
+    timers.add(timer);
+    const signal = init?.signal ? AbortSignal.any([init.signal, deadline.signal]) : deadline.signal;
+    try {
+      // Cleared below once the headers are in, so reading the body is never
+      // cut short by this deadline.
+      return await proxyFetch(input, { ...init, signal });
+    } catch (err) {
+      if (err !== null && typeof err === 'object') {
+        rejections.add(err);
+        if (deadline.signal.aborted) deadlineRejections.add(err);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      timers.delete(timer);
+    }
+  }) as typeof fetch;
+  return {
+    fetchImpl,
+    /** True when `err` means the proxy never answered and the budget still has time for direct. */
+    unreachable(err: unknown, budget?: AbortSignal): boolean {
+      // The source budget's own abort is not the proxy's fault, and leaves
+      // no time for direct anyway.
+      if (budget?.aborted) return false;
+      if (err === null || typeof err !== 'object' || !rejections.has(err)) return false;
+      return deadlineRejections.has(err) || isNetworkLevelFetchError(err);
+    },
+    dispose(): void {
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+    },
+  };
+}
+
+/** Proxy URLs whose HTTP client could not be created, each logged once. */
+const senateProxyClientUnavailable = new Set<string>();
+
+/**
+ * The proxied fetch for `proxyUrl`, or undefined when no proxy client can be
+ * created for it.  createProxiedFetch then quietly hands back the base fetch
+ * (no Deno.createHttpClient, or it threw), and a leg run on that would be
+ * datacenter egress labeled `proxy`: it would read and write the proxy's
+ * shared KV session and get the proxy's answer deadline.  The call runs
+ * direct only instead, as if no proxy were configured.
+ */
+function senateProxyFetch(proxyUrl: string, baseFetch: typeof fetch): typeof fetch | undefined {
+  if (!getDenoHttpClient(proxyUrl)) {
+    if (!senateProxyClientUnavailable.has(proxyUrl)) {
+      senateProxyClientUnavailable.add(proxyUrl);
+      console.warn(
+        'senateSource: the residential proxy HTTP client could not be created; '
+          + 'Senate eFD requests go out direct only until it can',
+      );
+    }
+    return undefined;
+  }
+  senateProxyClientUnavailable.delete(proxyUrl);
+  return createProxiedFetch(proxyUrl, baseFetch);
+}
+
+function resolveExplicitSenateProxyUrl(opts: FetchSenatePtrFilingsOptions): string | undefined {
+  const trimmed = opts.proxyUrl?.trim();
+  if (trimmed) return trimmed;
+  const env = typeof process !== 'undefined'
+    ? {
+        RESIDENTIAL_PROXY_URL: process.env?.RESIDENTIAL_PROXY_URL,
+        SENATE_PROXY_URL: process.env?.SENATE_PROXY_URL,
+      }
+    : undefined;
+  return resolveResidentialProxyUrl(env, { allowDefault: false });
+}
+
+/** Which leg `withSenateEfdEgress` is running. */
+export interface SenateEfdEgressLeg {
+  egress: 'direct' | 'proxy';
+  /** True on a direct leg that only stands in for an unreachable proxy. */
+  fallback: boolean;
+}
+
+/**
+ * Run `run` through the operator-configured residential proxy first.  Direct
+ * datacenter egress is only a fallback for when the proxy never answers: a
+ * fetch is refused or reset, or a request gets no HTTP answer within
+ * SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS (a black-holed proxy), so a Mango
+ * outage still falls back (CT-2361 / #2748).  An HTTP answer through the
+ * proxy, an edge deny included, is the result: it is never retried direct,
+ * because the box's own egress has been edge-denied even for GET (Akamai
+ * SERVE_403) since at least 2026-10-16 (CT-2442).  A fault elsewhere in the
+ * leg (a parse or code error) and the source budget's own abort do not fall
+ * back either.  Without a usable explicit proxy (none configured, or no
+ * proxy client can be created for it), direct is the only egress and keeps
+ * its short backoff for transient answers.  The Mango default is never used
+ * implicitly.
+ *
+ * The direct fallback shares the source budget (`opts.signal`) with the proxy
+ * leg on purpose: the watcher bounds each source at
+ * WATCHER_SOURCE_IO_BUDGET_MS, and a fresh budget would let one source take
+ * two.  A proxy request gives up within the answer deadline, which leaves the
+ * fallback the rest.
+ */
+export async function withSenateEfdEgress<T>(
+  opts: FetchSenatePtrFilingsOptions,
+  baseFetch: typeof fetch,
+  run: (fetchImpl: typeof fetch, leg: SenateEfdEgressLeg) => Promise<T>,
+): Promise<T> {
+  const explicitProxy = resolveExplicitSenateProxyUrl(opts);
+  const transportScrubSecrets = senateEfdTransportScrubSecrets(explicitProxy);
+  const proxied = explicitProxy ? senateProxyFetch(explicitProxy, baseFetch) : undefined;
+  let proxyErr: unknown = null;
+  if (proxied) {
+    const leg = guardProxyLeg(
+      proxied,
+      boundedPositiveInt(opts.proxyFirstAnswerTimeoutMs, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS),
+    );
+    try {
+      return await run(leg.fetchImpl, { egress: 'proxy', fallback: false });
+    } catch (err) {
+      if (!leg.unreachable(err, opts.signal)) throw err;
+      proxyErr = err;
+    } finally {
+      leg.dispose();
+    }
+  }
+
+  const backoff = proxied ? SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS : SENATE_EFD_DIRECT_BACKOFF_MS;
+  for (let attempt = 0; attempt < backoff.length; attempt++) {
+    const waitMs = backoff[attempt] ?? 0;
+    if (waitMs > 0) await delay(waitMs, opts.signal);
+    try {
+      const out = await run(baseFetch, { egress: 'direct', fallback: Boolean(proxied) });
+      if (proxyErr) {
+        console.warn(
+          'senateSource: residential proxy unreachable; the direct fallback reached eFD:',
+          sanitizeEfdTransportError(proxyErr, transportScrubSecrets),
+        );
+      }
+      return out;
+    } catch (err) {
+      if (attempt + 1 < backoff.length && isRetryableSenateTransportError(err)) continue;
+      // Name the proxy outage first: it is the failure to act on, and the
+      // direct leg's own answer (usually an edge deny) is only the fallback.
+      // Its [edge_denied] tag is left off: the whole failure is not one.
+      if (proxyErr && !opts.signal?.aborted) {
+        throw new SenateProxyEgressError(proxyErr, err, transportScrubSecrets);
+      }
+      throw err;
+    }
+  }
+  throw new Error('senate egress failed');
+}
 
 const SENATE_BASE = 'https://efdsearch.senate.gov';
-const SENATE_SEARCH = `${SENATE_BASE}/search/`;
-const SENATE_HOME = `${SENATE_BASE}/search/home/`;
-const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
+export const SENATE_SEARCH = `${SENATE_BASE}/search/`;
+export const SENATE_HOME = `${SENATE_BASE}/search/home/`;
+export const SENATE_DATA = `${SENATE_BASE}/search/report/data/`;
 
 /** PTR report type code in the efdsearch DataTables API. */
 export const SENATE_PTR_REPORT_TYPE = 11;
@@ -150,8 +368,9 @@ export function looksLikeSenateAgreementWall(html: string): boolean {
  * Returns '' if not found.
  */
 export function parseCsrfMiddlewareToken(html: string): string {
-  const $ = cheerio.load(html);
-  const token = $('input[name="csrfmiddlewaretoken"]').val();
+  const token = parse(html)
+    .querySelector('input[name="csrfmiddlewaretoken"]')
+    ?.getAttribute('value');
   return typeof token === 'string' ? token : '';
 }
 
@@ -161,8 +380,7 @@ export function parseCsrfMiddlewareToken(html: string): string {
  * Returns { reportPath, reportId } or null if no parseable href.
  */
 export function parseReportLink(cellHtml: string): { reportPath: string; reportId: string } | null {
-  const $ = cheerio.load(cellHtml);
-  const href = $('a').attr('href');
+  const href = parse(cellHtml).querySelector('a')?.getAttribute('href');
   if (!href) return null;
   const reportPath = href;
   // id is the last non-empty path segment (handles trailing slash).
@@ -188,7 +406,7 @@ export function parseSenateRows(rows: string[][]): SenateFiling[] {
   for (const row of rows) {
     if (!Array.isArray(row)) continue;
     const cells = row.map((c) => (typeof c === 'string' ? c : ''));
-    const textCells = cells.map((c) => cheerio.load(c).text().trim());
+    const textCells = cells.map((c) => parse(c).text.trim());
     const linkCell = cells.find((c) => /\/search\/view\/(?:ptr|paper)\//i.test(c)) ?? '';
     const parsed = parseReportLink(linkCell);
     if (!parsed) continue;
@@ -213,6 +431,87 @@ export function parseSenateRows(rows: string[][]): SenateFiling[] {
     });
   }
   return out;
+}
+
+
+/** One row from the Mac eFD fetcher's output file (~/efd-fetcher/out/*.json). */
+export interface EfdFetcherRow {
+  first_name?: string | null;
+  last_name?: string | null;
+  filer?: string | null;
+  report_title?: string | null;
+  report_url?: string | null;
+  date_received?: string | null;
+  is_paper?: boolean;
+  /** The original DataTables row, when the fetcher preserved it. */
+  raw?: string[];
+}
+
+function fetcherRowText(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Convert one Mac eFD fetcher row into a SenateFiling, or null when the row
+ * does not carry a usable official eFD report link and filed date.  When the
+ * fetcher preserved the original DataTables row, parseSenateRows is the
+ * primary path so intake filings are parsed identically to polled filings.
+ * The extracted fields are the fallback for rows without a usable raw row.
+ * A report URL on any host other than efdsearch.senate.gov is rejected: the
+ * pipeline fetches sourceUrl server-side, so intake must never become a way
+ * to point it at an arbitrary URL.
+ */
+export function senateFilingFromFetcherRow(row: EfdFetcherRow): SenateFiling | null {
+  if (!row || typeof row !== 'object') return null;
+  if (Array.isArray(row.raw)) {
+    const parsed = parseSenateRows([row.raw])[0];
+    // parseSenateRows tolerates a missing date or name cell (it yields '');
+    // intake must not.  A raw parse without a valid filed date and filer
+    // name falls through to the extracted-fields path, which validates both.
+    if (
+      parsed &&
+      parsed.sourceUrl.startsWith(`${SENATE_BASE}/search/view/`) &&
+      parsed.fullName &&
+      /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(parsed.filedDate)
+    ) {
+      return parsed;
+    }
+  }
+  const reportUrl = fetcherRowText(row.report_url);
+  if (!reportUrl) return null;
+  let reportPath = '';
+  if (reportUrl.startsWith('/')) {
+    reportPath = reportUrl.split(/[?#]/, 1)[0];
+  } else {
+    try {
+      const url = new URL(reportUrl);
+      if (url.origin !== SENATE_BASE) return null;
+      reportPath = url.pathname;
+    } catch {
+      return null;
+    }
+  }
+  if (!/^\/search\/view\/(?:ptr|paper)\//i.test(reportPath)) return null;
+  const segments = reportPath.split('/').filter((s) => s.length > 0);
+  const reportId = segments[segments.length - 1] ?? '';
+  if (!reportId) return null;
+  const filedDate = fetcherRowText(row.date_received);
+  if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(filedDate)) return null;
+  const first = fetcherRowText(row.first_name);
+  const last = fetcherRowText(row.last_name);
+  const fullName = fetcherRowText(row.filer) || `${first} ${last}`.trim();
+  if (!fullName) return null;
+  return {
+    reportId,
+    first,
+    last,
+    fullName,
+    filingTypeLabel: fetcherRowText(row.report_title),
+    filedDate,
+    reportPath,
+    sourceUrl: `${SENATE_BASE}${reportPath}`,
+    pipelineDocId: `S-${reportId}`,
+  };
 }
 
 /** Format a Date as the "MM/DD/YYYY HH:MM:SS" string efdsearch expects. */
@@ -278,8 +577,32 @@ export interface FetchSenatePtrFilingsOptions {
   relaySecret?: string;
   /** Optional proxy URL for routing Senate requests. */
   proxyUrl?: string;
+  /** Injectable for tests; capped at SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS. */
+  proxyFirstAnswerTimeoutMs?: number;
   /** Cancels active source I/O when the enclosing watcher tick reaches its deadline. */
   signal?: AbortSignal;
+  /**
+   * Run the eFD flow through a real Chromium page (senateBrowserFetch.ts)
+   * instead of plain HTTP.  Opt-in; default off (env SENATE_EFD_BROWSER_FETCH).
+   * The plain-HTTP flow has been edge-denied at the agreement POST since
+   * 2026-10-23 (CT-2442), and the browser is the only automated client class
+   * observed to pass.  Requires the playwright package and a Chromium build
+   * in the deployment image.
+   */
+  browserFetch?: boolean;
+  /**
+   * With browserFetch, launch Chromium with
+   * --disable-blink-features=AutomationControlled, so navigator.webdriver
+   * reads false (owner decision, 2026-10-30).  Default off (env
+   * SENATE_EFD_HIDE_AUTOMATION).
+   */
+  hideAutomation?: boolean;
+  /**
+   * With browserFetch, launch Chromium headless.  Default true (env
+   * SENATE_EFD_BROWSER_HEADLESS); the verified eFD passes were headed (Mac)
+   * or a managed browser, so headless is unverified against the edge.
+   */
+  browserHeadless?: boolean;
 }
 
 /** KV key holding the cached, agreement-accepted eFD session. Shared with the
@@ -292,12 +615,68 @@ export interface SenateSession {
   cookieHeader: string;
 }
 
+/** The response's Server header (AkamaiGHost for the edge, gunicorn for the origin). */
+function senateServer(res: Response): string | null {
+  return res.headers.get('server');
+}
+
+/**
+ * Read at most `maxChars` characters of a response body and cancel the rest,
+ * so a large page is never buffered whole.  `truncated` is true when the
+ * body went on past the limit.  A read error rejects, as `res.text()` does.
+ */
+async function readSenateBodyPrefix(
+  res: Response,
+  maxChars: number,
+): Promise<{ text: string; truncated: boolean }> {
+  if (!res.body) return { text: '', truncated: false };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return { text: text + decoder.decode(), truncated: false };
+      text += decoder.decode(value, { stream: true });
+      if (text.length > maxChars) {
+        await reader.cancel().catch(() => {});
+        return { text: text.slice(0, maxChars), truncated: true };
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * The start of an error response body, enough to recognize Akamai's deny page
+ * (~400 bytes).  Fail-soft: it only enriches an error that is thrown anyway.
+ */
+async function readSenateBodySnippet(res: Response, maxChars = 4096): Promise<string> {
+  try {
+    return (await readSenateBodyPrefix(res, maxChars)).text;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * How much of a 200 answer to the agreement POST is read to look for the
+ * agreement form, which sits past byte 5,000 of eFD's landing page.  A page
+ * longer than this fails closed.
+ */
+const SENATE_AGREEMENT_PAGE_MAX_CHARS = 256 * 1024;
+
 /**
  * Run the eFD landing + agreement-acceptance handshake and return a usable
  * session (cookie header + CSRF token). When `kv` is provided the session is
  * cached for 24 hours under SENATE_SESSION_KV_KEY so the discovery poll and the
  * filing fetcher share one session instead of re-negotiating (or, worse,
  * fetching report pages sessionless and receiving the agreement wall).
+ *
+ * Throws SenateHttpError when eFD does not accept the agreement, and then
+ * writes nothing to KV: a refused cookie jar cached for 24 hours would be
+ * replayed by every poll and every document fetch.
  */
 export async function establishSenateSession(
   opts: { kv?: any; politeDelayMs?: number; signal?: AbortSignal } = {},
@@ -319,7 +698,11 @@ export async function establishSenateSession(
     },
     signal: opts.signal,
   }, { service: 'filing-discovery', operation: 'open-senate-search-session' }, fetchImpl);
-  if (!landing.ok) throw new Error(`senate GET /search/ -> HTTP ${landing.status}`);
+  if (!landing.ok) {
+    throw new SenateHttpError('GET /search/', landing.status, senateServer(landing), {
+      body: await readSenateBodySnippet(landing),
+    });
+  }
   jar.absorb(landing);
   const landingHtml = await landing.text();
   const middlewareToken = parseCsrfMiddlewareToken(landingHtml);
@@ -348,7 +731,41 @@ export async function establishSenateSession(
     redirect: 'manual',
     signal: opts.signal,
   }, { service: 'filing-discovery', operation: 'accept-senate-search-terms' }, fetchImpl);
-  // 200 or 302 are both fine; we only care that cookies are refreshed.
+  // A normal acceptance answers with a redirect (302).  A 200 counts only
+  // when the page no longer carries the agreement form.  Anything else is a
+  // refusal (since 2026-10-23 the Akamai edge answers this POST with 403
+  // "Access Denied", CT-2442), and a refused jar must never reach KV.
+  if (agree.status >= 300 && agree.status < 400) {
+    await agree.body?.cancel().catch(() => {});
+  } else if (agree.status === 200) {
+    // The form sits past byte 5,000 of eFD's landing page, so up to
+    // SENATE_AGREEMENT_PAGE_MAX_CHARS is read, never the whole body.  An
+    // unreadable body is no proof of acceptance, and neither is a page too
+    // long to check: fail closed.
+    let page: { text: string; truncated: boolean };
+    try {
+      page = await readSenateBodyPrefix(agree, SENATE_AGREEMENT_PAGE_MAX_CHARS);
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
+      throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+        detail: `body unreadable (${errorMessage(err)})`,
+      });
+    }
+    if (looksLikeSenateAgreementWall(page.text)) {
+      throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+        detail: 'still shows the agreement form',
+      });
+    }
+    if (page.truncated) {
+      throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+        detail: `page longer than ${SENATE_AGREEMENT_PAGE_MAX_CHARS} chars, not checked`,
+      });
+    }
+  } else {
+    throw new SenateHttpError('POST /search/home/', agree.status, senateServer(agree), {
+      body: await readSenateBodySnippet(agree),
+    });
+  }
   jar.absorb(agree);
   await delay(politeDelayMs, opts.signal);
 
@@ -397,9 +814,6 @@ export async function fetchSenatePtrFilings(
   const maxPages = boundedPositiveInt(opts.maxPages, SENATE_MAX_PAGES, SENATE_MAX_PAGES);
   const politeDelayMs = boundedNonNegativeInt(opts.politeDelayMs, POLITE_DELAY_MS);
 
-  const proxyUrl = opts.proxyUrl ?? resolveResidentialProxyUrl();
-  const effectiveFetch = proxyUrl ? createProxiedFetch(proxyUrl, fetchImpl) : fetchImpl;
-
   // Owner 2026-09-09: the Mac scout relay (`https://scout.jays.services`)
   // is retired (board `ba810d46`).  The Senate relay fallback at the
   // bottom of this function used to point there; it is now a no-op.
@@ -416,11 +830,17 @@ export async function fetchSenatePtrFilings(
     );
   }
 
+  const runFlow = async (effectiveFetch: typeof fetch, leg: SenateEfdEgressLeg): Promise<SenateFiling[]> => {
+  // The shared KV session belongs to the primary egress.  A direct leg that
+  // is only the proxy's fallback never reads, writes or deletes it: the
+  // proxy made it, the fetcher replays it through the same proxy, and a
+  // direct failure must not wipe it (CT-2442).
+  const sessionKv = leg.fallback ? undefined : opts.kv;
   let session: SenateSession | null = null;
 
-  if (opts.kv) {
+  if (sessionKv) {
     try {
-      const cached = await opts.kv.get(SENATE_SESSION_KV_KEY, 'json');
+      const cached = await sessionKv.get(SENATE_SESSION_KV_KEY, 'json');
       if (cached) session = cached as SenateSession;
     } catch (err) {
       console.warn('watcher: Failed to read senate session from KV:', err);
@@ -434,7 +854,7 @@ export async function fetchSenatePtrFilings(
 
   while (true) {
     if (!session && !handshakeDone) {
-      session = await establishSenateSession({ kv: opts.kv, politeDelayMs, signal: opts.signal }, effectiveFetch);
+      session = await establishSenateSession({ kv: sessionKv, politeDelayMs, signal: opts.signal }, effectiveFetch);
       handshakeDone = true;
     }
     if (!session) break;
@@ -478,16 +898,24 @@ export async function fetchSenatePtrFilings(
 
       const contentType = data.headers.get('content-type') || '';
       if (!data.ok || !contentType.includes('application/json')) {
-        if (useCached && !handshakeDone) {
-          console.warn(`watcher: senate cached session invalid (HTTP ${data.status} ${contentType}), retrying handshake`);
-          if (opts.kv) {
-            await opts.kv.delete(SENATE_SESSION_KV_KEY).catch(() => {});
+        const server = senateServer(data);
+        const failure = data.ok
+          ? null
+          : new SenateHttpError('POST report/data/', data.status, server, { body: await readSenateBodySnippet(data) });
+        // An edge deny is not a session problem.  Re-negotiating would only
+        // send the edge another agreement POST, so it surfaces as is.
+        if (useCached && !handshakeDone && !isSenateEdgeDeniedError(failure)) {
+          console.warn(
+            `watcher: senate cached session invalid (HTTP ${data.status} ${logSafeHeaderToken(contentType)}, server=${logSafeHeaderToken(server)}), retrying handshake`,
+          );
+          if (sessionKv) {
+            await sessionKv.delete(SENATE_SESSION_KV_KEY).catch(() => {});
           }
           pageError = true;
           break;
         }
-        if (!data.ok) throw new Error(`senate POST report/data/ -> HTTP ${data.status}`);
-        throw new Error(`senate POST report/data/ -> unexpected content-type ${contentType}`);
+        if (failure) throw failure;
+        throw new Error(`senate POST report/data/ -> unexpected content-type ${logSafeHeaderToken(contentType)} (server=${logSafeHeaderToken(server)})`);
       }
 
       const json = (await data.json()) as { data?: unknown; recordsFiltered?: unknown };
@@ -511,5 +939,30 @@ export async function fetchSenatePtrFilings(
   }
 
   return parseSenateRows(rows);
+  };
+
+  const browserFetchEnabled = opts.browserFetch ??
+    (typeof process !== 'undefined' && process.env?.SENATE_EFD_BROWSER_FETCH === 'true');
+  if (browserFetchEnabled) {
+    const { createSenateBrowserFetch } = await import('./senateBrowserFetch.ts');
+    const browser = await createSenateBrowserFetch({
+      hideAutomation: opts.hideAutomation ??
+        (typeof process !== 'undefined' && process.env?.SENATE_EFD_HIDE_AUTOMATION === 'true'),
+      headless: opts.browserHeadless ??
+        (typeof process !== 'undefined' ? process.env?.SENATE_EFD_BROWSER_HEADLESS !== 'false' : true),
+      proxyUrl: resolveExplicitSenateProxyUrl(opts),
+    });
+    try {
+      // The browser owns its egress and its cookie jar, so the egress legs do
+      // not apply.  fallback: true keeps the browser-negotiated session out
+      // of the shared KV cache: its cookie header cannot be replayed by the
+      // plain-HTTP path, and the browser context is rebuilt on every run.
+      return await runFlow(browser.fetchImpl, { egress: 'direct', fallback: true });
+    } finally {
+      await browser.close();
+    }
+  }
+
+  return await withSenateEfdEgress(opts, fetchImpl, runFlow);
 }
 // Senate Scraper Hardening applied

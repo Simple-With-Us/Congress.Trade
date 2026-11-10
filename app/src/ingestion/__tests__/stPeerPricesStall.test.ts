@@ -40,6 +40,10 @@ vi.mock('../../delivery/targetCircuit.ts', () => ({
 
 vi.mock('../../shared/pipelineHealth.ts', () => ({
   checkPipelineHealth: vi.fn(async () => ({ status: 'ok', checks: [] })),
+  collectEmptyFetchHandoffCheck: vi.fn(async () => ({
+    check: { id: 'empty_fetch_handoff', status: 'ok', detail: 'none', value: 0 },
+    wakeDocId: null,
+  })),
 }));
 
 let db: SqliteDatabase;
@@ -47,6 +51,7 @@ let d1: D1Database;
 let close: () => void;
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   const opened = await openMigratedD1();
   db = opened.db;
   d1 = opened.d1;
@@ -138,6 +143,9 @@ describe('st_peer_prices stall detector', () => {
       `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
        VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
     ).run();
+    db.prepare(
+      `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 100)`,
+    ).run();
 
     const now = new Date('2026-10-12T18:00:00.000Z');
     const result = await sweepPipelineStallAlerts(envWithDb(), now);
@@ -161,6 +169,9 @@ describe('st_peer_prices stall detector', () => {
     db.prepare(
       `INSERT INTO securities_ref (ticker, latest_price_date, price_checked_at, source)
        VALUES ('FRESH', '2026-10-10', datetime('now'), 'socratic')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 100)`,
     ).run();
 
     const now = new Date('2026-10-12T18:00:00.000Z');

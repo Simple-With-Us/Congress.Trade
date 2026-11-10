@@ -72,15 +72,23 @@ describe('review queue durable state migration', () => {
     const statements: string[] = [];
     const db = {
       prepare(sql: string) {
-        return {
+        const stmt = {
           bind() {
-            return this;
+            return stmt;
           },
           async run() {
             statements.push(sql);
             return { success: true, meta: { changes: 1 } };
           },
+          async all() {
+            return { results: [], success: true };
+          },
+          async first() {
+            if (/sqlite_master/i.test(sql)) return null;
+            return null;
+          },
         };
+        return stmt;
       },
     } as unknown as D1Database;
 

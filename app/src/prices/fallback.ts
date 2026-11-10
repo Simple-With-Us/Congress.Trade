@@ -8,7 +8,7 @@
  */
 
 import type { Close } from './compute.ts';
-import type { PriceClient } from './fmp.ts';
+import type { PriceClient } from './types.ts';
 
 /**
  * Auth/plan failures on the primary (peer 401/402/403) must stay fail-closed.

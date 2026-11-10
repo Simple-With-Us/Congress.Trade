@@ -190,6 +190,11 @@ export interface Transaction {
    * otherwise the persist time. Never a date before txDate.
    */
   firstSeenAt?: string | null;
+  /**
+   * Delivery-only stamp: true when filed/first-seen is outside the default
+   * fresh window (webhook/SSE payloads). Absent on feed rows until stamped.
+   */
+  isBackfill?: boolean;
   /** Original public disclosure document URL. Feed only. */
   sourceUrl?: string | null;
   /**
@@ -248,8 +253,14 @@ export interface ParsedTx {
    * Source fields that were explicitly unreadable and were defaulted locally,
    * or provenance markers for the row itself (e.g. recovered from a truncated
    * provider response — see `salvageTruncatedTransactions` in visionLlm.ts).
+   *
+   * `band_amount_inferred` marks an amount bracket that parseAmountRange SNAPPED
+   * onto a canonical STOCK Act tier rather than matching one the document
+   * printed. On a checkbox-band form that means the band legend was not legible
+   * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
+   * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output'>;
+  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type'>;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -279,6 +290,11 @@ export interface SubscriptionFilters {
   sectors?: string[];
   /** Market-cap buckets to include (mega…nano, securities_ref.market_cap_bucket). */
   marketCapBuckets?: string[];
+  /**
+   * When true, deliver historical backfill rows too. Default (omitted/false) is
+   * fresh-only (filed or first-seen within seven days).
+   */
+  includeBackfill?: boolean;
 }
 
 export interface Subscription {
@@ -700,8 +716,8 @@ export interface Env {
   FMP_RAPIDAPI_DAILY_CAP?: string;
   /** Daily FMP call budget (stringified int); defaults to 230 when unset. */
   FMP_DAILY_CALL_CAP?: string;
-  /** Shared FMP per-minute pacer ceiling (stringified int). Infisical-tunable. */
-  FMP_MAX_PER_MINUTE?: string;
+  /** Socratic.Trade peer-read pace (clamped to ST_PEER_SAFE_MAX_PER_MINUTE).  Infisical-tunable. */
+  ST_PEER_MAX_PER_MINUTE?: string;
   /** SEC EDGAR per-minute pacer ceiling (stringified int). Infisical-tunable. */
   EDGAR_MAX_PER_MINUTE?: string;
   /** Local-dev-only escape hatch: opens admin when the environment is not production. */
@@ -774,7 +790,7 @@ export interface Env {
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   /** Unusual Whales API key for recent Congress trades (latency probe). */
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias (global-api-keys / Infisical) without underscores in the vendor name. */
+  /** Alias (Infisical) without underscores in the vendor name. */
   UNUSUALWHALES_API_KEY?: string;
   /** Distinct filed dates the UW disclosure-latency deep-match pass may query
    *  per probe run (recent-trades?date=<filedDate>), for pending observations
@@ -965,6 +981,11 @@ export interface Env {
   DELIVERY_TARGET_BASE_BACKOFF_SEC?: string;
   /** Parked deliveries allowed per subscription before overflow quarantine (default 500). */
   DELIVERY_TARGET_PARKED_CAP?: string;
+  /**
+   * Env fallback for the Infisical app setting of the same name: when truthy
+   * the scheduled flush re-parks live quarantined rows (default off).
+   */
+  DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER?: string;
   /** Admin + scoped import bearer tokens. */
   ADMIN_TOKEN?: string;
   /** Admin email allowlist for site-session admin access and Cloudflare Access. */
@@ -984,6 +1005,8 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Scoped token for the idempotent admin maintenance endpoints only (backlog requeue/retry). */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /** Scoped token for POST /api/admin/senate-ptr-intake only (Mac eFD fetcher, CT-2442). */
+  SENATE_INTAKE_TOKEN?: string;
   LLAMAPARSE_API_KEY?: string;
 
   // --- Billing (Stripe) ---

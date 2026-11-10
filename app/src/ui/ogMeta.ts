@@ -282,7 +282,7 @@ export function resolveOgMeta(
       subs: {
         title: 'Delivery',
         description:
-          'Email, push, and webhook alerts the moment a new congressional stock trade is disclosed — Congress.Trade Delivery.',
+          'Signed webhook + live SSE alerts the moment a new congressional stock trade is disclosed — Congress.Trade Delivery.',
       },
     } as const;
     const { title, description } = byView[view];

@@ -25,8 +25,8 @@ const PKG = "@jaywedgeworth22/congress-trading-shared";
 const PROVENANCE_PATH = join(ROOT, "app/vendor/congress-trading-shared/VENDOR-PROVENANCE.md");
 const VENDOR_PKG_PATH = join(ROOT, "app/vendor/congress-trading-shared/package.json");
 const PEERS = [
-  { repo: "jaywedgeworth22/Socratic.Trade", lockPath: "package-lock.json" },
-  { repo: "jaywedgeworth22/API-usage-monitor", lockPath: "package-lock.json" },
+  { repo: "Simple-With-Us/Socratic-Trade", lockPath: "package-lock.json" },
+  { repo: "Simple-With-Us/Usage-Monitor", lockPath: "package-lock.json" },
 ];
 
 function read(path) {

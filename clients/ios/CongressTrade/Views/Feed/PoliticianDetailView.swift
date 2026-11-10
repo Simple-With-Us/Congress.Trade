@@ -160,6 +160,14 @@ struct PoliticianDetailView: View {
                                 }
                             }
                             .padding(.horizontal, 16)
+
+                            if let polName = member.name, !polName.isEmpty, polName != "Unknown" {
+                                SeeAllTradesHandoff(
+                                    totalTrades: summary?.totalTrades ?? 0,
+                                    displayedCount: trades.count,
+                                    filter: .politician(polName)
+                                )
+                            }
                         }
                     }
                 }

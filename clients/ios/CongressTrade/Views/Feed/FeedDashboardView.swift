@@ -4,7 +4,13 @@ import UIKit
 
 struct FeedDashboardView: View {
     @EnvironmentObject private var store: CongressTradeStore
-    @Query private var cachedTrades: [ClientTrade]
+    // CT-2459: cursor-desc is the server's feed order — let SwiftData
+    // maintain it instead of starting every view sort from arbitrary order.
+    @Query(sort: \ClientTrade.cursor, order: .reverse) private var cachedTrades: [ClientTrade]
+    /// Memoized sort+filter output (CT-2459). Recomputed only when
+    /// `filterSignature` changes (see `.task(id:)` in body), not on every
+    /// body pass / unrelated store publish.
+    @State private var tradesSnapshot: [ClientTrade] = []
     @State private var searchText = ""
     @State private var filterTask: Task<Void, Never>?
     @State private var selectedTrade: ClientTrade?
@@ -61,7 +67,54 @@ struct FeedDashboardView: View {
         }
     }
 
-    var filteredTrades: [ClientTrade] {
+    /// Everything `computeFilteredTrades` reads, as one comparable token.
+    /// Built by concatenation in small steps — the single array literal
+    /// version timed out CI's Swift type checker (CT-2459).
+    private var filterSignature: String {
+        var sig = String(cachedTrades.count)
+        sig += "|" + (cachedTrades.first?.id ?? "")
+        sig += "|" + (cachedTrades.last?.id ?? "")
+        sig += "|" + searchText
+        sig += "|" + store.feedSortKey.rawValue
+        sig += "|" + store.feedSortDirection.rawValue
+        let chambers: [String] = store.selectedChambers.map(\.rawValue).sorted()
+        sig += "|" + chambers.joined(separator: ",")
+        let parties: [String] = store.selectedParties.map(\.rawValue).sorted()
+        sig += "|" + parties.joined(separator: ",")
+        let types: [String] = store.selectedTradeTypes.map(\.rawValue).sorted()
+        sig += "|" + types.joined(separator: ",")
+        sig += "|" + store.selectedTimeRange.rawValue
+        sig += "|" + String(store.feed?.cursor ?? -1)
+        // Content version: `@Query` rows are mutated in place by poll
+        // upserts, so count/first/last ids alone miss edited amounts,
+        // dates, chambers — the memo would serve the stale arrangement.
+        sig += "|v" + String(Self.feedContentDigest(cachedTrades))
+        return sig
+    }
+
+    /// Digest over every field `computeFilteredTrades` and the sorts read.
+    /// `Hasher` is process-randomized, which is fine here: the digest is
+    /// only ever compared within one run.
+    static func feedContentDigest(_ trades: [ClientTrade]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(trades.count)
+        for trade in trades {
+            hasher.combine(trade.id)
+            hasher.combine(trade.transaction.date)
+            hasher.combine(trade.transaction.type)
+            hasher.combine(trade.transaction.amountMin)
+            hasher.combine(trade.transaction.amountMax)
+            hasher.combine(trade.asset.ticker)
+            hasher.combine(trade.asset.name)
+            hasher.combine(trade.member.name)
+            hasher.combine(trade.member.party)
+            hasher.combine(trade.member.chamber)
+            hasher.combine(trade.member.state)
+        }
+        return hasher.finalize()
+    }
+
+    private func computeFilteredTrades() -> [ClientTrade] {
         let searchNeedle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let chambers = store.selectedChambers
         let filteringChambers = !chambers.isEmpty
@@ -170,10 +223,10 @@ struct FeedDashboardView: View {
     }
 
     var body: some View {
-        // Read once per render. `filteredTrades` re-sorts the whole loaded page
-        // every time it is touched, and the body needs it for the count, the
-        // empty state and the list — three full sorts per frame before this.
-        let trades = filteredTrades
+        // CT-2459: memoized snapshot, recomputed by the `.task(id:)` below
+        // only when an actual filter/sort/cache input changes — not on
+        // every body pass.
+        let trades = tradesSnapshot
         return NavigationStack {
             VStack(spacing: 0) {
                 FeedDisclaimerHeader(disclaimerExpanded: $disclaimerExpanded) {
@@ -384,6 +437,9 @@ struct FeedDashboardView: View {
             .simultaneousGesture(
                 TapGesture().onEnded { searchFocused = false }
             )
+            .task(id: filterSignature) {
+                tradesSnapshot = computeFilteredTrades()
+            }
         }
     }
 
@@ -1145,10 +1201,10 @@ struct SidesFilterMenuLabel: View {
                 HStack(spacing: 1) {
                     Image(systemName: "arrow.up")
                         .font(.caption2.weight(.heavy))
-                        .foregroundStyle(isOn(.buy) ? Color.green : dimColor)
+                        .foregroundStyle(isOn(.buy) ? AppTheme.semanticPositive : dimColor)
                     Image(systemName: "arrow.down")
                         .font(.caption2.weight(.heavy))
-                        .foregroundStyle(isOn(.sell) ? Color.red : dimColor)
+                        .foregroundStyle(isOn(.sell) ? AppTheme.semanticNegative : dimColor)
                     // Same semi-dark grey as the other filter glyphs (owner
                     // 2026-08-22). Green/red stay on buy/sell because those
                     // colours mean something; exchange does not.

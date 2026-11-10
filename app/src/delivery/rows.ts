@@ -210,6 +210,7 @@ export function mapTransaction(row: TransactionRow): Transaction {
   return sanitizeCompetitorPublication({
     ...transaction,
     filedDate: row.filed_date ?? null,
+    firstSeenAt: tradeLearnedAt(row.first_seen_at, row.created_at, row.tx_date),
   });
 }
 
@@ -1226,4 +1227,56 @@ export function buildTransactionsExportQuery(
     `ORDER BY ${NEWEST_SNAPSHOT_ORDER_SQL} DESC, t.cursor_seq DESC` +
     (hasLimit ? ` LIMIT ${limit}` : '');
   return { sql, params, limit, offset: 0 };
+}
+
+/** Rows per streamed CSV batch. Bounds export memory to one batch of rows
+ *  plus its serialized lines instead of the full match set three times over. */
+export const EXPORT_BATCH_SIZE = 1000;
+
+/**
+ * COUNT companion for the CSV export, using the SAME filters as
+ * buildTransactionsExportQuery — including source-twin dedupe, unlike the
+ * feed count (#2062) — so a pre-count taken before streaming honestly
+ * predicts the number of rows the export emits (X-Export-Row-Count).
+ * Joins-lite: no filter references securities_ref.
+ */
+export function buildTransactionsExportCountQuery(
+  p: TxQueryParams,
+): { sql: string; params: Array<string | number> } {
+  const { where, params } = buildTxFilters(p, false);
+  const sql =
+    'SELECT COUNT(*) AS total ' +
+    TX_FROM_JOINS_LITE +
+    (where.length ? `WHERE ${where.join(' AND ')}` : '');
+  return { sql, params };
+}
+
+/**
+ * One bounded batch of the export set, in the export's exact order.
+ * OFFSET paging (not a cursor keyset): the export order is the newest-first
+ * snapshot expression COALESCE(first_seen_at, filed_date, tx_date,
+ * cursor_seq), which has no single stable scalar key to keyset on without
+ * changing which rows sort where. OFFSET preserves the set and order
+ * exactly; the batch size bounds memory, which is the defect being fixed.
+ */
+export function buildTransactionsExportBatchQuery(
+  p: TxQueryParams,
+  batchSize: number,
+  offset: number,
+): BuiltQuery {
+  const size =
+    Number.isFinite(batchSize) && Math.floor(Number(batchSize)) > 0
+      ? Math.floor(Number(batchSize))
+      : EXPORT_BATCH_SIZE;
+  const off =
+    Number.isFinite(offset) && Math.floor(Number(offset)) > 0
+      ? Math.floor(Number(offset))
+      : 0;
+  const built = buildTransactionsExportQuery(p, size);
+  return {
+    sql: built.sql + (off > 0 ? ` OFFSET ${off}` : ''),
+    params: built.params,
+    limit: size,
+    offset: off,
+  };
 }

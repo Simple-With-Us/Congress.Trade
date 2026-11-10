@@ -1,12 +1,24 @@
 name: iOS TestFlight ship (Mac runner)
 
-# Archive + upload on the owned Mac runner so TestFlight (the phone) actually
-# updates when iOS code lands on main. Unsigned compile stays in ios-build.yml.
+# Archive + upload on GitHub-hosted macos-latest so TestFlight (the phone)
+# actually updates when iOS code lands on main. Unsigned compile stays in
+# ios-build.yml. Fork PRs never run here.
 #
-# XCODE BUILDS ONLY (owner 2026-08-12): this workflow may target mac-runner
-# labels. Backend jobs stay off this host. Fork PRs never run here.
+# AUTO-SHIP CONTRACT (owner 2026-10-17): a merge to main that touches
+# clients/ios/** (the `push:` paths filter below) uploads a fresh TestFlight
+# build with no human step and publishes What to Test (IOS_TF_RELEASE_NOTES=1).
+# `workflow_dispatch` is the manual path.  scripts/ios-ship-workflow.test.mjs
+# pins these pieces in CI.  The rate gate and the same-HEAD skip are the ship
+# script's defaults: never set IOS_TF_MIN_INTERVAL_SEC or --force-ship in this
+# file (a one-off override belongs on a dispatch input for that run only).
 #
-# Signing material from Infisical prod; identity on GitHub only.
+# RUNNER: macos-latest on purpose, not the owned Mac.  The owned Mac runner is a
+# macOS 27 beta and App Store review rejects binaries built there as
+# INVALID_BINARY even when TestFlight accepts them (see ios-appstore-gm.yml).
+#
+# Signing material from Infisical prod; identity on GitHub only.  ASC key and
+# issuer come from Fleet Secrets prod /asc, certificates from the Congress.Trade
+# project.
 #
 # WHY THERE IS A `schedule:` TRIGGER (2026-08-13)
 # ----------------------------------------------
@@ -39,6 +51,10 @@ name: iOS TestFlight ship (Mac runner)
 # A scheduled tick with no last-ship file now skips.  Real ships are a push
 # that passed paths: or an explicit workflow_dispatch.  To force one run,
 # dispatch the workflow or run the wrapper locally with --force-ship.
+# For the same reason the ship script's rate gate and same-HEAD skip have no
+# state to read on this runner: every push that passes paths: ships once, and
+# the cron is a no-op until last-ship state is seeded (ios-appstore-gm.yml seeds
+# it from its previous successful run).
 
 on:
   push:
@@ -65,6 +81,11 @@ jobs:
     if: github.event.repository.fork == false
     runs-on: macos-latest
     timeout-minutes: 90
+    # The one planned build of this release, computed once by the plan-build
+    # step below and handed to the ship step as --build. A single-platform
+    # release plans the same way: one plan, every ship job takes it.
+    outputs:
+      build: ${{ steps.plan-build.outputs.build }}
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -87,7 +108,8 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ios-fleet/scheduled-ship-gate.sh" \
             --event "${{ github.event_name }}" \
-            --path-prefix 'clients/ios/' \
+            --path-prefix 'clients/ios/**' \
+            --path-prefix '.github/workflows/ios-ship.yml' \
             --repo-root "$GITHUB_WORKSPACE" \
             congress
 
@@ -174,7 +196,7 @@ jobs:
             fi
             val="$(
               INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
-                --plain --silent --telemetry=false --expand=false \
+                --plain --silent --telemetry=false --expand=true \
                 --projectId="$secret_project" --env=prod --path="$secret_path" \
                 2>/dev/null || true
             )"
@@ -189,12 +211,27 @@ jobs:
               echo "::error::Signing field $name must be single-line; correct Infisical formatting." >&2
               exit 1
             fi
+            if [[ "$val" =~ ^\$\{[^}]+\}$ ]]; then
+              echo "::error::$name is still an unresolved Infisical secret reference; check the target exists and the CI identity can read the referenced folder."
+              exit 1
+            fi
             printf '::add-mask::%s\n' "${val//'%'/'%25'}"
             printf -v "$name" '%s' "$val"
             export "$name"
             # Certificate credentials belong only to this load/import step.
             if [[ "$name" == "ASC_KEY_ID" || "$name" == "ASC_ISSUER_ID" || "$name" == "SENTRY_DSN" ]]; then
               printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
+            fi
+            # The hosted form of the ASC credential:  the key id and the issuer
+            # under the names the shell layer and the client read.  A path on
+            # disk is not an approved credential source (AFC-459), so the
+            # credential itself crosses the step boundary in the environment
+            # (as base64 below), never as a file path.
+            if [[ "$name" == "ASC_KEY_ID" ]]; then
+              printf 'APPLE_API_KEY_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
+            if [[ "$name" == "ASC_ISSUER_ID" ]]; then
+              printf 'APPLE_API_ISSUER_ID=%s\n' "$val" >> "$GITHUB_ENV"
             fi
           done
           if [ -z "${SENTRY_DSN:-}" ]; then
@@ -216,8 +253,59 @@ jobs:
           printf '%s\n' "$key_material" | bash "$GITHUB_WORKSPACE/scripts/ios-stage-asc-key.sh"
           ASC_KEY_PATH="$(sed -n 's/^ASC_KEY_PATH=//p' "$GITHUB_ENV" | tail -n 1)"
           export ASC_KEY_PATH
+
+          # The hosted form of the credential:  the key id, the issuer and the
+          # key as base64.  Base64 is one line, so the runner's environment
+          # file stays well formed and the raw PEM never enters GITHUB_ENV.
+          # The shell layer and the client both read the trio from the
+          # environment, because a path on disk is not an approved credential
+          # source (AFC-459).
+          key_b64="$(printf '%s' "$key_material" | base64 | tr -d '\n')"
+          printf '::add-mask::%s\n' "${key_b64//'%'/'%25'}"
+          printf 'APPLE_API_KEY_P8_BASE64=%s\n' "$key_b64" >> "$GITHUB_ENV"
+
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
-          unset key_material TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
+          unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
+
+      # ONE plan per release (owner 2026-10-29): the shared merge-timestamp
+      # build max(S, M + 1) is computed here, once, and handed to the ship
+      # step below as --build. The ship script's own fixed-mode plan is the
+      # same code path (the same node command with the same merge stamp), for
+      # operators running locally without --build. The paired lookup mirrors
+      # the ship script (pairedBundleId, then the macBundleId alias), so the
+      # one plan covers the same inventory. Runs only when the gate
+      # says ship, so a gated tick plans nothing. Credentials are the ASC
+      # trio the previous step loaded into the environment; they are never
+      # echoed (only the planned build number is printed, which is not
+      # secret).
+      - name: Plan the shared merge-timestamp build (once per release)
+        id: plan-build
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=America/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD)"
+          if [[ ! "$stamp" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::merge stamp is not a 12-digit YYYYMMDDHHMM: ${stamp}"
+            exit 1
+          fi
+          registry="$GITHUB_WORKSPACE/scripts/ios-fleet/apps.json"
+          bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"]["bundleId"])' "$registry")"
+          paired="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["apps"]["congress"]; print(e.get("pairedBundleId") or e.get("macBundleId") or "")' "$registry")"
+          feed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"].get("pairedBuildFeed") or "")' "$registry")"
+          if [ -n "$feed" ]; then
+            echo "::error::congress has a pairedBuildFeed floor that this plan step does not fetch; extend it before shipping."
+            exit 1
+          fi
+          args=(plan-release-build "$bundle")
+          if [ -n "$paired" ]; then args+=("$paired"); fi
+          args+=(--merge-stamp "$stamp")
+          build="$(node "$GITHUB_WORKSPACE/scripts/ios-fleet/asc-api.mjs" "${args[@]}")"
+          if [[ ! "$build" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::planned build is not a 12-digit YYYYMMDDHHMM: ${build}"
+            exit 1
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "planned build ${build} for merge stamp ${stamp}"
 
       - name: Report runtime ios-fleet drift (advisory)
         if: steps.gate.outputs.should_ship == '1'
@@ -249,4 +337,58 @@ jobs:
           # Wrapper resolves the in-repo fleet script (scripts/ios-fleet/) and
           # enforces the stable-Xcode rule; it falls back to the host copy only
           # if the repo copy is missing, and logs loudly when it does.
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh"
+          #
+          # CT-2434: keep the log.  The external beta promotion below has to
+          # name the build THIS run uploaded -- "the newest build" is the
+          # previous ship for the first minutes after an upload, and the
+          # vendored client is explicit that a newest-build fallback is the
+          # defect it removed (scripts/ios-fleet/asc-api.mjs, ensure-tf-ready).
+          # The --build below is the release's one planned build from the
+          # plan-build step above: every ship of this release uploads it.
+          set -o pipefail
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --build "${{ steps.plan-build.outputs.build }}" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
+
+      # Name the build this run uploaded, for the external promotion below.
+      # The fleet script resolves the version before it uploads and logs it as
+      # "marketing=1.1.2 build=<12-digit>";  the extractor reads that, and
+      # falls back to the checkout's commit count -- the number a next-patch
+      # ship starts from.
+      - name: Name the build this ship uploaded
+        id: buildnum
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          build_num="$(bash "$GITHUB_WORKSPACE/scripts/ios-ship-build-number.sh" \
+            "$RUNNER_TEMP/congress-ship.log" "$GITHUB_WORKSPACE")"
+          echo "build_num=${build_num}" >> "$GITHUB_OUTPUT"
+          marketing="$(grep -o 'marketing=[0-9][0-9.]* build=' "$RUNNER_TEMP/congress-ship.log" | tail -1 | sed 's/^marketing=//; s/ build=$//' || true)"
+          echo "marketing=${marketing}" >> "$GITHUB_OUTPUT"
+          echo "shipped build number: ${build_num}"
+
+      # CT-2434:  the external TestFlight group (Public Beta, public link) is
+      # what a tester outside the team actually reaches, and it only ever sees
+      # a build someone assigns to it.  It was created 2026-08-31 and never
+      # refreshed, so it served one Aug-2026 build that expired 2026-11-29
+      # while the internal group tracked every ship.  BotFleet and Clutch
+      # promote on every ship;  this repo did not, and that is the gap.
+      #
+      # --build names the build this ship uploaded.  It is not optional
+      # politeness:  picking "the newest build" instead would promote the
+      # PREVIOUS ship for the first minutes after an upload, which is the
+      # same defect the vendored ASC client documents and removed.
+      #
+      # continue-on-error, always:  a promotion problem is a warning on a ship
+      # that already succeeded, never a red run that blocks the next deploy.
+      - name: Refresh the public TestFlight beta
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        run: |
+          # The node client never reads a key file (AFC-459):  the credential
+          # reaches it in the environment, which is where the hosted trio
+          # (APPLE_API_KEY_ID, APPLE_API_ISSUER_ID, APPLE_API_KEY_P8_BASE64)
+          # crossed this step boundary.  The key is never an argument of any
+          # command.
+          node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs" \
+            --build "${{ steps.buildnum.outputs.build_num }}" \
+            ${{ steps.buildnum.outputs.marketing && format('--marketing "{0}"', steps.buildnum.outputs.marketing) || '' }}
+

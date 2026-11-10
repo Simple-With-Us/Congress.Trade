@@ -26,6 +26,8 @@ describe('browserSecurityHeaders', () => {
     expect(csp).toContain("script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com");
     expect(csp).toContain("style-src 'self' 'unsafe-inline'");
     expect(csp).toContain("object-src 'none'");
+    // worker-src is locked down to 'none' when Sentry is not enabled.
+    expect(csp).toContain("worker-src 'none'");
     expect(csp).not.toContain('*');
   });
 
@@ -60,6 +62,11 @@ describe('browserSecurityHeaders', () => {
     });
     expect(on).toContain('https://browser.sentry-cdn.com');
     expect(on).toContain('https://o1.ingest.us.sentry.io');
+    // Sentry Replay creates a blob: worker; allow it when the Sentry script
+    // is enabled. Without this, every page load logs a CSP violation and the
+    // replay worker silently fails to start.
+    expect(on).toContain("worker-src 'self' blob:");
+    expect(off).toContain("worker-src 'none'");
     expect(on).not.toContain('*');
   });
 
