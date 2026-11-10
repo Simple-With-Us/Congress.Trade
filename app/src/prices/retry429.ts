@@ -39,19 +39,45 @@ function waitMs(res: Response, attempt: number, random: () => number): number {
 /**
  * Sleep for `ms`, unless `signal` fires first — then reject with
  * `signal.reason`.  Without a signal this is exactly the injected sleep.
- * The listener is removed when the sleep wins the race, so an abort that
- * lands after the wait settled never touches it.
+ *
+ * With the built-in default sleep (`cancelable`), the wait runs on an
+ * internal timer that the abort clears:  racing a plain `setTimeout` sleep
+ * would settle the caller on abort but leave the losing timer (up to
+ * MAX_WAIT_MS) dangling, keeping the caller's isolate/process alive for a
+ * wait nobody is waiting on anymore.  The abort listener is removed when
+ * the timer fires, so an abort that lands after the wait settled never
+ * touches it.
+ *
+ * An injected sleep (test doubles) cannot be cancelled from here, so it is
+ * raced against the signal instead — the caller still settles promptly on
+ * abort, and the double's own timer is the double's business.
  */
 async function sleepWithAbort(
   ms: number,
   signal: AbortSignal | undefined,
   sleep: (ms: number) => Promise<void>,
+  cancelable: boolean,
 ): Promise<void> {
   if (!signal) {
     await sleep(ms);
     return;
   }
   signal.throwIfAborted();
+  if (cancelable) {
+    await new Promise<void>((resolve, reject) => {
+      let onAbort: () => void = () => {};
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      onAbort = () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    return;
+  }
   let onAbort: () => void = () => {};
   const aborted = new Promise<never>((_resolve, reject) => {
     onAbort = () => reject(signal.reason);
@@ -81,7 +107,7 @@ export async function with429Retries(
   const random = opts.random ?? Math.random;
   let res = await call();
   for (let attempt = 0; attempt < RETRY_WAITS_MS.length && res.status === 429; attempt++) {
-    await sleepWithAbort(waitMs(res, attempt, random), opts.signal, sleep);
+    await sleepWithAbort(waitMs(res, attempt, random), opts.signal, sleep, opts.sleep === undefined);
     res = await call();
   }
   return res;
