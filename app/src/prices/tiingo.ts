@@ -53,12 +53,14 @@ export function buildTiingoPriceClient(
     // A 429 that still persists after the retries throws below.
     // The caller's signal rides every attempt:  an abort cancels the
     // in-flight fetch instead of leaving it running detached past the
-    // caller's deadline, and a retry fired after the abort rejects with the
-    // abort reason immediately rather than spending another request.
+    // caller's deadline, a retry fired after the abort rejects with the
+    // abort reason immediately rather than spending another request, and
+    // the backoff wait between attempts is bound to the signal too, so an
+    // abort landing mid-wait settles the call at once.
     const res = await with429Retries(() => trackedFetch(url, {
       headers: { 'user-agent': 'congress.trade/0.1 (+https://congress.trade)', accept: 'application/json' },
       signal,
-    }, { service: 'market-prices', operation: 'fetch-price-history' }, fetchImpl), retry);
+    }, { service: 'market-prices', operation: 'fetch-price-history' }, fetchImpl), { ...retry, signal });
     if (!res.ok) {
       if (res.status === 404) return []; // symbol not found → genuinely no data (safe to negative-cache)
       // Auth/rate/server errors (401/403/429/5xx) fail identically for every

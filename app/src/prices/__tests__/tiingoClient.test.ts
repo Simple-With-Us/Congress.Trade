@@ -72,6 +72,32 @@ describe('buildTiingoPriceClient — caller cancellation', () => {
     expect(seen).toEqual([controller.signal, controller.signal]);
   });
 
+  it('an abort during the 429 backoff wait rejects promptly with the abort reason', async () => {
+    const calls = { n: 0 };
+    let enteredWait: () => void = () => {};
+    const waitEntered = new Promise<void>((resolve) => { enteredWait = resolve; });
+    const fetchImpl = (async () => {
+      calls.n += 1;
+      return new Response('', { status: 429 });
+    }) as unknown as typeof fetch;
+    const client = buildTiingoPriceClient('k', fetchImpl, {
+      // Stand-in for the multi-second backoff wait:  long enough that only
+      // the abort can settle the call promptly.
+      sleep: async () => {
+        enteredWait();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      },
+      random: () => 0.5,
+    });
+    const controller = new AbortController();
+    const reason = new Error('lane deadline');
+    const pending = client.eodHistory('AAPL', '2024-01-01', '2024-01-05', controller.signal);
+    await waitEntered; // first attempt 429'd; the backoff wait is in progress
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(calls.n).toBe(1); // no retry attempt was spent after the abort
+  });
+
   it('an abort mid-flight rejects the call with the abort reason instead of hanging detached', async () => {
     // A fetch double with real fetch semantics: it settles only when the
     // signal fires, rejecting with the signal's reason.  If the client
