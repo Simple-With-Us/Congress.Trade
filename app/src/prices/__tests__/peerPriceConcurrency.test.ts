@@ -61,13 +61,31 @@ vi.mock('../peer', async (importOriginal) => {
   return {
     ...actual,
     buildPeerPriceClient: () => ({
-      eodHistory: async (symbol: string, from?: string, to?: string) => {
+      eodHistory: async (symbol: string, from?: string, to?: string, signal?: AbortSignal) => {
         h.inFlight++;
         h.maxInFlight = Math.max(h.maxInFlight, h.inFlight);
         h.eodCalls.push({ symbol, from: from ?? '', to: to ?? '', startedAt: Date.now() });
         try {
           const d = h.delaysMs.get(symbol) ?? 0;
-          if (d > 0) await new Promise((r) => setTimeout(r, d));
+          if (d > 0) {
+            // Honor the per-call signal the way the real peer client does:
+            // a fetch in flight when the signal fires rejects with its
+            // reason instead of running to its full delay.
+            await new Promise<void>((resolve, reject) => {
+              const t = setTimeout(resolve, d);
+              if (signal) {
+                if (signal.aborted) {
+                  clearTimeout(t);
+                  reject(signal.reason);
+                  return;
+                }
+                signal.addEventListener('abort', () => {
+                  clearTimeout(t);
+                  reject(signal.reason);
+                }, { once: true });
+              }
+            });
+          }
           const err = h.errors.get(symbol);
           if (err) throw new Error(err);
           return h.responses.get(symbol) ?? [];
@@ -336,6 +354,48 @@ describe('runPriceRefresh — bounded-concurrency fetch stage (CT-2445)', () => 
     expect(res.fmpCalls).toBe(5);
     expect(res.budgetRemaining).toBe(0);
     for (const t of tickers) expect(eodCount(t)).toBeGreaterThan(0);
+  });
+
+  it('a fetch hanging until the lane signal fires settles the run — cancelled, not errored, no zombie', async () => {
+    // The pre-fix failure:  the peer client never received the lane signal,
+    // so a hanging Socratic.Trade response held its worker forever;  the
+    // lane deadline aborted around it and the run's promise never settled.
+    // Here the (mock) client honors the per-call signal exactly like the
+    // real one now does, and the walk must settle promptly on abort with
+    // the hanging ticker recorded as neither priced nor errored.
+    seedTrade('z1', 'HANG', '2026-03-02');
+    seedTrade('z2', 'AFTER', '2026-03-03');
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, enriched_at)
+       VALUES ('HANG', '2020-01-01', '2020-01-01T00:00:00Z')`,
+    ).run();
+    h.delaysMs.set('HANG', 60_000); // effectively a hang; only the abort ends it
+    h.responses.set('HANG', freshCloses());
+    h.responses.set('AFTER', freshCloses());
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('lane deadline')), 100);
+
+    const started = Date.now();
+    const res = await runPriceRefresh(env, {
+      max: 20,
+      concurrency: 1,
+      maxPerMinute: 100_000,
+      signal: controller.signal,
+    });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(10_000); // settled on the abort, not the 60s hang
+    expect(res.aborted).toBe(true);
+    expect(res.tickersPriced).toBe(0);
+    // Cancellation is not a per-ticker failure:  no error entry, no marker,
+    // no checked-at stamp for the ticker that was in flight.
+    expect(res.errors).toEqual([]);
+    const row = srRow('HANG');
+    expect(row?.price_checked_at ?? null).toBeNull();
+    expect(row?.price_unavailable_reason ?? null).toBeNull();
+    expect(eodCount('HANG')).toBe(0);
+    // The ticker behind the hanging one was never attempted.
+    expect(h.eodCalls.some((c) => c.symbol === 'AFTER')).toBe(false);
   });
 
   it('fetches the scoped missing window under concurrency', async () => {
