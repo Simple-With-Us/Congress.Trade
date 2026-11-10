@@ -33,6 +33,7 @@ export function buildFallbackPriceClient(
   async function tryPrimaryThenSecondary(
     runPrimary: () => Promise<Close[]>,
     runSecondary: () => Promise<Close[]>,
+    signal?: AbortSignal,
   ): Promise<Close[]> {
     try {
       const closes = await runPrimary();
@@ -40,9 +41,19 @@ export function buildFallbackPriceClient(
         return closes;
       }
     } catch (e) {
+      // The caller's own cancellation is not a primary failure:  rethrow its
+      // reason untouched instead of swallowing it and falling through.
+      // throwIfAborted throws signal.reason when the signal has fired and is
+      // a no-op otherwise, so genuine primary failures continue below.
+      signal?.throwIfAborted();
       const message = e instanceof Error ? e.message : String(e ?? '');
       if (opts.rethrowFatal && FATAL_PRIMARY_ERROR.test(message)) throw e;
     }
+    // Never invoke the secondary on a dead signal:  the call cannot succeed,
+    // and a secondary that ignores the signal would run detached past the
+    // caller's deadline.  An abort that landed while the primary was
+    // resolving (empty series, no rejection) surfaces here the same way.
+    signal?.throwIfAborted();
     return runSecondary();
   }
 
@@ -51,11 +62,13 @@ export function buildFallbackPriceClient(
       tryPrimaryThenSecondary(
         () => primary.eodHistory(symbol, from, to, signal),
         () => secondary.eodHistory(symbol, from, to, signal),
+        signal,
       ),
     spxHistory: (from, to, signal) =>
       tryPrimaryThenSecondary(
         () => primary.spxHistory(from, to, signal),
         () => secondary.spxHistory(from, to, signal),
+        signal,
       ),
   };
 }

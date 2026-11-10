@@ -39,7 +39,7 @@ export function buildTiingoPriceClient(
   fetchImpl: typeof fetch = fetch,
   retry: Retry429Options = {},
 ): PriceClient {
-  async function hist(symbol: string, from: string, to: string): Promise<Close[]> {
+  async function hist(symbol: string, from: string, to: string, signal?: AbortSignal): Promise<Close[]> {
     const url =
       BASE +
       encodeURIComponent(symbol) +
@@ -51,8 +51,13 @@ export function buildTiingoPriceClient(
       encodeURIComponent(apiKey);
     // 429s (per-minute limit) are retried with backoff first — see ./retry429.ts.
     // A 429 that still persists after the retries throws below.
+    // The caller's signal rides every attempt:  an abort cancels the
+    // in-flight fetch instead of leaving it running detached past the
+    // caller's deadline, and a retry fired after the abort rejects with the
+    // abort reason immediately rather than spending another request.
     const res = await with429Retries(() => trackedFetch(url, {
       headers: { 'user-agent': 'congress.trade/0.1 (+https://congress.trade)', accept: 'application/json' },
+      signal,
     }, { service: 'market-prices', operation: 'fetch-price-history' }, fetchImpl), retry);
     if (!res.ok) {
       if (res.status === 404) return []; // symbol not found → genuinely no data (safe to negative-cache)
@@ -64,7 +69,7 @@ export function buildTiingoPriceClient(
     return parseTiingoPrices(await res.json());
   }
   return {
-    eodHistory: (symbol, from, to) => hist(symbol, from, to),
-    spxHistory: (from, to) => hist('SPY', from, to),
+    eodHistory: (symbol, from, to, signal) => hist(symbol, from, to, signal),
+    spxHistory: (from, to, signal) => hist('SPY', from, to, signal),
   };
 }
