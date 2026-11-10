@@ -213,3 +213,126 @@ describe('upsertAppleSubscription owner assignment', () => {
     expect((await getAppleSubscription(env, 'otxn-1'))?.userId).toBe('user-a');
   });
 });
+
+
+describe('clientRedeemWouldResurrectRevoked — lapsed ledger rows', () => {
+  it('blocks replaying the original JWS after the row expired (same transaction)', () => {
+    expect(
+      clientRedeemWouldResurrectRevoked(
+        revokedRow({ status: 'expired', revokedAt: null, revocationReason: null }),
+        { transactionId: 'txn-refund', purchaseDateMs: Date.parse('2026-01-01T00:00:00.000Z') },
+      ),
+    ).toBe(true);
+  });
+
+  it('lets a genuine resubscribe through an expired row (new txn purchased after expiry)', () => {
+    expect(
+      clientRedeemWouldResurrectRevoked(
+        revokedRow({ status: 'expired', revokedAt: null }),
+        { transactionId: 'txn-resub', purchaseDateMs: Date.parse('2026-02-02T00:00:00.000Z') },
+      ),
+    ).toBe(false);
+  });
+
+  it('blocks a "resubscribe" dated before the recorded expiry', () => {
+    expect(
+      clientRedeemWouldResurrectRevoked(
+        revokedRow({ status: 'expired', revokedAt: null }),
+        { transactionId: 'txn-resub', purchaseDateMs: Date.parse('2026-01-20T00:00:00.000Z') },
+      ),
+    ).toBe(true);
+  });
+
+  it('blocks a stale replay against a billing_retry row', () => {
+    expect(
+      clientRedeemWouldResurrectRevoked(
+        revokedRow({ status: 'billing_retry', revokedAt: null, revocationReason: null }),
+        { transactionId: 'txn-refund', purchaseDateMs: Date.parse('2026-01-01T00:00:00.000Z') },
+      ),
+    ).toBe(true);
+  });
+
+  it('revoked rows anchor on revokedAt even when expiresDate is later', () => {
+    expect(
+      clientRedeemWouldResurrectRevoked(
+        revokedRow({ expiresDate: '2026-03-01T00:00:00.000Z' }),
+        { transactionId: 'txn-resub', purchaseDateMs: Date.parse('2026-02-15T00:00:00.000Z') },
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('upsertAppleSubscription redeemGuard (atomic resurrect guard)', () => {
+  const revokedInput = () => ({
+    ...baseInput({ userId: 'user-a' }),
+    status: 'revoked' as const,
+    latestTransactionId: 'txn-refund',
+    purchaseDate: '2026-01-01T00:00:00.000Z',
+    expiresDate: '2026-02-01T00:00:00.000Z',
+    revokedAt: '2026-01-15T00:00:00.000Z',
+  });
+
+  it('refuses to resurrect a revoked row, atomically', async () => {
+    const { env } = await fakeEnv();
+    await upsertAppleSubscription(env, revokedInput());
+    const replay = await upsertAppleSubscription(env, {
+      ...baseInput({ userId: 'user-a' }),
+      latestTransactionId: 'txn-refund',
+      purchaseDate: '2026-01-01T00:00:00.000Z',
+      redeemGuard: true,
+    });
+    expect(replay.ok).toBe(false);
+    if (replay.ok) return;
+    expect(replay.reason).toBe('guarded_status');
+    expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe('revoked');
+  });
+
+  it('allows a genuine resubscribe through the atomic guard', async () => {
+    const { env } = await fakeEnv();
+    await upsertAppleSubscription(env, revokedInput());
+    const resub = await upsertAppleSubscription(env, {
+      ...baseInput({ userId: 'user-a' }),
+      latestTransactionId: 'txn-resub',
+      purchaseDate: '2026-02-20T00:00:00.000Z',
+      expiresDate: '2026-03-20T00:00:00.000Z',
+      redeemGuard: true,
+    });
+    expect(resub.ok).toBe(true);
+    expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe('active');
+  });
+
+  it('expired rows stay expired when the original JWS is replayed atomically', async () => {
+    const { env } = await fakeEnv();
+    await upsertAppleSubscription(env, {
+      ...baseInput({ userId: 'user-a' }),
+      status: 'expired',
+      latestTransactionId: 'txn-lapse',
+      purchaseDate: '2026-01-01T00:00:00.000Z',
+      expiresDate: '2026-02-01T00:00:00.000Z',
+    });
+    const replay = await upsertAppleSubscription(env, {
+      ...baseInput({ userId: 'user-a' }),
+      latestTransactionId: 'txn-lapse',
+      purchaseDate: '2026-01-01T00:00:00.000Z',
+      redeemGuard: true,
+    });
+    expect(replay.ok).toBe(false);
+    if (replay.ok) return;
+    expect(replay.reason).toBe('guarded_status');
+    expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe('expired');
+  });
+
+  it('webhook-style upserts (no redeemGuard) still update guarded rows', async () => {
+    const { env } = await fakeEnv();
+    await upsertAppleSubscription(env, revokedInput());
+    const renewed = await upsertAppleSubscription(env, {
+      ...baseInput({ userId: 'user-a' }),
+      latestTransactionId: 'txn-renew',
+      purchaseDate: '2026-02-20T00:00:00.000Z',
+      expiresDate: '2026-03-20T00:00:00.000Z',
+      revokedAt: null,
+    });
+    expect(renewed.ok).toBe(true);
+    expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe('active');
+  });
+});
