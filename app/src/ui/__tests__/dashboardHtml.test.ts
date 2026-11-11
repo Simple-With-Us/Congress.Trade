@@ -6851,6 +6851,30 @@ describe('owner health banner: not covered by ST (CT-2443, executed)', () => {
     expect(banner.style.display).toBe('block');
   });
 
+  it('shows No longer trading with the reason when st_peer_prices has terminal > 0', () => {
+    const banner = renderBanner({
+      checks: [
+        {
+          id: 'st_peer_prices',
+          status: 'ok',
+          detail: 'ST price refresh moving (no pending tickers); 2 no longer trading (SGEN no_longer_trading)',
+          value: {
+            pending: 0,
+            terminal: 2,
+            terminalSample: [
+              { ticker: 'SGEN', reason: 'no_longer_trading', since: '2026-11-09', lastTrade: '2023-12-13' },
+              { ticker: 'SPLK', reason: 'no_longer_trading', since: '2026-11-09', lastTrade: '2024-03-15' },
+            ],
+          },
+        },
+      ],
+    });
+    expect(banner.innerHTML).toContain('No longer trading: 2');
+    expect(banner.innerHTML).toContain('SGEN no_longer_trading');
+    expect(banner.innerHTML).toContain('SPLK no_longer_trading');
+    expect(banner.style.display).toBe('block');
+  });
+
   it('shows no not-covered row when the count is 0 or absent', () => {
     const zero = renderBanner({
       checks: [{ id: 'st_peer_prices', status: 'ok', detail: 'ok', value: { pending: 0, notCovered: 0 } }],

@@ -74,22 +74,27 @@ export const PRICE_STALE_LISTING_DAYS = 14;
  *                          or stuck-while-pending sweep, CT-2443); excluded from
  *                          every pending predicate UNCONDITIONALLY (no TTL) and
  *                          retried only by the daily not-covered re-check.
+ *   5 (TERMINAL)         — confirmed no longer trading (last trade far in the
+ *                          past, or that plus a repeat not-found). Excluded from
+ *                          pending and the stall clock. Visible as its own count.
+ *                          CT-2466. `acquired` is a stored reason only; this file
+ *                          does not infer an acquisition.
  */
-// Exported (FIRST + NOT_COVERED) so the other pending predicates
-// (admin/routes.ts's marketPending, export/priceNeeds.ts, prices/
-// peerPricePending.ts) can mirror this file's CASE without re-deriving the
-// magic numbers in a second file.
+// Exported so the other pending predicates (admin/routes.ts marketPending,
+// export/priceNeeds.ts, prices/peerPricePending.ts) and the terminal sweep
+// share these integers instead of re-deriving them.
 export const PRICE_UNAVAILABLE_NOT_FOUND_FIRST = 1;
-const PRICE_UNAVAILABLE_NOT_FOUND_AGAIN = 2;
+export const PRICE_UNAVAILABLE_NOT_FOUND_AGAIN = 2;
 const PRICE_UNAVAILABLE_STALLED = 3;
 export const PRICE_UNAVAILABLE_NOT_COVERED = 4;
+export const PRICE_UNAVAILABLE_TERMINAL = 5;
 
 /**
- * Shared `AND ...` clause excluding stage-4 (not covered by ST) tickers from
- * a pending predicate. Every pending predicate (selectTickersNeedingPrices,
- * the st_peer_prices SQL, marketPending, the price-needs export) uses this so
- * the exclusion cannot drift between the four copies. Unconditional — no TTL,
- * no binds.
+ * Shared `AND ...` clause excluding stage-4 (not covered by ST) and stage-5
+ * (terminal, no longer trading) tickers from a pending predicate. Every
+ * pending predicate (selectTickersNeedingPrices, the st_peer_prices SQL,
+ * marketPending, the price-needs export) uses this so the exclusion cannot
+ * drift between the four copies. Unconditional — no TTL, no binds.
  */
 const PRICE_NOT_COVERED_SQL_ALIASES: ReadonlySet<string> = new Set(['sr']);
 
@@ -98,7 +103,7 @@ export function priceNotCoveredExclusionSql(srAlias = 'sr'): string {
   if (!PRICE_NOT_COVERED_SQL_ALIASES.has(srAlias)) {
     throw new Error(`priceNotCoveredExclusionSql: unsupported SQL alias ${JSON.stringify(srAlias)}`);
   }
-  return `COALESCE(${srAlias}.price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`;
+  return `COALESCE(${srAlias}.price_unavailable, 0) NOT IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})`;
 }
 
 /**
@@ -160,6 +165,70 @@ export const NOT_COVERED_CAUSE_LAST_ERRORED = 'last ST fetch errored';
 /** `st_not_covered since <ISO date>: <cause>` — the since-date is kept when the daily re-check restamps. */
 export function notCoveredReason(now: Date, cause: string): string {
   return `st_not_covered since ${now.toISOString().slice(0, 10)}: ${cause}`;
+}
+
+/**
+ * Last trade this many days before the last completed session is no longer a
+ * halt or a one-session lag. Weekends and the 14-day stalled-listing cache
+ * stay below this bar.
+ */
+export const TERMINAL_LAST_TRADE_DAYS = 90;
+
+export const TERMINAL_PEER_PRICE_REASONS = ['delisted', 'acquired', 'no_longer_trading'] as const;
+export type TerminalPeerPriceReason = (typeof TERMINAL_PEER_PRICE_REASONS)[number];
+
+/** YYYY-MM-DD. A last trade strictly before this date is terminal. */
+export function terminalLastTradeCutoff(now = new Date()): string {
+  const fresh = lastTradingDay(now);
+  const day = new Date(`${fresh}T00:00:00Z`);
+  day.setUTCDate(day.getUTCDate() - TERMINAL_LAST_TRADE_DAYS);
+  return day.toISOString().slice(0, 10);
+}
+
+/** True when `latestPriceDate` is far enough before the last completed session. */
+export function isConfirmedNoLongerTradingDate(
+  latestPriceDate: string | null | undefined,
+  now = new Date(),
+): boolean {
+  if (!latestPriceDate || latestPriceDate.length < 10) return false;
+  return latestPriceDate.slice(0, 10) < terminalLastTradeCutoff(now);
+}
+
+/**
+ * Repeat empty history (stage 2) plus an ancient last trade is `delisted`.
+ * The date alone, including a fetch whose newest close is ancient, is
+ * `no_longer_trading`. `acquired` is not chosen here.
+ */
+export function terminalReasonForListing(stage: number): TerminalPeerPriceReason {
+  if (stage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) return 'delisted';
+  return 'no_longer_trading';
+}
+
+/** `terminal since <ISO date>: <reason> (last trade <ISO date>)`. The since-date stays on re-check. */
+export function formatTerminalReason(now: Date, reason: TerminalPeerPriceReason, lastTradeDate: string): string {
+  return `terminal since ${now.toISOString().slice(0, 10)}: ${reason} (last trade ${lastTradeDate.slice(0, 10)})`;
+}
+
+const TERMINAL_REASON_PATTERN =
+  /^terminal since (\d{4}-\d{2}-\d{2}): (delisted|acquired|no_longer_trading)(?: \(last trade (\d{4}-\d{2}-\d{2})\))?/;
+
+export function parseTerminalReason(reason: string | null | undefined): {
+  since: string;
+  reason: TerminalPeerPriceReason;
+  lastTrade: string | null;
+} | null {
+  if (!reason) return null;
+  const match = TERMINAL_REASON_PATTERN.exec(reason);
+  if (!match) return null;
+  const kind = match[2];
+  switch (kind) {
+    case 'delisted':
+    case 'acquired':
+    case 'no_longer_trading':
+      return { since: match[1], reason: kind, lastTrade: match[3] ?? null };
+    default:
+      return null;
+  }
 }
 
 /** Provider / import confirmed no EOD history for this symbol. */
@@ -311,6 +380,22 @@ export function isFatalPriceProviderError(e: unknown, _fmpBudgeted: boolean): bo
   const message = e instanceof Error ? e.message : String(e ?? '');
   if (FATAL_PRICE_PROVIDER_ERROR.test(message)) return true;
   return RATE_LIMIT_PROVIDER_ERROR.test(message);
+}
+
+/**
+ * True when a rejection IS the caller's own cancellation:  the promise
+ * rejected with the lane signal's reason object itself.  That identity is
+ * reliable end to end — fetch rejects with the signal's reason, and the
+ * peer client rethrows a caller's abort reason untouched.  A provider
+ * failure that merely RACES the abort (a fatal 401/402/403/429 or a
+ * per-request timeout settling just before the deadline fires) rejects
+ * with its own error while `signal.aborted` is also true, so classifying
+ * on the aborted flag alone would swallow it:  no error entry, no fatal
+ * handling, an outage misreported as a quiet cancellation.  Identity
+ * against `signal.reason` is the test, never the flag alone.
+ */
+export function isCallerAbortRejection(error: unknown, signal?: AbortSignal): boolean {
+  return signal !== undefined && error === signal.reason;
 }
 
 type PeerStaleSignal = { closes: Close[] };
@@ -595,6 +680,8 @@ export interface TickerEodFetchPlan {
   prevStage: number;
   /** securities_ref.price_unavailable_reason before this fetch (when present). */
   prevReason: string | null;
+  /** securities_ref.latest_price_date before this fetch (null when no row). */
+  latestPriceDate: string | null;
   /**
    * The window start before any `maxLookbackDays` clamp.  When it is earlier
    * than `from`, the clamped window does NOT cover what the ticker's trades
@@ -639,9 +726,10 @@ export async function planTickerEodFetch(
     `SELECT MIN(date) AS mn, MAX(date) AS mx FROM price_eod WHERE ticker = ?`,
     [ticker],
   );
-  const refMeta = await get<{ pu: number | null; pr: string | null }>(
+  const refMeta = await get<{ pu: number | null; pr: string | null; ld: string | null }>(
     env.DB,
-    `SELECT price_unavailable AS pu, price_unavailable_reason AS pr FROM securities_ref WHERE ticker = ?`,
+    `SELECT price_unavailable AS pu, price_unavailable_reason AS pr, latest_price_date AS ld
+       FROM securities_ref WHERE ticker = ?`,
     [ticker],
   );
   let oldestTrade: string | null = null;
@@ -672,13 +760,14 @@ export async function planTickerEodFetch(
     to: today(),
     prevStage: Number(refMeta?.pu ?? 0),
     prevReason: refMeta?.pr ?? null,
+    latestPriceDate: refMeta?.ld ?? null,
   };
 }
 
 export interface TickerEodWriteOpts {
   /** price_unavailable stage to stamp (0 clears; 4 also stamps `reason`). */
   stage: number;
-  /** Only written when stage is NOT_COVERED; stages 0/3 clear the reason. */
+  /** Written for NOT_COVERED and TERMINAL; stages 0/3 clear the reason. */
   reason?: string | null;
 }
 
@@ -725,7 +814,7 @@ export async function writeTickerEodHistory(
        price_unavailable=excluded.price_unavailable,
        price_checked_at=excluded.price_checked_at,
        price_unavailable_reason=CASE
-         WHEN excluded.price_unavailable = ${PRICE_UNAVAILABLE_NOT_COVERED} THEN excluded.price_unavailable_reason
+         WHEN excluded.price_unavailable IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL}) THEN excluded.price_unavailable_reason
          WHEN excluded.price_unavailable IN (0, ${PRICE_UNAVAILABLE_STALLED}) THEN NULL
          ELSE securities_ref.price_unavailable_reason END,
        market_cap = CASE
@@ -870,7 +959,7 @@ export async function runPriceRefresh(
     // real quota and must not be under-reported.
     calls++;
     budget--;
-    spx = await client.spxHistory(spxFrom, today());
+    spx = await client.spxHistory(spxFrom, today(), opts.signal);
     if (spx.length && !dryRun) {
       for (let i = 0; i < spx.length; i += 100) {
         await batchPrepared(
@@ -888,14 +977,23 @@ export async function runPriceRefresh(
       result.shareSpx = spx;
     }
   } catch (e) {
-    result.errors.push('spx: ' + (e as Error).message);
-    // Auth/plan/rate-limit failure: every subsequent call this run (SPX or any
-    // ticker) would fail the same way, so abort rather than walking the rest of
-    // the ticker list.  Remaining tickers are left untouched for the next run —
-    // no negative-cache writes, no partial state.  Peer EOD treats 429 as fatal
-    // (see RATE_LIMIT_PROVIDER_ERROR) so a rate-limited Socratic.Trade cannot
-    // burn thousands of identical retries in one refresh.
-    if (isFatalPriceProviderError(e, fmpBudgeted)) result.aborted = true;
+    // Caller cancellation (lane deadline) is not a provider failure:  record
+    // the abort without an error entry, and let the aborted flag below skip
+    // the ticker walk entirely.  Only the caller's own abort reason counts
+    // as a cancellation — a provider failure that raced the abort still
+    // records its error entry and gets fatal handling below.
+    if (isCallerAbortRejection(e, opts.signal)) {
+      result.aborted = true;
+    } else {
+      result.errors.push('spx: ' + (e as Error).message);
+      // Auth/plan/rate-limit failure: every subsequent call this run (SPX or any
+      // ticker) would fail the same way, so abort rather than walking the rest of
+      // the ticker list.  Remaining tickers are left untouched for the next run —
+      // no negative-cache writes, no partial state.  Peer EOD treats 429 as fatal
+      // (see RATE_LIMIT_PROVIDER_ERROR) so a rate-limited Socratic.Trade cannot
+      // burn thousands of identical retries in one refresh.
+      if (isFatalPriceProviderError(e, fmpBudgeted)) result.aborted = true;
+    }
   }
 
   // 2) Per-ticker EOD history + per-trade performance anchors. Skipped
@@ -949,6 +1047,7 @@ export async function runPriceRefresh(
   type TickerFetchOutcome =
     | { kind: 'noplan'; nowIso: string }
     | { kind: 'throw'; error: unknown }
+    | { kind: 'aborted'; nowIso: string }
     | { kind: 'fetched'; plan: TickerEodFetchPlan; nowIso: string; hist: Close[] }
     | { kind: 'error'; plan: TickerEodFetchPlan; nowIso: string; error: unknown };
   const outcomes = page.map(() => {
@@ -980,9 +1079,21 @@ export async function runPriceRefresh(
       // Count the attempt regardless of outcome (see the SPX comment above).
       calls++;
       budget--;
-      const hist = await client.eodHistory(ticker, plan.from, plan.to);
+      // Thread the lane signal into the request itself:  the peer client
+      // composes it with its per-request deadline, so a lane abort (or the
+      // deadline) cancels this fetch in-flight.  Without it, a hanging peer
+      // response held the worker — and with it this whole run's settlement —
+      // past the lane deadline, and the abort changed nothing on the wire.
+      const hist = await client.eodHistory(ticker, plan.from, plan.to, opts.signal);
       return { kind: 'fetched', plan, nowIso, hist };
     } catch (error) {
+      // A rejection caused by the caller's own abort is a cancellation, not
+      // a per-ticker failure:  the processor stops the walk on it without an
+      // error entry or an error marker for the ticker.  Only the abort
+      // reason itself classifies as a cancellation — a fatal provider error
+      // that settled just before the abort fired is an 'error' outcome, so
+      // it still records its entry and gets fatal handling.
+      if (isCallerAbortRejection(error, opts.signal)) return { kind: 'aborted', nowIso };
       return { kind: 'error', plan, nowIso, error };
     }
   }
@@ -1041,9 +1152,18 @@ export async function runPriceRefresh(
       pendingThrow = { error: outcome.error };
       break;
     }
+    if (outcome.kind === 'aborted') {
+      // The lane signal fired while this fetch was in flight and the fetch
+      // was actually cancelled (see fetchTicker).  The ticker was never
+      // attempted to completion:  restore the resume point so the next run
+      // starts here, and stop without recording an error for it.
+      result.lastCursorSeq = resumeBefore;
+      result.aborted = true;
+      break;
+    }
     let stopWalk = false;
     if (outcome.kind !== 'noplan') {
-      const { trades, prevStage, prevReason } = outcome.plan;
+      const { trades, prevStage, prevReason, latestPriceDate } = outcome.plan;
       const nowIso = outcome.nowIso;
       let hist: Close[] = [];
       let skipTicker = false;
@@ -1070,7 +1190,7 @@ export async function runPriceRefresh(
                ON CONFLICT(ticker) DO UPDATE SET
                  price_checked_at = excluded.price_checked_at,
                  price_unavailable_reason = excluded.price_unavailable_reason
-               WHERE COALESCE(securities_ref.price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}`,
+               WHERE COALESCE(securities_ref.price_unavailable, 0) NOT IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})`,
                 [ticker, nowIso, peerStaleHitReason(resolution.hits)],
               );
             }
@@ -1082,7 +1202,7 @@ export async function runPriceRefresh(
               await run(
                 env.DB,
                 `UPDATE securities_ref SET price_unavailable_reason = ?
-                WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}
+                WHERE ticker = ? AND COALESCE(price_unavailable, 0) NOT IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})
                   AND price_unavailable_reason IS NOT ?`,
                 [marker, ticker, marker],
               );
@@ -1111,7 +1231,7 @@ export async function runPriceRefresh(
               await run(
                 env.DB,
                 `UPDATE securities_ref SET price_unavailable_reason = ?
-            WHERE ticker = ? AND COALESCE(price_unavailable, 0) <> ${PRICE_UNAVAILABLE_NOT_COVERED}
+            WHERE ticker = ? AND COALESCE(price_unavailable, 0) NOT IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})
               AND price_unavailable_reason IS NOT ?`,
                 [marker, ticker, marker],
               );
@@ -1141,12 +1261,26 @@ export async function runPriceRefresh(
           // CT-2443 rule (a): a repeat miss on a ticker ALREADY at stage 2 (i.e.
           // the 30-day re-check that ended in another miss) terminates at stage 4
           // (not covered by ST) instead of cycling 2 → 2 forever.
+          // CT-2466: that same repeat miss on a ticker whose last trade is
+          // already far in the past is terminal (`delisted`), not a coverage gap.
           if (!dryRun) {
-            if (prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) {
+            const checked = new Date(nowIso);
+            if (
+              prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN &&
+              latestPriceDate != null &&
+              isConfirmedNoLongerTradingDate(latestPriceDate, checked)
+            ) {
               await markTickerPriceUnavailable(
                 env,
                 ticker,
-                notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_EMPTY),
+                formatTerminalReason(checked, 'delisted', latestPriceDate),
+                { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_TERMINAL },
+              );
+            } else if (prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN) {
+              await markTickerPriceUnavailable(
+                env,
+                ticker,
+                notCoveredReason(checked, NOT_COVERED_CAUSE_REPEAT_EMPTY),
                 { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
               );
             } else {
@@ -1159,20 +1293,29 @@ export async function runPriceRefresh(
           result.tickersPriced++;
           if (!dryRun) {
             // If the newest available close is weeks stale, the series has stopped
-            // (delisted/halted) even though the fetch wasn't empty — negative-cache it
+            // (halted) even though the fetch wasn't empty — negative-cache it
             // (TTL-bounded) so it isn't re-selected + re-fetched daily forever;
             // otherwise clear any prior negative-cache. CT-2443 rule (a): a stale
             // result on a ticker ALREADY at stage 3 terminates at stage 4 (not
             // covered by ST) instead of cycling 3 → 3 forever.
+            // CT-2466: a newest close older than TERMINAL_LAST_TRADE_DAYS is
+            // terminal immediately (`no_longer_trading`), not a 30-day stage-3
+            // cache that re-enters the stall clock.
             const latest = hist[0];
-            const priceStalled = isStaleListingDate(latest.date);
-            let stage = priceStalled ? PRICE_UNAVAILABLE_STALLED : 0;
+            const checked = new Date(nowIso);
+            const tradingStopped = isConfirmedNoLongerTradingDate(latest.date, checked);
+            const priceStalled = !tradingStopped && isStaleListingDate(latest.date, checked);
+            let stage = tradingStopped
+              ? PRICE_UNAVAILABLE_TERMINAL
+              : priceStalled
+                ? PRICE_UNAVAILABLE_STALLED
+                : 0;
             let reason: string | null = null;
-            if (priceStalled) {
-              if (prevStage === PRICE_UNAVAILABLE_STALLED) {
-                stage = PRICE_UNAVAILABLE_NOT_COVERED;
-                reason = notCoveredReason(new Date(nowIso), NOT_COVERED_CAUSE_REPEAT_STALLED);
-              }
+            if (tradingStopped) {
+              reason = formatTerminalReason(checked, terminalReasonForListing(prevStage), latest.date);
+            } else if (priceStalled && prevStage === PRICE_UNAVAILABLE_STALLED) {
+              stage = PRICE_UNAVAILABLE_NOT_COVERED;
+              reason = notCoveredReason(checked, NOT_COVERED_CAUSE_REPEAT_STALLED);
             }
             await writeTickerEodHistory(env, ticker, hist, nowIso, { stage, reason });
             result.sharePrices.push({ ticker, closes: hist, currentPrice: latest.close, currentPriceDate: latest.date });

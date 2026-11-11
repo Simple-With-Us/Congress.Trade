@@ -32,6 +32,7 @@ const h = vi.hoisted(() => ({
   responses: new Map<string, Array<{ date: string; close: number }>>(),
   errors: new Map<string, string>(),
   delaysMs: new Map<string, number>(),
+  rejectWithOnAbort: new Map<string, string>(),
   inFlight: 0,
   maxInFlight: 0,
   paceCalls: 0,
@@ -58,16 +59,39 @@ vi.mock('../../secrets/infisical', async (importOriginal) => ({
 
 vi.mock('../peer', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../peer.ts')>();
+  // A delay that honors the per-call signal the way the real peer client
+  // does:  a fetch in flight when the signal fires rejects immediately
+  // instead of running to its full delay.  The rejection is the signal's
+  // reason — or, for symbols in rejectWithOnAbort, that provider error
+  // instead:  a provider response that settled at the same moment the
+  // deadline fired, whose rejection is the provider's own even though the
+  // signal is aborted by the time the caller classifies it.
+  const waitWithSignal = (symbol: string, ms: number, signal?: AbortSignal) =>
+    new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, ms);
+      if (signal) {
+        const onAbort = () => {
+          clearTimeout(t);
+          const raced = h.rejectWithOnAbort.get(symbol);
+          reject(raced ? new Error(raced) : signal.reason);
+        };
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
   return {
     ...actual,
     buildPeerPriceClient: () => ({
-      eodHistory: async (symbol: string, from?: string, to?: string) => {
+      eodHistory: async (symbol: string, from?: string, to?: string, signal?: AbortSignal) => {
         h.inFlight++;
         h.maxInFlight = Math.max(h.maxInFlight, h.inFlight);
         h.eodCalls.push({ symbol, from: from ?? '', to: to ?? '', startedAt: Date.now() });
         try {
           const d = h.delaysMs.get(symbol) ?? 0;
-          if (d > 0) await new Promise((r) => setTimeout(r, d));
+          if (d > 0) await waitWithSignal(symbol, d, signal);
           const err = h.errors.get(symbol);
           if (err) throw new Error(err);
           return h.responses.get(symbol) ?? [];
@@ -75,8 +99,10 @@ vi.mock('../peer', async (importOriginal) => {
           h.inFlight--;
         }
       },
-      spxHistory: async (from?: string, to?: string) => {
+      spxHistory: async (from?: string, to?: string, signal?: AbortSignal) => {
         h.eodCalls.push({ symbol: 'SPY', from: from ?? '', to: to ?? '', startedAt: Date.now() });
+        const d = h.delaysMs.get('SPY') ?? 0;
+        if (d > 0) await waitWithSignal('SPY', d, signal);
         const err = h.errors.get('SPY');
         if (err) throw new Error(err);
         return h.responses.get('SPY') ?? [];
@@ -99,6 +125,7 @@ beforeEach(async () => {
   h.responses.clear();
   h.errors.clear();
   h.delaysMs.clear();
+  h.rejectWithOnAbort.clear();
   h.inFlight = 0;
   h.maxInFlight = 0;
   h.paceCalls = 0;
@@ -338,6 +365,48 @@ describe('runPriceRefresh — bounded-concurrency fetch stage (CT-2445)', () => 
     for (const t of tickers) expect(eodCount(t)).toBeGreaterThan(0);
   });
 
+  it('a fetch hanging until the lane signal fires settles the run — cancelled, not errored, no zombie', async () => {
+    // The pre-fix failure:  the peer client never received the lane signal,
+    // so a hanging Socratic.Trade response held its worker forever;  the
+    // lane deadline aborted around it and the run's promise never settled.
+    // Here the (mock) client honors the per-call signal exactly like the
+    // real one now does, and the walk must settle promptly on abort with
+    // the hanging ticker recorded as neither priced nor errored.
+    seedTrade('z1', 'HANG', '2026-03-02');
+    seedTrade('z2', 'AFTER', '2026-03-03');
+    db.prepare(
+      `INSERT INTO securities_ref (ticker, latest_price_date, enriched_at)
+       VALUES ('HANG', '2020-01-01', '2020-01-01T00:00:00Z')`,
+    ).run();
+    h.delaysMs.set('HANG', 60_000); // effectively a hang; only the abort ends it
+    h.responses.set('HANG', freshCloses());
+    h.responses.set('AFTER', freshCloses());
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('lane deadline')), 100);
+
+    const started = Date.now();
+    const res = await runPriceRefresh(env, {
+      max: 20,
+      concurrency: 1,
+      maxPerMinute: 100_000,
+      signal: controller.signal,
+    });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(10_000); // settled on the abort, not the 60s hang
+    expect(res.aborted).toBe(true);
+    expect(res.tickersPriced).toBe(0);
+    // Cancellation is not a per-ticker failure:  no error entry, no marker,
+    // no checked-at stamp for the ticker that was in flight.
+    expect(res.errors).toEqual([]);
+    const row = srRow('HANG');
+    expect(row?.price_checked_at ?? null).toBeNull();
+    expect(row?.price_unavailable_reason ?? null).toBeNull();
+    expect(eodCount('HANG')).toBe(0);
+    // The ticker behind the hanging one was never attempted.
+    expect(h.eodCalls.some((c) => c.symbol === 'AFTER')).toBe(false);
+  });
+
   it('fetches the scoped missing window under concurrency', async () => {
     // Covered cache:  narrow 7-day incremental off the cached max.
     seedTrade('w1', 'WARM', '2026-06-10');
@@ -357,5 +426,71 @@ describe('runPriceRefresh — bounded-concurrency fetch stage (CT-2445)', () => 
     expect(res.tickersPriced).toBe(2);
     expect(h.eodCalls.find((c) => c.symbol === 'WARM')?.from).toBe('2026-06-24');
     expect(h.eodCalls.find((c) => c.symbol === 'COLD')?.from).toBe('2021-02-22');
+  });
+
+  it('a fatal provider error that races the abort still records its error entry — not swallowed as a cancellation', async () => {
+    // The provider's 429 settled at the same moment the lane deadline
+    // fired:  the fetch rejects with the provider error while the signal
+    // is aborted.  Classifying on signal.aborted alone (the pre-fix test)
+    // called that a cancellation — no error entry, no fatal handling — so
+    // a rate-limit outage read as a quiet abort.  Identity against the
+    // signal's reason is the classifier:  this rejection is not the
+    // reason, so it lands as a run-fatal error outcome.
+    seedTrade('r1', 'RACE', '2026-03-02');
+    h.delaysMs.set('RACE', 60_000); // in flight until the abort ends it
+    h.rejectWithOnAbort.set('RACE', 'PEER_HTTP_429');
+    h.responses.set('RACE', freshCloses());
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('lane deadline')), 100);
+
+    const res = await runPriceRefresh(env, {
+      max: 20,
+      concurrency: 1,
+      maxPerMinute: 100_000,
+      signal: controller.signal,
+    });
+
+    // Fatal handling still stops the run and restores the resume point…
+    expect(res.aborted).toBe(true);
+    expect(res.lastCursorSeq).toBeNull();
+    expect(res.tickersPriced).toBe(0);
+    expect(eodCount('RACE')).toBe(0);
+    // …but the failure is on the record, not hidden behind the abort.
+    expect(res.errors).toEqual(['RACE: PEER_HTTP_429']);
+  });
+
+  it('an SPX provider failure on an already-aborted signal still records the error', async () => {
+    // Same race at the SPX step:  the signal fired first, then the SPX
+    // fetch rejected with a fatal provider error.  The error entry and the
+    // fatal classification must survive; only the caller's own abort
+    // reason may take the silent-cancellation path.
+    h.errors.set('SPY', 'PEER_HTTP_429');
+    const controller = new AbortController();
+    controller.abort(new Error('lane deadline'));
+
+    const res = await runPriceRefresh(env, { max: 20, signal: controller.signal });
+
+    expect(res.aborted).toBe(true);
+    expect(res.errors).toEqual(['spx: PEER_HTTP_429']);
+    expect(res.tickersPriced).toBe(0);
+  });
+
+  it('an SPX fetch cancelled by the lane signal records no error entry', async () => {
+    // The mirror image:  the SPX fetch hangs, the lane signal fires, and
+    // the fetch rejects with the signal's reason itself.  That IS the
+    // caller's cancellation — the run aborts with errors empty.
+    h.delaysMs.set('SPY', 60_000);
+    h.responses.set('SPY', freshCloses());
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error('lane deadline')), 100);
+
+    const started = Date.now();
+    const res = await runPriceRefresh(env, { max: 20, signal: controller.signal });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(10_000); // settled on the abort, not the 60s hang
+    expect(res.aborted).toBe(true);
+    expect(res.errors).toEqual([]);
+    expect(res.spxUpdated).toBe(false);
   });
 });
