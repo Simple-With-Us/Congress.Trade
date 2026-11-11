@@ -822,6 +822,17 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).toContain('via browser-direct');
   });
 
+  it('drops an unknown senate transport instead of reflecting it in health detail', () => {
+    const signals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) => (
+        p.source === 'senate' ? { ...p, transport: 'future-untrusted-transport' } : p
+      )),
+    };
+    const res = evaluatePipelineSignals(signals as unknown as Parameters<typeof evaluatePipelineSignals>[0], nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).not.toContain('future-untrusted-transport');
+  });
+
   it('omits the senate fetcher check when the signal was not collected', () => {
     expect(evaluatePipelineSignals(base, nowMs).checks.find((c) => c.id === 'senate_fetcher')).toBeUndefined();
   });

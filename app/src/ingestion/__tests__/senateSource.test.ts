@@ -1286,6 +1286,17 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       expect(browserTransport.close).not.toHaveBeenCalled();
     });
 
+    it.each(['AbortError', 'TimeoutError'])('preserves %s from the browser fallback', async (name) => {
+      const abort = new DOMException('browser cancelled', name);
+      browserTransport.failLaunch = abort;
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchImpl = http((url, proxied) => (
+        proxied && url.endsWith('/search/home/') ? akamaiDenied() : undefined
+      ));
+      await expect(fetchSenatePtrFilings({ ...search, proxyUrl: PROXY, browserFallback: true }, fetchImpl))
+        .rejects.toBe(abort);
+    });
+
     it('honors SENATE_EFD_BROWSER_FALLBACK from the environment', async () => {
       stubBrowserSuccess();
       vi.stubEnv('SENATE_EFD_BROWSER_FALLBACK', 'true');

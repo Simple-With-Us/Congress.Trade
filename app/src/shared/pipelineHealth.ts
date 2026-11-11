@@ -1005,7 +1005,10 @@ export function evaluatePipelineSignals(
         && !(Number.isFinite(attemptMs) && Number.isFinite(deniedMs) && attemptMs > deniedMs + 60_000)
         && nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS;
       if (successAgeH <= maxAgeH) {
-        const via = src === 'senate' && st.transport ? ` via ${st.transport}` : '';
+        const transport = src === 'senate' && st.transport
+          ? parseSenateEfdTransportNote(`transport=${st.transport}`)
+          : null;
+        const via = transport ? ` via ${transport}` : '';
         checks.push({
           id,
           status: 'ok',

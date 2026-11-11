@@ -1105,6 +1105,12 @@ export async function fetchSenatePtrFilings(
       );
       return filings;
     } catch (browserErr) {
+      // Cancellation must retain its own classification, never become an
+      // earlier edge-deny/proxy failure that triggers backoff.
+      if (opts.signal?.aborted
+        || (browserErr instanceof Error && (browserErr.name === 'AbortError' || browserErr.name === 'TimeoutError'))) {
+        throw browserErr;
+      }
       // Keep the original failure class (edge-deny backoff, proxy outage) and
       // say the browser did not recover it.
       console.warn(
