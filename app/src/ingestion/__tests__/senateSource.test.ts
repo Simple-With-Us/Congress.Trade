@@ -5,7 +5,30 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // proxied calls the way the real wrapper does: an extra `client` on init.
 // getDenoHttpClient gives a client for every proxy URL except NO_CLIENT_PROXY,
 // which stands for a proxy whose client cannot be created.
-const { NO_CLIENT_PROXY } = vi.hoisted(() => ({ NO_CLIENT_PROXY: 'http://no-client.test:8888' }));
+const { NO_CLIENT_PROXY, browserTransport } = vi.hoisted(() => ({
+  NO_CLIENT_PROXY: 'http://no-client.test:8888',
+  browserTransport: {
+    launches: [] as Array<{ proxyUrl?: string }>,
+    fetchImpl: null as null | typeof fetch,
+    close: vi.fn(async () => {}),
+    failLaunch: null as null | Error,
+  },
+}));
+vi.mock('../senateBrowserFetch.ts', () => ({
+  createSenateBrowserFetch: async (opts: { proxyUrl?: string }) => {
+    browserTransport.launches.push({ proxyUrl: opts.proxyUrl });
+    if (browserTransport.failLaunch) throw browserTransport.failLaunch;
+    const impl = browserTransport.fetchImpl;
+    return {
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (!impl) throw new Error('browser fetch not stubbed');
+        return impl(input, init);
+      }) as typeof fetch,
+      close: () => browserTransport.close(),
+    };
+  },
+}));
+
 vi.mock('../../shared/proxyFetch.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../shared/proxyFetch.ts')>();
   return {
@@ -30,6 +53,10 @@ import {
   fetchSenatePtrFilings,
   establishSenateSession,
   looksLikeSenateAgreementWall,
+  formatSenateEfdTransportNote,
+  parseSenateEfdTransportNote,
+  readSenateEfdTransport,
+  senateBrowserFallbackRoute,
   SENATE_SESSION_KV_KEY,
 } from '../senateSource.ts';
 import {
@@ -1105,6 +1132,193 @@ describe('Senate eFD edge deny (CT-2442)', () => {
         '/search/report/data/', '/search/', '/search/home/', '/search/report/data/',
       ]);
       expect(warn.mock.calls.some(([msg]) => /cached session invalid \(HTTP 403 text\/html, server=gunicorn\)/.test(String(msg)))).toBe(true);
+    });
+  });
+
+  describe('browser fallback (CT-2465)', () => {
+    const PROXY = 'http://proxy.test:8888';
+    const search = {
+      now: new Date('2026-10-23T16:00:00.000Z'),
+      since: new Date('2026-10-16T16:00:00.000Z'),
+      politeDelayMs: 0,
+      maxPages: 1,
+    };
+
+    beforeEach(() => {
+      browserTransport.launches.length = 0;
+      browserTransport.fetchImpl = null;
+      browserTransport.failLaunch = null;
+      browserTransport.close.mockClear();
+    });
+
+    function http(route: (url: string, proxied: boolean) => Response | undefined): typeof fetch {
+      return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const url = String(input);
+        const proxied = Boolean((init as { client?: unknown } | undefined)?.client);
+        const routed = route(url, proxied);
+        if (routed) return routed;
+        if (url.endsWith('/search/')) {
+          return new Response(LANDING_HTML, { headers: { 'set-cookie': 'csrftoken=csrf-cookie; Path=/' } });
+        }
+        if (url.endsWith('/search/home/')) {
+          return new Response('', { status: 302, headers: { 'set-cookie': 'sessionid=sess; Path=/' } });
+        }
+        if (url.endsWith('/search/report/data/')) {
+          return new Response(JSON.stringify({
+            data: [[
+              'Jane',
+              'Smith',
+              '<a href="/search/view/ptr/edge-1/">Smith, Jane</a>',
+              'Periodic Transaction Report',
+              '10/23/2026',
+            ]],
+            recordsFiltered: 1,
+          }), { headers: { 'content-type': 'application/json' } });
+        }
+        throw new Error(`unexpected ${url}`);
+      }) as typeof fetch;
+    }
+
+    function stubBrowserSuccess(): void {
+      browserTransport.fetchImpl = http(() => undefined);
+    }
+
+    function refuseProxy(): never {
+      throw new TypeError('connect ECONNREFUSED');
+    }
+
+    it('leaves HTTP egress unchanged when the fallback flag is off', async () => {
+      const fetchImpl = http((url, proxied) => {
+        if (proxied) refuseProxy();
+        if (url.endsWith('/search/')) return akamaiDenied();
+        return undefined;
+      });
+      const err = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY }, fetchImpl).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SenateProxyEgressError);
+      expect(browserTransport.launches).toEqual([]);
+    });
+
+    it('browses direct after a proxy timeout and an Akamai deny on the direct path', async () => {
+      stubBrowserSuccess();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const proxied = Boolean((init as { client?: unknown } | undefined)?.client);
+        if (proxied) {
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (!signal) return;
+            if (signal.aborted) reject(signal.reason);
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          });
+        }
+        if (String(input).endsWith('/search/')) return akamaiDenied();
+        return http(() => undefined)(input, init);
+      }) as typeof fetch;
+
+      const out = await fetchSenatePtrFilings({
+        ...search,
+        proxyUrl: PROXY,
+        browserFallback: true,
+        proxyFirstAnswerTimeoutMs: 20,
+      }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(browserTransport.launches).toEqual([{ proxyUrl: undefined }]);
+      expect(readSenateEfdTransport(out)).toEqual({ transport: 'browser-direct', fallback: true });
+      expect(browserTransport.close).toHaveBeenCalled();
+    });
+
+    it('browses through the proxy when the proxy itself returns an Akamai deny', async () => {
+      stubBrowserSuccess();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchImpl = http((url, proxied) => (
+        proxied && url.endsWith('/search/home/') ? akamaiDenied() : undefined
+      ));
+
+      const out = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY, browserFallback: true }, fetchImpl);
+
+      expect(browserTransport.launches).toEqual([{ proxyUrl: PROXY }]);
+      expect(readSenateEfdTransport(out)).toEqual({ transport: 'browser-proxy', fallback: true });
+    });
+
+    it('does not browse when direct HTTP recovers an unreachable proxy', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchImpl = http((_url, proxied) => (proxied ? refuseProxy() : undefined));
+      const out = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY, browserFallback: true }, fetchImpl);
+      expect(readSenateEfdTransport(out)).toEqual({ transport: 'http-direct', fallback: true });
+      expect(browserTransport.launches).toEqual([]);
+    });
+
+    it('records http-proxy when the proxy answers', async () => {
+      const out = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY, browserFallback: true }, http(() => undefined));
+      expect(readSenateEfdTransport(out)).toEqual({ transport: 'http-proxy', fallback: false });
+      expect(browserTransport.launches).toEqual([]);
+    });
+
+    it('uses the browser as the only transport when SENATE_EFD_BROWSER_FETCH is set', async () => {
+      stubBrowserSuccess();
+      const calls: string[] = [];
+      const fetchImpl = (async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        throw new Error('http should not run');
+      }) as typeof fetch;
+      vi.stubEnv('SENATE_EFD_BROWSER_FETCH', 'true');
+      try {
+        const out = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY }, fetchImpl);
+        expect(calls).toEqual([]);
+        expect(browserTransport.launches).toEqual([{ proxyUrl: PROXY }]);
+        expect(readSenateEfdTransport(out)?.transport).toBe('browser-proxy');
+        expect(readSenateEfdTransport(out)?.fallback).toBe(false);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('keeps the original edge deny when the browser cannot launch', async () => {
+      browserTransport.failLaunch = new Error('playwright missing');
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchImpl = http((url, proxied) => (
+        proxied && url.endsWith('/search/home/') ? akamaiDenied() : undefined
+      ));
+      const err = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY, browserFallback: true }, fetchImpl)
+        .catch((e: unknown) => e);
+      expect(isSenateEdgeDeniedError(err)).toBe(true);
+      expect(browserTransport.close).not.toHaveBeenCalled();
+    });
+
+    it.each(['AbortError', 'TimeoutError'])('preserves %s from the browser fallback', async (name) => {
+      const abort = new DOMException('browser cancelled', name);
+      browserTransport.failLaunch = abort;
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const fetchImpl = http((url, proxied) => (
+        proxied && url.endsWith('/search/home/') ? akamaiDenied() : undefined
+      ));
+      await expect(fetchSenatePtrFilings({ ...search, proxyUrl: PROXY, browserFallback: true }, fetchImpl))
+        .rejects.toBe(abort);
+    });
+
+    it('honors SENATE_EFD_BROWSER_FALLBACK from the environment', async () => {
+      stubBrowserSuccess();
+      vi.stubEnv('SENATE_EFD_BROWSER_FALLBACK', 'true');
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const fetchImpl = http((_url, proxied) => (proxied ? refuseProxy() : akamaiDenied()));
+        const out = await fetchSenatePtrFilings({ ...search, proxyUrl: PROXY }, fetchImpl);
+        expect(readSenateEfdTransport(out)).toEqual({ transport: 'browser-direct', fallback: true });
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('sends a direct-only Akamai deny to a direct browser and ignores other failures', () => {
+      const denied = new SenateHttpError('GET /search/', 403, 'AkamaiGHost', { body: AKAMAI_ACCESS_DENIED });
+      expect(senateBrowserFallbackRoute(denied, undefined)).toEqual({ proxyUrl: undefined });
+      expect(senateBrowserFallbackRoute(new Error('parse'), PROXY)).toBeNull();
+      expect(senateBrowserFallbackRoute(new SenateProxyEgressError('down', 'denied'), PROXY)).toEqual({ proxyUrl: undefined });
+      const note = formatSenateEfdTransportNote({ transport: 'browser-direct', fallback: true });
+      expect(note).toBe('transport=browser-direct fallback');
+      expect(parseSenateEfdTransportNote(note)).toBe('browser-direct');
+      expect(parseSenateEfdTransportNote('transport=nope')).toBeNull();
     });
   });
 

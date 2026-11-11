@@ -7,6 +7,7 @@ import {
   DEFAULT_PIPELINE_THRESHOLDS,
 } from '../pipelineHealth.ts';
 import { DEFAULT_PROBE_SCHEDULE_CONFIG } from '../../ingestion/probeSchedule.ts';
+import { evaluateSenateFetcherHealth } from '../../ingestion/senateIntakeStatus.ts';
 
 describe('evaluatePipelineSignals', () => {
   const nowMs = 1754092800000; // Fixed clock for testing
@@ -809,6 +810,74 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('DOWN');
     expect(check.detail).toContain('scout.jays.services');
     expect(res.checks.find((c) => c.id === 'polling_senate')!.status).toBe('ok');
+  });
+
+  it('names the transport on the latest successful senate poll', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      pollSources: base.pollSources!.map((p) => (
+        p.source === 'senate' ? { ...p, transport: 'browser-direct' } : p
+      )),
+    }, nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).toContain('via browser-direct');
+  });
+
+  it('drops an unknown senate transport instead of reflecting it in health detail', () => {
+    const signals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) => (
+        p.source === 'senate' ? { ...p, transport: 'future-untrusted-transport' } : p
+      )),
+    };
+    const res = evaluatePipelineSignals(signals as unknown as Parameters<typeof evaluatePipelineSignals>[0], nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).not.toContain('future-untrusted-transport');
+  });
+
+  it('omits the senate fetcher check when the signal was not collected', () => {
+    expect(evaluatePipelineSignals(base, nowMs).checks.find((c) => c.id === 'senate_fetcher')).toBeUndefined();
+  });
+
+  it('warns on /api/health when the fetcher has not reported a run inside the window', () => {
+    const at = new Date('2026-11-09T18:00:00.000Z');
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateFetcher: evaluateSenateFetcherHealth(null, at),
+    }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('has not reported a run');
+    expect(check.detail).toContain('senate-fetcher:last-run');
+    expect(res.status).not.toBe('ok');
+  });
+
+  it('stays quiet overnight when the fetcher has not reported a run', () => {
+    const at = new Date('2026-11-09T09:00:00.000Z');
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateFetcher: evaluateSenateFetcherHealth(null, at),
+    }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('Quiet outside');
+  });
+
+  it('does not warn on a fresh fetcher run that found no new filings', () => {
+    const at = new Date('2026-11-09T18:00:00.000Z');
+    const health = evaluateSenateFetcherHealth({
+      ranAt: '2026-11-09T17:50:00.000Z',
+      receivedAt: '2026-11-09T17:50:00.000Z',
+      status: 'ok',
+      rows: 4,
+      newCount: 0,
+      role: 'agents',
+      ageMs: 10 * 60_000,
+      stale: false,
+    }, at);
+    const res = evaluatePipelineSignals({ ...base, senateFetcher: health }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('0 new rows');
+    expect(check.detail).toContain('not a missed run');
   });
 
   it('an unset Senate relay URL is degraded, not silent', () => {

@@ -20,6 +20,8 @@ import { readResidentialProxyProbe, SENATE_EFD_PROXY_PROBE_INTERVAL_MS } from '.
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
 import { readSenateEdgeBackoff, SENATE_EDGE_BACKOFF_GRACE_MS } from '../ingestion/senateEdgeDeny.ts';
+import { evaluateSenateFetcherHealth, readSenateFetcherRunStatus, type SenateFetcherHealth } from '../ingestion/senateIntakeStatus.ts';
+import { parseSenateEfdTransportNote } from '../ingestion/senateSource.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { latencyProvidersWithRejectedCredentials } from '../ingestion/scoutHandoff.ts';
@@ -250,6 +252,11 @@ export interface PipelineSignals {
      * "NOT RUNNING".  Absent = no backoff.
      */
     edgeBackoff?: { until: string; lastDeniedAt: string; reason: string };
+    /**
+     * Senate only: the transport named on the latest successful
+     * source_attempts row (`transport=http-proxy` and the browser variants).
+     */
+    transport?: string;
   }> | null;
   /**
    * Latency-probe liveness (same directive): newest observation per provider
@@ -317,6 +324,12 @@ export interface PipelineSignals {
      */
     edgeBackoff?: { until: string; lastDeniedAt: string; reason: string } | null;
   } | null;
+  /**
+   * Mac eFD fetcher run heartbeat (senate-fetcher:last-run, CT-2462).
+   * Absent on fixtures that predate the check.  null = uncollected.
+   * Deliveries (senate-intake:last) are not this signal.
+   */
+  senateFetcher?: SenateFetcherHealth | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
    * an indexed column — price_eod itself is 1.4M rows).  Absent = the signal builder
@@ -992,10 +1005,14 @@ export function evaluatePipelineSignals(
         && !(Number.isFinite(attemptMs) && Number.isFinite(deniedMs) && attemptMs > deniedMs + 60_000)
         && nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS;
       if (successAgeH <= maxAgeH) {
+        const transport = src === 'senate' && st.transport
+          ? parseSenateEfdTransportNote(`transport=${st.transport}`)
+          : null;
+        const via = transport ? ` via ${transport}` : '';
         checks.push({
           id,
           status: 'ok',
-          detail: `${src} polling live: last success ${successAgeH < 1 ? Math.round(successAgeH * 60) + 'm' : Math.round(successAgeH) + 'h'} ago`,
+          detail: `${src} polling live: last success ${successAgeH < 1 ? Math.round(successAgeH * 60) + 'm' : Math.round(successAgeH) + 'h'} ago${via}`,
           value: Math.round(successAgeH * 10) / 10,
         });
       } else if (backoff && backedOff) {
@@ -1300,6 +1317,45 @@ export function evaluatePipelineSignals(
         detail: `Senate eFD landing + agreement POST ok through ${probe.egress ?? 'proxy'}: probed ${ago}`,
         value: Math.round(ageMin * 10) / 10,
       });
+    }
+  }
+
+  // Mac eFD fetcher runs (CT-2462 senate-fetcher:last-run, CT-2465).  A missing
+  // run report is not silent: inside 6:00 AM–10:00 PM CT it is a warning, and
+  // overnight the check says why it is quiet.  A fresh run with zero new rows
+  // is healthy.  degraded, not stalled — the uptime target stays 200 and the
+  // loud sweep does not page a standing never-reported fetcher.
+  if (s.senateFetcher === undefined) {
+    /* fixtures that predate the fetcher-run signal omit this check */
+  } else if (s.senateFetcher == null) {
+    checks.push({ id: 'senate_fetcher', status: 'unknown', detail: 'Senate fetcher run status uncollected', value: null });
+  } else {
+    switch (s.senateFetcher.level) {
+      case 'warning':
+        checks.push({
+          id: 'senate_fetcher',
+          status: 'degraded',
+          detail: s.senateFetcher.detail,
+          value: s.senateFetcher.seen ? 1 : 0,
+        });
+        break;
+      case 'ok':
+        checks.push({
+          id: 'senate_fetcher',
+          status: 'ok',
+          detail: s.senateFetcher.detail,
+          value: s.senateFetcher.seen ? 1 : 0,
+        });
+        break;
+      default: {
+        const unrecognized: never = s.senateFetcher.level;
+        checks.push({
+          id: 'senate_fetcher',
+          status: 'unknown',
+          detail: `Senate fetcher run status unrecognized (${String(unrecognized)})`,
+          value: null,
+        });
+      }
     }
   }
 
@@ -1935,6 +1991,26 @@ export async function checkPipelineHealth(
     });
   } catch {}
 
+  if (pollSources) {
+    try {
+      const row = await get<{ error: string | null }>(
+        env.DB,
+        `SELECT error FROM source_attempts
+          WHERE source = 'senate' AND outcome = 'success'
+          ORDER BY attempted_at DESC
+          LIMIT 1`,
+      );
+      const transport = parseSenateEfdTransportNote(row?.error ?? null);
+      if (transport) {
+        pollSources = pollSources.map((source) => (
+          source.source === 'senate' ? { ...source, transport } : source
+        ));
+      }
+    } catch {
+      /* the liveness times above still stand without the transport name */
+    }
+  }
+
   let latencyProviders: PipelineSignals['latencyProviders'] = null;
   try {
     const rows = await all<{ provider: string; last_observed: string }>(
@@ -2019,6 +2095,14 @@ export async function checkPipelineHealth(
     senateEfd = null;
   }
 
+  let senateFetcher: PipelineSignals['senateFetcher'] = null;
+  try {
+    const fetcherNow = new Date(nowMs);
+    senateFetcher = evaluateSenateFetcherHealth(await readSenateFetcherRunStatus(env, fetcherNow), fetcherNow);
+  } catch {
+    senateFetcher = null;
+  }
+
   const signals: PipelineSignals = {
     outboxPending,
     outboxOldestAt,
@@ -2048,6 +2132,7 @@ export async function checkPipelineHealth(
     residentialProxyConfigured,
     residentialProxy,
     senateEfd,
+    senateFetcher,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,
