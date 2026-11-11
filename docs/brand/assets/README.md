@@ -24,11 +24,12 @@
 | `eagle-lockup-dark-ui.png` | Website dark type (white text), transparent |
 | `eagle-header-lockup-{light,dark}-240.png` | High-DPI header embeds |
 | `eagle-moneybag-icon-square.png` | Transparent eagle mark (splash / BrandLogo) |
-| `source-owner-app-icon-1024x1024.jpg` | Owner App Store / AppIcon plate (1024×1024) |
-| `source-owner-app-icon-1408x1408.jpg` | Owner app-icon master at 1408×1408 |
-| `eagle-app-icon-light-1024.png` | iOS AppIcon + derived PWA icons |
-| `eagle-app-icon-light-1408.png` | Hi-res app-icon master (pixels in name) |
-| `eagle-app-icon-light-{180,192,512}.png` | Derived install / PWA sizes |
+| `source-owner-app-icon-1024x1024.jpg` | Legacy reference only; not the installed AppIcon source |
+| `source-owner-app-icon-1408x1408.jpg` | Legacy reference only; not the installed AppIcon source |
+| `source-owner-app-icon-mockup-rounded-1408x1408.jpg` | Pre-rounded presentation mockup; reference only, never install as AppIcon |
+| `eagle-app-icon-light-1024.png` | Opaque full-bleed iOS AppIcon source |
+| `eagle-app-icon-light-1408.png` | Hi-res opaque full-bleed iOS AppIcon source |
+| `eagle-app-icon-light-{180,192,512}.png` | Plate-filled reference exports; not the transparent web/PWA icons |
 | `eagle-app-icon-1024.png` | Archived navy mockup — **do not use** |
 
 ## Installed
@@ -38,4 +39,4 @@
 - Web `app/public/{icon-192,icon-512,apple-touch-icon,favicon}.png` ← **transparent** mark (`?v=10`)
 - iOS `BrandLockup` ← light (black letters) + dark (white letters)
 - iOS `BrandLogo` ← transparent eagle mark (in-app; alpha OK)
-- iOS `AppIcon` ← **opaque** owner 1024×1024 plate only
+- iOS `AppIcon` ← **opaque** `eagle-app-icon-light-1024.png` full-bleed plate only (not the JPG references or rounded mockup)
