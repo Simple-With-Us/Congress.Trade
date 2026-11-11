@@ -107,6 +107,12 @@ function addDays(p: ChicagoParts, days: number): ChicagoParts {
   return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), hour: p.hour, minute: p.minute };
 }
 
+/** True during the fetcher's 06:00–22:00 America/Chicago window. */
+export function senateIntakeInWindow(now: Date): boolean {
+  const p = chicagoParts(now);
+  return p.hour >= FETCHER_WINDOW_START_HOUR && p.hour < FETCHER_WINDOW_END_HOUR;
+}
+
 /**
  * Window-aware staleness.  Inside the 06:00–22:00 window the plain
  * threshold applies, except that silence before today's window opened
@@ -119,7 +125,7 @@ function isStale(receivedMs: number, now: Date): boolean {
   if (!Number.isFinite(receivedMs)) return true;
   const nowMs = now.getTime();
   const p = chicagoParts(now);
-  const inWindow = p.hour >= FETCHER_WINDOW_START_HOUR && p.hour < FETCHER_WINDOW_END_HOUR;
+  const inWindow = senateIntakeInWindow(now);
   if (inWindow) {
     const openMs = chicagoWallToUtcMs(p.year, p.month, p.day, FETCHER_WINDOW_START_HOUR, 0);
     if (receivedMs >= openMs) return nowMs - receivedMs > SENATE_INTAKE_STALE_AFTER_MS;
@@ -221,4 +227,78 @@ export async function readSenateFetcherRunStatus(env: Env, now = new Date()): Pr
   const receivedMs = Date.parse(raw.receivedAt);
   const ageMs = Number.isFinite(receivedMs) ? Math.max(0, now.getTime() - receivedMs) : Infinity;
   return { ...raw, ageMs, stale: isStale(receivedMs, now) };
+}
+
+export interface SenateFetcherHealth {
+  /** warning while a run report is missing or stale inside the fetcher window. */
+  level: 'ok' | 'warning';
+  detail: string;
+  inWindow: boolean;
+  seen: boolean;
+}
+
+function fetcherAgePhrase(ageMs: number): string {
+  if (!Number.isFinite(ageMs)) return 'an unknown time ago';
+  const minutes = Math.round(ageMs / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 90) return `${minutes} minutes ago`;
+  const hours = Math.round(ageMs / 3_600_000);
+  return `${hours} hours ago`;
+}
+
+const FETCHER_WINDOW_NOTE = 'The Mac eFD fetcher runs every 15 minutes from 6:00 AM to 10:00 PM CT and posts every completed run.';
+
+/**
+ * Health wording for the fetcher RUN heartbeat (senate-fetcher:last-run).
+ * Deliveries (senate-intake:last) only exist when a run finds new rows, so
+ * a quiet day must not read as a dead fetcher.  This function never looks
+ * at the delivery record.
+ *
+ * A run that has never been reported does not get the 45-minute grace after
+ * 6:00 AM.  That grace exists so yesterday's last run is not called stale
+ * before today's first report.
+ */
+export function evaluateSenateFetcherHealth(
+  run: SenateFetcherRunState | null,
+  now = new Date(),
+): SenateFetcherHealth {
+  const inWindow = senateIntakeInWindow(now);
+  if (!run) {
+    if (inWindow) {
+      return {
+        level: 'warning',
+        inWindow,
+        seen: false,
+        detail: `Mac eFD fetcher has not reported a run.\u00A0 ${FETCHER_WINDOW_NOTE}\u00A0 No senate-fetcher:last-run record exists.`,
+      };
+    }
+    return {
+      level: 'ok',
+      inWindow,
+      seen: false,
+      detail: `Mac eFD fetcher has not reported a run.\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.`,
+    };
+  }
+  const age = fetcherAgePhrase(run.ageMs);
+  const who = run.role === 'jay' ? 'Jay standby copy' : 'agents copy';
+  if (run.stale) {
+    const detail = inWindow
+      ? `Mac eFD fetcher run heartbeat is stale (last report ${age}, ${run.status}, ${who}).\u00A0 ${FETCHER_WINDOW_NOTE}`
+      : `Mac eFD fetcher run heartbeat was already stale when the 10:00 PM CT window closed (last report ${age}, ${run.status}, ${who}).\u00A0 It stays a warning overnight.`;
+    return { level: 'warning', inWindow, seen: true, detail };
+  }
+  if (!inWindow) {
+    return {
+      level: 'ok',
+      inWindow,
+      seen: true,
+      detail: `Mac eFD fetcher last reported ${run.status} ${age} (${who}, ${run.newCount} new rows).\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.`,
+    };
+  }
+  return {
+    level: 'ok',
+    inWindow,
+    seen: true,
+    detail: `Mac eFD fetcher reported ${run.status} ${age} (${who}, ${run.newCount} new rows).\u00A0 A quiet day with no new filings is not a missed run.`,
+  };
 }

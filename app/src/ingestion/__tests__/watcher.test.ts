@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import { SenateHttpError, SenateProxyEgressError } from '../senateEdgeDeny.ts';
+import { withSenateEfdTransport } from '../senateSource.ts';
 
 const mocks = vi.hoisted(() => ({
   fetchHouseIndex: vi.fn(),
@@ -746,6 +747,19 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     const again = await runWatcher(env, at(1141 + 120));
     expect(again.senateEdgeBackoffUntil).toBe(at(1141 + 120 + 60).toISOString());
     expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 1 });
+  });
+
+  it('records the transport that succeeded on the senate source_attempts row', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockResolvedValue(withSenateEfdTransport([], {
+      transport: 'browser-direct',
+      fallback: true,
+    }));
+    const result = await runWatcher(env, T0);
+    expect(result.senate).toBe('success');
+    const receipt = dbRuns.find((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt?.params[2]).toBe('success');
+    expect(receipt?.params[4]).toBe('transport=browser-direct fallback');
   });
 
   it('keeps the backoff across a restart (the state lives in CONFIG_KV)', async () => {

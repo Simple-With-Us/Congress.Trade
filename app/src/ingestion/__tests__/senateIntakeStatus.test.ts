@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  evaluateSenateFetcherHealth,
   readSenateFetcherRunStatus,
   readSenateIntakeStatus,
   recordSenateFetcherRun,
@@ -184,5 +185,43 @@ describe('senate fetcher run heartbeat', () => {
     } as unknown as Env;
     await expect(recordSenateFetcherRun(failing, runRecord(new Date().toISOString()))).resolves.toBeUndefined();
     expect(await readSenateFetcherRunStatus(failing)).toBeNull();
+  });
+
+  it('warns when no run has been reported inside the 6am-10pm window', () => {
+    const health = evaluateSenateFetcherHealth(null, new Date('2026-11-09T18:00:00.000Z'));
+    expect(health).toMatchObject({ level: 'warning', seen: false, inWindow: true });
+    expect(health.detail).toContain('has not reported a run');
+    expect(health.detail).toContain('senate-fetcher:last-run');
+  });
+
+  it('stays quiet overnight when no run has been reported', () => {
+    const health = evaluateSenateFetcherHealth(null, new Date('2026-11-09T09:00:00.000Z'));
+    expect(health).toMatchObject({ level: 'ok', seen: false, inWindow: false });
+    expect(health.detail).toContain('Quiet outside');
+  });
+
+  it('does not warn on a fresh run with zero new rows, even when no delivery exists', async () => {
+    const { env } = memEnv();
+    const now = new Date('2026-11-09T18:00:00.000Z');
+    await recordSenateFetcherRun(env, runRecord('2026-11-09T17:50:00.000Z'));
+    const run = await readSenateFetcherRunStatus(env, now);
+    const health = evaluateSenateFetcherHealth(run, now);
+    expect(await readSenateIntakeStatus(env, now)).toBeNull();
+    expect(health.level).toBe('ok');
+    expect(health.detail).toContain('0 new rows');
+    expect(health.detail).toContain('not a missed run');
+  });
+
+  it('warns on a stale run inside the window and keeps a pre-close stale warning overnight', async () => {
+    const { env } = memEnv();
+    await recordSenateFetcherRun(env, runRecord('2026-11-09T16:00:00.000Z'));
+    const midday = await readSenateFetcherRunStatus(env, new Date('2026-11-09T18:00:00.000Z'));
+    expect(evaluateSenateFetcherHealth(midday, new Date('2026-11-09T18:00:00.000Z')).level).toBe('warning');
+
+    await recordSenateFetcherRun(env, runRecord('2026-11-05T02:00:00.000Z'));
+    const overnight = await readSenateFetcherRunStatus(env, new Date('2026-11-05T09:00:00.000Z'));
+    const health = evaluateSenateFetcherHealth(overnight, new Date('2026-11-05T09:00:00.000Z'));
+    expect(health.level).toBe('warning');
+    expect(health.detail).toContain('already stale');
   });
 });
