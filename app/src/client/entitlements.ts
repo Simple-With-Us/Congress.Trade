@@ -109,7 +109,7 @@ export async function redeemAppleEntitlementAnonymously(c: Context<{ Bindings: E
     expiresDate: transaction.expiresDate != null ? new Date(Number(transaction.expiresDate)).toISOString() : null,
     redeemGuard: true,
   });
-  if (!upserted.ok) {
+  if (upserted.ok === false) {
     if (upserted.reason === 'guarded_status') {
       return c.json({ error: 'this Apple subscription was refunded or revoked' }, 400);
     }

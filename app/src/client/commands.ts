@@ -171,9 +171,9 @@ async function redeemAppleTransactionForUser(
     latestTransactionId: transaction.transactionId ?? null,
     purchaseDate: transaction.purchaseDate != null ? new Date(Number(transaction.purchaseDate)).toISOString() : null,
     expiresDate: transaction.expiresDate != null ? new Date(Number(transaction.expiresDate)).toISOString() : null,
-     redeemGuard: true,
+    redeemGuard: true,
   });
-  if (!upserted.ok) {
+  if (upserted.ok === false) {
     if (upserted.reason === 'guarded_status') {
       throw new ClientInputError('this Apple subscription was refunded or revoked', 400);
     }
