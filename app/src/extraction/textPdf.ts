@@ -378,8 +378,31 @@ function calculateRowConfidence(row: {
   return Math.max(0.3, Math.min(0.94, confidence));
 }
 
+/**
+ * A holding that breaks across a page puts its asset name on both sides of the
+ * repeated table header: "Norwegian Cruise Line Holdings P 10/20/2026
+ * 11/09/2026 $1,001 - $15,000" ends one page and "Ltd. Ordinary Shares (NCLH)
+ * [ST]" opens the next.  Once the header is stripped that is one line with the
+ * `[TYPE]` token after the amount, so the `[TYPE] P/S/E date` tail misses the
+ * row.  One missed row made the column-order parser win the row count, and
+ * that parser shifts every Subholding Of onto the next row's asset name
+ * (H-2026-20035788, 65 rows).  Move the trailing asset text back in front of
+ * the Type/Date/Amount run so the row reads in normal tail order.
+ */
+const HOUSE_PAGE_SPLIT_ROW_RE = new RegExp(
+  String.raw`^(?<head>(?!\s*(?:P|S|E)\s)[^\[\]\n]*?\S)\s+` +
+    String.raw`(?<tail>(?:P|S|E)(?:\s*\([^)\n]*\))?\s+\d{1,2}\/\d{1,2}\/\d{2,4}\s+\d{1,2}\/\d{1,2}\/\d{2,4}\s+(?:Over\s+)?\$[\d,]+(?:\s*(?:-|–|—|to)\s*\$[\d,]+|\s*\+)?)` +
+    String.raw`\s+(?<rest>[^\[\]\n]*\[[A-Z]{2,4}\])[ \t]*$`,
+  'gm',
+);
+
+function rejoinPageSplitRows(text: string): string {
+  return text.replace(HOUSE_PAGE_SPLIT_ROW_RE, (_m, head: string, tail: string, rest: string) =>
+    `${head} ${rest.trim()}\n${tail}`);
+}
+
 function parseTailRecords(text: string): ParsedTx[] {
-  const doc = collapseHousePtrLines(stripHouseTableHeaders(cleanPdfText(text)));
+  const doc = collapseHousePtrLines(rejoinPageSplitRows(stripHouseTableHeaders(cleanPdfText(text))));
   const normalized = doc.text;
   const matches = [...normalized.matchAll(ptrTailRe())];
   if (matches.length === 0) return [];
