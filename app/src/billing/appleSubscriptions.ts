@@ -104,7 +104,10 @@ export function appleStatusGrantsAccess(status: AppleSubscriptionStatus): boolea
  * (`expired` / `billing_retry`): replaying the purchase-time JWS must not
  * resurrect a subscription Apple already considers dead — otherwise one
  * stored JWS re-grants Premium forever. A lapse is anchored at the
- * recorded `expiresDate` rather than `revokedAt`.
+ * recorded `expiresDate` rather than `revokedAt`. Legacy lapsed rows can
+ * lack either date; use their persisted last-observed timestamp in that case.
+ * A different transaction id alone is not proof of a new purchase: a historic
+ * signed transaction could also differ from the latest ledger id.
  */
 const REDEEM_GUARDED_STATUSES: ReadonlySet<AppleSubscriptionRecord['status']> = new Set([
   'revoked',
@@ -122,7 +125,11 @@ export function clientRedeemWouldResurrectRevoked(
   const purchaseMs = incoming.purchaseDateMs ?? Number.NaN;
   const anchorMs = existing.revokedAt
     ? Date.parse(existing.revokedAt)
-    : Date.parse(existing.expiresDate ?? '');
+    : Date.parse(existing.expiresDate ?? (
+      existing.status === 'expired' || existing.status === 'billing_retry'
+        ? existing.updatedAt
+        : ''
+    ));
   const isNewerPurchase =
     incomingTxn.length > 0 &&
     incomingTxn !== existingTxn &&
@@ -248,6 +255,9 @@ export async function upsertAppleSubscription(
          OR NOT (
            (apple_subscriptions.revoked_at IS NOT NULL AND excluded.purchase_date > apple_subscriptions.revoked_at)
            OR (apple_subscriptions.revoked_at IS NULL AND apple_subscriptions.expires_date IS NOT NULL AND excluded.purchase_date > apple_subscriptions.expires_date)
+           OR (apple_subscriptions.revoked_at IS NULL AND apple_subscriptions.expires_date IS NULL
+               AND apple_subscriptions.status IN ('expired', 'billing_retry')
+               AND excluded.purchase_date > apple_subscriptions.updated_at)
          )
        )
      )`

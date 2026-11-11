@@ -336,3 +336,29 @@ describe('upsertAppleSubscription redeemGuard (atomic resurrect guard)', () => {
     expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe('active');
   });
 });
+
+
+describe('legacy lapse with no expiry anchor', () => {
+  for (const status of ['expired', 'billing_retry'] as const) {
+    it(`${status}: allows a new purchase after the last observed lapse but rejects older or same-id replays`, () => {
+      const row = revokedRow({ status, revokedAt: null, expiresDate: null, updatedAt: '2026-02-01T00:00:00.000Z' });
+      expect(clientRedeemWouldResurrectRevoked(row, { transactionId: 'txn-new', purchaseDateMs: Date.parse('2026-02-02T00:00:00.000Z') })).toBe(false);
+      expect(clientRedeemWouldResurrectRevoked(row, { transactionId: 'txn-historic', purchaseDateMs: Date.parse('2026-01-20T00:00:00.000Z') })).toBe(true);
+      expect(clientRedeemWouldResurrectRevoked(row, { transactionId: row.latestTransactionId, purchaseDateMs: Date.parse('2026-02-02T00:00:00.000Z') })).toBe(true);
+    });
+
+    it(`${status}: atomic SQL matches the precheck for missing anchors`, async () => {
+      const { env, db } = await fakeEnv();
+      await upsertAppleSubscription(env, { ...baseInput({ userId: 'user-a' }), status, latestTransactionId: 'txn-lapse', expiresDate: null, revokedAt: null });
+      db.prepare('UPDATE apple_subscriptions SET updated_at = ? WHERE original_transaction_id = ?').run('2026-02-01T00:00:00.000Z', 'otxn-1');
+      for (const date of ['2026-01-20T00:00:00.000Z', '2026-02-01T00:00:00.000Z']) {
+        const replay = await upsertAppleSubscription(env, { ...baseInput({ userId: 'user-a' }), latestTransactionId: 'txn-historic', purchaseDate: date, redeemGuard: true });
+        expect(replay.ok).toBe(false);
+        expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe(status);
+      }
+      const recovery = await upsertAppleSubscription(env, { ...baseInput({ userId: 'user-a' }), latestTransactionId: 'txn-new', purchaseDate: '2026-02-02T00:00:00.000Z', redeemGuard: true });
+      expect(recovery.ok).toBe(true);
+      expect((await getAppleSubscription(env, 'otxn-1'))?.status).toBe('active');
+    });
+  }
+});
