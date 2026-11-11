@@ -209,6 +209,12 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      # Offline host-health table for box-disk-hygiene (CT-2471).
+      # Fixtures only: no Docker daemon, no host, no network.
+      - name: Box disk hygiene host-health tests
+        working-directory: .
+        run: bash scripts/ops/test-box-disk-hygiene.sh
+
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs

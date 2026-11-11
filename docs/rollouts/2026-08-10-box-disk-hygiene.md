@@ -1,5 +1,7 @@
 # 2026-08-10 — Box disk hygiene + health-recover hardening
 
+Host-health checks on this same timer are recorded in `docs/rollouts/2026-11-11-host-health-alerts.md` (CT-2471).  This note stays the record of the original prune thresholds.
+
 ## Summary
 
 Monet hit a **100% full root disk** (15MB free of 150GB) mid-deploy on the Coolify
