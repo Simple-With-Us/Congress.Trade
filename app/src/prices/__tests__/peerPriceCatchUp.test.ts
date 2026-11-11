@@ -175,6 +175,17 @@ describe('peerPriceCatchUpAfterRun', () => {
     expect(unknown.noProgressRuns).toBe(2);
   });
 
+  it('resets no-progress when tickers priced even if pending count is flat', () => {
+    const next = peerPriceCatchUpAfterRun(claimed, {
+      pendingBefore: 950,
+      pendingAfter: 950,
+      lastCursorSeq: 900,
+      reachedEndOfPending: false,
+      tickersPriced: 120,
+    });
+    expect(next.noProgressRuns).toBe(0);
+  });
+
   it('does not count a failed run with no progress toward the park', () => {
     const failed = peerPriceCatchUpAfterRun(claimed, {
       pendingBefore: 20, pendingAfter: 20, lastCursorSeq: null, reachedEndOfPending: false, failed: true,

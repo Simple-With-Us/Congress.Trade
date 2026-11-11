@@ -15,9 +15,25 @@ vi.mock('../../shared/db.ts', () => ({
 }));
 
 import { all, get } from '../../shared/db.ts';
+import { PRICE_DRAIN_LAST_PROGRESS_KEY } from '../peerPriceDrainProgress.ts';
+
+function envWithKv(store = new Map<string, string>()): Env {
+  return {
+    DB: {},
+    CONFIG_KV: {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => {
+        store.set(key, value);
+      },
+      delete: async (key: string) => {
+        store.delete(key);
+      },
+    },
+  } as Env;
+}
 
 describe('stPeerPricesHealth', () => {
-  const env = { DB: {} } as Env;
+  const env = envWithKv();
   const now = new Date('2026-10-23T15:00:00.000Z');
 
   beforeEach(() => {
@@ -27,17 +43,21 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('maps a stalled metrics payload to a stalled pipeline check', async () => {
+    const stalledEnv = envWithKv(new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-21T00:00:00.000Z'],
+    ]));
     vi.mocked(get).mockResolvedValueOnce({
       n: 1200,
       never_n: 50,
-      last_at: '2026-10-21T00:00:00.000Z',
+      oldest_at: '2026-10-01T00:00:00.000Z',
     });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
     vi.mocked(get).mockResolvedValueOnce({ n: 0 });
 
-    const metrics = await collectStPeerPricesMetrics(env, now, 6);
+    const metrics = await collectStPeerPricesMetrics(stalledEnv, now, 6);
     expect(metrics.stalled).toBe(true);
     expect(metrics.pending).toBe(1200);
+    expect(metrics.detail).toContain('no drain progress');
     expect(metrics.notCovered).toBe(0);
     expect(metrics.notCoveredSample).toEqual([]);
 
@@ -49,7 +69,7 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('reports ok when there is no pending backlog', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 0, never_n: 0, last_at: null });
+    vi.mocked(get).mockResolvedValueOnce({ n: 0, never_n: 0, oldest_at: null });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
     vi.mocked(get).mockResolvedValueOnce({ n: 0 });
 
@@ -59,7 +79,7 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('carries the not-covered count + sample in the check value and detail without degrading', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 0, never_n: 0, last_at: null });
+    vi.mocked(get).mockResolvedValueOnce({ n: 0, never_n: 0, oldest_at: null });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
     vi.mocked(get).mockResolvedValueOnce({ n: 3 });
     vi.mocked(all).mockResolvedValueOnce([
@@ -84,17 +104,20 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('appends the not-covered suffix to the stalled detail when both are present', async () => {
+    const stalledEnv = envWithKv(new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-21T00:00:00.000Z'],
+    ]));
     vi.mocked(get).mockResolvedValueOnce({
       n: 12,
       never_n: 12,
-      last_at: '2026-10-21T00:00:00.000Z',
+      oldest_at: '2026-10-01T00:00:00.000Z',
     });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
     vi.mocked(get).mockResolvedValueOnce({ n: 2 });
     vi.mocked(all).mockResolvedValueOnce([{ ticker: 'AAA' }, { ticker: 'BBB' }]);
     vi.mocked(all).mockResolvedValueOnce([{ ticker: 'PEND1' }]);
 
-    const metrics = await collectStPeerPricesMetrics(env, now, 6);
+    const metrics = await collectStPeerPricesMetrics(stalledEnv, now, 6);
     expect(metrics.stalled).toBe(true);
     expect(metrics.notCovered).toBe(2);
 
@@ -104,20 +127,24 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('keeps an in-progress backlog under the threshold ok, with pending visible (Kody #3)', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 12, never_n: 0, last_at: '2026-10-23T13:00:00.000Z' });
+    const movingEnv = envWithKv(new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-23T13:00:00.000Z'],
+    ]));
+    vi.mocked(get).mockResolvedValueOnce({ n: 12, never_n: 0, oldest_at: '2026-10-01T00:00:00.000Z' });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
 
-    const metrics = await collectStPeerPricesMetrics(env, now, 6);
+    const metrics = await collectStPeerPricesMetrics(movingEnv, now, 6);
     expect(metrics.stalled).toBe(false);
     const check = stPeerPricesMetricsToCheck(metrics);
     expect(check.status).toBe('ok');
     expect((check.value as { pending: number }).pending).toBe(12);
     expect(check.detail).toContain('12 ticker(s) pending');
+    expect(check.detail).toContain('drain progress');
     expect(check.detail).toContain('2.0h ago');
   });
 
   it('keeps a tail-only backlog with a current corpus ok (Kody #3)', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 2, never_n: 2, last_at: '2026-10-20T00:00:00.000Z' });
+    vi.mocked(get).mockResolvedValueOnce({ n: 2, never_n: 2, oldest_at: '2026-10-20T00:00:00.000Z' });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
 
     const metrics = await collectStPeerPricesMetrics(env, now, 6);
@@ -126,7 +153,7 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('does not throw out of health when the corpus date read fails (Kody #4)', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 12, never_n: 0, last_at: '2026-10-23T13:00:00.000Z' });
+    vi.mocked(get).mockResolvedValueOnce({ n: 12, never_n: 0, oldest_at: null });
     vi.mocked(get).mockRejectedValueOnce(new Error('D1 statement error: SQLITE_BUSY'));
 
     const metrics = await collectStPeerPricesMetrics(env, now, 6);
@@ -136,16 +163,33 @@ describe('stPeerPricesHealth', () => {
   });
 
   it('renders never, not neverh ago, when pending tickers have no progress stamp (Kody #6)', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 7, never_n: 0, last_at: null });
+    vi.mocked(get).mockResolvedValueOnce({ n: 7, never_n: 0, oldest_at: null });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
 
     const metrics = await collectStPeerPricesMetrics(env, now, 6);
-    expect(metrics.detail).toContain('progress never on pending set');
+    expect(metrics.detail).toContain('drain progress never');
     expect(metrics.detail).not.toContain('neverh');
   });
 
+  it('does not stall on old pending rows when KV shows recent drain progress (CT-2469)', async () => {
+    const kv = envWithKv(new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-23T14:30:00.000Z'],
+    ]));
+    vi.mocked(get).mockResolvedValueOnce({
+      n: 950,
+      never_n: 10,
+      oldest_at: '2026-10-08T12:00:00.000Z',
+    });
+    vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
+
+    const metrics = await collectStPeerPricesMetrics(kv, now, 6);
+    expect(metrics.stalled).toBe(false);
+    expect(metrics.oldestPendingCheckedAt).toBe('2026-10-08T12:00:00.000Z');
+    expect(metrics.detail).toContain('oldest pending check');
+  });
+
   it('no longer runs the full-table MAX(price_checked_at) read (Kody #5)', async () => {
-    vi.mocked(get).mockResolvedValueOnce({ n: 0, never_n: 0, last_at: null });
+    vi.mocked(get).mockResolvedValueOnce({ n: 0, never_n: 0, oldest_at: null });
     vi.mocked(get).mockResolvedValue({ d: '2026-10-22' });
 
     await collectStPeerPricesMetrics(env, now, 6);

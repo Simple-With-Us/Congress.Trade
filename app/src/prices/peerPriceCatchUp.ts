@@ -203,8 +203,23 @@ export function parsePeerPriceCatchUpState(
 export type PeerPriceCatchUpGate = 'ok' | 'session-cap' | 'no-progress' | 'spacing';
 
 /** The cheap (KV-only) part of the policy, checked before any D1 read. */
-export function peerPriceCatchUpGate(state: PeerPriceCatchUpState, now: Date): PeerPriceCatchUpGate {
-  if (state.runs >= PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION) return 'session-cap';
+/** Engaged-run budget scales with backlog so a daily EOD wave can finish in one day. */
+export function peerPriceCatchUpEffectiveRunCap(pending: number): number {
+  if (pending <= 0) return PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION;
+  const pages = Math.ceil(pending / PEER_PRICE_CATCHUP_MAX_TICKERS);
+  return Math.min(
+    PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION,
+    Math.max(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION, pages + 1),
+  );
+}
+
+export function peerPriceCatchUpGate(
+  state: PeerPriceCatchUpState,
+  now: Date,
+  opts: { maxRuns?: number } = {},
+): PeerPriceCatchUpGate {
+  const maxRuns = opts.maxRuns ?? PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION;
+  if (state.runs >= maxRuns) return 'session-cap';
   if (state.attempts >= PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION) return 'session-cap';
   if (state.noProgressRuns >= PEER_PRICE_CATCHUP_MAX_NO_PROGRESS_RUNS) return 'no-progress';
   if (state.lastRunAt) {
@@ -249,10 +264,15 @@ export function peerPriceCatchUpAfterRun(
      *  and engaged runs spend one of the day's runs as before.  The
      *  day's attempt count is never handed back either way. */
     spendRun?: boolean;
+    /** Tickers that received EOD history this run (may not shrink pending when
+     *  the tail re-queues on negative-cache boundaries). */
+    tickersPriced?: number;
   },
 ): PeerPriceCatchUpState {
-  // An unreadable after-count is not proof of progress.
-  const progressed = run.pendingAfter !== null && run.pendingAfter < run.pendingBefore;
+  // An unreadable after-count is not proof of progress; priced tickers are.
+  const progressed =
+    (run.pendingAfter !== null && run.pendingAfter < run.pendingBefore) ||
+    (run.tickersPriced ?? 0) > 0;
   // A failed run that moved nothing says nothing about whether ST can price the
   // rest, so it does not count toward the park (Kody #2859).  It still spent one
   // of the day's runs and waits out the spacing, so failures stay bounded.

@@ -17,6 +17,7 @@ import {
 import { stNotCoveredTickersFromSql } from './notCovered.ts';
 import { stTerminalTickersFromSql, type TerminalTickerSample } from './terminalListing.ts';
 import { parseTerminalReason } from './service.ts';
+import { readPeerPriceDrainLastProgressAt } from './peerPriceDrainProgress.ts';
 import type { PipelineCheck, PipelineStatus } from '../shared/pipelineHealth.ts';
 
 export interface StPeerPricesMetrics {
@@ -24,7 +25,10 @@ export interface StPeerPricesMetrics {
   skip: boolean;
   pending: number;
   neverPricedPending: number;
+  /** ISO time the drain last shrank pending or priced tickers (KV). */
   lastProgressAt: string | null;
+  /** MIN(price_checked_at) over the pending set — informational only. */
+  oldestPendingCheckedAt: string | null;
   corpusLatestDate: string | null;
   freshThrough: string;
   pendingSample: string[];
@@ -114,6 +118,7 @@ export async function collectStPeerPricesMetrics(
       pending: 0,
       neverPricedPending: 0,
       lastProgressAt: null,
+      oldestPendingCheckedAt: null,
       corpusLatestDate: null,
       freshThrough: '',
       pendingSample: [],
@@ -134,20 +139,20 @@ export async function collectStPeerPricesMetrics(
 
   let pending = 0;
   let neverPricedPending = 0;
-  let lastProgressAt: string | null = null;
+  let oldestPendingCheckedAt: string | null = null;
   let pendingSample: string[] = [];
   try {
-    const row = await get<{ n: number; never_n: number; last_at: string | null }>(
+    const row = await get<{ n: number; never_n: number; oldest_at: string | null }>(
       env.DB,
       `SELECT
          (SELECT COUNT(DISTINCT t.ticker) ${pendingFrom}) AS n,
          (SELECT COUNT(DISTINCT t.ticker) ${neverPricedFrom}) AS never_n,
-         (SELECT MAX(sr.price_checked_at) ${pendingFrom}) AS last_at`,
+         (SELECT MIN(sr.price_checked_at) ${pendingFrom}) AS oldest_at`,
       countAndProgressBinds,
     );
     pending = Number(row?.n ?? 0);
     neverPricedPending = Number(row?.never_n ?? 0);
-    lastProgressAt = row?.last_at ?? null;
+    oldestPendingCheckedAt = row?.oldest_at ?? null;
   } catch {
     return {
       configured: true,
@@ -155,6 +160,7 @@ export async function collectStPeerPricesMetrics(
       pending: 0,
       neverPricedPending: 0,
       lastProgressAt: null,
+      oldestPendingCheckedAt: null,
       corpusLatestDate: null,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
@@ -168,6 +174,7 @@ export async function collectStPeerPricesMetrics(
   }
 
   const corpusLatestDate = await readCorpusLatestPriceDate(env);
+  const lastProgressAt = await readPeerPriceDrainLastProgressAt(env);
 
   // Visibility-only: stage-4 tickers ST cannot price. Best-effort — a failure
   // here must not fail the whole check, and the count never affects status.
@@ -202,6 +209,7 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
+      oldestPendingCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
@@ -222,6 +230,7 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
+      oldestPendingCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
@@ -252,12 +261,16 @@ export async function collectStPeerPricesMetrics(
       /* optional */
     }
     const sampleSuffix = pendingSample.length ? `; pending sample: ${pendingSample.join(', ')}` : '';
+    const oldestSuffix = oldestPendingCheckedAt
+      ? `; oldest pending check ${progressAgoLabel(oldestPendingCheckedAt, now)}`
+      : '';
     return {
       configured: true,
       skip: false,
       pending,
       neverPricedPending,
       lastProgressAt,
+      oldestPendingCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample,
@@ -269,7 +282,8 @@ export async function collectStPeerPricesMetrics(
       stalled: false,
       detail:
         `${pending} ticker(s) pending ST EOD/current prices${sampleSuffix}; ` +
-        `price_checked_at progress ${progressAgoLabel(lastProgressAt, now)} on pending set (under ${stallThresholdHours}h threshold)` +
+        `drain progress ${progressAgoLabel(lastProgressAt, now)} (under ${stallThresholdHours}h threshold)` +
+        oldestSuffix +
         notCoveredSuffix +
         terminalSuffix,
     };
@@ -288,10 +302,14 @@ export async function collectStPeerPricesMetrics(
     /* optional */
   }
   const sampleSuffix = pendingSample.length ? `; pending sample: ${pendingSample.join(', ')}` : '';
+  const oldestSuffix = oldestPendingCheckedAt
+    ? `; oldest pending check ${progressAgoLabel(oldestPendingCheckedAt, now)}`
+    : '';
   const detail =
     `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
     sampleSuffix +
-    `; no price_checked_at progress on pending tickers in ${hoursSinceIso(lastProgressAt, now)}h (threshold ${stallThresholdHours}h)` +
+    `; no drain progress in ${hoursSinceIso(lastProgressAt, now)}h (threshold ${stallThresholdHours}h)` +
+    oldestSuffix +
     notCoveredSuffix +
     terminalSuffix;
 
@@ -301,6 +319,7 @@ export async function collectStPeerPricesMetrics(
     pending,
     neverPricedPending,
     lastProgressAt,
+    oldestPendingCheckedAt,
     corpusLatestDate,
     freshThrough: pendingParams.freshThrough,
     pendingSample,
@@ -336,6 +355,7 @@ export function stPeerPricesMetricsToCheck(metrics: StPeerPricesMetrics): Pipeli
       freshThrough: metrics.freshThrough,
       corpusLatestDate: metrics.corpusLatestDate,
       lastProgressAt: metrics.lastProgressAt,
+      oldestPendingCheckedAt: metrics.oldestPendingCheckedAt,
       stallThresholdHours: metrics.stallThresholdHours,
       pendingSample: metrics.pendingSample,
       notCovered: metrics.notCovered,
