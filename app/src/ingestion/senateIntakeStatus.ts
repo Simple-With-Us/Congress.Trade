@@ -10,6 +10,11 @@
  * KV failure never fails the intake), and the admin review queue reads it
  * back so the queue view can show the relay status next to the work it
  * feeds.
+ *
+ * Runs vs deliveries: this module also carries the fetcher RUN heartbeat
+ * (see the second half of the file).  A run only becomes a delivery when
+ * it finds new filings, so the delivery record alone cannot say whether
+ * the fetcher is alive — the run record can.
  */
 
 import type { Env } from '../shared/types.ts';
@@ -139,6 +144,80 @@ export async function readSenateIntakeStatus(env: Env, now = new Date()): Promis
     return null;
   }
   if (!isSenateIntakeRecord(raw)) return null;
+  const receivedMs = Date.parse(raw.receivedAt);
+  const ageMs = Number.isFinite(receivedMs) ? Math.max(0, now.getTime() - receivedMs) : Infinity;
+  return { ...raw, ageMs, stale: isStale(receivedMs, now) };
+}
+
+// ---------------------------------------------------------------------------
+// Fetcher run heartbeat (CT-2462).  The delivery record above only exists
+// when a run finds NEW filings, so a quiet stretch — the norm — was
+// indistinguishable from a dead fetcher: the review queue read "never
+// reported" while the fetcher ran every 15 minutes.  The fetcher now also
+// reports every completed run (ok / blocked / error) to
+// POST /api/admin/senate-fetcher-run, and each report overwrites this
+// record.  The queue renders it as its own line, separate from deliveries:
+// runs answer "is the fetcher alive", deliveries answer "when did new
+// filings last arrive".
+
+export const SENATE_FETCHER_RUN_KV_KEY = 'senate-fetcher:last-run';
+
+export type SenateFetcherRunStatus = 'ok' | 'blocked' | 'error';
+export type SenateFetcherRole = 'agents' | 'jay';
+
+export interface SenateFetcherRunRecord {
+  /** ISO timestamp of the run, as reported by the fetcher. */
+  ranAt: string;
+  /** ISO timestamp of when the app received the report (server clock). */
+  receivedAt: string;
+  /** Outcome of the run: completed, blocked by the Senate, or errored. */
+  status: SenateFetcherRunStatus;
+  /** Rows the run's search returned (0 when it never got that far). */
+  rows: number;
+  /** Rows that were new to the fetcher on this run. */
+  newCount: number;
+  /** Which Mac copy ran: the agents primary or Jay's standby. */
+  role: SenateFetcherRole;
+}
+
+export interface SenateFetcherRunState extends SenateFetcherRunRecord {
+  /** Milliseconds between the record's receivedAt and the read time. */
+  ageMs: number;
+  /** True when the last reported run is older than the stale threshold. */
+  stale: boolean;
+}
+
+/** Best-effort run-heartbeat write; never throws into the report path. */
+export async function recordSenateFetcherRun(env: Env, rec: SenateFetcherRunRecord): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(SENATE_FETCHER_RUN_KV_KEY, JSON.stringify(rec));
+  } catch {
+    /* best-effort: the review queue reads a missing record as no runs yet */
+  }
+}
+
+function isSenateFetcherRunRecord(raw: unknown): raw is SenateFetcherRunRecord {
+  if (!raw || typeof raw !== 'object') return false;
+  const rec = raw as Record<string, unknown>;
+  return typeof rec.ranAt === 'string'
+    && typeof rec.receivedAt === 'string'
+    && (rec.status === 'ok' || rec.status === 'blocked' || rec.status === 'error')
+    && typeof rec.rows === 'number'
+    && typeof rec.newCount === 'number'
+    && (rec.role === 'agents' || rec.role === 'jay');
+}
+
+/** The last reported fetcher run, or null when no run has been reported. */
+export async function readSenateFetcherRunStatus(env: Env, now = new Date()): Promise<SenateFetcherRunState | null> {
+  if (!env.CONFIG_KV) return null;
+  let raw: unknown;
+  try {
+    raw = await env.CONFIG_KV.get(SENATE_FETCHER_RUN_KV_KEY, 'json');
+  } catch {
+    return null;
+  }
+  if (!isSenateFetcherRunRecord(raw)) return null;
   const receivedMs = Date.parse(raw.receivedAt);
   const ageMs = Number.isFinite(receivedMs) ? Math.max(0, now.getTime() - receivedMs) : Infinity;
   return { ...raw, ageMs, stale: isStale(receivedMs, now) };
