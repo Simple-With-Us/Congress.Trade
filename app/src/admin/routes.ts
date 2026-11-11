@@ -1272,7 +1272,7 @@ async function listDeadLetters(
        Only a missing-table/column error means that; anything else (a
        transient DB failure, a locked database) is a real error and must
        surface instead of masquerading as an unmigrated queue. */
-    if (/no such table|no such column/i.test((err as Error).message ?? '')) {
+    if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ''))) {
       return { items: [], count: 0, available: false };
     }
     throw err;
@@ -1335,7 +1335,7 @@ async function listDlqFailedRows(
     /* Same contract as listDeadLetters: `available: false` is only for a
        not-yet-migrated table; real DB errors surface instead of hiding as
        an empty, healthy-looking queue. */
-    if (/no such table|no such column/i.test((err as Error).message ?? '')) {
+    if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ''))) {
       return { items: [], count: 0, available: false };
     }
     throw err;
@@ -1360,8 +1360,14 @@ async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCou
               SUM(CASE WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 1 ELSE 0 END) AS parked
          FROM ingestion_outbox
         WHERE status = 'failed'`,
-    ).catch(() => null),
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
+    ).catch((err) => {
+      if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ""))) return null;
+      throw err;
+    }),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch((err) => {
+      if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ""))) return null;
+      throw err;
+    }),
   ]);
   return {
     deadLetters: Number(outboxRow?.dead ?? 0) || 0,
