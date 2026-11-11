@@ -407,3 +407,19 @@ jobs:
             --build "${{ steps.buildnum.outputs.build_num }}" \
             ${{ steps.buildnum.outputs.marketing && format('--marketing "{0}"', steps.buildnum.outputs.marketing) || '' }}
 
+      # OPS-1052 / BF-2552: the in-ship ensure-tf-ready check runs before the
+      # external beta refresh, so it can warn that nobody can install the build
+      # even after this step assigns it.  Re-run once here and record THAT
+      # verdict on the job summary.
+      - name: Re-verify TestFlight readiness after external beta refresh
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bundle="$(python3 -c 'import json; print(json.load(open("scripts/ios-fleet/apps.json"))["apps"]["congress"]["bundleId"])')"
+          build="${{ steps.buildnum.outputs.build_num }}"
+          marketing="${{ steps.buildnum.outputs.marketing }}"
+          args=("$bundle" "$build")
+          if [ -n "$marketing" ]; then args+=("$marketing"); fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-report-post-sync-tf-ready.sh" "${args[@]}"
+

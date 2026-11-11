@@ -404,6 +404,8 @@ jobs:
           bash -n scripts/ios-assert-stable-xcode.sh
           bash -n scripts/ios-fleet/publish-ios-versions.sh
           bash -n scripts/ios-fleet/test-asc-credentials.sh
+          bash -n scripts/ios-fleet/test-tf-ready-labels.sh
+          bash -n scripts/ios-report-post-sync-tf-ready.sh
           node --check scripts/ios-fleet/asc-api.mjs
           node --check scripts/ios-fleet/asc-key.mjs
           node --check scripts/ios-fleet/version-plan.mjs
@@ -433,6 +435,9 @@ jobs:
 
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs
+
+      - name: ensure-tf-ready return-code labels (offline)
+        run: bash scripts/ios-fleet/test-tf-ready-labels.sh
 
       - name: External TestFlight beta promotion
         run: node --test scripts/promote-external-beta.node-test.mjs

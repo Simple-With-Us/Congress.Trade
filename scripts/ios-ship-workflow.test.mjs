@@ -301,6 +301,40 @@ test("the App Store version workflow prepares a version and never submits", () =
   assert.doesNotMatch(api, /appStoreVersionLocalizations.*method:\s*"POST"/);
 });
 
+test("ensure-tf-ready rc=5 and rc=6 are not mislabeled as export compliance", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  const rc5 = ship.slice(ship.indexOf("if [[ $rc -eq 5 ]]"), ship.indexOf("if [[ $rc -eq 6 ]]"));
+  const rc6 = ship.slice(ship.indexOf("if [[ $rc -eq 6 ]]"), ship.indexOf("if [[ $rc -eq 3 ]]"));
+  assert.match(rc5, /NO internal tester has access to all builds/);
+  assert.match(rc5, /no internal tester can install it/);
+  assert.doesNotMatch(rc5, /stuck on export compliance/);
+  assert.doesNotMatch(rc5, /no external TestFlight group/);
+  assert.match(rc6, /internal tester count could not be read/);
+  assert.match(rc6, /internal tester state is unreadable/);
+  assert.doesNotMatch(rc6, /stuck on export compliance/);
+  assert.doesNotMatch(rc6, /external installability/);
+
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  const readyStart = asc.lastIndexOf("Exit codes: 0 ready", asc.indexOf('if (method === "ensure-tf-ready")'));
+  const ready = asc.slice(readyStart, asc.indexOf('if (method === "latest-marketing-patch"'));
+  assert.match(ready, /Exit codes: 0 ready \| 2 usage\/API error \| 3 readiness timeout/);
+  assert.doesNotMatch(ready, /process\.exit\(5\)/);
+  assert.doesNotMatch(ready, /process\.exit\(6\)/);
+
+});
+
+test("ios-ship.yml re-runs ensure-tf-ready after the external beta refresh", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const promote = yml.indexOf("name: Refresh the public TestFlight beta");
+  const verify = yml.indexOf("name: Re-verify TestFlight readiness after external beta refresh");
+  assert.ok(promote >= 0, "Refresh the public TestFlight beta step must exist");
+  assert.ok(verify > promote, "post-sync ensure-tf-ready must follow the external beta refresh");
+  assert.match(yml, /ios-report-post-sync-tf-ready\.sh/);
+  const report = read("scripts/ios-report-post-sync-tf-ready.sh");
+  assert.match(report, /GITHUB_STEP_SUMMARY/);
+  assert.match(report, /tf_ready_verdict_line/);
+});
+
 test("ios-appstore-gm.yml can ship one exact marketing version", () => {
   const yml = read(".github/workflows/ios-appstore-gm.yml");
 
