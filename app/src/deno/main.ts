@@ -108,8 +108,9 @@ const secretEnv = {
 // snapshot (Infisical SOT: startup load, in-memory cache, background refresh,
 // write-through on admin save — see INFISICAL.md).  Boot fails fast here if
 // the resolver is misconfigured; individual knobs stay fail-soft with safe
-// defaults.
-await refreshSecrets(secretEnv);
+// defaults.  The 5s abort bounds a hung Infisical connection so Coolify boot
+// cannot stall forever on a fetch that never returns (OPS-1055, from PR #2962).
+await refreshSecrets(secretEnv, { signal: AbortSignal.timeout(5_000) });
 const settings = await initSettings(secretEnv);
 startSettingsRefresh(secretEnv);
 // SIGHUP = on-demand settings reload (canonical "Reload settings" path).
