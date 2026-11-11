@@ -10,6 +10,7 @@ import {
   ensureIngestFailureReviewQueueRow,
   inferIngestFailureStage,
   recordGenuineIngestFailure,
+  sweepIngestFailureReviewQueue,
 } from '../ingestFailureReviewQueue.ts';
 
 describe('ingestFailureReviewQueue', () => {
@@ -110,6 +111,36 @@ describe('ingestFailureReviewQueue', () => {
     expect(cleared).toBe(true);
     const n = await d1.prepare('SELECT COUNT(*) AS n FROM review_queue').first<{ n: number }>();
     expect(n?.n ?? 0).toBe(0);
+  });
+
+  it('hourly sweep does not queue CT-2453 published-stale or rejected filings', async () => {
+    const env = makeEnv();
+    await d1.prepare(
+      `INSERT INTO filings (doc_id, ingest_status, error, first_seen_at)
+       VALUES
+         ('S-PUB-STALE', 'error', 'late fetch', '2026-01-01'),
+         ('H-REJECTED', 'error', 'bad', '2026-01-02'),
+         ('H-GENUINE', 'error', 'fetcher: boom', '2026-01-03')`,
+    ).run();
+    await d1.prepare(
+      `INSERT INTO transactions (id, doc_id, deprecated_at) VALUES ('t1', 'S-PUB-STALE', NULL)`,
+    ).run();
+    await d1.prepare(
+      `INSERT INTO ingestion_decisions (id, doc_id, action, source, created_at)
+       VALUES ('d1', 'S-PUB-STALE', 'auto_published', 'test', '2026-01-02T00:00:00Z')`,
+    ).run();
+    await d1.prepare(
+      `INSERT INTO review_queue (doc_id, reason, created_at, resolved, resolution_kind, review_revision)
+       VALUES ('H-REJECTED', 'rejected: bad', '2026-01-02T00:00:00Z', 1, 'rejected', 1)`,
+    ).run();
+
+    const { backfill } = await sweepIngestFailureReviewQueue(env, { limit: 50 });
+    expect(backfill.ensured).toBe(1);
+    expect(backfill.skipped).toBe(0);
+
+    const rows = await d1.prepare('SELECT doc_id FROM review_queue WHERE reason LIKE ?')
+      .bind('ingest_failure:%').all<{ doc_id: string }>();
+    expect(rows.results?.map((r) => r.doc_id)).toEqual(['H-GENUINE']);
   });
 
   it('backfill dry-run counts eligible rows without writing', async () => {

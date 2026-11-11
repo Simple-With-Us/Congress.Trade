@@ -102,7 +102,7 @@ export async function clearIngestFailureReviewQueueIfRecovered(
         )`,
     [docId, `${INGEST_FAILURE_REASON_PREFIX}%`, docId],
   );
-  return (res.meta?.changes ?? 0) > 0;
+  return (res?.meta?.changes ?? 0) > 0;
 }
 
 async function shouldEnsureIngestFailureQueue(
