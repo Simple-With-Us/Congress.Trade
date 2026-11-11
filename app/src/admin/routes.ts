@@ -1267,9 +1267,15 @@ async function listDeadLetters(
       };
     });
     return { items, count: items.length, available: true };
-  } catch {
-    /* ingestion_outbox not migrated yet — the dashboard says unavailable. */
-    return { items: [], count: 0, available: false };
+  } catch (err) {
+    /* ingestion_outbox not migrated yet — the dashboard says unavailable.
+       Only a missing-table/column error means that; anything else (a
+       transient DB failure, a locked database) is a real error and must
+       surface instead of masquerading as an unmigrated queue. */
+    if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ''))) {
+      return { items: [], count: 0, available: false };
+    }
+    throw err;
   }
 }
 
@@ -1325,8 +1331,14 @@ async function listDlqFailedRows(
       };
     });
     return { items, count: items.length, available: true };
-  } catch {
-    return { items: [], count: 0, available: false };
+  } catch (err) {
+    /* Same contract as listDeadLetters: `available: false` is only for a
+       not-yet-migrated table; real DB errors surface instead of hiding as
+       an empty, healthy-looking queue. */
+    if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ''))) {
+      return { items: [], count: 0, available: false };
+    }
+    throw err;
   }
 }
 
@@ -1338,14 +1350,28 @@ interface PipelineFailureCounts {
 
 /** Counts for the two pipeline-failure stores the review totals carry. */
 async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCounts> {
-  const [deadRow, parkedRow, dlqRow] = await Promise.all([
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') NOT LIKE 'parked:%'`).catch(() => null),
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') LIKE 'parked:%'`).catch(() => null),
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
+  const [outboxRow, dlqRow] = await Promise.all([
+    // One pass over the failed outbox rows, split into active vs parked by
+    // conditional aggregation — this used to run two COUNT(*) scans over
+    // the same rows on every totals read.
+    get<{ dead: number | null; parked: number | null }>(
+      db,
+      `SELECT SUM(CASE WHEN COALESCE(last_error, '') NOT LIKE 'parked:%' THEN 1 ELSE 0 END) AS dead,
+              SUM(CASE WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 1 ELSE 0 END) AS parked
+         FROM ingestion_outbox
+        WHERE status = 'failed'`,
+    ).catch((err) => {
+      if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ""))) return null;
+      throw err;
+    }),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch((err) => {
+      if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ""))) return null;
+      throw err;
+    }),
   ]);
   return {
-    deadLetters: Number(deadRow?.n ?? 0) || 0,
-    deadLettersParked: Number(parkedRow?.n ?? 0) || 0,
+    deadLetters: Number(outboxRow?.dead ?? 0) || 0,
+    deadLettersParked: Number(outboxRow?.parked ?? 0) || 0,
     dlqFailed: Number(dlqRow?.n ?? 0) || 0,
   };
 }
