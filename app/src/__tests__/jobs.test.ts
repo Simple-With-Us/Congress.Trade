@@ -349,22 +349,25 @@ function stickyPriceDb(row: Record<string, unknown> | null) {
 
 function priceProbeDb(rows: Array<Record<string, unknown> | null>) {
   const queue = [...rows];
-  const statement = {
-    bind() {
-      return statement;
-    },
-    async first() {
-      return queue.shift() ?? null;
-    },
-    async all() {
-      return { results: [] };
-    },
-    async run() {
-      return { success: true, meta: { changes: 0 } };
-    },
-  };
   return {
-    prepare() {
+    prepare(sql: string) {
+      const statement = {
+        bind() {
+          return statement;
+        },
+        async first() {
+          // The terminal sweep (CT-2466) reads on the same tick as the catch-up
+          // probe. It must not consume the scripted corpus/pending rows.
+          if (String(sql).includes('terminal-peer-price')) return { n: 0, d: null };
+          return queue.shift() ?? null;
+        },
+        async all() {
+          return { results: [] };
+        },
+        async run() {
+          return { success: true, meta: { changes: 0 } };
+        },
+      };
       return statement;
     },
   };

@@ -71,7 +71,7 @@ export function parsePriceNeedsQuery(q: Record<string, string | undefined>): Pri
  * Tickers still negative-cached as unavailable are excluded while their TTL is
  * active (same two-stage policy as selectTickersNeedingPrices), so App B does
  * not thrash delisted/foreign names every night. Stage-4 (not covered by ST)
- * tickers are excluded unconditionally.
+ * and stage-5 (no longer trading) tickers are excluded unconditionally.
  */
 function unavailableExclusionSql(): string {
   return `NOT (

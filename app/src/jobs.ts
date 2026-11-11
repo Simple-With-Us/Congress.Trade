@@ -18,6 +18,7 @@ import {
   markStuckPeerPriceTickersNotCovered,
   recheckNotCoveredPeerPrices,
 } from './prices/notCovered.ts';
+import { markTerminalPeerPriceTickers } from './prices/terminalListing.ts';
 import { notifyAdmin } from './alerts/notify.ts';
 import { shareWithPeer, type PeerShareInput } from './share/outbound.ts';
 import { runFreshnessCheck } from './share/freshness.ts';
@@ -483,11 +484,27 @@ export async function runNotCoveredRecheckLane(
  * not-covered sweep is NOT run here:  it needs a full-set walk, which only the
  * daily refresh does.  not_covered tickers stay excluded by the pending SQL.
  */
+/** Local classification only. A failure must not block the price lane. */
+async function sweepTerminalPeerPrices(env: Env, now: Date): Promise<void> {
+  try {
+    const swept = await markTerminalPeerPriceTickers(env, now);
+    if (swept.marked > 0) {
+      console.log(`terminal peer-price sweep marked ${swept.marked} ticker(s)`);
+    }
+  } catch (err) {
+    console.warn('terminal peer-price sweep failed:', (err as Error).message);
+  }
+}
+
 export async function maybeRunPeerPriceCatchUp(
   env: Env,
   now: Date,
   opts: { signal?: AbortSignal } = {},
 ): Promise<DailyLaneStatus> {
+  // Stored last-trade evidence only. A parked catch-up still classifies, so a
+  // dead ticker does not keep the stall clock until the next full refresh.
+  // The statement is marked so it does not consume the catch-up's probe.
+  await sweepTerminalPeerPrices(env, now);
   const freshThrough = lastTradingDay(now);
   let state: PeerPriceCatchUpState;
   try {
@@ -705,6 +722,7 @@ export async function maybeRunDailyMarketDataJobs(
   }
   let priceRefreshFailed = false;
   let priceRefreshAttemptedAllPending = false;
+  await sweepTerminalPeerPrices(env, now);
   try {
     const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });
     priceRefreshAttemptedAllPending = r.attemptedAllPending;

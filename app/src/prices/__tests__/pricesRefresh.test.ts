@@ -102,7 +102,7 @@ vi.mock('../peer', async (importOriginal) => {
 });
 
 import type { Env } from '../../shared/types.ts';
-import { runPriceRefresh } from '../service.ts';
+import { lastTradingDay, runPriceRefresh } from '../service.ts';
 import { openMigratedD1, type SqliteDatabase } from './sqliteD1.ts';
 
 let db: SqliteDatabase;
@@ -221,11 +221,17 @@ describe('runPriceRefresh — successful fetch bookkeeping', () => {
 
   it('negative-caches a delisted ticker whose newest close is weeks stale (non-empty fetch)', async () => {
     seedTrade('t2b', 'GONE', '2019-01-05'); // trades exist, but the series stopped
+    const fresh = lastTradingDay();
+    const stale = new Date(`${fresh}T00:00:00Z`);
+    stale.setUTCDate(stale.getUTCDate() - 21);
+    const staleDate = stale.toISOString().slice(0, 10);
     db.prepare(
       // stale latest_price_date → selected; the provider still returns its OLD closes.
-      "INSERT INTO securities_ref (ticker, latest_price_date, enriched_at) VALUES ('GONE', '2020-01-15', '2020-01-01T00:00:00Z')",
-    ).run();
-    h.responses.set('GONE', [{ date: '2020-01-15', close: 50 }]); // newest close is years old
+      "INSERT INTO securities_ref (ticker, latest_price_date, enriched_at) VALUES ('GONE', ?, '2020-01-01T00:00:00Z')",
+    ).run(staleDate);
+    // 21 days behind the last session: past the 14-day stall bar, inside the
+    // 90-day terminal bar, so this stays the TTL-bounded stage-3 cache.
+    h.responses.set('GONE', [{ date: staleDate, close: 50 }]);
 
     await runPriceRefresh(env, { max: 10 });
 
@@ -238,7 +244,7 @@ describe('runPriceRefresh — successful fetch bookkeeping', () => {
     // status so a reader can tell "confirmed empty" apart from "stopped
     // trading" without re-deriving it from latest_price_date.
     expect(row?.price_unavailable).toBe(3);
-    expect(row?.latest_price_date).toBe('2020-01-15');
+    expect(row?.latest_price_date).toBe(staleDate);
     expect(row?.current_price).toBe(50);
   });
 });

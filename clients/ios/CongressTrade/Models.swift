@@ -1998,6 +1998,8 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
     /// `st_peer_prices` check only: tickers ST cannot price (CT-2443). Nil for
     /// scalar values and older servers that do not send it.
     let notCovered: Int?
+    /// `st_peer_prices` check only: tickers confirmed no longer trading (CT-2466).
+    let terminal: Int?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -2007,8 +2009,10 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
         value = FailSoftJSON.double(c, .value)
         if let nested = try? c.nestedContainer(keyedBy: CheckValueKeys.self, forKey: .value) {
             notCovered = FailSoftJSON.int(nested, .notCovered)
+            terminal = FailSoftJSON.int(nested, .terminal)
         } else {
             notCovered = nil
+            terminal = nil
         }
     }
 
@@ -2029,6 +2033,7 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
 
     private enum CheckValueKeys: String, CodingKey {
         case notCovered
+        case terminal
     }
 }
 
