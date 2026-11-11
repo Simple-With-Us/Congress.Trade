@@ -10,6 +10,8 @@ import {
   TYPE_COLUMN,
   classifyMarkScores,
   fitColumnLines,
+  cleanGridAssetName,
+  ownerCodeFromCell,
   readHouseGridForm,
   xTemplateForFit,
   type GrayImage,
@@ -361,6 +363,69 @@ describe('HousePdfExtractor grid stage', () => {
     });
     expect(visionCalls).toBe(1);
     expect(out.transactions[0]?.ticker).toBe('INTC');
+  });
+});
+
+describe('grid row, owner, and date corrections', () => {
+  it('leaves the trade date empty when only the notification column has a date', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: 'SP', asset: 'APPLE INC (AAPL)', txDate: '', notifDate: '11/02/26', marks: [TYPE_COLUMN.p, 9] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 4 }]);
+    expect(read.transactions).toHaveLength(1);
+    expect(read.transactions[0]?.txDate).toBeNull();
+    expect(read.transactions[0]?.description).toContain('2026-11-02');
+    expect(read.transactions[0]?.confidence).toBeLessThan(0.95);
+  });
+
+  it('does not read the cover sample grid as trades', () => {
+    const drawn = drawGrid(0.72, 40, ROWS.slice(0, 1));
+    hline(drawn.image, 40, drawn.xs[7], drawn.xs[drawn.xs.length - 1]);
+    const covered = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 1 }]);
+    expect(covered.transactions).toHaveLength(0);
+    const plain = drawGrid(0.72, 40, ROWS.slice(0, 1));
+    const open = readHouseGridForm([{ image: plain.image, boxes: plain.boxes, page: 2 }]);
+    expect(open.transactions).toHaveLength(1);
+  });
+
+  it('reads an impossible OCR month 20 as October', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: 'DC', asset: 'INTEL CORP', txDate: '20/13/26', notifDate: '11/02/26', marks: [TYPE_COLUMN.s, 10] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 6 }]);
+    expect(read.transactions[0]?.txDate).toBe('2026-10-13');
+  });
+
+  it('splits glued form words without rewriting a clean name', () => {
+    expect(cleanGridAssetName('APPLE INC (AAPL)')).toBe('APPLE INC (AAPL)');
+    expect(cleanGridAssetName('COSTCO WHOLESALE CORPORATION CMN')).toBe('COSTCO WHOLESALE CORPORATION CMN');
+    expect(cleanGridAssetName('WALMARTINC CMN')).toBe('WALMART INC CMN');
+    expect(cleanGridAssetName('EATONCORPPLCCMN')).toBe('EATON CORP PLC CMN');
+    expect(cleanGridAssetName('WELLS FARGO FINANCE LLCLINKED TO SQPSODINDEX')).toBe('WELLS FARGO FINANCE LLC LINKED TO S&P 500 INDEX');
+    expect(cleanGridAssetName('ACCENTURE PLECMN CLASSA')).toBe('ACCENTURE PLC CMN CLASS A');
+    expect(cleanGridAssetName('CARVANACO CMN CLASS A')).toBe('CARVANA CO CMN CLASS A');
+    expect(cleanGridAssetName('PEPSICO INC CMN')).toBe('PEPSICO INC CMN');
+    expect(cleanGridAssetName('ON SEMICONOUCTOR CORPORATION CMN')).toBe('ON SEMICONDUCTOR CORPORATION CMN');
+    expect(cleanGridAssetName('NETFLIX INC CAN')).toBe('NETFLIX INC CMN');
+    expect(cleanGridAssetName('AGILENT TECHNOLOGIES NC CMN')).toBe('AGILENT TECHNOLOGIES INC CMN');
+  });
+
+  it('reads a stamped DC owner cell when the text box is missing', () => {
+    const image = blank(80, 40);
+    const glyphs = [
+      { x: 16, rows: [' ######.', '#######.', '###..###', '###...##', '###...##', '###...##', '###...##', '###...##', '####.##.', '#######.'] },
+      { x: 26, rows: ['.######', '.######', '###....', '##.....', '##.....', '##.....', '##.....', '##.....', '###...#', '.######'] },
+    ];
+    for (const glyph of glyphs) {
+      for (let y = 0; y < glyph.rows.length; y += 1) {
+        for (let x = 0; x < glyph.rows[y].length; x += 1) {
+          if (glyph.rows[y][x] === '#') image.pixels[(10 + y) * image.width + glyph.x + x] = 0;
+        }
+      }
+    }
+    expect(ownerCodeFromCell(image, 0, 0, 80, 40)).toBe('dependent');
   });
 });
 

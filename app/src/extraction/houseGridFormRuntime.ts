@@ -6,6 +6,7 @@
  */
 
 import {
+  planHouseGridColumns,
   readHouseGridForm,
   type GrayImage,
   type HouseGridFormReader,
@@ -100,6 +101,39 @@ export function parsePgm(bytes: Uint8Array): GrayImage | null {
   return null;
 }
 
+function cropGray(image: GrayImage, x0: number, y0: number, x1: number, y1: number, scale = 1): GrayImage {
+  const left = Math.max(0, Math.floor(x0));
+  const top = Math.max(0, Math.floor(y0));
+  const right = Math.max(left + 1, Math.min(image.width, Math.ceil(x1)));
+  const bot = Math.max(top + 1, Math.min(image.height, Math.ceil(y1)));
+  const srcWidth = right - left;
+  const srcHeight = bot - top;
+  const factor = scale > 1 ? Math.round(scale) : 1;
+  const width = srcWidth * factor;
+  const height = srcHeight * factor;
+  const pixels = new Uint8Array(width * height);
+  pixels.fill(255);
+  for (let y = 0; y < srcHeight; y += 1) {
+    const src = (top + y) * image.width + left;
+    for (let x = 0; x < srcWidth; x += 1) {
+      const value = image.pixels[src + x];
+      for (let dy = 0; dy < factor; dy += 1) {
+        const row = (y * factor + dy) * width + x * factor;
+        for (let dx = 0; dx < factor; dx += 1) pixels[row + dx] = value;
+      }
+    }
+  }
+  return { width, height, pixels };
+}
+
+function pgmBytes(image: GrayImage): Uint8Array {
+  const header = new TextEncoder().encode(`P5\n${image.width} ${image.height}\n255\n`);
+  const bytes = new Uint8Array(header.length + image.pixels.length);
+  bytes.set(header, 0);
+  bytes.set(image.pixels, header.length);
+  return bytes;
+}
+
 /** Group tesseract TSV words into line boxes with conf in 0..1. */
 export function parseTesseractTsv(tsv: string, width: number, height: number): HouseGridOcrBox[] {
   const lines = tsv.split(/\r?\n/);
@@ -162,9 +196,37 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
           const raw = await Deno.readFile(`${dir}/${names[i]}`);
           const image = parsePgm(raw);
           if (!image) continue;
-          const ocr = await runBinary(TESSERACT, [`${dir}/${names[i]}`, 'stdout', 'tsv'], 120_000);
-          const text = new TextDecoder().decode(ocr.stdout);
-          const boxes = ocr.code === 0 ? parseTesseractTsv(text, image.width, image.height) : [];
+          const plan = planHouseGridColumns(image);
+          const boxes: HouseGridOcrBox[] = [];
+          if (plan && plan.xs.length >= 10) {
+            const strips: Array<{ x0: number; x1: number; scale: number; whitelist: string | null; psm: string }> = [
+              { x0: plan.xs[1] + 2, x1: plan.xs[2] - 2, scale: 2, whitelist: null, psm: '6' },
+              { x0: plan.xs[7] + 1, x1: plan.xs[8] - 1, scale: 2, whitelist: '0123456789/', psm: '11' },
+              { x0: plan.xs[8] + 1, x1: plan.xs[9] - 1, scale: 2, whitelist: '0123456789/', psm: '11' },
+            ];
+            for (let stripIndex = 0; stripIndex < strips.length; stripIndex += 1) {
+              const strip = strips[stripIndex];
+              const crop = cropGray(image, strip.x0, 0, strip.x1, image.height, strip.scale);
+              const path = `${dir}/strip-${i}-${stripIndex}.pgm`;
+              await Deno.writeFile(path, pgmBytes(crop));
+              const args = [path, 'stdout', '--psm', strip.psm];
+              if (strip.whitelist) args.push('-c', `tessedit_char_whitelist=${strip.whitelist}`);
+              args.push('tsv');
+              const ocr = await runBinary(TESSERACT, args, 60_000);
+              if (ocr.code !== 0) continue;
+              const text = new TextDecoder().decode(ocr.stdout);
+              for (const box of parseTesseractTsv(text, crop.width, crop.height)) {
+                boxes.push({
+                  x0: strip.x0 + box.x0 / strip.scale,
+                  x1: strip.x0 + box.x1 / strip.scale,
+                  y0: box.y0 / strip.scale,
+                  y1: box.y1 / strip.scale,
+                  text: box.text,
+                  conf: box.conf,
+                });
+              }
+            }
+          }
           pages.push({ image, boxes, page: i + 1 });
         }
         if (pages.length === 0) return null;

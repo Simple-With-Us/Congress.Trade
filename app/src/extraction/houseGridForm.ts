@@ -190,7 +190,7 @@ export function scaleGray(src: GrayImage, scale: number): GrayImage {
  * Coverage counts a broken rule. A wide text blob is not a rule.
  * At most 28 candidates go into the column fit, strongest first.
  */
-export function detectVerticalLines(image: GrayImage, y0: number, y1: number): number[] {
+export function detectVerticalLines(image: GrayImage, y0: number, y1: number, minFraction = 0.18): number[] {
   const top = Math.max(0, Math.min(image.height, y0));
   const bot = Math.max(top, Math.min(image.height, y1));
   const band = Math.max(1, bot - top);
@@ -200,7 +200,7 @@ export function detectVerticalLines(image: GrayImage, y0: number, y1: number): n
     for (let y = top; y < bot; y += 1) {
       if (image.pixels[y * image.width + x] < 180) dark += 1;
     }
-    if (dark > band * 0.18) hits.push(x);
+    if (dark > band * minFraction) hits.push(x);
   }
   const groups: number[][] = [];
   for (const x of hits) {
@@ -229,7 +229,7 @@ export function detectVerticalLines(image: GrayImage, y0: number, y1: number): n
  * Same search as the prototype: two detected lines, two template lines,
  * keep the scale in (0.5, 1.4) with the most inliers.
  */
-export function fitColumnLines(detected: readonly number[]): ColumnFit | null {
+export function fitColumnLines(detected: readonly number[], minScale = 0.5): ColumnFit | null {
   if (detected.length < 4) return null;
   let best: ColumnFit | null = null;
   let bestErr = Number.POSITIVE_INFINITY;
@@ -242,7 +242,7 @@ export function fitColumnLines(detected: readonly number[]): ColumnFit | null {
             const denom = template[b] - template[a];
             if (denom === 0) continue;
             const scale = (detected[j] - detected[i]) / denom;
-            if (scale < 0.5 || scale > 1.4) continue;
+            if (scale < minScale || scale > 1.4) continue;
             const offset = detected[i] - scale * template[a];
             let inliers = 0;
             let err = 0;
@@ -478,10 +478,12 @@ export function classifyMarkScores(scores: readonly number[]): ClassifiedMarks {
 function parseLooseDate(text: string): string | null {
   const match = DATE_RE.exec(text.replace(/\s+/g, ''));
   if (!match) return null;
-  const month = Number(match[1]);
+  let month = Number(match[1]);
   const day = Number(match[2]);
   let year = Number(match[3]);
   if (year < 100) year += 2000;
+  // "10" is often read as 16 or 20. Those months cannot exist, so keep the day.
+  if (month === 16 || month === 18 || month === 19 || month === 20) month = 10;
   if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1990 || year > 2100) return null;
   const dt = new Date(Date.UTC(year, month - 1, day));
   if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) return null;
@@ -517,13 +519,315 @@ function boxesInRow(
 }
 
 /**
+ * Printed owner codes on these grids. Measured from a 150 DPI scan.
+ * D/C/S/P are the ink; T/J are the same stroke weight so a joint code
+ * can match without a second OCR pass.
+ */
+const OWNER_GLYPHS: Record<string, readonly string[]> = {
+  D: [' ######.', '#######.', '###..###', '###...##', '###...##', '###...##', '###...##', '###...##', '####.##.', '#######.'],
+  C: ['.######', '.######', '###....', '##.....', '##.....', '##.....', '##.....', '##.....', '###...#', '.######'],
+  S: ['.####.', '#####.', '###...', '##....', '####..', '.###..', '..####', '....##', '...###', '######', '####..'],
+  P: ['.####...', '#######.', '###..##.', '###..###', '###..###', '#######.', '#######.', '###.....', '###.....', '###.....'],
+  T: ['#######', '...#...', '...#...', '...#...', '...#...', '...#...', '...#...', '...#...', '...#...', '...#...'],
+  J: ['..####.', '....##.', '....##.', '....##.', '....##.', '....##.', '....##.', '##..##.', '.#####.', '..###..'],
+};
+
+function glyphTemplate(rows: readonly string[]): { width: number; height: number; pixels: Float64Array } {
+  const height = rows.length;
+  const width = rows.reduce((max, row) => Math.max(max, row.length), 0);
+  const pixels = new Float64Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const row = rows[y] ?? '';
+    for (let x = 0; x < width; x += 1) pixels[y * width + x] = row[x] === '#' ? 1 : 0;
+  }
+  return { width, height, pixels };
+}
+
+const OWNER_TEMPLATES = Object.fromEntries(
+  Object.entries(OWNER_GLYPHS).map(([letter, rows]) => [letter, glyphTemplate(rows)]),
+) as Record<string, { width: number; height: number; pixels: Float64Array }>;
+
+function sampleIndex(index: number, outCount: number, inCount: number): number {
+  if (outCount <= 1 || inCount <= 1) return 0;
+  return Math.min(inCount - 1, Math.floor((index * (inCount - 1)) / (outCount - 1)));
+}
+
+function glyphNcc(
+  glyph: Uint8Array,
+  glyphWidth: number,
+  glyphHeight: number,
+  template: { width: number; height: number; pixels: Float64Array },
+): number {
+  if (glyphWidth < 2 || glyphHeight < 4) return -1;
+  const { width, height, pixels } = template;
+  let tMean = 0;
+  for (const value of pixels) tMean += value;
+  tMean /= pixels.length;
+  let gMean = 0;
+  const sampled = new Float64Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const sy = sampleIndex(y, height, glyphHeight);
+    for (let x = 0; x < width; x += 1) {
+      const sx = sampleIndex(x, width, glyphWidth);
+      const value = glyph[sy * glyphWidth + sx];
+      sampled[y * width + x] = value;
+      gMean += value;
+    }
+  }
+  gMean /= sampled.length;
+  let num = 0;
+  let tEnergy = 0;
+  let gEnergy = 0;
+  for (let i = 0; i < sampled.length; i += 1) {
+    const tv = pixels[i] - tMean;
+    const gv = sampled[i] - gMean;
+    num += tv * gv;
+    tEnergy += tv * tv;
+    gEnergy += gv * gv;
+  }
+  const den = Math.sqrt(tEnergy * gEnergy);
+  return den < 1e-6 ? -1 : num / den;
+}
+
+function bestOwnerLetter(glyph: Uint8Array, width: number, height: number): { letter: string; score: number; margin: number; runnerUp: string } {
+  let best = '';
+  let runnerUp = '';
+  let score = -2;
+  let second = -2;
+  for (const [letter, template] of Object.entries(OWNER_TEMPLATES)) {
+    const value = glyphNcc(glyph, width, height, template);
+    if (value > score) {
+      second = score;
+      runnerUp = best;
+      score = value;
+      best = letter;
+    } else if (value > second) {
+      second = value;
+      runnerUp = letter;
+    }
+  }
+  return { letter: best, score, margin: score - second, runnerUp };
+}
+
+function trimGlyph(mask: Uint8Array, width: number, height: number): { pixels: Uint8Array; width: number; height: number } | null {
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!mask[y * width + x]) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < minX) return null;
+  const outWidth = maxX - minX + 1;
+  const outHeight = maxY - minY + 1;
+  const pixels = new Uint8Array(outWidth * outHeight);
+  for (let y = 0; y < outHeight; y += 1) {
+    for (let x = 0; x < outWidth; x += 1) pixels[y * outWidth + x] = mask[(minY + y) * width + minX + x];
+  }
+  return { pixels, width: outWidth, height: outHeight };
+}
+
+export type OwnerMatchDetail = {
+  pair: string;
+  first: number;
+  second: number;
+  firstMargin: number;
+  secondMargin: number;
+  width: number;
+  height: number;
+};
+
+/** DC, SP, or JT from the owner cell. Blank ink stays null. */
+export function ownerCodeFromCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): Owner | null {
+  const left = Math.max(0, Math.floor(x0) + 4);
+  const right = Math.min(image.width, Math.ceil(x1) - 4);
+  const top = Math.max(0, Math.floor(y0) + 2);
+  const bot = Math.min(image.height, Math.ceil(y1) - 2);
+  const width = right - left;
+  const height = bot - top;
+  if (width < 8 || height < 8) return null;
+  const mask = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const src = (top + y) * image.width + left;
+    for (let x = 0; x < width; x += 1) mask[y * width + x] = image.pixels[src + x] < 155 ? 1 : 0;
+  }
+  const colMean = new Float64Array(width);
+  const rowMean = new Float64Array(height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const value = mask[y * width + x];
+      colMean[x] += value;
+      rowMean[y] += value;
+    }
+  }
+  for (let x = 0; x < width; x += 1) {
+    if (colMean[x] / height > 0.55) {
+      for (let y = 0; y < height; y += 1) mask[y * width + x] = 0;
+    }
+  }
+  for (let y = 0; y < height; y += 1) {
+    if (rowMean[y] / width > 0.7) {
+      mask.fill(0, y * width, (y + 1) * width);
+    }
+  }
+  let ink = 0;
+  for (const value of mask) ink += value;
+  if (ink < 10) return null;
+  let glyph = trimGlyph(mask, width, height);
+  if (!glyph) return null;
+  if (glyph.height > 16) {
+    const span = 13;
+    let bestStart = 0;
+    let bestInk = -1;
+    for (let start = 0; start <= glyph.height - span; start += 1) {
+      let sum = 0;
+      for (let y = start; y < start + span; y += 1) {
+        for (let x = 0; x < glyph.width; x += 1) sum += glyph.pixels[y * glyph.width + x];
+      }
+      if (sum > bestInk) {
+        bestInk = sum;
+        bestStart = start;
+      }
+    }
+    const sliced = new Uint8Array(glyph.width * span);
+    for (let y = 0; y < span; y += 1) {
+      sliced.set(glyph.pixels.subarray((bestStart + y) * glyph.width, (bestStart + y + 1) * glyph.width), y * glyph.width);
+    }
+    glyph = trimGlyph(sliced, glyph.width, span);
+    if (!glyph) return null;
+  }
+  if (glyph.width > 22) {
+    const window = 18;
+    let bestX = 0;
+    let bestInk = -1;
+    for (let x = 0; x <= glyph.width - window; x += 1) {
+      let sum = 0;
+      for (let y = 0; y < glyph.height; y += 1) {
+        for (let dx = 0; dx < window; dx += 1) sum += glyph.pixels[y * glyph.width + x + dx];
+      }
+      if (sum > bestInk) {
+        bestInk = sum;
+        bestX = x;
+      }
+    }
+    const sliced = new Uint8Array(window * glyph.height);
+    for (let y = 0; y < glyph.height; y += 1) {
+      sliced.set(glyph.pixels.subarray(y * glyph.width + bestX, y * glyph.width + bestX + window), y * window);
+    }
+    glyph = trimGlyph(sliced, window, glyph.height);
+    if (!glyph) return null;
+  }
+  if (glyph.width < 8) return null;
+  const col = new Uint32Array(glyph.width);
+  for (let y = 0; y < glyph.height; y += 1) {
+    for (let x = 0; x < glyph.width; x += 1) col[x] += glyph.pixels[y * glyph.width + x];
+  }
+  const mid0 = Math.floor(glyph.width * 0.25);
+  const mid1 = Math.floor(glyph.width * 0.8);
+  if (mid1 <= mid0) return null;
+  let valley = mid0;
+  for (let x = mid0 + 1; x <= mid1; x += 1) if (col[x] < col[valley]) valley = x;
+  const leftWidth = Math.max(1, valley);
+  const leftPixels = new Uint8Array(leftWidth * glyph.height);
+  for (let y = 0; y < glyph.height; y += 1) {
+    for (let x = 0; x < leftWidth; x += 1) leftPixels[y * leftWidth + x] = glyph.pixels[y * glyph.width + x];
+  }
+  const leftGlyph = trimGlyph(leftPixels, leftWidth, glyph.height);
+  const rightOffset = valley + 1;
+  const rightWidth = glyph.width - rightOffset;
+  const rightPixels = new Uint8Array(Math.max(1, rightWidth) * glyph.height);
+  if (rightWidth > 0) {
+    for (let y = 0; y < glyph.height; y += 1) {
+      for (let x = 0; x < rightWidth; x += 1) {
+        rightPixels[y * rightWidth + x] = glyph.pixels[y * glyph.width + rightOffset + x];
+      }
+    }
+  }
+  const rightGlyph = rightWidth > 0 ? trimGlyph(rightPixels, rightWidth, glyph.height) : null;
+  if (!leftGlyph || !rightGlyph) return null;
+  if (leftGlyph.pixels.reduce((sum, value) => sum + value, 0) < 4) return null;
+  if (rightGlyph.pixels.reduce((sum, value) => sum + value, 0) < 4) return null;
+  const first = bestOwnerLetter(leftGlyph.pixels, leftGlyph.width, leftGlyph.height);
+  const second = bestOwnerLetter(rightGlyph.pixels, rightGlyph.width, rightGlyph.height);
+  const pair = `${first.letter}${second.letter}`;
+  if (detail) {
+    detail.pair = pair;
+    detail.first = first.score;
+    detail.second = second.score;
+    detail.firstMargin = first.margin;
+    detail.secondMargin = second.margin;
+    detail.width = glyph.width;
+    detail.height = glyph.height;
+  }
+  const joint = pair === 'JT';
+  // DC/SP stay rejected unless both letters clear a modest score. Joint
+  // stays strict: a weak JT is usually a broken DC or SP.
+  const floor = joint ? 0.62 : 0.3;
+  const margin = joint ? 0.12 : 0.02;
+  if (first.score < floor || second.score < floor) return null;
+  if (first.margin < margin || second.margin < margin) return null;
+  if (pair === 'DC') return 'dependent';
+  if (pair === 'SP') return 'spouse';
+  if (pair === 'JT') return 'joint';
+  // There is no DD or CC code. A strong D beside a C that lost to D or C is DC.
+  if (pair === 'DD' && first.score >= 0.5 && second.runnerUp === 'C' && second.margin <= 0.2 && second.score >= 0.4) {
+    return 'dependent';
+  }
+  if (pair === 'CC' && second.score >= 0.45 && first.runnerUp === 'D' && first.margin <= 0.2 && first.score >= 0.45) {
+    return 'dependent';
+  }
+  return null;
+}
+
+function medianNumber(values: readonly number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] ?? 64;
+}
+
+/**
+ * Column fit for one page.
+ * The usual window starts below the running header. A short table that
+ * sits entirely above that window (a last page with a few rows) is fit
+ * again from the top of the page.
+ */
+export function planHouseGridColumns(image: GrayImage): ColumnFit | null {
+  const primary = fitColumnLines(detectVerticalLines(
+    image,
+    Math.floor(image.height * 0.28),
+    Math.floor(image.height * 0.92),
+  ));
+  if (primary && primary.inliers >= GRID_MIN_INLIERS) return primary;
+  const fallback = fitColumnLines(
+    detectVerticalLines(image, Math.floor(image.height * 0.05), Math.floor(image.height * 0.72), 0.15),
+    0.42,
+  );
+  if (fallback && fallback.inliers >= GRID_MIN_INLIERS) return fallback;
+  return null;
+}
+
+/**
  * Data-row bands from the amount-column rules.
  * A section title is a thick black bar. Thin rules are the row separators.
- * A gap of about two pitches gets one inferred rule. Bands above the first
- * section bar are the column header, not trades.
+ * When the single-row pitch is visible, a gap of several pitches is filled
+ * back in. Pages with no section bar keep the original one-gap fill so a
+ * synthetic grid is unchanged.
  */
-function rowBands(image: GrayImage, xs: readonly number[]): Array<{ y0: number; y1: number }> {
-  if (xs.length < 12) return [];
+export function rowBands(image: GrayImage, xs: readonly number[]): { bands: Array<{ y0: number; y1: number }>; sectionBars: number } {
+  const none = { bands: [] as Array<{ y0: number; y1: number }>, sectionBars: 0 };
+  if (xs.length < 12) return none;
   const x0 = xs[7];
   const x1 = xs[xs.length - 1];
   const groups: number[][] = [];
@@ -544,24 +848,44 @@ function rowBands(image: GrayImage, xs: readonly number[]): Array<{ y0: number; 
     if (group.length <= 5) rules.push(Math.round(group.reduce((sum, v) => sum + v, 0) / group.length));
     else if (group.length >= 12) barBottoms.push(group[group.length - 1]);
   }
-  if (rules.length < 3) return [];
+  if (rules.length < 3 && barBottoms.length === 0) return none;
   const firstBar = barBottoms.length ? Math.min(...barBottoms) : null;
   const dataRules = (firstBar === null ? rules : rules.filter((rule) => rule > firstBar + 4)).sort((a, b) => a - b);
-  if (dataRules.length < 2) return [];
-  const gaps = dataRules.slice(1).map((rule, index) => rule - dataRules[index]).filter((gap) => gap >= 24 && gap <= 140);
-  const pitch = gaps.length ? gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : 64;
+  const rawGaps = dataRules.slice(1).map((rule, index) => rule - dataRules[index]);
+  const smallGaps = rawGaps.filter((gap) => gap >= 32 && gap <= 70);
+  const canSubdivide = smallGaps.length >= 2 && firstBar !== null;
+  const pitch = canSubdivide
+    ? medianNumber(smallGaps)
+    : medianNumber(rawGaps.filter((gap) => gap >= 24 && gap <= 140));
   const edges = [...dataRules];
-  for (let i = 0; i < dataRules.length - 1; i += 1) {
-    const gap = dataRules[i + 1] - dataRules[i];
-    if (gap > pitch * 1.6 && gap < pitch * 2.5) edges.push(Math.round(dataRules[i] + gap / 2));
-  }
-  if (firstBar !== null) {
-    for (const bottom of barBottoms) {
-      const next = edges.filter((edge) => edge > bottom + 8).sort((a, b) => a - b)[0];
-      if (next !== undefined && Math.abs(next - bottom - pitch) <= pitch * 0.45) edges.push(bottom + 1);
+  if (canSubdivide && firstBar !== null && dataRules.length > 0) {
+    for (let i = 0; i < dataRules.length - 1; i += 1) {
+      const gap = dataRules[i + 1] - dataRules[i];
+      const slots = pitch > 0 ? Math.round(gap / pitch) : 1;
+      if (slots >= 2 && slots <= 8 && Math.abs(gap - slots * pitch) <= pitch * 0.42) {
+        for (let k = 1; k < slots; k += 1) edges.push(Math.round(dataRules[i] + (k * gap) / slots));
+      }
+    }
+    const span = dataRules[0] - firstBar;
+    const slots = pitch > 0 ? Math.round(span / pitch) : 1;
+    if (slots >= 1 && slots <= 6 && Math.abs(span - slots * pitch) <= pitch * 0.45) {
+      edges.push(firstBar + 4);
+      for (let k = 1; k < slots; k += 1) edges.push(Math.round(firstBar + (k * span) / slots));
+    }
+  } else {
+    if (dataRules.length < 2 && firstBar === null) return none;
+    for (let i = 0; i < dataRules.length - 1; i += 1) {
+      const gap = dataRules[i + 1] - dataRules[i];
+      if (gap > pitch * 1.6 && gap < pitch * 2.5) edges.push(Math.round(dataRules[i] + gap / 2));
+    }
+    if (firstBar !== null) {
+      for (const bottom of barBottoms) {
+        const next = edges.filter((edge) => edge > bottom + 8).sort((a, b) => a - b)[0];
+        if (next !== undefined && Math.abs(next - bottom - pitch) <= pitch * 0.45) edges.push(bottom + 1);
+      }
     }
   }
-  const sorted = [...new Set(edges)].sort((a, b) => a - b);
+  const sorted = [...new Set(edges.filter((edge) => firstBar === null || edge >= firstBar))].sort((a, b) => a - b);
   const bands: Array<{ y0: number; y1: number }> = [];
   for (let i = 0; i < sorted.length - 1; i += 1) {
     const y0 = sorted[i];
@@ -580,7 +904,53 @@ function rowBands(image: GrayImage, xs: readonly number[]): Array<{ y0: number; 
     if (dark / samples > 0.45) continue;
     bands.push({ y0, y1 });
   }
-  return bands;
+  if (canSubdivide && bands.length > 0) {
+    const assetLeft = (xs[1] ?? 0) + 6;
+    const assetRight = (xs[2] ?? assetLeft) - 6;
+    let cursor = bands[bands.length - 1].y1;
+    for (let extra = 0; extra < 4; extra += 1) {
+      const next = Math.round(cursor + pitch);
+      if (next > image.height * 0.92 || assetRight - assetLeft < 8) break;
+      let ink = 0;
+      let inkSamples = 0;
+      let block = 0;
+      let blockSamples = 0;
+      for (let y = cursor + 4; y < next - 2; y += 1) {
+        const row = y * image.width;
+        for (let x = assetLeft; x < assetRight; x += 2) {
+          inkSamples += 1;
+          if (image.pixels[row + x] < 160) ink += 1;
+        }
+      }
+      for (let y = cursor; y < next; y += 2) {
+        const row = y * image.width;
+        for (let x = x0; x < x1; x += 4) {
+          blockSamples += 1;
+          if (image.pixels[row + x] < DARK) block += 1;
+        }
+      }
+      if (inkSamples === 0 || ink / inkSamples < 0.035) break;
+      if (blockSamples > 0 && block / blockSamples > 0.45) break;
+      bands.push({ y0: cursor, y1: next });
+      cursor = next;
+    }
+  }
+  return { bands, sectionBars: barBottoms.length };
+}
+
+function hasEarlyHorizontalRule(image: GrayImage, xs: readonly number[]): boolean {
+  const x0 = Math.max(0, Math.floor(xs[7] ?? 0));
+  const x1 = Math.min(image.width, Math.floor(xs[xs.length - 1] ?? 0));
+  if (x1 - x0 < 20) return false;
+  const limit = Math.floor(image.height * 0.15);
+  const span = x1 - x0;
+  for (let y = 0; y < limit; y += 1) {
+    let dark = 0;
+    const row = y * image.width;
+    for (let x = x0; x < x1; x += 1) if (image.pixels[row + x] < 200) dark += 1;
+    if (dark > span * 0.22) return true;
+  }
+  return false;
 }
 
 function scoreRowCells(
@@ -606,15 +976,195 @@ function scoreRowCells(
   return { scores, marked };
 }
 
+const FORM_WORDS = [
+  'CORPORATION', 'INCORPORATED', 'INTERNATIONAL', 'HOLDINGS', 'COMPANIES',
+  'PERPETUAL', 'WHOLESALE', 'COMMON', 'COMPANY', 'LIMITED', 'SYSTEMS',
+  'INDEX', 'LINKED', 'CLASS', 'STOCK', 'TRUST', 'SHARE',
+  'CORP', 'INC', 'LLC', 'PLC', 'CMN', 'LTD', 'FUND', 'LINE', 'HLDG',
+  'USD', 'US', 'CO',
+].sort((left, right) => right.length - left.length);
+
+// Prefix splits only where a form word is glued onto the next word.
+// INC/COM as prefixes cut real names (INCYTE, COMCAST).
+const FORM_PREFIXES = new Set(['LLC', 'PLC', 'LINKED']);
+
+const FORM_LEXICON = [
+  'SEMICONDUCTOR', 'HOLDINGS', 'INCORPORATED', 'TECHNOLOGY', 'PHARMACEUTICALS',
+  'COMMUNICATIONS', 'UNSPONSORED', 'CORPORATION', 'INTERNATIONAL', 'DIAGNOSTICS',
+  'WHOLESALE', 'MATERIALS', 'ENTERPRISES', 'INSTRUMENTS', 'LABORATORIES',
+];
+
+const FORM_TOKEN_MAP: Record<string, string> = {
+  CMIN: 'CMN',
+  CIMIN: 'CMN',
+  CMMN: 'CMN',
+  ICMN: 'CMN',
+  CMI: 'CMN',
+  CMM: 'CMN',
+  CMNN: 'CMN',
+  CMA: 'CMN',
+  CRN: 'CMN',
+  CHN: 'CMN',
+  CIN: 'CMN',
+  CNN: 'CMN',
+  MIN: 'CMN',
+  CIMN: 'CMN',
+  CHIN: 'CMN',
+  CHAN: 'CMN',
+  HLDGCO: 'HLDG CO',
+  PLE: 'PLC',
+  PLO: 'PLC',
+  HOLOINGS: 'HOLDINGS',
+  HOLDNGS: 'HOLDINGS',
+  CLASSA: 'CLASS A',
+  CLASSB: 'CLASS B',
+};
+
+const CO_REMAINDER_DENY = new Set(['COST', 'COCA', 'TACO', 'LOCO', 'ARCO', 'PEPSI', 'DISCO', 'GEICO']);
+
+function editDistanceAtMost1(left: string, right: string): boolean {
+  if (Math.abs(left.length - right.length) > 1) return false;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) {
+      i += 1;
+      j += 1;
+      continue;
+    }
+    edits += 1;
+    if (edits > 1) return false;
+    if (left.length === right.length) {
+      i += 1;
+      j += 1;
+    } else if (left.length > right.length) i += 1;
+    else j += 1;
+  }
+  if (i < left.length || j < right.length) edits += 1;
+  return edits <= 1;
+}
+
+function correctFormWord(token: string): string {
+  if (token.length < 8 || FORM_LEXICON.includes(token)) return token;
+  const hits = FORM_LEXICON.filter((word) => editDistanceAtMost1(token, word));
+  return hits.length === 1 ? hits[0] : token;
+}
+
+function repairIndexToken(token: string): string[] | null {
+  if (/^S[QR8]?PS?[O0]{1,3}D?INDEX$/.test(token)) return ['S&P', '500', 'INDEX'];
+  if (/^(?:SOO|SOD|S00|5OO)INDE[XK]$/.test(token)) return ['500', 'INDEX'];
+  if (/^(?:SOO|S00|5OO)$/.test(token)) return ['500'];
+  if (/^(?:SRP|SQP|S8P)$/.test(token)) return ['S&P'];
+  return null;
+}
+
+/** Split a glued form word. Already-spaced tokens stay as written. */
+function splitFormToken(token: string): string[] {
+  if (/[()]/.test(token)) return [token];
+  const trimmed = token.replace(/^[^A-Za-z0-9&]+|[^A-Za-z0-9&]+$/g, '');
+  if (!trimmed || !/^[A-Za-z0-9&]+$/.test(trimmed)) return [token];
+  const upper = trimmed.toUpperCase();
+  const mapped = FORM_TOKEN_MAP[upper];
+  if (mapped) return mapped.split(' ');
+  const index = repairIndexToken(upper);
+  if (index) return index;
+  if (/^CLASS[ABC]$/.test(upper)) return ['CLASS', upper.slice(5)];
+  const prefixes: string[] = [];
+  const suffixes: string[] = [];
+  let rest = upper;
+  for (let guard = 0; rest.length >= 3 && guard < 8; guard += 1) {
+    let peeled = false;
+    for (const word of FORM_WORDS) {
+      if (rest === word) {
+        prefixes.push(FORM_TOKEN_MAP[word] ?? word);
+        rest = '';
+        peeled = true;
+        break;
+      }
+      const minRemainder = word === 'LINE' || word === 'FUND' || word === 'US' || word === 'CO' ? 4 : 3;
+      const prefixOk = FORM_PREFIXES.has(word) && rest.startsWith(word) && rest.length >= word.length + minRemainder;
+      const suffixOk = rest.endsWith(word) && rest.length >= word.length + minRemainder;
+      if (!prefixOk && !suffixOk) continue;
+      if (suffixOk && CO_REMAINDER_DENY.has(rest.slice(0, -word.length))) continue;
+      const piece = FORM_TOKEN_MAP[word] ?? word;
+      if (prefixOk) {
+        prefixes.push(piece);
+        rest = rest.slice(word.length);
+      } else {
+        suffixes.unshift(piece);
+        rest = rest.slice(0, -word.length);
+      }
+      peeled = true;
+      break;
+    }
+    if (!peeled) break;
+  }
+  if (rest) prefixes.push(FORM_TOKEN_MAP[rest] ?? correctFormWord(rest));
+  const pieces = [...prefixes, ...suffixes];
+  if (pieces.length === 1 && pieces[0] === upper) return [token];
+  return pieces;
+}
+
+export function cleanGridAssetName(text: string): string {
+  const tokens = text.replace(/[|`´‘’_]+/g, ' ').split(/\s+/).filter(Boolean);
+  const words: string[] = [];
+  for (const token of tokens) {
+    for (const piece of splitFormToken(token)) {
+      if (piece === 'SA' && words[words.length - 1] === 'CLASS') {
+        words.push('A');
+        continue;
+      }
+      if (piece === 'SB' && words[words.length - 1] === 'CLASS') {
+        words.push('B');
+        continue;
+      }
+      const previous = words[words.length - 1] ?? '';
+      if (piece === 'NC' && /^[A-Z]{4,}$/.test(previous)) {
+        words.push('INC');
+        continue;
+      }
+      if ((piece === 'MN' || piece === 'CM' || piece === 'CAN') && /^(CORPORATION|COMPANY|INCORPORATED|HOLDINGS|LIMITED|INC|CORP|PLC|LLC|CO)$/.test(previous)) {
+        words.push('CMN');
+        continue;
+      }
+      if (piece === 'SP' && /^(?:500|SOO|SOD|S00)/.test(tokens[tokens.indexOf(token) + 1]?.toUpperCase() ?? '')) {
+        words.push('S&P');
+        continue;
+      }
+      if (words[words.length - 1] === piece) continue;
+      if (piece.length === 1 && !/^[A-Z]$/.test(piece)) continue;
+      words.push(piece);
+    }
+  }
+  return words.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function readingOrder(boxes: readonly HouseGridOcrBox[]): string {
+  const sorted = [...boxes].sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+  const lines: HouseGridOcrBox[][] = [];
+  for (const box of sorted) {
+    const line = lines[lines.length - 1];
+    const cy = (box.y0 + box.y1) / 2;
+    const lineY = line ? line.reduce((sum, entry) => sum + (entry.y0 + entry.y1) / 2, 0) / line.length : 0;
+    if (!line || Math.abs(cy - lineY) > 8) lines.push([box]);
+    else line.push(box);
+  }
+  return lines
+    .map((line) => line.sort((a, b) => a.x0 - b.x0).map((box) => box.text.trim()).filter(Boolean).join(' '))
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function assetText(boxes: readonly HouseGridOcrBox[], xs: readonly number[]): { text: string; conf: number } {
   const left = (xs[1] ?? 0) - 8;
   const right = (xs[2] ?? 0) - 4;
-  const hits = boxes
-    .filter((box) => box.x0 >= left && box.x0 < right && box.text.trim())
-    .sort((a, b) => Math.round(a.y0 / 12) - Math.round(b.y0 / 12) || a.x0 - b.x0);
+  const hits = boxes.filter((box) => box.x0 >= left && box.x0 < right && box.text.trim());
   if (hits.length === 0) return { text: '', conf: 0 };
   const conf = hits.reduce((sum, box) => sum + box.conf, 0) / hits.length;
-  return { text: hits.map((box) => box.text.trim()).join(' ').replace(/\s+/g, ' '), conf };
+  return { text: readingOrder(hits), conf };
 }
 
 function confidenceFor(marks: ClassifiedMarks, assetConf: number, hasDate: boolean, asset: string): number {
@@ -641,13 +1191,14 @@ function pageRows(page: HouseGridPageInput): {
   markCells: number;
 } {
   const empty = { detected: false, transactions: [], markedCells: 0, markCells: 0 };
-  const y0 = Math.floor(page.image.height * 0.28);
-  const y1 = Math.floor(page.image.height * 0.92);
-  const detectedLines = detectVerticalLines(page.image, y0, y1);
-  const fit = fitColumnLines(detectedLines);
-  if (!fit || fit.inliers < GRID_MIN_INLIERS || fit.xs.length < 21) return empty;
+  const fit = planHouseGridColumns(page.image);
+  if (!fit || fit.xs.length < 21) return empty;
+  const laidOut = rowBands(page.image, fit.xs);
+  // The cover prints a sample grid under the filer block and has no trust
+  // bar. A ruled line in the top of that page is the filer form, not a trade.
+  if (laidOut.sectionBars === 0 && hasEarlyHorizontalRule(page.image, fit.xs)) return empty;
   const sized = xTemplateForFit(fit.scale);
-  const bands = rowBands(page.image, fit.xs);
+  const bands = laidOut.bands;
   const transactions: ParsedTx[] = [];
   let markedCells = 0;
   let markCells = 0;
@@ -659,20 +1210,34 @@ function pageRows(page: HouseGridPageInput): {
     const marks = classifyMarkScores(scores);
     const inBand = boxesInRow(page.boxes, band.y0, band.y1);
     const asset = assetText(inBand, fit.xs);
-    const owners = inBand
+    const textOwner = inBand
       .filter((box) => box.x1 <= (fit.xs[1] ?? 0) + 12)
       .map((box) => ownerFromText(box.text))
-      .filter((owner): owner is Owner => owner !== null);
-    const dateLeft = fit.xs[7] ?? 0;
-    const dateRight = fit.xs[9] ?? dateLeft;
-    const dates = inBand
-      .map((box) => ({ box, iso: parseLooseDate(box.text) }))
-      .filter((entry): entry is { box: HouseGridOcrBox; iso: string } => {
-        if (!entry.iso) return false;
-        const cx = (entry.box.x0 + entry.box.x1) / 2;
-        return cx >= dateLeft - 8 && cx <= dateRight + 8;
-      })
-      .sort((a, b) => a.box.x0 - b.box.x0);
+      .find((owner): owner is Owner => owner !== null) ?? null;
+    const glyphOwner = ownerCodeFromCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
+    const owner = textOwner ?? glyphOwner;
+    const tradeLeft = fit.xs[7] ?? 0;
+    const tradeRight = fit.xs[8] ?? tradeLeft;
+    const notifRight = fit.xs[9] ?? tradeRight;
+    let tradeDate: string | null = null;
+    let notifDate: string | null = null;
+    for (const box of inBand) {
+      const iso = parseLooseDate(box.text);
+      if (!iso) continue;
+      const cx = (box.x0 + box.x1) / 2;
+      // The left date column is the trade. The right column is the notification.
+      // A missed trade-date word stays null instead of copying the notification.
+      if (cx >= tradeLeft - 8 && cx < tradeRight) {
+        if (!tradeDate) tradeDate = iso;
+      } else if (cx >= tradeRight && cx <= notifRight + 8) {
+        if (!notifDate) notifDate = iso;
+      }
+    }
+    // A "26" read as "25" is a year behind the notification, not a 2025 trade.
+    if (tradeDate && notifDate && tradeDate.slice(0, 4) === String(Number(notifDate.slice(0, 4)) - 1)) {
+      const snapped = `${notifDate.slice(0, 4)}-${tradeDate.slice(5)}`;
+      if (snapped <= notifDate) tradeDate = snapped;
+    }
     const chrome = looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text);
     const hasMark = marks.typeReason !== 'unmarked' || marks.amountReason !== 'unmarked' || marks.capGainsOver200;
     if (!asset.text && !hasMark) continue;
@@ -689,9 +1254,9 @@ function pageRows(page: HouseGridPageInput): {
     if (marks.typeReason !== 'ok' || marks.txType === null) warnings.push('grid_type_unmarked');
     const txType = marks.txType ?? ('' as TxType);
     transactions.push({
-      txDate: dates[0]?.iso ?? null,
-      owner: owners[0] ?? null,
-      assetName: asset.text || `(unreadable asset p${pageNum})`,
+      txDate: tradeDate,
+      owner,
+      assetName: cleanGridAssetName(asset.text) || asset.text || `(unreadable asset p${pageNum})`,
       ticker: tickerMatch?.[1] ?? null,
       assetType: null,
       txType,
@@ -701,8 +1266,8 @@ function pageRows(page: HouseGridPageInput): {
       capGainsOver200: marks.capGainsOver200,
       rawText: `${asset.text || '(unreadable)'} | type ${marks.txType ?? 'unmarked'} | amt ${marks.amountLetter ?? 'blank'}`,
       supplementalText: notes.join('; '),
-      description: dates[1] ? `date notified ${dates[1].iso}` : null,
-      confidence: confidenceFor(marks, asset.conf, Boolean(dates[0]), asset.text),
+      description: notifDate ? `date notified ${notifDate}` : null,
+      confidence: confidenceFor(marks, asset.conf, Boolean(tradeDate), asset.text),
       ...(warnings.length ? { extractionWarnings: warnings } : {}),
     });
   }

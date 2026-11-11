@@ -128,7 +128,7 @@ def x_template_for_fit(fit_scale: float) -> np.ndarray:
     return cv2.resize(src, (width, height), interpolation=cv2.INTER_NEAREST)
 
 
-def fit_column_lines(detected: Sequence[int]) -> Optional[ColumnFit]:
+def fit_column_lines(detected: Sequence[int], min_scale: float = 0.5) -> Optional[ColumnFit]:
     if len(detected) < 4:
         return None
     best: Optional[Tuple[int, float, ColumnFit]] = None
@@ -142,7 +142,7 @@ def fit_column_lines(detected: Sequence[int]) -> Optional[ColumnFit]:
                         if denom == 0:
                             continue
                         scale = (detected_arr[j] - detected_arr[i]) / denom
-                        if not 0.5 < scale < 1.4:
+                        if scale < min_scale or scale > 1.4:
                             continue
                         offset = detected_arr[i] - scale * template[a]
                         predicted = [offset + scale * t for t in template]
@@ -229,7 +229,7 @@ def classify_mark_scores(scores: Sequence[float]) -> ClassifiedMarks:
     )
 
 
-def detect_vertical_lines(gray: np.ndarray, y0: int, y1: int) -> List[int]:
+def detect_vertical_lines(gray: np.ndarray, y0: int, y1: int, min_fraction: float = 0.18) -> List[int]:
     """Thin vertical rules. Broken rules still count; wide text blobs do not."""
     top, bot = max(0, y0), min(gray.shape[0], max(y0 + 1, y1))
     band = gray[top:bot]
@@ -237,7 +237,7 @@ def detect_vertical_lines(gray: np.ndarray, y0: int, y1: int) -> List[int]:
         return []
     dark = band < 180
     cov = dark.mean(axis=0)
-    idx = np.where(cov > 0.18)[0]
+    idx = np.where(cov > min_fraction)[0]
     groups: List[List[int]] = []
     for x in idx.tolist():
         if groups and x - groups[-1][-1] <= 6:
@@ -264,16 +264,26 @@ def _cluster(values: Sequence[int], gap: int) -> List[int]:
     return [int(round(sum(group) / len(group))) for group in groups]
 
 
-def row_bands(gray: np.ndarray, xs: Sequence[int]) -> List[Tuple[int, int]]:
-    """Amount-column rules, with section bars and a one-pitch gap fill."""
+def _median(values: Sequence[float]) -> float:
+    if not values:
+        return 64.0
+    ordered = sorted(values)
+    return float(ordered[len(ordered) // 2])
+
+
+def row_bands(gray: np.ndarray, xs: Sequence[int]) -> Tuple[List[Tuple[int, int]], int]:
+    """Amount-column rules. A stable pitch fills faint multi-row gaps.
+
+    Pages with no section bar keep the original one-gap fill so a synthetic
+    grid is unchanged. The section-bar count lets the cover page, which has
+    rules and no trust bar, be skipped by the caller.
+    """
     if len(xs) < 12:
-        return []
-    # Date column through the amount rules. Asset text is left of this span,
-    # so a faint rule still counts without turning names into false lines.
+        return [], 0
     x0, x1 = int(xs[7]), int(xs[-1])
     x0, x1 = max(0, x0), min(gray.shape[1], max(x0 + 1, x1))
     if x1 <= x0:
-        return []
+        return [], 0
     strip = gray[:, x0:x1]
     dark = strip < 200
     cov = dark.mean(axis=1)
@@ -291,25 +301,41 @@ def row_bands(gray: np.ndarray, xs: Sequence[int]) -> List[Tuple[int, int]]:
             rules.append(int(round(sum(group) / len(group))))
         elif len(group) >= 12:
             bar_bottoms.append(group[-1])
-    if len(rules) < 3:
-        return []
+    if len(rules) < 3 and not bar_bottoms:
+        return [], 0
     first_bar = min(bar_bottoms) if bar_bottoms else None
     data_rules = sorted(rule for rule in rules if first_bar is None or rule > first_bar + 4)
-    if len(data_rules) < 2:
-        return []
-    gaps = [b - a for a, b in zip(data_rules, data_rules[1:]) if 24 <= b - a <= 140]
-    pitch = float(sorted(gaps)[len(gaps) // 2]) if gaps else 64.0
+    raw_gaps = [b - a for a, b in zip(data_rules, data_rules[1:])]
+    small_gaps = [gap for gap in raw_gaps if 32 <= gap <= 70]
+    can_subdivide = len(small_gaps) >= 2 and first_bar is not None
+    pitch = _median(small_gaps) if can_subdivide else _median([gap for gap in raw_gaps if 24 <= gap <= 140])
     edges = list(data_rules)
-    for a, b in zip(data_rules, data_rules[1:]):
-        gap = b - a
-        if pitch * 1.6 < gap < pitch * 2.5:
-            edges.append(int(round(a + gap / 2)))
-    if first_bar is not None:
-        for bottom in bar_bottoms:
-            nxt = min((edge for edge in edges if edge > bottom + 8), default=None)
-            if nxt is not None and abs(nxt - bottom - pitch) <= pitch * 0.45:
-                edges.append(bottom + 1)
-    sorted_edges = sorted(set(edges))
+    if can_subdivide and first_bar is not None and data_rules:
+        for a, b in zip(data_rules, data_rules[1:]):
+            gap = b - a
+            slots = round(gap / pitch) if pitch else 1
+            if 2 <= slots <= 8 and abs(gap - slots * pitch) <= pitch * 0.42:
+                for k in range(1, slots):
+                    edges.append(int(round(a + (k * gap) / slots)))
+        span = data_rules[0] - first_bar
+        slots = round(span / pitch) if pitch else 1
+        if 1 <= slots <= 6 and abs(span - slots * pitch) <= pitch * 0.45:
+            edges.append(first_bar + 4)
+            for k in range(1, slots):
+                edges.append(int(round(first_bar + (k * span) / slots)))
+    else:
+        if len(data_rules) < 2 and first_bar is None:
+            return [], len(bar_bottoms)
+        for a, b in zip(data_rules, data_rules[1:]):
+            gap = b - a
+            if pitch * 1.6 < gap < pitch * 2.5:
+                edges.append(int(round(a + gap / 2)))
+        if first_bar is not None:
+            for bottom in bar_bottoms:
+                nxt = min((edge for edge in edges if edge > bottom + 8), default=None)
+                if nxt is not None and abs(nxt - bottom - pitch) <= pitch * 0.45:
+                    edges.append(bottom + 1)
+    sorted_edges = sorted({edge for edge in edges if first_bar is None or edge >= first_bar})
     bands: List[Tuple[int, int]] = []
     for top, bot in zip(sorted_edges, sorted_edges[1:]):
         height = bot - top
@@ -319,7 +345,23 @@ def row_bands(gray: np.ndarray, xs: Sequence[int]) -> List[Tuple[int, int]]:
         if sample.size and float(sample.mean()) > 0.45:
             continue
         bands.append((top, bot))
-    return bands
+    if can_subdivide and bands:
+        asset_left = int(xs[1]) + 6
+        asset_right = int(xs[2]) - 6
+        cursor = bands[-1][1]
+        for _extra in range(4):
+            nxt = int(round(cursor + pitch))
+            if nxt > gray.shape[0] * 0.92 or asset_right - asset_left < 8:
+                break
+            asset = gray[cursor + 4:nxt - 2, asset_left:asset_right:2]
+            block = gray[cursor:nxt:2, x0:x1:4]
+            if asset.size == 0 or float((asset < 160).mean()) < 0.035:
+                break
+            if block.size and float((block < 150).mean()) > 0.45:
+                break
+            bands.append((cursor, nxt))
+            cursor = nxt
+    return bands, len(bar_bottoms)
 
 
 def _parse_date(text: str) -> Optional[str]:
@@ -329,6 +371,9 @@ def _parse_date(text: str) -> Optional[str]:
     month, day, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
     if year < 100:
         year += 2000
+    # "10" is often read as 16 or 20. Those months cannot exist, so keep the day.
+    if month in (16, 18, 19, 20):
+        month = 10
     if not (1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100):
         return None
     try:
@@ -380,14 +425,27 @@ def _match_cell(cell: np.ndarray, template: np.ndarray) -> float:
 def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> Optional[List[GridRow]]:
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-    y0, y1 = int(gray.shape[0] * 0.28), int(gray.shape[0] * 0.92)
-    detected = detect_vertical_lines(gray, y0, y1)
+    height = gray.shape[0]
+    detected = detect_vertical_lines(gray, int(height * 0.28), int(height * 0.92))
     fit = fit_column_lines(detected)
+    if fit is None or fit.inliers < GRID_MIN_INLIERS:
+        fit = fit_column_lines(
+            detect_vertical_lines(gray, int(height * 0.05), int(height * 0.72), 0.15),
+            0.42,
+        )
     if fit is None or fit.inliers < GRID_MIN_INLIERS or len(fit.xs) < 21:
         return None
     template = x_template_for_fit(fit.scale)
     xs = fit.xs
-    bands = row_bands(gray, xs)
+    bands, section_bars = row_bands(gray, xs)
+    # The cover prints a sample grid under the filer block and has no trust bar.
+    if section_bars == 0:
+        x0, x1 = int(xs[7]), int(xs[-1])
+        limit = int(height * 0.15)
+        if x1 - x0 >= 20 and limit > 0:
+            early = gray[:limit, max(0, x0):min(gray.shape[1], x1)]
+            if early.size and float((early < 200).mean(axis=1).max()) > 0.22:
+                return []
     rows: List[GridRow] = []
     for top, bot in bands:
         scores: List[float] = []
@@ -400,20 +458,29 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
         marks = classify_mark_scores(scores)
         in_band = [box for box in boxes if top <= (box.y0 + box.y1) / 2 <= bot]
         asset_boxes = [box for box in in_band if xs[1] - 8 <= box.x0 < xs[2] - 4 and box.text.strip()]
-        asset_boxes.sort(key=lambda box: (round(box.y0 / 12), box.x0))
+        asset_boxes.sort(key=lambda box: ((box.y0 + box.y1) / 2, box.x0))
         asset = " ".join(box.text.strip() for box in asset_boxes)
         asset_conf = sum(box.conf for box in asset_boxes) / len(asset_boxes) if asset_boxes else 0.0
         owners = [owner for owner in (_owner(box.text) for box in in_band if box.x1 <= xs[1] + 12) if owner]
-        date_left, date_right = xs[7], xs[9]
-        dates = []
+        trade_left, trade_right, notif_right = xs[7], xs[8], xs[9]
+        trade_date: Optional[str] = None
+        notif_date: Optional[str] = None
         for box in in_band:
             iso = _parse_date(box.text)
             if not iso:
                 continue
             cx = (box.x0 + box.x1) / 2
-            if date_left - 8 <= cx <= date_right + 8:
-                dates.append((box.x0, iso))
-        dates.sort()
+            # The left date column is the trade. A missed word stays empty.
+            if trade_left - 8 <= cx < trade_right:
+                if trade_date is None:
+                    trade_date = iso
+            elif trade_right <= cx <= notif_right + 8:
+                if notif_date is None:
+                    notif_date = iso
+        if trade_date and notif_date and trade_date[:4] == f"{int(notif_date[:4]) - 1:04d}":
+            snapped = f"{notif_date[:4]}-{trade_date[5:]}"
+            if snapped <= notif_date:
+                trade_date = snapped
         has_mark = marks.type_reason != "unmarked" or marks.amount_reason != "unmarked" or marks.cap_gains
         if not asset and not has_mark:
             continue
@@ -436,7 +503,7 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
             and marks.type_score >= GRID_STRONG_MARK
             and marks.amount_reason == "ok"
             and marks.amount_score >= GRID_STRONG_MARK
-            and bool(dates)
+            and bool(trade_date)
             and len(asset.strip()) >= 4
             and asset_conf >= 0.45
         )
@@ -445,7 +512,7 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
         elif strong:
             confidence = 0.97
         else:
-            confidence = min(0.9, 0.42 + min(0.2, marks.type_score * 0.2) + (0.12 if marks.amount_reason == "ok" else 0) + (0.08 if dates else 0))
+            confidence = min(0.9, 0.42 + min(0.2, marks.type_score * 0.2) + (0.12 if marks.amount_reason == "ok" else 0) + (0.08 if trade_date else 0))
         ticker = None
         found = re.search(r"\(([A-Z]{1,5})\)", asset)
         if found:
@@ -454,8 +521,8 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
             asset_name=asset or f"(unreadable asset p{page})",
             owner=owners[0] if owners else None,
             tx_type=marks.tx_type or "",
-            tx_date=dates[0][1] if dates else None,
-            notif_date=dates[1][1] if len(dates) > 1 else None,
+            tx_date=trade_date,
+            notif_date=notif_date,
             amount_min=marks.amount_min,
             amount_max=marks.amount_max,
             confidence=confidence,

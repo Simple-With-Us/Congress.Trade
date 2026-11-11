@@ -26,4 +26,4 @@ Scored on H-2026-9116399 (Ro Khanna, 23 pages) against the 275 hand-verified typ
 
 - Text OCR on the app image is tesseract, which is the CPU backend already installed there.  The worker can keep using its configured OCR backend.  RapidOCR is not added to the image.
 - Amount column K is recorded and not mapped onto a STOCK Act bracket.
-- Faint row rules still drop or merge rows on some pages (notably 6, 12, 16, and 23).  Page 13's asset column OCR is scrambled.  DC/SP owner codes are often missed.  A missing trade date is sometimes replaced by the notification date.
+- The 2026-11-11 accuracy pass fills faint row rules, skips the cover, reads owner ink, and stops copying a notification date into a missed trade date.  See `docs/rollouts/2026-11-11-house-grid-form-accuracy.md`.
