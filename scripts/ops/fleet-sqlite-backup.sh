@@ -19,12 +19,22 @@
 #   4) VACUUM INTO instead of sqlite3 .backup -- online backup never converges on
 #      the ~11 GB ST DB under continuous writers
 #   5) a timed-out or failed dump ALERTS and returns non-zero (never return 0)
-# B2 compression (Jay 2026-10-30): each run's dump set is zstd-compressed for
-#   the B2 upload only (`<name>-<STAMP>.db.zst`, plus the raw-db `.db.sha256`).
-#   Local dumps stay plain `.db` (weekly verify + local restore unchanged).
-#   Restore from B2:  zstd -d X-<STAMP>.db.zst -o X-<STAMP>.db, then
-#   PRAGMA integrity_check.  Older B2 sets stay plain `.db`; prune handles both.
-#   FLEET_BACKUP_B2_COMPRESS=0, or no zstd on PATH, uploads raw (old behavior).
+# Local compression (CT-2472, OPS-1006): after a dump is complete (sha256
+#   present, no rollback journal), zstd replaces the plain `.db` with
+#   `<name>-<STAMP>.db.zst` in the same directory.  Keep counts are unchanged
+#   and the files stay on the root disk (`/data/backups` is a symlink chain
+#   onto `/backups`; readlink -f before measure or delete).  Incomplete dumps
+#   are never compressed or removed by the compress step.  Retention still
+#   drops incomplete files so they cannot occupy a KEEP_COUNT slot.
+#   FLEET_BACKUP_LOCAL_COMPRESS=0 leaves plain `.db`.  Missing zstd leaves
+#   plain `.db` and logs a warning.
+# B2 compression (Jay 2026-10-30): the offsite object is still
+#   `<name>-<STAMP>.db.zst` plus the raw-db `.db.sha256`.  B2/R2 keep policy
+#   is unchanged.  When the local file is already `.db.zst`, that file is
+#   uploaded and kept.  FLEET_BACKUP_B2_COMPRESS=0, or no zstd on PATH,
+#   uploads the raw `.db` when it is still present.
+#   Restore: zstd -d X-<STAMP>.db.zst -o X-<STAMP>.db, then PRAGMA integrity_check.
+#   Older B2 sets stay plain `.db`; prune handles both.
 # Host install after merge: /usr/local/sbin/fleet-sqlite-backup.sh on
 # fleet-hetzner-nbg1 (apply on top of the UUID-pinned host copy; do not
 # overwrite wholesale).  Not a Coolify image bake.
@@ -73,15 +83,105 @@ app_enabled() {
 BACKUP_APP_LIST=()
 
 
-# A dump is complete only when the .db exists, a matching .sha256 sidecar
-# exists, and sqlite3 is not still writing a rollback journal.  Incomplete
-# files must never win KEEP_COUNT / KEEP_DAYS over a finished snapshot.
-dump_is_complete() {
+# /data/backups is a symlink chain onto /backups on the root disk.  Resolve
+# before measuring or deleting, and never delete a path that lands outside
+# that resolved root (a symlink planted in the dump dir).
+resolve_fs_path() {
+  local p="$1"
+  if [ -e "$p" ] || [ -L "$p" ]; then
+    readlink -f -- "$p"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
+resolve_backup_root() {
+  if [ -d "$ROOT" ] || [ -L "$ROOT" ]; then
+    resolve_fs_path "$ROOT"
+    return 0
+  fi
+  return 1
+}
+
+# Logical dump path ending in .db.  The .sha256 and -journal sidecars hang off it.
+dump_base_db() {
   local f="$1"
-  [ -f "$f" ] || return 1
-  [ -s "$f" ] || return 1
-  [ -f "${f}.sha256" ] || return 1
-  [ ! -e "${f}-journal" ]
+  case "$f" in
+    *.db.zst) printf '%s\n' "${f%.zst}" ;;
+    *) printf '%s\n' "$f" ;;
+  esac
+}
+
+path_under_root() {
+  local root="$1" path="$2" r p
+  r="$(resolve_fs_path "$root")"
+  p="$(resolve_fs_path "$path")"
+  case "$p" in
+    "$r"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Byte size of the physical file.  Callers pass either the symlink path or
+# the real path; du always sees the readlink -f target.
+measure_path_bytes() {
+  local resolved
+  [ -e "$1" ] || [ -L "$1" ] || return 1
+  resolved="$(resolve_fs_path "$1")"
+  du -b "$resolved" | awk '{print $1}'
+}
+
+# Delete one logical dump's payload and sidecars on the resolved root.
+rm_dump_set() {
+  local base="$1" root_real p resolved
+  base="$(dump_base_db "$base")"
+  root_real="$(resolve_backup_root)" || return 0
+  for p in "$base" "${base}.sha256" "${base}.zst" "${base}-journal" "${base}-wal" "${base}.zst.partial"; do
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    resolved="$(resolve_fs_path "$p")"
+    if ! path_under_root "$root_real" "$resolved"; then
+      echo "[fleet-backup] SKIP delete outside backup root: $p -> $resolved" >&2
+      continue
+    fi
+    rm -f "$resolved"
+  done
+}
+
+# A dump is complete when a payload exists (.db and/or .db.zst), a matching
+# .sha256 sidecar exists, and sqlite3 is not still writing a rollback journal.
+# Incomplete files must never win KEEP_COUNT / KEEP_DAYS over a finished snapshot.
+dump_is_complete() {
+  local f base
+  f="$1"
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    f="$(resolve_fs_path "$f")"
+  fi
+  base="$(dump_base_db "$f")"
+  case "$base" in
+    *.db) ;;
+    *) return 1 ;;
+  esac
+  [ -f "${base}.sha256" ] || return 1
+  [ ! -e "${base}-journal" ] || return 1
+  if [ -f "$base" ] && [ -s "$base" ]; then
+    return 0
+  fi
+  if [ -f "${base}.zst" ] && [ -s "${base}.zst" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Newest-first logical .db paths (one per stamp) under a physical app dir.
+list_dump_bases_newest_first() {
+  local dir="$1" path
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -type f \( -name '*.db' -o -name '*.db.zst' \) -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -nr \
+    | while IFS=$'\t' read -r _ts path; do
+        [ -n "$path" ] || continue
+        dump_base_db "$path"
+      done
 }
 
 # VACUUM INTO runs in ONE read transaction so concurrent writers cannot
@@ -157,7 +257,7 @@ backup_one() {
   fi
   # integrity + checksum: sha256 is the completeness marker for retention
   if sqlite3 "$dest" "PRAGMA integrity_check;" | head -1 | grep -qx ok; then
-    echo "[fleet-backup] OK $name -> $dest ($(du -h "$dest" | awk '{print $1}')) at $(fleet_ct_label)"
+    echo "[fleet-backup] OK $name -> $dest ($(du -h "$(resolve_fs_path "$dest")" | awk '{print $1}')) at $(fleet_ct_label)"
     sha256sum "$dest" > "${dest}.sha256"
   else
     echo "[fleet-backup] FAIL $name integrity not clean: $dest"
@@ -168,33 +268,46 @@ backup_one() {
 }
 
 prune_incomplete_dumps() {
-  local app dir f
-  [ -d "$ROOT" ] || return 0
+  local root_real app dir f base resolved
+  local -A seen=()
+  root_real="$(resolve_backup_root)" || return 0
   for app in "${BACKUP_APP_LIST[@]}"; do
-    dir="$ROOT/$app"
+    dir="$root_real/$app"
     [ -d "$dir" ] || continue
-    for f in "$dir"/*.db; do
+    seen=()
+    # Torn compress output only.  A finished .db.zst is a local dump, not a
+    # leftover B2 upload, and must survive this pass.
+    for f in "$dir"/*.zst.partial; do
+      [ -e "$f" ] || [ -L "$f" ] || continue
+      resolved="$(resolve_fs_path "$f")"
+      path_under_root "$root_real" "$resolved" || continue
+      echo "[fleet-backup] prune-stale-zst $resolved at $(fleet_ct_label)"
+      rm -f "$resolved"
+    done
+    for f in "$dir"/*.db "$dir"/*.db.zst; do
       [ -f "$f" ] || continue
-      if dump_is_complete "$f"; then
+      base="$(dump_base_db "$(resolve_fs_path "$f")")"
+      [ -n "${seen[$base]:-}" ] && continue
+      seen["$base"]=1
+      if dump_is_complete "$base"; then
         continue
       fi
-      echo "[fleet-backup] prune-incomplete $f at $(fleet_ct_label)"
-      rm -f "$f" "${f}.sha256" "${f}-journal" "${f}-wal"
-    done
-    # .zst / .zst.partial are transient B2-upload copies (upload_b2_set removes
-    # them after each upload).  Any left here came from an interrupted run;
-    # this runs before the current run compresses anything, so drop them all.
-    for f in "$dir"/*.zst "$dir"/*.zst.partial; do
-      [ -f "$f" ] || continue
-      echo "[fleet-backup] prune-stale-zst $f at $(fleet_ct_label)"
-      rm -f "$f"
+      echo "[fleet-backup] prune-incomplete $base at $(fleet_ct_label)"
+      rm_dump_set "$base"
     done
   done
 }
 
+payload_is_older_than_keep_days() {
+  local p="$1"
+  [ -f "$p" ] || return 1
+  find "$p" -maxdepth 0 -type f -mtime +"$KEEP_DAYS" -print 2>/dev/null | grep -q .
+}
+
 prune_by_age() {
-  local app dir f s db
-  [ -d "$ROOT" ] || return 0
+  local root_real app dir f s db base p aged resolved
+  local -A seen=()
+  root_real="$(resolve_backup_root)" || return 0
   case "$KEEP_DAYS" in
     ''|*[!0-9]*)
       echo "[fleet-backup] retention SKIP: non-numeric FLEET_BACKUP_KEEP_DAYS=$KEEP_DAYS"
@@ -204,28 +317,54 @@ prune_by_age() {
   # Age-prune only complete dumps so an incomplete newer file cannot keep a
   # finished snapshot from being the one KEEP_DAYS considers.  Scoped to
   # FLEET_BACKUP_APPS dirs only (ST/CT keep-2 must not touch UM dumps).
+  # A logical dump is old only when every payload that exists (.db and .db.zst)
+  # is older than KEEP_DAYS, so compressing a fresh copy cannot be undone by
+  # an older sidecar.
   for app in "${BACKUP_APP_LIST[@]}"; do
-    dir="$ROOT/$app"
+    dir="$root_real/$app"
     [ -d "$dir" ] || continue
-    find "$dir" -type f -name '*.db' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r f; do
-      dump_is_complete "$f" || continue
-      echo "[fleet-backup] prune-age $f at $(fleet_ct_label)"
-      rm -f "$f" "${f}.sha256"
+    seen=()
+    for f in "$dir"/*.db "$dir"/*.db.zst; do
+      [ -f "$f" ] || continue
+      base="$(dump_base_db "$(resolve_fs_path "$f")")"
+      [ -n "${seen[$base]:-}" ] && continue
+      seen["$base"]=1
+      dump_is_complete "$base" || continue
+      aged=1
+      for p in "$base" "${base}.zst"; do
+        [ -f "$p" ] || continue
+        if ! payload_is_older_than_keep_days "$p"; then
+          aged=0
+        fi
+      done
+      if [ "$aged" = 1 ]; then
+        echo "[fleet-backup] prune-age $base at $(fleet_ct_label)"
+        rm_dump_set "$base"
+      fi
+    done
+    find "$dir" -type f -name '*.sqlite' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r f; do
+      resolved="$(resolve_fs_path "$f")"
+      path_under_root "$root_real" "$resolved" || continue
+      echo "[fleet-backup] prune-age $resolved at $(fleet_ct_label)"
+      rm -f "$resolved"
     done || true
-    find "$dir" -type f -name '*.sqlite' -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null || true
     find "$dir" -type f -name '*.sha256' -mtime +"$KEEP_DAYS" -print 2>/dev/null | while read -r s; do
       db="${s%.sha256}"
-      if [ ! -f "$db" ]; then
-        echo "[fleet-backup] prune-age-orphan $s at $(fleet_ct_label)"
-        rm -f "$s"
+      # .db.sha256 belongs to either the plain dump or the .db.zst payload.
+      if [ ! -f "$db" ] && [ ! -f "${db}.zst" ]; then
+        resolved="$(resolve_fs_path "$s")"
+        path_under_root "$root_real" "$resolved" || continue
+        echo "[fleet-backup] prune-age-orphan $resolved at $(fleet_ct_label)"
+        rm -f "$resolved"
       fi
     done || true
   done
 }
 
 prune_by_keep_count() {
-  local app dir f n
-  [ -d "$ROOT" ] || return 0
+  local root_real app dir base n
+  local -A seen=()
+  root_real="$(resolve_backup_root)" || return 0
   case "$KEEP_COUNT" in
     ''|*[!0-9]*)
       echo "[fleet-backup] retention SKIP: non-numeric FLEET_BACKUP_KEEP_COUNT=$KEEP_COUNT"
@@ -237,20 +376,117 @@ prune_by_keep_count() {
     return 0
   fi
   for app in "${BACKUP_APP_LIST[@]}"; do
-    dir="$ROOT/$app"
+    dir="$root_real/$app"
     [ -d "$dir" ] || continue
     n=0
+    seen=()
     # Newest-first; skip anything that is not a complete dump so a live
     # .db-journal or missing .sha256 cannot occupy a KEEP_COUNT slot.
-    ls -1t "$dir"/*.db 2>/dev/null | while read -r f; do
-      [ -f "$f" ] || continue
-      dump_is_complete "$f" || continue
+    # Plain .db and .db.zst of the same stamp count once.
+    while IFS= read -r base; do
+      [ -n "$base" ] || continue
+      [ -n "${seen[$base]:-}" ] && continue
+      seen["$base"]=1
+      dump_is_complete "$base" || continue
       n=$((n + 1))
       if [ "$n" -gt "$KEEP_COUNT" ]; then
-        echo "[fleet-backup] prune-count $f at $(fleet_ct_label)"
-        rm -f "$f" "${f}.sha256"
+        echo "[fleet-backup] prune-count $base at $(fleet_ct_label)"
+        rm_dump_set "$base"
       fi
-    done || true
+    done < <(list_dump_bases_newest_first "$dir")
+  done
+}
+
+# Compress complete plain dumps in place.  Never compresses or deletes an
+# incomplete dump.  A hash mismatch keeps the plain file and drops the .zst.
+FLEET_BACKUP_LOCAL_COMPRESS="${FLEET_BACKUP_LOCAL_COMPRESS:-1}"
+compress_one_complete_dump() {
+  local db="$1" base lvl zst partial want got root_real db_resolved zst_resolved
+  [ "${FLEET_BACKUP_LOCAL_COMPRESS:-1}" = "1" ] || return 0
+  if [ -e "$db" ] || [ -L "$db" ]; then
+    db="$(resolve_fs_path "$db")"
+  fi
+  base="$(dump_base_db "$db")"
+  case "$base" in
+    *.db) ;;
+    *) return 0 ;;
+  esac
+  dump_is_complete "$base" || return 0
+  [ -f "$base" ] && [ -s "$base" ] || return 0
+  [ ! -e "${base}-journal" ] || return 0
+  root_real="$(resolve_backup_root)" || return 0
+  if ! path_under_root "$root_real" "$base"; then
+    echo "[fleet-backup] SKIP compress outside backup root: $base" >&2
+    return 0
+  fi
+  if ! command -v zstd >/dev/null 2>&1; then
+    echo "[fleet-backup] WARN zstd missing; leaving plain $(basename "$base")"
+    return 0
+  fi
+  want="$(awk 'NR==1 { print $1; exit }' "${base}.sha256")"
+  got="$(sha256sum "$base" | awk '{print $1}')"
+  if [ -z "$want" ] || [ "$got" != "$want" ]; then
+    echo "[fleet-backup] WARN $(basename "$base") sha256 mismatch; not compressing"
+    return 0
+  fi
+  lvl="${FLEET_BACKUP_ZSTD_LEVEL:-3}"
+  case "$lvl" in ''|*[!0-9]*) lvl=3 ;; esac
+  zst="${base}.zst"
+  partial="${base}.zst.partial"
+  rm -f "$partial"
+  if [ ! -s "$zst" ]; then
+    if ! nice -n 10 zstd -q -T2 -"$lvl" "$base" -o "$partial"; then
+      rm -f "$partial"
+      echo "[fleet-backup] WARN zstd failed for $(basename "$base"); keeping plain dump"
+      return 0
+    fi
+    if ! zstd -q -t "$partial"; then
+      rm -f "$partial"
+      echo "[fleet-backup] WARN zstd test failed for $(basename "$base"); keeping plain dump"
+      return 0
+    fi
+    mv -f "$partial" "$zst"
+  elif ! zstd -q -t "$zst"; then
+    rm -f "$zst"
+    echo "[fleet-backup] WARN existing zst failed test for $(basename "$base"); keeping plain dump"
+    return 0
+  fi
+  # Re-check immediately before unlinking the plain dump.
+  dump_is_complete "$base" || { rm -f "$zst"; return 0; }
+  [ ! -e "${base}-journal" ] || { rm -f "$zst"; return 0; }
+  if ! got="$(zstd -q -d -c "$zst" | sha256sum | awk '{print $1}')"; then
+    rm -f "$zst"
+    echo "[fleet-backup] WARN decompress failed for $(basename "$base"); keeping plain dump"
+    return 0
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "[fleet-backup] WARN compressed $(basename "$base") != sha256; keeping plain dump"
+    rm -f "$zst"
+    return 0
+  fi
+  dump_is_complete "$base" || { rm -f "$zst"; return 0; }
+  db_resolved="$(resolve_fs_path "$base")"
+  zst_resolved="$(resolve_fs_path "$zst")"
+  path_under_root "$root_real" "$db_resolved" || return 0
+  path_under_root "$root_real" "$zst_resolved" || { rm -f "$zst"; return 0; }
+  rm -f "$db_resolved"
+  echo "[fleet-backup] local zstd $(basename "$base") -> $(basename "$zst_resolved") ($(du -h "$zst_resolved" | awk '{print $1}')) at $(fleet_ct_label)"
+}
+
+compress_complete_local_dumps() {
+  local root_real app dir f
+  [ "${FLEET_BACKUP_LOCAL_COMPRESS:-1}" = "1" ] || return 0
+  root_real="$(resolve_backup_root)" || return 0
+  if [ "${#BACKUP_APP_LIST[@]}" -eq 0 ]; then
+    backup_apps_selected || return 0
+  fi
+  for app in "${BACKUP_APP_LIST[@]}"; do
+    dir="$root_real/$app"
+    [ -d "$dir" ] || continue
+    for f in "$dir"/*.db; do
+      [ -f "$f" ] || continue
+      compress_one_complete_dump "$f"
+    done
   done
 }
 
@@ -262,6 +498,7 @@ apply_local_retention() {
   prune_incomplete_dumps
   prune_by_age
   prune_by_keep_count
+  compress_complete_local_dumps
 }
 
 # B2-side prune (defined above the LIB_ONLY return so the offline test can
@@ -532,16 +769,36 @@ compress_offsite_set() {
 
 # Upload this run's set to b2:<bucket>/hetzner/.  Compressed: only .zst files
 # plus the raw-db .sha256 sidecars.  Raw fallback: the whole set as before.
-# Local .zst copies are removed after a successful upload (local retention
-# keeps plain .db; prune_incomplete_dumps clears any leftover .zst).
+# A local .db.zst that is already the retained dump is uploaded and kept.
+# A .zst produced only for this upload is removed after success when the plain
+# .db is still the local copy (FLEET_BACKUP_LOCAL_COMPRESS=0).
 upload_b2_set() {
-  local dir="$1" bucket="$2" stamp="$3" rc=0
+  local dir="$1" bucket="$2" stamp="$3" rc=0 raw=0 have_zst=0 f
+  for f in "$dir"/*"${stamp}".db; do
+    [ -f "$f" ] && raw=1 && break
+  done
+  for f in "$dir"/*"${stamp}".db.zst; do
+    [ -f "$f" ] && have_zst=1 && break
+  done
+  if [ "$have_zst" = 1 ] && [ "$raw" = 0 ]; then
+    rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*.zst" --include "*${stamp}*.sha256" --transfers 2 -q || rc=$?
+    return "$rc"
+  fi
   if compress_offsite_set "$dir" "$stamp"; then
     rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*.zst" --include "*${stamp}*.sha256" --transfers 2 -q || rc=$?
     # Keep the verified .zst after a failed upload for a manual retry; the next
-    # run's prune_incomplete_dumps removes it, so at most one set lingers.
+    # run's prune removes a .zst that has no sha256.  On success the plain .db
+    # is still the local copy, so the upload-only .zst goes away.
     if [ "$rc" -eq 0 ]; then
-      rm -f "$dir"/*"${stamp}"*.zst
+      local zf zr root_real
+      root_real="$(resolve_backup_root || true)"
+      for zf in "$dir"/*"${stamp}"*.zst "$dir"/*"${stamp}"*.zst.partial; do
+        [ -e "$zf" ] || [ -L "$zf" ] || continue
+        zr="$(resolve_fs_path "$zf")"
+        if [ -n "$root_real" ] && path_under_root "$root_real" "$zr"; then
+          rm -f "$zr"
+        fi
+      done
     fi
   else
     # compress_offsite_set already removed any partial .zst output.
@@ -582,6 +839,11 @@ fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_FAILED=0
 LOG="/var/log/fleet-backup/sqlite-${STAMP}.log"
+# Pin the physical directory.  /data/backups is a symlink chain onto /backups.
+if _root_real="$(resolve_backup_root)"; then
+  ROOT="$_root_real"
+fi
+unset _root_real
 mkdir -p "$ROOT" /var/log/fleet-backup
 exec > >(tee -a "$LOG") 2>&1
 echo "[fleet-backup] start $(fleet_ct_label "$STAMP") apps=$FLEET_BACKUP_APPS keep_days=$KEEP_DAYS keep_count=$KEEP_COUNT b2_sets=${B2_KEEP_SETS:-} b2_daily=${B2_KEEP_DAILY:-} b2_weekly=${B2_KEEP_WEEKLY:-} b2_max_age_days=${B2_MAX_AGE_DAYS:-} ct_hours=${FLEET_BACKUP_CT_HOURS:-}"
@@ -594,12 +856,14 @@ if [ "$FLEET_BACKUP_DRY_RUN" = "1" ]; then
   echo "[fleet-backup] DRY-RUN: would dump/prune local dirs and B2 hetzner/ prefixes:"
   declare -A _B2_BUCKET=( [congress]="jays-congress-trade-eu" [socratic]="jays-socratic-trade-eu" [usage-monitor]="jays-usage-monitor-eu" )
   for app in "${BACKUP_APP_LIST[@]}"; do
-    echo "  local: $ROOT/$app/"
+    echo "  local: $(resolve_fs_path "$ROOT/$app")/"
     echo "  B2:    b2:${_B2_BUCKET[$app]}/hetzner/  (dump sets only; never Litestream / qdrant/)"
     if [ -d "$ROOT/$app" ]; then
-      ls -1t "$ROOT/$app"/*.db 2>/dev/null | head -5 | while read -r f; do
-        echo "    present: $(basename "$f") ($(du -h "$f" | awk '{print $1}'))"
-      done || true
+      find "$(resolve_fs_path "$ROOT/$app")" -maxdepth 1 -type f \( -name '*.db' -o -name '*.db.zst' \) -printf '%T@\t%p\n' 2>/dev/null \
+        | sort -nr | head -5 | while IFS=$'\t' read -r _ f; do
+          [ -n "$f" ] || continue
+          echo "    present: $(basename "$f") ($(du -h "$(resolve_fs_path "$f")" | awk '{print $1}'))"
+        done || true
     fi
   done
   echo "[fleet-backup] DRY-RUN done (no VACUUM, upload, or delete)"
@@ -652,7 +916,7 @@ fi
 
 # retention: drop incomplete dumps first, then age-based (FLEET_BACKUP_KEEP_DAYS,
 # default 2d) AND keep-count (FLEET_BACKUP_KEEP_COUNT, default 2 newest COMPLETE
-# .db per app dir)
+# dumps per app dir, plain .db or .db.zst).  Then compress surviving plain dumps.
 apply_local_retention
 echo "[fleet-backup] done $(fleet_ct_label "$STAMP") finished $(fleet_ct_label)"
 df -h /data / | tail -5
@@ -710,13 +974,20 @@ for app in congress socratic usage-monitor; do
         # without listing the bucket (no secrets on the health path).
         if [ "$app" = "congress" ]; then
           status_path="/data/congress-trade/.r2-archive-status.json"
-          newest="$(ls -1t "$dir"/*"${STAMP}"*.db 2>/dev/null | head -1 || true)"
-          key="weekly/$(basename "${newest:-congress-trade-${STAMP}.db}")"
+          newest=""
+          for candidate in "$dir"/*"${STAMP}".db.zst "$dir"/*"${STAMP}".db; do
+            [ -f "$candidate" ] || continue
+            newest="$candidate"
+            break
+          done
+          key="weekly/$(basename "${newest:-congress-trade-${STAMP}.db.zst}")"
           printf '{"ok":true,"key":"%s","completedAt":"%s"}\n' "$key" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$status_path"
           # R2 is weekly-archive-only.  One CT db is ~1.9 GB; extra copies
           # trip the 10 GB free tier.  Keep the newest weekly set only.
+          # Stamp strip accepts both congress-trade-<STAMP>.db.zst and .db.
           keep="$(basename "${newest:-}")"
           stamp_keep="${keep#congress-trade-}"
+          stamp_keep="${stamp_keep%.db.zst}"
           stamp_keep="${stamp_keep%.db}"
           rclone lsf "r2:${r2bucket}/weekly/" 2>/dev/null | while read -r name; do
             [ -n "$name" ] || continue
