@@ -33,6 +33,10 @@ import type { Env, DocKind } from '../shared/types.ts';
 import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { get, run } from '../shared/db.ts';
 import { isReviewResolved } from './reviewQueueGuard.ts';
+import {
+  clearIngestFailureReviewQueueIfRecovered,
+  recordGenuineIngestFailure,
+} from './ingestFailureReviewQueue.ts';
 
 interface FilingRow {
   doc_id: string;
@@ -174,11 +178,12 @@ export async function classifyFiling(
   const key = row.raw_object_key;
   if (!key) {
     await lease?.assertOwned();
-    await run(
-      env.DB,
-      `UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?`,
-      ['classifier: missing raw_object_key', docId],
-    );
+    const message = 'classifier: missing raw_object_key';
+    await recordGenuineIngestFailure(env, docId, message, {
+      source: 'classifier',
+      stage: 'parse',
+      lease,
+    });
     return 'unknown';
   }
 
@@ -186,11 +191,12 @@ export async function classifyFiling(
   const obj = await env.RAW_FILES.get(key);
   if (!obj) {
     await lease?.assertOwned();
-    await run(
-      env.DB,
-      `UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?`,
-      [`classifier: R2 object ${key} not found`, docId],
-    );
+    const message = `classifier: R2 object ${key} not found`;
+    await recordGenuineIngestFailure(env, docId, message, {
+      source: 'classifier',
+      stage: 'parse',
+      lease,
+    });
     return 'unknown';
   }
 
@@ -229,6 +235,7 @@ export async function classifyFiling(
       WHERE doc_id = ?`,
     [docKind, docId],
   );
+  await clearIngestFailureReviewQueueIfRecovered(env.DB, docId);
 
   // Hand off to the extraction stage. Per the QueueMessage contract this is the
   // message the extraction step consumes (see src/index.ts routing).

@@ -237,3 +237,39 @@ describe('review-queue ingest-failure input validation', () => {
   });
 });
 
+describe('POST /review-queue/backfill-ingest-failures', () => {
+  it('dry-run reports matched rows; apply opens them on the review queue', async () => {
+    const db = makeReviewQueueTestDb(mixedFixture());
+    const dry = await app.request(
+      '/review-queue/backfill-ingest-failures',
+      { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: JSON.stringify({ dryRun: true }) },
+      env(db),
+    );
+    expect(dry.status).toBe(200);
+    const dryBody = (await dry.json()) as { matched: number; ensured: number; dryRun: boolean };
+    expect(dryBody.dryRun).toBe(true);
+    expect(dryBody.matched).toBe(2);
+    expect(dryBody.ensured).toBe(0);
+
+    const apply = await app.request(
+      '/review-queue/backfill-ingest-failures',
+      { method: 'POST', headers: { ...AUTH, 'Content-Type': 'application/json' }, body: JSON.stringify({ apply: true }) },
+      env(db),
+    );
+    expect(apply.status).toBe(200);
+    const applyBody = (await apply.json()) as { ensured: number };
+    expect(applyBody.ensured).toBe(2);
+
+    const queue = await app.request('/review-queue?limit=50&resolved=0', { headers: AUTH }, env(db));
+    const queueBody = (await queue.json()) as { items: Array<{ docId: string; reason: string }> };
+    expect(queueBody.items.map((i) => i.docId).sort()).toEqual(
+      ['H-FAIL-2', 'H-PENDING', 'H-QUEUED', 'S-FAIL-1'].sort(),
+    );
+    const failRow = queueBody.items.find((i) => i.docId === 'S-FAIL-1');
+    expect(failRow?.reason).toMatch(/^ingest_failure:/);
+
+    const ingest = await fetchIngest(db, '?limit=50');
+    expect(ingest.body.items.map((i) => i.docId).sort()).toEqual([]);
+  });
+});
+
