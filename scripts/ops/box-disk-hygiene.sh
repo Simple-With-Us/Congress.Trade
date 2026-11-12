@@ -30,6 +30,7 @@
 #   CRIT_FREE_GB              default 8
 #   LIGHT_BUILDER_UNTIL       default 12h   (unused build cache older than this)
 #   IMAGE_PRUNE_UNTIL         default 1h    (warn/crit prune skips newer images/cache)
+#   DEPLOY_STALE_MIN          default 90    (ignore queue rows not updated for this long)
 #   AGGRESSIVE_COOLDOWN_SEC   default 1800
 #   PRUNE_VOLUMES             default 0     (1 = docker volume prune -f unused only)
 #   CT_DATA_DIR               default /data/congress-trade
@@ -52,6 +53,8 @@ WARN_FREE_GB="${WARN_FREE_GB:-15}"
 CRIT_FREE_GB="${CRIT_FREE_GB:-8}"
 LIGHT_BUILDER_UNTIL="${LIGHT_BUILDER_UNTIL:-12h}"
 IMAGE_PRUNE_UNTIL="${IMAGE_PRUNE_UNTIL:-1h}"
+DEPLOY_STALE_MIN="${DEPLOY_STALE_MIN:-90}"
+[[ "$DEPLOY_STALE_MIN" =~ ^[0-9]+$ ]] || DEPLOY_STALE_MIN=90
 AGGRESSIVE_COOLDOWN_SEC="${AGGRESSIVE_COOLDOWN_SEC:-1800}"
 PRUNE_VOLUMES="${PRUNE_VOLUMES:-0}"
 CT_DATA_DIR="${CT_DATA_DIR:-/data/congress-trade}"
@@ -108,8 +111,10 @@ is_deploy_active() {
   if docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -Eqi 'nixpacks|coolify-builder|buildkit|coolify-helper'; then
     return 0
   fi
+  # Only recent rows count: a job stuck in queued/in_progress for longer than
+  # DEPLOY_STALE_MIN must not block pruning (and disk alerts) forever.
   if docker exec coolify-db psql -U coolify -d coolify -tAc \
-    "SELECT 1 FROM application_deployment_queues WHERE status IN ('in_progress','queued') LIMIT 1;" \
+    "SELECT 1 FROM application_deployment_queues WHERE status IN ('in_progress','queued') AND updated_at > now() - interval '${DEPLOY_STALE_MIN} minutes' LIMIT 1;" \
     2>/dev/null | grep -q 1; then
     return 0
   fi
