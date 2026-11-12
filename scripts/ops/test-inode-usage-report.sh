@@ -94,6 +94,22 @@ else
   fail=1
 fi
 
+# --- find traversal errors do not abort (pipefail + set -e) ---
+bad_root="$TMP/unreadable"
+mkdir -p "$bad_root/ok"
+: >"$bad_root/ok/x"
+chmod 000 "$bad_root" 2>/dev/null || true
+rc=0
+INODE_REPORT_DF_FILE="$FIXTURES/inode-df-ok.txt" \
+  INODE_SCAN_ROOTS="$bad_root" INODE_TOP_N=1 "$SCRIPT" --json >/dev/null 2>&1 || rc=$?
+chmod 755 "$bad_root" 2>/dev/null || true
+if [[ "$rc" -eq 0 ]]; then
+  echo "ok   find traversal errors do not abort script"
+else
+  echo "FAIL unreadable root aborted script (rc=$rc)"
+  fail=1
+fi
+
 # --- top directory ranking (small tree) ---
 scan_root="$TMP/scan"
 mkdir -p "$scan_root/heavy/nested" "$scan_root/light"

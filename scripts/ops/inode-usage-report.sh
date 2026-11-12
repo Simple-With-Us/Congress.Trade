@@ -152,8 +152,10 @@ count_files_under() {
     INODE_COUNT_TARGET="$dir" $INODE_COUNT_CMD
     return
   fi
-  # -xdev: stay on one filesystem; best-effort when unreadable.
-  find "$dir" -xdev -type f 2>/dev/null | wc -l | tr -d ' '
+  # -xdev: stay on one filesystem; best-effort when unreadable. GNU find exits
+  # 1 on traversal errors — neutralize so set -e/pipefail does not abort the report.
+  # shellcheck disable=SC2126
+  (find "$dir" -xdev -type f 2>/dev/null || true) | wc -l | tr -d ' '
 }
 
 collect_top_directories() {
