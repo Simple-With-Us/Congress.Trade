@@ -35,9 +35,20 @@ const GOVT_ISSUER_RE =
 const CRYPTO_NAME_RE =
   /\b(BITCOIN|ETHEREUM|CRYPTO(CURRENCY)?|DOGECOIN|LITECOIN|SOLANA|CARDANO|RIPPLE)\b/i;
 
-/** Whole-ticker crypto labels filed in the ticker column (not exchange symbols). */
+/**
+ * Whole-ticker crypto labels filed in the ticker column.
+ * ETH, SOL, LTC, and ADA are omitted: those symbols are also listed equities
+ * (Ethan Allen, Emeren, LTC Properties, and a possible ADA listing). They are
+ * crypto only when the row's asset type or name says so.
+ */
 const CRYPTO_TICKER_WORD_RE =
-  /^(BITCOIN|ETHEREUM|BTC|ETH|SOL|SOLANA|DOGE|DOGECOIN|LTC|LITECOIN|XRP|RIPPLE|ADA|CARDANO|USDC|USDT)$/i;
+  /^(BITCOIN|ETHEREUM|BTC|SOLANA|DOGE|DOGECOIN|LITECOIN|XRP|RIPPLE|CARDANO|USDC|USDT)$/i;
+
+/**
+ * Class-share and preferred forms WELL_FORMED_TICKER accepts that
+ * isTickerShapedSymbol rejects. Normalization stores BRK-B, not BRK/B.
+ */
+const LISTED_PUNCTUATED_TICKER = /^[A-Z]{1,5}(?:-[A-Z]{1,2}|\^[A-Z0-9]{1,2})$/;
 
 export type StUnpriceableCause =
   | 'government'
@@ -92,14 +103,27 @@ function isConfirmedMutualFund(hints: StPeerPriceableHints): boolean {
   return false;
 }
 
+function issuerKeyword(value: string): boolean {
+  return GOVT_ISSUER_RE.test(value) ||
+    /\bMUNICIPAL\b/.test(value) ||
+    /\bTREASURY\b/.test(value) ||
+    /\bCORPORATE BOND\b/.test(value);
+}
+
+function listedPunctuatedTicker(ticker: string): boolean {
+  return LISTED_PUNCTUATED_TICKER.test(ticker.trim().toUpperCase());
+}
+
 function governmentOrMunicipal(hints: StPeerPriceableHints): boolean {
-  const hay = [hints.ticker, hints.assetName].map((v) => (v ?? '').trim()).filter(Boolean).join(' ');
-  if (!hay) return false;
-  const upper = hay.toUpperCase();
-  if (GOVT_ISSUER_RE.test(upper)) return true;
-  if (/\bMUNICIPAL\b/.test(upper) || /\bTREASURY\b/.test(upper)) return true;
-  if (/\bCORPORATE BOND\b/.test(upper)) return true;
-  return false;
+  const ticker = (hints.ticker ?? '').trim().toUpperCase();
+  const name = (hints.assetName ?? '').trim().toUpperCase();
+  // Same guard as obviousNonEquity: a 1-5 letter listing (TLT, LQD) stays
+  // eligible when the asset name says Treasury or Corporate Bond.
+  if (/^[A-Z]{1,5}$/.test(ticker)) return false;
+  // Ticker-shaped symbols, including hyphen class shares, match on the symbol only.
+  if (isTickerShapedSymbol(ticker) || listedPunctuatedTicker(ticker)) return issuerKeyword(ticker);
+  const hay = [ticker, name].filter(Boolean).join(' ');
+  return hay.length > 0 && issuerKeyword(hay);
 }
 
 /**
@@ -132,7 +156,7 @@ export function classifyStUnpriceableSymbol(hints: StPeerPriceableHints): StUnpr
 
   if (isConfirmedMutualFund(hints)) return 'mutual_fund';
 
-  if (!isTickerShapedSymbol(ticker)) return 'invalid_ticker';
+  if (!isTickerShapedSymbol(ticker) && !listedPunctuatedTicker(ticker)) return 'invalid_ticker';
 
   return null;
 }

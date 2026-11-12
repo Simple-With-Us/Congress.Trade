@@ -45,6 +45,42 @@ describe('classifyStUnpriceableSymbol', () => {
     expect(classifyStUnpriceableSymbol({ ticker: 'AAPL' })).toBeNull();
     expect(classifyStUnpriceableSymbol({ ticker: 'MSFT', assetName: 'Microsoft Corporation' })).toBeNull();
     expect(classifyStUnpriceableSymbol({ ticker: 'BRK/B' })).toBeNull();
+    expect(classifyStUnpriceableSymbol({ ticker: 'BRK-B' })).toBeNull();
+    expect(classifyStUnpriceableSymbol({
+      ticker: 'BRK-B',
+      assetName: 'Berkshire Hathaway Inc. Class B',
+    })).toBeNull();
+    expect(classifyStUnpriceableSymbol({ ticker: 'JPM^J' })).toBeNull();
+  });
+
+  it('does not treat bond ETF names as government issuers', () => {
+    expect(classifyStUnpriceableSymbol({
+      ticker: 'TLT',
+      assetName: 'iShares 20+ Year Treasury Bond ETF',
+    })).toBeNull();
+    expect(classifyStUnpriceableSymbol({
+      ticker: 'LQD',
+      assetName: 'iShares iBoxx $ Investment Grade Corporate Bond ETF',
+    })).toBeNull();
+    expect(classifyStUnpriceableSymbol({ ticker: 'TREASURY' })).toBe('government');
+  });
+
+  it('does not treat equity tickers that collide with crypto names as crypto', () => {
+    expect(classifyStUnpriceableSymbol({
+      ticker: 'ETH',
+      assetType: 'ST',
+      assetName: 'Ethan Allen Interiors Inc.',
+    })).toBeNull();
+    expect(classifyStUnpriceableSymbol({
+      ticker: 'SOL',
+      assetType: 'ST',
+      assetName: 'Emeren Group Ltd.',
+    })).toBeNull();
+    expect(classifyStUnpriceableSymbol({ ticker: 'LTC', assetType: 'ST', assetName: 'LTC Properties Inc.' }))
+      .toBeNull();
+    expect(classifyStUnpriceableSymbol({ ticker: 'ETH', assetType: 'CT' })).toBe('crypto');
+    expect(classifyStUnpriceableSymbol({ ticker: 'ETH', assetName: 'Ethereum' })).toBe('crypto');
+    expect(classifyStUnpriceableSymbol({ ticker: 'BTC' })).toBe('crypto');
   });
 
   it('honors enrichment not-an-equity tombstones', () => {
