@@ -327,7 +327,7 @@ assert "cron" not in human.split("congress-app", 1)[1].split("\n", 1)[0]
 stats_lines = [line for line in log if " stats " in line]
 inspect_lines = [line for line in log if " inspect " in line]
 assert len(stats_lines) == 2  # human + json
-assert len(inspect_lines) == 2
+assert len(inspect_lines) == 10  # five containers, once per run
 for line in stats_lines:
     assert "--no-stream" in line
     assert "json" in line
@@ -494,6 +494,42 @@ log = open(sys.argv[2], encoding="utf-8").read()
 assert "touch" not in log
 assert "deadbeefdead" not in log
 print("ok   path escape, symlink, and unsafe id")
+PY
+
+# A container that vanishes between stats and inspect must not abort the report.
+KEEP_ID="abc123abc123"
+GONE_ID="def456def456"
+write_inspect "$KEEP_ID" "$KEEP_ID" "/still-here" "still:latest" "1048576" "1" "0"
+printf '%s\n' \
+  "{\"ID\":\"${GONE_ID}\",\"Name\":\"gone\",\"MemUsage\":\"4MiB / 1GiB\"}" \
+  "{\"ID\":\"${KEEP_ID}\",\"Name\":\"still-here\",\"MemUsage\":\"3MiB / 1MiB\"}" \
+  >"${FIX}/stats.ndjson"
+: >"$LOG"
+set +e
+bash "$SCRIPT" --json >"${TMP}/gone.json" 2>"${TMP}/gone.err"
+gone_status=$?
+set -e
+if [[ "$gone_status" -ne 0 ]]; then
+  echo "FAIL vanished container aborted the report (exit ${gone_status})"
+  fail=1
+else
+  echo "ok   vanished container does not abort"
+fi
+python3 - "${TMP}/gone.json" "${TMP}/gone.err" "$GONE_ID" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+err = open(sys.argv[2], encoding="utf-8").read()
+gone_id = sys.argv[3]
+by_name = {row["name"]: row for row in report["containers"]}
+assert set(by_name) == {"gone", "still-here"}, set(by_name)
+assert by_name["gone"]["image"] is None
+assert by_name["gone"]["memory_limit_source"] == "unknown"
+assert by_name["gone"]["memory_usage_bytes"] == 4 * 1024 * 1024
+assert by_name["still-here"]["image"] == "still:latest"
+assert by_name["still-here"]["memory_limit_bytes"] == 1048576
+assert gone_id in err
+assert "continuing" in err
+print("ok   vanished container stays in the report")
 PY
 
 if [[ "$fail" -ne 0 ]]; then

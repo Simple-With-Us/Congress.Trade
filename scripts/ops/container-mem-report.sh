@@ -104,7 +104,8 @@ docker_ro() {
 
 stats_file="$(mktemp)"
 inspect_file="$(mktemp)"
-trap 'rm -f "$stats_file" "$inspect_file"' EXIT
+one_inspect="$(mktemp)"
+trap 'rm -f "$stats_file" "$inspect_file" "$one_inspect"' EXIT
 
 if ! docker_ro stats --no-stream --format '{{json .}}' >"$stats_file"; then
   echo "container-mem-report: docker stats --no-stream failed" >&2
@@ -157,14 +158,18 @@ if [[ -n "$ids_text" ]]; then
   mapfile -t ids <<< "$ids_text"
 fi
 
-if [[ "${#ids[@]}" -gt 0 ]]; then
-  if ! docker_ro inspect --format "$INSPECT_FMT" "${ids[@]}" >"$inspect_file"; then
-    echo "container-mem-report: docker inspect failed" >&2
-    exit 1
+# One inspect per id. A container that exits between stats and inspect must
+# not throw away the rest of the report. Its stats row stays, without inspect
+# fields. A failed inspect can still write a partial line, so keep that line
+# only when the command succeeds.
+: >"$inspect_file"
+for id in "${ids[@]}"; do
+  if docker_ro inspect --format "$INSPECT_FMT" "$id" >"$one_inspect"; then
+    cat "$one_inspect" >>"$inspect_file"
+  else
+    echo "container-mem-report: docker inspect failed for ${id}; continuing without its inspect fields" >&2
   fi
-else
-  : >"$inspect_file"
-fi
+done
 
 python3 - "$stats_file" "$inspect_file" "$CONTAINER_MEM_CGROUP" "$CONTAINER_MEM_PROC" "$JSON" "$CONTAINER_MEM_TOP_RSS" "$CONTAINER_MEM_TOP_RSS_MAX_PROCS" <<'PY'
 import json
