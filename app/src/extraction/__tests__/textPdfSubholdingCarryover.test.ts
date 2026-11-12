@@ -228,6 +228,29 @@ describe('textPdf House PTR row segmentation', () => {
       expect(rows.every((row) => !row.assetName.startsWith('150 Main Street'))).toBe(true);
       expect(rows.every((row) => !/Filing Status|Subholding Of/i.test(row.assetName))).toBe(true);
     });
+
+    it('keeps a wrapped ticker line when the row has no detail lines', () => {
+      const rows = parseColumnTailRecords([
+        'ID Owner Asset Transaction Type Date Notification Date Amount',
+        'Organon & Co. Common Stock',
+        'S 08/05/2026 08/05/2026 $1,001 - $15,000',
+        '(OGN) [ST]',
+        'Versant Media Group, Inc. - Class A Common Stock',
+        'S 08/05/2026 08/05/2026 $1,001 - $15,000',
+        '(VSNT) [ST]',
+      ].join('\n'));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({
+        ticker: 'OGN',
+        assetType: 'ST',
+        assetName: 'Organon & Co. Common Stock',
+      });
+      expect(rows[1]).toMatchObject({
+        ticker: 'VSNT',
+        assetType: 'ST',
+        assetName: 'Versant Media Group, Inc. - Class A Common Stock',
+      });
+    });
   });
 
   describe('synthetic House text layers', () => {

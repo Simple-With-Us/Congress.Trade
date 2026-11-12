@@ -490,8 +490,9 @@ const COLUMN_DETAIL_LABEL_RE =
  *
  * `trailEnd` is the start of this row's detail block.  Text before it belongs
  * to this row.  `detailEnd` is the end of that block.  Text after it is the
- * next row's asset.  A gap with no detail line keeps only a same-line
- * ticker/type token, so the next asset name stays with the next row.
+ * next row's asset.  A gap with no detail line still keeps a ticker/type
+ * token on the amount line or on the following lines, and leaves the next
+ * asset name with the next row.
  */
 function columnGapSplit(
   doc: HousePtrDoc,
@@ -527,15 +528,44 @@ function columnGapSplit(
     li += 1;
     const later = columnDetailLineStart(doc, li, lastLine, gapEnd);
     if (later != null) return finish(later);
-    if (COLUMN_TRAILING_TOKEN_RE.test(token)) {
-      return { trailEnd: portionEnd, detailEnd: portionEnd };
-    }
-    return { trailEnd: gapStart, detailEnd: gapStart };
+    const trailEnd = columnTrailingTokenEnd(
+      doc,
+      li,
+      lastLine,
+      gapEnd,
+      COLUMN_TRAILING_TOKEN_RE.test(token) ? portionEnd : gapStart,
+    );
+    return { trailEnd, detailEnd: trailEnd };
   }
 
   const later = columnDetailLineStart(doc, li, lastLine, gapEnd);
   if (later != null) return finish(later);
-  return { trailEnd: gapStart, detailEnd: gapStart };
+  const trailEnd = columnTrailingTokenEnd(doc, li, lastLine, gapEnd, gapStart);
+  return { trailEnd, detailEnd: trailEnd };
+}
+
+/**
+ * End offset of consecutive `(TICKER) [TYPE]` lines in a gap that has no
+ * detail block.  Those lines belong to the row whose amount just ended, even
+ * when they wrap onto their own line.  A line with asset-name words is the
+ * next row and stops the scan.
+ */
+function columnTrailingTokenEnd(
+  doc: HousePtrDoc,
+  li: number,
+  lastLine: number,
+  gapEnd: number,
+  fallback: number,
+): number {
+  let end = fallback;
+  for (; li <= lastLine; li += 1) {
+    const lineStart = doc.lineStart[li] ?? Infinity;
+    if (lineStart >= gapEnd) break;
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (!COLUMN_TRAILING_TOKEN_RE.test((doc.lines[li] ?? '').trim())) break;
+    end = Math.min(doc.lineEnd[li] ?? end, gapEnd);
+  }
+  return end;
 }
 
 function columnDetailLineStart(
