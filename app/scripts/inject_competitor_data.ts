@@ -119,7 +119,7 @@ async function run() {
   
   const nowStr = new Date().toISOString();
 
-  function processTrade(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
+  function processTrade(provider: string, rawName: string, ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
     if (!date || date < cutoffDate) return;
 
     const tk = (ticker || '').toUpperCase();
@@ -192,7 +192,7 @@ async function run() {
   }
 
   // Before looping over competitors, create a set of seen filers to add if missing
-  const filersToAdd = new Map<string, { id: string, name: string, chamber: string }>();
+  const filersToAdd = new Map<string, { id: string; name: string; chamber: ParsedCompetitorChamber | null }>();
 
   // Live, non-tombstoned filers: the identities a competitor row must attach to
   // instead of minting a second one (board rows 2c0b428c / 591011b9).
@@ -270,8 +270,11 @@ async function run() {
       return;
     }
     const { filerId, resolvedChamber } = resolved;
-    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber: resolvedChamber });
-    processTrade(provider, rawName, resolvedChamber, ticker, date, typeStr, rawObj, filerId);
+    const prior = filersToAdd.get(filerId);
+    const chamber =
+      resolvedChamber ?? (prior?.chamber as ParsedCompetitorChamber | null | undefined) ?? null;
+    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber });
+    processTrade(provider, rawName, ticker, date, typeStr, rawObj, filerId);
   }
 
   // unusual whales

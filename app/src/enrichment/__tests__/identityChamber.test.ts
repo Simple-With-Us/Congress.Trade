@@ -244,6 +244,16 @@ describe('planIdentitySync: chamber for competitor-minted MANUAL-* filers', () =
     expect(plan.changes[0].after.chamber).toBe('executive');
   });
 
+  it('resolves roster metadata for a MANUAL-* filer ingested with chamber null (not senate)', () => {
+    const plan = planIdentitySync(
+      [row({ bioguide_id: 'MANUAL-JORDAN', full_name: 'Jim Jordan', chamber: null, state: 'OH', district: '4' })],
+      indexes,
+    );
+    expect(plan.chambersCorrected).toBe(1);
+    expect(plan.changes[0].after.chamber).toBe('house');
+    expect(plan.changes[0].after.resolved_bioguide_id).toBe('J000289');
+  });
+
   it('never invents a chamber: no evidence, no change, and senate is not a default', () => {
     const plan = planIdentitySync(
       [row({ bioguide_id: 'MANUAL-NOBODY', full_name: 'Nobody Known', chamber: 'senate' })],
