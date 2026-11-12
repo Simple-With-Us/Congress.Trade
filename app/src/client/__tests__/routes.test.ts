@@ -3,6 +3,7 @@ import { buildClientRouter } from '../routes.ts';
 import { executeQueuedCommand } from '../commands.ts';
 import { createSession } from '../../auth/session.ts';
 import { spendRowBudget, DAILY_ROW_BUDGET } from '../../security/botDefense.ts';
+import { TCP_PEER_HEADER } from '../../security/originLock.ts';
 import { canonicalizeAssetType } from '../../shared/assetTypes.ts';
 import type { Env, QueueMessage } from '../../shared/types.ts';
 import type { FeedTransactionRow, SubscriptionRow } from '../../delivery/rows.ts';
@@ -1926,7 +1927,7 @@ describe('client API detail endpoints: row budget + zero-delta polling', () => {
     await spendRowBudget(guardedEnv, ip, DAILY_ROW_BUDGET);
 
     const app = buildClientRouter();
-    const headers = { 'cf-connecting-ip': ip };
+    const headers = { 'cf-connecting-ip': ip, [TCP_PEER_HEADER]: '104.16.1.2' };
     const trade = await app.request('http://localhost/trade/tx_budget', { headers }, guardedEnv);
     expect(trade.status).toBe(429);
     const ticker = await app.request('http://localhost/ticker/AAPL', { headers }, guardedEnv);
