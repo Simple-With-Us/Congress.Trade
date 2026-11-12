@@ -1,8 +1,9 @@
 [Unit]
-Description=Run box disk hygiene every 15 minutes
+Description=Run host health and disk hygiene every 15 minutes
 Requires=box-disk-hygiene.service
 
 [Timer]
+# Cadence stays 15 minutes (CT-1875, extended by CT-2471). One timer only.
 OnBootSec=5min
 OnUnitActiveSec=15min
 AccuracySec=1min

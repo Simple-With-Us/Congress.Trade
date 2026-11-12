@@ -203,12 +203,23 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
+      - name: Hetzner resource digest ops tests (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/hetzner-resource-digest.sh
+          bash scripts/ops/test-hetzner-resource-digest.sh
+
       # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
       # Does not talk to Docker, Coolify, or the origin.
       - name: Deploy overlap policy tests
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      # Offline host-health table for box-disk-hygiene (CT-2471).
+      # Fixtures only: no Docker daemon, no host, no network.
+      - name: Box disk hygiene host-health tests
+        working-directory: .
+        run: bash scripts/ops/test-box-disk-hygiene.sh
       # Offline restore drill. Temp databases only; no host and no live sqlite file.
       - name: Sqlite backup restore drill
         working-directory: .
@@ -243,12 +254,23 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-sqlite-maintenance.sh
 
+      - name: Test disk-growth snapshot and report (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/disk-growth-lib.sh
+          bash -n scripts/ops/disk-growth-snapshot.sh
+          bash -n scripts/ops/disk-growth-report.sh
+          bash scripts/ops/test-disk-growth.sh
       - name: Fleet log cap ops tests (offline)
         working-directory: .
         run: |
           bash -n scripts/ops/fleet-log-cap-report.sh
           bash -n scripts/ops/fleet-log-cap-install.sh
           bash scripts/ops/test-fleet-log-cap.sh
+
+      - name: Root disk usage report tests (offline)
+        working-directory: .
+        run: bash scripts/ops/test-root-disk-usage-report.sh
 
       - name: Host swap report offline tests
         working-directory: .

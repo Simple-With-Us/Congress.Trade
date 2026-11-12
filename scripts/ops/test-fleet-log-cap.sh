@@ -171,12 +171,12 @@ EMPTY_DAEMON="${TMP}/etc/docker/empty-daemon.json"
 mkdir -p "$(dirname "$EMPTY_DAEMON")"
 : >"$EMPTY_DAEMON"
 APPLY=1 DAEMON_JSON_PATH="$EMPTY_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/empty-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
-assert_eq "$(jq -r '."log-opts"."max-size"' <"$EMPTY_DAEMON")" "50m" "empty daemon.json file gets log caps"
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$EMPTY_DAEMON")" "10m" "empty daemon.json file gets log caps"
 
 WS_DAEMON="${TMP}/etc/docker/ws-daemon.json"
 printf ' \n' >"$WS_DAEMON"
 APPLY=1 DAEMON_JSON_PATH="$WS_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/ws-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
-assert_eq "$(jq -r '."log-opts"."max-size"' <"$WS_DAEMON")" "50m" "whitespace-only daemon.json gets log caps"
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$WS_DAEMON")" "10m" "whitespace-only daemon.json gets log caps"
 
 # --- journalctl vacuum failure does not abort install ----------------------
 VAC_FAIL_LOG="${TMP}/journalctl-fail.log"
@@ -224,7 +224,7 @@ assert_contains "$apply_out" "NOT restarted" "apply reminds no docker restart"
 
 merged="$(jq -c . "$INSTALL_DAEMON")"
 assert_eq "$(jq -r '."log-driver"' <<<"$merged")" "json-file" "merge sets log-driver"
-assert_eq "$(jq -r '."log-opts"."max-size"' <<<"$merged")" "50m" "merge sets max-size"
+assert_eq "$(jq -r '."log-opts"."max-size"' <<<"$merged")" "10m" "merge sets max-size"
 assert_eq "$(jq -r '."log-opts"."max-file"' <<<"$merged")" "3" "merge sets max-file"
 assert_eq "$(jq -r '."storage-driver"' <<<"$merged")" "overlay2" "merge keeps storage-driver"
 assert_eq "$(jq -r '.features.cdi' <<<"$merged")" "true" "merge keeps unrelated keys"
@@ -243,7 +243,13 @@ assert_not_contains "$(tr '\n' ' ' <"$SYSTEMCTL_LOG")" "restart" "systemctl mock
 
 # --- idempotent re-apply -----------------------------------------------------
 APPLY=1 DAEMON_JSON_PATH="$INSTALL_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="$JOURNALD_DEST" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >"${TMP}/reapply.out"
-assert_contains "$(cat "${TMP}/reapply.out")" "already has fleet log caps" "second apply is idempotent for docker"
+reapply_docker="$(cat "${TMP}/reapply.out")"
+if printf '%s' "$reapply_docker" | grep -qE 'already has fleet log caps|will not loosen'; then
+  echo "ok   second apply is idempotent for docker"
+else
+  echo "FAIL second apply is idempotent for docker: missing idempotent docker message"
+  fail=1
+fi
 assert_contains "$(cat "${TMP}/reapply.out")" "already matches repo" "second apply idempotent journald copy"
 
 # --- merge on missing file ---------------------------------------------------
@@ -252,6 +258,85 @@ mkdir -p "$(dirname "$MISSING_DAEMON")"
 APPLY=1 DAEMON_JSON_PATH="$MISSING_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/journald2.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
 assert_file_exists "$MISSING_DAEMON" "apply creates missing daemon.json"
 assert_eq "$(jq -r '."log-opts"."max-file"' <"$MISSING_DAEMON")" "3" "fresh daemon.json has caps"
+
+# --- no daemon.json (missing file) -------------------------------------------
+NOFILE_DAEMON="${TMP}/nofile/daemon.json"
+mkdir -p "$(dirname "$NOFILE_DAEMON")"
+rm -f "$NOFILE_DAEMON"
+APPLY=1 DAEMON_JSON_PATH="$NOFILE_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/nofile-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
+assert_file_exists "$NOFILE_DAEMON" "missing daemon.json path is created"
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$NOFILE_DAEMON")" "10m" "missing daemon.json uses 10m default"
+assert_eq "$(jq -r '."log-opts"."max-file"' <"$NOFILE_DAEMON")" "3" "missing daemon.json uses max-file 3"
+
+# --- tighter existing cap (never loosen) -------------------------------------
+TIGHT_DAEMON="${TMP}/etc/docker/tight-daemon.json"
+mkdir -p "$(dirname "$TIGHT_DAEMON")"
+printf '%s\n' '{"storage-driver":"overlay2","log-driver":"json-file","log-opts":{"max-size":"5m","max-file":"2"}}' >"$TIGHT_DAEMON"
+tight_before="$(cat "$TIGHT_DAEMON")"
+tight_out="$(APPLY=1 DAEMON_JSON_PATH="$TIGHT_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/tight-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL")"
+assert_eq "$(cat "$TIGHT_DAEMON")" "$tight_before" "tighter cap leaves daemon.json bytes unchanged"
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$TIGHT_DAEMON")" "5m" "tighter max-size preserved"
+assert_eq "$(jq -r '."log-opts"."max-file"' <"$TIGHT_DAEMON")" "2" "tighter max-file preserved"
+assert_contains "$tight_out" "will not loosen" "tighter cap reports skip"
+
+# --- looser existing cap (tighten only) --------------------------------------
+LOOSE_DAEMON="${TMP}/etc/docker/loose-daemon.json"
+mkdir -p "$(dirname "$LOOSE_DAEMON")"
+printf '%s\n' '{"log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"5"}}' >"$LOOSE_DAEMON"
+APPLY=1 DAEMON_JSON_PATH="$LOOSE_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/loose-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$LOOSE_DAEMON")" "10m" "looser max-size tightened to 10m"
+assert_eq "$(jq -r '."log-opts"."max-file"' <"$LOOSE_DAEMON")" "3" "looser max-file tightened to 3"
+
+# --- Docker size formats, partial configs, unreadable values ------------------
+# run_case NAME JSON -> applies installer to a fresh daemon.json, prints file path
+run_case() {
+  local name="$1" json="$2" path
+  path="${TMP}/cases/${name}/daemon.json"
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$json" >"$path"
+  APPLY=1 DAEMON_JSON_PATH="$path" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/cases/${name}/journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >"${TMP}/cases/${name}/out" 2>&1
+  printf '%s' "$path"
+}
+opt() { jq -r --arg k "$2" '."log-opts"[$k] // "absent"' <"$1"; }
+
+p="$(run_case upper-m '{"log-opts":{"max-size":"10M","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/3" "10M equals fleet cap (not loosened)"
+p="$(run_case one-g '{"log-opts":{"max-size":"1g","max-file":"5"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/3" "1g tightened to 10m/3"
+p="$(run_case k512 '{"log-opts":{"max-size":"512k","max-file":"2"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "512k/2" "512k preserved"
+p="$(run_case bare '{"log-opts":{"max-size":"2048","max-file":"2"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "2048/2" "bare byte count preserved"
+p="$(run_case decimal '{"log-opts":{"max-size":"1.5g","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)" "10m" "Docker-valid 1.5g parsed and tightened"
+assert_file_exists "${TMP}/cases/decimal/journald.conf" "1.5g run still installs journald drop-in"
+p="$(run_case mib '{"log-opts":{"max-size":"10MiB","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/3" "10MiB treated as 10m"
+p="$(run_case small-mb '{"log-opts":{"max-size":"5mb","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)" "5mb" "5mb tighter than fleet preserved"
+p="$(run_case size-only '{"log-opts":{"max-size":"5m"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "5m/1" "max-size without max-file keeps one file"
+p="$(run_case size-only-big '{"log-opts":{"max-size":"50m"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/1" "50m without max-file tightens size, keeps one file"
+p="$(run_case weird '{"log-opts":{"max-size":"lots","max-file":"2"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "lots/2" "unreadable max-size preserved, not aborted"
+assert_contains "$(cat "${TMP}/cases/weird/out")" "keeping existing log max-size" "unreadable max-size warns"
+assert_file_exists "${TMP}/cases/weird/journald.conf" "unreadable max-size still installs journald drop-in"
+
+# --- malformed daemon.json ---------------------------------------------------
+BAD_DAEMON="${TMP}/etc/docker/bad-daemon.json"
+printf '{not json' >"$BAD_DAEMON"
+set +e
+bad_out="$(APPLY=1 DAEMON_JSON_PATH="$BAD_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/bad-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" 2>&1)"
+bad_rc=$?
+set -e
+if [[ "$bad_rc" -ne 0 ]]; then
+  echo "ok   malformed daemon.json exits non-zero"
+else
+  echo "FAIL malformed daemon.json should exit non-zero"
+  fail=1
+fi
+assert_contains "$bad_out" "cannot parse" "malformed daemon.json error message"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "FAILED"

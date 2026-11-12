@@ -4,7 +4,7 @@
 
 Adds repo-side tooling to **measure** Docker json-file container log bytes and journald
 disk use, and to **install** (on the host, with Jay's approval) Docker daemon defaults
-`json-file` with `max-size=50m` / `max-file=3` plus a systemd-journald drop-in cap.
+`json-file` with `max-size=10m` / `max-file=3` plus a systemd-journald drop-in cap.
 This complements `box-disk-hygiene.sh` (image/builder prune) by bounding unbounded
 container and journal growth on the 150G root volume.
 
@@ -32,6 +32,19 @@ Prints per-container json log path/size, total bytes, `journalctl --disk-usage`,
 configured/runtime Docker logging driver/options.
 
 ### Install (host — after merge + Jay yes)
+
+The installer targets `max-size=10m` / `max-file=3` and never loosens an existing
+cap: each axis takes the tighter of the host value and the fleet value.  A
+`log-opts` with `max-size` but no `max-file` counts as one file (Docker's json-file
+default).  Docker-valid sizes such as `1.5g`, `10mb`, `10MiB` and `1t` are parsed;
+a size the script cannot read is kept as-is with a warning, and the journald step
+still runs.
+
+Overrides (tests only): `FLEET_LOG_MAX_SIZE` (default `10m`) and
+`FLEET_LOG_MAX_FILE` (default `3`) change the fleet target itself.  The
+never-loosen check compares only against the host's existing `daemon.json`, so
+raising either above the default with `APPLY=1` installs a looser cap.  Leave them
+unset on the host.
 
 Dry-run default (no writes):
 
