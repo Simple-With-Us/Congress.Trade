@@ -88,6 +88,12 @@ import { canonicalizeAmountBounds, parseAmountRange } from './amounts.ts';
 import { issuerWords, junkAssetNameReason, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
 import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
+import { parseHousePtrDisclosedName } from './textPdf.ts';
+import {
+  houseMemberNameMismatch,
+  suppressAssetOcrHoldForMemberBleed,
+  type HouseMemberIdentity,
+} from './housePtrMember.ts';
 import {
   PIPELINE_TX_SOURCES_SQL,
   VISION_SUPERSEDE_REASON,
@@ -343,11 +349,44 @@ function rowKeyAssetTypeName(assetType: string | null | undefined, assetTypeName
  * and the admin reprocess path, which recomputes confidence for already-persisted
  * filings and updates the existing rows in place.
  */
+export interface HouseMemberContext {
+  identity: HouseMemberIdentity | null;
+}
+
+async function loadHouseMemberContext(
+  env: Env,
+  filing: Filing,
+  sourceText: string | null | undefined,
+): Promise<HouseMemberContext> {
+  if (filing.chamber !== 'house') return { identity: null };
+  const disclosed = parseHousePtrDisclosedName(sourceText);
+  if (!disclosed || !filing.filerId) return { identity: null };
+  try {
+    const row = await get<{ full_name: string | null; chamber: string | null; state: string | null }>(
+      env.DB,
+      'SELECT full_name, chamber, state FROM filers WHERE bioguide_id = ?',
+      [filing.filerId],
+    );
+    if (!row?.full_name) return { identity: null };
+    return {
+      identity: {
+        disclosedName: disclosed,
+        registeredName: row.full_name,
+        chamber: row.chamber ?? filing.chamber,
+        state: row.state,
+      },
+    };
+  } catch {
+    return { identity: null };
+  }
+}
+
 export async function recomputeTransactions(
   env: Env,
   filing: Filing,
   parsed: ParsedTx[],
   sourceOverride?: TxSource,
+  houseMember?: HouseMemberContext,
 ): Promise<FlaggedTx[]> {
   const nowIso = new Date().toISOString();
   const [resolver, nameIndex] = await Promise.all([loadResolver(env), loadNameIndex(env)]);
@@ -358,8 +397,19 @@ export async function recomputeTransactions(
   // scanned path ("3641 Microsoft Corp. Com"); strip it before the resolver sees
   // the name, when the filing itself shows the pattern (board row 3d31c7b9).
   const rows = filing.chamber === 'executive' ? stripOgeRowIndexes(parsed) : parsed;
+  const memberCtx = houseMember ?? { identity: null };
   return rows.map((p, rowIndex) =>
-    buildTransaction(p, filing, resolver, nowIso, rowIndex, sourceOverride, nameIndex, ocrExtraWords),
+    buildTransaction(
+      p,
+      filing,
+      resolver,
+      nowIso,
+      rowIndex,
+      sourceOverride,
+      nameIndex,
+      ocrExtraWords,
+      memberCtx,
+    ),
   );
 }
 
@@ -437,7 +487,8 @@ export async function normalize(
     looksLikeNothingToReport(p.assetName) || looksLikeNothingToReport(p.rawText)
   );
 
-  const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source);
+  const houseMember = await loadHouseMemberContext(env, filing, sourceText);
+  const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source, houseMember);
   if (isVisionOrOcrExtraction(extractorName, source) && usableParsed.length > 0) {
     visionDegenerateAssessment = assessVisionDegenerate(usableParsed, {
       resolvedTickers: allFlagged.map((f) => f.tx.ticker ?? null),
@@ -887,6 +938,7 @@ function buildTransaction(
   sourceOverride?: TxSource,
   nameIndex?: NameIndex,
   ocrExtraWords?: ReadonlySet<string>,
+  houseMember: HouseMemberContext = { identity: null },
 ): FlaggedTx {
   const placeholders = new Set(['NONE', '--', 'N/A', 'NA', 'NULL', '—']);
   const prepared = prepareExtractedTx(p);
@@ -935,6 +987,7 @@ function buildTransaction(
       txDate: p.txDate,
       rawText: p.rawText,
       gridTypeUnmarked: (p.extractionWarnings ?? []).includes('grid_type_unmarked'),
+      ownerUnread: (p.extractionWarnings ?? []).includes('owner_unread'),
     },
     filing.filedDate,
     resolve,
@@ -967,6 +1020,8 @@ function buildTransaction(
 
   const txSource = sourceOverride ?? (p as { source?: TxSource }).source ?? 'primary';
 
+  let publishConfidence = s.confidence;
+
   const tx: Transaction = {
     id: uuid(),
     docId: filing.docId,
@@ -990,7 +1045,7 @@ function buildTransaction(
     location: p.location ?? null,
     description: p.description ?? null,
     supplementalText: p.supplementalText ?? null,
-    confidence: s.confidence,
+    confidence: publishConfidence,
     source: txSource,
     rowKey: transactionRowKey(txSource, rowIndex, {
       ...p,
@@ -1007,14 +1062,31 @@ function buildTransaction(
     cursorSeq: 0,
   };
 
-  return {
-    tx,
-    flags: [
-      ...s.flags,
-      ...(p.extractionWarnings ?? []).filter((flag) =>
-        flag === 'unreadable_is_option' || flag === 'unreadable_cap_gains' || flag === 'suspected_constant_tx_type'),
-    ],
-  };
+  let flags = [
+    ...s.flags,
+    ...(p.extractionWarnings ?? []).filter((flag) =>
+      flag === 'unreadable_is_option'
+        || flag === 'unreadable_cap_gains'
+        || flag === 'suspected_constant_tx_type'
+        || flag === 'owner_unread'),
+  ];
+  const publishedOwner = normalizeOwner(p.owner);
+  if (
+    houseMember.identity
+    && suppressAssetOcrHoldForMemberBleed(ocrAssetName, publishedOwner, houseMember.identity.disclosedName)
+    && flags.includes('ocr_name_hold')
+  ) {
+    flags = flags.filter((flag) => flag !== 'ocr_name_hold');
+    if (s.flags.includes('ocr_name_hold')) {
+      publishConfidence = clamp01(publishConfidence / PENALTY_OCR_HOLD);
+      tx.confidence = publishConfidence;
+    }
+  }
+  if (houseMember.identity && houseMemberNameMismatch(houseMember.identity)) {
+    flags.push('ocr_name_hold');
+  }
+
+  return { tx, flags };
 }
 
 /** Result of applying the shared validation rubric to one row's fields. */
@@ -1051,6 +1123,8 @@ export function scoreFields(
     rawText?: string | null;
     /** Grid form found no single type mark. Do not invent B/S/E. */
     gridTypeUnmarked?: boolean;
+    /** Grid or scan could not read the owner cell (not a confident blank). */
+    ownerUnread?: boolean;
   },
   filedDate: string | null,
   resolve: TickerResolver,
@@ -1236,6 +1310,9 @@ export function scoreFields(
   if (ocr.nameHolds.length > 0) {
     flags.push('ocr_name_hold');
     confidence *= PENALTY_OCR_HOLD;
+  }
+  if (fields.ownerUnread) {
+    confidence *= 0.92;
   }
 
   return { confidence: clamp01(confidence), flags, ticker, amountMin, amountMax, txType };

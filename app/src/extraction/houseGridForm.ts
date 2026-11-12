@@ -748,15 +748,26 @@ export type OwnerMatchDetail = {
   height: number;
 };
 
-/** DC, SP, or JT from the owner cell. Blank ink stays null. */
-export function ownerCodeFromCell(
+/** Blank form cell vs unreadable ink vs a confident SP/DC/JT read. */
+export type OwnerCellRead =
+  | { kind: 'code'; owner: Owner }
+  | { kind: 'blank' }
+  | { kind: 'unread' };
+
+type OwnerCellMask = {
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  ink: number;
+};
+
+function ownerCellMask(
   image: GrayImage,
   x0: number,
   y0: number,
   x1: number,
   y1: number,
-  detail?: OwnerMatchDetail,
-): Owner | null {
+): OwnerCellMask | null {
   const left = Math.max(0, Math.floor(x0) + 4);
   const right = Math.min(image.width, Math.ceil(x1) - 4);
   const top = Math.max(0, Math.floor(y0) + 2);
@@ -790,7 +801,43 @@ export function ownerCodeFromCell(
   }
   let ink = 0;
   for (const value of mask) ink += value;
-  if (ink < 10) return null;
+  return { mask, width, height, ink };
+}
+
+/**
+ * Read the owner column on a House grid row. A cell with no ink is blank — on
+ * the PTR form that means the filer (self). Ink without a confident DC/SP/JT
+ * pair is unread and must not be treated as self.
+ */
+export function readOwnerCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): OwnerCellRead {
+  const owner = ownerCodeFromCell(image, x0, y0, x1, y1, detail);
+  if (owner) return { kind: 'code', owner };
+  // ownerCodeFromCell returns null for blank and unread; distinguish via ink.
+  const cell = ownerCellMask(image, x0, y0, x1, y1);
+  if (!cell) return { kind: 'unread' };
+  return cell.ink < 10 ? { kind: 'blank' } : { kind: 'unread' };
+}
+
+/** DC, SP, or JT from the owner cell when ink reads as a code; else null. */
+export function ownerCodeFromCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): Owner | null {
+  const cell = ownerCellMask(image, x0, y0, x1, y1);
+  if (!cell) return null;
+  const { mask, width, height, ink } = cell;
+  if (ink < 10) return null; // blank — use readOwnerCell to tell blank from unread
   let glyph = trimGlyph(mask, width, height);
   if (!glyph) return null;
   if (glyph.height > 16) {
@@ -1494,6 +1541,7 @@ function confidenceFor(
   hasDate: boolean,
   dateConfidenceOk: boolean,
   asset: string,
+  ownerUnread: boolean,
 ): number {
   if (marks.typeReason !== 'ok') return 0.35;
   const strong = marks.typeScore >= GRID_STRONG_MARK
@@ -1502,13 +1550,15 @@ function confidenceFor(
     && hasDate
     && dateConfidenceOk
     && asset.trim().length >= 4
-    && assetConf >= 0.45;
+    && assetConf >= 0.45
+    && !ownerUnread;
   if (strong) return 0.97;
   let score = 0.42;
   score += Math.min(0.2, marks.typeScore * 0.2);
   if (marks.amountReason === 'ok') score += 0.12;
   if (hasDate) score += 0.08;
   if (asset.trim().length >= 4) score += 0.08 * Math.min(1, assetConf);
+  if (ownerUnread) score = Math.min(score, 0.94);
   return Math.min(0.9, score);
 }
 
@@ -1549,14 +1599,18 @@ function pageRows(page: HouseGridPageInput, dateContext: GridFormDateContext): {
     const marks = classifyMarkScores(scores);
     const inBand = boxesInRow(page.boxes, band.y0, band.y1);
     const asset = assetText(inBand, fit.xs);
-    const glyphOwner = ownerCodeFromCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
+    const ownerRead = readOwnerCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
     const textOwner = inBand
       .filter((box) => box.x1 <= (fit.xs[1] ?? 0) + 12 && box.conf >= 0.4)
       .map((box) => ownerFromText(box.text))
       .find((owner): owner is Owner => owner !== null) ?? null;
+    const matchedOwner = ownerRead.kind === 'code' ? ownerRead.owner : null;
     // Glyph scores never swapped spouse and dependent on the scored filing.
-    // Text fills the cells the glyph leaves blank.
-    const owner = glyphOwner ?? textOwner;
+    // Text fills the cells the glyph leaves blank. A blank owner cell is self.
+    let owner: Owner | null = matchedOwner ?? textOwner;
+    let ownerUnread = false;
+    if (!owner && ownerRead.kind === 'blank') owner = 'self';
+    else if (!owner && ownerRead.kind === 'unread') ownerUnread = true;
     const tradeLeft = fit.xs[7] ?? 0;
     const tradeRight = fit.xs[8] ?? tradeLeft;
     const notifRight = fit.xs[9] ?? tradeRight;
@@ -1626,6 +1680,7 @@ function pageRows(page: HouseGridPageInput, dateContext: GridFormDateContext): {
     if (tradeDate && !dates.dateConfidenceOk) notes.push('date plausibility lowered confidence');
     const warnings: NonNullable<ParsedTx['extractionWarnings']> = [];
     if (marks.typeReason !== 'ok' || marks.txType === null) warnings.push('grid_type_unmarked');
+    if (ownerUnread) warnings.push('owner_unread');
     const txType = marks.txType ?? ('' as TxType);
     transactions.push({
       txDate: tradeDate,
@@ -1641,7 +1696,14 @@ function pageRows(page: HouseGridPageInput, dateContext: GridFormDateContext): {
       rawText: `${asset.text || '(unreadable)'} | type ${marks.txType ?? 'unmarked'} | amt ${marks.amountLetter ?? 'blank'}`,
       supplementalText: notes.join('; '),
       description: notifDate ? `date notified ${notifDate}` : null,
-      confidence: confidenceFor(marks, asset.conf, Boolean(tradeDate), dates.dateConfidenceOk, asset.text),
+      confidence: confidenceFor(
+        marks,
+        asset.conf,
+        Boolean(tradeDate),
+        dates.dateConfidenceOk,
+        asset.text,
+        ownerUnread,
+      ),
       ...(warnings.length ? { extractionWarnings: warnings } : {}),
     });
   }

@@ -29,8 +29,22 @@ import {
 } from './housePtrParserArbitration.ts';
 import { detectOption } from './senateHtml.ts';
 import { ptrColumnTailRe, ptrTailRe } from './ptrTails.ts';
+import { cleanFilerName } from './nameNormalizer.ts';
 
 export { countHousePtrTails } from './ptrTails.ts';
+
+const HOUSE_DISCLOSED_NAME_RE =
+  /Name:\s*Hon\.\s+(.+?)(?=\s+Status:|\s+State\/District:)/i;
+
+/** Member name line from a machine-readable House PTR text layer. */
+export function parseHousePtrDisclosedName(text: string | null | undefined): string | null {
+  if (!text?.trim()) return null;
+  const normalized = text.replace(/\u0000/g, '');
+  const match = HOUSE_DISCLOSED_NAME_RE.exec(normalized);
+  if (!match?.[1]) return null;
+  const name = cleanFilerName(match[1].replace(/\s+/g, ' ').trim());
+  return name || null;
+}
 
 /** Penalty per missing core field (date / amount / type / asset). */
 const MISSING_FIELD_PENALTY = 0.12;
