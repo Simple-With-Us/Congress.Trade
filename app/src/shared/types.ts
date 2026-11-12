@@ -761,6 +761,8 @@ export interface Env {
   RESIDENTIAL_PROXY_PORT?: string;
   RESIDENTIAL_PROXY_USERNAME?: string;
   RESIDENTIAL_PROXY_PASSWORD?: string;
+  /** Consecutive residential-proxy probe failures before health_senate_relay reports down (default 3). */
+  RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD?: string;
   /** Enable Cloudflare Browser Rendering fallback (strictly capped to free tier). */
   SENATE_USE_BROWSER_RENDERING?: string;
   /** Enables the OGE executive-branch (278-T) filings watcher. Infisical-tunable. */

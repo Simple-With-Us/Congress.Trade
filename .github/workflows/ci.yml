@@ -209,6 +209,35 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      # Offline restore drill. Temp databases only; no host and no live sqlite file.
+      - name: Sqlite backup restore drill
+        working-directory: .
+        run: |
+          if ! command -v sqlite3 >/dev/null || ! command -v zstd >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sqlite3 zstd
+          fi
+          bash scripts/ops/test-fleet-backup-restore-drill.sh
+      - name: Fleet CPU sampler offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/cpu-sampler.sh
+          bash -n scripts/ops/cpu-history-report.sh
+          bash scripts/ops/test-fleet-cpu-sampler.sh
+
+      - name: B2 backup report (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/b2-backup-report.sh
+          bash -n scripts/ops/test-b2-backup-report.sh
+          bash scripts/ops/test-b2-backup-report.sh
+
+      - name: Inode usage report offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/inode-usage-report.sh
+          bash scripts/ops/test-inode-usage-report.sh
+
       # Temp sqlite files only.  No Docker, Coolify, or production database.
       - name: SQLite maintenance policy tests
         working-directory: .
@@ -221,9 +250,20 @@ jobs:
           bash -n scripts/ops/fleet-log-cap-install.sh
           bash scripts/ops/test-fleet-log-cap.sh
 
+      - name: Host swap report offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/host-swap-report.sh
+          bash scripts/ops/test-host-swap-report.sh
+
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
+
+      # CT-2506 offline retention. Temp dirs only. No host and no Backblaze.
+      - name: Local backup retention tests
+        working-directory: .
+        run: bash scripts/ops/test-local-backup-retention.sh
 
       # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
       # stub `infisical` first on PATH records its arguments, so the real CLI,

@@ -19,9 +19,14 @@
 // CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
-import type { Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
+import type { Env, Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { HOUSE_ASSET_TYPE_NAMES, houseAssetTypeCodePattern } from '../shared/assetTypes.ts';
 import { parseAmountRange } from './amounts.ts';
+import {
+  arbitrateHousePtrParsers,
+  loadHousePtrSecuritiesRefIndex,
+  type HousePtrNameIndex,
+} from './housePtrParserArbitration.ts';
 import { detectOption } from './senateHtml.ts';
 import { ptrColumnTailRe, ptrTailRe } from './ptrTails.ts';
 import { cleanFilerName } from './nameNormalizer.ts';
@@ -47,6 +52,8 @@ const MISSING_FIELD_PENALTY = 0.12;
 export class TextPdfExtractor implements Extractor {
   readonly name = 'textPdf';
 
+  constructor(private readonly env?: Env) {}
+
   canHandle(f: Filing): boolean {
     return f.docKind === 'text_pdf';
   }
@@ -57,7 +64,8 @@ export class TextPdfExtractor implements Extractor {
     }
 
     const { text, pageCount } = await extractPdfText(input.bytes);
-    const rows = parseHousePtrText(text);
+    const nameIndex = await this.securitiesRefIndex();
+    const rows = parseHousePtrText(text, nameIndex ? { nameIndex } : undefined);
 
     // Document confidence = mean of row confidences (or low if nothing found).
     const docConfidence =
@@ -77,6 +85,16 @@ export class TextPdfExtractor implements Extractor {
       pageCount,
     };
     return result;
+  }
+
+  private async securitiesRefIndex(): Promise<HousePtrNameIndex | undefined> {
+    if (!this.env?.DB) return undefined;
+    try {
+      return await loadHousePtrSecuritiesRefIndex(this.env);
+    } catch (err) {
+      console.warn('[textPdf] securities_ref name index unavailable:', err);
+      return undefined;
+    }
   }
 }
 
@@ -162,11 +180,17 @@ const INLINE_RECORD_RE = new RegExp(
   'gi',
 );
 
+/** Optional securities_ref names for parser arbitration. */
+export interface HousePtrParseOptions {
+  /** Ticker to simplified company name (`securities_ref.company_name`). */
+  nameIndex?: HousePtrNameIndex;
+}
+
 /**
  * Parse the merged House PTR text into ParsedTx[]. We segment the text into
  * candidate holding blocks, then pull fields from each block.
  */
-export function parseHousePtrText(text: string): ParsedTx[] {
+export function parseHousePtrText(text: string, options?: HousePtrParseOptions): ParsedTx[] {
   const cleaned = cleanPdfText(text);
   // Electronic PTRs often omit SP/DC/JT on every row after the first. The
   // owner-required INLINE_RECORD_RE then glues those later rows into one
@@ -174,17 +198,13 @@ export function parseHousePtrText(text: string): ParsedTx[] {
   // `[TYPE] P/S/E date date $amount` tail first.
   const tailRows = parseTailRecords(cleaned);
   const columnRows = parseColumnTailRecords(cleaned);
-  const completeCount = (rows: ParsedTx[]) =>
-    rows.filter((row) =>
-      Boolean(row.assetName && row.assetName !== '(unknown)' && row.txDate && row.txType && row.amountMin != null)
-    ).length;
-  // Prefer the `[TYPE] P/S/E date` tail when it already has a complete lineup.
-  // Use the column-order parser only when it recovers more complete rows
-  // (EO.Pdf wraps `[ST]` onto the next line after Type/Date/Amount).
-  if (tailRows.length > 0 && completeCount(tailRows) >= completeCount(columnRows)) {
-    return tailRows;
+  // Both parsers read the same text. Count is not a vote: a page-split row
+  // can make the column parser longer while it shifts Subholding Of and the
+  // next ticker (H-2026-20035788). Scoring and the hold live next to the
+  // parsers so a column-parser fix does not have to re-decide the winner.
+  if (tailRows.length > 0 || columnRows.length > 0) {
+    return arbitrateHousePtrParsers(tailRows, columnRows, options?.nameIndex).rows;
   }
-  if (columnRows.length > 0) return columnRows;
 
   if (HOUSE_TABLE_HEADER_RE.test(cleaned)) {
     const inlineRows = parseInlineRecords(cleaned);
@@ -205,6 +225,20 @@ export function parseHousePtrText(text: string): ParsedTx[] {
     if (tx) rows.push(tx);
   }
   return rows;
+}
+
+/**
+ * True when both House PTR parsers produced rows and they disagree on content.
+ * A filing that disagrees is held. A filing they agree on, or that only one
+ * parser could read, keeps the parser confidence.
+ */
+export function housePtrParsersDisagree(text: string, options?: HousePtrParseOptions): boolean {
+  const cleaned = cleanPdfText(text);
+  return arbitrateHousePtrParsers(
+    parseTailRecords(cleaned),
+    parseColumnTailRecords(cleaned),
+    options?.nameIndex,
+  ).contested;
 }
 
 function cleanPdfText(text: string): string {
@@ -398,10 +432,8 @@ function calculateRowConfidence(row: {
  * 11/09/2026 $1,001 - $15,000" ends one page and "Ltd. Ordinary Shares (NCLH)
  * [ST]" opens the next.  Once the header is stripped that is one line with the
  * `[TYPE]` token after the amount, so the `[TYPE] P/S/E date` tail misses the
- * row.  One missed row made the column-order parser win the row count, and
- * that parser shifts every Subholding Of onto the next row's asset name
- * (H-2026-20035788, 65 rows).  Move the trailing asset text back in front of
- * the Type/Date/Amount run so the row reads in normal tail order.
+ * row.  Move the trailing asset text back in front of the Type/Date/Amount run
+ * so the row reads in normal tail order.
  */
 const HOUSE_PAGE_SPLIT_ROW_RE = new RegExp(
   String.raw`^(?<head>(?!\s*(?:P|S|E)\s)[^\[\]\n]*?\S)\s+` +
@@ -483,52 +515,166 @@ function parseTailRecords(text: string): ParsedTx[] {
   return rows;
 }
 
-function parseColumnTailRecords(text: string): ParsedTx[] {
-  const normalized = joinWrappedAmountRanges(
-    stripHouseTableHeaders(cleanPdfText(text)).replace(/\s+/g, ' ').trim(),
-  );
+/**
+ * Ticker and asset-type printed after the amount on an EO.Pdf row, with no
+ * asset-name words of their own: `(OGN) [ST]`, `[CS]`, `8/11/2027 [CS]`.
+ */
+const COLUMN_TRAILING_TOKEN_RE =
+  /^(?:\d{1,2}\/\d{1,2}\/\d{2,4}\s+)?(?:\([A-Z][A-Z0-9.^\/-]{0,9}\)\s*)?\[[A-Z0-9]{2,4}\]$/i;
+
+/** A detail label that may share a line with the amount or a wrapped name. */
+const COLUMN_DETAIL_LABEL_RE =
+  /\b(?:Filing\s+Status|Subholding\s+Of|Location|Description)\s*:|\b(?:L|D)\s*:/i;
+
+/**
+ * Split the text between two column tails (`P/S/E date date $amount`).
+ *
+ * The form prints this row's detail lines after its amount and before the
+ * next row's asset.  EO.Pdf also prints `(TICKER) [TYPE]` (and a wrapped name
+ * fragment) in that same gap, still before the detail lines.  Flattening the
+ * gap onto one string glued each row's Subholding Of onto the next asset and
+ * let the next row's ticker / `[TYPE]` win (H-2026-20035788: a muni took `CF`,
+ * BridgeBio was typed `[GS]`).
+ *
+ * `trailEnd` is the start of this row's detail block.  Text before it belongs
+ * to this row.  `detailEnd` is the end of that block.  Text after it is the
+ * next row's asset.  A gap with no detail line still keeps a ticker/type
+ * token on the amount line or on the following lines, and leaves the next
+ * asset name with the next row.
+ */
+function columnGapSplit(
+  doc: HousePtrDoc,
+  gapStart: number,
+  gapEnd: number,
+): { trailEnd: number; detailEnd: number } {
+  if (gapStart >= gapEnd) return { trailEnd: gapStart, detailEnd: gapStart };
+
+  const finish = (detailAt: number): { trailEnd: number; detailEnd: number } => {
+    const li = doc.lineOf[detailAt] ?? 0;
+    const lineStart = doc.lineStart[li] ?? detailAt;
+    const lineEnd = Math.min(doc.lineEnd[li] ?? gapEnd, gapEnd);
+    if (detailAt > lineStart) {
+      let detailEnd = lineEnd;
+      const more = houseDetailBlockEnd(lineEnd, gapEnd, doc);
+      if (more > detailEnd) detailEnd = more;
+      return { trailEnd: detailAt, detailEnd };
+    }
+    return { trailEnd: detailAt, detailEnd: houseDetailBlockEnd(detailAt, gapEnd, doc) };
+  };
+
+  const lastLine = doc.lineOf[gapEnd - 1] ?? (doc.lineOf[gapStart] ?? 0);
+  let li = doc.lineOf[gapStart] ?? 0;
+  if (gapStart > (doc.lineStart[li] ?? 0)) {
+    const lineEnd = doc.lineEnd[li] ?? gapEnd;
+    const portionEnd = Math.min(lineEnd, gapEnd);
+    const portion = doc.text.slice(gapStart, portionEnd);
+    const rel = portion.search(COLUMN_DETAIL_LABEL_RE);
+    if (rel >= 0 && lineEnd <= gapEnd) return finish(gapStart + rel);
+    // The next tail sits on this same line.  The remainder is that row.
+    if (lineEnd > gapEnd) return { trailEnd: gapStart, detailEnd: gapStart };
+    const token = portion.trim();
+    li += 1;
+    const later = columnDetailLineStart(doc, li, lastLine, gapEnd);
+    if (later != null) return finish(later);
+    const trailEnd = columnTrailingTokenEnd(
+      doc,
+      li,
+      lastLine,
+      gapEnd,
+      COLUMN_TRAILING_TOKEN_RE.test(token) ? portionEnd : gapStart,
+    );
+    return { trailEnd, detailEnd: trailEnd };
+  }
+
+  const later = columnDetailLineStart(doc, li, lastLine, gapEnd);
+  if (later != null) return finish(later);
+  const trailEnd = columnTrailingTokenEnd(doc, li, lastLine, gapEnd, gapStart);
+  return { trailEnd, detailEnd: trailEnd };
+}
+
+/**
+ * End offset of consecutive `(TICKER) [TYPE]` lines in a gap that has no
+ * detail block.  Those lines belong to the row whose amount just ended, even
+ * when they wrap onto their own line.  A line with asset-name words is the
+ * next row and stops the scan.
+ */
+function columnTrailingTokenEnd(
+  doc: HousePtrDoc,
+  li: number,
+  lastLine: number,
+  gapEnd: number,
+  fallback: number,
+): number {
+  let end = fallback;
+  for (; li <= lastLine; li += 1) {
+    const lineStart = doc.lineStart[li] ?? Infinity;
+    if (lineStart >= gapEnd) break;
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (!COLUMN_TRAILING_TOKEN_RE.test((doc.lines[li] ?? '').trim())) break;
+    end = Math.min(doc.lineEnd[li] ?? end, gapEnd);
+  }
+  return end;
+}
+
+function columnDetailLineStart(
+  doc: HousePtrDoc,
+  li: number,
+  lastLine: number,
+  gapEnd: number,
+): number | null {
+  for (; li <= lastLine; li += 1) {
+    if ((doc.lineStart[li] ?? Infinity) >= gapEnd) break;
+    // A line that runs into the next tail is that row's identity.
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (HOUSE_DETAIL_LINE_RE.test(doc.lines[li] ?? '')) return doc.lineStart[li] ?? null;
+  }
+  return null;
+}
+
+/**
+ * Column-order House PTR parser.  Used when `[TYPE]` is not in front of the
+ * `P/S/E date date $amount` run (EO.Pdf wraps it onto the following line), so
+ * `parseTailRecords` under-counts.  `parseHousePtrText` prefers the tail
+ * parser when the two agree.
+ */
+export function parseColumnTailRecords(text: string): ParsedTx[] {
+  const doc = collapseHousePtrLines(joinWrappedAmountRanges(
+    stripHouseTableHeaders(cleanPdfText(text)),
+  ));
+  const normalized = doc.text;
   const matches = [...normalized.matchAll(ptrColumnTailRe())];
   if (matches.length === 0) return [];
+
+  const tailStart = matches.map((m) => m.index ?? 0);
+  const tailEnd = matches.map((m, i) => (m.index ?? 0) + (matches[i][0]?.length ?? 0));
+  const gapEnd = tailStart.slice(1).concat(normalized.length);
+  const splits = tailEnd.map((start, i) => columnGapSplit(doc, start, gapEnd[i]));
 
   const rows: ParsedTx[] = [];
   for (let i = 0; i < matches.length; i += 1) {
     const m = matches[i];
-    const next = matches[i + 1];
-    const start = m.index ?? 0;
-    const end = next?.index ?? normalized.length;
-    const prevEnd = i > 0
-      ? (matches[i - 1].index ?? 0) + (matches[i - 1][0].length)
-      : 0;
-    let prefix = normalized.slice(prevEnd, start);
-    if (i > 0) {
-      prefix = prefix
-        .replace(/^[\s\S]*\b(?:Filing\s+Status|Subholding\s+Of|Location|Description):/i, '')
-        .replace(/^[\s\S]*\bD\s*:\s+/i, '')
-        .replace(/^[A-Za-z][A-Za-z .,&'/-]{0,40}?\s+(?=[A-Z])/i, '')
-        .trim();
-    }
-    let suffix = normalized.slice(start + m[0].length, end);
-    suffix = suffix.replace(/\s+\d{7,}\s+(?:SP|DC|JT|SELF)\b[\s\S]*$/i, '');
-    const identitySlice = suffix
-      .replace(/\b(?:Filing\s+Status|Subholding\s+Of|Location|Description):[\s\S]*$/i, '')
-      .replace(ASSET_TYPE_RE, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const rawText = `${prefix} ${m[0]} ${suffix}`.replace(/\s+/g, ' ').trim();
+    const leadingStart = i === 0 ? 0 : splits[i - 1].detailEnd;
+    const leading = normalized.slice(leadingStart, tailStart[i]);
+    const trailing = normalized.slice(tailEnd[i], splits[i].trailEnd);
+    const detailsText = normalized.slice(splits[i].trailEnd, splits[i].detailEnd);
+    const identityText = `${leading} ${trailing}`.replace(/\s+/g, ' ').trim();
+    const rawText = `${identityText} ${m[0]} ${detailsText}`.replace(/\s+/g, ' ').trim();
     const groups = m.groups ?? {};
-    const identity = identityFromPrefix(`${prefix} ${identitySlice}`);
-    const suffixTicker = normalizeTicker((suffix.match(TICKER_RE) ?? identitySlice.match(TICKER_RE) ?? [])[1] ?? null);
-    const typeMatch = suffix.match(ASSET_TYPE_RE) ?? prefix.match(ASSET_TYPE_RE);
-    const assetType = typeMatch?.[1]?.toUpperCase() ?? groups.assetType?.toUpperCase() ?? null;
+    const identity = identityFromPrefix(identityText, i === 0);
+    const typeMatches = [...identityText.matchAll(new RegExp(ASSET_TYPE_RE.source, 'gi'))];
+    const assetType = typeMatches.at(-1)?.[1]?.toUpperCase() ?? null;
     const txType = parseTxType(groups.txType ?? '') ?? 'B';
     const txDate = toIsoDate(groups.txDate ?? '');
     const { min, max } = parseAmountRange(groups.amount ?? '');
-    const details = parseHouseRowDetails(suffix);
-    const ticker = identity.ticker ?? suffixTicker;
+    const details = parseHouseRowDetails(detailsText);
+    const assetName = identity.assetName
+      .replace(new RegExp(ASSET_TYPE_RE.source, 'gi'), ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || identity.ticker || '(unknown)';
     const confidence = calculateRowConfidence({
       owner: identity.owner,
-      assetName: identity.assetName,
-      ticker,
+      assetName,
+      ticker: identity.ticker,
       txType,
       txDate,
       amountMin: min,
@@ -536,8 +682,8 @@ function parseColumnTailRecords(text: string): ParsedTx[] {
     rows.push({
       txDate,
       owner: identity.owner,
-      assetName: identity.assetName,
-      ticker,
+      assetName,
+      ticker: identity.ticker,
       assetType,
       assetTypeName: assetType ? HOUSE_ASSET_TYPE_NAMES[assetType] ?? null : null,
       txType,

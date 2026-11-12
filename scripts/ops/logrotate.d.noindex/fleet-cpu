@@ -1,0 +1,14 @@
+# Optional belt-and-suspenders rotation for /var/log/fleet-cpu/samples.jsonl
+# Primary retention is enforced inside cpu-sampler.sh (7d / 20 MiB).
+# Install: cp to /etc/logrotate.d/fleet-cpu on the host.
+
+/var/log/fleet-cpu/*.jsonl {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    maxsize 20M
+}

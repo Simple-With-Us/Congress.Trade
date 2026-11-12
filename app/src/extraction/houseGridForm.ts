@@ -13,6 +13,11 @@
 
 import type { Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { looksLikeColumnHeaderAsset, looksLikeHeaderContaminatedAsset } from './extractRouting.ts';
+import {
+  parseGridFormLooseDate,
+  refineGridFormRowDates,
+  type GridFormDateContext,
+} from './houseGridFormDatePlausibility.ts';
 
 /** Recorded on filings.extractor when the in-app stage handles the PDF. */
 export const HOUSE_GRID_FORM_EXTRACTOR = 'houseGridForm';
@@ -122,11 +127,14 @@ export interface HouseGridRead {
 }
 
 /** Injected by the Deno app. Tests pass a fake. Null means the binaries are missing. */
-export interface HouseGridFormReader {
-  read(bytes: ArrayBuffer): Promise<HouseGridRead | null>;
+export interface HouseGridReadOptions {
+  filedDate?: string | null;
 }
 
-const DATE_RE = /^\D{0,2}(\d{1,2})\s*[/l1I|]\s*(\d{1,2})\s*[/l1I|]\s*(\d{2,4})\D{0,3}$/;
+export interface HouseGridFormReader {
+  read(bytes: ArrayBuffer, options?: HouseGridReadOptions): Promise<HouseGridRead | null>;
+}
+
 const DARK = 150;
 
 /**
@@ -476,20 +484,7 @@ export function classifyMarkScores(scores: readonly number[]): ClassifiedMarks {
 }
 
 function parseLooseDate(text: string): string | null {
-  const match = DATE_RE.exec(text.replace(/\s+/g, ''));
-  if (!match) return null;
-  let month = Number(match[1]);
-  const day = Number(match[2]);
-  let year = Number(match[3]);
-  if (year < 100) year += 2000;
-  // "10" is often read as 16, 20, 30, or 40. Those months cannot exist, so keep the day.
-  if (month === 16 || month === 18 || month === 19 || month === 20 || month === 30 || month === 40) month = 10;
-  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1990 || year > 2100) return null;
-  const dt = new Date(Date.UTC(year, month - 1, day));
-  if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) return null;
-  const mm = String(month).padStart(2, '0');
-  const dd = String(day).padStart(2, '0');
-  return `${year}-${mm}-${dd}`;
+  return parseGridFormLooseDate(text);
 }
 
 function ownerFromText(text: string): Owner | null {
@@ -1318,6 +1313,7 @@ function confidenceFor(
   marks: ClassifiedMarks,
   assetConf: number,
   hasDate: boolean,
+  dateConfidenceOk: boolean,
   asset: string,
   ownerUnread: boolean,
 ): number {
@@ -1326,6 +1322,7 @@ function confidenceFor(
     && marks.amountReason === 'ok'
     && marks.amountScore >= GRID_STRONG_MARK
     && hasDate
+    && dateConfidenceOk
     && asset.trim().length >= 4
     && assetConf >= 0.45
     && !ownerUnread;
@@ -1339,7 +1336,7 @@ function confidenceFor(
   return Math.min(0.9, score);
 }
 
-function pageRows(page: HouseGridPageInput): {
+function pageRows(page: HouseGridPageInput, dateContext: GridFormDateContext): {
   detected: boolean;
   transactions: ParsedTx[];
   markedCells: number;
@@ -1382,6 +1379,8 @@ function pageRows(page: HouseGridPageInput): {
     const notifRight = fit.xs[9] ?? tradeRight;
     let tradeDate: string | null = null;
     let notifDate: string | null = null;
+    let tradeRaw: string | null = null;
+    let notifRaw: string | null = null;
     for (const box of inBand) {
       const iso = parseLooseDate(box.text);
       if (!iso) continue;
@@ -1389,9 +1388,26 @@ function pageRows(page: HouseGridPageInput): {
       // The left date column is the trade. The right column is the notification.
       // A missed trade-date word stays null instead of copying the notification.
       if (cx >= tradeLeft - 8 && cx < tradeRight) {
-        if (!tradeDate) tradeDate = iso;
+        if (!tradeDate) {
+          tradeDate = iso;
+          tradeRaw = box.text.trim();
+        }
       } else if (cx >= tradeRight && cx <= notifRight + 8) {
-        if (!notifDate) notifDate = iso;
+        if (!notifDate) {
+          notifDate = iso;
+          notifRaw = box.text.trim();
+        }
+      }
+    }
+    if (!tradeDate) {
+      for (const box of inBand) {
+        if (box.x0 < tradeLeft - 4 || box.x1 > tradeRight + 2) continue;
+        if (box.x0 >= tradeRight) continue;
+        const iso = parseLooseDate(box.text);
+        if (!iso) continue;
+        tradeDate = iso;
+        tradeRaw = box.text.trim();
+        break;
       }
     }
     // A "26" read as "25" is a year behind the notification, not a 2025 trade.
@@ -1399,6 +1415,12 @@ function pageRows(page: HouseGridPageInput): {
       const snapped = `${notifDate.slice(0, 4)}-${tradeDate.slice(5)}`;
       if (snapped <= notifDate) tradeDate = snapped;
     }
+    const dates = refineGridFormRowDates(
+      { tradeDate, notifDate, tradeRaw, notifRaw },
+      dateContext,
+    );
+    tradeDate = dates.tradeDate;
+    notifDate = dates.notifDate;
     const chrome = looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text);
     const hasMark = marks.typeReason !== 'unmarked' || marks.amountReason !== 'unmarked' || marks.capGainsOver200;
     if (!asset.text && !hasMark) continue;
@@ -1412,6 +1434,8 @@ function pageRows(page: HouseGridPageInput): {
     if (marks.amountReason === 'unmarked') notes.push('no amount box marked');
     if (marks.amountReason === 'ambiguous') notes.push('amount marks were ambiguous');
     if (marks.amountReason === 'column_k') notes.push('amount column K marked');
+    if (dates.repaired) notes.push('date digit repair applied');
+    if (tradeDate && !dates.dateConfidenceOk) notes.push('date plausibility lowered confidence');
     const warnings: NonNullable<ParsedTx['extractionWarnings']> = [];
     if (marks.typeReason !== 'ok' || marks.txType === null) warnings.push('grid_type_unmarked');
     if (ownerUnread) warnings.push('owner_unread');
@@ -1430,7 +1454,14 @@ function pageRows(page: HouseGridPageInput): {
       rawText: `${asset.text || '(unreadable)'} | type ${marks.txType ?? 'unmarked'} | amt ${marks.amountLetter ?? 'blank'}`,
       supplementalText: notes.join('; '),
       description: notifDate ? `date notified ${notifDate}` : null,
-      confidence: confidenceFor(marks, asset.conf, Boolean(tradeDate), asset.text, ownerUnread),
+      confidence: confidenceFor(
+        marks,
+        asset.conf,
+        Boolean(tradeDate),
+        dates.dateConfidenceOk,
+        asset.text,
+        ownerUnread,
+      ),
       ...(warnings.length ? { extractionWarnings: warnings } : {}),
     });
   }
@@ -1438,13 +1469,17 @@ function pageRows(page: HouseGridPageInput): {
 }
 
 /** Read every supplied page. A filing is a grid form when any page fits. */
-export function readHouseGridForm(pages: readonly HouseGridPageInput[]): HouseGridRead {
+export function readHouseGridForm(
+  pages: readonly HouseGridPageInput[],
+  options: HouseGridReadOptions = {},
+): HouseGridRead {
+  const dateContext: GridFormDateContext = { filedDate: options.filedDate ?? null };
   const transactions: ParsedTx[] = [];
   let gridPages = 0;
   let markedCells = 0;
   let markCells = 0;
   for (const page of pages) {
-    const read = pageRows(page);
+    const read = pageRows(page, dateContext);
     if (!read.detected) continue;
     gridPages += 1;
     markedCells += read.markedCells;

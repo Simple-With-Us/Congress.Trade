@@ -587,16 +587,16 @@ export class HousePdfExtractor implements Extractor {
       };
     }
 
-    const grid = await this.readGridForm(input.bytes);
+    const grid = await this.readGridForm(input.bytes, input.filing.filedDate);
     if (grid?.detected) return houseGridFormResult(grid);
     if (textResult && textHasRows) return textResult;
     return this.visionPdf.extract(input);
   }
 
-  private async readGridForm(bytes: ArrayBuffer | undefined): Promise<HouseGridRead | null> {
+  private async readGridForm(bytes: ArrayBuffer | undefined, filedDate: string | null): Promise<HouseGridRead | null> {
     if (!this.gridForm || !bytes) return null;
     try {
-      return await this.gridForm.read(bytes);
+      return await this.gridForm.read(bytes, { filedDate });
     } catch (err) {
       console.warn('housePdf: grid form stage failed', (err as Error).message);
       return null;
@@ -741,7 +741,7 @@ function emptyOgeTextResult(): ExtractorResult {
  */
 export function buildExtractorPipeline(env: Env): Extractor[] {
   const senateHtml = new SenateHtmlExtractor(env);
-  const textPdf = new TextPdfExtractor();
+  const textPdf = new TextPdfExtractor(env);
   const ogeText = new OgeTextExtractor();
 
   const geminiVision = new VisionLlmExtractor(env);

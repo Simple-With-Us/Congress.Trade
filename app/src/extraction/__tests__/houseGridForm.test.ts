@@ -231,7 +231,7 @@ describe('unmarked grid rows in the normalizer', () => {
 
 describe('synthetic hand-delivered grid page', () => {
   const drawn = drawGrid(0.72, 40, ROWS);
-  const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+  const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }], { filedDate: filing().filedDate });
 
   it('detects the form and classifies every row without inventing a type', () => {
     expect(read.detected).toBe(true);
@@ -375,7 +375,7 @@ describe('grid row, owner, and date corrections', () => {
       { y0: 220, y1: 300, owner: 'SP', asset: 'APPLE INC (AAPL)', txDate: '', notifDate: '11/02/26', marks: [TYPE_COLUMN.p, 9] },
     ];
     const drawn = drawGrid(0.72, 40, rows);
-    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 4 }]);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 4 }], { filedDate: filing().filedDate });
     expect(read.transactions).toHaveLength(1);
     expect(read.transactions[0]?.txDate).toBeNull();
     expect(read.transactions[0]?.description).toContain('2026-11-02');
@@ -385,10 +385,10 @@ describe('grid row, owner, and date corrections', () => {
   it('does not read the cover sample grid as trades', () => {
     const drawn = drawGrid(0.72, 40, ROWS.slice(0, 1));
     hline(drawn.image, 40, drawn.xs[7], drawn.xs[drawn.xs.length - 1]);
-    const covered = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 1 }]);
+    const covered = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 1 }], { filedDate: filing().filedDate });
     expect(covered.transactions).toHaveLength(0);
     const plain = drawGrid(0.72, 40, ROWS.slice(0, 1));
-    const open = readHouseGridForm([{ image: plain.image, boxes: plain.boxes, page: 2 }]);
+    const open = readHouseGridForm([{ image: plain.image, boxes: plain.boxes, page: 2 }], { filedDate: filing().filedDate });
     expect(open.transactions).toHaveLength(1);
   });
 
@@ -397,7 +397,7 @@ describe('grid row, owner, and date corrections', () => {
       { y0: 220, y1: 300, owner: 'DC', asset: 'INTEL CORP', txDate: '20/13/26', notifDate: '11/02/26', marks: [TYPE_COLUMN.s, 10] },
     ];
     const drawn = drawGrid(0.72, 40, rows);
-    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 6 }]);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 6 }], { filedDate: filing().filedDate });
     expect(read.transactions[0]?.txDate).toBe('2026-10-13');
   });
 
@@ -439,7 +439,7 @@ describe('grid row, owner, and date corrections', () => {
       { y0: 460, y1: 540, owner: 'JT', asset: '', txDate: '', notifDate: '', marks: [] },
     ];
     const drawn = drawGrid(0.72, 40, rows);
-    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }], { filedDate: filing().filedDate });
     expect(read.transactions).toHaveLength(1);
     expect(read.transactions[0]).toMatchObject({
       owner: 'joint',
@@ -452,12 +452,23 @@ describe('grid row, owner, and date corrections', () => {
     expect(read.transactions[0]?.assetName).not.toMatch(/TLH/);
   });
 
+  it('lowers confidence when trade and notification order is implausible', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: 'SP', asset: 'INTEL CORP', txDate: '11/12/26', notifDate: '11/02/26', marks: [TYPE_COLUMN.p, 9] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 6 }], { filedDate: filing().filedDate });
+    expect(read.transactions[0]?.txDate).toBe('2026-11-12');
+    expect(read.transactions[0]?.confidence).toBeLessThan(0.95);
+    expect(read.transactions[0]?.supplementalText).toContain('date plausibility lowered confidence');
+  });
+
   it('reads an impossible OCR month 40 as October', () => {
     const rows: DrawnRow[] = [
       { y0: 220, y1: 300, owner: 'JT', asset: 'SELECT SECTOR SPDR ENERGY  XLE', txDate: '40/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.s, 9] },
     ];
     const drawn = drawGrid(0.72, 40, rows);
-    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }], { filedDate: filing().filedDate });
     expect(read.transactions[0]?.txDate).toBe('2026-10-22');
     expect(read.transactions[0]?.ticker).toBe('XLE');
     expect(read.transactions[0]?.owner).toBe('joint');
