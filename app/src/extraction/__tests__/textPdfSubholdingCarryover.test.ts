@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { parseHousePtrText } from '../textPdf.ts';
+import { parseColumnTailRecords, parseHousePtrText } from '../textPdf.ts';
 
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), '../__fixtures__');
 
@@ -169,6 +169,65 @@ describe('textPdf House PTR row segmentation', () => {
       'Mercato Partners Traverse IV QP, LP (GLAS Funds, LP)',
     ]);
     expect(rows.every((r) => r.subholding === '2012 Trust')).toBe(true);
+  });
+
+  describe('column-order fallback on H-2026-20035788', () => {
+    // The tail parser wins on this filing after the page-split rejoin.  The
+    // column-order parser is what runs when that tail under-counts, and it
+    // used to glue each Subholding Of onto the next asset and steal the next
+    // row's ticker and [TYPE] (a muni took CF; BridgeBio was typed GS).
+    const rows = parseColumnTailRecords(fixture('H-2026-20035788-text-layer.txt'));
+    const expected = expectedRows('H-2026-20035788-parsed-rows.json');
+
+    it('extracts 65 rows in filing order', () => {
+      expect(rows).toHaveLength(65);
+      expect(rows).toHaveLength(expected.length);
+    });
+
+    it('keeps each asset name, ticker, and asset type on its own row', () => {
+      expect(rows.map((row) => ({
+        assetName: row.assetName,
+        ticker: row.ticker,
+        assetType: row.assetType,
+        txDate: row.txDate,
+        txType: row.txType,
+        owner: row.owner,
+        amountMin: row.amountMin,
+        amountMax: row.amountMax,
+        filingStatus: row.filingStatus,
+        subholding: row.subholding,
+        description: row.description,
+      }))).toEqual(expected.map((want) => ({
+        assetName: want.assetName,
+        ticker: want.ticker,
+        assetType: want.assetType,
+        txDate: want.txDate,
+        txType: want.txType,
+        owner: want.owner,
+        amountMin: want.amountMin,
+        amountMax: want.amountMax,
+        filingStatus: want.filingStatus,
+        subholding: want.subholding,
+        description: want.description ?? null,
+      })));
+    });
+
+    it('does not move a trust name or the next ticker onto the neighboring row', () => {
+      const muni = rows.find((row) => row.assetName === 'California Community Choice Financing Authority Rev Bonds');
+      const bridge = rows.find((row) => row.ticker === 'BBIO' && row.txDate === '2026-11-02');
+      const cf = rows.find((row) => row.ticker === 'CF');
+      expect(muni).toMatchObject({ ticker: null, assetType: 'GS' });
+      expect(bridge).toMatchObject({
+        assetName: 'BridgeBio Pharma, Inc. - Common Stock',
+        assetType: 'ST',
+      });
+      expect(cf).toMatchObject({
+        assetName: 'CF Industries Holdings, Inc. Common Stock',
+        assetType: 'ST',
+      });
+      expect(rows.every((row) => !row.assetName.startsWith('150 Main Street'))).toBe(true);
+      expect(rows.every((row) => !/Filing Status|Subholding Of/i.test(row.assetName))).toBe(true);
+    });
   });
 
   describe('synthetic House text layers', () => {
