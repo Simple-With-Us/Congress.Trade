@@ -88,6 +88,8 @@ import {
   isVisionTxSource,
   supersededPipelineSourcesSql,
 } from './sourceSupersede.ts';
+import { proposedMatchesLivePipeline } from '../admin/publishContentHash.ts';
+import { recordReviewRevisionAudit } from '../shared/reviewRevisionAudit.ts';
 
 /**
  * Per-tx confidence at or above this threshold is trusted for auto-publish. If a
@@ -1534,6 +1536,30 @@ async function persistNormalizedPublish(
       `refusing to publish ${transactions.length} transactions; limit is ${MAX_PUBLISH_TRANSACTIONS_PER_FILING}`,
     );
   }
+
+  const pipelineMatch = await proposedMatchesLivePipeline(env.DB, docId, transactions);
+  if (pipelineMatch.identical) {
+    await recordReviewRevisionAudit(env.DB, {
+      docId,
+      revision: review?.review_revision ?? 1,
+      trigger: 'pipeline_publish_identical_noop',
+      contentHash: pipelineMatch.contentHash,
+      detail: {
+        extractor: metadata.extractor,
+        modelVersion: metadata.modelVersion,
+        resolved: review?.resolved ?? null,
+      },
+      createdAt: nowIso,
+    });
+    const existingIds = await all<{ id: string }>(
+      env.DB,
+      `SELECT id FROM transactions
+        WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL}) AND deprecated_at IS NULL`,
+      [docId],
+    );
+    return { published: false, insertedIds: existingIds.map((row) => row.id) };
+  }
+
   const insertRowsJson = transactionInsertJson(transactions);
   const rowKeysJson = JSON.stringify(transactions.map((tx) => tx.rowKey ?? ''));
   const incomingSource = transactions[0]?.source ?? 'primary';
