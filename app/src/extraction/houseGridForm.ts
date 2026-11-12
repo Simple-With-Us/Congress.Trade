@@ -12,7 +12,14 @@
  */
 
 import type { Owner, ParsedTx, TxType } from '../shared/types.ts';
-import { looksLikeColumnHeaderAsset, looksLikeHeaderContaminatedAsset } from './extractRouting.ts';
+import {
+  looksLikeColumnHeaderAsset,
+  looksLikeHeaderContaminatedAsset,
+  looksLikePtrFormSampleAsset,
+  looksLikePtrFormSampleDate,
+  looksLikePtrFormSampleRow,
+  looksLikeSeeAttachmentPointer,
+} from './extractRouting.ts';
 
 /** Recorded on filings.extractor when the in-app stage handles the PDF. */
 export const HOUSE_GRID_FORM_EXTRACTOR = 'houseGridForm';
@@ -29,6 +36,28 @@ export const COLUMN_TEMPLATES: readonly (readonly number[])[] = [
   [219, 331, 861, 955, 1010, 1105, 1202, 1321, 1481, 1648, 1758, 1859, 1948, 2036, 2125, 2233, 2336, 2453, 2668, 2783, 3033],
   [278, 395, 939, 1037, 1093, 1195, 1300, 1426, 1604, 1777, 1892, 2009, 2104, 2200, 2296, 2405, 2517, 2645, 2771, 2893, 3023],
 ];
+
+/**
+ * Printed House PTR (filer block on the same page as the grid).
+ * Eighteen rules at 150 DPI: owner, asset, purchase, sale, exchange,
+ * trade date, notification date, amount brackets A–J. No partial column,
+ * no capital-gains column, and no bracket K.
+ * Measured on H-2026-9116403 page 1.
+ */
+export const OFFICIAL_PTR_TEMPLATE: readonly number[] = [
+  164, 242, 675, 716, 756, 795, 900, 1005, 1061, 1117, 1172, 1228, 1284, 1340, 1396, 1452, 1508, 1564,
+];
+/** Template rules that must land on a detected line before this form wins. */
+export const OFFICIAL_PTR_MIN_HITS = 16;
+/** The printed form is scanned at its own size. A schedule page can line up 16 of these rules near scale 0.92. */
+export const OFFICIAL_PTR_MIN_SCALE = 0.96;
+export const OFFICIAL_PTR_MAX_SCALE = 1.05;
+/**
+ * The printed PTR checkbox is a little larger than the schedule glyph at
+ * the same column-fit scale. Scoring at the raw fit scale leaves a real
+ * sale mark under MARK_SCORE_MIN while the header words stay well below it.
+ */
+export const OFFICIAL_MARK_SCALE = 1.1;
 
 /** Intervals between the 21 rules. Dates sit in 7 and 8 and are not marks. */
 /** Purchase, sale, exchange, capital-gains, partial. Header order on the printed grid. */
@@ -86,6 +115,8 @@ export interface HouseGridPageInput {
   page?: number;
 }
 
+export type GridFormKind = 'schedule' | 'official';
+
 export interface ColumnFit {
   templateIndex: number;
   scale: number;
@@ -93,6 +124,11 @@ export interface ColumnFit {
   /** Predicted rule x positions, length 21. */
   xs: number[];
   inliers: number;
+  /**
+   * `schedule` is the attached-page grid (partial, capital gains, bracket K).
+   * `official` is the printed PTR on the filer page (brackets A–J only).
+   */
+  kind: GridFormKind;
 }
 
 export type GridTypeReason = 'ok' | 'unmarked' | 'ambiguous';
@@ -259,7 +295,7 @@ export function fitColumnLines(detected: readonly number[], minScale = 0.5): Col
             }
             const xs = template.map((t) => Math.round(offset + scale * t));
             if (!best || inliers > best.inliers || (inliers === best.inliers && err < bestErr)) {
-              best = { templateIndex, scale, offset, xs, inliers };
+              best = { templateIndex, scale, offset, xs, inliers, kind: 'schedule' };
               bestErr = err;
             }
           }
@@ -269,6 +305,79 @@ export function fitColumnLines(detected: readonly number[], minScale = 0.5): Col
   }
   if (!best || best.inliers < 8) return null;
   return best;
+}
+
+/**
+ * Map the 18 printed-PTR rules onto the 21 schedule slots.
+ * Capital gains, partial, and bracket K are not printed, so those slots
+ * share a boundary and stay empty.
+ */
+export function expandOfficialPtrRules(rules: readonly number[]): number[] {
+  const rule = (index: number): number => rules[index] ?? rules[rules.length - 1] ?? 0;
+  return [
+    rule(0), rule(1), rule(2), rule(3), rule(4),
+    rule(5), rule(5), rule(5),
+    rule(6),
+    rule(7), rule(8), rule(9), rule(10), rule(11), rule(12), rule(13), rule(14), rule(15), rule(16),
+    rule(17), rule(17),
+  ];
+}
+
+/**
+ * Fit the printed PTR column rules.
+ * A hit is a template rule with a detected line within 12px, and both
+ * outer rules have to hit. The attached schedule does not clear the hit
+ * floor, so this fit does not steal those pages.
+ */
+export function fitOfficialPtrLines(detected: readonly number[]): ColumnFit | null {
+  if (detected.length < 8) return null;
+  const template = OFFICIAL_PTR_TEMPLATE;
+  let best: { hits: number; err: number; scale: number; offset: number } | null = null;
+  for (let i = 0; i < detected.length; i += 1) {
+    for (let j = i + 1; j < detected.length; j += 1) {
+      for (let a = 0; a < template.length; a += 1) {
+        for (let b = a + 1; b < template.length; b += 1) {
+          const denom = template[b] - template[a];
+          if (denom === 0) continue;
+          const scale = (detected[j] - detected[i]) / denom;
+          if (scale < OFFICIAL_PTR_MIN_SCALE || scale > OFFICIAL_PTR_MAX_SCALE) continue;
+          const offset = detected[i] - scale * template[a];
+          let hits = 0;
+          let err = 0;
+          let first = false;
+          let last = false;
+          for (let t = 0; t < template.length; t += 1) {
+            const predicted = offset + scale * template[t];
+            let nearest = Number.POSITIVE_INFINITY;
+            for (const x of detected) {
+              const distance = Math.abs(x - predicted);
+              if (distance < nearest) nearest = distance;
+            }
+            if (nearest < 12) {
+              hits += 1;
+              err += nearest;
+              if (t === 0) first = true;
+              if (t === template.length - 1) last = true;
+            }
+          }
+          if (!first || !last) continue;
+          if (!best || hits > best.hits || (hits === best.hits && err < best.err)) {
+            best = { hits, err, scale, offset };
+          }
+        }
+      }
+    }
+  }
+  if (!best || best.hits < OFFICIAL_PTR_MIN_HITS) return null;
+  const rules = template.map((value) => Math.round(best.offset + best.scale * value));
+  return {
+    templateIndex: -1,
+    scale: best.scale,
+    offset: best.offset,
+    xs: expandOfficialPtrRules(rules),
+    inliers: best.hits,
+    kind: 'official',
+  };
 }
 
 function crop(image: GrayImage, x0: number, y0: number, x1: number, y1: number): GrayImage {
@@ -800,21 +909,29 @@ function medianNumber(values: readonly number[]): number {
 
 /**
  * Column fit for one page.
- * The usual window starts below the running header. A short table that
- * sits entirely above that window (a last page with a few rows) is fit
- * again from the top of the page.
+ * The printed PTR (owner, three type columns, brackets A–J) is tried
+ * before the attached-schedule templates. A short table that sits above
+ * the usual window is fit again from the top of the page.
  */
 export function planHouseGridColumns(image: GrayImage): ColumnFit | null {
-  const primary = fitColumnLines(detectVerticalLines(
+  const primaryLines = detectVerticalLines(
     image,
     Math.floor(image.height * 0.28),
     Math.floor(image.height * 0.92),
-  ));
-  if (primary && primary.inliers >= GRID_MIN_INLIERS) return primary;
-  const fallback = fitColumnLines(
-    detectVerticalLines(image, Math.floor(image.height * 0.05), Math.floor(image.height * 0.72), 0.15),
-    0.42,
   );
+  const official = fitOfficialPtrLines(primaryLines);
+  if (official) return official;
+  const primary = fitColumnLines(primaryLines);
+  if (primary && primary.inliers >= GRID_MIN_INLIERS) return primary;
+  const fallbackLines = detectVerticalLines(
+    image,
+    Math.floor(image.height * 0.05),
+    Math.floor(image.height * 0.72),
+    0.15,
+  );
+  const officialFallback = fitOfficialPtrLines(fallbackLines);
+  if (officialFallback) return officialFallback;
+  const fallback = fitColumnLines(fallbackLines, 0.42);
   if (fallback && fallback.inliers >= GRID_MIN_INLIERS) return fallback;
   return null;
 }
@@ -984,8 +1101,94 @@ export function rowBands(image: GrayImage, xs: readonly number[]): { bands: Arra
   return { bands, sectionBars: barBottoms.length };
 }
 
-/** Cover sample grid: no trust bar, and a rule in the top of the page. */
-export function shouldSkipHouseGridCover(image: GrayImage, xs: readonly number[], sectionBars: number): boolean {
+/**
+ * Row bands for the printed PTR.
+ * Amount-column rules at the data pitch are kept. The sample row is shorter
+ * than that pitch, and the filer block above the table is a separate run.
+ * The longest run is the transaction table. Dollar-range ink in the header
+ * is thicker than a rule and is not a trust bar.
+ */
+export function officialPtrRowBands(
+  image: GrayImage,
+  xs: readonly number[],
+): { bands: Array<{ y0: number; y1: number }>; sectionBars: number } {
+  const none = { bands: [] as Array<{ y0: number; y1: number }>, sectionBars: 0 };
+  const x0 = Math.max(0, Math.floor(xs[9] ?? 0));
+  const x1 = Math.min(image.width, Math.floor(xs[xs.length - 1] ?? 0));
+  if (x1 - x0 < 40) return none;
+  const groups: number[][] = [];
+  for (let y = 0; y < image.height; y += 1) {
+    let dark = 0;
+    const row = y * image.width;
+    for (let x = x0; x < x1; x += 1) {
+      if (image.pixels[row + x] < 200) dark += 1;
+    }
+    if (dark <= (x1 - x0) * 0.22) continue;
+    const last = groups[groups.length - 1];
+    if (last && y - last[last.length - 1] <= 3) last.push(y);
+    else groups.push([y]);
+  }
+  const rules: number[] = [];
+  for (const group of groups) {
+    if (group.length <= 8) rules.push(Math.round(group.reduce((sum, value) => sum + value, 0) / group.length));
+  }
+  if (rules.length < 3) return none;
+  const gaps = rules.slice(1).map((rule, index) => rule - rules[index]);
+  const pitchGaps = gaps.filter((gap) => gap >= 45 && gap <= 90);
+  const pitch = medianNumber(pitchGaps.length >= 3 ? pitchGaps : gaps.filter((gap) => gap >= 24 && gap <= 140));
+  if (!(pitch > 0)) return none;
+  const candidates: Array<{ y0: number; y1: number }> = [];
+  for (let i = 0; i < rules.length - 1; i += 1) {
+    const y0 = rules[i];
+    const y1 = rules[i + 1];
+    const height = y1 - y0;
+    if (height < pitch * 0.8 || height > pitch * 1.35) continue;
+    let dark = 0;
+    const sample = Math.max(1, x1 - x0);
+    for (let y = y0 + 2; y < y1 - 2; y += 2) {
+      const row = y * image.width;
+      for (let x = x0; x < x1; x += 4) {
+        if (image.pixels[row + x] < DARK) dark += 1;
+      }
+    }
+    const samples = Math.max(1, Math.ceil((y1 - y0) / 2) * Math.ceil(sample / 4));
+    if (dark / samples > 0.45) continue;
+    candidates.push({ y0, y1 });
+  }
+  const runs: Array<Array<{ y0: number; y1: number }>> = [];
+  let run: Array<{ y0: number; y1: number }> = [];
+  for (const band of candidates) {
+    const previous = run[run.length - 1];
+    if (previous && band.y0 !== previous.y1) {
+      runs.push(run);
+      run = [];
+    }
+    run.push(band);
+  }
+  if (run.length > 0) runs.push(run);
+  runs.sort((left, right) => right.length - left.length || right[0].y0 - left[0].y0);
+  return { bands: runs[0] ?? [], sectionBars: 0 };
+}
+
+export function layoutHouseGridRows(
+  image: GrayImage,
+  fit: ColumnFit,
+): { bands: Array<{ y0: number; y1: number }>; sectionBars: number } {
+  if (fit.kind === 'official') return officialPtrRowBands(image, fit.xs);
+  return rowBands(image, fit.xs);
+}
+
+/**
+ * Schedule cover: no trust bar, and a rule in the top of the page.
+ * The printed PTR has that same header rule and is not a cover.
+ */
+export function shouldSkipHouseGridCover(
+  image: GrayImage,
+  xs: readonly number[],
+  sectionBars: number,
+  kind: GridFormKind = 'schedule',
+): boolean {
+  if (kind === 'official') return false;
   return sectionBars === 0 && hasEarlyHorizontalRule(image, xs);
 }
 
@@ -1019,7 +1222,14 @@ function scoreRowCells(
       continue;
     }
     const inset = 4;
-    const cell = crop(image, xs[column] + inset, y0 + 2, xs[column + 1] - inset, y1 - 2);
+    const left = xs[column] + inset;
+    const right = xs[column + 1] - inset;
+    // Capital gains, partial, and bracket K are not printed on the PTR grid.
+    if (right - left < 8) {
+      scores.push(0);
+      continue;
+    }
+    const cell = crop(image, left, y0 + 2, right, y1 - 2);
     const score = matchTemplateMax(cell, template);
     scores.push(score);
     if (score >= MARK_SCORE_MIN) marked += 1;
@@ -1195,10 +1405,13 @@ const TICKER_DENY = new Set([
  * two spaces separate it from the asset name, which is how these grids
  * print the symbol after the name.
  */
-export function splitBareTicker(text: string): { name: string; ticker: string | null } {
+export function splitBareTicker(text: string, spaces: 1 | 2 = 2): { name: string; ticker: string | null } {
   const paren = text.match(/\(([A-Z]{1,5})\)/);
   if (paren) return { name: text, ticker: paren[1] };
-  const match = text.match(/^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$/);
+  // The attached schedule prints two spaces before the symbol. The PTR
+  // prints one, and a single space must not peel a schedule name.
+  const gap = spaces === 1 ? '[ \\t]+' : '[ \\t]{2,}';
+  const match = text.match(new RegExp(`^(.*\\S)${gap}([A-Z]{2,5})[ \\t]*$`));
   if (!match || TICKER_DENY.has(match[2])) return { name: text, ticker: null };
   return { name: match[1], ticker: match[2] };
 }
@@ -1231,7 +1444,7 @@ export function cleanGridAssetName(text: string): string {
         continue;
       }
       if (words[words.length - 1] === piece) continue;
-      if (piece.length === 1 && !/^[A-Z]$/.test(piece)) continue;
+      if (piece.length === 1 && piece !== '&' && !/^[A-Z]$/.test(piece)) continue;
       words.push(piece);
     }
   }
@@ -1284,6 +1497,17 @@ function confidenceFor(marks: ClassifiedMarks, assetConf: number, hasDate: boole
   return Math.min(0.9, score);
 }
 
+/** Header, sample, and attachment lines on the printed PTR. Marks do not keep them. */
+function isOfficialGridChrome(asset: string, txDate: string | null): boolean {
+  if (looksLikeHeaderContaminatedAsset(asset) || looksLikeColumnHeaderAsset(asset)) return true;
+  if (looksLikePtrFormSampleAsset(asset)) return true;
+  if (looksLikePtrFormSampleRow({ assetName: asset, rawText: asset, txDate })) return true;
+  if (looksLikeSeeAttachmentPointer(asset)) return true;
+  if (/provide full name|ticker symbol|full asset name|filer notes|footnote|amount of transaction|type of trans|publicly disclosed/i.test(asset)) return true;
+  if (txDate && looksLikePtrFormSampleDate(txDate)) return true;
+  return false;
+}
+
 function pageRows(page: HouseGridPageInput): {
   detected: boolean;
   transactions: ParsedTx[];
@@ -1293,11 +1517,11 @@ function pageRows(page: HouseGridPageInput): {
   const empty = { detected: false, transactions: [], markedCells: 0, markCells: 0 };
   const fit = planHouseGridColumns(page.image);
   if (!fit || fit.xs.length < 21) return empty;
-  const laidOut = rowBands(page.image, fit.xs);
-  // The cover prints a sample grid under the filer block and has no trust
-  // bar. A ruled line in the top of that page is the filer form, not a trade.
-  if (shouldSkipHouseGridCover(page.image, fit.xs, laidOut.sectionBars)) return empty;
-  const sized = xTemplateForFit(fit.scale);
+  const laidOut = layoutHouseGridRows(page.image, fit);
+  // The attached schedule's cover prints a sample grid under the filer block
+  // and has no trust bar. The printed PTR has that header rule and real rows.
+  if (shouldSkipHouseGridCover(page.image, fit.xs, laidOut.sectionBars, fit.kind)) return empty;
+  const sized = xTemplateForFit(fit.kind === 'official' ? fit.scale * OFFICIAL_MARK_SCALE : fit.scale);
   const bands = laidOut.bands;
   const transactions: ParsedTx[] = [];
   let markedCells = 0;
@@ -1340,11 +1564,16 @@ function pageRows(page: HouseGridPageInput): {
       const snapped = `${notifDate.slice(0, 4)}-${tradeDate.slice(5)}`;
       if (snapped <= notifDate) tradeDate = snapped;
     }
-    const chrome = looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text);
     const hasMark = marks.typeReason !== 'unmarked' || marks.amountReason !== 'unmarked' || marks.capGainsOver200;
     if (!asset.text && !hasMark) continue;
-    if (chrome && !hasMark) continue;
-    const named = splitBareTicker(asset.text);
+    if (fit.kind === 'official') {
+      // The sample row is marked. Header text and that sample never become trades.
+      if (isOfficialGridChrome(asset.text, tradeDate)) continue;
+      if (marks.typeReason !== 'ok' || !asset.text.trim()) continue;
+    } else if ((looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text)) && !hasMark) {
+      continue;
+    }
+    const named = splitBareTicker(asset.text, fit.kind === 'official' ? 1 : 2);
     const assetName = cleanGridAssetName(named.name) || named.name;
     const notes: string[] = [`grid page ${pageNum}`];
     if (marks.partial) notes.push('partial transaction box marked');

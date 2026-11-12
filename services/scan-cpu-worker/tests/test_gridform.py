@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gridform import (  # noqa: E402
     COLUMN_TEMPLATES,
+    OFFICIAL_PTR_TEMPLATE,
     TYPE_P,
     TYPE_PARTIAL,
     TYPE_S,
@@ -18,7 +19,9 @@ from gridform import (  # noqa: E402
     OcrBox,
     classify_mark_scores,
     clean_grid_asset_name,
+    expand_official_ptr_rules,
     fit_column_lines,
+    fit_official_ptr_lines,
     read_grid_page,
     reading_order,
     row_bands,
@@ -159,3 +162,18 @@ def test_gray_halo_stays_under_the_150_band_cutoff():
     bands, section_bars = row_bands(gray, xs)
     assert section_bars == 0
     assert len(bands) == 2
+
+
+def test_official_ptr_fit_rejects_a_schedule_page():
+    noisy = sorted([*OFFICIAL_PTR_TEMPLATE, 400, 510])
+    fit = fit_official_ptr_lines(noisy)
+    assert fit is not None
+    assert fit.kind == "official"
+    assert fit.inliers == len(OFFICIAL_PTR_TEMPLATE)
+    expanded = expand_official_ptr_rules(OFFICIAL_PTR_TEMPLATE)
+    assert fit.xs[9] == expanded[9]
+    schedule = [int(round(value * 0.5)) for value in COLUMN_TEMPLATES[0]]
+    assert fit_official_ptr_lines(schedule) is None
+    shrunk = [int(round(value * 0.92)) for value in OFFICIAL_PTR_TEMPLATE]
+    assert fit_official_ptr_lines(shrunk) is None
+    assert clean_grid_asset_name("SPDR SER TR S&P AEROSPACE & DEFENSE") == "SPDR SER TR S&P AEROSPACE & DEFENSE"
