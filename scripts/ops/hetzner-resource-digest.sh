@@ -6,10 +6,12 @@
 # from /proc/stat.  Each metric gets green/yellow/red against env-configured thresholds.
 # Numeric fields include deltas versus the previous run's saved JSON state file.
 #
-# Optional sibling report scripts (when installed on the host) may replace built-in
-# collectors when they print one JSON object to stdout (HETZNER_DIGEST_JSON=1):
+# Optional inode/disk/CPU siblings may replace their built-in collectors.
+# Container RAM is separate from host memory and never overrides MemAvailable.
+# Siblings print one JSON object (HETZNER_DIGEST_JSON=1); the container report
+# uses its native --json interface:
 #   host-inode-report.sh, host-cpu-steal-sampler.sh,
-#   host-container-ram-report.sh, host-disk-growth-snapshot.sh
+#   container-mem-report.sh, host-disk-growth-snapshot.sh
 # Default search: same directory as this script, then /usr/local/bin/.
 # HETZNER_DIGEST_SIBLING_DIR, when set, is an exclusive sibling directory.
 #
@@ -26,6 +28,7 @@
 #   THRESH_DISK_USED_YELLOW / _RED      default 80 / 90
 #   THRESH_INODE_USED_YELLOW / _RED     default 80 / 90
 #   THRESH_MEM_AVAIL_PCT_YELLOW / _RED  default 15 / 8  (LOW available % is worse; inverted)
+#   THRESH_CONTAINER_MEM_USED_PCT_YELLOW / _RED default 80 / 90 (HIGH usage/cap)
 #   THRESH_SWAP_USED_GB_YELLOW / _RED   default 4 / 12
 #   THRESH_LOAD_PER_CPU_YELLOW / _RED   default 1.0 / 2.0  (load1 / ncpu)
 #   THRESH_CPU_STEAL_PCT_YELLOW / _RED  default 3 / 8
@@ -52,6 +55,8 @@ THRESH_INODE_USED_YELLOW="${THRESH_INODE_USED_YELLOW:-80}"
 THRESH_INODE_USED_RED="${THRESH_INODE_USED_RED:-90}"
 THRESH_MEM_AVAIL_PCT_YELLOW="${THRESH_MEM_AVAIL_PCT_YELLOW:-15}"
 THRESH_MEM_AVAIL_PCT_RED="${THRESH_MEM_AVAIL_PCT_RED:-8}"
+THRESH_CONTAINER_MEM_USED_PCT_YELLOW="${THRESH_CONTAINER_MEM_USED_PCT_YELLOW:-80}"
+THRESH_CONTAINER_MEM_USED_PCT_RED="${THRESH_CONTAINER_MEM_USED_PCT_RED:-90}"
 THRESH_SWAP_USED_GB_YELLOW="${THRESH_SWAP_USED_GB_YELLOW:-4}"
 THRESH_SWAP_USED_GB_RED="${THRESH_SWAP_USED_GB_RED:-12}"
 THRESH_LOAD_PER_CPU_YELLOW="${THRESH_LOAD_PER_CPU_YELLOW:-1.0}"
@@ -244,12 +249,13 @@ sibling_search_paths() {
 
 try_sibling_json() {
   local base="$1"
+  shift
   local path out
   local candidate failed=0
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
     if [[ -x "$candidate" ]]; then
-      if out="$(HETZNER_DIGEST_JSON=1 "$candidate" 2>/dev/null)" && [[ -n "$out" ]]; then
+      if out="$(HETZNER_DIGEST_JSON=1 "$candidate" "$@" 2>/dev/null)" && [[ -n "$out" ]]; then
         printf '%s' "$out"
         return 0
       fi
@@ -290,6 +296,7 @@ emit_json_and_md() {
   local prior_path="$1"
   python3 - "$prior_path" <<'PY'
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -480,6 +487,85 @@ for key, raw in (
     else:
         siblings[key] = {"status": "absent", "payload": None}
 
+# CT-2492 container-mem-report.sh owns this schema. Do not read available_pct:
+# a host availability percentage and a container usage/cap ratio are not peers.
+yellow = float(env["THRESH_CONTAINER_MEM_USED_PCT_YELLOW"])
+red = float(env["THRESH_CONTAINER_MEM_USED_PCT_RED"])
+if not (math.isfinite(yellow) and math.isfinite(red) and 0 < yellow < red <= 100):
+    raise SystemExit("container thresholds must satisfy 0 < yellow < red <= 100")
+
+def byte_count(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+container_metric = {
+    "max_used_pct": None,
+    "status": "unknown",
+    "thresholds": {"yellow_used_pct": yellow, "red_used_pct": red},
+    "denominator": "per-container memory_limit_bytes (positive configured cap)",
+    "containers": [],
+    "reported_count": None,
+    "evaluated_count": 0,
+    "unlimited_count": 0,
+    "unknown_count": 0,
+    "error": None,
+}
+ram = siblings["container_ram_report"]
+payload = ram["payload"]
+if ram["status"] == "absent":
+    container_metric["error"] = "collector_absent"
+elif ram["status"] != "ok":
+    container_metric["error"] = "collector_failed"
+elif not isinstance(payload, dict) or not isinstance(payload.get("containers"), list):
+    container_metric["error"] = "invalid_container_schema"
+else:
+    rows = payload["containers"]
+    container_metric["reported_count"] = len(rows)
+    for row in rows:
+        if not isinstance(row, dict):
+            row = {}
+        usage = byte_count(row.get("memory_usage_bytes"))
+        cap = byte_count(row.get("memory_limit_bytes"))
+        source = row.get("memory_usage_source")
+        limit_source = row.get("memory_limit_source")
+        error = None
+        pct = None
+        if limit_source == "none":
+            container_metric["unlimited_count"] += 1
+            error = "no_configured_cap"
+        elif cap is None or cap <= 0 or limit_source not in ("cgroup_max", "inspect"):
+            error = "limit_unavailable"
+        elif usage is None or source not in ("docker_stats", "cgroup_current"):
+            error = "usage_unavailable"
+        else:
+            pct = round(100 * usage / cap, 3)
+            if not math.isfinite(pct):
+                pct = None
+                error = "invalid_ratio"
+        status = status_high(pct, yellow, red)
+        container_metric["containers"].append({
+            "id": row.get("id"), "name": row.get("name"),
+            "usage_bytes": usage, "usage_source": source,
+            "current_bytes": byte_count(row.get("memory_current_bytes")),
+            "limit_bytes": cap, "limit_source": limit_source,
+            "used_pct": pct, "status": status, "error": error,
+        })
+        if pct is None:
+            container_metric["unknown_count"] += 1
+        else:
+            container_metric["evaluated_count"] += 1
+    values = [row["used_pct"] for row in container_metric["containers"] if row["used_pct"] is not None]
+    container_metric["max_used_pct"] = max(values) if values else None
+    # Empty valid report means no running containers, not a failed collection.
+    container_metric["status"] = worst(*(row["status"] for row in container_metric["containers"]))
+    if container_metric["unknown_count"]:
+        container_metric["error"] = "incomplete_cap_coverage"
+metrics["container_memory"] = container_metric
+# Preserve the memory key for existing consumers. Make its host denominator explicit.
+metrics["memory"]["scope"] = "host"
+metrics["memory"]["denominator"] = "MemTotal (from /proc/meminfo)"
+
 doc = {
     "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "root_path": env.get("ROOT_PATH", "/"),
@@ -489,6 +575,7 @@ doc = {
         metrics["root_disk_used_pct"]["status"],
         metrics["root_inode_used_pct"]["status"],
         metrics["memory"]["status"],
+        metrics["container_memory"]["status"],
         metrics["swap"]["status"],
         metrics["load"]["status"],
         metrics["cpu_steal"]["status"],
@@ -520,10 +607,16 @@ rows = [
         metrics["root_inode_used_pct"]["delta"],
     ),
     (
-        "Mem available %",
+        "Host MemAvailable / MemTotal %",
         metrics["memory"]["available_pct"],
         metrics["memory"]["status"],
         metrics["memory"]["delta_available_pct"],
+    ),
+    (
+        "Container max usage / configured cap %",
+        metrics["container_memory"]["max_used_pct"],
+        metrics["container_memory"]["status"],
+        None,
     ),
     (
         "Swap used (GiB)",
@@ -549,6 +642,14 @@ for label, val, st, d in rows:
     dstr = "—" if d is None else f"{d:+g}"
     lines.append(f"| {label} | {v} | {st} | {dstr} |")
 
+lines.extend([
+    "",
+    f"Container cap coverage: {container_metric['evaluated_count']}/{container_metric['reported_count']} evaluated; "
+    f"{container_metric['unlimited_count']} unlimited; {container_metric['unknown_count']} unknown.",
+    "Container usage uses the report's named source: docker_stats excludes inactive file cache; "
+    "cgroup_current fallback includes cache. High usage is a headroom signal, not an OOM diagnosis. "
+    "Host available RAM remains independent. Missing or unlimited caps are unknown, never 0% usage.",
+])
 md_text = "\n".join(lines) + "\n"
 
 out_json = env.get("JSON_OUT", "")
@@ -612,7 +713,7 @@ main() {
     v="$(merge_sibling_metric steal "$sib" steal_pct 2>/dev/null || true)"
     [[ -n "$v" ]] && CPU_STEAL_PCT="$v" && CPU_STEAL_ERR=""
   fi
-  sib="$(try_sibling_json host-container-ram-report.sh)" || true
+  sib="$(try_sibling_json container-mem-report.sh --json)" || true
   if [[ -n "$sib" ]]; then
     SIBLING_RAM_JSON="$sib"
   fi
@@ -633,6 +734,7 @@ main() {
   export THRESH_DISK_USED_YELLOW THRESH_DISK_USED_RED
   export THRESH_INODE_USED_YELLOW THRESH_INODE_USED_RED
   export THRESH_MEM_AVAIL_PCT_YELLOW THRESH_MEM_AVAIL_PCT_RED
+  export THRESH_CONTAINER_MEM_USED_PCT_YELLOW THRESH_CONTAINER_MEM_USED_PCT_RED
   export THRESH_SWAP_USED_GB_YELLOW THRESH_SWAP_USED_GB_RED
   export THRESH_LOAD_PER_CPU_YELLOW THRESH_LOAD_PER_CPU_RED
   export THRESH_CPU_STEAL_PCT_YELLOW THRESH_CPU_STEAL_PCT_RED

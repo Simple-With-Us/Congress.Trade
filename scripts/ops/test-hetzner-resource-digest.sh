@@ -115,4 +115,5 @@ if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
 python3 "$ROOT/scripts/ops/test_hetzner_digest_failures.py"
+python3 "$ROOT/scripts/ops/test_hetzner_container_memory.py"
 echo "hetzner-resource-digest tests passed"
