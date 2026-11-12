@@ -82,6 +82,21 @@ test('the report is read-only and prints bytes, inodes, and top directories', ()
   assert.equal(readFileSync(join(symdb, '111'), 'utf8'), before);
 });
 
+test('a long top-level listing still exits 0', () => {
+  const root = mkdtempSync(join(tmpdir(), 'tmp-hygiene-many-'));
+  try {
+    for (let i = 0; i < 2000; i += 1) {
+      mkdirSync(join(root, `d${String(i).padStart(4, '0')}`));
+    }
+    const run = spawnSync('bash', [reportPath.pathname, root], { encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+    const listed = run.stdout.split('\n').filter((line) => /^\d+\td\d{4}$/.test(line));
+    assert.equal(listed.length, 10);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('an unreadable directory does not abort the report', () => {
   if (typeof process.getuid === 'function' && process.getuid() === 0) return;
   const root = mkdtempSync(join(tmpdir(), 'tmp-hygiene-unreadable-'));

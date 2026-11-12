@@ -45,4 +45,4 @@ find -P "$root" -xdev -mindepth 1 -maxdepth 1 -type d -print0 |
   while IFS= read -r -d '' dir; do
     count="$(find -P "$dir" -xdev -type f -printf '.' | wc -c | awk '{print $1}')"
     printf '%s\t%s\n' "$count" "${dir#"$root"/}"
-  done | sort -nr -k1,1 | head -n 10
+  done | sort -nr -k1,1 | sed -n '1,10p'
