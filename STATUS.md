@@ -1,3 +1,8 @@
+## 2026-11-12 CURSOR — OPS-1003 /tmp symdb-pids
+
+Congress.Trade does not create `/tmp/symdb-pids`.  `tryInitDdTracer` loads `dd-trace` 6.12.0, whose tarball has no `symdb` string, and compose does not mount host `/tmp`.  The public name match is `dd-trace-py`, which this repo does not depend on.  `DD_TRACE_AGENTLESS_GUARDS` is opt-in and off by default.  The tmpfiles policy and the read-only report are in the tree and are not installed.  Rollout: `docs/rollouts/2026-11-12-tmp-symdb-pids.md`.
+
+
 ## 2026-10-26 BF-PUBLISHER — Published filings stuck at ingest_status error (CT-2453)
 
 A filing that already has live transactions and a publish decision can still show `ingest_status` error, because a later fetch failure overwrites the stamp.  The hourly desync reconcile only mapped a resolved `review_queue` row, so a filing that never had one stayed error.  The reconcile now stamps `persisted` from those two facts, and a fetch failure leaves an already-published filing's `ingest_status` alone.  Stored raw for the four Senate filings matches the live published rows: 5, 33, 1, and 1.  No production write from this seat.  Branch `publisher/reconcile-published-errored`.  Refs CT-2453.  Rollout: `docs/rollouts/2026-10-26-reconcile-published-errored.md`.
