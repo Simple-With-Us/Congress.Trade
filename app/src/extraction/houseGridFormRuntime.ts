@@ -6,14 +6,16 @@
  */
 
 import {
+  layoutHouseGridRows,
   planHouseGridColumns,
   readHouseGridForm,
-  rowBands,
   shouldSkipHouseGridCover,
   type GrayImage,
   type HouseGridFormReader,
   type HouseGridOcrBox,
+  type HouseGridReadOptions,
 } from './houseGridForm.ts';
+import { snapHouseGridRead, type HouseGridSecurityCatalog } from './houseGridAssetSnap.ts';
 
 const PDFTOPPM = 'pdftoppm';
 const TESSERACT = 'tesseract';
@@ -313,9 +315,14 @@ async function runPool<T>(jobs: Array<() => Promise<T>>, limit: number): Promise
   return results;
 }
 
-export function createDenoHouseGridReader(): HouseGridFormReader {
+export interface HouseGridReaderOptions {
+  /** Known securities. Absent or empty leaves OCR names unchanged. */
+  loadCatalog?: () => Promise<HouseGridSecurityCatalog | null>;
+}
+
+export function createDenoHouseGridReader(readerOptions: HouseGridReaderOptions = {}): HouseGridFormReader {
   return {
-    async read(bytes: ArrayBuffer): Promise<ReturnType<typeof readHouseGridForm> | null> {
+    async read(bytes: ArrayBuffer, readOptions?: HouseGridReadOptions): Promise<ReturnType<typeof readHouseGridForm> | null> {
       if (typeof Deno === 'undefined') return null;
       if (!(await binariesReady())) return null;
       const dir = await Deno.makeTempDir({ prefix: 'house-grid-' });
@@ -349,8 +356,8 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
           const boxes: HouseGridOcrBox[] = [];
           if (hi && plan && plan.xs.length >= 10) {
             const factor = hi.width / image.width;
-            const laidOut = rowBands(image, plan.xs);
-            if (shouldSkipHouseGridCover(image, plan.xs, laidOut.sectionBars)) {
+            const laidOut = layoutHouseGridRows(image, plan);
+            if (shouldSkipHouseGridCover(image, plan.xs, laidOut.sectionBars, plan.kind)) {
               pages.push({ image, boxes, page: i + 1 });
               continue;
             }
@@ -358,11 +365,17 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
             const jobs: Array<() => Promise<HouseGridOcrBox | null>> = [];
             let jobId = 0;
             const ruleInset = Math.round(4 * factor);
+            // The fitted line is the rule. A 2px inset still includes it, and
+            // Tesseract then reads JT as "ost" and 11 as 41. The printed PTR
+            // needs one more pixel. The schedule crop stays where it scored.
+            const dateInset = 4;
+            const textInset = plan.kind === 'official' ? 4 : 2;
+            const yInset = plan.kind === 'official' ? 4 : dateInset;
             for (const band of bands) {
               // The row rules sit on the band edges. Leaving them in the cell
               // makes a one-line date read as empty.
-              const y0 = band.y0 + 3;
-              const y1 = band.y1 - 3;
+              const y0 = band.y0 + yInset;
+              const y1 = band.y1 - yInset;
               const asset = spanBetweenRules(
                 hi,
                 (plan.xs[1] - 14) * factor,
@@ -374,15 +387,15 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
                 ruleInset,
               );
               const cells: Array<{ x0: number; x1: number; psm: string; whitelist: string | null }> = [
-                { x0: plan.xs[0] + 2, x1: plan.xs[1] - 2, psm: '7', whitelist: null },
+                { x0: plan.xs[0] + textInset, x1: plan.xs[1] - 2, psm: '7', whitelist: null },
                 {
                   x0: asset ? asset.x0 / factor : plan.xs[1] + 4,
                   x1: asset ? asset.x1 / factor : plan.xs[2] - 3,
                   psm: '6',
                   whitelist: null,
                 },
-                { x0: plan.xs[7] + 2, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
-                { x0: plan.xs[8] + 2, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[7] + dateInset, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[8] + dateInset, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
               ];
               for (const cell of cells) {
                 const id = jobId;
@@ -398,7 +411,16 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
           pages.push({ image, boxes, page: i + 1 });
         }
         if (pages.length === 0) return null;
-        return readHouseGridForm(pages);
+        const gridRead = readHouseGridForm(pages, readOptions);
+        if (!readerOptions.loadCatalog) return gridRead;
+        try {
+          const catalog = await readerOptions.loadCatalog();
+          if (!catalog || catalog.entries.length === 0) return gridRead;
+          return snapHouseGridRead(gridRead, catalog);
+        } catch (err) {
+          console.warn('house grid form: asset snap skipped', (err as Error).message);
+          return gridRead;
+        }
       } catch (err) {
         console.warn('house grid form: local render failed', (err as Error).message);
         return null;

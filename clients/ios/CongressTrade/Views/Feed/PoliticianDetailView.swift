@@ -98,7 +98,7 @@ struct PoliticianDetailView: View {
                                     }
                                 }
                             } else if isExecutiveChamber(member.chamber) {
-                                Text("Executive filers do not sit on congressional committees.")
+                                Text("Executive branch officials do not sit on congressional committees.")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             } else {
@@ -283,7 +283,8 @@ struct PoliticianDetailView: View {
     private func fetchMember() async throws -> ClientMemberResponse {
         do {
             return try await store.fetchMember(id: memberId)
-        } catch let error as APIError where error.isRetryable {
+        } catch let error as APIError where error.isRetryable
+            && !TransientRetryPolicy.shouldRetry(error: error, method: "GET") {
             try await Task.sleep(for: .milliseconds(400))
             return try await store.fetchMember(id: memberId)
         }

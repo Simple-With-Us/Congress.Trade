@@ -529,6 +529,11 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain('<h3>Push Notifications</h3>');
     expect(DASHBOARD_SOURCE).toContain('one digest per new filing');
     expect(DASHBOARD_SOURCE).toContain('<h3>Alerts</h3>');
+    expect(DASHBOARD_SOURCE).toContain(
+      'We read official House, Senate, and Executive Branch filings directly, so new trades reach you within minutes to hours.',
+    );
+    expect(DASHBOARD_SOURCE).not.toContain('Relaying a 3rd-party competitor API');
+    expect(DASHBOARD_SOURCE).not.toContain('minutes-to-hours edge');
     expect(DASHBOARD_SOURCE).toContain('Get the Filing First');
     expect(DASHBOARD_SOURCE).toContain('Signed Webhooks');
     expect(DASHBOARD_SOURCE).toContain('HMAC-SHA256');
@@ -4810,7 +4815,7 @@ describe('entity click-through coverage (verifying PR #1517 reaches every named 
     it('replaces the politician-drawer Not recorded committee fallback', () => {
       expect(DASHBOARD_SOURCE).not.toContain("? '<span class=\"muted\">Not recorded</span>'");
       expect(DASHBOARD_SOURCE).toContain('No current assignments on file.');
-      expect(DASHBOARD_SOURCE).toContain('Executive filers do not sit on congressional committees.');
+      expect(DASHBOARD_SOURCE).toContain('Executive branch officials do not sit on congressional committees.');
     });
 
     it('uses a second-click Confirm? for web delivery delete', () => {
@@ -7603,7 +7608,7 @@ describe('masthead and Delivery layout update', () => {
     expect(DASHBOARD_SOURCE).toContain('class="speed-mini-bolt"');
     expect(DASHBOARD_SOURCE).toContain('.speed-mini > button { margin-left: auto; flex: 0 0 auto; }');
     expect(DASHBOARD_SOURCE).not.toContain('Get the Filing First.&nbsp; Premium pushes');
-    expect(DASHBOARD_SOURCE).toContain('>Premium pushes a filing to you the moment we ingest it');
+    expect(DASHBOARD_SOURCE).toContain('>Premium sends each new trade to you as soon as we have it.');
   });
   it('paints mobile chrome white and styles the iOS link as a button', () => {
     expect(DASHBOARD_SOURCE).toContain('nav.tabs { padding-top: 6px; padding-bottom: env(safe-area-inset-bottom, 0px); }');

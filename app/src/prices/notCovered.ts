@@ -35,6 +35,12 @@ import {
   stPeerPricePendingFromSql,
 } from './peerPricePending.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
+import {
+  disclosureUnsupportedPendingSql,
+  DISCLOSURE_NOT_COVERED_SWEEP_MAX,
+  notCoveredCauseForDisclosure,
+  tickerPriceInstrumentHintsFromRow,
+} from './peerInstrumentCoverage.ts';
 
 /** A pending ticker with no price_checked_at progress for this long is ST-unpriceable (rule b). */
 export const ST_NOT_COVERED_STUCK_HOURS = 72;
@@ -85,6 +91,65 @@ export function stNotCoveredTickersFromSql(): string {
 export interface NotCoveredSweepResult {
   marked: number;
   qualified: number;
+}
+
+export interface DisclosureNotCoveredSweepResult {
+  marked: number;
+  qualified: number;
+}
+
+/**
+ * Mark pending tickers whose disclosure types cannot use ST EOD — no provider
+ * call. Requires a fresh corpus (same gate as the stuck sweep).
+ */
+export async function markDisclosureUnsupportedPeerPrices(
+  env: Env,
+  now = new Date(),
+): Promise<DisclosureNotCoveredSweepResult> {
+  const corpusLatest = await readCorpusLatestPriceDate(env);
+  if (!isCurrentPriceFresh(corpusLatest, lastTradingDay(now))) {
+    return { marked: 0, qualified: 0 };
+  }
+  const params = stPeerPricePendingBindParams(now);
+  const pendingBinds = stPeerPricePendingBindsForSubqueries(params, 1);
+  const tradeHintFilter = `nt.tx_date IS NOT NULL AND nt.tx_date >= '1990-01-01'
+        AND nt.deprecated_at IS NULL
+        AND ${excludeCompetitorFixtureTransactionSql('nt')}`;
+  const hintSub = (col: string) =>
+    `(SELECT nt.${col} FROM transactions nt
+       WHERE nt.ticker = t.ticker AND ${tradeHintFilter}
+       ORDER BY nt.tx_date DESC, nt.id DESC
+       LIMIT 1)`;
+  const rows = await all<{
+    ticker: string;
+    asset_type: string | null;
+    asset_type_name: string | null;
+    asset_name: string | null;
+    is_option: number | null;
+  }>(
+    env.DB,
+    `SELECT DISTINCT t.ticker AS ticker,
+            ${hintSub('asset_type')} AS asset_type,
+            ${hintSub('asset_type_name')} AS asset_type_name,
+            ${hintSub('asset_name')} AS asset_name,
+            ${hintSub('is_option')} AS is_option
+       ${stPeerPricePendingFromSql()}
+       AND ${disclosureUnsupportedPendingSql()}
+     ORDER BY t.ticker ASC
+     LIMIT ${DISCLOSURE_NOT_COVERED_SWEEP_MAX}`,
+    pendingBinds,
+  );
+  const nowIso = now.toISOString();
+  let marked = 0;
+  for (const row of rows) {
+    const hints = tickerPriceInstrumentHintsFromRow(row.ticker, row);
+    await markTickerPriceUnavailable(env, row.ticker, notCoveredReason(now, notCoveredCauseForDisclosure(hints)), {
+      checkedAt: nowIso,
+      stage: PRICE_UNAVAILABLE_NOT_COVERED,
+    });
+    marked++;
+  }
+  return { marked, qualified: rows.length };
 }
 
 /**
