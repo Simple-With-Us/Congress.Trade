@@ -50,6 +50,8 @@ scout/*.log
 scout/*state*.json
 
 # Never commit real secrets (2026-08-01 purge; secrets live in Coolify env store)
+app/.prod.vars
+.prod.vars
 app/.prod.vars.local
 .prod.vars.local
 .upstream-shared/
