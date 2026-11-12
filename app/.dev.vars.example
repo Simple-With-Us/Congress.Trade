@@ -258,6 +258,10 @@ SENTRY_ENVIRONMENT="development"
 #   DD_CLIENT_TOKEN               public RUM client token
 #   DD_APPLICATION_ID             public RUM application id
 # Aliases: DD_RUM_*, NEXT_PUBLIC_DD_*
+# DD_TRACE_AGENTLESS_GUARDS=true pins dynamic instrumentation, profiling, and
+# remote config off when no DD_AGENT_HOST / DD_TRACE_AGENT_URL is set. Leave
+# blank to keep today's tracer init. It does not disable agentless APM.
+DD_TRACE_AGENTLESS_GUARDS=""
 DD_API_KEY=""
 DD_APP_KEY=""
 DD_SITE=""

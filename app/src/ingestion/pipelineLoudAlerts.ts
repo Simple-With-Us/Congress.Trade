@@ -25,13 +25,7 @@ import {
 } from '../enrichment/service.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import { evaluateStPeerPricesStall } from '../prices/stPeerPricesHealth.ts';
-import {
-  evaluateFreshness,
-  FRESHNESS_LATEST_SQL,
-  FRESHNESS_MAX_AGE_DAYS,
-  type FreshnessSnapshot,
-  type FreshnessStream,
-} from '../share/freshness.ts';
+import { evaluateStInboundMarketDataStall } from '../share/stInboundMarketDataHealth.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { checkTargetCircuit, targetKeyForUrl } from '../delivery/targetCircuit.ts';
 import { checkPipelineHealth, collectEmptyFetchHandoffCheck } from '../shared/pipelineHealth.ts';
@@ -95,6 +89,8 @@ const HEALTH_STALL_SKIP_IDS = new Set([
   'empty_fetch_handoff',
   // CT-2335: fmp_latency uses a dedicated silence confirm + self-healing grace path.
   'fmp_latency',
+  // Evaluated by evaluateStInboundMarketDataStall (CT-2497); avoid duplicate pages.
+  'st_inbound_market_data',
 ]);
 
 export interface PipelineStallAlertResult {
@@ -526,61 +522,6 @@ async function evaluateStPeerPrices(env: Env, now: Date, thresholdMs: number): P
   return evaluateStPeerPricesStall(env, now, thresholdMs);
 }
 
-async function loadFreshnessSnapshot(env: Env): Promise<FreshnessSnapshot | null> {
-  try {
-    const row = await get<{
-      spx_latest: string | null;
-      price_latest: string | null;
-      fundamentals_latest: string | null;
-      insider_latest: string | null;
-      short_volume_latest: string | null;
-      analyst_latest: string | null;
-    }>(env.DB, FRESHNESS_LATEST_SQL);
-    return {
-      spxLatestDate: row?.spx_latest ?? null,
-      priceLatestDate: row?.price_latest ?? null,
-      fundamentalsLatest: row?.fundamentals_latest ?? null,
-      insiderLatestDate: row?.insider_latest ?? null,
-      shortVolumeLatestDate: row?.short_volume_latest ?? null,
-      analystLatest: row?.analyst_latest ?? null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function scaledFreshnessMaxAgeDays(thresholdMs: number): Record<FreshnessStream, number> {
-  const baseMs = stallWindowMs(DEFAULT_PIPELINE_STALL_HOURS);
-  const ratio = thresholdMs / baseMs;
-  const out = { ...FRESHNESS_MAX_AGE_DAYS };
-  for (const stream of Object.keys(out) as FreshnessStream[]) {
-    out[stream] = Math.max(1, Math.ceil(out[stream] * ratio));
-  }
-  return out;
-}
-
-async function evaluateStInboundMarketData(
-  env: Env,
-  now: Date,
-  thresholdMs: number,
-): Promise<StallEval> {
-  if (!(await hasConfiguredKeyedEnrichmentProvider(env))) {
-    return { stalled: false, detail: 'ST inbound streams not configured', skip: true };
-  }
-  const snapshot = await loadFreshnessSnapshot(env);
-  if (!snapshot) {
-    return { stalled: false, detail: 'freshness snapshot unavailable', skip: true };
-  }
-  const stale = evaluateFreshness(snapshot, now.getTime(), scaledFreshnessMaxAgeDays(thresholdMs));
-  if (stale.length === 0) {
-    return { stalled: false, detail: 'inbound market-data streams fresh' };
-  }
-  const detail = stale
-    .map((s) => `${s.stream} last ${s.latest} (${s.ageDays}d ago)`)
-    .join('; ');
-  return { stalled: true, detail: `Stale Socratic.Trade donated streams: ${detail}` };
-}
-
 async function evaluateStOutboundShare(env: Env): Promise<StallEval> {
   const keys = await resolveSecrets(env, ['APP_B_IMPORT_URL']);
   const url = keys.APP_B_IMPORT_URL?.trim();
@@ -822,7 +763,7 @@ export async function sweepPipelineStallAlerts(
   await processStallCondition(
     env,
     'st_inbound_market_data',
-    await evaluateStInboundMarketData(env, now, inboundThresholdMs),
+    await evaluateStInboundMarketDataStall(env, now, inboundThresholdMs),
     now,
     result,
     deps,

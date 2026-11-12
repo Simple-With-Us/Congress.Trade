@@ -58,6 +58,6 @@ H-2026-9116403 is a second hand set, committed as seven rows: purchases TLH, XAR
 
 ## Follow-ups
 
-The live Fleischmann scan needs a column template whose amount pitch matches the page.  The geometrically correct scale is about 0.48, below the primary minimum of 0.5, and anchoring the outer rules only reaches 9 to 12 inliers.  Do not drop the cover check to read it.  The Khanna cover still scores false type and amount marks.
+The live Fleischmann scan needs a column template whose amount pitch matches the page.  The geometrically correct scale is about 0.48, below the primary minimum of 0.5, and anchoring the outer rules only reaches 9 to 12 inliers.  Do not drop the cover check to read it.  The Khanna cover still scores false type and amount marks.  The printed PTR template that reads Fleischmann is in `docs/rollouts/2026-11-12-house-official-ptr-grid.md`.
 Remaining Khanna misses are clipped first letters, a few one-digit dates, and the 20 blank owner cells.  Do not copy a notification date into a null trade date, do not lower the glyph floor, and do not add a company dictionary.
 Sixteen extra rows remain, on pages 8, 13, 14, 15, 18, 19, and 20.

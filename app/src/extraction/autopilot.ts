@@ -75,6 +75,7 @@ import { isTransientInfrastructureError } from '../shared/transientInfra.ts';
 import { isDocScopedOpenRouterError } from './openRouterReply.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import { countReviewQueueBuckets, TERMINAL_REVIEW_REASON_EXCLUDE_SQL } from './reviewQueueHealth.ts';
+import { autoResolveFailureGuardSql } from '../ingestion/terminalFailureReview.ts';
 import { estimateNominalReadCostUsd, priceBenchmarkUsage } from './benchmarkMetrics.ts';
 import { meanConfidence, persistExtractionRun, type CandidateDocResult, type Provider } from './bakeoff.ts';
 import { arbitrationRowKey } from '../extractors/types.ts';
@@ -1008,7 +1009,8 @@ async function resolveEmptyDoc(env: Env, docId: string, now: Date): Promise<bool
               resolved_at = CURRENT_TIMESTAMP,
               review_revision = review_revision + 1
         WHERE doc_id = ? AND resolved = 0 AND agreement_suppressed_at IS NULL
-          AND (agreement_claim_token IS NULL OR agreement_claimed_at IS NULL OR agreement_claimed_at <= ?)`,
+          AND (agreement_claim_token IS NULL OR agreement_claimed_at IS NULL OR agreement_claimed_at <= ?)
+          AND ${autoResolveFailureGuardSql('reason')}`,
       [docId, leaseExpired],
     ],
     [
