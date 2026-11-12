@@ -283,6 +283,20 @@ STRIPE_TRIAL_DAYS="7"
 # curl/scripts against local /api/* data endpoints (or send a browser UA).
 SCRAPE_GUARD_ENABLED="true"
 
+# Origin lock (CT-1337). Leave unset or "false": traffic is unchanged.
+# Set ORIGIN_LOCK_ENABLED to true/1/yes/on only after Cloudflare can prove
+# itself, either because the proxy's X-Real-IP is a Cloudflare edge address
+# or because a Transform Rule sends X-CT-Origin-Secret. Docker/Traefik health
+# probes to /health and /api/health from loopback or the docker network stay
+# allowed. ORIGIN_LOCK_TRUSTED_PROXIES adds CIDRs to the built-in loopback and
+# private ranges. ORIGIN_LOCK_AOP_HEADER is the header a trusted proxy sets
+# after verifying Authenticated Origin Pulls (value defaults to SUCCESS).
+# ORIGIN_LOCK_ENABLED=""
+# ORIGIN_LOCK_SECRET=""
+# ORIGIN_LOCK_TRUSTED_PROXIES=""
+# ORIGIN_LOCK_AOP_HEADER=""
+# ORIGIN_LOCK_AOP_VALUE=""
+
 # Executive-branch (OGE Form 278-T) filings watcher — Presidential trades.
 # Cadence is the same adaptive probeSchedule / decideSourcePoll path as
 # House/Senate (weekday 15-minute coverage floor, weekend hourly like House).
