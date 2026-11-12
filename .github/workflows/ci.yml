@@ -241,6 +241,12 @@ jobs:
           bash -n scripts/ops/fleet-log-cap-install.sh
           bash scripts/ops/test-fleet-log-cap.sh
 
+      - name: Host swap report offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/host-swap-report.sh
+          bash scripts/ops/test-host-swap-report.sh
+
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
