@@ -83,6 +83,7 @@ import { apnsLaneErrorIsRecent, inspectApnsFanoutDiagnostics, resolveApnsConfig 
 import { apnsConfigured } from '../shared/apns.ts';
 import { runSeedBackfillFromEnv } from '../backfill/seed.ts';
 import { runHouseHistoricalBackfill } from '../backfill/houseCrawler.ts';
+import { backfillHouseEmptyFiledDates } from '../ingestion/houseFiledDateBackfill.ts';
 import { runSenateBackfill } from '../backfill/senateCrawler.ts';
 import {
   senateFilingFromFetcherRow,
@@ -6700,6 +6701,35 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   //   { fromYear?: number, toYear?: number, maxFilings?: number, dryRun?: boolean }
   // maxFilings defaults to 500. dryRun only counts matching PTRs; it does not
   // write filings rows or enqueue pipeline work.
+  // --- POST /backfill/house-filed-dates ------------------------------------
+  // CT-2481: backfill NULL House filed_date from the official FD index (preferred)
+  // or the Clerk Received stamp in stored PDF text. Defaults to dryRun=true.
+  r.post('/backfill/house-filed-dates', async (c) => {
+    let body: Record<string, unknown> = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const dryRun = body.dryRun !== false;
+    const limit = typeof body.limit === 'number' && body.limit > 0 ? Math.floor(body.limit) : 200;
+    const maxYears = typeof body.maxYears === 'number' && body.maxYears > 0 ? Math.floor(body.maxYears) : 2;
+    const useOcr = body.useOcr !== false;
+    try {
+      const result = await backfillHouseEmptyFiledDates(c.env, {
+        dryRun,
+        limit,
+        maxYears,
+        useOcr,
+        relayUrl: c.env.HOUSE_RELAY_URL || c.env.INGEST_RELAY_URL,
+      });
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
   r.post('/house-backfill', async (c) => {
     let body: Record<string, unknown> = {};
     try {

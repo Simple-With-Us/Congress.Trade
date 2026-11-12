@@ -484,7 +484,7 @@ describe('autonomySweeps', () => {
 
       const row = await d1.prepare(`SELECT filed_date FROM filings WHERE doc_id = ?`)
         .bind('H-2026-20012345').first<{ filed_date: string }>();
-      expect(row?.filed_date).toBe('7/1/2026');
+      expect(row?.filed_date).toBe('2026-07-01');
     });
 
     it('never overwrites an already-set filed_date', async () => {

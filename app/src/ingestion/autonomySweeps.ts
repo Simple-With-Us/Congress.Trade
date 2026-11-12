@@ -39,6 +39,10 @@ import { sendPushover } from '../shared/pushover.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
 import {
+  applyHouseFiledDateIfMissing,
+  normalizeHouseFilingDateToIso,
+} from './houseFiledDate.ts';
+import {
   isSenateEdgeBackoffActive,
   readSenateEdgeBackoff,
   SENATE_EDGE_BACKOFF_GRACE_MS,
@@ -407,7 +411,8 @@ export async function sweepFiledDateBackfill(
         signal: controller.signal,
       });
       for (const f of index) {
-        if (f.filingDate) filedDateByDocId.set(f.pipelineDocId, f.filingDate);
+        const iso = normalizeHouseFilingDateToIso(f.filingDate);
+        if (iso) filedDateByDocId.set(f.pipelineDocId, iso);
       }
     } catch (err) {
       console.warn(`autonomySweep: filed-date backfill fetch failed for year ${year}:`, (err as Error).message);
@@ -420,23 +425,11 @@ export async function sweepFiledDateBackfill(
   for (const row of stuck) {
     const filedDate = filedDateByDocId.get(row.doc_id);
     if (!filedDate) continue;
-    const res = await run(
-      env.DB,
-      `UPDATE filings SET filed_date = ? WHERE doc_id = ? AND filed_date IS NULL`,
-      [filedDate, row.doc_id],
-    );
-    if ((res.meta?.changes ?? 0) > 0) {
-      updated += 1;
-      try {
-        await run(
-          env.DB,
-          `UPDATE disclosure_latency_candidates SET filed_date = ? WHERE doc_id = ? AND (filed_date IS NULL OR filed_date = '')`,
-          [filedDate, row.doc_id],
-        );
-      } catch {
-        /* optional table, mirrors watcher.ts's own swallow */
-      }
-    }
+    const applied = await applyHouseFiledDateIfMissing(env, row.doc_id, {
+      iso: filedDate,
+      source: 'index',
+    });
+    if (applied.applied) updated += 1;
   }
   return { updated, yearsFetched: years };
 }
