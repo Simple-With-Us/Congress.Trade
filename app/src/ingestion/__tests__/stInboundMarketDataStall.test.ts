@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sweepPipelineStallAlerts } from '../pipelineLoudAlerts.ts';
 import { collectStInboundMarketDataMetrics } from '../../share/stInboundMarketDataHealth.ts';
 import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
+import { PRICE_DRAIN_LAST_PROGRESS_KEY } from '../../prices/peerPriceDrainProgress.ts';
 import type { Env } from '../../shared/types.ts';
 
 vi.mock('../reviewQueueNotify.ts', () => ({
@@ -51,16 +52,22 @@ beforeEach(async () => {
 });
 afterEach(() => close());
 
-function envWithDb(): Env {
-  return { DB: d1, CONFIG_KV: createKv() } as Env;
+function envWithDb(kv?: Map<string, string>): Env {
+  return { DB: d1, CONFIG_KV: createKv(kv) } as Env;
 }
 
-function createKv() {
-  const store = new Map<string, string>();
+function createKv(initial?: Map<string, string>) {
+  const store = initial ?? new Map<string, string>();
   return {
     get: async (key: string) => {
       const raw = store.get(key);
-      return raw ? JSON.parse(raw) : null;
+      if (raw === undefined) return null;
+      if (key === PRICE_DRAIN_LAST_PROGRESS_KEY) return raw;
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
     },
     put: async (key: string, value: string) => {
       store.set(key, value);
@@ -100,11 +107,12 @@ describe('st_inbound_market_data stall detector (CT-2497)', () => {
               ('DONE', '2026-10-11', ?, 'socratic')`,
     ).run(recent, recent, old);
 
+    const kv = new Map([[PRICE_DRAIN_LAST_PROGRESS_KEY, recent]]);
     const now = new Date('2026-10-12T18:00:00.000Z');
-    const metrics = await collectStInboundMarketDataMetrics(envWithDb(), now);
+    const metrics = await collectStInboundMarketDataMetrics(envWithDb(kv), now);
     expect(metrics.stalled).toBe(false);
     expect(metrics.status).toBe('degraded');
-    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    const result = await sweepPipelineStallAlerts(envWithDb(kv), now);
     expect(result.evaluated).toContain('st_inbound_market_data');
     expect(result.alerted).not.toContain('st_inbound_market_data');
     const inboundPages = (captureMessage as ReturnType<typeof vi.fn>).mock.calls.filter((c) =>
