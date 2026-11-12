@@ -350,7 +350,11 @@ export function snapHouseGridAsset(
     return { ...unchanged(input), ticker };
   }
   const shorter = Math.min(key.length, best.key.length);
-  const oneEdit = best.distance === 1 && shorter >= 5 && best.ratio >= 0.8 && margin >= 0.12;
+  // A five-character key is one letter of the whole name (ratio 0.80). A
+  // two-edit runner-up is only 0.20 behind, which still clears 0.12. Zoetis
+  // is that length and is unique, so the short-key case needs a wider margin.
+  const oneEditMargin = shorter <= 5 ? 0.25 : 0.12;
+  const oneEdit = best.distance === 1 && shorter >= 5 && best.ratio >= 0.8 && margin >= oneEditMargin;
   const twoEdit = best.distance === 2 && shorter >= 8 && best.ratio >= 0.9 && margin >= 0.08;
   if (!oneEdit && !twoEdit) return unchanged(input);
   if (existing && best.group.tickers.size > 0 && !best.group.tickers.has(existing)) {
@@ -365,7 +369,7 @@ export function snapHouseGridAsset(
   if (
     !ticker
     && best.distance <= 1
-    && margin >= 0.08
+    && margin >= (key.length <= 5 ? 0.25 : 0.08)
     && best.group.tickers.size === 1
     && key.length >= 5
     && !NON_EQUITY.test(input.assetName)
@@ -444,10 +448,16 @@ function parseAliases(value: string | null): string[] {
  * securities_ref company names, securities_master names and aliases, and the
  * curated issuer list. An empty catalog leaves every OCR line unchanged.
  */
+function isMissingTable(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.toLowerCase().includes('no such table');
+}
+
 export async function loadHouseGridSecurityCatalog(env: Env): Promise<HouseGridSecurityCatalog> {
   const now = Date.now();
   if (catalogCache && now - catalogCache.at < CATALOG_TTL_MS) return catalogCache.catalog;
   const entries: HouseGridSecurityRef[] = [];
+  let cacheable = true;
   try {
     const refs = await all<{ ticker: string | null; company_name: string | null }>(
       env.DB,
@@ -455,8 +465,9 @@ export async function loadHouseGridSecurityCatalog(env: Env): Promise<HouseGridS
         WHERE company_name IS NOT NULL AND trim(company_name) != ''`,
     );
     for (const row of refs) entries.push({ ticker: row.ticker, name: row.company_name ?? '' });
-  } catch {
-    // A missing ref table leaves the master and curated names in place.
+  } catch (err) {
+    // A missing ref table is stable. A lock or other failure must be retried.
+    if (!isMissingTable(err)) cacheable = false;
   }
   try {
     const masters = await all<{ ticker: string | null; name: string | null; aliases: string | null }>(
@@ -469,11 +480,11 @@ export async function loadHouseGridSecurityCatalog(env: Env): Promise<HouseGridS
         entries.push({ ticker: row.ticker, name: alias });
       }
     }
-  } catch {
-    // A missing master table does not block ref names.
+  } catch (err) {
+    if (!isMissingTable(err)) cacheable = false;
   }
   for (const name of OCR_KNOWN_ISSUERS) entries.push({ ticker: null, name });
   const catalog = { entries };
-  catalogCache = { at: now, catalog };
+  if (cacheable) catalogCache = { at: now, catalog };
   return catalog;
 }

@@ -15,9 +15,9 @@ The grid-form reader on H-2026-9116399 matches 238 of 275 asset names at token o
 
 The matcher builds a key from the company tokens.  Legal forms compare equal without rewriting the OCR word, so INC stays INC and CORPORATION stays CORPORATION.  N.V. stays in the key.  Apostrophes and ampersands split into the same display tokens the aligner uses, so O'Reilly stays O REILLY.
 
-A distance of 0 does not rewrite the string.  It may fill a null ticker when the catalog name has exactly one ticker.  A one-letter edit is accepted when the shorter key is at least 5 characters, the ratio is at least 0.80, and the margin over the next name is at least 0.12.  A two-letter edit needs a shorter key of at least 8, a ratio of at least 0.90, and a margin of at least 0.08.  An existing ticker that names a different security blocks the snap.  Option lines that start with CALL/ or PUT/ are left alone.  A name change appends "asset name snapped" to supplementalText and sets confidence to the original minus 0.03, never higher.
+A distance of 0 does not rewrite the string.  It may fill a null ticker when the catalog name has exactly one ticker.  A one-letter edit is accepted when the shorter key is at least 5 characters, the ratio is at least 0.80, and the margin over the next name is at least 0.12, or 0.25 when that key is only 5 characters.  A two-letter edit needs a shorter key of at least 8, a ratio of at least 0.90, and a margin of at least 0.08.  An existing ticker that names a different security blocks the snap.  Option lines that start with CALL/ or PUT/ are left alone.  A name change appends "asset name snapped" to supplementalText and sets confidence to the original minus 0.03, never higher.
 
-The catalog is securities_ref (ticker, company_name), securities_master (ticker, name, aliases), and the curated issuer list.  A missing table or a failed load returns the unsnapped read.  Tests that call `readHouseGridForm` directly are unchanged.
+The catalog is securities_ref (ticker, company_name), securities_master (ticker, name, aliases), and the curated issuer list.  A missing table is cached as an empty side.  A lock or other query failure is not cached, so the next filing retries it.  Tests that call `readHouseGridForm` directly are unchanged.
 
 ## Verification
 

@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
+import type { Env } from '../../shared/types.ts';
 import {
   HOUSE_GRID_ASSET_SNAP_CONFIDENCE_DROP,
+  clearHouseGridSecurityCatalogCache,
+  loadHouseGridSecurityCatalog,
   snapHouseGridAssets,
   type HouseGridSecurityCatalog,
 } from '../houseGridAssetSnap.ts';
@@ -101,5 +104,71 @@ describe('house grid asset snap', () => {
     const input = [row('OETIS INC CMN CLASS A')];
     const snapped = snapHouseGridAssets(input, { entries: [] });
     expect(snapped[0]).toBe(input[0]);
+  });
+
+  it('does not rewrite a five-character key whose runner-up is two edits away', () => {
+    const [snapped] = snapHouseGridAssets(
+      [row('ABCDF INC')],
+      {
+        entries: [
+          { ticker: 'ABCD', name: 'Abcde Inc.' },
+          { ticker: 'ABCX', name: 'Abcxx Inc.' },
+        ],
+      },
+    );
+    expect(snapped.assetName).toBe('ABCDF INC');
+    expect(snapped.ticker).toBeNull();
+    expect(snapped.confidence).toBe(0.97);
+  });
+});
+
+function catalogDb(query: (sql: string) => { results: unknown[] } | Error): Env {
+  return {
+    DB: {
+      prepare(sql: string) {
+        return {
+          all: async () => {
+            const result = query(sql);
+            if (result instanceof Error) throw result;
+            return result;
+          },
+        };
+      },
+    },
+  } as unknown as Env;
+}
+
+describe('house grid security catalog cache', () => {
+  beforeEach(() => {
+    clearHouseGridSecurityCatalogCache();
+  });
+
+  it('caches a successful load and a missing table', async () => {
+    let calls = 0;
+    const env = catalogDb((sql) => {
+      calls += 1;
+      if (sql.includes('securities_ref')) {
+        return { results: [{ ticker: 'AAPL', company_name: 'Apple Inc.' }] };
+      }
+      throw new Error('no such table: securities_master');
+    });
+    const first = await loadHouseGridSecurityCatalog(env);
+    const second = await loadHouseGridSecurityCatalog(env);
+    expect(first.entries.some((entry) => entry.ticker === 'AAPL')).toBe(true);
+    expect(second).toBe(first);
+    expect(calls).toBe(2);
+  });
+
+  it('does not cache a lock, so the next load retries', async () => {
+    let calls = 0;
+    const env = catalogDb(() => {
+      calls += 1;
+      throw new Error('SQLITE_BUSY: database is locked');
+    });
+    const first = await loadHouseGridSecurityCatalog(env);
+    const second = await loadHouseGridSecurityCatalog(env);
+    expect(first.entries.length).toBeGreaterThan(0);
+    expect(second).not.toBe(first);
+    expect(calls).toBe(4);
   });
 });
