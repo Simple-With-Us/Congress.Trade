@@ -30,7 +30,7 @@ class DiskGrowthFailures(unittest.TestCase):
         self.command('df', '#!/bin/bash\nprintf "Filesystem Blocks Used Available Use%% Mounted\\n/dev/test 100 50 50 50%% /\\n"\n')
         self.command('docker', '#!/bin/bash\nprintf "Images space usage:\\nREPOSITORY  SIZE\\none  1MB\\n"\n')
         self.command('findmnt', '#!/bin/bash\nexit 0\n')
-        self.command('du', '#!/usr/bin/env python3\nimport os,sys\nroot=sys.argv[-1]\nwith open(os.environ["DU_LOG"],"a") as f:f.write(root+"\\n")\nfor path,ds,fs in os.walk(root):print("100\\t"+path)\nsys.exit(int(os.environ.get("FAKE_DU_EXIT","0")))\n')
+        self.command('du', '#!/usr/bin/env python3\nimport os,sys\nroot=sys.argv[-1]\nwith open(os.environ["DU_LOG"],"a") as f:f.write(root+"\\n")\nfor path,ds,fs in os.walk(root):sys.stdout.buffer.write(("100\\t"+path+"\\n").encode("utf-8", "surrogateescape"))\nsys.exit(int(os.environ.get("FAKE_DU_EXIT","0")))\n')
         self.env = dict(os.environ, SNAPSHOT_DIR=str(self.snap),
                         SNAPSHOT_DATE='2026-07-01', REPORT_DATE='2026-07-01',
                         DISK_GROWTH_FORCE='1', DRY_RUN='1',
@@ -159,6 +159,7 @@ class DiskGrowthFailures(unittest.TestCase):
             if exc.errno == errno.EILSEQ:
                 self.skipTest('filesystem refuses invalid filename bytes')
             raise
+        self.env['PYTHONIOENCODING'] = 'utf-8:strict'
         doc = self.snapshot()
         paths = [ent['path'] for block in doc['directory_totals'].values() for ent in block['entries']]
         self.assertIn(os.fsdecode(raw), paths)
@@ -175,11 +176,33 @@ class DiskGrowthFailures(unittest.TestCase):
         self.assertEqual(d['shrinkers'], [])
         self.assertEqual(d['unmatched_baseline_paths'], 1)
 
+    def test_human_report_discloses_unmatched_paths(self):
+        self.seed('2026-07-01', directory_totals={'/var':{'entries':[],'timeout':False}})
+        self.seed('2026-06-30')
+        run = subprocess.run(['bash', str(OPS/'disk-growth-report.sh')], env=self.env,
+                             text=True, capture_output=True, check=True, timeout=10)
+        self.assertIn('Top-N unmatched paths: current=0, baseline=1', run.stdout)
+
+    def test_metadata_collector_hangs_are_bounded(self):
+        timeout = shutil.which('timeout')
+        if not timeout:
+            self.skipTest('GNU timeout not available')
+        self.env['DISK_GROWTH_TIMEOUT'] = timeout
+        self.env['COLLECTOR_TIMEOUT_SEC'] = '0.1'
+        for name in ('docker', 'df'):
+            self.command(name, '#!/bin/bash\nsleep 10\n')
+        run = subprocess.run(['bash', str(OPS/'disk-growth-snapshot.sh')], env=self.env,
+                             text=True, capture_output=True, check=True, timeout=3)
+        doc = json.loads(run.stdout)
+        self.assertFalse(doc['docker']['available'])
+        self.assertEqual(doc['filesystems'], [])
+        self.assertTrue(doc['directory_totals'])
+
     def test_required_default_separate_mount_roots(self):
         s = (OPS/'disk-growth-lib.sh').read_text()
         self.assertIn('DU_SCAN_ROOTS:=/,/var,/home,/data,/opt,/tmp,/mnt/fleet-extra', s)
         unit = (OPS/'systemd.noindex/disk-growth-snapshot.service').read_text()
-        self.assertIn('TimeoutStartSec=infinity', unit)
+        self.assertIn('TimeoutStartSec=2h', unit)
 
 
 if __name__ == '__main__':

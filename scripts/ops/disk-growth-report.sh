@@ -125,7 +125,7 @@ def diff_directories(new, old):
     return result
 
 def diff_fs(new, old):
-    if old is None:
+    if old is None or not fs_index(new) or not fs_index(old):
         return {"available": False}
     mounts = set(fs_index(new)) | set(fs_index(old))
     used_deltas = []
@@ -222,6 +222,7 @@ for label, key, baseline_key in (
 
     dirs = report["directories"][key]
     if dirs.get("available"):
+        print(f"Top-N unmatched paths: current={dirs.get('unmatched_current_paths', 0)}, baseline={dirs.get('unmatched_baseline_paths', 0)} (no zero-size inference)")
         print("Directory byte growers:")
         for path, d in dirs.get("growers", [])[:10]:
             print(f"  {path}: {fmt_bytes(d)}")

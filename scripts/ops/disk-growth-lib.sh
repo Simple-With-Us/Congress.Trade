@@ -6,6 +6,7 @@ set -euo pipefail
 : "${RETENTION_DAYS:=60}"
 : "${TOP_N:=20}"
 : "${DU_TIMEOUT_SEC:=600}"
+: "${COLLECTOR_TIMEOUT_SEC:=30}"
 : "${DU_SCAN_ROOTS:=/,/var,/home,/data,/opt,/tmp,/mnt/fleet-extra}"
 : "${BACKUP_SCAN_DIRS:=/data/backups}"
 : "${SNAPSHOT_PREFIX:=disk-growth-}"
@@ -37,7 +38,7 @@ disk_growth_mount_present() {
   if [[ "$m" == / ]]; then
     return 0
   fi
-  "$DISK_GROWTH_FINDMNT" -n -T "$m" >/dev/null 2>&1
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_FINDMNT" -n -T "$m" >/dev/null 2>&1
 }
 
 disk_growth_list_mount_targets() {
@@ -53,14 +54,14 @@ disk_growth_collect_df() {
   local mounts tmp
   mounts="$(disk_growth_list_mount_targets | tr '\n' ' ')"
   # shellcheck disable=SC2086
-  "$DISK_GROWTH_DF" -Pk $mounts 2>/dev/null || true
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DF" -Pk $mounts 2>/dev/null || true
 }
 
 disk_growth_collect_df_inodes() {
   local mounts tmp
   mounts="$(disk_growth_list_mount_targets | tr '\n' ' ')"
   # shellcheck disable=SC2086
-  "$DISK_GROWTH_DF" -Pi $mounts 2>/dev/null || true
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DF" -Pi $mounts 2>/dev/null || true
 }
 
 # One traversal for overlapping roots on the same device. Keep requested
@@ -69,9 +70,11 @@ disk_growth_collect_du() {
   export DU_SCAN_ROOTS BACKUP_SCAN_DIRS TOP_N DU_TIMEOUT_SEC
   export DISK_GROWTH_TIMEOUT DISK_GROWTH_IONICE DISK_GROWTH_NICE DISK_GROWTH_DU
   python3 - <<'PY'
-import os, subprocess
+import os, subprocess, sys
 from pathlib import Path
 
+# Paths are opaque filesystem bytes across both input and output pipes.
+sys.stdout.reconfigure(errors="surrogateescape")
 env = os.environ
 top_n = int(env["TOP_N"])
 if top_n <= 0:
@@ -96,7 +99,7 @@ for row in roots:
 for group in groups:
     base = group["path"]
     depth = max(len(Path(root).parts) - len(Path(base).parts) + 1 for root in group["roots"])
-    command = [env["DISK_GROWTH_TIMEOUT"], env["DU_TIMEOUT_SEC"],
+    command = [env["DISK_GROWTH_TIMEOUT"], "--kill-after=5s", env["DU_TIMEOUT_SEC"],
                env["DISK_GROWTH_IONICE"], "-c3", env["DISK_GROWTH_NICE"], "-n", "19",
                env["DISK_GROWTH_DU"], "-x", "-d", str(depth), "-B1", "--", base]
     # Consume the whole stream while retaining only bounded top-N rows.
@@ -134,7 +137,7 @@ PY
 }
 
 disk_growth_docker_verbose() {
-  "$DISK_GROWTH_DOCKER" system df -v 2>/dev/null || return 1
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DOCKER" system df -v 2>/dev/null || return 1
 }
 
 disk_growth_prune_old_snapshots() {

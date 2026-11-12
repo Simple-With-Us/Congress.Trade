@@ -4,8 +4,9 @@ After=docker.service
 Wants=docker.service
 
 [Service]
-# Each planned filesystem scan has its own DU_TIMEOUT_SEC bound.
-TimeoutStartSec=infinity
+# Finite watchdog: default <=8 roots x (600s+5s), plus bounded metadata collectors.
+# Increase this with a drop-in if custom root/time budgets exceed two hours.
+TimeoutStartSec=2h
 Type=oneshot
 ExecStart=/usr/local/bin/disk-growth-snapshot.sh
 Nice=10

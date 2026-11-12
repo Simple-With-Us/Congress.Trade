@@ -47,8 +47,8 @@ ls -la /var/lib/fleet-disk-growth/
 ## Review repairs
 
 Both entrypoints source the sibling library first, so the documented install of
-all `disk-growth-*.sh` files works outside a checkout. The sample oneshot does
-not impose the 90-second systemd default on multi-minute directory scans.
+all `disk-growth-*.sh` files works outside a checkout. The sample oneshot uses a finite two-hour watchdog instead of the 90-second systemd default
+on multi-minute directory scans.
 Nothing is installed or enabled by these source changes.
 
 Overlapping requested roots on the same device are grouped under one ancestor
@@ -76,3 +76,19 @@ comparisons. CI runs this suite alongside the other ops tests.
 Directory deltas compare paths observed in both top-N lists. An omitted path
 can have fallen below the sampling cutoff rather than disappeared, so unmatched
 path counts are reported instead of inventing a zero-size grower or shrinker.
+
+Metadata collectors (`findmnt`, both `df` calls, and Docker storage) each have
+a default 30-second timeout (`COLLECTOR_TIMEOUT_SEC`), with forced termination
+five seconds after the timeout if needed. `du` retains its per-walk timeout
+and the same forced-termination grace. The two-hour sample service budget is
+above the default eight configured roots at 600 seconds plus metadata and
+shutdown overhead. Custom roots or time budgets that exceed that watchdog
+require a matching service drop-in; the unit never waits forever. A timed-out
+Docker query remains unavailable. Incomplete filesystem collection is not
+presented as measured usage. No unit is installed or changed on the host.
+
+The human report prints both unmatched top-N path counts. CI syntax-checks
+each script separately, rather than treating later paths as Bash arguments.
+The invalid-byte fixture and collector output pipe both preserve raw filesystem
+bytes even under a strict Python stdout encoding. The expanded suite checks
+strict-output round trips, human counts and bounded metadata collector hangs.
