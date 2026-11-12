@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily local backup retention dry-run
+# This timer does not set APPLY. Deletes happen only when
+# /etc/fleet-local-backup-retention.env sets APPLY=1.
+Requires=fleet-local-backup-retention.service
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+AccuracySec=15min
+RandomizedDelaySec=10min
+Unit=fleet-local-backup-retention.service
+
+[Install]
+WantedBy=timers.target
