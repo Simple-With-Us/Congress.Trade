@@ -3891,3 +3891,87 @@ final class TraderIdentityTests: XCTestCase {
         XCTAssertNil(MemberPhotoURL.resolve(nil, ""))
     }
 }
+
+/// CT-2435: cold launch must not install `ShakeDetectorViewController` or
+/// measure Zilla Slab on the main thread. Sentry named that controller as
+/// the screen for fully-blocked app hangs whose stack was
+/// `CTLineCreateWithAttributedString` → `OTL::Coverage::SearchFmt2Binary`.
+final class ShakeDetectorLaunchTests: XCTestCase {
+    func testColdLaunchSkipsTheDetectorEvenWhenTheOptInIsOn() {
+        XCTAssertFalse(ShakeToReportLaunch.shouldInstallDetector(
+            isEnabled: false,
+            firstFrameCommitted: false
+        ))
+        XCTAssertFalse(ShakeToReportLaunch.shouldInstallDetector(
+            isEnabled: true,
+            firstFrameCommitted: false
+        ))
+        XCTAssertFalse(ShakeToReportLaunch.shouldInstallDetector(
+            isEnabled: false,
+            firstFrameCommitted: true
+        ))
+        XCTAssertTrue(ShakeToReportLaunch.shouldInstallDetector(
+            isEnabled: true,
+            firstFrameCommitted: true
+        ))
+        XCTAssertEqual(
+            ShakeToReportLaunch.schedule(isEnabled: true, firstFrameCommitted: false),
+            .skip
+        )
+        XCTAssertEqual(
+            ShakeToReportLaunch.schedule(isEnabled: true, firstFrameCommitted: true),
+            .nextMainTurn
+        )
+        XCTAssertEqual(
+            ShakeToReportLaunch.schedule(isEnabled: false, firstFrameCommitted: true),
+            .skip
+        )
+    }
+
+    func testDetectorInitDoesNotReadTheStoredOptIn() {
+        let key = ShakeToReportPreference.defaultsKey
+        let previous = UserDefaults.standard.object(forKey: key)
+        UserDefaults.standard.set(true, forKey: key)
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+
+        let vc = ShakeDetectorViewController()
+        XCTAssertFalse(vc.isShakeEnabled)
+        XCTAssertFalse(vc.launchFrameCommitted)
+        XCTAssertEqual(vc.responderSchedule(), .skip)
+        XCTAssertFalse(vc.canBecomeFirstResponder)
+
+        vc.isShakeEnabled = true
+        XCTAssertEqual(vc.responderSchedule(), .skip)
+        vc.launchFrameCommitted = true
+        XCTAssertEqual(vc.responderSchedule(), .nextMainTurn)
+        XCTAssertTrue(vc.canBecomeFirstResponder)
+    }
+
+    func testOptInReadRunsOffTheMainThread() async {
+        let suite = "ct.shake.launch.\(UUID().uuidString)"
+        let seeded = UserDefaults(suiteName: suite)!
+        seeded.removePersistentDomain(forName: suite)
+        seeded.set(true, forKey: ShakeToReportPreference.defaultsKey)
+        defer { seeded.removePersistentDomain(forName: suite) }
+
+        let loaded = await ShakeToReportPreference.load(suiteName: suite)
+        XCTAssertTrue(loaded.enabled)
+        XCTAssertTrue(loaded.readOffMainThread)
+    }
+
+    func testZillaWarmupAndBrandFontGateStayOffTheLaunchTurn() async {
+        XCTAssertFalse(BrandFontLaunch.appliesCustomFont(warmedOffMain: false))
+        let warmed = await Task.detached(priority: .userInitiated) {
+            BrandFontWarmup.warmTables()
+        }.value
+        XCTAssertTrue(warmed.ranOffMainThread)
+        XCTAssertTrue(BrandFontWarmup.hasWarmedOffMain())
+        XCTAssertTrue(BrandFontLaunch.appliesCustomFont(warmedOffMain: true))
+    }
+}
