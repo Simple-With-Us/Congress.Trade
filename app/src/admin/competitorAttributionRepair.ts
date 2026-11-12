@@ -51,6 +51,7 @@ import { all, run } from '../shared/db.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
 import { fallbackCleanDisplayName } from '../enrichment/identitySync.ts';
 import {
+  chamberForMintedCompetitorInsert,
   competitorReporterMismatch,
   competitorReporterNames,
   hasCompetitorCryptoMarker,
@@ -117,6 +118,8 @@ function resolveNewFilerId(parsed: ParsedCompetitorReporter, existing: readonly 
 function chamberForFilerId(filerId: string, parsed: ParsedCompetitorReporter): string | null {
   if (filerId.startsWith('EXEC-')) return 'executive';
   if (filerId.startsWith('house-')) return 'house';
+  if (filerId.startsWith('senate-')) return 'senate';
+  if (isMintedCompetitorFilerId(filerId)) return chamberForMintedCompetitorInsert(parsed);
   return parsed.chamber ?? null;
 }
 

@@ -26,12 +26,12 @@ Pass D of `dedupeSplitFilerIdentities` does the same alias at the end of the dai
 ## Verification
 
 - `cd app && npm run typecheck` passed (`deno check src/deno/main.ts`, Deno 2.9.3).
-- `cd app && npm test` passed: 396 files, 5458 tests passed, 2 skipped.
+- `cd app && npm test` passed after the main merge: 396 files, 5471 tests passed, 2 skipped.
 - `cd app && npm run lint` exits 1 with 3248 pre-existing `deno lint` findings (the repo baseline, including `dashboard.js`). `deno lint` on `src/shared/phantomFilerAliases.ts` and `src/shared/competitorFilerMatch.ts` is clean.
 - The alias test seeds every named pair, including a senate-labelled phantom, and checks that chamber, party, state, and district stay put while live trades sit on the canonical id. A second run moves nothing. A bare surname does not alias. `MANUAL-JOHN` (`John Delaney`) does not move onto April.
 
 ## Follow-ups
 
 - Do not run `bash app/scripts/ship.sh` from this lane.  The next production ship applies the alias through `POST /api/admin/migrate`.  A missing canonical row is a no-op.
-- Open PR #3062 (CT-1361, `cursor/ct-1361-manual-chamber-a59d`) also edits `app/scripts/inject_competitor_data.ts` and `app/src/admin/competitorAttributionRepair.ts`. This branch leaves chamber and party labelling to that PR. A merge of both will need the identity assignment and their chamber helpers together.
+- CT-1361 landed on main while this branch was open and edited the same two ingest files.  The merge keeps `assignCompetitorFilerId` for the id and `chamberForMatchedCompetitorFiler` / `chamberForMintedCompetitorInsert` for the label on a new insert.  Existing filer rows use `ON CONFLICT DO NOTHING`, so this path does not rewrite a stored chamber or party.
 - Name-only phantoms that are not in the pinned list move only when the daily identity sync runs pass D.

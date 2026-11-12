@@ -10,9 +10,12 @@ import {
   assetNameFromCompetitorPayload,
 } from "../src/shared/executiveIdentity.ts";
 import {
+  chamberForMatchedCompetitorFiler,
+  chamberForMintedCompetitorInsert,
   chamberFromMemberType,
   competitorReporterNames,
   parseCompetitorReporter,
+  type ParsedCompetitorChamber,
 } from "../src/shared/competitorAttribution.ts";
 import {
   assignCompetitorFilerId,
@@ -113,7 +116,7 @@ async function run() {
   
   const nowStr = new Date().toISOString();
 
-  function processTrade(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
+  function processTrade(provider: string, rawName: string, ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
     if (!date || date < cutoffDate) return;
 
     const tk = (ticker || '').toUpperCase();
@@ -186,7 +189,7 @@ async function run() {
   }
 
   // Before looping over competitors, create a set of seen filers to add if missing
-  const filersToAdd = new Map<string, { id: string, name: string, chamber: string }>();
+  const filersToAdd = new Map<string, { id: string; name: string; chamber: ParsedCompetitorChamber | null }>();
 
   // Live, non-tombstoned filers: the identities a competitor row must attach to
   // instead of minting a second one (board rows 2c0b428c / 591011b9).
@@ -227,9 +230,8 @@ async function run() {
    */
   function resolveFilerId(
     rawName: string,
-    chamber: 'house' | 'senate' | 'executive',
-    rawObj: any,
-  ): { filerId: string; resolvedChamber: 'house' | 'senate' | 'executive' } | null {
+    rawObj: unknown,
+  ): { filerId: string; resolvedChamber: ParsedCompetitorChamber | null } | null {
     const parsed = parseCompetitorReporter(rawObj);
     // Payload chamber only. The provider default is not trusted here; that is
     // how executives ended up labelled senate. A bare surname returns null.
@@ -243,25 +245,31 @@ async function run() {
       candidates: existingFilers,
     });
     if (!assigned) return null;
-    if (assigned.filerId.startsWith('EXEC-')) return { filerId: assigned.filerId, resolvedChamber: 'executive' };
-    if (assigned.filerId.startsWith('house-')) return { filerId: assigned.filerId, resolvedChamber: 'house' };
+    if (assigned.minted) {
+      if (assigned.filerId.startsWith('EXEC-')) return { filerId: assigned.filerId, resolvedChamber: 'executive' };
+      if (assigned.filerId.startsWith('house-')) return { filerId: assigned.filerId, resolvedChamber: 'house' };
+      if (assigned.filerId.startsWith('senate-')) return { filerId: assigned.filerId, resolvedChamber: 'senate' };
+      return { filerId: assigned.filerId, resolvedChamber: chamberForMintedCompetitorInsert(parsed) };
+    }
     const existing = existingFilers.find((f) => f.filerId === assigned.filerId);
-    const existingChamber = (existing?.chamber ?? '').toLowerCase();
-    const resolvedChamber = existingChamber === 'house' || existingChamber === 'senate' || existingChamber === 'executive'
-      ? existingChamber
-      : (parsed.chamber ?? chamber);
-    return { filerId: assigned.filerId, resolvedChamber };
+    return {
+      filerId: assigned.filerId,
+      resolvedChamber: chamberForMatchedCompetitorFiler(existing?.chamber, parsed),
+    };
   }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
-    const resolved = resolveFilerId(rawName, chamber, rawObj);
+    const resolved = resolveFilerId(rawName, rawObj);
     if (!resolved) {
       refusedBareName += 1;
       return;
     }
     const { filerId, resolvedChamber } = resolved;
-    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber: resolvedChamber });
-    processTrade(provider, rawName, resolvedChamber, ticker, date, typeStr, rawObj, filerId);
+    const prior = filersToAdd.get(filerId);
+    const chamber =
+      resolvedChamber ?? (prior?.chamber as ParsedCompetitorChamber | null | undefined) ?? null;
+    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber });
+    processTrade(provider, rawName, ticker, date, typeStr, rawObj, filerId);
   }
 
   // unusual whales

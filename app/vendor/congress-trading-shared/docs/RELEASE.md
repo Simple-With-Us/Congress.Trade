@@ -53,7 +53,7 @@ mkdir -p "$scratch/home" "$scratch/cache"
 env -u NODE_AUTH_TOKEN -u NPM_TOKEN -u GH_PACKAGES_TOKEN -u GITHUB_TOKEN \
   HOME="$scratch/home" npm_config_cache="$scratch/cache" \
   npm install --prefix "$scratch" \
-  "git+https://github.com/jaywedgeworth22/congress-trading-shared.git#v${version}"
+  "git+https://github.com/Simple-With-Us/congress-trading-shared.git#v${version}"
 test "$(node -p "require('$scratch/node_modules/@jaywedgeworth22/congress-trading-shared/package.json').version")" = "$version"
 node -e "require('$scratch/node_modules/@jaywedgeworth22/congress-trading-shared')"
 (cd "$scratch" && node --input-type=module \
