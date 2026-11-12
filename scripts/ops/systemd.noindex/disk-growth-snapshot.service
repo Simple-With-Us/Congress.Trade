@@ -1,0 +1,16 @@
+[Unit]
+Description=Fleet daily read-only disk growth snapshot (JSON)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disk-growth-snapshot.sh
+Nice=10
+IOSchedulingClass=idle
+SyslogIdentifier=disk-growth-snapshot
+# Optional overrides:
+# EnvironmentFile=-/etc/disk-growth-snapshot.env
+
+[Install]
+WantedBy=multi-user.target
