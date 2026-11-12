@@ -4,7 +4,7 @@
 
 Adds repo-side tooling to **measure** Docker json-file container log bytes and journald
 disk use, and to **install** (on the host, with Jay's approval) Docker daemon defaults
-`json-file` with `max-size=50m` / `max-file=3` plus a systemd-journald drop-in cap.
+`json-file` with `max-size=10m` / `max-file=3` plus a systemd-journald drop-in cap.
 This complements `box-disk-hygiene.sh` (image/builder prune) by bounding unbounded
 container and journal growth on the 150G root volume.
 

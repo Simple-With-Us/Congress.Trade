@@ -29,6 +29,8 @@ INSTALL_CMD="${INSTALL_CMD:-install}"
 SYSTEMCTL_CMD="${SYSTEMCTL_CMD:-systemctl}"
 JOURNALCTL_CMD="${JOURNALCTL_CMD:-journalctl}"
 DATE_CMD="${DATE_CMD:-date}"
+FLEET_LOG_MAX_SIZE="${FLEET_LOG_MAX_SIZE:-10m}"
+FLEET_LOG_MAX_FILE="${FLEET_LOG_MAX_FILE:-3}"
 
 log() {
   printf '%s\n' "$*"
@@ -37,6 +39,138 @@ log() {
 die() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+# Convert Docker json-file max-size (e.g. 10m, 50M, 1g) to bytes for comparison.
+log_max_size_bytes() {
+  local raw="${1:-}"
+  local n suffix unit mul
+  raw="${raw//[[:space:]]/}"
+  if [[ -z "$raw" ]]; then
+    printf '%s' ''
+    return 0
+  fi
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  if [[ ! "$raw" =~ ^([0-9]+)([bBkKmMgG])?$ ]]; then
+    die "unsupported log max-size value: ${raw}"
+  fi
+  n="${BASH_REMATCH[1]}"
+  suffix="${BASH_REMATCH[2]:-b}"
+  case "${suffix,,}" in
+    b) mul=1 ;;
+    k) mul=1024 ;;
+    m) mul=$((1024 * 1024)) ;;
+    g) mul=$((1024 * 1024 * 1024)) ;;
+    *) die "unsupported log max-size suffix: ${suffix}" ;;
+  esac
+  printf '%s' $((n * mul))
+}
+
+log_max_file_int() {
+  local raw="${1:-}"
+  raw="${raw//[[:space:]]/}"
+  if [[ -z "$raw" ]]; then
+    printf '%s' ''
+    return 0
+  fi
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    die "unsupported log max-file value: ${raw}"
+  fi
+  printf '%s' "$raw"
+}
+
+# Tightest cap per axis: never above fleet default, never above existing (no loosening).
+effective_log_opts_json() {
+  local existing_json="$1"
+  local fleet_size_bytes fleet_file fleet_size existing_size_bytes existing_file
+  local eff_size_bytes eff_file eff_size_human
+
+  fleet_size_bytes="$(log_max_size_bytes "$FLEET_LOG_MAX_SIZE")"
+  fleet_file="$(log_max_file_int "$FLEET_LOG_MAX_FILE")"
+
+  existing_size="$("$JQ_CMD" -r '."log-opts"."max-size" // empty' <<<"$existing_json")"
+  existing_file="$(log_max_file_int "$("$JQ_CMD" -r '."log-opts"."max-file" // empty' <<<"$existing_json")")"
+  if [[ -n "$existing_size" ]]; then
+    existing_size_bytes="$(log_max_size_bytes "$existing_size")"
+  else
+    existing_size_bytes=''
+  fi
+
+  if [[ -n "$existing_size_bytes" ]]; then
+    if (( existing_size_bytes < fleet_size_bytes )); then
+      eff_size_bytes="$existing_size_bytes"
+    else
+      eff_size_bytes="$fleet_size_bytes"
+    fi
+  else
+    eff_size_bytes="$fleet_size_bytes"
+  fi
+
+  if [[ -n "$existing_file" ]]; then
+    if (( existing_file < fleet_file )); then
+      eff_file="$existing_file"
+    else
+      eff_file="$fleet_file"
+    fi
+  else
+    eff_file="$fleet_file"
+  fi
+
+  case "$eff_size_bytes" in
+    "$fleet_size_bytes") eff_size_human="$FLEET_LOG_MAX_SIZE" ;;
+    *)
+      if [[ -n "$existing_size" ]] && [[ "$(log_max_size_bytes "$existing_size")" == "$eff_size_bytes" ]]; then
+        eff_size_human="$existing_size"
+      else
+        eff_size_human="$FLEET_LOG_MAX_SIZE"
+      fi
+      ;;
+  esac
+
+  "$JQ_CMD" -cn --arg max_size "$eff_size_human" --argjson max_file "$eff_file" \
+    '{"max-size": $max_size, "max-file": ($max_file|tostring)}'
+}
+
+existing_cap_tighter_or_equal_than_fleet() {
+  local existing_json="$1"
+  local existing_size existing_file sz_bytes fleet_bytes fleet_file file_n
+
+  existing_size="$("$JQ_CMD" -r '."log-opts"."max-size" // empty' <<<"$existing_json")"
+  existing_file="$(log_max_file_int "$("$JQ_CMD" -r '."log-opts"."max-file" // empty' <<<"$existing_json")")"
+  fleet_bytes="$(log_max_size_bytes "$FLEET_LOG_MAX_SIZE")"
+  fleet_file="$(log_max_file_int "$FLEET_LOG_MAX_FILE")"
+
+  if [[ -z "$existing_size" ]] || [[ -z "$existing_file" ]]; then
+    return 1
+  fi
+  sz_bytes="$(log_max_size_bytes "$existing_size")"
+  file_n="$existing_file"
+  (( sz_bytes <= fleet_bytes )) && (( file_n <= fleet_file ))
+}
+
+merged_loosens_existing_caps() {
+  local current_json="$1" merged_json="$2"
+  local cur_sz cur_file mrg_sz mrg_file cur_b mrg_b
+
+  cur_sz="$("$JQ_CMD" -r '."log-opts"."max-size" // empty' <<<"$current_json")"
+  cur_file="$(log_max_file_int "$("$JQ_CMD" -r '."log-opts"."max-file" // empty' <<<"$current_json")")"
+  mrg_sz="$("$JQ_CMD" -r '."log-opts"."max-size" // empty' <<<"$merged_json")"
+  mrg_file="$(log_max_file_int "$("$JQ_CMD" -r '."log-opts"."max-file" // empty' <<<"$merged_json")")"
+
+  if [[ -n "$cur_sz" ]]; then
+    cur_b="$(log_max_size_bytes "$cur_sz")"
+    mrg_b="$(log_max_size_bytes "$mrg_sz")"
+    if (( mrg_b > cur_b )); then
+      return 0
+    fi
+  fi
+  if [[ -n "$cur_file" ]] && (( mrg_file > cur_file )); then
+    return 0
+  fi
+  return 1
 }
 
 merge_daemon_json() {
@@ -50,9 +184,11 @@ merge_daemon_json() {
       existing='{}'
     fi
   fi
-  printf '%s' "$existing" | "$JQ_CMD" -c '
+  local log_opts
+  log_opts="$(effective_log_opts_json "$existing")"
+  printf '%s' "$existing" | "$JQ_CMD" -c --argjson log_opts "$log_opts" '
     ."log-driver" = "json-file"
-    | ."log-opts" = ((."log-opts" // {}) + {"max-size": "50m", "max-file": "3"})
+    | ."log-opts" = ((."log-opts" // {}) + $log_opts)
   '
 }
 
@@ -79,7 +215,13 @@ install_docker_daemon_json() {
   fi
 
   if [[ "$want" == "$current" ]]; then
-    log "daemon.json already has fleet log caps (no change)"
+    if [[ -n "$current" ]] && existing_cap_tighter_or_equal_than_fleet "$current"; then
+      log "daemon.json log caps are already at or below fleet defaults (${FLEET_LOG_MAX_SIZE} / ${FLEET_LOG_MAX_FILE}); skipping (will not loosen)"
+    else
+      log "daemon.json already has fleet log caps (no change)"
+    fi
+  elif [[ -n "$current" ]] && merged_loosens_existing_caps "$current" "$merged"; then
+    log "daemon.json already has tighter log caps than fleet defaults; refusing to loosen — no write"
   else
     log "planned daemon.json:"
     printf '%s\n' "$merged" | "$JQ_CMD" .
