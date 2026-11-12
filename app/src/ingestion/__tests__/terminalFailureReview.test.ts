@@ -207,4 +207,52 @@ describe('terminalFailureReview', () => {
     ).first<{ ingest_status: string }>();
     expect(filing?.ingest_status).toBe('error');
   });
+
+  it('leaves a transient outbox failure for replay until its cycle cap', async () => {
+    const env = makeEnv();
+    const mid = '2026-11-12T01:00:00.000Z';
+    const later = '2026-11-12T02:00:00.000Z';
+    await d1.prepare(
+      `INSERT INTO filings (doc_id, chamber, ingest_status, first_seen_at)
+       VALUES
+         ('H-RETRY-1', 'house', 'new', ?),
+         ('H-RETRY-2', 'house', 'new', ?),
+         ('H-RETRY-4', 'house', 'new', ?),
+         ('H-RETRY-3', 'house', 'new', ?),
+         ('H-POISON-1', 'house', 'new', ?)`,
+    ).bind(AT, AT, AT, AT, AT).run();
+    await d1.prepare(
+      `INSERT INTO ingestion_outbox
+         (doc_id, chamber, source_url, status, attempts, dead_letter_cycles, available_at, last_error, created_at, updated_at)
+       VALUES
+         ('H-RETRY-1', 'house', 'https://example.test/H-RETRY-1.pdf', 'failed', 6, 0, ?, 'fetcher: HTTP 429 too many requests', ?, ?),
+         ('H-RETRY-2', 'house', 'https://example.test/H-RETRY-2.pdf', 'failed', 6, 4, ?, 'SQLITE_BUSY: database is locked', ?, ?),
+         ('H-RETRY-4', 'house', 'https://example.test/H-RETRY-4.pdf', 'failed', 6, 1, ?, 'fetcher: timeout', ?, ?),
+         ('H-RETRY-3', 'house', 'https://example.test/H-RETRY-3.pdf', 'failed', 6, 5, ?, 'fetcher: HTTP 429 too many requests', ?, ?),
+         ('H-POISON-1', 'house', 'https://example.test/H-POISON-1.pdf', 'failed', 6, 0, ?, 'invalid payload', ?, ?)`,
+    ).bind(
+      AT, AT, AT,
+      AT, AT, AT,
+      AT, AT, AT,
+      mid, mid, mid,
+      later, later, later,
+    ).run();
+
+    const sweep = await sweepTerminalFailureReviewQueue(env, { limit: 2 });
+    expect(sweep.enqueued).toBe(2);
+    expect(sweep.byReason[PIPELINE_FAILURE_REASON.download]).toBe(1);
+    expect(sweep.byReason[PIPELINE_FAILURE_REASON.deadLetter]).toBe(1);
+
+    const queued = await d1.prepare(
+      `SELECT doc_id, reason FROM review_queue ORDER BY doc_id`,
+    ).all<{ doc_id: string; reason: string }>();
+    expect(queued.results).toEqual([
+      { doc_id: 'H-POISON-1', reason: PIPELINE_FAILURE_REASON.deadLetter },
+      { doc_id: 'H-RETRY-3', reason: PIPELINE_FAILURE_REASON.download },
+    ]);
+    const waiting = await d1.prepare(
+      `SELECT ingest_status FROM filings WHERE doc_id IN ('H-RETRY-1', 'H-RETRY-2', 'H-RETRY-4') ORDER BY doc_id`,
+    ).all<{ ingest_status: string }>();
+    expect(waiting.results?.every((row) => row.ingest_status === 'new')).toBe(true);
+  });
 });

@@ -1563,8 +1563,9 @@ export async function runAutonomySweeps(
     errors.push(`transientDlq: ${(err as Error).message}`);
   }
 
-  // After the bounded replay above, rows still `failed` are terminal.
-  // Mirror any of those with no review_queue row onto the manual lane.
+  // Rows still failed after the batch above are terminal once their transient
+  // replay budget is spent. Retryable rows (transient error, cycles under the
+  // cap) stay failed for a later batch and are not parked on review_queue.
   try {
     throwIfAborted();
     result.terminalFailureReview = await sweepTerminalFailureReviewQueue(env, { limit: 100 });

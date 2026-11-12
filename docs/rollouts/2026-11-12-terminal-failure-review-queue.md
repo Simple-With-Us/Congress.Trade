@@ -2,7 +2,7 @@
 
 ## Summary
 
-House and Senate filings that die in a terminal failure state now get one unresolved `review_queue` row when they do not already have one.  Download, extract, OCR, normalize, and publish misses use a `pipeline_failure:*` reason.  Outbox dead letters and durable-queue filing failures are included.  A filing that already has a review row, including a human resolution, is left alone.  The enqueue never sets `resolved = 1`.  Autopilot will not auto-close `ingest_failure:*`, `pipeline_failure:*`, extract-empty, OCR-unusable, or empty-fetch rows.  Transient outbox and queue failures still retry with the existing bounded backoff before this sweep runs.
+House and Senate filings that die in a terminal failure state now get one unresolved `review_queue` row when they do not already have one.  Download, extract, OCR, normalize, and publish misses use a `pipeline_failure:*` reason.  Outbox dead letters and durable-queue filing failures are included.  A filing that already has a review row, including a human resolution, is left alone.  The enqueue never sets `resolved = 1`.  Autopilot will not auto-close `ingest_failure:*`, `pipeline_failure:*`, extract-empty, OCR-unusable, or empty-fetch rows.  Transient outbox and queue failures still retry with the existing bounded backoff before this sweep runs.  A failed row whose error is still transient and whose dead-letter cycles are under the replay cap stays off review_queue until that budget is spent.
 
 ## Files changed
 

@@ -12,6 +12,7 @@
 import type { Env } from '../shared/types.ts';
 import { all, get, run } from '../shared/db.ts';
 import { notifyReviewQueuePublisher } from './reviewQueueNotify.ts';
+import { AUTO_TRANSIENT_DLQ_MAX_CYCLES, isTransientDlqError } from './transientDlq.ts';
 
 const PROVIDER_MISSING_PREFIX = 'provider-missing-%';
 
@@ -204,6 +205,14 @@ interface SweepCandidate {
   error: string | null;
   source: TerminalFailureSource;
   msg_type: string | null;
+  cycles: number | null;
+}
+
+/** Page of failed rows inspected per source. Wider than the enqueue cap so a transient backlog cannot hide a real terminal. */
+const SWEEP_SCAN_LIMIT = 500;
+
+function awaitingTransientReplay(error: string | null, cycles: number | null): boolean {
+  return isTransientDlqError(error) && Number(cycles ?? 0) < AUTO_TRANSIENT_DLQ_MAX_CYCLES;
 }
 
 export interface TerminalFailureSweepResult {
@@ -241,21 +250,23 @@ export async function sweepTerminalFailureReviewQueue(
   const [deadLetters, dlqRows, reviewOrphans] = await Promise.all([
     all<SweepCandidate>(
       env.DB,
-      `SELECT o.doc_id AS doc_id, o.last_error AS error, 'dead_letter' AS source, NULL AS msg_type
+      `SELECT o.doc_id AS doc_id, o.last_error AS error, 'dead_letter' AS source,
+              NULL AS msg_type, o.dead_letter_cycles AS cycles
          FROM ingestion_outbox o
          JOIN filings f ON f.doc_id = o.doc_id
         WHERE o.status = 'failed'
           AND ${OPEN_FAILURE_FILING_SQL}
         ORDER BY o.updated_at ASC, o.doc_id
         LIMIT ?`,
-      [PROVIDER_MISSING_PREFIX, limit],
+      [PROVIDER_MISSING_PREFIX, SWEEP_SCAN_LIMIT],
     ),
     all<SweepCandidate>(
       env.DB,
       `SELECT json_extract(q.payload, '$.docId') AS doc_id,
               q.last_error AS error,
               'dlq' AS source,
-              json_extract(q.payload, '$.type') AS msg_type
+              json_extract(q.payload, '$.type') AS msg_type,
+              q.dead_letter_cycles AS cycles
          FROM deno_runtime_queue q
          JOIN filings f ON f.doc_id = json_extract(q.payload, '$.docId')
         WHERE q.status = 'failed'
@@ -266,11 +277,12 @@ export async function sweepTerminalFailureReviewQueue(
           AND ${OPEN_FAILURE_FILING_SQL}
         ORDER BY q.updated_at ASC, q.id
         LIMIT ?`,
-      [PROVIDER_MISSING_PREFIX, limit],
+      [PROVIDER_MISSING_PREFIX, SWEEP_SCAN_LIMIT],
     ),
     all<SweepCandidate>(
       env.DB,
-      `SELECT f.doc_id AS doc_id, f.error AS error, 'normalize' AS source, NULL AS msg_type
+      `SELECT f.doc_id AS doc_id, f.error AS error, 'normalize' AS source, NULL AS msg_type,
+              NULL AS cycles
          FROM filings f
         WHERE f.ingest_status = 'needs_review'
           AND ${OPEN_FAILURE_FILING_SQL}
@@ -288,8 +300,20 @@ export async function sweepTerminalFailureReviewQueue(
     byReason: {},
   };
   const seen = new Set<string>();
+  const deferred = new Set<string>();
+  const accepted = new Map<TerminalFailureSource, number>();
   for (const row of [...deadLetters, ...dlqRows, ...reviewOrphans]) {
-    if (!row.doc_id || seen.has(row.doc_id)) continue;
+    if (!row.doc_id || seen.has(row.doc_id) || deferred.has(row.doc_id)) continue;
+    if (
+      (row.source === 'dead_letter' || row.source === 'dlq')
+      && awaitingTransientReplay(row.error, row.cycles)
+    ) {
+      deferred.add(row.doc_id);
+      continue;
+    }
+    const soFar = accepted.get(row.source) ?? 0;
+    if (soFar >= limit) continue;
+    accepted.set(row.source, soFar + 1);
     seen.add(row.doc_id);
     result.matched += 1;
     const detail = [row.msg_type, row.error].filter(Boolean).join(' ')
