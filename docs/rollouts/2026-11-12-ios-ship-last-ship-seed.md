@@ -37,3 +37,4 @@ node scripts/check-actions-runner-policy.mjs
 Merging this workflow file to main starts ios-ship, because `.github/workflows/ios-ship.yml` is on the push path filter.  Do not dispatch that run from the PR.
 
 If the last real upload is older than 50 pages of successful runs, the seed writes nothing and the scheduled tick skips.  That is the safe side.
+A failed Actions lookup warns and leaves the file unwritten.  It does not report that there was no previous upload.

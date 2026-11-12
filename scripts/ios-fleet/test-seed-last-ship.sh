@@ -28,6 +28,16 @@ check() {
   fi
 }
 
+contains() {
+  if [[ "$3" == *"$2"* ]]; then
+    echo "  ok  : $1"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $1 (missing '$2' in '$3')"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 cat >"${TMP}/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GH_LOG:?}"
@@ -42,6 +52,10 @@ if [[ "$1" == "api" ]]; then
       cat "${FIXTURE_PAGE:?}"
       ;;
     */runs/*/jobs*)
+      if [[ "${GH_FAIL_JOBS:-}" == "1" ]]; then
+        echo "HTTP 502: Bad gateway" >&2
+        exit 1
+      fi
       id="${url#*/runs/}"
       id="${id%%/*}"
       cat "${FIXTURE_DIR:?}/jobs-${id}.json"
@@ -136,6 +150,60 @@ run_seed --workflow '../etc/passwd' --app congress --state-dir "${TMP}/state" >/
 status=$?
 set -e
 check "bad workflow name is rejected" "2" "$status"
+
+cat >"${TMP}/gh-fail" <<'STUB'
+#!/usr/bin/env bash
+echo "HTTP 401: Bad credentials" >&2
+exit 1
+STUB
+chmod 755 "${TMP}/gh-fail"
+
+rm -rf "${TMP}/state"
+set +e
+out="$(SEED_LAST_SHIP_GH="${TMP}/gh-fail" GITHUB_REPOSITORY="Simple-With-Us/Congress.Trade" bash "$SEED" --workflow ios-ship.yml --app congress --require-upload --ship-step "Ship CongressTrade to TestFlight" --state-dir "${TMP}/state")"
+status=$?
+set -e
+contains "api failure warns" "::warning::HTTP 401: Bad credentials" "$out"
+contains "api failure is not an empty history" "Could not read previous runs; not seeding." "$out"
+lacks() {
+  if [[ "$3" != *"$2"* ]]; then
+    echo "  ok  : $1"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $1 (found '$2' in '$3')"
+    FAIL=$((FAIL + 1))
+  fi
+}
+lacks "api failure does not claim there was no upload" "No previous successful upload" "$out"
+check "api failure exits 0" "0" "$status"
+check "api failure writes no file" "missing" "$([[ -f ${TMP}/state/last-ship-congress.txt ]] && echo present || echo missing)"
+
+rm -rf "${TMP}/state"
+: >"${TMP}/gh.log"
+cat >"${TMP}/page.json" <<EOF
+{"workflow_runs":[
+  {"id":4,"head_sha":"${SHA_B}","run_started_at":"2026-11-02T12:00:00Z","updated_at":"2026-11-02T12:10:00Z"}
+]}
+EOF
+set +e
+out="$(GH_FAIL_JOBS=1 run_seed --workflow ios-ship.yml --app congress --require-upload --ship-step "Ship CongressTrade to TestFlight" --state-dir "${TMP}/state")"
+status=$?
+set -e
+contains "jobs failure warns" "::warning::HTTP 502: Bad gateway" "$out"
+contains "jobs failure is not an empty history" "Could not read previous runs; not seeding." "$out"
+check "jobs failure exits 0" "0" "$status"
+check "jobs failure writes no file" "missing" "$([[ -f ${TMP}/state/last-ship-congress.txt ]] && echo present || echo missing)"
+
+cat >"${TMP}/gh-secret" <<'STUB'
+#!/usr/bin/env bash
+echo "token ghp_exampleexampleexampleexample leaked" >&2
+exit 1
+STUB
+chmod 755 "${TMP}/gh-secret"
+rm -rf "${TMP}/state"
+out="$(SEED_LAST_SHIP_GH="${TMP}/gh-secret" GITHUB_REPOSITORY="Simple-With-Us/Congress.Trade" bash "$SEED" --workflow ios-appstore-gm.yml --app congress --state-dir "${TMP}/state")"
+contains "credential-shaped errors are redacted" "looked like a credential" "$out"
+lacks "credential text is not printed" "ghp_exampleexampleexampleexample" "$out"
 
 echo
 echo "${PASS} passed, ${FAIL} failed"
