@@ -244,9 +244,25 @@ restored_size_bytes() {
   esac
 }
 
+# -nofollow is SQLite 3.39+. An older CLI rejects the flag and would fail a
+# healthy dump. Probe once. -readonly is older and stays on either way.
+# The restored file is one this run just created, and symlink sources are
+# already refused, so a CLI without -nofollow is still not opening the live DB.
+sqlite_ro_flags() {
+  if [[ "${SQLITE_RO_READY:-}" == 1 ]]; then
+    return 0
+  fi
+  SQLITE_RO_FLAGS=(-readonly)
+  if sqlite3 -nofollow :memory: "SELECT 1;" >/dev/null 2>&1; then
+    SQLITE_RO_FLAGS+=(-nofollow)
+  fi
+  SQLITE_RO_READY=1
+}
+
 sqlite_ro() {
   local db="$1" sql="$2"
-  sqlite3 -readonly -nofollow -- "$db" "$sql"
+  sqlite_ro_flags
+  sqlite3 "${SQLITE_RO_FLAGS[@]}" -- "$db" "$sql"
 }
 
 valid_ident() {

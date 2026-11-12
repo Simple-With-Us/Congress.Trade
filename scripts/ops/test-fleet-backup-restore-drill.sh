@@ -487,6 +487,35 @@ PY
 printf 'ok   per-app json\n'
 assert_clean "two-app temp removed"
 
+# --- sqlite3 without -nofollow still passes ---------------------------------
+new_case oldsqlite
+oldcli="$(stamp_db "$ROOT/congress" congress-trade 20261112T175000Z)"
+make_sqlite "$oldcli" 4 2 2 2
+cat >"$CASE/sqlite3" <<'EOF'
+#!/bin/bash
+kept=()
+for arg in "$@"; do
+  if [[ "$arg" == "-nofollow" ]]; then
+    printf '%s\n' "Error: unknown option: -nofollow" >&2
+    exit 1
+  fi
+  kept+=("$arg")
+done
+exec /usr/bin/sqlite3 "${kept[@]}"
+EOF
+chmod +x "$CASE/sqlite3"
+PATH="${CASE}:${PATH}" run_drill --json
+assert_rc 0 "older sqlite3 without -nofollow passes"
+assert_contains "integrity_check=ok quick_check=ok" "older sqlite3 still checks"
+python3 - "$(json_last)" <<'PY'
+import json, sys
+dump = json.loads(sys.argv[1])["dumps"][0]
+assert dump["ok"] is True and dump["tables"]["filers"] == 2
+assert dump["schema_version"] == 4
+PY
+printf 'ok   older sqlite3 json\n'
+assert_clean "older sqlite3 temp removed"
+
 # --- nice/ionice re-exec still passes ---------------------------------------
 new_case renice
 nice_db="$(stamp_db "$ROOT/congress" congress-trade 20261112T180000Z)"
