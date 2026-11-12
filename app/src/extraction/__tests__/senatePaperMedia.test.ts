@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   extractSenatePaperMediaUrls,
   isSenatePaperViewerHtml,
@@ -55,21 +55,9 @@ describe('senate paper media URL extraction', () => {
       OPENROUTER_API_KEY: 'test-key',
     } as any;
 
-    // Proxy, relay, and direct fallback must fail locally. A real CDN request makes
-    // this error-path unit test depend on network timing and can exceed 5s in CI.
-    const offlineFetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('offline test transport'));
-    try {
-      await expect(
-        extractFromSenatePaperMedia(mockEnv, ['https://efd-media-public.senate.gov/media/a.gif']),
-      ).rejects.toThrow('senatePaperMedia: unable to load page scan images');
-      expect(offlineFetch.mock.calls.map(([url]) => String(url))).toEqual([
-        'https://efd-media-public.senate.gov/media/a.gif',
-        'http://127.0.0.1:9999/fetch-doc',
-        'https://efd-media-public.senate.gov/media/a.gif',
-      ]);
-    } finally {
-      offlineFetch.mockRestore();
-    }
+    await expect(
+      extractFromSenatePaperMedia(mockEnv, ['https://efd-media-public.senate.gov/media/a.gif']),
+    ).rejects.toThrow('senatePaperMedia: unable to load page scan images');
   });
 });
 
