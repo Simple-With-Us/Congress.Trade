@@ -7,6 +7,7 @@ set -euo pipefail
 : "${TOP_N:=20}"
 : "${DU_TIMEOUT_SEC:=600}"
 : "${COLLECTOR_TIMEOUT_SEC:=30}"
+: "${DOCKER_TIMEOUT_SEC:=600}"
 : "${DU_SCAN_ROOTS:=/,/var,/home,/data,/opt,/tmp,/mnt/fleet-extra}"
 : "${BACKUP_SCAN_DIRS:=/data/backups}"
 : "${SNAPSHOT_PREFIX:=disk-growth-}"
@@ -42,26 +43,31 @@ disk_growth_mount_present() {
 }
 
 disk_growth_list_mount_targets() {
-  local m
+  local m rc incomplete=0
   for m in / /tmp /dev/shm /mnt/fleet-extra; do
     if disk_growth_mount_present "$m"; then
       printf '%s\n' "$m"
+    else
+      rc=$?
+      # findmnt status 1 means no matching filesystem; timeouts/errors do not.
+      if (( rc != 1 )); then incomplete=1; fi
     fi
   done
+  (( incomplete == 0 )) || return 2
 }
 
 disk_growth_collect_df() {
   local mounts tmp
-  mounts="$(disk_growth_list_mount_targets | tr '\n' ' ')"
+  mounts="$(disk_growth_list_mount_targets)" || return 2
   # shellcheck disable=SC2086
-  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DF" -Pk $mounts 2>/dev/null || true
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DF" -Pk $mounts 2>/dev/null
 }
 
 disk_growth_collect_df_inodes() {
   local mounts tmp
-  mounts="$(disk_growth_list_mount_targets | tr '\n' ' ')"
+  mounts="$(disk_growth_list_mount_targets)" || return 2
   # shellcheck disable=SC2086
-  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DF" -Pi $mounts 2>/dev/null || true
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DF" -Pi $mounts 2>/dev/null
 }
 
 # One traversal for overlapping roots on the same device. Keep requested
@@ -137,7 +143,7 @@ PY
 }
 
 disk_growth_docker_verbose() {
-  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$COLLECTOR_TIMEOUT_SEC" "$DISK_GROWTH_DOCKER" system df -v 2>/dev/null || return 1
+  "$DISK_GROWTH_TIMEOUT" --kill-after=5s "$DOCKER_TIMEOUT_SEC" "$DISK_GROWTH_DOCKER" system df -v 2>/dev/null
 }
 
 disk_growth_prune_old_snapshots() {
@@ -164,12 +170,16 @@ disk_growth_build_snapshot_json() (
   captured_at="${DISK_GROWTH_CAPTURED_AT:-${date_utc}T$(date -u +%H:%M:%SZ)}"
   host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 
-  local df_out inode_out docker_out du_partial=0
-  df_out="$(disk_growth_collect_df)"
-  inode_out="$(disk_growth_collect_df_inodes)"
-  docker_out=""
-  if ! docker_out="$(disk_growth_docker_verbose)"; then
+  local df_out inode_out docker_out du_partial=0 fs_partial=0 docker_error="" rc
+  if df_out="$(disk_growth_collect_df)"; then :; else df_out=""; fs_partial=1; fi
+  if inode_out="$(disk_growth_collect_df_inodes)"; then :; else inode_out=""; fs_partial=1; fi
+  if docker_out="$(disk_growth_docker_verbose)"; then :; else
+    rc=$?
     docker_out=""
+    case "$rc" in
+      124|137) docker_error="docker_collector_timeout" ;;
+      *) docker_error="docker_unavailable" ;;
+    esac
   fi
 
   local du_blob
@@ -193,6 +203,8 @@ disk_growth_build_snapshot_json() (
   DISK_GROWTH_TOP_N="$TOP_N" \
   DISK_GROWTH_DU_TIMEOUT="$DU_TIMEOUT_SEC" \
   DISK_GROWTH_DU_PARTIAL="$du_partial" \
+  DISK_GROWTH_FS_PARTIAL="$fs_partial" \
+  DISK_GROWTH_DOCKER_ERROR="$docker_error" \
   python3 - "$input_dir" <<'PY'
 import json, os, re, sys
 from pathlib import Path
@@ -236,7 +248,7 @@ def merge_inodes(rows, blob):
 
 def parse_docker(blob):
     if not blob.strip():
-        return {"available": False, "error": "docker_unavailable", "sections": {}}
+        return {"available": False, "error": os.environ.get("DISK_GROWTH_DOCKER_ERROR") or "docker_unavailable", "sections": {}}
     sections = {}
     current = None
     headers = None
@@ -333,6 +345,7 @@ doc = {
         "top_n": int(os.environ["DISK_GROWTH_TOP_N"]),
         "du_timeout_sec": int(os.environ["DISK_GROWTH_DU_TIMEOUT"]),
         "du_partial": os.environ["DISK_GROWTH_DU_PARTIAL"] == "1",
+        "filesystem_partial": os.environ["DISK_GROWTH_FS_PARTIAL"] == "1",
         "snapshot_dir": os.environ.get("DISK_GROWTH_SNAPSHOT_DIR", ""),
     },
 }

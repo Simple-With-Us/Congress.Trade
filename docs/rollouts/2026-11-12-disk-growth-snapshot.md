@@ -77,7 +77,7 @@ Directory deltas compare paths observed in both top-N lists. An omitted path
 can have fallen below the sampling cutoff rather than disappeared, so unmatched
 path counts are reported instead of inventing a zero-size grower or shrinker.
 
-Metadata collectors (`findmnt`, both `df` calls, and Docker storage) each have
+Mount and filesystem collectors (`findmnt` and both `df` calls) each have
 a default 30-second timeout (`COLLECTOR_TIMEOUT_SEC`), with forced termination
 five seconds after the timeout if needed. `du` retains its per-walk timeout
 and the same forced-termination grace. The two-hour sample service budget is
@@ -92,3 +92,18 @@ each script separately, rather than treating later paths as Bash arguments.
 The invalid-byte fixture and collector output pipe both preserve raw filesystem
 bytes even under a strict Python stdout encoding. The expanded suite checks
 strict-output round trips, human counts and bounded metadata collector hangs.
+
+Docker storage inventory has a separate default 600-second budget
+(`DOCKER_TIMEOUT_SEC`). A timeout, including forced termination, is recorded as
+`docker_collector_timeout`, distinct from `docker_unavailable`. Both suppress
+growth comparison rather than implying reclaimed storage.
+
+A failed or timed-out mount probe or filesystem collector sets
+`meta.filesystem_partial`. Mount-probe status 1 is treated as absence; other
+failures make the mount set incomplete. Filesystem growth comparisons require
+complete, matching mount sets and numeric usage counters in both snapshots.
+Older snapshots with differing mount sets are also not compared. JSON records
+`missing_baseline` or `incomplete_filesystem_scan`, and the human report names
+the corresponding cause rather than inventing zero usage for missing rows.
+Human output displays non-UTF-8 path bytes as escaped text instead of aborting
+or emitting invalid text; JSON preserves their existing escaped representation.

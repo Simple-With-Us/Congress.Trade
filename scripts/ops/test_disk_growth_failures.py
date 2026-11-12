@@ -189,6 +189,7 @@ class DiskGrowthFailures(unittest.TestCase):
             self.skipTest('GNU timeout not available')
         self.env['DISK_GROWTH_TIMEOUT'] = timeout
         self.env['COLLECTOR_TIMEOUT_SEC'] = '0.1'
+        self.env['DOCKER_TIMEOUT_SEC'] = '0.1'
         for name in ('docker', 'df'):
             self.command(name, '#!/bin/bash\nsleep 10\n')
         run = subprocess.run(['bash', str(OPS/'disk-growth-snapshot.sh')], env=self.env,
@@ -197,6 +198,64 @@ class DiskGrowthFailures(unittest.TestCase):
         self.assertFalse(doc['docker']['available'])
         self.assertEqual(doc['filesystems'], [])
         self.assertTrue(doc['directory_totals'])
+
+    def test_human_report_escapes_opaque_filename_without_aborting(self):
+        bad = '/var/bad-' + chr(0xdcff)
+        for day, size in [('2026-07-01', 200), ('2026-06-30', 100)]:
+            self.seed(day, directory_totals={'/var':{'entries':[{'path':bad,'size_bytes':size}], 'timeout':False}})
+        self.env['PYTHONIOENCODING'] = 'utf-8:strict'
+        run = subprocess.run(['bash', str(OPS/'disk-growth-report.sh')], env=self.env,
+                             text=True, capture_output=True, check=True, timeout=10)
+        self.assertIn('/var/bad-\\udcff', run.stdout)
+        self.assertIn('Docker section size growers:', run.stdout)
+        self.assertNotIn('Traceback', run.stderr)
+
+    def test_filesystem_failures_and_mount_set_changes_have_distinct_reason(self):
+        one = {'mount':'/', 'used_kb':50, 'avail_kb':50}
+        two = {'mount':'/tmp', 'used_kb':30, 'avail_kb':70}
+        for current, old, meta in [([one], [one,two], {}),
+                                   ([one,two], [one], {}),
+                                   ([], [one], {}),
+                                   ([one], [one], {'filesystem_partial':True}),
+                                   ([{'mount':'/', 'inodes':{}}], [one], {})]:
+            self.seed('2026-07-01', filesystems=current, meta=meta)
+            self.seed('2026-06-30', filesystems=old)
+            fs = self.run_script('disk-growth-report.sh','--json')['filesystems']['1d']
+            self.assertFalse(fs['available'])
+            self.assertEqual(fs['reason'], 'incomplete_filesystem_scan')
+            run = subprocess.run(['bash', str(OPS/'disk-growth-report.sh')], env=self.env,
+                                 text=True, capture_output=True, check=True, timeout=10)
+            # Day 7 legitimately lacks its baseline; inspect only day 1 here.
+            first = run.stdout.split('== vs 7-day')[0]
+            self.assertIn('incomplete filesystem scan', first)
+            self.assertNotIn('no baseline snapshot', first)
+        (self.snap/'disk-growth-2026-06-30.json').unlink()
+        self.assertEqual(self.run_script('disk-growth-report.sh','--json')['filesystems']['1d']['reason'], 'missing_baseline')
+
+    def test_mount_probe_timeout_marks_snapshot_incomplete(self):
+        timeout = shutil.which('timeout')
+        if not timeout:
+            self.skipTest('GNU timeout not available')
+        self.env.update(DISK_GROWTH_TIMEOUT=timeout, COLLECTOR_TIMEOUT_SEC='0.05')
+        self.command('findmnt', '#!/bin/bash\nsleep 10\n')
+        doc = self.snapshot()
+        self.assertTrue(doc['meta']['filesystem_partial'])
+        self.assertEqual(doc['filesystems'], [])
+
+    def test_docker_timeout_is_distinct_and_budget_is_independent(self):
+        timeout = shutil.which('timeout')
+        if not timeout:
+            self.skipTest('GNU timeout not available')
+        self.env.update(DISK_GROWTH_TIMEOUT=timeout, COLLECTOR_TIMEOUT_SEC='0.02', DOCKER_TIMEOUT_SEC='3')
+        self.command('docker', '#!/bin/bash\nsleep 0.1\nprintf "Images space usage:\nREPOSITORY  SIZE\none  1MB\n"\n')
+        doc = self.snapshot()
+        self.assertTrue(doc['docker']['available'])
+        self.env['DOCKER_TIMEOUT_SEC'] = '0.02'
+        doc = self.snapshot()
+        self.assertFalse(doc['docker']['available'])
+        self.assertEqual(doc['docker']['error'], 'docker_collector_timeout')
+        self.command('docker', '#!/bin/bash\nexit 1\n')
+        self.assertEqual(self.snapshot()['docker']['error'], 'docker_unavailable')
 
     def test_required_default_separate_mount_roots(self):
         s = (OPS/'disk-growth-lib.sh').read_text()

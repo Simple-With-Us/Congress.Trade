@@ -68,6 +68,9 @@ DISK_GROWTH_JSON_OUT="$JSON_OUT" \
 python3 - "$current_path" "$path1" "$path7" <<'PY'
 import json, os, sys
 
+# Human output must stay valid text even for opaque filesystem bytes.
+sys.stdout.reconfigure(errors="backslashreplace")
+
 def load(label, path):
     if not os.path.isfile(path):
         return None
@@ -125,9 +128,15 @@ def diff_directories(new, old):
     return result
 
 def diff_fs(new, old):
-    if old is None or not fs_index(new) or not fs_index(old):
-        return {"available": False}
-    mounts = set(fs_index(new)) | set(fs_index(old))
+    if old is None:
+        return {"available": False, "reason": "missing_baseline"}
+    ni, oi = fs_index(new), fs_index(old)
+    if (new.get("meta", {}).get("filesystem_partial") or old.get("meta", {}).get("filesystem_partial")
+            or not ni or set(ni) != set(oi)
+            or any(not isinstance(row.get(key), int) for index in (ni, oi)
+                   for row in index.values() for key in ("used_kb", "avail_kb"))):
+        return {"available": False, "reason": "incomplete_filesystem_scan"}
+    mounts = set(ni)
     used_deltas = []
     avail_deltas = []
     for m in mounts:
@@ -218,7 +227,8 @@ for label, key, baseline_key in (
             for m, d in fs.get("used_kb_shrinkers", [])[:10]:
                 print(f"  {m}: {fmt_kb(d)}")
     else:
-        print("  (no baseline snapshot)")
+        print("  (no baseline snapshot)" if fs.get("reason") == "missing_baseline"
+              else "  (filesystem comparison unavailable: incomplete filesystem scan or changed mount set)")
 
     dirs = report["directories"][key]
     if dirs.get("available"):
