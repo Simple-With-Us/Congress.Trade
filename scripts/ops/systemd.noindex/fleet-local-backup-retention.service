@@ -9,6 +9,3 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 SyslogIdentifier=fleet-local-backup-retention
-
-[Install]
-WantedBy=multi-user.target

@@ -537,9 +537,24 @@ class RetentionTests(unittest.TestCase):
         )
         self.assertNotIn("APPLY=1", active_service)
         self.assertIn("OnCalendar=daily", active_timer)
+        self.assertIn("Unit=fleet-local-backup-retention.service", active_timer)
+        self.assertNotIn("Requires=", active_timer)
+        self.assertNotIn("WantedBy=", active_service)
         self.assertNotRegex(active_timer, r"^APPLY=")
         self.assertNotIn("APPLY=1", active_timer)
         self.assertTrue(stat.S_ISREG(os.stat(SCRIPT).st_mode))
+
+    def test_unstamped_files_do_not_share_a_keep_slot(self) -> None:
+        root = self.tmp / "root"
+        older = aged(root / "db" / "manual-a.sql.gz", 40, 10 * DAY)
+        middle = aged(root / "db" / "manual-b.sql.gz", 40, 9 * DAY)
+        newest = aged(root / "db" / "manual-c.sql.gz", 40, 8 * DAY)
+        code, out = self.run_py(str(root), APPLY="1", KEEP_COUNT="2", MIN_AGE_HOURS="48")
+        self.assertEqual(code, 0)
+        self.assertEqual(deleted(out), [])
+        self.assertTrue(older.exists())
+        self.assertTrue(middle.exists())
+        self.assertTrue(newest.exists())
 
 
 if __name__ == "__main__":

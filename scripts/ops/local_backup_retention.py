@@ -215,11 +215,14 @@ def same_device(file_dev: int, root_dev: int) -> bool:
     return file_dev == root_dev
 
 
-def logical_group(parent: str, prefix: str, stamped: bool) -> str:
+def logical_group(parent: str, prefix: str, stamped: bool, name: str = "") -> str:
     if stamped:
         parts = [part for part in (parent, prefix) if part and part != "."]
         return "/".join(parts) if parts else "."
-    return parent if parent not in ("", ".") else "."
+    # No recognized stamp means this file is not a member of a snapshot series.
+    # Its own name is the group, so KEEP_COUNT cannot delete a neighbor.
+    parts = [part for part in (parent, name) if part and part != "."]
+    return "/".join(parts) if parts else "."
 
 
 def discover(root_real: str) -> tuple[list[FileRec], list[Action], int]:
@@ -282,7 +285,7 @@ def discover(root_real: str) -> tuple[list[FileRec], list[Action], int]:
                 logical = logical_group(parent, prefix, True)
                 generation = logical + "|" + stamp
             else:
-                logical = logical_group(parent, "", False)
+                logical = logical_group(parent, "", False, name)
                 generation = logical + "|file|" + name
             display = logical
             if real in records:
