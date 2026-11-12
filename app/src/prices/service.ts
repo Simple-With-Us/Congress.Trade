@@ -1230,27 +1230,24 @@ export async function runPriceRefresh(
             result.aborted = true;
             stopWalk = true;
           } else {
-            // Non-fatal per-ticker error:  stamp price_checked_at so stuck and
-            // terminal sweeps can see movement, and record the error as the last
-            // outcome so the not-covered sweep can tell "ST keeps erroring" from
-            // "ST had no data".  A later success or empty result overwrites it.
-            // Write only when the marker changes:  a ticker that keeps failing with
-            // the same error costs a read, not a securities_ref write, every run.
+            // Non-fatal per-ticker error: record the error as the last outcome
+            // so the not-covered sweep can tell "ST keeps erroring" from "ST
+            // had no data". A later success or empty result overwrites it.
+            // Stamp price_checked_at only when that marker changes. Repeating
+            // the same error must not slide the 72h stuck clock forward, and
+            // it must not turn the read into a securities_ref write every run.
             if (!dryRun) {
               const marker = stFetchErrorReason(e);
               const excludedStages = `${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL}`;
               await run(
                 env.DB,
-                `UPDATE securities_ref SET price_checked_at = ?
-                 WHERE ticker = ? AND COALESCE(price_unavailable, 0) NOT IN (${excludedStages})`,
-                [nowIso, ticker],
-              );
-              await run(
-                env.DB,
-                `UPDATE securities_ref SET price_unavailable_reason = ?
-                 WHERE ticker = ? AND COALESCE(price_unavailable, 0) NOT IN (${excludedStages})
-                   AND price_unavailable_reason IS NOT ?`,
-                [marker, ticker, marker],
+                `UPDATE securities_ref
+                    SET price_checked_at = ?,
+                        price_unavailable_reason = ?
+                  WHERE ticker = ?
+                    AND COALESCE(price_unavailable, 0) NOT IN (${excludedStages})
+                    AND price_unavailable_reason IS NOT ?`,
+                [nowIso, marker, ticker, marker],
               );
             }
             skipTicker = true;

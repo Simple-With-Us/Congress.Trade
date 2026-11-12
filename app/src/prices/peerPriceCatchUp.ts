@@ -105,6 +105,11 @@ export interface PeerPriceCatchUpState {
   /** Rotating resume point (MAX(cursor_seq) of the last ticker reached).  Null
    *  starts from the head of the oldest-first pending set. */
   cursorSeq: number | null;
+  /** High-water engaged-run cap for this budget day. Pending shrinks as the
+   *  wave drains, and recomputing the cap from the smaller count would park
+   *  runs that the morning backlog already paid for. Absent on states written
+   *  before the anchor existed. */
+  runCap?: number;
   /** ET calendar day (YYYY-MM-DD) the runs / attempts / noProgressRuns
    *  budgets belong to.  freshThrough does not roll over a weekend, so a
    *  session alone can span three-plus days;  the budgets reset when this
@@ -142,6 +147,8 @@ export const PeerPriceCatchUpStateSchema = z.object({
   // Optional so states written before the day roll still parse;  the reader
   // derives the day from lastRunAt.
   budgetDay: z.string().optional(),
+  // Optional so states written before the high-water cap still parse.
+  runCap: nonNegativeInt.optional(),
 });
 
 /** Parse a stored state;  anything malformed or from another session restarts. */
@@ -187,6 +194,7 @@ export function parsePeerPriceCatchUpState(
       noProgressRuns: 0,
       cursorSeq: v.cursorSeq ?? null,
       budgetDay: today,
+      runCap: 0,
     };
   }
   return {
@@ -197,6 +205,7 @@ export function parsePeerPriceCatchUpState(
     noProgressRuns: v.noProgressRuns,
     cursorSeq: v.cursorSeq ?? null,
     budgetDay,
+    runCap: v.runCap ?? 0,
   };
 }
 
@@ -211,6 +220,22 @@ export function peerPriceCatchUpEffectiveRunCap(pending: number): number {
     PEER_PRICE_CATCHUP_MAX_ATTEMPTS_PER_SESSION,
     Math.max(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION, pages + 1),
   );
+}
+
+/**
+ * Cap for this tick. Never lower than the high water already stored for the
+ * budget day, so a 3000-ticker morning (11 runs) does not drop to 8 after the
+ * backlog drains to 1500 and park runs 9–11 with work still pending.
+ * A failed pending probe keeps the stored cap, or the floor of 8.
+ */
+export function peerPriceCatchUpAnchoredRunCap(
+  state: PeerPriceCatchUpState,
+  pending: number | null,
+): number {
+  const current = pending === null
+    ? (state.runCap ?? PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION)
+    : peerPriceCatchUpEffectiveRunCap(pending);
+  return Math.max(state.runCap ?? 0, current);
 }
 
 export function peerPriceCatchUpGate(
@@ -269,10 +294,12 @@ export function peerPriceCatchUpAfterRun(
     tickersPriced?: number;
   },
 ): PeerPriceCatchUpState {
-  // An unreadable after-count is not proof of progress; priced tickers are.
-  const progressed =
-    (run.pendingAfter !== null && run.pendingAfter < run.pendingBefore) ||
-    (run.tickersPriced ?? 0) > 0;
+  // A readable after-count decides. Repriced tickers that leave pending flat
+  // are not progress, or a plateaued tail resets the park on every run.
+  // Priced tickers count only when the after-count could not be read.
+  const progressed = run.pendingAfter !== null
+    ? run.pendingAfter < run.pendingBefore
+    : (run.tickersPriced ?? 0) > 0;
   // A failed run that moved nothing says nothing about whether ST can price the
   // rest, so it does not count toward the park (Kody #2859).  It still spent one
   // of the day's runs and waits out the spacing, so failures stay bounded.

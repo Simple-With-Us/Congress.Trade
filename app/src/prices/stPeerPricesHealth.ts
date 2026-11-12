@@ -85,7 +85,10 @@ async function readTerminalTickers(env: Env): Promise<{ terminal: number; termin
 
 function pendingPriceProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
-  if (!Number.isFinite(lastMs)) return false;
+  // A missing, expired, or unparseable drain stamp is idle. Callers only ask
+  // once a non-empty backlog is already in hand, so "no clock" must stall
+  // instead of reading as a healthy drain that has simply never reported.
+  if (!Number.isFinite(lastMs)) return true;
   return now.getTime() - lastMs >= thresholdMs;
 }
 
@@ -305,10 +308,15 @@ export async function collectStPeerPricesMetrics(
   const oldestSuffix = oldestPendingCheckedAt
     ? `; oldest pending check ${progressAgoLabel(oldestPendingCheckedAt, now)}`
     : '';
+  const idleFor = hoursSinceIso(lastProgressAt, now);
+  // hoursSinceIso returns the word "never", which must not be glued onto "h".
+  const progressClause = idleFor === 'never'
+    ? `drain progress never (threshold ${stallThresholdHours}h)`
+    : `no drain progress in ${idleFor}h (threshold ${stallThresholdHours}h)`;
   const detail =
     `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
     sampleSuffix +
-    `; no drain progress in ${hoursSinceIso(lastProgressAt, now)}h (threshold ${stallThresholdHours}h)` +
+    `; ${progressClause}` +
     oldestSuffix +
     notCoveredSuffix +
     terminalSuffix;
