@@ -190,6 +190,108 @@ assert_eq "$PUSHOVER_APP_TOKEN" only-app "app token is used when usage token is 
 unset PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY PUSHOVER_USAGE_API_TOKEN
 unset BOX_DISK_HYGIENE_ENV CONGRESS_HEALTH_RECOVER_ENV
 
+section "env file does not replace process secrets"
+printf 'PUSHOVER_APP_TOKEN=file-app\nPUSHOVER_USER_KEY=file-user\nPUSHOVER_USAGE_API_TOKEN=file-usage\nALERT_WEBHOOK_URL=https://file.example/hook\nWARN_USED_PCT=77\n' > "$env_dir/box.env"
+printf 'PUSHOVER_APP_TOKEN=recover-app\nALERT_WEBHOOK_URL=https://recover.example/hook\n' > "$env_dir/recover.env"
+PUSHOVER_APP_TOKEN=process-app
+PUSHOVER_USER_KEY=process-user
+PUSHOVER_USAGE_API_TOKEN=process-usage
+ALERT_WEBHOOK_URL=https://process.example/hook
+WARN_USED_PCT=80
+BOX_DISK_HYGIENE_ENV="$env_dir/box.env" CONGRESS_HEALTH_RECOVER_ENV="$env_dir/recover.env" load_host_env
+assert_eq "$PUSHOVER_APP_TOKEN" process-app "process app token is not replaced by an env file"
+assert_eq "$PUSHOVER_USER_KEY" process-user "process user key is not replaced by an env file"
+assert_eq "$PUSHOVER_USAGE_API_TOKEN" process-usage "process usage token is not replaced by an env file"
+assert_eq "$ALERT_WEBHOOK_URL" "https://process.example/hook" "process webhook url is not replaced by an env file"
+assert_eq "$WARN_USED_PCT" 77 "non-secret env file settings still apply"
+unset PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY PUSHOVER_USAGE_API_TOKEN ALERT_WEBHOOK_URL
+WARN_USED_PCT=80
+BOX_DISK_HYGIENE_ENV="$env_dir/box.env" CONGRESS_HEALTH_RECOVER_ENV="$env_dir/recover.env" load_host_env
+assert_eq "$PUSHOVER_APP_TOKEN" file-usage "empty process token is filled from the env file"
+assert_eq "$PUSHOVER_USER_KEY" file-user "empty process user key is filled from the env file"
+assert_eq "$ALERT_WEBHOOK_URL" "https://recover.example/hook" "empty process webhook url is filled from the env file"
+unset PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY PUSHOVER_USAGE_API_TOKEN ALERT_WEBHOOK_URL
+unset BOX_DISK_HYGIENE_ENV CONGRESS_HEALTH_RECOVER_ENV
+WARN_USED_PCT=80
+
+section "webhook url and pushover tokens stay out of curl argv"
+CURL_STUB="${TMP}/curlbin"
+mkdir -p "$CURL_STUB"
+export CURL_LOG="${TMP}/curl-argv.log"
+cat > "$CURL_STUB/curl" <<'EOF'
+#!/bin/bash
+{
+  printf 'ARGV'
+  printf ' %q' "$@"
+  printf '\nSTDIN\n'
+  cat
+  printf '\nEND\n'
+} >> "${CURL_LOG:?}"
+exit 0
+EOF
+chmod 0755 "$CURL_STUB/curl"
+: > "$CURL_LOG"
+saved_path="$PATH"
+PATH="${CURL_STUB}:${PATH}"
+ALERT_WEBHOOK_URL='https://alerts.example/hook?token=webhook-secret-ZZZ'
+alert_webhook "disk critical"
+PATH="$saved_path"
+argv_line=$(head -n 1 "$CURL_LOG")
+case "$argv_line" in
+  ARGV*)
+    case "$argv_line" in
+      *webhook-secret-ZZZ*)
+        echo "FAIL webhook url appeared in curl argv: ${argv_line}"
+        fail=1
+        ;;
+      *)
+        echo "ok   webhook url is absent from curl argv"
+        ;;
+    esac
+    ;;
+  *)
+    echo "FAIL curl argv was not recorded: ${argv_line}"
+    fail=1
+    ;;
+esac
+if awk 'f && index($0, "webhook-secret-ZZZ"){found=1} /^STDIN$/{f=1} END{exit !found}' "$CURL_LOG"; then
+  echo "ok   webhook url is passed on the curl config stream"
+else
+  echo "FAIL webhook url missing from curl config stream"
+  fail=1
+fi
+: > "$CURL_LOG"
+PATH="${CURL_STUB}:${PATH}"
+PUSHOVER_APP_TOKEN=pushover-token-QQQ
+PUSHOVER_USER_KEY=pushover-user-RRR
+alert_pushover crit "host disk"
+PATH="$saved_path"
+argv_line=$(head -n 1 "$CURL_LOG")
+case "$argv_line" in
+  ARGV*)
+    case "$argv_line" in
+      *pushover-token-QQQ*|*pushover-user-RRR*)
+        echo "FAIL pushover token appeared in curl argv: ${argv_line}"
+        fail=1
+        ;;
+      *)
+        echo "ok   pushover token and user key are absent from curl argv"
+        ;;
+    esac
+    ;;
+  *)
+    echo "FAIL curl argv was not recorded: ${argv_line}"
+    fail=1
+    ;;
+esac
+if awk 'f && index($0, "pushover-token-QQQ"){t=1} f && index($0, "pushover-user-RRR"){u=1} /^STDIN$/{f=1} END{exit !(t && u)}' "$CURL_LOG"; then
+  echo "ok   pushover token and user key are passed on the curl config stream"
+else
+  echo "FAIL pushover token missing from curl config stream"
+  fail=1
+fi
+unset PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY PUSHOVER_USAGE_API_TOKEN ALERT_WEBHOOK_URL
+
 section "metric collection from fixtures"
 FIX="${TMP}/fixture"
 mkdir -p "$FIX"
@@ -303,6 +405,15 @@ DOCKER_LOG="${TMP}/docker.log"
 cat > "$STUB/docker" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "${DOCKER_LOG:?}"
+if [[ "${HYGIENE_REWRITE_AFTER_PRUNE:-0}" == "1" && "$*" == *prune* ]]; then
+  mark="${HYGIENE_AFTER_DIR:-}/.rewritten"
+  if [[ -n "${HYGIENE_AFTER_DIR:-}" && -f "${HYGIENE_AFTER_DIR}/df-P.txt" && ! -f "$mark" ]]; then
+    cp "${HYGIENE_AFTER_DIR}/df-P.txt" "${HYGIENE_FIXTURE_DIR}/df-P.txt"
+    cp "${HYGIENE_AFTER_DIR}/df-i.txt" "${HYGIENE_FIXTURE_DIR}/df-i.txt"
+    cp "${HYGIENE_AFTER_DIR}/docker-df.txt" "${HYGIENE_FIXTURE_DIR}/docker-df.txt"
+    : > "$mark"
+  fi
+fi
 if [[ "$1" == "system" && "$2" == "df" ]]; then
   if [[ -n "${DOCKER_DF_FILE:-}" && -f "$DOCKER_DF_FILE" ]]; then
     cat "$DOCKER_DF_FILE"
@@ -311,6 +422,9 @@ fi
 exit 0
 EOF
 chmod 0755 "$STUB/docker"
+cp "$CURL_STUB/curl" "$STUB/curl"
+CURL_LOG="${TMP}/curl-from-main.log"
+: > "$CURL_LOG"
 
 write_levels() {
   local root_pct="$1" root_free="$2" cache_active="$3" mem_avail_kb="$4"
@@ -367,20 +481,32 @@ PY
 
 run_main() {
   : > "$DOCKER_LOG"
-  env -u HYGIENE_LIB_ONLY -u PUSHOVER_APP_TOKEN -u PUSHOVER_USER_KEY -u PUSHOVER_USAGE_API_TOKEN \
+  : > "$CURL_LOG"
+  mkdir -p "$TMP/backups" "$TMP/scratch" "$TMP/ct"
+  env -u HYGIENE_LIB_ONLY \
+    -u PUSHOVER_APP_TOKEN -u PUSHOVER_USER_KEY -u PUSHOVER_USAGE_API_TOKEN -u ALERT_WEBHOOK_URL \
     HYGIENE_FIXTURE_DIR="$FIX" \
     STATE_DIR="$STATE_DIR" \
     HYGIENE_NOW="${HYGIENE_NOW}" \
     HYGIENE_DEPLOY_ACTIVE="${HYGIENE_DEPLOY_ACTIVE:-0}" \
     HYGIENE_FAIL_DF_AFTER_PRUNE="${HYGIENE_FAIL_DF_AFTER_PRUNE:-0}" \
+    HYGIENE_REWRITE_AFTER_PRUNE="${HYGIENE_REWRITE_AFTER_PRUNE:-0}" \
+    HYGIENE_AFTER_DIR="${HYGIENE_AFTER_DIR:-}" \
     PAGE_SIZE=4096 \
     PATH="${STUB}:${PATH}" \
     DOCKER_LOG="$DOCKER_LOG" \
+    CURL_LOG="$CURL_LOG" \
     DOCKER_DF_FILE="$FIX/docker-df.txt" \
     DRY_RUN="${DRY_RUN:-0}" \
     PRUNE_VOLUMES="${PRUNE_VOLUMES:-0}" \
     ALERT_REMINDER_SEC="${ALERT_REMINDER_SEC}" \
     AGGRESSIVE_COOLDOWN_SEC="${AGGRESSIVE_COOLDOWN_SEC:-1800}" \
+    BACKUP_DATA_DIR="$TMP/backups" \
+    SCRATCH_DATA_DIR="$TMP/scratch" \
+    CT_DATA_DIR="$TMP/ct" \
+    BOX_DISK_HYGIENE_ENV="$TMP/no-box-disk-hygiene.env" \
+    CONGRESS_HEALTH_RECOVER_ENV="$TMP/no-congress-health-recover.env" \
+    ROOT_PATH=/var/tmp \
     bash "$SCRIPT"
 }
 
@@ -401,6 +527,9 @@ PRUNE_VOLUMES=0
 write_levels 40 90 0 8192000
 run_main > "${TMP}/light.out"
 assert_file_has "$DOCKER_LOG" "image prune -f" "ok path prunes dangling images"
+assert_file_has "${TMP}/light.out" "start path=/" "start log measures /"
+assert_file_lacks "${TMP}/light.out" "root=/var/tmp" "ROOT_PATH override is not advertised"
+assert_file_has "${TMP}/light.out" "backups: dir=${TMP}/backups" "prune backup dir stays under the temp dir"
 assert_file_has "$DOCKER_LOG" "builder prune -f --filter until=12h" "ok path prunes old builder cache"
 assert_file_lacks "$DOCKER_LOG" "builder prune -af" "ok path does not run builder prune -af"
 assert_file_lacks "$DOCKER_LOG" "volume prune" "ok path does not prune volumes"
@@ -411,7 +540,30 @@ rm -rf "$STATE_DIR"
 mkdir -p "$STATE_DIR"
 HYGIENE_NOW=60000
 write_levels 85 12 0 8192000
+mkdir -p "$TMP/backups" "$TMP/scratch/olddir" "$TMP/ct"
+touch -d '30 days ago' "$TMP/backups/old.db"
+touch -d '20 days ago' "$TMP/scratch/olddir"
+export ALERT_WEBHOOK_URL='https://alerts.example/hook?token=webhook-secret-LEAK'
+export PUSHOVER_APP_TOKEN=pushover-token-LEAK
+export PUSHOVER_USER_KEY=pushover-user-LEAK
 run_main > "${TMP}/warn.out"
+unset ALERT_WEBHOOK_URL PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY
+if [[ -f "$TMP/backups/old.db" ]]; then
+  echo "FAIL old backup under the temp dir was not pruned"
+  fail=1
+else
+  echo "ok   old backup prune target is the temp dir"
+fi
+if [[ -d "$TMP/scratch/olddir" ]]; then
+  echo "FAIL old scratch under the temp dir was not pruned"
+  fail=1
+else
+  echo "ok   old scratch prune target is the temp dir"
+fi
+assert_file_lacks "${TMP}/warn.out" "/data/backups" "warn path does not touch /data/backups"
+assert_file_lacks "${TMP}/warn.out" "/data/scratch" "warn path does not touch /data/scratch"
+assert_file_lacks "$CURL_LOG" "webhook-secret-LEAK" "run_main does not send the parent webhook"
+assert_file_lacks "$CURL_LOG" "pushover-token-LEAK" "run_main does not send the parent pushover token"
 assert_file_has "$DOCKER_LOG" "builder prune -af" "warn path runs builder prune -af when cache is idle"
 assert_file_has "$DOCKER_LOG" "image prune -af" "warn path prunes unused images"
 assert_file_lacks "$DOCKER_LOG" "system prune -af" "warn path does not system-prune"
@@ -445,6 +597,8 @@ assert_file_has "$DOCKER_LOG" "system prune -af" "crit path runs system prune -a
 assert_file_lacks "$DOCKER_LOG" "--volumes" "crit path never passes --volumes"
 assert_file_lacks "$DOCKER_LOG" "volume prune" "crit path never prunes volumes"
 assert_file_has "${TMP}/crit.out" "STILL critical" "crit after a no-op reclaim says so"
+assert_file_has "${TMP}/crit.out" "phase=live level=crit" "pre-prune root level is emitted"
+assert_eq "$(notify_count)" 1 "same crit level is not double-paged in one run"
 assert_file_has "$STATE_DIR/last-status" "level_before=crit" "status keeps the pre-prune level"
 assert_file_has "$STATE_DIR/last-status" "level_after=crit" "status keeps the post-prune level"
 
@@ -524,6 +678,73 @@ run_main > "${TMP}/cool.out"
 assert_file_has "${TMP}/cool.out" "soft prune: skipped (cooldown" "warn cooldown is logged"
 assert_file_has "$DOCKER_LOG" "builder prune -f --filter until=12h" "warn cooldown uses the light prune"
 assert_file_lacks "$DOCKER_LOG" "builder prune -af" "warn cooldown does not run builder prune -af"
+
+section "missing root df still emits other alerts"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+HYGIENE_NOW=91000
+write_levels 95 5 0 655360
+grep -v ' /$' "$FIX/df-P.txt" > "$FIX/df-P.txt.noroot"
+mv "$FIX/df-P.txt.noroot" "$FIX/df-P.txt"
+grep -v ' /$' "$FIX/df-i.txt" > "$FIX/df-i.txt.noroot"
+mv "$FIX/df-i.txt.noroot" "$FIX/df-i.txt"
+run_main > "${TMP}/noroot.out"
+assert_file_has "${TMP}/noroot.out" "mount /: missing from df level=unknown" "missing root df is recorded unknown"
+assert_file_has "${TMP}/noroot.out" "prune: skipped (root level unknown)" "missing root df skips prune"
+assert_file_lacks "$DOCKER_LOG" "prune" "missing root df does not prune"
+assert_file_has "$STATE_DIR/notifications.log" $'mem\tcrit' "missing root df still pages memory"
+assert_file_has "$STATE_DIR/last-status" "mem=crit" "missing root df still writes status"
+
+section "no metrics fails the run"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+HYGIENE_NOW=92000
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' > "$FIX/df-P.txt"
+printf '%s\n' 'Filesystem Inodes IUsed IFree IUse% Mounted on' > "$FIX/df-i.txt"
+: > "$FIX/meminfo"
+: > "$FIX/vmstat"
+: > "$FIX/loadavg"
+: > "$FIX/nproc"
+: > "$FIX/mounts"
+: > "$FIX/docker-df.txt"
+none_rc=0
+run_main > "${TMP}/nometrics.out" || none_rc=$?
+assert_eq "$none_rc" 1 "a run with no metrics fails"
+assert_file_has "${TMP}/nometrics.out" "error: no host metrics collected" "empty collection is logged"
+assert_eq "$(notify_count)" 0 "a run with no metrics does not page"
+
+section "pre-prune page and fresh post-prune metrics"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR" "$TMP/afterfix"
+HYGIENE_NOW=93000
+write_levels 40 90 0 8192000
+python3 - "$FIX/docker-df.txt" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text(
+    "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+    "Images          5         1         10GB      2GB (20%)\n"
+    "Build Cache     2         0         0.050GB   0.050GB\n"
+)
+PY
+cp "$FIX/df-P.txt" "$FIX/df-i.txt" "$FIX/docker-df.txt" "$TMP/afterfix/"
+write_levels 95 5 0 8192000
+HYGIENE_REWRITE_AFTER_PRUNE=1
+HYGIENE_AFTER_DIR="$TMP/afterfix"
+run_main > "${TMP}/fresh.out"
+unset HYGIENE_REWRITE_AFTER_PRUNE HYGIENE_AFTER_DIR
+assert_file_has "${TMP}/fresh.out" "phase=live level=crit" "pre-prune crit is emitted"
+assert_file_has "${TMP}/fresh.out" "disk-after: used=40% free=90.0G level=ok" "post-prune df is re-read"
+assert_file_has "${TMP}/fresh.out" "builder-cache: total=2 active=0 size=0.050GB" "post-prune builder cache is re-read"
+assert_file_has "${TMP}/fresh.out" "phase=after level=ok" "post-prune recovery is emitted"
+assert_eq "$(awk -F '\t' '$2=="disk:/" && $3=="crit"' "$STATE_DIR/notifications.log" | wc -l | tr -d ' ')" 1 "pre-prune crit pages once"
+assert_eq "$(awk -F '\t' '$2=="disk:/" && $3=="ok"' "$STATE_DIR/notifications.log" | wc -l | tr -d ' ')" 1 "post-prune recovery pages once"
+if awk '/size=1\.628GB/{pre=NR} /size=0\.050GB/{post=NR} END{exit !(pre && post && post>pre)}' "${TMP}/fresh.out"; then
+  echo "ok   fresh builder-cache size is logged after the pre-prune size"
+else
+  echo "FAIL fresh builder-cache size was not logged after the pre-prune size"
+  fail=1
+fi
 
 if grep -E -n 'docker volume prune|system prune --volumes|prune --volumes' "$SCRIPT"; then
   echo "FAIL script still contains a volume prune command"

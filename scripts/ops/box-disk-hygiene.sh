@@ -22,8 +22,10 @@
 #   systemctl daemon-reload
 #   systemctl enable --now box-disk-hygiene.timer
 #
-# Env (optional /etc/box-disk-hygiene.env, then /etc/congress-health-recover.env):
-#   ROOT_PATH                 default /
+# Env (optional /etc/box-disk-hygiene.env, then /etc/congress-health-recover.env).
+# A non-empty process value for the Pushover tokens and ALERT_WEBHOOK_URL is
+# never replaced; those files only fill a name that is still empty. The
+# measured root filesystem is always /.
 #   WARN_USED_PCT             default 80     (root and other large mounts)
 #   CRIT_USED_PCT             default 90
 #   WARN_FREE_GB              default 15
@@ -58,7 +60,6 @@
 
 set -euo pipefail
 
-ROOT_PATH="${ROOT_PATH:-/}"
 WARN_USED_PCT="${WARN_USED_PCT:-80}"
 CRIT_USED_PCT="${CRIT_USED_PCT:-90}"
 WARN_FREE_GB="${WARN_FREE_GB:-15}"
@@ -96,6 +97,17 @@ DRY_RUN="${DRY_RUN:-0}"
 load_host_env() {
   local box="${BOX_DISK_HYGIENE_ENV:-/etc/box-disk-hygiene.env}"
   local rec="${CONGRESS_HEALTH_RECOVER_ENV:-/etc/congress-health-recover.env}"
+  # Snapshot before sourcing. Files may fill an empty name, and a value
+  # already present in the process environment is written back afterward.
+  local saved_usage="${PUSHOVER_USAGE_API_TOKEN-}"
+  local saved_app="${PUSHOVER_APP_TOKEN-}"
+  local saved_user="${PUSHOVER_USER_KEY-}"
+  local saved_hook="${ALERT_WEBHOOK_URL-}"
+  local keep_usage=0 keep_app=0 keep_user=0 keep_hook=0
+  [[ -n "$saved_usage" ]] && keep_usage=1
+  [[ -n "$saved_app" ]] && keep_app=1
+  [[ -n "$saved_user" ]] && keep_user=1
+  [[ -n "$saved_hook" ]] && keep_hook=1
   if [[ -f "$box" ]]; then
     # shellcheck disable=SC1090
     set -a; source "$box"; set +a
@@ -104,7 +116,18 @@ load_host_env() {
     # shellcheck disable=SC1090
     set -a; source "$rec"; set +a
   fi
-  PUSHOVER_APP_TOKEN="${PUSHOVER_USAGE_API_TOKEN:-${PUSHOVER_APP_TOKEN:-}}"
+  if [[ "$keep_usage" == 1 ]]; then PUSHOVER_USAGE_API_TOKEN="$saved_usage"; fi
+  if [[ "$keep_app" == 1 ]]; then PUSHOVER_APP_TOKEN="$saved_app"; fi
+  if [[ "$keep_user" == 1 ]]; then PUSHOVER_USER_KEY="$saved_user"; fi
+  if [[ "$keep_hook" == 1 ]]; then ALERT_WEBHOOK_URL="$saved_hook"; fi
+  if [[ "$keep_app" != 1 ]]; then
+    PUSHOVER_APP_TOKEN="${PUSHOVER_USAGE_API_TOKEN:-${PUSHOVER_APP_TOKEN:-}}"
+  fi
+  PUSHOVER_USAGE_API_TOKEN="${PUSHOVER_USAGE_API_TOKEN:-}"
+  PUSHOVER_APP_TOKEN="${PUSHOVER_APP_TOKEN:-}"
+  PUSHOVER_USER_KEY="${PUSHOVER_USER_KEY:-}"
+  ALERT_WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}"
+  export PUSHOVER_USAGE_API_TOKEN PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY ALERT_WEBHOOK_URL
 }
 
 log() {
@@ -401,13 +424,24 @@ fill_mount_metrics() {
   if [[ -z "$fields" ]]; then
     printf -v "M_${prefix}_LEVEL" '%s' unknown
     printf -v "M_${prefix}_INODE_LEVEL" '%s' unknown
+    printf -v "M_${prefix}_USED_PCT" '%s' ""
+    printf -v "M_${prefix}_FREE_GB" '%s' ""
+    printf -v "M_${prefix}_INODE_PCT" '%s' ""
     if [[ "$mount" == "/" ]]; then
-      log "error: df failed for /"
-      return 1
+      USED_PCT=""
+      FREE_GB=""
+      TOTAL_GB=""
+      USED_GB=""
     fi
     log "mount ${mount}: missing from df level=unknown"
+    # Root stays a hard miss so the post-prune re-read can fall back to the
+    # pre-prune level. collect_host_metrics ignores this status and continues.
+    if [[ "$mount" == "/" ]]; then
+      return 1
+    fi
     return 0
   fi
+  METRICS_SEEN=1
   local total_k used_k avail_k pct free_gb total_gb used_gb level
   read -r total_k used_k avail_k pct <<<"$fields"
   pct=${pct%%%}
@@ -458,6 +492,7 @@ collect_memory() {
     log "memory: unavailable"
     return 0
   fi
+  METRICS_SEEN=1
   MEM_AVAIL_PCT=$(awk -v a="$avail" -v t="$total" 'BEGIN { printf "%.1f", (a/t)*100 }')
   MEM_AVAIL_MB=$(awk -v a="$avail" 'BEGIN { printf "%.0f", a/1024 }')
   M_MEM_LEVEL=$(mem_level "$MEM_AVAIL_PCT")
@@ -522,6 +557,9 @@ collect_load() {
     read -r _ LOAD5 _ <<<"$LOADAVG_TEXT"
   fi
   NCPU="${NPROC_TEXT:-}"
+  if [[ -n "${LOAD5:-}" && -n "${NCPU:-}" && "$NCPU" != "0" ]]; then
+    METRICS_SEEN=1
+  fi
   M_LOAD_LEVEL=$(load_level "$LOAD5" "$NCPU")
   log "load: load5=${LOAD5:-unknown} ncpu=${NCPU:-unknown} level=${M_LOAD_LEVEL}"
 }
@@ -600,15 +638,20 @@ update_growth() {
 }
 
 collect_host_metrics() {
+  METRICS_SEEN=0
   read_metric_texts
   mkdir -p "$STATE_DIR"
-  fill_mount_metrics "/" root ROOT || return 1
-  fill_mount_metrics "/tmp" tmpfs TMP || return 1
-  fill_mount_metrics "/dev/shm" tmpfs SHM || return 1
-  fill_mount_metrics "/mnt/fleet-extra" extra EXTRA || return 1
+  fill_mount_metrics "/" root ROOT || true
+  fill_mount_metrics "/tmp" tmpfs TMP
+  fill_mount_metrics "/dev/shm" tmpfs SHM
+  fill_mount_metrics "/mnt/fleet-extra" extra EXTRA
   collect_memory
   collect_swap
   collect_load
+  if [[ "$METRICS_SEEN" != 1 ]]; then
+    log "error: no host metrics collected"
+    return 1
+  fi
   M_GROWTH_ROOT_ACTION=skip
   M_GROWTH_ROOT_LEVEL=ok
   M_GROWTH_TMP_ACTION=skip
@@ -819,16 +862,35 @@ pushover_priority() {
   echo 0
 }
 
+curl_cfg_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
 alert_webhook() {
   local body="$1"
-  if [[ -z "$ALERT_WEBHOOK_URL" ]]; then
+  if [[ -z "${ALERT_WEBHOOK_URL:-}" ]]; then
     return 0
   fi
-  local payload
+  case "$ALERT_WEBHOOK_URL" in
+    *$'\n'*|*$'\r'*)
+      log "warn: alert webhook skipped (url contains CR/LF)"
+      return 0
+      ;;
+  esac
+  local payload url_esc body_file
   payload=$(printf '{"text":"[%s] %s"}' "$LOG_TAG" "$body")
-  curl -fsS -m 15 -X POST -H 'Content-Type: application/json' \
-    -d "$payload" "$ALERT_WEBHOOK_URL" >/dev/null 2>&1 \
-    || log "warn: alert webhook failed"
+  url_esc=$(curl_cfg_escape "$ALERT_WEBHOOK_URL")
+  body_file=$(mktemp)
+  printf '%s' "$payload" > "$body_file"
+  # The URL is curl config on stdin (`-K -`), never a curl argument.
+  if ! printf 'url = "%s"\nheader = "Content-Type: application/json"\n' "$url_esc" \
+    | curl -fsS -m 15 -X POST -K - --data-binary @"$body_file" >/dev/null 2>&1; then
+    log "warn: alert webhook failed"
+  fi
+  rm -f "$body_file"
 }
 
 alert_pushover() {
@@ -844,13 +906,19 @@ alert_pushover() {
     return 0
   fi
   pri=$(pushover_priority "$severity")
-  curl -fsS -m 15 \
-    -K <(printf '%s\n' "$_po_cfg") \
-    --form-string "title=${title}" \
-    --form-string "message=${body}" \
-    --form-string "priority=${pri}" \
-    https://api.pushover.net/1/messages.json >/dev/null 2>&1 \
-    || log "warn: pushover notify failed (curl exit $?; bad config or network)"
+  local title_esc body_esc
+  title_esc=$(curl_cfg_escape "$title")
+  body_esc=$(curl_cfg_escape "$body")
+  # Token and user key travel in the curl config on stdin, not in argv.
+  if ! {
+    printf 'url = "https://api.pushover.net/1/messages.json"\n'
+    printf '%s\n' "$_po_cfg"
+    printf 'form-string = "title=%s"\n' "$title_esc"
+    printf 'form-string = "message=%s"\n' "$body_esc"
+    printf 'form-string = "priority=%s"\n' "$pri"
+  } | curl -fsS -m 15 -K - >/dev/null 2>&1; then
+    log "warn: pushover notify failed (curl exit $?; bad config or network)"
+  fi
 }
 
 alert_warn() {
@@ -1028,7 +1096,9 @@ emit_root_alert() {
   local phase="$2"
   local host body
   host=$(hostname)
-  if [[ "$phase" == "after" && "$level" == "crit" ]]; then
+  if [[ "$level" == "unknown" ]]; then
+    body="disk unknown on ${host}"
+  elif [[ "$phase" == "after" && "$level" == "crit" ]]; then
     body="disk STILL critical after reclaim used=${USED_PCT}% free=${FREE_GB}G on ${host} $(disk_alert_suffix). Needs a human if this repeats."
   elif [[ "$level" == "crit" ]]; then
     body="disk critical used=${USED_PCT}% free=${FREE_GB}G on ${host} $(disk_alert_suffix)"
@@ -1037,6 +1107,7 @@ emit_root_alert() {
   else
     body="disk recovered used=${USED_PCT}% free=${FREE_GB}G on ${host}"
   fi
+  log "root-alert phase=${phase} level=${level} ${body}"
   emit_alert "disk:/" "$level" "$body"
 }
 
@@ -1086,9 +1157,9 @@ apply_prune() {
 
 main() {
   mkdir -p "$STATE_DIR"
-  log "start root=$ROOT_PATH warn=${WARN_USED_PCT}%/${WARN_FREE_GB}G crit=${CRIT_USED_PCT}%/${CRIT_FREE_GB}G dry_run=$DRY_RUN reminder=${ALERT_REMINDER_SEC}s"
+  log "start path=/ warn=${WARN_USED_PCT}%/${WARN_FREE_GB}G crit=${CRIT_USED_PCT}%/${CRIT_FREE_GB}G dry_run=$DRY_RUN reminder=${ALERT_REMINDER_SEC}s"
   collect_host_metrics || return 1
-  log "disk: path=/ used=${USED_PCT}% (${USED_GB}G/${TOTAL_GB}G) free=${FREE_GB}G level=${M_ROOT_LEVEL}"
+  log "disk: path=/ used=${USED_PCT:-unknown}% (${USED_GB:-unknown}G/${TOTAL_GB:-unknown}G) free=${FREE_GB:-unknown}G level=${M_ROOT_LEVEL}"
   report_sqlite
   report_backup_dir
   report_docker
@@ -1106,8 +1177,11 @@ main() {
 
   local _prev_used_pct="${USED_PCT:-}" _prev_free_gb="${FREE_GB:-}"
   local _prev_used_gb="${USED_GB:-}" _prev_total_gb="${TOTAL_GB:-}"
+  emit_root_alert "$root_level" "live"
   apply_prune "$root_level"
-  HYGIENE_POST_PRUNE_READ=1 read_metric_texts
+  HYGIENE_POST_PRUNE_READ=1
+  read_metric_texts
+  unset HYGIENE_POST_PRUNE_READ
   local level_after
   if fill_mount_metrics "/" root ROOT; then
     level_after="$M_ROOT_LEVEL"
