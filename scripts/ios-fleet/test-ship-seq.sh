@@ -234,6 +234,7 @@ run_ship() {
     FLEET_SECRETS="${FAKE_BIN}/fleet-secrets" \
     ASC_KEY_ID=fake \
     IOS_FLEET_NODE="${FAKE_BIN}/node" \
+    IOS_FLEET_STUB_BIN="${FAKE_BIN}" \
     FAKE_ASC_PATCH="$FAKE_ASC_PATCH" \
     FAKE_ASC_FLOOR="$FAKE_ASC_FLOOR" \
     FAKE_RELEASED="${FAKE_RELEASED:-}" \
