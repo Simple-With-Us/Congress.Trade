@@ -8,7 +8,9 @@
 # Safe defaults:
 #   - never restarts docker / never host reboot
 #   - never prunes named volumes (opt-in only via PRUNE_VOLUMES=1)
-#   - skips prune while Coolify/nixpacks/buildkit is actively building
+#   - skips prune while a Coolify deploy is in progress (helper container
+#     or application_deployment_queues in_progress/queued)
+#   - warn/crit image and builder prunes keep objects younger than IMAGE_PRUNE_UNTIL
 #   - rate-limits aggressive prunes
 #   - always logs df + docker system df + CT SQLite/WAL sizes
 #
@@ -27,6 +29,7 @@
 #   WARN_FREE_GB              default 15
 #   CRIT_FREE_GB              default 8
 #   LIGHT_BUILDER_UNTIL       default 12h   (unused build cache older than this)
+#   IMAGE_PRUNE_UNTIL         default 1h    (warn/crit prune skips newer images/cache)
 #   AGGRESSIVE_COOLDOWN_SEC   default 1800
 #   PRUNE_VOLUMES             default 0     (1 = docker volume prune -f unused only)
 #   CT_DATA_DIR               default /data/congress-trade
@@ -48,6 +51,7 @@ CRIT_USED_PCT="${CRIT_USED_PCT:-90}"
 WARN_FREE_GB="${WARN_FREE_GB:-15}"
 CRIT_FREE_GB="${CRIT_FREE_GB:-8}"
 LIGHT_BUILDER_UNTIL="${LIGHT_BUILDER_UNTIL:-12h}"
+IMAGE_PRUNE_UNTIL="${IMAGE_PRUNE_UNTIL:-1h}"
 AGGRESSIVE_COOLDOWN_SEC="${AGGRESSIVE_COOLDOWN_SEC:-1800}"
 PRUNE_VOLUMES="${PRUNE_VOLUMES:-0}"
 CT_DATA_DIR="${CT_DATA_DIR:-/data/congress-trade}"
@@ -96,7 +100,17 @@ log() {
 now() { date +%s; }
 
 is_deploy_active() {
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -Eqi 'nixpacks|coolify-builder|buildkit'; then
+  # Dockerfile-pack deploys (Socratic-Trade, Usage Monitor) run in a
+  # coollabsio/coolify-helper container named with the deployment uuid, not
+  # nixpacks/coolify-builder/buildkit. The previous name-only check missed
+  # that helper on 2026-11-12, and soft_prune deleted the just-built unused
+  # tag before compose up (ST outage ~10:33Z).
+  if docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -Eqi 'nixpacks|coolify-builder|buildkit|coolify-helper'; then
+    return 0
+  fi
+  if docker exec coolify-db psql -U coolify -d coolify -tAc \
+    "SELECT 1 FROM application_deployment_queues WHERE status IN ('in_progress','queued') LIMIT 1;" \
+    2>/dev/null | grep -q 1; then
     return 0
   fi
   return 1
@@ -296,9 +310,11 @@ light_prune() {
 }
 
 soft_prune() {
-  # Monet's recovery path (unused images + full builder cache).
-  run_cmd docker builder prune -af || true
-  run_cmd docker image prune -af || true
+  # Unused images + builder cache, but never objects younger than
+  # IMAGE_PRUNE_UNTIL (default 1h). A just-built Coolify tag has no
+  # container until compose up, so unfiltered -af would delete it.
+  run_cmd docker builder prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
+  run_cmd docker image prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
   if [[ "$PRUNE_VOLUMES" == "1" ]]; then
     run_cmd docker volume prune -f || true
   fi
@@ -306,14 +322,16 @@ soft_prune() {
 
 aggressive_prune() {
   # Still avoids volumes unless PRUNE_VOLUMES=1.
-  run_cmd docker builder prune -af || true
-  run_cmd docker image prune -af || true
-  run_cmd docker container prune -f || true
+  # Keep objects younger than IMAGE_PRUNE_UNTIL so an in-flight deploy
+  # cannot lose its freshly built image (see soft_prune).
+  run_cmd docker builder prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
+  run_cmd docker image prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
+  run_cmd docker container prune -f --filter "until=${IMAGE_PRUNE_UNTIL}" || true
   if [[ "$PRUNE_VOLUMES" == "1" ]]; then
     run_cmd docker volume prune -f || true
   fi
   # system prune without --volumes keeps named volumes
-  run_cmd docker system prune -af || true
+  run_cmd docker system prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
 }
 
 level_for() {
