@@ -209,6 +209,12 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      - name: Inode usage report offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/inode-usage-report.sh
+          bash scripts/ops/test-inode-usage-report.sh
+
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
