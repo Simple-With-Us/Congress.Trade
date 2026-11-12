@@ -32,11 +32,17 @@ import {
 } from './extractRouting.ts';
 import {
   handCheckReviewReason,
+  isVisionOrOcrExtraction,
   mergeHandCheckIntoReviewReason,
   NEEDS_HAND_CHECK_MAC_VISION,
   NEEDS_HAND_CHECK_SCANNED_VISION,
   requiresHandCheckBeforePublish,
 } from './handCheckPublish.ts';
+import {
+  assessVisionDegenerate,
+  mergeVisionDegenerateReason,
+  type VisionDegenerateAssessment,
+} from './visionDegenerateGuard.ts';
 import type { ExtractorParseDisposition } from '../extractors/types.ts';
 import {
   closeUnreadableExecutive,
@@ -95,6 +101,8 @@ import {
   isVisionTxSource,
   supersededPipelineSourcesSql,
 } from './sourceSupersede.ts';
+import { proposedMatchesLivePipeline } from '../admin/publishContentHash.ts';
+import { recordReviewRevisionAudit } from '../shared/reviewRevisionAudit.ts';
 
 /**
  * Per-tx confidence at or above this threshold is trusted for auto-publish. If a
@@ -470,6 +478,7 @@ export async function normalize(
     && !looksLikeNothingToReport(p.assetName)
   );
   const droppedFormChrome = parsed.length - usableParsed.length;
+  let visionDegenerateAssessment: VisionDegenerateAssessment | null = null;
   const sawOgePart7ExplicitNone = looksLikeOgePart7ExplicitNone(sourceText)
     || parsed.some((p) =>
       looksLikeOgePart7ExplicitNone(p.assetName) || looksLikeOgePart7ExplicitNone(p.rawText)
@@ -480,6 +489,11 @@ export async function normalize(
 
   const houseMember = await loadHouseMemberContext(env, filing, sourceText);
   const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source, houseMember);
+  if (isVisionOrOcrExtraction(extractorName, source) && usableParsed.length > 0) {
+    visionDegenerateAssessment = assessVisionDegenerate(usableParsed, {
+      resolvedTickers: allFlagged.map((f) => f.tx.ticker ?? null),
+    });
+  }
   const deletedFlagged = allFlagged.filter((f) => isDeletedFilingStatus(f.tx.filingStatus));
   const flagged = allFlagged.filter((f) => !isDeletedFilingStatus(f.tx.filingStatus));
 
@@ -585,6 +599,9 @@ export async function normalize(
     && reviewSnapshot?.resolved !== 1
     && flagged.length > 0;
   if (handCheckRequired) {
+    needsReview = true;
+  }
+  if (visionDegenerateAssessment?.degenerate) {
     needsReview = true;
   }
 
@@ -804,6 +821,9 @@ export async function normalize(
           + `(${rowCompleteness.missingCount} missing, evidence=${rowCompleteness.evidence}); held for review`,
       );
     }
+    if (visionDegenerateAssessment?.degenerate) {
+      reason = mergeVisionDegenerateReason(reason);
+    }
     const routed = await routeToReview(
       env,
       filing,
@@ -820,8 +840,12 @@ export async function normalize(
           || (filing.chamber === 'executive' && meta?.parseDisposition === 'unreadable')
           || handCheckRequired
           || rowsIncomplete
+          || visionDegenerateAssessment?.degenerate
             ? reason
             : undefined,
+        payloadExtras: visionDegenerateAssessment?.degenerate
+          ? { visionDegenerate: visionDegenerateAssessment }
+          : undefined,
       },
       reviewSnapshot,
     );
@@ -1602,6 +1626,13 @@ async function persistNormalizedPublish(
       `refusing to publish ${transactions.length} transactions; limit is ${MAX_PUBLISH_TRANSACTIONS_PER_FILING}`,
     );
   }
+
+  const pipelineMatch = await proposedMatchesLivePipeline(env.DB, docId, transactions);
+  const skipRevisionBump = pipelineMatch.identical;
+  const reviewRevisionSql = skipRevisionBump
+    ? 'review_revision = review_revision'
+    : 'review_revision = review_revision + 1';
+
   const insertRowsJson = transactionInsertJson(transactions);
   const rowKeysJson = JSON.stringify(transactions.map((tx) => tx.rowKey ?? ''));
   const incomingSource = transactions[0]?.source ?? 'primary';
@@ -1725,7 +1756,7 @@ async function persistNormalizedPublish(
                 agreement_suppression_reason = NULL,
                 resolution_kind = 'published',
                 resolution_reason = 'auto_published',
-                review_revision = review_revision + 1
+                ${reviewRevisionSql}
           WHERE doc_id = ? AND resolved = 1 AND review_revision = ?
             AND ${exactLiveSet}`,
         [
@@ -1745,7 +1776,7 @@ async function persistNormalizedPublish(
                 resolution_kind = 'published',
                 resolution_reason = 'auto_published',
                 resolved_at = CURRENT_TIMESTAMP,
-                review_revision = review_revision + 1
+                ${reviewRevisionSql}
           WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
             AND ${exactLiveSet}`,
         [
@@ -1856,8 +1887,32 @@ async function persistNormalizedPublish(
     }
     throw err;
   }
-  if ((results[transitionIndex]?.meta?.changes ?? 0) === 0) {
-    return { published: false, insertedIds: [] };
+  const transitionChanges = results[transitionIndex]?.meta?.changes ?? 0;
+  if (skipRevisionBump) {
+    await recordReviewRevisionAudit(env.DB, {
+      docId,
+      revision: review?.review_revision ?? 1,
+      trigger: 'pipeline_publish_identical_noop',
+      contentHash: pipelineMatch.contentHash,
+      detail: {
+        extractor: metadata.extractor,
+        modelVersion: metadata.modelVersion,
+        resolved: review?.resolved ?? null,
+        transitionChanges,
+      },
+      createdAt: nowIso,
+    });
+  }
+  if (transitionChanges === 0) {
+    const existingIds = skipRevisionBump
+      ? (await all<{ id: string }>(
+        env.DB,
+        `SELECT id FROM transactions
+          WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL}) AND deprecated_at IS NULL`,
+        [docId],
+      )).map((row) => row.id)
+      : [];
+    return { published: false, insertedIds: existingIds };
   }
 
   const insertedCount = results[0]?.meta?.changes ?? 0;
@@ -1919,6 +1974,7 @@ async function routeToReview(
     extractor: string | null;
     modelVersion: string | null;
     reasonOverride?: string;
+    payloadExtras?: Record<string, unknown>;
   },
   review: ReviewSnapshot | null,
 ): Promise<boolean> {
@@ -1966,6 +2022,7 @@ async function routeToReview(
         if (f.flags.includes('grid_type_unmarked')) row.txType = null;
         return row;
       }),
+    ...(meta.payloadExtras ?? {}),
   });
   const decisionPayload = JSON.stringify({
     minConfidence,

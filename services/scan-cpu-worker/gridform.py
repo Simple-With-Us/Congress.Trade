@@ -36,6 +36,15 @@ AMOUNT_COLUMNS: Tuple[Tuple[int, str, Optional[int], Optional[int]], ...] = (
     (18, "J", 50000001, None),
     (19, "K", None, None),
 )
+# Printed PTR: owner, asset, P/S/E, two dates, amount brackets A–J. No
+# capital-gains column, no partial column, and no bracket K.
+OFFICIAL_PTR_TEMPLATE: Tuple[int, ...] = (
+    164, 242, 675, 716, 756, 795, 900, 1005, 1061, 1117, 1172, 1228, 1284, 1340, 1396, 1452, 1508, 1564,
+)
+OFFICIAL_PTR_MIN_HITS = 16
+OFFICIAL_PTR_MIN_SCALE = 0.96
+OFFICIAL_PTR_MAX_SCALE = 1.05
+OFFICIAL_MARK_SCALE = 1.1
 MARK_SCORE_MIN = 0.45
 MARK_AMBIGUITY_GAP = 0.08
 GRID_MIN_INLIERS = 14
@@ -49,6 +58,7 @@ class ColumnFit:
     offset: float
     xs: List[int]
     inliers: int
+    kind: str = "schedule"
 
 
 @dataclass
@@ -180,7 +190,71 @@ def fit_column_lines(detected: Sequence[int], min_scale: float = 0.5) -> Optiona
         return None
     _count, _error, scale, offset, template = best
     xs = [int(round(offset + scale * value)) for value in template]
-    return ColumnFit(scale, offset, xs, best[0])
+    return ColumnFit(scale, offset, xs, best[0], "schedule")
+
+
+def expand_official_ptr_rules(rules: Sequence[int]) -> List[int]:
+    """Map 18 printed rules onto the 21 schedule slots. Missing columns share a boundary."""
+    def rule(index: int) -> int:
+        return int(rules[index] if index < len(rules) else rules[-1])
+
+    return [
+        rule(0), rule(1), rule(2), rule(3), rule(4),
+        rule(5), rule(5), rule(5),
+        rule(6),
+        rule(7), rule(8), rule(9), rule(10), rule(11), rule(12), rule(13), rule(14), rule(15), rule(16),
+        rule(17), rule(17),
+    ]
+
+
+def fit_official_ptr_lines(detected: Sequence[int]) -> Optional[ColumnFit]:
+    """Fit the printed PTR. A hit is a template rule with a line within 12px.
+
+    Both outer rules have to hit, and the attached schedule stays under the
+    hit floor so this fit does not steal those pages.
+    """
+    if len(detected) < 8:
+        return None
+    det = np.asarray([float(value) for value in detected], dtype=np.float64)
+    tmpl = np.asarray(OFFICIAL_PTR_TEMPLATE, dtype=np.float64)
+    pair_i, pair_j = np.triu_indices(int(det.shape[0]), 1)
+    left, right = np.triu_indices(int(tmpl.shape[0]), 1)
+    denom = tmpl[right] - tmpl[left]
+    keep = denom != 0
+    left, denom = left[keep], denom[keep]
+    if denom.size == 0:
+        return None
+    span = det[pair_j] - det[pair_i]
+    scale = span[:, None] / denom[None, :]
+    offset = det[pair_i][:, None] - scale * tmpl[left][None, :]
+    valid = (scale >= OFFICIAL_PTR_MIN_SCALE) & (scale <= OFFICIAL_PTR_MAX_SCALE)
+    flat_scale = np.ascontiguousarray(scale[valid])
+    flat_offset = np.ascontiguousarray(offset[valid])
+    if flat_scale.size == 0:
+        return None
+    best: Optional[Tuple[int, float, float, float]] = None
+    for start in range(0, int(flat_scale.shape[0]), 2048):
+        end = min(int(flat_scale.shape[0]), start + 2048)
+        sc = flat_scale[start:end]
+        off = flat_offset[start:end]
+        predicted = off[:, None] + sc[:, None] * tmpl[None, :]
+        nearest = np.abs(predicted[:, :, None] - det[None, None, :]).min(axis=2)
+        hit = nearest < 12
+        hits = hit.sum(axis=1)
+        err = (nearest * hit).sum(axis=1)
+        endpoints = hit[:, 0] & hit[:, -1]
+        for index in range(end - start):
+            if not bool(endpoints[index]):
+                continue
+            count = int(hits[index])
+            error = float(err[index])
+            if best is None or count > best[0] or (count == best[0] and error < best[1]):
+                best = (count, error, float(sc[index]), float(off[index]))
+    if best is None or best[0] < OFFICIAL_PTR_MIN_HITS:
+        return None
+    _count, _error, scale_value, offset_value = best
+    rules = [int(round(offset_value + scale_value * value)) for value in OFFICIAL_PTR_TEMPLATE]
+    return ColumnFit(scale_value, offset_value, expand_official_ptr_rules(rules), best[0], "official")
 
 
 def _best(scores: Sequence[float], indexes: Sequence[int]) -> Optional[Tuple[int, float, float]]:
@@ -618,6 +692,37 @@ def _split_form_token(token: str) -> List[str]:
     return pieces
 
 
+_TICKER_DENY = {
+    "INC", "CMN", "LLC", "PLC", "CORP", "CO", "ETF", "LTD", "USD", "USD0", "ADR",
+    "COM", "FUND", "CLASS", "HLDG", "STOCK", "TRUST", "THE", "AND", "NEW", "CL",
+    "COMMON", "SHARES", "INDEX", "LINKED", "COMPANY",
+}
+
+
+def split_bare_ticker(text: str, spaces: int = 2) -> Tuple[Optional[str], str]:
+    """Same ticker split as houseGridForm.ts splitBareTicker.
+
+    One space peels a symbol only when the previous word is a form word or
+    contains a lowercase letter. "US TREASURY NOTE" keeps NOTE.
+    """
+    found = re.search(r"\(([A-Z]{1,5})\)", text)
+    if found:
+        return found.group(1), text
+    wide = re.search(r"^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$", text)
+    if wide and wide.group(2) not in _TICKER_DENY:
+        return wide.group(2), wide.group(1)
+    if spaces != 1:
+        return None, text
+    narrow = re.search(r"^(.*\S)[ \t]+([A-Z]{2,5})[ \t]*$", text)
+    if not narrow or narrow.group(2) in _TICKER_DENY:
+        return None, text
+    previous = narrow.group(1).strip().split()[-1]
+    letters = re.sub(r"[^A-Za-z]", "", previous).upper()
+    if letters not in _TICKER_DENY and not re.search(r"[a-z]", previous):
+        return None, text
+    return narrow.group(2), narrow.group(1)
+
+
 def clean_grid_asset_name(text: str) -> str:
     """Same form-word splits as houseGridForm.ts cleanGridAssetName."""
     tokens = [token for token in re.sub(r"[|`\u00b4\u2018\u2019_]+", " ", text).split() if token]
@@ -643,7 +748,7 @@ def clean_grid_asset_name(text: str) -> str:
                 continue
             if words and words[-1] == piece:
                 continue
-            if len(piece) == 1 and not re.fullmatch(r"[A-Z]", piece):
+            if len(piece) == 1 and piece != "&" and not re.fullmatch(r"[A-Z]", piece):
                 continue
             words.append(piece)
     return re.sub(r"\s+", " ", " ".join(words)).strip()
@@ -711,24 +816,119 @@ def row_confidence(marks: ClassifiedMarks, asset_conf: float, has_date: bool, as
     )
 
 
+def official_ptr_row_bands(gray: np.ndarray, xs: Sequence[int]) -> List[Tuple[int, int]]:
+    """Amount-column rules at the data pitch. The longest run is the table.
+
+    The sample row is shorter than that pitch. Dollar-range header ink is
+    thicker than a rule and is not a trust bar.
+    """
+    if len(xs) < 10:
+        return []
+    x0 = max(0, int(xs[9]))
+    x1 = min(gray.shape[1], int(xs[-1]))
+    if x1 - x0 < 40:
+        return []
+    dark = (gray[:, x0:x1] < 200).mean(axis=1) > 0.22
+    groups: List[List[int]] = []
+    for y, on in enumerate(dark.tolist()):
+        if not on:
+            continue
+        if groups and y - groups[-1][-1] <= 3:
+            groups[-1].append(y)
+        else:
+            groups.append([y])
+    rules = [int(round(sum(group) / len(group))) for group in groups if len(group) <= 8]
+    if len(rules) < 3:
+        return []
+    gaps = [rules[index + 1] - rules[index] for index in range(len(rules) - 1)]
+    pitch_gaps = [gap for gap in gaps if 45 <= gap <= 90]
+    chosen = pitch_gaps if len(pitch_gaps) >= 3 else [gap for gap in gaps if 24 <= gap <= 140]
+    if not chosen:
+        return []
+    pitch = float(np.median(np.asarray(chosen, dtype=np.float64)))
+    if not pitch > 0:
+        return []
+    candidates: List[Tuple[int, int]] = []
+    for index in range(len(rules) - 1):
+        y0, y1 = rules[index], rules[index + 1]
+        height = y1 - y0
+        if height < pitch * 0.8 or height > pitch * 1.35:
+            continue
+        sample = gray[y0 + 2:y1 - 2:2, x0:x1:4]
+        if sample.size and float((sample < 150).mean()) > 0.45:
+            continue
+        candidates.append((y0, y1))
+    runs: List[List[Tuple[int, int]]] = []
+    run: List[Tuple[int, int]] = []
+    for band in candidates:
+        if run and band[0] != run[-1][1]:
+            runs.append(run)
+            run = []
+        run.append(band)
+    if run:
+        runs.append(run)
+    runs.sort(key=lambda item: (len(item), item[0][0] if item else 0), reverse=True)
+    return runs[0] if runs else []
+
+
+_SAMPLE_SQUASHED = re.compile(r"^(?:ex[a-z]{0,10})?(?:manufactur[a-z]{0,8}|mfg|mega|meg)corp(?:commonstock)?$")
+_SAMPLE_DATES = {"2012-08-14", "2020-02-05", "2020-05-02"}
+
+
+def _official_grid_chrome(asset: str, tx_date: Optional[str]) -> bool:
+    """Header, sample, and attachment lines. Marks do not keep them."""
+    if re.search(
+        r"provide full name|ticker symbol|full asset name|filer notes|footnote|amount of transaction|type of trans|publicly disclosed",
+        asset,
+        re.I,
+    ):
+        return True
+    if re.search(r"\bsee\s+attach(?:ment|ments)\b", asset, re.I):
+        return True
+    letters = re.sub(r"[^a-z]", "", asset.lower())
+    if letters and _SAMPLE_SQUASHED.fullmatch(letters):
+        return True
+    if tx_date in _SAMPLE_DATES:
+        return True
+    return False
+
+
+def _plan_columns(gray: np.ndarray) -> Optional[ColumnFit]:
+    height = gray.shape[0]
+    detected = detect_vertical_lines(gray, int(height * 0.28), int(height * 0.92))
+    official = fit_official_ptr_lines(detected)
+    if official is not None:
+        return official
+    fit = fit_column_lines(detected)
+    if fit is not None and fit.inliers >= GRID_MIN_INLIERS:
+        return fit
+    fallback = detect_vertical_lines(gray, int(height * 0.05), int(height * 0.72), 0.15)
+    official = fit_official_ptr_lines(fallback)
+    if official is not None:
+        return official
+    fit = fit_column_lines(fallback, 0.42)
+    if fit is not None and fit.inliers >= GRID_MIN_INLIERS:
+        return fit
+    return None
+
+
 def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> Optional[List[GridRow]]:
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
     height = gray.shape[0]
-    detected = detect_vertical_lines(gray, int(height * 0.28), int(height * 0.92))
-    fit = fit_column_lines(detected)
-    if fit is None or fit.inliers < GRID_MIN_INLIERS:
-        fit = fit_column_lines(
-            detect_vertical_lines(gray, int(height * 0.05), int(height * 0.72), 0.15),
-            0.42,
-        )
-    if fit is None or fit.inliers < GRID_MIN_INLIERS or len(fit.xs) < 21:
+    fit = _plan_columns(gray)
+    if fit is None or len(fit.xs) < 21:
         return None
-    template = x_template_for_fit(fit.scale)
+    template = x_template_for_fit(fit.scale * OFFICIAL_MARK_SCALE if fit.kind == "official" else fit.scale)
     xs = fit.xs
-    bands, section_bars = row_bands(gray, xs)
+    if fit.kind == "official":
+        bands = official_ptr_row_bands(gray, xs)
+        section_bars = 0
+    else:
+        bands, section_bars = row_bands(gray, xs)
     # The cover prints a sample grid under the filer block and has no trust bar.
-    if section_bars == 0:
+    # The printed PTR has that header rule and is not a cover.
+    if fit.kind != "official" and section_bars == 0:
         x0, x1 = int(xs[7]), int(xs[-1])
         limit = int(height * 0.15)
         if x1 - x0 >= 20 and limit > 0:
@@ -740,6 +940,10 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
         scores: List[float] = []
         for column in range(2, 20):
             if column in (7, 8):
+                scores.append(0.0)
+                continue
+            # Capital gains, partial, and bracket K are not printed on the PTR grid.
+            if xs[column + 1] - xs[column] < 16:
                 scores.append(0.0)
                 continue
             cell = gray[top + 2:bot - 2, xs[column] + 4:xs[column + 1] - 4]
@@ -770,6 +974,11 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
         has_mark = marks.type_reason != "unmarked" or marks.amount_reason != "unmarked" or marks.cap_gains
         if not asset and not has_mark:
             continue
+        if fit.kind == "official":
+            if _official_grid_chrome(asset, trade_date):
+                continue
+            if marks.type_reason != "ok" or not asset.strip():
+                continue
         notes = [f"grid page {page}"]
         if marks.partial:
             notes.append("partial transaction box marked")
@@ -785,19 +994,7 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
             notes.append("amount column K marked")
         warnings = ["grid_type_unmarked"] if marks.type_reason != "ok" or marks.tx_type is None else []
         confidence = row_confidence(marks, asset_conf, trade_date is not None, asset)
-        ticker = None
-        found = re.search(r"\(([A-Z]{1,5})\)", asset)
-        bare = re.search(r"^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$", asset)
-        ticker_deny = {
-            "INC", "CMN", "LLC", "PLC", "CORP", "CO", "ETF", "LTD", "USD", "USD0", "ADR",
-            "COM", "FUND", "CLASS", "HLDG", "STOCK", "TRUST", "THE", "AND", "NEW", "CL",
-            "COMMON", "SHARES", "INDEX", "LINKED", "COMPANY",
-        }
-        if found:
-            ticker = found.group(1)
-        elif bare and bare.group(2) not in ticker_deny:
-            ticker = bare.group(2)
-            asset = bare.group(1)
+        ticker, asset = split_bare_ticker(asset, 1 if fit.kind == "official" else 2)
         cleaned = clean_grid_asset_name(asset)
         rows.append(GridRow(
             asset_name=cleaned or asset or f"(unreadable asset p{page})",
