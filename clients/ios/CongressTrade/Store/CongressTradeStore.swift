@@ -1786,6 +1786,15 @@ enum DeliveryMode: String, CaseIterable, Identifiable {
     case webhook = "Webhook"
 
     var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .sse:
+            return "Live Stream"
+        case .webhook:
+            return "Webhook"
+        }
+    }
 }
 
 /// What the Trades header is allowed to say about "how many trades".
