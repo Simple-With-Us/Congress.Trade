@@ -432,7 +432,10 @@ def limit_label(source, limit_bytes):
         return "n/a"
     if limit_bytes is None:
         return "none"
-    return fmt_bytes(limit_bytes)
+    label = fmt_bytes(limit_bytes)
+    if source == "inspect_total":
+        return label + " mem+swap"
+    return label
 
 
 def cell(value):
@@ -576,13 +579,20 @@ for obj in stats_rows:
         elif reservation_source == "unknown" and inspected_reservation is not None and inspected_reservation <= 0:
             reservation_source = "none"
 
-    # HostConfig.MemorySwap of 0 means Docker was not given a swap cap.
-    # A negative value is Docker's unlimited sentinel. Neither is a zero-byte cap.
+    # HostConfig.MemorySwap is memory plus swap, not the swap ceiling.
+    # 0 means Docker was not given a cap. A negative value is unlimited.
+    # Subtract a positive memory cap so SWAP_LIMIT stays in swap bytes.
+    # Without that cap, keep the total and mark the source inspect_total.
     if swap_limit_source == "unknown" and info is not None:
         inspected_swap = info["memory_swap"]
+        memory_cap = info["memory"]
         if inspected_swap is not None and inspected_swap > 0:
-            swap_limit_bytes = inspected_swap
-            swap_limit_source = "inspect"
+            if memory_cap is not None and memory_cap > 0 and inspected_swap >= memory_cap:
+                swap_limit_bytes = inspected_swap - memory_cap
+                swap_limit_source = "inspect"
+            else:
+                swap_limit_bytes = inspected_swap
+                swap_limit_source = "inspect_total"
         elif inspected_swap is not None and inspected_swap < 0:
             swap_limit_bytes = None
             swap_limit_source = "none"

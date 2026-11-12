@@ -154,7 +154,7 @@ write_status 201 python 40960
 # sqlite-web: limit comes from inspect because memory.max is absent. Swap file
 # is absent, so swap stays unknown rather than zero.
 SQL_ID="cccccccccccc"
-write_inspect "$SQL_ID" "$SQL_ID" "/congress-sqlite-web" "congress-sqlite-web:latest" "536870912" "4" "301" "134217728" "0"
+write_inspect "$SQL_ID" "$SQL_ID" "/congress-sqlite-web" "congress-sqlite-web:latest" "536870912" "4" "301" "134217728" "1073741824"
 SQL_DIR="$(scope_dir "$SQL_ID")"
 mkdir -p "$SQL_DIR"
 printf '943718400\n' >"${SQL_DIR}/memory.current"
@@ -293,7 +293,8 @@ assert sql["memory_limit_source"] == "inspect"
 assert sql["memory_reservation_bytes"] == 134217728
 assert sql["memory_reservation_source"] == "inspect"
 assert sql["swap_bytes"] is None
-assert sql["swap_limit_source"] == "unknown"
+assert sql["swap_limit_bytes"] == 536870912
+assert sql["swap_limit_source"] == "inspect"
 assert sql["restart_count"] == 4
 
 proxy = by_name["unlimited-proxy"]
@@ -491,7 +492,7 @@ PY
 # Unsafe ids are not passed to docker. A cgroup path that walks out of the
 # root, and a scope directory that is a symlink to the outside, are not read.
 LINK_ID="fedcba987654"
-write_inspect "$LINK_ID" "$LINK_ID" "/link-escape" "link:latest" "0" "0" "701"
+write_inspect "$LINK_ID" "$LINK_ID" "/link-escape" "link:latest" "0" "0" "701" "0" "2097152"
 write_cgroup_ptr 701 "0::/system.slice/link.scope"
 printf '%s\n' \
   "{\"ID\":\"${ESCAPE_ID}\",\"Name\":\"escape\",\"MemUsage\":\"7MiB / 1MiB\"}" \
@@ -511,6 +512,8 @@ assert by_name["escape"]["swap_bytes"] is None
 assert by_name["escape"]["memory_current_bytes"] is None
 assert by_name["link-escape"]["swap_bytes"] is None
 assert by_name["link-escape"]["memory_limit_source"] == "none"
+assert by_name["link-escape"]["swap_limit_bytes"] == 2097152
+assert by_name["link-escape"]["swap_limit_source"] == "inspect_total"
 assert "bad-id" in by_name
 log = open(sys.argv[2], encoding="utf-8").read()
 assert "touch" not in log
@@ -580,7 +583,7 @@ assert row["memory_limit_source"] == "inspect"
 assert report["totals"]["unlimited"] == 0
 assert row["memory_reservation_bytes"] == 402653184
 assert row["memory_reservation_source"] == "inspect"
-assert row["swap_limit_bytes"] == 2147483648
+assert row["swap_limit_bytes"] == 1073741824
 assert row["swap_limit_source"] == "inspect"
 assert row["swap_bytes"] == 0
 print("ok   cgroup max keeps a positive inspect memory limit")
