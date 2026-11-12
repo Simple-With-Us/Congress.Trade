@@ -139,6 +139,13 @@ describe('peerPriceCatchUpAnchoredRunCap', () => {
     expect(peerPriceCatchUpGate(morning, NOW, { maxRuns: anchored })).toBe('ok');
     expect(peerPriceCatchUpGate(morning, NOW, { maxRuns: peerPriceCatchUpEffectiveRunCap(1500) })).toBe('session-cap');
   });
+
+  it('treats stored runCap 0 as unset when the pending probe fails', () => {
+    const legacy = { ...freshPeerPriceCatchUpState(SESSION, NOW), runCap: 0, runs: 0 };
+    const anchored = peerPriceCatchUpAnchoredRunCap(legacy, null);
+    expect(anchored).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    expect(peerPriceCatchUpGate(legacy, NOW, { maxRuns: anchored })).toBe('ok');
+  });
 });
 
 describe('peerPriceCatchUpGate', () => {

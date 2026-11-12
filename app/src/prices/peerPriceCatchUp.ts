@@ -228,14 +228,21 @@ export function peerPriceCatchUpEffectiveRunCap(pending: number): number {
  * backlog drains to 1500 and park runs 9–11 with work still pending.
  * A failed pending probe keeps the stored cap, or the floor of 8.
  */
+function peerPriceCatchUpStoredRunCap(state: PeerPriceCatchUpState): number {
+  // Legacy and day-roll states store 0 before the first successful pending probe;
+  // ?? would keep 0 and park the whole budget day as session-cap.
+  return state.runCap > 0 ? state.runCap : PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION;
+}
+
 export function peerPriceCatchUpAnchoredRunCap(
   state: PeerPriceCatchUpState,
   pending: number | null,
 ): number {
+  const stored = peerPriceCatchUpStoredRunCap(state);
   const current = pending === null
-    ? (state.runCap ?? PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION)
+    ? stored
     : peerPriceCatchUpEffectiveRunCap(pending);
-  return Math.max(state.runCap ?? 0, current);
+  return Math.max(stored, current);
 }
 
 export function peerPriceCatchUpGate(
