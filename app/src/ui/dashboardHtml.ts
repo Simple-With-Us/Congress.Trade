@@ -66,7 +66,7 @@ function speedProofSectionHtml(placement: 'delivery' | 'trends' | 'admin'): stri
   <div class="section speed-proof" id="${sectionId}"${admin ? '' : ' hidden'} style="margin-top:24px; padding:24px 20px;">
     <div class="speed-head">
       <div>
-        <h3 style="margin:0 0 16px 0">Filing Latency Comparison <span class="info-tip" tabindex="0" aria-label="${infoTip}" title="${infoTip}">ⓘ</span></h3>
+        <h3 style="margin:0 0 16px 0">Filing Latency Comparison <button type="button" class="info-tip" aria-label="${infoTip}" title="${infoTip}">ⓘ</button></h3>
       </div>
       <span class="note" id="${updatedId}" style="white-space:nowrap"></span>
     </div>
@@ -126,8 +126,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
 <meta name="twitter:image" content="%TWITTER_IMAGE%" />
 <!-- Icons / PWA -->
 <link rel="icon" href="/favicon.ico?v=10" sizes="32x32" />
-<link rel="icon" type="image/png" href="/icon-192.png?v=10" sizes="192x192" />
-<link rel="icon" type="image/png" href="/icon-512.png?v=10" sizes="512x512" />
+<link rel="icon" type="image/png" href="/icon-192.png?v=10" sizes="192x192" /><!-- 512 stays manifest-only (CT-2459): a document icon link downloads 140 KB nobody renders at that size. -->
 <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=10" />
 <link rel="manifest" href="/site.webmanifest" />
 <script>
@@ -175,21 +174,25 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     } catch (e) {}
   })();
 </script>
+<link rel="preload" as="font" type="font/woff2" crossorigin href="/assets/inter-400.woff2">
+<link rel="preload" as="font" type="font/woff2" crossorigin href="/assets/inter-600.woff2">
 <link rel="stylesheet" href="/assets/dashboard.css?v=${DASHBOARD_CSS_VERSION}">
 </head>
 <body>
+<a class="skip-link" href="#main">Skip to main content</a>
 
 <header class="top">
   <a class="brand" href="/?view=trends" aria-label="Congress.Trade - home" onclick="event.preventDefault(); showView('trends'); window.scrollTo({ top: 0 });">
-    <img class="brand-logo" id="brandLogo" src="/assets/brand-logo-light.png?v=20" data-src-dark="/assets/brand-logo-dark.png?v=20" data-src-light="/assets/brand-logo-light.png?v=20" alt="Congress.Trade" width="1670" height="334" decoding="async" /></a>
+    <img class="brand-logo" id="brandLogo" src="/assets/brand-logo-light.webp?v=21" data-src-dark="/assets/brand-logo-dark.webp?v=21" data-src-light="/assets/brand-logo-light.webp?v=21" alt="Congress.Trade" width="920" height="184" decoding="async" fetchpriority="high" /></a>
   <nav class="tabs" role="tablist" aria-label="Primary views">
-    <a href="/?view=trends" data-view="trends" data-mobile="Trends" data-icon="📈" class="active" id="tab-trends" role="tab" aria-selected="true" aria-current="page" aria-controls="view-trends" aria-label="Trends"><span aria-hidden="true">Trends</span></a>
-    <a href="/?view=trades" data-view="trades" data-mobile="Trades" data-icon="☰" id="tab-trades" role="tab" aria-selected="false" aria-controls="view-trades" aria-label="Trades"><span aria-hidden="true">Trades</span></a>
-    <a href="/?view=people" data-view="people" data-mobile="Directory" data-icon="👥" id="tab-people" role="tab" aria-selected="false" aria-controls="view-people" aria-label="Directory"><span aria-hidden="true">Directory</span></a>
-    <a href="/?view=review" data-view="review" data-mobile="Review" data-icon="✓" id="tab-review" role="tab" aria-selected="false" aria-controls="view-review" data-admin-tab="true" title="Review Queue" hidden aria-label="Review Queue"><span aria-hidden="true">Review Queue <span class="tab-count-badge" id="reviewTabBadge" hidden></span></span></a>
-    <a href="/?view=subs" data-view="subs" data-mobile="Delivery" data-icon="🔔" id="tab-subs" role="tab" aria-selected="false" aria-controls="view-subs" aria-label="Delivery"><span aria-hidden="true">Delivery</span></a>
-    <a href="/?view=admin" data-view="admin" data-mobile="Admin" data-icon="⚙" id="tab-admin" role="tab" aria-selected="false" aria-controls="view-admin" data-admin-tab="true" title="Admin · Cadence" hidden aria-label="Admin · Cadence"><span aria-hidden="true">Admin · Cadence <span class="tab-count-badge" id="adminTabBadge" hidden></span></span></a>
+    <a href="/?view=trends" data-view="trends" data-mobile="Trends" class="active" id="tab-trends" role="tab" aria-selected="true" aria-current="page" aria-controls="view-trends"><span class="tab-ico" aria-hidden="true">📈</span><span class="tab-label">Trends</span></a>
+    <a href="/?view=trades" data-view="trades" data-mobile="Trades" id="tab-trades" role="tab" aria-selected="false" aria-controls="view-trades" tabindex="-1"><span class="tab-ico" aria-hidden="true">☰</span><span class="tab-label">Trades</span></a>
+    <a href="/?view=people" data-view="people" data-mobile="Directory" id="tab-people" role="tab" aria-selected="false" aria-controls="view-people" tabindex="-1"><span class="tab-ico" aria-hidden="true">👥</span><span class="tab-label">Directory</span></a>
+    <a href="/?view=review" data-view="review" data-mobile="Review" id="tab-review" role="tab" aria-selected="false" aria-controls="view-review" data-admin-tab="true" title="Review Queue" hidden tabindex="-1"><span class="tab-ico" aria-hidden="true">✓</span><span class="tab-label"><span class="tab-label-full">Review Queue</span><span class="tab-label-short">Review</span></span><span class="tab-count-badge" id="reviewTabBadge" hidden></span></a>
+    <a href="/?view=subs" data-view="subs" data-mobile="Delivery" id="tab-subs" role="tab" aria-selected="false" aria-controls="view-subs" tabindex="-1"><span class="tab-ico" aria-hidden="true">🔔</span><span class="tab-label">Delivery</span></a>
+    <a href="/?view=admin" data-view="admin" data-mobile="Admin" id="tab-admin" role="tab" aria-selected="false" aria-controls="view-admin" data-admin-tab="true" title="Admin · Cadence" hidden tabindex="-1"><span class="tab-ico" aria-hidden="true">⚙</span><span class="tab-label"><span class="tab-label-full">Admin · Cadence</span><span class="tab-label-short">Admin</span></span><span class="tab-count-badge" id="adminTabBadge" hidden></span></a>
   </nav>
+  <h1 class="field-vh-label" id="viewH1" style="position:absolute">Congress.Trade — Trends</h1>
   <div id="acct" class="acct"></div>
 
 </header>
@@ -224,7 +227,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       </span>
       <div class="filter-groups">
         <div class="ios-filter branch-filters" id="qChamber">
-          <button type="button" class="ios-filter-btn" aria-haspopup="true" aria-expanded="false" aria-label="Filter by branch">
+          <button type="button" class="ios-filter-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Filter by branch">
             <span class="ios-filter-ico" aria-hidden="true">🏛</span>
             <span class="ios-filter-lbl" data-ios-summary>All</span>
           </button>
@@ -236,7 +239,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           </div>
         </div>
         <div class="ios-filter party-chips" id="qPartyGroup">
-          <button type="button" class="ios-filter-btn" aria-haspopup="true" aria-expanded="false" aria-label="Filter by party">
+          <button type="button" class="ios-filter-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Filter by party">
             <span class="ios-filter-ico" aria-hidden="true">👥</span>
             <span class="ios-filter-lbl" data-ios-summary>All</span>
           </button>
@@ -248,7 +251,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           </div>
         </div>
         <div class="ios-filter side-chips" id="qSideGroup">
-          <button type="button" class="ios-filter-btn" aria-haspopup="true" aria-expanded="false" aria-label="Filter by trade type">
+          <button type="button" class="ios-filter-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Filter by trade type">
             <span class="ios-filter-ico sides" aria-hidden="true"><span class="side-up">▲</span><span class="side-dn">▼</span><span class="side-ex">⇄</span></span>
             <span class="ios-filter-lbl" data-ios-summary></span>
           </button>
@@ -274,7 +277,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <button type="button" class="btn ghost sm ct-filter-reset" id="ctFilterReset" onclick="resetSharedFilters()" title="Reset filters to defaults" hidden>Reset</button>
   </div>
 
-<main>
+<main id="main" tabindex="-1">
   <!-- #2071: do not put #banner here. A first-child status strip sits
        between header.top and the sticky filter rows. Feed status lives
        inside each filtered view, after that view's filter row, and stays
@@ -309,7 +312,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         <select id="mobileSortKey" aria-label="Sort by" title="Sort by" onchange="handleMobileSortKeyChange()"></select>
         <button type="button" class="btn ghost sm" id="mobileSortDirBtn" onclick="toggleMobileSortDir()" aria-label="Toggle sort direction"></button>
       </div>
-      <span class="note trades-count-msg" id="tradesCountMsgTop" data-trades-count></span>
+      <span class="note trades-count-msg" id="tradesCountMsgTop" data-trades-count role="status" aria-live="polite" aria-atomic="true"></span>
       <div class="pager-controls" role="navigation" aria-label="Trades pagination top">
         <button class="btn ghost sm" data-pager-first onclick="firstTradesPage()" title="First page" aria-label="First page">&laquo;</button>
         <button class="btn ghost sm" data-pager-prev onclick="prevTradesPage()" title="Previous page" aria-label="Previous page">&lsaquo;</button>
@@ -322,7 +325,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           <option value="25">25 rows</option><option value="50" selected>50 rows</option><option value="100">100 rows</option><option value="250">250 rows</option>
         </select>
         <div class="menu feed-options">
-          <button type="button" class="btn ghost sm feed-options-btn" data-feed-options-btn onclick="toggleFeedOptions(this)" title="List options" aria-label="List options" aria-haspopup="true" aria-expanded="false">⋯</button>
+          <button type="button" class="btn ghost sm feed-options-btn" data-feed-options-btn onclick="toggleFeedOptions(this)" title="List options" aria-label="List options" aria-haspopup="menu" aria-expanded="false">⋯</button>
           <div class="menu-pop feed-options-menu" data-feed-options-menu role="menu">
             <button type="button" class="feed-options-item-cols" role="menuitem" onclick="closeFeedOptions();toggleColChooser()">Columns</button>
             <button type="button" id="exportCsvBtn" role="menuitem" onclick="closeFeedOptions();openExportCsvDialog()">Export CSV <span class="premium-mark" title="Premium">Pro</span></button>
@@ -337,7 +340,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       <tbody id="tradesBody"></tbody>
     </table>
     </div>
-    <div id="tradesCards" class="trades-cards mobile-only" aria-live="polite"></div>
+    <div id="tradesCards" class="trades-cards mobile-only"></div>
     <div class="row-flex pager pager-bottom" data-pager="bottom">
       <span class="note trades-count-msg" id="tradesCountMsg" data-trades-count></span>
       <div class="pager-controls" role="navigation" aria-label="Trades pagination">
@@ -352,7 +355,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           <option value="25">25 rows</option><option value="50" selected>50 rows</option><option value="100">100 rows</option><option value="250">250 rows</option>
         </select>
         <div class="menu feed-options">
-          <button type="button" class="btn ghost sm feed-options-btn" data-feed-options-btn onclick="toggleFeedOptions(this)" title="List options" aria-label="List options" aria-haspopup="true" aria-expanded="false">⋯</button>
+          <button type="button" class="btn ghost sm feed-options-btn" data-feed-options-btn onclick="toggleFeedOptions(this)" title="List options" aria-label="List options" aria-haspopup="menu" aria-expanded="false">⋯</button>
           <div class="menu-pop feed-options-menu" data-feed-options-menu role="menu">
             <button type="button" class="feed-options-item-cols" role="menuitem" onclick="closeFeedOptions();toggleColChooser()">Columns</button>
             <button type="button" role="menuitem" onclick="closeFeedOptions();openExportCsvDialog()">Export CSV <span class="premium-mark" title="Premium">Pro</span></button>
@@ -387,7 +390,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
       </span>
       <div class="filter-groups">
         <div class="ios-filter branch-filters" id="trChamber">
-          <button type="button" class="ios-filter-btn" aria-haspopup="true" aria-expanded="false" aria-label="Filter by branch">
+          <button type="button" class="ios-filter-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Filter by branch">
             <span class="ios-filter-ico" aria-hidden="true">🏛</span>
             <span class="ios-filter-lbl" data-ios-summary>All</span>
           </button>
@@ -399,7 +402,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           </div>
         </div>
         <div class="ios-filter party-chips" id="trPartyGroup">
-          <button type="button" class="ios-filter-btn" aria-haspopup="true" aria-expanded="false" aria-label="Filter by party">
+          <button type="button" class="ios-filter-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Filter by party">
             <span class="ios-filter-ico" aria-hidden="true">👥</span>
             <span class="ios-filter-lbl" data-ios-summary>All</span>
           </button>
@@ -411,7 +414,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           </div>
         </div>
         <div class="ios-filter side-chips" id="trSideGroup">
-          <button type="button" class="ios-filter-btn" aria-haspopup="true" aria-expanded="false" aria-label="Filter by trade type">
+          <button type="button" class="ios-filter-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Filter by trade type">
             <span class="ios-filter-ico sides" aria-hidden="true"><span class="side-up">▲</span><span class="side-dn">▼</span><span class="side-ex">⇄</span></span>
             <span class="ios-filter-lbl" data-ios-summary></span>
           </button>
@@ -461,7 +464,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
         </div>
       </details>
       <details class="section trends-fold" id="trPerformersFold" open>
-        <summary class="tf-h">Top Performers <span class="info-tip" tabindex="0" aria-label="Measured from each trade's public filing date to now.  5+ buys, stocks only, +/-200% cap per trade." title="Measured from each trade's public filing date to now.  5+ buys, stocks only, +/-200% cap per trade.">ⓘ</span><span class="fold-cue" aria-hidden="true"></span></summary>
+        <summary class="tf-h">Top Performers <span class="info-tip" aria-hidden="true" title="Measured from each trade's public filing date to now.  5+ buys, stocks only, +/-200% cap per trade.">ⓘ</span><span class="fold-cue" aria-hidden="true"></span></summary>
         <p class="sub">Politicians whose disclosed <strong>buys</strong> beat the S&amp;P 500 after the trade was <strong>disclosed</strong>, shown as an <strong>average excess return</strong> (matching the benchmark = 0%).</p>
         <p class="sub">5+ buys&nbsp;&nbsp; &bull;&nbsp;&nbsp;&nbsp;stocks only&nbsp;&nbsp; &bull;&nbsp;&nbsp;&nbsp;+/-200% cap per trade</p>
         <p class="sub" id="trPerformersAsOf" aria-live="polite"></p>
@@ -544,7 +547,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <!-- Disclosure timeliness -->
     <details class="section trends-fold" open>
       <summary class="tf-h">Disclosure Timeliness<span class="fold-cue" aria-hidden="true"></span></summary>
-      <p class="sub">Days from trade to filing.&nbsp; The STOCK Act sets a 45-day deadline; this is a data-quality + accountability lens.</p>
+      <p class="sub">Days from the trade to the filing.&#160; The STOCK Act sets a 45-day deadline.</p>
       <div class="grid-cards" id="trLagKpis"></div>
       <div class="trend-grid2 timeliness-grid">
         <div class="timeliness-panel">
@@ -553,7 +556,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           <div id="trLagDist" class="lag-dist"></div>
         </div>
         <div class="timeliness-panel">
-          <h3 title="Filers with the highest average trade-to-filing delay in the selected time window.">Slowest Filers (Average Lag)</h3>
+          <h3 title="People with the longest average wait between the trade and the filing.">Slowest to File</h3>
           <div class="late-filers-wrap"><table>
             <thead><tr><th scope="col">Politician</th><th scope="col">Avg</th><th scope="col">Max</th><th scope="col">Late</th></tr></thead>
             <tbody id="trLateFilers"></tbody>
@@ -565,7 +568,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <!-- Committee conflicts (journalistic accountability lens) -->
     <details class="section trends-fold" open>
       <summary class="tf-h">Committee Sector Conflicts<span class="fold-cue" aria-hidden="true"></span></summary>
-      <p class="sub">Disclosed trades in sectors that a politician&rsquo;s committees oversee (curated committee→sector map).&nbsp; Observational — not evidence of impropriety.&nbsp; Hover a committee cell for the full list; click a row for the politician.</p>
+      <p class="sub">Trades in sectors a politician&rsquo;s committees oversee.&#160; This is a comparison, not proof of anything improper.&#160; Hover a committee cell for the full list; click a row for the politician.</p>
       <div class="table-wrap"><table class="conflicts-table" id="tableTrConflicts">
         <colgroup><col class="c-pol"><col class="c-com"><col class="c-sec"><col class="c-ast"><col class="c-side"><col class="c-est"></colgroup>
         <thead><tr><th scope="col">Politician</th><th scope="col">Committee</th><th scope="col">Sector</th><th scope="col">Asset</th><th scope="col">Side</th><th scope="col" class="est">Est. $</th></tr></thead>
@@ -580,14 +583,14 @@ ${speedProofSectionHtml('trends')}
   <section class="view" id="view-people" role="tabpanel" aria-labelledby="tab-people" aria-hidden="true">
     <div class="section">
       <h3>Directory</h3>
-      <p class="sub" id="dirSub">Look up members of Congress and executive filers.&nbsp; Search by name, state (full or abbrev), or party.&nbsp; Click a column heading to sort; click a name for their profile and trades.&nbsp; Trade counts cover the full record, not the timeframe set on Trades or Trends.</p>
+      <p class="sub" id="dirSub">Look up members of Congress and executive branch officials.&#160; Search by name, state, or party.&#160; Click a column heading to sort; click a name for their profile and trades.&#160; Trade counts cover the full record, not the timeframe set on Trades or Trends.</p>
       <div class="seg dir-mode-seg" id="dirMode" role="group" aria-label="Directory mode">
         <button type="button" data-mode="people" class="on" onclick="setDirectoryMode('people')">People</button>
         <button type="button" data-mode="assets" onclick="setDirectoryMode('assets')">Assets</button>
       </div>
       <div class="toolbar" style="margin-bottom:12px">
         <input id="peopleQ" placeholder="Search name, state, party… any order" aria-label="Search directory" style="min-width:0;flex:1" oninput="filterDirectory()" />
-        <select id="peopleChamber" onchange="filterPeopleDirectory()" aria-label="Chamber filter">
+        <select id="peopleChamber" onchange="filterPeopleDirectory()" aria-label="Branch filter">
           <option value="">All Branches</option>
           <option value="house">House</option>
           <option value="senate">Senate</option>
@@ -625,6 +628,8 @@ ${speedProofSectionHtml('trends')}
         <button class="btn sm" id="revTabPending" onclick="setReviewTab(0)">Pending</button>
         <button class="btn ghost sm" id="revTabReviewed" onclick="setReviewTab(1)">Resolved Reviews</button>
       </div>
+      <div id="reviewRelayStatus"></div>
+      <div id="reviewFailures"></div>
       <div class="review-table-wrap" id="reviewTableWrap" role="region" aria-label="Review queue table">
         <table>
           <thead><tr><th>Filed</th><th>Doc</th><th>Status</th><th>Reason</th><th>Payload</th><th></th></tr></thead>
@@ -653,7 +658,7 @@ ${speedProofSectionHtml('trends')}
       <div style="margin-top:12px;">
         <a href="${APP_STORE_URL}" class="btn sm" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;">
           <svg viewBox="0 0 170 170" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.83.13-9.67-1.92-14.52-6.13-3.23-2.75-7.14-7.46-11.75-14.13-6.53-9.47-11.73-20.08-15.58-31.8-3.86-11.73-5.79-22.9-5.79-33.52 0-14.88 3.75-27.18 11.24-36.9 7.49-9.72 17.06-14.65 28.71-14.78 4.71 0 10.08 1.18 16.12 3.54 6.03 2.36 10.08 3.54 12.14 3.54 1.83 0 5.92-1.22 12.27-3.66 6.35-2.44 11.48-3.58 15.39-3.42 12.37.52 22.25 4.88 29.62 13.08-11.05 6.67-16.48 15.77-16.3 27.31.18 9.07 3.57 16.65 10.17 22.75 6.6 6.1 14.58 9.54 23.94 10.32-2.12 6.53-4.9 13.11-8.35 19.74zM119.22 31.78c0-7.07 2.53-13.67 7.59-19.8 5.06-6.13 11.46-9.75 19.2-10.86.36 1.44.54 2.76.54 3.96 0 7.07-2.61 13.79-7.83 20.16-5.22 6.37-11.66 9.87-19.32 10.51-.12-1.32-.18-2.65-.18-3.97z"/></svg>
-          Get iOS app
+          Get iOS App
         </a>
       </div>
     </div>
@@ -662,8 +667,8 @@ ${speedProofSectionHtml('trends')}
          requires a signed-in Premium account. -->
     <div class="section" id="subsMarketing">
       <h3>Alerts</h3>
-      <p class="sub">We ingest official House, Senate, and Executive Branch trades.&nbsp; Relaying a 3rd-party competitor API would ruin our minutes-to-hours edge that Congress.Trade was made for.</p>
-      <p class="sub" style="margin-top: 8px;">Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
+      <p class="sub">We read official House, Senate, and Executive Branch filings directly, so new trades reach you within minutes to hours.</p>
+      <p class="sub" style="margin-top: 8px;">Premium sends each new trade to you as soon as we have it.&#160; Two methods, both included:</p>
       <div class="speed-mini" id="alertsSpeedMini"></div>
       <div class="delivery-grid">
         <div class="delivery-card">
@@ -681,7 +686,7 @@ ${speedProofSectionHtml('trends')}
       <h3>Delivery</h3>
       <p class="sub" id="subsManageSub">Create signed webhook or SSE deliveries for your account.&nbsp; Secrets are shown once at creation; webhook consumers dedupe on <code>X-Subscription-Id</code> + <code>X-Tx-Id</code>.&nbsp; Pause stops events without removing the delivery; Delete removes it permanently.&nbsp; Edit filters anytime (Premium).</p>
       <div id="subsGate" class="note" role="status" aria-live="polite" style="margin:12px 0;padding:12px;border:1px solid var(--border, #ddd);border-radius:8px">
-        Sign in with Google to manage Delivery. Creating a delivery also requires Premium.
+        Sign in to manage Delivery.&#160; Creating a delivery also requires Premium.
       </div>
       <table id="subsTable">
         <thead><tr><th>Channel</th><th>Target</th><th>Filters</th><th>Progress</th><th>Status</th><th>Actions</th></tr></thead>
@@ -692,14 +697,14 @@ ${speedProofSectionHtml('trends')}
       <div class="row-flex" id="subsCreateRow" style="margin-top:14px;flex-wrap:wrap">
         <label class="field-vh-label" for="newDelivery">Channel</label>
         <select id="newDelivery" disabled onchange="updateNewTargetVisibility()">
-          <option value="sse">SSE</option><option value="webhook">webhook</option>
+          <option value="sse">Live Stream</option><option value="webhook">Webhook</option>
         </select>
         <label class="field-vh-label" for="newTarget">Target URL</label>
-        <input id="newTarget" placeholder="target URL (webhook only)" style="flex:1 1 100%;min-width:0" disabled />
+        <input id="newTarget" type="url" inputmode="url" autocomplete="url" aria-describedby="subsMsg" placeholder="target URL (webhook only)" style="flex:1 1 100%;min-width:0" disabled />
         <label class="field-vh-label" for="newTickers">Tickers</label>
-        <input id="newTickers" placeholder="tickers (CSV, optional)" style="flex:1 1 100%;min-width:0" disabled />
+        <input id="newTickers" placeholder="Tickers, separated by commas (optional)" style="flex:1 1 100%;min-width:0" disabled />
         <label class="field-vh-label" for="newMembers">Members</label>
-        <input id="newMembers" placeholder="members (names/ids, optional)" style="flex:1 1 100%;min-width:0" disabled title="Comma-separated member names or filer ids.  A name must match exactly one member." />
+        <input id="newMembers" placeholder="Politicians (optional)" style="flex:1 1 100%;min-width:0" disabled title="Comma-separated names. A name must match exactly one person." />
         <label class="field-vh-label" for="newChambers">Branches</label>
         <select id="newChambers" disabled>
           <option value="">House + Senate + Executive</option>
@@ -709,7 +714,7 @@ ${speedProofSectionHtml('trends')}
           <option value="executive">Executive</option>
         </select>
         <label class="field-vh-label" for="newSides">Trade side</label>
-        <select id="newSides" disabled title="Trade side filter (B buy / S sell / E exchange)">
+        <select id="newSides" disabled title="Limit alerts to buys, sells, or exchanges">
           <option value="">Buys + Sells + Exchanges</option>
           <option value="B">Buys</option>
           <option value="S">Sells</option>
@@ -718,7 +723,7 @@ ${speedProofSectionHtml('trends')}
         </select>
         <label class="minamt-label" style="display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="newIncludeBackfill" disabled />
-          Include historical backfill (older than 7 days)
+          Include trades older than 7 days
         </label>
         <label class="minamt-label" style="display:flex;align-items:center;gap:6px">Minimum Trade Size:
           <select id="newMinAmt" disabled title="Minimum amount bracket floor">
@@ -736,7 +741,7 @@ ${speedProofSectionHtml('trends')}
           </select>
         </label>
         <button class="btn sm" id="subsCreateBtn" onclick="createSubscription()" disabled>Add New Delivery</button>
-        <button class="btn ghost sm" id="subsEditCancel" type="button" hidden onclick="clearDeliveryForm(); if(el('newDelivery')) el('newDelivery').disabled=false; updateDeliveryGate();">Cancel edit</button>
+        <button class="btn ghost sm" id="subsEditCancel" type="button" hidden onclick="clearDeliveryForm(); if(el('newDelivery')) el('newDelivery').disabled=false; updateDeliveryGate();">Cancel Edit</button>
         <div id="subsMsg" class="note subs-msg" aria-live="polite"></div>
       </div>
       <div class="row-flex" style="margin-top:20px;justify-content:center" data-premium-cue="alerts">
@@ -758,7 +763,7 @@ ${speedProofSectionHtml('admin')}
       <h3>Admin Access Control</h3>
       <p class="sub">Grant or revoke admin access for a specific email.&nbsp; Premium never grants Admin or Review Queue by itself — only an email listed below, or one configured via <code>ADMIN_EMAILS</code> in the environment, can see them.</p>
       <div class="row-flex">
-        <input id="adminGrantEmail" type="email" autocomplete="off" placeholder="name@example.com" style="flex:1;min-width:240px" />
+        <input id="adminGrantEmail" aria-label="Grant Premium email" type="email" autocomplete="off" placeholder="name@example.com" style="flex:1;min-width:240px" />
         <button class="btn" onclick="grantAdminEmail()">Grant Admin</button>
         <span id="adminGrantMsg" class="note" role="status" aria-live="polite"></span>
       </div>
@@ -804,9 +809,9 @@ ${speedProofSectionHtml('admin')}
       <p class="sub">Bulk-import pre-aggregated public datasets as <code>seed_dataset</code> rows to bootstrap back-history. Idempotent (safe to re-run); these rows are reference-only and never dispatched to subscribers.</p>
       <div class="row-flex">
         <label class="lbl">Since Year</label>
-        <input id="bfSince" type="number" placeholder="e.g. 2020" style="width:120px" />
+        <input id="bfSince" aria-label="Backfill since year" type="number" placeholder="e.g. 2020" style="width:120px" />
         <label class="lbl">Row Limit</label>
-        <input id="bfLimit" type="number" placeholder="(none)" style="width:120px" />
+        <input id="bfLimit" aria-label="Backfill limit" type="number" placeholder="(none)" style="width:120px" />
         <select id="bfChambers">
           <option value="">Both Chambers</option><option value="house">House Only</option><option value="senate">Senate Only</option>
         </select>
@@ -817,9 +822,9 @@ ${speedProofSectionHtml('admin')}
       <p class="note">API HOOK: <code>POST /api/admin/backfill</code>. Senate defaults to the GitHub mirror (works out of the box). The House community bucket is gated (HTTP 403) — set <code>SEED_HOUSE_URL</code>, or use the official House index backfill below.</p>
       <div class="row-flex" style="margin-top:14px">
         <label class="lbl">House History (Official Index)</label>
-        <input id="hiFrom" type="number" placeholder="from year" style="width:120px" />
-        <input id="hiTo" type="number" placeholder="to year" style="width:120px" />
-        <input id="hiMax" type="number" min="1" max="5000" value="500" title="Maximum filings to enqueue in this run" style="width:120px" />
+        <input id="hiFrom" aria-label="History from year" type="number" placeholder="from year" style="width:120px" />
+        <input id="hiTo" aria-label="History to year" type="number" placeholder="to year" style="width:120px" />
+        <input id="hiMax" aria-label="History max rows" type="number" min="1" max="5000" value="500" title="Maximum filings to enqueue in this run" style="width:120px" />
         <button class="btn ghost sm" onclick="runHouseIndex(true)">Dry Run</button>
         <button class="btn" onclick="runHouseIndex(false)">Backfill House Index</button>
         <span id="hiMsg" class="note"></span>
@@ -913,9 +918,9 @@ ${speedProofSectionHtml('admin')}
       <p class="sub">Ticker enrichment coverage for company name, sector, country, and market-cap fields. This is the data behind company drawers, Sector, Country, and Market Cap columns.</p>
       <div class="row-flex">
         <label class="lbl">Max Rows</label>
-        <input id="mdMax" type="number" min="1" max="200" value="40" style="width:90px" title="Maximum ticker rows to process in this run" />
+        <input id="mdMax" aria-label="Max ticker rows" type="number" min="1" max="200" value="40" style="width:90px" title="Maximum ticker rows to process in this run" />
         <label class="lbl">Max Calls / Min</label>
-        <input id="mdPerMin" type="number" min="1" max="1000" value="250" style="width:100px" title="API throttle limit" />
+        <input id="mdPerMin" aria-label="Requests per minute" type="number" min="1" max="1000" value="250" style="width:100px" title="API throttle limit" />
         <button class="btn ghost sm" onclick="runMarketBackfill(true)">Dry Run</button>
         <button class="btn" onclick="runMarketBackfill(false)">Run One Pass</button>
         <button class="btn ghost sm" onclick="loadMarketCoverage()">Reload</button>
@@ -995,7 +1000,7 @@ ${speedProofSectionHtml('admin')}
 
 <div class="drawer" id="detailDrawer">
   <div class="drawer-backdrop" onclick="closeDrawer()"></div>
-  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawerTopbarTitle"><div class="drawer-topbar"><span class="drawer-topbar-title" id="drawerTopbarTitle" aria-hidden="true"></span><button class="drawer-close" onclick="closeDrawer()" aria-label="Close">✕</button></div><div id="detailDrawerBody"></div></div>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawerTopbarTitle"><div class="drawer-topbar"><span class="drawer-topbar-title" id="drawerTopbarTitle"></span><button class="drawer-close" onclick="closeDrawer()" aria-label="Close">✕</button></div><div id="detailDrawerBody"></div></div>
 </div>
 
 <!-- ================= LOGIN MODAL ================= -->
@@ -1022,7 +1027,7 @@ ${speedProofSectionHtml('admin')}
         Sign in with X
       </a>
     </div>
-    <p class="note" id="loginMsg"></p>
+    <p class="note" id="loginMsg" role="status" aria-live="polite"></p>
   </div>
 </div>
 
@@ -1057,7 +1062,7 @@ ${speedProofSectionHtml('admin')}
     <p class="trial-note" id="pricingTrialNote">1-week free trial. No charge today.</p>
     <p class="note" id="pricingPremiumNote" style="text-align:center" hidden></p>
     <button class="btn" style="width:100%;padding:11px" id="subscribeBtn" onclick="startCheckout()">Start Free Trial</button>
-    <p class="note" id="pricingMsg"></p>
+    <p class="note" id="pricingMsg" role="status" aria-live="polite"></p>
   </div>
 </div>
 

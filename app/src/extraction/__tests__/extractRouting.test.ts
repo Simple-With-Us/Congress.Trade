@@ -158,6 +158,21 @@ describe('looksLikeOgePart7ExplicitNone', () => {
 });
 
 describe('evaluateExtractQuality — hard-stops', () => {
+  it('treats the scanned PTR "Provide full name, not ticker symbol" column header as chrome', () => {
+    // H-2026-9116389: local Mac vision returned the faded column header as a row.
+    expect(looksLikeHeaderContaminatedAsset('Pro d full m tu k r symb l')).toBe(true);
+    expect(looksLikeHeaderContaminatedAsset('Prov d full m ttick ymbol')).toBe(true);
+    expect(looksLikeHeaderContaminatedAsset('Provide full name, not ticker symbol')).toBe(true);
+  });
+
+  it('keeps real Pro-prefixed holdings whose notes mention full name and ticker symbol', () => {
+    expect(looksLikeHeaderContaminatedAsset('Procter full year note, ticker symbol PG')).toBe(false);
+    expect(looksLikeHeaderContaminatedAsset('Procter & Gamble Co (PG) full position, see ticker symbol')).toBe(false);
+    expect(looksLikeHeaderContaminatedAsset('Prospect Capital full redemption; symbol PSEC')).toBe(false);
+    expect(looksLikeHeaderContaminatedAsset('Prudential Financial Inc')).toBe(false);
+    expect(looksLikeHeaderContaminatedAsset('Procter & Gamble full year note')).toBe(false);
+  });
+
   it('treats the printed PTR Example Mega Corp sample as form chrome', () => {
     expect(looksLikePtrFormSampleAsset('Example Mega Corp Common Stock')).toBe(true);
     expect(looksLikePtrFormSampleAsset('Exemplje Mega Corp.')).toBe(true);

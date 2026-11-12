@@ -1,82 +1,76 @@
 /**
- * Direct Senate eFD (efdsearch.senate.gov) reachability probe.
+ * Senate eFD (efdsearch.senate.gov) functional-probe record, cached in
+ * CONFIG_KV so `/api/health` can report eFD state without dialing eFD.
  *
- * Cached in CONFIG_KV so `/api/health` can surface a dead residential proxy
- * without dialing the Mango device on every health request.
+ * The probe itself lives in residentialProxyHealth.ts (CT-2416): it runs the
+ * real landing GET + agreement POST through the same residential proxy as
+ * senateSource.ts.  The old unproxied direct GET was dropped (owner ruling
+ * 2026-10-16) because datacenter egress is a structural 403 that said nothing
+ * about whether ingestion works.  Each probe sends eFD one agreement POST, so
+ * it dials at most twice a day and not at all while the watcher's
+ * edge-deny backoff is active (CT-2442).
  */
 
-import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
+import { z } from 'zod';
 import type { Env } from '../shared/types.ts';
-import { BROWSER_HEADERS, SENATE_SEARCH } from './senateSource.ts';
 
 export const SENATE_EFD_HEALTH_KV_KEY = 'senate-efd:health';
 export const SENATE_EFD_PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * ok        landing GET 200 + csrf token, agreement POST 3xx (or a 200 without
+ *           the agreement form), as establishSenateSession judges it.
+ * blocked   eFD's Akamai edge denied a step (classifySenateHttpFailure
+ *           `edge_denied`: a 403 from AkamaiGHost or with the Access Denied page).
+ * degraded  relay/proxy down or unconfigured, or eFD misbehaved otherwise.
+ */
+export type SenateEfdProbeState = 'ok' | 'blocked' | 'degraded';
 
 export interface SenateEfdProbeRecord {
   ok: boolean;
   status: number | null;
   checkedAt: string;
-  /** `direct` or `proxy` — how the last successful watcher poll reached eFD. */
+  /** Egress used by the probe (`proxy`); legacy records carry `direct`. */
   egress?: string | null;
   error?: string | null;
+  /** Absent on legacy direct-GET records, which pipelineHealth ignores. */
+  state?: SenateEfdProbeState;
+  /** Which step decided the state, e.g. `POST /search/home/`. */
+  step?: string | null;
+  /**
+   * True when the probe that wrote this record attempted an eFD dial, including
+   * one that then failed in transport or timed out (it still counts against the
+   * throttle).  False on relay-down / unconfigured records, which never dial.
+   */
+  dialed?: boolean;
+  /** When an eFD dial was last attempted (carried across relay-down records; drives the twice-a-day throttle). */
+  lastDialedAt?: string | null;
 }
 
-export async function probeSenateEfdLanding(
-  fetchImpl: typeof fetch = globalThis.fetch,
-  timeoutMs = SENATE_EFD_PROBE_TIMEOUT_MS,
-): Promise<SenateEfdProbeRecord> {
-  const checkedAt = new Date().toISOString();
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await trackedFetch(
-      SENATE_SEARCH,
-      {
-        method: 'GET',
-        headers: {
-          ...BROWSER_HEADERS,
-          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        signal: controller.signal,
-      },
-      { service: 'filing-discovery', operation: 'probe-senate-efd-landing' },
-      fetchImpl,
-    );
-    clearTimeout(timeoutId);
-    const ok = res.status >= 200 && res.status < 400;
-    return {
-      ok,
-      status: res.status,
-      checkedAt,
-      egress: 'direct',
-      error: ok ? null : `HTTP ${res.status}`,
-    };
-  } catch (err) {
-    clearTimeout(timeoutId);
-    return {
-      ok: false,
-      status: null,
-      checkedAt,
-      egress: 'direct',
-      error: (err as Error).message,
-    };
-  }
-}
-
-export async function refreshSenateEfdHealth(env: Env, now = new Date()): Promise<void> {
-  const rec = await probeSenateEfdLanding(globalThis.fetch, SENATE_EFD_PROBE_TIMEOUT_MS);
-  rec.checkedAt = now.toISOString();
-  await persistSenateEfdProbe(env, rec);
-}
+/**
+ * Trust boundary for the cached probe record in CONFIG_KV.  `ok` and
+ * `checkedAt` are required, as before; a legacy direct-GET record (no
+ * `state`) still parses, and pipelineHealth ignores it.  A record with a
+ * wrong-typed field reads as no record, so the probe dials again (still
+ * subject to the edge-deny backoff).  Unknown fields are dropped.
+ */
+export const SenateEfdProbeRecordSchema = z.object({
+  ok: z.boolean(),
+  status: z.number().int().nullable().catch(null),
+  checkedAt: z.string(),
+  egress: z.string().nullish(),
+  error: z.string().nullish(),
+  state: z.enum(['ok', 'blocked', 'degraded']).optional(),
+  step: z.string().nullish(),
+  dialed: z.boolean().optional(),
+  lastDialedAt: z.string().nullish(),
+});
 
 export async function readSenateEfdProbe(env: Env): Promise<SenateEfdProbeRecord | null> {
   if (!env.CONFIG_KV) return null;
   try {
-    const raw = await env.CONFIG_KV.get(SENATE_EFD_HEALTH_KV_KEY, 'json');
-    if (!raw || typeof raw !== 'object') return null;
-    const rec = raw as SenateEfdProbeRecord;
-    if (typeof rec.ok !== 'boolean' || typeof rec.checkedAt !== 'string') return null;
-    return rec;
+    const parsed = SenateEfdProbeRecordSchema.safeParse(await env.CONFIG_KV.get(SENATE_EFD_HEALTH_KV_KEY, 'json'));
+    return parsed.success ? { ...parsed.data, status: parsed.data.status ?? null } : null;
   } catch {
     return null;
   }
@@ -86,7 +80,10 @@ export async function persistSenateEfdProbe(env: Env, rec: SenateEfdProbeRecord)
   if (!env.CONFIG_KV) return;
   try {
     await env.CONFIG_KV.put(SENATE_EFD_HEALTH_KV_KEY, JSON.stringify(rec), {
-      expirationTtl: 86_400,
+      // Four days, not one: the health check's stale threshold is three
+      // probe intervals (36h), and a record that expires at 24h would make
+      // that branch unreachable — the record must outlive the threshold.
+      expirationTtl: 4 * 86_400,
     });
   } catch {
     /* best-effort */

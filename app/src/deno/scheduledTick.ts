@@ -77,6 +77,34 @@ export function tickLockErrorShouldFailOpen(err: unknown): boolean {
 }
 
 /**
+ * CT-2459: the eligibleReview probe (review_queue JOIN filings + NOT EXISTS
+ * transactions) is by far the priciest of the five idle probes. Cache a
+ * POSITIVE result for 5 minutes: "work exists" only makes lanes run and
+ * self-check, so a stale true costs one empty lane pass; a negative is
+ * never cached, so newly claimable work is still seen on the next tick.
+ */
+const ELIGIBLE_REVIEW_POSITIVE_CACHE_MS = 5 * 60_000;
+// Keyed by DB binding (like the pipeline-health cache): one shim per prod
+// process, while per-test fake DBs stay isolated from each other.
+const eligibleReviewPositiveAtMs = new WeakMap<object, number>();
+let eligibleReviewPositiveFallbackMs = 0;
+function eligibleReviewCachedPositive(env: Env, nowMs: number): boolean {
+  const key = (env as { DB?: unknown }).DB;
+  const at = key && (typeof key === 'object' || typeof key === 'function')
+    ? (eligibleReviewPositiveAtMs.get(key as object) ?? 0)
+    : eligibleReviewPositiveFallbackMs;
+  return nowMs - at < ELIGIBLE_REVIEW_POSITIVE_CACHE_MS;
+}
+function markEligibleReviewPositive(env: Env, nowMs: number): void {
+  const key = (env as { DB?: unknown }).DB;
+  if (key && (typeof key === 'object' || typeof key === 'function')) {
+    eligibleReviewPositiveAtMs.set(key as object, nowMs);
+  } else {
+    eligibleReviewPositiveFallbackMs = nowMs;
+  }
+}
+
+/**
  * Cheap EXISTS-style probes so idle ticks avoid multi-statement outbox flushes
  * and empty claim loops. Fail-open: any probe error returns true (do the work).
  */
@@ -142,7 +170,9 @@ export async function probePendingWork(env: Env, now = new Date()): Promise<Pend
     // Selector due-now, not health `eligible`.  Conservative defaults
     // (attempt cap 3, skip senate_html) so a quiet paid tick cannot skip
     // claimable House filings.
-    existsOrFalse(
+    eligibleReviewCachedPositive(env, now.getTime())
+      ? Promise.resolve(true)
+      : existsOrFalse(
       `SELECT 1 AS ok
          FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
         WHERE rq.resolved = 0
@@ -160,7 +190,10 @@ export async function probePendingWork(env: Env, now = new Date()): Promise<Pend
           )
         LIMIT 1`,
       [nowIso, leaseExpired],
-    ),
+    ).then((found) => {
+      if (found) markEligibleReviewPositive(env, now.getTime());
+      return found;
+    }),
   ]);
 
   return { ingestQueue, deliveryQueue, ingestionOutbox, deliveryOutbox, eligibleReview };
@@ -281,6 +314,32 @@ export const DEFAULT_MAINTENANCE_LANE_TIMEOUT_MS: Record<MaintenanceLane, number
   d1_budget: 8_000,
 };
 
+/**
+ * CONGRESS-TRADE-1T: per-lane timeout alerts are rate-limited so a lane that
+ * times out every tick does not flood Sentry. Alert once the lane has timed
+ * out on this many consecutive ticks, then at most once per
+ * LANE_TIMEOUT_ALERT_SUPPRESS_MS while it keeps timing out. Any in-budget
+ * completion (success or non-timeout error) resets the streak.
+ */
+const LANE_TIMEOUT_ALERT_STREAK_THRESHOLD = 3;
+const LANE_TIMEOUT_ALERT_SUPPRESS_MS = 60 * 60_000;
+
+interface LaneTimeoutAlertState {
+  consecutiveTimeouts: number;
+  lastAlertAtMs: number | null;
+}
+
+const laneTimeoutAlertState = new Map<MaintenanceLane, LaneTimeoutAlertState>();
+
+function resetLaneTimeoutAlertStreak(lane: MaintenanceLane): void {
+  laneTimeoutAlertState.delete(lane);
+}
+
+/** Test-only reset for the module-level lane-timeout alert streaks. */
+export function __resetLaneTimeoutAlertStateForTests(): void {
+  laneTimeoutAlertState.clear();
+}
+
 export interface MaintenancePipelineOptions {
   outboxLimit: number;
   /** When set, re-dispatch circuit-parked deliveries. */
@@ -380,10 +439,28 @@ export async function runMaintenancePipeline(
     return AbortSignal.any([laneSignal, options.signal]);
   };
 
-  const alertLaneTimeout = (lane: MaintenanceLane, timeoutMs: number, err: unknown) => {
+  const alertLaneTimeout = (lane: MaintenanceLane, timeoutMs: number, err: unknown, nowMs: number) => {
     const detail = errorText(err);
     const message = `Cron maintenance lane timed out: ${lane} (${timeoutMs}ms) — ${detail}`;
+    if (lane === 'usage_telemetry') {
+      // Match index.ts observeLane: receiver outages must not create Sentry
+      // envelopes (Usage Monitor amplification). console.log stays outside
+      // the Sentry warn/error log integration.
+      console.log(message);
+      return;
+    }
     console.error(message);
+    let state = laneTimeoutAlertState.get(lane);
+    if (!state) {
+      state = { consecutiveTimeouts: 0, lastAlertAtMs: null };
+      laneTimeoutAlertState.set(lane, state);
+    }
+    state.consecutiveTimeouts += 1;
+    const streakReached = state.consecutiveTimeouts >= LANE_TIMEOUT_ALERT_STREAK_THRESHOLD;
+    const holdoffElapsed = state.lastAlertAtMs === null
+      || nowMs - state.lastAlertAtMs >= LANE_TIMEOUT_ALERT_SUPPRESS_MS;
+    if (!streakReached || !holdoffElapsed) return;
+    state.lastAlertAtMs = nowMs;
     try {
       captureMessage(message, 'error');
     } catch {
@@ -398,7 +475,7 @@ export async function runMaintenancePipeline(
     const timeoutMs = laneTimeoutFor(lane);
     try {
       throwIfAborted();
-      return await raceMaintenanceLane(lane, timeoutMs, (laneSignal) => {
+      const result = await raceMaintenanceLane(lane, timeoutMs, (laneSignal) => {
         const signal = mergeLaneSignal(laneSignal);
         const work = run(signal);
         const observed = options.observeLane
@@ -406,13 +483,16 @@ export async function runMaintenancePipeline(
           : work;
         return observed as Promise<T>;
       });
+      resetLaneTimeoutAlertStreak(lane);
+      return result;
     } catch (err) {
       if (isTickAbort(err)) throw err;
       if (isMaintenanceLaneTimeout(err)) {
-        alertLaneTimeout(lane, timeoutMs, err);
+        alertLaneTimeout(lane, timeoutMs, err, now.getTime());
         errors.push(`${lane}: timed out after ${timeoutMs}ms`);
         return null;
       }
+      resetLaneTimeoutAlertStreak(lane);
       errors.push(`${lane}: ${errorText(err)}`);
       console.error(`maintenance lane ${lane} failed:`, err);
       return null;

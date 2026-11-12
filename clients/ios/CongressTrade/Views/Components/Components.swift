@@ -1,4 +1,5 @@
 import AuthenticationServices
+import ImageIO
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -310,15 +311,106 @@ extension String {
 }
 
 enum MemberPhotoURL {
-    /// First usable absolute URL among the API profile, a Directory-row seed,
-    /// and any already-loaded roster entry. Relative `/api/photos/...` paths
-    /// are ignored: SwiftUI `AsyncImage` cannot resolve them.
+    /// First usable URL among the API profile, a Directory-row seed, and any
+    /// already-loaded roster entry. CT-2459: relative `/api/photos/...`
+    /// paths now resolve against the site origin instead of being dropped
+    /// (rows silently fell back to initials). Non-http(s) results are still
+    /// rejected after resolution.
     static func resolve(_ candidates: String?...) -> URL? {
+        let origin = CongressTradeAPIClient.defaultBaseURL
+            .deletingLastPathComponent() // v1
+            .deletingLastPathComponent() // client
+            .deletingLastPathComponent() // api
         for raw in candidates {
-            guard let raw, !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else { continue }
-            return url
+            guard let raw, !raw.isEmpty else { continue }
+            if let url = URL(string: raw), let scheme = url.scheme,
+               scheme == "http" || scheme == "https" {
+                return url
+            }
+            if raw.hasPrefix("/"), let url = URL(string: raw, relativeTo: origin)?.absoluteURL,
+               url.scheme == "http" || url.scheme == "https" {
+                return url
+            }
         }
         return nil
+    }
+}
+
+/// CT-2459: shared downsampling image cache. Bare `AsyncImage` re-decoded
+/// full-size assets on every scroll-back with no memory cache. This loads
+/// once per URL and pixel size, thumbnail-decodes at display pixels via
+/// ImageIO, and keeps results in a cost-capped NSCache. A previously cached
+/// image renders synchronously (no placeholder flash).
+enum CachedImageLoader {
+    static let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.totalCostLimit = 20 * 1024 * 1024
+        return c
+    }()
+
+    /// CT-2461: the pixel size is part of the key. The same logo shows at
+    /// 22-48pt, so a URL-only key upscaled a small Trends thumbnail in the
+    /// larger feed and detail views.
+    private static func cacheKey(url: URL, maxPixelSize: CGFloat) -> NSString {
+        "\(max(1, Int(maxPixelSize)))|\(url.absoluteString)" as NSString
+    }
+
+    static func cachedImage(for url: URL, maxPixelSize: CGFloat) -> UIImage? {
+        cache.object(forKey: cacheKey(url: url, maxPixelSize: maxPixelSize))
+    }
+
+    /// Image hosts sit behind the same Cloudflare managed challenge as the
+    /// API; a default `URLSession.shared` UA can be 502'd. Carry the Safari
+    /// iOS UA the API client uses.
+    static var session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        ]
+        return URLSession(configuration: configuration)
+    }()
+
+    static func load(url: URL, maxPixelSize: CGFloat) async -> UIImage? {
+        if let hit = cachedImage(for: url, maxPixelSize: maxPixelSize) { return hit }
+        guard let (data, _) = try? await session.data(from: url) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maxPixelSize)),
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        let image = UIImage(cgImage: cg)
+        cache.setObject(image, forKey: cacheKey(url: url, maxPixelSize: maxPixelSize), cost: data.count)
+        return image
+    }
+}
+
+struct CachedAsyncImage: View {
+    let url: URL
+    var pointSize: CGFloat = 48
+    @State private var image: UIImage?
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable()
+            } else {
+                Color.clear
+            }
+        }
+        .task(id: url) {
+            let maxPixelSize = pointSize * displayScale
+            if let hit = CachedImageLoader.cachedImage(for: url, maxPixelSize: maxPixelSize) {
+                image = hit
+                return
+            }
+            image = nil
+            let loaded = await CachedImageLoader.load(url: url, maxPixelSize: maxPixelSize)
+            if !Task.isCancelled { image = loaded }
+        }
     }
 }
 
@@ -337,12 +429,9 @@ struct MemberAvatar: View {
                 .frame(width: size, height: size)
                 .background(AppTheme.card, in: Circle())
             if let photoURL {
-                AsyncImage(url: photoURL) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    }
-                }
-                .frame(width: size, height: size)
+                CachedAsyncImage(url: photoURL, pointSize: size)
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: size, height: size)
             }
         }
         .frame(width: size, height: size)
@@ -356,17 +445,21 @@ struct MetricTile: View {
     let title: String
     let value: String
     var tint: Color? = nil
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+            // CT-2459: at accessibility sizes the value wraps instead of
+            // shrinking below legibility via minimumScaleFactor.
             Text(value)
                 .font(.subheadline.weight(.bold))
                 .foregroundStyle(tint ?? .primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                .minimumScaleFactor(dynamicTypeSize.isAccessibilitySize ? 1 : 0.75)
+                .fixedSize(horizontal: false, vertical: dynamicTypeSize.isAccessibilitySize)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
@@ -409,11 +502,13 @@ struct FilterChip: View {
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
+                .frame(minHeight: 44)
                 .foregroundStyle(isSelected ? Color.white : Color.primary)
                 .background(
                     isSelected ? Color.accentColor : Color(uiColor: .systemGray5),
                     in: Capsule()
                 )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }
@@ -448,14 +543,21 @@ struct AssetMark: View {
         return components.url
     }
 
+    @State private var logoImage: UIImage?
+    @Environment(\.displayScale) private var displayScale
+
     var body: some View {
         // No monogram / blue-square placeholders: when there is no real logo,
         // take zero space so asset + politician names get the width.
-        if let url = themedLogoURL {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image
+        // CT-2459: served from the shared downsampling cache; a cached logo
+        // appears synchronously on scroll-back instead of re-decoding.
+        // CT-2461: `.task` needs a view that exists before the image does. On
+        // a `Group` holding only `if let logoImage`, it has no child to attach
+        // to, so the load never starts and no logo ever appears.
+        if let themedLogoURL {
+            ZStack {
+                if let logoImage {
+                    Image(uiImage: logoImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .padding(size * 0.12)
@@ -468,9 +570,21 @@ struct AssetMark: View {
                             RoundedRectangle(cornerRadius: size * 0.22)
                                 .stroke(AppTheme.borderColor, lineWidth: 1)
                         )
-                default:
-                    EmptyView()
+                } else {
+                    Color.clear.frame(width: 0, height: 0)
                 }
+            }
+            .task(id: themedLogoURL) {
+                let maxPixelSize = size * displayScale
+                if let hit = CachedImageLoader.cachedImage(for: themedLogoURL, maxPixelSize: maxPixelSize) {
+                    logoImage = hit
+                    return
+                }
+                // Never leave one company's logo on a row reused for another.
+                logoImage = nil
+                let loaded = await CachedImageLoader.load(url: themedLogoURL, maxPixelSize: maxPixelSize)
+                // A cancelled load must not blank a logo a newer task has set.
+                if !Task.isCancelled { logoImage = loaded }
             }
         }
     }
@@ -1459,19 +1573,28 @@ struct BugReportSheet: View {
 /// user has opted in via Settings → Account → "Shake to Report Bug".
 extension Notification.Name {
     static let shakeToReport = Notification.Name("CT.shakeToReport")
+    /// Posted by `ShakeToReportToggle` so the root detector can follow the
+    /// opt-in without reading `UserDefaults` on the launch layout turn.
+    static let shakeToReportPreferenceChanged = Notification.Name("CT.shakeToReportPreferenceChanged")
 }
 
 /// Settings row for the shake-to-report opt-in toggle. Lives inside
 /// AccountQuickMenu below the Appearance row so the user can find it
-/// without scrolling past Account actions. Default false; the
-/// `ShakeDetectorViewController` reads the same UserDefaults key and
-/// stays subscribed only while this is on.
+/// without scrolling past Account actions. Default false. The root
+/// detector installs only after the first frame, and only while this is on.
 struct ShakeToReportToggle: View {
-    @AppStorage("shake_to_report_enabled") private var enabled: Bool = false
+    @AppStorage(ShakeToReportPreference.defaultsKey) private var enabled: Bool = false
 
     var body: some View {
         Toggle("Shake to Report Bug", isOn: $enabled)
             .accessibilityHint("When on, shaking the device opens a bug-report sheet. Default is off.")
+            .onChange(of: enabled) { _, newValue in
+                NotificationCenter.default.post(
+                    name: .shakeToReportPreferenceChanged,
+                    object: nil,
+                    userInfo: [ShakeToReportPreference.enabledUserInfoKey: newValue]
+                )
+            }
     }
 }
 

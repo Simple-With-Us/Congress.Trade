@@ -13,8 +13,14 @@ import {
   deliverUsageTelemetryEvent,
 } from './shared/thirdPartyTelemetry.ts';
 import { persistUsageTelemetryFallback } from './shared/thirdPartyTelemetry.ts';
-import { reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { gateQueuedDelivery, isOutboxSuppressed, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
+import { recordGenuineIngestFailure } from './ingestion/ingestFailureReviewQueue.ts';
+import {
+  ensureTerminalFailureReviewRow,
+  terminalFailureReason,
+} from './ingestion/terminalFailureReview.ts';
 import { executeQueuedCommand } from './client/commands.ts';
 import { updateCommandStatus } from './client/state.ts';
 import { sentryLoggerWarn } from './shared/sentryRuntime.ts';
@@ -97,6 +103,18 @@ export async function handleDeliveryMessage(
   await lease?.assertOwned();
   switch (msg.type) {
     case 'delivery.dispatch': {
+      // Subscriber alert pause (CT_DELIVERY_MODE) for messages queued before
+      // the switch or by another producer.  Returning false acks the message
+      // without completing the outbox row (gateQueuedDelivery re-opens or
+      // suppresses it).  Throws if settings never booted, so it retries.
+      const mode = readDeliveryMode();
+      if (mode !== 'deliver') {
+        if (!msg.subscriptionId) await gateQueuedDelivery(env, msg.txId, mode);
+        return false;
+      }
+      // A row suppressed while its message sat in the queue stays unsent
+      // after delivery resumes: ack it without dispatching.
+      if (!msg.subscriptionId && (await isOutboxSuppressed(env, msg.txId))) return false;
       const result = lease
         ? await dispatchWebhook(env, msg, lease)
         : await dispatchWebhook(env, msg);
@@ -179,6 +197,19 @@ export async function handleDeadLetterMessage(
       queue: 'ingest',
       reason: 'outbox_missing',
     });
+    try {
+      const message =
+        `dlq: ingestion outbox missing (${queue}/${msg.type}): ${recoveryError.message}`;
+      await ensureTerminalFailureReviewRow(
+        env,
+        msg.docId,
+        terminalFailureReason('dlq', `${queue}/${msg.type} ${recoveryError.message}`),
+        message,
+        { source: 'dlq' },
+      );
+    } catch (err) {
+      console.error(`failed to enqueue review for ${msg.docId} after missing outbox:`, err);
+    }
   }
   if (recovered.status === 'failed') {
     // VISIBLE TERMINAL STATE (autonomy diagnosis 2026-08-09, principle b):
@@ -193,15 +224,14 @@ export async function handleDeadLetterMessage(
     // equally visible) and excluded from every "why is this still pending"
     // query. Never clobbers an already-terminal/resolved row.
     try {
-      await run(
-        env.DB,
-        `UPDATE filings
-            SET ingest_status = 'error',
-                error = ?
-          WHERE doc_id = ?
-            AND ingest_status NOT IN ('persisted', 'error')`,
-        [`autonomy: ingestion outbox dead-letter budget exhausted (${queue}/${msg.type}): ${recoveryError.message}`.slice(0, 1000), msg.docId],
-      );
+      const terminalMsg =
+        `autonomy: ingestion outbox dead-letter budget exhausted (${queue}/${msg.type}): ${recoveryError.message}`;
+      await recordGenuineIngestFailure(env, msg.docId, terminalMsg.slice(0, 1000), {
+        source: 'ingest_dlq',
+        stage: 'ingest',
+        filingAlreadyStamped: false,
+        preserveTerminalStatus: true,
+      });
     } catch (err) {
       console.error(`failed to terminalize filing ${msg.docId} after outbox dead-letter:`, err);
     }

@@ -21,6 +21,18 @@ function makeEnv(sendFails = false) {
     params: [] as unknown[],
     bind(...params: unknown[]) { this.params = params; return this; },
     async all<T>() {
+      // CT-2459: bulk claim is UPDATE..RETURNING via all() — simulate the
+      // claim transition here so `run()` no longer sees it.
+      if (/SET status = 'sending'/i.test(sql) && /RETURNING/i.test(sql)) {
+        const now = String(this.params[1]);
+        const staleBefore = String(this.params[this.params.length - 1]);
+        const ready = (['pending', 'sending'].includes(row.status) && row.available_at <= now)
+          || (row.status === 'enqueued' && row.updated_at <= staleBefore);
+        if (!ready) return { results: [] as T[] };
+        row.status = 'sending'; row.attempts += 1;
+        row.available_at = String(this.params[0]); row.updated_at = now;
+        return { results: [{ doc_id: row.doc_id, attempts: row.attempts }] as T[] };
+      }
       if (/WHERE doc_id = \?/i.test(sql)) return { results: [row] as T[] };
       const now = String(this.params[0]);
       const staleBefore = String(this.params[1]);
@@ -46,9 +58,14 @@ function makeEnv(sendFails = false) {
     },
   });
   const send = vi.fn(async () => { if (fail) throw new Error('queue unavailable'); });
+  // CT-2459: flush prefers sendBatch; route it through `send` so the
+  // outage simulation and call assertions keep covering every message.
+  const sendBatch = vi.fn(async (messages: Array<{ body: unknown }>) => {
+    for (const m of messages) await send(m.body as never);
+  });
   const env = {
     DB: { prepare } as unknown as D1Database,
-    INGEST_QUEUE: { send, sendBatch: vi.fn() },
+    INGEST_QUEUE: { send, sendBatch },
   } as unknown as Env;
   return { env, row, send, recoverQueue: () => { fail = false; } };
 }

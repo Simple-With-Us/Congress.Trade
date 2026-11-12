@@ -34,6 +34,9 @@ function makeRecoveryEnv() {
       return null as T | null;
     },
     async all<T>() {
+      // Every transaction exists here: the scheduled flush's undeliverable-only
+      // scan (auto-recovery off) finds nothing.
+      if (/\(t\.id IS NULL OR t\.deprecated_at IS NOT NULL\)/i.test(sql)) return { results: [] as T[] };
       if (/FROM deliveries d\s+JOIN subscriptions s/i.test(sql) && /status = 'quarantined'/i.test(sql)) {
         const rows: unknown[] = [];
         for (const d of deliveries.values()) {
@@ -131,8 +134,38 @@ describe('POST /delivery-requeue-quarantined', () => {
     const payload = (await res.json()) as { ok: boolean; recovery: { recovered: number }; flushed: { scanned: number } };
     expect(payload.ok).toBe(true);
     expect(payload.recovery.recovered).toBe(1);
-    expect(payload.flushed).toMatchObject({ scanned: 0, released: 0, skipped: 0, quarantineRecovered: 0 });
+    // Same keys as a real flush's ParkedFlushResult.
+    expect(payload.flushed).toEqual({
+      scanned: 0, released: 0, skipped: 0, terminalized: 0, quarantineRecovered: 0, quarantineTerminalized: 0,
+    });
     expect(deliveries.get('sub_1:tx_q')!.status).toBe('quarantined');
+  });
+
+  it('recovers live rows on an explicit call while auto-recovery is off, once parked depth is under the cap', async () => {
+    const { env, deliveries } = makeRecoveryEnv();
+    (env as unknown as Record<string, string>).DELIVERY_TARGET_PARKED_CAP = '1';
+    // Parked depth at the cap: nothing can be recovered yet.
+    deliveries.set('sub_1:tx_p', { subscription_id: 'sub_1', tx_id: 'tx_p', status: 'parked', attempts: 0, last_error: null });
+    const blocked = await app.request(
+      '/delivery-requeue-quarantined',
+      { method: 'POST', headers: AUTH, body: JSON.stringify({ limit: 10 }) },
+      env,
+    );
+    expect(blocked.status).toBe(200);
+    await expect(blocked.json()).resolves.toMatchObject({ recovery: { recovered: 0, skipped: 1 } });
+    expect(deliveries.get('sub_1:tx_q')!.status).toBe('quarantined');
+
+    // The parked row drains (delivered), headroom opens, and the same explicit
+    // call now re-parks the live row even though the scheduled gate is off.
+    deliveries.get('sub_1:tx_p')!.status = 'delivered';
+    const res = await app.request(
+      '/delivery-requeue-quarantined',
+      { method: 'POST', headers: AUTH, body: JSON.stringify({ limit: 10 }) },
+      env,
+    );
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ ok: true, recovery: { recovered: 1 } });
+    expect(deliveries.get('sub_1:tx_q')!.status).toBe('parked');
   });
 
   it('applies default limit when the body is empty', async () => {

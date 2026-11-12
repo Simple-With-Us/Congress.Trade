@@ -120,6 +120,21 @@ describe('matchesFilters', () => {
     expect(matchesFilters(tx({ firstSeenAt: new Date().toISOString() }), {})).toBe(true);
   });
 
+  it('matches a fresh disclosure under default filters {} though its trade date is weeks old', () => {
+    // Disclosures are filed a median ~52 days after the trade.  The old trade
+    // date must not drop a filing that was filed and first seen today.
+    const oldTradeDay = new Date(Date.now() - 52 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    expect(matchesFilters(tx({ txDate: oldTradeDay }), {})).toBe(true);
+  });
+
+  it('judges freshness as of freshnessAtMs when the caller passes one', () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const parked = tx({ txDate: tenDaysAgo.slice(0, 10), filedDate: tenDaysAgo.slice(0, 10), firstSeenAt: tenDaysAgo, createdAt: tenDaysAgo });
+    expect(matchesFilters(parked, {})).toBe(false);
+    expect(matchesFilters(parked, {}, Date.parse(tenDaysAgo))).toBe(true);
+    expect(matchesFiltersWithContext(parked, {}, { freshnessAtMs: Date.parse(tenDaysAgo) })).toBe(true);
+  });
+
   it('filters by transaction side (buys only)', () => {
     expect(matchesFilters(tx({ txType: 'B' }), { sides: ['B'] })).toBe(true);
     expect(matchesFilters(tx({ txType: 'S' }), { sides: ['B'] })).toBe(false);

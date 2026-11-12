@@ -21,6 +21,7 @@
 
 import { SEMANTIC_DARK, SEMANTIC_DARK_NEG, SEMANTIC_LIGHT } from './semanticThemeTokens.ts';
 import { assetVersion } from './assets.ts';
+import { minifyCss } from './minifyCss.ts';
 
 export const DASHBOARD_CSS = /* css */ `
 
@@ -31,6 +32,9 @@ export const DASHBOARD_CSS = /* css */ `
     --panel:     #121b30;
     --panel-2:   #172440;
     --border:    #2e3e65;
+    /* CT-2459: form-control boundaries need 3:1 (WCAG 1.4.11); --border is
+       1.6:1 decorative chrome. Controls use this stronger token. */
+    --control-border: #647fae;
     --text:      #ffffff;
     --text-dim:  #b8c7dd;
     --icon-grey: #9ca3af; /* medium grey for header hamburger + info glyphs (dark theme) */
@@ -85,6 +89,7 @@ export const DASHBOARD_CSS = /* css */ `
     --panel:     #ffffff;
     --panel-2:   #e8eff8;
     --border:    #c1cde2;
+    --control-border: #6e829f;
     --text:      #09101c;
     --icon-grey: #6b7280; /* medium grey for header hamburger + info glyphs */
     --text-dim:  #34435b;
@@ -346,13 +351,21 @@ export const DASHBOARD_CSS = /* css */ `
   nav.tabs a:hover { color: var(--text); background: var(--panel); }
   nav.tabs a.active { color: var(--text); background: var(--panel-2); border-color: var(--border); font-weight: 600; }
   nav.tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* CT-2505: the icon is a real element with aria-hidden, not CSS
+     generated content (generated content was announced again next to the
+     visible label: "Trends Trends").  Hidden on the desktop row; the
+     phone dock shows it.  Admin short labels are display:none by default
+     so the accessible name is the full label exactly once. */
+  nav.tabs .tab-ico { display: none; }
+  nav.tabs .tab-label-short { display: none; }
   /* Admin-only tabs (Review Queue / Admin · Cadence) are long labels that
-     crowd row 1 at laptop widths; desktop shows their short data-mobile
-     label and keeps the full text in the tooltip.  Phones already render
-     data-mobile under the icon. */
+     crowd row 1 at laptop widths; desktop shows the short label and keeps
+     the full text in the tooltip.  Phones render the short label under
+     the icon.  Only one of full/short is display:none-swapped, so the
+     name never includes both. */
   @media (min-width: 769px) and (hover: hover) {
-    nav.tabs a[data-admin-tab] { font-size: 0; }
-    nav.tabs a[data-admin-tab]::before { content: attr(data-mobile) / ""; font-size: 13px; }
+    nav.tabs a[data-admin-tab] .tab-label-full { display: none; }
+    nav.tabs a[data-admin-tab] .tab-label-short { display: inline; font-size: 13px; }
   }
   .tab-count-badge {
     display: none;
@@ -389,9 +402,19 @@ export const DASHBOARD_CSS = /* css */ `
   .view.active { display: block; }
   .toolbar { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; margin-bottom: 22px; }
   input, select {
-    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); border: 1px solid var(--control-border);
     padding: 8px 11px; border-radius: 8px; font-size: 13px; font-family: var(--sans);
   }
+  /* CT-2459: skip link — first tab stop, revealed on focus (same pattern
+     family as .row-open-btn). */
+  .skip-link {
+    position: absolute; left: 12px; top: -60px; z-index: 200;
+    background: var(--accent); color: #fff; padding: 10px 16px;
+    border-radius: 0 0 8px 8px; font-weight: 600; text-decoration: none;
+    transition: top 0.15s ease;
+  }
+  .skip-link:focus-visible { top: 0; outline: 2px solid var(--text); outline-offset: -2px; }
+  main:focus { outline: none; }
   input::placeholder { color: var(--text-dim); }
   .grid-cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 19px; margin-bottom: 32px; }
   #view-trends #trKpis.grid-cards {
@@ -415,7 +438,7 @@ export const DASHBOARD_CSS = /* css */ `
   .card .v .bp-n { font-size: 28px; font-weight: 700; }
   .card .v .bp-pct { font-size: 28px; font-weight: 700; margin: 0; letter-spacing: 0; }
   .card .v .bp-w { font-size: 14px; font-weight: 500; margin-left: 0.25em; color: var(--text-dim); }
-  .kpi-note { font-size: 10px; font-weight: 500; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; margin-top: 6px; color: var(--text-dim); }
+  .kpi-note { font-size: 11px; font-weight: 500; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; margin-top: 6px; color: var(--text-dim); }
   /* Trends snapshot: extras (option footnote, sparkline) live inside .v so
      the figure + extra center as one group under a top-pinned heading. */
   #trKpis .card .v {
@@ -440,8 +463,10 @@ export const DASHBOARD_CSS = /* css */ `
     pointer-events: none;
     flex: 0 0 auto;
   }
-  .info-tip { color: var(--text-dim); cursor: help; border-bottom: 0; text-decoration: none; font-size: .82em; line-height: 1; vertical-align: .35em; margin-left: 1px; }
-  .info-tip:hover, .info-tip:focus-visible { color: var(--accent); outline: none; }
+  /* CT-2459: info-tip is a real <button> now — reset its chrome to the old span look. */
+  .info-tip { color: var(--text-dim); cursor: help; border: 0; background: none; padding: 0; font: inherit; text-decoration: none; font-size: .82em; line-height: 1; vertical-align: .35em; margin-left: 1px; }
+  .info-tip:hover { color: var(--accent); }
+  .info-tip:focus-visible { color: var(--accent); outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
   table { width: 100%; border-collapse: collapse; background: color-mix(in srgb, var(--panel) 75%, transparent); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid color-mix(in srgb, var(--border) 70%, transparent); border-radius: var(--radius); overflow: hidden; box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.1), 0 8px 32px rgba(0, 0, 0, 0.2); }
   th, td { text-align: center; padding: 11px 13px; border-bottom: 1px solid var(--border); border-right: 1px solid color-mix(in srgb, var(--border) 42%, transparent); font-size: 13px; vertical-align: middle; }
   th, .v, .fval, .hval, .latency, .est-money, .amount-range, .amount-tier-line, .fc-amt-val, .def-v { font-variant-numeric: tabular-nums; }
@@ -598,7 +623,14 @@ export const DASHBOARD_CSS = /* css */ `
      white would fail contrast (the dark-mode badge-contrast test below). */
   .tag.B, .tag.P { background: linear-gradient(135deg, var(--buy), color-mix(in srgb, var(--buy) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--buy) 30%, transparent); color: #fff; }
   html[data-theme="dark"] .tag.B, html[data-theme="dark"] .tag.P { color: #080c17; }
-  .tag.S { background: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--sell) 30%, transparent); }
+  /* CT-2505: opaque --sell under the gradient so the badge fill is the
+     token (the shorthand used to reset background-color to transparent).
+     Light mode's dark red takes white ink (8.31:1 on #991b1b, higher on
+     the darker gradient stop).  Dark mode's light pink cannot take white
+     ink (2.55:1); it uses the same near-black as Buy, and a shallower
+     black mix so that ink still clears 4.5:1 on the darker stop. */
+  .tag.S { background-color: var(--sell); background-image: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--sell) 30%, transparent); color: #fff; }
+  html[data-theme="dark"] .tag.S { color: #080c17; background-image: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 82%, #000)); }
   .tag.E { background: linear-gradient(135deg, var(--exch), color-mix(in srgb, var(--exch) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--exch) 30%, transparent); color: #080c17; }
   html[data-theme="light"] .tag.E { color: #fff; }
   .conf { font-family: var(--mono); font-size: 12px; }
@@ -621,7 +653,7 @@ export const DASHBOARD_CSS = /* css */ `
   .fc-row2 .avatar { width: 22px; height: 22px; font-size: 8px; }
   .fc-sep { opacity: .5; margin: 0 1px; }
   .fc-member { color: var(--text); }
-  .fc-owner { display: inline-block; flex: 0 0 auto; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .3px; color: var(--text); }
+  .fc-owner { display: inline-block; flex: 0 0 auto; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .3px; color: var(--text); }
   .fc-member.clickable:active { text-decoration: underline; }
   .fc-chevron { grid-column: 2; justify-self: end; color: var(--text-dim); font-size: 22px; line-height: 1; opacity: .55; pointer-events: none; }
   /* Visually hidden but still readable by AT — folded into the card's
@@ -694,7 +726,7 @@ export const DASHBOARD_CSS = /* css */ `
      wide drawer cannot stretch the value away from its label. */
   .def-grid { display: grid; grid-template-columns: min(35%, 180px) 1fr; gap: 7px 14px; margin: 0; max-width: 560px; }
   .def-item { display: contents; }
-  .def-k { min-width: 0; color: var(--text-dim); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; align-self: center; }
+  .def-k { min-width: 0; color: var(--text-dim); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; align-self: center; }
   .def-v { min-width: 0; color: var(--text); font-weight: 600; font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; align-self: center; }
   /* Trade-drawer header — makes a tapped trade read as a TRANSACTION, not a company. */
   .drawer-trade-head { padding: 2px 0 6px; }
@@ -717,8 +749,8 @@ export const DASHBOARD_CSS = /* css */ `
   /* Owner punch list #13(c): Owner (Self/Spouse/Joint) rides beside the
      politician's name at the top of the trade drawer instead of its own row
      further down in Trade Details. */
-  .drawer-trade-owner { display:inline-block; flex:0 0 auto; padding:1px 6px; border-radius:999px; border:1px solid var(--border); background:var(--panel-2); font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:.3px; vertical-align:middle; }
-  .owner-badge { display:inline-block; flex:0 0 auto; padding:1px 6px; border-radius:999px; border:1px solid var(--border); background:var(--panel-2); font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:.3px; vertical-align:middle; }
+  .drawer-trade-owner { display:inline-block; flex:0 0 auto; padding:1px 6px; border-radius:999px; border:1px solid var(--border); background:var(--panel-2); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.3px; vertical-align:middle; }
+  .owner-badge { display:inline-block; flex:0 0 auto; padding:1px 6px; border-radius:999px; border:1px solid var(--border); background:var(--panel-2); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.3px; vertical-align:middle; }
   .member-cell .owner-badge { margin-left: 2px; }
   /* Owner punch list #13(b): a small link chevron on the "Name" row in Trade
      Details signals it opens the politician drawer (the click already worked). */
@@ -756,6 +788,22 @@ export const DASHBOARD_CSS = /* css */ `
   @keyframes tr-shimmer { from { transform: translateX(100%); } to { transform: translateX(-100%); } }
   .sk-line { height: 12px; width: 100%; margin: 7px 0; }
   @media (prefers-reduced-motion: reduce) { .sk::after { animation: none; display: none; } }
+  /* CT-2459: reduced motion also stops positional transitions, not just
+     keyframe animations (the drawer slide was the big remaining mover). */
+  @media (prefers-reduced-motion: reduce) {
+    .drawer-panel, .card, .tcol, .skip-link { transition: none !important; }
+    html { scroll-behavior: auto !important; }
+  }
+  /* CT-2459: coarse pointers get real touch targets + no iOS focus zoom.
+     Desktop density (--control-h 34px, 13px fields) is untouched. */
+  @media (hover: none) and (pointer: coarse) {
+    :root { --control-h: 44px; }
+    input, select, .icon-input { font-size: 16px; }
+    .branch-info { width: 44px; height: 44px; }
+    .filters-info-wrap .branch-info { width: 44px; height: 44px; }
+    /* Chart # / $ and Directory People / Assets sit outside --control-h. */
+    .seg button { min-width: 44px; min-height: 44px; }
+  }
   /* Segmented time-range control for the buys/sells chart. */
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .seg button { background: transparent; border: 0; border-left: 1px solid var(--border); color: var(--text-dim); font: 600 12px var(--sans); padding: 5px 10px; cursor: pointer; }
@@ -764,7 +812,7 @@ export const DASHBOARD_CSS = /* css */ `
   .seg button:hover:not(.on) { color: var(--text); }
   .trades-card-meta { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 10px; min-width: 0; }
   .trades-card-meta > div { min-width: 0; }
-  .trades-card-meta .mkey { display: block; color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .4px; margin-bottom: 2px; }
+  .trades-card-meta .mkey { display: block; color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; margin-bottom: 2px; }
   .trades-card-meta .mval { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
   .latency { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
   .amount-cell { display:flex; flex-direction:column; gap:2px; align-items:center; min-width:0; line-height:1.15; text-align:center; }
@@ -1121,8 +1169,9 @@ export const DASHBOARD_CSS = /* css */ `
      Columns always flex to the container width so the chart fits the card
      (including phone screens) without horizontal scrolling. */
   .tchart { display:flex; align-items:flex-end; gap:2px; height:180px; overflow-x:hidden; padding-top:6px; width:100%; max-width:100%; box-sizing:border-box; }
-  .tcol { display:flex; flex-direction:column; align-items:center; gap:4px; flex:1 1 0; min-width:0; transition: opacity 0.15s; outline: none; cursor: pointer; }
-  .tcol:hover, .tcol:focus-visible { opacity: 0.8; }
+  .tcol { display:flex; flex-direction:column; align-items:center; gap:4px; flex:1 1 0; min-width:0; transition: opacity 0.15s; cursor: pointer; }
+  .tcol:hover { opacity: 0.8; }
+  .tcol:focus-visible { opacity: 0.85; outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 4px; }
   .tbars { display:flex; align-items:flex-end; justify-content:center; gap:2px; height:150px; width:100%; }
   .tbars i { display:block; width:max(2px, calc(50% - 1px)); max-width:9px; border-radius:2px 2px 0 0; min-height:0; }
   .tchart-head { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; flex-wrap:wrap; }
@@ -1202,7 +1251,7 @@ export const DASHBOARD_CSS = /* css */ `
      labels beneath them. A reserved height keeps every column the same
      total height regardless of label content, so all bars share one baseline
      above the label row and never dip below it. */
-  .tlbl { display:block; height:12px; line-height:12px; font-size:9px; color: var(--text-dim); font-family: var(--mono); white-space:nowrap; }
+  .tlbl { display:block; height:13px; line-height:13px; font-size:11px; color: var(--text-dim); font-family: var(--mono); white-space:nowrap; }
   .legend { display:flex; gap:14px; font-size:12px; color: var(--text-dim); margin-bottom:6px; }
   .legend .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle; }
   .legend .sw.buy { background: var(--buy); } .legend .sw.sell { background: var(--sell); }
@@ -1392,7 +1441,7 @@ export const DASHBOARD_CSS = /* css */ `
      phones), and the ledger block itself stops at 560px so a wide drawer does
      not stretch values away from their labels. */
   .drawer-kv { display:grid; grid-template-columns:min(35%, 180px) 1fr; gap:8px 14px; margin:0; font-size:13px; align-items:center; max-width:560px; }
-  .drawer-kv dt { color:var(--text-dim); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .drawer-kv dt { color:var(--text-dim); font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .drawer-kv dd { margin:0; text-align:left; word-break:break-word; font-weight:600; color:var(--text); }
   .tier-gate-note { font-size:12px; color:var(--text-dim); background:var(--panel-2); border:1px dashed var(--border); border-radius:8px; padding:9px 11px; line-height:1.5; }
   /* Owner punch list #18(a): the ticker drawer's 5 stat cards (grid-cards
@@ -1513,8 +1562,8 @@ export const DASHBOARD_CSS = /* css */ `
     .diag-card { padding: 12px 14px; display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; }
     .diag-head { margin-bottom: 0; width: 100%; border-bottom: 1px solid var(--border-light); padding-bottom: 4px; margin-bottom: 4px; }
     .diag-meta { grid-template-columns: repeat(2, auto 1fr); gap: 2px 8px; width: 100%; margin-bottom: 0; }
-    .diag-meta span { font-size: 10px; }
-    .diag-note { width: 100%; padding-top: 4px; margin-top: 4px; font-size: 10px; }
+    .diag-meta span { font-size: 11px; }
+    .diag-note { width: 100%; padding-top: 4px; margin-top: 4px; font-size: 11px; }
     .drawer-panel { width:100%; max-width:100%; bottom:0; top:auto; height:90vh; border-radius:12px 12px 0 0; transform: translateY(100%); }
     .drawer.open .drawer-panel { animation: slideUpIn 0.34s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
   }
@@ -1523,7 +1572,7 @@ export const DASHBOARD_CSS = /* css */ `
   footer .footer-links { display:inline-flex; flex-wrap:wrap; gap:12px 16px; justify-content:center; }
   footer .footer-links a { color: var(--text-dim); text-decoration:none; }
   footer .footer-links a:hover { color: var(--accent); }
-  footer .swu-attribution { display:inline-flex; align-items:center; gap:5px; color:var(--text-dim); text-decoration:none; font-size:10px; }
+  footer .swu-attribution { display:inline-flex; align-items:center; gap:5px; color:var(--text-dim); text-decoration:none; font-size:11px; }
   footer .swu-attribution:hover { color:var(--accent); }
   footer .swu-attribution:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
   footer .swu-attribution img { display:block; width:min(288px, calc(100vw - 105px)); height:auto; }
@@ -1771,7 +1820,8 @@ export const DASHBOARD_CSS = /* css */ `
   .branch-toggle, .party-chip, .side-chip { height: var(--control-h); }
   .branch-toggle.on { background: var(--accent); color: #fff; box-shadow: none; }
   .party-chip.on[data-party="D"] { background: var(--buy); box-shadow: none; }
-  .party-chip.on[data-party="R"] { background: var(--sell); box-shadow: none; }
+  .party-chip.on[data-party="R"] { background: var(--sell); color: #fff; box-shadow: none; }
+  html[data-theme="dark"] .party-chip.on[data-party="R"] { color: #080c17; }
   .party-chip.on[data-party="O"] { background: var(--accent); color:#fff; box-shadow: none; }
 
   /* iOS-style filter dropdowns (Trades + Trends). The old H/S/P chip strip
@@ -1872,7 +1922,9 @@ export const DASHBOARD_CSS = /* css */ `
   .ios-filter .ios-filter-item.side-chip.on[data-side="E"] .side-ex { color: var(--text); }
   .side-chip.on[data-side="B"] { background: var(--buy); box-shadow: none; }
   .side-chip.on[data-side="B"] .side-up { color:#fff; }
-  .side-chip.on[data-side="S"] { background: var(--sell); box-shadow: none; }
+  .side-chip.on[data-side="S"] { background: var(--sell); color: #fff; box-shadow: none; }
+  html[data-theme="dark"] .side-chip.on[data-side="S"] { color: #080c17; }
+  html[data-theme="dark"] .side-chip.on[data-side="S"] .side-dn { color: #080c17; }
   .side-chip.on[data-side="S"] .side-dn { color:#fff; }
   .side-chip.on[data-side="E"] { background: var(--exch); box-shadow: none; }
   .side-chip.on[data-side="E"] .side-ex { color:#fff; }
@@ -1887,7 +1939,8 @@ export const DASHBOARD_CSS = /* css */ `
      here vs 17px previously) so the two header glyphs sit at the same visual
      weight. Stays centered inside the same-size 28px circle. */
   .branch-info { width:24px; height:24px; border-radius:999px; border:none; background:transparent; color:var(--icon-grey); font-size:13px; line-height:1; cursor:pointer; padding:0; display:flex; align-items:center; justify-content:center; }
-  .branch-info:hover, .branch-info:focus-visible, .branch-info[aria-expanded="true"] { color:var(--accent); outline:none; }
+  .branch-info:hover, .branch-info[aria-expanded="true"] { color:var(--accent); }
+  .branch-info:focus-visible { color:var(--accent); outline:2px solid var(--accent); outline-offset:2px; }
   .branch-pop { position:absolute; top:calc(100% + 8px); left:0; z-index:60; min-width:270px; max-width:min(340px, 92vw); background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:10px 12px; display:grid; gap:6px; font-size:12px; color:var(--text); box-shadow:0 10px 30px rgba(0,0,0,.35); }
   .branch-pop-row { display:grid; grid-template-columns:16px 1fr; gap:8px; align-items:baseline; }
   /* Owner feedback: this legend previously painted every glyph (H/S/P, the
@@ -2063,7 +2116,8 @@ export const DASHBOARD_CSS = /* css */ `
   /* ---- Speed vs data providers (provider scorecard grid) ---- */
   .speed-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
   .speed-head h3 { margin:0; }
-  .speed-kicker { font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:var(--accent); margin-bottom:4px; opacity:0.85; }
+  /* CT-2459: no opacity fade — accent at 0.85 measured <4.5:1 on panel-2. */
+  .speed-kicker { font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:var(--text-dim); margin-bottom:4px; }
   /* Scorecard grid — one card per provider, side by side */
   .sp-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-top:14px; }
   .sp-card {
@@ -2154,7 +2208,7 @@ export const DASHBOARD_CSS = /* css */ `
   .sp-wlt-val.w { color:var(--good); }
   .sp-wlt-val.l { color:var(--rival); }
   .sp-wlt-val.t { color:var(--text-dim); }
-  .sp-wlt-key { font-size:9.5px; text-transform:uppercase; letter-spacing:0.8px; color:var(--text-dim); opacity:0.7; }
+  .sp-wlt-key { font-size:11px; text-transform:uppercase; letter-spacing:0.8px; color:var(--text-dim); }
   /* n= sample chip */
   .sp-sample { font-size:10.5px; color:var(--text-dim); line-height:1.3; }
   /* Empty / gathering state */
@@ -2258,11 +2312,11 @@ export const DASHBOARD_CSS = /* css */ `
       html[data-theme="light"] nav.tabs { background: #fff; }
     }
     nav.tabs a {
-      display: block; height: auto; white-space: normal;
-      padding: 6px 2px; min-height: 44px; font-size: 0; min-width: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: auto; white-space: normal;
+      padding: 6px 2px; min-height: 44px; font-size: 10px; line-height: 1.1; min-width: 0;
       border-radius: 0; border: 0; background: transparent;
     }
-    nav.tabs a[data-admin-tab] { font-size: 0; }
     nav.tabs a.active {
       background: transparent;
       box-shadow: none;
@@ -2270,8 +2324,10 @@ export const DASHBOARD_CSS = /* css */ `
     html[data-theme="dark"] nav.tabs a.active {
       background: transparent;
     }
-    nav.tabs a::before { content: attr(data-icon) / ""; display: block; font-size: 16px; line-height: 1; margin-bottom: 3px; }
-    nav.tabs a::after { content: attr(data-mobile) / ""; display: block; font-size: 10px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    nav.tabs .tab-ico { display: block; font-size: 16px; line-height: 1; margin-bottom: 3px; }
+    nav.tabs .tab-label { display: block; max-width: 100%; font-size: 10px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    nav.tabs a[data-admin-tab] .tab-label-full { display: none; }
+    nav.tabs a[data-admin-tab] .tab-label-short { display: block; }
     .tab-count-badge,
     .tab-count-badge.is-on {
       position: absolute;
@@ -2296,11 +2352,11 @@ export const DASHBOARD_CSS = /* css */ `
       padding-left: 1px;
       padding-right: 1px;
     }
-    html.ct-admin nav.tabs a::before {
+    html.ct-admin nav.tabs .tab-ico {
       font-size: 14px;
       margin-bottom: 2px;
     }
-    html.ct-admin nav.tabs a::after {
+    html.ct-admin nav.tabs .tab-label {
       font-size: clamp(8px, 2.3vw, 9px);
     }
     /* right:max(4px, calc(50% - 22px)) on .tab-count-badge above assumes the
@@ -2552,7 +2608,7 @@ export const DASHBOARD_CSS = /* css */ `
   @media (max-width: 420px) {
     .toolbar { grid-template-columns: repeat(2,minmax(0,1fr)); }
     .toolbar #qMember { grid-column:1 / -1; }
-    nav.tabs a::after { font-size: 9px; }
+    nav.tabs .tab-label { font-size: 9px; }
     th, td { padding: 9px 10px; }
     /* Rising Activity: tighter cells so all four headings fit on phones. */
     #tableTrTrending th, #tableTrTrending td { padding: 9px 6px; }
@@ -3217,5 +3273,14 @@ export const DASHBOARD_CSS = /* css */ `
   }
 `;
 
+/**
+ * CT-2459: what browsers actually download — DASHBOARD_CSS minified at
+ * module load (comments/whitespace stripped by minifyCss). DASHBOARD_CSS
+ * stays the readable source so stylesheet tests/tooling keep working
+ * against authored text; routes serve SERVED and the `?v=` fingerprint
+ * below is taken over the served bytes.
+ */
+export const DASHBOARD_CSS_SERVED = minifyCss(DASHBOARD_CSS);
+
 /** `?v=` cache-busting fingerprint; see assetVersion(). */
-export const DASHBOARD_CSS_VERSION = assetVersion(DASHBOARD_CSS);
+export const DASHBOARD_CSS_VERSION = assetVersion(DASHBOARD_CSS_SERVED);

@@ -1,0 +1,20 @@
+[Unit]
+Description=Weekly sqlite backup restore drill
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fleet-backup-restore-drill.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=6h
+SyslogIdentifier=fleet-backup-restore-drill
+# Sample unit only. Host install waits for Jay. Do not enable this from the repo.
+# Environment=FLEET_BACKUP_DRILL_APPS=congress
+# Environment=FLEET_BACKUP_DRILL_WORKDIR=/var/tmp/fleet-backup-restore-drill
+# Environment=FLEET_BACKUP_ROOT=/data/backups
+# Environment=FLEET_BACKUP_DRILL_LOCKFILE=/var/lock/fleet-backup-restore-drill.lock
+
+[Install]
+WantedBy=multi-user.target

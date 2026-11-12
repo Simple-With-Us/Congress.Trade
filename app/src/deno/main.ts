@@ -21,6 +21,7 @@ import { resolveProductionSentryEnv } from '../shared/sentryRuntime.ts';
 import { datadogCaptureException, initProductionDatadog } from '../shared/datadog.ts';
 import { resolveProductionDatadogEnv } from '../shared/datadogRuntime.ts';
 import { captureException, flushSentry, initProductionSentry } from '#sentry';
+import { stampTcpPeer } from '../security/originLock.ts';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
@@ -108,8 +109,9 @@ const secretEnv = {
 // snapshot (Infisical SOT: startup load, in-memory cache, background refresh,
 // write-through on admin save — see INFISICAL.md).  Boot fails fast here if
 // the resolver is misconfigured; individual knobs stay fail-soft with safe
-// defaults.
-await refreshSecrets(secretEnv);
+// defaults.  The 5s abort bounds a hung Infisical connection so Coolify boot
+// cannot stall forever on a fetch that never returns (OPS-1055, from PR #2962).
+await refreshSecrets(secretEnv, { signal: AbortSignal.timeout(5_000) });
 const settings = await initSettings(secretEnv);
 startSettingsRefresh(secretEnv);
 // SIGHUP = on-demand settings reload (canonical "Reload settings" path).
@@ -378,6 +380,10 @@ if (!costProfile.disableInternalCron) {
           signal: tickAbort.signal,
           includeDailyJobs: false,
           includeLatencyLanes: false,
+          // CT-2459: the singleton must outlive the longest legal tick, or a
+          // raised CT_TICK_DEADLINE_MS lets the lock expire mid-tick and a
+          // second tick runs concurrently on the single connection.
+          lockTtlMs: tickDeadlineMs + 30_000,
         },
       ));
       let softTimeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -483,10 +489,12 @@ const dummyCtx = {
 // Start HTTP Server
 const portStr = Deno.env.get('PORT');
 const port = portStr ? parseInt(portStr, 10) : 5000;
-Deno.serve({ port }, async (req) => {
+Deno.serve({ port }, async (req, info) => {
   const env = buildEnv();
+  const peer = 'hostname' in info.remoteAddr ? info.remoteAddr.hostname : undefined;
+  const stamped = stampTcpPeer(req, peer);
   try {
-    return await app.fetch(req, env, dummyCtx as any);
+    return await app.fetch(stamped, env, dummyCtx as any);
   } finally {
     // Do not await: a 2s flush must not hold the HTTP response.  The
     // long-lived Deno process keeps the envelope fetch alive.

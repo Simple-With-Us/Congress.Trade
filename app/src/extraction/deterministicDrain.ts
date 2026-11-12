@@ -188,6 +188,11 @@ export async function maybeRunDeterministicReviewDrain(
           -- every minute is pure churn (observed 2026-08-20: H-2025-20033330
           -- revision climbing ~1/min for days).
           AND COALESCE(rq.reason, '') NOT LIKE '%future_tx_date%'
+          -- Same for a trade dated past the filing window (the parser reads
+          -- the same date again) and a 278-T parked for missing rows (the
+          -- same reader drops the same rows); both need a human or vision.
+          AND COALESCE(rq.reason, '') NOT LIKE '%tx_date_after_filing_window%'
+          AND COALESCE(rq.reason, '') NOT LIKE '%oge_rows_incomplete%'
           -- Attempt-capped cascade disagreement is human-review terminal.
           -- Re-extracting the same textPdf every minute (live 2026-08-26:
           -- H-2026-20035235 revision 3600+, H-2026-20035196 2700+) only

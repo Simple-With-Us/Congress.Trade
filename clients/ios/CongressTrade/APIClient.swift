@@ -137,13 +137,54 @@ final class CongressTradeAPIClient {
     private let session: URLSession
     private let interceptor: RequestInterceptor
     private let decoder: JSONDecoder
+    /// Backoff sleep behind the GET retry loop. Production suspends with
+    /// `Task.sleep` (throws on cancel); tests inject a recorder/no-op.
+    private let retrySleeper: (TimeInterval) async throws -> Void
+
+    /// Dedicated production session with a sized URLCache so idempotent GETs
+    /// can honor server `Cache-Control`/`ETag` (Batch 4 lands those headers
+    /// server-side; without them responses simply are not stored and every
+    /// request still goes to the network — no behavior change today).
+    /// Tests keep injecting their own MockURLProtocol session.
+    static func makeDefaultSession() -> URLSession {
+        let configuration = URLSessionConfiguration.default
+        configuration.requestCachePolicy = .useProtocolCachePolicy
+        configuration.urlCache = URLCache(
+            memoryCapacity: 10 * 1024 * 1024,
+            diskCapacity: 50 * 1024 * 1024,
+            diskPath: "trade.congress.api-cache"
+        )
+        return URLSession(configuration: configuration)
+    }
+
+    /// Cache policy per request. Only allowlisted idempotent public GETs may
+    /// use the protocol cache; everything account-scoped (`/me` via
+    /// bootstrap, preferences, subscriptions, commands), premium-gated
+    /// (documents), admin, auth, and every mutation bypasses the cache.
+    /// Fail-closed: an unrecognized path is never cached.
+    static func cachePolicy(for url: URL, method: String = "GET") -> URLRequest.CachePolicy {
+        guard method.uppercased() == "GET" else { return .reloadIgnoringLocalCacheData }
+        let path = url.path
+        let cacheable = path.hasSuffix("/feed")
+            || path.contains("/member/")
+            || path.contains("/ticker/")
+            || path.contains("/trade/")
+            || path == "/api/members"
+            || path == "/api/assets"
+            || path.hasPrefix("/api/analytics/")
+            || path.hasPrefix("/api/logos/")
+        return cacheable ? .useProtocolCachePolicy : .reloadIgnoringLocalCacheData
+    }
 
     init(
         baseURL: URL = CongressTradeAPIClient.defaultBaseURL,
         tokenStore: SessionTokenStore = KeychainTokenStore(),
         deviceEntitlementStore: SessionTokenStore = KeychainTokenStore(service: "trade.congress.appleDeviceEntitlement"),
-        session: URLSession = .shared,
-        interceptor: RequestInterceptor? = nil
+        session: URLSession = CongressTradeAPIClient.makeDefaultSession(),
+        interceptor: RequestInterceptor? = nil,
+        retrySleeper: @escaping (TimeInterval) async throws -> Void = { delay in
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
     ) {
         self.baseURL = baseURL
         self.tokenStore = tokenStore
@@ -151,6 +192,7 @@ final class CongressTradeAPIClient {
         self.session = session
         self.interceptor = interceptor ?? AuthHeaderInterceptor(tokenStore: tokenStore)
         self.decoder = JSONDecoder()
+        self.retrySleeper = retrySleeper
     }
 
     deinit {
@@ -921,6 +963,7 @@ final class CongressTradeAPIClient {
     private func postCommand<T: Decodable>(idempotencyKey: String, body: [String: Any]) async throws -> ClientCommandResponse<T> {
         var request = try makeRequest(endpointURL("commands"))
         request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(idempotencyKey, forHTTPHeaderField: "idempotency-key")
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -986,7 +1029,7 @@ final class CongressTradeAPIClient {
 
     private func makeRequest(_ url: URL) throws -> URLRequest {
         var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.cachePolicy = Self.cachePolicy(for: url)
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "accept")
         // congress.trade sits behind a Cloudflare managed challenge that 502s
@@ -1004,6 +1047,7 @@ final class CongressTradeAPIClient {
     private func makeAdminRequest(_ url: URL, method: String = "GET", body: [String: Any]? = nil) throws -> URLRequest {
         var request = try makeRequest(url)
         request.httpMethod = method
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "content-type")
             request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -1038,6 +1082,54 @@ final class CongressTradeAPIClient {
     }
 
     private func send<T: Decodable>(_ request: URLRequest) async throws -> T {
+        // Deploy-window retry (CONGRESS-TRADE-25): idempotent GETs ride
+        // through a short origin swap instead of surfacing an error the
+        // user must pull-to-refresh away. Mutations never retry here, and
+        // admin calls use sendAdmin, which has no loop at all.
+        var request = request
+        // Marks GETs that this loop will retry, so Sentry beforeSend can drop
+        // the per-attempt HTTPClientError without silencing widget or image
+        // loads that use a different session and do not retry.
+        if (request.httpMethod ?? "GET").uppercased() == "GET" {
+            request.setValue(
+                TransientRetryPolicy.retryHeaderValue,
+                forHTTPHeaderField: TransientRetryPolicy.retryHeaderName
+            )
+        }
+        var retries = 0
+        while true {
+            do {
+                return try await sendOnce(request)
+            } catch let error as APIError {
+                let retryable = TransientRetryPolicy.shouldRetry(error: error, method: request.httpMethod)
+                guard retryable, retries < TransientRetryPolicy.maxRetries else {
+                    if retries > 0, retryable, case .server(let status, _, _) = error,
+                        TransientRetryPolicy.retryableStatuses.contains(status) {
+                        SentryTelemetry.captureExhaustedRetry(
+                            method: request.httpMethod ?? "GET",
+                            path: request.url?.path,
+                            status: status,
+                            attempts: retries + 1
+                        )
+                    }
+                    throw error
+                }
+                retries += 1
+                // CancellationError becomes APIError so callers that only
+                // check isCancellation do not paint a banner for a dismissed
+                // view. Task.sleep throws that error when the task is cancelled.
+                do {
+                    try Task.checkCancellation()
+                    try await retrySleeper(TransientRetryPolicy.delay(for: error, retryIndex: retries - 1))
+                } catch is CancellationError {
+                    throw APIError.transport(URLError(.cancelled))
+                }
+            }
+        }
+    }
+
+    /// Single attempt behind `send`'s retry loop.
+    private func sendOnce<T: Decodable>(_ request: URLRequest) async throws -> T {
         let (data, response) = try await perform(request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
@@ -1051,6 +1143,13 @@ final class CongressTradeAPIClient {
     }
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        // Belt-and-braces: a mutation must never be served from (or stored
+        // in) the URL cache, whatever policy makeRequest picked while the
+        // request still looked like a GET.
+        var request = request
+        if (request.httpMethod ?? "GET").uppercased() != "GET" {
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+        }
         do {
             return try await session.data(for: request)
         } catch let error as URLError {
@@ -1081,6 +1180,53 @@ struct AssetDirectoryEntry: Decodable, Identifiable, Hashable {
 
 struct APIErrorResponse: Decodable {
     let error: String
+}
+
+/// Retry policy for idempotent GETs through short deploy-window
+/// outages (CONGRESS-TRADE-25): while the origin swap has no server, edge
+/// and LB failures surface as 502/503/504 — Cloudflare's own page carries
+/// `Retry-After: 60`, far too long for an interactive app. Pure (no
+/// networking, no sleeping) so tests pin the decisions directly.
+struct TransientRetryPolicy: Sendable {
+    /// Extra attempts after the first try: 3 requests worst case.
+    static let maxRetries = 2
+    /// Server `Retry-After` is honored only up to this.
+    static let maxRetryAfterDelay: TimeInterval = 5
+    /// Deploy-window statuses worth another GET. Other failures fail fast
+    /// at this layer. Callers must not run a second loop over errors
+    /// `shouldRetry` still accepts: this policy already exhausted them.
+    static let retryableStatuses: Set<Int> = [502, 503, 504]
+    /// Request header set on GETs that pass through `send`'s retry loop.
+    /// Sentry's automatic failed-request event keeps the header (it is not
+    /// in the SDK's security-header denylist), so beforeSend can tell a
+    /// retried API GET from a widget or image GET.
+    static let retryHeaderName = "X-Congress-Retry"
+    static let retryHeaderValue = "deploy-window"
+
+    /// GET-only gate. POST/PUT/DELETE must never implicitly repeat —
+    /// callers own their idempotency keys.
+    static func shouldRetry(error: APIError, method: String?) -> Bool {
+        guard (method ?? "GET").uppercased() == "GET" else { return false }
+        guard error.isRetryable else { return false }
+        switch error {
+        case .server(let status, _, _):
+            return retryableStatuses.contains(status)
+        case .transport(let urlError):
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost].contains(urlError.code)
+        case .invalidResponse:
+            return false
+        }
+    }
+
+    /// Backoff before retry number `retryIndex` (0-based). A positive
+    /// `Retry-After` is honored up to 5s. Zero is not an immediate burst:
+    /// it uses the same 1s then 2s schedule as a missing header.
+    static func delay(for error: APIError, retryIndex: Int) -> TimeInterval {
+        if let retryAfter = error.retryAfterSeconds, retryAfter > 0 {
+            return min(TimeInterval(retryAfter), maxRetryAfterDelay)
+        }
+        return retryIndex <= 0 ? 1 : 2
+    }
 }
 
 enum APIError: LocalizedError {

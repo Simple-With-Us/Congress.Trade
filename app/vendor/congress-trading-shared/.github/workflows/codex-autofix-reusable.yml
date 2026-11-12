@@ -73,8 +73,8 @@ name: Claude Code Autofix (Reusable)
 #           <repo-specific fixer policy>
 #
 # Org-level alternative (preferred):
-#   Move this file to jaywedgeworth22/.github/workflows/codex-autofix-reusable.yml
-#   and call it as jaywedgeworth22/.github/workflows/codex-autofix-reusable.yml@main.
+#   Move this file to Simple-With-Us/.github/workflows/codex-autofix-reusable.yml
+#   and call it as Simple-With-Us/.github/workflows/codex-autofix-reusable.yml@main.
 #   See docs/how-to-setup-org-dot-github.md for setup steps.
 
 on:

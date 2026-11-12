@@ -49,7 +49,7 @@ export async function redeemAppleEntitlementAnonymously(c: Context<{ Bindings: E
     return errorResponse(c, err);
   }
 
-  const ip = clientIp(c.req.raw);
+  const ip = clientIp(c.req.raw, c.env);
   const ipLimited = await rateLimit(c.env, 'apple-anon-redeem-ip', ip, IP_LIMIT, IP_WINDOW_SEC);
   if (!ipLimited.ok) {
     return c.json({ error: 'too many redeem attempts' }, 429, { 'Retry-After': String(ipLimited.retryAfterSec) });
@@ -71,6 +71,17 @@ export async function redeemAppleEntitlementAnonymously(c: Context<{ Bindings: E
   }
   const { transaction, plan, originalTransactionId } = verified;
 
+  // Count every presentation of this JWS BEFORE any early-exit check:
+  // replaying a stored JWS after REFUND/REVOKE exits 400 below and would
+  // otherwise be free to retry forever, while iOS keeps the transaction
+  // unfinished and redelivers it indefinitely.
+  const txnLimited = await rateLimit(c.env, 'apple-anon-redeem-txn', originalTransactionId, TXN_LIMIT, TXN_WINDOW_SEC);
+  if (!txnLimited.ok) {
+    return c.json({ error: 'too many redeem attempts for this transaction' }, 429, {
+      'Retry-After': String(txnLimited.retryAfterSec),
+    });
+  }
+
   const existing = await getAppleSubscription(c.env, originalTransactionId);
   if (
     clientRedeemWouldResurrectRevoked(existing, {
@@ -79,13 +90,6 @@ export async function redeemAppleEntitlementAnonymously(c: Context<{ Bindings: E
     })
   ) {
     return c.json({ error: 'this Apple subscription was refunded or revoked' }, 400);
-  }
-
-  const txnLimited = await rateLimit(c.env, 'apple-anon-redeem-txn', originalTransactionId, TXN_LIMIT, TXN_WINDOW_SEC);
-  if (!txnLimited.ok) {
-    return c.json({ error: 'too many redeem attempts for this transaction' }, 429, {
-      'Retry-After': String(txnLimited.retryAfterSec),
-    });
   }
 
   // userId: null — the defining move of this route. upsertAppleSubscription's
@@ -103,8 +107,12 @@ export async function redeemAppleEntitlementAnonymously(c: Context<{ Bindings: E
     latestTransactionId: transaction.transactionId ?? null,
     purchaseDate: transaction.purchaseDate != null ? new Date(Number(transaction.purchaseDate)).toISOString() : null,
     expiresDate: transaction.expiresDate != null ? new Date(Number(transaction.expiresDate)).toISOString() : null,
+    redeemGuard: true,
   });
-  if (!upserted.ok) {
+  if (upserted.ok === false) {
+    if (upserted.reason === 'guarded_status') {
+      return c.json({ error: 'this Apple subscription was refunded or revoked' }, 400);
+    }
     return c.json(
       { error: 'this Apple subscription is already linked to a different account', upgradeRequired: false },
       409,

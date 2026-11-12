@@ -6,25 +6,31 @@
   "tasks": {
     "start": "deno run --unstable-kv --unstable-cron --unstable-ffi --allow-ffi --allow-net --allow-env --allow-read src/deno/main.ts"
   },
+  "lint": {
+    "rules": {
+      "exclude": [
+        "no-irregular-whitespace"
+      ]
+    }
+  },
   "imports": {
     "#sentry": "./src/deno/sentry.ts",
-    "@sentry/deno": "npm:@sentry/deno@^11.0.0",
+    "@sentry/deno": "npm:@sentry/deno@^11.4.0",
     "@jaywedgeworth22/congress-trading-shared": "./vendor/congress-trading-shared/src/index.ts",
-    "hono": "npm:hono@^4.13.7",
-    "hono/cookie": "npm:hono@^4.13.7/cookie",
+    "hono": "npm:hono@^4.13.13",
+    "hono/cookie": "npm:hono@^4.13.13/cookie",
     "node-html-parser": "npm:node-html-parser@^9.0.4",
-    "unpdf": "npm:unpdf@^1.6.2",
+    "unpdf": "npm:unpdf@^2.0.0",
     "pdf-lib": "npm:pdf-lib@^1.17.1",
-    "zod": "npm:zod@^4.4.3",
-    "cheerio": "npm:cheerio@^1.2.0",
+    "zod": "npm:zod@^4.6.5",
     "fflate": "npm:fflate@^0.8.3",
     "jsonrepair": "npm:jsonrepair@^3.15.0",
-    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1152.0",
-    "@google/genai": "npm:@google/genai@^2.23.0",
+    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1164.0",
+    "@google/genai": "npm:@google/genai@^3.0.0",
     "@libsql/client": "npm:@libsql/client@^0.18.0",
     "@libsql/client/web": "npm:@libsql/client@^0.18.0/web",
-    "@sentry/cloudflare": "npm:@sentry/cloudflare@^11.0.0",
-    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^5.0.0"
+    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^5.0.0",
+    "esbuild": "npm:esbuild@0.28.2"
   },
   "exclude": [
     "node_modules",
@@ -44,9 +50,5 @@
     "exclude": [
       "npm:@google/genai"
     ]
-  },
-  "deploy": {
-    "org": "congress-trade",
-    "app": "congress-trade"
   }
 }

@@ -433,7 +433,10 @@ export function planIdentitySync(
       }
     }
 
-    if (!resolvedBioguide && !staleCleared && !executive && canResolve) {
+  // MANUAL-* filers may be ingested with chamber unset; roster resolution must
+    // still run so decideMintedChamber can use the legislator's term (never a
+    // provider default).
+    if (!resolvedBioguide && !staleCleared && !executive && (canResolve || minted)) {
       const match = resolveByName(f, indexes, accept);
       if (match) {
         resolvedBioguide = match.bioguide;

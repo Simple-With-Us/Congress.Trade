@@ -193,45 +193,14 @@ export function buildAdminMigrateStatements(): readonly string[] {
       'CREATE INDEX IF NOT EXISTS idx_ingestion_decisions_action ON ingestion_decisions (action, created_at DESC)',
       // 0020_disclosure_available_generated.sql — generated column for disclosure availability.
       ...DISCLOSURE_AVAILABLE_SCHEMA_STATEMENTS,
-      // 0021_disclosure_latency_watch.sql — congress.trade-vs-FMP disclosure race monitor.
-      `CREATE TABLE IF NOT EXISTS disclosure_latency_candidates (
-         doc_id TEXT NOT NULL,
-         provider TEXT NOT NULL DEFAULT 'fmp',
-         chamber TEXT NOT NULL,
-         source_url TEXT,
-         filed_date TEXT,
-         filer_name TEXT,
-         congress_first_seen_at TEXT NOT NULL,
-         provider_key TEXT,
-         provider_first_seen_at TEXT,
-         provider_published_at TEXT,
-         match_method TEXT,
-         status TEXT NOT NULL DEFAULT 'pending',
-         attempts INTEGER NOT NULL DEFAULT 0,
-         last_checked_at TEXT,
-         error TEXT,
-         payload TEXT,
-         created_at TEXT NOT NULL,
-         updated_at TEXT NOT NULL,
-         PRIMARY KEY (doc_id, provider)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_disc_latency_candidates_status
-         ON disclosure_latency_candidates (provider, status, created_at DESC)`,
-      `CREATE TABLE IF NOT EXISTS disclosure_provider_observations (
-         provider TEXT NOT NULL,
-         chamber TEXT NOT NULL,
-         provider_key TEXT NOT NULL,
-         first_observed_at TEXT NOT NULL,
-         last_observed_at TEXT NOT NULL,
-         provider_published_at TEXT,
-         source_url TEXT,
-         filed_date TEXT,
-         filer_name TEXT,
-         payload TEXT,
-         PRIMARY KEY (provider, chamber, provider_key)
-       )`,
-      `CREATE INDEX IF NOT EXISTS idx_disc_provider_seen
-         ON disclosure_provider_observations (provider, chamber, first_observed_at DESC)`,
+      // NOTE: 0021_disclosure_latency_watch.sql (disclosure_latency_candidates,
+      // disclosure_provider_observations and their indexes) and the 0023
+      // provider_published_at ALTERs on those tables are deliberately NOT
+      // replayed here.  0059 (TRADE_LATENCY_WATCH_SCHEMA_STATEMENTS, later in
+      // this list) drops both tables, so replaying them only created two
+      // tables and two indexes under the boot write lock on every deploy to
+      // throw them away.  The 0059 DROP TABLE IF EXISTS statements stay to
+      // clean databases that still have them.
       // 0022_stripe_webhook_events.sql — durable Stripe webhook idempotency ledger.
       `CREATE TABLE IF NOT EXISTS stripe_webhook_events (
          event_id TEXT PRIMARY KEY,
@@ -241,9 +210,7 @@ export function buildAdminMigrateStatements(): readonly string[] {
        )`,
       `CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_received
          ON stripe_webhook_events (received_at DESC)`,
-      // 0023_disclosure_provider_timestamps.sql — provider-side publish/upload timestamp when available.
-      'ALTER TABLE disclosure_latency_candidates ADD COLUMN provider_published_at TEXT',
-      'ALTER TABLE disclosure_provider_observations ADD COLUMN provider_published_at TEXT',
+      // 0023_disclosure_provider_timestamps.sql — not replayed; see the 0021 NOTE above.
       // 0024_dead_letter_events.sql — operator log for terminally-failed queue messages.
       `CREATE TABLE IF NOT EXISTS dead_letter_events (
          id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -271,31 +238,89 @@ export function buildAdminMigrateStatements(): readonly string[] {
          PRIMARY KEY (trade_hash, provider, event)
        )`,
       `CREATE INDEX IF NOT EXISTS idx_latency_price_due ON latency_price_snapshots (captured_at, due_at)`,
-      // 0025_amendment_trump_deprecation.sql — soft-deprecate unamended Trump report rows superseded by amendment.
+      // 0025_amendment_trump_deprecation.sql — soft-deprecate the rows of the
+      // filing the amendment ACTUALLY amends, and only when that filing's own
+      // transaction dates overlap the amended filing's period.
+      //
+      // CT-2452: this statement used to deprecate E-2025-…-278t-3 (period
+      // 2025-07-25 + 2025-08-01) because the amendment
+      // E-2025-…-278t-2-amended (period 2025-07-01 .. 2025-07-23) was filed on
+      // the same date.  Those periods are DISJOINT: the amendment supersedes
+      // neither sibling, and the -3 rows were wrongly unpublished (38 of the
+      // 545 lost rows in that incident).  The amended filing is
+      // E-2025-…-278t-2, and the overlap test below is the same rule
+      // extraction/amendmentPredecessor.ts applies at runtime.  A NULL from
+      // either side (a filing with no live rows) leaves the comparison NULL,
+      // which is not TRUE, so nothing is deprecated.
       `UPDATE transactions
           SET deprecated_at = '2026-07-28T17:00:00.000Z',
               deprecated_reason = 'superseded by amendment E-2025-donald-j-trump-08-12-2025-278t-2-amended'
-        WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-3'
+        WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2'
           AND deprecated_at IS NULL
           AND EXISTS (
             SELECT 1 FROM transactions WHERE doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND deprecated_at IS NULL
-          )`,
+          )
+          AND (SELECT MIN(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+              <= (SELECT MAX(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+          AND (SELECT MAX(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+              >= (SELECT MIN(t.tx_date) FROM transactions t
+                 WHERE t.doc_id = 'E-2025-donald-j-trump-08-12-2025-278t-2-amended' AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')`,
       `CREATE INDEX IF NOT EXISTS idx_filings_filer_amend ON filings(filer_id, ingest_status, filed_date)`,
-      // 0026_retroactive_amendment_deprecation_sweep.sql — soft-deprecate all historical predecessor filing transactions superseded by amended filings across all chambers (indexed and bounded to 50 per run for instant response).
+      // 0026_retroactive_amendment_deprecation_sweep.sql — soft-deprecate the
+      // transactions of filings that an amended filing actually supersedes,
+      // across all chambers (bounded to 50 per run for instant response).
+      //
+      // CT-2452: this sweep joined the amended filing to its "predecessor" on
+      // filer_id + filed_date, so it deprecated every sibling report filed the
+      // same day (345 rows of the 2025-08-12 Trump 278-T base, whose period
+      // Jan 21 - Jun 13 is disjoint from the July amendment).  The join is now
+      // the REAL amended-document relationship: the amended filing's doc id
+      // minus its trailing amendment marker (-amended / -amendment / -amend)
+      // IS the amended filing's doc id, exactly as OGE names an amendment
+      // after the document it amends ("278T(2) AMENDED.pdf" amends
+      // "278T(2).pdf").  The period-overlap test is the same rule
+      // extraction/amendmentPredecessor.ts applies at runtime, and a filing
+      // whose doc id carries no amendment marker yields NULL and matches
+      // nothing.  A trailing -N sequence (a second amendment) is stripped
+      // first, and empty tx_date rows are ignored, both as at runtime.
       `UPDATE transactions
           SET deprecated_at = '2026-07-28T17:15:00.000Z',
               deprecated_reason = 'retroactive amendment cleanup: superseded by newer amended filing'
         WHERE deprecated_at IS NULL
           AND doc_id IN (
             SELECT f_orig.doc_id
-              FROM filings f_amend
+              FROM (
+                SELECT f.*,
+                       CASE
+                         WHEN RTRIM(f.doc_id, '0123456789') <> f.doc_id
+                          AND SUBSTR(RTRIM(f.doc_id, '0123456789'), -1) = '-'
+                         THEN SUBSTR(f.doc_id, 1, LENGTH(RTRIM(f.doc_id, '0123456789')) - 1)
+                         ELSE f.doc_id
+                       END AS base_id
+                  FROM filings f
+              ) f_amend
               JOIN filings f_orig
-                ON f_amend.filer_id = f_orig.filer_id
-               AND f_amend.filed_date = f_orig.filed_date
-               AND f_amend.doc_id <> f_orig.doc_id
-             WHERE f_amend.ingest_status = 'persisted'
+                ON f_orig.doc_id = CASE
+                     WHEN f_amend.base_id LIKE '%-amended'  THEN SUBSTR(f_amend.base_id, 1, LENGTH(f_amend.base_id) - LENGTH('-amended'))
+                     WHEN f_amend.base_id LIKE '%-amendment' THEN SUBSTR(f_amend.base_id, 1, LENGTH(f_amend.base_id) - LENGTH('-amendment'))
+                     WHEN f_amend.base_id LIKE '%-amend'     THEN SUBSTR(f_amend.base_id, 1, LENGTH(f_amend.base_id) - LENGTH('-amend'))
+                     ELSE NULL
+                   END
                AND f_orig.ingest_status = 'persisted'
+             WHERE f_amend.ingest_status = 'persisted'
                AND (f_amend.filing_status = 'Amended' OR f_amend.doc_id LIKE '%amend%' OR f_amend.source_url LIKE '%amend%')
+               AND (SELECT MIN(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+                   <= (SELECT MAX(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+               AND (SELECT MAX(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_orig.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+                   >= (SELECT MIN(t.tx_date) FROM transactions t
+                     WHERE t.doc_id = f_amend.doc_id AND t.deprecated_at IS NULL AND t.tx_date IS NOT NULL AND t.tx_date <> '')
+             ORDER BY f_amend.doc_id, f_orig.doc_id
              LIMIT 50
           )`,
       // 0029-0039 — canonical value, reliability, Stripe, review, and benchmark tail.

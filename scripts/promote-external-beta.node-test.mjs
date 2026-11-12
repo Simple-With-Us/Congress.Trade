@@ -300,11 +300,15 @@ test("a malformed App Store Connect error body is never believed and never throw
 });
 
 test("a build number that is not a positive integer is refused, not guessed at", () => {
-  for (const junk of ["0", "-1", "-2320", "nope", "2320.5", "1e3"]) {
+  for (const junk of ["0", "-1", "-2320", "nope", "1e3", "1..2", ".1", "1.", "1.2.3.4", "0.0.0", "1.1.x"]) {
     assert.equal(resolveExpectedBuildNumber({ explicit: junk }), null, `refused: ${JSON.stringify(junk)}`);
   }
   assert.equal(resolveExpectedBuildNumber({ explicit: "2320" }), 2320);
   assert.equal(resolveExpectedBuildNumber({ explicit: " 2320 " }), 2320);
+  // Dotted builds (1.1.2) pass through as the exact string.
+  assert.equal(resolveExpectedBuildNumber({ explicit: "1.1.2" }), "1.1.2");
+  assert.equal(resolveExpectedBuildNumber({ explicit: "0.1.0" }), "0.1.0");
+  assert.equal(resolveExpectedBuildNumber({ explicit: "2320.5" }), "2320.5");
 });
 
 test("an absent build number falls back to the checkout's commit count", () => {
@@ -395,4 +399,22 @@ test("the promotion never falls back to the newest build", () => {
   // App Store Connect;  it must never feed the selection.
   assert.doesNotMatch(src, /sort=-uploadedDate[^\n]*\n[^\n]*build\s*=\s*buildsRes/);
   assert.match(src, /newestKnownBuild/);
+});
+
+test("a known marketing version pins the build lookup to its train", () => {
+  const asc = fakeAsc({
+    builds: [{ id: "b9", attributes: { version: "1.1.2", processingState: "VALID" } }],
+  });
+  promoteExternalBeta({ asc, appId: "6798076688", buildNumber: "1.1.2", marketingVersion: "1.1.2", log: noop, warn: noop });
+  const q = asc.calls.find((c) => c.method === "GET" && c.path.includes("/v1/builds?"));
+  assert.ok(q.path.includes("filter[version]=1.1.2"));
+  assert.ok(q.path.includes("filter[preReleaseVersion.version]=1.1.2"));
+});
+
+test("a malformed marketing version is refused, not dropped", () => {
+  const asc = fakeAsc({ builds: [{ id: "b9", attributes: { version: "1.1.2", processingState: "VALID" } }] });
+  const result = promoteExternalBeta({ asc, appId: "6798076688", buildNumber: "1.1.2", marketingVersion: "1.1.x", log: noop, warn: noop });
+  assert.equal(result.outcome, "asc-error");
+  assert.equal(result.added, false);
+  assert.equal(asc.calls.some((c) => c.path.includes("/v1/builds?")), false);
 });

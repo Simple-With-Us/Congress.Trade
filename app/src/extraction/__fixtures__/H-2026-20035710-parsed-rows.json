@@ -1,0 +1,38 @@
+[
+  {
+    "assetName": "ASML Holding N.V. - New York Registry Shares",
+    "ticker": "ASML",
+    "assetType": "ST",
+    "txDate": "2026-10-23",
+    "txType": "S",
+    "owner": "joint",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": "Hern Family Foundation"
+  },
+  {
+    "assetName": "Seagate Technology Holdings PLC - Ordinary Shares",
+    "ticker": "STX",
+    "assetType": "ST",
+    "txDate": "2026-10-23",
+    "txType": "S",
+    "owner": "self",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": "Kevin Hern Traditional IRA"
+  },
+  {
+    "assetName": "Texas Instruments Incorporated - Common Stock",
+    "ticker": "TXN",
+    "assetType": "ST",
+    "txDate": "2026-10-14",
+    "txType": "S",
+    "owner": "joint",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": "Hern Family Foundation"
+  }
+]

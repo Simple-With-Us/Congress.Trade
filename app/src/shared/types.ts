@@ -260,7 +260,15 @@ export interface ParsedTx {
    * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
    * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type'>;
+  extractionWarnings?: Array<
+    | 'unreadable_is_option'
+    | 'unreadable_cap_gains'
+    | 'salvaged_truncated_output'
+    | 'band_amount_inferred'
+    | 'suspected_constant_tx_type'
+    | 'grid_type_unmarked'
+    | 'owner_unread'
+  >;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -716,8 +724,8 @@ export interface Env {
   FMP_RAPIDAPI_DAILY_CAP?: string;
   /** Daily FMP call budget (stringified int); defaults to 230 when unset. */
   FMP_DAILY_CALL_CAP?: string;
-  /** Shared FMP per-minute pacer ceiling (stringified int). Infisical-tunable. */
-  FMP_MAX_PER_MINUTE?: string;
+  /** Socratic.Trade peer-read pace (clamped to ST_PEER_SAFE_MAX_PER_MINUTE).  Infisical-tunable. */
+  ST_PEER_MAX_PER_MINUTE?: string;
   /** SEC EDGAR per-minute pacer ceiling (stringified int). Infisical-tunable. */
   EDGAR_MAX_PER_MINUTE?: string;
   /** Local-dev-only escape hatch: opens admin when the environment is not production. */
@@ -753,6 +761,8 @@ export interface Env {
   RESIDENTIAL_PROXY_PORT?: string;
   RESIDENTIAL_PROXY_USERNAME?: string;
   RESIDENTIAL_PROXY_PASSWORD?: string;
+  /** Consecutive residential-proxy probe failures before health_senate_relay reports down (default 3). */
+  RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD?: string;
   /** Enable Cloudflare Browser Rendering fallback (strictly capped to free tier). */
   SENATE_USE_BROWSER_RENDERING?: string;
   /** Enables the OGE executive-branch (278-T) filings watcher. Infisical-tunable. */
@@ -774,6 +784,23 @@ export interface Env {
   DISCLOSURE_LATENCY_WATCH_ENABLED?: string;
   /** Enables the public-API anti-scraping guard (UA blocklist + per-IP budgets). Unset = off. */
   SCRAPE_GUARD_ENABLED?: string;
+  /**
+   * Reject requests that did not arrive via Cloudflare. Unset = off, so a
+   * deploy does not change traffic. See src/security/originLock.ts.
+   */
+  ORIGIN_LOCK_ENABLED?: string;
+  /** Shared secret Cloudflare adds (Transform Rule) as X-CT-Origin-Secret. */
+  ORIGIN_LOCK_SECRET?: string;
+  /** Extra trusted-proxy CIDRs, comma-separated, added to loopback and private ranges. */
+  ORIGIN_LOCK_TRUSTED_PROXIES?: string;
+  /**
+   * Header a trusted proxy sets only after verifying Cloudflare Authenticated
+   * Origin Pulls. Unset = that check is off. Client-supplied values are
+   * ignored unless the socket peer is a trusted proxy or Cloudflare.
+   */
+  ORIGIN_LOCK_AOP_HEADER?: string;
+  /** Expected value of ORIGIN_LOCK_AOP_HEADER. Default SUCCESS. */
+  ORIGIN_LOCK_AOP_VALUE?: string;
   /** App-level D1 daily rows-READ budget (stringified int). Soft-warns at 80%; default 200M/day. Infisical-tunable. */
   D1_DAILY_ROWS_READ_BUDGET?: string;
   /** App-level D1 daily rows-WRITTEN budget (stringified int). Soft-warns at 80%; default 2M/day (~$10/mo of D1 writes). Infisical-tunable. */
@@ -872,6 +899,11 @@ export interface Env {
   NEXT_PUBLIC_DD_APPLICATION_ID?: string;
   NEXT_PUBLIC_DD_RUM_APPLICATION_ID?: string;
   NEXT_PUBLIC_DD_SITE?: string;
+  /** Opt-in. Pins agent-only dd-trace switches off when no agent host or URL is set. */
+  DD_TRACE_AGENTLESS_GUARDS?: string;
+  DD_DYNAMIC_INSTRUMENTATION_ENABLED?: string;
+  DD_PROFILING_ENABLED?: string;
+  DD_REMOTE_CONFIGURATION_ENABLED?: string;
   /** Cloudflare Workers version metadata binding; used by Sentry to auto-tag the release. */
   CF_VERSION_METADATA?: { id: string; tag: string; timestamp?: string };
 
@@ -981,6 +1013,11 @@ export interface Env {
   DELIVERY_TARGET_BASE_BACKOFF_SEC?: string;
   /** Parked deliveries allowed per subscription before overflow quarantine (default 500). */
   DELIVERY_TARGET_PARKED_CAP?: string;
+  /**
+   * Env fallback for the Infisical app setting of the same name: when truthy
+   * the scheduled flush re-parks live quarantined rows (default off).
+   */
+  DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER?: string;
   /** Admin + scoped import bearer tokens. */
   ADMIN_TOKEN?: string;
   /** Admin email allowlist for site-session admin access and Cloudflare Access. */
@@ -1000,6 +1037,8 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Scoped token for the idempotent admin maintenance endpoints only (backlog requeue/retry). */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /** Scoped token for POST /api/admin/senate-ptr-intake only (Mac eFD fetcher, CT-2442). */
+  SENATE_INTAKE_TOKEN?: string;
   LLAMAPARSE_API_KEY?: string;
 
   // --- Billing (Stripe) ---

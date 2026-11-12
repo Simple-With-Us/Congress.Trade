@@ -3,6 +3,12 @@
  * Outbound CT->ST pushes use share/outbound.ts; this module is inbound-only.
  */
 
+import {
+  SHARE_PAYLOAD_SCHEMA_VERSION,
+  SharePayloadSchemaVersionSchema,
+  isSupportedSharePayloadSchemaVersion,
+  resolveSharePayloadSchemaVersion,
+} from '@jaywedgeworth22/congress-trading-shared';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import type { Env } from '../shared/types.ts';
 
@@ -127,6 +133,109 @@ export function warnPeerImportSchemaDrops(input: {
     droppedJson: JSON.stringify(input.dropped),
   };
   sentryLoggerWarn('peer.import.schema_drops', attrs);
+}
+
+function payloadHadStreamRows(body: Record<string, unknown>): boolean {
+  for (const stream of SHARE_IMPORT_STREAMS) {
+    if (Array.isArray(body[stream]) && body[stream]!.length > 0) return true;
+  }
+  return false;
+}
+
+function acceptedRowsTotal(accepted: Record<ShareImportStream, number>): number {
+  let n = 0;
+  for (const stream of SHARE_IMPORT_STREAMS) n += accepted[stream] ?? 0;
+  return n;
+}
+
+/** Payload carried rows but nothing landed — usually schema drift or a bad token writing to /dev/null. */
+export function warnPeerImportNoAcceptedRows(input: {
+  requestId: string;
+  origin: string | null;
+  payloadBytes: number;
+  dropped: DroppedMap;
+  accepted: Record<ShareImportStream, number>;
+  rawBody: Record<string, unknown>;
+}): void {
+  if (!payloadHadStreamRows(input.rawBody)) return;
+  if (acceptedRowsTotal(input.accepted) > 0) return;
+  sentryLoggerWarn('peer.import.no_accepted_rows', {
+    requestId: input.requestId,
+    origin: input.origin ?? 'unknown',
+    payloadBytes: input.payloadBytes,
+    droppedTotal: totalDroppedCount(input.dropped),
+    droppedJson: JSON.stringify(input.dropped),
+  });
+}
+
+/** Import path rejected before handler — auth/token mismatch or ingest token unset. */
+export function warnPeerImportAuthRejected(input: {
+  path: string;
+  hasAuthorization: boolean;
+  ingestTokenConfigured: boolean;
+  ingestBearerAttempt: boolean;
+}): void {
+  if (!input.path.endsWith('/securities/import')) return;
+  const reason = !input.ingestTokenConfigured
+    ? 'ingest_token_unconfigured'
+    : !input.hasAuthorization
+      ? 'missing_bearer'
+      : input.ingestBearerAttempt
+        ? 'ingest_bearer_mismatch'
+        : 'admin_auth_required';
+  sentryLoggerWarn('peer.import.auth_rejected', {
+    reason,
+    ingestTokenConfigured: input.ingestTokenConfigured,
+    hasAuthorization: input.hasAuthorization,
+  });
+}
+
+export interface PeerImportSchemaVersion {
+  schemaVersion: number | null;
+  supported: boolean;
+}
+
+/**
+ * Resolve the contract version of an inbound peer share payload (ST-3853).
+ *
+ * Never throws and never rejects: an unsupported or malformed version is warned
+ * about and reported back to the peer, but the batch is still imported so mixed
+ * deploys keep working.  A payload without `schemaVersion` predates versioning
+ * and resolves to the legacy version.
+ */
+export function resolvePeerImportSchemaVersion(
+  raw: unknown,
+  ctx: { requestId: string; origin: string | null },
+): PeerImportSchemaVersion {
+  const origin = ctx.origin ?? 'unknown';
+  try {
+    if (raw === undefined) {
+      return { schemaVersion: resolveSharePayloadSchemaVersion({}), supported: true };
+    }
+    const parsed = SharePayloadSchemaVersionSchema.safeParse(raw);
+    if (parsed.success) {
+      const schemaVersion = parsed.data;
+      const supported = isSupportedSharePayloadSchemaVersion({ schemaVersion });
+      if (!supported) {
+        sentryLoggerWarn('peer.import.unsupported_schema_version', {
+          requestId: ctx.requestId,
+          origin,
+          schemaVersion,
+          supportedMax: SHARE_PAYLOAD_SCHEMA_VERSION,
+        });
+      }
+      return { schemaVersion, supported };
+    }
+    // Never log the raw value — only its type.
+    sentryLoggerWarn('peer.import.malformed_schema_version', {
+      requestId: ctx.requestId,
+      origin,
+      receivedType: typeof raw,
+    });
+    return { schemaVersion: null, supported: false };
+  } catch {
+    return { schemaVersion: null, supported: false };
+  }
 }
 
 export interface PersistPeerImportReceiptInput {

@@ -63,6 +63,13 @@ import { createCongressEvent } from '@jaywedgeworth22/congress-trading-shared';
 import { prefixedId } from '../shared/ids.ts';
 import { rateLimit } from '../shared/rateLimit.ts';
 import { flushD1Budget } from '../shared/d1Budget.ts';
+import {
+  formatRetractFrame,
+  listRetractions,
+  readRetractionHighWater,
+  readRetractionResumeFloor,
+} from './retractions.ts';
+import { readDeliveryMode } from './deliveryMode.ts';
 
 /** How often to poll D1 for new rows. */
 const POLL_INTERVAL_MS = 5_000;
@@ -221,6 +228,9 @@ export async function openSseStream(
   streamToken?: string,
   requestIp = 'unknown',
   timingOptions: SseStreamTimingOptions = {},
+  /** Resume point for trade.retract frames (?retractSince=).  Fresh opens default
+      to the live tail; a resume without one replays from 0. */
+  retractSince?: number,
 ): Promise<Response> {
   const subRow = await get<SubscriptionRow>(
     env.DB,
@@ -329,15 +339,49 @@ export async function openSseStream(
       }
     }
 
+    // trade.retract frames (retractions.ts) resume from their own cursor; a
+    // missing table (migration 0108 not applied yet) just disables them.
+    // A native EventSource auto-reconnect replays the original URL, so it
+    // carries Last-Event-ID (the trade cursor) but no ?retractSince=.
+    // Falling back to the high-water mark there would skip every retraction
+    // that landed mid-disconnect, so a resume without a retract cursor
+    // replays the last SSE_RETRACT_RESUME_LOOKBACK_MS of retractions
+    // (at-least-once; receivers dedupe by retractSeq).  Replaying from 0
+    // would re-send the whole history on every 25-minute reconnect.  Fresh
+    // opens with no resume point stay live-tail.
+    let retractCursor: number | null = null;
+    try {
+      retractCursor = retractSince !== undefined && Number.isFinite(retractSince) && retractSince >= 0
+        ? Math.floor(retractSince)
+        : liveTailDefault
+          ? await readRetractionHighWater(env)
+          : await readRetractionResumeFloor(env);
+    } catch {
+      retractCursor = null;
+    }
+    const emitRetractions = async (): Promise<void> => {
+      if (retractCursor === null) return;
+      for (let page = 0; page < MAX_DRAIN_PAGES_PER_TICK; page += 1) {
+        const batch = await listRetractions(env, retractCursor, PAGE_SIZE);
+        // Unfiltered on purpose, like the webhook: a retract for a trade this
+        // subscriber never saw is a no-op for it.
+        for (const r of batch.retractions) await send(formatRetractFrame(r));
+        retractCursor = batch.cursor;
+        if (!batch.hasMore) break;
+      }
+    };
+
     // Opening comment + initial cursor so clients know the resume point.
     await send(`: connected\n`);
     await send(`event: cursor\ndata: ${cursor}\n\n`);
+    if (retractCursor !== null) await send(`event: retract-cursor\ndata: ${retractCursor}\n\n`);
 
     // 1) Catch-up replay when the client asked for history (?since= / header).
     // Fresh opens at the HWM skip this — they are already on the live tail.
     if (!liveTailDefault) {
       cursor = await drainSseBacklog(env, sub, cursor, send);
     }
+    await emitRetractions();
     // The HTTP handler's waitUntil settles when this Response is created, but
     // the producer continues querying D1 in the background. Flush those rows
     // while the stream is alive instead of leaving them in the isolate until
@@ -419,6 +463,8 @@ export async function openSseStream(
       // push path is healthy (drainSseBacklog never re-emits below the HWM).
       if (Date.now() - lastBacklogDrain >= backlogDrainIntervalMs) {
         cursor = await drainSseBacklog(env, sub, cursor, send);
+        // Retractions are not alerts, so the slow durable cadence is enough.
+        await emitRetractions();
         await flushD1Budget(env);
         lastBacklogDrain = Date.now();
       }
@@ -430,7 +476,9 @@ export async function openSseStream(
     channel?.close();
 
     if (!closed && Date.now() < deadlineAt) {
-      await send(`event: reconnect\ndata: ${JSON.stringify({ since: cursor })}\n\n`);
+      await send(`event: reconnect\ndata: ${JSON.stringify(
+        retractCursor === null ? { since: cursor } : { since: cursor, retractSince: retractCursor },
+      )}\n\n`);
     }
   };
 
@@ -529,11 +577,23 @@ export async function drainSseBacklog(
   send: (chunk: string) => Promise<void>,
 ): Promise<number> {
   let hwm = cursor;
+  // Subscriber alert pause (CT_DELIVERY_MODE hold or suppress): emit nothing
+  // and keep the cursor where it is, so the stream resumes from here once
+  // delivery is switched back.  Suppress pauses too: the flush marks rows
+  // 'suppressed' only on its next tick, so streaming during suppress would
+  // leak rows written since the last flush.  After resume the drain skips
+  // rows that ended up suppressed.
+  if (readDeliveryMode() !== 'deliver') return hwm;
   // Drain a bounded number of pages. If more history remains, the next poll
   // tick continues from this exact high-water cursor without gaps.
   for (let page = 0; page < MAX_DRAIN_PAGES_PER_TICK; page += 1) {
     const rows = await all<
-      FeedTransactionRow & { __chamber: string | null; __sector: string | null; __bucket: string | null }
+      FeedTransactionRow & {
+        __chamber: string | null;
+        __sector: string | null;
+        __bucket: string | null;
+        __outbox_status?: string | null;
+      }
     >(
       env.DB,
       // `filer_party` is the column mapFeedTransaction reads for Transaction.party.
@@ -545,7 +605,8 @@ export async function drainSseBacklog(
       `SELECT t.*, f.chamber AS __chamber,
               sr.sector AS __sector, sr.market_cap_bucket AS __bucket,
               COALESCE(fl.display_name, fl.full_name) AS filer_full_name, fl.state AS filer_state,
-              fl.photo_url AS filer_photo_url, fl.party AS filer_party
+              fl.photo_url AS filer_photo_url, fl.party AS filer_party,
+              o.status AS __outbox_status
          FROM (
            SELECT t.* FROM transactions t INDEXED BY idx_tx_cursor
             WHERE t.cursor_seq > ? AND t.deprecated_at IS NULL
@@ -554,13 +615,21 @@ export async function drainSseBacklog(
          ) t
          LEFT JOIN filings f ON f.doc_id = t.doc_id
          LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
-         LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id`,
+         LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id
+         LEFT JOIN delivery_outbox o ON o.tx_id = t.id`,
       [hwm, PAGE_SIZE],
     );
     if (rows.length === 0) break;
 
     for (const row of rows) {
       const tx: Transaction = mapFeedTransaction(row);
+      // Suppressed (CT_DELIVERY_MODE=suppress) rows are never alerted, also
+      // on catch-up after delivery resumed; still advance past them so a
+      // fully suppressed page cannot stall the stream.
+      if (row.__outbox_status === 'suppressed') {
+        hwm = Math.max(hwm, tx.cursorSeq);
+        continue;
+      }
       const ctx = {
         chamber: row.__chamber ?? null,
         sector: row.__sector ?? null,

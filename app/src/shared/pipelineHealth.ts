@@ -16,9 +16,12 @@ import {
 } from '../extraction/reviewQueueHealth.ts';
 import { describeAutopilotHaltReason } from '../extraction/providerHealth.ts';
 import { ogeWatchEnabled } from '../ingestion/ogeSource.ts';
-import { readResidentialProxyProbe } from '../ingestion/residentialProxyHealth.ts';
+import { readResidentialProxyProbe, SENATE_EFD_PROXY_PROBE_INTERVAL_MS } from '../ingestion/residentialProxyHealth.ts';
 import { readSenateRelayProbe } from '../ingestion/senateRelayHealth.ts';
 import { readSenateEfdProbe } from '../ingestion/senateEfdHealth.ts';
+import { readSenateEdgeBackoff, SENATE_EDGE_BACKOFF_GRACE_MS } from '../ingestion/senateEdgeDeny.ts';
+import { evaluateSenateFetcherHealth, readSenateFetcherRunStatus, type SenateFetcherHealth } from '../ingestion/senateIntakeStatus.ts';
+import { parseSenateEfdTransportNote } from '../ingestion/senateSource.ts';
 import { resolveResidentialProxyUrl } from './proxyFetch.ts';
 import { configExpectedLatencyProviderIds } from '../ingestion/tradeLatency.ts';
 import { latencyProvidersWithRejectedCredentials } from '../ingestion/scoutHandoff.ts';
@@ -43,6 +46,25 @@ import {
   formatIngestionDeadLetterIdentityDetail,
   type FailedIngestionOutboxIdentity,
 } from '../ingestion/failedOutboxIdentity.ts';
+import { readPipelineStallHours } from '../ingestion/pipelineStallConfig.ts';
+import {
+  collectStPeerPricesMetrics,
+  stPeerPricesMetricsToCheck,
+} from '../prices/stPeerPricesHealth.ts';
+import {
+  collectStInboundMarketDataMetrics,
+  stInboundMarketDataMetricsToCheck,
+} from '../share/stInboundMarketDataHealth.ts';
+import { emptyFetchAlertWhere, emptyFetchSeenCutoff } from '../ingestion/emptyFetchHandoff.ts';
+import { collectDeliveryModeCheck } from '../delivery/deliveryMode.ts';
+import {
+  enrichFmpLatencySelfHealingSilence,
+  evaluateFmpLatencyCheck,
+  readFmpLatencyCriticalAgeSec,
+  readFmpLatencySelfHealingGraceMs,
+  fmpLatencyProbeExpected,
+  type FmpLatencySelfHealingSilence,
+} from './fmpLatencyProbeHealth.ts';
 
 export type PipelineStatus = 'ok' | 'degraded' | 'critical' | 'stalled' | 'unknown';
 
@@ -93,6 +115,11 @@ export interface PipelineHealth {
   signals?: {
     filingSkips24h: number | null;
     filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'];
+    /** Count of docs behind `oge_text_unreadable` in the same 24h window. */
+    unreadableExecutiveDocCount?: number | null;
+    /** Doc ids behind `oge_text_unreadable` in the same 24h window. Only
+     *  collected for operator-private callers; null in public responses. */
+    unreadableExecutiveDocIds?: string[] | null;
     fmpLatency: PipelineSignals['fmpLatency'];
     priceEodLatestDate: string | null;
     spxEodLatestDate: string | null;
@@ -148,6 +175,15 @@ export interface PipelineSignals {
   filingSkips24h: number | null;
   /** 2026-09-21: per-provider breakdown of recent skips (admin + dashboard). */
   filingSkipsByAction24h: Record<FilingSkipAction, number> | null;
+  /** Count of docs behind `oge_text_unreadable` in the same 24h window. */
+  unreadableExecutiveDocCount?: number | null;
+  /**
+   * Up to five doc ids behind `oge_text_unreadable` in the same 24h window,
+   * most recently failed first. Absent when the ids were not collected;
+   * collection is gated on `includeUnreadableDocIds` so public health
+   * responses never carry raw filing identifiers.
+   */
+  unreadableExecutiveDocIds?: string[] | null;
   /**
    * 2026-09-21: FMP-family latency summary for both admin and user surfaces.
    * The user-facing dashboard renders `lastObservationAgeSec` + `observationCount24h`
@@ -162,6 +198,8 @@ export interface PipelineSignals {
     http429s24h: number | null;
     /** Per-provider last-observation age (seconds) when trade_provider_observations is reachable. */
     byProvider: Record<string, { lastObservationAt: string | null; ageSec: number | null; count24h: number | null }> | null;
+    /** Set during signal collection when silence is a known self-healing state (CT-2335). */
+    selfHealingSilence?: FmpLatencySelfHealingSilence | null;
   } | null;
   lastExtractionSuccessAt: string | null;
   /**
@@ -211,6 +249,18 @@ export interface PipelineSignals {
     lastSuccessAt: string | null;
     lastAttemptAt: string | null;
     configDisabled: boolean;
+    /**
+     * Senate only: the eFD edge-deny backoff the watcher is honoring
+     * (CONFIG_KV, CT-2442).  Its attempts are sparse by design (60 minutes up
+     * to 6 hours apart), so the check names the backoff instead of reading
+     * "NOT RUNNING".  Absent = no backoff.
+     */
+    edgeBackoff?: { until: string; lastDeniedAt: string; reason: string };
+    /**
+     * Senate only: the transport named on the latest successful
+     * source_attempts row (`transport=http-proxy` and the browser variants).
+     */
+    transport?: string;
   }> | null;
   /**
    * Latency-probe liveness (same directive): newest observation per provider
@@ -258,7 +308,7 @@ export interface PipelineSignals {
       host?: string;
     } | null;
   } | null;
-  /** Direct GET /search/ probe (CONFIG_KV), independent of residential proxy. */
+  /** Proxied eFD landing + agreement POST probe (CONFIG_KV, CT-2416). */
   senateEfd?: {
     probe: {
       ok: boolean;
@@ -266,8 +316,24 @@ export interface PipelineSignals {
       checkedAt: string;
       egress?: string | null;
       error?: string | null;
+      state?: 'ok' | 'blocked' | 'degraded';
+      step?: string | null;
+      /** False on relay-down / unconfigured records, which carry no eFD verdict. */
+      dialed?: boolean;
     } | null;
+    /**
+     * The watcher's eFD edge-deny backoff (CONFIG_KV, CT-2442).  The probe
+     * does not dial while it is active, so a deny newer than the probe is the
+     * freshest word on eFD.  Absent = no backoff.
+     */
+    edgeBackoff?: { until: string; lastDeniedAt: string; reason: string } | null;
   } | null;
+  /**
+   * Mac eFD fetcher run heartbeat (senate-fetcher:last-run, CT-2462).
+   * Absent on fixtures that predate the check.  null = uncollected.
+   * Deliveries (senate-intake:last) are not this signal.
+   */
+  senateFetcher?: SenateFetcherHealth | null;
   /**
    * Newest daily price bar we hold for any ticker (MAX securities_ref.latest_price_date,
    * an indexed column — price_eod itself is 1.4M rows).  Absent = the signal builder
@@ -605,8 +671,8 @@ export function evaluatePipelineSignals(
         status: 'degraded',
         detail:
           `${s.deliveryQuarantined} webhook delivery(ies) quarantined after parked cap overflow ` +
-          `(${parkedDeliveries} still parked). Rows recover when the target circuit closes and parked ` +
-          `headroom opens, or via POST /api/admin/delivery-requeue-quarantined`,
+          `(${parkedDeliveries} still parked). Live rows recover only when DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER ` +
+          `is on, or via an explicit POST /api/admin/delivery-requeue-quarantined`,
         value: s.deliveryQuarantined,
       });
     } else {
@@ -649,24 +715,31 @@ export function evaluatePipelineSignals(
   } else {
     const halted = Boolean(s.autopilotHaltReason);
     const backlog = s.reviewBacklog ?? 0;
+    // CT-2448: a terminal-only backlog is work no extraction attempt can
+    // help — parked unreadable 278-Ts, rejected rows, attempt-capped
+    // cascades.  Those rows must never mark the provider stalled, so the
+    // stall signal counts only the rows that are still ELIGIBLE for a read.
+    // reviewEligible is collected together with reviewBacklog; when it is
+    // missing, fall back to the backlog count rather than going quiet.
+    const eligibleBacklog = s.reviewEligible ?? s.reviewBacklog ?? 0;
     const localActive = (s.localWorkerActivity24h ?? 0) > 0;
-    if (halted || (backlog > 0 && !localActive)) {
+    if (halted || (eligibleBacklog > 0 && !localActive)) {
       checks.push({
         id: 'extraction_provider',
         status: 'stalled',
         detail: halted
           ? `No extraction attempts in 24h while autopilot is halted (${s.autopilotHaltReason})`
-          : `No extraction attempts in 24h while review backlog is ${backlog}`,
+          : `No extraction attempts in 24h while review backlog is ${eligibleBacklog}`,
         value: 0,
       });
-    } else if (localActive && backlog > 0) {
+    } else if (localActive && eligibleBacklog > 0) {
       // The Mac/server local-vision workers publish scans without writing
       // extraction_runs; a busy local drain with backlog is activity, not a
       // stall — but still degraded while provider extractors stay idle.
       checks.push({
         id: 'extraction_provider',
         status: 'degraded',
-        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) while review backlog is ${backlog}`,
+        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) while review backlog is ${eligibleBacklog}`,
         value: s.localWorkerActivity24h ?? 0,
       });
     } else if (localActive) {
@@ -674,7 +747,9 @@ export function evaluatePipelineSignals(
       checks.push({
         id: 'extraction_provider',
         status: 'ok',
-        detail: `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and review backlog clear`,
+        detail: backlog > 0
+          ? `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and no eligible review backlog`
+          : `No provider extraction runs in 24h; local vision worker active (${s.localWorkerActivity24h} submissions) and review backlog clear`,
         value: s.localWorkerActivity24h ?? 0,
       });
     } else {
@@ -683,10 +758,16 @@ export function evaluatePipelineSignals(
         weekday: 'short',
       }).format(new Date(nowMs));
       const isWeekend = weekdayEt === 'Sat' || weekdayEt === 'Sun';
+      // A backlog made only of terminal rows (parked unreadable 278-Ts,
+      // rejected rows) is reported by the extraction_backlog check; the
+      // provider itself is idle, not stalled.
+      const terminalOnly = backlog > 0 && eligibleBacklog === 0;
       checks.push({
         id: 'extraction_provider',
         status: 'ok',
-        detail: isWeekend
+        detail: terminalOnly
+          ? 'No extraction attempts in 24h (review backlog is terminal rows only)'
+          : isWeekend
           ? 'No extraction attempts in 24h (expected on weekend)'
           : 'No extraction attempts in 24h',
         value: 0
@@ -719,10 +800,14 @@ export function evaluatePipelineSignals(
         .filter(([, v]) => typeof v === 'number' && v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(', ') || 'unknown';
+      const named = (byAction.oge_text_unreadable ?? 0) > 0
+        ? (s.unreadableExecutiveDocIds ?? []).filter((id) => id.length > 0).slice(0, 5)
+        : [];
+      const namedSuffix = named.length > 0 ? `  Unreadable docs: ${named.join(', ')}.` : '';
       checks.push({
         id: 'filing_skips',
         status: 'critical',
-        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.`,
+        detail: `${s.filingSkips24h} filing(s) extract-produced-empty/blank/unreadable in last 24h (threshold ${threshold}; ${breakdown}). Almost always an app error — investigate the underlying OCR/vision/model failure.${namedSuffix}`,
         value: { total: s.filingSkips24h, byAction, threshold },
       });
     } else {
@@ -744,32 +829,21 @@ export function evaluatePipelineSignals(
   // starts returning 401/403 (which would silently stall the price refresh
   // lane — the 2026-09-20 outage class).
   if (s.fmpLatency != null) {
-    const ageSec = s.fmpLatency.lastObservationAgeSec;
-    const count = s.fmpLatency.observationCount24h;
-    const f429 = s.fmpLatency.http429s24h;
-    const probeExpected = (() => {
-      const on = envGet('FMP_LATENCY_PROBE_ENABLED');
-      return on !== 'false' && on !== '0';
-    })();
-    const isCritical = probeExpected && (ageSec == null || ageSec > 3 * 3600 || (count ?? 0) === 0);
-    const isDegraded = !isCritical && (ageSec == null || ageSec > 3600 || (f429 ?? 0) > 5);
-    const tier: PipelineStatus = isCritical ? 'critical' : isDegraded ? 'degraded' : 'ok';
-    const detail = isCritical
-      ? `FMP latency probe silent for ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'no observation in 48h'} (${count ?? 0} obs/24h). Observations are not committing.  Check SQLITE_BUSY / WAL checkpoint before rotating FMP_LATENCY_API_KEY.`
-      : isDegraded
-        ? `FMP latency probe lagging (last age ${ageSec != null ? Math.round(ageSec / 60) + ' min' : 'unknown'}, ${f429 ?? 0} HTTP 429s in 24h).`
-        : `FMP latency probe live (last observation ${ageSec != null ? Math.round(ageSec / 60) + ' min ago' : 'unknown'}, ${count ?? 0} obs in 24h, ${f429 ?? 0} 429s).`;
+    // Reuses this function's guarded `envGet` (defined above for filing skips).
+    const probeExpected = fmpLatencyProbeExpected(envGet);
+    const criticalAgeSec = readFmpLatencyCriticalAgeSec(envGet);
+    const graceMs = readFmpLatencySelfHealingGraceMs(envGet);
+    const evaluated = evaluateFmpLatencyCheck(s.fmpLatency, nowMs, {
+      probeExpected,
+      criticalAgeSec,
+      graceMs,
+      selfHealing: s.fmpLatency.selfHealingSilence,
+    });
     checks.push({
       id: 'fmp_latency',
-      status: tier,
-      detail,
-      value: {
-        observationCount24h: count,
-        lastObservationAt: s.fmpLatency.lastObservationAt,
-        lastObservationAgeSec: ageSec,
-        http429s24h: f429,
-        byProvider: s.fmpLatency.byProvider,
-      },
+      status: evaluated.status,
+      detail: evaluated.detail,
+      value: evaluated.value,
     });
   } else {
     checks.push({ id: 'fmp_latency', status: 'unknown', detail: 'FMP latency telemetry uncollected', value: null });
@@ -921,12 +995,39 @@ export function evaluatePipelineSignals(
       const attemptMs = st.lastAttemptAt ? Date.parse(st.lastAttemptAt) : NaN;
       const successAgeH = Number.isFinite(successMs) ? (nowMs - successMs) / 3_600_000 : Infinity;
       const attemptAgeH = Number.isFinite(attemptMs) ? (nowMs - attemptMs) / 3_600_000 : Infinity;
+      // An edge-deny backoff explains sparse attempts while its deny is newer
+      // than the last success, the latest attempt is that deny (the watcher
+      // stamps both with one instant), and the next attempt is not overdue.
+      // An attempt after the deny means polling resumed and failed for its
+      // own reason, so the generic wording names it.  Still stalled:
+      // discovery is down, and this detail is what the page says.
+      const backoff = st.edgeBackoff;
+      const backoffUntilMs = backoff ? Date.parse(backoff.until) : NaN;
+      const deniedMs = backoff ? Date.parse(backoff.lastDeniedAt) : NaN;
+      const backedOff = backoff !== undefined
+        && !(Number.isFinite(successMs) && deniedMs <= successMs)
+        && !(Number.isFinite(attemptMs) && Number.isFinite(deniedMs) && attemptMs > deniedMs + 60_000)
+        && nowMs <= backoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS;
       if (successAgeH <= maxAgeH) {
+        const transport = src === 'senate' && st.transport
+          ? parseSenateEfdTransportNote(`transport=${st.transport}`)
+          : null;
+        const via = transport ? ` via ${transport}` : '';
         checks.push({
           id,
           status: 'ok',
-          detail: `${src} polling live: last success ${successAgeH < 1 ? Math.round(successAgeH * 60) + 'm' : Math.round(successAgeH) + 'h'} ago`,
+          detail: `${src} polling live: last success ${successAgeH < 1 ? Math.round(successAgeH * 60) + 'm' : Math.round(successAgeH) + 'h'} ago${via}`,
           value: Math.round(successAgeH * 10) / 10,
+        });
+      } else if (backoff && backedOff) {
+        const waitMin = Math.round((backoffUntilMs - nowMs) / 60_000);
+        checks.push({
+          id,
+          status: 'stalled',
+          detail: `${src} polling BACKED OFF after an edge deny (${backoff.reason}): `
+            + `${!Number.isFinite(waitMin) ? 'next attempt time unknown' : waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'}; `
+            + `no success in ${successAgeH === Infinity ? 'ever' : Math.round(successAgeH) + 'h'} (threshold ${maxAgeH}h)`,
+          value: successAgeH === Infinity ? null : Math.round(successAgeH),
         });
       } else if (attemptAgeH <= maxAgeH) {
         checks.push({
@@ -1044,11 +1145,14 @@ export function evaluatePipelineSignals(
       const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
       const host = probe.host ?? 'residential-proxy';
       if (!probe.ok) {
+        const outageSince = (probe as { outageStartedAt?: string | null }).outageStartedAt;
+        const outageNote = outageSince ? ` — outage since ${outageSince}` : '';
         checks.push({
           id: 'senate_relay',
           status: 'stalled',
           detail: `Residential proxy DOWN at ${host}`
             + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + outageNote
             + ' — Senate/House fetches may fail Imperva checks until the proxy is back.',
           value: probe.status,
         });
@@ -1116,44 +1220,149 @@ export function evaluatePipelineSignals(
     }
   }
 
+  // Senate eFD functional probe (CT-2416): landing GET + agreement POST through
+  // the residential proxy.  ok / blocked (an Akamai anti-bot 403 reads
+  // `degraded` since the 2026-11-05 canary redesign: the deny is the expected
+  // state of this path and Senate data flows via the Mac fetcher relay) /
+  // degraded.  A degraded probe where eFD itself answered wrong (non-Akamai
+  // HTTP error, landing without a csrf token: `status` set) is `stalled`, so it
+  // escalates like the pre-CT-2416 probe did.  Relay-down / transport-error
+  // records (`status: null`) stay `degraded`: the residential_proxy check owns
+  // relay outages, and paging twice for one cause is the churn CT-2416 removes.
+  //
+  // The probe does not dial while the watcher's edge-deny backoff is active
+  // (CT-2442).  An ingestion edge deny newer than the probe's last eFD verdict
+  // is the same Akamai refusal the probe reports as `blocked`, so it speaks for
+  // eFD until the probe dials again.  Relay-down records (`dialed: false`)
+  // carry no eFD verdict and never outrank it.
+  const efdBackoff = s.senateEfd?.edgeBackoff ?? null;
+  const efdDeniedMs = efdBackoff ? Date.parse(efdBackoff.lastDeniedAt) : NaN;
+  const efdBackoffUntilMs = efdBackoff ? Date.parse(efdBackoff.until) : NaN;
+  const efdProbe = s.senateEfd?.probe ?? null;
+  const efdVerdictMs = efdProbe?.state && efdProbe.dialed !== false ? Date.parse(efdProbe.checkedAt) : NaN;
+  const efdDeniedSinceProbe = Number.isFinite(efdDeniedMs)
+    && nowMs <= efdBackoffUntilMs + SENATE_EDGE_BACKOFF_GRACE_MS
+    && !(Number.isFinite(efdVerdictMs) && efdVerdictMs >= efdDeniedMs);
   if (s.senateEfd === undefined) {
-    /* optional — fixtures predating the direct eFD probe omit this signal */
+    /* optional — fixtures predating the eFD probe omit this signal */
   } else if (s.senateEfd == null) {
-    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD direct probe uncollected', value: null });
-  } else if (!s.senateEfd.probe) {
+    checks.push({ id: 'senate_efd', status: 'unknown', detail: 'Senate eFD probe uncollected', value: null });
+  } else if (efdBackoff && efdDeniedSinceProbe) {
+    const deniedAgoMin = (nowMs - efdDeniedMs) / 60_000;
+    const waitMin = Math.round((efdBackoffUntilMs - nowMs) / 60_000);
     checks.push({
       id: 'senate_efd',
-      status: 'unknown',
-      detail: 'Senate eFD direct landing not yet probed',
-      value: null,
+      status: 'degraded',
+      detail: `Senate eFD canary: Akamai edge deny on Senate ingestion `
+        + `${deniedAgoMin < 1 ? Math.round(deniedAgoMin * 60) + 's' : Math.round(deniedAgoMin) + 'm'} ago (${efdBackoff.reason})`
+        + ` — refused by eFD itself, not a relay outage; the twice-a-day canary tracks this path and Senate filings arrive via the Mac fetcher relay`
+        + ` (ingestion backoff: ${waitMin > 0 ? `next attempt in ${waitMin}m` : 'next attempt due now'})`,
+      value: 403,
     });
+  } else if (!s.senateEfd.probe || !s.senateEfd.probe.state) {
+    // Missing, or a legacy unproxied direct-GET record (dropped 2026-10-16).
+    // A legacy datacenter 401/403 while the residential proxy is live is the
+    // expected direct-egress block (#2837): say so as `degraded`.  Anything
+    // else legacy is ignored (unknown) until the proxied probe overwrites it.
+    const legacy = s.senateEfd.probe;
+    const residentialLive = Boolean(s.residentialProxyConfigured && s.residentialProxy?.probe?.ok);
+    if (legacy && !legacy.ok && residentialLive && (legacy.status === 403 || legacy.status === 401)) {
+      checks.push({
+        id: 'senate_efd',
+        status: 'degraded',
+        detail: `Senate eFD direct probe blocked from datacenter (HTTP ${legacy.status})`
+          + ` — expected; Senate ingest uses the residential proxy (live).`,
+        value: legacy.status,
+      });
+    } else {
+      checks.push({
+        id: 'senate_efd',
+        status: 'unknown',
+        detail: 'Senate eFD proxied probe not yet run',
+        value: null,
+      });
+    }
   } else {
     const probe = s.senateEfd.probe;
     const checkedMs = Date.parse(probe.checkedAt);
     const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
-    if (!probe.ok) {
-      checks.push({
-        id: 'senate_efd',
-        status: 'stalled',
-        detail: `Senate eFD direct landing unreachable`
-          + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
-          + `${probe.error ? ` — ${probe.error}` : ''}`,
-        value: probe.status,
-      });
-    } else if (ageMin > t.senateRelayProbeMaxAgeMinutes) {
+    const ago = ageMin === Infinity ? 'never' : `${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`;
+    // The probe dials eFD at most twice a day, so allow three cycles
+    // before a resting ok record is even called stale (it still reads ok).
+    const maxAgeMin = Math.max(t.senateRelayProbeMaxAgeMinutes, (3 * SENATE_EFD_PROXY_PROBE_INTERVAL_MS) / 60_000);
+    const http = probe.status != null ? ` (HTTP ${probe.status})` : '';
+    if (probe.state === 'blocked') {
       checks.push({
         id: 'senate_efd',
         status: 'degraded',
-        detail: `Senate eFD direct probe stale: last ok ${Math.round(ageMin)}m ago (threshold ${t.senateRelayProbeMaxAgeMinutes}m)`,
+        detail: `Senate eFD canary blocked: Akamai anti-bot "Access Denied" on ${probe.step ?? 'eFD'}${http} through the residential proxy`
+          + ` — expected for this path, not a relay outage; Senate filings arrive via the Mac fetcher relay (probed ${ago})`,
+        value: probe.status,
+      });
+    } else if (probe.state === 'degraded') {
+      checks.push({
+        id: 'senate_efd',
+        status: probe.status != null ? 'stalled' : 'degraded',
+        detail: `Senate eFD probe degraded${probe.step ? ` at ${probe.step}` : ''}${http}`
+          + `${probe.error ? ` — ${probe.error}` : ''} (checked ${ago})`,
+        value: probe.status,
+      });
+    } else if (ageMin > maxAgeMin) {
+      // A stale ok is the canary resting between its twice-a-day dials, not a
+      // stall: the dial schedule plus missed-cycle tolerance puts this
+      // threshold far past any healthy gap.
+      checks.push({
+        id: 'senate_efd',
+        status: 'ok',
+        detail: `Senate eFD canary: last dial ok ${Math.round(ageMin)}m ago — the probe dials twice a day by design; Senate filings arrive via the Mac fetcher relay`,
         value: Math.round(ageMin),
       });
     } else {
       checks.push({
         id: 'senate_efd',
         status: 'ok',
-        detail: `Senate eFD direct landing reachable (${probe.egress ?? 'direct'}): probed ${ageMin < 1 ? Math.round(ageMin * 60) + 's' : Math.round(ageMin) + 'm'} ago`,
+        detail: `Senate eFD landing + agreement POST ok through ${probe.egress ?? 'proxy'}: probed ${ago}`,
         value: Math.round(ageMin * 10) / 10,
       });
+    }
+  }
+
+  // Mac eFD fetcher runs (CT-2462 senate-fetcher:last-run, CT-2465).  A missing
+  // run report is not silent: inside 6:00 AM–10:00 PM CT it is a warning, and
+  // overnight the check says why it is quiet.  A fresh run with zero new rows
+  // is healthy.  degraded, not stalled — the uptime target stays 200 and the
+  // loud sweep does not page a standing never-reported fetcher.
+  if (s.senateFetcher === undefined) {
+    /* fixtures that predate the fetcher-run signal omit this check */
+  } else if (s.senateFetcher == null) {
+    checks.push({ id: 'senate_fetcher', status: 'unknown', detail: 'Senate fetcher run status uncollected', value: null });
+  } else {
+    switch (s.senateFetcher.level) {
+      case 'warning':
+        checks.push({
+          id: 'senate_fetcher',
+          status: 'degraded',
+          detail: s.senateFetcher.detail,
+          value: s.senateFetcher.seen ? 1 : 0,
+        });
+        break;
+      case 'ok':
+        checks.push({
+          id: 'senate_fetcher',
+          status: 'ok',
+          detail: s.senateFetcher.detail,
+          value: s.senateFetcher.seen ? 1 : 0,
+        });
+        break;
+      default: {
+        const unrecognized: never = s.senateFetcher.level;
+        checks.push({
+          id: 'senate_fetcher',
+          status: 'unknown',
+          detail: `Senate fetcher run status unrecognized (${String(unrecognized)})`,
+          value: null,
+        });
+      }
     }
   }
 
@@ -1246,6 +1455,8 @@ export function evaluatePipelineSignals(
     signals: {
       filingSkips24h: s.filingSkips24h,
       filingSkipsByAction24h: s.filingSkipsByAction24h,
+      unreadableExecutiveDocCount: s.unreadableExecutiveDocCount ?? null,
+      unreadableExecutiveDocIds: s.unreadableExecutiveDocIds ?? null,
       fmpLatency: s.fmpLatency,
       priceEodLatestDate: s.priceEodLatestDate,
       spxEodLatestDate: s.spxEodLatestDate,
@@ -1254,9 +1465,93 @@ export function evaluatePipelineSignals(
 }
 
 /**
+ * `/api/health` check `empty_fetch_handoff`. Same id as the loud-alert
+ * condition, and the same WHERE as that condition (`emptyFetchAlertWhere`).
+ * A positive count is critical: the filing is outside every other detector.
+ * The stall sweep skips this id so the dedicated condition is the only page.
+ */
+export function emptyFetchHandoffHealthCheck(count: number | null): PipelineCheck {
+  if (count == null || !Number.isFinite(count)) {
+    // Optional probe. `unknown` ranks above `ok` in worstStatus and would
+    // drop the whole /api/health response. The miss stays in the detail.
+    return {
+      id: 'empty_fetch_handoff',
+      status: 'ok',
+      detail: 'Empty-fetch handoff count uncollected',
+      value: null,
+    };
+  }
+  if (count > 0) {
+    return {
+      id: 'empty_fetch_handoff',
+      status: 'critical',
+      detail:
+        `${count} filing(s) have no raw object and no live transactions while ` +
+        `ingest_status is outside the valid union or the fetch outbox completed without storing one`,
+      value: count,
+    };
+  }
+  return {
+    id: 'empty_fetch_handoff',
+    status: 'ok',
+    detail: 'No empty-fetch handoff outside a terminal ingest status',
+    value: 0,
+  };
+}
+
+export interface EmptyFetchHandoffSnapshot {
+  check: PipelineCheck;
+  wakeDocId: string | null;
+}
+
+/**
+ * One filings scan: the window count and the earliest wake doc.
+ * `/api/health` and the stall sweep share the snapshot.
+ */
+export async function collectEmptyFetchHandoffCheck(
+  env: Env,
+  now = new Date(),
+): Promise<EmptyFetchHandoffSnapshot> {
+  try {
+    const where = emptyFetchAlertWhere('f', 'o');
+    const row = await get<{ n: number; doc_id: string | null }>(
+      env.DB,
+      `SELECT COUNT(*) OVER () AS n, f.doc_id AS doc_id
+         FROM filings f
+         LEFT JOIN ingestion_outbox o ON o.doc_id = f.doc_id
+        WHERE ${where}
+        ORDER BY f.first_seen_at ASC
+        LIMIT 1`,
+      [emptyFetchSeenCutoff(now)],
+    );
+    if (!row) {
+      return { check: emptyFetchHandoffHealthCheck(0), wakeDocId: null };
+    }
+    const n = Number(row.n);
+    return {
+      check: emptyFetchHandoffHealthCheck(Number.isFinite(n) ? n : null),
+      wakeDocId: row.doc_id,
+    };
+  } catch {
+    return { check: emptyFetchHandoffHealthCheck(null), wakeDocId: null };
+  }
+}
+
+/**
  * Collect signals from DB and evaluate health.
  */
-export async function checkPipelineHealth(env: Env, now = new Date()): Promise<PipelineHealth> {
+export async function checkPipelineHealth(
+  env: Env,
+  now = new Date(),
+  precomputed: { emptyFetch?: EmptyFetchHandoffSnapshot } = {},
+  opts: { includeUnreadableDocIds?: boolean } = {},
+): Promise<PipelineHealth> {
+  // Raw unreadable-filing doc ids are operator-private diagnostics: public
+  // /health responses must not disclose them, so callers serving
+  // unauthenticated traffic pass includeUnreadableDocIds: false and get
+  // unreadableExecutiveDocCount only. Defaults to true so existing
+  // operator-private callers (loud alerts, admin surface) keep the names.
+  const includeUnreadableDocIds = opts.includeUnreadableDocIds ?? true;
   const nowMs = now.getTime();
   const iso24hAgo = new Date(nowMs - 24 * 3600 * 1000).toISOString();
   // 2026-10-04: read the live probe schedule from env so a legally slower
@@ -1296,6 +1591,8 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // Filing-skips signal (extract_empty_failure / auto_resolved_empty / doc_quarantined / oge_text_unreadable).
   let filingSkips24h: number | null = null;
   let filingSkipsByAction24h: PipelineSignals['filingSkipsByAction24h'] = null;
+  let unreadableExecutiveDocIds: string[] | null = null;
+  let unreadableExecutiveDocCount: number | null = null;
   // 2026-09-21: FMP-family latency surface for admin + user dashboards.
   let fmpLatency: PipelineSignals['fmpLatency'] = null;
 
@@ -1319,21 +1616,24 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
       auto_resolved_empty: number | null;
       doc_quarantined: number | null;
       oge_text_unreadable: number | null;
+      oge_text_unreadable_docs: number | null;
     }>(
       env.DB,
       `SELECT
          SUM(CASE WHEN action = 'extract_empty_failure' THEN 1 ELSE 0 END) AS extract_empty_failure,
          SUM(CASE WHEN action = 'auto_resolved_empty'   THEN 1 ELSE 0 END) AS auto_resolved_empty,
          SUM(CASE WHEN action = 'doc_quarantined'       THEN 1 ELSE 0 END) AS doc_quarantined,
-         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable
+         SUM(CASE WHEN action = ?                        THEN 1 ELSE 0 END) AS oge_text_unreadable,
+         COUNT(DISTINCT CASE WHEN action = ? THEN doc_id END) AS oge_text_unreadable_docs
        FROM ingestion_decisions
        WHERE created_at >= ?`,
-      [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
+      [OGE_TEXT_UNREADABLE_DECISION_ACTION, OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
     );
     const ee = Number(res?.extract_empty_failure ?? 0);
     const ar = Number(res?.auto_resolved_empty ?? 0);
     const dq = Number(res?.doc_quarantined ?? 0);
     const unread = Number(res?.oge_text_unreadable ?? 0);
+    const unreadDocs = Number(res?.oge_text_unreadable_docs ?? 0);
     filingSkips24h = ee + ar + dq + unread;
     filingSkipsByAction24h = {
       extract_empty_failure: ee,
@@ -1341,6 +1641,24 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
       doc_quarantined: dq,
       oge_text_unreadable: unread,
     };
+    // Distinct unreadable DOCS, not decisions: duplicate unreadable
+    // decisions for the same doc must not inflate the public count.
+    unreadableExecutiveDocCount = unreadDocs;
+    if (unread > 0 && includeUnreadableDocIds) {
+      try {
+        // Most recent failure first: GROUP BY doc_id collapses duplicate
+        // decisions for the same doc, and ordering by MAX(created_at)
+        // surfaces the filing that just failed instead of alphabetically
+        // early ids.
+        const rows = await all<{ doc_id: string | null }>(
+          env.DB,
+          `SELECT doc_id, MAX(created_at) AS latest_at FROM ingestion_decisions
+           WHERE action = ? AND created_at >= ? GROUP BY doc_id ORDER BY latest_at DESC LIMIT 5`,
+          [OGE_TEXT_UNREADABLE_DECISION_ACTION, iso24hAgo],
+        );
+        unreadableExecutiveDocIds = rows.map((r) => r.doc_id ?? '').filter((id) => id.length > 0);
+      } catch {}
+    }
   } catch {}
 
   // 2026-09-21: FMP-family latency. Two parts: trade_provider_observations
@@ -1418,6 +1736,22 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
     if (fmpLatency) fmpLatency.http429s24h = total;
   } catch {}
+
+  if (fmpLatency) {
+    try {
+      const envGet = (k: string): string | undefined => {
+        try {
+          return (globalThis as { Deno?: { env: { get(k: string): string | undefined } } }).Deno?.env.get(k);
+        } catch {
+          return undefined;
+        }
+      };
+      const selfHealing = await enrichFmpLatencySelfHealingSilence(env, fmpLatency, now, envGet);
+      if (selfHealing) fmpLatency = { ...fmpLatency, selfHealingSilence: selfHealing };
+    } catch {
+      /* fail-soft */
+    }
+  }
 
   try {
     const res = await get<{ n: number; oldest: string | null }>(
@@ -1617,6 +1951,15 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
   // started writing source_attempts rows) and reads its enable gate — a
   // disabled chamber must be LOUD, never a silent skip.
   let pollSources: PipelineSignals['pollSources'] = null;
+  // Fail-soft (null on any KV fault); shared by polling_senate and senate_efd.
+  const senateEdgeBackoff = await readSenateEdgeBackoff(env);
+  const senateEdgeBackoffSignal = senateEdgeBackoff
+    ? {
+        until: senateEdgeBackoff.until,
+        lastDeniedAt: senateEdgeBackoff.lastDeniedAt,
+        reason: senateEdgeBackoff.reason,
+      }
+    : null;
   try {
     const rows = await all<{ source: string; last_success: string | null; last_attempt: string | null }>(
       env.DB,
@@ -1650,9 +1993,30 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
         lastSuccessAt,
         lastAttemptAt,
         configDisabled: source === 'executive' ? ogeDisabled : false,
+        ...(source === 'senate' && senateEdgeBackoffSignal ? { edgeBackoff: senateEdgeBackoffSignal } : {}),
       };
     });
   } catch {}
+
+  if (pollSources) {
+    try {
+      const row = await get<{ error: string | null }>(
+        env.DB,
+        `SELECT error FROM source_attempts
+          WHERE source = 'senate' AND outcome = 'success'
+          ORDER BY attempted_at DESC
+          LIMIT 1`,
+      );
+      const transport = parseSenateEfdTransportNote(row?.error ?? null);
+      if (transport) {
+        pollSources = pollSources.map((source) => (
+          source.source === 'senate' ? { ...source, transport } : source
+        ));
+      }
+    } catch {
+      /* the liveness times above still stand without the transport name */
+    }
+  }
 
   let latencyProviders: PipelineSignals['latencyProviders'] = null;
   try {
@@ -1731,11 +2095,19 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     }
   }
 
-  let senateEfd: PipelineSignals['senateEfd'] = { probe: null };
+  let senateEfd: PipelineSignals['senateEfd'] = { probe: null, edgeBackoff: senateEdgeBackoffSignal };
   try {
-    senateEfd = { probe: await readSenateEfdProbe(env) };
+    senateEfd = { probe: await readSenateEfdProbe(env), edgeBackoff: senateEdgeBackoffSignal };
   } catch {
     senateEfd = null;
+  }
+
+  let senateFetcher: PipelineSignals['senateFetcher'] = null;
+  try {
+    const fetcherNow = new Date(nowMs);
+    senateFetcher = evaluateSenateFetcherHealth(await readSenateFetcherRunStatus(env, fetcherNow), fetcherNow);
+  } catch {
+    senateFetcher = null;
   }
 
   const signals: PipelineSignals = {
@@ -1767,15 +2139,104 @@ export async function checkPipelineHealth(env: Env, now = new Date()): Promise<P
     residentialProxyConfigured,
     residentialProxy,
     senateEfd,
+    senateFetcher,
     priceEodLatestDate,
     spxEodLatestDate,
     filingSkips24h,
     filingSkipsByAction24h,
+    unreadableExecutiveDocCount,
+    unreadableExecutiveDocIds,
     fmpLatency,
     deliveryParked,
     deliveryQuarantined,
   };
 
   const evaluated = evaluatePipelineSignals(signals, nowMs, DEFAULT_PIPELINE_THRESHOLDS, schedule);
-  return { ...evaluated, reviewQueue };
+
+  const stPeerMetrics = await collectStPeerPricesMetrics(
+    env,
+    now,
+    readPipelineStallHours(env, 'st_peer_prices'),
+  );
+  const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
+  const stInboundMetrics = await collectStInboundMarketDataMetrics(
+    env,
+    now,
+    readPipelineStallHours(env, 'st_inbound_market_data'),
+  );
+  const stInboundCheck = stInboundMarketDataMetricsToCheck(stInboundMetrics);
+  const emptyFetchCheck = (precomputed.emptyFetch ?? await collectEmptyFetchHandoffCheck(env, now)).check;
+  // Subscriber alert pause: never let CT_DELIVERY_MODE sit off silently.
+  const deliveryModeCheck = await collectDeliveryModeCheck(env, now);
+  const checks = [...evaluated.checks, stPeerCheck, stInboundCheck, emptyFetchCheck, deliveryModeCheck];
+  let status: PipelineStatus = 'ok';
+  for (const c of checks) {
+    status = worstStatus(status, c.status);
+  }
+
+  return { ...evaluated, status, checks, reviewQueue };
+}
+
+export interface PipelineHealthCache {
+  get(env: Env, now?: Date): Promise<PipelineHealth>;
+  reset(): void;
+}
+
+/**
+ * Short-TTL singleflight cache around a pipeline-health fetcher.
+ *
+ * checkPipelineHealth runs dozens of sequential probes; the public health
+ * endpoints are monitor targets, so uncached hits amplify into full scans.
+ * Entries are keyed by the DB binding object: the Deno runtime reuses one
+ * shim per process (deno/main.ts), while tests that build a fresh fake DB
+ * per case stay isolated. Errors are never cached — a rejected fetch clears
+ * the in-flight slot so the next caller retries immediately.
+ */
+export function createPipelineHealthCache(
+  fetcher: (env: Env, now: Date) => Promise<PipelineHealth>,
+  ttlMs = 60_000,
+): PipelineHealthCache {
+  interface Entry {
+    at: number;
+    result?: PipelineHealth;
+    pending?: Promise<PipelineHealth>;
+  }
+  const entries = new WeakMap<object, Entry>();
+  let fallback: Entry | null = null;
+  const entryFor = (env: Env): Entry => {
+    const key = (env as { DB?: unknown }).DB;
+    if (key && (typeof key === 'object' || typeof key === 'function')) {
+      let entry = entries.get(key as object);
+      if (!entry) {
+        entry = { at: 0 };
+        entries.set(key as object, entry);
+      }
+      return entry;
+    }
+    fallback ??= { at: 0 };
+    return fallback;
+  };
+  return {
+    async get(env: Env, now = new Date()): Promise<PipelineHealth> {
+      const entry = entryFor(env);
+      const nowMs = now.getTime();
+      if (entry.result && nowMs - entry.at < ttlMs) return entry.result;
+      if (entry.pending) return entry.pending;
+      const pending = (async () => {
+        const result = await fetcher(env, now);
+        entry.at = nowMs;
+        entry.result = result;
+        return result;
+      })();
+      entry.pending = pending;
+      try {
+        return await pending;
+      } finally {
+        if (entry.pending === pending) entry.pending = undefined;
+      }
+    },
+    reset(): void {
+      fallback = null;
+    },
+  };
 }

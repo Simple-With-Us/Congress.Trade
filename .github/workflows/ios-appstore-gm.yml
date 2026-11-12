@@ -19,6 +19,11 @@ on:
         description: "Bypass the 2.5 hour interval and same-HEAD gate for this run only"
         type: boolean
         default: false
+      marketing_version:
+        description: "Exact App Store version to build, e.g. 1.0.236.  Empty = next patch automatically."
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -193,43 +198,37 @@ jobs:
       # Hosted runners have an empty home each job, and this repo forbids
       # actions/cache.  Without a state file the ship gate reads "never shipped"
       # and the release notes fall back to the HEAD subject only.  Seed both from
-      # the previous successful run of this workflow.
+      # the previous successful run of this workflow.  A skip fails the assert
+      # below, so the newest success is an upload.  The helper is not asked
+      # to ignore short runs.
       - name: Seed last-ship state from the previous successful run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          prev="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ios-appstore-gm.yml \
-            --status success --limit 1 --json headSha,updatedAt \
-            --jq '.[0] | select(. != null) | "\(.updatedAt) \(.headSha)"' || true)"
-          if [ -z "$prev" ]; then
-            echo "No previous successful run; the ship gate treats this as a first ship."
-            exit 0
-          fi
-          prev_at="${prev%% *}"
-          prev_sha="${prev##* }"
-          # gh prints RFC 3339 without fractions, but drop any fraction so a
-          # format change cannot fail this step under set -e.
-          prev_at="${prev_at%%.*}"
-          prev_at="${prev_at%Z}Z"
-          if ! [[ "$prev_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::warning::Previous run sha is not a full sha; not seeding."
-            exit 0
-          fi
-          prev_ts="$(python3 -c 'import sys,datetime; print(int(datetime.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()))' "$prev_at")"
-          state_dir="${IOS_FLEET_STATE_DIR:-$HOME/.cache/ios-fleet}"
-          mkdir -p "$state_dir"
-          printf '%s %s\n' "$prev_ts" "$prev_sha" > "$state_dir/last-ship-congress.txt"
-          echo "Seeded last ship: ${prev_sha:0:10} at ${prev_at}"
+          bash "$GITHUB_WORKSPACE/scripts/ios-fleet/seed-last-ship.sh" \
+            --workflow ios-appstore-gm.yml \
+            --app congress
 
       - name: Ship CongressTrade from GM host
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           FORCE_SHIP: ${{ inputs.force_ship }}
+          # The input is passed through the environment, never interpolated
+          # into the script:  a dispatch input is operator text, and the
+          # script validates it before it is used.
+          MARKETING_VERSION_INPUT: ${{ inputs.marketing_version }}
         run: |
+          set -euo pipefail
           args=()
           if [ "$FORCE_SHIP" = "true" ]; then
             args+=(--force-ship)
+          fi
+          if [ -n "${MARKETING_VERSION_INPUT:-}" ]; then
+            if ! [[ "$MARKETING_VERSION_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::marketing_version must be X.Y.Z (got '${MARKETING_VERSION_INPUT}')."
+              exit 1
+            fi
+            args+=(--version "$MARKETING_VERSION_INPUT")
           fi
           bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" ${args[@]:+"${args[@]}"}
 

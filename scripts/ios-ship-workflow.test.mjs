@@ -72,11 +72,18 @@ test("ios-appstore-gm.yml ships with notes, Sentry, and a per-run gate override"
   assert.doesNotMatch(yml, /ios-ship-testflight\.sh["'\s].*--force-ship/);
   assert.match(yml, /force_ship:\s*\n\s+description:[^\n]*\n\s+type: boolean\s*\n\s+default: false/);
   assert.match(yml, /FORCE_SHIP:\s*\$\{\{ inputs\.force_ship \}\}/);
-  // Hosted runners start empty, so the gate and the notes range are seeded.
+  // Hosted runners start empty, so the gate and the notes range are seeded
+  // from the previous successful run. A skip fails this job, so the newest
+  // success is an upload and the shared helper is not asked to filter.
   assert.match(yml, /actions: read/);
   assert.match(yml, /Seed last-ship state/);
-  assert.match(yml, /last-ship-congress\.txt/);
-  assert.match(yml, /prev_at="\$\{prev_at%%\.\*\}"/);
+  assert.match(yml, /scripts\/ios-fleet\/seed-last-ship\.sh/);
+  assert.match(yml, /--workflow ios-appstore-gm\.yml/);
+  assert.match(yml, /--app congress/);
+  assert.doesNotMatch(yml, /--require-upload/);
+  const helper = read("scripts/ios-fleet/seed-last-ship.sh");
+  assert.match(helper, /last-ship-\$\{APP\}\.txt/);
+  assert.match(read("scripts/ios-fleet/seed-last-ship.mjs"), /indexOf\("\."\)/);
   // A gate skip must not look like a shipped build.
   assert.match(yml, /Assert this checkout was uploaded/);
   assert.match(yml, /fetch-depth: 0/);
@@ -108,6 +115,26 @@ function onBlock(yml) {
   return m[1];
 }
 
+// on.push.paths list only: not paths-ignore, branches, schedule, or other lists.
+// Each entry may be single-quoted, double-quoted, or unquoted.
+function extractPushPaths(onText) {
+  const push = onText.match(/^\s*push:\s*\n((?:^(?:\s{3,}.*|\s*)\n?)*)/m);
+  const paths = push?.[1].match(/^\s*paths:\s*\n((?:^\s+-\s+.*\n?)*)/m);
+  const list = paths?.[1] ?? "";
+  return [...list.matchAll(/^\s+-\s+['"]?([^'"\s]+)['"]?\s*(?:#.*)?$/gm)].map((m) => m[1]);
+}
+
+// Scheduled gate step only, so other --path-prefix uses are not picked up.
+// Each prefix may be single-quoted, double-quoted, or unquoted.
+function gateStepBlock(code) {
+  const step = code.match(/-\s*name:\s*Scheduled ship gate[\s\S]*?(?=\n\s+-\s*name:|\n\S|$)/);
+  return step?.[0] ?? "";
+}
+
+function extractGatePrefixes(code) {
+  return [...gateStepBlock(code).matchAll(/--path-prefix\s+['"]?([^'"\s]+)['"]?(?:\s*#.*)?/g)].map((m) => m[1]);
+}
+
 test("ios-ship.yml ships automatically on a merge that touches the native tree", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const code = withoutComments(yml);
@@ -121,27 +148,77 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // A scheduled catch-up is allowed only behind the scheduled path gate.
   if (/^\s+schedule:/m.test(on)) {
     assert.match(code, /scheduled-ship-gate\.sh/);
-    assert.match(code, /--path-prefix 'clients\/ios\/'/);
     assert.match(code, /--event "\$\{\{ github\.event_name \}\}"/);
+    // The gate must watch every push path, so a missed push still ships.
+    const pushGlobs = extractPushPaths(on);
+    assert.ok(pushGlobs.length > 0, "push paths must list at least one glob");
+    const gatePrefixes = extractGatePrefixes(code);
+    for (const g of pushGlobs) {
+      assert.ok(gatePrefixes.includes(g), `gate must watch push path '${g}'`);
+    }
+    const gate = read("scripts/ios-fleet/scheduled-ship-gate.sh");
+    assert.match(gate, /repeatable/);
+    assert.match(gate, /:!/);
   }
 
   // The gate diffs against an older sha, and the notes need the commit range.
   assert.match(code, /fetch-depth:\s*0/);
+  // The seed runs on every event, before the gate and the ship script, and
+  // reads the previous upload of this workflow. A green skip is not a seed.
+  const seedAt = code.indexOf("name: Seed last-ship state from the previous successful run");
+  const gateAt = code.indexOf("name: Scheduled ship gate");
+  const shipAt = code.indexOf("scripts/ios-ship-testflight.sh");
+  assert.ok(seedAt >= 0 && gateAt > seedAt && shipAt > gateAt, "seed must precede the gate and the ship script");
+  assert.match(code, /actions: read/);
+  assert.match(code, /scripts\/ios-fleet\/seed-last-ship\.sh/);
+  assert.match(code, /--workflow ios-ship\.yml/);
+  assert.match(code, /--require-upload/);
+  assert.match(code, /--ship-step "Ship CongressTrade to TestFlight"/);
+  assert.doesNotMatch(code, /actions\/cache/);
   // What to Test is mandatory and published, never dry-rendered.
   assert.match(code, /IOS_TF_RELEASE_NOTES:\s*"1"/);
   // Ship through the wrapper that runs ship-testflight.sh (ensure-tf-ready inside).
   // CT-2434: the ship log is kept so the external-beta promotion can name the
   // exact build this run uploaded, so the invocation may carry a tee -- but it
   // must still be the wrapper, and still be the last thing in the step.
+  // Owner 2026-10-29: the one planned build of the release is handed to the
+  // ship as --build, so every ship of the release uploads the same number.
   assert.match(
     code,
-    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"( \$\{ship_args\[@\]\+"\$\{ship_args\[@\]\}"\})?(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
   );
+  // The only argument a dispatch may add is an exact --version; never --force-ship.
+  assert.doesNotMatch(code, /--force-ship/);
+  assert.match(code, /ship_args\+=\(--version "\$INPUT_MARKETING_VERSION"\)/);
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);
   assert.match(code, /secret_path=\/asc/);
   assert.match(code, /ASC_INFISICAL_PROJECT_ID:\s*[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/);
+});
+
+test("ios-ship.yml plans the release build once and hands it to the ship", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const code = withoutComments(yml);
+
+  // ONE upstream plan per release: a plan-build step that runs the shared
+  // plan command with the merge stamp of HEAD, and only when the gate says
+  // ship -- so a gated tick plans nothing and uploads nothing.
+  assert.match(code, /id: plan-build\n\s+if: steps\.gate\.outputs\.should_ship == '1'/);
+  assert.match(code, /plan-release-build/);
+  assert.match(code, /--merge-stamp/);
+  assert.match(code, /TZ=America\/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD/);
+  // The one plan covers the same inventory as the ship script's own
+  // fixed-mode plan: pairedBundleId first, then the macBundleId alias
+  // (ship-testflight.sh asc_next_shared_build), and a pairedBuildFeed
+  // floor fails the run instead of planning without it.
+  assert.match(code, /get\("pairedBundleId"\) or e\.get\("macBundleId"\)/);
+  assert.match(code, /pairedBuildFeed floor that this plan step does not fetch/);
+  // The value leaves the job as a job output, so every ship job of the
+  // release takes the same number.
+  assert.match(code, /outputs:\s*\n\s+build: \$\{\{ steps\.plan-build\.outputs\.build \}\}/);
+  // A malformed plan fails the run instead of shipping a guessed number.
+  assert.match(code, /\^?\[1-9\]\[0-9\]\{11\}\$/);
 });
 
 test("no iOS ship workflow carries a standing gate override", () => {
@@ -156,9 +233,44 @@ test("no iOS ship workflow carries a standing gate override", () => {
   }
 });
 
+test("ship-gate coverage extractors accept any quote style", () => {
+  const sampleOn = [
+    "  push:",
+    "    branches: [main]",
+    "    paths:",
+    "      - 'a/**'",
+    '      - "b/**"',
+    "      - c/**",
+    "      - 'd/**' # trailing comment",
+    "    paths-ignore:",
+    "      - 'ignored/**'",
+    "  schedule:",
+    "    - cron: '7,37 * * * *'",
+    "",
+  ].join("\n");
+  assert.deepEqual(extractPushPaths(sampleOn), ["a/**", "b/**", "c/**", "d/**"]);
+
+  const sampleGate = [
+    "      - name: Scheduled ship gate",
+    "        id: gate",
+    "        run: |",
+    '          bash foo/scheduled-ship-gate.sh \\',
+    "            --path-prefix 'a/**' \\",
+    '            --path-prefix "b/**" \\',
+    "            --path-prefix c/** \\",
+    "            --path-prefix 'd/**' # trailing comment \\",
+    "            congress",
+    "      - name: Other",
+    "        run: |",
+    "          echo --path-prefix 'ignored/**'",
+    "",
+  ].join("\n");
+  assert.deepEqual(extractGatePrefixes(sampleGate), ["a/**", "b/**", "c/**", "d/**"]);
+});
+
 test("the push paths filter matches the native tree and not backend code", () => {
   const on = withoutComments(onBlock(read(".github/workflows/ios-ship.yml")));
-  const globs = [...on.matchAll(/^\s+-\s+'([^']+)'$/gm)].map((m) => m[1]);
+  const globs = extractPushPaths(on);
   // GitHub's `dir/**` matches anything under dir/.
   const matches = (glob, file) => glob.endsWith("/**")
     ? file.startsWith(glob.slice(0, -2))
@@ -169,4 +281,88 @@ test("the push paths filter matches the native tree and not backend code", () =>
   assert.ok(hit("clients/ios/CongressTrade.xcodeproj/project.pbxproj"));
   assert.ok(!hit("app/src/deno/main.ts"), "backend-only commits must not ship a TestFlight build");
   assert.ok(!hit("docs/rollouts/2026-10-17-ios-autoship-reenable.md"));
+});
+
+// ---- App Store version preparation (AFC-517 / CT-2444) --------------------
+// A version can be prepared and attached to a build by a machine, but the
+// submission for review is a human decision.  Nothing here may create a
+// submission, and the inputs may never be interpolated into the script.
+
+test("the App Store version workflow prepares a version and never submits", () => {
+  const yml = read(".github/workflows/ios-appstore-version.yml");
+
+  assert.match(yml, /name: iOS App Store version \(prepare, never submits\)/);
+  assert.match(yml, /permissions:\s*\n\s+contents: read/);
+  assert.match(yml, /concurrency:\s*\n\s+group: ios-appstore-version-congress/);
+  assert.match(yml, /runs-on:\s*macos-latest/);
+  assert.match(yml, /timeout-minutes:\s*20/);
+  assert.match(yml, /github\.event\.repository\.fork == false/);
+  assert.match(yml, /actions\/checkout@[0-9a-f]{40}/);
+  assert.match(yml, /type: choice/);
+  assert.match(yml, /appstore-version-plan/);
+  assert.match(yml, /appstore-version-prepare/);
+
+  // The dispatch inputs reach the script through the environment.
+  assert.match(yml, /MODE: \$\{\{ inputs\.mode \}\}/);
+  assert.match(yml, /VERSION: \$\{\{ inputs\.version \}\}/);
+  assert.match(yml, /BUILD: \$\{\{ inputs\.build \}\}/);
+  // The inputs are validated before they are used.
+  assert.match(yml, /\^\[0-9\]/);
+  assert.match(yml, /\^\[0-9\]\+\\\.\[0-9\]\+\\\.\[0-9\]\+/);
+
+  // No submission endpoint, anywhere.
+  assert.doesNotMatch(yml, /appStoreVersionSubmissions|reviewSubmissions|reviewSubmissionItems/);
+  const api = read("scripts/ios-fleet/asc-api.mjs");
+  assert.doesNotMatch(api, /\/v1\/appStoreVersionSubmissions/);
+  assert.doesNotMatch(api, /\/v1\/reviewSubmissions/);
+  assert.doesNotMatch(api, /\/v1\/reviewSubmissionItems/);
+  // And no localization is written either.
+  assert.doesNotMatch(api, /appStoreVersionLocalizations.*method:\s*"POST"/);
+});
+
+test("ensure-tf-ready rc=5 and rc=6 are not mislabeled as export compliance", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  const rc5 = ship.slice(ship.indexOf("if [[ $rc -eq 5 ]]"), ship.indexOf("if [[ $rc -eq 6 ]]"));
+  const rc6 = ship.slice(ship.indexOf("if [[ $rc -eq 6 ]]"), ship.indexOf("if [[ $rc -eq 3 ]]"));
+  assert.match(rc5, /NO internal tester has access to all builds/);
+  assert.match(rc5, /no internal tester can install it/);
+  assert.doesNotMatch(rc5, /stuck on export compliance/);
+  assert.doesNotMatch(rc5, /no external TestFlight group/);
+  assert.match(rc6, /internal tester count could not be read/);
+  assert.match(rc6, /internal tester state is unreadable/);
+  assert.doesNotMatch(rc6, /stuck on export compliance/);
+  assert.doesNotMatch(rc6, /external installability/);
+
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  const readyStart = asc.lastIndexOf("Exit codes: 0 ready", asc.indexOf('if (method === "ensure-tf-ready")'));
+  const ready = asc.slice(readyStart, asc.indexOf('if (method === "latest-marketing-patch"'));
+  assert.match(ready, /Exit codes: 0 ready \| 2 usage\/API error \| 3 readiness timeout/);
+  assert.doesNotMatch(ready, /process\.exit\(5\)/);
+  assert.doesNotMatch(ready, /process\.exit\(6\)/);
+
+});
+
+test("ios-ship.yml re-runs ensure-tf-ready after the external beta refresh", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const promote = yml.indexOf("name: Refresh the public TestFlight beta");
+  const verify = yml.indexOf("name: Re-verify TestFlight readiness after external beta refresh");
+  assert.ok(promote >= 0, "Refresh the public TestFlight beta step must exist");
+  assert.ok(verify > promote, "post-sync ensure-tf-ready must follow the external beta refresh");
+  assert.match(yml, /ios-report-post-sync-tf-ready\.sh/);
+  const report = read("scripts/ios-report-post-sync-tf-ready.sh");
+  assert.match(report, /GITHUB_STEP_SUMMARY/);
+  assert.match(report, /tf_ready_verdict_line/);
+});
+
+test("ios-appstore-gm.yml can ship one exact marketing version", () => {
+  const yml = read(".github/workflows/ios-appstore-gm.yml");
+
+  assert.match(yml, /marketing_version:/);
+  assert.match(yml, /description: "Exact App Store version to build, e\.g\. 1\.0\.236\.  Empty = next patch automatically\."/);
+  // The input crosses the step boundary in the environment and is never
+  // interpolated into the script.
+  const uses = yml.match(/inputs\.marketing_version/g) || [];
+  assert.equal(uses.length, 1, "the marketing_version input is used exactly once");
+  assert.match(yml, /MARKETING_VERSION_INPUT: \$\{\{ inputs\.marketing_version \}\}/);
+  assert.match(yml, /args\+=\(--version "\$MARKETING_VERSION_INPUT"\)/);
 });

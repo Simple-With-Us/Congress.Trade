@@ -22,11 +22,29 @@ struct TrendsView: View {
                 }
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                // CT-2459: lazy stack — below-fold sections (and their rows
+                // of images/bars) are no longer all built at first paint.
+                LazyVStack(alignment: .leading, spacing: 16) {
                     if store.isLoadingTrends && store.analyticsSummary == nil {
+                        // Redacted skeleton cards give first paint structure
+                        // instead of a lone spinner (hidden from VoiceOver).
+                        VStack(alignment: .leading, spacing: 16) {
+                            ForEach(0..<3, id: \.self) { _ in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Loading section title")
+                                    Text("Loading row one with values")
+                                    Text("Loading row two")
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                            }
+                        }
+                        .redacted(reason: .placeholder)
+                        .accessibilityHidden(true)
                         ProgressView("Loading trends…")
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
+                            .padding(.vertical, 12)
                     } else {
                         if let notice = store.trendsNotice,
                            !Self.isBenignCancellationNotice(notice) {
@@ -723,7 +741,7 @@ struct TrendsView: View {
     private var conflictsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             trendsHeading("Committee Sector Conflicts")
-            Text("Disclosed trades in sectors that a politician's committees oversee (curated committee→sector map). Observational — not evidence of impropriety.")
+            Text("Trades in sectors a politician's committees oversee.\u{00A0} This is a comparison, not proof of anything improper.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -781,7 +799,7 @@ struct TrendsView: View {
     private func timelinessSection(lag: FilingLagResponse) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             trendsHeading("Disclosure Timeliness")
-            Text("Days from trade to official filing date (45-day STOCK Act limit).")
+            Text("Days from the trade to the filing.\u{00A0} The STOCK Act sets a 45-day deadline.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -809,7 +827,7 @@ struct TrendsView: View {
             }
 
             if let late = lag.topLateFilers, !late.isEmpty {
-                Text("Slowest Filers (Avg Delay)")
+                Text("Slowest to File")
                     .font(.subheadline.weight(.bold))
                     .padding(.top, 6)
                 VStack(spacing: 0) {
@@ -863,6 +881,20 @@ struct TrendsView: View {
         return "\(whole) \(whole == 1 ? "day" : "days")"
     }
 
+    // CT-2459: hoisted — was allocating a DateFormatter + Calendar per
+    // call (2x per volume row per render). Main-actor use only.
+    private static let volumeMonthDayFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d"
+        return fmt
+    }()
+    private static let volumeMonthYearFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM yyyy"
+        return fmt
+    }()
+    private static let volumeCalendar = Calendar(identifier: .gregorian)
+
     private func formatVolumePeriod(_ period: String) -> String {
         let parts = period.split(separator: "-")
         if parts.count == 2, let year = Int(parts[0]) {
@@ -873,22 +905,16 @@ struct TrendsView: View {
                 components.yearForWeekOfYear = year
                 components.weekOfYear = num
                 components.weekday = 2
-                let cal = Calendar(identifier: .gregorian)
-                if let date = cal.date(from: components) {
-                    let fmt = DateFormatter()
-                    fmt.dateFormat = "MMM d"
-                    return fmt.string(from: date)
+                if let date = Self.volumeCalendar.date(from: components) {
+                    return Self.volumeMonthDayFormatter.string(from: date)
                 }
             } else if let num = Int(numStr) {
                 // Month (e.g. 2026-05)
                 var components = DateComponents()
                 components.year = year
                 components.month = num
-                let cal = Calendar(identifier: .gregorian)
-                if let date = cal.date(from: components) {
-                    let fmt = DateFormatter()
-                    fmt.dateFormat = "MMM yyyy"
-                    return fmt.string(from: date)
+                if let date = Self.volumeCalendar.date(from: components) {
+                    return Self.volumeMonthYearFormatter.string(from: date)
                 }
             }
         } else if parts.count == 3, let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]) {
@@ -897,11 +923,8 @@ struct TrendsView: View {
             components.year = year
             components.month = month
             components.day = day
-            let cal = Calendar(identifier: .gregorian)
-            if let date = cal.date(from: components) {
-                let fmt = DateFormatter()
-                fmt.dateFormat = "MMM d"
-                return fmt.string(from: date)
+            if let date = Self.volumeCalendar.date(from: components) {
+                return Self.volumeMonthDayFormatter.string(from: date)
             }
         }
         return period

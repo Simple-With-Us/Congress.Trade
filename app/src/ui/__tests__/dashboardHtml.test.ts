@@ -13,8 +13,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { parse } from 'node-html-parser';
 import { DASHBOARD_HTML } from '../dashboardHtml.ts';
-import { DASHBOARD_CSS, DASHBOARD_CSS_VERSION } from '../dashboardStyles.ts';
-import { DASHBOARD_APP_JS, DASHBOARD_APP_JS_VERSION } from '../dashboardClient.ts';
+import { DASHBOARD_CSS, DASHBOARD_CSS_SERVED, DASHBOARD_CSS_VERSION } from '../dashboardStyles.ts';
+import {
+  DASHBOARD_APP_JS,
+  DASHBOARD_APP_JS_SERVED,
+  DASHBOARD_APP_JS_VERSION,
+} from '../dashboardClient.ts';
 import {
   SEMANTIC_DARK_NEG,
   SEMANTIC_LIGHT,
@@ -183,11 +187,12 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).not.toMatch(/data:image\/webp;base64,/);
     expect(DASHBOARD_SOURCE).toContain('href="/favicon.ico');
     expect(DASHBOARD_SOURCE).toContain('href="/icon-192.png');
-    expect(DASHBOARD_SOURCE).toContain('href="/icon-512.png');
+    // CT-2459: 512 icon is manifest-only now (no 140 KB document link).
+    expect(DASHBOARD_SOURCE).not.toContain('rel="icon" type="image/png" href="/icon-512.png');
     expect(DASHBOARD_SOURCE).toContain('href="/apple-touch-icon.png');
-    expect(DASHBOARD_SOURCE).toContain('src="/assets/brand-logo-light.png');
-    expect(DASHBOARD_SOURCE).toContain('data-src-dark="/assets/brand-logo-dark.png');
-    expect(DASHBOARD_SOURCE).toContain('data-src-light="/assets/brand-logo-light.png');
+    expect(DASHBOARD_SOURCE).toContain('src="/assets/brand-logo-light.webp');
+    expect(DASHBOARD_SOURCE).toContain('data-src-dark="/assets/brand-logo-dark.webp');
+    expect(DASHBOARD_SOURCE).toContain('data-src-light="/assets/brand-logo-light.webp');
     expect(DASHBOARD_SOURCE).toContain('content="%OG_IMAGE%"');
   });
 
@@ -311,10 +316,10 @@ describe('DASHBOARD_HTML', () => {
     // The former "Live Feed" tab is now labelled "Trades" — canonical id is
     // now "trades" too (owner follow-up batch #25), not the pre-rename "feed".
     expect(DASHBOARD_SOURCE).toContain('data-view="trades" data-mobile="Trades"');
-    expect(DASHBOARD_SOURCE).toContain('aria-controls="view-trades" aria-label="Trades"><span aria-hidden="true">Trades</span></a>');
+    expect(DASHBOARD_SOURCE).toContain('aria-controls="view-trades" tabindex="-1"><span class="tab-ico" aria-hidden="true">☰</span><span class="tab-label">Trades</span></a>');
     // People tab is Directory (owner rename); view id stays "people" for deep links.
     expect(DASHBOARD_SOURCE).toContain('data-view="people" data-mobile="Directory"');
-    expect(DASHBOARD_SOURCE).toContain('aria-controls="view-people" aria-label="Directory"><span aria-hidden="true">Directory</span></a>');
+    expect(DASHBOARD_SOURCE).toContain('aria-controls="view-people" tabindex="-1"><span class="tab-ico" aria-hidden="true">👥</span><span class="tab-label">Directory</span></a>');
     // Trends is warmed on boot since it is the landing view.
     expect(DASHBOARD_SOURCE).toContain('loadTrends(); // Trends is the default landing view');
   });
@@ -330,31 +335,26 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain("if (e && e.preventDefault) e.preventDefault();");
   });
 
-  it('gives every primary tab exactly one accessible name (aria-label + aria-hidden inner text, #2186)', () => {
-    // Issue #2186: the CSS3 `content: attr(data-icon) / ""` alt-text spec is not
-    // honored by every screen reader, so the visible "Trends" text inside the tab
-    // could double up with the data-icon ::before content.  The belt-and-suspenders
-    // fix is: aria-label on the tab + aria-hidden inner span, so screen readers
-    // hear exactly the canonical label once.
+  it('gives every primary tab exactly one accessible name (CT-2505)', () => {
+    // CT-2505: aria-label plus the visible label, and CSS `content: attr()`
+    // on ::before/::after, both announced the name twice ("Trends Trends").
+    // The name is the label text alone.  The icon is aria-hidden.  Admin
+    // short and full labels are never both displayed.
     const tabIds = ['trends', 'trades', 'people', 'review', 'subs', 'admin'];
     for (const id of tabIds) {
-      // Anchor carries aria-label + aria-controls (attr order is from the source
-      // markup, not assumed by this regex) + inner aria-hidden span.  Review
-      // and Admin tabs nest a badge span inside the aria-hidden label; allow
-      // an optional nested span so the regex matches both shapes.
-      const inner = '<span aria-hidden="true">(?:[^<]+<span[^>]*></span>|[^<]+)</span>';
       const anchorRe = new RegExp(
-        '<a[^>]+id="tab-' + id + '"[^>]*>\\s*' + inner + '\\s*</a>',
+        '<a(?![^>]*\\saria-label=)[^>]+id="tab-' + id + '"[^>]*>[\\s\\S]*?</a>',
       );
       expect(DASHBOARD_SOURCE, 'tab-' + id).toMatch(anchorRe);
-      expect(DASHBOARD_SOURCE, 'tab-' + id).toContain('id="tab-' + id + '"');
-      expect(DASHBOARD_SOURCE, 'tab-' + id).toMatch(
-        new RegExp('id="tab-' + id + '"[^>]*aria-label="[^"]+"'),
-      );
       expect(DASHBOARD_SOURCE, 'tab-' + id).toMatch(
         new RegExp('id="tab-' + id + '"[^>]*aria-controls="view-' + id + '"'),
       );
+      expect(DASHBOARD_SOURCE, 'tab-' + id).toMatch(
+        new RegExp('id="tab-' + id + '"[^>]*>\\s*<span class="tab-ico" aria-hidden="true">'),
+      );
     }
+    expect(DASHBOARD_SOURCE).not.toMatch(/nav\.tabs[^{]*::(?:before|after)[^{]*content:\s*attr\(data-(?:icon|mobile)\)/);
+    expect(DASHBOARD_SOURCE).toContain('nav.tabs .tab-label-short { display: none; }');
     // Benchmark tablist also exposes three buttons with aria-label + aria-hidden
     // span so the CSS3 alt-text fallback path is not the only accessibility gate.
     for (const id of ['House', 'Senate', 'Exec']) {
@@ -490,7 +490,7 @@ describe('DASHBOARD_HTML', () => {
   it('keeps document.title in sync with the active tab and open drawer (SEOSOCIAL-04)', () => {
     // Tab-switch path: sets the title right after marking the clicked tab active.
     expect(DASHBOARD_SOURCE).toContain(
-      "b.setAttribute('aria-current', 'page');\n    if (TAB_PAGE_TITLES[b.dataset.view]) setDocumentTitle(TAB_PAGE_TITLES[b.dataset.view]);",
+      "b.setAttribute('aria-current', 'page');\n    b.removeAttribute('tabindex');\n    if (TAB_PAGE_TITLES[b.dataset.view]) setDocumentTitle(TAB_PAGE_TITLES[b.dataset.view]);",
     );
     // Boot-time restore-from-localStorage path (no ?view= in the request URL,
     // so the server-rendered <title> couldn't have known which tab this is).
@@ -507,7 +507,7 @@ describe('DASHBOARD_HTML', () => {
   });
 
   it('exposes a public Delivery tab with account-gated management', () => {
-    expect(DASHBOARD_SOURCE).toMatch(/<a[^>]+data-view="subs"[^>]*aria-label="Delivery"[^>]*><span aria-hidden="true">Delivery<\/span><\/a>/);
+    expect(DASHBOARD_SOURCE).toMatch(/<a[^>]+data-view="subs"[^>]*>\s*<span class="tab-ico" aria-hidden="true">[^<]*<\/span><span class="tab-label">Delivery<\/span><\/a>/);
     expect(DASHBOARD_SOURCE).toMatch(/data-mobile="Delivery"/);
     expect(DASHBOARD_SOURCE).not.toMatch(/<a[^>]+data-view="subs"[^>]+data-admin-tab/);
     expect(DASHBOARD_SOURCE).toContain('id="subsManage"');
@@ -529,6 +529,11 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain('<h3>Push Notifications</h3>');
     expect(DASHBOARD_SOURCE).toContain('one digest per new filing');
     expect(DASHBOARD_SOURCE).toContain('<h3>Alerts</h3>');
+    expect(DASHBOARD_SOURCE).toContain(
+      'We read official House, Senate, and Executive Branch filings directly, so new trades reach you within minutes to hours.',
+    );
+    expect(DASHBOARD_SOURCE).not.toContain('Relaying a 3rd-party competitor API');
+    expect(DASHBOARD_SOURCE).not.toContain('minutes-to-hours edge');
     expect(DASHBOARD_SOURCE).toContain('Get the Filing First');
     expect(DASHBOARD_SOURCE).toContain('Signed Webhooks');
     expect(DASHBOARD_SOURCE).toContain('HMAC-SHA256');
@@ -588,7 +593,7 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).not.toContain('>Timeframe</label>');
     expect(DASHBOARD_SOURCE).not.toContain('↻ Refresh');
     expect(DASHBOARD_SOURCE).toContain('class="brand-logo"');
-    expect(DASHBOARD_SOURCE).toContain('src="/assets/brand-logo-light.png');
+    expect(DASHBOARD_SOURCE).toContain('src="/assets/brand-logo-light.webp');
     expect(DASHBOARD_SOURCE).not.toMatch(/class="brand-text"/);
   });
 
@@ -947,7 +952,7 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain("id: 'system', label: 'System'");
     expect(DASHBOARD_SOURCE).toContain('theme-row-label');
     expect(DASHBOARD_SOURCE).toContain('prefers-color-scheme: dark');
-    expect(DASHBOARD_SOURCE).toContain('brand-logo-light.png');
+    expect(DASHBOARD_SOURCE).toContain('brand-logo-light.webp');
   });
 
   it('requests separate light and dark ticker logos and swaps them with theme', () => {
@@ -3679,7 +3684,7 @@ describe('UX wave2 web product (People / conflicts / delivery / mobile)', () => 
     expect(DASHBOARD_SOURCE).toContain('function loadTrConflicts(');
     expect(DASHBOARD_SOURCE).toContain("aGet('conflicts?'");
     expect(DASHBOARD_SOURCE).toContain('id="trConflicts"');
-    expect(DASHBOARD_SOURCE).toContain('loadTrConflicts();');
+    expect(DASHBOARD_SOURCE).toContain("loadTrSectionNearViewport('trConflicts', loadTrConflicts)");
   });
 
   it('wires delivery create filters for members, sides, and minAmount', () => {
@@ -4033,10 +4038,10 @@ describe('design convergence — filter chrome + card restyle (issue #1529)', ()
     expect(DASHBOARD_SOURCE).toContain('.branch-toggle, .party-chip, .side-chip { height: var(--control-h); }');
     expect(DASHBOARD_SOURCE).toContain('.branch-toggle.on { background: var(--accent); color: #fff; box-shadow: none; }');
     expect(DASHBOARD_SOURCE).toContain('.party-chip.on[data-party="D"] { background: var(--buy); box-shadow: none; }');
-    expect(DASHBOARD_SOURCE).toContain('.party-chip.on[data-party="R"] { background: var(--sell); box-shadow: none; }');
+    expect(DASHBOARD_SOURCE).toContain('.party-chip.on[data-party="R"] { background: var(--sell); color: #fff; box-shadow: none; }');
     expect(DASHBOARD_SOURCE).toContain('.party-chip.on[data-party="O"] { background: var(--accent); color:#fff; box-shadow: none; }');
     expect(DASHBOARD_SOURCE).toContain('.side-chip.on[data-side="B"] { background: var(--buy); box-shadow: none; }');
-    expect(DASHBOARD_SOURCE).toContain('.side-chip.on[data-side="S"] { background: var(--sell); box-shadow: none; }');
+    expect(DASHBOARD_SOURCE).toContain('.side-chip.on[data-side="S"] { background: var(--sell); color: #fff; box-shadow: none; }');
     expect(DASHBOARD_SOURCE).toContain('.side-chip.on[data-side="E"] { background: var(--exch); box-shadow: none; }');
   });
 
@@ -4810,7 +4815,7 @@ describe('entity click-through coverage (verifying PR #1517 reaches every named 
     it('replaces the politician-drawer Not recorded committee fallback', () => {
       expect(DASHBOARD_SOURCE).not.toContain("? '<span class=\"muted\">Not recorded</span>'");
       expect(DASHBOARD_SOURCE).toContain('No current assignments on file.');
-      expect(DASHBOARD_SOURCE).toContain('Executive filers do not sit on congressional committees.');
+      expect(DASHBOARD_SOURCE).toContain('Executive branch officials do not sit on congressional committees.');
     });
 
     it('uses a second-click Confirm? for web delivery delete', () => {
@@ -4907,7 +4912,11 @@ describe('static UI assets (issue #1040)', () => {
       const res = await app.request(`http://localhost${path}?v=${version}`, {}, {} as never);
       expect(res.status, path).toBe(200);
       expect(res.headers.get('cache-control') ?? '', path).toContain('immutable');
-      expect(await res.text(), path).toBe(path.endsWith('.css') ? DASHBOARD_CSS : DASHBOARD_APP_JS);
+      // CT-2459: served bytes are the minified variants; the readable
+      // DASHBOARD_CSS / DASHBOARD_APP_JS remain the authored sources.
+      expect(await res.text(), path).toBe(
+        path.endsWith('.css') ? DASHBOARD_CSS_SERVED : DASHBOARD_APP_JS_SERVED,
+      );
     }
   });
 
@@ -5251,7 +5260,8 @@ describe('MONET web punch list 2 (LANE W2 — drawers + delivery)', () => {
   });
 
   it('#13(f) gives every drawer a useful sticky-header summary instead of an empty bar', () => {
-    expect(DASHBOARD_SOURCE).toContain('<span class="drawer-topbar-title" id="drawerTopbarTitle" aria-hidden="true"></span>');
+    // CT-2459: no aria-hidden on the labelledby target (it dropped the dialog name).
+    expect(DASHBOARD_SOURCE).toContain('<span class="drawer-topbar-title" id="drawerTopbarTitle"></span>');
     expect(DASHBOARD_SOURCE).toContain('function openDrawer(html, topbarTitle) {');
     expect(DASHBOARD_SOURCE).toContain("if (titleEl) titleEl.innerHTML = topbarTitle || DRAWER_DEFAULT_TITLE;");
     expect(DASHBOARD_SOURCE).toContain('function bindDrawerHero(panel) {');
@@ -6767,8 +6777,115 @@ describe('iOS language + Capitol Ledger harvest (issues #1529 / #1459)', () => {
     expect(DASHBOARD_SOURCE).not.toContain('Largest Buys');
     expect(DASHBOARD_SOURCE).not.toContain('Largest Sells');
     expect(DASHBOARD_SOURCE).not.toContain('function loadTrExtremes()');
-    expect(DASHBOARD_SOURCE).toContain('loadTrSummary(); loadTrTickers();');
+    expect(DASHBOARD_SOURCE).toContain('loadTrSummary();');
+    expect(DASHBOARD_SOURCE).toContain("loadTrSectionNearViewport('trTickers', loadTrTickers)");
     expect(DASHBOARD_SOURCE).not.toContain('loadTrExtremes()');
+  });
+});
+
+describe('owner health banner: not covered by ST (CT-2443, executed)', () => {
+  function extractFn(html: string, name: string): string {
+    const marker = 'function ' + name + '(';
+    const start = html.indexOf(marker);
+    if (start < 0) throw new Error('function not found in DASHBOARD_SOURCE: ' + name);
+    const braceStart = html.indexOf('{', start);
+    let depth = 0;
+    let i = braceStart;
+    for (; i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') {
+        depth--;
+        if (depth === 0) return html.slice(start, i + 1);
+      }
+    }
+    throw new Error('unbalanced braces for ' + name);
+  }
+
+  interface BannerNode {
+    innerHTML: string;
+    style: { display: string };
+    attrs: Record<string, string>;
+    setAttribute(k: string, v: string): void;
+    removeAttribute(k: string): void;
+  }
+
+  function renderBanner(pipeline: unknown): BannerNode {
+    const banner: BannerNode = {
+      innerHTML: '',
+      style: { display: '' },
+      attrs: {},
+      setAttribute(k: string, v: string) {
+        this.attrs[k] = v;
+      },
+      removeAttribute(k: string) {
+        delete this.attrs[k];
+      },
+    };
+    const factory = new Function(
+      'nodes',
+      [
+        'function el(id) { return nodes[id] || null; }',
+        extractFn(DASHBOARD_SOURCE, 'esc'),
+        extractFn(DASHBOARD_SOURCE, 'renderOwnerHealthBanner'),
+        'return renderOwnerHealthBanner;',
+      ].join('\n'),
+    ) as (nodes: Record<string, BannerNode>) => (pipeline: unknown, admin: boolean) => void;
+    factory({ ownerHealthBanner: banner })(pipeline, true);
+    return banner;
+  }
+
+  it('shows Not covered by ST with the sample when st_peer_prices has notCovered > 0', () => {
+    const banner = renderBanner({
+      checks: [
+        {
+          id: 'st_peer_prices',
+          status: 'ok',
+          detail: 'ST price refresh moving (no pending tickers); 3 not covered by ST',
+          value: { pending: 0, notCovered: 3, notCoveredSample: ['AAA', 'BBB', 'CCC'] },
+        },
+      ],
+    });
+    expect(banner.innerHTML).toContain('Not covered by ST: 3');
+    expect(banner.innerHTML).toContain('(AAA, BBB, CCC)');
+    expect(banner.innerHTML).toContain('title="AAA, BBB, CCC"');
+    expect(banner.style.display).toBe('block');
+  });
+
+  it('shows No longer trading with the reason when st_peer_prices has terminal > 0', () => {
+    const banner = renderBanner({
+      checks: [
+        {
+          id: 'st_peer_prices',
+          status: 'ok',
+          detail: 'ST price refresh moving (no pending tickers); 2 no longer trading (SGEN no_longer_trading)',
+          value: {
+            pending: 0,
+            terminal: 2,
+            terminalSample: [
+              { ticker: 'SGEN', reason: 'no_longer_trading', since: '2026-11-09', lastTrade: '2023-12-13' },
+              { ticker: 'SPLK', reason: 'no_longer_trading', since: '2026-11-09', lastTrade: '2024-03-15' },
+            ],
+          },
+        },
+      ],
+    });
+    expect(banner.innerHTML).toContain('No longer trading: 2');
+    expect(banner.innerHTML).toContain('SGEN no_longer_trading');
+    expect(banner.innerHTML).toContain('SPLK no_longer_trading');
+    expect(banner.style.display).toBe('block');
+  });
+
+  it('shows no not-covered row when the count is 0 or absent', () => {
+    const zero = renderBanner({
+      checks: [{ id: 'st_peer_prices', status: 'ok', detail: 'ok', value: { pending: 0, notCovered: 0 } }],
+    });
+    expect(zero.innerHTML).not.toContain('Not covered by ST');
+    expect(zero.style.display).toBe('none');
+
+    const legacy = renderBanner({
+      checks: [{ id: 'st_peer_prices', status: 'ok', detail: 'ok', value: { pending: 0 } }],
+    });
+    expect(legacy.innerHTML).not.toContain('Not covered by ST');
   });
 });
 
@@ -6833,7 +6950,8 @@ describe('remove Largest Buys/Sells from Trends (issue #2019)', () => {
     expect(trends).toContain('data-side="S"');
     expect(DASHBOARD_SOURCE).not.toContain('function loadTrExtremes()');
     expect(DASHBOARD_SOURCE).toContain('function loadTrends()');
-    expect(DASHBOARD_SOURCE).toContain('loadTrSummary(); loadTrTickers();');
+    expect(DASHBOARD_SOURCE).toContain('loadTrSummary();');
+    expect(DASHBOARD_SOURCE).toContain("loadTrSectionNearViewport('trTickers', loadTrTickers)");
   });
 });
 
@@ -6864,8 +6982,8 @@ describe('mobile tab bar centering (#2075 regression) + six-tab shrink + avatar 
     // applyAdminVisibility() from canUseAdmin()), so the six-tab shrink keys
     // off the same class — no [hidden] :has() probe, no extra JS.
     expect(DASHBOARD_SOURCE).toContain('html.ct-admin nav.tabs a {');
-    expect(DASHBOARD_SOURCE).toContain('html.ct-admin nav.tabs a::before {');
-    expect(DASHBOARD_SOURCE).toContain('html.ct-admin nav.tabs a::after {');
+    expect(DASHBOARD_SOURCE).toContain('html.ct-admin nav.tabs .tab-ico {');
+    expect(DASHBOARD_SOURCE).toContain('html.ct-admin nav.tabs .tab-label {');
     expect(DASHBOARD_SOURCE).not.toContain('nav.tabs:has(a[data-admin-tab]:not([hidden]))');
     expect(DASHBOARD_SOURCE).toContain('font-size: clamp(8px, 2.3vw, 9px);');
     // The default badge offset (right: max(4px, calc(50% - 22px))) assumes
@@ -6878,10 +6996,10 @@ describe('mobile tab bar centering (#2075 regression) + six-tab shrink + avatar 
     // longest data-mobile label ("Directory", 9 chars) renders at ~40.6px
     // (390px viewport, 63px available) and ~36.7px (320px viewport, 51.3px
     // available) — comfortably one line at the clamp's own floor, so
-    // text-overflow:ellipsis on nav.tabs a::after stays a last resort for
+    // text-overflow:ellipsis on the real label stays a last resort for
     // pathological cases, not the normal six-tab render path.
     expect(DASHBOARD_SOURCE).toContain(
-      'nav.tabs a::after { content: attr(data-mobile) / ""; display: block; font-size: 10px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+      'nav.tabs .tab-label { display: block; max-width: 100%; font-size: 10px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
     );
   });
 
@@ -7138,7 +7256,7 @@ describe('web chrome column + Trends flow rows (owner 2026-09-08)', () => {
     expect(DASHBOARD_SOURCE).toContain('@media (min-width: 1100px) { .brand-logo { width:clamp(423px, 30vw, 460px); } }');
     // Intrinsic size attributes so the 5:1 box is known before the PNG loads
     // (no header-height jump for the sticky filter offset).
-    expect(DASHBOARD_SOURCE).toContain('alt="Congress.Trade" width="1670" height="334" decoding="async" />');
+    expect(DASHBOARD_SOURCE).toContain('alt="Congress.Trade" width="920" height="184" decoding="async" fetchpriority="high" />');
     // Both phone blocks carry the reset: the <=768px grid header and the
     // <=768px / coarse-pointer block (anchored on their neighbouring rules).
     // Phones: the wordmark fills the brand cell up to 322px; the <=768px
@@ -7229,7 +7347,8 @@ describe('header chrome rework (owner 2026-09-09)', () => {
     const header = document.querySelector('header.top');
     expect(header).not.toBeNull();
     const kids = header!.childNodes.filter((n) => n.nodeType === 1).map((n: any) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + (n.classList.contains('brand') ? '.brand' : '') + (n.classList.contains('tabs') ? '.tabs' : ''));
-    expect(kids).toEqual(['a.brand', 'nav.tabs', 'div#acct']);
+    // CT-2459: visually-hidden per-view <h1> rides in the header (absolute, grid-neutral).
+    expect(kids).toEqual(['a.brand', 'nav.tabs', 'h1#viewH1', 'div#acct']);
     // Brand is a real link home (Trends) — no more inert div.
     const brand = document.querySelector('header.top a.brand');
     expect(brand?.getAttribute('href')).toBe('/?view=trends');
@@ -7285,12 +7404,12 @@ describe('header chrome rework (owner 2026-09-09)', () => {
     // Popovers / menus keep the larger card radius.
     expect(DASHBOARD_SOURCE).toContain('padding: 6px; border-radius: var(--radius);');
     expect(DASHBOARD_SOURCE).toContain('.ios-filter-btn[aria-expanded="true"] { border-color: var(--accent); background: var(--panel-2); }');
-    // Desktop shortens the admin tab labels to their data-mobile text.
-    // Short label is decorative (alt "") so the accessible name stays
-    // "Review Queue" / "Admin · Cadence"; the full text is the tooltip.
-    expect(DASHBOARD_SOURCE).toContain('@media (min-width: 769px) and (hover: hover) {\n    nav.tabs a[data-admin-tab] { font-size: 0; }\n    nav.tabs a[data-admin-tab]::before { content: attr(data-mobile) / ""; font-size: 13px; }');
-    expect(DASHBOARD_SOURCE).toContain('data-admin-tab="true" title="Review Queue" hidden aria-label="Review Queue"><span aria-hidden="true">Review Queue');
-    expect(DASHBOARD_SOURCE).toContain('data-admin-tab="true" title="Admin · Cadence" hidden aria-label="Admin · Cadence"><span aria-hidden="true">Admin · Cadence');
+    // Desktop shortens the admin tab labels.  The short span replaces the
+    // full span via display:none, so the accessible name is whichever one
+    // is shown, never both.  The title keeps the long name as a tooltip.
+    expect(DASHBOARD_SOURCE).toContain('@media (min-width: 769px) and (hover: hover) {\n    nav.tabs a[data-admin-tab] .tab-label-full { display: none; }\n    nav.tabs a[data-admin-tab] .tab-label-short { display: inline; font-size: 13px; }');
+    expect(DASHBOARD_SOURCE).toContain('data-admin-tab="true" title="Review Queue" hidden tabindex="-1"><span class="tab-ico" aria-hidden="true">✓</span><span class="tab-label"><span class="tab-label-full">Review Queue</span><span class="tab-label-short">Review</span></span>');
+    expect(DASHBOARD_SOURCE).toContain('data-admin-tab="true" title="Admin · Cadence" hidden tabindex="-1"><span class="tab-ico" aria-hidden="true">⚙</span><span class="tab-label"><span class="tab-label-full">Admin · Cadence</span><span class="tab-label-short">Admin</span></span>');
     // Laptop widths: the filter row may wrap instead of overflowing its track;
     // the search field has no inline min-width:0 so its 180px floor applies.
     expect(DASHBOARD_SOURCE).toContain('grid-template-rows: var(--control-h, 34px) minmax(var(--control-h, 34px), auto);');
@@ -7336,7 +7455,9 @@ describe('header chrome rework (owner 2026-09-09)', () => {
     expect(DASHBOARD_SOURCE).toContain('#ctFilters #tradesSharedFilters::-webkit-scrollbar { display: none; }');
     expect(DASHBOARD_SOURCE).toContain('#ctFilters .ios-filter-btn { height: 40px; padding: 0 8px; }');
     // The fixed dock resets the desktop inline-flex/height on nav.tabs a.
-    expect(DASHBOARD_SOURCE).toContain('nav.tabs a {\n      display: block; height: auto; white-space: normal;\n      padding: 6px 2px; min-height: 44px; font-size: 0; min-width: 0;');
+    // font-size stays on the label (CT-2505); it is not zeroed to hide text
+    // behind a CSS ::after copy of the same name.
+    expect(DASHBOARD_SOURCE).toContain('nav.tabs a {\n      display: flex; flex-direction: column; align-items: center; justify-content: center;\n      height: auto; white-space: normal;\n      padding: 6px 2px; min-height: 44px; font-size: 10px; line-height: 1.1; min-width: 0;');
     // Account sheet anchors under the wordmark row, not the whole header.
     expect(DASHBOARD_SOURCE).toContain('top: calc(var(--ct-brand-h, 62px) + 8px);');
     expect(DASHBOARD_SOURCE).toContain("document.documentElement.style.setProperty('--ct-brand-h', Math.round(brand.getBoundingClientRect().bottom) + 'px');");
@@ -7413,7 +7534,7 @@ describe('header chrome rework (owner 2026-09-09)', () => {
     expect(DASHBOARD_SOURCE).toContain("var menuOpen = !!document.querySelector('.ios-filter-pop:not([hidden]), .menu-pop.open, .acct-mobile-menu.open');");
     // Reset issues one fetch (no debounced search fetch racing resetTradesPage).
     expect(DASHBOARD_SOURCE).toContain("if (typeof tradesSearchTimer !== 'undefined' && tradesSearchTimer) { clearTimeout(tradesSearchTimer); tradesSearchTimer = null; }");
-    expect(DASHBOARD_SOURCE).toContain("if (b.classList.contains('active') && e && e.isTrusted) { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }");
+    expect(DASHBOARD_SOURCE).toContain("if (b.classList.contains('active') && e && e.isTrusted) { window.scrollTo({ top: 0, behavior: scrollBehavior() }); return; }");
     expect(DASHBOARD_SOURCE).toContain("if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {");
     expect(DASHBOARD_SOURCE).toContain("if (!typing && !menuOpen && q && document.documentElement.getAttribute('data-view') === 'trades' && !openOverlayContainer()) {");
   });
@@ -7487,7 +7608,7 @@ describe('masthead and Delivery layout update', () => {
     expect(DASHBOARD_SOURCE).toContain('class="speed-mini-bolt"');
     expect(DASHBOARD_SOURCE).toContain('.speed-mini > button { margin-left: auto; flex: 0 0 auto; }');
     expect(DASHBOARD_SOURCE).not.toContain('Get the Filing First.&nbsp; Premium pushes');
-    expect(DASHBOARD_SOURCE).toContain('>Premium pushes a filing to you the moment we ingest it');
+    expect(DASHBOARD_SOURCE).toContain('>Premium sends each new trade to you as soon as we have it.');
   });
   it('paints mobile chrome white and styles the iOS link as a button', () => {
     expect(DASHBOARD_SOURCE).toContain('nav.tabs { padding-top: 6px; padding-bottom: env(safe-area-inset-bottom, 0px); }');

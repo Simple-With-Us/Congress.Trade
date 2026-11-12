@@ -3,14 +3,12 @@ import type { Env } from '../shared/types.ts';
 
 // Every collaborator maybeRunDailyJobs calls out to is mocked so this test is
 // purely about how the daily-jobs entry point resolves + wires
-// FMP_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE, not about enrichment/price/share
+// ST_PEER_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE, not about enrichment/price/share
 // business logic (those have their own test suites).
 const mocks = vi.hoisted(() => ({
   resolveSecrets: vi.fn(),
-  getDailyUsed: vi.fn(),
   runEnrichment: vi.fn(),
   runPriceRefresh: vi.fn(),
-  hasFmpTierFailure: vi.fn(),
   notifyAdmin: vi.fn(),
   shareWithPeer: vi.fn(),
   runFreshnessCheck: vi.fn(),
@@ -29,7 +27,6 @@ vi.mock('../secrets/infisical', () => ({
   resolveSecrets: mocks.resolveSecrets,
 }));
 vi.mock('../enrichment/service', () => ({
-  getDailyUsed: mocks.getDailyUsed,
   runEnrichment: mocks.runEnrichment,
   DEFAULT_DAILY_CAP: 230,
 }));
@@ -41,9 +38,6 @@ vi.mock('../prices/service', async (importOriginal) => {
     backfillCurrentPricesFromEod: mocks.backfillCurrentPricesFromEod,
   };
 });
-vi.mock('../shared/fmpStatus', () => ({
-  hasFmpTierFailure: mocks.hasFmpTierFailure,
-}));
 vi.mock('../alerts/notify', () => ({
   notifyAdmin: mocks.notifyAdmin,
 }));
@@ -114,7 +108,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
     vi.clearAllMocks();
     mocks.resolveSecrets.mockResolvedValue({});
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.getDailyUsed.mockResolvedValue(0);
     mocks.runEnrichment.mockResolvedValue({
       hasFmpKey: false,
       dailyCap: null,
@@ -131,7 +124,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
       sharePrices: [],
       shareSpx: [],
     });
-    mocks.hasFmpTierFailure.mockReturnValue(false);
     mocks.shareWithPeer.mockResolvedValue({ sent: false, reason: 'not configured' });
     mocks.runFreshnessCheck.mockResolvedValue([]);
     mocks.runBulkSnapshot.mockResolvedValue({ tables: {} });
@@ -201,7 +193,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
     });
   });
 
-  it('folds FMP_MAX_PER_MINUTE and EDGAR_MAX_PER_MINUTE into the market-data lane resolveSecrets call alongside the USAGE_MONITOR_* vars', async () => {
+  it('folds ST_PEER_MAX_PER_MINUTE and EDGAR_MAX_PER_MINUTE into the market-data lane resolveSecrets call alongside the USAGE_MONITOR_* vars', async () => {
     const env = fakeEnv();
 
     await maybeRunDailyJobs(env, new Date('2026-07-10T00:00:00Z'));
@@ -213,7 +205,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
     const [, keys] = mocks.resolveSecrets.mock.calls[0];
     expect(keys).toEqual(
       expect.arrayContaining([
-        'FMP_MAX_PER_MINUTE',
+        'ST_PEER_MAX_PER_MINUTE',
         'EDGAR_MAX_PER_MINUTE',
         'USAGE_MONITOR_ENABLED',
         'USAGE_MONITOR_INGEST_URL',
@@ -223,10 +215,10 @@ describe('maybeRunDailyJobs secret resolution', () => {
     );
   });
 
-  it('passes the resolved FMP_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE through to runEnrichment/runPriceRefresh as maxPerMinute/edgarMaxPerMinute', async () => {
+  it('passes the resolved ST_PEER_MAX_PER_MINUTE / EDGAR_MAX_PER_MINUTE through to runEnrichment/runPriceRefresh as maxPerMinute/edgarMaxPerMinute', async () => {
     const env = fakeEnv();
     mocks.resolveSecrets.mockResolvedValue({
-      FMP_MAX_PER_MINUTE: '123',
+      ST_PEER_MAX_PER_MINUTE: '123',
       EDGAR_MAX_PER_MINUTE: '456',
     });
 
@@ -242,7 +234,7 @@ describe('maybeRunDailyJobs secret resolution', () => {
     );
   });
 
-  it('falls back to undefined (no pacing) when resolveSecrets yields nothing for either var, matching prior unset behavior', async () => {
+  it('passes undefined when resolveSecrets yields nothing for either var (the shared ST pacer then applies its 100/min ceiling)', async () => {
     const env = fakeEnv();
     mocks.resolveSecrets.mockResolvedValue({});
 
@@ -282,7 +274,6 @@ describe('maybeRunDailyJobs secret resolution', () => {
         env,
         expect.not.objectContaining({ max: expect.any(Number) }),
       );
-      expect(mocks.getDailyUsed).not.toHaveBeenCalled();
     });
 
     it('alerts when Socratic profile or price reads fail auth', async () => {
@@ -358,22 +349,25 @@ function stickyPriceDb(row: Record<string, unknown> | null) {
 
 function priceProbeDb(rows: Array<Record<string, unknown> | null>) {
   const queue = [...rows];
-  const statement = {
-    bind() {
-      return statement;
-    },
-    async first() {
-      return queue.shift() ?? null;
-    },
-    async all() {
-      return { results: [] };
-    },
-    async run() {
-      return { success: true, meta: { changes: 0 } };
-    },
-  };
   return {
-    prepare() {
+    prepare(sql: string) {
+      const statement = {
+        bind() {
+          return statement;
+        },
+        async first() {
+          // The terminal sweep (CT-2466) reads on the same tick as the catch-up
+          // probe. It must not consume the scripted corpus/pending rows.
+          if (String(sql).includes('terminal-peer-price')) return { n: 0, d: null };
+          return queue.shift() ?? null;
+        },
+        async all() {
+          return { results: [] };
+        },
+        async run() {
+          return { success: true, meta: { changes: 0 } };
+        },
+      };
       return statement;
     },
   };
@@ -400,14 +394,12 @@ describe('staggered daily lanes', () => {
     vi.clearAllMocks();
     mocks.resolveSecrets.mockResolvedValue({});
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.getDailyUsed.mockResolvedValue(0);
     mocks.runEnrichment.mockResolvedValue({
       hasFmpKey: false, dailyCap: null, fmpCalls: 0, errors: [], shareRefs: [], scanned: 0, enriched: 0,
     });
     mocks.runPriceRefresh.mockResolvedValue({
       hasFmpKey: false, fmpCalls: 0, errors: [], sharePrices: [], shareSpx: [],
     });
-    mocks.hasFmpTierFailure.mockReturnValue(false);
     mocks.shareWithPeer.mockResolvedValue({ sent: false, reason: 'not configured' });
     mocks.runFreshnessCheck.mockResolvedValue([]);
     mocks.runBulkSnapshot.mockResolvedValue({ tables: {} });
@@ -520,36 +512,228 @@ describe('staggered daily lanes', () => {
     expect(kv.get('jobs:daily:lastok:market-data')).toBe('2026-10-15');
   });
 
-  it('retries prices only when the lane is already stamped but the corpus is behind', async () => {
+  const CATCHUP_STATE_KEY = 'jobs:market-data:price-catchup-state';
+  const catchUpState = (kv: Map<string, string>) => JSON.parse(kv.get(CATCHUP_STATE_KEY) ?? 'null');
+
+  it('retries prices only when the lane is already stamped but the corpus is behind, bounded per run', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
-    (env as { DB: unknown }).DB = priceProbeDb([{ d: '2026-10-13' }]);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
 
     const status = await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'));
 
     expect(status).toBe('ran');
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ max: 301, maxPerMinute: 60, afterCursorSeq: null });
     expect(mocks.runEnrichment).not.toHaveBeenCalled();
     expect(mocks.backfillCurrentPricesFromEod).toHaveBeenCalledTimes(1);
-    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBe('2026-10-15');
+    expect(catchUpState(kv)).toMatchObject({ freshThrough: '2026-10-14', runs: 1, lastRunAt: '2026-10-15T08:42:00.000Z' });
 
+    // 25 minutes later is inside the spacing:  no second walk.
     expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('stamped');
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
   });
 
-  it('does not catch up again the same day after one successful price retry', async () => {
+  it('caps the catch-up pace at the configured ST_PEER_MAX_PER_MINUTE when that is lower', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
     (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
-    const morning = new Date('2026-10-15T08:42:00Z');
-    const later = new Date('2026-10-15T15:07:00Z');
+    mocks.resolveSecrets.mockResolvedValue({ ST_PEER_MAX_PER_MINUTE: '30' });
 
-    expect(await maybeRunDailyMarketDataJobs(env, morning)).toBe('ran');
-    expect(await maybeRunDailyMarketDataJobs(env, later)).toBe('stamped');
-    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 30 });
   });
 
-  it('retries a catch-up that aborted, and skips it when the D1 budget is already spent', async () => {
+  it('ignores the retired FMP_MAX_PER_MINUTE name', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    mocks.resolveSecrets.mockResolvedValue({ FMP_MAX_PER_MINUTE: '30' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('ran');
+    // Not read, so the catch-up keeps its own 60/min default.
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ maxPerMinute: 60 });
+    for (const [, keys] of mocks.resolveSecrets.mock.calls) {
+      expect(keys).not.toContain('FMP_MAX_PER_MINUTE');
+    }
+  });
+
+  it('runs again in later hourly slots while pending shrinks, resuming from the cursor', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    // Each pending read is two first() calls:  corpus date, then the count.
+    (env as { DB: unknown }).DB = priceProbeDb([
+      { d: '2026-10-14' }, { n: 1427 }, // run 1 before
+      { d: '2026-10-14' }, { n: 1130 }, // run 1 after
+      { d: '2026-10-14' }, { n: 1130 }, // run 2 before
+      { d: '2026-10-14' }, { n: 830 }, // run 2 after
+    ]);
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, errors: [], sharePrices: [], shareSpx: [], lastCursorSeq: 500, reachedEndOfPending: false,
+    });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T13:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T14:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
+    expect(mocks.runPriceRefresh.mock.calls[1][1]).toMatchObject({ afterCursorSeq: 500 });
+    expect(catchUpState(kv)).toMatchObject({ runs: 2, noProgressRuns: 0, cursorSeq: 500 });
+    // The NULL-only EOD -> current-price repair runs on the first catch-up only.
+    expect(mocks.backfillCurrentPricesFromEod).toHaveBeenCalledTimes(1);
+  });
+
+  it('parks for the session after two catch-ups with no progress', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T10:07:00Z'))).toBe('stamped');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T15:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
+    expect(catchUpState(kv)).toMatchObject({ runs: 2, noProgressRuns: 2 });
+  });
+
+  it('does not park on aborted runs (a 429 says nothing about coverage), but they spend the run budget', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    mocks.runPriceRefresh.mockResolvedValue({ aborted: true, errors: [], sharePrices: [], shareSpx: [] });
+
+    for (const h of ['08', '09', '10']) {
+      expect(await maybeRunDailyMarketDataJobs(env, new Date(`2026-10-15T${h}:07:00Z`))).toBe('error');
+    }
+    expect(catchUpState(kv)).toMatchObject({ runs: 3, noProgressRuns: 0 });
+  });
+
+  it('does not park or spend the session budget on catch-up runs where ST never engaged (503 outage)', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    // The outage signature: the refresh completes (a 503 is non-fatal per
+    // ticker), prices nothing, and records provider errors.
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, tickersPriced: 0,
+      errors: ['spx: PEER_HTTP_503', 'ASGN: PEER_HTTP_503'],
+      sharePrices: [], shareSpx: [], lastCursorSeq: null, reachedEndOfPending: false,
+    });
+
+    // Three hourly slots during the outage: each run executes (spacing is
+    // honored) but none parks the session or spends its run budget.
+    for (const h of ['08', '09', '10']) {
+      expect(await maybeRunDailyMarketDataJobs(env, new Date(`2026-10-15T${h}:07:00Z`))).toBe('ran');
+    }
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(3);
+    expect(catchUpState(kv)).toMatchObject({ runs: 0, noProgressRuns: 0, attempts: 3, lastRunAt: '2026-10-15T10:07:00.000Z' });
+
+    // A slot inside the spacing still does not walk.
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T10:32:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(3);
+
+    // ST recovers: the next due slot drains immediately — it is not gated by
+    // a park or a spent budget — and engaged runs spend budget as before.
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, tickersPriced: 300, errors: [],
+      sharePrices: [], shareSpx: [], lastCursorSeq: 500, reachedEndOfPending: false,
+    });
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T11:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(4);
+    expect(mocks.runPriceRefresh.mock.calls[3][1]).toMatchObject({ max: 301 });
+    expect(catchUpState(kv)).toMatchObject({ runs: 1, noProgressRuns: 1, attempts: 4 });
+  });
+
+  it('counts zero-priced runs with ticker-level errors as engaged:  they spend the budget and park', async () => {
+    const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+    // ST engaged and answered, but every attempt failed at the ticker level
+    // (no provider-level error in the run) — that is information about the
+    // pending set, not an outage, so the normal park and budget apply.
+    mocks.runPriceRefresh.mockResolvedValue({
+      aborted: false, tickersPriced: 0,
+      errors: ['ASGN: unexpected payload shape', 'XYZ: no series available'],
+      sharePrices: [], shareSpx: [], lastCursorSeq: null, reachedEndOfPending: false,
+    });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('ran');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T10:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
+    expect(catchUpState(kv)).toMatchObject({ runs: 2, noProgressRuns: 2, attempts: 2 });
+  });
+
+  it('stops walking at the per-session attempt cap even when no run ever spent the budget', async () => {
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-10-15'],
+      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 0, attempts: 24, lastRunAt: '2026-10-15T14:07:00Z', noProgressRuns: 0, cursorSeq: null })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T20:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+  });
+
+  it('stops at the per-session run cap, and a new freshThrough session starts over', async () => {
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-10-15'],
+      [CATCHUP_STATE_KEY, JSON.stringify({ freshThrough: '2026-10-14', runs: 8, lastRunAt: '2026-10-15T14:07:00Z', noProgressRuns: 0, cursorSeq: 42 })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T20:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+
+    // 04:07Z on 10-16 is past midnight ET, so freshThrough rolls to 10-15.
+    kv.set('jobs:daily:lastok:market-data', '2026-10-16');
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-16T04:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ afterCursorSeq: null });
+    expect(catchUpState(kv)).toMatchObject({ freshThrough: '2026-10-15', runs: 1 });
+  });
+
+  it('resumes a weekend tail on a new ET day even when Friday spent the whole run budget', async () => {
+    // The 2026-11-07 incident:  freshThrough is Friday 2026-11-06 and does
+    // not roll until Tuesday, but the run budget belonged to Friday's ET
+    // day — Saturday's tick gets a fresh budget and resumes from the
+    // cursor instead of staying session-capped all weekend.
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-11-07'],
+      [CATCHUP_STATE_KEY, JSON.stringify({
+        freshThrough: '2026-11-06', runs: 8, attempts: 8,
+        lastRunAt: '2026-11-07T12:17:00.000Z', noProgressRuns: 0,
+        cursorSeq: 102624, budgetDay: '2026-11-06',
+      })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-11-05' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-11-07T14:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ afterCursorSeq: 102624 });
+    expect(catchUpState(kv)).toMatchObject({ freshThrough: '2026-11-06', runs: 1, budgetDay: '2026-11-07', cursorSeq: 102624 });
+  });
+
+  it('rolls a pre-budgetDay legacy state spent on an earlier ET day', async () => {
+    // The state KV actually held at the incident: written by the code before
+    // this field existed, so no budgetDay, runs at the cap.
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-11-08'],
+      [CATCHUP_STATE_KEY, JSON.stringify({
+        freshThrough: '2026-11-06', runs: 8, attempts: 8,
+        lastRunAt: '2026-11-07T12:17:00.000Z', noProgressRuns: 0,
+        cursorSeq: 102624,
+      })],
+    ]);
+    const env = laneEnv(kv);
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-11-05' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-11-08T14:07:00Z'))).toBe('ran');
+    expect(mocks.runPriceRefresh.mock.calls[0][1]).toMatchObject({ afterCursorSeq: 102624 });
+    expect(catchUpState(kv)).toMatchObject({ runs: 1, budgetDay: '2026-11-08', cursorSeq: 102624 });
+  });
+
+  it('skips a catch-up when the D1 budget is spent, and spaces out a retry after an aborted one', async () => {
     const kv = new Map([['jobs:daily:lastok:market-data', '2026-10-15']]);
     const env = laneEnv(kv);
     (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
@@ -558,27 +742,46 @@ describe('staggered daily lanes', () => {
 
     expect(await maybeRunDailyMarketDataJobs(env, now)).toBe('budget');
     expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
-    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBeUndefined();
+    expect(kv.has(CATCHUP_STATE_KEY)).toBe(false);
 
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.runPriceRefresh.mockResolvedValueOnce({
-      aborted: true,
-      errors: [],
-      sharePrices: [],
-      shareSpx: [],
-    });
+    mocks.runPriceRefresh.mockResolvedValueOnce({ aborted: true, errors: [], sharePrices: [], shareSpx: [] });
     expect(await maybeRunDailyMarketDataJobs(env, now)).toBe('error');
-    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBeUndefined();
+    expect(catchUpState(kv)).toMatchObject({ runs: 1 });
 
-    mocks.runPriceRefresh.mockResolvedValue({
-      aborted: false,
-      errors: [],
-      sharePrices: [],
-      shareSpx: [],
-    });
-    expect(await maybeRunDailyMarketDataJobs(env, now)).toBe('ran');
-    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(2);
-    expect(kv.get('jobs:daily:lastok:market-data-price-catchup')).toBe('2026-10-15');
+    // A 429 abort must not retry on the very next tick.
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(1);
+
+    mocks.runPriceRefresh.mockRejectedValueOnce(new Error('boom'));
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:42:00Z'))).toBe('error');
+    expect(catchUpState(kv)).toMatchObject({ runs: 2 });
+  });
+
+  it('does not walk prices when the catch-up state cannot be read', async () => {
+    const env = laneEnv(new Map([['jobs:daily:lastok:market-data', '2026-10-15']]));
+    const kv = env.CONFIG_KV as unknown as { get: (k: string) => Promise<string | null> };
+    const realGet = kv.get;
+    kv.get = async (key: string) => {
+      if (key === CATCHUP_STATE_KEY) throw new Error('kv down');
+      return realGet(key);
+    };
+    (env as { DB: unknown }).DB = stickyPriceDb({ d: '2026-10-13' });
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T08:42:00Z'))).toBe('stamped');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
+  });
+
+  it('runs the not-covered re-check from the stamped fast path, so an aborted one retries the same day', async () => {
+    const kv = new Map([
+      ['jobs:daily:lastok:market-data', '2026-10-15'],
+    ]);
+    const env = laneEnv(kv);
+
+    expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T09:07:00Z'))).toBe('stamped');
+    // No price provider in this env, so the re-check is a clean no-op and stamps its own lane.
+    expect(kv.get('jobs:daily:lastok:market-data-not-covered-recheck')).toBe('2026-10-15');
+    expect(mocks.runPriceRefresh).not.toHaveBeenCalled();
   });
 
   it('stays stamped when the corpus is current and the pending tail is small', async () => {
@@ -629,7 +832,6 @@ describe('runHourlyEnrichmentSlice', () => {
     vi.clearAllMocks();
     mocks.resolveSecrets.mockResolvedValue({});
     mocks.isD1RowBudgetExceeded.mockResolvedValue(false);
-    mocks.getDailyUsed.mockResolvedValue(0);
     mocks.runEnrichment.mockResolvedValue({
       hasFmpKey: true, dailyCap: 5000, fmpCalls: 10, errors: [], shareRefs: [], scanned: 50, enriched: 40,
       budgetRemaining: 4000,
@@ -655,9 +857,7 @@ describe('runHourlyEnrichmentSlice', () => {
 
   it('uses the slice cap even when an FMP key and a spent day counter are present', async () => {
     mocks.resolveSecrets.mockResolvedValue({ FMP_API_KEY: 'k', FMP_DAILY_CALL_CAP: '1000' });
-    mocks.getDailyUsed.mockResolvedValue(950);
     await runHourlyEnrichmentSlice(sliceEnv(), DAY);
-    expect(mocks.getDailyUsed).not.toHaveBeenCalled();
     expect(mocks.runEnrichment).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ max: HOURLY_ENRICHMENT_SLICE_MAX }),

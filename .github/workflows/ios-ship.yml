@@ -46,15 +46,14 @@ name: iOS TestFlight ship (Mac runner)
 # Neither kind of skip consumes a build number.
 # Hosted macos-latest runners have an empty home each job.  This repo forbids
 # actions/cache (check-actions-runner-policy.mjs), so last-ship state cannot
-# persist.  Treating that empty home as "never shipped" re-archived every
-# cron tick (measured: 1.0.222 on 2026-09-04 from schedule, no iOS change).
-# A scheduled tick with no last-ship file now skips.  Real ships are a push
-# that passed paths: or an explicit workflow_dispatch.  To force one run,
-# dispatch the workflow or run the wrapper locally with --force-ship.
-# For the same reason the ship script's rate gate and same-HEAD skip have no
-# state to read on this runner: every push that passes paths: ships once, and
-# the cron is a no-op until last-ship state is seeded (ios-appstore-gm.yml seeds
-# it from its previous successful run).
+# persist in the runner cache.  Treating that empty home as "never shipped"
+# re-archived every cron tick (measured: 1.0.222 on 2026-09-04 from schedule,
+# no iOS change).  A scheduled tick with no last-ship file still skips.
+# The seed step restores last-ship-congress.txt from the previous successful
+# run of this workflow that actually uploaded, before the scheduled gate and
+# the ship script.  A green skip is not an upload: seeding its timestamp would
+# make the 1 hour rate gate block every push.  To force one run, dispatch the
+# workflow.  This file does not pass a standing gate override.
 
 on:
   push:
@@ -63,6 +62,11 @@ on:
       - 'clients/ios/**'
       - '.github/workflows/ios-ship.yml'
   workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: 'Exact marketing version to ship. Defaults to 1.1.2, the version pinned for Congress.Trade in scripts/ios-fleet/apps.json (fixedMarketingVersion); change it only to ship a replacement build in another existing train.'
+        required: false
+        default: '1.1.2'
   schedule:
     # Twice an hour, offset from Socratic.Trade's '*/30' so the shared Mac
     # runner is not asked to start three fleet ships on the same minute.
@@ -70,6 +74,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ios-ship-congress
@@ -81,6 +86,11 @@ jobs:
     if: github.event.repository.fork == false
     runs-on: macos-latest
     timeout-minutes: 90
+    # The one planned build of this release, computed once by the plan-build
+    # step below and handed to the ship step as --build. A single-platform
+    # release plans the same way: one plan, every ship job takes it.
+    outputs:
+      build: ${{ steps.plan-build.outputs.build }}
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -93,8 +103,22 @@ jobs:
           # gate would degrade to skipping every tick.
           fetch-depth: 0
 
-      # Runs FIRST so a tick with nothing to ship costs seconds and cannot go
-      # red on an unrelated environment problem.
+      # Hosted runners have an empty home, and this repo forbids actions/cache.
+      # Seed before the gate so a scheduled tick can see the last upload, and
+      # before the ship script so a push can apply the same-HEAD skip.  A
+      # successful skip is not an upload (--require-upload).
+      - name: Seed last-ship state from the previous successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ios-fleet/seed-last-ship.sh" \
+            --workflow ios-ship.yml \
+            --app congress \
+            --require-upload \
+            --ship-step "Ship CongressTrade to TestFlight"
+
+      # Runs before signing and archive so a tick with nothing to ship costs
+      # seconds and cannot go red on an unrelated environment problem.
       # Logic lives in a script, not inline YAML, so it can be syntax-checked
       # and unit-tested by CI (ios-fleet-ship-logic job) on every PR instead of
       # only being exercised on the one Mac that can ship.
@@ -103,7 +127,8 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ios-fleet/scheduled-ship-gate.sh" \
             --event "${{ github.event_name }}" \
-            --path-prefix 'clients/ios/' \
+            --path-prefix 'clients/ios/**' \
+            --path-prefix '.github/workflows/ios-ship.yml' \
             --repo-root "$GITHUB_WORKSPACE" \
             congress
 
@@ -261,6 +286,46 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
           unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
+      # ONE plan per release (owner 2026-10-29): the shared merge-timestamp
+      # build max(S, M + 1) is computed here, once, and handed to the ship
+      # step below as --build. The ship script's own fixed-mode plan is the
+      # same code path (the same node command with the same merge stamp), for
+      # operators running locally without --build. The paired lookup mirrors
+      # the ship script (pairedBundleId, then the macBundleId alias), so the
+      # one plan covers the same inventory. Runs only when the gate
+      # says ship, so a gated tick plans nothing. Credentials are the ASC
+      # trio the previous step loaded into the environment; they are never
+      # echoed (only the planned build number is printed, which is not
+      # secret).
+      - name: Plan the shared merge-timestamp build (once per release)
+        id: plan-build
+        if: steps.gate.outputs.should_ship == '1'
+        run: |
+          set -euo pipefail
+          stamp="$(TZ=America/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD)"
+          if [[ ! "$stamp" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::merge stamp is not a 12-digit YYYYMMDDHHMM: ${stamp}"
+            exit 1
+          fi
+          registry="$GITHUB_WORKSPACE/scripts/ios-fleet/apps.json"
+          bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"]["bundleId"])' "$registry")"
+          paired="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["apps"]["congress"]; print(e.get("pairedBundleId") or e.get("macBundleId") or "")' "$registry")"
+          feed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"].get("pairedBuildFeed") or "")' "$registry")"
+          if [ -n "$feed" ]; then
+            echo "::error::congress has a pairedBuildFeed floor that this plan step does not fetch; extend it before shipping."
+            exit 1
+          fi
+          args=(plan-release-build "$bundle")
+          if [ -n "$paired" ]; then args+=("$paired"); fi
+          args+=(--merge-stamp "$stamp")
+          build="$(node "$GITHUB_WORKSPACE/scripts/ios-fleet/asc-api.mjs" "${args[@]}")"
+          if [[ ! "$build" =~ ^[1-9][0-9]{11}$ ]]; then
+            echo "::error::planned build is not a 12-digit YYYYMMDDHHMM: ${build}"
+            exit 1
+          fi
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "planned build ${build} for merge stamp ${stamp}"
+
       - name: Report runtime ios-fleet drift (advisory)
         if: steps.gate.outputs.should_ship == '1'
         run: |
@@ -287,6 +352,7 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          INPUT_MARKETING_VERSION: ${{ github.event.inputs.marketing_version }}
         run: |
           # Wrapper resolves the in-repo fleet script (scripts/ios-fleet/) and
           # enforces the stable-Xcode rule; it falls back to the host copy only
@@ -297,13 +363,25 @@ jobs:
           # previous ship for the first minutes after an upload, and the
           # vendored client is explicit that a newest-build fallback is the
           # defect it removed (scripts/ios-fleet/asc-api.mjs, ensure-tf-ready).
+          # The --build below is the release's one planned build from the
+          # plan-build step above: every ship of this release uploads it.
           set -o pipefail
-          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
+          # A manual dispatch may pin the marketing version; the build number
+          # is still the release's one planned build from the plan-build step
+          # above.  The expansion form is safe for an empty array under
+          # bash 3.2.
+          ship_args=()
+          if [[ -n "${INPUT_MARKETING_VERSION:-}" ]]; then
+            [[ "$INPUT_MARKETING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::marketing_version must look like 1.1.2"; exit 1; }
+            ship_args+=(--version "$INPUT_MARKETING_VERSION")
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-ship-testflight.sh" --build "${{ steps.plan-build.outputs.build }}" ${ship_args[@]+"${ship_args[@]}"} 2>&1 | tee "$RUNNER_TEMP/congress-ship.log"
 
       # Name the build this run uploaded, for the external promotion below.
       # The fleet script resolves the version before it uploads and logs it as
-      # "marketing=1.0.<n> build=<n>";  the extractor reads that, and falls back
-      # to the checkout's commit count -- the number the ship starts from.
+      # "marketing=1.1.2 build=<12-digit>";  the extractor reads that, and
+      # falls back to the checkout's commit count -- the number a next-patch
+      # ship starts from.
       - name: Name the build this ship uploaded
         id: buildnum
         if: steps.gate.outputs.should_ship == '1'
@@ -312,6 +390,8 @@ jobs:
           build_num="$(bash "$GITHUB_WORKSPACE/scripts/ios-ship-build-number.sh" \
             "$RUNNER_TEMP/congress-ship.log" "$GITHUB_WORKSPACE")"
           echo "build_num=${build_num}" >> "$GITHUB_OUTPUT"
+          marketing="$(grep -o 'marketing=[0-9][0-9.]* build=' "$RUNNER_TEMP/congress-ship.log" | tail -1 | sed 's/^marketing=//; s/ build=$//' || true)"
+          echo "marketing=${marketing}" >> "$GITHUB_OUTPUT"
           echo "shipped build number: ${build_num}"
 
       # CT-2434:  the external TestFlight group (Public Beta, public link) is
@@ -338,5 +418,22 @@ jobs:
           # crossed this step boundary.  The key is never an argument of any
           # command.
           node "$GITHUB_WORKSPACE/scripts/promote-external-beta.mjs" \
-            --build "${{ steps.buildnum.outputs.build_num }}"
+            --build "${{ steps.buildnum.outputs.build_num }}" \
+            ${{ steps.buildnum.outputs.marketing && format('--marketing "{0}"', steps.buildnum.outputs.marketing) || '' }}
+
+      # OPS-1052 / BF-2552: the in-ship ensure-tf-ready check runs before the
+      # external beta refresh, so it can warn that nobody can install the build
+      # even after this step assigns it.  Re-run once here and record THAT
+      # verdict on the job summary.
+      - name: Re-verify TestFlight readiness after external beta refresh
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bundle="$(python3 -c 'import json; print(json.load(open("scripts/ios-fleet/apps.json"))["apps"]["congress"]["bundleId"])')"
+          build="${{ steps.buildnum.outputs.build_num }}"
+          marketing="${{ steps.buildnum.outputs.marketing }}"
+          args=("$bundle" "$build")
+          if [ -n "$marketing" ]; then args+=("$marketing"); fi
+          bash "$GITHUB_WORKSPACE/scripts/ios-report-post-sync-tf-ready.sh" "${args[@]}"
 

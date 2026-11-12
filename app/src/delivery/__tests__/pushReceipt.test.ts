@@ -92,6 +92,68 @@ describe('pushReceipt', () => {
     expect(await webhookSubscriberConsumptionError(response)).toBeNull();
   });
 
+  it('fails closed on a legacy batch whose results carry extra keys', () => {
+    const parsed = parseCongressPushReceipt({
+      results: [{ ok: false, applied: 0, reason: 'invalid-event', traceId: 'extra-field' }],
+    });
+    expect(parsed.ok).toBe(true);
+    expect(congressPushReceiptFailureReason(parsed)).toMatch(/invalid-event/);
+  });
+
+  it('does not mark an empty legacy batch consumed or ok', () => {
+    const parsed = parseCongressPushReceipt({ results: [] });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error('expected parse');
+    expect(parsed.receipt.consumed).toBe(false);
+    expect(parsed.receipt.ok).toBe(false);
+    expect(congressPushReceiptFailureReason(parsed)).not.toBeNull();
+  });
+
+  it('fails on a v1 receipt with consumed=true but ok=false', () => {
+    const parsed = parseCongressPushReceipt({
+      receiptVersion: 1,
+      delivered: true,
+      consumed: true,
+      ok: false,
+      applied: 0,
+    });
+    expect(parsed.ok).toBe(true);
+    expect(congressPushReceiptFailureReason(parsed)).toMatch(/ok=false/);
+  });
+
+  it('never falls back to legacy parsing for a receiptVersion body', () => {
+    const parsed = parseCongressPushReceipt({
+      receiptVersion: 1,
+      delivered: true,
+      consumed: true,
+      ok: true,
+      applied: 1,
+      unexpected: 'extra-field',
+    });
+    expect(parsed.ok).toBe(false);
+  });
+
+  it('webhookSubscriberConsumptionError ignores oversize generic JSON bodies', async () => {
+    const response = new Response(
+      JSON.stringify({ status: 'ok', padding: 'x'.repeat(40_000) }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    expect(await webhookSubscriberConsumptionError(response)).toBeNull();
+  });
+
+  it('webhookSubscriberConsumptionError ignores invalid and primitive JSON bodies', async () => {
+    const invalid = new Response('not json{', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(await webhookSubscriberConsumptionError(invalid)).toBeNull();
+    const primitive = new Response('42', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(await webhookSubscriberConsumptionError(primitive)).toBeNull();
+  });
+
   it('webhookSubscriberConsumptionError fails on v1 consumed=false', async () => {
     const response = new Response(
       JSON.stringify({
