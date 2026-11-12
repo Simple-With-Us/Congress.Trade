@@ -52,6 +52,8 @@ import {
 /** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
 export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
 export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
+/** In-tick retries on the residential proxy leg before direct fallback (CT-2498). */
+export const SENATE_PROXY_EGRESS_BACKOFF_MS = [0, 750, 2_000];
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err ?? '');
@@ -286,20 +288,27 @@ export async function withSenateEfdEgress<T>(
   const proxied = explicitProxy ? senateProxyFetch(explicitProxy, baseFetch) : undefined;
   let proxyErr: unknown = null;
   if (proxied) {
-    const leg = guardProxyLeg(
-      proxied,
-      boundedPositiveInt(opts.proxyFirstAnswerTimeoutMs, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS),
+    const answerTimeoutMs = boundedPositiveInt(
+      opts.proxyFirstAnswerTimeoutMs,
+      SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+      SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
     );
-    try {
-      return await run(leg.fetchImpl, { egress: 'proxy', fallback: false });
-    } catch (err) {
-      if (!leg.unreachable(err, opts.signal)) {
-        tagSenateEgress(err, 'proxy');
-        throw err;
+    proxyLoop: for (let attempt = 0; attempt < SENATE_PROXY_EGRESS_BACKOFF_MS.length; attempt++) {
+      const waitMs = SENATE_PROXY_EGRESS_BACKOFF_MS[attempt] ?? 0;
+      if (waitMs > 0) await delay(waitMs, opts.signal);
+      const leg = guardProxyLeg(proxied, answerTimeoutMs);
+      try {
+        return await run(leg.fetchImpl, { egress: 'proxy', fallback: false });
+      } catch (err) {
+        if (!leg.unreachable(err, opts.signal)) {
+          tagSenateEgress(err, 'proxy');
+          throw err;
+        }
+        proxyErr = err;
+        if (attempt + 1 < SENATE_PROXY_EGRESS_BACKOFF_MS.length) continue proxyLoop;
+      } finally {
+        leg.dispose();
       }
-      proxyErr = err;
-    } finally {
-      leg.dispose();
     }
   }
 
