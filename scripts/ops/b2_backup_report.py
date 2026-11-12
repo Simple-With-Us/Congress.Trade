@@ -149,7 +149,7 @@ def run_subprocess(argv: list[str], *, env: dict[str, str] | None = None) -> str
 def list_via_b2_json(bucket: str, prefix: str) -> list[dict[str, Any]]:
     folder = prefix.rstrip("/")
     argv = ["b2", "ls", "--json", "--recursive", bucket, folder]
-    if os.environ.get("B2_REPORT_INCLUDE_VERSIONS", "1") == "1":
+    if os.environ.get("B2_REPORT_INCLUDE_VERSIONS", "0") == "1":
         argv = ["b2", "ls", "--json", "--versions", "--recursive", bucket, folder]
     out = run_subprocess(argv)
     rows: list[dict[str, Any]] = []
@@ -169,7 +169,7 @@ def list_via_aws(bucket: str, prefix: str) -> list[dict[str, Any]]:
     region = os.environ.get("B2_S3_REGION", DEFAULT_S3_REGION)
     rows: list[dict[str, Any]] = []
     token: str | None = None
-    include_versions = os.environ.get("B2_REPORT_INCLUDE_VERSIONS", "1") == "1"
+    include_versions = os.environ.get("B2_REPORT_INCLUDE_VERSIONS", "0") == "1"
     while True:
         if include_versions:
             argv = [
@@ -289,6 +289,17 @@ def b2_rows_to_objects(
     return out
 
 
+def collapse_to_current_objects(objects: list[ObjectRow]) -> list[ObjectRow]:
+    """When version listing is enabled, keep only the latest row per key (skip hidden heads)."""
+    latest: dict[tuple[str, str], ObjectRow] = {}
+    for obj in objects:
+        key = (obj.bucket_label, obj.key)
+        prev = latest.get(key)
+        if prev is None or obj.mtime > prev.mtime:
+            latest[key] = obj
+    return [row for row in latest.values() if not row.is_hidden]
+
+
 def choose_lister() -> Callable[[str, str], list[dict[str, Any]]]:
     fixture = os.environ.get("B2_REPORT_FIXTURE_DIR")
     if fixture:
@@ -327,6 +338,8 @@ def collect_objects(
     for label, bucket in sorted(cfg.bucket_map.items()):
         raw = lister(bucket, cfg.object_prefix)
         all_rows.extend(b2_rows_to_objects(bucket, label, raw, prefix=cfg.object_prefix))
+    if os.environ.get("B2_REPORT_INCLUDE_VERSIONS", "0") == "1":
+        all_rows = collapse_to_current_objects(all_rows)
     return all_rows
 
 
@@ -349,7 +362,7 @@ def build_report(cfg: ReportConfig, objects: list[ObjectRow]) -> dict[str, Any]:
     flags: list[str] = []
 
     for obj in objects:
-        if obj.is_hidden and os.environ.get("B2_REPORT_SKIP_HIDDEN", "0") == "1":
+        if obj.is_hidden and os.environ.get("B2_REPORT_SKIP_HIDDEN", "1") == "1":
             continue
         total_bytes += obj.size
         total_count += 1
@@ -525,22 +538,26 @@ def parse_fixture_objects(text: str, bucket: str, label: str, prefix: str) -> li
     return b2_rows_to_objects(bucket, label, rows, prefix=prefix)
 
 
+def _fail(exc: BaseException, *, json_out: bool) -> int:
+    if json_out:
+        print(json.dumps({"status": "crit", "exit_code": 2, "error": str(exc)}))
+    else:
+        print(f"b2-backup-report FAIL: {exc}", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only B2 hetzner/ backup report")
     parser.add_argument("--json", action="store_true", help="Emit JSON on stdout")
     args = parser.parse_args(argv)
 
-    cfg = load_config()
     try:
+        cfg = load_config()
         lister = choose_lister()
         objects = collect_objects(cfg, lister)
         report = build_report(cfg, objects)
-    except RuntimeError as exc:
-        if args.json:
-            print(json.dumps({"status": "crit", "exit_code": 2, "error": str(exc)}))
-        else:
-            print(f"b2-backup-report FAIL: {exc}", file=sys.stderr)
-        return 2
+    except Exception as exc:
+        return _fail(exc, json_out=args.json)
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))

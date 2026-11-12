@@ -13,6 +13,8 @@
 #   B2_KEEP_DAILY / B2_KEEP_WEEKLY  informational in report (default 3 / 2)
 #   B2_REPORT_STALE_HOURS   default 26 (crit if no object newer)
 #   B2_REPORT_TOTAL_BYTES_CAP  optional warn threshold on summed bytes
+#   B2_REPORT_INCLUDE_VERSIONS  default 0 (current objects); set 1 for full version audit
+#   B2_REPORT_SKIP_HIDDEN     default 1 (exclude hide/delete markers)
 #   B2_REPORT_FIXTURE_DIR   offline/json fixtures (tests only)
 #
 # Usage:
