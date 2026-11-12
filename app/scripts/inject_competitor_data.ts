@@ -11,11 +11,14 @@ import {
   resolveExecutiveFilerIdFromName,
 } from "../src/shared/executiveIdentity.ts";
 import {
+  chamberForMatchedCompetitorFiler,
+  chamberForMintedCompetitorInsert,
   chamberFromMemberType,
   competitorHouseFilerId,
   competitorQualifiedManualFilerId,
   competitorReporterNames,
   parseCompetitorReporter,
+  type ParsedCompetitorChamber,
 } from "../src/shared/competitorAttribution.ts";
 import {
   findExistingFilerForCompetitorReporter,
@@ -230,9 +233,8 @@ async function run() {
    */
   function resolveFilerId(
     rawName: string,
-    chamber: 'house' | 'senate' | 'executive',
-    rawObj: any,
-  ): { filerId: string; resolvedChamber: 'house' | 'senate' | 'executive' } | null {
+    rawObj: unknown,
+  ): { filerId: string; resolvedChamber: ParsedCompetitorChamber | null } | null {
     const execId = resolveExecutiveFilerIdFromName(rawName);
     if (execId) return { filerId: execId, resolvedChamber: 'executive' };
 
@@ -245,11 +247,10 @@ async function run() {
       candidates: existingFilers,
     });
     if (existing) {
-      const existingChamber = (existing.chamber ?? '').toLowerCase();
-      const resolvedChamber = existingChamber === 'house' || existingChamber === 'senate' || existingChamber === 'executive'
-        ? existingChamber
-        : (parsed.chamber ?? chamber);
-      return { filerId: existing.filerId, resolvedChamber };
+      return {
+        filerId: existing.filerId,
+        resolvedChamber: chamberForMatchedCompetitorFiler(existing.chamber, parsed),
+      };
     }
 
     if (parsed.state && parsed.district) {
@@ -257,16 +258,13 @@ async function run() {
       if (houseId) return { filerId: houseId, resolvedChamber: 'house' };
     }
 
-    // Only a payload-declared chamber is trusted here; the provider default is
-    // NOT — that is how executives ended up labelled 'senate'.
-    const resolvedChamber = parsed.chamber ?? chamber;
     const qualified = competitorQualifiedManualFilerId(rawName);
     if (!qualified) return null;
-    return { filerId: qualified, resolvedChamber };
+    return { filerId: qualified, resolvedChamber: chamberForMintedCompetitorInsert(parsed) };
   }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
-    const resolved = resolveFilerId(rawName, chamber, rawObj);
+    const resolved = resolveFilerId(rawName, rawObj);
     if (!resolved) {
       refusedBareName += 1;
       return;
