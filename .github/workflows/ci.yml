@@ -215,6 +215,11 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      # Offline host-health table for box-disk-hygiene (CT-2471).
+      # Fixtures only: no Docker daemon, no host, no network.
+      - name: Box disk hygiene host-health tests
+        working-directory: .
+        run: bash scripts/ops/test-box-disk-hygiene.sh
       # Offline restore drill. Temp databases only; no host and no live sqlite file.
       - name: Sqlite backup restore drill
         working-directory: .
@@ -249,6 +254,13 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-sqlite-maintenance.sh
 
+      - name: Test disk-growth snapshot and report (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/disk-growth-lib.sh
+          bash -n scripts/ops/disk-growth-snapshot.sh
+          bash -n scripts/ops/disk-growth-report.sh
+          bash scripts/ops/test-disk-growth.sh
       - name: Fleet log cap ops tests (offline)
         working-directory: .
         run: |

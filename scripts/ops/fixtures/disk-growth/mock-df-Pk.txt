@@ -1,0 +1,4 @@
+Filesystem     1024-blocks      Used Available Use% Mounted on
+/dev/sda1       157286400  83886080  65011712  57% /
+/dev/sda1       157286400    524288    999424  35% /tmp
+/dev/sda1       157286400     65536    458752  13% /dev/shm
