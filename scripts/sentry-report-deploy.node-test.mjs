@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { CONFIG, readIdentity, observeProduction, reportDeploy, isCoolifyDeployRelevant } from './sentry-report-deploy.mjs';
 const old = '1'.repeat(40), expected = '2'.repeat(40), newer = '3'.repeat(40), foreign = '4'.repeat(40);
 const healthy = (revision) => ({ ok: true, status: 'live', environment: 'production', revision, build: { sha: revision }, checks: { release: { sha: revision } } });
@@ -10,6 +11,12 @@ const observe = (values, options = {}) => {
   return observeProduction({ expected, attempts: values.length, intervalMs: 0, sleep: async () => {}, refreshMain: () => {}, isAncestor,
     fetchImpl: async (url, init) => { assert.equal(url.origin, new URL(CONFIG.health).origin); assert.equal(init.headers.Authorization, undefined); assert.equal(init.redirect, 'error'); assert.equal(init.cache, 'no-store'); const value = values[i++]; return value instanceof Response ? value : json(healthy(value)); }, ...options });
 };
+test('production observation defaults use a 60-minute deadline and 180 attempts', async () => {
+  const source = await readFile(new URL('./sentry-report-deploy.mjs', import.meta.url), 'utf8');
+  assert.match(source, /attempts = 180,/);
+  assert.match(source, /deadline = now\(\) \+ 60 \* 60 \* 1000;/);
+});
+
 test('requires healthy, full source identity', () => {
   assert.equal(readIdentity(healthy(expected)), expected);
   for (const body of [null, {ok:false}, healthy('unknown'), healthy(expected.slice(0,12))]) assert.throws(() => readIdentity(body));
