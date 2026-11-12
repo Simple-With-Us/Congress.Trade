@@ -67,6 +67,16 @@
 # the Coolify project from the live image.  When that container is running
 # this script prefers it as the Traefik failover (real app, not the holding
 # page).  Standby remains the last-resort fallback when hold is absent.
+#
+# IMPORTANT (2026-11-09, CONGRESS-TRADE-25): the alias attach below runs
+# BEFORE the route-file swap.  At the end of a deploy the replacement
+# container exists but does not carry the alias yet, so a route flipped to
+# the single-server shape first points at a name that does not resolve —
+# a brief 502 on every deploy even when the overlap hold covered the swap
+# itself.  Attaching first means the primary health check is already
+# passing against the new container while the failover shape is still up.
+# If the attach fails, a plain route (no health check, no failover) is left
+# untouched so a working hold route is not replaced by an unresolvable name.
 
 set -euo pipefail
 
@@ -202,7 +212,58 @@ fi
 
 DESIRED=$(render_config "$FALLBACK")
 
-if [[ -f "$DYNAMIC_FILE" ]] && [[ "$(cat "$DYNAMIC_FILE")" == "$DESIRED" ]]; then
+# --- keep the container aliased on the proxy network ----------------------
+# BEFORE the route-file swap below (CONGRESS-TRADE-25): flipping to the
+# single-server shape first would point at a name the replacement
+# container does not carry yet.  When the app is missing entirely the
+# route file is still written — otherwise the catch-all takes over.
+# Match both Coolify's `congress-app-<hash>` names and a literal
+# `container_name: congress-app`.  Never pick the overlap hold.
+APP=$(docker ps --format "{{.Names}}" | grep -E '^congress-app(-|$)' | grep -v "^${HOLD_NAME}\$" | head -1 || true)
+alias_ready=0
+if [[ -z "${APP}" ]]; then
+  echo "no congress-app container"
+else
+  # Aliases the container currently advertises on $NETWORK (empty if not attached).
+  # docker inspect prints a newline even when the alias list is empty; treat
+  # whitespace-only as "not attached" so we connect instead of disconnecting.
+  current_aliases=$(docker inspect "$APP" \
+    --format "{{range \$net, \$conf := .NetworkSettings.Networks}}{{if eq \$net \"${NETWORK}\"}}{{range \$conf.Aliases}}{{.}} {{end}}{{end}}{{end}}" \
+    2>/dev/null || true)
+  current_aliases=${current_aliases//$'\n'/ }
+  current_aliases="${current_aliases#"${current_aliases%%[![:space:]]*}"}"
+  current_aliases="${current_aliases%"${current_aliases##*[![:space:]]}"}"
+
+  if [[ -z "$current_aliases" ]]; then
+    # Not on the network at all — attach.
+    if docker network connect --alias "$ALIAS" "$NETWORK" "$APP"; then
+      alias_ready=1
+      echo "attached $APP to $NETWORK as $ALIAS"
+    else
+      echo "alias attach failed for $APP on $NETWORK"
+    fi
+  elif ! printf '%s' "$current_aliases" | tr ' ' '\n' | grep -qx "$ALIAS"; then
+    # On the network but missing the alias — this is the only case that needs a
+    # disconnect/reconnect, since aliases cannot be added to a live endpoint.
+    docker network disconnect "$NETWORK" "$APP" 2>/dev/null || true
+    if docker network connect --alias "$ALIAS" "$NETWORK" "$APP"; then
+      alias_ready=1
+      echo "re-aliased $APP on $NETWORK as $ALIAS (was: $current_aliases)"
+    else
+      echo "alias attach failed for $APP on $NETWORK"
+    fi
+  else
+    alias_ready=1
+    echo "ok: $APP already on $NETWORK as $ALIAS"
+  fi
+fi
+
+# --- swap the route file --------------------------------------------------
+# Plain has no health check. Writing it while the alias is missing turns a
+# hold failover into a 502. Keep the file that is already on disk.
+if [[ -z "$FALLBACK" && -n "${APP}" && "$alias_ready" -ne 1 ]]; then
+  echo "route file unchanged: alias not attached and desired route is plain"
+elif [[ -f "$DYNAMIC_FILE" ]] && [[ "$(cat "$DYNAMIC_FILE")" == "$DESIRED" ]]; then
   : # steady state: identical, so do not touch the watched file at all
 else
   TMP=$(mktemp "${STAGE_DIR}/.ct-reattach-proxy.XXXXXX")
@@ -210,31 +271,4 @@ else
   chmod 0644 "$TMP"
   mv -f "$TMP" "$DYNAMIC_FILE"   # atomic rename; Traefik never sees a partial file
   echo "route file updated (fallback=${FALLBACK:-plain} hold=${HOLD_RUNNING:-0} standby=${STANDBY_RUNNING:-0})"
-fi
-
-# --- keep the container aliased on the proxy network ----------------------
-# Match both Coolify's `congress-app-<hash>` names and a literal
-# `container_name: congress-app`.  Never pick the overlap hold.
-APP=$(docker ps --format "{{.Names}}" | grep -E '^congress-app(-|$)' | grep -v "^${HOLD_NAME}\$" | head -1 || true)
-if [[ -z "${APP}" ]]; then
-  echo "no congress-app container"; exit 0
-fi
-
-# Aliases the container currently advertises on $NETWORK (empty if not attached).
-current_aliases=$(docker inspect "$APP" \
-  --format "{{range \$net, \$conf := .NetworkSettings.Networks}}{{if eq \$net \"${NETWORK}\"}}{{range \$conf.Aliases}}{{.}} {{end}}{{end}}{{end}}" \
-  2>/dev/null || true)
-
-if [[ -z "$current_aliases" ]]; then
-  # Not on the network at all — attach.
-  docker network connect --alias "$ALIAS" "$NETWORK" "$APP" || true
-  echo "attached $APP to $NETWORK as $ALIAS"
-elif ! printf '%s' "$current_aliases" | tr ' ' '\n' | grep -qx "$ALIAS"; then
-  # On the network but missing the alias — this is the only case that needs a
-  # disconnect/reconnect, since aliases cannot be added to a live endpoint.
-  docker network disconnect "$NETWORK" "$APP" 2>/dev/null || true
-  docker network connect --alias "$ALIAS" "$NETWORK" "$APP" || true
-  echo "re-aliased $APP on $NETWORK as $ALIAS (was: $current_aliases)"
-else
-  echo "ok: $APP already on $NETWORK as $ALIAS"
 fi

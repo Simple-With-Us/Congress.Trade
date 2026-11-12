@@ -1024,7 +1024,9 @@ final class CongressTradeStore: ObservableObject {
         trendsSnapshotRevision += 1
     }
 
-    /// Shared 429 / 5xx / transport retry used by Trades and Trends.
+    /// Shared retry for Trades and Trends GETs. Deploy-window statuses and
+    /// the transport codes `TransientRetryPolicy` already retried are not
+    /// repeated here. 429, other 5xx, and offline errors still are.
     private func withRetry<T>(_ work: () async throws -> T) async throws -> T {
         var attempt = 0
         while true {
@@ -1032,6 +1034,12 @@ final class CongressTradeStore: ObservableObject {
                 return try await work()
             } catch let error as APIError {
                 attempt += 1
+                // APIClient already spent the deploy-window budget on these
+                // GETs. Looping again multiplies one Trends fan-out into nine
+                // summary calls before the notice appears.
+                if TransientRetryPolicy.shouldRetry(error: error, method: "GET") {
+                    throw error
+                }
                 guard error.isRetryable, attempt < Self.maxAttemptsPerPage else { throw error }
                 let backoffSeconds = error.retryAfterSeconds.map(Double.init) ?? pow(2.0, Double(attempt))
                 guard backoffSeconds <= 15.0 else { throw error }

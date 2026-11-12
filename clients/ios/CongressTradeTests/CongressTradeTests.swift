@@ -775,6 +775,7 @@ final class CongressTradeTests: XCTestCase {
     func testTransientServerErrorIsRetriedWithBackoffThenSucceeds() async throws {
         var feedAttempts = 0
         var recordedDelays: [Double] = []
+        var clientDelays: [TimeInterval] = []
         MockURLProtocol.handler = { request in
             if request.url?.path.hasSuffix("/bootstrap") == true {
                 return Self.response(for: request, json: Self.bootstrapJSON)
@@ -791,14 +792,22 @@ final class CongressTradeTests: XCTestCase {
         }
 
         let store = CongressTradeStore(
-            api: CongressTradeAPIClient(baseURL: Self.baseURL, tokenStore: MemoryTokenStore(token: nil), session: makeSession()),
+            api: CongressTradeAPIClient(
+                baseURL: Self.baseURL,
+                tokenStore: MemoryTokenStore(token: nil),
+                session: makeSession(),
+                retrySleeper: { delay in clientDelays.append(delay) }
+            ),
             cursorStore: InMemorySyncCursorStore(),
             sleeper: { seconds in recordedDelays.append(seconds) }
         )
         await store.refresh()
 
         XCTAssertEqual(feedAttempts, 2, "A transient 503 should be retried once before succeeding")
-        XCTAssertEqual(recordedDelays.count, 1)
+        // CONGRESS-TRADE-25: the retry now happens inside APIClient, so the
+        // store's outer retry never sees the 503.
+        XCTAssertEqual(clientDelays, [1])
+        XCTAssertTrue(recordedDelays.isEmpty)
         XCTAssertNil(store.feedNotice)
     }
 
@@ -806,6 +815,7 @@ final class CongressTradeTests: XCTestCase {
     func testTrendsTransient502IsRetriedThenSucceeds() async throws {
         var summaryAttempts = 0
         var recordedDelays: [Double] = []
+        var clientDelays: [TimeInterval] = []
         MockURLProtocol.handler = { request in
             if request.url?.path.contains("/api/analytics/summary") == true {
                 summaryAttempts += 1
@@ -824,14 +834,22 @@ final class CongressTradeTests: XCTestCase {
         }
 
         let store = CongressTradeStore(
-            api: CongressTradeAPIClient(baseURL: Self.baseURL, tokenStore: MemoryTokenStore(token: nil), session: makeSession()),
+            api: CongressTradeAPIClient(
+                baseURL: Self.baseURL,
+                tokenStore: MemoryTokenStore(token: nil),
+                session: makeSession(),
+                retrySleeper: { delay in clientDelays.append(delay) }
+            ),
             cursorStore: InMemorySyncCursorStore(),
             sleeper: { seconds in recordedDelays.append(seconds) }
         )
         await store.refreshTrends()
 
         XCTAssertEqual(summaryAttempts, 2, "A transient Trends 502 should be retried once before succeeding")
-        XCTAssertEqual(recordedDelays.count, 1)
+        // CONGRESS-TRADE-25: the retry now happens inside APIClient, so the
+        // store's outer retry never sees the 502.
+        XCTAssertEqual(clientDelays, [1])
+        XCTAssertTrue(recordedDelays.isEmpty)
         XCTAssertNil(store.trendsNotice)
         XCTAssertEqual(store.analyticsSummary?.totalTrades, 4)
     }
@@ -854,15 +872,263 @@ final class CongressTradeTests: XCTestCase {
         }
 
         let store = CongressTradeStore(
-            api: CongressTradeAPIClient(baseURL: Self.baseURL, tokenStore: MemoryTokenStore(token: nil), session: makeSession()),
+            api: CongressTradeAPIClient(
+                baseURL: Self.baseURL,
+                tokenStore: MemoryTokenStore(token: nil),
+                session: makeSession(),
+                retrySleeper: { _ in }
+            ),
             cursorStore: InMemorySyncCursorStore(),
             sleeper: { _ in }
         )
         await store.refreshTrends()
 
+        // The client retries a 502 twice (3 attempts). The store does not
+        // multiply that loop.
         XCTAssertEqual(summaryAttempts, 3)
         XCTAssertEqual(store.trendsNotice, "The site is updating (502).  Pull to refresh.")
         XCTAssertFalse((store.trendsNotice ?? "").contains("Request failed"))
+    }
+
+    // MARK: - Deploy-window GET retry (CONGRESS-TRADE-25)
+
+    private static func gatewayError(for request: URLRequest, status: Int, headers: [String: String] = [:]) -> (HTTPURLResponse, Data) {
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!
+        return (response, Data("{\"error\":\"Bad Gateway\"}".utf8))
+    }
+
+    /// First attempt 502s, the retry succeeds: one backoff, two requests.
+    func testGetRetrySucceedsAfterOne502() async throws {
+        let session = makeSession()
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: nil),
+            session: session,
+            retrySleeper: { delay in delays.append(delay) }
+        )
+        MockURLProtocol.handler = { request in
+            attempts += 1
+            XCTAssertEqual(
+                request.value(forHTTPHeaderField: TransientRetryPolicy.retryHeaderName),
+                TransientRetryPolicy.retryHeaderValue
+            )
+            if attempts == 1 {
+                return Self.gatewayError(for: request, status: 502)
+            }
+            return Self.response(for: request, json: Self.bootstrapJSON)
+        }
+
+        let bootstrap = try await client.bootstrap()
+        XCTAssertEqual(bootstrap.serverTime, "2026-07-18T00:00:00Z")
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(delays, [1])
+    }
+
+    /// Three straight 502s: exactly 3 attempts, 1s then 2s backoff, then the 502 throws.
+    func testGetGivesUpAfterThree502s() async throws {
+        let session = makeSession()
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: nil),
+            session: session,
+            retrySleeper: { delay in delays.append(delay) }
+        )
+        MockURLProtocol.handler = { request in
+            attempts += 1
+            return Self.gatewayError(for: request, status: 502)
+        }
+
+        do {
+            _ = try await client.bootstrap()
+            XCTFail("Three 502s must still throw")
+        } catch APIError.server(let status, _, _) {
+            XCTAssertEqual(status, 502)
+        }
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(delays, [1, 2])
+    }
+
+    /// Mutations never implicitly repeat: a POST 502 throws after 1 attempt with no backoff.
+    func testPostIsNotRetriedOn502() async throws {
+        let session = makeSession()
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: nil),
+            session: session,
+            retrySleeper: { delay in delays.append(delay) }
+        )
+        MockURLProtocol.handler = { request in
+            attempts += 1
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertNil(request.value(forHTTPHeaderField: TransientRetryPolicy.retryHeaderName))
+            return Self.gatewayError(for: request, status: 502)
+        }
+
+        do {
+            _ = try await client.signInWithApple(identityToken: "test-token")
+            XCTFail("A POST 502 must throw")
+        } catch APIError.server(let status, _, _) {
+            XCTAssertEqual(status, 502)
+        }
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(delays.isEmpty)
+    }
+
+    /// A 404 is a permanent rejection, not a deploy window: no retry.
+    func testGet404IsNotRetried() async throws {
+        let session = makeSession()
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: nil),
+            session: session,
+            retrySleeper: { delay in delays.append(delay) }
+        )
+        MockURLProtocol.handler = { request in
+            attempts += 1
+            return Self.gatewayError(for: request, status: 404)
+        }
+
+        do {
+            _ = try await client.bootstrap()
+            XCTFail("A 404 must throw")
+        } catch APIError.server(let status, _, _) {
+            XCTAssertEqual(status, 404)
+        }
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(delays.isEmpty)
+    }
+
+    /// Cloudflare's Retry-After: 60 is capped: the backoff is 5s, not 60s —
+    /// and the test never sleeps it, because the sleeper is injected.
+    func testGetHonorsCappedRetryAfter() async throws {
+        let session = makeSession()
+        var attempts = 0
+        var delays: [TimeInterval] = []
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: nil),
+            session: session,
+            retrySleeper: { delay in delays.append(delay) }
+        )
+        MockURLProtocol.handler = { request in
+            attempts += 1
+            if attempts == 1 {
+                return Self.gatewayError(for: request, status: 502, headers: ["Retry-After": "60"])
+            }
+            return Self.response(for: request, json: Self.bootstrapJSON)
+        }
+
+        _ = try await client.bootstrap()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(delays, [5])
+    }
+
+    /// Cancelling during backoff stops the loop: no second request.
+    func testCancellationStopsRetries() async throws {
+        let session = makeSession()
+        var attempts = 0
+        // Production sleeper: a real Task.sleep so cancel interrupts backoff.
+        let client = CongressTradeAPIClient(
+            baseURL: Self.baseURL,
+            tokenStore: MemoryTokenStore(token: nil),
+            session: session
+        )
+        MockURLProtocol.handler = { request in
+            attempts += 1
+            return Self.gatewayError(for: request, status: 502)
+        }
+
+        let task = Task { try await client.bootstrap() }
+        for _ in 0..<100 {
+            if attempts == 1 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("A cancelled retry must throw")
+        } catch is CancellationError {
+            // The task surfaced the cancel before the client converted it.
+        } catch let error as APIError where error.isCancellation {
+            // Backoff sleep is converted to APIError. A cancel that lands
+            // inside the URLSession task is already that case.
+        }
+        XCTAssertEqual(attempts, 1)
+    }
+
+    /// Pins the pure policy: gate, statuses, transport codes, and delays.
+    func testTransientRetryPolicyDecisions() {
+        let server502 = APIError.server(status: 502, message: "Bad Gateway", retryAfterSeconds: nil)
+        XCTAssertTrue(TransientRetryPolicy.shouldRetry(error: server502, method: "GET"))
+        XCTAssertTrue(TransientRetryPolicy.shouldRetry(error: server502, method: nil), "URLRequest.httpMethod is nil for GETs")
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(error: server502, method: "POST"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(error: server502, method: "DELETE"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(
+            error: .server(status: 404, message: "Not Found", retryAfterSeconds: nil), method: "GET"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(
+            error: .server(status: 500, message: "boom", retryAfterSeconds: nil), method: "GET"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(
+            error: .server(status: 429, message: "slow down", retryAfterSeconds: 2), method: "GET"))
+        XCTAssertTrue(TransientRetryPolicy.shouldRetry(error: .transport(URLError(.timedOut)), method: "GET"))
+        XCTAssertTrue(TransientRetryPolicy.shouldRetry(error: .transport(URLError(.networkConnectionLost)), method: "GET"))
+        XCTAssertTrue(TransientRetryPolicy.shouldRetry(error: .transport(URLError(.cannotConnectToHost)), method: "GET"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(error: .transport(URLError(.cancelled)), method: "GET"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(error: .transport(URLError(.notConnectedToInternet)), method: "GET"))
+        XCTAssertFalse(TransientRetryPolicy.shouldRetry(error: .invalidResponse, method: "GET"))
+
+        XCTAssertEqual(
+            TransientRetryPolicy.delay(
+                for: .server(status: 502, message: "Bad Gateway", retryAfterSeconds: 60), retryIndex: 0),
+            5)
+        XCTAssertEqual(
+            TransientRetryPolicy.delay(
+                for: .server(status: 503, message: "try again", retryAfterSeconds: 2), retryIndex: 0),
+            2)
+        XCTAssertEqual(TransientRetryPolicy.delay(for: server502, retryIndex: 0), 1)
+        XCTAssertEqual(TransientRetryPolicy.delay(for: server502, retryIndex: 1), 2)
+    }
+
+    /// Pins the beforeSend drop predicate: only marked GETs to our origin with a deploy-window status drop.
+    func testShouldDropFailedRequestPredicate() {
+        let header = TransientRetryPolicy.retryHeaderValue
+        XCTAssertTrue(SentryTelemetry.shouldDropFailedRequest(
+            method: "GET",
+            urlString: "https://congress.trade/api/analytics/market-cap-breakdown?window=30d",
+            statusCode: 502,
+            retryHeader: header))
+        XCTAssertTrue(SentryTelemetry.shouldDropFailedRequest(
+            method: "get", urlString: "https://www.congress.trade/api/health", statusCode: 504, retryHeader: header))
+        XCTAssertTrue(SentryTelemetry.shouldDropFailedRequest(
+            method: nil, urlString: "https://congress.trade/api/feed", statusCode: 503, retryHeader: header))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(
+            method: "GET",
+            urlString: "https://congress.trade/api/analytics/market-cap-breakdown?window=30d",
+            statusCode: 502,
+            retryHeader: nil))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(
+            method: "POST", urlString: "https://congress.trade/api/client/v1/commands", statusCode: 502, retryHeader: header))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(
+            method: "GET", urlString: "https://congress.trade/api/feed", statusCode: 500, retryHeader: header))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(
+            method: "GET", urlString: "https://congress.trade/api/feed", statusCode: 404, retryHeader: header))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(
+            method: "GET", urlString: "https://example.test/api/feed", statusCode: 502, retryHeader: header))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(method: "GET", urlString: nil, statusCode: 502, retryHeader: header))
+        XCTAssertFalse(SentryTelemetry.shouldDropFailedRequest(
+            method: "GET", urlString: "https://congress.trade/api/feed", statusCode: nil, retryHeader: header))
+        XCTAssertEqual(SentryTelemetry.httpStatusCode(502), 502)
+        XCTAssertEqual(SentryTelemetry.httpStatusCode(NSNumber(value: 503)), 503)
+        XCTAssertNil(SentryTelemetry.httpStatusCode("502"))
+        XCTAssertEqual(SentryTelemetry.retryHeaderValue(["x-congress-retry": header]), header)
+        XCTAssertNil(SentryTelemetry.retryHeaderValue(nil))
     }
 
     @MainActor

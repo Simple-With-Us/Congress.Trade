@@ -1,6 +1,7 @@
 #!/bin/bash
-# Offline tests for #1537 overlap, the hold env, and the Traefik render.
-# No Docker, no Coolify, no network.
+# Offline tests for #1537 overlap, the hold env, the Traefik render, and
+# the reattach alias/route ordering (CONGRESS-TRADE-25).
+# No Docker, no Coolify, no network (a stub `docker` stands in below).
 #
 #   bash scripts/ops/test-deploy-overlap.sh
 
@@ -175,6 +176,85 @@ assert_not_contains "$both" "fallback: congress-standby" "both does not use stan
 assert_not_contains "$plain" "servers: { }" "plain is not an empty LB"
 assert_not_contains "$hold" "servers: { }" "hold is not an empty LB"
 assert_not_contains "$standby" "servers: { }" "standby is not an empty LB"
+
+# --- reattach alias/route ordering (CONGRESS-TRADE-25) ---------------------
+# End of a deploy: the replacement is up but unaliased, and the route file
+# still holds the stale hold-failover shape. The alias attach must land
+# BEFORE the route flips to the single-server shape, or Traefik 502s on an
+# unresolvable name. A stub `docker` first on PATH keeps this offline and
+# hermetic (a real daemon's containers must not leak in).
+stubbin="$env_tmp/stubbin"
+mkdir -p "$stubbin"
+cat > "$stubbin/docker" <<'STUBEOF'
+#!/bin/bash
+# STUB_MODE=app-unaliased: replacement up, carries no aliases yet.
+# STUB_MODE=empty:         no containers at all (mid-swap gap).
+# STUB_MODE=connect-fails: replacement up, but network connect fails.
+mode="${STUB_MODE:-app-unaliased}"
+if [[ "$1" == "ps" ]]; then
+  if [[ "$mode" == "app-unaliased" || "$mode" == "connect-fails" ]]; then
+    printf 'congress-app-abc123\n'
+  fi
+  exit 0
+fi
+if [[ "$1" == "inspect" ]]; then
+  printf '\n'
+  exit 0
+fi
+if [[ "$1" == "network" && "$2" == "connect" ]]; then
+  # The stub answers "unaliased" until this runs, so if the route file
+  # already flipped to plain, the swap beat the attach.
+  if [[ -n "${STUB_ROUTE_FILE:-}" && -n "${STUB_ORDER_LOG:-}" ]]; then
+    if grep -q 'fallback:' "${STUB_ROUTE_FILE}" 2>/dev/null; then
+      printf 'alias-before-route\n' >> "${STUB_ORDER_LOG}"
+    else
+      printf 'route-before-alias\n' >> "${STUB_ORDER_LOG}"
+    fi
+  fi
+  if [[ "$mode" == "connect-fails" ]]; then
+    exit 1
+  fi
+  exit 0
+fi
+exit 0
+STUBEOF
+chmod +x "$stubbin/docker"
+
+order_log="$env_tmp/order.log"
+route_file="$env_tmp/congress-trade.yml"
+bash "$REATTACH" --render hold > "$route_file" # stale deploy-window shape
+: > "$order_log"
+rc=0
+STUB_MODE=app-unaliased STUB_ROUTE_FILE="$route_file" STUB_ORDER_LOG="$order_log" \
+  PATH="$stubbin:$PATH" DYNAMIC_FILE="$route_file" STAGE_DIR="$env_tmp" \
+  bash "$REATTACH" > "$env_tmp/reattach-out.txt" 2>&1 || rc=$?
+assert_eq "$rc" "0" "reattach exits 0 with stub docker"
+assert_eq "$(cat "$order_log")" "alias-before-route" "alias attach lands before the route swap"
+assert_eq "$(cat "$route_file")" "$(bash "$REATTACH" --render plain)" "stale failover route returns to plain"
+assert_contains "$(cat "$env_tmp/reattach-out.txt")" "route file updated" "swap is logged"
+
+# Mid-swap gap: no app container at all. The route file must still be
+# written (stale failover -> plain), or the catch-all takes over.
+bash "$REATTACH" --render hold > "$route_file" # stale again
+rc=0
+STUB_MODE=empty \
+  PATH="$stubbin:$PATH" DYNAMIC_FILE="$route_file" STAGE_DIR="$env_tmp" \
+  bash "$REATTACH" > "$env_tmp/reattach-out2.txt" 2>&1 || rc=$?
+assert_eq "$rc" "0" "reattach exits 0 with no app container"
+assert_eq "$(cat "$route_file")" "$(bash "$REATTACH" --render plain)" "route file is written even with no app container"
+assert_contains "$(cat "$env_tmp/reattach-out2.txt")" "no congress-app container" "missing app is logged"
+
+# Attach failed and the desired route is plain. The stale hold file must
+# stay: a plain route has no health check, so an unaliased name 502s.
+bash "$REATTACH" --render hold > "$route_file"
+rc=0
+STUB_MODE=connect-fails \
+  PATH="$stubbin:$PATH" DYNAMIC_FILE="$route_file" STAGE_DIR="$env_tmp" \
+  bash "$REATTACH" > "$env_tmp/reattach-out3.txt" 2>&1 || rc=$?
+assert_eq "$rc" "0" "reattach exits 0 when alias attach fails"
+assert_eq "$(cat "$route_file")" "$(bash "$REATTACH" --render hold)" "failed attach does not flip a hold route to plain"
+assert_contains "$(cat "$env_tmp/reattach-out3.txt")" "alias attach failed" "failed attach is logged"
+assert_not_contains "$(cat "$env_tmp/reattach-out3.txt")" "route file updated" "failed attach does not log a route swap"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "FAILED"
