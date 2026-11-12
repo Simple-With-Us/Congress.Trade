@@ -894,7 +894,8 @@ alert_decision() {
     prev_ts=0
   fi
   if [[ "$level" == "unknown" ]]; then
-    alert_state_set "$signal" unknown "$prev_ts"
+  # Transient unmount/read failures must not erase the last known level or
+  # timestamp; recovery and dedupe depend on the prior crit/warn state.
     echo suppress unknown
     return 0
   fi
@@ -1070,10 +1071,12 @@ main() {
   fi
 
   apply_prune "$root_level"
+  read_metric_texts
   fill_mount_metrics "/" root ROOT || return 1
   local level_after="$M_ROOT_LEVEL"
   log "disk-after: used=${USED_PCT}% free=${FREE_GB}G level=${level_after}"
   report_docker
+  report_builder_cache
   emit_root_alert "$level_after" "after"
   write_status "$root_level" "$level_after"
   log "done level_before=$root_level level_after=$level_after"

@@ -154,6 +154,17 @@ emit_alert "disk:/" ok "still ok"
 assert_eq "$(wc -l < "$STATE_DIR/notifications.log" | tr -d ' ')" 4 "quiet ok does not page again"
 emit_alert "disk:/mnt/fleet-extra" unknown "not mounted"
 assert_eq "$(wc -l < "$STATE_DIR/notifications.log" | tr -d ' ')" 4 "unknown mount does not page"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+HYGIENE_NOW=3000
+emit_alert "disk:/tmp" crit "tmp crit"
+HYGIENE_NOW=3060
+emit_alert "disk:/tmp" unknown "tmp unmounted"
+assert_eq "$(awk -F '\t' '$1=="disk:/tmp" {print $2; exit}' "$STATE_DIR/alert-state.tsv")" crit "unknown preserves prior crit level in state"
+HYGIENE_NOW=3120
+emit_alert "disk:/tmp" ok "tmp back"
+assert_eq "$(wc -l < "$STATE_DIR/notifications.log" | tr -d ' ')" 2 "recovery still pages after unknown gap"
+assert_eq "$(awk -F '\t' 'END {print $3" "$4}' "$STATE_DIR/notifications.log")" "ok recovery" "recovery after unknown is recovery"
 
 section "pushover token preference"
 env_dir="${TMP}/env"
