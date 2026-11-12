@@ -1,0 +1,19 @@
+[Unit]
+Description=Fleet daily read-only disk growth snapshot (JSON)
+After=docker.service
+Wants=docker.service
+
+[Service]
+# Finite watchdog: default <=8 roots x (600s+5s), plus bounded metadata collectors.
+# Increase this with a drop-in if custom root/time budgets exceed two hours.
+TimeoutStartSec=2h
+Type=oneshot
+ExecStart=/usr/local/bin/disk-growth-snapshot.sh
+Nice=10
+IOSchedulingClass=idle
+SyslogIdentifier=disk-growth-snapshot
+# Optional overrides:
+# EnvironmentFile=-/etc/disk-growth-snapshot.env
+
+[Install]
+WantedBy=multi-user.target

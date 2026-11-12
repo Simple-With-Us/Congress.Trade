@@ -249,6 +249,13 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-sqlite-maintenance.sh
 
+      - name: Test disk-growth snapshot and report (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/disk-growth-lib.sh
+          bash -n scripts/ops/disk-growth-snapshot.sh
+          bash -n scripts/ops/disk-growth-report.sh
+          bash scripts/ops/test-disk-growth.sh
       - name: Fleet log cap ops tests (offline)
         working-directory: .
         run: |
