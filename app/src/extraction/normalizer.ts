@@ -62,6 +62,7 @@ import {
   cleanFilerName,
   isJunkAssetString,
   cleanAssetString,
+  namesPlausiblyMatch,
   simplifyCompanyName,
   splitAssetNameDetail,
 } from './nameNormalizer.ts';
@@ -1412,16 +1413,6 @@ export async function loadNameIndex(env: Env): Promise<NameIndex> {
   }
   nameIndexCache = { loadedAt: now, index };
   return index;
-}
-
-/**
- * True when two simplified company names plausibly refer to the same issuer.
- * Exact match or substring containment either direction (tolerates partial
- * historical forms, e.g. "apple computer" vs "apple").
- */
-function namesPlausiblyMatch(a: string, b: string): boolean {
-  if (!a || !b) return true; // nothing to compare against is not evidence of mismatch
-  return a === b || a.includes(b) || b.includes(a);
 }
 
 // ---------------------------------------------------------------------------

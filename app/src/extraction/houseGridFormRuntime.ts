@@ -13,6 +13,7 @@ import {
   type GrayImage,
   type HouseGridFormReader,
   type HouseGridOcrBox,
+  type HouseGridReadOptions,
 } from './houseGridForm.ts';
 import { snapHouseGridRead, type HouseGridSecurityCatalog } from './houseGridAssetSnap.ts';
 
@@ -319,9 +320,9 @@ export interface HouseGridReaderOptions {
   loadCatalog?: () => Promise<HouseGridSecurityCatalog | null>;
 }
 
-export function createDenoHouseGridReader(options: HouseGridReaderOptions = {}): HouseGridFormReader {
+export function createDenoHouseGridReader(readerOptions: HouseGridReaderOptions = {}): HouseGridFormReader {
   return {
-    async read(bytes: ArrayBuffer): Promise<ReturnType<typeof readHouseGridForm> | null> {
+    async read(bytes: ArrayBuffer, readOptions?: HouseGridReadOptions): Promise<ReturnType<typeof readHouseGridForm> | null> {
       if (typeof Deno === 'undefined') return null;
       if (!(await binariesReady())) return null;
       const dir = await Deno.makeTempDir({ prefix: 'house-grid-' });
@@ -364,11 +365,12 @@ export function createDenoHouseGridReader(options: HouseGridReaderOptions = {}):
             const jobs: Array<() => Promise<HouseGridOcrBox | null>> = [];
             let jobId = 0;
             const ruleInset = Math.round(4 * factor);
+            const dateInset = 4;
             for (const band of bands) {
               // The row rules sit on the band edges. Leaving them in the cell
               // makes a one-line date read as empty.
-              const y0 = band.y0 + 3;
-              const y1 = band.y1 - 3;
+              const y0 = band.y0 + dateInset;
+              const y1 = band.y1 - dateInset;
               const asset = spanBetweenRules(
                 hi,
                 (plan.xs[1] - 14) * factor,
@@ -387,8 +389,8 @@ export function createDenoHouseGridReader(options: HouseGridReaderOptions = {}):
                   psm: '6',
                   whitelist: null,
                 },
-                { x0: plan.xs[7] + 2, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
-                { x0: plan.xs[8] + 2, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[7] + dateInset, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[8] + dateInset, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
               ];
               for (const cell of cells) {
                 const id = jobId;
@@ -404,15 +406,15 @@ export function createDenoHouseGridReader(options: HouseGridReaderOptions = {}):
           pages.push({ image, boxes, page: i + 1 });
         }
         if (pages.length === 0) return null;
-        const read = readHouseGridForm(pages);
-        if (!options.loadCatalog) return read;
+        const gridRead = readHouseGridForm(pages, readOptions);
+        if (!readerOptions.loadCatalog) return gridRead;
         try {
-          const catalog = await options.loadCatalog();
-          if (!catalog || catalog.entries.length === 0) return read;
-          return snapHouseGridRead(read, catalog);
+          const catalog = await readerOptions.loadCatalog();
+          if (!catalog || catalog.entries.length === 0) return gridRead;
+          return snapHouseGridRead(gridRead, catalog);
         } catch (err) {
           console.warn('house grid form: asset snap skipped', (err as Error).message);
-          return read;
+          return gridRead;
         }
       } catch (err) {
         console.warn('house grid form: local render failed', (err as Error).message);

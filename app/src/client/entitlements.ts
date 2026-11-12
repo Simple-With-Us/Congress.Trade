@@ -49,7 +49,7 @@ export async function redeemAppleEntitlementAnonymously(c: Context<{ Bindings: E
     return errorResponse(c, err);
   }
 
-  const ip = clientIp(c.req.raw);
+  const ip = clientIp(c.req.raw, c.env);
   const ipLimited = await rateLimit(c.env, 'apple-anon-redeem-ip', ip, IP_LIMIT, IP_WINDOW_SEC);
   if (!ipLimited.ok) {
     return c.json({ error: 'too many redeem attempts' }, 429, { 'Retry-After': String(ipLimited.retryAfterSec) });

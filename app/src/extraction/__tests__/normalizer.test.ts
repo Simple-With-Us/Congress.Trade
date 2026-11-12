@@ -16,6 +16,7 @@ import {
 } from '../normalizer.ts';
 import type { Env, Filing, ParsedTx } from '../../shared/types.ts';
 import { parseOgeTransactionRows } from '../ogeText.ts';
+import { simplifyCompanyName } from '../nameNormalizer.ts';
 
 beforeEach(() => {
   clearResolverCache();
@@ -1674,6 +1675,80 @@ describe('scoreFields ticker/asset-name consistency (informational, unpenalized)
       passthroughResolve,
     );
     expect(scored.flags).not.toContain('ticker_asset_mismatch');
+  });
+
+  it('does not flag Vanguard ETF rows when securities_ref uses longer fund titles (CT-2480)', () => {
+  const vanguardEtfCases: Array<{ ticker: string; assetName: string; refName: string }> = [
+    {
+      ticker: 'VTI',
+      assetName: 'Vanguard Total Stock Market ETF',
+      refName: 'Vanguard Total Stock Market Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VUG',
+      assetName: 'Vanguard Growth Index Fund ETF Shares',
+      refName: 'Vanguard Growth Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VXUS',
+      assetName: 'Vanguard Total International Stock ETF',
+      refName: 'Vanguard Total International Stock Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VGT',
+      assetName: 'Vanguard Information Technology Index Fund ETF',
+      refName: 'Vanguard Information Technology Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VWO',
+      assetName: 'Vanguard FTSE Emerging Markets ETF',
+      refName: 'Vanguard FTSE Emerging Markets Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VEA',
+      assetName: 'Vanguard FTSE Developed Markets ETF',
+      refName: 'Vanguard FTSE Developed Markets Index Fund ETF Shares',
+    },
+    {
+      ticker: 'IVV',
+      assetName: 'iShares Core S&P 500 ETF',
+      refName: 'iShares Core S&P 500 Index ETF',
+    },
+    {
+      ticker: 'SPY',
+      assetName: 'SPDR S&P 500 ETF Trust',
+      refName: 'SPDR S&P 500 ETF',
+    },
+    {
+      ticker: 'SCHB',
+      assetName: 'Schwab U.S. Broad Market ETF',
+      refName: 'Schwab U.S. Broad Market ETF Shares',
+    },
+  ];
+
+  for (const { ticker, assetName, refName } of vanguardEtfCases) {
+    const nameIndex: NameIndex = new Map([[ticker, simplifyCompanyName(refName)]]);
+    const scored = scoreFields(
+      0.97,
+      { ...baseFields, ticker, assetName },
+      '2024-07-01',
+      passthroughResolve,
+      nameIndex,
+    );
+    expect(scored.flags, `${ticker} ${assetName}`).not.toContain('ticker_asset_mismatch');
+  }
+  });
+
+  it('still flags AAPL when the asset name is Microsoft Corp', () => {
+    const nameIndex: NameIndex = new Map([['AAPL', simplifyCompanyName('Apple Inc')]]);
+    const scored = scoreFields(
+      0.97,
+      { ...baseFields, ticker: 'AAPL', assetName: 'Microsoft Corp' },
+      '2024-07-01',
+      passthroughResolve,
+      nameIndex,
+    );
+    expect(scored.flags).toContain('ticker_asset_mismatch');
   });
 
   it('does not flag invalid_amount when rawText is a fund name with a digit', () => {
