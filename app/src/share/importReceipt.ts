@@ -135,6 +135,61 @@ export function warnPeerImportSchemaDrops(input: {
   sentryLoggerWarn('peer.import.schema_drops', attrs);
 }
 
+function payloadHadStreamRows(body: Record<string, unknown>): boolean {
+  for (const stream of SHARE_IMPORT_STREAMS) {
+    if (Array.isArray(body[stream]) && body[stream]!.length > 0) return true;
+  }
+  return false;
+}
+
+function acceptedRowsTotal(accepted: Record<ShareImportStream, number>): number {
+  let n = 0;
+  for (const stream of SHARE_IMPORT_STREAMS) n += accepted[stream] ?? 0;
+  return n;
+}
+
+/** Payload carried rows but nothing landed — usually schema drift or a bad token writing to /dev/null. */
+export function warnPeerImportNoAcceptedRows(input: {
+  requestId: string;
+  origin: string | null;
+  payloadBytes: number;
+  dropped: DroppedMap;
+  accepted: Record<ShareImportStream, number>;
+  rawBody: Record<string, unknown>;
+}): void {
+  if (!payloadHadStreamRows(input.rawBody)) return;
+  if (acceptedRowsTotal(input.accepted) > 0) return;
+  sentryLoggerWarn('peer.import.no_accepted_rows', {
+    requestId: input.requestId,
+    origin: input.origin ?? 'unknown',
+    payloadBytes: input.payloadBytes,
+    droppedTotal: totalDroppedCount(input.dropped),
+    droppedJson: JSON.stringify(input.dropped),
+  });
+}
+
+/** Import path rejected before handler — auth/token mismatch or ingest token unset. */
+export function warnPeerImportAuthRejected(input: {
+  path: string;
+  hasAuthorization: boolean;
+  ingestTokenConfigured: boolean;
+  ingestBearerAttempt: boolean;
+}): void {
+  if (!input.path.endsWith('/securities/import')) return;
+  const reason = !input.ingestTokenConfigured
+    ? 'ingest_token_unconfigured'
+    : !input.hasAuthorization
+      ? 'missing_bearer'
+      : input.ingestBearerAttempt
+        ? 'ingest_bearer_mismatch'
+        : 'admin_auth_required';
+  sentryLoggerWarn('peer.import.auth_rejected', {
+    reason,
+    ingestTokenConfigured: input.ingestTokenConfigured,
+    hasAuthorization: input.hasAuthorization,
+  });
+}
+
 export interface PeerImportSchemaVersion {
   schemaVersion: number | null;
   supported: boolean;
