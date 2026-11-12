@@ -129,36 +129,58 @@ def x_template_for_fit(fit_scale: float) -> np.ndarray:
 
 
 def fit_column_lines(detected: Sequence[int], min_scale: float = 0.5) -> Optional[ColumnFit]:
+    """Same pair search as houseGridForm.ts fitColumnLines.
+
+    Every detected pair is still scored against every template pair. The
+    inlier count is the same sum, evaluated in array chunks so a dense page
+    does not spend seconds in the Python interpreter. Scale stays in
+    [min_scale, 1.4], matching the TypeScript bounds.
+    """
     if len(detected) < 4:
         return None
-    best: Optional[Tuple[int, float, ColumnFit]] = None
-    detected_arr = [float(v) for v in detected]
+    det = np.asarray([float(v) for v in detected], dtype=np.float64)
+    n_det = int(det.shape[0])
+    best: Optional[Tuple[int, float, float, float, Tuple[int, ...]]] = None
+    pair_i, pair_j = np.triu_indices(n_det, 1)
     for template in COLUMN_TEMPLATES:
-        for i in range(len(detected_arr)):
-            for j in range(i + 1, len(detected_arr)):
-                for a in range(len(template)):
-                    for b in range(a + 1, len(template)):
-                        denom = template[b] - template[a]
-                        if denom == 0:
-                            continue
-                        scale = (detected_arr[j] - detected_arr[i]) / denom
-                        if scale < min_scale or scale > 1.4:
-                            continue
-                        offset = detected_arr[i] - scale * template[a]
-                        predicted = [offset + scale * t for t in template]
-                        inliers = 0
-                        err = 0.0
-                        for x in detected_arr:
-                            nearest = min(abs(x - p) for p in predicted)
-                            if nearest < 12:
-                                inliers += 1
-                                err += nearest
-                        if best is None or inliers > best[0] or (inliers == best[0] and err < best[1]):
-                            xs = [int(round(p)) for p in predicted]
-                            best = (inliers, err, ColumnFit(scale, offset, xs, inliers))
+        tmpl = np.asarray(template, dtype=np.float64)
+        n_tpl = int(tmpl.shape[0])
+        left, right = np.triu_indices(n_tpl, 1)
+        denom = tmpl[right] - tmpl[left]
+        keep = denom != 0
+        left, denom = left[keep], denom[keep]
+        if denom.size == 0:
+            continue
+        span = det[pair_j] - det[pair_i]
+        scale = span[:, None] / denom[None, :]
+        offset = det[pair_i][:, None] - scale * tmpl[left][None, :]
+        valid = (scale >= min_scale) & (scale <= 1.4)
+        flat_scale = np.ascontiguousarray(scale[valid])
+        flat_offset = np.ascontiguousarray(offset[valid])
+        hypothesis_count = int(flat_scale.shape[0])
+        if hypothesis_count == 0:
+            continue
+        for start in range(0, hypothesis_count, 4096):
+            end = min(hypothesis_count, start + 4096)
+            sc = flat_scale[start:end]
+            off = flat_offset[start:end]
+            nearest = np.full((end - start, n_det), np.inf, dtype=np.float64)
+            for value in tmpl:
+                predicted = off + sc * value
+                nearest = np.minimum(nearest, np.abs(det[None, :] - predicted[:, None]))
+            mask = nearest < 12
+            inliers = mask.sum(axis=1)
+            err = (nearest * mask).sum(axis=1)
+            for index in range(end - start):
+                count = int(inliers[index])
+                error = float(err[index])
+                if best is None or count > best[0] or (count == best[0] and error < best[1]):
+                    best = (count, error, float(sc[index]), float(off[index]), template)
     if best is None or best[0] < 8:
         return None
-    return best[2]
+    _count, _error, scale, offset, template = best
+    xs = [int(round(offset + scale * value)) for value in template]
+    return ColumnFit(scale, offset, xs, best[0])
 
 
 def _best(scores: Sequence[float], indexes: Sequence[int]) -> Optional[Tuple[int, float, float]]:
@@ -341,7 +363,9 @@ def row_bands(gray: np.ndarray, xs: Sequence[int]) -> Tuple[List[Tuple[int, int]
         height = bot - top
         if height < pitch * 0.55 or height > pitch * 1.8:
             continue
-        sample = dark[top + 2:bot - 2:2, ::4]
+        # Rule detection above uses <200. Band solidity matches the TS DARK=150
+        # scorer so a gray halo is not counted as a filled row.
+        sample = strip[top + 2:bot - 2:2, ::4] < 150
         if sample.size and float(sample.mean()) > 0.45:
             continue
         bands.append((top, bot))
@@ -422,6 +446,241 @@ def _match_cell(cell: np.ndarray, template: np.ndarray) -> float:
     return 0.0 if not np.isfinite(score) else score
 
 
+# Longest form words peel first. Equal lengths keep the source order.
+_FORM_WORDS = tuple(sorted((
+    "CORPORATION", "INCORPORATED", "INTERNATIONAL", "HOLDINGS", "COMPANIES",
+    "PERPETUAL", "WHOLESALE", "COMMON", "COMPANY", "LIMITED", "SYSTEMS",
+    "INDEX", "LINKED", "CLASS", "STOCK", "TRUST", "SHARE",
+    "CORP", "INC", "LLC", "PLC", "CMN", "LTD", "FUND", "LINE", "HLDG",
+    "USD", "US", "CO",
+), key=len, reverse=True))
+_FORM_PREFIXES = frozenset({"LLC", "PLC", "LINKED"})
+_FORM_LEXICON = (
+    "SEMICONDUCTOR", "HOLDINGS", "INCORPORATED", "TECHNOLOGY", "PHARMACEUTICALS",
+    "COMMUNICATIONS", "UNSPONSORED", "CORPORATION", "INTERNATIONAL", "DIAGNOSTICS",
+    "WHOLESALE", "MATERIALS", "ENTERPRISES", "INSTRUMENTS", "LABORATORIES",
+)
+_FORM_TOKEN_MAP = {
+    "CMIN": "CMN",
+    "CIMIN": "CMN",
+    "CMMN": "CMN",
+    "ICMN": "CMN",
+    "CMI": "CMN",
+    "CMM": "CMN",
+    "CMNN": "CMN",
+    "CMA": "CMN",
+    "CRN": "CMN",
+    "CHN": "CMN",
+    "CIN": "CMN",
+    "CNN": "CMN",
+    "MIN": "CMN",
+    "CIMN": "CMN",
+    "CHIN": "CMN",
+    "CHAN": "CMN",
+    "HLDGCO": "HLDG CO",
+    "PLE": "PLC",
+    "PLO": "PLC",
+    "HOLOINGS": "HOLDINGS",
+    "HOLDNGS": "HOLDINGS",
+    "CLASSA": "CLASS A",
+    "CLASSB": "CLASS B",
+}
+_CO_REMAINDER_DENY = frozenset({"COST", "COCA", "TACO", "LOCO", "ARCO", "PEPSI", "DISCO", "GEICO"})
+_COMPANY_TAIL = re.compile(r"^(CORPORATION|COMPANY|INCORPORATED|HOLDINGS|LIMITED|INC|CORP|PLC|LLC|CO)$")
+
+
+def _edit_distance_at_most_1(left: str, right: str) -> bool:
+    if abs(len(left) - len(right)) > 1:
+        return False
+    i = 0
+    j = 0
+    edits = 0
+    while i < len(left) and j < len(right):
+        if left[i] == right[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left) == len(right):
+            i += 1
+            j += 1
+        elif len(left) > len(right):
+            i += 1
+        else:
+            j += 1
+    if i < len(left) or j < len(right):
+        edits += 1
+    return edits <= 1
+
+
+def _correct_form_word(token: str) -> str:
+    if len(token) < 8 or token in _FORM_LEXICON:
+        return token
+    hits = [word for word in _FORM_LEXICON if _edit_distance_at_most_1(token, word)]
+    return hits[0] if len(hits) == 1 else token
+
+
+def _repair_index_token(token: str) -> Optional[List[str]]:
+    if re.fullmatch(r"S[QR8]?PS?[O0]{1,3}D?INDEX", token):
+        return ["S&P", "500", "INDEX"]
+    if re.fullmatch(r"(?:SOO|SOD|S00|5OO)INDE[XK]", token):
+        return ["500", "INDEX"]
+    if re.fullmatch(r"(?:SOO|S00|5OO)", token):
+        return ["500"]
+    if re.fullmatch(r"(?:SRP|SQP|S8P)", token):
+        return ["S&P"]
+    return None
+
+
+def _split_form_token(token: str) -> List[str]:
+    if re.search(r"[()]", token):
+        return [token]
+    trimmed = re.sub(r"^[^A-Za-z0-9&]+|[^A-Za-z0-9&]+$", "", token)
+    if not trimmed or not re.fullmatch(r"[A-Za-z0-9&]+", trimmed):
+        return [token]
+    upper = trimmed.upper()
+    mapped = _FORM_TOKEN_MAP.get(upper)
+    if mapped:
+        return mapped.split(" ")
+    index = _repair_index_token(upper)
+    if index:
+        return index
+    if re.fullmatch(r"CLASS[ABC]", upper):
+        return ["CLASS", upper[5:]]
+    prefixes: List[str] = []
+    suffixes: List[str] = []
+    rest = upper
+    for _guard in range(8):
+        if len(rest) < 3:
+            break
+        peeled = False
+        for word in _FORM_WORDS:
+            if rest == word:
+                prefixes.append(_FORM_TOKEN_MAP.get(word, word))
+                rest = ""
+                peeled = True
+                break
+            min_remainder = 4 if word in {"LINE", "FUND", "US", "CO"} else 3
+            prefix_ok = word in _FORM_PREFIXES and rest.startswith(word) and len(rest) >= len(word) + min_remainder
+            suffix_ok = rest.endswith(word) and len(rest) >= len(word) + min_remainder
+            if not prefix_ok and not suffix_ok:
+                continue
+            if suffix_ok and rest[:-len(word)] in _CO_REMAINDER_DENY:
+                continue
+            piece = _FORM_TOKEN_MAP.get(word, word)
+            if prefix_ok:
+                prefixes.append(piece)
+                rest = rest[len(word):]
+            else:
+                suffixes.insert(0, piece)
+                rest = rest[:-len(word)]
+            peeled = True
+            break
+        if not peeled:
+            break
+    if rest:
+        prefixes.append(_FORM_TOKEN_MAP.get(rest, _correct_form_word(rest)))
+    pieces = prefixes + suffixes
+    if len(pieces) == 1 and pieces[0] == upper:
+        return [token]
+    return pieces
+
+
+def clean_grid_asset_name(text: str) -> str:
+    """Same form-word splits as houseGridForm.ts cleanGridAssetName."""
+    tokens = [token for token in re.sub(r"[|`\u00b4\u2018\u2019_]+", " ", text).split() if token]
+    words: List[str] = []
+    for token_index, token in enumerate(tokens):
+        for piece in _split_form_token(token):
+            if piece == "SA" and words and words[-1] == "CLASS":
+                words.append("A")
+                continue
+            if piece == "SB" and words and words[-1] == "CLASS":
+                words.append("B")
+                continue
+            previous = words[-1] if words else ""
+            if piece == "NC" and re.fullmatch(r"[A-Z]{4,}", previous):
+                words.append("INC")
+                continue
+            if piece in {"MN", "CM", "CAN"} and _COMPANY_TAIL.fullmatch(previous):
+                words.append("CMN")
+                continue
+            nxt = tokens[token_index + 1].upper() if token_index + 1 < len(tokens) else ""
+            if piece == "SP" and re.match(r"(?:500|SOO|SOD|S00)", nxt):
+                words.append("S&P")
+                continue
+            if words and words[-1] == piece:
+                continue
+            if len(piece) == 1 and not re.fullmatch(r"[A-Z]", piece):
+                continue
+            words.append(piece)
+    return re.sub(r"\s+", " ", " ".join(words)).strip()
+
+
+def reading_order(boxes: Sequence[OcrBox]) -> str:
+    """Group words into lines the way houseGridForm.ts readingOrder does."""
+    ordered = sorted(boxes, key=lambda box: (box.y0, box.x0))
+    lines: List[List[OcrBox]] = []
+    for box in ordered:
+        cy = (box.y0 + box.y1) / 2
+        if not lines:
+            lines.append([box])
+            continue
+        line = lines[-1]
+        line_y = sum((entry.y0 + entry.y1) / 2 for entry in line) / len(line)
+        if abs(cy - line_y) > 8:
+            lines.append([box])
+        else:
+            line.append(box)
+    parts: List[str] = []
+    for line in lines:
+        text = " ".join(
+            box.text.strip()
+            for box in sorted(line, key=lambda box: box.x0)
+            if box.text.strip()
+        )
+        if text:
+            parts.append(text)
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def asset_text(boxes: Sequence[OcrBox], xs: Sequence[int]) -> Tuple[str, float]:
+    left = xs[1] - 8
+    right = xs[2] - 4
+    hits = [box for box in boxes if left <= box.x0 < right and box.text.strip()]
+    if not hits:
+        return "", 0.0
+    conf = sum(box.conf for box in hits) / len(hits)
+    return reading_order(hits), conf
+
+
+def row_confidence(marks: ClassifiedMarks, asset_conf: float, has_date: bool, asset: str) -> float:
+    """Same weights as houseGridForm.ts confidenceFor, including the asset term."""
+    if marks.type_reason != "ok":
+        return 0.35
+    strong = (
+        marks.type_score >= GRID_STRONG_MARK
+        and marks.amount_reason == "ok"
+        and marks.amount_score >= GRID_STRONG_MARK
+        and has_date
+        and len(asset.strip()) >= 4
+        and asset_conf >= 0.45
+    )
+    if strong:
+        return 0.97
+    asset_term = 0.08 * min(1.0, asset_conf) if len(asset.strip()) >= 4 else 0.0
+    return min(
+        0.9,
+        0.42
+        + min(0.2, marks.type_score * 0.2)
+        + (0.12 if marks.amount_reason == "ok" else 0.0)
+        + (0.08 if has_date else 0.0)
+        + asset_term,
+    )
+
+
 def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> Optional[List[GridRow]]:
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
@@ -457,10 +716,7 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
             scores.append(_match_cell(cell, template))
         marks = classify_mark_scores(scores)
         in_band = [box for box in boxes if top <= (box.y0 + box.y1) / 2 <= bot]
-        asset_boxes = [box for box in in_band if xs[1] - 8 <= box.x0 < xs[2] - 4 and box.text.strip()]
-        asset_boxes.sort(key=lambda box: ((box.y0 + box.y1) / 2, box.x0))
-        asset = " ".join(box.text.strip() for box in asset_boxes)
-        asset_conf = sum(box.conf for box in asset_boxes) / len(asset_boxes) if asset_boxes else 0.0
+        asset, asset_conf = asset_text(in_band, xs)
         owners = [owner for owner in (_owner(box.text) for box in in_band if box.x1 <= xs[1] + 12) if owner]
         trade_left, trade_right, notif_right = xs[7], xs[8], xs[9]
         trade_date: Optional[str] = None
@@ -498,27 +754,14 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
         if marks.amount_reason == "column_k":
             notes.append("amount column K marked")
         warnings = ["grid_type_unmarked"] if marks.type_reason != "ok" or marks.tx_type is None else []
-        strong = (
-            marks.type_reason == "ok"
-            and marks.type_score >= GRID_STRONG_MARK
-            and marks.amount_reason == "ok"
-            and marks.amount_score >= GRID_STRONG_MARK
-            and bool(trade_date)
-            and len(asset.strip()) >= 4
-            and asset_conf >= 0.45
-        )
-        if marks.type_reason != "ok":
-            confidence = 0.35
-        elif strong:
-            confidence = 0.97
-        else:
-            confidence = min(0.9, 0.42 + min(0.2, marks.type_score * 0.2) + (0.12 if marks.amount_reason == "ok" else 0) + (0.08 if trade_date else 0))
+        confidence = row_confidence(marks, asset_conf, trade_date is not None, asset)
         ticker = None
         found = re.search(r"\(([A-Z]{1,5})\)", asset)
         if found:
             ticker = found.group(1)
+        cleaned = clean_grid_asset_name(asset)
         rows.append(GridRow(
-            asset_name=asset or f"(unreadable asset p{page})",
+            asset_name=cleaned or asset or f"(unreadable asset p{page})",
             owner=owners[0] if owners else None,
             tx_type=marks.tx_type or "",
             tx_date=trade_date,
