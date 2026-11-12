@@ -96,6 +96,21 @@ const ROSTER: Legislator[] = [
     name: { first: 'Adam', last: 'Schiff', official_full: 'Adam B. Schiff' },
     terms: [{ type: 'sen', party: 'Democrat', state: 'CA', start: '2025-01-03', end: '2031-01-03' }],
   },
+  {
+    id: { bioguide: 'F000459' },
+    name: { first: 'Charles', last: 'Fleischmann', nickname: 'Chuck', official_full: 'Charles J. Fleischmann' },
+    terms: [{ type: 'rep', party: 'Republican', state: 'TN', district: 3, start: '2023-01-03', end: '2027-01-03' }],
+  },
+  {
+    id: { bioguide: 'S001216' },
+    name: { first: 'Kim', last: 'Schrier', official_full: 'Kim Schrier' },
+    terms: [{ type: 'rep', party: 'Democrat', state: 'WA', district: 8, start: '2023-01-03', end: '2027-01-03' }],
+  },
+  {
+    id: { bioguide: 'L000559' },
+    name: { first: 'James', last: 'Langevin', official_full: 'James R. Langevin' },
+    terms: [{ type: 'rep', party: 'Democrat', state: 'RI', district: 2, start: '2021-01-03', end: '2023-01-03' }],
+  },
 ];
 
 function indexesFrom(list: readonly Legislator[]): LegislatorIndexes {
@@ -153,6 +168,45 @@ describe('planIdentitySync: chamber for competitor-minted MANUAL-* filers', () =
     expect(plan.changes[0].after.chamber).toBe('house');
   });
 
+  it.each([
+    ['MANUAL-FLEISHMANN', 'Chuck Fleischmann', 'TN', '3', 'F000459'],
+    ['MANUAL-SCHRIER', 'Kim Schrier', 'WA', '8', 'S001216'],
+    ['MANUAL-LANGEVIN', 'James Langevin', 'RI', '2', 'L000559'],
+  ] as const)('corrects %s (House mis-tagged senate) from the roster', (filerId, name, state, district, bioguide) => {
+    const plan = planIdentitySync(
+      [
+        row({
+          bioguide_id: filerId,
+          full_name: name,
+          chamber: 'senate',
+          state,
+          district,
+          party: 'Republican',
+          resolved_bioguide_id: bioguide,
+          display_name: name,
+        }),
+      ],
+      indexes,
+    );
+    expect(plan.chambersCorrected).toBe(1);
+    expect(plan.changes[0].after.chamber).toBe('house');
+  });
+
+  it.each([
+    ['MANUAL-LUTNICK', 'Howard Lutnick', false],
+    ['MANUAL-MCMAHON', 'Linda McMahon', false],
+    ['MANUAL-BONDI', 'Pam Bondi', true],
+    ['MANUAL-BLANCHE', 'Pam Bondi', true],
+    ['MANUAL-MIRAN', 'Stephen Miran', true],
+    ['MANUAL-ISAACMAN', 'Jared Isaacman', true],
+    ['MANUAL-LANDAU', 'Eric Landau', true],
+  ] as const)('labels %s executive (not senate)', (filerId, name, usePhotoPack) => {
+    const evidence: IdentityEvidence = usePhotoPack ? { executiveFilerIds: new Set([filerId]) } : {};
+    const plan = planIdentitySync([row({ bioguide_id: filerId, full_name: name, chamber: 'senate' })], indexes, evidence);
+    expect(plan.chambersCorrected).toBe(1);
+    expect(plan.changes[0].after.chamber).toBe('executive');
+  });
+
   it('corrects a Senator labelled house from the roster (MANUAL-SULLIVAN, live: "Dan Sullivan house R AK") even though the payload said house', () => {
     const evidence: IdentityEvidence = { payloadChamber: new Map([['MANUAL-SULLIVAN', 'house']]) };
     const plan = planIdentitySync(
@@ -188,6 +242,16 @@ describe('planIdentitySync: chamber for competitor-minted MANUAL-* filers', () =
       indexes,
     );
     expect(plan.changes[0].after.chamber).toBe('executive');
+  });
+
+  it('resolves roster metadata for a MANUAL-* filer ingested with chamber null (not senate)', () => {
+    const plan = planIdentitySync(
+      [row({ bioguide_id: 'MANUAL-JORDAN', full_name: 'Jim Jordan', chamber: null, state: 'OH', district: '4' })],
+      indexes,
+    );
+    expect(plan.chambersCorrected).toBe(1);
+    expect(plan.changes[0].after.chamber).toBe('house');
+    expect(plan.changes[0].after.resolved_bioguide_id).toBe('J000289');
   });
 
   it('never invents a chamber: no evidence, no change, and senate is not a default', () => {

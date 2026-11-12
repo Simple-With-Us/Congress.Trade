@@ -2,7 +2,7 @@
 /**
  * Vendor-era shared-package pin check for Congress.Trade.
  *
- * CT no longer npm-installs @jaywedgeworth22/congress-trading-shared. Deno
+ * CT no longer npm-installs from git; the @jaywedgeworth22/congress-trading-shared import map points at vendor/. Deno
  * resolves it from app/vendor/congress-trading-shared (see VENDOR-PROVENANCE.md).
  * Peer apps (Socratic.Trade, Usage-Monitor) still npm-pin the git tag.
  *

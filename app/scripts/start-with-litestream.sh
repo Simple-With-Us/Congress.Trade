@@ -70,14 +70,22 @@ elif [[ ! -x "${LITESTREAM_BIN}" ]]; then
   log "ERROR-LEVEL WARNING: litestream binary missing at ${LITESTREAM_BIN} — THE DATABASE IS NOT BEING BACKED UP. Starting the app anyway (uptime over backup); the Dockerfile's 'test -x bin/litestream' should have caught this at build time."
 else
   # Mint a short-lived token from the app's existing bootstrap identity. Do
+  # Bound the login with GNU timeout when the image ships it; a minimal
+  # image without timeout must still attempt the login directly instead of
+  # failing both calls with 127 and silently disabling replication.
+  if command -v timeout >/dev/null 2>&1; then
+    LOGIN_BOUND=(timeout -s KILL 3s)
+  else
+    LOGIN_BOUND=()
+  fi
   # not log the token or any secret value at any point below.
   TOKEN="$(
     INFISICAL_UNIVERSAL_AUTH_CLIENT_ID="${BOOTSTRAP_CLIENT_ID}" \
     INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET="${BOOTSTRAP_CLIENT_SECRET}" \
-    infisical login --method=universal-auth --silent --plain 2>/dev/null || true
+    "${LOGIN_BOUND[@]}" infisical login --method=universal-auth --silent --plain 2>/dev/null || true
   )"
   if [[ -z "${TOKEN}" ]]; then
-    log "WARNING: Infisical universal-auth login failed — running without Litestream."
+    log "WARNING: Infisical universal-auth login failed or timed out — running without Litestream."
   else
     # Fetch only the 5 keys Litestream needs. Capturing via command
     # substitution keeps the values out of any log stream; `infisical run`
@@ -87,7 +95,7 @@ else
     # shellcheck disable=SC2016  # single quotes are required: these expand in
     # the `sh -c` child, whose env `infisical run` populates — not here.
     mapfile -t _ls_secrets < <(
-      INFISICAL_TOKEN="${TOKEN}" infisical run \
+      INFISICAL_TOKEN="${TOKEN}" timeout -s KILL 3s infisical run \
         --env "${CT_ENV}" --path / --projectId "${CT_PROJECT_ID}" --silent -- \
         sh -c 'printf "%s\n" "$LITESTREAM_S3_BUCKET" "$LITESTREAM_S3_ENDPOINT" "$LITESTREAM_S3_REGION" "$LITESTREAM_S3_ACCESS_KEY_ID" "$LITESTREAM_S3_SECRET_ACCESS_KEY"' \
         2>/dev/null || true

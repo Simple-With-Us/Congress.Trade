@@ -250,6 +250,37 @@ export async function collectStPeerPricesMetrics(
     };
   }
 
+  // Brand-new tickers with no price history and no drain clock yet are pending
+  // but the catch-up lane has not stamped progress — do not page until ST has
+  // been attempted or stale-bar backlog exists (neverPricedPending < pending).
+  if (
+    neverPricedPending === pending
+    && oldestPendingCheckedAt == null
+    && lastProgressAt == null
+  ) {
+    return {
+      configured: true,
+      skip: false,
+      pending,
+      neverPricedPending,
+      lastProgressAt,
+      oldestPendingCheckedAt,
+      corpusLatestDate,
+      freshThrough: pendingParams.freshThrough,
+      pendingSample: [],
+      notCovered,
+      notCoveredSample,
+      terminal: terminalVisibility.terminal,
+      terminalSample: terminalVisibility.terminalSample,
+      stallThresholdHours,
+      stalled: false,
+      detail:
+        `${pending} never-priced ticker(s) awaiting first ST drain; no drain progress recorded yet` +
+        notCoveredSuffix +
+        terminalSuffix,
+    };
+  }
+
   if (!pendingPriceProgressIdle(lastProgressAt, now, thresholdMs)) {
     try {
       const names = await all<{ ticker: string }>(

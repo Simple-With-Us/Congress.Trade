@@ -19,7 +19,7 @@ jobs:
     # on the shared self-hosted box. While SHARED_CI_RUNNER is unset this
     # workflow behaves exactly as before (hosted).
     # Runbook — clearing the variable is an instant, global hosted fallback:
-    #   gh variable set SHARED_CI_RUNNER --repo jaywedgeworth22/congress-trading-shared --body ""
+    #   gh variable set SHARED_CI_RUNNER --repo Simple-With-Us/congress-trading-shared --body ""
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

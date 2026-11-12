@@ -140,6 +140,8 @@ import {
   type MemberFilerMerge,
 } from '../shared/memberIdentity.ts';
 import { dedupeSplitFilerIdentities } from './filerIdentityDedupe.ts';
+import { assignCompetitorFilerId, type ExistingFilerCandidate } from '../shared/competitorFilerMatch.ts';
+import { competitorReporterNames, parseCompetitorReporter } from '../shared/competitorAttribution.ts';
 import { constantTimeEqual } from '../auth/tokens.ts';
 import { getCurrentUserFromRequest } from '../auth/session.ts';
 import {
@@ -317,6 +319,7 @@ import { executeAdminSchemaMigrations } from './schemaMigrationRunner.ts';
 import { ensurePeerImportSchemaColumns } from './ensurePeerSchema.ts';
 import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
+import { backfillIngestFailureReviewQueue } from '../ingestion/ingestFailureReviewQueue.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import {
   NEEDS_HAND_CHECK_MAC_VISION,
@@ -1267,9 +1270,15 @@ async function listDeadLetters(
       };
     });
     return { items, count: items.length, available: true };
-  } catch {
-    /* ingestion_outbox not migrated yet — the dashboard says unavailable. */
-    return { items: [], count: 0, available: false };
+  } catch (err) {
+    /* ingestion_outbox not migrated yet — the dashboard says unavailable.
+       Only a missing-table/column error means that; anything else (a
+       transient DB failure, a locked database) is a real error and must
+       surface instead of masquerading as an unmigrated queue. */
+    if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ''))) {
+      return { items: [], count: 0, available: false };
+    }
+    throw err;
   }
 }
 
@@ -1325,8 +1334,14 @@ async function listDlqFailedRows(
       };
     });
     return { items, count: items.length, available: true };
-  } catch {
-    return { items: [], count: 0, available: false };
+  } catch (err) {
+    /* Same contract as listDeadLetters: `available: false` is only for a
+       not-yet-migrated table; real DB errors surface instead of hiding as
+       an empty, healthy-looking queue. */
+    if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ''))) {
+      return { items: [], count: 0, available: false };
+    }
+    throw err;
   }
 }
 
@@ -1338,14 +1353,28 @@ interface PipelineFailureCounts {
 
 /** Counts for the two pipeline-failure stores the review totals carry. */
 async function pipelineFailureCounts(db: D1Database): Promise<PipelineFailureCounts> {
-  const [deadRow, parkedRow, dlqRow] = await Promise.all([
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') NOT LIKE 'parked:%'`).catch(() => null),
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM ingestion_outbox WHERE status = 'failed' AND COALESCE(last_error, '') LIKE 'parked:%'`).catch(() => null),
-    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch(() => null),
+  const [outboxRow, dlqRow] = await Promise.all([
+    // One pass over the failed outbox rows, split into active vs parked by
+    // conditional aggregation — this used to run two COUNT(*) scans over
+    // the same rows on every totals read.
+    get<{ dead: number | null; parked: number | null }>(
+      db,
+      `SELECT SUM(CASE WHEN COALESCE(last_error, '') NOT LIKE 'parked:%' THEN 1 ELSE 0 END) AS dead,
+              SUM(CASE WHEN COALESCE(last_error, '') LIKE 'parked:%' THEN 1 ELSE 0 END) AS parked
+         FROM ingestion_outbox
+        WHERE status = 'failed'`,
+    ).catch((err) => {
+      if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ""))) return null;
+      throw err;
+    }),
+    get<{ n: number }>(db, `SELECT COUNT(*) AS n FROM deno_runtime_queue WHERE status = 'failed'`).catch((err) => {
+      if (/no such table|no such column/i.test(err instanceof Error ? err.message : String(err ?? ""))) return null;
+      throw err;
+    }),
   ]);
   return {
-    deadLetters: Number(deadRow?.n ?? 0) || 0,
-    deadLettersParked: Number(parkedRow?.n ?? 0) || 0,
+    deadLetters: Number(outboxRow?.dead ?? 0) || 0,
+    deadLettersParked: Number(outboxRow?.parked ?? 0) || 0,
     dlqFailed: Number(dlqRow?.n ?? 0) || 0,
   };
 }
@@ -2924,6 +2953,15 @@ const DeliveryRequeueBodySchema = z
     limit: z.number().int().min(1).max(5000).default(500),
     ignoreCircuit: z.boolean().default(false),
     dryRun: z.boolean().default(false),
+  })
+  .strict();
+
+const IngestFailureBackfillBodySchema = z
+  .object({
+    chamber: z.enum(['house', 'senate', 'executive']).nullable().default(null),
+    apply: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+    limit: z.number().int().min(1).max(2000).default(500),
   })
   .strict();
 
@@ -4895,7 +4933,9 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       tunables: [
         'LLM_DOC_USD_CEILING', 'LLM_DAILY_USD_CEILING', 'OPENROUTER_DAILY_USD_CEILING', 'OPENROUTER_MIN_BALANCE_USD', 'LLAMAPARSE_DAILY_CREDIT_CEILING', 'LLAMAPARSE_DAILY_CREDITS_CEILING', 'LLAMAPARSE_DAILY_USD_CEILING',
         'APP_BASE_URL', 'PRICE_PROVIDER', 'FMP_DAILY_CALL_CAP', 'ST_PEER_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE',
-        'SCRAPE_GUARD_ENABLED', 'DISCLOSURE_LATENCY_WATCH_ENABLED', 'DISCLOSURE_LATENCY_PROVIDERS',
+        'SCRAPE_GUARD_ENABLED', 'ORIGIN_LOCK_ENABLED', 'ORIGIN_LOCK_SECRET',
+        'ORIGIN_LOCK_TRUSTED_PROXIES', 'ORIGIN_LOCK_AOP_HEADER', 'ORIGIN_LOCK_AOP_VALUE',
+        'DISCLOSURE_LATENCY_WATCH_ENABLED', 'DISCLOSURE_LATENCY_PROVIDERS',
         'DISCLOSURE_LATENCY_WATCH_LIMIT', 'FMP_DISCLOSURE_WATCH_ENABLED', 'FMP_DISCLOSURE_WATCH_LIMIT',
         'FMP_LATENCY_PROBE_ENABLED', 'FMP_LATENCY_PATHS', 'FMP_STABLE_BASE_URL',
         'FMP_RAPIDAPI_BASE_URL', 'FMP_RAPIDAPI_HOST', 'FMP_LATENCY_DAILY_CAP',
@@ -6524,6 +6564,28 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     let filerReassigned = 0;
     let typesFixed = 0;
     const filersEnsured = new Set<string>();
+    const candidates: ExistingFilerCandidate[] = (
+      await all<{
+        bioguide_id: string;
+        full_name: string | null;
+        display_name: string | null;
+        chamber: string | null;
+        state: string | null;
+        resolved_bioguide_id: string | null;
+      }>(
+        c.env.DB,
+        `SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id
+           FROM filers
+          WHERE merged_into IS NULL`,
+      )
+    ).map((f) => ({
+      filerId: f.bioguide_id,
+      fullName: f.full_name,
+      displayName: f.display_name,
+      chamber: f.chamber,
+      state: f.state,
+      resolvedBioguideId: f.resolved_bioguide_id,
+    }));
 
     for (const row of rows) {
       let assetName = row.asset_name;
@@ -6555,29 +6617,35 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           if (correct !== filerId) {
             if (correct) {
               filerId = correct;
+              filerReassigned += 1;
+              changed = true;
             } else {
-              // Demote to MANUAL-{LAST} (House/other) — never keep wrong EXEC slot.
-              const last = payloadName
-                .replace(/,/g, ' ')
-                .trim()
-                .split(/\s+/)
-                .filter(Boolean)
-                .pop()
-                ?.toUpperCase()
-                .replace(/[^A-Z]/g, '') || 'UNKNOWN';
-              filerId = `MANUAL-${last}`;
-              if (!filersEnsured.has(filerId)) {
-                await run(
-                  c.env.DB,
-                  `INSERT OR IGNORE INTO filers (bioguide_id, full_name, chamber)
-                   VALUES (?, ?, 'house')`,
-                  [filerId, payloadName],
-                );
-                filersEnsured.add(filerId);
+              // Prefer an existing roster filer. Never mint MANUAL-<LAST>.
+              const parsed = parseCompetitorReporter(row.raw_text);
+              const assignment = assignCompetitorFilerId({
+                rawName: payloadName,
+                names: competitorReporterNames(row.raw_text),
+                chamber: parsed.chamber,
+                state: parsed.state,
+                district: parsed.district,
+                bioguideId: parsed.bioguideId,
+                candidates,
+              });
+              if (assignment && assignment.filerId !== row.filer_id) {
+                filerId = assignment.filerId;
+                if (assignment.minted && !filersEnsured.has(filerId)) {
+                  await run(
+                    c.env.DB,
+                    `INSERT OR IGNORE INTO filers (bioguide_id, full_name, chamber)
+                     VALUES (?, ?, ?)`,
+                    [filerId, payloadName, parsed.chamber],
+                  );
+                  filersEnsured.add(filerId);
+                }
+                filerReassigned += 1;
+                changed = true;
               }
             }
-            filerReassigned += 1;
-            changed = true;
           }
         }
       }
@@ -7099,6 +7167,29 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     return c.json({ ok: true, dryRun: !apply, ...result });
   });
 
+  // --- POST /review-queue/backfill-ingest-failures -------------------------
+  // One-time (or periodic) mirror of genuine ingest_status='error' filings
+  // onto open review_queue rows for Publisher drain.  Default dry-run.
+  // Body (all optional): { apply?: boolean, dryRun?: boolean, chamber?: string, limit?: number }
+  // Do not run against production from an agent unless the operator asked.
+  r.post('/review-queue/backfill-ingest-failures', async (c) => {
+    let json: unknown = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) json = JSON.parse(raw) as unknown;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = IngestFailureBackfillBodySchema.safeParse(json);
+    if (!parsed.success) return c.json({ error: 'invalid payload' }, 400);
+    const apply = parsed.data.apply === true && parsed.data.dryRun !== true;
+    const result = await backfillIngestFailureReviewQueue(c.env, {
+      chamber: parsed.data.chamber,
+      limit: parsed.data.limit,
+      dryRun: !apply,
+    });
+    return c.json({ ok: true, ...result });
+  });
 
   // --- POST /sweep-already-published --------------------------------------
   // On-demand trigger for sweepAlreadyPublishedReviewRows. The hourly

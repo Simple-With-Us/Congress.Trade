@@ -173,6 +173,16 @@ describe('stPeerPricesHealth', () => {
     expect(metrics.detail).not.toContain('neverh');
   });
 
+  it('does not stall when every pending ticker is never-priced and drain has not started', async () => {
+    vi.mocked(get).mockResolvedValueOnce({ n: 2, never_n: 2, oldest_at: null });
+    vi.mocked(get).mockResolvedValueOnce({ d: null });
+
+    const metrics = await collectStPeerPricesMetrics(env, now, 6);
+    expect(metrics.stalled).toBe(false);
+    expect(metrics.detail).toContain('never-priced');
+    expect(metrics.detail).not.toContain('drain progress never');
+  });
+
   it('does not stall on old pending rows when KV shows recent drain progress (CT-2469)', async () => {
     const kv = envWithKv(new Map([
       [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-23T14:30:00.000Z'],
