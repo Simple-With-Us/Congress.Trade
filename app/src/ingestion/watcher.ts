@@ -58,7 +58,7 @@ import {
   type SenateEdgeBackoffState,
   type SenateHttpError,
 } from './senateEdgeDeny.ts';
-import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
+import { consumeResidentialProxySenateCatchup, refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
@@ -1332,7 +1332,9 @@ export async function runWatcher(
       now,
     );
     result.senateCadence = senateDecision;
-    if (senateDecision.poll) {
+    const proxyCatchup = !senateDecision.poll && await consumeResidentialProxySenateCatchup(env);
+    const senatePollDue = senateDecision.poll || proxyCatchup;
+    if (senatePollDue) {
       senateEdgeBackoff = await readSenateEdgeBackoff(env);
       if (senateEdgeBackoff && lastSenate && Date.parse(senateEdgeBackoff.lastDeniedAt) <= lastSenate.getTime()) {
         senateEdgeBackoff = null;
@@ -1345,8 +1347,8 @@ export async function runWatcher(
         // instead of the 600 s failure skip.  polling_senate stays stalled
         // and names the backoff meanwhile.
         result.senateEdgeBackoffUntil = senateEdgeBackoff.until;
-      } else if (lastAttemptFailed && elapsedSec < 600) {
-        // Skip this poll tick to respect failure backoff
+      } else if (lastAttemptFailed && elapsedSec < 600 && !proxyCatchup) {
+        // Skip this poll tick to respect failure backoff (proxy recovery catch-up bypasses)
       } else {
         await setLastAttemptAt(env, 'senate', now);
         await pollSenate(env, now, watcherSourceIoSignal(options.signal));
