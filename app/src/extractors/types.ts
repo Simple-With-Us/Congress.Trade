@@ -741,7 +741,7 @@ function emptyOgeTextResult(): ExtractorResult {
  */
 export function buildExtractorPipeline(env: Env): Extractor[] {
   const senateHtml = new SenateHtmlExtractor(env);
-  const textPdf = new TextPdfExtractor();
+  const textPdf = new TextPdfExtractor(env);
   const ogeText = new OgeTextExtractor();
 
   const geminiVision = new VisionLlmExtractor(env);

@@ -19,9 +19,14 @@
 // CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
-import type { Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
+import type { Env, Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { HOUSE_ASSET_TYPE_NAMES, houseAssetTypeCodePattern } from '../shared/assetTypes.ts';
 import { parseAmountRange } from './amounts.ts';
+import {
+  arbitrateHousePtrParsers,
+  loadHousePtrSecuritiesRefIndex,
+  type HousePtrNameIndex,
+} from './housePtrParserArbitration.ts';
 import { detectOption } from './senateHtml.ts';
 import { ptrColumnTailRe, ptrTailRe } from './ptrTails.ts';
 
@@ -33,6 +38,8 @@ const MISSING_FIELD_PENALTY = 0.12;
 export class TextPdfExtractor implements Extractor {
   readonly name = 'textPdf';
 
+  constructor(private readonly env?: Env) {}
+
   canHandle(f: Filing): boolean {
     return f.docKind === 'text_pdf';
   }
@@ -43,7 +50,8 @@ export class TextPdfExtractor implements Extractor {
     }
 
     const { text, pageCount } = await extractPdfText(input.bytes);
-    const rows = parseHousePtrText(text);
+    const nameIndex = await this.securitiesRefIndex();
+    const rows = parseHousePtrText(text, nameIndex ? { nameIndex } : undefined);
 
     // Document confidence = mean of row confidences (or low if nothing found).
     const docConfidence =
@@ -63,6 +71,16 @@ export class TextPdfExtractor implements Extractor {
       pageCount,
     };
     return result;
+  }
+
+  private async securitiesRefIndex(): Promise<HousePtrNameIndex | undefined> {
+    if (!this.env?.DB) return undefined;
+    try {
+      return await loadHousePtrSecuritiesRefIndex(this.env);
+    } catch (err) {
+      console.warn('[textPdf] securities_ref name index unavailable:', err);
+      return undefined;
+    }
   }
 }
 
@@ -148,11 +166,17 @@ const INLINE_RECORD_RE = new RegExp(
   'gi',
 );
 
+/** Optional securities_ref names for parser arbitration. */
+export interface HousePtrParseOptions {
+  /** Ticker to simplified company name (`securities_ref.company_name`). */
+  nameIndex?: HousePtrNameIndex;
+}
+
 /**
  * Parse the merged House PTR text into ParsedTx[]. We segment the text into
  * candidate holding blocks, then pull fields from each block.
  */
-export function parseHousePtrText(text: string): ParsedTx[] {
+export function parseHousePtrText(text: string, options?: HousePtrParseOptions): ParsedTx[] {
   const cleaned = cleanPdfText(text);
   // Electronic PTRs often omit SP/DC/JT on every row after the first. The
   // owner-required INLINE_RECORD_RE then glues those later rows into one
@@ -160,17 +184,13 @@ export function parseHousePtrText(text: string): ParsedTx[] {
   // `[TYPE] P/S/E date date $amount` tail first.
   const tailRows = parseTailRecords(cleaned);
   const columnRows = parseColumnTailRecords(cleaned);
-  const completeCount = (rows: ParsedTx[]) =>
-    rows.filter((row) =>
-      Boolean(row.assetName && row.assetName !== '(unknown)' && row.txDate && row.txType && row.amountMin != null)
-    ).length;
-  // Prefer the `[TYPE] P/S/E date` tail when it already has a complete lineup.
-  // Use the column-order parser only when it recovers more complete rows
-  // (EO.Pdf wraps `[ST]` onto the next line after Type/Date/Amount).
-  if (tailRows.length > 0 && completeCount(tailRows) >= completeCount(columnRows)) {
-    return tailRows;
+  // Both parsers read the same text. Count is not a vote: a page-split row
+  // can make the column parser longer while it shifts Subholding Of and the
+  // next ticker (H-2026-20035788). Scoring and the hold live next to the
+  // parsers so a column-parser fix does not have to re-decide the winner.
+  if (tailRows.length > 0 || columnRows.length > 0) {
+    return arbitrateHousePtrParsers(tailRows, columnRows, options?.nameIndex).rows;
   }
-  if (columnRows.length > 0) return columnRows;
 
   if (HOUSE_TABLE_HEADER_RE.test(cleaned)) {
     const inlineRows = parseInlineRecords(cleaned);
@@ -191,6 +211,20 @@ export function parseHousePtrText(text: string): ParsedTx[] {
     if (tx) rows.push(tx);
   }
   return rows;
+}
+
+/**
+ * True when both House PTR parsers produced rows and they disagree on content.
+ * A filing that disagrees is held. A filing they agree on, or that only one
+ * parser could read, keeps the parser confidence.
+ */
+export function housePtrParsersDisagree(text: string, options?: HousePtrParseOptions): boolean {
+  const cleaned = cleanPdfText(text);
+  return arbitrateHousePtrParsers(
+    parseTailRecords(cleaned),
+    parseColumnTailRecords(cleaned),
+    options?.nameIndex,
+  ).contested;
 }
 
 function cleanPdfText(text: string): string {
