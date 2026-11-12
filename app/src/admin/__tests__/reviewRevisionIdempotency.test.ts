@@ -84,6 +84,20 @@ function auditRows(db: Awaited<ReturnType<typeof openMigratedD1>>['db'], docId: 
 }
 
 describe('review_revision idempotency (CT-2510)', () => {
+  it('deprecated-only identical republication records a single audit row', async () => {
+    const { db, d1, revision } = await seededPendingRepublish(5);
+    const res = await app.request(`/review/${DOC}`, {
+      method: 'POST',
+      headers: AUTH,
+      body: JSON.stringify({ decision: 'manual', reviewRevision: 5, edits: EDITS }),
+    }, env(d1));
+    expect(res.status).toBe(200);
+    expect(revision()).toBe(5);
+    const audits = auditRows(db, DOC);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]?.trigger).toBe('admin_manual_identical_noop');
+  });
+
   it('repeated identical admin_manual publish is a no-op and does not bump review_revision', async () => {
     const { db, d1, revision } = await seededPendingRepublish(3);
     const first = await app.request(`/review/${DOC}`, {

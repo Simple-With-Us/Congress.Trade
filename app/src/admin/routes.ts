@@ -3915,14 +3915,6 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
 
     if (identicalRepublish.identical) {
       const liveActive = prior.some((row) => !row.deprecated_at);
-      await recordReviewRevisionAudit(c.env.DB, {
-        docId,
-        revision: reviewRevision,
-        trigger: identicalTrigger,
-        contentHash: identicalRepublish.contentHash,
-        detail: { decision, liveActive },
-        createdAt: nowIso,
-      });
       if (liveActive) {
         const noopResults = await batch(c.env.DB, [
           [
@@ -3947,6 +3939,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         if ((noopResults[0]?.meta?.changes ?? 0) === 0) {
           return c.json({ error: 'review item changed; reload it before deciding' }, 409);
         }
+        await recordReviewRevisionAudit(c.env.DB, {
+          docId,
+          revision: reviewRevision,
+          trigger: identicalTrigger,
+          contentHash: identicalRepublish.contentHash,
+          detail: { decision, liveActive: true },
+          createdAt: nowIso,
+        });
         return c.json({
           docId,
           decision,

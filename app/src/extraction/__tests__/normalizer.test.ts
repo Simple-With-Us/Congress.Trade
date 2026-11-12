@@ -37,6 +37,7 @@ interface Captured {
   batches: string[][];
   batchParams: unknown[][][];
   auditRows: unknown[][];
+  revisionAuditRows: unknown[][];
   masterReads: number;
   deprecated: unknown[][];
 }
@@ -53,6 +54,7 @@ function makeEnv(
     };
     refuseClose?: boolean;
     liveTxMatch?: boolean;
+    livePipelineRows?: Array<Record<string, unknown>>;
   } = {},
 ) {
   const cap: Captured = {
@@ -64,6 +66,7 @@ function makeEnv(
     batches: [],
     batchParams: [],
     auditRows: [],
+    revisionAuditRows: [],
     masterReads: 0,
     deprecated: [],
   };
@@ -83,6 +86,22 @@ function makeEnv(
         if (/FROM securities_master/i.test(sql)) {
           cap.masterReads += 1;
           return { results: securities as unknown as T[] };
+        }
+        if (
+          opts.livePipelineRows
+          && /FROM transactions/i.test(sql)
+          && /deprecated_at IS NULL/i.test(sql)
+        ) {
+          if (/tx_date, owner, asset_name/i.test(sql)) {
+            return { results: opts.livePipelineRows as unknown as T[] };
+          }
+          if (/SELECT id FROM transactions/i.test(sql)) {
+            return {
+              results: opts.livePipelineRows.map((row, index) => ({
+                id: String(row.id ?? `live-${index}`),
+              })) as unknown as T[],
+            };
+          }
         }
         return { results: [] as T[] };
       },
@@ -126,6 +145,7 @@ function makeEnv(
           cap.reviewSql.push(sql);
         }
         else if (/INSERT(?: OR IGNORE)? INTO ingestion_decisions/i.test(sql)) cap.auditRows.push(this._params);
+        else if (/INSERT INTO review_revision_audit/i.test(sql)) cap.revisionAuditRows.push(this._params);
         else if (/UPDATE filings/i.test(sql)) cap.filingUpdates.push(this._params);
         else if (/SET deprecated_at/i.test(sql)) cap.deprecated.push(this._params);
         return { success: true, meta: { changes } } as unknown;
@@ -865,6 +885,39 @@ describe('normalize', () => {
     expect(sql).not.toMatch(/SET resolved = 1/i);
     expect(cap.auditRows.some((row) => row[2] === 'oge_text_unreadable' && row[3] === 'oge_text_unreadable')).toBe(true);
     expect(cap.auditRows.some((row) => row[2] === 'rejected')).toBe(false);
+  });
+
+  it('identical pipeline replay resolves open review without bumping review_revision (CT-2510)', async () => {
+    const livePipelineRows = [{
+      tx_date: '2024-06-14',
+      owner: 'self',
+      asset_name: 'Apple Inc.',
+      ticker: 'AAPL',
+      tx_type: 'B',
+      amount_min: 1001,
+      amount_max: 15000,
+      is_option: 0,
+      cap_gains_over_200: 0,
+      filing_status: null,
+      subholding: null,
+      location: null,
+      description: null,
+      supplemental_text: null,
+    }];
+    const { env, cap } = makeEnv(
+      [{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }],
+      {
+        resolvedReview: { resolved: 0, review_revision: 4, agreement_suppressed_at: null },
+        livePipelineRows,
+      },
+    );
+    const result = await normalize(env, filing(), [tx()]);
+    expect(result.published).toBe(true);
+    const reviewBumpSql = cap.batches.flat().find((sql) => /UPDATE review_queue/i.test(sql) && /review_revision/i.test(sql));
+    expect(reviewBumpSql).toBeDefined();
+    expect(reviewBumpSql).toMatch(/review_revision = review_revision(?!\s*\+ 1)/);
+    expect(cap.batches.flat().some((sql) => /SET resolved = 1/i.test(sql))).toBe(true);
+    expect(cap.revisionAuditRows.some((row) => row[3] === 'pipeline_publish_identical_noop')).toBe(true);
   });
 
   it('closes a refused executive extract only against the captured review revision', async () => {
