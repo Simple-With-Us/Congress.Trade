@@ -58,7 +58,11 @@ import {
   readSenateEfdTransport,
   senateBrowserFallbackRoute,
   SENATE_SESSION_KV_KEY,
+  SENATE_PROXY_EGRESS_BACKOFF_MS,
+  SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+  proxyRetryFitsSourceBudget,
 } from '../senateSource.ts';
+import { watcherSourceIoSignal } from '../watcherSourceIo.ts';
 import {
   SenateHttpError,
   SenateProxyEgressError,
@@ -759,6 +763,24 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       ]);
     });
 
+    it('retries the residential proxy leg before falling back to direct (CT-2498)', async () => {
+      const calls: Call[] = [];
+      let proxyAttempts = 0;
+      const fetchImpl = efd(calls, (c) => {
+        if (c.egress === 'proxy') {
+          proxyAttempts += 1;
+          if (proxyAttempts === 1) return connectRefused();
+        }
+        return undefined;
+      });
+
+      const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY }, fetchImpl);
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(proxyAttempts).toBeGreaterThanOrEqual(2);
+      expect(calls.every((c) => c.egress === 'proxy')).toBe(true);
+    });
+
     it('falls back to direct when the proxy leg fails at the network level', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const calls: Call[] = [];
@@ -767,9 +789,8 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY }, fetchImpl);
 
       expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
-      expect(calls[0].egress).toBe('proxy');
-      expect(calls.slice(1).length).toBeGreaterThan(0);
-      expect(calls.slice(1).every((c) => c.egress === 'direct')).toBe(true);
+      expect(calls.filter((c) => c.egress === 'proxy').length).toBe(SENATE_PROXY_EGRESS_BACKOFF_MS.length);
+      expect(calls.filter((c) => c.egress === 'direct').length).toBeGreaterThan(0);
       expect(warn.mock.calls.some(([msg]) => /proxy unreachable; the direct fallback reached eFD/.test(String(msg)))).toBe(true);
     });
 
@@ -822,6 +843,47 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       });
     }
 
+    it('skips later proxy retries when the pollSenate source budget cannot fit them', () => {
+      expect(
+        proxyRetryFitsSourceBudget(
+          4_000,
+          SENATE_PROXY_EGRESS_BACKOFF_MS[1] ?? 0,
+          SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+        ),
+      ).toBe(false);
+      expect(
+        proxyRetryFitsSourceBudget(
+          7_000,
+          0,
+          SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+        ),
+      ).toBe(true);
+    });
+
+    it('falls back to direct under the pollSenate 7s source budget when the proxy black-holes', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: Call[] = [];
+      const direct = efd(calls, () => undefined);
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        if (!(init as { client?: unknown } | undefined)?.client) return direct(input, init);
+        recordCall(calls, input, init);
+        return hangUntilAborted(init?.signal);
+      }) as typeof fetch;
+
+      const out = await fetchSenatePtrFilings(
+        { ...searchWindow, proxyUrl: PROXY, signal: watcherSourceIoSignal() },
+        fetchImpl,
+      );
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.some((c) => c.egress === 'direct')).toBe(true);
+      expect(calls.filter((c) => c.egress === 'proxy').length).toBeLessThan(
+        SENATE_PROXY_EGRESS_BACKOFF_MS.length * 3,
+      );
+      expect(warn.mock.calls.some(([msg]) =>
+        /proxy unreachable; the direct fallback reached eFD/.test(String(msg)))).toBe(true);
+    }, 20_000);
+
     it('falls back to direct when a hung proxy gives no answer before its first-answer deadline', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const calls: Call[] = [];
@@ -840,7 +902,12 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       );
 
       expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
-      expect(calls.map((c) => c.egress)).toEqual(['proxy', 'direct', 'direct', 'direct']);
+      expect(calls.map((c) => c.egress)).toEqual([
+        ...Array.from({ length: SENATE_PROXY_EGRESS_BACKOFF_MS.length }, () => 'proxy'),
+        'direct',
+        'direct',
+        'direct',
+      ]);
       expect(warn.mock.calls.some(([msg, detail]) =>
         /proxy unreachable; the direct fallback reached eFD/.test(String(msg))
         && /senate proxy gave no HTTP answer within 20ms/.test(String(detail)))).toBe(true);
@@ -866,9 +933,12 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       );
 
       expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
-      expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
+      const proxyPairs = Array.from({ length: SENATE_PROXY_EGRESS_BACKOFF_MS.length }, () => [
         'proxy GET /search/',
         'proxy POST /search/home/',
+      ]).flat();
+      expect(calls.map((c) => `${c.egress} ${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        ...proxyPairs,
         'direct GET /search/',
         'direct POST /search/home/',
         'direct POST /search/report/data/',
@@ -894,7 +964,12 @@ describe('Senate eFD edge deny (CT-2442)', () => {
       const out = await fetchSenatePtrFilings({ ...searchWindow, proxyUrl: PROXY, proxyFirstAnswerTimeoutMs: 20 }, fetchImpl);
 
       expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
-      expect(calls.map((c) => c.egress)).toEqual(['proxy', 'proxy', 'proxy', 'direct', 'direct', 'direct']);
+      expect(calls.map((c) => c.egress)).toEqual([
+        ...Array.from({ length: SENATE_PROXY_EGRESS_BACKOFF_MS.length * 3 }, () => 'proxy'),
+        'direct',
+        'direct',
+        'direct',
+      ]);
     });
 
     it('keeps a proxy whose every answer beats the deadline, however long the whole leg takes', async () => {

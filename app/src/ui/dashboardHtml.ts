@@ -547,7 +547,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <!-- Disclosure timeliness -->
     <details class="section trends-fold" open>
       <summary class="tf-h">Disclosure Timeliness<span class="fold-cue" aria-hidden="true"></span></summary>
-      <p class="sub">Days from trade to filing.&nbsp; The STOCK Act sets a 45-day deadline; this is a data-quality + accountability lens.</p>
+      <p class="sub">Days from the trade to the filing.&#160; The STOCK Act sets a 45-day deadline.</p>
       <div class="grid-cards" id="trLagKpis"></div>
       <div class="trend-grid2 timeliness-grid">
         <div class="timeliness-panel">
@@ -556,7 +556,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
           <div id="trLagDist" class="lag-dist"></div>
         </div>
         <div class="timeliness-panel">
-          <h3 title="Filers with the highest average trade-to-filing delay in the selected time window.">Slowest Filers (Average Lag)</h3>
+          <h3 title="People with the longest average wait between the trade and the filing.">Slowest to File</h3>
           <div class="late-filers-wrap"><table>
             <thead><tr><th scope="col">Politician</th><th scope="col">Avg</th><th scope="col">Max</th><th scope="col">Late</th></tr></thead>
             <tbody id="trLateFilers"></tbody>
@@ -568,7 +568,7 @@ export const DASHBOARD_HTML = /* html */ `<!DOCTYPE html>
     <!-- Committee conflicts (journalistic accountability lens) -->
     <details class="section trends-fold" open>
       <summary class="tf-h">Committee Sector Conflicts<span class="fold-cue" aria-hidden="true"></span></summary>
-      <p class="sub">Disclosed trades in sectors that a politician&rsquo;s committees oversee (curated committee→sector map).&nbsp; Observational — not evidence of impropriety.&nbsp; Hover a committee cell for the full list; click a row for the politician.</p>
+      <p class="sub">Trades in sectors a politician&rsquo;s committees oversee.&#160; This is a comparison, not proof of anything improper.&#160; Hover a committee cell for the full list; click a row for the politician.</p>
       <div class="table-wrap"><table class="conflicts-table" id="tableTrConflicts">
         <colgroup><col class="c-pol"><col class="c-com"><col class="c-sec"><col class="c-ast"><col class="c-side"><col class="c-est"></colgroup>
         <thead><tr><th scope="col">Politician</th><th scope="col">Committee</th><th scope="col">Sector</th><th scope="col">Asset</th><th scope="col">Side</th><th scope="col" class="est">Est. $</th></tr></thead>
@@ -583,14 +583,14 @@ ${speedProofSectionHtml('trends')}
   <section class="view" id="view-people" role="tabpanel" aria-labelledby="tab-people" aria-hidden="true">
     <div class="section">
       <h3>Directory</h3>
-      <p class="sub" id="dirSub">Look up members of Congress and executive filers.&nbsp; Search by name, state (full or abbrev), or party.&nbsp; Click a column heading to sort; click a name for their profile and trades.&nbsp; Trade counts cover the full record, not the timeframe set on Trades or Trends.</p>
+      <p class="sub" id="dirSub">Look up members of Congress and executive branch officials.&#160; Search by name, state, or party.&#160; Click a column heading to sort; click a name for their profile and trades.&#160; Trade counts cover the full record, not the timeframe set on Trades or Trends.</p>
       <div class="seg dir-mode-seg" id="dirMode" role="group" aria-label="Directory mode">
         <button type="button" data-mode="people" class="on" onclick="setDirectoryMode('people')">People</button>
         <button type="button" data-mode="assets" onclick="setDirectoryMode('assets')">Assets</button>
       </div>
       <div class="toolbar" style="margin-bottom:12px">
         <input id="peopleQ" placeholder="Search name, state, party… any order" aria-label="Search directory" style="min-width:0;flex:1" oninput="filterDirectory()" />
-        <select id="peopleChamber" onchange="filterPeopleDirectory()" aria-label="Chamber filter">
+        <select id="peopleChamber" onchange="filterPeopleDirectory()" aria-label="Branch filter">
           <option value="">All Branches</option>
           <option value="house">House</option>
           <option value="senate">Senate</option>
@@ -658,7 +658,7 @@ ${speedProofSectionHtml('trends')}
       <div style="margin-top:12px;">
         <a href="${APP_STORE_URL}" class="btn sm" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;">
           <svg viewBox="0 0 170 170" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.83.13-9.67-1.92-14.52-6.13-3.23-2.75-7.14-7.46-11.75-14.13-6.53-9.47-11.73-20.08-15.58-31.8-3.86-11.73-5.79-22.9-5.79-33.52 0-14.88 3.75-27.18 11.24-36.9 7.49-9.72 17.06-14.65 28.71-14.78 4.71 0 10.08 1.18 16.12 3.54 6.03 2.36 10.08 3.54 12.14 3.54 1.83 0 5.92-1.22 12.27-3.66 6.35-2.44 11.48-3.58 15.39-3.42 12.37.52 22.25 4.88 29.62 13.08-11.05 6.67-16.48 15.77-16.3 27.31.18 9.07 3.57 16.65 10.17 22.75 6.6 6.1 14.58 9.54 23.94 10.32-2.12 6.53-4.9 13.11-8.35 19.74zM119.22 31.78c0-7.07 2.53-13.67 7.59-19.8 5.06-6.13 11.46-9.75 19.2-10.86.36 1.44.54 2.76.54 3.96 0 7.07-2.61 13.79-7.83 20.16-5.22 6.37-11.66 9.87-19.32 10.51-.12-1.32-.18-2.65-.18-3.97z"/></svg>
-          Get iOS app
+          Get iOS App
         </a>
       </div>
     </div>
@@ -667,8 +667,8 @@ ${speedProofSectionHtml('trends')}
          requires a signed-in Premium account. -->
     <div class="section" id="subsMarketing">
       <h3>Alerts</h3>
-      <p class="sub">We ingest official House, Senate, and Executive Branch trades.&nbsp; Relaying a 3rd-party competitor API would ruin our minutes-to-hours edge that Congress.Trade was made for.</p>
-      <p class="sub" style="margin-top: 8px;">Premium pushes a filing to you the moment we ingest it &mdash; two methods, both included:</p>
+      <p class="sub">We read official House, Senate, and Executive Branch filings directly, so new trades reach you within minutes to hours.</p>
+      <p class="sub" style="margin-top: 8px;">Premium sends each new trade to you as soon as we have it.&#160; Two methods, both included:</p>
       <div class="speed-mini" id="alertsSpeedMini"></div>
       <div class="delivery-grid">
         <div class="delivery-card">
@@ -686,7 +686,7 @@ ${speedProofSectionHtml('trends')}
       <h3>Delivery</h3>
       <p class="sub" id="subsManageSub">Create signed webhook or SSE deliveries for your account.&nbsp; Secrets are shown once at creation; webhook consumers dedupe on <code>X-Subscription-Id</code> + <code>X-Tx-Id</code>.&nbsp; Pause stops events without removing the delivery; Delete removes it permanently.&nbsp; Edit filters anytime (Premium).</p>
       <div id="subsGate" class="note" role="status" aria-live="polite" style="margin:12px 0;padding:12px;border:1px solid var(--border, #ddd);border-radius:8px">
-        Sign in to manage Delivery. Creating a delivery also requires Premium.
+        Sign in to manage Delivery.&#160; Creating a delivery also requires Premium.
       </div>
       <table id="subsTable">
         <thead><tr><th>Channel</th><th>Target</th><th>Filters</th><th>Progress</th><th>Status</th><th>Actions</th></tr></thead>
@@ -697,14 +697,14 @@ ${speedProofSectionHtml('trends')}
       <div class="row-flex" id="subsCreateRow" style="margin-top:14px;flex-wrap:wrap">
         <label class="field-vh-label" for="newDelivery">Channel</label>
         <select id="newDelivery" disabled onchange="updateNewTargetVisibility()">
-          <option value="sse">SSE</option><option value="webhook">webhook</option>
+          <option value="sse">Live Stream</option><option value="webhook">Webhook</option>
         </select>
         <label class="field-vh-label" for="newTarget">Target URL</label>
         <input id="newTarget" type="url" inputmode="url" autocomplete="url" aria-describedby="subsMsg" placeholder="target URL (webhook only)" style="flex:1 1 100%;min-width:0" disabled />
         <label class="field-vh-label" for="newTickers">Tickers</label>
-        <input id="newTickers" placeholder="tickers (CSV, optional)" style="flex:1 1 100%;min-width:0" disabled />
+        <input id="newTickers" placeholder="Tickers, separated by commas (optional)" style="flex:1 1 100%;min-width:0" disabled />
         <label class="field-vh-label" for="newMembers">Members</label>
-        <input id="newMembers" placeholder="members (names/ids, optional)" style="flex:1 1 100%;min-width:0" disabled title="Comma-separated member names or filer ids.  A name must match exactly one member." />
+        <input id="newMembers" placeholder="Politicians (optional)" style="flex:1 1 100%;min-width:0" disabled title="Comma-separated names. A name must match exactly one person." />
         <label class="field-vh-label" for="newChambers">Branches</label>
         <select id="newChambers" disabled>
           <option value="">House + Senate + Executive</option>
@@ -714,7 +714,7 @@ ${speedProofSectionHtml('trends')}
           <option value="executive">Executive</option>
         </select>
         <label class="field-vh-label" for="newSides">Trade side</label>
-        <select id="newSides" disabled title="Trade side filter (B buy / S sell / E exchange)">
+        <select id="newSides" disabled title="Limit alerts to buys, sells, or exchanges">
           <option value="">Buys + Sells + Exchanges</option>
           <option value="B">Buys</option>
           <option value="S">Sells</option>
@@ -723,7 +723,7 @@ ${speedProofSectionHtml('trends')}
         </select>
         <label class="minamt-label" style="display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="newIncludeBackfill" disabled />
-          Include historical backfill (older than 7 days)
+          Include trades older than 7 days
         </label>
         <label class="minamt-label" style="display:flex;align-items:center;gap:6px">Minimum Trade Size:
           <select id="newMinAmt" disabled title="Minimum amount bracket floor">
@@ -741,7 +741,7 @@ ${speedProofSectionHtml('trends')}
           </select>
         </label>
         <button class="btn sm" id="subsCreateBtn" onclick="createSubscription()" disabled>Add New Delivery</button>
-        <button class="btn ghost sm" id="subsEditCancel" type="button" hidden onclick="clearDeliveryForm(); if(el('newDelivery')) el('newDelivery').disabled=false; updateDeliveryGate();">Cancel edit</button>
+        <button class="btn ghost sm" id="subsEditCancel" type="button" hidden onclick="clearDeliveryForm(); if(el('newDelivery')) el('newDelivery').disabled=false; updateDeliveryGate();">Cancel Edit</button>
         <div id="subsMsg" class="note subs-msg" aria-live="polite"></div>
       </div>
       <div class="row-flex" style="margin-top:20px;justify-content:center" data-premium-cue="alerts">

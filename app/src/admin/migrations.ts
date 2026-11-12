@@ -1568,6 +1568,20 @@ END`,
 /** 0110_phantom_filer_aliases.sql — re-point known MANUAL-* phantoms. Idempotent. */
 export const PHANTOM_FILER_ALIAS_STATEMENTS = phantomFilerAliasStatements();
 
+/** 0111_review_revision_audit.sql — per-revision publish trigger audit (CT-2510). */
+export const REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS review_revision_audit (
+     id           TEXT PRIMARY KEY,
+     doc_id       TEXT NOT NULL,
+     revision     INTEGER NOT NULL,
+     trigger      TEXT NOT NULL,
+     content_hash TEXT,
+     detail       TEXT,
+     created_at   TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_review_revision_audit_doc ON review_revision_audit (doc_id, revision DESC, created_at DESC)',
+] as const;
+
 /**
  * 0109_delivery_mode_audit.sql — who switched CT_DELIVERY_MODE (subscriber
  * alert pause) and when; read by the delivery_mode health check and stamped
@@ -1765,6 +1779,8 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
   // 0110_phantom_filer_aliases.sql (CT-1362 / CT-1360)
   ...PHANTOM_FILER_ALIAS_STATEMENTS,
+  // 0111_review_revision_audit.sql (CT-2510)
+  ...REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

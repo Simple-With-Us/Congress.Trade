@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -24,6 +24,15 @@ import { fileURLToPath } from 'node:url';
 
 const PROD_VARS = fileURLToPath(new URL('../../../.prod.vars', import.meta.url));
 
+/**
+ * 2026-11-12: the file was removed from git tracking and gitignored
+ * after provider secret scanning flagged historical blobs.  When the file is
+ * absent from the checkout there is nothing to leak, so the guards below pass
+ * trivially.  If the file ever reappears in the tree, every guard applies in
+ * full again.
+ */
+const PROD_VARS_PRESENT = existsSync(PROD_VARS);
+
 /** Prefixes that identify a live credential regardless of which key holds it. */
 const LIVE_CREDENTIAL_PATTERNS: Array<[label: string, pattern: RegExp]> = [
   ['Stripe live secret key', /^(sk|rk)_live_/],
@@ -42,6 +51,7 @@ const LIVE_CREDENTIAL_PATTERNS: Array<[label: string, pattern: RegExp]> = [
 type Entry = { key: string; value: string; markedSecret: boolean; line: number };
 
 function parseProdVars(): Entry[] {
+  if (!PROD_VARS_PRESENT) return [];
   const raw = readFileSync(PROD_VARS, 'utf8');
   const entries: Entry[] = [];
 
@@ -75,6 +85,10 @@ describe('app/.prod.vars is a template, never a secret store', () => {
   const entries = parseProdVars();
 
   it('parses as a non-trivial env template', () => {
+    if (!PROD_VARS_PRESENT) {
+      expect(entries).toEqual([]);
+      return;
+    }
     expect(entries.length).toBeGreaterThan(50);
   });
 
@@ -100,6 +114,7 @@ describe('app/.prod.vars is a template, never a secret store', () => {
   });
 
   it('keeps the purge notice that explains why the file is empty', () => {
+    if (!PROD_VARS_PRESENT) return;
     const header = readFileSync(PROD_VARS, 'utf8').slice(0, 1200);
     expect(header).toContain('NEVER commit real values');
     expect(header).toContain('2026-08-01-prod-vars-secret-purge.md');
