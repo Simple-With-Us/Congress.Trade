@@ -225,6 +225,11 @@ jobs:
         working-directory: .
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
 
+      # CT-2506 offline retention. Temp dirs only. No host and no Backblaze.
+      - name: Local backup retention tests
+        working-directory: .
+        run: bash scripts/ops/test-local-backup-retention.sh
+
       # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
       # stub `infisical` first on PATH records its arguments, so the real CLI,
       # network and credentials are never reached.
