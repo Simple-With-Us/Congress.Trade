@@ -96,24 +96,27 @@ scope_dir() {
   printf '%s/system.slice/docker-%s.scope' "$CG" "$id"
 }
 
-INSPECT_FMT='{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.State.Pid}}{{"\t"}}{{.State.Status}}'
+INSPECT_FMT='{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.HostConfig.MemoryReservation}}{{"\t"}}{{.HostConfig.MemorySwap}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.State.Pid}}{{"\t"}}{{.State.Status}}'
 
 write_inspect() {
   local short="$1" full="$2" name="$3" image="$4" memory="$5" restarts="$6" pid="$7"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\trunning\n' \
-    "$full" "$name" "$image" "$memory" "$restarts" "$pid" >"${FIX}/inspect/${short}"
+  local reservation="${8:-0}" memory_swap="${9:--1}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\trunning\n' \
+    "$full" "$name" "$image" "$memory" "$reservation" "$memory_swap" "$restarts" "$pid" >"${FIX}/inspect/${short}"
 }
 
 # congress-app: stats 1.5 GiB, cgroup max 3 GiB wins over a conflicting inspect
 # memory value, swap 4.5 GiB, oom history, six RSS rows so only five are shown.
 CONGRESS_SHORT="aaaaaaaaaaaa"
 CONGRESS_FULL="${CONGRESS_SHORT}$(printf '%052d' 0)"
-write_inspect "$CONGRESS_SHORT" "$CONGRESS_FULL" "/congress-app" "congress-app:latest" "999" "3" "101"
+write_inspect "$CONGRESS_SHORT" "$CONGRESS_FULL" "/congress-app" "congress-app:latest" "999" "3" "101" "1073741824" "-1"
 CONGRESS_DIR="$(scope_dir "$CONGRESS_SHORT")"
 mkdir -p "$CONGRESS_DIR"
 printf '4831838208\n' >"${CONGRESS_DIR}/memory.swap.current"
 printf '2147483648\n' >"${CONGRESS_DIR}/memory.current"
 printf '3221225472\n' >"${CONGRESS_DIR}/memory.max"
+printf '1073741824\n' >"${CONGRESS_DIR}/memory.low"
+printf 'max\n' >"${CONGRESS_DIR}/memory.swap.max"
 cat >"${CONGRESS_DIR}/memory.events" <<'EOF'
 low 0
 high 0
@@ -132,15 +135,17 @@ write_status 105 wget 12800
 write_status 106 cron 6400
 write_status 107 idle 0
 
-# scan-cpu-worker: no kernel cap (memory.max = max, inspect memory 0). The
-# stats line's right-hand side looks like a 16 GiB limit and must be ignored.
+# scan-cpu-worker: cgroup memory.max = max but inspect still carries the 1g cap.
+# The stats line's right-hand side looks like a 16 GiB limit and must be ignored.
 SCAN_ID="bbbbbbbbbbbb"
-write_inspect "$SCAN_ID" "$SCAN_ID" "/congress-scan-cpu-worker" "congress-scan-cpu-worker:latest" "0" "0" "201"
+write_inspect "$SCAN_ID" "$SCAN_ID" "/congress-scan-cpu-worker" "congress-scan-cpu-worker:latest" "1073741824" "0" "201" "402653184" "2147483648"
 SCAN_DIR="$(scope_dir "$SCAN_ID")"
 mkdir -p "$SCAN_DIR"
 printf '0\n' >"${SCAN_DIR}/memory.swap.current"
 printf '209715200\n' >"${SCAN_DIR}/memory.current"
 printf 'max\n' >"${SCAN_DIR}/memory.max"
+printf '402653184\n' >"${SCAN_DIR}/memory.low"
+printf '1073741824\n' >"${SCAN_DIR}/memory.swap.max"
 printf 'oom 0\noom_kill 0\n' >"${SCAN_DIR}/memory.events"
 printf '201\n' >"${SCAN_DIR}/cgroup.procs"
 write_cgroup_ptr 201 "0::/system.slice/docker-${SCAN_ID}.scope"
@@ -257,6 +262,9 @@ assert app["memory_usage_source"] == "docker_stats"
 assert app["memory_current_bytes"] == 2147483648
 assert app["memory_limit_bytes"] == 3221225472
 assert app["memory_limit_source"] == "cgroup_max"
+assert app["memory_reservation_bytes"] == 1073741824
+assert app["memory_reservation_source"] == "cgroup_low"
+assert app["swap_limit_source"] == "none"
 assert app["swap_bytes"] == int(4.5 * 1024 ** 3)
 assert app["oom"] == 2
 assert app["oom_kill"] == 1
@@ -269,8 +277,12 @@ assert all(row["comm"] != "idle" for row in app["top_rss"])
 
 scan = by_name["congress-scan-cpu-worker"]
 assert scan["memory_usage_bytes"] == 200 * 1024 * 1024
-assert scan["memory_limit_bytes"] is None
-assert scan["memory_limit_source"] == "none"
+assert scan["memory_limit_bytes"] == 1073741824
+assert scan["memory_limit_source"] == "inspect"
+assert scan["memory_reservation_bytes"] == 402653184
+assert scan["memory_reservation_source"] == "cgroup_low"
+assert scan["swap_limit_bytes"] == 1073741824
+assert scan["swap_limit_source"] == "cgroup_swap_max"
 assert scan["swap_bytes"] == 0
 assert scan["oom"] == 0 and scan["oom_kill"] == 0
 assert scan["top_rss"][0]["comm"] == "python"
@@ -297,7 +309,7 @@ totals = report["totals"]
 usage_sum = sum(row["memory_usage_bytes"] or 0 for row in report["containers"])
 assert totals["memory_usage_bytes"] == usage_sum
 assert totals["containers"] == 5
-assert totals["unlimited"] == 2
+assert totals["unlimited"] == 1
 assert totals["swap_bytes"] == int(4.5 * 1024 ** 3)
 assert totals["swap_unknown"] == 3  # sqlite (no file), proxy (symlink), mystery
 assert totals["oom"] == 2
@@ -319,7 +331,9 @@ assert "MEM_LIMIT" in human
 assert "none" in human
 assert "n/a" in human
 assert "TOTALS  containers=5" in human
-assert "unlimited=2" in human
+assert "unlimited=1" in human
+assert "MEM_RESERV" in human
+assert "SWAP_LIMIT" in human
 assert "read-only" in human
 assert "deno 200.00 MiB" in human
 assert "cron" not in human.split("congress-app", 1)[1].split("\n", 1)[0]
