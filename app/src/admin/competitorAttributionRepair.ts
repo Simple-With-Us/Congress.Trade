@@ -153,31 +153,31 @@ export async function repairCompetitorAttribution(
   const clusters = new Map<string, RepairCompetitorAttributionCluster>();
   const movedFrom = new Map<string, Map<string, number>>();
 
-  // Live real (non-MANUAL, non-tombstoned) filers: the only valid re-key targets.
-  const candidates: ExistingFilerCandidate[] = rows.some((r) => isMintedCompetitorFilerId(r.filer_id))
-    ? (
-        await all<{
-          bioguide_id: string;
-          full_name: string | null;
-          display_name: string | null;
-          chamber: string | null;
-          state: string | null;
-          resolved_bioguide_id: string | null;
-        }>(
-          env.DB,
-          `SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id
-             FROM filers
-            WHERE merged_into IS NULL AND bioguide_id NOT LIKE 'MANUAL-%'`,
-        )
-      ).map((f) => ({
-        filerId: f.bioguide_id,
-        fullName: f.full_name,
-        displayName: f.display_name,
-        chamber: f.chamber,
-        state: f.state,
-        resolvedBioguideId: f.resolved_bioguide_id,
-      }))
-    : [];
+  // Live real (non-MANUAL, non-tombstoned) filers. Loaded on every run, not
+  // only when a MANUAL-* row is in the batch: the mismatch path below also
+  // resolves EXEC-* and roster ids, and an empty list would mint a duplicate.
+  const candidates: ExistingFilerCandidate[] = (
+    await all<{
+      bioguide_id: string;
+      full_name: string | null;
+      display_name: string | null;
+      chamber: string | null;
+      state: string | null;
+      resolved_bioguide_id: string | null;
+    }>(
+      env.DB,
+      `SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id
+         FROM filers
+        WHERE merged_into IS NULL AND bioguide_id NOT LIKE 'MANUAL-%'`,
+    )
+  ).map((f) => ({
+    filerId: f.bioguide_id,
+    fullName: f.full_name,
+    displayName: f.display_name,
+    chamber: f.chamber,
+    state: f.state,
+    resolvedBioguideId: f.resolved_bioguide_id,
+  }));
 
   for (const row of rows) {
     const parsed = parseCompetitorReporter(row.raw_text);
