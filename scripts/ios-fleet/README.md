@@ -224,7 +224,7 @@ inline the type in `App.swift`.  Do not make a Swift package.  Congress.Trade
 keeps its copy at `clients/ios/CongressTrade/AppUpdatePrompt.swift`.
 
 Numeric Apple IDs live in `apps.json` and
-https://raw.githubusercontent.com/jaywedgeworth22/ai-fleet-coordinator/main/site/ios-versions.json
+https://raw.githubusercontent.com/Simple-With-Us/ai-fleet-coordinator/main/site/ios-versions.json
 — not in the Swift pin.  Live DealDex is `net.dealdex` (appleId 6802474288).
 `online.dealdex` is a stale leftover, not live.  Do not upload `me.grok.dealdex`.
 TestFlight versions are published to that manifest by `publish-ios-versions.sh`
