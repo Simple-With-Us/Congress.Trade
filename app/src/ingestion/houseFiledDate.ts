@@ -92,7 +92,20 @@ export function resolveHouseFiledDate(opts: {
   return null;
 }
 
-const indexCacheByYear = new Map<string, Map<string, string>>();
+/**
+ * The Clerk regenerates the year ZIP about daily, and this process stays up
+ * across that refresh. A hit inside the window avoids a repeat download.
+ * After it, the next lookup fetches again so a filing added to the index is
+ * visible without a process restart.
+ */
+export const HOUSE_INDEX_FILING_DATE_CACHE_TTL_MS = 60 * 60 * 1000;
+
+type HouseIndexYearCache = {
+  loadedAt: number;
+  map: Map<string, string>;
+};
+
+const indexCacheByYear = new Map<string, HouseIndexYearCache>();
 
 export function filingDateFromHouseIndexRows(rows: HouseFiling[], pipelineDocId: string): string | null {
   const row = rows.find((f) => f.pipelineDocId === pipelineDocId);
@@ -104,8 +117,11 @@ export async function loadHouseIndexFilingDateMap(
   year: string,
   opts: { relayUrl?: string; fetchImpl?: typeof fetch; signal?: AbortSignal } = {},
 ): Promise<Map<string, string>> {
+  const now = Date.now();
   const cached = indexCacheByYear.get(year);
-  if (cached) return cached;
+  if (cached && now - cached.loadedAt < HOUSE_INDEX_FILING_DATE_CACHE_TTL_MS) {
+    return cached.map;
+  }
   const index = await fetchHouseIndex(year, opts);
   const map = new Map<string, string>();
   for (const f of index) {
@@ -113,7 +129,7 @@ export async function loadHouseIndexFilingDateMap(
       map.set(f.pipelineDocId, f.filingDate.trim());
     }
   }
-  indexCacheByYear.set(year, map);
+  indexCacheByYear.set(year, { loadedAt: now, map });
   return map;
 }
 
@@ -224,6 +240,13 @@ export async function ensureHouseFiledDateBeforeNormalize(
   const parts = parseHousePipelineDocId(filing.docId);
   if (!parts) {
     return normalizeHouseFilingDateToIso(filing.filedDate);
+  }
+
+  // Existing dates win (resolveHouseFiledDate). Skip the year-ZIP download.
+  const existing = normalizeHouseFilingDateToIso(filing.filedDate);
+  if (existing) {
+    filing.filedDate = existing;
+    return existing;
   }
 
   const indexDate = await lookupHouseIndexFilingDate(filing.docId, {
