@@ -21,6 +21,7 @@ import { resolveProductionSentryEnv } from '../shared/sentryRuntime.ts';
 import { datadogCaptureException, initProductionDatadog } from '../shared/datadog.ts';
 import { resolveProductionDatadogEnv } from '../shared/datadogRuntime.ts';
 import { captureException, flushSentry, initProductionSentry } from '#sentry';
+import { stampTcpPeer } from '../security/originLock.ts';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
@@ -488,10 +489,12 @@ const dummyCtx = {
 // Start HTTP Server
 const portStr = Deno.env.get('PORT');
 const port = portStr ? parseInt(portStr, 10) : 5000;
-Deno.serve({ port }, async (req) => {
+Deno.serve({ port }, async (req, info) => {
   const env = buildEnv();
+  const peer = 'hostname' in info.remoteAddr ? info.remoteAddr.hostname : undefined;
+  const stamped = stampTcpPeer(req, peer);
   try {
-    return await app.fetch(req, env, dummyCtx as any);
+    return await app.fetch(stamped, env, dummyCtx as any);
   } finally {
     // Do not await: a 2s flush must not hold the HTTP response.  The
     // long-lived Deno process keeps the envelope fetch alive.
