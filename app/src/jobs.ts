@@ -20,6 +20,7 @@ import {
   recheckNotCoveredPeerPrices,
 } from './prices/notCovered.ts';
 import { markTerminalPeerPriceTickers } from './prices/terminalListing.ts';
+import { sweepStUnpriceablePeerPriceTickers } from './prices/stPeerPriceable.ts';
 import { notifyAdmin } from './alerts/notify.ts';
 import { shareWithPeer, type PeerShareInput } from './share/outbound.ts';
 import { runFreshnessCheck } from './share/freshness.ts';
@@ -502,6 +503,17 @@ async function sweepTerminalPeerPrices(env: Env, now: Date): Promise<void> {
   }
 }
 
+async function sweepUnpriceablePeerPrices(env: Env, now: Date): Promise<void> {
+  try {
+    const swept = await sweepStUnpriceablePeerPriceTickers(env, now);
+    if (swept.marked > 0) {
+      console.log(`unpriceable peer-price sweep marked ${swept.marked} ticker(s)`);
+    }
+  } catch (err) {
+    console.warn('unpriceable peer-price sweep failed:', (err as Error).message);
+  }
+}
+
 export async function maybeRunPeerPriceCatchUp(
   env: Env,
   now: Date,
@@ -511,6 +523,7 @@ export async function maybeRunPeerPriceCatchUp(
   // dead ticker does not keep the stall clock until the next full refresh.
   // The statement is marked so it does not consume the catch-up's probe.
   await sweepTerminalPeerPrices(env, now);
+  await sweepUnpriceablePeerPrices(env, now);
   const freshThrough = lastTradingDay(now);
   let state: PeerPriceCatchUpState;
   try {
@@ -759,6 +772,7 @@ export async function maybeRunDailyMarketDataJobs(
   let priceRefreshFailed = false;
   let priceRefreshAttemptedAllPending = false;
   await sweepTerminalPeerPrices(env, now);
+  await sweepUnpriceablePeerPrices(env, now);
   const pricePendingBefore = await readPeerPricePending(env, now);
   try {
     const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });

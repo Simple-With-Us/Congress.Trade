@@ -29,6 +29,11 @@ import {
   tickerHasOnlyUnsupportedDisclosureTrades,
 } from './peerInstrumentCoverage.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
+import {
+  classifyStUnpriceableSymbol,
+  markStUnpriceableSymbol,
+  readStPeerPriceableHints,
+} from './stPeerPriceable.ts';
 
 /**
  * Per-run ticker cap. Socratic.Trade serves EOD from its own database — no
@@ -1061,6 +1066,7 @@ export async function runPriceRefresh(
   const fetchConcurrency = Math.max(1, Math.min(16, Math.floor(opts.concurrency ?? 1) || 1));
   type TickerFetchOutcome =
     | { kind: 'noplan'; nowIso: string }
+    | { kind: 'unpriceable'; nowIso: string }
     | { kind: 'throw'; error: unknown }
     | { kind: 'aborted'; nowIso: string }
     | { kind: 'fetched'; plan: TickerEodFetchPlan; nowIso: string; hist: Close[] }
@@ -1080,6 +1086,12 @@ export async function runPriceRefresh(
   };
   async function fetchTicker(ticker: string): Promise<TickerFetchOutcome> {
     const nowIso = new Date().toISOString();
+    const hints = await readStPeerPriceableHints(env, ticker);
+    const unpriceable = classifyStUnpriceableSymbol(hints);
+    if (unpriceable) {
+      if (!dryRun) await markStUnpriceableSymbol(env, ticker, unpriceable, new Date(nowIso));
+      return { kind: 'unpriceable', nowIso };
+    }
     let plan: TickerEodFetchPlan | null;
     try {
       plan = await planTickerEodFetch(env, ticker);
@@ -1176,6 +1188,11 @@ export async function runPriceRefresh(
       result.aborted = true;
       break;
     }
+    if (outcome.kind === 'unpriceable') {
+      processedCount++;
+      notifyGate();
+      continue;
+    }
     let stopWalk = false;
     if (outcome.kind !== 'noplan') {
       const { trades, prevStage, prevReason, latestPriceDate } = outcome.plan;
@@ -1263,6 +1280,16 @@ export async function runPriceRefresh(
       }
       if (!skipTicker && !stopWalk) {
         if (hist.length === 0) {
+          const retryHints = await readStPeerPriceableHints(env, ticker);
+          const retryCause = classifyStUnpriceableSymbol(retryHints);
+          if (retryCause) {
+            if (!dryRun) {
+              await markStUnpriceableSymbol(env, ticker, retryCause, new Date(nowIso));
+            }
+            processedCount++;
+            notifyGate();
+            continue;
+          }
           // Reaching here means the provider returned a CONFIRMED empty result (a 2xx
           // with no rows, or a 404 "unknown symbol") — the price clients THROW on
           // transient/global failures (401/402/403/429/5xx), which are caught above

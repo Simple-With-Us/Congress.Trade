@@ -6,10 +6,10 @@ import type { Env } from '../../shared/types.ts';
 import {
   disclosureExcludesPeerEod,
   disclosureTradeSupportsPeerEod,
-  NOT_COVERED_CAUSE_DISCLOSURE_TYPE,
   readTickerPriceInstrumentHints,
   tickerHasOnlyUnsupportedDisclosureTrades,
 } from '../peerInstrumentCoverage.ts';
+import { ST_UNPRICEABLE_CAUSE_MUTUAL_FUND } from '../stPeerPriceable.ts';
 import {
   lastTradingDay,
   PRICE_UNAVAILABLE_NOT_COVERED,
@@ -176,7 +176,7 @@ describe('confirmed empty ST response on unsupported disclosure', () => {
       .prepare('SELECT price_unavailable, price_unavailable_reason FROM securities_ref WHERE ticker = ?')
       .get('CAMOX') as { price_unavailable: number; price_unavailable_reason: string };
     expect(row.price_unavailable).toBe(PRICE_UNAVAILABLE_NOT_COVERED);
-    expect(row.price_unavailable_reason).toContain(NOT_COVERED_CAUSE_DISCLOSURE_TYPE);
+    expect(row.price_unavailable_reason).toContain(ST_UNPRICEABLE_CAUSE_MUTUAL_FUND);
   });
 
   it('keeps two-stage backoff for listed equities', async () => {

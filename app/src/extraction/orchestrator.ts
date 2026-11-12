@@ -41,6 +41,7 @@ import {
   isLlmDocBudgetHalt,
   LlmDocBudgetExceededError,
 } from '../shared/llmSpend.ts';
+import { ensureHouseFiledDateBeforeNormalize } from '../ingestion/houseFiledDate.ts';
 
 interface FilingRow {
   doc_id: string;
@@ -193,6 +194,17 @@ export async function extractAndNormalize(
   if (!extracted) return; // missing row / raw object: already recorded as error.
 
   await lease?.assertOwned();
+
+  try {
+    await ensureHouseFiledDateBeforeNormalize(env, extracted.filing, {
+      ocrText: extracted.raw,
+      relayUrl: env.HOUSE_RELAY_URL || env.INGEST_RELAY_URL,
+      signal: lease?.signal,
+    });
+  } catch (err) {
+    lease?.signal.throwIfAborted();
+    console.warn('orchestrator: house filed_date resolve failed:', docId, (err as Error).message);
+  }
 
   // CT-2448: before the OGE path parks a 278-T as `oge_text_unreadable`,
   // run the local tesseract pass over the stored PDF.  When both reads agree
