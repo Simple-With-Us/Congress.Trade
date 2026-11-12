@@ -35,7 +35,7 @@ ASC writes are live on App Store Connect (no app binary change).
 
 ## Fleet protocol
 
-Canonical: `/Users/jay/apps/AGENT-SYNC.md` § Two spaces between sentences.
+Canonical: `/Users/jay/apps/AG***-S**C.md` § Two spaces between sentences.
 Copy detail: `/Users/jay/apps/FLEET-UI-COPY.md`.  Coordinator PR mirrors those
 files plus onboarding / `TEMPLATE-AGENTS.md`.
 

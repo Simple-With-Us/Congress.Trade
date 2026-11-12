@@ -110,7 +110,7 @@ function sourceConfigs(env: Env): SourceConfig[] {
   const appClientSecret = env.INFISICAL_CLIENT_SECRET || env.INFISICAL_APP_CLIENT_SECRET;
 
   // Merge order: shared first, then app.  App wins on a name collision, so
-  // fleet-wide keys (AGENT_SYNC_TOKEN, AGENT_SYNC_POST_TOKEN) MUST live only
+  // fleet-wide keys (AG***_S**C_TOKEN, AG***_S**C_POST_TOKEN) MUST live only
   // in shared-at-ct.  Duplicating them on the ST/CT app projects shadows the
   // shared row and makes rotation a three-project chore.
   return [

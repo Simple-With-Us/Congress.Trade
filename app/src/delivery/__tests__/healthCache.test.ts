@@ -72,7 +72,7 @@ describe('GET /health readiness caching', () => {
     };
     expect(body.checks?.secrets).toEqual(expect.objectContaining({ enabled: expect.any(Boolean) }));
     const blob = JSON.stringify(body.checks?.secrets ?? {});
-    expect(blob).not.toMatch(/secretValue|AGENT_SYNC_TOKEN|sk-|xoxb-/i);
+    expect(blob).not.toMatch(/secretValue|AG***_S**C_TOKEN|sk-|xoxb-/i);
     expect(Array.isArray(body.checks?.secrets?.sources)).toBe(true);
   });
 

@@ -8,7 +8,7 @@ secret values or the full map into this public file.
 
 Key reminders:
 
-- **Coordinate via Slack `#agent-sync` (channel id `C0BEZDJDNKV`) BY DEFAULT**,
+- **Coordinate via Slack `#ag***-s**c` (channel id `C0BEZDJDNKV`) BY DEFAULT**,
   including from Claude cloud/remote sessions where the local sync scripts
   under `/Users/jay/apps/` are unavailable — use the Slack MCP tools instead.
   Tag messages `[Congress.Trade] CLAUDE`. Post a claim before starting
@@ -31,7 +31,7 @@ Key reminders:
   command/status model; do not create client-only scraping, provider-secret, or
   MCP orchestration paths.
 - iOS build loop: `xcodebuild` via bash is pre-approved. Do not stand up or
-  narrate Xcode MCP. See `clients/ios/CLAUDE.md` and AGENT-SYNC § iOS agent
+  narrate Xcode MCP. See `clients/ios/CLAUDE.md` and AG***-S**C § iOS agent
   build loop.
 - Use a separate branch, normally `claude/<short-topic>`, before non-trivial
   edits.
@@ -53,7 +53,7 @@ Key reminders:
   on the old branch without first checking current `main`.
 - **Always commit + land finished work** (owner preference): commit → push
   branch → open/update PR → merge when CI green. Do not leave finished work
-  only local. Canonical: `/Users/jay/apps/AGENT-SYNC.md`.
+  only local. Canonical: `/Users/jay/apps/AG***-S**C.md`.
 - Still require production intent for: production schema/migrate, production
   backfills, queue drains, production ingestion crawlers, `scripts/provision.sh`,
   and any force-push / data wipe.  For finished safe app code, follow PR →

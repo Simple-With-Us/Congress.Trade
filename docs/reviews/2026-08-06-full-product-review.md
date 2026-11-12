@@ -1,7 +1,7 @@
 # Full-product review — 2026-08-06 (MONET)
 
 > Seat note: work began under the CLAUDE tag (Slack claim 14:33 CDT); the owner
-> re-designated this seat MONET mid-session ("for agent sync purposes going
+> re-designated this seat MONET mid-session ("for ag*** s**c purposes going
 > forward always"). Same seat, one review; issues #1452–#1460 filed pre-rename
 > say CLAUDE.
 
@@ -81,7 +81,7 @@ once GROK's #1432 iOS polish wave lands, to avoid overlap.
 
 ## Coordination audit
 
-- **Slack #agent-sync**: healthy cadence — GROK claim/closeout discipline is
+- **Slack #ag***-s**c**: healthy cadence — GROK claim/closeout discipline is
   good; a parallel CLAUDE seat is running the same review for Socratic.Trade.
 - **Effort board ↔ Issues mirror**: the sync (scripts/sync-effort-issues.py)
   keys state off the **section** a row sits in, not the row's own
