@@ -35,6 +35,13 @@ import {
   stPeerPricePendingFromSql,
 } from './peerPricePending.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
+import {
+  disclosureExcludesPeerEod,
+  disclosureUnsupportedPendingSql,
+  DISCLOSURE_NOT_COVERED_SWEEP_MAX,
+  notCoveredCauseForDisclosure,
+  readTickerPriceInstrumentHints,
+} from './peerInstrumentCoverage.ts';
 
 /** A pending ticker with no price_checked_at progress for this long is ST-unpriceable (rule b). */
 export const ST_NOT_COVERED_STUCK_HOURS = 72;
@@ -85,6 +92,48 @@ export function stNotCoveredTickersFromSql(): string {
 export interface NotCoveredSweepResult {
   marked: number;
   qualified: number;
+}
+
+export interface DisclosureNotCoveredSweepResult {
+  marked: number;
+  qualified: number;
+}
+
+/**
+ * Mark pending tickers whose disclosure types cannot use ST EOD — no provider
+ * call. Requires a fresh corpus (same gate as the stuck sweep).
+ */
+export async function markDisclosureUnsupportedPeerPrices(
+  env: Env,
+  now = new Date(),
+): Promise<DisclosureNotCoveredSweepResult> {
+  const corpusLatest = await readCorpusLatestPriceDate(env);
+  if (!isCurrentPriceFresh(corpusLatest, lastTradingDay(now))) {
+    return { marked: 0, qualified: 0 };
+  }
+  const params = stPeerPricePendingBindParams(now);
+  const pendingBinds = stPeerPricePendingBindsForSubqueries(params, 1);
+  const rows = await all<{ ticker: string }>(
+    env.DB,
+    `SELECT DISTINCT t.ticker AS ticker
+       ${stPeerPricePendingFromSql()}
+       AND ${disclosureUnsupportedPendingSql()}
+     ORDER BY t.ticker ASC
+     LIMIT ${DISCLOSURE_NOT_COVERED_SWEEP_MAX}`,
+    pendingBinds,
+  );
+  const nowIso = now.toISOString();
+  let marked = 0;
+  for (const { ticker } of rows) {
+    const hints = await readTickerPriceInstrumentHints(env, ticker);
+    if (!hints || !disclosureExcludesPeerEod(hints)) continue;
+    await markTickerPriceUnavailable(env, ticker, notCoveredReason(now, notCoveredCauseForDisclosure(hints)), {
+      checkedAt: nowIso,
+      stage: PRICE_UNAVAILABLE_NOT_COVERED,
+    });
+    marked++;
+  }
+  return { marked, qualified: rows.length };
 }
 
 /**

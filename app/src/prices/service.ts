@@ -23,6 +23,11 @@ import { buildPeerPriceClient, readPeerStaleCloses } from './peer.ts';
 import type { Close } from './compute.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { readCorpusLatestPriceDate } from './peerPricePending.ts';
+import {
+  disclosureExcludesPeerEod,
+  notCoveredCauseForDisclosure,
+  readTickerPriceInstrumentHints,
+} from './peerInstrumentCoverage.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
 
 /**
@@ -566,6 +571,10 @@ export interface PriceRefreshResult {
  * are excluded unconditionally, outside any TTL. Selection reads the maintained,
  * indexed `securities_ref.latest_price_date` instead of scanning the whole
  * price_eod table with a `MAX(date) GROUP BY ticker` subquery.
+ *
+ * Order is oldest `price_checked_at` first (never-checked sorts first), then
+ * oldest trade — so post-rollover backlog does not starve newer common stocks
+ * behind a long FIFO tail (CT-2482).
  */
 export async function selectTickersNeedingPrices(
   env: Env,
@@ -622,7 +631,8 @@ export async function selectTickersNeedingPricesPage(
         AND ${priceNotCoveredExclusionSql('sr')}
       GROUP BY t.ticker
       ${after === null ? '' : 'HAVING MAX(t.cursor_seq) > ?'}
-      ORDER BY MAX(t.cursor_seq) ASC
+      ORDER BY COALESCE(sr.price_checked_at, '1970-01-01T00:00:00.000Z') ASC,
+               MAX(t.cursor_seq) ASC
       LIMIT ?`,
     after === null
       ? [freshThrough, firstUnavailableCutoff, unavailableCutoff, limit]
@@ -1270,9 +1280,20 @@ export async function runPriceRefresh(
           // (not covered by ST) instead of cycling 2 → 2 forever.
           // CT-2466: that same repeat miss on a ticker whose last trade is
           // already far in the past is terminal (`delisted`), not a coverage gap.
+          // CT-2482: confirmed empty on an unsupported disclosure type (mutual
+          // fund, option, …) goes straight to stage 4 instead of a 7-day pending
+          // rebound.
           if (!dryRun) {
             const checked = new Date(nowIso);
-            if (
+            const hints = await readTickerPriceInstrumentHints(env, ticker);
+            if (hints && disclosureExcludesPeerEod(hints)) {
+              await markTickerPriceUnavailable(
+                env,
+                ticker,
+                notCoveredReason(checked, notCoveredCauseForDisclosure(hints)),
+                { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
+              );
+            } else if (
               prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN &&
               latestPriceDate != null &&
               isConfirmedNoLongerTradingDate(latestPriceDate, checked)
