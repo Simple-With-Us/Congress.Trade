@@ -38,11 +38,19 @@ import {
   sweepIngestFailureReviewQueue,
   type IngestFailureBackfillResult,
 } from './ingestFailureReviewQueue.ts';
+import {
+  sweepTerminalFailureReviewQueue,
+  type TerminalFailureSweepResult,
+} from './terminalFailureReview.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
+import {
+  applyHouseFiledDateIfMissing,
+  normalizeHouseFilingDateToIso,
+} from './houseFiledDate.ts';
 import {
   isSenateEdgeBackoffActive,
   readSenateEdgeBackoff,
@@ -420,7 +428,8 @@ export async function sweepFiledDateBackfill(
         signal: controller.signal,
       });
       for (const f of index) {
-        if (f.filingDate) filedDateByDocId.set(f.pipelineDocId, f.filingDate);
+        const iso = normalizeHouseFilingDateToIso(f.filingDate);
+        if (iso) filedDateByDocId.set(f.pipelineDocId, iso);
       }
     } catch (err) {
       console.warn(`autonomySweep: filed-date backfill fetch failed for year ${year}:`, (err as Error).message);
@@ -433,23 +442,11 @@ export async function sweepFiledDateBackfill(
   for (const row of stuck) {
     const filedDate = filedDateByDocId.get(row.doc_id);
     if (!filedDate) continue;
-    const res = await run(
-      env.DB,
-      `UPDATE filings SET filed_date = ? WHERE doc_id = ? AND filed_date IS NULL`,
-      [filedDate, row.doc_id],
-    );
-    if ((res.meta?.changes ?? 0) > 0) {
-      updated += 1;
-      try {
-        await run(
-          env.DB,
-          `UPDATE disclosure_latency_candidates SET filed_date = ? WHERE doc_id = ? AND (filed_date IS NULL OR filed_date = '')`,
-          [filedDate, row.doc_id],
-        );
-      } catch {
-        /* optional table, mirrors watcher.ts's own swallow */
-      }
-    }
+    const applied = await applyHouseFiledDateIfMissing(env, row.doc_id, {
+      iso: filedDate,
+      source: 'index',
+    });
+    if (applied.applied) updated += 1;
   }
   return { updated, yearsFetched: years };
 }
@@ -631,6 +628,8 @@ export interface AutonomySweepResult {
   ungroundedIngest: EmptyFetchSweepResult | null;
   /** Genuine ingest failures mirrored onto review_queue + stale-row cleanup. */
   ingestFailureReview: IngestFailureBackfillResult | null;
+  /** Terminal outbox/DLQ/review-orphan failures with no review_queue row. */
+  terminalFailureReview: TerminalFailureSweepResult | null;
   errors: string[];
 }
 
@@ -1418,6 +1417,7 @@ export async function runAutonomySweeps(
     completedEmptyRaw: null,
     ungroundedIngest: null,
     ingestFailureReview: null,
+    terminalFailureReview: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -1554,6 +1554,16 @@ export async function runAutonomySweeps(
     result.transientDlq = await sweepTransientDeadLetters(env, now);
   } catch (err) {
     errors.push(`transientDlq: ${(err as Error).message}`);
+  }
+
+  // Rows still failed after the batch above are terminal once their transient
+  // replay budget is spent. Retryable rows (transient error, cycles under the
+  // cap) stay failed for a later batch and are not parked on review_queue.
+  try {
+    throwIfAborted();
+    result.terminalFailureReview = await sweepTerminalFailureReviewQueue(env, { limit: 100 });
+  } catch (err) {
+    errors.push(`terminalFailureReview: ${(err as Error).message}`);
   }
 
   try {

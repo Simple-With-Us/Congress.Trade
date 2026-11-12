@@ -260,7 +260,15 @@ export interface ParsedTx {
    * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
    * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type' | 'grid_type_unmarked'>;
+  extractionWarnings?: Array<
+    | 'unreadable_is_option'
+    | 'unreadable_cap_gains'
+    | 'salvaged_truncated_output'
+    | 'band_amount_inferred'
+    | 'suspected_constant_tx_type'
+    | 'grid_type_unmarked'
+    | 'owner_unread'
+  >;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -753,6 +761,8 @@ export interface Env {
   RESIDENTIAL_PROXY_PORT?: string;
   RESIDENTIAL_PROXY_USERNAME?: string;
   RESIDENTIAL_PROXY_PASSWORD?: string;
+  /** Consecutive residential-proxy probe failures before health_senate_relay reports down (default 3). */
+  RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD?: string;
   /** Enable Cloudflare Browser Rendering fallback (strictly capped to free tier). */
   SENATE_USE_BROWSER_RENDERING?: string;
   /** Enables the OGE executive-branch (278-T) filings watcher. Infisical-tunable. */

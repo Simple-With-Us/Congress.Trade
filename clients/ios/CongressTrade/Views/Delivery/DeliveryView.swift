@@ -82,9 +82,9 @@ struct DeliveryView: View {
                             DeliveryMethodExplainer()
                                 .padding(.bottom, 2)
 
-                            Picker("Mode", selection: $deliveryMode) {
+                            Picker("Channel", selection: $deliveryMode) {
                                 ForEach(DeliveryMode.allCases) { mode in
-                                    Text(mode.rawValue).tag(mode)
+                                    Text(mode.label).tag(mode)
                                 }
                             }
                             .pickerStyle(.segmented)
@@ -98,7 +98,7 @@ struct DeliveryView: View {
                             }
 
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Chambers")
+                                Text("Branches")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 HStack(spacing: 8) {
@@ -116,7 +116,7 @@ struct DeliveryView: View {
                                         .accessibilityLabel(chamber.label)
                                     }
                                 }
-                                Text("No selection delivers all chambers.")
+                                Text("No selection includes every branch.")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
@@ -376,6 +376,19 @@ struct DeliveryMemberPicker: View {
     }
 }
 
+private extension Subscription {
+    var deliveryTitle: String {
+        switch delivery.lowercased() {
+        case "sse":
+            return "Live Stream"
+        case "webhook":
+            return "Webhook"
+        default:
+            return delivery
+        }
+    }
+}
+
 /// One-line-each Webhook/SSE explainer (owner punch list #2, item 10) —
 /// mirrors the web's shortened Delivery copy (lane W2, `app/src/ui/dashboardHtml.ts`),
 /// replacing the old single long paragraph that tried to cover both methods
@@ -387,8 +400,8 @@ struct DeliveryMethodExplainer: View {
             // trades sends several requests (`app/src/delivery/webhook.ts`
             // sets X-Tx-Id per POST).  "New filings" read as one-per-filing and
             // sent integrators dedupe on the wrong key.
-            Text("Webhooks: POST each new trade to your URL (HMAC signed).")
-            Text("SSE: Live stream over an open connection.")
+            Text("Webhooks: we send each new trade to your URL, signed.")
+            Text("Live stream: new trades arrive over an open connection.")
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -404,9 +417,9 @@ struct SubscriptionRow: View {
     var body: some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(subscription.delivery.uppercased())
+                Text(subscription.deliveryTitle)
                     .font(.headline)
-                Text(subscription.targetUrl ?? subscription.streamUrl ?? "SSE stream")
+                Text(subscription.targetUrl ?? subscription.streamUrl ?? "Live stream")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -416,7 +429,7 @@ struct SubscriptionRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(3)
                 }
-                Text("Cursor \(subscription.cursor)")
+                Text(subscription.cursor > 0 ? "Caught up through #\(subscription.cursor)" : "Waiting for the first trade")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(.secondary)
             }
