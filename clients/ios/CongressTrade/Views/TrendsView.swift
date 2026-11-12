@@ -741,7 +741,7 @@ struct TrendsView: View {
     private var conflictsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             trendsHeading("Committee Sector Conflicts")
-            Text("Disclosed trades in sectors that a politician's committees oversee (curated committee→sector map). Observational — not evidence of impropriety.")
+            Text("Trades in sectors a politician's committees oversee.\u{00A0} This is a comparison, not proof of anything improper.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -799,7 +799,7 @@ struct TrendsView: View {
     private func timelinessSection(lag: FilingLagResponse) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             trendsHeading("Disclosure Timeliness")
-            Text("Days from trade to official filing date (45-day STOCK Act limit).")
+            Text("Days from the trade to the filing.\u{00A0} The STOCK Act sets a 45-day deadline.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -827,7 +827,7 @@ struct TrendsView: View {
             }
 
             if let late = lag.topLateFilers, !late.isEmpty {
-                Text("Slowest Filers (Avg Delay)")
+                Text("Slowest to File")
                     .font(.subheadline.weight(.bold))
                     .padding(.top, 6)
                 VStack(spacing: 0) {

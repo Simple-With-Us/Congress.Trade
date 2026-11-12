@@ -1573,19 +1573,28 @@ struct BugReportSheet: View {
 /// user has opted in via Settings → Account → "Shake to Report Bug".
 extension Notification.Name {
     static let shakeToReport = Notification.Name("CT.shakeToReport")
+    /// Posted by `ShakeToReportToggle` so the root detector can follow the
+    /// opt-in without reading `UserDefaults` on the launch layout turn.
+    static let shakeToReportPreferenceChanged = Notification.Name("CT.shakeToReportPreferenceChanged")
 }
 
 /// Settings row for the shake-to-report opt-in toggle. Lives inside
 /// AccountQuickMenu below the Appearance row so the user can find it
-/// without scrolling past Account actions. Default false; the
-/// `ShakeDetectorViewController` reads the same UserDefaults key and
-/// stays subscribed only while this is on.
+/// without scrolling past Account actions. Default false. The root
+/// detector installs only after the first frame, and only while this is on.
 struct ShakeToReportToggle: View {
-    @AppStorage("shake_to_report_enabled") private var enabled: Bool = false
+    @AppStorage(ShakeToReportPreference.defaultsKey) private var enabled: Bool = false
 
     var body: some View {
         Toggle("Shake to Report Bug", isOn: $enabled)
             .accessibilityHint("When on, shaking the device opens a bug-report sheet. Default is off.")
+            .onChange(of: enabled) { _, newValue in
+                NotificationCenter.default.post(
+                    name: .shakeToReportPreferenceChanged,
+                    object: nil,
+                    userInfo: [ShakeToReportPreference.enabledUserInfoKey: newValue]
+                )
+            }
     }
 }
 

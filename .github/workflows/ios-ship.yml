@@ -46,15 +46,14 @@ name: iOS TestFlight ship (Mac runner)
 # Neither kind of skip consumes a build number.
 # Hosted macos-latest runners have an empty home each job.  This repo forbids
 # actions/cache (check-actions-runner-policy.mjs), so last-ship state cannot
-# persist.  Treating that empty home as "never shipped" re-archived every
-# cron tick (measured: 1.0.222 on 2026-09-04 from schedule, no iOS change).
-# A scheduled tick with no last-ship file now skips.  Real ships are a push
-# that passed paths: or an explicit workflow_dispatch.  To force one run,
-# dispatch the workflow or run the wrapper locally with --force-ship.
-# For the same reason the ship script's rate gate and same-HEAD skip have no
-# state to read on this runner: every push that passes paths: ships once, and
-# the cron is a no-op until last-ship state is seeded (ios-appstore-gm.yml seeds
-# it from its previous successful run).
+# persist in the runner cache.  Treating that empty home as "never shipped"
+# re-archived every cron tick (measured: 1.0.222 on 2026-09-04 from schedule,
+# no iOS change).  A scheduled tick with no last-ship file still skips.
+# The seed step restores last-ship-congress.txt from the previous successful
+# run of this workflow that actually uploaded, before the scheduled gate and
+# the ship script.  A green skip is not an upload: seeding its timestamp would
+# make the 1 hour rate gate block every push.  To force one run, dispatch the
+# workflow.  This file does not pass a standing gate override.
 
 on:
   push:
@@ -75,6 +74,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ios-ship-congress
@@ -103,8 +103,22 @@ jobs:
           # gate would degrade to skipping every tick.
           fetch-depth: 0
 
-      # Runs FIRST so a tick with nothing to ship costs seconds and cannot go
-      # red on an unrelated environment problem.
+      # Hosted runners have an empty home, and this repo forbids actions/cache.
+      # Seed before the gate so a scheduled tick can see the last upload, and
+      # before the ship script so a push can apply the same-HEAD skip.  A
+      # successful skip is not an upload (--require-upload).
+      - name: Seed last-ship state from the previous successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/ios-fleet/seed-last-ship.sh" \
+            --workflow ios-ship.yml \
+            --app congress \
+            --require-upload \
+            --ship-step "Ship CongressTrade to TestFlight"
+
+      # Runs before signing and archive so a tick with nothing to ship costs
+      # seconds and cannot go red on an unrelated environment problem.
       # Logic lives in a script, not inline YAML, so it can be syntax-checked
       # and unit-tested by CI (ios-fleet-ship-logic job) on every PR instead of
       # only being exercised on the one Mac that can ship.
