@@ -351,13 +351,21 @@ export const DASHBOARD_CSS = /* css */ `
   nav.tabs a:hover { color: var(--text); background: var(--panel); }
   nav.tabs a.active { color: var(--text); background: var(--panel-2); border-color: var(--border); font-weight: 600; }
   nav.tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* CT-2505: the icon is a real element with aria-hidden, not CSS
+     generated content (generated content was announced again next to the
+     visible label: "Trends Trends").  Hidden on the desktop row; the
+     phone dock shows it.  Admin short labels are display:none by default
+     so the accessible name is the full label exactly once. */
+  nav.tabs .tab-ico { display: none; }
+  nav.tabs .tab-label-short { display: none; }
   /* Admin-only tabs (Review Queue / Admin · Cadence) are long labels that
-     crowd row 1 at laptop widths; desktop shows their short data-mobile
-     label and keeps the full text in the tooltip.  Phones already render
-     data-mobile under the icon. */
+     crowd row 1 at laptop widths; desktop shows the short label and keeps
+     the full text in the tooltip.  Phones render the short label under
+     the icon.  Only one of full/short is display:none-swapped, so the
+     name never includes both. */
   @media (min-width: 769px) and (hover: hover) {
-    nav.tabs a[data-admin-tab] { font-size: 0; }
-    nav.tabs a[data-admin-tab]::before { content: attr(data-mobile) / ""; font-size: 13px; }
+    nav.tabs a[data-admin-tab] .tab-label-full { display: none; }
+    nav.tabs a[data-admin-tab] .tab-label-short { display: inline; font-size: 13px; }
   }
   .tab-count-badge {
     display: none;
@@ -615,7 +623,14 @@ export const DASHBOARD_CSS = /* css */ `
      white would fail contrast (the dark-mode badge-contrast test below). */
   .tag.B, .tag.P { background: linear-gradient(135deg, var(--buy), color-mix(in srgb, var(--buy) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--buy) 30%, transparent); color: #fff; }
   html[data-theme="dark"] .tag.B, html[data-theme="dark"] .tag.P { color: #080c17; }
-  .tag.S { background: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--sell) 30%, transparent); }
+  /* CT-2505: opaque --sell under the gradient so the badge fill is the
+     token (the shorthand used to reset background-color to transparent).
+     Light mode's dark red takes white ink (8.31:1 on #991b1b, higher on
+     the darker gradient stop).  Dark mode's light pink cannot take white
+     ink (2.55:1); it uses the same near-black as Buy, and a shallower
+     black mix so that ink still clears 4.5:1 on the darker stop. */
+  .tag.S { background-color: var(--sell); background-image: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--sell) 30%, transparent); color: #fff; }
+  html[data-theme="dark"] .tag.S { color: #080c17; background-image: linear-gradient(135deg, var(--sell), color-mix(in srgb, var(--sell) 82%, #000)); }
   .tag.E { background: linear-gradient(135deg, var(--exch), color-mix(in srgb, var(--exch) 70%, #000)); box-shadow: 0 4px 12px color-mix(in srgb, var(--exch) 30%, transparent); color: #080c17; }
   html[data-theme="light"] .tag.E { color: #fff; }
   .conf { font-family: var(--mono); font-size: 12px; }
@@ -1805,7 +1820,8 @@ export const DASHBOARD_CSS = /* css */ `
   .branch-toggle, .party-chip, .side-chip { height: var(--control-h); }
   .branch-toggle.on { background: var(--accent); color: #fff; box-shadow: none; }
   .party-chip.on[data-party="D"] { background: var(--buy); box-shadow: none; }
-  .party-chip.on[data-party="R"] { background: var(--sell); box-shadow: none; }
+  .party-chip.on[data-party="R"] { background: var(--sell); color: #fff; box-shadow: none; }
+  html[data-theme="dark"] .party-chip.on[data-party="R"] { color: #080c17; }
   .party-chip.on[data-party="O"] { background: var(--accent); color:#fff; box-shadow: none; }
 
   /* iOS-style filter dropdowns (Trades + Trends). The old H/S/P chip strip
@@ -1906,7 +1922,9 @@ export const DASHBOARD_CSS = /* css */ `
   .ios-filter .ios-filter-item.side-chip.on[data-side="E"] .side-ex { color: var(--text); }
   .side-chip.on[data-side="B"] { background: var(--buy); box-shadow: none; }
   .side-chip.on[data-side="B"] .side-up { color:#fff; }
-  .side-chip.on[data-side="S"] { background: var(--sell); box-shadow: none; }
+  .side-chip.on[data-side="S"] { background: var(--sell); color: #fff; box-shadow: none; }
+  html[data-theme="dark"] .side-chip.on[data-side="S"] { color: #080c17; }
+  html[data-theme="dark"] .side-chip.on[data-side="S"] .side-dn { color: #080c17; }
   .side-chip.on[data-side="S"] .side-dn { color:#fff; }
   .side-chip.on[data-side="E"] { background: var(--exch); box-shadow: none; }
   .side-chip.on[data-side="E"] .side-ex { color:#fff; }
@@ -2294,11 +2312,11 @@ export const DASHBOARD_CSS = /* css */ `
       html[data-theme="light"] nav.tabs { background: #fff; }
     }
     nav.tabs a {
-      display: block; height: auto; white-space: normal;
-      padding: 6px 2px; min-height: 44px; font-size: 0; min-width: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: auto; white-space: normal;
+      padding: 6px 2px; min-height: 44px; font-size: 10px; line-height: 1.1; min-width: 0;
       border-radius: 0; border: 0; background: transparent;
     }
-    nav.tabs a[data-admin-tab] { font-size: 0; }
     nav.tabs a.active {
       background: transparent;
       box-shadow: none;
@@ -2306,8 +2324,10 @@ export const DASHBOARD_CSS = /* css */ `
     html[data-theme="dark"] nav.tabs a.active {
       background: transparent;
     }
-    nav.tabs a::before { content: attr(data-icon) / ""; display: block; font-size: 16px; line-height: 1; margin-bottom: 3px; }
-    nav.tabs a::after { content: attr(data-mobile) / ""; display: block; font-size: 10px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    nav.tabs .tab-ico { display: block; font-size: 16px; line-height: 1; margin-bottom: 3px; }
+    nav.tabs .tab-label { display: block; max-width: 100%; font-size: 10px; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    nav.tabs a[data-admin-tab] .tab-label-full { display: none; }
+    nav.tabs a[data-admin-tab] .tab-label-short { display: block; }
     .tab-count-badge,
     .tab-count-badge.is-on {
       position: absolute;
@@ -2332,11 +2352,11 @@ export const DASHBOARD_CSS = /* css */ `
       padding-left: 1px;
       padding-right: 1px;
     }
-    html.ct-admin nav.tabs a::before {
+    html.ct-admin nav.tabs .tab-ico {
       font-size: 14px;
       margin-bottom: 2px;
     }
-    html.ct-admin nav.tabs a::after {
+    html.ct-admin nav.tabs .tab-label {
       font-size: clamp(8px, 2.3vw, 9px);
     }
     /* right:max(4px, calc(50% - 22px)) on .tab-count-badge above assumes the
@@ -2588,7 +2608,7 @@ export const DASHBOARD_CSS = /* css */ `
   @media (max-width: 420px) {
     .toolbar { grid-template-columns: repeat(2,minmax(0,1fr)); }
     .toolbar #qMember { grid-column:1 / -1; }
-    nav.tabs a::after { font-size: 9px; }
+    nav.tabs .tab-label { font-size: 9px; }
     th, td { padding: 9px 10px; }
     /* Rising Activity: tighter cells so all four headings fit on phones. */
     #tableTrTrending th, #tableTrTrending td { padding: 9px 6px; }

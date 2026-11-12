@@ -22,8 +22,8 @@ export function readIdentity(body) {
 
 /**
  * Coolify watch_paths are `app/**` and `services/**`.  A main push that only
- * touches workflows, docs, or iOS never rebuilds congress-app, so waiting 25
- * minutes for that SHA to appear on /api/health is FLEET-INFRA-DR (15
+ * touches workflows, docs, or iOS never rebuilds congress-app, so waiting the
+ * full Sentry observe window for that SHA on /api/health is FLEET-INFRA-DR (15
  * failures).  Reuses scripts/ops/deploy_relevance.py.
  */
 export function isCoolifyDeployRelevant(sha, { spawn = spawnSync } = {}) {
@@ -55,9 +55,11 @@ export function gitAncestry(ancestor, descendant, spawn = spawnSync) {
 
 export async function observeProduction({ expected, fetchImpl = fetch, sleep = pause,
   isAncestor = gitAncestry, refreshMain = () => execFileSync('git', ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { stdio: 'ignore', timeout: 30000 }),
-  attempts = 75, intervalMs = 20000, now = Date.now } = {}) {
+  attempts = 180, intervalMs = 20000, now = Date.now } = {}) {
   if (!SHA.test(expected || '')) throw new Error('Expected CI revision must be a full SHA');
-  const deadline = now() + 25 * 60 * 1000;
+  // Coolify can lag GitHub merge by well over the old 25-minute window. Keep
+  // attempts aligned with the deadline so the loop can use the full window (20s cadence).
+  const deadline = now() + 60 * 60 * 1000;
   let prior = null;
   let reason = 'No healthy live revision observed';
   for (let attempt = 0; attempt < attempts; attempt++) {
