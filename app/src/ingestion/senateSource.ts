@@ -47,6 +47,7 @@ import {
   sanitizeEfdTransportError,
   senateEfdTransportScrubSecrets,
 } from './senateEdgeDeny.ts';
+import { WATCHER_SOURCE_IO_BUDGET_MS } from './watcherSourceIo.ts';
 
 /** Backoff between direct Senate eFD attempts when direct is the only egress. */
 /** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
@@ -54,6 +55,26 @@ export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
 export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
 /** In-tick retries on the residential proxy leg before direct fallback (CT-2498). */
 export const SENATE_PROXY_EGRESS_BACKOFF_MS = [0, 750, 2_000];
+/**
+ * Reserve left on the shared pollSenate source budget so the direct fallback
+ * leg still gets a direct attempt after proxy retries bail out.
+ */
+export const SENATE_DIRECT_FALLBACK_MIN_BUDGET_MS = 1_000;
+
+function watcherSourceIoBudgetRemainingMs(signal: AbortSignal | undefined, startedAtMs: number): number | undefined {
+  if (!signal) return undefined;
+  if (signal.aborted) return 0;
+  return Math.max(0, WATCHER_SOURCE_IO_BUDGET_MS - (Date.now() - startedAtMs));
+}
+
+export function proxyRetryFitsSourceBudget(
+  remainingMs: number | undefined,
+  waitMs: number,
+  answerTimeoutMs: number,
+): boolean {
+  if (remainingMs === undefined) return true;
+  return remainingMs >= waitMs + answerTimeoutMs + SENATE_DIRECT_FALLBACK_MIN_BUDGET_MS;
+}
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err ?? '');
@@ -293,9 +314,21 @@ export async function withSenateEfdEgress<T>(
       SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
       SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
     );
+    const sourceBudgetStartedAt = Date.now();
     proxyLoop: for (let attempt = 0; attempt < SENATE_PROXY_EGRESS_BACKOFF_MS.length; attempt++) {
       const waitMs = SENATE_PROXY_EGRESS_BACKOFF_MS[attempt] ?? 0;
-      if (waitMs > 0) await delay(waitMs, opts.signal);
+      const budgetRemaining = watcherSourceIoBudgetRemainingMs(opts.signal, sourceBudgetStartedAt);
+      if (!proxyRetryFitsSourceBudget(budgetRemaining, waitMs, answerTimeoutMs)) {
+        break proxyLoop;
+      }
+      if (waitMs > 0) {
+        try {
+          await delay(waitMs, opts.signal);
+        } catch (err) {
+          if (proxyErr !== null) break proxyLoop;
+          throw err;
+        }
+      }
       const leg = guardProxyLeg(proxied, answerTimeoutMs);
       try {
         return await run(leg.fetchImpl, { egress: 'proxy', fallback: false });

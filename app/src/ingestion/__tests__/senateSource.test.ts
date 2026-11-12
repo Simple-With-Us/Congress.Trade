@@ -59,7 +59,10 @@ import {
   senateBrowserFallbackRoute,
   SENATE_SESSION_KV_KEY,
   SENATE_PROXY_EGRESS_BACKOFF_MS,
+  SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+  proxyRetryFitsSourceBudget,
 } from '../senateSource.ts';
+import { watcherSourceIoSignal } from '../watcherSourceIo.ts';
 import {
   SenateHttpError,
   SenateProxyEgressError,
@@ -839,6 +842,47 @@ describe('Senate eFD edge deny (CT-2442)', () => {
         signal.addEventListener('abort', () => reject(signal.reason), { once: true });
       });
     }
+
+    it('skips later proxy retries when the pollSenate source budget cannot fit them', () => {
+      expect(
+        proxyRetryFitsSourceBudget(
+          4_000,
+          SENATE_PROXY_EGRESS_BACKOFF_MS[1] ?? 0,
+          SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+        ),
+      ).toBe(false);
+      expect(
+        proxyRetryFitsSourceBudget(
+          7_000,
+          0,
+          SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+        ),
+      ).toBe(true);
+    });
+
+    it('falls back to direct under the pollSenate 7s source budget when the proxy black-holes', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const calls: Call[] = [];
+      const direct = efd(calls, () => undefined);
+      const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        if (!(init as { client?: unknown } | undefined)?.client) return direct(input, init);
+        recordCall(calls, input, init);
+        return hangUntilAborted(init?.signal);
+      }) as typeof fetch;
+
+      const out = await fetchSenatePtrFilings(
+        { ...searchWindow, proxyUrl: PROXY, signal: watcherSourceIoSignal() },
+        fetchImpl,
+      );
+
+      expect(out.map((f) => f.pipelineDocId)).toEqual(['S-edge-1']);
+      expect(calls.some((c) => c.egress === 'direct')).toBe(true);
+      expect(calls.filter((c) => c.egress === 'proxy').length).toBeLessThan(
+        SENATE_PROXY_EGRESS_BACKOFF_MS.length * 3,
+      );
+      expect(warn.mock.calls.some(([msg]) =>
+        /proxy unreachable; the direct fallback reached eFD/.test(String(msg)))).toBe(true);
+    }, 20_000);
 
     it('falls back to direct when a hung proxy gives no answer before its first-answer deadline', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
