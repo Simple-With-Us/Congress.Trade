@@ -260,7 +260,15 @@ export interface ParsedTx {
    * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
    * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type' | 'grid_type_unmarked'>;
+  extractionWarnings?: Array<
+    | 'unreadable_is_option'
+    | 'unreadable_cap_gains'
+    | 'salvaged_truncated_output'
+    | 'band_amount_inferred'
+    | 'suspected_constant_tx_type'
+    | 'grid_type_unmarked'
+    | 'owner_unread'
+  >;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -891,6 +899,11 @@ export interface Env {
   NEXT_PUBLIC_DD_APPLICATION_ID?: string;
   NEXT_PUBLIC_DD_RUM_APPLICATION_ID?: string;
   NEXT_PUBLIC_DD_SITE?: string;
+  /** Opt-in. Pins agent-only dd-trace switches off when no agent host or URL is set. */
+  DD_TRACE_AGENTLESS_GUARDS?: string;
+  DD_DYNAMIC_INSTRUMENTATION_ENABLED?: string;
+  DD_PROFILING_ENABLED?: string;
+  DD_REMOTE_CONFIGURATION_ENABLED?: string;
   /** Cloudflare Workers version metadata binding; used by Sentry to auto-tag the release. */
   CF_VERSION_METADATA?: { id: string; tag: string; timestamp?: string };
 

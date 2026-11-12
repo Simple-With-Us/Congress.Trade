@@ -203,6 +203,12 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
+      - name: Hetzner resource digest ops tests (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/hetzner-resource-digest.sh
+          bash scripts/ops/test-hetzner-resource-digest.sh
+
       # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
       # Does not talk to Docker, Coolify, or the origin.
       - name: Deploy overlap policy tests
@@ -263,7 +269,7 @@ jobs:
 
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
-        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs scripts/ops/tmp-hygiene-report.node-test.mjs
 
       # CT-2506 offline retention. Temp dirs only. No host and no Backblaze.
       - name: Local backup retention tests

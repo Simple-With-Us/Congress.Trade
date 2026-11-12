@@ -63,13 +63,17 @@ RUN deno install --frozen
 # Copy only what the runtime reads (CT-2459): src, public (ui/assets.ts
 # reads ../../public at module load), migrations, the entrypoint scripts,
 # litestream config. Tests/docs/ops scripts stay out (see .dockerignore).
-# .prod.vars is kept on purpose: src/deno/main.ts reads it as an env
-# fallback; removing it from the image is an owner-gated decision.
+# .prod.vars left git tracking on 2026-11-12 (owner decision, after provider
+# secret scanning flagged historical blobs): src/deno/main.ts reads it only
+# as an env fallback and production env comes from Coolify and Infisical, so
+# the image copies it when the build context has one (local builds) and
+# falls back to an empty file on fresh checkouts instead of failing.
 COPY src ./src
 COPY public ./public
 COPY migrations ./migrations
 COPY litestream.yml ./
-COPY .prod.vars ./
+RUN --mount=type=bind,source=.,target=/build-context,readonly \
+    if [ -f /build-context/.prod.vars ]; then cp /build-context/.prod.vars ./.prod.vars; else : > ./.prod.vars; fi
 COPY scripts/start-with-litestream.sh ./scripts/start-with-litestream.sh
 
 # Cache source files, including lazily dynamic-imported entries that a

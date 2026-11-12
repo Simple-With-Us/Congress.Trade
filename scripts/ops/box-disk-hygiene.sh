@@ -8,8 +8,10 @@
 # Safe defaults:
 #   - never restarts docker and never reboots the host
 #   - never prunes named volumes and never passes --volumes
-#   - skips prune while Coolify/nixpacks/buildkit is actively building
+#   - skips prune while a Coolify deploy is in progress (helper container
+#     or application_deployment_queues in_progress/queued)
 #   - skips `docker builder prune -af` unless Build Cache ACTIVE is 0
+#   - warn/crit image and builder prunes keep objects younger than IMAGE_PRUNE_UNTIL
 #   - rate-limits aggressive prunes
 #   - pages on level change plus a periodic reminder, not every tick
 #
@@ -41,7 +43,9 @@
 #   ROOT_GROWTH_WINDOW_SEC    default 3600
 #   TMP_GROWTH_GB             default 4      (monitor 23168883; sampled each run)
 #   TMP_GROWTH_WINDOW_SEC     default 1200
-#   LIGHT_BUILDER_UNTIL       default 12h
+#   LIGHT_BUILDER_UNTIL       default 12h   (unused build cache older than this)
+#   IMAGE_PRUNE_UNTIL         default 1h    (warn/crit prune skips newer images/cache)
+#   DEPLOY_STALE_MIN          default 90    (ignore queue rows not updated for this long)
 #   AGGRESSIVE_COOLDOWN_SEC   default 1800
 #   PRUNE_VOLUMES             ignored       (named volumes are never pruned)
 #   PUSHOVER_USAGE_API_TOKEN  preferred app token
@@ -75,6 +79,9 @@ ROOT_GROWTH_WINDOW_SEC="${ROOT_GROWTH_WINDOW_SEC:-3600}"
 TMP_GROWTH_GB="${TMP_GROWTH_GB:-4}"
 TMP_GROWTH_WINDOW_SEC="${TMP_GROWTH_WINDOW_SEC:-1200}"
 LIGHT_BUILDER_UNTIL="${LIGHT_BUILDER_UNTIL:-12h}"
+IMAGE_PRUNE_UNTIL="${IMAGE_PRUNE_UNTIL:-1h}"
+DEPLOY_STALE_MIN="${DEPLOY_STALE_MIN:-90}"
+[[ "$DEPLOY_STALE_MIN" =~ ^[0-9]+$ ]] || DEPLOY_STALE_MIN=90
 AGGRESSIVE_COOLDOWN_SEC="${AGGRESSIVE_COOLDOWN_SEC:-1800}"
 PRUNE_VOLUMES="${PRUNE_VOLUMES:-0}"
 CT_DATA_DIR="${CT_DATA_DIR:-/data/congress-trade}"
@@ -123,7 +130,19 @@ is_deploy_active() {
     [[ "$HYGIENE_DEPLOY_ACTIVE" == "1" ]]
     return
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -Eqi 'nixpacks|coolify-builder|buildkit'; then
+  # Dockerfile-pack deploys (Socratic-Trade, Usage Monitor) run in a
+  # coollabsio/coolify-helper container named with the deployment uuid, not
+  # nixpacks/coolify-builder/buildkit. The previous name-only check missed
+  # that helper on 2026-11-12, and soft_prune deleted the just-built unused
+  # tag before compose up (ST outage ~10:33Z).
+  if docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -Eqi 'nixpacks|coolify-builder|buildkit|coolify-helper'; then
+    return 0
+  fi
+  # Only recent rows count: a job stuck in queued/in_progress for longer than
+  # DEPLOY_STALE_MIN must not block pruning (and disk alerts) forever.
+  if docker exec coolify-db psql -U coolify -d coolify -tAc \
+    "SELECT 1 FROM application_deployment_queues WHERE status IN ('in_progress','queued') AND updated_at > now() - interval '${DEPLOY_STALE_MIN} minutes' LIMIT 1;" \
+    2>/dev/null | grep -q 1; then
     return 0
   fi
   return 1
@@ -759,21 +778,26 @@ light_prune() {
 }
 
 soft_prune() {
+  # Unused images + builder cache, but never objects younger than
+  # IMAGE_PRUNE_UNTIL (default 1h). A just-built Coolify tag has no
+  # container until compose up, so unfiltered -af would delete it.
   if builder_prune_af_allowed; then
-    run_cmd docker builder prune -af || true
+    run_cmd docker builder prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
   fi
-  run_cmd docker image prune -af || true
+  run_cmd docker image prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
   refuse_volume_prune
 }
 
 aggressive_prune() {
+  # Keep objects younger than IMAGE_PRUNE_UNTIL so an in-flight deploy
+  # cannot lose its freshly built image (see soft_prune).
   if builder_prune_af_allowed; then
-    run_cmd docker builder prune -af || true
+    run_cmd docker builder prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
   fi
-  run_cmd docker image prune -af || true
-  run_cmd docker container prune -f || true
+  run_cmd docker image prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
+  run_cmd docker container prune -f --filter "until=${IMAGE_PRUNE_UNTIL}" || true
   refuse_volume_prune
-  run_cmd docker system prune -af || true
+  run_cmd docker system prune -af --filter "until=${IMAGE_PRUNE_UNTIL}" || true
 }
 
 pushover_curl_config() {

@@ -7096,22 +7096,30 @@ function loadTrSectionNearViewport(id, fn) {
     fn();
     return;
   }
+  // An empty table body or chart box has no area, so a fresh observer never
+  // reports it as intersecting and the section stays blank on first paint
+  // (What Is Being Traded, Top Performers, Rising Activity, Most Active
+  // Politicians). The enclosing card has a heading, so watch that.
+  var target = node.closest('details') || node;
+  if (target.getAttribute('data-tr-load') && target.getAttribute('data-tr-load') !== id) target = node;
+  target.setAttribute('data-tr-load', id);
   __trPending[id] = fn;
   if (!__trObserver) {
     __trObserver = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
         if (!entry.isIntersecting) return;
-        var pendingId = entry.target.id;
+        var pendingId = entry.target.getAttribute('data-tr-load') || entry.target.id;
         var pendingFn = __trPending[pendingId];
         if (!pendingFn) return;
         delete __trPending[pendingId];
         __trLoadedOnce[pendingId] = true;
         __trObserver.unobserve(entry.target);
+        entry.target.removeAttribute('data-tr-load');
         pendingFn();
       });
     }, { rootMargin: '400px 0px' });
   }
-  __trObserver.observe(node);
+  __trObserver.observe(target);
 }
 function loadTrends() {
   stampWindowChips();
@@ -7454,8 +7462,8 @@ function filterPeopleDirectory() {
 
 /* ---- Directory People|Assets toggle ---- */
 var DIRECTORY_MODE = 'people';
-var DIR_SUB_PEOPLE = 'Look up members of Congress and executive filers.\u00a0 Search by name, state (full or abbrev), or party.\u00a0 Click a column heading to sort; click a name for their profile and trades.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
-var DIR_SUB_ASSETS = 'Every ticker Congress has disclosed a trade in.\u00a0 Search by ticker or company name.\u00a0 Click a column heading to sort; click a row to open its profile.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
+var DIR_SUB_PEOPLE = 'Look up members of Congress and executive branch officials.\u00a0 Search by name, state, or party.\u00a0 Click a column heading to sort; click a name for their profile and trades.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
+var DIR_SUB_ASSETS = 'Every ticker with a disclosed trade.\u00a0 Search by ticker or company name.\u00a0 Click a column heading to sort; click a row to open its profile.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
 var directorySearchTimer = null;
 function syncDirectoryUrl() {
   try {
@@ -8160,7 +8168,7 @@ function loadTrSectorFlow() {
   box.innerHTML = skBars(5);
   aGet('sector-flow?' + trParams() + '&limit=12').then(function (d) {
     var rows = (d.sectors || []).filter(function (r) { return r.sector && r.sector !== 'Unknown'; });
-    if (!rows.length) { box.innerHTML = '<div class="note">No sector-classified trades in this window yet (security reference data fills in as enrichment runs).</div>'; return; }
+    if (!rows.length) { box.innerHTML = '<div class="note">No sector labels in this window yet.</div>'; return; }
     var merged = {}, order = [];
     rows.forEach(function (r) {
       var key = canonSector(r.sector);
@@ -8223,7 +8231,7 @@ function loadTrPerformers() {
     var asOf = el('trPerformersAsOf');
     if (asOf) asOf.textContent = d && d.pricesAsOf ? 'Prices as of ' + fmtAsOf(d.pricesAsOf) + '.  Excess return is measured to that date.' : '';
     var rows = d.members || [];
-    if (!rows.length) { body.innerHTML = stateRow(2, 'Not enough priced, filing-anchored buys to rank yet — this fills in as the price cache backfills.'); return; }
+    if (!rows.length) { body.innerHTML = stateRow(2, 'Not enough priced stock buys to rank yet.\u00a0 Prices show up after the filing date.'); return; }
     body.innerHTML = rows.map(function (r, i) {
       var name = fmtName(r.fullName || r.filerId || 'Unknown');
       var memberAttr = r.filerId ? ' class="member-cell clickable" data-member="' + esc(r.filerId) + '"' : ' class="member-cell"';
@@ -8307,7 +8315,7 @@ function loadTrTrending() {
   var queryParams = trParams() + '&limit=12';
   aGet('trending?' + queryParams).then(function (d) {
     var rows = (d.trending || []).filter(function (r) { return r.deltaCount > 0; });
-    if (!rows.length) { body.innerHTML = stateRow(4, 'Not enough history to rank momentum.'); return; }
+    if (!rows.length) { body.innerHTML = stateRow(4, 'Not enough history to show a change.'); return; }
     body.innerHTML = rows.map(function (r) {
       return '<tr class="row clickable" data-asset="' + esc(r.ticker) + '" title="Open company">' +
         '<td><div class="asset-cell clickable" data-asset="' + esc(r.ticker) + '">' + tickerLogoHtml(r.ticker, fmtCompany(r.name)) + '<div><span class="tkr">' + esc(r.ticker) + '</span>' + (r.name ? ' <span class="muted">' + esc(fmtCompany(r.name)) + '</span>' : '') + '</div></div></td>' +
@@ -8323,7 +8331,7 @@ function loadTrClusters() {
   box.innerHTML = '<div class="chip">Loading…</div>';
   aGet('cluster-buys?' + trParams() + '&limit=12&minMembers=2').then(function (d) {
     var cs = d.clusters || [];
-    if (!cs.length) { box.innerHTML = '<div class="chip">No multi-politician consensus in this window — try a longer window or “All Data”.</div>'; return; }
+    if (!cs.length) { box.innerHTML = '<div class="chip">No multi-politician consensus in this window.\u00a0 Try a longer window.</div>'; return; }
     box.innerHTML = cs.map(function (c) {
       var faces = (c.topMembers || []).slice(0, 5).map(function (m) {
         var av = memberAvatarHtml(m.fullName, m.photoUrl, m.partyBucket || m.party);
@@ -9071,7 +9079,7 @@ function tickerBacktestHtml(d) {
   var horizons = d.horizons || [];
   var total = d.totalBuyEvents != null ? d.totalBuyEvents : 0;
   if (!horizons.length || !total) {
-    return '<div class="note">No priced equity buys to score yet — this fills in as the price cache backfills. Options are excluded.</div>';
+    return '<div class="note">No priced stock buys to score yet.\u00a0 Options are left out.</div>';
   }
   function hzLabel(days) {
     if (days === 21) return '~1 mo';
@@ -9122,7 +9130,7 @@ function openMember(filerId) {
     var commHtml = committees.length
       ? committees.map(function (c) { return '<span class="committee-tag">' + esc(c) + '</span>'; }).join('')
       : '<span class="muted">' + (isExec
-        ? 'Executive filers do not sit on congressional committees.'
+        ? 'Executive branch officials do not sit on congressional committees.'
         : 'No current assignments on file.') + '</span>';
     var top = (d.topTickers || []).map(function (t) {
       return '<div class="hbar ledger" style="margin:5px 0"><div class="hlabel clickable" data-asset="' + esc(t.ticker) + '">' +
@@ -9182,7 +9190,7 @@ function memberPerfHtml(d) {
   var filing = d.filingDate || null;
   var buyCount = d.buyCount != null ? d.buyCount : (trade && trade.tradeCount);
   if ((!trade || !trade.scoredCount) && (!filing || !filing.scoredCount)) {
-    return '<div class="note">No priced equity buys to score yet — this fills in as the price cache backfills. Sells are not scored as skill (no cost basis).</div>';
+    return '<div class="note">No priced stock buys to score yet.\u00a0 Sells are left out, because the filing does not include a purchase price.</div>';
   }
   function legBlock(title, tip, horizon, leg, isDeemphasized) {
     if (!leg || !leg.scoredCount) {

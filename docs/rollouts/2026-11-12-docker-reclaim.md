@@ -68,3 +68,5 @@ APPLY=1 /usr/local/sbin/docker-reclaim.sh
 ```
 
 There is no timer.  Run it by hand.  `box-disk-hygiene` is a separate job and is not modified here.
+
+If Docker changes while the report is being collected, the script exits before any delete and prints `snapshot changed during collection; retry`.  That abort is the safe path.  Run the script again.
