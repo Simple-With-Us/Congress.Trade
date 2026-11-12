@@ -1,3 +1,7 @@
+## 2026-11-11 CURSOR — compress local sqlite backup dumps on root (CT-2472)
+
+Complete local dumps are zstd `.db.zst` files on the root disk, next to the raw-db `.sha256`.  Keep counts stay Socratic 4 / 2 days, Congress 4 / 2 days, and Usage-Monitor 2 / 2 days.  Dumps stay on `/backups` via the `/data/backups` symlink.  Incomplete dumps are not compressed.  B2/R2 keep policy is unchanged.  This does not install the host copies.  Rollout: `docs/rollouts/2026-11-11-compress-local-sqlite-dumps.md`.
+
 ## 2026-10-26 BF-PUBLISHER — Published filings stuck at ingest_status error (CT-2453)
 
 A filing that already has live transactions and a publish decision can still show `ingest_status` error, because a later fetch failure overwrites the stamp.  The hourly desync reconcile only mapped a resolved `review_queue` row, so a filing that never had one stayed error.  The reconcile now stamps `persisted` from those two facts, and a fetch failure leaves an already-published filing's `ingest_status` alone.  Stored raw for the four Senate filings matches the live published rows: 5, 33, 1, and 1.  No production write from this seat.  Branch `publisher/reconcile-published-errored`.  Refs CT-2453.  Rollout: `docs/rollouts/2026-10-26-reconcile-published-errored.md`.
