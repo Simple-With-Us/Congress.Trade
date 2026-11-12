@@ -134,7 +134,8 @@ import json, sys
 from datetime import datetime, timezone, timedelta
 
 path = sys.argv[1]
-base = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+# Stay inside the report's one-hour window no matter when CI runs.
+base = datetime.now(timezone.utc) - timedelta(minutes=40)
 lines = []
 for i in range(30):
     ts = (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -181,7 +182,7 @@ import json, sys
 from datetime import datetime, timezone, timedelta
 
 path = sys.argv[1]
-base = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+base = datetime.now(timezone.utc) - timedelta(minutes=40)
 with open(path, "w", encoding="utf-8") as f:
     for i in range(20):
         ts = (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
