@@ -538,6 +538,21 @@ describe('runWatcher', () => {
     expect(senateSince()).toEqual(new Date(SENATE_NOW.getTime() - 13 * 86_400_000));
   });
 
+  it('runs a prompt Senate poll when residential-proxy recovery catch-up is queued', async () => {
+    const { env } = fakeEnv({}, {}, {
+      'senate_deep_sweep:lastdate': '2026-07-16',
+      'last_poll:senate': SENATE_NOW.toISOString(),
+      'residential-proxy:senate-catchup': SENATE_NOW.toISOString(),
+    });
+    quietHouse();
+    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
+
+    const result = await runWatcher(env, SENATE_NOW);
+
+    expect(result.senate).toBe('success');
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+  });
+
   it('does not consume the day\'s deep sweep when the senate poll fails', async () => {
     const { env, kvPuts } = fakeEnv({}, {}, {
       'last_poll:senate': new Date(SENATE_NOW.getTime() - 6 * 3600_000).toISOString(),

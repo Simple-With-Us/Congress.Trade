@@ -1141,11 +1141,14 @@ export function evaluatePipelineSignals(
       const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
       const host = probe.host ?? 'residential-proxy';
       if (!probe.ok) {
+        const outageSince = (probe as { outageStartedAt?: string | null }).outageStartedAt;
+        const outageNote = outageSince ? ` — outage since ${outageSince}` : '';
         checks.push({
           id: 'senate_relay',
           status: 'stalled',
           detail: `Residential proxy DOWN at ${host}`
             + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + outageNote
             + ' — Senate/House fetches may fail Imperva checks until the proxy is back.',
           value: probe.status,
         });

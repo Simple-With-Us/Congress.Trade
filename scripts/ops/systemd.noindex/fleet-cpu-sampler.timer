@@ -1,0 +1,13 @@
+[Unit]
+Description=Run fleet CPU sampler every minute
+Requires=fleet-cpu-sampler.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=fleet-cpu-sampler.service
+
+[Install]
+WantedBy=timers.target

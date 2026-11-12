@@ -299,10 +299,10 @@ describe('runPriceRefresh — bounded-concurrency fetch stage (CT-2445)', () => 
     expect(res.aborted).toBe(false);
     expect(res.errors).toEqual(['ERRC: PEER_HTTP_500']);
     expect(res.tickersPriced).toBe(4);
-    // The erroring ticker:  outcome recorded, but stage and the checked-at
-    // clock are untouched — exactly the serial walk's marker-only write.
+    // The erroring ticker:  outcome recorded and price_checked_at stamped so
+    // stuck sweeps can see movement (CT-2469).
     const errRow = srRow('ERRC');
-    expect(errRow?.price_checked_at ?? null).toBeNull();
+    expect(errRow?.price_checked_at ?? null).toBeTruthy();
     expect(String(errRow?.price_unavailable_reason ?? '')).toContain('PEER_HTTP_500');
     expect(eodCount('ERRC')).toBe(0);
     // The empty ticker:  negative-cached at stage 1 with a real check stamp.
