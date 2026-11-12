@@ -203,8 +203,11 @@ describe('st_peer_prices stall detector', () => {
       `INSERT INTO securities_ref (ticker, source) VALUES ('NEW1', 'socratic'), ('NEW2', 'socratic')`,
     ).run();
 
+    const kv = new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-12T14:00:00.000Z'],
+    ]);
     const now = new Date('2026-10-12T18:00:00.000Z');
-    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    const result = await sweepPipelineStallAlerts(envWithDb(kv), now);
     expect(result.evaluated).toContain('st_peer_prices');
     expect(result.alerted).not.toContain('st_peer_prices');
   });
