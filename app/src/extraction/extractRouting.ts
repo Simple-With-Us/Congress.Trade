@@ -439,12 +439,19 @@ export function shouldSkipAgreementForReviewReason(reason: string | null | undef
   return AGREEMENT_HARD_STOP_RE.test(reason);
 }
 
+/** Local House grid-form stage. It must not spend the agreement trio. */
+export function isHouseGridFormExtractor(extractor: string | null | undefined): boolean {
+  const compact = (extractor || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return compact === 'housegridform' || compact === 'server_cpu_gridform';
+}
+
 export function shouldEnqueueAgreement(input: {
   filing: Filing;
   extractor?: string | null;
   quality: ExtractQuality;
   reviewReason?: string | null;
 }): boolean {
+  if (isHouseGridFormExtractor(input.extractor)) return false;
   if (!input.quality.ok) return false;
   if (shouldSkipAgreementForReviewReason(input.reviewReason)) return false;
   const route = classifyHouseExtractRoute(input.filing);
