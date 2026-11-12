@@ -448,9 +448,9 @@ blocked by Apple on this first version.  Did not touch Guideline 2.1
 Resolution Center (`37412b30`).  Receipt:
 `docs/rollouts/2026-08-16-asc-eula-100.md`.
 
-## 2026-08-16 GROK — Health + Infisical shared-only AGENT_SYNC
+## 2026-08-16 GROK — Health + Infisical shared-only AG***_S**C
 
-`AGENT_SYNC_TOKEN` / `AGENT_SYNC_POST_TOKEN` live only in Infisical
+`AG***_S**C_TOKEN` / `AG***_S**C_POST_TOKEN` live only in Infisical
 shared-at-ct.  Deleted the copies that had been written onto the ST and
 CT app projects during the 2026-08-14 rotation.  `GET /api/health` now
 publishes `checks.secrets` (source names and counts, never values).
@@ -493,7 +493,7 @@ capped and now use two spaces; they do not name chambers.  Version remains
 `PREPARE_FOR_SUBMISSION`, not submitted.  Receipt:
 `docs/rollouts/2026-08-14-asc-listing-copy.md`.
 
-Fleet rule strengthened in `~/apps/AGENT-SYNC.md` § Two spaces (all agents,
+Fleet rule strengthened in `~/apps/AG***-S**C.md` § Two spaces (all agents,
 all surfaces, including review notes).
 
 ## 2026-08-14 GROK — App Store 1.0 now has TestFlight 1.0.14 attached
@@ -815,7 +815,7 @@ Last updated: 2026-07-24 (CURSOR)
   on `/api/*`, Infisical single-source config + `GET /api/admin/config-sources`),
   then PR #308 (`b8ce1b4`) made the workerd/Miniflare D1 suite probe-and-skip
   on the deploy runner (its container cannot spawn workerd; failed the gate
-  2×) and set CLAUDE.md defaults (agent-sync coordination + effort-log updates
+  2×) and set CLAUDE.md defaults (ag***-s**c coordination + effort-log updates
   by default). `deploy.yml` run **29177444399 succeeded** on `b8ce1b4`.
 - **Verified live**: all served script blocks parse; `/api/health`
   ok/db/schema true; scoreboard + Alerts tab render with real probe data

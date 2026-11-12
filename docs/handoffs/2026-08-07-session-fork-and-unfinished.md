@@ -4,7 +4,7 @@
 
 **Owner model (binding):** Shellular and laptop Grok Terminal are the **same product surface** — one session, one transcript, line-for-line identical. A healthy new chat stays in sync on both. The broken session forked into **two concurrent agent turns inside one session id**; that is a product bug in that session only, not dual-client architecture.
 
-Tag: **[GROK]**. Repo: `/Users/jay/Code/Congress.Trade`. Agent-sync: `#agent-sync` `C0BEZDJDNKV`. Effort board: `/Users/jay/apps/CONGRESS-TRADE-EFFORT-LOG.md` then mirror `docs/EFFORT-LOG.md`. Auto-commit + land when green. Ship: `bash app/scripts/ship.sh`. CI only on Coolify self-hosted runners (never local Mac).
+Tag: **[GROK]**. Repo: `/Users/jay/Code/Congress.Trade`. ag***-s**c: `#ag***-s**c` `C0BEZDJDNKV`. Effort board: `/Users/jay/apps/CONGRESS-TRADE-EFFORT-LOG.md` then mirror `docs/EFFORT-LOG.md`. Auto-commit + land when green. Ship: `bash app/scripts/ship.sh`. CI only on Coolify self-hosted runners (never local Mac).
 
 ---
 
@@ -101,7 +101,7 @@ Land when CI green. Prefer coolify/oracle runners; local Mac CI banned.
 
 ## First actions for this new session
 
-1. Agent-sync poll + claim effort board for the slice you take
+1. ag***-s**c poll + claim effort board for the slice you take
 2. `git status` — protect dirty scorecard files onto a branch immediately
 3. Pick primary: **(A)** finish OR/scorecard PR, or **(B)** land open iOS/export PRs / CI — do not dual-turn
 4. One turn at a time; one chat log; Shellular will match Terminal line-for-line if you stay single-threaded
