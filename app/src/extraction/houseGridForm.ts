@@ -12,7 +12,19 @@
  */
 
 import type { Owner, ParsedTx, TxType } from '../shared/types.ts';
-import { looksLikeColumnHeaderAsset, looksLikeHeaderContaminatedAsset } from './extractRouting.ts';
+import {
+  looksLikeColumnHeaderAsset,
+  looksLikeHeaderContaminatedAsset,
+  looksLikePtrFormSampleAsset,
+  looksLikePtrFormSampleDate,
+  looksLikePtrFormSampleRow,
+  looksLikeSeeAttachmentPointer,
+} from './extractRouting.ts';
+import {
+  parseGridFormLooseDate,
+  refineGridFormRowDates,
+  type GridFormDateContext,
+} from './houseGridFormDatePlausibility.ts';
 
 /** Recorded on filings.extractor when the in-app stage handles the PDF. */
 export const HOUSE_GRID_FORM_EXTRACTOR = 'houseGridForm';
@@ -29,6 +41,28 @@ export const COLUMN_TEMPLATES: readonly (readonly number[])[] = [
   [219, 331, 861, 955, 1010, 1105, 1202, 1321, 1481, 1648, 1758, 1859, 1948, 2036, 2125, 2233, 2336, 2453, 2668, 2783, 3033],
   [278, 395, 939, 1037, 1093, 1195, 1300, 1426, 1604, 1777, 1892, 2009, 2104, 2200, 2296, 2405, 2517, 2645, 2771, 2893, 3023],
 ];
+
+/**
+ * Printed House PTR (filer block on the same page as the grid).
+ * Eighteen rules at 150 DPI: owner, asset, purchase, sale, exchange,
+ * trade date, notification date, amount brackets A–J. No partial column,
+ * no capital-gains column, and no bracket K.
+ * Measured on H-2026-9116403 page 1.
+ */
+export const OFFICIAL_PTR_TEMPLATE: readonly number[] = [
+  164, 242, 675, 716, 756, 795, 900, 1005, 1061, 1117, 1172, 1228, 1284, 1340, 1396, 1452, 1508, 1564,
+];
+/** Template rules that must land on a detected line before this form wins. */
+export const OFFICIAL_PTR_MIN_HITS = 16;
+/** The printed form is scanned at its own size. A schedule page can line up 16 of these rules near scale 0.92. */
+export const OFFICIAL_PTR_MIN_SCALE = 0.96;
+export const OFFICIAL_PTR_MAX_SCALE = 1.05;
+/**
+ * The printed PTR checkbox is a little larger than the schedule glyph at
+ * the same column-fit scale. Scoring at the raw fit scale leaves a real
+ * sale mark under MARK_SCORE_MIN while the header words stay well below it.
+ */
+export const OFFICIAL_MARK_SCALE = 1.1;
 
 /** Intervals between the 21 rules. Dates sit in 7 and 8 and are not marks. */
 /** Purchase, sale, exchange, capital-gains, partial. Header order on the printed grid. */
@@ -86,6 +120,8 @@ export interface HouseGridPageInput {
   page?: number;
 }
 
+export type GridFormKind = 'schedule' | 'official';
+
 export interface ColumnFit {
   templateIndex: number;
   scale: number;
@@ -93,6 +129,11 @@ export interface ColumnFit {
   /** Predicted rule x positions, length 21. */
   xs: number[];
   inliers: number;
+  /**
+   * `schedule` is the attached-page grid (partial, capital gains, bracket K).
+   * `official` is the printed PTR on the filer page (brackets A–J only).
+   */
+  kind: GridFormKind;
 }
 
 export type GridTypeReason = 'ok' | 'unmarked' | 'ambiguous';
@@ -122,11 +163,14 @@ export interface HouseGridRead {
 }
 
 /** Injected by the Deno app. Tests pass a fake. Null means the binaries are missing. */
-export interface HouseGridFormReader {
-  read(bytes: ArrayBuffer): Promise<HouseGridRead | null>;
+export interface HouseGridReadOptions {
+  filedDate?: string | null;
 }
 
-const DATE_RE = /^\D{0,2}(\d{1,2})\s*[/l1I|]\s*(\d{1,2})\s*[/l1I|]\s*(\d{2,4})\D{0,3}$/;
+export interface HouseGridFormReader {
+  read(bytes: ArrayBuffer, options?: HouseGridReadOptions): Promise<HouseGridRead | null>;
+}
+
 const DARK = 150;
 
 /**
@@ -259,7 +303,7 @@ export function fitColumnLines(detected: readonly number[], minScale = 0.5): Col
             }
             const xs = template.map((t) => Math.round(offset + scale * t));
             if (!best || inliers > best.inliers || (inliers === best.inliers && err < bestErr)) {
-              best = { templateIndex, scale, offset, xs, inliers };
+              best = { templateIndex, scale, offset, xs, inliers, kind: 'schedule' };
               bestErr = err;
             }
           }
@@ -269,6 +313,79 @@ export function fitColumnLines(detected: readonly number[], minScale = 0.5): Col
   }
   if (!best || best.inliers < 8) return null;
   return best;
+}
+
+/**
+ * Map the 18 printed-PTR rules onto the 21 schedule slots.
+ * Capital gains, partial, and bracket K are not printed, so those slots
+ * share a boundary and stay empty.
+ */
+export function expandOfficialPtrRules(rules: readonly number[]): number[] {
+  const rule = (index: number): number => rules[index] ?? rules[rules.length - 1] ?? 0;
+  return [
+    rule(0), rule(1), rule(2), rule(3), rule(4),
+    rule(5), rule(5), rule(5),
+    rule(6),
+    rule(7), rule(8), rule(9), rule(10), rule(11), rule(12), rule(13), rule(14), rule(15), rule(16),
+    rule(17), rule(17),
+  ];
+}
+
+/**
+ * Fit the printed PTR column rules.
+ * A hit is a template rule with a detected line within 12px, and both
+ * outer rules have to hit. The attached schedule does not clear the hit
+ * floor, so this fit does not steal those pages.
+ */
+export function fitOfficialPtrLines(detected: readonly number[]): ColumnFit | null {
+  if (detected.length < 8) return null;
+  const template = OFFICIAL_PTR_TEMPLATE;
+  let best: { hits: number; err: number; scale: number; offset: number } | null = null;
+  for (let i = 0; i < detected.length; i += 1) {
+    for (let j = i + 1; j < detected.length; j += 1) {
+      for (let a = 0; a < template.length; a += 1) {
+        for (let b = a + 1; b < template.length; b += 1) {
+          const denom = template[b] - template[a];
+          if (denom === 0) continue;
+          const scale = (detected[j] - detected[i]) / denom;
+          if (scale < OFFICIAL_PTR_MIN_SCALE || scale > OFFICIAL_PTR_MAX_SCALE) continue;
+          const offset = detected[i] - scale * template[a];
+          let hits = 0;
+          let err = 0;
+          let first = false;
+          let last = false;
+          for (let t = 0; t < template.length; t += 1) {
+            const predicted = offset + scale * template[t];
+            let nearest = Number.POSITIVE_INFINITY;
+            for (const x of detected) {
+              const distance = Math.abs(x - predicted);
+              if (distance < nearest) nearest = distance;
+            }
+            if (nearest < 12) {
+              hits += 1;
+              err += nearest;
+              if (t === 0) first = true;
+              if (t === template.length - 1) last = true;
+            }
+          }
+          if (!first || !last) continue;
+          if (!best || hits > best.hits || (hits === best.hits && err < best.err)) {
+            best = { hits, err, scale, offset };
+          }
+        }
+      }
+    }
+  }
+  if (!best || best.hits < OFFICIAL_PTR_MIN_HITS) return null;
+  const rules = template.map((value) => Math.round(best.offset + best.scale * value));
+  return {
+    templateIndex: -1,
+    scale: best.scale,
+    offset: best.offset,
+    xs: expandOfficialPtrRules(rules),
+    inliers: best.hits,
+    kind: 'official',
+  };
 }
 
 function crop(image: GrayImage, x0: number, y0: number, x1: number, y1: number): GrayImage {
@@ -476,20 +593,7 @@ export function classifyMarkScores(scores: readonly number[]): ClassifiedMarks {
 }
 
 function parseLooseDate(text: string): string | null {
-  const match = DATE_RE.exec(text.replace(/\s+/g, ''));
-  if (!match) return null;
-  let month = Number(match[1]);
-  const day = Number(match[2]);
-  let year = Number(match[3]);
-  if (year < 100) year += 2000;
-  // "10" is often read as 16, 20, 30, or 40. Those months cannot exist, so keep the day.
-  if (month === 16 || month === 18 || month === 19 || month === 20 || month === 30 || month === 40) month = 10;
-  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1990 || year > 2100) return null;
-  const dt = new Date(Date.UTC(year, month - 1, day));
-  if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) return null;
-  const mm = String(month).padStart(2, '0');
-  const dd = String(day).padStart(2, '0');
-  return `${year}-${mm}-${dd}`;
+  return parseGridFormLooseDate(text);
 }
 
 function ownerFromText(text: string): Owner | null {
@@ -644,15 +748,26 @@ export type OwnerMatchDetail = {
   height: number;
 };
 
-/** DC, SP, or JT from the owner cell. Blank ink stays null. */
-export function ownerCodeFromCell(
+/** Blank form cell vs unreadable ink vs a confident SP/DC/JT read. */
+export type OwnerCellRead =
+  | { kind: 'code'; owner: Owner }
+  | { kind: 'blank' }
+  | { kind: 'unread' };
+
+type OwnerCellMask = {
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  ink: number;
+};
+
+function ownerCellMask(
   image: GrayImage,
   x0: number,
   y0: number,
   x1: number,
   y1: number,
-  detail?: OwnerMatchDetail,
-): Owner | null {
+): OwnerCellMask | null {
   const left = Math.max(0, Math.floor(x0) + 4);
   const right = Math.min(image.width, Math.ceil(x1) - 4);
   const top = Math.max(0, Math.floor(y0) + 2);
@@ -686,7 +801,43 @@ export function ownerCodeFromCell(
   }
   let ink = 0;
   for (const value of mask) ink += value;
-  if (ink < 10) return null;
+  return { mask, width, height, ink };
+}
+
+/**
+ * Read the owner column on a House grid row. A cell with no ink is blank — on
+ * the PTR form that means the filer (self). Ink without a confident DC/SP/JT
+ * pair is unread and must not be treated as self.
+ */
+export function readOwnerCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): OwnerCellRead {
+  const owner = ownerCodeFromCell(image, x0, y0, x1, y1, detail);
+  if (owner) return { kind: 'code', owner };
+  // ownerCodeFromCell returns null for blank and unread; distinguish via ink.
+  const cell = ownerCellMask(image, x0, y0, x1, y1);
+  if (!cell) return { kind: 'unread' };
+  return cell.ink < 10 ? { kind: 'blank' } : { kind: 'unread' };
+}
+
+/** DC, SP, or JT from the owner cell when ink reads as a code; else null. */
+export function ownerCodeFromCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): Owner | null {
+  const cell = ownerCellMask(image, x0, y0, x1, y1);
+  if (!cell) return null;
+  const { mask, width, height, ink } = cell;
+  if (ink < 10) return null; // blank — use readOwnerCell to tell blank from unread
   let glyph = trimGlyph(mask, width, height);
   if (!glyph) return null;
   if (glyph.height > 16) {
@@ -800,21 +951,29 @@ function medianNumber(values: readonly number[]): number {
 
 /**
  * Column fit for one page.
- * The usual window starts below the running header. A short table that
- * sits entirely above that window (a last page with a few rows) is fit
- * again from the top of the page.
+ * The printed PTR (owner, three type columns, brackets A–J) is tried
+ * before the attached-schedule templates. A short table that sits above
+ * the usual window is fit again from the top of the page.
  */
 export function planHouseGridColumns(image: GrayImage): ColumnFit | null {
-  const primary = fitColumnLines(detectVerticalLines(
+  const primaryLines = detectVerticalLines(
     image,
     Math.floor(image.height * 0.28),
     Math.floor(image.height * 0.92),
-  ));
-  if (primary && primary.inliers >= GRID_MIN_INLIERS) return primary;
-  const fallback = fitColumnLines(
-    detectVerticalLines(image, Math.floor(image.height * 0.05), Math.floor(image.height * 0.72), 0.15),
-    0.42,
   );
+  const official = fitOfficialPtrLines(primaryLines);
+  if (official) return official;
+  const primary = fitColumnLines(primaryLines);
+  if (primary && primary.inliers >= GRID_MIN_INLIERS) return primary;
+  const fallbackLines = detectVerticalLines(
+    image,
+    Math.floor(image.height * 0.05),
+    Math.floor(image.height * 0.72),
+    0.15,
+  );
+  const officialFallback = fitOfficialPtrLines(fallbackLines);
+  if (officialFallback) return officialFallback;
+  const fallback = fitColumnLines(fallbackLines, 0.42);
   if (fallback && fallback.inliers >= GRID_MIN_INLIERS) return fallback;
   return null;
 }
@@ -984,8 +1143,94 @@ export function rowBands(image: GrayImage, xs: readonly number[]): { bands: Arra
   return { bands, sectionBars: barBottoms.length };
 }
 
-/** Cover sample grid: no trust bar, and a rule in the top of the page. */
-export function shouldSkipHouseGridCover(image: GrayImage, xs: readonly number[], sectionBars: number): boolean {
+/**
+ * Row bands for the printed PTR.
+ * Amount-column rules at the data pitch are kept. The sample row is shorter
+ * than that pitch, and the filer block above the table is a separate run.
+ * The longest run is the transaction table. Dollar-range ink in the header
+ * is thicker than a rule and is not a trust bar.
+ */
+export function officialPtrRowBands(
+  image: GrayImage,
+  xs: readonly number[],
+): { bands: Array<{ y0: number; y1: number }>; sectionBars: number } {
+  const none = { bands: [] as Array<{ y0: number; y1: number }>, sectionBars: 0 };
+  const x0 = Math.max(0, Math.floor(xs[9] ?? 0));
+  const x1 = Math.min(image.width, Math.floor(xs[xs.length - 1] ?? 0));
+  if (x1 - x0 < 40) return none;
+  const groups: number[][] = [];
+  for (let y = 0; y < image.height; y += 1) {
+    let dark = 0;
+    const row = y * image.width;
+    for (let x = x0; x < x1; x += 1) {
+      if (image.pixels[row + x] < 200) dark += 1;
+    }
+    if (dark <= (x1 - x0) * 0.22) continue;
+    const last = groups[groups.length - 1];
+    if (last && y - last[last.length - 1] <= 3) last.push(y);
+    else groups.push([y]);
+  }
+  const rules: number[] = [];
+  for (const group of groups) {
+    if (group.length <= 8) rules.push(Math.round(group.reduce((sum, value) => sum + value, 0) / group.length));
+  }
+  if (rules.length < 3) return none;
+  const gaps = rules.slice(1).map((rule, index) => rule - rules[index]);
+  const pitchGaps = gaps.filter((gap) => gap >= 45 && gap <= 90);
+  const pitch = medianNumber(pitchGaps.length >= 3 ? pitchGaps : gaps.filter((gap) => gap >= 24 && gap <= 140));
+  if (!(pitch > 0)) return none;
+  const candidates: Array<{ y0: number; y1: number }> = [];
+  for (let i = 0; i < rules.length - 1; i += 1) {
+    const y0 = rules[i];
+    const y1 = rules[i + 1];
+    const height = y1 - y0;
+    if (height < pitch * 0.8 || height > pitch * 1.35) continue;
+    let dark = 0;
+    const sample = Math.max(1, x1 - x0);
+    for (let y = y0 + 2; y < y1 - 2; y += 2) {
+      const row = y * image.width;
+      for (let x = x0; x < x1; x += 4) {
+        if (image.pixels[row + x] < DARK) dark += 1;
+      }
+    }
+    const samples = Math.max(1, Math.ceil((y1 - y0) / 2) * Math.ceil(sample / 4));
+    if (dark / samples > 0.45) continue;
+    candidates.push({ y0, y1 });
+  }
+  const runs: Array<Array<{ y0: number; y1: number }>> = [];
+  let run: Array<{ y0: number; y1: number }> = [];
+  for (const band of candidates) {
+    const previous = run[run.length - 1];
+    if (previous && band.y0 !== previous.y1) {
+      runs.push(run);
+      run = [];
+    }
+    run.push(band);
+  }
+  if (run.length > 0) runs.push(run);
+  runs.sort((left, right) => right.length - left.length || right[0].y0 - left[0].y0);
+  return { bands: runs[0] ?? [], sectionBars: 0 };
+}
+
+export function layoutHouseGridRows(
+  image: GrayImage,
+  fit: ColumnFit,
+): { bands: Array<{ y0: number; y1: number }>; sectionBars: number } {
+  if (fit.kind === 'official') return officialPtrRowBands(image, fit.xs);
+  return rowBands(image, fit.xs);
+}
+
+/**
+ * Schedule cover: no trust bar, and a rule in the top of the page.
+ * The printed PTR has that same header rule and is not a cover.
+ */
+export function shouldSkipHouseGridCover(
+  image: GrayImage,
+  xs: readonly number[],
+  sectionBars: number,
+  kind: GridFormKind = 'schedule',
+): boolean {
+  if (kind === 'official') return false;
   return sectionBars === 0 && hasEarlyHorizontalRule(image, xs);
 }
 
@@ -1019,7 +1264,14 @@ function scoreRowCells(
       continue;
     }
     const inset = 4;
-    const cell = crop(image, xs[column] + inset, y0 + 2, xs[column + 1] - inset, y1 - 2);
+    const left = xs[column] + inset;
+    const right = xs[column + 1] - inset;
+    // Capital gains, partial, and bracket K are not printed on the PTR grid.
+    if (right - left < 8) {
+      scores.push(0);
+      continue;
+    }
+    const cell = crop(image, left, y0 + 2, right, y1 - 2);
     const score = matchTemplateMax(cell, template);
     scores.push(score);
     if (score >= MARK_SCORE_MIN) marked += 1;
@@ -1192,15 +1444,31 @@ const TICKER_DENY = new Set([
 
 /**
  * A parenthetical ticker stays. A bare ticker is the last token only when
- * two spaces separate it from the asset name, which is how these grids
- * print the symbol after the name.
+ * two spaces separate it from the asset name, which is how the attached
+ * schedule prints the symbol.
+ *
+ * The printed PTR uses one space. That split still requires the previous
+ * word to be a form word (ETF, INC) or to contain a lowercase letter, so an
+ * all-caps name such as "US TREASURY NOTE" keeps NOTE.
  */
-export function splitBareTicker(text: string): { name: string; ticker: string | null } {
+export function splitBareTicker(text: string, spaces: 1 | 2 = 2): { name: string; ticker: string | null } {
   const paren = text.match(/\(([A-Z]{1,5})\)/);
   if (paren) return { name: text, ticker: paren[1] };
-  const match = text.match(/^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$/);
-  if (!match || TICKER_DENY.has(match[2])) return { name: text, ticker: null };
-  return { name: match[1], ticker: match[2] };
+  const wide = text.match(/^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$/);
+  if (wide && !TICKER_DENY.has(wide[2])) return { name: wide[1], ticker: wide[2] };
+  if (spaces !== 1) return { name: text, ticker: null };
+  const narrow = text.match(/^(.*\S)[ \t]+([A-Z]{2,5})[ \t]*$/);
+  if (!narrow || TICKER_DENY.has(narrow[2]) || !officialOneSpaceTicker(narrow[1])) {
+    return { name: text, ticker: null };
+  }
+  return { name: narrow[1], ticker: narrow[2] };
+}
+
+function officialOneSpaceTicker(name: string): boolean {
+  const previous = name.trim().split(/\s+/).pop() ?? '';
+  const letters = previous.replace(/[^A-Za-z]/g, '');
+  if (TICKER_DENY.has(letters.toUpperCase())) return true;
+  return /[a-z]/.test(previous);
 }
 
 export function cleanGridAssetName(text: string): string {
@@ -1231,7 +1499,7 @@ export function cleanGridAssetName(text: string): string {
         continue;
       }
       if (words[words.length - 1] === piece) continue;
-      if (piece.length === 1 && !/^[A-Z]$/.test(piece)) continue;
+      if (piece.length === 1 && piece !== '&' && !/^[A-Z]$/.test(piece)) continue;
       words.push(piece);
     }
   }
@@ -1267,24 +1535,45 @@ function assetText(boxes: readonly HouseGridOcrBox[], xs: readonly number[]): { 
   return { text: readingOrder(hits), conf };
 }
 
-function confidenceFor(marks: ClassifiedMarks, assetConf: number, hasDate: boolean, asset: string): number {
+function confidenceFor(
+  marks: ClassifiedMarks,
+  assetConf: number,
+  hasDate: boolean,
+  dateConfidenceOk: boolean,
+  asset: string,
+  ownerUnread: boolean,
+): number {
   if (marks.typeReason !== 'ok') return 0.35;
   const strong = marks.typeScore >= GRID_STRONG_MARK
     && marks.amountReason === 'ok'
     && marks.amountScore >= GRID_STRONG_MARK
     && hasDate
+    && dateConfidenceOk
     && asset.trim().length >= 4
-    && assetConf >= 0.45;
+    && assetConf >= 0.45
+    && !ownerUnread;
   if (strong) return 0.97;
   let score = 0.42;
   score += Math.min(0.2, marks.typeScore * 0.2);
   if (marks.amountReason === 'ok') score += 0.12;
   if (hasDate) score += 0.08;
   if (asset.trim().length >= 4) score += 0.08 * Math.min(1, assetConf);
+  if (ownerUnread) score = Math.min(score, 0.94);
   return Math.min(0.9, score);
 }
 
-function pageRows(page: HouseGridPageInput): {
+/** Header, sample, and attachment lines on the printed PTR. Marks do not keep them. */
+function isOfficialGridChrome(asset: string, txDate: string | null): boolean {
+  if (looksLikeHeaderContaminatedAsset(asset) || looksLikeColumnHeaderAsset(asset)) return true;
+  if (looksLikePtrFormSampleAsset(asset)) return true;
+  if (looksLikePtrFormSampleRow({ assetName: asset, rawText: asset, txDate })) return true;
+  if (looksLikeSeeAttachmentPointer(asset)) return true;
+  if (/provide full name|ticker symbol|full asset name|filer notes|footnote|amount of transaction|type of trans|publicly disclosed/i.test(asset)) return true;
+  if (txDate && looksLikePtrFormSampleDate(txDate)) return true;
+  return false;
+}
+
+function pageRows(page: HouseGridPageInput, dateContext: GridFormDateContext): {
   detected: boolean;
   transactions: ParsedTx[];
   markedCells: number;
@@ -1293,11 +1582,11 @@ function pageRows(page: HouseGridPageInput): {
   const empty = { detected: false, transactions: [], markedCells: 0, markCells: 0 };
   const fit = planHouseGridColumns(page.image);
   if (!fit || fit.xs.length < 21) return empty;
-  const laidOut = rowBands(page.image, fit.xs);
-  // The cover prints a sample grid under the filer block and has no trust
-  // bar. A ruled line in the top of that page is the filer form, not a trade.
-  if (shouldSkipHouseGridCover(page.image, fit.xs, laidOut.sectionBars)) return empty;
-  const sized = xTemplateForFit(fit.scale);
+  const laidOut = layoutHouseGridRows(page.image, fit);
+  // The attached schedule's cover prints a sample grid under the filer block
+  // and has no trust bar. The printed PTR has that header rule and real rows.
+  if (shouldSkipHouseGridCover(page.image, fit.xs, laidOut.sectionBars, fit.kind)) return empty;
+  const sized = xTemplateForFit(fit.kind === 'official' ? fit.scale * OFFICIAL_MARK_SCALE : fit.scale);
   const bands = laidOut.bands;
   const transactions: ParsedTx[] = [];
   let markedCells = 0;
@@ -1310,19 +1599,25 @@ function pageRows(page: HouseGridPageInput): {
     const marks = classifyMarkScores(scores);
     const inBand = boxesInRow(page.boxes, band.y0, band.y1);
     const asset = assetText(inBand, fit.xs);
-    const glyphOwner = ownerCodeFromCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
+    const ownerRead = readOwnerCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
     const textOwner = inBand
       .filter((box) => box.x1 <= (fit.xs[1] ?? 0) + 12 && box.conf >= 0.4)
       .map((box) => ownerFromText(box.text))
       .find((owner): owner is Owner => owner !== null) ?? null;
+    const matchedOwner = ownerRead.kind === 'code' ? ownerRead.owner : null;
     // Glyph scores never swapped spouse and dependent on the scored filing.
-    // Text fills the cells the glyph leaves blank.
-    const owner = glyphOwner ?? textOwner;
+    // Text fills the cells the glyph leaves blank. A blank owner cell is self.
+    let owner: Owner | null = matchedOwner ?? textOwner;
+    let ownerUnread = false;
+    if (!owner && ownerRead.kind === 'blank') owner = 'self';
+    else if (!owner && ownerRead.kind === 'unread') ownerUnread = true;
     const tradeLeft = fit.xs[7] ?? 0;
     const tradeRight = fit.xs[8] ?? tradeLeft;
     const notifRight = fit.xs[9] ?? tradeRight;
     let tradeDate: string | null = null;
     let notifDate: string | null = null;
+    let tradeRaw: string | null = null;
+    let notifRaw: string | null = null;
     for (const box of inBand) {
       const iso = parseLooseDate(box.text);
       if (!iso) continue;
@@ -1330,9 +1625,26 @@ function pageRows(page: HouseGridPageInput): {
       // The left date column is the trade. The right column is the notification.
       // A missed trade-date word stays null instead of copying the notification.
       if (cx >= tradeLeft - 8 && cx < tradeRight) {
-        if (!tradeDate) tradeDate = iso;
+        if (!tradeDate) {
+          tradeDate = iso;
+          tradeRaw = box.text.trim();
+        }
       } else if (cx >= tradeRight && cx <= notifRight + 8) {
-        if (!notifDate) notifDate = iso;
+        if (!notifDate) {
+          notifDate = iso;
+          notifRaw = box.text.trim();
+        }
+      }
+    }
+    if (!tradeDate) {
+      for (const box of inBand) {
+        if (box.x0 < tradeLeft - 4 || box.x1 > tradeRight + 2) continue;
+        if (box.x0 >= tradeRight) continue;
+        const iso = parseLooseDate(box.text);
+        if (!iso) continue;
+        tradeDate = iso;
+        tradeRaw = box.text.trim();
+        break;
       }
     }
     // A "26" read as "25" is a year behind the notification, not a 2025 trade.
@@ -1340,11 +1652,22 @@ function pageRows(page: HouseGridPageInput): {
       const snapped = `${notifDate.slice(0, 4)}-${tradeDate.slice(5)}`;
       if (snapped <= notifDate) tradeDate = snapped;
     }
-    const chrome = looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text);
+    const dates = refineGridFormRowDates(
+      { tradeDate, notifDate, tradeRaw, notifRaw },
+      dateContext,
+    );
+    tradeDate = dates.tradeDate;
+    notifDate = dates.notifDate;
     const hasMark = marks.typeReason !== 'unmarked' || marks.amountReason !== 'unmarked' || marks.capGainsOver200;
     if (!asset.text && !hasMark) continue;
-    if (chrome && !hasMark) continue;
-    const named = splitBareTicker(asset.text);
+    if (fit.kind === 'official') {
+      // The sample row is marked. Header text and that sample never become trades.
+      if (isOfficialGridChrome(asset.text, tradeDate)) continue;
+      if (marks.typeReason !== 'ok' || !asset.text.trim()) continue;
+    } else if ((looksLikeHeaderContaminatedAsset(asset.text) || looksLikeColumnHeaderAsset(asset.text)) && !hasMark) {
+      continue;
+    }
+    const named = splitBareTicker(asset.text, fit.kind === 'official' ? 1 : 2);
     const assetName = cleanGridAssetName(named.name) || named.name;
     const notes: string[] = [`grid page ${pageNum}`];
     if (marks.partial) notes.push('partial transaction box marked');
@@ -1353,8 +1676,11 @@ function pageRows(page: HouseGridPageInput): {
     if (marks.amountReason === 'unmarked') notes.push('no amount box marked');
     if (marks.amountReason === 'ambiguous') notes.push('amount marks were ambiguous');
     if (marks.amountReason === 'column_k') notes.push('amount column K marked');
+    if (dates.repaired) notes.push('date digit repair applied');
+    if (tradeDate && !dates.dateConfidenceOk) notes.push('date plausibility lowered confidence');
     const warnings: NonNullable<ParsedTx['extractionWarnings']> = [];
     if (marks.typeReason !== 'ok' || marks.txType === null) warnings.push('grid_type_unmarked');
+    if (ownerUnread) warnings.push('owner_unread');
     const txType = marks.txType ?? ('' as TxType);
     transactions.push({
       txDate: tradeDate,
@@ -1370,7 +1696,14 @@ function pageRows(page: HouseGridPageInput): {
       rawText: `${asset.text || '(unreadable)'} | type ${marks.txType ?? 'unmarked'} | amt ${marks.amountLetter ?? 'blank'}`,
       supplementalText: notes.join('; '),
       description: notifDate ? `date notified ${notifDate}` : null,
-      confidence: confidenceFor(marks, asset.conf, Boolean(tradeDate), asset.text),
+      confidence: confidenceFor(
+        marks,
+        asset.conf,
+        Boolean(tradeDate),
+        dates.dateConfidenceOk,
+        asset.text,
+        ownerUnread,
+      ),
       ...(warnings.length ? { extractionWarnings: warnings } : {}),
     });
   }
@@ -1378,13 +1711,17 @@ function pageRows(page: HouseGridPageInput): {
 }
 
 /** Read every supplied page. A filing is a grid form when any page fits. */
-export function readHouseGridForm(pages: readonly HouseGridPageInput[]): HouseGridRead {
+export function readHouseGridForm(
+  pages: readonly HouseGridPageInput[],
+  options: HouseGridReadOptions = {},
+): HouseGridRead {
+  const dateContext: GridFormDateContext = { filedDate: options.filedDate ?? null };
   const transactions: ParsedTx[] = [];
   let gridPages = 0;
   let markedCells = 0;
   let markCells = 0;
   for (const page of pages) {
-    const read = pageRows(page);
+    const read = pageRows(page, dateContext);
     if (!read.detected) continue;
     gridPages += 1;
     markedCells += read.markedCells;

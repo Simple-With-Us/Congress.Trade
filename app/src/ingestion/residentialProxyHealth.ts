@@ -31,7 +31,32 @@ import {
 } from './senateEfdHealth.ts';
 
 export const RESIDENTIAL_PROXY_HEALTH_KV_KEY = 'residential-proxy:health';
+/** Hysteresis + outage windows for health_senate_relay (CT-2498). */
+export const RESIDENTIAL_PROXY_STATE_KV_KEY = 'residential-proxy:state';
+/** One-shot flag: watcher should run Senate poll promptly after proxy recovery. */
+export const RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY = 'residential-proxy:senate-catchup';
 export const RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS = 5_000;
+/** Backoff between tunneled liveness attempts on a single watcher tick (CT-2498). */
+export const RESIDENTIAL_PROXY_PROBE_BACKOFF_MS = [0, 500, 1_500] as const;
+export const DEFAULT_RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD = 3;
+
+function delayMs(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const n = parseInt(raw ?? '', 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.floor(n));
+}
+
+export function readResidentialProxyProbeFailureThreshold(env: Env): number {
+  return parsePositiveInt(
+    env.RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD,
+    DEFAULT_RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD,
+  );
+}
 
 /** Cheap origin fetched *through* the HTTP proxy (never GET {proxy}/health). */
 export const RESIDENTIAL_PROXY_PROBE_TARGET_URL = 'http://example.com/';
@@ -42,6 +67,18 @@ export interface ResidentialProxyProbeRecord {
   status: number | null;
   checkedAt: string;
   host: string | null;
+  /** Present when ok is false after hysteresis tripped (CT-2498). */
+  consecutiveFailures?: number;
+  outageStartedAt?: string | null;
+}
+
+export interface ResidentialProxyProbeState {
+  consecutiveFailures: number;
+  /** True once hysteresis has published a down probe (pages health_senate_relay). */
+  reportedDown: boolean;
+  currentOutageStartedAt: string | null;
+  lastOutageStartedAt: string | null;
+  lastOutageEndedAt: string | null;
 }
 
 export interface ResidentialProxyHealthResult {
@@ -65,6 +102,25 @@ export interface ResidentialProxyHealthResult {
  * (equivalent to `curl -x {proxy} http://example.com`).  Never issues a plain
  * GET to `{proxy}/health` — tinyproxy has no health route and will wedge workers.
  */
+/**
+ * Tunnel probe with bounded in-tick retries (CT-2498).  A single Mango flap
+ * should not flip the published health record on one refused connection.
+ */
+export async function probeResidentialProxyHealthWithRetry(
+  proxyUrlOrEnv?: string | Env,
+  fetchImpl: typeof fetch = globalThis.fetch,
+  timeoutMs = RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS,
+  backoffMs: readonly number[] = RESIDENTIAL_PROXY_PROBE_BACKOFF_MS,
+): Promise<ResidentialProxyHealthResult> {
+  let last: ResidentialProxyHealthResult | null = null;
+  for (let i = 0; i < backoffMs.length; i++) {
+    if (i > 0) await delayMs(backoffMs[i] ?? 0);
+    last = await probeResidentialProxyHealth(proxyUrlOrEnv, fetchImpl, timeoutMs);
+    if (!last.configured || last.reachable) return last;
+  }
+  return last!;
+}
+
 export async function probeResidentialProxyHealth(
   proxyUrlOrEnv?: string | Env,
   fetchImpl: typeof fetch = globalThis.fetch,
@@ -155,23 +211,184 @@ function residentialProxyHost(proxyUrl: string): string | null {
   }
 }
 
+export async function readResidentialProxyProbeState(env: Env): Promise<ResidentialProxyProbeState | null> {
+  if (!env.CONFIG_KV) return null;
+  try {
+    const raw = await env.CONFIG_KV.get(RESIDENTIAL_PROXY_STATE_KV_KEY, 'json');
+    if (!raw || typeof raw !== 'object') return null;
+    const rec = raw as ResidentialProxyProbeState;
+    if (!Number.isFinite(rec.consecutiveFailures) || typeof rec.reportedDown !== 'boolean') return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+async function persistResidentialProxyProbeState(env: Env, state: ResidentialProxyProbeState): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(RESIDENTIAL_PROXY_STATE_KV_KEY, JSON.stringify(state), {
+      expirationTtl: 86_400 * 14,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Apply consecutive-failure hysteresis before writing the cached probe that
+ * `/api/health` reads.  Exported for tests (CT-2498).
+ */
+export function applyResidentialProxyHysteresis(
+  prev: ResidentialProxyProbeState | null,
+  probeResult: ResidentialProxyHealthResult,
+  now: Date,
+  failureThreshold: number,
+): { state: ResidentialProxyProbeState; published: ResidentialProxyProbeRecord; recovery: boolean } {
+  const checkedAt = now.toISOString();
+  const host = probeResult.proxyUrl ? residentialProxyHost(probeResult.proxyUrl) : null;
+  const empty: ResidentialProxyProbeState = {
+    consecutiveFailures: 0,
+    reportedDown: false,
+    currentOutageStartedAt: null,
+    lastOutageStartedAt: null,
+    lastOutageEndedAt: null,
+  };
+  const prior = prev ?? empty;
+
+  if (!probeResult.configured) {
+    return {
+      state: { ...empty },
+      published: { ok: true, status: null, checkedAt, host: null },
+      recovery: false,
+    };
+  }
+
+  if (probeResult.reachable) {
+    const wasDown = prior.reportedDown;
+    const state: ResidentialProxyProbeState = {
+      consecutiveFailures: 0,
+      reportedDown: false,
+      currentOutageStartedAt: null,
+      lastOutageStartedAt: wasDown ? prior.currentOutageStartedAt ?? prior.lastOutageStartedAt : prior.lastOutageStartedAt,
+      lastOutageEndedAt: wasDown ? checkedAt : prior.lastOutageEndedAt,
+    };
+    if (wasDown && prior.currentOutageStartedAt) {
+      state.lastOutageStartedAt = prior.currentOutageStartedAt;
+    }
+    return {
+      state,
+      published: { ok: true, status: probeResult.status ?? null, checkedAt, host },
+      recovery: wasDown,
+    };
+  }
+
+  const consecutiveFailures = prior.consecutiveFailures + 1;
+  const tripped = consecutiveFailures >= failureThreshold;
+  if (!tripped) {
+    return {
+      state: {
+        ...prior,
+        consecutiveFailures,
+        reportedDown: false,
+      },
+      published: {
+        ok: true,
+        status: probeResult.status ?? null,
+        checkedAt,
+        host,
+      },
+      recovery: false,
+    };
+  }
+
+  const outageStartedAt = prior.currentOutageStartedAt ?? checkedAt;
+  return {
+    state: {
+      consecutiveFailures,
+      reportedDown: true,
+      currentOutageStartedAt: outageStartedAt,
+      lastOutageStartedAt: prior.lastOutageStartedAt,
+      lastOutageEndedAt: prior.lastOutageEndedAt,
+    },
+    published: {
+      ok: false,
+      status: probeResult.status ?? null,
+      checkedAt,
+      host,
+      consecutiveFailures,
+      outageStartedAt,
+    },
+    recovery: false,
+  };
+}
+
+/** Returns true when a residential-proxy recovery requested a prompt Senate poll. */
+export async function consumeResidentialProxySenateCatchup(env: Env): Promise<boolean> {
+  if (!env.CONFIG_KV) return false;
+  try {
+    const raw = await env.CONFIG_KV.get(RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY);
+    if (!raw) return false;
+    await env.CONFIG_KV.delete(RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function requestResidentialProxySenateCatchup(env: Env, recoveryAt: string): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY, recoveryAt, {
+      expirationTtl: 7200,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
 export async function refreshResidentialProxyHealth(env: Env, now = new Date()): Promise<void> {
   const proxyUrl = resolveResidentialProxyUrl(env, { allowDefault: false });
   const checkedAt = now.toISOString();
   if (!proxyUrl) {
     await persistResidentialProxyProbe(env, { ok: true, status: null, checkedAt, host: null });
+    await persistResidentialProxyProbeState(env, {
+      consecutiveFailures: 0,
+      reportedDown: false,
+      currentOutageStartedAt: null,
+      lastOutageStartedAt: null,
+      lastOutageEndedAt: null,
+    });
     await refreshSenateEfdProxyProbe(env, now, { proxyUrl: undefined, proxyReachable: false });
     return;
   }
-  const result = await probeResidentialProxyHealth(env, globalThis.fetch, RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS);
-  const host = result.proxyUrl ? residentialProxyHost(result.proxyUrl) : null;
-  await persistResidentialProxyProbe(env, {
-    ok: result.reachable,
-    status: result.status ?? null,
-    checkedAt,
-    host,
+  const result = await probeResidentialProxyHealthWithRetry(
+    env,
+    globalThis.fetch,
+    RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS,
+  );
+  const threshold = readResidentialProxyProbeFailureThreshold(env);
+  const prevState = await readResidentialProxyProbeState(env);
+  const { state, published, recovery } = applyResidentialProxyHysteresis(prevState, result, now, threshold);
+  await persistResidentialProxyProbeState(env, state);
+  await persistResidentialProxyProbe(env, published);
+  if (recovery) {
+    console.log(
+      `residentialProxy: proxy recovered at ${checkedAt}`
+        + (state.lastOutageStartedAt ? ` after outage since ${state.lastOutageStartedAt}` : '')
+        + ' — scheduling prompt Senate fetch catch-up',
+    );
+    await requestResidentialProxySenateCatchup(env, checkedAt);
+  } else if (!result.reachable && state.consecutiveFailures > 0 && state.consecutiveFailures < threshold) {
+    console.warn(
+      `residentialProxy: probe failed ${state.consecutiveFailures}/${threshold} (in-tick retries exhausted); `
+        + 'health_senate_relay stays up until threshold',
+    );
+  }
+  await refreshSenateEfdProxyProbe(env, now, {
+    proxyUrl,
+    proxyReachable: published.ok,
   });
-  await refreshSenateEfdProxyProbe(env, now, { proxyUrl, proxyReachable: result.reachable });
 }
 
 // ---------------------------------------------------------------------------
