@@ -1,3 +1,7 @@
+## 2026-11-12 CURSOR — Cloudflare-only origin gate, default off (CT-1337)
+
+Requests are accepted from Cloudflare edge ranges, a shared origin secret, or an Authenticated Origin Pulls header set by a trusted proxy.  Loopback and docker-network `GET`/`HEAD` `/health` and `/api/health` stay open.  `ORIGIN_LOCK_ENABLED` defaults off, so a merge does not change traffic.  `CF-Connecting-IP` and `X-Forwarded-For` are trusted only after the peer is Cloudflare.  The host firewall for ports 80 and 443 stays out of scope.  Rollout: `docs/rollouts/2026-11-12-origin-lock-request-gate.md`.
+
 ## 2026-11-11 CURSOR — compress local sqlite backup dumps on root (CT-2472)
 
 Complete local dumps are zstd `.db.zst` files on the root disk, next to the raw-db `.sha256`.  Keep counts stay Socratic 4 / 2 days, Congress 4 / 2 days, and Usage-Monitor 2 / 2 days.  Dumps stay on `/backups` via the `/data/backups` symlink.  Incomplete dumps are not compressed.  B2/R2 keep policy is unchanged.  This does not install the host copies.  Rollout: `docs/rollouts/2026-11-11-compress-local-sqlite-dumps.md`.

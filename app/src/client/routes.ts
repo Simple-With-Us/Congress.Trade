@@ -179,7 +179,7 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
     }
     // Same anti-scrape daily row budget as /api/transactions — both pagers
     // walk the identical corpus, so they draw on one shared per-IP budget.
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
@@ -196,7 +196,7 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
     if (!id || id.length > 128) return c.json({ error: 'invalid trade id' }, 400);
     // Same per-IP daily row budget as /feed — a detail endpoint is still a
     // corpus read and must not be a free side-channel around the pager budget.
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
@@ -219,7 +219,7 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
   r.get('/ticker/:ticker', async (c) => {
     const ticker = normalizeTickerLogoSymbol(c.req.param('ticker'));
     if (!ticker) return c.json({ error: 'invalid ticker' }, 400);
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
@@ -284,7 +284,7 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
     if (!memberIdOrName || memberIdOrName.length > 120) {
       return c.json({ error: 'invalid member id or name' }, 400);
     }
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
