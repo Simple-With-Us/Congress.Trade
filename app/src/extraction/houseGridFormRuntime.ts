@@ -204,8 +204,7 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
               { x0: plan.xs[7] + 1, x1: plan.xs[8] - 1, scale: 2, whitelist: '0123456789/', psm: '11' },
               { x0: plan.xs[8] + 1, x1: plan.xs[9] - 1, scale: 2, whitelist: '0123456789/', psm: '11' },
             ];
-            for (let stripIndex = 0; stripIndex < strips.length; stripIndex += 1) {
-              const strip = strips[stripIndex];
+            const recognized = await Promise.all(strips.map(async (strip, stripIndex) => {
               const crop = cropGray(image, strip.x0, 0, strip.x1, image.height, strip.scale);
               const path = `${dir}/strip-${i}-${stripIndex}.pgm`;
               await Deno.writeFile(path, pgmBytes(crop));
@@ -213,6 +212,9 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
               if (strip.whitelist) args.push('-c', `tessedit_char_whitelist=${strip.whitelist}`);
               args.push('tsv');
               const ocr = await runBinary(TESSERACT, args, 60_000);
+              return { strip, crop, ocr };
+            }));
+            for (const { strip, crop, ocr } of recognized) {
               if (ocr.code !== 0) continue;
               const text = new TextDecoder().decode(ocr.stdout);
               for (const box of parseTesseractTsv(text, crop.width, crop.height)) {
