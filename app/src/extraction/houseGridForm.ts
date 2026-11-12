@@ -650,48 +650,20 @@ export type OwnerCellRead =
   | { kind: 'blank' }
   | { kind: 'unread' };
 
-/**
- * Read the owner column on a House grid row. A cell with no ink is blank — on
- * the PTR form that means the filer (self). Ink without a confident DC/SP/JT
- * pair is unread and must not be treated as self.
- */
-export function readOwnerCell(
-  image: GrayImage,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-  detail?: OwnerMatchDetail,
-): OwnerCellRead {
-  const owner = ownerCodeFromCell(image, x0, y0, x1, y1, detail);
-  if (owner) return { kind: 'code', owner };
-  // ownerCodeFromCell returns null for blank and unread; distinguish via ink.
-  const left = Math.max(0, Math.floor(x0) + 4);
-  const right = Math.min(image.width, Math.ceil(x1) - 4);
-  const top = Math.max(0, Math.floor(y0) + 2);
-  const bot = Math.min(image.height, Math.ceil(y1) - 2);
-  const width = right - left;
-  const height = bot - top;
-  if (width < 8 || height < 8) return { kind: 'unread' };
-  let ink = 0;
-  for (let y = top; y < bot; y += 1) {
-    const row = y * image.width;
-    for (let x = left; x < right; x += 1) {
-      if (image.pixels[row + x] < 155) ink += 1;
-    }
-  }
-  return ink < 10 ? { kind: 'blank' } : { kind: 'unread' };
-}
+type OwnerCellMask = {
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  ink: number;
+};
 
-/** DC, SP, or JT from the owner cell when ink reads as a code; else null. */
-export function ownerCodeFromCell(
+function ownerCellMask(
   image: GrayImage,
   x0: number,
   y0: number,
   x1: number,
   y1: number,
-  detail?: OwnerMatchDetail,
-): Owner | null {
+): OwnerCellMask | null {
   const left = Math.max(0, Math.floor(x0) + 4);
   const right = Math.min(image.width, Math.ceil(x1) - 4);
   const top = Math.max(0, Math.floor(y0) + 2);
@@ -725,6 +697,42 @@ export function ownerCodeFromCell(
   }
   let ink = 0;
   for (const value of mask) ink += value;
+  return { mask, width, height, ink };
+}
+
+/**
+ * Read the owner column on a House grid row. A cell with no ink is blank — on
+ * the PTR form that means the filer (self). Ink without a confident DC/SP/JT
+ * pair is unread and must not be treated as self.
+ */
+export function readOwnerCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): OwnerCellRead {
+  const owner = ownerCodeFromCell(image, x0, y0, x1, y1, detail);
+  if (owner) return { kind: 'code', owner };
+  // ownerCodeFromCell returns null for blank and unread; distinguish via ink.
+  const cell = ownerCellMask(image, x0, y0, x1, y1);
+  if (!cell) return { kind: 'unread' };
+  return cell.ink < 10 ? { kind: 'blank' } : { kind: 'unread' };
+}
+
+/** DC, SP, or JT from the owner cell when ink reads as a code; else null. */
+export function ownerCodeFromCell(
+  image: GrayImage,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  detail?: OwnerMatchDetail,
+): Owner | null {
+  const cell = ownerCellMask(image, x0, y0, x1, y1);
+  if (!cell) return null;
+  const { mask, width, height, ink } = cell;
   if (ink < 10) return null; // blank — use readOwnerCell to tell blank from unread
   let glyph = trimGlyph(mask, width, height);
   if (!glyph) return null;

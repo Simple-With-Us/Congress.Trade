@@ -995,6 +995,8 @@ function buildTransaction(
 
   const txSource = sourceOverride ?? (p as { source?: TxSource }).source ?? 'primary';
 
+  let publishConfidence = s.confidence;
+
   const tx: Transaction = {
     id: uuid(),
     docId: filing.docId,
@@ -1018,7 +1020,7 @@ function buildTransaction(
     location: p.location ?? null,
     description: p.description ?? null,
     supplementalText: p.supplementalText ?? null,
-    confidence: s.confidence,
+    confidence: publishConfidence,
     source: txSource,
     rowKey: transactionRowKey(txSource, rowIndex, {
       ...p,
@@ -1050,6 +1052,10 @@ function buildTransaction(
     && flags.includes('ocr_name_hold')
   ) {
     flags = flags.filter((flag) => flag !== 'ocr_name_hold');
+    if (s.flags.includes('ocr_name_hold')) {
+      publishConfidence = clamp01(publishConfidence / PENALTY_OCR_HOLD);
+      tx.confidence = publishConfidence;
+    }
   }
   if (houseMember.identity && houseMemberNameMismatch(houseMember.identity)) {
     flags.push('ocr_name_hold');

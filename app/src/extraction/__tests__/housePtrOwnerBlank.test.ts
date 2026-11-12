@@ -113,6 +113,71 @@ describe('Cisneros H-2026-20035788 typed PTR', () => {
     expect(flagged.every((f) => !f.flags.includes('ocr_name_hold'))).toBe(true);
     expect(flagged.every((f) => f.tx.confidence >= 0.95)).toBe(true);
   });
+
+  it('restores publish confidence when member bleed suppresses asset ocr_name_hold', async () => {
+    const env = {
+      DB: {
+        prepare(sql: string) {
+          return {
+            async all<T>() {
+              if (/securities_master/i.test(sql)) return { results: [] as T[] };
+              if (/securities_ref/i.test(sql)) return { results: [] as T[] };
+              return { results: [] as T[] };
+            },
+            async first<T>() {
+              if (/FROM filers WHERE bioguide_id = \?/i.test(sql)) {
+                return {
+                  full_name: 'Gilbert Ray Cisneros, Jr',
+                  chamber: 'house',
+                  state: 'CA',
+                } as T;
+              }
+              return null as T | null;
+            },
+            async run() {
+              return { success: true, meta: { changes: 1 } };
+            },
+            bind() {
+              return this;
+            },
+          };
+        },
+        batch: async () => [{ meta: { changes: 1 } }],
+      },
+      DELIVERY_QUEUE: { send: async () => {}, sendBatch: async () => {} },
+    } as unknown as Env;
+
+    const filing: Filing = {
+      docId: 'H-2026-20035788',
+      chamber: 'house',
+      filerId: 'house-ca31-gilbert-cisneros',
+      filingType: 'P',
+      filedDate: '2026-11-10',
+      sourceUrl: 'https://example.test/cisneros.pdf',
+      rawObjectKey: 'raw/cisneros.pdf',
+      ingestStatus: 'extracted',
+      docKind: 'text_pdf',
+      extractor: 'textPdf',
+      modelVersion: null,
+      confidence: null,
+      firstSeenAt: '2026-11-10T00:00:00.000Z',
+      sourceUpdatedAt: null,
+      error: null,
+    };
+
+    const flagged = await recomputeTransactions(env, filing, [
+      tx({ assetName: 'Gilbert Cisneros Legal200m Com Inc', owner: 'self' }),
+    ], 'primary', {
+      identity: {
+        disclosedName: 'Gilbert Cisneros',
+        registeredName: 'Gilbert Ray Cisneros, Jr',
+        chamber: 'house',
+        state: 'CA',
+      },
+    });
+    expect(flagged[0]?.flags).not.toContain('ocr_name_hold');
+    expect(flagged[0]?.tx.confidence).toBeGreaterThanOrEqual(0.95);
+  });
 });
 
 describe('Khanna-style grid owner_unread', () => {

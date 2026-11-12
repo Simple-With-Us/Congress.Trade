@@ -463,6 +463,25 @@ describe('grid row, owner, and date corrections', () => {
     expect(read.transactions[0]?.owner).toBe('joint');
   });
 
+  it('treats rule-line residue in a blank owner cell as blank, not unread', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: '', asset: 'ISHARES TR RUS 1000 ETF IWB', txDate: '10/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.p, 9] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const xs = drawn.xs;
+    const midX = Math.floor(((xs[0] ?? 0) + (xs[1] ?? 0)) / 2);
+    for (let y = rows[0].y0 + 4; y < rows[0].y1 - 4; y += 1) {
+      drawn.image.pixels[y * drawn.image.width + midX] = 0;
+      drawn.image.pixels[y * drawn.image.width + midX + 1] = 0;
+    }
+    expect(readOwnerCell(drawn.image, xs[0] ?? 0, rows[0].y0, xs[1] ?? 0, rows[0].y1)).toEqual({
+      kind: 'blank',
+    });
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    expect(read.transactions[0]?.owner).toBe('self');
+    expect(read.transactions[0]?.extractionWarnings ?? []).not.toContain('owner_unread');
+  });
+
   it('maps a blank owner cell to self (Khanna-style empty SP/DC/JT)', () => {
     const rows: DrawnRow[] = [
       { y0: 220, y1: 300, owner: '', asset: 'ISHARES TR RUS 1000 ETF IWB', txDate: '10/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.p, 9] },
