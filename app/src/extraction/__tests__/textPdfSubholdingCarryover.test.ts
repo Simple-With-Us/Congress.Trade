@@ -64,6 +64,14 @@ const CASES: { docId: string; text: string; rows: string }[] = [
     text: 'H-2026-20035710-text-layer.txt',
     rows: 'H-2026-20035710-parsed-rows.json',
   },
+  {
+    // Gilbert Cisneros CA31, 2026-11-11: 65 blank-owner rows; the Norwegian
+    // Cruise Line row breaks across a page, so its "(NCLH) [ST]" prints after
+    // the Type/Date/Amount run on the next page.
+    docId: 'H-2026-20035788',
+    text: 'H-2026-20035788-text-layer.txt',
+    rows: 'H-2026-20035788-parsed-rows.json',
+  },
 ];
 
 describe('textPdf House PTR row segmentation', () => {
@@ -78,7 +86,11 @@ describe('textPdf House PTR row segmentation', () => {
 
       it('keeps every field on the row that owns it', () => {
         for (const want of expected) {
-          const got = rows.find((r) => r.txDate === want.txDate && r.ticker === want.ticker);
+          // Untickered munis can share a trade date, so match those on name too.
+          const got = rows.find((r) =>
+            r.txDate === want.txDate && r.ticker === want.ticker &&
+            (want.ticker !== null || r.assetName === want.assetName)
+          );
           expect(got, `row ${want.ticker ?? want.assetName} @ ${want.txDate}`).toBeDefined();
           expect(got).toMatchObject({
             owner: want.owner,
@@ -130,6 +142,22 @@ describe('textPdf House PTR row segmentation', () => {
       filingStatus: 'New',
       subholding: 'Trust One',
     });
+  });
+
+  it('keeps a holding whose asset name breaks across a page', () => {
+    // H-2026-20035788: "Norwegian Cruise Line Holdings P 10/20/2026 ..." ends
+    // page 4 and "Ltd. Ordinary Shares (NCLH) [ST]" opens page 5.
+    const rows = parseHousePtrText(fixture('H-2026-20035788-text-layer.txt'));
+    expect(rows).toHaveLength(65);
+    expect(rows.find((r) => r.ticker === 'NCLH')).toMatchObject({
+      assetName: 'Norwegian Cruise Line Holdings Ltd. Ordinary Shares',
+      assetType: 'ST',
+      txType: 'B',
+      txDate: '2026-10-20',
+      subholding: '150 Main Street Trust > Bank of America',
+    });
+    // The row after it keeps its own asset type instead of inheriting [GS].
+    expect(rows.find((r) => r.ticker === 'NVDA')).toMatchObject({ assetType: 'ST' });
   });
 
   it('keeps the asset name that shares its line with the transaction type', () => {

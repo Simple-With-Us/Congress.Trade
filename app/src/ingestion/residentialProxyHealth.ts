@@ -112,7 +112,10 @@ export async function probeResidentialProxyHealth(
 
     clearTimeout(timeoutId);
     const latencyMs = Date.now() - t0;
-    const reachable = res.status >= 200 && res.status < 600;
+    // A 5xx means the tunnel itself failed — tinyproxy answers 502/503 when
+    // it cannot reach the target — so it must not read as a healthy proxy.
+    // A sub-500 status proves the tunnel carried a real target response.
+    const reachable = res.status >= 200 && res.status < 500;
 
     if (reachable) {
       return {
