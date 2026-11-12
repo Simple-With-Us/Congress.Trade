@@ -366,7 +366,13 @@ if args[:2] == ["system", "df"] and "-v" not in args and "--verbose" not in args
 if args[:2] == ["system", "df"] and "-v" in args:
     if "--format" in args:
         fail("json format is not this fixture")
-    sys.stdout.write((root / "df-verbose.txt").read_text(encoding="utf-8"))
+    state.mkdir(parents=True, exist_ok=True)
+    counter = state / "df-verbose-count"
+    count = int(counter.read_text(encoding="utf-8") or "0") + 1 if counter.exists() else 1
+    counter.write_text(str(count), encoding="utf-8")
+    drift = root / "df-verbose-drift.txt"
+    name = "df-verbose-drift.txt" if drift.exists() and count >= 2 else "df-verbose.txt"
+    sys.stdout.write((root / name).read_text(encoding="utf-8"))
     sys.exit(0)
 if args[:1] == ["ps"] and "--format" in args:
     active = (root / "build-active.txt")
@@ -1092,6 +1098,50 @@ class ShellTests(unittest.TestCase):
             for call in calls:
                 self.assertNotIn("rm", call)
                 self.assertNotIn("prune", call)
+
+    def test_apply_aborts_when_the_snapshot_drifts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            write_demo(fixture)
+            verbose = (fixture / "df-verbose.txt").read_text(encoding="utf-8")
+            drifted = verbose.replace(IMG_OLD[:12], "fffffffffffe", 1)
+            self.assertNotEqual(verbose, drifted)
+            (fixture / "df-verbose-drift.txt").write_text(drifted, encoding="utf-8")
+            state = root / "state"
+            log = root / "docker-log"
+            fake = root / "docker"
+            fake.write_text(FAKE_DOCKER, encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            completed = subprocess.run(
+                ["bash", str(SHELL)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "DOCKER": str(fake),
+                    "PATH": str(root) + os.pathsep + os.environ.get("PATH", ""),
+                    "FIXTURE": str(fixture),
+                    "DOCKER_LOG": str(log),
+                    "DOCKER_STATE": str(state),
+                    "DOCKER_RECLAIM_NOW": NOW_TEXT,
+                    "APPLY": "1",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("snapshot changed during collection; retry", completed.stderr)
+            calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            self.assertGreaterEqual(
+                sum(1 for call in calls if call[:2] == ["system", "df"] and "-v" in call),
+                2,
+            )
+            for call in calls:
+                self.assertNotIn("rm", call)
+                self.assertNotIn("prune", call)
+            self.assertFalse((state / "mutated").exists())
 
     def test_apply_does_not_prune_when_the_plan_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
