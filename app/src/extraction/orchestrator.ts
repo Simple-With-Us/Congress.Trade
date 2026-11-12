@@ -16,6 +16,7 @@
 import type { Env, Filing, DocKind, Chamber, ParsedTx } from '../shared/types.ts';
 import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { get, run } from '../shared/db.ts';
+import { recordGenuineIngestFailure } from '../ingestion/ingestFailureReviewQueue.ts';
 import {
   buildExtractorPipeline,
   type ExtractorModelRun,
@@ -87,12 +88,11 @@ async function markError(
   message: string,
   lease?: DurableQueueLeaseContext,
 ): Promise<void> {
-  await lease?.assertOwned();
-  await run(
-    env.DB,
-    "UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?",
-    [message.slice(0, 500), docId],
-  );
+  await recordGenuineIngestFailure(env, docId, message, {
+    source: 'orchestrator',
+    stage: 'extract',
+    lease,
+  });
 }
 
 function isProviderRateLimit(err: unknown): boolean {

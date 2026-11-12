@@ -141,6 +141,8 @@ import {
   type MemberFilerMerge,
 } from '../shared/memberIdentity.ts';
 import { dedupeSplitFilerIdentities } from './filerIdentityDedupe.ts';
+import { assignCompetitorFilerId, type ExistingFilerCandidate } from '../shared/competitorFilerMatch.ts';
+import { competitorReporterNames, parseCompetitorReporter } from '../shared/competitorAttribution.ts';
 import { constantTimeEqual } from '../auth/tokens.ts';
 import { getCurrentUserFromRequest } from '../auth/session.ts';
 import {
@@ -318,6 +320,7 @@ import { executeAdminSchemaMigrations } from './schemaMigrationRunner.ts';
 import { ensurePeerImportSchemaColumns } from './ensurePeerSchema.ts';
 import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
+import { backfillIngestFailureReviewQueue } from '../ingestion/ingestFailureReviewQueue.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import {
   NEEDS_HAND_CHECK_MAC_VISION,
@@ -2951,6 +2954,15 @@ const DeliveryRequeueBodySchema = z
     limit: z.number().int().min(1).max(5000).default(500),
     ignoreCircuit: z.boolean().default(false),
     dryRun: z.boolean().default(false),
+  })
+  .strict();
+
+const IngestFailureBackfillBodySchema = z
+  .object({
+    chamber: z.enum(['house', 'senate', 'executive']).nullable().default(null),
+    apply: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+    limit: z.number().int().min(1).max(2000).default(500),
   })
   .strict();
 
@@ -6551,6 +6563,28 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     let filerReassigned = 0;
     let typesFixed = 0;
     const filersEnsured = new Set<string>();
+    const candidates: ExistingFilerCandidate[] = (
+      await all<{
+        bioguide_id: string;
+        full_name: string | null;
+        display_name: string | null;
+        chamber: string | null;
+        state: string | null;
+        resolved_bioguide_id: string | null;
+      }>(
+        c.env.DB,
+        `SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id
+           FROM filers
+          WHERE merged_into IS NULL`,
+      )
+    ).map((f) => ({
+      filerId: f.bioguide_id,
+      fullName: f.full_name,
+      displayName: f.display_name,
+      chamber: f.chamber,
+      state: f.state,
+      resolvedBioguideId: f.resolved_bioguide_id,
+    }));
 
     for (const row of rows) {
       let assetName = row.asset_name;
@@ -6582,29 +6616,35 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           if (correct !== filerId) {
             if (correct) {
               filerId = correct;
+              filerReassigned += 1;
+              changed = true;
             } else {
-              // Demote to MANUAL-{LAST} (House/other) — never keep wrong EXEC slot.
-              const last = payloadName
-                .replace(/,/g, ' ')
-                .trim()
-                .split(/\s+/)
-                .filter(Boolean)
-                .pop()
-                ?.toUpperCase()
-                .replace(/[^A-Z]/g, '') || 'UNKNOWN';
-              filerId = `MANUAL-${last}`;
-              if (!filersEnsured.has(filerId)) {
-                await run(
-                  c.env.DB,
-                  `INSERT OR IGNORE INTO filers (bioguide_id, full_name, chamber)
-                   VALUES (?, ?, 'house')`,
-                  [filerId, payloadName],
-                );
-                filersEnsured.add(filerId);
+              // Prefer an existing roster filer. Never mint MANUAL-<LAST>.
+              const parsed = parseCompetitorReporter(row.raw_text);
+              const assignment = assignCompetitorFilerId({
+                rawName: payloadName,
+                names: competitorReporterNames(row.raw_text),
+                chamber: parsed.chamber,
+                state: parsed.state,
+                district: parsed.district,
+                bioguideId: parsed.bioguideId,
+                candidates,
+              });
+              if (assignment && assignment.filerId !== row.filer_id) {
+                filerId = assignment.filerId;
+                if (assignment.minted && !filersEnsured.has(filerId)) {
+                  await run(
+                    c.env.DB,
+                    `INSERT OR IGNORE INTO filers (bioguide_id, full_name, chamber)
+                     VALUES (?, ?, ?)`,
+                    [filerId, payloadName, parsed.chamber],
+                  );
+                  filersEnsured.add(filerId);
+                }
+                filerReassigned += 1;
+                changed = true;
               }
             }
-            filerReassigned += 1;
-            changed = true;
           }
         }
       }
@@ -7155,6 +7195,29 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     return c.json({ ok: true, dryRun: !apply, ...result });
   });
 
+  // --- POST /review-queue/backfill-ingest-failures -------------------------
+  // One-time (or periodic) mirror of genuine ingest_status='error' filings
+  // onto open review_queue rows for Publisher drain.  Default dry-run.
+  // Body (all optional): { apply?: boolean, dryRun?: boolean, chamber?: string, limit?: number }
+  // Do not run against production from an agent unless the operator asked.
+  r.post('/review-queue/backfill-ingest-failures', async (c) => {
+    let json: unknown = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) json = JSON.parse(raw) as unknown;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = IngestFailureBackfillBodySchema.safeParse(json);
+    if (!parsed.success) return c.json({ error: 'invalid payload' }, 400);
+    const apply = parsed.data.apply === true && parsed.data.dryRun !== true;
+    const result = await backfillIngestFailureReviewQueue(c.env, {
+      chamber: parsed.data.chamber,
+      limit: parsed.data.limit,
+      dryRun: !apply,
+    });
+    return c.json({ ok: true, ...result });
+  });
 
   // --- POST /sweep-already-published --------------------------------------
   // On-demand trigger for sweepAlreadyPublishedReviewRows. The hourly

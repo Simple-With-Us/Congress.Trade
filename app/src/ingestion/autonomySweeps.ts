@@ -33,6 +33,11 @@ import {
   ungroundedIngestStatusSql,
 } from './emptyFetchHandoff.ts';
 import { parkEmptyFetchHandoff, rearmFilingForEmptyFetch } from './outbox.ts';
+import {
+  ensureIngestFailureReviewQueueRow,
+  sweepIngestFailureReviewQueue,
+  type IngestFailureBackfillResult,
+} from './ingestFailureReviewQueue.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
@@ -187,7 +192,15 @@ export async function sweepStrandedFilings(
         row.ingest_status,
       ],
     );
-    if ((res.meta?.changes ?? 0) > 0) terminalized += 1;
+    if ((res.meta?.changes ?? 0) > 0) {
+      terminalized += 1;
+      const errMsg =
+        `autonomy-sweep: stranded in '${row.ingest_status}' past ${ceilingDays}d ceiling as of ${nowIso}; terminalized for visibility`;
+      await ensureIngestFailureReviewQueueRow(env, row.doc_id, errMsg, {
+        source: 'autonomy_sweep',
+        stage: 'ingest',
+      });
+    }
   }
   return { terminalized };
 }
@@ -609,6 +622,8 @@ export interface AutonomySweepResult {
   completedEmptyRaw: EmptyFetchSweepResult | null;
   /** ingest_status outside IngestStatus, no raw object, no live transactions. */
   ungroundedIngest: EmptyFetchSweepResult | null;
+  /** Genuine ingest failures mirrored onto review_queue + stale-row cleanup. */
+  ingestFailureReview: IngestFailureBackfillResult | null;
   errors: string[];
 }
 
@@ -1395,6 +1410,7 @@ export async function runAutonomySweeps(
     transientDlq: null,
     completedEmptyRaw: null,
     ungroundedIngest: null,
+    ingestFailureReview: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -1429,6 +1445,15 @@ export async function runAutonomySweeps(
     result.stranded = await sweepStrandedFilings(env, now);
   } catch (err) {
     errors.push(`stranded: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    const sweep = await sweepIngestFailureReviewQueue(env, { limit: 200 });
+    result.ingestFailureReview = sweep.backfill;
+    result.ingestFailureReview.recovered = sweep.recovered;
+  } catch (err) {
+    errors.push(`ingestFailureReview: ${(err as Error).message}`);
   }
 
   // Reject stubs whose official filing has persisted since (including ones the

@@ -16,6 +16,7 @@ import { persistUsageTelemetryFallback } from './shared/thirdPartyTelemetry.ts';
 import { gateQueuedDelivery, isOutboxSuppressed, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
 import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
+import { recordGenuineIngestFailure } from './ingestion/ingestFailureReviewQueue.ts';
 import { executeQueuedCommand } from './client/commands.ts';
 import { updateCommandStatus } from './client/state.ts';
 import { sentryLoggerWarn } from './shared/sentryRuntime.ts';
@@ -206,15 +207,14 @@ export async function handleDeadLetterMessage(
     // equally visible) and excluded from every "why is this still pending"
     // query. Never clobbers an already-terminal/resolved row.
     try {
-      await run(
-        env.DB,
-        `UPDATE filings
-            SET ingest_status = 'error',
-                error = ?
-          WHERE doc_id = ?
-            AND ingest_status NOT IN ('persisted', 'error')`,
-        [`autonomy: ingestion outbox dead-letter budget exhausted (${queue}/${msg.type}): ${recoveryError.message}`.slice(0, 1000), msg.docId],
-      );
+      const terminalMsg =
+        `autonomy: ingestion outbox dead-letter budget exhausted (${queue}/${msg.type}): ${recoveryError.message}`;
+      await recordGenuineIngestFailure(env, msg.docId, terminalMsg.slice(0, 1000), {
+        source: 'ingest_dlq',
+        stage: 'ingest',
+        filingAlreadyStamped: false,
+        preserveTerminalStatus: true,
+      });
     } catch (err) {
       console.error(`failed to terminalize filing ${msg.docId} after outbox dead-letter:`, err);
     }

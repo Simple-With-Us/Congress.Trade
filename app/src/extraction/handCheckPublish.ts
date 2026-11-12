@@ -2,7 +2,7 @@
  * Human verification gate for vision / OCR extractions that must not auto-publish.
  */
 import type { Filing, TxSource } from '../shared/types.ts';
-import { filingDocClass, isHousePaperScanDocId } from './extractRouting.ts';
+import { filingDocClass, isHouseGridFormExtractor, isHousePaperScanDocId } from './extractRouting.ts';
 
 function isLocalVisionExtractor(extractor: string | null | undefined): boolean {
   const compact = (extractor || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
@@ -50,6 +50,9 @@ export function requiresHandCheckBeforePublish(
   source: TxSource,
 ): boolean {
   if (source === 'manual') return false;
+  // Clean grid-form rows publish on the normalizer's own confidence and
+  // hard-flag gates. The older server_cpu ink reader still requires a hand check.
+  if (isHouseGridFormExtractor(extractor)) return false;
   if (source === 'local_mac' || isLocalVisionExtractor(extractor)) return true;
   if (!isScannedOrHandwrittenFiling(filing)) return false;
   return isVisionOrOcrExtraction(extractor, source);
