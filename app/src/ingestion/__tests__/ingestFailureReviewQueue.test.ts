@@ -160,4 +160,81 @@ describe('ingestFailureReviewQueue', () => {
     n = await d1.prepare('SELECT COUNT(*) AS n FROM review_queue').first<{ n: number }>();
     expect(n?.n ?? 0).toBe(2);
   });
+
+  it('does not let a resolved review row starve an older genuine failure', async () => {
+    const env = makeEnv();
+    await d1.prepare(
+      `INSERT INTO filings (doc_id, ingest_status, error, first_seen_at)
+       VALUES
+         ('H-RESOLVED', 'error', 'old empty', '2026-02-02'),
+         ('H-OLDER', 'error', 'fetcher: still stuck', '2026-01-01')`,
+    ).run();
+    await d1.prepare(
+      `INSERT INTO review_queue (doc_id, reason, created_at, resolved, resolution_kind, resolution_reason, review_revision)
+       VALUES ('H-RESOLVED', 'verified_empty: done', '2026-02-02T00:00:00Z', 1, 'verified_empty', 'no trades', 1)`,
+    ).run();
+
+    const applied = await backfillIngestFailureReviewQueue(env, { dryRun: false, limit: 1 });
+    expect(applied.matched).toBe(1);
+    expect(applied.docIds).toEqual(['H-OLDER']);
+    expect(applied.ensured).toBe(1);
+
+    const resolved = await d1.prepare(
+      'SELECT resolved, resolution_kind FROM review_queue WHERE doc_id = ?',
+    ).bind('H-RESOLVED').first<{ resolved: number; resolution_kind: string }>();
+    expect(resolved?.resolved).toBe(1);
+    expect(resolved?.resolution_kind).toBe('verified_empty');
+  });
+
+  it('preserveTerminalStatus keeps persisted rows and existing error text', async () => {
+    const env = makeEnv();
+    await d1.prepare(
+      `INSERT INTO filings (doc_id, ingest_status, error, first_seen_at)
+       VALUES
+         ('H-DONE', 'persisted', NULL, '2026-01-01'),
+         ('H-ERR', 'error', 'fetcher: original', '2026-01-02'),
+         ('H-MID', 'fetched', NULL, '2026-01-03')`,
+    ).run();
+    await recordGenuineIngestFailure(env, 'H-DONE', 'autonomy: dlq', {
+      preserveTerminalStatus: true,
+      source: 'ingest_dlq',
+    });
+    await recordGenuineIngestFailure(env, 'H-ERR', 'autonomy: dlq', {
+      preserveTerminalStatus: true,
+      source: 'ingest_dlq',
+    });
+    await recordGenuineIngestFailure(env, 'H-MID', 'autonomy: dlq', {
+      preserveTerminalStatus: true,
+      source: 'ingest_dlq',
+    });
+
+    const done = await d1.prepare('SELECT ingest_status, error FROM filings WHERE doc_id = ?')
+      .bind('H-DONE').first<{ ingest_status: string; error: string | null }>();
+    expect(done?.ingest_status).toBe('persisted');
+    expect(done?.error).toBeNull();
+    const err = await d1.prepare('SELECT ingest_status, error FROM filings WHERE doc_id = ?')
+      .bind('H-ERR').first<{ ingest_status: string; error: string | null }>();
+    expect(err?.ingest_status).toBe('error');
+    expect(err?.error).toBe('fetcher: original');
+    const mid = await d1.prepare('SELECT ingest_status, error FROM filings WHERE doc_id = ?')
+      .bind('H-MID').first<{ ingest_status: string; error: string | null }>();
+    expect(mid?.ingest_status).toBe('error');
+    expect(mid?.error).toBe('autonomy: dlq');
+
+    const queued = await d1.prepare(
+      `SELECT doc_id FROM review_queue WHERE reason LIKE 'ingest_failure:%' ORDER BY doc_id`,
+    ).all<{ doc_id: string }>();
+    expect(queued.results?.map((row) => row.doc_id)).toEqual(['H-ERR', 'H-MID']);
+  });
+
+  it('propagates a database error instead of acknowledging the caller', async () => {
+    const env = {
+      DB: {
+        prepare() {
+          throw new Error('db down');
+        },
+      },
+    } as unknown as Env;
+    await expect(recordGenuineIngestFailure(env, 'H-DOWN', 'fetcher: boom')).rejects.toThrow('db down');
+  });
 });

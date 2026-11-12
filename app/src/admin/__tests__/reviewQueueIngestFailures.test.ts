@@ -271,5 +271,31 @@ describe('POST /review-queue/backfill-ingest-failures', () => {
     const ingest = await fetchIngest(db, '?limit=50');
     expect(ingest.body.items.map((i) => i.docId).sort()).toEqual([]);
   });
+
+  it('rejects a backfill body that fails the zod schema', async () => {
+    const db = makeReviewQueueTestDb([]);
+    for (const body of [
+      { chamber: 'commons' },
+      { limit: 0 },
+      { limit: 1.5 },
+      { limit: 2001 },
+      { apply: 'yes' },
+      { extra: true },
+      null,
+    ]) {
+      const res = await app.request(
+        '/review-queue/backfill-ingest-failures',
+        {
+          method: 'POST',
+          headers: { ...AUTH, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        env(db),
+      );
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      const payload = (await res.json()) as { error: string };
+      expect(payload.error).toBe('invalid payload');
+    }
+  });
 });
 

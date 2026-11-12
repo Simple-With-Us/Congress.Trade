@@ -2928,6 +2928,15 @@ const DeliveryRequeueBodySchema = z
   })
   .strict();
 
+const IngestFailureBackfillBodySchema = z
+  .object({
+    chamber: z.enum(['house', 'senate', 'executive']).nullable().default(null),
+    apply: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+    limit: z.number().int().min(1).max(2000).default(500),
+  })
+  .strict();
+
 export const PriceUnavailableBodySchema = z.object({
   reason: z.string().trim().min(1).max(500),
 }).strict();
@@ -7106,23 +7115,19 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // Body (all optional): { apply?: boolean, dryRun?: boolean, chamber?: string, limit?: number }
   // Do not run against production from an agent unless the operator asked.
   r.post('/review-queue/backfill-ingest-failures', async (c) => {
-    let body: Record<string, unknown> = {};
+    let json: unknown = {};
     try {
       const raw = await c.req.text();
-      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+      if (raw) json = JSON.parse(raw) as unknown;
     } catch {
       return c.json({ error: 'invalid JSON body' }, 400);
     }
-    const chamber = typeof body.chamber === 'string' ? body.chamber : null;
-    if (chamber !== null && !['house', 'senate', 'executive'].includes(chamber)) {
-      return c.json({ error: "chamber must be 'house', 'senate', or 'executive'" }, 400);
-    }
-    const apply = body.apply === true && body.dryRun !== true;
-    let limit = typeof body.limit === 'number' && body.limit > 0 ? Math.floor(body.limit) : 500;
-    if (limit > 2000) limit = 2000;
+    const parsed = IngestFailureBackfillBodySchema.safeParse(json);
+    if (!parsed.success) return c.json({ error: 'invalid payload' }, 400);
+    const apply = parsed.data.apply === true && parsed.data.dryRun !== true;
     const result = await backfillIngestFailureReviewQueue(c.env, {
-      chamber,
-      limit,
+      chamber: parsed.data.chamber,
+      limit: parsed.data.limit,
       dryRun: !apply,
     });
     return c.json({ ok: true, ...result });

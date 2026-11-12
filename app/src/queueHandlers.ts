@@ -213,6 +213,7 @@ export async function handleDeadLetterMessage(
         source: 'ingest_dlq',
         stage: 'ingest',
         filingAlreadyStamped: false,
+        preserveTerminalStatus: true,
       });
     } catch (err) {
       console.error(`failed to terminalize filing ${msg.docId} after outbox dead-letter:`, err);

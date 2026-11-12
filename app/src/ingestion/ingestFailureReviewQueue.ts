@@ -6,7 +6,7 @@
 
 import type { Env } from '../shared/types.ts';
 import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
-import { all, get, run, type SqlParam } from '../shared/db.ts';
+import { all, get, run, withSqliteLockRetry, type SqlParam } from '../shared/db.ts';
 import { notifyReviewQueuePublisher } from './reviewQueueNotify.ts';
 import {
   alreadyPublishedPredicate,
@@ -32,15 +32,14 @@ function buildEligibleWhere(chamber: string | null): { clause: string; params: S
   const clauses = [
     `f.ingest_status = 'error'`,
     `f.doc_id NOT LIKE ?`,
-    `NOT EXISTS (
-       SELECT 1 FROM review_queue rq
-        WHERE rq.doc_id = f.doc_id AND rq.resolved = 0
-     )`,
+    // Any existing review_queue row, including a resolved one, already occupies
+    // the doc_id primary key. Selecting those filings again makes INSERT OR
+    // IGNORE return skipped and burns the LIMIT, so older failures never run.
+    // Resolved rows stay resolved: reviewQueueGuard and the stranded sweep
+    // refuse to revive a closed-out filing.
     `NOT EXISTS (
        SELECT 1 FROM review_queue rq
         WHERE rq.doc_id = f.doc_id
-          AND rq.resolved = 1
-          AND rq.resolution_kind = 'rejected'
      )`,
     `NOT EXISTS (
        SELECT 1 FROM transactions t
@@ -207,34 +206,35 @@ export async function recordGenuineIngestFailure(
     source?: string;
     stage?: IngestFailureStage;
     filingAlreadyStamped?: boolean;
+    /**
+     * Dead-letter terminalization must not replace `persisted` or an existing
+     * `error` message. NULL status stays untouched (SQL NOT IN is unknown).
+     */
+    preserveTerminalStatus?: boolean;
     lease?: DurableQueueLeaseContext;
   } = {},
 ): Promise<void> {
-  try {
-    await opts.lease?.assertOwned();
-    if (await isFilingAlreadyPublished(env.DB, docId)) return;
+  await opts.lease?.assertOwned();
+  if (await isFilingAlreadyPublished(env.DB, docId)) return;
 
-    if (!opts.filingAlreadyStamped) {
-      await run(
-        env.DB,
-        `UPDATE filings
-            SET ingest_status = 'error', error = ?
-          WHERE doc_id = ?
-            AND NOT (${alreadyPublishedPredicate('filings')})`,
-        [errorMessage.slice(0, 1000), docId, ...PUBLISH_DECISION_ACTIONS],
-      );
-    }
-
-    await ensureIngestFailureReviewQueueRow(env, docId, errorMessage, {
-      stage: opts.stage,
-      source: opts.source,
-    });
-  } catch (err) {
-    console.warn(
-      `ingestFailureReviewQueue: record failed for ${docId}:`,
-      (err as Error).message,
+  if (!opts.filingAlreadyStamped) {
+    const terminalGuard = opts.preserveTerminalStatus
+      ? ` AND ingest_status NOT IN ('persisted', 'error')`
+      : '';
+    await run(
+      env.DB,
+      `UPDATE filings
+          SET ingest_status = 'error', error = ?
+        WHERE doc_id = ?
+          AND NOT (${alreadyPublishedPredicate('filings')})${terminalGuard}`,
+      [errorMessage.slice(0, 1000), docId, ...PUBLISH_DECISION_ACTIONS],
     );
   }
+
+  await ensureIngestFailureReviewQueueRow(env, docId, errorMessage, {
+    stage: opts.stage,
+    source: opts.source,
+  });
 }
 
 export async function backfillIngestFailureReviewQueue(
@@ -265,15 +265,75 @@ export async function backfillIngestFailureReviewQueue(
   };
   if (dryRun) return result;
 
-  for (const row of rows) {
+  const at = new Date().toISOString();
+  const pending = rows.map((row) => {
     const msg = row.error?.trim() || 'ingest failure (no error text)';
-    const outcome = await ensureIngestFailureReviewQueueRow(env, row.doc_id, msg, {
-      source: 'backfill',
-    });
-    if (outcome === 'inserted' || outcome === 'updated') result.ensured += 1;
-    else result.skipped += 1;
-  }
+    const stage = inferIngestFailureStage(msg, 'backfill');
+    const reason = ingestFailureReviewReason(stage);
+    return {
+      docId: row.doc_id,
+      reason,
+      payload: JSON.stringify({
+        kind: 'ingest_failure',
+        stage,
+        source: 'backfill',
+        error: msg.slice(0, 1000),
+        at,
+      }),
+      at,
+    };
+  });
+  const inserted = await insertIngestFailureReviewRows(env, pending);
+  result.ensured = inserted.length;
+  result.skipped = pending.length - inserted.length;
   return result;
+}
+
+/**
+ * Rows per INSERT. Four bound parameters each, and this repo treats 100 as
+ * the D1 statement cap (`D1_BOUND_PARAM_LIMIT`), so 20 rows is 80 parameters.
+ */
+const BACKFILL_INSERT_CHUNK = 20;
+
+/**
+ * One multi-row INSERT per chunk. Production SQLite is a single writer
+ * (`withSqliteLockRetry` in db.ts); concurrent per-row ensures would queue
+ * on that lock instead of reducing the sweep's round trips.
+ */
+async function insertIngestFailureReviewRows(
+  env: Pick<Env, 'DB'>,
+  rows: Array<{ docId: string; reason: string; payload: string; at: string }>,
+): Promise<string[]> {
+  const inserted: string[] = [];
+  for (let i = 0; i < rows.length; i += BACKFILL_INSERT_CHUNK) {
+    const chunk = rows.slice(i, i + BACKFILL_INSERT_CHUNK);
+    const values: string[] = [];
+    const params: SqlParam[] = [];
+    for (const row of chunk) {
+      values.push('(?, ?, ?, ?, 0)');
+      params.push(row.docId, row.reason, row.payload, row.at);
+    }
+    const written = await withSqliteLockRetry(() => all<{ doc_id: string }>(
+      env.DB,
+      `INSERT OR IGNORE INTO review_queue (doc_id, reason, payload, created_at, resolved)
+       VALUES ${values.join(', ')}
+       RETURNING doc_id`,
+      params,
+    ));
+    const byId = new Map(chunk.map((row) => [row.docId, row]));
+    for (const row of written) {
+      inserted.push(row.doc_id);
+      const source = byId.get(row.doc_id);
+      if (!source) continue;
+      void notifyReviewQueuePublisher(env as Env, {
+        docId: row.doc_id,
+        reason: source.reason,
+        kind: 'insert',
+        at: source.at,
+      });
+    }
+  }
+  return inserted;
 }
 
 /** Hourly safety net: backfill missing rows and drop stale rows after retries. */
