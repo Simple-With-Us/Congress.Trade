@@ -26,10 +26,12 @@ Khanna H-2026-9116399 rescored with `score-house-grid-form-khanna.ts` against th
 | all five | 171/275 | 143/275 | 143/275 |
 | confidence ≥ 0.95 | 109 | 109 | 108 |
 
-This pass applied one on-filing date digit repair (`date digit repair applied` in row notes).  Most remaining date misses are plausible misreads that do not fail the plausibility gate (per spec: no invented dates).  Cloud aligner pairs 268 of 275 hand rows (page mapping misses seven rows vs the hand count).
+This pass applied one on-filing date digit repair (`date digit repair applied` in row notes).  Most remaining date misses are plausible misreads that do not fail the plausibility gate (per spec: no invented dates).
+
+Cloud rescoring investigation (2026-11-12): #3038 reader is on `main` (291 emitted; conf 109 vs 108 on this pass).  The seven “missed” hand rows are **not** supplemental page drift — per-page counts match except six pages where pred has one extra phantom row.  The first committed greedy aligner pairs the first type match and leaves Comcast, CSGP, UBER, CRH, SYK, and Wells Fargo unmatched.  Same-page index fallback after greedy restores **275/275** pairs without raising all-five above **143/275**; the rollout **171/275** ceiling is mostly reader field accuracy on paired rows, not a missing merge on `main`.  On greedy pairs, date misses bucket as **30** `pred_null_trade_date`, **9** `same_month_day_digit`, **1** `month_mismatch`.  See `/opt/cursor/artifacts/khanna-score-investigation-2026-11-12.md` on cloud agent runs.
 
 ## Follow-ups
 
 - Mirror digit repair in `services/scan-cpu-worker/gridform.py` when that lane is rescored.
 - Broader digit repair when both readings stay plausible but disagree with each other only if a unique joint repair exists (needs a separate design).
-- Close the seven hand rows the cloud aligner still misses (page index drift vs manual supplemental text).
+- Aligner bakeoff: add same-page index fallback after greedy (or check in the author’s local pairing script) so Khanna reports 275/275 paired; keep all-five denominator at 275.
