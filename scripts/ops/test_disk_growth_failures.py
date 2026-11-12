@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Hermetic regression tests for disk-growth collector/report failure paths."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -102,10 +103,13 @@ class DiskGrowthFailures(unittest.TestCase):
         self.env['DISK_GROWTH_DU'] = shutil.which('du')
         self.env['BACKUP_SCAN_DIRS'] = str(self.tree/'data/backups')
         (self.tree/'data/backups/day.sql').write_text('fixture')
+        raw = os.fsencode(self.tree/'data/backups') + b'/gnu-\xff-name'
+        os.mkdir(raw)
         d = self.snapshot()
         self.assertFalse(d['meta']['du_partial'])
         block = d['directory_totals'][str(self.tree/'data/backups')]
         self.assertTrue(any(x['path'] == str(self.tree/'data/backups') for x in block['entries']))
+        self.assertTrue(any(x['path'] == os.fsdecode(raw) for x in block['entries']))
 
     def test_similar_prefix_is_not_ancestor(self):
         other = self.root / 'tree2'
@@ -144,6 +148,25 @@ class DiskGrowthFailures(unittest.TestCase):
                 self.seed('2026-07-01'); self.seed('2026-06-30')
                 self.seed(day, docker={'available':False,'error':'docker_unavailable','sections':{}})
                 self.assertFalse(self.run_script('disk-growth-report.sh','--json')['docker_summary']['1d']['available'])
+
+    def test_invalid_filename_bytes_survive_collection_and_report(self):
+        # du emits filesystem bytes, not guaranteed Unicode. The stub walks a
+        # real invalid-byte directory and emits it with the OS surrogate policy.
+        raw = os.fsencode(self.tree) + b'/bad-\xff-name'
+        try:
+            os.mkdir(raw)
+        except OSError as exc:
+            if exc.errno == errno.EILSEQ:
+                self.skipTest('filesystem refuses invalid filename bytes')
+            raise
+        doc = self.snapshot()
+        paths = [ent['path'] for block in doc['directory_totals'].values() for ent in block['entries']]
+        self.assertIn(os.fsdecode(raw), paths)
+        self.assertFalse(doc['meta']['du_partial'])
+        self.seed('2026-07-01', directory_totals=doc['directory_totals'])
+        self.seed('2026-06-30', directory_totals=doc['directory_totals'])
+        report = self.run_script('disk-growth-report.sh', '--json')
+        self.assertTrue(report['directories']['1d']['available'])
 
     def test_top_n_omission_is_not_measured_shrinkage(self):
         self.seed('2026-07-01', directory_totals={'/var':{'entries':[],'timeout':False}})

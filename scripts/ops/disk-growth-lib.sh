@@ -103,7 +103,7 @@ for group in groups:
     # Piping to head would truncate scans; staging all du output could fill /tmp.
     selected = {root: [] for root in group["roots"]}
     try:
-        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as run:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="surrogateescape") as run:
             for line in run.stdout:
                 parts = line.rstrip("\n").split(None, 1)
                 if len(parts) != 2:
@@ -195,7 +195,7 @@ import json, os, re, sys
 from pathlib import Path
 
 def blob(name):
-    return (Path(sys.argv[1]) / name).read_text(encoding="utf-8")
+    return (Path(sys.argv[1]) / name).read_text(encoding="utf-8", errors="surrogateescape")
 
 def parse_df(blob):
     out = []
