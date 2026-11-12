@@ -20,17 +20,6 @@ ROOT=/data/backups
 # Comma-separated: socratic, congress, usage-monitor.  Default = UM only.
 FLEET_BACKUP_VERIFY_APPS="${FLEET_BACKUP_VERIFY_APPS:-usage-monitor}"
 SCRATCH="${FLEET_RESTORE_SCRATCH:-/data/scratch/fleet-restore-drill}"
-LOG=/var/log/fleet-backup/weekly-verify-$(date -u +%Y%m%d).log
-mkdir -p /var/log/fleet-backup "$SCRATCH"
-exec > >(tee -a "$LOG") 2>&1
-echo "[weekly-verify] start $(date -u -Iseconds)"
-
-if [[ -f /etc/congress-health-recover.env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source /etc/congress-health-recover.env
-  set +a
-fi
 
 FAIL=0
 FAIL_MSGS=()
@@ -78,19 +67,87 @@ row_count_ok() {
   [[ "$n" -gt 0 ]]
 }
 
+# Logical .db path.  Sidecars are `<name>.db.sha256` and `<name>.db-journal`.
+verify_dump_base() {
+  case "$1" in
+    *.db.zst) printf '%s\n' "${1%.zst}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+verify_dump_complete() {
+  local base
+  base="$(verify_dump_base "$1")"
+  [ -f "${base}.sha256" ] || return 1
+  [ ! -e "${base}-journal" ] || return 1
+  if [ -f "$base" ] && [ -s "$base" ]; then
+    return 0
+  fi
+  if [ -f "${base}.zst" ] && [ -s "${base}.zst" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Newest complete payload under $ROOT/$1.  Prefers .db.zst when both exist.
+# Prints nothing when the dir is missing or every file is incomplete.
+latest_complete_dump() {
+  local subdir="$1" root_real dir path base
+  root_real="$(readlink -f -- "$ROOT")"
+  dir="$root_real/$subdir"
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -type f \( -name '*.db' -o -name '*.db.zst' \) -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -nr \
+    | while IFS=$'\t' read -r _ts path; do
+        [ -n "$path" ] || continue
+        base="$(verify_dump_base "$path")"
+        verify_dump_complete "$base" || continue
+        if [ -s "${base}.zst" ] && {
+          [ ! -s "$base" ] || zstd -q -t "${base}.zst" >/dev/null 2>&1
+        }; then
+          printf '%s\n' "${base}.zst"
+        else
+          printf '%s\n' "$base"
+        fi
+        break
+      done
+}
+
 check_dump() {
   local d="$1"
-  local latest tmp
-  latest=$(ls -1t "$ROOT/$d"/*.db 2>/dev/null | head -1 || true)
+  local latest tmp base sidecar want got root_real
+  root_real="$(readlink -f -- "$ROOT")"
+  latest="$(latest_complete_dump "$d" | head -1 || true)"
   if [ -z "$latest" ]; then
     echo "FAIL $d dump: no backup"
     FAIL=1
     FAIL_MSGS+=("$d dump missing")
     return 0
   fi
-  tmp="$SCRATCH/dump-$(basename "$latest")"
+  latest="$(readlink -f -- "$latest")"
+  case "$latest" in
+    "$root_real"/*) ;;
+    *)
+      echo "FAIL $d dump: outside backup root ($latest)"
+      FAIL=1
+      FAIL_MSGS+=("$d dump outside root")
+      return 0
+      ;;
+  esac
+  base="$(verify_dump_base "$latest")"
+  tmp="$SCRATCH/dump-$(basename "$base")"
   rm -f "$tmp"
-  cp -a "$latest" "$tmp"
+  if [[ "$latest" == *.zst ]]; then
+    if ! command -v zstd >/dev/null 2>&1 || ! zstd -q -d "$latest" -o "$tmp"; then
+      echo "FAIL $d dump: decompress"
+      FAIL=1
+      FAIL_MSGS+=("$d dump decompress")
+      rm -f "$tmp"
+      return 0
+    fi
+  else
+    cp -a "$latest" "$tmp"
+  fi
   if ! sqlite3 "$tmp" "PRAGMA integrity_check;" | head -1 | grep -qx ok; then
     echo "FAIL $d dump: integrity"
     FAIL=1
@@ -105,9 +162,12 @@ check_dump() {
     rm -f "$tmp"
     return 0
   fi
-  echo "OK  $d dump integrity+rows ($(du -h "$tmp" | awk '{print $1}')) from $(basename "$latest")"
-  if [ -f "${latest}.sha256" ]; then
-    if (cd "$(dirname "$latest")" && sha256sum -c "$(basename "$latest").sha256" >/dev/null); then
+  echo "OK  $d dump integrity+rows ($(du -h "$(readlink -f -- "$tmp")" | awk '{print $1}')) from $(basename "$latest")"
+  sidecar="${base}.sha256"
+  if [ -f "$sidecar" ]; then
+    want="$(awk 'NR==1 { print $1; exit }' "$(readlink -f -- "$sidecar")")"
+    got="$(sha256sum "$(readlink -f -- "$tmp")" | awk '{print $1}')"
+    if [ -n "$want" ] && [ "$got" = "$want" ]; then
       echo "OK  $d dump sha256"
     else
       echo "FAIL $d dump sha256"
@@ -266,6 +326,22 @@ verify_app_enabled() {
   done
   return 1
 }
+
+if [ "${FLEET_VERIFY_LIB_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+LOG=/var/log/fleet-backup/weekly-verify-$(date -u +%Y%m%d).log
+mkdir -p /var/log/fleet-backup "$SCRATCH"
+exec > >(tee -a "$LOG") 2>&1
+echo "[weekly-verify] start $(date -u -Iseconds)"
+
+if [[ -f /etc/congress-health-recover.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /etc/congress-health-recover.env
+  set +a
+fi
 
 echo "[weekly-verify] apps=$FLEET_BACKUP_VERIFY_APPS"
 
