@@ -1,0 +1,5 @@
+nr_free_pages 100
+pgpgin 99999
+pgpgout 20
+pswpin 1120
+pswpout 2000

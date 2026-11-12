@@ -13,6 +13,7 @@ import {
   type GrayImage,
   type HouseGridFormReader,
   type HouseGridOcrBox,
+  type HouseGridReadOptions,
 } from './houseGridForm.ts';
 
 const PDFTOPPM = 'pdftoppm';
@@ -315,7 +316,7 @@ async function runPool<T>(jobs: Array<() => Promise<T>>, limit: number): Promise
 
 export function createDenoHouseGridReader(): HouseGridFormReader {
   return {
-    async read(bytes: ArrayBuffer): Promise<ReturnType<typeof readHouseGridForm> | null> {
+    async read(bytes: ArrayBuffer, options?: HouseGridReadOptions): Promise<ReturnType<typeof readHouseGridForm> | null> {
       if (typeof Deno === 'undefined') return null;
       if (!(await binariesReady())) return null;
       const dir = await Deno.makeTempDir({ prefix: 'house-grid-' });
@@ -361,8 +362,9 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
             // The fitted line is the rule. A 2px inset still includes it, and
             // Tesseract then reads JT as "ost" and 11 as 41. The printed PTR
             // needs one more pixel. The schedule crop stays where it scored.
+            const dateInset = 4;
             const textInset = plan.kind === 'official' ? 4 : 2;
-            const yInset = plan.kind === 'official' ? 4 : 3;
+            const yInset = plan.kind === 'official' ? 4 : dateInset;
             for (const band of bands) {
               // The row rules sit on the band edges. Leaving them in the cell
               // makes a one-line date read as empty.
@@ -386,8 +388,8 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
                   psm: '6',
                   whitelist: null,
                 },
-                { x0: plan.xs[7] + textInset, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
-                { x0: plan.xs[8] + textInset, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[7] + dateInset, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[8] + dateInset, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
               ];
               for (const cell of cells) {
                 const id = jobId;
@@ -403,7 +405,7 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
           pages.push({ image, boxes, page: i + 1 });
         }
         if (pages.length === 0) return null;
-        return readHouseGridForm(pages);
+        return readHouseGridForm(pages, options);
       } catch (err) {
         console.warn('house grid form: local render failed', (err as Error).message);
         return null;
