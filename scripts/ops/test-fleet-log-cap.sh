@@ -287,6 +287,42 @@ APPLY=1 DAEMON_JSON_PATH="$LOOSE_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURN
 assert_eq "$(jq -r '."log-opts"."max-size"' <"$LOOSE_DAEMON")" "10m" "looser max-size tightened to 10m"
 assert_eq "$(jq -r '."log-opts"."max-file"' <"$LOOSE_DAEMON")" "3" "looser max-file tightened to 3"
 
+# --- Docker size formats, partial configs, unreadable values ------------------
+# run_case NAME JSON -> applies installer to a fresh daemon.json, prints file path
+run_case() {
+  local name="$1" json="$2" path
+  path="${TMP}/cases/${name}/daemon.json"
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$json" >"$path"
+  APPLY=1 DAEMON_JSON_PATH="$path" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/cases/${name}/journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >"${TMP}/cases/${name}/out" 2>&1
+  printf '%s' "$path"
+}
+opt() { jq -r --arg k "$2" '."log-opts"[$k] // "absent"' <"$1"; }
+
+p="$(run_case upper-m '{"log-opts":{"max-size":"10M","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/3" "10M equals fleet cap (not loosened)"
+p="$(run_case one-g '{"log-opts":{"max-size":"1g","max-file":"5"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/3" "1g tightened to 10m/3"
+p="$(run_case k512 '{"log-opts":{"max-size":"512k","max-file":"2"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "512k/2" "512k preserved"
+p="$(run_case bare '{"log-opts":{"max-size":"2048","max-file":"2"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "2048/2" "bare byte count preserved"
+p="$(run_case decimal '{"log-opts":{"max-size":"1.5g","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)" "10m" "Docker-valid 1.5g parsed and tightened"
+assert_file_exists "${TMP}/cases/decimal/journald.conf" "1.5g run still installs journald drop-in"
+p="$(run_case mib '{"log-opts":{"max-size":"10MiB","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/3" "10MiB treated as 10m"
+p="$(run_case small-mb '{"log-opts":{"max-size":"5mb","max-file":"3"}}')"
+assert_eq "$(opt "$p" max-size)" "5mb" "5mb tighter than fleet preserved"
+p="$(run_case size-only '{"log-opts":{"max-size":"5m"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "5m/1" "max-size without max-file keeps one file"
+p="$(run_case size-only-big '{"log-opts":{"max-size":"50m"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "10m/1" "50m without max-file tightens size, keeps one file"
+p="$(run_case weird '{"log-opts":{"max-size":"lots","max-file":"2"}}')"
+assert_eq "$(opt "$p" max-size)/$(opt "$p" max-file)" "lots/2" "unreadable max-size preserved, not aborted"
+assert_contains "$(cat "${TMP}/cases/weird/out")" "keeping existing log max-size" "unreadable max-size warns"
+assert_file_exists "${TMP}/cases/weird/journald.conf" "unreadable max-size still installs journald drop-in"
+
 # --- malformed daemon.json ---------------------------------------------------
 BAD_DAEMON="${TMP}/etc/docker/bad-daemon.json"
 printf '{not json' >"$BAD_DAEMON"
