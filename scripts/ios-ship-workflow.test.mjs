@@ -72,11 +72,18 @@ test("ios-appstore-gm.yml ships with notes, Sentry, and a per-run gate override"
   assert.doesNotMatch(yml, /ios-ship-testflight\.sh["'\s].*--force-ship/);
   assert.match(yml, /force_ship:\s*\n\s+description:[^\n]*\n\s+type: boolean\s*\n\s+default: false/);
   assert.match(yml, /FORCE_SHIP:\s*\$\{\{ inputs\.force_ship \}\}/);
-  // Hosted runners start empty, so the gate and the notes range are seeded.
+  // Hosted runners start empty, so the gate and the notes range are seeded
+  // from the previous successful run. A skip fails this job, so the newest
+  // success is an upload and the shared helper is not asked to filter.
   assert.match(yml, /actions: read/);
   assert.match(yml, /Seed last-ship state/);
-  assert.match(yml, /last-ship-congress\.txt/);
-  assert.match(yml, /prev_at="\$\{prev_at%%\.\*\}"/);
+  assert.match(yml, /scripts\/ios-fleet\/seed-last-ship\.sh/);
+  assert.match(yml, /--workflow ios-appstore-gm\.yml/);
+  assert.match(yml, /--app congress/);
+  assert.doesNotMatch(yml, /--require-upload/);
+  const helper = read("scripts/ios-fleet/seed-last-ship.sh");
+  assert.match(helper, /last-ship-\$\{APP\}\.txt/);
+  assert.match(read("scripts/ios-fleet/seed-last-ship.mjs"), /indexOf\("\."\)/);
   // A gate skip must not look like a shipped build.
   assert.match(yml, /Assert this checkout was uploaded/);
   assert.match(yml, /fetch-depth: 0/);
@@ -156,6 +163,18 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
 
   // The gate diffs against an older sha, and the notes need the commit range.
   assert.match(code, /fetch-depth:\s*0/);
+  // The seed runs on every event, before the gate and the ship script, and
+  // reads the previous upload of this workflow. A green skip is not a seed.
+  const seedAt = code.indexOf("name: Seed last-ship state from the previous successful run");
+  const gateAt = code.indexOf("name: Scheduled ship gate");
+  const shipAt = code.indexOf("scripts/ios-ship-testflight.sh");
+  assert.ok(seedAt >= 0 && gateAt > seedAt && shipAt > gateAt, "seed must precede the gate and the ship script");
+  assert.match(code, /actions: read/);
+  assert.match(code, /scripts\/ios-fleet\/seed-last-ship\.sh/);
+  assert.match(code, /--workflow ios-ship\.yml/);
+  assert.match(code, /--require-upload/);
+  assert.match(code, /--ship-step "Ship CongressTrade to TestFlight"/);
+  assert.doesNotMatch(code, /actions\/cache/);
   // What to Test is mandatory and published, never dry-rendered.
   assert.match(code, /IOS_TF_RELEASE_NOTES:\s*"1"/);
   // Ship through the wrapper that runs ship-testflight.sh (ensure-tf-ready inside).

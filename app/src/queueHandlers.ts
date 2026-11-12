@@ -17,6 +17,10 @@ import { gateQueuedDelivery, isOutboxSuppressed, reconnectDeadLetteredOutbox } f
 import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
 import { recordGenuineIngestFailure } from './ingestion/ingestFailureReviewQueue.ts';
+import {
+  ensureTerminalFailureReviewRow,
+  terminalFailureReason,
+} from './ingestion/terminalFailureReview.ts';
 import { executeQueuedCommand } from './client/commands.ts';
 import { updateCommandStatus } from './client/state.ts';
 import { sentryLoggerWarn } from './shared/sentryRuntime.ts';
@@ -193,6 +197,19 @@ export async function handleDeadLetterMessage(
       queue: 'ingest',
       reason: 'outbox_missing',
     });
+    try {
+      const message =
+        `dlq: ingestion outbox missing (${queue}/${msg.type}): ${recoveryError.message}`;
+      await ensureTerminalFailureReviewRow(
+        env,
+        msg.docId,
+        terminalFailureReason('dlq', `${queue}/${msg.type} ${recoveryError.message}`),
+        message,
+        { source: 'dlq' },
+      );
+    } catch (err) {
+      console.error(`failed to enqueue review for ${msg.docId} after missing outbox:`, err);
+    }
   }
   if (recovered.status === 'failed') {
     // VISIBLE TERMINAL STATE (autonomy diagnosis 2026-08-09, principle b):

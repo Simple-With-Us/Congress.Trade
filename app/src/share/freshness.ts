@@ -22,6 +22,7 @@
 import type { Env } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
+import { DEFAULT_PIPELINE_STALL_HOURS, stallWindowMs } from '../ingestion/pipelineStallConfig.ts';
 
 export type FreshnessStream =
   | 'spx'
@@ -64,6 +65,17 @@ export const FRESHNESS_MAX_AGE_DAYS: Record<FreshnessStream, number> = {
 };
 
 const DAY_MS = 86_400_000;
+
+/** Scale day thresholds when a custom stall window is configured for inbound streams. */
+export function scaledFreshnessMaxAgeDays(thresholdMs: number): Record<FreshnessStream, number> {
+  const baseMs = stallWindowMs(DEFAULT_PIPELINE_STALL_HOURS);
+  const ratio = thresholdMs / baseMs;
+  const out = { ...FRESHNESS_MAX_AGE_DAYS };
+  for (const stream of Object.keys(out) as FreshnessStream[]) {
+    out[stream] = Math.max(1, Math.ceil(out[stream] * ratio));
+  }
+  return out;
+}
 
 /** Whole days between a date/ISO string and `nowMs`; null when unparseable. */
 export function ageInDays(value: string | null, nowMs: number): number | null {

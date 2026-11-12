@@ -90,11 +90,12 @@ describe('parseHousePtrText', () => {
   });
 
   it('parses single-line House text without treating the PTR header as an asset', () => {
-    const rows = parseHousePtrText(
+    const text =
       'P T R Clerk of the House of Representatives T ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? ' +
-        'SP Amazon.com, Inc. - Common Stock (AMZN) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New S O: Putnam Investments D: details with AAPL and QQQ shares ' +
-        'DC Apple Inc. - Common Stock (AAPL) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New',
-    );
+      'SP Amazon.com, Inc. - Common Stock (AMZN) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New S O: Putnam Investments D: details with AAPL and QQQ shares ' +
+      'DC Apple Inc. - Common Stock (AAPL) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New';
+    const rows = parseHousePtrText(text);
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
 
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
@@ -107,13 +108,13 @@ describe('parseHousePtrText', () => {
       txDate: '2026-03-16',
       amountMin: 1001,
       amountMax: 15000,
-      confidence: 1.0,
+      confidence,
     });
     expect(rows[1]).toMatchObject({
       owner: 'dependent',
       assetName: 'Apple Inc. - Common Stock',
       ticker: 'AAPL',
-      confidence: 1.0,
+      confidence,
     });
     expect(rows[0].assetName).not.toContain('Clerk');
   });
@@ -201,11 +202,12 @@ describe('parseHousePtrText', () => {
   });
 
   it('parses Pelosi-style option rows from House PTR text at 1.0 deterministic confidence', () => {
-    const rows = parseHousePtrText(
+    const text =
       'Periodic Transaction Report ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? ' +
-        'SP Intel Corporation - Common Stock (INTC) [OP] P 05/29/2026 05/29/2026 $1,000,001 - $5,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27. ' +
-        'SP Uber Technologies, Inc. Common Stock (UBER) [OP] P 05/29/2026 05/29/2026 $500,001 - $1,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27.',
-    );
+      'SP Intel Corporation - Common Stock (INTC) [OP] P 05/29/2026 05/29/2026 $1,000,001 - $5,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27. ' +
+      'SP Uber Technologies, Inc. Common Stock (UBER) [OP] P 05/29/2026 05/29/2026 $500,001 - $1,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27.';
+    const rows = parseHousePtrText(text);
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
 
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
@@ -218,7 +220,7 @@ describe('parseHousePtrText', () => {
       amountMin: 1000001,
       amountMax: 5000000,
       isOption: true,
-      confidence: 1.0,
+      confidence,
     });
     expect(rows[1]).toMatchObject({
       assetName: 'Uber Technologies, Inc. Common Stock',
@@ -226,7 +228,7 @@ describe('parseHousePtrText', () => {
       amountMin: 500001,
       amountMax: 1000000,
       isOption: true,
-      confidence: 1.0,
+      confidence,
     });
   });
 
