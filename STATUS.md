@@ -2,6 +2,9 @@
 
 Congress.Trade does not create `/tmp/symdb-pids`.  `tryInitDdTracer` loads `dd-trace` 6.12.0, whose tarball has no `symdb` string, and compose does not mount host `/tmp`.  The public name match is `dd-trace-py`, which this repo does not depend on.  `DD_TRACE_AGENTLESS_GUARDS` is opt-in and off by default.  The tmpfiles policy and the read-only report are in the tree and are not installed.  Rollout: `docs/rollouts/2026-11-12-tmp-symdb-pids.md`.
 
+## 2026-11-11 CURSOR — compress local sqlite backup dumps on root (CT-2472)
+
+Complete local dumps are zstd `.db.zst` files on the root disk, next to the raw-db `.sha256`.  Keep counts stay Socratic 4 / 2 days, Congress 4 / 2 days, and Usage-Monitor 2 / 2 days.  Dumps stay on `/backups` via the `/data/backups` symlink.  Incomplete dumps are not compressed.  B2/R2 keep policy is unchanged.  This does not install the host copies.  Rollout: `docs/rollouts/2026-11-11-compress-local-sqlite-dumps.md`.
 
 ## 2026-10-26 BF-PUBLISHER — Published filings stuck at ingest_status error (CT-2453)
 

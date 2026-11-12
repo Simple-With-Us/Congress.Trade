@@ -317,6 +317,7 @@ import { executeAdminSchemaMigrations } from './schemaMigrationRunner.ts';
 import { ensurePeerImportSchemaColumns } from './ensurePeerSchema.ts';
 import { getQualityCrosscheck } from '../analytics/quality.ts';
 import { runFilingsHygiene } from '../ingestion/reviewStatusReconcile.ts';
+import { backfillIngestFailureReviewQueue } from '../ingestion/ingestFailureReviewQueue.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import {
   NEEDS_HAND_CHECK_MAC_VISION,
@@ -2950,6 +2951,15 @@ const DeliveryRequeueBodySchema = z
     limit: z.number().int().min(1).max(5000).default(500),
     ignoreCircuit: z.boolean().default(false),
     dryRun: z.boolean().default(false),
+  })
+  .strict();
+
+const IngestFailureBackfillBodySchema = z
+  .object({
+    chamber: z.enum(['house', 'senate', 'executive']).nullable().default(null),
+    apply: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+    limit: z.number().int().min(1).max(2000).default(500),
   })
   .strict();
 
@@ -7127,6 +7137,29 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     return c.json({ ok: true, dryRun: !apply, ...result });
   });
 
+  // --- POST /review-queue/backfill-ingest-failures -------------------------
+  // One-time (or periodic) mirror of genuine ingest_status='error' filings
+  // onto open review_queue rows for Publisher drain.  Default dry-run.
+  // Body (all optional): { apply?: boolean, dryRun?: boolean, chamber?: string, limit?: number }
+  // Do not run against production from an agent unless the operator asked.
+  r.post('/review-queue/backfill-ingest-failures', async (c) => {
+    let json: unknown = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) json = JSON.parse(raw) as unknown;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const parsed = IngestFailureBackfillBodySchema.safeParse(json);
+    if (!parsed.success) return c.json({ error: 'invalid payload' }, 400);
+    const apply = parsed.data.apply === true && parsed.data.dryRun !== true;
+    const result = await backfillIngestFailureReviewQueue(c.env, {
+      chamber: parsed.data.chamber,
+      limit: parsed.data.limit,
+      dryRun: !apply,
+    });
+    return c.json({ ok: true, ...result });
+  });
 
   // --- POST /sweep-already-published --------------------------------------
   // On-demand trigger for sweepAlreadyPublishedReviewRows. The hourly
