@@ -244,7 +244,7 @@ export const publicApiGuard: MiddlewareHandler<{ Bindings: Env }> = async (c, ne
         { 'X-Robots-Tag': 'noindex' },
       );
     }
-    const rl = await rateLimit(c.env, 'pub-api', clientIp(c.req.raw), PUBLIC_API_LIMIT, PUBLIC_API_WINDOW_SEC);
+    const rl = await rateLimit(c.env, 'pub-api', clientIp(c.req.raw, c.env), PUBLIC_API_LIMIT, PUBLIC_API_WINDOW_SEC);
     if (!rl.ok) {
       return c.json({ error: 'too many requests' }, 429, {
         'Retry-After': String(rl.retryAfterSec),
