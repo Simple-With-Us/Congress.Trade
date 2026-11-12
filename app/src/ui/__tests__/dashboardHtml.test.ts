@@ -529,6 +529,11 @@ describe('DASHBOARD_HTML', () => {
     expect(DASHBOARD_SOURCE).toContain('<h3>Push Notifications</h3>');
     expect(DASHBOARD_SOURCE).toContain('one digest per new filing');
     expect(DASHBOARD_SOURCE).toContain('<h3>Alerts</h3>');
+    expect(DASHBOARD_SOURCE).toContain(
+      'We read official House, Senate, and Executive Branch filings directly, so new trades reach you within minutes to hours.',
+    );
+    expect(DASHBOARD_SOURCE).not.toContain('Relaying a 3rd-party competitor API');
+    expect(DASHBOARD_SOURCE).not.toContain('minutes-to-hours edge');
     expect(DASHBOARD_SOURCE).toContain('Get the Filing First');
     expect(DASHBOARD_SOURCE).toContain('Signed Webhooks');
     expect(DASHBOARD_SOURCE).toContain('HMAC-SHA256');

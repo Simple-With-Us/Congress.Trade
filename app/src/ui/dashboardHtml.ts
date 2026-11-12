@@ -667,7 +667,7 @@ ${speedProofSectionHtml('trends')}
          requires a signed-in Premium account. -->
     <div class="section" id="subsMarketing">
       <h3>Alerts</h3>
-      <p class="sub">We read official House, Senate, and Executive Branch filings.</p>
+      <p class="sub">We read official House, Senate, and Executive Branch filings directly, so new trades reach you within minutes to hours.</p>
       <p class="sub" style="margin-top: 8px;">Premium sends each new trade to you as soon as we have it.&#160; Two methods, both included:</p>
       <div class="speed-mini" id="alertsSpeedMini"></div>
       <div class="delivery-grid">
