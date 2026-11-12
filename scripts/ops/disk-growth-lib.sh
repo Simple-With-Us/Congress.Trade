@@ -72,9 +72,14 @@ disk_growth_du_one_root() {
     "$DISK_GROWTH_NICE" -n 19
     "$DISK_GROWTH_DU" -x -d 1 -B1
   )
-  if ! "${cmd[@]}" "$root" 2>/dev/null | sort -rn -k1 | head -n "$TOP_N"; then
+  set +o pipefail
+  "${cmd[@]}" "$root" 2>/dev/null | sort -rn -k1 | head -n "$TOP_N"
+  local du_ec=${PIPESTATUS[0]}
+  set -o pipefail
+  if (( du_ec == 124 )); then
     return 124
   fi
+  return 0
 }
 
 disk_growth_docker_verbose() {
@@ -201,9 +206,9 @@ def parse_docker(blob):
         if not line:
             if current and rows:
                 sections[current] = {"headers": headers, "rows": rows}
-            current = None
-            headers = None
-            rows = []
+                current = None
+                headers = None
+                rows = []
             continue
         if line.endswith("usage:") or line.endswith("usage"):
             if current and rows:
@@ -213,7 +218,11 @@ def parse_docker(blob):
             rows = []
             continue
         if current and headers is None and (
-            "REPOSITORY" in line or "TYPE" in line or "VOLUME NAME" in line or "CACHE ID" in line
+            "REPOSITORY" in line
+            or "TYPE" in line
+            or "VOLUME NAME" in line
+            or "CACHE ID" in line
+            or "CONTAINER ID" in line
         ):
             headers = re.split(r"\s{2,}", line.strip())
             continue
@@ -235,7 +244,7 @@ def parse_docker(blob):
         total = 0
         for row in block.get("rows") or []:
             val = row.get(size_key, "")
-            m = re.match(r"([\d.]+)\s*([KMGT]?B)", str(val).replace(" ", ""))
+            m = re.match(r"([\d.]+)\s*([KMGT]?i?B)", str(val).replace(" ", ""), re.I)
             if not m:
                 continue
             num = float(m.group(1))

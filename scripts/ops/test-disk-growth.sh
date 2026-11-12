@@ -77,6 +77,8 @@ assert doc["schema_version"] == 1
 assert doc["filesystems"], "expected filesystem rows"
 assert doc["directory_totals"], "expected directory totals"
 assert doc["docker"].get("available") is True
+assert doc["docker"].get("sections"), "expected docker sections"
+assert "Images" in doc["docker"]["sections"], "docker parser should retain Images block"
 PY
 then
   assert_fail "snapshot JSON shape"
