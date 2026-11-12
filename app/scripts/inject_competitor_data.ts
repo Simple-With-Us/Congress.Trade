@@ -11,11 +11,14 @@ import {
   resolveExecutiveFilerIdFromName,
 } from "../src/shared/executiveIdentity.ts";
 import {
+  chamberForMatchedCompetitorFiler,
+  chamberForMintedCompetitorInsert,
   chamberFromMemberType,
   competitorHouseFilerId,
   competitorQualifiedManualFilerId,
   competitorReporterNames,
   parseCompetitorReporter,
+  type ParsedCompetitorChamber,
 } from "../src/shared/competitorAttribution.ts";
 import {
   findExistingFilerForCompetitorReporter,
@@ -116,7 +119,7 @@ async function run() {
   
   const nowStr = new Date().toISOString();
 
-  function processTrade(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
+  function processTrade(provider: string, rawName: string, ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
     if (!date || date < cutoffDate) return;
 
     const tk = (ticker || '').toUpperCase();
@@ -189,7 +192,7 @@ async function run() {
   }
 
   // Before looping over competitors, create a set of seen filers to add if missing
-  const filersToAdd = new Map<string, { id: string, name: string, chamber: string }>();
+  const filersToAdd = new Map<string, { id: string; name: string; chamber: ParsedCompetitorChamber | null }>();
 
   // Live, non-tombstoned filers: the identities a competitor row must attach to
   // instead of minting a second one (board rows 2c0b428c / 591011b9).
@@ -230,9 +233,8 @@ async function run() {
    */
   function resolveFilerId(
     rawName: string,
-    chamber: 'house' | 'senate' | 'executive',
-    rawObj: any,
-  ): { filerId: string; resolvedChamber: 'house' | 'senate' | 'executive' } | null {
+    rawObj: unknown,
+  ): { filerId: string; resolvedChamber: ParsedCompetitorChamber | null } | null {
     const execId = resolveExecutiveFilerIdFromName(rawName);
     if (execId) return { filerId: execId, resolvedChamber: 'executive' };
 
@@ -245,11 +247,10 @@ async function run() {
       candidates: existingFilers,
     });
     if (existing) {
-      const existingChamber = (existing.chamber ?? '').toLowerCase();
-      const resolvedChamber = existingChamber === 'house' || existingChamber === 'senate' || existingChamber === 'executive'
-        ? existingChamber
-        : (parsed.chamber ?? chamber);
-      return { filerId: existing.filerId, resolvedChamber };
+      return {
+        filerId: existing.filerId,
+        resolvedChamber: chamberForMatchedCompetitorFiler(existing.chamber, parsed),
+      };
     }
 
     if (parsed.state && parsed.district) {
@@ -257,23 +258,23 @@ async function run() {
       if (houseId) return { filerId: houseId, resolvedChamber: 'house' };
     }
 
-    // Only a payload-declared chamber is trusted here; the provider default is
-    // NOT — that is how executives ended up labelled 'senate'.
-    const resolvedChamber = parsed.chamber ?? chamber;
     const qualified = competitorQualifiedManualFilerId(rawName);
     if (!qualified) return null;
-    return { filerId: qualified, resolvedChamber };
+    return { filerId: qualified, resolvedChamber: chamberForMintedCompetitorInsert(parsed) };
   }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
-    const resolved = resolveFilerId(rawName, chamber, rawObj);
+    const resolved = resolveFilerId(rawName, rawObj);
     if (!resolved) {
       refusedBareName += 1;
       return;
     }
     const { filerId, resolvedChamber } = resolved;
-    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber: resolvedChamber });
-    processTrade(provider, rawName, resolvedChamber, ticker, date, typeStr, rawObj, filerId);
+    const prior = filersToAdd.get(filerId);
+    const chamber =
+      resolvedChamber ?? (prior?.chamber as ParsedCompetitorChamber | null | undefined) ?? null;
+    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber });
+    processTrade(provider, rawName, ticker, date, typeStr, rawObj, filerId);
   }
 
   // unusual whales
