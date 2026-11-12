@@ -90,11 +90,10 @@ test('a long top-level listing still exits 0', () => {
     for (let i = 0; i < directories; i += 1) {
       mkdirSync(join(root, `d${String(i).padStart(4, '0')}${pad}`));
     }
-    const probe = spawnSync('bash', ['-c', `
-      set -o pipefail
-      find -P "$1" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' | sort | head -n 10 >/dev/null
-    `, 'bash', root], { encoding: 'utf8' });
-    assert.equal(probe.status, 141, probe.stderr);
+    // About 70KB, past one 64KB pipe. A sort|head status is not asserted:
+    // head can drain a 5KB overflow before sort's next write, so 141 is a race.
+    const lineBytes = `0\td0000${pad}\n`.length;
+    assert.ok(directories * lineBytes > 65_536);
     const run = spawnSync('bash', [reportPath.pathname, root], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
     const listed = run.stdout.split('\n').filter((line) => /^\d+\td\d{4}x{180}$/.test(line));
