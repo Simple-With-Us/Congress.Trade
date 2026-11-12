@@ -8,20 +8,17 @@ import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 import { resolveSecret } from "../src/secrets/infisical.ts";
 import {
   assetNameFromCompetitorPayload,
-  resolveExecutiveFilerIdFromName,
 } from "../src/shared/executiveIdentity.ts";
 import {
   chamberForMatchedCompetitorFiler,
   chamberForMintedCompetitorInsert,
   chamberFromMemberType,
-  competitorHouseFilerId,
-  competitorQualifiedManualFilerId,
   competitorReporterNames,
   parseCompetitorReporter,
   type ParsedCompetitorChamber,
 } from "../src/shared/competitorAttribution.ts";
 import {
-  findExistingFilerForCompetitorReporter,
+  assignCompetitorFilerId,
   type ExistingFilerCandidate,
 } from "../src/shared/competitorFilerMatch.ts";
 
@@ -235,32 +232,30 @@ async function run() {
     rawName: string,
     rawObj: unknown,
   ): { filerId: string; resolvedChamber: ParsedCompetitorChamber | null } | null {
-    const execId = resolveExecutiveFilerIdFromName(rawName);
-    if (execId) return { filerId: execId, resolvedChamber: 'executive' };
-
     const parsed = parseCompetitorReporter(rawObj);
-    const existing = findExistingFilerForCompetitorReporter({
+    // Payload chamber only. The provider default is not trusted here; that is
+    // how executives ended up labelled senate. A bare surname returns null.
+    const assigned = assignCompetitorFilerId({
+      rawName,
       names: [...competitorReporterNames(rawObj), rawName],
       chamber: parsed.chamber,
       state: parsed.state,
+      district: parsed.district,
       bioguideId: parsed.bioguideId,
       candidates: existingFilers,
     });
-    if (existing) {
-      return {
-        filerId: existing.filerId,
-        resolvedChamber: chamberForMatchedCompetitorFiler(existing.chamber, parsed),
-      };
+    if (!assigned) return null;
+    if (assigned.minted) {
+      if (assigned.filerId.startsWith('EXEC-')) return { filerId: assigned.filerId, resolvedChamber: 'executive' };
+      if (assigned.filerId.startsWith('house-')) return { filerId: assigned.filerId, resolvedChamber: 'house' };
+      if (assigned.filerId.startsWith('senate-')) return { filerId: assigned.filerId, resolvedChamber: 'senate' };
+      return { filerId: assigned.filerId, resolvedChamber: chamberForMintedCompetitorInsert(parsed) };
     }
-
-    if (parsed.state && parsed.district) {
-      const houseId = competitorHouseFilerId(rawName, parsed.state, parsed.district);
-      if (houseId) return { filerId: houseId, resolvedChamber: 'house' };
-    }
-
-    const qualified = competitorQualifiedManualFilerId(rawName);
-    if (!qualified) return null;
-    return { filerId: qualified, resolvedChamber: chamberForMintedCompetitorInsert(parsed) };
+    const existing = existingFilers.find((f) => f.filerId === assigned.filerId);
+    return {
+      filerId: assigned.filerId,
+      resolvedChamber: chamberForMatchedCompetitorFiler(existing?.chamber, parsed),
+    };
   }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
