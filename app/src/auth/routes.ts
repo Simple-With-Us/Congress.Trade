@@ -278,7 +278,7 @@ export function buildAuthRouter(): Hono<{ Bindings: Env }> {
     // checked first and short-circuited so an already-throttled IP can't keep
     // spending a victim email's separate 5/hr quota while never itself getting
     // a magic link sent. Fails open if KV is unavailable.
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const ipRl = await rateLimit(c.env, 'magic-ip', ip, 10, 600);
     if (!ipRl.ok) {
       return c.json({ error: 'too many requests, please try again later' }, 429, {
@@ -443,7 +443,7 @@ export function buildAuthRouter(): Hono<{ Bindings: Env }> {
     const enabled = (await resolveSecret(c.env, 'APPLE_SIGNIN_ENABLED')).value === 'true';
     if (!enabled) return c.json({ error: 'Sign in with Apple is not enabled' }, 503);
 
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const ipRl = await rateLimit(c.env, 'apple-signin-ip', ip, 20, 600);
     if (!ipRl.ok) {
       return c.json({ error: 'too many requests, please try again later' }, 429, {

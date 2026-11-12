@@ -111,7 +111,14 @@ describe('orchestrator provider-ban circuit breaker', () => {
     expect(extract).not.toHaveBeenCalled();
 
     const errorRun = runs.find((r) => /SET ingest_status = 'error'/i.test(r.sql));
-    expect(errorRun?.params).toEqual([expect.stringContaining('circuit breaker is open'), 'H-1']);
+    expect(errorRun?.params?.[0]).toEqual(expect.stringContaining('circuit breaker is open'));
+    expect(errorRun?.params?.[1]).toBe('H-1');
+    expect(errorRun?.params?.slice(2)).toEqual([
+      'auto_published',
+      'confirmed',
+      'manual',
+      'agreement_published',
+    ]);
   });
 
   it('proceeds with extraction when the KV read throws', async () => {

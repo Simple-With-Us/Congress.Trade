@@ -31,6 +31,11 @@ describe('requiresHandCheckBeforePublish', () => {
     expect(requiresHandCheckBeforePublish(filing(), 'server_cpu_tesseract', 'server_cpu')).toBe(true);
   });
 
+  it('lets a grid-form CPU read use the normalizer gates instead of a blanket hand check', () => {
+    expect(requiresHandCheckBeforePublish(filing(), 'server_cpu_gridform', 'server_cpu')).toBe(false);
+    expect(requiresHandCheckBeforePublish(filing(), 'houseGridForm', 'primary')).toBe(false);
+  });
+
   it('allows typed primary extraction on electronic filings', () => {
     const f = filing({ docId: 'H-2026-20035190', docKind: 'text_pdf' });
     expect(requiresHandCheckBeforePublish(f, 'textPdf', 'primary')).toBe(false);

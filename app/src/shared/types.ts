@@ -260,7 +260,7 @@ export interface ParsedTx {
    * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
    * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type'>;
+  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output' | 'band_amount_inferred' | 'suspected_constant_tx_type' | 'grid_type_unmarked'>;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -774,6 +774,23 @@ export interface Env {
   DISCLOSURE_LATENCY_WATCH_ENABLED?: string;
   /** Enables the public-API anti-scraping guard (UA blocklist + per-IP budgets). Unset = off. */
   SCRAPE_GUARD_ENABLED?: string;
+  /**
+   * Reject requests that did not arrive via Cloudflare. Unset = off, so a
+   * deploy does not change traffic. See src/security/originLock.ts.
+   */
+  ORIGIN_LOCK_ENABLED?: string;
+  /** Shared secret Cloudflare adds (Transform Rule) as X-CT-Origin-Secret. */
+  ORIGIN_LOCK_SECRET?: string;
+  /** Extra trusted-proxy CIDRs, comma-separated, added to loopback and private ranges. */
+  ORIGIN_LOCK_TRUSTED_PROXIES?: string;
+  /**
+   * Header a trusted proxy sets only after verifying Cloudflare Authenticated
+   * Origin Pulls. Unset = that check is off. Client-supplied values are
+   * ignored unless the socket peer is a trusted proxy or Cloudflare.
+   */
+  ORIGIN_LOCK_AOP_HEADER?: string;
+  /** Expected value of ORIGIN_LOCK_AOP_HEADER. Default SUCCESS. */
+  ORIGIN_LOCK_AOP_VALUE?: string;
   /** App-level D1 daily rows-READ budget (stringified int). Soft-warns at 80%; default 200M/day. Infisical-tunable. */
   D1_DAILY_ROWS_READ_BUDGET?: string;
   /** App-level D1 daily rows-WRITTEN budget (stringified int). Soft-warns at 80%; default 2M/day (~$10/mo of D1 writes). Infisical-tunable. */

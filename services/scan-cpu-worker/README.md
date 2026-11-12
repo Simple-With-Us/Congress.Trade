@@ -69,6 +69,10 @@ python worker.py --once --pdf /path/to/sample.pdf --doc-id H-TEST
 
 Install extras only if needed: `pip install -r requirements-optional.txt`.
 
+## Hand-delivered grid forms
+
+Pages whose vertical rules match a hand-delivered House PTR template are read by `gridform.py` instead of the ink-ratio pass.  Column boundaries are fit per page.  An x glyph is template-matched into the type columns (purchase, sale, sale partial, exchange) and the amount columns.  Asset, owner, and date text still come from the CPU OCR backend.  A row with no single type mark is submitted with `extractionWarnings: ["grid_type_unmarked"]` and an empty `txType`.  It is not stored as a guessed purchase.  When any page matches, the submit extractor is `server_cpu_gridform`.
+
 ## Deterministic checkbox algorithm
 
 1. Deskew / pick upright rotation (OCR keyword score or EXIF).
