@@ -27,8 +27,16 @@ else
   echo "filesystem_inodes_free=unavailable"
 fi
 
-walk_files="$(find -P "$root" -xdev -type f -printf '.' | wc -c | awk '{print $1}')"
-walk_bytes="$(find -P "$root" -xdev -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}')"
+# One pass for both totals. An unreadable subtree must not abort the report.
+find() {
+  command find "$@" 2>/dev/null || true
+}
+
+walk_stats="$(
+  find -P "$root" -xdev -type f -printf '%s\n' |
+    awk '{ count++; bytes += $1 } END { print count + 0, bytes + 0 }'
+)"
+read -r walk_files walk_bytes <<< "$walk_stats"
 echo "walk_files=$walk_files"
 echo "walk_bytes=$walk_bytes"
 

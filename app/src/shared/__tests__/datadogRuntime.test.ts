@@ -7,6 +7,7 @@ import {
   datadogTracesIntakeUrl,
   canonicalizeDatadogEnv,
   normalizeDatadogSite,
+  applyAgentOnlyTracerEnv,
   planAgentlessTracerGuards,
   resolveDatadogBackend,
   resolveDatadogRum,
@@ -392,11 +393,36 @@ describe('agentless tracer guards', () => {
     });
   });
 
+  it('copies an explicit switch onto the tracer env after the guard plan', () => {
+    const env: Record<string, string | undefined> = {};
+    const input = { DD_REMOTE_CONFIGURATION_ENABLED: 'false' };
+    const planned = planAgentlessTracerGuards({
+      guards: 'true',
+      current: input,
+    });
+    applyAgentOnlyTracerEnv(env, planned, input);
+    expect(env.DD_DYNAMIC_INSTRUMENTATION_ENABLED).toBe('false');
+    expect(env.DD_PROFILING_ENABLED).toBe('false');
+    expect(env.DD_REMOTE_CONFIGURATION_ENABLED).toBe('false');
+
+    const kept: Record<string, string | undefined> = {};
+    const explicit = { DD_DYNAMIC_INSTRUMENTATION_ENABLED: 'true' };
+    applyAgentOnlyTracerEnv(
+      kept,
+      planAgentlessTracerGuards({ guards: 'true', current: explicit }),
+      explicit,
+    );
+    expect(kept.DD_DYNAMIC_INSTRUMENTATION_ENABLED).toBe('true');
+    expect(kept.DD_PROFILING_ENABLED).toBe('false');
+  });
+
   it('applies the guard plan before the dd-trace import', () => {
     const src = readFileSync(new URL('../datadog.ts', import.meta.url), 'utf8');
-    const planAt = src.indexOf('planAgentlessTracerGuards');
+    const planAt = src.indexOf('planAgentlessTracerGuards(');
+    const applyAt = src.indexOf('applyAgentOnlyTracerEnv(');
     const importAt = src.indexOf("import('npm:dd-trace')");
     expect(planAt).toBeGreaterThan(-1);
-    expect(importAt).toBeGreaterThan(planAt);
+    expect(applyAt).toBeGreaterThan(planAt);
+    expect(importAt).toBeGreaterThan(applyAt);
   });
 });

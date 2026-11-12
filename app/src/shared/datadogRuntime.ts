@@ -181,6 +181,24 @@ export function planAgentlessTracerGuards(args: {
   return planned;
 }
 
+/**
+ * Write the guard plan, then any explicit operator value, onto the process
+ * environment before dd-trace is imported. An Infisical value lives on
+ * `input` and is not necessarily already on `process.env`.
+ */
+export function applyAgentOnlyTracerEnv(
+  env: Record<string, string | undefined>,
+  planned: Partial<Record<AgentOnlyTracerEnv, string | undefined>>,
+  input: Partial<Record<AgentOnlyTracerEnv, string | undefined>> | undefined,
+): void {
+  for (const key of AGENT_ONLY_TRACER_ENV) {
+    const pinned = planned[key];
+    if (pinned) env[key] = pinned;
+    const explicit = firstNonEmpty(input?.[key]);
+    if (explicit) env[key] = explicit;
+  }
+}
+
 export const FLEET_DD_HOSTNAME = 'fleet-hetzner-nbg1';
 
 export function firstNonEmpty(...values: Array<string | undefined>): string {

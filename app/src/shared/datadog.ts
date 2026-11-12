@@ -6,6 +6,7 @@
 import type { MiddlewareHandler } from 'hono';
 import {
   FLEET_DD_HOSTNAME,
+  applyAgentOnlyTracerEnv,
   planAgentlessTracerGuards,
   resolveDatadogBackend,
   resolveDatadogRum,
@@ -98,21 +99,20 @@ export async function tryInitDdTracer(
   try {
     const proc = (globalThis as any).process;
     const env = proc?.env as Record<string, string | undefined> | undefined;
+    const current = {
+      DD_DYNAMIC_INSTRUMENTATION_ENABLED:
+        input?.DD_DYNAMIC_INSTRUMENTATION_ENABLED ?? env?.DD_DYNAMIC_INSTRUMENTATION_ENABLED,
+      DD_PROFILING_ENABLED: input?.DD_PROFILING_ENABLED ?? env?.DD_PROFILING_ENABLED,
+      DD_REMOTE_CONFIGURATION_ENABLED:
+        input?.DD_REMOTE_CONFIGURATION_ENABLED ?? env?.DD_REMOTE_CONFIGURATION_ENABLED,
+    };
     const planned = planAgentlessTracerGuards({
       guards: input?.DD_TRACE_AGENTLESS_GUARDS ?? env?.DD_TRACE_AGENTLESS_GUARDS,
       agentHost: backend.agentHost,
       agentUrl: backend.agentUrl,
-      current: {
-        DD_DYNAMIC_INSTRUMENTATION_ENABLED:
-          input?.DD_DYNAMIC_INSTRUMENTATION_ENABLED ?? env?.DD_DYNAMIC_INSTRUMENTATION_ENABLED,
-        DD_PROFILING_ENABLED: input?.DD_PROFILING_ENABLED ?? env?.DD_PROFILING_ENABLED,
-        DD_REMOTE_CONFIGURATION_ENABLED:
-          input?.DD_REMOTE_CONFIGURATION_ENABLED ?? env?.DD_REMOTE_CONFIGURATION_ENABLED,
-      },
+      current,
     });
-    if (env) {
-      for (const [key, value] of Object.entries(planned)) env[key] = value;
-    }
+    if (env) applyAgentOnlyTracerEnv(env, planned, input);
     const hostTag = backend.hostname
       || proc?.env?.DD_HOSTNAME
       || ((proc?.env?.COOLIFY_FQDN || proc?.env?.COOLIFY_RESOURCE_UUID) ? FLEET_DD_HOSTNAME : '');

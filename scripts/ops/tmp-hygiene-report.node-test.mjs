@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -80,4 +80,25 @@ test('the report is read-only and prints bytes, inodes, and top directories', ()
   assert.match(run.stdout, /^1\tctdb$/m);
   assert.match(run.stdout, /^1\tother$/m);
   assert.equal(readFileSync(join(symdb, '111'), 'utf8'), before);
+});
+
+test('an unreadable directory does not abort the report', () => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+  const root = mkdtempSync(join(tmpdir(), 'tmp-hygiene-unreadable-'));
+  const hidden = join(root, 'hidden');
+  mkdirSync(hidden);
+  writeFileSync(join(hidden, 'secret'), 'zzzz');
+  writeFileSync(join(root, 'visible'), 'ab');
+  chmodSync(hidden, 0);
+  try {
+    const run = spawnSync('bash', [reportPath.pathname, root], { encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stderr, '');
+    assert.match(run.stdout, /^walk_files=1$/m);
+    assert.match(run.stdout, /^walk_bytes=2$/m);
+    assert.match(run.stdout, /^top_directories$/m);
+  } finally {
+    chmodSync(hidden, 0o755);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
