@@ -19,6 +19,7 @@ from gridform import (  # noqa: E402
     OcrBox,
     classify_mark_scores,
     clean_grid_asset_name,
+    split_bare_ticker,
     expand_official_ptr_rules,
     fit_column_lines,
     fit_official_ptr_lines,
@@ -177,3 +178,9 @@ def test_official_ptr_fit_rejects_a_schedule_page():
     shrunk = [int(round(value * 0.92)) for value in OFFICIAL_PTR_TEMPLATE]
     assert fit_official_ptr_lines(shrunk) is None
     assert clean_grid_asset_name("SPDR SER TR S&P AEROSPACE & DEFENSE") == "SPDR SER TR S&P AEROSPACE & DEFENSE"
+    assert split_bare_ticker("US TREASURY NOTE", 1) == (None, "US TREASURY NOTE")
+    assert split_bare_ticker("COCA COLA", 1) == (None, "COCA COLA")
+    assert split_bare_ticker("SPDR Ser Tr S&P Aerospace & Defense XAR", 1) == (
+        "XAR",
+        "SPDR Ser Tr S&P Aerospace & Defense",
+    )

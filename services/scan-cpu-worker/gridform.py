@@ -692,6 +692,37 @@ def _split_form_token(token: str) -> List[str]:
     return pieces
 
 
+_TICKER_DENY = {
+    "INC", "CMN", "LLC", "PLC", "CORP", "CO", "ETF", "LTD", "USD", "USD0", "ADR",
+    "COM", "FUND", "CLASS", "HLDG", "STOCK", "TRUST", "THE", "AND", "NEW", "CL",
+    "COMMON", "SHARES", "INDEX", "LINKED", "COMPANY",
+}
+
+
+def split_bare_ticker(text: str, spaces: int = 2) -> Tuple[Optional[str], str]:
+    """Same ticker split as houseGridForm.ts splitBareTicker.
+
+    One space peels a symbol only when the previous word is a form word or
+    contains a lowercase letter. "US TREASURY NOTE" keeps NOTE.
+    """
+    found = re.search(r"\(([A-Z]{1,5})\)", text)
+    if found:
+        return found.group(1), text
+    wide = re.search(r"^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$", text)
+    if wide and wide.group(2) not in _TICKER_DENY:
+        return wide.group(2), wide.group(1)
+    if spaces != 1:
+        return None, text
+    narrow = re.search(r"^(.*\S)[ \t]+([A-Z]{2,5})[ \t]*$", text)
+    if not narrow or narrow.group(2) in _TICKER_DENY:
+        return None, text
+    previous = narrow.group(1).strip().split()[-1]
+    letters = re.sub(r"[^A-Za-z]", "", previous).upper()
+    if letters not in _TICKER_DENY and not re.search(r"[a-z]", previous):
+        return None, text
+    return narrow.group(2), narrow.group(1)
+
+
 def clean_grid_asset_name(text: str) -> str:
     """Same form-word splits as houseGridForm.ts cleanGridAssetName."""
     tokens = [token for token in re.sub(r"[|`\u00b4\u2018\u2019_]+", " ", text).split() if token]
@@ -963,20 +994,7 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
             notes.append("amount column K marked")
         warnings = ["grid_type_unmarked"] if marks.type_reason != "ok" or marks.tx_type is None else []
         confidence = row_confidence(marks, asset_conf, trade_date is not None, asset)
-        ticker = None
-        found = re.search(r"\(([A-Z]{1,5})\)", asset)
-        gap = r"[ \t]+" if fit.kind == "official" else r"[ \t]{2,}"
-        bare = re.search(rf"^(.*\S){gap}([A-Z]{{2,5}})[ \t]*$", asset)
-        ticker_deny = {
-            "INC", "CMN", "LLC", "PLC", "CORP", "CO", "ETF", "LTD", "USD", "USD0", "ADR",
-            "COM", "FUND", "CLASS", "HLDG", "STOCK", "TRUST", "THE", "AND", "NEW", "CL",
-            "COMMON", "SHARES", "INDEX", "LINKED", "COMPANY",
-        }
-        if found:
-            ticker = found.group(1)
-        elif bare and bare.group(2) not in ticker_deny:
-            ticker = bare.group(2)
-            asset = bare.group(1)
+        ticker, asset = split_bare_ticker(asset, 1 if fit.kind == "official" else 2)
         cleaned = clean_grid_asset_name(asset)
         rows.append(GridRow(
             asset_name=cleaned or asset or f"(unreadable asset p{page})",

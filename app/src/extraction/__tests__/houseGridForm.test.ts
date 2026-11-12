@@ -507,6 +507,16 @@ describe('grid row, owner, and date corrections', () => {
       name: 'SELECT SECTOR SPDR ENERGY SEL SEC ETF',
       ticker: 'XLE',
     });
+    expect(splitBareTicker('IShares Tr Ishares Core MSCI Europe IEUR', 1)).toEqual({
+      name: 'IShares Tr Ishares Core MSCI Europe',
+      ticker: 'IEUR',
+    });
+    expect(splitBareTicker('SPDR Ser Tr S&P Aerospace & Defense XAR', 1)).toEqual({
+      name: 'SPDR Ser Tr S&P Aerospace & Defense',
+      ticker: 'XAR',
+    });
+    expect(splitBareTicker('US TREASURY NOTE', 1)).toEqual({ name: 'US TREASURY NOTE', ticker: null });
+    expect(splitBareTicker('COCA COLA', 1)).toEqual({ name: 'COCA COLA', ticker: null });
     const rows: DrawnRow[] = [
       { y0: 220, y1: 300, owner: 'JT', asset: 'ISHARES TR 10 20 YR TREAS BD ETF  TLH', txDate: '10/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.p, 9] },
       { y0: 300, y1: 380, owner: 'JT', asset: '', txDate: '', notifDate: '', marks: [] },

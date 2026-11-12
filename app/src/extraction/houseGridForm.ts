@@ -1402,18 +1402,31 @@ const TICKER_DENY = new Set([
 
 /**
  * A parenthetical ticker stays. A bare ticker is the last token only when
- * two spaces separate it from the asset name, which is how these grids
- * print the symbol after the name.
+ * two spaces separate it from the asset name, which is how the attached
+ * schedule prints the symbol.
+ *
+ * The printed PTR uses one space. That split still requires the previous
+ * word to be a form word (ETF, INC) or to contain a lowercase letter, so an
+ * all-caps name such as "US TREASURY NOTE" keeps NOTE.
  */
 export function splitBareTicker(text: string, spaces: 1 | 2 = 2): { name: string; ticker: string | null } {
   const paren = text.match(/\(([A-Z]{1,5})\)/);
   if (paren) return { name: text, ticker: paren[1] };
-  // The attached schedule prints two spaces before the symbol. The PTR
-  // prints one, and a single space must not peel a schedule name.
-  const gap = spaces === 1 ? '[ \\t]+' : '[ \\t]{2,}';
-  const match = text.match(new RegExp(`^(.*\\S)${gap}([A-Z]{2,5})[ \\t]*$`));
-  if (!match || TICKER_DENY.has(match[2])) return { name: text, ticker: null };
-  return { name: match[1], ticker: match[2] };
+  const wide = text.match(/^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$/);
+  if (wide && !TICKER_DENY.has(wide[2])) return { name: wide[1], ticker: wide[2] };
+  if (spaces !== 1) return { name: text, ticker: null };
+  const narrow = text.match(/^(.*\S)[ \t]+([A-Z]{2,5})[ \t]*$/);
+  if (!narrow || TICKER_DENY.has(narrow[2]) || !officialOneSpaceTicker(narrow[1])) {
+    return { name: text, ticker: null };
+  }
+  return { name: narrow[1], ticker: narrow[2] };
+}
+
+function officialOneSpaceTicker(name: string): boolean {
+  const previous = name.trim().split(/\s+/).pop() ?? '';
+  const letters = previous.replace(/[^A-Za-z]/g, '');
+  if (TICKER_DENY.has(letters.toUpperCase())) return true;
+  return /[a-z]/.test(previous);
 }
 
 export function cleanGridAssetName(text: string): string {

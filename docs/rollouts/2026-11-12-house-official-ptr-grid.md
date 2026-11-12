@@ -28,7 +28,7 @@ Amount-column rules define the rows.  The pitch is the median gap from 45px to 
 
 On an official page, chrome is dropped even when a box is marked.  That covers the instruction line, Example Mega Corp, a sample date, and a see-attachment pointer.  A row still needs a clear type mark and an asset name.  The schedule page keeps the old rule and drops chrome only when there is no mark.
 
-The printed PTR puts one space before the ticker.  The schedule still requires two spaces, so a one-space XLE on a schedule name does not peel.  A standalone ampersand stays in the asset name.  The owner and date crops sit 4px inside the fitted rule.  A 2px inset still included the rule, and Tesseract read JT as ost and 11 as 41.  The schedule crop is unchanged.
+The printed PTR puts one space before the ticker.  A one-space suffix is kept when the previous word is all capitals and is not a form word, so US TREASURY NOTE and COCA COLA stay whole.  The schedule still requires two spaces, so a one-space XLE on a schedule name does not peel.  A standalone ampersand stays in the asset name.  The owner and date crops sit 4px inside the fitted rule.  A 2px inset still included the rule, and Tesseract read JT as ost and 11 as 41.  The schedule crop is unchanged.
 
 The Python worker mirrors the fit, the bands, the cover skip, the chrome drop, the mark scale, and the one-space ticker.  It does not run the 300 DPI cell OCR.
 
