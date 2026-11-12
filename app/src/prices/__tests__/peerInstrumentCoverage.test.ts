@@ -5,19 +5,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import {
   disclosureExcludesPeerEod,
+  disclosureTradeSupportsPeerEod,
   NOT_COVERED_CAUSE_DISCLOSURE_TYPE,
   readTickerPriceInstrumentHints,
+  tickerHasOnlyUnsupportedDisclosureTrades,
 } from '../peerInstrumentCoverage.ts';
 import {
   lastTradingDay,
   PRICE_UNAVAILABLE_NOT_COVERED,
   runPriceRefresh,
   selectTickersNeedingPrices,
+  selectTickersNeedingPricesPage,
 } from '../service.ts';
 import {
   markDisclosureUnsupportedPeerPrices,
 } from '../notCovered.ts';
-import { openMigratedD1, type SqliteDatabase } from './sqliteD1.ts';
+import { d1OnlyEnv, openMigratedD1, type SqliteDatabase } from './sqliteD1.ts';
 
 const h = vi.hoisted(() => ({
   responses: new Map<string, Array<{ date: string; close: number }>>(),
@@ -64,10 +67,10 @@ beforeEach(async () => {
   db = opened.db;
   close = opened.close;
   env = {
-    DB: opened.d1,
+    ...d1OnlyEnv(opened.d1),
     APP_B_IMPORT_URL: 'https://socratic.trade',
     APP_B_INGEST_TOKEN: 'test-peer-token',
-  } as unknown as Env;
+  } as Env;
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -110,6 +113,43 @@ describe('disclosureExcludesPeerEod', () => {
     const hints = await readTickerPriceInstrumentHints(env, 'ETSY');
     expect(hints && disclosureExcludesPeerEod(hints)).toBe(false);
   });
+
+  it('keeps label-based crypto disclosures priceable', async () => {
+    seedTrade('t-btc', 'COIN', { assetType: 'Cryptocurrency' });
+    const hints = await readTickerPriceInstrumentHints(env, 'COIN');
+    expect(hints && disclosureTradeSupportsPeerEod(hints)).toBe(true);
+  });
+});
+
+describe('tickerHasOnlyUnsupportedDisclosureTrades', () => {
+  it('does not exclude a ticker with both ST and OP rows', async () => {
+    seedTrade('t-st', 'INTC', { txDate: '2020-01-01', assetType: 'ST' });
+    seedTrade('t-op', 'INTC', { txDate: '2026-09-01', assetType: 'OP' });
+    expect(await tickerHasOnlyUnsupportedDisclosureTrades(env, 'INTC')).toBe(false);
+  });
+});
+
+describe('selectTickersNeedingPricesPage rotation (CT-2482)', () => {
+  it('uses cursor_seq order when resuming after a rotation cursor', async () => {
+    seedTrade('s1', 'LOW', { txDate: '2020-01-01' });
+    seedTrade('s2', 'HIGH', { txDate: '2021-01-01' });
+    db.prepare('UPDATE transactions SET cursor_seq = ? WHERE ticker = ?').run(5, 'LOW');
+    db.prepare('UPDATE transactions SET cursor_seq = ? WHERE ticker = ?').run(50, 'HIGH');
+    seedSr('LOW', {
+      latestPriceDate: '2020-01-01',
+      priceCheckedAt: '2026-10-01T00:00:00Z',
+    });
+    seedSr('HIGH', {
+      latestPriceDate: '2020-01-01',
+      priceCheckedAt: '2026-10-02T00:00:00Z',
+    });
+
+    const page = await selectTickersNeedingPricesPage(env, 10, {
+      freshThrough: FRESH_THROUGH,
+      afterCursorSeq: 5,
+    });
+    expect(page.map((r) => r.ticker)).toEqual(['HIGH']);
+  });
 });
 
 describe('selectTickersNeedingPrices ordering (CT-2482)', () => {
@@ -147,6 +187,19 @@ describe('confirmed empty ST response on unsupported disclosure', () => {
     const row = db
       .prepare('SELECT price_unavailable FROM securities_ref WHERE ticker = ?')
       .get('ASGN') as { price_unavailable: number };
+    expect(row.price_unavailable).toBe(1);
+  });
+
+  it('does not mark stage 4 when a newer OP row hides an ST equity', async () => {
+    seedTrade('t-st', 'INTC', { txDate: '2020-01-01', assetType: 'ST' });
+    seedTrade('t-op', 'INTC', { txDate: '2026-09-01', assetType: 'OP' });
+    seedSr('INTC', { latestPriceDate: '2026-10-20' });
+
+    await runPriceRefresh(env, { max: 5 });
+
+    const row = db
+      .prepare('SELECT price_unavailable FROM securities_ref WHERE ticker = ?')
+      .get('INTC') as { price_unavailable: number };
     expect(row.price_unavailable).toBe(1);
   });
 });

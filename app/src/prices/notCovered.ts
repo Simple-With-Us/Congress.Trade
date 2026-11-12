@@ -36,11 +36,10 @@ import {
 } from './peerPricePending.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
 import {
-  disclosureExcludesPeerEod,
   disclosureUnsupportedPendingSql,
   DISCLOSURE_NOT_COVERED_SWEEP_MAX,
   notCoveredCauseForDisclosure,
-  readTickerPriceInstrumentHints,
+  tickerPriceInstrumentHintsFromRow,
 } from './peerInstrumentCoverage.ts';
 
 /** A pending ticker with no price_checked_at progress for this long is ST-unpriceable (rule b). */
@@ -113,9 +112,27 @@ export async function markDisclosureUnsupportedPeerPrices(
   }
   const params = stPeerPricePendingBindParams(now);
   const pendingBinds = stPeerPricePendingBindsForSubqueries(params, 1);
-  const rows = await all<{ ticker: string }>(
+  const tradeHintFilter = `nt.tx_date IS NOT NULL AND nt.tx_date >= '1990-01-01'
+        AND nt.deprecated_at IS NULL
+        AND ${excludeCompetitorFixtureTransactionSql('nt')}`;
+  const hintSub = (col: string) =>
+    `(SELECT nt.${col} FROM transactions nt
+       WHERE nt.ticker = t.ticker AND ${tradeHintFilter}
+       ORDER BY nt.tx_date DESC, nt.id DESC
+       LIMIT 1)`;
+  const rows = await all<{
+    ticker: string;
+    asset_type: string | null;
+    asset_type_name: string | null;
+    asset_name: string | null;
+    is_option: number | null;
+  }>(
     env.DB,
-    `SELECT DISTINCT t.ticker AS ticker
+    `SELECT DISTINCT t.ticker AS ticker,
+            ${hintSub('asset_type')} AS asset_type,
+            ${hintSub('asset_type_name')} AS asset_type_name,
+            ${hintSub('asset_name')} AS asset_name,
+            ${hintSub('is_option')} AS is_option
        ${stPeerPricePendingFromSql()}
        AND ${disclosureUnsupportedPendingSql()}
      ORDER BY t.ticker ASC
@@ -124,10 +141,9 @@ export async function markDisclosureUnsupportedPeerPrices(
   );
   const nowIso = now.toISOString();
   let marked = 0;
-  for (const { ticker } of rows) {
-    const hints = await readTickerPriceInstrumentHints(env, ticker);
-    if (!hints || !disclosureExcludesPeerEod(hints)) continue;
-    await markTickerPriceUnavailable(env, ticker, notCoveredReason(now, notCoveredCauseForDisclosure(hints)), {
+  for (const row of rows) {
+    const hints = tickerPriceInstrumentHintsFromRow(row.ticker, row);
+    await markTickerPriceUnavailable(env, row.ticker, notCoveredReason(now, notCoveredCauseForDisclosure(hints)), {
       checkedAt: nowIso,
       stage: PRICE_UNAVAILABLE_NOT_COVERED,
     });

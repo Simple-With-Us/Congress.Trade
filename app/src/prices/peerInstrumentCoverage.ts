@@ -7,13 +7,19 @@ import type { Env } from '../shared/types.ts';
 import { all, get } from '../shared/db.ts';
 import { excludeCompetitorFixtureTransactionSql } from '../shared/competitorFixtures.ts';
 import {
+  canonicalAssetTypeCategorySql,
   canonicalizeAssetType,
+  HOUSE_ASSET_TYPE_NAMES,
   type CanonicalAssetType,
 } from '../shared/assetTypes.ts';
 import {
   capabilityForInstrument,
   type InstrumentHints,
 } from './instrumentCapabilities.ts';
+
+function truthyOptionFlag(value: boolean | number | null | undefined): boolean {
+  return value === true || value === 1;
+}
 
 /** House / Senate codes whose trades may use ST peer EOD (common listed instruments). */
 export const PEER_EOD_DISCLOSURE_ASSET_TYPES = new Set([
@@ -67,6 +73,56 @@ export async function readTickerPriceInstrumentHints(
     [sym],
   );
   if (!row) return null;
+  return tickerPriceInstrumentHintsFromRow(sym, row);
+}
+
+/** Newest trade hints for every symbol in `tickers` (one D1 round trip). */
+export async function readTickerPriceInstrumentHintsBatch(
+  env: Env,
+  tickers: string[],
+): Promise<Map<string, TickerPriceInstrumentHints>> {
+  const out = new Map<string, TickerPriceInstrumentHints>();
+  const syms = [...new Set(tickers.map((t) => t.trim().toUpperCase()).filter(Boolean))];
+  if (syms.length === 0) return out;
+  const placeholders = syms.map(() => '?').join(', ');
+  const rows = await all<{
+    ticker: string;
+    asset_type: string | null;
+    asset_type_name: string | null;
+    asset_name: string | null;
+    is_option: number | null;
+    tx_date: string;
+    id: string;
+  }>(
+    env.DB,
+    `SELECT t.ticker AS ticker, t.asset_type, t.asset_type_name, t.asset_name, t.is_option,
+            t.tx_date, t.id
+       FROM transactions t
+      WHERE t.ticker IN (${placeholders}) AND ${TRADE_FILTER}
+      ORDER BY t.ticker ASC, t.tx_date DESC, t.id DESC`,
+    syms,
+  );
+  for (const row of rows) {
+    if (out.has(row.ticker)) continue;
+    out.set(row.ticker, tickerPriceInstrumentHintsFromRow(row.ticker, row));
+  }
+  return out;
+}
+
+/** True when EOD capability is off for this instrument class (options, etc.). */
+export function instrumentClassExcludesPeerEod(hints: InstrumentHints): boolean {
+  return capabilityForInstrument(hints).eodPricing !== true;
+}
+
+export function tickerPriceInstrumentHintsFromRow(
+  sym: string,
+  row: {
+    asset_type: string | null;
+    asset_type_name: string | null;
+    asset_name: string | null;
+    is_option: number | null;
+  },
+): TickerPriceInstrumentHints {
   const disclosureAssetType = row.asset_type?.trim() || null;
   const hints: InstrumentHints = {
     ticker: sym,
@@ -82,9 +138,31 @@ export async function readTickerPriceInstrumentHints(
   return { ...hints, disclosureAssetType, canonical };
 }
 
-/** True when EOD capability is off for this instrument class (options, etc.). */
-export function instrumentClassExcludesPeerEod(hints: InstrumentHints): boolean {
-  return capabilityForInstrument(hints).eodPricing !== true;
+/**
+ * Whether a single disclosure row can use ST peer EOD.  House PTR codes use
+ * the allowlist; free-text labels canonicalize through capability (so
+ * "Cryptocurrency" stays priceable while MF/OP stay out).
+ */
+export function disclosureTradeSupportsPeerEod(hints: TickerPriceInstrumentHints): boolean {
+  if (truthyOptionFlag(hints.isOption)) return false;
+  if (hints.canonical?.category === 'option') return false;
+
+  const canonical = hints.canonical ?? canonicalizeAssetType(
+    hints.disclosureAssetType,
+    hints.assetTypeName,
+    {
+      isOption: truthyOptionFlag(hints.isOption),
+      assetName: hints.assetName,
+    },
+  );
+  if (canonical.source === 'house_code' && canonical.code) {
+    return PEER_EOD_DISCLOSURE_ASSET_TYPES.has(canonical.code);
+  }
+  const rawCode = (hints.disclosureAssetType ?? '').trim().toUpperCase();
+  if (rawCode && HOUSE_ASSET_TYPE_NAMES[rawCode]) {
+    return PEER_EOD_DISCLOSURE_ASSET_TYPES.has(rawCode);
+  }
+  return capabilityForInstrument(hints).eodPricing === true;
 }
 
 /**
@@ -92,10 +170,24 @@ export function instrumentClassExcludesPeerEod(hints: InstrumentHints): boolean 
  * cannot be priced from ST EOD (mutual funds, options, private stock, …).
  */
 export function disclosureExcludesPeerEod(hints: TickerPriceInstrumentHints): boolean {
-  if (hints.isOption === true || hints.isOption === 1) return true;
-  if (hints.canonical?.category === 'option') return true;
-  const code = (hints.disclosureAssetType ?? DEFAULT_DISCLOSURE_ASSET_TYPE).toUpperCase();
-  return !PEER_EOD_DISCLOSURE_ASSET_TYPES.has(code);
+  return !disclosureTradeSupportsPeerEod(hints);
+}
+
+/** SQL predicate on a transactions alias: this trade row supports ST EOD. */
+export function disclosureTradeSupportsPeerEodSql(tradeAlias: string): string {
+  const supported = [...PEER_EOD_DISCLOSURE_ASSET_TYPES].map((c) => `'${c}'`).join(', ');
+  const category = canonicalAssetTypeCategorySql(
+    `${tradeAlias}.asset_type`,
+    `${tradeAlias}.asset_type_name`,
+    `${tradeAlias}.is_option`,
+  );
+  return `(
+    UPPER(COALESCE(NULLIF(TRIM(${tradeAlias}.asset_type), ''), '${DEFAULT_DISCLOSURE_ASSET_TYPE}')) IN (${supported})
+    OR (
+      ${category} IN ('public_equity', 'crypto')
+      AND COALESCE(${tradeAlias}.is_option, 0) = 0
+    )
+  )`;
 }
 
 /** Mark on a confirmed-empty ST response when disclosure already rules out EOD. */
@@ -114,26 +206,31 @@ export async function tickerHasOnlyUnsupportedDisclosureTrades(
 ): Promise<boolean> {
   const sym = ticker.trim().toUpperCase();
   if (!sym) return false;
-  const rows = await all<{ asset_type: string | null }>(
+  const tradeRow = await get<{ n: number }>(
     env.DB,
-    `SELECT DISTINCT COALESCE(NULLIF(TRIM(t.asset_type), ''), ?) AS asset_type
-       FROM transactions t
+    `SELECT COUNT(*) AS n FROM transactions t
       WHERE t.ticker = ? AND ${TRADE_FILTER}`,
-    [DEFAULT_DISCLOSURE_ASSET_TYPE, sym],
+    [sym],
   );
-  if (rows.length === 0) return false;
-  return rows.every((r) => !PEER_EOD_DISCLOSURE_ASSET_TYPES.has(r.asset_type.toUpperCase()));
+  if (Number(tradeRow?.n ?? 0) === 0) return false;
+  const supportedRow = await get<{ n: number }>(
+    env.DB,
+    `SELECT COUNT(*) AS n FROM transactions t
+      WHERE t.ticker = ? AND ${TRADE_FILTER}
+        AND ${disclosureTradeSupportsPeerEodSql('t')}`,
+    [sym],
+  );
+  return Number(supportedRow?.n ?? 0) === 0;
 }
 
 /** EXISTS filter: no dated trade uses a peer-EOD disclosure asset code. */
 export function disclosureUnsupportedPendingSql(): string {
-  const supported = [...PEER_EOD_DISCLOSURE_ASSET_TYPES].map((c) => `'${c}'`).join(', ');
   return `NOT EXISTS (
      SELECT 1 FROM transactions t2
       WHERE t2.ticker = t.ticker
         AND t2.tx_date IS NOT NULL AND t2.tx_date >= '1990-01-01'
         AND t2.deprecated_at IS NULL
         AND ${excludeCompetitorFixtureTransactionSql('t2')}
-        AND UPPER(COALESCE(NULLIF(TRIM(t2.asset_type), ''), '${DEFAULT_DISCLOSURE_ASSET_TYPE}')) IN (${supported})
+        AND ${disclosureTradeSupportsPeerEodSql('t2')}
    )`;
 }

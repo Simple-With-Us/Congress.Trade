@@ -24,9 +24,9 @@ import type { Close } from './compute.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { readCorpusLatestPriceDate } from './peerPricePending.ts';
 import {
-  disclosureExcludesPeerEod,
   notCoveredCauseForDisclosure,
-  readTickerPriceInstrumentHints,
+  readTickerPriceInstrumentHintsBatch,
+  tickerHasOnlyUnsupportedDisclosureTrades,
 } from './peerInstrumentCoverage.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
 
@@ -631,8 +631,10 @@ export async function selectTickersNeedingPricesPage(
         AND ${priceNotCoveredExclusionSql('sr')}
       GROUP BY t.ticker
       ${after === null ? '' : 'HAVING MAX(t.cursor_seq) > ?'}
-      ORDER BY COALESCE(sr.price_checked_at, '1970-01-01T00:00:00.000Z') ASC,
-               MAX(t.cursor_seq) ASC
+      ${after === null
+    ? `ORDER BY COALESCE(sr.price_checked_at, '1970-01-01T00:00:00.000Z') ASC,
+               MAX(t.cursor_seq) ASC`
+    : 'ORDER BY MAX(t.cursor_seq) ASC'}
       LIMIT ?`,
     after === null
       ? [freshThrough, firstUnavailableCutoff, unavailableCutoff, limit]
@@ -1019,6 +1021,9 @@ export async function runPriceRefresh(
     ? []
     : await selectTickersNeedingPricesPage(env, budget, { afterCursorSeq: opts.afterCursorSeq });
   const tickers = page.map((r) => r.ticker);
+  const instrumentHintsByTicker = result.aborted
+    ? new Map()
+    : await readTickerPriceInstrumentHintsBatch(env, tickers);
   const runCorpusLatest = await readCorpusLatestPriceDate(env);
   const runCorpusFresh = isCurrentPriceFresh(runCorpusLatest, lastTradingDay());
 
@@ -1282,14 +1287,16 @@ export async function runPriceRefresh(
           // rebound.
           if (!dryRun) {
             const checked = new Date(nowIso);
-            const hints = await readTickerPriceInstrumentHints(env, ticker);
-            if (hints && disclosureExcludesPeerEod(hints)) {
-              await markTickerPriceUnavailable(
-                env,
-                ticker,
-                notCoveredReason(checked, notCoveredCauseForDisclosure(hints)),
-                { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
-              );
+            if (await tickerHasOnlyUnsupportedDisclosureTrades(env, ticker)) {
+              const hints = instrumentHintsByTicker.get(ticker);
+              if (hints) {
+                await markTickerPriceUnavailable(
+                  env,
+                  ticker,
+                  notCoveredReason(checked, notCoveredCauseForDisclosure(hints)),
+                  { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
+                );
+              }
             } else if (
               prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN &&
               latestPriceDate != null &&
@@ -1363,6 +1370,12 @@ export async function runPriceRefresh(
   notifyGate();
   await Promise.all(workers);
   if (pendingThrow) throw pendingThrow.error;
+
+  // Priority walks (no rotation cursor) sort by price_checked_at;  do not stamp
+  // a cursor_seq resume point or the next catch-up page skips lower-seq pendings.
+  if (opts.afterCursorSeq == null && !result.aborted) {
+    result.lastCursorSeq = null;
+  }
 
   result.reachedEndOfPending = !result.aborted && tickers.length < selectBudget;
   // A walk that resumed from a cursor skipped everything before it, so it never
