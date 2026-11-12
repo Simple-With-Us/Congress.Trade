@@ -19,23 +19,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from docker_size import SizeError, parse_size as parse_docker_size
+
 
 class SnapshotError(Exception):
     """The collected Docker output is not safe to plan from."""
 
 
-_SIZE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)([KMGT]I?B|B)$", re.IGNORECASE)
-_SIZE_SCALE = {
-    "B": 1,
-    "KB": 1000,
-    "MB": 1000**2,
-    "GB": 1000**3,
-    "TB": 1000**4,
-    "KIB": 1024,
-    "MIB": 1024**2,
-    "GIB": 1024**3,
-    "TIB": 1024**4,
-}
 _RELATIVE_RE = re.compile(
     r"^(?:about\s+)?(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$"
 )
@@ -169,15 +159,10 @@ class Plan:
 
 
 def parse_size(text: str) -> int:
-    raw = text.strip().replace(" ", "")
-    if not raw:
-        raise SnapshotError("empty size")
-    match = _SIZE_RE.match(raw)
-    if not match:
-        raise SnapshotError("unparsed size")
-    number = float(match.group(1))
-    unit = match.group(2).upper()
-    return int(round(number * _SIZE_SCALE[unit]))
+    try:
+        return parse_docker_size(text)
+    except SizeError as exc:
+        raise SnapshotError(str(exc)) from exc
 
 
 def human_size(nbytes: int) -> str:

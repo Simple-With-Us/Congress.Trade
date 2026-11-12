@@ -256,6 +256,64 @@ class ReportTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in built["top_growers"]], ["kept"])
         self.assertIn("| plugin-data | unknown |", report.render_markdown(built))
 
+    def test_volume_missing_from_df_stays_in_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = Path(tmp)
+            write_snapshot(
+                snap,
+                volumes=[("kept", "0", "1MB")],
+                volume_meta=[volume_ls("kept"), volume_ls("raced")],
+                containers=[],
+                bind_sizes={},
+            )
+            built = report.report_from_dir(snap, now=NOW, host="fixture", top=10, previous_path=None)
+            write_snapshot(
+                snap,
+                volumes=[("kept", "0", "1MB"), ("df-only", "0", "2MB")],
+                volume_meta=[volume_ls("kept")],
+                containers=[],
+                bind_sizes={},
+            )
+            with self.assertRaises(report.SnapshotError) as caught:
+                report.report_from_dir(snap, now=NOW, host="fixture", top=10, previous_path=None)
+        by_name = {row["name"]: row for row in built["volumes"]}
+        self.assertIsNone(by_name["raced"]["bytes"])
+        self.assertIsNone(by_name["raced"]["links"])
+        self.assertTrue(by_name["raced"]["orphan"])
+        self.assertEqual(built["totals"]["volume_bytes"], 1_000_000)
+        self.assertIn("listed a volume ls did not", str(caught.exception))
+
+    def test_compose_project_and_service_name_the_app(self) -> None:
+        owner = report.owner_from_labels(
+            {
+                "com.docker.compose.project": "congress",
+                "com.docker.compose.service": "worker",
+            }
+        )
+        self.assertIsNotNone(owner)
+        assert owner is not None
+        self.assertEqual(owner.app, "congress/worker")
+        coolify = report.owner_from_labels(
+            {
+                "coolify.resourceName": "congress-trade",
+                "com.docker.compose.project": "congress",
+                "com.docker.compose.service": "worker",
+            }
+        )
+        assert coolify is not None
+        self.assertEqual(coolify.app, "congress-trade")
+
+    def test_nested_bind_total_counts_the_parent_once(self) -> None:
+        sizes = {
+            "/srv/app": (100, ""),
+            "/srv/app/data": (40, ""),
+            "/srv/database": (7, ""),
+            "/srv/missing": (None, "error"),
+        }
+        self.assertEqual(report.bind_bytes_total(sizes), 107)
+        self.assertFalse(report._is_bind_descendant("/srv/database", "/srv/data"))
+        self.assertTrue(report._is_bind_descendant("/srv/app/data", "/srv/app"))
+
     def test_mapping_orphans_and_growth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -566,6 +624,80 @@ class ShellTests(unittest.TestCase):
             grown_md = (state / "latest.md").read_text(encoding="utf-8")
             self.assertIn("congress-data", grown_md)
             self.assertNotIn("No previous JSON was saved", grown_md)
+
+    def test_du_nonzero_keeps_a_printed_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kept = root / "host-data"
+            empty = root / "empty-case"
+            kept.mkdir()
+            empty.mkdir()
+            (kept / "file").write_bytes(b"x")
+            fixture = root / "fixture"
+            write_snapshot(
+                fixture,
+                volumes=[],
+                volume_meta=[],
+                containers=[
+                    container(
+                        C_APP,
+                        "/congress-app",
+                        "running",
+                        {"coolify.resourceName": "congress-trade"},
+                        [
+                            {"Type": "bind", "Source": str(kept), "Destination": "/data"},
+                            {"Type": "bind", "Source": str(empty), "Destination": "/empty"},
+                        ],
+                    )
+                ],
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            docker = bin_dir / "docker"
+            docker.write_text(FAKE_DOCKER, encoding="utf-8")
+            docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
+            du = bin_dir / "du"
+            du.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import sys",
+                        "path = sys.argv[-1]",
+                        "if path.endswith('empty-case'):",
+                        "    sys.exit(1)",
+                        "sys.stdout.write('4096\\t' + path + '\\n')",
+                        "sys.exit(1)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            du.chmod(du.stat().st_mode | stat.S_IEXEC)
+            env = {
+                **os.environ,
+                "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+                "FIXTURE": str(fixture),
+                "DOCKER_LOG": str(root / "docker-log"),
+                "DU_LOG": str(root / "du-log"),
+                "VOLUME_REPORT_DIR": str(root / "state"),
+                "VOLUME_REPORT_NOW": NOW,
+                "VOLUME_REPORT_HOST": "fixture",
+            }
+            completed = subprocess.run(
+                ["bash", str(SHELL)],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads((root / "state" / "latest.json").read_text(encoding="utf-8"))
+        by_source = {row["source"]: row for row in payload["bind_mounts"]}
+        self.assertEqual(by_source[str(kept)]["bytes"], 4096)
+        self.assertIsNone(by_source[str(empty)]["bytes"])
+        self.assertEqual(by_source[str(empty)]["size_error"], "error")
+        self.assertEqual(payload["totals"]["bind_bytes"], 4096)
 
     def test_bad_snapshot_does_not_overwrite_or_print_rm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

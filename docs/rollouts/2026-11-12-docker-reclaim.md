@@ -9,7 +9,7 @@ The default is a dry-run.  `APPLY=1` is the only switch that deletes anything.�
 ## Files changed
 
 - `scripts/ops/docker-reclaim.sh` collects `docker system df -v` and narrow inspect records, prints the report, and runs the action list only when `APPLY=1`.
-- `scripts/ops/docker_reclaim.py` decides what is reclaimable.  It never calls Docker.
+- `scripts/ops/docker_size.py` holds the shared byte-unit grammar.  `scripts/ops/docker_reclaim.py` imports it and still never calls Docker.
 - `scripts/ops/tests/test_docker_reclaim.py` and `scripts/ops/test-docker-reclaim.sh` cover the planner with mocked CLI output.
 - `.github/workflows/docker-reclaim.yml` runs those tests on Ubuntu.  `ci.yml` is unchanged so this does not collide with the other host-hygiene PRs.
 
@@ -51,12 +51,13 @@ The tests use a fake `docker` on `PATH`.  They check that a dry-run never calls
 
 Coolify watch paths are `app/**` and `services/**`.  This change does not rebuild congress-app.  `bash app/scripts/ship.sh` is not part of it.
 
-## Operator follow-up
+## Follow-ups
 
-After merge, install both files next to each other on the Coolify host.  The shell looks beside itself for the planner.  Python 3 and Bash 4.3 or newer are required.  Do not point this at a Mac.
+After merge, install the planner and the shared size grammar next to each other on the Coolify host.  The shell looks beside itself for the planner, and the planner imports `docker_size.py` from that same directory.  Python 3 and Bash 4.3 or newer are required.  Do not point this at a Mac.
 
 ```bash
 install -m 0755 scripts/ops/docker-reclaim.sh /usr/local/sbin/docker-reclaim.sh
+install -m 0644 scripts/ops/docker_size.py /usr/local/sbin/docker_size.py
 install -m 0644 scripts/ops/docker_reclaim.py /usr/local/sbin/docker_reclaim.py
 /usr/local/sbin/docker-reclaim.sh
 ```

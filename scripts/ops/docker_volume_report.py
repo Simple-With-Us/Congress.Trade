@@ -21,25 +21,13 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from docker_size import SizeError, parse_size as parse_docker_size
+
 
 class SnapshotError(Exception):
     """The collected Docker output is not safe to report."""
 
 
-# Same byte grammar as scripts/ops/docker_reclaim.py. Both reports read
-# `docker system df -v`, and a size such as 12.4kB has to mean the same thing.
-_SIZE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)([KMGT]I?B|B)$", re.IGNORECASE)
-_SIZE_SCALE = {
-    "B": 1,
-    "KB": 1000,
-    "MB": 1000**2,
-    "GB": 1000**3,
-    "TB": 1000**4,
-    "KIB": 1024,
-    "MIB": 1024**2,
-    "GIB": 1024**3,
-    "TIB": 1024**4,
-}
 _NOW_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})?$")
 _HEX_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -100,12 +88,10 @@ def parse_size(text: str) -> int | None:
     # stays in the report with unknown bytes. A blank or other token still aborts.
     if raw.upper() == "N/A":
         return None
-    match = _SIZE_RE.match(raw)
-    if not match:
-        raise SnapshotError("unparsed size")
-    number = float(match.group(1))
-    unit = match.group(2).upper()
-    return int(round(number * _SIZE_SCALE[unit]))
+    try:
+        return parse_docker_size(text)
+    except SizeError as exc:
+        raise SnapshotError(str(exc)) from exc
 
 
 def human_size(nbytes: int) -> str:
@@ -334,8 +320,15 @@ def load_volumes(input_dir: Path) -> list[VolumeRec]:
             raise SnapshotError("duplicate volume in volume ls")
         seen.add(name)
         df_row = table.get(name)
+        # volume ls and docker system df -v are separate calls. A volume that
+        # appears only in ls is kept with unknown size and links. A volume that
+        # only df lists still aborts, because ls is the label source.
         if df_row is None:
-            raise SnapshotError("docker system df -v omitted a volume")
+            links: int | None = None
+            size: int | None = None
+        else:
+            links = parse_links(str(df_row.get("LINKS", "")))
+            size = parse_size(df_row.get("SIZE", "") or "")
         driver = clean_text(str(row.get("Driver") or "local"), limit=64) or "local"
         raw_mount = str(row.get("Mountpoint") or "").strip()
         mountpoint = ""
@@ -347,11 +340,12 @@ def load_volumes(input_dir: Path) -> list[VolumeRec]:
                 driver=driver,
                 mountpoint=mountpoint,
                 labels=labels_from(row.get("Labels")),
-                links=parse_links(str(df_row.get("LINKS", ""))),
-                size=parse_size(df_row.get("SIZE", "") or ""),
+                links=links,
+                size=size,
             )
         )
-    if set(table) != seen:
+    extra = set(table) - seen
+    if extra:
         raise SnapshotError("docker system df -v listed a volume ls did not")
     return listed
 
@@ -403,10 +397,10 @@ def owner_from_labels(labels: dict[str, str]) -> Owner | None:
     app = _first_label(labels, _RESOURCE_LABELS)
     service = _first_label(labels, _SERVICE_LABELS)
     project = _first_label(labels, _PROJECT_LABELS)
-    if not app:
-        app = service or _first_label(labels, _NAME_LABELS)
     if not app and project and service:
         app = f"{project}/{service}"
+    if not app:
+        app = service or _first_label(labels, _NAME_LABELS)
     if not app:
         app = project
     coolify_type = _first_label(labels, _TYPE_LABELS)
@@ -525,6 +519,23 @@ def bind_source_list(containers: list[ContainerRec]) -> list[str]:
             if mount.mount_type == "bind":
                 found.add(mount.source)
     return sorted(found)
+
+
+def _is_bind_descendant(path: str, parent: str) -> bool:
+    prefix = parent if parent.endswith("/") else parent + "/"
+    return path.startswith(prefix)
+
+
+def bind_bytes_total(bind_sizes: dict[str, tuple[int | None, str]]) -> int:
+    known = [source for source, (nbytes, _error) in bind_sizes.items() if isinstance(nbytes, int)]
+    total = 0
+    for source in known:
+        if any(_is_bind_descendant(source, other) for other in known if other != source):
+            continue
+        nbytes = bind_sizes[source][0]
+        if isinstance(nbytes, int):
+            total += nbytes
+    return total
 
 
 def _check_links(name: str, links: int | None, holders: int) -> None:
@@ -647,7 +658,7 @@ def build_report(
             "bind_mounts": len(bind_rows),
             "orphans": len(orphans),
             "volume_bytes": sum(volume.size for volume in volumes if volume.size is not None),
-            "bind_bytes": sum(nbytes for nbytes, _error in bind_sizes.values() if isinstance(nbytes, int)),
+            "bind_bytes": bind_bytes_total(bind_sizes),
         },
         "volumes": volume_rows,
         "bind_mounts": bind_rows,

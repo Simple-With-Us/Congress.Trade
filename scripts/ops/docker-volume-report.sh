@@ -117,7 +117,10 @@ size_binds() {
       printf 'missing\t%s\n' "$src" >> "$dir/bind-sizes.txt"
       continue
     fi
-    if out="$(LC_ALL=C du -sB1 -- "$src" 2>/dev/null)"; then
+    # GNU du prints a total and exits nonzero when part of the tree is unreadable.
+    # Keep that total. Record an error only when du prints nothing.
+    out="$(LC_ALL=C du -sB1 -- "$src" 2>/dev/null)" || true
+    if [[ -n "$out" ]]; then
       printf '%s\n' "$out" >> "$dir/bind-sizes.txt"
     else
       printf 'error\t%s\n' "$src" >> "$dir/bind-sizes.txt"
