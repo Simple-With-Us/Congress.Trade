@@ -1,6 +1,5 @@
 [Unit]
 Description=Daily Hetzner resource digest
-Requires=hetzner-resource-digest.service
 
 [Timer]
 OnCalendar=daily

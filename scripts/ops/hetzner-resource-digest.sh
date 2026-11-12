@@ -11,6 +11,7 @@
 #   host-inode-report.sh, host-cpu-steal-sampler.sh,
 #   host-container-ram-report.sh, host-disk-growth-snapshot.sh
 # Default search: same directory as this script, then /usr/local/bin/.
+# HETZNER_DIGEST_SIBLING_DIR, when set, is an exclusive sibling directory.
 #
 #   bash scripts/ops/hetzner-resource-digest.sh
 #   HETZNER_DIGEST_FIXTURE_ROOT=scripts/ops/fixtures/hetzner-resource-digest \
@@ -83,7 +84,8 @@ read_file_or_live() {
   local fixture_name="$1" live_path="$2"
   local fp
   fp="$(fixture_path "$fixture_name")"
-  if [[ -n "$fp" && -f "$fp" ]]; then
+  if [[ -n "$FIXTURE_ROOT" ]]; then
+    [[ -f "$fp" ]] || return 1
     cat -- "$fp"
     return 0
   fi
@@ -157,7 +159,11 @@ collect_load() {
     return 1
   fi
   read -r LOAD_1 LOAD_5 LOAD_15 _rest <<<"$la"
-  if [[ -n "$(fixture_path ncpu.txt)" ]]; then
+  if [[ -n "$FIXTURE_ROOT" ]]; then
+    if [[ ! -s "$(fixture_path ncpu.txt)" ]]; then
+      LOAD_ERR="cpu_count_unavailable"
+      return 1
+    fi
     CPU_COUNT="$(cat "$(fixture_path ncpu.txt)")"
   elif [[ -n "${HETZNER_DIGEST_CPU_COUNT:-}" ]]; then
     CPU_COUNT="$HETZNER_DIGEST_CPU_COUNT"
@@ -183,7 +189,12 @@ read_cpu_agg() {
 
 collect_cpu_steal() {
   local a b total1 steal1 total2 steal2
-  if [[ -n "$(fixture_path proc-stat-a.txt)" && -n "$(fixture_path proc-stat-b.txt)" ]]; then
+  if [[ -n "$FIXTURE_ROOT" ]]; then
+    if [[ ! -s "$(fixture_path proc-stat-a.txt)" || ! -s "$(fixture_path proc-stat-b.txt)" ]]; then
+      CPU_STEAL_PCT=""
+      CPU_STEAL_ERR="fixture_missing"
+      return 1
+    fi
     read -r total1 steal1 < <(awk '/^cpu / {
       user=$2; nice=$3; sys=$4; idle=$5; iowait=$6; irq=$7; softirq=$8; steal=$9;
       total=user+nice+sys+idle+iowait+irq+softirq+steal;
@@ -209,7 +220,7 @@ collect_cpu_steal() {
   dt=$((total2 - total1))
   ds=$((steal2 - steal1))
   if (( dt <= 0 )); then
-    CPU_STEAL_PCT="0"
+    CPU_STEAL_PCT=""
     CPU_STEAL_ERR="zero_interval"
     return 0
   fi
@@ -221,6 +232,10 @@ collect_cpu_steal() {
 
 sibling_search_paths() {
   local base="$1"
+  if [[ -n "${HETZNER_DIGEST_SIBLING_DIR:-}" ]]; then
+    printf '%s\n' "$HETZNER_DIGEST_SIBLING_DIR/$base"
+    return 0
+  fi
   printf '%s\n' \
     "${HETZNER_DIGEST_SIBLING_DIR:-$SCRIPT_DIR}/$base" \
     "$SCRIPT_DIR/$base" \
@@ -230,7 +245,7 @@ sibling_search_paths() {
 try_sibling_json() {
   local base="$1"
   local path out
-  local candidate
+  local candidate failed=0
   while IFS= read -r candidate; do
     [[ -z "$candidate" ]] && continue
     if [[ -x "$candidate" ]]; then
@@ -239,9 +254,15 @@ try_sibling_json() {
         return 0
       fi
       printf '{"sibling":"%s","path":"%s","status":"error"}\n' "$base" "$candidate" >&2
-      return 1
+      failed=1
+      continue
     fi
   done < <(sibling_search_paths "$base")
+  # A failed installed collector is not an absent collector.
+  if (( failed )); then
+    printf '{"status":"error"}'
+    return 1
+  fi
   return 1
 }
 
@@ -308,7 +329,7 @@ def status_low(value, yellow, red):
     return "green"
 
 def worst(*statuses):
-    rank = {"red": 3, "yellow": 2, "green": 1, "unknown": 0}
+    rank = {"red": 4, "yellow": 3, "unknown": 2, "green": 1}
     best = "green"
     for s in statuses:
         if rank.get(s, 0) > rank.get(best, 0):
@@ -452,7 +473,8 @@ for key, raw in (
 ):
     if raw:
         try:
-            siblings[key] = {"status": "ok", "payload": json.loads(raw)}
+            payload = json.loads(raw)
+            siblings[key] = {"status": "error" if isinstance(payload, dict) and payload.get("status") == "error" else "ok", "payload": payload}
         except json.JSONDecodeError:
             siblings[key] = {"status": "error", "payload": None}
     else:
@@ -552,8 +574,9 @@ else:
         with open(state_path, "w", encoding="utf-8") as f:
             f.write(json_text)
 
-# Machine-readable block for tests (last line marker)
-print(json_text, end="")
+# File-output mode also exposes one machine-readable document on stdout.
+if not stdout_only:
+    print(json_text, end="")
 PY
 }
 
@@ -577,23 +600,27 @@ main() {
   SIBLING_CPU_JSON=""
   SIBLING_RAM_JSON=""
   SIBLING_DISK_GROWTH_JSON=""
-  if sib="$(try_sibling_json host-inode-report.sh 2>/dev/null || true)"; then
+  sib="$(try_sibling_json host-inode-report.sh)" || true
+  if [[ -n "$sib" ]]; then
     SIBLING_INODE_JSON="$sib"
     v="$(merge_sibling_metric inode "$sib" used_pct 2>/dev/null || true)"
-    [[ -n "$v" ]] && INODE_USED_PCT="$v"
+    [[ -n "$v" ]] && INODE_USED_PCT="$v" && INODE_ERR=""
   fi
-  if sib="$(try_sibling_json host-cpu-steal-sampler.sh 2>/dev/null || true)"; then
+  sib="$(try_sibling_json host-cpu-steal-sampler.sh)" || true
+  if [[ -n "$sib" ]]; then
     SIBLING_CPU_JSON="$sib"
     v="$(merge_sibling_metric steal "$sib" steal_pct 2>/dev/null || true)"
     [[ -n "$v" ]] && CPU_STEAL_PCT="$v" && CPU_STEAL_ERR=""
   fi
-  if sib="$(try_sibling_json host-container-ram-report.sh 2>/dev/null || true)"; then
+  sib="$(try_sibling_json host-container-ram-report.sh)" || true
+  if [[ -n "$sib" ]]; then
     SIBLING_RAM_JSON="$sib"
   fi
-  if sib="$(try_sibling_json host-disk-growth-snapshot.sh 2>/dev/null || true)"; then
+  sib="$(try_sibling_json host-disk-growth-snapshot.sh)" || true
+  if [[ -n "$sib" ]]; then
     SIBLING_DISK_GROWTH_JSON="$sib"
     v="$(merge_sibling_metric disk "$sib" used_pct 2>/dev/null || true)"
-    [[ -n "$v" ]] && DISK_USED_PCT="$v"
+    [[ -n "$v" ]] && DISK_USED_PCT="$v" && DISK_ERR=""
   fi
 
   export DISK_USED_PCT INODE_USED_PCT MEM_TOTAL_KB MEM_AVAIL_KB MEM_AVAIL_PCT

@@ -8,6 +8,7 @@ SCRIPT="${ROOT}/scripts/ops/hetzner-resource-digest.sh"
 FIXTURES="${ROOT}/scripts/ops/fixtures/hetzner-resource-digest"
 TMP="$(mktemp -d)"
 fail=0
+mkdir -p "$TMP/empty-siblings"
 
 cleanup() {
   rm -rf -- "${TMP}"
@@ -33,7 +34,8 @@ assert_json_field() {
 
 run_digest() {
   local state="$1" json_out="$2" md_out="$3"
-  HETZNER_DIGEST_FIXTURE_ROOT="$FIXTURES" \
+  HETZNER_DIGEST_SIBLING_DIR="$TMP/empty-siblings" \
+    HETZNER_DIGEST_FIXTURE_ROOT="$FIXTURES" \
     HETZNER_DIGEST_STATE_PATH="$state" \
     HETZNER_DIGEST_JSON_OUT="$json_out" \
     HETZNER_DIGEST_MD_OUT="$md_out" \
@@ -112,4 +114,5 @@ if [[ "$fail" -ne 0 ]]; then
   echo "hetzner-resource-digest tests FAILED"
   exit 1
 fi
+python3 "$ROOT/scripts/ops/test_hetzner_digest_failures.py"
 echo "hetzner-resource-digest tests passed"
