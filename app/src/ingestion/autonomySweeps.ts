@@ -38,6 +38,10 @@ import {
   sweepIngestFailureReviewQueue,
   type IngestFailureBackfillResult,
 } from './ingestFailureReviewQueue.ts';
+import {
+  sweepTerminalFailureReviewQueue,
+  type TerminalFailureSweepResult,
+} from './terminalFailureReview.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
@@ -631,6 +635,8 @@ export interface AutonomySweepResult {
   ungroundedIngest: EmptyFetchSweepResult | null;
   /** Genuine ingest failures mirrored onto review_queue + stale-row cleanup. */
   ingestFailureReview: IngestFailureBackfillResult | null;
+  /** Terminal outbox/DLQ/review-orphan failures with no review_queue row. */
+  terminalFailureReview: TerminalFailureSweepResult | null;
   errors: string[];
 }
 
@@ -1418,6 +1424,7 @@ export async function runAutonomySweeps(
     completedEmptyRaw: null,
     ungroundedIngest: null,
     ingestFailureReview: null,
+    terminalFailureReview: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -1554,6 +1561,15 @@ export async function runAutonomySweeps(
     result.transientDlq = await sweepTransientDeadLetters(env, now);
   } catch (err) {
     errors.push(`transientDlq: ${(err as Error).message}`);
+  }
+
+  // After the bounded replay above, rows still `failed` are terminal.
+  // Mirror any of those with no review_queue row onto the manual lane.
+  try {
+    throwIfAborted();
+    result.terminalFailureReview = await sweepTerminalFailureReviewQueue(env, { limit: 100 });
+  } catch (err) {
+    errors.push(`terminalFailureReview: ${(err as Error).message}`);
   }
 
   try {

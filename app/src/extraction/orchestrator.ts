@@ -18,6 +18,11 @@ import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { get, run } from '../shared/db.ts';
 import { recordGenuineIngestFailure } from '../ingestion/ingestFailureReviewQueue.ts';
 import {
+  ensureTerminalFailureReviewRow,
+  PIPELINE_FAILURE_REASON,
+  unsettledNormalizeReason,
+} from '../ingestion/terminalFailureReview.ts';
+import {
   buildExtractorPipeline,
   type ExtractorModelRun,
   type ExtractorParseDisposition,
@@ -184,7 +189,15 @@ export async function extractAndNormalize(
     await assertDocLlmSpendAllowed(env, docId);
   } catch (err) {
     if (err instanceof LlmDocBudgetExceededError || isLlmDocBudgetHalt(err)) {
+      const message = `orchestrator: doc llm budget exceeded: ${(err as Error).message}`;
       console.info(`orchestrator: skip paid extract for ${docId}: ${(err as Error).message}`);
+      await ensureTerminalFailureReviewRow(
+        env,
+        docId,
+        PIPELINE_FAILURE_REASON.extractBudget,
+        message,
+        { source: 'extract' },
+      );
       return;
     }
     throw err;
@@ -228,6 +241,25 @@ export async function extractAndNormalize(
     parseDisposition: effective.parseDisposition,
     reviewPayload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
   });
+
+  // A lost publish/review CAS returns without a queue row. The hourly sweep
+  // is the backstop; this lands the row on the attempt that noticed.
+  if (!result.published && !result.settled) {
+    try {
+      await ensureTerminalFailureReviewRow(
+        env,
+        docId,
+        unsettledNormalizeReason({
+          needsReview: result.needsReview,
+          reviewReason: result.reviewReason,
+        }),
+        result.reviewReason ?? 'normalize: publish did not commit',
+        { source: result.needsReview ? 'normalize' : 'publish' },
+      );
+    } catch (err) {
+      console.warn('orchestrator: terminal failure review enqueue failed:', docId, (err as Error).message);
+    }
+  }
 
   // Fast path: a doc that just landed in review gets a cross-vendor agreement
   // check enqueued immediately (self-gates on the flag; the per-minute cron is
