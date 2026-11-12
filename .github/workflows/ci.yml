@@ -256,6 +256,10 @@ jobs:
           bash -n scripts/ops/fleet-log-cap-install.sh
           bash scripts/ops/test-fleet-log-cap.sh
 
+      - name: Root disk usage report tests (offline)
+        working-directory: .
+        run: bash scripts/ops/test-root-disk-usage-report.sh
+
       - name: Host swap report offline tests
         working-directory: .
         run: |
