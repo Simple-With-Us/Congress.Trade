@@ -1109,7 +1109,8 @@ function splitFormToken(token: string): string[] {
 export function cleanGridAssetName(text: string): string {
   const tokens = text.replace(/[|`´‘’_]+/g, ' ').split(/\s+/).filter(Boolean);
   const words: string[] = [];
-  for (const token of tokens) {
+  for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+    const token = tokens[tokenIndex];
     for (const piece of splitFormToken(token)) {
       if (piece === 'SA' && words[words.length - 1] === 'CLASS') {
         words.push('A');
@@ -1128,7 +1129,7 @@ export function cleanGridAssetName(text: string): string {
         words.push('CMN');
         continue;
       }
-      if (piece === 'SP' && /^(?:500|SOO|SOD|S00)/.test(tokens[tokens.indexOf(token) + 1]?.toUpperCase() ?? '')) {
+      if (piece === 'SP' && /^(?:500|SOO|SOD|S00)/.test(tokens[tokenIndex + 1]?.toUpperCase() ?? '')) {
         words.push('S&P');
         continue;
       }

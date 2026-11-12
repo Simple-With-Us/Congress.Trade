@@ -410,6 +410,8 @@ describe('grid row, owner, and date corrections', () => {
     expect(cleanGridAssetName('ON SEMICONOUCTOR CORPORATION CMN')).toBe('ON SEMICONDUCTOR CORPORATION CMN');
     expect(cleanGridAssetName('NETFLIX INC CAN')).toBe('NETFLIX INC CMN');
     expect(cleanGridAssetName('AGILENT TECHNOLOGIES NC CMN')).toBe('AGILENT TECHNOLOGIES INC CMN');
+    expect(cleanGridAssetName('SP 500 SP FUND')).toBe('S&P 500 SP FUND');
+    expect(cleanGridAssetName('SP FUND SP 500')).toBe('SP FUND S&P 500');
   });
 
   it('reads a stamped DC owner cell when the text box is missing', () => {
