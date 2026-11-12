@@ -403,6 +403,35 @@ assert_eq "$flag_status" "2" "unknown flag exits 2"
 assert_eq "$big_status" "2" "huge window exits 2"
 assert_eq "$top_status" "2" "top 0 exits 2"
 
+# Leading zeros are decimal. 09 must not abort, and 010 is ten rather than eight.
+timeout 10 bash "$SCRIPT" --json --window 09 >"${TMP}/w09.json"
+timeout 10 bash "$SCRIPT" --json --window 010 >"${TMP}/w010.json"
+timeout 10 bash "$SCRIPT" --json --window 0 --top 08 >"${TMP}/top08.json"
+HOST_SWAP_PAGE_SIZE=08 timeout 10 bash "$SCRIPT" --json --window 0 >"${TMP}/page08.json"
+export HOST_SWAP_PAGE_SIZE=4096
+python3 - "${TMP}/w09.json" "${TMP}/w010.json" "${TMP}/top08.json" "${TMP}/page08.json" <<'PY'
+import json, sys
+w09, w010, top08, page08 = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:5]]
+assert w09["sample"]["window_seconds"] == 9
+assert w010["sample"]["window_seconds"] == 10
+assert top08["sample"]["window_seconds"] == 0
+assert 1 <= len(top08["top_processes"]) <= 8
+assert page08["sample"]["page_size_bytes"] == 8
+print("ok   leading zeros are decimal")
+PY
+
+set +e
+bash "$SCRIPT" --window 0007000 >/dev/null 2>"${TMP}/octal.err"
+octal_status=$?
+set -e
+assert_eq "$octal_status" "2" "7000 with leading zeros exits 2"
+if grep -q 'value too great for base' "${TMP}/octal.err" "${TMP}/w09.json"; then
+  echo "FAIL octal arithmetic error leaked"
+  fail=1
+else
+  echo "ok   no octal arithmetic error"
+fi
+
 : >"$LOG"
 bash "$SCRIPT" --help >"${TMP}/help.txt"
 if grep -q 'ps' "$LOG"; then

@@ -83,33 +83,45 @@ done
 WINDOW="${WINDOW:-${HOST_SWAP_WINDOW_SEC:-60}}"
 TOP="${TOP:-${HOST_SWAP_TOP_N:-10}}"
 
-case "$WINDOW" in
-  ''|*[!0-9]*)
-    echo "host-swap-report: window must be an integer from 0 to 3600" >&2
-    exit 2
-    ;;
-esac
+# 10# forces base 10. A leading zero is otherwise octal, so 08 and 09
+# error and 010 compares as eight.
+decimal_int() {
+  local raw="$1"
+  local value
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if ! value="$((10#$raw))" 2>/dev/null; then
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+if ! WINDOW="$(decimal_int "$WINDOW")"; then
+  echo "host-swap-report: window must be an integer from 0 to 3600" >&2
+  exit 2
+fi
 if [[ "$WINDOW" -gt 3600 ]]; then
   echo "host-swap-report: window must be an integer from 0 to 3600" >&2
   exit 2
 fi
-case "$TOP" in
-  ''|*[!0-9]*)
-    echo "host-swap-report: top N must be an integer from 1 to 1000" >&2
-    exit 2
-    ;;
-esac
+if ! TOP="$(decimal_int "$TOP")"; then
+  echo "host-swap-report: top N must be an integer from 1 to 1000" >&2
+  exit 2
+fi
 if [[ "$TOP" -lt 1 || "$TOP" -gt 1000 ]]; then
   echo "host-swap-report: top N must be an integer from 1 to 1000" >&2
   exit 2
 fi
-if [[ -n "$HOST_SWAP_PAGE_SIZE" && ! "$HOST_SWAP_PAGE_SIZE" =~ ^[0-9]+$ ]]; then
-  echo "host-swap-report: HOST_SWAP_PAGE_SIZE must be a positive integer" >&2
-  exit 2
-fi
-if [[ -n "$HOST_SWAP_PAGE_SIZE" && "$HOST_SWAP_PAGE_SIZE" -lt 1 ]]; then
-  echo "host-swap-report: HOST_SWAP_PAGE_SIZE must be a positive integer" >&2
-  exit 2
+if [[ -n "$HOST_SWAP_PAGE_SIZE" ]]; then
+  if ! HOST_SWAP_PAGE_SIZE="$(decimal_int "$HOST_SWAP_PAGE_SIZE")"; then
+    echo "host-swap-report: HOST_SWAP_PAGE_SIZE must be a positive integer" >&2
+    exit 2
+  fi
+  if [[ "$HOST_SWAP_PAGE_SIZE" -lt 1 ]]; then
+    echo "host-swap-report: HOST_SWAP_PAGE_SIZE must be a positive integer" >&2
+    exit 2
+  fi
 fi
 if [[ -n "$OUT_DIR" && ! -d "$OUT_DIR" ]]; then
   echo "host-swap-report: --out-dir is not a directory" >&2
