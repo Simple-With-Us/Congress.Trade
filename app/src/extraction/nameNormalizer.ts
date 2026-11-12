@@ -309,3 +309,73 @@ export function simplifyCompanyName(name: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+/** Fund/ETF descriptor tokens with no issuer identity (stripped for ticker↔name checks). */
+const FUND_DESCRIPTOR_STOP = new Set([
+  'etf',
+  'fund',
+  'index',
+  'shares',
+  'share',
+  'trust',
+  'admiral',
+  'investor',
+  'institutional',
+  'portfolio',
+  'portfolios',
+  'receipt',
+  'receipts',
+  'depository',
+  'registered',
+  'open',
+  'end',
+  'mutual',
+  'exchange',
+  'traded',
+  'advisor',
+  'advisors',
+  'ultra',
+  'pro',
+  'ultrapro',
+  'ultrashort',
+  'class',
+  'series',
+  'select',
+  'cmn',
+  'lp',
+  'llp',
+]);
+
+function stripFundDescriptorTokens(simplified: string): string {
+  if (!simplified) return '';
+  return simplified
+    .split(/\s+/)
+    .filter((token) => token && !FUND_DESCRIPTOR_STOP.has(token))
+    .join(' ');
+}
+
+/**
+ * True when two simplified company names plausibly refer to the same security.
+ * Tolerates ETF/fund wording differences (Index/Fund/ETF/Shares, etc.) while
+ * still rejecting unrelated issuers (e.g. AAPL ticker with "Microsoft Corp").
+ */
+export function namesPlausiblyMatch(a: string, b: string): boolean {
+  if (!a || !b) return true;
+
+  const as = stripFundDescriptorTokens(a);
+  const bs = stripFundDescriptorTokens(b);
+  if (!as || !bs) return true;
+
+  if (as === bs || as.includes(bs) || bs.includes(as)) return true;
+
+  const at = as.split(/\s+/).filter(Boolean);
+  const bt = bs.split(/\s+/).filter(Boolean);
+  const [shorter, longer] = at.length <= bt.length ? [at, bt] : [bt, at];
+  if (shorter.length === 0) return true;
+
+  const longerSet = new Set(longer);
+  if (!shorter.every((token) => longerSet.has(token))) return false;
+
+  const significant = shorter.filter((token) => token.length >= 3);
+  return significant.length >= 2 || (significant.length === 1 && shorter.length === 1);
+}
