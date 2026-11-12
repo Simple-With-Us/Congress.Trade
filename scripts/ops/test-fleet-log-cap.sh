@@ -173,6 +173,11 @@ mkdir -p "$(dirname "$EMPTY_DAEMON")"
 APPLY=1 DAEMON_JSON_PATH="$EMPTY_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/empty-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
 assert_eq "$(jq -r '."log-opts"."max-size"' <"$EMPTY_DAEMON")" "50m" "empty daemon.json file gets log caps"
 
+WS_DAEMON="${TMP}/etc/docker/ws-daemon.json"
+printf ' \n' >"$WS_DAEMON"
+APPLY=1 DAEMON_JSON_PATH="$WS_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/ws-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$WS_DAEMON")" "50m" "whitespace-only daemon.json gets log caps"
+
 # --- journalctl vacuum failure does not abort install ----------------------
 VAC_FAIL_LOG="${TMP}/journalctl-fail.log"
 cat >"${MOCK_BIN}/journalctl-fail" <<'MOCK'

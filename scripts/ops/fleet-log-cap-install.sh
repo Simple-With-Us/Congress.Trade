@@ -43,8 +43,11 @@ merge_daemon_json() {
   local in_path="$1"
   local existing='{}'
   if [[ -f "$in_path" ]] && [[ -s "$in_path" ]]; then
-    if ! existing="$("$JQ_CMD" -c . "$in_path" 2>/dev/null)" || [[ -z "$existing" ]]; then
+    if ! existing="$("$JQ_CMD" -c . "$in_path" 2>/dev/null)"; then
       die "cannot parse ${in_path} as JSON (fix or remove before install)"
+    fi
+    if [[ -z "$existing" ]]; then
+      existing='{}'
     fi
   fi
   printf '%s' "$existing" | "$JQ_CMD" -c '
