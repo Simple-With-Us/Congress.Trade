@@ -14,10 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from checkbox import ink_ratio
 from form_chrome import is_form_chrome_asset
 from grid_ptr import BRACKET_RANGES, analyze_grid, row_bracket, row_type
-from ocr_backends import OcrBackend, extract_dates, get_backend
+from gridform import OcrBox, read_grid_page
+from ocr_backends import OcrBackend, OcrPage, extract_dates, get_backend
 
 logger = logging.getLogger("scan-cpu-worker.pipeline")
 
@@ -42,6 +42,9 @@ class ExtractedTx:
     page: Optional[int] = None
     bracket: Optional[str] = None
     note: Optional[str] = None
+    warnings: Optional[List[str]] = None
+    capGainsOver200: bool = False
+    isOption: bool = False
 
     def to_parsed_tx(self) -> Dict[str, Any]:
         # Matches ParsedTx shape expected by /ingest-local-vision
@@ -54,6 +57,8 @@ class ExtractedTx:
             "amountMax": self.amountMax,
             "confidence": self.confidence,
             "rawText": self.rawText,
+            "isOption": self.isOption,
+            "capGainsOver200": self.capGainsOver200,
         }
         if self.owner:
             out["owner"] = self.owner
@@ -63,6 +68,9 @@ class ExtractedTx:
             out["page"] = self.page
         if self.note:
             out["note"] = self.note
+            out["supplementalText"] = self.note
+        if self.warnings:
+            out["extractionWarnings"] = list(self.warnings)
         return out
 
 
@@ -147,6 +155,75 @@ def _asset_from_ocr_for_row(
     return " ".join(pieces), (sum(confs) / len(confs) if confs else 0.0)
 
 
+def _boxes_from_ocr(page: OcrPage, width: int, height: int) -> List[OcrBox]:
+    boxes: List[OcrBox] = []
+    for line in page.lines:
+        if not line.bbox:
+            continue
+        x, y, w, h = line.bbox
+        boxes.append(OcrBox(
+            x0=int(x * width),
+            y0=int(y * height),
+            x1=int((x + w) * width),
+            y1=int((y + h) * height),
+            text=line.text,
+            conf=line.conf,
+        ))
+    return boxes
+
+
+def _grid_rows_to_tx(rows: List, page_num: int) -> List[ExtractedTx]:
+    out: List[ExtractedTx] = []
+    for row in rows:
+        out.append(ExtractedTx(
+            ticker=row.ticker,
+            assetName=row.asset_name[:200],
+            txType=row.tx_type,
+            txDate=row.tx_date,
+            amountMin=row.amount_min,
+            amountMax=row.amount_max,
+            confidence=row.confidence,
+            rawText=row.raw_text,
+            owner=row.owner,
+            notifDate=row.notif_date,
+            page=page_num,
+            note=row.note,
+            warnings=row.warnings or None,
+            capGainsOver200=row.cap_gains,
+            isOption=row.is_option,
+        ))
+    return out
+
+
+@dataclass
+class PageExtract:
+    rows: List[ExtractedTx]
+    grid_form: bool
+
+
+def extract_page_result(
+    image_bgr: np.ndarray,
+    *,
+    page_num: int,
+    ocr: OcrBackend,
+    ink_thr: float = 0.10,
+) -> PageExtract:
+    upright, _rot = upright_bgr(image_bgr, ocr)
+    ocr_page = ocr.run(upright)
+    gray = cv2.cvtColor(upright, cv2.COLOR_BGR2GRAY) if upright.ndim == 3 else upright
+    grid_rows = read_grid_page(
+        gray,
+        _boxes_from_ocr(ocr_page, gray.shape[1], gray.shape[0]),
+        page_num,
+    )
+    if grid_rows is not None:
+        return PageExtract(_grid_rows_to_tx(grid_rows, page_num), True)
+    return PageExtract(
+        _legacy_ink_rows(upright, ocr_page, page_num=page_num, ink_thr=ink_thr),
+        False,
+    )
+
+
 def extract_page(
     image_bgr: np.ndarray,
     *,
@@ -154,8 +231,16 @@ def extract_page(
     ocr: OcrBackend,
     ink_thr: float = 0.10,
 ) -> List[ExtractedTx]:
-    upright, _rot = upright_bgr(image_bgr, ocr)
-    ocr_page = ocr.run(upright)
+    return extract_page_result(image_bgr, page_num=page_num, ocr=ocr, ink_thr=ink_thr).rows
+
+
+def _legacy_ink_rows(
+    upright: np.ndarray,
+    ocr_page: OcrPage,
+    *,
+    page_num: int,
+    ink_thr: float,
+) -> List[ExtractedTx]:
     grid = analyze_grid(upright, ink_thr=ink_thr)
     txs: List[ExtractedTx] = []
 
@@ -168,9 +253,11 @@ def extract_page(
         bracket = row_bracket(row.marks)
         if not tx_type and not bracket:
             continue
+        warnings: List[str] = []
         if not tx_type:
-            tx_type = "P"
-            note_bits = ["type box not checked; defaulted P"]
+            note_bits = ["transaction type was not marked"]
+            warnings.append("grid_type_unmarked")
+            tx_type = ""
         else:
             note_bits = []
 
@@ -212,6 +299,8 @@ def extract_page(
         if tx_date:
             conf += 0.1
         conf = min(0.95, conf)
+        if warnings:
+            conf = min(conf, 0.4)
 
         if not asset:
             asset = f"(unreadable asset p{page_num} y{row.y0})"
@@ -232,9 +321,66 @@ def extract_page(
                 page=page_num,
                 bracket=bracket,
                 note="; ".join(note_bits) if note_bits else None,
+                warnings=warnings or None,
             )
         )
     return txs
+
+
+@dataclass
+class PdfExtract:
+    rows: List[Dict[str, Any]]
+    extractor: str
+    grid_pages: int
+
+
+def extract_pdf_detailed(
+    pdf_path: str,
+    *,
+    dpi: int = 200,
+    ocr_backend: Optional[str] = None,
+    ink_thr: Optional[float] = None,
+) -> PdfExtract:
+    """Full PDF extraction. Grid-form pages replace the ink-ratio reader."""
+    ocr = get_backend(ocr_backend)
+    thr = float(ink_thr if ink_thr is not None else os.getenv("CHECKBOX_INK_RATIO", "0.10"))
+    dpi = int(os.getenv("DPI", str(dpi)))
+
+    with tempfile.TemporaryDirectory(prefix="scan_cpu_") as tmp:
+        pages = render_pdf_pages(pdf_path, tmp, dpi=dpi)
+        grid_tx: List[ExtractedTx] = []
+        legacy_tx: List[ExtractedTx] = []
+        grid_pages = 0
+        for i, page_path in enumerate(pages, start=1):
+            img = cv2.imread(page_path)
+            if img is None:
+                logger.warning("Failed to read page image %s", page_path)
+                continue
+            try:
+                page = extract_page_result(img, page_num=i, ocr=ocr, ink_thr=thr)
+            except Exception as e:
+                logger.exception("Page %d extract failed: %s", i, e)
+                continue
+            if page.grid_form:
+                grid_pages += 1
+                grid_tx.extend(page.rows)
+            else:
+                legacy_tx.extend(page.rows)
+        all_tx = grid_tx if grid_pages else legacy_tx
+        before = len(all_tx)
+        all_tx = [t for t in all_tx if not is_form_chrome_asset(t.assetName)]
+        dropped = before - len(all_tx)
+        if dropped:
+            logger.info(
+                "extract_pdf %s: dropped %d form-chrome row(s) (letterhead/header)",
+                pdf_path, dropped,
+            )
+        extractor = "server_cpu_gridform" if grid_pages else "server_cpu_v1"
+        logger.info(
+            "extract_pdf %s: %d pages, %d grid pages, %d rows via %s",
+            pdf_path, len(pages), grid_pages, len(all_tx), extractor,
+        )
+        return PdfExtract([t.to_parsed_tx() for t in all_tx], extractor, grid_pages)
 
 
 def extract_pdf(
@@ -245,33 +391,6 @@ def extract_pdf(
     ink_thr: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Full PDF extraction → list of ParsedTx dicts."""
-    ocr = get_backend(ocr_backend)
-    thr = float(ink_thr if ink_thr is not None else os.getenv("CHECKBOX_INK_RATIO", "0.10"))
-    dpi = int(os.getenv("DPI", str(dpi)))
-
-    with tempfile.TemporaryDirectory(prefix="scan_cpu_") as tmp:
-        pages = render_pdf_pages(pdf_path, tmp, dpi=dpi)
-        all_tx: List[ExtractedTx] = []
-        for i, page_path in enumerate(pages, start=1):
-            img = cv2.imread(page_path)
-            if img is None:
-                logger.warning("Failed to read page image %s", page_path)
-                continue
-            try:
-                page_txs = extract_page(img, page_num=i, ocr=ocr, ink_thr=thr)
-                all_tx.extend(page_txs)
-            except Exception as e:
-                logger.exception("Page %d extract failed: %s", i, e)
-        before = len(all_tx)
-        all_tx = [t for t in all_tx if not is_form_chrome_asset(t.assetName)]
-        dropped = before - len(all_tx)
-        if dropped:
-            logger.info(
-                "extract_pdf %s: dropped %d form-chrome row(s) (letterhead/header)",
-                pdf_path, dropped,
-            )
-        logger.info(
-            "extract_pdf %s: %d pages, %d rows via %s",
-            pdf_path, len(pages), len(all_tx), ocr.name if hasattr(ocr, "name") else ocr_backend,
-        )
-        return [t.to_parsed_tx() for t in all_tx]
+    return extract_pdf_detailed(
+        pdf_path, dpi=dpi, ocr_backend=ocr_backend, ink_thr=ink_thr,
+    ).rows

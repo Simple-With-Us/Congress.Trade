@@ -39,7 +39,7 @@ unset CT_LOCAL_BOOTSTRAP_TEST_FLEET_SECRETS_BIN
 # expected; do not fail the whole session setup for a keyless checkout.
 node "$SCRIPT_DIR/merge-local-dev-vars.mjs" || echo "==> Infisical local bootstrap skipped (ok in keyless cloud)"
 
-# @jaywedgeworth22/congress-trading-shared is a public repo consumed as a
+# Simple-With-Us/congress-trading-shared (@jaywedgeworth22/congress-trading-shared npm name) is a public repo consumed as a
 # tokenless git dependency. The vendored local copy at app/vendor/ is the
 # canonical resolution — no npm registry, no NODE_AUTH_TOKEN, no .npmrc entry.
 # Deterministic install from the committed lockfile (app/package-lock.json).

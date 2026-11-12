@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline tests for fleet-sqlite-backup.sh retention + completeness.
+# Offline tests for fleet-sqlite-backup.sh retention, local zstd, and verify.
 # No Docker, no live DBs, no network.
 #
 #   bash scripts/ops/test-fleet-sqlite-backup.sh
@@ -359,6 +359,13 @@ mkdir -p "$ROOT/socratic"
 prune_incomplete_dumps >/dev/null
 assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst" "stale local .zst pruned"
 assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial" "stale local .zst.partial pruned"
+# A finished local .db.zst (sha256 present, no journal) is the retained dump.
+kept_zst="$ROOT/socratic/socratic-app-20261102T113000Z.db.zst"
+printf 'kept-zst\n' > "$kept_zst"
+printf 'deadbeef  %s\n' "${kept_zst%.zst}" > "${kept_zst%.zst}.sha256"
+prune_incomplete_dumps >/dev/null
+assert_exists "$kept_zst" "complete local .db.zst survives prune"
+assert_exists "${kept_zst%.zst}.sha256" "complete local .db.zst keeps sha256"
 
 # --- zstd upload + restore round trip (needs sqlite3 + zstd) ----------------
 if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
@@ -431,6 +438,274 @@ if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
 else
   echo "skip zstd round trip (sqlite3 or zstd not installed)"
 fi
+
+# --- local zstd dumps: keep count, age, symlink root, verify ----------------
+# Keep counts still apply to .db.zst.  Incomplete files do not take a slot.
+ZAPP="$TMP/zst-keep/socratic"
+mkdir -p "$ZAPP"
+make_kept_zst() {
+  local db="$1" payload="$2"
+  printf '%s\n' "$payload" > "${db}.zst"
+  printf 'side  %s\n' "$db" > "${db}.sha256"
+}
+make_kept_zst "$ZAPP/socratic-app-20261101T000000Z.db" oldest
+make_kept_zst "$ZAPP/socratic-app-20261102T000000Z.db" middle
+make_kept_zst "$ZAPP/socratic-app-20261103T000000Z.db" newest
+age_file "$ZAPP/socratic-app-20261101T000000Z.db.zst" 5
+age_file "$ZAPP/socratic-app-20261102T000000Z.db.zst" 4
+age_file "$ZAPP/socratic-app-20261103T000000Z.db.zst" 3
+journaled_zst="$ZAPP/socratic-app-20261104T000000Z.db"
+make_kept_zst "$journaled_zst" journaled
+printf 'j\n' > "${journaled_zst}-journal"
+nosh_zst="$ZAPP/socratic-app-20261105T000000Z.db"
+printf 'no-sha\n' > "$nosh_zst"
+saved_root="$ROOT"
+ROOT="$TMP/zst-keep"
+KEEP_COUNT=2
+KEEP_DAYS=30
+FLEET_BACKUP_LOCAL_COMPRESS=0
+apply_local_retention >/dev/null
+assert_missing "$nosh_zst" "incomplete plain dump removed and not a keep slot"
+assert_missing "${journaled_zst}.zst" "journaled .zst removed and not a keep slot"
+assert_missing "${journaled_zst}-journal" "journal removed with incomplete .zst"
+assert_missing "$ZAPP/socratic-app-20261101T000000Z.db.zst" "KEEP_COUNT=2 prunes oldest .zst"
+assert_missing "$ZAPP/socratic-app-20261101T000000Z.db.sha256" "KEEP_COUNT prunes sha256 with .zst"
+assert_exists "$ZAPP/socratic-app-20261102T000000Z.db.zst" "KEEP_COUNT=2 keeps newer .zst"
+assert_exists "$ZAPP/socratic-app-20261103T000000Z.db.zst" "KEEP_COUNT=2 keeps newest .zst"
+
+# Aged sha256 must not be treated as an orphan while the .zst payload remains.
+fresh_base="$ZAPP/socratic-app-20261106T000000Z.db"
+make_kept_zst "$fresh_base" fresh
+age_file "${fresh_base}.sha256" 10
+old_base="$ZAPP/socratic-app-20261107T000000Z.db"
+make_kept_zst "$old_base" old
+age_file "${old_base}.zst" 10
+age_file "${old_base}.sha256" 10
+KEEP_DAYS=7
+KEEP_COUNT=10
+apply_local_retention >/dev/null
+assert_exists "${fresh_base}.zst" "KEEP_DAYS keeps fresh .zst"
+assert_exists "${fresh_base}.sha256" "aged sha256 stays while .zst payload exists"
+assert_missing "${old_base}.zst" "KEEP_DAYS deletes .zst older than keep days"
+assert_missing "${old_base}.sha256" "KEEP_DAYS deletes sha256 with aged .zst"
+
+# Symlink chain: /data/backups style.  Resolve before measure and delete.
+phys="$TMP/phys-backups"
+mkdir -p "$phys/socratic" "$TMP/link-hop"
+ln -s "$phys" "$TMP/link-hop/target"
+ln -s "$TMP/link-hop/target" "$TMP/backup-link"
+printf 'measure-me\n' > "$phys/socratic/socratic-app-20261108T000000Z.db"
+printf 'side  x\n' > "$phys/socratic/socratic-app-20261108T000000Z.db.sha256"
+printf 'older\n' > "$phys/socratic/socratic-app-20261107T000000Z.db"
+printf 'side  y\n' > "$phys/socratic/socratic-app-20261107T000000Z.db.sha256"
+age_file "$phys/socratic/socratic-app-20261107T000000Z.db" 2
+age_file "$phys/socratic/socratic-app-20261107T000000Z.db.sha256" 2
+outside="$TMP/outside-live.db"
+printf 'do-not-delete\n' > "$outside"
+ln -s "$outside" "$phys/socratic/socratic-app-20261109T000000Z.db"
+printf 'side  z\n' > "$phys/socratic/socratic-app-20261109T000000Z.db.sha256"
+ROOT="$TMP/backup-link"
+assert_eq "$(resolve_fs_path "$ROOT")" "$(readlink -f "$phys")" "backup root resolves through the symlink chain"
+measure_got="$(measure_path_bytes "$ROOT/socratic/socratic-app-20261108T000000Z.db")"
+measure_want="$(wc -c < "$phys/socratic/socratic-app-20261108T000000Z.db" | tr -d ' ')"
+assert_eq "$measure_got" "$measure_want" "measure uses the resolved file size"
+KEEP_COUNT=1
+KEEP_DAYS=30
+apply_local_retention >/dev/null
+assert_exists "$phys/socratic/socratic-app-20261108T000000Z.db" "keep-count keeps the dump on the physical root"
+assert_missing "$phys/socratic/socratic-app-20261107T000000Z.db" "keep-count deletes the older dump on the physical root"
+assert_exists "$outside" "delete refuses a dump symlink whose target is outside the root"
+[ -L "$TMP/backup-link" ] && r=yes || r=no
+assert_eq "$r" yes "symlink chain itself is not removed"
+[ -L "$phys/socratic/socratic-app-20261109T000000Z.db" ] && r=yes || r=no
+assert_eq "$r" yes "outside dump symlink is left in place"
+rm_dump_set "$phys/socratic/socratic-app-20261109T000000Z.db"
+assert_exists "$outside" "rm_dump_set still refuses the outside target"
+
+# Compression itself never deletes an incomplete dump.
+inc_plain="$phys/socratic/socratic-app-20261110T000000Z.db"
+printf 'incomplete\n' > "$inc_plain"
+journ_plain="$phys/socratic/socratic-app-20261111T000000Z.db"
+printf 'journal-body\n' > "$journ_plain"
+sha256sum "$journ_plain" > "${journ_plain}.sha256"
+printf 'j\n' > "${journ_plain}-journal"
+FLEET_BACKUP_LOCAL_COMPRESS=1
+compress_one_complete_dump "$inc_plain"
+compress_one_complete_dump "$journ_plain"
+assert_exists "$inc_plain" "compress leaves a dump with no sha256"
+assert_missing "${inc_plain}.zst" "compress does not write .zst for a dump with no sha256"
+assert_exists "$journ_plain" "compress leaves a dump that still has a journal"
+assert_exists "${journ_plain}-journal" "compress does not delete the journal"
+assert_missing "${journ_plain}.zst" "compress does not write .zst while a journal exists"
+
+if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+  good="$phys/socratic/socratic-app-20261112T000000Z.db"
+  sqlite3 "$good" "CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('kept');" >/dev/null
+  sha256sum "$good" > "${good}.sha256"
+  compress_one_complete_dump "$good" >/dev/null
+  assert_missing "$good" "compress removes the plain dump after a matching .zst"
+  assert_exists "${good}.zst" "compress writes .db.zst on the physical root"
+  assert_exists "${good}.sha256" "compress keeps the raw-db sha256"
+  [ -L "$TMP/backup-link" ] && r=yes || r=no
+  assert_eq "$r" yes "compress does not replace the backup symlink"
+  restored="$TMP/restored-good.db"
+  zstd -q -d "${good}.zst" -o "$restored"
+  assert_eq "$(sqlite3 "$restored" 'PRAGMA integrity_check;')" ok "compressed dump decompresses to a clean sqlite file"
+  assert_eq "$(sqlite3 "$restored" 'SELECT x FROM t;')" kept "compressed dump round-trips the row"
+  want_sha="$(awk 'NR==1 { print $1; exit }' "${good}.sha256")"
+  got_sha="$(sha256sum "$restored" | awk '{print $1}')"
+  assert_eq "$got_sha" "$want_sha" "compressed dump matches the raw-db sha256"
+
+  bad_hash="$phys/socratic/socratic-app-20261113T000000Z.db"
+  printf 'not-the-hash\n' > "$bad_hash"
+  printf 'deadbeef  no\n' > "${bad_hash}.sha256"
+  compress_one_complete_dump "$bad_hash" >/dev/null
+  assert_exists "$bad_hash" "sha256 mismatch keeps the plain dump"
+  assert_missing "${bad_hash}.zst" "sha256 mismatch does not leave a .zst"
+
+  FLEET_BACKUP_LOCAL_COMPRESS=0
+  held="$phys/socratic/socratic-app-20261114T000000Z.db"
+  sqlite3 "$held" "CREATE TABLE t(x); INSERT INTO t VALUES (1);" >/dev/null
+  sha256sum "$held" > "${held}.sha256"
+  compress_complete_local_dumps >/dev/null
+  assert_exists "$held" "FLEET_BACKUP_LOCAL_COMPRESS=0 leaves the plain dump"
+  assert_missing "${held}.zst" "FLEET_BACKUP_LOCAL_COMPRESS=0 writes no .zst"
+  FLEET_BACKUP_LOCAL_COMPRESS=1
+
+  # Upload of an already-local .zst keeps that file (it is the retained dump).
+  UROOT="$TMP/upload-parent"
+  UDIR="$UROOT/socratic"
+  mkdir -p "$UDIR"
+  ROOT="$UROOT"
+  ustamp=20261130T120000Z
+  udb="$UDIR/socratic-app-${ustamp}.db"
+  sqlite3 "$udb" "CREATE TABLE t(x); INSERT INTO t VALUES ('up');" >/dev/null
+  sha256sum "$udb" > "${udb}.sha256"
+  compress_one_complete_dump "$udb" >/dev/null
+  UB="$TMP/upload-b2"
+  mkdir -p "$UB"
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$UB/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$UDIR" jays-socratic-trade-eu "$ustamp" >/dev/null
+  assert_exists "$UB/socratic-app-${ustamp}.db.zst" "already-local .zst is what B2 receives"
+  assert_exists "$UB/socratic-app-${ustamp}.db.sha256" "already-local upload sends the raw sha256"
+  assert_missing "$UB/socratic-app-${ustamp}.db" "already-local upload does not send a raw .db"
+  assert_exists "${udb}.zst" "upload keeps the local .db.zst"
+  assert_missing "$udb" "upload does not recreate the plain dump"
+  unset -f rclone
+
+  CROOT="$TMP/congress-upload"
+  CDIR="$CROOT/congress"
+  mkdir -p "$CDIR"
+  ROOT="$CROOT"
+  cstamp=20261130T130000Z
+  cdb="$CDIR/congress-trade-${cstamp}.db"
+  sqlite3 "$cdb" "CREATE TABLE t(x);" >/dev/null
+  sha256sum "$cdb" > "${cdb}.sha256"
+  compress_one_complete_dump "$cdb" >/dev/null
+  kv="$CDIR/kv-${cstamp}.sqlite"
+  sqlite3 "$kv" "CREATE TABLE kv(k TEXT);" >/dev/null
+  UB2="$TMP/upload-b2-congress"
+  mkdir -p "$UB2"
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$UB2/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$CDIR" jays-socratic-trade-eu "$cstamp" >/dev/null
+  assert_exists "$UB2/congress-trade-${cstamp}.db.zst" "fast path uploads local .db.zst"
+  if [ -f "$UB2/kv-${cstamp}.sqlite.zst" ]; then
+    echo "ok   fast path uploads kv as .sqlite.zst"
+  elif [ -f "$UB2/kv-${cstamp}.sqlite" ]; then
+    echo "ok   fast path uploads uncompressed kv sqlite"
+  else
+    echo "FAIL fast path must upload kv-${cstamp}.sqlite set member"
+    fail=1
+  fi
+  unset -f rclone
+
+  reused="$phys/socratic/socratic-app-20261115T000000Z.db"
+  sqlite3 "$reused" "CREATE TABLE t(x); INSERT INTO t VALUES ('z');" >/dev/null
+  sha256sum "$reused" > "${reused}.sha256"
+  zstd -q -f "$reused" -o "${reused}.zst"
+  printf 'j\n' > "${reused}-journal"
+  compress_one_complete_dump "$reused" >/dev/null
+  assert_exists "${reused}.zst" "pre-existing valid .zst survives journal during recheck"
+
+  # Weekly verify accepts the compressed form, including through a symlink root.
+  VERIFY="${ROOT_DIR}/scripts/ops/fleet-backup-verify-weekly.sh"
+  # shellcheck disable=SC1090
+  FLEET_VERIFY_LIB_ONLY=1 . "$VERIFY"
+  VROOT="$TMP/verify-phys"
+  mkdir -p "$VROOT/usage-monitor" "$TMP/verify-scratch" "$TMP/verify-hop"
+  ln -s "$VROOT" "$TMP/verify-hop/target"
+  ln -s "$TMP/verify-hop/target" "$TMP/verify-link"
+  vbase="$VROOT/usage-monitor/usage-monitor-20261111T000000Z.db"
+  sqlite3 "$vbase" "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (7);" >/dev/null
+  sha256sum "$vbase" > "${vbase}.sha256"
+  zstd -q -f "$vbase" -o "${vbase}.zst"
+  zstd -q -d "${vbase}.zst" -o "$TMP/verify-plain.db"
+  rm -f "$vbase"
+  # Newer incomplete must not hide the complete compressed dump.
+  printf 'partial\n' > "$VROOT/usage-monitor/usage-monitor-20261112T000000Z.db"
+  ROOT="$TMP/verify-link"
+  SCRATCH="$TMP/verify-scratch"
+  FAIL=0
+  FAIL_MSGS=()
+  check_dump usage-monitor >/dev/null
+  assert_eq "$FAIL" 0 "verify accepts a compressed dump through the symlink root"
+  # Bad checksum fails closed after a clean decompress.
+  printf '0000000000000000000000000000000000000000000000000000000000000000  x\n' > "${vbase}.sha256"
+  FAIL=0
+  FAIL_MSGS=()
+  check_dump usage-monitor >/dev/null
+  assert_eq "$FAIL" 1 "verify fails a compressed dump whose sha256 does not match"
+  sha256sum "$TMP/verify-plain.db" > "${vbase}.sha256"
+  printf 'garbage\n' > "${vbase}.zst"
+  FAIL=0
+  FAIL_MSGS=()
+  check_dump usage-monitor >/dev/null
+  assert_eq "$FAIL" 1 "verify fails a compressed dump that does not decompress"
+  pick_root="$TMP/verify-pick"
+  mkdir -p "$pick_root/socratic"
+  ROOT="$pick_root"
+  pick_base="$pick_root/socratic/socratic-app-20261120T000000Z.db"
+  sqlite3 "$pick_base" "CREATE TABLE t(x); INSERT INTO t VALUES (1);" >/dev/null
+  sha256sum "$pick_base" > "${pick_base}.sha256"
+  printf 'not-zstd\n' > "${pick_base}.zst"
+  picked="$(latest_complete_dump socratic | head -1)"
+  assert_eq "$picked" "$pick_base" "latest_complete_dump falls back to .db when .zst fails zstd -t"
+else
+  echo "FAIL compressed dump tests require sqlite3 and zstd"
+  fail=1
+fi
+FLEET_BACKUP_LOCAL_COMPRESS=1
+ROOT="$saved_root"
 
 if [ "$fail" -ne 0 ]; then
   echo "FAILED"

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  chamberForMatchedCompetitorFiler,
+  chamberForMintedCompetitorInsert,
   competitorHouseFilerId,
   competitorManualFilerId,
   competitorReporterMismatch,
@@ -79,6 +81,21 @@ describe('hasCompetitorCryptoMarker', () => {
 
   it('is false for an ordinary equity payload', () => {
     expect(hasCompetitorCryptoMarker({ notes: 'Common stock purchase' }, 'Apple Inc.', 'AAPL')).toBe(false);
+  });
+});
+
+describe('chamberForMintedCompetitorInsert / chamberForMatchedCompetitorFiler', () => {
+  it('never falls back to a provider feed default for new MANUAL-* filers', () => {
+    expect(chamberForMintedCompetitorInsert({ name: 'Pete Hegseth', state: null, district: null, chamber: null, bioguideId: null })).toBeNull();
+    expect(chamberForMintedCompetitorInsert({ name: 'Jim Jordan', state: 'OH', district: '4', chamber: 'house', bioguideId: null })).toBe('house');
+  });
+
+  it('prefers a known existing filer chamber, else payload evidence only', () => {
+    const parsed = { name: 'Susan Collins', state: 'ME', district: null, chamber: 'house', bioguideId: null };
+    expect(chamberForMatchedCompetitorFiler('senate', parsed)).toBe('senate');
+    expect(chamberForMatchedCompetitorFiler('senate', { ...parsed, chamber: null })).toBe('senate');
+    expect(chamberForMatchedCompetitorFiler('', { ...parsed, chamber: 'executive' })).toBe('executive');
+    expect(chamberForMatchedCompetitorFiler(null, { ...parsed, chamber: null })).toBeNull();
   });
 });
 
