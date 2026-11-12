@@ -1,0 +1,93 @@
+[
+  {
+    "page": 1,
+    "row": 1,
+    "assetName": "iShares Tr 10 20 Yr Treas Bd ETF",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  },
+  {
+    "page": 1,
+    "row": 2,
+    "assetName": "iShares Tr iShares Core MSCI Europe",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  },
+  {
+    "page": 1,
+    "row": 3,
+    "assetName": "SPDR Ser Tr State S&P 500 Gwth",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  },
+  {
+    "page": 1,
+    "row": 4,
+    "assetName": "SPDR Ser Tr S&P Aerospace & Defense",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  },
+  {
+    "page": 1,
+    "row": 5,
+    "assetName": "SPDR Ser Tr Inter Term Treas ETF",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  },
+  {
+    "page": 2,
+    "row": 1,
+    "assetName": "SPDR Ser Tr S&P 400 Mid Cap ETF",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  },
+  {
+    "page": 2,
+    "row": 2,
+    "assetName": "Select Sector SPDR Energy Sel Sec ETF",
+    "ticker": null,
+    "txType": "S",
+    "owner": "self",
+    "txDate": "2026-10-22",
+    "notificationDate": "2026-11-01",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "docId": "H-2026-9116403"
+  }
+]
