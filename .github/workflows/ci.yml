@@ -209,6 +209,13 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-deploy-overlap.sh
 
+      - name: Fleet CPU sampler offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/cpu-sampler.sh
+          bash -n scripts/ops/cpu-history-report.sh
+          bash scripts/ops/test-fleet-cpu-sampler.sh
+
       - name: B2 backup report (offline)
         working-directory: .
         run: |
