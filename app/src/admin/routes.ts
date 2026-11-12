@@ -313,6 +313,8 @@ import {
   resolvePeerImportRequestId,
   resolvePeerImportSchemaVersion,
   warnPeerImportSchemaDrops,
+  warnPeerImportAuthRejected,
+  warnPeerImportNoAcceptedRows,
 } from '../share/importReceipt.ts';
 import { buildAdminMigrateStatements } from './migrateStatements.ts';
 import { executeAdminSchemaMigrations } from './schemaMigrationRunner.ts';
@@ -3047,7 +3049,31 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       accessJwt: c.req.header('Cf-Access-Jwt-Assertion'),
       sessionEmail,
     });
-    if (!ok) return c.json({ error: 'unauthorized' }, 401);
+    if (!ok) {
+      const ingestAttempt = await isAuthorizedIngest(env, c.req.path, authorization);
+      if (!ingestAttempt && c.req.path.endsWith('/securities/import')) {
+        const ingestToken = (await resolveSecret(env, 'INGEST_TOKEN')).value;
+        const bearer = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+        warnPeerImportAuthRejected({
+          path: c.req.path,
+          hasAuthorization: Boolean(authorization?.trim()),
+          ingestTokenConfigured: Boolean(ingestToken),
+          ingestBearerAttempt: Boolean(bearer && ingestToken),
+        });
+        return c.json(
+          {
+            error: 'unauthorized',
+            reason: !ingestToken
+              ? 'ingest_token_unconfigured'
+              : !authorization?.trim()
+                ? 'missing_bearer'
+                : 'ingest_bearer_mismatch_or_admin_required',
+          },
+          401,
+        );
+      }
+      return c.json({ error: 'unauthorized' }, 401);
+    }
     await next();
   });
 
@@ -11602,6 +11628,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     const accepted = acceptedCountsFromSummary(summary);
     const rejected = rejectedCountsFromErrors(summary.errors);
     warnPeerImportSchemaDrops({ requestId, origin: originTag, dropped, payloadBytes });
+    warnPeerImportNoAcceptedRows({
+      requestId,
+      origin: originTag,
+      payloadBytes,
+      dropped,
+      accepted,
+      rawBody: body,
+    });
     try {
       await persistPeerImportReceipt(c.env.DB, {
         requestId,
