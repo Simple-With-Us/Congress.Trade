@@ -169,6 +169,7 @@ def write_demo(path: Path) -> None:
     for full, ref, size, count, created in images:
         repo, tag = ref.split(":", 1)
         image_rows.append([repo, tag, full[:12], created, size, "0B", size, count])
+    image_rows.append(["nginx", "1.25", IMG_NGINX[:12], "10 months ago", "60MB", "0B", "60MB", "0"])
     containers = [
         (C_RUN, f"{APP1}:deploy-new", "Up 12 hours", "congress-app", "1MB"),
         (C_PLAIN, "scratch:old", "Exited (0) 40 days ago", "one-shot", "5MB"),
@@ -263,7 +264,7 @@ def write_demo(path: Path) -> None:
         IMG_OLD: ("2026-08-01T00:00:00Z", [f"{APP1}:deploy-old"], app(APP1)),
         IMG_DANGLE: ("2026-07-01T00:00:00Z", [], {}),
         IMG_YOUNG: ("2026-11-11T00:00:00Z", [], {}),
-        IMG_NGINX: ("2026-01-01T00:00:00Z", ["nginx:old"], {}),
+        IMG_NGINX: ("2026-01-01T00:00:00Z", ["nginx:old", "nginx:1.25"], {}),
         IMG_STOPPED: ("2026-06-01T00:00:00Z", ["scratch:old"], {}),
         IMG_APP2: ("2026-11-01T00:00:00Z", [f"{APP2}:current"], app(APP2)),
         IMG_SIB: ("2026-07-15T00:00:00Z", [f"{APP1}:deploy-sib"], app(APP1)),
@@ -283,7 +284,9 @@ def write_demo(path: Path) -> None:
             )
         )
     (path / "images.jsonl").write_text("\n".join(image_lines) + "\n", encoding="utf-8")
-    (path / "image-ids.txt").write_text("\n".join(image_meta) + "\n", encoding="utf-8")
+    image_id_lines = list(image_meta)
+    image_id_lines.append(IMG_NGINX)
+    (path / "image-ids.txt").write_text("\n".join(image_id_lines) + "\n", encoding="utf-8")
     container_meta = [
         (C_RUN, IMG_RUNNING, "/congress-app", "running", ZERO, "2026-11-11T00:00:00Z", app(APP1)),
         (C_PLAIN, IMG_STOPPED, "/one-shot", "exited", "2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z", {}),
@@ -375,6 +378,11 @@ if args[:2] == ["container", "inspect"]:
     sys.stdout.write((root / "containers.jsonl").read_text(encoding="utf-8"))
     sys.exit(0)
 if args[:2] == ["image", "inspect"]:
+    if len(args) < 5 or args[2] != "--format":
+        fail("image inspect argv")
+    image_ids = args[4:]
+    if len(image_ids) != len(set(image_ids)):
+        fail("duplicate image id")
     sys.stdout.write((root / "images.jsonl").read_text(encoding="utf-8"))
     sys.exit(0)
 if args[:2] == ["volume", "ls"]:
@@ -667,10 +675,89 @@ class PlannerTests(unittest.TestCase):
                     mode="dry-run",
                 )
 
-    def _write_min_snapshot(self, root: Path, image_ids: list[str], df_ids: list[str]) -> None:
+    def test_repeated_image_rows_merge_when_they_agree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_min_snapshot(
+                root,
+                [IMG_NGINX],
+                df_ids=[IMG_NGINX[:12], IMG_NGINX[:12]],
+                df_sizes=["60MB", "60MB"],
+                df_counts=["0", "0"],
+            )
+            recorded = (root / "images.jsonl").read_text(encoding="utf-8")
+            (root / "images.jsonl").write_text(recorded + recorded, encoding="utf-8")
+            result = planner.plan_from_dir(
+                root,
+                now=NOW,
+                image_min_age_days=14,
+                container_min_age_days=14,
+                coolify_recent_days=14,
+                build_cache_until="72h",
+                mode="dry-run",
+            )
+        self.assertIn("dangling_images count=1 bytes=60000000", result.report)
+        self.assertEqual(action_values(result, "image"), {IMG_NGINX})
+
+    def test_repeated_image_rows_fail_when_they_disagree(self) -> None:
+        cases = (
+            (["60MB", "61MB"], ["0", "0"]),
+            (["60MB", "60MB"], ["0", "1"]),
+        )
+        for sizes, counts in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_min_snapshot(
+                    root,
+                    [IMG_NGINX],
+                    df_ids=[IMG_NGINX[:12], IMG_NGINX[:12]],
+                    df_sizes=sizes,
+                    df_counts=counts,
+                )
+                with self.assertRaises(planner.SnapshotError):
+                    planner.plan_from_dir(
+                        root,
+                        now=NOW,
+                        image_min_age_days=14,
+                        container_min_age_days=14,
+                        coolify_recent_days=14,
+                        build_cache_until="72h",
+                        mode="dry-run",
+                    )
+
+    def test_disagreeing_image_inspect_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_min_snapshot(root, [IMG_NGINX], df_ids=[IMG_NGINX[:12]])
+            lines = (root / "images.jsonl").read_text(encoding="utf-8").splitlines()
+            other = json.loads(lines[0])
+            other["Size"] = 2
+            lines.append(json.dumps(other))
+            (root / "images.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with self.assertRaises(planner.SnapshotError):
+                planner.plan_from_dir(
+                    root,
+                    now=NOW,
+                    image_min_age_days=14,
+                    container_min_age_days=14,
+                    coolify_recent_days=14,
+                    build_cache_until="72h",
+                    mode="dry-run",
+                )
+
+    def _write_min_snapshot(
+        self,
+        root: Path,
+        image_ids: list[str],
+        df_ids: list[str],
+        df_sizes: list[str] | None = None,
+        df_counts: list[str] | None = None,
+    ) -> None:
+        sizes = df_sizes or ["1MB"] * len(df_ids)
+        counts = df_counts or ["0"] * len(df_ids)
         rows = [
-            ["repo", "tag", short, "10 days ago", "1MB", "0B", "1MB", "0"]
-            for short in df_ids
+            ["repo", f"t{index}", short, "10 days ago", size, "0B", size, count]
+            for index, (short, size, count) in enumerate(zip(df_ids, sizes, counts, strict=True))
         ]
         verbose = "\n".join(
             [
@@ -828,6 +915,11 @@ class ShellTests(unittest.TestCase):
             for call in dry_calls:
                 self.assertNotIn("rm", call)
                 self.assertNotIn("prune", call)
+            inspect_calls = [call for call in dry_calls if call[:2] == ["image", "inspect"]]
+            self.assertEqual(len(inspect_calls), 1)
+            inspected = inspect_calls[0][4:]
+            self.assertEqual(len(inspected), len(set(inspected)))
+            self.assertEqual(inspected.count(IMG_NGINX), 1)
             self.assertFalse((state / "mutated").exists())
 
             log.unlink()

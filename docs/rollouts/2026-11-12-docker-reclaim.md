@@ -15,7 +15,7 @@ The default is a dry-run.  `APPLY=1` is the only switch that deletes anything.�
 
 ## What the report counts
 
-Bytes come from `docker system df -v`.  Exact ages and Coolify labels come from inspect, because the verbose table's relative times are not safe enough to choose a delete.  The build-cache byte count is an estimate from those relative times.  The daemon's `until` filter is what actually deletes cache.
+Bytes come from `docker system df -v`.  A multi-tagged image is one object: the verbose table prints one row per tag, and those rows are merged when the size and container count agree.  A disagreement aborts the plan.  Exact ages and Coolify labels come from inspect, because the verbose table's relative times are not safe enough to choose a delete.  The build-cache byte count is an estimate from those relative times.  The daemon's `until` filter is what actually deletes cache.
 
 The report lists five reclaimable groups:
 

@@ -481,6 +481,21 @@ def _image_repos(tags: list[str]) -> list[str]:
     return repos
 
 
+def _df_image_measure(row: dict[str, str]) -> tuple[int, int | None]:
+    if row.get("UNIQUE SIZE", ""):
+        size = parse_size(row["UNIQUE SIZE"])
+    elif row.get("SIZE", ""):
+        size = parse_size(row["SIZE"])
+    else:
+        raise SnapshotError("image size was missing from docker system df -v")
+    containers_text = row.get("CONTAINERS", "").strip()
+    if not containers_text:
+        return size, None
+    if not re.fullmatch(r"\d+", containers_text):
+        raise SnapshotError("unparsed image container count")
+    return size, int(containers_text)
+
+
 def _parse_links(value: str) -> int | None:
     text = value.strip()
     if not text or text.upper() == "N/A":
@@ -498,10 +513,18 @@ def load_snapshot(input_dir: Path, now: datetime) -> tuple[str, list[ImageRec], 
     volume_rows = _load_jsonl(input_dir / "volumes.jsonl")
 
     images: list[ImageRec] = []
+    seen_image_rows: dict[str, dict] = {}
     for row in image_rows:
         full = norm_id(row.get("Id"))
         if not _HEX_ID_RE.fullmatch(full):
             raise SnapshotError("image id was not 64 hex characters")
+        # `docker images -aq` prints one id per tag, so inspect can repeat an id.
+        prior_row = seen_image_rows.get(full)
+        if prior_row is not None:
+            if prior_row != row:
+                raise SnapshotError("image inspect disagreed about an id")
+            continue
+        seen_image_rows[full] = row
         tags_raw = row.get("RepoTags")
         if tags_raw is None:
             tags: list[str] = []
@@ -527,24 +550,19 @@ def load_snapshot(input_dir: Path, now: datetime) -> tuple[str, list[ImageRec], 
     _assert_unique_prefixes([image.full_id for image in images])
     image_ids = [image.full_id for image in images]
     images_by_id = {image.full_id: image for image in images}
-    seen_images: set[str] = set()
+    # `docker system df -v` prints one row per tag. A repeated id is one image.
+    seen_images: dict[str, tuple[int, int | None]] = {}
     for row in verbose["images"]:
         matched = _match_id(row.get("IMAGE ID", ""), image_ids)
-        if matched in seen_images:
-            raise SnapshotError("duplicate image in docker system df -v")
-        seen_images.add(matched)
+        measure = _df_image_measure(row)
+        prior_measure = seen_images.get(matched)
+        if prior_measure is not None:
+            if prior_measure != measure:
+                raise SnapshotError("docker system df -v disagreed about an image")
+            continue
+        seen_images[matched] = measure
         image = images_by_id[matched]
-        if row.get("UNIQUE SIZE", ""):
-            image.unique_size = parse_size(row["UNIQUE SIZE"])
-        elif row.get("SIZE", ""):
-            image.unique_size = parse_size(row["SIZE"])
-        else:
-            raise SnapshotError("image size was missing from docker system df -v")
-        containers_text = row.get("CONTAINERS", "").strip()
-        if containers_text:
-            if not re.fullmatch(r"\d+", containers_text):
-                raise SnapshotError("unparsed image container count")
-            image.df_containers = int(containers_text)
+        image.unique_size, image.df_containers = measure
     if len(seen_images) != len(images):
         raise SnapshotError("docker system df -v omitted an image")
 

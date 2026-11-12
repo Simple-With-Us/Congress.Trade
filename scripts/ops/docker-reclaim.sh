@@ -66,6 +66,21 @@ collect_ids() {
   done <<< "$raw"
 }
 
+# `docker images -aq` prints one id per tag. Inspect each image once.
+dedupe_ids() {
+  local -n incoming="$1"
+  local -a kept=()
+  local -A seen=()
+  local id
+  for id in "${incoming[@]}"; do
+    if [[ -z "${seen[$id]+x}" ]]; then
+      seen[$id]=1
+      kept+=("$id")
+    fi
+  done
+  incoming=("${kept[@]}")
+}
+
 collect_snapshot() {
   local dir="$1"
   "$DOCKER" system df > "$dir/df-summary.txt"
@@ -83,6 +98,7 @@ collect_snapshot() {
   raw="$("$DOCKER" images -aq --no-trunc)"
   collect_ids "$raw" iids
   if ((${#iids[@]})); then
+    dedupe_ids iids
     "$DOCKER" image inspect --format "$IMAGE_FMT" "${iids[@]}" > "$dir/images.jsonl"
   fi
   "$DOCKER" volume ls --format '{{json .}}' > "$dir/volumes.jsonl"
