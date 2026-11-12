@@ -16,10 +16,10 @@
  *      disagrees with the assigned filer (different chamber, different
  *      state, or a differing resolved bioguide id —
  *      `competitorReporterMismatch`), the row is reassigned to the correct
- *      filer, minting one if it doesn't exist yet: a curated EXEC-* id when
- *      the name matches a known executive alias, a real
+ *      filer, minting one if it doesn't exist yet: an existing roster or
+ *      EXEC-* id when the full name matches, a real
  *      `house-<state><district>-<slug>` id when office metadata gives
- *      state+district, else the existing `MANUAL-${LASTNAME}` convention.
+ *      state+district, else `MANUAL-<FIRST>-<LAST>`. A bare surname mints nothing.
  *
  *   2. Crypto mis-typed as equity: rows whose raw notes carry the
  *      provider's '[CT]' crypto marker (or an explicit crypto keyword) got
@@ -49,12 +49,9 @@
 import type { Env } from '../shared/types.ts';
 import { all, run } from '../shared/db.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
-import { resolveExecutiveFilerIdFromName } from '../shared/executiveIdentity.ts';
 import { fallbackCleanDisplayName } from '../enrichment/identitySync.ts';
 import {
   chamberForMintedCompetitorInsert,
-  competitorHouseFilerId,
-  competitorQualifiedManualFilerId,
   competitorReporterMismatch,
   competitorReporterNames,
   hasCompetitorCryptoMarker,
@@ -62,6 +59,7 @@ import {
   type ParsedCompetitorReporter,
 } from '../shared/competitorAttribution.ts';
 import {
+  assignCompetitorFilerId,
   findExistingFilerForCompetitorReporter,
   isMintedCompetitorFilerId,
   type ExistingFilerCandidate,
@@ -106,23 +104,15 @@ interface CompetitorRow {
 
 function resolveNewFilerId(parsed: ParsedCompetitorReporter, existing: readonly ExistingFilerCandidate[]): string | null {
   if (!parsed.name) return null;
-  const execId = resolveExecutiveFilerIdFromName(parsed.name);
-  if (execId) return execId;
-  if (parsed.state && parsed.district) {
-    const houseId = competitorHouseFilerId(parsed.name, parsed.state, parsed.district);
-    if (houseId) return houseId;
-  }
-  // Ingest guard: never mint a filer from a bare last name when a real filer
-  // already matches, and never mint `MANUAL-<LAST>` for a surname alone.
-  const match = findExistingFilerForCompetitorReporter({
+  return assignCompetitorFilerId({
+    rawName: parsed.name,
     names: [parsed.name],
     chamber: parsed.chamber,
     state: parsed.state,
+    district: parsed.district,
     bioguideId: parsed.bioguideId,
     candidates: existing,
-  });
-  if (match) return match.filerId;
-  return competitorQualifiedManualFilerId(parsed.name);
+  })?.filerId ?? null;
 }
 
 function chamberForFilerId(filerId: string, parsed: ParsedCompetitorReporter): string | null {
@@ -163,31 +153,31 @@ export async function repairCompetitorAttribution(
   const clusters = new Map<string, RepairCompetitorAttributionCluster>();
   const movedFrom = new Map<string, Map<string, number>>();
 
-  // Live real (non-MANUAL, non-tombstoned) filers: the only valid re-key targets.
-  const candidates: ExistingFilerCandidate[] = rows.some((r) => isMintedCompetitorFilerId(r.filer_id))
-    ? (
-        await all<{
-          bioguide_id: string;
-          full_name: string | null;
-          display_name: string | null;
-          chamber: string | null;
-          state: string | null;
-          resolved_bioguide_id: string | null;
-        }>(
-          env.DB,
-          `SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id
-             FROM filers
-            WHERE merged_into IS NULL AND bioguide_id NOT LIKE 'MANUAL-%'`,
-        )
-      ).map((f) => ({
-        filerId: f.bioguide_id,
-        fullName: f.full_name,
-        displayName: f.display_name,
-        chamber: f.chamber,
-        state: f.state,
-        resolvedBioguideId: f.resolved_bioguide_id,
-      }))
-    : [];
+  // Live real (non-MANUAL, non-tombstoned) filers. Loaded on every run, not
+  // only when a MANUAL-* row is in the batch: the mismatch path below also
+  // resolves EXEC-* and roster ids, and an empty list would mint a duplicate.
+  const candidates: ExistingFilerCandidate[] = (
+    await all<{
+      bioguide_id: string;
+      full_name: string | null;
+      display_name: string | null;
+      chamber: string | null;
+      state: string | null;
+      resolved_bioguide_id: string | null;
+    }>(
+      env.DB,
+      `SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id
+         FROM filers
+        WHERE merged_into IS NULL AND bioguide_id NOT LIKE 'MANUAL-%'`,
+    )
+  ).map((f) => ({
+    filerId: f.bioguide_id,
+    fullName: f.full_name,
+    displayName: f.display_name,
+    chamber: f.chamber,
+    state: f.state,
+    resolvedBioguideId: f.resolved_bioguide_id,
+  }));
 
   for (const row of rows) {
     const parsed = parseCompetitorReporter(row.raw_text);

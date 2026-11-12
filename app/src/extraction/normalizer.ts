@@ -28,6 +28,7 @@ import {
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
+  isHouseGridFormExtractor,
 } from './extractRouting.ts';
 import {
   handCheckReviewReason,
@@ -257,6 +258,7 @@ export const HARD_FAILURE_FLAGS = [
   'tx_date_after_filing_window',
   'ocr_name_hold',
   'ocr_date_hold',
+  'grid_type_unmarked',
 ];
 const HARD_FAILURE_FLAG_SET = new Set<string>(HARD_FAILURE_FLAGS);
 
@@ -718,7 +720,12 @@ export async function normalize(
     // hundreds of fake rows for humans/agreement — empty extract_empty class
     // so local-vision pending can re-claim the stored raw copy.
     let reviewFlagged = flagged;
-    if (ocrUnusable && !exceedsPublishLimit && meta?.parseDisposition !== 'unreadable') {
+    if (
+      ocrUnusable
+      && !isHouseGridFormExtractor(extractorName)
+      && !exceedsPublishLimit
+      && meta?.parseDisposition !== 'unreadable'
+    ) {
       // Keep dated, non-chrome rows (amendment letters with one real Treasury
       // line). Only wipe when nothing recoverable remains.
       const keepable = flagged.filter((f) =>
@@ -902,6 +909,7 @@ function buildTransaction(
       txType: p.txType,
       txDate: p.txDate,
       rawText: p.rawText,
+      gridTypeUnmarked: (p.extractionWarnings ?? []).includes('grid_type_unmarked'),
     },
     filing.filedDate,
     resolve,
@@ -1016,6 +1024,8 @@ export function scoreFields(
     txType: string | null;
     txDate: string | null;
     rawText?: string | null;
+    /** Grid form found no single type mark. Do not invent B/S/E. */
+    gridTypeUnmarked?: boolean;
   },
   filedDate: string | null,
   resolve: TickerResolver,
@@ -1142,8 +1152,14 @@ export function scoreFields(
   }
 
   // --- tx_type must be B / S / E (Purchase/P/buy → B) ----------------------
+  // A grid row with no x in the type columns is flagged and left untyped.
+  // Other bad labels still fall back to B, which is the historical rubric.
   let txType = (canonicalizeTxType(fields.txType) ?? fields.txType) as TxType;
-  if (!isTxType(txType)) {
+  if (fields.gridTypeUnmarked) {
+    flags.push('grid_type_unmarked');
+    confidence *= PENALTY_BAD_TX_TYPE;
+    txType = '' as TxType;
+  } else if (!isTxType(txType)) {
     flags.push('bad_tx_type');
     confidence *= PENALTY_BAD_TX_TYPE;
     txType = 'B';
@@ -1438,8 +1454,12 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
   json_extract(value, '$.cleaningNote')
   FROM json_each(?)`;
 
+function isStoredTxType(txType: string | null | undefined): txType is TxType {
+  return txType === 'B' || txType === 'S' || txType === 'E';
+}
+
 function transactionInsertJson(transactions: Transaction[]): string {
-  return JSON.stringify(transactions.map((tx) => ({
+  return JSON.stringify(transactions.filter((tx) => isStoredTxType(tx.txType)).map((tx) => ({
     id: tx.id,
     docId: tx.docId,
     filerId: tx.filerId,
@@ -1873,7 +1893,11 @@ async function routeToReview(
     truncated,
     transactions: flagged
       .slice(0, MAX_PUBLISH_TRANSACTIONS_PER_FILING)
-      .map((f) => ({ ...f.tx, flags: f.flags })),
+      .map((f) => {
+        const row: Record<string, unknown> = { ...f.tx, flags: f.flags };
+        if (f.flags.includes('grid_type_unmarked')) row.txType = null;
+        return row;
+      }),
   });
   const decisionPayload = JSON.stringify({
     minConfidence,

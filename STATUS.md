@@ -1,6 +1,9 @@
 ## 2026-11-12 CURSOR — OPS-1003 /tmp symdb-pids
 
 Congress.Trade does not create `/tmp/symdb-pids`.  `tryInitDdTracer` loads `dd-trace` 6.12.0, whose tarball has no `symdb` string, and compose does not mount host `/tmp`.  The public name match is `dd-trace-py`, which this repo does not depend on.  `DD_TRACE_AGENTLESS_GUARDS` is opt-in and off by default.  The tmpfiles policy and the read-only report are in the tree and are not installed.  Rollout: `docs/rollouts/2026-11-12-tmp-symdb-pids.md`.
+## 2026-11-12 CURSOR — Cloudflare-only origin gate, default off (CT-1337)
+
+Requests are accepted from Cloudflare edge ranges, a shared origin secret, or an Authenticated Origin Pulls header set by a trusted proxy.  Loopback and docker-network `GET`/`HEAD` `/health` and `/api/health` stay open.  `ORIGIN_LOCK_ENABLED` defaults off, so a merge does not change traffic.  `CF-Connecting-IP` and `X-Forwarded-For` are trusted only after the peer is Cloudflare.  The host firewall for ports 80 and 443 stays out of scope.  Rollout: `docs/rollouts/2026-11-12-origin-lock-request-gate.md`.
 
 ## 2026-11-11 CURSOR — compress local sqlite backup dumps on root (CT-2472)
 

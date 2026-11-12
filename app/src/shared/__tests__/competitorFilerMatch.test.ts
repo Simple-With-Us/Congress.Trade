@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  assignCompetitorFilerId,
   competitorNameTokens,
   competitorNamesMatch,
   findExistingFilerForCompetitorReporter,
@@ -30,8 +31,16 @@ const FILERS: ExistingFilerCandidate[] = [
   filer({ filerId: 'house-tx03-nicholas-v-taylor', fullName: 'Nicholas V Taylor', state: 'TX' }),
   filer({ filerId: 'EXEC-DOUGLAS-J-BURGUM', fullName: 'Douglas J Burgum', chamber: 'executive' }),
   filer({ filerId: 'EXEC-CWRIGHT', fullName: 'Chris Wright', chamber: 'executive' }),
+  filer({ filerId: 'EXEC-MICHAEL-J-KRATSIOS', fullName: 'Michael J. Kratsios', chamber: 'executive' }),
+  filer({ filerId: 'EXEC-FRANK-J-BISIGNANO', fullName: 'Frank J. Bisignano', chamber: 'executive' }),
+  filer({ filerId: 'EXEC-SARA-BAILEY', fullName: 'Sara Bailey', chamber: 'executive' }),
+  filer({ filerId: 'EXEC-SCOTT-A-KUPOR', fullName: 'Scott A. Kupor', chamber: 'executive' }),
+  filer({ filerId: 'house-nj07-thomas-h-kean', fullName: 'Thomas H. Kean Jr.', state: 'NJ' }),
+  filer({ filerId: 'house-mn08-peter-allen-stauber', fullName: 'Peter Allen Stauber', state: 'MN' }),
   // Phantoms are never a valid target.
-  filer({ filerId: 'MANUAL-DELANEY', fullName: 'April Delaney' }),
+  filer({ filerId: 'MANUAL-DELANEY', fullName: 'John Delaney', state: 'NY' }),
+  filer({ filerId: 'MANUAL-WRIGHT', fullName: 'Christopher A Wright', chamber: 'senate' }),
+  filer({ filerId: 'MANUAL-ELVIRA', fullName: 'Maria Elvira', chamber: 'senate' }),
 ];
 
 const DELANEY_PAYLOAD = JSON.stringify({
@@ -143,6 +152,63 @@ describe('findExistingFilerForCompetitorReporter', () => {
 
   it('never returns a bare-surname match', () => {
     expect(findExistingFilerForCompetitorReporter({ names: ['Delaney'], candidates: FILERS })).toBeNull();
+    expect(findExistingFilerForCompetitorReporter({ names: ['Kean'], candidates: FILERS })).toBeNull();
+    expect(findExistingFilerForCompetitorReporter({ names: ['Wright'], candidates: FILERS })).toBeNull();
+  });
+
+  it('resolves each CT-1362 twin onto the roster or EXEC id, never the MANUAL phantom', () => {
+    const cases: Array<[string, string]> = [
+      ['Christopher A Wright', 'EXEC-CWRIGHT'],
+      ['Chris Wright', 'EXEC-CWRIGHT'],
+      ['Douglas J Burgum', 'EXEC-DOUGLAS-J-BURGUM'],
+      ['Doug Burgum', 'EXEC-DOUGLAS-J-BURGUM'],
+      ['Michael J. Kratsios', 'EXEC-MICHAEL-J-KRATSIOS'],
+      ['Michael Kratsios', 'EXEC-MICHAEL-J-KRATSIOS'],
+      ['Frank J. Bisignano', 'EXEC-FRANK-J-BISIGNANO'],
+      ['Frank Bisignano', 'EXEC-FRANK-J-BISIGNANO'],
+      ['Sara Bailey', 'EXEC-SARA-BAILEY'],
+      ['Scott A. Kupor', 'EXEC-SCOTT-A-KUPOR'],
+      ['Scott Kupor', 'EXEC-SCOTT-A-KUPOR'],
+      ['Thomas H. Kean Jr.', 'house-nj07-thomas-h-kean'],
+      ['Tom Kean', 'house-nj07-thomas-h-kean'],
+      ['Peter Allen Stauber', 'house-mn08-peter-allen-stauber'],
+      ['Pete Stauber', 'house-mn08-peter-allen-stauber'],
+    ];
+    for (const [name, filerId] of cases) {
+      expect(findExistingFilerForCompetitorReporter({ names: [name], candidates: FILERS })?.filerId, name).toBe(filerId);
+    }
+  });
+});
+
+describe('assignCompetitorFilerId (ingest guard: a last name never creates a filer)', () => {
+  it('attaches a full name to the existing id and does not mint', () => {
+    expect(assignCompetitorFilerId({
+      rawName: 'Christopher A Wright',
+      chamber: 'executive',
+      candidates: FILERS,
+    })).toEqual({ filerId: 'EXEC-CWRIGHT', minted: false });
+    expect(assignCompetitorFilerId({
+      rawName: 'Hon. April McClain Delaney',
+      chamber: 'house',
+      state: 'MD',
+      district: '6',
+      candidates: FILERS,
+    })).toEqual({ filerId: 'house-md06-april-mcclain-delaney', minted: false });
+  });
+
+  it('a last-name-only match never creates a new filer, even with a district or an existing namesake', () => {
+    expect(assignCompetitorFilerId({ rawName: 'Delaney', candidates: FILERS })).toBeNull();
+    expect(assignCompetitorFilerId({ rawName: 'Kean', candidates: FILERS })).toBeNull();
+    expect(assignCompetitorFilerId({ rawName: 'Wright', candidates: FILERS })).toBeNull();
+    expect(assignCompetitorFilerId({ rawName: 'Elvira', candidates: FILERS })).toBeNull();
+    expect(assignCompetitorFilerId({
+      rawName: 'Delaney',
+      chamber: 'house',
+      state: 'NY',
+      district: '7',
+      candidates: FILERS,
+    })).toBeNull();
+    expect(assignCompetitorFilerId({ rawName: 'Delaney', candidates: [] })).toBeNull();
   });
 });
 
