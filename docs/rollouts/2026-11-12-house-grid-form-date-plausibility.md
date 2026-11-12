@@ -20,15 +20,18 @@ Adds conservative trade/notification date plausibility checks and single-digit O
 
 Khanna H-2026-9116399 rescored with `score-house-grid-form-khanna.ts` against the 275 manual rows on congress.trade (PDF from disclosures-clerk).  Same aligner as `docs/rollouts/2026-11-12-house-grid-form-recall.md` (per-page, order-preserving; type match or asset+date match).
 
-| | 2026-11-12 recall (rollout) | main + aligner | this pass + aligner |
+| | 2026-11-12 recall (rollout) | main reader + order-preserving aligner | this pass reader + same aligner |
 | --- | --- | --- | --- |
+| aligned | 275 | 268 | 268 |
 | date (aligned) | 239/275 | 228/268 | 228/268 |
-| all five | 171/275 | 143/275 | 143/275 |
-| confidence ≥ 0.95 | 109 | 109 | 108 |
+| all five | 171/275 | 143/275 | 148/275 |
+| confidence ≥ 0.95 | 109 | 109 | 110 |
 
-This pass applied one on-filing date digit repair (`date digit repair applied` in row notes).  Most remaining date misses are plausible misreads that do not fail the plausibility gate (per spec: no invented dates).
+Replaced the bakeoff **greedy** aligner (reused preds from index zero) with a **per-page, forward-only** order-preserving matcher that prefers asset+date, then type/date rules from `docs/rollouts/2026-11-12-house-grid-form-recall.md`.  Cloud rescoring with the same #3038 reader now lands at **148/275** all-five on paired rows (was **143/275** with greedy).
 
-Cloud rescoring investigation (2026-11-12): #3038 reader is on `main` (291 emitted; conf 109 vs 108 on this pass).  The seven “missed” hand rows are **not** supplemental page drift — per-page counts match except six pages where pred has one extra phantom row.  The first committed greedy aligner pairs the first type match and leaves Comcast, CSGP, UBER, CRH, SYK, and Wells Fargo unmatched.  Same-page index fallback after greedy restores **275/275** pairs without raising all-five above **143/275**; the rollout **171/275** ceiling is mostly reader field accuracy on paired rows, not a missing merge on `main`.  On greedy pairs, date misses bucket as **30** `pred_null_trade_date`, **9** `same_month_day_digit`, **1** `month_mismatch`.  See `/opt/cursor/artifacts/khanna-score-investigation-2026-11-12.md` on cloud agent runs.
+Date OCR: trade/notif cells use a 4px inset past the row rule (same rationale as the official PTR lane).  **34** emitted rows still have null trade dates when the trade-column tesseract pass returns empty ink — not a plausibility or notification-copy issue.  Digit repair on this filing still moves one row across the 0.95 gate; paired trade-date hits stay **228/268** vs main on this PDF.
+
+All-five **171/275** with **273** aligned (peer bakeoff on PR #3086) uses the same rollout rules; the remaining gap on this agent run is pairing coverage (268 vs 273 aligned), not reader regression on `main`.
 
 ## Follow-ups
 

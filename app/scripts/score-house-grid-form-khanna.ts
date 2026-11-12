@@ -57,19 +57,32 @@ function toAlignRow(tx: {
 }
 
 async function loadManualHandRows(): Promise<{ filedDate: string; rows: GridAlignRow[] }> {
-  const url = `https://congress.trade/api/filings/${DOC_ID}`;
-  const res = await fetch(url, {
-    headers: { 'user-agent': 'Mozilla/5.0 (compatible; CongressTradeGridScore/1.0)' },
-  });
-  if (!res.ok) throw new Error(`hand rows fetch ${res.status}`);
-  const body = await res.json() as {
-    filing: { filedDate: string };
-    transactions: ParsedTx[];
-  };
-  return {
-    filedDate: body.filing.filedDate,
-    rows: body.transactions.map((tx) => toAlignRow(tx)),
-  };
+  const localPath = Deno.env.get('KHANNA_HAND_JSON')
+    ?? '/opt/cursor/artifacts/H-2026-9116399-manual.json';
+  try {
+    const body = JSON.parse(await Deno.readTextFile(localPath)) as {
+      filing: { filedDate: string };
+      transactions: ParsedTx[];
+    };
+    return {
+      filedDate: body.filing.filedDate,
+      rows: body.transactions.map((tx) => toAlignRow(tx)),
+    };
+  } catch {
+    const url = `https://congress.trade/api/filings/${DOC_ID}`;
+    const res = await fetch(url, {
+      headers: { 'user-agent': 'Mozilla/5.0 (compatible; CongressTradeGridScore/1.0)' },
+    });
+    if (!res.ok) throw new Error(`hand rows fetch ${res.status}`);
+    const fetched = await res.json() as {
+      filing: { filedDate: string };
+      transactions: ParsedTx[];
+    };
+    return {
+      filedDate: fetched.filing.filedDate,
+      rows: fetched.transactions.map((tx) => toAlignRow(tx)),
+    };
+  }
 }
 
 function printScore(label: string, score: ReturnType<typeof scoreGridFormAlignment>): void {

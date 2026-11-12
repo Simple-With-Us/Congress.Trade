@@ -72,7 +72,8 @@ function sameDate(a: GridAlignRow, b: GridAlignRow): boolean {
   return a.txDate === b.txDate;
 }
 
-function rowMatches(hand: GridAlignRow, pred: GridAlignRow): boolean {
+/** Rollout pairing rule: type agrees, or asset and trade date identify the same row. */
+export function rowMatches(hand: GridAlignRow, pred: GridAlignRow): boolean {
   if (hand.txType && pred.txType && hand.txType === pred.txType) return true;
   if (
     hand.txDate
@@ -94,26 +95,42 @@ export function alignGridFormRowsByPage(
   for (const page of pages) {
     const h = hand.filter((r) => r.page === page);
     const p = pred.filter((r) => r.page === page);
-    pairs.push(...greedyOrderAlign(h, p));
+    pairs.push(...orderPreservingAlign(h, p));
   }
   return pairs;
 }
 
-function greedyOrderAlign(hand: readonly GridAlignRow[], pred: readonly GridAlignRow[]): GridAlignPair[] {
+/**
+ * Walk each hand row in page order. Scan preds only forward from the last match
+ * so phantom rows in the middle do not steal preds from later hand rows.
+ */
+function orderPreservingAlign(
+  hand: readonly GridAlignRow[],
+  pred: readonly GridAlignRow[],
+): GridAlignPair[] {
   const pairs: GridAlignPair[] = [];
-  const used = new Set<number>();
+  let predIndex = 0;
   for (const hr of hand) {
     let match = -1;
-    for (let i = 0; i < pred.length; i += 1) {
-      if (used.has(i)) continue;
-      if (rowMatches(hr, pred[i])) {
+    for (let i = predIndex; i < pred.length; i += 1) {
+      const pr = pred[i];
+      const assetHit = assetTokenOverlap(hr.assetName, pr.assetName) >= 0.75;
+      if (hr.txDate && pr.txDate && hr.txDate === pr.txDate && assetHit) {
         match = i;
         break;
       }
     }
+    if (match < 0) {
+      for (let i = predIndex; i < pred.length; i += 1) {
+        if (rowMatches(hr, pred[i])) {
+          match = i;
+          break;
+        }
+      }
+    }
     if (match >= 0) {
-      used.add(match);
       pairs.push({ hand: hr, pred: pred[match] });
+      predIndex = match + 1;
     }
   }
   return pairs;

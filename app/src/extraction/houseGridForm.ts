@@ -1345,6 +1345,17 @@ function pageRows(page: HouseGridPageInput, dateContext: GridFormDateContext): {
         }
       }
     }
+    if (!tradeDate) {
+      for (const box of inBand) {
+        if (box.x0 < tradeLeft - 4 || box.x1 > tradeRight + 2) continue;
+        if (box.x0 >= tradeRight) continue;
+        const iso = parseLooseDate(box.text);
+        if (!iso) continue;
+        tradeDate = iso;
+        tradeRaw = box.text.trim();
+        break;
+      }
+    }
     // A "26" read as "25" is a year behind the notification, not a 2025 trade.
     if (tradeDate && notifDate && tradeDate.slice(0, 4) === String(Number(notifDate.slice(0, 4)) - 1)) {
       const snapped = `${notifDate.slice(0, 4)}-${tradeDate.slice(5)}`;
