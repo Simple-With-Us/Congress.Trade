@@ -314,6 +314,37 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(report._is_bind_descendant("/srv/database", "/srv/data"))
         self.assertTrue(report._is_bind_descendant("/srv/app/data", "/srv/app"))
 
+    def test_partial_du_line_is_marked_and_not_ranked(self) -> None:
+        sizes = report.parse_bind_sizes("partial\t500\t/srv/app\n40\t/srv/db\n")
+        self.assertEqual(sizes["/srv/app"], (500, "partial"))
+        self.assertEqual(sizes["/srv/db"], (40, ""))
+        self.assertEqual(report.bind_bytes_total(sizes), 540)
+
+    def test_nested_binds_are_not_ranked_twice(self) -> None:
+        sizes = {"/srv/app": (600, ""), "/srv/app/data": (200, ""), "/srv/db": (5, "partial")}
+        self.assertEqual(report.bind_roots(sizes), ["/srv/app", "/srv/db"])
+
+    def test_partial_previous_is_not_a_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prev = Path(tmp) / "prev.json"
+            prev.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "volumes": [],
+                        "bind_mounts": [
+                            {"source": "/srv/app", "bytes": 10, "size_error": "partial"},
+                            {"source": "/srv/db", "bytes": 10, "size_error": ""},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sizes, _ = report.load_previous(prev)
+        assert sizes is not None
+        self.assertIsNone(sizes[("bind", "/srv/app")])
+        self.assertEqual(sizes[("bind", "/srv/db")], 10)
+
     def test_mapping_orphans_and_growth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -695,6 +726,7 @@ class ShellTests(unittest.TestCase):
             payload = json.loads((root / "state" / "latest.json").read_text(encoding="utf-8"))
         by_source = {row["source"]: row for row in payload["bind_mounts"]}
         self.assertEqual(by_source[str(kept)]["bytes"], 4096)
+        self.assertEqual(by_source[str(kept)]["size_error"], "partial")
         self.assertIsNone(by_source[str(empty)]["bytes"])
         self.assertEqual(by_source[str(empty)]["size_error"], "error")
         self.assertEqual(payload["totals"]["bind_bytes"], 4096)

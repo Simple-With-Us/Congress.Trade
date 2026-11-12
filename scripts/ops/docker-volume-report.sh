@@ -118,10 +118,14 @@ size_binds() {
       continue
     fi
     # GNU du prints a total and exits nonzero when part of the tree is unreadable.
-    # Keep that total. Record an error only when du prints nothing.
-    out="$(LC_ALL=C du -sB1 -- "$src" 2>/dev/null)" || true
-    if [[ -n "$out" ]]; then
+    # Keep that total but mark it partial so it is never ranked as growth.
+    # Record an error only when du prints nothing.
+    local rc=0
+    out="$(LC_ALL=C du -sB1 -- "$src" 2>/dev/null)" || rc=$?
+    if [[ -n "$out" && "$rc" -eq 0 ]]; then
       printf '%s\n' "$out" >> "$dir/bind-sizes.txt"
+    elif [[ -n "$out" ]]; then
+      printf 'partial\t%s\n' "$out" >> "$dir/bind-sizes.txt"
     else
       printf 'error\t%s\n' "$src" >> "$dir/bind-sizes.txt"
     fi

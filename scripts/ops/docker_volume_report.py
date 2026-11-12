@@ -483,6 +483,11 @@ def parse_bind_sizes(text: str) -> dict[str, tuple[int | None, str]]:
                 raise SnapshotError("duplicate bind size")
             sizes[source] = (None, kind)
             continue
+        error = ""
+        if line.startswith("partial\t"):
+            # du printed a total but exited nonzero: a lower bound, not a size.
+            error = "partial"
+            line = line.split("\t", 1)[1]
         if "\t" in line:
             raw_size, path = line.split("\t", 1)
         else:
@@ -495,7 +500,7 @@ def parse_bind_sizes(text: str) -> dict[str, tuple[int | None, str]]:
         source = normalize_bind_source(path)
         if source in sizes:
             raise SnapshotError("duplicate bind size")
-        sizes[source] = (int(raw_size.strip()), "")
+        sizes[source] = (int(raw_size.strip()), error)
     return sizes
 
 
@@ -526,12 +531,19 @@ def _is_bind_descendant(path: str, parent: str) -> bool:
     return path.startswith(prefix)
 
 
-def bind_bytes_total(bind_sizes: dict[str, tuple[int | None, str]]) -> int:
+def bind_roots(bind_sizes: dict[str, tuple[int | None, str]]) -> list[str]:
+    """Sized sources that do not sit inside another sized source."""
     known = [source for source, (nbytes, _error) in bind_sizes.items() if isinstance(nbytes, int)]
+    return sorted(
+        source
+        for source in known
+        if not any(_is_bind_descendant(source, other) for other in known if other != source)
+    )
+
+
+def bind_bytes_total(bind_sizes: dict[str, tuple[int | None, str]]) -> int:
     total = 0
-    for source in known:
-        if any(_is_bind_descendant(source, other) for other in known if other != source):
-            continue
+    for source in bind_roots(bind_sizes):
         nbytes = bind_sizes[source][0]
         if isinstance(nbytes, int):
             total += nbytes
@@ -643,8 +655,16 @@ def build_report(
         ("volume", str(row["name"])): row["bytes"] if isinstance(row["bytes"], int) else None
         for row in volume_rows
     }
+    # Growth uses the same non-overlapping roots as the bind total, so a nested
+    # source is not ranked on top of the parent that already contains it.
+    # Partial du totals are left out of the ranking.
+    roots = set(bind_roots(bind_sizes))
     for row in bind_rows:
-        current_sizes[("bind", str(row["source"]))] = row["bytes"] if isinstance(row["bytes"], int) else None
+        source = str(row["source"])
+        if source not in roots:
+            continue
+        nbytes = row["bytes"] if isinstance(row["bytes"], int) and row["size_error"] != "partial" else None
+        current_sizes[("bind", source)] = nbytes
 
     return {
         "version": 1,
@@ -722,7 +742,10 @@ def load_previous(path: Path | None) -> tuple[dict[tuple[str, str], int | None] 
     for item in binds:
         if not isinstance(item, dict) or not isinstance(item.get("source"), str):
             raise SnapshotError("previous JSON bind mount was unparsed")
-        sizes[("bind", item["source"])] = _previous_bytes(item.get("bytes"))
+        nbytes = _previous_bytes(item.get("bytes"))
+        if item.get("size_error") == "partial":
+            nbytes = None
+        sizes[("bind", item["source"])] = nbytes
     generated = data.get("generated_at")
     if generated is not None and not isinstance(generated, str):
         raise SnapshotError("previous JSON timestamp was unparsed")
