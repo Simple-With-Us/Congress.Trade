@@ -56,6 +56,8 @@ const DIMINUTIVE_GROUPS: readonly (readonly string[])[] = [
   ['thomas', 'tom', 'thom'],
   ['daniel', 'dan', 'danny'],
   ['christopher', 'chris'],
+  ['peter', 'pete'],
+  ['douglas', 'doug'],
   ['michael', 'mike'],
   ['joseph', 'joe'],
   ['edward', 'ed', 'ted'],

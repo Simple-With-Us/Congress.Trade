@@ -11,8 +11,8 @@ Guideline 2.1(b) — Performance: In-App Purchases (Error Handling & Subscriptio
 - In PremiumSheet, StoreKit product catalog load failures and pre-charge transaction errors are separated from post-charge server transaction processing.
 - User-facing error messages provide clear, actionable guidance and always point users to "Restore Purchases" if an entitlement is already active.
 - Both subscription items are submitted with this version in the "Premium" subscription group with localized metadata and screenshots:
-  - trade.congress.premium.monthly — Premium Monthly ($5/mo, 2-week trial)
-  - trade.congress.premium.annual — Premium Annual ($50/yr, 2-week trial)
+  - trade.congress.premium.monthly — Premium Monthly ($8.99/mo, 1-week free trial)
+  - trade.congress.premium.annual — Premium Annual ($79.99/yr, 1-week free trial)
 
 Guideline 5.1.1(v) — Registration before purchase & Account deletion
 - Premium can be purchased without an account; browsing and paywall access are fully available without signing in.

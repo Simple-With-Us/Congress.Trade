@@ -25,20 +25,21 @@ cd "$SCRIPT_DIR/../app"
 
 echo "==> Node: $(node --version 2>/dev/null || echo 'not found')  npm: $(npm --version 2>/dev/null || echo 'not found')"
 
-# Parse the optional machine-level key file as inert data (never source it),
-# validate complete identity pairs, map canonical CT names to the runtime names,
+# Read the Infisical machine identities from the explicit environment (cloud and
+# CI use only this) or, on a Mac with the CLI installed, from `fleet-secrets get`.
+# Validate complete identity pairs, map canonical CT names to the runtime names,
 # preserve non-empty managed app/.dev.vars values, and retain only the documented
 # early-init/local selectors from the explicit environment. This runs before the
 # expensive install so malformed bootstrap state fails closed immediately.
 unset CT_LOCAL_BOOTSTRAP_TEST_MODE
 unset CT_LOCAL_BOOTSTRAP_TEST_APP_DIR
 unset CT_LOCAL_BOOTSTRAP_TEST_DEV_VARS_FILE
-unset CT_LOCAL_BOOTSTRAP_TEST_GLOBAL_KEYS_FILE
-# Cloud VMs do not have ~/.secrets/global-api-keys. Missing identities are
+unset CT_LOCAL_BOOTSTRAP_TEST_FLEET_SECRETS_BIN
+# Cloud VMs have no fleet-secrets CLI. Missing identities are
 # expected; do not fail the whole session setup for a keyless checkout.
 node "$SCRIPT_DIR/merge-local-dev-vars.mjs" || echo "==> Infisical local bootstrap skipped (ok in keyless cloud)"
 
-# @jaywedgeworth22/congress-trading-shared is a public repo consumed as a
+# Simple-With-Us/congress-trading-shared (@jaywedgeworth22/congress-trading-shared npm name) is a public repo consumed as a
 # tokenless git dependency. The vendored local copy at app/vendor/ is the
 # canonical resolution — no npm registry, no NODE_AUTH_TOKEN, no .npmrc entry.
 # Deterministic install from the committed lockfile (app/package-lock.json).

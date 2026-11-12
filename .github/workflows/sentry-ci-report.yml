@@ -3,7 +3,7 @@ name: Sentry CI Report
 # Fleet-wide CI observability: receives completion events from the observed
 # workflows, but only reserves a runner for failures or scheduled check-ins.
 # It reports those actionable events to the shared `fleet-infra` Sentry project
-# (org jays-services). ADDITIVE ONLY — this file must never modify the behavior
+# (org simple-with-us). ADDITIVE ONLY — this file must never modify the behavior
 # of the workflows it observes.
 #
 # Two independent signals per completed run:
@@ -18,7 +18,7 @@ name: Sentry CI Report
 #      copy): the fleet-infra project is shared across repos, and this repo
 #      shares workflow names ("CI", "Deploy", "Security") with Socratic.Trade,
 #      so without `app` a "CI" failure here would dedup into the same Sentry
-#      issue as a "CI" failure there. See AGENT-SYNC.md "Observability".
+#      issue as a "CI" failure there. See FLEET-PROTOCOL.md "Observability".
 #   2. On event == schedule (i.e. the completed run was a cron-triggered
 #      run of a workflow that defines `schedule:`): a Sentry Crons check-in
 #      (ok on success, error on failure) with an upsert monitor_config whose
@@ -107,7 +107,7 @@ jobs:
         # script rather than whatever version lives on an arbitrary (possibly fork/PR) branch that
         # triggered the observed workflow. Do not add `ref: ${{ github.event.workflow_run.head_sha }}`
         # without re-reviewing the security implications.
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Report failure + cron check-in to Sentry fleet-infra
         shell: bash

@@ -70,10 +70,16 @@ function spxOnOrBeforePriceDateSql(dateExpr: string): string {
  * figure.  Materialized once per query (securities_ref is small) instead of a
  * correlated lookup per trade row.
  */
-const PRICE_ANCHOR_CTE_BODY =
-  'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
-  `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
-  'FROM securities_ref r WHERE r.current_price IS NOT NULL AND r.current_price > 0';
+/** Materialized once per query; excludes tickers whose current price is too old for excess-return math. */
+export function buildPriceAnchorCteBody(priceFreshThrough: string): string {
+  const through = priceFreshThrough.slice(0, 10);
+  return (
+    'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
+    `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
+    'FROM securities_ref r WHERE r.current_price IS NOT NULL AND r.current_price > 0 ' +
+    `AND r.current_price_date IS NOT NULL AND r.current_price_date >= '${through}'`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // 1. Summary — KPI strip
@@ -705,7 +711,7 @@ export function buildLateFilersQuery(p: CommonFilters & { limit?: number }): Bui
  * is not. Skipped per perf constraint, not an oversight.
  */
 export function buildMemberPerformanceLeaderboardQuery(
-  p: CommonFilters & { limit?: number; minTrades?: number },
+  p: CommonFilters & { limit?: number; minTrades?: number; priceFreshThrough: string },
 ): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const limit = clampLimit(p.limit, 20, 100);
@@ -740,7 +746,7 @@ export function buildMemberPerformanceLeaderboardQuery(
     ...where,
   ];
   const sql =
-    `WITH px AS MATERIALIZED (${PRICE_ANCHOR_CTE_BODY}) ` +
+    `WITH px AS MATERIALIZED (${buildPriceAnchorCteBody(p.priceFreshThrough)}) ` +
     'SELECT t.filer_id AS filer_id, MAX(COALESCE(fl.display_name, fl.full_name)) AS full_name, MAX(fl.party) AS party, ' +
     'MAX(fl.photo_url) AS photo_url, ' +
     'MAX(px.price_date) AS prices_as_of, ' +
@@ -795,7 +801,10 @@ export function buildConvictionMemberLinksQuery(tickers: string[], p: CommonFilt
  * ?source=primary won't let seed-dataset buys leak in). Only politicians with >= 5
  * scored buys are returned. Caller must chunk `filerIds` under D1's 100-bind cap.
  */
-export function buildMemberSkillQuery(filerIds: string[], p: CommonFilters): BuiltQuery {
+export function buildMemberSkillQuery(
+  filerIds: string[],
+  p: CommonFilters & { priceFreshThrough: string },
+): BuiltQuery {
   // Same as-of-aligned exit legs as the performance leaderboard (see PRICE_ANCHOR_CTE_BODY).
   const EXCESS =
     '((px.current_price / p.price_at_filing) - 1.0) - ((px.spx_now / p.spx_at_filing) - 1.0)';
@@ -820,7 +829,7 @@ export function buildMemberSkillQuery(filerIds: string[], p: CommonFilters): Bui
   where.push(`t.filer_id IN (${filerIds.map(() => '?').join(', ')})`);
   for (const id of filerIds) params.push(id);
   const sql =
-    `WITH px AS MATERIALIZED (${PRICE_ANCHOR_CTE_BODY}) ` +
+    `WITH px AS MATERIALIZED (${buildPriceAnchorCteBody(p.priceFreshThrough)}) ` +
     'SELECT t.filer_id AS filer_id, COUNT(*) AS scored, ' +
     `SUM(CASE WHEN ${EXCESS} > 0 THEN 1 ELSE 0 END) AS wins, ` +
     `AVG(${EXCESS}) AS avg_excess ` +
@@ -880,12 +889,47 @@ export function buildTickerBacktestCohortQuery(
 }
 
 /**
+ * CT-2459: price series for a backtest, bounded to the cohort. Entry bars
+ * are "close on or before tx_date", so the only pre-cohort bar ever read is
+ * the last one on/before the earliest cohort date. Previously both call
+ * sites loaded the ticker's ENTIRE price history plus the ENTIRE spx_eod
+ * table on every cache miss. `pricedDays` keeps its full-coverage meaning
+ * via {@link buildPricedDaysCountQuery}.
+ */
+export function buildBacktestPriceQuery(ticker: string, cohortMinDate: string): BuiltQuery {
+  return {
+    sql:
+      'SELECT date, close FROM price_eod WHERE ticker = ? AND (' +
+      'date >= ? OR date = (SELECT MAX(date) FROM price_eod WHERE ticker = ? AND date <= ?)' +
+      ') ORDER BY date ASC',
+    params: [ticker, cohortMinDate, ticker, cohortMinDate],
+  };
+}
+
+export function buildBacktestSpxQuery(cohortMinDate: string): BuiltQuery {
+  return {
+    sql:
+      'SELECT date, close FROM spx_eod WHERE ' +
+      'date >= ? OR date = (SELECT MAX(date) FROM spx_eod WHERE date <= ?) ' +
+      'ORDER BY date ASC',
+    params: [cohortMinDate, cohortMinDate],
+  };
+}
+
+export function buildPricedDaysCountQuery(ticker: string): BuiltQuery {
+  return {
+    sql: 'SELECT COUNT(*) AS n FROM price_eod WHERE ticker = ?',
+    params: [ticker],
+  };
+}
+
+/**
  * Candidate trades for the committee conflict-of-interest signal: trades by a
  * politician WITH committees, in a resolved sector. The route applies the curated
  * committee→sector map (see committeeConflict) to keep only true conflicts, so
  * this just pre-filters to rows that could possibly conflict.
  */
-export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number }): BuiltQuery {
+export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number; offset?: number }): BuiltQuery {
   const { where, params } = buildCommonFilters(p);
   const allWhere = [
     ...where,
@@ -896,6 +940,7 @@ export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number
     "fl.committees <> '[]'",
   ];
   const limit = clampLimit(p.limit, 200, 2000);
+  const offset = Math.max(0, Math.floor(Number(p.offset) || 0));
   const sql =
     'SELECT t.id AS id, t.ticker AS ticker, t.tx_type AS tx_type, t.tx_date AS tx_date, ' +
     `t.filer_id AS filer_id, COALESCE(fl.display_name, fl.full_name) AS full_name, ${CHAMBER_EXPR} AS chamber, fl.party AS party, ` +
@@ -903,7 +948,9 @@ export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number
     ANALYTICS_FROM_JOINS +
     'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
     whereSql(allWhere) +
-    `ORDER BY t.tx_date DESC LIMIT ${limit}`;
+    // cursor_seq tiebreak: stable order so callers can page candidates
+    // (CT-2459) instead of fetching the full 2000-row window up front.
+    `ORDER BY t.tx_date DESC, t.cursor_seq DESC LIMIT ${limit} OFFSET ${offset}`;
   return { sql, params };
 }
 
@@ -1006,23 +1053,39 @@ export function buildMemberStatsQuery(filerId: string, p: CommonFilters): BuiltQ
  */
 export function buildMemberPerformanceQuery(filerId: string, p: CommonFilters): BuiltQuery {
   const { where, params } = memberFilters(filerId, p);
+  // CT-2459: the dual aggregator only ever considers buy rows (isBuyRow in
+  // compute.ts) — sells/exchanges contributed nothing but row materialization
+  // (up to ~22k rows for a prolific filer on every uncached /member hit).
+  // Filter to the exact isBuyRow set in SQL; buyCount/tradeCount outputs are
+  // unchanged. (pricesAsOf now also reflects scored buy rows only, matching
+  // its documented meaning.)
+  const buyWhere = [...where, "UPPER(t.tx_type) IN ('B', 'P', 'PURCHASE', 'BUY')"];
   // Same filing anchor as the member-performance leaderboard.
   const ANCHOR_DATE = 'COALESCE(f.filed_date, f.first_seen_at, t.tx_date)';
+  // CT-2459: materialize the per-ticker price anchor ONCE (like the
+  // leaderboard's PRICE_ANCHOR CTE) instead of 2 correlated spx_eod
+  // subqueries per trade row. No freshness filter here — freshness is
+  // applied in the aggregator, exactly as before; the spx fallback for a
+  // missing price date is the same COALESCE-latest-close expression.
   const sql =
+    'WITH px AS MATERIALIZED (' +
+    'SELECT r.ticker AS ticker, r.current_price AS current_price, r.current_price_date AS price_date, ' +
+    `${spxOnOrBeforePriceDateSql('r.current_price_date')} AS spx_now ` +
+    'FROM securities_ref r) ' +
     'SELECT t.is_option AS is_option, t.tx_type AS tx_type, ' +
     'txp.price_at_trade AS price_at_trade, txp.spx_at_trade AS spx_at_trade, ' +
     'txp.price_at_filing AS price_at_filing, txp.spx_at_filing AS spx_at_filing, ' +
-    'sr.current_price AS current_price, sr.current_price_date AS current_price_date, ' +
+    'px.current_price AS current_price, px.price_date AS current_price_date, ' +
     // S&P close on or before the ticker's own current-price date, so both exit
     // legs end on the same as-of date; falls back to the latest close (old behaviour)
     // when the ticker has no price date or predates the S&P series.
-    `${spxOnOrBeforePriceDateSql('sr.current_price_date')} AS spx_now, ` +
+    'px.spx_now AS spx_now, ' +
     `(julianday('now') - julianday(${ANCHOR_DATE})) AS elapsed_days_since_filing, ` +
     `${MID} AS est_volume ` +
     ANALYTICS_FROM_JOINS +
     'LEFT JOIN tx_performance txp ON txp.tx_id = t.id ' +
-    'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
-    whereSql(where);
+    'LEFT JOIN px ON px.ticker = t.ticker ' +
+    whereSql(buyWhere);
   return { sql, params };
 }
 

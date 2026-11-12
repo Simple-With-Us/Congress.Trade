@@ -51,8 +51,8 @@ import {
 import { AppleRedeemError, jwsFromInput, requireAppleIapEnabled, verifyAppleRedemption } from './appleRedeem.ts';
 import { clientRedeemWouldResurrectRevoked, getAppleSubscription, upsertAppleSubscription } from './appleSubscriptions.ts';
 
-/** Default free trial when STRIPE_TRIAL_DAYS is unset: 14 days (2 weeks). */
-const DEFAULT_TRIAL_DAYS = 14;
+/** Default free trial when STRIPE_TRIAL_DAYS is unset: 7 days (1 week), matching web/iOS marketing copy. */
+const DEFAULT_TRIAL_DAYS = 7;
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 
 /**
@@ -245,8 +245,12 @@ export function buildBillingRouter(): Hono<{ Bindings: Env }> {
         latestTransactionId: transaction.transactionId ?? null,
         purchaseDate: transaction.purchaseDate != null ? new Date(Number(transaction.purchaseDate)).toISOString() : null,
         expiresDate: transaction.expiresDate != null ? new Date(Number(transaction.expiresDate)).toISOString() : null,
+       redeemGuard: true,
       });
-      if (!upserted.ok) {
+      if (upserted.ok === false) {
+        if (upserted.reason === 'guarded_status') {
+          return c.json({ error: 'this Apple subscription was refunded or revoked' }, 400);
+        }
         return c.json({ error: 'this Apple subscription is already linked to a different account' }, 409);
       }
       // The deprecated path grants Premium just like redeem_apple_purchase, so it

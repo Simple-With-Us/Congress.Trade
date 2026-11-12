@@ -47,7 +47,12 @@ export function getDenoHttpClient(proxyUrl?: string): unknown | undefined {
       client = Deno.createHttpClient({ proxy: { url: cleanUrl } });
       clientCache.set(cleanUrl, client);
     } catch (err) {
-      console.warn(`proxyFetch: failed to create Deno HTTP client for ${cleanUrl}:`, (err as Error).message);
+      // The proxy URL can carry credentials as userinfo; never log them.
+      const redact = (s: string) => s.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
+      console.warn(
+        `proxyFetch: failed to create Deno HTTP client for ${redact(cleanUrl)}:`,
+        redact((err as Error).message ?? String(err)),
+      );
       return undefined;
     }
   }
@@ -56,7 +61,13 @@ export function getDenoHttpClient(proxyUrl?: string): unknown | undefined {
 
 /**
  * Wraps a fetch function to route outbound requests through the specified proxy URL.
- * If no proxy is configured or the proxy client cannot be initialized, returns the underlying fetch.
+ * If no proxy is configured, returns the underlying fetch.  If a proxy IS
+ * configured but no proxied client can be created in the Deno runtime, the
+ * returned fetch rejects rather than silently using the underlying fetch —
+ * that fallback would send the request over direct egress while the caller
+ * believes it is proxied (health probes would measure, and report healthy,
+ * the wrong path).  Outside Deno (Node tooling and tests) there is no proxy
+ * client mechanism at all, so the pass-through stands there.
  */
 export function createProxiedFetch(
   proxyUrl?: string,
@@ -67,7 +78,17 @@ export function createProxiedFetch(
   if (!cleanUrl) return baseFetch;
 
   const client = getDenoHttpClient(cleanUrl);
-  if (!client) return baseFetch;
+  if (!client) {
+    if (typeof Deno !== 'undefined') {
+      const redact = (s: string) => s.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, '$1[redacted]@');
+      return async function proxiedFetchUnavailable(): Promise<Response> {
+        throw new Error(
+          `proxyFetch: no Deno HTTP client available for proxy ${redact(cleanUrl)}; refusing to fall back to direct egress`,
+        );
+      };
+    }
+    return baseFetch;
+  }
 
   return async function proxiedFetch(
     input: RequestInfo | URL,

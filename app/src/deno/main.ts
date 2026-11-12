@@ -6,18 +6,33 @@ import { DurableQueueAdapter } from './durableQueue.ts';
 import app from '../index.ts';
 import type { Env, QueueMessage } from '../shared/types.ts';
 import { resolveSecret, resolveSecrets, refreshSecrets } from '../secrets/infisical.ts';
+import { initSettings, startSettingsRefresh, appSettings } from '../settings/settingsService.ts';
 import { resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import { resolveDenoCostProfile } from './costProfile.ts';
 import { createRuntimeQueueHandlers } from './runtimeHandlers.ts';
 import { runScheduledTick } from './scheduledTick.ts';
-import { registerDailyLaneCrons, resolveDailyLaneDeadlineMs } from './cronLanes.ts';
+import {
+  registerDailyLaneCrons,
+  registerFrequentLaneCrons,
+  resolveDailyLaneDeadlineMs,
+} from './cronLanes.ts';
 import { withThirdPartyTelemetry } from '../shared/thirdPartyTelemetry.ts';
 import { resolveProductionSentryEnv } from '../shared/sentryRuntime.ts';
 import { datadogCaptureException, initProductionDatadog } from '../shared/datadog.ts';
 import { resolveProductionDatadogEnv } from '../shared/datadogRuntime.ts';
-import { captureException, initProductionSentry } from '#sentry';
+import { captureException, flushSentry, initProductionSentry } from '#sentry';
+import { stampTcpPeer } from '../security/originLock.ts';
 import { isExpectedPdfParseNoise } from '../shared/pdfParseErrors.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
+import { applySqliteConnectionPragmas, libsqlClientOptions } from './sqliteClient.ts';
+import { buildAdminMigrateStatements } from '../admin/migrateStatements.ts';
+import { executeAdminSchemaMigrations } from '../admin/schemaMigrationRunner.ts';
+import {
+  clearCronTickOverrun,
+  isDenoCronTickHardDeadline,
+  recordCronTickOverrun,
+  tickOutcomeShouldRecord,
+} from '../shared/cronDeadlineSignal.ts';
 
 // 1. Initialize the KV namespace used for configuration and Infisical caching.
 // Deno KV Connect does not support queues, so queue bindings are attached only
@@ -90,10 +105,24 @@ const secretEnv = {
   CONFIG_KV: configKvShim as any,
 } as Env;
 
-// 2. Resolve Infisical secrets at boot, then init Sentry for this Coolify
-// container (Deno-in-Docker on Hetzner).  Not Deno Deploy — no deployctl,
-// no Deploy APIs.  Missing Coolify/Infisical SENTRY_DSN is fail-soft.
-await refreshSecrets(secretEnv);
+// 2. Resolve Infisical secrets at boot, then load the typed app-settings
+// snapshot (Infisical SOT: startup load, in-memory cache, background refresh,
+// write-through on admin save — see INFISICAL.md).  Boot fails fast here if
+// the resolver is misconfigured; individual knobs stay fail-soft with safe
+// defaults.  The 5s abort bounds a hung Infisical connection so Coolify boot
+// cannot stall forever on a fetch that never returns (OPS-1055, from PR #2962).
+await refreshSecrets(secretEnv, { signal: AbortSignal.timeout(5_000) });
+const settings = await initSettings(secretEnv);
+startSettingsRefresh(secretEnv);
+// SIGHUP = on-demand settings reload (canonical "Reload settings" path).
+try {
+  Deno.addSignalListener('SIGHUP', () => {
+    settings.refresh(secretEnv).catch((err) => {
+      console.error('settings.SIGHUP refresh failed (keeping last-known-good):', (err as Error).message);
+    });
+  });
+} catch {}
+console.log(`App settings initialized (${settings.keys().length} knobs from Infisical/env)`);
 const sentryResolved = await resolveProductionSentryEnv(secretEnv, resolveSecret);
 const sentryBoot = initProductionSentry(sentryResolved);
 console.log(
@@ -126,7 +155,7 @@ const proxySecrets = await resolveSecrets(secretEnv, [
 const resolvedProxyUrl = resolveResidentialProxyUrl({
   ...secretEnv,
   ...proxySecrets,
-});
+}, { allowDefault: false });
 if (resolvedProxyUrl && cachedEnvValues) {
   cachedEnvValues['RESIDENTIAL_PROXY_URL'] = resolvedProxyUrl;
   console.log('Residential proxy initialized from Infisical for Senate/House scraping');
@@ -144,25 +173,49 @@ if (!tursoUrl || tursoUrl.includes('dummy-url')) {
   console.warn("WARNING: TURSO_DATABASE_URL is missing after resolving secrets. The app is falling back to a dummy URL, which means database connections will fail. Ensure INFISICAL_APP_CLIENT_ID and INFISICAL_APP_CLIENT_SECRET are set in Coolify.");
 }
 
-// 3. Initialize Turso DB Shim
-const libsqlClient = createClient({
-  url: tursoUrl || 'libsql://dummy-url.turso.io', // Provide a valid dummy URL to prevent crash at boot
-  authToken: tursoToken,
-});
+// 3. Initialize Turso DB Shim.
+// File URLs (production /data/congress-trade/db.sqlite) use one connection
+// and a per-connection busy timeout. See sqliteClient.ts (CONGRESS-TRADE-1M).
+const libsqlClient = createClient(libsqlClientOptions(
+  tursoUrl || 'libsql://dummy-url.turso.io', // Provide a valid dummy URL to prevent crash at boot
+  tursoToken,
+));
 
-// Execute connection pragmas for performance and concurrency resilience
-async function initSqlite(client: typeof libsqlClient) {
-  await client.execute("PRAGMA journal_mode = WAL;").catch(() => {});
-  await client.execute("PRAGMA foreign_keys = ON;").catch(() => {});
-  await client.execute("PRAGMA busy_timeout = 10000;").catch(() => {});
-  await client.execute("PRAGMA synchronous = NORMAL;").catch(() => {});
-  await client.execute("PRAGMA cache_size = -64000;").catch(() => {});
-  await client.execute("PRAGMA mmap_size = 268435456;").catch(() => {});
-}
-await initSqlite(libsqlClient);
+await applySqliteConnectionPragmas(libsqlClient);
 
 const dbShim = new D1DatabaseShim(libsqlClient);
 tursoDbShim = dbShim;
+
+function startupSchemaMigrateDisabled(): boolean {
+  const flag = Deno.env.get('CT_DISABLE_STARTUP_SCHEMA_MIGRATE')
+    ?? Deno.env.get('DENO_DISABLE_STARTUP_SCHEMA_MIGRATE');
+  return flag === '1' || flag === 'true' || flag === 'TRUE';
+}
+
+if (!startupSchemaMigrateDisabled()) {
+  try {
+    console.log('[startup] applying idempotent schema migrations…');
+    const migrateResult = await executeAdminSchemaMigrations(
+      dbShim as unknown as D1Database,
+      buildAdminMigrateStatements(),
+    );
+    if (migrateResult.failed.length > 0) {
+      console.error(
+        `[startup] schema migrate finished with ${migrateResult.failed.length} failed statement(s); ` +
+          'see [schema-migrate] logs',
+      );
+    } else {
+      console.log(
+        `[startup] schema migrate ok (applied=${migrateResult.applied.length}, ` +
+          `skipped=${migrateResult.skipped.length})`,
+      );
+    }
+  } catch (err) {
+    console.error('[startup] schema migrate threw:', (err as Error).message);
+  }
+} else {
+  console.log('[startup] schema migrate disabled (CT_DISABLE_STARTUP_SCHEMA_MIGRATE)');
+}
 const durableQueueDb = dbShim as unknown as D1Database;
 const ingestQueueShim = new DurableQueueAdapter<QueueMessage>(durableQueueDb, 'ingest');
 const deliveryQueueShim = new DurableQueueAdapter<QueueMessage>(durableQueueDb, 'delivery');
@@ -224,7 +277,11 @@ function buildEnv(): Env {
 }
 
 const durableQueueHandlers = createRuntimeQueueHandlers();
-const costProfile = resolveDenoCostProfile(Deno.env);
+// Tick cost profile knobs come from Infisical first (settings snapshot),
+// with process env as the legacy fallback — never direct env reads alone.
+const costProfile = resolveDenoCostProfile({
+  get: (k: string) => settings.get(k) ?? Deno.env.get(k) ?? undefined,
+});
 
 // Start Cron Tasks. Deno Deploy does not run the Cloudflare Worker
 // `scheduled()` entrypoint, so the live filing watcher and durable outbox
@@ -259,10 +316,8 @@ if (!costProfile.disableInternalCron) {
   Deno.cron('Worker scheduled tasks', costProfile.cronSchedule, async () => {
     if (tickInFlight) {
       const heldMs = Date.now() - tickInFlightSinceMs;
-      const stuckMinutes = (() => {
-        const n = Number.parseInt(Deno.env.get('CT_TICK_STUCK_MINUTES') || '', 10);
-        return Number.isFinite(n) && n >= 1 ? Math.min(n, 60) : 10;
-      })();
+      // Stuck detection (Infisical knob CT_TICK_STUCK_MINUTES, default 10).
+      const stuckMinutes = settings.getInt('CT_TICK_STUCK_MINUTES', 10, 60);
       consecutiveOverlapTicks += 1;
       sentryLoggerWarn('cron.tick_overlap', {
         runtime: 'deno',
@@ -279,6 +334,14 @@ if (!costProfile.disableInternalCron) {
           `Deno cron tick stuck for ${Math.round(heldMs / 1000)}s — force-releasing tickInFlight so subsequent ticks can run`,
         );
         console.error('cron.tick_stuck', { heldMs, consecutive: consecutiveOverlapTicks });
+        try {
+          await recordCronTickOverrun(buildEnv(), {
+            deadlineMs: settings.getInt('CT_TICK_DEADLINE_MS', 45_000),
+            reason: err.message,
+          });
+        } catch (recordErr) {
+          console.error('cron overrun signal failed:', recordErr);
+        }
         captureException(err, {
           tags: { cron: 'deno-tick', class: 'stuck-force-released' },
           extra: { heldMs, consecutive: consecutiveOverlapTicks },
@@ -300,12 +363,9 @@ if (!costProfile.disableInternalCron) {
     consecutiveOverlapTicks = 0;
     // The tick deadline aborts the tick pipeline instead of abandoning it:
     // lanes stop at the next boundary and the queue drain stops claiming.
-    // Default 45s (Deno Deploy free-tier heritage); the Oracle container
-    // raises it via CT_TICK_DEADLINE_MS so bigger drain batches fit one tick.
-    const tickDeadlineMs = (() => {
-      const n = Number.parseInt(Deno.env.get('CT_TICK_DEADLINE_MS') || '', 10);
-      return Number.isFinite(n) && n >= 10_000 ? Math.min(n, 14 * 60_000) : 45_000;
-    })();
+    // Default 45s; the Oracle container raises it via CT_TICK_DEADLINE_MS
+    // (Infisical knob) so bigger drain batches fit one tick.
+    const tickDeadlineMs = Math.max(10_000, Math.min(settings.getInt('CT_TICK_DEADLINE_MS', 45_000), 14 * 60_000));
     const tickAbort = new AbortController();
     try {
       const env = buildEnv();
@@ -316,13 +376,22 @@ if (!costProfile.disableInternalCron) {
         new Date(),
         // Daily work moved to dedicated staggered lane crons (cronLanes.ts)
         // with multi-minute deadlines; the 45s tick must not run or starve it.
-        { signal: tickAbort.signal, includeDailyJobs: false },
+        {
+          signal: tickAbort.signal,
+          includeDailyJobs: false,
+          includeLatencyLanes: false,
+          // CT-2459: the singleton must outlive the longest legal tick, or a
+          // raised CT_TICK_DEADLINE_MS lets the lock expire mid-tick and a
+          // second tick runs concurrently on the single connection.
+          lockTtlMs: tickDeadlineMs + 30_000,
+        },
       ));
       let softTimeoutId: ReturnType<typeof setTimeout> | undefined;
       let hardTimeoutId: ReturnType<typeof setTimeout> | undefined;
 
-      // Soft abort 5s before hard deadline so active lanes stop claiming and return cleanly
-      const softDeadlineMs = Math.max(5000, tickDeadlineMs - 5000);
+      // Soft abort 20s before hard deadline so active lanes wind down before
+      // CONGRESS-TRADE-1B hard cutoff (latency lanes moved to dedicated crons).
+      const softDeadlineMs = Math.max(5000, tickDeadlineMs - 20000);
       softTimeoutId = setTimeout(() => {
         tickAbort.abort(new Error(`Deno cron tick nearing ${tickDeadlineMs}ms deadline`));
       }, softDeadlineMs);
@@ -336,6 +405,17 @@ if (!costProfile.disableInternalCron) {
 
       try {
         const result = await Promise.race([tickPromise, timeoutPromise]);
+        const overrunReason = tickOutcomeShouldRecord(result);
+        if (overrunReason) {
+          await recordCronTickOverrun(env, {
+            deadlineMs: tickDeadlineMs,
+            reason: overrunReason,
+          });
+        } else if (!result.skippedOverlap) {
+          // A finished tick is the recovery signal.  An overlap skip must
+          // not clear an open deadline episode it did not prove over.
+          await clearCronTickOverrun(env);
+        }
         if (result.skippedOverlap) {
           console.log('Deno tick skipped: another tick holds the singleton lock');
         } else if (result.aborted) {
@@ -355,12 +435,32 @@ if (!costProfile.disableInternalCron) {
         if (hardTimeoutId !== undefined) clearTimeout(hardTimeoutId);
       }
     } catch (err) {
-      console.error('Deno cron tick caught error:', err);
-      captureException(err, { tags: { cron: 'deno-tick' } });
-      datadogCaptureException(err, { cron: 'deno-tick' });
+      const message = err instanceof Error ? err.message : String(err);
+      const hardDeadline = isDenoCronTickHardDeadline(message);
+      if (hardDeadline) {
+        // Soft abort already stopped new work; the hard race is expected when a
+        // lane ignores the tick signal (CONGRESS-TRADE-1B).  Overrun KV + logs
+        // are enough — avoid a second Sentry exception on top of lane alerts.
+        console.warn('Deno cron tick hard deadline:', message);
+      } else {
+        console.error('Deno cron tick caught error:', err);
+        captureException(err, { tags: { cron: 'deno-tick' } });
+        datadogCaptureException(err, { cron: 'deno-tick' });
+      }
+      try {
+        await recordCronTickOverrun(buildEnv(), {
+          deadlineMs: settings.getInt('CT_TICK_DEADLINE_MS', 45_000),
+          reason: message,
+        });
+      } catch (recordErr) {
+        console.error('cron overrun signal failed:', recordErr);
+      }
     } finally {
       tickInFlight = false;
       tickInFlightSinceMs = 0;
+      try {
+        await flushSentry(2000);
+      } catch {}
     }
   });
 
@@ -370,6 +470,7 @@ if (!costProfile.disableInternalCron) {
   // multi-minute deadline, so a slow provider lane can no longer starve the
   // lanes behind it (the old single-stamp chain died at the tick's 45s).
   registerDailyLaneCrons(buildEnv, resolveDailyLaneDeadlineMs(Deno.env));
+  registerFrequentLaneCrons(buildEnv);
 } else {
   console.log(
     'Deno internal cron disabled (DENO_DISABLE_INTERNAL_CRON); ' +
@@ -388,7 +489,15 @@ const dummyCtx = {
 // Start HTTP Server
 const portStr = Deno.env.get('PORT');
 const port = portStr ? parseInt(portStr, 10) : 5000;
-Deno.serve({ port }, async (req) => {
+Deno.serve({ port }, async (req, info) => {
   const env = buildEnv();
-  return app.fetch(req, env, dummyCtx as any);
+  const peer = 'hostname' in info.remoteAddr ? info.remoteAddr.hostname : undefined;
+  const stamped = stampTcpPeer(req, peer);
+  try {
+    return await app.fetch(stamped, env, dummyCtx as any);
+  } finally {
+    // Do not await: a 2s flush must not hold the HTTP response.  The
+    // long-lived Deno process keeps the envelope fetch alive.
+    void flushSentry(2000);
+  }
 });

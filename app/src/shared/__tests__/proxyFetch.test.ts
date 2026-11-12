@@ -60,4 +60,43 @@ describe('proxyFetch', () => {
     expect(resolveResidentialProxyUrl({})).toBe(DEFAULT_RESIDENTIAL_PROXY_URL);
     expect(resolveResidentialProxyUrl({ RESIDENTIAL_PROXY_PORT: '8888' })).toBe(DEFAULT_RESIDENTIAL_PROXY_URL);
   });
+
+  it('refuses direct egress in a Deno runtime when the proxy client cannot be created', async () => {
+    const url = 'http://proxy-egress-guard.internal:8888';
+    vi.stubGlobal('Deno', {
+      createHttpClient: () => {
+        throw new Error('client boom');
+      },
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const mockFetch = vi.fn().mockResolvedValue(new Response('direct', { status: 200 }));
+    try {
+      const fetcher = createProxiedFetch(url, mockFetch as unknown as typeof fetch);
+      await expect(fetcher('http://example.com/')).rejects.toThrow(/refusing to fall back to direct egress/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('never logs proxy credentials when the Deno client cannot be created (CT-2442)', () => {
+    const url = 'http://user1:s3cretpw@proxy-redact-test.internal:8888';
+    vi.stubGlobal('Deno', {
+      createHttpClient: () => {
+        throw new Error(`invalid proxy url ${url}`);
+      },
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(getDenoHttpClient(url)).toBeUndefined();
+      const logged = warn.mock.calls.flat().join(' ');
+      expect(logged).toContain('proxy-redact-test.internal');
+      expect(logged).not.toContain('s3cretpw');
+      expect(logged).not.toContain('user1');
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
 });

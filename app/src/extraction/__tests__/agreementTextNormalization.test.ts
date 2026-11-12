@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { sameRowSet } from '../agreement.ts';
+import { buildMajorityRows, sameRowSet } from '../agreement.ts';
 import { arbitrationRowKey } from '../../extractors/types.ts';
 import type { CandidateDocResult } from '../bakeoff.ts';
 import type { ParsedTx } from '../../shared/types.ts';
@@ -109,5 +109,58 @@ describe('agreement cascade text normalization — sameRowSet', () => {
     const t1 = tx({ ticker: 'AAPL', assetName: 'Apple Inc.' });
     const t2 = tx({ ticker: 'AAPL', assetName: 'APPLE INCORPORATED, COMMON STOCK' });
     expect(arbitrationRowKey(t1)).toBe(arbitrationRowKey(t2));
+  });
+});
+
+describe('buildMajorityRows owner-qualified keys (CT-2397)', () => {
+  function lot(owner: ParsedTx['owner'], amountMin: number, amountMax: number): ParsedTx {
+    return tx({
+      ticker: 'COO',
+      assetName: 'Cooper Companies',
+      owner,
+      txDate: '2026-09-11',
+      amountMin,
+      amountMax,
+    });
+  }
+
+  it('publishes same-day spouse and dependent lots instead of ambiguous_multi_lot', () => {
+    const spouse = lot('spouse', 1001, 15000);
+    const dependent = lot('dependent', 15001, 50000);
+    const built = buildMajorityRows([
+      read([spouse, dependent], { model: 'a' }),
+      read([spouse, dependent], { model: 'b' }),
+      read([dependent, spouse], { model: 'c' }),
+    ], 3, true);
+    expect(built.ok).toBe(true);
+    expect(built.rows.map((row) => row.owner).sort()).toEqual(['dependent', 'spouse']);
+    const byOwner = Object.fromEntries(built.rows.map((row) => [row.owner, [row.amountMin, row.amountMax]]));
+    expect(byOwner.spouse).toEqual([1001, 15000]);
+    expect(byOwner.dependent).toEqual([15001, 50000]);
+  });
+
+  it('still rejects two lots that share owner as ambiguous_multi_lot', () => {
+    const first = lot('self', 1001, 15000);
+    const second = lot('self', 15001, 50000);
+    const built = buildMajorityRows([
+      read([first, second]),
+      read([first, second]),
+      read([first, second]),
+    ], 3, true);
+    expect(built.ok).toBe(false);
+    expect(built.reason).toContain('ambiguous_multi_lot:COO|2026-09-11|B|SELF');
+  });
+
+  it('still aligns a single lot when one read omitted owner', () => {
+    const spouse = lot('spouse', 1001, 15000);
+    const bare = lot(null, 1001, 15000);
+    const built = buildMajorityRows([
+      read([spouse], { model: 'a' }),
+      read([spouse], { model: 'b' }),
+      read([bare], { model: 'c' }),
+    ], 3, true);
+    expect(built.ok).toBe(true);
+    expect(built.rows).toHaveLength(1);
+    expect(built.rows[0].owner).toBe('spouse');
   });
 });

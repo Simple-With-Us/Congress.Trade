@@ -21,7 +21,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from pipeline import extract_pdf
+from infisical_config import resolve_admin_token
+from pipeline import extract_pdf, extract_pdf_detailed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger("scan-cpu-worker")
 
 API_BASE_URL = os.getenv("CONGRESS_TRADE_API_URL", "http://localhost:8787").rstrip("/")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ADMIN_TOKEN = ""
 WORKER_ID = os.getenv("WORKER_ID", "server_cpu_1")
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "30"))
 STORE_AUTH_BACKOFF_SEC = int(os.getenv("STORE_AUTH_BACKOFF_SEC", "300"))
@@ -41,6 +42,19 @@ EXTRACTOR = os.getenv("EXTRACTOR", "server_cpu_v1")
 
 class StoredCopyAuthError(RuntimeError):
     """Object store rejected credentials. Stop the pending batch."""
+
+
+def init_admin_token() -> None:
+    """Load ADMIN_TOKEN from env or Infisical; refuse to run without it."""
+    global ADMIN_TOKEN
+    try:
+        ADMIN_TOKEN = resolve_admin_token()
+    except Exception as e:
+        logger.error("FATAL: cannot resolve ADMIN_TOKEN: %s", e)
+        raise SystemExit(1) from e
+    if not ADMIN_TOKEN:
+        logger.error("FATAL: ADMIN_TOKEN is empty after resolution")
+        raise SystemExit(1)
 
 
 def send_request(
@@ -148,8 +162,12 @@ def process_filing(filing: Dict[str, Any]) -> bool:
         logger.error("No stored PDF for %s", doc_id)
         return False
 
+    extractor = EXTRACTOR
     try:
-        transactions = extract_pdf(pdf_path, ocr_backend=OCR_BACKEND)
+        detailed = extract_pdf_detailed(pdf_path, ocr_backend=OCR_BACKEND)
+        transactions = detailed.rows
+        if detailed.grid_pages:
+            extractor = detailed.extractor
     except Exception as e:
         logger.exception("extract_pdf failed for %s: %s", doc_id, e)
         transactions = []
@@ -164,7 +182,7 @@ def process_filing(filing: Dict[str, Any]) -> bool:
         "docId": doc_id,
         "transactions": transactions,
         "workerId": WORKER_ID,
-        "extractor": EXTRACTOR,
+        "extractor": extractor,
         "source": "server_cpu",
     }
     res = send_request(url, method="POST", payload=payload, timeout=120)
@@ -223,6 +241,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             with open(args.json_out, "w") as f:
                 json.dump(txs, f, indent=2)
         return 0
+
+    init_admin_token()
 
     if args.once:
         send_heartbeat()

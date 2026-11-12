@@ -13,6 +13,9 @@ import { Hono } from 'hono';
 import { buildUiRouter } from '../routes.ts';
 import { browserSecurityHeadersMiddleware } from '../../security/headers.ts';
 import { resetSitemapCacheForTests } from '../sitemap.ts';
+import { APP_STORE_URL, testFlightUrl } from '../appLinks.ts';
+import { DASHBOARD_HTML } from '../dashboardHtml.ts';
+import { DASHBOARD_APP_JS } from '../dashboardClient.ts';
 
 describe('/robots.txt', () => {
   it('allows the read-only render paths the SPA needs under the general Disallow: /api/', async () => {
@@ -174,7 +177,42 @@ describe('Datadog RUM injection', () => {
   });
 });
 
-describe('iOS Beta / TestFlight redirect routes', () => {
+describe('iOS install redirect routes', () => {
+  it('shares the released listing across dashboard links and the install fallback', () => {
+    expect(testFlightUrl()).toBe(APP_STORE_URL);
+    expect(testFlightUrl({ IOS_APP_STORE_ID: 'invalid' } as never)).toBe(APP_STORE_URL);
+    // CT-2418: six of the seven links are rendered by the application script,
+    // which now lives in dashboardClient.ts rather than in the document; the
+    // document keeps the install-fallback link. Count across both so the
+    // "every install path points at the released listing" invariant is still
+    // what this test actually enforces.
+    const dashboardSource = DASHBOARD_HTML + DASHBOARD_APP_JS;
+    expect(dashboardSource.split(APP_STORE_URL)).toHaveLength(7);
+    expect(DASHBOARD_HTML).not.toContain('href="null"');
+    expect(dashboardSource).not.toContain('href="null"');
+  });
+
+  it('uses the released App Store listing when no install URL is configured', async () => {
+    const app = buildUiRouter();
+    for (const path of ['/beta', '/testflight', '/ios', '/app']) {
+      const res = await app.request(`http://localhost${path}`, {}, {} as never);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')).toBe(APP_STORE_URL);
+    }
+  });
+
+  it.each([
+    'https://testflight.apple.com/',
+    'https://testflight.apple.com/join/trade.congress.ios',
+    'http://testflight.apple.com/join/VNUEU6Ge',
+    'https://example.com/install',
+    'not a URL',
+  ])('does not advertise an invalid configured install destination: %s', async (url) => {
+    const app = buildUiRouter();
+    const res = await app.request('http://localhost/beta', {}, { IOS_TESTFLIGHT_URL: url } as never);
+    expect(res.headers.get('location')).toBe(APP_STORE_URL);
+  });
+
   it('redirects /beta, /testflight, /ios, /app to the configured TestFlight or App Store URL', async () => {
     const app = buildUiRouter();
     const env = { IOS_TESTFLIGHT_URL: 'https://testflight.apple.com/join/xyz123' } as never;

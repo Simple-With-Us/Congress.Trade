@@ -16,6 +16,7 @@ import {
   type PushSettings,
 } from '../shared/pushSettings.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import {
   apnsConfigured,
   loadApnsConfig,
@@ -25,6 +26,8 @@ import {
   type ApnsDisposition,
   type ApnsTransport,
 } from '../shared/apns.ts';
+import { isDeliveryBackfill } from './deliveryFreshness.ts';
+import { readDeliveryMode } from './deliveryMode.ts';
 
 export const APNS_FANOUT_LOOKBACK_MS = 2 * 60 * 60 * 1000;
 export const APNS_FANOUT_PAGE = 40;
@@ -33,13 +36,14 @@ const LAST_ERROR_KV_KEY = 'apns:fanout:last_error';
 
 /** Official-trade query. filers PK is bioguide_id, not f.id. */
 export const APNS_FANOUT_TRADE_SQL = `SELECT t.id, t.doc_id, t.ticker, t.tx_type, t.asset_name, t.amount_min,
-            t.created_at, t.filer_id,
+            t.created_at, t.filed_date, t.first_seen_at, t.tx_date, t.filer_id,
             COALESCE(f.display_name, f.full_name) AS filer_name,
             f.chamber AS chamber, f.state AS state, f.district AS district
        FROM delivery_outbox o
        JOIN transactions t ON t.id = o.tx_id
        LEFT JOIN filers f ON f.bioguide_id = t.filer_id
       WHERE t.deprecated_at IS NULL
+        AND o.status != 'suppressed'
         AND t.created_at > ?
       ORDER BY t.created_at ASC
       LIMIT ${APNS_FANOUT_PAGE}`;
@@ -58,7 +62,8 @@ export const APNS_FANOUT_REVIEW_SQL = `SELECT doc_id, reason, created_at
  */
 export const APNS_FANOUT_TRADE_PENDING_SQL = `SELECT 1 AS ok
        FROM delivery_outbox o
-      WHERE EXISTS (
+      WHERE o.status != 'suppressed'
+        AND EXISTS (
               SELECT 1 FROM transactions t
                WHERE t.id = o.tx_id
                  AND t.deprecated_at IS NULL
@@ -91,7 +96,7 @@ export const APNS_SECRET_KEYS = [
 ] as const;
 
 export interface ApnsFanoutResult {
-  skipped?: 'not_configured' | 'no_devices' | 'no_pending';
+  skipped?: 'not_configured' | 'no_devices' | 'no_pending' | 'delivery_hold' | 'delivery_suppress';
   trades: number;
   reviews: number;
   delivered: number;
@@ -106,6 +111,9 @@ interface TradeRow {
   asset_name: string | null;
   amount_min: number | null;
   created_at: string;
+  filed_date: string | null;
+  first_seen_at: string | null;
+  tx_date: string | null;
   filer_id: string | null;
   filer_name: string | null;
   chamber: string | null;
@@ -127,6 +135,7 @@ export interface ApnsFanoutState {
 export interface ApnsFanoutDeps {
   transport?: ApnsTransport;
   now?: Date;
+  signal?: AbortSignal;
   loadConfig?: (env: Env) => ApnsConfig | null | Promise<ApnsConfig | null>;
   readState?: (env: Env) => Promise<ApnsFanoutState>;
   writeState?: (env: Env, state: ApnsFanoutState) => Promise<void>;
@@ -375,6 +384,11 @@ export async function fanOutApnsProductEvents(
   deps: ApnsFanoutDeps = {},
 ): Promise<ApnsFanoutResult> {
   const now = deps.now ?? new Date();
+  // Subscriber alert pause (CT_DELIVERY_MODE).  Skip without advancing the
+  // cursor: on resume, held trades inside the lookback window still push;
+  // suppressed outbox rows are excluded by APNS_FANOUT_TRADE_SQL.
+  const mode = readDeliveryMode();
+  if (mode !== 'deliver') return { skipped: mode === 'hold' ? 'delivery_hold' : 'delivery_suppress', trades: 0, reviews: 0, delivered: 0, retired: 0 };
   const config = await (deps.loadConfig ?? resolveApnsConfig)(env);
   if (!apnsConfigured(config)) return { skipped: 'not_configured', trades: 0, reviews: 0, delivered: 0, retired: 0 };
 
@@ -393,7 +407,14 @@ export async function fanOutApnsProductEvents(
       return { skipped: 'no_pending', trades: 0, reviews: 0, delivered: 0, retired: 0 };
     }
 
-    const trades = await all<TradeRow>(env.DB, APNS_FANOUT_TRADE_SQL, [tradeSince]);
+    const tradesRaw = await all<TradeRow>(env.DB, APNS_FANOUT_TRADE_SQL, [tradeSince]);
+    const nowMs = now.getTime();
+    const trades = tradesRaw.filter((row) => !isDeliveryBackfill({
+      filedDate: row.filed_date,
+      firstSeenAt: row.first_seen_at,
+      createdAt: row.created_at,
+      txDate: row.tx_date,
+    }, nowMs));
     const reviews = await all<ReviewRow>(env.DB, APNS_FANOUT_REVIEW_SQL, [reviewSince]);
 
     let delivered = 0;
@@ -450,6 +471,7 @@ export async function fanOutApnsProductEvents(
 
     let sendError: string | null = null;
     userLoop: for (const [userId, userDevices] of devicesByUser) {
+      abortIfSignal(deps.signal);
       const prefs = prefsByUser.get(userId);
       const settings = parsePushSettings(prefs?.notificationSettings);
       if (settings.pushMode === 'off') continue;
@@ -470,7 +492,8 @@ export async function fanOutApnsProductEvents(
     }
 
     if (!sendError) {
-      for (const trade of trades) {
+      // Advance from the raw outbox page so backfill filtering cannot stall the cursor.
+      for (const trade of tradesRaw) {
         if (trade.created_at > lastTradeAt) lastTradeAt = trade.created_at;
       }
       // Review-queue rows are operator work, not a product alert. Advance the

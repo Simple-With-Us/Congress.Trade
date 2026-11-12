@@ -29,6 +29,7 @@ export const captureMessage = bindings.captureMessage;
 export const setTags = bindings.setTags;
 export const consoleLoggingIntegration = bindings.consoleLoggingIntegration;
 export const isSentryInitialized = bindings.isInitialized;
+export const flushSentry = bindings.flush;
 export const logger = { warn: sentryLoggerWarn };
 
 export function initProductionSentry(

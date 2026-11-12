@@ -118,6 +118,19 @@ function fakeDb() {
               ] as T[],
             };
           }
+          if (/latest_import_at/i.test(sql) && /fundamentals_eod/i.test(sql)) {
+            const readsReceiveTime = /max\(received_at\)/i.test(sql) && !/updated_at/i.test(sql);
+            return {
+              results: [
+                {
+                  imported_refs: 3,
+                  fundamentals_rows: 2,
+                  analyst_rows: 1,
+                  latest_import_at: readsReceiveTime ? '2026-10-05T04:00:00.000Z' : '2020-01-01T00:00:00.000Z',
+                },
+              ] as T[],
+            };
+          }
           if (/FROM deliveries/i.test(sql)) return { results: [] as T[] };
           if (/FROM review_queue/i.test(sql)) return { results: [] as T[] };
           if (/FROM client_commands/i.test(sql)) return { results: [] as T[] };
@@ -152,7 +165,14 @@ describe('admin diagnostics API', () => {
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      connections: Array<{ id: string; status: string; configured: boolean; callsToday: number }>;
+      connections: Array<{
+        id: string;
+        status: string;
+        configured: boolean;
+        callsToday: number;
+        callsTotal?: number;
+        lastUsedAt?: string | null;
+      }>;
       errors: Array<{ area: string; subject: string; message: string }>;
       usageTelemetry: { state: string; ingestUrlConfigured: boolean; ingestTokenConfigured: boolean };
     };
@@ -166,16 +186,22 @@ describe('admin diagnostics API', () => {
           callsToday: 1,
         }),
         expect.objectContaining({ id: 'source:house', status: 'ok', callsToday: 2 }),
-        expect.objectContaining({ id: 'provider:massive', status: 'ok', configured: true, callsToday: 1 }),
-        expect.objectContaining({ id: 'cache:prices', status: 'ok', configured: true, callsToday: 0 }),
-        expect.objectContaining({ id: 'cache:spx', status: 'ok', configured: true, callsToday: 0 }),
-        expect.objectContaining({ id: 'cache:performance', status: 'ok', configured: true, callsToday: 0 }),
+        expect.objectContaining({ id: 'provider:socratic', status: 'warn', configured: false }),
+        expect.objectContaining({ id: 'provider:massive', status: 'warn', configured: false }),
+        expect.objectContaining({ id: 'cache:prices', status: 'warn', configured: false, callsToday: 0 }),
+        expect.objectContaining({ id: 'cache:spx', status: 'warn', configured: false, callsToday: 0 }),
+        expect.objectContaining({ id: 'cache:performance', status: 'warn', configured: false, callsToday: 0 }),
         expect.objectContaining({ id: 'telemetry:usage-monitor', status: 'error', configured: false }),
         expect.objectContaining({
           id: 'delivery:apns',
           status: 'warn',
           configured: false,
           note: expect.stringContaining('APNs credentials are not available'),
+        }),
+        expect.objectContaining({
+          id: 'app-b:receive',
+          lastUsedAt: '2026-10-05T04:00:00.000Z',
+          callsTotal: 6,
         }),
       ]),
     );

@@ -12,13 +12,16 @@ import type { Env } from '../../shared/types.ts';
 import { dispatchWebhook } from '../webhook.ts';
 import { openSseStream } from '../sse.ts';
 import { subscriptionOwnerEntitled } from '../subscriptions.ts';
+import { freshDeliveryAnchor, freshDeliveryDay, freshDeliveryIso } from './freshDeliveryFixtures.ts';
 
 const txRow = {
-  id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: '2026-06-20', owner: 'self',
+  id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: freshDeliveryDay, owner: 'self',
   asset_name: 'Apple Inc.', ticker: 'AAPL', asset_type: 'stock', tx_type: 'B',
   amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0,
   raw_text: 'AAPL purchase', confidence: 0.99, source: 'primary',
-  created_at: '2026-06-20T00:00:00.000Z', cursor_seq: 42,
+  filed_date: freshDeliveryDay,
+  first_seen_at: freshDeliveryIso,
+  created_at: freshDeliveryIso, cursor_seq: 42,
 };
 
 interface OwnerState {
@@ -47,7 +50,11 @@ function webhookEnv(clientId: string, owner: OwnerState | null) {
     async first<T>() {
       if (/FROM transactions WHERE id = \?/i.test(sql)) return txRow as T;
       if (/FROM users WHERE id/i.test(sql)) return (owner ? userRow(owner) : null) as T;
-      if (/SELECT chamber FROM filings/i.test(sql)) return { chamber: 'house' } as T;
+      // The chamber lookup became a transactions+filers+filings join when it also
+      // started resolving the filer party for the SSE broadcast. Matching the old
+      // 'SELECT chamber FROM filings' spelling here left this mock silently
+      // returning null, so ctx.chamber went empty and nothing asserted on it.
+      if (/AS chamber, fl\.party AS party/i.test(sql)) return { chamber: 'house', party: 'D' } as T;
       if (/FROM securities_ref/i.test(sql)) return { sector: 'Technology', market_cap_bucket: 'mega' } as T;
       if (/FROM subscriptions/i.test(sql)) return subRow as T;
       return null as T | null;
@@ -78,7 +85,16 @@ function targetFetch() {
       return Response.json({ Status: 0, Answer: type === 'A' ? [{ type: 1, data: '93.184.216.34' }] : [] });
     }
     targetCalls += 1;
-    return new Response('ok', { status: 200 });
+    return new Response(
+      JSON.stringify({
+        receiptVersion: 1,
+        delivered: true,
+        consumed: true,
+        ok: true,
+        applied: 1,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
   });
   return { fetchMock, targetCalls: () => targetCalls };
 }
@@ -118,6 +134,35 @@ describe('webhook dispatch entitlement re-check', () => {
       expect(skip?.sql).toContain('ON CONFLICT (subscription_id, tx_id) DO NOTHING');
       // No delivery attempt was claimed or recorded.
       expect(runs.some((r) => /status = 'sending'/i.test(r.sql))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('skips a targeted retry of a parked row for a lapsed owner instead of leaving it parked', async () => {
+    // The skip marker is insert-only, so on its own it leaves an existing parked
+    // row parked, and flushParkedDeliveries would re-release it every tick.
+    const { env, runs } = webhookEnv('user:user_1', { subscription_status: 'canceled', plan: 'monthly' });
+    const http = targetFetch();
+    vi.stubGlobal('fetch', http.fetchMock);
+    try {
+      await dispatchWebhook(env, { type: 'delivery.dispatch', txId: 'tx_1', subscriptionId: 'sub_1' });
+      expect(http.targetCalls()).toBe(0);
+      const terminal = runs.find((r) => /status IN \('parked', 'quarantined'\)/.test(r.sql));
+      expect(terminal?.params).toEqual([
+        'subscription owner entitlement inactive', expect.any(String), 'sub_1', 'tx_1',
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not rewrite existing rows on a fan-out skip for a lapsed owner', async () => {
+    const { env, runs } = webhookEnv('user:user_1', { subscription_status: 'canceled', plan: 'monthly' });
+    vi.stubGlobal('fetch', targetFetch().fetchMock);
+    try {
+      await dispatchWebhook(env, 'tx_1');
+      expect(runs.some((r) => /status IN \('parked', 'quarantined'\)/.test(r.sql))).toBe(false);
     } finally {
       vi.unstubAllGlobals();
     }

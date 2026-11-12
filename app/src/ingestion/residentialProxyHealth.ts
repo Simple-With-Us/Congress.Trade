@@ -4,9 +4,82 @@
  * Probe and health helpers for the residential Tailscale proxy.
  */
 
+import { z } from 'zod';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
-import { DEFAULT_RESIDENTIAL_PROXY_URL, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
+import { createProxiedFetch, DEFAULT_RESIDENTIAL_PROXY_URL, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 import type { Env } from '../shared/types.ts';
+import {
+  BROWSER_HEADERS,
+  CookieJar,
+  looksLikeSenateAgreementWall,
+  parseCsrfMiddlewareToken,
+  SENATE_SEARCH,
+} from './senateSource.ts';
+import {
+  classifySenateHttpFailure,
+  isSenateEdgeBackoffActive,
+  logSafeHeaderToken,
+  readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEfdTransportScrubSecrets,
+} from './senateEdgeDeny.ts';
+import {
+  persistSenateEfdProbe,
+  readSenateEfdProbe,
+  SENATE_EFD_PROBE_TIMEOUT_MS,
+  type SenateEfdProbeRecord,
+} from './senateEfdHealth.ts';
+
+export const RESIDENTIAL_PROXY_HEALTH_KV_KEY = 'residential-proxy:health';
+/** Hysteresis + outage windows for health_senate_relay (CT-2498). */
+export const RESIDENTIAL_PROXY_STATE_KV_KEY = 'residential-proxy:state';
+/** One-shot flag: watcher should run Senate poll promptly after proxy recovery. */
+export const RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY = 'residential-proxy:senate-catchup';
+export const RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS = 5_000;
+/** Backoff between tunneled liveness attempts on a single watcher tick (CT-2498). */
+export const RESIDENTIAL_PROXY_PROBE_BACKOFF_MS = [0, 500, 1_500] as const;
+export const DEFAULT_RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD = 3;
+
+function delayMs(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const n = parseInt(raw ?? '', 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.floor(n));
+}
+
+export function readResidentialProxyProbeFailureThreshold(env: Env): number {
+  return parsePositiveInt(
+    env.RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD,
+    DEFAULT_RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD,
+  );
+}
+
+/** Cheap origin fetched *through* the HTTP proxy (never GET {proxy}/health). */
+export const RESIDENTIAL_PROXY_PROBE_TARGET_URL = 'http://example.com/';
+
+/** Cached proxy-egress probe for pipelineHealth (no live hop on /api/health). */
+export interface ResidentialProxyProbeRecord {
+  ok: boolean;
+  status: number | null;
+  checkedAt: string;
+  host: string | null;
+  /** Present when ok is false after hysteresis tripped (CT-2498). */
+  consecutiveFailures?: number;
+  outageStartedAt?: string | null;
+}
+
+export interface ResidentialProxyProbeState {
+  consecutiveFailures: number;
+  /** True once hysteresis has published a down probe (pages health_senate_relay). */
+  reportedDown: boolean;
+  currentOutageStartedAt: string | null;
+  lastOutageStartedAt: string | null;
+  lastOutageEndedAt: string | null;
+}
 
 export interface ResidentialProxyHealthResult {
   /** An operator explicitly set a residential proxy env. */
@@ -25,8 +98,29 @@ export interface ResidentialProxyHealthResult {
 }
 
 /**
- * Probe the health endpoint of the residential proxy daemon.
+ * Probe residential proxy liveness by tunneling a cheap HTTP request through it
+ * (equivalent to `curl -x {proxy} http://example.com`).  Never issues a plain
+ * GET to `{proxy}/health` — tinyproxy has no health route and will wedge workers.
  */
+/**
+ * Tunnel probe with bounded in-tick retries (CT-2498).  A single Mango flap
+ * should not flip the published health record on one refused connection.
+ */
+export async function probeResidentialProxyHealthWithRetry(
+  proxyUrlOrEnv?: string | Env,
+  fetchImpl: typeof fetch = globalThis.fetch,
+  timeoutMs = RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS,
+  backoffMs: readonly number[] = RESIDENTIAL_PROXY_PROBE_BACKOFF_MS,
+): Promise<ResidentialProxyHealthResult> {
+  let last: ResidentialProxyHealthResult | null = null;
+  for (let i = 0; i < backoffMs.length; i++) {
+    if (i > 0) await delayMs(backoffMs[i] ?? 0);
+    last = await probeResidentialProxyHealth(proxyUrlOrEnv, fetchImpl, timeoutMs);
+    if (!last.configured || last.reachable) return last;
+  }
+  return last!;
+}
+
 export async function probeResidentialProxyHealth(
   proxyUrlOrEnv?: string | Env,
   fetchImpl: typeof fetch = globalThis.fetch,
@@ -54,7 +148,7 @@ export async function probeResidentialProxyHealth(
   }
 
   const cleanUrl = proxyUrl.replace(/\/$/, '');
-  const healthEndpoint = `${cleanUrl}/health`;
+  const proxiedFetch = createProxiedFetch(cleanUrl, fetchImpl);
   const t0 = Date.now();
 
   const controller = new AbortController();
@@ -62,31 +156,29 @@ export async function probeResidentialProxyHealth(
 
   try {
     const res = await trackedFetch(
-      healthEndpoint,
+      RESIDENTIAL_PROXY_PROBE_TARGET_URL,
       {
         method: 'GET',
-        headers: { accept: 'application/json' },
+        headers: { accept: 'text/html' },
         signal: controller.signal,
       },
       { service: 'filing-discovery', operation: 'probe-residential-proxy-health' },
-      fetchImpl,
+      proxiedFetch,
     );
 
     clearTimeout(timeoutId);
     const latencyMs = Date.now() - t0;
+    // A 5xx means the tunnel itself failed — tinyproxy answers 502/503 when
+    // it cannot reach the target — so it must not read as a healthy proxy.
+    // A sub-500 status proves the tunnel carried a real target response.
+    const reachable = res.status >= 200 && res.status < 500;
 
-    if (res.ok) {
-      let data: { ok?: boolean; service?: string; uptime?: number } = {};
-      try {
-        data = (await res.json()) as typeof data;
-      } catch {}
+    if (reachable) {
       return {
         configured: true,
         proxyUrl: cleanUrl,
         reachable: true,
         status: res.status,
-        service: data.service,
-        uptime: data.uptime,
         latencyMs,
       };
     }
@@ -108,5 +200,456 @@ export async function probeResidentialProxyHealth(
       latencyMs: Date.now() - t0,
       error: (err as Error).message,
     };
+  }
+}
+
+function residentialProxyHost(proxyUrl: string): string | null {
+  try {
+    return new URL(proxyUrl).host;
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+export async function readResidentialProxyProbeState(env: Env): Promise<ResidentialProxyProbeState | null> {
+  if (!env.CONFIG_KV) return null;
+  try {
+    const raw = await env.CONFIG_KV.get(RESIDENTIAL_PROXY_STATE_KV_KEY, 'json');
+    if (!raw || typeof raw !== 'object') return null;
+    const rec = raw as ResidentialProxyProbeState;
+    if (!Number.isFinite(rec.consecutiveFailures) || typeof rec.reportedDown !== 'boolean') return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+async function persistResidentialProxyProbeState(env: Env, state: ResidentialProxyProbeState): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(RESIDENTIAL_PROXY_STATE_KV_KEY, JSON.stringify(state), {
+      expirationTtl: 86_400 * 14,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Apply consecutive-failure hysteresis before writing the cached probe that
+ * `/api/health` reads.  Exported for tests (CT-2498).
+ */
+export function applyResidentialProxyHysteresis(
+  prev: ResidentialProxyProbeState | null,
+  probeResult: ResidentialProxyHealthResult,
+  now: Date,
+  failureThreshold: number,
+): { state: ResidentialProxyProbeState; published: ResidentialProxyProbeRecord; recovery: boolean } {
+  const checkedAt = now.toISOString();
+  const host = probeResult.proxyUrl ? residentialProxyHost(probeResult.proxyUrl) : null;
+  const empty: ResidentialProxyProbeState = {
+    consecutiveFailures: 0,
+    reportedDown: false,
+    currentOutageStartedAt: null,
+    lastOutageStartedAt: null,
+    lastOutageEndedAt: null,
+  };
+  const prior = prev ?? empty;
+
+  if (!probeResult.configured) {
+    return {
+      state: { ...empty },
+      published: { ok: true, status: null, checkedAt, host: null },
+      recovery: false,
+    };
+  }
+
+  if (probeResult.reachable) {
+    const wasDown = prior.reportedDown;
+    const state: ResidentialProxyProbeState = {
+      consecutiveFailures: 0,
+      reportedDown: false,
+      currentOutageStartedAt: null,
+      lastOutageStartedAt: wasDown ? prior.currentOutageStartedAt ?? prior.lastOutageStartedAt : prior.lastOutageStartedAt,
+      lastOutageEndedAt: wasDown ? checkedAt : prior.lastOutageEndedAt,
+    };
+    if (wasDown && prior.currentOutageStartedAt) {
+      state.lastOutageStartedAt = prior.currentOutageStartedAt;
+    }
+    return {
+      state,
+      published: { ok: true, status: probeResult.status ?? null, checkedAt, host },
+      recovery: wasDown,
+    };
+  }
+
+  const consecutiveFailures = prior.consecutiveFailures + 1;
+  const tripped = consecutiveFailures >= failureThreshold;
+  if (!tripped) {
+    return {
+      state: {
+        ...prior,
+        consecutiveFailures,
+        reportedDown: false,
+      },
+      published: {
+        ok: true,
+        status: probeResult.status ?? null,
+        checkedAt,
+        host,
+      },
+      recovery: false,
+    };
+  }
+
+  const outageStartedAt = prior.currentOutageStartedAt ?? checkedAt;
+  return {
+    state: {
+      consecutiveFailures,
+      reportedDown: true,
+      currentOutageStartedAt: outageStartedAt,
+      lastOutageStartedAt: prior.lastOutageStartedAt,
+      lastOutageEndedAt: prior.lastOutageEndedAt,
+    },
+    published: {
+      ok: false,
+      status: probeResult.status ?? null,
+      checkedAt,
+      host,
+      consecutiveFailures,
+      outageStartedAt,
+    },
+    recovery: false,
+  };
+}
+
+/** Returns true when a residential-proxy recovery requested a prompt Senate poll. */
+export async function consumeResidentialProxySenateCatchup(env: Env): Promise<boolean> {
+  if (!env.CONFIG_KV) return false;
+  try {
+    const raw = await env.CONFIG_KV.get(RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY);
+    if (!raw) return false;
+    await env.CONFIG_KV.delete(RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function requestResidentialProxySenateCatchup(env: Env, recoveryAt: string): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(RESIDENTIAL_PROXY_SENATE_CATCHUP_KV_KEY, recoveryAt, {
+      expirationTtl: 7200,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+export async function refreshResidentialProxyHealth(env: Env, now = new Date()): Promise<void> {
+  const proxyUrl = resolveResidentialProxyUrl(env, { allowDefault: false });
+  const checkedAt = now.toISOString();
+  if (!proxyUrl) {
+    await persistResidentialProxyProbe(env, { ok: true, status: null, checkedAt, host: null });
+    await persistResidentialProxyProbeState(env, {
+      consecutiveFailures: 0,
+      reportedDown: false,
+      currentOutageStartedAt: null,
+      lastOutageStartedAt: null,
+      lastOutageEndedAt: null,
+    });
+    await refreshSenateEfdProxyProbe(env, now, { proxyUrl: undefined, proxyReachable: false });
+    return;
+  }
+  const result = await probeResidentialProxyHealthWithRetry(
+    env,
+    globalThis.fetch,
+    RESIDENTIAL_PROXY_PROBE_TIMEOUT_MS,
+  );
+  const threshold = readResidentialProxyProbeFailureThreshold(env);
+  const prevState = await readResidentialProxyProbeState(env);
+  const { state, published, recovery } = applyResidentialProxyHysteresis(prevState, result, now, threshold);
+  await persistResidentialProxyProbeState(env, state);
+  await persistResidentialProxyProbe(env, published);
+  if (recovery) {
+    console.log(
+      `residentialProxy: proxy recovered at ${checkedAt}`
+        + (state.lastOutageStartedAt ? ` after outage since ${state.lastOutageStartedAt}` : '')
+        + ' — scheduling prompt Senate fetch catch-up',
+    );
+    await requestResidentialProxySenateCatchup(env, checkedAt);
+  } else if (!result.reachable && state.consecutiveFailures > 0 && state.consecutiveFailures < threshold) {
+    console.warn(
+      `residentialProxy: probe failed ${state.consecutiveFailures}/${threshold} (in-tick retries exhausted); `
+        + 'health_senate_relay stays up until threshold',
+    );
+  }
+  await refreshSenateEfdProxyProbe(env, now, {
+    proxyUrl,
+    proxyReachable: published.ok,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Senate eFD functional probe (CT-2416)
+// ---------------------------------------------------------------------------
+
+/**
+ * Dial eFD at most this often, whatever the last verdict; relay-down records
+ * are written every tick (no eFD hop).  Each dial sends eFD one agreement
+ * POST, the request its edge is refusing for automated clients (CT-2442).  
+ * The probe is a twice-a-day canary now, not a live status feed: Senate
+ * filings arrive through the Mac eFD fetcher's intake relay, and this dial
+ * only watches for the proxy path ever opening again (owner direction,
+ * 2026-11-05).  An edge deny gets no shorter or separate probe backoff: the
+ * watcher's edge-deny backoff (senateEdgeDeny.ts) is the one Senate
+ * backoff, and the probe skips while it is active.
+ */
+export const SENATE_EFD_PROXY_PROBE_INTERVAL_MS = 12 * 60 * 60_000;
+
+// Literal (not derived from SENATE_SEARCH) so suites that vi.mock senateSource
+// without these exports can still import this module.
+const SENATE_EFD_HOME = 'https://efdsearch.senate.gov/search/home/';
+const SENATE_EFD_ORIGIN = 'https://efdsearch.senate.gov';
+
+/**
+ * Per-step headers on top of BROWSER_HEADERS.  These must match
+ * `establishSenateSession` in senateSource.ts exactly (pinned by a test):
+ * Akamai scores browser fidelity, so a thinner probe could be refused while the
+ * real handshake succeeds (or vice versa).
+ */
+export const SENATE_EFD_LANDING_HEADERS: Readonly<Record<string, string>> = {
+  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'none',
+  'sec-fetch-user': '?1',
+  'upgrade-insecure-requests': '1',
+};
+export const SENATE_EFD_AGREEMENT_HEADERS: Readonly<Record<string, string>> = {
+  'content-type': 'application/x-www-form-urlencoded',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'same-origin',
+};
+
+/** eFD pages we classify are small; cap what we scan and keep. */
+const EFD_BODY_MAX_CHARS = 512 * 1024;
+/**
+ * Trust boundary for eFD response bodies: coerce anything unreadable or
+ * non-string to '' and bound the size before it reaches the classifier.
+ */
+export const SenateEfdResponseBodySchema = z
+  .string()
+  .catch('')
+  .transform((body) => body.slice(0, EFD_BODY_MAX_CHARS));
+
+async function readEfdBody(res: Response): Promise<string> {
+  return SenateEfdResponseBodySchema.parse(await res.text().catch(() => ''));
+}
+
+/**
+ * Exercise the path Senate ingestion actually needs, through the same
+ * residential proxy `senateSource.ts` uses: GET /search/ (200 + csrf token),
+ * then the agreement POST to /search/home/, judged the way
+ * `establishSenateSession` judges it (a 3xx, or a 200 without the agreement
+ * form).  The example.com liveness hop above cannot see an eFD edge deny;
+ * this can.
+ *
+ * Each request gets its own `timeoutMs` budget, so a slow landing GET cannot
+ * starve the agreement POST.  Transport-error text is scrubbed with
+ * senateEdgeDeny's `sanitizeEfdTransportError` before it is persisted.
+ *
+ * Classification:
+ *   ok        both steps passed
+ *   blocked   either step was an edge deny (classifySenateHttpFailure)
+ *   degraded  proxy unreachable / transport error / timeout, or any other failure
+ */
+export async function probeSenateEfdThroughProxy(
+  proxyUrl: string,
+  fetchImpl: typeof fetch = globalThis.fetch,
+  timeoutMs = SENATE_EFD_PROBE_TIMEOUT_MS,
+  now = new Date(),
+  secrets: Array<string | undefined> = [],
+): Promise<SenateEfdProbeRecord> {
+  const checkedAt = now.toISOString();
+  const proxiedFetch = createProxiedFetch(proxyUrl.replace(/\/$/, ''), fetchImpl);
+  const base = { checkedAt, egress: 'proxy', dialed: true } as const;
+  let step = 'GET /search/';
+  let timedOut = false;
+  const withTimeout = async <T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    try {
+      return await run(controller.signal);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+  try {
+    const { landing, landingHtml } = await withTimeout(async (signal) => {
+      const res = await trackedFetch(
+        SENATE_SEARCH,
+        { method: 'GET', headers: { ...BROWSER_HEADERS, ...SENATE_EFD_LANDING_HEADERS }, signal },
+        { service: 'filing-discovery', operation: 'probe-senate-efd-landing' },
+        proxiedFetch,
+      );
+      return { landing: res, landingHtml: await readEfdBody(res) };
+    });
+    if (landing.status !== 200) {
+      return classifyEfdFailure(base, step, landing, landingHtml);
+    }
+    const jar = new CookieJar();
+    jar.absorb(landing);
+    const token = parseCsrfMiddlewareToken(landingHtml);
+    if (!token && !jar.get('csrftoken')) {
+      return { ...base, ok: false, state: 'degraded', status: 200, step, error: 'eFD landing has no csrf token' };
+    }
+
+    step = 'POST /search/home/';
+    const { agree, agreeBody } = await withTimeout(async (signal) => {
+      const res = await trackedFetch(
+        SENATE_EFD_HOME,
+        {
+          method: 'POST',
+          headers: {
+            ...BROWSER_HEADERS,
+            ...SENATE_EFD_AGREEMENT_HEADERS,
+            cookie: jar.header(),
+            referer: SENATE_SEARCH,
+            origin: SENATE_EFD_ORIGIN,
+          },
+          body: new URLSearchParams({
+            prohibition_agreement: '1',
+            csrfmiddlewaretoken: token || jar.get('csrftoken') || '',
+          }).toString(),
+          redirect: 'manual',
+          signal,
+        },
+        { service: 'filing-discovery', operation: 'probe-senate-efd-agreement' },
+        proxiedFetch,
+      );
+      return { agree: res, agreeBody: await readEfdBody(res) };
+    });
+    if (agree.status >= 300 && agree.status < 400) {
+      return { ...base, ok: true, state: 'ok', status: agree.status, step, error: null };
+    }
+    if (agree.status === 200) {
+      if (looksLikeSenateAgreementWall(agreeBody)) {
+        return { ...base, ok: false, state: 'degraded', status: 200, step, error: 'eFD still shows the agreement form' };
+      }
+      return { ...base, ok: true, state: 'ok', status: 200, step, error: null };
+    }
+    return classifyEfdFailure(base, step, agree, agreeBody);
+  } catch (err) {
+    return {
+      ...base,
+      ok: false,
+      state: 'degraded',
+      status: null,
+      step,
+      error: timedOut
+        ? `relay/transport timeout after ${timeoutMs}ms`
+        : `relay/transport error: ${sanitizeEfdTransportError(err, secrets)}`,
+    };
+  }
+}
+
+/** One classifier for every Senate eFD answer: senateEdgeDeny's. */
+function classifyEfdFailure(
+  base: { checkedAt: string; egress: 'proxy'; dialed: true },
+  step: string,
+  res: Response,
+  body: string,
+): SenateEfdProbeRecord {
+  const { status } = res;
+  const server = res.headers.get('server');
+  if (classifySenateHttpFailure(status, server, body) === 'edge_denied') {
+    return {
+      ...base, ok: false, state: 'blocked', status, step,
+      error: `eFD edge denied (Akamai Access Denied, server=${logSafeHeaderToken(server)})`,
+    };
+  }
+  return { ...base, ok: false, state: 'degraded', status, step, error: `HTTP ${status} (server=${logSafeHeaderToken(server)})` };
+}
+
+/**
+ * Refresh the cached eFD probe.  Relay down/unconfigured is recorded every
+ * call without dialing eFD.  Otherwise eFD is not dialed while the watcher's
+ * edge-deny backoff is active (CT-2442), and at most once per
+ * SENATE_EFD_PROXY_PROBE_INTERVAL_MS, measured from the last attempted dial
+ * (`lastDialedAt`), so relay flaps cannot shorten the interval.
+ *
+ * An attempt that fails in transport or times out still counts: Akamai can
+ * tarpit or reset a request it has already scored, so re-dialing on the next
+ * tick would bring back the retry churn CT-2416 removes.
+ *
+ * A stored `blocked` record is never overwritten by a relay-down record: the
+ * relay outage is the residential_proxy check's to report, and replacing the
+ * Akamai verdict with `degraded` would silently downgrade a critical alert.
+ */
+export async function refreshSenateEfdProxyProbe(
+  env: Env,
+  now: Date,
+  ctx: { proxyUrl: string | undefined; proxyReachable: boolean },
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  const checkedAt = now.toISOString();
+  const last = await readSenateEfdProbe(env);
+  // Relay-down records must not reset the throttle: carry the last real dial
+  // forward so a flapping relay cannot trigger an eFD hit on every recovery.
+  const lastDialedAt = last?.lastDialedAt ?? (last?.dialed ? last.checkedAt : null);
+  if (!ctx.proxyUrl || !ctx.proxyReachable) {
+    if (last?.state === 'blocked') return;
+    await persistSenateEfdProbe(env, {
+      ok: false, state: 'degraded', status: null, checkedAt, egress: 'proxy', dialed: false, lastDialedAt,
+      step: null, error: ctx.proxyUrl ? 'residential proxy down' : 'residential proxy not configured',
+    });
+    return;
+  }
+  // While Senate polling is backed off after an edge deny, eFD is refusing the
+  // very agreement POST this probe sends.  Leave the record as it is:
+  // pipelineHealth reads the backoff itself and reports the deny.
+  const edgeBackoff = await readSenateEdgeBackoff(env);
+  if (edgeBackoff && isSenateEdgeBackoffActive(edgeBackoff, now)) return;
+  const lastMs = lastDialedAt ? Date.parse(lastDialedAt) : NaN;
+  if (Number.isFinite(lastMs) && now.getTime() - lastMs < SENATE_EFD_PROXY_PROBE_INTERVAL_MS) {
+    // Throttled.  If the stored record is a relay-down one, the relay is back
+    // but eFD state is unknown until the next allowed dial, so leave it as is
+    // (pipelineHealth reads that record as the canary state until the next scheduled dial).
+    return;
+  }
+  const rec = await probeSenateEfdThroughProxy(
+    ctx.proxyUrl, fetchImpl, SENATE_EFD_PROBE_TIMEOUT_MS, now,
+    senateEfdTransportScrubSecrets(ctx.proxyUrl, env),
+  );
+  await persistSenateEfdProbe(env, { ...rec, lastDialedAt: checkedAt });
+}
+
+export async function readResidentialProxyProbe(env: Env): Promise<ResidentialProxyProbeRecord | null> {
+  if (!env.CONFIG_KV) return null;
+  try {
+    const raw = await env.CONFIG_KV.get(RESIDENTIAL_PROXY_HEALTH_KV_KEY, 'json');
+    if (!raw || typeof raw !== 'object') return null;
+    const rec = raw as ResidentialProxyProbeRecord;
+    if (typeof rec.ok !== 'boolean' || typeof rec.checkedAt !== 'string') return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+async function persistResidentialProxyProbe(env: Env, rec: ResidentialProxyProbeRecord): Promise<void> {
+  if (!env.CONFIG_KV) return;
+  try {
+    await env.CONFIG_KV.put(RESIDENTIAL_PROXY_HEALTH_KV_KEY, JSON.stringify(rec), {
+      expirationTtl: 86_400,
+    });
+  } catch {
+    /* best-effort; pipelineHealth treats a missing probe as unknown */
   }
 }

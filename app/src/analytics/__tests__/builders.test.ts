@@ -365,7 +365,7 @@ describe('conviction realized-skill inputs', () => {
   });
 
   it('buildMemberSkillQuery: per-politician scored/wins/avg-excess for the given filers (>=5)', () => {
-    const q = buildMemberSkillQuery(['A1', 'B2', 'C3'], { window: 'all' });
+    const q = buildMemberSkillQuery(['A1', 'B2', 'C3'], { window: 'all', priceFreshThrough: '2020-01-01' });
     expect(q.sql).toContain('JOIN tx_performance p ON p.tx_id = t.id');
     expect(q.sql).toContain('COUNT(*) AS scored');
     expect(q.sql).toContain('AS wins');
@@ -379,7 +379,12 @@ describe('conviction realized-skill inputs', () => {
   });
 
   it('buildMemberSkillQuery: honors source + minConf (trade-level), binds before the filer IN-list', () => {
-    const q = buildMemberSkillQuery(['A1'], { window: 'all', source: 'primary', minConf: 0.7 });
+    const q = buildMemberSkillQuery(['A1'], {
+      window: 'all',
+      source: 'primary',
+      minConf: 0.7,
+      priceFreshThrough: '2020-01-01',
+    });
     expect(q.sql).toContain('t.source = ?');
     expect(q.sql).toContain('t.confidence >= ?');
     expect(q.params).toEqual(['primary', 0.7, 'A1']);
@@ -388,7 +393,12 @@ describe('conviction realized-skill inputs', () => {
 
 describe('buildMemberPerformanceLeaderboardQuery', () => {
   it('anchors excess return at the filing date, buys only, options excluded, small-N guarded', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', minTrades: 5, limit: 10 });
+    const q = buildMemberPerformanceLeaderboardQuery({
+      window: 'all',
+      minTrades: 5,
+      limit: 10,
+      priceFreshThrough: '2020-01-01',
+    });
     expect(q.sql).toContain('JOIN tx_performance p ON p.tx_id = t.id');
     // Excess uses the FILING anchors, not the trade-date ones.
     expect(q.sql).toContain('p.price_at_filing');
@@ -411,13 +421,18 @@ describe('buildMemberPerformanceLeaderboardQuery', () => {
   });
 
   it('sorts by the SAME statistic the card displays (winsorized, size-weighted, non-annualized avg_excess) — not the annualized figure', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', minTrades: 5, limit: 10 });
+    const q = buildMemberPerformanceLeaderboardQuery({
+      window: 'all',
+      minTrades: 5,
+      limit: 10,
+      priceFreshThrough: '2020-01-01',
+    });
     expect(q.sql).toContain('ORDER BY avg_excess DESC');
     expect(q.sql).not.toContain('ORDER BY avg_annualized_excess');
   });
 
   it('winsorizes each trade excess to a flat +/-200% cap before it feeds any aggregate', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all' });
+    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', priceFreshThrough: '2020-01-01' });
     // Flat MIN/MAX cap, not a percentile — applied once and reused by both
     // avg_excess and avg_annualized_excess (and thus by `wins`, which is
     // derived from the annualized figure's sign).
@@ -430,14 +445,14 @@ describe('buildMemberPerformanceLeaderboardQuery', () => {
   });
 
   it('restricts to public-equity rows so a crypto/misc ticker collision cannot leak in', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all' });
+    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', priceFreshThrough: '2020-01-01' });
     expect(q.sql).toContain("= 'public_equity'");
     // House crypto code still resolves to 'crypto' in the CASE, distinct from 'public_equity'.
     expect(q.sql).toContain("WHEN upper(trim(coalesce(t.asset_type, ''))) = 'CT' THEN 'crypto'");
   });
 
   it('defaults and clamps the small-N guard + limit', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all' });
+    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', priceFreshThrough: '2020-01-01' });
     expect(q.sql).toContain('HAVING trade_count >= 5'); // default minTrades
     expect(q.sql).toContain('LIMIT 20'); // default limit
   });
@@ -474,14 +489,18 @@ describe('politician deep-dive builders', () => {
   it('performance query joins both anchors + elapsed filing days and filters by filer', () => {
     const q = buildMemberPerformanceQuery('P000197', { window: 'all' });
     expect(q.sql).toContain('LEFT JOIN tx_performance txp ON txp.tx_id = t.id');
-    expect(q.sql).toContain('LEFT JOIN securities_ref sr ON sr.ticker = t.ticker');
+    // CT-2459: price anchor materialized once in a CTE, joined per ticker.
+    expect(q.sql).toContain('WITH px AS MATERIALIZED');
+    expect(q.sql).toContain('LEFT JOIN px ON px.ticker = t.ticker');
     expect(q.sql).toContain('txp.price_at_trade AS price_at_trade');
     expect(q.sql).toContain('txp.price_at_filing AS price_at_filing');
     expect(q.sql).toContain('txp.spx_at_filing AS spx_at_filing');
     expect(q.sql).toContain('t.tx_type AS tx_type');
     expect(q.sql).toContain('elapsed_days_since_filing');
     expect(q.sql).toContain('COALESCE(f.filed_date, f.first_seen_at, t.tx_date)');
-    expect(q.sql).toContain('sr.current_price AS current_price');
+    expect(q.sql).toContain('px.current_price AS current_price');
+    // CT-2459: buys-only in SQL (aggregator never considers other sides).
+    expect(q.sql).toContain("UPPER(t.tx_type) IN ('B', 'P', 'PURCHASE', 'BUY')");
     expect(q.sql).toContain('t.filer_id = ?');
     expect(q.params).toEqual(['P000197']);
   });

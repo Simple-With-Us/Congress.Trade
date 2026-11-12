@@ -132,12 +132,14 @@ services:
       - POLL_INTERVAL_SEC=30
       - HEARTBEAT_INTERVAL_SEC=60
       - EXTRACTOR=server_cpu_v1
-      # ADMIN_TOKEN comes from env_file (.env / Coolify secrets)
+      # ADMIN_TOKEN: env override optional; worker fetches from Infisical at boot
     depends_on:
       - congress-app
     healthcheck:
+      # This only proves Python starts (it always exits 0), so a 30s cadence
+      # forked an interpreter twice a minute for no signal.
       test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
-      interval: 30s
+      interval: 120s
       timeout: 10s
       retries: 3
       start_period: 30s

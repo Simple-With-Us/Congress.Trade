@@ -54,7 +54,10 @@ describe('scheduled maintenance isolation', () => {
     expect(mocks.watcher).toHaveBeenCalledOnce();
     expect(mocks.deliveryOutbox).toHaveBeenCalledOnce();
     expect(mocks.ingestionOutbox).toHaveBeenCalledOnce();
-    expect(mocks.telemetryFallback).toHaveBeenCalledWith(expect.anything(), { limit: 25 });
+    expect(mocks.telemetryFallback).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ limit: 25, signal: expect.any(AbortSignal) }),
+    );
     // Lane orchestration now lives in runMaintenancePipeline (shared with the
     // Deno tick); scheduled() registers that one pipeline with waitUntil and
     // the pipeline isolates per-lane failures internally.

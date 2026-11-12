@@ -12,6 +12,7 @@ import {
   buildMemberPerformanceLeaderboardQuery,
   buildMemberPerformanceQuery,
   buildMemberSkillQuery,
+  buildPriceAnchorCteBody,
 } from '../builders.ts';
 import { aggregateMemberDualPerformance } from '../compute.ts';
 
@@ -47,29 +48,49 @@ function buy(filerId: string, ticker: string) {
 }
 
 describe('performance leaderboard excess uses the S&P close on the ticker\'s own price date', () => {
-  it('STALE (priced 2026-07-24) is measured against the 2026-07-24 S&P, FRESH against 2026-08-03', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', minTrades: 1, limit: 10 });
+  const freshThrough = '2026-08-03';
+
+  it('excludes stale-priced tickers from excess-return leaderboards', () => {
+    const q = buildMemberPerformanceLeaderboardQuery({
+      window: 'all',
+      minTrades: 1,
+      limit: 10,
+      priceFreshThrough: freshThrough,
+    });
+    expect(q.sql).toContain(buildPriceAnchorCteBody(freshThrough));
     const rows = db.prepare(q.sql).all(...q.params) as Array<{ filer_id: string; avg_excess: number; prices_as_of: string }>;
     const by = Object.fromEntries(rows.map((r) => [r.filer_id, r]));
-
-    // (110/100 - 1) - (5040/4800 - 1) = 0.10 - 0.05
-    expect(by['f-stale'].avg_excess).toBeCloseTo(0.05, 6);
-    expect(by['f-stale'].prices_as_of).toBe('2026-07-24');
-    // (110/100 - 1) - (5100/4800 - 1) = 0.10 - 0.0625
+    expect(by['f-stale']).toBeUndefined();
     expect(by['f-fresh'].avg_excess).toBeCloseTo(0.0375, 6);
     expect(by['f-fresh'].prices_as_of).toBe('2026-08-03');
-    // Before the fix STALE read 0.0375 too (benchmark drifted 1.25 points for free).
   });
 
-  it('a ticker with no price date falls back to the latest S&P close (the old behaviour) rather than dropping out', () => {
-    const q = buildMemberPerformanceLeaderboardQuery({ window: 'all', minTrades: 1, limit: 10 });
+  it('when freshThrough is relaxed, STALE is measured against the 2026-07-24 S&P (aligned legs)', () => {
+    const q = buildMemberPerformanceLeaderboardQuery({
+      window: 'all',
+      minTrades: 1,
+      limit: 10,
+      priceFreshThrough: '2026-07-20',
+    });
+    const rows = db.prepare(q.sql).all(...q.params) as Array<{ filer_id: string; avg_excess: number; prices_as_of: string }>;
+    const by = Object.fromEntries(rows.map((r) => [r.filer_id, r]));
+    expect(by['f-stale'].avg_excess).toBeCloseTo(0.05, 6);
+    expect(by['f-stale'].prices_as_of).toBe('2026-07-24');
+  });
+
+  it('a ticker with no price date is excluded once freshness is enforced', () => {
+    const q = buildMemberPerformanceLeaderboardQuery({
+      window: 'all',
+      minTrades: 1,
+      limit: 10,
+      priceFreshThrough: freshThrough,
+    });
     const rows = db.prepare(q.sql).all(...q.params) as Array<{ filer_id: string; avg_excess: number }>;
-    const nodate = rows.find((r) => r.filer_id === 'f-nodate');
-    expect(nodate?.avg_excess).toBeCloseTo(0.0375, 6);
+    expect(rows.find((r) => r.filer_id === 'f-nodate')).toBeUndefined();
   });
 
   it('the skill query and the per-member rows use the same alignment', () => {
-    const sq = buildMemberSkillQuery(['f-stale'], { window: 'all' });
+    const sq = buildMemberSkillQuery(['f-stale'], { window: 'all', priceFreshThrough: '2026-07-20' });
     // Skill needs >= 5 scored buys; assert the aligned excess through the raw per-trade rows instead.
     expect(sq.sql).toContain('px.spx_now / p.spx_at_filing');
     const pq = buildMemberPerformanceQuery('f-stale', { window: 'all' });

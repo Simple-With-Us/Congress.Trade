@@ -214,6 +214,20 @@ function warnIfOverSoft(
   });
 }
 
+/** CT-2459 flush throttle: at most one meter write per window (or per row
+ *  threshold) per isolate. Previously every invocation with any metered
+ *  rows did an INSERT+SELECT — a DB write per read request on the single
+ *  libsql connection. Metering is approximate by design (see header), so
+ *  delaying the flush loses nothing but freshness of the day counter. */
+export const D1_BUDGET_FLUSH_INTERVAL_MS = 30_000;
+export const D1_BUDGET_FLUSH_ROW_THRESHOLD = 10_000;
+let lastBudgetFlushMs = 0;
+
+/** Test hook: reset the flush throttle clock. */
+export function resetD1BudgetFlushClockForTests(): void {
+  lastBudgetFlushMs = 0;
+}
+
 /**
  * Flush the isolate's accumulated D1 row usage to today's atomic D1 counter, and warn
  * if the day's total crossed the soft threshold. Call once at an invocation tail
@@ -225,6 +239,14 @@ export async function flushD1Budget(env: Env, now = new Date()): Promise<void> {
   resetD1WriteGovernor();
   const snap = pending;
   if (snap.read === 0 && snap.written === 0) return;
+  const nowMs = now.getTime();
+  if (
+    nowMs - lastBudgetFlushMs < D1_BUDGET_FLUSH_INTERVAL_MS &&
+    snap.read + snap.written < D1_BUDGET_FLUSH_ROW_THRESHOLD
+  ) {
+    return; // keep accumulating; a later tail (or the threshold) flushes
+  }
+  lastBudgetFlushMs = nowMs;
   pending = { read: 0, written: 0 };
   try {
     const day = dayStr(now);
