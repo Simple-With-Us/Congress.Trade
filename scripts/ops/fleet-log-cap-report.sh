@@ -43,7 +43,7 @@ print_daemon_json() {
   fi
   if ! "$JQ_CMD" -e . "$DAEMON_JSON_PATH" >/dev/null 2>&1; then
     echo "ERROR: ${DAEMON_JSON_PATH} is not valid JSON"
-    return 1
+    return 0
   fi
   local driver opts
   driver="$("$JQ_CMD" -r '."log-driver" // "(unset)"' "$DAEMON_JSON_PATH")"
@@ -65,14 +65,18 @@ print_docker_info() {
 
 echo "=== Docker container json logs ==="
 total=0
-if mapfile -t ids < <("$DOCKER_CMD" ps -aq 2>/dev/null); then
+if ps_output="$("$DOCKER_CMD" ps -aq 2>/dev/null)"; then
+  ids=()
+  if [[ -n "$ps_output" ]]; then
+    mapfile -t ids <<<"$ps_output"
+  fi
   if ((${#ids[@]} == 0)); then
     echo "(no containers)"
   else
     printf '%-14s %-40s %12s  %s\n' "CONTAINER_ID" "NAME" "BYTES" "LOG_PATH"
     for id in "${ids[@]}"; do
       [[ -z "$id" ]] && continue
-      name="$("$DOCKER_CMD" inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')"
+      name="$("$DOCKER_CMD" inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##' || true)"
       log_path="$("$DOCKER_CMD" inspect -f '{{.LogPath}}' "$id" 2>/dev/null || true)"
       bytes=0
       if [[ -n "$log_path" ]]; then

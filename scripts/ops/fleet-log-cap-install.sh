@@ -42,8 +42,10 @@ die() {
 merge_daemon_json() {
   local in_path="$1"
   local existing='{}'
-  if [[ -f "$in_path" ]]; then
-  existing="$("$JQ_CMD" -c . "$in_path")"
+  if [[ -f "$in_path" ]] && [[ -s "$in_path" ]]; then
+    if ! existing="$("$JQ_CMD" -c . "$in_path" 2>/dev/null)" || [[ -z "$existing" ]]; then
+      die "cannot parse ${in_path} as JSON (fix or remove before install)"
+    fi
   fi
   printf '%s' "$existing" | "$JQ_CMD" -c '
     ."log-driver" = "json-file"
@@ -65,8 +67,10 @@ install_docker_daemon_json() {
 
   local want current
   want="$(printf '%s' "$merged" | canonical_json)"
-  if [[ -f "$DAEMON_JSON_PATH" ]]; then
-    current="$(canonical_json <"$DAEMON_JSON_PATH")"
+  if [[ -f "$DAEMON_JSON_PATH" ]] && [[ -s "$DAEMON_JSON_PATH" ]]; then
+    if ! current="$(canonical_json <"$DAEMON_JSON_PATH" 2>/dev/null)"; then
+      current=''
+    fi
   else
     current=''
   fi
@@ -103,15 +107,17 @@ install_docker_daemon_json() {
 
 reload_journald_light() {
   if [[ "$APPLY" != "1" ]]; then
-    log "DRY_RUN: would signal systemd-journald (SIGUSR2) to reload config"
+    log "DRY_RUN: would signal systemd-journald (SIGUSR2) or run journalctl --vacuum-size=1G"
     return 0
   fi
   if "$SYSTEMCTL_CMD" kill --kill-who=main --signal=SIGUSR2 systemd-journald 2>/dev/null; then
-    log "signaled systemd-journald (SIGUSR2)"
+    log "signaled systemd-journald (SIGUSR2) for log rotation"
     return 0
   fi
-  log "SIGUSR2 reload unavailable; running journalctl --vacuum-size=1G"
-  "$JOURNALCTL_CMD" --vacuum-size=1G
+  log "SIGUSR2 unavailable; running journalctl --vacuum-size=1G (best-effort)"
+  if ! "$JOURNALCTL_CMD" --vacuum-size=1G; then
+    log "WARNING: journalctl --vacuum-size=1G failed (drop-in still installed)"
+  fi
 }
 
 install_journald_dropin() {
@@ -135,6 +141,9 @@ install_journald_dropin() {
   fi
 
   reload_journald_light
+  log ""
+  log "NOTE: journald drop-in caps apply after systemd-journald restart."
+  log "NOTE: Full journald restart is out of scope for this script (Jay approval)."
 }
 
 main() {

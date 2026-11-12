@@ -166,6 +166,35 @@ assert_contains "$report_out" "aaa111" "report lists container aaa111"
 assert_contains "$report_out" "logging driver: json-file" "report docker info driver"
 assert_contains "$report_out" "Archived and active journals" "report journald disk usage"
 
+# --- empty daemon.json merges as {} ------------------------------------------
+EMPTY_DAEMON="${TMP}/etc/docker/empty-daemon.json"
+mkdir -p "$(dirname "$EMPTY_DAEMON")"
+: >"$EMPTY_DAEMON"
+APPLY=1 DAEMON_JSON_PATH="$EMPTY_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="${TMP}/empty-journald.conf" SYSTEMCTL_CMD=systemctl INSTALL_CMD=install bash "$INSTALL" >/dev/null
+assert_eq "$(jq -r '."log-opts"."max-size"' <"$EMPTY_DAEMON")" "50m" "empty daemon.json file gets log caps"
+
+# --- journalctl vacuum failure does not abort install ----------------------
+VAC_FAIL_LOG="${TMP}/journalctl-fail.log"
+cat >"${MOCK_BIN}/journalctl-fail" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+  --vacuum-size|--vacuum-size=*) exit 1 ;;
+esac
+exec journalctl "$@"
+MOCK
+chmod +x "${MOCK_BIN}/journalctl-fail"
+VAC_DAEMON="${TMP}/vac/daemon.json"
+mkdir -p "$(dirname "$VAC_DAEMON")"
+printf '{"storage-driver":"overlay2"}\n' >"$VAC_DAEMON"
+VAC_DEST="${TMP}/vac-journald.conf"
+if APPLY=1 DAEMON_JSON_PATH="$VAC_DAEMON" JOURNALD_DROPIN_SRC="$DROPIN_SRC" JOURNALD_DROPIN_DEST="$VAC_DEST" SYSTEMCTL_CMD=/bin/false JOURNALCTL_CMD=journalctl-fail INSTALL_CMD=install bash "$INSTALL" | tee "$VAC_FAIL_LOG"; then
+  echo "ok   install succeeds when vacuum fails"
+else
+  echo "FAIL install should not exit non-zero when vacuum fails"
+  fail=1
+fi
+assert_contains "$(cat "$VAC_FAIL_LOG")" "WARNING: journalctl --vacuum-size=1G failed" "vacuum failure is warning only"
+
 # --- install dry-run ---------------------------------------------------------
 INSTALL_DAEMON="${TMP}/etc/docker/daemon.json"
 mkdir -p "$(dirname "$INSTALL_DAEMON")"
