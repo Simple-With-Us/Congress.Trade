@@ -12,6 +12,8 @@ import {
   PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION,
   PEER_PRICE_CATCHUP_MIN_SPACING_MS,
   peerPriceCatchUpAfterRun,
+  peerPriceCatchUpAnchoredRunCap,
+  peerPriceCatchUpEffectiveRunCap,
   peerPriceCatchUpGate,
   peerPriceSnapshotNeedsCatchUp,
 } from '../peerPriceCatchUp.ts';
@@ -33,9 +35,13 @@ describe('parsePeerPriceCatchUpState', () => {
     // parses with attempts approximated by the spent-run count.  A state
     // stored before the day roll has no budgetDay;  it parses as belonging
     // to the current ET day (NOW is 2026-10-24 in ET).
-    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION, NOW)).toEqual({ ...good, attempts: 3, budgetDay: '2026-10-24' });
+    expect(parsePeerPriceCatchUpState(JSON.stringify(good), SESSION, NOW)).toEqual({
+      ...good, attempts: 3, budgetDay: '2026-10-24', runCap: 0,
+    });
     const withAttempts = { ...good, attempts: 11 };
-    expect(parsePeerPriceCatchUpState(JSON.stringify(withAttempts), SESSION, NOW)).toEqual({ ...withAttempts, budgetDay: '2026-10-24' });
+    expect(parsePeerPriceCatchUpState(JSON.stringify(withAttempts), SESSION, NOW)).toEqual({
+      ...withAttempts, budgetDay: '2026-10-24', runCap: 0,
+    });
     for (const bad of [
       { ...good, runs: -1 },
       { ...good, runs: 1.5 },
@@ -119,6 +125,29 @@ describe('parsePeerPriceCatchUpState day roll', () => {
   });
 });
 
+describe('peerPriceCatchUpAnchoredRunCap', () => {
+  it('keeps the morning cap after the backlog drains', () => {
+    expect(peerPriceCatchUpEffectiveRunCap(3000)).toBe(11);
+    expect(peerPriceCatchUpEffectiveRunCap(1500)).toBe(8);
+    const morning = {
+      ...freshPeerPriceCatchUpState(SESSION, NOW),
+      runs: 9,
+      runCap: peerPriceCatchUpEffectiveRunCap(3000),
+    };
+    const anchored = peerPriceCatchUpAnchoredRunCap(morning, 1500);
+    expect(anchored).toBe(11);
+    expect(peerPriceCatchUpGate(morning, NOW, { maxRuns: anchored })).toBe('ok');
+    expect(peerPriceCatchUpGate(morning, NOW, { maxRuns: peerPriceCatchUpEffectiveRunCap(1500) })).toBe('session-cap');
+  });
+
+  it('treats stored runCap 0 as unset when the pending probe fails', () => {
+    const legacy = { ...freshPeerPriceCatchUpState(SESSION, NOW), runCap: 0, runs: 0 };
+    const anchored = peerPriceCatchUpAnchoredRunCap(legacy, null);
+    expect(anchored).toBe(PEER_PRICE_CATCHUP_MAX_RUNS_PER_SESSION);
+    expect(peerPriceCatchUpGate(legacy, NOW, { maxRuns: anchored })).toBe('ok');
+  });
+});
+
 describe('peerPriceCatchUpGate', () => {
   const base = freshPeerPriceCatchUpState(SESSION);
 
@@ -173,6 +202,28 @@ describe('peerPriceCatchUpAfterRun', () => {
     expect(flat.noProgressRuns).toBe(2);
     const unknown = peerPriceCatchUpAfterRun(claimed, { pendingBefore: 20, pendingAfter: null, lastCursorSeq: 7, reachedEndOfPending: false });
     expect(unknown.noProgressRuns).toBe(2);
+  });
+
+  it('does not reset no-progress when priced tickers leave pending flat', () => {
+    const next = peerPriceCatchUpAfterRun(claimed, {
+      pendingBefore: 950,
+      pendingAfter: 950,
+      lastCursorSeq: 900,
+      reachedEndOfPending: false,
+      tickersPriced: 120,
+    });
+    expect(next.noProgressRuns).toBe(2);
+  });
+
+  it('treats priced tickers as progress only when the after-count is unreadable', () => {
+    const next = peerPriceCatchUpAfterRun(claimed, {
+      pendingBefore: 950,
+      pendingAfter: null,
+      lastCursorSeq: 900,
+      reachedEndOfPending: false,
+      tickersPriced: 120,
+    });
+    expect(next.noProgressRuns).toBe(0);
   });
 
   it('does not count a failed run with no progress toward the park', () => {

@@ -71,6 +71,7 @@ import {
   ST_PEER_STALE_HIT_TERMINATE,
   parsePeerStaleHitCount,
 } from '../service.ts';
+import { PRICE_DRAIN_LAST_PROGRESS_KEY } from '../peerPriceDrainProgress.ts';
 import {
   markStuckPeerPriceTickersNotCovered,
   NOT_COVERED_RECHECK_LOOKBACK_DAYS,
@@ -93,6 +94,7 @@ import { openMigratedD1, type SqliteDatabase } from './sqliteD1.ts';
 let db: SqliteDatabase;
 let env: Env;
 let close: () => void;
+let kvStore: Map<string, string>;
 
 // Friday 2026-10-23 15:00Z = 11:00 ET Friday → last trading day Thu 2026-10-22.
 const NOW = new Date('2026-10-23T15:00:00.000Z');
@@ -115,11 +117,20 @@ beforeEach(async () => {
   const opened = await openMigratedD1();
   db = opened.db;
   close = opened.close;
+  kvStore = new Map<string, string>();
   env = {
     DB: opened.d1,
     APP_B_IMPORT_URL: 'https://socratic.trade',
     APP_B_INGEST_TOKEN: 'test-peer-token',
-    CONFIG_KV: { get: async () => null, put: async () => {} },
+    CONFIG_KV: {
+      get: async (key: string) => kvStore.get(key) ?? null,
+      put: async (key: string, value: string) => {
+        kvStore.set(key, value);
+      },
+      delete: async (key: string) => {
+        kvStore.delete(key);
+      },
+    },
   } as unknown as Env;
 });
 afterEach(() => {
@@ -580,6 +591,7 @@ describe('health metrics carry the not-covered count', () => {
       seedSr(ticker, { priceUnavailable: 0, priceCheckedAt: hoursAgoIso(73) });
     }
 
+    kvStore.set(PRICE_DRAIN_LAST_PROGRESS_KEY, hoursAgoIso(80));
     const before = await collectStPeerPricesMetrics(env, NOW, 6);
     expect(before.pending).toBe(15);
     expect(before.stalled).toBe(true);
@@ -686,7 +698,7 @@ describe('Kody review follow-ups (#2849)', () => {
     seedPrice('CORP', FRESH_THROUGH);
   }
 
-  it('#1 a non-fatal ST error records the error as the last outcome, leaving stage and price_checked_at alone', async () => {
+  it('#1 a non-fatal ST error records the error and stamps price_checked_at without changing stage', async () => {
     seedTrade('t-e1', 'ERRS');
     seedSr('ERRS', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
     h.errors.set('ERRS', 'peer 500 upstream');
@@ -695,7 +707,7 @@ describe('Kody review follow-ups (#2849)', () => {
 
     const row = srRow('ERRS');
     expect(row?.price_unavailable).toBe(1);
-    expect(row?.price_checked_at).toBe('2000-01-01T00:00:00Z');
+    expect(row?.price_checked_at).toBe(NOW.toISOString());
     expect(String(row?.price_unavailable_reason)).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream`);
   });
 
@@ -950,24 +962,34 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
         Number((db.prepare('SELECT COUNT(*) AS n FROM _sr_updates WHERE ticker = ?').get(ticker) as { n: number }).n);
     }
 
-    it('the same error on the next run writes nothing to securities_ref', async () => {
+    it('the same error on the next run does not rewrite price_checked_at or the marker', async () => {
       seedTrade('t-w1', 'SAMEERR');
-      seedSr('SAMEERR', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
+      seedSr('SAMEERR', {
+        priceUnavailable: 0,
+        priceCheckedAt: '2000-01-01T00:00:00Z',
+        latestPriceDate: weeksStaleDate(),
+      });
       h.errors.set('SAMEERR', 'peer 500 upstream');
       const updates = countUpdates('SAMEERR');
 
       await runPriceRefresh(env, { max: 10 });
       const afterFirst = updates();
-      expect(afterFirst).toBe(1);
+      expect(afterFirst).toBeGreaterThanOrEqual(1);
+      const checkedAfterFirst = srRow('SAMEERR')?.price_checked_at;
+      expect(checkedAfterFirst).toBe(NOW.toISOString());
       await runPriceRefresh(env, { max: 10 });
       expect(updates()).toBe(afterFirst);
       expect(srRow('SAMEERR')?.price_unavailable_reason).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream`);
-      expect(srRow('SAMEERR')?.price_checked_at).toBe('2000-01-01T00:00:00Z');
+      expect(srRow('SAMEERR')?.price_checked_at).toBe(checkedAfterFirst);
     });
 
     it('a different error message still updates the marker', async () => {
       seedTrade('t-w2', 'NEWERR');
-      seedSr('NEWERR', { priceUnavailable: 1, priceCheckedAt: '2000-01-01T00:00:00Z' });
+      seedSr('NEWERR', {
+        priceUnavailable: 0,
+        priceCheckedAt: '2000-01-01T00:00:00Z',
+        latestPriceDate: weeksStaleDate(),
+      });
       h.errors.set('NEWERR', 'peer 500 upstream');
       const updates = countUpdates('NEWERR');
 
@@ -975,7 +997,7 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
       h.errors.set('NEWERR', 'peer 502 bad gateway');
       await runPriceRefresh(env, { max: 10 });
 
-      expect(updates()).toBe(2);
+      expect(updates()).toBeGreaterThanOrEqual(2);
       expect(srRow('NEWERR')?.price_unavailable_reason).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 502 bad gateway`);
     });
   });

@@ -5,6 +5,7 @@ import {
   sweepPipelineStallAlerts,
 } from '../pipelineLoudAlerts.ts';
 import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
+import { PRICE_DRAIN_LAST_PROGRESS_KEY } from '../../prices/peerPriceDrainProgress.ts';
 import type { Env } from '../../shared/types.ts';
 
 vi.mock('../reviewQueueNotify.ts', () => ({
@@ -66,16 +67,22 @@ function seedTrade(ticker: string): void {
   ).run(`tx-${ticker}`, ticker);
 }
 
-function envWithDb(): Env {
-  return { DB: d1, CONFIG_KV: createKv() } as Env;
+function envWithDb(kvStore?: Map<string, string>): Env {
+  return { DB: d1, CONFIG_KV: createKv(kvStore) } as Env;
 }
 
-function createKv() {
-  const store = new Map<string, string>();
+function createKv(initial?: Map<string, string>) {
+  const store = initial ?? new Map<string, string>();
   return {
     get: async (key: string) => {
       const raw = store.get(key);
-      return raw ? JSON.parse(raw) : null;
+      if (raw === undefined) return null;
+      if (key === PRICE_DRAIN_LAST_PROGRESS_KEY) return raw;
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
     },
     put: async (key: string, value: string) => {
       store.set(key, value);
@@ -104,8 +111,11 @@ describe('st_peer_prices stall detector', () => {
               ('DONE', '2026-10-11', ?, 'socratic')`,
     ).run(recent, recent, old);
 
+    const kv = new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, '2026-10-12T14:00:00.000Z'],
+    ]);
     const now = new Date('2026-10-12T18:00:00.000Z');
-    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    const result = await sweepPipelineStallAlerts(envWithDb(kv), now);
     expect(result.evaluated).toContain('st_peer_prices');
     expect(result.alerted).not.toContain('st_peer_prices');
   });
@@ -120,8 +130,11 @@ describe('st_peer_prices stall detector', () => {
     );
     for (let i = 1; i <= 6; i++) stmt.run(`JUNK${i}`, stale);
 
+    const kv = new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, stale],
+    ]);
     const now = new Date('2026-10-12T18:00:00.000Z');
-    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    const result = await sweepPipelineStallAlerts(envWithDb(kv), now);
     expect(result.alerted).toContain('st_peer_prices');
     const msg = (captureMessage as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
       String(c[0]).includes('st_peer_prices'),
@@ -147,8 +160,11 @@ describe('st_peer_prices stall detector', () => {
       `INSERT INTO price_eod (ticker, date, close) VALUES ('FRESH', '2026-10-10', 100)`,
     ).run();
 
+    const kv = new Map([
+      [PRICE_DRAIN_LAST_PROGRESS_KEY, staleChecked],
+    ]);
     const now = new Date('2026-10-12T18:00:00.000Z');
-    const result = await sweepPipelineStallAlerts(envWithDb(), now);
+    const result = await sweepPipelineStallAlerts(envWithDb(kv), now);
     expect(result.alerted).toContain('st_peer_prices');
     const msg = (captureMessage as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
       String(c[0]).includes('st_peer_prices'),
