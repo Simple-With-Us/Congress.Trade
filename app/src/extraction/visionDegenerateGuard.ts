@@ -24,6 +24,12 @@ const LISTED_SECURITY_NAME_RE =
   /\b(?:ETF|ETN|ETFs?|Tr\b|Trust|SPDR|iShares|Vanguard|Select Sector|Ser Tr|Index|Inc\.?|Corp\.?|Corporation|Common Stock|Class [A-Z])\b/i;
 
 const PAREN_TICKER_RE = /\(([A-Z]{1,5})\)\s*$/;
+const PAREN_TICKER_INLINE_RE = /\(([A-Z]{1,5})\)/;
+
+export type AssessVisionDegenerateOptions = {
+  /** Resolved tickers from normalize() / securities_master, index-aligned to `rows`. */
+  resolvedTickers?: readonly (string | null | undefined)[];
+};
 
 export interface VisionDegenerateSignal {
   code:
@@ -62,10 +68,27 @@ function normalizedOwner(row: ParsedTx): string | null {
   return s === '' ? null : s;
 }
 
-function rowTickerMissing(row: ParsedTx): boolean {
-  const t = (row.ticker ?? '').trim();
-  if (t === '') return true;
-  return isPlaceholderTicker(t);
+function tickerFromAssetName(name: string | null | undefined): string | null {
+  const value = (name ?? '').trim();
+  if (!value) return null;
+  const match = value.match(PAREN_TICKER_INLINE_RE);
+  return match ? match[1] : null;
+}
+
+/** Raw ticker on the row, parenthetical ticker in the description, or a resolved symbol. */
+export function effectiveTickerForDegenerate(
+  row: ParsedTx,
+  resolvedTicker?: string | null,
+): string | null {
+  const resolved = (resolvedTicker ?? '').trim();
+  if (resolved && !isPlaceholderTicker(resolved)) return resolved;
+  const raw = (row.ticker ?? '').trim();
+  if (raw && !isPlaceholderTicker(raw)) return raw;
+  return tickerFromAssetName(row.assetName);
+}
+
+function rowTickerMissing(row: ParsedTx, resolvedTicker?: string | null): boolean {
+  return effectiveTickerForDegenerate(row, resolvedTicker) === null;
 }
 
 function amountKey(row: ParsedTx): string {
@@ -86,9 +109,16 @@ function distinctAssetCount(rows: readonly ParsedTx[]): number {
  * and other vision paths should run this after duplicate-span collapse and
  * other integrity guards, immediately before normalize().
  */
-export function assessVisionDegenerate(rows: readonly ParsedTx[]): VisionDegenerateAssessment {
+export function assessVisionDegenerate(
+  rows: readonly ParsedTx[],
+  options?: AssessVisionDegenerateOptions,
+): VisionDegenerateAssessment {
   const signals: VisionDegenerateSignal[] = [];
-  const usable = rows.filter((r) => (r.assetName ?? '').trim().length > 0);
+  const resolvedByIndex = options?.resolvedTickers;
+  const usableEntries = rows
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => (row.assetName ?? '').trim().length > 0);
+  const usable = usableEntries.map(({ row }) => row);
   const rowCount = usable.length;
   const distinctAssets = distinctAssetCount(usable);
 
@@ -111,7 +141,9 @@ export function assessVisionDegenerate(rows: readonly ParsedTx[]): VisionDegener
   }
 
   const recognizableCount = usable.filter((r) => assetNameSuggestsListedSecurity(r.assetName)).length;
-  const allTickersMissing = usable.every(rowTickerMissing);
+  const allTickersMissing = usableEntries.every(({ row, index }) =>
+    rowTickerMissing(row, resolvedByIndex?.[index] ?? null),
+  );
   if (allTickersMissing && recognizableCount >= MIN_VISION_DEGENERATE_ROWS) {
     signals.push({
       code: 'all_tickers_null_recognizable_names',

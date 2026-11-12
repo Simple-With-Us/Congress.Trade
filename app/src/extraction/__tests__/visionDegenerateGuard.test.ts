@@ -7,6 +7,7 @@ import type { Owner, ParsedTx, TxType } from '../../shared/types.ts';
 import {
   assessVisionDegenerate,
   assetNameSuggestsListedSecurity,
+  effectiveTickerForDegenerate,
   mergeVisionDegenerateReason,
   VISION_DEGENERATE_REASON,
 } from '../visionDegenerateGuard.ts';
@@ -101,6 +102,38 @@ describe('assessVisionDegenerate', () => {
     );
     const hit = assessVisionDegenerate(rows);
     expect(hit.degenerate).toBe(false);
+  });
+
+  it('parenthetical tickers in asset names count as present (pre-resolution)', () => {
+    const rows = ['TLH', 'IEUR', 'SPMD'].map((ticker, i) =>
+      tx({
+        ticker: null,
+        owner: 'joint',
+        txType: 'B',
+        assetName: `Sample ETF Tr Series ${i} (${ticker})`,
+        txDate: '2026-10-22',
+      }),
+    );
+    expect(rows.every((r) => effectiveTickerForDegenerate(r) !== null)).toBe(true);
+    expect(assessVisionDegenerate(rows).degenerate).toBe(false);
+  });
+
+  it('issuer-resolved tickers suppress false degenerate on uniform multi-row vision', () => {
+    const rows = ['TLH', 'XAR', 'SPMD'].map((ticker, i) =>
+      tx({
+        ticker: null,
+        owner: 'joint',
+        txType: 'S',
+        assetName: `ETF Tr Sample ${i}`,
+        txDate: '2026-10-22',
+      }),
+    );
+    const pre = assessVisionDegenerate(rows);
+    expect(pre.degenerate).toBe(true);
+    const post = assessVisionDegenerate(rows, {
+      resolvedTickers: ['TLH', 'XAR', 'SPMD'],
+    });
+    expect(post.degenerate).toBe(false);
   });
 
   it('CONTROL: shared date and amount alone is not degenerate when types and tickers vary', () => {

@@ -426,9 +426,6 @@ export async function normalize(
   );
   const droppedFormChrome = parsed.length - usableParsed.length;
   let visionDegenerateAssessment: VisionDegenerateAssessment | null = null;
-  if (isVisionOrOcrExtraction(extractorName, source) && usableParsed.length > 0) {
-    visionDegenerateAssessment = assessVisionDegenerate(usableParsed);
-  }
   const sawOgePart7ExplicitNone = looksLikeOgePart7ExplicitNone(sourceText)
     || parsed.some((p) =>
       looksLikeOgePart7ExplicitNone(p.assetName) || looksLikeOgePart7ExplicitNone(p.rawText)
@@ -438,6 +435,11 @@ export async function normalize(
   );
 
   const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source);
+  if (isVisionOrOcrExtraction(extractorName, source) && usableParsed.length > 0) {
+    visionDegenerateAssessment = assessVisionDegenerate(usableParsed, {
+      resolvedTickers: allFlagged.map((f) => f.tx.ticker ?? null),
+    });
+  }
   const deletedFlagged = allFlagged.filter((f) => isDeletedFilingStatus(f.tx.filingStatus));
   const flagged = allFlagged.filter((f) => !isDeletedFilingStatus(f.tx.filingStatus));
 
