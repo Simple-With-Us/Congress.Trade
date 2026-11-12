@@ -5,6 +5,10 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 #     Socratic.Trade   6:30am + 7:30pm CT   local keep 4 (2 days)
 #     Congress.Trade   6:00am + 8:00pm CT   local keep 4 (2 days)
 #     Usage-Monitor    8:30pm CT            local keep 2 (2 days)
+#   Complete local dumps are stored as zstd `<name>-<STAMP>.db.zst` next to
+#   the raw-db `.sha256`, still on this root disk (`/data/backups` -> `/backups`).
+#   Keep counts above are unchanged.  Incomplete dumps are not compressed.
+#   Weekly verify accepts `.db` and `.db.zst`.
 #   Backblaze B2 (hetzner/ dump sets): 3 dailies + weeklies at ~7 and ~14 days,
 #     hard 14-day max age (B2_MAX_AGE_DAYS).  Nothing on B2 older than 14 days.
 # Host timezone is America/Chicago (Jay 2026-10-30), so cron times below are

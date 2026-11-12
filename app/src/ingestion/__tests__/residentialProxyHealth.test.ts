@@ -28,15 +28,27 @@ describe('probeResidentialProxyHealth', () => {
     expect(requestedUrl).not.toContain(proxyUrl);
   });
 
-  it('treats any HTTP status from the tunneled request as reachable (proxy spoke)', async () => {
+  it('treats a sub-500 HTTP status from the tunneled request as reachable (proxy spoke)', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response('Not Found', { status: 404 }),
+    );
+
+    const result = await probeResidentialProxyHealth('http://100.113.106.39:3128', mockFetch);
+    expect(result.configured).toBe(true);
+    expect(result.reachable).toBe(true);
+    expect(result.status).toBe(404);
+  });
+
+  it('treats a proxy-generated 502 as unreachable (a 5xx means the tunnel failed)', async () => {
     const mockFetch = vi.fn().mockResolvedValue(
       new Response('Bad Gateway', { status: 502 }),
     );
 
     const result = await probeResidentialProxyHealth('http://100.113.106.39:3128', mockFetch);
     expect(result.configured).toBe(true);
-    expect(result.reachable).toBe(true);
+    expect(result.reachable).toBe(false);
     expect(result.status).toBe(502);
+    expect(result.error).toBe('HTTP 502');
   });
 
   it('handles network error / timeout gracefully', async () => {

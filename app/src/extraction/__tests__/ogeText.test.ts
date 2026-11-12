@@ -21,6 +21,7 @@ import {
   isOgeRowSequenceCoherent,
   ogePart7SectionLooksEmpty,
   parseOgeTransactionRows,
+  assessOgeRowCompleteness,
 } from '../ogeText.ts';
 
 beforeEach(() => {
@@ -601,5 +602,44 @@ describe('OgeTextExtractor', () => {
 
     expect(bytes.byteLength).toBe(8);
     expect(() => new Uint8Array(bytes)).not.toThrow();
+  });
+});
+
+describe('repeated per-page table header', () => {
+  // Shape of the merged unpdf text for E-2026-arjun-mody-08-06-2026-278t:
+  // every page repeats the header, preceded by the previous page's footer or,
+  // when unpdf orders a page late, by prose that has its own digits.
+  const HEADER = '# DESCRIPTION TYPE DATE NOTIFICATION RECEIVED OVER 30 DAYS AGO AMOUNT';
+  const row = (n: number, name: string, type = 'Purchase') =>
+    `${n} ${name} ${type} 06/02/2026 No $1,001 - $15,000`;
+  const text = [
+    'Transactions',
+    HEADER,
+    row(1, 'Vanguard Total Stock Market Index Fund ETF Class Shares (VTI)'),
+    row(2, 'Accenture Plc (ACN)', 'Sale'),
+    'Mody, Arjun - Page 3',
+    HEADER,
+    row(3, 'Vanguard Information Technology Index Fund ETF Class Shares (VGT)', 'Sale'),
+    row(4, 'CVS Health Corp. (CVS)', 'Sale'),
+    'to another, a public',
+    HEADER,
+    row(5, 'Vanguard Growth Index Fund ETF Class Shares (VUG)'),
+  ].join(' ');
+
+  it('never glues the header or a page footer onto the next row', () => {
+    const rows = parseOgeTransactionRows(text);
+    expect(rows.map((r) => r.assetName)).toEqual([
+      'Vanguard Total Stock Market Index Fund ETF Class Shares',
+      'Accenture Plc',
+      'Vanguard Information Technology Index Fund ETF Class Shares',
+      'CVS Health Corp.',
+      'Vanguard Growth Index Fund ETF Class Shares',
+    ]);
+    expect(rows.map((r) => r.rawText.split(' ')[0])).toEqual(['1', '2', '3', '4', '5']);
+  });
+
+  it('reports the table as complete', () => {
+    const rows = parseOgeTransactionRows(text);
+    expect(assessOgeRowCompleteness(text, rows)).toMatchObject({ expectedRows: 5, missingCount: 0 });
   });
 });

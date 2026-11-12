@@ -316,3 +316,79 @@ describe('GET /review-queue pipeline failures', () => {
   });
 
 });
+
+describe('GET /review-queue pipeline failures — one-pass totals and DLQ error surfacing', () => {
+  it('computes the pipeline-failure totals with one pass over the outbox', async () => {
+    const rows = [...fixture(), {
+      docId: 'DL-3', createdAt: tsAt(6), noReview: true, chamber: 'senate',
+      ingestStatus: 'persisted', outboxUpdatedAt: tsAt(13), error: 'parked:empty_fetch_handoff',
+    }];
+    const db = makeReviewQueueTestDb(rows);
+    await seedFailures(db, true);
+    await db.prepare("UPDATE ingestion_outbox SET status = 'failed', attempts = 1 WHERE doc_id = ?").bind('DL-3').run();
+    const seen: string[] = [];
+    const orig = db.prepare.bind(db);
+    const recording = {
+      ...db,
+      prepare: (sql: string) => {
+        seen.push(sql);
+        return orig(sql);
+      },
+    } as TestDb;
+    const res = await app.request('/review-queue', { headers: AUTH }, env(recording));
+    expect(res.status).toBe(200);
+    const body = await res.json() as ReviewQueueBody;
+    expect(body.totals.deadLetters).toBe(2);
+    expect(body.totals.deadLettersParked).toBe(1);
+    expect(body.totals.dlqFailed).toBe(2);
+    // The parked/active split used to cost two scans of the failed outbox
+    // rows on every totals read; it is one conditional-aggregation pass now.
+    const outboxSplitScans = seen.filter((s) => /from\s+ingestion_outbox/i.test(s) && /parked/i.test(s));
+    expect(outboxSplitScans).toHaveLength(1);
+  });
+
+  it('surfaces a real dead-letter DB error instead of reporting the listing unavailable', async () => {
+    const db = makeReviewQueueTestDb(fixture());
+    await seedFailures(db, true);
+    const orig = db.prepare.bind(db);
+    const failing = {
+      ...db,
+      prepare: (sql: string) => {
+        if (/from\s+ingestion_outbox/i.test(sql) && /order by/i.test(sql)) {
+          throw new Error('D1_ERROR: database is locked');
+        }
+        return orig(sql);
+      },
+    } as TestDb;
+    const res = await app.request('/review-queue?include=dead_letters', { headers: AUTH }, env(failing));
+    expect(res.status).toBe(500);
+  });
+
+  it('surfaces a real durable-queue DB error instead of reporting the listing unavailable', async () => {
+    const db = makeReviewQueueTestDb(fixture());
+    await seedFailures(db, true);
+    const orig = db.prepare.bind(db);
+    const failing = {
+      ...db,
+      prepare: (sql: string) => {
+        if (/from\s+deno_runtime_queue/i.test(sql) && /order by/i.test(sql)) {
+          throw new Error('D1_ERROR: database is locked');
+        }
+        return orig(sql);
+      },
+    } as TestDb;
+    const res = await app.request('/review-queue?include=dlq_failed', { headers: AUTH }, env(failing));
+    expect(res.status).toBe(500);
+  });
+
+  it('still reports dead letters unavailable when the outbox table does not exist', async () => {
+    const db = makeReviewQueueTestDb(fixture());
+    await db.prepare('DROP TABLE ingestion_outbox').run();
+    const res = await app.request('/review-queue?include=dead_letters', { headers: AUTH }, env(db));
+    expect(res.status).toBe(200);
+    const body = await res.json() as ReviewQueueBody;
+    expect(body.deadLetters).toEqual([]);
+    expect(body.deadLettersAvailable).toBe(false);
+    expect(body.totals.deadLetters).toBe(0);
+  });
+});

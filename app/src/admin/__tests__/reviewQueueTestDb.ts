@@ -134,6 +134,14 @@ CREATE TABLE ingestion_outbox (
   updated_at         TEXT NOT NULL
 );
 CREATE INDEX idx_ingestion_outbox_ready ON ingestion_outbox (status, available_at);
+
+CREATE TABLE ingestion_decisions (
+  id         TEXT PRIMARY KEY,
+  doc_id     TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  source     TEXT,
+  created_at TEXT
+);
 `;
 
 export interface ReviewQueueFixtureRow {

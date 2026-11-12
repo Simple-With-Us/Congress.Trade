@@ -25,6 +25,10 @@ import {
   PUBLISH_DECISION_ACTIONS,
 } from './reviewStatusReconcile.ts';
 import {
+  clearIngestFailureReviewQueueIfRecovered,
+  recordGenuineIngestFailure,
+} from './ingestFailureReviewQueue.ts';
+import {
   SENATE_SESSION_KV_KEY,
   establishSenateSession,
   looksLikeSenateAgreementWall,
@@ -193,23 +197,11 @@ async function markError(
   message: string,
   lease?: DurableQueueLeaseContext,
 ): Promise<void> {
-  try {
-    await lease?.assertOwned();
-    if (await isFilingAlreadyPublished(env.DB, docId)) {
-      console.warn(`fetcher: ${docId} already published; leaving ingest_status alone`);
-      return;
-    }
-    await run(
-      env.DB,
-      `UPDATE filings
-          SET ingest_status = 'error', error = ?
-        WHERE doc_id = ?
-          AND NOT (${alreadyPublishedPredicate('filings')})`,
-      [message.slice(0, 1000), docId, ...PUBLISH_DECISION_ACTIONS],
-    );
-  } catch (e) {
-    console.error(`fetcher: failed to record error for ${docId}:`, e);
-  }
+  await recordGenuineIngestFailure(env, docId, message, {
+    source: 'fetcher',
+    stage: 'fetch',
+    lease,
+  });
 }
 
 /**
@@ -474,6 +466,7 @@ export async function fetchFiling(
       console.warn(`fetcher: ${docId} already published; not enqueuing extraction`);
       return;
     }
+    await clearIngestFailureReviewQueueIfRecovered(env.DB, docId);
 
     await lease?.assertOwned();
     await env.INGEST_QUEUE.send({ type: 'filing.fetched', docId });

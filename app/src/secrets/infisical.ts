@@ -462,7 +462,14 @@ export async function refreshSecrets(
     errors,
     sources: sourceStatus,
   };
-  cache.set(key, entry);
+  // Never cache a fetch that produced no values because every configured
+  // source failed (for example the boot-time 5s abort on a slow Infisical):
+  // caching the empty entry for the full TTL would poison the immediate
+  // initSettings reload and every caller until expiry.  Leave any previous
+  // entry untouched and let the next caller retry the fetch instead.
+  if (errors.length === 0 || Object.keys(values).length > 0) {
+    cache.set(key, entry);
+  }
 
   const kvSecret = kvCacheSecret(env);
   if (env.CONFIG_KV && kvSecret && errors.length === 0 && Object.keys(values).length > 0) {

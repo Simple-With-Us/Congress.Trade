@@ -172,6 +172,11 @@ describe('autonomySweeps', () => {
         .bind('doc-stranded-1').first<{ ingest_status: string; error: string }>();
       expect(row?.ingest_status).toBe('error');
       expect(row?.error).toMatch(/autonomy-sweep/);
+      const queue = await d1.prepare(
+        `SELECT reason, resolved FROM review_queue WHERE doc_id = ?`,
+      ).bind('doc-stranded-1').first<{ reason: string; resolved: number }>();
+      expect(queue?.resolved).toBe(0);
+      expect(queue?.reason).toMatch(/^ingest_failure:/);
     });
 
     it('leaves a recently-stuck filing alone', async () => {
