@@ -1235,9 +1235,9 @@ interface DeadLetterRow {
 
 /**
  * One page of ingestion-outbox dead letters: rows whose delivery failed
- * terminally (status 'failed').  These filings never reach the review queue
- * and are not ingest failures either — the filing exists, but its outbox
- * delivery died — so the queue view needs this listing to see them at all.
+ * terminally (status 'failed'). The terminal-failure sweep also opens a
+ * review_queue row when the filing has none. This listing stays the
+ * outbox-shaped view of the same failures.
  */
 async function listDeadLetters(
   db: D1Database,
@@ -1297,10 +1297,10 @@ interface DlqFailedRow {
 
 /**
  * One page of durable-queue rows in terminal failed state
- * (deno_runtime_queue).  Like the outbox dead letters, these are pipeline
- * failures no other queue surface lists.  `available` is false when the
- * table does not exist yet, so the dashboard can say so instead of
- * implying the queue is healthy.
+ * (deno_runtime_queue). Filing messages in this state are mirrored onto
+ * review_queue by the terminal-failure sweep when the filing has no row.
+ * `available` is false when the table does not exist yet, so the dashboard
+ * can say so instead of implying the queue is healthy.
  */
 async function listDlqFailedRows(
   db: D1Database,

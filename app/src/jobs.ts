@@ -15,6 +15,7 @@ import { run, all, batch as batchStatements } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
 import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
 import {
+  markDisclosureUnsupportedPeerPrices,
   markStuckPeerPriceTickersNotCovered,
   recheckNotCoveredPeerPrices,
 } from './prices/notCovered.ts';
@@ -536,6 +537,14 @@ export async function maybeRunPeerPriceCatchUp(
   const before = beforeProbe;
   if (!before || !peerPriceSnapshotNeedsCatchUp(before)) return 'stamped';
   try {
+    const disclosure = await markDisclosureUnsupportedPeerPrices(env, now);
+    if (disclosure.marked > 0) {
+      console.log(`catch-up disclosure sweep marked ${disclosure.marked} ticker(s) not covered`);
+    }
+  } catch (err) {
+    console.warn('catch-up disclosure sweep failed:', (err as Error).message);
+  }
+  try {
     const stuck = await markStuckPeerPriceTickersNotCovered(env, now);
     if (stuck.marked > 0) {
       console.log(`catch-up stuck sweep marked ${stuck.marked} ticker(s) not covered`);
@@ -798,6 +807,14 @@ export async function maybeRunDailyMarketDataJobs(
   // leaves tickers unattempted, so a stale price_checked_at says nothing
   // about ST.
   if (!priceRefreshFailed && priceRefreshAttemptedAllPending) {
+    try {
+      const disclosure = await markDisclosureUnsupportedPeerPrices(env, now);
+      if (disclosure.marked > 0) {
+        console.log(`not-covered disclosure sweep marked ${disclosure.marked} unsupported ticker(s)`);
+      }
+    } catch (err) {
+      console.warn('not-covered disclosure sweep failed:', (err as Error).message);
+    }
     try {
       const swept = await markStuckPeerPriceTickersNotCovered(env, now);
       if (swept.marked > 0) {

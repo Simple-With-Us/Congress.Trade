@@ -23,6 +23,11 @@ import { buildPeerPriceClient, readPeerStaleCloses } from './peer.ts';
 import type { Close } from './compute.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { readCorpusLatestPriceDate } from './peerPricePending.ts';
+import {
+  notCoveredCauseForDisclosure,
+  readTickerPriceInstrumentHintsBatch,
+  tickerHasOnlyUnsupportedDisclosureTrades,
+} from './peerInstrumentCoverage.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
 import {
   classifyStUnpriceableSymbol,
@@ -571,6 +576,10 @@ export interface PriceRefreshResult {
  * are excluded unconditionally, outside any TTL. Selection reads the maintained,
  * indexed `securities_ref.latest_price_date` instead of scanning the whole
  * price_eod table with a `MAX(date) GROUP BY ticker` subquery.
+ *
+ * Order is oldest `price_checked_at` first (never-checked sorts first), then
+ * oldest trade — so post-rollover backlog does not starve newer common stocks
+ * behind a long FIFO tail (CT-2482).
  */
 export async function selectTickersNeedingPrices(
   env: Env,
@@ -627,7 +636,10 @@ export async function selectTickersNeedingPricesPage(
         AND ${priceNotCoveredExclusionSql('sr')}
       GROUP BY t.ticker
       ${after === null ? '' : 'HAVING MAX(t.cursor_seq) > ?'}
-      ORDER BY MAX(t.cursor_seq) ASC
+      ${after === null
+    ? `ORDER BY COALESCE(sr.price_checked_at, '1970-01-01T00:00:00.000Z') ASC,
+               MAX(t.cursor_seq) ASC`
+    : 'ORDER BY MAX(t.cursor_seq) ASC'}
       LIMIT ?`,
     after === null
       ? [freshThrough, firstUnavailableCutoff, unavailableCutoff, limit]
@@ -1014,6 +1026,9 @@ export async function runPriceRefresh(
     ? []
     : await selectTickersNeedingPricesPage(env, budget, { afterCursorSeq: opts.afterCursorSeq });
   const tickers = page.map((r) => r.ticker);
+  const instrumentHintsByTicker = result.aborted
+    ? new Map()
+    : await readTickerPriceInstrumentHintsBatch(env, tickers);
   const runCorpusLatest = await readCorpusLatestPriceDate(env);
   const runCorpusFresh = isCurrentPriceFresh(runCorpusLatest, lastTradingDay());
 
@@ -1294,9 +1309,22 @@ export async function runPriceRefresh(
           // (not covered by ST) instead of cycling 2 → 2 forever.
           // CT-2466: that same repeat miss on a ticker whose last trade is
           // already far in the past is terminal (`delisted`), not a coverage gap.
+          // CT-2482: confirmed empty on an unsupported disclosure type (mutual
+          // fund, option, …) goes straight to stage 4 instead of a 7-day pending
+          // rebound.
           if (!dryRun) {
             const checked = new Date(nowIso);
-            if (
+            if (await tickerHasOnlyUnsupportedDisclosureTrades(env, ticker)) {
+              const hints = instrumentHintsByTicker.get(ticker);
+              if (hints) {
+                await markTickerPriceUnavailable(
+                  env,
+                  ticker,
+                  notCoveredReason(checked, notCoveredCauseForDisclosure(hints)),
+                  { checkedAt: nowIso, stage: PRICE_UNAVAILABLE_NOT_COVERED },
+                );
+              }
+            } else if (
               prevStage === PRICE_UNAVAILABLE_NOT_FOUND_AGAIN &&
               latestPriceDate != null &&
               isConfirmedNoLongerTradingDate(latestPriceDate, checked)
@@ -1369,6 +1397,12 @@ export async function runPriceRefresh(
   notifyGate();
   await Promise.all(workers);
   if (pendingThrow) throw pendingThrow.error;
+
+  // Priority walks (no rotation cursor) sort by price_checked_at;  do not stamp
+  // a cursor_seq resume point or the next catch-up page skips lower-seq pendings.
+  if (opts.afterCursorSeq == null && !result.aborted) {
+    result.lastCursorSeq = null;
+  }
 
   result.reachedEndOfPending = !result.aborted && tickers.length < selectBudget;
   // A walk that resumed from a cursor skipped everything before it, so it never
