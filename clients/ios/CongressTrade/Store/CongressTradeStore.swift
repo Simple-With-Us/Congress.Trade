@@ -918,7 +918,7 @@ final class CongressTradeStore: ObservableObject {
         let skipRising = selectedTimeRange == .all
 
         do {
-            try await withRetry {
+            try await withRetry(method: "GET") {
                 try await self.loadTrendsFanout(
                     analyticsWindow: analyticsWindow,
                     partyParam: partyParam,
@@ -1024,14 +1024,23 @@ final class CongressTradeStore: ObservableObject {
         trendsSnapshotRevision += 1
     }
 
-    /// Shared 429 / 5xx / transport retry used by Trades and Trends.
-    private func withRetry<T>(_ work: () async throws -> T) async throws -> T {
+    /// Shared retry for Trades and Trends. `method` is the verb `work`
+    /// actually sends. The client only retries GETs, so a POST that fails
+    /// with 502 must still use this loop. Deploy-window statuses the client
+    /// already retried are not repeated. 429, other 5xx, and offline errors still are.
+    private func withRetry<T>(method: String, _ work: () async throws -> T) async throws -> T {
         var attempt = 0
         while true {
             do {
                 return try await work()
             } catch let error as APIError {
                 attempt += 1
+                // APIClient already spent the deploy-window budget on these
+                // GETs. Looping again multiplies one Trends fan-out into nine
+                // summary calls before the notice appears.
+                if TransientRetryPolicy.shouldRetry(error: error, method: method) {
+                    throw error
+                }
                 guard error.isRetryable, attempt < Self.maxAttemptsPerPage else { throw error }
                 let backoffSeconds = error.retryAfterSeconds.map(Double.init) ?? pow(2.0, Double(attempt))
                 guard backoffSeconds <= 15.0 else { throw error }
@@ -1041,7 +1050,7 @@ final class CongressTradeStore: ObservableObject {
     }
 
     private func fetchPageWithRetry(_ query: FeedQuery) async throws -> ClientFeedResponse {
-        try await withRetry {
+        try await withRetry(method: "GET") {
             try await api.feed(query: query)
         }
     }
@@ -1777,6 +1786,15 @@ enum DeliveryMode: String, CaseIterable, Identifiable {
     case webhook = "Webhook"
 
     var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .sse:
+            return "Live Stream"
+        case .webhook:
+            return "Webhook"
+        }
+    }
 }
 
 /// What the Trades header is allowed to say about "how many trades".

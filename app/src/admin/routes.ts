@@ -83,6 +83,7 @@ import { apnsLaneErrorIsRecent, inspectApnsFanoutDiagnostics, resolveApnsConfig 
 import { apnsConfigured } from '../shared/apns.ts';
 import { runSeedBackfillFromEnv } from '../backfill/seed.ts';
 import { runHouseHistoricalBackfill } from '../backfill/houseCrawler.ts';
+import { backfillHouseEmptyFiledDates } from '../ingestion/houseFiledDateBackfill.ts';
 import { runSenateBackfill } from '../backfill/senateCrawler.ts';
 import {
   senateFilingFromFetcherRow,
@@ -104,6 +105,7 @@ import {
   refuseIllegibleBandAmounts,
   rejectConstantColumnReads,
 } from '../extraction/visionIntegrityGuards.ts';
+import { assessVisionDegenerate } from '../extraction/visionDegenerateGuard.ts';
 import { PIPELINE_TX_SOURCES_SQL, VISION_SUPERSEDE_REASON } from '../extraction/sourceSupersede.ts';
 import { EXTRACTION_PROMPT_VERSION } from '../extraction/visionLlm.ts';
 import { deprecatePredecessorFilingTransactions, duplicateLineupReason, enqueueAgreementCheck, processAgreementDoc, loadDocBytes, loadFilingRow, sameRowSet, type AgreementModels } from '../extraction/agreement.ts';
@@ -134,6 +136,8 @@ import {
   type CorrectionPlan,
   type PriorTxRow,
 } from './reviewCorrection.ts';
+import { assessIdenticalAdminRepublish } from './publishContentHash.ts';
+import { recordReviewRevisionAudit } from '../shared/reviewRevisionAudit.ts';
 import {
   MEMBER_FILER_MERGES,
   MEMBER_NAME_ALIASES,
@@ -313,6 +317,8 @@ import {
   resolvePeerImportRequestId,
   resolvePeerImportSchemaVersion,
   warnPeerImportSchemaDrops,
+  warnPeerImportAuthRejected,
+  warnPeerImportNoAcceptedRows,
 } from '../share/importReceipt.ts';
 import { buildAdminMigrateStatements } from './migrateStatements.ts';
 import { executeAdminSchemaMigrations } from './schemaMigrationRunner.ts';
@@ -1234,9 +1240,9 @@ interface DeadLetterRow {
 
 /**
  * One page of ingestion-outbox dead letters: rows whose delivery failed
- * terminally (status 'failed').  These filings never reach the review queue
- * and are not ingest failures either — the filing exists, but its outbox
- * delivery died — so the queue view needs this listing to see them at all.
+ * terminally (status 'failed'). The terminal-failure sweep also opens a
+ * review_queue row when the filing has none. This listing stays the
+ * outbox-shaped view of the same failures.
  */
 async function listDeadLetters(
   db: D1Database,
@@ -1296,10 +1302,10 @@ interface DlqFailedRow {
 
 /**
  * One page of durable-queue rows in terminal failed state
- * (deno_runtime_queue).  Like the outbox dead letters, these are pipeline
- * failures no other queue surface lists.  `available` is false when the
- * table does not exist yet, so the dashboard can say so instead of
- * implying the queue is healthy.
+ * (deno_runtime_queue). Filing messages in this state are mirrored onto
+ * review_queue by the terminal-failure sweep when the filing has no row.
+ * `available` is false when the table does not exist yet, so the dashboard
+ * can say so instead of implying the queue is healthy.
  */
 async function listDlqFailedRows(
   db: D1Database,
@@ -3047,7 +3053,31 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       accessJwt: c.req.header('Cf-Access-Jwt-Assertion'),
       sessionEmail,
     });
-    if (!ok) return c.json({ error: 'unauthorized' }, 401);
+    if (!ok) {
+      const ingestAttempt = await isAuthorizedIngest(env, c.req.path, authorization);
+      if (!ingestAttempt && c.req.path.endsWith('/securities/import')) {
+        const ingestToken = (await resolveSecret(env, 'INGEST_TOKEN')).value;
+        const bearer = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+        warnPeerImportAuthRejected({
+          path: c.req.path,
+          hasAuthorization: Boolean(authorization?.trim()),
+          ingestTokenConfigured: Boolean(ingestToken),
+          ingestBearerAttempt: Boolean(bearer && ingestToken),
+        });
+        return c.json(
+          {
+            error: 'unauthorized',
+            reason: !ingestToken
+              ? 'ingest_token_unconfigured'
+              : !authorization?.trim()
+                ? 'missing_bearer'
+                : 'ingest_bearer_mismatch_or_admin_required',
+          },
+          401,
+        );
+      }
+      return c.json({ error: 'unauthorized' }, 401);
+    }
     await next();
   });
 
@@ -3895,8 +3925,73 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
              WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
           )`;
     const reviveRowsJson = JSON.stringify(reviveRows);
-    const changedReviveIds = reviveChangedIds(new Map(prior.map((row) => [row.id, row])), reviveRows);
+    const storedById = new Map(prior.map((row) => [row.id, row]));
+    const changedReviveIds = reviveChangedIds(storedById, reviveRows);
     const changedReviveIdsJson = changedReviveIds.length === 0 ? null : JSON.stringify(changedReviveIds);
+    const identicalRepublish = await assessIdenticalAdminRepublish({
+      edits,
+      plan: correctionPlan,
+      prior,
+      insertCount: insertRows.length,
+      reviveRows,
+      storedById,
+    });
+    const resolutionReason = decision === 'manual' ? 'admin_manual' : 'admin_confirmed';
+    const identicalTrigger = decision === 'manual'
+      ? 'admin_manual_identical_noop'
+      : 'admin_confirm_identical_noop';
+
+    if (identicalRepublish.identical) {
+      const liveActive = prior.some((row) => !row.deprecated_at);
+      if (liveActive) {
+        const noopResults = await batch(c.env.DB, [
+          [
+            `UPDATE review_queue
+                SET resolved = 1,
+                    agreement_suppressed_at = NULL,
+                    agreement_suppression_reason = NULL,
+                    resolution_kind = 'published',
+                    resolution_reason = ?,
+                    resolved_at = CURRENT_TIMESTAMP
+              WHERE doc_id = ? AND resolved = 0 AND review_revision = ?`,
+            [resolutionReason, docId, reviewRevision],
+          ],
+          [
+            `UPDATE filings SET ingest_status = 'persisted'
+              WHERE doc_id = ?
+                AND EXISTS (SELECT 1 FROM review_queue
+                  WHERE doc_id = ? AND resolved = 1 AND review_revision = ?)`,
+            [docId, docId, reviewRevision],
+          ],
+        ]);
+        if ((noopResults[0]?.meta?.changes ?? 0) === 0) {
+          return c.json({ error: 'review item changed; reload it before deciding' }, 409);
+        }
+        await recordReviewRevisionAudit(c.env.DB, {
+          docId,
+          revision: reviewRevision,
+          trigger: identicalTrigger,
+          contentHash: identicalRepublish.contentHash,
+          detail: { decision, liveActive: true },
+          createdAt: nowIso,
+        });
+        return c.json({
+          docId,
+          decision,
+          source,
+          resolved: true,
+          noop: true,
+          identical: true,
+          reviewRevision,
+          contentHash: identicalRepublish.contentHash,
+          republish: correctionSummary(correctionPlan),
+        });
+      }
+    }
+
+    const reviewRevisionSql = identicalRepublish.identical
+      ? 'review_revision = review_revision'
+      : 'review_revision = review_revision + 1';
     const reviveStatements: Array<[string, SqlParam[]]> = reviveRows.length === 0 ? [] : [
       // Only the rows whose stored fields change (diffed in JS against the
       // prior SELECT) are bound here, as an id list, so the batch never
@@ -4018,11 +4113,11 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
                   resolution_kind = 'published',
                   resolution_reason = ?,
                   resolved_at = CURRENT_TIMESTAMP,
-                  review_revision = review_revision + 1
+                  ${reviewRevisionSql}
             WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
               AND ${completeLiveSet}`,
           [
-            decision === 'manual' ? 'admin_manual' : 'admin_confirmed',
+            resolutionReason,
             docId, reviewRevision,
             docId, source, rowKeysJson, rowKeys.length,
             docId, rowKeys.length,
@@ -4039,6 +4134,22 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     if ((resolvedResult?.meta?.changes ?? 0) === 0) {
       return c.json({ error: 'review item changed or not all edited rows could be persisted' }, 409);
     }
+    const nextReviewRevision = identicalRepublish.identical
+      ? reviewRevision
+      : reviewRevision + 1;
+    const publishTrigger = decision === 'manual' ? 'admin_manual' : 'admin_confirmed';
+    await recordReviewRevisionAudit(c.env.DB, {
+      docId,
+      revision: nextReviewRevision,
+      trigger: identicalRepublish.identical ? identicalTrigger : publishTrigger,
+      contentHash: identicalRepublish.contentHash,
+      detail: {
+        decision,
+        identical: identicalRepublish.identical,
+        inserted: persistResults[0]?.meta?.changes ?? 0,
+      },
+      createdAt: nowIso,
+    });
     const insertedCount = persistResults[0]?.meta?.changes ?? 0;
     const newlyInsertedIds = insertedCount === proposedIds.length ? proposedIds : [];
     let transactionIds = newlyInsertedIds;
@@ -4116,6 +4227,10 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       inserted: insertedCount,
       transactionIds,
       delivery,
+      reviewRevision: nextReviewRevision,
+      noop: identicalRepublish.identical ? true : undefined,
+      identical: identicalRepublish.identical ? true : undefined,
+      contentHash: identicalRepublish.contentHash,
       republish: correctionSummary(correctionPlan),
     });
   });
@@ -4209,6 +4324,13 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       return c.json({ error: 'review item changed before it could be unpublished' }, 409);
     }
     const deprecated = results[0]?.meta?.changes ?? 0;
+    await recordReviewRevisionAudit(c.env.DB, {
+      docId,
+      revision: reviewRevision + 1,
+      trigger: 'admin_unpublish',
+      detail: { reason, deprecatedTransactions: deprecated },
+      createdAt: nowIso,
+    });
     void notifyReviewQueuePublisher(c.env, {
       docId,
       reason: holdReason,
@@ -4943,6 +5065,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
         'UW_DEEP_MATCH_DATES_PER_RUN',
         'HOUSE_LIVE_SEARCH_ENABLED', 'HOUSE_PRIOR_YEAR_OVERLAP_DAYS',
         'SENATE_LOOKBACK_DAYS', 'SENATE_MAX_LOOKBACK_DAYS',
+        'RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD',
         'SEED_HOUSE_URL', 'SEED_SENATE_URL',
         'OGE_WATCH_ENABLED', 'OGE_INDEX_URL', 'OGE_POLL_INTERVAL_SEC', 'OGE_MAX_VISION_BYTES',
         'VISION_PRIMARY_MODEL', 'ARBITRATION_ENABLED', 'ARBITRATION_MODEL',
@@ -6742,6 +6865,35 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   //   { fromYear?: number, toYear?: number, maxFilings?: number, dryRun?: boolean }
   // maxFilings defaults to 500. dryRun only counts matching PTRs; it does not
   // write filings rows or enqueue pipeline work.
+  // --- POST /backfill/house-filed-dates ------------------------------------
+  // CT-2481: backfill NULL House filed_date from the official FD index (preferred)
+  // or the Clerk Received stamp in stored PDF text. Defaults to dryRun=true.
+  r.post('/backfill/house-filed-dates', async (c) => {
+    let body: Record<string, unknown> = {};
+    try {
+      const raw = await c.req.text();
+      if (raw) body = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'invalid JSON body' }, 400);
+    }
+    const dryRun = body.dryRun !== false;
+    const limit = typeof body.limit === 'number' && body.limit > 0 ? Math.floor(body.limit) : 200;
+    const maxYears = typeof body.maxYears === 'number' && body.maxYears > 0 ? Math.floor(body.maxYears) : 2;
+    const useOcr = body.useOcr !== false;
+    try {
+      const result = await backfillHouseEmptyFiledDates(c.env, {
+        dryRun,
+        limit,
+        maxYears,
+        useOcr,
+        relayUrl: c.env.HOUSE_RELAY_URL || c.env.INGEST_RELAY_URL,
+      });
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 500);
+    }
+  });
+
   r.post('/house-backfill', async (c) => {
     let body: Record<string, unknown> = {};
     try {
@@ -7664,6 +7816,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // value.
     const bandChecked = refuseIllegibleBandAmounts(deduped.rows);
     const columnChecked = rejectConstantColumnReads(bandChecked.rows);
+    const visionDegenerate = assessVisionDegenerate(columnChecked.rows);
     const parsedTx = columnChecked.rows;
 
     try {
@@ -7765,6 +7918,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           value: r.value,
           rowCount: r.rowIndexes.length,
         })),
+        visionDegenerate,
       });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
@@ -11604,6 +11758,14 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     const accepted = acceptedCountsFromSummary(summary);
     const rejected = rejectedCountsFromErrors(summary.errors);
     warnPeerImportSchemaDrops({ requestId, origin: originTag, dropped, payloadBytes });
+    warnPeerImportNoAcceptedRows({
+      requestId,
+      origin: originTag,
+      payloadBytes,
+      dropped,
+      accepted,
+      rawBody: body,
+    });
     try {
       await persistPeerImportReceipt(c.env.DB, {
         requestId,

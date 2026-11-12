@@ -801,6 +801,8 @@ export const DASHBOARD_CSS = /* css */ `
     input, select, .icon-input { font-size: 16px; }
     .branch-info { width: 44px; height: 44px; }
     .filters-info-wrap .branch-info { width: 44px; height: 44px; }
+    /* Chart # / $ and Directory People / Assets sit outside --control-h. */
+    .seg button { min-width: 44px; min-height: 44px; }
   }
   /* Segmented time-range control for the buys/sells chart. */
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }

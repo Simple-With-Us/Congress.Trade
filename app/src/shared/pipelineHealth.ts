@@ -51,6 +51,10 @@ import {
   collectStPeerPricesMetrics,
   stPeerPricesMetricsToCheck,
 } from '../prices/stPeerPricesHealth.ts';
+import {
+  collectStInboundMarketDataMetrics,
+  stInboundMarketDataMetricsToCheck,
+} from '../share/stInboundMarketDataHealth.ts';
 import { emptyFetchAlertWhere, emptyFetchSeenCutoff } from '../ingestion/emptyFetchHandoff.ts';
 import { collectDeliveryModeCheck } from '../delivery/deliveryMode.ts';
 import {
@@ -1141,11 +1145,14 @@ export function evaluatePipelineSignals(
       const ageMin = Number.isFinite(checkedMs) ? (nowMs - checkedMs) / 60_000 : Infinity;
       const host = probe.host ?? 'residential-proxy';
       if (!probe.ok) {
+        const outageSince = (probe as { outageStartedAt?: string | null }).outageStartedAt;
+        const outageNote = outageSince ? ` — outage since ${outageSince}` : '';
         checks.push({
           id: 'senate_relay',
           status: 'stalled',
           detail: `Residential proxy DOWN at ${host}`
             + `${probe.status != null ? ` (HTTP ${probe.status})` : ''}`
+            + outageNote
             + ' — Senate/House fetches may fail Imperva checks until the proxy is back.',
           value: probe.status,
         });
@@ -2152,10 +2159,16 @@ export async function checkPipelineHealth(
     readPipelineStallHours(env, 'st_peer_prices'),
   );
   const stPeerCheck = stPeerPricesMetricsToCheck(stPeerMetrics);
+  const stInboundMetrics = await collectStInboundMarketDataMetrics(
+    env,
+    now,
+    readPipelineStallHours(env, 'st_inbound_market_data'),
+  );
+  const stInboundCheck = stInboundMarketDataMetricsToCheck(stInboundMetrics);
   const emptyFetchCheck = (precomputed.emptyFetch ?? await collectEmptyFetchHandoffCheck(env, now)).check;
   // Subscriber alert pause: never let CT_DELIVERY_MODE sit off silently.
   const deliveryModeCheck = await collectDeliveryModeCheck(env, now);
-  const checks = [...evaluated.checks, stPeerCheck, emptyFetchCheck, deliveryModeCheck];
+  const checks = [...evaluated.checks, stPeerCheck, stInboundCheck, emptyFetchCheck, deliveryModeCheck];
   let status: PipelineStatus = 'ok';
   for (const c of checks) {
     status = worstStatus(status, c.status);

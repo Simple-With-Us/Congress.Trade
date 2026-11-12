@@ -606,7 +606,7 @@ describe('runPriceRefresh — rotating cursor for the bounded catch-up (CT-2445)
     h.responses.set('TAIL', [{ date: daysAgo(1), close: 10 }]);
 
     // max 3 = 1 S&P call + 2 tickers.
-    const first = await runPriceRefresh(env, { max: 3, afterCursorSeq: null });
+    const first = await runPriceRefresh(env, { max: 3, afterCursorSeq: -1 });
     expect(h.eodCalls.filter((c) => c.symbol !== 'SPY').map((c) => c.symbol)).toEqual(['ERRA', 'ERRB']);
     expect(first.reachedEndOfPending).toBe(false);
     expect(first.lastCursorSeq).not.toBeNull();

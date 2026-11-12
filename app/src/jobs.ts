@@ -15,6 +15,7 @@ import { run, all, batch as batchStatements } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
 import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
 import {
+  markDisclosureUnsupportedPeerPrices,
   markStuckPeerPriceTickersNotCovered,
   recheckNotCoveredPeerPrices,
 } from './prices/notCovered.ts';
@@ -39,12 +40,17 @@ import {
   PEER_PRICE_CATCHUP_MAX_TICKERS,
   parsePeerPriceCatchUpState,
   peerPriceCatchUpAfterRun,
+  peerPriceCatchUpAnchoredRunCap,
   peerPriceCatchUpGate,
   peerPriceSnapshotNeedsCatchUp,
   isProviderLevelPriceError,
   readPeerPricePending,
   type PeerPriceCatchUpState,
 } from './prices/peerPriceCatchUp.ts';
+import {
+  peerPriceDrainMadeProgress,
+  recordPeerPriceDrainProgress,
+} from './prices/peerPriceDrainProgress.ts';
 // NOTE: runHouseReconciler (./ingestion/houseReconciler) is intentionally not
 // imported here yet -- it is reserved for future scheduled-job wiring. Importing
 // it unused would trip noUnusedLocals (enabled in this PR).
@@ -525,13 +531,32 @@ export async function maybeRunPeerPriceCatchUp(
   } catch {
     return 'stamped'; // no KV → skip rather than risk an unbounded hourly walk
   }
-  if (peerPriceCatchUpGate(state, now) !== 'ok') return 'stamped';
-  const before = await readPeerPricePending(env, now);
+  const beforeProbe = await readPeerPricePending(env, now);
+  const runCap = peerPriceCatchUpAnchoredRunCap(state, beforeProbe?.pending ?? null);
+  if (peerPriceCatchUpGate(state, now, { maxRuns: runCap }) !== 'ok') return 'stamped';
+  const before = beforeProbe;
   if (!before || !peerPriceSnapshotNeedsCatchUp(before)) return 'stamped';
+  try {
+    const disclosure = await markDisclosureUnsupportedPeerPrices(env, now);
+    if (disclosure.marked > 0) {
+      console.log(`catch-up disclosure sweep marked ${disclosure.marked} ticker(s) not covered`);
+    }
+  } catch (err) {
+    console.warn('catch-up disclosure sweep failed:', (err as Error).message);
+  }
+  try {
+    const stuck = await markStuckPeerPriceTickersNotCovered(env, now);
+    if (stuck.marked > 0) {
+      console.log(`catch-up stuck sweep marked ${stuck.marked} ticker(s) not covered`);
+    }
+  } catch (err) {
+    console.warn('catch-up stuck sweep failed:', (err as Error).message);
+  }
   if (await dailyBudgetExceeded(env, 'price catch-up')) return 'budget';
 
   const claimed: PeerPriceCatchUpState = {
     ...state,
+    runCap,
     runs: state.runs + 1,
     attempts: state.attempts + 1,
     lastRunAt: now.toISOString(),
@@ -605,6 +630,7 @@ export async function maybeRunPeerPriceCatchUp(
   // Same clock as the before-count, so both count the same pending set even
   // when the run crosses the midnight-ET rollover.
   const after = await readPeerPricePending(env, now);
+  const tickersPriced = refresh?.tickersPriced ?? 0;
   const next = peerPriceCatchUpAfterRun(claimed, {
     pendingBefore: before.pending,
     pendingAfter: after?.pending ?? null,
@@ -612,7 +638,17 @@ export async function maybeRunPeerPriceCatchUp(
     reachedEndOfPending,
     failed: status === 'error' || providerNeverEngaged,
     spendRun: !providerNeverEngaged,
+    tickersPriced,
   });
+  if (
+    peerPriceDrainMadeProgress({
+      pendingBefore: before.pending,
+      pendingAfter: after?.pending ?? null,
+      tickersPriced,
+    })
+  ) {
+    await recordPeerPriceDrainProgress(env, now);
+  }
   console.log(
     'price catch-up:',
     JSON.stringify({
@@ -737,6 +773,7 @@ export async function maybeRunDailyMarketDataJobs(
   let priceRefreshAttemptedAllPending = false;
   await sweepTerminalPeerPrices(env, now);
   await sweepUnpriceablePeerPrices(env, now);
+  const pricePendingBefore = await readPeerPricePending(env, now);
   try {
     const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });
     priceRefreshAttemptedAllPending = r.attemptedAllPending;
@@ -744,6 +781,16 @@ export async function maybeRunDailyMarketDataJobs(
     share.prices = r.sharePrices;
     share.spx = r.shareSpx;
     if (r.aborted) priceRefreshFailed = true;
+    const pricePendingAfter = await readPeerPricePending(env, now);
+    if (
+      peerPriceDrainMadeProgress({
+        pendingBefore: pricePendingBefore?.pending ?? 0,
+        pendingAfter: pricePendingAfter?.pending ?? null,
+        tickersPriced: r.tickersPriced,
+      })
+    ) {
+      await recordPeerPriceDrainProgress(env, now);
+    }
   } catch (err) {
     console.warn('daily price refresh failed:', (err as Error).message);
     errors.push('prices: ' + (err as Error).message);
@@ -760,6 +807,14 @@ export async function maybeRunDailyMarketDataJobs(
   // leaves tickers unattempted, so a stale price_checked_at says nothing
   // about ST.
   if (!priceRefreshFailed && priceRefreshAttemptedAllPending) {
+    try {
+      const disclosure = await markDisclosureUnsupportedPeerPrices(env, now);
+      if (disclosure.marked > 0) {
+        console.log(`not-covered disclosure sweep marked ${disclosure.marked} unsupported ticker(s)`);
+      }
+    } catch (err) {
+      console.warn('not-covered disclosure sweep failed:', (err as Error).message);
+    }
     try {
       const swept = await markStuckPeerPriceTickersNotCovered(env, now);
       if (swept.marked > 0) {

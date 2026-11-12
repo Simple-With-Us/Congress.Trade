@@ -33,7 +33,7 @@ DOCKER="${DOCKER:-docker}"
 # Labels, timestamps, and image ids only. Env, mounts, and volume options stay
 # out of the collected snapshot.
 CONTAINER_FMT='{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Created":{{json .Created}},"Status":{{json .State.Status}},"FinishedAt":{{json .State.FinishedAt}},"StartedAt":{{json .State.StartedAt}},"Labels":{{json .Config.Labels}}}'
-IMAGE_FMT='{"Id":{{json .Id}},"Created":{{json .Created}},"Size":{{.Size}},"RepoTags":{{json .RepoTags}},"Labels":{{json .Config.Labels}}}'
+IMAGE_FMT='{"Id":{{json .Id}},"Created":{{json .Created}},"Size":{{.Size}},"RepoTags":{{json .RepoTags}},"Labels":{{json (index .Config "Labels")}}}'
 
 die() {
   echo "docker-reclaim: $*" >&2
