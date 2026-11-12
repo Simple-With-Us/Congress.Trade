@@ -246,6 +246,15 @@ assert_contains "$(combined)" "checkpoint skipped reason=dry-run mode=PASSIVE" "
 assert_not_contains "$(cat "${WRAP_LOG}")" "wal_checkpoint" "DRY_RUN does not call wal_checkpoint"
 assert_contains "$(cat "${WRAP_LOG}")" "PRAGMA freelist_count;" "DRY_RUN still reads page stats"
 
+plain="${TMP}/plain.sqlite"
+"${REAL_SQLITE}" "${plain}" "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES ('kept-plain');"
+maint bash "${SCRIPT}" --lock-file "${LOCK}" --db "${plain}" --vacuum
+expect_code 3 "a non-WAL database still reaches the vacuum guards"
+assert_contains "$(combined)" "checkpoint skipped reason=not-wal" "a rollback database is reported as not-wal"
+assert_not_contains "$(combined)" "checkpoint-parse" "a not-WAL checkpoint is not a parse error"
+assert_contains "$(combined)" "reason=backup-marker-missing" "not-wal does not skip the vacuum guards"
+assert_eq "$("${REAL_SQLITE}" "${plain}" "SELECT v FROM t WHERE id=1;")" "kept-plain" "a not-WAL report keeps the row"
+
 maint bash "${SCRIPT}" --lock-file "${LOCK}" --db "${db}" --checkpoint none
 expect_code 0 "checkpoint none exits 0"
 assert_contains "$(combined)" "reason=checkpoint-none" "none mode is reported"
@@ -514,6 +523,7 @@ assert_contains "${service_text}" "SQLITE_CHECKPOINT=passive" "service checkpoin
 assert_not_contains "${service_text}" "SQLITE_VACUUM" "service does not opt into VACUUM"
 assert_not_contains "${service_text}" "--vacuum" "service command has no vacuum flag"
 assert_contains "${timer_text}" "OnCalendar=Sun 09:30:00" "timer is weekly"
+assert_not_contains "${timer_text}" "Requires=" "timer does not start the service when the timer starts"
 assert_not_contains "${timer_text}" "--vacuum" "timer has no vacuum flag"
 assert_not_contains "${timer_text}" "SQLITE_VACUUM" "timer does not opt into VACUUM"
 

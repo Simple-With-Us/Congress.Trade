@@ -4,7 +4,6 @@
 # 06:00 and 20:00 Central backup slots.
 [Unit]
 Description=Weekly Congress.Trade sqlite report and passive WAL checkpoint
-Requires=sqlite-maintenance.service
 
 [Timer]
 OnCalendar=Sun 09:30:00

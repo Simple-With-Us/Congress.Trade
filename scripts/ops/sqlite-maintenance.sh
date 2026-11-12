@@ -115,6 +115,11 @@ is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+# wal_checkpoint returns -1 for log and checkpointed when the file is not WAL.
+is_checkpoint_int() {
+  [[ "${1:-}" =~ ^-?[0-9]+$ ]]
+}
+
 raise_code() {
   local code="$1"
   local current next
@@ -582,16 +587,21 @@ process_one() {
     ck_busy=${ck_busy//[[:space:]]/}
     ck_log=${ck_log//[[:space:]]/}
     ck_ckpt=${ck_ckpt//[[:space:]]/}
-    if ! is_uint "$ck_busy" || ! is_uint "$ck_log" || ! is_uint "$ck_ckpt"; then
+    if ! is_uint "$ck_busy" || ! is_checkpoint_int "$ck_log" || ! is_checkpoint_int "$ck_ckpt"; then
       say "sqlite-maintenance: error checkpoint-parse db=$db raw=${last}"
       append_row "$db" "checkpoint-parse" "$file_bytes" "$wal_bytes" "$shm_bytes" \
         "$page_size" "$page_count" "$freelist" "$reclaim" "" "" "" "" "" "0" "" ""
       raise_code 1
       return 0
     fi
-    say "sqlite-maintenance: checkpoint mode=$CHECKPOINT_MODE busy=$ck_busy log=$ck_log checkpointed=$ck_ckpt db=$db"
-    if [[ "$CHECKPOINT_MODE" != "PASSIVE" && "$ck_busy" != "0" ]]; then
-      raise_code 4
+    if [[ "$ck_log" == "-1" || "$ck_ckpt" == "-1" ]]; then
+      ck_skipped="not-wal"
+      say "sqlite-maintenance: checkpoint skipped reason=not-wal mode=$CHECKPOINT_MODE busy=$ck_busy log=$ck_log checkpointed=$ck_ckpt db=$db"
+    else
+      say "sqlite-maintenance: checkpoint mode=$CHECKPOINT_MODE busy=$ck_busy log=$ck_log checkpointed=$ck_ckpt db=$db"
+      if [[ "$CHECKPOINT_MODE" != "PASSIVE" && "$ck_busy" != "0" ]]; then
+        raise_code 4
+      fi
     fi
   fi
 

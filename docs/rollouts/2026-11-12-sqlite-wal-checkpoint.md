@@ -10,6 +10,8 @@ VACUUM runs only when free disk is at least 2.5 times the main file size, a back
 
 Host install is out of scope and waits for Jay.  This change does not SSH to the host and does not edit the CT-2471 or CT-2472 scripts.
 
+A database that is not in WAL mode returns `0|-1|-1` from `wal_checkpoint`.  The script reports that as `not-wal` and continues, instead of treating the minus signs as a parse error.  The sample timer does not use `Requires=` on the service, so enabling the timer does not start a checkpoint immediately.
+
 ## Files changed
 
 - `scripts/ops/sqlite-maintenance.sh`
