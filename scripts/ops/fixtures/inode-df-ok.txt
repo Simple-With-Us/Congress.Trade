@@ -1,0 +1,5 @@
+Filesystem     Type     Inodes IUsed IFree IUse% Mounted on
+/dev/sda1      ext4   9830400  50000 9780400    1% /
+tmpfs          tmpfs    512000    200  511800    1% /run
+overlay        overlay  256000   1000  255000    1% /var/lib/docker/overlay2/abc
+/dev/sdb1      xfs    5242880 100000 5142880    2% /data
