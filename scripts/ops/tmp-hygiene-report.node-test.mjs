@@ -84,13 +84,20 @@ test('the report is read-only and prints bytes, inodes, and top directories', ()
 
 test('a long top-level listing still exits 0', () => {
   const root = mkdtempSync(join(tmpdir(), 'tmp-hygiene-many-'));
+  const directories = 380;
+  const pad = 'x'.repeat(180);
   try {
-    for (let i = 0; i < 2000; i += 1) {
-      mkdirSync(join(root, `d${String(i).padStart(4, '0')}`));
+    for (let i = 0; i < directories; i += 1) {
+      mkdirSync(join(root, `d${String(i).padStart(4, '0')}${pad}`));
     }
+    const probe = spawnSync('bash', ['-c', `
+      set -o pipefail
+      find -P "$1" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' | sort | head -n 10 >/dev/null
+    `, 'bash', root], { encoding: 'utf8' });
+    assert.equal(probe.status, 141, probe.stderr);
     const run = spawnSync('bash', [reportPath.pathname, root], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
-    const listed = run.stdout.split('\n').filter((line) => /^\d+\td\d{4}$/.test(line));
+    const listed = run.stdout.split('\n').filter((line) => /^\d+\td\d{4}x{180}$/.test(line));
     assert.equal(listed.length, 10);
   } finally {
     rmSync(root, { recursive: true, force: true });
