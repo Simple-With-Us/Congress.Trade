@@ -295,11 +295,13 @@ def row_bands(gray: np.ndarray, xs: Sequence[int]) -> Tuple[List[Tuple[int, int]
         else:
             groups.append([y])
     rules: List[int] = []
+    bars: List[Tuple[int, int]] = []
     bar_bottoms: List[int] = []
     for group in groups:
         if len(group) <= 5:
             rules.append(int(round(sum(group) / len(group))))
         elif len(group) >= 12:
+            bars.append((group[0], group[-1]))
             bar_bottoms.append(group[-1])
     if len(rules) < 3 and not bar_bottoms:
         return [], 0
@@ -334,6 +336,34 @@ def row_bands(gray: np.ndarray, xs: Sequence[int]) -> Tuple[List[Tuple[int, int]
             for bottom in bar_bottoms:
                 nxt = min((edge for edge in edges if edge > bottom + 8), default=None)
                 if nxt is not None and abs(nxt - bottom - pitch) <= pitch * 0.45:
+                    edges.append(bottom + 1)
+    # A row rule that touches a trust bar is absorbed into the bar. Keep the
+    # one-pitch rows above and below it when the asset column still has ink.
+    if pitch > 0 and bars:
+        asset_left = int(xs[1]) + 6
+        asset_right = int(xs[2]) - 6
+
+        def _inked_row(y0: int, y1: int) -> bool:
+            if asset_right - asset_left < 8 or y1 - y0 < 8:
+                return False
+            asset = gray[y0 + 4:y1 - 2, asset_left:asset_right:2]
+            block = gray[y0:y1:2, x0:x1:4]
+            if asset.size == 0 or float((asset < 160).mean()) < 0.035:
+                return False
+            if block.size and float((block < 150).mean()) > 0.45:
+                return False
+            return True
+
+        for top, bottom in bars:
+            prev = [rule for rule in data_rules if rule < top]
+            nxt = [rule for rule in data_rules if rule > bottom]
+            if prev:
+                gap = top - prev[-1]
+                if pitch * 0.75 <= gap <= pitch * 1.35 and _inked_row(prev[-1], top):
+                    edges.append(top)
+            if nxt:
+                gap = nxt[0] - bottom
+                if pitch * 0.75 <= gap <= pitch * 1.35 and _inked_row(bottom, nxt[0]):
                     edges.append(bottom + 1)
     sorted_edges = sorted({edge for edge in edges if first_bar is None or edge >= first_bar})
     bands: List[Tuple[int, int]] = []
@@ -371,8 +401,8 @@ def _parse_date(text: str) -> Optional[str]:
     month, day, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
     if year < 100:
         year += 2000
-    # "10" is often read as 16 or 20. Those months cannot exist, so keep the day.
-    if month in (16, 18, 19, 20):
+    # "10" is often read as 16, 20, 30, or 40. Those months cannot exist, so keep the day.
+    if month in (16, 18, 19, 20, 30, 40):
         month = 10
     if not (1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100):
         return None
@@ -397,7 +427,7 @@ def _owner(text: str) -> Optional[str]:
     letters = re.sub(r"[^A-Z]", "", token)
     if len(letters) < 2 or len(letters) > 3:
         return None
-    if letters in {"OC", "PC", "DO", "OD", "QC", "CG", "CD"}:
+    if letters in {"OC", "PC", "DO", "OD", "QC", "CG", "CD", "BC", "CC", "HC"}:
         return "dependent"
     if letters in {"SD", "SF", "PS"}:
         return "spouse"
@@ -515,8 +545,17 @@ def read_grid_page(gray: np.ndarray, boxes: Sequence[OcrBox], page: int = 1) -> 
             confidence = min(0.9, 0.42 + min(0.2, marks.type_score * 0.2) + (0.12 if marks.amount_reason == "ok" else 0) + (0.08 if trade_date else 0))
         ticker = None
         found = re.search(r"\(([A-Z]{1,5})\)", asset)
+        bare = re.search(r"^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$", asset)
+        ticker_deny = {
+            "INC", "CMN", "LLC", "PLC", "CORP", "CO", "ETF", "LTD", "USD", "USD0", "ADR",
+            "COM", "FUND", "CLASS", "HLDG", "STOCK", "TRUST", "THE", "AND", "NEW", "CL",
+            "COMMON", "SHARES", "INDEX", "LINKED", "COMPANY",
+        }
         if found:
             ticker = found.group(1)
+        elif bare and bare.group(2) not in ticker_deny:
+            ticker = bare.group(2)
+            asset = bare.group(1)
         rows.append(GridRow(
             asset_name=asset or f"(unreadable asset p{page})",
             owner=owners[0] if owners else None,

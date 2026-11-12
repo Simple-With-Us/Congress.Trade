@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { hasHardFailureFlags, scoreFields } from '../normalizer.ts';
 import { shouldEnqueueAgreement } from '../extractRouting.ts';
@@ -12,6 +13,7 @@ import {
   fitColumnLines,
   cleanGridAssetName,
   ownerCodeFromCell,
+  splitBareTicker,
   readHouseGridForm,
   xTemplateForFit,
   type GrayImage,
@@ -410,6 +412,52 @@ describe('grid row, owner, and date corrections', () => {
     expect(cleanGridAssetName('ON SEMICONOUCTOR CORPORATION CMN')).toBe('ON SEMICONDUCTOR CORPORATION CMN');
     expect(cleanGridAssetName('NETFLIX INC CAN')).toBe('NETFLIX INC CMN');
     expect(cleanGridAssetName('AGILENT TECHNOLOGIES NC CMN')).toBe('AGILENT TECHNOLOGIES INC CMN');
+    expect(cleanGridAssetName('INTEL CORP COM USDO 001')).toBe('INTEL CORP COM USD0 001');
+    expect(cleanGridAssetName('UNSPONSORED AOR')).toBe('UNSPONSORED ADR');
+    expect(cleanGridAssetName('CARVANA CO CMNCLASSA')).toBe('CARVANA CO CMN CLASS A');
+    expect(cleanGridAssetName('AGILENT TECHNOLOGIES [NC CMN')).toBe('AGILENT TECHNOLOGIES INC CMN');
+    expect(cleanGridAssetName('CARRIER GLOBAL CORPORATION C©MIN')).toBe('CARRIER GLOBAL CORPORATION CMN');
+    expect(cleanGridAssetName('COOPER COSINC/THECMN')).toBe('COOPER COS INC THE CMN');
+    expect(cleanGridAssetName('GRAPHIC PACKAGING KLDG CO CMN')).toBe('GRAPHIC PACKAGING HLDG CO CMN');
+    expect(cleanGridAssetName('ROYAL CARIBBEAN GROUP ISIN LROOO8862868')).toBe('ROYAL CARIBBEAN GROUP ISIN LR0008862868');
+  });
+
+  it('keeps a parenthetical ticker and a bare ticker written after two spaces', () => {
+    expect(splitBareTicker('APPLE INC (AAPL)')).toEqual({ name: 'APPLE INC (AAPL)', ticker: 'AAPL' });
+    expect(splitBareTicker('SPDR SER TR S&P 400 MID CAP ETF  SPMD')).toEqual({
+      name: 'SPDR SER TR S&P 400 MID CAP ETF',
+      ticker: 'SPMD',
+    });
+    expect(splitBareTicker('SELECT SECTOR SPDR ENERGY SEL SEC ETF XLE').ticker).toBeNull();
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: 'JT', asset: 'ISHARES TR 10 20 YR TREAS BD ETF  TLH', txDate: '10/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.p, 9] },
+      { y0: 300, y1: 380, owner: 'JT', asset: '', txDate: '', notifDate: '', marks: [] },
+      { y0: 380, y1: 460, owner: 'JT', asset: '', txDate: '', notifDate: '', marks: [] },
+      { y0: 460, y1: 540, owner: 'JT', asset: '', txDate: '', notifDate: '', marks: [] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    expect(read.transactions).toHaveLength(1);
+    expect(read.transactions[0]).toMatchObject({
+      owner: 'joint',
+      ticker: 'TLH',
+      txType: 'B',
+      txDate: '2026-10-22',
+      amountMin: 1001,
+      amountMax: 15000,
+    });
+    expect(read.transactions[0]?.assetName).not.toMatch(/TLH/);
+  });
+
+  it('reads an impossible OCR month 40 as October', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: 'JT', asset: 'SELECT SECTOR SPDR ENERGY  XLE', txDate: '40/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.s, 9] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    expect(read.transactions[0]?.txDate).toBe('2026-10-22');
+    expect(read.transactions[0]?.ticker).toBe('XLE');
+    expect(read.transactions[0]?.owner).toBe('joint');
   });
 
   it('reads a stamped DC owner cell when the text box is missing', () => {
@@ -426,6 +474,31 @@ describe('grid row, owner, and date corrections', () => {
       }
     }
     expect(ownerCodeFromCell(image, 0, 0, 80, 40)).toBe('dependent');
+  });
+});
+
+describe('Fleischmann H-2026-9116403 hand rows', () => {
+  const rows = JSON.parse(readFileSync(new URL('../__fixtures__/H-2026-9116403-hand-rows.json', import.meta.url), 'utf8')) as Array<{
+    page: number;
+    assetName: string;
+    ticker: string;
+    txType: string;
+    owner: string;
+    txDate: string;
+    notificationDate: string;
+    amountMin: number;
+    amountMax: number;
+  }>;
+
+  it('locks the seven hand-checked rows and leaves page 2 blanks out', () => {
+    expect(rows).toHaveLength(7);
+    expect(new Set(rows.map((row) => row.owner))).toEqual(new Set(['joint']));
+    expect(new Set(rows.map((row) => row.txDate))).toEqual(new Set(['2026-10-22']));
+    expect(new Set(rows.map((row) => row.notificationDate))).toEqual(new Set(['2026-11-01']));
+    expect(rows.every((row) => row.amountMin === 1001 && row.amountMax === 15000)).toBe(true);
+    expect(rows.filter((row) => row.page === 1).map((row) => row.ticker)).toEqual(['TLH', 'IEUR', 'SPYG', 'XAR', 'SPTI']);
+    expect(rows.filter((row) => row.page === 2).map((row) => `${row.txType}:${row.ticker}`)).toEqual(['B:SPMD', 'S:XLE']);
+    expect(rows.map((row) => row.txType).join('')).toBe('BSSBSBS');
   });
 });
 

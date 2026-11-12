@@ -8,6 +8,8 @@
 import {
   planHouseGridColumns,
   readHouseGridForm,
+  rowBands,
+  shouldSkipHouseGridCover,
   type GrayImage,
   type HouseGridFormReader,
   type HouseGridOcrBox,
@@ -16,6 +18,9 @@ import {
 const PDFTOPPM = 'pdftoppm';
 const TESSERACT = 'tesseract';
 const RENDER_DPI = 150;
+// Text cells are rendered at twice the mark image so a 10px glyph is a real
+// sample, not a nearest-neighbor blow-up of the 150 DPI page.
+const TEXT_DPI = 300;
 const MAX_PAGES = 40;
 
 interface CommandOutput {
@@ -34,6 +39,9 @@ async function runBinary(cmd: string, args: string[], timeoutMs: number): Promis
       stdout: 'piped',
       stderr: 'piped',
       stdin: 'null',
+      // LSTM OpenMP inside each tesseract process. Eight of those on a small
+      // machine spend their time fighting over cores instead of reading cells.
+      env: cmd === TESSERACT ? { OMP_THREAD_LIMIT: '1', OMP_NUM_THREADS: '1' } : undefined,
     });
     const child = command.spawn();
     const timer = setTimeout(() => {
@@ -126,6 +134,17 @@ function cropGray(image: GrayImage, x0: number, y0: number, x1: number, y1: numb
   return { width, height, pixels };
 }
 
+function padGray(image: GrayImage, pad: number): GrayImage {
+  const width = image.width + pad * 2;
+  const height = image.height + pad * 2;
+  const pixels = new Uint8Array(width * height);
+  pixels.fill(255);
+  for (let y = 0; y < image.height; y += 1) {
+    pixels.set(image.pixels.subarray(y * image.width, (y + 1) * image.width), (y + pad) * width + pad);
+  }
+  return { width, height, pixels };
+}
+
 function pgmBytes(image: GrayImage): Uint8Array {
   const header = new TextEncoder().encode(`P5\n${image.width} ${image.height}\n255\n`);
   const bytes = new Uint8Array(header.length + image.pixels.length);
@@ -171,6 +190,129 @@ async function binariesReady(): Promise<boolean> {
     : false;
 }
 
+// The text page is already 300 DPI. A second nearest-neighbor scale turns
+// the first letter into a blob and makes Tesseract drop the date.
+const CELL_SCALE = 1;
+const CELL_PAD = 8;
+
+/**
+ * Asset text sits between the vertical rules. The fitted column line is
+ * often a few pixels into the first letter, so a fixed inset clips it.
+ * Returns bounds in the same pixel space as `image`.
+ */
+function spanBetweenRules(
+  image: GrayImage,
+  searchLeft: number,
+  searchRight: number,
+  anchorLeft: number,
+  anchorRight: number,
+  top: number,
+  bottom: number,
+  inset: number,
+): { x0: number; x1: number } | null {
+  const left = Math.max(0, Math.floor(searchLeft));
+  const right = Math.min(image.width - 1, Math.ceil(searchRight));
+  const y0 = Math.max(0, Math.floor(top));
+  const y1 = Math.min(image.height, Math.ceil(bottom));
+  const height = y1 - y0;
+  if (height < 8 || right - left < 16) return null;
+  const rules: number[] = [];
+  for (let x = left; x <= right; x += 1) {
+    let dark = 0;
+    for (let y = y0; y < y1; y += 1) {
+      if (image.pixels[y * image.width + x] < 150) dark += 1;
+    }
+    if (dark / height > 0.55) rules.push(x);
+  }
+  const slop = Math.max(8, inset * 2);
+  const leftRules = rules.filter((x) => x <= anchorLeft + slop);
+  const rightRules = rules.filter((x) => x >= anchorRight - slop);
+  if (leftRules.length === 0 || rightRules.length === 0) return null;
+  const x0 = leftRules[leftRules.length - 1] + inset;
+  const x1 = rightRules[0] - inset;
+  if (x1 - x0 < 20) return null;
+  return { x0, x1 };
+}
+
+function joinCellWords(words: readonly HouseGridOcrBox[]): string {
+  const lines: HouseGridOcrBox[][] = [];
+  for (const word of words) {
+    const line = lines[lines.length - 1];
+    const cy = (word.y0 + word.y1) / 2;
+    const lineY = line ? line.reduce((sum, entry) => sum + (entry.y0 + entry.y1) / 2, 0) / line.length : 0;
+    if (!line || Math.abs(cy - lineY) > 12) lines.push([word]);
+    else line.push(word);
+  }
+  return lines.map((line) => {
+    const ordered = [...line].sort((a, b) => a.x0 - b.x0);
+    let text = '';
+    for (let i = 0; i < ordered.length; i += 1) {
+      if (i > 0) {
+        const gap = ordered[i].x0 - ordered[i - 1].x1;
+        const height = Math.max(8, ordered[i].y1 - ordered[i].y0);
+        text += gap > height * 0.85 ? '  ' : ' ';
+      }
+      text += ordered[i].text.trim();
+    }
+    return text.trim();
+  }).filter(Boolean).join(' ').trim();
+}
+
+async function recognizeCell(
+  hi: GrayImage,
+  factor: number,
+  low: { x0: number; y0: number; x1: number; y1: number },
+  psm: string,
+  whitelist: string | null,
+  path: string,
+): Promise<HouseGridOcrBox | null> {
+  const hx0 = low.x0 * factor;
+  const hy0 = low.y0 * factor;
+  const hx1 = low.x1 * factor;
+  const hy1 = low.y1 * factor;
+  if (hx1 - hx0 < 8 || hy1 - hy0 < 8) return null;
+  const padded = padGray(cropGray(hi, hx0, hy0, hx1, hy1, CELL_SCALE), CELL_PAD);
+  if (typeof Deno === 'undefined') return null;
+  await Deno.writeFile(path, pgmBytes(padded));
+  const args = [path, 'stdout', '--psm', psm];
+  if (whitelist) args.push('-c', `tessedit_char_whitelist=${whitelist}`);
+  args.push('tsv');
+  const ocr = await runBinary(TESSERACT, args, 30_000);
+  if (ocr.code !== 0) return null;
+  const words = parseTesseractTsv(new TextDecoder().decode(ocr.stdout), padded.width, padded.height)
+    .filter((box) => {
+      const cx = (box.x0 + box.x1) / 2;
+      const cy = (box.y0 + box.y1) / 2;
+      return cx >= CELL_PAD && cy >= CELL_PAD && cx < padded.width - CELL_PAD && cy < padded.height - CELL_PAD;
+    });
+  const text = joinCellWords(words);
+  if (!text) return null;
+  const conf = words.reduce((sum, word) => sum + word.conf, 0) / words.length;
+  return {
+    x0: low.x0 + 1,
+    y0: low.y0 + 2,
+    x1: Math.max(low.x0 + 2, low.x1 - 1),
+    y1: Math.max(low.y0 + 3, low.y1 - 2),
+    text,
+    conf,
+  };
+}
+
+async function runPool<T>(jobs: Array<() => Promise<T>>, limit: number): Promise<T[]> {
+  const results = new Array<T>(jobs.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < jobs.length) {
+      const index = next;
+      next += 1;
+      results[index] = await jobs[index]();
+    }
+  }
+  const workers = Math.min(limit, jobs.length);
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
+}
+
 export function createDenoHouseGridReader(): HouseGridFormReader {
   return {
     async read(bytes: ArrayBuffer): Promise<ReturnType<typeof readHouseGridForm> | null> {
@@ -182,13 +324,18 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
         await Deno.writeFile(pdf, new Uint8Array(bytes));
         const rendered = await runBinary(
           PDFTOPPM,
-          ['-gray', '-r', String(RENDER_DPI), '-f', '1', '-l', String(MAX_PAGES), pdf, `${dir}/page`],
+          ['-gray', '-r', String(RENDER_DPI), '-f', '1', '-l', String(MAX_PAGES), pdf, `${dir}/mark`],
           180_000,
         );
-        if (rendered.code !== 0) return null;
+        const renderedText = await runBinary(
+          PDFTOPPM,
+          ['-gray', '-r', String(TEXT_DPI), '-f', '1', '-l', String(MAX_PAGES), pdf, `${dir}/text`],
+          180_000,
+        );
+        if (rendered.code !== 0 || renderedText.code !== 0) return null;
         const names: string[] = [];
         for await (const entry of Deno.readDir(dir)) {
-          if (entry.isFile && entry.name.endsWith('.pgm')) names.push(entry.name);
+          if (entry.isFile && entry.name.startsWith('mark-') && entry.name.endsWith('.pgm')) names.push(entry.name);
         }
         names.sort();
         const pages = [];
@@ -196,35 +343,56 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
           const raw = await Deno.readFile(`${dir}/${names[i]}`);
           const image = parsePgm(raw);
           if (!image) continue;
+          const textName = names[i].replace(/^mark-/, 'text-');
+          const hi = parsePgm(await Deno.readFile(`${dir}/${textName}`));
           const plan = planHouseGridColumns(image);
           const boxes: HouseGridOcrBox[] = [];
-          if (plan && plan.xs.length >= 10) {
-            const strips: Array<{ x0: number; x1: number; scale: number; whitelist: string | null; psm: string }> = [
-              { x0: plan.xs[1] + 2, x1: plan.xs[2] - 2, scale: 2, whitelist: null, psm: '6' },
-              { x0: plan.xs[7] + 1, x1: plan.xs[8] - 1, scale: 2, whitelist: '0123456789/', psm: '11' },
-              { x0: plan.xs[8] + 1, x1: plan.xs[9] - 1, scale: 2, whitelist: '0123456789/', psm: '11' },
-            ];
-            for (let stripIndex = 0; stripIndex < strips.length; stripIndex += 1) {
-              const strip = strips[stripIndex];
-              const crop = cropGray(image, strip.x0, 0, strip.x1, image.height, strip.scale);
-              const path = `${dir}/strip-${i}-${stripIndex}.pgm`;
-              await Deno.writeFile(path, pgmBytes(crop));
-              const args = [path, 'stdout', '--psm', strip.psm];
-              if (strip.whitelist) args.push('-c', `tessedit_char_whitelist=${strip.whitelist}`);
-              args.push('tsv');
-              const ocr = await runBinary(TESSERACT, args, 60_000);
-              if (ocr.code !== 0) continue;
-              const text = new TextDecoder().decode(ocr.stdout);
-              for (const box of parseTesseractTsv(text, crop.width, crop.height)) {
-                boxes.push({
-                  x0: strip.x0 + box.x0 / strip.scale,
-                  x1: strip.x0 + box.x1 / strip.scale,
-                  y0: box.y0 / strip.scale,
-                  y1: box.y1 / strip.scale,
-                  text: box.text,
-                  conf: box.conf,
-                });
+          if (hi && plan && plan.xs.length >= 10) {
+            const factor = hi.width / image.width;
+            const laidOut = rowBands(image, plan.xs);
+            if (shouldSkipHouseGridCover(image, plan.xs, laidOut.sectionBars)) {
+              pages.push({ image, boxes, page: i + 1 });
+              continue;
+            }
+            const bands = laidOut.bands;
+            const jobs: Array<() => Promise<HouseGridOcrBox | null>> = [];
+            let jobId = 0;
+            const ruleInset = Math.round(4 * factor);
+            for (const band of bands) {
+              // The row rules sit on the band edges. Leaving them in the cell
+              // makes a one-line date read as empty.
+              const y0 = band.y0 + 3;
+              const y1 = band.y1 - 3;
+              const asset = spanBetweenRules(
+                hi,
+                (plan.xs[1] - 14) * factor,
+                (plan.xs[2] + 6) * factor,
+                plan.xs[1] * factor,
+                plan.xs[2] * factor,
+                y0 * factor,
+                y1 * factor,
+                ruleInset,
+              );
+              const cells: Array<{ x0: number; x1: number; psm: string; whitelist: string | null }> = [
+                { x0: plan.xs[0] + 2, x1: plan.xs[1] - 2, psm: '7', whitelist: null },
+                {
+                  x0: asset ? asset.x0 / factor : plan.xs[1] + 4,
+                  x1: asset ? asset.x1 / factor : plan.xs[2] - 3,
+                  psm: '6',
+                  whitelist: null,
+                },
+                { x0: plan.xs[7] + 2, x1: plan.xs[8] - 2, psm: '7', whitelist: '0123456789/' },
+                { x0: plan.xs[8] + 2, x1: plan.xs[9] - 2, psm: '7', whitelist: '0123456789/' },
+              ];
+              for (const cell of cells) {
+                const id = jobId;
+                jobId += 1;
+                const low = { x0: cell.x0, y0, x1: cell.x1, y1 };
+                jobs.push(() => recognizeCell(hi, factor, low, cell.psm, cell.whitelist, `${dir}/cell-${i}-${id}.pgm`));
               }
+            }
+            for (const box of await runPool(jobs, 8)) {
+              if (box) boxes.push(box);
             }
           }
           pages.push({ image, boxes, page: i + 1 });

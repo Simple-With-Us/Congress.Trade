@@ -50,3 +50,4 @@ All-five recall is 0.524.  The 0.60 target is not met.  Cover rows are zero. 
 Page 22 is still short two typed rows, and page 15 has one extra band.  The other extras are the 15 untyped rows left out of the hand set.
 Owner misses are unread glyphs, not spouse/dependent swaps.  Trade-date misses are unread or one-digit-off words, not the notification date.  Asset misses are proper-noun character errors at this scan size.
 Those three still overlap, which is why all-five recall stays under 0.60.  Closing that gap needs a better read of the 10px glyphs, not a looser publish gate.
+The next pass is in `docs/rollouts/2026-11-12-house-grid-form-recall.md`.  It scores 171/275 and page 22 is 13 of 13.  The notes above describe the 2026-11-11 reader.

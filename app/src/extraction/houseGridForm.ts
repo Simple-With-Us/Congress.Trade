@@ -482,8 +482,8 @@ function parseLooseDate(text: string): string | null {
   const day = Number(match[2]);
   let year = Number(match[3]);
   if (year < 100) year += 2000;
-  // "10" is often read as 16 or 20. Those months cannot exist, so keep the day.
-  if (month === 16 || month === 18 || month === 19 || month === 20) month = 10;
+  // "10" is often read as 16, 20, 30, or 40. Those months cannot exist, so keep the day.
+  if (month === 16 || month === 18 || month === 19 || month === 20 || month === 30 || month === 40) month = 10;
   if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1990 || year > 2100) return null;
   const dt = new Date(Date.UTC(year, month - 1, day));
   if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) return null;
@@ -501,7 +501,8 @@ function ownerFromText(text: string): Owner | null {
   // The owner cell is a two-letter code. Tesseract often reads DC as OC or PC.
   const letters = token.replace(/[^A-Z]/g, '');
   if (letters.length < 2 || letters.length > 3) return null;
-  if (['OC', 'PC', 'DO', 'OD', 'QC', 'CG', 'CD'].includes(letters)) return 'dependent';
+  // B/C and C/C are the same DC ink when the D's left stroke is faint.
+  if (['OC', 'PC', 'DO', 'OD', 'QC', 'CG', 'CD', 'BC', 'CC', 'HC'].includes(letters)) return 'dependent';
   if (['SD', 'SF', 'PS'].includes(letters)) return 'spouse';
   if (['JI', 'IT', 'JF', 'TJ'].includes(letters)) return 'joint';
   return null;
@@ -843,11 +844,12 @@ export function rowBands(image: GrayImage, xs: readonly number[]): { bands: Arra
     else groups.push([y]);
   }
   const rules: number[] = [];
-  const barBottoms: number[] = [];
+  const bars: Array<{ top: number; bottom: number }> = [];
   for (const group of groups) {
     if (group.length <= 5) rules.push(Math.round(group.reduce((sum, v) => sum + v, 0) / group.length));
-    else if (group.length >= 12) barBottoms.push(group[group.length - 1]);
+    else if (group.length >= 12) bars.push({ top: group[0], bottom: group[group.length - 1] });
   }
+  const barBottoms = bars.map((bar) => bar.bottom);
   if (rules.length < 3 && barBottoms.length === 0) return none;
   const firstBar = barBottoms.length ? Math.min(...barBottoms) : null;
   const dataRules = (firstBar === null ? rules : rules.filter((rule) => rule > firstBar + 4)).sort((a, b) => a - b);
@@ -882,6 +884,50 @@ export function rowBands(image: GrayImage, xs: readonly number[]): { bands: Arra
       for (const bottom of barBottoms) {
         const next = edges.filter((edge) => edge > bottom + 8).sort((a, b) => a - b)[0];
         if (next !== undefined && Math.abs(next - bottom - pitch) <= pitch * 0.45) edges.push(bottom + 1);
+      }
+    }
+  }
+  // A row rule that touches a trust bar is absorbed into the bar. The row
+  // above the bar and the row under it are each one pitch and still have
+  // asset ink. Filling only that pitch keeps the bar itself out of the table.
+  if (pitch > 0 && bars.length > 0) {
+    const assetLeft = (xs[1] ?? 0) + 6;
+    const assetRight = (xs[2] ?? assetLeft) - 6;
+    const inkedRow = (y0: number, y1: number): boolean => {
+      if (assetRight - assetLeft < 8 || y1 - y0 < 8) return false;
+      let ink = 0;
+      let inkSamples = 0;
+      let block = 0;
+      let blockSamples = 0;
+      for (let y = y0 + 4; y < y1 - 2; y += 1) {
+        const row = y * image.width;
+        for (let x = assetLeft; x < assetRight; x += 2) {
+          inkSamples += 1;
+          if (image.pixels[row + x] < 160) ink += 1;
+        }
+      }
+      for (let y = y0; y < y1; y += 2) {
+        const row = y * image.width;
+        for (let x = x0; x < x1; x += 4) {
+          blockSamples += 1;
+          if (image.pixels[row + x] < DARK) block += 1;
+        }
+      }
+      if (inkSamples === 0 || ink / inkSamples < 0.035) return false;
+      if (blockSamples > 0 && block / blockSamples > 0.45) return false;
+      return true;
+    };
+    for (const bar of bars) {
+      const earlier = dataRules.filter((rule) => rule < bar.top);
+      const prev = earlier.length > 0 ? earlier[earlier.length - 1] : undefined;
+      const next = dataRules.find((rule) => rule > bar.bottom);
+      if (prev !== undefined) {
+        const gap = bar.top - prev;
+        if (gap >= pitch * 0.75 && gap <= pitch * 1.35 && inkedRow(prev, bar.top)) edges.push(bar.top);
+      }
+      if (next !== undefined) {
+        const gap = next - bar.bottom;
+        if (gap >= pitch * 0.75 && gap <= pitch * 1.35 && inkedRow(bar.bottom, next)) edges.push(bar.bottom + 1);
       }
     }
   }
@@ -936,6 +982,11 @@ export function rowBands(image: GrayImage, xs: readonly number[]): { bands: Arra
     }
   }
   return { bands, sectionBars: barBottoms.length };
+}
+
+/** Cover sample grid: no trust bar, and a rule in the top of the page. */
+export function shouldSkipHouseGridCover(image: GrayImage, xs: readonly number[], sectionBars: number): boolean {
+  return sectionBars === 0 && hasEarlyHorizontalRule(image, xs);
 }
 
 function hasEarlyHorizontalRule(image: GrayImage, xs: readonly number[]): boolean {
@@ -1012,6 +1063,11 @@ const FORM_TOKEN_MAP: Record<string, string> = {
   CHIN: 'CMN',
   CHAN: 'CMN',
   HLDGCO: 'HLDG CO',
+  HLOGCO: 'HLDG CO',
+  HUDGCO: 'HLDG CO',
+  KLDG: 'HLDG',
+  USDO: 'USD0',
+  AOR: 'ADR',
   PLE: 'PLC',
   PLO: 'PLC',
   HOLOINGS: 'HOLDINGS',
@@ -1059,17 +1115,37 @@ function repairIndexToken(token: string): string[] | null {
   return null;
 }
 
+/** A long id mixes letters and digits. O in that mix is a zero. */
+function repairDigitToken(token: string): string | null {
+  const digits = token.replace(/\D/g, '').length;
+  const letters = token.replace(/[^A-Z]/g, '').length;
+  if (token.length < 8 || digits < 4 || digits <= letters) return null;
+  const repaired = token.replace(/O/g, '0');
+  return repaired === token ? null : repaired;
+}
+
 /** Split a glued form word. Already-spaced tokens stay as written. */
 function splitFormToken(token: string): string[] {
   if (/[()]/.test(token)) return [token];
-  const trimmed = token.replace(/^[^A-Za-z0-9&]+|[^A-Za-z0-9&]+$/g, '');
-  if (!trimmed || !/^[A-Za-z0-9&]+$/.test(trimmed)) return [token];
+  if (token.includes('/')) {
+    return token.split('/').filter(Boolean).flatMap((part) => splitFormToken(part));
+  }
+  const trimmed = token.replace(/[^A-Za-z0-9&]+/g, '');
+  if (!trimmed) return [token];
   const upper = trimmed.toUpperCase();
   const mapped = FORM_TOKEN_MAP[upper];
   if (mapped) return mapped.split(' ');
   const index = repairIndexToken(upper);
   if (index) return index;
+  const digitId = repairDigitToken(upper);
+  if (digitId) return [digitId];
   if (/^CLASS[ABC]$/.test(upper)) return ['CLASS', upper.slice(5)];
+  // CMNCLASSA is the class letter glued on, not a new word.
+  for (const key of ['CLASSA', 'CLASSB']) {
+    if (!upper.endsWith(key) || upper.length < key.length + 3) continue;
+    const head = splitFormToken(upper.slice(0, -key.length));
+    return [...head, ...(FORM_TOKEN_MAP[key] ?? key).split(' ')];
+  }
   const prefixes: string[] = [];
   const suffixes: string[] = [];
   let rest = upper;
@@ -1102,8 +1178,29 @@ function splitFormToken(token: string): string[] {
   }
   if (rest) prefixes.push(FORM_TOKEN_MAP[rest] ?? correctFormWord(rest));
   const pieces = [...prefixes, ...suffixes];
-  if (pieces.length === 1 && pieces[0] === upper) return [token];
+  if (pieces.length === 1 && pieces[0] === upper) {
+    return trimmed === token ? [token] : [upper];
+  }
   return pieces;
+}
+
+const TICKER_DENY = new Set([
+  'INC', 'CMN', 'LLC', 'PLC', 'CORP', 'CO', 'ETF', 'LTD', 'USD', 'USD0', 'ADR',
+  'COM', 'FUND', 'CLASS', 'HLDG', 'STOCK', 'TRUST', 'THE', 'AND', 'NEW', 'CL',
+  'COMMON', 'SHARES', 'INDEX', 'LINKED', 'COMPANY',
+]);
+
+/**
+ * A parenthetical ticker stays. A bare ticker is the last token only when
+ * two spaces separate it from the asset name, which is how these grids
+ * print the symbol after the name.
+ */
+export function splitBareTicker(text: string): { name: string; ticker: string | null } {
+  const paren = text.match(/\(([A-Z]{1,5})\)/);
+  if (paren) return { name: text, ticker: paren[1] };
+  const match = text.match(/^(.*\S)[ \t]{2,}([A-Z]{2,5})[ \t]*$/);
+  if (!match || TICKER_DENY.has(match[2])) return { name: text, ticker: null };
+  return { name: match[1], ticker: match[2] };
 }
 
 export function cleanGridAssetName(text: string): string {
@@ -1154,7 +1251,9 @@ function readingOrder(boxes: readonly HouseGridOcrBox[]): string {
     .map((line) => line.sort((a, b) => a.x0 - b.x0).map((box) => box.text.trim()).filter(Boolean).join(' '))
     .filter(Boolean)
     .join(' ')
-    .replace(/\s+/g, ' ')
+    // Keep a two-space gap. That gap is the bare ticker printed after the name.
+    .replace(/[ \t]{3,}/g, '  ')
+    .replace(/[\r\n]+/g, ' ')
     .trim();
 }
 
@@ -1196,7 +1295,7 @@ function pageRows(page: HouseGridPageInput): {
   const laidOut = rowBands(page.image, fit.xs);
   // The cover prints a sample grid under the filer block and has no trust
   // bar. A ruled line in the top of that page is the filer form, not a trade.
-  if (laidOut.sectionBars === 0 && hasEarlyHorizontalRule(page.image, fit.xs)) return empty;
+  if (shouldSkipHouseGridCover(page.image, fit.xs, laidOut.sectionBars)) return empty;
   const sized = xTemplateForFit(fit.scale);
   const bands = laidOut.bands;
   const transactions: ParsedTx[] = [];
@@ -1210,12 +1309,14 @@ function pageRows(page: HouseGridPageInput): {
     const marks = classifyMarkScores(scores);
     const inBand = boxesInRow(page.boxes, band.y0, band.y1);
     const asset = assetText(inBand, fit.xs);
+    const glyphOwner = ownerCodeFromCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
     const textOwner = inBand
-      .filter((box) => box.x1 <= (fit.xs[1] ?? 0) + 12)
+      .filter((box) => box.x1 <= (fit.xs[1] ?? 0) + 12 && box.conf >= 0.4)
       .map((box) => ownerFromText(box.text))
       .find((owner): owner is Owner => owner !== null) ?? null;
-    const glyphOwner = ownerCodeFromCell(page.image, fit.xs[0] ?? 0, band.y0, fit.xs[1] ?? 0, band.y1);
-    const owner = textOwner ?? glyphOwner;
+    // Glyph scores never swapped spouse and dependent on the scored filing.
+    // Text fills the cells the glyph leaves blank.
+    const owner = glyphOwner ?? textOwner;
     const tradeLeft = fit.xs[7] ?? 0;
     const tradeRight = fit.xs[8] ?? tradeLeft;
     const notifRight = fit.xs[9] ?? tradeRight;
@@ -1242,7 +1343,8 @@ function pageRows(page: HouseGridPageInput): {
     const hasMark = marks.typeReason !== 'unmarked' || marks.amountReason !== 'unmarked' || marks.capGainsOver200;
     if (!asset.text && !hasMark) continue;
     if (chrome && !hasMark) continue;
-    const tickerMatch = asset.text.match(/\(([A-Z]{1,5})\)/);
+    const named = splitBareTicker(asset.text);
+    const assetName = cleanGridAssetName(named.name) || named.name;
     const notes: string[] = [`grid page ${pageNum}`];
     if (marks.partial) notes.push('partial transaction box marked');
     if (marks.typeReason === 'unmarked') notes.push('transaction type was not marked');
@@ -1256,8 +1358,8 @@ function pageRows(page: HouseGridPageInput): {
     transactions.push({
       txDate: tradeDate,
       owner,
-      assetName: cleanGridAssetName(asset.text) || asset.text || `(unreadable asset p${pageNum})`,
-      ticker: tickerMatch?.[1] ?? null,
+      assetName: assetName || asset.text || `(unreadable asset p${pageNum})`,
+      ticker: named.ticker,
       assetType: null,
       txType,
       amountMin: marks.amountMin,
