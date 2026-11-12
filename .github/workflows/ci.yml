@@ -214,6 +214,13 @@ jobs:
         working-directory: .
         run: bash scripts/ops/test-sqlite-maintenance.sh
 
+      - name: Fleet log cap ops tests (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/fleet-log-cap-report.sh
+          bash -n scripts/ops/fleet-log-cap-install.sh
+          bash scripts/ops/test-fleet-log-cap.sh
+
       - name: Sentry deploy reporter + browser sourcemap tests
         working-directory: .
         run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs
