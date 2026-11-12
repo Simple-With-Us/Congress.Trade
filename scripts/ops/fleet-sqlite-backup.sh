@@ -401,7 +401,7 @@ prune_by_keep_count() {
 # incomplete dump.  A hash mismatch keeps the plain file and drops the .zst.
 FLEET_BACKUP_LOCAL_COMPRESS="${FLEET_BACKUP_LOCAL_COMPRESS:-1}"
 compress_one_complete_dump() {
-  local db="$1" base lvl zst partial want got root_real db_resolved zst_resolved
+  local db="$1" base lvl zst partial want got root_real db_resolved zst_resolved zst_created_this_run=0
   [ "${FLEET_BACKUP_LOCAL_COMPRESS:-1}" = "1" ] || return 0
   if [ -e "$db" ] || [ -L "$db" ]; then
     db="$(resolve_fs_path "$db")"
@@ -446,29 +446,42 @@ compress_one_complete_dump() {
       return 0
     fi
     mv -f "$partial" "$zst"
+    zst_created_this_run=1
   elif ! zstd -q -t "$zst"; then
     rm -f "$zst"
     echo "[fleet-backup] WARN existing zst failed test for $(basename "$base"); keeping plain dump"
     return 0
   fi
   # Re-check immediately before unlinking the plain dump.
-  dump_is_complete "$base" || { rm -f "$zst"; return 0; }
-  [ ! -e "${base}-journal" ] || { rm -f "$zst"; return 0; }
+  dump_is_complete "$base" || {
+    [ "$zst_created_this_run" = 1 ] && rm -f "$zst"
+    return 0
+  }
+  [ ! -e "${base}-journal" ] || {
+    [ "$zst_created_this_run" = 1 ] && rm -f "$zst"
+    return 0
+  }
   if ! got="$(zstd -q -d -c "$zst" | sha256sum | awk '{print $1}')"; then
-    rm -f "$zst"
+    [ "$zst_created_this_run" = 1 ] && rm -f "$zst"
     echo "[fleet-backup] WARN decompress failed for $(basename "$base"); keeping plain dump"
     return 0
   fi
   if [ "$got" != "$want" ]; then
     echo "[fleet-backup] WARN compressed $(basename "$base") != sha256; keeping plain dump"
-    rm -f "$zst"
+    [ "$zst_created_this_run" = 1 ] && rm -f "$zst"
     return 0
   fi
-  dump_is_complete "$base" || { rm -f "$zst"; return 0; }
+  dump_is_complete "$base" || {
+    [ "$zst_created_this_run" = 1 ] && rm -f "$zst"
+    return 0
+  }
   db_resolved="$(resolve_fs_path "$base")"
   zst_resolved="$(resolve_fs_path "$zst")"
   path_under_root "$root_real" "$db_resolved" || return 0
-  path_under_root "$root_real" "$zst_resolved" || { rm -f "$zst"; return 0; }
+  path_under_root "$root_real" "$zst_resolved" || {
+    [ "$zst_created_this_run" = 1 ] && rm -f "$zst"
+    return 0
+  }
   rm -f "$db_resolved"
   echo "[fleet-backup] local zstd $(basename "$base") -> $(basename "$zst_resolved") ($(du -h "$zst_resolved" | awk '{print $1}')) at $(fleet_ct_label)"
 }
@@ -781,7 +794,12 @@ upload_b2_set() {
     [ -f "$f" ] && have_zst=1 && break
   done
   if [ "$have_zst" = 1 ] && [ "$raw" = 0 ]; then
-    rclone copy "$dir" "b2:${bucket}/hetzner/" --include "*${stamp}*.zst" --include "*${stamp}*.sha256" --transfers 2 -q || rc=$?
+    compress_offsite_set "$dir" "$stamp" || true
+    rclone copy "$dir" "b2:${bucket}/hetzner/" \
+      --include "*${stamp}*.zst" \
+      --include "*${stamp}*.sha256" \
+      --include "*${stamp}*.sqlite" \
+      --transfers 2 -q || rc=$?
     return "$rc"
   fi
   if compress_offsite_set "$dir" "$stamp"; then

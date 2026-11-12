@@ -102,7 +102,9 @@ latest_complete_dump() {
         [ -n "$path" ] || continue
         base="$(verify_dump_base "$path")"
         verify_dump_complete "$base" || continue
-        if [ -s "${base}.zst" ]; then
+        if [ -s "${base}.zst" ] && {
+          [ ! -s "$base" ] || zstd -q -t "${base}.zst" >/dev/null 2>&1
+        }; then
           printf '%s\n' "${base}.zst"
         else
           printf '%s\n' "$base"

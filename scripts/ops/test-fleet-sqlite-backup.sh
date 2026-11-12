@@ -608,6 +608,55 @@ if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
   assert_missing "$udb" "upload does not recreate the plain dump"
   unset -f rclone
 
+  CROOT="$TMP/congress-upload"
+  CDIR="$CROOT/congress"
+  mkdir -p "$CDIR"
+  ROOT="$CROOT"
+  cstamp=20261130T130000Z
+  cdb="$CDIR/congress-trade-${cstamp}.db"
+  sqlite3 "$cdb" "CREATE TABLE t(x);" >/dev/null
+  sha256sum "$cdb" > "${cdb}.sha256"
+  compress_one_complete_dump "$cdb" >/dev/null
+  kv="$CDIR/kv-${cstamp}.sqlite"
+  sqlite3 "$kv" "CREATE TABLE kv(k TEXT);" >/dev/null
+  UB2="$TMP/upload-b2-congress"
+  mkdir -p "$UB2"
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$UB2/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$CDIR" jays-socratic-trade-eu "$cstamp" >/dev/null
+  assert_exists "$UB2/congress-trade-${cstamp}.db.zst" "fast path uploads local .db.zst"
+  if [ -f "$UB2/kv-${cstamp}.sqlite.zst" ]; then
+    echo "ok   fast path uploads kv as .sqlite.zst"
+  elif [ -f "$UB2/kv-${cstamp}.sqlite" ]; then
+    echo "ok   fast path uploads uncompressed kv sqlite"
+  else
+    echo "FAIL fast path must upload kv-${cstamp}.sqlite set member"
+    fail=1
+  fi
+  unset -f rclone
+
+  reused="$phys/socratic/socratic-app-20261115T000000Z.db"
+  sqlite3 "$reused" "CREATE TABLE t(x); INSERT INTO t VALUES ('z');" >/dev/null
+  sha256sum "$reused" > "${reused}.sha256"
+  zstd -q -f "$reused" -o "${reused}.zst"
+  printf 'j\n' > "${reused}-journal"
+  compress_one_complete_dump "$reused" >/dev/null
+  assert_exists "${reused}.zst" "pre-existing valid .zst survives journal during recheck"
+
   # Weekly verify accepts the compressed form, including through a symlink root.
   VERIFY="${ROOT_DIR}/scripts/ops/fleet-backup-verify-weekly.sh"
   # shellcheck disable=SC1090
@@ -642,6 +691,15 @@ if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
   FAIL_MSGS=()
   check_dump usage-monitor >/dev/null
   assert_eq "$FAIL" 1 "verify fails a compressed dump that does not decompress"
+  pick_root="$TMP/verify-pick"
+  mkdir -p "$pick_root/socratic"
+  ROOT="$pick_root"
+  pick_base="$pick_root/socratic/socratic-app-20261120T000000Z.db"
+  sqlite3 "$pick_base" "CREATE TABLE t(x); INSERT INTO t VALUES (1);" >/dev/null
+  sha256sum "$pick_base" > "${pick_base}.sha256"
+  printf 'not-zstd\n' > "${pick_base}.zst"
+  picked="$(latest_complete_dump socratic | head -1)"
+  assert_eq "$picked" "$pick_base" "latest_complete_dump falls back to .db when .zst fails zstd -t"
 else
   echo "FAIL compressed dump tests require sqlite3 and zstd"
   fail=1
