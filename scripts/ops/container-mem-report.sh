@@ -2,9 +2,12 @@
 # Read-only per-container RAM and swap report.
 #
 # For each running container: name, image, docker stats memory usage, memory
-# limit (or none), cgroup v2 swap (memory.swap.current), memory.events oom
-# and oom_kill, restart count, and the top processes by RSS when that read
-# is cheap. Sorted by usage. Totals at the end. --json prints one object.
+# limit (or none), reservation (memory.low), cgroup v2 swap usage
+# (memory.swap.current), swap limit (memory.swap.max), memory.events oom
+# and oom_kill for the current instance, restart count, and the top
+# processes by RSS when that read is cheap. Sorted by usage. Totals at the
+# end. --json prints one object. oom and oom_kill reset when the container
+# restarts, because the cgroup is recreated.
 #
 # Reads `docker stats --no-stream` and `docker inspect` (a fixed format that
 # does not include environment) plus /sys/fs/cgroup and /proc. Never starts,
@@ -31,7 +34,7 @@ CONTAINER_MEM_TOP_RSS_MAX_PROCS="${CONTAINER_MEM_TOP_RSS_MAX_PROCS:-250}"
 
 # Fixed inspect format. Do not widen this: a full inspect object includes
 # Config.Env and would print secrets.
-INSPECT_FMT='{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.State.Pid}}{{"\t"}}{{.State.Status}}'
+INSPECT_FMT='{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.State.Pid}}{{"\t"}}{{.State.Status}}{{"\t"}}{{.HostConfig.MemoryReservation}}{{"\t"}}{{.HostConfig.MemorySwap}}'
 
 usage() {
   cat <<'EOF'
@@ -39,8 +42,9 @@ Usage: container-mem-report.sh [--json]
 
 Read-only report of running containers, sorted by memory usage.
 Prints name, image, docker stats memory, cgroup memory.current, limit
-(or none), memory.swap.current, oom, oom_kill, restarts, and top RSS.
-Does not start, stop, update, or limit anything.
+(or none), reservation, swap usage, swap limit, oom, oom_kill, restarts,
+and top RSS. oom and oom_kill are the current instance. Does not start,
+stop, update, or limit anything.
 
   --json    print one JSON object instead of the text table
 EOF
@@ -265,10 +269,10 @@ def load_inspect(text):
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) != 7:
+        if len(parts) != 9:
             sys.stderr.write("container-mem-report: skipping an inspect row with an unexpected shape\n")
             continue
-        cid, name, image, memory, restarts, pid, status = parts
+        cid, name, image, memory, restarts, pid, status, reservation, memory_swap = parts
         if name.startswith("/"):
             name = name[1:]
         rows.append({
@@ -279,6 +283,8 @@ def load_inspect(text):
             "restarts": to_int(restarts),
             "pid": to_int(pid),
             "status": status.strip(),
+            "memory_reservation": to_int(reservation),
+            "memory_swap": to_int(memory_swap),
         })
     return rows
 
@@ -482,10 +488,14 @@ for obj in stats_rows:
 
     memory_current = None
     swap_bytes = None
+    swap_limit_bytes = None
+    swap_limit_source = "unknown"
     oom = None
     oom_kill = None
     limit_bytes = None
     limit_source = "unknown"
+    reservation_bytes = None
+    reservation_source = "unknown"
     rss = {"status": "unavailable", "proc_count": None, "procs": []}
     restarts = info["restarts"] if info else None
     if restarts is not None and restarts < 0:
@@ -513,13 +523,39 @@ for obj in stats_rows:
         if max_text is not None:
             token = max_text.strip()
             if token == "max":
-                limit_bytes = None
-                limit_source = "none"
+                inspected = info["memory"] if info is not None else None
+                if inspected is not None and inspected > 0:
+                    limit_bytes = inspected
+                    limit_source = "inspect"
+                else:
+                    limit_bytes = None
+                    limit_source = "none"
             else:
                 parsed_max = to_int(token)
                 if parsed_max is not None and parsed_max > 0:
                     limit_bytes = parsed_max
                     limit_source = "cgroup_max"
+        low_text = read_text(cgroup_real, os.path.join(cg_dir, "memory.low"))
+        if low_text is not None:
+            low_token = low_text.strip()
+            if low_token != "max":
+                parsed_low = to_int(low_token)
+                if parsed_low is not None and parsed_low > 0:
+                    reservation_bytes = parsed_low
+                    reservation_source = "cgroup_low"
+                elif parsed_low is not None and parsed_low <= 0:
+                    reservation_source = "none"
+        swap_max_text = read_text(cgroup_real, os.path.join(cg_dir, "memory.swap.max"))
+        if swap_max_text is not None:
+            swap_token = swap_max_text.strip()
+            if swap_token == "max":
+                swap_limit_bytes = None
+                swap_limit_source = "none"
+            else:
+                parsed_swap_max = to_int(swap_token)
+                if parsed_swap_max is not None and parsed_swap_max >= 0:
+                    swap_limit_bytes = parsed_swap_max
+                    swap_limit_source = "cgroup_swap_max"
         if proc_real:
             rss = read_top_rss(proc_real, cg_dir, cgroup_real)
 
@@ -531,6 +567,25 @@ for obj in stats_rows:
         elif inspected is not None and inspected <= 0:
             limit_bytes = None
             limit_source = "none"
+
+    if reservation_source != "cgroup_low" and info is not None:
+        inspected_reservation = info["memory_reservation"]
+        if inspected_reservation is not None and inspected_reservation > 0:
+            reservation_bytes = inspected_reservation
+            reservation_source = "inspect"
+        elif reservation_source == "unknown" and inspected_reservation is not None and inspected_reservation <= 0:
+            reservation_source = "none"
+
+    # HostConfig.MemorySwap of 0 means Docker was not given a swap cap.
+    # A negative value is Docker's unlimited sentinel. Neither is a zero-byte cap.
+    if swap_limit_source == "unknown" and info is not None:
+        inspected_swap = info["memory_swap"]
+        if inspected_swap is not None and inspected_swap > 0:
+            swap_limit_bytes = inspected_swap
+            swap_limit_source = "inspect"
+        elif inspected_swap is not None and inspected_swap < 0:
+            swap_limit_bytes = None
+            swap_limit_source = "none"
 
     if usage is None and memory_current is not None and memory_current >= 0:
         usage = memory_current
@@ -546,7 +601,11 @@ for obj in stats_rows:
         "memory_current_bytes": memory_current,
         "memory_limit_bytes": limit_bytes,
         "memory_limit_source": limit_source,
+        "memory_reservation_bytes": reservation_bytes,
+        "memory_reservation_source": reservation_source,
         "swap_bytes": swap_bytes,
+        "swap_limit_bytes": swap_limit_bytes,
+        "swap_limit_source": swap_limit_source,
         "oom": oom,
         "oom_kill": oom_kill,
         "restart_count": restarts,
@@ -605,7 +664,10 @@ if json_flag == "1":
     sys.stdout.write("\n")
     sys.exit(0)
 
-headers = ["NAME", "IMAGE", "MEM_USAGE", "CGROUP", "MEM_LIMIT", "SWAP", "OOM", "OOM_KILL", "RESTARTS", "TOP_RSS"]
+headers = [
+    "NAME", "IMAGE", "MEM_USAGE", "CGROUP", "MEM_LIMIT", "MEM_RESERV",
+    "SWAP", "SWAP_LIMIT", "OOM", "OOM_KILL", "RESTARTS", "TOP_RSS",
+]
 table = []
 for row in containers:
     table.append([
@@ -614,7 +676,9 @@ for row in containers:
         fmt_bytes(row["memory_usage_bytes"]),
         fmt_bytes(row["memory_current_bytes"]),
         limit_label(row["memory_limit_source"], row["memory_limit_bytes"]),
+        limit_label(row["memory_reservation_source"], row["memory_reservation_bytes"]),
         fmt_bytes(row["swap_bytes"]),
+        limit_label(row["swap_limit_source"], row["swap_limit_bytes"]),
         cell(row["oom"]),
         cell(row["oom_kill"]),
         cell(row["restart_count"]),
@@ -634,6 +698,8 @@ def render(cells):
     return "  ".join(padded)
 
 sys.stdout.write("# read-only container memory report; no containers were changed\n")
+sys.stdout.write("# OOM and OOM_KILL count the current container instance and reset on restart\n")
+sys.stdout.write("# SWAP n/a means swap accounting is unavailable for that row, not zero usage\n")
 sys.stdout.write(render(headers) + "\n")
 for cells in table:
     sys.stdout.write(render(cells) + "\n")

@@ -96,24 +96,28 @@ scope_dir() {
   printf '%s/system.slice/docker-%s.scope' "$CG" "$id"
 }
 
-INSPECT_FMT='{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.State.Pid}}{{"\t"}}{{.State.Status}}'
+INSPECT_FMT='{{.Id}}{{"\t"}}{{.Name}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.State.Pid}}{{"\t"}}{{.State.Status}}{{"\t"}}{{.HostConfig.MemoryReservation}}{{"\t"}}{{.HostConfig.MemorySwap}}'
 
 write_inspect() {
   local short="$1" full="$2" name="$3" image="$4" memory="$5" restarts="$6" pid="$7"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\trunning\n' \
-    "$full" "$name" "$image" "$memory" "$restarts" "$pid" >"${FIX}/inspect/${short}"
+  local reservation="${8:-0}" memory_swap="${9:-0}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\trunning\t%s\t%s\n' \
+    "$full" "$name" "$image" "$memory" "$restarts" "$pid" \
+    "$reservation" "$memory_swap" >"${FIX}/inspect/${short}"
 }
 
 # congress-app: stats 1.5 GiB, cgroup max 3 GiB wins over a conflicting inspect
 # memory value, swap 4.5 GiB, oom history, six RSS rows so only five are shown.
 CONGRESS_SHORT="aaaaaaaaaaaa"
 CONGRESS_FULL="${CONGRESS_SHORT}$(printf '%052d' 0)"
-write_inspect "$CONGRESS_SHORT" "$CONGRESS_FULL" "/congress-app" "congress-app:latest" "999" "3" "101"
+write_inspect "$CONGRESS_SHORT" "$CONGRESS_FULL" "/congress-app" "congress-app:latest" "999" "3" "101" "1" "1"
 CONGRESS_DIR="$(scope_dir "$CONGRESS_SHORT")"
 mkdir -p "$CONGRESS_DIR"
 printf '4831838208\n' >"${CONGRESS_DIR}/memory.swap.current"
 printf '2147483648\n' >"${CONGRESS_DIR}/memory.current"
 printf '3221225472\n' >"${CONGRESS_DIR}/memory.max"
+printf '1073741824\n' >"${CONGRESS_DIR}/memory.low"
+printf '6442450944\n' >"${CONGRESS_DIR}/memory.swap.max"
 cat >"${CONGRESS_DIR}/memory.events" <<'EOF'
 low 0
 high 0
@@ -141,6 +145,7 @@ mkdir -p "$SCAN_DIR"
 printf '0\n' >"${SCAN_DIR}/memory.swap.current"
 printf '209715200\n' >"${SCAN_DIR}/memory.current"
 printf 'max\n' >"${SCAN_DIR}/memory.max"
+printf 'max\n' >"${SCAN_DIR}/memory.swap.max"
 printf 'oom 0\noom_kill 0\n' >"${SCAN_DIR}/memory.events"
 printf '201\n' >"${SCAN_DIR}/cgroup.procs"
 write_cgroup_ptr 201 "0::/system.slice/docker-${SCAN_ID}.scope"
@@ -149,7 +154,7 @@ write_status 201 python 40960
 # sqlite-web: limit comes from inspect because memory.max is absent. Swap file
 # is absent, so swap stays unknown rather than zero.
 SQL_ID="cccccccccccc"
-write_inspect "$SQL_ID" "$SQL_ID" "/congress-sqlite-web" "congress-sqlite-web:latest" "536870912" "4" "301"
+write_inspect "$SQL_ID" "$SQL_ID" "/congress-sqlite-web" "congress-sqlite-web:latest" "536870912" "4" "301" "134217728" "0"
 SQL_DIR="$(scope_dir "$SQL_ID")"
 mkdir -p "$SQL_DIR"
 printf '943718400\n' >"${SQL_DIR}/memory.current"
@@ -166,6 +171,7 @@ PROXY_DIR="$(scope_dir "$PROXY_ID")"
 mkdir -p "$PROXY_DIR"
 printf '10485760\n' >"${PROXY_DIR}/memory.current"
 printf 'max\n' >"${PROXY_DIR}/memory.max"
+printf 'max\n' >"${PROXY_DIR}/memory.swap.max"
 printf 'oom 0\noom_kill 0\n' >"${PROXY_DIR}/memory.events"
 printf '401\n' >"${PROXY_DIR}/cgroup.procs"
 write_cgroup_ptr 401 "0::/system.slice/docker-${PROXY_ID}.scope"
@@ -257,7 +263,11 @@ assert app["memory_usage_source"] == "docker_stats"
 assert app["memory_current_bytes"] == 2147483648
 assert app["memory_limit_bytes"] == 3221225472
 assert app["memory_limit_source"] == "cgroup_max"
+assert app["memory_reservation_bytes"] == 1073741824
+assert app["memory_reservation_source"] == "cgroup_low"
 assert app["swap_bytes"] == int(4.5 * 1024 ** 3)
+assert app["swap_limit_bytes"] == 6442450944
+assert app["swap_limit_source"] == "cgroup_swap_max"
 assert app["oom"] == 2
 assert app["oom_kill"] == 1
 assert app["restart_count"] == 3
@@ -272,22 +282,30 @@ assert scan["memory_usage_bytes"] == 200 * 1024 * 1024
 assert scan["memory_limit_bytes"] is None
 assert scan["memory_limit_source"] == "none"
 assert scan["swap_bytes"] == 0
+assert scan["swap_limit_bytes"] is None
+assert scan["swap_limit_source"] == "none"
 assert scan["oom"] == 0 and scan["oom_kill"] == 0
 assert scan["top_rss"][0]["comm"] == "python"
 
 sql = by_name["congress-sqlite-web"]
 assert sql["memory_limit_bytes"] == 536870912
 assert sql["memory_limit_source"] == "inspect"
+assert sql["memory_reservation_bytes"] == 134217728
+assert sql["memory_reservation_source"] == "inspect"
 assert sql["swap_bytes"] is None
+assert sql["swap_limit_source"] == "unknown"
 assert sql["restart_count"] == 4
 
 proxy = by_name["unlimited-proxy"]
 assert proxy["memory_limit_source"] == "none"
 assert proxy["swap_bytes"] is None
+assert proxy["swap_limit_source"] == "none"
 assert proxy["image"] == "traefik:v3.2"
 
 mystery = by_name["mystery"]
 assert mystery["memory_limit_source"] == "unknown"
+assert mystery["memory_reservation_source"] == "unknown"
+assert mystery["swap_limit_source"] == "unknown"
 assert mystery["image"] is None
 assert mystery["restart_count"] is None
 assert mystery["swap_bytes"] is None
@@ -316,6 +334,10 @@ body = human.split("TOTALS", 1)[0]
 positions = [body.index(name) for name in order]
 assert positions == sorted(positions)
 assert "MEM_LIMIT" in human
+assert "MEM_RESERV" in human
+assert "SWAP_LIMIT" in human
+assert "current container instance" in human
+assert "SWAP n/a means swap accounting is unavailable" in human
 assert "none" in human
 assert "n/a" in human
 assert "TOTALS  containers=5" in human
@@ -530,6 +552,38 @@ assert by_name["still-here"]["memory_limit_bytes"] == 1048576
 assert gone_id in err
 assert "continuing" in err
 print("ok   vanished container stays in the report")
+PY
+
+# memory.max of "max" must not hide a positive HostConfig.Memory.
+CAP_ID="aaa111aaa111"
+write_inspect "$CAP_ID" "$CAP_ID" "/congress-scan-cpu-worker" "worker:latest" \
+  "1073741824" "2" "801" "402653184" "2147483648"
+CAP_DIR="$(scope_dir "$CAP_ID")"
+mkdir -p "$CAP_DIR"
+printf 'max\n' >"${CAP_DIR}/memory.max"
+printf '104857600\n' >"${CAP_DIR}/memory.current"
+printf '0\n' >"${CAP_DIR}/memory.swap.current"
+printf '0\n' >"${CAP_DIR}/memory.low"
+printf 'oom 0\noom_kill 0\n' >"${CAP_DIR}/memory.events"
+printf '801\n' >"${CAP_DIR}/cgroup.procs"
+write_cgroup_ptr 801 "0::/system.slice/docker-${CAP_ID}.scope"
+write_status 801 python 20480
+printf '%s\n' "{\"ID\":\"${CAP_ID}\",\"Name\":\"congress-scan-cpu-worker\",\"MemUsage\":\"100MiB / 16GiB\"}" >"${FIX}/stats.ndjson"
+bash "$SCRIPT" --json >"${TMP}/cap.json"
+python3 - "${TMP}/cap.json" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+row = report["containers"][0]
+assert row["name"] == "congress-scan-cpu-worker"
+assert row["memory_limit_bytes"] == 1073741824, row["memory_limit_bytes"]
+assert row["memory_limit_source"] == "inspect"
+assert report["totals"]["unlimited"] == 0
+assert row["memory_reservation_bytes"] == 402653184
+assert row["memory_reservation_source"] == "inspect"
+assert row["swap_limit_bytes"] == 2147483648
+assert row["swap_limit_source"] == "inspect"
+assert row["swap_bytes"] == 0
+print("ok   cgroup max keeps a positive inspect memory limit")
 PY
 
 if [[ "$fail" -ne 0 ]]; then
