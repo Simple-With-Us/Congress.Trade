@@ -7,10 +7,15 @@
 #   bash scripts/ops/disk-growth-snapshot.sh
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=scripts/ops/disk-growth-lib.sh
 # shellcheck disable=SC1091
-source "${ROOT_DIR}/scripts/ops/disk-growth-lib.sh"
+if [[ -f "$SCRIPT_DIR/disk-growth-lib.sh" ]]; then
+  source "$SCRIPT_DIR/disk-growth-lib.sh"
+else
+  source "${ROOT_DIR}/scripts/ops/disk-growth-lib.sh"
+fi
 
 if [[ -f /etc/disk-growth-snapshot.env ]]; then
   # shellcheck disable=SC1091

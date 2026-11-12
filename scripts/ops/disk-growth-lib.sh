@@ -6,7 +6,7 @@ set -euo pipefail
 : "${RETENTION_DAYS:=60}"
 : "${TOP_N:=20}"
 : "${DU_TIMEOUT_SEC:=600}"
-: "${DU_SCAN_ROOTS:=/,/var,/home,/data,/opt}"
+: "${DU_SCAN_ROOTS:=/,/var,/home,/data,/opt,/tmp,/mnt/fleet-extra}"
 : "${BACKUP_SCAN_DIRS:=/data/backups}"
 : "${SNAPSHOT_PREFIX:=disk-growth-}"
 : "${DISK_GROWTH_DF:=df}"
@@ -63,23 +63,74 @@ disk_growth_collect_df_inodes() {
   "$DISK_GROWTH_DF" -Pi $mounts 2>/dev/null || true
 }
 
-disk_growth_du_one_root() {
-  local root="$1"
-  [[ -d "$root" ]] || return 0
-  local cmd=(
-    "$DISK_GROWTH_TIMEOUT" "$DU_TIMEOUT_SEC"
-    "$DISK_GROWTH_IONICE" -c3
-    "$DISK_GROWTH_NICE" -n 19
-    "$DISK_GROWTH_DU" -x -d 1 -B1
-  )
-  set +o pipefail
-  "${cmd[@]}" "$root" 2>/dev/null | sort -rn -k1 | head -n "$TOP_N"
-  local du_ec=${PIPESTATUS[0]}
-  set -o pipefail
-  if (( du_ec == 124 )); then
-    return 124
-  fi
-  return 0
+# One traversal for overlapping roots on the same device. Keep requested
+# child breakdowns by choosing the necessary depth, not rescanning each child.
+disk_growth_collect_du() {
+  export DU_SCAN_ROOTS BACKUP_SCAN_DIRS TOP_N DU_TIMEOUT_SEC
+  export DISK_GROWTH_TIMEOUT DISK_GROWTH_IONICE DISK_GROWTH_NICE DISK_GROWTH_DU
+  python3 - <<'PY'
+import os, subprocess
+from pathlib import Path
+
+env = os.environ
+top_n = int(env["TOP_N"])
+if top_n <= 0:
+    raise SystemExit("TOP_N must be positive")
+roots = []
+for value in (env["DU_SCAN_ROOTS"] + "," + env["BACKUP_SCAN_DIRS"]).split(","):
+    requested = value.strip()
+    if not requested or not os.path.isdir(requested):
+        continue
+    resolved = os.path.realpath(requested)
+    if not any(row["path"] == resolved for row in roots):
+        roots.append({"path": resolved, "device": os.stat(resolved).st_dev})
+roots.sort(key=lambda row: (len(Path(row["path"]).parts), row["path"]))
+groups = []
+for row in roots:
+    parent = next((g for g in groups if g["device"] == row["device"] and
+                   os.path.commonpath([g["path"], row["path"]]) == g["path"]), None)
+    if parent is None:
+        parent = dict(row, roots=[])
+        groups.append(parent)
+    parent["roots"].append(row["path"])
+for group in groups:
+    base = group["path"]
+    depth = max(len(Path(root).parts) - len(Path(base).parts) + 1 for root in group["roots"])
+    command = [env["DISK_GROWTH_TIMEOUT"], env["DU_TIMEOUT_SEC"],
+               env["DISK_GROWTH_IONICE"], "-c3", env["DISK_GROWTH_NICE"], "-n", "19",
+               env["DISK_GROWTH_DU"], "-x", "-d", str(depth), "-B1", "--", base]
+    # Consume the whole stream while retaining only bounded top-N rows.
+    # Piping to head would truncate scans; staging all du output could fill /tmp.
+    selected = {root: [] for root in group["roots"]}
+    try:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as run:
+            for line in run.stdout:
+                parts = line.rstrip("\n").split(None, 1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    size = int(parts[0])
+                except ValueError:
+                    continue
+                path = parts[1]
+                for root in group["roots"]:
+                    if path == root or os.path.dirname(path.rstrip("/")) == root:
+                        rows = selected[root]
+                        rows.append((size, path))
+                        rows.sort(key=lambda row: (-row[0], row[1]))
+                        del rows[top_n:]
+            code = run.wait()
+    except OSError:
+        code = 1
+    for root in group["roots"]:
+        print("ROOT " + root)
+        for size, path in selected[root]:
+            print(str(size) + "\t" + path)
+        if code == 124:
+            print("DU_TIMEOUT 1")
+        elif code:
+            print("DU_ERROR 1")
+PY
 }
 
 disk_growth_docker_verbose() {
@@ -104,7 +155,7 @@ disk_growth_prune_old_snapshots() {
   done
 }
 
-disk_growth_build_snapshot_json() {
+disk_growth_build_snapshot_json() (
   local captured_at date_utc host
   date_utc="${DISK_GROWTH_SNAPSHOT_DATE:-$(date -u +%Y-%m-%d)}"
   captured_at="${DISK_GROWTH_CAPTURED_AT:-${date_utc}T$(date -u +%H:%M:%SZ)}"
@@ -118,47 +169,33 @@ disk_growth_build_snapshot_json() {
     docker_out=""
   fi
 
-  local -a du_roots=()
-  local r
-  IFS=',' read -ra scan_roots <<<"$DU_SCAN_ROOTS"
-  for r in "${scan_roots[@]}"; do
-    r="${r#"${r%%[![:space:]]*}"}"
-    r="${r%"${r##*[![:space:]]}"}"
-    [[ -n "$r" ]] && du_roots+=("$r")
-  done
-  IFS=',' read -ra backup_roots <<<"$BACKUP_SCAN_DIRS"
-  for r in "${backup_roots[@]}"; do
-    r="${r#"${r%%[![:space:]]*}"}"
-    r="${r%"${r##*[![:space:]]}"}"
-    [[ -n "$r" ]] && du_roots+=("$r")
-  done
-
-  local du_blob=""
-  du_blob="$(
-    for r in "${du_roots[@]}"; do
-      printf 'ROOT %s\n' "$r"
-      if ! disk_growth_du_one_root "$r"; then
-        printf 'DU_TIMEOUT 1\n'
-      fi
-    done
-  )"
-  if grep -q '^DU_TIMEOUT 1$' <<<"$du_blob"; then
+  local du_blob
+  du_blob="$(disk_growth_collect_du)"
+  if grep -Eq '^DU_(TIMEOUT|ERROR) 1$' <<<"$du_blob"; then
     du_partial=1
   fi
+  # Data files avoid MAX_ARG_STRLEN/ARG_MAX even for a large Docker inventory.
+  local input_dir
+  input_dir="$(mktemp -d "${TMPDIR:-/tmp}/disk-growth-input.XXXXXX")"
+  trap 'rm -rf "$input_dir"' EXIT
+  printf '%s' "$df_out" > "$input_dir/df"
+  printf '%s' "$inode_out" > "$input_dir/inodes"
+  printf '%s' "$docker_out" > "$input_dir/docker"
+  printf '%s' "$du_blob" > "$input_dir/du"
 
   DISK_GROWTH_SNAPSHOT_DIR="$SNAPSHOT_DIR" \
-  DISK_GROWTH_DF_BLOB="$df_out" \
-  DISK_GROWTH_INODE_BLOB="$inode_out" \
-  DISK_GROWTH_DOCKER_BLOB="$docker_out" \
-  DISK_GROWTH_DU_BLOB="$du_blob" \
   DISK_GROWTH_CAPTURED_AT="$captured_at" \
   DISK_GROWTH_DATE="$date_utc" \
   DISK_GROWTH_HOST="$host" \
   DISK_GROWTH_TOP_N="$TOP_N" \
   DISK_GROWTH_DU_TIMEOUT="$DU_TIMEOUT_SEC" \
   DISK_GROWTH_DU_PARTIAL="$du_partial" \
-  python3 - <<'PY'
-import json, os, re
+  python3 - "$input_dir" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+
+def blob(name):
+    return (Path(sys.argv[1]) / name).read_text(encoding="utf-8")
 
 def parse_df(blob):
     out = []
@@ -261,10 +298,13 @@ def parse_du(blob):
     for line in (blob or "").splitlines():
         if line.startswith("ROOT "):
             current = line[5:].strip()
-            roots[current] = {"entries": [], "timeout": False}
+            roots[current] = {"entries": [], "timeout": False, "error": False}
             continue
         if line.strip() == "DU_TIMEOUT 1" and current:
             roots[current]["timeout"] = True
+            continue
+        if line.strip() == "DU_ERROR 1" and current:
+            roots[current]["error"] = True
             continue
         parts = line.split(None, 1)
         if len(parts) != 2 or not current:
@@ -277,15 +317,15 @@ def parse_du(blob):
         roots[current]["entries"].append({"path": path, "size_bytes": size})
     return roots
 
-fs = merge_inodes(parse_df(os.environ.get("DISK_GROWTH_DF_BLOB", "")), os.environ.get("DISK_GROWTH_INODE_BLOB", ""))
+fs = merge_inodes(parse_df(blob("df")), blob("inodes"))
 doc = {
     "schema_version": 1,
     "captured_at": os.environ["DISK_GROWTH_CAPTURED_AT"],
     "date": os.environ["DISK_GROWTH_DATE"],
     "host": os.environ["DISK_GROWTH_HOST"],
     "filesystems": fs,
-    "directory_totals": parse_du(os.environ.get("DISK_GROWTH_DU_BLOB", "")),
-    "docker": parse_docker(os.environ.get("DISK_GROWTH_DOCKER_BLOB", "")),
+    "directory_totals": parse_du(blob("du")),
+    "docker": parse_docker(blob("docker")),
     "meta": {
         "top_n": int(os.environ["DISK_GROWTH_TOP_N"]),
         "du_timeout_sec": int(os.environ["DISK_GROWTH_DU_TIMEOUT"]),
@@ -295,4 +335,4 @@ doc = {
 }
 print(json.dumps(doc, indent=2, sort_keys=True))
 PY
-}
+)

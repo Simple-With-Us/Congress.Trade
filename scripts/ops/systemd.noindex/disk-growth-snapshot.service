@@ -4,6 +4,8 @@ After=docker.service
 Wants=docker.service
 
 [Service]
+# Each planned filesystem scan has its own DU_TIMEOUT_SEC bound.
+TimeoutStartSec=infinity
 Type=oneshot
 ExecStart=/usr/local/bin/disk-growth-snapshot.sh
 Nice=10

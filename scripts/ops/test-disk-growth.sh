@@ -144,6 +144,8 @@ else
   assert_ok "report computes 1d directory and fs deltas"
 fi
 
+python3 "$ROOT_DIR/scripts/ops/test_disk_growth_failures.py"
+
 if [[ "$fail" -eq 0 ]]; then
   echo "All disk-growth tests passed."
 else

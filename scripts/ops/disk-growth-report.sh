@@ -5,10 +5,15 @@
 #   bash scripts/ops/disk-growth-report.sh --json
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=scripts/ops/disk-growth-lib.sh
 # shellcheck disable=SC1091
-source "${ROOT_DIR}/scripts/ops/disk-growth-lib.sh"
+if [[ -f "$SCRIPT_DIR/disk-growth-lib.sh" ]]; then
+  source "$SCRIPT_DIR/disk-growth-lib.sh"
+else
+  source "${ROOT_DIR}/scripts/ops/disk-growth-lib.sh"
+fi
 
 if [[ -f /etc/disk-growth-snapshot.env ]]; then
   # shellcheck disable=SC1091
@@ -45,50 +50,41 @@ print((base - datetime.timedelta(days=off)).isoformat())
 PY
 }
 
-load_snap() {
-  local d="$1"
-  local p
-  p="$(SNAPSHOT_DIR="$SNAPSHOT_DIR" disk_growth_snapshot_path "$d")"
-  if [[ ! -f "$p" ]]; then
-    echo ""
-    return 1
-  fi
-  cat "$p"
-}
-
-current_json="$(load_snap "$REPORT_DATE" || true)"
-if [[ -z "$current_json" ]]; then
+current_path="$(disk_growth_snapshot_path "$REPORT_DATE")"
+if [[ ! -s "$current_path" ]]; then
   echo "disk-growth-report: missing snapshot for ${REPORT_DATE} in ${SNAPSHOT_DIR}" >&2
   exit 1
 fi
 
 day1="$(disk_growth_path_for_offset "$REPORT_DATE" 1)"
 day7="$(disk_growth_path_for_offset "$REPORT_DATE" 7)"
-json1="$(load_snap "$day1" || true)"
-json7="$(load_snap "$day7" || true)"
+path1="$(disk_growth_snapshot_path "$day1")"
+path7="$(disk_growth_snapshot_path "$day7")"
 
-DISK_GROWTH_CURRENT="$current_json" \
-DISK_GROWTH_BASE1="$json1" \
-DISK_GROWTH_BASE7="$json7" \
 DISK_GROWTH_REPORT_DATE="$REPORT_DATE" \
 DISK_GROWTH_DAY1="$day1" \
 DISK_GROWTH_DAY7="$day7" \
 DISK_GROWTH_JSON_OUT="$JSON_OUT" \
-python3 - <<'PY'
+python3 - "$current_path" "$path1" "$path7" <<'PY'
 import json, os, sys
 
-def load(label, raw):
-    if not raw.strip():
+def load(label, path):
+    if not os.path.isfile(path):
         return None
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
         print(f"disk-growth-report: invalid JSON for {label}: {exc}", file=sys.stderr)
         sys.exit(1)
 
 def dir_index(doc):
+    if doc.get("meta", {}).get("du_partial"):
+        return None
     out = {}
     for block in (doc.get("directory_totals") or {}).values():
+        if block.get("timeout") or block.get("error"):
+            return None
         for ent in block.get("entries") or []:
             path = ent.get("path")
             if path:
@@ -100,10 +96,12 @@ def fs_index(doc):
 
 def docker_index(doc):
     d = doc.get("docker") or {}
+    if d.get("available") is not True or d.get("error"):
+        return None
     return dict((d.get("summary") or {}).items())
 
 def diff_maps(new, old):
-    if old is None:
+    if new is None or old is None:
         return {"available": False, "growers": [], "shrinkers": []}
     keys = set(new) | set(old)
     deltas = []
@@ -112,6 +110,19 @@ def diff_maps(new, old):
     growers = sorted([x for x in deltas if x[1] > 0], key=lambda t: t[1], reverse=True)
     shrinkers = sorted([x for x in deltas if x[1] < 0], key=lambda t: t[1])
     return {"available": True, "growers": growers[:15], "shrinkers": shrinkers[:15]}
+
+def diff_directories(new, old):
+    current = dir_index(new)
+    baseline = dir_index(old) if old is not None else None
+    if current is None or baseline is None:
+        return diff_maps(None, None)
+    # These are top-N observations, not exhaustive path inventories. Missing
+    # from a complete top-N list still does not prove the path shrank to zero.
+    common = set(current) & set(baseline)
+    result = diff_maps({k: current[k] for k in common}, {k: baseline[k] for k in common})
+    result["unmatched_current_paths"] = len(set(current) - common)
+    result["unmatched_baseline_paths"] = len(set(baseline) - common)
+    return result
 
 def diff_fs(new, old):
     if old is None:
@@ -140,16 +151,19 @@ def diff_docker_summary(new, old):
         return {"available": False}
 
     def sizes(doc):
+        index = docker_index(doc)
+        if index is None:
+            return None
         out = {}
-        for name, block in (docker_index(doc)).items():
+        for name, block in index.items():
             out[name] = int(block.get("size_bytes_sum") or 0)
         return out
 
     return diff_maps(sizes(new), sizes(old))
 
-current = load("current", os.environ["DISK_GROWTH_CURRENT"])
-base1 = load("day1", os.environ.get("DISK_GROWTH_BASE1", ""))
-base7 = load("day7", os.environ.get("DISK_GROWTH_BASE7", ""))
+current = load("current", sys.argv[1])
+base1 = load("day1", sys.argv[2])
+base7 = load("day7", sys.argv[3])
 
 report = {
     "report_date": os.environ["DISK_GROWTH_REPORT_DATE"],
@@ -160,8 +174,8 @@ report = {
         "7d": diff_fs(current, base7),
     },
     "directories": {
-        "1d": diff_maps(dir_index(current), dir_index(base1) if base1 else None),
-        "7d": diff_maps(dir_index(current), dir_index(base7) if base7 else None),
+        "1d": diff_directories(current, base1),
+        "7d": diff_directories(current, base7),
     },
     "docker_summary": {
         "1d": diff_docker_summary(current, base1),
@@ -216,7 +230,7 @@ for label, key, baseline_key in (
             for path, d in dirs.get("shrinkers", [])[:10]:
                 print(f"  {path}: {fmt_bytes(d)}")
     else:
-        print("  (no baseline snapshot for directories)")
+        print("  (directory comparison unavailable: missing baseline or incomplete scan)")
 
     dk = report["docker_summary"][key]
     if dk.get("available"):
@@ -224,5 +238,5 @@ for label, key, baseline_key in (
         for name, d in dk.get("growers", [])[:10]:
             print(f"  {name}: {fmt_bytes(d)}")
     else:
-        print("  (no baseline snapshot for docker)")
+        print("  (Docker comparison unavailable: missing baseline or collection failure)")
 PY
