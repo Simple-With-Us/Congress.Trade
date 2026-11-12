@@ -159,14 +159,16 @@ describe('stPeerPricesHealth', () => {
     const metrics = await collectStPeerPricesMetrics(env, now, 6);
     expect(metrics.corpusLatestDate).toBeNull();
     expect(metrics.skip).toBe(false);
-    expect(stPeerPricesMetricsToCheck(metrics).status).toBe('ok');
+    expect(metrics.stalled).toBe(true);
+    expect(stPeerPricesMetricsToCheck(metrics).status).toBe('stalled');
   });
 
-  it('renders never, not neverh ago, when pending tickers have no progress stamp (Kody #6)', async () => {
+  it('stalls a pending backlog that has no drain-progress stamp, without saying neverh', async () => {
     vi.mocked(get).mockResolvedValueOnce({ n: 7, never_n: 0, oldest_at: null });
     vi.mocked(get).mockResolvedValueOnce({ d: '2026-10-22' });
 
     const metrics = await collectStPeerPricesMetrics(env, now, 6);
+    expect(metrics.stalled).toBe(true);
     expect(metrics.detail).toContain('drain progress never');
     expect(metrics.detail).not.toContain('neverh');
   });

@@ -639,7 +639,7 @@ describe('staggered daily lanes', () => {
     expect(await maybeRunDailyMarketDataJobs(env, new Date('2026-10-15T11:07:00Z'))).toBe('ran');
     expect(mocks.runPriceRefresh).toHaveBeenCalledTimes(4);
     expect(mocks.runPriceRefresh.mock.calls[3][1]).toMatchObject({ max: 301 });
-    expect(catchUpState(kv)).toMatchObject({ runs: 1, noProgressRuns: 0, attempts: 4 });
+    expect(catchUpState(kv)).toMatchObject({ runs: 1, noProgressRuns: 1, attempts: 4 });
   });
 
   it('counts zero-priced runs with ticker-level errors as engaged:  they spend the budget and park', async () => {

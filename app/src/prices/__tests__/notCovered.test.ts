@@ -962,7 +962,7 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
         Number((db.prepare('SELECT COUNT(*) AS n FROM _sr_updates WHERE ticker = ?').get(ticker) as { n: number }).n);
     }
 
-    it('the same error on the next run updates only price_checked_at, not the marker', async () => {
+    it('the same error on the next run does not rewrite price_checked_at or the marker', async () => {
       seedTrade('t-w1', 'SAMEERR');
       seedSr('SAMEERR', {
         priceUnavailable: 0,
@@ -976,11 +976,11 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
       const afterFirst = updates();
       expect(afterFirst).toBeGreaterThanOrEqual(1);
       const checkedAfterFirst = srRow('SAMEERR')?.price_checked_at;
+      expect(checkedAfterFirst).toBe(NOW.toISOString());
       await runPriceRefresh(env, { max: 10 });
-      expect(updates()).toBeGreaterThan(afterFirst);
+      expect(updates()).toBe(afterFirst);
       expect(srRow('SAMEERR')?.price_unavailable_reason).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 500 upstream`);
-      expect(srRow('SAMEERR')?.price_checked_at).toBe(NOW.toISOString());
-      expect(checkedAfterFirst).toBeTruthy();
+      expect(srRow('SAMEERR')?.price_checked_at).toBe(checkedAfterFirst);
     });
 
     it('a different error message still updates the marker', async () => {
@@ -997,7 +997,7 @@ describe('Kody follow-ups on #2849 (post-merge)', () => {
       h.errors.set('NEWERR', 'peer 502 bad gateway');
       await runPriceRefresh(env, { max: 10 });
 
-      expect(updates()).toBeGreaterThanOrEqual(3);
+      expect(updates()).toBeGreaterThanOrEqual(2);
       expect(srRow('NEWERR')?.price_unavailable_reason).toBe(`${ST_FETCH_ERROR_REASON_PREFIX}peer 502 bad gateway`);
     });
   });

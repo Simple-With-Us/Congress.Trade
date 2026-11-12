@@ -38,7 +38,7 @@ import {
   PEER_PRICE_CATCHUP_MAX_TICKERS,
   parsePeerPriceCatchUpState,
   peerPriceCatchUpAfterRun,
-  peerPriceCatchUpEffectiveRunCap,
+  peerPriceCatchUpAnchoredRunCap,
   peerPriceCatchUpGate,
   peerPriceSnapshotNeedsCatchUp,
   isProviderLevelPriceError,
@@ -518,7 +518,7 @@ export async function maybeRunPeerPriceCatchUp(
     return 'stamped'; // no KV → skip rather than risk an unbounded hourly walk
   }
   const beforeProbe = await readPeerPricePending(env, now);
-  const runCap = beforeProbe ? peerPriceCatchUpEffectiveRunCap(beforeProbe.pending) : undefined;
+  const runCap = peerPriceCatchUpAnchoredRunCap(state, beforeProbe?.pending ?? null);
   if (peerPriceCatchUpGate(state, now, { maxRuns: runCap }) !== 'ok') return 'stamped';
   const before = beforeProbe;
   if (!before || !peerPriceSnapshotNeedsCatchUp(before)) return 'stamped';
@@ -534,6 +534,7 @@ export async function maybeRunPeerPriceCatchUp(
 
   const claimed: PeerPriceCatchUpState = {
     ...state,
+    runCap,
     runs: state.runs + 1,
     attempts: state.attempts + 1,
     lastRunAt: now.toISOString(),
