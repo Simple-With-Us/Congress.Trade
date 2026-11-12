@@ -36,6 +36,7 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
+import { applyHouseFiledDateIfMissing, normalizeHouseFilingDateToIso } from './houseFiledDate.ts';
 import {
   fetchSenatePtrFilings,
   formatSenateEfdTransportNote,
@@ -158,13 +159,7 @@ export function preclassifyDocKind(
 }
 
 function normalizeFilingDate(raw: string | null | undefined): string | null {
-  const s = (raw ?? '').trim();
-  if (!s) return null;
-  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s);
-  if (us) return `${us[3]}-${us[1].padStart(2, '0')}-${us[2].padStart(2, '0')}`;
-  return s.slice(0, 10);
+  return normalizeHouseFilingDateToIso(raw);
 }
 
 function slugPart(raw: string): string {
@@ -486,28 +481,7 @@ export async function insertFilingIfNew(
   // ZIP later surfaces the same doc WITH a date, so COALESCE it in then instead
   // of leaving the row permanently dateless.
   if (filedDate) {
-    await run(env.DB, 'UPDATE filings SET filed_date = ? WHERE doc_id = ? AND filed_date IS NULL', [
-      filedDate,
-      f.docId,
-    ]);
-    // Same backfill on the latency candidate row: recordDisclosureLatencyCandidate
-    // only runs for genuinely-new discoveries (see persistAndEnqueue), so a
-    // duplicate discovery that finally supplies a filed_date (e.g. the bulk ZIP
-    // confirming a live-search-only doc) would otherwise leave
-    // disclosure_latency_candidates.filed_date permanently NULL, breaking the
-    // FMP matcher's filer/date fallback for that filing. disclosure_latency_candidates
-    // is an optional table (migration 0021); swallow a missing-table error the
-    // same way recordDisclosureLatencyCandidate does rather than aborting the
-    // whole discovery on a deployment where it hasn't been applied yet.
-    try {
-      await run(
-        env.DB,
-        'UPDATE disclosure_latency_candidates SET filed_date = ? WHERE doc_id = ? AND (filed_date IS NULL OR filed_date = "")',
-        [filedDate, f.docId],
-      );
-    } catch (err) {
-      if (!storageMissing(err)) throw err;
-    }
+    await applyHouseFiledDateIfMissing(env, f.docId, { iso: filedDate, source: 'index' });
   }
   if (filerId) {
     await run(env.DB, 'UPDATE filings SET filer_id = ? WHERE doc_id = ? AND filer_id IS NULL', [
