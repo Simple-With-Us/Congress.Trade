@@ -1,0 +1,518 @@
+{
+  "note": "Curated source portraits for the face pack. Congressional members are resolved automatically from unitedstates/images by bioguide (see build_face_pack.py) and are NOT listed here. Every entry below was produced by discover_commons.py and then eyeballed on a contact sheet. The licence check is a RECORD, not a gate (owner decision, 2026-08): every entry still carries its verified licence, author/Artist and a ready-to-use attributionCaption, but public domain is no longer required to ship -- see facepack.py's licence_tier for how PD is still preferred where available. Leave an entry out entirely only when NO licence can be recorded, or the right-person identification is not confident -- a gap is still cheaper than a wrong face or an unattributable one.",
+  "filerIdAliasesNote": "filerId -> bioguide for duplicate identities that will never carry their own bioguide-shaped photoUrl (a MANUAL-* or otherwise-orphaned filer extracted under a legal-name variant of someone already packed under their common name, e.g. Congress's own disclosure pipeline producing a second filer id for the same person). Reuses that bioguide's already-built image byte for byte -- no new download, no new licence to track.",
+  "filerIdAliases": {
+    "MANUAL-CAWTHORN": "C001104",
+    "MANUAL-HOLLINGSWORTH": "H001074"
+  },
+  "congressOverridesNote": "Members whose bioguide has no image in unitedstates/images yet (newly seated, or a historical bioguide that predates portraits) or whose bioguide the live /api/members identity matcher has not linked a photoUrl to yet even though unitedstates/images already carries the portrait. Same licence-as-record rule as the executive list; congress members still get public domain wherever it exists (unitedstates/images always is).",
+  "congressOverrides": [
+    {
+      "key": "B001323",
+      "bioguide": "B001323",
+      "name": "Nicholas J. Begich III",
+      "filerIds": [
+        "house-ak00-nicholas-iii-begich"
+      ],
+      "commonsFile": "File:Rep. Nick Begich III (119th Congress) (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/c/ca/Rep._Nick_Begich_III_%28119th_Congress%29_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Rep._Nick_Begich_III_(119th_Congress)_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States House of Representatives"
+    },
+    {
+      "key": "V000139",
+      "bioguide": "V000139",
+      "name": "Matt Van Epps",
+      "filerIds": [
+        "house-tn07-matthew-robert-van-epps"
+      ],
+      "commonsFile": "File:Matt Van Epps official portrait.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/d/d9/Matt_Van_Epps_official_portrait.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Matt_Van_Epps_official_portrait.jpg",
+      "licence": "Public domain",
+      "attribution": "US Congress"
+    },
+    {
+      "key": "M001245",
+      "bioguide": "M001245",
+      "name": "Christian D. Menefee",
+      "filerIds": [
+        "MANUAL-MENEFEE"
+      ],
+      "commonsFile": "File:Christian Menefee, official portrait (119th Congress).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/4/40/Christian_Menefee%2C_official_portrait_%28119th_Congress%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Christian_Menefee,_official_portrait_(119th_Congress).jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. House of Representatives"
+    },
+    {
+      "key": "H001104",
+      "bioguide": "H001104",
+      "name": "Jon Husted",
+      "filerIds": [
+        "MANUAL-HUSTED"
+      ],
+      "commonsFile": "File:Sen. Jon Husted official portrait, 119th Congress (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/6/6d/Sen._Jon_Husted_official_portrait%2C_119th_Congress_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Sen._Jon_Husted_official_portrait,_119th_Congress_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Senate"
+    },
+    {
+      "key": "T000479",
+      "bioguide": "T000479",
+      "name": "Nicholas V. Taylor",
+      "filerIds": [
+        "house-tx03-nicholas-v-taylor"
+      ],
+      "note": "Van Taylor (legal name Nicholas Van Campen Taylor), TX-03 2019-2023. The live /api/members identity matcher has not linked this filer id to a photoUrl even though unitedstates/images already carries T000479 (verified 200 on both /original/ and /450x550/) -- pointed straight at the standard PD CDN rather than a Commons search.",
+      "sourceUrl": "https://unitedstates.github.io/images/congress/original/T000479.jpg",
+      "sourcePage": "https://github.com/unitedstates/images",
+      "licence": "Public domain (CC0 1.0 Universal)",
+      "attribution": "unitedstates/images — public-domain congressional portraits"
+    }
+  ],
+  "executives": [
+    {
+      "key": "pete-hegseth",
+      "name": "Pete Hegseth",
+      "filerIds": [
+        "MANUAL-HEGSETH"
+      ],
+      "commonsFile": "File:Pete Hegseth Official Portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/9/9b/Pete_Hegseth_Official_Portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Pete_Hegseth_Official_Portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of Defense"
+    },
+    {
+      "key": "scott-bessent",
+      "name": "Scott Bessent",
+      "filerIds": [
+        "EXEC-BESSENT"
+      ],
+      "commonsFile": "File:Official portrait of Treasury Secretary Scott Bessent (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/86/Official_portrait_of_Treasury_Secretary_Scott_Bessent_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Official_portrait_of_Treasury_Secretary_Scott_Bessent_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of the Treasury"
+    },
+    {
+      "key": "howard-lutnick",
+      "name": "Howard Lutnick",
+      "filerIds": [
+        "MANUAL-LUTNICK"
+      ],
+      "commonsFile": "File:Howard Lutnick (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/c/c9/Howard_Lutnick_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Howard_Lutnick_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "The White House"
+    },
+    {
+      "key": "linda-mcmahon",
+      "name": "Linda McMahon",
+      "filerIds": [
+        "EXEC-MCMAHON",
+        "MANUAL-MCMAHON"
+      ],
+      "commonsFile": "File:ED Sec Linda McMahon (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/b/b9/ED_Sec_Linda_McMahon_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:ED_Sec_Linda_McMahon_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "US Government"
+    },
+    {
+      "key": "chris-wright",
+      "name": "Chris Wright",
+      "filerIds": [
+        "EXEC-CWRIGHT",
+        "MANUAL-WRIGHT"
+      ],
+      "commonsFile": "File:Secretary Chris Wright Official Portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/d/da/Secretary_Chris_Wright_Official_Portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Secretary_Chris_Wright_Official_Portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "Donica Payne, United States Department of Energy"
+    },
+    {
+      "key": "doug-burgum",
+      "name": "Doug Burgum",
+      "filerIds": [
+        "MANUAL-BURGUM",
+        "EXEC-DOUGLAS-J-BURGUM"
+      ],
+      "commonsFile": "File:Official portrait of Secretary of the Interior Doug Burgum.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/a/a8/Official_portrait_of_Secretary_of_the_Interior_Doug_Burgum.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Official_portrait_of_Secretary_of_the_Interior_Doug_Burgum.jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of the Interior"
+    },
+    {
+      "key": "pam-bondi",
+      "name": "Pam Bondi",
+      "filerIds": [
+        "MANUAL-BONDI"
+      ],
+      "commonsFile": "File:Pam Bondi official portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/6/6e/Pam_Bondi_official_portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Pam_Bondi_official_portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of Justice"
+    },
+    {
+      "key": "todd-blanche",
+      "name": "Todd Blanche",
+      "filerIds": [
+        "MANUAL-BLANCHE"
+      ],
+      "commonsFile": "File:2025 Todd Blanche official portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2d/2025_Todd_Blanche_official_portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:2025_Todd_Blanche_official_portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "Unknown authorUnknown author"
+    },
+    {
+      "key": "jared-isaacman",
+      "name": "Jared Isaacman",
+      "filerIds": [
+        "MANUAL-ISAACMAN"
+      ],
+      "commonsFile": "File:Jared isaacman official portrait.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/2/23/Jared_isaacman_official_portrait.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Jared_isaacman_official_portrait.jpg",
+      "licence": "Public domain",
+      "attribution": "Bill Ingalls"
+    },
+    {
+      "key": "michael-kratsios",
+      "name": "Michael Kratsios",
+      "filerIds": [
+        "MANUAL-KRATSIOS",
+        "EXEC-MICHAEL-J-KRATSIOS"
+      ],
+      "commonsFile": "File:Michael Kratsios, official White House portrait, 2025.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/2/25/Michael_Kratsios%2C_official_White_House_portrait%2C_2025.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Michael_Kratsios,_official_White_House_portrait,_2025.jpg",
+      "licence": "Public domain",
+      "attribution": "The White House"
+    },
+    {
+      "key": "frank-bisignano",
+      "name": "Frank Bisignano",
+      "filerIds": [
+        "MANUAL-BISIGNANO",
+        "EXEC-FRANK-J-BISIGNANO"
+      ],
+      "commonsFile": "File:Frank Bisignano SSA Commissioner.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/e/ef/Frank_Bisignano_SSA_Commissioner.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Frank_Bisignano_SSA_Commissioner.jpg",
+      "licence": "Public domain",
+      "attribution": "Social Security Administration"
+    },
+    {
+      "key": "keith-sonderling",
+      "name": "Keith Sonderling",
+      "filerIds": [
+        "MANUAL-SONDERLING"
+      ],
+      "commonsFile": "File:Deputy Secretary Sonderling (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/7/71/Deputy_Secretary_Sonderling_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Deputy_Secretary_Sonderling_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "Department of Labor"
+    },
+    {
+      "key": "stephen-miran",
+      "name": "Stephen Miran",
+      "filerIds": [
+        "MANUAL-MIRAN"
+      ],
+      "commonsFile": "File:Stephen Miran, official portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/e/ea/Stephen_Miran%2C_official_portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Stephen_Miran,_official_portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "White House"
+    },
+    {
+      "key": "john-phelan",
+      "name": "John Phelan",
+      "filerIds": [
+        "MANUAL-PHELAN"
+      ],
+      "commonsFile": "File:Secretary of Navy John Phelan.png",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/85/Secretary_of_Navy_John_Phelan.png",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Secretary_of_Navy_John_Phelan.png",
+      "licence": "Public domain",
+      "attribution": "U.S. Navy"
+    },
+    {
+      "key": "bryan-bedford",
+      "name": "Bryan Bedford",
+      "filerIds": [
+        "MANUAL-BEDFORD"
+      ],
+      "commonsFile": "File:FAA Administrator Bryan Bedford.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/83/FAA_Administrator_Bryan_Bedford.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:FAA_Administrator_Bryan_Bedford.jpg",
+      "licence": "Public domain",
+      "attribution": "Federal Aviation Administration"
+    },
+    {
+      "key": "christopher-landau",
+      "name": "Christopher Landau",
+      "filerIds": [
+        "MANUAL-LANDAU"
+      ],
+      "commonsFile": "File:Christopher T. Landau official portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/e/e6/Christopher_T._Landau_official_portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Christopher_T._Landau_official_portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of State"
+    },
+    {
+      "key": "troy-edgar",
+      "name": "Troy Edgar",
+      "filerIds": [
+        "MANUAL-EDGAR"
+      ],
+      "commonsFile": "File:Deputy Secretary Troy Edgar Official Portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/9/95/Deputy_Secretary_Troy_Edgar_Official_Portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Deputy_Secretary_Troy_Edgar_Official_Portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "Mikaela McGee; United States Department of Homeland Security"
+    },
+    {
+      "key": "stacey-dixon",
+      "name": "Stacey Dixon",
+      "filerIds": [
+        "MANUAL-DIXON"
+      ],
+      "commonsFile": "File:Stacey Dixon, ODNI Deputy Director.png",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/4/41/Stacey_Dixon%2C_ODNI_Deputy_Director.png",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Stacey_Dixon,_ODNI_Deputy_Director.png",
+      "licence": "Public domain",
+      "attribution": "United States Office of the Director of National Intelligence"
+    },
+    {
+      "key": "scott-kupor",
+      "name": "Scott Kupor",
+      "filerIds": [
+        "MANUAL-KUPOR",
+        "EXEC-SCOTT-A-KUPOR"
+      ],
+      "commonsFile": "File:OPM Director scott-kupor (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2d/OPM_Director_scott-kupor_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:OPM_Director_scott-kupor_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Office of Personnel Management"
+    },
+    {
+      "key": "sean-mcmaster",
+      "name": "Sean McMaster",
+      "filerIds": [
+        "MANUAL-MCMASTER"
+      ],
+      "commonsFile": "File:Sean McMaster.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/a/a7/Sean_McMaster.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Sean_McMaster.jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of Transportation"
+    },
+    {
+      "key": "katharine-macgregor",
+      "name": "Katharine MacGregor",
+      "filerIds": [
+        "MANUAL-MACGREGOR"
+      ],
+      "commonsFile": "File:Katie MacGregor 2025 portrait.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/0/0f/Katie_MacGregor_2025_portrait.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Katie_MacGregor_2025_portrait.jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of the Interior"
+    },
+    {
+      "key": "stephen-vaden",
+      "name": "Stephen Vaden",
+      "filerIds": [
+        "MANUAL-VADEN"
+      ],
+      "commonsFile": "File:Stephen A. Vaden.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/c/c1/Stephen_A._Vaden.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Stephen_A._Vaden.jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of Agriculture"
+    },
+    {
+      "key": "scott-turner",
+      "name": "Scott Turner",
+      "filerIds": [
+        "MANUAL-TURNER"
+      ],
+      "commonsFile": "File:Scott Turner, official portrait (2025).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/5/5c/Scott_Turner%2C_official_portrait_%282025%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Scott_Turner,_official_portrait_(2025).jpg",
+      "licence": "Public domain",
+      "attribution": "U.S. Department of Housing and Urban Development"
+    },
+    {
+      "key": "barbara-barrett",
+      "name": "Barbara Barrett",
+      "filerIds": [
+        "EXEC-BARBARA-M-BARRETT-2021-ERM"
+      ],
+      "commonsFile": "File:Barbara Barrett (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/0/0e/Barbara_Barrett_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Barbara_Barrett_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of State. Photographer not named."
+    },
+    {
+      "key": "alex-azar",
+      "name": "Alex Azar",
+      "filerIds": [
+        "EXEC-ALEX-M-AZAR-2021-ERM"
+      ],
+      "commonsFile": "File:Alex Azar official portrait (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/1/19/Alex_Azar_official_portrait_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Alex_Azar_official_portrait_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of Health and Human Services"
+    },
+    {
+      "key": "antony-blinken",
+      "name": "Antony Blinken",
+      "filerIds": [
+        "EXEC-ANTHONY-J-BLINKEN-2025-ERM"
+      ],
+      "commonsFile": "File:Antony Blinken.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/4/4a/Antony_Blinken.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Antony_Blinken.jpg",
+      "licence": "Public domain",
+      "attribution": "US State Department"
+    },
+    {
+      "key": "lloyd-austin",
+      "name": "Lloyd Austin",
+      "filerIds": [
+        "EXEC-LLOYD-AUSTIN-2025-ERM"
+      ],
+      "commonsFile": "File:Secretary of Defense Lloyd Austin, official portrait, 2023 (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/a/a2/Secretary_of_Defense_Lloyd_Austin%2C_official_portrait%2C_2023_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Secretary_of_Defense_Lloyd_Austin,_official_portrait,_2023_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "Chad J. McNeeley, U.S. Department of Defense"
+    },
+    {
+      "key": "wally-adeyemo",
+      "name": "Wally Adeyemo",
+      "filerIds": [
+        "EXEC-ADEWALE-ADEYEMO"
+      ],
+      "commonsFile": "File:Wally-Adeyemo-Treasury (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/8c/Wally-Adeyemo-Treasury_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Wally-Adeyemo-Treasury_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of the Treasury"
+    },
+    {
+      "key": "deanne-criswell",
+      "name": "Deanne Criswell",
+      "filerIds": [
+        "EXEC-DEANNE-CRISWELL"
+      ],
+      "commonsFile": "File:Deanne Criswell, FEMA Administrator.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/1/1e/Deanne_Criswell%2C_FEMA_Administrator.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Deanne_Criswell,_FEMA_Administrator.jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of Homeland Security"
+    },
+    {
+      "key": "alice-albright",
+      "name": "Alice Albright",
+      "filerIds": [
+        "EXEC-ALICE-ALBRIGHT-10-24-2022"
+      ],
+      "commonsFile": "File:Alice Albright, MCC CEO.jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/9/97/Alice_Albright%2C_MCC_CEO.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Alice_Albright,_MCC_CEO.jpg",
+      "licence": "Public domain",
+      "attribution": "Millennium Challenge Corporation"
+    },
+    {
+      "key": "christine-abizaid",
+      "name": "Christine Abizaid",
+      "filerIds": [
+        "EXEC-CHRISTINE-ABIZAID"
+      ],
+      "commonsFile": "File:Christine Abizaid NCTC (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/86/Christine_Abizaid_NCTC_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Christine_Abizaid_NCTC_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "Office of the Director of National Intelligence"
+    },
+    {
+      "key": "eric-lander",
+      "name": "Eric Lander",
+      "filerIds": [
+        "EXEC-ERIC-S-LANDER-2022-ERM"
+      ],
+      "commonsFile": "File:Eric Lander, PCAST Co-Chair (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/5/5b/Eric_Lander%2C_PCAST_Co-Chair_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Eric_Lander,_PCAST_Co-Chair_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "The White House"
+    },
+    {
+      "key": "sara-bailey",
+      "name": "Sara Bailey",
+      "filerIds": [
+        "EXEC-SARA-BAILEY",
+        "MANUAL-BAILEY"
+      ],
+      "note": "Sara A. Carter Bailey (bylines as \"Sara Carter\"), confirmed ONDCP Director (\"drug czar\") Jan 2026, 52-48. No public-domain ONDCP/White House portrait found on Commons yet (agency likely has not uploaded one) -- widened net: candid Gage Skidmore press photo, CC BY-SA 2.0, single subject, already cropped tight to head/shoulders. Re-check for a PD official portrait on a future run; swap it in if one appears (facepack.licence_tier ranks PD above this automatically).",
+      "commonsFile": "File:Sara A. Carter (45564638675) (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/80/Sara_A._Carter_%2845564638675%29_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Sara_A._Carter_(45564638675)_(cropped).jpg",
+      "licence": "CC BY-SA 2.0",
+      "attribution": "Gage Skidmore",
+      "attributionCaption": "Gage Skidmore — CC BY-SA 2.0, via Wikimedia Commons"
+    },
+    {
+      "key": "tommy-beaudreau",
+      "name": "Tommy Beaudreau",
+      "filerIds": [
+        "EXEC-TOMMY-BEAUDREAU"
+      ],
+      "commonsFile": "File:Tommy Beaudreau, Deputy Secretary of the Interior (cropped).jpg",
+      "sourceUrl": "https://upload.wikimedia.org/wikipedia/commons/8/81/Tommy_Beaudreau%2C_Deputy_Secretary_of_the_Interior_%28cropped%29.jpg",
+      "sourcePage": "https://commons.wikimedia.org/wiki/File:Tommy_Beaudreau,_Deputy_Secretary_of_the_Interior_(cropped).jpg",
+      "licence": "Public domain",
+      "attribution": "United States Department of the Interior"
+    }
+  ],
+  "unresolved": [
+    {
+      "filerIds": [
+        "MANUAL-MODY"
+      ],
+      "name": "Arjun Mody",
+      "why": "CORRECTION (2026-08, was wrongly marked \"likely an extraction artefact\"): real, currently-serving official -- confirmed Deputy Commissioner of Social Security, Senate vote 53-43 on 2025-12-18 (PN379-20). No Commons portrait found for him yet (SSA does not appear to have uploaded an official one). Re-run discover_commons.py for him periodically; not a right-person problem, purely a no-source-yet problem."
+    },
+    {
+      "filerIds": [
+        "MANUAL-ELVIRA"
+      ],
+      "name": "Maria Elvira",
+      "why": "New gap since the last pass (was not previously in this list). Given name only, no surname, filed under chamber=senate. The only prominent \"Maria Elvira\" in federal politics is Rep. Maria Elvira Salazar (FL-27, House, already covered under her own bioguide S001211) -- but the chamber mismatch and dropped surname are exactly the shape of a name-extraction artefact, not a confident match to her. Not sourcing a photo on a first-name-only coincidence: a wrong face here would misattribute a real, recognisable sitting member's likeness to unverified trading data. Needs filer-identity confirmation before any photo is sourced."
+    },
+    {
+      "filerIds": [
+        "house-pr00-ada-norah-henriquez"
+      ],
+      "name": "Ada Norah Henriquez",
+      "why": "CORRECTION (2026-08, was wrongly marked \"no member of Congress by this name\"): she is real -- the Republican candidate defeated by Jenniffer Gonzalez-Colon for PR Resident Commissioner in 2020 -- but never held office, so it is unclear why she would appear as a filer with trades at all (PR's current, and only, non-voting seat is Pablo Jose Hernandez). Whether this filer id genuinely maps to her is a filer-identity question outside this pack's scope; sourcing her (real, publicly identifiable) photo before that is confirmed risks attributing someone else's trades to her face. Left as a gap pending identity-sync triage."
+    }
+  ]
+}

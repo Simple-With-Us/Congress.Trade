@@ -1,0 +1,11 @@
+[Unit]
+Description=Congress.Trade deploy guard (coalesce + rate-limit + serialize Coolify deploys)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ct-deploy-guard.sh
+SyslogIdentifier=ct-deploy-guard
+# COOLIFY_TOKEN + PUSHOVER_* are shared with the health watchdog.
+EnvironmentFile=-/etc/congress-health-recover.env

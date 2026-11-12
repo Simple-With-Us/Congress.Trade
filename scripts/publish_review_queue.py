@@ -5,8 +5,8 @@ import urllib.parse
 import sys
 import re
 
-ADMIN_TOKEN = "***REMOVED***"
-BASE_URL = "https://congress.trade/api/admin"
+import os; ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+BASE_URL = os.environ.get("BASE_URL", "https://congress.trade/api/admin")
 HEADERS = {
     "Authorization": f"Bearer {ADMIN_TOKEN}",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -103,7 +103,7 @@ def validate_date(d_str, filed_date=""):
 
 def http_get(url):
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req) as res:
+    with urllib.request.urlopen(req, timeout=60) as res:
         return json.loads(res.read().decode("utf-8"))
 
 def http_post(url, body):
@@ -111,7 +111,7 @@ def http_post(url, body):
     post_headers = dict(HEADERS)
     post_headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=post_headers)
-    with urllib.request.urlopen(req) as res:
+    with urllib.request.urlopen(req, timeout=60) as res:
         return json.loads(res.read().decode("utf-8"))
 
 def process_item(item):
@@ -186,7 +186,7 @@ def process_item(item):
             print(f"[REJECTED] {doc_id}")
             return True
         except Exception as e:
-            return False
+            print(f"HTTPError {e.code}: {e.read()}"); return False
 
     try:
         res = http_post(f"{BASE_URL}/review/{urllib.parse.quote(doc_id, safe='')}", {
@@ -200,9 +200,9 @@ def process_item(item):
         if e.code in (404, 409):
             # Already resolved or not found
             return True
-        return False
+        print(f"HTTPError {e.code}: {e.read()}"); return False
     except Exception:
-        return False
+        print(f"HTTPError {e.code}: {e.read()}"); return False
 
 def main():
     total_processed = 0
@@ -210,6 +210,7 @@ def main():
 
     while True:
         data = http_get(f"{BASE_URL}/review-queue?limit=100")
+        print("Data keys:", data.keys())
         items = data.get("items", [])
         if not items:
             break

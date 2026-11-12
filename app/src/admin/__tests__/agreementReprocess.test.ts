@@ -26,7 +26,7 @@ async function validPdfArrayBuffer(): Promise<ArrayBuffer> {
 const app = buildAdminRouter();
 const AUTH = { Authorization: 'Bearer test-admin', 'content-type': 'application/json' };
 
-const ROW_AAPL = '[{"ticker":"AAPL","assetName":"Apple Inc.","txDate":"2026-06-19","txType":"P","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]';
+const ROW_AAPL = '[{"ticker":"AAPL","assetName":"Apple Inc.","txDate":"2026-06-19","txType": "B","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]';
 const ROW_MSFT = '[{"ticker":"MSFT","assetName":"Microsoft","txDate":"2026-06-19","txType":"S","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]';
 
 function makeEnv() {

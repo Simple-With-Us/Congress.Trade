@@ -7,8 +7,11 @@ import {
   marketCapBucket,
   bracketMidpoint,
   isIsoDate,
+  isIsoDateTime,
+  toIsoUtcString,
   daysBetween,
   mergeRefs,
+  normalizeCompanyName,
 } from "../utils";
 import {
   TICKER_ALIASES,
@@ -399,6 +402,57 @@ describe("isIsoDate", () => {
 });
 
 // =============================================================================
+// isIsoDateTime
+// =============================================================================
+
+describe("isIsoDateTime", () => {
+  it("accepts valid ISO 8601 UTC date-time strings", () => {
+    expect(isIsoDateTime("2026-07-22T14:30:00Z")).toBe(true);
+    expect(isIsoDateTime("2026-07-22T14:30:00.000Z")).toBe(true);
+    expect(isIsoDateTime("2026-07-22T14:30:00+00:00")).toBe(true);
+  });
+
+  it("rejects non-UTC timezone offsets or invalid formats", () => {
+    expect(isIsoDateTime("2026-07-22 14:30:00")).toBe(false);
+    expect(isIsoDateTime("invalid-date")).toBe(false);
+    expect(isIsoDateTime("2026-07-22")).toBe(false);
+    expect(isIsoDateTime(123456789 as never)).toBe(false);
+  });
+});
+
+// =============================================================================
+// toIsoUtcString
+// =============================================================================
+
+describe("toIsoUtcString", () => {
+  it("converts Date objects to ISO 8601 UTC strings", () => {
+    const d = new Date("2026-07-22T14:30:00.000Z");
+    expect(toIsoUtcString(d)).toBe("2026-07-22T14:30:00.000Z");
+  });
+
+  it("converts numeric timestamps to ISO 8601 UTC strings", () => {
+    const ts = Date.UTC(2026, 6, 22, 14, 30, 0);
+    expect(toIsoUtcString(ts)).toBe("2026-07-22T14:30:00.000Z");
+  });
+
+  it("converts YYYY-MM-DD date strings to ISO 8601 UTC timestamp strings", () => {
+    expect(toIsoUtcString("2026-07-22")).toBe("2026-07-22T00:00:00.000Z");
+  });
+
+  it("normalizes ISO date-time strings to UTC ISO format", () => {
+    expect(toIsoUtcString("2026-07-22T14:30:00Z")).toBe("2026-07-22T14:30:00.000Z");
+  });
+
+  it("returns null for null, undefined, or invalid inputs", () => {
+    expect(toIsoUtcString(null)).toBeNull();
+    expect(toIsoUtcString(undefined)).toBeNull();
+    expect(toIsoUtcString("invalid")).toBeNull();
+    expect(toIsoUtcString(NaN)).toBeNull();
+    expect(toIsoUtcString(new Date("invalid"))).toBeNull();
+  });
+});
+
+// =============================================================================
 // daysBetween
 // =============================================================================
 
@@ -504,5 +558,51 @@ describe("mergeRefs", () => {
   });
 });
 
+// =============================================================================
+// normalizeCompanyName
+// =============================================================================
 
+describe("normalizeCompanyName", () => {
+  it("returns null for falsy or empty values", () => {
+    expect(normalizeCompanyName(null)).toBeNull();
+    expect(normalizeCompanyName(undefined)).toBeNull();
+    expect(normalizeCompanyName("")).toBeNull();
+    expect(normalizeCompanyName("   ")).toBeNull();
+  });
 
+  it("converts all-caps strings to title case and preserves normal case conventions", () => {
+    expect(normalizeCompanyName("APPLE INC")).toBe("Apple Inc.");
+    expect(normalizeCompanyName("CBS CORPORATION")).toBe("CBS Corporation");
+    expect(normalizeCompanyName("MICROSOFT CORP")).toBe("Microsoft Corp.");
+  });
+
+  it("preserves casing of mixed-case strings but standardizes suffixes", () => {
+    expect(normalizeCompanyName("Apple Inc.")).toBe("Apple Inc.");
+    expect(normalizeCompanyName("Apple Inc")).toBe("Apple Inc.");
+    expect(normalizeCompanyName("Microsoft Corp.")).toBe("Microsoft Corp.");
+    expect(normalizeCompanyName("CBS Corporation, Inc")).toBe("CBS Corporation, Inc.");
+  });
+
+  it("normalizes common corporate suffixes correctly", () => {
+    expect(normalizeCompanyName("Google LLC")).toBe("Google LLC");
+    expect(normalizeCompanyName("Google llc")).toBe("Google LLC");
+    expect(normalizeCompanyName("Google, LLC")).toBe("Google, LLC");
+    expect(normalizeCompanyName("Netflix Ltd")).toBe("Netflix Ltd.");
+    expect(normalizeCompanyName("Netflix LTD")).toBe("Netflix Ltd.");
+    expect(normalizeCompanyName("Tesla Co")).toBe("Tesla Co.");
+    expect(normalizeCompanyName("Tesla CO")).toBe("Tesla Co.");
+  });
+
+  it("preserves known acronyms and capitalizations", () => {
+    expect(normalizeCompanyName("TSMC")).toBe("TSMC");
+    expect(normalizeCompanyName("tsmc")).toBe("TSMC");
+    expect(normalizeCompanyName("asml holdings")).toBe("ASML Holdings");
+    expect(normalizeCompanyName("IBM CORP")).toBe("IBM Corp.");
+  });
+
+  it("strips trailing state of incorporation suffixes", () => {
+    expect(normalizeCompanyName("TRACTOR SUPPLY CO /DE/")).toBe("Tractor Supply Co.");
+    expect(normalizeCompanyName("TRACTOR SUPPLY CO /DE")).toBe("Tractor Supply Co.");
+    expect(normalizeCompanyName("Flex /DE/ Class A")).toBe("Flex Class A");
+  });
+});

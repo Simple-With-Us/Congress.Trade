@@ -8,8 +8,19 @@ import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 import { resolveSecret } from "../src/secrets/infisical.ts";
 import {
   assetNameFromCompetitorPayload,
-  resolveExecutiveFilerIdFromName,
 } from "../src/shared/executiveIdentity.ts";
+import {
+  chamberForMatchedCompetitorFiler,
+  chamberForMintedCompetitorInsert,
+  chamberFromMemberType,
+  competitorReporterNames,
+  parseCompetitorReporter,
+  type ParsedCompetitorChamber,
+} from "../src/shared/competitorAttribution.ts";
+import {
+  assignCompetitorFilerId,
+  type ExistingFilerCandidate,
+} from "../src/shared/competitorFilerMatch.ts";
 
 const dataDir = new URL("../../data/hoarded", import.meta.url).pathname;
 
@@ -105,9 +116,9 @@ async function run() {
   
   const nowStr = new Date().toISOString();
 
-  function processTrade(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
-    if (!date || date < cutoffDate) return; 
-    
+  function processTrade(provider: string, rawName: string, ticker: string, date: string, typeStr: string, rawObj: any, filerId: string) {
+    if (!date || date < cutoffDate) return;
+
     const tk = (ticker || '').toUpperCase();
     if (!tk) return; // Need ticker
 
@@ -140,8 +151,9 @@ async function run() {
     const tradeHash = generateTradeHash(rawName, tk, date, type);
     const docId = `COMPETITOR-${tradeHash}`;
 
-    // Full-name executive match only — never bare last-name → EXEC-*.
-    const filerId = resolveExecutiveFilerIdFromName(rawName) ?? `MANUAL-${lastName.toUpperCase()}`;
+    // filerId is resolved once by the caller (resolveFilerId) — never
+    // recomputed here, so this insert can never disagree with the filers
+    // row processTradeWithFiler already registered under filersToAdd.
     const assetName = assetNameFromCompetitorPayload(rawObj, tk);
     novelTrades.push({
       id: `${docId}-${tradeHash}`,
@@ -152,9 +164,9 @@ async function run() {
       assetName,
       ticker: tk,
       assetType: 'stock', // Fallback
-      txType: type === 'buy' ? 'P' : type === 'sell' ? 'S' : 'E',
-      amountMin: 1001, // default
-      amountMax: 15000, // default
+      txType: type === 'buy' ? 'B' : type === 'sell' ? 'S' : 'E',
+      amountMin: null,
+      amountMax: null,
       isOption: false,
       capGainsOver200: false,
       rawText: JSON.stringify(rawObj),
@@ -165,27 +177,99 @@ async function run() {
       description: `Injected from ${provider}`,
       supplementalText: null,
       rowKey: tradeHash,
-      confidence: 100,
+      confidence: 0,
       source: 'competitor_backfill',
       createdAt: nowStr,
       // cursor_seq is assigned by the DB trigger; persistTransactions() binds NULL.
       cursorSeq: 0,
       firstSeenAt: nowStr,
-      filedDate: date, // Treat filed_date same as tx_date for these purposes
+      filedDate: null,
     });
     novelSet.add(exactKey);
   }
 
   // Before looping over competitors, create a set of seen filers to add if missing
-  const filersToAdd = new Map<string, { id: string, name: string, chamber: string }>();
+  const filersToAdd = new Map<string, { id: string; name: string; chamber: ParsedCompetitorChamber | null }>();
+
+  // Live, non-tombstoned filers: the identities a competitor row must attach to
+  // instead of minting a second one (board rows 2c0b428c / 591011b9).
+  const existingFilers: ExistingFilerCandidate[] = (
+    await env.DB.prepare(
+      "SELECT bioguide_id, full_name, display_name, chamber, state, resolved_bioguide_id FROM filers WHERE merged_into IS NULL",
+    ).all<{
+      bioguide_id: string; full_name: string | null; display_name: string | null;
+      chamber: string | null; state: string | null; resolved_bioguide_id: string | null;
+    }>()
+  ).results.map((f) => ({
+    filerId: f.bioguide_id,
+    fullName: f.full_name,
+    displayName: f.display_name,
+    chamber: f.chamber,
+    state: f.state,
+    resolvedBioguideId: f.resolved_bioguide_id,
+  }));
+  let refusedBareName = 0;
+
+  /**
+   * Ingest identity guard.  History: the original injector resolved filers by
+   * LAST NAME ONLY (`MANUAL-${lastName}`), which collided Rep. Mike Collins
+   * GA-10 with Sen. Susan M. Collins ME, fused two different "Delaney"s into
+   * one MANUAL-DELANEY, and left MANUAL-ELVIRA / MANUAL-BURGUM / MANUAL-WRIGHT
+   * beside the real Salazar and EXEC-* filers.  Order now:
+   *   1. a curated EXEC-* alias (full-name match only);
+   *   2. an EXISTING real filer the payload's reporter names — first+last name
+   *      (diminutive-aware), payload bioguide id, with a known state/chamber
+   *      conflict a hard miss and an ambiguous match a miss
+   *      (shared/competitorFilerMatch.ts);
+   *   3. a real `house-<state><district>-<slug>` id when the payload carries
+   *      office metadata;
+   *   4. a first-name-qualified `MANUAL-<FIRST>-<LAST>` id;
+   *   5. otherwise REFUSE (null): a bare surname never mints a filer.
+   * See admin/competitorAttributionRepair.ts for the repair of rows already
+   * poisoned by the old behavior.
+   */
+  function resolveFilerId(
+    rawName: string,
+    rawObj: unknown,
+  ): { filerId: string; resolvedChamber: ParsedCompetitorChamber | null } | null {
+    const parsed = parseCompetitorReporter(rawObj);
+    // Payload chamber only. The provider default is not trusted here; that is
+    // how executives ended up labelled senate. A bare surname returns null.
+    const assigned = assignCompetitorFilerId({
+      rawName,
+      names: [...competitorReporterNames(rawObj), rawName],
+      chamber: parsed.chamber,
+      state: parsed.state,
+      district: parsed.district,
+      bioguideId: parsed.bioguideId,
+      candidates: existingFilers,
+    });
+    if (!assigned) return null;
+    if (assigned.minted) {
+      if (assigned.filerId.startsWith('EXEC-')) return { filerId: assigned.filerId, resolvedChamber: 'executive' };
+      if (assigned.filerId.startsWith('house-')) return { filerId: assigned.filerId, resolvedChamber: 'house' };
+      if (assigned.filerId.startsWith('senate-')) return { filerId: assigned.filerId, resolvedChamber: 'senate' };
+      return { filerId: assigned.filerId, resolvedChamber: chamberForMintedCompetitorInsert(parsed) };
+    }
+    const existing = existingFilers.find((f) => f.filerId === assigned.filerId);
+    return {
+      filerId: assigned.filerId,
+      resolvedChamber: chamberForMatchedCompetitorFiler(existing?.chamber, parsed),
+    };
+  }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {
-    const lastName = extractLastName(rawName);
-    const execId = resolveExecutiveFilerIdFromName(rawName);
-    const filerId = execId ?? `MANUAL-${lastName.toUpperCase()}`;
-    const resolvedChamber = execId ? 'executive' : chamber;
-    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber: resolvedChamber });
-    processTrade(provider, rawName, resolvedChamber as 'house' | 'senate' | 'executive', ticker, date, typeStr, rawObj);
+    const resolved = resolveFilerId(rawName, rawObj);
+    if (!resolved) {
+      refusedBareName += 1;
+      return;
+    }
+    const { filerId, resolvedChamber } = resolved;
+    const prior = filersToAdd.get(filerId);
+    const chamber =
+      resolvedChamber ?? (prior?.chamber as ParsedCompetitorChamber | null | undefined) ?? null;
+    filersToAdd.set(filerId, { id: filerId, name: rawName, chamber });
+    processTrade(provider, rawName, ticker, date, typeStr, rawObj, filerId);
   }
 
   // unusual whales
@@ -199,7 +283,9 @@ async function run() {
   // quiver
   for (const t of qqTrades) {
     if (t.Representative) {
-      processTradeWithFiler('quiver', t.Representative, t.House === 'House' ? 'house' : 'senate', t.Ticker, t.TransactionDate, t.Transaction, t);
+      // Quiver's `House` field reads 'Representatives' | 'Senate'; the old `=== 'House'`
+      // test never matched, so every Representative defaulted to 'senate'.
+      processTradeWithFiler('quiver', t.Representative, chamberFromMemberType(t.House) === 'senate' ? 'senate' : 'house', t.Ticker, t.TransactionDate, t.Transaction, t);
     }
   }
 
@@ -219,6 +305,9 @@ async function run() {
   }
   
   console.log(`Found ${novelTrades.length} novel trades across all competitor datasets.`);
+  if (refusedBareName > 0) {
+    console.warn(`Refused ${refusedBareName} rows whose reporter is a bare surname (no filer minted from a last name alone).`);
+  }
 
   console.log("Inserting required filers...");
   for (const f of filersToAdd.values()) {

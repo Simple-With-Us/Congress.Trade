@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assertSubscriptionQuota,
+  deleteSubscription,
   MAX_ACTIVE_SUBSCRIPTIONS_PER_USER,
   MAX_SUBSCRIPTIONS_PER_USER,
   SubscriptionQuotaError,
@@ -42,5 +43,46 @@ describe('durable subscription quotas', () => {
       }) } as unknown as D1Database,
     } as unknown as Env;
     await expect(updateSubscription(env, 'sub_1', { active: true })).rejects.toBeInstanceOf(SubscriptionQuotaError);
+  });
+
+  it('deleteSubscription removes an existing row and no-ops when missing', async () => {
+    const deleted: string[] = [];
+    const env = {
+      DB: {
+        prepare: (sql: string) => ({
+          params: [] as unknown[],
+          bind(...params: unknown[]) {
+            this.params = params;
+            return this;
+          },
+          async first<T>() {
+            if (/FROM subscriptions WHERE id = \?/i.test(sql) && this.params[0] === 'sub_alive') {
+              return {
+                id: 'sub_alive',
+                client_id: 'user:u',
+                delivery: 'sse',
+                target_url: null,
+                secret: 's',
+                filters: '{}',
+                cursor: 0,
+                active: 1,
+                created_at: '2026-01-01T00:00:00.000Z',
+              } as T;
+            }
+            return null as T | null;
+          },
+          async run() {
+            if (/DELETE FROM subscriptions/i.test(sql)) deleted.push(`sub:${this.params[0]}`);
+            if (/DELETE FROM sse_leases/i.test(sql)) deleted.push(`lease:${this.params[0]}`);
+            return { success: true, meta: { changes: 1 } };
+          },
+        }),
+      } as unknown as D1Database,
+    } as unknown as Env;
+
+    await expect(deleteSubscription(env, 'missing')).resolves.toBe(false);
+    expect(deleted).toEqual([]);
+    await expect(deleteSubscription(env, 'sub_alive')).resolves.toBe(true);
+    expect(deleted).toEqual(['sub:sub_alive', 'lease:sub_alive']);
   });
 });

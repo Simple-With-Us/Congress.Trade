@@ -424,7 +424,7 @@ async function loadTransactions(env: Env, q: PitScoreQuery): Promise<TxRow[]> {
   const where = [
     't.deprecated_at IS NULL',
     "t.ticker IS NOT NULL AND t.ticker <> ''",
-    "t.tx_type IN ('P', 'S')",
+    "t.tx_type IN ('B', 'P', 'S')",
     // Congress PIT scores are a CONGRESSIONAL contract for App B: executive
     // (OGE 278-T) rows stay out until the shared package carries the chamber.
     "(COALESCE(fl.chamber, f.chamber) IS NULL OR COALESCE(fl.chamber, f.chamber) <> 'executive')",
@@ -459,7 +459,7 @@ async function loadTransactions(env: Env, q: PitScoreQuery): Promise<TxRow[]> {
     `t.asset_type, t.asset_type_name, t.tx_type, t.amount_min, t.amount_max, t.is_option, ` +
     `t.raw_text, t.confidence, t.source, t.created_at, ` +
     `f.filed_date, f.first_seen_at, f.source_url, f.chamber AS filing_chamber, ` +
-    `fl.full_name, fl.chamber AS filer_chamber, fl.party, fl.state, fl.committees, ` +
+    `COALESCE(fl.display_name, fl.full_name) AS full_name, fl.chamber AS filer_chamber, fl.party, fl.state, fl.committees, ` +
     `sr.company_name, sr.sector, sr.industry, sr.asset_class, sr.cik, sr.exchange_short ` +
     `FROM transactions t ` +
     `LEFT JOIN filings f ON f.doc_id = t.doc_id ` +
@@ -551,8 +551,13 @@ function horizonWeightsRecord(): Record<string, number> {
   return Object.fromEntries(MEMBER_SKILL_HORIZONS.map((h) => [h.key, h.weight]));
 }
 
+function isBuySide(txType: string | null | undefined): boolean {
+  const c = String(txType ?? '').toUpperCase();
+  return c === 'B' || c === 'P';
+}
+
 function sideFromTxType(txType: TxType | undefined): SkillSide | null {
-  if (txType === 'P') return 'buy';
+  if (isBuySide(txType)) return 'buy';
   if (txType === 'S') return 'sell';
   return null;
 }
@@ -841,7 +846,7 @@ async function memberSkillFor(
   }
   const where = [
     't.deprecated_at IS NULL',
-    "t.tx_type IN ('P', 'S')",
+    "t.tx_type IN ('B', 'P', 'S')",
     't.is_option = 0',
     "t.ticker IS NOT NULL AND t.ticker <> ''",
     `COALESCE(f.first_seen_at, CASE WHEN f.filed_date IS NOT NULL THEN f.filed_date || 'T00:00:00.000Z' END, t.created_at) < ?`,
@@ -1051,12 +1056,12 @@ function buildClusterWindow(ticker: string, asOf: string, allRows: TxRow[], days
     const d = dateOnly(available);
     return !!available && !!d && available <= asOf && d >= startDate && d <= endDate;
   });
-  const buyMemberIds = new Set(rows.filter((r) => r.tx_type === 'P' && r.filer_id).map((r) => r.filer_id as string));
+  const buyMemberIds = new Set(rows.filter((r) => isBuySide(r.tx_type) && r.filer_id).map((r) => r.filer_id as string));
   const sellMemberIds = new Set(rows.filter((r) => r.tx_type === 'S' && r.filer_id).map((r) => r.filer_id as string));
   const allMemberIds = new Set(rows.filter((r) => r.filer_id).map((r) => r.filer_id as string));
   const memberSideWeights = new Map<string, number>();
   for (const row of rows) {
-    const side = row.tx_type === 'P' ? 'buy' : row.tx_type === 'S' ? 'sell' : null;
+    const side = isBuySide(row.tx_type) ? 'buy' : row.tx_type === 'S' ? 'sell' : null;
     const member = row.filer_id ?? row.id;
     if (!side) continue;
     const key = `${side}:${member}`;
@@ -1105,14 +1110,14 @@ function buildClusterWindow(ticker: string, asOf: string, allRows: TxRow[], days
 }
 
 function buildClusterConsensus(ticker: string, asOf: string, currentRows: TxRow[], allRows: TxRow[], memberSkill: MemberSkillSummary): Record<string, unknown> {
-  const buyCount = currentRows.filter((t) => t.tx_type === 'P').length;
+  const buyCount = currentRows.filter((t) => isBuySide(t.tx_type)).length;
   const sellCount = currentRows.filter((t) => t.tx_type === 'S').length;
-  const buyMembers = new Set(currentRows.filter((t) => t.tx_type === 'P' && t.filer_id).map((t) => t.filer_id as string));
+  const buyMembers = new Set(currentRows.filter((t) => isBuySide(t.tx_type) && t.filer_id).map((t) => t.filer_id as string));
   const sellMembers = new Set(currentRows.filter((t) => t.tx_type === 'S' && t.filer_id).map((t) => t.filer_id as string));
   const allMembers = new Set(currentRows.filter((t) => t.filer_id).map((t) => t.filer_id as string));
-  const direction = directionFrom(buyCount, sellCount, currentRows.reduce((s, t) => s + (t.tx_type === 'P' ? midpoint(t) : t.tx_type === 'S' ? -midpoint(t) : 0), 0));
+  const direction = directionFrom(buyCount, sellCount, currentRows.reduce((s, t) => s + (isBuySide(t.tx_type) ? midpoint(t) : t.tx_type === 'S' ? -midpoint(t) : 0), 0));
   const sameSideMembers = direction === 'SELL' ? sellMembers.size : direction === 'BUY' ? buyMembers.size : allMembers.size;
-  const netFlowUsd = currentRows.reduce((s, t) => s + (t.tx_type === 'P' ? midpoint(t) : t.tx_type === 'S' ? -midpoint(t) : 0), 0);
+  const netFlowUsd = currentRows.reduce((s, t) => s + (isBuySide(t.tx_type) ? midpoint(t) : t.tx_type === 'S' ? -midpoint(t) : 0), 0);
   const windows = Object.fromEntries(
     CLUSTER_WINDOWS.map((w) => [w.key, { label: w.label, ...buildClusterWindow(ticker, asOf, allRows, w.days) }]),
   );
@@ -1152,13 +1157,13 @@ async function buildRow(
 ): Promise<PitScoreRow> {
   const asOfDate = dateOnly(asOf) ?? computedAt.slice(0, 10);
   const ids = txs.map((t) => t.id);
-  const buyCount = txs.filter((t) => t.tx_type === 'P').length;
+  const buyCount = txs.filter((t) => isBuySide(t.tx_type)).length;
   const sellCount = txs.filter((t) => t.tx_type === 'S').length;
-  const buyMembers = new Set(txs.filter((t) => t.tx_type === 'P' && t.filer_id).map((t) => t.filer_id as string));
+  const buyMembers = new Set(txs.filter((t) => isBuySide(t.tx_type) && t.filer_id).map((t) => t.filer_id as string));
   const sellMembers = new Set(txs.filter((t) => t.tx_type === 'S' && t.filer_id).map((t) => t.filer_id as string));
   const allMembers = new Set(txs.filter((t) => t.filer_id).map((t) => t.filer_id as string));
   const estVolumeUsd = txs.reduce((s, t) => s + midpoint(t), 0);
-  const netFlowUsd = txs.reduce((s, t) => s + (t.tx_type === 'P' ? midpoint(t) : t.tx_type === 'S' ? -midpoint(t) : 0), 0);
+  const netFlowUsd = txs.reduce((s, t) => s + (isBuySide(t.tx_type) ? midpoint(t) : t.tx_type === 'S' ? -midpoint(t) : 0), 0);
   const direction = directionFrom(buyCount, sellCount, netFlowUsd);
   const directionSign = direction === 'SELL' ? -1 : direction === 'BUY' ? 1 : 0;
   const sameSideMembers = direction === 'SELL' ? sellMembers.size : direction === 'BUY' ? buyMembers.size : allMembers.size;

@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { PDFDocument } from 'pdf-lib';
-import { deprecatePredecessorFilingTransactions, processAgreementDoc, type AgreementModels } from '../agreement.ts';
+import { processAgreementDoc, type AgreementModels } from '../agreement.ts';
 import { clearResolverCache } from '../normalizer.ts';
 
 beforeEach(() => {
@@ -26,7 +26,7 @@ async function validPdfArrayBuffer(): Promise<ArrayBuffer> {
  * filing/review writes.
  */
 
-const ROW_AAPL = '[{"ticker":"AAPL","assetName":"Apple Inc.","txDate":"2026-06-19","txType":"P","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]';
+const ROW_AAPL = '[{"ticker":"AAPL","assetName":"Apple Inc.","txDate":"2026-06-19","txType": "B","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]';
 const ROW_MSFT = '[{"ticker":"MSFT","assetName":"Microsoft","txDate":"2026-06-19","txType":"S","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]';
 
 interface ExtractionRunRow {
@@ -239,7 +239,7 @@ describe('processAgreementDoc extraction_runs persistence', () => {
   it('rejects null, impossible, and future transaction dates', async () => {
     for (const txDate of [null, '2026-02-31', '2099-01-01']) {
       const payload = JSON.stringify([{
-        ticker: 'AAPL', assetName: 'Apple Inc.', txDate, txType: 'P',
+        ticker: 'AAPL', assetName: 'Apple Inc.', txDate, txType: 'B',
         amountRange: '$1,001 - $15,000', confidence: 0.9,
       }]);
       stubProviders(payload, payload);
@@ -255,37 +255,5 @@ describe('processAgreementDoc extraction_runs persistence', () => {
     const res = await processAgreementDoc(makeEnv().env, duplicate, 'H-9', 'raw/H-9', false);
     expect(res).toMatchObject({ outcome: 'skipped', reason: 'duplicate_model_lineup' });
     expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('soft-deprecates predecessor filing transactions when an amended filing is published', async () => {
-    let deprecatedSql = '';
-    let params: unknown[] = [];
-    const mockDb = {
-      prepare(sql: string) {
-        return {
-          bind(...p: unknown[]) {
-            deprecatedSql = sql;
-            params = p;
-            return this;
-          },
-          async run() {
-            return { meta: { changes: 3 } };
-          },
-        };
-      },
-    } as any;
-
-    const count = await deprecatePredecessorFilingTransactions(
-      mockDb,
-      'E-2025-donald-j-trump-08-12-2025-278t-2-amended',
-      'EXEC-DONALD-J-TRUMP',
-      '2025-08-12',
-    );
-
-    expect(count).toBe(3);
-    expect(deprecatedSql).toMatch(/UPDATE transactions/i);
-    expect(deprecatedSql).toMatch(/deprecated_at = \?/i);
-    expect(params[1]).toContain('superseded by amendment E-2025-donald-j-trump-08-12-2025-278t-2-amended');
-    expect(params[2]).toBe('EXEC-DONALD-J-TRUMP');
   });
 });

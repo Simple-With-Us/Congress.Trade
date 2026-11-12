@@ -228,7 +228,7 @@ describe('GET /review-queue pagination', () => {
         createdAt: tsAt(i),
         payload: JSON.stringify({
           minConfidence: 0.4,
-          transactions: [{ ticker: 'AAPL', assetName: 'Apple Inc.', txType: 'P', rawText: pad }],
+          transactions: [{ ticker: 'AAPL', assetName: 'Apple Inc.', txType: 'B', rawText: pad }],
         }),
         models: [{ provider: 'anthropic', model: 'claude-sonnet-5', ok: true, rowCount: 1, avgConfidence: 0.75 }],
       });
@@ -243,5 +243,26 @@ describe('GET /review-queue pagination', () => {
 
     const byteSize = new TextEncoder().encode(text).length;
     expect(byteSize).toBeLessThan(500 * 1024);
+  });
+
+  it('keeps OpenRouter extraction_runs model as the slug, not a copy of the provider', async () => {
+    const db = makeReviewQueueTestDb([
+      {
+        docId: 'OR-1',
+        createdAt: tsAt(1),
+        models: [
+          { provider: 'openrouter', model: 'google/gemini-2.5-pro', ok: true, rowCount: 2, avgConfidence: 0.88, createdAt: tsAt(2) },
+          { provider: 'openrouter', model: 'anthropic/claude-sonnet-4', ok: true, rowCount: 1, avgConfidence: 0.81, createdAt: tsAt(1) },
+        ],
+      },
+    ]);
+    const { status, body } = await fetchQueue(db, '?limit=10');
+    expect(status).toBe(200);
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0].models).toEqual([
+      expect.objectContaining({ provider: 'openrouter', model: 'google/gemini-2.5-pro', ok: true, rowCount: 2 }),
+      expect.objectContaining({ provider: 'openrouter', model: 'anthropic/claude-sonnet-4', ok: true, rowCount: 1 }),
+    ]);
+    expect(body.items[0].models.every((m) => m.model !== 'openrouter')).toBe(true);
   });
 });

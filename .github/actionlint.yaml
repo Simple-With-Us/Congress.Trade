@@ -1,4 +1,5 @@
 self-hosted-runner:
   labels:
-    - congress-ci
-    - congress-deploy
+    - macOS
+    - ARM64
+    - xcode26

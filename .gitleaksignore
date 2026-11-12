@@ -1,0 +1,53 @@
+# False positives: curated executive-filer id strings in executiveTitles.ts pattern-match the generic-api-key rule.
+959ef3117b16acee8e4994fee015b16d3b3d7918:app/src/shared/executiveTitles.ts:generic-api-key:62
+959ef3117b16acee8e4994fee015b16d3b3d7918:app/src/shared/executiveTitles.ts:generic-api-key:66
+#
+# PR #1851 APNs send: comment listed the APNS p8 env name next to PEM/base64 wording.
+# Not a secret — hosted gitleaks scans the introducing commit, so the fingerprint is
+# required even after the comment was reworded.
+5872446d24ecf296d3a39db9820a589641f8802c:app/src/shared/apns.ts:generic-api-key:10
+#
+# PR #2552 test fixture, not a secret: providerMissingStubClose.test.ts seeds a fake
+# Unusual Whales hash key ('uw-9f3a1c77e2') for the hashed-key reconcile test.
+# The value was renamed to 'uw-hash-fixture-a' in a follow-up commit, but the
+# introducing commit stays inside the PR base..head range gitleaks scans, so
+# its finding has to be ignored by fingerprint.
+20e2cd408ebe9d17020cc284aafea19a8c506c0c:app/src/ingestion/__tests__/providerMissingStubClose.test.ts:generic-api-key:398
+#
+# PR #2789 dashboard client lint: same executive-title data family as the
+# executiveTitles.ts entries above, one line lower in the generated client. The rule
+# keys on the word 'secret', and this 2,485-char line is a table of congressional
+# title forms containing 'Secretary of ...'. Longest token is 31 chars at 4.06
+# bits/char (English), and there is no hex or base64 run of 32+ chars anywhere on
+# the line. Not a secret -- and the table is already on main, unchanged.
+f8e29727fd0d58fc76f6b74a1f83b59ad37278f1:app/src/ui/dashboardClient.ts:generic-api-key:270
+#
+# CT-2437 browser source-map scrub test, not a secret: the scrubber test seeds a
+# fake bearer credential as a key/value assignment, to prove the forwarded child
+# output is redacted before it reaches a CI log.  The fixture was changed to a
+# placeholder in a follow-up commit, because the scrub redacts by pattern rather
+# than by how realistic the value looks, but the introducing commit stays inside
+# the PR base..head range gitleaks scans, so its finding has to be ignored by
+# fingerprint.  No Sentry token was ever committed.
+0d1d5d284a0da6d303aba59d246da8662a20a7f6:scripts/sentry-upload-browser-sourcemaps.node-test.mjs:generic-api-key:91
+#
+# Follow-on to the entry above: the commit that added that comment quoted the
+# fixture value inline, so the ignore file reproduced the flagged shape in its own
+# diff and tripped a second time one commit later.  The comment now describes the
+# fixture instead of quoting it; this fingerprint covers the intermediate commit
+# that still carries the literal.
+f6b1d492e7f3f8db346412958cde59eff2342e6f:.gitleaksignore:generic-api-key:26
+#
+# PR #2930 (CT-2459) minified dashboard client: same executive-title table as
+# the entries above ("EXEC-...-ERM" filer ids next to "Secretary of ..."),
+# now packed onto the single minified DASHBOARD_APP_JS_SERVED line. Public
+# role titles, not credentials. Two commits touched the generated file.
+221e82044f5ee9effa1102aed794641650b5284c:app/src/ui/dashboardClient.ts:generic-api-key:10804
+38144c8b375e23bc767e3f10ffafbccb5a810909:app/src/ui/dashboardClient.ts:generic-api-key:10922
+
+# CT-2462 review-queue failure panels: the regenerated minified dashboard client
+# re-emits the same executive-title data line the PR #2789 entry above covers
+# ('Secretary of ...' forms next to curated EXEC-* filer ids).  Same data family,
+# already on main; the line moved because the client gained the failure panels.
+# Not a secret.
+46dc4fcb31de55f3a5bae12c8debf52cb079bbbe:app/src/ui/dashboardClient.ts:generic-api-key:11073

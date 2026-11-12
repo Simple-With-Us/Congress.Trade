@@ -51,25 +51,145 @@ import {
 } from './bakeoff.ts';
 import { getUnderlyingProvider, isOpenRouterAuto } from '../benchmark/settings.ts';
 import { estimateNominalReadCostUsd } from './benchmarkMetrics.ts';
+import {
+  classifyOpenRouterErrorMessage,
+  isDocScopedOpenRouterError,
+  isProvenOpenRouterCredentialRejection,
+  providerErrorClassForOpenRouterReply,
+} from './openRouterReply.ts';
+import { isTransientInfrastructureError } from '../shared/transientInfra.ts';
 
-export type ProviderErrorClass = 'billing' | 'auth' | 'quota' | 'parse' | 'timeout' | 'other';
+export type ProviderErrorClass =
+  | 'billing'
+  | 'auth'
+  | 'quota'
+  | 'rate_limit'
+  | 'parse'
+  | 'timeout'
+  | 'other';
 
 /** Error classes that indicate a dead account/key rather than a bad document. */
 export const BREAKER_ERROR_CLASSES: readonly ProviderErrorClass[] = ['billing', 'auth'];
+
+/** Circuit wrapper stamped by openRouterBudgetCircuit.ts — peel `last:` to classify. */
+const OPENROUTER_CIRCUIT_MARKER = 'openrouter key budget circuit open';
+
+function peelCircuitLastError(message: string): string | null {
+  const match = message.match(/\(last:\s*(.+?)\)\s*$/i);
+  const last = match?.[1]?.trim() ?? '';
+  return last || null;
+}
+
+/**
+ * Proven LLM/provider credential rejection.  These stay fail-closed + ack.
+ * Do not treat source-fetch 401/403 or admin 401 as a dead OpenRouter key.
+ */
+function isProvenLlmCredentialRejection(message: string): boolean {
+  return isProvenOpenRouterCredentialRejection(message);
+}
+
+function isLlmCredentialContext(message: string): boolean {
+  return (
+    message.includes('openrouter')
+    || message.includes('openai')
+    || message.includes('anthropic')
+    || message.includes('gemini')
+    || message.includes('xai')
+    || message.includes('grok')
+    || message.includes('api key')
+    || message.includes('api_key')
+    || /\bllm\b/.test(message)
+    || message.includes('openroutervision')
+    || message.includes('openroutertext')
+  );
+}
+
+/**
+ * House Clerk / eFD / OGE / fetcher / admin 401-403.  Ingest already treats
+ * `fetcher: Unauthorized` as a transient DLQ.  The HTTP statusText for 401
+ * is the bare word "Unauthorized" — that must not trip extract auth.
+ */
+function isSourceFetchOrAdminAuthNoise(message: string): boolean {
+  const m = message.trim();
+  if (!m) return false;
+  if (m === 'unauthorized' || m === 'forbidden') return true;
+  if (m.startsWith('unauthorized —') || m.startsWith('unauthorized -')) return true;
+  if (m.includes('fetcher:')) return true;
+  if (m.includes('paste your admin token')) return true;
+  if (m.includes('/api/admin')) return true;
+  const statusish = /\b40[13]\b/.test(m) || m.includes('unauthorized') || m.includes('forbidden');
+  if (!statusish) return false;
+  return (
+    m.includes('clerk')
+    || m.includes('disclosures-clerk')
+    || /house (get|live|bulk|zip|ptr|fd|search|fetch)/.test(m)
+    || /senate (get|post|relay|search|fetch|agreement)/.test(m)
+    || m.includes('efdsearch')
+    || /oge (index|get|fetch)/.test(m)
+    || (/\badmin\b/.test(m) && !isLlmCredentialContext(m))
+  );
+}
+
+function isCredentialAuthFailure(message: string): boolean {
+  if (isSourceFetchOrAdminAuthNoise(message)) return false;
+  if (isProvenLlmCredentialRejection(message)) return true;
+  // Bare 401 / "unauthorized" is HTTP statusText from Clerk, admin, or R2 —
+  // only count it as a dead key when an LLM provider is named.
+  if (/\b401\b/.test(message) || message.includes('unauthorized')) {
+    return isLlmCredentialContext(message);
+  }
+  return false;
+}
 
 const label = (c: { provider: string; model: string }): string => `${c.provider}:${c.model}`;
 
 /**
  * Classify one extraction error string into a stable, secret-safe class.
- * Billing/auth/quota patterns intentionally mirror classifyProviderFailure
- * (providerFailure.ts) and the isProviderRateLimit regexes so the same
- * failure is never counted under two different classes by two code paths.
+ * Billing vs credential-auth stay aligned with classifyProviderFailure
+ * (providerFailure.ts).  Rate-limit, stale circuit wrappers, and transient
+ * 403 are NOT quota — a 429 must not halt autopilot as error_class:quota.
  */
 export function classifyProviderErrorClass(
   error: string | null | undefined,
 ): ProviderErrorClass | null {
   const message = (error ?? '').trim().toLowerCase();
   if (!message) return null;
+  // SQLITE_BUSY and cron-deadline aborts are not a provider timeout.  Classing
+  // them as timeout latches autopilot after two ticks (KILL_SWITCH_CLASSES).
+  if (isTransientInfrastructureError(message)) return 'other';
+  // Stale/open circuit is not itself a quota class — classify the wrapped last
+  // error.  A wrapper with no last: detail is a leftover cool-down, not quota.
+  if (message.includes(OPENROUTER_CIRCUIT_MARKER)) {
+    const last = peelCircuitLastError(message);
+    if (last && !last.includes(OPENROUTER_CIRCUIT_MARKER)) {
+      return classifyProviderErrorClass(last) ?? 'other';
+    }
+    return 'other';
+  }
+  // App-level budget gates are not provider billing/auth — do not trip model bans.
+  // A skip because the doc already published is not a budget/quota failure.
+  if (message.includes('llm skip: doc already has transactions')) return 'other';
+  if (
+    message.includes('llm daily usd budget exceeded')
+    || message.includes('llm per-doc usd budget exceeded')
+  ) return 'quota';
+  // OpenRouter reply-routing: a garbage / bare Unauthorized completion is
+  // one document, not a dead key.  Proven invalid_api_key / User not found
+  // still classify as auth and stay fail-closed.
+  if (
+    message.includes('openrouter')
+    || message.includes('openrouterreply:')
+    || isDocScopedOpenRouterError(message)
+  ) {
+    const replyClass = providerErrorClassForOpenRouterReply(
+      classifyOpenRouterErrorMessage(message),
+    );
+    if (replyClass === 'auth' || replyClass === 'billing' || replyClass === 'quota'
+      || replyClass === 'rate_limit' || replyClass === 'timeout') {
+      return replyClass;
+    }
+    if (isDocScopedOpenRouterError(message)) return 'other';
+  }
   if (
     /\b402\b/.test(message)
     || message.includes('payment required')
@@ -78,27 +198,26 @@ export function classifyProviderErrorClass(
     || message.includes('credit balance is too low')
     || message.includes('insufficient_quota')
     || message.includes('billing hard limit')
-  ) return 'billing';
-  if (
-    message.includes('key limit exceeded')
+    || message.includes('balance for files')
+    // OpenRouter weekly/key budget — must be billing, not auth (403 alone).
+    || message.includes('budget limit')
+    || message.includes('api key budget')
+    || message.includes('key budget')
+    || message.includes('key limit exceeded')
     || message.includes('exceeded your monthly')
-  ) return 'quota';
-  if (
-    /\b401\b/.test(message)
-    || /\b403\b/.test(message)
-    || message.includes('forbidden')
-    || message.includes('invalid_api_key')
-    || message.includes('invalid api key')
-    || message.includes('authentication')
-    || message.includes('unauthorized')
-    || message.includes('api key not configured')
-    || message.includes('rejected the configured credential')
-  ) return 'auth';
+    || message.includes('weekly limit')
+  ) return 'billing';
+  // Credential failures only.  Bare / transient 403 (Clerk, eFD, Cloudflare)
+  // is not a dead API key and must not halt autopilot as auth or quota.
+  if (isCredentialAuthFailure(message)) return 'auth';
+  // Rate-limit is a backoff class, not account quota.
   if (
     /\b429\b/.test(message)
     || message.includes('too many requests')
     || /rate[- ]?limit/.test(message)
-    || message.includes('quota exceeded')
+  ) return 'rate_limit';
+  if (
+    message.includes('quota exceeded')
     || message.includes('usage limit')
   ) return 'quota';
   if (
@@ -118,6 +237,163 @@ export function classifyProviderErrorClass(
     || message.includes('empty markdown')
   ) return 'parse';
   return 'other';
+}
+
+/**
+ * Operator-facing halt cause.  Reclassifies a stored `error_class:*` using the
+ * sample error so a stale "quota" receipt cannot hide a 402 files-balance or
+ * rate-limit.  Secret-safe: never echoes tokens or request ids.
+ */
+export function summarizeProviderHaltCause(error: string | null | undefined): string {
+  const message = (error ?? '').trim();
+  if (!message) return 'unknown provider error';
+  const lower = message.toLowerCase();
+  if (lower.includes('balance for files') || /at least \$0\.50/.test(lower)) {
+    return 'OpenRouter files-endpoint prepaid minimum, not account quota';
+  }
+  if (lower.includes(OPENROUTER_CIRCUIT_MARKER)) {
+    const last = peelCircuitLastError(lower);
+    if (last) return summarizeProviderHaltCause(last);
+    return 'stale OpenRouter budget-circuit cool-down, not current quota';
+  }
+  if (/\b429\b/.test(lower) || /rate[- ]?limit/.test(lower) || lower.includes('too many requests')) {
+    return 'provider rate-limit';
+  }
+  if (isSourceFetchOrAdminAuthNoise(lower)) {
+    return 'source-fetch or admin unauthorized, not a dead LLM key';
+  }
+  if (/\b403\b/.test(lower) && !isCredentialAuthFailure(lower)) {
+    return 'transient 403';
+  }
+  if (/\b402\b/.test(lower) || lower.includes('payment required')) {
+    return 'provider billing 402';
+  }
+  if (lower.includes('llm daily usd budget exceeded') || lower.includes('llm per-doc usd budget exceeded')) {
+    return 'app LLM daily/per-doc budget';
+  }
+  return `classified ${classifyProviderErrorClass(message) ?? 'other'}`;
+}
+
+/**
+ * Transient OpenRouter files / key-limit failures.  These are NOT a dead
+ * account and must not permanently latch autopilot.  Fail-closed classes
+ * (auth, app LLM daily budget, credits actually depleted) stay halt+ack.
+ */
+export function isTransientFilesPrepaidError(error: string | null | undefined): boolean {
+  const message = (error ?? '').trim().toLowerCase();
+  if (!message) return false;
+  if (message.includes(OPENROUTER_CIRCUIT_MARKER)) {
+    const last = peelCircuitLastError(message);
+    return last ? isTransientFilesPrepaidError(last) : false;
+  }
+  if (message.includes('balance for files') || /at least \$0\.50/.test(message)) return true;
+  if (message.includes('openrouter_key_limit')) return true;
+  if (message.includes('files-endpoint prepaid')) return true;
+  return false;
+}
+
+export function isTransientInfrastructureHalt(
+  haltReason: string | null | undefined,
+  sampleErrors: string | Record<string, string> | null | undefined = null,
+): boolean {
+  const samples = sampleErrorValues(sampleErrors);
+  if (samples.length > 0) return samples.every((sample) => isTransientInfrastructureError(sample));
+  return isTransientInfrastructureError(haltReason);
+}
+
+export function isTransientFilesPrepaidHalt(
+  haltReason: string | null | undefined,
+  sampleErrors: string | Record<string, string> | null | undefined = null,
+): boolean {
+  const described = describeAutopilotHaltReason(haltReason, sampleErrors) ?? '';
+  if (isTransientFilesPrepaidError(described) || isTransientFilesPrepaidError(haltReason)) {
+    return true;
+  }
+  if (typeof sampleErrors === 'string' && sampleErrors.trim()) {
+    return isTransientFilesPrepaidError(sampleErrors);
+  }
+  if (sampleErrors && typeof sampleErrors === 'object') {
+    return Object.values(sampleErrors).some((value) => isTransientFilesPrepaidError(value));
+  }
+  return false;
+}
+
+function sampleErrorValues(
+  sampleErrors: string | Record<string, string> | null | undefined,
+): string[] {
+  if (typeof sampleErrors === 'string' && sampleErrors.trim()) {
+    try {
+      const value = JSON.parse(sampleErrors) as unknown;
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return Object.values(value as Record<string, string>).filter((v) => typeof v === 'string');
+      }
+    } catch {
+      return [sampleErrors];
+    }
+    return [sampleErrors];
+  }
+  if (sampleErrors && typeof sampleErrors === 'object') {
+    return Object.values(sampleErrors).filter((v) => typeof v === 'string');
+  }
+  return [];
+}
+
+/** Source-fetch / admin / Clerk 401 statusText — not a rejected LLM key. */
+export function isFalseSourceAuthError(error: string | null | undefined): boolean {
+  const message = (error ?? '').trim().toLowerCase();
+  if (!message) return false;
+  if (isProvenLlmCredentialRejection(message)) return false;
+  return isSourceFetchOrAdminAuthNoise(message);
+}
+
+/**
+ * Stored `error_class:auth` latch from source-fetch / admin Unauthorized.
+ * Safe to auto-resume.  Proven invalid_api_key / User not found / OpenRouter
+ * API 401 stay fail-closed until a human acks.
+ */
+export function isFalseSourceAuthHalt(
+  haltReason: string | null | undefined,
+  sampleErrors: string | Record<string, string> | null | undefined = null,
+): boolean {
+  if ((haltReason ?? '').trim() !== 'error_class:auth') return false;
+  const samples = sampleErrorValues(sampleErrors);
+  if (samples.length === 0) return false;
+  if (samples.some((sample) => isProvenLlmCredentialRejection(sample.toLowerCase()))) {
+    return false;
+  }
+  return samples.every((sample) => isFalseSourceAuthError(sample));
+}
+
+export function describeAutopilotHaltReason(
+  haltReason: string | null | undefined,
+  sampleErrors: string | Record<string, string> | null | undefined = null,
+): string | null {
+  const stored = (haltReason ?? '').trim();
+  if (!stored) return null;
+  const storedClass = stored.startsWith('error_class:') ? stored.slice('error_class:'.length) : null;
+  let parsed: Record<string, string> | null = null;
+  if (typeof sampleErrors === 'string' && sampleErrors.trim()) {
+    try {
+      const value = JSON.parse(sampleErrors) as unknown;
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        parsed = value as Record<string, string>;
+      }
+    } catch {
+      parsed = null;
+    }
+  } else if (sampleErrors && typeof sampleErrors === 'object') {
+    parsed = sampleErrors as Record<string, string>;
+  }
+  const sample = parsed
+    ? (storedClass && parsed[storedClass]) || Object.values(parsed)[0] || null
+    : null;
+  const actual = sample ? classifyProviderErrorClass(sample) : classifyProviderErrorClass(stored);
+  const cause = sample ? summarizeProviderHaltCause(sample) : null;
+  if (actual && storedClass && actual !== storedClass) {
+    return `error_class:${actual} (${cause ?? 'reclassified'}; stored as ${storedClass})`;
+  }
+  if (cause && storedClass) return `error_class:${storedClass} (${cause})`;
+  return stored;
 }
 
 // ---------------------------------------------------------------------------

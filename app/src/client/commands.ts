@@ -1,8 +1,9 @@
 import type { Env, User, ClientCommandType, Subscription } from '../shared/types.ts';
-import { isPremiumUser } from '../billing/entitlement.ts';
+import { isPremiumUserAsync, resolveEntitlementAsync } from '../billing/entitlement.ts';
 import {
   assertSubscriptionQuota,
   createSubscription,
+  deleteSubscription,
   SubscriptionQuotaError,
   updateSubscription,
   webhookTargetLengthError,
@@ -10,6 +11,7 @@ import {
 import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from '../delivery/webhookTarget.ts';
 import { rateLimit } from '../shared/rateLimit.ts';
 import { getCommand, updateCommandStatus, upsertPreferences } from './state.ts';
+import { parsePushSettings, serializePushSettings } from '../shared/pushSettings.ts';
 import { getUserById } from '../auth/users.ts';
 import {
   asDelivery,
@@ -20,6 +22,16 @@ import {
   clientIdForUser,
 } from './utils.ts';
 import { getOwnedSubscription } from './queries.ts';
+import {
+  asPushPlatform,
+  deactivatePushDevice,
+  publicPushDevice,
+  upsertPushDevice,
+} from './pushDevices.ts';
+import { AppleRedeemError, jwsFromInput, requireAppleIapEnabled, verifyAppleRedemption } from '../billing/appleRedeem.ts';
+import { clientRedeemWouldResurrectRevoked, getAppleSubscription, upsertAppleSubscription } from '../billing/appleSubscriptions.ts';
+import { notifyPremiumActivation } from '../billing/premiumActivationAlert.ts';
+import { deleteUserAccount } from '../auth/deleteAccount.ts';
 
 export function commandType(value: unknown): ClientCommandType {
   const type = String(value || '');
@@ -27,8 +39,14 @@ export function commandType(value: unknown): ClientCommandType {
     type === 'update_preferences' ||
     type === 'create_subscription' ||
     type === 'update_subscription' ||
+    type === 'delete_subscription' ||
+    type === 'register_device' ||
+    type === 'unregister_device' ||
     type === 'start_checkout' ||
-    type === 'request_export'
+    type === 'request_export' ||
+    type === 'redeem_apple_purchase' ||
+    type === 'link_apple_entitlement' ||
+    type === 'delete_account'
   ) {
     return type;
   }
@@ -52,7 +70,9 @@ export function normalizePreferencePatch(input: Record<string, unknown>) {
     ) {
       throw new ClientInputError('notificationSettings must be an object');
     }
-    patch.notificationSettings = input.notificationSettings as Record<string, unknown>;
+    patch.notificationSettings = serializePushSettings(
+      parsePushSettings(input.notificationSettings),
+    );
   }
   if (input.defaultWindow !== undefined) {
     patch.defaultWindow = input.defaultWindow == null ? null : String(input.defaultWindow);
@@ -103,6 +123,95 @@ function subscriptionIdForCommand(commandId: string | undefined): string | undef
   return commandId?.startsWith('cmd_') ? `sub_${commandId.slice(4)}` : undefined;
 }
 
+/**
+ * Shared body of `redeem_apple_purchase` and `link_apple_entitlement` — both
+ * verify the same JWS the same way and attach the transaction to `user.id`.
+ * The only difference between the two commands is client-side: iOS calls
+ * `redeem_apple_purchase` from an explicit user action (Subscribe, Restore
+ * Purchases) and surfaces its errors; it calls `link_apple_entitlement`
+ * silently right after sign-in to claim a purchase this device already made
+ * anonymously, and swallows a 409 there (see `PremiumSheet` /
+ * `Store/AppleIAP.swift` `linkAppleEntitlementIfNeeded`). Reusing one server
+ * code path keeps that distinction purely presentational, never a second
+ * place the verify-and-ledger logic could drift.
+ */
+async function redeemAppleTransactionForUser(
+  env: Env,
+  user: User,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  await requireAppleIapEnabled(env);
+  const jws = jwsFromInput(input);
+  let verified;
+  try {
+    verified = await verifyAppleRedemption(env, jws);
+  } catch (err) {
+    if (err instanceof AppleRedeemError) throw new ClientInputError(err.message, err.status);
+    throw err;
+  }
+  const { transaction, plan, originalTransactionId } = verified;
+
+  const existing = await getAppleSubscription(env, originalTransactionId);
+  if (
+    clientRedeemWouldResurrectRevoked(existing, {
+      transactionId: transaction.transactionId,
+      purchaseDateMs: transaction.purchaseDate != null ? Number(transaction.purchaseDate) : null,
+    })
+  ) {
+    throw new ClientInputError('this Apple subscription was refunded or revoked', 400);
+  }
+
+  const upserted = await upsertAppleSubscription(env, {
+    originalTransactionId,
+    userId: user.id,
+    productId: transaction.productId ?? '',
+    plan,
+    status: 'active',
+    environment: transaction.environment ?? null,
+    latestTransactionId: transaction.transactionId ?? null,
+    purchaseDate: transaction.purchaseDate != null ? new Date(Number(transaction.purchaseDate)).toISOString() : null,
+    expiresDate: transaction.expiresDate != null ? new Date(Number(transaction.expiresDate)).toISOString() : null,
+    redeemGuard: true,
+  });
+  if (upserted.ok === false) {
+    if (upserted.reason === 'guarded_status') {
+      throw new ClientInputError('this Apple subscription was refunded or revoked', 400);
+    }
+    // Never silently reassign a subscription's Premium grant to a new
+    // account — restore-purchases (or claiming an anonymous device purchase)
+    // on a shared/second Apple ID or account must surface as a conflict, not
+    // a takeover of the original owner's Premium.
+    throw new ClientInputError('this Apple subscription is already linked to a different account', 409);
+  }
+  if (upserted.isNew) {
+    // Fires once per originalTransactionId (isNew is only true the first
+    // time this ledger row is created — see appleSubscriptions.ts).  A
+    // restore-purchases replay of the SAME transaction id (tested above:
+    // "redeeming the same originalTransactionId again ... is idempotent")
+    // hits the ON CONFLICT branch instead and does not re-notify.
+    // Apple's JWS payload carries no trial/introductory-offer flag this
+    // codebase decodes, so Apple activations are always reported as "paid" —
+    // a known gap vs. Stripe, where `trialing` is exact.
+    await notifyPremiumActivation(env, {
+      activationKey: `apple:${upserted.record.originalTransactionId}`,
+      userId: user.id,
+      userEmail: user.email,
+      source: 'apple',
+      plan: upserted.record.plan,
+      trialing: false,
+    });
+  }
+
+  const refreshedUser = await getUserById(env, user.id);
+  const entitlement = await resolveEntitlementAsync(env, refreshedUser);
+  return {
+    entitlement,
+    plan: upserted.record.plan,
+    expiresAt: upserted.record.expiresDate,
+    originalTransactionId: upserted.record.originalTransactionId,
+  };
+}
+
 export async function executeCommand(
   env: Env,
   user: User,
@@ -115,7 +224,18 @@ export async function executeCommand(
     return { preferences: await upsertPreferences(env, user.id, normalizePreferencePatch(input)) };
   }
   if (type === 'create_subscription') {
-    if (!isPremiumUser(user)) {
+    // Legacy iOS builds registered APNs via create_subscription + delivery:'apns'.
+    // That is not a webhook/SSE channel — rewrite to the device-registration path
+    // so production tokens stop failing with "delivery must be 'sse' or 'webhook'".
+    if (input.delivery === 'apns' || input.delivery === 'ios' || input.delivery === 'push') {
+      return executeCommand(env, user, 'register_device', {
+        platform: 'apns',
+        token: input.targetUrl ?? input.token ?? input.deviceToken,
+        appBundle: input.appBundle,
+        env: input.env,
+      }, opts);
+    }
+    if (!(await isPremiumUserAsync(env, user))) {
       throw new ClientInputError('Creating a subscription requires a Premium account', 402);
     }
     const delivery = asDelivery(input.delivery);
@@ -139,7 +259,7 @@ export async function executeCommand(
         delivery,
         targetUrl: delivery === 'webhook' ? targetUrl : null,
         secret: null,
-        filters: normalizeFilters(input.filters),
+        filters: await normalizeFilters(env, input.filters),
       });
       return { subscription: publicSubscription(sub, true) };
     } catch (err) {
@@ -152,11 +272,11 @@ export async function executeCommand(
     if (!id) throw new ClientInputError('id is required');
     const existing = await getOwnedSubscription(env, user, id);
     const patch: Partial<Pick<Subscription, 'filters' | 'targetUrl' | 'active'>> = {};
-    if (input.filters !== undefined) patch.filters = normalizeFilters(input.filters);
+    if (input.filters !== undefined) patch.filters = await normalizeFilters(env, input.filters);
     if (input.active !== undefined) {
       patch.active = input.active === true;
       if (patch.active && !existing.active) {
-        if (!isPremiumUser(user)) {
+        if (!(await isPremiumUserAsync(env, user))) {
           throw new ClientInputError('Activating a subscription requires a Premium account', 402);
         }
         try {
@@ -187,12 +307,101 @@ export async function executeCommand(
       throw err;
     }
   }
+  if (type === 'delete_subscription') {
+    const id = typeof input.id === 'string' ? input.id : '';
+    if (!id) throw new ClientInputError('id is required');
+    // Ownership check (404 if missing / not owned). Delete is allowed for
+    // signed-in owners even without Premium so cancelled accounts can clean up.
+    await getOwnedSubscription(env, user, id);
+    const deleted = await deleteSubscription(env, id);
+    if (!deleted) throw new ClientInputError('subscription not found', 404);
+    return { deleted: true, id };
+  }
+  if (type === 'register_device') {
+    // Device registration is signed-in only (not Premium-gated). Actual trade
+    // push fan-out still requires Premium + APNs credentials when that path
+    // ships — storing the token early means upgrade → push without re-prompt.
+    let platform;
+    try {
+      platform = asPushPlatform(input.platform ?? input.delivery ?? 'apns');
+    } catch (err) {
+      throw new ClientInputError(err instanceof Error ? err.message : String(err));
+    }
+    const tokenRaw =
+      (typeof input.token === 'string' && input.token) ||
+      (typeof input.targetUrl === 'string' && input.targetUrl) ||
+      (typeof input.deviceToken === 'string' && input.deviceToken) ||
+      '';
+    const limited = await rateLimit(env, 'device-register-user', user.id, 30, 3600);
+    if (!limited.ok) throw new ClientInputError('too many device registration requests', 429);
+    try {
+      const device = await upsertPushDevice(env, {
+        userId: user.id,
+        platform,
+        token: tokenRaw,
+        appBundle: typeof input.appBundle === 'string' ? input.appBundle : null,
+        env: typeof input.env === 'string' ? input.env : null,
+      });
+      return { device: publicPushDevice(device) };
+    } catch (err) {
+      throw new ClientInputError(err instanceof Error ? err.message : String(err));
+    }
+  }
+  if (type === 'unregister_device') {
+    const limited = await rateLimit(env, 'device-unregister-user', user.id, 30, 3600);
+    if (!limited.ok) throw new ClientInputError('too many device unregister requests', 429);
+    let platform;
+    try {
+      platform = input.platform !== undefined || input.delivery !== undefined
+        ? asPushPlatform(input.platform ?? input.delivery)
+        : undefined;
+    } catch (err) {
+      throw new ClientInputError(err instanceof Error ? err.message : String(err));
+    }
+    const token =
+      (typeof input.token === 'string' && input.token) ||
+      (typeof input.targetUrl === 'string' && input.targetUrl) ||
+      (typeof input.deviceToken === 'string' && input.deviceToken) ||
+      undefined;
+    const id = typeof input.id === 'string' ? input.id : undefined;
+    if (!id && !token) throw new ClientInputError('id or token is required');
+    try {
+      const deactivated = await deactivatePushDevice(env, {
+        userId: user.id,
+        id,
+        token,
+        platform,
+      });
+      if (!deactivated) throw new ClientInputError('device not found', 404);
+      return { deactivated: true, id: id ?? null };
+    } catch (err) {
+      if (err instanceof ClientInputError) throw err;
+      throw new ClientInputError(err instanceof Error ? err.message : String(err));
+    }
+  }
+  if (type === 'redeem_apple_purchase' || type === 'link_apple_entitlement') {
+    return redeemAppleTransactionForUser(env, user, input);
+  }
+  if (type === 'delete_account') {
+    return deleteUserAccount(env, user, { keepCommandId: opts.commandId });
+  }
   throw new ClientInputError(`${type} is not implemented yet`, 501);
 }
 
 /**
- * Queue-worker entrypoint for `command.execute` messages (POST
- * /api/client/v1/commands enqueues and returns 202; this runs the command).
+ * How long POST /api/client/v1/commands will hold a request open trying to
+ * finish the command inline before handing it back to the durable queue and
+ * answering 202. Must stay comfortably under the iOS client's 20s per-request
+ * timeout (`APIClient.makeRequest`) — a budget that outlives the socket buys
+ * nothing and costs the caller a transport error instead of a status.
+ */
+export const INLINE_COMMAND_BUDGET_MS = 9_000;
+
+/**
+ * Queue-worker entrypoint for `command.execute` messages. Also the inline
+ * fast path: POST /api/client/v1/commands enqueues the durable backstop, then
+ * calls this directly so a human waiting on a screen gets a terminal status in
+ * one round trip instead of waiting out the background tick.
  * Idempotent on redelivery: terminal rows are left untouched. Deterministic
  * input/entitlement failures are recorded as `failed` and acknowledged;
  * unexpected errors are rethrown so the queue retry/backoff applies.

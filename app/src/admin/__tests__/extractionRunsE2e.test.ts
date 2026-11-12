@@ -141,7 +141,7 @@ describe('extraction_runs E2E: bake-off → store → dashboard', () => {
               content: [
                 {
                   type: 'text',
-                  text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000","confidence":0.9}]',
+                  text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000","confidence":0.9}]',
                 },
               ],
             }),
@@ -176,7 +176,7 @@ describe('extraction_runs E2E: bake-off → store → dashboard', () => {
     // The reading was stored with the extracted row + a confidence.
     expect(extractionRuns).toHaveLength(1);
     expect(extractionRuns[0]).toMatchObject({ doc_id: 'H-TEST-1', provider: 'anthropic', ok: 1, row_count: 1 });
-    expect(JSON.parse(extractionRuns[0].result_json!)[0]).toMatchObject({ ticker: 'AAPL', txType: 'P' });
+    expect(JSON.parse(extractionRuns[0].result_json!)[0]).toMatchObject({ ticker: 'AAPL', txType: 'B' });
 
     // 2) Review-queue list attaches the per-model summary + a status.
     const list = await app.request('/review-queue', { headers: AUTH }, env);
@@ -232,8 +232,8 @@ describe('extraction_runs E2E: openai token usage capture', () => {
             json: async () => ({
               model: 'gpt-5.6-terra',
               status: 'completed',
-              output_text: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"}]}',
-              choices: [{ message: { content: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"}]}' } }],
+              output_text: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"}]}',
+              choices: [{ message: { content: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"}]}' } }],
               usage: {
                 input_tokens: 1200,
                 output_tokens: 80,
@@ -289,8 +289,8 @@ describe('extraction_runs E2E: openai token usage capture', () => {
             json: async () => ({
               model: 'gpt-5.6-terra',
               status: 'completed',
-              output_text: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"}]}',
-              choices: [{ message: { content: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"}]}' } }],
+              output_text: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"}]}',
+              choices: [{ message: { content: '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"}]}' } }],
               // no `usage` field — older models / some error paths omit it.
             }),
           } as unknown as Response;

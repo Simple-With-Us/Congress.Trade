@@ -49,6 +49,16 @@ function normalizedAmount(value: unknown): number | null | string {
   return normalizedText(value);
 }
 
+/** Canonical side letter for fingerprinting: Purchase/P/buy → B. */
+function normalizedTxType(value: unknown): string {
+  const s = String(value ?? '').trim().toUpperCase().replace(/[_\-]+/g, ' ');
+  if (!s) return '';
+  if (s === 'B' || s === 'P' || s.includes('PURCHASE') || s.includes('BUY') || s.includes('BOUGHT')) return 'B';
+  if (s === 'S' || s.includes('SALE') || s.includes('SELL') || s.includes('SOLD')) return 'S';
+  if (s === 'E' || s.includes('EXCHANGE')) return 'E';
+  return s;
+}
+
 function normalizedBoolean(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
 }
@@ -63,7 +73,7 @@ function benchmarkRowIdentityFingerprint(row: BenchmarkRow): string {
   return JSON.stringify([
     normalizedText(firstDefined(row, 'assetName', 'asset_name')),
     firstDefined(row, 'txDate', 'tx_date') ?? '',
-    normalizedText(firstDefined(row, 'txType', 'tx_type')),
+    normalizedTxType(firstDefined(row, 'txType', 'tx_type')),
     normalizedAmount(firstDefined(row, 'amountMin', 'amount_min')),
     normalizedAmount(firstDefined(row, 'amountMax', 'amount_max')),
   ]);
@@ -75,7 +85,7 @@ function benchmarkStrictRowFingerprint(row: BenchmarkRow): string {
     normalizedText(row.ticker),
     normalizedText(firstDefined(row, 'assetName', 'asset_name')),
     firstDefined(row, 'txDate', 'tx_date') ?? '',
-    normalizedText(firstDefined(row, 'txType', 'tx_type')),
+    normalizedTxType(firstDefined(row, 'txType', 'tx_type')),
     normalizedAmount(firstDefined(row, 'amountMin', 'amount_min')),
     normalizedAmount(firstDefined(row, 'amountMax', 'amount_max')),
     normalizedText(row.owner),

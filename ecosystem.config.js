@@ -16,16 +16,10 @@ try {
 
 module.exports = {
   apps: [
-    {
-      name: 'scout',
-      script: './scout/run-scout.sh',
-      interpreter: 'bash',
-      cwd: __dirname,
-      log_date_format: 'YYYY-MM-DD HH:mm Z',
-      out_file: './scout/scout.log',
-      error_file: './scout/scout.err',
-      merge_logs: true
-    },
+    // Mac scout / senate-relay / senate-tunnel retired 2026-09-09 (#2351).
+    // Coolify owns Senate relay/tunnel; residential egress is the little
+    // physical-device / WireGuard proxy via RESIDENTIAL_PROXY_URL (Infisical).
+    // See docs/rollouts/2026-09-09-retire-mac-scout-folder.md.
     {
       name: 'vision-worker',
       script: 'worker.py',

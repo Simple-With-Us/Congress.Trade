@@ -243,13 +243,82 @@ export function isAssetTypeCategory(value: string | null | undefined): value is 
   return !!value && Object.prototype.hasOwnProperty.call(ASSET_TYPE_CATEGORY_LABELS, value);
 }
 
+/**
+ * Infer a House bracket code when the model left assetType blank but the
+ * disclosed asset name / raw text still carries a clear type signal.
+ * Examples: "3M Company Common Stock (MMM)" → ST; trailing "[ST]" → ST.
+ * Never invent a code from a weak signal — return null when unsure.
+ */
+export function inferHouseAssetTypeCode(
+  rawType: string | null | undefined,
+  opts?: {
+    assetTypeName?: string | null;
+    assetName?: string | null;
+    rawText?: string | null;
+    isOption?: boolean | null;
+  },
+): { code: string; label: string } | null {
+  const existing = cleanNullable(rawType)?.toUpperCase() ?? null;
+  if (existing && HOUSE_ASSET_TYPE_NAMES[existing]) {
+    return { code: existing, label: HOUSE_ASSET_TYPE_NAMES[existing] };
+  }
+
+  const typeNameKey = normalizeAssetTypeKey(opts?.assetTypeName ?? rawType);
+  // Explicit type labels beat the isOption flag (a stock row can also mark
+  // option-like footnotes; prefer the disclosed label when present).
+  if (typeNameKey === 'stock option' || typeNameKey === 'option' || typeNameKey === 'options') {
+    return { code: 'OP', label: HOUSE_ASSET_TYPE_NAMES.OP };
+  }
+  if (typeNameKey === 'stock' || typeNameKey === 'stocks' || typeNameKey === 'stocks including adrs') {
+    return { code: 'ST', label: HOUSE_ASSET_TYPE_NAMES.ST };
+  }
+
+  const haystack = [opts?.assetTypeName, opts?.assetName, opts?.rawText]
+    .map((v) => cleanNullable(v) ?? '')
+    .filter(Boolean)
+    .join(' \n ');
+  if (!haystack) {
+    if (opts?.isOption) return { code: 'OP', label: HOUSE_ASSET_TYPE_NAMES.OP };
+    return null;
+  }
+
+  const bracket = /\[([A-Z0-9]{2,3})\]/.exec(haystack.toUpperCase());
+  if (bracket && HOUSE_ASSET_TYPE_NAMES[bracket[1]]) {
+    return { code: bracket[1], label: HOUSE_ASSET_TYPE_NAMES[bracket[1]] };
+  }
+
+  // House PDFs often put the type only in the asset line ("… Common Stock").
+  if (/\bcommon\s+stocks?\b/i.test(haystack) || /\bstocks?\s*\(including\s+adrs?\)/i.test(haystack)) {
+    return { code: 'ST', label: HOUSE_ASSET_TYPE_NAMES.ST };
+  }
+  if (/\bexchange[\s-]?traded\s+fund\b|\betf\b/i.test(haystack)) {
+    return { code: 'EF', label: HOUSE_ASSET_TYPE_NAMES.EF };
+  }
+  if (/\bmutual\s+fund\b/i.test(haystack)) {
+    return { code: 'MF', label: HOUSE_ASSET_TYPE_NAMES.MF };
+  }
+
+  if (opts?.isOption) return { code: 'OP', label: HOUSE_ASSET_TYPE_NAMES.OP };
+  return null;
+}
+
 export function canonicalizeAssetType(
   rawType: string | null | undefined,
   rawName?: string | null,
-  opts?: { isOption?: boolean | null; assetName?: string | null },
+  opts?: {
+    isOption?: boolean | null;
+    assetName?: string | null;
+    rawText?: string | null;
+  },
 ): CanonicalAssetType {
-  const type = cleanNullable(rawType);
-  const name = cleanNullable(rawName);
+  const inferred = inferHouseAssetTypeCode(rawType, {
+    assetTypeName: rawName,
+    assetName: opts?.assetName,
+    rawText: opts?.rawText,
+    isOption: opts?.isOption,
+  });
+  const type = cleanNullable(rawType) ?? inferred?.code ?? null;
+  const name = cleanNullable(rawName) ?? (inferred && !cleanNullable(rawName) ? inferred.label : null);
   const upper = type?.toUpperCase() ?? null;
 
   if (upper && HOUSE_ASSET_TYPE_NAMES[upper]) {
@@ -359,4 +428,56 @@ function escapeRegExp(value: string): string {
 
 function sqlQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** True when `value` is a House PTR instrument-type code (GS, ST, CS, …). */
+export function isHouseAssetTypeCode(value: string | null | undefined): boolean {
+  const code = (value ?? '').trim().toUpperCase();
+  return code !== '' && Object.prototype.hasOwnProperty.call(HOUSE_ASSET_TYPE_NAMES, code);
+}
+
+/**
+ * House type codes that also happen to be listed tickers (GS, ST, BA, …).
+ * Only treat the ticker as a misfiled type code when the asset *name*
+ * describes that instrument class — a real Goldman Sachs row named
+ * "Goldman Sachs" keeps ticker GS.
+ */
+const HOUSE_TYPE_NAME_HINTS: Record<string, RegExp> = {
+  GS: /\b(treasury|t[\s-]?bill|t[\s-]?note|t[\s-]?bond|us treas|united states treas|government securit|agency (?:debt|bond)|muni(?:cipal)?)\b/i,
+  CS: /\b(note|bond|debenture|corp(?:orate)? securit)\b/i,
+  CT: /\b(crypto|bitcoin|ethereum|\bbtc\b|\beth\b)\b/i,
+  HN: /\b(l\.?p\.?|llc|partners|private equity|hedge fund|venture)\b/i,
+  HE: /\b(l\.?p\.?|llc|partners|private equity|hedge fund|venture)\b/i,
+  OT: /\b(option|call|put)\b/i,
+  OP: /\b(option|call|put)\b/i,
+  BA: /\b(money market|certificate of deposit|\bcd\b|bank account|cash)\b/i,
+  MF: /\b(mutual fund)\b/i,
+  EF: /\b(etf|exchange traded)\b/i,
+};
+
+/**
+ * Models routinely copy the House PTR type column (GS/ST/CS/…) into `ticker`.
+ * Prod H-2025-20026666: four successful reads of the same T-bill, split into
+ * GS|date|B vs TREASURY BILL|date|B because one model used GS as the ticker.
+ */
+export function tickerIsMisfiledHouseTypeCode(
+  ticker: string | null | undefined,
+  assetType: string | null | undefined,
+  assetName: string | null | undefined,
+): boolean {
+  const t = (ticker ?? '').trim().toUpperCase();
+  if (!isHouseAssetTypeCode(t)) return false;
+  const hint = HOUSE_TYPE_NAME_HINTS[t];
+  if (hint && hint.test(assetName ?? '')) return true;
+  const at = (assetType ?? '').trim().toUpperCase();
+  // Same code in both columns AND no conflicting type hint is still a
+  // type-column echo when the name is long descriptive text, not a symbol.
+  if (at === t && (assetName ?? '').trim().length >= 24) return true;
+  return false;
+}
+
+/** Purchase/sale letters that leak into assetType from the tx-type column. */
+export function assetTypeLooksLikeTxType(value: string | null | undefined): boolean {
+  const at = (value ?? '').trim().toUpperCase();
+  return at === 'B' || at === 'S' || at === 'E' || at === 'P';
 }

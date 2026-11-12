@@ -217,6 +217,65 @@ function paceLine(label: string, used: number, limit: number, monthElapsed: numb
   return `${label}: ${fmtCount(used)} (${current}% MTD, pace → ${projected}% at month-end)`;
 }
 
+/** This process's product identity for Pushover footers. */
+export const R2_SENDER_APP_LABEL = 'Congress.Trade';
+
+/**
+ * Append `(sent from APP)` only when messaging under another product's Pushover
+ * logo (subject ≠ this runner). Same-product messages omit the footer.
+ *
+ * @param subjectIsSelf true when the free-tier subject matches this host (CT).
+ */
+export function appendSentFromFooter(
+  body: string,
+  opts?: { subjectIsSelf?: boolean; senderLabel?: string },
+): string {
+  const trimmed = body.replace(/\s+$/u, '');
+  const subjectIsSelf = opts?.subjectIsSelf ?? true;
+  if (subjectIsSelf) return trimmed;
+  const senderLabel = opts?.senderLabel ?? R2_SENDER_APP_LABEL;
+  const footer = `(sent from ${senderLabel})`;
+  if (trimmed.endsWith(footer)) return trimmed;
+  return `${trimmed}\n${footer}`;
+}
+
+/**
+ * Prefer the SUBJECT product's Pushover app token (CT for own free tier).
+ * When messaging about another fleet free tier, pass that product's token env.
+ */
+export function resolveCongressPushoverAppToken(
+  secrets: { PUSHOVER_APP_TOKEN?: string; PUSHOVER_CT_API_TOKEN?: string },
+): string {
+  return (
+    secrets.PUSHOVER_CT_API_TOKEN?.trim() ||
+    secrets.PUSHOVER_APP_TOKEN?.trim() ||
+    ''
+  );
+}
+
+/**
+ * Own backup reminder: three independent layers, coarsest last.
+ *
+ * 1. Continuous Litestream replication to B2, rebuilt 2026-08-12 as an
+ *    in-container replica (app/litestream.yml -> jays-congress-trade-eu,
+ *    prefix `congress-trade/`) after the Oracle->Hetzner migration dropped
+ *    the old host-level systemd unit that targeted R2. ~5m RPO.
+ * 2. The fleet cron's 6h full-DB snapshots, already running, written to the
+ *    SAME bucket under the disjoint prefix `hetzner/`. Litestream is layered
+ *    on top of these, not a replacement — the full snapshots stay as the
+ *    coarse, self-contained restore artifact that needs no LTX replay.
+ * 3. Hetzner volume snapshots, the ~24h floor.
+ *
+ * B2 has no free-tier kill switch (unlike the `raw/` filing-PDF object store,
+ * which still lives on R2), so `killEngaged` does not apply to this backup
+ * path; the parameter is kept for call-site compatibility and always reports
+ * the steady-state line.
+ */
+export function formatOwnBackupRegimenLine(killEngaged = false): string {
+  void killEngaged;
+  return 'Backup: litestream→B2 continuous (15m sync · 24h/168h snapshots) + 6h full-DB snapshots (fleet cron) + Hetzner ~24h volume floor.';
+}
+
 /** Compact message body for the Pushover notification. */
 export function formatUsageMessage(s: R2UsageSummary, now: Date): string {
   const lines: string[] = [];
@@ -247,7 +306,9 @@ export function formatUsageMessage(s: R2UsageSummary, now: Date): string {
   );
   const status = worst >= 80 ? '⚠️ OVER 80% — action needed' : worst >= 50 ? 'Heads-up: >50% projected' : 'OK — well within free tier';
   lines.push(`Status: ${status}`);
-  return lines.join('\n');
+  lines.push(formatOwnBackupRegimenLine(false));
+  // Own free tier under CT logo — no sent-from footer (only peers would stamp one).
+  return appendSentFromFooter(lines.join('\n'), { subjectIsSelf: true });
 }
 
 interface GraphqlResponse {
@@ -327,12 +388,14 @@ type R2UsageSecretKeys =
   | 'CLOUDFLARE_ACCOUNT_ID'
   | 'CLOUDFLARE_R2_ANALYTICS_TOKEN'
   | 'PUSHOVER_APP_TOKEN'
+  | 'PUSHOVER_CT_API_TOKEN'
   | 'PUSHOVER_USER_KEY';
 
 const R2_USAGE_SECRET_KEYS: R2UsageSecretKeys[] = [
   'CLOUDFLARE_ACCOUNT_ID',
   'CLOUDFLARE_R2_ANALYTICS_TOKEN',
   'PUSHOVER_APP_TOKEN',
+  'PUSHOVER_CT_API_TOKEN',
   'PUSHOVER_USER_KEY',
 ];
 
@@ -362,12 +425,14 @@ export async function runR2UsageSummary(
     const summary = buildSummary(storage, ops, now);
     const message = formatUsageMessage(summary, now);
     const dateLabel = now.toISOString().slice(0, 10);
+    // Subject free tier is Congress.Trade → CT Pushover app token (logo).
+    const appToken = resolveCongressPushoverAppToken(secrets);
 
     const delivered = await sendPushover(env, {
       title: `Congress.Trade R2 usage — ${dateLabel}`,
       message,
     }, {
-      appToken: secrets.PUSHOVER_APP_TOKEN,
+      appToken,
       userKey: secrets.PUSHOVER_USER_KEY,
     });
     if (!delivered.sent) return { sent: false, reason: delivered.reason, summary };

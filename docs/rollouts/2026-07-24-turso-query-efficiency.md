@@ -1,5 +1,9 @@
 # Turso query efficiency (2026-07-24)
 
+> **Current shape (2026-08):** Turso is retired.  Production reads a local
+> SQLite file on Coolify / Hetzner (`file:/data/congress-trade/db.sqlite`).
+> The query cuts below still apply; do not open a Turso dashboard.
+
 ## Summary
 
 Turso metrics showed a small set of queries dominating rows-read and latency

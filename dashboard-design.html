@@ -155,8 +155,8 @@
         <option value="1y">Last 1 year</option>
       </select>
       <select id="qType" onchange="renderFeed()">
-        <option value="">All types</option><option value="P">Purchase</option>
-        <option value="S">Sale</option><option value="E">Exchange</option>
+        <option value="">All types</option><option value="P">Buy</option>
+        <option value="S">Sell</option><option value="E">Exchange</option>
       </select>
       <select id="qChamber" onchange="renderFeed()">
         <option value="">Both chambers</option><option value="house">House</option><option value="senate">Senate</option>
@@ -263,7 +263,7 @@ let aggressive = false;
 /* ============================ RENDER ============================ */
 const fmt = n => "$" + n.toLocaleString();
 const confClass = c => c >= 0.9 ? "hi" : c >= 0.7 ? "mid" : "lo";
-const typeName = { P:"Purchase", S:"Sale", E:"Exchange" };
+const typeName = { P:"Buy", B:"Buy", S:"Sell", E:"Exchange" };
 
 function renderFeed() {
   // API HOOK: replace SAMPLE_TRADES with GET /api/transactions?since=<cursor>

@@ -15,32 +15,42 @@
  *     metric uses the bracket MIDPOINT ({@link BRACKET_MIDPOINT_SQL}). The
  *     open-ended top tier ($50,000,001+) has amount_max IS NULL and falls back
  *     to the bracket floor (amount_min). All $ figures are therefore ESTIMATES.
- *   - party is frequently empty in the data (seed filers store party=''), so it
- *     is bucketed into D / R / O(ther) by first letter only when known. Unknown
- *     party stays NULL rather than being treated as Independent.
+ *   - party is frequently empty in the data (seed filers store party='',
+ *     executive-branch and manual filers have none), so it is bucketed into
+ *     D / R / O by first letter: D and R are matched, and EVERYTHING else
+ *     (Independent, minor parties, and no party on file) is 'O' — labelled
+ *     "Other / No party" in the UI.  The bucket is total (never NULL), so a
+ *     party filter always partitions the data: All == D + R + O.  Row-level
+ *     `partyBucket` fields in API responses are separate and still `null` when
+ *     no party is on file.
  */
 
 import { WINDOW_PRESETS as SHARED_WINDOW_PRESETS } from '@jaywedgeworth22/congress-trading-shared';
 import type { Chamber, TxType } from '../shared/types.ts';
 import type { SqlParam } from '../shared/db.ts';
+import {
+  fabricatedCompetitorAmountSql,
+  TWIN_DEDUPE_SQL,
+} from '../shared/tradeIdentity.ts';
 
 // ---------------------------------------------------------------------------
 // Enumerations + validators (closed sets → safe to interpolate as literals)
 // ---------------------------------------------------------------------------
 
 /**
- * A window is either 'all' or `<N>d` (N whole days, e.g. '90d'). The UI surfaces
- * the presets below, but any positive `<N>d` is valid — so callers can request a
- * custom age (e.g. ?window=45d) without enumerating it here.
+ * A window is either 'all', `<N>d` (N whole days, e.g. '90d'), or a calendar-year
+ * preset (`this_cy` / `last_cy`). Any positive `<N>d` is also valid.
  */
 export const WINDOW_PRESETS = SHARED_WINDOW_PRESETS;
-export type Window = string; // always produced via asWindow(): 'all' | `${number}d`
+export type Window = string; // always produced via asWindow()
 const WINDOW_RE = /^(\d{1,5})d$/;
 const MAX_WINDOW_DAYS = 36500; // ~100y guardrail against absurd inputs
+const CALENDAR_WINDOWS = new Set(['this_cy', 'last_cy']);
 
 export function isWindow(v: unknown): v is Window {
   if (v === 'all') return true;
   if (typeof v !== 'string') return false;
+  if (CALENDAR_WINDOWS.has(v)) return true;
   const m = WINDOW_RE.exec(v);
   if (!m) return false;
   const n = Number(m[1]);
@@ -53,6 +63,12 @@ export function asWindow(v: unknown, fallback: Window = '90d'): Window {
 /** Number of days a window spans, or null for 'all'. Defaults to 30 on garbage. */
 export function windowDays(w: Window): number | null {
   if (w === 'all') return null;
+  if (w === 'this_cy') {
+    const now = new Date();
+    const start = Date.UTC(now.getUTCFullYear(), 0, 1);
+    return Math.max(1, Math.ceil((Date.now() - start) / 86_400_000));
+  }
+  if (w === 'last_cy') return 365;
   const m = WINDOW_RE.exec(w);
   return m ? Number(m[1]) : 30;
 }
@@ -65,11 +81,29 @@ export function asSourceFilter(v: unknown, fallback: SourceFilter = 'all'): Sour
     : fallback;
 }
 
+/**
+ * Party bucket filter value.  `O` means "Other / No party": Independents, minor
+ * parties AND filers with no party on file (see {@link PARTY_BUCKET_SQL}).
+ */
 export type PartyBucket = 'D' | 'R' | 'O';
 export function asPartyBucket(v: unknown): PartyBucket | undefined {
   if (typeof v !== 'string' || v.length === 0) return undefined;
   const c = v[0].toUpperCase();
   return c === 'D' ? 'D' : c === 'R' ? 'R' : c === 'O' || c === 'I' ? 'O' : undefined;
+}
+
+/** CSV multi-party selection (e.g. "D,R"). Undefined = no party filter. */
+export function asPartyBuckets(v: unknown): PartyBucket[] | undefined {
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  const parsed = Array.from(
+    new Set(
+      v
+        .split(',')
+        .map((part) => asPartyBucket(part.trim()))
+        .filter((c): c is PartyBucket => !!c),
+    ),
+  ).sort();
+  return parsed.length ? parsed : undefined;
 }
 
 export function asChamber(v: unknown): Chamber | undefined {
@@ -91,12 +125,41 @@ export function asChambers(v: unknown): Chamber[] | undefined {
   return parsed.length ? parsed : undefined;
 }
 
+/** Canonical B|S|E. Legacy form letter P (Purchase) → Buy. */
+export function asTxType(v: unknown): TxType | undefined {
+  if (typeof v !== 'string') return undefined;
+  if (v === 'P' || v === 'p' || v === 'B' || v === 'b') return 'B';
+  return v === 'S' || v === 'E' ? v : undefined;
+}
+
+/** CSV multi-type selection (e.g. "B,S"). Undefined = no type filter. */
+export function asTxTypes(v: unknown): TxType[] | undefined {
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  const parsed = Array.from(
+    new Set(v.split(',').map((part) => asTxType(part.trim())).filter((t): t is TxType => !!t)),
+  ).sort();
+  return parsed.length ? parsed : undefined;
+}
+
 /**
- * Map a window to the SQLite date modifier used in `date('now', ?)`. `all`
- * returns null (no date clause — the whole corpus). The returned strings are a
- * closed set, never user input.
+ * Narrow a caller-requested type set to an endpoint's allowed universe
+ * (cluster/conviction are directional B/S only). Absent request → allowed.
+ * Empty intersection keeps a no-row bind so we do not silently widen.
+ */
+export function constrainTxTypes(requested: TxType[] | undefined, allowed: TxType[]): TxType[] {
+  if (!requested?.length) return [...allowed];
+  const allow = new Set(allowed);
+  const next = requested.filter((t) => allow.has(t));
+  return next.length ? next : (['__none__'] as unknown as TxType[]);
+}
+
+/**
+ * Map a window to the SQLite date modifier used in `date('now', ?)`. `all` and
+ * calendar-year presets return null (calendar years use absolute date bounds in
+ * buildCommonFilters). Returned offset strings are a closed set, never user input.
  */
 export function windowToOffset(w: Window): string | null {
+  if (w === 'all' || CALENDAR_WINDOWS.has(w)) return null;
   const d = windowDays(w);
   return d == null ? null : `-${d} days`;
 }
@@ -119,7 +182,7 @@ export function autoGranularity(w: Window): Granularity {
 }
 /** strftime() format string for a granularity. */
 export function granularityFormat(g: Granularity): string {
-  return g === 'day' ? '%Y-%m-%d' : g === 'week' ? '%Y-%W' : '%Y-%m';
+  return g === 'day' ? '%Y-%m-%d' : g === 'week' ? '%Y-W%W' : '%Y-%m';
 }
 
 // ---------------------------------------------------------------------------
@@ -132,13 +195,35 @@ export function granularityFormat(g: Granularity): string {
  * floor (amount_min); a fully-missing amount contributes 0. THE single source
  * of truth for "$" — every dollar metric interpolates this exact expression.
  */
-export const BRACKET_MIDPOINT_SQL =
+const RAW_BRACKET_MIDPOINT_SQL =
   '(CASE WHEN t.amount_max IS NOT NULL THEN (t.amount_min + t.amount_max) / 2.0 ' +
   'WHEN t.amount_min IS NOT NULL THEN t.amount_min ELSE 0 END)';
 
+/**
+ * Estimated dollar value of one transaction from its STOCK Act bracket.
+ * Fabricated competitor_backfill $1,001–$15,000 defaults contribute 0
+ * (DATACORRECTNESS-02) until a real bracket exists.
+ */
+export const BRACKET_MIDPOINT_SQL =
+  `(CASE WHEN ${fabricatedCompetitorAmountSql('t')} THEN 0 ELSE ${RAW_BRACKET_MIDPOINT_SQL} END)`;
+
 /** Signed midpoint: +mid for purchases, -mid for sales, 0 otherwise (net flow). */
 export const SIGNED_MIDPOINT_SQL =
-  "(CASE WHEN t.tx_type = 'P' THEN " +
+  "(CASE WHEN t.tx_type IN ('B', 'P') THEN " +
+  BRACKET_MIDPOINT_SQL +
+  " WHEN t.tx_type = 'S' THEN -" +
+  BRACKET_MIDPOINT_SQL +
+  ' ELSE 0 END)';
+
+/**
+ * Stock-only dollars for headline Net Flow / Approx. Volume / ticker
+ * net-flow (DATACORRECTNESS-10). Option premiums stay out of the $ KPIs
+ * even when the request does not pass excludeOptions.
+ */
+export const STOCK_MIDPOINT_SQL =
+  `(CASE WHEN t.is_option = 1 THEN 0 ELSE ${BRACKET_MIDPOINT_SQL} END)`;
+export const STOCK_SIGNED_MIDPOINT_SQL =
+  "(CASE WHEN t.is_option = 1 THEN 0 WHEN t.tx_type IN ('B', 'P') THEN " +
   BRACKET_MIDPOINT_SQL +
   " WHEN t.tx_type = 'S' THEN -" +
   BRACKET_MIDPOINT_SQL +
@@ -147,12 +232,18 @@ export const SIGNED_MIDPOINT_SQL =
 /** Chamber resolved from the filers table, falling back to the owning filing. */
 export const CHAMBER_EXPR = 'COALESCE(fl.chamber, f.chamber)';
 
-/** Party bucketed to 'D' | 'R' | 'O' by first letter; unknown stays NULL. */
+/**
+ * Party bucketed to 'D' | 'R' | 'O' by first letter.  Total: anything that is
+ * not D or R — Independent, minor parties, empty/NULL party (seed, executive
+ * and manual filers) or a transaction whose filer has no `filers` row — is 'O'
+ * ("Other / No party").  Never NULL, so the three buckets partition the data
+ * and `party=D,R,O` returns exactly what no party filter returns.  Keep in sync
+ * with PARTY_BUCKET_SQL_LOCAL in delivery/rows.ts (asserted by a test).
+ */
 export const PARTY_BUCKET_SQL =
   "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' " +
   "WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' " +
-  "WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) IN ('I', 'O') THEN 'O' " +
-  'ELSE NULL END)';
+  "ELSE 'O' END)";
 
 /** A non-null, non-empty ticker (the analytics definition of "a resolved asset"). */
 export const TICKER_RESOLVED_SQL = "(t.ticker IS NOT NULL AND t.ticker <> '' AND t.ticker NOT IN ('NONE', '--', 'N/A', 'NA', 'NULL', '—'))";
@@ -194,15 +285,17 @@ export interface CommonFilters {
    * executive rows excluded (see {@link asChambers}).
    */
   chambers?: Chamber[];
-  /** Party bucket (D/R/O); matched against {@link PARTY_BUCKET_SQL}. */
+  /** Party bucket (D/R/O, O = Other / No party); matched against {@link PARTY_BUCKET_SQL}. */
   party?: PartyBucket;
+  /** Multi-party selection (takes precedence over `party`). */
+  parties?: PartyBucket[];
   /** 'all' (default) applies no source filter; else t.source = source. */
   source?: SourceFilter;
   /** Minimum per-row confidence (omit for no filter). */
   minConf?: number;
   /** Require a resolved (non-null, non-empty) ticker. */
   tickerNotNull?: boolean;
-  /** Restrict to these transaction types (e.g. ['P','S']). */
+  /** Restrict to these transaction types (e.g. ['B','S']). */
   txTypes?: TxType[];
   /** Restrict to this explicit set of tickers (e.g. a precomputed candidate set). */
   tickers?: string[];
@@ -221,11 +314,40 @@ export function buildCommonFilters(p: CommonFilters): { where: string[]; params:
 
   // Retracted (un-published) rows never appear in any analytics aggregate.
   where.push('t.deprecated_at IS NULL');
+  // Same "real, first-class disclosed trade" guards the public feed applies
+  // unconditionally (see buildTxFilters in src/delivery/rows.ts). Before this,
+  // Trends aggregates (e.g. the "Trades" summary KPI) counted synthetic
+  // provider-discovered placeholders, filer-less orphan rows, and
+  // competitor-only executive injects that the Trades tab has never shown —
+  // inflating every Trends number above the feed's total for what should be
+  // the identical underlying universe (owner report: the Trends "TRADES" stat
+  // running far ahead of the Trades tab's own total). Mirrored here (not
+  // imported) so this module stays dependency-free, matching its own "mirrors
+  // src/delivery/rows.ts" convention.
+  where.push("SUBSTR(t.doc_id, 1, 17) != 'provider-missing-'");
+  where.push('t.filer_id IS NOT NULL');
+  where.push(
+    "NOT (t.source = 'competitor_backfill' AND t.filer_id LIKE 'EXEC-%' AND t.doc_id LIKE 'COMPETITOR%')",
+  );
+  // Same real-world trade must count once (DATACORRECTNESS-01). Twin
+  // guard lives in shared/tradeIdentity.ts so the feed uses the same rule.
+  // Relies on idx_tx_twin_seek (0088 / #2062) so this is an index SEARCH.
+  where.push(TWIN_DEDUPE_SQL);
 
-  const offset = windowToOffset(p.window ?? '30d');
-  if (offset) {
-    where.push("t.tx_date >= date('now', ?)");
-    params.push(offset);
+  const win = p.window ?? '30d';
+  if (win === 'this_cy') {
+    // Inclusive from Jan 1 of the current UTC calendar year.
+    where.push("t.tx_date >= date(strftime('%Y', 'now') || '-01-01')");
+  } else if (win === 'last_cy') {
+    // Full previous UTC calendar year [Jan 1, Jan 1 this year).
+    where.push("t.tx_date >= date(strftime('%Y', 'now') || '-01-01', '-1 year')");
+    where.push("t.tx_date < date(strftime('%Y', 'now') || '-01-01')");
+  } else {
+    const offset = windowToOffset(win);
+    if (offset) {
+      where.push("t.tx_date >= date('now', ?)");
+      params.push(offset);
+    }
   }
   if (p.chambers && p.chambers.length) {
     where.push(`${CHAMBER_EXPR} IN (${p.chambers.map(() => '?').join(', ')})`);
@@ -236,13 +358,20 @@ export function buildCommonFilters(p: CommonFilters): { where: string[]; params:
   } else {
     // Default view = all chambers. We no longer exclude executive filings by default.
   }
-  if (p.party) {
+  if (p.parties && p.parties.length) {
+    where.push(`${PARTY_BUCKET_SQL} IN (${p.parties.map(() => '?').join(', ')})`);
+    for (const b of p.parties) params.push(b);
+  } else if (p.party) {
     where.push(`${PARTY_BUCKET_SQL} = ?`);
     params.push(p.party);
   }
   if (p.source && p.source !== 'all') {
-    where.push('t.source = ?');
-    params.push(p.source);
+    if (p.source === 'primary') {
+      where.push("t.source IN ('primary', 'manual')");
+    } else {
+      where.push('t.source = ?');
+      params.push(p.source);
+    }
   }
   if (typeof p.minConf === 'number' && Number.isFinite(p.minConf)) {
     where.push('t.confidence >= ?');
@@ -252,8 +381,19 @@ export function buildCommonFilters(p: CommonFilters): { where: string[]; params:
     where.push(TICKER_RESOLVED_SQL);
   }
   if (p.txTypes && p.txTypes.length) {
-    where.push(`t.tx_type IN (${p.txTypes.map(() => '?').join(', ')})`);
-    for (const ty of p.txTypes) params.push(ty);
+    // Expand Buy (B) to include legacy Purchase letter P during migration window.
+    const expanded = new Set<string>();
+    for (const ty of p.txTypes) {
+      expanded.add(ty);
+      const code = String(ty);
+      if (code === 'B' || code === 'P') {
+        expanded.add('B');
+        expanded.add('P');
+      }
+    }
+    const list = [...expanded];
+    where.push(`t.tx_type IN (${list.map(() => '?').join(', ')})`);
+    for (const ty of list) params.push(ty);
   }
   if (p.tickers && p.tickers.length) {
     where.push(`t.ticker IN (${p.tickers.map(() => '?').join(', ')})`);

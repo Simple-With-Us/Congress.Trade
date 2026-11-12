@@ -2,6 +2,10 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   encodeForm,
   verifyStripeSignature,
+  stripeEventLivemodeMatchesKey,
+  stripeObjectId,
+  stripeEnvironmentFromKey,
+  stripeEnvironmentFromLivemode,
   billingCapabilities,
   billingCapabilitiesAsync,
   checkoutConfigured,
@@ -235,5 +239,57 @@ describe('Stripe write idempotency', () => {
       { path: '/v1/customers', key: 'customer-key' },
       { path: '/v1/billing_portal/sessions', key: 'portal-key' },
     ]);
+  });
+
+  it('sends the Billing Portal configuration so the hosted page lists Premium', async () => {
+    let body = '';
+    vi.stubGlobal('fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+      body = String(init?.body ?? '');
+      return Response.json({ id: 'bps_1', url: 'https://stripe/portal' });
+    });
+    await createBillingPortalSession({ STRIPE_SECRET_KEY: 'sk' } as Env, {
+      customerId: 'cus_1',
+      returnUrl: 'https://app/',
+      idempotencyKey: 'portal-key',
+      configuration: 'bpc_live_premium',
+    });
+    expect(body).toContain('configuration=bpc_live_premium');
+    expect(body).toContain('customer=cus_1');
+  });
+});
+
+describe('stripeEventLivemodeMatchesKey', () => {
+  it('requires livemode to match a live or test key prefix', () => {
+    expect(stripeEventLivemodeMatchesKey(true, 'sk_live_abc')).toBe(true);
+    expect(stripeEventLivemodeMatchesKey(false, 'sk_test_abc')).toBe(true);
+    expect(stripeEventLivemodeMatchesKey(false, 'sk_live_abc')).toBe(false);
+    expect(stripeEventLivemodeMatchesKey(true, 'sk_test_abc')).toBe(false);
+  });
+
+  it('rejects a missing livemode when the key prefix is checkable', () => {
+    expect(stripeEventLivemodeMatchesKey(undefined, 'sk_live_abc')).toBe(false);
+    expect(stripeEventLivemodeMatchesKey('true', 'sk_test_abc')).toBe(false);
+  });
+
+  it('skips the check when the key has no live/test prefix', () => {
+    expect(stripeEventLivemodeMatchesKey(undefined, 'sk_abc')).toBe(true);
+    expect(stripeEventLivemodeMatchesKey(true, undefined)).toBe(true);
+  });
+});
+
+describe('stripeObjectId / environment labels', () => {
+  it('reads a string id or an expanded object id', () => {
+    expect(stripeObjectId('sub_1')).toBe('sub_1');
+    expect(stripeObjectId({ id: 'cus_1' })).toBe('cus_1');
+    expect(stripeObjectId({})).toBeUndefined();
+    expect(stripeObjectId(null)).toBeUndefined();
+  });
+
+  it('maps Stripe key prefix and livemode onto Sandbox vs Production', () => {
+    expect(stripeEnvironmentFromKey('sk_test_abc')).toBe('Sandbox');
+    expect(stripeEnvironmentFromKey('sk_live_abc')).toBe('Production');
+    expect(stripeEnvironmentFromLivemode(false)).toBe('Sandbox');
+    expect(stripeEnvironmentFromLivemode(true)).toBe('Production');
+    expect(stripeEnvironmentFromLivemode(undefined)).toBeNull();
   });
 });

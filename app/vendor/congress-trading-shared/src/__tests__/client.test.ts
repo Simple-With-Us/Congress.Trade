@@ -463,14 +463,24 @@ describe("CongressTradeClient", () => {
       expect(result).toEqual([{ filerId: "123", tradeCount: 10 }]);
     });
 
-    it("getMemberPerformance returns performance data", async () => {
+    it("getMemberPerformance returns dual-anchor performance (filing + trade)", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ performance: { tradeCount: 10, winRate: 0.7 } }),
+        json: async () => ({
+          filerId: "filer-1",
+          side: "buys",
+          buyCount: 12,
+          tradeDate: { tradeCount: 12, scoredCount: 10, winRate: 0.7, avgExcess: 0.02 },
+          filingDate: { tradeCount: 12, scoredCount: 9, winRate: 0.66, avgExcess: 0.015, avgAnnualizedExcess: 0.04 },
+          performance: { tradeCount: 12, scoredCount: 10, winRate: 0.7, avgExcess: 0.02 },
+          note: "Buys only.",
+        }),
       });
       const client = mockClient(mockFetch);
       const result = await client.getMemberPerformance("filer-1");
-      expect(result).toEqual({ tradeCount: 10, winRate: 0.7 });
+      expect(result?.filingDate?.avgExcess).toBe(0.015);
+      expect(result?.tradeDate?.avgExcess).toBe(0.02);
+      expect(result?.performance?.winRate).toBe(0.7);
     });
 
     it("getMemberPerformance returns null for empty filerId", async () => {
@@ -481,12 +491,18 @@ describe("CongressTradeClient", () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it("getMemberPerformance accepts explicit null and rejects a missing envelope", async () => {
-      const mockFetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ performance: null }) });
+    it("getMemberPerformance accepts legacy single-leg performance and rejects garbage", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ performance: { tradeCount: 10, winRate: 0.7 } }),
+      });
       const client = mockClient(mockFetch);
-      const result = await client.getMemberPerformance("filer-1");
-      expect(result).toBeNull();
-      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+      const legacy = await client.getMemberPerformance("filer-1");
+      expect(legacy?.performance?.tradeCount).toBe(10);
+      expect(legacy?.tradeDate?.tradeCount).toBe(10);
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ performance: null }) });
+      expect(await client.getMemberPerformance("filer-1")).toBeNull();
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ not: "valid" }) });
       await expect(client.getMemberPerformance("filer-1")).rejects.toThrow("Invalid member performance response");
     });
 

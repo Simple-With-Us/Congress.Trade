@@ -36,6 +36,15 @@ import {
   DOC_CLASS_SCHEMA_STATEMENTS,
   EST_VALUE_SCHEMA_STATEMENTS,
   POST_0024_SCHEMA_STATEMENTS,
+  LATENCY_PROBE_LEASE_SCHEMA_STATEMENTS,
+  ASSET_NORMALIZATION_0085_SCHEMA_STATEMENTS,
+  APNS_FANOUT_STATE_SCHEMA_STATEMENTS,
+  LATENCY_PRICE_SNAPSHOT_SCHEMA_STATEMENTS,
+  TWIN_SEEK_INDEX_SCHEMA_STATEMENTS,
+  PROBE_RUN_BRACKET_SCHEMA_STATEMENTS,
+  LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS,
+  LATENCY_SNAPSHOT_12H_SWEEP_SCHEMA_STATEMENTS,
+  PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS,
   PRICE_BACKFILL_TERMINATION_SCHEMA_STATEMENTS,
   RELIABILITY_SCHEMA_STATEMENTS,
   RETENTION_INDEX_SCHEMA_STATEMENTS,
@@ -45,7 +54,37 @@ import {
   STRIPE_EVENT_SCHEMA_STATEMENTS,
   USAGE_TELEMETRY_PROBE_LEASE_SCHEMA_STATEMENTS,
   SUBSCRIPTION_QUOTA_ACTIVE_ONLY_SCHEMA_STATEMENTS,
+  LOWER_SUBSCRIPTION_QUOTA_SCHEMA_STATEMENTS,
+  PUSH_DEVICES_SCHEMA_STATEMENTS,
+  LLM_SPEND_PURPOSE_DOC_SCHEMA_STATEMENTS,
+  FILER_IDENTITY_MERGE_SCHEMA_STATEMENTS,
+  MEMBERS_DIRECTORY_PERF_SCHEMA_STATEMENTS,
+  APPLE_SIGNIN_SCHEMA_STATEMENTS,
+  APPLE_IAP_SCHEMA_STATEMENTS,
+  REVIEW_QUEUE_RESOLUTION_REASON_SCHEMA_STATEMENTS,
+  FILERS_DISPLAY_NAME_SCHEMA_STATEMENTS,
+  ADMIN_ALLOWLIST_SCHEMA_STATEMENTS,
+  APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS,
+  X_AUTH_SCHEMA_STATEMENTS,
+  GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS,
+  UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS,
+  LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
+  FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
+  PEER_IMPORT_RECEIPT_SCHEMA_STATEMENTS,
+  MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
+  FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
+  PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+  ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
+  FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+  FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+  FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
+  TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
+  DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
+  PHANTOM_FILER_ALIAS_STATEMENTS,
+  REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
+import { buildAdminMigrateStatements } from '../migrateStatements.ts';
+import { applyGuardedAppleSubscriptionsNullableUserMigration } from '../schemaMigrationRunner.ts';
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../../benchmark/schema.ts';
 import {
   beginBenchmarkRun,
@@ -95,7 +134,7 @@ function applyMigrationFiles(db: SqliteDatabase, files: string[]): void {
   }
 }
 
-function applyAdminTail(db: SqliteDatabase): void {
+async function applyAdminTail(db: SqliteDatabase): Promise<void> {
   for (const sql of POST_0024_SCHEMA_STATEMENTS) {
     try {
       db.exec(sql);
@@ -103,6 +142,8 @@ function applyAdminTail(db: SqliteDatabase): void {
       if (!/duplicate column|already exists/i.test((error as Error).message)) throw error;
     }
   }
+  // executeAdminSchemaMigrations runs the 0091 rebuild outside the list.
+  await applyGuardedAppleSubscriptionsNullableUserMigration(d1Database(db));
 }
 
 function d1Database(db: SqliteDatabase): D1Database {
@@ -179,7 +220,6 @@ describe('admin migration bootstrap', () => {
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('dead_letter_cycles');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('claim_token');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('lease_until');
-    expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('trg_subscriptions_total_quota');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('source_attempts');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('trg_sse_subscription_connection_quota');
     expect(RELIABILITY_SCHEMA_STATEMENTS.join('\n')).toContain('trg_sse_client_connection_quota');
@@ -248,7 +288,183 @@ describe('admin migration bootstrap', () => {
       ...PURGE_LEAKED_KV_CREDENTIALS_SCHEMA_STATEMENTS,
       ...QUEUE_OUTBOX_RETENTION_INDEX_SCHEMA_STATEMENTS,
       ...LOCAL_VISION_WORKER_SCHEMA_STATEMENTS,
+      ...LOWER_SUBSCRIPTION_QUOTA_SCHEMA_STATEMENTS,
+      ...PUSH_DEVICES_SCHEMA_STATEMENTS,
+      ...LLM_SPEND_PURPOSE_DOC_SCHEMA_STATEMENTS,
+      ...FILER_IDENTITY_MERGE_SCHEMA_STATEMENTS,
+      ...MEMBERS_DIRECTORY_PERF_SCHEMA_STATEMENTS,
+      ...APPLE_SIGNIN_SCHEMA_STATEMENTS,
+      ...APPLE_IAP_SCHEMA_STATEMENTS,
+      ...REVIEW_QUEUE_RESOLUTION_REASON_SCHEMA_STATEMENTS,
+      ...FILERS_DISPLAY_NAME_SCHEMA_STATEMENTS,
+      ...LATENCY_PROBE_LEASE_SCHEMA_STATEMENTS,
+      ...ASSET_NORMALIZATION_0085_SCHEMA_STATEMENTS,
+      ...APNS_FANOUT_STATE_SCHEMA_STATEMENTS,
+      ...LATENCY_PRICE_SNAPSHOT_SCHEMA_STATEMENTS,
+      ...TWIN_SEEK_INDEX_SCHEMA_STATEMENTS,
+      ...PROBE_RUN_BRACKET_SCHEMA_STATEMENTS,
+      ...ADMIN_ALLOWLIST_SCHEMA_STATEMENTS,
+      // 0091 is a guarded one-batch rebuild outside this list (schemaMigrationRunner.ts).
+      ...LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS,
+      ...PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS,
+      ...X_AUTH_SCHEMA_STATEMENTS,
+      ...LATENCY_SNAPSHOT_12H_SWEEP_SCHEMA_STATEMENTS,
+      ...GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS,
+      ...UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS,
+      ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
+      ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
+      ...PEER_IMPORT_RECEIPT_SCHEMA_STATEMENTS,
+      ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
+      ...FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
+      ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+      ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
+      ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+      ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+      ...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
+      ...TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
+      ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
+      ...PHANTOM_FILER_ALIAS_STATEMENTS,
+      ...REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS,
     ]);
+  });
+
+  it('unblocks House phantom not_found rows (0097)', () => {
+    const sql = UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS.join('\n');
+    expect(sql).toContain("ingest_status = 'not_found'");
+    expect(sql).toContain("error LIKE '%phantom%'");
+    expect(sql).toContain("DELETE FROM ingestion_outbox");
+    expect(sql).toContain("DELETE FROM filings");
+  });
+
+  it('indexes freshness MAX() columns the primary key cannot serve (0102)', async () => {
+    const sql = FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('idx_insider_eod_date');
+    expect(sql).toContain('idx_short_volume_eod_date');
+    expect(sql).toContain('idx_analyst_consensus_source_updated');
+    expect(sql).toContain('analyst_consensus (source, updated_at)');
+
+    const db = await sqliteDatabase();
+    try {
+      db.exec(
+        `CREATE TABLE insider_eod (
+           ticker TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (ticker, date))`,
+      );
+      db.exec(
+        `CREATE TABLE short_volume_eod (
+           ticker TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY (ticker, date))`,
+      );
+      db.exec(
+        `CREATE TABLE analyst_consensus (
+           ticker TEXT NOT NULL, date TEXT NOT NULL, source TEXT,
+           updated_at TEXT NOT NULL, PRIMARY KEY (ticker, date))`,
+      );
+      for (const statement of FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS) db.exec(statement);
+      const plan = (query: string) =>
+        db.prepare(`EXPLAIN QUERY PLAN ${query}`).all()
+          .map((row) => String(row.detail))
+          .join('\n');
+      expect(plan('SELECT MAX(date) FROM insider_eod')).toContain('idx_insider_eod_date');
+      expect(plan('SELECT MAX(date) FROM short_volume_eod')).toContain('idx_short_volume_eod_date');
+      expect(plan(
+        "SELECT MAX(updated_at) FROM analyst_consensus WHERE source = 'imported'",
+      )).toContain('idx_analyst_consensus_source_updated');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('indexes trade_latency_candidates by doc_id for the feed join (0099)', () => {
+    const sql = FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('idx_trade_latency_candidates_doc');
+    expect(sql).toContain('trade_latency_candidates (doc_id, ticker, tx_date, tx_type)');
+  });
+
+  it('adds observed-vs-claimed time provenance on latency snapshots (0098)', () => {
+    const sql = LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('ADD COLUMN time_provenance TEXT');
+    expect(sql).toContain("time_provenance = 'observed'");
+    expect(sql).toContain("event = 'ct_publish'");
+  });
+
+  it('includes the persisted admin allowlist + audit trail (0090)', () => {
+    const sql = ADMIN_ALLOWLIST_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('admin_allowlist');
+    expect(sql).toContain('granted_by  TEXT NOT NULL');
+    expect(sql).toContain('admin_access_audit');
+    expect(sql).toContain('idx_admin_access_audit_created');
+  });
+
+  it('reopens missed_window snapshots and adds confidence/session/backfill columns (0092)', () => {
+    const sql = LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('ADD COLUMN capture_mode TEXT');
+    expect(sql).toContain('ADD COLUMN confidence TEXT');
+    expect(sql).toContain('ADD COLUMN due_at_uncertainty_sec INTEGER');
+    expect(sql).toContain('ADD COLUMN market_session TEXT');
+    expect(sql).toContain('ADD COLUMN backfill_attempts INTEGER NOT NULL DEFAULT 0');
+    expect(sql).toContain('idx_latency_price_backfill_due');
+    expect(sql).toContain("WHERE error IN ('missed_window', 'fmp_quote_http_402')");
+  });
+
+  it('reopens missed_window rows on real SQLite and stays idempotent on replay (0092)', async () => {
+    const db = await sqliteDatabase();
+    applyMigrationFiles(db, migrationFiles());
+
+    const insertSnapshot = (event: string, error: string | null, capturedAt: string | null): void => {
+      db.prepare(
+        `INSERT INTO latency_price_snapshots (trade_hash, ticker, provider, event, due_at, captured_at, price, error, created_at)
+         VALUES ('h1', 'AAPL', 'fmp', ?, '2026-08-01T00:00:00Z', ?, NULL, ?, '2026-08-01T00:00:00Z')`,
+      ).run(event, capturedAt, error);
+    };
+    // A row previously abandoned with missed_window ...
+    insertSnapshot('ct_publish', 'missed_window', '2026-08-01T00:03:00Z');
+    // ... a row already terminal with a real outcome, which must never be
+    // reset by any later replay of the reopen UPDATE ...
+    insertSnapshot('provider_publish', 'confirmed_no_bars', '2026-08-02T00:00:00Z');
+    // ... and a row already successfully captured.
+    db.prepare(
+      `INSERT INTO latency_price_snapshots (trade_hash, ticker, provider, event, due_at, captured_at, price, error, created_at)
+       VALUES ('h1', 'AAPL', 'fmp', 'provider_plus_5m', '2026-08-01T00:05:00Z', '2026-08-01T00:05:30Z', 190.5, NULL, '2026-08-01T00:00:00Z')`,
+    ).run();
+
+    // Replayed on every deploy (POST /api/admin/migrate re-runs the full
+    // statement list, tolerating "duplicate column"/"already exists" the way
+    // the real route does — see applyAdminTail), so applying the tail twice
+    // more must change nothing further than the first reopen pass.
+    await applyAdminTail(db);
+    await applyAdminTail(db);
+
+    const rows = db
+      .prepare('SELECT event, captured_at, error FROM latency_price_snapshots ORDER BY event')
+      .all() as Array<{ event: string; captured_at: string | null; error: string | null }>;
+    const byEvent = Object.fromEntries(rows.map((r) => [r.event, r]));
+
+    expect(byEvent.ct_publish).toEqual({ event: 'ct_publish', captured_at: null, error: null });
+    expect(byEvent.provider_publish).toEqual({
+      event: 'provider_publish',
+      captured_at: '2026-08-02T00:00:00Z',
+      error: 'confirmed_no_bars',
+    });
+    expect(byEvent.provider_plus_5m).toEqual({
+      event: 'provider_plus_5m',
+      captured_at: '2026-08-01T00:05:30Z',
+      error: null,
+    });
+
+    const cols = db
+      .prepare("PRAGMA table_info(latency_price_snapshots)")
+      .all() as Array<{ name: string }>;
+    const names = cols.map((c) => c.name);
+    for (const col of ['capture_mode', 'confidence', 'due_at_uncertainty_sec', 'market_session', 'backfill_attempts']) {
+      expect(names).toContain(col);
+    }
+
+    db.close();  });
+
+  it('includes the twin-seek covering index (0088 / #2062)', () => {
+    const sql = TWIN_SEEK_INDEX_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('idx_tx_twin_seek');
+    expect(sql).toContain('(filer_id, tx_date)');
+    expect(sql).toContain('deprecated_at IS NULL');
   });
 
   it('includes immutable LLM and autopilot spend settlements (0053)', () => {
@@ -322,9 +538,32 @@ describe('admin migration bootstrap', () => {
   it('counts only active rows toward the total subscription quota trigger (0047)', () => {
     const sql = SUBSCRIPTION_QUOTA_ACTIVE_ONLY_SCHEMA_STATEMENTS.join('\n');
     expect(sql).toContain('DROP TRIGGER IF EXISTS trg_subscriptions_total_quota');
-    expect(sql).toContain('trg_subscriptions_total_quota');
-    expect(sql).toContain('client_id = NEW.client_id AND active = 1');
-    expect(sql).toContain('subscription total quota exceeded');
+    // 0047's CREATE is left out of the replay list (a later list drops and
+    // redefines the same trigger); the active-only predicate survives in the
+    // final definition the replay actually creates.
+    const replay = buildAdminMigrateStatements().join('\n');
+    expect(replay).toContain('trg_subscriptions_total_quota');
+    expect(replay).toContain('client_id = NEW.client_id AND active = 1');
+    expect(replay).toContain('subscription total quota exceeded');
+  });
+
+  it('adds price_unavailable_reason (0103)', () => {
+    expect(PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS.join('\n')).toContain('price_unavailable_reason TEXT');
+  });
+
+  it('adds filings.discovered_via (0106)', () => {
+    expect(FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS.join('\n')).toContain(
+      'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
+    );
+    // The column belongs to its own migration, not the 0096 probe-interval set.
+    expect(GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS.join('\n')).not.toContain('discovered_via');
+  });
+
+  it('adds enrichment_unavailable columns (0104)', () => {
+    const sql = ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS.join('\n');
+    expect(sql).toContain('enrichment_unavailable INTEGER');
+    expect(sql).toContain('enrichment_unavailable_reason TEXT');
+    expect(sql).toContain('enrichment_checked_at TEXT');
   });
 
   it('negative-caches un-priceable tickers and indexes latest_price_date (0043)', () => {
@@ -367,7 +606,7 @@ describe('admin migration bootstrap', () => {
     try {
       applyMigrationFiles(fileDb, files);
       applyMigrationFiles(adminDb, priorFiles);
-      applyAdminTail(adminDb);
+      await applyAdminTail(adminDb);
 
       expect(schemaSnapshot(adminDb)).toEqual(schemaSnapshot(fileDb));
       expect(await checkReadiness(d1Database(fileDb))).toEqual({
@@ -397,7 +636,7 @@ describe('admin migration bootstrap', () => {
         assetName: 'Example Corp',
         ticker: 'EXM',
         assetType: 'stock',
-        txType: 'P',
+        txType: 'B',
         amountMin: 15_001,
         amountMax: 50_000,
         isOption: false,
@@ -674,12 +913,31 @@ describe('admin migration bootstrap', () => {
   // statements contributed by other modules (e.g. src/benchmark/schema.ts).
   it('mirrors every object declared by migrations/*.sql into the production migrate list', async () => {
     const statements: string[] = [];
+    // Answer as a pre-0091 database (apple_subscriptions.user_id NOT NULL) so
+    // the route's guarded one-batch 0091 rebuild runs and reaches the mirror.
     const db = {
       prepare(sql: string) {
-        return {
-          bind() { return this; },
+        let params: unknown[] = [];
+        const stmt = {
+          bind(...values: unknown[]) { params = values; return stmt; },
           async run() { statements.push(sql); return { success: true, meta: { changes: 1 } }; },
+          async all() {
+            if (/PRAGMA table_info\("apple_subscriptions"\)/i.test(sql)) {
+              return { results: [{ name: 'user_id', notnull: 1 }], success: true };
+            }
+            return { results: [], success: true };
+          },
+          async first() {
+            if (/sqlite_master/i.test(sql)) return params[0] === 'apple_subscriptions' ? { ok: 1 } : null;
+            return null;
+          },
         };
+        return stmt;
+      },
+      async batch(prepared: Array<{ run(): Promise<unknown> }>) {
+        const results: unknown[] = [];
+        for (const stmt of prepared) results.push(await stmt.run());
+        return results;
       },
     } as unknown as D1Database;
 
@@ -704,8 +962,20 @@ describe('admin migration bootstrap', () => {
     ];
 
     // Objects a migration creates and then deliberately retires, so the prod
-    // mirror correctly never carries them.
-    const RETIRED = new Set(['trg_transactions_cursor']);
+    // mirror correctly never carries them.  0059 drops the 0021/0023
+    // disclosure_* tables; 0058 and 0062 drop the 0052/0056 queue indexes.
+    const RETIRED = new Set([
+      'trg_transactions_cursor',
+      'disclosure_latency_candidates',
+      'disclosure_provider_observations',
+      'idx_disc_latency_candidates_status',
+      'idx_disc_provider_seen',
+      'disclosure_latency_candidates.provider_published_at',
+      'disclosure_provider_observations.provider_published_at',
+      'idx_deno_runtime_queue_ready',
+      'idx_deno_runtime_queue_pending',
+      'idx_deno_runtime_queue_processing',
+    ]);
 
     const missing: string[] = [];
     for (const name of migrationFiles()) {
@@ -728,5 +998,81 @@ describe('admin migration bootstrap', () => {
         'because POST /api/admin/migrate does not create them. Mirror them into ' +
         'the statement list in src/admin/routes.ts (see AGENTS.md "Migrations & deploy").',
     ).toEqual([]);
+  });
+
+  // ---- boot replay churn (CT-2442) ----------------------------------------
+  // main.ts awaits this whole list before Deno.serve on every boot, holding
+  // the write lock statement by statement.  A table or index that a later
+  // statement in the same list drops is rebuilt and thrown away on every
+  // deploy (the deno_runtime_queue indexes cover millions of rows).  Leave
+  // the CREATE out of the replay and keep the DROP ... IF EXISTS, which is a
+  // cheap no-op that still cleans old databases.
+  function replayChurn(list: readonly string[]): string[] {
+    const statements = list.map((sql) => sql.replace(/\s+/g, ' ').trim());
+    const createRe = /^CREATE (?:UNIQUE )?(TABLE|INDEX|TRIGGER) (?:IF NOT EXISTS )?([a-z0-9_]+)(?: ON ([a-z0-9_]+))?/i;
+    const alterRe = /^ALTER TABLE ([a-z0-9_]+) /i;
+    const dropRe = /^DROP (TABLE|INDEX|TRIGGER) (?:IF EXISTS )?([a-z0-9_]+)/i;
+    const churn: string[] = [];
+    statements.forEach((sql, dropAt) => {
+      const drop = sql.match(dropRe);
+      if (!drop) return;
+      const kind = drop[1].toUpperCase();
+      const name = drop[2].toLowerCase();
+      statements.slice(0, dropAt).forEach((earlier, at) => {
+        const create = earlier.match(createRe);
+        const alter = earlier.match(alterRe);
+        const createsIt = create != null
+          && create[1].toUpperCase() === kind
+          && create[2].toLowerCase() === name;
+        const buildsOnDroppedTable = kind === 'TABLE' && (
+          (create != null && (create[1].toUpperCase() === 'INDEX' || create[1].toUpperCase() === 'TRIGGER')
+            && create[3]?.toLowerCase() === name)
+          || alter?.[1].toLowerCase() === name
+        );
+        if (createsIt || buildsOnDroppedTable) {
+          churn.push(`#${at} ${earlier.slice(0, 90)} ... dropped by #${dropAt} ${sql}`);
+        }
+      });
+    });
+    return churn;
+  }
+
+  it('detects a create that a later statement drops', () => {
+    expect(replayChurn([
+      'CREATE INDEX IF NOT EXISTS idx_q_ready ON q(status, id)',
+      'CREATE TABLE IF NOT EXISTS old_t (id TEXT PRIMARY KEY)',
+      'CREATE INDEX IF NOT EXISTS idx_old_t_id ON old_t (id)',
+      'ALTER TABLE old_t ADD COLUMN note TEXT',
+      'DROP INDEX IF EXISTS idx_q_ready',
+      'DROP TABLE IF EXISTS old_t',
+    ])).toHaveLength(4);
+    expect(replayChurn([
+      'DROP INDEX IF EXISTS idx_q_ready',
+      'CREATE INDEX IF NOT EXISTS idx_q_ready_id ON q (status, id)',
+    ])).toEqual([]);
+  });
+
+  it('never creates a table or index that a later replay statement drops', () => {
+    expect(
+      replayChurn(buildAdminMigrateStatements()),
+      'The boot replay rebuilds these objects under the write lock only to drop them. ' +
+        'Remove the CREATE (and any ALTER/INDEX on a dropped table) from the replay list; keep the DROP ... IF EXISTS.',
+    ).toEqual([]);
+  });
+
+  it('keeps the 0091 apple_subscriptions table swap out of the replay list', () => {
+    const replay = buildAdminMigrateStatements().join('\n');
+    expect(replay).not.toContain('apple_subscriptions_new');
+    expect(replay).not.toMatch(/DROP TABLE (?:IF EXISTS )?apple_subscriptions\b/i);
+    // The guarded rebuild still carries the 0091 statements, in file order.
+    expect(APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS.map((sql) => sql.split(/\s+/).slice(0, 3).join(' ')))
+      .toEqual([
+        'CREATE TABLE IF',
+        'INSERT INTO apple_subscriptions_new',
+        'DROP TABLE apple_subscriptions',
+        'ALTER TABLE apple_subscriptions_new',
+        'CREATE INDEX IF',
+        'CREATE INDEX IF',
+      ]);
   });
 });

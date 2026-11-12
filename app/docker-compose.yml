@@ -1,5 +1,20 @@
 version: '3.8'
 
+# RESOURCE CEILINGS (2026-08-12)
+# Every service is capped. On 2026-08-12 scan-cpu-worker — which had NO limit —
+# ran at 283% CPU (about 3 of the box's 8 cores) continuously, re-OCRing
+# documents whose results the ingest path was discarding. Nothing stopped it
+# because nothing bounded it.
+#
+# Ceilings are set well above observed working peaks (roughly 2-3x) so normal
+# work is never throttled; they exist to bound absurd runaway, not to tune
+# performance. cpus/mem_limit/pids_limit are the Compose v2 short-form keys,
+# which Coolify's docker-compose deployment honours directly.
+#
+#   observed steady CPU  ->  ceiling
+#   congress-app   ~1.5%     2.0 cpu / 3g
+#   scan-cpu-worker 283%(!)  2.0 cpu / 1g   (OCR is the legitimate heavy one)
+#   sqlite-web      ~0%      0.5 cpu / 512m
 services:
   # NOTE: do NOT add a `build.args` block here.
   #
@@ -18,6 +33,9 @@ services:
   congress-app:
     build: .
     container_name: congress-app
+    cpus: '2.0'
+    mem_limit: 3g
+    pids_limit: 512
     restart: unless-stopped
     ports:
       - "127.0.0.1:5000:5000"
@@ -28,22 +46,70 @@ services:
     environment:
       - DENO_KV_PATH=/data/congress-trade/kv.sqlite
       - PORT=5000
+      - CT_TICK_DEADLINE_MS=120000
+    # deno:alpine ships wget, not curl. Coolify/cmd healthchecks that call
+    # /usr/bin/curl mark the stack exited:unhealthy → public 502 even when
+    # the Deno process is fine. Use wget; keep start_period generous so
+    # first boot / migrate does not flap.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
 
   sqlite-web:
     build: 
       context: .
       dockerfile: Dockerfile.sqlite-web
     container_name: congress-sqlite-web
-    restart: unless-stopped
+    cpus: '0.5'
+    mem_limit: 512m
+    pids_limit: 128
+    # on-failure (not unless-stopped): a clean startup failure (missing/empty
+    # SQLITE_WEB_PASSWORD resolved from Infisical -- see Dockerfile.sqlite-web)
+    # is bounded to 3 attempts. An empty password used to crash-loop forever
+    # via sqlite-web's interactive-getpass fallback, and Coolify marked the
+    # whole multi-service stack exited:unhealthy, taking congress.trade to
+    # 502 (docs/rollouts/2026-08-08-sqlite-web-crashloop-502.md). Admin UI is
+    # non-critical.
+    restart: on-failure:3
+    # Bind loopback only — Coolify proxy already holds 0.0.0.0:8080; Tailscale
+    # IP binds also break when Coolify rewrites ports. Reach via SSH tunnel.
     ports:
-      - "100.97.154.2:8080:8080"
+      - "127.0.0.1:18080:8080"
     volumes:
       - /data/congress-trade:/data/congress-trade
-    env_file:
-      - .env
+    # SQLITE_WEB_PASSWORD is fetched at container start from Infisical (CT
+    # project, `prod` env) by Dockerfile.sqlite-web's CMD -- it is NOT read
+    # from Coolify's raw env anymore. This used to be
+    # `SQLITE_WEB_PASSWORD=${SQLITE_WEB_PASSWORD}` below, interpolated
+    # straight from Coolify at compose-parse time, which could (and did)
+    # silently hand the container an empty string (see rollout doc above and
+    # docs/rollouts/2026-09-08-sqlite-web-infisical.md).
+    #
+    # Deliberately no `env_file: - .env` here (unlike congress-app): this is
+    # a low-trust admin-UI sidecar with no functional need for the rest of
+    # congress-app's secrets, so it gets only the INFISICAL_APP_* bootstrap
+    # identity + INFISICAL_ENV the entrypoint's `infisical run` call needs.
+    #
+    # OWNER ACTION AFTER THIS DEPLOYS: delete SQLITE_WEB_PASSWORD from
+    # Coolify's env for this app -- Infisical is now the sole source. Do NOT
+    # delete it before this change is live in production, or the sidecar has
+    # no password source at all (Dockerfile.sqlite-web fails closed either
+    # way, so the worst case is bounded to 3 clean restart-and-fail cycles,
+    # never a blank-auth admin panel).
     environment:
-      - SQLITE_WEB_PASSWORD=${SQLITE_WEB_PASSWORD}
-    command: sqlite_web -x --password -H 0.0.0.0 /data/congress-trade/db.sqlite
+      - INFISICAL_APP_CLIENT_ID=${INFISICAL_APP_CLIENT_ID}
+      - INFISICAL_APP_CLIENT_SECRET=${INFISICAL_APP_CLIENT_SECRET}
+      - INFISICAL_APP_PROJECT_ID=${INFISICAL_APP_PROJECT_ID}
+      - INFISICAL_ENV=${INFISICAL_ENV}
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # Linux/ARM64 CPU scanned-PTR worker (no Mac, no LLM).
   # Polls /api/admin/scanned-filings/pending and posts source=server_cpu.
@@ -52,6 +118,9 @@ services:
     build:
       context: ../services/scan-cpu-worker
     container_name: congress-scan-cpu-worker
+    cpus: '2.0'
+    mem_limit: 1g
+    pids_limit: 256
     restart: unless-stopped
     env_file:
       - .env
@@ -63,11 +132,23 @@ services:
       - POLL_INTERVAL_SEC=30
       - HEARTBEAT_INTERVAL_SEC=60
       - EXTRACTOR=server_cpu_v1
-      # ADMIN_TOKEN comes from env_file (.env / Coolify secrets)
+      # ADMIN_TOKEN: env override optional; worker fetches from Infisical at boot
     depends_on:
       - congress-app
+    healthcheck:
+      # This only proves Python starts (it always exits 0), so a 30s cadence
+      # forked an interpreter twice a minute for no signal.
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 120s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
+# Join Coolify proxy network so Traefik/Caddy can reach congress-app after
+# Hetzner cutover. oracle_internal is legacy (Oracle host); do not require it.
+# Host helper `/usr/local/bin/ct-reattach-proxy.sh` also aliases the running
+# container as `congress-app` on this network for the dynamic Traefik file.
 networks:
   default:
-    name: oracle_internal
+    name: coolify
     external: true

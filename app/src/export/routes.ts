@@ -156,7 +156,7 @@ async function integrationCapabilities(env: ExportEnv): Promise<Record<string, u
     appBReturnPath: Boolean(runtimeSecrets.APP_B_IMPORT_URL && runtimeSecrets.APP_B_INGEST_TOKEN),
   };
   return {
-    app: 'congress.trade',
+    app: 'Congress.Trade',
     generatedAt: new Date().toISOString(),
     contractVersion: CAPABILITIES_VERSION,
     auth: {

@@ -1,0 +1,117 @@
+# Litestream 0.5.x config for Congress.Trade (congress-app, Coolify/Hetzner).
+# Continuous SQLite replication to Backblaze B2 (S3-compatible), rebuilt after
+# the Oracle->Hetzner migration dropped the old host-level systemd unit
+# (`litestream-congress`, `/etc/litestream/congress.yml` on the Oracle box —
+# decommissioned 2026-08). This is the in-container pattern already proven by
+# the sibling apps: Socratic.Trade `litestream.coolify.yml` and Usage-Monitor
+# `litestream.yml`. Field names below are cross-checked against Usage-Monitor's
+# working 0.5.13 config (closest match: singular `replica:`, top-level
+# `snapshot:` block, same env-var style).
+#
+# Schema notes (Litestream 0.5.x, verified against the pinned v0.5.13 binary):
+#   - A single `replica:` object per db (the 0.4.x `replicas:` array is
+#     deprecated; retention/snapshot keys placed under a replica are silently
+#     ignored by 0.5's yaml parsing).
+#   - Snapshot cadence/retention is a top-level `snapshot:` block
+#     (Config.Snapshot) — the canonical, documented location for the
+#     point-in-time restore window.
+#   - Env vars are expanded with Go's os.Getenv (NOT bash), so `${VAR:-default}`
+#     does NOT work — use a bare `${VAR}`. All values below are injected at
+#     container start by scripts/start-with-litestream.sh, which fetches them
+#     from Infisical (congress-trade project, env prod)
+#     using the same INFISICAL_APP_CLIENT_ID/SECRET bootstrap identity the
+#     Deno app already uses in-process for its own AWS_S3_* (R2 PDF storage)
+#     secrets. No secrets live in this file.
+#
+# IMPORTANT — do not confuse these with the app's own AWS_S3_* / AWS_REGION /
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets: those already point at
+# Cloudflare R2 and back the `raw/` filing-PDF object store consumed in-process
+# by src/deno/main.ts (S3Client). Reusing those names here would silently
+# repoint PDF storage at the B2 bucket. This file uses distinct
+# LITESTREAM_S3_* names (matching Usage-Monitor's convention) precisely to
+# avoid that collision.
+#
+# Destination (2026-08-12, owner): Backblaze B2 EU Central, bucket
+# jays-congress-trade-eu, endpoint s3.eu-central-003.backblazeb2.com — verified
+# against Infisical /backblaze-app-keys (B2_CT_* keys), NOT guessed.
+#
+# Sync interval (5m): the 2026-08-05 R2 Class A incident
+# (docs/rollouts/2026-08-05-r2-freetier-class-a-survival.md) showed Litestream
+# 0.5's L0-object-per-commit behavior keeps uploading at a high rate during
+# CT's bulk-load ingestion bursts *independent of the configured sync
+# interval* — the interval bounds polling frequency, not the number of
+# objects a heavy write burst produces between ticks. That incident was about
+# R2's free-tier Class A/storage caps specifically; B2 has no such free-tier
+# trap (2,500 Class A ops/day free, ~$0.004/10k after — trivial even at CT's
+# observed ~975 PUT/hr peak). 5m keeps a real RPO improvement over the current
+# up-to-6h gap while staying conservative against another write-burst spike,
+# within the fleet's stated 60s-1h sync-interval range for this rebuild.
+snapshot:
+  interval: 24h
+  # B2 is paid capacity, not R2 free-tier-capped storage — keep 7d of LTX
+  # history for restore headroom, matching Socratic.Trade's B2 target.
+  retention: 72h
+
+# Product compaction is L0 + bounded L1 + 24h snapshots.  L2 and L3 are OFF.
+# Mirror ST litestream.coolify.yml / UM litestream.yml.  Do NOT add a second
+# or third item unless L2/L3 are intentionally product-on again.
+# Do NOT add verify-compaction: true.
+# Litestream 0.5.x has no disable-L2 flag — one levels entry makes MaxLevel()=1
+# so NextLevel(1) is snapshot.  Removing L2/L3 is the backoff against mega-
+# compaction retry storms that burn shared Backblaze Class B/C caps.
+levels:
+  - interval: 30s
+
+dbs:
+  - path: /data/congress-trade/db.sqlite
+    # CONGRESS-TRADE-1M / 1J (2026-10-01, sibling of the 2026-09-29 ~500MB
+    # truncate storm). Litestream 0.5.13 holds a long read transaction so only
+    # it can checkpoint, then at truncate-page-n (default ~500MB / 121359
+    # pages) it runs wal_checkpoint(TRUNCATE). That exclusive lock waits on
+    # every reader while the app's writes return SQLITE_BUSY; the cron tick
+    # skips, and house/senate polling stays dark until someone stops the
+    # process and truncates by hand.
+    #
+    # On THIS pin, truncate-page-n: 0 disables that blocking checkpoint.
+    # Later Litestream releases changed 0 to mean "keep the default" — do not
+    # bump scripts/fetch-litestream.sh off 0.5.13 without revisiting this.
+    # PASSIVE checkpoints stay on: ~4MB (min-checkpoint-page-count) and every
+    # 30s after a real write. busy-timeout is Litestream's own wait for short
+    # app writes (PASSIVE itself does not block). The app must not hold a
+    # second connection's read snapshot across those attempts — see
+    # src/deno/sqliteClient.ts.
+    busy-timeout: 5s
+    checkpoint-interval: 30s
+    min-checkpoint-page-count: 1000
+    truncate-page-n: 0
+    replica:
+      type: s3
+      # Expected production values (Infisical congress-trade prod project):
+      #   LITESTREAM_S3_BUCKET=jays-congress-trade-eu
+      #   LITESTREAM_S3_ENDPOINT=https://s3.eu-central-003.backblazeb2.com
+      #   LITESTREAM_S3_REGION=eu-central-003
+      #   keys: B2_CT_KEY_ID / B2_CT_APPLICATION_KEY (scoped CT bucket key)
+      bucket: ${LITESTREAM_S3_BUCKET}
+      path: congress-trade/db.sqlite
+      region: ${LITESTREAM_S3_REGION}
+      endpoint: ${LITESTREAM_S3_ENDPOINT}
+      access-key-id: ${LITESTREAM_S3_ACCESS_KEY_ID}
+      secret-access-key: ${LITESTREAM_S3_SECRET_ACCESS_KEY}
+      # Large L1-compaction multiparts against B2 fail with "read multipart
+      # upload data failed ... checksum mismatch" on the default 5MB part size,
+      # and each abort restarts the whole multipart.  Usage-Monitor's retry
+      # storm of exactly this class (2026-08-27, 119 failed compactions in ~2h)
+      # burned the shared Backblaze daily transaction caps; Socratic.Trade hit
+      # it 2026-08-07/22.  Mirror ST's proven pair (litestream.coolify.yml):
+      # larger parts cut request count, concurrency 2 keeps memory modest.
+      part-size: 10MB
+      concurrency: 2
+      # 15m (owner 2026-08-27): all three fleet apps share ONE Backblaze
+      # account, so its daily Class B/C caps are fleet-wide — UM's corrupt-L0
+      # retry storm froze every app's backups at once.  CT's data is
+      # re-ingestable, so a coarser RPO costs little while cutting quiet-period
+      # object count (and the downstream compaction re-reads) 3x vs 5m.  Note
+      # the burst caveat above still applies: heavy ingestion writes produce
+      # L0 objects per commit regardless of this interval.  ST deliberately
+      # stays at 300s (live trading DB); UM is 1h.
+      sync-interval: 15m

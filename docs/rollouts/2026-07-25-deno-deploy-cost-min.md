@@ -1,5 +1,10 @@
 # Deno Deploy cost minimization (free-tier survival)
 
+> **Current shape (2026-08):** Deno Deploy is retired.  Production is Coolify
+> Deno-in-Docker on Hetzner, SQLite + Litestream, Infisical,
+> `CT_COST_PROFILE=paid` (`* * * * *`).  This note is the 2026-07 free-tier
+> survival work.  Do not set these knobs on Deploy.
+
 ## Summary
 
 Production burned a full Deno Deploy free-tier month of quota in ~4 days after

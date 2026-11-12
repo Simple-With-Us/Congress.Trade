@@ -1,5 +1,9 @@
 # 2026-07-31 — D1 row-budget raise + R2 free-tier daily Pushover summary
 
+> **Current shape (2026-08):** Turso stays retired.  The SQLite file is on
+> Hetzner (Oracle is decommissioned).  D1/Turso per-row pricing still does
+> not apply.
+
 ## Summary
 
 Two owner-directed ops changes:

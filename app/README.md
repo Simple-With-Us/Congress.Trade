@@ -1,24 +1,31 @@
 # Congress.Trade
 
-Cloudflare Workers service that ingests US congressional **STOCK Act** stock-trade
-disclosures (House + Senate), extracts structured trade events, and pushes them to
-clients via webhook / SSE / REST.
+Deno-in-Docker service that ingests US **STOCK Act** disclosures (House +
+Senate + Executive / OGE 278-T), extracts structured trade events, and pushes
+them to clients via webhook / SSE / REST / APNs.  Live site:
+[congress.trade](https://congress.trade).
 
-> This is the production Worker app. The original scaffold has grown into
-> implemented ingestion, extraction, delivery, admin, auth, billing, analytics,
-> enrichment, price-refresh, backfill, and UI surfaces. See `../AGENTS.md` for
-> branch/worktree coordination rules before continuing work.
+> This is the production Coolify app.  It runs as **Deno** (not Node) in
+> the Coolify `congress-app` container on the production fleet box (see
+> `../AGENTS.md` and `fleet-ops:ATTACK-MAP.md`; `https://host.jays.services`), not as a Cloudflare Worker.  Proof:
+> `../AGENTS.md` Current Shape, `Dockerfile`, `docker-compose.yml`,
+> `src/deno/main.ts`.  `wrangler.toml` is gone.  Leftover only:
+> `wrangler.preview.example.toml`, `@sentry/cloudflare`,
+> `@cloudflare/workers-types`.  Do not reintroduce Worker deploy as
+> production.  **Deno Deploy and Turso are retired.**  Production is Coolify
+> Docker, local SQLite + Litestream, Infisical secrets, paid cron
+> `* * * * *`.  See `../AGENTS.md` for branch/worktree coordination
+> rules before continuing work.
 >
-> iOS planning lives in `docs/mobile-app-roadmap.md`. It treats the planned
+> iOS planning lives in `docs/mobile-app-roadmap.md`.  It treats the planned
 > SwiftUI app as peer clients over one backend client API and
 > command/status model, not as places to run scraping, provider credentials, or
 > MCP orchestration.
 >
-> Cloudflare Worker service names: production is `congress-trade`; preview is
-> `congress-trade-preview`. Some backing D1/R2/queue resources still use legacy
-> `congress-feed-*` names and should not be renamed without a coordinated
-> resource migration.
-
+> Coolify compose service names: `congress-app` (API + UI), `sqlite-web`
+> (admin DB browser), `scan-cpu-worker` (Tesseract OCR helper).  Filing PDFs
+> still use the R2 bucket historically named `congress-feed-raw`.  Do not
+> rename that bucket without a coordinated resource migration.
 ---
 
 ## Architecture
@@ -46,7 +53,7 @@ clients via webhook / SSE / REST.
    │ delivery.dispatch → delivery/webhook  (sign + POST, record deliveries) │
    └─────────────────────────────────────────────────────────────────┘
                                                │
-                 fetch() Hono app ── /health ── /api (REST, SSE) ── /api/analytics ── /api/admin
+                 Deno.serve Hono app ── /health ── /api (REST, SSE) ── /api/analytics ── /api/admin
 ```
 
 ### Data flow (end to end)
@@ -76,11 +83,12 @@ clients via webhook / SSE / REST.
 
 | Path | Owner | Responsibility |
 |------|-------|----------------|
-| `src/index.ts` | foundation | Worker entry: `fetch`/`scheduled`/`queue`; `/health` (impl); router mounts |
+| `src/deno/main.ts` | foundation | Production entry: Deno.serve, SQLite + KV shims, in-process cron/queues |
+| `src/index.ts` | foundation | Hono app: `/health`, router mounts, scheduled/queue handlers |
 | `src/shared/types.ts` | foundation | Canonical types/enums, `QueueMessage`, `Env` |
 | `src/shared/config.ts` | foundation | Poll schedule, `shouldPollNow` (DST-correct ET), get/set config + last poll |
 | `src/shared/brackets.ts` | foundation | STOCK Act bracket set, `matchBracket`, `isValidBracket` |
-| `src/shared/db.ts` | foundation | Typed D1 `get`/`all`/`run`/`batch` helpers |
+| `src/shared/db.ts` | foundation | Typed SQLite `get`/`all`/`run`/`batch` helpers |
 | `src/shared/ids.ts` | foundation | `uuid`, prefixed/monotonic ids, R2 key builder |
 | `src/extractors/types.ts` | foundation | `Extractor` interface, `ArbitratingExtractor`, `buildExtractorPipeline` |
 | `src/ingestion/watcher.ts` | ingestion | Cron poll loop, source discovery, enqueue |
@@ -130,7 +138,7 @@ without a DB (mirroring `src/delivery/rows.ts`).
 | `GET /ticker/:ticker` | Single-ticker deep dive (series, top buyers/sellers, recent) |
 
 **Common query params:** `window=7d\|30d\|90d\|365d\|all` (default `30d`, by
-`tx_date`), `chamber=house\|senate`, `party=D\|R\|O`, `source=all\|primary\|seed_dataset`
+`tx_date`), `chamber=house\|senate`, `party=D\|R\|O` (CSV; `O` = Other / No party, so D+R+O = all), `source=all\|primary\|seed_dataset`
 (default `all`), `minConf=0..1`, plus per-endpoint `limit` / `sort` / `granularity`
 / `minMembers`.
 
@@ -154,32 +162,33 @@ Subscription ids are identifiers, not credentials.
 - `GET /api/stream?subscription=<id>&token=<secret>` opens an SSE stream. Native
   browser `EventSource` cannot set authorization headers, so browser clients use
   a scoped query token and must treat stream URLs as sensitive.
-- Webhook delivery is at-least-once. The Worker claims a unique
+- Webhook delivery is at-least-once.  The app claims a unique
   `(subscription_id, tx_id)` row before POSTing, and recipients should still
   dedupe on `X-Subscription-Id` + `X-Tx-Id`.
 
 Live normalization is also idempotent after migration `0008`: each primary row
-gets a stable `row_key`, and D1 enforces unique `(doc_id, source, row_key)`.
+gets a stable `row_key`, and SQLite enforces unique `(doc_id, source, row_key)`.
 Retries or duplicate queue messages should not create duplicate live rows or
 duplicate delivery fan-out.
 
-## Bindings (wrangler.toml)
+## Runtime resources (Coolify / host)
 
-| Binding | Type | Purpose |
-|---------|------|---------|
-| `DB` | D1 | Structured store (filers, filings, transactions, …) |
-| `RAW_FILES` | R2 | Raw disclosure files (PDF/HTML) |
-| `INGEST_QUEUE` | Queue | Pipeline stage hand-off |
-| `DELIVERY_QUEUE` | Queue | Delivery fan-out |
-| `CONFIG_KV` | KV | Hot config cache (poll schedule, last-poll timestamps) |
+There is no production `wrangler.toml`.  The Deno entrypoint in
+`src/deno/main.ts` shims the old Worker binding names onto host resources:
+
+| Name in code | Actual resource | Purpose |
+|--------------|-----------------|---------|
+| `DB` | Host SQLite `/data/congress-trade/db.sqlite` (libsql) | Structured store (filers, filings, transactions, …) |
+| `CONFIG_KV` | Deno KV `/data/congress-trade/kv.sqlite` | Hot config cache (poll schedule, last-poll timestamps) |
+| `RAW_FILES` | Cloudflare R2 via S3 shim | Raw disclosure files (PDF/HTML) |
+| `INGEST_QUEUE` / `DELIVERY_QUEUE` | SQLite `deno_runtime_queue`, polled in-process | Pipeline stage hand-off and delivery fan-out |
 
 Local development variables are documented in `.dev.vars.example`, but that
 template is reference-only. From the repository root run
 `bash scripts/cloud-setup.sh`; it safely maps the Congress.Trade and shared
-Infisical machine identities from explicit environment variables or the
-optional owner-only `$HOME/.secrets/global-api-keys` file (no group/other
-permission bits) into the gitignored `.dev.vars`. The global file is parsed as
-inert assignments and never sourced.
+Infisical machine identities from explicit environment variables or, on a Mac
+with the CLI installed, `fleet-secrets get NAME` into the gitignored
+`.dev.vars`. Cloud and CI use the environment only.
 The setup also carries forward only the five documented early-init/local
 selectors (`SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE`,
 `ADMIN_OPEN_IN_DEV`, and `USAGE_MONITOR_ENVIRONMENT`) from the explicit process
@@ -188,9 +197,10 @@ Only missing or empty managed entries are populated; existing non-empty managed
 values are not overwritten. To rotate one locally, deliberately remove or empty
 its managed line before re-running setup.
 Production provider/app secrets live in Infisical and are read at runtime
-through the machine-identity resolver. Cloudflare Worker secrets should only
-need the Infisical bootstrap identity credentials after cutover; provider-key
-Worker secrets are migration fallback only. Important groups:
+through the machine-identity resolver.  Coolify should hold only the Infisical
+bootstrap identity credentials plus documented host overrides
+(`TURSO_DATABASE_URL=file:/data/congress-trade/db.sqlite`).  Provider-key env
+copies are migration fallback only.  Important groups:
 
 | Group | Variables |
 |-------|-----------|
@@ -201,9 +211,31 @@ Worker secrets are migration fallback only. Important groups:
 | Delivery | `WEBHOOK_SIGNING_KEY` |
 | Public auth/email | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`, `APP_BASE_URL`, `ALERT_EMAIL` |
 | Billing | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_ANNUAL`, `STRIPE_TRIAL_DAYS` |
+| Litestream B2 backup | `LITESTREAM_S3_BUCKET`, `LITESTREAM_S3_ENDPOINT`, `LITESTREAM_S3_REGION`, `LITESTREAM_S3_ACCESS_KEY_ID`, `LITESTREAM_S3_SECRET_ACCESS_KEY` |
 
 The admin API fails closed unless `ADMIN_TOKEN` or Cloudflare Access is
 configured. `ADMIN_OPEN_IN_DEV=true` is a local-only escape hatch.
+
+### Continuous backup (Litestream -> Backblaze B2)
+
+The Coolify `congress-app` container replicates
+`/data/congress-trade/db.sqlite` continuously to Backblaze B2
+(`jays-congress-trade-eu`) via Litestream running as a sibling process inside
+the same container — the pattern already proven by Socratic.Trade
+(`litestream.coolify.yml`) and Usage-Monitor (`litestream.yml`). See
+`app/litestream.yml` for the replica config and
+`app/scripts/start-with-litestream.sh` for the entrypoint that resolves the
+`LITESTREAM_S3_*` secrets from Infisical (reusing the app's existing
+`INFISICAL_APP_CLIENT_ID`/`INFISICAL_APP_CLIENT_SECRET` bootstrap identity)
+and execs `litestream replicate -exec "deno run ..."` as PID 1. Deliberately
+uses **separate** `LITESTREAM_S3_*` secret names rather than the app's
+existing `AWS_S3_*`/`AWS_REGION`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+secrets — those already point at Cloudflare R2 and back the `raw/`
+filing-PDF object store consumed in-process by `src/deno/main.ts`; reusing
+those names for the DB backup replica would have silently repointed PDF
+storage at the B2 bucket. When `LITESTREAM_S3_*` are absent (local/preview),
+the container falls straight through to the unmodified `deno run ...` with no
+Litestream wrapper.
 
 ---
 
@@ -211,21 +243,18 @@ configured. `ADMIN_OPEN_IN_DEV=true` is a local-only escape hatch.
 
 ```bash
 npm install
-npm run typecheck   # tsc --noEmit (must be clean)
+npm run typecheck   # deno check src/deno/main.ts
 npm run test        # vitest run
-npm run migrate     # apply D1 migrations locally
-npm run dev         # wrangler dev
-npm run deploy      # production Worker deploy using wrangler.toml
+npm run migrate     # local-only leftover Wrangler D1 helper; not production
+npm run dev         # local Deno server
+npm run deploy      # prints that Coolify owns production; does not wrangler-deploy
 ```
 
-Deployment is automated via **Cloudflare Workers Builds** (connected to this
-repo): pushes to `main` run `npm run build` then `npx wrangler deploy` with the
-**Root directory** set to `app`. The production Worker service is
-`congress-trade`. The real D1 `database_id` and `CONFIG_KV` id are committed in
-`wrangler.toml`; the queues (`congress-feed-ingest`,
-`congress-feed-delivery`, + `*-dlq`) and the R2 bucket (`congress-feed-raw`) are
-legacy backing-resource names and must already exist on the account. Runtime
-secrets are set out-of-band via `wrangler secret put` and are NOT committed.
+Pushes to `main` rebuild the Coolify compose project (`app/docker-compose.yml`
+→ `congress-app` on the production fleet box).  `npm run deploy` is a reminder, not
+a Worker publish.  Production schema is **not** automatic: after the container
+is on the new SHA, run `ADMIN_TOKEN=... bash scripts/ship.sh` or
+`POST /api/admin/migrate` against `https://congress.trade`.  Secrets come from
+Infisical, not `wrangler secret put`.
 
-Plain deploys do not apply D1 migrations. Use the deployment runbook before any
-schema change reaches production.
+See `DEPLOY.md` before any schema change reaches production.

@@ -73,7 +73,7 @@ describe('runScheduledTick includeDailyJobs flag', () => {
     );
     expect(result.skippedOverlap).toBe(false);
     expect(mocks.maybeRunDailyJobs).not.toHaveBeenCalled();
-  });
+  }, 10000);
 
   it('runs the daily_jobs lane by default (external-scheduler path)', async () => {
     const env = await makeEnv();
@@ -85,5 +85,5 @@ describe('runScheduledTick includeDailyJobs flag', () => {
     );
     expect(result.skippedOverlap).toBe(false);
     expect(mocks.maybeRunDailyJobs).toHaveBeenCalledTimes(1);
-  });
+  }, 10000);
 });

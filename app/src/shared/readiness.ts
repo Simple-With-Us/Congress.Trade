@@ -7,6 +7,9 @@ export interface ReadinessResult {
   missing: string[];
 }
 
+// idx_tx_twin_seek (0088 / #2062) is intentionally absent. Coolify
+// auto-deploy does not run POST /api/admin/migrate, and pinning that
+// index here would 503 /api/health in the deploy-before-migrate window.
 const REQUIRED_PROBES: Array<[string, string, boolean?]> = [
   ['filings', 'SELECT doc_id, first_seen_at, filed_date, page_count, raw_bytes, local_wait_expires_at FROM filings LIMIT 0'],
   ['local_worker_heartbeat', 'SELECT worker_id, last_heartbeat_at, status_json FROM local_worker_heartbeat LIMIT 0'],

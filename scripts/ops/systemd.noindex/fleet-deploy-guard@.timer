@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Coolify deploy guard for %i every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+# Stagger per app so three guards never hit the Coolify API in the same instant.
+RandomizedDelaySec=15s
+Unit=fleet-deploy-guard@%i.service
+
+[Install]
+WantedBy=timers.target

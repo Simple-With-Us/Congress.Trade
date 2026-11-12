@@ -279,7 +279,7 @@ describe('POST /subscriptions/:id/deactivate', () => {
   it('frees the creation quota: a client with max active rows can create again after deactivating', async () => {
     const app = buildAdminRouter();
     const clientId = 'integration:quota-bound';
-    const seed = Array.from({ length: 10 }, (_, i) =>
+    const seed = Array.from({ length: 2 }, (_, i) =>
       seedWebhookSub({ id: `sub_q_${i}`, client_id: clientId, secret: `whsec_seed_secret_${i}` }));
     const { env } = makeEnv(seed);
 

@@ -314,6 +314,8 @@ export async function runSenateBackfill(
         maxPages: SENATE_MAX_PAGES,
         pageSize: SENATE_PAGE_SIZE,
         kv: env.CONFIG_KV,
+        relayUrl: env.SENATE_RELAY_URL,
+        relaySecret: env.SENATE_RELAY_SECRET,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

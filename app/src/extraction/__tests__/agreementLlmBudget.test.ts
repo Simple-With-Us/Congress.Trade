@@ -208,7 +208,7 @@ describe('agreement daily LLM budget guardrail', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it('decrements (consumes) the daily counter by each resolved doc\'s read count', async () => {
-    stubUnanimous(row('AAPL', 'P', '$1,001 - $15,000'));
+    stubUnanimous(row('AAPL', 'B', '$1,001 - $15,000'));
     const { env, cap, llmBudget } = makeEnv();
 
     await handleAgreementCheck(env, 'H-1', 'raw/H-1');
@@ -221,7 +221,7 @@ describe('agreement daily LLM budget guardrail', () => {
   });
 
   it('defers at cap WITHOUT consuming an agreement attempt, escalating, or calling any model', async () => {
-    const calls = stubUnanimous(row('AAPL', 'P', '$1,001 - $15,000'));
+    const calls = stubUnanimous(row('AAPL', 'B', '$1,001 - $15,000'));
     const seeded = new Map([[todayKey(), 2]]); // already at the cap
     const { env, cap, review } = makeEnv({ llmBudget: seeded, envVars: { AGREEMENT_DAILY_LLM_BUDGET: '2' } });
 
@@ -238,7 +238,7 @@ describe('agreement daily LLM budget guardrail', () => {
   });
 
   it('"-1" is unlimited and never touches the counter', async () => {
-    stubUnanimous(row('AAPL', 'P', '$1,001 - $15,000'));
+    stubUnanimous(row('AAPL', 'B', '$1,001 - $15,000'));
     const { env, cap, llmBudget } = makeEnv({ envVars: { AGREEMENT_DAILY_LLM_BUDGET: '-1' } });
 
     await handleAgreementCheck(env, 'H-4', 'raw/H-4');
@@ -248,7 +248,7 @@ describe('agreement daily LLM budget guardrail', () => {
   });
 
   it('day rollover: a prior day pinned at its cap does not block today', async () => {
-    stubUnanimous(row('AAPL', 'P', '$1,001 - $15,000'));
+    stubUnanimous(row('AAPL', 'B', '$1,001 - $15,000'));
     const seeded = new Map([['2020-01-01', 2]]); // an old day, fully exhausted
     const { env, cap, llmBudget } = makeEnv({ llmBudget: seeded, envVars: { AGREEMENT_DAILY_LLM_BUDGET: '2' } });
 
@@ -260,7 +260,7 @@ describe('agreement daily LLM budget guardrail', () => {
   });
 
   it('0 / unset falls back to the 300/day default rather than unlimited', async () => {
-    stubUnanimous(row('AAPL', 'P', '$1,001 - $15,000'));
+    stubUnanimous(row('AAPL', 'B', '$1,001 - $15,000'));
     const { env, cap, llmBudget } = makeEnv({ envVars: { AGREEMENT_DAILY_LLM_BUDGET: '0' } });
 
     await handleAgreementCheck(env, 'H-6', 'raw/H-6');

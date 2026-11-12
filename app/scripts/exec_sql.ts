@@ -1,4 +1,4 @@
-const ADMIN_TOKEN = "***REMOVED***";
+const ADMIN_TOKEN = Deno.env.get("ADMIN_TOKEN") || "";
 const URL = "https://congress.trade/api/admin/debug-sql";
 
 async function runSql(query: string, params: any[] = []) {

@@ -1,198 +1,180 @@
-diff --git upstream/.upstream-shared/src/__tests__/brackets.test.ts vendored/app/vendor/congress-trading-shared/src/__tests__/brackets.test.ts
-index 321adec665d69cf9c8b0976c967bd1dfe08cc8a4..a665114bc03a0b1f5e087c6b120ac07553e6e21d 100644
---- upstream/.upstream-shared/src/__tests__/brackets.test.ts
-+++ vendored/app/vendor/congress-trading-shared/src/__tests__/brackets.test.ts
-@@ -7,10 +7,11 @@ import {
- } from "../brackets";
- 
- describe("STOCK Act brackets helpers", () => {
--  it("defines the canonical 10 brackets in ascending order", () => {
--    expect(STOCK_ACT_BRACKETS).toHaveLength(10);
--    expect(STOCK_ACT_BRACKETS[0]).toEqual({ min: 1001, max: 15000 });
--    expect(STOCK_ACT_BRACKETS[9]).toEqual({ min: 50000001, max: null });
-+  it("defines the canonical 11 brackets in ascending order (incl. $0–$1,000)", () => {
-+    expect(STOCK_ACT_BRACKETS).toHaveLength(11);
-+    expect(STOCK_ACT_BRACKETS[0]).toEqual({ min: 0, max: 1000 });
-+    expect(STOCK_ACT_BRACKETS[1]).toEqual({ min: 1001, max: 15000 });
-+    expect(STOCK_ACT_BRACKETS[10]).toEqual({ min: 50000001, max: null });
-     expect(Object.isFrozen(STOCK_ACT_BRACKETS)).toBe(true);
-     expect(STOCK_ACT_BRACKETS.every(Object.isFrozen)).toBe(true);
- 
-@@ -20,6 +21,7 @@ describe("STOCK Act brackets helpers", () => {
-   });
- 
-   it("matches brackets exactly", () => {
-+    expect(matchBracket(0, 1000)).toEqual({ min: 0, max: 1000 });
-     expect(matchBracket(1001, 15000)).toEqual({ min: 1001, max: 15000 });
-     expect(matchBracket(50000001, null)).toEqual({ min: 50000001, max: null });
-     expect(matchBracket(1000, 15000)).toBeNull();
-@@ -27,12 +29,17 @@ describe("STOCK Act brackets helpers", () => {
-   });
- 
-   it("validates brackets", () => {
-+    expect(isValidBracket(0, 1000)).toBe(true);
-     expect(isValidBracket(1001, 15000)).toBe(true);
-     expect(isValidBracket(50000001, null)).toBe(true);
-     expect(isValidBracket(50000, 100000)).toBe(false);
-   });
- 
-   it("finds the nearest containing bracket", () => {
-+    // Sub-$1,001 exact dollar amounts (common on House PTRs)
-+    expect(nearestBracket(0, 1000)).toEqual({ min: 0, max: 1000 });
-+    expect(nearestBracket(456, 456)).toEqual({ min: 0, max: 1000 });
-+    expect(nearestBracket(1, 999)).toEqual({ min: 0, max: 1000 });
-     // Exact snap
-     expect(nearestBracket(1001, 15000)).toEqual({ min: 1001, max: 15000 });
-     // Arbitrary containing snap
-@@ -43,8 +50,6 @@ describe("STOCK Act brackets helpers", () => {
-     expect(nearestBracket(60000000, null)).toEqual({ min: 50000001, max: null });
-     expect(nearestBracket(50000000, null)).toEqual({ min: 50000001, max: null });
-     expect(nearestBracket(1001, null)).toBeNull();
--    // Out of bounds lo
--    expect(nearestBracket(0, 1000)).toBeNull();
-     // Non-finite min
-     expect(nearestBracket(NaN, 1000)).toBeNull();
-     expect(nearestBracket(Number.POSITIVE_INFINITY, null)).toBeNull();
 diff --git upstream/.upstream-shared/src/__tests__/schemas.test.ts vendored/app/vendor/congress-trading-shared/src/__tests__/schemas.test.ts
-index dbf16b7f86375051b1d8e98469b18c13b1438093..8e51eb4d3ed84f065e576957a1e1e8f36643d95f 100644
+index f674e465bc15b4da6b741278a510017bc7aac6b9..9bc90bf8852d11525ae8f50cb071084a751d3683 100644
 --- upstream/.upstream-shared/src/__tests__/schemas.test.ts
 +++ vendored/app/vendor/congress-trading-shared/src/__tests__/schemas.test.ts
-@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
- import { z } from "zod";
- import {
-   IsoDateSchema,
-+  IsoDateTimeSchema,
-   ChamberSchema,
-   PartyBucketSchema,
-   OwnerSchema,
-@@ -77,6 +78,24 @@ describe("IsoDateSchema", () => {
+@@ -589,6 +589,74 @@ describe("TransactionsPageSchema", () => {
+     ).toBe(false);
    });
+ 
++  it("keeps live ingestion sources and the disclosure fields the read schema used to strip", () => {
++    const latency = {
++      provider: "fmp",
++      observedAt: "2026-01-16T00:00:00Z",
++      providerPublishedAt: "2026-01-16T01:00:00Z",
++      congressFirstSeenAt: "2026-01-16T00:00:10Z",
++      providerDeltaSec: 12,
++      providerPublishedDeltaSec: 50,
++      status: "matched",
++    };
++    for (const source of ["competitor_backfill", "local_mac", "server_cpu"] as const) {
++      const parsed = TransactionsPageSchema.safeParse({
++        transactions: [{
++          ...validTx,
++          source,
++          party: "D",
++          bioguideId: "P000197",
++          pdfUrl: "/api/documents/doc-1/pdf",
++          disclosureLagDays: -2,
++          stockActStatus: "on_time",
++          priceAtTrade: 10.5,
++          spxAtTrade: 5000,
++          priceAtFiling: 11,
++          spxAtFiling: 5010,
++          latency,
++        }],
++        cursor: 50,
++        count: 1,
++        total: 100,
++        limit: 20,
++      });
++      expect(parsed.success).toBe(true);
++      if (!parsed.success) continue;
++      expect(parsed.data.transactions[0]).toMatchObject({
++        source,
++        party: "D",
++        bioguideId: "P000197",
++        pdfUrl: "/api/documents/doc-1/pdf",
++        disclosureLagDays: -2,
++        stockActStatus: "on_time",
++        priceAtTrade: 10.5,
++        spxAtTrade: 5000,
++        priceAtFiling: 11,
++        spxAtFiling: 5010,
++        latency,
++      });
++    }
++    expect(TransactionsPageSchema.safeParse({
++      transactions: [{ ...validTx, source: "unknown_source" }],
++      cursor: 50,
++      count: 1,
++      total: 100,
++      limit: 20,
++    }).success).toBe(false);
++    const emptyLatency = TransactionsPageSchema.safeParse({
++      transactions: [{ ...validTx, latency: null, priceAtTrade: null }],
++      cursor: 50,
++      count: 1,
++      total: 100,
++      limit: 20,
++    });
++    expect(emptyLatency.success).toBe(true);
++    if (emptyLatency.success) {
++      expect(emptyLatency.data.transactions[0].latency).toBeNull();
++      expect(emptyLatency.data.transactions[0].priceAtTrade).toBeNull();
++    }
++  });
++
+   it("rejects read rows missing required cursor provenance", () => {
+     const { cursorSeq: _cursorSeq, ...withoutCursor } = validTx;
+     expect(TransactionsPageSchema.safeParse({
+@@ -1485,6 +1553,23 @@ describe("ClientTradeSchema", () => {
+     };
+     expect(ClientTradeSchema.safeParse(valid).success).toBe(false);
+   });
++
++  it("accepts the live ingestion sources and still rejects an invented one", () => {
++    const base = {
++      id: "trade-1",
++      cursor: 42,
++      docId: "doc-1",
++      member: { id: null, name: null, chamber: null, party: null, state: null, photoUrl: null },
++      asset: { name: "Apple Inc.", ticker: "AAPL", type: null, sector: null, marketCapBucket: null },
++      transaction: { date: null, type: "P", owner: null, amountMin: null, amountMax: null, isOption: false },
++      filing: { filedDate: null, firstSeenAt: null, sourceUrl: null },
++      confidence: 0.95,
++    };
++    for (const source of ["local_mac", "server_cpu", "competitor_backfill"] as const) {
++      expect(ClientTradeSchema.safeParse({ ...base, source }).success).toBe(true);
++    }
++    expect(ClientTradeSchema.safeParse({ ...base, source: "unknown_source" }).success).toBe(false);
++  });
  });
  
-+// =============================================================================
-+// IsoDateTimeSchema
-+// =============================================================================
-+
-+describe("IsoDateTimeSchema", () => {
-+  it("accepts valid ISO 8601 UTC date-time strings", () => {
-+    expect(IsoDateTimeSchema.safeParse("2026-07-22T14:30:00Z").success).toBe(true);
-+    expect(IsoDateTimeSchema.safeParse("2026-07-22T14:30:00.000Z").success).toBe(true);
-+  });
-+
-+  it("rejects non-ISO date-time formats", () => {
-+    expect(IsoDateTimeSchema.safeParse("2026-07-22 14:30:00").success).toBe(false);
-+    expect(IsoDateTimeSchema.safeParse("2026-07-22").success).toBe(false);
-+    expect(IsoDateTimeSchema.safeParse("invalid-datetime").success).toBe(false);
-+    expect(IsoDateTimeSchema.safeParse(12345).success).toBe(false);
-+  });
-+});
-+
  // =============================================================================
- // Enum schemas
- // =============================================================================
-@@ -842,7 +861,25 @@ describe("SharePayloadSchema", () => {
-         { ticker: "AAPL", date: "2024-01-15", ratio: 0.3, elevated: false },
-       ],
-       fundamentals: [{ ticker: "AAPL", date: "2024-01-15", peRatio: 30 }],
--      analyst: [{ ticker: "AAPL", date: "2024-01-15", rating: "Buy" }],
-+      analyst: [{ ticker: "AAPL", date: "2024-01-15", rating: "Buy", source: "fmp", asOfTimestamp: "2026-07-24T16:34:08Z" }],
-+      trades: [
-+        {
-+          docId: "H-2026-20024100",
-+          chamber: "house",
-+          source: "house_clerk",
-+          sourceUrl: "https://disclosures-clerk.house.gov/public_disc/ptr-pdf/2026/20024100.pdf",
-+          filerName: "Nancy Pelosi",
-+          ticker: "NVDA",
-+          txType: "P",
-+          transactionDate: "2026-07-15",
-+          transactionTimestamp: "2026-07-15T00:00:00Z",
-+          disclosureDate: "2026-07-22",
-+          disclosureTimestamp: "2026-07-22T14:30:00Z",
-+          extractedTimestamp: "2026-07-22T14:31:05Z",
-+          amountMin: 1000001,
-+          amountMax: 5000000,
-+        },
-+      ],
-       origin: "app-b",
-     });
-     expect(result.success).toBe(true);
-diff --git upstream/.upstream-shared/src/brackets.ts vendored/app/vendor/congress-trading-shared/src/brackets.ts
-index 08476ca3be7dc7ca445d405ce25be545a7ab3058..3c46d231641c64690cb35c35e9a6a98ae496ea94 100644
---- upstream/.upstream-shared/src/brackets.ts
-+++ vendored/app/vendor/congress-trading-shared/src/brackets.ts
-@@ -9,10 +9,13 @@ export interface AmountBracket {
- }
- 
- /**
-- * The canonical STOCK Act bracket set (ascending). The final tier ($50,000,001+)
-- * is open-ended and represented with max === null.
-+ * The canonical STOCK Act bracket set (ascending), plus a product-level
-+ * `$0 – $1,000` tier for exact sub-$1,001 dollar amounts that appear on many
-+ * House PTRs (partial sales / small lots). The final tier ($50,000,001+) is
-+ * open-ended and represented with max === null.
-  */
- export const STOCK_ACT_BRACKETS: readonly AmountBracket[] = Object.freeze([
-+  Object.freeze({ min: 0, max: 1_000 }),
-   Object.freeze({ min: 1_001, max: 15_000 }),
-   Object.freeze({ min: 15_001, max: 50_000 }),
-   Object.freeze({ min: 50_001, max: 100_000 }),
 diff --git upstream/.upstream-shared/src/schemas.ts vendored/app/vendor/congress-trading-shared/src/schemas.ts
-index 7d27ba9121240e1744c3066ccb021e9a585ca524..139619a5d9f02d1c546512ed674e5a5c5bbf95ac 100644
+index 864d19dbddb151699a6159c9075b0869556bf691..d93105f2c282d299126f163d277832bdcd3f142c 100644
 --- upstream/.upstream-shared/src/schemas.ts
 +++ vendored/app/vendor/congress-trading-shared/src/schemas.ts
-@@ -11,6 +11,11 @@ export const IsoDateSchema = z.string().refine(isIsoDate, {
-   message: "Expected a valid YYYY-MM-DD date",
- });
+@@ -37,6 +37,16 @@ export const TxTypeSchema = z
+   .transform((v): "B" | "S" | "E" => (v === "P" ? "B" : v));
+ export type TxType = "B" | "S" | "E";
  
-+export const IsoDateTimeSchema = z.string().datetime({
-+  message: "Expected a valid ISO 8601 UTC date-time string (e.g., 2026-07-22T14:30:00Z)",
-+});
-+export type IsoDateTime = z.infer<typeof IsoDateTimeSchema>;
++/** Provenance values ingestion already writes.  Do not add sources that no writer emits. */
++export const TxSourceSchema = z.enum([
++  "primary",
++  "seed_dataset",
++  "manual",
++  "competitor_backfill",
++  "local_mac",
++  "server_cpu",
++]);
 +
- // "executive" covers OGE Form 278-T presidential/VP filers — the
- // executive-branch analogue of congressional STOCK Act disclosures.
- export const ChamberSchema = z.enum(["house", "senate", "executive"]);
-@@ -218,9 +223,34 @@ export const AnalystRowSchema = z.object({
-   analystCount: nullAsUndefined(z.number()),
-   source: nullAsUndefined(z.string()),
-   updatedAt: z.string().optional(),
-+  asOfTimestamp: nullAsUndefined(z.string()),
+ export const AssetTypeCategorySchema = z.enum([
+   "public_equity",
+   "private_equity",
+@@ -137,7 +147,7 @@ export const CongressTransactionSchema = z.object({
+   description: z.string().nullable().optional(),
+   supplementalText: z.string().nullable().optional(),
+   confidence: z.number().optional(),
+-  source: z.enum(["primary", "seed_dataset", "manual"]).optional(),
++  source: TxSourceSchema.optional(),
+   rowKey: z.string().nullable().optional(),
+   createdAt: z.string().optional(),
+   cursorSeq: z.number().int().nonnegative().optional(),
+@@ -156,13 +166,36 @@ export const CongressTransactionSchema = z.object({
+   refCountry: z.string().nullable().optional(),
+   refExchangeShort: z.string().nullable().optional(),
+   refAssetClass: z.string().nullable().optional(),
++  /** Raw `filers.party`.  Not a display label. */
++  party: z.string().nullable().optional(),
++  bioguideId: z.string().nullable().optional(),
++  pdfUrl: z.string().nullable().optional(),
++  disclosureLagDays: z.number().nullable().optional(),
++  stockActStatus: z.enum(["on_time", "late", "severely_late"]).nullable().optional(),
++  priceAtTrade: z.number().nullable().optional(),
++  spxAtTrade: z.number().nullable().optional(),
++  priceAtFiling: z.number().nullable().optional(),
++  spxAtFiling: z.number().nullable().optional(),
++  /**
++   * One `trade_latency_candidates` row for this trade.  `observedAt` is
++   * `provider_first_seen_at`.  The delta fields are computed, not stored columns.
++   */
++  latency: z.object({
++    provider: z.string().nullable(),
++    observedAt: z.string().nullable(),
++    providerPublishedAt: z.string().nullable(),
++    congressFirstSeenAt: z.string().nullable(),
++    providerDeltaSec: z.number().nullable(),
++    providerPublishedDeltaSec: z.number().nullable(),
++    status: z.string().nullable(),
++  }).nullable().optional(),
  });
- export type AnalystRow = z.infer<typeof AnalystRowSchema>;
+ export type CongressTransaction = z.infer<typeof CongressTransactionSchema>;
  
-+export const TradeEventRowSchema = z.object({
-+  docId: z.string(),
-+  chamber: ChamberSchema,
-+  source: z.string(),
-+  sourceUrl: nullAsUndefined(z.string()),
-+  filerName: z.string(),
-+  filerId: nullAsUndefined(z.string()),
-+  party: nullAsUndefined(z.string()),
-+  state: nullAsUndefined(z.string()),
-+  district: nullAsUndefined(z.string()),
-+  ticker: z.string(),
-+  assetType: nullAsUndefined(z.string()),
-+  assetDescription: nullAsUndefined(z.string()),
-+  txType: z.string(),
-+  transactionDate: IsoDateSchema,
-+  transactionTimestamp: nullAsUndefined(z.string()),
-+  disclosureDate: nullAsUndefined(IsoDateSchema),
-+  disclosureTimestamp: nullAsUndefined(z.string()),
-+  extractedTimestamp: nullAsUndefined(z.string()),
-+  amountMin: nullAsUndefined(z.number()),
-+  amountMax: nullAsUndefined(z.number()),
-+});
-+export type TradeEventRow = z.infer<typeof TradeEventRowSchema>;
-+
- export const InsiderRowSchema = z.object({
-   ticker: z.string(),
-   date: IsoDateSchema,
-@@ -273,6 +303,7 @@ export const SharePayloadSchema = z.object({
-   shortVolume: z.array(ShortVolumeRowSchema).optional(),
-   fundamentals: z.array(FundamentalRowSchema).optional(),
-   analyst: z.array(AnalystRowSchema).optional(),
-+  trades: z.array(TradeEventRowSchema).optional(),
-   origin: z.string().optional(),
+ /** Full transaction row returned by the cursor-paginated REST read endpoint. */
+ export const CongressTransactionReadSchema = CongressTransactionSchema.extend({
+   confidence: z.number(),
+-  source: z.enum(["primary", "seed_dataset", "manual"]),
++  source: TxSourceSchema,
+   createdAt: z.string(),
+   cursorSeq: z.number().int().nonnegative(),
  });
- export type SharePayload = z.infer<typeof SharePayloadSchema>;
+@@ -590,7 +623,7 @@ export const ClientTradeSchema = z.object({
+   transaction: ClientTransactionSchema,
+   filing: ClientFilingSchema,
+   confidence: z.number(),
+-  source: z.enum(["primary", "seed_dataset", "manual"]),
++  source: TxSourceSchema,
+ });
+ export type ClientTrade = z.infer<typeof ClientTradeSchema>;
+ 

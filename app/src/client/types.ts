@@ -60,6 +60,7 @@ export type MemberProfileRow = {
   district: string | null;
   committees: string | null;
   photo_url: string | null;
+  resolved_bioguide_id?: string | null;
 };
 
 export type ResolvedMember = {

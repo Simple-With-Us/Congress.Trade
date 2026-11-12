@@ -72,7 +72,7 @@ describe('VisionLlmExtractor', () => {
           assetName: 'Apple Inc.',
           ticker: 'aapl',
           assetType: 'ST',
-          txType: 'P',
+          txType: 'B',
           amountRange: '$1,001 - $15,000',
           isOption: false,
           capGainsOver200: false,
@@ -279,14 +279,14 @@ describe('fetchWithRetry', () => {
 
 describe('salvageTruncatedTransactions', () => {
   it('recovers complete leading rows from a truncated bare array and drops the trailing partial row', () => {
-    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Microsoft","txType":"S","amountRange":"$15,001 - $50,00';
+    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Microsoft","txType":"S","amountRange":"$15,001 - $50,00';
     const rows = salvageTruncatedTransactions(text);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ ticker: 'AAPL' });
   });
 
   it('recovers rows nested inside a wrapper object ({"transactions": [...]}) even when truncated', () => {
-    const text = '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Microsoft","txType":"S","amountRange":"$15,00';
+    const text = '{"transactions":[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Microsoft","txType":"S","amountRange":"$15,00';
     const rows = salvageTruncatedTransactions(text);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ ticker: 'AAPL' });
@@ -294,7 +294,7 @@ describe('salvageTruncatedTransactions', () => {
 
   it('recovers every row from a complete, well-formed array (same result as a normal parse)', () => {
     const text = JSON.stringify([
-      { ticker: 'AAPL', assetName: 'Apple Inc.', txType: 'P', amountRange: '$1,001 - $15,000' },
+      { ticker: 'AAPL', assetName: 'Apple Inc.', txType: 'B', amountRange: '$1,001 - $15,000' },
       { ticker: 'MSFT', assetName: 'Microsoft', txType: 'S', amountRange: '$15,001 - $50,000' },
     ]);
     const rows = salvageTruncatedTransactions(text);
@@ -303,7 +303,7 @@ describe('salvageTruncatedTransactions', () => {
   });
 
   it('drops a row truncated mid-string value even though brace counting alone would look balanced', () => {
-    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Microsoft is a tech compan';
+    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Microsoft is a tech compan';
     const rows = salvageTruncatedTransactions(text);
     expect(rows).toHaveLength(1);
     expect(rows[0].ticker).toBe('AAPL');
@@ -319,7 +319,7 @@ describe('salvageTruncatedTransactions', () => {
   });
 
   it('strips a fenced ```json code block before scanning', () => {
-    const text = '```json\n[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"}]\n```';
+    const text = '```json\n[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"}]\n```';
     const rows = salvageTruncatedTransactions(text);
     expect(rows).toHaveLength(1);
   });
@@ -327,13 +327,13 @@ describe('salvageTruncatedTransactions', () => {
 
 describe('parseTruncationAwareJson', () => {
   it('parses complete JSON normally regardless of stop_reason', () => {
-    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"}]';
+    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"}]';
     expect(parseTruncationAwareJson(text, false)).toEqual({ rows: JSON.parse(text), salvaged: false });
     expect(parseTruncationAwareJson(text, true)).toEqual({ rows: JSON.parse(text), salvaged: false });
   });
 
   it('salvages complete leading rows when stop_reason is max_tokens and the JSON is truncated', () => {
-    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro';
+    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro';
     const result = parseTruncationAwareJson(text, true);
     expect(result.salvaged).toBe(true);
     expect(result.rows).toHaveLength(1);
@@ -341,7 +341,7 @@ describe('parseTruncationAwareJson', () => {
   });
 
   it('still throws on truncated JSON when stop_reason is not max_tokens (genuine parse failure)', () => {
-    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro';
+    const text = '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro';
     expect(() => parseTruncationAwareJson(text, false)).toThrow();
     expect(() => parseTruncationAwareJson(text, false)).toThrow();
   });
@@ -359,7 +359,7 @@ describe('markSalvaged', () => {
     assetName: 'Apple Inc.',
     ticker: 'AAPL',
     assetType: null,
-    txType: 'P',
+    txType: 'B',
     amountMin: 1001,
     amountMax: 15000,
     isOption: false,

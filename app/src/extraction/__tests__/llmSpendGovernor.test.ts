@@ -74,7 +74,7 @@ describe('runCandidateOnDoc under the USD ceiling governor', () => {
         ({
           ok: true,
           json: async () => ({
-            choices: [{ message: { content: '[{"assetName":"Apple Inc.","ticker":"AAPL","txType":"P","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]' } }],
+            choices: [{ message: { content: '[{"assetName":"Apple Inc.","ticker":"AAPL","txType": "B","amountRange":"$1,001 - $15,000","isOption":false,"capGainsOver200":false,"confidence":0.9}]' } }],
             usage: { prompt_tokens: 1000, completion_tokens: 100 },
           }),
         }) as unknown as Response,

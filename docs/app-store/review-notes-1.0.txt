@@ -1,0 +1,49 @@
+GUIDELINE 2.1 — APP REVIEW INFORMATION (Congress.Trade iOS 1.0)
+
+1) SCREEN RECORDING
+Attached: physical iPhone 16 Pro Max, iOS 27.0.  Starts at launch.  Walks Trends, Trades, Directory, Delivery, and Account.  It signs in and out, and shows Delivery both with methods configured and with none.  Premium sheet: monthly $8.99, annual $79.99, 1-week free trial, Restore, Terms, Privacy.
+
+2) DEVICES AND OPERATING SYSTEMS TESTED
+- Jay's iPhone (iPhone 16 Pro Max, iPhone17,2), iOS 27.0 — physical; this recording
+- iPhone 17 Pro Simulator, current Xcode iOS runtime
+- iPhone 16 Simulator, iOS 17+ compile and unit tests
+Minimum OS is iOS 17.0.  The binary under review is TestFlight 1.0.15, build 202608150702.
+
+3) FUNCTIONS AND TARGET AUDIENCE
+Congress.Trade is a live feed of publicly disclosed U.S. stock trades from the House, Senate, and Executive Branch (OGE 278-T).  Audience: journalists, researchers, and anyone who wants official STOCK Act / OGE disclosures without a third-party Congress-trading API.  Problem: most apps reskin one commercial data feed.  Value: we ingest official House, Senate, and Executive filings ourselves and publish the feed.  Free: browse trades, people, tickers, and analytics.  Premium: original filing PDFs, full-history CSV, and webhook/SSE delivery.  Educational only — not investment advice.  Amounts are disclosed ranges.
+
+4) HOW TO ACCESS MAIN FEATURES
+No login is required for the core product.  Launch the app.  Trends, Trades, and Directory are public.
+
+To create an account (optional, for Delivery / Premium / alerts):
+- Tap Menu (top right) and use Sign in with Apple (recommended for review) or Sign in with Google.
+There is no password.  demoAccountRequired is false because Sign in with Apple with the reviewer's own Apple ID is the intended path.
+
+After sign-in: Menu → Premium shows trade.congress.premium.monthly ($8.99/mo after a 1-week free trial) and trade.congress.premium.annual ($79.99/yr after a 1-week free trial), Restore Purchases, Terms of Use, and Privacy Policy.  Use a sandbox Apple ID to complete a purchase.  Sign Out is on the Account sheet.
+
+Account deletion: signed-in users tap Menu → Delete Account, confirm, and the app signs them out.  The backend deletes the account, sessions, push devices, delivery subscriptions, and personal information.  Email support@congress.trade remains an alternate path.  The app has no user-generated posts, comments, or profiles, so there is no report/block UI.
+
+5) EXTERNAL SERVICES
+- Congress.Trade backend (https://congress.trade) — feed, sessions, entitlements
+- Sign in with Apple; optional Google OAuth; transactional email for magic links
+- Apple In-App Purchase / StoreKit 2 for iOS Premium (web Premium uses Stripe at Congress.Trade; iOS does not take web payments).  Delivery and the empty StoreKit catalog do not link to website checkout.  Existing Stripe subscribers manage via the billing portal; Apple subscribers manage on the App Store.
+- Apple Push Notification service for optional Trade Disclosure Alerts
+- Official public sources: House PTR, Senate eFD, OGE 278-T
+- Market quotes for analytics/latency: Financial Modeling Prep
+- Cloudflare R2 for original filing PDFs (Premium)
+No in-app AI chat.  Extraction models run only on our backend for filing OCR.
+
+6) REGIONAL DIFFERENCES
+None.  Features, Apple-equalized Premium prices, and the public U.S. disclosure corpus are the same in every App Store territory.
+
+7) REGULATED INDUSTRY / THIRD-PARTY MATERIAL
+Not a broker, bank, or advisor.  Content is public U.S. government disclosure data (STOCK Act / OGE 278-T).  App Store Connect content-rights declaration is DOES_NOT_USE_THIRD_PARTY_CONTENT.  No licensed third-party dataset is required.
+
+SENSITIVE PERMISSIONS
+The app does not request location, contacts, camera, microphone, or App Tracking Transparency.  The only runtime prompt is optional push notifications (Menu → Trade Disclosure Alerts, or Delivery).  Encryption is standard HTTPS + Keychain.  ITSAppUsesNonExemptEncryption is false.
+
+CONTACT
+Jay Wedgeworth — mail@jays.services — +1 956 420 0244
+Support: https://Congress.Trade
+Privacy: https://Congress.Trade/privacy-policy
+Terms: https://Congress.Trade/terms-of-service

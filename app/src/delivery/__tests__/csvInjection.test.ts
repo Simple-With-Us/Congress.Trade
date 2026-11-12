@@ -49,7 +49,7 @@ const maliciousRow = {
   asset_name: '=HYPERLINK("https://evil.example","claim your refund")',
   ticker: '@SUM(1+1)',
   asset_type: 'stock',
-  tx_type: 'P',
+  tx_type: 'B',
   amount_min: 1001,
   amount_max: 15000,
   is_option: 0,
@@ -63,15 +63,41 @@ const maliciousRow = {
   __member_name: '=cmd|/c calc!A0',
 };
 
+/** Premium session so export is authorized (CSV is Premium-gated). */
 function fakeEnv(): Env {
   return {
-    CONFIG_KV: { get: async () => null, put: async () => {}, delete: async () => {} },
+    CONFIG_KV: {
+      get: async (key: string) => {
+        if (key === 'sess:premium-token') return JSON.stringify({ userId: 'user_premium' });
+        return null;
+      },
+      put: async () => {},
+      delete: async () => {},
+    },
     DB: {
       prepare: (sql: string) => ({
-        bind() {
+        params: [] as unknown[],
+        bind(...params: unknown[]) {
+          this.params = params;
           return this;
         },
         async first() {
+          if (/SELECT \* FROM users WHERE id = \?/i.test(sql)) {
+            const id = String(this.params[0] ?? '');
+            if (id !== 'user_premium') return null;
+            return {
+              id,
+              email: 'premium@example.com',
+              name: 'Premium',
+              picture: null,
+              google_sub: null,
+              email_verified: 1,
+              created_at: '2026-01-01T00:00:00.000Z',
+              last_login_at: null,
+              subscription_status: 'active',
+              plan: 'monthly',
+            };
+          }
           return null;
         },
         async all() {
@@ -88,7 +114,11 @@ function fakeEnv(): Env {
 describe('GET /export/transactions.csv neutralizes hostile filing values', () => {
   it('quotes formula-leading member/asset/ticker cells but not amounts', async () => {
     const app = buildRestRouter();
-    const res = await app.request('http://localhost/export/transactions.csv', {}, fakeEnv());
+    const res = await app.request(
+      'http://localhost/export/transactions.csv',
+      { headers: { authorization: 'Bearer premium-token' } },
+      fakeEnv(),
+    );
     expect(res.status).toBe(200);
     const csv = await res.text();
     const dataLine = csv.split('\r\n')[1];

@@ -1,5 +1,9 @@
 # FMP Senate historical recovery
 
+> **Current shape (2026-08):** Deno Deploy and Turso are retired.  Production
+> is Coolify + local SQLite.  The Deno/Turso copy described below is 2026-07
+> history.
+
 ## Summary
 
 The Deno/Turso migration copied the legacy community seed (7,133 Senate rows

@@ -107,7 +107,7 @@ same `--commit-every` default).
 
 ## Production runbook (requires host SSH access — pending fleet request)
 
-Prod DB lives on the Oracle ARM64 host (`141.148.182.224`) at
+Prod DB lives on the production Coolify host (see `fleet-ops:ATTACK-MAP.md`) at
 `/data/congress-trade/db.sqlite` (local SQLite file; the Deno app reads/writes
 it live). The loader is write-safe alongside the app (per-ticker transactions,
 `INSERT OR IGNORE`, busy-timeout 60s), but run it in a `tmux`/`nohup` session —

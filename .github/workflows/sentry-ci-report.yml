@@ -3,19 +3,22 @@ name: Sentry CI Report
 # Fleet-wide CI observability: receives completion events from the observed
 # workflows, but only reserves a runner for failures or scheduled check-ins.
 # It reports those actionable events to the shared `fleet-infra` Sentry project
-# (org jays-services). ADDITIVE ONLY — this file must never modify the behavior
+# (org simple-with-us). ADDITIVE ONLY — this file must never modify the behavior
 # of the workflows it observes.
 #
 # Two independent signals per completed run:
 #   1. On conclusion == failure: a Sentry error event, tagged with
 #      {app, workflow, branch, actor}, carrying the run URL, fingerprinted on
-#      [app, workflow, branch] so repeated failures on the same branch group
-#      together instead of paging separately every time. The `app` tag +
+#      [app, workflow] so every failure of one workflow groups into ONE Sentry
+#      issue instead of paging separately every time. The branch is a TAG only,
+#      never a fingerprint component (it was until 2026-08-12, which minted a
+#      permanent issue per feature branch — ~85 of the fleet's unresolved
+#      fleet-infra issues). The `app` tag +
 #      fingerprint component are REQUIRED here (not in the Socratic.Trade
 #      copy): the fleet-infra project is shared across repos, and this repo
 #      shares workflow names ("CI", "Deploy", "Security") with Socratic.Trade,
 #      so without `app` a "CI" failure here would dedup into the same Sentry
-#      issue as a "CI" failure there. See AGENT-SYNC.md "Observability".
+#      issue as a "CI" failure there. See FLEET-PROTOCOL.md "Observability".
 #   2. On event == schedule (i.e. the completed run was a cron-triggered
 #      run of a workflow that defines `schedule:`): a Sentry Crons check-in
 #      (ok on success, error on failure) with an upsert monitor_config whose
@@ -43,10 +46,15 @@ name: Sentry CI Report
 #     scripts/sentry-ci-report.py (margin/runtime tuned for a 5-min cadence).
 #
 # Cron schedules mirrored for the check-in step (must match the source
-# workflow's `schedule:` block; keep in sync if those change):
+# workflow's `schedule:` block AND its `name:`; keep in sync if those change).
+# The reporter validates these keys against the real workflow names on every
+# run and raises a Sentry issue on drift, so a rename cannot silently kill a
+# monitor the way "Shared package pin check" did between 2026-07-27 and
+# 2026-08-12:
+#   CI                       -> "23 * * * *"  (ci.yml, hourly backstop tick)
 #   Effort Issues Sync       -> "12 6 * * *"  (effort-issues-sync.yml, daily)
 #   Security                 -> "41 10 * * 1" (security.yml, Mondays)
-#   Shared package pin check -> "0 13 * * 1"  (shared-package-pin-check.yml, Mondays)
+#   Shared Package Pin Check -> "0 13 * * 1"  (shared-package-pin-check.yml, Mondays)
 
 on:
   workflow_run:
@@ -62,7 +70,8 @@ on:
       - Effort Issues Sync
       - Shared Package Pin Check
       - Security
-    types: [completed]
+      - Sentry Deploy
+    types: [requested, completed]
 
 permissions:
   contents: read
@@ -80,11 +89,15 @@ jobs:
   # error check-ins.
   report:
     if: >-
-      github.event.workflow_run.conclusion == 'failure' ||
+      (github.event.action == 'requested' && github.event.workflow_run.event == 'schedule') ||
+      (github.event.action == 'completed' && (github.event.workflow_run.conclusion == 'failure' ||
       github.event.workflow_run.conclusion == 'timed_out' ||
       github.event.workflow_run.conclusion == 'startup_failure' ||
-      github.event.workflow_run.event == 'schedule'
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "oracle-ci"]') || 'ubuntu-latest' }}
+      github.event.workflow_run.event == 'schedule'))
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout (for the reporter script only; does not touch observed workflows)
@@ -94,12 +107,14 @@ jobs:
         # script rather than whatever version lives on an arbitrary (possibly fork/PR) branch that
         # triggered the observed workflow. Do not add `ref: ${{ github.event.workflow_run.head_sha }}`
         # without re-reviewing the security implications.
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Report failure + cron check-in to Sentry fleet-infra
         shell: bash
         env:
           SENTRY_FLEET_DSN: ${{ secrets.SENTRY_FLEET_DSN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          WORKFLOW_RUN_ACTION: ${{ github.event.action }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
           WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           WORKFLOW_EVENT: ${{ github.event.workflow_run.event }}
@@ -107,4 +122,5 @@ jobs:
           WORKFLOW_ACTOR: ${{ github.event.workflow_run.actor.login }}
           WORKFLOW_RUN_URL: ${{ github.event.workflow_run.html_url }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: python3 scripts/sentry-ci-report.py

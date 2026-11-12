@@ -145,4 +145,13 @@ describe('checkReadiness', () => {
     }; } } as unknown as D1Database;
     expect((await checkReadiness(db)).missing).toEqual(['idx_ingestion_outbox_ready']);
   });
+
+  it('does not require idx_tx_twin_seek (0088 is migrate-only; Coolify auto-deploy does not run it)', async () => {
+    expect(await checkReadiness(dbMissing('idx_tx_twin_seek'))).toEqual({
+      ok: true,
+      db: true,
+      schema: true,
+      missing: [],
+    });
+  });
 });

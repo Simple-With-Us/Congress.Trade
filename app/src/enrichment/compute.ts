@@ -73,10 +73,10 @@ export function mergeRefs(ticker: string, partials: Array<Partial<SecurityRef> |
       if (k === 'ticker' || k === 'source') continue;
       const v = p[k];
       if (k === 'isEtf' || k === 'isAdr') {
-        if (v === true) (out as unknown as Record<string, unknown>)[k] = true;
+        if (v === true) (out as unknown as Record<string, unknown>)[k as string] = true;
         continue;
       }
-      if (v != null && v !== '') (out as unknown as Record<string, unknown>)[k] = v;
+      if (v != null && v !== '') (out as unknown as Record<string, unknown>)[k as string] = v;
     }
   }
   out.companyName = normalizeCompanyName(out.companyName);

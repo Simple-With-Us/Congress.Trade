@@ -141,6 +141,44 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/BlockedAgent" }
         "429": { $ref: "#/components/responses/RowBudgetExceeded" }
+  /api/transactions/retractions:
+    get:
+      tags: [Feed]
+      summary: Cursor-paged trade.retract feed (transactions taken off the feed)
+      description: |
+        One entry per deprecation of a published transaction (admin
+        unpublish, reject, republish retirement, amendment supersede).
+        Same access as `/api/transactions`: public, CORS-readable, and the
+        same per-IP daily row budget.  Poll forward by feeding `cursor` back
+        as `since` (the retraction cursor, independent of `cursor_seq`).
+        Entries whose transaction was later revived are omitted; the revived
+        row returns through `/api/transactions` with a new `cursorSeq`.
+        Not an alert; consumers should hide or delete the trade, not notify.
+        See docs/trade-retractions.md.
+      operationId: listRetractions
+      parameters:
+        - name: since
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        "200":
+          description: Page of retractions, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [retractions, cursor, hasMore]
+                properties:
+                  retractions:
+                    type: array
+                    items: { $ref: "#/components/schemas/TradeRetraction" }
+                  cursor: { type: integer, description: Largest retraction seq scanned; feed back as `since`. }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RowBudgetExceeded" }
   /api/export/transactions.csv:
     get:
       tags: [Feed]
@@ -167,7 +205,10 @@ paths:
       description: |
         Server-Sent Events stream of `trade.new` events. Resume via `?since=`
         (cursor_seq) or the standard `Last-Event-ID` header; replay is
-        gap-free from the full transactions table. Requires the subscription
+        gap-free from the full transactions table.  Also carries
+        `event: trade.retract` frames (no `id:` line) resumable via
+        `?retractSince=`; the opening `retract-cursor` frame and the
+        `reconnect` frame's `retractSince` give the resume point. Requires the subscription
         secret — as `Authorization: Bearer`, `X-Subscription-Secret`, or the
         `token` query parameter (the query form exists for browser
         EventSource, which cannot set headers).
@@ -184,6 +225,10 @@ paths:
           in: query
           schema: { type: string }
           description: Subscription secret (EventSource fallback).
+        - name: retractSince
+          in: query
+          schema: { type: integer, minimum: 0 }
+          description: Retraction cursor to resume trade.retract frames from (default live tail).
       responses:
         "200":
           description: text/event-stream of trade.new events (id = cursor_seq).
@@ -247,7 +292,7 @@ paths:
           description: Logo image bytes (edge-cached).
           content:
             image/*: {}
-        "404": { description: No logo available; clients should fall back to a monogram. }
+        "204": { description: No logo available (cacheable miss); clients should fall back to a monogram. }
   /api/members:
     get:
       tags: [Feed]
@@ -1077,7 +1122,8 @@ paths:
         A duplicate submission replays the winning row (`replayed: true`,
         200); a stale in-flight row (owner presumed dead, >2 min) is reclaimed
         and re-run. Implemented types: `update_preferences`,
-        `create_subscription`, `update_subscription`. `start_checkout` and
+        `create_subscription`, `update_subscription`, `delete_subscription`,
+        `delete_account`. `start_checkout` and
         `request_export` are defined but currently return 501.
       operationId: clientSubmitCommand
       security: [{ sessionCookie: [] }, { bearerSession: [] }]
@@ -1095,7 +1141,7 @@ paths:
               properties:
                 type:
                   type: string
-                  enum: [update_preferences, create_subscription, update_subscription, start_checkout, request_export]
+                  enum: [update_preferences, create_subscription, update_subscription, delete_subscription, start_checkout, request_export, delete_account]
                 payload: { type: object }
                 idempotencyKey: { type: string }
       responses:
@@ -1209,8 +1255,8 @@ components:
     txType:
       name: type
       in: query
-      schema: { type: string, enum: [P, S, E] }
-      description: Purchase / Sale / Exchange.
+      schema: { type: string, enum: [B, S, E] }
+      description: "Buy / Sell / Exchange (codes B|S|E). Legacy P accepted and treated as Buy."
     from:
       name: from
       in: query
@@ -1234,8 +1280,13 @@ components:
     party:
       name: party
       in: query
-      schema: { type: string, enum: [D, R, I] }
-      description: Party bucket filter.
+      schema: { type: string, example: "D,R", description: "One or a comma-separated list of D, R, O." }
+      description: >-
+        Party bucket filter, CSV multi-select (`D`, `R`, `O`).  `O` is
+        "Other / No party": Independents, minor parties and filers with no party
+        on file (executive-branch and manual filers, seed rows).  The three
+        buckets partition the data, so `party=D,R,O` returns exactly what no
+        party filter returns.
     source:
       name: source
       in: query
@@ -1310,6 +1361,14 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
   schemas:
+    TradeRetraction:
+      type: object
+      required: [retractSeq, txId, docId, retractedAt]
+      properties:
+        retractSeq: { type: integer, description: Retraction cursor. }
+        txId: { type: string }
+        docId: { type: string }
+        retractedAt: { type: string, description: When the row was deprecated (ISO 8601). }
     Error:
       type: object
       properties:
@@ -1343,15 +1402,38 @@ components:
         photoUrl: { type: string, nullable: true }
         ticker: { type: string, nullable: true }
         assetName: { type: string, nullable: true }
-        txType: { type: string, enum: [P, S, E], nullable: true, description: "null = disclosed side did not parse; render as unknown." }
+        txType: { type: string, enum: [B, S, E], nullable: true, description: "B=Buy S=Sell E=Exchange. null = disclosed side did not parse; render as unknown. Legacy P coerced to B." }
         txDate: { type: string, format: date, nullable: true }
         amountMin: { type: number, nullable: true }
         amountMax: { type: number, nullable: true }
         owner: { type: string, nullable: true }
-        source: { type: string }
+        source:
+          type: string
+          enum: [primary, seed_dataset, manual, competitor_backfill, local_mac, server_cpu]
         confidence: { type: number }
         cursorSeq: { type: integer }
         createdAt: { type: string, format: date-time }
+        party: { type: string, nullable: true, description: Raw filer party.  Not a display label. }
+        bioguideId: { type: string, nullable: true }
+        pdfUrl: { type: string, nullable: true }
+        disclosureLagDays: { type: number, nullable: true }
+        stockActStatus: { type: string, enum: [on_time, late, severely_late], nullable: true }
+        priceAtTrade: { type: number, nullable: true }
+        spxAtTrade: { type: number, nullable: true }
+        priceAtFiling: { type: number, nullable: true }
+        spxAtFiling: { type: number, nullable: true }
+        latency:
+          type: object
+          nullable: true
+          description: One trade_latency_candidates row.  observedAt is provider_first_seen_at.  Lag seconds are computed, not stored columns.
+          properties:
+            provider: { type: string, nullable: true }
+            observedAt: { type: string, nullable: true }
+            providerPublishedAt: { type: string, nullable: true }
+            congressFirstSeenAt: { type: string, nullable: true }
+            providerDeltaSec: { type: number, nullable: true }
+            providerPublishedDeltaSec: { type: number, nullable: true }
+            status: { type: string, nullable: true }
     PublicFiling:
       type: object
       properties:
@@ -1378,7 +1460,10 @@ components:
         members:
           type: array
           items: { type: string }
-          description: Filer ids (max 50).
+          description: >-
+            Filer ids or member names (max 50).  Names are resolved to filer ids on
+            create/update and stored as ids; a name that matches no member, or more
+            than one, is rejected with 400 (`error` plus `unresolvedMembers`).
         tickers:
           type: array
           items: { type: string }
@@ -1390,7 +1475,7 @@ components:
         maxAmount: { type: number, minimum: 0 }
         sides:
           type: array
-          items: { type: string, enum: [P, S, E] }
+          items: { type: string, enum: [B, S, E] }
         sectors:
           type: array
           items: { type: string }
@@ -1474,7 +1559,7 @@ components:
         transaction:
           type: object
           properties:
-            type: { type: string, enum: [P, S, E], nullable: true, description: "null = unknown side; do not render as Purchase." }
+            type: { type: string, enum: [B, S, E], nullable: true, description: "Storage codes B=Buy, S=Sell, E=Exchange. null = unknown side. Legacy P is coerced to B on read/write." }
             date: { type: string, format: date, nullable: true }
             amountMin: { type: number, nullable: true }
             amountMax: { type: number, nullable: true }
@@ -1532,7 +1617,7 @@ components:
         userId: { type: string }
         type:
           type: string
-          enum: [update_preferences, create_subscription, update_subscription, start_checkout, request_export]
+          enum: [update_preferences, create_subscription, update_subscription, delete_subscription, start_checkout, request_export, delete_account]
         status:
           type: string
           enum: [queued, running, succeeded, failed, canceled]

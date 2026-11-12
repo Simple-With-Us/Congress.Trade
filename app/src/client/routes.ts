@@ -10,9 +10,11 @@ import { Hono } from 'hono';
 import type { ClientCommand, Env, User, ClientCommandType } from '../shared/types.ts';
 
 import { getCurrentUserFromRequest } from '../auth/session.ts';
-import { entitlementOf } from '../billing/entitlement.ts';
+import { resolveEntitlementAsync } from '../billing/entitlement.ts';
 import { normalizeTickerLogoSymbol } from '../ui/tickerLogos.ts';
 import { serveDocumentPdf } from '../delivery/rest.ts';
+import { describeSubscriptionMembers } from '../delivery/subscriptions.ts';
+import { redeemAppleEntitlementAnonymously } from './entitlements.ts';
 import {
   claimCommandResultSecret,
   createCommand,
@@ -34,6 +36,7 @@ import {
   filtersFromQuery,
   detailLimit,
   asOrder,
+  asSort,
   num,
   str,
   baseSummary,
@@ -51,18 +54,54 @@ import {
   resolveMember,
   tickerSummarySql,
 } from './queries.ts';
-import { commandType, mergeClaimedSecret, normalizePreferencePatch } from './commands.ts';
-import { checkRowBudget, spendRowBudget } from '../security/botDefense.ts';
+import {
+  commandType,
+  executeQueuedCommand,
+  INLINE_COMMAND_BUDGET_MS,
+  mergeClaimedSecret,
+  normalizePreferencePatch,
+} from './commands.ts';
+import { tickerAnalytics, wantsAnalytics } from './tickerAnalytics.ts';
+import { checkRowBudget, spendRowBudget, MAX_PUBLIC_TX_OFFSET } from '../security/botDefense.ts';
 import { clientIp } from '../shared/rateLimit.ts';
 import { get, all } from '../shared/db.ts';
+import { cached, cacheKey } from '../shared/kvCache.ts';
+import { resolveFilerCommittees } from '../shared/committeeNames.ts';
 import { buildMemberPerformanceQuery } from '../analytics/builders.ts';
+import { asWindow } from '../analytics/sql.ts';
 import { aggregateMemberDualPerformance } from '../analytics/compute.ts';
 import { latestSpxClose } from '../prices/service.ts';
+import { currentPriceFreshThrough } from '../prices/staleness.ts';
 import type { TradeSummaryRow } from './types.ts';
 import type { TxQueryParams } from '../delivery/rows.ts';
+import { mergePeeledQuery, peelEncodedQueryFromPathParam } from '../shared/memberPath.ts';
 
 export function buildClientRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
+
+  // CT-2459: public, user-independent GETs (feed/trade/ticker/member — none
+  // of them read the session, verified in this file) previously sent ZERO
+  // Cache-Control, so neither the edge nor the iOS URLCache could ever
+  // serve a repeat view. Account-scoped routes (/bootstrap, /me,
+  // /preferences, /subscriptions, /commands, the Premium document PDF) are
+  // deliberately excluded. Policies mirror delivery/rest.ts
+  // (PUBLIC_FEED_CACHE / PUBLIC_STABLE_CACHE).
+  r.use('*', async (c, next) => {
+    await next();
+    if (c.req.method !== 'GET' || c.res.status !== 200) return;
+    if (c.res.headers.has('Cache-Control')) return;
+    const path = new URL(c.req.url).pathname;
+    const rel = path.slice('/api/client/v1'.length);
+    if (rel === '/feed') {
+      c.res.headers.set('Cache-Control', 'public, s-maxage=15, stale-while-revalidate=45');
+    } else if (
+      rel.startsWith('/trade/') ||
+      rel.startsWith('/ticker/') ||
+      rel.startsWith('/member/')
+    ) {
+      c.res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
+    }
+  });
 
   r.get('/bootstrap', async (c) => {
     const user = await getCurrentUserFromRequest(c);
@@ -72,7 +111,7 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
         user: user
           ? { id: user.id, email: user.email, name: user.name, picture: user.picture }
           : null,
-        entitlement: entitlementOf(user),
+        entitlement: await resolveEntitlementAsync(c.env, user),
       },
       capabilities: {
         feed: true,
@@ -95,16 +134,52 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
 
   r.get('/documents/:docId/pdf', serveDocumentPdf);
 
+  // Unauthenticated by design (Guideline 5.1.1(v)) — see client/entitlements.ts.
+  r.post('/entitlements/apple/redeem', redeemAppleEntitlementAnonymously);
+
   r.get('/me', async (c) => {
     const user = await getCurrentUserFromRequest(c);
-    return c.json({ user, entitlement: entitlementOf(user) });
+    return c.json({ user, entitlement: await resolveEntitlementAsync(c.env, user) });
   });
 
   r.get('/feed', async (c) => {
     const params = filtersFromQuery(c.req.query());
+    // Default to newest-first when the caller has no forward cursor. The raw
+    // ordering `buildTransactionsQuery` falls back to is `cursor_seq ASC`
+    // (oldest first) so a `since=`-cursor poll can resume gap-free — but that
+    // means an unparameterized first call also got oldest-first, and the
+    // oldest ~11,820 rows are `seed_dataset` bulk-import rows with no owning
+    // `filings` row at all (no filedDate/firstSeenAt/sourceUrl — see
+    // mapFeedTransaction). A public endpoint called "feed" defaulting to a
+    // wall of filing-less historical rows is the actual defect; the fix is
+    // scoped to *default direction only*, not the paging contract itself:
+    // - `since` present (including `since=0`, an explicit "start of history"
+    //   cursor) => leave `order` as the caller set it (undefined stays ASC in
+    //   buildTransactionsQuery) so incremental sync keeps walking forward.
+    // - `since` absent AND caller didn't pass `order` => default to `desc` so
+    //   a plain `GET /feed` (or `GET /feed?limit=…&ticker=…`, etc.) shows
+    //   recent, fully-populated rows. iOS always sends its own explicit
+    //   `order` (clients/ios/CongressTrade/Store/CongressTradeStore.swift) and
+    //   never sends `since`, so it is unaffected either way; webhook/SSE
+    //   delivery (src/delivery/{webhook,sse}.ts) hardcode their own
+    //   `cursor_seq ASC` SQL and never go through this parser at all.
+    if (params.since === undefined && params.order === undefined) {
+      params.order = 'desc';
+    }
+    // Same public offset depth cap as /api/transactions (src/delivery/rest.ts)
+    // — deep offset walks are Premium CSV export's job, not a free scrape path.
+    if ((params.offset ?? 0) > MAX_PUBLIC_TX_OFFSET) {
+      return c.json(
+        {
+          error: `offset beyond ${MAX_PUBLIC_TX_OFFSET} is not available on the public feed`,
+          hint: 'Premium CSV export: GET /api/export/transactions.csv (authenticated Premium session).',
+        },
+        400,
+      );
+    }
     // Same anti-scrape daily row budget as /api/transactions — both pagers
     // walk the identical corpus, so they draw on one shared per-IP budget.
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
@@ -121,7 +196,7 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
     if (!id || id.length > 128) return c.json({ error: 'invalid trade id' }, 400);
     // Same per-IP daily row budget as /feed — a detail endpoint is still a
     // corpus read and must not be a free side-channel around the pager budget.
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
@@ -144,23 +219,48 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
   r.get('/ticker/:ticker', async (c) => {
     const ticker = normalizeTickerLogoSymbol(c.req.param('ticker'));
     if (!ticker) return c.json({ error: 'invalid ticker' }, 400);
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
         'Retry-After': String(budget.retryAfterSec),
       });
     }
+    const q = c.req.query();
+    const filters = filtersFromQuery(q);
     const params: TxQueryParams = {
+      ...filters,
       ticker,
-      limit: detailLimit(c.req.query('limit')),
-      order: asOrder(c.req.query('order')) ?? 'desc',
+      limit: detailLimit(q.limit),
+      order: asOrder(q.order) ?? 'desc',
     };
-    const summaryQ = tickerSummarySql(ticker);
-    const [list, summaryRow, refRow] = await Promise.all([
+    // Company-drawer parity block (buy pressure, buys/sells over time, top
+    // buyers/sellers, "Performance After Buys"). Opt-in because the backtest
+    // leg scans this ticker's full price history plus the whole SPX series —
+    // see client/tickerAnalytics.ts for why it lives on THIS contract rather
+    // than sending clients to the internal /api/analytics routes.
+    const includeAnalytics = wantsAnalytics(q.include);
+    const summaryQ = tickerSummarySql(ticker, filters);
+    const [list, summaryRow, refRow, analytics] = await Promise.all([
       readClientTradeList(c.env, params),
       get<TradeSummaryRow>(c.env.DB, summaryQ.sql, summaryQ.params),
       getSecurityRef(c.env, ticker),
+      includeAnalytics
+        ? tickerAnalytics(c.env, ticker, {
+            window: q.window,
+            granularity: q.granularity,
+          }).catch((err) => {
+            // The trade list is this endpoint's primary job; an analytics
+            // failure degrades that one section to `null` rather than blanking
+            // the whole screen. Clients must treat `analytics: null` as
+            // "unavailable right now", never as "no activity".
+            console.error('client ticker analytics failed', {
+              ticker,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return null;
+          })
+        : Promise.resolve(undefined),
     ]);
     await spendRowBudget(c.env, ip, list.count);
     return c.json({
@@ -170,16 +270,21 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
         ...baseSummary(summaryRow),
         memberCount: num(summaryRow?.member_count),
       },
+      // Omitted entirely unless requested, so existing decoders see byte-for-byte
+      // the response they see today.
+      ...(includeAnalytics ? { analytics } : {}),
       ...list,
     });
   });
 
   r.get('/member/:memberIdOrName', async (c) => {
-    const memberIdOrName = (c.req.param('memberIdOrName') || '').trim();
+    const peeled = peelEncodedQueryFromPathParam((c.req.param('memberIdOrName') || '').trim());
+    const memberIdOrName = peeled.id.trim();
+    const q = mergePeeledQuery(c.req.query(), peeled.query);
     if (!memberIdOrName || memberIdOrName.length > 120) {
       return c.json({ error: 'invalid member id or name' }, 400);
     }
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json({ error: 'daily feed row budget reached' }, 429, {
@@ -188,23 +293,46 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
     }
     const resolved = await resolveMember(c.env, memberIdOrName);
     if (!resolved) return c.json({ error: 'member not found' }, 404);
+    const filters = filtersFromQuery(q);
     const params: TxQueryParams = {
+      ...filters,
       member: resolved.id,
-      limit: detailLimit(c.req.query('limit')),
-      order: asOrder(c.req.query('order')) ?? 'desc',
+      limit: detailLimit(q.limit),
+      // Recent Trades must be newest *trade date*, not newest ingest cursor.
+      // Khanna 2026-08-16: lastTrade 2026-07-01 but cursor order put a
+      // reimported 2025-12-12 filing first on the politician sheet.
+      sort: asSort(q.sort) ?? 'tx_date',
+      order: asOrder(q.order) ?? 'desc',
     };
-    const summaryQ = memberSummarySql(resolved.id);
-    const perfQ = buildMemberPerformanceQuery(resolved.id, { window: 'all' });
-    const [list, summaryRow, perfRowsRaw, currentSpx] = await Promise.all([
+    const summaryQ = memberSummarySql(resolved.id, filters);
+    const perfFilters = {
+      window: asWindow(q.window, 'all'),
+      chambers: filters.chambers,
+      parties: filters.partyBuckets,
+      txTypes: filters.types ?? (filters.type ? [filters.type] : undefined),
+    };
+    const perfQ = buildMemberPerformanceQuery(resolved.id, perfFilters);
+    const [list, summaryRow] = await Promise.all([
       readClientTradeList(c.env, params),
       get<TradeSummaryRow>(c.env.DB, summaryQ.sql, summaryQ.params),
-      all<Record<string, unknown>>(c.env.DB, perfQ.sql, perfQ.params),
-      latestSpxClose(c.env),
     ]);
     if (!resolved.profile && list.total === 0) return c.json({ error: 'member not found' }, 404);
     await spendRowBudget(c.env, ip, list.count);
 
-    const perfRows = perfRowsRaw.map((row) => ({
+    // CT-2459: the performance block (per-trade anchors over the member's
+    // whole windowed history) was recomputed on every /member hit while the
+    // analytics twin (/member/:id/performance) already caches 600s. Same
+    // key inputs, same TTL.
+    const performance = await cached(
+      c.env,
+      cacheKey(`client-member-perf-v1:${resolved.id}`, perfFilters as never),
+      600,
+      async () => {
+        const [perfRowsRaw, currentSpx] = await Promise.all([
+          all<Record<string, unknown>>(c.env.DB, perfQ.sql, perfQ.params),
+          latestSpxClose(c.env),
+        ]);
+        const perfRows = perfRowsRaw.map((row) => ({
       isOption: num(row.is_option) === 1,
       txType: str(row.tx_type),
       priceAtTrade: row.price_at_trade == null ? null : num(row.price_at_trade),
@@ -214,20 +342,41 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
       currentPrice: row.current_price == null ? null : num(row.current_price),
       elapsedDaysSinceFiling:
         row.elapsed_days_since_filing == null ? null : num(row.elapsed_days_since_filing),
+      currentPriceDate: str(row.current_price_date),
+      spxNow: row.spx_now == null ? null : num(row.spx_now),
     }));
-    const dual = aggregateMemberDualPerformance(perfRows, currentSpx);
-    // Flat `performance` stays trade-date buy skill for older iOS decoders;
-    // nested legs expose both anchors for new clients.
-    const performance = {
-      ...dual.tradeDate,
-      side: dual.side,
-      buyCount: dual.buyCount,
-      tradeDate: dual.tradeDate,
-      filingDate: dual.filingDate,
-    };
+        const dual = aggregateMemberDualPerformance(perfRows, currentSpx, {
+          priceFreshThrough: currentPriceFreshThrough(),
+        });
+        // Flat `performance` stays trade-date buy skill for older iOS decoders;
+        // nested legs expose both anchors for new clients.
+        return {
+          ...dual.tradeDate,
+          side: dual.side,
+          buyCount: dual.buyCount,
+          tradeDate: dual.tradeDate,
+          filingDate: dual.filingDate,
+          // Newest price date behind any scored trade: every return above ends on it
+          // (the S&P leg is aligned per ticker to the same day) — clients print "Prices as of".
+          pricesAsOf: perfRows.reduce<string | null>(
+            (best, r) => (r.currentPriceDate && (!best || r.currentPriceDate > best) ? r.currentPriceDate : best),
+            null,
+          ),
+        };
+      },
+    );
 
+    const member = memberProfile(resolved.profile, resolved.id);
+    if (!member.committees.length) {
+      member.committees = await resolveFilerCommittees(
+        c.env.DB,
+        resolved.id,
+        resolved.profile?.committees,
+        resolved.profile?.resolved_bioguide_id,
+      );
+    }
     return c.json({
-      member: memberProfile(resolved.profile, resolved.id),
+      member,
       summary: {
         ...baseSummary(summaryRow),
         uniqueTickers: num(summaryRow?.unique_tickers),
@@ -263,7 +412,8 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
     try {
       const user = await requireUser(c);
       const subs = await listUserSubscriptions(c.env, user);
-      return c.json({ subscriptions: subs.map((sub) => publicSubscription(sub)) });
+      const memberInfo = await describeSubscriptionMembers(c.env, subs);
+      return c.json({ subscriptions: subs.map((sub) => publicSubscription(sub, false, memberInfo.get(sub.id))) });
     } catch (err) {
       const e = err as ClientInputError;
       return c.json({ error: e.message }, errorStatus(e));
@@ -363,9 +513,10 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
       }
     }
 
-    // Execute asynchronously on the durable queue (202 Accepted); clients poll
-    // GET /commands/:id for the terminal status. The queue dedupes on
-    // commandId, so reclaim re-enqueues and redeliveries stay idempotent.
+    // Enqueue FIRST as the durable backstop: if this request dies mid-flight
+    // (or inline execution below overruns its budget), the tick still runs the
+    // command. The queue dedupes on commandId, so reclaim re-enqueues and
+    // redeliveries stay idempotent.
     try {
       await c.env.INGEST_QUEUE.send({
         type: 'command.execute',
@@ -379,7 +530,48 @@ export function buildClientRouter(): Hono<{ Bindings: Env }> {
       });
       return c.json({ command: failed, error: 'command enqueue failed' }, 503);
     }
-    return c.json({ command }, 202);
+
+    // Then try to finish it INLINE, inside this request. Commands are typed by
+    // a human waiting on a screen (redeem an App Store purchase, create a
+    // delivery), but the durable queue is drained by the background tick — one
+    // minute apart on the paid profile, five on free, and behind whatever
+    // ingest work the tick claims first. The iOS client only polls
+    // GET /commands/:id for ~18s, so a purchase that Apple had already charged
+    // surfaced as "Request failed" while the redeem sat queued (owner report,
+    // 2026-08-13 TestFlight). Inline execution collapses that to one round
+    // trip; the enqueued message is what covers the cases it cannot.
+    //
+    // executeQueuedCommand is idempotent — it re-reads the row and no-ops
+    // unless it is still queued/running — so the later queue delivery of a
+    // command finished here is a cheap read, not a second execution.
+    try {
+      await Promise.race([
+        executeQueuedCommand(c.env, command.id, user.id),
+        new Promise<void>((resolve) => setTimeout(resolve, INLINE_COMMAND_BUDGET_MS)),
+      ]);
+    } catch {
+      // executeQueuedCommand already recorded the failure on the row; a
+      // non-ClientInputError rethrow here must not 500 the request, because
+      // the terminal status it just wrote is exactly what the client needs.
+    }
+
+    const settled = (await getCommand(c.env, user.id, command.id)) ?? command;
+    // 200 once terminal, 202 while it is still the queue's problem — the
+    // client polls on queued/running either way.
+    const terminal = settled.status === 'succeeded' || settled.status === 'failed' ||
+      settled.status === 'canceled';
+    // Inline create_subscription used to return the redacted row and never
+    // GET /commands/:id, so the one-time secret sat unclaimed (DELIVERYALERTS-01).
+    // Claim it here for the creating user. Do not log the secret.
+    if (settled.status === 'succeeded') {
+      const claimed = await claimCommandResultSecret(c.env, user.id, settled.id);
+      if (claimed) {
+        return c.json({
+          command: { ...settled, result: mergeClaimedSecret(settled.result, claimed) },
+        }, 200);
+      }
+    }
+    return c.json({ command: settled }, terminal ? 200 : 202);
   });
 
   return r;

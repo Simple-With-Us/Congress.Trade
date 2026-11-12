@@ -23,7 +23,7 @@ describe('runTickerBackfill', () => {
         owner: 'self',
         asset_type: 'ST',
         asset_type_name: 'Stocks (including ADRs)',
-        tx_type: 'P',
+        tx_type: 'B',
         amount_min: 1001,
         amount_max: 15000,
         is_option: 0,

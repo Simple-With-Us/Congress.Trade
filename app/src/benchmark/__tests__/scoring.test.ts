@@ -10,7 +10,7 @@ function row(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     ticker: 'AAPL',
     assetName: 'Apple Inc.',
     txDate: '2026-07-01',
-    txType: 'P',
+    txType: 'B',
     amountMin: 1_001,
     amountMax: 15_000,
     owner: 'self',

@@ -1,11 +1,14 @@
-# Preview deployments
+# Preview deployments (leftover Wrangler tooling)
 
-Use this when you want a browser-accessible review site before merging or
-deploying `congress.trade`.
+This is **not** production.  The live site is Coolify `congress-app` at
+[https://congress.trade](https://congress.trade).  These scripts still
+provision an isolated Cloudflare Worker named `congress-trade-preview` for
+optional review sandboxes.  Do not point them at the host SQLite file or
+`congress.trade`.
 
-The preview deployment is intentionally isolated:
+The leftover preview stack is intentionally isolated:
 
-- Worker: `congress-trade-preview`
+- Worker: `congress-trade-preview` (sandbox only)
 - Config: `app/wrangler.preview.toml` (generated locally, ignored by git)
 - Database: `congress-feed-preview-db` (legacy backing-resource name)
 - R2 bucket: `congress-feed-preview-raw` (legacy backing-resource name)
@@ -66,9 +69,9 @@ first-class staging environment with permanent resource IDs.
 
 ## Merge policy
 
-Preview deploys are for review. Merging to `main` still deploys production via
-Cloudflare Workers Builds and production migrations are not automatic. Before
-merging, run:
+Preview deploys are for review.  Merging to `main` rebuilds Coolify
+`congress-app`; production migrations are not automatic.  Before merging,
+run:
 
 ```bash
 cd app
@@ -77,5 +80,5 @@ npm test
 ```
 
 Apply production schema changes through `npm run deploy:full` / `scripts/ship.sh`
-or `POST /api/admin/migrate`; do not use remote Wrangler D1 migrations on this
-account.
+or `POST /api/admin/migrate` against `https://congress.trade`.  Do not use
+remote Wrangler D1 migrations against the live host.

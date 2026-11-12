@@ -5,12 +5,12 @@ on:
 
 jobs:
   diagnostics:
-    name: Diagnose workerd EPIPE on self-hosted runner
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "oracle-ci"]') || 'ubuntu-latest' }}
+    name: Diagnose workerd EPIPE on GitHub-hosted ubuntu
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Materialize the full repository checkout
         run: |
@@ -18,13 +18,12 @@ jobs:
           git reset --hard HEAD
           test -d app
 
-      # Without this the self-hosted runner's job shell resolves node to the
-      # stock Ubuntu 20.04 /usr/bin/node (v10, no npm on PATH), so npm ci and
-      # every downstream workerd/miniflare step no-ops. Mirrors ci.yml/deploy.yml.
+      # Pin Node so npm ci and the workerd/miniflare probe do not depend on
+      # whatever the image ships on PATH. Mirrors ci.yml.
       - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
 
       - name: Ensure strace available (best effort)
         continue-on-error: true

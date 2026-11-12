@@ -111,7 +111,14 @@ describe('orchestrator provider-ban circuit breaker', () => {
     expect(extract).not.toHaveBeenCalled();
 
     const errorRun = runs.find((r) => /SET ingest_status = 'error'/i.test(r.sql));
-    expect(errorRun?.params).toEqual([expect.stringContaining('circuit breaker is open'), 'H-1']);
+    expect(errorRun?.params?.[0]).toEqual(expect.stringContaining('circuit breaker is open'));
+    expect(errorRun?.params?.[1]).toBe('H-1');
+    expect(errorRun?.params?.slice(2)).toEqual([
+      'auto_published',
+      'confirmed',
+      'manual',
+      'agreement_published',
+    ]);
   });
 
   it('proceeds with extraction when the KV read throws', async () => {
@@ -173,6 +180,37 @@ describe('orchestrator provider-ban circuit breaker', () => {
     const result = await extractParsed(env, 'H-1');
 
     expect(result?.extractor).toBe('textPdf');
+    expect(extract).toHaveBeenCalledTimes(1);
+    expect(kvGet).not.toHaveBeenCalled();
+  });
+
+  it('does not let a vision ban block the text-first OGE wrapper, including scans', async () => {
+    const extract = vi.fn(async () => ({
+      transactions: [{ id: 'tx-1' }],
+      confidence: 0.97,
+      raw: 'text',
+      extractor: 'ogeText',
+    }));
+    mocks.buildExtractorPipeline.mockReturnValue([
+      {
+        name: 'ogePdf(ogeText,arbitrating(configuredVision,visionLlm-secondary))',
+        circuitBreakerName: 'configuredVision',
+        canHandle: () => true,
+        extract,
+      },
+    ]);
+
+    const { db } = fakeDb();
+    const kvGet = vi.fn(async () => '1');
+    const env = {
+      DB: db,
+      RAW_FILES: fakeRawFiles(new ArrayBuffer(8)),
+      CONFIG_KV: { get: kvGet, put: vi.fn(), delete: vi.fn() },
+    } as unknown as Env;
+
+    const result = await extractParsed(env, 'H-1');
+
+    expect(result?.extractor).toBe('ogeText');
     expect(extract).toHaveBeenCalledTimes(1);
     expect(kvGet).not.toHaveBeenCalled();
   });

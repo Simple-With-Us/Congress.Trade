@@ -1,0 +1,13 @@
+[Unit]
+Description=Coolify deploy guard for %i (coalesce + rate-limit + serialize)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fleet-deploy-guard.sh %i
+SyslogIdentifier=fleet-deploy-guard-%i
+# COOLIFY_TOKEN + PUSHOVER_* are shared across every app's guard.
+EnvironmentFile=-/etc/congress-health-recover.env
+# Per-app APP_UUID / APP_NAME / HEALTH_URL / MIN_DEPLOY_INTERVAL_SEC.
+EnvironmentFile=-/etc/fleet-deploy-guard.d/%i.env

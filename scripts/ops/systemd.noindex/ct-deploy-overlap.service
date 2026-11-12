@@ -1,0 +1,27 @@
+[Unit]
+# congress.trade deploy overlap (live app clone outside Coolify).
+#
+# Coolify compose deploys stop every in-project container before starting
+# the replacement.  This unit clones congress-app as congress-hold so
+# Traefik keeps a server during that window.  See
+# docs/rollouts/2026-08-17-coolify-deploy-overlap.md and #1537.
+#
+# INSTALL (root on the Coolify host; does not take the site down):
+#   install -m 0755 scripts/ops/ct-deploy-overlap.sh /usr/local/bin/
+#   install -m 0644 scripts/ops/ct-deploy-overlap.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now ct-deploy-overlap.service
+Description=Congress.Trade deploy overlap (keep a live backend during Coolify swap)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+ExecStart=/usr/local/bin/ct-deploy-overlap.sh --loop
+SyslogIdentifier=ct-deploy-overlap
+EnvironmentFile=-/etc/congress-health-recover.env
+
+[Install]
+WantedBy=multi-user.target

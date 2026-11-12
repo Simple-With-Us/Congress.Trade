@@ -10,7 +10,7 @@ pays for the same FMP call twice.
 
 You are working on **App B**, a Next.js app (running locally) that pulls market
 data from **Financial Modeling Prep (FMP)**. There is a sibling app, **App A =
-congress.trade**, a Cloudflare Worker (always-on, public) backed by a database.
+congress.trade**, a Coolify Deno app (always-on, public) backed by host SQLite.
 Both apps use FMP. Goal: **share the data App B already fetches with App A**, so
 App A rarely needs to call FMP itself (saving the shared daily FMP quota).
 
@@ -26,8 +26,8 @@ Headers:
   Content-Type: application/json
 ```
 
-> **Token:** use a **scoped `INGEST_TOKEN`** (set via `wrangler secret put
-> INGEST_TOKEN` on App A) so the sending app never holds the full `ADMIN_TOKEN`.
+> **Token:** use a **scoped `INGEST_TOKEN`** (set in Infisical on App A) so the
+> sending app never holds the full `ADMIN_TOKEN`.
 > The ingest token authorizes *only* this endpoint; the full admin token still
 > works too. App B stores whichever value as its `CONGRESS_TRADE_TOKEN`.
 
@@ -159,10 +159,9 @@ function fmpHistToPrices(symbol, hist) {
 
 ### Backfilling history fast (paid FMP tier)
 
-If congress.trade has its own `FMP_API_KEY` (set via `wrangler secret put`), you
-can fill all history quickly without App B. Raise the daily cap
-(`wrangler secret put FMP_DAILY_CALL_CAP` → e.g. `100000`) and loop the bounded
-backfill until it reports `done: true`:
+If congress.trade has its own `FMP_API_KEY` (Infisical), you can fill all
+history quickly without App B.  Raise the daily cap (`FMP_DAILY_CALL_CAP`,
+e.g. `100000`) and loop the bounded backfill until it reports `done: true`:
 
 ```bash
 cd app
@@ -171,7 +170,7 @@ BASE=https://congress.trade TOKEN=your_admin_token ./scripts/backfill-market.sh 
 ```
 
 Each pass runs one safe batch of enrichment + price refresh (bounded by the
-Worker's per-request limits) and `maxPerMinute` throttles FMP to stay under your
+app's per-request limits) and `maxPerMinute` throttles FMP to stay under your
 plan's rate. `GET /api/admin/enrich-securities/status` reports
 `pendingTickers` / `pricePendingTickers` as it drains.
 
@@ -291,13 +290,13 @@ Full contract: [`app/docs/pit-score-export.md`](pit-score-export.md).
 
 ## Ops / health
 
-- `GET /api/health` → `{ ok, db, time }` — liveness + D1 connectivity (`db:false`
+- `GET /api/health` → `{ ok, db, time }` — liveness + SQLite connectivity (`db:false`
   means the database is unreachable or unmigrated).
 - **Apply migrations to production** (the common cause of 500s on DB-backed
   routes): use `npm run deploy:full` / `ADMIN_TOKEN=... bash scripts/ship.sh`,
-  which deploys then calls the idempotent `POST /api/admin/migrate` path. The
-  plain `npm run migrate` is **local-only**, and `npm run migrate:remote` is
-  intentionally disabled for this account.
+  which waits for the Coolify SHA then calls the idempotent
+  `POST /api/admin/migrate` path.  The plain `npm run migrate` is **local-only**,
+  and `npm run migrate:remote` is intentionally disabled for this account.
 
 ## Read-back routes (avoid re-paying for donated data)
 
@@ -375,7 +374,7 @@ Headers: Authorization: Bearer <INGEST_TOKEN>
 ```
 
 Notes for App B:
-- **No presigned URLs.** The R2 binding in the Workers runtime can't sign URLs, so
+- **No presigned URLs.**  The R2 S3 shim does not mint presigned URLs, so
   downloads go through the token-gated `downloadPath` (same `INGEST_TOKEN`).
 - **Pin the run, then download.** Each run writes to a unique `runId` prefix and the
   manifest's `downloadPath` carries that `runId`, so the row counts you read and the

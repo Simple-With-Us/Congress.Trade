@@ -20,12 +20,12 @@ import { jsonrepair } from 'jsonrepair';
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Env, Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { parseAmountRange } from './amounts.ts';
-import { PDFDocument } from 'pdf-lib';
+// CT-2459: pdf-lib + @google/genai are dynamic-imported at first use so
+// server startup (and /health) does not pay for the PDF/LLM stacks.
 import { resolveSecret } from '../secrets/infisical.ts';
 import { get } from '../shared/db.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { assertLlmSpendWithinCeiling, settleLlmSpend } from '../shared/llmSpend.ts';
-import { GoogleGenAI } from '@google/genai';
 import { candidateSpendUsd } from './bakeoff.ts';
 
 /**
@@ -61,10 +61,10 @@ const geminiRateLimiter = new RateLimiter();
  * Gemini model id. Centralized + documented so it is trivial to bump.
  * NOTE: Flash model ids rotate; if calls start 404-ing, update this to the
  * current Flash generation — the request/response contract below is unchanged
- * across Flash generations. Current as of 2026-06: 'gemini-3.5-flash'.
+ * across Flash generations. Current as of 2026-09: 'gemini-3.8-flash'.
  * Override via env var VISION_PRIMARY_MODEL.
  */
-const DEFAULT_MODEL = 'gemini-3.5-flash';
+const DEFAULT_MODEL = 'gemini-3.8-flash';
 
 
 
@@ -169,6 +169,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
       lowerModel.includes('openrouter');
 
     try {
+      const { PDFDocument } = await import('pdf-lib');
       const pdfDoc = await PDFDocument.load(input.bytes, { ignoreEncryption: true });
       pageCount = pdfDoc.getPageCount();
       const MAX_PAGES = 50;
@@ -215,6 +216,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
         for (const k of keys) {
           try {
             await geminiRateLimiter.wait(this.env.GEMINI_RPM_LIMIT);
+            const { GoogleGenAI } = await import('@google/genai');
             const ai = new GoogleGenAI({ apiKey: k });
             
             res = await ai.models.generateContent({
@@ -361,7 +363,7 @@ let keyString = this.apiKeyOverride ?? (await resolveSecret(this.env, this.apiKe
 /** Stable identifier for the extraction instructions sent to vision models.
  *  BUMP DISCIPLINE: any change to SYSTEM_PROMPT / EXECUTIVE_SYSTEM_PROMPT /
  *  buildExtractionPrompt's grounding block requires a new version string. */
-export const EXTRACTION_PROMPT_VERSION = 'stock-act-ptr-v4-grounded';
+export const EXTRACTION_PROMPT_VERSION = 'stock-act-ptr-v5-grounded';
 
 export const SYSTEM_PROMPT = `You are a meticulous data-extraction engine for U.S. congressional STOCK Act
 Periodic Transaction Reports (PTRs). The attached document is a scanned PTR.
@@ -372,8 +374,8 @@ Extract EVERY disclosed transaction row. For each transaction return:
 - ticker: the stock ticker symbol in UPPERCASE. Look VERY CAREFULLY in the asset description column, often in parentheses like (AAPL) or a standalone column. Do not miss the ticker if it is visible. null only if it is truly missing.
 - assetType: short asset-type code/label if shown (e.g. "ST","OP","Stock","Option"), else null.
 - assetTypeName: expanded asset-type name if the document or code is clear, else null.
-- txType: one of "P" (Purchase), "S" (Sale), "E" (Exchange). Map "Sale (Full)", "Sale (Partial)" or "S (partial)" to "S". Pay extremely close attention to the Transaction Type column; do not hallucinate "P" if it says "S" or "Sale". null if illegible.
-- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$50,000,001 +".
+- txType: one of "B" (Buy/Purchase), "S" (Sell/Sale), "E" (Exchange). Map "Purchase"/"P"/"Buy" to "B". Map "Sale (Full)", "Sale (Partial)" or "S (partial)" to "S". Pay extremely close attention to the Transaction Type column; do not hallucinate "B" if it says "S" or "Sale". null if illegible.
+- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$50,000,001 +". These amounts are CHECKBOX BANDS: identify WHICH band column is marked and transcribe that band's own printed range. If you cannot tell which column is marked, or the band-to-dollar legend is too small/blurred to read at this resolution, return null. NEVER guess, and never fall back to the first or most common band — a null amount is correct when the band is not readable.
 - isOption: true if the holding is an option/call/put/warrant.
 - capGainsOver200: true only if a ">$200" capital-gains box/flag is checked.
 - filingStatus: row-specific filing status such as "New", if shown.
@@ -393,8 +395,8 @@ Extract EVERY disclosed transaction row. For each transaction return:
 - ticker: the stock ticker symbol in UPPERCASE. Look VERY CAREFULLY in the asset description column, often in parentheses like (AAPL) or a standalone column. Do not miss the ticker if it is visible. null only if it is truly missing.
 - assetType: short asset-type code/label if shown (e.g. "Stock", "Option"), else null.
 - assetTypeName: expanded asset-type name if the document or code is clear, else null.
-- txType: one of "P" (Purchase), "S" (Sale), "E" (Exchange). Map "Purchase" to "P", "Sale" or "Sale (Partial)" to "S", "Exchange" to "E". Pay extremely close attention to the Transaction Type column; do not hallucinate "P" if it says "S" or "Sale". null if illegible.
-- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$15,001 - $50,000".
+- txType: one of "B" (Buy/Purchase), "S" (Sell/Sale), "E" (Exchange). Map "Purchase"/"P"/"Buy" to "B", "Sale"/"Sell"/"Sale (Partial)" to "S", "Exchange" to "E". Pay extremely close attention to the Transaction Type column; do not hallucinate "B" if it says "S" or "Sale". null if illegible.
+- amountRange: the disclosed amount bracket exactly as printed, e.g. "$1,001 - $15,000" or "$15,001 - $50,000". These amounts are CHECKBOX BANDS: identify WHICH band column is marked and transcribe that band's own printed range. If you cannot tell which column is marked, or the band-to-dollar legend is too small/blurred to read at this resolution, return null. NEVER guess, and never fall back to the first or most common band — a null amount is correct when the band is not readable.
 - isOption: true if the holding is an option/call/put/warrant.
 - capGainsOver200: false (rarely applicable on OGE forms).
 - filingStatus: row-specific filing status such as "New", if shown.
@@ -522,7 +524,7 @@ const RESPONSE_SCHEMA = {
       ticker: { type: 'STRING', nullable: true },
       assetType: { type: 'STRING', nullable: true },
       assetTypeName: { type: 'STRING', nullable: true },
-      txType: { type: 'STRING', enum: ['P', 'S', 'E'], nullable: true },
+      txType: { type: 'STRING', enum: ['B', 'S', 'E', 'P'], nullable: true },
       amountRange: { type: 'STRING', nullable: true },
       isOption: { type: 'BOOLEAN', nullable: true },
       capGainsOver200: { type: 'BOOLEAN', nullable: true },
@@ -830,6 +832,7 @@ export function markSalvaged(tx: ParsedTx): ParsedTx {
  */
 export async function validatePdfForAnthropic(bytes: ArrayBuffer): Promise<ArrayBuffer> {
   try {
+    const { PDFDocument } = await import('pdf-lib');
     await PDFDocument.load(bytes, { ignoreEncryption: true });
     return bytes;
   } catch {
@@ -850,6 +853,7 @@ export async function validatePdfForAnthropic(bytes: ArrayBuffer): Promise<Array
  */
 export async function resavePdfForAnthropic(bytes: ArrayBuffer): Promise<ArrayBuffer> {
   try {
+    const { PDFDocument } = await import('pdf-lib');
     const pdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const saved = await pdfDoc.save();
     return (saved.buffer as ArrayBuffer).slice(saved.byteOffset, saved.byteOffset + saved.byteLength);
@@ -871,7 +875,8 @@ export function isAnthropicInvalidPdfError(detail: string): boolean {
 }
 
 export function toParsedTx(m: ModelTx): ParsedTx {
-  const { min, max } = parseAmountRange(m.amountRange ?? '');
+  const parsedAmount = parseAmountRange(m.amountRange ?? '');
+  const { min, max } = parsedAmount;
   const modelConf = typeof m.confidence === 'number' ? clamp01(m.confidence) : DEFAULT_CONFIDENCE;
   // Cap vision confidence at the conservative default so scanned docs lean to review.
   const confidence = Math.min(modelConf, DEFAULT_CONFIDENCE);
@@ -879,6 +884,10 @@ export function toParsedTx(m: ModelTx): ParsedTx {
   const extractionWarnings: ParsedTx['extractionWarnings'] = [];
   if (typeof m.isOption !== 'boolean') extractionWarnings.push('unreadable_is_option');
   if (typeof m.capGainsOver200 !== 'boolean') extractionWarnings.push('unreadable_cap_gains');
+  // CT-2415 Guard 2: the bracket was snapped onto a canonical tier, not matched
+  // from what the form printed. On a checkbox-band PTR that is an inferred
+  // amount, so flag it for refusal instead of shipping it as a real read.
+  if (parsedAmount.snapped && min !== null) extractionWarnings.push('band_amount_inferred');
 
   return {
     txDate: m.txDate ?? null,
@@ -918,10 +927,11 @@ function normalizeOwner(raw: string | null | undefined): Owner | null {
 }
 
 function normalizeTxType(raw: string | null | undefined): TxType {
-  const s = (raw ?? '').toUpperCase();
-  if (s === 'P') return 'P';
-  if (s === 'S') return 'S';
-  if (s === 'E') return 'E';
+  const s = (raw ?? '').toUpperCase().trim();
+  // Storage B|S|E; legacy form P and buy synonyms → B.
+  if (s === 'P' || s === 'B' || s === 'BUY' || s === 'PURCHASE') return 'B';
+  if (s === 'S' || s === 'SELL' || s === 'SALE') return 'S';
+  if (s === 'E' || s === 'EXCHANGE') return 'E';
   // ParsedTx historically narrows this field to TxType, but the shared
   // normalizer must see an invalid value so it can hard-flag unreadable rows.
   return '' as TxType;

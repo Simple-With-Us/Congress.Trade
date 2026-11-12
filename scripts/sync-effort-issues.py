@@ -122,6 +122,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -146,6 +147,32 @@ RATE_LIMIT_RETRY_BUDGET_SECONDS = 300.0
 # Backoff for rate-limited requests when the server sends no Retry-After.
 RATE_LIMIT_BACKOFF_BASE_SECONDS = 15.0
 RATE_LIMIT_BACKOFF_MAX_SECONDS = 120.0
+# Socket timeout for a single API call. Without one, urlopen blocks forever on a
+# half-open connection and the job only ends when Actions kills the whole run.
+# 60s rather than 30s because the self-hosted runner's link to github.com is
+# demonstrably slow (a shallow clone of this repo took ~20 minutes on the same
+# box), and a large list response must finish inside one timeout window.
+HTTP_TIMEOUT_SECONDS = 60.0
+# Page size for list endpoints, and the floor we will shrink to when a response
+# is too large to transfer intact. See GitHubClient._get_all_pages.
+PAGE_SIZE_DEFAULT = 100
+PAGE_SIZE_MIN = 10
+# Transport-level (not HTTP-level) retries. A truncated response body raises
+# http.client.IncompleteRead out of resp.read() *after* a 200, so it never
+# reaches the rate-limit retry in GitHubClient._request and used to abort the
+# whole sync. Listing every issue with state=all pulls ~700KB across pages, so
+# a single mid-body disconnect was enough to fail the run
+# ("IncompleteRead(714456 bytes read, 6207 more expected)").
+#
+# Only *idempotent* methods are retried. A POST that created an issue but whose
+# response body was truncated has already mutated the repo — replaying it would
+# file a duplicate issue, which is worse than the failure we are fixing. POSTs
+# therefore surface the transport error and let the next scheduled run reconcile
+# (creation is keyed off the board, so a re-run is self-healing).
+TRANSPORT_RETRY_METHODS = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
+TRANSPORT_RETRY_ATTEMPTS = 4
+TRANSPORT_BACKOFF_BASE_SECONDS = 2.0
+TRANSPORT_BACKOFF_MAX_SECONDS = 15.0
 
 MIRROR_LABEL = "effort-board"
 STATE_LABELS = {
@@ -302,17 +329,49 @@ def http_request(
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else {}), dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+
+    retryable = method.upper() in TRANSPORT_RETRY_METHODS
+    attempt = 0
+    while True:
         try:
-            parsed = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            parsed = {"message": raw.decode("utf-8", errors="replace")}
-        return e.code, parsed, dict(e.headers or {})
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else {}), dict(resp.headers)
+        except urllib.error.HTTPError as e:
+            # A real HTTP response, not a transport failure. Return it so
+            # GitHubClient._request can apply its rate-limit backoff. Note this
+            # must stay ahead of URLError below — HTTPError subclasses it.
+            raw = e.read()
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                parsed = {"message": raw.decode("utf-8", errors="replace")}
+            return e.code, parsed, dict(e.headers or {})
+        except (
+            http.client.IncompleteRead,
+            http.client.HTTPException,
+            urllib.error.URLError,
+            ConnectionError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ) as e:
+            # json.JSONDecodeError lands here because a body that was cut short
+            # without tripping IncompleteRead still fails to parse — same root
+            # cause, same remedy.
+            attempt += 1
+            if not retryable or attempt >= TRANSPORT_RETRY_ATTEMPTS:
+                raise
+            wait = min(
+                TRANSPORT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+                TRANSPORT_BACKOFF_MAX_SECONDS,
+            )
+            print(
+                f"transport error on {method} {url} "
+                f"({type(e).__name__}: {e}) — retrying in {wait:.0f}s "
+                f"(attempt {attempt}/{TRANSPORT_RETRY_ATTEMPTS - 1})",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
 
 
 class RateLimitBudgetExhausted(Exception):
@@ -378,22 +437,72 @@ class GitHubClient:
             )
             time.sleep(wait)
 
-    def _get_all_pages(self, path: str, params: str = "") -> list[dict]:
+    def _collect_pages(self, path: str, params: str, per_page: int) -> list[dict]:
         results: list[dict] = []
         page = 1
         while True:
             sep = "&" if params else ""
-            url = f"{API_BASE}/repos/{self.repo}/{path}?per_page=100&page={page}{sep}{params}"
+            url = (
+                f"{API_BASE}/repos/{self.repo}/{path}"
+                f"?per_page={per_page}&page={page}{sep}{params}"
+            )
             status, payload = self._request("GET", url)
             if status >= 300:
                 raise RuntimeError(f"GET {path} failed: {status} {payload}")
             if not payload:
                 break
             results.extend(payload)
-            if len(payload) < 100:
+            if len(payload) < per_page:
                 break
             page += 1
         return results
+
+    def _get_all_pages(self, path: str, params: str = "") -> list[dict]:
+        """Page through a list endpoint, shrinking per_page if a page won't transfer.
+
+        Retrying an identical request is useless when the truncation is
+        deterministic rather than flaky, which is what this repo actually hits:
+        `issues?state=all` page 3 failed on EVERY attempt at ~712KB of a ~722KB
+        body (run 31626620379 -- the transport retry added earlier fired all
+        three times, with correct backoff, and still could not finish the read).
+        This board's issue bodies are unusually large (effort-log rows run to
+        thousands of characters each), so 100 issues/page is simply too big to
+        get across this runner's link.
+
+        Halving per_page and restarting the listing makes each response small
+        enough to complete. The restart re-fetches earlier pages, which is
+        wasteful, but it only happens after a failure and page numbering is
+        per_page-relative -- so the size cannot be changed mid-listing without
+        silently skipping or duplicating rows.
+
+        All transport-layer exceptions are caught here (not just IncompleteRead)
+        because a large page on a slow link can also manifest as a TimeoutError
+        (60s socket timeout) or a JSONDecodeError (body cut short in a way that
+        Python's http.client doesn't detect as IncompleteRead). The inner
+        http_request retry loop already handles these with backoff; when it
+        exhausts its attempts it re-raises, and we catch them here to apply the
+        same adaptive page-size reduction rather than letting them crash the run.
+        """
+        per_page = PAGE_SIZE_DEFAULT
+        while True:
+            try:
+                return self._collect_pages(path, params, per_page)
+            except (
+                http.client.IncompleteRead,
+                http.client.HTTPException,
+                urllib.error.URLError,
+                ConnectionError,
+                TimeoutError,
+                json.JSONDecodeError,
+            ) as e:
+                if per_page <= PAGE_SIZE_MIN:
+                    raise
+                per_page = max(PAGE_SIZE_MIN, per_page // 2)
+                print(
+                    f"transport error on {path} ({type(e).__name__}: {e}) -- retrying the whole "
+                    f"listing at per_page={per_page}",
+                    file=sys.stderr,
+                )
 
     def list_labels(self) -> set[str]:
         labels = self._get_all_pages("labels")

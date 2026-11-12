@@ -18,8 +18,8 @@ owner-only machine-level file (no group/other permission bits; exact `0600` is
 recommended, not required). Existing non-empty managed values are not replaced;
 remove or empty one deliberately before re-running setup to rotate it locally.
 Incomplete identity pairs fail before dependency installation. The known
-Congress.Trade (`f61a79de-8d77-4f0b-9361-4b7208598290`)
-and shared (`18f563a3-9c88-454c-96eb-28fc9678f3ba`) project IDs are defaults only
+Congress.Trade (`<CT_INFISICAL_PROJECT_ID>`)
+and shared (`<SHARED_INFISICAL_PROJECT_ID>`) project IDs are defaults only
 when their corresponding complete identities are present.
 
 Existing `.dev.vars` parsing is scoped to keys the helper manages. Unrelated

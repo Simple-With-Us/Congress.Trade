@@ -1,22 +1,21 @@
 {
   "imports": {
-    "#sentry": "./app/src/deno/sentryDummy.ts",
+    "#sentry": "./app/src/deno/sentry.ts",
+    "@sentry/deno": "npm:@sentry/deno@^11.0.0",
     "@jaywedgeworth22/congress-trading-shared": "./app/vendor/congress-trading-shared/src/index.ts",
     "hono": "npm:hono@^4.12.31",
     "hono/cookie": "npm:hono@^4.12.31/cookie",
-    "node-html-parser": "npm:node-html-parser@^9.0.0",
-    "unpdf": "npm:unpdf@^1.6.2",
+    "node-html-parser": "npm:node-html-parser@^9.0.3",
+    "unpdf": "npm:unpdf@^2.0.0",
     "pdf-lib": "npm:pdf-lib@^1.17.1",
     "zod": "npm:zod@^4.4.3",
     "cheerio": "npm:cheerio@^1.2.0",
     "fflate": "npm:fflate@^0.8.3",
     "jsonrepair": "npm:jsonrepair@^3.15.0",
-    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1091.0",
-    "@google/genai": "npm:@google/genai@^2.13.0",
-    "@libsql/client": "npm:@libsql/client@^0.17.4",
-    "@libsql/client/web": "npm:@libsql/client@^0.17.4/web",
-    "@sentry/cloudflare": "npm:@sentry/cloudflare@^10.66.0",
-    "@cloudflare/workers-types": "npm:@cloudflare/workers-types@^4.20240718.0"
+    "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@3.1164.0",
+    "@google/genai": "npm:@google/genai@^3.0.0",
+    "@libsql/client": "npm:@libsql/client@^0.18.0",
+    "@libsql/client/web": "npm:@libsql/client@^0.18.0/web"
   },
   "exclude": [
     "node_modules",
@@ -52,5 +51,3 @@
     "app": "congress-trade"
   }
 }
-
-

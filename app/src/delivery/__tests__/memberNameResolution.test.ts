@@ -25,7 +25,10 @@ function makeEnv(opts: { filerId: string | null }): { env: Env; captured: Captur
       return this;
     },
     async first<T>() {
-      if (/SELECT bioguide_id FROM filers/i.test(sql)) {
+      // Matches both the legacy `SELECT bioguide_id FROM filers` and the
+      // ranked COALESCE(merged_into, bioguide_id) form that prefers canonical
+      // filers with live transactions (dormant-duplicate fix).
+      if (/bioguide_id[\s\S]*FROM filers/i.test(sql)) {
         captured.filerLookups += 1;
         return (opts.filerId ? { bioguide_id: opts.filerId } : null) as T | null;
       }
@@ -79,7 +82,7 @@ describe('GET /transactions memberName handling', () => {
     expect(res.status).toBe(200);
     const feedSql = captured.sql.find((s) => /FROM transactions/i.test(s)) ?? '';
     expect(feedSql).toContain("LOWER(COALESCE(fl.full_name, t.filer_id, '')) LIKE ?");
-    expect(feedSql).not.toMatch(/FROM \(SELECT t\.\* FROM transactions t/);
+    expect(feedSql).toMatch(/FROM \(SELECT t\.\* FROM \(SELECT t\.\*, \(.+\) AS __sort_key FROM transactions t/);
   });
 
   it('does not look up a filer when member (filer_id) is already given', async () => {

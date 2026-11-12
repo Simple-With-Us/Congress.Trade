@@ -2,8 +2,10 @@
  * src/ingestion/watcher.ts
  * OWNER: ingestion agent
  *
- * Cron entrypoint logic. Runs every minute; decides via shouldPollNow whether
- * to actually poll House + Senate disclosure indexes. For each NEW filing,
+ * Cron entrypoint logic. Runs every minute; decides via decideSourcePoll (which
+ * consults the measured cadence in probeSchedule.ts, falling back to the legacy
+ * poll_config windows) whether to actually poll House, Senate, and Executive
+ * (OGE) disclosure indexes. For each NEW filing,
  * inserts a 'new' filings row (INSERT OR IGNORE) and enqueues a
  * {type:'filing.new'} INGEST_QUEUE message. Records cadence in ingest_log and
  * updates last-poll via setLastPollAt after successful source polls.
@@ -13,7 +15,8 @@
  */
 
 import type { Chamber, Env } from '../shared/types.ts';
-import { all, batch, run } from '../shared/db.ts';
+import { all, batch, get, isSqliteLockBusy, run, withSqliteLockRetry } from '../shared/db.ts';
+import { sameFilerIdentity } from '../shared/filerIdentityMatch.ts';
 import {
   getConfig,
   getLastAttemptAt,
@@ -22,12 +25,46 @@ import {
   setLastPollAt,
   shouldPollNow,
 } from '../shared/config.ts';
+import type { PollConfig } from '../shared/types.ts';
+import {
+  DEFAULT_PROBE_SCHEDULE_CONFIG,
+  probeScheduleConfigFromEnv,
+  shouldProbeNow,
+  type DayType,
+  type ProbeScheduleConfig,
+  type ProbeTier,
+} from './probeSchedule.ts';
+import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings } from './senateSource.ts';
+import { applyHouseFiledDateIfMissing, normalizeHouseFilingDateToIso } from './houseFiledDate.ts';
+import {
+  fetchSenatePtrFilings,
+  formatSenateEfdTransportNote,
+  readSenateEfdTransport,
+  type SenateFiling,
+} from './senateSource.ts';
+import {
+  clearSenateEdgeBackoff,
+  isSenateEdgeBackoffActive,
+  isSenateEdgeDeniedError,
+  nextSenateEdgeBackoff,
+  readSenateEdgeBackoff,
+  sanitizeEfdTransportError,
+  senateEdgeDenyLogFields,
+  senateEdgeDenyReason,
+  senateEfdTransportScrubSecrets,
+  SenateProxyEgressError,
+  writeSenateEdgeBackoff,
+  type SenateEdgeBackoffState,
+  type SenateHttpError,
+} from './senateEdgeDeny.ts';
+import { consumeResidentialProxySenateCatchup, refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
+import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { pollOgeExecutive } from './ogeSource.ts';
+import { watcherSourceIoSignal } from './watcherSourceIo.ts';
 import { consumeGovernedD1Writes } from '../shared/d1Budget.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 
@@ -86,6 +123,10 @@ export interface DiscoveredFiling {
   party?: string | null;
   photoUrl?: string | null;
   docKind?: string | null;
+  /** Which discovery path first surfaced this filing: intraday live-search
+   *  or the daily bulk index. Set by pollHouse(); used for the bulk-window
+   *  discovery alert. Undefined for non-House sources. */
+  discoveredVia?: 'live' | 'bulk';
 }
 
 export function preclassifyDocKind(
@@ -118,13 +159,7 @@ export function preclassifyDocKind(
 }
 
 function normalizeFilingDate(raw: string | null | undefined): string | null {
-  const s = (raw ?? '').trim();
-  if (!s) return null;
-  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s);
-  if (us) return `${us[3]}-${us[1].padStart(2, '0')}-${us[2].padStart(2, '0')}`;
-  return s.slice(0, 10);
+  return normalizeHouseFilingDateToIso(raw);
 }
 
 function slugPart(raw: string): string {
@@ -196,10 +231,86 @@ function houseDiscovery(f: { pipelineDocId: string; sourceUrl: string; filingDat
  */
 export type InsertFilingResult = 'inserted' | 'duplicate' | 'deferred';
 
+/**
+ * Best-effort match-time canonicalization: when a newly discovered filing's
+ * synthetic filer_id (houseFilerId/senateFilerId) hasn't been seen before,
+ * check whether it's a fresh middle-initial/punctuation/suffix fork of an
+ * already-known filer — same chamber + state, see
+ * shared/filerIdentityMatch.ts — and reuse that filer's id instead of
+ * minting a brand-new `filers` row. This is what stops a NEW fork (e.g.
+ * "Michael T. McCaul" landing after "Michael McCaul" is already on file)
+ * from ever being created going forward. Any fork that already exists in the
+ * DB is fixed by the repeatable backfill in admin/filerIdentityDedupe.ts
+ * (POST /api/admin/dedupe-filer-identities).
+ *
+ * Two cheap, indexed lookups short-circuit the common case (an id already
+ * recorded as a merge alias, or an id that's already a live filers row)
+ * before the pricier chamber+state scan, which only runs for a genuinely
+ * first-ever sighting of a synthetic id — rare (a new member, or a name-
+ * format variance), not the steady-state poll of already-known filers.
+ * `state` is frequently unknown for a brand-new Senate filer (the Senate
+ * source carries no state code; photo enrichment fills it in later) — this
+ * fails closed and returns the input id unchanged rather than guessing.
+ */
+async function resolveIngestFilerId(
+  env: Env,
+  filerId: string,
+  fullName: string,
+  chamber: Chamber,
+  state: string | null | undefined,
+): Promise<string> {
+  const merge = await get<{ canonical_filer_id: string }>(
+    env.DB,
+    'SELECT canonical_filer_id FROM filer_identity_merges WHERE alias_filer_id = ?',
+    [filerId],
+  );
+  if (merge?.canonical_filer_id) return merge.canonical_filer_id;
+
+  const existing = await get<{ bioguide_id: string }>(
+    env.DB,
+    'SELECT bioguide_id FROM filers WHERE bioguide_id = ?',
+    [filerId],
+  );
+  if (existing) return filerId;
+
+  if (!state) return filerId;
+  const candidates = await all<{ bioguide_id: string; full_name: string | null }>(
+    env.DB,
+    'SELECT bioguide_id, full_name FROM filers WHERE chamber = ? AND state = ? AND merged_into IS NULL',
+    [chamber, state],
+  );
+  for (const c of candidates) {
+    if (sameFilerIdentity({ fullName, chamber, state }, { fullName: c.full_name, chamber, state })) {
+      return c.bioguide_id;
+    }
+  }
+  return filerId;
+}
+
+export async function getPreviousSuccessfulSourceAttemptAt(
+  env: Env,
+  source: 'house' | 'senate' | 'executive',
+  beforeIso: string,
+): Promise<string | null> {
+  try {
+    const row = await get<{ attempted_at: string }>(
+      env.DB,
+      `SELECT attempted_at FROM source_attempts
+        WHERE source = ? AND outcome = 'success' AND attempted_at < ?
+        ORDER BY attempted_at DESC LIMIT 1`,
+      [source, beforeIso],
+    );
+    return row?.attempted_at ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function insertFilingIfNew(
   env: Env,
   f: DiscoveredFiling,
   nowIso: string,
+  opts?: { prevProbeAt?: string | null; probeIntervalSec?: number | null },
 ): Promise<InsertFilingResult> {
   // GOVERNOR 2: discovery upserts are a known storm writer (a source that
   // suddenly returns thousands of "new" rows, or a crawler loop). Past the
@@ -211,7 +322,10 @@ export async function insertFilingIfNew(
     return 'deferred';
   }
   const filerName = cleanFilerName(f.filerName) || null;
-  if (f.filerId && filerName) {
+  const filerId = f.filerId && filerName
+    ? await resolveIngestFilerId(env, f.filerId, filerName, f.chamber, f.state ?? null)
+    : f.filerId ?? null;
+  if (filerId && filerName) {
     if (f.party || f.photoUrl) {
       // Sources that curate party/portrait metadata (the OGE executive index)
       // upsert it so pre-existing filer rows — created before the metadata was
@@ -225,14 +339,14 @@ export async function insertFilingIfNew(
            photo_url = COALESCE(excluded.photo_url, photo_url)
          WHERE (excluded.party IS NOT NULL AND (filers.party IS NULL OR filers.party != excluded.party))
             OR (excluded.photo_url IS NOT NULL AND (filers.photo_url IS NULL OR filers.photo_url != excluded.photo_url))`,
-        [f.filerId, f.chamber, filerName, f.party ?? null, f.state ?? null, f.district ?? null, f.photoUrl ?? null],
+        [filerId, f.chamber, filerName, f.party ?? null, f.state ?? null, f.district ?? null, f.photoUrl ?? null],
       );
     } else {
       await run(
         env.DB,
         `INSERT OR IGNORE INTO filers (bioguide_id, chamber, full_name, party, state, district, committees)
          VALUES (?, ?, ?, NULL, ?, ?, NULL)`,
-        [f.filerId, f.chamber, filerName, f.state ?? null, f.district ?? null],
+        [filerId, f.chamber, filerName, f.state ?? null, f.district ?? null],
       );
     }
   }
@@ -243,10 +357,11 @@ export async function insertFilingIfNew(
       `INSERT OR IGNORE INTO filings
        (doc_id, chamber, filer_id, filing_type, filed_date, source_url,
         raw_object_key, ingest_status, doc_kind, extractor, model_version,
-        confidence, first_seen_at, source_updated_at, error)
+        confidence, first_seen_at, source_updated_at, error, prev_probe_at, probe_interval_sec,
+        discovered_via)
      VALUES (?, ?, ?, 'P', ?, ?, NULL, 'new', ?, NULL, NULL,
-             NULL, ?, NULL, NULL)`,
-      [f.docId, f.chamber, f.filerId ?? null, filedDate, f.sourceUrl, docKind, nowIso],
+             NULL, ?, NULL, NULL, ?, ?, ?)`,
+      [f.docId, f.chamber, filerId ?? null, filedDate, f.sourceUrl, docKind, nowIso, opts?.prevProbeAt ?? null, opts?.probeIntervalSec ?? null, f.discoveredVia ?? null],
     ],
     ingestionOutboxInsertForDoc(f.docId, nowIso),
   ]);
@@ -256,18 +371,17 @@ export async function insertFilingIfNew(
   // reachable: atomically reopen only the narrowly-tagged provider seed.  The
   // outbox statement above has already created the durable fetch hand-off.
   let upgradedProviderSeed = false;
+  let upgradedNotFound = false;
   if ((res.meta?.changes ?? 0) === 0) {
-    const [providerSeed] = await all<{ doc_id: string }>(
+    const [existingRow] = await all<{ doc_id: string; ingest_status: string; extractor: string | null }>(
       env.DB,
-      `SELECT doc_id FROM filings
+      `SELECT doc_id, ingest_status, extractor FROM filings
         WHERE doc_id = ?
-          AND ingest_status = 'provider_seeded'
-          AND extractor = 'fmp-senate-latest'
           AND raw_object_key IS NULL
         LIMIT 1`,
       [f.docId],
     );
-    if (providerSeed) {
+    if (existingRow && existingRow.ingest_status === 'provider_seeded' && existingRow.extractor === 'fmp-senate-latest') {
       const upgrade = await run(
         env.DB,
         `UPDATE filings
@@ -282,15 +396,83 @@ export async function insertFilingIfNew(
               model_version = NULL,
               confidence = NULL,
               first_seen_at = ?,
+              prev_probe_at = COALESCE(?, prev_probe_at),
+              probe_interval_sec = COALESCE(?, probe_interval_sec),
               source_updated_at = NULL,
               error = NULL
         WHERE doc_id = ?
           AND ingest_status = 'provider_seeded'
           AND extractor = 'fmp-senate-latest'
           AND raw_object_key IS NULL`,
-        [f.chamber, f.filerId ?? null, filedDate, f.sourceUrl, nowIso, f.docId],
+        [
+          f.chamber,
+          filerId ?? null,
+          filedDate,
+          f.sourceUrl,
+          nowIso,
+          opts?.prevProbeAt ?? null,
+          opts?.probeIntervalSec ?? null,
+          f.docId,
+        ],
       );
       upgradedProviderSeed = (upgrade.meta?.changes ?? 0) > 0;
+    } else if (existingRow && (existingRow.ingest_status === 'not_found' || existingRow.ingest_status === 'failed')) {
+      // Unblock official filings that collided with prior frontier-probe phantoms
+      // (observed 2026-07-30 sequential burst H-2026-20035076..20035975, e.g.
+      // Cisneros H-2026-20035190, Taylor H-2026-20035146 / H-2026-20035392).
+      const upgrade = await run(
+        env.DB,
+        `UPDATE filings
+          SET chamber = ?,
+              filer_id = COALESCE(?, filer_id),
+              filed_date = COALESCE(?, filed_date),
+              source_url = ?,
+              raw_object_key = NULL,
+              ingest_status = 'new',
+              doc_kind = ?,
+              extractor = NULL,
+              model_version = NULL,
+              confidence = NULL,
+              first_seen_at = ?,
+              prev_probe_at = COALESCE(?, prev_probe_at),
+              probe_interval_sec = COALESCE(?, probe_interval_sec),
+              source_updated_at = NULL,
+              error = NULL
+        WHERE doc_id = ?
+          AND ingest_status IN ('not_found', 'failed')
+          AND raw_object_key IS NULL`,
+        [
+          f.chamber,
+          filerId ?? null,
+          filedDate,
+          f.sourceUrl,
+          docKind,
+          nowIso,
+          opts?.prevProbeAt ?? null,
+          opts?.probeIntervalSec ?? null,
+          f.docId,
+        ],
+      );
+      if ((upgrade.meta?.changes ?? 0) > 0) {
+        upgradedNotFound = true;
+        // Re-arm ingestion_outbox so the fetcher picks it up
+        await run(
+          env.DB,
+          `INSERT INTO ingestion_outbox
+             (doc_id, chamber, source_url, status, attempts, available_at, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+           ON CONFLICT(doc_id) DO UPDATE SET
+             chamber = excluded.chamber,
+             source_url = excluded.source_url,
+             status = 'pending',
+             attempts = 0,
+             available_at = excluded.available_at,
+             last_error = NULL,
+             updated_at = excluded.updated_at`,
+          [f.docId, f.chamber, f.sourceUrl, nowIso, nowIso, nowIso],
+        );
+        await enqueueIngestionOutboxNow(env, f.docId);
+      }
     }
   }
   // Backfill filed_date when a later, richer discovery of the same doc supplies
@@ -299,40 +481,19 @@ export async function insertFilingIfNew(
   // ZIP later surfaces the same doc WITH a date, so COALESCE it in then instead
   // of leaving the row permanently dateless.
   if (filedDate) {
-    await run(env.DB, 'UPDATE filings SET filed_date = ? WHERE doc_id = ? AND filed_date IS NULL', [
-      filedDate,
-      f.docId,
-    ]);
-    // Same backfill on the latency candidate row: recordDisclosureLatencyCandidate
-    // only runs for genuinely-new discoveries (see persistAndEnqueue), so a
-    // duplicate discovery that finally supplies a filed_date (e.g. the bulk ZIP
-    // confirming a live-search-only doc) would otherwise leave
-    // disclosure_latency_candidates.filed_date permanently NULL, breaking the
-    // FMP matcher's filer/date fallback for that filing. disclosure_latency_candidates
-    // is an optional table (migration 0021); swallow a missing-table error the
-    // same way recordDisclosureLatencyCandidate does rather than aborting the
-    // whole discovery on a deployment where it hasn't been applied yet.
-    try {
-      await run(
-        env.DB,
-        'UPDATE disclosure_latency_candidates SET filed_date = ? WHERE doc_id = ? AND (filed_date IS NULL OR filed_date = "")',
-        [filedDate, f.docId],
-      );
-    } catch (err) {
-      if (!storageMissing(err)) throw err;
-    }
+    await applyHouseFiledDateIfMissing(env, f.docId, { iso: filedDate, source: 'index' });
   }
-  if (f.filerId) {
+  if (filerId) {
     await run(env.DB, 'UPDATE filings SET filer_id = ? WHERE doc_id = ? AND filer_id IS NULL', [
-      f.filerId,
+      filerId,
       f.docId,
     ]);
     await run(env.DB, 'UPDATE transactions SET filer_id = ? WHERE doc_id = ? AND filer_id IS NULL', [
-      f.filerId,
+      filerId,
       f.docId,
     ]);
   }
-  return (res.meta?.changes ?? 0) > 0 || upgradedProviderSeed ? 'inserted' : 'duplicate';
+  return (res.meta?.changes ?? 0) > 0 || upgradedProviderSeed || upgradedNotFound ? 'inserted' : 'duplicate';
 }
 
 /** Enqueue the canonical filing.new INGEST_QUEUE message for a discovered filing. */
@@ -348,19 +509,24 @@ async function persistAndEnqueue(
   env: Env,
   filings: DiscoveredFiling[],
   nowIso: string,
-  opts: { maxNew?: number } = {},
-): Promise<number> {
+  opts: { maxNew?: number; prevProbeAt?: string | null; probeIntervalSec?: number | null } = {},
+): Promise<{ count: number; inserted: DiscoveredFiling[] }> {
   let newCount = 0;
+  const inserted: DiscoveredFiling[] = [];
   for (const f of filings) {
     if (opts.maxNew !== undefined && newCount >= opts.maxNew) break;
-    const insertResult = await insertFilingIfNew(env, f, nowIso);
+    const insertResult = await insertFilingIfNew(env, f, nowIso, {
+      prevProbeAt: opts.prevProbeAt,
+      probeIntervalSec: opts.probeIntervalSec,
+    });
     if (insertResult === 'inserted') {
       await recordDisclosureLatencyCandidate(env, f, nowIso);
       await enqueueFilingNew(env, f);
       newCount += 1;
+      inserted.push(f);
     }
   }
-  return newCount;
+  return { count: newCount, inserted };
 }
 
 /** Write one ingest_log row recording the cadence + yield of a poll. */
@@ -383,23 +549,29 @@ export type SourceAttemptOutcome = 'success' | 'failure';
 
 async function recordSourceAttempt(
   env: Env,
-  source: 'house' | 'senate',
+  source: 'house' | 'senate' | 'executive',
   attemptedAt: string,
   outcome: SourceAttemptOutcome,
   newCount: number,
   error: string | null,
 ): Promise<void> {
   try {
-    await run(
+    await withSqliteLockRetry(() => run(
       env.DB,
       `INSERT INTO source_attempts (source, attempted_at, outcome, new_count, error)
        VALUES (?, ?, ?, ?, ?)`,
       [source, attemptedAt, outcome, newCount, error?.slice(0, 1000) ?? null],
-    );
+    ));
   } catch (err) {
-    // Deploys briefly run new code before /api/admin/migrate. Do not convert a
+    // Deploys briefly run new code before /api/admin/migrate.  Do not convert a
     // source success/failure into a different result solely because the new
-    // observability table is not present yet.
+    // observability table is not present yet.  A missing table is one warn and
+    // no retry.  A busy database is retried, then logged, and still does not
+    // fail the poll.
+    if (isSqliteLockBusy(err)) {
+      console.error('watcher: failed to record source attempt:', source, (err as Error).message);
+      return;
+    }
     console.warn('watcher: failed to record source attempt:', source, (err as Error).message);
   }
 }
@@ -407,10 +579,13 @@ async function recordSourceAttempt(
 /**
  * A source failure is "transient" when it reflects a recoverable upstream or
  * platform condition rather than a bug: anti-bot blocks (403), rate limits
- * (429), and transient D1/Workers platform limits. These recur on a normal
+ * (429), and transient D1/Workers platform limits.  These recur on a normal
  * cadence (e.g. the Senate efdsearch 403), so logging them at `error` floods
- * observability and buries genuine errors. We log them at `warn` instead; the
- * daily bulk/backfill path keeps history complete regardless.
+ * observability and buries genuine errors.  We log them at `warn` instead; for
+ * the House the daily bulk index keeps history complete regardless.  The
+ * Senate has no bulk path, and a persistent eFD edge deny is not transient:
+ * runWatcher handles that class (SenateHttpError `edge_denied`) before this
+ * check is consulted.
  */
 export function isTransientSourceError(message: string): boolean {
   return (
@@ -423,15 +598,69 @@ export function isTransientSourceError(message: string): boolean {
   );
 }
 
+/**
+ * Senate error text with the proxy secrets and URL userinfo scrubbed, for
+ * the logs and source_attempts (CT-2442).  It can carry proxy transport text
+ * or upstream detail.
+ */
+function scrubSenateErrorText(env: Env, err: unknown): string {
+  const secrets = senateEfdTransportScrubSecrets(env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL, env);
+  return sanitizeEfdTransportError(err, secrets, 1000);
+}
+
 /** Record a source-level failure without presenting it as a successful poll. */
-async function recordSourceError(env: Env, source: 'house' | 'senate', nowIso: string, err: unknown): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
-  if (isTransientSourceError(message)) {
-    console.warn(`watcher: ${source} source degraded (transient, bulk path still authoritative):`, message);
+async function recordSourceError(env: Env, source: 'house' | 'senate' | 'executive', nowIso: string, err: unknown): Promise<void> {
+  const message = source === 'senate'
+    ? scrubSenateErrorText(env, err)
+    : err instanceof Error ? err.message : String(err);
+  // A residential-proxy outage is an egress fault to act on, even when the
+  // wrapped direct-fallback answer carries "HTTP 403".
+  if (!(err instanceof SenateProxyEgressError) && isTransientSourceError(message)) {
+    // eFD search is the only Senate discovery path; there is no Senate bulk index.
+    const fallback = source === 'senate' ? 'no alternate Senate discovery path' : 'bulk path still authoritative';
+    console.warn(`watcher: ${source} source degraded (transient, ${fallback}):`, message);
   } else {
     console.error(`watcher: ${source} source failed:`, message);
   }
   await recordSourceAttempt(env, source, nowIso, 'failure', 0, message);
+}
+
+/**
+ * Record a Senate eFD edge deny (CT-2442): grow and persist the polling
+ * backoff, say plainly what is blocked, and write the failure receipt.
+ * Returns the saved backoff, or null when it could not be saved (the 600 s
+ * failure skip then still applies).
+ *
+ * Log level: console.error for the first deny of an episode, console.warn for
+ * the repeats.  Both levels reach Sentry logs and Datadog (consoleLogging /
+ * the console hook capture warn and error); error is the level this codebase
+ * escalates to once per sustained outage.  The start of a whole-chamber
+ * discovery outage belongs there once, and the repeats, at most one per
+ * backoff window, are already paged by the polling_senate liveness alarm.
+ *
+ * Only the classified fields (source, failure class, step, HTTP status,
+ * Server header, the count and the next attempt) reach the log line, the
+ * receipt and the stored backoff reason, never the error's raw message.
+ */
+async function recordSenateEdgeDenied(
+  env: Env,
+  now: Date,
+  err: SenateHttpError,
+  prev: SenateEdgeBackoffState | null,
+): Promise<SenateEdgeBackoffState | null> {
+  const reason = senateEdgeDenyReason(err);
+  const next = nextSenateEdgeBackoff(prev, now, reason);
+  const saved = await writeSenateEdgeBackoff(env, next);
+  const plan = saved
+    ? `next senate attempt after ${next.until} (${Math.round(next.windowMs / 60_000)}m backoff)`
+    : 'the backoff could not be saved, so the 600s failure skip applies';
+  const line = `watcher: senate eFD edge denied (${next.consecutive} in a row since ${next.firstDeniedAt}): `
+    + 'Senate PTR discovery and document fetch are blocked while eFD refuses the agreement, '
+    + `and there is no alternate Senate discovery path; ${plan} [${senateEdgeDenyLogFields(err)}]`;
+  if (next.consecutive === 1) console.error(line);
+  else console.warn(line);
+  await recordSourceAttempt(env, 'senate', now.toISOString(), 'failure', 0, reason);
+  return saved ? next : null;
 }
 
 /** Days into January during which the previous year's House index is ALSO
@@ -473,24 +702,31 @@ export function inHousePriorYearWindow(now: Date, overlapDays: number): boolean 
  * Poll the House yearly bulk index, diff against D1, enqueue new PTRs.
  * Throws on any failure (caught by the per-source guard in runWatcher).
  */
-async function pollHouse(env: Env, now: Date): Promise<number> {
+async function pollHouse(
+  env: Env,
+  now: Date,
+  signal?: AbortSignal,
+  tickSignal?: AbortSignal,
+): Promise<number> {
   const nowIso = now.toISOString();
   const year = Number(
     new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric' }).format(now),
   );
-  const all = await fetchHouseIndex(year);
+  const houseRelayUrl = env.HOUSE_RELAY_URL || env.INGEST_RELAY_URL;
+  const all = await fetchHouseIndex(year, { relayUrl: houseRelayUrl, signal });
   const ptrs = all.filter((f) => f.isPtr);
 
   const byDoc = new Map<string, DiscoveredFiling>();
   for (const f of ptrs) {
-    byDoc.set(f.pipelineDocId, houseDiscovery(f));
+    byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'bulk' });
   }
 
   // YEAR-BOUNDARY GAP: for the first N days of a new ET year, also sweep the
-  // PRIOR year's index (hourly, not every poll). A PTR filed Dec 30 can enter
+  // PRIOR year's index (hourly, not every poll).  A PTR filed Dec 30 can enter
   // the {YEAR-1}FD index days later — after we've switched to polling {YEAR} —
-  // and would otherwise never be discovered. Fail-soft: a prior-year fetch
-  // problem must not fail the current-year poll.
+  // and would otherwise never be discovered.  Fail-soft: a prior-year fetch
+  // problem (including a per-source 7s timeout after current-year succeeded)
+  // must not fail the current-year poll unless the outer tickSignal aborted.
   const overlapDays = await tunableInt(
     env,
     'HOUSE_PRIOR_YEAR_OVERLAP_DAYS',
@@ -503,73 +739,215 @@ async function pollHouse(env: Env, now: Date): Promise<number> {
       const lastIso = env.CONFIG_KV ? await env.CONFIG_KV.get(HOUSE_PRIOR_YEAR_KV_KEY) : null;
       const lastMs = lastIso ? Date.parse(lastIso) : NaN;
       if (!Number.isFinite(lastMs) || now.getTime() - lastMs >= HOUSE_PRIOR_YEAR_FETCH_INTERVAL_MS) {
-        const prior = (await fetchHouseIndex(year - 1)).filter((f) => f.isPtr);
+        const prior = (await fetchHouseIndex(year - 1, { relayUrl: houseRelayUrl, signal })).filter((f) => f.isPtr);
         for (const f of prior) {
-          if (!byDoc.has(f.pipelineDocId)) byDoc.set(f.pipelineDocId, houseDiscovery(f));
+          if (!byDoc.has(f.pipelineDocId)) byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'bulk' });
         }
         if (env.CONFIG_KV) await env.CONFIG_KV.put(HOUSE_PRIOR_YEAR_KV_KEY, nowIso);
       }
     } catch (err) {
+      if (tickSignal?.aborted) throw err;
       console.warn('watcher: house prior-year index poll failed (current year unaffected):', (err as Error).message);
     }
   }
 
-  // Intraday overlay: catch same-day PTRs that the daily XML hasn't picked up
-  // yet. Fail-soft — a flaky/anti-bot live endpoint must never break the stable
-  // bulk path. INSERT OR IGNORE de-dupes the overlap with the bulk rows above.
+  // Intraday live-search overlay: runs on each scheduled House poll (following
+  // the adaptive cadence: 60s in the morning burst, 4 min shoulder, ~10 min
+  // midday, 30 min overnight).  Fail-soft — a flaky live endpoint or per-source
+  // timeout after the current-year bulk XML has already been fetched must never
+  // discard the bulk rows above unless the outer tickSignal aborted.
   if (await houseLiveSearchEnabled(env)) {
     let liveErr: Error | null = null;
     try {
-      const live = await pollHouseLiveSearch(year);
+      const live = await pollHouseLiveSearch(year, fetch, { env, signal });
       for (const f of live) {
-        if (!byDoc.has(f.pipelineDocId)) {
-          byDoc.set(f.pipelineDocId, houseDiscovery(f));
+        const existing = byDoc.get(f.pipelineDocId);
+        if (!existing) {
+          byDoc.set(f.pipelineDocId, { ...houseDiscovery(f), discoveredVia: 'live' });
+        } else if (existing.discoveredVia === 'bulk') {
+          // Seen by BOTH the bulk index and live search this poll: live search
+          // did surface it, so attribute it to 'live' (otherwise the stale
+          // bulk-discovery alert would false-positive).  Keep the bulk record
+          // itself: the live-search HTML carries no FilingDate, so replacing it
+          // would insert filed_date NULL.
+          byDoc.set(f.pipelineDocId, { ...existing, discoveredVia: 'live' });
         }
       }
     } catch (err) {
+      if (tickSignal?.aborted) throw err;
       liveErr = err as Error;
     }
-    // Consecutive-failure counter — fully isolated in its own try/catch. A KV
-    // blip here must never (a) fall into the poll's failure path and record a
-    // live-search *success* as a failure, nor (b) escape and abort the
-    // authoritative bulk persist/enqueue below. The observability overlay is
-    // strictly best-effort; the bulk path is not.
-    let fails = liveErr ? 1 : 0;
-    try {
-      if (env.CONFIG_KV) {
-        if (!liveErr) {
-          const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
-          if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
+      // Consecutive-failure counter — fully isolated in its own try/catch. A KV
+      // blip here must never (a) fall into the poll's failure path and record a
+      // live-search *success* as a failure, nor (b) escape and abort the
+      // authoritative bulk persist/enqueue below. The observability overlay is
+      // strictly best-effort; the bulk path is not.
+      let fails = liveErr ? 1 : 0;
+      try {
+        if (env.CONFIG_KV) {
+          if (!liveErr) {
+            const prevFails = parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0;
+            if (prevFails !== 0) await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, '0');
+          } else {
+            fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
+            await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+          }
+        }
+      } catch (counterErr) {
+        console.warn(
+          'watcher: house live-search failure-counter update failed (ignored):',
+          (counterErr as Error).message,
+        );
+      }
+      if (liveErr) {
+        if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
+          console.error(
+            `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
+            liveErr.message,
+          );
         } else {
-          fails = (parseInt((await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0', 10) || 0) + 1;
-          await env.CONFIG_KV.put(HOUSE_LIVE_SEARCH_FAILS_KV_KEY, String(fails));
+          console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
         }
       }
-    } catch (counterErr) {
-      console.warn(
-        'watcher: house live-search failure-counter update failed (ignored):',
-        (counterErr as Error).message,
-      );
     }
-    if (liveErr) {
-      if (fails % HOUSE_LIVE_SEARCH_ESCALATE_EVERY === 0) {
-        console.error(
-          `watcher: house live search has failed ${fails} consecutive polls — intraday House discovery is degraded to the daily bulk index:`,
-          liveErr.message,
-        );
-      } else {
-        console.warn('watcher: house live search failed (bulk index still used):', liveErr.message);
-      }
-    }
-  }
 
   const discovered: DiscoveredFiling[] = Array.from(byDoc.values());
-  const newCount = await persistAndEnqueue(env, discovered, nowIso);
+  const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'house', nowIso);
+  const probeIntervalSec = prevAttemptAt
+    ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
+    : null;
+  const { count: newCount, inserted } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
+  await alertOnStaleBulkDiscoveries(env, inserted, nowIso);
   await logPoll(env, 'house', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'house', now);
   await recordSourceAttempt(env, 'house', nowIso, 'success', newCount, null);
   return newCount;
 }
+
+/**
+ * Bulk-window discovery alert (Jay directive 2026-10-16).
+ *
+ *  A filing first discovered via the daily bulk XML whose filed_date is more
+ *  than BULK_DISCOVERY_ALERT_THRESHOLD_MS old means live-search missed it
+ *  intraday across a full window of polls. Logs via console.error (Sentry-visible,
+ *  matching the watcher's existing escalation pattern) with the doc id, member,
+ *  filed/discovered timestamps, hours late, and live-search health.
+ */
+export interface StaleBulkDiscoveryAlert {
+  docId: string;
+  filerName: string | null;
+  filedDate: string;
+  discoveredAt: string;
+  hoursLate: number;
+  liveSearchFails: string;
+}
+
+/**
+ * Latest instant a filed_date can denote, so the filing's age is a lower bound.
+ * The House bulk XML reports a
+ * day-granularity `M/D/YYYY` (normalized rows hold `YYYY-MM-DD`), which says
+ * nothing about the time of day.  Reading it as midnight UTC would make a
+ * filing filed earlier the same day look ~13h old at the morning bulk refresh,
+ * so a date-only value counts as filed at the END of that calendar day on the
+ * Clerk's ET clock: lateness is then a lower bound and a same-day discovery is
+ * never late.  A value that carries a time of day is parsed as given.
+ * Returns null for empty or unparseable input.
+ */
+export function filedInstantUpperBoundMs(filedDate: string | null | undefined): number | null {
+  const s = (filedDate ?? '').trim();
+  if (!s) return null;
+  const dayOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s) ?? /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  if (!dayOnly) {
+    const ms = Date.parse(s);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const iso = s.includes('-');
+  const y = Number(iso ? dayOnly[1] : dayOnly[3]);
+  const m = Number(iso ? dayOnly[2] : dayOnly[1]);
+  const d = Number(iso ? dayOnly[3] : dayOnly[2]);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  // Midnight ET starting the NEXT day is 04:00Z (EDT) or 05:00Z (EST).
+  const nextDayUtc = Date.UTC(y, m - 1, d + 1);
+  const etHour = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    hourCycle: 'h23',
+  });
+  for (const offsetHours of [4, 5]) {
+    const t = nextDayUtc + offsetHours * 3600000;
+    if (Number(etHour.format(t)) === 0) return t;
+  }
+  return nextDayUtc + 5 * 3600000;
+}
+
+/**
+ * Pure helper: returns alerts for bulk-discovered filings older than the threshold.
+ * Exported for testing; the console.error side effect lives in alertOnStaleBulkDiscoveries.
+ * `hoursLate` is measured from the end of the filed day in ET for day-only
+ * filed dates (see filedInstantUpperBoundMs).
+ */
+export function findStaleBulkDiscoveries(
+  inserted: DiscoveredFiling[],
+  nowIso: string,
+  liveSearchFails: string = 'unknown',
+): StaleBulkDiscoveryAlert[] {
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(nowMs)) return [];
+  const alerts: StaleBulkDiscoveryAlert[] = [];
+  for (const f of inserted) {
+    if (f.discoveredVia !== 'bulk') continue;
+    if (!f.filedDate) continue;
+    const filedMs = filedInstantUpperBoundMs(f.filedDate);
+    if (filedMs === null) continue;
+    const lateMs = nowMs - filedMs;
+    if (lateMs <= BULK_DISCOVERY_ALERT_THRESHOLD_MS) continue;
+    alerts.push({
+      docId: f.docId,
+      filerName: f.filerName ?? null,
+      filedDate: f.filedDate,
+      discoveredAt: nowIso,
+      hoursLate: Math.round((lateMs / 3600000) * 10) / 10,
+      liveSearchFails,
+    });
+  }
+  return alerts;
+}
+
+export async function alertOnStaleBulkDiscoveries(
+  env: Env,
+  inserted: DiscoveredFiling[],
+  nowIso: string,
+): Promise<void> {
+  let liveSearchFails: string = 'unknown';
+  try {
+    if (env.CONFIG_KV) {
+      liveSearchFails = (await env.CONFIG_KV.get(HOUSE_LIVE_SEARCH_FAILS_KV_KEY)) ?? '0';
+    }
+  } catch {
+    // best-effort only; never block the alert on a KV read
+  }
+  for (const a of findStaleBulkDiscoveries(inserted, nowIso, liveSearchFails)) {
+    console.error(
+      `watcher: house filing ${a.docId} (${a.filerName ?? 'unknown member'}) ` +
+      `filed ${a.filedDate} but first discovered via BULK index at ${a.discoveredAt} ` +
+      `(${a.hoursLate}h late, measured from the end of the filed day in ET) — live-search missed it intraday ` +
+      `(live-search consecutive failures: ${a.liveSearchFails})`,
+    );
+  }
+}
+
+/** Bulk-window discovery alert threshold.
+ *
+ *  When a House filing is first discovered via the daily bulk XML (not intraday
+ *  live-search) and its filed_date is older than this, something is wrong: the
+ *  filing survived a full window of live-search polls (~12 polls at the 20-min
+ *  off-hours cadence, ~48 at the 5-min weekday cadence) without intraday
+ *  discovery. Either live-search is failing/missing it, or the Clerk published
+ *  very late — both warrant a look. Under the threshold stays silent (normal
+ *  Clerk publication lag). Set per Jay 2026-10-16: he'd rather investigate a
+ *  false positive than miss a live-search failure.
+ */
+export const BULK_DISCOVERY_ALERT_THRESHOLD_MS = 4 * 3600 * 1000;
 
 /** Default / max lookback windows for the Senate submitted-date filter.
  *  Tunable via SENATE_LOOKBACK_DAYS / SENATE_MAX_LOOKBACK_DAYS. */
@@ -609,11 +987,42 @@ export function computeSenateLookbackDays(
   return Math.min(max, Math.max(baseDays, gapDays));
 }
 
+/** Map Senate filings to watcher discovery rows.  Shared by pollSenate and
+ * the out-of-band intake so both paths mint identical filer identities. */
+export function senateDiscoveredFilings(filings: SenateFiling[]): DiscoveredFiling[] {
+  return filings.map((f) => {
+    const filerName = cleanFilerName(f.fullName || [f.first, f.last].filter(Boolean).join(' ').trim()) || null;
+    return {
+      docId: f.pipelineDocId,
+      chamber: 'senate' as const,
+      sourceUrl: f.sourceUrl,
+      filedDate: f.filedDate,
+      filerId: senateFilerId(filerName),
+      filerName,
+    };
+  });
+}
+
+/**
+ * Persist Senate filings discovered outside the poller (the Mac eFD fetcher
+ * intake, CT-2442) through the same insert + durable-outbox path as
+ * pollSenate.  This deliberately writes no poll log, no last-poll state, and
+ * no source-attempt health: an intake must not make a still-failing Senate
+ * poller look healthy.
+ */
+export async function ingestSenateFilings(
+  env: Env,
+  filings: SenateFiling[],
+  now: Date,
+): Promise<{ count: number; inserted: DiscoveredFiling[] }> {
+  return persistAndEnqueue(env, senateDiscoveredFilings(filings), now.toISOString());
+}
+
 /**
  * Poll the Senate efdsearch DataTables API, diff against D1, enqueue new PTRs.
  * Throws on any failure (caught by the per-source guard in runWatcher).
  */
-async function pollSenate(env: Env, now: Date): Promise<number> {
+async function pollSenate(env: Env, now: Date, signal?: AbortSignal): Promise<number> {
   const nowIso = now.toISOString();
   const baseDays = await tunableInt(
     env,
@@ -641,22 +1050,31 @@ async function pollSenate(env: Env, now: Date): Promise<number> {
   const lastSuccessAt = await getLastPollAt(env, 'senate');
   const lookbackDays = computeSenateLookbackDays(now, lastSuccessAt, baseDays, maxDays, deepSweepDue);
   const since = new Date(now.getTime() - lookbackDays * 86_400_000);
-  const filings = await fetchSenatePtrFilings({ now, since, kv: env.CONFIG_KV });
-  const discovered: DiscoveredFiling[] = filings.map((f) => {
-    const filerName = cleanFilerName(f.fullName || [f.first, f.last].filter(Boolean).join(' ').trim()) || null;
-    return {
-      docId: f.pipelineDocId,
-      chamber: 'senate' as const,
-      sourceUrl: f.sourceUrl,
-      filedDate: f.filedDate,
-      filerId: senateFilerId(filerName),
-      filerName,
-    };
+  const filings = await fetchSenatePtrFilings({
+    now,
+    since,
+    kv: env.CONFIG_KV,
+    relayUrl: env.SENATE_RELAY_URL,
+    relaySecret: env.SENATE_RELAY_SECRET,
+    proxyUrl: env.RESIDENTIAL_PROXY_URL || env.SENATE_PROXY_URL,
+    signal,
   });
-  const newCount = await persistAndEnqueue(env, discovered, nowIso);
+  const discovered = senateDiscoveredFilings(filings);
+  const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'senate', nowIso);
+  const probeIntervalSec = prevAttemptAt
+    ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
+    : null;
+  const { count: newCount } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
   await logPoll(env, 'senate', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'senate', now);
-  await recordSourceAttempt(env, 'senate', nowIso, 'success', newCount, null);
+  await recordSourceAttempt(
+    env,
+    'senate',
+    nowIso,
+    'success',
+    newCount,
+    formatSenateEfdTransportNote(readSenateEfdTransport(filings)),
+  );
   // Stamp the deep sweep ONLY after a fully successful poll: a 403 day must
   // not consume the day's widened window.
   if (deepSweepDue && env.CONFIG_KV) {
@@ -678,37 +1096,193 @@ export interface WatcherResult {
   house: SourceAttemptOutcome | 'skipped';
   senate: SourceAttemptOutcome | 'skipped';
   executive: SourceAttemptOutcome | 'skipped';
+  /** Why House/Senate polled or skipped this tick — which tier, which window,
+   *  which authority. `'skipped'` on its own cannot distinguish "correctly
+   *  off-peak" from "the cadence quietly stopped", which is the whole point.
+   *  Optional so existing structural consumers of WatcherResult are unaffected. */
+  houseCadence?: SourcePollDecision;
+  senateCadence?: SourcePollDecision;
+  executiveCadence?: SourcePollDecision;
+  /** Set while Senate polling is backed off after an eFD edge deny, so a
+   *  `senate: 'skipped'` under a due cadence explains itself. */
+  senateEdgeBackoffUntil?: string;
 }
 
 /**
- * Poll the OGE President/VP index for new executive 278-T filings. Self-gated
- * to a slow cadence inside pollOgeExecutive (filings land every few weeks);
- * returns the count of genuinely-new filings, or null when disabled/not due.
+ * Poll the OGE President/VP index for new executive 278-T filings. Cadence is
+ * decided by decideSourcePoll (same adaptive probeSchedule as House/Senate).
+ * Returns the count of genuinely-new filings, or null when disabled/not due.
  */
 export async function pollExecutive(
   env: Env,
   now: Date,
-  opts: { force?: boolean; maxFilings?: number; dryRun?: boolean } = {},
+  opts: { force?: boolean; maxFilings?: number; dryRun?: boolean; signal?: AbortSignal } = {},
 ): Promise<number | null> {
   const nowIso = now.toISOString();
   const filings = await pollOgeExecutive(env, now, fetch, opts);
   if (filings === null) return null;
   const maxFilings = Math.min(Math.max(Math.floor(opts.maxFilings ?? 100), 1), 500);
   if (opts.dryRun) return Math.min(filings.length, maxFilings);
-  const newCount = await persistAndEnqueue(env, filings, nowIso, { maxNew: maxFilings });
+  const prevAttemptAt = await getPreviousSuccessfulSourceAttemptAt(env, 'executive', nowIso);
+  const probeIntervalSec = prevAttemptAt
+    ? Math.max(0, Math.round((Date.parse(nowIso) - Date.parse(prevAttemptAt)) / 1000))
+    : null;
+  const { count: newCount } = await persistAndEnqueue(env, filings, nowIso, { maxNew: maxFilings, prevProbeAt: prevAttemptAt, probeIntervalSec });
   await setLastPollAt(env, 'oge', now);
   await logPoll(env, 'oge', nowIso, newCount, nowIso);
+  // Liveness receipt (owner 2026-08-10: polling must never be silently off
+  // for any chamber). Executive historically wrote only the KV checkpoint,
+  // leaving no durable per-attempt record — which is exactly how a 5-day
+  // OGE polling outage went unnoticed. Fail-soft: a receipt failure must
+  // never fail the poll that just succeeded.
+  try {
+    await recordSourceAttempt(env, 'executive', nowIso, 'success', newCount, null);
+  } catch (err) {
+    console.warn('watcher: failed to record executive source attempt:', (err as Error).message);
+  }
   return newCount;
 }
 
-export async function runWatcher(env: Env, now: Date = new Date()): Promise<WatcherResult> {
+/**
+ * The composed poll decision for one direct source. PURE — no I/O, no clock
+ * read, no env read. Every input is passed in; the caller owns the reads.
+ *
+ * COMPOSITION (see probeSchedule.ts header and app/docs/probe-schedule.md):
+ * probeSchedule decides HOW OFTEN. There is no lease on House/Senate — the
+ * lease covers only the metered latency providers — so here the schedule is
+ * the sole authority, and the legacy poll_config windows are the fallback.
+ *
+ * Two paths, never both:
+ *   • SCHEDULE  — the measured windows own the cadence. This is the default.
+ *   • POLL-WINDOW — the legacy fixed-interval poll_config path, used when the
+ *     schedule is switched off (PROBE_SCHEDULE_ENABLED=0) or when the owner
+ *     has explicitly asked for aggressiveMode.
+ *
+ * WHY aggressiveMode FALLS BACK rather than being ignored: it is an owner-
+ * facing "poll as hard as you can" switch. Under the measured schedule the
+ * 08:55-09:40 peak already runs at 60s — five times faster than aggressive
+ * mode's 180s — but the 12:00-20:00 window would drop from 180s to ~10min,
+ * so honouring the switch means honouring the legacy path wholesale. The
+ * decision reports which authority ran, and the caller logs it, so this is
+ * never a silent downgrade.
+ */
+export interface SourcePollDecision {
+  readonly poll: boolean;
+  readonly authority: ProbeCadenceAuthority;
+  readonly tier: ProbeTier | 'none';
+  readonly dayType: DayType | 'n/a';
+  readonly intervalSec: number;
+  readonly elapsedSec: number;
+  readonly reason: string;
+}
+
+export function decideSourcePoll(args: {
+  source: 'house' | 'senate' | 'executive';
+  now: Date;
+  cfg: PollConfig;
+  lastPollAt: Date | null;
+  schedule?: ProbeScheduleConfig;
+}): SourcePollDecision {
+  const schedule = args.schedule ?? DEFAULT_PROBE_SCHEDULE_CONFIG;
+  const legacy = (reason: string): SourcePollDecision => {
+    const poll = shouldPollNow(args.now, args.cfg, args.lastPollAt);
+    return {
+      poll,
+      authority: 'poll-window',
+      tier: 'none',
+      dayType: 'n/a',
+      intervalSec: 0,
+      elapsedSec: args.lastPollAt
+        ? (args.now.getTime() - args.lastPollAt.getTime()) / 1000
+        : Infinity,
+      reason: poll ? `${reason}:due` : `${reason}:not-due`,
+    };
+  };
+
+  // Kill switch first: a disabled schedule must restore the OLD behaviour, not
+  // stop polling. shouldProbeNow() reports `disabled` with probe=false, and
+  // treating that as "do not poll" would silently halt ingestion the moment
+  // someone set PROBE_SCHEDULE_ENABLED=0.
+  if (!schedule.enabled) return legacy('schedule-disabled');
+  if (args.cfg.aggressiveMode) return legacy('aggressive-mode');
+
+  const decision = shouldProbeNow({
+    source: args.source,
+    now: args.now,
+    lastProbeAt: args.lastPollAt,
+    config: schedule,
+  });
+  return {
+    poll: decision.probe,
+    authority: 'schedule',
+    tier: decision.tier,
+    dayType: decision.dayType,
+    intervalSec: decision.intervalSec,
+    elapsedSec: decision.elapsedSec,
+    reason: decision.reason,
+  };
+}
+
+/**
+ * Build the live schedule config from env. Never throws — every unparseable
+ * value falls back to the shipped table (see probeScheduleConfigFromEnv), so a
+ * fat-fingered retune degrades to the measured default instead of stalling
+ * ingestion.
+ */
+function scheduleConfigFor(env: Env): ProbeScheduleConfig {
+  try {
+    return probeScheduleConfigFromEnv(env as unknown as Record<string, string | undefined>);
+  } catch {
+    return DEFAULT_PROBE_SCHEDULE_CONFIG;
+  }
+}
+
+function throwIfWatcherAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error(
+    signal.reason instanceof Error ? signal.reason.message : 'watcher aborted',
+  );
+  error.name = 'AbortError';
+  throw error;
+}
+
+export async function runWatcher(
+  env: Env,
+  now: Date = new Date(),
+  options: { signal?: AbortSignal } = {},
+): Promise<WatcherResult> {
+  throwIfWatcherAborted(options.signal);
   const cfg = await getConfig(env);
+  const schedule = scheduleConfigFor(env);
   const result: WatcherResult = { house: 'skipped', senate: 'skipped', executive: 'skipped' };
 
   // HOUSE -----------------------------------------------------------------
   try {
+    throwIfWatcherAborted(options.signal);
     const lastHouse = await getLastPollAt(env, 'house');
-    if (shouldPollNow(now, cfg, lastHouse)) {
+    const houseDecision = decideSourcePoll({
+      source: 'house',
+      now,
+      cfg,
+      lastPollAt: lastHouse,
+      schedule,
+    });
+    logProbeCadence(
+      {
+        lane: 'house',
+        source: 'house',
+        probe: houseDecision.poll,
+        tier: houseDecision.tier,
+        dayType: houseDecision.dayType,
+        intervalSec: houseDecision.intervalSec,
+        elapsedSec: houseDecision.elapsedSec,
+        authority: houseDecision.authority,
+        reason: houseDecision.reason,
+      },
+      now,
+    );
+    result.houseCadence = houseDecision;
+    if (houseDecision.poll) {
       const lastAttempt = await getLastAttemptAt(env, 'house');
       const elapsedSec = lastAttempt ? (now.getTime() - lastAttempt.getTime()) / 1000 : Infinity;
       const lastAttemptFailed = lastAttempt && (!lastHouse || lastHouse.getTime() < lastAttempt.getTime());
@@ -716,44 +1290,162 @@ export async function runWatcher(env: Env, now: Date = new Date()): Promise<Watc
         // Skip this poll tick to respect failure backoff
       } else {
         await setLastAttemptAt(env, 'house', now);
-        await pollHouse(env, now);
+        // Fresh 7s budget per source.  A timer created once at tick entry
+        // would already be spent by the time Senate and OGE run.
+        await pollHouse(env, now, watcherSourceIoSignal(options.signal), options.signal);
         result.house = 'success';
       }
     }
   } catch (err) {
+    if (options.signal?.aborted) throwIfWatcherAborted(options.signal);
+    if (err instanceof Error && err.name === 'AbortError') throw err;
     await recordSourceError(env, 'house', now.toISOString(), err);
     result.house = 'failure';
   }
 
   // SENATE ----------------------------------------------------------------
+  // eFD edge-deny backoff (CT-2442), read only when a poll is due.  A backoff
+  // whose last deny predates the last success is spent: success resets it.
+  let senateEdgeBackoff: SenateEdgeBackoffState | null = null;
   try {
+    throwIfWatcherAborted(options.signal);
     const lastSenate = await getLastPollAt(env, 'senate');
-    if (shouldPollNow(now, cfg, lastSenate)) {
+    const senateDecision = decideSourcePoll({
+      source: 'senate',
+      now,
+      cfg,
+      lastPollAt: lastSenate,
+      schedule,
+    });
+    logProbeCadence(
+      {
+        lane: 'senate',
+        source: 'senate',
+        probe: senateDecision.poll,
+        tier: senateDecision.tier,
+        dayType: senateDecision.dayType,
+        intervalSec: senateDecision.intervalSec,
+        elapsedSec: senateDecision.elapsedSec,
+        authority: senateDecision.authority,
+        reason: senateDecision.reason,
+      },
+      now,
+    );
+    result.senateCadence = senateDecision;
+    const proxyCatchup = !senateDecision.poll && await consumeResidentialProxySenateCatchup(env);
+    const senatePollDue = senateDecision.poll || proxyCatchup;
+    if (senatePollDue) {
+      senateEdgeBackoff = await readSenateEdgeBackoff(env);
+      if (senateEdgeBackoff && lastSenate && Date.parse(senateEdgeBackoff.lastDeniedAt) <= lastSenate.getTime()) {
+        senateEdgeBackoff = null;
+      }
       const lastAttempt = await getLastAttemptAt(env, 'senate');
       const elapsedSec = lastAttempt ? (now.getTime() - lastAttempt.getTime()) / 1000 : Infinity;
       const lastAttemptFailed = lastAttempt && (!lastSenate || lastSenate.getTime() < lastAttempt.getTime());
-      if (lastAttemptFailed && elapsedSec < 600) {
-        // Skip this poll tick to respect failure backoff
+      if (senateEdgeBackoff && isSenateEdgeBackoffActive(senateEdgeBackoff, now)) {
+        // eFD's edge refused the last attempt: stay off until the window ends
+        // instead of the 600 s failure skip.  polling_senate stays stalled
+        // and names the backoff meanwhile.
+        result.senateEdgeBackoffUntil = senateEdgeBackoff.until;
+      } else if (lastAttemptFailed && elapsedSec < 600 && !proxyCatchup) {
+        // Skip this poll tick to respect failure backoff (proxy recovery catch-up bypasses)
       } else {
         await setLastAttemptAt(env, 'senate', now);
-        await pollSenate(env, now);
+        await pollSenate(env, now, watcherSourceIoSignal(options.signal));
         result.senate = 'success';
+        if (senateEdgeBackoff) {
+          console.log(
+            `watcher: senate eFD accepted the poll again after ${senateEdgeBackoff.consecutive} edge denies `
+              + `since ${senateEdgeBackoff.firstDeniedAt}; backoff cleared`,
+          );
+          await clearSenateEdgeBackoff(env);
+        }
       }
     }
   } catch (err) {
-    await recordSourceError(env, 'senate', now.toISOString(), err);
+    if (options.signal?.aborted) throwIfWatcherAborted(options.signal);
+    if (err instanceof Error && err.name === 'AbortError') throw err;
+    if (isSenateEdgeDeniedError(err)) {
+      const backoff = await recordSenateEdgeDenied(env, now, err, senateEdgeBackoff);
+      if (backoff) result.senateEdgeBackoffUntil = backoff.until;
+    } else {
+      await recordSourceError(env, 'senate', now.toISOString(), err);
+    }
     result.senate = 'failure';
   }
 
   // EXECUTIVE (OGE 278-T) ---------------------------------------------------
-  // Entirely fail-soft and self-gated to a slow cadence; an OGE outage must
-  // never affect House/Senate polling above.
+  // Same decideSourcePoll + last_attempt failure skip as House/Senate.
+  // Fail-soft: an OGE outage must never affect House/Senate polling above.
+  // Server-first: direct extapps2.oge.gov, then Mac/scout relay if direct fails.
   try {
-    const polled = await pollExecutive(env, now);
-    if (polled !== null) result.executive = 'success';
+    throwIfWatcherAborted(options.signal);
+    const lastExec = await getLastPollAt(env, 'oge');
+    const execDecision = decideSourcePoll({
+      source: 'executive',
+      now,
+      cfg,
+      lastPollAt: lastExec,
+      schedule,
+    });
+    logProbeCadence(
+      {
+        lane: 'executive',
+        source: 'executive',
+        probe: execDecision.poll,
+        tier: execDecision.tier,
+        dayType: execDecision.dayType,
+        intervalSec: execDecision.intervalSec,
+        elapsedSec: execDecision.elapsedSec,
+        authority: execDecision.authority,
+        reason: execDecision.reason,
+      },
+      now,
+    );
+    result.executiveCadence = execDecision;
+    if (execDecision.poll) {
+      const lastAttempt = await getLastAttemptAt(env, 'oge');
+      const elapsedSec = lastAttempt ? (now.getTime() - lastAttempt.getTime()) / 1000 : Infinity;
+      const lastAttemptFailed = lastAttempt && (!lastExec || lastExec.getTime() < lastAttempt.getTime());
+      // Match House/Senate last_attempt skip. Do not invent a 10-minute
+      // backoff shorter than the current success interval (weekday floor is
+      // 15 min). House/Senate keep their own hardcoded 600.
+      const failureBackoffSec = Math.max(600, execDecision.intervalSec);
+      if (lastAttemptFailed && elapsedSec < failureBackoffSec) {
+        // Skip this poll tick to respect failure backoff
+      } else {
+        await setLastAttemptAt(env, 'oge', now);
+        const polled = await pollExecutive(env, now, { signal: watcherSourceIoSignal(options.signal) });
+        if (polled !== null) result.executive = 'success';
+      }
+    }
   } catch (err) {
+    if (options.signal?.aborted) throwIfWatcherAborted(options.signal);
+    if (err instanceof Error && err.name === 'AbortError') throw err;
     console.warn('watcher: executive (OGE) source failed:', (err as Error).message);
+    // Durable failure receipt so the polling_executive liveness check sees
+    // "attempts running, successes stale" instead of silence.
+    await recordSourceError(env, 'executive', now.toISOString(), err);
     result.executive = 'failure';
+  }
+
+  // Cheap GET /health against the named Senate tunnel.  Fail-soft: a probe
+  // error must never fail the watcher tick.  Writes CONFIG_KV so pipelineHealth
+  // can surface a dead Mac without adding an outbound hop to /api/health.
+  try {
+    await refreshSenateRelayHealth(env, now);
+  } catch (err) {
+    console.warn('watcher: senate relay health probe failed:', (err as Error).message);
+  }
+  try {
+    // Also refreshes the proxied Senate eFD functional probe (CT-2416).  It
+    // runs after the senate poll on purpose: a deny this tick has already
+    // armed the edge-deny backoff, and the probe skips while that is active,
+    // so a tick whose poll eFD just refused sends it no second agreement POST
+    // (CT-2442).
+    await refreshResidentialProxyHealth(env, now);
+  } catch (err) {
+    console.warn('watcher: residential proxy health probe failed:', (err as Error).message);
   }
   return result;
 }

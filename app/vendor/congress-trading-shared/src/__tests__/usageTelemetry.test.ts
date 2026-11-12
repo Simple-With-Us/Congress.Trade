@@ -1,11 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   createUsageTelemetryClient,
+  createUsageTelemetryV2Event,
   deriveUsageTelemetryIdempotencyKey,
   deriveUsageTelemetryV2IdempotencyKey,
   UsageTelemetryEventSchema,
   UsageTelemetryApiError,
   UsageTelemetryV2BatchSchema,
+  UsageTelemetryProducerSchema,
+  UsageTelemetryKnownProviderSchema,
+  API_USAGE_MONITOR_HEALTH_PATH,
+  API_USAGE_MONITOR_READY_PATH,
   type UsageTelemetryEventInput,
 } from "../usageTelemetry";
 import {
@@ -755,3 +760,51 @@ describe("createUsageTelemetryClient", () => {
     await expect(malformedClient.send([{ provider: "provider", eventId: "event-2" }])).rejects.toThrow();
   });
 });
+
+describe("Usage Monitor routes, producer/provider schemas, and createUsageTelemetryV2Event", () => {
+  it("exports valid API route constants", () => {
+    expect(API_USAGE_MONITOR_HEALTH_PATH).toBe("/api/health");
+    expect(API_USAGE_MONITOR_READY_PATH).toBe("/api/ready");
+  });
+
+  it("validates producer identities", () => {
+    expect(UsageTelemetryProducerSchema.safeParse("congress-trade").success).toBe(true);
+    expect(UsageTelemetryProducerSchema.safeParse("socratic-trade").success).toBe(true);
+    expect(UsageTelemetryProducerSchema.safeParse("usage-monitor").success).toBe(true);
+    expect(UsageTelemetryProducerSchema.safeParse("unknown-app").success).toBe(false);
+  });
+
+  it("validates known provider identities", () => {
+    expect(UsageTelemetryKnownProviderSchema.safeParse("openrouter").success).toBe(true);
+    expect(UsageTelemetryKnownProviderSchema.safeParse("openai").success).toBe(true);
+    expect(UsageTelemetryKnownProviderSchema.safeParse("anthropic").success).toBe(true);
+    expect(UsageTelemetryKnownProviderSchema.safeParse("google-ai").success).toBe(true);
+    expect(UsageTelemetryKnownProviderSchema.safeParse("finnhub").success).toBe(true);
+    expect(UsageTelemetryKnownProviderSchema.safeParse("hetzner").success).toBe(true);
+    expect(UsageTelemetryKnownProviderSchema.safeParse("cloudflare").success).toBe(true);
+  });
+
+  it("creates valid v2 events with provided or auto-generated eventId", () => {
+    const customEvent = createUsageTelemetryV2Event({
+      eventId: "custom-id-123",
+      provider: "openrouter",
+      metricType: "usage",
+      quantity: 150,
+      unit: "token",
+    });
+    expect(customEvent.eventId).toBe("custom-id-123");
+    expect(customEvent.provider).toBe("openrouter");
+    expect(customEvent.quantity).toBe(150);
+
+    const autoEvent = createUsageTelemetryV2Event({
+      provider: "anthropic",
+      metricType: "cost",
+      costUsd: 0.005,
+    });
+    expect(typeof autoEvent.eventId).toBe("string");
+    expect(autoEvent.eventId.length).toBeGreaterThan(0);
+    expect(autoEvent.provider).toBe("anthropic");
+    expect(autoEvent.costUsd).toBe(0.005);
+  });
+});
+

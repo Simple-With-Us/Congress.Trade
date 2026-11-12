@@ -90,14 +90,19 @@ export function classifyProviderFailure(
   if (!message) return null;
   const lower = message.toLowerCase();
 
-  // Matches LLM_BUDGET_ERROR_MARKER in shared/llmSpend.ts (kept literal here
-  // so this module stays dependency-free for the benchmark decode path).
-  if (lower.includes('llm daily usd budget exceeded')) {
+  // Matches LLM_BUDGET_ERROR_MARKER / LLM_DOC_BUDGET_ERROR_MARKER in
+  // shared/llmSpend.ts (kept literal here so this module stays dependency-free
+  // for the benchmark decode path). Per-doc already-extracted skips stay
+  // unclassified (document-specific, not a provider outage).
+  if (
+    lower.includes('llm daily usd budget exceeded')
+    || lower.includes('llm per-doc usd budget exceeded')
+  ) {
     return {
       code: 'llm_budget_exceeded',
       scope: 'provider',
       retryable: false,
-      message: `${provider} calls are halted: the daily LLM USD budget is exhausted.`,
+      message: `${provider} calls are halted: an app LLM USD budget is exhausted.`,
     };
   }
 
@@ -137,6 +142,10 @@ export function classifyProviderFailure(
     || lower.includes('insufficient_quota')
     || lower.includes('billing hard limit')
     || lower.includes('credit balance is too low')
+    || lower.includes('budget limit')
+    || lower.includes('api key budget')
+    || lower.includes('key budget')
+    || lower.includes('weekly limit')
   ) {
     return {
       code: 'provider_credits_depleted',
@@ -165,7 +174,7 @@ export function classifyProviderFailure(
 
   if (
     /\b401\b/.test(lower)
-    || /\b403\b/.test(lower)
+    || (/\b403\b/.test(lower) && !lower.includes('budget'))
     || lower.includes('forbidden')
     || lower.includes('invalid_api_key')
     || lower.includes('invalid api key')

@@ -5,3 +5,9 @@ dist
 
 # Sentry Config File
 .sentryclirc
+
+# Build-time Litestream binary fetched by scripts/fetch-litestream.sh (38MB,
+# pinned + sha256-verified at build). Belongs in the image, never in git.
+# Anchored: this is app/bin/ specifically, not every nested bin/ directory —
+# an unanchored `bin/` would silently swallow any future app/**/bin/ path.
+/bin/

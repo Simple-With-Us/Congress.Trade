@@ -113,7 +113,7 @@ describe('decodeXaiResult', () => {
     const item = {
       batch_request_id: 'H-7',
       batch_result: { response: { chat_get_completion: {
-        choices: [{ message: { content: '{"transactions":[{"ticker":"NVDA","assetName":"Nvidia","txType":"P","amountRange":"$1,001 - $15,000"}]}' } }],
+        choices: [{ message: { content: '{"transactions":[{"ticker":"NVDA","assetName":"Nvidia","txType": "B","amountRange":"$1,001 - $15,000"}]}' } }],
         usage: {
           prompt_tokens: 120,
           completion_tokens: 30,
@@ -156,14 +156,14 @@ describe('decodeAnthropicLine', () => {
       result: {
         type: 'succeeded',
         message: {
-          content: [{ type: 'text', text: '[{"ticker":"AAPL","assetName":"Apple","txType":"P","amountRange":"$1,001 - $15,000"}]' }],
+          content: [{ type: 'text', text: '[{"ticker":"AAPL","assetName":"Apple","txType": "B","amountRange":"$1,001 - $15,000"}]' }],
           usage: { input_tokens: 300, output_tokens: 60, cache_read_input_tokens: 100 },
         },
       },
     };
     const r = decodeAnthropicLine(line);
     expect(r).toMatchObject({ docId: 'H-1', ok: true });
-    expect(r.rows[0]).toMatchObject({ ticker: 'AAPL', txType: 'P' });
+    expect(r.rows[0]).toMatchObject({ ticker: 'AAPL', txType: 'B' });
     expect(r.usage).toEqual({ promptTokens: 300, completionTokens: 60, cachedTokens: 100 });
   });
 
@@ -183,7 +183,7 @@ describe('decodeAnthropicLine', () => {
           content: [{
             type: 'text',
             // Cut off mid-second-row: no retry is possible for an already-submitted batch.
-            text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro',
+            text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro',
           }],
           usage: { input_tokens: 300, output_tokens: 8000 },
         },
@@ -222,7 +222,7 @@ describe('decodeAnthropicLine', () => {
           stop_reason: 'end_turn',
           content: [{
             type: 'text',
-            text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro',
+            text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro',
           }],
           usage: { input_tokens: 300, output_tokens: 60 },
         },
@@ -347,7 +347,7 @@ describe('submitBatch/pollBatch Anthropic: per-item PDF pre-validation', () => {
       if (url === resultsUrl) {
         const lines = [
           { custom_id: 'H-valid-1', result: { type: 'succeeded', message: {
-            content: [{ type: 'text', text: '[{"ticker":"AAPL","assetName":"Apple","txType":"P","amountRange":"$1,001 - $15,000"}]' }],
+            content: [{ type: 'text', text: '[{"ticker":"AAPL","assetName":"Apple","txType": "B","amountRange":"$1,001 - $15,000"}]' }],
           } } },
           { custom_id: 'H-valid-2', result: { type: 'succeeded', message: {
             content: [{ type: 'text', text: '[]' }],
@@ -519,7 +519,7 @@ describe('decodeOpenAiLine', () => {
         model: 'gpt-5.6-terra',
         status: 'incomplete',
         incomplete_details: { reason: 'max_output_tokens' },
-        output: [{ content: [{ text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType":"P","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro' }] }],
+        output: [{ content: [{ text: '[{"ticker":"AAPL","assetName":"Apple Inc.","txType": "B","amountRange":"$1,001 - $15,000"},{"ticker":"MSFT","assetName":"Micro' }] }],
         usage: { input_tokens: 500, output_tokens: 8_000 },
       } },
     });
@@ -1009,7 +1009,7 @@ describe('pollBatch OpenAI terminal results', () => {
               model: 'gpt-4o-2024-11-20',
               choices: [{
                 message: {
-                  content: '{"transactions":[{"ticker":"MSFT","assetName":"Microsoft","txType":"P","amountRange":"$1,001 - $15,000"}]}',
+                  content: '{"transactions":[{"ticker":"MSFT","assetName":"Microsoft","txType": "B","amountRange":"$1,001 - $15,000"}]}',
                 },
               }],
               usage: {
@@ -1055,7 +1055,7 @@ describe('decodeMistralLine', () => {
     const line = {
       custom_id: 'H-5',
       response: { body: {
-        document_annotation: JSON.stringify({ transactions: [{ ticker: 'TSLA', assetName: 'Tesla', txType: 'P', amountRange: '$1,001 - $15,000' }] }),
+        document_annotation: JSON.stringify({ transactions: [{ ticker: 'TSLA', assetName: 'Tesla', txType: 'B', amountRange: '$1,001 - $15,000' }] }),
         usage_info: { pages_processed: 6 },
       } },
     };
@@ -1066,7 +1066,7 @@ describe('decodeMistralLine', () => {
   });
 
   it('also accepts the annotation directly on the line body', () => {
-    const r = decodeMistralLine({ custom_id: 'H-6', body: { document_annotation: { transactions: [{ assetName: 'X', ticker: 'XOM', txType: 'P', amountRange: '$1,001 - $15,000' }] } } });
+    const r = decodeMistralLine({ custom_id: 'H-6', body: { document_annotation: { transactions: [{ assetName: 'X', ticker: 'XOM', txType: 'B', amountRange: '$1,001 - $15,000' }] } } });
     expect(r.rows[0].ticker).toBe('XOM');
   });
 

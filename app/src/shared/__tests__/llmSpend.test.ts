@@ -69,8 +69,16 @@ function spendEnv(rows: SpendRow[], vars: Record<string, string> = {}): {
     async run() {
       if (failures.writes) throw new Error('D1 unavailable');
       if (/INSERT OR IGNORE INTO llm_spend_settlements/i.test(sql)) {
-        const [settlementId, provider, providerResponseId, , day, , , , , usd, receiptHash]
-          = this.params as [string, string, string | null, string, string, string, string, string | null, string | null, number, string, string];
+        // Pre-0077: 12 binds (…, doc_id, usd, receipt_hash, created_at)
+        // Post-0077: 13 binds (…, doc_id, purpose, usd, receipt_hash, created_at)
+        const p = this.params as unknown[];
+        const settlementId = p[0] as string;
+        const provider = p[1] as string;
+        const providerResponseId = p[2] as string | null;
+        const day = p[4] as string;
+        const hasPurpose = p.length >= 13 || /purpose/i.test(sql);
+        const usd = (hasPurpose ? p[10] : p[9]) as number;
+        const receiptHash = (hasPurpose ? p[11] : p[10]) as string;
         const existing = settlements.find((row) =>
           row.settlementId === settlementId
           || (providerResponseId !== null
@@ -78,6 +86,7 @@ function spendEnv(rows: SpendRow[], vars: Record<string, string> = {}): {
             && row.providerResponseId === providerResponseId));
         if (existing) return { success: true, meta: { changes: 0 } };
         settlements.push({ settlementId, provider, providerResponseId, day, usd, receiptHash });
+        return { success: true, meta: { changes: 1 } };
       }
       return { success: true, meta: { changes: 1 } };
     },
@@ -248,5 +257,20 @@ describe('settleLlmSpend / readLlmSpend', () => {
     failures.writes = true;
     await expect(settleLlmSpend(env, receipt('failed', 1)))
       .rejects.toBeInstanceOf(LlmSpendSettlementError);
+  });
+
+  it('enforces LLAMAPARSE_DAILY_CREDIT_CEILING in credits rather than USD', async () => {
+    // $1.25 spent = 1,000 credits spent (at 800 credits/$1.00 or $0.00125/credit)
+    const { env } = spendEnv(
+      [{ provider: 'llamaparse', usd: 1.25 }],
+      { LLAMAPARSE_DAILY_CREDIT_CEILING: '1000' },
+    );
+    const decision = await checkLlmSpendCeiling(env, 'llamaparse');
+    expect(decision.allowed).toBe(false);
+    expect(decision.scope).toBe('provider');
+    expect(decision.spentCredits).toBeCloseTo(1000);
+    expect(decision.ceilingCredits).toBe(1000);
+    expect(isLlmBudgetHalt(llmBudgetHaltMessage(decision))).toBe(true);
+    expect(llmBudgetHaltMessage(decision)).toContain('1000 of 1000 credits spent today');
   });
 });

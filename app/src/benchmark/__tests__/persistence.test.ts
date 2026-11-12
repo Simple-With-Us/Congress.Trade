@@ -704,7 +704,7 @@ describe('summarizeBenchmarkMeasurements', () => {
 describe('rescoreBenchmarkRun', () => {
   it('repairs saved score columns and stamps the current profile without provider calls', async () => {
     const truth = {
-      ticker: 'AAPL', assetName: 'Apple Inc.', txDate: '2026-07-01', txType: 'P',
+      ticker: 'AAPL', assetName: 'Apple Inc.', txDate: '2026-07-01', txType: 'B',
       amountMin: 1_001, amountMax: 15_000, owner: 'self', assetType: 'ST',
       assetTypeName: 'Stocks (including ADRs)', isOption: false, capGainsOver200: false,
       filingStatus: null, subholding: null, location: null, description: null, supplementalText: null,

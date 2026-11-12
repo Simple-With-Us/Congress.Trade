@@ -61,7 +61,7 @@ function fakeDb() {
 }
 
 describe('admin disclosure latency API', () => {
-  it('lists Congress.Trade-vs-FMP observations with computed provider delta', async () => {
+  it('lists congress.trade-vs-FMP observations with computed provider delta', async () => {
     const res = await app.request(
       '/disclosure-latency',
       { headers: { Authorization: 'Bearer admin-secret' } },
@@ -86,7 +86,7 @@ describe('admin disclosure latency API', () => {
     const res = await app.request(
       '/disclosure-latency/summary',
       { headers: { Authorization: 'Bearer admin-secret' } },
-      { ADMIN_TOKEN: 'admin-secret', FMP_API_KEY: 'configured', DB: fakeDb() } as never,
+      { ADMIN_TOKEN: 'admin-secret', FMP_LATENCY_API_KEY: 'configured', DB: fakeDb() } as never,
     );
 
     expect(res.status).toBe(200);
@@ -95,8 +95,10 @@ describe('admin disclosure latency API', () => {
       providers: Array<{ provider: string; avgMonitorDeltaSec: number | null; avgProviderPublishedDeltaSec: number | null }>;
       publicSummary: { providers: Array<{ provider: string }> };
     };
+    // Free-tier FMP_LATENCY_* configures stable only; RapidAPI needs RAPIDAPI_KEY /
+    // FMP_RAPIDAPI_KEY (ST marketplace convention). So one configured path here.
     expect(body.totals).toEqual(expect.objectContaining({ candidates: 1, matched: 1, configuredComparableProviders: 1 }));
-    expect(body.providers[0]).toEqual(
+    expect(body.providers.find((p) => p.provider === 'fmp')).toEqual(
       expect.objectContaining({ provider: 'fmp', avgMonitorDeltaSec: 210, avgProviderPublishedDeltaSec: 120 }),
     );
     expect(JSON.stringify(body.publicSummary)).not.toContain('H-2026-20012345');

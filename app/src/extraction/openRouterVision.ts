@@ -30,14 +30,15 @@
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
 import type { Env, Filing, ParsedTx } from '../shared/types.ts';
-import { getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 import { resolveSecret } from '../secrets/infisical.ts';
-import { environmentName } from '../shared/thirdPartyTelemetry.ts';
 import { sendPushover } from '../shared/pushover.ts';
+import type { OpenRouterRequestEnrichment } from '@jaywedgeworth22/congress-trading-shared';
 import {
-  openrouterRequestEnrichment,
-  type OpenRouterRequestEnrichment,
-} from '@jaywedgeworth22/congress-trading-shared';
+  OPENROUTER_PURPOSE,
+  buildOpenRouterClassifier,
+  openRouterAttributionHeaders,
+} from '../shared/openRouterAttribution.ts';
 import {
   buildExtractionPrompt,
   loadExtractionPromptContext,
@@ -47,10 +48,53 @@ import {
   arrayBufferToBase64,
   markSalvaged,
 } from './visionLlm.ts';
+import {
+  assertOpenRouterBudgetCircuitAllowsCall,
+  isOpenRouterBudgetHttp,
+  noteOpenRouterBudgetFailure,
+  noteOpenRouterBudgetSuccess,
+} from '../shared/openRouterBudgetCircuit.ts';
+import {
+  classifyOpenRouterReply,
+  docScopedOpenRouterError,
+  isDocScopedOpenRouterReply,
+} from './openRouterReply.ts';
+import { IngestRetryError } from '../ingestion/fetcher.ts';
 
-/** Live default (verified against the OpenRouter catalog 2026-07-18); the
- *  former default `qwen/qwen-2.5-vl-72b-instruct:free` is no longer listed. */
-const DEFAULT_MODEL = 'google/gemini-3.5-flash';
+/**
+ * OpenRouter Flash-latest alias.  Live catalog 2026-08-21: this slug
+ * "always redirects to the latest model in the Google Gemini Flash family"
+ * and currently prices as Gemini 3.7 ($0.375/$1.875, Vertex 75% off).
+ * Bare `google/gemini-flash-latest` 404s — the `~` prefix is required.
+ */
+export const OPENROUTER_GEMINI_FLASH = '~google/gemini-flash-latest';
+/** Pinned 3.7 batch/offline slug (the latest alias has no `:batch` variant). */
+export const OPENROUTER_GEMINI_FLASH_BATCH = 'google/gemini-3.8-flash:batch';
+const DEFAULT_MODEL = OPENROUTER_GEMINI_FLASH;
+
+function isOpenRouterGeminiFlashLatest(model: string): boolean {
+  const base = model.trim().replace(/:batch$/i, '').replace(/^~/, '').toLowerCase();
+  return base === 'google/gemini-flash-latest' || base === 'gemini-flash-latest';
+}
+
+function isOpenRouterGemini37Flash(model: string): boolean {
+  const base = model.trim().replace(/:batch$/i, '').replace(/^~/, '').toLowerCase();
+  return base === 'google/gemini-3.8-flash' || base === 'gemini-3.8-flash';
+}
+
+/**
+ * Vertex/`Google` is the 75%-off Gemini Flash endpoint for current latest
+ * (3.7) and the pinned 3.7 slug.  AI Studio is only 50% off.  Fall back
+ * if Vertex is down rather than failing the read.
+ */
+export function gemini37FlashProviderPreference(model: string): {
+  order: string[];
+  allow_fallbacks: boolean;
+} | Record<string, never> {
+  if (!isOpenRouterGeminiFlashLatest(model) && !isOpenRouterGemini37Flash(model)) return {};
+  return { order: ['Google'], allow_fallbacks: true };
+}
+
 const DEFAULT_CONFIDENCE = 0.6;
 const MAX_TOKENS = 65000;
 
@@ -107,8 +151,32 @@ export function supportsNativeVision(model: string): boolean {
   // paid mistral-ocr parse for models that read PDFs natively.
   if (/claude-(?:\d|sonnet|haiku|opus)/.test(m)) return true;
   if (m.includes('gemini-1.5') || m.includes('gemini-2') || m.includes('gemini-3')) return true;
+  // `~google/gemini-flash-latest` has file modality (verified 2026-08-21) but
+  // does not contain `gemini-3`, so the generation test above misses it.
+  if (/gemini-flash-latest/.test(m)) return true;
   // x-ai/grok-4.x lists `file` input modality on the live catalog (2026-07-18).
   if (/grok-4/.test(m)) return true;
+  // DeepSeek V4 Flash Vision (exp or later).  Catalog lists image, not file;
+  // skip paid mistral-ocr so a future seat does not double-pay.  Text-only
+  // `deepseek-v4-flash` stays on the OCR plugin.
+  if (/deepseek[-/].*flash-vision|deepseek[-/].*-vision(?:-|$)/.test(m)) return true;
+  return false;
+}
+
+/**
+ * True when the model reads raster pages (image_url) but not PDF `file`
+ * attachments.  Sending a PDF through OpenRouter's file-parser would bill
+ * mistral-ocr (~$2/1k pages) — the opposite of a cheap cascade.  The Mac
+ * vision-worker therefore attaches page PNGs/JPEGs for these slugs.
+ *
+ * Keep in sync with `model_uses_page_images` in services/vision-worker/worker.py.
+ */
+export function prefersPageImages(model: string): boolean {
+  const m = model.toLowerCase();
+  if (supportsNativeVision(m)) return false;
+  if (/qwen/.test(m) && /vl/.test(m)) return true;
+  if (/glm-4/.test(m) && /v/.test(m)) return true;
+  if (/deepseek[-/].*flash-vision|deepseek[-/].*-vision(?:-|$)/.test(m)) return true;
   return false;
 }
 
@@ -120,7 +188,7 @@ export function supportsNativeVision(model: string): boolean {
  * unpredictable `openrouter/auto` router stay on the prompt-JSON fallback.
  */
 export function supportsStructuredOutputs(model: string): boolean {
-  const m = model.trim().toLowerCase();
+  const m = model.trim().replace(/^~/, '').toLowerCase();
   if (m.includes('mistral-ocr')) return false; // OCR endpoint, not a chat model
   const slash = m.indexOf('/');
   if (slash <= 0) return false;
@@ -331,38 +399,19 @@ export class OpenRouterVisionExtractor implements Extractor {
    * a deterministic per-document `user` id, per
    * DESIGN-usage-compliance-classifier.md §2. Built once per extraction call
    * (not per fetchWithRetry attempt) so `user` stays byte-identical across
-   * retries of the same document.
-   *
-   * Best-effort by design: the shared builder fails fast on an invalid STATIC
-   * field (a programming error), but that must never take down a paid
-   * extraction call. Any error here — expected or not — degrades to sending
-   * the OpenRouter request WITHOUT enrichment; the extraction itself proceeds
-   * unaffected.
+   * retries of the same document. Delegates to shared openRouterAttribution.
    */
   private buildClassifierEnrichment(input: ExtractorInput): OpenRouterRequestEnrichment | undefined {
-    try {
-      return openrouterRequestEnrichment({
-        sourceApp: 'congress-trade',
-        environment: environmentName(this.env),
-        service: this.name,
-        feature: input.filing.chamber ? `vision-extract-${input.filing.chamber}` : undefined,
-        keyRef: this.apiKeyName,
-        gitSha: this.env.CF_VERSION_METADATA?.id || this.env.CF_VERSION_METADATA?.tag || undefined,
-        // Deterministic per-doc id, stable across fetchWithRetry's retries of
-        // this same call. Never "" — an unpopulated docId (e.g. a caller that
-        // constructs a partial Filing, as the bake-off harness does for
-        // non-OpenRouter candidates) must OMIT `user`, not send a blank one.
-        user: input.filing.docId || undefined,
-        // No run/session id is in scope at this call site today.
-        sessionId: undefined,
-      });
-    } catch (err) {
-      console.warn(
-        `${this.name}: classifier enrichment failed; sending OpenRouter request without it:`,
-        (err as Error).message,
-      );
-      return undefined;
-    }
+    const chamber = input.filing.chamber || undefined;
+    return buildOpenRouterClassifier(this.env, {
+      service: this.name,
+      purpose: OPENROUTER_PURPOSE.VISION_EXTRACT,
+      feature: chamber ? `vision-extract-${chamber}` : 'vision-extract',
+      chamber,
+      keyRef: this.apiKeyName,
+      // Deterministic per-doc id — never "" (omit when missing).
+      user: input.filing.docId || undefined,
+    });
   }
 
   async extract(input: ExtractorInput): Promise<ExtractorResult> {
@@ -384,6 +433,7 @@ export class OpenRouterVisionExtractor implements Extractor {
     let pagesProcessed: number | undefined = undefined;
     if (model.toLowerCase().includes('mistral-ocr')) {
       try {
+        const { getDocumentProxy } = await import('unpdf');
         const pdf = await getDocumentProxy(new Uint8Array(input.bytes.slice(0)));
         pagesProcessed = typeof pdf.numPages === 'number' && Number.isFinite(pdf.numPages) ? pdf.numPages : undefined;
       } catch {
@@ -476,9 +526,14 @@ export class OpenRouterVisionExtractor implements Extractor {
           ...(includeEngine && engine ? [{ id: 'file-parser', pdf: { engine } }] : []),
         ];
         const provider = {
+          ...gemini37FlashProviderPreference(model),
           ...(structured ? { require_parameters: true } : {}),
           ...(maxPrice ? { max_price: maxPrice } : {}),
         };
+
+        // Owner: no million retries when the key is out of budget — short
+        // burst then hourly cool-down (openRouterBudgetCircuit).
+        await assertOpenRouterBudgetCircuitAllowsCall(this.env);
 
         const res = await fetchWithRetry(
           'https://openrouter.ai/api/v1/chat/completions',
@@ -487,8 +542,7 @@ export class OpenRouterVisionExtractor implements Extractor {
             headers: {
               'Authorization': `Bearer ${key}`,
               'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://congress.trade',
-              'X-Title': 'Congress.Trade',
+              ...openRouterAttributionHeaders(),
             },
             body: JSON.stringify({
               model,
@@ -510,7 +564,9 @@ export class OpenRouterVisionExtractor implements Extractor {
               : AbortSignal.timeout(600_000),
           },
           this.name,
-          { model, spendGuard: { env: this.env, provider: 'openrouter' } }
+          // Budget 402/403 are not retryable at HTTP layer; maxAttempts=3 only
+          // covers transient 429/5xx. Burst+hourly lives in the circuit module.
+          { model, maxAttempts: 3, spendGuard: { env: this.env, provider: 'openrouter' } }
         );
 
         if (!res.ok) {
@@ -523,16 +579,17 @@ export class OpenRouterVisionExtractor implements Extractor {
           if (includeEngine && engine && isEngineOverrideRejection(res.status, detail)) {
             return { rejection: detail, status: res.status };
           }
-          if (res.status === 402 || res.status === 403) {
+          if (isOpenRouterBudgetHttp(res.status, detail)) {
             await sendPushover(this.env, {
               title: 'OpenRouter Budget Alert',
-              message: `OpenRouter HTTP ${res.status} budget cap reached for model ${model} (doc: ${docId ?? 'unknown'}). Attempting backup key failover.`,
+              message: `OpenRouter HTTP ${res.status} budget cap reached for model ${model} (doc: ${docId ?? 'unknown'}). Circuit will trip after a short burst; not waiting on credits as a strategy.`,
               priority: 1,
             }).catch(() => {});
 
             const backupKey = (await resolveSecret(this.env, 'OPENROUTER_BACKUP_API_KEY')).value;
             if (backupKey && backupKey !== key) {
               console.warn(`${this.name}: HTTP ${res.status} budget cap; attempting failover to OPENROUTER_BACKUP_API_KEY`);
+              await assertOpenRouterBudgetCircuitAllowsCall(this.env);
               const backupRes = await fetchWithRetry(
                 'https://openrouter.ai/api/v1/chat/completions',
                 {
@@ -540,8 +597,7 @@ export class OpenRouterVisionExtractor implements Extractor {
                   headers: {
                     'Authorization': `Bearer ${backupKey}`,
                     'Content-Type': 'application/json',
-                    'HTTP-Referer': 'https://congress.trade',
-                    'X-Title': 'Congress.Trade',
+                    ...openRouterAttributionHeaders(),
                   },
                   body: JSON.stringify({
                     model,
@@ -553,23 +609,69 @@ export class OpenRouterVisionExtractor implements Extractor {
                     ...(Object.keys(provider).length ? { provider } : {}),
                     plugins,
                     messages: buildMessages(),
-                    ...classifierEnrichment,
+                    // Backup key still tags as OPENROUTER_BACKUP_API_KEY so
+                    // Usage-Monitor key attribution can split primary vs backup.
+                    ...buildOpenRouterClassifier(this.env, {
+                      service: this.name,
+                      purpose: OPENROUTER_PURPOSE.VISION_EXTRACT,
+                      feature: input.filing.chamber
+                        ? `vision-extract-${input.filing.chamber}`
+                        : 'vision-extract',
+                      chamber: input.filing.chamber || undefined,
+                      keyRef: 'OPENROUTER_BACKUP_API_KEY',
+                      user: input.filing.docId || undefined,
+                    }),
                   }),
                   signal: input.signal
                     ? AbortSignal.any([input.signal, AbortSignal.timeout(600_000)])
                     : AbortSignal.timeout(600_000),
                 },
                 this.name,
-                { model, spendGuard: { env: this.env, provider: 'openrouter' } }
+                { model, maxAttempts: 3, spendGuard: { env: this.env, provider: 'openrouter' } }
               );
               if (backupRes.ok) {
+                await noteOpenRouterBudgetSuccess(this.env);
                 return { payload: (await backupRes.json()) as OpenAIChatPayload };
               }
+              let backupDetail = '';
+              try {
+                backupDetail = (await backupRes.text()).slice(0, 500);
+              } catch {
+                /* ignore */
+              }
+              if (isOpenRouterBudgetHttp(backupRes.status, backupDetail)) {
+                const trip = await noteOpenRouterBudgetFailure(
+                  this.env,
+                  `HTTP ${backupRes.status} ${backupDetail}`,
+                );
+                throw new IngestRetryError(
+                  `${this.name}: OpenRouter API ${backupRes.status} budget ${backupDetail.slice(0, 200)}`,
+                  trip.delaySeconds,
+                );
+              }
             }
+
+            const trip = await noteOpenRouterBudgetFailure(
+              this.env,
+              `HTTP ${res.status} ${detail}`,
+            );
+            throw new IngestRetryError(
+              `${this.name}: OpenRouter API ${res.status} ${res.statusText} ${detail}`,
+              trip.delaySeconds,
+            );
+          }
+          const kind = classifyOpenRouterReply({
+            httpStatus: res.status,
+            statusText: res.statusText,
+            bodyText: detail,
+          });
+          if (isDocScopedOpenRouterReply(kind)) {
+            throw docScopedOpenRouterError(kind, `${res.status} ${res.statusText} ${detail}`);
           }
           throw new Error(`${this.name}: OpenRouter API ${res.status} ${res.statusText} ${detail}`);
         }
 
+        await noteOpenRouterBudgetSuccess(this.env);
         return { payload: (await res.json()) as OpenAIChatPayload };
       };
 
@@ -627,6 +729,13 @@ export class OpenRouterVisionExtractor implements Extractor {
         costUsd: providerCostUsd ?? null,
       }));
 
+      const replyKind = classifyOpenRouterReply({
+        httpStatus: 200,
+        completionText: text,
+      });
+      if (isDocScopedOpenRouterReply(replyKind)) {
+        throw docScopedOpenRouterError(replyKind, text || 'empty completion');
+      }
       if (!text) {
         throw new Error(`${this.name}: OpenRouter returned no text block`);
       }

@@ -34,11 +34,11 @@ const SENATE_REC: RawWatcherRecord = {
 
 describe('field mappers', () => {
   it('maps transaction type to P/S/E', () => {
-    expect(mapTxType('Purchase')).toBe('P');
+    expect(mapTxType('Purchase')).toBe('B');
     expect(mapTxType('Sale (Full)')).toBe('S');
     expect(mapTxType('Sale (Partial)')).toBe('S');
     expect(mapTxType('Exchange')).toBe('E');
-    expect(mapTxType(undefined)).toBe('P');
+    expect(mapTxType(undefined)).toBe('B');
   });
 
   it('maps owner to the Owner union', () => {
@@ -75,7 +75,7 @@ describe('mapRecordToTransaction', () => {
     expect(tx.ticker).toBe('NVDA');
     expect(tx.assetName).toBe('NVIDIA Corporation');
     expect(tx.assetTypeName).toBe('Stock');
-    expect(tx.txType).toBe('P');
+    expect(tx.txType).toBe('B');
     expect(tx.owner).toBe('spouse');
     expect(tx.txDate).toBe('2026-06-04');
     expect(tx.amountMin).toBe(250001);

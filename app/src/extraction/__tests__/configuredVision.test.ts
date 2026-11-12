@@ -55,7 +55,7 @@ function okResult(over: Partial<CandidateDocResult> = {}): CandidateDocResult {
     ok: true,
     latencyMs: 50,
     rowCount: 1,
-    rowKeys: ['AAPL|2026-07-01|P'],
+    rowKeys: ['AAPL|2026-07-01|B'],
     avgConfidence: 0.9,
     rows: [{ ticker: 'AAPL', confidence: 0.9 } as never],
     resolvedModel: 'mistral-ocr-latest-2026',
@@ -110,9 +110,9 @@ describe('resolvePrimaryFailoverModels', () => {
     expect(failover).toEqual({ provider: 'anthropic', model: 'claude-sonnet-5' });
   });
 
-  it('returns default Grok 4.5 for an unconfigured chamber', async () => {
+  it('returns default Grok 4.6 for an unconfigured chamber', async () => {
     const { primary, failover } = await resolvePrimaryFailoverModels({} as Env, 'senate');
-    expect(primary).toEqual({ provider: 'openrouter', model: 'x-ai/grok-4.5' });
+    expect(primary).toEqual({ provider: 'openrouter', model: 'x-ai/grok-4.6' });
     expect(failover).toBeNull();
   });
 });

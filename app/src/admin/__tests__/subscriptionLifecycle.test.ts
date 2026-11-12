@@ -56,12 +56,12 @@ function seedSubscription(id: string, clientId: string, active: number, delivery
 }
 
 describe('subscription lifecycle on a migrated database', () => {
-  it('lifetime rows no longer lock out creation: 20 historical rows, 15 deactivated → create succeeds', async () => {
+  it('lifetime rows no longer lock out creation: 3 historical rows, 2 deactivated → create succeeds', async () => {
     const clientId = 'user:lifetime-locked';
-    for (let i = 0; i < 5; i += 1) seedSubscription(`sub_active_${i}`, clientId, 1);
-    for (let i = 0; i < 15; i += 1) seedSubscription(`sub_retired_${i}`, clientId, 0);
+    for (let i = 0; i < 1; i += 1) seedSubscription(`sub_active_${i}`, clientId, 1);
+    for (let i = 0; i < 2; i += 1) seedSubscription(`sub_retired_${i}`, clientId, 0);
 
-    // Pre-0047 this was a guaranteed 409: total lifetime rows (20) hit the cap
+    // Pre-0047 this was a guaranteed 409: total lifetime rows hit the cap
     // and no delete path existed to ever free a slot.
     const res = await app.request('http://localhost/subscriptions', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -72,7 +72,7 @@ describe('subscription lifecycle on a migrated database', () => {
 
   it('deactivate frees the active quota against the real triggers', async () => {
     const clientId = 'user:active-bound';
-    for (let i = 0; i < 10; i += 1) seedSubscription(`sub_full_${i}`, clientId, 1);
+    for (let i = 0; i < 2; i += 1) seedSubscription(`sub_full_${i}`, clientId, 1);
 
     const blocked = await app.request('http://localhost/subscriptions', {
       method: 'POST', headers: { 'content-type': 'application/json' },

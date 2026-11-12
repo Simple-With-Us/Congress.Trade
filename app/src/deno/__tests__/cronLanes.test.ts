@@ -5,21 +5,35 @@ import { D1DatabaseShim } from '../shims.ts';
 
 const mocks = vi.hoisted(() => ({
   marketData: vi.fn(async () => 'ran' as const),
+  peerPriceCatchUp: vi.fn(async (): Promise<'ran' | 'stamped'> => 'ran'),
   snapshot: vi.fn(async () => 'ran' as const),
   filer: vi.fn(async () => 'ran' as const),
   retention: vi.fn(async () => 'ran' as const),
   hourlyEnrichment: vi.fn(async () => ({
     scanned: 0, enriched: 0, fmpCalls: 0, budgetRemaining: 0, remainingBacklog: false,
   })),
+  autonomySweeps: vi.fn(async () => ({
+    ceiling: { flipped: 0 }, stranded: { terminalized: 0 },
+    filedDateBackfill: { updated: 0, yearsFetched: [] }, ogeUndated: { updated: 0, attempted: 0 },
+    errors: [],
+  })),
 }));
 
 vi.mock('../../jobs.ts', () => ({
   maybeRunDailyMarketDataJobs: mocks.marketData,
+  maybeRunPeerPriceCatchUp: mocks.peerPriceCatchUp,
   maybeRunDailySnapshotJob: mocks.snapshot,
   maybeRunDailyFilerJobs: mocks.filer,
   maybeRunDailyRetentionJobs: mocks.retention,
   runHourlyEnrichmentSlice: mocks.hourlyEnrichment,
   HOURLY_ENRICHMENT_SLICE_DEADLINE_MS: 480_000,
+}));
+
+vi.mock('../../ingestion/autonomySweeps.ts', () => ({
+  runAutonomySweeps: mocks.autonomySweeps,
+}));
+vi.mock('#sentry', () => ({
+  captureException: vi.fn(),
 }));
 
 import {
@@ -28,6 +42,7 @@ import {
   resolveDailyLaneDeadlineMs,
   runDailyLane,
   type DailyLaneCron,
+  frequentLaneLogLine,
 } from '../cronLanes.ts';
 
 async function makeEnv(): Promise<{ env: Env; client: ReturnType<typeof createClient> }> {
@@ -50,10 +65,10 @@ describe('daily lane cron windows', () => {
     vi.clearAllMocks();
   });
 
-  it('has five lanes with unique names, hourly schedules, off-peak minutes, and snapshot after market data', () => {
-    expect(DAILY_LANE_CRONS).toHaveLength(5);
+  it('has seven lanes with unique names, hourly schedules, off-peak minutes, and snapshot after market data', () => {
+    expect(DAILY_LANE_CRONS).toHaveLength(7);
     const names = DAILY_LANE_CRONS.map((l) => l.name);
-    expect(new Set(names).size).toBe(5);
+    expect(new Set(names).size).toBe(7);
     const minuteOf = (schedule: string) => Number(schedule.split(' ')[0]);
     const minutes = DAILY_LANE_CRONS.map((l) => minuteOf(l.schedule));
     // Every lane is hourly with a fixed minute.
@@ -66,7 +81,7 @@ describe('daily lane cron windows', () => {
     }
     // Snapshot must fire after the market-data lane it captures.
     expect(minuteOf('22 * * * *')).toBeGreaterThan(minuteOf('7 * * * *'));
-    const order = ['daily-market-data', 'daily-snapshot', 'daily-filer', 'hourly-enrichment', 'daily-retention'];
+    const order = ['daily-market-data', 'peer-price-catchup', 'daily-snapshot', 'daily-filer', 'hourly-enrichment', 'autonomy-sweeps', 'daily-retention'];
     expect(names).toEqual(order);
   });
 
@@ -79,11 +94,50 @@ describe('daily lane cron windows', () => {
     }
     expect(mocks.marketData).toHaveBeenCalledTimes(1);
     expect(mocks.marketData.mock.calls[0][2]).toHaveProperty('signal');
+    expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
+    expect(mocks.peerPriceCatchUp.mock.calls[0][2]).toHaveProperty('signal');
     expect(mocks.snapshot).toHaveBeenCalledTimes(1);
     expect(mocks.filer).toHaveBeenCalledTimes(1);
     expect(mocks.retention).toHaveBeenCalledTimes(1);
     expect(mocks.hourlyEnrichment).toHaveBeenCalledTimes(1);
     expect(mocks.hourlyEnrichment.mock.calls[0][2]).toMatchObject({ deadlineMs: 480_000 });
+    expect(mocks.autonomySweeps).toHaveBeenCalledTimes(1);
+    expect(mocks.autonomySweeps.mock.calls[0][2]).toHaveProperty('signal');
+  });
+
+  it('runs the peer-price catch-up on its own lane, independent of the market-data lane', async () => {
+    const { env } = await makeEnv();
+    const lane = DAILY_LANE_CRONS.find((l) => l.name === 'peer-price-catchup')!;
+    expect(lane.schedule).toBe('17 * * * *');
+    const result = await runDailyLane(lane, env, new Date(), 10_000);
+    expect(result.status).toBe('ran');
+    expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
+    expect(mocks.peerPriceCatchUp.mock.calls[0][2]).toHaveProperty('signal');
+    expect(mocks.marketData).not.toHaveBeenCalled();
+  });
+
+  it('reports a gated catch-up firing as skipped-gated, so the firing is visible in the lane log', async () => {
+    const { env } = await makeEnv();
+    mocks.peerPriceCatchUp.mockResolvedValueOnce('stamped');
+    const lane = DAILY_LANE_CRONS.find((l) => l.name === 'peer-price-catchup')!;
+    const result = await runDailyLane(lane, env, new Date(), 10_000);
+    // registerDailyLaneCrons suppresses the 'stamped' status line;  the lane
+    // maps the catch-up's gate refusal so a parked or capped drain still
+    // leaves a log line.
+    expect(result.status).toBe('skipped-gated');
+    expect(mocks.peerPriceCatchUp).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the catch-up lane when another isolate holds its singleton lock', async () => {
+    const { env, client } = await makeEnv();
+    await client.execute({
+      sql: `INSERT INTO deno_runtime_kv (namespace, key, value, expires_at) VALUES ('locks', 'peer-price-catchup', 'other-token', ?)`,
+      args: [Date.now() + 60_000],
+    });
+    const lane = DAILY_LANE_CRONS.find((l) => l.name === 'peer-price-catchup')!;
+    const result = await runDailyLane(lane, env, new Date(), 10_000);
+    expect(result.status).toBe('skipped-overlap');
+    expect(mocks.peerPriceCatchUp).not.toHaveBeenCalled();
   });
 });
 
@@ -140,5 +194,19 @@ describe('resolveDailyLaneDeadlineMs', () => {
     // Below the 10s floor → default; above the 30min ceiling → clamped.
     expect(resolveDailyLaneDeadlineMs({ CT_DAILY_LANE_DEADLINE_MS: '5000' })).toBe(600_000);
     expect(resolveDailyLaneDeadlineMs({ CT_DAILY_LANE_DEADLINE_MS: '99999999' })).toBe(1_800_000);
+  });
+});
+
+describe('frequentLaneLogLine', () => {
+  it('stays quiet for normal tick results and logs only runner outcome markers', () => {
+    expect(frequentLaneLogLine('latency-probe', { status: { plan: { lanes: [] }, result: null }, durationMs: 40 })).toBeNull();
+    expect(frequentLaneLogLine('latency-price-snapshots', { status: { scheduled: 0, liveCaptured: 0 }, durationMs: 12 })).toBeNull();
+    expect(frequentLaneLogLine('latency-probe', { status: 'stamped', durationMs: 5 })).toBeNull();
+    expect(frequentLaneLogLine('latency-probe', { status: 'aborted', durationMs: 120000 }))
+      .toBe('frequent lane latency-probe aborted in 120000ms');
+    expect(frequentLaneLogLine('latency-probe', { status: 'skipped-overlap', durationMs: 3 }))
+      .toBe('frequent lane latency-probe skipped-overlap in 3ms');
+    expect(frequentLaneLogLine('latency-probe', { status: 'error', durationMs: 9 }))
+      .toBe('frequent lane latency-probe error in 9ms');
   });
 });

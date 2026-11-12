@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.congress.trade.vision-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jay/vision-worker/run-vision-worker.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/jay/Library/Logs/com.congress.trade.vision-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jay/Library/Logs/com.congress.trade.vision-worker.err.log</string>
+</dict>
+</plist>

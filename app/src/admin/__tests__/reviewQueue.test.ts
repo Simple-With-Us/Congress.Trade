@@ -97,6 +97,9 @@ describe('review queue admin API', () => {
       docId: 'H-2026-2003695',
       sourceUrl: 'https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/2003695.pdf',
       rawObjectKey: 'raw/H-2026-2003695',
+      // Document open path is admin stored-raw (not Premium /api/documents or gov).
+      pdfUrl: '/api/admin/filings/H-2026-2003695/raw',
+      storedDocumentUrl: '/api/admin/filings/H-2026-2003695/raw',
       docKind: 'scanned_pdf',
       chamber: 'house',
       reviewRevision: 7,
@@ -210,6 +213,9 @@ describe('review queue admin API', () => {
       reason: string;
     };
     expect(body).toMatchObject({ unpublished: true, deprecatedTransactions: 3, reason: 'bad parse' });
+    const deprecateSql = preparedSql.find((sql) => /UPDATE transactions[\s\S]*deprecated_at/i.test(sql));
+    expect(deprecateSql).toMatch(/local_mac/);
+    expect(deprecateSql).toMatch(/server_cpu/);
     const reopenSql = preparedSql.find((sql) => /UPDATE review_queue[\s\S]*SET resolved = 0/i.test(sql));
     expect(reopenSql).toMatch(/agreement_attempted_at = NULL/i);
     expect(reopenSql).toMatch(/agreement_attempts = 0/i);
@@ -352,7 +358,7 @@ describe('review queue admin API', () => {
       },
     } as unknown as D1Database;
     const base = {
-      ticker: 'AAPL', assetName: 'Apple Inc.', txType: 'P', txDate: '2026-06-19',
+      ticker: 'AAPL', assetName: 'Apple Inc.', txType: 'B', txDate: '2026-06-19',
       owner: null, isOption: false, capGainsOver200: false,
     };
     const invalid = [
@@ -360,7 +366,7 @@ describe('review queue admin API', () => {
       { ...base, txDate: undefined },
       { ...base, owner: 'somebody' },
       { ...base, isOption: 'false' },
-      { ...base, txDate: '2026-06-21' },
+      { ...base, txDate: '2099-01-01' },
     ];
     for (const edit of invalid) {
       const res = await app.request(
@@ -426,7 +432,7 @@ describe('review queue admin API', () => {
             assetType: 'ST',
             assetTypeName: 'Stocks',
             owner: 'self',
-            txType: 'P',
+            txType: 'B',
             amountMin: 1001,
             amountMax: 15000,
             txDate: '2026-06-01',
@@ -465,7 +471,7 @@ describe('review queue admin API', () => {
       ticker: 'AAPL',
       assetType: 'ST',
       assetTypeName: 'Stocks',
-      txType: 'P',
+      txType: 'B',
       amountMin: 1001,
       amountMax: 15000,
       isOption: false,

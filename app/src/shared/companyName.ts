@@ -1,4 +1,11 @@
-/** Standardize company name: title-case all-caps, normalize common suffixes, preserve key acronyms. */
+/**
+ * Standardize company name: title-case all-caps, normalize common suffixes, preserve key acronyms.
+ *
+ * Stays local on purpose (issue #1462).  Shared `normalizeCompanyName` is a
+ * subset; this copy also strips exchange parens, "Common Stock", and uses a
+ * curated US-state suffix list.  Do not switch the product path to shared
+ * without a display-name fixture pass.
+ */
 export function normalizeCompanyName(raw: string | null | undefined, ticker?: string | null): string | null {
   if (!raw) return null;
   let name = raw.trim();
@@ -164,4 +171,84 @@ export function normalizeCompanyName(raw: string | null | undefined, ticker?: st
   name = name.replace(/\.{2,}/g, ".");
 
   return name.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Display-name resolution (review issue #1453, server-side "asset name" fix)
+// ---------------------------------------------------------------------------
+
+/** Loose ticker-shape check used only to decide whether a bare symbol is a
+ *  reasonable display fallback (e.g. "UNH" instead of a mangled "Unh Stock").
+ *  Deliberately permissive/local — this file stays dependency-free — and is
+ *  NOT a securities_master resolution; `ticker` here is whatever the caller's
+ *  own extraction/resolution pipeline already produced. */
+const LOOSE_TICKER_SHAPE = /^[A-Z]{1,5}([.^-][A-Z0-9]{1,3})?$/;
+
+/** Generic asset words that carry no company information on their own. */
+const GENERIC_ASSET_WORDS_RE = /^(?:common\s+)?stock$|^securit(?:y|ies)$/i;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True when `name` (already stripped of a trailing "Common Stock" suffix)
+ * carries no real company signal: it's blank, a bare generic word ("Stock",
+ * "Securities", …), exactly the ticker, or a "<TICKER> Stock" / "<TICKER>
+ * Securities" style placeholder some filings use in place of a company name.
+ */
+function isGenericAssetPlaceholder(name: string, ticker: string): boolean {
+  if (!name) return true;
+  if (GENERIC_ASSET_WORDS_RE.test(name)) return true;
+  if (!ticker) return false;
+  if (name.toLowerCase() === ticker.toLowerCase()) return true;
+  const tickerStockRe = new RegExp(
+    `^${escapeRegExp(ticker)}\\s+(?:common\\s+)?(?:stock|securit(?:y|ies))$`,
+    "i",
+  );
+  return tickerStockRe.test(name);
+}
+
+/**
+ * Resolve the display name a client should render for an asset — the single
+ * server-side authority for "what do we call this position" (review #1453).
+ *
+ * Priority:
+ *   1. `securities_ref` canonical company name, when supplied — authoritative
+ *      and consistently formatted, so it wins over filing free text whenever
+ *      we have it (still run through {@link normalizeCompanyName} defensively
+ *      in case the ref row itself carries odd casing).
+ *   2. A generic, information-free filing placeholder ("Stock", "Securities",
+ *      "<TICKER> Stock", the ticker repeated as the name, …) with no ref name
+ *      available: show the bare ticker symbol when it at least looks like a
+ *      real one — never a mangled title-case of the placeholder itself
+ *      ("Unh Stock").
+ *   3. Real filing-provided text: title-case cleanup via
+ *      {@link normalizeCompanyName}.
+ *   4. Nothing usable at all (no ref name, no ticker, no text worth cleaning):
+ *      hand back the original filing text unchanged — never invent a name.
+ */
+export function resolveAssetDisplayName(
+  rawName: string | null | undefined,
+  ticker?: string | null,
+  refCompanyName?: string | null,
+): string | null {
+  const original = (rawName ?? "").trim();
+  const tkr = (ticker ?? "").trim();
+  const ref = (refCompanyName ?? "").trim();
+
+  // Strip the boilerplate "Common Stock" suffix so the placeholder checks
+  // below see the underlying signal (or lack of one), same as the cleanup
+  // callers previously applied inline.
+  const stripped = original.replace(/\s*(?:-)?\s*Common Stock\b/gi, "").trim();
+
+  if (isGenericAssetPlaceholder(stripped, tkr)) {
+    if (ref) return normalizeCompanyName(ref, tkr || undefined) || ref;
+    if (tkr && LOOSE_TICKER_SHAPE.test(tkr.toUpperCase())) return tkr.toUpperCase();
+    // Genuinely unknown: never invent, return exactly what the filing said.
+    return original || null;
+  }
+
+  if (ref) return normalizeCompanyName(ref, tkr || undefined) || ref;
+  return normalizeCompanyName(stripped, tkr || undefined) || stripped || original || null;
 }

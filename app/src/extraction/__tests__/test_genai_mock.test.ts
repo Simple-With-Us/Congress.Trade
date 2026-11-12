@@ -8,7 +8,7 @@ export const mockGenerateContent = vi.fn().mockResolvedValue({
     assetName: 'Apple Inc.',
     ticker: 'aapl',
     assetType: 'ST',
-    txType: 'P',
+    txType: 'B',
     amountRange: '$1,001 - $15,000',
     isOption: false,
     capGainsOver200: false,

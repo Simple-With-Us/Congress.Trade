@@ -13,8 +13,10 @@ import {
   OPENROUTER_EXTRACTION_RESPONSE_FORMAT,
   annotationObjectKey,
   chooseParserEngine,
+  gemini37FlashProviderPreference,
   isEngineOverrideRejection,
   parseMaxPrice,
+  prefersPageImages,
   supportsNativeVision,
   supportsStructuredOutputs,
 } from '../openRouterVision.ts';
@@ -56,7 +58,7 @@ describe('OpenRouterVisionExtractor', () => {
                   {
                     ticker: 'AAPL',
                     assetName: 'Apple Inc.',
-                    txType: 'P',
+                    txType: 'B',
                     amountRange: '$1,001 - $15,000',
                     txDate: '2026-05-01',
                     owner: 'Self',
@@ -90,6 +92,23 @@ describe('OpenRouterVisionExtractor', () => {
     
     // Verify extractor name
     expect(result.extractor).toBe('openRouterVision');
+  });
+
+  it('skips a bare Unauthorized reply without a second Files call', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      text: async () => '{"error":{"message":"Unauthorized","code":401}}',
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ex = new OpenRouterVisionExtractor(env);
+    await expect(ex.extract({
+      filing: filing(),
+      bytes: new TextEncoder().encode('dummy pdf bytes').buffer as ArrayBuffer,
+    })).rejects.toThrow(/openRouterReply:unauth_reply/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('throws an error if no API key is provided', async () => {
@@ -197,7 +216,7 @@ describe('OpenRouterVisionExtractor', () => {
     }
     
     expect(caughtErr).toBeDefined();
-    expect(caughtErr?.message).toContain('could not parse model JSON');
+    expect(caughtErr?.message).toContain('openRouterReply:garbage');
     expect(caughtErr?.usage).toMatchObject({ promptTokens: 100, completionTokens: 50 });
     // The call was billed before the parse failure: the generation id must
     // survive onto the thrown error for bakeoff.ts's error-path telemetry.
@@ -231,6 +250,8 @@ describe('OpenRouterVisionExtractor', () => {
     expect(body.user).toBe('S-1');
     expect('session_id' in body).toBe(false);
     // Classifier keys FLAT under trace — no metadata sub-object anywhere.
+    // Purpose tags (purpose/generation_name/chamber) ride alongside the shared
+    // static classifier fields for call-purpose reporting.
     expect(body.trace).toEqual({
       sourceApp: 'congress-trade',
       environment: 'test',
@@ -238,11 +259,19 @@ describe('OpenRouterVisionExtractor', () => {
       feature: 'vision-extract-senate',
       keyRef: 'OPENROUTER_API_KEY',
       gitSha: 'abc123def456',
+      purpose: 'vision_extract',
+      generation_name: 'PTR vision extraction',
+      chamber: 'senate',
     });
     expect(body.trace.metadata).toBeUndefined();
     expect('metadata' in body).toBe(false);
     // Enrichment must never displace the core request fields.
-    expect(body.model).toBe('google/gemini-3.5-flash');
+    expect(body.model).toBe('~google/gemini-flash-latest');
+    expect(body.provider).toEqual({
+      order: ['Google'],
+      allow_fallbacks: true,
+      require_parameters: true,
+    });
     expect(body.messages).toHaveLength(1);
   });
 
@@ -388,16 +417,74 @@ function lastRequestBody(fetchMock: ReturnType<typeof vi.fn>, call = 0): Record<
   return JSON.parse(String(fetchMock.mock.calls[call][1].body));
 }
 
+describe('gemini37FlashProviderPreference', () => {
+  it('pins Flash latest and 3.8 (plus batch) to Vertex/Google with fallbacks', () => {
+    expect(gemini37FlashProviderPreference('~google/gemini-flash-latest')).toEqual({
+      order: ['Google'],
+      allow_fallbacks: true,
+    });
+    expect(gemini37FlashProviderPreference('google/gemini-3.8-flash')).toEqual({
+      order: ['Google'],
+      allow_fallbacks: true,
+    });
+    expect(gemini37FlashProviderPreference('google/gemini-3.8-flash:batch')).toEqual({
+      order: ['Google'],
+      allow_fallbacks: true,
+    });
+  });
+
+  // Regression guard for sentry[bot] review on #2529: the provider-preference
+  // function must recognise every spelling the production caller can pass
+  // (OpenRouter forwarders occasionally normalise away the `google/` prefix;
+  // users can paste the slug with a leading `~`; a future caller may pass the
+  // bare slug from a config var). All of these must route through the
+  // 75%-off Vertex endpoint, not the 50%-off AI Studio default.
+  it('recognises every spelling of gemini-3.8-flash and routes to Vertex', () => {
+    const expected = { order: ['Google'], allow_fallbacks: true };
+    expect(gemini37FlashProviderPreference('google/gemini-3.8-flash')).toEqual(expected);
+    expect(gemini37FlashProviderPreference('~google/gemini-3.8-flash')).toEqual(expected);
+    expect(gemini37FlashProviderPreference('gemini-3.8-flash')).toEqual(expected);
+    expect(gemini37FlashProviderPreference('  google/gemini-3.8-flash  ')).toEqual(expected);
+    expect(gemini37FlashProviderPreference('GOOGLE/GEMINI-3.8-FLASH')).toEqual(expected);
+  });
+
+  it('does not pin other models', () => {
+    expect(gemini37FlashProviderPreference('anthropic/claude-sonnet-5')).toEqual({});
+    expect(gemini37FlashProviderPreference('google/gemini-3.5-flash-lite')).toEqual({});
+    expect(gemini37FlashProviderPreference('google/gemini-3.5-flash')).toEqual({});
+  });
+});
+
 describe('supportsNativeVision', () => {
   it('matches the current anthropic/claude-* catalog slugs', () => {
     expect(supportsNativeVision('anthropic/claude-sonnet-5')).toBe(true);
     expect(supportsNativeVision('anthropic/claude-haiku-4.5')).toBe(true);
     expect(supportsNativeVision('anthropic/claude-3-opus')).toBe(true);
   });
-  it('rejects models without native PDF file input', () => {
+  it('matches Gemini Flash latest and DeepSeek Flash Vision without paying mistral-ocr', () => {
+    expect(supportsNativeVision('~google/gemini-flash-latest')).toBe(true);
+    expect(supportsNativeVision('google/gemini-flash-latest')).toBe(true);
+    expect(supportsNativeVision('google/gemini-3.8-flash')).toBe(true);
+    expect(supportsNativeVision('deepseek/deepseek-v4-flash-vision-exp')).toBe(true);
+  });
+  it('rejects models without native PDF / vision input', () => {
     expect(supportsNativeVision('amazon/nova-lite-v1')).toBe(false);
     expect(supportsNativeVision('z-ai/glm-4.6v')).toBe(false);
     expect(supportsNativeVision('qwen/qwen3-vl-8b-instruct')).toBe(false);
+    expect(supportsNativeVision('deepseek/deepseek-v4-flash')).toBe(false);
+  });
+});
+
+describe('prefersPageImages', () => {
+  it('routes Qwen VL and GLM-V to raster pages instead of PDF file-parser', () => {
+    expect(prefersPageImages('qwen/qwen3-vl-8b-instruct')).toBe(true);
+    expect(prefersPageImages('qwen/qwen3-vl-30b-a3b-instruct')).toBe(true);
+    expect(prefersPageImages('z-ai/glm-4.6v')).toBe(true);
+  });
+  it('does not force images on native-PDF models', () => {
+    expect(prefersPageImages('x-ai/grok-4.5')).toBe(false);
+    expect(prefersPageImages('google/gemini-3.8-flash')).toBe(false);
+    expect(prefersPageImages('anthropic/claude-sonnet-5')).toBe(false);
   });
 });
 
@@ -405,6 +492,7 @@ describe('supportsStructuredOutputs', () => {
   it('allows vendors verified to list structured_outputs', () => {
     for (const model of [
       'openai/gpt-5.6-terra', 'anthropic/claude-sonnet-5', 'google/gemini-3.5-flash',
+      '~google/gemini-flash-latest',
       'deepseek/deepseek-v4-flash', 'qwen/qwen3-vl-8b-instruct', 'x-ai/grok-4.5',
     ]) expect(supportsStructuredOutputs(model), model).toBe(true);
   });
@@ -426,7 +514,10 @@ describe('chooseParserEngine', () => {
   });
   it('lets native-vision models read scans natively and routes the rest to mistral-ocr', () => {
     expect(chooseParserEngine({ model: 'anthropic/claude-sonnet-5', docKind: 'scanned_pdf' })).toBeNull();
+    expect(chooseParserEngine({ model: '~google/gemini-flash-latest', docKind: 'scanned_pdf' })).toBeNull();
+    expect(chooseParserEngine({ model: 'deepseek/deepseek-v4-flash-vision-exp', docKind: 'scanned_pdf' })).toBeNull();
     expect(chooseParserEngine({ model: 'amazon/nova-lite-v1', docKind: 'scanned_pdf' })).toBe('mistral-ocr');
+    expect(chooseParserEngine({ model: 'deepseek/deepseek-v4-flash', docKind: 'scanned_pdf' })).toBe('mistral-ocr');
   });
   it('honors the engine knobs', () => {
     expect(chooseParserEngine({ model: 'amazon/nova-lite-v1', docClass: 'typed', textEngine: 'mistral-ocr' })).toBe('mistral-ocr');
@@ -457,6 +548,49 @@ describe('OpenRouterVisionExtractor OpenRouter features', () => {
     expect(conf).toEqual({ type: 'number' });
     expect(conf).not.toHaveProperty('minimum');
     expect(conf).not.toHaveProperty('maximum');
+  });
+
+  it('defaults to Flash latest and pins Vertex/Google', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(okPayload());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ex = new OpenRouterVisionExtractor(env);
+    await ex.extract({ filing: filing(), bytes: new TextEncoder().encode('x').buffer as ArrayBuffer });
+
+    const body = lastRequestBody(fetchMock);
+    expect(body.model).toBe('~google/gemini-flash-latest');
+    expect(body.provider).toEqual({
+      order: ['Google'],
+      allow_fallbacks: true,
+      require_parameters: true,
+    });
+  });
+
+  it('still pins Vertex/Google when an explicit 3.8 Flash slug is requested', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(okPayload());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ex = new OpenRouterVisionExtractor(env, { model: 'google/gemini-3.8-flash' });
+    await ex.extract({ filing: filing(), bytes: new TextEncoder().encode('x').buffer as ArrayBuffer });
+
+    const body = lastRequestBody(fetchMock);
+    expect(body.model).toBe('google/gemini-3.8-flash');
+    expect(body.provider.order).toEqual(['Google']);
+  });
+
+  it('leaves Flash Lite and Claude provider prefs unchanged', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okPayload());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const lite = new OpenRouterVisionExtractor(env, { model: 'google/gemini-3.5-flash-lite' });
+    await lite.extract({ filing: filing(), bytes: new TextEncoder().encode('x').buffer as ArrayBuffer });
+    expect(lastRequestBody(fetchMock, 0).model).toBe('google/gemini-3.5-flash-lite');
+    expect(lastRequestBody(fetchMock, 0).provider).toEqual({ require_parameters: true });
+
+    const claude = new OpenRouterVisionExtractor(env, { model: 'anthropic/claude-sonnet-5' });
+    await claude.extract({ filing: filing(), bytes: new TextEncoder().encode('x').buffer as ArrayBuffer });
+    expect(lastRequestBody(fetchMock, 1).model).toBe('anthropic/claude-sonnet-5');
+    expect(lastRequestBody(fetchMock, 1).provider).toEqual({ require_parameters: true });
   });
 
   it('sends strict json_schema + require_parameters + usage accounting for structured-output models', async () => {

@@ -1,5 +1,5 @@
 /**
- * Complete outbound-call accounting for Congress.Trade.
+ * Complete outbound-call accounting for congress.trade.
  *
  * Every deployed Worker-owned third-party HTTP attempt passes through `trackedFetch`.
  * The active Worker invocation's Env is carried with AsyncLocalStorage, so
@@ -13,15 +13,20 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { z } from 'zod';
 import {
   API_USAGE_MONITOR_INGEST_PATH,
   createUsageTelemetryClient,
   LegacyUsageTelemetryOutboxEventSchema,
   UsageTelemetryV2EventSchema,
+  UsageTelemetryV2IngestAckSchema,
 } from '@jaywedgeworth22/congress-trading-shared';
 import type { LegacyUsageTelemetryOutboxEventInput } from '@jaywedgeworth22/congress-trading-shared';
 import { resolveSecrets } from '../secrets/infisical.ts';
+import { startDatadogSpan } from './datadog.ts';
+import { withDatadogLlmObs } from './datadogLlmobs.ts';
 import type { Env, ThirdPartyUsageTelemetryEvent } from './types.ts';
+import { abortIfSignal } from './signalAbort.ts';
 
 interface TelemetryContext {
   env: Env;
@@ -143,6 +148,12 @@ interface MeasuredThirdPartyUsageFields {
   confidence?: ThirdPartyUsageTelemetryEvent['confidence'];
   metadata?: Record<string, string | number | boolean | null>;
   /**
+   * Secret-name alias for the key that produced this measurement (never the
+   * raw secret). Usage-Monitor key attribution binds this to a project/app —
+   * e.g. OPENROUTER_API_KEY → congress-trade. Optional.
+   */
+  producerKeyRef?: string;
+  /**
    * Provider-side call/generation id (e.g. OpenRouter's `id` on a completions
    * response), for monitor-side spend verification (`GET
    * /api/v1/generation?id=...`). Callers must pass `undefined` — never `""`
@@ -177,6 +188,8 @@ const HOST_PROVIDERS = new Map<string, string>([
   ['generativelanguage.googleapis.com', 'gemini'],
   ['api.cloud.llamaindex.ai', 'llamaparse'],
   ['financialmodelingprep.com', 'fmp'],
+  ['financial-modeling-prep.p.rapidapi.com', 'fmp'],
+  ['fmp-api.p.rapidapi.com', 'fmp'],
   ['api.unusualwhales.com', 'unusual-whales'],
   ['api.quiverquant.com', 'quiver-quant'],
   ['api.massive.com', 'massive'],
@@ -206,6 +219,8 @@ const HOST_PROVIDERS = new Map<string, string>([
 const HOST_SUFFIX_PROVIDERS: Array<[suffix: string, provider: string]> = [
   ['.cloudflareaccess.com', 'cloudflare-access'],
   ['.sentry.io', 'sentry'],
+  ['.datadoghq.com', 'datadog'],
+  ['.datadoghq.eu', 'datadog'],
 ];
 
 const DYNAMIC_PROVIDERS: Record<DynamicThirdPartyTarget, string> = {
@@ -396,6 +411,7 @@ function baseEvent(
     billingMode: ThirdPartyUsageTelemetryEvent['billingMode'];
     confidence: ThirdPartyUsageTelemetryEvent['confidence'];
     providerRequestId?: string;
+    producerKeyRef?: string;
   },
 ): ThirdPartyUsageTelemetryEvent {
   const service = stableTag(input.service, 'external-api');
@@ -403,6 +419,9 @@ function baseEvent(
   const idempotencyKey = input.idempotencyKey
     ? stableTag(input.idempotencyKey, 'ct-third-party')
     : eventId('ct-third-party');
+  const producerKeyRef = input.producerKeyRef?.trim()
+    ? stableTag(input.producerKeyRef, 'key-ref')
+    : undefined;
   return {
     eventId: idempotencyKey,
     environment: environmentName(env),
@@ -410,6 +429,7 @@ function baseEvent(
     service,
     project: 'congress-trade',
     label: operation,
+    ...(producerKeyRef ? { producerKeyRef } : {}),
     billingMode: input.billingMode,
     metricType: input.metricType,
     confidence: input.confidence,
@@ -455,7 +475,7 @@ function parseUsageTelemetryFallback(raw: string): DeliverableUsageTelemetryEven
       || !parsed.occurredAt
       || !['usage', 'cost', 'limit'].includes(parsed.metricType)
     ) {
-      throw new Error('fallback telemetry event is not a Congress.Trade event');
+      throw new Error('fallback telemetry event is not a congress.trade event');
     }
     return parsed as ThirdPartyUsageTelemetryEvent;
   }
@@ -470,7 +490,7 @@ function parseUsageTelemetryFallback(raw: string): DeliverableUsageTelemetryEven
     || !parsed.occurredAt
     || !['usage', 'cost', 'limit'].includes(parsed.metricType)
   ) {
-    throw new Error('fallback telemetry event is not a Congress.Trade event');
+    throw new Error('fallback telemetry event is not a congress.trade event');
   }
   return parsed as LegacyThirdPartyUsageTelemetryEvent;
 }
@@ -664,6 +684,51 @@ class UsageTelemetryDeliveryHttpError extends Error {
   }
 }
 
+/** A successful HTTP response is not proof that the receiver accepted this
+ * event. Keep incomplete ACKs retryable, including malformed response bodies:
+ * receiver contract failures must never be classified as poison event data. */
+class UsageTelemetryDeliveryAckError extends Error {
+  constructor() {
+    super('usage telemetry receiver did not acknowledge delivery');
+    this.name = 'UsageTelemetryDeliveryAckError';
+  }
+}
+
+/** A valid ACK rejected this event, rather than failing the receiver. Queue
+ * ownership may end only after a recoverable quarantine copy exists. */
+class UsageTelemetryDeliveryEventRejectedError extends Error {
+  constructor(readonly quarantined: boolean) {
+    super(quarantined
+      ? 'usage telemetry event rejected; preserved in quarantine for replay'
+      : 'usage telemetry event rejected; quarantine unavailable');
+    this.name = 'UsageTelemetryDeliveryEventRejectedError';
+  }
+}
+
+/** The only receiver-specific extension to the shared strict ACK contract. */
+export const UsageTelemetryReceiverRejectionSchema = z.object({
+  index: z.literal(0),
+  eventId: z.string().min(1).max(200).optional(),
+  issues: z.array(z.string()),
+}).strict();
+export const UsageTelemetryReceiverAckSchema = UsageTelemetryV2IngestAckSchema.safeExtend({
+  rejections: z.array(UsageTelemetryReceiverRejectionSchema).max(1).optional(),
+});
+export type UsageTelemetryReceiverAck = z.infer<typeof UsageTelemetryReceiverAckSchema>;
+
+/** Parse before inspecting external data. The shared schema still validates
+ * every count and their sum; only validated, request-bound details are removed. */
+function usageTelemetryAckPayload(payload: unknown, eventId: string): Omit<UsageTelemetryReceiverAck, 'rejections'> {
+  const parsed = UsageTelemetryReceiverAckSchema.safeParse(payload);
+  if (!parsed.success) throw new UsageTelemetryDeliveryAckError();
+  const { rejections = [], ...ack } = parsed.data;
+  if ((rejections.length > 0 && (ack.received !== 1 || ack.rejected !== 1))
+    || rejections.some((detail) => detail.eventId !== undefined && detail.eventId !== eventId)) {
+    throw new UsageTelemetryDeliveryAckError();
+  }
+  return ack;
+}
+
 function usageTelemetryErrorStatus(error: unknown): number | null {
   if (!error || typeof error !== 'object') return null;
   const candidate = error as { status?: unknown; response?: { status?: unknown } };
@@ -671,12 +736,13 @@ function usageTelemetryErrorStatus(error: unknown): number | null {
   return typeof status === 'number' && Number.isInteger(status) ? status : null;
 }
 
-/** True only for deterministic per-event receiver rejects that cannot become
- * successful when the identical queue payload is retried. The plain-error
+/** True for durably quarantined rejected events or deterministic legacy HTTP
+ * rejections. Malformed/ambiguous ACKs always remain retryable. The plain-error
  * branch keeps the queue boundary compatible with a future shared client that
  * exposes status/message directly instead of the local HTTP wrapper. */
 export function isTerminalUsageTelemetryDeliveryError(error: unknown): boolean {
-  if (error instanceof UsageTelemetryCircuitOpenError) return false;
+  if (error instanceof UsageTelemetryCircuitOpenError || error instanceof UsageTelemetryDeliveryAckError) return false;
+  if (error instanceof UsageTelemetryDeliveryEventRejectedError) return error.quarantined;
   if (error instanceof UsageTelemetryDeliveryHttpError) {
     const eventSpecific = /\b(?:schema|idempotency|invalid payload|malformed payload|required.*idempotency|event\s+\d+.*invalid)\b/i.test(error.message);
     return eventSpecific || (error.status === 400 && /\b(?:validation|field|property)\b/i.test(error.message));
@@ -997,6 +1063,13 @@ export async function recordMeasuredThirdPartyUsage(
   }
   const mapped = remapOpenRouterTelemetry(usage.provider, usage.model);
 
+  // Default OpenRouter spend to the primary CT key alias so Usage-Monitor
+  // Key Attribution can bind OPENROUTER_API_KEY → congress-trade without
+  // every call site having to remember the field.
+  const defaultProducerKeyRef =
+    mapped.provider === 'openrouter' && !usage.producerKeyRef
+      ? 'OPENROUTER_API_KEY'
+      : usage.producerKeyRef;
   const event = baseEvent(env, {
     provider: mapped.provider,
     service: usage.service,
@@ -1008,6 +1081,7 @@ export async function recordMeasuredThirdPartyUsage(
     billingMode: usage.billingMode ?? 'actual',
     confidence: usage.confidence ?? 'actual',
     providerRequestId: usage.providerRequestId,
+    producerKeyRef: defaultProducerKeyRef,
   });
   event.quantity = nonNegativeFinite(usage.quantity);
   event.unit = usage.unit;
@@ -1016,6 +1090,10 @@ export async function recordMeasuredThirdPartyUsage(
   event.requests = requests == null ? undefined : Math.floor(requests);
   event.credits = nonNegativeFinite(usage.credits);
   const remappedMetadata: Record<string, string> = mapped.transport ? { transport: mapped.transport } : {};
+  // Always stamp sourceApp on metadata so dashboards can filter without
+  // depending only on the batch-level producerId.
+  remappedMetadata.sourceApp = 'congress-trade';
+  if (defaultProducerKeyRef) remappedMetadata.keyRef = defaultProducerKeyRef;
   event.metadata = safeMetadata({ ...(event.metadata ?? {}), ...(usage.metadata ?? {}), ...remappedMetadata });
   return enqueueUsageTelemetryEvent(env, event);
 }
@@ -1055,10 +1133,25 @@ export async function trackedFetch(
   }
 
   const mapped = remapOpenRouterTelemetry(provider, descriptor.model);
+  const span = startDatadogSpan('http.client.request', {
+    resource: `${descriptor.service}.${descriptor.operation}`,
+    type: 'http',
+    tags: {
+      'outbound.provider': mapped.provider,
+      'outbound.service': descriptor.service,
+      'outbound.operation': descriptor.operation,
+      'outbound.model': mapped.model || 'none',
+    },
+  });
 
   const startedAt = Date.now();
   try {
-    const response = await fetchImpl(input, init);
+    const response = await withDatadogLlmObs(mapped.provider, mapped.model, () => fetchImpl(input, init));
+    span.setTag('http.status_code', String(response.status));
+    if (!response.ok) {
+      span.setTag('error', true);
+    }
+    span.finish();
     if (env) {
       const event = baseEvent(env, {
         provider: mapped.provider,
@@ -1085,6 +1178,9 @@ export async function trackedFetch(
     }
     return response;
   } catch (error) {
+    span.setTag('error', true);
+    span.setTag('error.type', error instanceof Error ? error.name : 'unknown');
+    span.finish();
     if (env) {
       const event = baseEvent(env, {
         provider: mapped.provider,
@@ -1117,7 +1213,7 @@ export async function trackedFetch(
 
 /**
  * The shared client accepts a service base URL and appends its canonical ingest
- * path. Older Congress.Trade config stored the full endpoint, so strip that
+ * path. Older congress.trade config stored the full endpoint, so strip that
  * suffix before constructing the client to avoid appending it twice.
  */
 export function normalizeUsageMonitorBaseUrl(configuredUrl: string): string {
@@ -1176,6 +1272,22 @@ class UsageTelemetryDeliveryTimeoutError extends Error {
   }
 }
 
+/**
+ * The drain budget cut this delivery short before the receiver's own
+ * configured timeout elapsed. This is still a transient timeout for
+ * retention (retained, not quarantined — same as
+ * UsageTelemetryDeliveryTimeoutError), but it must not be recorded as a
+ * receiver failure: the receiver never got its full timeout window, so
+ * counting it toward the circuit breaker would let our own lane budget
+ * trip the breaker and suppress healthy deliveries.
+ */
+class UsageTelemetryDeliveryBudgetTimeoutError extends UsageTelemetryDeliveryTimeoutError {
+  constructor() {
+    super();
+    this.name = 'UsageTelemetryDeliveryBudgetTimeoutError';
+  }
+}
+
 /** Explicit unmetered receiver primitive; telemetry must never meter itself. */
 async function fetchUsageTelemetryReceiver(
   input: RequestInfo | URL,
@@ -1197,8 +1309,15 @@ export async function deliverUsageTelemetryEvent(
   env: Env,
   event: DeliverableUsageTelemetryEvent,
   signal?: AbortSignal,
+  timeoutMsOrOptions?: number | { timeoutMs?: number },
 ): Promise<void> {
+  const callerTimeoutMs = typeof timeoutMsOrOptions === 'number'
+    ? timeoutMsOrOptions
+    : timeoutMsOrOptions?.timeoutMs;
   signal?.throwIfAborted();
+  if (callerTimeoutMs != null && callerTimeoutMs <= 0) {
+    throw new UsageTelemetryDeliveryBudgetTimeoutError();
+  }
   let circuitState = await readUsageTelemetryCircuitState(env);
   if (!circuitState) throw new UsageTelemetryCircuitOpenError();
   if (circuitState.openUntil != null && Date.now() < circuitState.openUntil) {
@@ -1256,12 +1375,23 @@ export async function deliverUsageTelemetryEvent(
     await withoutThirdPartyTelemetry(env, async () => {
       const { baseUrl, token } = receiverConfig
         ?? await resolveUsageTelemetryReceiverConfig(env);
+      const configuredTimeoutMs = usageTelemetryDeliveryTimeoutMs(env);
+      // Bound the receiver call by the caller's remaining budget when one
+      // is supplied (the fallback drain passes its remaining lane budget),
+      // floored so a nearly-spent budget still gets one short attempt
+      // instead of an instant abort. Callers that pass no override keep
+      // the existing configured-timeout behaviour.
+      const effectiveTimeoutMs = callerTimeoutMs == null
+        ? configuredTimeoutMs
+        : Math.max(250, Math.min(configuredTimeoutMs, Math.floor(callerTimeoutMs)));
+      const budgetLimited = callerTimeoutMs != null && effectiveTimeoutMs < configuredTimeoutMs;
       const controller = new AbortController();
       const timer = setTimeout(
         () => controller.abort(),
-        usageTelemetryDeliveryTimeoutMs(env),
+        effectiveTimeoutMs,
       );
       let receiverStatus: number | null = null;
+      let eventRejected = false;
       try {
         signal?.throwIfAborted();
         const client = createUsageTelemetryClient({
@@ -1279,19 +1409,41 @@ export async function deliverUsageTelemetryEvent(
               },
             );
             receiverStatus = response.status;
+            if (response.ok && response.status !== 204 && response.status !== 205) {
+              // Consume the body under the existing delivery deadline. Do not
+              // log or retain receiver-provided rejection detail strings.
+              const payload = usageTelemetryAckPayload(
+                await response.json(), usageTelemetryEventIdentity(event),
+              );
+              return Response.json(payload, { status: response.status });
+            }
             return response;
           },
         });
-        if (isV2UsageTelemetryEvent(event)) {
-          await client.send([event]);
-        } else {
-          await client.sendLegacyOutbox([event]);
+        const ack = isV2UsageTelemetryEvent(event)
+          ? await client.send([event])
+          : await client.sendLegacyOutbox([event]);
+        // The shared client validates the v2 ACK shape and bucket sum. Bind
+        // it to this one-event request before clearing any durable receipt.
+        // Duplicates and pruned events are acknowledged by the v2 contract.
+        if (ack.received !== 1) {
+          throw new UsageTelemetryDeliveryAckError();
         }
+        eventRejected = ack.rejected !== 0;
       } catch (error) {
         if (signal?.aborted) {
           throw signal.reason ?? new Error('durable queue lease lost');
         }
-        if (controller.signal.aborted) throw new UsageTelemetryDeliveryTimeoutError();
+        if (controller.signal.aborted) {
+          throw budgetLimited
+            ? new UsageTelemetryDeliveryBudgetTimeoutError()
+            : new UsageTelemetryDeliveryTimeoutError();
+        }
+        if (receiverStatus != null && receiverStatus >= 200 && receiverStatus < 300) {
+          // Do not expose response bytes, or let a response-schema error
+          // match the terminal-event classifier's schema/idempotency words.
+          throw new UsageTelemetryDeliveryAckError();
+        }
         if (receiverStatus != null) {
           const message = error instanceof Error ? error.message : String(error ?? '');
           throw new UsageTelemetryDeliveryHttpError(receiverStatus, message);
@@ -1302,12 +1454,37 @@ export async function deliverUsageTelemetryEvent(
         // response-schema validation, not just until fetch returns headers.
         clearTimeout(timer);
       }
+      if (eventRejected) {
+        // Persistence has its own failure mode; it must not inherit the
+        // receiver deadline or turn a healthy receiver into a global outage.
+        signal?.throwIfAborted();
+        const quarantined = await writeUsageTelemetryQuarantine(
+          (env as Partial<Env>).RAW_FILES,
+          usageTelemetryEventIdentity(event),
+          JSON.stringify(event),
+          'terminal_receiver_rejection',
+        );
+        signal?.throwIfAborted();
+        throw new UsageTelemetryDeliveryEventRejectedError(quarantined);
+      }
     });
   } catch (error) {
     if (signal?.aborted) {
       throw signal.reason ?? new Error('durable queue lease lost');
     }
-    if (isTerminalUsageTelemetryDeliveryError(error)) {
+    if (error instanceof UsageTelemetryDeliveryBudgetTimeoutError) {
+      // Our own drain/lane budget cut the call short, not the receiver:
+      // the receiver never saw its full configured timeout, so this must
+      // not count toward the circuit breaker. Rethrow as a transient
+      // timeout so the drain retains the event for the next tick. The
+      // half-open probe lease (if any) is left to expire — no receiver
+      // health signal was observed either way.
+      throw error;
+    }
+    if (error instanceof UsageTelemetryDeliveryEventRejectedError || isTerminalUsageTelemetryDeliveryError(error)) {
+      // A fully validated per-event rejection proves the receiver is healthy.
+      // Even a quarantine write failure must not trip the shared breaker and
+      // prevent unrelated healthy events from making progress.
       const closedPersisted = await recordUsageTelemetryDeliverySuccess(env);
       if (probeLease && closedPersisted) {
         await releaseUsageTelemetryHalfOpenProbe(env, probeLease.token);
@@ -1322,6 +1499,34 @@ export async function deliverUsageTelemetryEvent(
   if (probeLease && closedPersisted) {
     await releaseUsageTelemetryHalfOpenProbe(env, probeLease.token);
   }
+}
+
+const UsageTelemetryDrainCursorSchema = z.object({
+  r2: z.string().min(1).optional(),
+  d1: z.object({ updatedAt: z.string().min(1), idempotencyKey: z.string().min(1) }).strict().optional(),
+}).strict();
+type UsageTelemetryDrainCursor = z.infer<typeof UsageTelemetryDrainCursorSchema>;
+const USAGE_TELEMETRY_DRAIN_CURSOR_KEY = 'usage_telemetry_drain_cursor';
+const usageTelemetryDrainCursors = new WeakMap<Env, UsageTelemetryDrainCursor>();
+
+async function readUsageTelemetryDrainCursor(env: Env): Promise<UsageTelemetryDrainCursor> {
+  let value: unknown = usageTelemetryDrainCursors.get(env);
+  try {
+    if (value === undefined && env.CONFIG_KV?.get) value = await env.CONFIG_KV.get(USAGE_TELEMETRY_DRAIN_CURSOR_KEY, 'json');
+  } catch { /* A cursor outage must not authorize removing retained data. */ }
+  const parsed = UsageTelemetryDrainCursorSchema.safeParse(value);
+  return parsed.success ? parsed.data : {};
+}
+
+async function writeUsageTelemetryDrainCursor(env: Env, cursor: UsageTelemetryDrainCursor): Promise<void> {
+  try {
+    if (env.CONFIG_KV?.put) {
+      await env.CONFIG_KV.put(USAGE_TELEMETRY_DRAIN_CURSOR_KEY, JSON.stringify(cursor));
+      usageTelemetryDrainCursors.delete(env);
+      return;
+    }
+  } catch { /* Keep same-isolate progress without weakening durability. */ }
+  usageTelemetryDrainCursors.set(env, cursor);
 }
 
 export interface UsageTelemetryFallbackFlushResult {
@@ -1352,28 +1557,63 @@ export interface UsageTelemetryFallbackFlushResult {
  */
 export async function flushUsageTelemetryFallback(
   env: Env,
-  options: { limit?: number } = {},
+  options: { limit?: number; signal?: AbortSignal } = {},
 ): Promise<UsageTelemetryFallbackFlushResult> {
   if (await isUsageTelemetryCircuitOpen(env)) {
     return { listed: 0, delivered: 0, failed: 0, expired: 0, skipped: true };
   }
+  const cursor = await readUsageTelemetryDrainCursor(env);
+  const initialCursor = JSON.stringify(cursor);
+  try {
+    return await drainUsageTelemetryFallbackPage(env, options, cursor);
+  } finally {
+    if (JSON.stringify(cursor) !== initialCursor) await writeUsageTelemetryDrainCursor(env, cursor);
+  }
+}
+
+async function drainUsageTelemetryFallbackPage(
+  env: Env,
+  options: { limit?: number; signal?: AbortSignal },
+  cursor: UsageTelemetryDrainCursor,
+): Promise<UsageTelemetryFallbackFlushResult> {
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 25)));
   const storage = (env as Partial<Env>).RAW_FILES;
   const db = (env as Partial<Env>).DB;
   const ttlMs = usageTelemetryFallbackTtlMs(env);
   const now = Date.now();
   const r2Available = Boolean(storage?.list);
+  const startingR2Cursor = cursor.r2;
   const listed = storage?.list
     ? await storage.list({
         prefix: USAGE_TELEMETRY_FALLBACK_PREFIX,
         limit,
+        ...(startingR2Cursor ? { cursor: startingR2Cursor } : {}),
+      }).catch((error) => {
+        // A stale continuation token must not permanently wedge the drain.
+        delete cursor.r2;
+        throw error;
       })
     : { objects: [] as R2Object[], truncated: false as const };
   let delivered = 0;
   let failed = 0;
   let expired = 0;
   let r2Removed = 0; // outbox objects deleted this cycle (delivered + expired + quarantined)
+  // Stay inside the usage_telemetry maintenance lane budget (8s default).  Each
+  // object can take multiple remote calls; stop early instead of timing out the
+  // whole tick (CONGRESS-TRADE-1S).
+  const drainStartedMs = Date.now();
+  const drainBudgetMs = 6_500;
+  const remainingDrainBudgetMs = () => drainBudgetMs - (Date.now() - drainStartedMs);
+  // Publish the next page token only after every object on this page is
+  // visited.  listed.cursor points past this page; saving it on a budget
+  // break skips the objects not yet processed until wrap-around.
+  let r2PageFinished = true;
   for (const object of listed.objects) {
+    abortIfSignal(options.signal);
+    if (remainingDrainBudgetMs() <= 0) {
+      r2PageFinished = false;
+      break;
+    }
     if (object.uploaded && now - object.uploaded.getTime() > ttlMs) {
       try {
         await storage?.delete(object.key);
@@ -1389,7 +1629,12 @@ export async function flushUsageTelemetryFallback(
       let event: DeliverableUsageTelemetryEvent | null = null;
       try {
         event = parseUsageTelemetryFallback(raw);
-        await deliverUsageTelemetryEvent(env, event);
+        // Re-read the budget (the R2 get/body read above also spends it), but
+        // an object whose read started inside the budget still gets one short
+        // attempt instead of being dropped as a budget timeout.
+        await deliverUsageTelemetryEvent(
+          env, event, options.signal, Math.max(250, remainingDrainBudgetMs()),
+        );
         await storage?.delete(object.key);
         r2Removed += 1;
         delivered += 1;
@@ -1401,12 +1646,12 @@ export async function flushUsageTelemetryFallback(
         const quarantineIdentity = event ? usageTelemetryEventIdentity(event) : object.key;
         const quarantineReason = event == null ? 'malformed' : 'terminal_receiver_rejection';
         if (event == null || isTerminalUsageTelemetryDeliveryError(error)) {
-          const quarantined = await writeUsageTelemetryQuarantine(
-            storage,
-            quarantineIdentity,
-            raw,
-            quarantineReason,
-          );
+          // The delivery path already wrote canonical event bytes. Reuse
+          // that durable copy when identical; otherwise preserve the original
+          // formatted/migrated bytes before removing the source receipt.
+          const quarantined = (error instanceof UsageTelemetryDeliveryEventRejectedError
+            && error.quarantined && raw === JSON.stringify(event))
+            || await writeUsageTelemetryQuarantine(storage, quarantineIdentity, raw, quarantineReason);
           if (quarantined) {
             await storage?.delete(object.key);
             r2Removed += 1;
@@ -1418,31 +1663,63 @@ export async function flushUsageTelemetryFallback(
       failed += 1;
     }
   }
+  if (r2Available && r2PageFinished) {
+    if (listed.truncated && 'cursor' in listed) cursor.r2 = listed.cursor;
+    else delete cursor.r2;
+  }
   // Maintain the O(1) admission counter. When the bounded list was the entire
-  // outbox (not truncated), the exact remainder is known, so set it
+  // outbox (not truncated and starting at the prefix), the exact remainder is known, so set it
   // authoritatively — this self-heals any drift, including R2 objects that
   // predate the counter. Otherwise best-effort decrement by what we removed.
   if (r2Available) {
-    if (!listed.truncated) {
+    if (!listed.truncated && !startingR2Cursor) {
       await writeUsageTelemetryOutboxCount(env, Math.max(0, listed.objects.length - r2Removed));
     } else if (r2Removed > 0) {
       await adjustUsageTelemetryOutboxCount(env, -r2Removed);
     }
   }
+  abortIfSignal(options.signal);
   const remainingLimit = Math.max(0, limit - listed.objects.length);
   const d1DrainComplete = await isUsageTelemetryD1DrainComplete(env);
-  if (remainingLimit > 0 && db?.prepare && !d1DrainComplete) {
+  // Share the R2 drain budget: do not start the legacy phase (not even its
+  // page read) once the budget is spent. The D1 cursor is left untouched so
+  // the next tick resumes exactly where this one stopped.
+  if (remainingLimit > 0 && db?.prepare && !d1DrainComplete && remainingDrainBudgetMs() > 0) {
     try {
-      const rows = await db.prepare(
-        `SELECT idempotency_key, event_json, attempts
-           FROM usage_telemetry_fallback_events
-          ORDER BY updated_at ASC
-          LIMIT ?`,
-      )
-        .bind(Math.min(remainingLimit, usageTelemetryD1DrainLimit(env)))
-        .all<{ idempotency_key: string; event_json: string; attempts: number }>();
+      type LegacyRow = { idempotency_key: string; event_json: string; attempts: number; updated_at: string };
+      const readPage = async (after?: UsageTelemetryDrainCursor['d1']) => {
+        const where = after ? 'WHERE updated_at > ? OR (updated_at = ? AND idempotency_key > ?)' : '';
+        const params: unknown[] = after ? [after.updatedAt, after.updatedAt, after.idempotencyKey] : [];
+        return await db.prepare(
+          `SELECT idempotency_key, event_json, attempts, updated_at
+             FROM usage_telemetry_fallback_events
+             ${where}
+            ORDER BY updated_at ASC, idempotency_key ASC
+            LIMIT ?`,
+        ).bind(...params, Math.min(remainingLimit, usageTelemetryD1DrainLimit(env))).all<LegacyRow>();
+      };
+      let rows = await readPage(cursor.d1);
+      if (cursor.d1 && !(rows.results?.length)) {
+        // An empty suffix is not an empty table. Wrap and verify its head
+        // before setting the one-time drain-complete marker.
+        delete cursor.d1;
+        rows = await readPage();
+      }
       const results = rows.results ?? [];
+      // Advance the D1 cursor incrementally below, only past rows actually
+      // visited. Pre-setting it to the page tail (the old behaviour) would
+      // skip unvisited rows when the shared drain budget breaks the loop
+      // early; the finally in flushUsageTelemetryFallback persists whatever
+      // partial progress was made.
+      if (results.length === 0) delete cursor.d1;
       for (const row of results) {
+        abortIfSignal(options.signal);
+        const remainingMs = remainingDrainBudgetMs();
+        if (remainingMs <= 0) break;
+        // This row is now visited: advance the cursor past it (and only it)
+        // before attempting delivery, so a later budget break never skips
+        // rows that were not reached.
+        cursor.d1 = { updatedAt: row.updated_at, idempotencyKey: row.idempotency_key };
         let event: DeliverableUsageTelemetryEvent | null = null;
         try {
           event = parseUsageTelemetryFallback(row.event_json);
@@ -1454,7 +1731,7 @@ export async function flushUsageTelemetryFallback(
           continue;
         }
         try {
-          await deliverUsageTelemetryEvent(env, event);
+          await deliverUsageTelemetryEvent(env, event, options.signal, remainingMs);
           await db.prepare(
             'DELETE FROM usage_telemetry_fallback_events WHERE idempotency_key = ?',
           )
@@ -1465,7 +1742,17 @@ export async function flushUsageTelemetryFallback(
           // Keep valid rows intact across transient receiver/circuit failures.
           // Deterministic per-event rejections are bounded and moved to the
           // back so one poison row cannot wedge the legacy drain forever.
-          if (isTerminalUsageTelemetryDeliveryError(error)) {
+          if (error instanceof UsageTelemetryDeliveryEventRejectedError && error.quarantined) {
+            // A valid ACK already produced a replayable copy. Do not POST and
+            // rewrite it five times through the legacy HTTP-poison budget.
+            const exactCopy = (row.idempotency_key === usageTelemetryEventIdentity(event)
+              && row.event_json === JSON.stringify(event))
+              || await writeUsageTelemetryQuarantine(storage, row.idempotency_key, row.event_json, 'terminal_receiver_rejection');
+            if (exactCopy) {
+              await db.prepare('DELETE FROM usage_telemetry_fallback_events WHERE idempotency_key = ?')
+                .bind(row.idempotency_key).run();
+            }
+          } else if (isTerminalUsageTelemetryDeliveryError(error)) {
             await advanceTerminalLegacyUsageTelemetryRow(
               db,
               storage,
@@ -1478,7 +1765,10 @@ export async function flushUsageTelemetryFallback(
       }
       if (results.length === 0) await markUsageTelemetryD1DrainComplete(env);
       return { listed: listed.objects.length + results.length, delivered, failed, expired, skipped: false };
-    } catch {
+    } catch (error) {
+      // A lane abort is not a D1 read failure: let it propagate so the
+      // caller observes the cancellation (the cursor finally still runs).
+      if (options.signal?.aborted) throw error;
       return { listed: listed.objects.length, delivered, failed: failed + 1, expired, skipped: false };
     }
   }

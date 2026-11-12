@@ -104,8 +104,10 @@ export async function verifyRawFilesStorage(
     }
   }
 
-  if (cleanupFailure) throw cleanupFailure;
+  // Prefer the first real failure. If put/get failed and cleanup also 401s,
+  // reporting delete hides the actual store-auth problem (live 2026-08-18).
   if (primaryFailure) throw primaryFailure;
+  if (cleanupFailure) throw cleanupFailure;
 
   return {
     ok: true,

@@ -1,0 +1,32 @@
+What changed since the build you last reviewed
+
+The previous submission reviewed was 1.0.81 (build 202608220518).  This submission includes targeted fixes for the items noted in your review.
+
+Guideline 2.1(a) — Performance: App Completeness (Login Responsiveness)
+- In SignInPanel, tapping "Sign in with Apple" or "Sign in with Google" now immediately activates a loading spinner overlay and disables input controls with explicit "Signing in…" visual feedback, ensuring the user immediately sees activity.
+- Login failures, network timeouts, or cancellations render clear inline error notices with distinct error styling.
+- Google OAuth presentation context now cleanly resolves to visible windows on iPadOS form sheets.
+
+Guideline 2.1(b) — Performance: In-App Purchases (Error Handling & Subscriptions)
+- In PremiumSheet, StoreKit product catalog load failures and pre-charge transaction errors are separated from post-charge server transaction processing.
+- User-facing error messages provide clear, actionable guidance and always point users to "Restore Purchases" if an entitlement is already active.
+- Both subscription items are submitted with this version in the "Premium" subscription group with localized metadata and screenshots:
+  - trade.congress.premium.monthly — Premium Monthly ($8.99/mo, 1-week free trial)
+  - trade.congress.premium.annual — Premium Annual ($79.99/yr, 1-week free trial)
+
+Guideline 5.1.1(v) — Registration before purchase & Account deletion
+- Premium can be purchased without an account; browsing and paywall access are fully available without signing in.
+- In-app Account Deletion is accessible from the ≡ menu and deletes all sessions, push tokens, and delivery subscriptions upon confirmation.
+- The 39-second physical-device screen recording demonstrating the complete account deletion flow is attached (account-deletion-physical-device.mp4, COMPLETE).
+
+iPad Air 11-inch Layout
+- All detail, paywall, and settings sheets use full width (.iPadFullWidthSheet()), the Assets directory uses a two-column grid, and the ≡ menu is accessible from every tab.
+
+What the app is
+Congress.Trade publishes stock-trade disclosures that U.S. House and Senate members, and executive-branch officials, file publicly under the STOCK Act (2012).  All underlying data comes from public government records.  Dollar figures are estimates derived from disclosure brackets.  It is an educational and informational tool, not investment advice, and is not affiliated with the U.S. Congress or any government agency.
+
+Demo account
+Not required — the app is fully browsable without an account, and Premium can be purchased without one.  To test account-based features (Delivery alerts, push) or deletion, sign in with any Apple ID via Sign in with Apple; no allowlist is needed.
+
+Contact
+Reply in App Store Connect and we will respond same day.

@@ -1,7 +1,7 @@
 /**
  * src/shared/monitorBudgetGate.ts
  *
- * Read-side self-throttle feedback loop: Congress.Trade polls the API Usage
+ * Read-side self-throttle feedback loop: congress.trade polls the API Usage
  * Monitor's cross-app `GET /api/budget-status` (usage.jays.services) so
  * discretionary, non-essential spend can back off a provider the monitor
  * already reports at/over its monthly budget — closing the loop on
@@ -75,7 +75,7 @@ export interface ProviderThrottleDecision {
 // The monitor's read-time joins normalize producer/provider names down to a
 // canonical alias (see provider-identity.ts on the monitor side, not
 // importable here). This mirrors just the handful of aliases relevant to
-// Congress.Trade's own `Provider` union (bakeoff.ts) so a CT-side key such as
+// congress.trade's own `Provider` union (bakeoff.ts) so a CT-side key such as
 // `gemini` matches a monitor Provider row configured as "Google AI"/"Gemini".
 // Matching is intentionally conservative: no match => not throttled (fail
 // open), never the reverse.

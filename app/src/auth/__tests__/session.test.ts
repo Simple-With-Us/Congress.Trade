@@ -4,6 +4,7 @@ import {
   createSession,
   resolveSession,
   destroySession,
+  destroySessionsForUser,
   getCurrentUserFromRequest,
   getSessionTokensFromRequest,
   getSafeRedirectUrl,
@@ -79,6 +80,15 @@ describe('sessions', () => {
     const token = await createSession(env, 'user-1');
     await destroySession(env, token);
     expect(await resolveSession(env, token)).toBeNull();
+  });
+
+  it('destroySessionsForUser revokes every indexed token for that user', async () => {
+    const { env } = fakeEnv({ id: 'user-1' });
+    const first = await createSession(env, 'user-1');
+    const second = await createSession(env, 'user-1');
+    expect(await destroySessionsForUser(env, 'user-1')).toBe(2);
+    expect(await resolveSession(env, first)).toBeNull();
+    expect(await resolveSession(env, second)).toBeNull();
   });
 
   it('resolves bearer sessions for native clients', async () => {

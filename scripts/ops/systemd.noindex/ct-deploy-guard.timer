@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Congress.Trade deploy guard every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=ct-deploy-guard.service
+
+[Install]
+WantedBy=timers.target

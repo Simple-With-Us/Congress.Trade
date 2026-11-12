@@ -7,6 +7,7 @@ export type IngestionDecisionAction =
   | 'confirmed'
   | 'manual'
   | 'rejected'
+  | 'reopened_after_reject'
   | 'unpublished'
   | 'auto_retry_requested'
   | 'agreement_published'
@@ -20,7 +21,16 @@ export type IngestionDecisionAction =
    * Agreement/pipeline total extract failure: successful model reads returned
    * zero rows (empty×empty). Loud hard-fail — not soft cascade_unresolved.
    */
-  | 'extract_empty_failure';
+  | 'extract_empty_failure'
+  /**
+   * Executive 278-T whose text layer could not be read.  Parked for a human.
+   * Not a terminal reject: the same reason hid real rows on the Sep 8 Trump
+   * filing.  Counted by the filing-skip alarm.
+   */
+  | 'oge_text_unreadable';
+
+/** Ingestion-decision action for a parked unreadable executive 278-T. */
+export const OGE_TEXT_UNREADABLE_DECISION_ACTION = 'oge_text_unreadable' as const;
 
 export type IngestionDecisionSource = 'pipeline' | 'admin' | 'agreement';
 
@@ -48,6 +58,7 @@ interface IngestionDecisionRow {
   chamber?: string | null;
   ingest_status?: string | null;
   source_url?: string | null;
+  raw_object_key?: string | null;
 }
 
 export interface ListedIngestionDecision {
@@ -63,6 +74,10 @@ export interface ListedIngestionDecision {
   chamber: string | null;
   ingestStatus: string | null;
   sourceUrl: string | null;
+  /** Present when filings.raw_object_key is set — UI opens stored copy only. */
+  rawObjectKey: string | null;
+  /** Admin stored-raw path (never a government URL). */
+  storedDocumentUrl: string | null;
 }
 
 /**
@@ -124,7 +139,7 @@ export async function listIngestionDecisions(
     `SELECT
         d.id, d.doc_id, d.action, d.source, d.actor, d.reason, d.payload,
         d.transaction_ids, d.created_at,
-        f.chamber, f.ingest_status, f.source_url
+        f.chamber, f.ingest_status, f.source_url, f.raw_object_key
        FROM ingestion_decisions d
        LEFT JOIN filings f ON f.doc_id = d.doc_id
        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -133,18 +148,26 @@ export async function listIngestionDecisions(
     params,
   );
 
-  return rows.map((row) => ({
-    id: row.id,
-    docId: row.doc_id,
-    action: row.action,
-    source: row.source,
-    actor: row.actor ?? null,
-    reason: row.reason ?? null,
-    payload: parseJson<Record<string, unknown> | null>(row.payload, null),
-    transactionIds: parseJson<string[]>(row.transaction_ids, []),
-    createdAt: row.created_at,
-    chamber: row.chamber ?? null,
-    ingestStatus: row.ingest_status ?? null,
-    sourceUrl: row.source_url ?? null,
-  }));
+  return rows.map((row) => {
+    const rawKey = row.raw_object_key ?? null;
+    return {
+      id: row.id,
+      docId: row.doc_id,
+      action: row.action,
+      source: row.source,
+      actor: row.actor ?? null,
+      reason: row.reason ?? null,
+      payload: parseJson<Record<string, unknown> | null>(row.payload, null),
+      transactionIds: parseJson<string[]>(row.transaction_ids, []),
+      createdAt: row.created_at,
+      chamber: row.chamber ?? null,
+      ingestStatus: row.ingest_status ?? null,
+      // Metadata only — admin UI must not navigate here for document open.
+      sourceUrl: row.source_url ?? null,
+      rawObjectKey: rawKey,
+      storedDocumentUrl: row.doc_id
+        ? `/api/admin/filings/${encodeURIComponent(row.doc_id)}/raw`
+        : null,
+    };
+  });
 }

@@ -85,6 +85,12 @@ function fakeEnv(vars: Record<string, string> = {}): { env: Env; sent: QueueMess
           }
           return Promise.resolve({ results: [] as T[] });
         },
+        // resolveIngestFilerId's merge/existing-filer lookups (get() -> .first()).
+        // No filer_identity_merges/filers rows exist in this fixture DB, so
+        // these always miss — same as insertFilingIfNew minting a fresh slug.
+        first<T>() {
+          return Promise.resolve(null as T | null);
+        },
       };
       return stmt as unknown as D1PreparedStatement;
     },

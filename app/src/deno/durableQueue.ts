@@ -1,4 +1,5 @@
 import type { Env, QueueMessage } from "../shared/types.ts";
+import { maybeAlertTerminalDurableIngestFailure } from "../ingestion/pipelineLoudAlerts.ts";
 import {
   AUTOPILOT_BUDGET_SETTLEMENT_WRITER,
   LLM_SPEND_SETTLEMENT_WRITER,
@@ -160,7 +161,11 @@ function normalizedDelaySeconds(delaySeconds: number | undefined): number {
   return Math.floor(delaySeconds);
 }
 
-function retryDelayMs(attempts: number, error?: unknown): number {
+/** Hard ceiling for handler-supplied retry delays (CT-2459): an uncapped
+ *  delaySeconds could park a message for days after one bad error. */
+export const RETRY_DELAY_SECONDS_CAP = 3_600;
+
+export function retryDelayMs(attempts: number, error?: unknown): number {
   if (error && typeof error === "object") {
     const delaySeconds = (error as { delaySeconds?: unknown }).delaySeconds;
     if (
@@ -168,14 +173,17 @@ function retryDelayMs(attempts: number, error?: unknown): number {
       Number.isFinite(delaySeconds) &&
       delaySeconds >= 0
     ) {
-      return Math.floor(delaySeconds * 1_000);
+      return Math.floor(Math.min(delaySeconds, RETRY_DELAY_SECONDS_CAP) * 1_000);
     }
   }
   const exponent = Math.max(0, attempts - 1);
-  return Math.min(
+  const ceiling = Math.min(
     DURABLE_QUEUE_RETRY_MAX_MS,
     DURABLE_QUEUE_RETRY_BASE_MS * (2 ** exponent),
   );
+  // Full jitter (0.5x-1.0x of the exponential ceiling): without it, every
+  // message that failed in the same provider outage retries in lockstep.
+  return Math.floor(ceiling * (0.5 + Math.random() * 0.5));
 }
 
 function errorText(error: unknown): string {
@@ -196,6 +204,7 @@ function queueDedupeKey(
     case "filing.new":
     case "filing.fetched":
     case "filing.extracted":
+    case "filing.local_wait_check":
       return typeof message.docId === "string" ? key(message.docId) : null;
     case "tx.persisted":
       return typeof message.txId === "string" ? key(message.txId) : null;
@@ -274,6 +283,11 @@ export function assertCanonicalQueueMessage(
       return;
     case "filing.fetched":
     case "filing.extracted":
+    // Local vision wait polls — enqueued by classifyFiling for scanned_pdf
+    // when a local worker heartbeat is fresh. Missing this case dead-lettered
+    // every scanned filing with "invalid ingest queue message type:
+    // filing.local_wait_check" (prod 2026-08-04/05: 1540 durable + 270 outbox).
+    case "filing.local_wait_check":
       requireString(message.docId, "docId", type);
       return;
     case "tx.persisted":
@@ -407,6 +421,9 @@ async function claimMessages(
 ): Promise<DurableQueueRow[]> {
   const nowIso = now.toISOString();
   const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
+  // CT-2459 aging: a row that has been ready >15 min is promoted one
+  // priority class so continuous high-class inflow cannot starve it.
+  const agingThresholdIso = new Date(now.getTime() - 15 * 60_000).toISOString();
   const leaseToken = crypto.randomUUID();
   return await allOrThrow<DurableQueueRow>(
     db.prepare(`
@@ -428,23 +445,26 @@ async function claimMessages(
         -- free-tier drain budget (3 msgs / 5 min). Telemetry still drains,
         -- just after agreement/autopilot and normal ingest messages.
         -- json_valid guards corrupt payloads (dead-letter resume tests / DLQ).
-        ORDER BY CASE
-                   WHEN json_valid(payload) THEN
-                     CASE json_extract(payload, '$.type')
-                       WHEN 'agreement.check' THEN 0
-                       WHEN 'autopilot.tick' THEN 0
-                       WHEN 'usage.telemetry' THEN 2
-                       ELSE 1
-                     END
-                   ELSE 1
-                 END,
+        ORDER BY MAX(0,
+                   (CASE
+                      WHEN json_valid(payload) THEN
+                        CASE json_extract(payload, '$.type')
+                          WHEN 'agreement.check' THEN 0
+                          WHEN 'autopilot.tick' THEN 0
+                          WHEN 'usage.telemetry' THEN 2
+                          ELSE 1
+                        END
+                      ELSE 1
+                    END)
+                   - (CASE WHEN available_at <= ? THEN 1 ELSE 0 END)
+                 ),
                  available_at ASC, id ASC
         LIMIT ?
       )
       RETURNING id, queue_name, payload, status, attempts, available_at,
                 dead_letter_pending, dead_letter_cycles, lease_until,
                 lease_token, last_error, created_at, updated_at
-    `).bind(leaseUntil, leaseToken, nowIso, queueName, nowIso, queueName, nowIso, limit),
+    `).bind(leaseUntil, leaseToken, nowIso, queueName, nowIso, queueName, nowIso, agingThresholdIso, limit),
     `claim ${queueName} queue messages`,
   );
 }
@@ -685,9 +705,15 @@ function leaseGuardedEnv(
     return guarded;
   };
 
+  // CT-2459: memoize guarded proxies per lease — handlers touch env
+  // bindings hundreds of times and previously paid a fresh Proxy (plus a
+  // fresh DurableQueueAdapter for queues) on every access.
+  const guardedBindings = new WeakMap<object, object>();
   const guardBinding = <T extends object>(binding: T | undefined): T | undefined => {
     if (!binding) return undefined;
-    return new Proxy(binding as Record<PropertyKey, unknown>, {
+    const existing = guardedBindings.get(binding);
+    if (existing) return existing as T;
+    const guarded = new Proxy(binding as Record<PropertyKey, unknown>, {
       get(target, property, receiver) {
         const value = Reflect.get(target, property, receiver);
         if (property === "body" && value instanceof ReadableStream) {
@@ -708,8 +734,12 @@ function leaseGuardedEnv(
         };
       },
     }) as T;
+    guardedBindings.set(binding, guarded);
+    return guarded;
   };
 
+  let guardedIngestQueue: unknown;
+  let guardedDeliveryQueue: unknown;
   return new Proxy(env, {
     get(target, property, receiver) {
       // A stale worker is still responsible for accounting for a provider
@@ -725,20 +755,26 @@ function leaseGuardedEnv(
       if (property === "RAW_FILES") return guardBinding(target.RAW_FILES);
       if (property === "CONFIG_KV") return guardBinding(target.CONFIG_KV);
       if (property === "INGEST_QUEUE") {
-        const queue = target.INGEST_QUEUE;
-        return guardBinding(
-          queue instanceof DurableQueueAdapter
-            ? queue.withWriteGuard(() => lease.assertOwned())
-            : queue,
-        );
+        if (guardedIngestQueue === undefined) {
+          const queue = target.INGEST_QUEUE;
+          guardedIngestQueue = guardBinding(
+            queue instanceof DurableQueueAdapter
+              ? queue.withWriteGuard(() => lease.assertOwned())
+              : queue,
+          );
+        }
+        return guardedIngestQueue;
       }
       if (property === "DELIVERY_QUEUE") {
-        const queue = target.DELIVERY_QUEUE;
-        return guardBinding(
-          queue instanceof DurableQueueAdapter
-            ? queue.withWriteGuard(() => lease.assertOwned())
-            : queue,
-        );
+        if (guardedDeliveryQueue === undefined) {
+          const queue = target.DELIVERY_QUEUE;
+          guardedDeliveryQueue = guardBinding(
+            queue instanceof DurableQueueAdapter
+              ? queue.withWriteGuard(() => lease.assertOwned())
+              : queue,
+          );
+        }
+        return guardedDeliveryQueue;
       }
       return Reflect.get(target, property, receiver);
     },
@@ -760,6 +796,36 @@ async function completeClaim(
     [now.toISOString(), now.toISOString()],
     `complete durable queue message ${row.id}`,
   );
+}
+
+/**
+ * CT-2459: hand claimed-but-unstarted rows back immediately when the drain
+ * is aborted mid-batch. Before this they stayed `processing` until lease
+ * expiry (10 min default) even though no handler ever touched them. The
+ * claim's attempts bump is undone so an aborted batch burns no attempts.
+ * Fenced on the batch lease_token + processing status, like every other
+ * transition; a row a handler already started is never in this set.
+ */
+export async function releaseUnstartedClaims(
+  db: D1Database,
+  rows: DurableQueueRow[],
+  now: Date,
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  const token = rows[0].lease_token;
+  if (!token || rows.some((r) => r.lease_token !== token)) return 0;
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(", ");
+  const result = await runOrThrow(
+    db.prepare(`
+      UPDATE deno_runtime_queue
+      SET status = 'pending', attempts = MAX(attempts - 1, 0),
+          lease_until = NULL, lease_token = NULL, updated_at = ?
+      WHERE status = 'processing' AND lease_token = ? AND id IN (${placeholders})
+    `).bind(now.toISOString(), token, ...ids),
+    "release unstarted durable queue claims",
+  );
+  return Number((result as { meta?: { changes?: number } }).meta?.changes ?? 0);
 }
 
 async function retryClaim(
@@ -822,6 +888,33 @@ async function failClaim(
     [errorText(error), now.toISOString(), now.toISOString()],
     `fail durable queue message ${row.id}`,
   );
+}
+
+async function failIngestQueueClaim(
+  env: Env,
+  queueName: DurableQueueName,
+  row: DurableQueueRow,
+  now: Date,
+  error: unknown,
+  message: QueueMessage | null,
+): Promise<boolean> {
+  const failed = await failClaim(env.DB, row, now, error);
+  if (failed && queueName === "ingest" && message) {
+    // Do not block the bounded durable_queue cron lane on KV + webhook I/O per
+    // failed row (CONGRESS-TRADE-1T).  Alert asynchronously; drain continues.
+    void maybeAlertTerminalDurableIngestFailure(
+      env,
+      message,
+      errorText(error),
+      now,
+    ).catch((alertErr) => {
+      console.warn(
+        "terminal durable ingest alert failed:",
+        errorText(alertErr),
+      );
+    });
+  }
+  return failed;
 }
 
 async function dispatchMessage(
@@ -895,8 +988,16 @@ export async function drainDurableQueue(
     if (rows.length === 0) break;
     result.claimed += rows.length;
 
-    for (const row of rows) {
-      if (options.signal?.aborted) break;
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      const row = rows[rowIndex];
+      if (options.signal?.aborted) {
+        // CT-2459: rows from here on were claimed but never started; return
+        // them now instead of stranding them until lease expiry.
+        await releaseUnstartedClaims(env.DB, rows.slice(rowIndex), now()).catch(
+          () => 0,
+        );
+        break;
+      }
       const attempts = Number(row.attempts);
       let parsed: unknown;
       let canonicalMessage: QueueMessage | null = null;
@@ -950,11 +1051,13 @@ export async function drainDurableQueue(
           await lease.assertOwned();
           await stopHeartbeat();
           if (
-            await failClaim(
-              env.DB,
+            await failIngestQueueClaim(
+              env,
+              queueName,
               row,
               now(),
               row.last_error || "message exhausted retries",
+              canonicalMessage,
             )
           ) {
             result.failed += 1;
@@ -969,11 +1072,13 @@ export async function drainDurableQueue(
             )
           ) {
             if (
-              await failClaim(
-                env.DB,
+              await failIngestQueueClaim(
+                env,
+                queueName,
                 row,
                 now(),
                 deadLetterError,
+                canonicalMessage,
               )
             ) {
               result.failed += 1;
@@ -987,13 +1092,15 @@ export async function drainDurableQueue(
             // Recovery budget exhausted: go terminal instead of looping the
             // poison receipt forever.
             if (
-              await failClaim(
-                env.DB,
+              await failIngestQueueClaim(
+                env,
+                queueName,
                 row,
                 now(),
                 new Error(
                   `dead-letter recovery budget exhausted (${DURABLE_QUEUE_MAX_DEAD_LETTER_CYCLES} cycles): ${errorText(deadLetterError)}`,
                 ),
+                canonicalMessage,
               )
             ) {
               result.failed += 1;
@@ -1037,7 +1144,7 @@ export async function drainDurableQueue(
           handlers.isTerminalDeadLetterError(canonicalMessage, error)
         ) {
           await stopHeartbeat();
-          if (await failClaim(env.DB, row, now(), error)) {
+          if (await failIngestQueueClaim(env, queueName, row, now(), error, canonicalMessage)) {
             result.failed += 1;
           }
           continue;
@@ -1079,11 +1186,13 @@ export async function drainDurableQueue(
             )
           ) {
             if (
-              await failClaim(
-                env.DB,
+              await failIngestQueueClaim(
+                env,
+                queueName,
                 row,
                 now(),
                 deadLetterError,
+                canonicalMessage,
               )
             ) {
               result.failed += 1;
@@ -1107,7 +1216,7 @@ export async function drainDurableQueue(
           }
           continue;
         }
-        if (await failClaim(env.DB, row, now(), error)) {
+        if (await failIngestQueueClaim(env, queueName, row, now(), error, canonicalMessage)) {
           result.failed += 1;
         }
       }
@@ -1124,9 +1233,44 @@ export async function drainDurableQueues(
 ): Promise<
   { ingest: DurableQueueDrainResult; delivery: DurableQueueDrainResult }
 > {
-  const ingest = await drainDurableQueue(env, "ingest", handlers, options);
-  const delivery = await drainDurableQueue(env, "delivery", handlers, options);
-  return { ingest, delivery };
+  // CT-2459: interleave claim rounds between the queues. Draining ingest to
+  // its full limit first let slow ingest handlers (fetch/LLM) starve
+  // delivery dispatch for the whole shared tick budget; alternating
+  // claimSize rounds bounds delivery latency to one ingest round.
+  const limit = Math.max(
+    0,
+    Math.floor(options.limit ?? DURABLE_QUEUE_DEFAULT_LIMIT),
+  );
+  const roundSize = Math.max(
+    1,
+    Math.floor(options.claimSize ?? DURABLE_QUEUE_DEFAULT_CLAIM_SIZE),
+  );
+  const totals: Record<"ingest" | "delivery", DurableQueueDrainResult> = {
+    ingest: { claimed: 0, completed: 0, retried: 0, failed: 0 },
+    delivery: { claimed: 0, completed: 0, retried: 0, failed: 0 },
+  };
+  const exhausted = { ingest: false, delivery: false };
+  const queues: Array<"ingest" | "delivery"> = ["ingest", "delivery"];
+  while (!options.signal?.aborted) {
+    let progressed = false;
+    for (const queueName of queues) {
+      if (options.signal?.aborted) break;
+      if (exhausted[queueName] || totals[queueName].claimed >= limit) continue;
+      const round = await drainDurableQueue(env, queueName, handlers, {
+        ...options,
+        limit: Math.min(roundSize, limit - totals[queueName].claimed),
+      });
+      totals[queueName].claimed += round.claimed;
+      totals[queueName].completed += round.completed;
+      totals[queueName].retried += round.retried;
+      totals[queueName].failed += round.failed;
+      if (round.claimed === 0) exhausted[queueName] = true;
+      else progressed = true;
+    }
+    if (!progressed) break;
+    if (queues.every((q) => exhausted[q] || totals[q].claimed >= limit)) break;
+  }
+  return { ingest: totals.ingest, delivery: totals.delivery };
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import { applyMemberNameAlias } from '../shared/memberIdentity.ts';
+import { houseAssetTypeCodePattern } from '../shared/assetTypes.ts';
 
 export function isJunkAssetString(s: string | null | undefined): boolean {
   if (!s) return true;
@@ -80,6 +81,11 @@ export function cleanAssetString(name: string | null | undefined, ticker?: strin
       }
       return txt.charAt(0).toUpperCase() + txt.substring(1).toLowerCase();
     });
+    // The expansions above append a period ("INC" -> "Inc."), but the word
+    // matcher is [A-Za-z0-9]+ and so never consumed one the source already had.
+    // "ECOLAB Inc." came out as "Ecolab Inc..". Scoped to exactly the
+    // abbreviations this branch rewrites so no other punctuation is touched.
+    str = str.replace(/\b(Inc|Co|Ltd|Corp)\.\.+/g, '$1.');
   }
 
   // 4. Entity normalizations (case-insensitive)
@@ -99,6 +105,159 @@ export function cleanAssetString(name: string | null | undefined, ticker?: strin
   str = str.replace(/\s{2,}/g, ' ');
 
   return str.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Asset name <-> cleaning-note split
+// ---------------------------------------------------------------------------
+
+/**
+ * An asset name with the disclosure-form scaffolding lifted out of it. `note`
+ * is an internal `transactions.cleaning_note` fragment (plain-English, no
+ * terminal punctuation) surfaced as the web "Notes" column via
+ * `plainCleaningNote`; null when nothing was moved.
+ */
+export interface AssetNameDetail {
+  name: string;
+  note: string | null;
+}
+
+/**
+ * Trailing bracket scaffolding: House asset-type codes ("[GS]", "[ST]", "[4K]")
+ * and numeric footnote markers ("[1]", "[1][2]"). Both are form artifacts, not
+ * part of the security's name — the type code is already stored in
+ * `asset_type`, and the footnote marker points at a page the feed never shows.
+ *
+ * Anchored at the END and repeatable so mid-string bracketed content survives
+ * untouched: "Lisa Family Investments LP [15294% Interest]" is real disclosed
+ * detail and matches neither alternative.
+ *
+ * Reuses `houseAssetTypeCodePattern()` rather than restating the code list, so
+ * a new House code only has to be added in shared/assetTypes.ts.
+ */
+const TRAILING_BRACKET_JUNK_RE = new RegExp(
+  String.raw`(?:\s*\[(?:${houseAssetTypeCodePattern()}|\d{1,3})\])+\s*$`,
+  'i',
+);
+
+/**
+ * The rigid Senate eFD suffix, e.g.
+ * "… Revenue Bond Rate/Coupon: 5.0% Matures: 05/01/2026". Only the literal
+ * "Rate/Coupon:" lead-in matches — an INLINE rate/date ("King Cnty Wash Ltd.
+ * 4.00% 12/1/32") is genuinely part of a muni's name and is deliberately left
+ * alone.
+ */
+const COUPON_SUFFIX_RE = /\s*Rate\s*\/\s*Coupon\s*:\s*(\S+?)\s*(?:Matures\s*:\s*(\S+)\s*)?$/i;
+
+/** MM/DD/YY(YY), YYYY-MM-DD, or "Jun 15, 2030" / "March 15, 2085". */
+const MATURITY_DATE = String.raw`(?:\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})`;
+const COUPON_RATE = String.raw`\d{1,2}(?:\.\d{1,3})?\s*%`;
+
+/**
+ * The other rigid maturity suffix House/Senate sources emit, in the three
+ * orders actually observed in production:
+ *   "… JR Oblig 4.00% Due Jun 15, 2030"   (rate then Due-date)
+ *   "US TREASURY DUE 08/15/2030 0.625%"   (Due-date then rate)
+ *   "… Go Utx Due 08/15/31"               (Due-date alone)
+ * The literal word "Due" immediately followed by a date is what makes this
+ * safe; a bare inline "4.00% 12/1/32" is NOT matched (see COUPON_SUFFIX_RE).
+ */
+const DUE_SUFFIX_RES: readonly RegExp[] = [
+  new RegExp(String.raw`\s*(${COUPON_RATE})\s*Due\s+(${MATURITY_DATE})\s*$`, 'i'),
+  new RegExp(String.raw`\s*Due\s+(${MATURITY_DATE})\s+(${COUPON_RATE})\s*$`, 'i'),
+  new RegExp(String.raw`\s*Due\s+(${MATURITY_DATE})\s*$`, 'i'),
+];
+
+/** "<security A> (Exchanged) <security B>[ (Received)]" — one PTR row, two legs. */
+const EXCHANGE_RE = /^(.*?)\s*\(\s*Exchanged\s*\)\s*(.*)$/i;
+
+function trimWhitespace(value: string): string {
+  // WHITESPACE ONLY. A previous dry run stripped trailing punctuation too and
+  // silently rewrote 790 ordinary company names ("Adobe Inc." -> "Adobe Inc",
+  // "AT&T Inc." -> "AT&T Inc"). Never widen this character class.
+  return value.replace(/^\s+|\s+$/g, '');
+}
+
+function normalizeRate(rate: string): string {
+  const trimmed = trimWhitespace(rate).replace(/\s+/g, '');
+  return /%$/.test(trimmed) ? trimmed : `${trimmed}%`;
+}
+
+/**
+ * Split disclosure-form scaffolding out of a raw asset name, returning the
+ * name a reader wants plus an audit note carrying what was moved.
+ *
+ * Order matters: brackets are stripped first (they sit outside everything
+ * else), then the maturity suffix (it trails the exchange leg on combined
+ * rows), then the exchange split. `cleanAssetString` runs LAST — running it
+ * first would eat the closing bracket of "[GS]" via its trailing-`]` OCR rule
+ * and leave "US Treasury Bill [GS".
+ */
+export function splitAssetNameDetail(
+  name: string | null | undefined,
+  ticker?: string | null,
+): AssetNameDetail {
+  if (!name || isJunkAssetString(name)) {
+    return { name: cleanAssetString(name, ticker), note: null };
+  }
+
+  let str = trimWhitespace(String(name));
+  const notes: string[] = [];
+
+  // 1. Trailing form scaffolding. Stripped silently: the House code duplicates
+  //    asset_type and a footnote marker carries no information we can show.
+  str = trimWhitespace(str.replace(TRAILING_BRACKET_JUNK_RE, ''));
+
+  // 2. Rigid maturity/coupon suffix -> note.
+  let rate: string | null = null;
+  let matures: string | null = null;
+  const coupon = COUPON_SUFFIX_RE.exec(str);
+  if (coupon) {
+    rate = coupon[1] ?? null;
+    matures = coupon[2] ?? null;
+    str = trimWhitespace(str.slice(0, coupon.index));
+  } else {
+    for (const [index, re] of DUE_SUFFIX_RES.entries()) {
+      const due = re.exec(str);
+      if (!due) continue;
+      if (index === 0) {
+        rate = due[1];
+        matures = due[2];
+      } else if (index === 1) {
+        matures = due[1];
+        rate = due[2];
+      } else {
+        matures = due[1];
+      }
+      str = trimWhitespace(str.slice(0, due.index));
+      break;
+    }
+  }
+
+  // A suffix-only string ("Rate/Coupon: 5.0% Matures: …" with no issuer) has no
+  // name left to keep; leave the row exactly as it was rather than blanking it.
+  if (!str) return { name: cleanAssetString(name, ticker), note: null };
+
+  // 3. Exchange legs. The PTR row discloses ONE asset; the leading leg is that
+  //    asset. The trailing leg is real disclosed text, so it goes to the note
+  //    rather than being dropped — and never becomes a second row or ticker.
+  const exchange = EXCHANGE_RE.exec(str);
+  if (exchange && trimWhitespace(exchange[1])) {
+    const received = trimWhitespace(exchange[2]).replace(/\s*\(\s*Received\s*\)\s*$/i, '');
+    str = trimWhitespace(exchange[1]);
+    notes.push(received ? `exchanged for ${trimWhitespace(received)}` : 'disclosed as an exchange');
+  }
+
+  if (rate && matures) notes.push(`coupon ${normalizeRate(rate)}, matures ${matures}`);
+  else if (rate) notes.push(`coupon ${normalizeRate(rate)}`);
+  else if (matures) notes.push(`matures ${matures}`);
+
+  const cleaned = cleanAssetString(str, ticker);
+  // Never trade a usable name for a note: if the shared cleaner rejects what is
+  // left, fall back to the original row untouched.
+  if (!cleaned) return { name: cleanAssetString(name, ticker), note: null };
+
+  return { name: cleaned, note: notes.length ? notes.join('; ') : null };
 }
 
 export function cleanFilerName(name: string | null | undefined): string {
@@ -140,4 +299,105 @@ export function cleanFilerName(name: string | null | undefined): string {
   str = applyMemberNameAlias(str.trim());
 
   return str.trim();
+}
+
+export function simplifyCompanyName(name: string): string {
+  if (!name) return '';
+  return name.toLowerCase()
+    .replace(/[^\w\s]/g, '') // remove punctuation
+    .replace(/\b(inc|corp|corporation|llc|plc|ltd|company|co)\b/g, '') // remove common suffixes
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Fund/ETF descriptor tokens with no issuer identity (stripped for ticker↔name checks). */
+const FUND_DESCRIPTOR_STOP = new Set([
+  'etf',
+  'fund',
+  'index',
+  'shares',
+  'share',
+  'trust',
+  'admiral',
+  'investor',
+  'institutional',
+  'portfolio',
+  'portfolios',
+  'receipt',
+  'receipts',
+  'depository',
+  'registered',
+  'open',
+  'end',
+  'mutual',
+  'exchange',
+  'traded',
+  'advisor',
+  'advisors',
+  'class',
+  'series',
+  'select',
+  'cmn',
+  'lp',
+  'llp',
+]);
+
+/**
+ * Leverage and direction tokens that name a different product in the same
+ * family. Kept out of FUND_DESCRIPTOR_STOP so stripping cannot collapse
+ * Ultra / UltraPro / UltraShort onto one string.
+ */
+const FUND_DIRECTION_TOKENS = new Set([
+  'short',
+  'bull',
+  'bear',
+  'inverse',
+  'leveraged',
+  'ultra',
+  'ultrapro',
+  'ultrashort',
+]);
+
+function stripFundDescriptorTokens(simplified: string): string {
+  if (!simplified) return '';
+  return simplified
+    .split(/\s+/)
+    .filter((token) => token && !FUND_DESCRIPTOR_STOP.has(token))
+    .join(' ');
+}
+
+function fundDirectionTokens(simplified: string): Set<string> {
+  const found = new Set<string>();
+  for (const token of simplified.split(/\s+/)) {
+    if (FUND_DIRECTION_TOKENS.has(token)) found.add(token);
+  }
+  return found;
+}
+
+function sameFundDirection(a: string, b: string): boolean {
+  const left = fundDirectionTokens(a);
+  const right = fundDirectionTokens(b);
+  if (left.size !== right.size) return false;
+  for (const token of left) {
+    if (!right.has(token)) return false;
+  }
+  return true;
+}
+
+/**
+ * True when two simplified company names plausibly refer to the same security.
+ * Tolerates ETF/fund wording differences (Index/Fund/ETF/Shares, etc.) while
+ * still rejecting unrelated issuers (e.g. AAPL ticker with "Microsoft Corp").
+ * Containment is whole-string only: a shorter token list is not enough, so
+ * "Vanguard Growth" does not match "Vanguard Small Cap Growth".
+ */
+export function namesPlausiblyMatch(a: string, b: string): boolean {
+  if (!a || !b) return true;
+  if (!sameFundDirection(a, b)) return false;
+
+  const as = stripFundDescriptorTokens(a);
+  const bs = stripFundDescriptorTokens(b);
+  if (!as || !bs) return true;
+
+  return as === bs || as.includes(bs) || bs.includes(as);
 }

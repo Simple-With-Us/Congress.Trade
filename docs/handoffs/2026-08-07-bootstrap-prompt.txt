@@ -1,0 +1,11 @@
+Read and follow docs/handoffs/2026-08-07-session-fork-and-unfinished.md completely.
+
+You are a brand-new Grok session for Congress.Trade. The previous "iOS UI" session (019fda5e…) forked into two concurrent agent turns — do not resume it.
+
+First: git status on /Users/jay/Code/Congress.Trade. There is dirty uncommitted OR-circuit/scorecard work on main from the broken fork. Move those files onto branch grok/or-budget-scorecard-caps (or similar), then finish that slice (circuit + per-doc cap + purpose/doc_id meter + coverage scorecard admin) with typecheck/tests, PR, land, ship. Do not dual-turn. Never raise OpenRouter budget as the fix.
+
+Also know: open PRs #1466–#1472 from this workstream are not merged; multi-year DB restore from R2 litestream already done in prod — do not re-extract history.
+
+After securing the dirty tree, claim effort board + Slack [GROK], then execute. Prefer finishing scorecard/OR first unless dirty tree is empty/safe and CI for #1472 is the faster win.
+
+Reply with: (1) dirty-tree secured yes/no, (2) chosen primary slice, (3) first concrete steps.

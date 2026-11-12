@@ -12,7 +12,7 @@ const DISCOVERED: DiscoveredFiling = {
   filerName: 'Jane Smith',
 };
 
-function envWithExistingFiling(providerSeed: boolean) {
+function envWithExistingFiling(mode: 'provider_seed' | 'not_found' | 'none') {
   const writes: Array<{ sql: string; params: unknown[] }> = [];
   const db = {
     prepare(sql: string) {
@@ -27,14 +27,29 @@ function envWithExistingFiling(providerSeed: boolean) {
           writes.push({ sql, params: statement.params });
           let changes = 1;
           if (/INSERT OR IGNORE INTO filings/i.test(sql)) changes = 0;
-          if (/ingest_status = 'provider_seeded'/i.test(sql)) changes = providerSeed ? 1 : 0;
+          if (/ingest_status = 'provider_seeded'/i.test(sql)) changes = mode === 'provider_seed' ? 1 : 0;
+          if (/ingest_status (?:= 'not_found'|IN)/i.test(sql)) changes = (mode === 'not_found' || mode === 'failed') ? 1 : 0;
           return { meta: { changes } } as D1Result;
         },
         async all<T>() {
-          if (/FROM filings/i.test(sql) && /provider_seeded/i.test(sql) && providerSeed) {
-            return { results: [{ doc_id: DISCOVERED.docId }] as T[] };
+          if (/FROM filings/i.test(sql)) {
+            if (mode === 'provider_seed') {
+              return { results: [{ doc_id: DISCOVERED.docId, ingest_status: 'provider_seeded', extractor: 'fmp-senate-latest' }] as T[] };
+            }
+            if (mode === 'not_found') {
+              return { results: [{ doc_id: DISCOVERED.docId, ingest_status: 'not_found', extractor: null }] as T[] };
+            }
+            if (mode === 'failed') {
+              return { results: [{ doc_id: DISCOVERED.docId, ingest_status: 'failed', extractor: null }] as T[] };
+            }
           }
           return { results: [] as T[] };
+        },
+        // resolveIngestFilerId's merge/existing-filer lookups (get() -> .first()).
+        // DISCOVERED carries no `state`, so it never reaches the chamber+state
+        // scan — these two always miss for this fixture, same as an empty DB.
+        async first<T>() {
+          return null as T | null;
         },
       };
       return statement as unknown as D1PreparedStatement;
@@ -51,7 +66,7 @@ afterEach(() => resetD1WriteGovernor());
 
 describe('official discovery upgrades FMP provider seeds', () => {
   it('reopens only the narrowly-tagged provider seed for the official pipeline', async () => {
-    const { env, writes } = envWithExistingFiling(true);
+    const { env, writes } = envWithExistingFiling('provider_seed');
     const result = await insertFilingIfNew(env, DISCOVERED, '2026-07-22T00:00:00.000Z');
 
     expect(result).toBe('inserted');
@@ -61,8 +76,33 @@ describe('official discovery upgrades FMP provider seeds', () => {
     expect(upgrade?.params).toEqual(expect.arrayContaining(['S-abc12345', 'senate-jane-smith']));
   });
 
+  it('unblocks official filings stuck as not_found phantoms', async () => {
+    const { env, writes } = envWithExistingFiling('not_found');
+    const result = await insertFilingIfNew(env, DISCOVERED, '2026-07-22T00:00:00.000Z');
+
+    expect(result).toBe('inserted');
+    const upgrade = writes.find(({ sql }) => /ingest_status IN \('not_found', 'failed'\)/.test(sql));
+    expect(upgrade?.sql).toContain("ingest_status = 'new'");
+    expect(upgrade?.sql).toContain("error = NULL");
+    expect(upgrade?.params).toEqual(expect.arrayContaining(['S-abc12345']));
+
+    const outboxReArm = writes.find(({ sql }) => /INSERT INTO ingestion_outbox/.test(sql));
+    expect(outboxReArm?.sql).toContain("ON CONFLICT(doc_id) DO UPDATE");
+  });
+
+  it('unblocks official filings stuck as failed phantoms', async () => {
+    const { env, writes } = envWithExistingFiling('failed');
+    const result = await insertFilingIfNew(env, DISCOVERED, '2026-07-22T00:00:00.000Z');
+
+    expect(result).toBe('inserted');
+    const upgrade = writes.find(({ sql }) => /ingest_status IN \('not_found', 'failed'\)/.test(sql));
+    expect(upgrade?.sql).toContain("ingest_status = 'new'");
+    expect(upgrade?.sql).toContain("error = NULL");
+    expect(upgrade?.params).toEqual(expect.arrayContaining(['S-abc12345']));
+  });
+
   it('leaves an unrelated pre-existing filing classified as a duplicate', async () => {
-    const { env } = envWithExistingFiling(false);
+    const { env } = envWithExistingFiling('none');
     await expect(insertFilingIfNew(env, DISCOVERED, '2026-07-22T00:00:00.000Z')).resolves.toBe('duplicate');
   });
 });

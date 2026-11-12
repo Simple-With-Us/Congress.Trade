@@ -53,7 +53,7 @@ function env(overrides: Record<string, unknown> = {}): Env {
                 ticker: 'AAPL',
                 asset_name: 'Apple Inc.',
                 tx_date: '2026-07-01',
-                tx_type: 'P',
+                tx_type: 'B',
                 amount_min: 1_001,
                 amount_max: 15_000,
                 owner: 'self',
@@ -612,7 +612,7 @@ function activeRunCreationRaceDb() {
           if (/FROM transactions/i.test(sql)) {
             return { results: [{
               ticker: 'AAPL', asset_name: 'Apple Inc.', tx_date: '2026-07-01',
-              tx_type: 'P', amount_min: 1_001, amount_max: 15_000, owner: 'self',
+              tx_type: 'B', amount_min: 1_001, amount_max: 15_000, owner: 'self',
               asset_type: 'ST', is_option: 0, cap_gains_over_200: 0,
             }] as T[] };
           }
@@ -896,12 +896,13 @@ describe('durable benchmark admin routes', () => {
     expect(groundTruthQueried).toBe(false);
     expect(selectionSql).toContain("d.source = 'admin'");
     expect(selectionSql).toContain("d.action IN ('confirmed', 'manual')");
+    expect(selectionSql).toContain("'amount_bounds_canonicalize'");
     expect(selectionSql).toContain('ORDER BY d.created_at DESC, d.id DESC');
   });
 
   it('re-scores a saved run from persisted rows without invoking a provider', async () => {
     const truth = {
-      ticker: 'AAPL', assetName: 'Apple Inc.', txDate: '2026-07-01', txType: 'P',
+      ticker: 'AAPL', assetName: 'Apple Inc.', txDate: '2026-07-01', txType: 'B',
       amountMin: 1_001, amountMax: 15_000, owner: 'self', assetType: 'ST',
       assetTypeName: 'Stocks (including ADRs)', isOption: false, capGainsOver200: false,
       filingStatus: null, subholding: null, location: null, description: null, supplementalText: null,
@@ -1380,7 +1381,7 @@ describe('durable benchmark admin routes', () => {
   it('accepts an all-OpenRouter agreement lineup whose underlying vendors are distinct', async () => {
     const lineup = {
       a: { provider: 'llamaparse', model: 'cost-effective' },
-      b: { provider: 'openrouter', model: 'google/gemini-3.5-flash' },
+      b: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
       c: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
     };
     const response = await buildAdminRouter().request('/benchmark/dry-run/H-1', {
@@ -1824,7 +1825,7 @@ describe('durable benchmark admin routes', () => {
       ticker: 'AAPL',
       assetName: 'Apple Inc.',
       txDate: '2026-07-01',
-      txType: 'P',
+      txType: 'B',
       amountMin: 1_001,
       amountMax: 15_000,
       owner: 'self',
@@ -1915,7 +1916,7 @@ describe('durable benchmark admin routes', () => {
 
   it('models disagreement as tier-one A+B followed by fresh tier-two A+B+C', async () => {
     const rowA = {
-      ticker: 'AAPL', assetName: 'Apple Inc.', txDate: '2026-07-01', txType: 'P',
+      ticker: 'AAPL', assetName: 'Apple Inc.', txDate: '2026-07-01', txType: 'B',
       amountMin: 1_001, amountMax: 15_000, owner: 'self', assetType: 'ST',
       assetTypeName: 'Stock', isOption: false, capGainsOver200: false,
       rawText: 'Apple', confidence: 0.99,

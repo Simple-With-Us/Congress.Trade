@@ -65,7 +65,8 @@ describe('lagBucket', () => {
     expect(lagBucket(8)).toBe('8-14d');
     expect(lagBucket(30)).toBe('15-30d');
     expect(lagBucket(45)).toBe('31-45d');
-    expect(lagBucket(60)).toBe('46-60d');
+    expect(lagBucket(50)).toBe('46-59d');
+    expect(lagBucket(60)).toBe('60d+');
     expect(lagBucket(900)).toBe('60d+');
   });
 });
@@ -92,7 +93,7 @@ describe('summarizeLag', () => {
     const rows: LagRow[] = [
       { lagDays: 3, count: 5 }, // 0-7d
       { lagDays: 12, count: 3 }, // 8-14d
-      { lagDays: 50, count: 2 }, // 46-60d, also > 45
+      { lagDays: 50, count: 2 }, // 46-59d, also > 45
     ];
     const s = summarizeLag(rows);
     expect(s.count).toBe(10);
@@ -101,7 +102,7 @@ describe('summarizeLag', () => {
     const byBucket = Object.fromEntries(s.distribution.map((d) => [d.bucket, d.count]));
     expect(byBucket['0-7d']).toBe(5);
     expect(byBucket['8-14d']).toBe(3);
-    expect(byBucket['46-60d']).toBe(2);
+    expect(byBucket['46-59d']).toBe(2);
     // every fixed bucket is present (zero-filled)
     expect(s.distribution).toHaveLength(6);
   });
@@ -179,6 +180,53 @@ describe('aggregateMemberPerformance', () => {
     expect(out.medianExcess).toBeCloseTo(0.05, 5); // median of +0.20 and -0.10
   });
 
+  it('skips stale-priced rows when priceFreshThrough is set', () => {
+    const dual = aggregateMemberDualPerformance(
+      [
+        row({
+          txType: 'P',
+          priceAtTrade: 100,
+          currentPrice: 120,
+          spxAtTrade: 100,
+          currentPriceDate: '2026-07-01',
+          spxNow: 105,
+        }),
+        row({
+          txType: 'P',
+          priceAtTrade: 100,
+          currentPrice: 110,
+          spxAtTrade: 100,
+          currentPriceDate: '2026-08-01',
+          spxNow: 100,
+        }),
+      ],
+      110,
+      { priceFreshThrough: '2026-08-01' },
+    );
+    expect(dual.tradeDate.scoredCount).toBe(1);
+    expect(dual.tradeDate.avgReturn).toBeCloseTo(0.1, 5);
+  });
+
+  it('skips a missing current price date when priceFreshThrough is set', () => {
+    const out = aggregateMemberPerformance(
+      [
+        row({ currentPriceDate: null }),
+        row({ currentPriceDate: '' }),
+        row({
+          currentPriceDate: '2026-08-01',
+          priceAtTrade: 100,
+          currentPrice: 110,
+          spxAtTrade: 100,
+        }),
+      ],
+      100,
+      { priceFreshThrough: '2026-08-01' },
+    );
+    expect(out.tradeCount).toBe(3);
+    expect(out.scoredCount).toBe(1);
+    expect(out.avgReturn).toBeCloseTo(0.1, 5);
+  });
+
   it('leaves excess null (but still scores the return) when no S&P anchor exists', () => {
     const out = aggregateMemberPerformance([row({ spxAtTrade: null })], null);
     expect(out.scoredCount).toBe(1);
@@ -190,7 +238,7 @@ describe('aggregateMemberPerformance', () => {
   it('buysOnly skips sells; filing anchor uses priceAtFiling', () => {
     const rows: MemberPerfRow[] = [
       row({
-        txType: 'P',
+        txType: 'B',
         priceAtTrade: 100,
         currentPrice: 120,
         spxAtTrade: 100,
@@ -241,7 +289,7 @@ describe('aggregateMemberDualPerformance', () => {
       [
         {
           isOption: false,
-          txType: 'P',
+          txType: 'B',
           priceAtTrade: 100,
           spxAtTrade: 100,
           priceAtFiling: 105,

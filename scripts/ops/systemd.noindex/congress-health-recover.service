@@ -1,0 +1,19 @@
+[Unit]
+Description=Congress.Trade health recover (auto-restart on local /api/health failure)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/congress-health-recover.sh
+Restart=always
+RestartSec=15
+SyslogIdentifier=congress-health-recover
+# COOLIFY_TOKEN (Coolify API restart — the only recovery path that works when
+# the container has been removed rather than merely stopped) and
+# PUSHOVER_APP_TOKEN / PUSHOVER_USER_KEY (give-up alerts) live here.
+# Leading "-" keeps the unit startable when the file is absent.
+EnvironmentFile=-/etc/congress-health-recover.env
+
+[Install]
+WantedBy=multi-user.target

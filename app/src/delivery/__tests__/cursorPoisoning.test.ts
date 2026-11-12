@@ -36,6 +36,7 @@ async function createInMemoryD1(): Promise<D1Database> {
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE);
     ALTER TABLE filers ADD COLUMN photo_url TEXT;
     ALTER TABLE filers ADD COLUMN resolved_bioguide_id TEXT;
+    ALTER TABLE filers ADD COLUMN display_name TEXT;
     ALTER TABLE filings ADD COLUMN filing_status TEXT;
     ALTER TABLE transactions ADD COLUMN deprecated_at TEXT;
   `);
@@ -63,6 +64,20 @@ async function createInMemoryD1(): Promise<D1Database> {
     exec(sql: string) {
       db.exec(sql);
       return Promise.resolve({ count: 1, duration: 0 });
+    },
+    // POST /migrate on a fresh DB runs the guarded 0091 apple_subscriptions
+    // rebuild, which refuses to run without one write transaction.
+    async batch(statements: Array<{ run(): Promise<D1Result> }>) {
+      db.exec('BEGIN');
+      try {
+        const results: D1Result[] = [];
+        for (const statement of statements) results.push(await statement.run());
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
     },
   } as unknown as D1Database;
 }

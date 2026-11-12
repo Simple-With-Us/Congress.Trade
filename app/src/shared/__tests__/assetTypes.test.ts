@@ -4,6 +4,7 @@ import {
   canonicalAssetTypeCategorySql,
   canonicalizeAssetType,
   houseAssetTypeCodePattern,
+  inferHouseAssetTypeCode,
 } from '../assetTypes.ts';
 
 describe('canonicalizeAssetType', () => {
@@ -36,6 +37,18 @@ describe('canonicalizeAssetType', () => {
 
   it('lets disclosed type labels override the option flag', () => {
     expect(canonicalizeAssetType('Stock', null, { isOption: true }).category).toBe('public_equity');
+  });
+
+  it('infers ST from Common Stock asset lines and [ST] brackets when the model left type blank', () => {
+    expect(inferHouseAssetTypeCode(null, { assetName: '3M Company Common Stock (MMM)' })).toEqual({
+      code: 'ST',
+      label: 'Stocks (including ADRs)',
+    });
+    expect(inferHouseAssetTypeCode(null, { rawText: 'Adobe Inc. - Common Stock (ADBE) [ST]' })?.code).toBe('ST');
+    expect(canonicalizeAssetType(null, null, { assetName: 'Boeing Company Common Stock (BA)' }).code).toBe('ST');
+    expect(canonicalizeAssetType(null, null, { assetName: 'Boeing Company Common Stock (BA)' }).category).toBe(
+      'public_equity',
+    );
   });
 
   it('keeps present but unmapped values separate from missing values', () => {

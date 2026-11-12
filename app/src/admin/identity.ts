@@ -1,9 +1,18 @@
 import type { Env } from '../shared/types.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { parseEmailAllowlist } from './access.ts';
+import { listGrantedAdminEmails } from './adminAccess.ts';
 
 export interface AdminRuntimeConfig {
+  /** Merged allowlist: ADMIN_EMAILS (env bootstrap) + persisted grants.  This
+   *  is what "is this email an admin" checks against. */
   allow: Set<string>;
+  /** ADMIN_EMAILS only — the env-configured root bootstrap.  Read-only from
+   *  the UI: grant/revoke never write to it, and revoking one of these
+   *  addresses through the admin-management UI is refused (see
+   *  admin/adminAccess.ts).  Kept separate so the UI can label these entries
+   *  "configured in the environment — not editable here". */
+  envAllow: Set<string>;
   accessAud?: string;
   accessTeamDomain?: string;
 }
@@ -18,8 +27,21 @@ export async function adminRuntimeConfig(env: Env): Promise<AdminRuntimeConfig> 
     resolved(env, 'ACCESS_AUD'),
     resolved(env, 'ACCESS_TEAM_DOMAIN'),
   ]);
+  const envAllow = parseEmailAllowlist(emails);
+  // Defensive: a missing/broken DB binding (some test envs stub only what
+  // they need) must degrade to the env-only allowlist, never throw and never
+  // widen access.
+  let granted: Set<string>;
+  try {
+    granted = await listGrantedAdminEmails(env.DB);
+  } catch {
+    granted = new Set<string>();
+  }
+  const allow = new Set<string>(envAllow);
+  for (const email of granted) allow.add(email);
   return {
-    allow: parseEmailAllowlist(emails),
+    allow,
+    envAllow,
     accessAud,
     accessTeamDomain,
   };

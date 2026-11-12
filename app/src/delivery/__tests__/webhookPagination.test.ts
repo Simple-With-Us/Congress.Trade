@@ -35,7 +35,7 @@ function pageEnv(rows: SubscriptionRow[], failContinuation = false) {
         async first<T>() {
           if (/FROM transactions WHERE id/i.test(sql)) return ({
             id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: '2026-01-01', owner: 'self',
-            asset_name: 'Apple', ticker: 'AAPL', asset_type: 'stock', tx_type: 'P', amount_min: 1001,
+            asset_name: 'Apple', ticker: 'AAPL', asset_type: 'stock', tx_type: 'B', amount_min: 1001,
             amount_max: 15000, is_option: 0, cap_gains_over_200: 0, raw_text: '', confidence: 1,
             source: 'primary', created_at: '2026-01-01T00:00:00.000Z', cursor_seq: 1,
           } as T);

@@ -8,6 +8,7 @@ import {
   detectOption,
   detectCapGains,
 } from '../senateHtml.ts';
+import { normalizeOcrAssetName } from '../ocrSanity.ts';
 import type { ExtractorInput } from '../../extractors/types.ts';
 import type { Filing } from '../../shared/types.ts';
 
@@ -77,7 +78,7 @@ describe('SenateHtmlExtractor', () => {
     expect(r1.assetName).toContain('Apple');
     expect(r1.assetType).toBe('Stock');
     expect(r1.assetTypeName).toBe('Stock');
-    expect(r1.txType).toBe('P');
+    expect(r1.txType).toBe('B');
     expect(r1.amountMin).toBe(1001);
     expect(r1.amountMax).toBe(15000);
     expect(r1.isOption).toBe(false);
@@ -90,6 +91,58 @@ describe('SenateHtmlExtractor', () => {
     expect(r2.isOption).toBe(true);
   });
 
+  it('splits eFD Company:/Description: detail lines out of assetName', async () => {
+    // Shape of Senate PTR e67780bf (Blumenthal, filed 2026-10-26): private
+    // partnership rows carry muted detail lines inside the Asset Name cell.
+    const html = `<table class="table report-data"><thead><tr>
+      <th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th>
+      <th>Asset Name</th><th>Asset Type</th><th>Type</th><th>Amount</th><th>Comment</th>
+    </tr></thead><tbody><tr>
+      <td>8</td><td>09/21/2026</td><td>Spouse</td><td>--</td>
+      <td>
+        GCP Captivate Secondary LP
+        <div class="text-muted"><em>Company:</em> Captivate Network
+          &nbsp;(New York, NY)
+        </div>
+        <div class="text-muted"><em>Description:</em>&nbsp;Media Company</div>
+      </td>
+      <td>Other</td><td>Sale (Full)</td><td>$500,001 - $1,000,000</td>
+      <td>Underlying Asset of Peter L. Malkin Family 2000 LLC</td>
+    </tr></tbody></table>`;
+    const result = await new SenateHtmlExtractor().extract({ filing: filing(), html });
+    expect(result.transactions).toHaveLength(1);
+    const [r] = result.transactions;
+    expect(r.assetName).toBe('GCP Captivate Secondary LP');
+    expect(r.description).toBe('Company: Captivate Network (New York, NY); Description: Media Company');
+    expect(r.txType).toBe('S');
+    expect(r.amountMin).toBe(500001);
+    expect(r.rawText).toContain('Company:');
+    expect(normalizeOcrAssetName(r.assetName).nameHolds).toEqual([]);
+    // The split must not mutate the tree that is serialized into raw.
+    expect(result.raw).toContain('Company:');
+    expect(result.raw).toContain('Description:');
+    expect(result.raw).toContain('Media Company');
+  });
+
+  it('does not restore the polluted name when the cell holds only muted detail lines', async () => {
+    const html = `<table class="table report-data"><thead><tr>
+      <th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th>
+      <th>Asset Name</th><th>Asset Type</th><th>Type</th><th>Amount</th><th>Comment</th>
+    </tr></thead><tbody><tr>
+      <td>9</td><td>09/21/2026</td><td>Spouse</td><td>--</td>
+      <td>
+        <div class="text-muted"><em>Company:</em> Only Detail Co (Austin, TX)</div>
+        <div class="text-muted"><em>Description:</em> Partnership</div>
+      </td>
+      <td>Other</td><td>Sale (Full)</td><td>$1,001 - $15,000</td><td>--</td>
+    </tr></tbody></table>`;
+    const result = await new SenateHtmlExtractor().extract({ filing: filing(), html });
+    expect(result.transactions).toHaveLength(1);
+    const [r] = result.transactions;
+    expect(r.assetName).not.toContain(':');
+    expect(r.description).toBe('Company: Only Detail Co (Austin, TX); Description: Partnership');
+  });
+
   it('returns low confidence when no transaction table is present', async () => {
     const ex = new SenateHtmlExtractor();
     const result = await ex.extract({ filing: filing(), html: '<html><body><p>nope</p></body></html>' });
@@ -100,10 +153,10 @@ describe('SenateHtmlExtractor', () => {
 
 describe('field normalizers', () => {
   it('maps tx-type labels to P/S/E', () => {
-    expect(normalizeTxType('Purchase')).toBe('P');
+    expect(normalizeTxType('Purchase')).toBe('B');
     expect(normalizeTxType('Sale (Partial)')).toBe('S');
     expect(normalizeTxType('Exchange')).toBe('E');
-    expect(normalizeTxType('P')).toBe('P');
+    expect(normalizeTxType('P')).toBe('B');
     expect(normalizeTxType('')).toBeNull();
   });
 

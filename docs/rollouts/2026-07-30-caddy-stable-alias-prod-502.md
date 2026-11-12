@@ -11,7 +11,7 @@ mints a new container name, so routing broke on each deploy. Additionally,
 `oracle-caddy-1` was not attached to the `congress-trade` Docker network, so no
 congress container name could resolve at all.
 
-Fixes applied on the Oracle host (141.148.182.224):
+Fixes applied on the Oracle host (<ORACLE_IP_RETIRED>):
 
 1. Caddyfile congress.trade block now proxies to the Coolify **stable network
    alias** `congress-app:5000` (the alias is constant across redeploys; backup
@@ -22,7 +22,7 @@ Fixes applied on the Oracle host (141.148.182.224):
    `compose.yaml.bak-20260730`). The manual connect persists across restarts;
    the compose edit covers container recreation.
 3. host.jays.services (Coolify UI, also 502) pointed at a tailscale IP
-   (`100.97.154.2:8000`) that is unreachable from inside the container network
+   (`<TAILSCALE_IP_RETIRED>:8000`) that is unreachable from inside the container network
    namespace; now `reverse_proxy coolify:8080` over the shared `coolify`
    Docker network.
 

@@ -6,13 +6,19 @@ import {
   hasDrainableWork,
   probePendingWork,
   runScheduledTick,
+  tickLockErrorShouldFailOpen,
 } from '../scheduledTick.ts';
+import { withSqliteLockRetry } from '../../shared/db.ts';
 import type { DenoCostProfile } from '../costProfile.ts';
 import type { DurableQueueHandlers } from '../durableQueue.ts';
 
-vi.mock('../../extraction/agreement.ts', () => ({
-  maybeRunAgreementAutopublish: vi.fn(async () => ({ attempted: 0, enqueued: 0, terminalized: 0 })),
-}));
+vi.mock('../../extraction/agreement.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../extraction/agreement.ts')>();
+  return {
+    ...actual,
+    maybeRunAgreementAutopublish: vi.fn(async () => ({ attempted: 0, enqueued: 0, terminalized: 0 })),
+  };
+});
 vi.mock('../../extraction/autopilot.ts', () => ({
   maybeStartBacklogAutopilot: vi.fn(async () => ({ blocked: 'not_due' as const })),
 }));
@@ -126,6 +132,7 @@ describe('probePendingWork / hasDrainableWork', () => {
       deliveryQueue: false,
       ingestionOutbox: false,
       deliveryOutbox: false,
+      eligibleReview: false,
     });
     expect(hasDrainableWork(probe)).toBe(false);
   });
@@ -149,7 +156,102 @@ describe('probePendingWork / hasDrainableWork', () => {
     const probe = await probePendingWork(env, new Date(now));
     expect(probe.ingestQueue).toBe(true);
     expect(probe.deliveryOutbox).toBe(true);
+    expect(probe.eligibleReview).toBe(false);
     expect(hasDrainableWork(probe)).toBe(true);
+  });
+
+  it('treats claimable eligible-due review rows as drainable work', async () => {
+    const { client, db } = await makeDb();
+    const now = '2026-08-18T23:00:00.000Z';
+    await client.execute(`
+      CREATE TABLE review_queue (
+        doc_id TEXT PRIMARY KEY,
+        resolved INTEGER,
+        agreement_suppressed_at TEXT,
+        agreement_attempts INTEGER,
+        agreement_next_attempt_at TEXT,
+        agreement_claim_token TEXT,
+        agreement_claimed_at TEXT,
+        reason TEXT
+      )
+    `);
+    await client.execute(`
+      CREATE TABLE filings (
+        doc_id TEXT PRIMARY KEY,
+        raw_object_key TEXT,
+        doc_kind TEXT
+      )
+    `);
+    await client.execute(`
+      CREATE TABLE transactions (
+        id INTEGER PRIMARY KEY,
+        doc_id TEXT,
+        source TEXT,
+        deprecated_at TEXT
+      )
+    `);
+    await client.execute({
+      sql: `INSERT INTO review_queue
+        (doc_id, resolved, agreement_suppressed_at, agreement_attempts, reason)
+        VALUES ('H-2026-20000001', 0, NULL, 0, 'agreement_cascade_unresolved')`,
+      args: [],
+    });
+    await client.execute({
+      sql: `INSERT INTO filings (doc_id, raw_object_key, doc_kind)
+        VALUES ('H-2026-20000001', 'raw/H-2026-20000001.pdf', 'ptr_pdf')`,
+      args: [],
+    });
+    const env = { DB: db } as unknown as Env;
+    const probe = await probePendingWork(env, new Date(now));
+    expect(probe.eligibleReview).toBe(true);
+    expect(hasDrainableWork(probe)).toBe(true);
+  });
+
+  it('does not treat attempt-capped cascade disagreements as selector-due work', async () => {
+    const { client, db } = await makeDb();
+    const now = '2026-08-18T23:00:00.000Z';
+    await client.execute(`
+      CREATE TABLE review_queue (
+        doc_id TEXT PRIMARY KEY,
+        resolved INTEGER,
+        agreement_suppressed_at TEXT,
+        agreement_attempts INTEGER,
+        agreement_next_attempt_at TEXT,
+        agreement_claim_token TEXT,
+        agreement_claimed_at TEXT,
+        reason TEXT
+      )
+    `);
+    await client.execute(`
+      CREATE TABLE filings (
+        doc_id TEXT PRIMARY KEY,
+        raw_object_key TEXT,
+        doc_kind TEXT
+      )
+    `);
+    await client.execute(`
+      CREATE TABLE transactions (
+        id INTEGER PRIMARY KEY,
+        doc_id TEXT,
+        source TEXT,
+        deprecated_at TEXT
+      )
+    `);
+    await client.execute({
+      sql: `INSERT INTO review_queue
+        (doc_id, resolved, agreement_suppressed_at, agreement_attempts, reason)
+        VALUES ('H-2026-20000002', 0, NULL, 3, 'agreement_cascade_unresolved')`,
+      args: [],
+    });
+    await client.execute({
+      sql: `INSERT INTO filings (doc_id, raw_object_key, doc_kind)
+        VALUES ('H-2026-20000002', 'raw/H-2026-20000002.pdf', 'ptr_pdf')`,
+      args: [],
+    });
+    const env = { DB: db } as unknown as Env;
+    const probe = await probePendingWork(env, new Date(now));
+    expect(probe.eligibleReview).toBe(false);
+    expect(hasDrainableWork(probe)).toBe(false);
   });
 });
 
@@ -199,6 +301,13 @@ describe('runScheduledTick idle short-circuit', () => {
     expect(result.skippedDrain).toBe(true);
     expect(result.drained).toBeNull();
     expect(result.ingestionOutbox).toBeNull();
+    expect(result.apnsFanout).toEqual({
+      skipped: 'not_configured',
+      trades: 0,
+      reviews: 0,
+      delivered: 0,
+      retired: 0,
+    });
     expect(handlers.handleIngestMessage).not.toHaveBeenCalled();
     // Autonomy lanes still run even when the drain short-circuits.
     expect(refreshSecrets).toHaveBeenCalledOnce();
@@ -323,5 +432,84 @@ describe('runScheduledTick singleton + abort', () => {
     expect(result.errors).toContain('tick: aborted');
     expect(refreshSecrets).not.toHaveBeenCalled();
     expect(maybeRunAgreementAutopublish).not.toHaveBeenCalled();
+  });
+
+  it('does not fail open on a busy, locked, or in-progress singleton lock', () => {
+    expect(tickLockErrorShouldFailOpen(new Error('SQLITE_BUSY'))).toBe(false);
+    expect(tickLockErrorShouldFailOpen(new Error('database is locked'))).toBe(false);
+    expect(tickLockErrorShouldFailOpen(new Error('cannot commit transaction - SQL statements in progress'))).toBe(false);
+    expect(tickLockErrorShouldFailOpen(new Error('no such table: deno_runtime_kv'))).toBe(true);
+  });
+
+  it('skips the tick when acquiring the singleton lock throws SQLITE_BUSY', async () => {
+    const { db } = await makeDb();
+    const busy = {
+      prepare(sql: string) {
+        const stmt = db.prepare(sql);
+        return {
+          bind(...args: unknown[]) {
+            stmt.bind(...args);
+            return {
+              run: async () => {
+                throw new Error('SQLITE_BUSY: database is locked');
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await runScheduledTick(
+        testEnv(busy),
+        emptyHandlers(),
+        FREE,
+        new Date('2026-07-25T12:00:00.000Z'),
+      );
+      expect(result.skippedOverlap).toBe(true);
+      expect(result.errors).toEqual([
+        'tick_singleton_unavailable: SQLITE_BUSY: database is locked',
+      ]);
+      expect(refreshSecrets).not.toHaveBeenCalled();
+      expect(maybeRunAgreementAutopublish).not.toHaveBeenCalled();
+      expect(errorSpy.mock.calls.some((args) => String(args[0]).includes('running unguarded'))).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('still runs the tick when the singleton lock table is missing', async () => {
+    const { client, db } = await makeDb();
+    await client.execute('DROP TABLE deno_runtime_kv');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await runScheduledTick(
+        testEnv(db),
+        emptyHandlers(),
+        FREE,
+        new Date('2026-07-25T12:00:00.000Z'),
+      );
+      expect(result.skippedOverlap).toBe(false);
+      expect(result.errors.some((entry) => entry.startsWith('tick_singleton_unavailable:') && entry.includes('no such table'))).toBe(true);
+      expect(refreshSecrets).toHaveBeenCalledOnce();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('retries a busy write three times and does not retry a missing table', async () => {
+    let busyCalls = 0;
+    await expect(withSqliteLockRetry(async () => {
+      busyCalls += 1;
+      throw new Error('SQLITE_BUSY: database is locked');
+    })).rejects.toThrow('SQLITE_BUSY');
+    expect(busyCalls).toBe(4);
+
+    let missingCalls = 0;
+    await expect(withSqliteLockRetry(async () => {
+      missingCalls += 1;
+      throw new Error('no such table: source_attempts');
+    })).rejects.toThrow('no such table');
+    expect(missingCalls).toBe(1);
   });
 });

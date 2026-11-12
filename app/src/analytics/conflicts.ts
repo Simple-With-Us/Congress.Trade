@@ -21,22 +21,32 @@ interface CommitteeRule {
 }
 
 export const COMMITTEE_SECTOR_RULES: ReadonlyArray<CommitteeRule> = [
-  { match: 'armed services', sectors: ['Industrials'] },
+  { match: 'armed services', sectors: ['Industrials', 'Information Technology'] },
   { match: 'financial services', sectors: ['Financials', 'Real Estate'] },
   { match: 'banking', sectors: ['Financials', 'Real Estate'] }, // Senate Banking, Housing & Urban Affairs
-  { match: 'energy and commerce', sectors: ['Energy', 'Utilities', 'Health Care', 'Communication Services'] },
-  { match: 'energy and natural resources', sectors: ['Energy', 'Utilities'] },
+  { match: 'energy and commerce', sectors: ['Energy', 'Utilities', 'Health Care', 'Communication Services', 'Information Technology'] },
+  { match: 'energy and natural resources', sectors: ['Energy', 'Utilities', 'Materials'] },
   { match: 'natural resources', sectors: ['Energy', 'Materials'] }, // House Natural Resources
   { match: 'health, education', sectors: ['Health Care'] }, // Senate HELP
   { match: 'help', sectors: ['Health Care'] },
   { match: 'agriculture', sectors: ['Consumer Staples', 'Materials'] },
-  { match: 'transportation and infrastructure', sectors: ['Industrials'] },
+  { match: 'transportation and infrastructure', sectors: ['Industrials', 'Utilities'] },
+  { match: 'transportation', sectors: ['Industrials'] },
   { match: 'commerce, science', sectors: ['Communication Services', 'Industrials', 'Consumer Discretionary', 'Information Technology'] },
-  { match: 'judiciary', sectors: ['Information Technology', 'Communication Services'] },
-  { match: 'homeland security', sectors: ['Industrials', 'Information Technology'] },
-  { match: 'intelligence', sectors: ['Industrials', 'Information Technology'] },
-  { match: 'ways and means', sectors: ['Health Care', 'Financials'] },
-  { match: 'finance', sectors: ['Health Care', 'Financials'] }, // Senate Finance (not "financial")
+  { match: 'science, space', sectors: ['Information Technology', 'Industrials'] },
+  { match: 'science and technology', sectors: ['Information Technology', 'Industrials'] },
+  { match: 'judiciary', sectors: ['Information Technology', 'Communication Services', 'Financials'] },
+  { match: 'homeland security', sectors: ['Industrials', 'Information Technology', 'Communication Services'] },
+  { match: 'intelligence', sectors: ['Industrials', 'Information Technology', 'Communication Services'] },
+  { match: 'foreign affairs', sectors: ['Industrials', 'Energy', 'Materials'] },
+  { match: 'foreign relations', sectors: ['Industrials', 'Energy', 'Materials'] },
+  { match: 'ways and means', sectors: ['Health Care', 'Financials', 'Consumer Staples'] },
+  { match: 'finance', sectors: ['Health Care', 'Financials', 'Consumer Staples'] }, // Senate Finance
+  { match: 'small business', sectors: ['Financials', 'Consumer Discretionary', 'Industrials'] },
+  { match: 'veterans', sectors: ['Health Care', 'Real Estate'] },
+  { match: 'environment and public works', sectors: ['Utilities', 'Materials', 'Industrials'] },
+  { match: 'oversight', sectors: ['Industrials', 'Information Technology', 'Health Care', 'Financials'] },
+  { match: 'appropriations', sectors: ['Industrials', 'Health Care', 'Information Technology', 'Energy'] },
 ];
 
 export interface ConflictMatch {

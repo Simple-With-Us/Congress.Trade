@@ -11,7 +11,6 @@
 #   ingest-retry-errored   -> re-enqueue filing.fetched for errored filings that
 #                             already have raw bytes (extraction-stage casualties)
 #   batch-status           -> poll and resolve one explicitly identified batch job
-#   fmp-senate-recovery    -> import one bounded page range of Senate history
 name: Admin Maintenance
 
 on:
@@ -31,7 +30,6 @@ on:
           - storage-smoke
           - official-data-dry-run
           - official-data-batch
-          - fmp-senate-recovery
           - metadata-enrichment
           - market-backfill
       job_id:
@@ -63,16 +61,6 @@ on:
         required: false
         default: '100'
         type: string
-      from_page:
-        description: First FMP Senate page (0-100)
-        required: false
-        default: '0'
-        type: string
-      to_page:
-        description: Last FMP Senate page (0-100, at most 5 pages per run)
-        required: false
-        default: '4'
-        type: string
       confirm:
         description: Type run-production-maintenance to confirm
         required: true
@@ -89,10 +77,9 @@ jobs:
       inputs.confirm == 'run-production-maintenance' &&
       github.ref == 'refs/heads/main'
     environment: production
-    # Self-hosted like deploy.yml: Cloudflare serves GitHub's hosted (Azure)
-    # runners a managed bot challenge before requests reach the Worker, so
-    # admin curls must come from the same runner ship.sh already uses.
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "oracle-ci"]') || 'ubuntu-latest' }}
+    # GitHub-hosted. Cloudflare still serves a managed challenge to bare curl,
+    # so every admin call below spoofs the same browser UA as app/scripts/ship.sh.
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       BASE_URL: https://congress.trade
@@ -102,8 +89,8 @@ jobs:
       # with the browser UA used by app/scripts/ship.sh.
       BROWSER_UA: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36
     steps:
-      # The self-hosted runner's curl predates --fail-with-body, so capture the
-      # body and status code separately and fail on non-200 by hand.
+      # Capture body and status separately and fail on non-200 by hand so older
+      # curl without --fail-with-body still reports the response.
       - name: Requeue dead-lettered fetches (ingestion_outbox failed -> pending)
         if: inputs.task == 'drain-backlog' || inputs.task == 'ingest-requeue-failed'
         run: |
@@ -277,47 +264,6 @@ jobs:
             echo "== $route"; cat "/tmp/${route}.json"; echo
             [ "$code" = "200" ] || { echo "HTTP $code"; exit 1; }
           done
-
-      - name: Recover bounded FMP Senate history
-        if: inputs.task == 'fmp-senate-recovery'
-        env:
-          FROM_PAGE: ${{ inputs.from_page }}
-          TO_PAGE: ${{ inputs.to_page }}
-        run: |
-          set -euo pipefail
-          [[ "$FROM_PAGE" =~ ^[0-9]+$ ]]
-          [[ "$TO_PAGE" =~ ^[0-9]+$ ]]
-          [ "$FROM_PAGE" -le "$TO_PAGE" ]
-          [ "$TO_PAGE" -le 100 ]
-          [ $((TO_PAGE - FROM_PAGE + 1)) -le 5 ]
-          response_file=$(mktemp "${TMPDIR:-/tmp}/ct-fmp-senate.XXXXXX")
-          chmod 600 "$response_file"
-          trap 'rm -f "$response_file"' EXIT
-          body=$(printf '{"fromPage":%s,"toPage":%s,"dryRun":false}' "$FROM_PAGE" "$TO_PAGE")
-          code=$(curl -sS -A "$BROWSER_UA" -o "$response_file" -w '%{http_code}' -X POST \
-            "$BASE_URL/api/admin/fmp-senate-recovery" \
-            -H "authorization: Bearer $ADMIN_TOKEN" \
-            -H 'content-type: application/json' -d "$body")
-          cat "$response_file"; echo
-          [ "$code" = "200" ] || { echo "HTTP $code"; exit 1; }
-          python3 - "$response_file" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              payload = json.load(handle)
-          if payload.get("ok") is not True or payload.get("errors"):
-              print("::error::FMP Senate recovery reported a partial failure")
-              raise SystemExit(1)
-          print(
-              "FMP Senate recovery receipt:",
-              "pages", f"{payload.get('fromPage')}-{payload.get('toPage')}",
-              "fetched", payload.get("fetched"),
-              "inserted", payload.get("inserted"),
-              "duplicates", payload.get("duplicates"),
-              "rejected", payload.get("rejected"),
-          )
-          PY
 
       - name: Run one governed market-data batch
         if: inputs.task == 'market-backfill'

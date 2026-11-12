@@ -64,7 +64,10 @@ CREATE TABLE review_queue (
   agreement_legacy_replay_at TEXT,
   agreement_suppressed_at TEXT,
   agreement_suppression_reason TEXT,
-  review_revision INTEGER NOT NULL DEFAULT 1
+  review_revision INTEGER NOT NULL DEFAULT 1,
+  resolution_kind TEXT,
+  resolution_reason TEXT,
+  resolved_at TEXT
 );
 CREATE INDEX idx_review_resolved ON review_queue (resolved);
 
@@ -107,6 +110,38 @@ CREATE TABLE extraction_runs (
   created_at     TEXT NOT NULL
 );
 CREATE INDEX idx_extraction_runs_doc ON extraction_runs (doc_id);
+
+CREATE TABLE filers (
+  bioguide_id TEXT PRIMARY KEY,
+  chamber     TEXT,
+  full_name   TEXT,
+  party       TEXT,
+  state       TEXT,
+  district    TEXT,
+  committees  TEXT
+);
+
+CREATE TABLE ingestion_outbox (
+  doc_id             TEXT PRIMARY KEY,
+  chamber            TEXT NOT NULL,
+  source_url         TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'pending',
+  attempts           INTEGER NOT NULL DEFAULT 0,
+  dead_letter_cycles INTEGER NOT NULL DEFAULT 0,
+  available_at       TEXT NOT NULL,
+  last_error         TEXT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+);
+CREATE INDEX idx_ingestion_outbox_ready ON ingestion_outbox (status, available_at);
+
+CREATE TABLE ingestion_decisions (
+  id         TEXT PRIMARY KEY,
+  doc_id     TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  source     TEXT,
+  created_at TEXT
+);
 `;
 
 export interface ReviewQueueFixtureRow {
@@ -119,6 +154,21 @@ export interface ReviewQueueFixtureRow {
   ingestStatus?: string | null;
   docKind?: string | null;
   sourceUrl?: string | null;
+  resolutionKind?: string | null;
+  resolutionReason?: string | null;
+  /** Skip the review_queue row entirely (the ingest-failure shape). */
+  noReview?: boolean;
+  filerId?: string | null;
+  /** Seeds a filers row with bioguide_id = filerId (or docId) for name lookup. */
+  filerName?: string | null;
+  filedDate?: string | null;
+  filingType?: string | null;
+  error?: string | null;
+  firstSeenAt?: string | null;
+  sourceUpdatedAt?: string | null;
+  liveTransactions?: number;
+  deprecatedTransactions?: number;
+  outboxUpdatedAt?: string | null;
   models?: Array<{
     provider: string;
     model: string;
@@ -145,35 +195,84 @@ export function makeReviewQueueTestDb(rows: ReviewQueueFixtureRow[]): D1Database
   raw.exec(SCHEMA_SQL);
 
   const insertFiling = raw.prepare(
-    `INSERT INTO filings (doc_id, chamber, source_url, raw_object_key, doc_kind, ingest_status)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO filings
+       (doc_id, chamber, filer_id, filing_type, filed_date, source_url,
+        raw_object_key, doc_kind, ingest_status, first_seen_at,
+        source_updated_at, error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertReview = raw.prepare(
-    `INSERT INTO review_queue (doc_id, reason, payload, created_at, resolved, review_revision)
-     VALUES (?, ?, ?, ?, ?, 1)`,
+    `INSERT INTO review_queue
+       (doc_id, reason, payload, created_at, resolved, review_revision,
+        resolution_kind, resolution_reason, resolved_at)
+     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`,
   );
   const insertRun = raw.prepare(
     `INSERT INTO extraction_runs (id, doc_id, provider, model, kind, ok, error, row_count, latency_ms, avg_confidence, created_at)
      VALUES (?, ?, ?, ?, 'bakeoff', ?, NULL, ?, NULL, ?, ?)`,
   );
+  const insertFiler = raw.prepare(
+    `INSERT OR IGNORE INTO filers (bioguide_id, chamber, full_name) VALUES (?, ?, ?)`,
+  );
+  const insertTx = raw.prepare(
+    `INSERT INTO transactions (id, doc_id, deprecated_at) VALUES (?, ?, ?)`,
+  );
+  const insertOutbox = raw.prepare(
+    `INSERT INTO ingestion_outbox
+       (doc_id, chamber, source_url, status, attempts, available_at,
+        last_error, created_at, updated_at)
+     VALUES (?, ?, ?, 'pending', 3, ?, ?, ?, ?)`,
+  );
 
   let runIdSeq = 0;
+  let txIdSeq = 0;
   for (const row of rows) {
     insertFiling.run(
       row.docId,
       row.chamber ?? null,
+      row.filerId ?? null,
+      row.filingType ?? 'P',
+      row.filedDate ?? null,
       row.sourceUrl ?? `https://example.test/${row.docId}`,
       `raw/${row.docId}`,
       row.docKind ?? 'text_pdf',
       row.ingestStatus ?? (row.resolved ? 'persisted' : 'needs_review'),
+      row.firstSeenAt ?? row.createdAt,
+      row.sourceUpdatedAt ?? null,
+      row.error ?? null,
     );
-    insertReview.run(
-      row.docId,
-      row.reason ?? 'low_confidence',
-      row.payload === undefined ? '{"minConfidence":0,"transactions":[]}' : row.payload,
-      row.createdAt,
-      row.resolved ?? 0,
-    );
+    if (row.filerName) {
+      insertFiler.run(row.filerId ?? row.docId, row.chamber ?? null, row.filerName);
+    }
+    if (!row.noReview) {
+      insertReview.run(
+        row.docId,
+        row.reason ?? 'low_confidence',
+        row.payload === undefined ? '{"minConfidence":0,"transactions":[]}' : row.payload,
+        row.createdAt,
+        row.resolved ?? 0,
+        row.resolutionKind ?? null,
+        row.resolutionReason ?? null,
+        row.resolved ? row.createdAt : null,
+      );
+    }
+    for (let i = 0; i < (row.liveTransactions ?? 0); i++) {
+      insertTx.run(`tx-${txIdSeq++}`, row.docId, null);
+    }
+    for (let i = 0; i < (row.deprecatedTransactions ?? 0); i++) {
+      insertTx.run(`tx-${txIdSeq++}`, row.docId, row.createdAt);
+    }
+    if (row.outboxUpdatedAt) {
+      insertOutbox.run(
+        row.docId,
+        row.chamber ?? 'senate',
+        row.sourceUrl ?? `https://example.test/${row.docId}`,
+        row.outboxUpdatedAt,
+        row.error ?? null,
+        row.createdAt,
+        row.outboxUpdatedAt,
+      );
+    }
     for (const m of row.models ?? []) {
       insertRun.run(
         `run-${runIdSeq++}`,

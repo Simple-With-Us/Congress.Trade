@@ -1,22 +1,31 @@
 # Config Registry — Infisical as the Single Source of Truth
 
-Last updated: 2026-07-18
+Last updated: 2026-08-20
 
-Every configuration key and knob the Worker reads is routed through the
-Infisical runtime resolver (`src/secrets/infisical.ts`) unless listed under
-**Env-only** below. Resolution order per key:
+**Current shape:** production is Coolify Deno-in-Docker on Hetzner, local
+SQLite + Litestream, Infisical secrets.  Deno Deploy and Turso are retired.
+Do not set production secrets "in Deno Deploy."  Edit Infisical (and Coolify
+only for the Infisical bootstrap + `TURSO_DATABASE_URL=file:…` override).
 
+Every configuration key and knob the Coolify Deno process reads is routed
+through the Infisical runtime resolver (`src/secrets/infisical.ts`) unless
+listed under **Env-only** below. Resolution order per key:
 1. **Infisical** — the value set in the Infisical project (env `prod` by
    default). Edits go live within the resolver cache TTL
    (`INFISICAL_CACHE_TTL_SECONDS`, default 600s) with **no redeploy**.
-2. **Env fallback** — the `wrangler.toml [vars]` value or Worker secret.
+   The resolver merges **shared-at-ct first, then the app project**.  A
+   name that exists in both is shadowed by the app row — so fleet-wide
+   keys (`AGENT_SYNC_TOKEN`, `AGENT_SYNC_POST_TOKEN`) live **only** in
+   shared.  Do not copy them onto the ST or CT app projects.
+2. **Env fallback** — Coolify container env, or local `.dev.vars` for tests.
    Kept so keyless local dev / tests still boot and so an Infisical outage
    never leaves production unconfigured. Disable with
    `INFISICAL_ALLOW_ENV_FALLBACK="false"` to hard-require Infisical.
 
-**Operate by editing Infisical, not wrangler.toml.** Audit which source is
-live for every key at any time: `GET /api/admin/config-sources` (admin-gated;
-reports names + sources only, never values).
+**Operate by editing Infisical, not Deno Deploy and not wrangler.toml.**
+There is no production `wrangler.toml`.  Audit which source is live for
+every key at any time: `GET /api/admin/config-sources` (admin-gated; reports
+names + sources only, never values).
 
 ## Infisical-tunable (everything here is live-editable)
 
@@ -24,7 +33,7 @@ reports names + sources only, never values).
 `FMP_API_KEY`, `TIINGO_API_KEY`, `MASSIVE_API_KEY`, `INTRINIO_API_KEY`,
 `TWELVEDATA_API_KEY`, `FINNHUB_API_KEY`, `UNUSUAL_WHALES_API_KEY`,
 `QUIVER_API_KEY`, `QUIVER_API_TOKEN`, `AINVEST_API_KEY`,
-`LOGODEV_PUBLISHABLE_KEY`
+`LOGODEV_PUBLISHABLE_KEY` (alias accepted at runtime: `LOGO_DEV_TOKEN` — Coolify name)
 
 ### Model/LLM keys
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `MISTRAL_API_KEY`,
@@ -38,6 +47,9 @@ surfaced in `GET /api/admin/diagnostics` (`provider:openrouter`) and
 
 ### Auth, billing, email
 `ADMIN_TOKEN`¹, `INGEST_TOKEN`, `ADMIN_MAINTENANCE_TOKEN`², `ADMIN_EMAILS`, `ACCESS_AUD`,
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL`, `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (optional GB Publisher fan-out; same `_SECRET`),
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB` (optional GB-only `Authorization` header; value includes `Bearer `),
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET`,
 `ACCESS_TEAM_DOMAIN`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
 `WEBHOOK_SIGNING_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
 `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_ANNUAL`, `STRIPE_TRIAL_DAYS`,
@@ -51,10 +63,15 @@ they can drain backlogs without holding `ADMIN_TOKEN`. Worst case if leaked:
 someone re-runs an idempotent requeue.
 
 ¹ Admin AUTH accepts the Infisical value (rotation works live). Keep a strong
-`INFISICAL_APP_CLIENT_SECRET` set as a Worker secret regardless: the encrypted
+`INFISICAL_APP_CLIENT_SECRET` set as a Coolify env regardless: the encrypted
 KV cache of resolved secrets keys off the Infisical client secret (falling
-back to the env `ADMIN_TOKEN`), so pulling ADMIN_TOKEN out of Worker env is
+back to the env `ADMIN_TOKEN`), so pulling ADMIN_TOKEN out of container env is
 safe only while a strong client secret exists.
+
+### Fleet coordination (shared-at-ct ONLY)
+`AGENT_SYNC_TOKEN`, `AGENT_SYNC_POST_TOKEN` — one pair for every app.
+Rotate in the shared project; never duplicate onto `socratic-trade` or
+`congress-trade` app projects.  Local Mac copy: Infisical `/agent-sync` (`fleet-secrets get`).
 
 ### Integrations
 `APP_B_IMPORT_URL`, `APP_B_INGEST_TOKEN`, `USAGE_MONITOR_ENABLED`,
@@ -62,31 +79,142 @@ safe only while a strong client secret exists.
 `USAGE_MONITOR_ENVIRONMENT`², `USAGE_MONITOR_READ_TOKEN` (optional; read-only
 budget-status polling, see Tunables & flags below)
 
+### Datadog (existing fleet account — no new plan)
+Coolify / Infisical names only.  Values are never invented.  Missing or
+partial keys fail closed (the app boots; nothing is sent).
+
+Backend logs + APM (agentless HTTP intake from the Deno container):
+`DD_API_KEY`, `DD_SITE` (required together; known sites only, e.g.
+`us5.datadoghq.com`).  Optional: `DD_SERVICE` (default `congress-trade`),
+`DD_ENV` (falls back to `SENTRY_ENVIRONMENT` / `USAGE_MONITOR_ENVIRONMENT`).
+`DD_APP_KEY` is accepted for fleet registry completeness and is **not**
+required to send logs or traces.
+
+Public RUM (injected into `/`, legal pages, and the shared dashboard document
+via `%GA_SCRIPT%` — not Admin copy).  Requires all three: a client token, an
+application id, and a site.  Canonical: `DD_CLIENT_TOKEN`,
+`DD_APPLICATION_ID`, `DD_SITE`.  Aliases also accepted:
+`DD_RUM_CLIENT_TOKEN`, `NEXT_PUBLIC_DD_CLIENT_TOKEN`,
+`NEXT_PUBLIC_DD_RUM_CLIENT_TOKEN`, `DD_RUM_APPLICATION_ID`,
+`NEXT_PUBLIC_DD_APPLICATION_ID`, `NEXT_PUBLIC_DD_RUM_APPLICATION_ID`,
+`NEXT_PUBLIC_DD_SITE`.  Session Replay stays off.  Do not mint a new RUM
+application from this repo; reuse an existing Browser RUM app on the
+current Datadog account.
+
 ### Tunables & flags
-- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `FMP_MAX_PER_MINUTE`,
+- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `ST_PEER_MAX_PER_MINUTE`,
   `EDGAR_MAX_PER_MINUTE`
+  - `ST_PEER_MAX_PER_MINUTE` paces every Socratic.Trade peer read (profiles,
+    EOD prices, the price catch-up, the not-covered re-check).  It is clamped to
+    100/min because ST's `peerRead` limit is 120/min for all peer reads;  unset
+    paces at 100/min.  It replaces `FMP_MAX_PER_MINUTE`, which is no longer read.
+    FMP is latency probes only and is never a price source.
 - Providers/routing: `PRICE_PROVIDER`, `APP_BASE_URL`
 - Anti-scrape: `SCRAPE_GUARD_ENABLED`
 - Disclosure-latency race: `DISCLOSURE_LATENCY_WATCH_ENABLED`,
   `DISCLOSURE_LATENCY_PROVIDERS`, `DISCLOSURE_LATENCY_WATCH_LIMIT`,
   legacy `FMP_DISCLOSURE_WATCH_ENABLED` / `FMP_DISCLOSURE_WATCH_LIMIT`,
-  `UW_DEEP_MATCH_DATES_PER_RUN` (Unusual Whales deep-match date budget;
-  default `8`). Production should keep these set in Infisical:
+  **FMP family (latency probes only; default ON for CT when keys present):**
+  `FMP_LATENCY_PROBE_ENABLED` (explicit false/off disables; grey OFF),
+  `FMP_LATENCY_PATHS` (congress probes are **stable only**. RapidAPI
+  house/senate-latest **404** as of 2026-09-04 and is not fetched even if
+  listed — it does not replace stable. Dual keys
+  `FMP_LATENCY_API_KEY` + `FMP_LATENCY_API_KEY_2` fail over on 429 / daily cap
+  / 401 / 403),
+  optional `FMP_STABLE_BASE_URL` / `FMP_RAPIDAPI_BASE_URL` / `FMP_RAPIDAPI_HOST`,
+  `FMP_RAPIDAPI_KEY` **or shared `RAPIDAPI_KEY`** (ST marketplace convention —
+  never free-tier `FMP_LATENCY_*` on the RapidAPI host),
+  `FMP_RAPIDAPI_DAILY_CAP` is not spent on house/senate probes (those routes 404),
+  `FMP_LATENCY_DAILY_CAP` (per free-tier key, default 235), dual free keys
+  `FMP_LATENCY_API_KEY` + `_2` (or `FMP_API_KEY` as slot-2 fallback) **rotate and
+  fail over** (429 / cap / 401 / 403) for ~2× capacity — no known per-IP limit,
+  `UW_LATENCY_DAILY_CAP` (default 240 HTTP/day incl. deep-match),
+  `QUIVER_LATENCY_DAILY_CAP` (default 360 HTTP/day; 3 calls per probe),
+  `UW_DEEP_MATCH_DATES_PER_RUN` (UW deep-match date budget; default `8`).
+  **Yield-weighted spacing (all three):** now read from the MEASURED windows in
+  `src/ingestion/probeSchedule.ts` (provider profile: peak 09–10 / high 16–18 /
+  mid 10–16+18–21 / low 21–09 ET), so daily budgets run densest in the hours
+  filings actually arrive and sparse overnight. The previous 08–12/12–16 bands
+  were **guessed, and measurement showed them wrong** — 10:00 ET was being
+  probed at burst rate an hour after the burst. Set `PROBE_SCHEDULE_ENABLED=0`
+  to restore the old band table. See `docs/probe-schedule.md`.
+- Adaptive probe cadence (`src/ingestion/probeSchedule.ts`, measured windows —
+  full reference in **`docs/probe-schedule.md`**): `PROBE_SCHEDULE_ENABLED`
+  (default on), `PROBE_SCHEDULE_MIN_INTERVAL_SEC` (default `60`, politeness
+  floor), `PROBE_SCHEDULE_MAX_INTERVAL_SEC` (default `1800` — the **coverage
+  floor**: no window ever goes longer than this between probes),
+  `PROBE_SCHEDULE_WEEKEND_MAX_INTERVAL_SEC` (default `3600`),
+  `PROBE_SCHEDULE_PEAK_TROUGH_RATIO` (default `30`; R = 4 is measurably worse
+  than today at peak — table in the doc),
+  `PROBE_SCHEDULE_RETRY_HEADROOM` (default `0.1`),
+  `PROBE_SCHEDULE_ALLOCATION_EXPONENT` (default `1` = proportional),
+  `PROBE_SCHEDULE_HOUSE_BUDGET` / `PROBE_SCHEDULE_SENATE_BUDGET` (default `171`
+  probes/weekday each — a self-imposed politeness budget, **not** a documented
+  Clerk rate limit), `PROBE_SCHEDULE_PROVIDER_BUDGET` (default `240` runs),
+  `PROBE_SCHEDULE_EXECUTIVE_BUDGET` (default `107` weekday probes — 96
+  spendable after 10% headroom = a flat 15-minute coverage floor; there is
+  **no measured OGE arrival-hour sample**, so this is not a 78% peak curve),
+  and `PROBE_SCHEDULE_JSON` for a full window-table override.  Every key is
+  optional and total: a malformed value degrades to the shipped default rather
+  than stalling ingestion, so the windows can be retuned live when Congress
+  recesses or the Clerk changes publication times — no redeploy.
+  Production should keep these set in Infisical:
   `DISCLOSURE_LATENCY_WATCH_ENABLED=true`,
-  `DISCLOSURE_LATENCY_PROVIDERS=fmp,unusual_whales,quiver`,
+  `DISCLOSURE_LATENCY_PROVIDERS=fmp` (add `unusual_whales,quiver` only after paid/trial keys; add `fmp_rapidapi` only if marketplace lists house/senate/executive-latest),
   `DISCLOSURE_LATENCY_WATCH_LIMIT=100`,
-  `FMP_DISCLOSURE_WATCH_ENABLED=true`,
-  `FMP_DISCLOSURE_WATCH_LIMIT=100`,
+  `FMP_LATENCY_PROBE_ENABLED` unset (default ON) or false to disable spend,
+  `FMP_LATENCY_PATHS=stable`,
   `UW_DEEP_MATCH_DATES_PER_RUN=8`. Provider API keys
-  (`FMP_API_KEY`, `UNUSUAL_WHALES_API_KEY`, `QUIVER_API_KEY`) live under
-  provider-keys.
+  (`FMP_LATENCY_API_KEY` + `_2` / `FMP_API_KEY` slot-2, `RAPIDAPI_KEY` /
+  `FMP_RAPIDAPI_KEY`, `UNUSUAL_WHALES_API_KEY` / `UNUSUALWHALES_API_KEY`,
+  `QUIVER_API_KEY`) live under Infisical (shared holds `RAPIDAPI_KEY`; CT app
+  holds UW + FMP latency). FMP dual free keys rotate; RapidAPI path is optional
+  (default off — congress endpoints 404 on marketplace product). Multi-avenue
+  rotation (`selectRotatedAvenue`) is the multi-key/host pattern. FMP is CT
+  latency + Mac scout only — not Socratic product.
+
+- **Probe leases (server ⇄ Mac mutual exclusion):**
+  `LATENCY_LEASE_SERVER_TTL_SEC` (default `1200`, clamped 30–3600),
+  `LATENCY_LEASE_MAC_TTL_SEC` (default `150`, same clamp),
+  `LATENCY_MAC_TENURE_HOURS` (default `6`, clamped 0.25–48).
+  Exactly one host may poll a provider at a time. The lease lives in D1
+  (`latency_probe_leases`, migration 0084) because the claim must be atomic —
+  KV has no compare-and-set, so two acquirers could both win. Leases
+  self-expire, so a crashed holder cannot park a lane.
+
+  The server holds every lane while healthy. On the 3rd successive server
+  error (`LATENCY_SCOUT_CONSECUTIVE_ERRORS`) it **releases the lane and stops
+  fetching that provider**; the Mac scout may then acquire it. After
+  `LATENCY_MAC_TENURE_HOURS` the server preempts and runs a reclaim probe even
+  if the Mac is succeeding — the server is always preferred when it can do the
+  work. Mac grants are charged to the **same** daily counters the server
+  spends from (`latency-budget:*`, `fmp-latency:calls:key*`), so
+  `UW_LATENCY_DAILY_CAP` / `QUIVER_LATENCY_DAILY_CAP` / `FMP_LATENCY_DAILY_CAP`
+  now bound both hosts together rather than the server alone.
+
+  Scout side: `SCOUT_HOLDER_ID` (default `mac-<hostname>`) — keep it stable, or
+  a restart resets the tenure clock. The scout acquires via
+  `POST /api/ingest/probe-lease` each cycle and does **not** poll when the
+  server is unreachable (it cannot tell whether the server is already polling).
+  Operator view: `GET /api/ingest/probe-leases` shows current holder, expiry,
+  tenure, and remaining daily budget per provider.
+
 - Ingestion: `HOUSE_LIVE_SEARCH_ENABLED`, `SEED_HOUSE_URL`, `SEED_SENATE_URL`
 - Executive (OGE 278-T) watcher: `OGE_WATCH_ENABLED`, `OGE_INDEX_URL`,
-  `OGE_POLL_INTERVAL_SEC`, `OGE_MAX_VISION_BYTES`
+  `OGE_MAX_VISION_BYTES`.  Cadence is `probeSchedule` / `decideSourcePoll`
+  (weekday 15-minute coverage floor, weekend hourly like House; politeness
+  floor 60s).  `OGE_POLL_INTERVAL_SEC` is **unused** — a leftover Infisical
+  `21600` must not re-impose 6h.  Fetch is **server-first**: direct
+  `extapps2.oge.gov`, then Mac/scout `POST /fetch-oge` if
+  `OGE_RELAY_URL` / `INGEST_RELAY_URL` is set and direct fails.  House
+  bulk index is the same (direct Clerk, then `/fetch-house`).  Senate
+  eFD stays **relay-first** — Imperva 403s the box.  Failure skip
+  matches House/Senate `last_attempt`
+  (never a shorter-than-success 10-minute backoff).
 - Extraction: `VISION_PRIMARY_MODEL`, `ARBITRATION_ENABLED`,
   `ARBITRATION_MODEL`
 - OpenRouter PDF pipeline: `OPENROUTER_MODEL` (default
-  `google/gemini-3.5-flash`), `OPENROUTER_PDF_ENGINE_TEXT` (file-parser engine
+  `~google/gemini-flash-latest`, currently Gemini 3.7), `OPENROUTER_PDF_ENGINE_TEXT` (file-parser engine
   for typed/text PDFs; default `cloudflare-ai` — free markdown conversion),
   `OPENROUTER_PDF_ENGINE_SCANNED` (engine for scans read by
   non-native-vision models; default `mistral-ocr`, $2/1k pages),
@@ -132,7 +260,9 @@ budget-status polling, see Tunables & flags below)
     without touching the per-minute cascade (default on)
   - `AUTOPILOT_BACKLOG_THRESHOLD` — unresolved-review count that triggers an
     extra same-day run (default `150`; a run always triggers on the first
-    cron tick of each UTC day)
+    cron tick of each UTC day, and also on any tick with claimable
+    eligible-due docs — attempts under cap, next_attempt due, raw bytes,
+    not suppressed/terminal)
   - `AUTOPILOT_DAILY_USD_BUDGET` — per-UTC-day USD spend meter priced via the
     shared benchmark rate card; reservations happen BEFORE model calls and
     the run halts when exhausted (default `5.00`)
@@ -176,7 +306,7 @@ budget-status polling, see Tunables & flags below)
   - `DOC_CLASSIFIER_ENABLED` — model tier for ambiguous docs (default on;
     `false` = deterministic signals only, ambiguity defaults to hard_scan)
   - `DOC_CLASSIFIER_MODEL` — bottom-tier OpenRouter model for the one
-    classification call (default `google/gemini-2.5-flash-lite`)
+    classification call (default `google/gemini-3.5-flash-lite`)
   - `DOC_CLASSIFIER_PARSE_ENGINE` — OpenRouter file-parser engine for the
     classification call (default `cloudflare-ai`, the free parse)
   - `DOC_CLASS_EMPTY_SPOTCHECK_RATE` — fraction of doc_class=empty docs left
@@ -200,6 +330,12 @@ budget-status polling, see Tunables & flags below)
   Metered dollars persist per day/provider in the D1 `llm_spend` table
   (migration 0049) and surface in `GET /diagnostics` under
   `resourceGovernors.llmSpend`.
+- Webhook quarantine recovery (`delivery/targetCircuit.ts`, an `APP_SETTINGS`
+  knob with env fallback): `DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER` (default
+  off).  When truthy, the scheduled parked flush re-parks live quarantined
+  deliveries for delivery once the target circuit closes and parked headroom
+  opens.  Off, only rows whose transaction is gone or retracted are skipped,
+  and live rows wait for an explicit `POST /api/admin/delivery-requeue-quarantined`.
 
 ² `USAGE_MONITOR_ENVIRONMENT` is Infisical-tunable on its async read paths
 (admin-open check, usage telemetry); the sync local-webhook-target gate in
@@ -211,7 +347,7 @@ path, never active in production).
 | Key | Why |
 |---|---|
 | `INFISICAL_BASE_URL`, `INFISICAL_ENV`, `INFISICAL_CACHE_TTL_SECONDS`, `INFISICAL_ALLOW_ENV_FALLBACK`, `INFISICAL_APP_*`, `INFISICAL_SHARED_*` | Resolver bootstrap — cannot resolve themselves |
-| `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE` | Read synchronously in the `Sentry.withSentry` init factory before any `await` is possible |
+| `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_TRACES_SAMPLE_RATE` | Read synchronously in the `Sentry.withSentry` init factory before any `await` is possible. Live `SENTRY_DSN` is owned by Infisical (canonical) and Coolify runtime env — never a git value |
 | `USAGE_TELEMETRY_CIRCUIT_*`, `USAGE_TELEMETRY_FALLBACK_*`, `USAGE_TELEMETRY_D1_DRAIN_LIMIT`, `USAGE_TELEMETRY_DELIVERY_TIMEOUT_MS` | Operational safety limits read synchronously on the telemetry hot path; must stay available while KV/D1/Infisical are the thing degraded |
 | `D1_WRITE_OPS_PER_INVOCATION_CAP` (default 2000), `D1_WRITE_BATCH_CAP` (default 200) | Resource governor 2 (`shared/d1Budget.ts` write governor): gate the hot D1 write path synchronously — per-invocation soft cap with batch truncation + `d1_write_quarantine` markers at the known storm writers (ingestion discovery, DLQ receipts, delivery-outbox flush, extraction_runs) |
 | `DELIVERY_TARGET_FAILURE_THRESHOLD` (default 5), `DELIVERY_TARGET_DAILY_ATTEMPT_CAP` (default 50 failed attempts/target/day), `DELIVERY_TARGET_BASE_BACKOFF_SEC` (default 60, doubling, capped at 1 probe/hour), `DELIVERY_TARGET_PARKED_CAP` (default 500 parked/subscription before quarantine + alert) | Resource governor 3 (`delivery/targetCircuit.ts`): per-target outbound circuit breaker for webhook + peer-app deliveries; must stay readable mid-incident |
@@ -244,11 +380,13 @@ rejected.
 
 ## Not env at all (already hot-configurable elsewhere)
 
-- **Poll cadence / Aggressive Mode** — stored in D1 `poll_config` + KV, edited
-  live from the Admin · Cadence tab.
-- **Site logo style** — admin UI setting (KV).
-- **Bindings** (D1/KV/R2/queues) — infrastructure in `wrangler.toml`, not
-  configuration values.
+- **Poll cadence / Aggressive Mode** — stored in SQLite `poll_config` + Deno KV,
+  edited live from the Admin · Cadence tab.
+- **Site logo style** — admin UI setting (Deno KV).
+- **Runtime paths** — SQLite file, Deno KV file, R2/S3 shim, and the
+  `deno_runtime_queue` table are Coolify/compose infrastructure
+  (`app/docker-compose.yml`, `src/deno/main.ts`), not Infisical knobs.
+  `TURSO_DATABASE_URL` is the leftover env name for the local file.
 
 ## Conventions
 

@@ -304,7 +304,7 @@ function tx(id: string, ticker: string, firstSeenAt: string | null, overrides: R
     ticker,
     asset_type: 'STOCK',
     asset_type_name: 'Stock',
-    tx_type: 'P',
+    tx_type: 'B',
     amount_min: 1001,
     amount_max: 15000,
     is_option: 0,

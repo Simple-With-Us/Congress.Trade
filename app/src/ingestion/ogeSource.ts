@@ -15,17 +15,26 @@
  *    detected by diffing doc ids (INSERT OR IGNORE in the shared watcher path).
  *  - Only known executive filers are ingested (currently the President).
  *    Additional filers (VP, cabinet) are one FILERS entry away.
- *  - Filings land WEEKS after the trades (the STOCK Act 45-day clock, often
- *    exceeded with late fees), so this source polls on a slow cadence and is
- *    entirely fail-soft: an OGE outage must never affect House/Senate polling.
- *  - EIGA §105(c) restricts certain uses of these reports; Congress.Trade
+ *  - Cadence is the same adaptive probeSchedule / decideSourcePoll path as
+ *    House and Senate.  There is no measured OGE arrival-hour sample in-repo,
+ *    so the executive profile is a flat weekday window at a 15-minute
+ *    coverage floor (never 6 hours) and a 60s politeness floor.  Weekend is
+ *    hourly like House.  Do not invent peak weights.  The watcher is
+ *    fail-soft: an OGE outage must never affect House/Senate polling.
+ *    Filings can still land weeks after the trades (STOCK Act 45-day clock,
+ *    often exceeded with late fees) — that is filing latency, not a reason
+ *    to poll slowly.
+ *  - Fetch: server-first.  Direct extapps2.oge.gov, then Mac/scout
+ *    POST /fetch-oge if OGE_RELAY_URL or INGEST_RELAY_URL is set and
+ *    direct fails.  The server can reach OGE.  Senate is the exception
+ *    that stays relay-first (Imperva 403s the box).
+ *  - EIGA §105(c) restricts certain uses of these reports; congress.trade
  *    disseminates them to the general public in the site's existing
  *    educational framing, mirroring its House/Senate STOCK Act posture.
  */
 
 import type { Env } from '../shared/types.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
-import { getLastAttemptAt, getLastPollAt, setLastAttemptAt } from '../shared/config.ts';
 import type { DiscoveredFiling } from './watcher.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { CURATED_EXECUTIVES } from '../shared/executiveIdentity.ts';
@@ -47,12 +56,6 @@ export const OGE_PAS_INDEX_URL =
 export const OGE_DEFAULT_INDEX_URL = `${OGE_PRESIDENT_INDEX_URL},${OGE_PAS_INDEX_URL}`;
 
 const OGE_ORIGIN = 'https://extapps2.oge.gov';
-const DEFAULT_POLL_INTERVAL_SEC = 21_600; // 6h fallback when no interval is configured
-/** Minimum wait after a FAILED attempt before hitting the index again. Without
- *  this, an OGE outage was retried on EVERY minutely cron tick (last_poll:oge
- *  only advances on success), hammering the host 60x/hour. */
-export const OGE_FAILURE_BACKOFF_SEC = 600;
-const POLL_SOURCE = 'oge';
 
 /** Known executive filers we pin to stable EXEC-* ids (filename match).
  *  party/photoUrl are curated (the OGE index carries neither). */
@@ -241,33 +244,11 @@ async function indexUrls(env: Env): Promise<string[]> {
   }
 }
 
-/** Parse a configured interval string; >= 60s or the 6h default. */
-function parseIntervalSec(raw: string | undefined): number {
-  const n = parseInt(raw || '', 10);
-  return Number.isFinite(n) && n >= 60 ? n : DEFAULT_POLL_INTERVAL_SEC;
-}
-
-/**
- * Effective OGE poll interval: Infisical value, else the OGE_POLL_INTERVAL_SEC
- * env var, else 6h. The catch path previously returned the 6h default WITHOUT
- * consulting the env var — so any secrets-resolution failure silently ignored
- * the configured cadence (part of why production drifted to ~6h polls against
- * a 1h expectation; the other part was that no value was deployed at all —
- * wrangler.toml now ships OGE_POLL_INTERVAL_SEC explicitly).
- */
-async function pollIntervalSec(env: Env): Promise<number> {
-  try {
-    const raw = (await resolveSecret(env, 'OGE_POLL_INTERVAL_SEC')).value ?? env.OGE_POLL_INTERVAL_SEC;
-    return parseIntervalSec(raw);
-  } catch {
-    return parseIntervalSec(env.OGE_POLL_INTERVAL_SEC);
-  }
-}
-
 /** Fetch + parse the OGE index(es). Throws on HTTP failure (caller guards). */
 export async function fetchOgeExecutiveFilings(
   env: Env,
   fetchImpl: typeof fetch = fetch,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<DiscoveredFiling[]> {
   const urls = await indexUrls(env);
   const allFilings: DiscoveredFiling[] = [];
@@ -276,32 +257,44 @@ export async function fetchOgeExecutiveFilings(
 
   for (const url of urls) {
     let htmlText: string | null = null;
+    let directError: Error | null = null;
 
-    if (relayUrl) {
-      try {
-        const relayRes = await trackedFetch(`${relayUrl.replace(/\/$/, '')}/fetch-oge`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ url, responseType: 'text' }),
-        }, { service: 'filing-discovery', operation: 'fetch-executive-index-relay' }, fetchImpl);
-        if (relayRes.ok) {
-          const json = (await relayRes.json()) as { body?: string };
-          if (json.body) htmlText = json.body;
-        }
-      } catch {
-        /* Fall back to direct fetch if relay attempt fails */
-      }
-    }
-
-    if (!htmlText) {
+    try {
       const res = await trackedFetch(url, {
         headers: {
           'user-agent': 'congress.trade/0.1 (+https://congress.trade)',
           accept: 'text/html',
         },
+        signal: opts.signal,
       }, { service: 'filing-discovery', operation: 'fetch-executive-index', dynamicTarget: 'filing-source' }, fetchImpl);
-      if (!res.ok) throw new Error(`OGE index HTTP ${res.status}`);
-      htmlText = await res.text();
+      if (res.ok) {
+        htmlText = await res.text();
+      } else {
+        directError = new Error(`OGE index HTTP ${res.status}`);
+      }
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
+      directError = err instanceof Error ? err : new Error(String(err));
+    }
+
+    if (htmlText == null && relayUrl) {
+      const relayRes = await trackedFetch(`${relayUrl.replace(/\/$/, '')}/fetch-oge`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url, responseType: 'text' }),
+        signal: opts.signal,
+      }, { service: 'filing-discovery', operation: 'fetch-executive-index-relay' }, fetchImpl);
+      if (relayRes.ok) {
+        const json = (await relayRes.json()) as { body?: string };
+        if (json.body) htmlText = json.body;
+      }
+      if (htmlText == null) {
+        throw directError ?? new Error(`OGE relay HTTP ${relayRes.status}`);
+      }
+    }
+
+    if (htmlText == null) {
+      throw directError ?? new Error('OGE index fetch failed');
     }
 
     const filings = parseOgeIndex(htmlText);
@@ -317,32 +310,20 @@ export async function fetchOgeExecutiveFilings(
 }
 
 /**
- * Cadence-gated poll for the cron watcher. Returns the discovered filings, or
- * null when disabled / not yet due — the caller only persists on non-null.
+ * Fetch the OGE indexes when the watcher is enabled (or force). Cadence is
+ * NOT decided here — runWatcher calls decideSourcePoll first, same as
+ * House/Senate. A leftover Infisical OGE_POLL_INTERVAL_SEC=21600 is unused
+ * and cannot re-impose a 6h gate.
  */
 export async function pollOgeExecutive(
   env: Env,
-  now: Date,
+  _now: Date,
   fetchImpl: typeof fetch = fetch,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; signal?: AbortSignal } = {},
 ): Promise<DiscoveredFiling[] | null> {
   if (!(await ogeWatchEnabled(env)) && !opts.force) return null;
-  if (!opts.force) {
-    const last = await getLastPollAt(env, POLL_SOURCE);
-    if (last && now.getTime() - last.getTime() < (await pollIntervalSec(env)) * 1000) return null;
-    // FAILURE BACKOFF (mirrors the House/Senate pattern in runWatcher): an
-    // attempt newer than the last success means the previous poll failed
-    // somewhere between fetch and persist; wait out the backoff window instead
-    // of retrying on every minutely tick.
-    const lastAttempt = await getLastAttemptAt(env, POLL_SOURCE);
-    const lastAttemptFailed = lastAttempt && (!last || last.getTime() < lastAttempt.getTime());
-    if (lastAttemptFailed && now.getTime() - lastAttempt.getTime() < OGE_FAILURE_BACKOFF_SEC * 1000) {
-      return null;
-    }
-    await setLastAttemptAt(env, POLL_SOURCE, now);
-  }
   // Checkpoint is written by the caller (pollExecutive) only after
   // persistence succeeds, matching the House/Senate ordering — a failed
   // persist must not advance last_poll:oge and skip the next cycles.
-  return fetchOgeExecutiveFilings(env, fetchImpl);
+  return fetchOgeExecutiveFilings(env, fetchImpl, { signal: opts.signal });
 }

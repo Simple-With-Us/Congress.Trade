@@ -53,7 +53,7 @@ describe('vision LLM unreadable fields', () => {
     const tx = result.transactions[0];
     expect(tx.assetName).toBe('');
     expect(tx.txType).toBe('');
-    expect(tx.txType).not.toBe('P');
+    expect(tx.txType).not.toBe('B');
 
     const scored = scoreFields(
       tx.confidence,
@@ -75,7 +75,7 @@ describe('vision LLM unreadable fields', () => {
   it('marks unreadable boolean disclosure fields instead of silently treating them as false', () => {
     const tx = toParsedTx({
       assetName: 'Apple Inc.',
-      txType: 'P',
+      txType: 'B',
       amountRange: '$1,001 - $15,000',
       isOption: null,
       capGainsOver200: null,
@@ -105,8 +105,8 @@ describe('vision LLM unreadable fields', () => {
   });
 
   it('retains valid transaction types and exports a stable prompt version', () => {
-    expect(EXTRACTION_PROMPT_VERSION).toBe('stock-act-ptr-v4-grounded');
-    expect(toParsedTx({ txType: 'P', assetName: 'Asset' }).txType).toBe('P');
+    expect(EXTRACTION_PROMPT_VERSION).toBe('stock-act-ptr-v5-grounded');
+    expect(toParsedTx({ txType: 'B', assetName: 'Asset' }).txType).toBe('B');
     expect(toParsedTx({ txType: 'S', assetName: 'Asset' }).txType).toBe('S');
     expect(toParsedTx({ txType: 'E', assetName: 'Asset' }).txType).toBe('E');
   });
