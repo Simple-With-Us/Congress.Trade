@@ -32,7 +32,7 @@ The Python worker mirrors the row fill, the month repair, the owner aliases, and
 
 ## Verification
 
-`cd app && npm run typecheck` passed.  `cd app && npm test` passed, 5459 tests, including 19 in `houseGridForm.test.ts`.  `services/scan-cpu-worker` pytest passed, 22 tests, including 5 in `test_gridform.py`.
+`cd app && npm run typecheck` passed.  `cd app && npm test` passed, 5459 tests, including 19 in `houseGridForm.test.ts`.  `services/scan-cpu-worker` pytest passed, 25 tests, including 5 in `test_gridform.py`.
 
 Scored again on H-2026-9116399.  The PDF stays out of the repo.  The 275 comparison rows are the names published for that filing.  The same aligner scores the 2026-11-11 reader at 143/275 on those names.  The 144/275 in the 2026-11-11 note used the original hand file, which is not in the repo.  Alignment is per page and order-preserving.  A pair is kept when the type agrees, or when the asset and date identify the same row.  Field hits below are on the aligned pairs.  All-five recall uses all 275 rows.  A blank owner on both sides counts as an owner hit.
 

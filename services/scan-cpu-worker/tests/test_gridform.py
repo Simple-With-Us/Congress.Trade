@@ -14,10 +14,15 @@ from gridform import (  # noqa: E402
     TYPE_P,
     TYPE_PARTIAL,
     TYPE_S,
+    ClassifiedMarks,
     OcrBox,
     classify_mark_scores,
+    clean_grid_asset_name,
     fit_column_lines,
     read_grid_page,
+    reading_order,
+    row_bands,
+    row_confidence,
     x_template_for_fit,
 )
 
@@ -117,3 +122,40 @@ def test_rendered_page_classifies_x_marks_and_refuses_empty_boxes():
     assert typed == 1
     assert held == 2
     assert typed + held == len(read)
+
+
+def test_reading_order_and_form_splits_match_the_ts_cleaner():
+    boxes = [
+        OcrBox(80, 10, 120, 20, "INC", 0.9),
+        OcrBox(10, 11, 70, 21, "WALMART", 0.9),
+    ]
+    assert reading_order(boxes) == "WALMART INC"
+    assert clean_grid_asset_name("WALMARTINC CMN") == "WALMART INC CMN"
+    assert clean_grid_asset_name("EATONCORPPLCCMN") == "EATON CORP PLC CMN"
+    assert clean_grid_asset_name("WELLS FARGO FINANCE LLCLINKED TO SQPSODINDEX") == "WELLS FARGO FINANCE LLC LINKED TO S&P 500 INDEX"
+    assert clean_grid_asset_name("SP 500 SP FUND") == "S&P 500 SP FUND"
+    assert clean_grid_asset_name("SP FUND SP 500") == "SP FUND S&P 500"
+    assert clean_grid_asset_name("PEPSICO INC CMN") == "PEPSICO INC CMN"
+
+
+def test_fallback_confidence_includes_asset_text():
+    marks = ClassifiedMarks("B", False, False, None, None, None, "ok", "unmarked", 0.5, 0.0)
+    low = row_confidence(marks, 0.0, False, "APPLE INC")
+    high = row_confidence(marks, 1.0, False, "APPLE INC")
+    assert abs((high - low) - 0.08) < 1e-9
+    assert row_confidence(marks, 0.5, False, "A") == low
+
+
+def test_gray_halo_stays_under_the_150_band_cutoff():
+    xs = [0, 40, 200, 260, 320, 380, 440, 500, 560, 620, 680, 740, 800]
+    gray = np.full((300, 900), 255, np.uint8)
+    for y in (40, 110, 180):
+        gray[y, 500:800] = 0
+    lattice = list(range(500, 800, 4))[:66]
+    for y in range(300):
+        if y in (40, 110, 180):
+            continue
+        gray[y, lattice] = 160
+    bands, section_bars = row_bands(gray, xs)
+    assert section_bars == 0
+    assert len(bands) == 2

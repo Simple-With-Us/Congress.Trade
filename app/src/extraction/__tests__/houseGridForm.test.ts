@@ -420,6 +420,8 @@ describe('grid row, owner, and date corrections', () => {
     expect(cleanGridAssetName('COOPER COSINC/THECMN')).toBe('COOPER COS INC THE CMN');
     expect(cleanGridAssetName('GRAPHIC PACKAGING KLDG CO CMN')).toBe('GRAPHIC PACKAGING HLDG CO CMN');
     expect(cleanGridAssetName('ROYAL CARIBBEAN GROUP ISIN LROOO8862868')).toBe('ROYAL CARIBBEAN GROUP ISIN LR0008862868');
+    expect(cleanGridAssetName('SP 500 SP FUND')).toBe('S&P 500 SP FUND');
+    expect(cleanGridAssetName('SP FUND SP 500')).toBe('SP FUND S&P 500');
   });
 
   it('keeps a parenthetical ticker and a bare ticker written after two spaces', () => {
