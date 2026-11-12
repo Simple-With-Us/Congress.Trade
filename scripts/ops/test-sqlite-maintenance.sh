@@ -204,6 +204,22 @@ else
   echo "ok   missing database is not created"
 fi
 
+maint bash "${SCRIPT}" --lock-file "${LOCK}" --json --db "${missing}"
+expect_code 1 "missing database json exits 1"
+assert_not_contains "$(combined)" "unbound variable" "missing database does not abort in append_row"
+python3 - "${missing}" "${MAINT_OUT}" <<'PY'
+import json, sys
+path, raw = sys.argv[1:]
+doc = json.loads(raw)
+row = doc["databases"][0]
+assert row["path"] == path
+assert row["error"] == "missing"
+assert row["vacuum"]["requested"] is False
+assert row["vacuum"]["ran"] is False
+assert row["vacuum"]["reason"] is None
+print("ok   missing database json names the error")
+PY
+
 db="$(new_db one)"
 file_bytes="$(stat_field "${db}" file_bytes)"
 wal_bytes="$(stat_field "${db}" wal_bytes)"
@@ -451,6 +467,27 @@ else
   echo "ok   vacuum shrinks freelist ${free_before} -> ${free_after}"
 fi
 assert_eq "$("${REAL_SQLITE}" "${db_v}" "SELECT v FROM t WHERE id=300;")" "${kept_v}" "vacuum keeps the row"
+page_after="$("${REAL_SQLITE}" "${db_v}" "PRAGMA page_size;")"
+fresh_marker "${marker}"
+maint SQLITE_MAINT_ALLOW_DEPLOY_OVERRIDE=1 SQLITE_MAINT_DEPLOY_STATE=idle \
+  SQLITE_MAINT_ALLOW_FREE_OVERRIDE=1 SQLITE_MAINT_FREE_BYTES="${need}" \
+  bash "${SCRIPT}" --lock-file "${LOCK}" --json --db "${db_v}" --vacuum \
+  --backup-marker "${marker}" --busy-timeout-ms 60000
+expect_code 0 "json vacuum exits 0"
+python3 - "${db_v}" "${page_after}" "${MAINT_OUT}" <<'PY'
+import json, sys
+path, page_size, raw = sys.argv[1:]
+doc = json.loads(raw)
+row = doc["databases"][0]
+assert row["path"] == path
+assert row["error"] is None
+assert row["page_size"] == int(page_size)
+assert row["reclaimable_bytes"] == row["freelist_count"] * row["page_size"]
+assert row["vacuum"]["ran"] is True
+assert row["vacuum"]["post_freelist_count"] == 0
+assert row["vacuum"]["post_reclaimable_bytes"] == 0
+print("ok   json vacuum keeps the pre-run page size")
+PY
 if [[ ! -f "${db_v}" ]]; then
   echo "FAIL vacuum removed the database file"
   fail=1

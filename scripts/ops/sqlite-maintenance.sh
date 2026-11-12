@@ -535,11 +535,11 @@ process_one() {
   local db="$1"
   local file_bytes wal_bytes shm_bytes row page_size page_count freelist reclaim
   local ck_skipped="" ck_busy="" ck_log="" ck_ckpt="" sql out last
-  local vac_reason="" vac_ran=0 post_free="" post_reclaim="" guard guard_line free_note free_seen need_seen chk
+  local vac_reason="" vac_ran=0 post_free="" post_reclaim="" post_page_size="" guard guard_line free_note free_seen need_seen chk
 
   if [[ ! -f "$db" ]]; then
     say "sqlite-maintenance: error missing db=$db"
-    append_row "$db" "missing" "" "" "" "" "" "" "" "" "" "" "" "0" "" ""
+    append_row "$db" "missing" "" "" "" "" "" "" "" "" "" "" "" "" "0" "" ""
     raise_code 1
     return 0
   fi
@@ -623,7 +623,8 @@ process_one() {
     else
       say "sqlite-maintenance: vacuum start mode=plain db=$db exclusive_lock=1 note=writers-block-for-the-rewrite"
       sql=$(printf 'PRAGMA busy_timeout=%s; VACUUM;' "$BUSY_MS")
-      if ! run_sqlite "$db" "$sql" "$VACUUM_TIMEOUT" 1; then
+      # busy_timeout prints its value.  Capture it so --json stays one document.
+      if ! out=$(run_sqlite "$db" "$sql" "$VACUUM_TIMEOUT" 1); then
         vac_reason="failed"
         say "sqlite-maintenance: vacuum failed db=$db"
         raise_code 5
@@ -643,12 +644,12 @@ process_one() {
             raise_code 5
           else
             post_free=$(printf '%s\n' "$row" | sed -n '3p' | tr -d '[:space:]')
-            page_size=$(printf '%s\n' "$row" | sed -n '1p' | tr -d '[:space:]')
-            if ! is_uint "$post_free" || ! is_uint "$page_size"; then
+            post_page_size=$(printf '%s\n' "$row" | sed -n '1p' | tr -d '[:space:]')
+            if ! is_uint "$post_free" || ! is_uint "$post_page_size"; then
               vac_reason="pragma-parse"
               raise_code 5
             else
-              post_reclaim=$((post_free * page_size))
+              post_reclaim=$((post_free * post_page_size))
               vac_ran=1
               vac_reason=""
               say "sqlite-maintenance: vacuum ok db=$db freelist_count=$post_free reclaimable_bytes=$post_reclaim"
