@@ -79,6 +79,25 @@ assert_contains "$last_line" '"cpus":8' "sample records cpu count"
 assert_contains "$last_line" '"congress-app"' "docker stub container name present"
 assert_contains "$last_line" '"steal_pct"' "sample includes steal_pct"
 
+# --- docker CLI present but daemon down (must not double-emit [] under pipefail)
+FAKE_BIN="$TMP/fakebin"
+mkdir -p "$FAKE_BIN"
+printf '#!/bin/sh\nexit 1\n' >"$FAKE_BIN/docker"
+chmod +x "$FAKE_BIN/docker"
+LOG_DIR="$TMP/log-down"
+STATE_DIR="$TMP/state-down"
+SAMPLES_FILE="$LOG_DIR/samples.jsonl"
+PROC_STAT_STATE="$STATE_DIR/proc-stat.prev"
+LOADAVG_PATH="${FIXTURES}/loadavg.txt"
+CPU_COUNT_OVERRIDE=8
+unset DOCKER_STATS_STUB
+rm -rf "$LOG_DIR" "$STATE_DIR"
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+PROC_STAT_PATH="${FIXTURES}/proc-stat-t0.txt"
+PATH="$FAKE_BIN:$PATH" sample_once
+down_line="$(tail -1 "$SAMPLES_FILE")"
+assert_contains "$down_line" '"containers":[]' "daemon-down still writes valid sample json"
+
 # --- rotation (age + size) ---------------------------------------------------
 python3 - <<PY
 import json, os, time

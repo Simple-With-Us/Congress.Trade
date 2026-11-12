@@ -111,8 +111,16 @@ top_docker_containers_json() {
     return
   fi
   # docker stats can be slow; cap wait. Skip quietly if daemon down.
-  docker stats --no-stream --format '{{.Name}}	{{.CPUPerc}}' 2>/dev/null \
-    | python3 -c '
+  local stats_out
+  if ! stats_out="$(docker stats --no-stream --format '{{.Name}}	{{.CPUPerc}}' 2>/dev/null)"; then
+    printf '[]'
+    return
+  fi
+  if [[ -z "$stats_out" ]]; then
+    printf '[]'
+    return
+  fi
+  printf '%s\n' "$stats_out" | python3 -c '
 import sys, re, json
 rows = []
 for line in sys.stdin:
@@ -130,7 +138,7 @@ for line in sys.stdin:
 rows.sort(reverse=True)
 out = [{"name": n, "cpu_pct": round(c, 2)} for c, n in rows[:5]]
 print(json.dumps(out))
-' || printf '[]'
+'
 }
 
 build_sample_json() {
