@@ -9,7 +9,7 @@ Congress.Trade iOS was reporting 502s on idempotent GETs while Coolify swapped t
 - `clients/ios/CongressTrade/APIClient.swift` — GET retry loop, capped Retry-After, cancellation mapped to `APIError`.
 - `clients/ios/CongressTrade/SentryTelemetry.swift` — drop per-attempt failed-request events that carry the retry header, and record one warning when the budget is spent.
 - `clients/ios/CongressTrade/Store/CongressTradeStore.swift` and `Views/Feed/PoliticianDetailView.swift` — do not run a second retry loop over errors the client already exhausted.
-- `scripts/ops/ct-reattach-proxy.sh` — alias before the route swap. A failed attach leaves a plain route unwritten.
+- `scripts/ops/ct-reattach-proxy.sh` — alias before the route swap. A failed attach leaves a plain route unwritten.  A failed re-alias puts the container back on the network without the alias.
 - `scripts/ops/test-deploy-overlap.sh` — offline coverage for that order and for a failed attach.
 
 ## Verification

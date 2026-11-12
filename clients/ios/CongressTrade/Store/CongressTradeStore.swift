@@ -918,7 +918,7 @@ final class CongressTradeStore: ObservableObject {
         let skipRising = selectedTimeRange == .all
 
         do {
-            try await withRetry {
+            try await withRetry(method: "GET") {
                 try await self.loadTrendsFanout(
                     analyticsWindow: analyticsWindow,
                     partyParam: partyParam,
@@ -1024,10 +1024,11 @@ final class CongressTradeStore: ObservableObject {
         trendsSnapshotRevision += 1
     }
 
-    /// Shared retry for Trades and Trends GETs. Deploy-window statuses and
-    /// the transport codes `TransientRetryPolicy` already retried are not
-    /// repeated here. 429, other 5xx, and offline errors still are.
-    private func withRetry<T>(_ work: () async throws -> T) async throws -> T {
+    /// Shared retry for Trades and Trends. `method` is the verb `work`
+    /// actually sends. The client only retries GETs, so a POST that fails
+    /// with 502 must still use this loop. Deploy-window statuses the client
+    /// already retried are not repeated. 429, other 5xx, and offline errors still are.
+    private func withRetry<T>(method: String, _ work: () async throws -> T) async throws -> T {
         var attempt = 0
         while true {
             do {
@@ -1037,7 +1038,7 @@ final class CongressTradeStore: ObservableObject {
                 // APIClient already spent the deploy-window budget on these
                 // GETs. Looping again multiplies one Trends fan-out into nine
                 // summary calls before the notice appears.
-                if TransientRetryPolicy.shouldRetry(error: error, method: "GET") {
+                if TransientRetryPolicy.shouldRetry(error: error, method: method) {
                     throw error
                 }
                 guard error.isRetryable, attempt < Self.maxAttemptsPerPage else { throw error }
@@ -1049,7 +1050,7 @@ final class CongressTradeStore: ObservableObject {
     }
 
     private func fetchPageWithRetry(_ query: FeedQuery) async throws -> ClientFeedResponse {
-        try await withRetry {
+        try await withRetry(method: "GET") {
             try await api.feed(query: query)
         }
     }

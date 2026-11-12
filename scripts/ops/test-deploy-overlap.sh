@@ -190,15 +190,28 @@ cat > "$stubbin/docker" <<'STUBEOF'
 # STUB_MODE=app-unaliased: replacement up, carries no aliases yet.
 # STUB_MODE=empty:         no containers at all (mid-swap gap).
 # STUB_MODE=connect-fails: replacement up, but network connect fails.
+# STUB_MODE=realias-fails: on the network under another alias; the aliased
+#                          reconnect fails and a plain reconnect must follow.
 mode="${STUB_MODE:-app-unaliased}"
+log_action() {
+  [[ -n "${STUB_ACTION_LOG:-}" ]] && printf '%s\n' "$1" >> "$STUB_ACTION_LOG"
+}
 if [[ "$1" == "ps" ]]; then
-  if [[ "$mode" == "app-unaliased" || "$mode" == "connect-fails" ]]; then
+  if [[ "$mode" == "app-unaliased" || "$mode" == "connect-fails" || "$mode" == "realias-fails" ]]; then
     printf 'congress-app-abc123\n'
   fi
   exit 0
 fi
 if [[ "$1" == "inspect" ]]; then
-  printf '\n'
+  if [[ "$mode" == "realias-fails" ]]; then
+    printf 'other-alias\n'
+  else
+    printf '\n'
+  fi
+  exit 0
+fi
+if [[ "$1" == "network" && "$2" == "disconnect" ]]; then
+  log_action disconnect
   exit 0
 fi
 if [[ "$1" == "network" && "$2" == "connect" ]]; then
@@ -213,6 +226,14 @@ if [[ "$1" == "network" && "$2" == "connect" ]]; then
   fi
   if [[ "$mode" == "connect-fails" ]]; then
     exit 1
+  fi
+  if [[ "$mode" == "realias-fails" ]]; then
+    if [[ "$3" == "--alias" ]]; then
+      log_action aliased-connect-failed
+      exit 1
+    fi
+    log_action plain-reconnect
+    exit 0
   fi
   exit 0
 fi
@@ -255,6 +276,20 @@ assert_eq "$rc" "0" "reattach exits 0 when alias attach fails"
 assert_eq "$(cat "$route_file")" "$(bash "$REATTACH" --render hold)" "failed attach does not flip a hold route to plain"
 assert_contains "$(cat "$env_tmp/reattach-out3.txt")" "alias attach failed" "failed attach is logged"
 assert_not_contains "$(cat "$env_tmp/reattach-out3.txt")" "route file updated" "failed attach does not log a route swap"
+
+# Re-alias disconnects first. If the aliased connect fails, the container
+# must be put back on the network without the alias, and the hold route stays.
+bash "$REATTACH" --render hold > "$route_file"
+action_log="$env_tmp/actions.log"
+: > "$action_log"
+rc=0
+STUB_MODE=realias-fails STUB_ACTION_LOG="$action_log" \
+  PATH="$stubbin:$PATH" DYNAMIC_FILE="$route_file" STAGE_DIR="$env_tmp" \
+  bash "$REATTACH" > "$env_tmp/reattach-out4.txt" 2>&1 || rc=$?
+assert_eq "$rc" "0" "reattach exits 0 when re-alias connect fails"
+assert_eq "$(cat "$action_log")" "$(printf '%s\n' disconnect aliased-connect-failed plain-reconnect)" "failed re-alias restores network membership"
+assert_eq "$(cat "$route_file")" "$(bash "$REATTACH" --render hold)" "failed re-alias does not flip the hold route"
+assert_contains "$(cat "$env_tmp/reattach-out4.txt")" "restored" "restore without alias is logged"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "FAILED"

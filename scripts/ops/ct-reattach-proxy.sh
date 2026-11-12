@@ -251,6 +251,13 @@ else
       echo "re-aliased $APP on $NETWORK as $ALIAS (was: $current_aliases)"
     else
       echo "alias attach failed for $APP on $NETWORK"
+      # disconnect already removed $APP from $NETWORK. Put it back without
+      # the alias so a failed re-alias does not leave the container dark.
+      if docker network connect "$NETWORK" "$APP"; then
+        echo "restored $APP on $NETWORK without alias"
+      else
+        echo "restore attach failed for $APP on $NETWORK"
+      fi
     fi
   else
     alias_ready=1

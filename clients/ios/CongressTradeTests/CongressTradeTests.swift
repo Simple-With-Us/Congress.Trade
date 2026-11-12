@@ -1094,6 +1094,9 @@ final class CongressTradeTests: XCTestCase {
             2)
         XCTAssertEqual(TransientRetryPolicy.delay(for: server502, retryIndex: 0), 1)
         XCTAssertEqual(TransientRetryPolicy.delay(for: server502, retryIndex: 1), 2)
+        let zeroWait = APIError.server(status: 502, message: "Bad Gateway", retryAfterSeconds: 0)
+        XCTAssertEqual(TransientRetryPolicy.delay(for: zeroWait, retryIndex: 0), 1)
+        XCTAssertEqual(TransientRetryPolicy.delay(for: zeroWait, retryIndex: 1), 2)
     }
 
     /// Pins the beforeSend drop predicate: only marked GETs to our origin with a deploy-window status drop.

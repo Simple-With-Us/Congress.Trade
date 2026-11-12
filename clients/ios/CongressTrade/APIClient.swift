@@ -1218,10 +1218,11 @@ struct TransientRetryPolicy: Sendable {
         }
     }
 
-    /// Backoff before retry number `retryIndex` (0-based): the server's
-    /// `Retry-After` capped at 5s when present, else 1s then 2s.
+    /// Backoff before retry number `retryIndex` (0-based). A positive
+    /// `Retry-After` is honored up to 5s. Zero is not an immediate burst:
+    /// it uses the same 1s then 2s schedule as a missing header.
     static func delay(for error: APIError, retryIndex: Int) -> TimeInterval {
-        if let retryAfter = error.retryAfterSeconds, retryAfter >= 0 {
+        if let retryAfter = error.retryAfterSeconds, retryAfter > 0 {
             return min(TimeInterval(retryAfter), maxRetryAfterDelay)
         }
         return retryIndex <= 0 ? 1 : 2
