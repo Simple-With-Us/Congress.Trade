@@ -47,11 +47,34 @@ import {
   sanitizeEfdTransportError,
   senateEfdTransportScrubSecrets,
 } from './senateEdgeDeny.ts';
+import { WATCHER_SOURCE_IO_BUDGET_MS } from './watcherSourceIo.ts';
 
 /** Backoff between direct Senate eFD attempts when direct is the only egress. */
 /** Keep direct retry waits under pollSenate's 7s abort when direct is the proxy's fallback. */
 export const SENATE_EFD_DIRECT_BACKOFF_MS = [0, 1_000, 2_000];
 export const SENATE_EFD_DIRECT_BACKOFF_WITH_PROXY_MS = [0, 1_000];
+/** In-tick retries on the residential proxy leg before direct fallback (CT-2498). */
+export const SENATE_PROXY_EGRESS_BACKOFF_MS = [0, 750, 2_000];
+/**
+ * Reserve left on the shared pollSenate source budget so the direct fallback
+ * leg still gets a direct attempt after proxy retries bail out.
+ */
+export const SENATE_DIRECT_FALLBACK_MIN_BUDGET_MS = 1_000;
+
+function watcherSourceIoBudgetRemainingMs(signal: AbortSignal | undefined, startedAtMs: number): number | undefined {
+  if (!signal) return undefined;
+  if (signal.aborted) return 0;
+  return Math.max(0, WATCHER_SOURCE_IO_BUDGET_MS - (Date.now() - startedAtMs));
+}
+
+export function proxyRetryFitsSourceBudget(
+  remainingMs: number | undefined,
+  waitMs: number,
+  answerTimeoutMs: number,
+): boolean {
+  if (remainingMs === undefined) return true;
+  return remainingMs >= waitMs + answerTimeoutMs + SENATE_DIRECT_FALLBACK_MIN_BUDGET_MS;
+}
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err ?? '');
@@ -184,6 +207,77 @@ export interface SenateEfdEgressLeg {
   fallback: boolean;
 }
 
+/** The eFD client that actually returned rows, written onto source_attempts. */
+export const SENATE_EFD_TRANSPORTS = ['http-proxy', 'http-direct', 'browser-proxy', 'browser-direct'] as const;
+export type SenateEfdTransport = (typeof SENATE_EFD_TRANSPORTS)[number];
+
+export interface SenateEfdTransportReceipt {
+  transport: SenateEfdTransport;
+  /** True when an earlier HTTP leg failed and this transport is the recovery. */
+  fallback: boolean;
+}
+
+const SENATE_EGRESS = Symbol('senateEgress');
+const SENATE_TRANSPORT = Symbol('senateEfdTransport');
+
+function tagSenateEgress(err: unknown, egress: SenateEfdEgressLeg['egress']): void {
+  if (err !== null && typeof err === 'object') {
+    Object.defineProperty(err, SENATE_EGRESS, { value: egress, enumerable: false });
+  }
+}
+
+function senateEgressOf(err: unknown): SenateEfdEgressLeg['egress'] | undefined {
+  if (err === null || typeof err !== 'object' || !(SENATE_EGRESS in err)) return undefined;
+  const value = (err as { [SENATE_EGRESS]?: unknown })[SENATE_EGRESS];
+  return value === 'proxy' || value === 'direct' ? value : undefined;
+}
+
+export function withSenateEfdTransport(
+  filings: SenateFiling[],
+  receipt: SenateEfdTransportReceipt,
+): SenateFiling[] {
+  Object.defineProperty(filings, SENATE_TRANSPORT, { value: receipt, enumerable: false });
+  return filings;
+}
+
+export function readSenateEfdTransport(filings: readonly SenateFiling[]): SenateEfdTransportReceipt | null {
+  const receipt = (filings as unknown as { [SENATE_TRANSPORT]?: SenateEfdTransportReceipt })[SENATE_TRANSPORT];
+  if (!receipt) return null;
+  if (!(SENATE_EFD_TRANSPORTS as readonly string[]).includes(receipt.transport)) return null;
+  return receipt;
+}
+
+/** `transport=browser-direct fallback` — the success note stored on source_attempts.error. */
+export function formatSenateEfdTransportNote(receipt: SenateEfdTransportReceipt | null): string | null {
+  if (!receipt) return null;
+  return `transport=${receipt.transport}${receipt.fallback ? ' fallback' : ''}`;
+}
+
+export function parseSenateEfdTransportNote(note: string | null | undefined): SenateEfdTransport | null {
+  if (!note?.startsWith('transport=')) return null;
+  const token = note.slice('transport='.length).replace(/ fallback$/, '');
+  return (SENATE_EFD_TRANSPORTS as readonly string[]).includes(token) ? token as SenateEfdTransport : null;
+}
+
+/**
+ * Where a browser fallback should egress, or null when this failure is not
+ * one the browser is allowed to recover.
+ *
+ * A proxy that never answered (`SenateProxyEgressError`) is not reachable,
+ * so the browser goes direct.  An Akamai edge deny is an HTTP answer: when
+ * that answer came through the proxy, the proxy is reachable and the browser
+ * uses it; otherwise the browser goes direct.
+ */
+export function senateBrowserFallbackRoute(
+  err: unknown,
+  configuredProxyUrl: string | undefined,
+): { proxyUrl: string | undefined } | null {
+  if (err instanceof SenateProxyEgressError) return { proxyUrl: undefined };
+  if (!isSenateEdgeDeniedError(err)) return null;
+  if (senateEgressOf(err) === 'proxy' && configuredProxyUrl) return { proxyUrl: configuredProxyUrl };
+  return { proxyUrl: undefined };
+}
+
 /**
  * Run `run` through the operator-configured residential proxy first.  Direct
  * datacenter egress is only a fallback for when the proxy never answers: a
@@ -215,17 +309,39 @@ export async function withSenateEfdEgress<T>(
   const proxied = explicitProxy ? senateProxyFetch(explicitProxy, baseFetch) : undefined;
   let proxyErr: unknown = null;
   if (proxied) {
-    const leg = guardProxyLeg(
-      proxied,
-      boundedPositiveInt(opts.proxyFirstAnswerTimeoutMs, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS, SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS),
+    const answerTimeoutMs = boundedPositiveInt(
+      opts.proxyFirstAnswerTimeoutMs,
+      SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
+      SENATE_PROXY_FIRST_ANSWER_TIMEOUT_MS,
     );
-    try {
-      return await run(leg.fetchImpl, { egress: 'proxy', fallback: false });
-    } catch (err) {
-      if (!leg.unreachable(err, opts.signal)) throw err;
-      proxyErr = err;
-    } finally {
-      leg.dispose();
+    const sourceBudgetStartedAt = Date.now();
+    proxyLoop: for (let attempt = 0; attempt < SENATE_PROXY_EGRESS_BACKOFF_MS.length; attempt++) {
+      const waitMs = SENATE_PROXY_EGRESS_BACKOFF_MS[attempt] ?? 0;
+      const budgetRemaining = watcherSourceIoBudgetRemainingMs(opts.signal, sourceBudgetStartedAt);
+      if (!proxyRetryFitsSourceBudget(budgetRemaining, waitMs, answerTimeoutMs)) {
+        break proxyLoop;
+      }
+      if (waitMs > 0) {
+        try {
+          await delay(waitMs, opts.signal);
+        } catch (err) {
+          if (proxyErr !== null) break proxyLoop;
+          throw err;
+        }
+      }
+      const leg = guardProxyLeg(proxied, answerTimeoutMs);
+      try {
+        return await run(leg.fetchImpl, { egress: 'proxy', fallback: false });
+      } catch (err) {
+        if (!leg.unreachable(err, opts.signal)) {
+          tagSenateEgress(err, 'proxy');
+          throw err;
+        }
+        proxyErr = err;
+        if (attempt + 1 < SENATE_PROXY_EGRESS_BACKOFF_MS.length) continue proxyLoop;
+      } finally {
+        leg.dispose();
+      }
     }
   }
 
@@ -250,6 +366,7 @@ export async function withSenateEfdEgress<T>(
       if (proxyErr && !opts.signal?.aborted) {
         throw new SenateProxyEgressError(proxyErr, err, transportScrubSecrets);
       }
+      tagSenateEgress(err, 'direct');
       throw err;
     }
   }
@@ -582,12 +699,11 @@ export interface FetchSenatePtrFilingsOptions {
   /** Cancels active source I/O when the enclosing watcher tick reaches its deadline. */
   signal?: AbortSignal;
   /**
-   * Run the eFD flow through a real Chromium page (senateBrowserFetch.ts)
-   * instead of plain HTTP.  Opt-in; default off (env SENATE_EFD_BROWSER_FETCH).
-   * The plain-HTTP flow has been edge-denied at the agreement POST since
-   * 2026-10-23 (CT-2442), and the browser is the only automated client class
-   * observed to pass.  Requires the playwright package and a Chromium build
-   * in the deployment image.
+   * EXPERIMENTAL.  Run the eFD flow through a real Chromium page
+   * (senateBrowserFetch.ts) instead of plain HTTP.  Opt-in; default off
+   * (env SENATE_EFD_BROWSER_FETCH).  Server-side Chromium from the Hetzner
+   * box is unverified against Akamai.  The browser path that works is the
+   * Mac efd-fetcher.  Requires playwright and a Chromium build in the image.
    */
   browserFetch?: boolean;
   /**
@@ -603,6 +719,17 @@ export interface FetchSenatePtrFilingsOptions {
    * or a managed browser, so headless is unverified against the edge.
    */
   browserHeadless?: boolean;
+  /**
+   * EXPERIMENTAL and off by default (env SENATE_EFD_BROWSER_FALLBACK).
+   * After HTTP egress fails because the residential proxy never answered, or
+   * because the leg that did answer was an Akamai edge deny, try
+   * senateBrowserFetch.  The browser uses the proxy only when that proxy
+   * returned the HTTP answer, and goes direct when the proxy was unreachable.
+   * Unverified against Akamai from the Hetzner IP.  The Mac efd-fetcher is
+   * the browser path.  SENATE_EFD_BROWSER_FETCH still means "browser is the
+   * only transport" and wins when both are set.
+   */
+  browserFallback?: boolean;
 }
 
 /** KV key holding the cached, agreement-accepted eFD session. Shared with the
@@ -798,6 +925,52 @@ function parseDataTablesCount(raw: unknown): number | null {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 }
 
+function envFlagTrue(name: string): boolean {
+  return typeof process !== 'undefined' && process.env?.[name] === 'true';
+}
+
+function senateBrowserLaunchOptions(
+  opts: FetchSenatePtrFilingsOptions,
+  proxyUrl: string | undefined,
+): { hideAutomation: boolean; headless: boolean; proxyUrl: string | undefined } {
+  return {
+    hideAutomation: opts.hideAutomation ?? envFlagTrue('SENATE_EFD_HIDE_AUTOMATION'),
+    headless: opts.browserHeadless ??
+      (typeof process !== 'undefined' ? process.env?.SENATE_EFD_BROWSER_HEADLESS !== 'false' : true),
+    proxyUrl,
+  };
+}
+
+/**
+ * Run the eFD flow inside Chromium.  The import stays dynamic because
+ * playwright is an optional deployment dependency: the default HTTP path
+ * must not load it.  This is not a circular import.
+ */
+async function runSenateBrowserFlow(
+  opts: FetchSenatePtrFilingsOptions,
+  proxyUrl: string | undefined,
+  fallback: boolean,
+  runFlow: (fetchImpl: typeof fetch, leg: SenateEfdEgressLeg) => Promise<SenateFiling[]>,
+): Promise<SenateFiling[]> {
+  const { createSenateBrowserFetch } = await import('./senateBrowserFetch.ts');
+  const browser = await createSenateBrowserFetch(senateBrowserLaunchOptions(opts, proxyUrl));
+  try {
+    // fallback: true on the leg keeps the browser session out of the shared
+    // KV cache.  Its cookie header cannot be replayed by plain HTTP, and the
+    // browser context is rebuilt on every run.
+    const filings = await runFlow(browser.fetchImpl, {
+      egress: proxyUrl ? 'proxy' : 'direct',
+      fallback: true,
+    });
+    return withSenateEfdTransport(filings, {
+      transport: proxyUrl ? 'browser-proxy' : 'browser-direct',
+      fallback,
+    });
+  } finally {
+    await browser.close();
+  }
+}
+
 /**
  * Run the full efdsearch flow and return discovered PTR filings submitted within
  * the [since, now] window. `since` defaults to 7 days ago.
@@ -941,28 +1114,53 @@ export async function fetchSenatePtrFilings(
   return parseSenateRows(rows);
   };
 
-  const browserFetchEnabled = opts.browserFetch ??
-    (typeof process !== 'undefined' && process.env?.SENATE_EFD_BROWSER_FETCH === 'true');
+  const browserFetchEnabled = opts.browserFetch ?? envFlagTrue('SENATE_EFD_BROWSER_FETCH');
+  const configuredProxy = resolveExplicitSenateProxyUrl(opts);
   if (browserFetchEnabled) {
-    const { createSenateBrowserFetch } = await import('./senateBrowserFetch.ts');
-    const browser = await createSenateBrowserFetch({
-      hideAutomation: opts.hideAutomation ??
-        (typeof process !== 'undefined' && process.env?.SENATE_EFD_HIDE_AUTOMATION === 'true'),
-      headless: opts.browserHeadless ??
-        (typeof process !== 'undefined' ? process.env?.SENATE_EFD_BROWSER_HEADLESS !== 'false' : true),
-      proxyUrl: resolveExplicitSenateProxyUrl(opts),
-    });
-    try {
-      // The browser owns its egress and its cookie jar, so the egress legs do
-      // not apply.  fallback: true keeps the browser-negotiated session out
-      // of the shared KV cache: its cookie header cannot be replayed by the
-      // plain-HTTP path, and the browser context is rebuilt on every run.
-      return await runFlow(browser.fetchImpl, { egress: 'direct', fallback: true });
-    } finally {
-      await browser.close();
-    }
+    // Browser is the only transport.  It uses the configured proxy when one
+    // is set; the HTTP egress legs do not run.
+    return await runSenateBrowserFlow(opts, configuredProxy, false, runFlow);
   }
 
-  return await withSenateEfdEgress(opts, fetchImpl, runFlow);
+  const httpFlow = (effectiveFetch: typeof fetch, leg: SenateEfdEgressLeg) =>
+    runFlow(effectiveFetch, leg).then((filings) => withSenateEfdTransport(filings, {
+      transport: leg.egress === 'proxy' ? 'http-proxy' : 'http-direct',
+      fallback: leg.fallback,
+    }));
+
+  const browserFallbackEnabled = opts.browserFallback ?? envFlagTrue('SENATE_EFD_BROWSER_FALLBACK');
+  if (!browserFallbackEnabled) {
+    return await withSenateEfdEgress(opts, fetchImpl, httpFlow);
+  }
+
+  try {
+    return await withSenateEfdEgress(opts, fetchImpl, httpFlow);
+  } catch (err) {
+    if (opts.signal?.aborted) throw err;
+    const route = senateBrowserFallbackRoute(err, configuredProxy);
+    if (!route) throw err;
+    try {
+      const filings = await runSenateBrowserFlow(opts, route.proxyUrl, true, runFlow);
+      console.warn(
+        'senateSource: HTTP egress failed; senate browser fallback reached eFD:',
+        sanitizeEfdTransportError(err, senateEfdTransportScrubSecrets(configuredProxy)),
+      );
+      return filings;
+    } catch (browserErr) {
+      // Cancellation must retain its own classification, never become an
+      // earlier edge-deny/proxy failure that triggers backoff.
+      if (opts.signal?.aborted
+        || (browserErr instanceof Error && (browserErr.name === 'AbortError' || browserErr.name === 'TimeoutError'))) {
+        throw browserErr;
+      }
+      // Keep the original failure class (edge-deny backoff, proxy outage) and
+      // say the browser did not recover it.
+      console.warn(
+        'senateSource: senate browser fallback failed:',
+        sanitizeEfdTransportError(browserErr, senateEfdTransportScrubSecrets(configuredProxy)),
+      );
+      throw err;
+    }
+  }
 }
 // Senate Scraper Hardening applied

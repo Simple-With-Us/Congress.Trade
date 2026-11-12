@@ -43,10 +43,10 @@ Key reminders:
   files are unrelated to your task, leave them untouched.
 - Check open PRs and worktrees before editing shared files:
   `git status --short --branch`, `git worktree list`, and
-  `gh pr list --state open`.
+  open PRs via the relay (`gr_wf_pr_list_page`).
 - For overlapping PRs, inspect changed files and checks before editing:
-  `gh pr view <number> --json headRefName,baseRefName,files,statusCheckRollup`
-  and `gh pr checks <number>`.
+  the relay's `gr_wf_pr_get` (head/base refs, files, check rollup)
+  and `gr_wf_checks`.
 - If a Codex, Cursor, Copilot, Antigravity, or another Claude branch/PR is
   already touching the same files, do not overwrite it. Either choose a
   disjoint slice, ask Jay which branch should own the work, or coordinate

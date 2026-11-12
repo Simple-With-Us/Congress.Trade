@@ -5,6 +5,9 @@ var TRADES = [];          // live transactions (newest first)
 var TRADE_BY_ID = {};     // trade id -> row, including mini-list rows cached from drawers
 var REVIEW = [];          // review-queue items
 var REVIEW_TOTALS = null; // aggregate queue counts returned with the current page
+var REVIEW_FAILURES = null; // failure sections embedded by GET /review-queue?include=… (pending tab only)
+var REVIEW_SENATE_INTAKE = null; // Senate intake relay heartbeat carried by every /review-queue response
+var REVIEW_SENATE_FETCHER_RUN = null; // Last reported Mac fetcher run, carried by every /review-queue response
 var DECISIONS = [];       // ingestion decision audit rows
 var REVIEW_RUNS = {};     // docId -> full extraction runs loaded on demand
 var REVIEW_CONSENSUS = {}; // docId -> { rows, summary } | null, loaded alongside REVIEW_RUNS
@@ -237,7 +240,7 @@ function chamberLabel(c) {
    nothing else: no 'Exec' branch word in front of it, and no state/district
    (they hold an office, not a seat). EXEC_TITLE_FALLBACK stands alone for an
    uncurated filer — it is never a prefix. */
-var EXEC_TITLE_FORMS = __CT_EXEC_TITLE_FORMS__;
+var EXEC_TITLE_FORMS = __CT_EXEC_TITLE_FORMS__; /*! gitleaks:allow — executive title labels; "Secretary" trips generic-api-key */
 var EXEC_TITLES = EXEC_TITLE_FORMS.titles;
 var EXEC_TITLES_SHORT = EXEC_TITLE_FORMS.short;
 var EXEC_TITLE_FALLBACK = EXEC_TITLE_FORMS.fallback;
@@ -2635,6 +2638,26 @@ function renderOwnerHealthBanner(pipeline, admin) {
         (sppSample ? ' (' + esc(sppSample) + ')' : '') + '</span>' +
     '</div>');
   }
+  // st_peer_prices — tickers confirmed no longer trading (CT-2466).
+  // Informational only: terminal tickers never page. The count, sample, and
+  // reason stay visible the same way not-covered does.
+  var sppTerminal = (spp && spp.value && Number(spp.value.terminal)) || 0;
+  if (spp && sppTerminal > 0) {
+    var sppTerminalSample = (spp.value && Array.isArray(spp.value.terminalSample))
+      ? spp.value.terminalSample.slice(0, 10).map(function (item) {
+          if (item && typeof item === 'object') {
+            return (item.ticker || '') + (item.reason ? ' ' + item.reason : '');
+          }
+          return String(item);
+        }).filter(Boolean).join(', ')
+      : '';
+    rows.push('<div class="owner-alert-row">' +
+      '<span class="owner-alert-icon">ℹ</span>' +
+      '<span class="owner-alert-title">NO LONGER TRADING</span>' +
+      '<span class="owner-alert-detail" title="' + esc(sppTerminalSample) + '">No longer trading: ' + sppTerminal +
+        (sppTerminalSample ? ' (' + esc(sppTerminalSample) + ')' : '') + '</span>' +
+    '</div>');
+  }
   if (rows.length === 0) {
     banner.innerHTML = '';
     banner.style.display = 'none';
@@ -2677,15 +2700,43 @@ function loadReview() {
   if (!canUseAdmin()) {
     REVIEW = [];
     REVIEW_TOTALS = null;
+    REVIEW_FAILURES = null;
+    REVIEW_SENATE_INTAKE = null;
+    REVIEW_SENATE_FETCHER_RUN = null;
+    if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
+    if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
     if (el('reviewTabBadge')) { el('reviewTabBadge').hidden = true; el('reviewTabBadge').textContent = ''; el('reviewTabBadge').classList.remove('is-on'); }
     if (el('kpiReview')) el('kpiReview').textContent = '—';
     return Promise.resolve();
   }
   // API HOOK: GET /api/admin/review-queue?resolved=
-  return fetch('/api/admin/review-queue?resolved=' + REVIEW_RESOLVED, { headers: adminHeaders() })
+  // The pending tab also embeds the pipeline failure sections; the Senate
+  // intake relay heartbeat rides on every response either way.
+  var reviewUrl = '/api/admin/review-queue?resolved=' + REVIEW_RESOLVED +
+    (REVIEW_RESOLVED === 0 ? '&include=ingest_failures,dead_letters,dlq_failed' : '');
+  return fetch(reviewUrl, { headers: adminHeaders() })
     .then(okOrThrow)
-    .then(function (data) { REVIEW = data.items || []; REVIEW_TOTALS = data.totals || null; renderReview(); loadDecisionHistory(); })
+    .then(function (data) {
+      REVIEW = data.items || [];
+      REVIEW_TOTALS = data.totals || null;
+      REVIEW_SENATE_INTAKE = data.senateIntake || null;
+      REVIEW_SENATE_FETCHER_RUN = data.senateFetcherRun || null;
+      REVIEW_FAILURES = REVIEW_RESOLVED === 0 ? {
+        ingestFailures: data.ingestFailures || null,
+        deadLetters: data.deadLetters || null,
+        deadLettersAvailable: data.deadLettersAvailable !== false,
+        dlqFailed: data.dlqFailed || null,
+        dlqFailedAvailable: data.dlqFailedAvailable !== false,
+      } : null;
+      renderReview();
+      loadDecisionHistory();
+    })
     .catch(function (e) {
+      REVIEW_FAILURES = null;
+      REVIEW_SENATE_INTAKE = null;
+      REVIEW_SENATE_FETCHER_RUN = null;
+      if (el('reviewRelayStatus')) el('reviewRelayStatus').innerHTML = '';
+      if (el('reviewFailures')) el('reviewFailures').innerHTML = '';
       el('reviewBody').innerHTML = stateRow(6, isAuthError(e) ? ADMIN_MOVED_MSG : ('Could not load review queue: ' + e.message));
     });
 }
@@ -3020,15 +3071,11 @@ function renderReview() {
   var unresolvedTotal = REVIEW_TOTALS && typeof REVIEW_TOTALS.unresolved === 'number' ? REVIEW_TOTALS.unresolved : REVIEW.length;
   if (canUseAdmin()) setTabBadge('reviewTabBadge', unresolvedTotal);
   if (el('kpiReview') && REVIEW_RESOLVED === 0) el('kpiReview').textContent = fmtCount(unresolvedTotal);
+  renderReviewPanels();
   if (REVIEW.length === 0) {
-    var ingestFailN = REVIEW_TOTALS && typeof REVIEW_TOTALS.ingestFailures === 'number'
-      ? REVIEW_TOTALS.ingestFailures
-      : 0;
     var emptyMsg = REVIEW_RESOLVED
       ? 'No reviewed documents yet.'
-      : ingestFailN > 0
-        ? 'Nothing in the review queue. Ingest failures (' + fmtCount(ingestFailN) + ') — use GET /api/admin/review-queue/ingest-failures.'
-        : 'Nothing awaiting review — queue is clear.';
+      : 'Nothing awaiting review — queue is clear.';
     body.innerHTML = stateRow(6, emptyMsg);
     return;
   }
@@ -3068,6 +3115,185 @@ function renderReview() {
     '</tr>';
   }).join('');
 }
+/* ============================ REVIEW FAILURE PANELS ============================
+   The pending tab embeds the pipeline failure sections the queue used to
+   hide: ingest failures (grouped by what actually went wrong), ingestion
+   outbox dead letters, and durable-queue rows in terminal failed state.
+   The Senate intake relay heartbeat renders above them — it is the
+   headless automation feed the Senate half of this queue depends on. */
+
+function reviewAgoText(ageMs) {
+  if (ageMs == null || !Number.isFinite(ageMs) || ageMs < 0) return '—';
+  var sec = Math.floor(ageMs / 1000);
+  if (sec < 60) return 'just now';
+  var min = Math.floor(sec / 60);
+  if (min < 60) return min + 'm ago';
+  var hr = Math.floor(min / 60);
+  if (hr < 48) { var remMin = min % 60; return hr + 'h' + (remMin ? ' ' + remMin + 'm' : '') + ' ago'; }
+  return Math.floor(hr / 24) + 'd ago';
+}
+
+function reviewAgeMs(iso) {
+  var t = iso ? Date.parse(iso) : NaN;
+  return Number.isFinite(t) ? Math.max(0, Date.now() - t) : null;
+}
+
+/* Buckets an ingest-failure error string by what the operator should
+   expect next: the pipeline retries retry-in-flight rows on its own; the
+   rest need a human. Grounded in fetcher.ts's markError message shapes. */
+function classifyIngestFailure(error) {
+  var e = String(error || '');
+  if (!e) return 'ingest error';
+  if (/agreement wall|edge[- ]deny/i.test(e)) return 'retry-in-flight';
+  if (/-> HTTP (404|410)\b/.test(e)) return 'retry-in-flight';
+  if (/^fetcher:/i.test(e)) return 'download failed';
+  return 'ingest error';
+}
+
+var FAILURE_CLASS_LABELS = {
+  'download failed': 'Download Failed',
+  'ingest error': 'Ingest Error',
+  'retry-in-flight': 'Retry in Flight',
+};
+
+function failureSectionHtml(title, rowsHtml) {
+  return '<div style="margin-top:14px"><h4 style="margin:0 0 6px">' + esc(title) + '</h4>' +
+    '<div class="review-table-wrap"><table><tbody>' + rowsHtml + '</tbody></table></div></div>';
+}
+
+function ingestFailureRowHtml(f) {
+  var safeUrl = safeDocUrl(f.sourceUrl);
+  var doc = safeUrl
+    ? '<a href="' + esc(safeUrl) + '" target="_blank" rel="noopener">' + esc(f.docId) + '</a>'
+    : esc(f.docId);
+  return '<tr class="row">' +
+    '<td>' + doc + '<div class="muted">' + esc(f.chamber || '') + (f.filingType ? ' · ' + esc(f.filingType) : '') + '</div></td>' +
+    '<td class="muted">' + esc(f.filerName || f.filerId || '—') + '</td>' +
+    '<td class="muted" style="max-width:420px">' + esc(f.error || '—') + (f.errorTruncated ? '…' : '') + '</td>' +
+    '<td class="muted">' + esc(reviewAgoText(reviewAgeMs(f.lastAttemptAt))) + '</td>' +
+  '</tr>';
+}
+
+function deadLetterRowHtml(d) {
+  return '<tr class="row">' +
+    '<td>' + esc(d.docId) + '<div class="muted">' + esc(d.chamber || '') + '</div></td>' +
+    '<td class="muted">' + fmtCount(d.attempts) + ' attempts · ' + fmtCount(d.deadLetterCycles) + ' dead-letter cycles</td>' +
+    '<td class="muted" style="max-width:420px">' + esc(d.error || '—') + (d.errorTruncated ? '…' : '') + '</td>' +
+    '<td class="muted">' + esc(reviewAgoText(reviewAgeMs(d.updatedAt))) + '</td>' +
+  '</tr>';
+}
+
+function dlqFailedRowHtml(d) {
+  return '<tr class="row">' +
+    '<td>' + esc(d.queueName || '—') + '<div class="muted">' + esc(d.type || '') + (d.dedupeKey ? ' · ' + esc(d.dedupeKey) : '') + '</div></td>' +
+    '<td class="muted">' + fmtCount(d.attempts) + ' attempts · ' + fmtCount(d.deadLetterCycles) + ' dead-letter cycles</td>' +
+    '<td class="muted" style="max-width:420px">' + esc(d.error || '—') + (d.errorTruncated ? '…' : '') + '</td>' +
+    '<td class="muted">' + esc(reviewAgoText(reviewAgeMs(d.updatedAt))) + '</td>' +
+  '</tr>';
+}
+
+function renderReviewPanels() {
+  var relayEl = el('reviewRelayStatus');
+  if (relayEl) {
+    var runHtml;
+    var r = REVIEW_SENATE_FETCHER_RUN;
+    if (!r) {
+      runHtml = '<p class="note">Mac Fetcher Runs: no runs recorded yet. The Mac eFD fetcher has not reported a run since run reporting began.</p>';
+    } else {
+      var rbits = ['last run ' + reviewAgoText(typeof r.ageMs === 'number' ? r.ageMs : reviewAgeMs(r.receivedAt))];
+      rbits.push('status ' + (r.status || 'ok'));
+      rbits.push(fmtCount(r.rows) + ' rows seen');
+      rbits.push(fmtCount(r.newCount) + ' new');
+      rbits.push(r.role === 'jay' ? 'Jay standby copy' : 'agents copy');
+      var runWarn = '';
+      if (r.status === 'blocked') runWarn = ' <strong style="color:#c0362c">The Senate blocked the last run.</strong>';
+      else if (r.status === 'error') runWarn = ' <strong style="color:#c0362c">The last run errored before completing.</strong>';
+      if (r.stale) runWarn += ' <strong style="color:#c0362c">Stale — the fetcher runs every 15 minutes from 6:00 AM to 10:00 PM, so a last run this old means the Mac fetcher is down or not reporting.</strong>';
+      runHtml = '<p class="note">Mac Fetcher Runs: ' + esc(rbits.join(' · ')) + runWarn + '</p>';
+    }
+    var s = REVIEW_SENATE_INTAKE;
+    if (!s) {
+      relayEl.innerHTML = runHtml + '<p class="note">Senate Intake Relay (deliveries): no delivery recorded yet. The Mac eFD fetcher has not delivered new filings since this status began recording — deliveries only happen when a run finds new filings.</p>';
+    } else {
+      var bits = ['last delivery ' + reviewAgoText(typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt))];
+      bits.push(fmtCount(s.received) + ' rows received');
+      bits.push(fmtCount(s.newCount) + ' new filings');
+      if (s.rejected) bits.push(fmtCount(s.rejected) + ' rejected');
+      if (s.dryRun) bits.push('dry run');
+      var failedWarn = s.failed
+        ? ' <strong style="color:#c0362c">The last relay call failed to ingest — nothing was written.</strong>'
+        : '';
+      var rAgeMs = r ? (typeof r.ageMs === 'number' ? r.ageMs : reviewAgeMs(r.receivedAt)) : null;
+      var sAgeMs = typeof s.ageMs === 'number' ? s.ageMs : reviewAgeMs(s.receivedAt);
+      // Broken-relay signal: a fresh run found filings the delivery line
+      // should already show.  The run must postdate the last delivery and
+      // be past a 5-minute grace window, so normal relay lag (the run
+      // reports after its intake post, but the panel can render in
+      // between) does not read as breakage.
+      var undelivered = !!(r && !r.stale && r.newCount > 0 && rAgeMs !== null && rAgeMs > 5 * 60 * 1000 && rAgeMs < sAgeMs);
+      var staleWarn = s.stale
+        ? (undelivered
+          ? ' <strong style="color:#c0362c">Stale — the last run found new filings but the last delivery is old, so the intake relay may be broken.</strong>'
+          : ' Deliveries only happen when a run finds new filings, so an old delivery is expected in quiet stretches — the run line above is the fetcher health signal.')
+        : '';
+      relayEl.innerHTML = runHtml + '<p class="note">Senate Intake Relay (deliveries): ' + esc(bits.join(' · ')) + failedWarn + staleWarn + '</p>';
+    }
+  }
+  var failEl = el('reviewFailures');
+  if (!failEl) return;
+  if (REVIEW_RESOLVED !== 0) { failEl.innerHTML = ''; return; }
+  var totals = REVIEW_TOTALS || {};
+  var f = REVIEW_FAILURES;
+  var sections = [];
+  if (f && f.ingestFailures) {
+    var groups = { 'download failed': [], 'ingest error': [], 'retry-in-flight': [] };
+    f.ingestFailures.forEach(function (row) { groups[classifyIngestFailure(row.error)].push(row); });
+    ['download failed', 'ingest error', 'retry-in-flight'].forEach(function (cls) {
+      if (!groups[cls].length) return;
+      sections.push(failureSectionHtml(
+        'Ingest Failures — ' + FAILURE_CLASS_LABELS[cls] + ' (' + fmtCount(groups[cls].length) + ')',
+        groups[cls].map(ingestFailureRowHtml).join('')));
+    });
+    var totalIngest = typeof totals.ingestFailures === 'number' ? totals.ingestFailures : f.ingestFailures.length;
+    if (totalIngest > f.ingestFailures.length) {
+      sections.push('<p class="note">Showing the ' + fmtCount(f.ingestFailures.length) + ' most recent of ' + fmtCount(totalIngest) + ' ingest failures.</p>');
+    }
+  }
+  if (typeof totals.publishedStatusStale === 'number' && totals.publishedStatusStale > 0) {
+    sections.push('<p class="note">' + fmtCount(totals.publishedStatusStale) + ' published filings still carry a stale error status (counted only — the filings themselves are live).</p>');
+  }
+  if (f && f.deadLettersAvailable === false) {
+    sections.push('<p class="note">Ingestion outbox table unavailable — its dead letters cannot be listed.</p>');
+  } else if (f && f.deadLetters && f.deadLetters.length) {
+    var activeDead = f.deadLetters.filter(function (d) { return !d.parked; });
+    var parkedDead = f.deadLetters.filter(function (d) { return d.parked; });
+    if (activeDead.length) {
+      var totalDead = typeof totals.deadLetters === 'number' ? totals.deadLetters : activeDead.length;
+      sections.push(failureSectionHtml(
+        'Dead Letters — Ingestion Outbox (' + fmtCount(totalDead) + ')',
+        activeDead.map(deadLetterRowHtml).join('')));
+      if (totalDead > activeDead.length) {
+        sections.push('<p class="note">Showing the ' + fmtCount(activeDead.length) + ' most recent of ' + fmtCount(totalDead) + ' dead letters.</p>');
+      }
+    }
+    if (parkedDead.length) {
+      var totalParked = typeof totals.deadLettersParked === 'number' ? totals.deadLettersParked : parkedDead.length;
+      sections.push(failureSectionHtml(
+        'Dead Letters — Parked, Human Review (' + fmtCount(totalParked) + ')',
+        parkedDead.map(deadLetterRowHtml).join('')));
+    }
+  }
+  if (f && f.dlqFailedAvailable === false) {
+    sections.push('<p class="note">Durable queue table unavailable — its failed rows cannot be listed.</p>');
+  } else if (f && f.dlqFailed && f.dlqFailed.length) {
+    sections.push(failureSectionHtml(
+      'Dead Letters — Durable Queue (' + fmtCount(f.dlqFailed.length) + ')',
+      f.dlqFailed.map(dlqFailedRowHtml).join('')));
+  }
+  if (!sections.length && f) sections.push('<p class="note">No pipeline failures.</p>');
+  failEl.innerHTML = sections.join('');
+}
+
 /* Expand/collapse a per-document model-comparison panel beneath its row. */
 function toggleModels(docId) {
   var existing = el('mdl-' + docId);
@@ -6870,22 +7096,30 @@ function loadTrSectionNearViewport(id, fn) {
     fn();
     return;
   }
+  // An empty table body or chart box has no area, so a fresh observer never
+  // reports it as intersecting and the section stays blank on first paint
+  // (What Is Being Traded, Top Performers, Rising Activity, Most Active
+  // Politicians). The enclosing card has a heading, so watch that.
+  var target = node.closest('details') || node;
+  if (target.getAttribute('data-tr-load') && target.getAttribute('data-tr-load') !== id) target = node;
+  target.setAttribute('data-tr-load', id);
   __trPending[id] = fn;
   if (!__trObserver) {
     __trObserver = new IntersectionObserver(function (entries) {
       entries.forEach(function (entry) {
         if (!entry.isIntersecting) return;
-        var pendingId = entry.target.id;
+        var pendingId = entry.target.getAttribute('data-tr-load') || entry.target.id;
         var pendingFn = __trPending[pendingId];
         if (!pendingFn) return;
         delete __trPending[pendingId];
         __trLoadedOnce[pendingId] = true;
         __trObserver.unobserve(entry.target);
+        entry.target.removeAttribute('data-tr-load');
         pendingFn();
       });
     }, { rootMargin: '400px 0px' });
   }
-  __trObserver.observe(node);
+  __trObserver.observe(target);
 }
 function loadTrends() {
   stampWindowChips();
@@ -7228,8 +7462,8 @@ function filterPeopleDirectory() {
 
 /* ---- Directory People|Assets toggle ---- */
 var DIRECTORY_MODE = 'people';
-var DIR_SUB_PEOPLE = 'Look up members of Congress and executive filers.\u00a0 Search by name, state (full or abbrev), or party.\u00a0 Click a column heading to sort; click a name for their profile and trades.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
-var DIR_SUB_ASSETS = 'Every ticker Congress has disclosed a trade in.\u00a0 Search by ticker or company name.\u00a0 Click a column heading to sort; click a row to open its profile.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
+var DIR_SUB_PEOPLE = 'Look up members of Congress and executive branch officials.\u00a0 Search by name, state, or party.\u00a0 Click a column heading to sort; click a name for their profile and trades.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
+var DIR_SUB_ASSETS = 'Every ticker with a disclosed trade.\u00a0 Search by ticker or company name.\u00a0 Click a column heading to sort; click a row to open its profile.\u00a0 Trade counts cover the full record, not the timeframe set on Trades or Trends.';
 var directorySearchTimer = null;
 function syncDirectoryUrl() {
   try {
@@ -7934,7 +8168,7 @@ function loadTrSectorFlow() {
   box.innerHTML = skBars(5);
   aGet('sector-flow?' + trParams() + '&limit=12').then(function (d) {
     var rows = (d.sectors || []).filter(function (r) { return r.sector && r.sector !== 'Unknown'; });
-    if (!rows.length) { box.innerHTML = '<div class="note">No sector-classified trades in this window yet (security reference data fills in as enrichment runs).</div>'; return; }
+    if (!rows.length) { box.innerHTML = '<div class="note">No sector labels in this window yet.</div>'; return; }
     var merged = {}, order = [];
     rows.forEach(function (r) {
       var key = canonSector(r.sector);
@@ -7997,7 +8231,7 @@ function loadTrPerformers() {
     var asOf = el('trPerformersAsOf');
     if (asOf) asOf.textContent = d && d.pricesAsOf ? 'Prices as of ' + fmtAsOf(d.pricesAsOf) + '.  Excess return is measured to that date.' : '';
     var rows = d.members || [];
-    if (!rows.length) { body.innerHTML = stateRow(2, 'Not enough priced, filing-anchored buys to rank yet — this fills in as the price cache backfills.'); return; }
+    if (!rows.length) { body.innerHTML = stateRow(2, 'Not enough priced stock buys to rank yet.\u00a0 Prices show up after the filing date.'); return; }
     body.innerHTML = rows.map(function (r, i) {
       var name = fmtName(r.fullName || r.filerId || 'Unknown');
       var memberAttr = r.filerId ? ' class="member-cell clickable" data-member="' + esc(r.filerId) + '"' : ' class="member-cell"';
@@ -8081,7 +8315,7 @@ function loadTrTrending() {
   var queryParams = trParams() + '&limit=12';
   aGet('trending?' + queryParams).then(function (d) {
     var rows = (d.trending || []).filter(function (r) { return r.deltaCount > 0; });
-    if (!rows.length) { body.innerHTML = stateRow(4, 'Not enough history to rank momentum.'); return; }
+    if (!rows.length) { body.innerHTML = stateRow(4, 'Not enough history to show a change.'); return; }
     body.innerHTML = rows.map(function (r) {
       return '<tr class="row clickable" data-asset="' + esc(r.ticker) + '" title="Open company">' +
         '<td><div class="asset-cell clickable" data-asset="' + esc(r.ticker) + '">' + tickerLogoHtml(r.ticker, fmtCompany(r.name)) + '<div><span class="tkr">' + esc(r.ticker) + '</span>' + (r.name ? ' <span class="muted">' + esc(fmtCompany(r.name)) + '</span>' : '') + '</div></div></td>' +
@@ -8097,7 +8331,7 @@ function loadTrClusters() {
   box.innerHTML = '<div class="chip">Loading…</div>';
   aGet('cluster-buys?' + trParams() + '&limit=12&minMembers=2').then(function (d) {
     var cs = d.clusters || [];
-    if (!cs.length) { box.innerHTML = '<div class="chip">No multi-politician consensus in this window — try a longer window or “All Data”.</div>'; return; }
+    if (!cs.length) { box.innerHTML = '<div class="chip">No multi-politician consensus in this window.\u00a0 Try a longer window.</div>'; return; }
     box.innerHTML = cs.map(function (c) {
       var faces = (c.topMembers || []).slice(0, 5).map(function (m) {
         var av = memberAvatarHtml(m.fullName, m.photoUrl, m.partyBucket || m.party);
@@ -8845,7 +9079,7 @@ function tickerBacktestHtml(d) {
   var horizons = d.horizons || [];
   var total = d.totalBuyEvents != null ? d.totalBuyEvents : 0;
   if (!horizons.length || !total) {
-    return '<div class="note">No priced equity buys to score yet — this fills in as the price cache backfills. Options are excluded.</div>';
+    return '<div class="note">No priced stock buys to score yet.\u00a0 Options are left out.</div>';
   }
   function hzLabel(days) {
     if (days === 21) return '~1 mo';
@@ -8896,7 +9130,7 @@ function openMember(filerId) {
     var commHtml = committees.length
       ? committees.map(function (c) { return '<span class="committee-tag">' + esc(c) + '</span>'; }).join('')
       : '<span class="muted">' + (isExec
-        ? 'Executive filers do not sit on congressional committees.'
+        ? 'Executive branch officials do not sit on congressional committees.'
         : 'No current assignments on file.') + '</span>';
     var top = (d.topTickers || []).map(function (t) {
       return '<div class="hbar ledger" style="margin:5px 0"><div class="hlabel clickable" data-asset="' + esc(t.ticker) + '">' +
@@ -8956,7 +9190,7 @@ function memberPerfHtml(d) {
   var filing = d.filingDate || null;
   var buyCount = d.buyCount != null ? d.buyCount : (trade && trade.tradeCount);
   if ((!trade || !trade.scoredCount) && (!filing || !filing.scoredCount)) {
-    return '<div class="note">No priced equity buys to score yet — this fills in as the price cache backfills. Sells are not scored as skill (no cost basis).</div>';
+    return '<div class="note">No priced stock buys to score yet.\u00a0 Sells are left out, because the filing does not include a purchase price.</div>';
   }
   function legBlock(title, tip, horizon, leg, isDeemphasized) {
     if (!leg || !leg.scoredCount) {

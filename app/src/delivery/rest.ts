@@ -172,8 +172,11 @@ let readinessCache: { at: number; result: ReadinessResult } | null = null;
 // endpoints. Previously only /health was cached while /health/deep,
 // /health/polling and /health/latency each paid the full 30+-probe scan per
 // unauthenticated monitor hit.
+// Public health endpoints serve unauthenticated traffic, so the shared
+// cache collects counts only: raw unreadable-filing doc ids stay on the
+// operator-private surfaces (loud alerts, GET /api/admin/pipeline-health/filing-skips).
 const pipelineHealthCache = createPipelineHealthCache(
-  (env) => checkPipelineHealth(env),
+  (env) => checkPipelineHealth(env, new Date(), {}, { includeUnreadableDocIds: false }),
   READINESS_CACHE_TTL_MS,
 );
 
@@ -669,7 +672,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       return c.json({ error: 'since must be an integer >= 0 and limit an integer from 1 to ' + RETRACTIONS_MAX_LIMIT }, 400);
     }
     const { since, limit } = parsed.data;
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json(
@@ -756,7 +759,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         400,
       );
     }
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json(
@@ -873,7 +876,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     }
     // Cap per IP so a premium account can't be scripted into unbounded read/CPU cost.
     // Fails open if KV down.
-    const exRl = await rateLimit(c.env, 'export-ip', clientIp(c.req.raw), 30, 600);
+    const exRl = await rateLimit(c.env, 'export-ip', clientIp(c.req.raw, c.env), 30, 600);
     if (!exRl.ok) {
       return c.json({ error: 'too many export requests' }, 429, {
         'Retry-After': String(exRl.retryAfterSec),
@@ -1057,7 +1060,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const resume = SseRetractQuerySchema.safeParse(c.req.query());
     if (!resume.success) return c.json({ error: 'retractSince must be an integer >= 0' }, 400);
     const retractSince = resume.data.retractSince;
-    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw), {}, retractSince);
+    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw, c.env), {}, retractSince);
   });
 
   // --- GET /logos/ticker --------------------------------------------------
@@ -1120,7 +1123,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     if (!filingRow) return c.json({ error: 'filing not found' }, 404);
     const docId = filingRow.doc_id;
 
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json(

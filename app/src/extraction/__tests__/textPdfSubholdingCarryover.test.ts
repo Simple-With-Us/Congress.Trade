@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { parseHousePtrText } from '../textPdf.ts';
+import { parseColumnTailRecords, parseHousePtrText } from '../textPdf.ts';
 
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), '../__fixtures__');
 
@@ -64,6 +64,14 @@ const CASES: { docId: string; text: string; rows: string }[] = [
     text: 'H-2026-20035710-text-layer.txt',
     rows: 'H-2026-20035710-parsed-rows.json',
   },
+  {
+    // Gilbert Cisneros CA31, 2026-11-11: 65 blank-owner rows; the Norwegian
+    // Cruise Line row breaks across a page, so its "(NCLH) [ST]" prints after
+    // the Type/Date/Amount run on the next page.
+    docId: 'H-2026-20035788',
+    text: 'H-2026-20035788-text-layer.txt',
+    rows: 'H-2026-20035788-parsed-rows.json',
+  },
 ];
 
 describe('textPdf House PTR row segmentation', () => {
@@ -78,7 +86,11 @@ describe('textPdf House PTR row segmentation', () => {
 
       it('keeps every field on the row that owns it', () => {
         for (const want of expected) {
-          const got = rows.find((r) => r.txDate === want.txDate && r.ticker === want.ticker);
+          // Untickered munis can share a trade date, so match those on name too.
+          const got = rows.find((r) =>
+            r.txDate === want.txDate && r.ticker === want.ticker &&
+            (want.ticker !== null || r.assetName === want.assetName)
+          );
           expect(got, `row ${want.ticker ?? want.assetName} @ ${want.txDate}`).toBeDefined();
           expect(got).toMatchObject({
             owner: want.owner,
@@ -132,6 +144,22 @@ describe('textPdf House PTR row segmentation', () => {
     });
   });
 
+  it('keeps a holding whose asset name breaks across a page', () => {
+    // H-2026-20035788: "Norwegian Cruise Line Holdings P 10/20/2026 ..." ends
+    // page 4 and "Ltd. Ordinary Shares (NCLH) [ST]" opens page 5.
+    const rows = parseHousePtrText(fixture('H-2026-20035788-text-layer.txt'));
+    expect(rows).toHaveLength(65);
+    expect(rows.find((r) => r.ticker === 'NCLH')).toMatchObject({
+      assetName: 'Norwegian Cruise Line Holdings Ltd. Ordinary Shares',
+      assetType: 'ST',
+      txType: 'B',
+      txDate: '2026-10-20',
+      subholding: '150 Main Street Trust > Bank of America',
+    });
+    // The row after it keeps its own asset type instead of inheriting [GS].
+    expect(rows.find((r) => r.ticker === 'NVDA')).toMatchObject({ assetType: 'ST' });
+  });
+
   it('keeps the asset name that shares its line with the transaction type', () => {
     // H-2026-20035715: "S (partial)" shares the Mercato Partners line, so the
     // name used to be lost entirely.
@@ -141,6 +169,88 @@ describe('textPdf House PTR row segmentation', () => {
       'Mercato Partners Traverse IV QP, LP (GLAS Funds, LP)',
     ]);
     expect(rows.every((r) => r.subholding === '2012 Trust')).toBe(true);
+  });
+
+  describe('column-order fallback on H-2026-20035788', () => {
+    // The tail parser wins on this filing after the page-split rejoin.  The
+    // column-order parser is what runs when that tail under-counts, and it
+    // used to glue each Subholding Of onto the next asset and steal the next
+    // row's ticker and [TYPE] (a muni took CF; BridgeBio was typed GS).
+    const rows = parseColumnTailRecords(fixture('H-2026-20035788-text-layer.txt'));
+    const expected = expectedRows('H-2026-20035788-parsed-rows.json');
+
+    it('extracts 65 rows in filing order', () => {
+      expect(rows).toHaveLength(65);
+      expect(rows).toHaveLength(expected.length);
+    });
+
+    it('keeps each asset name, ticker, and asset type on its own row', () => {
+      expect(rows.map((row) => ({
+        assetName: row.assetName,
+        ticker: row.ticker,
+        assetType: row.assetType,
+        txDate: row.txDate,
+        txType: row.txType,
+        owner: row.owner,
+        amountMin: row.amountMin,
+        amountMax: row.amountMax,
+        filingStatus: row.filingStatus,
+        subholding: row.subholding,
+        description: row.description,
+      }))).toEqual(expected.map((want) => ({
+        assetName: want.assetName,
+        ticker: want.ticker,
+        assetType: want.assetType,
+        txDate: want.txDate,
+        txType: want.txType,
+        owner: want.owner,
+        amountMin: want.amountMin,
+        amountMax: want.amountMax,
+        filingStatus: want.filingStatus,
+        subholding: want.subholding,
+        description: want.description ?? null,
+      })));
+    });
+
+    it('does not move a trust name or the next ticker onto the neighboring row', () => {
+      const muni = rows.find((row) => row.assetName === 'California Community Choice Financing Authority Rev Bonds');
+      const bridge = rows.find((row) => row.ticker === 'BBIO' && row.txDate === '2026-11-02');
+      const cf = rows.find((row) => row.ticker === 'CF');
+      expect(muni).toMatchObject({ ticker: null, assetType: 'GS' });
+      expect(bridge).toMatchObject({
+        assetName: 'BridgeBio Pharma, Inc. - Common Stock',
+        assetType: 'ST',
+      });
+      expect(cf).toMatchObject({
+        assetName: 'CF Industries Holdings, Inc. Common Stock',
+        assetType: 'ST',
+      });
+      expect(rows.every((row) => !row.assetName.startsWith('150 Main Street'))).toBe(true);
+      expect(rows.every((row) => !/Filing Status|Subholding Of/i.test(row.assetName))).toBe(true);
+    });
+
+    it('keeps a wrapped ticker line when the row has no detail lines', () => {
+      const rows = parseColumnTailRecords([
+        'ID Owner Asset Transaction Type Date Notification Date Amount',
+        'Organon & Co. Common Stock',
+        'S 08/05/2026 08/05/2026 $1,001 - $15,000',
+        '(OGN) [ST]',
+        'Versant Media Group, Inc. - Class A Common Stock',
+        'S 08/05/2026 08/05/2026 $1,001 - $15,000',
+        '(VSNT) [ST]',
+      ].join('\n'));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({
+        ticker: 'OGN',
+        assetType: 'ST',
+        assetName: 'Organon & Co. Common Stock',
+      });
+      expect(rows[1]).toMatchObject({
+        ticker: 'VSNT',
+        assetType: 'ST',
+        assetName: 'Versant Media Group, Inc. - Class A Common Stock',
+      });
+    });
   });
 
   describe('synthetic House text layers', () => {
@@ -222,7 +332,7 @@ describe('textPdf House PTR row segmentation', () => {
           ' Filing Status: New Subholding Of: ET IRA Home Depot, Inc. (HD) [ST] S 10/22/2026 10/22/2026 $1,001 - $15,000',
       );
       const hd = rows.find((r) => r.ticker === 'HD');
-      expect(hd?.assetName).toMatch(/Subholding Of/);
+      expect(hd?.assetName ?? '').toMatch(/Subholding Of|ET IRA/);
       expect(hd?.confidence ?? 1).toBeLessThan(0.95);
     });
 
@@ -233,7 +343,7 @@ describe('textPdf House PTR row segmentation', () => {
           ' Location: US Home Depot, Inc. (HD) [ST] S 10/22/2026 10/22/2026 $1,001 - $15,000',
       );
       const hd = rows.find((r) => r.ticker === 'HD');
-      expect(hd?.assetName).toMatch(/Location/);
+      expect(hd?.assetName ?? '').toMatch(/Location|\bUS\b/);
       expect(hd?.confidence ?? 1).toBeLessThan(0.95);
     });
   });

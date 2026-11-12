@@ -1,9 +1,7 @@
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 import { createClient } from "npm:@libsql/client";
-import {
-  assetNameFromCompetitorPayload,
-  resolveExecutiveFilerIdFromName,
-} from "../src/shared/executiveIdentity.ts";
+import { assetNameFromCompetitorPayload } from "../src/shared/executiveIdentity.ts";
+import { assignCompetitorFilerId, type ExistingFilerCandidate } from "../src/shared/competitorFilerMatch.ts";
 
 function mapTxType(raw: string | undefined): "P" | "S" | "E" {
   const t = (raw ?? "").toLowerCase();
@@ -12,18 +10,19 @@ function mapTxType(raw: string | undefined): "P" | "S" | "E" {
   return "P";
 }
 
-function filerIdForHole(h: { lastName?: string; name?: string; fullName?: string; raw?: { name?: string } }): string {
+function filerIdForHole(
+  h: { lastName?: string; name?: string; fullName?: string; raw?: { name?: string } },
+  candidates: readonly ExistingFilerCandidate[],
+): string | null {
   const full =
     h.fullName ||
     h.name ||
     (h.raw && typeof h.raw === "object" ? (h.raw as { name?: string }).name : "") ||
     "";
-  const exec = resolveExecutiveFilerIdFromName(full);
-  if (exec) return exec;
-  // Never map bare last name → EXEC-*. House members sharing a last name
-  // (e.g. Rich McCormick) stay on MANUAL-*.
-  const last = (h.lastName || full.split(/\s+/).pop() || "UNKNOWN").toUpperCase().replace(/[^A-Z]/g, "");
-  return `MANUAL-${last || "UNKNOWN"}`;
+  // A bare last name never mints MANUAL-<LAST>. Attach to an existing filer
+  // or a first+last id, or skip the row.
+  const name = full || h.lastName || "";
+  return assignCompetitorFilerId({ rawName: name, candidates })?.filerId ?? null;
 }
 
 async function main() {
@@ -40,10 +39,29 @@ async function main() {
 
   console.log(`Loaded ${holes.length} missing trades.`);
 
+  const filerRows = await client.execute(
+    "SELECT bioguide_id, full_name, chamber, state, resolved_bioguide_id FROM filers WHERE merged_into IS NULL",
+  );
+  const candidates: ExistingFilerCandidate[] = filerRows.rows.map((row) => {
+    const r = row as Record<string, unknown>;
+    return {
+      filerId: String(r.bioguide_id ?? ""),
+      fullName: typeof r.full_name === "string" ? r.full_name : null,
+      chamber: typeof r.chamber === "string" ? r.chamber : null,
+      state: typeof r.state === "string" ? r.state : null,
+      resolvedBioguideId: typeof r.resolved_bioguide_id === "string" ? r.resolved_bioguide_id : null,
+    };
+  }).filter((c) => c.filerId);
+
   const txBatch = [];
+  let skippedBareName = 0;
 
   for (const h of holes) {
-    const filerId = filerIdForHole(h);
+    const filerId = filerIdForHole(h, candidates);
+    if (!filerId) {
+      skippedBareName += 1;
+      continue;
+    }
     const txType = mapTxType(h.type);
     const assetName = assetNameFromCompetitorPayload(h.raw ?? h, h.ticker);
     const ticker = h.ticker && String(h.ticker).toUpperCase() !== "UNKNOWN" ? h.ticker : null;
@@ -76,6 +94,9 @@ async function main() {
     });
   }
 
+  if (skippedBareName > 0) {
+    console.warn(`Skipped ${skippedBareName} rows whose reporter is a bare surname.`);
+  }
   console.log(`Executing ${txBatch.length} insertions...`);
 
   let successCount = 0;

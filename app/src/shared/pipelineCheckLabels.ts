@@ -22,8 +22,10 @@ export const PIPELINE_CHECK_LABELS: Record<string, string> = {
   latency_probes: 'Latency Probes',
   senate_relay: 'Senate Relay',
   senate_efd: 'Senate eFD',
+  senate_fetcher: 'Mac eFD Fetcher',
   price_freshness: 'Price / S&P Freshness',
   st_peer_prices: 'ST → CT Peer Prices',
+  st_inbound_market_data: 'ST → CT Inbound Market Data',
 };
 
 export function pipelineCheckLabel(id: string): string {

@@ -72,11 +72,18 @@ test("ios-appstore-gm.yml ships with notes, Sentry, and a per-run gate override"
   assert.doesNotMatch(yml, /ios-ship-testflight\.sh["'\s].*--force-ship/);
   assert.match(yml, /force_ship:\s*\n\s+description:[^\n]*\n\s+type: boolean\s*\n\s+default: false/);
   assert.match(yml, /FORCE_SHIP:\s*\$\{\{ inputs\.force_ship \}\}/);
-  // Hosted runners start empty, so the gate and the notes range are seeded.
+  // Hosted runners start empty, so the gate and the notes range are seeded
+  // from the previous successful run. A skip fails this job, so the newest
+  // success is an upload and the shared helper is not asked to filter.
   assert.match(yml, /actions: read/);
   assert.match(yml, /Seed last-ship state/);
-  assert.match(yml, /last-ship-congress\.txt/);
-  assert.match(yml, /prev_at="\$\{prev_at%%\.\*\}"/);
+  assert.match(yml, /scripts\/ios-fleet\/seed-last-ship\.sh/);
+  assert.match(yml, /--workflow ios-appstore-gm\.yml/);
+  assert.match(yml, /--app congress/);
+  assert.doesNotMatch(yml, /--require-upload/);
+  const helper = read("scripts/ios-fleet/seed-last-ship.sh");
+  assert.match(helper, /last-ship-\$\{APP\}\.txt/);
+  assert.match(read("scripts/ios-fleet/seed-last-ship.mjs"), /indexOf\("\."\)/);
   // A gate skip must not look like a shipped build.
   assert.match(yml, /Assert this checkout was uploaded/);
   assert.match(yml, /fetch-depth: 0/);
@@ -156,6 +163,18 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
 
   // The gate diffs against an older sha, and the notes need the commit range.
   assert.match(code, /fetch-depth:\s*0/);
+  // The seed runs on every event, before the gate and the ship script, and
+  // reads the previous upload of this workflow. A green skip is not a seed.
+  const seedAt = code.indexOf("name: Seed last-ship state from the previous successful run");
+  const gateAt = code.indexOf("name: Scheduled ship gate");
+  const shipAt = code.indexOf("scripts/ios-ship-testflight.sh");
+  assert.ok(seedAt >= 0 && gateAt > seedAt && shipAt > gateAt, "seed must precede the gate and the ship script");
+  assert.match(code, /actions: read/);
+  assert.match(code, /scripts\/ios-fleet\/seed-last-ship\.sh/);
+  assert.match(code, /--workflow ios-ship\.yml/);
+  assert.match(code, /--require-upload/);
+  assert.match(code, /--ship-step "Ship CongressTrade to TestFlight"/);
+  assert.doesNotMatch(code, /actions\/cache/);
   // What to Test is mandatory and published, never dry-rendered.
   assert.match(code, /IOS_TF_RELEASE_NOTES:\s*"1"/);
   // Ship through the wrapper that runs ship-testflight.sh (ensure-tf-ready inside).
@@ -166,8 +185,11 @@ test("ios-ship.yml ships automatically on a merge that touches the native tree",
   // ship as --build, so every ship of the release uploads the same number.
   assert.match(
     code,
-    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
+    /bash "\$GITHUB_WORKSPACE\/scripts\/ios-ship-testflight\.sh" --build "\$\{\{ steps\.plan-build\.outputs\.build \}\}"( \$\{ship_args\[@\]\+"\$\{ship_args\[@\]\}"\})?(\s*2>&1\s*\|\s*tee "\$RUNNER_TEMP\/congress-ship\.log")?\s*$/m
   );
+  // The only argument a dispatch may add is an exact --version; never --force-ship.
+  assert.doesNotMatch(code, /--force-ship/);
+  assert.match(code, /ship_args\+=\(--version "\$INPUT_MARKETING_VERSION"\)/);
   // Hosted macOS with the stable-Xcode guard; ASC credentials from Fleet Secrets /asc.
   assert.match(code, /runs-on:\s*macos-latest/);
   assert.match(code, /Assert stable Xcode/);
@@ -296,6 +318,40 @@ test("the App Store version workflow prepares a version and never submits", () =
   assert.doesNotMatch(api, /\/v1\/reviewSubmissionItems/);
   // And no localization is written either.
   assert.doesNotMatch(api, /appStoreVersionLocalizations.*method:\s*"POST"/);
+});
+
+test("ensure-tf-ready rc=5 and rc=6 are not mislabeled as export compliance", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  const rc5 = ship.slice(ship.indexOf("if [[ $rc -eq 5 ]]"), ship.indexOf("if [[ $rc -eq 6 ]]"));
+  const rc6 = ship.slice(ship.indexOf("if [[ $rc -eq 6 ]]"), ship.indexOf("if [[ $rc -eq 3 ]]"));
+  assert.match(rc5, /NO internal tester has access to all builds/);
+  assert.match(rc5, /no internal tester can install it/);
+  assert.doesNotMatch(rc5, /stuck on export compliance/);
+  assert.doesNotMatch(rc5, /no external TestFlight group/);
+  assert.match(rc6, /internal tester count could not be read/);
+  assert.match(rc6, /internal tester state is unreadable/);
+  assert.doesNotMatch(rc6, /stuck on export compliance/);
+  assert.doesNotMatch(rc6, /external installability/);
+
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  const readyStart = asc.lastIndexOf("Exit codes: 0 ready", asc.indexOf('if (method === "ensure-tf-ready")'));
+  const ready = asc.slice(readyStart, asc.indexOf('if (method === "latest-marketing-patch"'));
+  assert.match(ready, /Exit codes: 0 ready \| 2 usage\/API error \| 3 readiness timeout/);
+  assert.doesNotMatch(ready, /process\.exit\(5\)/);
+  assert.doesNotMatch(ready, /process\.exit\(6\)/);
+
+});
+
+test("ios-ship.yml re-runs ensure-tf-ready after the external beta refresh", () => {
+  const yml = read(".github/workflows/ios-ship.yml");
+  const promote = yml.indexOf("name: Refresh the public TestFlight beta");
+  const verify = yml.indexOf("name: Re-verify TestFlight readiness after external beta refresh");
+  assert.ok(promote >= 0, "Refresh the public TestFlight beta step must exist");
+  assert.ok(verify > promote, "post-sync ensure-tf-ready must follow the external beta refresh");
+  assert.match(yml, /ios-report-post-sync-tf-ready\.sh/);
+  const report = read("scripts/ios-report-post-sync-tf-ready.sh");
+  assert.match(report, /GITHUB_STEP_SUMMARY/);
+  assert.match(report, /tf_ready_verdict_line/);
 });
 
 test("ios-appstore-gm.yml can ship one exact marketing version", () => {

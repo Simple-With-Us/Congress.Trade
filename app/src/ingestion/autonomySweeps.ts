@@ -33,11 +33,24 @@ import {
   ungroundedIngestStatusSql,
 } from './emptyFetchHandoff.ts';
 import { parkEmptyFetchHandoff, rearmFilingForEmptyFetch } from './outbox.ts';
+import {
+  ensureIngestFailureReviewQueueRow,
+  sweepIngestFailureReviewQueue,
+  type IngestFailureBackfillResult,
+} from './ingestFailureReviewQueue.ts';
+import {
+  sweepTerminalFailureReviewQueue,
+  type TerminalFailureSweepResult,
+} from './terminalFailureReview.ts';
 import { checkPipelineHealth } from '../shared/pipelineHealth.ts';
 import { sweepTransientDeadLetters, type TransientDlqSweepResult } from './transientDlq.ts';
 import { sendPushover } from '../shared/pushover.ts';
 import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import { fetchHouseIndex } from './houseSource.ts';
+import {
+  applyHouseFiledDateIfMissing,
+  normalizeHouseFilingDateToIso,
+} from './houseFiledDate.ts';
 import {
   isSenateEdgeBackoffActive,
   readSenateEdgeBackoff,
@@ -183,7 +196,15 @@ export async function sweepStrandedFilings(
         row.ingest_status,
       ],
     );
-    if ((res.meta?.changes ?? 0) > 0) terminalized += 1;
+    if ((res.meta?.changes ?? 0) > 0) {
+      terminalized += 1;
+      const errMsg =
+        `autonomy-sweep: stranded in '${row.ingest_status}' past ${ceilingDays}d ceiling as of ${nowIso}; terminalized for visibility`;
+      await ensureIngestFailureReviewQueueRow(env, row.doc_id, errMsg, {
+        source: 'autonomy_sweep',
+        stage: 'ingest',
+      });
+    }
   }
   return { terminalized };
 }
@@ -407,7 +428,8 @@ export async function sweepFiledDateBackfill(
         signal: controller.signal,
       });
       for (const f of index) {
-        if (f.filingDate) filedDateByDocId.set(f.pipelineDocId, f.filingDate);
+        const iso = normalizeHouseFilingDateToIso(f.filingDate);
+        if (iso) filedDateByDocId.set(f.pipelineDocId, iso);
       }
     } catch (err) {
       console.warn(`autonomySweep: filed-date backfill fetch failed for year ${year}:`, (err as Error).message);
@@ -420,23 +442,11 @@ export async function sweepFiledDateBackfill(
   for (const row of stuck) {
     const filedDate = filedDateByDocId.get(row.doc_id);
     if (!filedDate) continue;
-    const res = await run(
-      env.DB,
-      `UPDATE filings SET filed_date = ? WHERE doc_id = ? AND filed_date IS NULL`,
-      [filedDate, row.doc_id],
-    );
-    if ((res.meta?.changes ?? 0) > 0) {
-      updated += 1;
-      try {
-        await run(
-          env.DB,
-          `UPDATE disclosure_latency_candidates SET filed_date = ? WHERE doc_id = ? AND (filed_date IS NULL OR filed_date = '')`,
-          [filedDate, row.doc_id],
-        );
-      } catch {
-        /* optional table, mirrors watcher.ts's own swallow */
-      }
-    }
+    const applied = await applyHouseFiledDateIfMissing(env, row.doc_id, {
+      iso: filedDate,
+      source: 'index',
+    });
+    if (applied.applied) updated += 1;
   }
   return { updated, yearsFetched: years };
 }
@@ -565,10 +575,13 @@ export interface ResolvedDesyncSweepResult {
  * are ALL resolved=1 yet frozen at a pre-resolution status, so they were
  * invisible to every sweep AND to the health check built to surface them.
  *
- * This sweep owns exactly that population: it does NOT re-open, re-fetch, or
- * re-extract anything (the review outcome stands) — it only stamps the terminal
- * status from review_queue.resolution_kind / ingestion_decisions.  Provider-
- * missing placeholder rows are excluded.  Idempotent and bounded.
+ * This sweep owns exactly that population, plus CT-2453: a filing that is
+ * already published (live transactions and a latest publish decision) but
+ * whose ingest_status is still non-persisted, including `error`, even when
+ * it never had a review_queue row. It does NOT re-open, re-fetch, or
+ * re-extract anything — it only stamps the terminal status. Filings with
+ * no live transactions are left alone. Provider-missing placeholder rows
+ * are excluded. Idempotent and bounded.
  */
 export async function sweepResolvedStatusDesync(
   env: Env,
@@ -613,6 +626,10 @@ export interface AutonomySweepResult {
   completedEmptyRaw: EmptyFetchSweepResult | null;
   /** ingest_status outside IngestStatus, no raw object, no live transactions. */
   ungroundedIngest: EmptyFetchSweepResult | null;
+  /** Genuine ingest failures mirrored onto review_queue + stale-row cleanup. */
+  ingestFailureReview: IngestFailureBackfillResult | null;
+  /** Terminal outbox/DLQ/review-orphan failures with no review_queue row. */
+  terminalFailureReview: TerminalFailureSweepResult | null;
   errors: string[];
 }
 
@@ -1399,6 +1416,8 @@ export async function runAutonomySweeps(
     transientDlq: null,
     completedEmptyRaw: null,
     ungroundedIngest: null,
+    ingestFailureReview: null,
+    terminalFailureReview: null,
     errors,
   };
   const throwIfAborted = () => {
@@ -1433,6 +1452,15 @@ export async function runAutonomySweeps(
     result.stranded = await sweepStrandedFilings(env, now);
   } catch (err) {
     errors.push(`stranded: ${(err as Error).message}`);
+  }
+
+  try {
+    throwIfAborted();
+    const sweep = await sweepIngestFailureReviewQueue(env, { limit: 200 });
+    result.ingestFailureReview = sweep.backfill;
+    result.ingestFailureReview.recovered = sweep.recovered;
+  } catch (err) {
+    errors.push(`ingestFailureReview: ${(err as Error).message}`);
   }
 
   // Reject stubs whose official filing has persisted since (including ones the
@@ -1526,6 +1554,16 @@ export async function runAutonomySweeps(
     result.transientDlq = await sweepTransientDeadLetters(env, now);
   } catch (err) {
     errors.push(`transientDlq: ${(err as Error).message}`);
+  }
+
+  // Rows still failed after the batch above are terminal once their transient
+  // replay budget is spent. Retryable rows (transient error, cycles under the
+  // cap) stay failed for a later batch and are not parked on review_queue.
+  try {
+    throwIfAborted();
+    result.terminalFailureReview = await sweepTerminalFailureReviewQueue(env, { limit: 100 });
+  } catch (err) {
+    errors.push(`terminalFailureReview: ${(err as Error).message}`);
   }
 
   try {

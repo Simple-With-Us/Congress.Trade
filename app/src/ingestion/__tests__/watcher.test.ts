@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
 import { SenateHttpError, SenateProxyEgressError } from '../senateEdgeDeny.ts';
+import { withSenateEfdTransport } from '../senateSource.ts';
 
 const mocks = vi.hoisted(() => ({
   fetchHouseIndex: vi.fn(),
@@ -537,6 +538,21 @@ describe('runWatcher', () => {
     expect(senateSince()).toEqual(new Date(SENATE_NOW.getTime() - 13 * 86_400_000));
   });
 
+  it('runs a prompt Senate poll when residential-proxy recovery catch-up is queued', async () => {
+    const { env } = fakeEnv({}, {}, {
+      'senate_deep_sweep:lastdate': '2026-07-16',
+      'last_poll:senate': SENATE_NOW.toISOString(),
+      'residential-proxy:senate-catchup': SENATE_NOW.toISOString(),
+    });
+    quietHouse();
+    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
+
+    const result = await runWatcher(env, SENATE_NOW);
+
+    expect(result.senate).toBe('success');
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+  });
+
   it('does not consume the day\'s deep sweep when the senate poll fails', async () => {
     const { env, kvPuts } = fakeEnv({}, {}, {
       'last_poll:senate': new Date(SENATE_NOW.getTime() - 6 * 3600_000).toISOString(),
@@ -748,6 +764,19 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 1 });
   });
 
+  it('records the transport that succeeded on the senate source_attempts row', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockResolvedValue(withSenateEfdTransport([], {
+      transport: 'browser-direct',
+      fallback: true,
+    }));
+    const result = await runWatcher(env, T0);
+    expect(result.senate).toBe('success');
+    const receipt = dbRuns.find((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt?.params[2]).toBe('success');
+    expect(receipt?.params[4]).toBe('transport=browser-direct fallback');
+  });
+
   it('keeps the backoff across a restart (the state lives in CONFIG_KV)', async () => {
     const first = fakeEnv();
     mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
@@ -870,7 +899,7 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(warn.mock.calls.some(([msg]) => /senate source degraded/.test(String(msg)))).toBe(false);
   });
 
-  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most every 30 minutes', async () => {
+  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most twice a day', async () => {
     const PROXY = 'http://10.99.0.2:8888';
     const { env, kv } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
     const efdCalls: string[] = [];
@@ -904,11 +933,11 @@ describe('runWatcher senate eFD edge deny (CT-2442)', () => {
     expect(efdCalls).toEqual(['GET /search/', 'POST /search/home/']);
     expect(JSON.parse(kv.get('senate-efd:health')!)).toMatchObject({ state: 'ok', egress: 'proxy' });
 
-    // Then at most every 30 minutes.
+    // Then at most twice a day (12h probe interval).
     await runWatcher(env, at(62));
-    await runWatcher(env, at(90));
+    await runWatcher(env, at(61 + 11 * 60));
     expect(efdCalls).toHaveLength(2);
-    await runWatcher(env, at(91));
+    await runWatcher(env, at(61 + 12 * 60));
     expect(efdCalls).toHaveLength(4);
   });
 });

@@ -548,14 +548,26 @@ describe('dedupeSplitFilerIdentities: EXEC-* twin of a MANUAL-* phantom', () => 
     expect(result.details[0]?.aliasIds).toEqual(['MANUAL-WRIGHT']);
   });
 
-  it('while the phantom is still labelled senate nothing merges (the chamber fix must land first)', async () => {
-    insertFiler({ id: 'EXEC-DOUGLAS-J-BURGUM', fullName: 'Douglas J Burgum', chamber: 'executive', state: '' });
-    insertFiler({ id: 'MANUAL-BURGUM', fullName: 'Douglas J Burgum', chamber: 'senate', state: '' });
+  it('aliases a senate-labelled MANUAL-BURGUM onto EXEC-DOUGLAS-J-BURGUM without rewriting chamber or party', async () => {
+    insertFiler({ id: 'EXEC-DOUGLAS-J-BURGUM', fullName: 'Douglas J Burgum', chamber: 'executive', state: '', party: null });
+    insertFiler({ id: 'MANUAL-BURGUM', fullName: 'Douglas J Burgum', chamber: 'senate', state: '', party: 'Republican' });
     insertTx('MANUAL-BURGUM');
 
-    const result = await dedupeSplitFilerIdentities(env, { dryRun: true });
+    const result = await dedupeSplitFilerIdentities(env);
 
-    expect(result.clustersFound).toBe(0);
+    expect(result.details.find((d) => d.aliasIds.includes('MANUAL-BURGUM'))?.canonicalId).toBe('EXEC-DOUGLAS-J-BURGUM');
+    const phantom = db.prepare("SELECT chamber, party, merged_into FROM filers WHERE bioguide_id = 'MANUAL-BURGUM'").get() as {
+      chamber: string;
+      party: string | null;
+      merged_into: string | null;
+    };
+    expect(phantom).toEqual({ chamber: 'senate', party: 'Republican', merged_into: 'EXEC-DOUGLAS-J-BURGUM' });
+    const canonical = db.prepare("SELECT chamber, party FROM filers WHERE bioguide_id = 'EXEC-DOUGLAS-J-BURGUM'").get() as {
+      chamber: string;
+      party: string | null;
+    };
+    expect(canonical).toEqual({ chamber: 'executive', party: null });
+    expect(db.prepare("SELECT DISTINCT filer_id FROM transactions").all()).toEqual([{ filer_id: 'EXEC-DOUGLAS-J-BURGUM' }]);
   });
 
   it('a real house-* id stays canonical over a MANUAL-* twin that carries more rows', async () => {

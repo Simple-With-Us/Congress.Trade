@@ -15,6 +15,9 @@ import {
   stPeerPricePendingFromSql,
 } from './peerPricePending.ts';
 import { stNotCoveredTickersFromSql } from './notCovered.ts';
+import { stTerminalTickersFromSql, type TerminalTickerSample } from './terminalListing.ts';
+import { parseTerminalReason } from './service.ts';
+import { readPeerPriceDrainLastProgressAt } from './peerPriceDrainProgress.ts';
 import type { PipelineCheck, PipelineStatus } from '../shared/pipelineHealth.ts';
 
 export interface StPeerPricesMetrics {
@@ -22,21 +25,70 @@ export interface StPeerPricesMetrics {
   skip: boolean;
   pending: number;
   neverPricedPending: number;
+  /** ISO time the drain last shrank pending or priced tickers (KV). */
   lastProgressAt: string | null;
+  /** MIN(price_checked_at) over the pending set — informational only. */
+  oldestPendingCheckedAt: string | null;
   corpusLatestDate: string | null;
   freshThrough: string;
   pendingSample: string[];
   /** Stage-4 tickers (ST cannot price them): visible, but never stall/degrade on their own. */
   notCovered: number;
   notCoveredSample: string[];
+  /** Stage-5 tickers (confirmed no longer trading): visible, excluded from pending and the stall clock. */
+  terminal: number;
+  terminalSample: TerminalTickerSample[];
   stallThresholdHours: number;
   stalled: boolean;
   detail: string;
 }
 
+const NO_TERMINAL = { terminal: 0, terminalSample: [] as TerminalTickerSample[] };
+
+function terminalDetailSuffix(terminal: number, sample: TerminalTickerSample[]): string {
+  if (terminal <= 0) return '';
+  const shown = sample.slice(0, 10).map((row) => `${row.ticker} ${row.reason}`).join(', ');
+  return `; ${terminal} no longer trading` + (shown ? ` (${shown})` : '');
+}
+
+async function readTerminalTickers(env: Env): Promise<{ terminal: number; terminalSample: TerminalTickerSample[] }> {
+  try {
+    const row = await get<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n ${stTerminalTickersFromSql()}`,
+    );
+    const terminal = Number(row?.n ?? 0);
+    if (terminal <= 0) return { terminal: 0, terminalSample: [] };
+    const names = await all<{ ticker: string; reason: string | null }>(
+      env.DB,
+      `SELECT sr.ticker AS ticker, sr.price_unavailable_reason AS reason
+         ${stTerminalTickersFromSql()}
+        ORDER BY sr.ticker ASC
+        LIMIT 10`,
+    );
+    return {
+      terminal,
+      terminalSample: names.map((name) => {
+        const parsed = parseTerminalReason(name.reason);
+        return {
+          ticker: name.ticker,
+          reason: parsed?.reason ?? 'no_longer_trading',
+          since: parsed?.since ?? null,
+          lastTrade: parsed?.lastTrade ?? null,
+        };
+      }),
+    };
+  } catch {
+    return { terminal: 0, terminalSample: [] };
+  }
+}
+
 function pendingPriceProgressIdle(lastAt: string | null, now: Date, thresholdMs: number): boolean {
   const lastMs = lastAt ? Date.parse(lastAt) : NaN;
-  if (!Number.isFinite(lastMs)) return false;
+  // A missing, expired, or unparseable drain stamp is idle. Callers only ask
+  // once a non-empty backlog is already in hand, so "no clock" must stall
+  // instead of reading as a healthy drain that has simply never reported.
+  if (!Number.isFinite(lastMs)) return true;
   return now.getTime() - lastMs >= thresholdMs;
 }
 
@@ -69,11 +121,13 @@ export async function collectStPeerPricesMetrics(
       pending: 0,
       neverPricedPending: 0,
       lastProgressAt: null,
+      oldestPendingCheckedAt: null,
       corpusLatestDate: null,
       freshThrough: '',
       pendingSample: [],
       notCovered: 0,
       notCoveredSample: [],
+      ...NO_TERMINAL,
       stallThresholdHours,
       stalled: false,
       detail: 'ST peer prices not configured',
@@ -88,20 +142,20 @@ export async function collectStPeerPricesMetrics(
 
   let pending = 0;
   let neverPricedPending = 0;
-  let lastProgressAt: string | null = null;
+  let oldestPendingCheckedAt: string | null = null;
   let pendingSample: string[] = [];
   try {
-    const row = await get<{ n: number; never_n: number; last_at: string | null }>(
+    const row = await get<{ n: number; never_n: number; oldest_at: string | null }>(
       env.DB,
       `SELECT
          (SELECT COUNT(DISTINCT t.ticker) ${pendingFrom}) AS n,
          (SELECT COUNT(DISTINCT t.ticker) ${neverPricedFrom}) AS never_n,
-         (SELECT MAX(sr.price_checked_at) ${pendingFrom}) AS last_at`,
+         (SELECT MIN(sr.price_checked_at) ${pendingFrom}) AS oldest_at`,
       countAndProgressBinds,
     );
     pending = Number(row?.n ?? 0);
     neverPricedPending = Number(row?.never_n ?? 0);
-    lastProgressAt = row?.last_at ?? null;
+    oldestPendingCheckedAt = row?.oldest_at ?? null;
   } catch {
     return {
       configured: true,
@@ -109,11 +163,13 @@ export async function collectStPeerPricesMetrics(
       pending: 0,
       neverPricedPending: 0,
       lastProgressAt: null,
+      oldestPendingCheckedAt: null,
       corpusLatestDate: null,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
       notCovered: 0,
       notCoveredSample: [],
+      ...NO_TERMINAL,
       stallThresholdHours,
       stalled: false,
       detail: 'ST price stall query failed',
@@ -121,6 +177,7 @@ export async function collectStPeerPricesMetrics(
   }
 
   const corpusLatestDate = await readCorpusLatestPriceDate(env);
+  const lastProgressAt = await readPeerPriceDrainLastProgressAt(env);
 
   // Visibility-only: stage-4 tickers ST cannot price. Best-effort — a failure
   // here must not fail the whole check, and the count never affects status.
@@ -145,6 +202,8 @@ export async function collectStPeerPricesMetrics(
     /* optional */
   }
   const notCoveredSuffix = notCovered > 0 ? `; ${notCovered} not covered by ST` : '';
+  const terminalVisibility = await readTerminalTickers(env);
+  const terminalSuffix = terminalDetailSuffix(terminalVisibility.terminal, terminalVisibility.terminalSample);
 
   if (pending <= 0) {
     return {
@@ -153,14 +212,17 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
+      oldestPendingCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
       notCovered,
       notCoveredSample,
+      terminal: terminalVisibility.terminal,
+      terminalSample: terminalVisibility.terminalSample,
       stallThresholdHours,
       stalled: false,
-      detail: 'ST price refresh moving (no pending tickers)' + notCoveredSuffix,
+      detail: 'ST price refresh moving (no pending tickers)' + notCoveredSuffix + terminalSuffix,
     };
   }
 
@@ -171,16 +233,51 @@ export async function collectStPeerPricesMetrics(
       pending,
       neverPricedPending,
       lastProgressAt,
+      oldestPendingCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample: [],
       notCovered,
       notCoveredSample,
+      terminal: terminalVisibility.terminal,
+      terminalSample: terminalVisibility.terminalSample,
       stallThresholdHours,
       stalled: false,
       detail:
         `ST price tail backlog only (${pending} pending); corpus EOD current through ${pendingParams.freshThrough}` +
-        notCoveredSuffix,
+        notCoveredSuffix +
+        terminalSuffix,
+    };
+  }
+
+  // Brand-new tickers with no price history and no drain clock yet are pending
+  // but the catch-up lane has not stamped progress — do not page until ST has
+  // been attempted or stale-bar backlog exists (neverPricedPending < pending).
+  if (
+    neverPricedPending === pending
+    && oldestPendingCheckedAt == null
+    && lastProgressAt == null
+  ) {
+    return {
+      configured: true,
+      skip: false,
+      pending,
+      neverPricedPending,
+      lastProgressAt,
+      oldestPendingCheckedAt,
+      corpusLatestDate,
+      freshThrough: pendingParams.freshThrough,
+      pendingSample: [],
+      notCovered,
+      notCoveredSample,
+      terminal: terminalVisibility.terminal,
+      terminalSample: terminalVisibility.terminalSample,
+      stallThresholdHours,
+      stalled: false,
+      detail:
+        `${pending} never-priced ticker(s) awaiting first ST drain; no drain progress recorded yet` +
+        notCoveredSuffix +
+        terminalSuffix,
     };
   }
 
@@ -198,23 +295,31 @@ export async function collectStPeerPricesMetrics(
       /* optional */
     }
     const sampleSuffix = pendingSample.length ? `; pending sample: ${pendingSample.join(', ')}` : '';
+    const oldestSuffix = oldestPendingCheckedAt
+      ? `; oldest pending check ${progressAgoLabel(oldestPendingCheckedAt, now)}`
+      : '';
     return {
       configured: true,
       skip: false,
       pending,
       neverPricedPending,
       lastProgressAt,
+      oldestPendingCheckedAt,
       corpusLatestDate,
       freshThrough: pendingParams.freshThrough,
       pendingSample,
       notCovered,
       notCoveredSample,
+      terminal: terminalVisibility.terminal,
+      terminalSample: terminalVisibility.terminalSample,
       stallThresholdHours,
       stalled: false,
       detail:
         `${pending} ticker(s) pending ST EOD/current prices${sampleSuffix}; ` +
-        `price_checked_at progress ${progressAgoLabel(lastProgressAt, now)} on pending set (under ${stallThresholdHours}h threshold)` +
-        notCoveredSuffix,
+        `drain progress ${progressAgoLabel(lastProgressAt, now)} (under ${stallThresholdHours}h threshold)` +
+        oldestSuffix +
+        notCoveredSuffix +
+        terminalSuffix,
     };
   }
 
@@ -231,11 +336,21 @@ export async function collectStPeerPricesMetrics(
     /* optional */
   }
   const sampleSuffix = pendingSample.length ? `; pending sample: ${pendingSample.join(', ')}` : '';
+  const oldestSuffix = oldestPendingCheckedAt
+    ? `; oldest pending check ${progressAgoLabel(oldestPendingCheckedAt, now)}`
+    : '';
+  const idleFor = hoursSinceIso(lastProgressAt, now);
+  // hoursSinceIso returns the word "never", which must not be glued onto "h".
+  const progressClause = idleFor === 'never'
+    ? `drain progress never (threshold ${stallThresholdHours}h)`
+    : `no drain progress in ${idleFor}h (threshold ${stallThresholdHours}h)`;
   const detail =
     `${pending} ticker(s) still need EOD/current prices from Socratic.Trade` +
     sampleSuffix +
-    `; no price_checked_at progress on pending tickers in ${hoursSinceIso(lastProgressAt, now)}h (threshold ${stallThresholdHours}h)` +
-    notCoveredSuffix;
+    `; ${progressClause}` +
+    oldestSuffix +
+    notCoveredSuffix +
+    terminalSuffix;
 
   return {
     configured: true,
@@ -243,11 +358,14 @@ export async function collectStPeerPricesMetrics(
     pending,
     neverPricedPending,
     lastProgressAt,
+    oldestPendingCheckedAt,
     corpusLatestDate,
     freshThrough: pendingParams.freshThrough,
     pendingSample,
     notCovered,
     notCoveredSample,
+    terminal: terminalVisibility.terminal,
+    terminalSample: terminalVisibility.terminalSample,
     stallThresholdHours,
     stalled: true,
     detail,
@@ -276,10 +394,13 @@ export function stPeerPricesMetricsToCheck(metrics: StPeerPricesMetrics): Pipeli
       freshThrough: metrics.freshThrough,
       corpusLatestDate: metrics.corpusLatestDate,
       lastProgressAt: metrics.lastProgressAt,
+      oldestPendingCheckedAt: metrics.oldestPendingCheckedAt,
       stallThresholdHours: metrics.stallThresholdHours,
       pendingSample: metrics.pendingSample,
       notCovered: metrics.notCovered,
       notCoveredSample: metrics.notCoveredSample,
+      terminal: metrics.terminal,
+      terminalSample: metrics.terminalSample,
     },
   };
 }

@@ -105,6 +105,7 @@ import {
   ogeLocalOcrReviewPayload,
   OGE_LOCAL_OCR_EXTRACTOR,
 } from './ogeLocalOcr.ts';
+import { deprecatePredecessorFilingTransactions } from './amendmentPredecessor.ts';
 import { cleanAssetString } from './nameNormalizer.ts';
 import { prepareExtractedTx } from './prepareTx.ts';
 import { mapFiling, type FilingRow } from '../delivery/rows.ts';
@@ -809,40 +810,16 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
     )`;
 
 /**
- * Soft-deprecates live transactions from predecessor filings when an amended filing is published.
+ * Soft-deprecates the live transactions of the filing an amended filing
+ * supersedes.
+ *
+ * CT-2452: the predecessor match used to be "same filer + same filed_date, or
+ * a shared doc-id prefix", which deprecated every sibling PTR filed on the same
+ * day (545 Trump 278-T transactions).  The rule now requires a real
+ * amended-document relationship AND an overlapping reporting period; see
+ * ./amendmentPredecessor.ts for the whole rule and why it fails closed.
  */
-export async function deprecatePredecessorFilingTransactions(
-  db: D1Database,
-  docId: string,
-  filerId: string | null,
-  filedDate: string | null,
-  nowIso: string = new Date().toISOString(),
-): Promise<number> {
-  if (!filerId) return 0;
-  const reason = `superseded by amendment ${docId}`;
-
-  const stmt = `
-    UPDATE transactions
-       SET deprecated_at = ?,
-           deprecated_reason = ?
-     WHERE doc_id IN (
-       SELECT doc_id FROM filings
-        WHERE filer_id = ? AND doc_id <> ?
-          AND ingest_status = 'persisted'
-          AND (
-            (filed_date IS NOT NULL AND filed_date = ?)
-            OR (doc_id LIKE 'E-%' AND SUBSTR(doc_id, 1, 35) = SUBSTR(?, 1, 35))
-          )
-     ) AND deprecated_at IS NULL
-  `;
-  try {
-    const res = await run(db, stmt, [nowIso, reason, filerId, docId, filedDate ?? '', docId]);
-    return res.meta?.changes ?? 0;
-  } catch (err) {
-    console.warn('deprecatePredecessorFilingTransactions failed:', docId, (err as Error).message);
-    return 0;
-  }
-}
+export { deprecatePredecessorFilingTransactions };
 
 /**
  * Persist all rows and resolve the review item in one D1 batch. Every statement

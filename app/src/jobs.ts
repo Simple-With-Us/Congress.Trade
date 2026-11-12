@@ -15,9 +15,12 @@ import { run, all, batch as batchStatements } from './shared/db.ts';
 import { runEnrichment } from './enrichment/service.ts';
 import { buildPriceRefreshClient, lastTradingDay, runPriceRefresh } from './prices/service.ts';
 import {
+  markDisclosureUnsupportedPeerPrices,
   markStuckPeerPriceTickersNotCovered,
   recheckNotCoveredPeerPrices,
 } from './prices/notCovered.ts';
+import { markTerminalPeerPriceTickers } from './prices/terminalListing.ts';
+import { sweepStUnpriceablePeerPriceTickers } from './prices/stPeerPriceable.ts';
 import { notifyAdmin } from './alerts/notify.ts';
 import { shareWithPeer, type PeerShareInput } from './share/outbound.ts';
 import { runFreshnessCheck } from './share/freshness.ts';
@@ -32,15 +35,22 @@ import { isD1RowBudgetExceeded } from './shared/d1Budget.ts';
 import { runR2UsageSummary } from './shared/r2Usage.ts';
 import { backfillCurrentPricesFromEod } from './prices/service.ts';
 import {
+  PEER_PRICE_CATCHUP_FETCH_CONCURRENCY,
   PEER_PRICE_CATCHUP_MAX_PER_MINUTE,
   PEER_PRICE_CATCHUP_MAX_TICKERS,
   parsePeerPriceCatchUpState,
   peerPriceCatchUpAfterRun,
+  peerPriceCatchUpAnchoredRunCap,
   peerPriceCatchUpGate,
   peerPriceSnapshotNeedsCatchUp,
+  isProviderLevelPriceError,
   readPeerPricePending,
   type PeerPriceCatchUpState,
 } from './prices/peerPriceCatchUp.ts';
+import {
+  peerPriceDrainMadeProgress,
+  recordPeerPriceDrainProgress,
+} from './prices/peerPriceDrainProgress.ts';
 // NOTE: runHouseReconciler (./ingestion/houseReconciler) is intentionally not
 // imported here yet -- it is reserved for future scheduled-job wiring. Importing
 // it unused would trip noUnusedLocals (enabled in this PR).
@@ -71,8 +81,9 @@ import {
 const LANE_KEY_PREFIX = 'jobs:daily:lastok:';
 /**
  * Price catch-up state (CT-2445), a JSON PeerPriceCatchUpState keyed to the
- * freshThrough session rather than the UTC day.  Replaces the once-per-UTC-day
- * `jobs:daily:lastok:market-data-price-catchup` stamp.
+ * freshThrough session rather than the UTC day;  the budgets inside it roll
+ * on the ET day (see PeerPriceCatchUpState.budgetDay).  Replaces the
+ * once-per-UTC-day `jobs:daily:lastok:market-data-price-catchup` stamp.
  */
 const PRICE_CATCHUP_STATE_KEY = 'jobs:market-data:price-catchup-state';
 /** Survives a long weekend plus a holiday;  a stale session resets anyway. */
@@ -465,7 +476,12 @@ export async function runNotCoveredRecheckLane(
 
 /**
  * Bounded peer-price catch-up (CT-2445), run from the stamped market-data
- * fast path on every hourly tick.  Order matters for cost:  the KV-only gate
+ * fast path on every hourly tick AND from its own `peer-price-catchup` cron
+ * lane (deno/cronLanes.ts), so the drain does not depend on the market-data
+ * lane's daily stamp:  a full lane that cannot complete (deadline abort on a
+ * deep backlog) never stamps, and a stamp-gated drain would never engage.
+ * The KV gate below makes the extra entry point a cheap no-op when a run is
+ * not due.  Order matters for cost:  the KV-only gate
  * (session cap, no-progress park, spacing) runs before any D1 read, and the
  * run is claimed in KV before any Socratic.Trade call, so a throw or a 429
  * abort still waits out the spacing instead of retrying every tick.
@@ -475,24 +491,76 @@ export async function runNotCoveredRecheckLane(
  * not-covered sweep is NOT run here:  it needs a full-set walk, which only the
  * daily refresh does.  not_covered tickers stay excluded by the pending SQL.
  */
+/** Local classification only. A failure must not block the price lane. */
+async function sweepTerminalPeerPrices(env: Env, now: Date): Promise<void> {
+  try {
+    const swept = await markTerminalPeerPriceTickers(env, now);
+    if (swept.marked > 0) {
+      console.log(`terminal peer-price sweep marked ${swept.marked} ticker(s)`);
+    }
+  } catch (err) {
+    console.warn('terminal peer-price sweep failed:', (err as Error).message);
+  }
+}
+
+async function sweepUnpriceablePeerPrices(env: Env, now: Date): Promise<void> {
+  try {
+    const swept = await sweepStUnpriceablePeerPriceTickers(env, now);
+    if (swept.marked > 0) {
+      console.log(`unpriceable peer-price sweep marked ${swept.marked} ticker(s)`);
+    }
+  } catch (err) {
+    console.warn('unpriceable peer-price sweep failed:', (err as Error).message);
+  }
+}
+
 export async function maybeRunPeerPriceCatchUp(
   env: Env,
   now: Date,
   opts: { signal?: AbortSignal } = {},
 ): Promise<DailyLaneStatus> {
+  // Stored last-trade evidence only. A parked catch-up still classifies, so a
+  // dead ticker does not keep the stall clock until the next full refresh.
+  // The statement is marked so it does not consume the catch-up's probe.
+  await sweepTerminalPeerPrices(env, now);
+  await sweepUnpriceablePeerPrices(env, now);
   const freshThrough = lastTradingDay(now);
   let state: PeerPriceCatchUpState;
   try {
-    state = parsePeerPriceCatchUpState(await env.CONFIG_KV.get(PRICE_CATCHUP_STATE_KEY), freshThrough);
+    state = parsePeerPriceCatchUpState(await env.CONFIG_KV.get(PRICE_CATCHUP_STATE_KEY), freshThrough, now);
   } catch {
     return 'stamped'; // no KV → skip rather than risk an unbounded hourly walk
   }
-  if (peerPriceCatchUpGate(state, now) !== 'ok') return 'stamped';
-  const before = await readPeerPricePending(env, now);
+  const beforeProbe = await readPeerPricePending(env, now);
+  const runCap = peerPriceCatchUpAnchoredRunCap(state, beforeProbe?.pending ?? null);
+  if (peerPriceCatchUpGate(state, now, { maxRuns: runCap }) !== 'ok') return 'stamped';
+  const before = beforeProbe;
   if (!before || !peerPriceSnapshotNeedsCatchUp(before)) return 'stamped';
+  try {
+    const disclosure = await markDisclosureUnsupportedPeerPrices(env, now);
+    if (disclosure.marked > 0) {
+      console.log(`catch-up disclosure sweep marked ${disclosure.marked} ticker(s) not covered`);
+    }
+  } catch (err) {
+    console.warn('catch-up disclosure sweep failed:', (err as Error).message);
+  }
+  try {
+    const stuck = await markStuckPeerPriceTickersNotCovered(env, now);
+    if (stuck.marked > 0) {
+      console.log(`catch-up stuck sweep marked ${stuck.marked} ticker(s) not covered`);
+    }
+  } catch (err) {
+    console.warn('catch-up stuck sweep failed:', (err as Error).message);
+  }
   if (await dailyBudgetExceeded(env, 'price catch-up')) return 'budget';
 
-  const claimed: PeerPriceCatchUpState = { ...state, runs: state.runs + 1, lastRunAt: now.toISOString() };
+  const claimed: PeerPriceCatchUpState = {
+    ...state,
+    runCap,
+    runs: state.runs + 1,
+    attempts: state.attempts + 1,
+    lastRunAt: now.toISOString(),
+  };
   try {
     await env.CONFIG_KV.put(PRICE_CATCHUP_STATE_KEY, JSON.stringify(claimed), {
       expirationTtl: PRICE_CATCHUP_STATE_TTL_S,
@@ -517,6 +585,7 @@ export async function maybeRunPeerPriceCatchUp(
   let status: DailyLaneStatus = 'ran';
   let lastCursorSeq: number | null = null;
   let reachedEndOfPending = false;
+  let refresh: { aborted?: boolean; tickersPriced?: number; errors: string[] } | null = null;
   try {
     const configured = stPeerMaxPerMinute(await resolveSecrets(env, [...ST_PEER_PACE_SECRET_NAMES]));
     const maxPerMinute = Math.min(configured ?? PEER_PRICE_CATCHUP_MAX_PER_MINUTE, PEER_PRICE_CATCHUP_MAX_PER_MINUTE);
@@ -526,7 +595,11 @@ export async function maybeRunPeerPriceCatchUp(
       maxPerMinute,
       signal: opts.signal,
       afterCursorSeq: claimed.cursorSeq,
+      // Hide Socratic.Trade's ~10s cold-fetch latency behind a small pool;
+      // the shared pacer still caps the aggregate rate at maxPerMinute.
+      concurrency: PEER_PRICE_CATCHUP_FETCH_CONCURRENCY,
     });
+    refresh = r;
     lastCursorSeq = r.lastCursorSeq ?? null;
     reachedEndOfPending = r.reachedEndOfPending === true;
     if (r.aborted) status = 'error';
@@ -535,26 +608,59 @@ export async function maybeRunPeerPriceCatchUp(
     status = 'error';
   }
 
+  // No-engagement run (the outage signature):  the refresh completed without
+  // pricing a single ticker and every attempt it recorded failed at the
+  // provider level.  A 503 from ST is non-fatal per ticker, so an ST outage
+  // produces exactly this — a "completed" run that never engaged ST's data
+  // path.  It must not count toward the no-progress park, and it hands its
+  // session claim back, or an outage eats the whole session budget and the
+  // drain stays gated for hours after ST recovers (observed 2026-11-04:  ST
+  // back at 7:42 PM, the 8:07 PM tick still gated, 712 tickers pending, no
+  // progress since Nov 3 12:59 AM).  The classification is deliberately
+  // narrow (review follow-up, 2026-11-05):  a zero-priced run whose errors
+  // include ANY ticker-level failure counts as engaged — it spends its run
+  // and can park — and even a genuine outage is bounded, because the claim
+  // above already counted this attempt against the per-session attempt cap
+  // whether or not the run claim is handed back below.
+  const providerNeverEngaged =
+    status !== 'error' && refresh !== null && !refresh.aborted &&
+    (refresh.tickersPriced ?? 0) === 0 && refresh.errors.length > 0 &&
+    refresh.errors.every(isProviderLevelPriceError);
+
   // Same clock as the before-count, so both count the same pending set even
   // when the run crosses the midnight-ET rollover.
   const after = await readPeerPricePending(env, now);
+  const tickersPriced = refresh?.tickersPriced ?? 0;
   const next = peerPriceCatchUpAfterRun(claimed, {
     pendingBefore: before.pending,
     pendingAfter: after?.pending ?? null,
     lastCursorSeq,
     reachedEndOfPending,
-    failed: status === 'error',
+    failed: status === 'error' || providerNeverEngaged,
+    spendRun: !providerNeverEngaged,
+    tickersPriced,
   });
+  if (
+    peerPriceDrainMadeProgress({
+      pendingBefore: before.pending,
+      pendingAfter: after?.pending ?? null,
+      tickersPriced,
+    })
+  ) {
+    await recordPeerPriceDrainProgress(env, now);
+  }
   console.log(
     'price catch-up:',
     JSON.stringify({
       freshThrough,
       run: next.runs,
+      attempts: next.attempts,
       status,
       pendingBefore: before.pending,
       pendingAfter: after?.pending ?? null,
       noProgressRuns: next.noProgressRuns,
       cursorSeq: next.cursorSeq,
+      providerNeverEngaged,
     }),
   );
   try {
@@ -594,7 +700,8 @@ export async function maybeRunDailyMarketDataJobs(
     // The 2026-10-14/15 price refresh threw on a missing column and the
     // catch below still stamped the day, so the corpus sat one session
     // behind until the next UTC date.  The catch-up retries that, bounded per
-    // freshThrough session (CT-2445):  see maybeRunPeerPriceCatchUp.
+    // ET day within the freshThrough session (CT-2445):  see
+    // maybeRunPeerPriceCatchUp.
     return await maybeRunPeerPriceCatchUp(env, now, { signal: opts.signal });
   }
 
@@ -664,6 +771,9 @@ export async function maybeRunDailyMarketDataJobs(
   }
   let priceRefreshFailed = false;
   let priceRefreshAttemptedAllPending = false;
+  await sweepTerminalPeerPrices(env, now);
+  await sweepUnpriceablePeerPrices(env, now);
+  const pricePendingBefore = await readPeerPricePending(env, now);
   try {
     const r = await runPriceRefresh(env, { maxPerMinute, signal: opts.signal });
     priceRefreshAttemptedAllPending = r.attemptedAllPending;
@@ -671,6 +781,16 @@ export async function maybeRunDailyMarketDataJobs(
     share.prices = r.sharePrices;
     share.spx = r.shareSpx;
     if (r.aborted) priceRefreshFailed = true;
+    const pricePendingAfter = await readPeerPricePending(env, now);
+    if (
+      peerPriceDrainMadeProgress({
+        pendingBefore: pricePendingBefore?.pending ?? 0,
+        pendingAfter: pricePendingAfter?.pending ?? null,
+        tickersPriced: r.tickersPriced,
+      })
+    ) {
+      await recordPeerPriceDrainProgress(env, now);
+    }
   } catch (err) {
     console.warn('daily price refresh failed:', (err as Error).message);
     errors.push('prices: ' + (err as Error).message);
@@ -687,6 +807,14 @@ export async function maybeRunDailyMarketDataJobs(
   // leaves tickers unattempted, so a stale price_checked_at says nothing
   // about ST.
   if (!priceRefreshFailed && priceRefreshAttemptedAllPending) {
+    try {
+      const disclosure = await markDisclosureUnsupportedPeerPrices(env, now);
+      if (disclosure.marked > 0) {
+        console.log(`not-covered disclosure sweep marked ${disclosure.marked} unsupported ticker(s)`);
+      }
+    } catch (err) {
+      console.warn('not-covered disclosure sweep failed:', (err as Error).message);
+    }
     try {
       const swept = await markStuckPeerPriceTickersNotCovered(env, now);
       if (swept.marked > 0) {

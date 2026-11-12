@@ -36,7 +36,13 @@ import {
 } from './probeSchedule.ts';
 import { logProbeCadence, type ProbeCadenceAuthority } from './probeCadenceLog.ts';
 import { fetchHouseIndex, pollHouseLiveSearch } from './houseSource.ts';
-import { fetchSenatePtrFilings, type SenateFiling } from './senateSource.ts';
+import { applyHouseFiledDateIfMissing, normalizeHouseFilingDateToIso } from './houseFiledDate.ts';
+import {
+  fetchSenatePtrFilings,
+  formatSenateEfdTransportNote,
+  readSenateEfdTransport,
+  type SenateFiling,
+} from './senateSource.ts';
 import {
   clearSenateEdgeBackoff,
   isSenateEdgeBackoffActive,
@@ -52,7 +58,7 @@ import {
   type SenateEdgeBackoffState,
   type SenateHttpError,
 } from './senateEdgeDeny.ts';
-import { refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
+import { consumeResidentialProxySenateCatchup, refreshResidentialProxyHealth } from './residentialProxyHealth.ts';
 import { refreshSenateRelayHealth } from './senateRelayHealth.ts';
 import { recordDisclosureLatencyCandidate, storageMissing } from './tradeLatency.ts';
 import { enqueueIngestionOutboxNow, ingestionOutboxInsertForDoc } from './outbox.ts';
@@ -153,13 +159,7 @@ export function preclassifyDocKind(
 }
 
 function normalizeFilingDate(raw: string | null | undefined): string | null {
-  const s = (raw ?? '').trim();
-  if (!s) return null;
-  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(s);
-  if (us) return `${us[3]}-${us[1].padStart(2, '0')}-${us[2].padStart(2, '0')}`;
-  return s.slice(0, 10);
+  return normalizeHouseFilingDateToIso(raw);
 }
 
 function slugPart(raw: string): string {
@@ -481,28 +481,7 @@ export async function insertFilingIfNew(
   // ZIP later surfaces the same doc WITH a date, so COALESCE it in then instead
   // of leaving the row permanently dateless.
   if (filedDate) {
-    await run(env.DB, 'UPDATE filings SET filed_date = ? WHERE doc_id = ? AND filed_date IS NULL', [
-      filedDate,
-      f.docId,
-    ]);
-    // Same backfill on the latency candidate row: recordDisclosureLatencyCandidate
-    // only runs for genuinely-new discoveries (see persistAndEnqueue), so a
-    // duplicate discovery that finally supplies a filed_date (e.g. the bulk ZIP
-    // confirming a live-search-only doc) would otherwise leave
-    // disclosure_latency_candidates.filed_date permanently NULL, breaking the
-    // FMP matcher's filer/date fallback for that filing. disclosure_latency_candidates
-    // is an optional table (migration 0021); swallow a missing-table error the
-    // same way recordDisclosureLatencyCandidate does rather than aborting the
-    // whole discovery on a deployment where it hasn't been applied yet.
-    try {
-      await run(
-        env.DB,
-        'UPDATE disclosure_latency_candidates SET filed_date = ? WHERE doc_id = ? AND (filed_date IS NULL OR filed_date = "")',
-        [filedDate, f.docId],
-      );
-    } catch (err) {
-      if (!storageMissing(err)) throw err;
-    }
+    await applyHouseFiledDateIfMissing(env, f.docId, { iso: filedDate, source: 'index' });
   }
   if (filerId) {
     await run(env.DB, 'UPDATE filings SET filer_id = ? WHERE doc_id = ? AND filer_id IS NULL', [
@@ -1088,7 +1067,14 @@ async function pollSenate(env: Env, now: Date, signal?: AbortSignal): Promise<nu
   const { count: newCount } = await persistAndEnqueue(env, discovered, nowIso, { prevProbeAt: prevAttemptAt, probeIntervalSec });
   await logPoll(env, 'senate', nowIso, newCount, nowIso);
   await setLastPollAt(env, 'senate', now);
-  await recordSourceAttempt(env, 'senate', nowIso, 'success', newCount, null);
+  await recordSourceAttempt(
+    env,
+    'senate',
+    nowIso,
+    'success',
+    newCount,
+    formatSenateEfdTransportNote(readSenateEfdTransport(filings)),
+  );
   // Stamp the deep sweep ONLY after a fully successful poll: a 403 day must
   // not consume the day's widened window.
   if (deepSweepDue && env.CONFIG_KV) {
@@ -1346,7 +1332,9 @@ export async function runWatcher(
       now,
     );
     result.senateCadence = senateDecision;
-    if (senateDecision.poll) {
+    const proxyCatchup = !senateDecision.poll && await consumeResidentialProxySenateCatchup(env);
+    const senatePollDue = senateDecision.poll || proxyCatchup;
+    if (senatePollDue) {
       senateEdgeBackoff = await readSenateEdgeBackoff(env);
       if (senateEdgeBackoff && lastSenate && Date.parse(senateEdgeBackoff.lastDeniedAt) <= lastSenate.getTime()) {
         senateEdgeBackoff = null;
@@ -1359,8 +1347,8 @@ export async function runWatcher(
         // instead of the 600 s failure skip.  polling_senate stays stalled
         // and names the backoff meanwhile.
         result.senateEdgeBackoffUntil = senateEdgeBackoff.until;
-      } else if (lastAttemptFailed && elapsedSec < 600) {
-        // Skip this poll tick to respect failure backoff
+      } else if (lastAttemptFailed && elapsedSec < 600 && !proxyCatchup) {
+        // Skip this poll tick to respect failure backoff (proxy recovery catch-up bypasses)
       } else {
         await setLastAttemptAt(env, 'senate', now);
         await pollSenate(env, now, watcherSourceIoSignal(options.signal));

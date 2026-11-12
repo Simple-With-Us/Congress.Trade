@@ -566,65 +566,76 @@ export function scanOgeRows(text: string): OgeRowScan {
   const searchText = headerMatch
     ? normalized.slice(headerMatch.index + headerMatch[0].length)
     : normalized;
+  // A multi-page 278-T repeats the table header at the top of every page, and
+  // the merged text puts the previous page's footer ("Mody, Arjun - Page 3")
+  // or unrelated prose right before it.  Scanned as one string, ROW_RE took
+  // that footer digit (or the "30" in "30 DAYS AGO") as the row number and
+  // glued the whole header onto the next row's asset name, so the real row
+  // number went missing and the filing parked as oge_rows_incomplete
+  // (E-2026-arjun-mody-08-06-2026-278t rows 12, 31, 46).  Each repeated header
+  // starts a fresh segment, so a row can never begin before a header.
+  const segments = headerMatch ? searchText.split(TABLE_HEADER_RE) : [searchText];
 
   const rows: OgeScannedRow[] = [];
   const rowIndexes: number[] = [];
-  ROW_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = ROW_RE.exec(searchText)) !== null) {
-    const amountSpan = amountPrefixLength(m[5]);
-    if (amountSpan < m[5].length) {
-      const extra = m[5].length - amountSpan;
-      m[0] = m[0].slice(0, m[0].length - extra);
-      m[5] = m[5].slice(0, amountSpan);
-      ROW_RE.lastIndex -= extra;
-    }
-    const [matchText, descriptionRaw, typeWord, dateRaw, notification, amountRaw] = m;
-    const indexMatch = /^(\d{1,5})/.exec(matchText);
-    const index = indexMatch ? Number(indexMatch[1]) : null;
-    if (index !== null) rowIndexes.push(index);
-    const description = descriptionRaw.trim();
-    const tickerMatch = TICKER_SUFFIX_RE.exec(description);
-    const ticker = tickerMatch ? normalizeTicker(tickerMatch[1]) : null;
-    const assetName = (ticker ? description.replace(TICKER_SUFFIX_RE, '') : description).trim() || '(unknown)';
-    const txType = TX_TYPE_MAP[typeWord.toLowerCase()] ?? 'B';
-    const txDate = toIsoDate(dateRaw);
-    const { min, max } = parseAmountRange(amountRaw);
-    const hasDate = /^\d{4}-\d{2}-\d{2}$/.test(txDate);
-    const hasAmount = min !== null;
-    // ROW_RE requires description+type+date+amount to all be present for any
-    // match, so every row here already has the four core fields; the only
-    // thing that can still be "incomplete" is a date/amount that matched the
-    // regex shape but failed to parse cleanly (e.g. an out-of-range date).
-    const confidence = hasDate && hasAmount ? COMPLETE_ROW_CONFIDENCE : INCOMPLETE_ROW_CONFIDENCE;
+  for (const segment of segments) {
+    ROW_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ROW_RE.exec(segment)) !== null) {
+      const amountSpan = amountPrefixLength(m[5]);
+      if (amountSpan < m[5].length) {
+        const extra = m[5].length - amountSpan;
+        m[0] = m[0].slice(0, m[0].length - extra);
+        m[5] = m[5].slice(0, amountSpan);
+        ROW_RE.lastIndex -= extra;
+      }
+      const [matchText, descriptionRaw, typeWord, dateRaw, notification, amountRaw] = m;
+      const indexMatch = /^(\d{1,5})/.exec(matchText);
+      const index = indexMatch ? Number(indexMatch[1]) : null;
+      if (index !== null) rowIndexes.push(index);
+      const description = descriptionRaw.trim();
+      const tickerMatch = TICKER_SUFFIX_RE.exec(description);
+      const ticker = tickerMatch ? normalizeTicker(tickerMatch[1]) : null;
+      const assetName = (ticker ? description.replace(TICKER_SUFFIX_RE, '') : description).trim() || '(unknown)';
+      const txType = TX_TYPE_MAP[typeWord.toLowerCase()] ?? 'B';
+      const txDate = toIsoDate(dateRaw);
+      const { min, max } = parseAmountRange(amountRaw);
+      const hasDate = /^\d{4}-\d{2}-\d{2}$/.test(txDate);
+      const hasAmount = min !== null;
+      // ROW_RE requires description+type+date+amount to all be present for any
+      // match, so every row here already has the four core fields; the only
+      // thing that can still be "incomplete" is a date/amount that matched the
+      // regex shape but failed to parse cleanly (e.g. an out-of-range date).
+      const confidence = hasDate && hasAmount ? COMPLETE_ROW_CONFIDENCE : INCOMPLETE_ROW_CONFIDENCE;
 
-    rows.push({
-      index,
-      typeWord,
-      dateRaw,
-      notification: notification ?? null,
-      amountRaw,
-      rawText: matchText.trim(),
-      tx: {
-        txDate: hasDate ? txDate : null,
-        owner: null, // 278-T has no per-row owner column (unlike House SP/DC/JT codes)
-        assetName,
-        ticker,
-        assetType: null,
-        assetTypeName: null,
-        txType,
-        amountMin: min,
-        amountMax: max,
-        isOption: detectOption(matchText),
-        capGainsOver200: false,
+      rows.push({
+        index,
+        typeWord,
+        dateRaw,
+        notification: notification ?? null,
+        amountRaw,
         rawText: matchText.trim(),
-        confidence,
-      },
-    });
-    // Avoid an infinite loop on a zero-length match (shouldn't happen given
-    // ROW_RE always consumes at least the row-number + suffix, but a global
-    // regex with a zero-width overall match would otherwise stall exec()).
-    if (m.index === ROW_RE.lastIndex) ROW_RE.lastIndex += 1;
+        tx: {
+          txDate: hasDate ? txDate : null,
+          owner: null, // 278-T has no per-row owner column (unlike House SP/DC/JT codes)
+          assetName,
+          ticker,
+          assetType: null,
+          assetTypeName: null,
+          txType,
+          amountMin: min,
+          amountMax: max,
+          isOption: detectOption(matchText),
+          capGainsOver200: false,
+          rawText: matchText.trim(),
+          confidence,
+        },
+      });
+      // Avoid an infinite loop on a zero-length match (shouldn't happen given
+      // ROW_RE always consumes at least the row-number + suffix, but a global
+      // regex with a zero-width overall match would otherwise stall exec()).
+      if (m.index === ROW_RE.lastIndex) ROW_RE.lastIndex += 1;
+    }
   }
   return {
     rows,

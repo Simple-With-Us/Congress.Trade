@@ -16,6 +16,7 @@ import {
 } from '../normalizer.ts';
 import type { Env, Filing, ParsedTx } from '../../shared/types.ts';
 import { parseOgeTransactionRows } from '../ogeText.ts';
+import { simplifyCompanyName } from '../nameNormalizer.ts';
 
 beforeEach(() => {
   clearResolverCache();
@@ -37,6 +38,7 @@ interface Captured {
   batches: string[][];
   batchParams: unknown[][][];
   auditRows: unknown[][];
+  revisionAuditRows: unknown[][];
   masterReads: number;
   deprecated: unknown[][];
 }
@@ -53,6 +55,7 @@ function makeEnv(
     };
     refuseClose?: boolean;
     liveTxMatch?: boolean;
+    livePipelineRows?: Array<Record<string, unknown>>;
   } = {},
 ) {
   const cap: Captured = {
@@ -64,6 +67,7 @@ function makeEnv(
     batches: [],
     batchParams: [],
     auditRows: [],
+    revisionAuditRows: [],
     masterReads: 0,
     deprecated: [],
   };
@@ -83,6 +87,22 @@ function makeEnv(
         if (/FROM securities_master/i.test(sql)) {
           cap.masterReads += 1;
           return { results: securities as unknown as T[] };
+        }
+        if (
+          opts.livePipelineRows
+          && /FROM transactions/i.test(sql)
+          && /deprecated_at IS NULL/i.test(sql)
+        ) {
+          if (/tx_date, owner, asset_name/i.test(sql)) {
+            return { results: opts.livePipelineRows as unknown as T[] };
+          }
+          if (/SELECT id FROM transactions/i.test(sql)) {
+            return {
+              results: opts.livePipelineRows.map((row, index) => ({
+                id: String(row.id ?? `live-${index}`),
+              })) as unknown as T[],
+            };
+          }
         }
         return { results: [] as T[] };
       },
@@ -126,6 +146,7 @@ function makeEnv(
           cap.reviewSql.push(sql);
         }
         else if (/INSERT(?: OR IGNORE)? INTO ingestion_decisions/i.test(sql)) cap.auditRows.push(this._params);
+        else if (/INSERT INTO review_revision_audit/i.test(sql)) cap.revisionAuditRows.push(this._params);
         else if (/UPDATE filings/i.test(sql)) cap.filingUpdates.push(this._params);
         else if (/SET deprecated_at/i.test(sql)) cap.deprecated.push(this._params);
         return { success: true, meta: { changes } } as unknown;
@@ -455,6 +476,40 @@ describe('normalize', () => {
     const { env, cap } = makeEnv([{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }]);
     const result = await normalize(env, filing(), [tx({ amountMin: null, amountMax: null })]);
     expect(result.needsReview).toBe(true);
+    expect(cap.reviewRows).toHaveLength(1);
+    expect(String(cap.reviewRows[0][1])).toContain('no_amount');
+  });
+
+  it('local Grok vision holds the filing when every row omitted the amount', async () => {
+    const { env, cap } = makeEnv([]);
+    const result = await normalize(
+      env,
+      filing({ chamber: 'house', docKind: 'scanned_pdf', extractor: 'local_grok_cli_v1' }),
+      [
+        tx({
+          ticker: null,
+          assetName: 'Bridge Builder Sm/Mid Value',
+          txType: 'S',
+          amountMin: null,
+          amountMax: null,
+          confidence: 0.97,
+          rawText: 'Bridge Builder Sm/Mid Value',
+        }),
+        tx({
+          ticker: null,
+          assetName: 'Vng Growth Index',
+          txType: 'S',
+          amountMin: null,
+          amountMax: null,
+          confidence: 0.97,
+          rawText: 'Vng Growth Index',
+        }),
+      ],
+      { extractor: 'local_grok_cli_v1', source: 'local_mac' },
+    );
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
     expect(cap.reviewRows).toHaveLength(1);
     expect(String(cap.reviewRows[0][1])).toContain('no_amount');
   });
@@ -831,6 +886,39 @@ describe('normalize', () => {
     expect(sql).not.toMatch(/SET resolved = 1/i);
     expect(cap.auditRows.some((row) => row[2] === 'oge_text_unreadable' && row[3] === 'oge_text_unreadable')).toBe(true);
     expect(cap.auditRows.some((row) => row[2] === 'rejected')).toBe(false);
+  });
+
+  it('identical pipeline replay resolves open review without bumping review_revision (CT-2510)', async () => {
+    const livePipelineRows = [{
+      tx_date: '2024-06-14',
+      owner: 'self',
+      asset_name: 'Apple Inc.',
+      ticker: 'AAPL',
+      tx_type: 'B',
+      amount_min: 1001,
+      amount_max: 15000,
+      is_option: 0,
+      cap_gains_over_200: 0,
+      filing_status: null,
+      subholding: null,
+      location: null,
+      description: null,
+      supplemental_text: null,
+    }];
+    const { env, cap } = makeEnv(
+      [{ ticker: 'AAPL', name: 'Apple Inc.', aliases: '[]' }],
+      {
+        resolvedReview: { resolved: 0, review_revision: 4, agreement_suppressed_at: null },
+        livePipelineRows,
+      },
+    );
+    const result = await normalize(env, filing(), [tx()]);
+    expect(result.published).toBe(true);
+    const reviewBumpSql = cap.batches.flat().find((sql) => /UPDATE review_queue/i.test(sql) && /review_revision/i.test(sql));
+    expect(reviewBumpSql).toBeDefined();
+    expect(reviewBumpSql).toMatch(/review_revision = review_revision(?!\s*\+ 1)/);
+    expect(cap.batches.flat().some((sql) => /SET resolved = 1/i.test(sql))).toBe(true);
+    expect(cap.revisionAuditRows.some((row) => row[3] === 'pipeline_publish_identical_noop')).toBe(true);
   });
 
   it('closes a refused executive extract only against the captured review revision', async () => {
@@ -1642,6 +1730,80 @@ describe('scoreFields ticker/asset-name consistency (informational, unpenalized)
     expect(scored.flags).not.toContain('ticker_asset_mismatch');
   });
 
+  it('does not flag Vanguard ETF rows when securities_ref uses longer fund titles (CT-2480)', () => {
+  const vanguardEtfCases: Array<{ ticker: string; assetName: string; refName: string }> = [
+    {
+      ticker: 'VTI',
+      assetName: 'Vanguard Total Stock Market ETF',
+      refName: 'Vanguard Total Stock Market Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VUG',
+      assetName: 'Vanguard Growth Index Fund ETF Shares',
+      refName: 'Vanguard Growth Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VXUS',
+      assetName: 'Vanguard Total International Stock ETF',
+      refName: 'Vanguard Total International Stock Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VGT',
+      assetName: 'Vanguard Information Technology Index Fund ETF',
+      refName: 'Vanguard Information Technology Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VWO',
+      assetName: 'Vanguard FTSE Emerging Markets ETF',
+      refName: 'Vanguard FTSE Emerging Markets Index Fund ETF Shares',
+    },
+    {
+      ticker: 'VEA',
+      assetName: 'Vanguard FTSE Developed Markets ETF',
+      refName: 'Vanguard FTSE Developed Markets Index Fund ETF Shares',
+    },
+    {
+      ticker: 'IVV',
+      assetName: 'iShares Core S&P 500 ETF',
+      refName: 'iShares Core S&P 500 Index ETF',
+    },
+    {
+      ticker: 'SPY',
+      assetName: 'SPDR S&P 500 ETF Trust',
+      refName: 'SPDR S&P 500 ETF',
+    },
+    {
+      ticker: 'SCHB',
+      assetName: 'Schwab U.S. Broad Market ETF',
+      refName: 'Schwab U.S. Broad Market ETF Shares',
+    },
+  ];
+
+  for (const { ticker, assetName, refName } of vanguardEtfCases) {
+    const nameIndex: NameIndex = new Map([[ticker, simplifyCompanyName(refName)]]);
+    const scored = scoreFields(
+      0.97,
+      { ...baseFields, ticker, assetName },
+      '2024-07-01',
+      passthroughResolve,
+      nameIndex,
+    );
+    expect(scored.flags, `${ticker} ${assetName}`).not.toContain('ticker_asset_mismatch');
+  }
+  });
+
+  it('still flags AAPL when the asset name is Microsoft Corp', () => {
+    const nameIndex: NameIndex = new Map([['AAPL', simplifyCompanyName('Apple Inc')]]);
+    const scored = scoreFields(
+      0.97,
+      { ...baseFields, ticker: 'AAPL', assetName: 'Microsoft Corp' },
+      '2024-07-01',
+      passthroughResolve,
+      nameIndex,
+    );
+    expect(scored.flags).toContain('ticker_asset_mismatch');
+  });
+
   it('does not flag invalid_amount when rawText is a fund name with a digit', () => {
     const scored = scoreFields(
       0.97,
@@ -1752,5 +1914,52 @@ describe('normalize — 278-T row completeness gate', () => {
       parseDisposition: 'rows',
     });
     expect(result.reviewReason ?? '').not.toContain('oge_rows_incomplete');
+  });
+});
+
+describe('vision_degenerate guard (CT-2509)', () => {
+  it('parks degenerate local_mac vision with vision_degenerate and does not publish', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { VISION_DEGENERATE_REASON } = await import('../visionDegenerateGuard.ts');
+    const degenerate = JSON.parse(
+      readFileSync(new URL('../__fixtures__/H-2026-9116403-degenerate-rows.json', import.meta.url), 'utf8'),
+    ) as Array<{
+      assetName: string;
+      ticker: string | null;
+      txType: ParsedTx['txType'];
+      owner: ParsedTx['owner'];
+      txDate: string;
+      amountMin: number;
+      amountMax: number;
+    }>;
+    const parsed: ParsedTx[] = degenerate.map((row) => ({
+      txDate: row.txDate,
+      owner: row.owner,
+      assetName: row.assetName,
+      ticker: row.ticker,
+      assetType: null,
+      txType: row.txType,
+      amountMin: row.amountMin,
+      amountMax: row.amountMax,
+      isOption: false,
+      capGainsOver200: false,
+      rawText: row.assetName,
+      confidence: 0.97,
+    }));
+    const { env, cap } = makeEnv([
+      { ticker: 'TLH', name: 'iShares 10-20 Year Treasury Bond ETF', aliases: '[]' },
+    ]);
+    const result = await normalize(env, filing({ docId: 'H-2026-9116403' }), parsed, {
+      source: 'local_mac',
+      extractor: 'mac_vision_v1',
+      modelVersion: 'fixture',
+    });
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
+    const reasonCell = cap.reviewRows.flat().find(
+      (v) => typeof v === 'string' && (v as string).includes(VISION_DEGENERATE_REASON),
+    );
+    expect(reasonCell).toBeDefined();
   });
 });

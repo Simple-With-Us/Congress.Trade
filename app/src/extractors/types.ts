@@ -11,9 +11,15 @@ import { IngestRetryError } from '../ingestion/fetcher.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import {
   classifyHouseExtractRoute,
+  evaluateExtractQuality,
   looksLikeOgePart7ExplicitNone,
   looksLikePlausibleTradeTable,
 } from '../extraction/extractRouting.ts';
+import {
+  HOUSE_GRID_FORM_EXTRACTOR,
+  type HouseGridFormReader,
+  type HouseGridRead,
+} from '../extraction/houseGridForm.ts';
 import { isProvenOpenRouterCredentialRejection } from '../extraction/openRouterReply.ts';
 
 // ---------------------------------------------------------------------------
@@ -520,6 +526,7 @@ export class HousePdfExtractor implements Extractor {
     private readonly textPdf: Extractor,
     private readonly visionPdf: Extractor,
     private readonly cheapText?: Extractor,
+    private readonly gridForm?: HouseGridFormReader,
   ) {
     this.name = this.cheapText
       ? `housePdf(${textPdf.name},${this.cheapText.name},${visionPdf.name})`
@@ -540,37 +547,38 @@ export class HousePdfExtractor implements Extractor {
       // Text-layer parsing can fail on image-only or malformed PDFs.
     }
 
-    if (textResult) {
-      if (textResult.transactions.length > 0) {
-        // A cheap read that already failed (letterhead / headers) must not
-        // escalate to Files or the agreement trio. Orchestrator + agreement
-        // consult evaluateExtractQuality on these rows.
-        return textResult;
-      }
-      if (!route.allowFiles) {
-        if (
-          this.cheapText
-          && looksLikePlausibleTradeTable(textResult.raw)
-        ) {
-          try {
-            const cheap = await this.cheapText.extract({
-              ...input,
-              extractedText: textResult.raw,
-            });
-            return cheap;
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            // Proven dead-key rejections must still fail closed.  Garbage /
-            // Unauthorized replies skip this one doc instead of Files.
-            if (isProvenOpenRouterCredentialRejection(message)) throw err;
-            return textResult;
-          }
-        }
-        return textResult;
-      }
+    const textHasRows = (textResult?.transactions.length ?? 0) > 0;
+    const textQualityOk = textHasRows && textResult
+      ? evaluateExtractQuality(textResult.transactions).ok
+      : false;
+    if (textResult && textHasRows && (!route.allowFiles || textQualityOk)) {
+      // A cheap read that already failed (letterhead / headers) must not
+      // escalate to Files or the agreement trio. Orchestrator + agreement
+      // consult evaluateExtractQuality on these rows. A scanned grid whose
+      // text layer is only letterhead still gets the local x-mark stage below.
+      return textResult;
     }
 
     if (!route.allowFiles) {
+      if (
+        textResult
+        && this.cheapText
+        && looksLikePlausibleTradeTable(textResult.raw)
+      ) {
+        try {
+          const cheap = await this.cheapText.extract({
+            ...input,
+            extractedText: textResult.raw,
+          });
+          return cheap;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // Proven dead-key rejections must still fail closed.  Garbage /
+          // Unauthorized replies skip this one doc instead of Files.
+          if (isProvenOpenRouterCredentialRejection(message)) throw err;
+          return textResult;
+        }
+      }
       return textResult ?? {
         transactions: [],
         confidence: 0.2,
@@ -578,8 +586,41 @@ export class HousePdfExtractor implements Extractor {
         extractor: this.textPdf.name,
       };
     }
+
+    const grid = await this.readGridForm(input.bytes, input.filing.filedDate);
+    if (grid?.detected) return houseGridFormResult(grid);
+    if (textResult && textHasRows) return textResult;
     return this.visionPdf.extract(input);
   }
+
+  private async readGridForm(bytes: ArrayBuffer | undefined, filedDate: string | null): Promise<HouseGridRead | null> {
+    if (!this.gridForm || !bytes) return null;
+    try {
+      return await this.gridForm.read(bytes, { filedDate });
+    } catch (err) {
+      console.warn('housePdf: grid form stage failed', (err as Error).message);
+      return null;
+    }
+  }
+}
+
+function houseGridFormResult(grid: HouseGridRead): ExtractorResult {
+  const confidence = grid.transactions.length
+    ? Math.min(...grid.transactions.map((row) => row.confidence))
+    : 0.2;
+  return {
+    transactions: grid.transactions,
+    confidence,
+    raw: JSON.stringify({
+      houseGridForm: {
+        gridPages: grid.gridPages,
+        rows: grid.transactions.length,
+        markedCells: grid.markedCells,
+      },
+    }),
+    extractor: HOUSE_GRID_FORM_EXTRACTOR,
+    parseDisposition: grid.transactions.length ? 'rows' : 'unreadable',
+  };
 }
 
 /**
@@ -700,7 +741,7 @@ function emptyOgeTextResult(): ExtractorResult {
  */
 export function buildExtractorPipeline(env: Env): Extractor[] {
   const senateHtml = new SenateHtmlExtractor(env);
-  const textPdf = new TextPdfExtractor();
+  const textPdf = new TextPdfExtractor(env);
   const ogeText = new OgeTextExtractor();
 
   const geminiVision = new VisionLlmExtractor(env);
@@ -728,7 +769,12 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
 
   const visionArbitrated = new ArbitratingExtractor(configuredVision, env, secondary);
   const cheapText = new OpenRouterTextExtractor(env);
-  const housePdf = new HousePdfExtractor(textPdf, visionArbitrated, cheapText);
+  const housePdf = new HousePdfExtractor(
+    textPdf,
+    visionArbitrated,
+    cheapText,
+    createDenoHouseGridReader({ loadCatalog: () => loadHouseGridSecurityCatalog(env) }),
+  );
   const ogePdf = new OgePdfExtractor(ogeText, visionArbitrated);
 
   // ogePdf is ordered before the generic textPdf so executive-chamber PDFs
@@ -743,6 +789,8 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
 // Re-exported concrete extractor stub classes (implemented by extraction agent)
 // ---------------------------------------------------------------------------
 
+import { createDenoHouseGridReader } from '../extraction/houseGridFormRuntime.ts';
+import { loadHouseGridSecurityCatalog } from '../extraction/houseGridAssetSnap.ts';
 import { SenateHtmlExtractor } from '../extraction/senateHtml.ts';
 import { TextPdfExtractor } from '../extraction/textPdf.ts';
 import { OgeTextExtractor } from '../extraction/ogeText.ts';

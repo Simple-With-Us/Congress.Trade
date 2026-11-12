@@ -122,7 +122,7 @@ Before editing, run:
 ```bash
 git status --short --branch
 git worktree list
-gh pr list --state open
+# open PRs: relay gr_wf_pr_list_page
 ```
 
 If another branch or PR is touching the same files, either choose a disjoint
@@ -133,8 +133,8 @@ When a PR is open, inspect its changed files and check status before starting
 overlapping work:
 
 ```bash
-gh pr view <number> --json headRefName,baseRefName,files,statusCheckRollup
-gh pr checks <number>
+# PR detail + files + mergeability (mergeable, mergeStateStatus): relay gr_wf_pr_get
+# check status: relay gr_wf_checks (a point-in-time snapshot — re-read for fresher state; it does not watch or wait)
 ```
 
 If checks are failing, fix them on the owning branch only when explicitly asked;
@@ -147,25 +147,28 @@ agents "should never just wait and watch for things to merge since that wastes
 tokens/time and they inevitably almost invariably end up slowly wasting money/quota
 while the PR sits there with conflicts or comments/issues unresolved."
 
-- **Never idle-poll.**  Do not loop on `gh pr view` waiting for a merge, and never
+- **Never idle-poll.**  Do not loop on `gr_wf_pr_get` waiting for a merge, and never
   spend a turn narrating "standing by" / "waiting for CI" / "waiting on the review
   bot".  Watching costs tokens and wall-clock and changes nothing.
 - **A PR that is not merging is waiting on an ACTION, not on time.**  Exactly one of
   these is true, and you fix every one of them yourself:
-  - unresolved review threads (`gh pr view <n> --json reviewThreads`) — triage, reply,
-    resolve;
-  - a merge conflict (`--json mergeable,mergeStateStatus`) — this repo requires
+  - unresolved review threads (relay `gr_wf_review_threads` — walk the cursor
+    until `hasNextPage` is false; a first-page-only read hides threads) — triage,
+    reply, resolve;
+  - a merge conflict (relay `gr_wf_pr_get`: `mergeable`, `mergeStateStatus`) — this repo requires
     branches be kept current with `main` anyway, so `git fetch origin main && git
     merge origin/main`, resolve, push;
   - a failing required check (`typecheck + test`, `gitleaks`) — read the log, fix the
     cause, push;
-  - a check that never dispatched (`gh run list --branch <branch>`) — re-run or
-    re-trigger it;
-  - auto-merge never armed (`--json autoMergeRequest`) — `gh pr merge <n> --squash
-    --auto`.
+  - a check that never dispatched (relay `gr_wf_checks` on the branch) — re-run it
+    with relay `gr_wf_run_rerun`, or re-trigger it;
+  - auto-merge never armed (relay `gr_wf_pr_get` shows it) — arm it with
+    `gr_wf_automerge_enable`.
 - **The loop to run:** open the PR, arm auto-merge immediately, then go do the next
   useful thing.  If you truly need the result first, take ONE **bounded** wait
-  (`gh pr checks <n> --watch`); when it ends still unmerged, diagnose from the list
+  (one bounded relay `gr_wf_checks` read — `gr_wf_checks` returns a point-in-time
+  snapshot, not a watch like `gh pr checks --watch`, so re-read later rather than
+  polling); when it ends still unmerged, diagnose from the list
   above — do **not** start another wait.
 - **Review-bot threads block the merge forever** (`required_conversation_resolution`
   is on).  Triage the whole batch against current HEAD in one pass: fix the real

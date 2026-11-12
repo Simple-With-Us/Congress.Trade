@@ -25,6 +25,7 @@ import {
   ST_FETCH_ERROR_REASON_PREFIX,
   planTickerEodFetch,
   PRICE_UNAVAILABLE_NOT_COVERED,
+  PRICE_UNAVAILABLE_TERMINAL,
   writeTickerEodHistory,
 } from './service.ts';
 import {
@@ -34,6 +35,12 @@ import {
   stPeerPricePendingFromSql,
 } from './peerPricePending.ts';
 import { isCurrentPriceFresh } from './staleness.ts';
+import {
+  disclosureUnsupportedPendingSql,
+  DISCLOSURE_NOT_COVERED_SWEEP_MAX,
+  notCoveredCauseForDisclosure,
+  tickerPriceInstrumentHintsFromRow,
+} from './peerInstrumentCoverage.ts';
 
 /** A pending ticker with no price_checked_at progress for this long is ST-unpriceable (rule b). */
 export const ST_NOT_COVERED_STUCK_HOURS = 72;
@@ -84,6 +91,65 @@ export function stNotCoveredTickersFromSql(): string {
 export interface NotCoveredSweepResult {
   marked: number;
   qualified: number;
+}
+
+export interface DisclosureNotCoveredSweepResult {
+  marked: number;
+  qualified: number;
+}
+
+/**
+ * Mark pending tickers whose disclosure types cannot use ST EOD — no provider
+ * call. Requires a fresh corpus (same gate as the stuck sweep).
+ */
+export async function markDisclosureUnsupportedPeerPrices(
+  env: Env,
+  now = new Date(),
+): Promise<DisclosureNotCoveredSweepResult> {
+  const corpusLatest = await readCorpusLatestPriceDate(env);
+  if (!isCurrentPriceFresh(corpusLatest, lastTradingDay(now))) {
+    return { marked: 0, qualified: 0 };
+  }
+  const params = stPeerPricePendingBindParams(now);
+  const pendingBinds = stPeerPricePendingBindsForSubqueries(params, 1);
+  const tradeHintFilter = `nt.tx_date IS NOT NULL AND nt.tx_date >= '1990-01-01'
+        AND nt.deprecated_at IS NULL
+        AND ${excludeCompetitorFixtureTransactionSql('nt')}`;
+  const hintSub = (col: string) =>
+    `(SELECT nt.${col} FROM transactions nt
+       WHERE nt.ticker = t.ticker AND ${tradeHintFilter}
+       ORDER BY nt.tx_date DESC, nt.id DESC
+       LIMIT 1)`;
+  const rows = await all<{
+    ticker: string;
+    asset_type: string | null;
+    asset_type_name: string | null;
+    asset_name: string | null;
+    is_option: number | null;
+  }>(
+    env.DB,
+    `SELECT DISTINCT t.ticker AS ticker,
+            ${hintSub('asset_type')} AS asset_type,
+            ${hintSub('asset_type_name')} AS asset_type_name,
+            ${hintSub('asset_name')} AS asset_name,
+            ${hintSub('is_option')} AS is_option
+       ${stPeerPricePendingFromSql()}
+       AND ${disclosureUnsupportedPendingSql()}
+     ORDER BY t.ticker ASC
+     LIMIT ${DISCLOSURE_NOT_COVERED_SWEEP_MAX}`,
+    pendingBinds,
+  );
+  const nowIso = now.toISOString();
+  let marked = 0;
+  for (const row of rows) {
+    const hints = tickerPriceInstrumentHintsFromRow(row.ticker, row);
+    await markTickerPriceUnavailable(env, row.ticker, notCoveredReason(now, notCoveredCauseForDisclosure(hints)), {
+      checkedAt: nowIso,
+      stage: PRICE_UNAVAILABLE_NOT_COVERED,
+    });
+    marked++;
+  }
+  return { marked, qualified: rows.length };
 }
 
 /**
@@ -175,7 +241,7 @@ async function restampNotCovered(env: Env, ticker: string, nowIso: string): Prom
   await run(
     env.DB,
     `UPDATE securities_ref SET price_checked_at = ?
-      WHERE ticker = ? AND price_unavailable = ${PRICE_UNAVAILABLE_NOT_COVERED}`,
+      WHERE ticker = ? AND price_unavailable IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})`,
     [nowIso, ticker],
   );
 }
@@ -191,14 +257,16 @@ export interface NotCoveredRecheckResult {
 }
 
 /**
- * Daily re-check: retry up to `max` stage-4 tickers (oldest price_checked_at
- * first) through the given price client. A non-empty result whose newest close
- * is on/after the ticker's previous latest_price_date (any close when null)
- * and not stale per PRICE_STALE_LISTING_DAYS is written through the SAME
- * upsert path runPriceRefresh uses (stage cleared to 0, reason cleared).
- * Anything else restamps price_checked_at only, keeping stage 4 and the
- * original since-date. Fatal provider errors abort without touching tickers.
- * Once-per-UTC-day gating lives with the caller (jobs.ts lane stamp).
+ * Daily re-check: retry up to `max` stage-4 and stage-5 tickers (oldest
+ * price_checked_at first) through the given price client. A non-empty result
+ * whose newest close is on/after the ticker's previous latest_price_date (any
+ * close when null) and not stale per PRICE_STALE_LISTING_DAYS is written
+ * through the SAME upsert path runPriceRefresh uses (stage cleared to 0,
+ * reason cleared). Anything else restamps price_checked_at only, keeping the
+ * stage and the original since-date. A terminal ticker therefore stays off
+ * the stall clock unless Socratic.Trade actually resumes pricing it. Fatal
+ * provider errors abort without touching tickers. Once-per-UTC-day gating
+ * lives with the caller (jobs.ts lane stamp).
  */
 export async function recheckNotCoveredPeerPrices(
   env: Env,
@@ -227,7 +295,7 @@ export async function recheckNotCoveredPeerPrices(
     env.DB,
     `SELECT sr.ticker AS ticker, sr.latest_price_date AS latest_price_date
        FROM securities_ref sr
-      WHERE sr.price_unavailable = ${PRICE_UNAVAILABLE_NOT_COVERED}
+      WHERE sr.price_unavailable IN (${PRICE_UNAVAILABLE_NOT_COVERED}, ${PRICE_UNAVAILABLE_TERMINAL})
       ORDER BY sr.price_checked_at ASC
       LIMIT ?`,
     [max],
@@ -255,8 +323,15 @@ export async function recheckNotCoveredPeerPrices(
     let hist;
     try {
       await pace();
-      hist = await client.eodHistory(ticker, fetchPlan.from, fetchPlan.to);
+      // Thread the lane signal into the request so a deadline abort cancels
+      // a hanging fetch in-flight instead of leaving this serial loop
+      // stuck on it past the deadline (the refresh walk does the same).
+      hist = await client.eodHistory(ticker, fetchPlan.from, fetchPlan.to, opts.signal);
     } catch (e) {
+      if (opts.signal?.aborted) {
+        result.aborted = true;
+        break;
+      }
       result.errors.push(ticker + ': ' + (e as Error).message);
       if (isFatalPriceProviderError(e, false)) {
         result.aborted = true;
@@ -285,10 +360,14 @@ export async function recheckNotCoveredPeerPrices(
         // extra ST call only on the day a stage-4 ticker recovers.
         try {
           await pace();
-          const full = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to);
+          const full = await client.eodHistory(ticker, fetchPlan.fullFrom, fetchPlan.to, opts.signal);
           if (full.length > 0) toWrite = full;
           result.backfilled++;
         } catch (e) {
+          if (opts.signal?.aborted) {
+            result.aborted = true;
+            break;
+          }
           result.errors.push(ticker + ' (backfill): ' + (e as Error).message);
           if (isFatalPriceProviderError(e, false)) {
             result.aborted = true;

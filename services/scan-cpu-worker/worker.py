@@ -22,7 +22,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from infisical_config import resolve_admin_token
-from pipeline import extract_pdf
+from pipeline import extract_pdf, extract_pdf_detailed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,8 +162,12 @@ def process_filing(filing: Dict[str, Any]) -> bool:
         logger.error("No stored PDF for %s", doc_id)
         return False
 
+    extractor = EXTRACTOR
     try:
-        transactions = extract_pdf(pdf_path, ocr_backend=OCR_BACKEND)
+        detailed = extract_pdf_detailed(pdf_path, ocr_backend=OCR_BACKEND)
+        transactions = detailed.rows
+        if detailed.grid_pages:
+            extractor = detailed.extractor
     except Exception as e:
         logger.exception("extract_pdf failed for %s: %s", doc_id, e)
         transactions = []
@@ -178,7 +182,7 @@ def process_filing(filing: Dict[str, Any]) -> bool:
         "docId": doc_id,
         "transactions": transactions,
         "workerId": WORKER_ID,
-        "extractor": EXTRACTOR,
+        "extractor": extractor,
         "source": "server_cpu",
     }
     res = send_request(url, method="POST", payload=payload, timeout=120)

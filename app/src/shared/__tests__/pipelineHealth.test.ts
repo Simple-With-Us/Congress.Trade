@@ -7,6 +7,7 @@ import {
   DEFAULT_PIPELINE_THRESHOLDS,
 } from '../pipelineHealth.ts';
 import { DEFAULT_PROBE_SCHEDULE_CONFIG } from '../../ingestion/probeSchedule.ts';
+import { evaluateSenateFetcherHealth } from '../../ingestion/senateIntakeStatus.ts';
 
 describe('evaluatePipelineSignals', () => {
   const nowMs = 1754092800000; // Fixed clock for testing
@@ -497,6 +498,45 @@ describe('evaluatePipelineSignals', () => {
       expect(check?.status).toBe('unknown');
     });
   });
+
+  it('pages filing_skips on an unreadable 278-T and names the doc (board 5235c003)', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 0,
+        doc_quarantined: 0,
+        oge_text_unreadable: 1,
+      },
+      unreadableExecutiveDocIds: ['E-2026-donald-j-trump-09-17-2026-278t'],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(res.status).toBe('critical');
+    expect(check?.detail).toContain('oge_text_unreadable=1');
+    expect(check?.detail).toContain('E-2026-donald-j-trump-09-17-2026-278t');
+    expect(res.signals?.unreadableExecutiveDocIds).toEqual(['E-2026-donald-j-trump-09-17-2026-278t']);
+  });
+
+  it('keeps explicit Part 7 None in auto_resolved_empty and does not call it an unreadable doc', () => {
+    const res = evaluatePipelineSignals({
+      ...cleanSignals,
+      filingSkips24h: 1,
+      filingSkipsByAction24h: {
+        extract_empty_failure: 0,
+        auto_resolved_empty: 1,
+        doc_quarantined: 0,
+        oge_text_unreadable: 0,
+      },
+      unreadableExecutiveDocIds: [],
+    }, nowMs);
+    const check = res.checks.find((c) => c.id === 'filing_skips');
+    expect(check?.status).toBe('critical');
+    expect(check?.detail).toContain('auto_resolved_empty=1');
+    expect(check?.detail).not.toContain('oge_text_unreadable=');
+    expect(check?.detail).not.toContain('Unreadable docs');
+  });
 });
 
 describe('polling + latency liveness (owner 2026-08-10: never silently off)', () => {
@@ -772,6 +812,74 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(res.checks.find((c) => c.id === 'polling_senate')!.status).toBe('ok');
   });
 
+  it('names the transport on the latest successful senate poll', () => {
+    const res = evaluatePipelineSignals({
+      ...base,
+      pollSources: base.pollSources!.map((p) => (
+        p.source === 'senate' ? { ...p, transport: 'browser-direct' } : p
+      )),
+    }, nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).toContain('via browser-direct');
+  });
+
+  it('drops an unknown senate transport instead of reflecting it in health detail', () => {
+    const signals = {
+      ...base,
+      pollSources: base.pollSources!.map((p) => (
+        p.source === 'senate' ? { ...p, transport: 'future-untrusted-transport' } : p
+      )),
+    };
+    const res = evaluatePipelineSignals(signals as unknown as Parameters<typeof evaluatePipelineSignals>[0], nowMs);
+    expect(res.checks.find((c) => c.id === 'polling_senate')!.detail).not.toContain('future-untrusted-transport');
+  });
+
+  it('omits the senate fetcher check when the signal was not collected', () => {
+    expect(evaluatePipelineSignals(base, nowMs).checks.find((c) => c.id === 'senate_fetcher')).toBeUndefined();
+  });
+
+  it('warns on /api/health when the fetcher has not reported a run inside the window', () => {
+    const at = new Date('2026-11-09T18:00:00.000Z');
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateFetcher: evaluateSenateFetcherHealth(null, at),
+    }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('has not reported a run');
+    expect(check.detail).toContain('senate-fetcher:last-run');
+    expect(res.status).not.toBe('ok');
+  });
+
+  it('stays quiet overnight when the fetcher has not reported a run', () => {
+    const at = new Date('2026-11-09T09:00:00.000Z');
+    const res = evaluatePipelineSignals({
+      ...base,
+      senateFetcher: evaluateSenateFetcherHealth(null, at),
+    }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('Quiet outside');
+  });
+
+  it('does not warn on a fresh fetcher run that found no new filings', () => {
+    const at = new Date('2026-11-09T18:00:00.000Z');
+    const health = evaluateSenateFetcherHealth({
+      ranAt: '2026-11-09T17:50:00.000Z',
+      receivedAt: '2026-11-09T17:50:00.000Z',
+      status: 'ok',
+      rows: 4,
+      newCount: 0,
+      role: 'agents',
+      ageMs: 10 * 60_000,
+      stale: false,
+    }, at);
+    const res = evaluatePipelineSignals({ ...base, senateFetcher: health }, at.getTime());
+    const check = res.checks.find((c) => c.id === 'senate_fetcher')!;
+    expect(check.status).toBe('ok');
+    expect(check.detail).toContain('0 new rows');
+    expect(check.detail).toContain('not a missed run');
+  });
+
   it('an unset Senate relay URL is degraded, not silent', () => {
     const res = evaluatePipelineSignals({
       ...base,
@@ -870,13 +978,13 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     return res.checks.find((c) => c.id === 'senate_efd')!;
   }
 
-  it('senate_efd is critical (blocked) on an Akamai anti-bot 403, never stalled', () => {
+  it('senate_efd is degraded (canary blocked) on an Akamai anti-bot 403, never stalled', () => {
     const check = efdCheck({
       ok: false, state: 'blocked', status: 403, step: 'POST /search/home/', egress: 'proxy',
       checkedAt: new Date(nowMs - 60_000).toISOString(), error: 'eFD anti-bot block (Akamai Access Denied)',
     });
-    expect(check.status).toBe('critical');
-    expect(check.detail).toContain('BLOCKED');
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('canary blocked');
     expect(check.detail).toContain('Akamai');
     expect(check.detail).toContain('POST /search/home/');
     expect(check.detail).toContain('not a relay outage');
@@ -921,17 +1029,23 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     expect(check.detail).toContain('agreement POST ok');
   });
 
-  it('senate_efd ok goes degraded only after two missed 30m cycles', () => {
+  it('senate_efd ok reads as the resting canary between twice-a-day dials', () => {
     const fresh = efdCheck({
       ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 60 * 60_000).toISOString(),
     });
     expect(fresh.status).toBe('ok');
-    const stale = efdCheck({
-      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 100 * 60_000).toISOString(),
+    // 13 hours old: past one 12h dial interval, still a healthy resting canary.
+    const resting = efdCheck({
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 13 * 60 * 60_000).toISOString(),
     });
-    expect(stale.status).toBe('degraded');
-    expect(stale.detail).toContain('stale');
-    expect(stale.detail).toContain('threshold 90m');
+    expect(resting.status).toBe('ok');
+    // Past three missed cycles the wording names the canary schedule.
+    const canary = efdCheck({
+      ok: true, state: 'ok', status: 200, egress: 'proxy', checkedAt: new Date(nowMs - 40 * 60 * 60_000).toISOString(),
+    });
+    expect(canary.status).toBe('ok');
+    expect(canary.detail).toContain('canary');
+    expect(canary.detail).toContain('twice a day');
   });
 
   // CT-2442: the probe does not dial while the watcher's edge-deny backoff is
@@ -954,26 +1068,26 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
     return res.checks.find((c) => c.id === 'senate_efd')!;
   }
 
-  it('senate_efd is critical (blocked) while an ingestion edge deny is newer than an ok probe', () => {
+  it('senate_efd is degraded (canary) while an ingestion edge deny is newer than an ok probe', () => {
     const check = efdBackoffCheck(
       { ok: true, state: 'ok', status: 302, egress: 'proxy', dialed: true, checkedAt: new Date(nowMs - 20 * 60_000).toISOString() },
       { lastDeniedAgoMin: 10, untilInMin: 50 },
     );
-    expect(check.status).toBe('critical');
-    expect(check.detail).toContain('BLOCKED');
+    expect(check.status).toBe('degraded');
+    expect(check.detail).toContain('canary');
     expect(check.detail).toContain('Akamai edge deny on Senate ingestion 10m ago');
     expect(check.detail).toContain('[edge_denied]');
     expect(check.detail).toContain('not a relay outage');
-    expect(check.detail).toContain('probe is paused for the edge-deny backoff (next attempt in 50m)');
+    expect(check.detail).toContain('next attempt in 50m');
   });
 
   it('senate_efd names the deny when the probe never ran or only a legacy record exists', () => {
-    expect(efdBackoffCheck(null, { lastDeniedAgoMin: 5, untilInMin: 55 }).status).toBe('critical');
+    expect(efdBackoffCheck(null, { lastDeniedAgoMin: 5, untilInMin: 55 }).status).toBe('degraded');
     const legacy = efdBackoffCheck(
       { ok: false, status: 403, egress: 'direct', checkedAt: new Date(nowMs - 30_000).toISOString(), error: 'HTTP 403' },
       { lastDeniedAgoMin: 5, untilInMin: 55 },
     );
-    expect(legacy.status).toBe('critical');
+    expect(legacy.status).toBe('degraded');
     expect(legacy.detail).toContain('Akamai edge deny on Senate ingestion');
   });
 
@@ -985,7 +1099,7 @@ describe('polling + latency liveness (owner 2026-08-10: never silently off)', ()
       },
       { lastDeniedAgoMin: 10, untilInMin: 50 },
     );
-    expect(check.status).toBe('critical');
+    expect(check.status).toBe('degraded');
     expect(check.detail).toContain('Akamai edge deny on Senate ingestion');
   });
 

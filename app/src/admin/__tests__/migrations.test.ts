@@ -80,6 +80,8 @@ import {
   FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
   TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
   DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
+  PHANTOM_FILER_ALIAS_STATEMENTS,
+  REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS,
 } from '../migrations.ts';
 import { buildAdminMigrateStatements } from '../migrateStatements.ts';
 import { applyGuardedAppleSubscriptionsNullableUserMigration } from '../schemaMigrationRunner.ts';
@@ -321,6 +323,8 @@ describe('admin migration bootstrap', () => {
       ...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
       ...TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
       ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
+      ...PHANTOM_FILER_ALIAS_STATEMENTS,
+      ...REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS,
     ]);
   });
 

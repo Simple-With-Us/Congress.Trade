@@ -119,9 +119,16 @@
 set -euo pipefail
 
 # LaunchAgents inherit a tiny PATH (no Homebrew). Node is required for
-# ensure-tf-ready and for the App Store Connect queries. Keep this before any
-# `node` / `xcodegen` call.
-export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# ensure-tf-ready and for the App Store Connect queries. Prioritize /usr/bin and /bin so Apple distribution tools (rsync -E) use native macOS binaries.
+# Homebrew rsync 3.5.1 first on PATH shadows the system rsync that `xcodebuild
+# -exportArchive` spawns for the server half, and the IPA step then fails with
+# "rsync: --extended-attributes: unknown option" / "exportArchive Copy failed".
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# IOS_FLEET_STUB_BIN lets the offline tests (test-ship-seq.sh) keep their stub
+# curl/xcodebuild ahead of the system dirs above.  A real ship leaves it unset.
+if [ -n "${IOS_FLEET_STUB_BIN:-}" ]; then
+  export PATH="${IOS_FLEET_STUB_BIN}:${PATH}"
+fi
 # The node that runs asc-api.mjs.  IOS_FLEET_NODE lets the offline tests
 # (scripts/ios-fleet/test-ship-seq.sh) answer App Store Connect from a stub;
 # a real ship leaves it unset and uses node from PATH.
@@ -1474,6 +1481,27 @@ ensure_tf_ready() {
   fi
   if [[ $rc -eq 0 ]]; then
     log "TestFlight internal testers can install this build"
+    return 0
+  fi
+  if [[ $rc -eq 5 ]]; then
+    # rc=5 / rc=6 are NOT compliance failures: asc-api.mjs returns them only after
+    # the build reached IN_BETA_TESTING and the compliance PATCH already landed.
+    # This vendored client (see ensure-tf-ready exit codes) currently exits only
+    # 0 | 2 | 3 | 4; when internal-tester counting lands, rc=5 means zero internal
+    # testers with access to all builds (same contract as Usage-Monitor / ContactLogo).
+    log "warning: build ${BUILD_NUM} is compliant and in beta testing, but NO internal tester has access to all builds"
+    log "warning: add an internal tester (or a build-access group) in App Store Connect or the phone never gets this build"
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+      echo "::warning::ensure-tf-ready: ${BUNDLE_ID} build ${BUILD_NUM} is ready but no internal tester can install it"
+    fi
+    return 0
+  fi
+  if [[ $rc -eq 6 ]]; then
+    log "warning: build ${BUILD_NUM} is compliant and in beta testing, but the internal tester count could not be read"
+    log "warning: installability is unverified -- check the TestFlight groups by hand in App Store Connect"
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+      echo "::warning::ensure-tf-ready: ${BUNDLE_ID} build ${BUILD_NUM} is ready but the internal tester state is unreadable"
+    fi
     return 0
   fi
   if [[ $rc -eq 3 ]]; then

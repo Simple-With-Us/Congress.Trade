@@ -28,14 +28,21 @@ import {
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
+  isHouseGridFormExtractor,
 } from './extractRouting.ts';
 import {
   handCheckReviewReason,
+  isVisionOrOcrExtraction,
   mergeHandCheckIntoReviewReason,
   NEEDS_HAND_CHECK_MAC_VISION,
   NEEDS_HAND_CHECK_SCANNED_VISION,
   requiresHandCheckBeforePublish,
 } from './handCheckPublish.ts';
+import {
+  assessVisionDegenerate,
+  mergeVisionDegenerateReason,
+  type VisionDegenerateAssessment,
+} from './visionDegenerateGuard.ts';
 import type { ExtractorParseDisposition } from '../extractors/types.ts';
 import {
   closeUnreadableExecutive,
@@ -61,6 +68,7 @@ import {
   cleanFilerName,
   isJunkAssetString,
   cleanAssetString,
+  namesPlausiblyMatch,
   simplifyCompanyName,
   splitAssetNameDetail,
 } from './nameNormalizer.ts';
@@ -80,6 +88,12 @@ import { canonicalizeAmountBounds, parseAmountRange } from './amounts.ts';
 import { issuerWords, junkAssetNameReason, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
 import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
+import { parseHousePtrDisclosedName } from './textPdf.ts';
+import {
+  houseMemberNameMismatch,
+  suppressAssetOcrHoldForMemberBleed,
+  type HouseMemberIdentity,
+} from './housePtrMember.ts';
 import {
   PIPELINE_TX_SOURCES_SQL,
   VISION_SUPERSEDE_REASON,
@@ -87,6 +101,8 @@ import {
   isVisionTxSource,
   supersededPipelineSourcesSql,
 } from './sourceSupersede.ts';
+import { proposedMatchesLivePipeline } from '../admin/publishContentHash.ts';
+import { recordReviewRevisionAudit } from '../shared/reviewRevisionAudit.ts';
 
 /**
  * Per-tx confidence at or above this threshold is trusted for auto-publish. If a
@@ -257,6 +273,7 @@ export const HARD_FAILURE_FLAGS = [
   'tx_date_after_filing_window',
   'ocr_name_hold',
   'ocr_date_hold',
+  'grid_type_unmarked',
 ];
 const HARD_FAILURE_FLAG_SET = new Set<string>(HARD_FAILURE_FLAGS);
 
@@ -332,11 +349,44 @@ function rowKeyAssetTypeName(assetType: string | null | undefined, assetTypeName
  * and the admin reprocess path, which recomputes confidence for already-persisted
  * filings and updates the existing rows in place.
  */
+export interface HouseMemberContext {
+  identity: HouseMemberIdentity | null;
+}
+
+async function loadHouseMemberContext(
+  env: Env,
+  filing: Filing,
+  sourceText: string | null | undefined,
+): Promise<HouseMemberContext> {
+  if (filing.chamber !== 'house') return { identity: null };
+  const disclosed = parseHousePtrDisclosedName(sourceText);
+  if (!disclosed || !filing.filerId) return { identity: null };
+  try {
+    const row = await get<{ full_name: string | null; chamber: string | null; state: string | null }>(
+      env.DB,
+      'SELECT full_name, chamber, state FROM filers WHERE bioguide_id = ?',
+      [filing.filerId],
+    );
+    if (!row?.full_name) return { identity: null };
+    return {
+      identity: {
+        disclosedName: disclosed,
+        registeredName: row.full_name,
+        chamber: row.chamber ?? filing.chamber,
+        state: row.state,
+      },
+    };
+  } catch {
+    return { identity: null };
+  }
+}
+
 export async function recomputeTransactions(
   env: Env,
   filing: Filing,
   parsed: ParsedTx[],
   sourceOverride?: TxSource,
+  houseMember?: HouseMemberContext,
 ): Promise<FlaggedTx[]> {
   const nowIso = new Date().toISOString();
   const [resolver, nameIndex] = await Promise.all([loadResolver(env), loadNameIndex(env)]);
@@ -347,8 +397,19 @@ export async function recomputeTransactions(
   // scanned path ("3641 Microsoft Corp. Com"); strip it before the resolver sees
   // the name, when the filing itself shows the pattern (board row 3d31c7b9).
   const rows = filing.chamber === 'executive' ? stripOgeRowIndexes(parsed) : parsed;
+  const memberCtx = houseMember ?? { identity: null };
   return rows.map((p, rowIndex) =>
-    buildTransaction(p, filing, resolver, nowIso, rowIndex, sourceOverride, nameIndex, ocrExtraWords),
+    buildTransaction(
+      p,
+      filing,
+      resolver,
+      nowIso,
+      rowIndex,
+      sourceOverride,
+      nameIndex,
+      ocrExtraWords,
+      memberCtx,
+    ),
   );
 }
 
@@ -417,6 +478,7 @@ export async function normalize(
     && !looksLikeNothingToReport(p.assetName)
   );
   const droppedFormChrome = parsed.length - usableParsed.length;
+  let visionDegenerateAssessment: VisionDegenerateAssessment | null = null;
   const sawOgePart7ExplicitNone = looksLikeOgePart7ExplicitNone(sourceText)
     || parsed.some((p) =>
       looksLikeOgePart7ExplicitNone(p.assetName) || looksLikeOgePart7ExplicitNone(p.rawText)
@@ -425,7 +487,13 @@ export async function normalize(
     looksLikeNothingToReport(p.assetName) || looksLikeNothingToReport(p.rawText)
   );
 
-  const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source);
+  const houseMember = await loadHouseMemberContext(env, filing, sourceText);
+  const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source, houseMember);
+  if (isVisionOrOcrExtraction(extractorName, source) && usableParsed.length > 0) {
+    visionDegenerateAssessment = assessVisionDegenerate(usableParsed, {
+      resolvedTickers: allFlagged.map((f) => f.tx.ticker ?? null),
+    });
+  }
   const deletedFlagged = allFlagged.filter((f) => isDeletedFilingStatus(f.tx.filingStatus));
   const flagged = allFlagged.filter((f) => !isDeletedFilingStatus(f.tx.filingStatus));
 
@@ -451,6 +519,10 @@ export async function normalize(
       && !f.flags.includes('no_amount')
       && !f.flags.includes('missing_tx_date'))
     : flagged;
+  // Sibling-publish only: gate on rows that have amounts.  If every row
+  // omitted the checkbox, use the real min (includes the no_amount penalty)
+  // so the filing stays in review.  Substituting the publish threshold here
+  // auto-published all-null-amount extracts after #2143.
   const gateMinConfidence = gateRows.length
     ? Math.min(...gateRows.map((f) => f.tx.confidence))
     : minConfidence;
@@ -527,6 +599,9 @@ export async function normalize(
     && reviewSnapshot?.resolved !== 1
     && flagged.length > 0;
   if (handCheckRequired) {
+    needsReview = true;
+  }
+  if (visionDegenerateAssessment?.degenerate) {
     needsReview = true;
   }
 
@@ -714,7 +789,12 @@ export async function normalize(
     // hundreds of fake rows for humans/agreement — empty extract_empty class
     // so local-vision pending can re-claim the stored raw copy.
     let reviewFlagged = flagged;
-    if (ocrUnusable && !exceedsPublishLimit && meta?.parseDisposition !== 'unreadable') {
+    if (
+      ocrUnusable
+      && !isHouseGridFormExtractor(extractorName)
+      && !exceedsPublishLimit
+      && meta?.parseDisposition !== 'unreadable'
+    ) {
       // Keep dated, non-chrome rows (amendment letters with one real Treasury
       // line). Only wipe when nothing recoverable remains.
       const keepable = flagged.filter((f) =>
@@ -741,6 +821,9 @@ export async function normalize(
           + `(${rowCompleteness.missingCount} missing, evidence=${rowCompleteness.evidence}); held for review`,
       );
     }
+    if (visionDegenerateAssessment?.degenerate) {
+      reason = mergeVisionDegenerateReason(reason);
+    }
     const routed = await routeToReview(
       env,
       filing,
@@ -757,8 +840,12 @@ export async function normalize(
           || (filing.chamber === 'executive' && meta?.parseDisposition === 'unreadable')
           || handCheckRequired
           || rowsIncomplete
+          || visionDegenerateAssessment?.degenerate
             ? reason
             : undefined,
+        payloadExtras: visionDegenerateAssessment?.degenerate
+          ? { visionDegenerate: visionDegenerateAssessment }
+          : undefined,
       },
       reviewSnapshot,
     );
@@ -851,6 +938,7 @@ function buildTransaction(
   sourceOverride?: TxSource,
   nameIndex?: NameIndex,
   ocrExtraWords?: ReadonlySet<string>,
+  houseMember: HouseMemberContext = { identity: null },
 ): FlaggedTx {
   const placeholders = new Set(['NONE', '--', 'N/A', 'NA', 'NULL', '—']);
   const prepared = prepareExtractedTx(p);
@@ -898,6 +986,8 @@ function buildTransaction(
       txType: p.txType,
       txDate: p.txDate,
       rawText: p.rawText,
+      gridTypeUnmarked: (p.extractionWarnings ?? []).includes('grid_type_unmarked'),
+      ownerUnread: (p.extractionWarnings ?? []).includes('owner_unread'),
     },
     filing.filedDate,
     resolve,
@@ -930,6 +1020,8 @@ function buildTransaction(
 
   const txSource = sourceOverride ?? (p as { source?: TxSource }).source ?? 'primary';
 
+  let publishConfidence = s.confidence;
+
   const tx: Transaction = {
     id: uuid(),
     docId: filing.docId,
@@ -953,7 +1045,7 @@ function buildTransaction(
     location: p.location ?? null,
     description: p.description ?? null,
     supplementalText: p.supplementalText ?? null,
-    confidence: s.confidence,
+    confidence: publishConfidence,
     source: txSource,
     rowKey: transactionRowKey(txSource, rowIndex, {
       ...p,
@@ -970,14 +1062,31 @@ function buildTransaction(
     cursorSeq: 0,
   };
 
-  return {
-    tx,
-    flags: [
-      ...s.flags,
-      ...(p.extractionWarnings ?? []).filter((flag) =>
-        flag === 'unreadable_is_option' || flag === 'unreadable_cap_gains' || flag === 'suspected_constant_tx_type'),
-    ],
-  };
+  let flags = [
+    ...s.flags,
+    ...(p.extractionWarnings ?? []).filter((flag) =>
+      flag === 'unreadable_is_option'
+        || flag === 'unreadable_cap_gains'
+        || flag === 'suspected_constant_tx_type'
+        || flag === 'owner_unread'),
+  ];
+  const publishedOwner = normalizeOwner(p.owner);
+  if (
+    houseMember.identity
+    && suppressAssetOcrHoldForMemberBleed(ocrAssetName, publishedOwner, houseMember.identity.disclosedName)
+    && flags.includes('ocr_name_hold')
+  ) {
+    flags = flags.filter((flag) => flag !== 'ocr_name_hold');
+    if (s.flags.includes('ocr_name_hold')) {
+      publishConfidence = clamp01(publishConfidence / PENALTY_OCR_HOLD);
+      tx.confidence = publishConfidence;
+    }
+  }
+  if (houseMember.identity && houseMemberNameMismatch(houseMember.identity)) {
+    flags.push('ocr_name_hold');
+  }
+
+  return { tx, flags };
 }
 
 /** Result of applying the shared validation rubric to one row's fields. */
@@ -1012,6 +1121,10 @@ export function scoreFields(
     txType: string | null;
     txDate: string | null;
     rawText?: string | null;
+    /** Grid form found no single type mark. Do not invent B/S/E. */
+    gridTypeUnmarked?: boolean;
+    /** Grid or scan could not read the owner cell (not a confident blank). */
+    ownerUnread?: boolean;
   },
   filedDate: string | null,
   resolve: TickerResolver,
@@ -1138,8 +1251,14 @@ export function scoreFields(
   }
 
   // --- tx_type must be B / S / E (Purchase/P/buy → B) ----------------------
+  // A grid row with no x in the type columns is flagged and left untyped.
+  // Other bad labels still fall back to B, which is the historical rubric.
   let txType = (canonicalizeTxType(fields.txType) ?? fields.txType) as TxType;
-  if (!isTxType(txType)) {
+  if (fields.gridTypeUnmarked) {
+    flags.push('grid_type_unmarked');
+    confidence *= PENALTY_BAD_TX_TYPE;
+    txType = '' as TxType;
+  } else if (!isTxType(txType)) {
     flags.push('bad_tx_type');
     confidence *= PENALTY_BAD_TX_TYPE;
     txType = 'B';
@@ -1191,6 +1310,9 @@ export function scoreFields(
   if (ocr.nameHolds.length > 0) {
     flags.push('ocr_name_hold');
     confidence *= PENALTY_OCR_HOLD;
+  }
+  if (fields.ownerUnread) {
+    confidence *= 0.92;
   }
 
   return { confidence: clamp01(confidence), flags, ticker, amountMin, amountMax, txType };
@@ -1394,16 +1516,6 @@ export async function loadNameIndex(env: Env): Promise<NameIndex> {
   return index;
 }
 
-/**
- * True when two simplified company names plausibly refer to the same issuer.
- * Exact match or substring containment either direction (tolerates partial
- * historical forms, e.g. "apple computer" vs "apple").
- */
-function namesPlausiblyMatch(a: string, b: string): boolean {
-  if (!a || !b) return true; // nothing to compare against is not evidence of mismatch
-  return a === b || a.includes(b) || b.includes(a);
-}
-
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -1434,8 +1546,12 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
   json_extract(value, '$.cleaningNote')
   FROM json_each(?)`;
 
+function isStoredTxType(txType: string | null | undefined): txType is TxType {
+  return txType === 'B' || txType === 'S' || txType === 'E';
+}
+
 function transactionInsertJson(transactions: Transaction[]): string {
-  return JSON.stringify(transactions.map((tx) => ({
+  return JSON.stringify(transactions.filter((tx) => isStoredTxType(tx.txType)).map((tx) => ({
     id: tx.id,
     docId: tx.docId,
     filerId: tx.filerId,
@@ -1510,6 +1626,13 @@ async function persistNormalizedPublish(
       `refusing to publish ${transactions.length} transactions; limit is ${MAX_PUBLISH_TRANSACTIONS_PER_FILING}`,
     );
   }
+
+  const pipelineMatch = await proposedMatchesLivePipeline(env.DB, docId, transactions);
+  const skipRevisionBump = pipelineMatch.identical;
+  const reviewRevisionSql = skipRevisionBump
+    ? 'review_revision = review_revision'
+    : 'review_revision = review_revision + 1';
+
   const insertRowsJson = transactionInsertJson(transactions);
   const rowKeysJson = JSON.stringify(transactions.map((tx) => tx.rowKey ?? ''));
   const incomingSource = transactions[0]?.source ?? 'primary';
@@ -1633,7 +1756,7 @@ async function persistNormalizedPublish(
                 agreement_suppression_reason = NULL,
                 resolution_kind = 'published',
                 resolution_reason = 'auto_published',
-                review_revision = review_revision + 1
+                ${reviewRevisionSql}
           WHERE doc_id = ? AND resolved = 1 AND review_revision = ?
             AND ${exactLiveSet}`,
         [
@@ -1653,7 +1776,7 @@ async function persistNormalizedPublish(
                 resolution_kind = 'published',
                 resolution_reason = 'auto_published',
                 resolved_at = CURRENT_TIMESTAMP,
-                review_revision = review_revision + 1
+                ${reviewRevisionSql}
           WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
             AND ${exactLiveSet}`,
         [
@@ -1764,8 +1887,32 @@ async function persistNormalizedPublish(
     }
     throw err;
   }
-  if ((results[transitionIndex]?.meta?.changes ?? 0) === 0) {
-    return { published: false, insertedIds: [] };
+  const transitionChanges = results[transitionIndex]?.meta?.changes ?? 0;
+  if (skipRevisionBump) {
+    await recordReviewRevisionAudit(env.DB, {
+      docId,
+      revision: review?.review_revision ?? 1,
+      trigger: 'pipeline_publish_identical_noop',
+      contentHash: pipelineMatch.contentHash,
+      detail: {
+        extractor: metadata.extractor,
+        modelVersion: metadata.modelVersion,
+        resolved: review?.resolved ?? null,
+        transitionChanges,
+      },
+      createdAt: nowIso,
+    });
+  }
+  if (transitionChanges === 0) {
+    const existingIds = skipRevisionBump
+      ? (await all<{ id: string }>(
+        env.DB,
+        `SELECT id FROM transactions
+          WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL}) AND deprecated_at IS NULL`,
+        [docId],
+      )).map((row) => row.id)
+      : [];
+    return { published: false, insertedIds: existingIds };
   }
 
   const insertedCount = results[0]?.meta?.changes ?? 0;
@@ -1827,6 +1974,7 @@ async function routeToReview(
     extractor: string | null;
     modelVersion: string | null;
     reasonOverride?: string;
+    payloadExtras?: Record<string, unknown>;
   },
   review: ReviewSnapshot | null,
 ): Promise<boolean> {
@@ -1869,7 +2017,12 @@ async function routeToReview(
     truncated,
     transactions: flagged
       .slice(0, MAX_PUBLISH_TRANSACTIONS_PER_FILING)
-      .map((f) => ({ ...f.tx, flags: f.flags })),
+      .map((f) => {
+        const row: Record<string, unknown> = { ...f.tx, flags: f.flags };
+        if (f.flags.includes('grid_type_unmarked')) row.txType = null;
+        return row;
+      }),
+    ...(meta.payloadExtras ?? {}),
   });
   const decisionPayload = JSON.stringify({
     minConfidence,

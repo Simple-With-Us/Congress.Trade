@@ -16,6 +16,12 @@
 import type { Env, Filing, DocKind, Chamber, ParsedTx } from '../shared/types.ts';
 import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { get, run } from '../shared/db.ts';
+import { recordGenuineIngestFailure } from '../ingestion/ingestFailureReviewQueue.ts';
+import {
+  ensureTerminalFailureReviewRow,
+  PIPELINE_FAILURE_REASON,
+  unsettledNormalizeReason,
+} from '../ingestion/terminalFailureReview.ts';
 import {
   buildExtractorPipeline,
   type ExtractorModelRun,
@@ -40,6 +46,7 @@ import {
   isLlmDocBudgetHalt,
   LlmDocBudgetExceededError,
 } from '../shared/llmSpend.ts';
+import { ensureHouseFiledDateBeforeNormalize } from '../ingestion/houseFiledDate.ts';
 
 interface FilingRow {
   doc_id: string;
@@ -86,12 +93,11 @@ async function markError(
   message: string,
   lease?: DurableQueueLeaseContext,
 ): Promise<void> {
-  await lease?.assertOwned();
-  await run(
-    env.DB,
-    "UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?",
-    [message.slice(0, 500), docId],
-  );
+  await recordGenuineIngestFailure(env, docId, message, {
+    source: 'orchestrator',
+    stage: 'extract',
+    lease,
+  });
 }
 
 function isProviderRateLimit(err: unknown): boolean {
@@ -184,7 +190,15 @@ export async function extractAndNormalize(
     await assertDocLlmSpendAllowed(env, docId);
   } catch (err) {
     if (err instanceof LlmDocBudgetExceededError || isLlmDocBudgetHalt(err)) {
+      const message = `orchestrator: doc llm budget exceeded: ${(err as Error).message}`;
       console.info(`orchestrator: skip paid extract for ${docId}: ${(err as Error).message}`);
+      await ensureTerminalFailureReviewRow(
+        env,
+        docId,
+        PIPELINE_FAILURE_REASON.extractBudget,
+        message,
+        { source: 'extract' },
+      );
       return;
     }
     throw err;
@@ -193,6 +207,17 @@ export async function extractAndNormalize(
   if (!extracted) return; // missing row / raw object: already recorded as error.
 
   await lease?.assertOwned();
+
+  try {
+    await ensureHouseFiledDateBeforeNormalize(env, extracted.filing, {
+      ocrText: extracted.raw,
+      relayUrl: env.HOUSE_RELAY_URL || env.INGEST_RELAY_URL,
+      signal: lease?.signal,
+    });
+  } catch (err) {
+    lease?.signal.throwIfAborted();
+    console.warn('orchestrator: house filed_date resolve failed:', docId, (err as Error).message);
+  }
 
   // CT-2448: before the OGE path parks a 278-T as `oge_text_unreadable`,
   // run the local tesseract pass over the stored PDF.  When both reads agree
@@ -228,6 +253,25 @@ export async function extractAndNormalize(
     parseDisposition: effective.parseDisposition,
     reviewPayload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
   });
+
+  // A lost publish/review CAS returns without a queue row. The hourly sweep
+  // is the backstop; this lands the row on the attempt that noticed.
+  if (!result.published && !result.settled) {
+    try {
+      await ensureTerminalFailureReviewRow(
+        env,
+        docId,
+        unsettledNormalizeReason({
+          needsReview: result.needsReview,
+          reviewReason: result.reviewReason,
+        }),
+        result.reviewReason ?? 'normalize: publish did not commit',
+        { source: result.needsReview ? 'normalize' : 'publish' },
+      );
+    } catch (err) {
+      console.warn('orchestrator: terminal failure review enqueue failed:', docId, (err as Error).message);
+    }
+  }
 
   // Fast path: a doc that just landed in review gets a cross-vendor agreement
   // check enqueued immediately (self-gates on the flag; the per-minute cron is
