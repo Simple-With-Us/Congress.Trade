@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Hetzner resource digest
+Requires=hetzner-resource-digest.service
+
+[Timer]
+OnCalendar=daily
+AccuracySec=1h
+Persistent=true
+RandomizedDelaySec=30m
+Unit=hetzner-resource-digest.service
+
+[Install]
+WantedBy=timers.target
