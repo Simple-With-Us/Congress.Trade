@@ -165,6 +165,13 @@ HYGIENE_NOW=3120
 emit_alert "disk:/tmp" ok "tmp back"
 assert_eq "$(wc -l < "$STATE_DIR/notifications.log" | tr -d ' ')" 2 "recovery still pages after unknown gap"
 assert_eq "$(awk -F '\t' 'END {print $3" "$4}' "$STATE_DIR/notifications.log")" "ok recovery" "recovery after unknown is recovery"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+printf 'disk:/mnt/fleet-extra\tunknown\t2500\n' > "$STATE_DIR/alert-state.tsv"
+HYGIENE_NOW=2600
+emit_alert "disk:/mnt/fleet-extra" ok "legacy unknown cleared"
+assert_eq "$(wc -l < "$STATE_DIR/notifications.log" | tr -d ' ')" 1 "legacy unknown then ok pages recovery"
+assert_eq "$(awk -F '\t' 'END {print $4}' "$STATE_DIR/notifications.log")" legacy-recovery "legacy unknown recovery reason"
 
 section "pushover token preference"
 env_dir="${TMP}/env"
@@ -365,6 +372,7 @@ run_main() {
     STATE_DIR="$STATE_DIR" \
     HYGIENE_NOW="${HYGIENE_NOW}" \
     HYGIENE_DEPLOY_ACTIVE="${HYGIENE_DEPLOY_ACTIVE:-0}" \
+    HYGIENE_FAIL_DF_AFTER_PRUNE="${HYGIENE_FAIL_DF_AFTER_PRUNE:-0}" \
     PAGE_SIZE=4096 \
     PATH="${STUB}:${PATH}" \
     DOCKER_LOG="$DOCKER_LOG" \
@@ -439,6 +447,17 @@ assert_file_lacks "$DOCKER_LOG" "volume prune" "crit path never prunes volumes"
 assert_file_has "${TMP}/crit.out" "STILL critical" "crit after a no-op reclaim says so"
 assert_file_has "$STATE_DIR/last-status" "level_before=crit" "status keeps the pre-prune level"
 assert_file_has "$STATE_DIR/last-status" "level_after=crit" "status keeps the post-prune level"
+
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+HYGIENE_NOW=80500
+HYGIENE_FAIL_DF_AFTER_PRUNE=1
+write_levels 95 5 0 8192000
+run_main > "${TMP}/df-fail.out"
+assert_file_has "${TMP}/df-fail.out" "disk-after: re-read failed" "post-prune df failure is logged"
+assert_file_has "${TMP}/df-fail.out" "STILL critical" "post-prune df failure still pages STILL critical"
+assert_file_has "$STATE_DIR/last-status" "level_after=crit" "post-prune df failure still writes status"
+unset HYGIENE_FAIL_DF_AFTER_PRUNE
 
 rm -rf "$STATE_DIR"
 mkdir -p "$STATE_DIR"

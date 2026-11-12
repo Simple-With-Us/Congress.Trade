@@ -313,6 +313,10 @@ read_metric_texts() {
   if [[ -n "${HYGIENE_FIXTURE_DIR:-}" ]]; then
     DF_P_TEXT=$(cat "$HYGIENE_FIXTURE_DIR/df-P.txt")
     DF_I_TEXT=$(cat "$HYGIENE_FIXTURE_DIR/df-i.txt")
+    if [[ "${HYGIENE_FAIL_DF_AFTER_PRUNE:-0}" == "1" && "${HYGIENE_POST_PRUNE_READ:-0}" == "1" ]]; then
+      DF_P_TEXT=""
+      DF_I_TEXT=""
+    fi
     MEMINFO_TEXT=$(cat "$HYGIENE_FIXTURE_DIR/meminfo")
     VMSTAT_TEXT=$(cat "$HYGIENE_FIXTURE_DIR/vmstat")
     LOADAVG_TEXT=$(cat "$HYGIENE_FIXTURE_DIR/loadavg")
@@ -899,8 +903,14 @@ alert_decision() {
     echo suppress unknown
     return 0
   fi
+  if [[ "$level" == "ok" && "$prev_level" == "unknown" ]]; then
+    # Pre-preserve builds persisted unknown; still page once on the first ok.
+    alert_state_set "$signal" ok "$now_ts"
+    echo notify legacy-recovery
+    return 0
+  fi
   if [[ "$level" == "ok" ]]; then
-    if [[ -z "$prev_level" || "$prev_level" == "ok" || "$prev_level" == "unknown" ]]; then
+    if [[ -z "$prev_level" || "$prev_level" == "ok" ]]; then
       alert_state_set "$signal" ok "$prev_ts"
       echo suppress ok-quiet
       return 0
@@ -1070,10 +1080,22 @@ main() {
     return 0
   fi
 
+  local _prev_used_pct="${USED_PCT:-}" _prev_free_gb="${FREE_GB:-}"
+  local _prev_used_gb="${USED_GB:-}" _prev_total_gb="${TOTAL_GB:-}"
   apply_prune "$root_level"
-  read_metric_texts
-  fill_mount_metrics "/" root ROOT || return 1
-  local level_after="$M_ROOT_LEVEL"
+  HYGIENE_POST_PRUNE_READ=1 read_metric_texts
+  local level_after
+  if fill_mount_metrics "/" root ROOT; then
+    level_after="$M_ROOT_LEVEL"
+  else
+    log "disk-after: re-read failed, reusing before level=${root_level}"
+    USED_PCT="$_prev_used_pct"
+    FREE_GB="$_prev_free_gb"
+    USED_GB="$_prev_used_gb"
+    TOTAL_GB="$_prev_total_gb"
+    M_ROOT_LEVEL="$root_level"
+    level_after="$root_level"
+  fi
   log "disk-after: used=${USED_PCT}% free=${FREE_GB}G level=${level_after}"
   report_docker
   report_builder_cache
