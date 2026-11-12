@@ -368,6 +368,11 @@ if args[:2] == ["system", "df"] and "-v" in args:
         fail("json format is not this fixture")
     sys.stdout.write((root / "df-verbose.txt").read_text(encoding="utf-8"))
     sys.exit(0)
+if args[:1] == ["ps"] and "--format" in args:
+    active = (root / "build-active.txt")
+    if active.exists():
+        sys.stdout.write(active.read_text(encoding="utf-8"))
+    sys.exit(0)
 if args[:1] == ["ps"] and "-aq" in args:
     sys.stdout.write((root / "container-ids.txt").read_text(encoding="utf-8"))
     sys.exit(0)
@@ -393,6 +398,9 @@ if args[:1] == ["rm"] and len(args) == 2 and not args[1].startswith("-"):
     (state / "mutated").write_text("1", encoding="utf-8")
     sys.exit(0)
 if args[:2] == ["image", "rm"] and len(args) == 3 and not args[2].startswith("-"):
+    refused = (root / "refuse-image-rm.txt")
+    if refused.exists() and args[2] in refused.read_text(encoding="utf-8").splitlines():
+        sys.exit(5)
     state.mkdir(parents=True, exist_ok=True)
     (state / "mutated").write_text("1", encoding="utf-8")
     sys.exit(0)
@@ -463,7 +471,7 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("stopped_containers_older_than count=2 bytes=9000000", result.report)
         self.assertIn("dangling_anonymous_volumes count=1 bytes=12000000", result.report)
         self.assertIn("build_cache_older_than count=1 bytes=2000000000", result.report)
-        self.assertIn(f"rollback_image {IMG_PREV}", result.report)
+        self.assertIn(f"rollback_image {IMG_PREV} repo=", result.report)
         self.assertEqual(action_values(result, "image"), {IMG_OLD, IMG_DANGLE, IMG_NGINX})
         self.assertEqual(action_values(result, "container"), {C_PLAIN, C_DEAD})
         self.assertEqual(action_values(result, "volume"), {VOL_ANON})
@@ -511,7 +519,7 @@ class PlannerTests(unittest.TestCase):
         result = plan([inflight, current, previous, ancient], [running])
         self.assertEqual(action_values(result, "image"), {ancient.full_id})
         self.assertEqual(action_values(result, "container"), set())
-        self.assertIn(f"rollback_image {previous.full_id}", result.report)
+        self.assertIn(f"rollback_image {previous.full_id} repo=", result.report)
 
     def test_untagged_labeled_previous_image_is_kept(self) -> None:
         current = image(
@@ -543,7 +551,7 @@ class PlannerTests(unittest.TestCase):
         )
         result = plan([current, previous, older], [running])
         self.assertEqual(action_values(result, "image"), {older.full_id})
-        self.assertIn(f"rollback_image {previous.full_id}", result.report)
+        self.assertIn(f"rollback_image {previous.full_id} repo=", result.report)
 
     def test_orphan_repo_keeps_two_newest(self) -> None:
         repo = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
@@ -552,7 +560,67 @@ class PlannerTests(unittest.TestCase):
         oldest = image(hid("e33333333333", "c"), NOW - timedelta(days=50), [f"{repo}:old"])
         result = plan([newest, middle, oldest], [])
         self.assertEqual(action_values(result, "image"), {oldest.full_id})
-        self.assertIn(f"rollback_image {middle.full_id}", result.report)
+        self.assertIn(f"rollback_image {middle.full_id} repo=", result.report)
+
+    def test_unidentified_coolify_labels_use_unique_fallback_keys(self) -> None:
+        repo1 = f"{APP1}:current"
+        repo2 = f"{APP2}:current"
+        current1 = image(
+            hid("af1111111111", "a"),
+            NOW - timedelta(days=1),
+            [repo1],
+            labels={"coolify.managed": "true"},
+            containers=1,
+        )
+        previous1 = image(
+            hid("af2222222222", "b"),
+            NOW - timedelta(days=30),
+            [f"{APP1}:previous"],
+            labels={"coolify.managed": "true"},
+        )
+        current2 = image(
+            hid("af3333333333", "c"),
+            NOW - timedelta(days=1),
+            [repo2],
+            labels={"coolify.managed": "true"},
+            containers=1,
+        )
+        previous2 = image(
+            hid("af4444444444", "d"),
+            NOW - timedelta(days=30),
+            [f"{APP2}:previous"],
+            labels={"coolify.managed": "true"},
+        )
+        running1 = container(
+            hid("af5555555555", "e"),
+            current1.full_id,
+            "running",
+            labels={"coolify.managed": "true"},
+        )
+        running2 = container(
+            hid("af6666666666", "f"),
+            current2.full_id,
+            "running",
+            labels={"coolify.managed": "true"},
+        )
+        result = plan(
+            [current1, previous1, current2, previous2],
+            [running1, running2],
+        )
+        self.assertIn(f"rollback_image {previous1.full_id}", result.report)
+        self.assertIn(f"rollback_image {previous2.full_id}", result.report)
+        self.assertNotIn(previous1.full_id, action_values(result, "image"))
+        self.assertNotIn(previous2.full_id, action_values(result, "image"))
+
+    def test_verify_df_stable_rejects_a_changed_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_demo(root)
+            stable = (root / "df-verbose.txt").read_text(encoding="utf-8")
+            planner.verify_df_stable(stable, stable)
+            shifted = stable.replace(IMG_OLD[:12], "fffffffffffe", 1)
+            with self.assertRaises(planner.SnapshotError):
+                planner.verify_df_stable(stable, shifted)
 
     def test_age_boundary_and_control_plane(self) -> None:
         kept = image(hid("f11111111111", "a"), NOW - timedelta(days=14), [])
@@ -946,6 +1014,84 @@ class ShellTests(unittest.TestCase):
             self.assertIn(["builder", "prune", "-f", "--filter", "until=72h"], calls)
             self.assertLess(calls.index(["builder", "prune", "-f", "--filter", "until=72h"]), len(calls) - 1)
             self.assertEqual(calls[-1], ["system", "df"])
+            df_verbose_calls = [
+                call for call in calls if call[:2] == ["system", "df"] and "-v" in call
+            ]
+            self.assertGreaterEqual(len(df_verbose_calls), 2)
+
+    def test_apply_continues_after_a_failed_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            write_demo(fixture)
+            (fixture / "refuse-image-rm.txt").write_text(IMG_DANGLE + "\n", encoding="utf-8")
+            state = root / "state"
+            log = root / "docker-log"
+            fake = root / "docker"
+            fake.write_text(FAKE_DOCKER, encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            completed = subprocess.run(
+                ["bash", str(SHELL)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "DOCKER": str(fake),
+                    "PATH": str(root) + os.pathsep + os.environ.get("PATH", ""),
+                    "FIXTURE": str(fixture),
+                    "DOCKER_LOG": str(log),
+                    "DOCKER_STATE": str(state),
+                    "DOCKER_RECLAIM_NOW": NOW_TEXT,
+                    "EXPECT_UNTIL": "72h",
+                    "APPLY": "1",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("apply_failures count=1", completed.stderr)
+            self.assertIn("AFTER-TOTAL", completed.stdout)
+            calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            removed_images = {call[2] for call in calls if call[:2] == ["image", "rm"]}
+            self.assertEqual(removed_images, {IMG_OLD, IMG_DANGLE, IMG_NGINX})
+            self.assertEqual(calls[-1], ["system", "df"])
+
+    def test_apply_refuses_an_active_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            write_demo(fixture)
+            (fixture / "build-active.txt").write_text("coolify-builder\n", encoding="utf-8")
+            state = root / "state"
+            log = root / "docker-log"
+            fake = root / "docker"
+            fake.write_text(FAKE_DOCKER, encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            completed = subprocess.run(
+                ["bash", str(SHELL)],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "DOCKER": str(fake),
+                    "PATH": str(root) + os.pathsep + os.environ.get("PATH", ""),
+                    "FIXTURE": str(fixture),
+                    "DOCKER_LOG": str(log),
+                    "DOCKER_STATE": str(state),
+                    "DOCKER_RECLAIM_NOW": NOW_TEXT,
+                    "APPLY": "1",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("refused to apply while a Coolify build or deploy is active", completed.stderr)
+            calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+            for call in calls:
+                self.assertNotIn("rm", call)
+                self.assertNotIn("prune", call)
 
     def test_apply_does_not_prune_when_the_plan_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

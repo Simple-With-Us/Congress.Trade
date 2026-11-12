@@ -288,6 +288,74 @@ def app_key(labels: dict[str, str]) -> str | None:
     return "coolify.unidentified"
 
 
+def image_app_key(image: ImageRec) -> str | None:
+    key = app_key(image.labels)
+    if key is None:
+        return None
+    if key != "coolify.unidentified":
+        return key
+    uuids = _uuid_repos(image)
+    if uuids:
+        return f"repo={uuids[0]}"
+    return f"image={image.full_id}"
+
+
+def container_app_key(
+    container: ContainerRec, images_by_id: dict[str, ImageRec]
+) -> str | None:
+    key = app_key(container.labels)
+    if key is None:
+        return None
+    if key != "coolify.unidentified":
+        return key
+    image = images_by_id.get(container.image_id)
+    if image is not None:
+        image_key = image_app_key(image)
+        if image_key is not None:
+            return image_key
+    name = container.name.lstrip("/").strip()
+    if name:
+        return f"container={name}"
+    return f"container={container.full_id}"
+
+
+def _format_ts(value: datetime | None) -> str:
+    if value is None:
+        return "unknown"
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _format_tags(image: ImageRec) -> str:
+    tags = [tag for tag in image.repo_tags if tag and tag != "<none>:<none>"]
+    if tags:
+        return ",".join(tags)
+    if image.repos:
+        return ",".join(image.repos)
+    return "<none>"
+
+
+def df_verbose_fingerprints(text: str) -> tuple[frozenset[str], frozenset[str]]:
+    verbose = parse_df_verbose(text)
+    images: set[str] = set()
+    for row in verbose["images"]:
+        raw = row.get("IMAGE ID", "").strip()
+        if raw:
+            images.add(norm_id(raw))
+    containers: set[str] = set()
+    for row in verbose["containers"]:
+        raw = row.get("CONTAINER ID", "").strip()
+        if raw:
+            containers.add(norm_id(raw))
+    return frozenset(images), frozenset(containers)
+
+
+def verify_df_stable(before: str, after: str) -> None:
+    before_images, before_containers = df_verbose_fingerprints(before)
+    after_images, after_containers = df_verbose_fingerprints(after)
+    if before_images != after_images or before_containers != after_containers:
+        raise SnapshotError("snapshot changed during collection; retry")
+
+
 def repo_of(tag: str) -> str:
     slash = tag.rfind("/")
     colon = tag.rfind(":")
@@ -736,11 +804,11 @@ def rollback_sets(
             by_repo.setdefault(repo, []).append(image)
     by_app: dict[str, list[ImageRec]] = {}
     for image in images:
-        key = app_key(image.labels)
+        key = image_app_key(image)
         if key:
             by_app.setdefault(key, []).append(image)
     for container in containers:
-        key = app_key(container.labels)
+        key = container_app_key(container, by_id)
         image = by_id.get(container.image_id)
         if not key or image is None:
             continue
@@ -783,6 +851,31 @@ def _count_line(name: str, count: int, nbytes: int) -> str:
     return f"{name} count={count} bytes={nbytes} human={human_size(nbytes)}"
 
 
+def _format_image_hold(image: ImageRec, reason: str) -> str:
+    return (
+        f"keep_image {image.full_id} repo={_format_tags(image)} "
+        f"created={_format_ts(image.created)} reason={reason}"
+    )
+
+
+def _format_container_hold(container: ContainerRec, reason: str) -> str:
+    name = container.name.lstrip("/") or "<none>"
+    return (
+        f"keep_container {container.full_id} name={name} "
+        f"finished={_format_ts(container.finished_at)} reason={reason}"
+    )
+
+
+def _format_rollback(image_id: str, images_by_id: dict[str, ImageRec]) -> str:
+    image = images_by_id.get(image_id)
+    if image is None:
+        return f"rollback_image {image_id}"
+    return (
+        f"rollback_image {image_id} repo={_format_tags(image)} "
+        f"created={_format_ts(image.created)}"
+    )
+
+
 def build_plan(
     *,
     summary: str,
@@ -796,6 +889,7 @@ def build_plan(
     coolify_recent_days: int,
     build_cache_until: str,
     mode: str,
+    coolify_build_active: bool = False,
 ) -> Plan:
     if image_min_age_days < 1 or container_min_age_days < 1 or coolify_recent_days < 1:
         raise SnapshotError("age windows must be at least 1 day")
@@ -812,7 +906,7 @@ def build_plan(
             raise SnapshotError("df -v says an image has containers that inspect did not list")
     live_apps: set[str] = set()
     for container in containers:
-        key = app_key(container.labels)
+        key = container_app_key(container, images_by_id)
         if key and _container_recent(container, now, coolify_recent_days):
             live_apps.add(key)
     rollback_keep, previous_ids = rollback_sets(images, containers)
@@ -826,12 +920,13 @@ def build_plan(
             now=now,
             min_age_days=container_min_age_days,
             live_apps=live_apps,
+            images_by_id=images_by_id,
         )
         if reason is None:
             prunable_containers.append(container)
             actions.append(Action("container", container.full_id))
         else:
-            held_containers.append(f"keep_container {container.full_id} reason={reason}")
+            held_containers.append(_format_container_hold(container, reason))
 
     prunable_dangling: list[ImageRec] = []
     prunable_tagged: list[ImageRec] = []
@@ -852,7 +947,7 @@ def build_plan(
                 prunable_tagged.append(image)
             actions.append(Action("image", image.full_id))
         else:
-            held_images.append(f"keep_image {image.full_id} reason={reason}")
+            held_images.append(_format_image_hold(image, reason))
 
     prunable_volumes: list[VolumeRec] = []
     held_volumes: list[str] = []
@@ -879,13 +974,14 @@ def build_plan(
     actions.sort(key=lambda action: (_ACTION_ORDER[action.kind], action.value))
 
     rollback_lines = [
-        f"rollback_image {image_id}"
+        _format_rollback(image_id, images_by_id)
         for image_id in sorted(previous_ids)
     ]
     report = _render_report(
         mode=mode,
         now=now,
         summary=summary,
+        coolify_build_active=coolify_build_active,
         image_min_age_days=image_min_age_days,
         container_min_age_days=container_min_age_days,
         coolify_recent_days=coolify_recent_days,
@@ -916,6 +1012,7 @@ def _container_hold_reason(
     now: datetime,
     min_age_days: int,
     live_apps: set[str],
+    images_by_id: dict[str, ImageRec],
 ) -> str | None:
     if container.status not in _STOPPED_STATUSES:
         return "not_stopped"
@@ -923,7 +1020,7 @@ def _container_hold_reason(
         return "df_status_live"
     if is_control_plane_container(container.name):
         return "control_plane"
-    key = app_key(container.labels)
+    key = container_app_key(container, images_by_id)
     if has_coolify(container.labels) and key in live_apps:
         return "coolify_live_or_recent"
     if container.status == "created":
@@ -978,6 +1075,7 @@ def _render_report(
     mode: str,
     now: datetime,
     summary: str,
+    coolify_build_active: bool,
     image_min_age_days: int,
     container_min_age_days: int,
     coolify_recent_days: int,
@@ -999,9 +1097,11 @@ def _render_report(
     def total(items, attr: str) -> int:
         return sum(getattr(item, attr) for item in items)
 
+    build_state = "yes" if coolify_build_active else "no"
     lines = [
         f"docker-reclaim: mode={mode}",
         f"now: {now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"coolify_build_active: {build_state}",
         f"image_min_age_days: {image_min_age_days}",
         f"container_min_age_days: {container_min_age_days}",
         f"coolify_recent_days: {coolify_recent_days}",
@@ -1095,6 +1195,7 @@ def plan_from_dir(
     coolify_recent_days: int,
     build_cache_until: str,
     mode: str,
+    coolify_build_active: bool = False,
 ) -> Plan:
     summary, images, containers, volumes, cache = load_snapshot(input_dir, now)
     return build_plan(
@@ -1109,6 +1210,7 @@ def plan_from_dir(
         coolify_recent_days=coolify_recent_days,
         build_cache_until=build_cache_until,
         mode=mode,
+        coolify_build_active=coolify_build_active,
     )
 
 
@@ -1144,7 +1246,25 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("--build-cache-until", required=True)
     plan.add_argument("--commands", required=True, type=Path)
     plan.add_argument("--mode", choices=("dry-run", "apply"), default="dry-run")
+    plan.add_argument(
+        "--coolify-build-active",
+        choices=("yes", "no"),
+        default="no",
+    )
+    verify = sub.add_parser("verify-df-stable")
+    verify.add_argument("--before", required=True, type=Path)
+    verify.add_argument("--after", required=True, type=Path)
     args = parser.parse_args(argv)
+    if args.command == "verify-df-stable":
+        try:
+            verify_df_stable(
+                _require_text(args.before),
+                _require_text(args.after),
+            )
+        except SnapshotError as exc:
+            print(f"docker-reclaim: {exc}", file=sys.stderr)
+            return 1
+        return 0
     if args.command != "plan":
         print("docker-reclaim: unknown command", file=sys.stderr)
         return 2
@@ -1157,6 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
             coolify_recent_days=args.coolify_recent_days,
             build_cache_until=args.build_cache_until,
             mode=args.mode,
+            coolify_build_active=args.coolify_build_active == "yes",
         )
         write_actions(args.commands, result.actions)
     except SnapshotError as exc:

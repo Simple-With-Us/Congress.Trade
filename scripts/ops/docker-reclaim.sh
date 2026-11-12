@@ -40,6 +40,17 @@ die() {
   exit 1
 }
 
+log() {
+  echo "docker-reclaim: $*" >&2
+}
+
+is_deploy_active() {
+  if "$DOCKER" ps --format '{{.Names}}' 2>/dev/null | grep -Eqi 'nixpacks|coolify-builder|buildkit'; then
+    return 0
+  fi
+  return 1
+}
+
 cleanup() {
   if [[ -n "${RECLAIM_TMP:-}" ]]; then
     rm -rf "$RECLAIM_TMP"
@@ -102,11 +113,16 @@ collect_snapshot() {
     "$DOCKER" image inspect --format "$IMAGE_FMT" "${iids[@]}" > "$dir/images.jsonl"
   fi
   "$DOCKER" volume ls --format '{{json .}}' > "$dir/volumes.jsonl"
+  "$DOCKER" system df -v > "$dir/df-verbose-after.txt"
+  python3 "$PY" verify-df-stable \
+    --before "$dir/df-verbose.txt" \
+    --after "$dir/df-verbose-after.txt"
+  mv "$dir/df-verbose-after.txt" "$dir/df-verbose.txt"
 }
 
 apply_actions() {
   local file="$1"
-  local kind="" value="" extra=""
+  local kind="" value="" extra="" failures=0
   while IFS=$'\t' read -r kind value extra || [[ -n "$kind" ]]; do
     [[ -z "$kind" ]] && continue
     if [[ -n "$extra" ]]; then
@@ -115,19 +131,31 @@ apply_actions() {
     case "$kind" in
       container)
         [[ "$value" =~ ^[0-9a-f]{64}$ ]] || die "refused container id"
-        "$DOCKER" rm "$value"
+        if ! "$DOCKER" rm "$value"; then
+          log "failed: container $value"
+          failures=$((failures + 1))
+        fi
         ;;
       image)
         [[ "$value" =~ ^[0-9a-f]{64}$ ]] || die "refused image id"
-        "$DOCKER" image rm "$value"
+        if ! "$DOCKER" image rm "$value"; then
+          log "failed: image $value"
+          failures=$((failures + 1))
+        fi
         ;;
       volume)
         [[ "$value" =~ ^[a-f0-9]{64}$ ]] || die "refused volume name"
-        "$DOCKER" volume rm "$value"
+        if ! "$DOCKER" volume rm "$value"; then
+          log "failed: volume $value"
+          failures=$((failures + 1))
+        fi
         ;;
       build-cache)
         [[ "$value" =~ ^[1-9][0-9]*h$ ]] || die "refused build cache age"
-        "$DOCKER" builder prune -f --filter "until=${value}"
+        if ! "$DOCKER" builder prune -f --filter "until=${value}"; then
+          log "failed: build-cache until=${value}"
+          failures=$((failures + 1))
+        fi
         ;;
       *)
         die "refused action"
@@ -137,6 +165,10 @@ apply_actions() {
     value=""
     extra=""
   done < "$file"
+  if ((failures > 0)); then
+    log "apply_failures count=${failures}"
+  fi
+  return 0
 }
 
 main() {
@@ -154,6 +186,10 @@ main() {
     mode="dry-run"
   fi
   collect_snapshot "$RECLAIM_TMP"
+  build_active="no"
+  if is_deploy_active; then
+    build_active="yes"
+  fi
   python3 "$PY" plan \
     --input-dir "$RECLAIM_TMP" \
     --now "$now" \
@@ -162,8 +198,12 @@ main() {
     --coolify-recent-days "$COOLIFY_RECENT_DAYS" \
     --build-cache-until "$BUILD_CACHE_UNTIL" \
     --commands "$RECLAIM_TMP/actions.tsv" \
-    --mode "$mode"
+    --mode "$mode" \
+    --coolify-build-active "$build_active"
   if [[ "$mode" == "apply" ]]; then
+    if [[ "$build_active" == "yes" ]]; then
+      die "refused to apply while a Coolify build or deploy is active"
+    fi
     apply_actions "$RECLAIM_TMP/actions.tsv"
     echo "after:"
     "$DOCKER" system df
