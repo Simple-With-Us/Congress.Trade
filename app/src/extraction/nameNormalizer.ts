@@ -334,16 +334,28 @@ const FUND_DESCRIPTOR_STOP = new Set([
   'traded',
   'advisor',
   'advisors',
-  'ultra',
-  'pro',
-  'ultrapro',
-  'ultrashort',
   'class',
   'series',
   'select',
   'cmn',
   'lp',
   'llp',
+]);
+
+/**
+ * Leverage and direction tokens that name a different product in the same
+ * family. Kept out of FUND_DESCRIPTOR_STOP so stripping cannot collapse
+ * Ultra / UltraPro / UltraShort onto one string.
+ */
+const FUND_DIRECTION_TOKENS = new Set([
+  'short',
+  'bull',
+  'bear',
+  'inverse',
+  'leveraged',
+  'ultra',
+  'ultrapro',
+  'ultrashort',
 ]);
 
 function stripFundDescriptorTokens(simplified: string): string {
@@ -354,28 +366,38 @@ function stripFundDescriptorTokens(simplified: string): string {
     .join(' ');
 }
 
+function fundDirectionTokens(simplified: string): Set<string> {
+  const found = new Set<string>();
+  for (const token of simplified.split(/\s+/)) {
+    if (FUND_DIRECTION_TOKENS.has(token)) found.add(token);
+  }
+  return found;
+}
+
+function sameFundDirection(a: string, b: string): boolean {
+  const left = fundDirectionTokens(a);
+  const right = fundDirectionTokens(b);
+  if (left.size !== right.size) return false;
+  for (const token of left) {
+    if (!right.has(token)) return false;
+  }
+  return true;
+}
+
 /**
  * True when two simplified company names plausibly refer to the same security.
  * Tolerates ETF/fund wording differences (Index/Fund/ETF/Shares, etc.) while
  * still rejecting unrelated issuers (e.g. AAPL ticker with "Microsoft Corp").
+ * Containment is whole-string only: a shorter token list is not enough, so
+ * "Vanguard Growth" does not match "Vanguard Small Cap Growth".
  */
 export function namesPlausiblyMatch(a: string, b: string): boolean {
   if (!a || !b) return true;
+  if (!sameFundDirection(a, b)) return false;
 
   const as = stripFundDescriptorTokens(a);
   const bs = stripFundDescriptorTokens(b);
   if (!as || !bs) return true;
 
-  if (as === bs || as.includes(bs) || bs.includes(as)) return true;
-
-  const at = as.split(/\s+/).filter(Boolean);
-  const bt = bs.split(/\s+/).filter(Boolean);
-  const [shorter, longer] = at.length <= bt.length ? [at, bt] : [bt, at];
-  if (shorter.length === 0) return true;
-
-  const longerSet = new Set(longer);
-  if (!shorter.every((token) => longerSet.has(token))) return false;
-
-  const significant = shorter.filter((token) => token.length >= 3);
-  return significant.length >= 2 || (significant.length === 1 && shorter.length === 1);
+  return as === bs || as.includes(bs) || bs.includes(as);
 }

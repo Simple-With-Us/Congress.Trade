@@ -262,4 +262,37 @@ describe('namesPlausiblyMatch (ticker ↔ asset consistency)', () => {
       ),
     ).toBe(false);
   });
+
+  it('rejects sibling and opposite funds that share an issuer prefix', () => {
+    expect(
+      matchDisclosureToRef('ProShares UltraPro QQQ', 'ProShares UltraPro Short QQQ'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef('ProShares Ultra QQQ', 'ProShares UltraPro QQQ'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef('ProShares UltraShort QQQ', 'ProShares Ultra QQQ'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef('Vanguard Growth ETF', 'Vanguard Small Cap Growth Index Fund'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef(
+        'Direxion Daily S&P 500 Bull 3X Shares',
+        'Direxion Daily S&P 500 Bear 3X Shares',
+      ),
+    ).toBe(false);
+  });
+
+  it('still accepts the same leveraged product when only fund descriptors differ', () => {
+    expect(
+      matchDisclosureToRef('ProShares UltraPro QQQ', 'ProShares UltraPro QQQ ETF'),
+    ).toBe(true);
+    expect(
+      matchDisclosureToRef(
+        'ProShares UltraPro Short QQQ',
+        'ProShares UltraPro Short QQQ ETF',
+      ),
+    ).toBe(true);
+  });
 });
