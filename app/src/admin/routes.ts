@@ -105,6 +105,7 @@ import {
   refuseIllegibleBandAmounts,
   rejectConstantColumnReads,
 } from '../extraction/visionIntegrityGuards.ts';
+import { assessVisionDegenerate } from '../extraction/visionDegenerateGuard.ts';
 import { PIPELINE_TX_SOURCES_SQL, VISION_SUPERSEDE_REASON } from '../extraction/sourceSupersede.ts';
 import { EXTRACTION_PROMPT_VERSION } from '../extraction/visionLlm.ts';
 import { deprecatePredecessorFilingTransactions, duplicateLineupReason, enqueueAgreementCheck, processAgreementDoc, loadDocBytes, loadFilingRow, sameRowSet, type AgreementModels } from '../extraction/agreement.ts';
@@ -7695,6 +7696,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
     // value.
     const bandChecked = refuseIllegibleBandAmounts(deduped.rows);
     const columnChecked = rejectConstantColumnReads(bandChecked.rows);
+    const visionDegenerate = assessVisionDegenerate(columnChecked.rows);
     const parsedTx = columnChecked.rows;
 
     try {
@@ -7796,6 +7798,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
           value: r.value,
           rowCount: r.rowIndexes.length,
         })),
+        visionDegenerate,
       });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
