@@ -64,11 +64,13 @@ import {
 } from '../peerPricePending.ts';
 import { markTerminalPeerPriceTickers } from '../terminalListing.ts';
 import { collectStPeerPricesMetrics, stPeerPricesMetricsToCheck } from '../stPeerPricesHealth.ts';
+import { PRICE_DRAIN_LAST_PROGRESS_KEY } from '../peerPriceDrainProgress.ts';
 import { openMigratedD1, type SqliteDatabase } from './sqliteD1.ts';
 
 let db: SqliteDatabase;
 let env: Env;
 let close: () => void;
+let kvStore: Map<string, string>;
 
 const NOW = new Date('2026-10-23T15:00:00.000Z');
 const FRESH_THROUGH = lastTradingDay(NOW);
@@ -88,11 +90,20 @@ beforeEach(async () => {
   const opened = await openMigratedD1();
   db = opened.db;
   close = opened.close;
+  kvStore = new Map<string, string>();
   env = {
     DB: opened.d1,
     APP_B_IMPORT_URL: 'https://socratic.trade',
     APP_B_INGEST_TOKEN: 'test-peer-token',
-    CONFIG_KV: { get: async () => null, put: async () => {} },
+    CONFIG_KV: {
+      get: async (key: string) => kvStore.get(key) ?? null,
+      put: async (key: string, value: string) => {
+        kvStore.set(key, value);
+      },
+      delete: async (key: string) => {
+        kvStore.delete(key);
+      },
+    },
   } as unknown as Env;
 });
 
@@ -281,6 +292,7 @@ describe('terminal sweep and the stall clock', () => {
     });
     seedTrade('t-live', 'LIVE');
     seedSr('LIVE', { latestPriceDate: daysBeforeFresh(1), priceCheckedAt: hoursAgoIso(80) });
+    kvStore.set(PRICE_DRAIN_LAST_PROGRESS_KEY, hoursAgoIso(80));
 
     const metrics = await collectStPeerPricesMetrics(env, NOW, 6);
 
