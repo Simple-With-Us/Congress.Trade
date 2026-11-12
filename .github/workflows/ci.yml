@@ -397,6 +397,8 @@ jobs:
           bash -n scripts/ios-fleet/test-ship-seq.sh
           bash -n scripts/ios-fleet/scheduled-ship-gate.sh
           bash -n scripts/ios-fleet/test-scheduled-ship-gate.sh
+          bash -n scripts/ios-fleet/seed-last-ship.sh
+          bash -n scripts/ios-fleet/test-seed-last-ship.sh
           bash -n scripts/ios-ship-testflight.sh
           bash -n scripts/ios-stage-asc-key.sh
           bash -n scripts/test-ios-stage-asc-key.sh
@@ -411,6 +413,8 @@ jobs:
           node --check scripts/ios-fleet/version-plan.mjs
           node --check scripts/ios-fleet/test-asc-key.test.mjs
           node --check scripts/ios-fleet/appstore-version-plan.test.mjs
+          node --check scripts/ios-fleet/seed-last-ship.mjs
+          node --check scripts/ios-fleet/seed-last-ship.test.mjs
 
       - name: Fleet version publish guard
         run: node --test scripts/ios-fleet/publish-ios-versions.test.mjs
@@ -435,6 +439,11 @@ jobs:
 
       - name: ios-ship workflow contract
         run: node --test scripts/ios-ship-workflow.test.mjs
+
+      - name: Last-ship seed helper
+        run: |
+          node --test scripts/ios-fleet/seed-last-ship.test.mjs
+          bash scripts/ios-fleet/test-seed-last-ship.sh
 
       - name: ensure-tf-ready return-code labels (offline)
         run: bash scripts/ios-fleet/test-tf-ready-labels.sh
