@@ -98,7 +98,7 @@ struct PoliticianDetailView: View {
                                     }
                                 }
                             } else if isExecutiveChamber(member.chamber) {
-                                Text("Executive filers do not sit on congressional committees.")
+                                Text("Executive branch officials do not sit on congressional committees.")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             } else {
