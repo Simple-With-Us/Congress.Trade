@@ -25,6 +25,9 @@ from typing import Any, Callable
 
 SCHEMA_VERSION = 1
 
+# GNU du/find use exit 1 for non-fatal traversal errors while still emitting output.
+_ACCEPTABLE_CHILD_RC = frozenset({0, 1, 124})
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -54,6 +57,7 @@ class Runner:
     docker_cmd: str = "docker"
     deadline: float | None = None
     timed_out: bool = False
+    partial_warnings: list[str] = field(default_factory=list)
 
     def _check_deadline(self) -> None:
         if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -76,13 +80,17 @@ class Runner:
                 remaining = min(remaining, timeout)
         elif timeout is not None:
             remaining = timeout
-        return subprocess.run(
-            prefix,
-            check=False,
-            capture_output=True,
-            text=text,
-            timeout=remaining,
-        )
+        try:
+            return subprocess.run(
+                prefix,
+                check=False,
+                capture_output=True,
+                text=text,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            self.timed_out = True
+            raise
 
     def du_top_directories(
         self, root: Path, depth: int, top_n: int
@@ -98,8 +106,10 @@ class Runner:
             str(root),
         ]
         proc = self.run(argv)
-        if proc.returncode not in (0, 124):
-            return []
+        if proc.returncode not in _ACCEPTABLE_CHILD_RC:
+            raise RuntimeError(f"du failed (exit {proc.returncode})")
+        if proc.returncode == 1:
+            self.partial_warnings.append("du: exit 1; using partial directory totals")
         entries: list[tuple[int, str]] = []
         for line in (proc.stdout or "").splitlines():
             parts = line.split(maxsplit=1)
@@ -138,8 +148,10 @@ class Runner:
         # GNU find -printf; tests override FIND_CMD to a mock.
         expr.extend(["-printf", "%s\\t%T@\\t%p\\0"])
         proc = self.run(expr)
-        if proc.returncode not in (0, 124):
-            return []
+        if proc.returncode not in _ACCEPTABLE_CHILD_RC:
+            raise RuntimeError(f"find failed (exit {proc.returncode})")
+        if proc.returncode == 1:
+            self.partial_warnings.append("find: exit 1; using partial file list")
         out = proc.stdout or ""
         if "\0" in out:
             blobs = out.split("\0")
@@ -378,7 +390,7 @@ def run_report(opts: argparse.Namespace) -> dict[str, Any]:
     def safe_step(name: str, fn: Callable[[], Any], default: Any) -> Any:
         try:
             return fn()
-        except TimeoutError:
+        except (TimeoutError, subprocess.TimeoutExpired):
             runner.timed_out = True
             report["timed_out"] = True
             report.setdefault("partial_errors", []).append(f"{name}: timeout")
@@ -437,6 +449,8 @@ def run_report(opts: argparse.Namespace) -> dict[str, Any]:
     report["stale_large_files"] = safe_step("stale_large_files", collect_stale, [])
     report["docker"] = safe_step("docker", runner.docker_grouped_usage, {})
     report["timed_out"] = runner.timed_out
+    if runner.partial_warnings:
+        report["partial_warnings"] = list(runner.partial_warnings)
     return report
 
 
