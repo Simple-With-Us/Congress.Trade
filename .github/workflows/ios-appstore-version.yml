@@ -1,0 +1,187 @@
+name: iOS App Store version (prepare, never submits)
+
+# Prepare an App Store version for Congress.Trade.  Manual only.
+#
+# IT NEVER SUBMITS FOR REVIEW.  This workflow creates (or reuses) the App
+# Store version record, attaches the build to it, and compares the version's
+# metadata against the newest released version.  It never creates an
+# appStoreVersionSubmission, a reviewSubmission or a reviewSubmissionItem, and
+# it never writes a localization:  A HUMAN submits the version for review in
+# App Store Connect.
+#
+# Modes:
+#   plan    (default)  READ ONLY.  Prints the App Store versions, the newest
+#                      builds and the next marketing version as JSON.
+#   prepare            Creates the version <version> (or reuses it when it is
+#                      already editable), attaches build <build>, and prints
+#                      the metadata comparison.  It refuses to touch a
+#                      version that is already in review.
+#
+# The App Store Connect key comes from Fleet Secrets prod /asc (the same
+# identity secrets and the same Infisical project the ship workflows use).
+# No signing certificate, no Sentry DSN, no archive:  this workflow talks to
+# the App Store Connect API only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "plan = read-only report; prepare = create the version and attach the build"
+        type: choice
+        options:
+          - plan
+          - prepare
+        default: plan
+      version:
+        description: "Exact App Store version to prepare, e.g. 1.0.236"
+        type: string
+        required: false
+        default: ""
+      build:
+        description: "Build number (CFBundleVersion) to attach, e.g. 202610180036"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-appstore-version-congress
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: App Store version plan / prepare
+    if: github.event.repository.fork == false
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      BUNDLE_ID: trade.congress.ios
+      # The inputs reach the script through the environment, never by
+      # interpolation into it.
+      MODE: ${{ inputs.mode }}
+      VERSION: ${{ inputs.version }}
+      BUILD: ${{ inputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Identity stays on GitHub.  ASC uses Fleet Secrets prod /asc.
+      - name: Load App Store Connect key
+        env:
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          ASC_INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID }}
+          INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+        run: |
+          set +o xtrace
+          set -euo pipefail
+          export INFISICAL_DISABLE_UPDATE_CHECK=true
+
+          if ! command -v infisical >/dev/null 2>&1; then
+            NONINTERACTIVE=1 HOMEBREW_NO_AUTO_UPDATE=1 brew install infisical/get-cli/infisical
+          fi
+          command -v infisical >/dev/null 2>&1 || {
+            echo "::error::Infisical CLI is not installed."
+            exit 1
+          }
+
+          if [ -z "${INFISICAL_PROJECT_ID}" ]; then
+            echo "::error::Missing INFISICAL_PROJECT_ID GitHub secret."
+            exit 1
+          fi
+          CLIENT_ID="${INFISICAL_UNIVERSAL_AUTH_CLIENT_ID}"
+          CLIENT_SECRET="${INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET}"
+          if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+            CLIENT_ID="${INFISICAL_CLIENT_ID}"
+            CLIENT_SECRET="${INFISICAL_CLIENT_SECRET}"
+          fi
+          if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+            echo "::error::Missing Infisical machine identity.  Set INFISICAL_UNIVERSAL_AUTH_CLIENT_ID/SECRET (fallback INFISICAL_CLIENT_ID/SECRET) on the repo."
+            exit 1
+          fi
+
+          TOKEN="$(
+            env -u INFISICAL_CLIENT_ID -u INFISICAL_CLIENT_SECRET -u INFISICAL_TOKEN \
+              INFISICAL_UNIVERSAL_AUTH_CLIENT_ID="$CLIENT_ID" \
+              INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET="$CLIENT_SECRET" \
+              infisical login --method=universal-auth --silent --plain --telemetry=false 2>/dev/null || true
+          )"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Infisical universal-auth login failed."
+            exit 1
+          fi
+          if [[ "$TOKEN" == *$'\n'* || "$TOKEN" == *$'\r'* ]]; then
+            echo '::error::Infisical returned a multiline token.' >&2
+            exit 1
+          fi
+          printf '::add-mask::%s\n' "${TOKEN//'%'/'%25'}"
+
+          # The App Store Connect identity lives in Fleet Secrets prod /asc.
+          for name in ASC_KEY_ID ASC_ISSUER_ID; do
+            val="$(
+              INFISICAL_TOKEN="$TOKEN" infisical secrets get "$name" \
+                --plain --silent --telemetry=false --expand=true \
+                --projectId="$ASC_INFISICAL_PROJECT_ID" --env=prod --path=/asc \
+                2>/dev/null || true
+            )"
+            if [ -z "$val" ]; then
+              echo "::error::Missing $name in Fleet Secrets prod /asc; verify CI identity read access."
+              exit 1
+            fi
+            if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+              echo "::error::$name must be single-line; correct Infisical formatting." >&2
+              exit 1
+            fi
+            if [[ "$val" =~ ^\$\{[^}]+\}$ ]]; then
+              echo "::error::$name is still an unresolved Infisical secret reference; check the target exists and the CI identity can read the referenced folder."
+              exit 1
+            fi
+            printf '::add-mask::%s\n' "${val//'%'/'%25'}"
+            # The hosted form of the ASC credential:  the key id and the issuer
+            # under the names the client reads.  A path on disk is not an
+            # approved credential source (AFC-459), so the credential itself
+            # crosses the step boundary in the environment, never as a file.
+            if [[ "$name" == "ASC_KEY_ID" ]]; then
+              printf 'APPLE_API_KEY_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
+            if [[ "$name" == "ASC_ISSUER_ID" ]]; then
+              printf 'APPLE_API_ISSUER_ID=%s\n' "$val" >> "$GITHUB_ENV"
+            fi
+          done
+
+          # The key as base64:  one line, so the runner's environment file
+          # stays well formed and the raw PEM never enters GITHUB_ENV.
+          key_material="$(
+            INFISICAL_TOKEN="$TOKEN" infisical secrets get ASC_KEY_P8 \
+              --plain --silent --telemetry=false --expand=false \
+              --projectId="$ASC_INFISICAL_PROJECT_ID" --env=prod --path=/asc \
+              2>/dev/null || true
+          )"
+          if [ -z "$key_material" ]; then
+            echo "::error::Missing ASC key material in Fleet Secrets prod /asc; verify CI identity read access."
+            exit 1
+          fi
+          key_b64="$(printf '%s' "$key_material" | base64 | tr -d '\n')"
+          printf '::add-mask::%s\n' "${key_b64//'%'/'%25'}"
+          printf 'APPLE_API_KEY_P8_BASE64=%s\n' "$key_b64" >> "$GITHUB_ENV"
+          unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val
+
+      - name: Plan or prepare the App Store version
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "prepare" ]; then
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::version must be X.Y.Z (got '${VERSION}')."
+              exit 1
+            fi
+            if ! [[ "$BUILD" =~ ^[0-9]+$ ]]; then
+              echo "::error::build must be a plain integer (got '${BUILD}')."
+              exit 1
+            fi
+            node scripts/ios-fleet/asc-api.mjs appstore-version-prepare "$BUNDLE_ID" "$VERSION" "$BUILD"
+          else
+            node scripts/ios-fleet/asc-api.mjs appstore-version-plan "$BUNDLE_ID"
+          fi

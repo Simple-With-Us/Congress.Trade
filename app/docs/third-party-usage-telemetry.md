@@ -103,20 +103,21 @@ transport, and inventory operator-side `.mjs` requests under `scripts/`.
   explicit non-telemetry queue exceptions still generate metered Sentry
   envelopes. This prevents envelope-to-queue recursion during normal delivery
   and cross-service outages.
-- Cloudflare binding operations (D1, KV, R2, Queues) are platform bindings, not
-  third-party HTTP calls; their consumption remains available in Cloudflare
-  account metrics.
+- Host SQLite, Deno KV, in-process `deno_runtime_queue`, and R2 S3 calls are
+  not third-party HTTP product APIs.  R2 usage still appears in the Cloudflare
+  account metrics for that bucket.
 - A simultaneous Queue-send and R2-write failure is the remaining terminal
   producer gap. It emits one structured, secret-safe `usage telemetry durability
   exhausted` error (suppressed for Sentry's own transport) and returns `false`.
   No new infrastructure binding is required for the normal fallback path.
 - Browser dashboard calls are same-origin calls back to Congress.Trade, not
   third-party usage. External links are navigation, not server-side tool calls.
-- Operator-side maintenance programs are not bundled into the Worker and have
-  no Worker Queue/R2 bindings. `scripts/seed_securities.mjs` therefore uses the
-  fail-closed `scripts/usage-telemetry.mjs` transport: its environment must
-  receive `USAGE_MONITOR_INGEST_URL` and `USAGE_MONITOR_INGEST_TOKEN` (normally
-  through the approved secret runner) before it makes the SEC request.
+- Operator-side maintenance programs are not bundled into the Coolify app and
+  have no in-process queue / R2 bindings.  `scripts/seed_securities.mjs`
+  therefore uses the fail-closed `scripts/usage-telemetry.mjs` transport: its
+  environment must receive `USAGE_MONITOR_INGEST_URL` and
+  `USAGE_MONITOR_INGEST_TOKEN` (normally through the approved secret runner)
+  before it makes the SEC request.
 
 `src/shared/__tests__/thirdPartyTelemetry.test.ts` enforces the inventory,
 receiver-compatible event shape, secret redaction, host classification, and

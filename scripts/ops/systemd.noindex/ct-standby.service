@@ -1,0 +1,55 @@
+[Unit]
+# congress.trade standby holding page.
+#
+# WHY THIS EXISTS
+#   Coolify 4.1.2 has a health-gated rollout (ApplicationDeploymentJob::
+#   rolling_update(): start new -> health_check() -> stop old), but
+#   deploy_docker_compose_buildpack() never calls it.  It calls
+#   stop_running_container(force: true) BEFORE `docker compose up --build -d`,
+#   and `force: true` bypasses the newVersionIsHealthy gate.  Every deploy of a
+#   docker-compose application therefore has a window with ZERO app containers.
+#   There is no setting that changes this; see
+#   docs/rollouts/2026-08-12-deploy-downtime-gap.md.
+#
+#   This unit runs a tiny nginx container that is NOT part of the Coolify
+#   project, so `docker compose ... up` for the app project
+#   cannot stop or remove it.  ct-reattach-proxy.sh notices it is running and
+#   switches the Traefik route to a `failover` service, so requests landing in
+#   the deploy window get the holding page instead of Traefik's raw
+#   "no available server" / 502.
+#
+# INSTALL (run as root on the Coolify host)
+#   mkdir -p /opt/ct-standby
+#   install -m 0644 services/standby/nginx.conf   /opt/ct-standby/nginx.conf
+#   install -m 0644 services/standby/standby.html /opt/ct-standby/standby.html
+#   install -m 0644 scripts/ops/ct-standby.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now ct-standby.service
+#   # then let the ct-reattach-proxy cron pick it up (<= 60s), or force it:
+#   /usr/local/bin/ct-reattach-proxy.sh
+#
+# UNINSTALL / ROLLBACK
+#   systemctl disable --now ct-standby.service && /usr/local/bin/ct-reattach-proxy.sh
+#   ct-reattach-proxy.sh reverts to the plain single-server route automatically
+#   once the container is gone.
+Description=Congress.Trade standby holding page (deliberately outside Coolify)
+Documentation=file:///opt/ct-standby/standby.html
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+# Never let a stale container block the start.
+ExecStartPre=-/usr/bin/docker rm -f congress-standby
+ExecStartPre=-/usr/bin/docker pull nginx:alpine
+ExecStart=/usr/bin/docker run --rm --name congress-standby \
+  --network coolify --network-alias congress-standby \
+  --memory 64m --cpus 0.25 --pids-limit 64 \
+  -v /opt/ct-standby/nginx.conf:/etc/nginx/conf.d/default.conf:ro \
+  -v /opt/ct-standby/standby.html:/usr/share/nginx/html/standby.html:ro \
+  nginx:alpine
+ExecStop=/usr/bin/docker stop -t 5 congress-standby
+
+[Install]
+WantedBy=multi-user.target

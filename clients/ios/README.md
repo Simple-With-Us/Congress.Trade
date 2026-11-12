@@ -23,8 +23,25 @@ performance, accessibility, and verification roadmap.
 
 ## Open In Xcode
 
+The project container is `clients/ios/CongressTrade.xcodeproj` (no period in the
+basename — that tripped up tooling).  The dotted leftover
+`Congress.Trade.xcodeproj` is retired; do not recreate it.  Display name,
+bundle id, scheme, and targets are unchanged (`Congress.Trade` /
+`trade.congress.ios` / `CongressTrade`).
+
+`project.yml` is the XcodeGen source of truth. After changing sources, packages,
+or build settings:
+
 ```bash
-open clients/ios/Congress.Trade.xcodeproj
+cd clients/ios && xcodegen generate
+```
+
+Do not hand-edit `project.pbxproj`. Native Sentry is wired through
+`SentryTelemetry.swift` and plist key `SENTRY_DSN` (empty by default; pass the
+build setting for release archives).
+
+```bash
+open clients/ios/CongressTrade.xcodeproj
 ```
 
 Use the `CongressTrade` scheme and an iPhone simulator. The target is iOS 17+.
@@ -33,7 +50,7 @@ CLI build check:
 
 ```bash
 xcodebuild \
-  -project clients/ios/Congress.Trade.xcodeproj \
+  -project clients/ios/CongressTrade.xcodeproj \
   -scheme CongressTrade \
   -destination 'generic/platform=iOS Simulator' \
   CODE_SIGNING_ALLOWED=NO build
@@ -45,7 +62,7 @@ Run them against an installed simulator device:
 
 ```bash
 xcodebuild \
-  -project clients/ios/Congress.Trade.xcodeproj \
+  -project clients/ios/CongressTrade.xcodeproj \
   -scheme CongressTrade \
   -destination 'platform=iOS Simulator,name=iPhone 16' \
   test
@@ -96,4 +113,4 @@ bash scripts/ios-ship-testflight.sh --export-only
 Fleet driver (all three apps): `/Users/jay/apps/ios-fleet/README.md`.
 
 Bundle ID: `trade.congress.ios`. Team: `CC8UTF7ATG`. Requires App Store Connect
-app record + Xcode session or `~/.secrets/appstore-connect.env`.
+app record + Xcode session or ASC credentials (env, else Infisical `/asc` via `fleet-secrets`).

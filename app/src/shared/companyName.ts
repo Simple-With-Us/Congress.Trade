@@ -1,4 +1,11 @@
-/** Standardize company name: title-case all-caps, normalize common suffixes, preserve key acronyms. */
+/**
+ * Standardize company name: title-case all-caps, normalize common suffixes, preserve key acronyms.
+ *
+ * Stays local on purpose (issue #1462).  Shared `normalizeCompanyName` is a
+ * subset; this copy also strips exchange parens, "Common Stock", and uses a
+ * curated US-state suffix list.  Do not switch the product path to shared
+ * without a display-name fixture pass.
+ */
 export function normalizeCompanyName(raw: string | null | undefined, ticker?: string | null): string | null {
   if (!raw) return null;
   let name = raw.trim();

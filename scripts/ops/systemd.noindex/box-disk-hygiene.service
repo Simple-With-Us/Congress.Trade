@@ -1,0 +1,17 @@
+[Unit]
+Description=Coolify box disk hygiene (check free space + safe Docker prune)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/box-disk-hygiene.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SyslogIdentifier=box-disk-hygiene
+# Optional overrides:
+# EnvironmentFile=-/etc/box-disk-hygiene.env
+
+[Install]
+WantedBy=multi-user.target

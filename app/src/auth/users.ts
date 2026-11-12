@@ -30,6 +30,8 @@ interface UserRow {
   trial_end?: string | null;
   // Sign in with Apple (migration 0080). Same `?`-guard pattern as billing.
   apple_sub?: string | null;
+  // Sign in with X / Twitter (migration 0090).
+  x_sub?: string | null;
 }
 
 function mapUser(r: UserRow): User {
@@ -40,6 +42,7 @@ function mapUser(r: UserRow): User {
     picture: r.picture,
     googleSub: r.google_sub,
     appleSub: r.apple_sub ?? null,
+    xSub: r.x_sub ?? null,
     emailVerified: r.email_verified === 1,
     createdAt: r.created_at,
     lastLoginAt: r.last_login_at,
@@ -220,4 +223,64 @@ export async function upsertUserFromApple(env: Env, p: AppleProfile): Promise<Us
     ],
   );
   return (await getUserById(env, id)) as User;
+}
+
+export async function getUserByXSub(env: Env, xSub: string): Promise<User | null> {
+  const r = await get<UserRow>(env.DB, 'SELECT * FROM users WHERE x_sub = ?', [xSub]);
+  return r ? mapUser(r) : null;
+}
+
+export interface XProfile {
+  sub: string;
+  username: string;
+  name?: string | null;
+  picture?: string | null;
+}
+
+export async function upsertUserFromX(env: Env, p: XProfile): Promise<User> {
+  const now = new Date().toISOString();
+  const existingByX = await getUserByXSub(env, p.sub);
+  if (existingByX) {
+    await run(
+      env.DB,
+      `UPDATE users
+          SET name = COALESCE(?, name),
+              picture = COALESCE(?, picture),
+              last_login_at = ?
+        WHERE id = ?`,
+      [p.name ?? null, p.picture ?? null, now, existingByX.id],
+    );
+    return (await getUserById(env, existingByX.id)) as User;
+  }
+
+  const id = uuid();
+  const placeholderEmail = `x-${p.sub}@privaterelay.congress.trade.invalid`;
+  await run(
+    env.DB,
+    `INSERT INTO users (id, email, name, picture, google_sub, apple_sub, x_sub, email_verified, created_at, last_login_at)
+     VALUES (?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?)`,
+    [
+      id,
+      placeholderEmail,
+      p.name ?? p.username ?? null,
+      p.picture ?? null,
+      p.sub,
+      now,
+      now,
+    ],
+  );
+  return (await getUserById(env, id)) as User;
+}
+
+export async function linkXSubToUser(env: Env, userId: string, xSub: string): Promise<User> {
+  const now = new Date().toISOString();
+  await run(
+    env.DB,
+    `UPDATE users
+        SET x_sub = ?,
+            last_login_at = ?
+      WHERE id = ?`,
+    [xSub, now, userId],
+  );
+  return (await getUserById(env, userId)) as User;
 }

@@ -1,5 +1,9 @@
 # 2026-07-31 — Cron-lane split: staggered daily lanes (fix 45s deadline starvation)
 
+> **Current shape (2026-08):** Deno Deploy is retired.  Production is Coolify
+> paid (`* * * * *`) on Hetzner; the 45s Deploy free-tier deadline is
+> historical.  The staggered lanes below are still the live daily split.
+
 ## Summary
 
 The once-a-day job chain (FMP enrichment, price refresh, bulk R2 snapshot,

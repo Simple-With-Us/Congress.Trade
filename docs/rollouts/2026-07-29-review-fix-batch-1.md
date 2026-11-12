@@ -1,5 +1,9 @@
 # Rollout — Review Fix Batch 1 (2026-07-29, KIMI)
 
+> **Current shape (2026-08):** Deno Deploy and Turso stay retired.  Production
+> is Coolify on Hetzner (not the Oracle Docker monolith named in the doc-drift
+> follow-up).  See `app/DEPLOY.md`.
+
 ## Summary
 First landing batch from the six-lane review (`docs/reviews/2026-07-28-full-app-review.md`).
 Merged via PR #1126; deployed by the Deploy Oracle Monolith workflow (Docker on

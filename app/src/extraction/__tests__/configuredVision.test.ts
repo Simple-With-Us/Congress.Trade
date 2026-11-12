@@ -110,9 +110,9 @@ describe('resolvePrimaryFailoverModels', () => {
     expect(failover).toEqual({ provider: 'anthropic', model: 'claude-sonnet-5' });
   });
 
-  it('returns default Grok 4.5 for an unconfigured chamber', async () => {
+  it('returns default Grok 4.6 for an unconfigured chamber', async () => {
     const { primary, failover } = await resolvePrimaryFailoverModels({} as Env, 'senate');
-    expect(primary).toEqual({ provider: 'openrouter', model: 'x-ai/grok-4.5' });
+    expect(primary).toEqual({ provider: 'openrouter', model: 'x-ai/grok-4.6' });
     expect(failover).toBeNull();
   });
 });

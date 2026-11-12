@@ -67,9 +67,42 @@ function compareOrder(a: SubscriptionEventState, b: SubscriptionEventState): num
   return a.created - b.created || a.priority - b.priority || a.eventId.localeCompare(b.eventId);
 }
 
+/** Minimal `apple_subscriptions` row (migration 0081) for the IAP ledger seed. */
+interface AppleRow {
+  user_id: string | null;
+  status: string;
+  plan: string;
+  expires_date: string | null;
+  auto_renew_status: number | null;
+  original_transaction_id: string;
+  product_id: string;
+  environment: string | null;
+  latest_transaction_id: string | null;
+  purchase_date: string | null;
+  auto_renew_product_id: string | null;
+  revoked_at: string | null;
+  revocation_reason: number | null;
+  last_notification_type: string | null;
+  last_notification_subtype: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function appleRow(over: Partial<AppleRow> = {}): AppleRow {
+  return {
+    user_id: 'u1', status: 'active', plan: 'monthly', expires_date: null, auto_renew_status: 1,
+    original_transaction_id: 'ot_1', product_id: 'trade.congress.premium.monthly', environment: 'Production',
+    latest_transaction_id: 't_1', purchase_date: null, auto_renew_product_id: null, revoked_at: null,
+    revocation_reason: null, last_notification_type: null, last_notification_subtype: null,
+    created_at: 'now', updated_at: 'now',
+    ...over,
+  };
+}
+
 function fakeEnv(
   over: Record<string, unknown> = {},
   seed: URow[] = [],
+  appleSeed: AppleRow[] = [],
 ): {
   env: Env;
   rows: Map<string, URow>;
@@ -110,6 +143,22 @@ function fakeEnv(
           }
           if (/SELECT \* FROM users WHERE id/i.test(sql)) {
             return ((rows.get(this._p[0] as string) ?? null) as unknown) as T | null;
+          }
+          // activeAppleSubscriptionForUser (billing/appleSubscriptions.ts) — the
+          // second OR term resolveEntitlementAsync consults for Apple-purchased
+          // Premium. Mirrors that query's own status/expiry predicate.
+          if (/FROM apple_subscriptions[\s\S]*WHERE user_id/i.test(sql)) {
+            const [userId, nowIso] = this._p as [string, string];
+            const r = appleSeed.find((x) => (
+              x.user_id === userId
+              && (x.status === 'active' || x.status === 'grace_period')
+              && (x.expires_date === null || x.expires_date > nowIso)
+            ));
+            return ((r ?? null) as unknown) as T | null;
+          }
+          if (/FROM stripe_subscription_event_state WHERE subscription_id/i.test(sql)) {
+            const state = subscriptionEvents.get(this._p[0] as string);
+            return (state ? { last_event_id: state.eventId } : null) as T | null;
           }
           if (/SELECT processed_at FROM stripe_webhook_events/i.test(sql)) {
             const event = webhookEvents.get(this._p[0] as string);
@@ -180,42 +229,60 @@ function fakeEnv(
             return { success: true, meta: { changes } } as unknown as D1Result;
           }
           if (/SET\s+stripe_customer_id = \?,\s+stripe_subscription_id/i.test(sql)) {
-            const [
-              cust, sub, status, plan, cpe, cape, trial, id, expectedCustomer,
-              stateSub, created, priority, eventId, sameSub, newerCreated,
-              sameSecondCreated, eventType, crossStatus,
-            ] = p as [
-              string, string, string, string | null, string | null, number, string | null, string,
-              string, string, number, number, string, string, number, number, string, string,
-            ];
-            const r = rows.get(id);
-            const applied = subscriptionEvents.get(stateSub);
-            const current = r?.stripe_subscription_id ? subscriptionEvents.get(r.stripe_subscription_id) : undefined;
-            const crossSubscriptionAllowed = current && (
-              current.created < newerCreated
-              || (
-                current.created === sameSecondCreated
-                && eventType === 'customer.subscription.created'
-                && (crossStatus === 'active' || crossStatus === 'trialing')
-                && (r?.subscription_status === 'canceled' || r?.subscription_status === 'incomplete_expired')
-              )
-            );
-            if (
-              r
-              && (r.stripe_customer_id === null || r.stripe_customer_id === expectedCustomer)
-              && applied?.created === created
-              && applied.priority === priority
-              && applied.eventId === eventId
-              && (
-                r.stripe_subscription_id === null
-                || r.stripe_subscription_id === sameSub
-                || crossSubscriptionAllowed
-              )
-            ) Object.assign(r, {
-              stripe_customer_id: cust, stripe_subscription_id: sub, subscription_status: status,
-              plan, current_period_end: cpe, cancel_at_period_end: cape, trial_end: trial,
-            });
-            if (r?.subscription_status === status) counters.subscriptionApplies += 1;
+            if (/EXISTS/i.test(sql)) {
+              const [
+                cust, sub, status, plan, cpe, cape, trial, id, expectedCustomer,
+                stateSub, created, priority, eventId, sameSub, newerCreated,
+                sameSecondCreated, eventType, crossStatus,
+              ] = p as [
+                string, string, string, string | null, string | null, number, string | null, string,
+                string, string, number, number, string, string, number, number, string, string,
+              ];
+              const r = rows.get(id);
+              const applied = subscriptionEvents.get(stateSub);
+              const current = r?.stripe_subscription_id ? subscriptionEvents.get(r.stripe_subscription_id) : undefined;
+              const crossSubscriptionAllowed = current && (
+                current.created < newerCreated
+                || (
+                  current.created === sameSecondCreated
+                  && eventType === 'customer.subscription.created'
+                  && (crossStatus === 'active' || crossStatus === 'trialing')
+                  && (r?.subscription_status === 'canceled' || r?.subscription_status === 'incomplete_expired')
+                )
+              );
+              if (
+                r
+                && (r.stripe_customer_id === null || r.stripe_customer_id === expectedCustomer)
+                && applied?.created === created
+                && applied.priority === priority
+                && applied.eventId === eventId
+                && (
+                  r.stripe_subscription_id === null
+                  || r.stripe_subscription_id === sameSub
+                  || crossSubscriptionAllowed
+                )
+              ) Object.assign(r, {
+                stripe_customer_id: cust, stripe_subscription_id: sub, subscription_status: status,
+                plan: plan ?? r.plan, current_period_end: cpe, cancel_at_period_end: cape, trial_end: trial,
+              });
+              if (r?.subscription_status === status) counters.subscriptionApplies += 1;
+            } else {
+              const [cust, sub, status, plan, cpe, cape, trial, id, expectedCustomer, sameSub] = p as [
+                string, string, string, string | null, string | null, number, string | null, string, string, string,
+              ];
+              const r = rows.get(id);
+              if (
+                r
+                && (r.stripe_customer_id === null || r.stripe_customer_id === expectedCustomer)
+                && (r.stripe_subscription_id === null || r.stripe_subscription_id === sameSub)
+              ) {
+                Object.assign(r, {
+                  stripe_customer_id: cust, stripe_subscription_id: sub, subscription_status: status,
+                  plan: plan ?? r.plan, current_period_end: cpe, cancel_at_period_end: cape, trial_end: trial,
+                });
+                counters.subscriptionApplies += 1;
+              }
+            }
           } else if (/SET stripe_customer_id = \?[\s\S]+stripe_customer_id IS NULL/i.test(sql)) {
             const [customerId, userId] = p as [string, string, string];
             const r = rows.get(userId);
@@ -330,6 +397,28 @@ describe('billing router', () => {
     expect(res.status).toBe(401);
   });
 
+  it('POST /portal accepts a native Bearer session (iOS Manage Subscription)', async () => {
+    const seed: URow = {
+      id: 'u1', stripe_customer_id: 'cus_1', subscription_status: 'active', plan: 'monthly',
+      stripe_subscription_id: 'sub_1', current_period_end: null, cancel_at_period_end: 0, trial_end: null,
+      email: 'u1@x.com', name: null, picture: null, google_sub: null, email_verified: 1,
+      created_at: 'now', last_login_at: null,
+    };
+    vi.stubGlobal('fetch', async () => Response.json({ id: 'bps_1', url: 'https://stripe.test/portal' }));
+    const sessionKv = {
+      get: async (name: string) => name === 'sess:session-token' ? JSON.stringify({ userId: 'u1' }) : null,
+      put: async () => {},
+      delete: async () => {},
+    };
+    const { env } = fakeEnv({ STRIPE_SECRET_KEY: 'sk_test', CONFIG_KV: sessionKv }, [seed]);
+    const res = await buildBillingRouter().request('http://localhost/portal', {
+      method: 'POST',
+      headers: { authorization: 'Bearer session-token', 'Idempotency-Key': 'portal-bearer-1' },
+    }, env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ url: 'https://stripe.test/portal' });
+  });
+
   it('POST /checkout stays disabled when only Billing Portal is configured', async () => {
     const seed: URow = {
       id: 'u1', stripe_customer_id: 'cus_1', subscription_status: 'canceled', plan: 'monthly',
@@ -357,6 +446,90 @@ describe('billing router', () => {
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: 'checkout not configured' });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // --- duplicate-subscription guard (POST /checkout) -----------------------
+  // Stripe opens a SECOND subscription on a customer that already has one, so
+  // every path that reaches the pricing modal while Premium (/pricing,
+  // ?pricing=1, the footer link, the PDF redirect) was a double-billing hole —
+  // and an Apple IAP subscriber buying here would be charged by both stores.
+  describe('POST /checkout duplicate-subscription guard', () => {
+    function checkoutUser(over: Partial<URow> = {}): URow {
+      return {
+        id: 'u1', stripe_customer_id: 'cus_1', subscription_status: null, plan: null,
+        stripe_subscription_id: null, current_period_end: null, cancel_at_period_end: 0, trial_end: null,
+        email: 'u1@x.com', name: null, picture: null, google_sub: null, email_verified: 1,
+        created_at: 'now', last_login_at: null,
+        ...over,
+      };
+    }
+    const sessionKv = {
+      get: async (key: string) => key === 'sess:session-token' ? JSON.stringify({ userId: 'u1' }) : null,
+      put: async () => {},
+      delete: async () => {},
+    };
+    async function postCheckout(seed: URow, appleSeed: AppleRow[] = []): Promise<Response> {
+      const { env } = fakeEnv({ ...BILLING_READY, CONFIG_KV: sessionKv }, [seed], appleSeed);
+      return buildBillingRouter().request('http://localhost/checkout', {
+        method: 'POST',
+        body: JSON.stringify({ plan: 'monthly' }),
+        headers: {
+          cookie: 'ct_session=session-token',
+          'content-type': 'application/json',
+          'Idempotency-Key': 'checkout-guard-1',
+        },
+      }, env);
+    }
+
+    for (const status of ['active', 'trialing'] as const) {
+      it(`refuses a second Stripe checkout while ${status} (409, no Stripe call)`, async () => {
+        const fetchSpy = vi.fn();
+        vi.stubGlobal('fetch', fetchSpy);
+        const res = await postCheckout(checkoutUser({ subscription_status: status, plan: 'monthly' }));
+        expect(res.status).toBe(409);
+        expect(await res.json()).toMatchObject({ error: 'already_subscribed', source: 'stripe', status });
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+    }
+
+    it('refuses a Stripe checkout for an Apple IAP subscriber (409, source apple)', async () => {
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+      // Stripe columns empty — Premium comes only from the apple_subscriptions
+      // ledger, which is exactly the cross-store double-billing case.
+      const res = await postCheckout(checkoutUser(), [appleRow()]);
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: 'already_subscribed', source: 'apple' });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('refuses a second checkout while past_due, where the subscription is live but lapsed', async () => {
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+      const res = await postCheckout(checkoutUser({
+        subscription_status: 'past_due', plan: 'monthly', stripe_subscription_id: 'sub_1',
+      }));
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: 'already_subscribed', status: 'past_due' });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    // The guard must not strand a lapsed user: these statuses are terminal or
+    // never-started, so re-subscribing is legitimate and has to keep working.
+    for (const status of ['canceled', 'incomplete_expired', 'incomplete'] as const) {
+      it(`still allows a fresh checkout after ${status}`, async () => {
+        vi.stubGlobal('fetch', async () => Response.json({ id: 'cs_1', url: 'https://stripe.test/checkout' }));
+        const res = await postCheckout(checkoutUser({ subscription_status: status, plan: 'monthly' }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ url: 'https://stripe.test/checkout' });
+      });
+    }
+
+    it('still allows a checkout when an Apple subscription has expired', async () => {
+      vi.stubGlobal('fetch', async () => Response.json({ id: 'cs_1', url: 'https://stripe.test/checkout' }));
+      const res = await postCheckout(checkoutUser(), [appleRow({ status: 'expired' })]);
+      expect(res.status).toBe(200);
+    });
   });
 
   it('scopes deterministic Stripe idempotency keys to the user and checkout request', async () => {
@@ -465,6 +638,36 @@ describe('billing router', () => {
     }, env);
     expect(res.status).toBe(200);
     expect(key).toBe('congress-trade:portal:u1:portal-request-1');
+  });
+
+  it('forwards STRIPE_PORTAL_CONFIGURATION so the hosted portal lists Premium', async () => {
+    const seed: URow = {
+      id: 'u1', stripe_customer_id: 'cus_1', subscription_status: 'active', plan: 'monthly',
+      stripe_subscription_id: 'sub_1', current_period_end: null, cancel_at_period_end: 0, trial_end: null,
+      email: 'u1@x.com', name: null, picture: null, google_sub: null, email_verified: 1,
+      created_at: 'now', last_login_at: null,
+    };
+    let body = '';
+    vi.stubGlobal('fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+      body = String(init?.body ?? '');
+      return Response.json({ id: 'bps_1', url: 'https://stripe.test/portal' });
+    });
+    const sessionKv = {
+      get: async (name: string) => name === 'sess:session-token' ? JSON.stringify({ userId: 'u1' }) : null,
+      put: async () => {},
+      delete: async () => {},
+    };
+    const { env } = fakeEnv({
+      STRIPE_SECRET_KEY: 'sk_test',
+      STRIPE_PORTAL_CONFIGURATION: 'bpc_live_premium',
+      CONFIG_KV: sessionKv,
+    }, [seed]);
+    const res = await buildBillingRouter().request('http://localhost/portal', {
+      method: 'POST',
+      headers: { cookie: 'ct_session=session-token', 'Idempotency-Key': 'portal-cfg-1' },
+    }, env);
+    expect(res.status).toBe(200);
+    expect(new URLSearchParams(body).get('configuration')).toBe('bpc_live_premium');
   });
 
   it('rejects malformed client idempotency keys before calling Stripe', async () => {
@@ -608,6 +811,64 @@ describe('billing router', () => {
     expect(await res.json()).toEqual({ received: true });
     expect(rows.get('u1')?.subscription_status).toBe('active');
     expect(rows.get('u1')!.plan).toBe('monthly');
+  });
+
+  it('POST /webhook invoice.paid (subscription_cycle) applies live Stripe active over trialing', async () => {
+    const seed: URow = {
+      id: 'u1', stripe_customer_id: 'cus_1', subscription_status: 'trialing', plan: 'monthly',
+      stripe_subscription_id: 'sub_1', current_period_end: '2030-01-15T00:00:00.000Z',
+      cancel_at_period_end: 0, trial_end: '2030-01-15T00:00:00.000Z',
+      email: 'u1@x.com', name: null, picture: null, google_sub: null, email_verified: 1,
+      created_at: 'now', last_login_at: null,
+    };
+    const { env, rows } = fakeEnv({
+      STRIPE_WEBHOOK_SECRET: 'whsec',
+      STRIPE_SECRET_KEY: 'sk_test_123',
+    }, [seed]);
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL | Request) => {
+      if (String(url).includes('/v1/subscriptions/sub_1')) {
+        return new Response(JSON.stringify({
+          id: 'sub_1',
+          status: 'active',
+          customer: 'cus_1',
+          livemode: false,
+          items: { data: [{ price: { id: 'price_m' } }] },
+          trial_end: null,
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${String(url)}`);
+    }));
+    const res = await postWebhook(buildBillingRouter(), env, {
+      id: 'evt_invoice_paid_1',
+      created: 2_000,
+      type: 'invoice.paid',
+      livemode: false,
+      data: {
+        object: {
+          id: 'in_1',
+          billing_reason: 'subscription_cycle',
+          parent: { subscription_details: { subscription: 'sub_1' } },
+          customer: 'cus_1',
+        },
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true });
+    expect(rows.get('u1')?.subscription_status).toBe('active');
+    expect(rows.get('u1')!.plan).toBe('monthly');
+  });
+
+  it('POST /webhook rejects a livemode that does not match the Stripe key prefix', async () => {
+    const { env } = fakeEnv({ STRIPE_WEBHOOK_SECRET: 'whsec', STRIPE_SECRET_KEY: 'sk_live_prod' });
+    const res = await postWebhook(buildBillingRouter(), env, {
+      id: 'evt_livemode_mismatch',
+      created: 100,
+      type: 'customer.subscription.updated',
+      livemode: false,
+      data: { object: { id: 'sub_1', status: 'active', customer: 'cus_1' } },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'livemode does not match Stripe key' });
   });
 
   it('POST /webhook ignores duplicate checkout.session.completed events', async () => {

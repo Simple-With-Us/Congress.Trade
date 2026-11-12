@@ -26,14 +26,6 @@ import { classifyFiling } from './ingestion/classifier.ts';
 import { extractAndNormalize } from './extraction/orchestrator.ts';
 import { DeliveryRetryError, dispatchWebhook } from './delivery/webhook.ts';
 import { recordDeadLetterDurable } from './delivery/deadLetter.ts';
-import { buildRestRouter } from './delivery/rest.ts';
-import { buildAdminRouter } from './admin/routes.ts';
-import { buildAnalyticsRouter } from './analytics/routes.ts';
-import { buildAuthRouter } from './auth/routes.ts';
-import { buildBillingRouter } from './billing/routes.ts';
-import { buildClientRouter } from './client/routes.ts';
-import { buildExportRouter } from './export/routes.ts';
-import { buildUiRouter } from './ui/routes.ts';
 import { flushD1Budget } from './shared/d1Budget.ts';
 import { runMaintenancePipeline } from './deno/scheduledTick.ts';
 import { handleAgreementCheck } from './extraction/agreement.ts';
@@ -41,9 +33,13 @@ import {
   handleAutopilotTick,
   markAutopilotRunHalted,
 } from './extraction/autopilot.ts';
-import { buildDetectionRouter } from './ingestion/detectionRoutes.ts';
+import { datadogRequestMiddleware } from './shared/datadog.ts';
 import { browserSecurityHeadersMiddleware } from './security/headers.ts';
 import { publicApiGuard } from './security/botDefense.ts';
+import { originLockMiddleware, stampWorkersEdge } from './security/originLock.ts';
+import { mountApiRouters } from './apiRouters.ts';
+
+export { mountApiRouters, buildProductionApp } from './apiRouters.ts';
 import {
   completeDeliveryOutbox,
   reconnectDeadLetteredOutbox,
@@ -60,12 +56,22 @@ import {
   trackedFetch,
   withThirdPartyTelemetry,
 } from './shared/thirdPartyTelemetry.ts';
+import {
+  buildSentryInitOptions,
+  resolveSentryTracesSampleRate,
+  sentryLoggerWarn,
+} from './shared/sentryRuntime.ts';
 
 const app = new Hono<{ Bindings: Env }>();
 
 // Attach defense-in-depth browser headers to every Worker-generated response,
 // including error and redirect responses. HSTS is added only for HTTPS.
 app.use('*', browserSecurityHeadersMiddleware);
+app.use('*', datadogRequestMiddleware());
+// Off unless ORIGIN_LOCK_ENABLED. When on, only Cloudflare-fronted requests
+// (or the origin secret / Authenticated Origin Pulls header) are served.
+// Loopback and docker-network health probes stay open.
+app.use('*', originLockMiddleware);
 
 // Anti-scraping guard for the public data API (user-agent blocklist + per-IP
 // request budget + X-Robots-Tag). Runs before the feature routers; token-gated
@@ -74,70 +80,48 @@ app.use('/api/*', publicApiGuard);
 
 // --- IMPLEMENTED health check -------------------------------------------------
 app.get('/health', (c) => c.json({ ok: true }));
+app.get('/api/health/mac', async (c) => {
+  const now = Date.now();
+  let scoutHb: Record<string, unknown> | null = null;
+  let cpuWorkerHb: Record<string, unknown> | null = null;
+  if (c.env.CONFIG_KV) {
+    try {
+      const sRaw = await c.env.CONFIG_KV.get('mac-heartbeat:scout');
+      if (sRaw) scoutHb = JSON.parse(sRaw) as Record<string, unknown>;
+      const cRaw = await c.env.CONFIG_KV.get('mac-heartbeat:scan-cpu-worker');
+      if (cRaw) cpuWorkerHb = JSON.parse(cRaw) as Record<string, unknown>;
+    } catch {
+      // KV failure degrades gracefully
+    }
+  }
+  const scoutTs = typeof scoutHb?.timestamp === 'string' ? scoutHb.timestamp : null;
+  const cpuTs = typeof cpuWorkerHb?.timestamp === 'string' ? cpuWorkerHb.timestamp : null;
+  const scoutAge = scoutTs ? Math.floor((now - Date.parse(scoutTs)) / 1000) : null;
+  const cpuWorkerAge = cpuTs ? Math.floor((now - Date.parse(cpuTs)) / 1000) : null;
 
-/**
- * Mount the app routers defensively: a build failure is logged and does not take
- * down the worker or the /health route.
- */
-function mountApiRouters(root: Hono<{ Bindings: Env }>): void {
-  try {
-    root.route('/api', buildRestRouter());
-  } catch (err) {
-    console.warn('delivery/rest router not mounted:', (err as Error).message);
-  }
-  try {
-    root.route('/api/admin', buildAdminRouter());
-  } catch (err) {
-    console.warn('admin/routes router not mounted:', (err as Error).message);
-  }
-  try {
-    // Read-only trend analytics over the transaction corpus.
-    root.route('/api/analytics', buildAnalyticsRouter());
-  } catch (err) {
-    console.warn('analytics/routes router not mounted:', (err as Error).message);
-  }
-  try {
-    // Shared backend-owned contract for the phone-first SwiftUI app.
-    root.route('/api/client/v1', buildClientRouter());
-  } catch (err) {
-    console.warn('client/routes router not mounted:', (err as Error).message);
-  }
-  try {
-    // Bulk market-data snapshot export (NDJSON in R2) for App B bootstrapping.
-    root.route('/api/export', buildExportRouter());
-  } catch (err) {
-    console.warn('export/routes router not mounted:', (err as Error).message);
-  }
-  try {
-    // Residential detection scout push (INGEST_TOKEN) -> disclosure-latency race.
-    root.route('/api/ingest', buildDetectionRouter());
-  } catch (err) {
-    console.warn('ingestion/detectionRoutes router not mounted:', (err as Error).message);
-  }
-  // End-user auth (Google OAuth + magic-link) at /auth/*. Mounted before the UI
-  // catch-all so its routes are not shadowed by the dashboard.
-  try {
-    root.route('/auth', buildAuthRouter());
-  } catch (err) {
-    console.warn('auth/routes router not mounted:', (err as Error).message);
-  }
-  // Stripe billing (checkout / portal / webhook) at /billing/*. Also before the
-  // UI catch-all.
-  try {
-    root.route('/billing', buildBillingRouter());
-  } catch (err) {
-    console.warn('billing/routes router not mounted:', (err as Error).message);
-  }
-  // Dashboard SPA at `/` and `/admin`. Registered after /health and /api so the
-  // exact UI paths never shadow the API routers.
-  try {
-    root.route('/', buildUiRouter());
-  } catch (err) {
-    console.warn('ui/routes router not mounted:', (err as Error).message);
-  }
-}
+  const MAX_AGE_SEC = 900; // 15 minutes max age threshold
+  const scoutStalled = scoutAge === null || scoutAge > MAX_AGE_SEC;
+  const cpuStalled = cpuWorkerAge === null || cpuWorkerAge > MAX_AGE_SEC;
+  const ok = !scoutStalled || !cpuStalled; // ok if at least one Mac worker is reporting
+
+  return c.json(
+    {
+      ok,
+      status: ok ? 'ok' : 'degraded',
+      workers: {
+        scout: { heartbeat: scoutHb, ageSeconds: scoutAge, stalled: scoutStalled },
+        cpuWorker: { heartbeat: cpuWorkerHb, ageSeconds: cpuWorkerAge, stalled: cpuStalled },
+      },
+      thresholdSeconds: MAX_AGE_SEC,
+      checkedAt: new Date().toISOString(),
+    },
+    ok ? 200 : 503,
+  );
+});
 
 mountApiRouters(app);
+
+export { app as honoApp };
 
 // --- Queue message handlers ---------------------------------------------------
 // Single source of truth lives in queueHandlers.ts (used by the Deno durable
@@ -157,143 +141,8 @@ export {
   handleIngestMessage,
 };
 
-const SENTRY_FILTERED_VALUE = '[Filtered]';
-const SENTRY_CREDENTIAL_KEYS = new Set([
-  'apikey',
-  'xapikey',
-  'key',
-  'token',
-  'accesstoken',
-  'authtoken',
-  'authorization',
-  'proxyauthorization',
-  'clientsecret',
-  'secret',
-  'signature',
-  'sig',
-  'code',
-  'password',
-  'passwd',
-  'session',
-  'sessionid',
-  'cookie',
-  'setcookie',
-]);
-
-function normalizedSentryField(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function isSentryCredentialField(value: string): boolean {
-  return SENTRY_CREDENTIAL_KEYS.has(normalizedSentryField(value));
-}
-
-function redactSentryQuery(query: string): string {
-  const prefix = query.startsWith('?') ? '?' : '';
-  const raw = prefix ? query.slice(1) : query;
-  if (!raw.includes('=')) return query;
-  const params = new URLSearchParams(raw);
-  let changed = false;
-  for (const key of [...params.keys()]) {
-    if (!isSentryCredentialField(key)) continue;
-    params.set(key, SENTRY_FILTERED_VALUE);
-    changed = true;
-  }
-  return changed ? `${prefix}${params.toString()}` : query;
-}
-
-function redactSentryUrl(urlString: string): string {
-  try {
-    const url = new URL(urlString);
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return urlString;
-    let changed = false;
-    if (url.username || url.password) {
-      url.username = SENTRY_FILTERED_VALUE;
-      url.password = SENTRY_FILTERED_VALUE;
-      changed = true;
-    }
-    for (const key of [...url.searchParams.keys()]) {
-      if (!isSentryCredentialField(key)) continue;
-      url.searchParams.set(key, SENTRY_FILTERED_VALUE);
-      changed = true;
-    }
-    return changed ? url.toString() : urlString;
-  } catch {
-    return urlString;
-  }
-}
-
-function isSentryKeyValueCollection(field: string): boolean {
-  const normalized = normalizedSentryField(field);
-  return normalized.includes('query') || normalized.includes('header');
-}
-
-function scrubSentryKeyValueTuple(tuple: unknown[], field: string): unknown[] {
-  if (tuple.length < 2 || typeof tuple[0] !== 'string') {
-    return tuple.map((item) => scrubSentryValue(item, field));
-  }
-  const [key, child, ...rest] = tuple;
-  return [
-    key,
-    isSentryCredentialField(key)
-      ? SENTRY_FILTERED_VALUE
-      : scrubSentryValue(child, key),
-    ...rest.map((item) => scrubSentryValue(item, field)),
-  ];
-}
-
-function scrubSentryValue(value: unknown, field = ''): unknown {
-  if (typeof value === 'string') {
-    if (isSentryCredentialField(field)) return SENTRY_FILTERED_VALUE;
-    if (normalizedSentryField(field).includes('query')) return redactSentryQuery(value);
-    return value.replace(/https?:\/\/[^\s<>"']+/gi, (url) => redactSentryUrl(url));
-  }
-  if (Array.isArray(value)) {
-    if (!isSentryKeyValueCollection(field)) {
-      return value.map((item) => scrubSentryValue(item, field));
-    }
-    if (value.length >= 2 && typeof value[0] === 'string') {
-      return scrubSentryKeyValueTuple(value, field);
-    }
-    return value.map((item) => (
-      Array.isArray(item)
-        ? scrubSentryKeyValueTuple(item, field)
-        : scrubSentryValue(item, field)
-    ));
-  }
-  if (value && typeof value === 'object') {
-    const scrubbed: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value)) {
-      scrubbed[key] = isSentryCredentialField(key)
-        ? SENTRY_FILTERED_VALUE
-        : scrubSentryValue(child, key);
-    }
-    return scrubbed;
-  }
-  return value;
-}
-
-function scrubSentryEvent<T>(event: T): T {
-  return scrubSentryValue(event) as T;
-}
-
-const DEFAULT_SENTRY_DSN = 'https://bc783575b3d86e8cada5843a975d30fc@o4511650476326912.ingest.us.sentry.io/4511651172253696';
-
 function sentryOptions(env: Env, tracesSampleRate: number) {
-  return {
-    dsn: env.SENTRY_DSN || DEFAULT_SENTRY_DSN,
-    environment: env.SENTRY_ENVIRONMENT || 'production',
-    tracesSampleRate,
-    // Fetch instrumentation records complete provider URLs (including query
-    // credentials). Scrub at the final event hooks so errors, breadcrumbs, and
-    // transaction span attributes are clean before envelope serialization.
-    beforeSend: <T>(event: T) => scrubSentryEvent(event),
-    beforeSendTransaction: <T>(event: T) => scrubSentryEvent(event),
-    beforeSendLog: <T>(log: T) => scrubSentryEvent(log),
-    // Structured logs (Sentry Logs product), plus forward console.warn/error as
-    // logs too — the many existing console.error(...) call sites across the
-    // codebase become searchable in Sentry for free, without touching each one.
-    enableLogs: true,
+  return buildSentryInitOptions(env, tracesSampleRate, {
     integrations: [Sentry.consoleLoggingIntegration({ levels: ['warn', 'error'] })],
     // Meter the SDK-owned Sentry envelope transport too. The explicit Env is
     // required because the SDK can flush after the request callback unwinds.
@@ -307,25 +156,24 @@ function sentryOptions(env: Env, tracesSampleRate: number) {
           { envOverride: env, silentQueueFailure: true },
         ),
     },
-    // Outbound fetch also hits third-party providers (FMP, Stripe, Resend,
-    // Infisical) and arbitrary subscriber webhook URLs (delivery/webhook.ts).
-    // Only attach Sentry trace headers to our own domain.
-    tracePropagationTargets: [/^https:\/\/([\w-]+\.)?congress\.trade/],
-  };
+  });
 }
 
 const requestAndScheduledWorker = Sentry.withSentry(
   (env: Env) => sentryOptions(
     env,
     // Send traces for a sample of requests (0 = off, 1.0 = all). Override via
-    // the SENTRY_TRACES_SAMPLE_RATE var without a redeploy; defaults to a cheap
-    // 10% so HTTP/D1/outbound-fetch spans show up without full tracing cost.
-    env.SENTRY_TRACES_SAMPLE_RATE ? Number(env.SENTRY_TRACES_SAMPLE_RATE) : 0.1,
+    // the SENTRY_TRACES_SAMPLE_RATE var without a redeploy; fleet default is 0.2.
+    resolveSentryTracesSampleRate(env, 0.2),
   ),
   {
     /** HTTP entrypoint. */
     fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
-      const response = withThirdPartyTelemetry(env, () => app.fetch(request, env, ctx));
+      // No TCP peer on this retired entry. Trust CF-Connecting-IP only when
+      // the Workers runtime attached request.cf. A client-supplied peer or
+      // edge header is removed either way.
+      const sanitized = stampWorkersEdge(request);
+      const response = withThirdPartyTelemetry(env, () => app.fetch(sanitized, env, ctx));
       // Flush this request's metered D1 rows after the response settles — the
       // read path is where analytics/scraper scans accrue. Best-effort, never blocks.
       ctx.waitUntil(Promise.resolve(response).catch(() => undefined).then(() => flushD1Budget(env)));
@@ -483,7 +331,10 @@ const queueWorker = Sentry.withSentry(
               if (completion === 'missing') {
                 // Legacy/direct queue messages predate the outbox. Their work
                 // is complete, and retrying cannot manufacture an origin row.
-                console.warn('delivery outbox completion skipped: missing', msg.txId);
+                sentryLoggerWarn('ingest.dead_letter', {
+                  queue: 'delivery',
+                  reason: 'outbox_missing',
+                });
               }
             }
           } else {
@@ -491,7 +342,10 @@ const queueWorker = Sentry.withSentry(
             if (msg.type === 'filing.new') {
               const completion = await completeIngestionOutbox(env, msg.docId);
               if (completion === 'missing') {
-                console.warn('ingestion outbox completion skipped: missing', msg.docId);
+                sentryLoggerWarn('ingest.dead_letter', {
+                  queue: 'ingest',
+                  reason: 'outbox_missing',
+                });
               }
             }
           }
@@ -516,19 +370,27 @@ const queueWorker = Sentry.withSentry(
               message.ack();
               continue;
             }
-          } else {
+          } else if (!(err instanceof DeliveryRetryError) && !(err instanceof IngestRetryError)) {
             console.error(`queue ${typedBatch.queue} message failed:`, (err as Error).message);
             // Expected queue retries are control flow (at-least-once delivery /
             // transient ingest). Capturing them creates Sentry storms such as
             // CONGRESS-TRADE-J ("webhook delivery target(s) require retry").
             // Reserve Issues for unexpected failures only.
-            if (!(err instanceof DeliveryRetryError) && !(err instanceof IngestRetryError)) {
-              Sentry.captureException(err as Error, {
-                tags: { queue: typedBatch.queue, messageType },
-              });
-            }
+            Sentry.captureException(err as Error, {
+              tags: { queue: typedBatch.queue, messageType },
+            });
           }
-          if (err instanceof DeliveryRetryError || err instanceof IngestRetryError) {
+          if (err instanceof DeliveryRetryError) {
+            sentryLoggerWarn('webhook-retry', {
+              queue: typedBatch.queue,
+              delaySeconds: err.delaySeconds,
+            });
+            message.retry({ delaySeconds: err.delaySeconds });
+          } else if (err instanceof IngestRetryError) {
+            sentryLoggerWarn('ingest.retry', {
+              queue: typedBatch.queue,
+              delaySeconds: err.delaySeconds,
+            });
             message.retry({ delaySeconds: err.delaySeconds });
           } else if (ingestRetry) {
             message.retry({ delaySeconds: ingestRetry.delaySeconds });

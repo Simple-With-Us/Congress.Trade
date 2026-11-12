@@ -1,5 +1,9 @@
 # 2026-07-24 — Owner decisions: Delivery gate, Stripe live, shared pin redesign
 
+> **Current shape (2026-08):** Turso is retired (local SQLite on Coolify /
+> Hetzner).  The "Turso efficiency only" line below is the 2026-07 decision,
+> not today's database.
+
 ## Summary
 
 Jay closed open product decisions for Congress.Trade:

@@ -7,7 +7,20 @@
  */
 
 import type { Env, Filing, ParsedTx } from '../shared/types.ts';
+import { IngestRetryError } from '../ingestion/fetcher.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
+import {
+  classifyHouseExtractRoute,
+  evaluateExtractQuality,
+  looksLikeOgePart7ExplicitNone,
+  looksLikePlausibleTradeTable,
+} from '../extraction/extractRouting.ts';
+import {
+  HOUSE_GRID_FORM_EXTRACTOR,
+  type HouseGridFormReader,
+  type HouseGridRead,
+} from '../extraction/houseGridForm.ts';
+import { isProvenOpenRouterCredentialRejection } from '../extraction/openRouterReply.ts';
 
 // ---------------------------------------------------------------------------
 // Arbitration merge helpers (pure, unit-testable)
@@ -15,18 +28,142 @@ import { resolveSecret } from '../secrets/infisical.ts';
 
 const ROW_KEY_CACHE = new WeakMap<ParsedTx, string>();
 
+const ARBITRATION_OWNERS: Readonly<Record<string, string>> = {
+  self: 'SELF',
+  spouse: 'SPOUSE',
+  sp: 'SPOUSE',
+  joint: 'JOINT',
+  jt: 'JOINT',
+  dependent: 'DEPENDENT',
+  child: 'DEPENDENT',
+  dc: 'DEPENDENT',
+};
+
+const ARBITRATION_OWNER_SUFFIX = /^(SELF|SPOUSE|JOINT|DEPENDENT)$/;
+
 /**
- * Stable matching key for a parsed row: ticker (or asset name when no ticker) +
- * transaction date + transaction type. Two extractors that read the same row
- * should produce the same key even if other fields differ slightly.
+ * Owner segment for a row key. Known codes become SELF|SPOUSE|JOINT|DEPENDENT.
+ * Anything else (including a missing owner) stays empty so the historical
+ * 3-part key is unchanged.
+ */
+export function canonicalArbitrationOwner(owner: string | null | undefined): string {
+  const raw = (owner ?? '').trim().toLowerCase();
+  if (!raw) return '';
+  return ARBITRATION_OWNERS[raw] ?? '';
+}
+
+/**
+ * Historical matching key: ticker (or asset name) + date + type. Stored
+ * consensus keys, bake-off rowKeys, and in-flight review payloads use this
+ * shape. Keep producing it when owner is absent so those keys still compare.
+ */
+export function legacyArbitrationRowKey(tx: ParsedTx): string {
+  const sym = (tx.ticker || tx.assetName || '').trim().toUpperCase();
+  return `${sym}|${tx.txDate ?? ''}|${tx.txType}`;
+}
+
+/**
+ * Stable per-row key. Owner is appended when it normalizes to a known code,
+ * so two same-day lots for different people do not share a key. A missing or
+ * unrecognized owner keeps {@link legacyArbitrationRowKey}.
  */
 export function arbitrationRowKey(tx: ParsedTx): string {
   const cached = ROW_KEY_CACHE.get(tx);
   if (cached !== undefined) return cached;
-  const sym = (tx.ticker || tx.assetName || '').trim().toUpperCase();
-  const key = `${sym}|${tx.txDate ?? ''}|${tx.txType}`;
+  const legacy = legacyArbitrationRowKey(tx);
+  const owner = canonicalArbitrationOwner(tx.owner);
+  const key = owner ? `${legacy}|${owner}` : legacy;
   ROW_KEY_CACHE.set(tx, key);
   return key;
+}
+
+export interface ParsedArbitrationRowKey {
+  /** ticker|date|type, with any owner suffix removed. */
+  legacy: string;
+  /** Uppercase owner segment, or null when the key is the historical 3-part form. */
+  owner: string | null;
+}
+
+/** Split a current or historical arbitration key. Occurrence suffixes (`#2`) are ignored. */
+export function parseArbitrationRowKey(stored: string): ParsedArbitrationRowKey {
+  const hash = stored.lastIndexOf('#');
+  const key = hash > 0 && /^\d+$/.test(stored.slice(hash + 1)) ? stored.slice(0, hash) : stored;
+  const parts = key.split('|');
+  const last = parts[parts.length - 1] ?? '';
+  if (parts.length >= 4 && ARBITRATION_OWNER_SUFFIX.test(last)) {
+    return { legacy: parts.slice(0, -1).join('|'), owner: last };
+  }
+  return { legacy: key, owner: null };
+}
+
+/**
+ * Upgrade one stored key. A key that already carries an owner is left alone.
+ * A historical 3-part key gains `|OWNER` only when `owner` normalizes; otherwise
+ * it stays byte-identical to what was stored.
+ */
+export function migrateArbitrationRowKey(stored: string, owner?: string | null): string {
+  const parsed = parseArbitrationRowKey(stored);
+  if (parsed.owner) return parsed.legacy + '|' + parsed.owner;
+  const normalized = canonicalArbitrationOwner(owner);
+  return normalized ? `${parsed.legacy}|${normalized}` : parsed.legacy;
+}
+
+/** Current key, then the historical 3-part key when they differ. */
+export function arbitrationRowKeyAliases(tx: ParsedTx): string[] {
+  const current = arbitrationRowKey(tx);
+  const legacy = legacyArbitrationRowKey(tx);
+  return current === legacy ? [current] : [current, legacy];
+}
+
+/**
+ * Align key groups that may mix historical 3-part keys with owner-qualified
+ * keys.
+ *
+ * - When every group has at most one row for a ticker|date|type prefix, the
+ *   canonical key is the historical 3-part key. A missing owner, or two models
+ *   that disagree on the owner of a single lot, still line up and the owner
+ *   can be voted.
+ * - When any group has two or more rows for that prefix, owner stays in the
+ *   key so spouse and dependent lots do not collapse. A row that omitted owner
+ *   is upgraded only when exactly one owner is present for the prefix.
+ */
+export function canonicalArbitrationKeyGroups(keyGroups: readonly (readonly string[])[]): string[][] {
+  interface PrefixInfo {
+    counts: number[];
+    owners: Set<string>;
+  }
+  const parsed = keyGroups.map((keys) => keys.map((key) => parseArbitrationRowKey(key)));
+  const info = new Map<string, PrefixInfo>();
+  for (let group = 0; group < keyGroups.length; group += 1) {
+    for (let index = 0; index < keyGroups[group].length; index += 1) {
+      const prefix = parsed[group][index].legacy;
+      let slot = info.get(prefix);
+      if (!slot) {
+        slot = { counts: keyGroups.map(() => 0), owners: new Set() };
+        info.set(prefix, slot);
+      }
+      slot.counts[group] += 1;
+      const owner = parsed[group][index].owner;
+      if (owner) slot.owners.add(owner);
+    }
+  }
+  return keyGroups.map((keys, group) => keys.map((key, index) => {
+    const { legacy, owner } = parsed[group][index];
+    const slot = info.get(legacy);
+    if (!slot) return key;
+    const split = slot.counts.some((count) => count > 1);
+    if (!split) return legacy;
+    if (!owner && slot.owners.size === 1) {
+      const only = [...slot.owners][0];
+      return `${legacy}|${only}`;
+    }
+    return owner ? `${legacy}|${owner}` : key;
+  }));
+}
+
+/** {@link canonicalArbitrationKeyGroups} for parsed rows, one list per read. */
+export function canonicalArbitrationKeys(groups: readonly (readonly ParsedTx[])[]): string[][] {
+  return canonicalArbitrationKeyGroups(groups.map((rows) => rows.map((tx) => arbitrationRowKey(tx))));
 }
 
 /** Count how many of the comparable fields two matched rows agree on, out of N. */
@@ -98,12 +235,20 @@ function modelRunsForError(error: object, extractor: string): ExtractorModelRun[
  * blindly injected into the output.
  */
 export function mergeResults(primary: ExtractorResult, secondary: ExtractorResult): ExtractorResult {
+  const keyed = canonicalArbitrationKeys([
+    primary.transactions,
+    secondary.transactions,
+  ]);
+  const primaryKeys = keyed[0] ?? [];
+  const secondaryKeys = keyed[1] ?? [];
   const secByKey = new Map<string, ParsedTx>();
-  for (const tx of secondary.transactions) secByKey.set(arbitrationRowKey(tx), tx);
+  secondary.transactions.forEach((tx, index) => {
+    secByKey.set(secondaryKeys[index], tx);
+  });
 
   const matchedKeys = new Set<string>();
-  const transactions: ParsedTx[] = primary.transactions.map((p) => {
-    const key = arbitrationRowKey(p);
+  const transactions: ParsedTx[] = primary.transactions.map((p, index) => {
+    const key = primaryKeys[index];
     const match = secByKey.get(key);
     if (!match) {
       // Only the primary saw this row — corroboration absent.
@@ -122,7 +267,7 @@ export function mergeResults(primary: ExtractorResult, secondary: ExtractorResul
 
   // Rows present only in the secondary (primary missed them) = contested doc.
   const secondaryOnly = secondary.transactions.filter(
-    (s) => !matchedKeys.has(arbitrationRowKey(s)),
+    (_, index) => !matchedKeys.has(secondaryKeys[index]),
   ).length;
   const primaryOnly = primary.transactions.length - matchedKeys.size;
 
@@ -142,6 +287,7 @@ export function mergeResults(primary: ExtractorResult, secondary: ExtractorResul
     confidence: docConfidence,
     raw: `primary(${primary.extractor}):\n${primary.raw}\n\n---\nsecondary(${secondary.extractor}) [primaryOnly=${primaryOnly}, secondaryOnly=${secondaryOnly}]:\n${secondary.raw}`,
     extractor: `arbitrating(${primary.extractor},${secondary.extractor})`,
+    arbitrationCounts: { primaryOnly, secondaryOnly },
     modelVersion: primary.modelVersion,
     providerRequestId: primary.providerRequestId,
     usage: primary.usage ? { ...primary.usage } : undefined,
@@ -174,10 +320,19 @@ export interface ExtractorModelRun {
   usage?: ExtractorUsage;
 }
 
+/**
+ * What a zero-row deterministic parse means.  `empty` is a real miss.
+ * `unreadable` is a refusal (garbled index / a 278-T the parser would not
+ * trust).  Absent on extractors that do not make this distinction.
+ */
+export type ExtractorParseDisposition = 'rows' | 'empty' | 'unreadable';
+
 /** Result of running an extractor over one filing. */
 export interface ExtractorResult {
   /** Parsed (pre-normalization) transactions. */
   transactions: ParsedTx[];
+  /** Deterministic empty-vs-refusal signal.  See ExtractorParseDisposition. */
+  parseDisposition?: ExtractorParseDisposition;
   /** Document-level confidence in [0,1]. */
   confidence: number;
   /** Raw extracted text/markup retained for audit + review. */
@@ -192,6 +347,10 @@ export interface ExtractorResult {
   usage?: ExtractorUsage;
   /** Every underlying model call when arbitration combines multiple results. */
   modelRuns?: ExtractorModelRun[];
+  /** Present only on arbitrated results: rows each side saw that the other
+   *  missed. The merged row set stays primary-authoritative, so a contested
+   *  doc can have an empty `transactions` array with `secondaryOnly` > 0. */
+  arbitrationCounts?: { primaryOnly: number; secondaryOnly: number };
 }
 
 /** Input handed to an extractor. One of bytes/html is typically present. */
@@ -203,6 +362,8 @@ export interface ExtractorInput {
   bytes?: ArrayBuffer;
   /** Raw HTML (Senate eFD) when applicable. */
   html?: string;
+  /** Already-extracted text for the cheap OpenRouter text path (no Files). */
+  extractedText?: string;
 }
 
 /**
@@ -352,8 +513,10 @@ export class FallbackExtractor implements Extractor {
 
 /**
  * House PDFs often have extractable text even when the cheap byte-sniff
- * classifier misses it. Prefer deterministic text parsing, then fall back to
- * vision only when text extraction produces no usable transaction rows.
+ * classifier misses it. Prefer deterministic text parsing. Electronic / typed
+ * PTRs never fall through to OpenRouter Files. Vision/Files is only for
+ * documents classified as real scans, and only when the cheap read was empty
+ * (not letterhead junk).
  */
 export class HousePdfExtractor implements Extractor {
   readonly name: string;
@@ -362,8 +525,12 @@ export class HousePdfExtractor implements Extractor {
   constructor(
     private readonly textPdf: Extractor,
     private readonly visionPdf: Extractor,
+    private readonly cheapText?: Extractor,
+    private readonly gridForm?: HouseGridFormReader,
   ) {
-    this.name = `housePdf(${textPdf.name},${visionPdf.name})`;
+    this.name = this.cheapText
+      ? `housePdf(${textPdf.name},${this.cheapText.name},${visionPdf.name})`
+      : `housePdf(${textPdf.name},${visionPdf.name})`;
     this.circuitBreakerName = visionPdf.circuitBreakerName ?? visionPdf.name;
   }
 
@@ -372,14 +539,182 @@ export class HousePdfExtractor implements Extractor {
   }
 
   async extract(input: ExtractorInput): Promise<ExtractorResult> {
+    const route = classifyHouseExtractRoute(input.filing);
+    let textResult: ExtractorResult | null = null;
     try {
-      const textResult = await this.textPdf.extract(input);
-      if (textResult.transactions.length > 0) return textResult;
+      textResult = await this.textPdf.extract(input);
     } catch {
-      // Text-layer parsing can fail on image-only or malformed PDFs; vision is the fallback.
+      // Text-layer parsing can fail on image-only or malformed PDFs.
     }
+
+    const textHasRows = (textResult?.transactions.length ?? 0) > 0;
+    const textQualityOk = textHasRows && textResult
+      ? evaluateExtractQuality(textResult.transactions).ok
+      : false;
+    if (textResult && textHasRows && (!route.allowFiles || textQualityOk)) {
+      // A cheap read that already failed (letterhead / headers) must not
+      // escalate to Files or the agreement trio. Orchestrator + agreement
+      // consult evaluateExtractQuality on these rows. A scanned grid whose
+      // text layer is only letterhead still gets the local x-mark stage below.
+      return textResult;
+    }
+
+    if (!route.allowFiles) {
+      if (
+        textResult
+        && this.cheapText
+        && looksLikePlausibleTradeTable(textResult.raw)
+      ) {
+        try {
+          const cheap = await this.cheapText.extract({
+            ...input,
+            extractedText: textResult.raw,
+          });
+          return cheap;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // Proven dead-key rejections must still fail closed.  Garbage /
+          // Unauthorized replies skip this one doc instead of Files.
+          if (isProvenOpenRouterCredentialRejection(message)) throw err;
+          return textResult;
+        }
+      }
+      return textResult ?? {
+        transactions: [],
+        confidence: 0.2,
+        raw: '',
+        extractor: this.textPdf.name,
+      };
+    }
+
+    const grid = await this.readGridForm(input.bytes, input.filing.filedDate);
+    if (grid?.detected) return houseGridFormResult(grid);
+    if (textResult && textHasRows) return textResult;
     return this.visionPdf.extract(input);
   }
+
+  private async readGridForm(bytes: ArrayBuffer | undefined, filedDate: string | null): Promise<HouseGridRead | null> {
+    if (!this.gridForm || !bytes) return null;
+    try {
+      return await this.gridForm.read(bytes, { filedDate });
+    } catch (err) {
+      console.warn('housePdf: grid form stage failed', (err as Error).message);
+      return null;
+    }
+  }
+}
+
+function houseGridFormResult(grid: HouseGridRead): ExtractorResult {
+  const confidence = grid.transactions.length
+    ? Math.min(...grid.transactions.map((row) => row.confidence))
+    : 0.2;
+  return {
+    transactions: grid.transactions,
+    confidence,
+    raw: JSON.stringify({
+      houseGridForm: {
+        gridPages: grid.gridPages,
+        rows: grid.transactions.length,
+        markedCells: grid.markedCells,
+      },
+    }),
+    extractor: HOUSE_GRID_FORM_EXTRACTOR,
+    parseDisposition: grid.transactions.length ? 'rows' : 'unreadable',
+  };
+}
+
+/**
+ * Executive 278-T PDFs are often tagged `scanned_pdf` even when unpdf can
+ * still recover a usable text layer (Burns-class misclassifications). Always
+ * try the deterministic OGE parser first. Paid OpenRouter vision runs only
+ * when that parse yields zero rows on a true scan, and is fail-soft: missing
+ * keys, parse errors, and provider 4xx return the empty text result instead
+ * of failing the extract. Budget/rate-limit `IngestRetryError` still
+ * propagates so the queue can back off.
+ */
+export class OgePdfExtractor implements Extractor {
+  readonly name: string;
+  readonly circuitBreakerName: string;
+
+  constructor(
+    private readonly ogeText: Extractor,
+    private readonly visionPdf: Extractor,
+  ) {
+    this.name = `ogePdf(${ogeText.name},${visionPdf.name})`;
+    this.circuitBreakerName = visionPdf.circuitBreakerName ?? visionPdf.name;
+  }
+
+  canHandle(f: Filing): boolean {
+    return f.chamber === 'executive' && (f.docKind === 'text_pdf' || f.docKind === 'scanned_pdf');
+  }
+
+  async extract(input: ExtractorInput): Promise<ExtractorResult> {
+    let textResult: ExtractorResult | null = null;
+    let textError: unknown = null;
+    try {
+      textResult = await this.ogeText.extract(input);
+      if (textResult.transactions.length > 0) return textResult;
+      // 278e termination/annual reports often have a real text layer and a
+      // Part 7 body of "None". That is an honest empty, not a scan to vision.
+      if (looksLikeOgePart7ExplicitNone(textResult.raw)) return textResult;
+    } catch (error) {
+      // Image-only or malformed PDFs can throw in unpdf; vision is the fallback
+      // for scans. Typed 278-T files keep their previous throw behavior.
+      textError = error;
+    }
+
+    // Typed executive PDFs with no matching rows are usually empty/termination
+    // reports (Fudge-class). Do not charge vision for those.
+    if (input.filing.docKind === 'text_pdf') {
+      if (textResult) return textResult;
+      throw textError instanceof Error ? textError : new Error('ogePdf: ogeText failed');
+    }
+
+    try {
+      const vision = await this.visionPdf.extract(input);
+      if (vision.transactions.length > 0) return vision;
+      // A refused text layer must stay unreadable when vision also finds
+      // nothing.  An honest empty text layer stays empty.  Under arbitration
+      // the merged row set is primary-authoritative: the secondary vision
+      // read may have found rows (secondaryOnly > 0) that route the doc to
+      // human review.  Restoring the terminal state on the empty merged array
+      // alone would bury that signal, so require that EVERY vision read found
+      // nothing first.
+      const secondarySawRows = (vision.arbitrationCounts?.secondaryOnly ?? 0) > 0;
+      if (
+        !secondarySawRows
+        && (textResult?.parseDisposition === 'unreadable' || textResult?.parseDisposition === 'empty')
+      ) {
+        return { ...vision, parseDisposition: textResult.parseDisposition, transactions: [] };
+      }
+      return vision;
+    } catch (error) {
+      if (error instanceof IngestRetryError) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      const fallback = textResult ?? emptyOgeTextResult();
+      return {
+        ...fallback,
+        // Vision never confirmed this read: an 'unreadable' disposition from
+        // the refused text layer must not survive the fail-soft, or
+        // normalize() resolves the filing rejected without a successful
+        // zero-row vision read. An 'empty' disposition is positive evidence
+        // from the text layer (a bounded, readable empty Part 7) that needs
+        // no vision confirmation, so it survives.
+        parseDisposition:
+          fallback.parseDisposition === 'unreadable' ? undefined : fallback.parseDisposition,
+        raw: `${fallback.raw}\n\n---\nogePdf vision fail-soft: ${reason}`,
+      };
+    }
+  }
+}
+
+function emptyOgeTextResult(): ExtractorResult {
+  return {
+    transactions: [],
+    confidence: 0.3,
+    raw: '',
+    extractor: 'ogeText',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +727,10 @@ export class HousePdfExtractor implements Extractor {
  * Returns references to the concrete (stub) extractor classes that the
  * extraction agent implements in src/extraction/*:
  *   - SenateHtmlExtractor (senate_html)
- *   - TextPdfExtractor    (text_pdf)
+ *   - TextPdfExtractor    (text_pdf, House PTR layout)
+ *   - OgeTextExtractor    (text_pdf, chamber='executive' — OGE 278-T layout)
+ *   - OgePdfExtractor     (executive text_pdf + scanned_pdf — unpdf first,
+ *                          fail-soft OpenRouter vision only for true scans)
  *   - VisionLlmExtractor  (scanned_pdf — uses GEMINI_API_KEY)
  *
  * The classifier picks a docKind; the queue handler iterates this pipeline and
@@ -403,8 +741,9 @@ export class HousePdfExtractor implements Extractor {
  */
 export function buildExtractorPipeline(env: Env): Extractor[] {
   const senateHtml = new SenateHtmlExtractor(env);
-  const textPdf = new TextPdfExtractor();
-  
+  const textPdf = new TextPdfExtractor(env);
+  const ogeText = new OgeTextExtractor();
+
   const geminiVision = new VisionLlmExtractor(env);
   const anthropicVision = new AnthropicVisionExtractor(env);
   const visionLlmWithFallback = new FallbackExtractor(geminiVision, anthropicVision);
@@ -424,27 +763,43 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
   const secondary = new VisionLlmExtractor(env, {
     apiKeyName: 'ARBITRATION_API_KEY',
     modelEnvName: 'ARBITRATION_MODEL',
-    defaultModel: 'gemini-2.5-flash',
+    defaultModel: 'gemini-3.8-flash',
     name: 'visionLlm-secondary',
   });
 
   const visionArbitrated = new ArbitratingExtractor(configuredVision, env, secondary);
-  const housePdf = new HousePdfExtractor(textPdf, visionArbitrated);
+  const cheapText = new OpenRouterTextExtractor(env);
+  const housePdf = new HousePdfExtractor(
+    textPdf,
+    visionArbitrated,
+    cheapText,
+    createDenoHouseGridReader({ loadCatalog: () => loadHouseGridSecurityCatalog(env) }),
+  );
+  const ogePdf = new OgePdfExtractor(ogeText, visionArbitrated);
 
-  return [senateHtml, housePdf, textPdf, visionArbitrated];
+  // ogePdf is ordered before the generic textPdf so executive-chamber PDFs
+  // (OGE 278-T layout) get the parser tuned for their table, instead of
+  // silently matching the House-tuned parser and yielding zero rows.
+  // scanned_pdf executive filings stay on this wrapper (unpdf first, then
+  // fail-soft vision) rather than jumping straight to paid vision.
+  return [senateHtml, housePdf, ogePdf, textPdf, visionArbitrated];
 }
 
 // ---------------------------------------------------------------------------
 // Re-exported concrete extractor stub classes (implemented by extraction agent)
 // ---------------------------------------------------------------------------
 
+import { createDenoHouseGridReader } from '../extraction/houseGridFormRuntime.ts';
+import { loadHouseGridSecurityCatalog } from '../extraction/houseGridAssetSnap.ts';
 import { SenateHtmlExtractor } from '../extraction/senateHtml.ts';
 import { TextPdfExtractor } from '../extraction/textPdf.ts';
+import { OgeTextExtractor } from '../extraction/ogeText.ts';
 import { VisionLlmExtractor } from '../extraction/visionLlm.ts';
 import { AnthropicVisionExtractor } from '../extraction/anthropicVision.ts';
 import { ConfiguredVisionExtractor } from '../extraction/configuredVision.ts';
+import { OpenRouterTextExtractor } from '../extraction/openRouterText.ts';
 
 export {
-  SenateHtmlExtractor, TextPdfExtractor, VisionLlmExtractor, AnthropicVisionExtractor,
-  ConfiguredVisionExtractor,
+  SenateHtmlExtractor, TextPdfExtractor, OgeTextExtractor, VisionLlmExtractor, AnthropicVisionExtractor,
+  ConfiguredVisionExtractor, OpenRouterTextExtractor,
 };

@@ -3,9 +3,11 @@
  *
  * BACKLOG AUTOPILOT — the app-native replacement for the operator-driven
  * review-backlog drain. A cron gate (maybeStartBacklogAutopilot, invoked from
- * the per-minute scheduled handler) decides when a run is due — the first
- * tick of each UTC day, or sooner when the unresolved backlog exceeds
- * AUTOPILOT_BACKLOG_THRESHOLD — and starts a durable run row plus an
+ * the per-minute scheduled handler) decides when a run is due — any tick
+ * with at least one claimable eligible-due doc (threshold 1, not 150), a
+ * UTC-day catch-up when nothing is due now, or a rate-limited storm path
+ * when the unresolved backlog exceeds AUTOPILOT_BACKLOG_THRESHOLD — and
+ * starts a durable run row plus an
  * 'autopilot.tick' queue message. The queue consumer (handleAutopilotTick)
  * then drains docs a few at a time, re-enqueueing itself until the run ends,
  * because long model work must live in the queue (generous per-message
@@ -26,11 +28,10 @@
  *  - Error-class kill-switch: when the same error class (billing / auth /
  *    quota / parse / timeout) occurs AUTOPILOT_ERROR_CLASS_HALT_THRESHOLD
  *    times (default 2) in a run, the ENTIRE run halts immediately.
- *  - Halts require acknowledgment: a halted run persists a full receipt
- *    (per-class counts, bounded sample error text, per-doc outcomes, spend so
- *    far) surfaced via GET /api/admin/autopilot/status, and the cron will NOT
- *    start another run until POST /api/admin/autopilot/acknowledge. Errors
- *    are for seeing and understanding, not spending through.
+ *  - Halts require acknowledgment for auth and real runaway spend. Transient
+ *    OpenRouter files-prepaid / key-limit 402s use the budget circuit's
+ *    bounded cool-down and auto-resume — they must not silently latch
+ *    extraction for days. Jay is paged on every halt via Pushover.
  *
  * SPEND METER: every doc reserves a rate-card estimate against the shared
  * per-UTC-day autopilot_budget (AUTOPILOT_DAILY_USD_BUDGET, default $5.00,
@@ -48,7 +49,8 @@
  */
 
 import type { Env } from '../shared/types.ts';
-import { all, get, run } from '../shared/db.ts';
+import { all, batch, get, run } from '../shared/db.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import { uuid } from '../shared/ids.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import {
@@ -60,7 +62,20 @@ import {
   type AgreementDocResult,
   type AgreementModelsC,
 } from './agreement.ts';
-import { classifyProviderErrorClass, type ProviderErrorClass } from './providerHealth.ts';
+import {
+  classifyProviderErrorClass,
+  isFalseSourceAuthError,
+  isFalseSourceAuthHalt,
+  isTransientFilesPrepaidError,
+  isTransientFilesPrepaidHalt,
+  isTransientInfrastructureHalt,
+  type ProviderErrorClass,
+} from './providerHealth.ts';
+import { isTransientInfrastructureError } from '../shared/transientInfra.ts';
+import { isDocScopedOpenRouterError } from './openRouterReply.ts';
+import { sendPushover } from '../shared/pushover.ts';
+import { countReviewQueueBuckets, TERMINAL_REVIEW_REASON_EXCLUDE_SQL } from './reviewQueueHealth.ts';
+import { autoResolveFailureGuardSql } from '../ingestion/terminalFailureReview.ts';
 import { estimateNominalReadCostUsd, priceBenchmarkUsage } from './benchmarkMetrics.ts';
 import { meanConfidence, persistExtractionRun, type CandidateDocResult, type Provider } from './bakeoff.ts';
 import { arbitrationRowKey } from '../extractors/types.ts';
@@ -110,6 +125,12 @@ export interface AutopilotKnobs {
    * replayed. See selectLegacyReplayDoc for the exactly-once reset guard.
    */
   legacyReplayEnabled: boolean;
+  /**
+   * Document kinds the cascade never spends model calls on. Defaults to
+   * `senate_html` (deterministic parser, no model uncertainty to corroborate).
+   * Infisical: AGREEMENT_SKIP_DOC_KINDS.
+   */
+  skipDocKinds: string[];
 }
 
 interface AutopilotSecretEnv {
@@ -123,6 +144,7 @@ interface AutopilotSecretEnv {
   AUTOPILOT_BATCH_PRESEED?: string;
   DOC_CLASS_EMPTY_SPOTCHECK_RATE?: string;
   AUTOPILOT_LEGACY_REPLAY_ENABLED?: string;
+  AGREEMENT_SKIP_DOC_KINDS?: string;
 }
 
 function positiveNumber(raw: string | undefined, fallback: number): number {
@@ -149,6 +171,7 @@ export async function resolveAutopilotKnobs(env: Env): Promise<AutopilotKnobs> {
       'AUTOPILOT_BATCH_PRESEED',
       'DOC_CLASS_EMPTY_SPOTCHECK_RATE',
       'AUTOPILOT_LEGACY_REPLAY_ENABLED',
+      'AGREEMENT_SKIP_DOC_KINDS',
     ])) as AutopilotSecretEnv;
   } catch {
     // Resolver outage: fail closed (disabled) rather than run unconfigured.
@@ -162,6 +185,7 @@ export async function resolveAutopilotKnobs(env: Env): Promise<AutopilotKnobs> {
       preseedEnabled: false,
       emptySpotcheckRate: 0.1,
       legacyReplayEnabled: false,
+      skipDocKinds: agreementSkipDocKinds(),
     };
   }
   return {
@@ -177,6 +201,7 @@ export async function resolveAutopilotKnobs(env: Env): Promise<AutopilotKnobs> {
     preseedEnabled: secrets.AUTOPILOT_BATCH_PRESEED === 'true',
     emptySpotcheckRate: Math.min(positiveNumber(secrets.DOC_CLASS_EMPTY_SPOTCHECK_RATE, 0.1), 1),
     legacyReplayEnabled: secrets.AUTOPILOT_LEGACY_REPLAY_ENABLED === 'true',
+    skipDocKinds: agreementSkipDocKinds(secrets.AGREEMENT_SKIP_DOC_KINDS),
   };
 }
 
@@ -318,10 +343,25 @@ export async function markAutopilotRunHalted(
         WHERE id = ? AND status = 'running'`,
       [reason, nowIso, nowIso, runId],
     );
-    return (result.meta?.changes ?? 0) > 0;
+    const halted = (result.meta?.changes ?? 0) > 0;
+    if (halted) await pageExtractionHalt(env, reason);
+    return halted;
   } catch (err) {
     console.warn('autopilot: halt mark failed:', runId, (err as Error).message);
     return false;
+  }
+}
+
+async function pageExtractionHalt(env: Env, reason: string): Promise<void> {
+  const delivered = await sendPushover(env, {
+    title: 'CT DOWN: extraction halted',
+    message: `Autopilot halted: ${reason.slice(0, 240)}`,
+    priority: 1,
+    url: 'https://congress.trade/?view=review',
+    urlTitle: 'Review + acknowledge',
+  });
+  if (!delivered.sent) {
+    console.error('autopilot: halt page NOT delivered —', delivered.reason ?? 'unknown reason');
   }
 }
 
@@ -498,9 +538,50 @@ interface EligibleDoc {
   doc_class: string | null;
 }
 
+/**
+ * Document kinds the agreement cascade must never spend model calls on.
+ *
+ * The cascade exists to corroborate a MODEL's reading of a document by having
+ * two or three other models read the same bytes. That is only meaningful where
+ * the primary read was itself probabilistic. `senate_html` is parsed by a
+ * deterministic HTML extractor (extraction/senateHtml.ts) — there is no model
+ * uncertainty to corroborate, and the cascade's vision models receive HTML
+ * bytes they cannot parse at all.
+ *
+ * Measured cost of not having this gate (2026-08-11, production):
+ *   senate_html / agreement : 2,086 runs, 48 ok, ZERO rows
+ *   scanned_pdf / agreement : 2,590 runs, 1,345 ok, 11,710 rows
+ *   text_pdf    / agreement :   617 runs,   249 ok,  9,727 rows
+ *
+ * i.e. 25% of every model call this system has ever made went to a format that
+ * cannot produce a row. Three Senate HTML docs alone absorbed ~2,013 calls over
+ * four days, each provider replying "Failed to parse document.pdf" — the files
+ * were never corrupt, they were simply not PDFs.
+ *
+ * Override with AGREEMENT_SKIP_DOC_KINDS (comma-separated) to re-open a kind,
+ * or set it empty to disable the gate entirely.
+ */
+export const DEFAULT_AGREEMENT_SKIP_DOC_KINDS = 'senate_html';
+
+export function agreementSkipDocKinds(raw?: string | null): string[] {
+  const value = raw ?? DEFAULT_AGREEMENT_SKIP_DOC_KINDS;
+  return value
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/** SQL fragment excluding the skipped kinds; empty string when nothing is skipped. */
+export function agreementSkipDocKindSql(kinds: string[]): string {
+  if (!kinds.length) return '';
+  const list = kinds.map((k) => `'${k.replace(/'/g, "''")}'`).join(', ');
+  return `\n   AND COALESCE(f.doc_kind, '') NOT IN (${list})`;
+}
+
 const ELIGIBLE_PREDICATES = `
        rq.resolved = 0
    AND rq.agreement_suppressed_at IS NULL
+   AND ${TERMINAL_REVIEW_REASON_EXCLUDE_SQL}
    AND COALESCE(rq.agreement_attempts, 0) < ?
    AND (rq.agreement_next_attempt_at IS NULL OR rq.agreement_next_attempt_at <= ?)
    AND (rq.agreement_claim_token IS NULL OR rq.agreement_claimed_at IS NULL OR rq.agreement_claimed_at <= ?)
@@ -553,14 +634,16 @@ async function selectLegacyReplayDoc(
   attemptCap: number,
   excludeDocIds: string[],
   now: Date,
+  skipKinds: string[] = agreementSkipDocKinds(),
 ): Promise<EligibleDoc | null> {
   const nowIso = now.toISOString();
   const leaseExpired = new Date(now.getTime() - AGREEMENT_CLAIM_LEASE_MS).toISOString();
+  const skipSql = agreementSkipDocKindSql(skipKinds);
   const candidate = await get<EligibleDoc>(
     env.DB,
     `SELECT f.doc_id, f.raw_object_key, f.chamber, f.page_count, f.doc_class
        FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
-      WHERE ${LEGACY_REPLAY_PREDICATES}
+      WHERE ${LEGACY_REPLAY_PREDICATES}${skipSql}
         AND rq.doc_id NOT IN (SELECT value FROM json_each(?))
       ORDER BY rq.created_at ASC
       LIMIT 1`,
@@ -587,9 +670,11 @@ async function selectNextDoc(
   eraStart: string,
   now: Date,
   legacyReplayEnabled = false,
+  skipKinds: string[] = agreementSkipDocKinds(),
 ): Promise<EligibleDoc | null> {
   const nowIso = now.toISOString();
   const leaseExpired = new Date(now.getTime() - AGREEMENT_CLAIM_LEASE_MS).toISOString();
+  const skipSql = agreementSkipDocKindSql(skipKinds);
   // Ordering: doc_class first (typed/clean/empty are the cheapest to resolve,
   // hard scans and quarantine candidates last), then current-era-first, then
   // oldest review item. Cheapest wins.
@@ -597,7 +682,7 @@ async function selectNextDoc(
     env.DB,
     `SELECT f.doc_id, f.raw_object_key, f.chamber, f.page_count, f.doc_class
        FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
-      WHERE ${ELIGIBLE_PREDICATES}
+      WHERE ${ELIGIBLE_PREDICATES}${skipSql}
         AND rq.doc_id NOT IN (SELECT value FROM json_each(?))
       ORDER BY ${DOC_CLASS_ORDER_SQL},
                CASE WHEN COALESCE(f.filed_date, '') >= ? THEN 0 ELSE 1 END,
@@ -625,6 +710,15 @@ async function selectNextDoc(
  * a permanently-stuck backlog instead of surfacing it honestly.
  */
 export async function countEligibleBacklog(env: Env): Promise<number | null> {
+  let skipKindsRaw: string | undefined;
+  try {
+    const s = (await resolveSecrets(env, ['AGREEMENT_SKIP_DOC_KINDS'])) as {
+      AGREEMENT_SKIP_DOC_KINDS?: string;
+    };
+    skipKindsRaw = s.AGREEMENT_SKIP_DOC_KINDS;
+  } catch {
+    skipKindsRaw = undefined; // fall back to the default skip list
+  }
   try {
     const row = await get<{ n: number }>(
       env.DB,
@@ -632,7 +726,42 @@ export async function countEligibleBacklog(env: Env): Promise<number | null> {
          FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
         WHERE rq.resolved = 0
           AND rq.agreement_suppressed_at IS NULL
-          AND f.raw_object_key IS NOT NULL`,
+          AND f.raw_object_key IS NOT NULL${agreementSkipDocKindSql(agreementSkipDocKinds(skipKindsRaw))}`,
+    );
+    return row?.n ?? 0;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Selector-eligible due-now docs the cascade can claim on this tick.
+ * Health `eligible` is a looser bucket and must not be used as this count.
+ */
+export async function countEligibleDueDocs(env: Env, now = new Date()): Promise<number | null> {
+  let skipKindsRaw: string | undefined;
+  let maxAttemptsRaw: string | undefined;
+  try {
+    const s = (await resolveSecrets(env, ['AGREEMENT_SKIP_DOC_KINDS', 'AGREEMENT_MAX_ATTEMPTS'])) as {
+      AGREEMENT_SKIP_DOC_KINDS?: string;
+      AGREEMENT_MAX_ATTEMPTS?: string;
+    };
+    skipKindsRaw = s.AGREEMENT_SKIP_DOC_KINDS;
+    maxAttemptsRaw = s.AGREEMENT_MAX_ATTEMPTS;
+  } catch {
+    skipKindsRaw = undefined;
+    maxAttemptsRaw = undefined;
+  }
+  const attemptCap = maxAttempts({ AGREEMENT_MAX_ATTEMPTS: maxAttemptsRaw } as Parameters<typeof maxAttempts>[0]);
+  const nowIso = now.toISOString();
+  const leaseExpired = new Date(now.getTime() - AGREEMENT_CLAIM_LEASE_MS).toISOString();
+  try {
+    const row = await get<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n
+         FROM review_queue rq JOIN filings f ON f.doc_id = rq.doc_id
+        WHERE ${ELIGIBLE_PREDICATES}${agreementSkipDocKindSql(agreementSkipDocKinds(skipKindsRaw))}`,
+      [attemptCap, nowIso, leaseExpired],
     );
     return row?.n ?? 0;
   } catch {
@@ -644,33 +773,68 @@ export async function countEligibleBacklog(env: Env): Promise<number | null> {
 // Cron gate — decide whether a run is due, create it, enqueue the first tick
 // ---------------------------------------------------------------------------
 
+export type AutopilotStartTrigger = 'daily' | 'backlog' | 'eligible';
+
 export interface AutopilotStartResult {
-  started?: { runId: string; trigger: 'daily' | 'backlog' };
+  started?: { runId: string; trigger: AutopilotStartTrigger };
   blocked?: 'unacknowledged_halt' | 'run_in_progress' | 'stalled_run_halted' | 'not_due';
 }
 
 export async function maybeStartBacklogAutopilot(
   env: Env,
   now = new Date(),
+  opts: { signal?: AbortSignal } = {},
 ): Promise<AutopilotStartResult | null> {
+  abortIfSignal(opts.signal);
   const knobs = await resolveAutopilotKnobs(env);
   if (!knobs.enabled) return null;
 
   // Halt/ack + single-run gates. A halted run must be acknowledged by a human
   // (POST /api/admin/autopilot/acknowledge) before any new run may start.
-  let open: Array<{ id: string; status: string; updated_at: string }>;
+  let open: Array<{
+    id: string;
+    status: string;
+    updated_at: string;
+    halt_reason: string | null;
+    sample_errors: string | null;
+  }>;
   try {
-    open = await all<{ id: string; status: string; updated_at: string }>(
+    open = await all<{
+      id: string;
+      status: string;
+      updated_at: string;
+      halt_reason: string | null;
+      sample_errors: string | null;
+    }>(
       env.DB,
-      `SELECT id, status, updated_at FROM autopilot_runs
+      `SELECT id, status, updated_at, halt_reason, sample_errors FROM autopilot_runs
         WHERE status IN ('running', 'halted')
         ORDER BY started_at DESC LIMIT 10`,
     );
   } catch {
     return null; // autopilot_runs not migrated yet — do nothing, never throw
   }
-  if (open.some((row) => row.status === 'halted')) {
-    return { blocked: 'unacknowledged_halt' };
+  const haltedRows = open.filter((row) => row.status === 'halted');
+  if (haltedRows.length) {
+    const resumable = haltedRows.filter((row) =>
+      isTransientFilesPrepaidHalt(row.halt_reason, row.sample_errors)
+      || isFalseSourceAuthHalt(row.halt_reason, row.sample_errors)
+      || isTransientInfrastructureHalt(row.halt_reason, row.sample_errors));
+    if (resumable.length && resumable.length === haltedRows.length) {
+      for (const row of resumable) {
+        const actor = isFalseSourceAuthHalt(row.halt_reason, row.sample_errors)
+          ? 'auto_resume:false_source_auth'
+          : isTransientInfrastructureHalt(row.halt_reason, row.sample_errors)
+            ? 'auto_resume:transient_infra'
+            : 'auto_resume:files_prepaid';
+        await acknowledgeAutopilotHalt(env, {
+          runId: row.id,
+          actor,
+        });
+      }
+    } else {
+      return { blocked: 'unacknowledged_halt' };
+    }
   }
   const runningRow = open.find((row) => row.status === 'running');
   if (runningRow) {
@@ -683,23 +847,30 @@ export async function maybeStartBacklogAutopilot(
     return { blocked: 'run_in_progress' };
   }
 
-  // Trigger: first tick of a UTC day, or a big backlog (rate-limited by
-  // AUTOPILOT_MIN_INTERVAL_MINUTES so the per-minute cron can't storm).
+  // Due-now first: one claimable eligible-due doc is enough.  Do not wait
+  // for UTC midnight or AUTOPILOT_BACKLOG_THRESHOLD.  minIntervalMinutes
+  // applies only to the leftover >150 storm path so it cannot park due work.
+  // Daily UTC is catch-up when nothing is due now — never the only start.
   const day = budgetDay(now);
-  let trigger: 'daily' | 'backlog' | null = null;
+  let trigger: AutopilotStartTrigger | null = null;
   let backlog: number | null = null;
   try {
-    const lastDay = await env.CONFIG_KV.get(KV_LAST_DAY);
-    if (lastDay !== day) {
-      trigger = 'daily';
+    const eligibleDue = await countEligibleDueDocs(env, now);
+    if (eligibleDue != null && eligibleDue >= 1) {
+      trigger = 'eligible';
     } else {
-      backlog = await countEligibleBacklog(env);
-      if (backlog != null && backlog > knobs.backlogThreshold) {
-        const lastRunRaw = await env.CONFIG_KV.get(KV_LAST_RUN_AT);
-        const lastRunAt = lastRunRaw ? Date.parse(lastRunRaw) : Number.NaN;
-        if (!Number.isFinite(lastRunAt)
-          || now.getTime() - lastRunAt >= knobs.minIntervalMinutes * 60 * 1000) {
-          trigger = 'backlog';
+      const lastDay = await env.CONFIG_KV.get(KV_LAST_DAY);
+      if (lastDay !== day) {
+        trigger = 'daily';
+      } else {
+        backlog = await countEligibleBacklog(env);
+        if (backlog != null && backlog > knobs.backlogThreshold) {
+          const lastRunRaw = await env.CONFIG_KV.get(KV_LAST_RUN_AT);
+          const lastRunAt = lastRunRaw ? Date.parse(lastRunRaw) : Number.NaN;
+          if (!Number.isFinite(lastRunAt)
+            || now.getTime() - lastRunAt >= knobs.minIntervalMinutes * 60 * 1000) {
+            trigger = 'backlog';
+          }
         }
       }
     }
@@ -708,6 +879,7 @@ export async function maybeStartBacklogAutopilot(
   }
   if (!trigger) return { blocked: 'not_due' };
   if (backlog == null) backlog = await countEligibleBacklog(env);
+  abortIfSignal(opts.signal);
 
   // Stamp BEFORE starting so the next cron tick can't double-start.
   try {
@@ -812,20 +984,49 @@ async function quarantineCorruptDoc(env: Env, docId: string): Promise<boolean> {
 /**
  * Auto-resolve an empty doc as no-transactions. Lease-respecting guarded
  * UPDATE — a claimed/suppressed/resolved row is never touched.
+ *
+ * This is the ONLY 'verified_empty' write path: resolution_kind + a
+ * non-blank resolution_reason are set in the SAME statement that flips
+ * resolved=1 (trg_review_queue_honest_resolution, migration 0082, aborts any
+ * UPDATE that doesn't), and filings.ingest_status moves off 'needs_review' to
+ * 'verified_empty' in the same atomic batch. Previously this only touched
+ * review_queue — filings.ingest_status was left stuck at 'needs_review'
+ * forever, and review_queue recorded no reason on the row itself (only a
+ * companion ingestion_decisions audit row) — the exact production bug this
+ * migration fixes (3,497 review_queue rows all resolved=1, 738 with zero live
+ * transactions, 180 filings stuck at needs_review despite a "resolved" queue
+ * row).
  */
 async function resolveEmptyDoc(env: Env, docId: string, now: Date): Promise<boolean> {
   const leaseExpired = new Date(now.getTime() - AGREEMENT_CLAIM_LEASE_MS).toISOString();
-  const result = await run(
-    env.DB,
-    `UPDATE review_queue
-        SET resolved = 1, agreement_next_attempt_at = NULL,
-            agreement_claim_token = NULL, agreement_claimed_at = NULL,
-            review_revision = review_revision + 1
-      WHERE doc_id = ? AND resolved = 0 AND agreement_suppressed_at IS NULL
-        AND (agreement_claim_token IS NULL OR agreement_claimed_at IS NULL OR agreement_claimed_at <= ?)`,
-    [docId, leaseExpired],
-  );
-  if ((result.meta?.changes ?? 0) === 0) return false;
+  const results = await batch(env.DB, [
+    [
+      `UPDATE review_queue
+          SET resolved = 1, agreement_next_attempt_at = NULL,
+              agreement_claim_token = NULL, agreement_claimed_at = NULL,
+              resolution_kind = 'verified_empty',
+              resolution_reason = 'doc_class_empty_no_transactions',
+              resolved_at = CURRENT_TIMESTAMP,
+              review_revision = review_revision + 1
+        WHERE doc_id = ? AND resolved = 0 AND agreement_suppressed_at IS NULL
+          AND (agreement_claim_token IS NULL OR agreement_claimed_at IS NULL OR agreement_claimed_at <= ?)
+          AND ${autoResolveFailureGuardSql('reason')}`,
+      [docId, leaseExpired],
+    ],
+    [
+      `UPDATE filings
+          SET ingest_status = 'verified_empty', error = NULL
+        WHERE doc_id = ?
+          AND ingest_status <> 'persisted'
+          AND NOT EXISTS (SELECT 1 FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL)
+          AND EXISTS (
+            SELECT 1 FROM review_queue
+             WHERE doc_id = ? AND resolved = 1 AND resolution_kind = 'verified_empty'
+          )`,
+      [docId, docId, docId],
+    ],
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) === 0) return false;
   await recordIngestionDecision(env.DB, {
     docId,
     action: 'auto_resolved_empty',
@@ -858,6 +1059,9 @@ export async function handleAutopilotTick(
   let revision = row.revision;
   const state = parseRunState(row);
   const seenDocIds = state.outcomes.map((outcome) => outcome.docId);
+  // Minute-tick eligible drain is one selector-eligible-due doc.  Daily
+  // UTC and threshold backlog runs keep the configured pilot cap.
+  const maxDocsThisRun = row.run_trigger === 'eligible' ? 1 : knobs.maxDocsPerRun;
   const day = budgetDay(now);
   const eraStart = currentEraStart(now);
 
@@ -891,13 +1095,14 @@ export async function handleAutopilotTick(
     console.log(`autopilot: run ${runId} ${status} (${reason}); `
       + `attempted=${state.docsAttempted} published=${state.docsPublished} `
       + `deferred=${state.docsDeferred} spend=$${(state.spendMicro / MICRO).toFixed(4)}`);
+    if (status === 'halted') await pageExtractionHalt(env, reason);
   };
 
   let finished = false;
   let haltedByErrors = false;
 
   for (let slot = 0; slot < DOCS_PER_TICK && !finished; slot++) {
-    if (seenDocIds.length >= knobs.maxDocsPerRun) {
+    if (seenDocIds.length >= maxDocsThisRun) {
       await finalize('completed', 'max_docs_reached');
       finished = true;
       break;
@@ -1191,11 +1396,29 @@ export async function handleAutopilotTick(
     }
 
     // Error-class kill-switch: same class twice (default) halts the WHOLE
-    // run. The app stops, explains itself in the receipt, and waits for ack.
+    // run for auth / real spend / parse / timeout. Transient OpenRouter
+    // files-prepaid / key-limit 402s and source-fetch / admin Unauthorized
+    // are NOT a latch — those auto-resume. Proven invalid_api_key / User
+    // not found stay fail-closed.
     const haltClass = KILL_SWITCH_CLASSES.find(
       (cls) => (state.errorClassCounts[cls] ?? 0) >= knobs.errorClassHaltThreshold,
     );
-    if (haltClass) {
+    const haltSamples = Object.values(state.sampleErrors);
+    const transientFilesOnly = haltSamples.length > 0
+      && haltSamples.every((sample) => isTransientFilesPrepaidError(sample));
+    const falseSourceAuthOnly = haltSamples.length > 0
+      && haltSamples.every((sample) => isFalseSourceAuthError(sample));
+    const docScopedOpenRouterOnly = haltSamples.length > 0
+      && haltSamples.every((sample) => isDocScopedOpenRouterError(sample));
+    const infraOnly = haltSamples.length > 0
+      && haltSamples.every((sample) => isTransientInfrastructureError(sample));
+    const skipTransientLatch = (
+      (transientFilesOnly && (haltClass === 'billing' || haltClass === 'quota'))
+      || (falseSourceAuthOnly && haltClass === 'auth')
+      || (docScopedOpenRouterOnly && (haltClass === 'auth' || haltClass === 'parse'))
+      || infraOnly
+    );
+    if (haltClass && !skipTransientLatch) {
       await finalize('halted', `error_class:${haltClass}`);
       finished = true;
       haltedByErrors = true;
@@ -1591,6 +1814,7 @@ export async function getAutopilotStatus(env: Env, now = new Date()): Promise<{
   enabled: boolean;
   knobs: Omit<AutopilotKnobs, 'enabled' | 'dailyBudgetMicroUsd'> & { dailyBudgetUsd: number };
   backlog: number | null;
+  reviewQueue: Awaited<ReturnType<typeof countReviewQueueBuckets>>;
   today: { day: string; spendUsd: number; budgetUsd: number };
   unacknowledgedHalt: AutopilotRunReceipt | null;
   runs: AutopilotRunReceipt[];
@@ -1619,8 +1843,12 @@ export async function getAutopilotStatus(env: Env, now = new Date()): Promise<{
       preseedEnabled: knobs.preseedEnabled,
       emptySpotcheckRate: knobs.emptySpotcheckRate,
       legacyReplayEnabled: knobs.legacyReplayEnabled,
+      // Surfaced so the admin page shows which formats the cascade will not
+      // spend on, and where that is configured (Infisical AGREEMENT_SKIP_DOC_KINDS).
+      skipDocKinds: knobs.skipDocKinds,
     },
     backlog: await countEligibleBacklog(env),
+    reviewQueue: await countReviewQueueBuckets(env),
     today: {
       day,
       spendUsd: Math.round((spendMicro / MICRO) * 10_000) / 10_000,

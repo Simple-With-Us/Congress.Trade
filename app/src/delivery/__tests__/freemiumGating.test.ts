@@ -5,7 +5,10 @@ import {
   buildTransactionsExportQuery,
 } from '../rows.ts';
 import { buildRestRouter } from '../rest.ts';
+import { issueDeviceEntitlementToken } from '../../billing/deviceEntitlement.ts';
 import type { Env } from '../../shared/types.ts';
+
+const TEST_DEVICE_ENTITLEMENT_SECRET = 'test-device-entitlement-secret';
 
 describe('freemium query gating (filedSince)', () => {
   it('adds the recency clause + bound param to the feed query', () => {
@@ -30,7 +33,7 @@ describe('buildTransactionsExportQuery', () => {
   it('drops the cursor backstop, orders newest-first, and has no product LIMIT', () => {
     const q = buildTransactionsExportQuery({ ticker: 'aapl' });
     expect(q.sql).not.toContain('cursor_seq > ?');
-    expect(q.sql).toContain('ORDER BY t.cursor_seq DESC');
+    expect(q.sql).toContain('ORDER BY COALESCE(t.first_seen_at, t.filed_date, t.tx_date, t.cursor_seq) DESC, t.cursor_seq DESC');
     // Premium export is the full match set — no silent row cap.
     expect(q.sql).not.toMatch(/\bLIMIT\b/i);
     expect(q.params).toContain('AAPL');
@@ -62,8 +65,15 @@ describe('buildTransactionsExportQuery', () => {
  * - No Authorization / cookie => getCurrentUserFromRequest → null
  * - Bearer free-token / premium-token => session KV → user row with plan
  */
-function fakeEnv(opts: { plan?: 'premium' | 'free' } = {}): Env {
+interface AnonSubOpts {
+  originalTransactionId: string;
+  status: 'active' | 'expired' | 'revoked' | 'grace_period' | 'billing_retry';
+  expiresDate?: string | null;
+}
+
+function fakeEnv(opts: { plan?: 'premium' | 'free'; anonSub?: AnonSubOpts | null } = {}): Env {
   return {
+    APPLE_DEVICE_ENTITLEMENT_SECRET: TEST_DEVICE_ENTITLEMENT_SECRET,
     CONFIG_KV: {
       get: async (key: string) => {
         if (key === 'sess:free-token') return JSON.stringify({ userId: 'user_free' });
@@ -102,9 +112,31 @@ function fakeEnv(opts: { plan?: 'premium' | 'free' } = {}): Env {
           }
           // Non-premium-via-Stripe users also fall through to the Apple IAP
           // ledger check (resolveEntitlementAsync); none of these fake users
-          // have an Apple subscription, so that lookup must return null, not
-          // the generic COUNT(*) placeholder below.
-          if (/FROM apple_subscriptions/i.test(sql)) return null;
+          // have an Apple subscription, so that lookup returns null unless
+          // the test asked for an anonymous device-entitlement ledger row.
+          if (/FROM apple_subscriptions/i.test(sql)) {
+            const { anonSub } = opts;
+            if (!anonSub || String(this.params[0] ?? '') !== anonSub.originalTransactionId) return null;
+            return {
+              original_transaction_id: anonSub.originalTransactionId,
+              user_id: null,
+              product_id: 'trade.congress.premium.monthly',
+              plan: 'monthly',
+              status: anonSub.status,
+              environment: 'Production',
+              latest_transaction_id: anonSub.originalTransactionId,
+              purchase_date: '2026-01-01T00:00:00.000Z',
+              expires_date: anonSub.expiresDate === undefined ? '2099-01-01T00:00:00.000Z' : anonSub.expiresDate,
+              auto_renew_status: 1,
+              auto_renew_product_id: null,
+              revoked_at: null,
+              revocation_reason: null,
+              last_notification_type: null,
+              last_notification_subtype: null,
+              created_at: '2026-01-01T00:00:00.000Z',
+              updated_at: '2026-01-01T00:00:00.000Z',
+            };
+          }
           return { total: 0 };
         },
         async all() {
@@ -132,10 +164,10 @@ describe('GET /transactions is public (ungated)', () => {
 });
 
 describe('GET /export/transactions.csv', () => {
-  it('returns 401 for anonymous visitors (Premium-gated)', async () => {
+  it('returns 402 (not 401 — Guideline 5.1.1(v): no account required to buy) for anonymous visitors with no device token', async () => {
     const app = buildRestRouter();
     const res = await app.request('http://localhost/export/transactions.csv', {}, fakeEnv());
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(402);
     const body = (await res.json()) as { error?: string; upgradeRequired?: boolean; feature?: string };
     expect(body.upgradeRequired).toBe(true);
     expect(body.feature).toBe('export');
@@ -164,10 +196,54 @@ describe('GET /export/transactions.csv', () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/csv');
-    expect(res.headers.get('X-Export-Complete')).toBe('true');
+    // No completeness claim: headers precede the stream, so a mid-stream
+    // abort must not carry a promise the body did not keep.
+    expect(res.headers.get('X-Export-Complete')).toBeNull();
     expect(res.headers.get('X-Export-Row-Count')).toBe('0');
     const csv = await res.text();
     expect(csv).toContain('filed_at');
     expect(csv).toContain('ticker');
+  });
+});
+
+describe('GET /export/transactions.csv — anonymous device entitlement (Guideline 5.1.1(v))', () => {
+  const anonSub: AnonSubOpts = { originalTransactionId: 'otxn-anon-export', status: 'active' };
+
+  it('exports for a signed-out device carrying a valid device entitlement token', async () => {
+    const env = fakeEnv({ anonSub });
+    const token = await issueDeviceEntitlementToken(env, anonSub.originalTransactionId, '2099-01-01T00:00:00.000Z');
+    const app = buildRestRouter();
+    const res = await app.request(
+      'http://localhost/export/transactions.csv',
+      { headers: { 'X-Apple-Device-Entitlement': token! } },
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/csv');
+  });
+
+  it('refuses export once the ledger row backing the token is revoked', async () => {
+    const revoked: AnonSubOpts = { ...anonSub, originalTransactionId: 'otxn-anon-export-revoked', status: 'revoked' };
+    const env = fakeEnv({ anonSub: revoked });
+    const token = await issueDeviceEntitlementToken(env, revoked.originalTransactionId, '2099-01-01T00:00:00.000Z');
+    const app = buildRestRouter();
+    const res = await app.request(
+      'http://localhost/export/transactions.csv',
+      { headers: { 'X-Apple-Device-Entitlement': token! } },
+      env,
+    );
+    expect(res.status).toBe(402);
+  });
+
+  it('a present-but-free session takes priority over a valid device token (never OR the two)', async () => {
+    const env = fakeEnv({ anonSub });
+    const token = await issueDeviceEntitlementToken(env, anonSub.originalTransactionId, '2099-01-01T00:00:00.000Z');
+    const app = buildRestRouter();
+    const res = await app.request(
+      'http://localhost/export/transactions.csv',
+      { headers: { authorization: 'Bearer free-token', 'X-Apple-Device-Entitlement': token! } },
+      env,
+    );
+    expect(res.status).toBe(402);
   });
 });

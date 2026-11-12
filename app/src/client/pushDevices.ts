@@ -2,8 +2,8 @@
  * Account-owned push device registration (APNs / future web push).
  *
  * Device tokens are NOT delivery subscriptions: they must not consume the
- * MAX_SUBSCRIPTIONS_PER_USER webhook/SSE quota. Actual APNs HTTP/2 fan-out
- * is separate and requires APNs credentials (not part of this module).
+ * MAX_SUBSCRIPTIONS_PER_USER webhook/SSE quota. HTTP/2 send lives in
+ * shared/apns.ts + delivery/apnsFanout.ts (official trades + review needed).
  */
 
 import type { Env } from '../shared/types.ts';
@@ -225,6 +225,18 @@ export async function listActivePushDevices(env: Env, userId: string): Promise<P
       WHERE user_id = ? AND active = 1
       ORDER BY updated_at DESC`,
     [userId],
+  );
+  return rows.map(mapPushDevice);
+}
+
+/** Every live APNs token across accounts — product fan-out, not a per-user list. */
+export async function listAllActiveApnsDevices(env: Env): Promise<PushDevice[]> {
+  const rows = await all<PushDeviceRow>(
+    env.DB,
+    `SELECT ${SELECT_COLS} FROM push_devices
+      WHERE platform = 'apns' AND active = 1
+      ORDER BY updated_at DESC`,
+    [],
   );
   return rows.map(mapPushDevice);
 }

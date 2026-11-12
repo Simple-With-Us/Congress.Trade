@@ -25,18 +25,27 @@ import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { all, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
 import { mapSubscription, mapTransaction, type SubscriptionRow, type TransactionRow } from './rows.ts';
+import { deliveryFreshnessJudgedAtMs, stampDeliveryFreshness } from './deliveryFreshness.ts';
 import { matchesFiltersWithContext, subscriptionOwnerEntitled, webhookTargetLengthError } from './subscriptions.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from './webhookTarget.ts';
 import { notifyAdmin } from '../alerts/notify.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
+import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
 import {
   checkTargetCircuit,
+  markParkedDeliveryTerminal,
   parkDelivery,
   recordTargetFailure,
   recordTargetSuccess,
   targetKeyForUrl,
+  UNDELIVERABLE_REASONS,
 } from './targetCircuit.ts';
+import {
+  releaseSubscriberWebhookResponseBody,
+  webhookSubscriberConsumptionError,
+} from './pushReceipt.ts';
+import { getLiveRetraction, parseRetractKey, RETRACT_EVENT } from './retractions.ts';
 
 /** Max delivery attempts before we give up (initial try + retries). */
 const MAX_ATTEMPTS = 5;
@@ -223,28 +232,78 @@ export async function dispatchWebhook(
   const msg: DispatchMessage =
     typeof txIdOrMsg === 'string' ? { type: 'delivery.dispatch', txId: txIdOrMsg } : txIdOrMsg;
 
+  // trade.retract events ride the same outbox/queue/deliveries plumbing under
+  // the key 'retract:<seq>' (see retractions.ts).
+  const retractSeq = parseRetractKey(msg.txId);
+  if (retractSeq !== null) return dispatchRetraction(env, msg, retractSeq, lease);
+
   const txRow = await get<TransactionRow>(
     env.DB,
     'SELECT * FROM transactions WHERE id = ?',
     [msg.txId],
   );
   if (!txRow) {
-    console.warn('dispatchWebhook: transaction not found', msg.txId);
+    // Debug, not warn: this miss path is expected for stale outbox rows and
+    // was ~2.3k Datadog warn events/hour.  Real dispatch failures still warn.
+    console.debug('dispatchWebhook: transaction not found', msg.txId);
+    // A targeted retry of a row whose transaction was swept can never deliver.
+    // Left parked with its old updated_at, the flush would re-release it at the
+    // head of its oldest-first page every tick, forever.
+    if (msg.subscriptionId) {
+      await markParkedDeliveryTerminal(env, msg.subscriptionId, msg.txId, UNDELIVERABLE_REASONS.txMissing);
+    }
     return { outboxComplete: !msg.subscriptionId };
   }
   // Don't push a retracted (un-published) row, e.g. on a retry after unpublish.
   if ((txRow as { deprecated_at?: string | null }).deprecated_at) {
+    if (msg.subscriptionId) {
+      await markParkedDeliveryTerminal(env, msg.subscriptionId, msg.txId, UNDELIVERABLE_REASONS.txRetracted);
+    }
     return { outboxComplete: !msg.subscriptionId };
   }
-  const tx = mapTransaction(txRow);
+  const tx = stampDeliveryFreshness(mapTransaction(txRow));
+  // Fan-out judges freshness as of now.  A targeted retry re-sends a row that
+  // already matched at fan-out and then waited behind the target circuit, so
+  // its filter judges freshness as of when fan-out first did: a delivery that
+  // was fresh when it parked still goes out, one that was already backfill
+  // still skips.  The payload's isBackfill stays stamped as of now, so the
+  // receiver can tell a weeks-late retry from a new disclosure.
+  const freshnessAtMs = msg.subscriptionId ? deliveryFreshnessJudgedAtMs(tx) ?? undefined : undefined;
 
-  // Resolve chamber via the owning filing (Transaction carries no chamber col).
-  const chamberRow = await get<{ chamber: string | null }>(
+  // Resolve chamber + the filer's party in one query, keyed off the transaction.
+  //
+  // Base is `transactions` with LEFT JOINs, exactly like the replay paths
+  // (rows.ts TX_FROM_JOINS): competitor_backfill / seed rows are written by
+  // persistTransactions() with no `filings` row behind them, so a filings-driven
+  // base returned zero rows for them and both fields fell out as null — dropping
+  // them from every chamber-filtered subscription that the feed resolves.
+  //
+  // Party keys on the TRANSACTION's filer_id, not the filing's. filings.filer_id
+  // is nullable and written on its own schedule (extraction inserts filings with
+  // doc_id alone), so keying off it resolved NULL for rows whose transactions do
+  // carry a filer — while the SSE backlog (sse.ts) and the HTTP feed (rows.ts)
+  // both key the same party on t.filer_id. Binding the transaction's filer keeps
+  // all three delivery paths on one spelling, which is what this path is for.
+  //
+  // Party has to be on the transaction rather than only in ctx, because ctx is
+  // consumed for subscription matching and never serialized — formatTradeEvent
+  // sends the transaction alone, so a party held in ctx would be dropped before
+  // the frame reaches the client.
+  const filingRow = await get<{ chamber: string | null; party: string | null }>(
     env.DB,
-    'SELECT chamber FROM filings WHERE doc_id = ?',
-    [tx.docId],
+    `SELECT COALESCE(fl.chamber, f.chamber) AS chamber, fl.party AS party
+       FROM transactions t
+       LEFT JOIN filers fl ON fl.bioguide_id = t.filer_id
+       LEFT JOIN filings f ON f.doc_id = t.doc_id
+      WHERE t.id = ?`,
+    [tx.id],
   );
-  const chamber = chamberRow?.chamber ?? null;
+  const chamber = filingRow?.chamber ?? null;
+  // The backlog path gets this from mapFeedTransaction; this is the push path's
+  // equivalent, so both producers now emit the same shape.
+  if (tx.party === undefined || tx.party === null) {
+    tx.party = filingRow?.party ?? null;
+  }
 
   // Resolve sector + market-cap bucket for sector/cap subscription filters.
   const refRow = tx.ticker
@@ -258,6 +317,7 @@ export async function dispatchWebhook(
     chamber,
     sector: refRow?.sector ?? null,
     marketCapBucket: refRow?.market_cap_bucket ?? null,
+    freshnessAtMs,
   };
 
   // Broadcast the transaction to any live SSE streams exactly once (on the
@@ -276,12 +336,112 @@ export async function dispatchWebhook(
     }
   }
 
+  // flushParkedDeliveries targets one subscription; a targeted no-op (no
+  // target, filter miss) must not leave the row parked at the head of
+  // ORDER BY updated_at ASC forever.
+  const targeted = Boolean(msg.subscriptionId);
   const visit = async (sub: Subscription): Promise<void> => {
-    if (!sub.targetUrl) return;
-    if (!matchesFiltersWithContext(tx, sub.filters, ctx)) return;
-    await deliverToSubscription(env, sub, tx, lease);
+    if (!sub.targetUrl) {
+      if (targeted) await markParkedDeliveryTerminal(env, sub.id, tx.id, UNDELIVERABLE_REASONS.noTarget);
+      return;
+    }
+    if (!matchesFiltersWithContext(tx, sub.filters, ctx)) {
+      if (targeted) await markParkedDeliveryTerminal(env, sub.id, tx.id, UNDELIVERABLE_REASONS.filterMiss);
+      return;
+    }
+    await deliverToSubscription(env, sub, tradeNewEvent(tx), lease, targeted);
   };
+  return fanOutWebhook(env, msg, visit, lease);
+}
 
+/** One webhook POST's identity and body (trade.new or trade.retract). */
+interface WebhookEvent {
+  /** deliveries.tx_id / outbox key: the tx id, or 'retract:<seq>'. */
+  key: string;
+  /** X-Tx-Id header value: the tx id, or 'retract:<seq>' so a retract never dedupes against the original trade.new. */
+  txId: string;
+  /** X-CT-Event header value. */
+  ctEvent: string;
+  /** Advance subscriptions.cursor to this after delivery (trades only). */
+  cursorSeq: number | null;
+  payload(deliveredAt: string): unknown;
+}
+
+function tradeNewEvent(tx: Transaction): WebhookEvent {
+  return {
+    key: tx.id,
+    txId: tx.id,
+    ctEvent: 'transaction.created',
+    cursorSeq: tx.cursorSeq,
+    // Superset payload: the canonical cross-app contract fields from
+    // createCongressEvent (peers key delivery on `type === 'congress.trade'` +
+    // `data.trades` + `id` for idempotency) plus the legacy `event`/`transaction`
+    // fields, so existing external subscribers keep working while contract-aware
+    // consumers (Socratic Trade) ingest it directly.
+    payload: (deliveredAt) => ({
+      ...createCongressEvent('congress.trade', { trades: [tx] }, { id: `ct-tx-${tx.id}` }),
+      event: 'trade.new' as const,
+      transaction: tx,
+      deliveredAt,
+    }),
+  };
+}
+
+/**
+ * Deliver one trade.retract to every active webhook subscription.  Not
+ * filtered by subscription filters: a retract for a trade the subscriber
+ * never received is a no-op for it, while a freshness or filter change since
+ * the original delivery must never hide a retract it needs.  A revived
+ * retraction (the row is live again) is not sent.
+ */
+async function dispatchRetraction(
+  env: Env,
+  msg: DispatchMessage,
+  seq: number,
+  lease?: DurableQueueLeaseContext,
+): Promise<DispatchWebhookResult> {
+  const retraction = await getLiveRetraction(env, seq);
+  if (!retraction) {
+    if (msg.subscriptionId) {
+      await markParkedDeliveryTerminal(env, msg.subscriptionId, msg.txId, UNDELIVERABLE_REASONS.txMissing);
+    }
+    return { outboxComplete: !msg.subscriptionId };
+  }
+  const event: WebhookEvent = {
+    key: msg.txId,
+    // X-Tx-Id must not reuse the retracted trade's id: recipients dedupe on
+    // X-Subscription-Id + X-Tx-Id, so the retract would read as a duplicate
+    // of the original trade.new. The outbox/deliveries key ('retract:<seq>')
+    // is already unique per retraction; the body still names the trade.
+    txId: msg.txId,
+    ctEvent: 'transaction.retracted',
+    cursorSeq: null,
+    payload: (deliveredAt) => ({
+      type: RETRACT_EVENT,
+      id: `ct-retract-${retraction.retractSeq}`,
+      event: RETRACT_EVENT,
+      retraction,
+      deliveredAt,
+    }),
+  };
+  const targeted = Boolean(msg.subscriptionId);
+  const visit = async (sub: Subscription): Promise<void> => {
+    if (!sub.targetUrl) {
+      if (targeted) await markParkedDeliveryTerminal(env, sub.id, event.key, UNDELIVERABLE_REASONS.noTarget);
+      return;
+    }
+    await deliverToSubscription(env, sub, event, lease, targeted);
+  };
+  return fanOutWebhook(env, msg, visit, lease);
+}
+
+/** Shared subscription paging, retry aggregation and continuation enqueue. */
+async function fanOutWebhook(
+  env: Env,
+  msg: DispatchMessage,
+  visit: (sub: Subscription) => Promise<void>,
+  lease?: DurableQueueLeaseContext,
+): Promise<DispatchWebhookResult> {
   // Legacy targeted messages remain bounded to one subscription. Normal fanout
   // keyset-pages every active webhook and never loads/HMACs the whole set.
   let failures: unknown[];
@@ -343,13 +503,15 @@ export async function dispatchWebhook(
 
 /**
  * Deliver one transaction to one subscription, recording the attempt and
- * scheduling a backoff retry on failure (up to MAX_ATTEMPTS).
+ * scheduling a backoff retry on failure (up to MAX_ATTEMPTS). `targeted` marks
+ * a flushParkedDeliveries retry of an existing parked row.
  */
 async function deliverToSubscription(
   env: Env,
   sub: Subscription,
-  tx: Transaction,
+  event: WebhookEvent,
   lease?: DurableQueueLeaseContext,
+  targeted = false,
 ): Promise<void> {
   await lease?.assertOwned();
   // A queued fanout can outlive a subscriber opt-out. Re-check immediately
@@ -369,7 +531,10 @@ async function deliverToSubscription(
   // the owner renews, later transactions flow again (and a re-dispatch of
   // this one can still claim the 'skipped' row).
   if (!(await subscriptionOwnerEntitled(env, sub.clientId))) {
-    await markDeliverySkipped(env, sub.id, tx.id);
+    await markDeliverySkipped(env, sub.id, event.key);
+    // The insert above leaves an existing row alone, so a targeted retry's
+    // parked row would stay parked and be re-released every flush.
+    if (targeted) await markParkedDeliveryTerminal(env, sub.id, event.key, UNDELIVERABLE_REASONS.ownerInactive);
     return;
   }
 
@@ -383,31 +548,21 @@ async function deliverToSubscription(
   if (targetKey) {
     const gate = await checkTargetCircuit(env, targetKey);
     if (!gate.allowed) {
-      await parkDelivery(env, sub.id, tx.id, (gate as any).reason);
+      // Narrowed without a cast: only the not-allowed gate shape has `reason`.
+      await parkDelivery(env, sub.id, event.key, 'reason' in gate ? gate.reason : 'circuit-open');
       return;
     }
   }
 
-  const claim = await claimDelivery(env, sub.id, tx.id);
+  const claim = await claimDelivery(env, sub.id, event.key);
   if (claim.outcome === 'delivered') return;
   if (claim.outcome === 'busy') {
-    throw new DeliveryRetryError(`delivery claim busy for sub=${sub.id} tx=${tx.id}`, claim.delaySeconds);
+    throw new DeliveryRetryError(`delivery claim busy for sub=${sub.id} tx=${event.key}`, claim.delaySeconds);
   }
   const attempt = claim.attempt;
 
   const deliveredAt = new Date().toISOString();
-  // Superset payload: the canonical cross-app contract fields from
-  // createCongressEvent (peers key delivery on `type === 'congress.trade'` +
-  // `data.trades` + `id` for idempotency) plus the legacy `event`/`transaction`
-  // fields, so existing external subscribers keep working while contract-aware
-  // consumers (Socratic Trade) ingest it directly.
-  const payload = {
-    ...createCongressEvent('congress.trade', { trades: [tx] }, { id: `ct-tx-${tx.id}` }),
-    event: 'trade.new' as const,
-    transaction: tx,
-    deliveredAt,
-  };
-  const body = JSON.stringify(payload);
+  const body = JSON.stringify(event.payload(deliveredAt));
   try {
     const targetLengthError = webhookTargetLengthError(sub.targetUrl);
     if (targetLengthError) throw new Error(`unsafe webhook target URL: ${targetLengthError}`);
@@ -427,49 +582,58 @@ async function deliverToSubscription(
     let res: Response | undefined;
     try {
       await lease?.assertOwned();
-      res = await trackedFetch(sub.targetUrl as string, {
-        method: 'POST',
-        redirect: 'manual',
-        signal: lease
-          ? AbortSignal.any([controller.signal, lease.signal])
-          : controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          // Legacy: HMAC over the body alone, so it never expires. Retained
-          // for existing consumers during migration — prefer X-CT-Signature.
-          'X-Signature': `sha256=${signature}`,
-          // v1: HMAC over `${t}.${body}`. Verify this one and reject anything
-          // outside your acceptance window (we suggest
-          // WEBHOOK_SIGNATURE_TOLERANCE_SEC) so a captured request expires.
-          'X-CT-Signature': `t=${signedAtSec},v1=${signatureV1}`,
-          'X-CT-Event': 'transaction.created',
-          'X-Tx-Id': tx.id,
-          'X-Subscription-Id': sub.id,
-          'X-Delivery-Attempt': String(attempt),
-        },
-        body,
-      }, {
-        service: 'webhook-delivery',
-        operation: 'deliver-subscriber-event',
-        dynamicTarget: 'subscriber-webhook',
-      });
-    } catch (err) {
-      if (lease?.signal.aborted) {
-        throw lease.signal.reason ?? new Error('durable queue lease lost');
+      try {
+        res = await trackedFetch(sub.targetUrl as string, {
+          method: 'POST',
+          redirect: 'manual',
+          signal: lease
+            ? AbortSignal.any([controller.signal, lease.signal])
+            : controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            // Legacy: HMAC over the body alone, so it never expires. Retained
+            // for existing consumers during migration — prefer X-CT-Signature.
+            'X-Signature': `sha256=${signature}`,
+            // v1: HMAC over `${t}.${body}`. Verify this one and reject anything
+            // outside your acceptance window (we suggest
+            // WEBHOOK_SIGNATURE_TOLERANCE_SEC) so a captured request expires.
+            'X-CT-Signature': `t=${signedAtSec},v1=${signatureV1}`,
+            'X-CT-Event': event.ctEvent,
+            'X-Tx-Id': event.txId,
+            'X-Subscription-Id': sub.id,
+            'X-Delivery-Attempt': String(attempt),
+          },
+          body,
+        }, {
+          service: 'webhook-delivery',
+          operation: 'deliver-subscriber-event',
+          dynamicTarget: 'subscriber-webhook',
+        });
+      } catch (err) {
+        if (lease?.signal.aborted) {
+          throw lease.signal.reason ?? new Error('durable queue lease lost');
+        }
+        throw new Error(timedOut ? `timeout after ${WEBHOOK_FETCH_TIMEOUT_MS}ms` : ((err as Error).message ?? 'fetch failed'));
       }
-      throw new Error(timedOut ? `timeout after ${WEBHOOK_FETCH_TIMEOUT_MS}ms` : ((err as Error).message ?? 'fetch failed'));
+      if (!res.ok) {
+        await releaseSubscriberWebhookResponseBody(res);
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const consumptionError = await webhookSubscriberConsumptionError(res);
+      if (consumptionError) {
+        throw new Error(consumptionError);
+      }
+      await lease?.assertOwned();
+      await recordDelivery(env, claim.id, claim.token, true, attempt, null);
+      // 2xx auto-closes the target circuit (probe success releases the parked backlog).
+      if (targetKey) await recordTargetSuccess(env, targetKey);
     } finally {
       clearTimeout(timeout);
-      // We only need status/headers. Releasing every response body promptly is
-      // essential under Workers' six-outbound-connection limit, especially
-      // across several bounded fanout chunks.
-      await res?.body?.cancel().catch(() => {});
+      // We only need status/headers unless we read the body above. Releasing every
+      // unread response body promptly is essential under Workers' six-outbound-
+      // connection limit, especially across several bounded fanout chunks.
+      if (res) await releaseSubscriberWebhookResponseBody(res);
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    await lease?.assertOwned();
-    await recordDelivery(env, claim.id, claim.token, true, attempt, null);
-    // 2xx auto-closes the target circuit (probe success releases the parked backlog).
-    if (targetKey) await recordTargetSuccess(env, targetKey);
   } catch (err) {
     if (lease?.signal.aborted) {
       throw lease.signal.reason ?? new Error('durable queue lease lost');
@@ -486,23 +650,27 @@ async function deliverToSubscription(
       );
     }
     if (attempt < MAX_ATTEMPTS) throw new DeliveryRetryError(lastError, backoffSeconds(attempt));
-    console.warn(
-      `dispatchWebhook: giving up on sub=${sub.id} tx=${tx.id} after ${attempt} attempts: ${lastError}`,
-    );
+    sentryLoggerWarn('webhook-retry', {
+      reason: 'terminal',
+      attempts: attempt,
+    });
     // This is an application-level terminal attempt. Return successfully so
     // Cloudflare does not retry the same attempt another max_retries times.
     // The failed deliveries row is the durable terminal record.
-    await alertTerminalDelivery(env, sub.id, tx.id, attempt, lastError);
+    await alertTerminalDelivery(env, sub.id, event.key, attempt, lastError);
     return;
   }
 
   // Advance the subscription cursor after the durable delivered marker. A
-  // cursor write failure must not cause a duplicate POST.
+  // cursor write failure must not cause a duplicate POST.  Retractions have
+  // their own cursor and never move this one.
+  if (event.cursorSeq === null) return;
+  const cursorSeq = event.cursorSeq;
   await run(
     env.DB,
     'UPDATE subscriptions SET cursor = ? WHERE id = ? AND cursor < ?',
-    [tx.cursorSeq, sub.id, tx.cursorSeq],
-  ).catch((err) => console.warn('dispatchWebhook: cursor update failed', sub.id, (err as Error).message));
+    [cursorSeq, sub.id, cursorSeq],
+  ).catch((err) => console.warn('dispatchWebhook: cursor update failed', (err as Error).message));
 }
 
 type DeliveryClaim =
@@ -524,7 +692,7 @@ async function markDeliverySkipped(env: Env, subscriptionId: string, txId: strin
      ON CONFLICT (subscription_id, tx_id) DO NOTHING`,
     [prefixedId('dlv'), subscriptionId, txId, new Date().toISOString()],
   ).catch((err) =>
-    console.warn('markDeliverySkipped failed', subscriptionId, txId, (err as Error).message),
+    console.warn('markDeliverySkipped failed', (err as Error).message),
   );
 }
 

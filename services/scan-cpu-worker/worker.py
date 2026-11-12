@@ -17,10 +17,12 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from pipeline import extract_pdf
+from infisical_config import resolve_admin_token
+from pipeline import extract_pdf, extract_pdf_detailed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,12 +31,30 @@ logging.basicConfig(
 logger = logging.getLogger("scan-cpu-worker")
 
 API_BASE_URL = os.getenv("CONGRESS_TRADE_API_URL", "http://localhost:8787").rstrip("/")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ADMIN_TOKEN = ""
 WORKER_ID = os.getenv("WORKER_ID", "server_cpu_1")
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "30"))
+STORE_AUTH_BACKOFF_SEC = int(os.getenv("STORE_AUTH_BACKOFF_SEC", "300"))
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "60"))
 OCR_BACKEND = os.getenv("OCR_BACKEND", "tesseract")
 EXTRACTOR = os.getenv("EXTRACTOR", "server_cpu_v1")
+
+
+class StoredCopyAuthError(RuntimeError):
+    """Object store rejected credentials. Stop the pending batch."""
+
+
+def init_admin_token() -> None:
+    """Load ADMIN_TOKEN from env or Infisical; refuse to run without it."""
+    global ADMIN_TOKEN
+    try:
+        ADMIN_TOKEN = resolve_admin_token()
+    except Exception as e:
+        logger.error("FATAL: cannot resolve ADMIN_TOKEN: %s", e)
+        raise SystemExit(1) from e
+    if not ADMIN_TOKEN:
+        logger.error("FATAL: ADMIN_TOKEN is empty after resolution")
+        raise SystemExit(1)
 
 
 def send_request(
@@ -90,16 +110,44 @@ def get_pending_scanned_filings() -> List[Dict[str, Any]]:
     return []
 
 
-def download_pdf(url: str, dest: str) -> bool:
+def stored_document_url(filing: Dict[str, Any]) -> Optional[str]:
+    """Admin URL for durable R2 bytes. Never uses source_url / primary gov hosts."""
+    explicit = filing.get("stored_document_url") or filing.get("storedDocumentUrl")
+    if isinstance(explicit, str) and explicit.strip():
+        path = explicit.strip()
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        return f"{API_BASE_URL}{path if path.startswith('/') else '/' + path}"
+    doc_id = filing.get("doc_id")
+    if not doc_id or not filing.get("raw_object_key"):
+        return None
+    return f"{API_BASE_URL}/api/admin/filings/{urllib.parse.quote(str(doc_id), safe='')}/raw"
+
+
+def download_stored_document(filing: Dict[str, Any], dest: str) -> bool:
+    url = stored_document_url(filing)
+    if not url:
+        logger.warning(
+            "no stored copy for %s — refusing source re-download",
+            filing.get("doc_id"),
+        )
+        return False
     try:
         req = urllib.request.Request(url)
         if ADMIN_TOKEN:
             req.add_header("Authorization", f"Bearer {ADMIN_TOKEN}")
+        req.add_header("User-Agent", "congress-scan-cpu-worker/stored-raw")
         with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
             f.write(resp.read())
         return os.path.getsize(dest) > 100
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:200]
+        logger.warning("stored download failed %s: HTTP %s %s", url, e.code, body)
+        if e.code in (401, 403, 500, 503) and "unauthor" in body.lower():
+            raise StoredCopyAuthError(f"HTTP {e.code}")
+        return False
     except Exception as e:
-        logger.warning("PDF download failed %s: %s", url, e)
+        logger.warning("stored download failed %s: %s", url, e)
         return False
 
 
@@ -107,18 +155,19 @@ def process_filing(filing: Dict[str, Any]) -> bool:
     doc_id = filing.get("doc_id")
     if not doc_id:
         return False
-    logger.info("Processing %s …", doc_id)
+    logger.info("Processing %s (via=stored-raw) …", doc_id)
     pdf_path = f"/tmp/{doc_id}.pdf"
-    source_url = filing.get("source_url") or ""
-    ok_dl = False
-    if source_url:
-        ok_dl = download_pdf(source_url, pdf_path)
+    ok_dl = download_stored_document(filing, pdf_path)
     if not ok_dl or not os.path.exists(pdf_path):
-        logger.error("No PDF for %s", doc_id)
+        logger.error("No stored PDF for %s", doc_id)
         return False
 
+    extractor = EXTRACTOR
     try:
-        transactions = extract_pdf(pdf_path, ocr_backend=OCR_BACKEND)
+        detailed = extract_pdf_detailed(pdf_path, ocr_backend=OCR_BACKEND)
+        transactions = detailed.rows
+        if detailed.grid_pages:
+            extractor = detailed.extractor
     except Exception as e:
         logger.exception("extract_pdf failed for %s: %s", doc_id, e)
         transactions = []
@@ -133,7 +182,7 @@ def process_filing(filing: Dict[str, Any]) -> bool:
         "docId": doc_id,
         "transactions": transactions,
         "workerId": WORKER_ID,
-        "extractor": EXTRACTOR,
+        "extractor": extractor,
         "source": "server_cpu",
     }
     res = send_request(url, method="POST", payload=payload, timeout=120)
@@ -164,6 +213,14 @@ def run_loop() -> None:
                 logger.info("Pending scanned filings: %d", len(filings))
                 for f in filings:
                     process_filing(f)
+        except StoredCopyAuthError as e:
+            logger.error(
+                "stored-raw auth failed (%s); backing off %ss instead of spinning the backlog",
+                e,
+                STORE_AUTH_BACKOFF_SEC,
+            )
+            time.sleep(STORE_AUTH_BACKOFF_SEC)
+            continue
         except Exception as e:
             logger.exception("Poll loop error: %s", e)
         time.sleep(POLL_INTERVAL_SEC)
@@ -184,6 +241,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             with open(args.json_out, "w") as f:
                 json.dump(txs, f, indent=2)
         return 0
+
+    init_admin_token()
 
     if args.once:
         send_heartbeat()

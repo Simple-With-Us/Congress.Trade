@@ -146,6 +146,28 @@ describe('computeConsensusAgreement', () => {
     expect(agree.get('openai:o')).toBeCloseTo(1.0); // (1 + 1) / 2
     expect(agree.get('anthropic:a')).toBeCloseTo(0.75); // (1 + 0.5) / 2
   });
+
+  it('treats a stored 3-part key as the same single lot as an owner-qualified key', () => {
+    const results = [
+      r('gemini', 'g', 'doc1', ['AAPL|2026-07-14|B']),
+      r('openai', 'o', 'doc1', ['AAPL|2026-07-14|B|SELF']),
+    ];
+    const agree = computeConsensusAgreement(results);
+    expect(agree.get('gemini:g')).toBeCloseTo(1);
+    expect(agree.get('openai:o')).toBeCloseTo(1);
+  });
+
+  it('does not merge different owners into one stored key', () => {
+    const results = [
+      r('gemini', 'g', 'doc1', ['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|DEPENDENT']),
+      r('openai', 'o', 'doc1', ['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|DEPENDENT']),
+      r('anthropic', 'a', 'doc1', ['COO|2026-09-11|B']),
+    ];
+    const agree = computeConsensusAgreement(results);
+    expect(agree.get('gemini:g')).toBeCloseTo(1);
+    expect(agree.get('openai:o')).toBeCloseTo(1);
+    expect(agree.get('anthropic:a')).toBeCloseTo(0);
+  });
 });
 
 describe('summarizeModels', () => {
@@ -586,16 +608,17 @@ describe('runCandidateOnDoc (openai): token usage capture', () => {
       'openai/gpt-5.6-luna',
       'anthropic/claude-sonnet-5',
       'anthropic/claude-haiku-4.5',
-      'anthropic/claude-opus-4.8',
-      'x-ai/grok-4.5',
+      'anthropic/claude-opus-5',
+      'x-ai/grok-4.6',
       'deepseek/deepseek-v4-pro',
       'deepseek/deepseek-v4-flash',
       'qwen/qwen3-vl-30b-a3b-instruct',
       'qwen/qwen3-vl-8b-instruct',
-      'google/gemini-2.5-flash-lite',
+      'google/gemini-3.5-flash-lite',
       'amazon/nova-lite-v1',
       'z-ai/glm-4.6v',
-      'google/gemini-3.5-flash',
+      'google/gemini-3.8-flash',
+      '~google/gemini-flash-latest',
       'qwen/qwen-2.5-72b-instruct',
     ]);
 
@@ -672,6 +695,8 @@ describe('runCandidateOnDoc (openai): token usage capture', () => {
       .toEqual({ provider: 'openrouter', model: 'openai/gpt-5.6-terra' });
     expect(upgradeRetiredDisclosureCandidate({ provider: 'openrouter', model: 'z-ai/glm-4.6v' }))
       .toEqual({ provider: 'openrouter', model: 'z-ai/glm-4.6v' });
+    expect(upgradeRetiredDisclosureCandidate({ provider: 'openrouter', model: '~google/gemini-flash-latest' }))
+      .toEqual({ provider: 'openrouter', model: '~google/gemini-flash-latest' });
   });
 
   it('blocks a low-level GPT-4o invocation before resolving a key or calling a provider', async () => {
@@ -966,7 +991,7 @@ describe('runCandidateOnDoc extraction cache', () => {
       cached: true,
       latencyMs: 0,
       rowCount: 1,
-      rowKeys: ['AAPL|2026-07-14|B'],
+      rowKeys: ['AAPL|2026-07-14|B|SELF'],
       avgConfidence: 0.9,
       rows: [cachedRow],
     });

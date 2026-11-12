@@ -4,14 +4,16 @@
  * Pure, I/O-free consensus voting over the SAME document read by several
  * extraction models. Given each model's ParsedTx[] (the row shape produced by
  * the bake-off's runCandidateOnDoc), this module aligns rows across models on
- * the shared stable row key (ticker|date|type — {@link arbitrationRowKey}) and
+ * the canonical arbitration key ({@link canonicalArbitrationKeys}) and
  * occurrence within that key, then votes every material field to a majority
  * value so a reviewer sees exactly where the models agree and diverge.
  *
  * Voting contract:
- *   - Rows are matched across models by arbitrationRowKey + occurrence. Duplicate
- *     lots are never collapsed: two disclosure rows with the same ticker/date/type
- *     remain two independently reviewable rows.
+ *   - Rows are matched across models by the canonical arbitration key + occurrence.
+ *     Owner is part of that key when any model disclosed more than one lot for
+ *     the same ticker/date/type, so different owners stay distinct. A single lot
+ *     keeps the historical ticker|date|type key so a missing or disagreeing
+ *     owner still lines up. Duplicate lots are never collapsed.
  *   - Each material field is voted independently; AMOUNT is voted as the
  *     (amountMin, amountMax) BRACKET PAIR so a min from one model is never mixed
  *     with a max from another.
@@ -26,7 +28,8 @@
  */
 
 import type { ParsedTx } from '../shared/types.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { canonicalArbitrationKeys } from '../extractors/types.ts';
+import { prepareExtractedRows } from './prepareTx.ts';
 
 /** One model's reading of the document. */
 export interface ConsensusRun {
@@ -92,7 +95,9 @@ export type RowConsensus = 'unanimous' | 'majority' | 'contested';
 export interface ConsensusRow {
   /** Unique display key. Duplicate lots use `${baseRowKey}#N`. */
   rowKey: string;
-  /** ticker-or-name|date|type key shared by every occurrence of this lot. */
+  /** Lot key shared by every occurrence. Owner is included when the filing has
+   *  more than one lot for that ticker|date|type; a single lot keeps the
+   *  historical ticker|date|type key. */
   baseRowKey: string;
   /** One-based occurrence within baseRowKey, preserving source row order. */
   occurrence: number;
@@ -200,15 +205,15 @@ function byModel(a: { model: string }, b: { model: string }): number {
   return a.model < b.model ? -1 : a.model > b.model ? 1 : 0;
 }
 
-/** Preserve every lot while grouping each model's rows by arbitration key. */
-function groupRunRows(rows: ParsedTx[]): Map<string, ParsedTx[]> {
+/** Preserve source order while grouping one model's rows by a precomputed key. */
+function groupRunRows(rows: ParsedTx[], keys: readonly string[]): Map<string, ParsedTx[]> {
   const byKey = new Map<string, ParsedTx[]>();
-  for (const tx of rows) {
-    const key = arbitrationRowKey(tx);
+  rows.forEach((tx, index) => {
+    const key = keys[index];
     const group = byKey.get(key) ?? [];
     group.push(tx);
     byKey.set(key, group);
-  }
+  });
   return byKey;
 }
 
@@ -232,18 +237,50 @@ function voteField(
     }
     bloc.models.push(model);
   }
+  
+  const isPlaceholderKey = (k: string) =>
+    field === 'amount' && (!k || k === '|' || k === 'N/A' || k === '-' || k === 'UNKNOWN');
+  let hasValid = false;
+  let invalidVotes = 0;
+  for (const [key, bloc] of blocs.entries()) {
+    if (!isPlaceholderKey(key)) {
+      hasValid = true;
+    } else {
+      invalidVotes += bloc.models.length;
+    }
+  }
 
   // Largest bloc, ties broken by sorted vote key for determinism.
   let top: { rawValue: FieldValue; models: string[] } | null = null;
-  for (const [, bloc] of [...blocs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+  let secondVotes = 0;
+  
+  const sortedBlocs = [...blocs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (const [key, bloc] of sortedBlocs) {
+    if (hasValid && isPlaceholderKey(key)) continue; // exclude from winning
+    
     if (!top || bloc.models.length > top.models.length) {
+      secondVotes = top ? top.models.length : 0;
       top = { rawValue: bloc.rawValue, models: bloc.models };
+    } else if (bloc.models.length > secondVotes) {
+      secondVotes = bloc.models.length;
     }
   }
+  
   const topVotes = top ? top.models.length : 0;
-  const hasMajority = topVotes * 2 > total;
+  const effectiveTotal = hasValid ? total - invalidVotes : total;
+  
+  const hasMajority = topVotes * 2 > effectiveTotal;
+  const uniquePlurality = topVotes >= 2 && topVotes > secondVotes;
+  const allowPlurality =
+    field === 'assetName'
+    || field === 'assetType'
+    || field === 'assetTypeName'
+    || field === 'subholding'
+    || field === 'location'
+    || field === 'description'
+    || field === 'supplementalText';
 
-  if (hasMajority && top) {
+  if ((hasMajority || (allowPlurality && uniquePlurality)) && top) {
     const winners = new Set(top.models);
     const dissenters = present
       .filter((p) => !winners.has(p.model))
@@ -252,7 +289,7 @@ function voteField(
     return {
       value: top.rawValue,
       votes: topVotes,
-      total,
+      total: effectiveTotal,
       dissenters,
       unanimous: topVotes === total,
     };
@@ -262,13 +299,43 @@ function voteField(
   const dissenters = present
     .map((p) => ({ model: p.model, value: rawFieldValue(p.tx, field) }))
     .sort(byModel);
-  return { value: null, votes: topVotes, total, dissenters, unanimous: false };
+  return { value: null, votes: topVotes, total: effectiveTotal, dissenters, unanimous: false };
 }
 
 /**
  * Build the reconciled consensus rows + summary from each model's reading of a
  * single document. Pure — no I/O.
  */
+const IDENTITY_FIELDS: ConsensusFieldName[] = [
+  'txType',
+  'transactionDate',
+  'owner',
+  'ticker',
+  'isOption',
+  'capGainsOver200',
+  'filingStatus',
+  'amount',
+];
+
+function fieldAuthoritative(field: ConsensusFieldName, fc: FieldConsensus): boolean {
+  if (fc.total <= 0) return false;
+  if (fc.votes * 2 > fc.total) return true;
+  if (field === 'assetName' || field === 'assetType') {
+    return fc.value != null && fc.votes >= 2;
+  }
+  // Soft footnotes never veto a row that already has identity agreement.
+  if (
+    field === 'assetTypeName'
+    || field === 'subholding'
+    || field === 'location'
+    || field === 'description'
+    || field === 'supplementalText'
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function buildConsensusRows(runs: ConsensusRun[]): ConsensusResult {
   // Collapse duplicate model ids to a DISTINCT electorate. Two runs sharing a
   // model id (e.g. a misconfigured lineup naming the same provider:model twice)
@@ -277,13 +344,22 @@ export function buildConsensusRows(runs: ConsensusRun[]): ConsensusResult {
   // `totalRuns`, so both must be the distinct-model count. When ids collide the
   // last run's rows win (perModel is keyed by id); the earlier duplicate read is
   // dropped rather than corroborating itself.
-  const models = [...new Set(runs.map((r) => r.model))];
+  const preparedRuns = runs.map((r) => ({ ...r, rows: prepareExtractedRows(r.rows) }));
+  const models = [...new Set(preparedRuns.map((r) => r.model))];
   const totalRuns = models.length;
 
   // Per model: base row key -> every source-order occurrence. A later run with
   // the same model id replaces the earlier run, but occurrences within it stay.
+  // Canonical keys are computed on the surviving read only, so a dropped
+  // duplicate model id cannot flip a single lot into owner-split mode.
+  const rowsByModel = new Map<string, ParsedTx[]>();
+  for (const run of preparedRuns) rowsByModel.set(run.model, run.rows);
+  const rowLists = models.map((model) => rowsByModel.get(model) ?? []);
+  const canonical = canonicalArbitrationKeys(rowLists);
   const perModel = new Map<string, Map<string, ParsedTx[]>>();
-  for (const run of runs) perModel.set(run.model, groupRunRows(run.rows));
+  models.forEach((model, index) => {
+    perModel.set(model, groupRunRows(rowLists[index], canonical[index]));
+  });
 
   // Every row key seen by any model.
   const allKeys = new Set<string>();
@@ -341,9 +417,10 @@ export function buildConsensusRows(runs: ConsensusRun[]): ConsensusResult {
       // fail closed for automatic editor substitution.
       const ambiguousDuplicate = occurrenceCount > 1;
       const allUnanimous = FIELD_NAMES.every((f) => fields[f].unanimous);
-      // votes*2 > total is the strict-majority test; independent of the value
-      // being null (a unanimous "no ticker" reading still has a majority).
-      const allHaveMajority = FIELD_NAMES.every((f) => fields[f].votes * 2 > fields[f].total);
+      const identityOk = IDENTITY_FIELDS.every((f) => fields[f].votes * 2 > fields[f].total);
+      const nameOk = fieldAuthoritative('assetName', fields.assetName)
+        && fieldAuthoritative('assetType', fields.assetType);
+      const allHaveMajority = identityOk && nameOk;
 
       let rowConsensus: RowConsensus;
       if (!majorityPresence || ambiguousDuplicate) {

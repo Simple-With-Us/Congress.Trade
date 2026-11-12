@@ -53,14 +53,13 @@ export function isPremiumUser(user: User | null | undefined): boolean {
 /**
  * Full entitlement resolution: Stripe-derived (pure, sync `entitlementOf`
  * above — untouched) OR'd with the Apple IAP ledger (`apple_subscriptions`,
- * migration 0081). Two independent Apple pathways both feed into "premium":
- * the legacy POST /billing/apple/confirm route writes Apple state directly
- * onto the same Stripe-shaped `users` columns `entitlementOf` already reads
- * (so it's covered without any change here), while the current
- * `redeem_apple_purchase` command + App Store Server Notifications webhook
- * write to the `apple_subscriptions` ledger this function additionally
- * checks. Never mutates or restructures the Stripe subscription-resolution
- * code path itself — this only adds a second, independent OR term.
+ * migration 0081). Every live Apple grant path (redeem_apple_purchase,
+ * anonymous redeem, legacy POST /billing/apple/confirm, and the App Store
+ * Server Notifications webhook) writes that ledger. confirm used to stamp
+ * Stripe-shaped users columns instead; it no longer does, because those
+ * columns are invisible to REFUND/REVOKE. Never mutates or restructures the
+ * Stripe subscription-resolution code path itself — this only adds a second,
+ * independent OR term.
  */
 export async function resolveEntitlementAsync(env: Env, user: User | null | undefined): Promise<Entitlement> {
   const stripeEntitlement = entitlementOf(user);

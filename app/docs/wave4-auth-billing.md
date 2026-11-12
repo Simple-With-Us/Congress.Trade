@@ -12,24 +12,21 @@ is already merged and **degrades gracefully** until these are configured:
 
 So you can deploy now and flip each piece on as you create the accounts.
 
-Set `APP_BASE_URL` first — it's the public origin used to build every OAuth
-redirect and magic link (e.g. `https://congress.trade`). If unset we fall back to
-the request origin, which is fine for a single domain but explicit is safer.
-
-```bash
-cd app
-npx wrangler secret put APP_BASE_URL   # e.g. https://congress.trade
-```
+Set `APP_BASE_URL=https://congress.trade` in Infisical (congress-trade `prod`)
+first — it is the public origin used to build every OAuth redirect and magic
+link.  If unset we fall back to the request origin, which is fine for a single
+domain but explicit is safer.  Do not `wrangler secret put` — production is
+Coolify, not a Worker.
 
 ---
 
 ## 1. Stripe (freemium paywall)
 
-**Pricing (decided 2026-08-05):** 1-month free trial → **$5/mo** or **$50/yr**.
+**Pricing (current, verified 2026-10-09):** 1-week free trial → **$8.99/mo** or **$79.99/yr**.  Stripe checkout uses `STRIPE_TRIAL_DAYS` (default **7** when unset in `billing/routes.ts`).  App Store Connect intro offer must match **ONE_WEEK** on both `trade.congress.premium.monthly` and `.annual`.  In-app / store / web copy must quote 1 week, never 2 weeks or 1 month.
 
 1. **Create the product + prices** (Stripe Dashboard → Products, in *live* mode):
    - Product: "Congress.Trade Premium".
-   - Add two **recurring** prices: `$5 / month` and `$50 / year`. Copy each
+   - Add two **recurring** prices: `$8.99 / month` and `$79.99 / year`. Copy each
      `price_…` id.
 2. **Enable the Billing Portal**: Dashboard → Settings → Billing → Customer portal
    → activate (allow cancel + payment-method updates). This backs the
@@ -39,20 +36,13 @@ npx wrangler secret put APP_BASE_URL   # e.g. https://congress.trade
    - Events: `checkout.session.completed`, `customer.subscription.created`,
      `customer.subscription.updated`, `customer.subscription.deleted`
    - Copy the **Signing secret** (`whsec_…`).
-4. **Set the secrets/vars:**
-
-```bash
-npx wrangler secret put STRIPE_SECRET_KEY        # sk_live_…
-npx wrangler secret put STRIPE_WEBHOOK_SECRET    # whsec_…
-npx wrangler secret put STRIPE_PRICE_MONTHLY     # price_… ($5/mo)
-npx wrangler secret put STRIPE_PRICE_ANNUAL      # price_… ($50/yr)
-# optional — defaults to 7 if unset; can also live in wrangler.toml [vars]
-npx wrangler secret put STRIPE_TRIAL_DAYS        # 30
-```
+4. **Set the secrets/vars in Infisical** (`STRIPE_SECRET_KEY`,
+   `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_ANNUAL`,
+   `STRIPE_TRIAL_DAYS=7`).  Do not `wrangler secret put`.
 
 **Test before live:** do all of the above in Stripe *test* mode with `sk_test_…`
-keys and the test webhook secret; use card `4242 4242 4242 4242`. The trial means
-no charge for 30 days (1 month), so confirm the flow end-to-end first.
+keys and the test webhook secret; use card `4242 4242 4242 4242`.  The trial means
+no charge for 7 days (1 week), so confirm the flow end-to-end first.
 
 How it reconciles: checkout creates the customer up-front and stores the
 `customer ↔ user` link; the `customer.subscription.*` webhooks are the source of
@@ -70,13 +60,8 @@ Google Cloud Console → APIs & Services:
 2. **Credentials → Create OAuth client ID → Web application**:
    - Authorized JavaScript origin: `https://<APP_BASE_URL>`
    - Authorized redirect URI: `https://<APP_BASE_URL>/auth/google/callback`
-   - (add `http://localhost:8787/...` variants for local `wrangler dev`)
-3. Set the secrets:
-
-```bash
-npx wrangler secret put GOOGLE_OAUTH_CLIENT_ID       # …apps.googleusercontent.com
-npx wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET   # GOCSPX-…
-```
+   - (add `http://localhost:8787/...` variants for local Deno `npm run dev`)
+3. Set `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in Infisical.
 
 ---
 
@@ -84,12 +69,8 @@ npx wrangler secret put GOOGLE_OAUTH_CLIENT_SECRET   # GOCSPX-…
 
 1. Resend → add + **verify your sending domain** (DNS records).
 2. Create an API key.
-3. Set:
-
-```bash
-npx wrangler secret put RESEND_API_KEY   # re_…
-npx wrangler secret put EMAIL_FROM        # "Congress.Trade <login@congress.trade>"
-```
+3. Set `RESEND_API_KEY` and `EMAIL_FROM` in Infisical
+   (`Congress.Trade <login@congress.trade>`).
 
 `EMAIL_FROM` must be a verified sender on that domain. Until set, magic-link
 requests no-op gracefully and the UI nudges users to Google sign-in.
@@ -103,11 +84,9 @@ which returns `401/403` on the public site (the dashboard shows
 "Admin tools have moved to admin.congress.trade"). Gate that subdomain with
 Cloudflare Access + Google so admin is one-click SSO, **not** OTP-every-24h.
 
-1. **Route the subdomain to the Worker**: add to `wrangler.toml` `routes` and
-   redeploy (the zone is already on the account):
-   ```toml
-   { pattern = "admin.congress.trade", custom_domain = true }
-   ```
+1. **Point the subdomain at the Coolify app**: `admin.congress.trade` is
+   Cloudflare DNS/edge in front of the same `congress-app` container as
+   `congress.trade`.  Do not add a Worker `wrangler.toml` route.
 2. **Zero Trust → Access → Applications → Add → Self-hosted**:
    - Application domain: `admin.congress.trade`
    - **Session Duration: 1 month** (this is the knob that removes the
@@ -129,9 +108,9 @@ npm run typecheck && npm run test
 ADMIN_TOKEN=... bash scripts/ship.sh
 ```
 
-`ship.sh` deploys the Worker and applies the idempotent `POST /api/admin/migrate`
-path through the Worker binding. Do not use remote Wrangler D1 migrations on this
-account.
+`ship.sh` waits for the Coolify revision on `https://congress.trade`, then
+applies the idempotent `POST /api/admin/migrate` path against the host SQLite
+file.  Do not use remote Wrangler D1 migrations on this account.
 
 Smoke test:
 - `GET /auth/me` → `{ "user": null, "entitlement": { "premium": false, … } }`

@@ -3,6 +3,13 @@ import type { Env } from '../../shared/types.ts';
 import type { BakeoffCandidate } from '../bakeoff.ts';
 import {
   classifyProviderErrorClass,
+  describeAutopilotHaltReason,
+  isFalseSourceAuthError,
+  isFalseSourceAuthHalt,
+  isTransientFilesPrepaidError,
+  isTransientFilesPrepaidHalt,
+  isTransientInfrastructureHalt,
+  summarizeProviderHaltCause,
   healthWindowKey,
   modelBanKey,
   pruneHealthWindow,
@@ -31,18 +38,97 @@ describe('classifyProviderErrorClass', () => {
     expect(classifyProviderErrorClass('anthropic 401 unauthorized')).toBe('auth');
     expect(classifyProviderErrorClass('invalid_api_key')).toBe('auth');
     expect(classifyProviderErrorClass('openrouter API key not configured')).toBe('auth');
+    expect(classifyProviderErrorClass(
+      'openRouterVision: OpenRouter API 401 Unauthorized {"error":{"message":"User not found.","code":401}}',
+    )).toBe('auth');
+    expect(classifyProviderErrorClass(
+      'openRouterText: OpenRouter API 401 Unauthorized',
+    )).toBe('other');
+    expect(classifyProviderErrorClass(
+      'openRouterText: OpenRouter API 401 Unauthorized {"error":{"message":"Unauthorized","code":401}}',
+    )).toBe('other');
+    expect(classifyProviderErrorClass(
+      'openRouterReply:unauth_reply: 401 Unauthorized',
+    )).toBe('other');
+    expect(classifyProviderErrorClass(
+      'openRouterVision: could not parse model JSON: Unexpected token <',
+    )).toBe('other');
   });
 
-  it('classifies quota failures (429 / rate limit)', () => {
-    expect(classifyProviderErrorClass('gemini 429 too many requests')).toBe('quota');
-    expect(classifyProviderErrorClass('provider rate-limit hit, slow down')).toBe('quota');
+  it('does not treat source-fetch or admin Unauthorized as a dead LLM key', () => {
+    expect(classifyProviderErrorClass('Unauthorized')).toBe('other');
+    expect(classifyProviderErrorClass('fetcher: Unauthorized')).toBe('other');
+    expect(classifyProviderErrorClass('Unauthorized — paste your admin token in the Admin tab access box.')).toBe('other');
+    expect(classifyProviderErrorClass('house live search -> HTTP 401')).toBe('other');
+    expect(classifyProviderErrorClass('admin 401 unauthorized')).toBe('other');
+    expect(classifyProviderErrorClass('filing.extracted HTTP 401')).toBe('other');
+    expect(isFalseSourceAuthError('Unauthorized')).toBe(true);
+    expect(isFalseSourceAuthError('fetcher: Unauthorized')).toBe(true);
+    expect(isFalseSourceAuthError('invalid_api_key')).toBe(false);
+    expect(isFalseSourceAuthHalt('error_class:auth', { auth: 'Unauthorized' })).toBe(true);
+    expect(isFalseSourceAuthHalt('error_class:auth', { auth: 'invalid_api_key' })).toBe(false);
+    expect(isFalseSourceAuthHalt('error_class:auth', {
+      auth: 'openRouterVision: OpenRouter API 401 Unauthorized {"error":{"message":"User not found.","code":401}}',
+    })).toBe(false);
+    expect(summarizeProviderHaltCause('Unauthorized')).toContain('source-fetch or admin unauthorized');
+  });
+
+  it('classifies rate-limit as rate_limit, not quota', () => {
+    expect(classifyProviderErrorClass('gemini 429 too many requests')).toBe('rate_limit');
+    expect(classifyProviderErrorClass('provider rate-limit hit, slow down')).toBe('rate_limit');
+  });
+
+  it('does not treat stale circuit wrappers or transient 403 as quota', () => {
+    expect(classifyProviderErrorClass(
+      'openrouter key budget circuit open: cool-down 3067s (last: HTTP 402 {"error":{"message":"This request requires at least $0.50 in balance for files","code":402}})',
+    )).toBe('billing');
+    expect(classifyProviderErrorClass('openrouter key budget circuit open: cool-down 3600s')).toBe('other');
+    expect(classifyProviderErrorClass('senate GET /search/ -> HTTP 403')).toBe('other');
+    expect(classifyProviderErrorClass('openrouter 403 forbidden')).toBe('other');
+    expect(classifyProviderErrorClass('llm skip: doc already has transactions (H-2024-1)')).toBe('other');
+  });
+
+  it('keeps real app-budget and usage-limit failures as quota', () => {
+    expect(classifyProviderErrorClass('llm daily usd budget exceeded')).toBe('quota');
+    expect(classifyProviderErrorClass('account usage limit reached')).toBe('quota');
+  });
+
+  it('describes a stored quota halt from the 402 files-balance sample', () => {
+    const sample = {
+      quota: 'openrouter key budget circuit open: cool-down 3067s (last: HTTP 402 {"error":{"message":"This request requires at least $0.50 in balance for files","code":402}})',
+    };
+    expect(describeAutopilotHaltReason('error_class:quota', sample)).toContain('error_class:billing');
+    expect(describeAutopilotHaltReason('error_class:quota', sample)).toContain('stored as quota');
+    expect(describeAutopilotHaltReason('error_class:quota', sample)).toContain('files-endpoint prepaid');
+    expect(summarizeProviderHaltCause(sample.quota)).toContain('files-endpoint prepaid');
+    expect(isTransientFilesPrepaidError(sample.quota)).toBe(true);
+    expect(isTransientFilesPrepaidHalt('error_class:quota', sample)).toBe(true);
+    expect(isTransientFilesPrepaidHalt('error_class:auth', { auth: 'invalid_api_key' })).toBe(false);
+    expect(isTransientFilesPrepaidError('openrouter key budget circuit open: cool-down 3600s')).toBe(false);
+    expect(isTransientFilesPrepaidError('Your prepayment credits are depleted')).toBe(false);
   });
 
   it('classifies timeouts and parse failures', () => {
     expect(classifyProviderErrorClass('request timed out after 120000ms')).toBe('timeout');
     expect(classifyProviderErrorClass('The operation was aborted')).toBe('timeout');
+    expect(classifyProviderErrorClass('SQLITE_BUSY: database is locked')).toBe('other');
+    expect(classifyProviderErrorClass('Deno cron tick exceeded 45000ms deadline')).toBe('other');
+    expect(classifyProviderErrorClass('scheduled tick aborted')).toBe('other');
     expect(classifyProviderErrorClass('could not parse model JSON: unexpected token')).toBe('parse');
     expect(classifyProviderErrorClass('openai: empty completion')).toBe('parse');
+  });
+
+  it('auto-resumes only infrastructure halts, not a real provider timeout', () => {
+    expect(isTransientInfrastructureHalt('error_class:timeout', {
+      lock: 'SQLITE_BUSY: database is locked',
+    })).toBe(true);
+    expect(isTransientInfrastructureHalt('error_class:timeout', {
+      provider: 'request timed out after 120000ms',
+    })).toBe(false);
+    expect(isTransientInfrastructureHalt('error_class:timeout', {
+      lock: 'SQLITE_BUSY: database is locked',
+      provider: 'request timed out after 120000ms',
+    })).toBe(false);
   });
 
   it('returns other for unknown failures and null for no error', () => {

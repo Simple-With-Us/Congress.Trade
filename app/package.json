@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "main": "src/deno/main.ts",
-  "description": "Cloudflare Workers service ingesting US congressional STOCK Act stock-trade disclosures (House + Senate) and pushing structured trade events to clients.",
+  "description": "Congress.Trade app: public STOCK Act disclosures (House, Senate, Executive) served from Coolify Deno-in-Docker at congress.trade.",
   "scripts": {
     "start": "deno run --allow-net --allow-env --allow-read src/deno/main.ts",
     "deploy": "echo 'Production deployment is handled by Coolify on push to main'",
@@ -12,44 +12,50 @@
     "test": "vitest run",
     "coverage": "vitest run --coverage",
     "lint": "deno lint",
-    "migrate": "npx wrangler d1 migrations apply DB --local",
     "deploy:full": "bash scripts/ship.sh",
     "preview:provision": "bash scripts/provision-preview.sh",
     "preview:deploy": "bash scripts/deploy-preview.sh",
-    "sentry:sourcemaps": "_SENTRY_RELEASE=$(sentry-cli releases propose-version) && sentry-cli releases new $_SENTRY_RELEASE --org=jays-services --project=congress-trade && sentry-cli sourcemaps upload --org=jays-services --project=congress-trade --release=$_SENTRY_RELEASE --strip-prefix 'dist/..' dist",
-    "postdeploy": "if [ -n \"$SENTRY_AUTH_TOKEN\" ]; then npm run sentry:sourcemaps || echo '::warning::sentry sourcemaps upload failed (non-fatal); the Worker deploy already succeeded'; else echo '::warning::SENTRY_AUTH_TOKEN not set; skipping sentry sourcemaps upload'; fi"
+    "sentry:sourcemaps": "node ../scripts/sentry-upload-browser-sourcemaps.mjs",
+    "build:client": "deno run -A scripts/build-dashboard-client.ts",
+    "check:client": "deno run -A scripts/build-dashboard-client.ts --check",
+    "lint:client": "eslint src/ui/client/dashboard.js"
   },
   "imports": {
     "#sentry": {
-      "deno": "./src/deno/sentryDummy.ts",
-      "default": "./src/deno/sentryDummy.ts"
+      "deno": "./src/deno/sentry.ts",
+      "default": "./src/deno/sentry.ts"
     }
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.1102.0",
-    "@google/genai": "^2.15.0",
-    "@libsql/client": "^0.17.4",
-    "cheerio": "^1.2.0",
+    "@aws-sdk/client-s3": "3.1164.0",
+    "@google/genai": "^3.0.0",
+    "@libsql/client": "^0.18.0",
+    "@sentry/deno": "^11.4.0",
     "fflate": "^0.8.3",
-    "hono": "^4.13.0",
+    "hono": "^4.13.13",
     "jsonrepair": "^3.15.0",
-    "node-html-parser": "^9.0.1",
+    "node-html-parser": "^9.0.4",
     "pdf-lib": "^1.17.1",
-    "unpdf": "^1.8.0",
-    "zod": "^4.4.3"
+    "unpdf": "^2.0.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@fontsource/zilla-slab": "^5.3.0",
-    "@sentry/cli": "^3.6.2",
-    "@types/node": "26.1.2",
-    "@typescript-eslint/eslint-plugin": "^8.66.0",
-    "@typescript-eslint/parser": "^8.66.0",
-    "@vitest/coverage-v8": "4.1.10",
-    "eslint": "^10.8.0",
+    "@sentry/cli": "^3.8.0",
+    "@types/node": "26.6.6",
+    "@typescript-eslint/eslint-plugin": "^8.71.0",
+    "@typescript-eslint/parser": "^8.71.0",
+    "@vitest/coverage-v8": "^5.0.3",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
+    "jsdom": "^31.0.0",
     "typescript": "^5.6.3",
-    "vitest": "^4.1.10"
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
   },
   "overrides": {
-    "undici": "^7.29.0"
+    "minimatch": "^11.0.1",
+    "undici": "^8.12.3"
   }
 }

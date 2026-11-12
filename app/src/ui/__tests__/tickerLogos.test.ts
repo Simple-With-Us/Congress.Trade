@@ -42,6 +42,16 @@ describe('logoDevUrl', () => {
     expect(u).toContain('format=png');
     expect(u).toContain('fallback=404');
   });
+
+  it('requests a 96px (size=48, retina) image, not the old 256px oversize (WEBPERF-02)', () => {
+    // The largest rendered .tkr-logo box is 36px (.trades-card); size=128
+    // (256px effective) was ~7x oversized for the 22px table box and was the
+    // single largest byte cost on the Trades tab.
+    const u = logoDevUrl('AAPL', 'pk_test');
+    expect(u).toContain('size=48');
+    expect(u).toContain('retina=true');
+    expect(u).not.toContain('size=128');
+  });
 });
 
 describe('isValidPngBytes', () => {

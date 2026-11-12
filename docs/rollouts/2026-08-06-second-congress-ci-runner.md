@@ -6,7 +6,7 @@
 
 Added a second self-hosted GitHub Actions runner for Congress.Trade by
 reassigning the idle Socratic.Trade runner on the Oracle host
-(`141.148.182.224`).
+(`<ORACLE_IP_RETIRED>`).
 
 Context: there was only **one** online `socratic-ci` listener (not two). ST,
 Usage-Monitor, and congress-trading-shared workflows already target
@@ -52,7 +52,7 @@ gh api repos/jaywedgeworth22/Congress.Trade/actions/runners \
   --jq '.runners[] | {name,status,busy,labels:[.labels[].name]}'
 # expect both oracle-congress-ci and oracle-congress-ci-2 status=online
 
-ssh ubuntu@141.148.182.224 \
+ssh ubuntu@<ORACLE_IP_RETIRED> \
   'systemctl is-active actions.runner.jaywedgeworth22-Congress.Trade.oracle-congress-ci{,-2}.service'
 ```
 

@@ -8,11 +8,13 @@
  * (YYYY-MM-DD), and filtering by ticker / member / chamber / type.
  *
  * Routes (all relative to /api):
+ *   GET   /health/senate-relay  live probe of the named Senate tunnel origin (#1604)
  *   GET   /transactions      cursor-paged transaction feed (reconciliation backstop)
  *   GET   /feed.xml          RSS 2.0 feed of recent trades (same filters as /transactions)
  *   GET   /stream            SSE live stream (?since= or Last-Event-ID resume)
  *   GET   /filings/:docId    single filing (+ its transactions) for the dashboard
  *   GET   /members           distinct filers seen in transactions
+ *   GET   /assets            distinct tickers seen in transactions (Assets directory)
  *   POST  /subscriptions     create a subscription; returns its secret once
  *   GET   /subscriptions     disabled publicly; use /api/admin/subscriptions
  *   GET   /subscriptions/:id fetch one subscription with its secret
@@ -26,14 +28,26 @@ import { all, first, get } from '../shared/db.ts';
 import { asStockActStatus } from '../shared/stockAct.ts';
 import { cached } from '../shared/kvCache.ts';
 import { readBuildInfo } from '../shared/buildInfo.ts';
-import { checkPipelineHealth, type PipelineHealth } from '../shared/pipelineHealth.ts';
+import { datadogPublicStatus } from '../shared/datadogRuntime.ts';
+import { getDatadogInitInput } from '../shared/datadog.ts';
+import {
+  checkPipelineHealth,
+  createPipelineHealthCache,
+  type PipelineHealth,
+} from '../shared/pipelineHealth.ts';
+import { probeSenateRelay } from '../ingestion/senateRelayHealth.ts';
 import { providerHealthDiagnostics } from '../extraction/providerHealth.ts';
+import { enhanceSenateHtmlDocument } from '../extraction/senatePaperMedia.ts';
 import { inspectLlmSpend } from '../shared/llmSpend.ts';
 import {
+  asAssetCategories,
+  asTxSource,
   buildTransactionsQuery,
   buildTransactionsCountQuery,
   buildTransactionsTodayFilingsQuery,
-  buildTransactionsExportQuery,
+  buildTransactionsExportBatchQuery,
+  buildTransactionsExportCountQuery,
+  EXPORT_BATCH_SIZE,
   mapFiling,
   mapTransaction,
   mapFeedTransaction,
@@ -45,30 +59,80 @@ import {
   type FeedTransactionRow,
   type TxQueryParams,
 } from './rows.ts';
+import { isDeliveryBackfill } from './deliveryFreshness.ts';
 import { getCurrentUserFromRequest } from '../auth/session.ts';
 import { isPremiumUserAsync } from '../billing/entitlement.ts';
 import { getUserById } from '../auth/users.ts';
+import { getAppleSubscription, appleStatusGrantsAccess } from '../billing/appleSubscriptions.ts';
+import { verifyDeviceEntitlementToken } from '../billing/deviceEntitlement.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
+import { currentPriceStalenessFields } from '../prices/staleness.ts';
+
+/**
+ * `__member_name` is a raw join alias (COALESCE(display_name, full_name) at
+ * the SQL level, see buildTransactionsQuery) that never passes through
+ * cleanFilerName — unlike `mapFeedTransaction`'s `fullName`, which does. Only
+ * reach for this as a fallback when `tx.fullName` is missing (e.g. filer join
+ * gap); never prefer the raw value over the cleaned one.
+ */
+function cleanMemberNameFallback(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  return cleanFilerName(raw) || raw;
+}
 import { formatPartyLabel } from '../shared/partyLabel.ts';
+import { executiveTitleFor } from '../shared/executiveTitles.ts';
 import {
   createSubscription,
   getSubscription,
   updateSubscription,
-  validateSubscriptionFilters,
+  validateAndResolveSubscriptionFilters,
   assertSubscriptionQuota,
   SubscriptionQuotaError,
   subscriptionSecretError,
   webhookTargetLengthError,
 } from './subscriptions.ts';
 import { openSseStream } from './sse.ts';
+import {
+  isMissingRetractionsTable,
+  listRetractions,
+  RETRACTIONS_DEFAULT_LIMIT,
+  RETRACTIONS_MAX_LIMIT,
+} from './retractions.ts';
+import { z } from 'zod';
 import { handleTickerLogoRequest } from '../ui/tickerLogos.ts';
-import { resolveSecret } from '../secrets/infisical.ts';
+import { readLogoPolicyOverlay } from '../ui/tickerLogoPolicy.ts';
+import { handleMemberPhotoRequest } from '../enrichment/memberPhotoPack.ts';
+import { getSecretResolverStatus, resolveSecret } from '../secrets/infisical.ts';
 import { constantTimeEqual } from '../auth/tokens.ts';
 import { localWebhookTargetsAllowed, validatePublicWebhookTarget } from './webhookTarget.ts';
 import { rateLimit, clientIp } from '../shared/rateLimit.ts';
 import { checkRowBudget, spendRowBudget, MAX_PUBLIC_TX_OFFSET } from '../security/botDefense.ts';
 import { checkReadiness, type ReadinessResult } from '../shared/readiness.ts';
 import { costProfilePublicSummary, resolveDenoCostProfile } from '../deno/costProfile.ts';
+import { readLocalLitestreamAge } from '../shared/litestreamAge.ts';
+import { readR2WeeklyArchiveStatus } from '../shared/r2WeeklyArchive.ts';
+
+/** Optional non-negative integer query param ('' counts as absent). */
+const queryUint = z.preprocess(
+  (v) => (v === '' ? undefined : v),
+  z.string().regex(/^\d{1,16}$/).transform(Number).optional(),
+);
+
+/**
+ * GET /transactions/retractions query.  Unknown params are ignored (stripped),
+ * like the other public feed endpoints, so cache-busters keep working.
+ * `limit` above RETRACTIONS_MAX_LIMIT is clamped, as listRetractions did.
+ */
+export const RetractionsQuerySchema = z.object({
+  since: queryUint.transform((v) => v ?? 0),
+  limit: queryUint
+    .transform((v) => v ?? RETRACTIONS_DEFAULT_LIMIT)
+    .pipe(z.number().int().min(1))
+    .transform((v) => Math.min(v, RETRACTIONS_MAX_LIMIT)),
+});
+
+/** GET /stream retraction resume cursor (?retractSince=). */
+export const SseRetractQuerySchema = z.object({ retractSince: queryUint });
 
 function parseIntOrUndef(v: string | undefined): number | undefined {
   if (v === undefined || v === '') return undefined;
@@ -82,8 +146,8 @@ function parseIntOrUndef(v: string | undefined): number | undefined {
  * header, which clients resend automatically on reconnect. Each `trade.new`
  * event is emitted with `id: <cursorSeq>`, so the header value is the last
  * cursor the client saw — replaying cursor_seq > that value resumes gap-free.
- * Returns undefined when neither is a finite number (openSseStream treats that
- * as "from the beginning").
+ * Returns undefined when neither is a finite number (openSseStream starts at
+ * the durable high-water mark for a live tail with no history replay).
  */
 export function resolveResumeCursor(
   sinceParam: string | undefined,
@@ -104,7 +168,17 @@ type RestContext = Context<{ Bindings: Env }>;
  */
 const READINESS_CACHE_TTL_MS = 60_000;
 let readinessCache: { at: number; result: ReadinessResult } | null = null;
-let pipelineCache: { at: number; result: PipelineHealth } | null = null;
+// CT-2459: one 60s singleflight pipeline-health cache shared by ALL health
+// endpoints. Previously only /health was cached while /health/deep,
+// /health/polling and /health/latency each paid the full 30+-probe scan per
+// unauthenticated monitor hit.
+// Public health endpoints serve unauthenticated traffic, so the shared
+// cache collects counts only: raw unreadable-filing doc ids stay on the
+// operator-private surfaces (loud alerts, GET /api/admin/pipeline-health/filing-skips).
+const pipelineHealthCache = createPipelineHealthCache(
+  (env) => checkPipelineHealth(env, new Date(), {}, { includeUnreadableDocIds: false }),
+  READINESS_CACHE_TTL_MS,
+);
 
 /**
  * Edge-cache policies for public, read-only GETs. These endpoints carry no
@@ -127,6 +201,7 @@ const PUBLIC_STABLE_CACHE = 'public, s-maxage=300, stale-while-revalidate=600';
  */
 function isPublicReadPath(path: string): boolean {
   return path === '/transactions'
+    || path === '/transactions/retractions'
     || path === '/members'
     || path === '/health'
     || path === '/feed.xml'
@@ -146,6 +221,17 @@ interface PublicSubscription extends Omit<Subscription, 'secret'> {
    *  it and open /api/stream with `Authorization: Bearer <secret>` instead
    *  (the token-in-URL form leaks into browser history and proxy logs). */
   streamUrl?: string;
+}
+
+/** 400 body for a rejected filter set; lists unresolved member names so clients can highlight them. */
+export function subscriptionFilterErrorBody(result: { error?: string; unresolvedMembers?: string[] }): {
+  error: string;
+  unresolvedMembers?: string[];
+} {
+  return {
+    error: result.error ?? 'invalid filters',
+    ...(result.unresolvedMembers?.length ? { unresolvedMembers: result.unresolvedMembers } : {}),
+  };
 }
 
 function toPublicSubscription(
@@ -204,19 +290,28 @@ interface MembersRosterRow {
  * whatever plan the stats-less planner picks) rather than 500ing the People
  * tab for that window.
  */
+import { memberNameMatchKey } from '../shared/filerIdentityMatch.ts';
+
+/**
+ * GET /members' query — returns distinct filers with transaction counts.
+ * Uses COALESCE(f.merged_into, f.bioguide_id, t.filer_id) to map tombstoned
+ * aliases to their canonical filer, and folds duplicate name keys so the
+ * directory never shows two rows for the same politician.
+ */
 async function queryMembersRoster(db: D1Database): Promise<{ members: unknown[]; count: number }> {
-  const baseSql = `SELECT t.filer_id AS filer_id,
-                f.full_name AS full_name,
-                f.chamber   AS chamber,
-                f.party     AS party,
-                f.state     AS state,
-                f.district  AS district,
-                f.photo_url AS photo_url,
+  const baseSql = `SELECT COALESCE(f.merged_into, t.filer_id) AS filer_id,
+                COALESCE(cf.display_name, cf.full_name, f.display_name, f.full_name) AS full_name,
+                COALESCE(cf.chamber, f.chamber)   AS chamber,
+                COALESCE(cf.party, f.party)     AS party,
+                COALESCE(cf.state, f.state)     AS state,
+                COALESCE(cf.district, f.district) AS district,
+                COALESCE(cf.photo_url, f.photo_url) AS photo_url,
                 COUNT(*)    AS tx_count
            FROM transactions t %INDEX_HINT%
            LEFT JOIN filers f ON f.bioguide_id = t.filer_id
+           LEFT JOIN filers cf ON cf.bioguide_id = f.merged_into
           WHERE t.filer_id IS NOT NULL AND t.deprecated_at IS NULL
-          GROUP BY t.filer_id
+          GROUP BY COALESCE(f.merged_into, t.filer_id)
           ORDER BY tx_count DESC`;
   let rows: MembersRosterRow[];
   try {
@@ -228,19 +323,56 @@ async function queryMembersRoster(db: D1Database): Promise<{ members: unknown[];
     filerId: row.filer_id,
     fullName: row.full_name ? (cleanFilerName(row.full_name) || row.full_name) : null,
     chamber: row.chamber,
-    // One shared formatter across every branch (House/Senate carry
-    // congress-legislators' spelled-out "Republican"/"Democrat"; curated
-    // executive filers carry a bare "R"/"D" — see shared/partyLabel.ts) so
-    // the directory never shows both spellings side by side (#1452).
     party: formatPartyLabel(row.party) ?? row.party,
     state: row.state,
     district: row.district,
     txCount: row.tx_count,
-    // Rendered as a row avatar in the iOS People directory (owner punch list
-    // #2 item 9); the web directory table stays photo-less (unchanged).
     photoUrl: row.photo_url ?? null,
+    title: executiveTitleFor(row.filer_id, row.chamber),
   }));
   return { members, count: members.length };
+}
+
+interface AssetsRosterRow {
+  ticker: string;
+  company_name: string | null;
+  asset_class: string | null;
+  tx_count: number;
+  member_count: number;
+}
+
+/**
+ * GET /assets' query — the ticker-side analogue of {@link queryMembersRoster}
+ * above: every ticker that actually appears in the transaction feed, LEFT
+ * JOINed to `securities_ref` (the enrichment reference table populated
+ * out-of-band — see admin/migrations.ts INTERMEDIATE_SCHEMA_STATEMENTS and
+ * analytics/sql.ts ANALYTICS_FROM_JOINS_REF for the same join elsewhere) for
+ * a company name and asset class where enrichment has run for that ticker.
+ * LEFT, not INNER, so un-enriched tickers still appear in the directory
+ * (name/assetClass simply come back null) rather than vanishing.
+ */
+async function queryAssetsRoster(db: D1Database): Promise<{ assets: unknown[]; count: number }> {
+  const rows = await all<AssetsRosterRow>(
+    db,
+    `SELECT t.ticker AS ticker,
+            sr.company_name AS company_name,
+            sr.asset_class  AS asset_class,
+            COUNT(*) AS tx_count,
+            COUNT(DISTINCT t.filer_id) AS member_count
+       FROM transactions t
+       LEFT JOIN securities_ref sr ON sr.ticker = t.ticker
+      WHERE t.ticker IS NOT NULL AND t.ticker <> '' AND t.deprecated_at IS NULL
+      GROUP BY t.ticker
+      ORDER BY tx_count DESC`,
+  );
+  const assets = rows.map((row) => ({
+    ticker: row.ticker,
+    name: row.company_name || null,
+    assetClass: row.asset_class || null,
+    txCount: row.tx_count,
+    memberCount: row.member_count,
+  }));
+  return { assets, count: assets.length };
 }
 
 function bearerToken(value: string | undefined): string | null {
@@ -309,6 +441,15 @@ function asTxType(v: string | undefined): TxType | undefined {
   return v === 'S' || v === 'E' ? v : undefined;
 }
 
+/** CSV multi-type selection (e.g. "B,S"); undefined = no type filter. */
+function asTxTypes(v: string | undefined): TxType[] | undefined {
+  if (!v || !v.trim()) return undefined;
+  const parsed = Array.from(
+    new Set(v.split(',').map((part) => asTxType(part.trim())).filter((t): t is TxType => !!t)),
+  ).sort();
+  return parsed.length ? parsed : undefined;
+}
+
 /** Closed enum for the public `?owner=` feed filter (canonical insert-time set). */
 function asOwner(v: string | undefined): Owner | undefined {
   return v === 'self' || v === 'spouse' || v === 'joint' || v === 'dependent' ? v : undefined;
@@ -340,17 +481,24 @@ function asTxSort(v: string | undefined): TxQueryParams['sort'] {
 
 /** Parse the shared ticker/member/type/chamber filters from the query string. */
 function filtersFromQuery(q: Record<string, string>): TxQueryParams {
+  const types = asTxTypes(q.type);
   return {
     ticker: q.ticker || undefined,
     member: q.member || undefined,
     memberName: q.memberName || undefined,
     chambers: asChambers(q.chamber),
     partyBuckets: asPartyBuckets(q.party),
-    type: asTxType(q.type),
+    // Instrument-class dropdown; see TxQueryParams.assetCategories. Included
+    // here so Premium CSV export and the RSS feed honor the same selection
+    // the JSON feed does.
+    assetCategories: asAssetCategories(q.assetClass ?? q.assetCategory),
+    type: types?.length === 1 ? types[0] : asTxType(q.type),
+    types: types && types.length > 1 ? types : undefined,
     stockAct: asStockActStatus(q.stockAct),
     owner: asOwner(q.owner),
     txDateMin: q.from || q.txDateMin || undefined,
     txDateMax: q.to || q.txDateMax || undefined,
+    source: asTxSource(q.source),
   };
 }
 
@@ -398,17 +546,20 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     if (!readinessCache || now - readinessCache.at >= READINESS_CACHE_TTL_MS) {
       readinessCache = { at: now, result: await checkReadiness(c.env.DB) };
     }
-    if (!pipelineCache || now - pipelineCache.at >= READINESS_CACHE_TTL_MS) {
-      pipelineCache = { at: now, result: await checkPipelineHealth(c.env) };
-    }
     const readiness = readinessCache.result;
-    const pipeline = pipelineCache.result;
+    const pipeline = await pipelineHealthCache.get(c.env);
     const envx = c.env as Env & Record<string, string | undefined>;
     const costProfile = costProfilePublicSummary(resolveDenoCostProfile(envx));
     // `build` identifies the running revision so a deploy can be *verified*
     // rather than assumed — ship.sh does not deploy, Coolify does, and that
     // webhook has silently not fired before. See src/shared/buildInfo.ts.
     const build = readBuildInfo(envx);
+    const storage = await readLocalLitestreamAge();
+    const r2Weekly = await readR2WeeklyArchiveStatus();
+    // Public-safe Infisical view: source names, counts, errors.  Never values.
+    // Shared-project keys live only in shared-at-ct; app projects must not
+    // duplicate them (app merge would shadow shared).
+    const secrets = getSecretResolverStatus(c.env);
     return c.json(
       {
         ...readiness,
@@ -416,6 +567,26 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         pipeline,
         costProfile,
         build,
+        // Usage Monitor fleet backup reads checks.storage.litestreamAgeSeconds
+        // and checks.storage.r2Weekly.
+        checks: {
+          storage: { ...storage, r2Weekly },
+          datadog: datadogPublicStatus({
+            ...(getDatadogInitInput() ?? {}),
+            ...envx,
+          }),
+          secrets: {
+            enabled: secrets.enabled,
+            cacheReady: secrets.cacheReady,
+            errors: secrets.errors,
+            sources: secrets.sources.map((source) => ({
+              name: source.name,
+              configured: source.configured,
+              ok: source.ok,
+              count: source.count,
+            })),
+          },
+        },
         time: new Date().toISOString(),
       },
       readiness.ok ? 200 : 503,
@@ -426,7 +597,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // Deep pipeline diagnostics: probes queue backlogs, provider health counters,
   // LLM spend ceilings, and autopilot status without caching KV inspect calls.
   r.get('/health/deep', async (c) => {
-    const pipeline = await checkPipelineHealth(c.env);
+    const pipeline = await pipelineHealthCache.get(c.env);
     const providers = await providerHealthDiagnostics(c.env);
     const spend = await inspectLlmSpend(c.env);
     return c.json(
@@ -441,6 +612,94 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     );
   });
 
+  // --- GET /health/polling --------------------------------------------------
+  // Owner directive (2026-08-10): per-chamber polling liveness can never be
+  // silently off — see pipelineHealth.ts's polling_house/polling_senate/
+  // polling_executive checks. Scoped, public, unauthenticated: exists purely
+  // so one UptimeRobot HTTP monitor can page the owner on it directly (the
+  // free plan caps at 10 monitors, which is why all three chambers aggregate
+  // behind a single monitor instead of one each).
+  r.get('/health/polling', async (c) => {
+    const pipeline = await pipelineHealthCache.get(c.env);
+    const checks = pipeline.checks.filter(
+      (ch) => ch.id === 'polling_house' || ch.id === 'polling_senate' || ch.id === 'polling_executive',
+    );
+    // Only 'stalled' pages. 'unknown' and 'degraded' stay 200 so a transient
+    // collection blip doesn't flap the pager — the polling_* checks don't
+    // emit 'degraded' today anyway (each chamber is binary live/not-live).
+    const ok = !checks.some((ch) => ch.status === 'stalled');
+    c.header('Cache-Control', 'no-store');
+    return c.json({ ok, checks }, ok ? 200 : 503);
+  });
+
+  // --- GET /health/latency ---------------------------------------------------
+  // Same 2026-08-10 owner directive, for the latency-probe side: "monitor
+  // that ALL latency providers are being probed" — a single quiet provider
+  // must page. Scoped, public, unauthenticated, and the second (of two) of
+  // the UptimeRobot monitors this pair of endpoints exists for.
+  r.get('/health/latency', async (c) => {
+    const check = (await pipelineHealthCache.get(c.env)).checks.find((ch) => ch.id === 'latency_probes') ?? null;
+    // Pages on 'stalled' OR 'degraded': latency_probes already reserves
+    // 'degraded' for a specific provider having gone silent rather than a
+    // query hiccup, so both states are a real outage worth paging on.
+    // 'unknown' (uncollected) stays 200.
+    const ok = check === null || (check.status !== 'stalled' && check.status !== 'degraded');
+    c.header('Cache-Control', 'no-store');
+    return c.json({ ok, check }, ok ? 200 : 503);
+  });
+
+  // --- GET /health/senate-relay --------------------------------------------
+  // Issue #1604: the named tunnel hostname is permanent; the Mac origin is
+  // not.  Live-probes GET {SENATE_RELAY_URL}/health (5s budget) so a sleeping
+  // laptop pages in minutes.  Does not call checkPipelineHealth — that path
+  // is already the uptime-monitor target and must not grow an outbound hop.
+  r.get('/health/senate-relay', async (c) => {
+    const check = await probeSenateRelay(c.env);
+    c.header('Cache-Control', 'no-store');
+    return c.json(check, check.ok ? 200 : 503);
+  });
+
+  // --- GET /transactions/retractions --------------------------------------
+  // trade.retract poll feed (retractions.ts): transactions taken off the feed
+  // (unpublish, reject, republish retirement, amendment supersede).  Same
+  // access as /transactions: public, CORS-readable, same daily row budget.
+  // Keyset on the retraction cursor: pass the returned `cursor` back as
+  // `since`.  A retraction whose row was later revived is omitted; the row
+  // comes back through /transactions with a new cursorSeq.
+  r.get('/transactions/retractions', async (c) => {
+    const parsed = RetractionsQuerySchema.safeParse(c.req.query());
+    if (!parsed.success) {
+      return c.json({ error: 'since must be an integer >= 0 and limit an integer from 1 to ' + RETRACTIONS_MAX_LIMIT }, 400);
+    }
+    const { since, limit } = parsed.data;
+    const ip = clientIp(c.req.raw, c.env);
+    const budget = await checkRowBudget(c.env, ip);
+    if (!budget.ok) {
+      return c.json(
+        { error: 'daily feed row budget reached' },
+        429,
+        { 'Retry-After': String(budget.retryAfterSec) },
+      );
+    }
+    let page: Awaited<ReturnType<typeof listRetractions>>;
+    try {
+      page = await listRetractions(c.env, since, limit);
+    } catch (err) {
+      // Deploy-before-migrate: 0108 not applied yet.  Same degradation as the
+      // SSE path (retractions off), surfaced as a retryable 503, not a 500.
+      if (!isMissingRetractionsTable(err)) throw err;
+      c.header('Retry-After', '60');
+      return c.json({ error: 'retraction feed not available yet (migration 0108 pending)' }, 503);
+    }
+    await spendRowBudget(c.env, ip, page.retractions.length);
+    c.header('Cache-Control', 'no-store');
+    return c.json({
+      retractions: page.retractions,
+      cursor: page.cursor,
+      hasMore: page.hasMore,
+    });
+  });
+
   // --- GET /transactions --------------------------------------------------
   // Reconciliation backstop: rows with cursor_seq > since, ASC, plus the max
   // cursor in the page so clients can poll forward deterministically.
@@ -453,9 +712,12 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   //
   // Ordering: defaults to oldest-first (cursor_seq ASC) so a consumer can sync
   // incrementally by feeding the returned `cursor` back as the next `since`.
-  // Pass ?order=desc for a newest-first "latest trades" snapshot (pair with
-  // ?from= to bound the window); DESC is a snapshot, not a resumable forward
-  // pager, so incremental-sync consumers should keep the asc default.
+  // Pass ?order=desc for a newest-first "latest trades" snapshot ordered by
+  // COALESCE(first_seen_at, filed_date, tx_date) — not ingest cursor, so a
+  // historical backfill cannot occupy page 1 (#2180). Pair with ?from= to
+  // bound the window. DESC is a snapshot, not a resumable forward pager;
+  // incremental-sync consumers should keep the asc default. `sort=cursor`
+  // restores ingest-newest if a caller wants it.
   r.get('/transactions', async (c) => {
     const q = c.req.query();
     // The live feed is fully public — it's the site's SEO/discovery hook. The
@@ -472,6 +734,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       memberName: q.memberName || undefined,
       chambers: asChambers(q.chamber),
       partyBuckets: asPartyBuckets(q.party),
+      assetCategories: asAssetCategories(q.assetClass ?? q.assetCategory),
       type: asTxType(q.type),
       stockAct: asStockActStatus(q.stockAct),
       owner: asOwner(q.owner),
@@ -496,7 +759,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         400,
       );
     }
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json(
@@ -517,18 +780,20 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       }
     }
     const built = buildTransactionsQuery(params);
-    // The query SELECTs the resolved chamber + politician name alongside the feed
-    // columns via `__chamber` / `__member_name` (see buildTransactionsQuery).
-    // mapFeedTransaction maps the filer/filing columns (fullName, state,
-    // photoUrl, dates); we then attach the resolved `chamber` / `memberName`,
-    // which aren't part of the base Transaction type.
+    // The query SELECTs the resolved chamber + politician name + party
+    // alongside the feed columns via `__chamber` / `__member_name` / `__party`
+    // (see buildTransactionsQuery). mapFeedTransaction maps the filer/filing
+    // columns (fullName, state, photoUrl, dates); we then attach the resolved
+    // `chamber` / `memberName` / `party`, which aren't part of the base
+    // Transaction type on webhook/normalizer paths.
     const rows = await all<
-      FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
+      FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null; __party?: string | null }
     >(c.env.DB, built.sql, built.params);
     const transactions = rows.map((row) => ({
       ...mapFeedTransaction(row),
       chamber: (row.__chamber as Chamber | null) ?? null,
       memberName: row.__member_name ?? null,
+      party: row.__party ?? null,
     }));
     const maxCursor = transactions.reduce(
       (m, t) => (t.cursorSeq > m ? t.cursorSeq : m),
@@ -537,9 +802,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     // Zero-delta incremental poll: a `?since=` cursor with no new rows is the
     // dashboard's steady state (its fetchUpdates() bails out on an empty
     // delta before ever reading `total`/`filingsImportedToday`), so skip the
-    // full unindexed COUNT(*) scan AND the today-filings aggregate entirely
-    // rather than paying D1 read cost every ~poll interval for numbers nobody
-    // reads. Both fields are omitted (not falsely reported as 0) so a
+    // COUNT(*) and today-filings aggregates entirely rather than paying a
+    // full live-row read every ~poll interval for numbers nobody reads. Both fields are omitted (not falsely reported as 0) so a
     // reconciliation consumer that DOES want a fresh total on every poll can
     // tell "not computed this round" apart from "actually zero".
     // `since > 0` (not merely present): the dashboard sends since=0 on its
@@ -561,12 +825,16 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     if (!isIncrementalNoOp) {
       // Total = ALL rows matching the same ticker/member/type/chamber filters,
       // ignoring the cursor backstop (so the UI can show "showing X of N").
+      // CT-2459: the two aggregate reads are independent — issue them
+      // together instead of serially awaiting each handler-side.
       const countQuery = buildTransactionsCountQuery(params);
-      const countRow = await first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params);
-      total = countRow?.total ?? transactions.length;
       const today = new Date().toISOString().slice(0, 10);
       const todayQuery = buildTransactionsTodayFilingsQuery(params, today);
-      const todayRow = await first<{ total: number }>(c.env.DB, todayQuery.sql, todayQuery.params);
+      const [countRow, todayRow] = await Promise.all([
+        first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params),
+        first<{ total: number }>(c.env.DB, todayQuery.sql, todayQuery.params),
+      ]);
+      total = countRow?.total ?? transactions.length;
       filingsImportedToday = todayRow?.total ?? 0;
     }
     // Count served rows against the caller's daily budget. Incremental polls
@@ -590,13 +858,17 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   // session cookie and bearer so web + native clients share one gate.
   r.get('/export/transactions.csv', async (c) => {
     const user = await getCurrentUserFromRequest(c);
-    if (!user) {
-      return c.json(
-        { error: 'authentication required for CSV export', upgradeRequired: true, feature: 'export' },
-        401,
-      );
-    }
-    if (!(await isPremiumUserAsync(c.env, user))) {
+    // Signed in: unchanged Premium-session gate. Signed out (Guideline
+    // 5.1.1(v)): fall back to a device entitlement token from the anonymous
+    // Apple redeem route, instead of demanding sign-in before this feature —
+    // which is not account-based — can be used at all.
+    const premium = user
+      ? await isPremiumUserAsync(c.env, user)
+      : await hasAnonymousDeviceEntitlement(c);
+    if (!premium) {
+      // Always 402 "Premium required", never 401 "sign in required" — CSV
+      // export is not account-based, so the fix is subscribing, not signing
+      // in (though signing in remains available and optional).
       return c.json(
         { error: 'CSV export requires a Premium account', upgradeRequired: true, feature: 'export' },
         402,
@@ -604,7 +876,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     }
     // Cap per IP so a premium account can't be scripted into unbounded read/CPU cost.
     // Fails open if KV down.
-    const exRl = await rateLimit(c.env, 'export-ip', clientIp(c.req.raw), 30, 600);
+    const exRl = await rateLimit(c.env, 'export-ip', clientIp(c.req.raw, c.env), 30, 600);
     if (!exRl.ok) {
       return c.json({ error: 'too many export requests' }, 429, {
         'Retry-After': String(exRl.retryAfterSec),
@@ -614,10 +886,13 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     // already blocked above. Abuse/cost control = auth + per-IP rate limit
     // (not a silent incomplete file).
     const filters = filtersFromQuery(c.req.query());
-    const built = buildTransactionsExportQuery(filters);
-    const rows = await all<
-      FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
-    >(c.env.DB, built.sql, built.params);
+    // CT-2459: stream the export in bounded batches instead of materializing
+    // rows + lines + joined string (~3 copies of an uncapped match set).
+    // The Premium full-match-set rule is unchanged; the pre-count uses the
+    // same filters/dedupe so X-Export-Row-Count stays honest.
+    const countQuery = buildTransactionsExportCountQuery(filters);
+    const countRow = await first<{ total: number }>(c.env.DB, countQuery.sql, countQuery.params);
+    const totalRows = Number(countRow?.total ?? 0);
 
     const header = [
       'filed_at',
@@ -634,39 +909,61 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       'confidence',
       'doc_id',
     ];
-    const lines = [header.join(',')];
-    for (const row of rows) {
-      const t = mapFeedTransaction(row);
-      lines.push(
-        [
-          t.createdAt,
-          t.txDate ?? '',
-          row.__member_name ?? t.fullName ?? t.filerId ?? '',
-          (row.__chamber as string | null) ?? '',
-          t.ticker ?? '',
-          t.assetName ?? '',
-          t.txType,
-          t.amountMin ?? '',
-          t.amountMax ?? '',
-          t.owner ?? '',
-          t.source,
-          t.confidence,
-          t.docId,
-        ]
-          .map(csvCell)
-          .join(','),
-      );
-    }
-    const csv = lines.join('\r\n');
+    const db = c.env.DB;
+    const encoder = new TextEncoder();
+    let offset = 0;
+    let wroteHeader = false;
+    const csv = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (!wroteHeader) {
+          wroteHeader = true;
+          controller.enqueue(encoder.encode(header.join(',')));
+          return;
+        }
+        const batch = buildTransactionsExportBatchQuery(filters, EXPORT_BATCH_SIZE, offset);
+        const rows = await all<
+          FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
+        >(db, batch.sql, batch.params);
+        if (rows.length === 0) {
+          controller.close();
+          return;
+        }
+        offset += rows.length;
+        let chunk = '';
+        for (const row of rows) {
+          const t = mapFeedTransaction(row);
+          chunk +=
+            '\r\n' +
+            [
+              t.createdAt,
+              t.txDate ?? '',
+              t.fullName ?? cleanMemberNameFallback(row.__member_name) ?? t.filerId ?? '',
+              (row.__chamber as string | null) ?? '',
+              t.ticker ?? '',
+              t.assetName ?? '',
+              t.txType,
+              t.amountMin ?? '',
+              t.amountMax ?? '',
+              t.owner ?? '',
+              t.source,
+              t.confidence,
+              t.docId,
+            ]
+              .map(csvCell)
+              .join(',');
+        }
+        controller.enqueue(encoder.encode(chunk));
+        if (rows.length < EXPORT_BATCH_SIZE) controller.close();
+      },
+    });
     const day = isoDateDaysAgo(0);
     return new Response(csv, {
       headers: {
         'content-type': 'text/csv; charset=utf-8',
         'content-disposition': `attachment; filename="congress-trades-${day}.csv"`,
-        'X-Export-Row-Count': String(rows.length),
-        'X-Export-Complete': 'true',
+        'X-Export-Row-Count': String(totalRows),
         'Access-Control-Expose-Headers':
-          'X-Export-Row-Count, X-Export-Complete, Content-Disposition',
+          'X-Export-Row-Count, Content-Disposition',
       },
     });
   });
@@ -690,10 +987,12 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       FeedTransactionRow & { __chamber?: string | null; __member_name?: string | null }
     >(c.env.DB, built.sql, built.params);
     const origin = new URL(c.req.url).origin;
+    const includeBackfill = c.req.query('includeBackfill') === '1' || c.req.query('includeBackfill') === 'true';
 
     const items = rows.map((row) => {
       const tx = mapFeedTransaction(row);
-      const who = row.__member_name ?? tx.fullName ?? tx.filerId ?? 'Unknown filer';
+      if (!includeBackfill && isDeliveryBackfill(tx)) return '';
+      const who = tx.fullName ?? cleanMemberNameFallback(row.__member_name) ?? tx.filerId ?? 'Unknown filer';
       const side = (tx.txType === 'B' || String(tx.txType) === 'P') ? 'bought' : tx.txType === 'S' ? 'sold' : 'traded';
       const what = tx.ticker ?? tx.assetName;
       const title = `${who} ${side} ${what}`;
@@ -715,13 +1014,13 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         + (pubDate ? `      <pubDate>${pubDate}</pubDate>\n` : '')
         + `      <description>${xmlEscape(description)}</description>\n`
         + '    </item>';
-    });
+    }).filter(Boolean);
 
     const xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
       + '<rss version="2.0">\n  <channel>\n'
-      + '    <title>Congress.Trade — Recent Congressional Trades</title>\n'
+      + '    <title>Congress.Trade — Recent Trades</title>\n'
       + `    <link>${xmlEscape(origin)}</link>\n`
-      + '    <description>The most recent U.S. Congressional stock trades.</description>\n'
+      + '    <description>The most recent House, Senate, and Executive Branch stock trades.</description>\n'
       + items.join('\n')
       + '\n  </channel>\n</rss>\n';
     return new Response(xml, {
@@ -733,11 +1032,13 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- GET /stream --------------------------------------------------------
-  // SSE live stream. Resume point comes from ?since=<cursor_seq> or, on an
-  // automatic EventSource reconnect, the Last-Event-ID header (each trade event
-  // carries id:<cursorSeq>). The backlog replay is sourced from the full
-  // transactions table, so resume is gap-free regardless of how long the client
-  // was disconnected.
+  // SSE live stream. With no ?since= and no Last-Event-ID, the stream attaches
+  // at the current cursor high-water mark (live tail only). Resume / catch-up
+  // uses ?since=<cursor_seq> or the Last-Event-ID header (each trade event
+  // carries id:<cursorSeq>); replay is gap-free from the transactions table.
+  // Retractions resume from ?retractSince=; a resume without it replays the
+  // last 24h of retractions (native auto-reconnect cannot resend the query
+  // param), while a fresh open starts at the retraction high-water mark.
   //
   // Token transport: prefer `Authorization: Bearer <secret>` (or
   // X-Subscription-Secret) so the secret stays out of URLs (browser history,
@@ -746,11 +1047,20 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   r.get('/stream', async (c) => {
     const subscription = c.req.query('subscription');
     if (!subscription) {
-      return c.json({ error: 'missing ?subscription=' }, 400);
+      return c.json(
+        {
+          error: 'missing ?subscription=',
+          hint: 'SSE is per Premium subscription. Pass ?subscription=<id> and Authorization: Bearer <secret> (or ?token= for native EventSource).',
+        },
+        400,
+      );
     }
     const since = resolveResumeCursor(c.req.query('since'), c.req.header('Last-Event-ID'));
     const token = subscriptionSecretFromRequest(c, true) ?? undefined;
-    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw));
+    const resume = SseRetractQuerySchema.safeParse(c.req.query());
+    if (!resume.success) return c.json({ error: 'retractSince must be an integer >= 0' }, 400);
+    const retractSince = resume.data.retractSince;
+    return openSseStream(c.env, subscription, since, token, clientIp(c.req.raw, c.env), {}, retractSince);
   });
 
   // --- GET /logos/ticker --------------------------------------------------
@@ -764,26 +1074,44 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       ? undefined
       : (await resolveSecret(c.env, 'LOGO_DEV_TOKEN')).value
         ?? (typeof c.env.LOGO_DEV_TOKEN === 'string' ? c.env.LOGO_DEV_TOKEN : undefined);
-    return handleTickerLogoRequest(new URL(c.req.url), primary ?? alias);
+    const overlay = await readLogoPolicyOverlay(c.env);
+    return handleTickerLogoRequest(new URL(c.req.url), primary ?? alias, overlay);
   });
+
+  // --- GET /photos/member -------------------------------------------------
+  // Head-focused member portrait (see enrichment/memberPhotoPack.ts). Answers
+  // from the committed face pack first; a bioguide key we have no packed face
+  // for falls through to the upstream public-domain CDN.
+  r.get('/photos/member', async (c) => handleMemberPhotoRequest(new URL(c.req.url)));
 
   // --- GET /filings/:docId ------------------------------------------------
   // Detail endpoint on the same public corpus as /transactions: applies the
   // same per-IP daily row budget (a filing detail can carry many transaction
-  // rows) and never hands back internal fields — see toPublicFiling.
+  // rows), hides retracted rows (`deprecated_at IS NULL`, same as the feed),
+  // and never hands back internal fields — see toPublicFiling.
   r.get('/filings/:docId', async (c) => {
-    const docId = c.req.param('docId');
+    const requestedId = c.req.param('docId');
     let filingRow = await get<FilingRow>(
       c.env.DB,
       'SELECT * FROM filings WHERE doc_id = ?',
-      [docId],
+      [requestedId],
     );
+    // Drawer / deep-link may pass a transaction id.  Look that row up
+    // directly.  The old self-join used `t2.source = "primary"` — libsql
+    // treats double quotes as identifiers (DQS off), so a missing filing
+    // threw instead of 404.  Live: GET /api/filings/H-2025-8220711,
+    // H-2025-8220192, and any unknown docId (140ms 500).
     if (!filingRow) {
-      const matched = await get<{ doc_id: string }>(
-        c.env.DB,
-        'SELECT t2.doc_id FROM transactions t1 JOIN transactions t2 ON t1.filer_id = t2.filer_id AND t1.tx_date = t2.tx_date AND (t1.ticker IS t2.ticker OR t1.ticker IS NULL) AND t2.source = "primary" WHERE t1.doc_id = ? OR t1.id = ? LIMIT 1',
-        [docId, docId],
-      );
+      let matched: { doc_id: string } | null = null;
+      try {
+        matched = await get<{ doc_id: string }>(
+          c.env.DB,
+          'SELECT doc_id FROM transactions WHERE id = ? LIMIT 1',
+          [requestedId],
+        );
+      } catch {
+        matched = null;
+      }
       if (matched?.doc_id) {
         filingRow = await get<FilingRow>(
           c.env.DB,
@@ -793,8 +1121,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       }
     }
     if (!filingRow) return c.json({ error: 'filing not found' }, 404);
+    const docId = filingRow.doc_id;
 
-    const ip = clientIp(c.req.raw);
+    const ip = clientIp(c.req.raw, c.env);
     const budget = await checkRowBudget(c.env, ip);
     if (!budget.ok) {
       return c.json(
@@ -806,7 +1135,7 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
 
     const txRows = await all<TransactionRow>(
       c.env.DB,
-      'SELECT * FROM transactions WHERE doc_id = ? ORDER BY cursor_seq ASC',
+      'SELECT * FROM transactions WHERE doc_id = ? AND deprecated_at IS NULL ORDER BY cursor_seq ASC',
       [docId],
     );
     await spendRowBudget(c.env, ip, txRows.length);
@@ -888,11 +1217,15 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       'SELECT current_price, current_price_date FROM securities_ref WHERE ticker = ?',
       [ticker],
     );
+    const staleness = currentPriceStalenessFields(ref?.current_price_date ?? null);
     return c.json({
       ticker,
       closes,
       currentPrice: ref?.current_price ?? null,
       currentPriceDate: ref?.current_price_date ?? null,
+      stale: staleness.stale,
+      freshThrough: staleness.freshThrough,
+      dataAgeDays: staleness.dataAgeDays,
     });
   });
 
@@ -1050,11 +1383,15 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     const from = c.req.query('from');
     const to = c.req.query('to');
     const limit = marketLimit(c.req.query('limit'));
-    const refRow = await get<SecurityRefRow>(c.env.DB, 'SELECT * FROM securities_ref WHERE ticker = ?', [ticker]);
     const pq = priceRangeQuery('price_eod', ticker, from, to, limit);
-    const closes = await all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params);
     const sq = priceRangeQuery('spx_eod', null, from, to, limit);
-    const spx = await all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params);
+    // CT-2459: three independent reads, issued together (was sequential).
+    const [refRow, closes, spx] = await Promise.all([
+      get<SecurityRefRow>(c.env.DB, 'SELECT * FROM securities_ref WHERE ticker = ?', [ticker]),
+      all<{ date: string; close: number; volume?: number | null }>(c.env.DB, pq.sql, pq.params),
+      all<{ date: string; close: number }>(c.env.DB, sq.sql, sq.params),
+    ]);
+    const staleness = currentPriceStalenessFields(refRow?.current_price_date ?? null);
     return c.json({
       ticker,
       ref: refRow ? mapSecurityRef(refRow) : null,
@@ -1063,6 +1400,9 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
         closes,
         currentPrice: refRow?.current_price ?? null,
         currentPriceDate: refRow?.current_price_date ?? null,
+        stale: staleness.stale,
+        freshThrough: staleness.freshThrough,
+        dataAgeDays: staleness.dataAgeDays,
       },
       spx,
     });
@@ -1077,6 +1417,17 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
     // key); it only shifts with the daily ingest bursts, so a 30-min TTL is
     // invisible to users and cuts a full scan per hit down to one per window.
     const payload = await cached(c.env, 'members:roster', 1800, () => queryMembersRoster(c.env.DB));
+    c.header('Cache-Control', PUBLIC_STABLE_CACHE);
+    return c.json(payload);
+  });
+
+  // --- GET /assets ---------------------------------------------------------
+  // Tickers that actually appear in the transaction feed, joined to
+  // securities_ref for company name / asset class. The ticker-side analogue
+  // of GET /members above — same full-corpus-GROUP-BY cost, same fix: cache
+  // the whole roster (no params → a single key) for 30 minutes.
+  r.get('/assets', async (c) => {
+    const payload = await cached(c.env, 'assets:roster', 1800, () => queryAssetsRoster(c.env.DB));
     c.header('Cache-Control', PUBLIC_STABLE_CACHE);
     return c.json(payload);
   });
@@ -1114,8 +1465,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
       if (targetUrlError) return c.json({ error: targetUrlError }, 400);
     }
 
-    const validatedFilters = validateSubscriptionFilters(body.filters);
-    if (!validatedFilters.ok) return c.json({ error: (validatedFilters as any).error }, 400);
+    const validatedFilters = await validateAndResolveSubscriptionFilters(c.env, body.filters);
+    if (!validatedFilters.ok) return c.json(subscriptionFilterErrorBody(validatedFilters), 400);
     const secretError = subscriptionSecretError(body.secret);
     if (secretError) return c.json({ error: secretError }, 400);
     const secret = typeof body.secret === 'string' ? body.secret : undefined;
@@ -1185,8 +1536,8 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
 
     const patch: Parameters<typeof updateSubscription>[2] = {};
     if (body.filters !== undefined) {
-      const validatedFilters = validateSubscriptionFilters(body.filters);
-      if (!validatedFilters.ok) return c.json({ error: (validatedFilters as any).error }, 400);
+      const validatedFilters = await validateAndResolveSubscriptionFilters(c.env, body.filters);
+      if (!validatedFilters.ok) return c.json(subscriptionFilterErrorBody(validatedFilters), 400);
       patch.filters = validatedFilters.filters;
     }
     if (typeof body.targetUrl === 'string' || body.targetUrl === null) {
@@ -1237,10 +1588,62 @@ export function buildRestRouter(): Hono<{ Bindings: Env }> {
   return r;
 }
 
+/**
+ * App Store 3.1.1: native clients send Bearer and/or Accept: application/pdf.
+ * Those must get 402 JSON, never a 302 to /pricing (Safari would open Stripe).
+ * Browser HTML navigations without Bearer still 302 to the web paywall.
+ */
+export function documentPdfGateWantsJson(headers: {
+  authorization?: string | null;
+  accept?: string | null;
+}): boolean {
+  const auth = headers.authorization ?? '';
+  if (/^bearer\s+\S+/i.test(auth)) return true;
+  const accept = (headers.accept ?? '').toLowerCase();
+  return accept.includes('application/pdf');
+}
+
+export function documentPdfUpgradePayload(): {
+  error: string;
+  upgradeRequired: true;
+  feature: 'pdf';
+} {
+  return {
+    error: 'Archived filing PDF requires a Premium account',
+    upgradeRequired: true,
+    feature: 'pdf',
+  };
+}
+
+/**
+ * Second, account-free entitlement path for a signed-out device that
+ * anonymously redeemed an Apple purchase (Guideline 5.1.1(v) —
+ * `client/entitlements.ts` `POST /api/client/v1/entitlements/apple/redeem`).
+ * Verifies the HMAC token, then re-checks the LIVE ledger row (not just the
+ * token's own signature) so a refund/revoke applied after the token was
+ * issued still takes effect the moment it reaches `apple_subscriptions` —
+ * the token's own expiry (<=24h) is only the outer bound for how long a
+ * webhook delivery can lag behind, not the sole check.
+ */
+async function hasAnonymousDeviceEntitlement(c: Context<{ Bindings: Env }>): Promise<boolean> {
+  const token = c.req.header('X-Apple-Device-Entitlement');
+  if (!token) return false;
+  const claim = await verifyDeviceEntitlementToken(c.env, token);
+  if (!claim) return false;
+  const sub = await getAppleSubscription(c.env, claim.originalTransactionId);
+  if (!sub || !appleStatusGrantsAccess(sub.status)) return false;
+  if (sub.expiresDate && new Date(sub.expiresDate).getTime() <= Date.now()) return false;
+  return true;
+}
+
 export async function serveDocumentPdf(c: Context<{ Bindings: Env }>) {
   const user = await getCurrentUserFromRequest(c);
-  if (!user || !(await isPremiumUserAsync(c.env, user))) {
-    return c.redirect('/pricing?feature=pdf', 302);
+  // Session wins when present; a signed-out device falls back to its own
+  // Apple entitlement token — never the other way around, and never OR'd
+  // with a session that simply isn't Premium (that stays gated).
+  const premium = user ? await isPremiumUserAsync(c.env, user) : await hasAnonymousDeviceEntitlement(c);
+  if (!premium) {
+    return c.json(documentPdfUpgradePayload(), 402);
   }
 
   const docId = c.req.param('docId');
@@ -1250,42 +1653,41 @@ export async function serveDocumentPdf(c: Context<{ Bindings: Env }>) {
     [docId],
   );
 
-  let fallbackUrl = filingRow?.source_url;
-  if (!fallbackUrl) {
-    const s = String(docId || '');
-    if (s.startsWith('S-')) {
-      fallbackUrl = 'https://efdsearch.senate.gov/search/view/ptr/' + encodeURIComponent(s.slice(2)) + '/';
-    } else {
-      const m = /^H-(\d{4})-(\d+)$/.exec(s);
-      if (m) {
-        const num = parseInt(m[2], 10);
-        if (num >= 20000000 && num < 30000000) {
-          fallbackUrl = `https://disclosures-clerk.house.gov/public_disc/financial-pdfs/${m[1]}/${m[2]}.pdf`;
-        } else {
-          fallbackUrl = `https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/${m[1]}/${m[2]}.pdf`;
-        }
-      }
-    }
-  }
-
+  // STORED COPY ONLY (2026-08-10): never 302 to Clerk/eFD/OGE. Redirecting
+  // browsers (and any intermediate crawlers) at primary sources burns IP
+  // reputation and can serve a different document than the one we extracted.
+  // If we have not stored the bytes yet, 404 honestly.
   if (!filingRow || !filingRow.raw_object_key) {
-    if (fallbackUrl) return c.redirect(fallbackUrl, 302);
     return c.json({ error: 'document not found or not fetched' }, 404);
   }
   const obj = await c.env.RAW_FILES.get(filingRow.raw_object_key);
   if (!obj) {
-    if (fallbackUrl) return c.redirect(fallbackUrl, 302);
     return c.json({ error: 'document not found in storage' }, 404);
   }
 
   const contentType = obj.httpMetadata?.contentType || 'application/pdf';
-  return new Response(obj.body, {
-    headers: {
-      'content-type': contentType,
-      'content-disposition': 'inline',
-      'cache-control': 'public, max-age=86400, immutable',
-    },
-  });
+  const headers: Record<string, string> = {
+    'content-type': contentType,
+    'content-disposition': 'inline',
+    'cache-control': 'public, max-age=86400, immutable',
+    'x-content-type-options': 'nosniff',
+    'x-congress-trade-source': 'stored-raw',
+  };
+  // Stored senate filings are text/html authored by a third party (eFD).
+  // Serving them inline from our origin must never execute their markup in
+  // our origin context: CSP sandbox (no allow-scripts, no allow-same-origin)
+  // still renders the static document read-only. We enhance Senate HTML
+  // (extracting paper scans into a clean multi-page reader or injecting table CSS)
+  // so it renders legibly and reliably under sandbox CSP. PDFs stream as-is.
+  if (contentType.toLowerCase().includes('html')) {
+    headers['content-security-policy'] = 'sandbox';
+    const rawText = typeof (obj as any).text === 'function'
+      ? await (obj as any).text()
+      : await new Response(obj.body).text();
+    const enhanced = enhanceSenateHtmlDocument(rawText, docId, filingRow.source_url);
+    return new Response(enhanced, { headers });
+  }
+  return new Response(obj.body, { headers });
 }
 
 // --- Market cache read helpers (cross-app sharing) ------------------------

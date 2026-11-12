@@ -157,8 +157,15 @@ def summarize(rec: dict[str, Any]) -> str:
     lines = [f"latency-week {rec['ts']} base={rec['base']}"]
     h = rec.get("health") or {}
     lines.append(f"  health ok={h.get('ok')} status={h.get('status')}")
+    is_weekend = False
+    try:
+        is_weekend = weekday_et() >= 5
+    except Exception:
+        pass
     for ch, v in (rec.get("txByChamber") or {}).items():
-        lines.append(f"  tx {ch}: total={v.get('total')} importedToday={v.get('filingsImportedToday')}")
+        imp = v.get('filingsImportedToday')
+        note = " (weekend pause)" if is_weekend and imp == 0 else ""
+        lines.append(f"  tx {ch}: total={v.get('total')} importedToday={imp}{note}")
     for p in (rec.get("latency") or {}).get("providers") or []:
         lines.append(
             f"  {p.get('id')}: ops={p.get('operationalStatus')} matched={p.get('matched')} "

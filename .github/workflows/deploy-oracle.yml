@@ -14,7 +14,7 @@ on:
 
 jobs:
   deploy:
-    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "oracle-ci"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Queue Coolify deployment

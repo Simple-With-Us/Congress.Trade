@@ -51,6 +51,7 @@ describe('auth router', () => {
       user: null,
       entitlement: ANONYMOUS_ENTITLEMENT,
       admin: { allowed: false },
+      auth: { appleWeb: false, xWeb: false },
       billing: { configured: false, checkoutConfigured: false, portalConfigured: false, hasCustomer: false },
     });
   });
@@ -125,6 +126,17 @@ describe('auth router', () => {
       billing: { hasCustomer: true },
       entitlement: { premium: false },
     });
+
+    const bearer = await app.request(
+      'http://localhost/me',
+      { headers: { authorization: 'Bearer tok' } },
+      env,
+    );
+    expect(bearer.status).toBe(200);
+    expect(await bearer.json()).toMatchObject({
+      user: { email: 'admin@example.com' },
+      admin: { allowed: true },
+    });
   });
 
   it('GET /google/start is 503 when Google is not configured', async () => {
@@ -142,6 +154,23 @@ describe('auth router', () => {
     );
     expect(res.status).toBe(302);
     expect(res.headers.get('location') ?? '').toContain('accounts.google.com');
+  });
+
+  it('GET /x/start is 503 when X is not configured', async () => {
+    const app = buildAuthRouter();
+    const res = await app.request('http://localhost/x/start', {}, fakeEnv());
+    expect(res.status).toBe(503);
+  });
+
+  it('GET /x/start redirects to X authorization URL when configured', async () => {
+    const app = buildAuthRouter();
+    const res = await app.request(
+      'http://localhost/x/start',
+      {},
+      fakeEnv({ X_OAUTH_CLIENT_ID: 'x_cid' }),
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location') ?? '').toContain('twitter.com/i/oauth2/authorize');
   });
 
   it('POST /magic/request rejects an invalid email', async () => {
@@ -203,6 +232,77 @@ describe('auth router', () => {
       'sess:cookie-session-token',
       'sess:native-session-token',
     ]);
+  });
+
+  it('POST /account/delete requires a signed-in session', async () => {
+    const app = buildAuthRouter();
+    const res = await app.request('http://localhost/account/delete', { method: 'POST' }, fakeEnv());
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: 'sign in required' });
+  });
+
+  it('POST /account/delete removes the users row and revokes the session', async () => {
+    const users = new Map<string, Record<string, unknown>>([
+      ['u1', {
+        id: 'u1',
+        email: 'gone@example.com',
+        name: 'Gone',
+        picture: null,
+        google_sub: 'g-1',
+        apple_sub: 'a-1',
+        email_verified: 1,
+        created_at: '2026-06-28T00:00:00.000Z',
+        last_login_at: '2026-06-28T00:00:00.000Z',
+      }],
+    ]);
+    const kv = new Map<string, string>([['sess:tok', JSON.stringify({ userId: 'u1' })]]);
+    const env = fakeEnv({
+      CONFIG_KV: {
+        get: async (k: string) => (kv.has(k) ? kv.get(k)! : null),
+        put: async (k: string, v: string) => {
+          kv.set(k, v);
+        },
+        delete: async (k: string) => {
+          kv.delete(k);
+        },
+      },
+      DB: {
+        prepare: (sql: string) => {
+          const stmt = {
+            params: [] as unknown[],
+            bind(...params: unknown[]) {
+              this.params = params;
+              return this;
+            },
+            async first() {
+              if (/FROM users WHERE id/i.test(sql)) {
+                return users.get(String(this.params[0])) ?? null;
+              }
+              return null;
+            },
+            async run() {
+              if (/DELETE FROM users WHERE id/i.test(sql)) {
+                users.delete(String(this.params[0]));
+                return { success: true, meta: { changes: 1 } };
+              }
+              return { success: true, meta: { changes: 0 } };
+            },
+            async all() {
+              return { results: [] };
+            },
+          };
+          return stmt;
+        },
+      },
+    });
+    const res = await buildAuthRouter().request('http://localhost/account/delete', {
+      method: 'POST',
+      headers: { authorization: 'Bearer tok' },
+    }, env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, deleted: true, userId: 'u1' });
+    expect(users.has('u1')).toBe(false);
+    expect(kv.has('sess:tok')).toBe(false);
   });
 
   it('POST /logout de-duplicates the same cookie and bearer token', async () => {

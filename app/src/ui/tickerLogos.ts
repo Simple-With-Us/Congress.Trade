@@ -5,13 +5,11 @@
  * Ticker → company-logo support. A cached server proxy resolves a symbol to a
  * PNG so the browser only ever sees `/api/logos/ticker?symbol=AAPL` (the logo
  * provider's key + allowed-referrer stay server-side, and the edge caches the
- * result). Sources, in order:
- *
- *   1. logo.dev — best general coverage when the key is live (prefer over
- *      interim local options). Key: LOGODEV_PUBLISHABLE_KEY or LOGO_DEV_TOKEN.
- *   2. Repo pack (`app/public/assets/ticker-logos/SYMBOL.png`) — gap-fill for
- *      private / thin-coverage names (SPCX, HONAV, …). Owner options, replaceable.
- *   3. davidepalazzo/ticker-logos on GitHub — last resort.
+ * result). Source order is per ticker and per UI theme (tickerLogoPolicy.ts).
+ * Themed local files (`assets/ticker-logos/{light|dark}/SYMBOL.png`) always win
+ * when present. Otherwise: logo.dev, the unthemed repo pack, then GitHub —
+ * unless a jury row pins GitHub first or drops a source.
+ * Key: LOGODEV_PUBLISHABLE_KEY or LOGO_DEV_TOKEN.
  *
  * Empty/non-PNG "success" responses from logo.dev or GitHub are rejected so we
  * fall through instead of caching blank images that never fire img.onerror.
@@ -24,6 +22,12 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { PUBLIC_ASSETS_DIR } from './assets.ts';
+import {
+  type LogoSource,
+  type LogoTheme,
+  type TickerLogoPolicyMap,
+  sourceOrderFor,
+} from './tickerLogoPolicy.ts';
 
 const TICKER_LOGO_BASE_URL =
   'https://raw.githubusercontent.com/davidepalazzo/ticker-logos/main/ticker_icons';
@@ -75,11 +79,22 @@ export function tickerLogoRawUrl(symbol: string): string {
   return `${TICKER_LOGO_BASE_URL}/${encodeURIComponent(symbol)}.png`;
 }
 
-/** logo.dev ticker endpoint URL (PNG, dark by default, 404 on a true miss). */
+/**
+ * logo.dev ticker endpoint URL (PNG, dark by default, 404 on a true miss).
+ *
+ * WEBPERF-02: the largest rendered `.tkr-logo` box is 36px (.trades-card),
+ * so `size=48&retina=true` (96px delivered) already covers ~2.7x DPI with
+ * headroom, versus the previous `size=128` (256px) that was up to ~7x
+ * oversized for the 22px table box. Format stays PNG (not webp) because
+ * `isValidPngBytes`/`pngResponse` below, the repo pack, and the GitHub
+ * fallback all assume PNG bytes and an `image/png` content-type; switching
+ * format would need those three call sites (and their tests) reworked
+ * together, so it is left as a follow-up rather than folded in here.
+ */
 export function logoDevUrl(symbol: string, token: string, theme: 'dark' | 'light' = 'dark'): string {
   return (
     `https://img.logo.dev/ticker/${encodeURIComponent(symbol)}` +
-    `?token=${encodeURIComponent(token)}&format=png&theme=${theme}&size=128&retina=true&fallback=404`
+    `?token=${encodeURIComponent(token)}&format=png&theme=${theme}&size=48&retina=true&fallback=404`
   );
 }
 
@@ -132,21 +147,20 @@ export async function readValidPng(res: Response): Promise<Uint8Array | null> {
   return isValidPngBytes(buf) ? buf : null;
 }
 
-/** Try repo pack: `app/public/assets/ticker-logos/{SYMBOL}.png` (and candidates). */
-export function tryLocalTickerLogo(symbol: string): Response | null {
+function localTickerLogoFromDir(dir: string, symbol: string, sourcePrefix: string): Response | null {
   const names = new Set<string>([
     LOCAL_SYMBOL_ALIASES[symbol] ?? symbol,
     ...tickerLogoCandidates(symbol),
   ]);
   for (const name of names) {
     if (!name || name.includes('..') || name.includes('/') || name.includes('\\')) continue;
-    const abs = join(LOCAL_TICKER_LOGO_DIR, `${name}.png`);
+    const abs = join(dir, `${name}.png`);
     if (!existsSync(abs)) continue;
     try {
       const buf = readFileSync(abs);
       const bytes = new Uint8Array(buf);
       if (!isValidPngBytes(bytes)) continue;
-      return pngResponse(bytes, `local:ticker-logos/${name}.png`);
+      return pngResponse(bytes, `${sourcePrefix}${name}.png`);
     } catch {
       continue;
     }
@@ -155,39 +169,34 @@ export function tryLocalTickerLogo(symbol: string): Response | null {
 }
 
 /**
- * Cached proxy for a single ticker logo: logo.dev → local pack → GitHub.
- * Long-lived cache headers only on real PNG successes; a genuine miss returns
- * a short-lived cacheable 204 so it doesn't error in the browser console.
+ * Repo pack. Theme subfolders (`light/`, `dark/`) win for that chrome;
+ * unthemed `SYMBOL.png` is the gap-fill.
  */
-export async function handleTickerLogoRequest(url: URL, logoDevToken?: string): Promise<Response> {
-  const symbol = normalizeTickerLogoSymbol(url.searchParams.get('symbol'));
-  if (!symbol) {
-    return new Response(JSON.stringify({ error: 'symbol is required' }), {
-      status: 400,
-      headers: { 'content-type': 'application/json' },
-    });
+export function tryLocalTickerLogo(symbol: string, theme?: LogoTheme): Response | null {
+  if (theme) {
+    const themed = localTickerLogoFromDir(
+      join(LOCAL_TICKER_LOGO_DIR, theme),
+      symbol,
+      `local:ticker-logos/${theme}/`,
+    );
+    if (themed) return themed;
   }
-  const theme = url.searchParams.get('theme') === 'light' ? 'light' : 'dark';
+  return localTickerLogoFromDir(LOCAL_TICKER_LOGO_DIR, symbol, 'local:ticker-logos/');
+}
 
-  // 1) logo.dev first when key is present — but never accept empty/non-PNG bodies.
-  if (logoDevToken) {
-    try {
-      const res = await trackedFetch(logoDevUrl(symbol, logoDevToken, theme), {
-        headers: { referer: LOGO_REFERER, accept: 'image/png,image/*;q=0.8,*/*;q=0.5' },
-        cf: { cacheTtl: ONE_WEEK_SECONDS, cacheEverything: true },
-      }, { service: 'asset-logo', operation: 'fetch-logo-primary' });
-      const png = await readValidPng(res);
-      if (png) return pngResponse(png, 'logo.dev');
-    } catch {
-      /* fall through */
-    }
-  }
+async function fetchLogoDevPng(
+  symbol: string,
+  token: string,
+  theme: LogoTheme,
+): Promise<Uint8Array | null> {
+  const res = await trackedFetch(logoDevUrl(symbol, token, theme), {
+    headers: { referer: LOGO_REFERER, accept: 'image/png,image/*;q=0.8,*/*;q=0.5' },
+    cf: { cacheTtl: ONE_WEEK_SECONDS, cacheEverything: true },
+  }, { service: 'asset-logo', operation: 'fetch-logo-primary' });
+  return readValidPng(res);
+}
 
-  // 2) Repo pack — gap-fill (private names / logo.dev miss or empty).
-  const local = tryLocalTickerLogo(symbol);
-  if (local) return local;
-
-  // 3) davidepalazzo/ticker-logos on GitHub (last resort).
+async function fetchGithubTickerPng(symbol: string): Promise<Uint8Array | null> {
   for (const candidate of tickerLogoCandidates(symbol)) {
     let upstream: Response;
     try {
@@ -199,7 +208,91 @@ export async function handleTickerLogoRequest(url: URL, logoDevToken?: string): 
       continue;
     }
     const png = await readValidPng(upstream);
-    if (png) return pngResponse(png, 'github:davidepalazzo/ticker-logos');
+    if (png) return png;
+  }
+  return null;
+}
+
+export function parseForcedLogoSource(raw: string | null): LogoSource | null {
+  if (raw === 'local' || raw === 'github' || raw === 'logodev') return raw;
+  return null;
+}
+
+async function resolveLogoSource(
+  source: LogoSource,
+  symbol: string,
+  theme: LogoTheme,
+  logoDevToken: string | undefined,
+  localMode: 'themed' | 'unthemed' | 'any',
+): Promise<Response | null> {
+  if (source === 'local') {
+    if (localMode === 'themed') {
+      return localTickerLogoFromDir(
+        join(LOCAL_TICKER_LOGO_DIR, theme),
+        symbol,
+        `local:ticker-logos/${theme}/`,
+      );
+    }
+    if (localMode === 'unthemed') {
+      return localTickerLogoFromDir(LOCAL_TICKER_LOGO_DIR, symbol, 'local:ticker-logos/');
+    }
+    return tryLocalTickerLogo(symbol, theme);
+  }
+  if (source === 'logodev') {
+    if (!logoDevToken) return null;
+    try {
+      const png = await fetchLogoDevPng(symbol, logoDevToken, theme);
+      return png ? pngResponse(png, 'logo.dev') : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const png = await fetchGithubTickerPng(symbol);
+    return png ? pngResponse(png, 'github:davidepalazzo/ticker-logos') : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cached proxy for a single ticker logo. Default order is logo.dev → local pack
+ * → GitHub; jury policy (seed + CONFIG_KV overlay) can pin or drop sources per
+ * theme. `?source=github|logodev|local` forces one provider (admin jury plates).
+ * Long-lived cache headers only on real PNG successes; a genuine miss returns
+ * a short-lived cacheable 204 so it doesn't error in the browser console.
+ */
+export async function handleTickerLogoRequest(
+  url: URL,
+  logoDevToken?: string,
+  overlay?: TickerLogoPolicyMap,
+): Promise<Response> {
+  const symbol = normalizeTickerLogoSymbol(url.searchParams.get('symbol'));
+  if (!symbol) {
+    return new Response(JSON.stringify({ error: 'symbol is required' }), {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  const theme = url.searchParams.get('theme') === 'light' ? 'light' : 'dark';
+  const forced = parseForcedLogoSource(url.searchParams.get('source'));
+  const order = forced ? [forced] : sourceOrderFor(symbol, theme, overlay);
+
+  if (!forced) {
+    const themedLocal = await resolveLogoSource('local', symbol, theme, logoDevToken, 'themed');
+    if (themedLocal) {
+      themedLocal.headers.set('x-logo-policy', order.join(','));
+      return themedLocal;
+    }
+  }
+
+  for (const source of order) {
+    const localMode = source === 'local' ? (forced ? 'any' : 'unthemed') : 'any';
+    const hit = await resolveLogoSource(source, symbol, theme, logoDevToken, localMode);
+    if (hit) {
+      hit.headers.set('x-logo-policy', order.join(','));
+      return hit;
+    }
   }
 
   // Short cache on miss so a transient provider outage recovers quickly.

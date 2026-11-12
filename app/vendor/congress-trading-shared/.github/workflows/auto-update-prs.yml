@@ -1,0 +1,56 @@
+name: Auto-update eligible PRs
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# The default token is read-only. GitHub CLI uses the separately provisioned
+# PR_UPDATE_TOKEN, so branch writes emit normal events and rerun required CI.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: auto-update-eligible-prs
+  cancel-in-progress: false
+
+jobs:
+  autoupdate:
+    # Keep the workflow inert until an owner provisions a fine-grained token (or
+    # GitHub App token) with pull-request and contents write access.
+    if: ${{ vars.PR_UPDATE_PRS_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PR_UPDATE_TOKEN }}
+    steps:
+      - name: Update auto-merge PR branches that are behind main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+
+          pending_prs="$(mktemp)"
+          trap 'rm -f "$pending_prs"' EXIT
+          gh pr list --repo "$GITHUB_REPOSITORY" --base main --state open --limit 1000 \
+            --json number,autoMergeRequest,labels,mergeStateStatus \
+            --jq '.[]
+              | select(.autoMergeRequest != null)
+              | select(.mergeStateStatus == "BEHIND")
+              | select(any(.labels[]; .name == "do-not-update") | not)
+              | .number' \
+            | awk 'NR <= 5 { print }' > "$pending_prs"
+
+          while IFS= read -r pr; do
+            echo "Updating PR #$pr"
+            for attempt in 1 2 3; do
+              if gh pr update-branch "$pr" --repo "$GITHUB_REPOSITORY"; then
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                exit 1
+              fi
+              sleep 2
+            done
+          done < "$pending_prs"

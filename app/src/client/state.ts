@@ -79,6 +79,33 @@ export async function getPreferences(env: Env, userId: string): Promise<ClientPr
   return mapPreferences(row, userId);
 }
 
+const PREF_COLS =
+  'user_id, saved_filters, watchlist, notification_settings, default_window, updated_at';
+
+/** One round-trip for APNs fan-out. Missing users are omitted (caller defaults). */
+export async function listPreferencesByUserIds(
+  env: Env,
+  userIds: string[],
+): Promise<Map<string, ClientPreferences>> {
+  const ids = [...new Set(userIds.map((id) => id.trim()).filter(Boolean))];
+  const out = new Map<string, ClientPreferences>();
+  if (ids.length === 0) return out;
+  const placeholders = ids.map(() => '?').join(',');
+  try {
+    const rows = await all<PreferencesRow>(
+      env.DB,
+      `SELECT ${PREF_COLS} FROM user_preferences WHERE user_id IN (${placeholders})`,
+      ids,
+    );
+    for (const row of rows) {
+      out.set(row.user_id, mapPreferences(row, row.user_id));
+    }
+  } catch {
+    /* table optional in older test fixtures */
+  }
+  return out;
+}
+
 export async function upsertPreferences(
   env: Env,
   userId: string,

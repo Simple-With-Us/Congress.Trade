@@ -1,36 +1,181 @@
 name: CI
 
+# The `schedule:` trigger is a BACKSTOP, not a second CI cadence. A PR merged
+# by github-actions[bot] (auto-merge armed with GITHUB_TOKEN) produces a push
+# to main that GitHub's recursion guard suppresses entirely -- measured here:
+# sha c38b6787 (PR #1835, bot-merged) dispatched ZERO runs, while sha ceaca097
+# (PR #1836, human-merged) dispatched five. The post-merge squash sha on main
+# therefore never got verified. `schedule:` events are NOT subject to that
+# guard, so this tick notices an unverified main sha and runs CI on it.
+#
+# The schedule-gate job below makes every other tick a ~10-second no-op, so the
+# normal case costs one short ubuntu-latest job per hour and nothing else.
+# The root-cause fix is in .github/workflows/auto-merge-prs.yml (stop merging
+# as github-actions[bot]); this stays as defence in depth for any bot merge
+# that still slips through, e.g. Dependabot.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Hourly, off the top of the hour (GitHub throttles :00 stampedes).
+    - cron: '23 * * * *'
 
-# Cancel superseded runs on the same ref to save minutes.
+# Cancel superseded runs on the same ref to save minutes. Keyed on the event as
+# well as the ref so the scheduled backstop and a real push to main cannot
+# cancel each other -- push-vs-push and PR-vs-PR still supersede as before.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  # Cheap decision job. For every non-schedule event it immediately votes "run"
+  # and CI behaves exactly as it always has. For a scheduled tick it asks the
+  # Actions API whether main's current HEAD was already VERIFIED -- meaning some
+  # other run of this workflow ran the `typecheck + test` job itself to success,
+  # not merely that a run for that sha concluded green (a gate-skipped tick
+  # concludes green while verifying nothing). A run already in flight also
+  # suppresses this tick.
+  #
+  # Fail-closed on purpose: any API error, empty response, or unparseable
+  # result votes RUN. A backstop that silently stops backstopping is worse than
+  # one that occasionally re-runs.
+  schedule-gate:
+    name: scheduled backstop gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - name: Decide whether this run should proceed
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          if [ "$EVENT" != "schedule" ]; then
+            echo "should_run=1" >> "$GITHUB_OUTPUT"
+            echo "event=${EVENT}: normal CI, gate does not apply."
+            exit 0
+          fi
+
+          resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=100")" || resp=""
+          if [ -z "$resp" ]; then
+            echo "::warning::Could not read prior CI runs for ${SHA}; failing closed and running CI."
+            echo "should_run=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A run's own CONCLUSION is not proof that anything was verified.
+          # When this gate votes skip, every downstream job is `skipped`, and a
+          # workflow run whose jobs all skipped concludes as **success**. So a
+          # no-op scheduled tick looks identical to a real CI pass. Left
+          # unhandled that is self-latching: tick 1 sees a queued run and skips;
+          # that queued run then fails or is cancelled; tick 2 now counts tick
+          # 1's own no-op "success" as proof and skips forever, and the backstop
+          # silently stops backstopping -- the exact failure class this whole PR
+          # exists to fix. (Reported by the Codex reviewer on PR #1165.)
+          #
+          # So proof requires the VERIFICATION JOB itself to have succeeded, not
+          # merely the run wrapping it. in_progress/queued still short-circuit
+          # THIS tick (no point duplicating work already under way), and that is
+          # now safe precisely because such a tick no longer becomes proof for
+          # the next one.
+          active="$(printf '%s' "$resp" | jq -r --arg me "${GITHUB_RUN_ID}" '
+            [ .workflow_runs[]
+              | select((.id|tostring) != $me)
+              | select(.status == "in_progress" or .status == "queued")
+            ] | length')" || active=""
+          candidates="$(printf '%s' "$resp" | jq -r --arg me "${GITHUB_RUN_ID}" '
+            .workflow_runs[]
+            | select((.id|tostring) != $me)
+            | select(.conclusion == "success")
+            | .id')" || candidates=""
+          case "$active" in
+            ''|*[!0-9]*)
+              echo "::warning::Unparseable run list for ${SHA}; failing closed and running CI."
+              echo "should_run=1" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          verified=0
+          for run_id in $candidates; do
+            jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")" || jobs=""
+            if [ -z "$jobs" ]; then
+              # Cannot tell what that run actually did. Fail closed: treat it as
+              # NOT proof, so at worst the backstop re-runs.
+              echo "could not read jobs for run ${run_id}; not counting it as proof."
+              continue
+            fi
+            hit="$(printf '%s' "$jobs" | jq -r --arg n "typecheck + test" '
+              [ .jobs[] | select(.name == $n) | select(.conclusion == "success") ] | length')" || hit=""
+            case "$hit" in
+              ''|*[!0-9]*) hit=0 ;;
+            esac
+            if [ "$hit" -gt 0 ]; then
+              echo "run ${run_id} genuinely ran typecheck + test to success."
+              verified=$((verified + 1))
+            else
+              echo "run ${run_id} concluded success but typecheck + test did not run (a skipped no-op); not proof."
+            fi
+          done
+
+          if [ "$verified" -gt 0 ] || [ "$active" -gt 0 ]; then
+            echo "should_run=0" >> "$GITHUB_OUTPUT"
+            echo "CI already verified (${verified}) or is running (${active}) for ${SHA}; backstop skips."
+          else
+            echo "should_run=1" >> "$GITHUB_OUTPUT"
+            echo "::warning::No CI run exists for main sha ${SHA} -- a bot merge dispatched nothing. Running the backstop."
+            {
+              echo "### CI backstop engaged"
+              echo
+              echo "main sha \`${SHA}\` had no CI run. That is the bot-merge dispatch"
+              echo "dropout; see \`.github/workflows/auto-merge-prs.yml\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # `typecheck + test` is a REQUIRED check and now `needs:` this job, so
+          # this step must never be the reason a PR cannot merge.
+          exit 0
+
   build:
     name: typecheck + test
-    # Self-hosted CI with automatic hosted fallback. Set CT_CI_RUNNER repo
-    # variable to 'congress-ci' for owned runner, clear/delete for hosted.
-    # Dependabot forced to hosted runners for security.
+    # GitHub-hosted only. Do not restore a private-repo oracle-ci / self-hosted
+    # branch — a later private flip must not send Linux CI back to the box.
+    needs: [schedule-gate]
+    # `!cancelled()`, NOT the bare gate output. `needs:` alone would let a
+    # FAILED or timed-out schedule-gate job skip this one, and GitHub reports a
+    # skipped required check as SATISFIED -- so a gate outage would silently let
+    # a PR merge with tsc/tests never having run. That is the exact inverse of
+    # what the backstop is for. Failing closed inside the step is not enough;
+    # the job-level condition has to fail closed too. `!= '0'` means an absent
+    # or unparseable output still RUNS; only an explicit "already verified"
+    # vote skips, and only on the scheduled path.
+    # Fork PRs must run this required job. GitHub treats a skipped required
+    # check as satisfied, so a same-repo-only `if:` would let a fork merge
+    # without tsc/tests. congress-trading-shared is public and vendored;
+    # `npm ci` does not need GH_PAT. This job is contents:read on ubuntu-latest.
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ vars.CT_CI_RUNNER != '' && github.event.repository.private && fromJSON('["self-hosted", "oracle-ci"]') || 'ubuntu-latest' }}
+      !cancelled() &&
+      (github.event_name != 'schedule' ||
+      needs.schedule-gate.outputs.should_run != '0')
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
       run:
         working-directory: app
     steps:
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The persistent workspace may have been left in sparse-checkout mode by
       # an older reporter run. Explicitly restore every tracked path before a
@@ -43,9 +188,9 @@ jobs:
           test -f scripts/check-actions-runner-policy.mjs
           test -d app
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 22
+          node-version: 26
 
       # package.json typecheck is `deno check`; Coolify runners do not ship Deno.
       - name: Install Deno CLI
@@ -53,7 +198,97 @@ jobs:
 
       - name: Enforce owned-runner workflow policy
         working-directory: .
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
+
+      - name: Hetzner resource digest ops tests (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/hetzner-resource-digest.sh
+          bash scripts/ops/test-hetzner-resource-digest.sh
+
+      # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
+      # Does not talk to Docker, Coolify, or the origin.
+      - name: Deploy overlap policy tests
+        working-directory: .
+        run: bash scripts/ops/test-deploy-overlap.sh
+
+      # Offline restore drill. Temp databases only; no host and no live sqlite file.
+      - name: Sqlite backup restore drill
+        working-directory: .
+        run: |
+          if ! command -v sqlite3 >/dev/null || ! command -v zstd >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sqlite3 zstd
+          fi
+          bash scripts/ops/test-fleet-backup-restore-drill.sh
+      - name: Fleet CPU sampler offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/cpu-sampler.sh
+          bash -n scripts/ops/cpu-history-report.sh
+          bash scripts/ops/test-fleet-cpu-sampler.sh
+
+      - name: B2 backup report (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/b2-backup-report.sh
+          bash -n scripts/ops/test-b2-backup-report.sh
+          bash scripts/ops/test-b2-backup-report.sh
+
+      - name: Inode usage report offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/inode-usage-report.sh
+          bash scripts/ops/test-inode-usage-report.sh
+
+      # Temp sqlite files only.  No Docker, Coolify, or production database.
+      - name: SQLite maintenance policy tests
+        working-directory: .
+        run: bash scripts/ops/test-sqlite-maintenance.sh
+
+      - name: Fleet log cap ops tests (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/fleet-log-cap-report.sh
+          bash -n scripts/ops/fleet-log-cap-install.sh
+          bash scripts/ops/test-fleet-log-cap.sh
+
+      - name: Root disk usage report tests (offline)
+        working-directory: .
+        run: bash scripts/ops/test-root-disk-usage-report.sh
+
+      - name: Host swap report offline tests
+        working-directory: .
+        run: |
+          bash -n scripts/ops/host-swap-report.sh
+          bash scripts/ops/test-host-swap-report.sh
+
+      - name: Sentry deploy reporter + browser sourcemap tests
+        working-directory: .
+        run: node --test scripts/sentry-report-deploy.node-test.mjs scripts/sentry-upload-browser-sourcemaps.node-test.mjs scripts/ops/post-merge-sentinel.node-test.mjs scripts/ops/tmp-hygiene-report.node-test.mjs
+
+      # CT-2506 offline retention. Temp dirs only. No host and no Backblaze.
+      - name: Local backup retention tests
+        working-directory: .
+        run: bash scripts/ops/test-local-backup-retention.sh
+
+      # prod is the only Infisical environment (owner 2026-10-10).  Offline:  a
+      # stub `infisical` first on PATH records its arguments, so the real CLI,
+      # network and credentials are never reached.
+      - name: Infisical safe wrapper is prod-only
+        working-directory: .
+        run: |
+          bash -n scripts/infisical-secrets-safe.sh
+          node --test scripts/infisical-secrets-safe.test.mjs
+
+      # Local Infisical bootstrap reads the machine identity from env, then a
+      # fake `fleet-secrets` stub.  Offline: no real CLI, network or credentials.
+      - name: Local dev-vars bootstrap tests
+        working-directory: .
+        run: node --test scripts/merge-local-dev-vars.test.mjs
 
       # Static guard for the class of defect behind the sqlite-web finding: a
       # security-relevant variable given a fail-open default, or a password
@@ -87,14 +322,217 @@ jobs:
 
           exit $status
 
+      # CT-2459: deno.json (what Deno serves) and package.json (what Vitest
+      # tests) version the same packages twice and had drifted (hono, unpdf,
+      # zod). Fail on a MAJOR divergence; warn on minor/patch drift so it is
+      # visible without blocking on the pre-existing drift. Full equality
+      # needs a deno.lock regen, tracked separately.
+      - name: Assert deno.json and package.json version parity
+        run: |
+          node -e "
+          const fs = require('fs');
+          const deno = JSON.parse(fs.readFileSync('deno.json', 'utf8'));
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const deps = pkg.dependencies || {};
+          let fail = 0;
+          for (const spec of Object.values(deno.imports || {})) {
+            const m = /^npm:((?:@[^/]+\/)?[^@/]+)@([^/]+)/.exec(spec);
+            if (!m) continue;
+            const want = deps[m[1]];
+            if (!want) continue;
+            const norm = (s) => s.replace(/^[\^~>=<\s]+/, '');
+            const a = norm(m[2]), b = norm(want);
+            if (a === b) continue;
+            if (a.split('.')[0] !== b.split('.')[0]) {
+              console.log('::error::deno<->package MAJOR drift for ' + m[1] + ': deno.json ' + m[2] + ' vs package.json ' + want);
+              fail = 1;
+            } else {
+              console.log('::warning::deno<->package version drift for ' + m[1] + ': deno.json ' + m[2] + ' vs package.json ' + want);
+            }
+          }
+          process.exit(fail);
+          "
+
       - name: Install dependencies
         run: npm ci
 
       - name: Typecheck
         run: npm run typecheck
 
+      # CT-1500: the dashboard's ~546 KB of browser JavaScript used to live only
+      # in a TypeScript template literal, so `deno check` saw a string and eslint
+      # saw nothing — an undefined global shipped without anything failing. These
+      # two steps make that code a real lintable source file and keep the served
+      # string generated from it.
+      - name: Lint the dashboard client (no-undef, browser globals)
+        run: npm run lint:client
+
+      - name: Verify the served dashboard client matches its source
+        run: npm run check:client
+
+      # CT-2459: coverage instrumentation on every PR was pure overhead.
+      # PRs run the plain suite; thresholds in vitest.config.ts are enforced
+      # by the coverage run on push-to-main (and schedule/dispatch).
+      - name: Test (pull request)
+        if: github.event_name == 'pull_request'
+        run: npm test
+
       - name: Test with coverage thresholds
+        if: github.event_name != 'pull_request'
         run: npm run coverage
 
       - name: Audit
         run: npm audit
+
+  # `app/` gates do not touch services/scan-cpu-worker at all, so a Python
+  # service could break completely and CI stayed green. That is exactly how
+  # PR #1620 shipped an image whose entrypoint could not import (form_chrome.py
+  # added and imported, never added to the Dockerfile COPY list) — the OCR
+  # worker crash-looped in production until 2026-08-11 with no CI signal.
+  scan-cpu-worker:
+    name: scan-cpu-worker (python)
+    needs: [schedule-gate]
+    # `!cancelled()`, NOT the bare gate output. `needs:` alone would let a
+    # FAILED or timed-out schedule-gate job skip this one, and GitHub reports a
+    # skipped required check as SATISFIED -- so a gate outage would silently let
+    # a PR merge with tsc/tests never having run. That is the exact inverse of
+    # what the backstop is for. Failing closed inside the step is not enough;
+    # the job-level condition has to fail closed too. `!= '0'` means an absent
+    # or unparseable output still RUNS; only an explicit "already verified"
+    # vote skips, and only on the scheduled path.
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'schedule' ||
+      needs.schedule-gate.outputs.should_run != '0')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: services/scan-cpu-worker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.15'
+
+      # The existing worker tests import checkbox/form_chrome, which pull in
+      # numpy and OpenCV, so the runtime requirements are needed too — not just
+      # pytest.
+      - name: Install deps
+        run: |
+          pip install --disable-pip-version-check -r requirements.txt
+          pip install --disable-pip-version-check pytest
+
+      - name: Test (includes Dockerfile COPY-vs-imports guard)
+        run: python -m pytest tests -q
+
+  # The ship script decides release version numbers and whether a merge becomes
+  # a TestFlight upload, but it only ever runs on the owned Mac runner, so a
+  # defect in it is invisible until a real ship. That is how the 2026-08-12
+  # ordering bug landed: a rate-limited attempt still consumed a build number
+  # (sequence 5 -> 6 for a build that shipped nowhere). These tests are fully
+  # offline -- fake xcodebuild, scratch HOME/state, no credentials, no network.
+  ios-fleet-ship-logic:
+    name: ios-fleet ship numbering (bash)
+    needs: [schedule-gate]
+    # `!cancelled()`, NOT the bare gate output. `needs:` alone would let a
+    # FAILED or timed-out schedule-gate job skip this one, and GitHub reports a
+    # skipped required check as SATISFIED -- so a gate outage would silently let
+    # a PR merge with tsc/tests never having run. That is the exact inverse of
+    # what the backstop is for. Failing closed inside the step is not enough;
+    # the job-level condition has to fail closed too. `!= '0'` means an absent
+    # or unparseable output still RUNS; only an explicit "already verified"
+    # vote skips, and only on the scheduled path.
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'schedule' ||
+      needs.schedule-gate.outputs.should_run != '0')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Syntax-check the ship scripts
+        run: |
+          bash -n scripts/ios-fleet/ship-testflight.sh
+          bash -n scripts/ios-fleet/test-ship-seq.sh
+          bash -n scripts/ios-fleet/scheduled-ship-gate.sh
+          bash -n scripts/ios-fleet/test-scheduled-ship-gate.sh
+          bash -n scripts/ios-fleet/seed-last-ship.sh
+          bash -n scripts/ios-fleet/test-seed-last-ship.sh
+          bash -n scripts/ios-ship-testflight.sh
+          bash -n scripts/ios-stage-asc-key.sh
+          bash -n scripts/test-ios-stage-asc-key.sh
+          bash -n scripts/ios-ci-xctest.sh
+          bash -n scripts/ios-assert-stable-xcode.sh
+          bash -n scripts/ios-fleet/publish-ios-versions.sh
+          bash -n scripts/ios-fleet/test-asc-credentials.sh
+          bash -n scripts/ios-fleet/test-tf-ready-labels.sh
+          bash -n scripts/ios-report-post-sync-tf-ready.sh
+          node --check scripts/ios-fleet/asc-api.mjs
+          node --check scripts/ios-fleet/asc-key.mjs
+          node --check scripts/ios-fleet/version-plan.mjs
+          node --check scripts/ios-fleet/test-asc-key.test.mjs
+          node --check scripts/ios-fleet/appstore-version-plan.test.mjs
+          node --check scripts/ios-fleet/seed-last-ship.mjs
+          node --check scripts/ios-fleet/seed-last-ship.test.mjs
+
+      - name: Fleet version publish guard
+        run: node --test scripts/ios-fleet/publish-ios-versions.test.mjs
+
+      - name: Fleet version numbering (offline)
+        run: node --test scripts/ios-fleet/version-plan.test.mjs
+
+      - name: Fleet shared build counter (offline)
+        run: node --test scripts/ios-fleet/shared-build.test.mjs
+
+      - name: App Store version plan promo diagnostics (offline)
+        run: node --test scripts/ios-fleet/appstore-version-plan.test.mjs
+
+      - name: AppUpdatePrompt pin copy
+        run: node --test scripts/ios-fleet/app-update-prompt-pin.test.mjs
+
+      - name: ASC key module (offline)
+        run: node --test scripts/ios-fleet/test-asc-key.test.mjs
+
+      - name: ASC credential resolution (offline)
+        run: bash scripts/ios-fleet/test-asc-credentials.sh
+
+      - name: ios-ship workflow contract
+        run: node --test scripts/ios-ship-workflow.test.mjs
+
+      - name: Last-ship seed helper
+        run: |
+          node --test scripts/ios-fleet/seed-last-ship.test.mjs
+          bash scripts/ios-fleet/test-seed-last-ship.sh
+
+      - name: ensure-tf-ready return-code labels (offline)
+        run: bash scripts/ios-fleet/test-tf-ready-labels.sh
+
+      - name: External TestFlight beta promotion
+        run: node --test scripts/promote-external-beta.node-test.mjs
+
+      - name: ASC credentials helper (offline)
+        run: python3 scripts/asc/test_asc_creds.py
+
+      - name: iOS signing key-file handoff
+        run: bash scripts/test-ios-stage-asc-key.sh
+
+      - name: Build-number + ship-gate tests
+        run: bash scripts/ios-fleet/test-ship-seq.sh
+
+      # The scheduled ios-ship cron has no `paths:` filter of its own, so this
+      # gate is the only thing keeping a backend-only commit from becoming a
+      # TestFlight build. It runs solely on the Mac runner, so test it here.
+      - name: Scheduled ship gate tests
+        run: bash scripts/ios-fleet/test-scheduled-ship-gate.sh
+
+      # Docs-only main merges must not rebuild congress-app.  Same matcher
+      # Coolify watch_paths / fleet-deploy-guard use.
+      - name: Coolify deploy-relevance tests
+        run: |
+          bash -n scripts/ops/coolify-watch-paths.sh
+          bash -n scripts/ops/test-deploy-relevance.sh
+          python3 -m py_compile scripts/ops/deploy_relevance.py
+          bash scripts/ops/test-deploy-relevance.sh

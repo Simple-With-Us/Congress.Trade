@@ -207,6 +207,19 @@ ACCESS_TEAM_DOMAIN=""
 SEED_HOUSE_URL=""
 SEED_SENATE_URL=""
 
+# Senate eFD server Chromium.  EXPERIMENTAL and unverified against Akamai
+# from the Hetzner IP.  Both flags default off.  The browser path that works
+# is the Mac efd-fetcher.  The image also needs playwright and Chromium
+# before either flag can succeed.
+# SENATE_EFD_BROWSER_FALLBACK=true  HTTP first; Chromium after a proxy
+#   timeout/unreachable or an Akamai edge deny.  The browser uses the proxy
+#   when that proxy returned the deny, and goes direct when the proxy never
+#   answered.
+# SENATE_EFD_BROWSER_FETCH=true     Chromium is the only transport.  Wins when
+#   both flags are set.
+# SENATE_EFD_HIDE_AUTOMATION=true   --disable-blink-features=AutomationControlled
+# SENATE_EFD_BROWSER_HEADLESS=false headed Chromium.  Unset means headless.
+
 # Set to "false" to disable the intraday House live-search overlay (the watcher
 # falls back to the daily bulk-XML diff, which is always used regardless).
 HOUSE_LIVE_SEARCH_ENABLED=""
@@ -231,12 +244,29 @@ APP_BASE_URL=""
 # Throttled to at most one alert per 12h.
 ALERT_EMAIL=""
 
-# Sentry error monitoring (Cloudflare Workers SDK).
-# Get this from Sentry → Projects → congress-trade → Settings → Client Keys (DSN).
+# Sentry error monitoring (@sentry/deno). Production DSN lives in Infisical /
+# Coolify only — never commit a live value. Leave blank locally (SDK no-ops).
 SENTRY_DSN=""
 # Tags events/logs with this environment. Defaults to unset in local dev; the
 # production/preview values are already set as wrangler.toml [vars].
 SENTRY_ENVIRONMENT="development"
+
+# Datadog (existing fleet account).  Leave blank locally — missing/partial
+# keys fail closed (no send).  Coolify / Infisical names:
+#   DD_API_KEY + DD_SITE          backend logs + APM (required together)
+#   DD_APP_KEY                    unused for send; fleet registry only
+#   DD_CLIENT_TOKEN               public RUM client token
+#   DD_APPLICATION_ID             public RUM application id
+# Aliases: DD_RUM_*, NEXT_PUBLIC_DD_*
+# DD_TRACE_AGENTLESS_GUARDS=true pins dynamic instrumentation, profiling, and
+# remote config off when no DD_AGENT_HOST / DD_TRACE_AGENT_URL is set. Leave
+# blank to keep today's tracer init. It does not disable agentless APM.
+DD_TRACE_AGENTLESS_GUARDS=""
+DD_API_KEY=""
+DD_APP_KEY=""
+DD_SITE=""
+DD_CLIENT_TOKEN=""
+DD_APPLICATION_ID=""
 
 # Billing (Stripe) — freemium paywall. Premium unlocks full history + CSV export.
 #   - STRIPE_SECRET_KEY: sk_live_… / sk_test_… (enables billing; absent => 503)
@@ -257,12 +287,32 @@ STRIPE_TRIAL_DAYS="7"
 # curl/scripts against local /api/* data endpoints (or send a browser UA).
 SCRAPE_GUARD_ENABLED="true"
 
+# Origin lock (CT-1337). Leave unset or "false": traffic is unchanged.
+# Set ORIGIN_LOCK_ENABLED to true/1/yes/on only after Cloudflare can prove
+# itself, either because the proxy's X-Real-IP is a Cloudflare edge address
+# or because a Transform Rule sends X-CT-Origin-Secret. Docker/Traefik health
+# probes to /health and /api/health from loopback or the docker network stay
+# allowed. ORIGIN_LOCK_TRUSTED_PROXIES adds CIDRs to the built-in loopback and
+# private ranges. ORIGIN_LOCK_AOP_HEADER is the header a trusted proxy sets
+# after verifying Authenticated Origin Pulls (value defaults to SUCCESS).
+# ORIGIN_LOCK_ENABLED=""
+# ORIGIN_LOCK_SECRET=""
+# ORIGIN_LOCK_TRUSTED_PROXIES=""
+# ORIGIN_LOCK_AOP_HEADER=""
+# ORIGIN_LOCK_AOP_VALUE=""
+
 # Executive-branch (OGE Form 278-T) filings watcher — Presidential trades.
-# Polls the OGE President/VP index (~6h, fail-soft); rows land as
+# Cadence is the same adaptive probeSchedule / decideSourcePoll path as
+# House/Senate (weekday 15-minute coverage floor, weekend hourly like House).
+# OGE_POLL_INTERVAL_SEC is unused — leftover Infisical 21600 must not
+# re-impose a 6h gate.  Server-first: direct extapps2.oge.gov, then
+# Mac/scout relay if OGE_RELAY_URL or INGEST_RELAY_URL is set and
+# direct fails.  Senate stays Mac-first (Imperva).  Rows land as
 # chamber='executive' and stay OUT of the default feed/analytics until the
-# Executive chip / chamber filter opts in. Filings over OGE_MAX_VISION_BYTES
+# Executive chip / chamber filter opts in.  Filings over OGE_MAX_VISION_BYTES
 # (default 6MB) route straight to review instead of vision extraction.
 OGE_WATCH_ENABLED="true"
 OGE_INDEX_URL=""
-OGE_POLL_INTERVAL_SEC="21600"
+# Unused. Adaptive probe schedule is the authority.
+OGE_POLL_INTERVAL_SEC=""
 OGE_MAX_VISION_BYTES="6000000"

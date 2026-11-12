@@ -3,6 +3,7 @@ import { buildTransactionsQuery, buildTransactionsCountQuery } from '../rows.ts'
 import { matchesFiltersWithChamber } from '../subscriptions.ts';
 import { buildCommonFilters, asChambers } from '../../analytics/sql.ts';
 import type { Transaction } from '../../shared/types.ts';
+import { freshDeliveryDay, freshDeliveryIso } from './freshDeliveryFixtures.ts';
 
 /**
  * Executive (OGE 278-T) rows are now INCLUDED in the feed, analytics, and 
@@ -60,7 +61,17 @@ describe('analytics default includes executive', () => {
 });
 
 describe('subscription delivery default includes executive', () => {
-  const tx = { id: 't1', ticker: 'NVDA', txType: 'B', amountMin: 1001, amountMax: 15000 } as unknown as Transaction;
+  const tx = {
+    id: 't1',
+    ticker: 'NVDA',
+    txType: 'B',
+    amountMin: 1001,
+    amountMax: 15000,
+    txDate: freshDeliveryDay,
+    filedDate: freshDeliveryDay,
+    firstSeenAt: freshDeliveryIso,
+    createdAt: freshDeliveryIso,
+  } as unknown as Transaction;
 
   it('a subscription with NO chambers filter receives executive rows', () => {
     expect(matchesFiltersWithChamber(tx, {}, 'house')).toBe(true);

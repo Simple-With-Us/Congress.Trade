@@ -9,10 +9,15 @@
 import { describe, it, expect } from 'vitest';
 import {
   BRACKET_MIDPOINT_SQL,
+  STOCK_MIDPOINT_SQL,
   PARTY_BUCKET_SQL,
   asChamber,
   asPartyBucket,
+  asPartyBuckets,
   asSourceFilter,
+  asTxType,
+  asTxTypes,
+  constrainTxTypes,
   asWindow,
   autoGranularity,
   buildCommonFilters,
@@ -23,6 +28,7 @@ import {
   windowToOffset,
   windowDays,
 } from '../sql.ts';
+import { TWIN_DEDUPE_SQL } from '../../shared/tradeIdentity.ts';
 
 describe('validators', () => {
   it('asWindow accepts preset + custom <N>d windows and falls back otherwise', () => {
@@ -64,11 +70,38 @@ describe('validators', () => {
     expect(asPartyBucket(undefined)).toBeUndefined();
   });
 
+  it('asPartyBuckets parses CSV and IN-filters multiple buckets', () => {
+    expect(asPartyBuckets('D,R')).toEqual(['D', 'R']);
+    expect(asPartyBuckets('R, D, R')).toEqual(['D', 'R']);
+    expect(asPartyBuckets('')).toBeUndefined();
+    const { where, params } = buildCommonFilters({ window: '90d', parties: ['D', 'R'] });
+    expect(where.join(' AND ')).toContain('IN (?, ?)');
+    expect(params).toEqual(expect.arrayContaining(['D', 'R']));
+  });
+
   it('asChamber / asSourceFilter validate against known sets', () => {
     expect(asChamber('house')).toBe('house');
     expect(asChamber('xyz')).toBeUndefined();
     expect(asSourceFilter('primary')).toBe('primary');
     expect(asSourceFilter('bogus')).toBe('all');
+  });
+
+  it('asTxType / asTxTypes parse B/S/E and expand legacy P to Buy', () => {
+    expect(asTxType('B')).toBe('B');
+    expect(asTxType('P')).toBe('B');
+    expect(asTxType('S')).toBe('S');
+    expect(asTxType('E')).toBe('E');
+    expect(asTxType('X')).toBeUndefined();
+    expect(asTxTypes('B,S')).toEqual(['B', 'S']);
+    expect(asTxTypes('P,S,B')).toEqual(['B', 'S']);
+    expect(asTxTypes('')).toBeUndefined();
+    expect(asTxTypes('nope')).toBeUndefined();
+  });
+
+  it('constrainTxTypes intersects a request with an endpoint universe', () => {
+    expect(constrainTxTypes(undefined, ['B', 'S'])).toEqual(['B', 'S']);
+    expect(constrainTxTypes(['B'], ['B', 'S'])).toEqual(['B']);
+    expect(constrainTxTypes(['E'], ['B', 'S'])).toEqual(['__none__']);
   });
 
   it('accepts calendar-year window presets', () => {
@@ -108,13 +141,17 @@ describe('SQL fragments', () => {
   it('bracket midpoint guards the open-ended top tier (amount_max IS NULL)', () => {
     expect(BRACKET_MIDPOINT_SQL).toContain('t.amount_max IS NOT NULL');
     expect(BRACKET_MIDPOINT_SQL).toContain('(t.amount_min + t.amount_max) / 2.0');
+    expect(BRACKET_MIDPOINT_SQL).toContain("t.source = 'competitor_backfill'");
+    expect(STOCK_MIDPOINT_SQL).toContain('t.is_option = 1');
   });
 
-  it('party bucket classifies known parties and leaves unknown as NULL', () => {
+  it("party bucket classifies D and R and folds everything else (incl. no party) into 'O'", () => {
     expect(PARTY_BUCKET_SQL).toContain("= 'D'");
     expect(PARTY_BUCKET_SQL).toContain("= 'R'");
-    expect(PARTY_BUCKET_SQL).toContain("IN ('I', 'O') THEN 'O'");
-    expect(PARTY_BUCKET_SQL).toContain('ELSE NULL');
+    // Total, never NULL: All must equal D + R + O (board efd94c45; the real-SQL
+    // invariant lives in partyPartition.test.ts).
+    expect(PARTY_BUCKET_SQL).toContain("ELSE 'O' END");
+    expect(PARTY_BUCKET_SQL).not.toContain('NULL END');
   });
 });
 
@@ -130,7 +167,8 @@ describe('buildCommonFilters', () => {
     expect(where[3]).toBe(
       "NOT (t.source = 'competitor_backfill' AND t.filer_id LIKE 'EXEC-%' AND t.doc_id LIKE 'COMPETITOR%')",
     );
-    expect(where[4]).toBe("t.tx_date >= date('now', ?)");
+    expect(where[4]).toBe(TWIN_DEDUPE_SQL);
+    expect(where[5]).toBe("t.tx_date >= date('now', ?)");
     expect(params[0]).toBe('-30 days');
   });
 
@@ -155,9 +193,10 @@ describe('buildCommonFilters', () => {
       "SUBSTR(t.doc_id, 1, 17) != 'provider-missing-'",
       't.filer_id IS NOT NULL',
       "NOT (t.source = 'competitor_backfill' AND t.filer_id LIKE 'EXEC-%' AND t.doc_id LIKE 'COMPETITOR%')",
+      TWIN_DEDUPE_SQL,
       "t.tx_date >= date('now', ?)",
       'COALESCE(fl.chamber, f.chamber) = ?',
-      "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) IN ('I', 'O') THEN 'O' ELSE NULL END) = ?",
+      "(CASE WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'D' THEN 'D' WHEN UPPER(SUBSTR(TRIM(COALESCE(fl.party, '')), 1, 1)) = 'R' THEN 'R' ELSE 'O' END) = ?",
       "t.source IN ('primary', 'manual')",
       't.confidence >= ?',
     ]);
@@ -186,6 +225,11 @@ describe('buildCommonFilters', () => {
     const { where, params } = buildCommonFilters({ window: 'all', tickers: ['AAPL', 'MSFT', 'NVDA'] });
     expect(where.some((w) => w === 't.ticker IN (?, ?, ?)')).toBe(true);
     expect(params).toEqual(['AAPL', 'MSFT', 'NVDA']);
+  });
+
+  it('always applies the canonical-trade twin guard so one real-world trade counts once', () => {
+    const { where } = buildCommonFilters({ window: 'all' });
+    expect(where).toContain(TWIN_DEDUPE_SQL);
   });
 
   it('excludeOptions adds an is_option = 0 clause (no bind), off by default', () => {

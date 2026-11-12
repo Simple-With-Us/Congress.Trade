@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
+import type { Env } from '../../shared/types.ts';
 import {
   APPLE_PRODUCT_ANNUAL,
   APPLE_PRODUCT_MONTHLY,
+  appleSandboxPurchasesAllowed,
   appleTransactionIsActive,
   assertAppleJwsShape,
+  isAppleSandboxEnvironment,
   planFromAppleProductId,
 } from '../apple.ts';
 
@@ -48,5 +51,23 @@ describe('apple IAP helpers', () => {
         revocationDate: Date.now() - 10,
       }),
     ).toBe(false);
+  });
+
+  it('detects Apple Sandbox environments case-insensitively', () => {
+    expect(isAppleSandboxEnvironment('Sandbox')).toBe(true);
+    expect(isAppleSandboxEnvironment('sandbox')).toBe(true);
+    expect(isAppleSandboxEnvironment('Production')).toBe(false);
+    expect(isAppleSandboxEnvironment(undefined)).toBe(false);
+  });
+
+  it('allows Apple-signed Sandbox JWS unless APPLE_ALLOW_SANDBOX is explicitly false', async () => {
+    // Unset is the production default: TestFlight, App Review, and Designed-for-iPad
+    // on Mac all send environment=Sandbox to congress.trade.
+    expect(await appleSandboxPurchasesAllowed({} as Env)).toBe(true);
+    expect(await appleSandboxPurchasesAllowed({ APPLE_ALLOW_SANDBOX: 'true' } as Env)).toBe(true);
+    expect(await appleSandboxPurchasesAllowed({ APPLE_ALLOW_SANDBOX: 'TRUE' } as Env)).toBe(true);
+    expect(await appleSandboxPurchasesAllowed({ APPLE_ALLOW_SANDBOX: 'false' } as Env)).toBe(false);
+    expect(await appleSandboxPurchasesAllowed({ APPLE_ALLOW_SANDBOX: '0' } as Env)).toBe(false);
+    expect(await appleSandboxPurchasesAllowed({ APPLE_ALLOW_SANDBOX: 'no' } as Env)).toBe(false);
   });
 });

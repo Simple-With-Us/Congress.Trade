@@ -22,9 +22,10 @@ If an open PR or another worktree touches the same files, inspect changed files
 and checks, then choose a disjoint slice, coordinate through a deliberate
 integration branch, or stop and report the overlap.
 
-The runnable app is in `app/`. Do not deploy, push, provision Cloudflare
-resources, apply remote D1 migrations, run production scripts, or start
-production backfills/ingestion unless Jay explicitly asks.
+The runnable app is in `app/`.  Production is Coolify Deno-in-Docker on
+Hetzner, not a Cloudflare Worker.  Do not deploy, push, provision host or
+Cloudflare resources, apply production migrations, run production scripts,
+or start production backfills/ingestion unless Jay explicitly asks.
 
 For code changes, verify from `app/` with:
 

@@ -10,6 +10,7 @@ import type { BillingPlan, Env, User } from '../shared/types.ts';
 import { batch, get, run } from '../shared/db.ts';
 import { getUserById } from '../auth/users.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
+import { stripeObjectId, type StripeSubscriptionObject } from './stripe.ts';
 
 /** Map a Stripe Price id to our plan cadence, or null if it isn't ours. */
 export function planForPrice(env: Env, priceId: string | null | undefined): BillingPlan | null {
@@ -46,7 +47,9 @@ export interface StripeSubscriptionEventOrder {
   type:
     | 'customer.subscription.created'
     | 'customer.subscription.updated'
-    | 'customer.subscription.deleted';
+    | 'customer.subscription.deleted'
+    | 'charge.refunded'
+    | 'charge.dispute.created';
 }
 
 interface RawStripeSubscription {
@@ -56,7 +59,7 @@ interface RawStripeSubscription {
   current_period_end?: number | null;
   cancel_at_period_end?: boolean;
   trial_end?: number | null;
-  items?: { data?: Array<{ price?: { id?: string }; current_period_end?: number | null }> };
+  items?: { data?: Array<{ price?: string | { id?: string }; current_period_end?: number | null }> };
   metadata?: { userId?: string };
 }
 
@@ -64,22 +67,50 @@ function isoFromUnix(sec: number | null | undefined): string | null {
   return typeof sec === 'number' && Number.isFinite(sec) ? new Date(sec * 1000).toISOString() : null;
 }
 
+function priceIdFromItem(price: string | { id?: string } | undefined): string | null {
+  if (typeof price === 'string' && price.length > 0) return price;
+  if (price && typeof price === 'object' && typeof price.id === 'string' && price.id.length > 0) {
+    return price.id;
+  }
+  return null;
+}
+
 /** Normalize a raw Stripe Subscription (from a webhook event) into our shape. */
 export function parseSubscription(raw: RawStripeSubscription): ParsedSubscription | null {
   const id = raw.id;
   const customerId = typeof raw.customer === 'string' ? raw.customer : raw.customer?.id;
   if (!id || !customerId || !raw.status) return null;
+  const item = raw.items?.data?.[0];
   return {
     id,
     customerId,
     status: raw.status,
-    priceId: raw.items?.data?.[0]?.price?.id ?? null,
+    priceId: priceIdFromItem(item?.price),
     // API >=2025-03-31.basil moved current_period_end onto the subscription item.
-    currentPeriodEnd: isoFromUnix(raw.items?.data?.[0]?.current_period_end ?? raw.current_period_end),
+    currentPeriodEnd: isoFromUnix(item?.current_period_end ?? raw.current_period_end),
     cancelAtPeriodEnd: !!raw.cancel_at_period_end,
     trialEnd: isoFromUnix(raw.trial_end),
     metadataUserId: raw.metadata?.userId ?? null,
   };
+}
+
+/**
+ * Invoice.subscription moved under parent.subscription_details in API
+ * 2025-03-31.basil.  Read both so trial-to-paid `invoice.paid` still
+ * resolves the Subscription id.
+ */
+export function subscriptionIdFromInvoice(raw: Record<string, unknown>): string | null {
+  const direct = stripeObjectId(raw.subscription);
+  if (direct) return direct;
+  const parent = raw.parent;
+  if (!parent || typeof parent !== 'object') return null;
+  const details = (parent as Record<string, unknown>).subscription_details;
+  if (!details || typeof details !== 'object') return null;
+  return stripeObjectId((details as Record<string, unknown>).subscription) ?? null;
+}
+
+interface AppliedEventStateRow {
+  last_event_id: string;
 }
 
 interface UserIdRow {
@@ -112,7 +143,11 @@ export async function linkCustomerToUser(
 }
 
 function eventPriority(type: StripeSubscriptionEventOrder['type']): number {
-  if (type === 'customer.subscription.deleted') return 3;
+  if (
+    type === 'customer.subscription.deleted'
+    || type === 'charge.refunded'
+    || type === 'charge.dispute.created'
+  ) return 3;
   if (type === 'customer.subscription.updated') return 2;
   return 1;
 }
@@ -190,7 +225,7 @@ export async function applySubscription(
         SET stripe_customer_id = ?,
             stripe_subscription_id = ?,
             subscription_status = ?,
-            plan = ?,
+            plan = COALESCE(?, plan),
             current_period_end = ?,
             cancel_at_period_end = ?,
             trial_end = ?
@@ -247,7 +282,78 @@ export async function applySubscription(
       sub.status,
     ]],
   ]);
+  await healSubscriptionWriteIfEventWon(env, user.id, sub, event);
   return user.id;
+}
+
+/**
+ * The guarded UPDATE above shares a libsql write-batch with the event-state
+ * UPSERT.  If the batch snapshot cannot see that UPSERT, EXISTS misses and a
+ * trial-to-paid `customer.subscription.updated` leaves `subscription_status`
+ * stuck at `trialing` even though Stripe charged.  After the batch commits,
+ * re-read: when this event won ordering, write the user row directly.
+ */
+async function healSubscriptionWriteIfEventWon(
+  env: Env,
+  userId: string,
+  sub: ParsedSubscription,
+  event: StripeSubscriptionEventOrder,
+): Promise<void> {
+  const applied = await get<AppliedEventStateRow>(
+    env.DB,
+    'SELECT last_event_id FROM stripe_subscription_event_state WHERE subscription_id = ?',
+    [sub.id],
+  );
+  if (applied?.last_event_id !== event.id) return;
+  const current = await getUserById(env, userId);
+  if (!current) return;
+  const plan = await planForPriceAsync(env, sub.priceId);
+  const alreadyApplied =
+    current.stripeCustomerId === sub.customerId
+    && current.stripeSubscriptionId === sub.id
+    && current.subscriptionStatus === sub.status
+    && (plan == null || current.plan === plan)
+    && current.currentPeriodEnd === sub.currentPeriodEnd
+    && current.cancelAtPeriodEnd === sub.cancelAtPeriodEnd
+    && current.trialEnd === sub.trialEnd;
+  if (alreadyApplied) return;
+  await run(
+    env.DB,
+    `UPDATE users
+        SET stripe_customer_id = ?,
+            stripe_subscription_id = ?,
+            subscription_status = ?,
+            plan = COALESCE(?, plan),
+            current_period_end = ?,
+            cancel_at_period_end = ?,
+            trial_end = ?
+      WHERE id = ?
+        AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)
+        AND (stripe_subscription_id IS NULL OR stripe_subscription_id = ?)`,
+    [
+      sub.customerId,
+      sub.id,
+      sub.status,
+      plan,
+      sub.currentPeriodEnd,
+      sub.cancelAtPeriodEnd ? 1 : 0,
+      sub.trialEnd,
+      userId,
+      sub.customerId,
+      sub.id,
+    ],
+  );
+}
+
+/** Apply a live Stripe Subscription retrieve (Admin reconcile or invoice.paid). */
+export async function applyRetrievedStripeSubscription(
+  env: Env,
+  raw: StripeSubscriptionObject,
+  event: StripeSubscriptionEventOrder,
+): Promise<string | null> {
+  const parsed = parseSubscription(raw);
+  if (!parsed) return null;
+  return applySubscription(env, parsed, event);
 }
 
 /**

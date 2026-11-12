@@ -1,6 +1,106 @@
 #!/usr/bin/env bash
 # Thin wrapper: ship this app's native iOS binary to TestFlight (no Xcode UI).
-# Canonical implementation: /Users/jay/apps/ios-fleet/ship-testflight.sh
+# Canonical implementation: scripts/ios-fleet/ship-testflight.sh (in this repo).
+# The host copy at /Users/jay/apps/ios-fleet/ is a runtime install of the same
+# file and is used ONLY as a fallback when the in-repo copy is missing.
+#
+# WHY A MERGE OFTEN DOES NOT PRODUCE A TESTFLIGHT BUILD
+# .github/workflows/ios-ship.yml calls this on every push to main touching
+# clients/ios/**, but the fleet script enforces a minimum interval between
+# successful ships per app: DEFAULT_MIN_INTERVAL_SEC=3600 (3600s = 1 hour),
+# defined near the top of scripts/ios-fleet/ship-testflight.sh. Runs inside that
+# window log "ship-gate: skip" and exit 0. It also skips when git HEAD already
+# shipped. Neither kind of skip consumes a build number (fixed 2026-08-12).
+# Override one run with IOS_TF_MIN_INTERVAL_SEC=<seconds> or --force-ship;
+# changing the standing limit means editing DEFAULT_MIN_INTERVAL_SEC.
+#
+# VERSION NUMBERS: MARKETING_VERSION is the next patch on the app's train
+# (1.0.<P+1>, where P is the highest patch App Store Connect already holds on
+# that train) and CURRENT_PROJECT_VERSION is the repo commit count, raised
+# above the App Store Connect floor.  The two numbers are independent, so
+# App Store Connect shows "1.0.237 (2360)" instead of "1.0.237 (237)".
+# Owner directive 2026-10-24 (AFC-517); see scripts/ios-fleet/README.md.
+#
+# STABLE XCODE IS MANDATORY (owner, reaffirmed 2026-08-11).
+# Xcode-beta's SDK breaks TestFlight / App Store Connect compatibility: a binary
+# built against a beta SDK is accepted into TestFlight but rejected at
+# submission as INVALID_BINARY. Version 1.0 has now hit INVALID_BINARY twice.
+#
+# The fleet script carries its own beta guard. It used to live only outside
+# this repo, unversioned — exactly the fragility that left ct-reattach-proxy.sh
+# host-only until 2026-08-11 — and is now vendored under scripts/ios-fleet/.
+# This wrapper still enforces the rule itself, so the guarantee survives the
+# fleet script being changed, moved, or missing.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-exec bash /Users/jay/apps/ios-fleet/ship-testflight.sh congress --repo-root "$ROOT" "$@"
+
+STABLE_XCODE="${STABLE_XCODE:-/Applications/Xcode.app}"
+STABLE_DEV_DIR="${STABLE_XCODE}/Contents/Developer"
+
+# What would we build with if we did nothing?
+resolved="${DEVELOPER_DIR:-$(xcode-select -p 2>/dev/null || true)}"
+
+is_beta() {
+  local dir="$1"
+  [[ "$dir" == *Xcode-beta* ]] && return 0
+  # Also catch a stable-looking path whose Xcode self-reports as a beta.
+  local plist="${dir%/Contents/Developer}/Contents/Info.plist"
+  if [[ -r "$plist" ]]; then
+    local ver
+    ver=$(defaults read "$plist" CFBundleShortVersionString 2>/dev/null || echo "")
+    [[ "$ver" == *[Bb]eta* ]] && return 0
+  fi
+  return 1
+}
+
+if [[ -z "$resolved" ]] || is_beta "$resolved"; then
+  if [[ ! -d "$STABLE_DEV_DIR" ]]; then
+    echo "ERROR: stable Xcode not found at ${STABLE_XCODE}." >&2
+    echo "       Refusing to build for App Store Connect with Xcode-beta —" >&2
+    echo "       beta-SDK binaries are rejected as INVALID_BINARY at submission." >&2
+    echo "       Install Xcode from the Mac App Store, or set STABLE_XCODE." >&2
+    exit 1
+  fi
+  [[ -n "$resolved" ]] && echo "[ios-ship] refusing beta toolchain at ${resolved}"
+  export DEVELOPER_DIR="$STABLE_DEV_DIR"
+else
+  export DEVELOPER_DIR="$resolved"
+fi
+
+# Fail loudly rather than silently shipping a beta-built binary.
+if is_beta "$DEVELOPER_DIR"; then
+  echo "ERROR: DEVELOPER_DIR still resolves to a beta Xcode (${DEVELOPER_DIR})." >&2
+  exit 1
+fi
+
+echo "[ios-ship] DEVELOPER_DIR=${DEVELOPER_DIR}"
+xcodebuild -version | sed 's/^/[ios-ship] /'
+
+# Prefer the reviewed, version-controlled copy. Fall back to the host install
+# only if it is absent, and say so loudly — a silent fallback would put an
+# unreviewed script back in charge of release numbering, which is the exact
+# failure this vendoring was meant to end.
+IN_REPO="${ROOT}/scripts/ios-fleet/ship-testflight.sh"
+HOST_COPY="/Users/jay/apps/ios-fleet/ship-testflight.sh"
+
+if [[ -f "$IN_REPO" ]]; then
+  SHIP_SCRIPT="$IN_REPO"
+  echo "[ios-ship] using in-repo fleet script: ${SHIP_SCRIPT}"
+elif [[ -f "$HOST_COPY" ]]; then
+  SHIP_SCRIPT="$HOST_COPY"
+  echo "[ios-ship] ===================================================================" >&2
+  echo "[ios-ship] WARNING: in-repo fleet script missing (${IN_REPO})." >&2
+  echo "[ios-ship] WARNING: falling back to the UNVERSIONED host copy at" >&2
+  echo "[ios-ship] WARNING:   ${HOST_COPY}" >&2
+  echo "[ios-ship] WARNING: that copy is outside git — no history, no review. It may" >&2
+  echo "[ios-ship] WARNING: number this release differently than the repo would." >&2
+  echo "[ios-ship] WARNING: Restore scripts/ios-fleet/ before relying on this build." >&2
+  echo "[ios-ship] ===================================================================" >&2
+else
+  echo "ERROR: no fleet ship script found." >&2
+  echo "       looked for: ${IN_REPO}" >&2
+  echo "                   ${HOST_COPY}" >&2
+  exit 1
+fi
+
+exec bash "$SHIP_SCRIPT" congress --repo-root "$ROOT" "$@"

@@ -1,28 +1,20 @@
 # Local ticker logos (repo-hosted)
 
-**These are optional gap-fills**, not necessarily the best or final marks.
+**Gap-fills and owner-uploaded marks**, not automatically the winner.
 
-Resolution order for `GET /api/logos/ticker`:
+`GET /api/logos/ticker?symbol=AAPL&theme=light|dark` walks a **per-ticker, per-theme** source list (see `src/ui/tickerLogoPolicy.ts`):
 
-1. **logo.dev** (when `LOGODEV_PUBLISHABLE_KEY` / `LOGO_DEV_TOKEN` is live)
-2. **This pack** (only if logo.dev misses or is unavailable)
-3. GitHub ticker-logos mirror
+1. **Themed local file** `light/SYMBOL.png` or `dark/SYMBOL.png` (always wins when present)
+2. **Jury order** for that theme: logo.dev and/or GitHub `davidepalazzo/ticker-logos`, plus unthemed `SYMBOL.png`
+3. Default when ungraded: logo.dev → unthemed pack → GitHub
 
-So a better logo.dev hit always wins over files here. Overwrite any PNG anytime
-you have a cleaner official asset.
+A/B/C/D in the admin jury (`/api/admin/logo-jury`) means GitHub-on-light / GitHub-on-dark / logo.dev-light / logo.dev-dark. The top 30 from 2026-08-23 are seeded. Further grades live in CONFIG_KV until copied into the seed map.
 
-## Current options (2026-08-07)
+## Upload a mark
 
-| File | Use | Notes |
-|------|-----|--------|
-| `TSCO.png` | Tractor Supply | Interim TSC-style option |
-| `SPCX.png` | SpaceX (disclosure) | Interim X mark |
-| `HONAV.png` / `HON.png` | Honeywell Aerospace / HON | Interim wordmark |
-| `BRK.B.png` / `BRKB.png` / `BRK-B.png` | Berkshire B | Interim BH monogram |
-| Others | HUBB, ECL, … | Mirrors; replace freely |
+- Both themes: `SYMBOL.png` in this folder
+- One theme: `light/SYMBOL.png` or `dark/SYMBOL.png` (preferred when GitHub only works on dark, etc.)
+- Square PNG, 256×256 preferred
+- Deploy; confirm `x-logo-source` and `x-logo-policy`
 
-## Replace a logo
-
-1. Drop a square PNG (256×256 preferred) as `SYMBOL.png`.
-2. Commit — no code change if the filename matches the ticker.
-3. Deploy; confirm with `curl -sI '…/api/logos/ticker?symbol=TSCO' | grep x-logo-source`.
+Owner follow-ups from the first 30: SPCX (own mark), IBM (both themes), UBER/UNH/BLK (light-mode uploads).

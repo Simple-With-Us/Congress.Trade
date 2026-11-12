@@ -32,15 +32,32 @@
 import type { Env, DocKind } from '../shared/types.ts';
 import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { get, run } from '../shared/db.ts';
+import { isReviewResolved } from './reviewQueueGuard.ts';
+import {
+  clearIngestFailureReviewQueueIfRecovered,
+  recordGenuineIngestFailure,
+} from './ingestFailureReviewQueue.ts';
 
 interface FilingRow {
   doc_id: string;
   chamber: string | null;
   source_url: string | null;
   raw_object_key: string | null;
+  doc_kind: DocKind | null;
 }
 
 const PDF_SNIFF_BYTES = 256 * 1024; // bound the scan to the first 256KB
+
+/**
+ * Bounded wait for the local Mac vision worker before the server hands the
+ * filing off to the cloud extractors.  Owner 2026-09-04: cap the wait at
+ * 2 minutes so the slow path does not block a long tail of cloud fallback
+ * attempts; the local Mac still gets a real chance to finish first.  Pair
+ * with `docs/rollouts/2026-09-04-vision-worker-efficiency-checklist.md`
+ * for the known optimisation ideas to revisit when we want to beat other
+ * providers in the short to mid term.
+ */
+export const LOCAL_VISION_WAIT_MINUTES = 2;
 
 /** True if the leading bytes look like a PDF ("%PDF-"). */
 export function looksLikePdf(bytes: Uint8Array): boolean {
@@ -77,13 +94,31 @@ export function classifyPdfBytes(bytes: Uint8Array): 'text_pdf' | 'scanned_pdf' 
   // Latin1 decode keeps PDF operator bytes intact (binary-safe for ASCII tokens).
   const text = new TextDecoder('latin1').decode(sample);
   const hasFont = text.includes('/Font');
+  // Text-show operators are only visible when the content stream is NOT
+  // compressed. PDFs Flate-compress content by default, so this matches almost
+  // nothing in the wild — measured 0 of 25 real House/Executive filings on
+  // 2026-08-11. Kept as a positive signal, never as a requirement.
   const hasTextShow = /\bBT\b[\s\S]*?\b(Tj|TJ)\b/.test(text) || /\)\s*Tj/.test(text);
   // A scan typically has an /Image XObject and no fonts.
   const hasImageOnly = /\/Subtype\s*\/Image/.test(text) && !hasFont;
-  if (hasFont && hasTextShow) return 'text_pdf';
+
+  if (hasTextShow) return 'text_pdf';
+  // Embedded fonts mean glyphs are drawn from a font programme, i.e. there is a
+  // real text layer to extract — even though its operators sit inside a
+  // compressed stream we cannot see here. Requiring `hasFont && hasTextShow`
+  // (as this did until 2026-08-11) made the second half unreachable in practice
+  // and sent typed filings down the scan path: 19 of 25 sampled filings marked
+  // `scanned_pdf` in production had a full extractable text layer.
+  //
+  // Misclassification is deliberately biased toward `text_pdf` because the two
+  // errors do not cost the same. HousePdfExtractor runs text extraction first
+  // and only falls back to vision when it yields no usable rows
+  // (src/extractors/types.ts) — so a wrong `text_pdf` costs one FREE local
+  // attempt, while a wrong `scanned_pdf` costs a paid vision read plus 2-3
+  // more paid reads in the agreement cascade.
+  if (hasFont) return 'text_pdf';
   if (hasImageOnly) return 'scanned_pdf';
-  // Fallback: if any text-show markers exist, treat as text; else scanned.
-  return hasTextShow ? 'text_pdf' : 'scanned_pdf';
+  return 'scanned_pdf';
 }
 
 /**
@@ -124,21 +159,31 @@ export async function classifyFiling(
   await lease?.assertOwned();
   const row = await get<FilingRow>(
     env.DB,
-    `SELECT doc_id, chamber, source_url, raw_object_key FROM filings WHERE doc_id = ?`,
+    `SELECT doc_id, chamber, source_url, raw_object_key, doc_kind FROM filings WHERE doc_id = ?`,
     [docId],
   );
   if (!row) {
     console.warn(`classifier: no filings row for ${docId}; skipping`);
     return 'unknown';
   }
+  // Autonomy guard: the review process already closed this doc_id out
+  // (publish / admin reject-confirm / agreement exhaustion / provider-
+  // placeholder reconciliation). A re-triggered filing.fetched message must
+  // not clobber the terminal ingest_status it stamped. See
+  // reviewQueueGuard.ts for the full incident writeup.
+  if (await isReviewResolved(env.DB, docId)) {
+    console.warn(`classifier: ${docId} already review-resolved; skipping re-classify (no-op)`);
+    return row.doc_kind ?? 'unknown';
+  }
   const key = row.raw_object_key;
   if (!key) {
     await lease?.assertOwned();
-    await run(
-      env.DB,
-      `UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?`,
-      ['classifier: missing raw_object_key', docId],
-    );
+    const message = 'classifier: missing raw_object_key';
+    await recordGenuineIngestFailure(env, docId, message, {
+      source: 'classifier',
+      stage: 'parse',
+      lease,
+    });
     return 'unknown';
   }
 
@@ -146,11 +191,12 @@ export async function classifyFiling(
   const obj = await env.RAW_FILES.get(key);
   if (!obj) {
     await lease?.assertOwned();
-    await run(
-      env.DB,
-      `UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?`,
-      [`classifier: R2 object ${key} not found`, docId],
-    );
+    const message = `classifier: R2 object ${key} not found`;
+    await recordGenuineIngestFailure(env, docId, message, {
+      source: 'classifier',
+      stage: 'parse',
+      lease,
+    });
     return 'unknown';
   }
 
@@ -168,7 +214,7 @@ export async function classifyFiling(
         `UPDATE filings
             SET doc_kind = ?,
                 ingest_status = 'extraction_pending_local',
-                local_wait_expires_at = datetime('now', '+15 minutes'),
+                local_wait_expires_at = datetime('now', '+${LOCAL_VISION_WAIT_MINUTES} minutes'),
                 error = NULL
           WHERE doc_id = ?`,
         [docKind, docId],
@@ -176,7 +222,7 @@ export async function classifyFiling(
       await lease?.assertOwned();
       await env.INGEST_QUEUE.send(
         { type: 'filing.local_wait_check', docId },
-        { delaySeconds: 15 * 60 },
+        { delaySeconds: LOCAL_VISION_WAIT_MINUTES * 60 },
       );
       return docKind;
     }
@@ -189,6 +235,7 @@ export async function classifyFiling(
       WHERE doc_id = ?`,
     [docKind, docId],
   );
+  await clearIngestFailureReviewQueueIfRecovered(env.DB, docId);
 
   // Hand off to the extraction stage. Per the QueueMessage contract this is the
   // message the extraction step consumes (see src/index.ts routing).

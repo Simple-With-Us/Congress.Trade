@@ -8,7 +8,7 @@
  * sector mix, disclosure timeliness, and per-ticker deep dives.
  *
  * Every endpoint:
- *   - accepts the shared params window / chamber / party / source / minConf
+ *   - accepts the shared params window / chamber / party / type / source / minConf
  *     (+ endpoint-specific limit / sort / granularity / minMembers),
  *   - reports dollars as ESTIMATES from STOCK Act bracket midpoints
  *     (estimatedAmounts: true in the envelope),
@@ -19,16 +19,22 @@
 
 import { Hono } from 'hono';
 import type { Env } from '../shared/types.ts';
-import { all, first, get, parseJson } from '../shared/db.ts';
+import { all, first, get } from '../shared/db.ts';
+import { parseCommitteeNames, resolveFilerCommittees } from '../shared/committeeNames.ts';
+import { resolveMember } from '../client/queries.ts';
+import { tradeLearnedAt } from '../delivery/tradeLearnedAt.ts';
 import { cached, cacheKey } from '../shared/kvCache.ts';
 import { assetTypeCategoryLabel, isAssetTypeCategory } from '../shared/assetTypes.ts';
 import { normalizeCompanyName, resolveAssetDisplayName } from '../shared/companyName.ts';
 import {
   asChambers,
   asPartyBucket,
+  asPartyBuckets,
   asSourceFilter,
+  asTxTypes,
   asWindow,
   autoGranularity,
+  constrainTxTypes,
   isGranularity,
   type CommonFilters,
   type Granularity,
@@ -48,6 +54,9 @@ import {
   buildMemberPerformanceQuery,
   buildMemberStatsQuery,
   buildTickerBacktestCohortQuery,
+  buildBacktestPriceQuery,
+  buildBacktestSpxQuery,
+  buildPricedDaysCountQuery,
   buildMemberTopTickersQuery,
   buildMemberRecentTradesQuery,
   buildPartySplitQuery,
@@ -82,8 +91,16 @@ import {
 import { committeeConflict } from './conflicts.ts';
 import { computePerformance } from '../prices/compute.ts';
 import { latestSpxClose } from '../prices/service.ts';
-import { getDisclosureLatencySummary } from '../ingestion/tradeLatency.ts';
+import { currentPriceFreshThrough, evaluateCurrentPriceStaleness } from '../prices/staleness.ts';
+import {
+  getDisclosureLatencySummary,
+  isLatencyComparisonPublic,
+  type DisclosureLatencyProviderMetrics,
+} from '../ingestion/tradeLatency.ts';
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
+import { executiveTitleFor } from '../shared/executiveTitles.ts';
+import { sanitizeCompetitorPublication } from '../shared/tradeIdentity.ts';
+import { mergePeeledQuery, peelEncodedQueryFromPathParam } from '../shared/memberPath.ts';
 
 const TICKER_PARAM_RE = /^[A-Z0-9._^-]{1,20}$/;
 
@@ -167,6 +184,8 @@ function commonFromQuery(q: Record<string, string>): CommonQuery {
     chamber: chambers && chambers.length === 1 ? chambers[0] : undefined,
     chambers,
     party: asPartyBucket(q.party),
+    parties: asPartyBuckets(q.party),
+    txTypes: asTxTypes(q.type),
     source: asSourceFilter(q.source),
     minConf: minConf !== undefined && Number.isFinite(minConf) ? minConf : undefined,
     excludeOptions: q.excludeOptions === 'true',
@@ -177,12 +196,67 @@ function granularityFromQuery(q: Record<string, string>, w: Window): Granularity
   return isGranularity(q.granularity) ? q.granularity : autoGranularity(w);
 }
 
+function toLatencyScoreboardRow(
+  p: DisclosureLatencyProviderMetrics,
+  extras: { publiclyShown?: boolean } = {},
+) {
+  return {
+    id: p.provider,
+    label: p.label,
+    operationalStatus: p.operationalStatus ?? 'unknown',
+    candidates: p.candidates,
+    // Timed live races (CT live first_seen in 7d; |Δ| up to 14d).
+    matched: p.matched,
+    // Same cohort as matched (live imports only; backfills excluded).
+    strongMatched: p.strongMatched,
+    // Pairings that left one identity axis unverified — reported beside
+    // the headline, never inside it.
+    weakMatched: p.weakMatched,
+    providerObserved: p.providerObserved,
+    maturedProviderObserved: p.maturedProviderObserved,
+    unmatchedProvider: p.unmatchedProvider,
+    unmatchedProviderCtMissing: p.unmatchedProviderCtMissing,
+    unmatchedProviderCtExcluded: p.unmatchedProviderCtExcluded,
+    observedRowsMissingFiler: p.observedRowsMissingFiler,
+    parserHealth: p.parserHealth,
+    pendingProvider: p.pendingProvider,
+    maturedCandidates: p.maturedCandidates,
+    maturedMatched: p.maturedMatched,
+    maturedWeakMatched: p.maturedWeakMatched,
+    ctCoveragePct: p.ctCoveragePct,
+    providerCoveragePct: p.providerCoveragePct,
+    // Backward-compatible alias; unlike the former field this is CT's
+    // coverage of the mature provider-observed cohort, not matched/CT
+    // candidates.
+    coveragePct: p.ctCoveragePct,
+    overlapPct: p.overlapPct,
+    // `contradiction` means the coverage join is broken and the ratios
+    // above are deliberately null. Consumers must render that as
+    // "unavailable", never as 0%.
+    coverageIntegrity: p.coverageIntegrity,
+    coverageStrongPairingsOnFile: p.coverageStrongPairingsOnFile,
+    comparisonStatus: p.comparisonStatus,
+    comparisonBasis: p.comparisonBasis,
+    // Effective race deltas (monitor* fields already include provider-stamp
+    // fallback). Never switch to published-only — that empty-set path made
+    // Quiver show "preliminary tie" with null median/avg.
+    usFirstCount: p.ctAheadMonitorCount,
+    providerFirstCount: p.providerAheadMonitorCount,
+    tieCount: p.tieMonitorCount,
+    medianLeadSec: p.medianMonitorDeltaSec,
+    avgLeadSec: p.avgMonitorDeltaSec,
+    p90LeadSec: p.p90MonitorDeltaSec,
+    ...(typeof extras.publiclyShown === 'boolean' ? { publiclyShown: extras.publiclyShown } : {}),
+  };
+}
+
 /** Common envelope fields stamped on every response. */
 function meta(f: CommonQuery, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     window: f.window,
     chamber: f.chambers ? f.chambers.join(',') : f.chamber ?? null,
-    party: f.party ?? null,
+    party: f.parties && f.parties.length ? f.parties.join(',') : (f.party ?? null),
+    type: f.txTypes?.join(',') ?? null,
     source: f.source ?? 'all',
     estimatedAmounts: true,
     asOf: new Date().toISOString(),
@@ -196,6 +270,28 @@ function meta(f: CommonQuery, extra: Record<string, unknown> = {}): Record<strin
 
 export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
+
+  // CT-2418: every route in this router is public and user-independent (the
+  // router is mounted bare at /api/analytics with no auth middleware), and every
+  // one of them already wraps its work in the server-side `cached()` KV helper.
+  // They just never told Cloudflare, so none of them could ever be served from
+  // the edge and each one re-hit the origin on every repeat view.
+  //
+  // s-maxage=300 / stale-while-revalidate=600 matches PUBLIC_STABLE_CACHE in
+  // delivery/rest.ts, the policy already applied to /api/market/*. Cloudflare's
+  // cache key includes the path, so ?ticker= style path params key naturally and
+  // one entity's response can never be served for another's URL.
+  //
+  // Only sets the header when a route has not already chosen its own, so
+  // /latency-summary keeps its explicit `public, max-age=300`.
+  r.use('*', async (c, next) => {
+    await next();
+    if (c.req.method === 'GET' && c.res.status === 200) {
+      if (!c.res.headers.has('Cache-Control')) {
+        c.res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
+      }
+    }
+  });
 
   // --- GET /summary -------------------------------------------------------
   r.get('/summary', async (c) => {
@@ -216,8 +312,21 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         estimatedVolumeUsd: usd(row.est_volume),
         estimatedNetFlowUsd: usd(row.est_net_flow),
         optionCount: num(row.option_count),
+        dollarsExcludeOptions: true,
         resolvedTickerPct:
           totalTrades > 0 ? round(num(row.resolved_ticker_count) / totalTrades, 4) : null,
+        // Equity-like denominator (public_equity + still-unknown types) so rows that
+        // are probably equities but carry no ticker keep the gap visible.
+        resolvedEquityTickerPct:
+          num(row.equity_like_trade_count) > 0
+            ? round(num(row.resolved_equity_like_ticker_count) / num(row.equity_like_trade_count), 4)
+            : null,
+        equityLikeTradeCount: num(row.equity_like_trade_count),
+        // The narrow, pre-2026-09 definition: only rows already typed public_equity.
+        resolvedPublicEquityTickerPct:
+          num(row.equity_trade_count) > 0
+            ? round(num(row.resolved_equity_ticker_count) / num(row.equity_trade_count), 4)
+            : null,
         netSentiment: netSentiment(buyCount, sellCount),
       });
     });
@@ -284,7 +393,12 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       // (sameSideTrades = 0) and drop out — starving real BUY/SELL names and
       // returning fewer than `limit`. Filtering to P/S makes trade_count (and the
       // ranking) directional, and a ticker with no P/S simply isn't a candidate.
-      const lbQ = buildTickerLeaderboardQuery({ ...fStock, txTypes: ['B', 'S'], sort: 'trades', limit: pool });
+      const lbQ = buildTickerLeaderboardQuery({
+        ...fStock,
+        txTypes: constrainTxTypes(fStock.txTypes, ['B', 'S']),
+        sort: 'trades',
+        limit: pool,
+      });
       const lbRows = await all<Record<string, unknown>>(c.env.DB, lbQ.sql, lbQ.params);
       // Fetch the party + momentum + skill-link aggregates restricted to THIS
       // candidate set, so every ranked candidate's resolved side is present (a
@@ -302,7 +416,13 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           const clQ = buildClusterBuysQuery({ ...fStock, tickers: batch, minMembers: 2, limit: 200 });
           // Momentum is PER SIDE (bySide) and directional (P/S) only — rising
           // purchases must not feed a SELL signal, and 'E'/option rows never count.
-          const trQ = buildTrendingQuery({ ...fStock, tickers: batch, txTypes: ['B', 'S'], bySide: true, limit: 200 });
+          const trQ = buildTrendingQuery({
+            ...fStock,
+            tickers: batch,
+            txTypes: constrainTxTypes(fStock.txTypes, ['B', 'S']),
+            bySide: true,
+            limit: 200,
+          });
           // Who traded each candidate, by side (for the realized-skill rollup).
           const lkQ = buildConvictionMemberLinksQuery(batch, fStock);
           return [
@@ -350,7 +470,10 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       const memberSkill = new Map<string, { scored: number; wins: number; avgExcess: number }>();
       await Promise.all(
         chunk([...allFilers], D1_IN_CHUNK).map((batch) => {
-          const sq = buildMemberSkillQuery(batch, f);
+          const sq = buildMemberSkillQuery(batch, {
+            ...f,
+            priceFreshThrough: currentPriceFreshThrough(),
+          });
           return all<Record<string, unknown>>(c.env.DB, sq.sql, sq.params).then((rows) => {
             for (const row of rows) {
               const fid = str(row.filer_id);
@@ -663,9 +786,11 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         buyCount: num(row.buy_count),
         sellCount: num(row.sell_count),
         estVolumeUsd: usd(row.est_volume),
+        estNetFlowUsd: usd(row.est_net_flow),
+        uniqueMembers: num(row.unique_members),
         uniqueTickers: num(row.unique_tickers),
       }));
-      return meta(f, { count: sectors.length, sectors });
+      return meta(f, { count: sectors.length, sectors, estimatedAmounts: true });
     });
     return c.json(data);
   });
@@ -721,10 +846,15 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   });
 
   // --- GET /member-performance --------------------------------------------
-  // Per-politician annualized excess return vs the S&P 500 on their BUYS, anchored at the
+  // Per-politician excess return vs the S&P 500 on their BUYS, anchored at the
   // FILING (disclosure) date — the realizable "could you have followed this?"
   // number, not the trade-date hindsight figure. Buys only, options excluded,
-  // small-N guarded. Defaults to the whole track record (window=all).
+  // public-equity only (see buildMemberPerformanceLeaderboardQuery for why),
+  // small-N guarded. Ranked and displayed by the SAME statistic: size-weighted
+  // average excess, winsorized per-trade at ±200%, NOT annualized — a single
+  // outlier trade or a young trade's annualization multiplier can no longer
+  // put a member at the top of the board without matching the number shown.
+  // Defaults to the whole track record (window=all).
   r.get('/member-performance', async (c) => {
     const q = c.req.query();
     const f = { ...commonFromQuery(q), window: asWindow(q.window, 'all') };
@@ -732,7 +862,12 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const minTrades = q.minTrades ? Number(q.minTrades) : undefined;
     const key = cacheKey('member-performance', { ...f, limit, minTrades });
     const data = await cached(c.env, key, 900, async () => {
-      const built = buildMemberPerformanceLeaderboardQuery({ ...f, limit, minTrades });
+      const built = buildMemberPerformanceLeaderboardQuery({
+        ...f,
+        limit,
+        minTrades,
+        priceFreshThrough: currentPriceFreshThrough(),
+      });
       const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
       const members = rows.map((row) => {
         const n = num(row.trade_count);
@@ -744,9 +879,13 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           partyBucket: asPartyBucket(row.party) ?? null,
           photoUrl: str(row.photo_url),
           tradeCount: n,
-          // Annualized excess return vs SPX since the filing date, equal-weighted across buys.
+          // Annualized version of avgExcessReturn — reference/debugging only.
+          // NOT what the board sorts or displays by (a young trade's ~12x
+          // annualization multiplier made this misleading as the primary stat).
           avgAnnualizedExcessReturn: num(row.avg_annualized_excess),
-          // Raw cumulative excess is kept for compatibility/debugging.
+          // Size-weighted average excess vs SPX, winsorized per-trade at ±200%,
+          // NOT annualized. This is both what the card displays and what the
+          // query sorts by — rank always matches the number shown.
           avgExcessReturn: num(row.avg_excess),
           winRate: n > 0 ? wins / n : 0,
           estVolumeUsd: usd(row.est_volume),
@@ -755,9 +894,14 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       return meta(f, {
         count: members.length,
         members,
+        // Newest price date behind any ranked member's trades; the board prints "Prices as of".
+        pricesAsOf: rows.reduce<string | null>((best, row) => {
+          const d = str(row.prices_as_of);
+          return d && (!best || d > best) ? d : best;
+        }, null),
         anchor: 'filing_date',
         side: 'buys',
-        note: 'Annualized excess return vs S&P 500 from the disclosure date (realizable by a follower); 0% means matched the S&P, +3% means about 3 percentage points better per year. Buys only, options excluded.',
+        note: 'Size-weighted average excess return vs S&P 500 from the disclosure date (realizable by a follower), winsorized per-trade at ±200% so one outlier trade cannot dominate; 0% means matched the S&P, +3% means about 3 percentage points better. Buys only, options excluded, public equity only.',
         estimatedAmounts: true,
       });
     });
@@ -821,19 +965,29 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const key = cacheKey(`backtest:${tickerParam}`, { ...f, filerId, h: useHorizons.join('-') });
     const data = await cached(c.env, key, 600, async () => {
       const cohortQ = buildTickerBacktestCohortQuery(tickerParam, f, filerId);
-      const [cohortRows, priceAsc, spxAsc] = await Promise.all([
-        all<{ tx_date: string }>(c.env.DB, cohortQ.sql, cohortQ.params),
-        all<PriceBar>(c.env.DB, 'SELECT date, close FROM price_eod WHERE ticker = ? ORDER BY date ASC', [tickerParam]),
-        all<PriceBar>(c.env.DB, 'SELECT date, close FROM spx_eod ORDER BY date ASC'),
-      ]);
+      const cohortRows = await all<{ tx_date: string }>(c.env.DB, cohortQ.sql, cohortQ.params);
       const cohortDates = cohortRows.map((row) => str(row.tx_date)).filter((d): d is string => !!d);
+      // CT-2459: bound both series to the cohort window (see builders).
+      const countQ = buildPricedDaysCountQuery(tickerParam);
+      const pricedDaysRow = await first<{ n: number }>(c.env.DB, countQ.sql, countQ.params);
+      let priceAsc: PriceBar[] = [];
+      let spxAsc: PriceBar[] = [];
+      if (cohortDates.length > 0) {
+        const cohortMin = cohortDates.reduce((a, b) => (b < a ? b : a));
+        const priceQ = buildBacktestPriceQuery(tickerParam, cohortMin);
+        const spxQ = buildBacktestSpxQuery(cohortMin);
+        [priceAsc, spxAsc] = await Promise.all([
+          all<PriceBar>(c.env.DB, priceQ.sql, priceQ.params),
+          all<PriceBar>(c.env.DB, spxQ.sql, spxQ.params),
+        ]);
+      }
       const bt = aggregateTickerBacktest(cohortDates, priceAsc, spxAsc, useHorizons);
       return meta(f, {
         ticker: tickerParam,
         filerId: filerId ?? null,
         txType: 'B',
         totalBuyEvents: bt.tradeCount,
-        pricedDays: priceAsc.length,
+        pricedDays: num(pricedDaysRow?.n),
         horizons: bt.horizons,
       });
     });
@@ -917,6 +1071,8 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           memberCount: num(s.member_count),
           estVolumeUsd: usd(s.est_volume),
           estNetFlowUsd: usd(s.est_net_flow),
+          optionCount: num(s.option_count),
+          dollarsExcludeOptions: true,
           netSentiment: netSentiment(buyCount, sellCount),
           firstTrade: str(s.first_trade),
           lastTrade: str(s.last_trade),
@@ -930,7 +1086,15 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         })),
         topBuyers: buyerRows.map(mapTrader),
         topSellers: sellerRows.map(mapTrader),
-        recentTrades: recentRows.map((row) => ({
+        recentTrades: recentRows.map((row) => {
+          const published = sanitizeCompetitorPublication({
+            source: str(row.source),
+            amountMin: row.amount_min == null ? null : num(row.amount_min),
+            amountMax: row.amount_max == null ? null : num(row.amount_max),
+            filedDate: str(row.filed_date),
+            txDate: str(row.tx_date),
+          });
+          return {
           id: str(row.id),
           docId: str(row.doc_id),
           ticker: str(row.ticker),
@@ -941,25 +1105,25 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           txType: str(row.tx_type),
           owner: str(row.owner),
           isOption: num(row.is_option) === 1,
-          amountMin: row.amount_min == null ? null : num(row.amount_min),
-          amountMax: row.amount_max == null ? null : num(row.amount_max),
-          estValueUsd: Math.round(
-            bracketMidpoint(
-              row.amount_min == null ? null : num(row.amount_min),
-              row.amount_max == null ? null : num(row.amount_max),
-            ),
-          ),
+          amountMin: published.amountMin ?? null,
+          amountMax: published.amountMax ?? null,
+          estValueUsd: published.amountMin == null && published.amountMax == null
+            ? null
+            : Math.round(
+                bracketMidpoint(published.amountMin ?? null, published.amountMax ?? null),
+              ),
           filerId: str(row.filer_id),
           fullName: filerName(row.full_name),
           partyBucket: asPartyBucket(row.party) ?? null,
           photoUrl: str(row.photo_url),
-          filedDate: str(row.filed_date),
-          firstSeenAt: str(row.first_seen_at),
+          filedDate: published.filedDate ?? null,
+          firstSeenAt: tradeLearnedAt(str(row.first_seen_at), str(row.created_at), str(row.tx_date)),
           sourceUrl: str(row.source_url),
           createdAt: str(row.created_at),
           source: str(row.source),
           rawText: str(row.raw_text),
-        })),
+        };
+        }),
       });
     });
     return c.json(data);
@@ -972,6 +1136,10 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   r.get('/performance/:txId', async (c) => {
     const txId = c.req.param('txId') || '';
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(txId)) return c.json({ error: 'invalid id' }, 400);
+    // CT-2459: this was the one analytics route with no cached() wrapper,
+    // yet a drawer renders it per trade (API-level N+1). Anchors are EOD
+    // prices, so the sibling-standard 600s TTL is safe.
+    const data = await cached(c.env, cacheKey(`performance-v1:${txId}`, {}), 600, async () => {
     const row = await get<Record<string, unknown>>(
       c.env.DB,
       `SELECT t.tx_type, t.is_option, t.ticker, t.tx_date, f.filed_date,
@@ -984,24 +1152,54 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         WHERE t.id = ?`,
       [txId],
     );
-    if (!row) return c.json({ available: false });
+    if (!row) return { available: false };
     const isOption = num(row.is_option) === 1;
     const priceAtTrade = row.price_at_trade == null ? null : num(row.price_at_trade);
     const currentPrice = row.current_price == null ? null : num(row.current_price);
     const spxAtTrade = row.spx_at_trade == null ? null : num(row.spx_at_trade);
     if (isOption || priceAtTrade == null || currentPrice == null) {
-      return c.json({ available: false, isOption });
+      return { available: false, isOption };
     }
-    const currentSpx = await latestSpxClose(c.env);
+    // The asset's current price is the close on current_price_date, so the S&P's
+    // exit leg is the S&P close on or before that SAME day (board row 6c05e09b).
+    // A missing or old price date is stale and returns before these lookups.
+    // latestSpxClose is only the fallback when that day's S&P bar is absent.
+    const currentPriceDate = str(row.current_price_date);
+    const staleness = evaluateCurrentPriceStaleness(currentPriceDate);
+    // Stale responses drop both performance legs, so skip the S&P lookups.
+    if (staleness.stale) {
+      return {
+        available: true,
+        stale: true,
+        staleDataAgeDays: staleness.dataAgeDays,
+        freshThrough: staleness.freshThrough,
+        txType: str(row.tx_type),
+        ticker: str(row.ticker),
+        txDate: str(row.tx_date),
+        filedDate: str(row.filed_date),
+        priceAtTrade,
+        currentPrice,
+        currentPriceDate,
+        pricesAsOf: currentPriceDate,
+        tradeDatePerformance: null,
+        filingDatePerformance: null,
+        estimatedAmounts: true,
+      };
+    }
+    const currentSpx =
+      (currentPriceDate ? await closeOnOrBefore(c.env, 'spx_eod', currentPriceDate) : null) ??
+      (await latestSpxClose(c.env));
     const perf = computePerformance(priceAtTrade, currentPrice, spxAtTrade, currentSpx);
     const filedDate = str(row.filed_date);
-    const priceAtFiling = await closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker));
-    const spxAtFiling = await closeOnOrBefore(c.env, 'spx_eod', filedDate);
+    const [priceAtFiling, spxAtFiling] = await Promise.all([
+      closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker)),
+      closeOnOrBefore(c.env, 'spx_eod', filedDate),
+    ]);
     const filingPerf =
       priceAtFiling == null || currentSpx == null
         ? null
         : computePerformance(priceAtFiling, currentPrice, spxAtFiling, currentSpx);
-    return c.json({
+    return {
       available: true,
       txType: str(row.tx_type),
       ticker: str(row.ticker),
@@ -1009,34 +1207,45 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       filedDate,
       priceAtTrade,
       currentPrice,
-      currentPriceDate: str(row.current_price_date),
+      currentPriceDate,
+      // Every return on this response ends on this date (asset and S&P alike).
+      pricesAsOf: currentPriceDate,
       ...perf,
       tradeDatePerformance: { priceAt: priceAtTrade, spxAt: spxAtTrade, ...perf },
       filingDatePerformance:
         filingPerf == null ? null : { priceAt: priceAtFiling, spxAt: spxAtFiling, ...filingPerf },
       estimatedAmounts: true,
+    };
     });
+    return c.json(data);
   });
 
   // --- GET /member/:filerId (politician deep dive) -----------------------
   r.get('/member/:filerId', async (c) => {
-    const q = c.req.query();
+    const peeled = peelEncodedQueryFromPathParam(c.req.param('filerId') || '');
+    const q = mergePeeledQuery(c.req.query(), peeled.query);
     // Politician view defaults to the full history (window=all) unless overridden.
     const f = { ...commonFromQuery(q), window: asWindow(q.window, 'all') };
-    const filerId = c.req.param('filerId') || '';
+    const filerId = peeled.id;
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(filerId)) {
       return c.json({ error: 'invalid member id' }, 400);
     }
-    const key = cacheKey(`member:${filerId}`, f as never);
+    // Official bioguides (K000389) live on filers.resolved_bioguide_id; the
+    // PK / transactions.filer_id is the house- slug.  Without this remap the
+    // web drawer for a Trends tap on K000389 returned profile:null and 0 trades
+    // while the directory slug house-ca17-ro-khanna had 22k rows.
+    const resolved = await resolveMember(c.env, filerId);
+    const txFilerId = resolved?.id ?? filerId;
+    const key = cacheKey(`member:${txFilerId}`, f as never);
     const data = await cached(c.env, key, 600, async () => {
-      const statsQ = buildMemberStatsQuery(filerId, f);
-      const topQ = buildMemberTopTickersQuery(filerId, f);
-      const recentQ = buildMemberRecentTradesQuery(filerId, f);
+      const statsQ = buildMemberStatsQuery(txFilerId, f);
+      const topQ = buildMemberTopTickersQuery(txFilerId, f);
+      const recentQ = buildMemberRecentTradesQuery(txFilerId, f);
       const [profileRow, statsRow, topRows, recentRows] = await Promise.all([
         get<Record<string, unknown>>(
           c.env.DB,
-          'SELECT bioguide_id, chamber, full_name, party, state, district, committees, photo_url FROM filers WHERE bioguide_id = ?',
-          [filerId],
+          'SELECT bioguide_id, chamber, COALESCE(display_name, full_name) AS full_name, party, state, district, committees, photo_url, resolved_bioguide_id FROM filers WHERE bioguide_id = ?',
+          [txFilerId],
         ),
         first<Record<string, unknown>>(c.env.DB, statsQ.sql, statsQ.params),
         all<Record<string, unknown>>(c.env.DB, topQ.sql, topQ.params),
@@ -1046,10 +1255,15 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       const buyCount = num(s.buy_count);
       const sellCount = num(s.sell_count);
       const committees = profileRow
-        ? parseJson<string[]>(profileRow.committees, [])
+        ? await resolveFilerCommittees(
+            c.env.DB,
+            txFilerId,
+            profileRow.committees,
+            str(profileRow.resolved_bioguide_id),
+          )
         : [];
       return meta(f, {
-        filerId,
+        filerId: txFilerId,
         profile: profileRow
           ? {
               fullName: filerName(profileRow.full_name),
@@ -1060,6 +1274,9 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
               district: str(profileRow.district),
               committees: Array.isArray(committees) ? committees : [],
               photoUrl: str(profileRow.photo_url),
+              // Curated agency/position label for executive-branch filers
+              // (see shared/executiveTitles.ts); null for House/Senate filers.
+              title: executiveTitleFor(txFilerId) ?? executiveTitleFor(filerId),
             }
           : null,
         stats: {
@@ -1083,7 +1300,15 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           sellCount: num(row.sell_count),
           estVolumeUsd: usd(row.est_volume),
         })),
-        recentTrades: recentRows.map((row) => ({
+        recentTrades: recentRows.map((row) => {
+          const published = sanitizeCompetitorPublication({
+            source: str(row.source),
+            amountMin: row.amount_min == null ? null : num(row.amount_min),
+            amountMax: row.amount_max == null ? null : num(row.amount_max),
+            filedDate: str(row.filed_date),
+            txDate: str(row.tx_date),
+          });
+          return {
           id: str(row.id),
           docId: str(row.doc_id),
           ticker: str(row.ticker),
@@ -1091,25 +1316,25 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           assetName: str(row.asset_name),
           txType: str(row.tx_type),
           txDate: str(row.tx_date),
-          filedDate: str(row.filed_date),
-          firstSeenAt: str(row.first_seen_at),
+          filedDate: published.filedDate ?? null,
+          firstSeenAt: tradeLearnedAt(str(row.first_seen_at), str(row.created_at), str(row.tx_date)),
           createdAt: str(row.created_at),
           sourceUrl: str(row.source_url),
           owner: str(row.owner),
           isOption: num(row.is_option) === 1,
           assetType: str(row.asset_type),
           assetTypeName: str(row.asset_type_name),
-          amountMin: row.amount_min == null ? null : num(row.amount_min),
-          amountMax: row.amount_max == null ? null : num(row.amount_max),
+          amountMin: published.amountMin ?? null,
+          amountMax: published.amountMax ?? null,
           source: str(row.source),
           rawText: str(row.raw_text),
-          estValueUsd: Math.round(
-            bracketMidpoint(
-              row.amount_min == null ? null : num(row.amount_min),
-              row.amount_max == null ? null : num(row.amount_max),
-            ),
-          ),
-        })),
+          estValueUsd: published.amountMin == null && published.amountMax == null
+            ? null
+            : Math.round(
+                bracketMidpoint(published.amountMin ?? null, published.amountMax ?? null),
+              ),
+        };
+        }),
       });
     });
     return c.json(data);
@@ -1125,16 +1350,20 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   // then. Defaults to full history (window=all).
   // `performance` is a legacy alias of tradeDate for older clients.
   r.get('/member/:filerId/performance', async (c) => {
-    const q = c.req.query();
+    const peeled = peelEncodedQueryFromPathParam(c.req.param('filerId') || '');
+    const q = mergePeeledQuery(c.req.query(), peeled.query);
     const f = { ...commonFromQuery(q), window: asWindow(q.window, 'all') };
-    const filerId = c.req.param('filerId') || '';
+    const filerId = peeled.id;
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(filerId)) {
       return c.json({ error: 'invalid member id' }, 400);
     }
-    // Cache key v2: dual-anchor shape (bust old single-leg cache entries).
-    const key = cacheKey(`member-perf-v2:${filerId}`, f as never);
+    const resolved = await resolveMember(c.env, filerId);
+    const txFilerId = resolved?.id ?? filerId;
+    // Cache key v3: resolve house-/senate- slugs and official bioguides to the
+    // same PK the profile drawer already uses (v2 keyed the raw path param).
+    const key = cacheKey(`member-perf-v3:${txFilerId}`, f as never);
     const data = await cached(c.env, key, 600, async () => {
-      const built = buildMemberPerformanceQuery(filerId, f);
+      const built = buildMemberPerformanceQuery(txFilerId, f);
       const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
       const currentSpx = await latestSpxClose(c.env);
       const perfRows = rows.map((row) => ({
@@ -1148,10 +1377,19 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         elapsedDaysSinceFiling:
           row.elapsed_days_since_filing == null ? null : num(row.elapsed_days_since_filing),
         estVolume: row.est_volume == null ? null : num(row.est_volume),
+        currentPriceDate: str(row.current_price_date),
+        spxNow: row.spx_now == null ? null : num(row.spx_now),
       }));
-      const dual = aggregateMemberDualPerformance(perfRows, currentSpx);
+      const freshThrough = currentPriceFreshThrough();
+      const dual = aggregateMemberDualPerformance(perfRows, currentSpx, { priceFreshThrough: freshThrough });
       return meta(f, {
-        filerId,
+        filerId: txFilerId,
+        priceFreshThrough: freshThrough,
+        // Newest price date behind any scored trade: the drawer prints "Prices as of".
+        pricesAsOf: perfRows.reduce<string | null>(
+          (best, r) => (r.currentPriceDate && (!best || r.currentPriceDate > best) ? r.currentPriceDate : best),
+          null,
+        ),
         side: dual.side,
         buyCount: dual.buyCount,
         tradeDate: dual.tradeDate,
@@ -1178,12 +1416,20 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const limit = Math.max(1, Math.min(500, Math.floor(Number(q.limit) || 100)));
     const key = cacheKey('conflicts', { ...f, limit });
     const data = await cached(c.env, key, 900, async () => {
-      const built = buildConflictCandidatesQuery({ ...f, limit: 2000 });
-      const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
+      // CT-2459: page candidates instead of always fetching the full
+      // 2000-row window and JS-filtering — when conflicts are dense in the
+      // newest rows the first page already fills the caller's limit. Same
+      // 2000-candidate scan cap as before.
+      const PAGE = 500;
+      const MAX_SCANNED = 2000;
       const conflicts: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < MAX_SCANNED && conflicts.length < limit; offset += PAGE) {
+      const built = buildConflictCandidatesQuery({ ...f, limit: PAGE, offset });
+      const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
+      if (rows.length === 0) break;
       for (const row of rows) {
-        const committees = parseJson<string[]>(row.committees, []);
-        const m = committeeConflict(Array.isArray(committees) ? committees : [], str(row.sector));
+        const committees = parseCommitteeNames(row.committees);
+        const m = committeeConflict(committees, str(row.sector));
         if (!m.conflict) continue;
         conflicts.push({
           id: str(row.id),
@@ -1200,6 +1446,8 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         });
         if (conflicts.length >= limit) break;
       }
+      if (rows.length < PAGE) break;
+      }
       return meta(f, { count: conflicts.length, conflicts });
     });
     return c.json(data);
@@ -1214,14 +1462,21 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   // the public denominator so a congress.trade miss cannot become a speed win.
   //
   // Honesty (2026-08):
-  //  - FMP stable + RapidAPI are one public "FMP" lane (earliest path stamp).
+  //  - FMP stable + RapidAPI are one FinancialModelingPrep.com lane (earliest path stamp).
+  //  - Public `providers` are functioning lanes only (running, coverage join ok).
+  //  - `adminProviders` keeps every merged lane plus publiclyShown.
   //  - Lead stats always use effective race timestamps (provider stamp with
   //    monitor first-seen fallback) so Quiver-style feeds never report
   //    matched=N with empty W/L → fake "preliminary tie".
   r.get('/latency-summary', async (c) => {
     // v5: FMP family merge + effective timing deltas (not published-only).
-    const data = await cached(c.env, 'analytics:latency-summary:v5', 300, async () => {
+    // v6: strong/weak split, window-decoupled coverage, scope denominator.
+    // v9: public providers = functioning only; adminProviders keep hidden lanes.
+    const data = await cached(c.env, 'analytics:latency-summary:v9', 300, async () => {
       const { publicSummary } = await getDisclosureLatencySummary(c.env);
+      const { summarizeProviderPublishBump } = await import('../ingestion/latencyPriceSnapshots.ts');
+      const priceEdge = await summarizeProviderPublishBump(c.env);
+      const visible = publicSummary.providers.filter(isLatencyComparisonPublic);
       return {
         generatedAt: publicSummary.generatedAt,
         windowHours: publicSummary.windowHours,
@@ -1234,42 +1489,21 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           providerObserved: publicSummary.totals.providerObserved,
           maturedProviderObserved: publicSummary.totals.maturedProviderObserved,
           unmatchedProvider: publicSummary.totals.unmatchedProvider,
+          unmatchedProviderCtMissing: publicSummary.totals.unmatchedProviderCtMissing,
+          unmatchedProviderCtExcluded: publicSummary.totals.unmatchedProviderCtExcluded,
           comparableProviders: publicSummary.totals.comparableProviders,
+          scopeMatched: publicSummary.scope.matched,
+          scopeTotal: publicSummary.scope.total,
         },
-        providers: publicSummary.providers.map((p) => ({
-          id: p.provider,
-          label: p.label,
-          operationalStatus: p.operationalStatus ?? 'unknown',
-          candidates: p.candidates,
-          // Timed live races (CT live first_seen in 7d; |Δ| up to 14d).
-          matched: p.matched,
-          // Same cohort as matched (live imports only; backfills excluded).
-          strongMatched: p.strongMatched,
-          providerObserved: p.providerObserved,
-          maturedProviderObserved: p.maturedProviderObserved,
-          unmatchedProvider: p.unmatchedProvider,
-          pendingProvider: p.pendingProvider,
-          maturedCandidates: p.maturedCandidates,
-          maturedMatched: p.maturedMatched,
-          ctCoveragePct: p.ctCoveragePct,
-          providerCoveragePct: p.providerCoveragePct,
-          // Backward-compatible alias; unlike the former field this is CT's
-          // coverage of the mature provider-observed cohort, not matched/CT
-          // candidates.
-          coveragePct: p.ctCoveragePct,
-          overlapPct: p.overlapPct,
-          comparisonStatus: p.comparisonStatus,
-          comparisonBasis: p.comparisonBasis,
-          // Effective race deltas (monitor* fields already include provider-stamp
-          // fallback). Never switch to published-only — that empty-set path made
-          // Quiver show "preliminary tie" with null median/avg.
-          usFirstCount: p.ctAheadMonitorCount,
-          providerFirstCount: p.providerAheadMonitorCount,
-          tieCount: p.tieMonitorCount,
-          medianLeadSec: p.medianMonitorDeltaSec,
-          avgLeadSec: p.avgMonitorDeltaSec,
-          p90LeadSec: p.p90MonitorDeltaSec,
-        })),
+        // "N of M matched" over our whole realm of concern — see
+        // DisclosureLatencyScope in ingestion/tradeLatency.ts for exactly what
+        // M counts. Both clients render this as one line; do not re-derive it.
+        scope: publicSummary.scope,
+        providers: visible.map((p) => toLatencyScoreboardRow(p)),
+        adminProviders: publicSummary.providers.map((p) =>
+          toLatencyScoreboardRow(p, { publiclyShown: isLatencyComparisonPublic(p) }),
+        ),
+        priceEdge,
       };
     });
     // Edge/browser cache shield: the numbers only move every ~5 minutes.

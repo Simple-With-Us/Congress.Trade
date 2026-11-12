@@ -1,116 +1,245 @@
 import SwiftUI
 
-/// People directory tab (owner punch list #2, item 9) — mirrors the web's
-/// People directory (`app/src/ui/dashboardHtml.ts` `loadPeopleDirectory()`/
-/// `renderPeopleDirectory()`): loads the full `GET /api/members` roster once
-/// (memoized client-side, `CongressTradeStore.loadMembersDirectory`) and
-/// filters/sorts it locally by name/state/party as the user types — the
-/// roster is small enough (one filer per row, not one row per trade) that a
-/// server round trip per keystroke isn't worth it, same call the web makes.
+/// Directory tab — mirrors web Directory (`loadPeopleDirectory` /
+/// multi-token name/state/party search + column sort).
 struct PeopleDirectoryView: View {
     @EnvironmentObject private var store: CongressTradeStore
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @AppStorage("ct_disclaimer_expanded") private var disclaimerExpanded = false
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
-    @State private var selectedMemberId: String?
-    @State private var selectedMemberName: String?
+    @State private var selectedMember: MemberSheetTarget?
+    @State private var sortKey: MemberDirectorySearch.SortKey = .trades
+    @State private var sortAscending = false
+    /// 0-indexed page of `filteredMembers`. Purely local: `GET /api/members` is
+    /// a full-roster endpoint (379 members, ~13.7KB gzipped, 30-minute KV
+    /// cache) with no paging parameters, and the whole point of holding it in
+    /// memory is instant search and sort. Paging here is only about not
+    /// rendering 379 cards at once — it must never become a request.
+    @State private var currentPage = 0
+    @State private var pageSize = 50
+    @State private var directoryMode: DirectoryMode = .politicians
+
+    private enum DirectoryMode: String, CaseIterable {
+        case politicians = "Politicians"
+        case assets = "Assets"
+    }
 
     private var filteredMembers: [MemberDirectoryEntry] {
-        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // Most-active-first, matching the roster's own server-side default order.
-        let ranked = store.members.sorted { ($0.txCount ?? 0) > ($1.txCount ?? 0) }
-        guard !needle.isEmpty else { return ranked }
-        return ranked.filter { member in
-            let haystack = [member.fullName, member.filerId, member.party, member.state, member.chamber]
-                .compactMap { $0 }
-                .joined(separator: " ")
-                .lowercased()
-            return haystack.contains(needle)
-        }
+        let matched = store.members.filter { MemberDirectorySearch.matches($0, query: searchText) }
+        return MemberDirectorySearch.sort(matched, key: sortKey, ascending: sortAscending)
+    }
+
+    private func totalPages(for count: Int) -> Int {
+        max(1, Int((Double(count) / Double(pageSize)).rounded(.up)))
+    }
+
+    /// Takes the already-clamped page rather than re-deriving it, so the rows,
+    /// the pager and the page label can never disagree about which page this
+    /// is. Clamping matters because search text can shrink the result set under
+    /// the current page at any keystroke, and a stale index would render an
+    /// empty list that reads as "no matches".
+    private func pageSlice(of members: [MemberDirectoryEntry], page: Int) -> ArraySlice<MemberDirectoryEntry> {
+        let start = max(0, page) * pageSize
+        guard start < members.count else { return members.prefix(pageSize) }
+        return members[start..<min(start + pageSize, members.count)]
     }
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 12) {
-                    PeopleSearchField(text: $searchText, focused: $searchFocused)
-                        .accessibilityLabel("Search politicians by name, state, or party")
+        // Filtering + sorting the whole roster is not free; do it once per
+        // render and hand the same array to the count, the pager and the list.
+        let members = filteredMembers
+        let pages = totalPages(for: members.count)
+        let page = min(currentPage, pages - 1)
+        return NavigationStack {
+            VStack(spacing: 0) {
+                if disclaimerExpanded {
+                    DisclaimerBanner()
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                        .padding(.bottom, 4)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
-                    HStack {
-                        Spacer(minLength: 0)
-                        Text("\(filteredMembers.count) of \(store.members.count) shown")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
+                Picker("Directory", selection: $directoryMode) {
+                    ForEach(DirectoryMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
                     }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 6)
 
-                    if let notice = store.membersNotice {
-                        FeedFreshnessView(
-                            isOffline: false,
-                            lastRefresh: nil,
-                            notice: notice,
-                            onRetry: { Task { await store.loadMembersDirectory(force: true) } }
-                        )
-                    }
-
-                    if store.isLoadingMembers && store.members.isEmpty {
-                        ProgressView("Loading Directory…")
-                            .padding(.top, 40)
-                    } else if filteredMembers.isEmpty {
-                        ContentUnavailableView {
-                            Label(
-                                searchText.isEmpty ? "No Politicians Yet" : "No Matches",
-                                systemImage: "person.2"
-                            )
-                        } description: {
-                            Text(
-                                searchText.isEmpty
-                                    ? "The directory fills in as filings are ingested."
-                                    : "Try another name, state, or party."
-                            )
-                        }
-                        .padding(.top, 40)
-                    } else {
-                        LazyVStack(spacing: 8) {
-                            ForEach(filteredMembers) { member in
-                                Button {
-                                    selectedMemberId = member.filerId
-                                    selectedMemberName = member.fullName ?? member.filerId
-                                } label: {
-                                    PersonRow(member: member)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityHint("Opens politician details")
-                            }
+                if directoryMode == .assets {
+                    AssetDirectoryView(wrapsNavigation: false)
+                } else {
+                    peopleDirectoryList(members: members, page: page, pages: pages)
+                }
+            }
+            .animation(.easeInOut(duration: 0.32), value: disclaimerExpanded)
+            .background(AppTheme.background)
+            .navigationBarTitleDisplayMode(.inline)
+            .ctSolidFeedHeader()
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    HeaderIconButton(
+                        systemImage: "info.circle",
+                        accessibilityLabel: "About Congress.Trade"
+                    ) {
+                        DisclaimerColdStart.cancelAutoHide()
+                        withAnimation(.easeInOut(duration: 0.32)) {
+                            disclaimerExpanded.toggle()
                         }
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 24)
+                ToolbarItem(placement: .principal) {
+                    BrandTitle()
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    HamburgerMenuButton()
+                }
             }
-            .scrollDismissesKeyboard(.interactively)
-            .background(AppTheme.background)
-            .navigationTitle("People")
             .refreshable { await store.loadMembersDirectory(force: true) }
             .task {
                 await store.loadMembersDirectory()
             }
-            .sheet(isPresented: Binding<Bool>(
-                get: { selectedMemberId != nil },
-                set: { if !$0 { selectedMemberId = nil } }
-            )) {
-                if let memberId = selectedMemberId {
-                    PoliticianDetailView(memberId: memberId, memberName: selectedMemberName ?? "Politician")
-                        .presentationDetents([.medium, .large])
-                        .presentationDragIndicator(.visible)
-                        .presentationCornerRadius(18)
-                }
+            .sheet(item: $selectedMember) { target in
+                PoliticianDetailView(
+                    memberId: target.id,
+                    memberName: target.name,
+                    seedPhotoUrl: target.photoUrl
+                )
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+                    .presentationCornerRadius(18)
+                    .presentationContentInteraction(.resizes)
+                    .iPadFullWidthSheet()
             }
+            .onChange(of: searchText) { _, _ in currentPage = 0 }
+            .onChange(of: sortKey) { _, _ in currentPage = 0 }
+            .onChange(of: sortAscending) { _, _ in currentPage = 0 }
         }
+    }
+
+    @ViewBuilder
+    private func peopleDirectoryList(members: [MemberDirectoryEntry], page: Int, pages: Int) -> some View {
+                ScrollView {
+                    VStack(spacing: 8) {
+                        PeopleSearchField(text: $searchText, focused: $searchFocused)
+                            .accessibilityLabel("Search directory by name, state, or party")
+
+                        HStack {
+                            // Truthful by construction: the roster endpoint returns
+                            // every member, so both numbers are real totals — no
+                            // page limit is ever printed here.
+                            Text("\(CompactFormat.count(members.count)) of \(CompactFormat.count(store.members.count)) shown")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                        }
+
+                        directoryPager(page: page, pages: pages)
+
+                        if let notice = store.membersNotice {
+                            FeedFreshnessView(
+                                isOffline: false,
+                                lastRefresh: nil,
+                                notice: notice,
+                                onRetry: { Task { await store.loadMembersDirectory(force: true) } }
+                            )
+                        }
+
+                        if store.isLoadingMembers && store.members.isEmpty {
+                            ProgressView("Loading Directory…")
+                                .padding(.top, 40)
+                        } else if members.isEmpty {
+                            ContentUnavailableView {
+                                Label(
+                                    searchText.isEmpty ? "No Politicians Yet" : "No Matches",
+                                    systemImage: "person.2"
+                                )
+                            } description: {
+                                Text(
+                                    searchText.isEmpty
+                                        ? "The directory fills in as filings are ingested."
+                                        : "Try a name, state (full or CA), party, or “CA Ro”."
+                                )
+                            }
+                            .padding(.top, 40)
+                        } else {
+                        if horizontalSizeClass == .regular {
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 540), spacing: 12)], spacing: 12) {
+                                ForEach(pageSlice(of: members, page: page)) { member in
+                                    Button {
+                                        selectedMember = MemberSheetTarget(
+                                            id: member.filerId,
+                                            name: member.fullName ?? member.filerId,
+                                            photoUrl: member.photoUrl
+                                        )
+                                    } label: {
+                                        PersonRow(member: member)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityHint("Opens politician details")
+                                }
+                            }
+                        } else {
+                            LazyVStack(spacing: 8) {
+                                ForEach(pageSlice(of: members, page: page)) { member in
+                                    Button {
+                                        selectedMember = MemberSheetTarget(
+                                            id: member.filerId,
+                                            name: member.fullName ?? member.filerId,
+                                            photoUrl: member.photoUrl
+                                        )
+                                    } label: {
+                                        PersonRow(member: member)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityHint("Opens politician details")
+                                }
+                            }
+                        }
+
+                            directoryPager(page: page, pages: pages)
+                                .padding(.top, 4)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 24)
+                }
+                .scrollDismissesKeyboard(.interactively)
+    }
+
+    private func directoryPager(page: Int, pages: Int) -> some View {
+        PaginationBar(
+            currentPage: page,
+            totalPages: pages,
+            pageSize: pageSize,
+            canGoPrevious: page > 0,
+            canGoNext: page + 1 < pages,
+            onPrevious: { currentPage = max(0, page - 1) },
+            onNext: { currentPage = min(pages - 1, page + 1) },
+            onPageSize: { size in
+                pageSize = size
+                currentPage = 0
+            },
+            sortControls: AnyView(
+                SortMenuControl(
+                    keys: Array(MemberDirectorySearch.SortKey.allCases),
+                    sortKey: $sortKey,
+                    sortAscending: $sortAscending,
+                    label: { $0.label },
+                    defaultAscending: { $0 != .trades }
+                )
+            )
+        )
     }
 }
 
-/// One People-directory row: avatar (photo, falling back to a party-emoji
-/// tile), name + chamber/party-state meta line, trailing trade count.
+/// One Directory row: avatar, name + chamber/party-state meta, trade count.
 private struct PersonRow: View {
     let member: MemberDirectoryEntry
 
@@ -154,61 +283,41 @@ private struct PersonRow: View {
     private var metaLine: String {
         var parts: [String] = []
         if let chamber = member.chamber, !chamber.isEmpty {
-            parts.append(chamber.chamberLabel)
+            parts.append(chamber.chamberLabel(title: member.title))
         }
-        let partyState = [member.party, member.state]
-            .compactMap { value -> String? in
-                guard let value, !value.isEmpty else { return nil }
-                return value
-            }
-            .joined(separator: " · ")
-        if !partyState.isEmpty { parts.append(partyState) }
+        var partyStateBits: [String] = []
+        if let party = member.party, !party.isEmpty {
+            partyStateBits.append(party)
+        }
+        if let state = member.state, !state.isEmpty {
+            let district = CompactFormat.districtOrdinal(member.district)
+            partyStateBits.append(district.isEmpty ? state : "\(state) - \(district)")
+        }
+        if !partyStateBits.isEmpty {
+            parts.append(partyStateBits.joined(separator: " · "))
+        }
         return parts.isEmpty ? "—" : parts.joined(separator: " · ")
     }
 
-    @ViewBuilder
     private var avatar: some View {
-        if let photoUrlString = member.photoUrl, let url = URL(string: photoUrlString) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().aspectRatio(contentMode: .fill)
-                case .failure:
-                    emojiTile
-                case .empty:
-                    ProgressView()
-                @unknown default:
-                    emojiTile
-                }
-            }
-            .frame(width: 44, height: 44)
-            .clipShape(Circle())
-            .overlay(Circle().stroke(AppTheme.borderColor, lineWidth: 1))
-        } else {
-            emojiTile
-        }
-    }
-
-    private var emojiTile: some View {
-        Text((member.party ?? "").partyEmoji)
-            .font(.system(size: 20))
-            .frame(width: 44, height: 44)
-            .background(Color(uiColor: .secondarySystemBackground), in: Circle())
-            .overlay(Circle().stroke(AppTheme.borderColor, lineWidth: 1))
+        MemberAvatar(
+            photoURL: MemberPhotoURL.resolve(member.photoUrl),
+            name: member.fullName ?? member.filerId,
+            size: 44
+        )
     }
 }
 
-/// "Name" search field for the People directory — same visual language as
-/// Trades' `CompactFilterField`, kept standalone here rather than reusing
-/// that struct's `TradeFilterField`-typed focus binding, which is specific
-/// to the Trades tab's own text fields.
 private struct PeopleSearchField: View {
     @Binding var text: String
     var focused: FocusState<Bool>.Binding
 
     var body: some View {
         HStack(spacing: 6) {
-            TextField("Name", text: $text)
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            TextField("Name, state, party… e.g. CA Ro", text: $text)
                 .neverAutocapitalized()
                 .autocorrectionDisabled()
                 .font(.subheadline)
@@ -222,14 +331,12 @@ private struct PeopleSearchField: View {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Clear")
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .frame(maxWidth: .infinity)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(AppTheme.border(cornerRadius: 12))
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }

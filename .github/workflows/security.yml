@@ -8,18 +8,25 @@ on:
   schedule:
     - cron: "41 10 * * 1"
 
+env:
+  # Pinned to the same engine version gitleaks-action@e0c47f4 installed, so the
+  # ruleset and findings are unchanged by this migration.
+  GITLEAKS_VERSION: "8.24.3"
+  GITLEAKS_SHA256_X64: "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c"
+  GITLEAKS_SHA256_ARM64: "5f2edbe1f49f7b920f9e06e90759947d3c5dfc16f752fb93aaafc17e9d14cf07"
+
 jobs:
   gitleaks:
-    # Self-hosted CI with automatic hosted fallback. Dependabot forced to hosted
-    # runners for security. See ci.yml for the full rationale/runbook.
+    # GitHub-hosted only. Dependabot stays on hosted runners for security.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ vars.CT_CI_RUNNER != '' && github.event.repository.private && fromJSON('["self-hosted", "oracle-ci"]') || 'ubuntu-latest' }}
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
+      # pull-requests: read is gone with the action — nothing writes or reads
+      # PR metadata through the API any more.
       contents: read
-      pull-requests: read
     steps:
       - name: Refuse untrusted PR source
         if: github.event_name == 'pull_request'
@@ -32,7 +39,10 @@ jobs:
           actor="${{ github.actor }}"
           if printf '%s' "$actor" | grep -Eq '\[bot\]$'; then
             case "$actor" in
-              'cursor[bot]'|'dependabot[bot]')
+              # The swu-* glob is the owner ruling of 2026-10-20: all swu-* bots
+              # are trusted CI actors.  It replaces a 40-entry enumeration that
+              # would drift from the autofix allowlists on every new install.
+              'cursor[bot]'|'dependabot[bot]'|'renovate[bot]'|'sentry[bot]'|'codex[bot]'|'chatgpt-codex-connector[bot]'|'kody-ai[bot]'|'claude[bot]'|'github-actions[bot]'|swu-*'[bot]')
                 echo "Trusted same-repo bot: $actor"
                 ;;
               *)
@@ -41,20 +51,191 @@ jobs:
                 ;;
             esac
           fi
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # CT-2459: full history is only needed by the weekly scheduled sweep.
+      # PR/push range scans check out shallow and fetch just the two range
+      # endpoints below, instead of every ref, tag and blob since day one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'schedule'
         with:
           fetch-depth: 0
-      - name: Clean stale gitleaks installer temp files
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name != 'schedule'
+        with:
+          fetch-depth: 1
+
+      - name: Fetch scan-range endpoints
+        if: github.event_name != 'schedule'
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) lo="$PR_BASE"; hi="$PR_HEAD" ;;
+            push) lo="$PUSH_BEFORE"; hi="$PUSH_AFTER" ;;
+            *) lo=""; hi="" ;;
+          esac
+          if [ -n "$lo" ] && [ "$lo" != "0000000000000000000000000000000000000000" ] && [ -n "$hi" ]; then
+            git fetch --no-tags origin "$lo" "$hi"
+            # Depth-1 checkout leaves hi without parents. Without an ancestry
+            # link, gitleaks 8.24.3 cannot walk lo..hi and falls back to a
+            # full-tree tip scan, attributing every pre-existing finding to
+            # the tip SHA (seen on main after #2943). Deepen until lo is an
+            # ancestor of hi; unshallow only if deepen cannot bridge them.
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              for _ in 1 2 3 4 5 6 7 8; do
+                git fetch --no-tags --deepen=50 origin || true
+                if git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+                  break
+                fi
+              done
+            fi
+            if ! git merge-base --is-ancestor "$lo" "$hi" 2>/dev/null; then
+              git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+            fi
+          else
+            # No usable range (new branch / first push): the scan falls back
+            # to full history, so restore it rather than silently scanning
+            # a shallow slice.
+            git fetch --unshallow --no-tags origin || git fetch --no-tags origin
+          fi
+
+      # gitleaks-action@e0c47f4 was replaced by a direct binary invocation.
+      # The scan itself was never the problem: it logged "no leaks found" and
+      # then hung for ~6.5 more minutes in its POST-scan phase (job summary /
+      # PR annotation writes through the GitHub API) until the job-level timeout
+      # killed it and marked a green PR red. That blocked four PRs
+      # (#1747 #1749 #1776 #1777) inside one hour on 2026-08-12, each needing a
+      # manual `gh run rerun`; identical commits then passed in ~2m50s. The hang
+      # correlates with runner contention and GitHub API write-back after the scan.
+      #
+      # Running the binary directly removes every GitHub-API code path (job
+      # summary, PR annotations, SARIF artifact upload, and the action's
+      # keygen.sh licence check) while keeping the identical engine and ruleset.
+      # PR annotations are not load-bearing: findings print to the job log, which
+      # is what anyone debugging a failure actually reads.
+      - name: Install pinned gitleaks
+        timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
-          tmp_root="${TMPDIR:-/tmp}"
-          tmp_root="${tmp_root%/}"
+          tmp_root="${TMPDIR:-/tmp}"; tmp_root="${tmp_root%/}"
+          # The old action left these behind; a stale copy could poison a later
+          # run if the workspace is reused.
           rm -f "$tmp_root/gitleaks.tmp"
-          rm -rf "$tmp_root/gitleaks-8.24.3"
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+          rm -rf "$tmp_root/gitleaks-${GITLEAKS_VERSION}"
+
+          case "$(uname -m)" in
+            x86_64|amd64)  arch="x64";   want="$GITLEAKS_SHA256_X64" ;;
+            aarch64|arm64) arch="arm64"; want="$GITLEAKS_SHA256_ARM64" ;;
+            *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
+          esac
+
+          tarball="$tmp_root/gitleaks.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz" \
+            -o "$tarball"
+
+          # Verify before extracting: pinning a version alone does not protect
+          # against a swapped release asset.
+          got="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::gitleaks checksum mismatch (expected $want, got $got)"
+            exit 1
+          fi
+
+          mkdir -p "$tmp_root/gitleaks-${GITLEAKS_VERSION}"
+          tar -xzf "$tarball" -C "$tmp_root/gitleaks-${GITLEAKS_VERSION}" gitleaks
+          echo "$tmp_root/gitleaks-${GITLEAKS_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Scan for secrets
+        # Step-level bound so a hang fails fast and legibly AT THE STEP that
+        # hung, instead of silently eating the whole job budget and surfacing as
+        # an unexplained "The operation was canceled."
+        timeout-minutes: 8
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Avoid the action's GitHub artifact upload path and storage charge;
-          # the scan result and PR annotations remain enabled.
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          gitleaks version
+
+          # Preserve the action's scan SCOPE exactly. This matters for more than
+          # speed: a full-history scan of this repo (1,589 commits / 524MB .git)
+          # did not finish in 120s when measured locally, so scanning everything
+          # on every PR would trade an intermittent hang for a consistently slow
+          # job. The same repo's PR-range scan finishes in under a second.
+          case "$EVENT" in
+            pull_request)
+              # base..head is exactly the set of commits the PR introduces.
+              range="${PR_BASE}..${PR_HEAD}"
+              ;;
+            push)
+              # An all-zeroes "before" means a new branch / first push, so there
+              # is no usable range — fall back to full history rather than
+              # silently scanning nothing.
+              if [ -z "${PUSH_BEFORE:-}" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+                range=""
+              else
+                range="${PUSH_BEFORE}..${PUSH_AFTER}"
+              fi
+              ;;
+            *)
+              # schedule / manual: full history. This weekly sweep is what
+              # catches anything a range scan structurally cannot see.
+              range=""
+              ;;
+          esac
+
+          # The findings themselves are written to a JSON report rather than
+          # relied on from stdout.  `gitleaks git` only prints the "leaks found:
+          # N" summary line, so before this change a failing run said *how many*
+          # leaks it found and nothing else -- the weekly full-history sweep had
+          # failed every week since 2026-08-17 reporting "leaks found: 6" with
+          # no rule, path, commit or fingerprint anywhere in the log, which is
+          # why nobody could act on it.  --redact still applies, and we print
+          # only structural fields (rule / path / line / commit / fingerprint)
+          # and then delete the report, so no secret value can reach a job log
+          # or an artifact even if redaction ever regressed.
+          report="${RUNNER_TEMP:-/tmp}/gitleaks-report.json"
+          rm -f "$report"
+
+          if [ -n "$range" ]; then
+            echo "scanning commit range: $range"
+            gitleaks git --no-banner --redact --exit-code 0 \
+              --report-format json --report-path "$report" --log-opts "$range" .
+          else
+            echo "scanning full history"
+            gitleaks git --no-banner --redact --exit-code 0 \
+              --report-format json --report-path "$report" .
+          fi
+
+          count=0
+          if [ -s "$report" ]; then
+            count="$(jq 'length' "$report")"
+          fi
+
+          if [ "$count" -gt 0 ]; then
+            echo "::error::gitleaks found ${count} finding(s).  Structural details below; secret values are never printed."
+            # Explicitly whitelist the fields we emit.  Never emit .Secret or
+            # .Match.
+            jq -r '.[] | "  rule=\(.RuleID) file=\(.File) line=\(.StartLine) commit=\(.Commit[0:12]) date=\(.Date[0:10])\n    fingerprint=\(.Fingerprint)"' "$report"
+            echo
+            echo "A finding that is a confirmed false positive goes in .gitleaksignore as its"
+            echo "fingerprint line, with a comment saying why.  A finding that is a real secret"
+            echo "means ROTATE FIRST, then decide about history -- never the other way round."
+            rm -f "$report"
+            exit 1
+          fi
+
+          rm -f "$report"
+          echo "No leaks detected."

@@ -258,4 +258,19 @@ describe('settleLlmSpend / readLlmSpend', () => {
     await expect(settleLlmSpend(env, receipt('failed', 1)))
       .rejects.toBeInstanceOf(LlmSpendSettlementError);
   });
+
+  it('enforces LLAMAPARSE_DAILY_CREDIT_CEILING in credits rather than USD', async () => {
+    // $1.25 spent = 1,000 credits spent (at 800 credits/$1.00 or $0.00125/credit)
+    const { env } = spendEnv(
+      [{ provider: 'llamaparse', usd: 1.25 }],
+      { LLAMAPARSE_DAILY_CREDIT_CEILING: '1000' },
+    );
+    const decision = await checkLlmSpendCeiling(env, 'llamaparse');
+    expect(decision.allowed).toBe(false);
+    expect(decision.scope).toBe('provider');
+    expect(decision.spentCredits).toBeCloseTo(1000);
+    expect(decision.ceilingCredits).toBe(1000);
+    expect(isLlmBudgetHalt(llmBudgetHaltMessage(decision))).toBe(true);
+    expect(llmBudgetHaltMessage(decision)).toContain('1000 of 1000 credits spent today');
+  });
 });

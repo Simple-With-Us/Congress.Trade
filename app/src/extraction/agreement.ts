@@ -23,7 +23,12 @@
  * agreement read returns zero rows, that is total extraction failure
  * (`extract_empty_failure`). We mark the filing `error`, keep review
  * unresolved with reason `extract_empty_failure`, and do NOT escalate tiers
- * (escalating burns budget on a dead extract).
+ * (escalating burns budget on a dead extract).  An executive 278e whose
+ * deterministic read also found no 278-T table closes as verified_empty
+ * instead.  A deterministic refusal (garbled 278-T) parks open as unreadable
+ * for a human.  It is not a terminal reject.
+ * Capped-row recovery must not relabel either outcome as
+ * agreement_cascade_unresolved.
  *
  * When a doc trips cheap complexity signals (page_count / raw_bytes over their
  * thresholds) the cascade starts directly at tier 2 (AGREEMENT_BIG_DOC_START_TIER2,
@@ -71,22 +76,38 @@
 
 import type { Env, ParsedTx, Transaction } from '../shared/types.ts';
 import { all, batch, fromBool, get, run } from '../shared/db.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import {
   runCandidateOnDoc,
   persistExtractionRun,
   upgradeRetiredDisclosureCandidate,
+  cachedCandidateResult,
+  estimateLiveReadCostUsd,
+  unaffordableCandidateResult,
   type BakeoffCandidate,
   type CandidateDocResult,
   type CandidateInvocation,
 } from './bakeoff.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { canonicalArbitrationKeys } from '../extractors/types.ts';
 import {
   recomputeTransactions,
   HARD_FAILURE_FLAGS,
   MAX_PUBLISH_TRANSACTIONS_PER_FILING,
   loadResolver,
+  normalize,
+  OGE_ROWS_INCOMPLETE_REASON,
+  resolveVerifiedEmpty,
 } from './normalizer.ts';
+import { assessOgeRowCompleteness, classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import {
+  maybeRecoverOgeRowsViaLocalOcr,
+  ogeLocalOcrAlreadyAttempted,
+  ogeLocalOcrReviewPayload,
+  OGE_LOCAL_OCR_EXTRACTOR,
+} from './ogeLocalOcr.ts';
+import { deprecatePredecessorFilingTransactions } from './amendmentPredecessor.ts';
 import { cleanAssetString } from './nameNormalizer.ts';
+import { prepareExtractedTx } from './prepareTx.ts';
 import { mapFiling, type FilingRow } from '../delivery/rows.ts';
 import { recordIngestionDecision } from '../shared/ingestionDecisions.ts';
 import { buildConsensusRows, type AmountBracket, type ConsensusResult } from './consensus.ts';
@@ -97,6 +118,24 @@ import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { flushDeliveryOutbox } from '../delivery/outbox.ts';
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { recordProviderHealth } from './providerHealth.ts';
+import {
+  shouldSkipAgreementForReviewReason,
+  dropJunkAgreementRows,
+  dropPtrFormSamplesForPublish,
+  evaluateExtractQuality,
+} from './extractRouting.ts';
+import {
+  handCheckReviewReason,
+  requiresHandCheckBeforePublish,
+} from './handCheckPublish.ts';
+import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
+import { shouldRetryFetchStatus } from '../ingestion/fetcher.ts';
+import { TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED } from './reviewQueueHealth.ts';
+import { isUsdMeteredExtractionProvider, LLM_DOC_BUDGET_ERROR_MARKER } from '../shared/llmSpend.ts';
+import {
+  closeUnreadableExecutive,
+  closeVerifiedEmptyExecutive,
+} from './executiveDisposition.ts';
 
 export interface AgreementModels {
   a: BakeoffCandidate;
@@ -131,6 +170,10 @@ export interface AgreementDocResult {
   flags?: string[];
   tickers?: string[];
   rows?: Record<string, number | string>;
+  /** On a `skipped` outcome: true when the skip is a transient read failure
+   *  worth retrying later (source fetch timeout/HTTP error), false when no
+   *  bytes exist anywhere and retrying cannot heal it. */
+  retryable?: boolean;
 }
 
 const label = (c: BakeoffCandidate): string => `${c.provider}:${c.model}`;
@@ -195,6 +238,19 @@ function canonicalAgreementText(value: string | null | undefined, ticker?: strin
     .replace(/[.,;:'"()[\]{}/\\_-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/** Demote House type codes stuffed into ticker, then resolve real symbols. */
+async function prepareAgreementReads(env: Env, reads: CandidateDocResult[]): Promise<void> {
+  const resolver = await loadResolver(env);
+  for (const read of reads) {
+    if (!read.ok) continue;
+    for (let i = 0; i < read.rows.length; i += 1) {
+      const prepared = prepareExtractedTx(read.rows[i]);
+      const resolved = resolver(prepared.ticker, prepared.assetName);
+      read.rows[i] = resolved ? { ...prepared, ticker: resolved } : prepared;
+    }
+  }
 }
 
 /**
@@ -289,10 +345,12 @@ export function sameRowSet(
   b: CandidateDocResult,
   normalizeText = true,
 ): boolean {
-  if (!a.ok || !b.ok || a.rows.length === 0) return false;
-  if (a.rows.length !== b.rows.length) return false;
-  const ka = a.rows.map((tx) => materialRowFingerprint(tx, normalizeText));
-  const kb = b.rows.map((tx) => materialRowFingerprint(tx, normalizeText));
+  if (!a.ok || !b.ok) return false;
+  const aRows = dropJunkAgreementRows(a.rows);
+  const bRows = dropJunkAgreementRows(b.rows);
+  if (aRows.length === 0 || aRows.length !== bRows.length) return false;
+  const ka = aRows.map((tx) => materialRowFingerprint(tx, normalizeText));
+  const kb = bRows.map((tx) => materialRowFingerprint(tx, normalizeText));
   if (ka.some((k) => k === null) || kb.some((k) => k === null)) return false;
   const sortedA = (ka as string[]).sort();
   const sortedB = (kb as string[]).sort();
@@ -317,9 +375,13 @@ export function sameRowSet(
  * mixes assetName from one model with description from another, keeping a
  * published row internally coherent.
  */
-function resolveAgreedRows(reads: CandidateDocResult[], normalizeText: boolean): ParsedTx[] {
-  if (!normalizeText) return reads[0]?.rows ?? [];
-  const grouped = reads.map((r) => {
+export function resolveAgreedRows(reads: CandidateDocResult[], normalizeText: boolean): ParsedTx[] {
+  const cleaned = reads.map((r) => ({
+    ...r,
+    rows: r.ok ? dropJunkAgreementRows(r.rows) : [],
+  }));
+  if (!normalizeText) return cleaned[0]?.rows ?? [];
+  const grouped = cleaned.map((r) => {
     const byFingerprint = new Map<string, ParsedTx[]>();
     for (const tx of r.rows) {
       const fp = materialRowFingerprint(tx, true) ?? '';
@@ -349,6 +411,154 @@ function resolveAgreedRows(reads: CandidateDocResult[], normalizeText: boolean):
     }
   }
   return resolved;
+}
+
+/** Stable cheap-first order: lowest estimated live-read cost, original index as tie-break. */
+export function orderModelsCheapFirst<T extends BakeoffCandidate>(models: readonly T[]): T[] {
+  return models
+    .map((model, index) => ({ model, index, cost: estimateLiveReadCostUsd(model) }))
+    .sort((a, b) => a.cost - b.cost || a.index - b.index)
+    .map((entry) => entry.model);
+}
+
+export function qualityGateAgreementRead(read: CandidateDocResult): CandidateDocResult | null {
+  if (!read.ok || read.skippedUnaffordable) return null;
+  const rows = dropJunkAgreementRows(read.rows);
+  if (rows.length === 0) return null;
+  if (!evaluateExtractQuality(rows).ok) return null;
+  return { ...read, rows, rowCount: rows.length };
+}
+
+function uniqueQualityReads(reads: CandidateDocResult[]): CandidateDocResult[] {
+  const seen = new Set<string>();
+  const out: CandidateDocResult[] = [];
+  for (const read of reads) {
+    const gated = qualityGateAgreementRead(read);
+    if (!gated) continue;
+    const id = `${gated.provider}:${gated.model}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(gated);
+  }
+  return out;
+}
+
+export type AgreementPublishDecision =
+  | { action: 'publish'; rows: ParsedTx[]; qualityModels: string[] }
+  | { action: 'disagree'; reason?: string }
+  | { action: 'empty' }
+  | { action: 'junk'; flags: string[] }
+  | { action: 'budget_stop' }
+  | { action: 'model_read_failed' };
+
+/**
+ * Quality-gated agree-to-publish: junk / placeholder / null-amount extracts
+ * cannot vote, stored coherent extracts can, and a per-doc budget stop is
+ * not treated as material disagreement. A single quality survivor publishes
+ * when later slots are unaffordable or a stored coherent extract exists —
+ * never when a live sibling still needs a retry (429 / auth / timeout).
+ */
+export function decideAgreementPublish(
+  lineupReads: CandidateDocResult[],
+  storedReads: CandidateDocResult[],
+  normalizeText: boolean,
+): AgreementPublishDecision {
+  const providerFailed = lineupReads.some((read) => !read.ok && !read.skippedUnaffordable);
+  const unaffordable = lineupReads.some((read) => read.skippedUnaffordable);
+  const successful = lineupReads.filter((read) => read.ok);
+  if (providerFailed) return { action: 'model_read_failed' };
+
+  const quality = uniqueQualityReads([...lineupReads, ...storedReads]);
+  if (quality.length >= 2) {
+    const unanimous = quality.every((read, index) => index === 0 || sameRowSet(quality[0], read, normalizeText));
+    if (unanimous) {
+      return {
+        action: 'publish',
+        rows: resolveAgreedRows(quality, normalizeText),
+        qualityModels: quality.map((read) => `${read.provider}:${read.model}`),
+      };
+    }
+    const majority = buildMajorityRows(quality, quality.length, normalizeText);
+    if (majority.ok) {
+      return {
+        action: 'publish',
+        rows: majority.rows,
+        qualityModels: quality.map((read) => `${read.provider}:${read.model}`),
+      };
+    }
+    return { action: 'disagree', reason: majority.reason ?? 'no_majority' };
+  }
+
+  if (quality.length === 1) {
+    if (unaffordable || storedReads.length > 0) {
+      return {
+        action: 'publish',
+        rows: quality[0].rows,
+        qualityModels: [`${quality[0].provider}:${quality[0].model}`],
+      };
+    }
+    return { action: 'disagree', reason: 'quality_gated_insufficient_reads' };
+  }
+  if (
+    successful.length > 0
+    && allSuccessfulReadsEmpty(successful)
+    && quality.length === 0
+    && !unaffordable
+  ) {
+    return { action: 'empty' };
+  }
+  if (quality.length === 0 && successful.some((read) => read.rows.length > 0)) {
+    const flags = new Set<string>();
+    for (const read of successful) {
+      const qualityResult = evaluateExtractQuality(read.rows);
+      if (!qualityResult.ok && qualityResult.reason) flags.add(qualityResult.reason);
+    }
+    if (flags.size === 0) flags.add('placeholder_asset');
+    return { action: 'junk', flags: [...flags] };
+  }
+  if (unaffordable) return { action: 'budget_stop' };
+  return { action: 'disagree' };
+}
+
+async function loadStoredQualityReads(
+  env: Env,
+  docId: string,
+  exclude: Set<string>,
+): Promise<CandidateDocResult[]> {
+  let rows: Array<{ provider: string; model: string; result_json: string | null }>;
+  try {
+    rows = await all(
+      env.DB,
+      `SELECT provider, model, result_json
+         FROM extraction_runs
+        WHERE doc_id = ? AND ok = 1
+        ORDER BY created_at DESC`,
+      [docId],
+    );
+  } catch {
+    return [];
+  }
+  const latest = new Map<string, CandidateDocResult>();
+  for (const row of rows) {
+    const id = `${row.provider}:${row.model}`;
+    if (exclude.has(id) || latest.has(id)) continue;
+    let parsed: ParsedTx[] = [];
+    try {
+      const raw = row.result_json ? JSON.parse(row.result_json) : [];
+      parsed = Array.isArray(raw) ? raw as ParsedTx[] : [];
+    } catch {
+      continue;
+    }
+    const gated = qualityGateAgreementRead(
+      cachedCandidateResult(
+        { provider: row.provider as BakeoffCandidate['provider'], model: row.model },
+        docId,
+        parsed,
+      ),
+    );
+    if (gated) latest.set(id, gated);
+  }
+  return [...latest.values()];
 }
 
 /**
@@ -404,6 +614,7 @@ export async function loadDocBytes(
         docId,
         outcome: 'skipped',
         reason: rawObjectKey ? 'R2 object missing and no source_url' : 'no raw_object_key and no source_url',
+        retryable: false,
       },
     };
   }
@@ -427,17 +638,27 @@ export async function loadDocBytes(
       { envOverride: env },
     );
     if (!res.ok) {
+      // Use the ingestion fetcher's established transient classification:
+      // beyond 408/425/429/5xx it retries WAF 403 bursts and 404s on filings
+      // fresh enough to not be published yet, while a permanent 4xx (400,
+      // 401, 410, an old filing's 404) is terminal so capped recovery
+      // reaches human review instead of looping on the lease forever.
+      const retryable = shouldRetryFetchStatus(res.status, filing?.first_seen_at, new Date());
       return {
         skip: {
           docId,
           outcome: 'skipped',
           reason: `source_url fetch HTTP ${res.status}`,
+          retryable,
         },
       };
     }
     const buf = await res.arrayBuffer();
     if (buf.byteLength === 0) {
-      return { skip: { docId, outcome: 'skipped', reason: 'source_url empty body' } };
+      // A 200/204 with no body is the source's answer, not a blip: capped
+      // recovery keeps the lease on retryable skips, so a retryable empty
+      // body loops the row forever instead of reaching human review.
+      return { skip: { docId, outcome: 'skipped', reason: 'source_url empty body', retryable: false } };
     }
     if (buf.byteLength > SOURCE_URL_FALLBACK_MAX_BYTES) {
       return {
@@ -445,6 +666,7 @@ export async function loadDocBytes(
           docId,
           outcome: 'skipped',
           reason: `source_url body exceeds ${SOURCE_URL_FALLBACK_MAX_BYTES} bytes`,
+          retryable: false,
         },
       };
     }
@@ -464,6 +686,7 @@ export async function loadDocBytes(
         docId,
         outcome: 'skipped',
         reason: `source_url fetch failed: ${(err as Error).message?.slice(0, 160) || 'error'}`,
+        retryable: true,
       },
     };
   }
@@ -491,6 +714,7 @@ interface AgreementReviewState {
   agreement_suppressed_at: string | null;
   agreement_suppression_reason: string | null;
   review_revision: number;
+  payload: string | null;
 }
 
 export const AGREEMENT_CLAIM_LEASE_MS = 15 * 60 * 1000;
@@ -500,7 +724,7 @@ async function loadReviewState(env: Env, docId: string): Promise<AgreementReview
     env.DB,
     `SELECT resolved, agreement_attempts, agreement_tier, agreement_next_attempt_at,
             agreement_claim_token, agreement_claimed_at, agreement_suppressed_at,
-            agreement_suppression_reason, review_revision
+            agreement_suppression_reason, review_revision, payload
        FROM review_queue WHERE doc_id = ?`,
     [docId],
   );
@@ -586,40 +810,16 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
     )`;
 
 /**
- * Soft-deprecates live transactions from predecessor filings when an amended filing is published.
+ * Soft-deprecates the live transactions of the filing an amended filing
+ * supersedes.
+ *
+ * CT-2452: the predecessor match used to be "same filer + same filed_date, or
+ * a shared doc-id prefix", which deprecated every sibling PTR filed on the same
+ * day (545 Trump 278-T transactions).  The rule now requires a real
+ * amended-document relationship AND an overlapping reporting period; see
+ * ./amendmentPredecessor.ts for the whole rule and why it fails closed.
  */
-export async function deprecatePredecessorFilingTransactions(
-  db: D1Database,
-  docId: string,
-  filerId: string | null,
-  filedDate: string | null,
-  nowIso: string = new Date().toISOString(),
-): Promise<number> {
-  if (!filerId) return 0;
-  const reason = `superseded by amendment ${docId}`;
-
-  const stmt = `
-    UPDATE transactions
-       SET deprecated_at = ?,
-           deprecated_reason = ?
-     WHERE doc_id IN (
-       SELECT doc_id FROM filings
-        WHERE filer_id = ? AND doc_id <> ?
-          AND ingest_status = 'persisted'
-          AND (
-            (filed_date IS NOT NULL AND filed_date = ?)
-            OR (doc_id LIKE 'E-%' AND SUBSTR(doc_id, 1, 35) = SUBSTR(?, 1, 35))
-          )
-     ) AND deprecated_at IS NULL
-  `;
-  try {
-    const res = await run(db, stmt, [nowIso, reason, filerId, docId, filedDate ?? '', docId]);
-    return res.meta?.changes ?? 0;
-  } catch (err) {
-    console.warn('deprecatePredecessorFilingTransactions failed:', docId, (err as Error).message);
-    return 0;
-  }
-}
+export { deprecatePredecessorFilingTransactions };
 
 /**
  * Persist all rows and resolve the review item in one D1 batch. Every statement
@@ -763,6 +963,9 @@ async function persistClaimedPublish(
             agreement_next_attempt_at = NULL,
             agreement_claim_token = NULL,
             agreement_claimed_at = NULL,
+            resolution_kind = 'published',
+            resolution_reason = 'model_agreement',
+            resolved_at = CURRENT_TIMESTAMP,
             review_revision = review_revision + 1
       WHERE doc_id = ? AND resolved = 0 AND agreement_suppressed_at IS NULL
         AND agreement_claim_token = ? AND ${exactLiveSetPredicate}`,
@@ -804,27 +1007,48 @@ async function readAndPersist(
   invocations?: CandidateInvocation[],
   signal?: AbortSignal,
 ): Promise<CandidateDocResult[]> {
-  const reads: CandidateDocResult[] = [];
-  for (const [index, m] of models.entries()) {
+  const ranked = models
+    .map((model, index) => ({
+      model,
+      invocation: invocations?.[index],
+      index,
+      cost: estimateLiveReadCostUsd(model),
+    }))
+    .sort((a, b) => a.cost - b.cost || a.index - b.index);
+  const byLabel = new Map<string, CandidateDocResult>();
+  let stopUsdMetered = false;
+  let usdStopError = LLM_DOC_BUDGET_ERROR_MARKER;
+  for (const entry of ranked) {
     signal?.throwIfAborted();
+    if (stopUsdMetered && isUsdMeteredExtractionProvider(entry.model.provider)) {
+      byLabel.set(
+        label(entry.model),
+        unaffordableCandidateResult(entry.model, docId, usdStopError),
+      );
+      continue;
+    }
     const r = await runCandidateOnDoc(
       env,
-      m,
+      entry.model,
       docId,
       bytes,
-      invocations?.[index],
+      entry.invocation,
       signal,
     );
     signal?.throwIfAborted();
-    if (!r.cached) {
+    if (r.skippedUnaffordable && isUsdMeteredExtractionProvider(entry.model.provider)) {
+      stopUsdMetered = true;
+      usdStopError = r.error || LLM_DOC_BUDGET_ERROR_MARKER;
+    }
+    if (!r.cached && !r.skippedUnaffordable) {
       await persistExtractionRun(env, r, 'agreement', runBatchId);
       // Feed the per-provider:model rolling health window (billing/auth
       // breaker) from cascade reads too. Best-effort by construction.
-      await recordProviderHealth(env, m, r.ok, r.error);
+      await recordProviderHealth(env, entry.model, r.ok, r.error);
     }
-    reads.push(r);
+    byLabel.set(label(entry.model), r);
   }
-  return reads;
+  return models.map((model) => byLabel.get(label(model))!);
 }
 
 /**
@@ -834,7 +1058,7 @@ async function readAndPersist(
  * identical regardless of how the rows were agreed. Returns 'agree_but_hardfail'
  * without publishing when any resulting row carries a hard-failure flag.
  */
-async function finalizePublish(
+export async function finalizePublish(
   env: Env,
   frow: FilingRow,
   docId: string,
@@ -842,6 +1066,47 @@ async function finalizePublish(
   dryRun: boolean,
   audit: CascadeAudit,
 ): Promise<AgreementDocResult> {
+  const filing = mapFiling(frow);
+  const withoutSamples = dropPtrFormSamplesForPublish(docId, parsed);
+  const extractor = frow.extractor ?? filing.extractor ?? null;
+  if (requiresHandCheckBeforePublish(filing, extractor, 'primary')) {
+    return {
+      docId,
+      outcome: 'skipped',
+      tier: audit.tier,
+      reason: handCheckReviewReason(filing, extractor, 'primary'),
+    };
+  }
+  parsed = withoutSamples;
+  // 278-T completeness: a filing parked because the reader dropped numbered
+  // rows is not publishable by a cascade/stored-run read, which cannot prove
+  // it recovered them; neither is a candidate set whose own row numbers skip.
+  if (filing.chamber === 'executive') {
+    const completeness = assessOgeRowCompleteness(null, parsed);
+    let parkedIncomplete = false;
+    try {
+      // Only an OPEN parking counts: a resolved row's reason is history.
+      const review = await get<{ reason: string | null }>(
+        env.DB,
+        'SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0',
+        [docId],
+      );
+      parkedIncomplete = String(review?.reason ?? '').split(',').map((t) => t.trim())
+        .includes(OGE_ROWS_INCOMPLETE_REASON);
+    } catch {
+      // Fail closed: an unreadable review row must not let a partial set publish.
+      parkedIncomplete = true;
+    }
+    if (parkedIncomplete || (completeness !== null && completeness.missingCount > 0)) {
+      return {
+        docId,
+        outcome: 'agree_but_hardfail',
+        tier: audit.tier,
+        rowCount: parsed.length,
+        flags: [OGE_ROWS_INCOMPLETE_REASON],
+      };
+    }
+  }
   const filedDate = frow.filed_date?.slice(0, 10) ?? null;
   if (parsed.some((tx) => !isValidTransactionDate(tx.txDate) || (filedDate !== null && tx.txDate! > filedDate))) {
     return {
@@ -952,6 +1217,9 @@ export async function processAgreementDoc(
     ? await loadDocBytes(env, docId, rawObjectKey, options.signal)
     : await loadDocBytes(env, docId, rawObjectKey);
   if ('skip' in loaded) return loaded.skip;
+  // Copy before model reads. pdf.js detaches the buffer it is handed, and a
+  // later empty close still needs the text layer to see Part 7 "None".
+  const part7Bytes = docId.startsWith('E-') ? loaded.bytes.slice(0) : null;
 
   // Live-toggleable text-field agreement normalization (default on). Resolved
   // here (not just threaded from handleAgreementCheck) so the operator
@@ -985,17 +1253,56 @@ export async function processAgreementDoc(
     options.invocations,
     options.signal,
   );
-  const [rA, rB, rC] = [reads[0], reads[1], reads[2] ?? null];
+  const storedReads = await loadStoredQualityReads(
+    env,
+    docId,
+    new Set(lineup.map((model) => label(model))),
+  );
+  await prepareAgreementReads(env, [...reads, ...storedReads]);
 
-  if (!rA.ok || !rB.ok || (rC !== null && !rC.ok)) {
-    return { docId, outcome: 'skipped', tier: audit?.tier, reason: 'model_read_failed' };
+  const lineupRows = (): Record<string, number | string> => ({
+    [label(models.a)]: reads[0]?.ok ? reads[0].rowCount : (reads[0]?.skippedUnaffordable ? 'BUDGET' : 'ERR'),
+    [label(models.b)]: reads[1]?.ok ? reads[1].rowCount : (reads[1]?.skippedUnaffordable ? 'BUDGET' : 'ERR'),
+    ...(models.c ? {
+      [label(models.c)]: reads[2]?.ok ? reads[2].rowCount : (reads[2]?.skippedUnaffordable ? 'BUDGET' : 'ERR'),
+    } : {}),
+  });
+
+  const decision = decideAgreementPublish(reads, storedReads, normalizeText);
+  if (decision.action === 'model_read_failed') {
+    return { docId, outcome: 'skipped', tier: audit?.tier, reason: 'model_read_failed', rows: lineupRows() };
   }
-
-  // Empty×empty: every model "succeeded" with zero rows — total extract failure.
-  // Must not look like material disagreement (which escalates) or soft cascade
-  // park. Handled by handleAgreementCheck / leaveInReview via hard-fail flags.
-  const successfulReads = rC ? [rA, rB, rC] : [rA, rB];
-  if (allSuccessfulReadsEmpty(successfulReads)) {
+  if (decision.action === 'budget_stop') {
+    return { docId, outcome: 'skipped', tier: audit?.tier, reason: 'doc_budget_stop', rows: lineupRows() };
+  }
+  if (decision.action === 'empty') {
+    const part7 = await closeOgePart7ExplicitNone(
+      env,
+      docId,
+      part7Bytes,
+      audit?.tier ?? (models.c ? 2 : 1),
+      dryRun,
+    );
+    if (part7) return { ...part7, rows: lineupRows() };
+    // Every non-dry caller — handleAgreementCheck's tier-1 claim AND the
+    // operator /agreement-reprocess route — settles an executive zero-read
+    // here before extract_empty_failure: a real 278e empty closes itself, an
+    // unreadable 278-T parks for a human, and deterministic rows are routed
+    // through normalization.
+    if (!dryRun) {
+      const settled = await maybeSettleExecutiveZeroRead(
+        env,
+        docId,
+        async () => (part7Bytes ? part7Bytes.slice(0) : null),
+        audit?.claimToken,
+      );
+      if (settled) {
+        return {
+          ...settledZeroReadResult(docId, audit?.tier ?? (models.c ? 2 : 1), settled),
+          rows: lineupRows(),
+        };
+      }
+    }
     return {
       docId,
       outcome: 'agree_but_hardfail',
@@ -1003,38 +1310,39 @@ export async function processAgreementDoc(
       rowCount: 0,
       flags: ['extract_empty_failure'],
       reason: 'extract_empty_failure',
-      rows: {
-        [label(models.a)]: 0,
-        [label(models.b)]: 0,
-        ...(models.c ? { [label(models.c)]: 0 } : {}),
-      },
+      rows: lineupRows(),
     };
   }
-
-  const agree = sameRowSet(rA, rB, normalizeText)
-    && (!rC || (sameRowSet(rA, rC, normalizeText) && sameRowSet(rB, rC, normalizeText)));
-  if (!agree) {
+  if (decision.action === 'junk') {
     return {
       docId,
-      outcome: 'disagree',
-      rows: {
-        [label(models.a)]: rA.ok ? rA.rowCount : 'ERR',
-        [label(models.b)]: rB.ok ? rB.rowCount : 'ERR',
-        ...(models.c ? { [label(models.c)]: rC && rC.ok ? rC.rowCount : 'ERR' } : {}),
-      },
+      outcome: 'agree_but_hardfail',
+      tier: audit?.tier ?? (models.c ? 2 : 1),
+      rowCount: 0,
+      flags: decision.flags,
+      reason: decision.flags[0] ?? 'placeholder_asset',
+      rows: lineupRows(),
     };
+  }
+  if (decision.action === 'disagree') {
+    return { docId, outcome: 'disagree', rows: lineupRows() };
   }
 
   const frow = await loadFilingRow(env, docId);
   if (!frow) return { docId, outcome: 'skipped', reason: 'filing row missing' };
 
-  const agreedReads = rC ? [rA, rB, rC] : [rA, rB];
-  return finalizePublish(env, frow, docId, resolveAgreedRows(agreedReads, normalizeText), dryRun, {
+  const labels = modelLabels(models);
+  for (const [index, modelId] of decision.qualityModels.entries()) {
+    if (!Object.values(labels).includes(modelId)) {
+      labels[`stored${index}`] = modelId;
+    }
+  }
+  return finalizePublish(env, frow, docId, decision.rows, dryRun, {
     tier: audit?.tier ?? (models.c ? 2 : 1),
-    models: modelLabels(models),
+    models: labels,
     claimToken: audit?.claimToken,
     reviewRevision: operatorReviewRevision,
-    unanimous: true,
+    unanimous: decision.qualityModels.length >= 2,
     votes: audit?.votes,
   });
 }
@@ -1075,7 +1383,7 @@ interface MajorityBuild {
  * `normalizeText` is true. Soft free-text uses the same text comparator but
  * never fails the row.
  */
-function buildMajorityRows(
+export function buildMajorityRows(
   reads: CandidateDocResult[],
   totalModels: number,
   normalizeText: boolean,
@@ -1146,13 +1454,15 @@ function buildMajorityRows(
     );
     return String(nonEmpty[0].text);
   };
-  const groups = reads.map((read) => {
+  const canonical = canonicalArbitrationKeys(reads.map((read) => read.rows));
+  const groups = reads.map((read, groupIndex) => {
     const grouped = new Map<string, ParsedTx[]>();
-    for (const tx of read.rows) {
+    for (let index = 0; index < read.rows.length; index += 1) {
+      const tx = read.rows[index];
+      const key = canonical[groupIndex][index];
       if (!isValidTransactionDate(tx.txDate)) {
-        return { grouped, error: `invalid_transaction_date:${arbitrationRowKey(tx)}` };
+        return { grouped, error: `invalid_transaction_date:${key}` };
       }
-      const key = arbitrationRowKey(tx);
       const rows = grouped.get(key) ?? [];
       rows.push(tx);
       grouped.set(key, rows);
@@ -1187,9 +1497,20 @@ function buildMajorityRows(
         if (bloc) { bloc.count += 1; bloc.entries.push({ tx, order }); }
         else blocs.set(key, { count: 1, entries: [{ tx, order }] });
       });
-      const winnerBloc = [...blocs.entries()]
-        .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]))[0]?.[1];
-      if (!winnerBloc || winnerBloc.count * 2 <= totalModels) {
+      const ranked = [...blocs.entries()]
+        .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]));
+      const winnerBloc = ranked[0]?.[1];
+      const secondCount = ranked[1]?.[1].count ?? 0;
+      const uniquePlurality = Boolean(
+        winnerBloc && winnerBloc.count >= 2 && winnerBloc.count > secondCount,
+      );
+      const majority = Boolean(winnerBloc && winnerBloc.count * 2 > totalModels);
+      const variableField = field === 'assetName' || field === 'assetType';
+      if (!winnerBloc || (!majority && !(variableField && uniquePlurality))) {
+        if (field === 'assetType') {
+          winners.set(field, pickSoftValue(present, field as SoftFreeTextField) ?? present[0]?.assetType ?? null);
+          continue;
+        }
         return { ok: false, rows: [], reason: `field_disagreement:${rowKey}:${field}` };
       }
       // Within the winning bloc, publish the CONTRIBUTING row's own reading
@@ -1255,6 +1576,52 @@ function voteSummary(consensus: ConsensusResult, totalModels: number): unknown {
  * cap. Clearing the claim first made finishTerminalClaim a no-op, so the next
  * autopilot scan re-queued empty docs forever and burned more model reads.
  */
+
+/**
+ * Agreement reads returned zero rows, and the OGE text layer says Part 7 is
+ * explicitly None. That is verified_empty, not extract_empty_failure.
+ * A zero-row 278-T without the marker returns null so the caller still parks.
+ */
+async function closeOgePart7ExplicitNone(
+  env: Env,
+  docId: string,
+  bytes: ArrayBuffer | null,
+  tier: number,
+  dryRun: boolean,
+): Promise<AgreementDocResult | null> {
+  if (!bytes || !docId.startsWith('E-')) return null;
+  const explicitNone = await pdfBytesLookLikeOgePart7ExplicitNone(bytes);
+  if (!explicitNone) return null;
+  if (!dryRun) {
+    const frow = await loadFilingRow(env, docId);
+    if (!frow) return null;
+    const review = await loadReviewState(env, docId);
+    const closed = await resolveVerifiedEmpty(
+      env,
+      mapFiling(frow),
+      new Date().toISOString(),
+      review
+        ? {
+            resolved: review.resolved,
+            review_revision: review.review_revision,
+            agreement_suppressed_at: review.agreement_suppressed_at,
+            payload: review.payload,
+          }
+        : null,
+      'oge_part7_explicit_none',
+    );
+    if (!closed) return null;
+  }
+  return {
+    docId,
+    outcome: 'agree_but_hardfail',
+    tier,
+    rowCount: 0,
+    flags: ['oge_part7_explicit_none'],
+    reason: 'oge_part7_explicit_none',
+  };
+}
+
 export async function markExtractEmptyFailure(
   env: Env,
   docId: string,
@@ -1263,6 +1630,25 @@ export async function markExtractEmptyFailure(
   claimToken?: string,
   detail?: string,
 ): Promise<AgreementDocResult> {
+  // Part 7 "None" is an honest empty. Park extract_empty_failure only when
+  // the text layer does not say so (bare zero-row OCR stays in review).
+  try {
+    const filing = await loadFilingRow(env, docId);
+    const loaded = await loadDocBytes(env, docId, filing?.raw_object_key ?? null);
+    if (!('skip' in loaded)) {
+      const part7 = await closeOgePart7ExplicitNone(
+        env,
+        docId,
+        loaded.bytes.slice(0),
+        tier,
+        false,
+      );
+      if (part7) return part7;
+    }
+  } catch (err) {
+    console.warn('markExtractEmptyFailure part7 check failed:', docId, (err as Error).message);
+  }
+
   const nowIso = new Date().toISOString();
   const errMsg = detail
     ?? 'extract_empty_failure: all agreement reads returned zero transactions';
@@ -1277,13 +1663,15 @@ export async function markExtractEmptyFailure(
   };
 
   let existingRevision: number | null = null;
+  let wasResolved: number | null = null;
   try {
-    const row = await get<{ review_revision: number }>(
+    const row = await get<{ review_revision: number; resolved: number }>(
       env.DB,
-      'SELECT review_revision FROM review_queue WHERE doc_id = ?',
+      'SELECT review_revision, resolved FROM review_queue WHERE doc_id = ?',
       [docId],
     );
     existingRevision = row?.review_revision ?? null;
+    wasResolved = row?.resolved ?? null;
   } catch (err) {
     console.warn('markExtractEmptyFailure failed to read review_revision:', docId, (err as Error).message);
   }
@@ -1308,14 +1696,30 @@ export async function markExtractEmptyFailure(
       const reviewParams = claimToken
         ? ['extract_empty_failure', JSON.stringify(payload), docId, claimToken, existingRevision]
         : ['extract_empty_failure', JSON.stringify(payload), docId, existingRevision];
-      await run(env.DB, reviewSql, reviewParams);
+      const reviewResult = await run(env.DB, reviewSql, reviewParams);
+      if ((reviewResult.meta?.changes ?? 0) > 0 && wasResolved === 1) {
+        void notifyReviewQueuePublisher(env, {
+          docId,
+          reason: 'extract_empty_failure',
+          kind: 'reopen',
+          at: nowIso,
+        });
+      }
     } else {
-      await run(
+      const insertResult = await run(
         env.DB,
         `INSERT OR IGNORE INTO review_queue (doc_id, reason, payload, created_at, resolved)
          VALUES (?, ?, ?, ?, 0)`,
         [docId, 'extract_empty_failure', JSON.stringify(payload), nowIso],
       );
+      if ((insertResult.meta?.changes ?? 0) > 0) {
+        void notifyReviewQueuePublisher(env, {
+          docId,
+          reason: 'extract_empty_failure',
+          kind: 'insert',
+          at: nowIso,
+        });
+      }
     }
 
     await run(
@@ -1345,6 +1749,191 @@ export async function markExtractEmptyFailure(
     rowCount: 0,
     flags: ['extract_empty_failure'],
     reason: 'extract_empty_failure',
+  };
+}
+
+/**
+ * Result of a deterministic executive zero-read settlement: a terminal close,
+ * or rows the deterministic parser recovered and routed through normalization.
+ */
+type ZeroReadSettlement =
+  | { kind: 'empty' | 'unreadable' }
+  | {
+      kind: 'rows';
+      needsReview: boolean;
+      published: boolean;
+      /** normalize() resolved the review with nothing new to persist. */
+      settled: boolean;
+      rowCount: number;
+      /** normalize()'s resolution reason (e.g. amendment_already_persisted). */
+      reason?: string;
+    };
+
+/**
+ * Executive zero-row agreement.  House and Senate stay on
+ * markExtractEmptyFailure.  Returns null when this doc is not an executive
+ * filing the deterministic parser can close, so the caller keeps the
+ * existing empty-failure path.
+ */
+async function maybeSettleExecutiveZeroRead(
+  env: Env,
+  docId: string,
+  loadBytes: () => Promise<ArrayBuffer | null>,
+  claimToken?: string,
+): Promise<ZeroReadSettlement | null> {
+  const filing = await loadFilingRow(env, docId);
+  if (!filing || filing.chamber !== 'executive') return null;
+  let bytes: ArrayBuffer | null = null;
+  try {
+    bytes = await loadBytes();
+  } catch (err) {
+    console.warn('executive zero-read: bytes unavailable', docId, (err as Error).message);
+    return null;
+  }
+  if (!bytes) return null;
+  let classified;
+  try {
+    classified = await classifyExecutivePdfBytes(bytes, docId);
+  } catch (err) {
+    console.warn('executive zero-read: classify failed', docId, (err as Error).message);
+    return null;
+  }
+  // 'unconfirmed': zero rows but no positive evidence Part 7 is empty.
+  // Keep the fail-closed extract_empty_failure path.
+  if (classified.disposition === 'unconfirmed') return null;
+  if (classified.disposition === 'rows') {
+    // The deterministic parser found rows where the agreement reads came back
+    // empty.  Route them through normalization (persisted or staged into
+    // review) instead of letting the caller stamp extract_empty_failure over
+    // real rows that were never normalized or staged.
+    try {
+      const norm = await normalize(env, mapFiling(filing), classified.rows, {
+        extractor: 'ogeText',
+        parseDisposition: 'rows',
+      });
+      return {
+        kind: 'rows',
+        needsReview: norm.needsReview,
+        published: norm.published,
+        settled: norm.settled === true,
+        rowCount: norm.transactions.length,
+        reason: norm.reviewReason,
+      };
+    } catch (err) {
+      console.warn(
+        'executive zero-read: recovered rows failed normalization:',
+        docId,
+        (err as Error).message,
+      );
+      return null;
+    }
+  }
+  if (classified.disposition === 'unreadable') {
+    // CT-2448: try the local tesseract pass before parking.  The stored PDF
+    // bytes are already in hand here, so the pass costs no extra fetch.  When
+    // both reads agree the rows go through normalization exactly like the
+    // deterministic recovery above; when they do not, the filing parks as it
+    // does today with the unreconciled rows listed in the payload.
+    let ocrOutcome = null;
+    try {
+      if (!(await ogeLocalOcrAlreadyAttempted(env, docId))) {
+        ocrOutcome = await maybeRecoverOgeRowsViaLocalOcr(
+          env,
+          {
+            docId,
+            chamber: filing.chamber ?? '',
+            filingType: filing.filing_type ?? null,
+          },
+          bytes,
+          'unreadable',
+        );
+      }
+    } catch (err) {
+      console.warn('executive zero-read: local OCR retry failed:', docId, (err as Error).message);
+    }
+    if (ocrOutcome?.status === 'rows') {
+      try {
+        const norm = await normalize(env, mapFiling(filing), ocrOutcome.rows, {
+          extractor: OGE_LOCAL_OCR_EXTRACTOR,
+          parseDisposition: 'rows',
+        });
+        return {
+          kind: 'rows',
+          needsReview: norm.needsReview,
+          published: norm.published,
+          settled: norm.settled === true,
+          rowCount: norm.transactions.length,
+          reason: norm.reviewReason,
+        };
+      } catch (err) {
+        console.warn(
+          'executive zero-read: local OCR rows failed normalization:',
+          docId,
+          (err as Error).message,
+        );
+      }
+    }
+    const closed = await closeUnreadableExecutive(env, docId, {
+      respectSuppression: true,
+      claimToken,
+      payload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
+    });
+    return closed ? { kind: 'unreadable' } : null;
+  }
+  const closed = await closeVerifiedEmptyExecutive(env, docId, { respectSuppression: true, claimToken });
+  return closed ? { kind: 'empty' } : null;
+}
+
+export function settledZeroReadResult(
+  docId: string,
+  tier: number,
+  settled: ZeroReadSettlement,
+): AgreementDocResult {
+  if (settled.kind === 'rows') {
+    if (settled.settled) {
+      // The recovered rows already lived on a predecessor (or only deletions
+      // remained): normalize() resolved the review with nothing new to
+      // persist.  A successful terminal no-op, not a CAS loss.
+      return {
+        docId,
+        outcome: 'published',
+        tier,
+        rowCount: settled.rowCount,
+        flags: ['deterministic_rows_recovered'],
+        reason: settled.reason ?? 'deterministic_rows_recovered',
+      };
+    }
+    if (!settled.needsReview && !settled.published) {
+      // normalize() lost the persist/stage CAS (a concurrent revision, or a
+      // resolved-decision guard): the recovered rows were neither persisted
+      // nor staged, so reporting 'published' would finish the caller as a
+      // success over nothing.  Leave the doc to its next pass.
+      return {
+        docId,
+        outcome: 'skipped',
+        tier,
+        rowCount: settled.rowCount,
+        flags: ['deterministic_rows_recovered'],
+        reason: 'review_resolved_or_claim_lost',
+      };
+    }
+    return {
+      docId,
+      outcome: settled.needsReview ? 'review_flagged' : 'published',
+      tier,
+      rowCount: settled.rowCount,
+      flags: ['deterministic_rows_recovered'],
+      reason: 'deterministic_rows_recovered',
+    };
+  }
+  const reason = settled.kind === 'empty' ? 'auto_resolved_empty' : 'oge_text_unreadable';
+  return {
+    docId,
+    outcome: 'agree_but_hardfail',
+    tier,
+    rowCount: 0,
+    flags: [reason],
+    reason,
   };
 }
 
@@ -1447,6 +2036,10 @@ export async function processAgreementCascadeTier2(
     ? await loadDocBytes(env, docId, rawObjectKey, signal)
     : await loadDocBytes(env, docId, rawObjectKey);
   if ('skip' in loaded) return loaded.skip;
+  // Copy before model reads: pdf.js detaches the buffer it is handed, so
+  // loaded.bytes is not safe to reuse after readAndPersist.  The Part 7 None
+  // check and the executive zero-read settle both read from this copy.
+  const part7Bytes = docId.startsWith('E-') ? loaded.bytes.slice(0) : null;
 
   // Live-toggleable text-field agreement normalization (default on) — see the
   // matching comment in processAgreementDoc.
@@ -1476,50 +2069,28 @@ export async function processAgreementCascadeTier2(
     undefined,
     signal,
   );
-
-  // Align rows before consensus checks to prevent spurious field_disagreement
-  // on raw string variants of the same ticker/asset.
-  const resolver = await loadResolver(env);
-  for (const read of reads) {
-    if (read.ok) {
-      for (const tx of read.rows) {
-        const cleaned = cleanAssetString(tx.assetName, tx.ticker);
-        const resolved = resolver(tx.ticker, cleaned);
-        if (resolved) {
-          tx.ticker = resolved;
-        }
-        if (cleaned) {
-          tx.assetName = cleaned;
-        }
-      }
-    }
-  }
-
-  const [rA, rB, rC] = reads;
+  const storedReads = await loadStoredQualityReads(
+    env,
+    docId,
+    new Set(lineup.map((model) => label(model))),
+  );
+  await prepareAgreementReads(env, [...reads, ...storedReads]);
 
   const frow = await loadFilingRow(env, docId);
   if (!frow) return { docId, outcome: 'skipped', reason: 'filing row missing' };
 
   const labels = modelLabels(models);
+  const decision = decideAgreementPublish(reads, storedReads, normalizeText);
 
-  // 3-way unanimity → publish exactly as the original agreement path (tier 2).
-  const unanimous = rA.ok && rB.ok && rC.ok
-    && sameRowSet(rA, rB, normalizeText) && sameRowSet(rA, rC, normalizeText) && sameRowSet(rB, rC, normalizeText);
-  if (unanimous) {
-    return finalizePublish(env, frow, docId, resolveAgreedRows([rA, rB, rC], normalizeText), dryRun, {
-      tier: 2, models: labels, unanimous: true, claimToken, reviewRevision: operatorReviewRevision,
-    });
-  }
-
-  // A provider failure is operational, not semantic disagreement. Return a
-  // retryable skip so the autonomous handler applies bounded backoff/cap logic;
-  // never count an error as "saw nothing" in a false 2/3 publish quorum.
-  if (!rA.ok || !rB.ok || !rC.ok) {
+  if (decision.action === 'model_read_failed') {
     return { docId, outcome: 'skipped', tier: 3, reason: 'model_read_failed' };
   }
-
-  // Empty×empty×empty: total extract failure (not majority disagreement).
-  if (allSuccessfulReadsEmpty(reads)) {
+  if (decision.action === 'budget_stop') {
+    return { docId, outcome: 'skipped', tier: 2, reason: 'doc_budget_stop' };
+  }
+  if (decision.action === 'empty') {
+    const part7 = await closeOgePart7ExplicitNone(env, docId, part7Bytes, 2, dryRun);
+    if (part7) return part7;
     if (dryRun) {
       return {
         docId,
@@ -1530,31 +2101,83 @@ export async function processAgreementCascadeTier2(
         reason: 'extract_empty_failure',
       };
     }
+    const settled = await maybeSettleExecutiveZeroRead(
+      env, docId, async () => (part7Bytes ? part7Bytes.slice(0) : null), claimToken,
+    );
+    if (settled) return settledZeroReadResult(docId, 2, settled);
     return markExtractEmptyFailure(env, docId, 2, labels, claimToken);
   }
-
-  // Tier 3 — majority resolve over the three reads (no extra model calls).
-  const consensus = buildConsensusRows([
-    { model: labels.a, rows: rA.rows },
-    { model: labels.b, rows: rB.rows },
-    { model: labels.c, rows: rC.rows },
-  ]);
-  const majority = buildMajorityRows(reads, 3, normalizeText);
-  const votes = voteSummary(consensus, 3);
-  if (!majority.ok) {
-    if (dryRun) return { docId, outcome: 'review_flagged', tier: 3, reason: majority.reason };
-    return leaveInReviewHighPriority(env, docId, 3, labels, votes, majority.reason ?? 'no_majority', claimToken);
+  if (decision.action === 'junk') {
+    if (dryRun) {
+      return {
+        docId,
+        outcome: 'agree_but_hardfail',
+        tier: 2,
+        rowCount: 0,
+        flags: decision.flags,
+        reason: decision.flags[0],
+      };
+    }
+    return leaveInReviewHighPriority(
+      env, docId, 2, labels, null, decision.flags.join(','), claimToken,
+    );
+  }
+  if (decision.action === 'disagree') {
+    const [rA, rB, rC] = reads;
+    if (rA?.ok && rB?.ok && rC?.ok) {
+      const consensus = buildConsensusRows([
+        { model: labels.a, rows: rA.rows },
+        { model: labels.b, rows: rB.rows },
+        { model: labels.c, rows: rC.rows },
+      ]);
+      const majority = buildMajorityRows(reads, 3, normalizeText);
+      const votes = voteSummary(consensus, 3);
+      if (!majority.ok) {
+        const reason = majority.reason ?? decision.reason ?? 'no_majority';
+        if (dryRun) return { docId, outcome: 'review_flagged', tier: 3, reason };
+        return leaveInReviewHighPriority(env, docId, 3, labels, votes, reason, claimToken);
+      }
+      const res = await finalizePublish(env, frow, docId, majority.rows, dryRun, {
+        tier: 3,
+        models: labels,
+        claimToken,
+        reviewRevision: operatorReviewRevision,
+        unanimous: false,
+        votes,
+      });
+      if (res.outcome === 'agree_but_hardfail') {
+        if (dryRun) return res;
+        return leaveInReviewHighPriority(
+          env, docId, 3, labels, votes, `hard_fail:${(res.flags ?? []).join(',')}`, claimToken,
+        );
+      }
+      return res;
+    }
+    const reason = decision.reason ?? 'no_majority';
+    if (dryRun) return { docId, outcome: 'review_flagged', tier: 3, reason };
+    return leaveInReviewHighPriority(env, docId, 3, labels, null, reason, claimToken);
   }
 
-  const res = await finalizePublish(env, frow, docId, majority.rows, dryRun, {
-    tier: 3,
+  for (const [index, modelId] of decision.qualityModels.entries()) {
+    if (!Object.values(labels).includes(modelId)) {
+      labels[`stored${index}`] = modelId;
+    }
+  }
+  const quality = uniqueQualityReads([...reads, ...storedReads]);
+  const unanimous = quality.length >= 2
+    && quality.every((read, index) => index === 0 || sameRowSet(quality[0], read, normalizeText));
+  const consensus = buildConsensusRows(
+    quality.map((read) => ({ model: `${read.provider}:${read.model}`, rows: read.rows })),
+  );
+  const votes = unanimous ? undefined : voteSummary(consensus, quality.length);
+  const res = await finalizePublish(env, frow, docId, decision.rows, dryRun, {
+    tier: unanimous ? 2 : 3,
     models: labels,
     claimToken,
     reviewRevision: operatorReviewRevision,
-    unanimous: false,
+    unanimous,
     votes,
   });
-  // A hard-fail on the majority row set is NOT publishable — flag high-priority.
   if (res.outcome === 'agree_but_hardfail') {
     if (dryRun) return res;
     return leaveInReviewHighPriority(
@@ -1628,8 +2251,8 @@ export async function resolveAgreementEnv(env: Env): Promise<AgreementEnv> {
   ])) as AgreementEnv;
 }
 
-const DEFAULT_MODEL_C = 'openrouter:x-ai/grok-4.5';
-const DEFAULT_MODEL_D = 'openrouter:google/gemini-3.5-flash';
+const DEFAULT_MODEL_C = 'openrouter:x-ai/grok-4.6';
+const DEFAULT_MODEL_D = 'openrouter:~google/gemini-flash-latest';
 const DEFAULT_MODEL_E = 'openrouter:anthropic/claude-haiku-4.5';
 
 /** Resolve the explicit C/D chamber lineup (tier-1 pair); missing config falls back to default cross-vendor lineup. */
@@ -1767,6 +2390,34 @@ async function deferForBudgetExhausted(
     payload: { resolvedBy: 'agreement-cascade', tier, budget, detail: 'budget_exhausted' },
   });
   await rollbackUnspentAttempt(env, docId, claimToken, nextUtcMidnight());
+}
+
+/**
+ * Per-doc USD ceiling blocked usable live reads with no quality survivor.
+ * Lifetime per-doc spend does not reset at UTC midnight — terminalize into
+ * human review instead of deferring forever like the daily budget path.
+ */
+async function deferForDocBudgetStop(
+  env: Env,
+  docId: string,
+  tier: number,
+  models: Record<string, string>,
+  claimToken: string,
+  max: number,
+): Promise<void> {
+  if (!(await ownsUnresolvedReview(env, docId, claimToken))) {
+    await releaseAgreementClaim(env, docId, claimToken);
+    return;
+  }
+  await recordIngestionDecision(env.DB, {
+    docId,
+    action: 'review_opened',
+    source: 'agreement',
+    reason: 'doc_budget_stop',
+    payload: { resolvedBy: 'agreement-cascade', tier, detail: 'per_doc_ceiling' },
+  });
+  await leaveInReviewHighPriority(env, docId, tier, models, null, 'doc_budget_stop', claimToken);
+  await finishTerminalClaim(env, docId, claimToken, max);
 }
 
 /**
@@ -1979,6 +2630,12 @@ export async function enqueueAgreementCheck(
 ): Promise<boolean> {
   const e = await resolveAgreementEnv(env);
   if (e.AGREEMENT_AUTOPUBLISH_ENABLED !== 'true') return false;
+  const parked = await get<{ reason: string | null }>(
+    env.DB,
+    'SELECT reason FROM review_queue WHERE doc_id = ?',
+    [docId],
+  ).catch(() => null);
+  if (shouldSkipAgreementForReviewReason(parked?.reason)) return false;
   const token = await acquireAgreementLease(env, docId, maxAttempts(e), existingClaimToken);
   if (!token) return false;
 
@@ -2023,6 +2680,14 @@ export async function handleAgreementCheck(
   signal?.throwIfAborted();
   const e = await resolveAgreementEnv(env);
   if (e.AGREEMENT_AUTOPUBLISH_ENABLED !== 'true') return null;
+  const parked = await get<{ reason: string | null }>(
+    env.DB,
+    'SELECT reason FROM review_queue WHERE doc_id = ?',
+    [docId],
+  ).catch(() => null);
+  if (shouldSkipAgreementForReviewReason(parked?.reason)) {
+    return { docId, outcome: 'skipped', reason: `hard_stop:${parked?.reason ?? 'quality'}` };
+  }
   const max = maxAttempts(e);
 
   // A fresh check (tier unset) may start at tier 2 for a complex doc.
@@ -2092,10 +2757,18 @@ export async function handleAgreementCheck(
         await finishTerminalClaim(env, docId, claimed.token, max);
       } else if (
         res.outcome === 'agree_but_hardfail'
-        && (res.flags ?? []).includes('extract_empty_failure')
+        && (
+          (res.flags ?? []).includes('extract_empty_failure')
+          || (res.flags ?? []).includes('oge_part7_explicit_none')
+          || (res.flags ?? []).includes('auto_resolved_empty')
+          || (res.flags ?? []).includes('oge_text_unreadable')
+        )
       ) {
-        // markExtractEmptyFailure already applied inside tier-2 empty path.
+        // markExtractEmptyFailure or resolveVerifiedEmpty already applied.
         await finishTerminalClaim(env, docId, claimed.token, max);
+      } else if (res.outcome === 'skipped' && res.reason === 'doc_budget_stop') {
+        await refundLlmBudget(env, budget, readsNeeded);
+        await deferForDocBudgetStop(env, docId, tier, modelLabels(models), claimed.token, max);
       } else if (res.outcome === 'skipped') {
         if (res.reason === 'review_resolved_or_claim_lost') {
           await releaseAgreementClaim(env, docId, claimed.token);
@@ -2137,9 +2810,29 @@ export async function handleAgreementCheck(
       return { ...res, reason: 'attempt_cap_reached' };
     }
     if (res.outcome === 'agree_but_hardfail') {
-      const emptyFail = (res.flags ?? []).includes('extract_empty_failure');
-      if (emptyFail) {
+      const flags = res.flags ?? [];
+      if (
+        flags.includes('oge_part7_explicit_none')
+        || flags.includes('auto_resolved_empty')
+        || flags.includes('oge_text_unreadable')
+      ) {
+        // processAgreementDoc already settled this executive zero-read.
+        // Empty is terminal.  Unreadable is parked open for a human.
+      } else if (flags.includes('extract_empty_failure')) {
         // Do not escalate empty×empty and do not soft-label as cascade_unresolved.
+        // Executive 278e empty closes itself.  A refused 278-T parks open.
+        // Everything else stays extract_empty_failure.
+        const settled = await maybeSettleExecutiveZeroRead(env, docId, async () => {
+          const loaded = signal
+            ? await loadDocBytes(env, docId, rawObjectKey, signal)
+            : await loadDocBytes(env, docId, rawObjectKey);
+          return 'skip' in loaded ? null : loaded.bytes;
+        }, claimed.token);
+        if (settled) {
+          await finishTerminalClaim(env, docId, claimed.token, max);
+          console.log(`agreement.check ${docId} tier1: executive ${settled.kind}`);
+          return settledZeroReadResult(docId, 1, settled);
+        }
         await markExtractEmptyFailure(
           env, docId, 1, modelLabels(tier1Models), claimed.token,
           `hard_fail:${(res.flags ?? []).join(',')}`,
@@ -2151,6 +2844,9 @@ export async function handleAgreementCheck(
         );
       }
       await finishTerminalClaim(env, docId, claimed.token, max);
+    } else if (res.outcome === 'skipped' && res.reason === 'doc_budget_stop') {
+      await refundLlmBudget(env, budget, readsNeeded);
+      await deferForDocBudgetStop(env, docId, 1, modelLabels(tier1Models), claimed.token, max);
     } else if (res.outcome === 'skipped') {
       if (res.reason === 'review_resolved_or_claim_lost') {
         await releaseAgreementClaim(env, docId, claimed.token);
@@ -2183,10 +2879,33 @@ export async function handleAgreementCheck(
 }
 
 /**
+ * Reasons capped-row recovery must leave alone: rows already carrying the
+ * capped terminal label, and unreadable/OCR parks (health-terminal reason
+ * already; relabeling them would hide why they are waiting on a human).
+ *
+ * Empty failures are NOT excluded.  They are not health-terminal
+ * (reviewQueueHealth only treats ocr_unusable etc. as terminal), and once
+ * capped the normal selectors reject them, so without this path they sit
+ * eligible/unhealthy forever.  An executive empty failure is first re-run
+ * through the Part 7 classifier (maybeSettleExecutiveZeroRead) so a real
+ * empty 278e still closes verified_empty and a refused 278-T parks open
+ * for a human instead of being relabeled; only a read that stays
+ * `unconfirmed` (blank, garbled, header-only) gets the cascade-unresolved
+ * label.
+ */
+export const CAPPED_RECOVERY_REASON_EXCLUDE_SQL = `
+  COALESCE(reason, '') <> 'agreement_cascade_unresolved'
+  AND COALESCE(reason, '') NOT LIKE '%oge_text_unreadable%'
+  AND ${TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED}
+`.trim();
+
+/**
  * Repair a capped row whose previous consumer died before it could write the
  * terminal human-review flag. A fresh CAS lease makes this safe under
  * concurrent cron ticks; failures retain the lease and are retried after its
  * 15-minute expiry instead of silently stranding the row at the attempt cap.
+ * Unreadable rows are already parked for a human; do not relabel them.
+ * Executive empty failures get one more classifier pass before the label.
  */
 async function recoverExpiredCappedReviews(
   env: Env,
@@ -2196,12 +2915,19 @@ async function recoverExpiredCappedReviews(
   const now = new Date();
   const nowIso = now.toISOString();
   const expiredBefore = leaseExpiredBefore(now);
-  const rows = await all<{ doc_id: string; agreement_tier: number | null }>(
+  // review_revision is NOT NULL DEFAULT 1 (migration 0037_review_revision),
+  // so the lease CAS below can compare it with = directly.
+  const rows = await all<{
+    doc_id: string;
+    agreement_tier: number | null;
+    reason: string | null;
+    review_revision: number;
+  }>(
     env.DB,
-    `SELECT doc_id, agreement_tier FROM review_queue
+    `SELECT doc_id, agreement_tier, reason, review_revision FROM review_queue
       WHERE resolved = 0 AND agreement_suppressed_at IS NULL
         AND COALESCE(agreement_attempts, 0) >= ?
-        AND COALESCE(reason, '') <> 'agreement_cascade_unresolved'
+        AND ${CAPPED_RECOVERY_REASON_EXCLUDE_SQL}
         AND (
           agreement_claim_token IS NULL OR agreement_claimed_at IS NULL
           OR agreement_claimed_at <= ?
@@ -2213,20 +2939,78 @@ async function recoverExpiredCappedReviews(
   for (const row of rows) {
     const token = uuid();
     try {
+      // CAS on the review_revision this pass selected: a concurrent update
+      // (e.g. normalize() revising the row, changing its reason) bumps the
+      // revision, the lease fails, and we skip rather than branch on stale
+      // state like row.reason.
       const leased = await run(
         env.DB,
         `UPDATE review_queue
             SET agreement_claim_token = ?, agreement_claimed_at = ?
           WHERE doc_id = ? AND resolved = 0 AND agreement_suppressed_at IS NULL
             AND COALESCE(agreement_attempts, 0) >= ?
-            AND COALESCE(reason, '') <> 'agreement_cascade_unresolved'
+            AND ${CAPPED_RECOVERY_REASON_EXCLUDE_SQL}
+            AND review_revision = ?
             AND (
               agreement_claim_token IS NULL OR agreement_claimed_at IS NULL
               OR agreement_claimed_at <= ?
             )`,
-        [token, nowIso, row.doc_id, max, expiredBefore],
+        [token, nowIso, row.doc_id, max, row.review_revision, expiredBefore],
       );
       if ((leased.meta?.changes ?? 0) === 0) continue;
+      if (row.doc_id.startsWith('E-') && (row.reason ?? '').includes('empty_failure')) {
+        // Load outside the settle helper (which swallows loader errors) so a
+        // storage throw reaches the catch below: the lease is kept and the
+        // row retries after expiry instead of being labeled on a blip.
+        const filing = await loadFilingRow(env, row.doc_id);
+        const loaded = await loadDocBytes(env, row.doc_id, filing?.raw_object_key ?? null);
+        if ('skip' in loaded && loaded.skip.retryable) {
+          // A soft load failure (R2 miss + source timeout, etc.) is a blip,
+          // not a read. Keep the lease so the row retries after expiry;
+          // falling through would stamp the permanent
+          // agreement_cascade_unresolved label, which this recovery's own
+          // selector excludes from later passes.
+          console.warn(
+            'agreement capped-row recovery: doc bytes temporarily unavailable, retry after lease expiry:',
+            row.doc_id,
+            loaded.skip.reason,
+          );
+          continue;
+        }
+        const bytes = 'skip' in loaded ? null : loaded.bytes;
+        const settled = await maybeSettleExecutiveZeroRead(env, row.doc_id, async () => bytes, token);
+        if (settled) {
+          // The close helpers clear the lease themselves.  A recovered-rows
+          // settlement that stays in review ran the normalizer instead, and
+          // routeToReview already cleared agreement_claim_token, so a
+          // token-CAS finishTerminalClaim would match nothing: the row would
+          // keep a non-terminal reason and be re-normalized on every pass.
+          // Terminalize the revision the settlement produced -
+          // leaveInReviewHighPriority re-reads the row, CASes on that
+          // review_revision, and merges the staged candidates into the
+          // terminal-labeled payload, taking the row out of this selector.
+          if (settled.kind === 'rows') {
+            if (settled.needsReview) {
+              await leaveInReviewHighPriority(
+                env,
+                row.doc_id,
+                row.agreement_tier ?? 1,
+                {},
+                null,
+                'attempt_cap_recovery',
+              );
+            }
+            // A staged (needsReview) or persisted (published) settlement is
+            // terminal here.  A lost persist CAS (neither) persisted or
+            // staged nothing: do not count it - the row stays eligible for
+            // the next pass.
+            if (settled.needsReview || settled.published || settled.settled) terminalized += 1;
+            continue;
+          }
+          terminalized += 1;
+          continue;
+        }
+      }
       const flagged = await leaveInReviewHighPriority(
         env,
         row.doc_id,
@@ -2257,7 +3041,9 @@ async function recoverExpiredCappedReviews(
  */
 export async function maybeRunAgreementAutopublish(
   env: Env,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<{ attempted: number; enqueued: number; terminalized: number } | null> {
+  abortIfSignal(opts.signal);
   const e = await resolveAgreementEnv(env);
   if (e.AGREEMENT_AUTOPUBLISH_ENABLED !== 'true') return null;
   const limit = Math.min(Math.max(parseInt(e.AGREEMENT_AUTOPUBLISH_LIMIT || '3', 10) || 3, 1), 10);
@@ -2268,6 +3054,9 @@ export async function maybeRunAgreementAutopublish(
 
   let docs: Array<{ doc_id: string; raw_object_key: string | null }>;
   try {
+    // A2: skip deterministic doc_kinds (text_pdf / senate_html / oge_*) — they
+    // must not consume OpenRouter agreement budget when OR is halted. The
+    // deterministic re-extract drain + normalizer A1 path owns those instead.
     docs = await all<{ doc_id: string; raw_object_key: string | null }>(
       env.DB,
       `SELECT f.doc_id, f.raw_object_key
@@ -2280,6 +3069,8 @@ export async function maybeRunAgreementAutopublish(
             rq.agreement_claim_token IS NULL OR rq.agreement_claimed_at IS NULL OR rq.agreement_claimed_at <= ?
           )
           AND f.raw_object_key IS NOT NULL
+          AND LOWER(COALESCE(f.doc_kind, '')) NOT IN ('text_pdf', 'senate_html', 'oge_html', 'oge_text')
+          AND LOWER(COALESCE(f.extractor, '')) NOT IN ('textpdf', 'text_pdf', 'senatehtml', 'senate_html', 'ogetext', 'oge_text', 'oge-text')
           AND NOT EXISTS (
             SELECT 1 FROM transactions t
              WHERE t.doc_id = rq.doc_id AND t.source IN ('primary', 'manual')
@@ -2295,6 +3086,7 @@ export async function maybeRunAgreementAutopublish(
 
   let enqueued = 0;
   for (const d of docs) {
+    abortIfSignal(opts.signal);
     if (await enqueueAgreementCheck(env, d.doc_id, d.raw_object_key)) enqueued++;
   }
   if (docs.length) console.log(`agreement autopublish: enqueued ${enqueued}/${docs.length} checks`);

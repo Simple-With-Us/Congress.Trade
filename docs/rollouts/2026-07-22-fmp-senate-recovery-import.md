@@ -1,5 +1,8 @@
 # FMP Senate recovery production import — 2026-07-22
 
+> **Current shape (2026-08):** Deno Deploy is retired.  Production is Coolify
+> on Hetzner.  The Deploy revision named below was the 2026-07 host.
+
 ## Summary
 
 Completed the post-merge production import for PR **#771** (`c17daf3`, feature head `40db88d`) after Deno Deploy revision **`yveah28gatry`** was already healthy. Ran sequential Coolify `admin-maintenance.yml` `fmp-senate-recovery` batches for FMP pages **0–100** (≤5 pages/run), verified idempotency, re-read `data-status`, ran `metadata-enrichment`, and resolved the stale PR **#757** accounting review thread (already fixed on `main` by #762/#764/#766/#769).

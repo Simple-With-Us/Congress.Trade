@@ -1,0 +1,110 @@
+[
+  {
+    "assetName": "Abbott Laboratories Common Stock",
+    "ticker": "ABT",
+    "assetType": "ST",
+    "txDate": "2026-10-02",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 50001,
+    "amountMax": 100000,
+    "filingStatus": "New",
+    "subholding": "Trust One"
+  },
+  {
+    "assetName": "Amazon.com, Inc. - Common Stock",
+    "ticker": "AMZN",
+    "assetType": "ST",
+    "txDate": "2026-10-02",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 100001,
+    "amountMax": 250000,
+    "filingStatus": "New",
+    "subholding": "Trust One"
+  },
+  {
+    "assetName": "Amazon.com, Inc. - Common Stock",
+    "ticker": "AMZN",
+    "assetType": "ST",
+    "txDate": "2026-10-27",
+    "txType": "S",
+    "owner": "self",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": null
+  },
+  {
+    "assetName": "Home Depot, Inc.",
+    "ticker": "HD",
+    "assetType": "ST",
+    "txDate": "2026-10-22",
+    "txType": "S",
+    "owner": "self",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "filingStatus": "New",
+    "subholding": "ET IRA"
+  },
+  {
+    "assetName": "Apple Inc. - Common Stock",
+    "ticker": "AAPL",
+    "assetType": "ST",
+    "txDate": "2026-10-02",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 250001,
+    "amountMax": 500000,
+    "filingStatus": "New",
+    "subholding": "Trust One"
+  },
+  {
+    "assetName": "NVIDIA Corporation - Common Stock",
+    "ticker": "NVDA",
+    "assetType": "ST",
+    "txDate": "2026-10-02",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": "IRA One"
+  },
+  {
+    "assetName": "McDonald's Corporation Common Stock",
+    "ticker": "MCD",
+    "assetType": "ST",
+    "txDate": "2026-10-02",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": "Trust One"
+  },
+  {
+    "assetName": "McDonald's Corporation Common Stock",
+    "ticker": "MCD",
+    "assetType": "ST",
+    "txDate": "2026-10-27",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "filingStatus": "New",
+    "subholding": "IRA Two"
+  },
+  {
+    "assetName": "Mastercard Incorporated Common Stock",
+    "ticker": "MA",
+    "assetType": "ST",
+    "txDate": "2026-10-02",
+    "txType": "S",
+    "owner": "spouse",
+    "amountMin": 15001,
+    "amountMax": 50000,
+    "filingStatus": "New",
+    "subholding": "Trust One"
+  }
+]

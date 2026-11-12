@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ogeDocId, ogeFiledDateFromName, parseOgeIndex, pollOgeExecutive } from '../ogeSource.ts';
+import {
+  fetchOgeExecutiveFilings,
+  ogeDocId,
+  ogeFiledDateFromName,
+  parseOgeIndex,
+  pollOgeExecutive,
+} from '../ogeSource.ts';
 
 /** Anchor markup lifted from the LIVE OGE President/VP index view (Domino
  *  renders single-quoted hrefs with raw spaces in filenames). */
@@ -75,27 +81,18 @@ describe('filename helpers', () => {
   });
 });
 
-describe('pollOgeExecutive gating (cadence + failure backoff)', () => {
+describe('pollOgeExecutive enablement (cadence lives in decideSourcePoll)', () => {
   const NOW = new Date('2026-07-18T12:00:00.000Z');
 
-  function envWithKv(
-    kvSeed: Record<string, string>,
-    envVars: Record<string, string> = {},
-  ): { env: any; kv: Map<string, string> } {
-    const kv = new Map(Object.entries(kvSeed));
-    const env = {
+  function envWith(envVars: Record<string, string> = {}): any {
+    return {
       ...envVars,
       OGE_WATCH_ENABLED: envVars.OGE_WATCH_ENABLED ?? 'true',
       CONFIG_KV: {
-        async get(key: string) {
-          return kv.get(key) ?? null;
-        },
-        async put(key: string, value: string) {
-          kv.set(key, value);
-        },
+        async get() { return null; },
+        async put() {},
       },
     };
-    return { env, kv };
   }
 
   function countingFetch(): { fetchImpl: typeof fetch; calls: string[] } {
@@ -110,26 +107,18 @@ describe('pollOgeExecutive gating (cadence + failure backoff)', () => {
     return { fetchImpl, calls };
   }
 
-  it('honors the env-configured interval (1h) instead of the 6h fallback', async () => {
-    const { env } = envWithKv(
-      { 'last_poll:oge': new Date(NOW.getTime() - 2 * 3600_000).toISOString() },
-      { OGE_POLL_INTERVAL_SEC: '3600' },
-    );
+  it('does not apply a flat 6h or 15m interval gate — leftover Infisical 21600 is unused', async () => {
+    const env = envWith({ OGE_POLL_INTERVAL_SEC: '21600' });
     const { fetchImpl, calls } = countingFetch();
 
     const out = await pollOgeExecutive(env, NOW, fetchImpl);
 
-    // 2h since last success >= the configured 1h -> polls (the old code sat on
-    // the 6h default whenever no value resolved and would have returned null).
     expect(out).toEqual([]);
-    // Default OGE indexes: President/VP + PAS cabinet collection.
     expect(calls).toHaveLength(2);
   });
 
-  it('stays on the 6h fallback when no interval is configured', async () => {
-    const { env } = envWithKv({
-      'last_poll:oge': new Date(NOW.getTime() - 2 * 3600_000).toISOString(),
-    });
+  it('skips when the watcher is disabled', async () => {
+    const env = envWith({ OGE_WATCH_ENABLED: 'false' });
     const { fetchImpl, calls } = countingFetch();
 
     const out = await pollOgeExecutive(env, NOW, fetchImpl);
@@ -138,66 +127,60 @@ describe('pollOgeExecutive gating (cadence + failure backoff)', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('backs off after a failed attempt instead of retrying every cron tick', async () => {
-    // Attempt 2 minutes ago with NO success since -> the previous poll failed.
-    const { env, kv } = envWithKv(
-      { 'last_attempt:oge': new Date(NOW.getTime() - 120_000).toISOString() },
-      { OGE_POLL_INTERVAL_SEC: '3600' },
-    );
-    const { fetchImpl, calls } = countingFetch();
-
-    const out = await pollOgeExecutive(env, NOW, fetchImpl);
-
-    expect(out).toBeNull();
-    expect(calls).toHaveLength(0);
-    // The skipped tick must not advance the attempt stamp (that would extend
-    // the backoff forever).
-    expect(kv.get('last_attempt:oge')).toBe(new Date(NOW.getTime() - 120_000).toISOString());
-  });
-
-  it('retries once the failure backoff window has elapsed, stamping the new attempt', async () => {
-    const { env, kv } = envWithKv(
-      { 'last_attempt:oge': new Date(NOW.getTime() - 700_000).toISOString() },
-      { OGE_POLL_INTERVAL_SEC: '3600' },
-    );
-    const { fetchImpl, calls } = countingFetch();
-
-    const out = await pollOgeExecutive(env, NOW, fetchImpl);
-
-    expect(out).toEqual([]);
-    expect(calls).toHaveLength(2);
-    expect(kv.get('last_attempt:oge')).toBe(NOW.toISOString());
-  });
-
-  it('does not treat a successful last poll as a failed attempt', async () => {
-    // Success and attempt stamped at the same instant (the normal success
-    // shape) 2h ago with a 1h interval -> due, polls.
-    const twoHoursAgo = new Date(NOW.getTime() - 2 * 3600_000).toISOString();
-    const { env } = envWithKv(
-      { 'last_poll:oge': twoHoursAgo, 'last_attempt:oge': twoHoursAgo },
-      { OGE_POLL_INTERVAL_SEC: '3600' },
-    );
-    const { fetchImpl, calls } = countingFetch();
-
-    const out = await pollOgeExecutive(env, NOW, fetchImpl);
-
-    expect(out).toEqual([]);
-    expect(calls).toHaveLength(2);
-  });
-
-  it('force bypasses both the interval gate and the failure backoff', async () => {
-    const { env } = envWithKv(
-      {
-        'last_poll:oge': new Date(NOW.getTime() - 60_000).toISOString(),
-        'last_attempt:oge': new Date(NOW.getTime() - 30_000).toISOString(),
-      },
-      { OGE_POLL_INTERVAL_SEC: '3600' },
-    );
+  it('force fetches even when the watcher is disabled', async () => {
+    const env = envWith({ OGE_WATCH_ENABLED: 'false' });
     const { fetchImpl, calls } = countingFetch();
 
     const out = await pollOgeExecutive(env, NOW, fetchImpl, { force: true });
 
     expect(out).toEqual([]);
     expect(calls).toHaveLength(2);
+  });
+});
+
+describe('OGE fetch order (server-first, relay fallback)', () => {
+  const INDEX = 'https://extapps2.oge.gov/201/Presiden.nsf/index';
+  const RELAY = 'https://scout.jays.services';
+
+  function env(): any {
+    return {
+      OGE_INDEX_URL: INDEX,
+      OGE_RELAY_URL: RELAY,
+    };
+  }
+
+  it('attempts direct extapps2 before the Mac relay', async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      if (String(input).includes('/fetch-oge')) throw new Error('relay should not run when direct succeeds');
+      return new Response('<html>no matching filings</html>', { status: 200 });
+    }) as typeof fetch;
+
+    const out = await fetchOgeExecutiveFilings(env(), fetchImpl);
+
+    expect(out).toEqual([]);
+    expect(calls).toEqual([INDEX]);
+  });
+
+  it('falls back to the relay when direct fails', async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith('/fetch-oge')) {
+        return new Response(JSON.stringify({ body: '<html>no matching filings</html>' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('blocked', { status: 403 });
+    }) as typeof fetch;
+
+    const out = await fetchOgeExecutiveFilings(env(), fetchImpl);
+
+    expect(out).toEqual([]);
+    expect(calls[0]).toBe(INDEX);
+    expect(calls[1]).toBe(`${RELAY}/fetch-oge`);
   });
 });

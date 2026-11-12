@@ -1,12 +1,39 @@
-FROM python:3.9-alpine
+FROM python:3.15-alpine
 
 RUN pip install sqlite-web
 
+# Infisical CLI, via Alpine's official apk repo (python:3.9-alpine is Alpine/
+# musl too, same reasoning as app/Dockerfile: the generic linux-glibc release
+# tarball does not reliably run on musl libc -- see
+# https://github.com/Infisical/infisical/issues/3511). Pinned to the 0.43.x
+# line the rest of the fleet runs -- apk's `~` operator matches any patch
+# version sharing this prefix, so a build never silently jumps to a newer
+# minor/major CLI release.
+RUN wget -qO- 'https://artifacts-cli.infisical.com/setup.apk.sh' | sh \
+  && apk add --no-cache ca-certificates 'infisical~0.43' \
+  && infisical --version
+
 EXPOSE 8080
 
-# sqlite-web --password reads SQLITE_WEB_PASSWORD from the environment when set.
-# If the env is empty it falls back to interactive getpass(), which EOFErrors in
-# Docker (no TTY) and crash-loops with restart:unless-stopped. That restart storm
-# can flip Coolify's multi-service app status to exited:unhealthy and take down
-# congress-app (502 on congress.trade). Require the env and fail once if missing.
-CMD ["sh", "-c", "if [ -z \"${SQLITE_WEB_PASSWORD:-}\" ]; then echo 'FATAL: SQLITE_WEB_PASSWORD is empty; set it in Coolify env (loopback admin UI).' >&2; exit 1; fi; exec sqlite_web -x --password -H 0.0.0.0 /data/congress-trade/db.sqlite"]
+# Fail-closed startup. SQLITE_WEB_PASSWORD is now resolved ONLY from
+# Infisical (CT project, `prod` env) at container start -- Coolify's raw
+# SQLITE_WEB_PASSWORD env var is no longer read anywhere (see
+# app/docker-compose.yml, which used to interpolate it directly and could
+# silently hand this container an empty string). This mirrors
+# app/scripts/start-with-litestream.sh's pattern for the LITESTREAM_S3_*
+# keys: mint a short-lived token from the INFISICAL_APP_* bootstrap
+# identity already present in this service's environment, then fetch the
+# one secret this sidecar needs via `infisical run` + command substitution.
+#
+# Every failure path below is a clean `exit 1`, never a fallback to an
+# empty password: sqlite-web's own `--password` flag reads
+# SQLITE_WEB_PASSWORD from the environment when set, but when it's
+# unset/empty it falls back to interactive getpass(), which
+# EOFErrors immediately in a TTY-less container and crash-loops. That exact
+# crash-loop previously flipped Coolify's whole multi-service app status to
+# exited:unhealthy and took congress.trade to a public 502 (see
+# docs/rollouts/2026-08-08-sqlite-web-crashloop-502.md). `restart:
+# on-failure:3` in docker-compose.yml bounds this to 3 clean, loud failures
+# instead of either a crash-loop storm or ever serving the DB admin UI with
+# no real password.
+CMD ["sh", "-c", "set -eu; CT_PROJECT_ID=\"${INFISICAL_APP_PROJECT_ID:-}\"; CT_CLIENT_ID=\"${INFISICAL_APP_CLIENT_ID:-}\"; CT_CLIENT_SECRET=\"${INFISICAL_APP_CLIENT_SECRET:-}\"; CT_ENV=\"${INFISICAL_ENV:-prod}\"; if [ -z \"$CT_PROJECT_ID\" ] || [ -z \"$CT_CLIENT_ID\" ] || [ -z \"$CT_CLIENT_SECRET\" ]; then echo 'FATAL: INFISICAL_APP_CLIENT_ID/CLIENT_SECRET/PROJECT_ID missing from the container env; refusing to start sqlite-web (no Coolify SQLITE_WEB_PASSWORD fallback exists anymore).' >&2; exit 1; fi; TOKEN=\"$(INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=\"$CT_CLIENT_ID\" INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=\"$CT_CLIENT_SECRET\" infisical login --method=universal-auth --silent --plain 2>/dev/null || true)\"; if [ -z \"$TOKEN\" ]; then echo 'FATAL: Infisical universal-auth login failed; refusing to start sqlite-web with no password source.' >&2; exit 1; fi; SQLITE_WEB_PASSWORD=\"$(INFISICAL_TOKEN=\"$TOKEN\" infisical run --projectId \"$CT_PROJECT_ID\" --env \"$CT_ENV\" --path / --silent -- sh -c 'printf \"%s\" \"$SQLITE_WEB_PASSWORD\"' 2>/dev/null || true)\"; if [ -z \"$SQLITE_WEB_PASSWORD\" ]; then echo 'FATAL: SQLITE_WEB_PASSWORD not resolved from Infisical (prod); refusing to start sqlite-web with an empty password -- an empty password used to fall through to interactive getpass() and EOFError-crash-loop with no TTY, which once cascaded into Coolify marking the whole stack exited:unhealthy.' >&2; exit 1; fi; export SQLITE_WEB_PASSWORD; exec sqlite_web -x --password -H 0.0.0.0 /data/congress-trade/db.sqlite"]

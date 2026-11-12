@@ -1,0 +1,20 @@
+# Sample unit.  This change does not install or enable it.
+# Host install waits for Jay.
+# Report plus PRAGMA wal_checkpoint(PASSIVE) only.  Do not add a vacuum flag.
+[Unit]
+Description=Congress.Trade sqlite size report and passive WAL checkpoint
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sqlite-maintenance.sh
+Environment=SQLITE_DBS=/data/congress-trade/db.sqlite
+Environment=SQLITE_CHECKPOINT=passive
+Environment=SQLITE_LOCK_FILE=/var/lock/sqlite-maintenance.lock
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+SyslogIdentifier=sqlite-maintenance
+
+[Install]
+WantedBy=multi-user.target

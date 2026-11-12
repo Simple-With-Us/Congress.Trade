@@ -20,6 +20,9 @@ import {
   ShortVolumeRowSchema,
   PriceSeriesSchema,
   SharePayloadSchema,
+  SharePayloadSchemaVersionSchema,
+  resolveSharePayloadSchemaVersion,
+  isSupportedSharePayloadSchemaVersion,
   CongressEventTypeSchema,
   CongressEventSchema,
   ConvictionTickerSchema,
@@ -43,6 +46,7 @@ import {
   parseArray,
   parseSafe,
 } from "../schemas";
+import { SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION, SHARE_PAYLOAD_SCHEMA_VERSION } from "../constants";
 
 // =============================================================================
 // IoDateSchema
@@ -399,7 +403,7 @@ describe("CongressTransactionSchema", () => {
     assetName: "Apple Inc.",
     ticker: "AAPL",
     assetType: "stock",
-    txType: "B",
+    txType: "P",
     amountMin: 1001,
     amountMax: 15000,
     estValue: 8000,
@@ -514,7 +518,7 @@ describe("TransactionsPageSchema", () => {
     assetName: "Apple Inc.",
     ticker: "AAPL",
     assetType: "stock",
-    txType: "B",
+    txType: "P",
     amountMin: 1001,
     amountMax: 15000,
     estValue: 8000,
@@ -583,6 +587,74 @@ describe("TransactionsPageSchema", () => {
         limit: 20,
       }).success,
     ).toBe(false);
+  });
+
+  it("keeps live ingestion sources and the disclosure fields the read schema used to strip", () => {
+    const latency = {
+      provider: "fmp",
+      observedAt: "2026-01-16T00:00:00Z",
+      providerPublishedAt: "2026-01-16T01:00:00Z",
+      congressFirstSeenAt: "2026-01-16T00:00:10Z",
+      providerDeltaSec: 12,
+      providerPublishedDeltaSec: 50,
+      status: "matched",
+    };
+    for (const source of ["competitor_backfill", "local_mac", "server_cpu"] as const) {
+      const parsed = TransactionsPageSchema.safeParse({
+        transactions: [{
+          ...validTx,
+          source,
+          party: "D",
+          bioguideId: "P000197",
+          pdfUrl: "/api/documents/doc-1/pdf",
+          disclosureLagDays: -2,
+          stockActStatus: "on_time",
+          priceAtTrade: 10.5,
+          spxAtTrade: 5000,
+          priceAtFiling: 11,
+          spxAtFiling: 5010,
+          latency,
+        }],
+        cursor: 50,
+        count: 1,
+        total: 100,
+        limit: 20,
+      });
+      expect(parsed.success).toBe(true);
+      if (!parsed.success) continue;
+      expect(parsed.data.transactions[0]).toMatchObject({
+        source,
+        party: "D",
+        bioguideId: "P000197",
+        pdfUrl: "/api/documents/doc-1/pdf",
+        disclosureLagDays: -2,
+        stockActStatus: "on_time",
+        priceAtTrade: 10.5,
+        spxAtTrade: 5000,
+        priceAtFiling: 11,
+        spxAtFiling: 5010,
+        latency,
+      });
+    }
+    expect(TransactionsPageSchema.safeParse({
+      transactions: [{ ...validTx, source: "unknown_source" }],
+      cursor: 50,
+      count: 1,
+      total: 100,
+      limit: 20,
+    }).success).toBe(false);
+    const emptyLatency = TransactionsPageSchema.safeParse({
+      transactions: [{ ...validTx, latency: null, priceAtTrade: null }],
+      cursor: 50,
+      count: 1,
+      total: 100,
+      limit: 20,
+    });
+    expect(emptyLatency.success).toBe(true);
+    if (emptyLatency.success) {
+      expect(emptyLatency.data.transactions[0].latency).toBeNull();
+      expect(emptyLatency.data.transactions[0].priceAtTrade).toBeNull();
+    }
   });
 
   it("rejects read rows missing required cursor provenance", () => {
@@ -873,7 +945,7 @@ describe("SharePayloadSchema", () => {
           sourceUrl: "https://disclosures-clerk.house.gov/public_disc/ptr-pdf/2026/20024100.pdf",
           filerName: "Nancy Pelosi",
           ticker: "NVDA",
-          txType: "B",
+          txType: "P",
           transactionDate: "2026-07-15",
           transactionTimestamp: "2026-07-15T00:00:00Z",
           disclosureDate: "2026-07-22",
@@ -915,6 +987,49 @@ describe("SharePayloadSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  it("accepts the current schemaVersion and keeps it on the parsed payload", () => {
+    const result = SharePayloadSchema.safeParse({
+      schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION,
+      refs: [{ ticker: "AAPL" }],
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.schemaVersion).toBe(SHARE_PAYLOAD_SCHEMA_VERSION);
+  });
+
+  it("accepts a legacy payload without schemaVersion and leaves it unset", () => {
+    const result = SharePayloadSchema.safeParse({ refs: [{ ticker: "AAPL" }] });
+    expect(result.success).toBe(true);
+    expect(result.data).not.toHaveProperty("schemaVersion");
+  });
+
+  it("tolerates a newer schemaVersion so the receiver can decide", () => {
+    const result = SharePayloadSchema.safeParse({ schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION + 1 });
+    expect(result.success).toBe(true);
+  });
+
+  it.each([0, -1, 1.5, "1", null])("rejects malformed schemaVersion %j", (schemaVersion) => {
+    expect(SharePayloadSchema.safeParse({ schemaVersion }).success).toBe(false);
+    expect(SharePayloadSchemaVersionSchema.safeParse(schemaVersion).success).toBe(false);
+  });
+});
+
+describe("share payload schemaVersion helpers", () => {
+  it("exports version 1 as the current and legacy version", () => {
+    expect(SHARE_PAYLOAD_SCHEMA_VERSION).toBe(1);
+    expect(SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION).toBe(1);
+  });
+
+  it("resolves an unversioned payload to the legacy version", () => {
+    expect(resolveSharePayloadSchemaVersion({})).toBe(SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION);
+    expect(resolveSharePayloadSchemaVersion({ schemaVersion: 7 })).toBe(7);
+  });
+
+  it("flags only versions this package understands as supported", () => {
+    expect(isSupportedSharePayloadSchemaVersion({})).toBe(true);
+    expect(isSupportedSharePayloadSchemaVersion({ schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION })).toBe(true);
+    expect(isSupportedSharePayloadSchemaVersion({ schemaVersion: SHARE_PAYLOAD_SCHEMA_VERSION + 1 })).toBe(false);
+  });
 });
 
 // =============================================================================
@@ -952,7 +1067,7 @@ describe("CongressEventSchema", () => {
       id: "evt-1",
       seq: 1,
       emittedAt: "2024-01-15T10:00:00Z",
-      data: { ticker: "AAPL", txType: "B" },
+      data: { ticker: "AAPL", txType: "P" },
     });
     expect(result.success).toBe(true);
   });
@@ -1054,7 +1169,7 @@ describe("ClusterBuySchema", () => {
     const result = ClusterBuySchema.safeParse({
       ticker: "AAPL",
       name: "Apple Inc.",
-      txType: "B",
+      txType: "P",
       memberCount: 5,
       tradeCount: 10,
       estVolumeUsd: 2_000_000,
@@ -1090,6 +1205,7 @@ describe("MemberPerformanceSchema", () => {
       medianExcess: 0.005,
       avgReturn: 0.01,
       avgExcess: 0.003,
+      avgAnnualizedExcess: 0.04,
     });
     expect(result.success).toBe(true);
   });
@@ -1101,6 +1217,22 @@ describe("MemberPerformanceSchema", () => {
       medianExcess: null,
       avgReturn: null,
       avgExcess: null,
+      avgAnnualizedExcess: null,
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("MemberDualPerformanceSchema", () => {
+  it("parses dual-anchor envelope from App A", async () => {
+    const { MemberDualPerformanceSchema } = await import("../schemas");
+    const result = MemberDualPerformanceSchema.safeParse({
+      filerId: "P000197",
+      side: "buys",
+      buyCount: 20,
+      tradeDate: { scoredCount: 15, avgExcess: 0.02, winRate: 0.6 },
+      filingDate: { scoredCount: 14, avgExcess: 0.01, avgAnnualizedExcess: 0.03, winRate: 0.55 },
+      performance: { scoredCount: 15, avgExcess: 0.02 },
     });
     expect(result.success).toBe(true);
   });
@@ -1140,7 +1272,7 @@ describe("TickerBacktestSchema", () => {
   it("parses valid backtest data", () => {
     const result = TickerBacktestSchema.safeParse({
       ticker: "AAPL",
-      txType: "B",
+      txType: "P",
       totalBuyEvents: 25,
       pricedDays: 20,
       horizons: [
@@ -1157,7 +1289,7 @@ describe("CommitteeConflictSchema", () => {
       id: "conflict-1",
       ticker: "AAPL",
       sector: "Technology",
-      txType: "B",
+      txType: "P",
       txDate: "2024-01-15",
       filerId: "f1",
       memberName: "John Doe",
@@ -1420,6 +1552,23 @@ describe("ClientTradeSchema", () => {
       source: "unknown_source",
     };
     expect(ClientTradeSchema.safeParse(valid).success).toBe(false);
+  });
+
+  it("accepts the live ingestion sources and still rejects an invented one", () => {
+    const base = {
+      id: "trade-1",
+      cursor: 42,
+      docId: "doc-1",
+      member: { id: null, name: null, chamber: null, party: null, state: null, photoUrl: null },
+      asset: { name: "Apple Inc.", ticker: "AAPL", type: null, sector: null, marketCapBucket: null },
+      transaction: { date: null, type: "P", owner: null, amountMin: null, amountMax: null, isOption: false },
+      filing: { filedDate: null, firstSeenAt: null, sourceUrl: null },
+      confidence: 0.95,
+    };
+    for (const source of ["local_mac", "server_cpu", "competitor_backfill"] as const) {
+      expect(ClientTradeSchema.safeParse({ ...base, source }).success).toBe(true);
+    }
+    expect(ClientTradeSchema.safeParse({ ...base, source: "unknown_source" }).success).toBe(false);
   });
 });
 

@@ -3,6 +3,8 @@ import { buildClientRouter } from '../routes.ts';
 import { executeQueuedCommand } from '../commands.ts';
 import { createSession } from '../../auth/session.ts';
 import { spendRowBudget, DAILY_ROW_BUDGET } from '../../security/botDefense.ts';
+import { TCP_PEER_HEADER } from '../../security/originLock.ts';
+import { canonicalizeAssetType } from '../../shared/assetTypes.ts';
 import type { Env, QueueMessage } from '../../shared/types.ts';
 import type { FeedTransactionRow, SubscriptionRow } from '../../delivery/rows.ts';
 import type { CommandRow } from '../state.ts';
@@ -110,14 +112,22 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
   };
   const pushDevices = new Map<string, PushDeviceRow>();
   const feedRows: FeedTransactionRow[] = [];
+  const deletedUsers = new Set<string>();
   let duplicateRaceTriggered = false;
 
   const filterFeedRows = (sql: string, params: unknown[]) => {
     let rows = [...feedRows];
     let i = 0;
+    if (/t\.source <> 'seed_dataset'/i.test(sql)) {
+      rows = rows.filter((row) => row.source !== 'seed_dataset');
+    }
     if (/t\.cursor_seq > \?/i.test(sql)) {
       const since = Number(params[i++] ?? 0);
       rows = rows.filter((row) => Number(row.cursor_seq ?? 0) > since);
+    }
+    if (/\bt\.source = \?/i.test(sql)) {
+      const source = String(params[i++]);
+      rows = rows.filter((row) => row.source === source);
     }
     if (/t\.id = \?/i.test(sql)) {
       const id = String(params[i++]);
@@ -133,11 +143,30 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
     }
     if (/LOWER\(COALESCE\(fl\.full_name/i.test(sql)) {
       const memberName = String(params[i++]).replace(/%/g, '').toLowerCase();
+      // Second param: the OR LOWER(COALESCE(fl.display_name, '')) LIKE ?
+      // branch (rows.ts buildTxFilters) — same normalized term, consume it
+      // so downstream param indices stay aligned.
+      if (/OR LOWER\(COALESCE\(fl\.display_name/i.test(sql)) i++;
       rows = rows.filter((row) => String(row.filer_full_name ?? row.filer_id ?? '').toLowerCase().includes(memberName));
     }
     if (/t\.tx_type = \?/i.test(sql)) {
       const txType = String(params[i++]);
       rows = rows.filter((row) => row.tx_type === txType);
+    }
+    const typeIn = sql.match(/t\.tx_type IN \(([?, ]+)\)/i);
+    if (typeIn) {
+      const n = (typeIn[1].match(/\?/g) ?? []).length;
+      const types = params.slice(i, i + n).map(String);
+      i += n;
+      rows = rows.filter((row) => types.includes(String(row.tx_type)));
+    }
+    if (/t\.tx_date >= \?/i.test(sql)) {
+      const min = String(params[i++]).slice(0, 10);
+      rows = rows.filter((row) => String(row.tx_date ?? '') >= min);
+    }
+    if (/t\.tx_date <= \?/i.test(sql)) {
+      const max = String(params[i++]).slice(0, 10);
+      rows = rows.filter((row) => String(row.tx_date ?? '') <= max);
     }
     const chamberIn = sql.match(/COALESCE\(fl\.chamber, f\.chamber\) IN \(([?, ]+)\)/i);
     if (chamberIn) {
@@ -156,6 +185,24 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
     if (/t\.amount_min <= \?/i.test(sql)) {
       const maxAmount = Number(params[i++]);
       rows = rows.filter((row) => row.amount_min != null && row.amount_min <= maxAmount);
+    }
+    // Instrument-class filter (`?assetClass=`). buildTxFilters appends it last,
+    // so its params come last too. The real clause is a several-hundred-branch
+    // CASE (see canonicalAssetTypeCategorySql); match its distinctive tail and
+    // resolve each row's category with the same shared canonicalizer.
+    const assetCategoryIn = sql.match(/ELSE 'other' END\) IN \(([?, ]+)\)/i);
+    if (assetCategoryIn) {
+      const n = (assetCategoryIn[1].match(/\?/g) ?? []).length;
+      const categories = params.slice(i, i + n).map(String);
+      i += n;
+      rows = rows.filter((row) =>
+        categories.includes(
+          canonicalizeAssetType(row.asset_type, row.asset_type_name ?? null, {
+            isOption: row.is_option === 1,
+            assetName: row.asset_name ?? null,
+          }).category,
+        ),
+      );
     }
     // tx_date checks first: the real ORDER BY clause for sort=tx_date is
     // "t.tx_date DESC, t.cursor_seq DESC" (see buildTransactionsQuery), which
@@ -180,7 +227,11 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
     } else if (/ORDER BY[^]*t\.cursor_seq ASC/i.test(sql)) {
       rows.sort((a, b) => Number(a.cursor_seq ?? 0) - Number(b.cursor_seq ?? 0));
     }
-    const limit = Number(sql.match(/LIMIT\s+(\d+)/i)?.[1] ?? rows.length);
+    // Page LIMIT is last; an earlier LIMIT is the cheap twin-candidate window (#2062).
+    // The latency join's LIMIT 1 is not the page size.
+    const pageSql = sql.replace(/LEFT JOIN trade_latency_candidates[\s\S]*$/i, '');
+    const limitMatches = [...pageSql.matchAll(/LIMIT\s+(\d+)/gi)];
+    const limit = Number(limitMatches.at(-1)?.[1] ?? rows.length);
     const offsetMatch = sql.match(/OFFSET\s+(\d+)/i);
     const offset = offsetMatch ? Number(offsetMatch[1]) : 0;
     return rows.slice(offset, offset + limit);
@@ -223,7 +274,7 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
       return this;
     },
     async first<T>() {
-      if (/FROM users WHERE id = \?/i.test(sql) && this.params[0] === 'user_1') {
+      if (/FROM users WHERE id = \?/i.test(sql) && this.params[0] === 'user_1' && !deletedUsers.has('user_1')) {
         return userRow() as T;
       }
       if (/FROM user_preferences WHERE user_id = \?/i.test(sql)) {
@@ -531,6 +582,41 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
           row.active = 0;
           row.updated_at = String(updatedAt);
         }
+      } else if (/DELETE FROM users WHERE id = \?/i.test(sql)) {
+        deletedUsers.add(String(this.params[0]));
+        return { success: true, meta: { changes: 1 } };
+      } else if (/DELETE FROM push_devices WHERE user_id = \?/i.test(sql)) {
+        let changes = 0;
+        for (const [id, row] of pushDevices) {
+          if (row.user_id === this.params[0]) {
+            pushDevices.delete(id);
+            changes += 1;
+          }
+        }
+        return { success: true, meta: { changes } };
+      } else if (/DELETE FROM user_preferences WHERE user_id = \?/i.test(sql)) {
+        const existed = preferences.delete(String(this.params[0]));
+        return { success: true, meta: { changes: existed ? 1 : 0 } };
+      } else if (/DELETE FROM apple_subscriptions WHERE user_id = \?/i.test(sql)) {
+        return { success: true, meta: { changes: 0 } };
+      } else if (/DELETE FROM client_commands WHERE user_id = \? AND id != \?/i.test(sql)) {
+        let changes = 0;
+        for (const [id, row] of commands) {
+          if (row.user_id === this.params[0] && id !== this.params[1]) {
+            commands.delete(id);
+            changes += 1;
+          }
+        }
+        return { success: true, meta: { changes } };
+      } else if (/DELETE FROM client_commands WHERE user_id = \?/i.test(sql)) {
+        let changes = 0;
+        for (const [id, row] of commands) {
+          if (row.user_id === this.params[0]) {
+            commands.delete(id);
+            changes += 1;
+          }
+        }
+        return { success: true, meta: { changes } };
       } else if (
         /UPDATE push_devices SET active = 0, updated_at = \?\s+WHERE user_id = \? AND platform = \? AND token = \?/i
           .test(sql)
@@ -576,7 +662,7 @@ function makeEnv(opts: { quotaRace?: boolean; duplicateCommandRace?: boolean; st
     DELIVERY_QUEUE: { send: async (_msg: QueueMessage) => {}, sendBatch: async () => {} },
   } as unknown as Env;
 
-  return { env, subscriptions, commands, preferences, filers, securities, feedRows, queuedMessages, pushDevices };
+  return { env, subscriptions, commands, preferences, filers, securities, feedRows, queuedMessages, pushDevices, deletedUsers };
 }
 
 /** Simulate the queue worker: run every captured command.execute message. */
@@ -1005,6 +1091,39 @@ describe('client API routes', () => {
     expect(body.total).toBe(2);
   });
 
+  it('applies shared type= filter to ticker list and summary', async () => {
+    const { env, feedRows, securities } = makeEnv();
+    securities.set('AAPL', {
+      ticker: 'AAPL',
+      company_name: 'Apple Inc.',
+      sector: 'Technology',
+      industry: 'Consumer Electronics',
+      asset_class: 'equity',
+      country: 'US',
+      exchange_short: 'NASDAQ',
+      currency: 'USD',
+      market_cap: 3_200_000_000_000,
+      market_cap_bucket: 'mega',
+      current_price: 210.25,
+      current_price_date: '2026-06-24',
+    });
+    feedRows.push(
+      feedRow({ id: 'tx_aapl_buy', ticker: 'AAPL', tx_type: 'B', cursor_seq: 20 }),
+      feedRow({ id: 'tx_aapl_sell', ticker: 'AAPL', tx_type: 'S', cursor_seq: 21 }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/ticker/AAPL?type=B', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      summary: { totalTrades: number; buyCount: number; sellCount: number };
+      items: Array<{ id: string; transaction: { type: string } }>;
+      total: number;
+    };
+    expect(body.summary).toMatchObject({ totalTrades: 1, buyCount: 1, sellCount: 0 });
+    expect(body.total).toBe(1);
+    expect(body.items.map((item) => item.id)).toEqual(['tx_aapl_buy']);
+  });
+
   it('returns a public politician detail envelope by member endpoint/name', async () => {
     const { env, feedRows, filers } = makeEnv();
     filers.set('P000197', {
@@ -1102,6 +1221,120 @@ describe('client API routes', () => {
     expect(body.total).toBe(2);
   });
 
+  it('lists politician recent trades by trade date, not ingest cursor', async () => {
+    // Live Ro Khanna 2026-08-16: lastTrade 2026-07-01, but /member items
+    // defaulted to cursor_seq so a reimported Dec-2025 filing floated first.
+    const { env, feedRows, filers } = makeEnv();
+    filers.set('house-ca17-ro-khanna', {
+      bioguide_id: 'house-ca17-ro-khanna',
+      chamber: 'house',
+      full_name: 'Ro Khanna',
+      party: 'D',
+      state: 'CA',
+      district: '17',
+      committees: null,
+      photo_url: null,
+    });
+    feedRows.push(
+      feedRow({
+        id: 'tx-old-reimport',
+        filer_id: 'house-ca17-ro-khanna',
+        tx_date: '2025-12-12',
+        cursor_seq: 900,
+        ticker: null,
+        asset_name: 'Bond dump',
+        __chamber: 'house',
+      }),
+      feedRow({
+        id: 'tx-actually-recent',
+        filer_id: 'house-ca17-ro-khanna',
+        tx_date: '2026-07-01',
+        cursor_seq: 10,
+        ticker: 'NVDA',
+        __chamber: 'house',
+      }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/member/house-ca17-ro-khanna?limit=2', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }>; summary: { lastTrade: string | null } };
+    expect(body.summary.lastTrade).toBe('2026-07-01');
+    expect(body.items.map((item) => item.id)).toEqual(['tx-actually-recent', 'tx-old-reimport']);
+  });
+
+  it('peels a percent-encoded query string off the politician path (APICONTRACT-01)', async () => {
+    const { env, feedRows, filers } = makeEnv();
+    filers.set('house-ca17-ro-khanna', {
+      bioguide_id: 'house-ca17-ro-khanna',
+      chamber: 'house',
+      full_name: 'Ro Khanna',
+      party: 'D',
+      state: 'CA',
+      district: '17',
+      committees: null,
+      photo_url: null,
+    });
+    feedRows.push(
+      feedRow({
+        id: 'tx-recent',
+        filer_id: 'house-ca17-ro-khanna',
+        tx_date: '2026-07-01',
+        cursor_seq: 10,
+        ticker: 'NVDA',
+        __chamber: 'house',
+      }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request(
+      'http://localhost/member/house-ca17-ro-khanna%3Fsort%3Dtx_date%26order%3Ddesc',
+      {},
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { member: { id: string }; items: Array<{ id: string }> };
+    expect(body.member.id).toBe('house-ca17-ro-khanna');
+    expect(body.items.map((item) => item.id)).toEqual(['tx-recent']);
+  });
+
+  // Regression: TestFlight purchase, 2026-08-13. `redeem_apple_purchase` was
+  // enqueued on the durable queue and only executed by the background tick —
+  // a minute apart at best, five on the free profile — while the iOS client
+  // gave up polling after ~18s. Apple had already charged; the app said
+  // "Request failed". A command a human is waiting on must come back terminal
+  // from the POST itself, with the queue message kept only as the backstop.
+  it('finishes a command inline so the caller never waits for the background tick', async () => {
+    const { env, preferences, commands, queuedMessages } = makeEnv();
+    const app = buildClientRouter();
+    const res = await app.request(
+      'http://localhost/commands',
+      {
+        method: 'POST',
+        headers: { authorization: await bearer(env), 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'update_preferences',
+          payload: { defaultWindow: '30d' },
+          idempotencyKey: 'inline-1',
+        }),
+      },
+      env,
+    );
+
+    // Terminal in the response body, before anything drains the queue.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { command: { id: string; status: string } };
+    expect(body.command.status).toBe('succeeded');
+    expect(commands.get(body.command.id)?.status).toBe('succeeded');
+    expect(preferences.get('user_1')?.default_window).toBe('30d');
+
+    // The backstop message was still enqueued (this request could have died
+    // between the enqueue and the inline run), and replaying it changes
+    // nothing — executeQueuedCommand no-ops on a terminal row.
+    expect(queuedMessages).toHaveLength(1);
+    await drainQueuedCommands(env, queuedMessages);
+    expect(commands.get(body.command.id)?.status).toBe('succeeded');
+    expect(commands.size).toBe(1);
+  });
+
   it('updates preferences through an authenticated command', async () => {
     const { env, preferences, commands, queuedMessages } = makeEnv();
     const app = buildClientRouter();
@@ -1118,12 +1351,14 @@ describe('client API routes', () => {
       },
       env,
     );
-    // Commands are accepted for async execution on the durable queue; the
-    // worker (simulated by drainQueuedCommands) performs the write.
-    expect(res.status).toBe(202);
+    // The POST finishes the command inline and answers with a terminal row.
+    // The durable-queue message is still enqueued as the backstop, and
+    // draining it is a no-op because the row is already terminal.
+    expect(res.status).toBe(200);
     expect((await res.json()) as { command: { status: string } }).toMatchObject({
-      command: { status: 'queued' },
+      command: { status: 'succeeded' },
     });
+    expect(JSON.parse(preferences.get('user_1')?.watchlist ?? '[]')).toEqual(['AAPL', 'MSFT']);
     expect(queuedMessages).toHaveLength(1);
     expect(queuedMessages[0]).toMatchObject({ type: 'command.execute', userId: 'user_1' });
 
@@ -1146,30 +1381,35 @@ describe('client API routes', () => {
     };
 
     const first = await app.request('http://localhost/commands', req, env);
-    expect(first.status).toBe(202);
-    const accepted = (await first.json()) as { command: { id: string; status: string } };
-    expect(accepted.command.status).toBe('queued');
-    expect(subscriptions.size).toBe(0);
+    expect(first.status).toBe(200);
+    const accepted = (await first.json()) as {
+      command: { id: string; status: string; result: { subscription: { secret?: string; streamUrl?: string } } };
+    };
+    expect(accepted.command.status).toBe('succeeded');
+    expect(subscriptions.size).toBe(1);
+    // Inline success claims the one-time secret on the POST (DELIVERYALERTS-01).
+    expect(accepted.command.result.subscription.secret).toMatch(/^whsec_/);
+    expect(accepted.command.result.subscription.streamUrl).toContain('/api/stream?subscription=');
 
+    // Redelivery of the backstop message must not create a second subscription.
     await drainQueuedCommands(env, queuedMessages);
     expect(subscriptions.size).toBe(1);
     expect(commands.size).toBe(1);
-    // The secret is stored separately in result_secret; the persisted result is redacted:
+    // The persisted row stays redacted; the secret is not logged or stored in result.
     const persisted = JSON.parse(Array.from(commands.values())[0].result ?? '{}') as {
       subscription: { secret?: string; streamUrl?: string };
     };
     expect(persisted.subscription.secret).toBeUndefined();
     expect(persisted.subscription.streamUrl).toBeUndefined();
 
-    // First GET /commands/:id claims the one-time secret:
+    // Later GET /commands/:id does not disclose the secret again:
     const cmdId = accepted.command.id;
     const firstRead = await app.request(`http://localhost/commands/${cmdId}`, { headers: { authorization: auth } }, env);
     expect(firstRead.status).toBe(200);
     const firstBody = (await firstRead.json()) as { command: { result: { subscription: { secret?: string; streamUrl?: string } } } };
-    expect(firstBody.command.result.subscription.secret).toMatch(/^whsec_/);
-    expect(firstBody.command.result.subscription.streamUrl).toContain('/api/stream?subscription=');
+    expect(firstBody.command.result.subscription.secret).toBeUndefined();
 
-    // Second GET /commands/:id does NOT disclose the secret again:
+    // Second GET /commands/:id still does not disclose:
     const secondRead = await app.request(`http://localhost/commands/${cmdId}`, { headers: { authorization: auth } }, env);
     expect(secondRead.status).toBe(200);
     const secondBody = (await secondRead.json()) as { command: { result: { subscription: { secret?: string } } } };
@@ -1205,7 +1445,7 @@ describe('client API routes', () => {
       body: JSON.stringify({ type: 'create_subscription', payload: { delivery: 'sse', filters: {} } }),
     }, env);
     // Validation/entitlement failures surface on the command row, not the POST.
-    expect(limited.status).toBe(202);
+    expect(limited.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('failed');
     expect(Array.from(commands.values()).at(-1)?.error).toContain('subscription');
@@ -1215,7 +1455,7 @@ describe('client API routes', () => {
       method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'create_subscription', payload: { delivery: 'sse', filters: { tickers: Array(51).fill('A') } } }),
     }, env);
-    expect(invalid.status).toBe(202);
+    expect(invalid.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('failed');
     expect(Array.from(commands.values()).at(-1)?.error).toBeTruthy();
@@ -1239,7 +1479,7 @@ describe('client API routes', () => {
         payload: { platform: 'apns', token, appBundle: 'trade.congress.ios', env: 'production' },
       }),
     }, env);
-    expect(create.status).toBe(202);
+    expect(create.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('succeeded');
     expect(pushDevices.size).toBe(1);
@@ -1261,7 +1501,7 @@ describe('client API routes', () => {
         payload: { platform: 'apns', token, appBundle: 'trade.congress.ios' },
       }),
     }, env);
-    expect(again.status).toBe(202);
+    expect(again.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(pushDevices.size).toBe(1);
 
@@ -1278,7 +1518,7 @@ describe('client API routes', () => {
         payload: { delivery: 'apns', targetUrl: 'b'.repeat(64), filters: {} },
       }),
     }, env);
-    expect(legacy.status).toBe(202);
+    expect(legacy.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('succeeded');
     expect(pushDevices.size).toBe(2);
@@ -1296,7 +1536,7 @@ describe('client API routes', () => {
         payload: { platform: 'apns', token: 'not-a-token' },
       }),
     }, env);
-    expect(bad.status).toBe(202);
+    expect(bad.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('failed');
     expect(Array.from(commands.values()).at(-1)?.error).toMatch(/hex/i);
@@ -1311,7 +1551,7 @@ describe('client API routes', () => {
       method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'create_subscription', payload: { delivery: 'webhook', targetUrl: oversized, filters: {} } }),
     }, env);
-    expect(create.status).toBe(202);
+    expect(create.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('failed');
     expect(Array.from(commands.values()).at(-1)?.error).toBeTruthy();
@@ -1324,7 +1564,7 @@ describe('client API routes', () => {
       method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'update_subscription', payload: { id: 'sub_webhook', targetUrl: oversized } }),
     }, env);
-    expect(update.status).toBe(202);
+    expect(update.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('failed');
     expect(Array.from(commands.values()).at(-1)?.error).toBeTruthy();
@@ -1346,7 +1586,7 @@ describe('client API routes', () => {
         payload: { id: 'sub_inactive', active: true },
       }),
     }, env);
-    expect(res.status).toBe(202);
+    expect(res.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     const command = Array.from(commands.values()).at(-1);
     expect(command?.status).toBe('failed');
@@ -1373,7 +1613,7 @@ describe('client API routes', () => {
       headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'delete_subscription', payload: { id: 'sub_mine' } }),
     }, env);
-    expect(ok.status).toBe(202);
+    expect(ok.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     const okCmd = Array.from(commands.values()).at(-1);
     expect(okCmd?.status).toBe('succeeded');
@@ -1386,7 +1626,7 @@ describe('client API routes', () => {
       headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'delete_subscription', payload: { id: 'sub_theirs' } }),
     }, env);
-    expect(denied.status).toBe(202);
+    expect(denied.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     const deniedCmd = Array.from(commands.values()).at(-1);
     expect(deniedCmd?.status).toBe('failed');
@@ -1409,7 +1649,7 @@ describe('client API routes', () => {
       headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'update_subscription', payload: { id: 'sub_toggle', active: false } }),
     }, env);
-    expect(pause.status).toBe(202);
+    expect(pause.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('succeeded');
     expect(subscriptions.get('sub_toggle')?.active).toBe(0);
@@ -1419,10 +1659,53 @@ describe('client API routes', () => {
       headers: { authorization: auth, 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'update_subscription', payload: { id: 'sub_toggle', active: true } }),
     }, env);
-    expect(resume.status).toBe(202);
+    expect(resume.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     expect(Array.from(commands.values()).at(-1)?.status).toBe('succeeded');
     expect(subscriptions.get('sub_toggle')?.active).toBe(1);
+  });
+
+  it('deletes the signed-in account via delete_account', async () => {
+    const { env, subscriptions, commands, pushDevices, deletedUsers, queuedMessages } = makeEnv();
+    subscriptions.set('sub_mine', {
+      id: 'sub_mine',
+      client_id: 'user:user_1',
+      delivery: 'sse',
+      target_url: null,
+      secret: 'whsec_mine',
+      filters: '{}',
+      cursor: 0,
+      active: 1,
+      created_at: '2026-08-01T00:00:00.000Z',
+    });
+    pushDevices.set('dev_1', {
+      id: 'dev_1',
+      user_id: 'user_1',
+      platform: 'apns',
+      token: 'a'.repeat(64),
+      app_bundle: 'trade.congress.ios',
+      env: 'production',
+      active: 1,
+      created_at: '2026-08-01T00:00:00.000Z',
+      updated_at: '2026-08-01T00:00:00.000Z',
+    });
+    const app = buildClientRouter();
+    const ok = await app.request('http://localhost/commands', {
+      method: 'POST',
+      headers: { authorization: await bearer(env), 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'delete_account', payload: {} }),
+    }, env);
+    expect(ok.status).toBe(200);
+    await drainQueuedCommands(env, queuedMessages);
+    const command = Array.from(commands.values()).find((row) => row.type === 'delete_account');
+    expect(command?.status).toBe('succeeded');
+    expect(command?.result && JSON.parse(String(command.result))).toMatchObject({
+      deleted: true,
+      userId: 'user_1',
+    });
+    expect(deletedUsers.has('user_1')).toBe(true);
+    expect(subscriptions.has('sub_mine')).toBe(false);
+    expect(pushDevices.has('dev_1')).toBe(false);
   });
 
   it('fails unsupported client command types on the command row', async () => {
@@ -1441,7 +1724,7 @@ describe('client API routes', () => {
       },
       env,
     );
-    expect(res.status).toBe(202);
+    expect(res.status).toBe(200);
     await drainQueuedCommands(env, queuedMessages);
     const command = Array.from(commands.values()).at(-1);
     expect(command?.status).toBe('failed');
@@ -1495,9 +1778,10 @@ describe('client API routes', () => {
       },
       env,
     );
-    expect(res.status).toBe(202);
+    expect(res.status).toBe(200);
     const body = (await res.json()) as { replayed?: boolean; command: { id: string; status: string } };
     expect(body.command.id).toBe('cmd_stale');
+    expect(body.command.status).toBe('succeeded');
     expect(body.replayed).toBeUndefined();
     // The same row was reused (reclaimed), not duplicated.
     expect(commands.size).toBe(1);
@@ -1576,7 +1860,7 @@ describe('client API routes', () => {
       },
       env,
     );
-    expect(res.status).toBe(202);
+    expect(res.status).toBe(200);
     const body = (await res.json()) as { command: { id: string; status: string } };
     expect(body.command.id).toBe('cmd_recover_sub');
     // The reclaim re-enqueues the same row; the worker re-runs it and the
@@ -1589,9 +1873,11 @@ describe('client API routes', () => {
     };
     expect(result.subscription.id).toBe('sub_recover_sub');
     expect(result.subscription.secret).toBeUndefined();
+    const posted = body as { command: { result?: { subscription?: { secret?: string } } } };
+    expect(posted.command.result?.subscription?.secret).toBe('whsec_existing');
     const read = await app.request('http://localhost/commands/cmd_recover_sub', { headers: { authorization: await bearer(env) } }, env);
     const readBody = (await read.json()) as { command: { result: { subscription: { secret?: string } } } };
-    expect(readBody.command.result.subscription.secret).toBe('whsec_existing');
+    expect(readBody.command.result.subscription.secret).toBeUndefined();
     expect(result.subscription.filters.tickers).toEqual(['AAPL']);
     expect(subscriptions.size).toBe(1);
   });
@@ -1641,7 +1927,7 @@ describe('client API detail endpoints: row budget + zero-delta polling', () => {
     await spendRowBudget(guardedEnv, ip, DAILY_ROW_BUDGET);
 
     const app = buildClientRouter();
-    const headers = { 'cf-connecting-ip': ip };
+    const headers = { 'cf-connecting-ip': ip, [TCP_PEER_HEADER]: '104.16.1.2' };
     const trade = await app.request('http://localhost/trade/tx_budget', { headers }, guardedEnv);
     expect(trade.status).toBe(429);
     const ticker = await app.request('http://localhost/ticker/AAPL', { headers }, guardedEnv);
@@ -1672,6 +1958,113 @@ describe('client API detail endpoints: row budget + zero-delta polling', () => {
     const body = (await res.json()) as { items: unknown[]; total?: number };
     expect(body.items).toHaveLength(1);
     expect(body.total).toBe(1);
+  });
+});
+
+describe('client API feed: asset-class filter (?assetClass=)', () => {
+  /** One row per canonical bucket the dropdown has to tell apart. */
+  const mixedAssetRows = () => [
+    feedRow({ id: 'stock', cursor_seq: 1, asset_type: 'ST', ticker: 'AAPL', __chamber: 'house' }),
+    feedRow({ id: 'etf', cursor_seq: 2, asset_type: 'EF', ticker: 'SPY', __chamber: 'house' }),
+    feedRow({ id: 'mutual-fund', cursor_seq: 3, asset_type: 'MF', ticker: null, __chamber: 'house' }),
+    feedRow({ id: 'muni-bond', cursor_seq: 4, asset_type: 'GS', ticker: null, __chamber: 'house' }),
+    feedRow({ id: 'real-property', cursor_seq: 5, asset_type: 'RP', ticker: null, __chamber: 'house' }),
+  ];
+
+  it('narrows the page to public equities, funds, and ETFs', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(...mixedAssetRows());
+    const app = buildClientRouter();
+
+    const res = await app.request('http://localhost/feed?assetClass=equities_funds', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }>; count: number };
+    // Cursorless `/feed` is newest-first (PR #1767), so the matching rows come
+    // back in descending `cursor_seq`: mutual-fund(3), etf(2), stock(1).
+    expect(body.items.map((item) => item.id)).toEqual(['mutual-fund', 'etf', 'stock']);
+    expect(body.count).toBe(3);
+  });
+
+  it('reports a `total` that reflects the FILTER, not the page size', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(...mixedAssetRows());
+    const app = buildClientRouter();
+
+    // limit=2 with 3 matching rows: a client-side filter over one fetched page
+    // could only ever report 2 (or, unfiltered, all 5). The server-side filter
+    // must serve a 2-row page while reporting the true match count of 3 — that
+    // is the whole reason this filter is not done on the client.
+    const res = await app.request('http://localhost/feed?limit=2&assetClass=equities_funds', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }>; count: number; total: number };
+    // Newest-first (PR #1767): the 2-row page is the TOP of the match set,
+    // mutual-fund(3) and etf(2) — stock(1) is the one that falls off.
+    expect(body.items.map((item) => item.id)).toEqual(['mutual-fund', 'etf']);
+    expect(body.count).toBe(2);
+    expect(body.total).toBe(3);
+  });
+
+  it('treats "all" (and an absent param) as no filter at all', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(...mixedAssetRows());
+    const app = buildClientRouter();
+
+    const all = await app.request('http://localhost/feed?assetClass=all', {}, env);
+    const allBody = (await all.json()) as { total: number };
+    expect(allBody.total).toBe(5);
+
+    const absent = await app.request('http://localhost/feed', {}, env);
+    const absentBody = (await absent.json()) as { total: number };
+    expect(absentBody.total).toBe(5);
+  });
+
+  it('composes with the other server-side filters and their total', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(
+      ...mixedAssetRows(),
+      feedRow({ id: 'senate-stock', cursor_seq: 6, asset_type: 'ST', __chamber: 'senate' }),
+    );
+    const app = buildClientRouter();
+
+    const res = await app.request(
+      'http://localhost/feed?chamber=senate&assetClass=equities_funds',
+      {},
+      env,
+    );
+    const body = (await res.json()) as { items: Array<{ id: string }>; total: number };
+    expect(body.items.map((item) => item.id)).toEqual(['senate-stock']);
+    expect(body.total).toBe(1);
+  });
+
+  it('carries the canonical category and its label on every trade row', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(...mixedAssetRows());
+    const app = buildClientRouter();
+
+    const res = await app.request('http://localhost/feed', {}, env);
+    const body = (await res.json()) as {
+      items: Array<{
+        id: string;
+        asset: {
+          type: string | null;
+          typeCategory: string | null;
+          typeCategoryLabel: string | null;
+          logoUrl: string | null;
+        };
+      }>;
+    };
+    const byId = new Map(body.items.map((item) => [item.id, item.asset]));
+    // Raw disclosure code is preserved as provenance...
+    expect(byId.get('stock')?.type).toBe('ST');
+    // ...alongside the canonical rollup a client can actually filter/group on.
+    expect(byId.get('stock')?.typeCategory).toBe('public_equity');
+    expect(byId.get('stock')?.typeCategoryLabel).toBe('Public Equity');
+    expect(byId.get('etf')?.typeCategory).toBe('fund');
+    expect(byId.get('muni-bond')?.typeCategory).toBe('fixed_income_government');
+    expect(byId.get('muni-bond')?.typeCategoryLabel).toBe('Government / Municipal Debt');
+    // Same-origin logo proxy path, previously documented but never emitted.
+    expect(byId.get('stock')?.logoUrl).toBe('/api/logos/ticker?symbol=AAPL');
+    expect(byId.get('muni-bond')?.logoUrl).toBeNull();
   });
 });
 
@@ -1711,5 +2104,110 @@ describe('client API feed: offset-paged snapshots (iOS punch list #2, item 8)', 
     expect(page2.status).toBe(200);
     const page2Body = (await page2.json()) as { items: Array<{ id: string }> };
     expect(page2Body.items.map((i) => i.id)).toEqual(['tx-oldest']);
+  });
+});
+
+describe('client API feed: default order (oldest-first-seed-rows bug)', () => {
+  it('defaults to cursor_seq DESC (newest-first) when neither since nor order is given', async () => {
+    // Reproduces the diagnosed defect: the raw builder default is
+    // `cursor_seq ASC`, so a plain `GET /feed` used to surface the oldest
+    // `seed_dataset` rows first — rows with no owning `filings` row at all,
+    // so filedDate/firstSeenAt/sourceUrl all come back null. The route must
+    // now default to DESC so a caller with no forward cursor sees recent,
+    // fully-populated rows.
+    const { env, feedRows } = makeEnv();
+    feedRows.push(
+      feedRow({
+        id: 'seed-oldest',
+        cursor_seq: 1,
+        source: 'seed_dataset',
+        filing_filed_date: null,
+        filing_first_seen_at: null,
+        filing_source_url: undefined,
+      }),
+      feedRow({
+        id: 'seed-older',
+        cursor_seq: 2,
+        source: 'seed_dataset',
+        filing_filed_date: null,
+        filing_first_seen_at: null,
+        filing_source_url: undefined,
+      }),
+      feedRow({ id: 'live-newest', cursor_seq: 3 }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/feed?limit=2', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      items: Array<{ id: string; filing: { filedDate: string | null } }>;
+    };
+    expect(body.items.map((i) => i.id)).toEqual(['live-newest']);
+    expect(body.items[0].filing.filedDate).not.toBeNull();
+  });
+
+  it('includes seed_dataset rows only when source=all', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(
+      feedRow({
+        id: 'seed-older',
+        cursor_seq: 2,
+        source: 'seed_dataset',
+        filing_filed_date: null,
+        filing_first_seen_at: null,
+        filing_source_url: undefined,
+      }),
+      feedRow({ id: 'live-newest', cursor_seq: 3 }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/feed?limit=5&source=all', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }> };
+    expect(body.items.map((i) => i.id)).toEqual(['live-newest', 'seed-older']);
+  });
+
+  it('keeps ASC (oldest-of-the-new-batch-first) on a since-cursor poll even without an explicit order', async () => {
+    // The forward-cursor paging contract (a client re-feeds the returned max
+    // cursor back as `since=`) must keep resuming gap-free — the new DESC
+    // default only applies when there is no cursor at all.
+    const { env, feedRows } = makeEnv();
+    feedRows.push(
+      feedRow({ id: 'tx-a', cursor_seq: 10 }),
+      feedRow({ id: 'tx-b', cursor_seq: 11 }),
+      feedRow({ id: 'tx-c', cursor_seq: 12 }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/feed?since=5', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }> };
+    expect(body.items.map((i) => i.id)).toEqual(['tx-a', 'tx-b', 'tx-c']);
+  });
+
+  it('treats an explicit since=0 the same as any other cursor value (stays ASC)', async () => {
+    // since=0 is a legitimate "start of history, but I AM a resumable cursor
+    // client" value (parseIntOrUndef("0") -> 0, not undefined) — it must not
+    // be treated the same as "no cursor at all".
+    const { env, feedRows } = makeEnv();
+    feedRows.push(
+      feedRow({ id: 'tx-a', cursor_seq: 1 }),
+      feedRow({ id: 'tx-b', cursor_seq: 2 }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/feed?since=0', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }> };
+    expect(body.items.map((i) => i.id)).toEqual(['tx-a', 'tx-b']);
+  });
+
+  it('an explicit order always wins over the new no-cursor default', async () => {
+    const { env, feedRows } = makeEnv();
+    feedRows.push(
+      feedRow({ id: 'tx-a', cursor_seq: 1 }),
+      feedRow({ id: 'tx-b', cursor_seq: 2 }),
+    );
+    const app = buildClientRouter();
+    const res = await app.request('http://localhost/feed?order=asc', {}, env);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ id: string }> };
+    expect(body.items.map((i) => i.id)).toEqual(['tx-a', 'tx-b']);
   });
 });

@@ -8,6 +8,15 @@
  * `Transaction.originalID`); upserts here are what make both the
  * `redeem_apple_purchase` command and the App Store Server Notifications
  * webhook idempotent on that id.
+ *
+ * `userId` is nullable (migration 00NN_apple_subscriptions_nullable_user —
+ * see that file for why): a purchase made signed OUT (Guideline 5.1.1(v),
+ * `POST /api/client/v1/entitlements/apple/redeem`) writes a row with
+ * `userId: null`, granting Premium to the DEVICE via a separately-issued
+ * entitlement token (`billing/deviceEntitlement.ts`), not to any account. The
+ * row is claimable by the first account that later presents the same
+ * verified transaction (`link_apple_entitlement`) — see the owner-mismatch
+ * guard in `upsertAppleSubscription` below.
  */
 
 import type { ApplePlan } from './apple.ts';
@@ -18,7 +27,8 @@ export type AppleSubscriptionStatus = 'active' | 'expired' | 'revoked' | 'grace_
 
 export interface AppleSubscriptionRecord {
   originalTransactionId: string;
-  userId: string;
+  /** null = anonymous device purchase, not yet (or never) claimed by an account. */
+  userId: string | null;
   productId: string;
   plan: ApplePlan;
   status: AppleSubscriptionStatus;
@@ -38,7 +48,7 @@ export interface AppleSubscriptionRecord {
 
 interface AppleSubscriptionRow {
   original_transaction_id: string;
-  user_id: string;
+  user_id: string | null;
   product_id: string;
   plan: string;
   status: string;
@@ -83,6 +93,52 @@ export function appleStatusGrantsAccess(status: AppleSubscriptionStatus): boolea
   return status === 'active' || status === 'grace_period';
 }
 
+/**
+ * Client redeem/restore presents the original StoreKit JWS, which usually
+ * has no `revocationDate` even after Apple's REFUND/REVOKE webhook has
+ * already marked the ledger revoked. Replaying that JWS must not flip
+ * `status` back to `active`. A later purchase on the same
+ * `originalTransactionId` (new `transactionId` and `purchaseDate` after
+ * `revokedAt`) is allowed so a genuine resubscribe can restore without
+ * waiting for DID_RENEW. The same holds for a lapsed ledger row
+ * (`expired` / `billing_retry`): replaying the purchase-time JWS must not
+ * resurrect a subscription Apple already considers dead — otherwise one
+ * stored JWS re-grants Premium forever. A lapse is anchored at the
+ * recorded `expiresDate` rather than `revokedAt`. Legacy lapsed rows can
+ * lack either date; use their persisted last-observed timestamp in that case.
+ * A different transaction id alone is not proof of a new purchase: a historic
+ * signed transaction could also differ from the latest ledger id.
+ */
+const REDEEM_GUARDED_STATUSES: ReadonlySet<AppleSubscriptionRecord['status']> = new Set([
+  'revoked',
+  'expired',
+  'billing_retry',
+]);
+
+export function clientRedeemWouldResurrectRevoked(
+  existing: AppleSubscriptionRecord | null,
+  incoming: { transactionId?: string | null; purchaseDateMs?: number | null },
+): boolean {
+  if (!existing || !REDEEM_GUARDED_STATUSES.has(existing.status)) return false;
+  const incomingTxn = incoming.transactionId ?? '';
+  const existingTxn = existing.latestTransactionId ?? '';
+  const purchaseMs = incoming.purchaseDateMs ?? Number.NaN;
+  const anchorMs = existing.revokedAt
+    ? Date.parse(existing.revokedAt)
+    : Date.parse(existing.expiresDate ?? (
+      existing.status === 'expired' || existing.status === 'billing_retry'
+        ? existing.updatedAt
+        : ''
+    ));
+  const isNewerPurchase =
+    incomingTxn.length > 0 &&
+    incomingTxn !== existingTxn &&
+    Number.isFinite(purchaseMs) &&
+    Number.isFinite(anchorMs) &&
+    purchaseMs > anchorMs;
+  return !isNewerPurchase;
+}
+
 export async function getAppleSubscription(
   env: Env,
   originalTransactionId: string,
@@ -122,7 +178,8 @@ export async function activeAppleSubscriptionForUser(
 
 export interface UpsertAppleSubscriptionInput {
   originalTransactionId: string;
-  userId: string;
+  /** null = anonymous device purchase (no Congress.Trade account). */
+  userId: string | null;
   productId: string;
   plan: ApplePlan;
   status: AppleSubscriptionStatus;
@@ -134,27 +191,78 @@ export interface UpsertAppleSubscriptionInput {
   autoRenewProductId?: string | null;
   revokedAt?: string | null;
   revocationReason?: number | null;
+  /**
+   * Client redeem paths only: enforce the resurrect guard inside the
+   * UPSERT's own WHERE so a REFUND/REVOKE (or lapse) webhook landing after
+   * the caller's read cannot be clobbered by this write. A guarded current
+   * row makes the UPDATE no-op and returns
+   * `{ ok: false, reason: 'guarded_status' }`. Webhook callers must NOT set
+   * this — DID_RENEW legitimately flips a guarded row back to active.
+   */
+  redeemGuard?: boolean;
   lastNotificationType?: string | null;
   lastNotificationSubtype?: string | null;
 }
 
 /**
- * Idempotent upsert keyed on `originalTransactionId`. Reassigning the row to
- * a DIFFERENT userId is refused (returns `{ ok: false, reason: 'owner_mismatch' }`)
- * rather than silently reassigning a subscription's Premium grant to a new
- * account — the only legitimate way a transaction id's owner should ever
- * change is a support-assisted account merge, not an unauthenticated replay.
+ * Idempotent upsert keyed on `originalTransactionId`. Reassigning a row
+ * already owned by a DIFFERENT (non-null) userId is refused (returns
+ * `{ ok: false, reason: 'owner_mismatch' }`) rather than silently reassigning
+ * a subscription's Premium grant to a new account — the only legitimate way
+ * an OWNED transaction id's owner should ever change is a support-assisted
+ * account merge, not an unauthenticated replay.
+ *
+ * A `null`-owner row (anonymous device purchase — Guideline 5.1.1(v)) is the
+ * one case this guard deliberately lets through: it is claimable by the
+ * FIRST authenticated account that presents a matching verified JWS
+ * (`link_apple_entitlement` / `redeem_apple_purchase`), because nobody has a
+ * competing claim on it yet. Once claimed, the row behaves exactly like any
+ * other owned row. The SELECT+guard is not a transaction; the UPSERT uses
+ * `COALESCE(existing.user_id, excluded.user_id)` so an in-flight anonymous
+ * redeem cannot write NULL over a claim that landed after the read, and a
+ * non-null owner is never reassigned.
  */
 export async function upsertAppleSubscription(
   env: Env,
   input: UpsertAppleSubscriptionInput,
-): Promise<{ ok: true; record: AppleSubscriptionRecord } | { ok: false; reason: 'owner_mismatch'; ownerId: string }> {
+): Promise<
+  | { ok: true; record: AppleSubscriptionRecord; isNew: boolean }
+  | { ok: false; reason: 'owner_mismatch'; ownerId: string }
+  | { ok: false; reason: 'guarded_status' }
+> {
   const existing = await getAppleSubscription(env, input.originalTransactionId);
-  if (existing && existing.userId !== input.userId) {
+  if (existing && existing.userId != null && existing.userId !== input.userId) {
     return { ok: false, reason: 'owner_mismatch', ownerId: existing.userId };
   }
+  // No ledger row existed yet for this originalTransactionId before this
+  // call — i.e. this is the first time we've ever seen this Apple
+  // subscription, not a renewal/refresh of one we already knew about.
+  const isNew = !existing;
   const now = new Date().toISOString();
-  await run(
+  // SQL mirror of clientRedeemWouldResurrectRevoked, so the guard and the
+  // write are one statement (the SELECT+check above is not atomic with this
+  // write — a webhook can land in between). In the upsert grammar
+  // `apple_subscriptions.<col>` is the existing row, `excluded.<col>` the
+  // incoming one. A guarded row yields zero changed rows below.
+  const redeemGuardWhere = input.redeemGuard
+    ? `
+     WHERE NOT (
+       apple_subscriptions.status IN ('revoked', 'expired', 'billing_retry')
+       AND (
+         excluded.latest_transaction_id IS NULL
+         OR excluded.latest_transaction_id = apple_subscriptions.latest_transaction_id
+         OR excluded.purchase_date IS NULL
+         OR NOT (
+           (apple_subscriptions.revoked_at IS NOT NULL AND excluded.purchase_date > apple_subscriptions.revoked_at)
+           OR (apple_subscriptions.revoked_at IS NULL AND apple_subscriptions.expires_date IS NOT NULL AND excluded.purchase_date > apple_subscriptions.expires_date)
+           OR (apple_subscriptions.revoked_at IS NULL AND apple_subscriptions.expires_date IS NULL
+               AND apple_subscriptions.status IN ('expired', 'billing_retry')
+               AND excluded.purchase_date > apple_subscriptions.updated_at)
+         )
+       )
+     )`
+    : '';
+  const writeResult = await run(
     env.DB,
     `INSERT INTO apple_subscriptions (
        original_transaction_id, user_id, product_id, plan, status, environment,
@@ -163,6 +271,14 @@ export async function upsertAppleSubscription(
        last_notification_type, last_notification_subtype, created_at, updated_at
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(original_transaction_id) DO UPDATE SET
+       -- The SELECT+guard above is not atomic with this write. iOS leaves a
+       -- signed-out purchase UNFINISHED so Transaction.updates redelivers it
+       -- after sign-in (AppleIAP.observeAppleTransactions) while
+       -- link_apple_entitlement claims the same row. If the in-flight
+       -- anonymous redeem still saw user_id NULL, user_id = excluded.user_id
+       -- would write NULL over the claim and drop account Premium.
+       -- COALESCE keeps any existing owner and only fills a NULL.
+       user_id = COALESCE(apple_subscriptions.user_id, excluded.user_id),
        product_id = excluded.product_id,
        plan = excluded.plan,
        status = excluded.status,
@@ -176,7 +292,7 @@ export async function upsertAppleSubscription(
        revocation_reason = excluded.revocation_reason,
        last_notification_type = COALESCE(excluded.last_notification_type, apple_subscriptions.last_notification_type),
        last_notification_subtype = COALESCE(excluded.last_notification_subtype, apple_subscriptions.last_notification_subtype),
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at${redeemGuardWhere}`,
     [
       input.originalTransactionId,
       input.userId,
@@ -197,7 +313,20 @@ export async function upsertAppleSubscription(
       now,
     ],
   );
+  if (input.redeemGuard && (writeResult?.meta?.changes ?? 0) === 0) {
+    return { ok: false, reason: 'guarded_status' };
+  }
   const record = await getAppleSubscription(env, input.originalTransactionId);
   if (!record) throw new Error('apple subscription upsert failed');
-  return { ok: true, record };
+  // Re-check ownership AFTER the write before reporting newness.
+  //
+  // `isNew` above comes from a pre-read, so two accounts redeeming the same
+  // previously-unseen originalTransactionId can both see null and both claim to
+  // be new. The INSERT preserves the first writer's user_id, but the LOSER would
+  // still report isNew - and whichever request then claims the notification key
+  // first sends an alert carrying its own email for the winner's subscription.
+  // The row's persisted owner is the only authority on who actually won, so a
+  // caller that does not own it is never new.
+  const wonTheRow = record.userId == null || record.userId === input.userId;
+  return { ok: true, record, isNew: isNew && wonTheRow };
 }

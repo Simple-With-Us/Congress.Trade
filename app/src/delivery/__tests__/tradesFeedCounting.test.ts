@@ -52,6 +52,7 @@ async function createInMemoryD1(): Promise<D1Database> {
     CREATE TABLE IF NOT EXISTS securities_ref (ticker TEXT PRIMARY KEY, company_name TEXT, sector TEXT, market_cap REAL, market_cap_bucket TEXT, country TEXT, exchange_short TEXT, asset_class TEXT, enriched_at TEXT);
     ALTER TABLE filers ADD COLUMN photo_url TEXT;
     ALTER TABLE filers ADD COLUMN resolved_bioguide_id TEXT;
+    ALTER TABLE filers ADD COLUMN display_name TEXT;
     ALTER TABLE filings ADD COLUMN filing_status TEXT;
     ALTER TABLE transactions ADD COLUMN deprecated_at TEXT;
   `);

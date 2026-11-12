@@ -40,10 +40,13 @@ describe('GET /config-sources (single-source-of-truth audit)', () => {
     expect(guard?.source).toBe('env');
     // Env-only + bootstrap registries are present (names only).
     expect(body.envOnly.map((e) => e.key)).toContain('SENTRY_DSN');
+    expect(body.items.some((i) => i.key === 'DD_API_KEY' && i.category === 'integrations')).toBe(true);
+    expect(body.items.some((i) => i.key === 'DD_SITE' && i.category === 'integrations')).toBe(true);
+    expect(body.items.some((i) => i.key === 'DD_CLIENT_TOKEN' && i.category === 'integrations')).toBe(true);
     expect(body.bootstrap.map((e) => e.key)).toContain('INFISICAL_APP_CLIENT_ID');
     // The knobs consolidated in this change are all in the registry.
     for (const key of [
-      'FMP_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE', 'DISCLOSURE_LATENCY_PROVIDERS',
+      'ST_PEER_MAX_PER_MINUTE', 'EDGAR_MAX_PER_MINUTE', 'DISCLOSURE_LATENCY_PROVIDERS',
       'SEED_HOUSE_URL', 'HOUSE_LIVE_SEARCH_ENABLED', 'ARBITRATION_ENABLED',
       'VISION_PRIMARY_MODEL', 'ADMIN_OPEN_IN_DEV',
     ]) {

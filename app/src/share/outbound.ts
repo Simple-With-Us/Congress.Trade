@@ -32,6 +32,14 @@ import {
   recordTargetSuccess,
   targetKeyForUrl,
 } from '../delivery/targetCircuit.ts';
+import { notifyAdmin } from '../alerts/notify.ts';
+import { sentryLoggerWarn } from '../shared/sentryRuntime.ts';
+import {
+  interpretPeerPushReceipt,
+  PEER_PUSH_ID_HEADER,
+  type PeerPushAcks,
+  type PeerPushHealth,
+} from './peerPushReceipt.ts';
 
 type PeerEnv = Env & { APP_B_IMPORT_URL?: string; APP_B_INGEST_TOKEN?: string };
 
@@ -47,6 +55,9 @@ export interface PeerShareResult {
   reason?: string;
   status?: number;
   counts?: { refs: number; prices: number; spx: number; trades: number };
+  pushId?: string;
+  health?: PeerPushHealth;
+  acks?: PeerPushAcks;
 }
 
 /** The REF fields App B's /securities/import consumes (mirrors its REF_KEYS). */
@@ -106,7 +117,10 @@ export async function shareWithPeer(
   if (!parsed.success) {
     return { sent: false, reason: 'invalid shared payload: ' + parsed.error.issues[0]?.message };
   }
-  const body = JSON.stringify(parsed.data);
+  // Added after the shared schema parse.  SharePayloadSchema strips unknown keys,
+  // and the peer's local schema is what keeps pushId.
+  const pushId = crypto.randomUUID();
+  const body = JSON.stringify({ ...parsed.data, pushId });
 
   // GOVERNOR 3: the peer app is an outbound target like any other — a peer
   // outage opens its circuit and this daily push quietly skips (the data is a
@@ -123,18 +137,55 @@ export async function shareWithPeer(
   try {
     const res = await trackedFetch(url, {
       method: 'POST',
-      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+      headers: {
+        authorization: 'Bearer ' + token,
+        'content-type': 'application/json',
+        [PEER_PUSH_ID_HEADER]: pushId,
+      },
       body,
     }, { service: 'peer-data-share', operation: 'push-market-data', dynamicTarget: 'peer-app' }, fetchImpl);
     const counts = { refs: refs.length, prices: prices.length, spx: spx.length, trades: trades.length };
     if (!res.ok) {
       if (targetKey) await recordTargetFailure(env, targetKey, `HTTP ${res.status}`);
-      return { sent: false, reason: 'peer import failed: HTTP ' + res.status, status: res.status, counts };
+      return { sent: false, reason: 'peer import failed: HTTP ' + res.status, status: res.status, counts, pushId };
     }
     if (targetKey) await recordTargetSuccess(env, targetKey);
-    return { sent: true, status: res.status, counts };
+    const rawText = await res.text();
+    let parsedBody: unknown;
+    try {
+      parsedBody = rawText ? JSON.parse(rawText) : undefined;
+    } catch {
+      parsedBody = undefined;
+    }
+    const receipt = interpretPeerPushReceipt(parsedBody, pushId);
+    if (receipt.health !== 'ok') {
+      await alertMissingPeerPushAcks(env, pushId, receipt.health);
+      return {
+        sent: false,
+        reason: 'peer import receipt ' + receipt.health,
+        status: res.status,
+        counts,
+        pushId,
+        health: receipt.health,
+        acks: receipt.acks,
+      };
+    }
+    return { sent: true, status: res.status, counts, pushId, health: 'ok', acks: receipt.acks };
   } catch (e) {
     if (targetKey) await recordTargetFailure(env, targetKey, (e as Error).message ?? 'fetch failed');
-    return { sent: false, reason: 'peer import error: ' + (e as Error).message };
+    return { sent: false, reason: 'peer import error: ' + (e as Error).message, pushId };
   }
+}
+
+/** Page when a 2xx peer body has no delivered or consumed ack.  Email is throttled. */
+async function alertMissingPeerPushAcks(env: Env, pushId: string, health: PeerPushHealth): Promise<void> {
+  sentryLoggerWarn('peer.push.missing_ack', { pushId, health });
+  await notifyAdmin(env, {
+    subject: 'Congress.Trade peer push is missing an ack',
+    text:
+      'A push to Socratic-Trade returned HTTP success without a complete receipt.  ' +
+      `pushId=${pushId} health=${health}.  ` +
+      'Expected x-push-id echoed as pushId, plus acks.delivered and acks.consumed.',
+    dedupeKey: 'peer-push-missing-ack',
+  });
 }

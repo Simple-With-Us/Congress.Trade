@@ -1,5 +1,9 @@
 # 2026-07-27 — Enable disclosure-latency tunables (FMP / UW / QQ)
 
+> **Current shape (2026-08):** Turso is retired.  Schema now lives on the
+> Coolify SQLite file; tunables still live in Infisical.  The "Infisical +
+> Turso" ops section below is the 2026-07 apply-log.
+
 ## Summary
 
 Admin config-sources showed latency knobs as `missing` (and the race produced

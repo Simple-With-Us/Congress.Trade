@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# ship.sh — one-command production deploy for Congress.Trade.
+# ship.sh — wait for Coolify, then migrate Congress.Trade.
 #
-# Deploys the Worker (uses your saved `wrangler login` — no API key needed),
-# then applies schema + optional data steps through the Worker's own database
-# binding via the admin API. This deliberately AVOIDS `wrangler d1 ... --remote`,
-# which has OAuth auth issues on this account; the Worker binding works fine.
+# Coolify rebuilds the Deno-in-Docker app on push to main.  This script does
+# not wrangler-deploy and does not talk to Deno Deploy or Turso.  It waits
+# until https://congress.trade/api/health reports the current HEAD SHA, then
+# applies schema via POST /api/admin/migrate against the live host SQLite
+# file (not D1).
 #
 #   ADMIN_TOKEN=xxx bash scripts/ship.sh                  # deploy + ensure schema
 #   bash scripts/ship.sh --deploy-only                    # deploy + health only
@@ -115,7 +116,10 @@ check_live_revision() {
     return 0
   fi
   attempts="${DEPLOY_REVISION_ATTEMPTS:-30}"
-  delay="${DEPLOY_REVISION_DELAY_SECONDS:-20}"
+  # Gentle ramp (CT-2459): poll eagerly at first (Coolify usually lands in
+  # well under a minute), then back off to the old fixed 20s cadence.
+  # Setting DEPLOY_REVISION_DELAY_SECONDS pins a fixed delay instead.
+  delay="${DEPLOY_REVISION_DELAY_SECONDS:-5}"
 
   for ((i = 1; i <= attempts; i++)); do
     body="$(curl -sS -A "$UA" "$base/api/health" || true)"
@@ -142,6 +146,9 @@ check_live_revision() {
     echo "   waiting for deploy: live ${live:0:12} != HEAD ${expected:0:12} (attempt $i/$attempts)"
     if [ "$i" -lt "$attempts" ]; then
       sleep "$delay"
+      if [ -z "${DEPLOY_REVISION_DELAY_SECONDS:-}" ] && [ "$delay" -lt 20 ]; then
+        delay=$((delay + 5))
+      fi
     fi
   done
 
@@ -259,8 +266,20 @@ if [ "$DEPLOY_ONLY" = true ]; then
   exit 0
 fi
 
-# Always ensure the schema is current (idempotent), via the Worker binding.
-post migrate
+# Ensure the schema is current (idempotent). The app already applies the
+# same statement list at startup (src/deno/main.ts), and /api/health spreads
+# checkReadiness() ({ok, db, schema, missing[]}); when the just-verified
+# live build reports schema=true with nothing missing, the extra migrate
+# POST is a duplicate replay -- skip it (CT-2459). SHIP_FORCE_MIGRATE=1
+# always POSTs; the live-SHA assertion above still runs either way.
+health_body="$(curl -sS -A "$UA" "$ADMIN_BASE/api/health" || true)"
+if [ "${SHIP_FORCE_MIGRATE:-0}" != "1" ] \
+  && [[ "$health_body" == *'"schema":true'* ]] \
+  && [[ "$health_body" == *'"missing":[]'* ]]; then
+  echo "==> /api/health reports schema current (schema=true, missing=[]) -- skipping duplicate migrate POST."
+else
+  post migrate
+fi
 
 echo "==> Live API readiness check"
 check_api_health "$ADMIN_BASE/api/health" "$ADMIN_BASE"

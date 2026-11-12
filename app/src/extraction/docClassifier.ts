@@ -30,11 +30,17 @@
 
 import type { Env } from '../shared/types.ts';
 import { get, run } from '../shared/db.ts';
-import { PDFDocument } from 'pdf-lib';
+// CT-2459: pdf-lib dynamic-imported at first use (startup graph trim).
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { keyFor } from './bakeoff.ts';
 import { looksLikePdf } from '../ingestion/classifier.ts';
+import { isHouseElectronicDocId } from './extractRouting.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
+import {
+  OPENROUTER_PURPOSE,
+  buildOpenRouterClassifier,
+  openRouterAttributionHeaders,
+} from '../shared/openRouterAttribution.ts';
 
 export type DocClass = 'typed' | 'clean_scan' | 'hard_scan' | 'empty' | 'corrupt';
 
@@ -71,6 +77,8 @@ export interface DocClassSignals {
   hasImages: boolean;
   /** Pipeline docKind hint when known (text_pdf | scanned_pdf | senate_html | unknown). */
   docKind?: string | null;
+  /** Filing id — House 20xxxxxx electronic PTRs are typed without a model call. */
+  docId?: string | null;
 }
 
 /** Compute the free deterministic signals for a raw document. */
@@ -90,6 +98,7 @@ export async function computeDocClassSignals(
   let pageCount: number | null = null;
   if (claimsPdf) {
     try {
+      const { PDFDocument } = await import('pdf-lib');
       const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
       pageCount = pdf.getPageCount();
       pdfLoadable = true;
@@ -102,7 +111,10 @@ export async function computeDocClassSignals(
     pdfLoadable,
     claimsPdf,
     pageCount,
-    hasTextLayer: hasFont && hasTextShow,
+    // Fonts mean a real text layer even when Flate-compressed streams hide
+    // BT..Tj from the raw sniff (same bias as classifyPdfBytes). Requiring
+    // both markers sent typed House PTRs to the scan/Files path.
+    hasTextLayer: hasFont || hasTextShow,
     hasImages,
     docKind: docKind ?? null,
   };
@@ -116,6 +128,7 @@ export function decideDocClass(signals: DocClassSignals): DocClass | null {
   if (signals.byteLength === 0) return 'corrupt';
   if (signals.claimsPdf && !signals.pdfLoadable) return 'corrupt';
   if (signals.docKind === 'senate_html') return 'typed';
+  if (signals.docId && isHouseElectronicDocId(signals.docId)) return 'typed';
   if (signals.docKind === 'text_pdf' || signals.hasTextLayer) return 'typed';
   if (!signals.claimsPdf) {
     // Not a PDF, not eFD HTML: the pipeline calls this docKind 'unknown';
@@ -161,11 +174,11 @@ export async function resolveDocClassifierKnobs(env: Env): Promise<DocClassifier
     ])) as DocClassifierSecretEnv;
   } catch {
     // Resolver outage: deterministic tier still works; model tier disabled.
-    return { enabled: false, model: 'google/gemini-2.5-flash-lite', parseEngine: 'cloudflare-ai' };
+    return { enabled: false, model: 'google/gemini-3.5-flash-lite', parseEngine: 'cloudflare-ai' };
   }
   return {
     enabled: secrets.DOC_CLASSIFIER_ENABLED !== 'false',
-    model: secrets.DOC_CLASSIFIER_MODEL || 'google/gemini-2.5-flash-lite',
+    model: secrets.DOC_CLASSIFIER_MODEL || 'google/gemini-3.5-flash-lite',
     parseEngine: secrets.DOC_CLASSIFIER_PARSE_ENGINE || 'cloudflare-ai',
   };
 }
@@ -214,13 +227,18 @@ export async function classifyDocClassWithModel(
     signal?.throwIfAborted();
     const key = await keyFor(env, 'openrouter');
     if (!key) return null;
+    const classifierEnrichment = buildOpenRouterClassifier(env, {
+      service: 'docClassifier',
+      purpose: OPENROUTER_PURPOSE.DOC_CLASS,
+      feature: 'doc-class',
+      keyRef: 'OPENROUTER_API_KEY',
+    });
     const res = await trackedFetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://congress.trade',
-        'X-Title': 'Congress.Trade',
+        ...openRouterAttributionHeaders(),
       },
       body: JSON.stringify({
         model: knobs.model,
@@ -246,12 +264,14 @@ export async function classifyDocClassWithModel(
               type: 'file',
               file: {
                 filename: 'document.pdf',
-                file_data: `data:application/pdf;base64,${arrayBufferToBase64Chunked(bytes)}`,
+                file_data: `[PDF attachment removed — 0 KB]${arrayBufferToBase64Chunked(bytes)}`,
               },
             },
             { type: 'text', text: CLASSIFIER_PROMPT },
           ],
         }],
+        // App classifier tags for OpenRouter Activity + Usage-Monitor filters.
+        ...classifierEnrichment,
       }),
       signal: signal
         ? AbortSignal.any([signal, AbortSignal.timeout(60_000)])
@@ -329,7 +349,8 @@ export async function ensureDocClass(
     signal?.throwIfAborted();
     const signals = await computeSignals(bytes, docKindHint);
     signal?.throwIfAborted();
-    docClass = decideDocClass(signals);
+    docClass = decideDocClass({ ...signals, docId });
+    if (!docClass && isHouseElectronicDocId(docId)) docClass = 'typed';
   } catch (err) {
     signal?.throwIfAborted();
     console.warn('doc classifier: signal computation failed:', docId, (err as Error).message);

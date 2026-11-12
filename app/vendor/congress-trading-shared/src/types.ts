@@ -30,6 +30,7 @@ export type {
   CongressTransaction,
   CongressTransactionRead,
   TransactionsPage,
+  TransactionsQueryInput,
   TransactionsQuery,
   BundleResponse,
 } from "./schemas";
@@ -53,6 +54,7 @@ export type {
   ClusterBuy,
   MemberLeader,
   MemberPerformance,
+  MemberDualPerformance,
   BacktestHorizon,
   TickerBacktest,
   CommitteeConflict,
@@ -64,7 +66,7 @@ export type { SharePayload } from "./schemas";
 
 // ---- Push events (App A → App B) ----
 
-export type { CongressEventType, CongressEvent } from "./schemas";
+export type { CongressEventType, CongressEvent, CongressTradeEvent, CongressTradeData } from "./schemas";
 
 // ---- Snapshot/Export ----
 

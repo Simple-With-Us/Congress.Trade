@@ -14,6 +14,7 @@ import {
   LAG_BUCKETS as SHARED_LAG_BUCKETS,
 } from '@jaywedgeworth22/congress-trading-shared';
 import { computePerformance } from '../prices/compute.ts';
+import { isCurrentPriceFresh } from '../prices/staleness.ts';
 
 /**
  * Estimated dollar value of one STOCK Act bracket. Mirror of
@@ -158,12 +159,22 @@ export interface MemberPerfRow {
   spxAtFiling?: number | null;
   /**
    * Calendar days from the filing (or fallback) anchor to now. Used to
-   * annualize filing-date excess the same way as the Top Performers board
-   * (365.25 / max(30, elapsedDays)).
+   * annualize filing-date excess with the same formula the Top Performers
+   * board uses for its (reference-only) annualized figure: 365.25 /
+   * max(30, elapsedDays). Top Performers itself ranks by the non-annualized,
+   * winsorized avgExcess — see avgAnnualizedExcess below.
    */
   elapsedDaysSinceFiling?: number | null;
   /** Estimated trade volume in USD for size weighting. */
   estVolume?: number | null;
+  /** The day `currentPrice` is from (securities_ref.current_price_date). */
+  currentPriceDate?: string | null;
+  /**
+   * S&P 500 close on or before `currentPriceDate`, so the benchmark's exit leg
+   * ends on the SAME day as the asset's.  When absent the aggregate falls back to
+   * the single `currentSpx` it is handed (the pre-alignment behaviour).
+   */
+  spxNow?: number | null;
 }
 
 /**
@@ -186,11 +197,19 @@ export interface MemberPerfSummary {
   medianReturn: number | null;
   medianExcess: number | null;
   avgReturn: number | null;
+  /**
+   * Size-weighted average excess return. On the filing-date leg this is the
+   * SAME statistic Top Performers ranks and displays by (though this
+   * per-member computation is not asset-class filtered or winsorized the way
+   * the leaderboard SQL is — see buildMemberPerformanceLeaderboardQuery).
+   */
   avgExcess: number | null;
   /**
    * Equal-weighted average of annualized excess returns. Present on the
-   * filing-date leg so it matches Top Performers' ranking metric; null when
-   * no scored excess or when this leg does not annualize.
+   * filing-date leg using the same formula as Top Performers' reference-only
+   * annualized figure; NOT the ranking metric (Top Performers ranks by the
+   * non-annualized avgExcess above). Null when no scored excess or when this
+   * leg does not annualize.
    */
   avgAnnualizedExcess?: number | null;
 }
@@ -203,7 +222,8 @@ export interface MemberDualPerformance {
   tradeDate: MemberPerfSummary;
   /**
    * Copy-trade: if you bought when the disclosure went public. Buys only.
-   * Includes avgAnnualizedExcess aligned with Top Performers.
+   * filingDate.avgExcess is the same statistic Top Performers displays/sorts
+   * by; avgAnnualizedExcess is reference-only (see MemberPerfSummary above).
    */
   filingDate: MemberPerfSummary;
 }
@@ -248,7 +268,13 @@ function rowAnchors(
 export function aggregateMemberPerformance(
   rows: MemberPerfRow[],
   currentSpx: number | null,
-  opts: { anchor?: PerfAnchor; buysOnly?: boolean; annualize?: boolean } = {},
+  opts: {
+    anchor?: PerfAnchor;
+    buysOnly?: boolean;
+    annualize?: boolean;
+    /** Skip trades whose current price is older than this YYYY-MM-DD bar. */
+    priceFreshThrough?: string;
+  } = {},
 ): MemberPerfSummary {
   const anchor = opts.anchor ?? 'trade';
   const buysOnly = opts.buysOnly === true;
@@ -260,11 +286,14 @@ export function aggregateMemberPerformance(
   const annualized: number[] = [];
   const weights: number[] = [];
 
+  const freshThrough = opts.priceFreshThrough?.slice(0, 10);
   for (const r of considered) {
     if (r.isOption) continue;
+    // A missing date is stale, same as the price-anchor SQL and evaluateCurrentPriceStaleness.
+    if (freshThrough && !isCurrentPriceFresh(r.currentPriceDate, freshThrough)) continue;
     const { priceAt, spxAt } = rowAnchors(r, anchor);
     if (priceAt == null || r.currentPrice == null) continue;
-    const perf = computePerformance(priceAt, r.currentPrice, spxAt, currentSpx);
+    const perf = computePerformance(priceAt, r.currentPrice, spxAt, r.spxNow ?? currentSpx);
     if (perf.assetReturn == null) continue;
     returns.push(perf.assetReturn);
     
@@ -321,16 +350,19 @@ export function aggregateMemberPerformance(
 export function aggregateMemberDualPerformance(
   rows: MemberPerfRow[],
   currentSpx: number | null,
+  opts: { priceFreshThrough?: string } = {},
 ): MemberDualPerformance {
   const buyCount = rows.filter(isBuyRow).length;
+  const perfOpts = { priceFreshThrough: opts.priceFreshThrough };
   return {
     side: 'buys',
     buyCount,
-    tradeDate: aggregateMemberPerformance(rows, currentSpx, { anchor: 'trade', buysOnly: true }),
+    tradeDate: aggregateMemberPerformance(rows, currentSpx, { anchor: 'trade', buysOnly: true, ...perfOpts }),
     filingDate: aggregateMemberPerformance(rows, currentSpx, {
       anchor: 'filing',
       buysOnly: true,
       annualize: true,
+      ...perfOpts,
     }),
   };
 }

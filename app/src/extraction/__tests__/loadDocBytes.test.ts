@@ -10,6 +10,7 @@ describe('loadDocBytes', () => {
   function makeEnv(opts: {
     get?: (key: string) => Promise<unknown>;
     sourceUrl?: string | null;
+    firstSeenAt?: string | null;
   } = {}) {
     return {
       RAW_FILES: {
@@ -34,7 +35,7 @@ describe('loadDocBytes', () => {
                   extractor: null,
                   model_version: null,
                   confidence: null,
-                  first_seen_at: '2026-06-20',
+                  first_seen_at: 'firstSeenAt' in opts ? opts.firstSeenAt : '2026-06-20',
                   source_updated_at: null,
                   error: null,
                 };
@@ -77,6 +78,68 @@ describe('loadDocBytes', () => {
     expect('skip' in res).toBe(true);
     if ('skip' in res) {
       expect(res.skip.reason).toMatch(/source_url fetch HTTP 403/);
+    }
+  });
+
+  it('marks permanent 4xx skips non-retryable so capped recovery reaches review', async () => {
+    // Capped recovery keeps the lease and retries a retryable skip after
+    // expiry: a permanent 4xx marked retryable loops forever instead of
+    // reaching human review. Matches the ingestion fetcher's classification.
+    for (const status of [400, 401, 410]) {
+      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status, arrayBuffer: async () => new ArrayBuffer(0) })));
+      const env = makeEnv({ get: async () => null });
+      const res = await loadDocBytes(env, 'S-1', 'raw/S-1.pdf');
+      expect('skip' in res).toBe(true);
+      if ('skip' in res) {
+        expect(res.skip.reason).toMatch(new RegExp(`source_url fetch HTTP ${status}`));
+        expect(res.skip.retryable).toBe(false);
+      }
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('treats a 200 with an empty body as terminal, not retryable', async () => {
+    // Same capped-recovery loop as a permanent 4xx: a retryable empty body
+    // keeps the lease and retries forever instead of reaching human review.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0) })));
+    const env = makeEnv({ get: async () => null });
+    const res = await loadDocBytes(env, 'S-1', 'raw/S-1.pdf');
+    expect('skip' in res).toBe(true);
+    if ('skip' in res) {
+      expect(res.skip.reason).toMatch(/source_url empty body/);
+      expect(res.skip.retryable).toBe(false);
+    }
+  });
+
+  it('treats an old filing 404 as genuinely missing but retries a fresh one', async () => {
+    // A filing first seen months ago 404ing is gone for good.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0) })));
+    const stale = await loadDocBytes(makeEnv({ get: async () => null }), 'S-1', 'raw/S-1.pdf');
+    expect('skip' in stale && stale.skip.retryable).toBe(false);
+    vi.unstubAllGlobals();
+    // A filing first seen moments ago may simply not be published yet.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0) })));
+    const fresh = await loadDocBytes(
+      makeEnv({ get: async () => null, firstSeenAt: new Date().toISOString() }),
+      'S-1',
+      'raw/S-1.pdf',
+    );
+    expect('skip' in fresh && fresh.skip.retryable).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps transient statuses retryable', async () => {
+    // 403: the Clerk/eFD WAF answers request bursts with short-lived 403s
+    // (shouldRetryFetchStatus in src/ingestion/fetcher.ts).
+    for (const status of [403, 408, 425, 429, 500, 502, 503]) {
+      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status, arrayBuffer: async () => new ArrayBuffer(0) })));
+      const env = makeEnv({ get: async () => null });
+      const res = await loadDocBytes(env, 'S-1', 'raw/S-1.pdf');
+      expect('skip' in res).toBe(true);
+      if ('skip' in res) {
+        expect(res.skip.retryable).toBe(true);
+      }
+      vi.unstubAllGlobals();
     }
   });
 });

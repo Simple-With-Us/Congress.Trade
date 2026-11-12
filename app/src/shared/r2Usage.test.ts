@@ -3,6 +3,7 @@ import {
   buildSummary,
   classifyOps,
   fetchR2Usage,
+  formatOwnBackupRegimenLine,
   formatUsageMessage,
   R2_FREE_TIER,
   type R2OpsCount,
@@ -76,6 +77,14 @@ describe('buildSummary', () => {
   });
 });
 
+describe('formatOwnBackupRegimenLine', () => {
+  it('reports the configured 15m Litestream RPO', () => {
+    const line = formatOwnBackupRegimenLine();
+    expect(line).toContain('(15m sync');
+    expect(line).not.toContain('(5m sync');
+  });
+});
+
 describe('formatUsageMessage', () => {
   it('includes all three dimensions with percentages and pace', () => {
     const s = buildSummary(
@@ -96,6 +105,8 @@ describe('formatUsageMessage', () => {
     expect(msg).toContain('Class B ops: 17.5K (0.18% MTD, pace → 0.18% at month-end)');
     expect(msg).toContain('Status: OK — well within free tier');
     expect(msg).toContain('Backup:');
+    expect(msg).toContain('(15m sync');
+    expect(msg).not.toContain('(5m sync');
     expect(msg).toContain('Hetzner');
     // Own free tier under CT logo — no sent-from footer.
     expect(msg).not.toContain('(sent from');

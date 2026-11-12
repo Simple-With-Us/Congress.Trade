@@ -1,5 +1,9 @@
 # Review Queue autonomy restore (Deno tick + Infisical flag)
 
+> **Current shape (2026-08):** Deno Deploy and Turso are retired.  Production
+> is Coolify Deno-in-Docker + local SQLite.  This note is the 2026-07
+> Deploy-era autonomy restore.
+
 ## Summary
 
 Production review-queue autonomy had been dead since the Deno Deploy migration

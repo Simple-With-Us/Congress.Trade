@@ -273,7 +273,7 @@ describe("LAG_BUCKETS", () => {
     expect(LAG_BUCKETS[1]).toEqual({ label: "8-14d", max: 14 });
     expect(LAG_BUCKETS[2]).toEqual({ label: "15-30d", max: 30 });
     expect(LAG_BUCKETS[3]).toEqual({ label: "31-45d", max: 45 });
-    expect(LAG_BUCKETS[4]).toEqual({ label: "46-60d", max: 60 });
+    expect(LAG_BUCKETS[4]).toEqual({ label: "46-59d", max: 59 });
     expect(LAG_BUCKETS[5]).toEqual({ label: "60d+", max: null });
   });
 

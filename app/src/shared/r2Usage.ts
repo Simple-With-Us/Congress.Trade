@@ -253,12 +253,27 @@ export function resolveCongressPushoverAppToken(
   );
 }
 
-/** Own backup reminder: shallow R2 litestream + Hetzner ~24h volume floor. */
+/**
+ * Own backup reminder: three independent layers, coarsest last.
+ *
+ * 1. Continuous Litestream replication to B2, rebuilt 2026-08-12 as an
+ *    in-container replica (app/litestream.yml -> jays-congress-trade-eu,
+ *    prefix `congress-trade/`) after the Oracle->Hetzner migration dropped
+ *    the old host-level systemd unit that targeted R2. ~5m RPO.
+ * 2. The fleet cron's 6h full-DB snapshots, already running, written to the
+ *    SAME bucket under the disjoint prefix `hetzner/`. Litestream is layered
+ *    on top of these, not a replacement — the full snapshots stay as the
+ *    coarse, self-contained restore artifact that needs no LTX replay.
+ * 3. Hetzner volume snapshots, the ~24h floor.
+ *
+ * B2 has no free-tier kill switch (unlike the `raw/` filing-PDF object store,
+ * which still lives on R2), so `killEngaged` does not apply to this backup
+ * path; the parameter is kept for call-site compatibility and always reports
+ * the steady-state line.
+ */
 export function formatOwnBackupRegimenLine(killEngaged = false): string {
-  if (killEngaged) {
-    return 'Backup: R2 litestream paused (free-tier). Hetzner volume snapshots remain the ~24h PITR floor.';
-  }
-  return 'Backup: own litestream→R2 (15m/24h policy) + Hetzner ~24h volume floor.';
+  void killEngaged;
+  return 'Backup: litestream→B2 continuous (15m sync · 24h/168h snapshots) + 6h full-DB snapshots (fleet cron) + Hetzner ~24h volume floor.';
 }
 
 /** Compact message body for the Pushover notification. */

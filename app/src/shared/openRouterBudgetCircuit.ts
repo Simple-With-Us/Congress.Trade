@@ -36,6 +36,24 @@ export interface OpenRouterBudgetCircuitState {
   openUntilMs: number | null;
   lastError: string | null;
   updatedAtMs: number;
+  /**
+   * How many times this isolate has opened the circuit.  Files-prepaid /
+   * key-limit trips stay bounded: after MAX_TRANSIENT_OPENS the cool-down
+   * still applies once, then the circuit closes so extraction can auto-resume.
+   * Real depleted-credit / auth failures are not stored here — those halt
+   * autopilot fail-closed.
+   */
+  openCount: number;
+}
+
+/** Max transient (files-prepaid / key-limit) opens before we stop extending. */
+export const MAX_TRANSIENT_CIRCUIT_OPENS = 6;
+
+const FILES_PREPAID_RE = /balance for files|at least \$0\.50|openrouter_key_limit|files-endpoint prepaid/i;
+
+export function isTransientFilesPrepaidBudgetMessage(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return FILES_PREPAID_RE.test(message);
 }
 
 export interface OpenRouterBudgetCircuitKnobs {
@@ -80,6 +98,7 @@ function emptyState(nowMs: number): OpenRouterBudgetCircuitState {
     openUntilMs: null,
     lastError: null,
     updatedAtMs: nowMs,
+    openCount: 0,
   };
 }
 
@@ -101,6 +120,7 @@ export async function readOpenRouterBudgetCircuit(
         openUntilMs: null,
         lastError: parsed.lastError ?? null,
         updatedAtMs: nowMs,
+        openCount: Math.max(0, Number(parsed.openCount) || 0),
       };
     }
     return {
@@ -108,6 +128,7 @@ export async function readOpenRouterBudgetCircuit(
       openUntilMs,
       lastError: typeof parsed.lastError === 'string' ? parsed.lastError : null,
       updatedAtMs: typeof parsed.updatedAtMs === 'number' ? parsed.updatedAtMs : nowMs,
+      openCount: Math.max(0, Number(parsed.openCount) || 0),
     };
   } catch {
     return emptyState(nowMs);
@@ -163,32 +184,41 @@ export async function noteOpenRouterBudgetFailure(
 ): Promise<{ open: boolean; delaySeconds: number; consecutiveFailures: number }> {
   const knobs = await resolveOpenRouterBudgetCircuitKnobs(env);
   const prev = await readOpenRouterBudgetCircuit(env, nowMs);
+  const transient = isTransientFilesPrepaidBudgetMessage(detail);
   // If already open, refresh cool-down from now so a mid-cool-down hit extends
-  // the ban rather than allowing another burst immediately after.
+  // the ban rather than allowing another burst immediately after — except
+  // transient files/key-limit trips, which stay bounded and do not extend
+  // forever.
   if (prev.openUntilMs != null && prev.openUntilMs > nowMs) {
-    const openUntilMs = nowMs + knobs.cooldownSeconds * 1000;
+    const extend = !transient || prev.openCount < MAX_TRANSIENT_CIRCUIT_OPENS;
+    const openUntilMs = extend
+      ? nowMs + knobs.cooldownSeconds * 1000
+      : prev.openUntilMs;
     const state: OpenRouterBudgetCircuitState = {
       consecutiveFailures: prev.consecutiveFailures,
       openUntilMs,
       lastError: detail.slice(0, 300),
       updatedAtMs: nowMs,
+      openCount: prev.openCount,
     };
     await writeState(env, state, knobs.cooldownSeconds);
     return {
       open: true,
-      delaySeconds: knobs.cooldownSeconds,
+      delaySeconds: Math.max(1, Math.ceil((openUntilMs - nowMs) / 1000)),
       consecutiveFailures: prev.consecutiveFailures,
     };
   }
 
   const consecutiveFailures = prev.consecutiveFailures + 1;
-  const shouldOpen = consecutiveFailures >= knobs.tripAfter;
+  const shouldOpen = consecutiveFailures >= knobs.tripAfter
+    && (!transient || prev.openCount < MAX_TRANSIENT_CIRCUIT_OPENS);
   const openUntilMs = shouldOpen ? nowMs + knobs.cooldownSeconds * 1000 : null;
   const state: OpenRouterBudgetCircuitState = {
-    consecutiveFailures: shouldOpen ? consecutiveFailures : consecutiveFailures,
+    consecutiveFailures,
     openUntilMs,
     lastError: detail.slice(0, 300),
     updatedAtMs: nowMs,
+    openCount: shouldOpen ? prev.openCount + 1 : prev.openCount,
   };
   await writeState(env, state, knobs.cooldownSeconds);
   if (shouldOpen) {

@@ -13,10 +13,17 @@ import {
   deliverUsageTelemetryEvent,
 } from './shared/thirdPartyTelemetry.ts';
 import { persistUsageTelemetryFallback } from './shared/thirdPartyTelemetry.ts';
-import { reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { gateQueuedDelivery, isOutboxSuppressed, reconnectDeadLetteredOutbox } from './delivery/outbox.ts';
+import { readDeliveryMode } from './delivery/deliveryMode.ts';
 import { reconnectDeadLetteredIngestionOutbox } from './ingestion/outbox.ts';
+import { recordGenuineIngestFailure } from './ingestion/ingestFailureReviewQueue.ts';
+import {
+  ensureTerminalFailureReviewRow,
+  terminalFailureReason,
+} from './ingestion/terminalFailureReview.ts';
 import { executeQueuedCommand } from './client/commands.ts';
 import { updateCommandStatus } from './client/state.ts';
+import { sentryLoggerWarn } from './shared/sentryRuntime.ts';
 
 export async function handleIngestMessage(
   env: Env,
@@ -96,6 +103,18 @@ export async function handleDeliveryMessage(
   await lease?.assertOwned();
   switch (msg.type) {
     case 'delivery.dispatch': {
+      // Subscriber alert pause (CT_DELIVERY_MODE) for messages queued before
+      // the switch or by another producer.  Returning false acks the message
+      // without completing the outbox row (gateQueuedDelivery re-opens or
+      // suppresses it).  Throws if settings never booted, so it retries.
+      const mode = readDeliveryMode();
+      if (mode !== 'deliver') {
+        if (!msg.subscriptionId) await gateQueuedDelivery(env, msg.txId, mode);
+        return false;
+      }
+      // A row suppressed while its message sat in the queue stays unsent
+      // after delivery resumes: ack it without dispatching.
+      if (!msg.subscriptionId && (await isOutboxSuppressed(env, msg.txId))) return false;
       const result = lease
         ? await dispatchWebhook(env, msg, lease)
         : await dispatchWebhook(env, msg);
@@ -148,7 +167,10 @@ export async function handleDeadLetterMessage(
     // it completed — completing here permanently abandons the webhook.
     const recovered = await reconnectDeadLetteredOutbox(env, msg.txId, recoveryError.message);
     if (recovered.status === 'missing') {
-      console.warn(`delivery outbox missing for ${msg.txId}`);
+      sentryLoggerWarn('ingest.dead_letter', {
+        queue: 'delivery',
+        reason: 'outbox_missing',
+      });
     }
     return;
   }
@@ -171,7 +193,48 @@ export async function handleDeadLetterMessage(
     { reopenCompleted: msg.type !== 'filing.new' },
   );
   if (recovered.status === 'missing') {
-    console.warn(`ingestion outbox missing for ${msg.docId}`);
+    sentryLoggerWarn('ingest.dead_letter', {
+      queue: 'ingest',
+      reason: 'outbox_missing',
+    });
+    try {
+      const message =
+        `dlq: ingestion outbox missing (${queue}/${msg.type}): ${recoveryError.message}`;
+      await ensureTerminalFailureReviewRow(
+        env,
+        msg.docId,
+        terminalFailureReason('dlq', `${queue}/${msg.type} ${recoveryError.message}`),
+        message,
+        { source: 'dlq' },
+      );
+    } catch (err) {
+      console.error(`failed to enqueue review for ${msg.docId} after missing outbox:`, err);
+    }
+  }
+  if (recovered.status === 'failed') {
+    // VISIBLE TERMINAL STATE (autonomy diagnosis 2026-08-09, principle b):
+    // reconnectDeadLetteredIngestionOutbox exhausted its bounded dead-letter
+    // cycle budget and permanently gave up on this doc_id's outbox delivery
+    // — but that call only touches ingestion_outbox, never filings. Left
+    // alone, filings.ingest_status stays whatever mid-pipeline value it had
+    // (e.g. 'new'), so the filing looks silently stuck forever even though
+    // nothing will ever retry it again. Stamp it terminal here so it is both
+    // visible (pipelineHealth's ingestion_dead_letter check already counts
+    // ingestion_outbox status='failed'; this makes the *filing* itself
+    // equally visible) and excluded from every "why is this still pending"
+    // query. Never clobbers an already-terminal/resolved row.
+    try {
+      const terminalMsg =
+        `autonomy: ingestion outbox dead-letter budget exhausted (${queue}/${msg.type}): ${recoveryError.message}`;
+      await recordGenuineIngestFailure(env, msg.docId, terminalMsg.slice(0, 1000), {
+        source: 'ingest_dlq',
+        stage: 'ingest',
+        filingAlreadyStamped: false,
+        preserveTerminalStatus: true,
+      });
+    } catch (err) {
+      console.error(`failed to terminalize filing ${msg.docId} after outbox dead-letter:`, err);
+    }
   }
 }
 
@@ -207,7 +270,8 @@ export async function handleLocalWaitCheck(
   if (!row) return;
 
   if (row.ingest_status === 'extraction_pending_local') {
-    const isExpired = !row.local_wait_expires_at || new Date(row.local_wait_expires_at).getTime() <= Date.now();
+    const expiresMs = row.local_wait_expires_at ? new Date(row.local_wait_expires_at).getTime() : NaN;
+    const isExpired = !row.local_wait_expires_at || Number.isNaN(expiresMs) || expiresMs <= Date.now();
     if (isExpired) {
       await lease?.assertOwned();
       await run(
@@ -219,6 +283,26 @@ export async function handleLocalWaitCheck(
       );
       await lease?.assertOwned();
       await env.INGEST_QUEUE.send({ type: 'filing.extracted', docId });
+    } else {
+      // LOST-WAKEUP FIX (autonomy diagnosis 2026-08-09): this check fired
+      // early — classifyFiling's own delayed message landed before
+      // local_wait_expires_at, because a later re-classification pushed the
+      // expiry out further. Without this branch the message silently no-ops
+      // here and NOTHING is ever scheduled again: the filing is stranded in
+      // extraction_pending_local until the periodic ceiling sweep
+      // (autonomySweeps.ts, 24h backstop) eventually rescues it. Re-enqueue a
+      // follow-up check for the remaining wait instead, so the fast path
+      // (local vision worker finishing on time) keeps working within
+      // seconds of the real expiry rather than hours later.  The wait
+      // window itself is now `LOCAL_VISION_WAIT_MINUTES` (2 min per
+      // 2026-09-04 owner rule — was 15).
+      const remainingMs = expiresMs - Date.now();
+      const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
+      await lease?.assertOwned();
+      await env.INGEST_QUEUE.send(
+        { type: 'filing.local_wait_check', docId },
+        { delaySeconds: remainingSeconds },
+      );
     }
   }
 }

@@ -26,14 +26,25 @@ afterEach(() => {
   db.close();
 });
 
-function insertFiler(row: { id: string; fullName: string; chamber: string; state: string; party?: string | null; photoUrl?: string | null }) {
-  db.prepare(`INSERT INTO filers (bioguide_id, chamber, full_name, party, state, photo_url) VALUES (?, ?, ?, ?, ?, ?)`).run(
+function insertFiler(row: {
+  id: string;
+  fullName: string;
+  chamber: string;
+  state: string;
+  party?: string | null;
+  photoUrl?: string | null;
+  displayName?: string | null;
+}) {
+  db.prepare(
+    `INSERT INTO filers (bioguide_id, chamber, full_name, party, state, photo_url, display_name) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
     row.id,
     row.chamber,
     row.fullName,
     row.party ?? null,
     row.state,
     row.photoUrl ?? null,
+    row.displayName ?? null,
   );
 }
 
@@ -53,7 +64,14 @@ async function getMembers() {
   const res = await app.request('http://localhost/members', {}, env);
   expect(res.status).toBe(200);
   return (await res.json()) as {
-    members: Array<{ filerId: string; fullName: string | null; party: string | null; txCount: number; photoUrl: string | null }>;
+    members: Array<{
+      filerId: string;
+      fullName: string | null;
+      party: string | null;
+      txCount: number;
+      photoUrl: string | null;
+      title: string | null;
+    }>;
     count: number;
   };
 }
@@ -148,5 +166,50 @@ describe('GET /members', () => {
     const body = await getMembers();
     const row = body.members.find((m) => m.filerId === 'house-tx10-jane-smith');
     expect(row?.txCount).toBe(1); // still excludes the deprecated row
+  });
+
+  it('prefers display_name over full_name when both are set (COALESCE switch)', async () => {
+    insertFiler({
+      id: 'senate-bernie-moreno',
+      fullName: 'Bernardo Moreno',
+      chamber: 'senate',
+      state: 'OH',
+      displayName: 'Bernie Moreno',
+    });
+    insertTx('senate-bernie-moreno');
+
+    const body = await getMembers();
+    const row = body.members.find((m) => m.filerId === 'senate-bernie-moreno');
+    expect(row?.fullName).toBe('Bernie Moreno');
+  });
+
+  it('falls back to full_name when display_name is not set', async () => {
+    insertFiler({ id: 'house-tx10-jane-smith', fullName: 'Jane Smith', chamber: 'house', state: 'TX' });
+    insertTx('house-tx10-jane-smith');
+
+    const body = await getMembers();
+    const row = body.members.find((m) => m.filerId === 'house-tx10-jane-smith');
+    expect(row?.fullName).toBe('Jane Smith');
+  });
+
+  it('surfaces a curated title for a known executive filer, null for a House/Senate filer', async () => {
+    insertFiler({ id: 'EXEC-BESSENT', fullName: 'Scott Bessent', chamber: 'executive', state: 'DC', party: 'R' });
+    insertFiler({ id: 'house-tx10-jane-smith', fullName: 'Jane Smith', chamber: 'house', state: 'TX' });
+    insertTx('EXEC-BESSENT');
+    insertTx('house-tx10-jane-smith');
+
+    const body = await getMembers();
+    const byId = new Map(body.members.map((m) => [m.filerId, m]));
+    expect(byId.get('EXEC-BESSENT')?.title).toBe('Treasury Secretary');
+    expect(byId.get('house-tx10-jane-smith')?.title).toBeNull();
+  });
+
+  it('falls back to "Executive Branch" for an EXEC-* filer with no curated title', async () => {
+    insertFiler({ id: 'EXEC-UNCURATED-TEST', fullName: 'Some Nominee', chamber: 'executive', state: 'DC' });
+    insertTx('EXEC-UNCURATED-TEST');
+
+    const body = await getMembers();
+    const row = body.members.find((m) => m.filerId === 'EXEC-UNCURATED-TEST');
+    expect(row?.title).toBe('Executive Branch');
   });
 });

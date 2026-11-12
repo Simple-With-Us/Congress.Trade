@@ -1,6 +1,6 @@
 # 2026-08-08 — CT self-hosted runners now live on the Hetzner fleet box
 
-**The Oracle host (141.148.182.224) is DECOMMISSIONED.** Do not ssh to it, do
+**The Oracle host (<ORACLE_IP_RETIRED>) is DECOMMISSIONED.** Do not ssh to it, do
 not diagnose "the box is down" against it, and treat any doc that names it as
 historical. Owner confirmation 2026-08-08: "Oracle isn't being used anymore.
 Need to ssh to the Hetzner server."
@@ -9,7 +9,7 @@ Need to ssh to the Hetzner server."
 
 | Thing | Value |
 |---|---|
-| Host | `fleet-hetzner-nbg1` — 167.233.254.55 (x86_64, 8 cores, 15 GiB) |
+| Host | `fleet-hetzner-nbg1` — <PROD_ORIGIN_IP> (x86_64, 8 cores, 15 GiB) |
 | SSH | `ssh coolify` (alias in ~/.ssh/config; also `host.jays.services`, `fleet-hetzner-nbg1`) |
 | Runners | `hetzner-ct-ci-1`, `hetzner-ct-ci-2` — classic tarball installs, NOT docker |
 | Dirs | `/opt/actions-runner-ct-{1,2}`, owned by user `ghrunner` |

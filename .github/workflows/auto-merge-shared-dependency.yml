@@ -1,17 +1,35 @@
 name: Auto-merge congress-trading-shared PRs
 
+# Same-repo vendor bumps of congress-trading-shared. The package repo is
+# public and this app vendors it from app/vendor/congress-trading-shared,
+# so deploy and CI do not need GH_PAT. Do not add GH_PAT or SHEPHERD_TOKEN.
+#
+# pull_request (not pull_request_target): the job runs the PR's own
+# workflow with the default pull_request token. Combined with the same-repo
+# guard below, fork PRs never get contents:write and never auto-merge.
+# That matters because required typecheck used to skip on forks, and GitHub
+# treats a skipped required check as satisfied.
+#
+# Do not arm GitHub auto-merge with GITHUB_TOKEN. That merges as
+# github-actions[bot] and GitHub's recursion guard suppresses every
+# post-merge workflow on main (CI, Security, effort sync, iOS ship).
+# Land same-repo bumps with the owner's credentials:
+#   gh pr merge <n> --squash --auto
+
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened, labeled, ready_for_review]
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.draft == false
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Check if PR updates congress-trading-shared
         id: check
@@ -28,11 +46,23 @@ jobs:
           fi
           echo "is_shared=$IS_SHARED" >> "$GITHUB_OUTPUT"
 
-      - name: Enable auto-merge
+      - name: Do not arm auto-merge
         if: steps.check.outputs.is_shared == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
-          echo "Enabling auto-merge for $PR_URL"
-          gh pr merge --auto --squash --delete-branch "$PR_URL" || echo "Auto-merge already set or failed."
+          set -uo pipefail
+          echo "::notice::Same-repo congress-trading-shared bump. Not arming auto-merge."
+          echo "::notice::Land it with: gh pr merge $PR_URL --squash --auto"
+          {
+            echo "### Auto-merge not armed"
+            echo
+            echo "congress-trading-shared is public and vendored here."
+            echo "This workflow does not add or use \`GH_PAT\`."
+            echo
+            echo "Land this same-repo bump with the owner's credentials:"
+            echo
+            echo '```'
+            echo "gh pr merge $PR_URL --squash --auto"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -2,7 +2,7 @@
 /**
  * Vendor-era shared-package pin check for Congress.Trade.
  *
- * CT no longer npm-installs @jaywedgeworth22/congress-trading-shared. Deno
+ * CT no longer npm-installs from git; the @jaywedgeworth22/congress-trading-shared import map points at vendor/. Deno
  * resolves it from app/vendor/congress-trading-shared (see VENDOR-PROVENANCE.md).
  * Peer apps (Socratic.Trade, Usage-Monitor) still npm-pin the git tag.
  *
@@ -25,8 +25,8 @@ const PKG = "@jaywedgeworth22/congress-trading-shared";
 const PROVENANCE_PATH = join(ROOT, "app/vendor/congress-trading-shared/VENDOR-PROVENANCE.md");
 const VENDOR_PKG_PATH = join(ROOT, "app/vendor/congress-trading-shared/package.json");
 const PEERS = [
-  { repo: "jaywedgeworth22/Socratic.Trade", lockPath: "package-lock.json" },
-  { repo: "jaywedgeworth22/API-usage-monitor", lockPath: "package-lock.json" },
+  { repo: "Simple-With-Us/Socratic-Trade", lockPath: "package-lock.json" },
+  { repo: "Simple-With-Us/Usage-Monitor", lockPath: "package-lock.json" },
 ];
 
 function read(path) {

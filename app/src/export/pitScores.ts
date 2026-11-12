@@ -459,7 +459,7 @@ async function loadTransactions(env: Env, q: PitScoreQuery): Promise<TxRow[]> {
     `t.asset_type, t.asset_type_name, t.tx_type, t.amount_min, t.amount_max, t.is_option, ` +
     `t.raw_text, t.confidence, t.source, t.created_at, ` +
     `f.filed_date, f.first_seen_at, f.source_url, f.chamber AS filing_chamber, ` +
-    `fl.full_name, fl.chamber AS filer_chamber, fl.party, fl.state, fl.committees, ` +
+    `COALESCE(fl.display_name, fl.full_name) AS full_name, fl.chamber AS filer_chamber, fl.party, fl.state, fl.committees, ` +
     `sr.company_name, sr.sector, sr.industry, sr.asset_class, sr.cik, sr.exchange_short ` +
     `FROM transactions t ` +
     `LEFT JOIN filings f ON f.doc_id = t.doc_id ` +

@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Congress.Trade social card</title>
+<!--
+  Parameterised 1200x630 Open Graph / social share card.
+
+  Rendered by scripts/render-og-cards.sh with headless Chrome:
+    file://.../scripts/og-card.html?v=politician|company|trends|default
+
+  Design rules (owner spec, 2026-08-10):
+    - near-white background, 1px hairline border for containment
+    - brand lockup centred in the upper third, never recoloured or stretched
+    - small uppercase eyebrow label (NOT a headline)
+    - abstract "stacked pages of the product" graphic below, built from real
+      UI primitives (KPI tiles, buy/sell pills, trade rows, filter pills)
+    - grey placeholder bars only: never fake names, tickers or dollar amounts
+    - everything chunky enough to survive a 3x downscale to a chat thumbnail,
+      so the back sheets carry no interior detail and colour is used sparingly
+-->
+<style>
+  :root{
+    --line:#E4E7EC;
+    --line-soft:#EDF0F4;
+    --edge:#DFE3E9;
+    --sheet:#F6F8FB;
+    --label:#6B7280;
+    --bar:#DCE1E8;
+    --bar-strong:#BCC4D0;
+    --bar-soft:#E9ECF1;
+    --chip:#EDF1F6;
+    --chip-bar:#A2ACBB;
+    --green:#16A34A;
+    --red:#DC2626;
+    --neutral:#CBD2DC;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#fff}
+  body{
+    width:1200px;height:630px;overflow:hidden;background:#fff;
+    font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .card{
+    position:relative;width:1200px;height:630px;background:#fff;
+    border:1px solid var(--edge);overflow:hidden;
+  }
+
+  .lockup{display:block;margin:44px auto 0;width:648px}
+
+  .label{
+    margin-top:20px;text-align:center;text-transform:uppercase;
+    font-size:22px;font-weight:600;letter-spacing:.14em;text-indent:.07em;
+    color:var(--label);white-space:nowrap;
+  }
+
+  /* ---- stacked-pages stage -------------------------------------------
+     Depth comes from two tinted sheets peeking out at the sides. They carry
+     NO interior detail on purpose: at a 360px chat thumbnail any content in
+     a 70px sliver turns to noise, while a clean tinted edge still reads as
+     "there are more pages behind this one".                              */
+  .stage{position:absolute;left:0;top:258px;width:1200px;height:372px}
+
+  .panel{
+    position:absolute;background:#fff;border:1px solid var(--line);
+    border-radius:16px;
+    box-shadow:0 18px 36px -18px rgba(15,23,42,.22), 0 1px 3px rgba(15,23,42,.05);
+  }
+
+  /* Rotation sign is deliberate: the OUTER edge of each sheet lifts, so each
+     sliver reads as a full page edge rather than a short tab. `top` is tuned
+     so even the lifted outer corner stays just below the front panel's top,
+     and `height` so the dropped INNER corner stays above its bottom. Break
+     either and the sheets stop reading as pages and become a grey shelf. */
+  .back{width:704px;height:280px;top:26px;background:var(--sheet);
+        border-color:var(--edge);overflow:hidden}
+  .back.l{left:96px;transform:rotate(3.4deg)}
+  .back.r{left:400px;transform:rotate(-3.4deg)}
+  .back .bhdr{height:54px;border-bottom:1px solid var(--edge)}
+
+  .front{width:864px;height:334px;left:168px;top:0;padding:26px 28px;
+         display:flex;flex-direction:column}
+
+  /* ---- primitives ---------------------------------------------------- */
+  .bar{height:14px;border-radius:7px;background:var(--bar)}
+  .bar.s{background:var(--bar-strong)}
+  .bar.f{background:var(--bar-soft)}
+  .rule{height:1px;background:var(--line);flex:none}
+  .grow{flex:1 1 auto}
+  .row{display:flex;align-items:center;flex:none}
+
+  .avatar{width:66px;height:66px;border-radius:50%;background:#DFE4EB;flex:none}
+
+  .chip{
+    display:flex;align-items:center;justify-content:center;
+    height:34px;border-radius:10px;background:var(--chip);flex:none;
+  }
+  .chip i{display:block;height:11px;border-radius:6px;background:var(--chip-bar)}
+  .chip.lg{height:44px;border-radius:12px}
+  .chip.lg i{height:14px}
+
+  .pill{height:26px;border-radius:13px;flex:none}
+  .pill.buy{background:var(--green)}
+  .pill.sell{background:var(--red)}
+
+  .tile{
+    flex:1 1 0;height:96px;border-radius:14px;background:var(--sheet);
+    border:1px solid var(--line-soft);padding:18px 20px;
+    display:flex;flex-direction:column;justify-content:space-between;
+  }
+
+  .chart{display:flex;align-items:flex-end;gap:20px;flex:none}
+  .chart b{display:block;width:34px;border-radius:5px 5px 2px 2px;background:var(--neutral)}
+  .chart b.up{background:var(--green)}
+  .chart b.dn{background:var(--red)}
+  .axis{height:2px;background:var(--line);border-radius:1px;flex:none}
+
+  /* Buy-vs-sell comparison: two measured bars, not a progress meter. */
+  .cmp{display:flex;align-items:center;gap:18px;height:22px}
+  .cmp em{display:block;height:22px;border-radius:11px}
+
+  /* LEGALCOMPLIANCE-04 / CT-1336: non-affiliation on share-card art. */
+  .share-disclaimer{
+    position:absolute;left:0;right:0;bottom:14px;margin:0;
+    text-align:center;font-size:13px;font-weight:500;letter-spacing:.02em;
+    color:var(--label);padding:0 48px;line-height:1.35;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <img class="lockup" alt="">
+  <div class="label"></div>
+  <div class="stage">
+    <div class="panel back l"></div>
+    <div class="panel back r"></div>
+    <div class="panel front"></div>
+  </div>
+  <p class="share-disclaimer" id="og-share-disclaimer">Not affiliated with the U.S. Congress or any government agency.</p>
+</div>
+
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var variant = q.get('v') || 'default';
+  var lockup = q.get('lockup') || '../docs/brand/assets/eagle-lockup-transparent.png';
+
+  var LABELS = {
+    'default': 'Public financial disclosures',
+    'politician': 'Politician profile',
+    'company': 'Company profile',
+    'trends': 'Trends'
+  };
+
+  function bar(w, h, cls) {
+    return '<div class="bar ' + (cls || '') + '" style="width:' + w + 'px' +
+      (h ? ';height:' + h + 'px' : '') + '"></div>';
+  }
+  function chip(w, inner, cls) {
+    return '<div class="chip ' + (cls || '') + '" style="width:' + w + 'px">' +
+      '<i style="width:' + inner + 'px"></i></div>';
+  }
+  function pill(w, dir) {
+    return '<div class="pill ' + dir + '" style="width:' + w + 'px"></div>';
+  }
+  function gap(h) { return '<div style="height:' + h + 'px;flex:none"></div>'; }
+
+  function tiles(specs) {
+    return '<div class="row" style="gap:22px">' + specs.map(function (s) {
+      return '<div class="tile">' + bar(s[0], 12) + bar(s[1], 21, 's') + '</div>';
+    }).join('') + '</div>';
+  }
+
+  /** Buy/sell columns. `spec` is [height, 'up'|'dn'|''] so the mix is
+      deliberate rather than an arbitrary modulo pattern. */
+  function chart(spec, h) {
+    var bars = spec.map(function (s) {
+      return '<b class="' + s[1] + '" style="height:' + Math.round(s[0] * h) + 'px"></b>';
+    }).join('');
+    var w = spec.length * 34 + (spec.length - 1) * 20;
+    // Tick bars sit on the same 34/20 rhythm as the columns, so they read as
+    // axis labels instead of as a detached row of specks.
+    var ticks = spec.map(function () {
+      return '<div class="bar f" style="width:34px;height:9px"></div>';
+    }).join('');
+    return '<div style="width:' + w + 'px;margin:0 auto">' +
+      '<div class="chart">' + bars + '</div>' +
+      '<div class="axis" style="margin-top:10px"></div>' +
+      '<div class="chart" style="margin-top:12px">' + ticks + '</div></div>';
+  }
+
+  /** One trade row: ticker chip, asset-name bar, amount bar, buy/sell pill. */
+  function traderow(nameW, amtW, dir, h) {
+    return '<div class="row" style="gap:20px;height:' + (h || 52) + 'px">' +
+      chip(78, 42) + bar(nameW, 14) + '<div class="grow"></div>' +
+      bar(amtW, 15, 's') + pill(60, dir) + '</div>';
+  }
+
+  function filters() {
+    return '<div class="row" style="gap:16px;height:40px">' +
+      chip(112, 60) + chip(94, 46) + chip(132, 74) +
+      '<div class="grow"></div>' + chip(76, 38) + '</div>';
+  }
+
+  var FRONT = {
+    // Politician: profile header (avatar + name + district chip) over trades.
+    politician: function () {
+      return '' +
+        '<div class="row" style="gap:22px;height:66px">' +
+          '<div class="avatar"></div>' +
+          '<div>' + bar(236, 19, 's') + gap(13) + bar(154, 13) + '</div>' +
+          '<div class="grow"></div>' +
+          chip(146, 90, 'lg') +
+        '</div>' +
+        gap(20) + '<div class="rule"></div>' + gap(16) +
+        traderow(266, 92, 'buy') +
+        traderow(212, 74, 'sell') +
+        traderow(290, 104, 'buy');
+    },
+
+    // Company: ticker header, KPI tiles, buy/sell mix bar with a key.
+    company: function () {
+      return '' +
+        '<div class="row" style="gap:22px;height:56px">' +
+          chip(122, 74, 'lg') + bar(248, 17, 's') +
+          '<div class="grow"></div>' + pill(88, 'buy') +
+        '</div>' +
+        gap(22) + tiles([[62, 116], [78, 94], [58, 130]]) + gap(28) +
+        '<div class="cmp">' + bar(58, 12) +
+          '<em style="width:432px;background:var(--green)"></em>' +
+          '<div class="grow"></div>' + bar(92, 14, 's') + '</div>' +
+        gap(16) +
+        '<div class="cmp">' + bar(46, 12) +
+          '<em style="width:264px;background:var(--red)"></em>' +
+          '<div class="grow"></div>' + bar(74, 14, 's') + '</div>';
+    },
+
+    // Trends: filter pills over a buy/sell volume chart.
+    trends: function () {
+      return filters() + gap(30) +
+        chart([
+          [0.52, 'up'], [0.34, 'dn'], [0.71, 'up'], [0.44, 'up'], [0.86, 'dn'],
+          [0.38, 'up'], [0.63, 'up'], [1.00, 'up'], [0.49, 'dn'], [0.76, 'up'],
+          [0.41, 'up']
+        ], 150);
+    },
+
+    // Default (home): stat strip over the trades table.
+    'default': function () {
+      return '' +
+        tiles([[66, 122], [82, 96], [58, 134]]) +
+        gap(24) +
+        traderow(258, 92, 'buy', 50) +
+        traderow(306, 78, 'sell', 50) +
+        traderow(224, 110, 'buy', 50);
+    }
+  };
+
+  document.querySelector('.lockup').src = lockup;
+  document.querySelector('.label').textContent = LABELS[variant] || LABELS['default'];
+  document.querySelectorAll('.back').forEach(function (el) {
+    el.innerHTML = '<div class="bhdr"></div>';
+  });
+  document.querySelector('.front').innerHTML = (FRONT[variant] || FRONT['default'])();
+  document.documentElement.setAttribute('data-variant', variant);
+})();
+</script>
+</body>
+</html>

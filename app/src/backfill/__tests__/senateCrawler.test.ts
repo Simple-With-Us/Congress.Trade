@@ -253,6 +253,27 @@ describe('runSenateBackfill', () => {
     ]);
   });
 
+  it('threads env.SENATE_RELAY_URL explicitly into every source query (2026-08-09 regression)', async () => {
+    // Relying on fetchSenatePtrFilings's own process.env fallback proved
+    // unreliable in production: Imperva blocks the box's IP, and calls that
+    // depended solely on the ambient process.env read intermittently took the
+    // direct (non-relay) path and hit the block even with the container env
+    // var correctly set. The fix is to thread env.SENATE_RELAY_URL explicitly
+    // on every call so it never depends on ambient global state.
+    const { env } = fakeEnv({ SENATE_RELAY_URL: 'http://10.0.2.1:8900' });
+    const seenRelayUrls: (string | undefined)[] = [];
+    await runSenateBackfill(env, {
+      fromDate: '2024-01-01',
+      toDate: '2024-01-31',
+      fetchFilingsImpl: fetcher(async (opts) => {
+        seenRelayUrls.push(opts.relayUrl);
+        return [];
+      }),
+    });
+    expect(seenRelayUrls).not.toHaveLength(0);
+    expect(seenRelayUrls.every((u) => u === 'http://10.0.2.1:8900')).toBe(true);
+  });
+
   it('stops source discovery once the new-filing budget is satisfied', async () => {
     const { env } = fakeEnv();
     const calls: string[] = [];

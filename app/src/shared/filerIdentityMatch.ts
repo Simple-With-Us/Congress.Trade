@@ -29,6 +29,8 @@
  * earlier forks already sitting in `filers`).
  */
 
+import { fallbackCleanDisplayName } from '../enrichment/identitySync.ts';
+
 /** Tokens dropped as generational suffixes once middle initials are gone. */
 const NAME_SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv']);
 
@@ -84,4 +86,26 @@ export function sameFilerIdentity(a: FilerIdentityCandidate, b: FilerIdentityCan
   if (!keyA || !keyB) return false;
 
   return keyA === keyB;
+}
+
+/**
+ * Name-match key for `chamber='executive'` filers only. Executive disclosure
+ * rows carry no state (see the doc comment above — {@link sameFilerIdentity}
+ * fails closed on a blank state, which means it can NEVER match two exec
+ * rows to each other), so admin/filerIdentityDedupe.ts's exec pass uses this
+ * narrower key instead: chamber-scoped by the caller (never applied outside
+ * `chamber='executive'`), state is not consulted at all.
+ *
+ * Reuses enrichment/identitySync.ts's `fallbackCleanDisplayName` (the same
+ * cleanup identity sync already applies when computing a display name for a
+ * filer that never resolves to a bioguide) to strip ERM markers, bare years,
+ * and dotted/dashed date fragments — the noise that forks one real person
+ * into several exec filer rows, e.g. "Barbara M Barrett" vs "Barbara M
+ * Barrett 2021 ERM" vs "Alice Albright 10.24..2022" — then reduces the
+ * cleaned name the same way {@link memberNameMatchKey} does (drop middle
+ * initials/generational suffixes). Returns '' (never a wildcard) when the
+ * cleaned name doesn't reduce to at least two tokens.
+ */
+export function execNameMatchKey(raw: string | null | undefined): string {
+  return memberNameMatchKey(fallbackCleanDisplayName(raw));
 }

@@ -16,22 +16,37 @@
 import type { Env, Filing, DocKind, Chamber, ParsedTx } from '../shared/types.ts';
 import type { DurableQueueLeaseContext } from '../deno/durableQueue.ts';
 import { get, run } from '../shared/db.ts';
+import { recordGenuineIngestFailure } from '../ingestion/ingestFailureReviewQueue.ts';
+import {
+  ensureTerminalFailureReviewRow,
+  PIPELINE_FAILURE_REASON,
+  unsettledNormalizeReason,
+} from '../ingestion/terminalFailureReview.ts';
 import {
   buildExtractorPipeline,
   type ExtractorModelRun,
+  type ExtractorParseDisposition,
   type ExtractorResult,
   type ExtractorUsage,
 } from '../extractors/types.ts';
-import { normalize } from './normalizer.ts';
+import { isDeterministicExtractor, normalize } from './normalizer.ts';
+import {
+  isOgeLocalOcrCandidate,
+  maybeRecoverOgeRowsViaLocalOcr,
+  ogeLocalOcrReviewPayload,
+  OGE_LOCAL_OCR_EXTRACTOR,
+} from './ogeLocalOcr.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
 import { enqueueAgreementCheck } from './agreement.ts';
 import { ensureDocClass } from './docClassifier.ts';
+import { evaluateExtractQuality, shouldEnqueueAgreement } from './extractRouting.ts';
 import { reportAiUsage } from '../shared/telemetry.ts';
 import {
   assertDocLlmSpendAllowed,
   isLlmDocBudgetHalt,
   LlmDocBudgetExceededError,
 } from '../shared/llmSpend.ts';
+import { ensureHouseFiledDateBeforeNormalize } from '../ingestion/houseFiledDate.ts';
 
 interface FilingRow {
   doc_id: string;
@@ -78,12 +93,11 @@ async function markError(
   message: string,
   lease?: DurableQueueLeaseContext,
 ): Promise<void> {
-  await lease?.assertOwned();
-  await run(
-    env.DB,
-    "UPDATE filings SET ingest_status = 'error', error = ? WHERE doc_id = ?",
-    [message.slice(0, 500), docId],
-  );
+  await recordGenuineIngestFailure(env, docId, message, {
+    source: 'orchestrator',
+    stage: 'extract',
+    lease,
+  });
 }
 
 function isProviderRateLimit(err: unknown): boolean {
@@ -176,24 +190,109 @@ export async function extractAndNormalize(
     await assertDocLlmSpendAllowed(env, docId);
   } catch (err) {
     if (err instanceof LlmDocBudgetExceededError || isLlmDocBudgetHalt(err)) {
+      const message = `orchestrator: doc llm budget exceeded: ${(err as Error).message}`;
       console.info(`orchestrator: skip paid extract for ${docId}: ${(err as Error).message}`);
+      await ensureTerminalFailureReviewRow(
+        env,
+        docId,
+        PIPELINE_FAILURE_REASON.extractBudget,
+        message,
+        { source: 'extract' },
+      );
       return;
     }
     throw err;
   }
-  const extracted = await extractParsed(env, docId, lease);
+  const extracted = await extractParsed(env, docId, lease, { keepBytes: true });
   if (!extracted) return; // missing row / raw object: already recorded as error.
 
   await lease?.assertOwned();
-  const result = await normalize(env, extracted.filing, extracted.transactions, {
-    extractor: extracted.extractor,
-    modelVersion: extracted.modelVersion ?? null,
+
+  try {
+    await ensureHouseFiledDateBeforeNormalize(env, extracted.filing, {
+      ocrText: extracted.raw,
+      relayUrl: env.HOUSE_RELAY_URL || env.INGEST_RELAY_URL,
+      signal: lease?.signal,
+    });
+  } catch (err) {
+    lease?.signal.throwIfAborted();
+    console.warn('orchestrator: house filed_date resolve failed:', docId, (err as Error).message);
+  }
+
+  // CT-2448: before the OGE path parks a 278-T as `oge_text_unreadable`,
+  // run the local tesseract pass over the stored PDF.  When both reads agree
+  // the recovered rows go through the same normalize() decision model as any
+  // other extraction; when they do not, the filing parks exactly as it does
+  // today and the park payload lists the rows that did not reconcile.
+  let ocrOutcome = null;
+  try {
+    ocrOutcome = await maybeRecoverOgeRowsViaLocalOcr(
+      env,
+      extracted.filing,
+      extracted.bytes ?? null,
+      extracted.parseDisposition,
+    );
+  } catch (err) {
+    console.warn('orchestrator: local OGE OCR retry failed:', docId, (err as Error).message);
+  }
+
+  const recovered = ocrOutcome?.status === 'rows' ? ocrOutcome : null;
+  const effective = recovered
+    ? {
+      ...extracted,
+      transactions: recovered.rows,
+      extractor: OGE_LOCAL_OCR_EXTRACTOR,
+      parseDisposition: 'rows' as ExtractorParseDisposition,
+    }
+    : extracted;
+
+  const result = await normalize(env, effective.filing, effective.transactions, {
+    extractor: effective.extractor,
+    modelVersion: effective.modelVersion ?? null,
+    sourceText: effective.raw,
+    parseDisposition: effective.parseDisposition,
+    reviewPayload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
   });
+
+  // A lost publish/review CAS returns without a queue row. The hourly sweep
+  // is the backstop; this lands the row on the attempt that noticed.
+  if (!result.published && !result.settled) {
+    try {
+      await ensureTerminalFailureReviewRow(
+        env,
+        docId,
+        unsettledNormalizeReason({
+          needsReview: result.needsReview,
+          reviewReason: result.reviewReason,
+        }),
+        result.reviewReason ?? 'normalize: publish did not commit',
+        { source: result.needsReview ? 'normalize' : 'publish' },
+      );
+    } catch (err) {
+      console.warn('orchestrator: terminal failure review enqueue failed:', docId, (err as Error).message);
+    }
+  }
 
   // Fast path: a doc that just landed in review gets a cross-vendor agreement
   // check enqueued immediately (self-gates on the flag; the per-minute cron is
   // the backstop). Best-effort — a failure here must not fail the extraction.
-  if (result.needsReview) {
+  //
+  // A2: never enqueue paid agreement for deterministic text/html/OGE extractors.
+  // Those either already published at the lower confidence gate (A1) or belong
+  // in human review for hard flags — OpenRouter quota must not be spent on them.
+  // Electronic / typed House PTRs and already-failed letterhead reads also skip
+  // the trio — do not spend more models on junk.
+  const quality = evaluateExtractQuality(extracted.transactions);
+  if (
+    result.needsReview
+    && !isDeterministicExtractor(extracted.extractor, extracted.filing.docKind)
+    && shouldEnqueueAgreement({
+      filing: extracted.filing,
+      extractor: extracted.extractor,
+      quality,
+      reviewReason: result.reviewReason,
+    })
+  ) {
     try {
       await lease?.assertOwned();
       await enqueueAgreementCheck(env, extracted.filing.docId, extracted.filing.rawObjectKey);
@@ -209,7 +308,12 @@ export interface ExtractedFiling {
   transactions: ParsedTx[];
   extractor: string;
   modelVersion: string | null;
+  /** Extractor raw text. Part 7 "None" is visible here when the parser yields 0 rows. */
+  raw: string;
   modelRuns?: ExtractorModelRun[];
+  parseDisposition?: ExtractorParseDisposition;
+  /** The stored raw PDF, when the caller asked for it (CT-2448 local OCR retry). */
+  bytes?: ArrayBuffer;
 }
 
 /**
@@ -224,7 +328,7 @@ export async function extractParsed(
   env: Env,
   docId: string,
   lease?: DurableQueueLeaseContext,
-  options?: { forceVision?: boolean }
+  options?: { forceVision?: boolean; keepBytes?: boolean }
 ): Promise<ExtractedFiling | null> {
   await lease?.assertOwned();
   const row = await get<FilingRow>(
@@ -323,19 +427,21 @@ export async function extractParsed(
   if (!extractor) {
     // Unknown / unsupported doc form (e.g. an ambiguous scan): no extractor, no
     // parsed rows. Callers decide what to do (normalize([]) routes to review).
-    return { filing, transactions: [], extractor: 'none', modelVersion: null };
+    return { filing, transactions: [], extractor: 'none', modelVersion: null, raw: '' };
   }
 
   const breakerName = extractor.circuitBreakerName ?? extractor.name;
-  // HousePdfExtractor tries deterministic text parsing first for text-layer
-  // filings. A vision-provider ban must not block that healthy path before it
-  // gets a chance to run; scanned PDFs still consult the concrete vision ban.
+  // HousePdfExtractor / OgePdfExtractor try deterministic text parsing first.
+  // A vision-provider ban must not block that healthy path before it gets a
+  // chance to run. OgePdf also needs the unpdf attempt on scanned_pdf
+  // (Burns-class misclassifications); its vision fallback is fail-soft.
   // ConfiguredVisionExtractor checks the concrete candidate provider before
   // each primary/failover attempt. The wrapper name is not a valid provider
   // scope, so never consult or write provider_ban:configuredVision here.
   const configuredVisionOwnsBreaker = extractor.name.includes('configuredVision');
   const checkBreaker = !configuredVisionOwnsBreaker
-    && !(extractor.name.startsWith('housePdf(') && filing.docKind === 'text_pdf');
+    && !(extractor.name.startsWith('housePdf(') && filing.docKind === 'text_pdf')
+    && !extractor.name.startsWith('ogePdf(');
   const breakerKey = `provider_ban:${breakerName}`;
   let isBanned: string | null = null;
   if (checkBreaker && env.CONFIG_KV) {
@@ -354,6 +460,15 @@ export async function extractParsed(
     await markError(env, docId, message, lease);
     throw new Error(message);
   }
+
+  // CT-2448: copy the PDF for the local OCR retry before the extractor runs.
+  // An extractor may detach the buffer it is handed (pdf.js takes ownership),
+  // which would leave the retry with an empty document.  Only copied when
+  // asked for AND the filing is an executive 278-T the pass can actually
+  // retry — every other extraction skips the duplicate buffer.  Readability
+  // is known only after extraction, so a 278-T with a text layer still pays
+  // for one unused copy; the admin reprocess path (no keepBytes) copies never.
+  const ocrBytes = options?.keepBytes && isOgeLocalOcrCandidate(filing) ? bytes.slice(0) : undefined;
 
   let result;
   try {
@@ -417,6 +532,11 @@ export async function extractParsed(
     transactions: result.transactions,
     extractor: result.extractor,
     modelVersion: result.modelVersion ?? null,
+    raw: result.raw ?? '',
     modelRuns: result.modelRuns,
+    parseDisposition: result.parseDisposition,
+    // CT-2448: the pre-extractor copy above, so the retry reads the full PDF
+    // even when an extractor detached the shared buffer it was handed.
+    bytes: ocrBytes,
   };
 }

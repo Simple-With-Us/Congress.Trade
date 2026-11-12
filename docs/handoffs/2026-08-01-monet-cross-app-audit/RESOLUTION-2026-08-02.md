@@ -26,7 +26,7 @@ Verification found the substance real but several claims false:
   test) + one-time diagnostic log when the read token is missing so the gate can never
   be silently dead again.
 - **CT prod Infisical: set `USAGE_MONITOR_READ_TOKEN`** (project
-  `f61a79de-8d77-4f0b-9361-4b7208598290`, env `prod`) — it was MISSING, so the gate
+  `<CT_INFISICAL_PROJECT_ID>`, env `prod`) — it was MISSING, so the gate
   would have been cleanly-disabled forever. Value = the verified working
   `USAGE_READ_TOKEN` from `~/.secrets/global-api-keys.env`. CT resolves Infisical at
   runtime (TTL cache) → no redeploy needed for the token itself.

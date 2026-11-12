@@ -51,6 +51,7 @@ export type IngestStatus =
   | 'extracted'
   | 'persisted'
   | 'needs_review'
+  | 'verified_empty'
   | 'error';
 
 /** Detected physical form of a disclosure document. */
@@ -111,6 +112,20 @@ export interface Filing {
   localWaitExpiresAt?: string | null;
 }
 
+/** One `trade_latency_candidates` row, already reduced to a single object. */
+export interface TradeLatencyRead {
+  provider: string | null;
+  /** `provider_first_seen_at`.  There is no `observed_at` column. */
+  observedAt: string | null;
+  providerPublishedAt: string | null;
+  congressFirstSeenAt: string | null;
+  /** `observedAt` minus `congressFirstSeenAt`, in seconds.  Not a stored column. */
+  providerDeltaSec: number | null;
+  /** `providerPublishedAt` minus `congressFirstSeenAt`, in seconds.  Not a stored column. */
+  providerPublishedDeltaSec: number | null;
+  status: string | null;
+}
+
 export interface Transaction {
   id: string;
   docId: string;
@@ -154,6 +169,8 @@ export interface Transaction {
   fullName?: string | null;
   /** Filer's state (e.g. 'CA') resolved from the filers table. */
   state?: string | null;
+  /** Filer party from the filers table (feed only; used for D/R/I rings and the iOS politician line). */
+  party?: string | null;
   /** Filer's headshot URL (unitedstates/images CDN); null = show initials. */
   photoUrl?: string | null;
   /**
@@ -167,8 +184,17 @@ export interface Transaction {
   pdfUrl?: string;
   /** Filing's official disclosure date (date-only) from the source. Feed only. */
   filedDate?: string | null;
-  /** When our watcher first saw the filing (timestamp). Feed only. */
+  /**
+   * When we first learned about this trade (feed only). Filing-index
+   * first-seen is used only when it does not predate the trade date;
+   * otherwise the persist time. Never a date before txDate.
+   */
   firstSeenAt?: string | null;
+  /**
+   * Delivery-only stamp: true when filed/first-seen is outside the default
+   * fresh window (webhook/SSE payloads). Absent on feed rows until stamped.
+   */
+  isBackfill?: boolean;
   /** Original public disclosure document URL. Feed only. */
   sourceUrl?: string | null;
   /**
@@ -179,6 +205,21 @@ export interface Transaction {
   disclosureLagDays?: number | null;
   /** STOCK Act 45-day classification of the disclosure lag; null = unknown. */
   stockActStatus?: StockActStatus | null;
+  /** Close on/before the trade date (`tx_performance.price_at_trade`).  Feed only. */
+  priceAtTrade?: number | null;
+  /** S&P close on that same trade anchor (`tx_performance.spx_at_trade`). */
+  spxAtTrade?: number | null;
+  /** Close on/before the filing date (`tx_performance.price_at_filing`). */
+  priceAtFiling?: number | null;
+  /** S&P close on that same filing anchor (`tx_performance.spx_at_filing`). */
+  spxAtFiling?: number | null;
+  /**
+   * One provider-race row for this trade.  Null when the feed selected the
+   * latency columns and no candidate matched.  Absent when the query did not
+   * select them (SSE and CSV).  `observedAt` is `provider_first_seen_at`.
+   * Deltas are computed the same way as GET /api/admin/disclosure-latency.
+   */
+  latency?: TradeLatencyRead | null;
   // --- Optional cross-referenced asset data (securities_ref; feed only) ------
   // Populated when the ticker has been enriched; null/absent otherwise.
   refCompanyName?: string | null;
@@ -212,8 +253,22 @@ export interface ParsedTx {
    * Source fields that were explicitly unreadable and were defaulted locally,
    * or provenance markers for the row itself (e.g. recovered from a truncated
    * provider response — see `salvageTruncatedTransactions` in visionLlm.ts).
+   *
+   * `band_amount_inferred` marks an amount bracket that parseAmountRange SNAPPED
+   * onto a canonical STOCK Act tier rather than matching one the document
+   * printed. On a checkbox-band form that means the band legend was not legible
+   * at the render resolution, so the tier is inferred, not read — CT-2415 Guard 2
+   * refuses it rather than emitting a plausible wrong number.
    */
-  extractionWarnings?: Array<'unreadable_is_option' | 'unreadable_cap_gains' | 'salvaged_truncated_output'>;
+  extractionWarnings?: Array<
+    | 'unreadable_is_option'
+    | 'unreadable_cap_gains'
+    | 'salvaged_truncated_output'
+    | 'band_amount_inferred'
+    | 'suspected_constant_tx_type'
+    | 'grid_type_unmarked'
+    | 'owner_unread'
+  >;
   /** Verbatim source text for this row, for audit/review. */
   rawText: string;
   /** Structured/detail text that belongs to this filing row, not page chrome. */
@@ -243,6 +298,11 @@ export interface SubscriptionFilters {
   sectors?: string[];
   /** Market-cap buckets to include (mega…nano, securities_ref.market_cap_bucket). */
   marketCapBuckets?: string[];
+  /**
+   * When true, deliver historical backfill rows too. Default (omitted/false) is
+   * fresh-only (filed or first-seen within seven days).
+   */
+  includeBackfill?: boolean;
 }
 
 export interface Subscription {
@@ -307,7 +367,9 @@ export type ClientCommandType =
   | 'unregister_device'
   | 'start_checkout'
   | 'request_export'
-  | 'redeem_apple_purchase';
+  | 'redeem_apple_purchase'
+  | 'link_apple_entitlement'
+  | 'delete_account';
 
 export type ClientCommandStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled';
 
@@ -344,6 +406,8 @@ export interface User {
   googleSub: string | null;
   /** Apple `sub` claim when the user has linked Sign in with Apple; null otherwise. */
   appleSub: string | null;
+  /** X (Twitter) `sub` / user ID when linked; null otherwise. */
+  xSub: string | null;
   emailVerified: boolean;
   createdAt: string;
   lastLoginAt: string | null;
@@ -389,8 +453,14 @@ export interface Entitlement {
    * resolveEntitlementAsync) that also checks the Apple IAP ledger; the pure
    * sync `entitlementOf` leaves this undefined. Additive/optional so it is
    * always backward-compatible for existing Decodable clients.
+   *
+   * `'apple_anonymous'` is the device-scoped grant issued by `POST
+   * /api/client/v1/entitlements/apple/redeem` (Guideline 5.1.1(v) — no
+   * Congress.Trade account) — it is never present on a `User`-keyed
+   * `resolveEntitlementAsync` response (which only ever resolves 'stripe' |
+   * 'apple' | null), only on the anonymous route's own response body.
    */
-  source?: 'stripe' | 'apple' | null;
+  source?: 'stripe' | 'apple' | 'apple_anonymous' | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -514,14 +584,16 @@ export interface ThirdPartyUsageTelemetryEvent {
 // ---------------------------------------------------------------------------
 
 export interface Env {
-  // --- Bindings (wrangler.toml) ---
+  // --- Bindings (Worker-shaped names; Deno shims them on Coolify) ---
   DB: D1Database;
   RAW_FILES: R2Bucket;
   INGEST_QUEUE: Queue<QueueMessage>;
   DELIVERY_QUEUE: Queue<QueueMessage>;
   CONFIG_KV: KVNamespace;
 
-  // Turso Database Credentials (resolved via Infisical)
+  // SQLite path.  Env names are Turso leftovers.  Production is
+  // `file:/data/congress-trade/db.sqlite` via Coolify / Infisical.
+  // Do not point these at libsql://…turso.io.  Deno Deploy is retired.
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
 
@@ -532,11 +604,11 @@ export interface Env {
   AWS_S3_BUCKET_NAME?: string;
   AWS_REGION?: string;
 
-  // --- Secrets (wrangler secret put / .dev.vars) ---
+  // --- Secrets (Infisical / Coolify env / local .dev.vars) ---
   /** Vision/text LLM key (e.g. Gemini) for scanned-PDF extraction. */
   GEMINI_API_KEY?: string;
   GEMINI_RPM_LIMIT?: string;
-  /** Primary vision model override (defaults to 'gemini-3.5-flash'). */
+  /** Primary vision model override (defaults to 'gemini-3.8-flash'). */
   VISION_PRIMARY_MODEL?: string;
   /** Secondary arbitration extractor key. Presence enables arbitration. */
   ARBITRATION_API_KEY?: string;
@@ -548,13 +620,13 @@ export interface Env {
   OPENAI_API_KEY?: string;
   /** Mistral API key — `mistral-ocr-latest` candidate in the extractor bake-off. */
   MISTRAL_API_KEY?: string;
-  /** xAI API key — Grok (Files API → grok-4.3) candidate in the extractor bake-off. */
+  /** xAI API key — Grok (Files API → grok-4.6) candidate in the extractor bake-off. */
   XAI_API_KEY?: string;
   /** OpenRouter API key — the unified transport for ALL live LLM extraction. */
   OPENROUTER_API_KEY?: string;
   /** Secondary OpenRouter API key for budget cap failover. */
   OPENROUTER_BACKUP_API_KEY?: string;
-  /** OpenRouter model override (defaults to 'google/gemini-3.5-flash'). */
+  /** OpenRouter model override (defaults to '~google/gemini-flash-latest'). */
   OPENROUTER_MODEL?: string;
   /** file-parser engine for typed/text PDFs (default 'cloudflare-ai' — free). */
   OPENROUTER_PDF_ENGINE_TEXT?: string;
@@ -652,8 +724,8 @@ export interface Env {
   FMP_RAPIDAPI_DAILY_CAP?: string;
   /** Daily FMP call budget (stringified int); defaults to 230 when unset. */
   FMP_DAILY_CALL_CAP?: string;
-  /** Shared FMP per-minute pacer ceiling (stringified int). Infisical-tunable. */
-  FMP_MAX_PER_MINUTE?: string;
+  /** Socratic.Trade peer-read pace (clamped to ST_PEER_SAFE_MAX_PER_MINUTE).  Infisical-tunable. */
+  ST_PEER_MAX_PER_MINUTE?: string;
   /** SEC EDGAR per-minute pacer ceiling (stringified int). Infisical-tunable. */
   EDGAR_MAX_PER_MINUTE?: string;
   /** Local-dev-only escape hatch: opens admin when the environment is not production. */
@@ -673,6 +745,8 @@ export interface Env {
   SENATE_MAX_LOOKBACK_DAYS?: string;
   /** Relay microservice URL (e.g. Oracle Coolify host) for Senate eFD ingestion. */
   SENATE_RELAY_URL?: string;
+  /** Bearer token for Mac scout.jays.services POST /fetch-ptr and /fetch-doc. */
+  SENATE_RELAY_SECRET?: string;
   /** Relay microservice URL (e.g. Oracle Coolify host) for House Clerk ingestion. */
   HOUSE_RELAY_URL?: string;
   /** Relay microservice URL (e.g. Oracle Coolify host) for Executive OGE ingestion. */
@@ -681,6 +755,14 @@ export interface Env {
   INGEST_RELAY_URL?: string;
   /** Proxy gateway URL for routing Senate eFD requests. */
   SENATE_PROXY_URL?: string;
+  /** Residential proxy URL (e.g. Tailscale http://100.113.106.39:3128) for all gov scraping/probing. */
+  RESIDENTIAL_PROXY_URL?: string;
+  RESIDENTIAL_PROXY_HOST?: string;
+  RESIDENTIAL_PROXY_PORT?: string;
+  RESIDENTIAL_PROXY_USERNAME?: string;
+  RESIDENTIAL_PROXY_PASSWORD?: string;
+  /** Consecutive residential-proxy probe failures before health_senate_relay reports down (default 3). */
+  RESIDENTIAL_PROXY_PROBE_FAILURE_THRESHOLD?: string;
   /** Enable Cloudflare Browser Rendering fallback (strictly capped to free tier). */
   SENATE_USE_BROWSER_RENDERING?: string;
   /** Enables the OGE executive-branch (278-T) filings watcher. Infisical-tunable. */
@@ -689,7 +771,10 @@ export interface Env {
   OGE_INDEX_URL?: string;
   /** CSV list of override URLs for OGE filings index views. */
   OGE_INDEX_URLS?: string;
-  /** Minimum seconds between OGE index polls (default 21600 = 6h). */
+  /**
+   * UNUSED live gate. Adaptive `probeSchedule` / `decideSourcePoll` owns
+   * executive cadence. A leftover Infisical 21600 must not re-impose 6h.
+   */
   OGE_POLL_INTERVAL_SEC?: string;
   /** Max raw PDF bytes sent to vision extraction for executive filings (default 6MB). */
   OGE_MAX_VISION_BYTES?: string;
@@ -699,6 +784,23 @@ export interface Env {
   DISCLOSURE_LATENCY_WATCH_ENABLED?: string;
   /** Enables the public-API anti-scraping guard (UA blocklist + per-IP budgets). Unset = off. */
   SCRAPE_GUARD_ENABLED?: string;
+  /**
+   * Reject requests that did not arrive via Cloudflare. Unset = off, so a
+   * deploy does not change traffic. See src/security/originLock.ts.
+   */
+  ORIGIN_LOCK_ENABLED?: string;
+  /** Shared secret Cloudflare adds (Transform Rule) as X-CT-Origin-Secret. */
+  ORIGIN_LOCK_SECRET?: string;
+  /** Extra trusted-proxy CIDRs, comma-separated, added to loopback and private ranges. */
+  ORIGIN_LOCK_TRUSTED_PROXIES?: string;
+  /**
+   * Header a trusted proxy sets only after verifying Cloudflare Authenticated
+   * Origin Pulls. Unset = that check is off. Client-supplied values are
+   * ignored unless the socket peer is a trusted proxy or Cloudflare.
+   */
+  ORIGIN_LOCK_AOP_HEADER?: string;
+  /** Expected value of ORIGIN_LOCK_AOP_HEADER. Default SUCCESS. */
+  ORIGIN_LOCK_AOP_VALUE?: string;
   /** App-level D1 daily rows-READ budget (stringified int). Soft-warns at 80%; default 200M/day. Infisical-tunable. */
   D1_DAILY_ROWS_READ_BUDGET?: string;
   /** App-level D1 daily rows-WRITTEN budget (stringified int). Soft-warns at 80%; default 2M/day (~$10/mo of D1 writes). Infisical-tunable. */
@@ -715,7 +817,7 @@ export interface Env {
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   /** Unusual Whales API key for recent Congress trades (latency probe). */
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias (global-api-keys / Infisical) without underscores in the vendor name. */
+  /** Alias (Infisical) without underscores in the vendor name. */
   UNUSUALWHALES_API_KEY?: string;
   /** Distinct filed dates the UW disclosure-latency deep-match pass may query
    *  per probe run (recent-trades?date=<filedDate>), for pending observations
@@ -742,14 +844,66 @@ export interface Env {
   PRICE_PROVIDER?: string;
   /** HMAC key for signing outbound webhook payloads. */
   WEBHOOK_SIGNING_KEY?: string;
-  /** Sentry DSN for error monitoring (Cloudflare Workers SDK). */
+  /** Sentry DSN for error monitoring (Deno SDK via `#sentry`). */
   SENTRY_DSN?: string;
+  /** Coolify image SHA (`SOURCE_COMMIT` baked at Docker build).  Sentry release. */
+  CT_BUILD_SHA?: string;
+  /** Coolify runtime commit when `CT_BUILD_SHA` is unset.  Not a Deploy id. */
+  SOURCE_COMMIT?: string;
   /** Sentry event/log environment tag, e.g. "production" | "preview". */
   SENTRY_ENVIRONMENT?: string;
   /** Read-only safety switch for isolated branch-review deployments. */
   PREVIEW_DEPLOYMENT?: string;
   /** Uniform trace sampling rate (0-1) for the Sentry Cloudflare SDK; overrides the code default. */
   SENTRY_TRACES_SAMPLE_RATE?: string;
+  /** Browser SDK kill switch (`false`/`0`/`off`/`no`).  Default on when DSN is set. */
+  SENTRY_BROWSER_ENABLED?: string;
+  /** User Feedback widget kill switch.  Default on. */
+  SENTRY_FEEDBACK_ENABLED?: string;
+  /** Web session Replay sample (Designer 2026-09-04: default 0.1). */
+  SENTRY_REPLAY_SESSION_SAMPLE_RATE?: string;
+  /** Web error Replay sample (default 1). */
+  SENTRY_REPLAY_ERROR_SAMPLE_RATE?: string;
+  /** Datadog API key for agentless logs + APM intake. */
+  DD_API_KEY?: string;
+  DATADOG_API_KEY?: string;
+  /** Datadog application key (fleet registry / synthetics).  Not required to send logs or traces. */
+  DD_APP_KEY?: string;
+  DATADOG_APP_KEY?: string;
+  /** Datadog site, e.g. us5.datadoghq.com. Defaults to us5.datadoghq.com. */
+  DD_SITE?: string;
+  /** Optional APM/log service override.  Default congress-trade. */
+  DD_SERVICE?: string;
+  /** Optional Datadog env tag.  Falls back to SENTRY_ENVIRONMENT / USAGE_MONITOR_ENVIRONMENT. */
+  DD_ENV?: string;
+  /** Optional Datadog Agent host / URL (e.g. 127.0.0.1 or http://127.0.0.1:8126). */
+  DD_AGENT_HOST?: string;
+  DD_TRACE_AGENT_URL?: string;
+  DD_TRACE_AGENT_HOSTNAME?: string;
+  DD_TRACE_URL?: string;
+  /** Optional APM trace sample rate (0.0 to 1.0, defaults to 0.2). */
+  DD_TRACE_SAMPLE_RATE?: string;
+  /** Host tag.  Prefer fleet-hetzner-nbg1 so APM does not mint extra Free hosts. */
+  DD_HOSTNAME?: string;
+  /** RUM kill switch.  false/0/off/no fail-closes even when client tokens exist. */
+  DD_RUM_ENABLED?: string;
+  NEXT_PUBLIC_DD_RUM_ENABLED?: string;
+  /** Public RUM client token.  Aliases: DD_RUM_CLIENT_TOKEN, NEXT_PUBLIC_DD_CLIENT_TOKEN. */
+  DD_CLIENT_TOKEN?: string;
+  DD_RUM_CLIENT_TOKEN?: string;
+  NEXT_PUBLIC_DD_CLIENT_TOKEN?: string;
+  NEXT_PUBLIC_DD_RUM_CLIENT_TOKEN?: string;
+  /** Public RUM application id.  Aliases: DD_RUM_APPLICATION_ID, NEXT_PUBLIC_DD_APPLICATION_ID. */
+  DD_APPLICATION_ID?: string;
+  DD_RUM_APPLICATION_ID?: string;
+  NEXT_PUBLIC_DD_APPLICATION_ID?: string;
+  NEXT_PUBLIC_DD_RUM_APPLICATION_ID?: string;
+  NEXT_PUBLIC_DD_SITE?: string;
+  /** Opt-in. Pins agent-only dd-trace switches off when no agent host or URL is set. */
+  DD_TRACE_AGENTLESS_GUARDS?: string;
+  DD_DYNAMIC_INSTRUMENTATION_ENABLED?: string;
+  DD_PROFILING_ENABLED?: string;
+  DD_REMOTE_CONFIGURATION_ENABLED?: string;
   /** Cloudflare Workers version metadata binding; used by Sentry to auto-tag the release. */
   CF_VERSION_METADATA?: { id: string; tag: string; timestamp?: string };
 
@@ -757,6 +911,9 @@ export interface Env {
   /** Google OAuth client credentials for "Sign in with Google". */
   GOOGLE_OAUTH_CLIENT_ID?: string;
   GOOGLE_OAUTH_CLIENT_SECRET?: string;
+  /** X (Twitter) OAuth client credentials for "Sign in with X". */
+  X_OAUTH_CLIENT_ID?: string;
+  X_OAUTH_CLIENT_SECRET?: string;
   /** Resend API key + verified from-address for magic-link sign-in emails. */
   RESEND_API_KEY?: string;
   EMAIL_FROM?: string;
@@ -822,14 +979,20 @@ export interface Env {
    */
   /** Global daily LLM spend ceiling in USD (default 10). */
   LLM_DAILY_USD_CEILING?: string;
+  /** Per-doc lifetime LLM spend ceiling in USD (default 0.25). */
+  LLM_DOC_USD_CEILING?: string;
   /** Optional per-provider daily USD sub-ceilings; unset = global-only. */
   LLM_DAILY_USD_CEILING_OPENROUTER?: string;
+  OPENROUTER_DAILY_USD_CEILING?: string;
   LLM_DAILY_USD_CEILING_GEMINI?: string;
   LLM_DAILY_USD_CEILING_OPENAI?: string;
   LLM_DAILY_USD_CEILING_ANTHROPIC?: string;
   LLM_DAILY_USD_CEILING_MISTRAL?: string;
   LLM_DAILY_USD_CEILING_XAI?: string;
   LLM_DAILY_USD_CEILING_LLAMAPARSE?: string;
+  LLAMAPARSE_DAILY_USD_CEILING?: string;
+  LLAMAPARSE_DAILY_CREDIT_CEILING?: string;
+  LLAMAPARSE_DAILY_CREDITS_CEILING?: string;
   /**
    * Governor 2: D1 write governor (shared/d1Budget.ts). Env-only like the
    * usage-telemetry circuit limits: read synchronously on the hot write path.
@@ -850,10 +1013,23 @@ export interface Env {
   DELIVERY_TARGET_BASE_BACKOFF_SEC?: string;
   /** Parked deliveries allowed per subscription before overflow quarantine (default 500). */
   DELIVERY_TARGET_PARKED_CAP?: string;
+  /**
+   * Env fallback for the Infisical app setting of the same name: when truthy
+   * the scheduled flush re-parks live quarantined rows (default off).
+   */
+  DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER?: string;
   /** Admin + scoped import bearer tokens. */
   ADMIN_TOKEN?: string;
   /** Admin email allowlist for site-session admin access and Cloudflare Access. */
   ADMIN_EMAILS?: string;
+  /** HTTPS webhook that wakes Grok Bot Publisher on review_queue entry. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL?: string;
+  /** Optional GB Publisher (Grok Bot) webhook; same secret as BF. Comma-separated URLs also supported on the primary key. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB?: string;
+  /** Optional `Authorization` header for GB Publisher only (value includes `Bearer ` prefix). */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB?: string;
+  /** HMAC secret for REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL payloads. */
+  REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET?: string;
   /** Cloudflare Access team name/hostname for admin API JWT verification. */
   ACCESS_TEAM_DOMAIN?: string;
   /** Cloudflare Access application AUD tag for admin API JWT verification. */
@@ -861,6 +1037,8 @@ export interface Env {
   INGEST_TOKEN?: string;
   /** Scoped token for the idempotent admin maintenance endpoints only (backlog requeue/retry). */
   ADMIN_MAINTENANCE_TOKEN?: string;
+  /** Scoped token for POST /api/admin/senate-ptr-intake only (Mac eFD fetcher, CT-2442). */
+  SENATE_INTAKE_TOKEN?: string;
   LLAMAPARSE_API_KEY?: string;
 
   // --- Billing (Stripe) ---
@@ -873,8 +1051,29 @@ export interface Env {
   STRIPE_PRICE_ANNUAL?: string;
   /** Free-trial length in days for new subscriptions (default 7). */
   STRIPE_TRIAL_DAYS?: string;
+  /** Live Billing Portal configuration id (`bpc_…`).  Without this, Stripe's
+   *  implicit default can hide the Premium product and show an empty
+   *  subscription list. */
+  STRIPE_PORTAL_CONFIGURATION?: string;
   /** iOS bundle id for StoreKit receipt verification (default trade.congress.ios). */
   APPLE_BUNDLE_ID?: string;
+  /** Sign in with Apple Services ID for the website OAuth flow. */
+  APPLE_SERVICES_ID?: string;
+  APPLE_TEAM_ID?: string;
+  APPLE_KEY_ID?: string;
+  APPLE_P8?: string;
+  APPLE_PRIVATE_KEY?: string;
+  /** APNs provider key id (10-char). Required with team id + signing material to send. */
+  APNS_KEY_ID?: string;
+  /** Apple Developer Team ID. */
+  APNS_TEAM_ID?: string;
+  /** APNs topic; defaults to trade.congress.ios. */
+  APNS_BUNDLE_ID?: string;
+  /** Signing material for the APNs provider token. Never log. */
+  APNS_P8?: string;
+  /** Alternate env slot for the same signing material. */
+  APNS_PRIVATE_KEY_B64?: string;
+  APNS_PRIVATE_KEY?: string;
   /** "true" to enable Stripe Managed Payments (merchant-of-record) on Checkout.
    *  Leave off until the account is approved for Managed Payments and products
    *  carry an eligible digital tax code. */
@@ -885,10 +1084,26 @@ export interface Env {
   APPLE_SIGNIN_ENABLED?: string;
   /** "true" to enable the redeem_apple_purchase command + POST /api/webhooks/apple. Off until the App Store Connect subscription products exist. */
   APPLE_IAP_ENABLED?: string;
+  /**
+   * Kill switch for App Store Sandbox / TestFlight JWS. Default (unset / "true")
+   * allows Apple-signed Sandbox grants because TestFlight, App Review, and
+   * Designed-for-iPad on Mac all talk to this production API with
+   * environment=Sandbox. Set "false" to refuse those grants.
+   */
+  APPLE_ALLOW_SANDBOX?: string;
   /** App Store Connect product id for the monthly Premium subscription (default trade.congress.premium.monthly). */
   APPLE_PRODUCT_MONTHLY?: string;
   /** App Store Connect product id for the annual Premium subscription (default trade.congress.premium.annual). */
   APPLE_PRODUCT_ANNUAL?: string;
+  /**
+   * HMAC key for the anonymous-purchase device entitlement token
+   * (`billing/deviceEntitlement.ts`) — the short-lived proof a signed-out
+   * device presents on PDF/CSV requests after `POST
+   * /api/client/v1/entitlements/apple/redeem`. Independent of every other
+   * signing key in this file; rotating it just expires outstanding tokens
+   * early (every one re-mints on the device's next reconcile pass).
+   */
+  APPLE_DEVICE_ENTITLEMENT_SECRET?: string;
 
   // --- Infisical runtime secret resolver ---
   /** Optional Infisical API origin. Defaults to https://app.infisical.com. */
@@ -916,6 +1131,17 @@ export interface Env {
   INFISICAL_SHARED_SECRET_PATH?: string;
 
   // --- Plain vars (.dev.vars / [vars]) ---
+  /**
+   * Numeric App Store Connect id for the iOS app, e.g. "1234567890" — set
+   * once the app is Approved and has a real id (see src/ui/appLinks.ts).
+   * Unset by default: the app is not in the public App Store yet, so there
+   * is no real id to hardcode, and the Smart App Banner stays absent until
+   * this is configured.
+   */
+  IOS_APP_STORE_ID?: string;
+  /** Public TestFlight join link or beta URL for the iOS app. */
+  IOS_TESTFLIGHT_URL?: string;
+  IOS_BETA_URL?: string;
   /** "true" to force arbitration on when configured. */
   ARBITRATION_ENABLED?: string;
   /** Cross-app import guardrails. Tune down for lean/free-compatible runs. */

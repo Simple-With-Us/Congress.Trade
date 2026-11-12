@@ -1,4 +1,5 @@
 import { BENCHMARK_SCHEMA_STATEMENTS } from '../benchmark/schema.ts';
+import { phantomFilerAliasStatements } from '../shared/phantomFilerAliases.ts';
 
 /** Base schema needed before the incremental, idempotent admin migration list. */
 export const BASE_SCHEMA_STATEMENTS = [
@@ -35,6 +36,44 @@ export const BASE_SCHEMA_STATEMENTS = [
   'CREATE INDEX IF NOT EXISTS idx_review_resolved ON review_queue (resolved)',
   `CREATE TABLE IF NOT EXISTS ingest_log (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, polled_at TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0, first_seen_at TEXT)`,
   'CREATE INDEX IF NOT EXISTS idx_ingest_log_source ON ingest_log (source, polled_at)',
+  // Feed joins.  CREATE IF NOT EXISTS so sqlite tests that exec only this list
+  // can prepare GET /api/transactions.  Production already has both tables, so
+  // a repeat create is a no-op.  price_at_filing matches migration 0014.
+  `CREATE TABLE IF NOT EXISTS tx_performance (
+     tx_id TEXT PRIMARY KEY,
+     price_at_trade REAL,
+     spx_at_trade REAL,
+     price_at_filing REAL,
+     spx_at_filing REAL,
+     computed_at TEXT
+   )`,
+  `CREATE TABLE IF NOT EXISTS trade_latency_candidates (
+     trade_hash TEXT NOT NULL,
+     doc_id TEXT NOT NULL,
+     provider TEXT NOT NULL DEFAULT 'fmp',
+     chamber TEXT NOT NULL,
+     source_url TEXT,
+     filed_date TEXT,
+     filer_name TEXT,
+     ticker TEXT,
+     tx_date TEXT,
+     tx_type TEXT,
+     congress_first_seen_at TEXT NOT NULL,
+     provider_key TEXT,
+     provider_first_seen_at TEXT,
+     provider_published_at TEXT,
+     match_method TEXT,
+     status TEXT NOT NULL DEFAULT 'pending',
+     attempts INTEGER NOT NULL DEFAULT 0,
+     last_checked_at TEXT,
+     error TEXT,
+     payload TEXT,
+     created_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL,
+     PRIMARY KEY (trade_hash, provider)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_trade_latency_candidates_doc
+     ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
 ] as const;
 
 /**
@@ -91,9 +130,10 @@ export const RELIABILITY_SCHEMA_STATEMENTS = [
   'CREATE INDEX IF NOT EXISTS idx_sse_leases_client ON sse_leases(client_id, expires_at)',
   `CREATE TRIGGER IF NOT EXISTS trg_sse_subscription_connection_quota BEFORE INSERT ON sse_leases WHEN (SELECT COUNT(*) FROM sse_leases WHERE subscription_id = NEW.subscription_id AND expires_at > NEW.created_at) >= 2 BEGIN SELECT RAISE(ABORT, 'sse subscription connection quota exceeded'); END`,
   `CREATE TRIGGER IF NOT EXISTS trg_sse_client_connection_quota BEFORE INSERT ON sse_leases WHEN (SELECT COUNT(*) FROM sse_leases WHERE client_id = NEW.client_id AND expires_at > NEW.created_at) >= 5 BEGIN SELECT RAISE(ABORT, 'sse client connection quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota BEFORE INSERT ON subscriptions WHEN (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id) >= 20 BEGIN SELECT RAISE(ABORT, 'subscription total quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_active_insert_quota BEFORE INSERT ON subscriptions WHEN NEW.active = 1 AND (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id AND active = 1) >= 10 BEGIN SELECT RAISE(ABORT, 'subscription active quota exceeded'); END`,
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_active_update_quota BEFORE UPDATE OF active, client_id ON subscriptions WHEN NEW.active = 1 AND (OLD.active != 1 OR OLD.client_id != NEW.client_id) AND (SELECT COUNT(*) FROM subscriptions WHERE client_id = NEW.client_id AND active = 1 AND id != OLD.id) >= 10 BEGIN SELECT RAISE(ABORT, 'subscription active quota exceeded'); END`,
+  // The subscription quota triggers are intentionally NOT created here: the
+  // replay later drops and redefines them (0047, then the lower-quota set),
+  // so creating them in this list rebuilds and discards them under the write
+  // lock on every deploy.  Their only CREATE is the final definition.
   `CREATE TABLE IF NOT EXISTS source_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, attempted_at TEXT NOT NULL, outcome TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   'CREATE INDEX IF NOT EXISTS idx_source_attempts_source_time ON source_attempts(source, attempted_at DESC)',
 ] as const;
@@ -227,16 +267,13 @@ export const PRICE_BACKFILL_TERMINATION_SCHEMA_STATEMENTS = [
  * migrations/0047_subscription_quota_active_only.sql.
  */
 export const SUBSCRIPTION_QUOTA_ACTIVE_ONLY_SCHEMA_STATEMENTS = [
+  // The CREATE that followed this DROP in 0047 is intentionally left out of
+  // the boot replay: the lower-quota set later drops and redefines the same
+  // trigger, so creating it here rebuilds and discards it under the write
+  // lock on every deploy.  The DROP still migrates old databases; the final
+  // CREATE lives in LOWER_SUBSCRIPTION_QUOTA_SCHEMA_STATEMENTS.  Keep in
+  // lockstep with migrations/0047_subscription_quota_active_only.sql.
   'DROP TRIGGER IF EXISTS trg_subscriptions_total_quota',
-  `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota
-   BEFORE INSERT ON subscriptions
-   WHEN (
-     SELECT COUNT(*) FROM subscriptions
-      WHERE client_id = NEW.client_id AND active = 1
-   ) >= 20
-   BEGIN
-     SELECT RAISE(ABORT, 'subscription total quota exceeded');
-   END`,
 ] as const;
 
 /** Ordered review-queue autonomy schema mirrored by file migrations 0033-0037. */
@@ -359,7 +396,15 @@ export const RESOURCE_GOVERNOR_SCHEMA_STATEMENTS = [
 )`,
 ] as const;
 
-/** 0052_deno_runtime_queue.sql — durable queue for Deno KV Connect runtimes. */
+/**
+ * 0052_deno_runtime_queue.sql — durable queue for Deno KV Connect runtimes.
+ * The file's idx_deno_runtime_queue_ready is deliberately NOT replayed here:
+ * 0062 (FIX_DENO_RUNTIME_QUEUE_INDEX_SCHEMA_STATEMENTS, later in this list)
+ * drops it again.  The Deno boot replays this list before Deno.serve, so
+ * the pair rebuilt and dropped an index over the whole queue
+ * (~3.4M rows) under the write lock on every deploy.  The DROP ... IF EXISTS
+ * stays to clean databases that still have it.
+ */
 export const DENO_RUNTIME_QUEUE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS deno_runtime_queue (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -376,8 +421,6 @@ export const DENO_RUNTIME_QUEUE_SCHEMA_STATEMENTS = [
      created_at TEXT NOT NULL,
      updated_at TEXT NOT NULL
    )`,
-  `CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_ready
-     ON deno_runtime_queue(status, available_at, id)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_deno_runtime_queue_active_dedupe
      ON deno_runtime_queue(queue_name, dedupe_key)
      WHERE dedupe_key IS NOT NULL AND status IN ('pending', 'processing')`,
@@ -500,10 +543,15 @@ export const ACCOUNTING_PROJECTION_RESYNC_SCHEMA_STATEMENTS = [
 
 /**
  * tests. Keep this in the same order as file migrations 0029 through 0055.
+ *
+ * 0056_query_optimizations.sql.  The file's idx_deno_runtime_queue_pending
+ * and idx_deno_runtime_queue_processing are deliberately NOT replayed: 0058
+ * (TURSO_QUERY_EFFICIENCY_SCHEMA_STATEMENTS) replaces them with the _id
+ * twins and drops them a few statements later, so replaying the CREATEs only
+ * rebuilt two full-queue indexes under the boot write lock to throw them
+ * away.  The 0058 DROP ... IF EXISTS statements stay.
  */
 export const QUERY_OPTIMIZATIONS_SCHEMA_STATEMENTS = [
-  'CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_pending ON deno_runtime_queue (queue_name, status, available_at)',
-  'CREATE INDEX IF NOT EXISTS idx_deno_runtime_queue_processing ON deno_runtime_queue (queue_name, status, lease_until)',
   'CREATE INDEX IF NOT EXISTS idx_ingestion_outbox_enqueued ON ingestion_outbox (status, updated_at)',
   'CREATE INDEX IF NOT EXISTS idx_delivery_outbox_enqueued ON delivery_outbox (status, updated_at)',
 ] as const;
@@ -676,10 +724,13 @@ export const FILER_BIOGUIDE_RESOLUTION_SCHEMA_STATEMENTS = [
 ] as const;
 
 // 0067_clean_ocr_dot_leader_asset_names.sql — clean OCR dot leaders from asset_name and save audit note.
+// Owner 2026-08-09: cleaning_note strings are concise plain-English fragments
+// (no title case, no internal table names). New writes + a rewrite pass at the
+// end of this list keep API/UI/export consistent without a one-shot only.
 export const CLEAN_OCR_DOT_LEADERS_SCHEMA_STATEMENTS = [
   'ALTER TABLE transactions ADD COLUMN cleaning_note TEXT',
   `UPDATE transactions
-      SET cleaning_note = 'Cleaned OCR dot leader noise (Original: ' || asset_name || ')',
+      SET cleaning_note = 'cleaned OCR noise from asset name',
           asset_name = NULL
     WHERE asset_name IN (
        '..', '...', '....', '.....', '......', '.......', '........', '.........', '..........',
@@ -690,14 +741,14 @@ export const CLEAN_OCR_DOT_LEADERS_SCHEMA_STATEMENTS = [
        '..........................', '...........................', '.................',
        '.....]', '......s', '..........A', '..o', '...................0', '...................e', '.............e'
     )`,
-  `UPDATE transactions SET cleaning_note = 'Stripped OCR dot leader suffix (Original: ' || asset_name || ')', asset_name = 'ARCC' WHERE asset_name LIKE 'ARCC .%'`,
-  `UPDATE transactions SET cleaning_note = 'Stripped OCR dot leader suffix (Original: ' || asset_name || ')', asset_name = 'NVDA' WHERE asset_name LIKE 'NVDA .%'`,
-  `UPDATE transactions SET cleaning_note = 'Stripped OCR dot leader suffix (Original: ' || asset_name || ')', asset_name = 'XOM' WHERE asset_name LIKE 'XOM .%'`,
-  `UPDATE transactions SET cleaning_note = 'Stripped OCR dot leader suffix (Original: ' || asset_name || ')', asset_name = 'BAC' WHERE asset_name LIKE 'BAC .%'`,
-  `UPDATE transactions SET cleaning_note = 'Stripped OCR dot leader suffix (Original: ' || asset_name || ')', asset_name = 'FMAO' WHERE asset_name LIKE 'FMAO .%'`,
-  `UPDATE transactions SET cleaning_note = 'Stripped OCR dot leader suffix (Original: ' || asset_name || ')', asset_name = 'HD' WHERE asset_name LIKE 'HD .%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name', asset_name = 'ARCC' WHERE asset_name LIKE 'ARCC .%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name', asset_name = 'NVDA' WHERE asset_name LIKE 'NVDA .%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name', asset_name = 'XOM' WHERE asset_name LIKE 'XOM .%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name', asset_name = 'BAC' WHERE asset_name LIKE 'BAC .%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name', asset_name = 'FMAO' WHERE asset_name LIKE 'FMAO .%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name', asset_name = 'HD' WHERE asset_name LIKE 'HD .%'`,
   `UPDATE transactions
-      SET cleaning_note = 'Cleaned junk OCR text (Original: ' || asset_name || ')',
+      SET cleaning_note = 'removed junk OCR from asset name',
           asset_name = NULL
     WHERE (asset_name LIKE '...%' OR asset_name LIKE '%...' OR asset_name LIKE '%....%')
       AND cleaning_note IS NULL`,
@@ -706,17 +757,26 @@ export const CLEAN_OCR_DOT_LEADERS_SCHEMA_STATEMENTS = [
           deprecated_reason = 'synthetic_provider_missing_placeholder'
     WHERE doc_id LIKE 'provider-missing-%'
       AND deprecated_at IS NULL`,
-  `UPDATE review_queue
-      SET resolved = 1
-    WHERE reason = 'provider_discovered_missing_official'
-      AND resolved = 0`,
+  // Retroactive sweep (PR #1180), MOVED to REVIEW_QUEUE_RESOLUTION_REASON_
+  // SCHEMA_STATEMENTS below (still runs every /migrate, just after the
+  // resolution_kind/resolution_reason columns exist and can be set honestly
+  // — see that block for why it can't stay here).
   `UPDATE transactions
       SET asset_name = (SELECT sr.company_name FROM securities_ref sr WHERE sr.ticker = transactions.ticker),
-          cleaning_note = COALESCE(cleaning_note, 'Populated official company name from securities_ref')
+          cleaning_note = COALESCE(cleaning_note, 'asset name derived from ticker')
     WHERE ticker IS NOT NULL
       AND ticker != ''
       AND EXISTS (SELECT 1 FROM securities_ref sr WHERE sr.ticker = transactions.ticker AND sr.company_name IS NOT NULL AND sr.company_name != '')
       AND (asset_name IS NULL OR asset_name = '' OR asset_name = '(unknown)' OR asset_name = ticker OR asset_name LIKE '%..%')`,
+  // Rewrite legacy technical notes already stored (idempotent).
+  `UPDATE transactions SET cleaning_note = 'asset name derived from ticker'
+    WHERE cleaning_note = 'Populated official company name from securities_ref'`,
+  `UPDATE transactions SET cleaning_note = 'cleaned OCR noise from asset name'
+    WHERE cleaning_note LIKE 'Cleaned OCR dot leader noise%'`,
+  `UPDATE transactions SET cleaning_note = 'removed OCR noise from asset name'
+    WHERE cleaning_note LIKE 'Stripped OCR dot leader suffix%'`,
+  `UPDATE transactions SET cleaning_note = 'removed junk OCR from asset name'
+    WHERE cleaning_note LIKE 'Cleaned junk OCR text%'`,
 ] as const;
 
 /**
@@ -876,11 +936,26 @@ export const APPLE_SIGNIN_SCHEMA_STATEMENTS = [
 ] as const;
 
 /**
+ * 0094_x_auth.sql — "Sign in with X (Twitter)": link a user to their stable
+ * X `sub` claim.
+ */
+export const X_AUTH_SCHEMA_STATEMENTS = [
+  'ALTER TABLE users ADD COLUMN x_sub TEXT',
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_x_sub
+     ON users (x_sub)
+     WHERE x_sub IS NOT NULL`,
+] as const;
+
+/**
  * 0081_apple_iap.sql — Apple In-App Purchase (StoreKit 2) subscription ledger
  * + App Store Server Notifications V2 webhook idempotency ledger. See
  * migrations/0081_apple_iap.sql for the full design note (why this table is
  * independent of, not a replacement for, the Stripe-shaped `users` columns
  * the legacy POST /billing/apple/confirm route also writes).
+ *
+ * Before adding a column to apple_subscriptions in a later migration, read
+ * the note on APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS: its
+ * guarded rebuild runs after the whole replay on a fresh database.
  */
 export const APPLE_IAP_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS apple_subscriptions (
@@ -919,6 +994,122 @@ export const APPLE_IAP_SCHEMA_STATEMENTS = [
      ON apple_webhook_events (processed_at, claim_expires_at)`,
 ] as const;
 
+/**
+ * 0082_review_queue_resolution_reason.sql — make review_queue.resolved=1 an
+ * honest signal. See that file for the full production-bug writeup. Keep in
+ * exact lockstep with migrations/0082_review_queue_resolution_reason.sql.
+ */
+export const REVIEW_QUEUE_RESOLUTION_REASON_SCHEMA_STATEMENTS = [
+  'ALTER TABLE review_queue ADD COLUMN resolution_kind TEXT',
+  'ALTER TABLE review_queue ADD COLUMN resolution_reason TEXT',
+  'ALTER TABLE review_queue ADD COLUMN resolved_at TEXT',
+  `UPDATE review_queue
+      SET resolution_kind = 'published',
+          resolved_at = COALESCE(resolved_at, created_at)
+    WHERE resolved = 1
+      AND resolution_kind IS NULL
+      AND EXISTS (
+        SELECT 1 FROM transactions t
+         WHERE t.doc_id = review_queue.doc_id AND t.deprecated_at IS NULL
+      )`,
+  `UPDATE review_queue
+      SET resolution_kind = 'rejected',
+          resolution_reason = COALESCE(resolution_reason, reason),
+          resolved_at = COALESCE(resolved_at, created_at)
+    WHERE resolved = 1
+      AND resolution_kind IS NULL
+      AND (reason LIKE 'rejected:%' OR reason = 'orphan_filing_deleted')`,
+  // Remaining legacy rows (the ~950 that predate resolution_kind and match
+  // neither rule above): they were resolved with no live transactions and no
+  // 'rejected:' marker, i.e. closed as empty without ever recording why. That
+  // is a true statement we CAN make honestly — classify them as verified_empty
+  // with a reason naming the backfill, so review_resolution_integrity reports
+  // the real ongoing state instead of a permanent legacy number nobody can act
+  // on. Only ever touches rows still NULL, so it is idempotent.
+  `UPDATE review_queue
+      SET resolution_kind = 'verified_empty',
+          resolution_reason = COALESCE(
+            NULLIF(resolution_reason, ''),
+            'legacy backfill 2026-08-09: resolved before resolution_kind existed; no live transactions at backfill time'
+          ),
+          resolved_at = COALESCE(resolved_at, created_at)
+    WHERE resolved = 1
+      AND resolution_kind IS NULL`,
+  // Ongoing sweep (originally PR #1180, previously living unconditionally in
+  // CLEAN_OCR_DOT_LEADERS_SCHEMA_STATEMENTS / migration 0067's mirror — moved
+  // here, after resolution_kind/resolution_reason exist, because
+  // trg_review_queue_honest_resolution below is a durable DB object: once
+  // installed by any earlier deploy, it enforces on every future UPDATE that
+  // sets resolved=1 regardless of that statement's position in THIS list, so
+  // the bare `SET resolved = 1` it used to run would abort on every redeploy
+  // for as long as routeProviderOnlyObservationsToReview (tradeLatency.ts)
+  // keeps creating new provider-only rows. Provider-only placeholder filings
+  // have no raw_object_key — nothing was ever fetched to extract from — so
+  // they can never gain a live transaction; 'verified_empty' is honest here.
+  `UPDATE review_queue
+      SET resolved = 1,
+          resolution_kind = 'verified_empty',
+          resolution_reason = 'provider_only_lead_cleared',
+          resolved_at = CURRENT_TIMESTAMP
+    WHERE reason = 'provider_discovered_missing_official'
+      AND resolved = 0`,
+  `CREATE INDEX IF NOT EXISTS idx_review_queue_resolution_kind
+     ON review_queue (resolved, resolution_kind)`,
+  'DROP TRIGGER IF EXISTS trg_review_queue_honest_resolution',
+  `CREATE TRIGGER IF NOT EXISTS trg_review_queue_honest_resolution
+BEFORE UPDATE OF resolved ON review_queue
+WHEN NEW.resolved = 1 AND (
+  NEW.resolution_kind IS NULL
+  OR NEW.resolution_kind NOT IN ('published', 'verified_empty', 'rejected', 'orphan_deleted')
+  OR (
+    NEW.resolution_kind IN ('verified_empty', 'rejected')
+    AND (NEW.resolution_reason IS NULL OR TRIM(NEW.resolution_reason) = '')
+  )
+  OR (
+    NEW.resolution_kind = 'published'
+    AND NOT EXISTS (
+      SELECT 1 FROM transactions WHERE doc_id = NEW.doc_id AND deprecated_at IS NULL
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'review_queue.resolved=1 requires an honest resolution_kind: published needs a live transaction, verified_empty/rejected need resolution_reason');
+END`,
+] as const;
+
+/**
+ * 0083_filers_display_name.sql — the member's "campaign sign" preferred
+ * public display name, distinct from full_name. See that file and
+ * src/enrichment/identitySync.ts for how it is computed and kept in sync.
+ * Keep in exact lockstep with migrations/0083_filers_display_name.sql.
+ */
+export const FILERS_DISPLAY_NAME_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filers ADD COLUMN display_name TEXT',
+] as const;
+
+/**
+ * 0084_latency_probe_leases.sql — mutual exclusion for provider polling, so the
+ * Deno server and the Mac scout can never both spend quota on the same source.
+ * The PRIMARY KEY on `provider` is what makes the conditional upsert in
+ * ingestion/probeLease.ts a contended write with exactly one winner.
+ * Keep in exact lockstep with migrations/0084_latency_probe_leases.sql.
+ */
+export const LATENCY_PROBE_LEASE_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS latency_probe_leases (
+     provider          TEXT PRIMARY KEY,
+     holder            TEXT NOT NULL,
+     holder_id         TEXT NOT NULL,
+     acquired_at       TEXT NOT NULL,
+     expires_at        INTEGER NOT NULL,
+     tenure_started_at INTEGER NOT NULL,
+     reason            TEXT,
+     renewals          INTEGER NOT NULL DEFAULT 0,
+     updated_at        TEXT NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_latency_probe_leases_expires
+     ON latency_probe_leases (expires_at DESC)`,
+] as const;
+
 export const LOWER_SUBSCRIPTION_QUOTA_SCHEMA_STATEMENTS = [
   'DROP TRIGGER IF EXISTS trg_subscriptions_total_quota',
   `CREATE TRIGGER IF NOT EXISTS trg_subscriptions_total_quota
@@ -950,6 +1141,480 @@ BEGIN
 END`,
 ] as const;
 
+
+export const APNS_FANOUT_STATE_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS apns_fanout_state (
+     id TEXT PRIMARY KEY,
+     last_trade_at TEXT NOT NULL,
+     last_review_at TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
+  `INSERT OR IGNORE INTO apns_fanout_state (id, last_trade_at, last_review_at, updated_at)
+     VALUES ('default', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')`,
+] as const;
+
+export const LATENCY_PRICE_SNAPSHOT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS latency_price_snapshots (
+     trade_hash TEXT NOT NULL,
+     ticker TEXT NOT NULL,
+     provider TEXT NOT NULL,
+     event TEXT NOT NULL,
+     due_at TEXT NOT NULL,
+     captured_at TEXT,
+     price REAL,
+     source TEXT,
+     error TEXT,
+     created_at TEXT NOT NULL,
+     PRIMARY KEY (trade_hash, provider, event)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_latency_price_due
+     ON latency_price_snapshots (captured_at, due_at)`,
+] as const;
+
+/**
+ * 0088_tx_twin_seek_index.sql — issue #2062 (PR 2037 twin-dedupe hang).
+ * Partial covering index matching TWIN_DEDUPE_SQL's inner seek
+ * (filer_id, tx_date on live rows) so the correlated NOT EXISTS on the
+ * page / CSV / analytics path is an index SEARCH, not a per-row corpus scan.
+ */
+export const TWIN_SEEK_INDEX_SCHEMA_STATEMENTS = [
+  `CREATE INDEX IF NOT EXISTS idx_tx_twin_seek
+     ON transactions (filer_id, tx_date)
+     WHERE deprecated_at IS NULL`,
+] as const;
+
+export const ASSET_NORMALIZATION_0085_SCHEMA_STATEMENTS = [
+  'CREATE INDEX IF NOT EXISTS idx_tx_ticker_live ON transactions (ticker) WHERE deprecated_at IS NULL',
+  "UPDATE transactions SET ticker = 'ETH' WHERE ticker IN ('ETHUSD', 'ETH-USD', 'ETH/USD', '$ETHUSD', '$ETH')",
+  "UPDATE transactions SET ticker = 'BTC' WHERE ticker IN ('BTCUSD', 'BTC-USD', 'BTC/USD', 'XBTUSD', '$BTCUSD', '$BTC')",
+  "UPDATE transactions SET ticker = 'SOL' WHERE ticker IN ('SOLUSD', 'SOL-USD', 'SOL/USD', '$SOLUSD', '$SOL')",
+  "UPDATE transactions SET ticker = 'DOGE' WHERE ticker IN ('DOGEUSD', 'DOGE-USD', '$DOGEUSD', '$DOGE')",
+  "UPDATE transactions SET ticker = 'XRP' WHERE ticker IN ('XRPUSD', 'XRP-USD', '$XRPUSD', '$XRP')",
+  "UPDATE transactions SET ticker = 'ADA' WHERE ticker IN ('ADAUSD', 'ADA-USD', '$ADAUSD', '$ADA')",
+  "UPDATE transactions SET ticker = 'AVAX' WHERE ticker IN ('AVAXUSD', 'AVAX-USD', '$AVAXUSD', '$AVAX')",
+  "UPDATE transactions SET ticker = 'DOT' WHERE ticker IN ('DOTUSD', 'DOT-USD', '$DOTUSD', '$DOT')",
+  "UPDATE transactions SET ticker = 'MATIC' WHERE ticker IN ('MATICUSD', 'POLUSD', 'MATIC-USD', '$MATICUSD', '$MATIC')",
+  "UPDATE transactions SET ticker = 'LINK' WHERE ticker IN ('LINKUSD', 'LINK-USD', '$LINKUSD', '$LINK')",
+  "UPDATE transactions SET ticker = 'LTC' WHERE ticker IN ('LTCUSD', 'LTC-USD', '$LTCUSD', '$LTC')",
+  "UPDATE transactions SET asset_name = 'Unspecified Asset', ticker = NULL WHERE asset_name LIKE '$151,000%' OR ticker LIKE '$151,000%'",
+  "UPDATE transactions SET asset_name = 'U.S. Treasury Bill', ticker = NULL WHERE ticker LIKE '912796%' OR asset_name LIKE '912796%' OR asset_name LIKE '%13-WEEK, MATURESP%' OR asset_name LIKE '%4-WEEK, MATURESP%' OR asset_name LIKE '%3-MONTH, MATURESP%' OR asset_name LIKE '%6-MONTH, MATURESP%'",
+  "UPDATE transactions SET asset_name = 'U.S. Treasury Note', ticker = NULL WHERE ticker LIKE '91282C%' OR asset_name LIKE '91282C%'",
+  "UPDATE transactions SET ticker = NULL WHERE ticker IN ('1 1', '2 1', '5 1', '1093', '2020', '9201', '9843', '1QY', '3733Z', '559242Z', '5672A', '600690', '7410Z', '8376923Z', '^MWE', '^RGP', '0QZI.IL', '9201:JP', '559242Z:CN', '1494391D', '20030NCU3', '30303M8N5', '37045XCR5', '37045XDS2', '605699PU5', '64110LAS5', '68389XCD5', '713448FM5', '784532JF1', '92343VEU4')",
+  "INSERT OR IGNORE INTO securities_ref (ticker, company_name, asset_class) VALUES ('ETH', 'Ethereum', 'Crypto'), ('BTC', 'Bitcoin', 'Crypto'), ('SOL', 'Solana', 'Crypto'), ('DOGE', 'Dogecoin', 'Crypto'), ('XRP', 'XRP', 'Crypto'), ('ADA', 'Cardano', 'Crypto'), ('AVAX', 'Avalanche', 'Crypto'), ('DOT', 'Polkadot', 'Crypto'), ('MATIC', 'Polygon', 'Crypto'), ('LINK', 'Chainlink', 'Crypto'), ('LTC', 'Litecoin', 'Crypto')",
+] as const;
+
+/**
+ * 0089_probe_run_brackets.sql
+ *
+ * Durable record of EVERY competitor probe, including probes that found
+ * nothing — those are what establish the lower bound of a publication window.
+ * See src/ingestion/probeRunLog.ts for why a point-in-time
+ * `first_observed_at` is not a publication timestamp.
+ *
+ * `prev_probe_at` / `provider_window_*` are added as nullable columns: every
+ * pre-existing row keeps a NULL window and is therefore reported as
+ * UNBOUNDED confidence rather than being retroactively credited with a
+ * precision it never had.
+ */
+export const PROBE_RUN_BRACKET_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS provider_probe_runs (
+     provider TEXT NOT NULL,
+     chamber TEXT NOT NULL,
+     ran_at TEXT NOT NULL,
+     ok INTEGER NOT NULL DEFAULT 0,
+     rows_seen INTEGER NOT NULL DEFAULT 0,
+     error TEXT,
+     PRIMARY KEY (provider, chamber, ran_at)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_provider_probe_runs_lookup
+     ON provider_probe_runs (provider, chamber, ok, ran_at DESC)`,
+  'ALTER TABLE trade_provider_observations ADD COLUMN prev_probe_at TEXT',
+  'ALTER TABLE trade_latency_candidates ADD COLUMN provider_window_start TEXT',
+  'ALTER TABLE trade_latency_candidates ADD COLUMN provider_window_end TEXT',
+] as const;
+
+/**
+ * 0090_admin_allowlist.sql — persisted admin grant/revoke allowlist + audit
+ * trail, consulted ADDITIONALLY to the ADMIN_EMAILS environment bootstrap
+ * list (see admin/identity.ts's adminRuntimeConfig, admin/adminAccess.ts for
+ * the grant/revoke logic).  ADMIN_EMAILS itself is never written to this
+ * table — it stays the un-editable root escape hatch.
+ */
+export const ADMIN_ALLOWLIST_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS admin_allowlist (
+     email       TEXT PRIMARY KEY,
+     granted_by  TEXT NOT NULL,
+     granted_at  TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS admin_access_audit (
+     id         TEXT PRIMARY KEY,
+     action     TEXT NOT NULL,
+     email      TEXT NOT NULL,
+     actor      TEXT NOT NULL,
+     created_at TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_admin_access_audit_created ON admin_access_audit (created_at DESC)',
+] as const;
+
+/**
+ * 0091_apple_subscriptions_nullable_user.sql — Guideline 5.1.1(v): App Store
+ * review rejected submission b61e2a4a for requiring account registration
+ * before an In-App Purchase that is not itself account-based. Anonymous
+ * device purchases (`POST /api/client/v1/entitlements/apple/redeem`) write a
+ * `apple_subscriptions` row with `user_id = NULL`; SQLite cannot ALTER COLUMN
+ * to drop a NOT NULL constraint, so this rebuilds the table. Keep in exact
+ * lockstep with migrations/0091_apple_subscriptions_nullable_user.sql.
+ *
+ * NOT part of POST_0024_SCHEMA_STATEMENTS.  The replay used to run these as
+ * separate autocommit statements on every boot, and the runner moves on
+ * after a failed statement: a SQLITE_BUSY on CREATE/INSERT followed by a
+ * successful DROP deleted the table, and a BUSY on DROP left a filled
+ * apple_subscriptions_new that a later boot swapped over newer rows.
+ * applyGuardedAppleSubscriptionsNullableUserMigration
+ * (schemaMigrationRunner.ts) now runs them only while user_id is still NOT
+ * NULL, as ONE write batch that rolls back whole.
+ *
+ * On a fresh database that guarded rebuild runs after the WHOLE replay, not
+ * at 0091's place in it, and copies with `SELECT *` into the column list
+ * below.  A later migration that adds an apple_subscriptions column would
+ * make that copy fail on every fresh database (column-count mismatch, and
+ * /migrate reports it in failed[]).  Such a migration must also change how
+ * the rebuild runs, for example by running it at its list position.  The
+ * file-vs-admin snapshot test in migrations.test.ts catches the mismatch.
+ */
+export const APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS apple_subscriptions_new (
+     original_transaction_id   TEXT PRIMARY KEY,
+     user_id                   TEXT,
+     product_id                TEXT NOT NULL,
+     plan                      TEXT NOT NULL CHECK (plan IN ('monthly', 'annual')),
+     status                    TEXT NOT NULL DEFAULT 'active'
+                                  CHECK (status IN ('active', 'expired', 'revoked', 'grace_period', 'billing_retry')),
+     environment               TEXT,
+     latest_transaction_id     TEXT,
+     purchase_date              TEXT,
+     expires_date               TEXT,
+     auto_renew_status          INTEGER,
+     auto_renew_product_id      TEXT,
+     revoked_at                 TEXT,
+     revocation_reason          INTEGER,
+     last_notification_type     TEXT,
+     last_notification_subtype  TEXT,
+     created_at                 TEXT NOT NULL,
+     updated_at                 TEXT NOT NULL
+   )`,
+  'INSERT INTO apple_subscriptions_new SELECT * FROM apple_subscriptions',
+  'DROP TABLE apple_subscriptions',
+  'ALTER TABLE apple_subscriptions_new RENAME TO apple_subscriptions',
+  'CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_user ON apple_subscriptions (user_id)',
+  `CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_user_active
+     ON apple_subscriptions (user_id, status, expires_date)`,
+] as const;
+
+/**
+ * 0092_latency_snapshot_repair.sql
+ *
+ * Repairs the latency-price-snapshot pipeline: 2937/2955 scheduled rows were
+ * stuck at `missed_window` because snapshots are scheduled RETROSPECTIVELY
+ * from already-matched candidates, so `due_at` for ct_publish/provider_publish
+ * is always in the past by the time a row exists — captureDueLatencyPriceSnapshots
+ * correctly refused to stamp a live quote onto it. The other 11 failed on a
+ * paid quote provider's HTTP 402. Owner ruling: that provider is never a
+ * market-data source again.
+ *
+ * New columns record HOW a price was answered (`capture_mode`: 'live' or
+ * 'backfill'), how confident we are in `due_at` itself (`confidence` /
+ * `due_at_uncertainty_sec`, derived from the provider_probe_runs bracket added
+ * in 0089), the market session at the requested instant (`market_session`, so
+ * a print crossing the 16:00 close is labeled rather than silently averaged
+ * into a same-session comparison), and how many backfill attempts a row has
+ * exhausted (`backfill_attempts`) so a persistently unreachable peer
+ * terminates instead of retrying forever.
+ *
+ * The trailing UPDATE reopens every row previously abandoned with
+ * 'missed_window' for capture through the SAME live/backfill pipeline that
+ * answers new rows — never a synthetic "now" price on a past due_at.
+ * Idempotent: after the first replay no row still has this value, so replaying
+ * this statement list on a later deploy is a no-op.
+ */
+export const LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS = [
+  `ALTER TABLE latency_price_snapshots ADD COLUMN capture_mode TEXT`,
+  `ALTER TABLE latency_price_snapshots ADD COLUMN confidence TEXT`,
+  `ALTER TABLE latency_price_snapshots ADD COLUMN due_at_uncertainty_sec INTEGER`,
+  `ALTER TABLE latency_price_snapshots ADD COLUMN market_session TEXT`,
+  `ALTER TABLE latency_price_snapshots ADD COLUMN backfill_attempts INTEGER NOT NULL DEFAULT 0`,
+  `CREATE INDEX IF NOT EXISTS idx_latency_price_backfill_due
+     ON latency_price_snapshots (capture_mode, due_at)
+     WHERE captured_at IS NULL`,
+  `UPDATE latency_price_snapshots
+      SET captured_at = NULL, error = NULL
+    WHERE error IN ('missed_window', 'fmp_quote_http_402')`,
+] as const;
+
+/**
+ * 0093_premium_activation_alerts.sql — idempotency ledger for the "someone
+ * became Premium" Pushover notification (billing/premiumActivationAlert.ts),
+ * plus supporting indexes so the totals aggregate it sends stays cheap.
+ * Renumbered off 0090/0091 after those slots landed on main as
+ * admin_allowlist / apple_subscriptions_nullable_user / latency_snapshot_repair.
+ */
+export const PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS premium_activation_notices (
+     activation_key  TEXT PRIMARY KEY,
+     user_id         TEXT NOT NULL,
+     notified_at     TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_users_premium_status ON users (subscription_status, plan)',
+  `CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_status_expires
+     ON apple_subscriptions (status, expires_date)`,
+] as const;
+
+
+/**
+ * 0095_latency_snapshot_12h_sweep.sql
+ */
+export const LATENCY_SNAPSHOT_12H_SWEEP_SCHEMA_STATEMENTS = [
+  `ALTER TABLE latency_price_snapshots ADD COLUMN swept_12h INTEGER NOT NULL DEFAULT 0;`
+] as const;
+
+/**
+ * 0096_gov_probe_intervals_and_24h_snapshots.sql
+ */
+export const GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filings ADD COLUMN prev_probe_at TEXT',
+  'ALTER TABLE filings ADD COLUMN probe_interval_sec INTEGER',
+  'ALTER TABLE trade_latency_candidates ADD COLUMN congress_window_start TEXT',
+] as const;
+
+/**
+ * 0097_unblock_not_found_house_phantoms.sql
+ */
+/**
+ * 0098_latency_time_provenance.sql
+ * Observed vs claimed timestamp provenance on latency_price_snapshots.
+ * Independent of confidence (exact / bracketed / unbounded).
+ */
+export const LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS = [
+  'ALTER TABLE latency_price_snapshots ADD COLUMN time_provenance TEXT',
+  `UPDATE latency_price_snapshots
+      SET time_provenance = 'observed'
+    WHERE event = 'ct_publish'
+      AND time_provenance IS NULL`,
+] as const;
+
+/**
+ * 0099_feed_latency_join_index.sql
+ * GET /api/transactions looks up one trade_latency_candidates row by doc_id.
+ * The file migration creates the index.  POST_0024 must create the same
+ * object or the file-vs-admin schema snapshot diverges.
+ */
+export const FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS = [
+  `CREATE INDEX IF NOT EXISTS idx_trade_latency_candidates_doc
+     ON trade_latency_candidates (doc_id, ticker, tx_date, tx_type)`,
+] as const;
+
+/** 0100_peer_import_receipts.sql — inbound ST share-push import audit log. */
+export const PEER_IMPORT_RECEIPT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS peer_import_receipts (
+     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+     request_id      TEXT NOT NULL,
+     received_at     TEXT NOT NULL,
+     origin          TEXT,
+     kind            TEXT NOT NULL DEFAULT 'share_push',
+     payload_bytes   INTEGER NOT NULL DEFAULT 0,
+     ok              INTEGER NOT NULL DEFAULT 1,
+     accepted_json   TEXT NOT NULL DEFAULT '{}',
+     dropped_json    TEXT NOT NULL DEFAULT '{}',
+     rejected_json   TEXT NOT NULL DEFAULT '{}',
+     errors_json     TEXT NOT NULL DEFAULT '[]'
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_peer_import_receipts_received_at ON peer_import_receipts (received_at)',
+  'CREATE INDEX IF NOT EXISTS idx_peer_import_receipts_request_id ON peer_import_receipts (request_id)',
+] as const;
+
+/**
+ * 0101_market_import_provenance.sql
+ * Provider as-of stays in updated_at. received_at is when the push landed.
+ * 0100 is reserved for peer import receipts in #2634. 0102 on main is the
+ * freshness-stream indexes from #2635.
+ */
+export const MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS = [
+  'ALTER TABLE fundamentals_eod ADD COLUMN received_at TEXT',
+  'ALTER TABLE analyst_consensus ADD COLUMN received_at TEXT',
+  // Pre-0101 updated_at was the receive time. Copy it once so freshness does
+  // not go dark until the next push. Later imports set received_at themselves.
+  'UPDATE fundamentals_eod SET received_at = updated_at WHERE received_at IS NULL',
+  'UPDATE analyst_consensus SET received_at = updated_at WHERE received_at IS NULL',
+] as const;
+
+/**
+ * 0102_freshness_stream_indexes.sql
+ * Daily freshness MAX(date) / imported MAX(updated_at) cannot ride
+ * PRIMARY KEY (ticker, date).  Same statements as the file migration so the
+ * file-vs-admin schema snapshot stays aligned.
+ */
+export const FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS = [
+  'CREATE INDEX IF NOT EXISTS idx_insider_eod_date ON insider_eod (date)',
+  'CREATE INDEX IF NOT EXISTS idx_short_volume_eod_date ON short_volume_eod (date)',
+  `CREATE INDEX IF NOT EXISTS idx_analyst_consensus_source_updated
+     ON analyst_consensus (source, updated_at)`,
+] as const;
+
+/**
+ * 0103_price_unavailable_reason.sql — optional operator/provider reason text
+ * when a ticker is negative-cached as unpriceable.  Also applied via
+ * `applyGuardedSecuritiesRefColumnMigrations` (PRAGMA table_info guard) so
+ * deploy-before-migrate windows cannot 500 price writes.
+ */
+export const PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS = [
+  'ALTER TABLE securities_ref ADD COLUMN price_unavailable_reason TEXT',
+] as const;
+
+/**
+ * 0104_enrichment_unavailable.sql — negative-cache tickers that cannot be enriched.
+ */
+export const ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS = [
+  'ALTER TABLE securities_ref ADD COLUMN enrichment_unavailable INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE securities_ref ADD COLUMN enrichment_unavailable_reason TEXT',
+  'ALTER TABLE securities_ref ADD COLUMN enrichment_checked_at TEXT',
+] as const;
+
+/**
+ * 0105_filers_bioguide_lower_indexes.sql (CT-2418) — expression indexes so the
+ * case-insensitive member-id lookups stop full-scanning `filers`.  Same
+ * statements as the file migration; follows the 0075_filers_full_name_lower
+ * precedent.
+ */
+export const FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS = [
+  'CREATE INDEX IF NOT EXISTS idx_filers_bioguide_lower ON filers (LOWER(bioguide_id))',
+  'CREATE INDEX IF NOT EXISTS idx_filers_resolved_bioguide_lower ON filers (LOWER(resolved_bioguide_id))',
+] as const;
+
+/**
+ * 0106_filings_discovered_via.sql — which discovery path first surfaced a House
+ * filing ('live' intraday search or 'bulk' daily index); feeds the stale
+ * bulk-discovery alert in the watcher.
+ */
+export const FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filings ADD COLUMN discovered_via TEXT',
+] as const;
+
+/**
+ * 0107_filings_filing_status.sql — filings.filing_status, read by the admin
+ * manual-review and agreement publish paths since #1098 but never declared
+ * in a numbered migration.
+ */
+export const FILINGS_FILING_STATUS_SCHEMA_STATEMENTS = [
+  'ALTER TABLE filings ADD COLUMN filing_status TEXT',
+] as const;
+
+/**
+ * 0108_trade_retractions.sql — trade.retract signal: tx_retractions (the
+ * retraction cursor), delivery_outbox.event_kind, and the deprecation trigger
+ * that records a retraction and enqueues its 'retract:<seq>' outbox event.
+ * Keep in exact lockstep with the .sql file.
+ */
+export const TRADE_RETRACTIONS_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS tx_retractions (
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tx_id        TEXT NOT NULL,
+  doc_id       TEXT NOT NULL,
+  retracted_at TEXT NOT NULL,
+  reason       TEXT,
+  revived_at   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_tx_retractions_tx ON tx_retractions (tx_id, revived_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_tx_retractions_created ON tx_retractions (created_at)`,
+  `ALTER TABLE delivery_outbox ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'trade.new'`,
+  `CREATE TRIGGER IF NOT EXISTS trg_transactions_retract
+AFTER UPDATE OF deprecated_at ON transactions
+FOR EACH ROW
+WHEN OLD.deprecated_at IS NULL AND NEW.deprecated_at IS NOT NULL
+  -- Only rows the public feed could have served (buildTxFilters in
+  -- delivery/rows.ts): never expose ids of hidden placeholder/competitor rows.
+  AND NEW.filer_id IS NOT NULL
+  AND SUBSTR(NEW.doc_id, 1, 17) != 'provider-missing-'
+  AND NOT (NEW.source = 'competitor_backfill' AND NEW.filer_id LIKE 'EXEC-%' AND NEW.doc_id LIKE 'COMPETITOR%')
+BEGIN
+  INSERT INTO tx_retractions (tx_id, doc_id, retracted_at, reason)
+  VALUES (NEW.id, NEW.doc_id, NEW.deprecated_at, NEW.deprecated_reason);
+  INSERT OR IGNORE INTO delivery_outbox
+    (tx_id, status, attempts, available_at, last_error, created_at, updated_at, event_kind)
+  VALUES (
+    'retract:' || (SELECT MAX(seq) FROM tx_retractions WHERE tx_id = NEW.id),
+    'pending', 0,
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL,
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    'trade.retract'
+  );
+END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_transactions_unretract
+AFTER UPDATE OF deprecated_at ON transactions
+FOR EACH ROW
+WHEN OLD.deprecated_at IS NOT NULL AND NEW.deprecated_at IS NULL
+  AND EXISTS (SELECT 1 FROM tx_retractions WHERE tx_id = NEW.id AND revived_at IS NULL)
+BEGIN
+  INSERT INTO tx_cursor_seq (tx_id) SELECT NEW.id WHERE NEW.cursor_seq IS OLD.cursor_seq;
+  UPDATE transactions
+     SET cursor_seq = (SELECT MAX(seq) FROM tx_cursor_seq WHERE tx_id = NEW.id)
+   WHERE id = NEW.id AND NEW.cursor_seq IS OLD.cursor_seq;
+  UPDATE tx_retractions
+     SET revived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   WHERE tx_id = NEW.id AND revived_at IS NULL;
+END`,
+] as const;
+
+/** 0110_phantom_filer_aliases.sql — re-point known MANUAL-* phantoms. Idempotent. */
+export const PHANTOM_FILER_ALIAS_STATEMENTS = phantomFilerAliasStatements();
+
+/** 0111_review_revision_audit.sql — per-revision publish trigger audit (CT-2510). */
+export const REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS review_revision_audit (
+     id           TEXT PRIMARY KEY,
+     doc_id       TEXT NOT NULL,
+     revision     INTEGER NOT NULL,
+     trigger      TEXT NOT NULL,
+     content_hash TEXT,
+     detail       TEXT,
+     created_at   TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_review_revision_audit_doc ON review_revision_audit (doc_id, revision DESC, created_at DESC)',
+] as const;
+
+/**
+ * 0109_delivery_mode_audit.sql — who switched CT_DELIVERY_MODE (subscriber
+ * alert pause) and when; read by the delivery_mode health check and stamped
+ * on suppressed outbox rows.  Keep in lockstep with the .sql file.
+ */
+
+export const DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS delivery_mode_audit (
+     id            TEXT PRIMARY KEY,
+     mode          TEXT NOT NULL,
+     previous_mode TEXT,
+     actor         TEXT NOT NULL,
+     reason        TEXT,
+     created_at    TEXT NOT NULL
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_delivery_mode_audit_created ON delivery_mode_audit (created_at DESC)',
+] as const;
+
+export const UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS = [
+  `DELETE FROM ingestion_outbox
+   WHERE doc_id IN (
+     SELECT doc_id FROM filings
+     WHERE chamber = 'house'
+       AND ingest_status = 'not_found'
+       AND raw_object_key IS NULL
+       AND (error LIKE '%phantom%' OR error LIKE '%scout frontier-probe%')
+   )`,
+  `DELETE FROM filings
+   WHERE chamber = 'house'
+     AND ingest_status = 'not_found'
+     AND raw_object_key IS NULL
+     AND (error LIKE '%phantom%' OR error LIKE '%scout frontier-probe%')`,
+] as const;
 
 export const POST_0024_SCHEMA_STATEMENTS = [
 
@@ -1055,6 +1720,67 @@ export const POST_0024_SCHEMA_STATEMENTS = [
   ...APPLE_SIGNIN_SCHEMA_STATEMENTS,
   // 0081_apple_iap.sql
   ...APPLE_IAP_SCHEMA_STATEMENTS,
+  // 0082_review_queue_resolution_reason.sql
+  ...REVIEW_QUEUE_RESOLUTION_REASON_SCHEMA_STATEMENTS,
+  // 0083_filers_display_name.sql
+  ...FILERS_DISPLAY_NAME_SCHEMA_STATEMENTS,
+  // 0084_latency_probe_leases.sql
+  ...LATENCY_PROBE_LEASE_SCHEMA_STATEMENTS,
+  // 0085_asset_name_ticker_normalization.sql
+  ...ASSET_NORMALIZATION_0085_SCHEMA_STATEMENTS,
+  // 0086_apns_fanout_state.sql
+  ...APNS_FANOUT_STATE_SCHEMA_STATEMENTS,
+  // 0087_latency_price_snapshots.sql
+  ...LATENCY_PRICE_SNAPSHOT_SCHEMA_STATEMENTS,
+  // 0088_tx_twin_seek_index.sql
+  ...TWIN_SEEK_INDEX_SCHEMA_STATEMENTS,
+  // 0089_probe_run_brackets.sql
+  ...PROBE_RUN_BRACKET_SCHEMA_STATEMENTS,
+  // 0090_admin_allowlist.sql
+  ...ADMIN_ALLOWLIST_SCHEMA_STATEMENTS,
+  // 0091_apple_subscriptions_nullable_user.sql — Guideline 5.1.1(v).  A
+  // guarded one-batch table rebuild run by executeAdminSchemaMigrations, not
+  // replayed here (see APPLE_SUBSCRIPTIONS_NULLABLE_USER_SCHEMA_STATEMENTS).
+  // 0092_latency_snapshot_repair.sql
+  ...LATENCY_PRICE_SNAPSHOT_REPAIR_SCHEMA_STATEMENTS,
+  // 0093_premium_activation_alerts.sql
+  ...PREMIUM_ACTIVATION_ALERT_SCHEMA_STATEMENTS,
+  // 0094_x_auth.sql
+  ...X_AUTH_SCHEMA_STATEMENTS,
+  // 0095_latency_snapshot_12h_sweep.sql
+  ...LATENCY_SNAPSHOT_12H_SWEEP_SCHEMA_STATEMENTS,
+  // 0096_gov_probe_intervals_and_24h_snapshots.sql
+  ...GOV_PROBE_INTERVALS_SCHEMA_STATEMENTS,
+  // 0097_unblock_not_found_house_phantoms.sql
+  ...UNBLOCK_NOT_FOUND_HOUSE_PHANTOMS_STATEMENTS,
+  // 0098_latency_time_provenance.sql
+  ...LATENCY_TIME_PROVENANCE_SCHEMA_STATEMENTS,
+  // 0099_feed_latency_join_index.sql
+  ...FEED_LATENCY_JOIN_INDEX_SCHEMA_STATEMENTS,
+  // 0100_peer_import_receipts.sql
+  ...PEER_IMPORT_RECEIPT_SCHEMA_STATEMENTS,
+  // 0101_market_import_provenance.sql (0100 reserved for peer import receipts in #2634)
+  ...MARKET_IMPORT_PROVENANCE_SCHEMA_STATEMENTS,
+  // 0102_freshness_stream_indexes.sql (#2635)
+  ...FRESHNESS_STREAM_INDEX_SCHEMA_STATEMENTS,
+  // 0103_price_unavailable_reason.sql
+  ...PRICE_UNAVAILABLE_REASON_SCHEMA_STATEMENTS,
+  // 0104_enrichment_unavailable.sql
+  ...ENRICHMENT_UNAVAILABLE_SCHEMA_STATEMENTS,
+  // 0105_filers_bioguide_lower_indexes.sql (CT-2418)
+  ...FILERS_BIOGUIDE_LOWER_SCHEMA_STATEMENTS,
+  // 0106_filings_discovered_via.sql
+  ...FILINGS_DISCOVERED_VIA_SCHEMA_STATEMENTS,
+  // 0107_filings_filing_status.sql
+  ...FILINGS_FILING_STATUS_SCHEMA_STATEMENTS,
+  // 0108_trade_retractions.sql
+  ...TRADE_RETRACTIONS_SCHEMA_STATEMENTS,
+  // 0109_delivery_mode_audit.sql
+  ...DELIVERY_MODE_AUDIT_SCHEMA_STATEMENTS,
+  // 0110_phantom_filer_aliases.sql (CT-1362 / CT-1360)
+  ...PHANTOM_FILER_ALIAS_STATEMENTS,
+  // 0111_review_revision_audit.sql (CT-2510)
+  ...REVIEW_REVISION_AUDIT_SCHEMA_STATEMENTS,
 ] as const;
 
 export const INGESTION_DECISIONS_SCHEMA_STATEMENTS = [

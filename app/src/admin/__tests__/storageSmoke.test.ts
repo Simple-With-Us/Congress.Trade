@@ -97,4 +97,12 @@ describe('verifyRawFilesStorage', () => {
     expect(fake.remove).toHaveBeenCalledOnce();
     expect(fake.remove.mock.calls[0][0]).toMatch(/^storage-smoke\/[0-9a-f-]{36}\.txt$/);
   });
+
+  it('reports put when put and cleanup both fail', async () => {
+    const fake = fakeBucket();
+    fake.put.mockRejectedValueOnce(new Error('Unauthorized'));
+    fake.remove.mockRejectedValueOnce(new Error('Unauthorized'));
+
+    await expect(verifyRawFilesStorage(fake.bucket)).rejects.toMatchObject({ stage: 'put' });
+  });
 });

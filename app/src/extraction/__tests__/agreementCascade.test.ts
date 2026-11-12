@@ -1,9 +1,10 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, StandardFonts } from 'pdf-lib';
 import {
   allSuccessfulReadsEmpty,
   handleAgreementCheck,
   processAgreementCascadeTier2,
+  processAgreementDoc,
   type AgreementModelsC,
 } from '../agreement.ts';
 import type { CandidateDocResult } from '../bakeoff.ts';
@@ -13,6 +14,21 @@ import type { CandidateDocResult } from '../bakeoff.ts';
 async function validPdfArrayBuffer(): Promise<ArrayBuffer> {
   const pdf = await PDFDocument.create();
   pdf.addPage([200, 200]);
+  const bytes = await pdf.save();
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+/** A 278-T PDF whose text layer holds one real transaction row: the
+ *  deterministic ogeText parser must recover it from a zero-read settlement. */
+async function executiveRowsPdfArrayBuffer(): Promise<ArrayBuffer> {
+  const pdf = await PDFDocument.create();
+  const page = pdf.addPage([612, 792]);
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const lines = [
+    '# DESCRIPTION TYPE DATE NOTIFICATION RECEIVED OVER 30 DAYS AGO AMOUNT',
+    '1 Apple Inc. (AAPL) Purchase 01/05/2026 No $1,001 - $15,000',
+  ];
+  lines.forEach((line, i) => page.drawText(line, { x: 36, y: 740 - i * 14, size: 10, font }));
   const bytes = await pdf.save();
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
@@ -76,7 +92,7 @@ interface Captured {
   decisions: Array<{ action: unknown; source: unknown; reason: unknown; payload: Record<string, unknown> | null }>;
 }
 
-function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; priorAttempts?: number; maxAttempts?: string; env?: Record<string, unknown> } = {}) {
+function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; priorAttempts?: number; maxAttempts?: string; env?: Record<string, unknown>; rawDocBytes?: ArrayBuffer; reviewReason?: string } = {}) {
   const cap: Captured = { inserted: [], resolved: [], sent: [], reviewFlags: [], decisions: [] };
   const review = {
     resolved: 0,
@@ -94,7 +110,9 @@ function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; pr
         bind(...p: unknown[]) { this.params = p; return this; },
         async first<T>() {
           if (/SELECT doc_id, chamber, filer_id/i.test(sql)) {
-            return { doc_id: this.params[0], chamber: 'house', filer_id: 'P1', filing_type: 'P', filed_date: '2026-06-20', source_url: 'u', raw_object_key: 'raw/x', ingest_status: 'needs_review', doc_kind: 'scanned_pdf', extractor: null, model_version: null, confidence: null, first_seen_at: '2026-06-20', source_updated_at: null, error: null } as T;
+            const docId = String(this.params[0]);
+            const executive = docId.startsWith('E-');
+            return { doc_id: docId, chamber: executive ? 'executive' : 'house', filer_id: 'P1', filing_type: 'P', filed_date: '2026-06-20', source_url: 'u', raw_object_key: 'raw/x', ingest_status: 'needs_review', doc_kind: executive ? 'text_pdf' : 'scanned_pdf', extractor: executive ? 'ogeText' : null, model_version: null, confidence: null, first_seen_at: '2026-06-20', source_updated_at: null, error: null } as T;
           }
           if (/SELECT page_count, raw_bytes FROM filings/i.test(sql)) {
             return { page_count: opts.pageCount ?? null, raw_bytes: opts.rawBytes ?? null } as T;
@@ -110,13 +128,20 @@ function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; pr
               agreement_suppressed_at: null,
               agreement_suppression_reason: null,
               review_revision: review.revision,
+              payload: null,
             } as T;
           }
           if (/SELECT payload, review_revision FROM review_queue/i.test(sql)) {
             return { payload: null, review_revision: review.revision } as T;
           }
+          if (/SELECT review_revision, resolved FROM review_queue/i.test(sql)) {
+            return { review_revision: review.revision, resolved: review.resolved } as T;
+          }
           if (/SELECT review_revision FROM review_queue/i.test(sql)) {
             return { review_revision: review.revision } as T;
+          }
+          if (opts.reviewReason !== undefined && /SELECT reason FROM review_queue WHERE doc_id = \? AND resolved = 0/i.test(sql)) {
+            return { reason: opts.reviewReason } as T;
           }
           return null as T | null;
         },
@@ -212,6 +237,9 @@ function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; pr
         },
       };
     },
+    async batch(statements: Array<{ run(): Promise<unknown> }>) {
+      return Promise.all(statements.map((statement) => statement.run()));
+    },
   } as unknown as D1Database;
 
   const env = {
@@ -222,7 +250,11 @@ function makeEnv(opts: { pageCount?: number | null; rawBytes?: number | null; pr
     AGREEMENT_MAX_ATTEMPTS: opts.maxAttempts,
     OPENAI_API_KEY: 'k', ANTHROPIC_API_KEY: 'k', MISTRAL_API_KEY: 'k',
     DB: db,
-    RAW_FILES: { get: async () => ({ arrayBuffer: validPdfArrayBuffer }) },
+    RAW_FILES: {
+      get: async () => ({
+        arrayBuffer: opts.rawDocBytes ? async () => opts.rawDocBytes : validPdfArrayBuffer,
+      }),
+    },
     INGEST_QUEUE: { send: async (m: unknown) => { cap.sent.push(m); } },
     DELIVERY_QUEUE: { send: async () => {}, sendBatch: async () => {} },
     ...(opts.env ?? {}),
@@ -255,6 +287,27 @@ describe('allSuccessfulReadsEmpty', () => {
 
 describe('agreement cascade — tier 1', () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it('refuses to publish an executive filing parked as oge_rows_incomplete', async () => {
+    // A unanimous cascade read cannot prove it recovered the numbered rows the
+    // text parser dropped; only a human / full transcription may publish it.
+    stub(asJson([row('AAPL', 'B', AB)]), asJson([row('AAPL', 'B', AB)]));
+    const { env, cap } = makeEnv({ reviewReason: 'oge_rows_incomplete,low_confidence' });
+    const res = await handleAgreementCheck(env, 'E-2026-jane-doe-01-15-2026-278t', 'raw/x');
+    expect(cap.inserted).toHaveLength(0);
+    expect(cap.resolved).toHaveLength(0);
+    expect(res).toMatchObject({ outcome: 'agree_but_hardfail', flags: ['oge_rows_incomplete'] });
+  });
+
+
+  it('refuses an executive candidate set whose own row numbers skip', async () => {
+    const numbered = (n: number) => row('AAPL', 'B', AB, { rawText: `#${n} APPLE INC purchase`, supplementalText: `OGE 278-T row ${n}, page 2 of 2` });
+    stub(asJson([numbered(1), numbered(3)]), asJson([numbered(1), numbered(3)]));
+    const { env, cap } = makeEnv({ reviewReason: 'low_confidence' });
+    const res = await handleAgreementCheck(env, 'E-2026-jane-doe-01-15-2026-278t', 'raw/x');
+    expect(cap.inserted).toHaveLength(0);
+    expect(res).toMatchObject({ outcome: 'agree_but_hardfail', flags: ['oge_rows_incomplete'] });
+  });
 
   it('tier-1 unanimous publishes (regression)', async () => {
     stub(asJson([row('AAPL', 'B', AB)]), asJson([row('AAPL', 'B', AB)]));
@@ -309,6 +362,44 @@ describe('agreement cascade — tier 1', () => {
     expect(cap.reviewFlags.some((f) => f.reason === 'extract_empty_failure')).toBe(true);
   });
 
+  it('executive zero-read settlement routes deterministic rows through normalization', async () => {
+    // Both agreement reads come back empty, but the deterministic parser
+    // finds a real 278-T row in the stored PDF.  The settlement must route
+    // that row through normalization instead of stamping
+    // extract_empty_failure over it.
+    stub(asJson([]), asJson([]));
+    const rawDocBytes = await executiveRowsPdfArrayBuffer();
+    const { env, cap } = makeEnv({ rawDocBytes });
+    const res = await handleAgreementCheck(env, 'E-2026-jane-doe-01-15-2026-278t', 'raw/x');
+    expect(res).toMatchObject({
+      reason: 'deterministic_rows_recovered',
+      flags: expect.arrayContaining(['deterministic_rows_recovered']),
+    });
+    expect(res?.outcome).not.toBe('agree_but_hardfail');
+    expect(cap.decisions.some((d) => d.action === 'extract_empty_failure')).toBe(false);
+    expect(cap.reviewFlags.some((f) => String(f.reason).includes('extract_empty_failure'))).toBe(false);
+  });
+
+  it('operator reprocess (processAgreementDoc, non-dry) settles an executive zero-read', async () => {
+    // The /agreement-reprocess route calls processAgreementDoc directly with
+    // no claim token; its empty path must run the same executive settlement
+    // as the tier-1 queue handler instead of stamping extract_empty_failure.
+    stub(asJson([]), asJson([]));
+    const rawDocBytes = await executiveRowsPdfArrayBuffer();
+    const { env, cap } = makeEnv({ rawDocBytes });
+    const models = { a: MODELS_C.a, b: MODELS_C.b };
+    const res = await processAgreementDoc(
+      env, models, 'E-2026-jane-doe-01-15-2026-278t', 'raw/x', false,
+    );
+    expect(res).toMatchObject({
+      reason: 'deterministic_rows_recovered',
+      flags: expect.arrayContaining(['deterministic_rows_recovered']),
+    });
+    expect(res.outcome).not.toBe('agree_but_hardfail');
+    expect(cap.decisions.some((d) => d.action === 'extract_empty_failure')).toBe(false);
+    expect(cap.reviewFlags.some((f) => String(f.reason).includes('extract_empty_failure'))).toBe(false);
+  });
+
   it('a big doc (page_count over threshold) starts directly at tier 2', async () => {
     const seen = stub(asJson([row('AAPL', 'B', AB)]), asJson([row('AAPL', 'B', AB)]), asJson([row('AAPL', 'B', AB)]));
     const { env, cap } = makeEnv({ pageCount: 20 });
@@ -332,12 +423,12 @@ describe('agreement cascade — tier 2 / tier 3', () => {
   });
 
   it('2-of-3 majority on every material field publishes with a cascade audit (tier 3)', async () => {
-    // Same row identity in all reads; C disagrees on owner, so exact tier-2
-    // unanimity fails and tier 3 resolves the 2-of-3 material-field majority.
+    // Same row identity in all reads; C disagrees on amount bracket, so exact
+    // tier-2 unanimity fails and tier 3 resolves the 2-of-3 material-field majority.
     stub(
       asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
       asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
-      asJson([row('AAPL', 'B', AB, { owner: 'spouse' })]),
+      asJson([row('AAPL', 'B', AB2, { owner: 'self' })]),
     );
     const { env, cap } = makeEnv();
     const res = await processAgreementCascadeTier2(env, MODELS_C, 'H-6', 'raw/H-6', false);
@@ -346,6 +437,23 @@ describe('agreement cascade — tier 2 / tier 3', () => {
     const decision = cap.decisions.find((d) => d.action === 'agreement_published');
     expect(decision?.payload).toMatchObject({ resolvedBy: 'agreement-cascade', tier: 3 });
     expect(decision?.payload?.votes).toBeTruthy(); // per-field vote summary present
+  });
+
+  it('2-of-3 owner majority on a single lot publishes the majority owner (tier 3)', async () => {
+    // Owner disagreement alone: tier-2 unanimity fails, the lot still meets under
+    // the owner-aware key back-compat, and tier 3 votes owner 2-of-3.  A split of
+    // the lot into two keys, or a collapse that drops the vote, fails here.
+    stub(
+      asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
+      asJson([row('AAPL', 'B', AB, { owner: 'self' })]),
+      asJson([row('AAPL', 'B', AB, { owner: 'spouse' })]),
+    );
+    const { env, cap } = makeEnv();
+    const res = await processAgreementCascadeTier2(env, MODELS_C, 'H-owner-majority', 'raw/x', false);
+    expect(res).toMatchObject({ outcome: 'published', tier: 3 });
+    expect(cap.inserted).toHaveLength(1);
+    const insertedRows = JSON.parse(cap.inserted[0][0] as string) as Array<{ owner: string | null }>;
+    expect(insertedRows.map((r) => r.owner)).toEqual(['self']);
   });
 
   it('does not drop a minority-only extra row', async () => {
@@ -494,6 +602,27 @@ describe('agreement cascade — text-field normalization', () => {
     const insertedRows = JSON.parse(cap.inserted[0][0] as string) as Array<{ assetName: string }>;
     expect(insertedRows).toHaveLength(1);
     expect(insertedRows[0].assetName).toBe('First Data, Corp.'); // majority (A+B) text, B's wording
+  });
+
+  it('tier 1: House GS type-code as ticker still agrees with a no-ticker T-bill read', async () => {
+    stub(
+      asJson([row('GS', 'B', AB, {
+        assetName: 'Treasury Bill (3-Month, Matures 5/1/2025)',
+        ticker: 'GS',
+        assetType: 'GS',
+        confidence: 0.55,
+      })]),
+      asJson([row('GS', 'B', AB, {
+        assetName: 'Treasury Bill (3-Month, Matures 5/1/2025)',
+        ticker: null,
+        assetType: 'GS',
+        confidence: 0.5,
+      })]),
+    );
+    const { env, cap } = makeEnv();
+    await handleAgreementCheck(env, 'H-tbill-gs', 'raw/H-tbill-gs');
+    expect(cap.inserted).toHaveLength(1);
+    expect(cap.sent).toHaveLength(0);
   });
 
   it('kill switch (AGREEMENT_TEXT_NORMALIZATION=false) restores byte-strict comparison: the SAME near-miss pair that agrees by default now disagrees', async () => {

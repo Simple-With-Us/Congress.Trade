@@ -8,6 +8,9 @@ export default defineConfig({
   },
   test: {
     exclude: ['vendor/**', 'node_modules/**'],
+    // Pins CT_DELIVERY_MODE=deliver so suites that never boot the settings
+    // service keep today's delivery behavior; deliveryMode.test.ts clears it.
+    setupFiles: ['./src/__tests__/setupDeliveryMode.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary', 'html'],

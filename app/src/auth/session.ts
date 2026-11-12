@@ -21,9 +21,38 @@ import { isSecureRequest } from '../security/requestProtocol.ts';
 export const SESSION_COOKIE = 'ct_session';
 const SESSION_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
 const SESSION_PREFIX = 'sess:';
+const SESSION_USER_PREFIX = 'sess_user:';
 
 interface SessionData {
   userId: string;
+}
+
+function parseTokenList(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((token): token is string => typeof token === 'string' && token.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function indexUserSession(env: Env, userId: string, token: string): Promise<void> {
+  const key = SESSION_USER_PREFIX + userId;
+  const tokens = parseTokenList(await env.CONFIG_KV.get(key));
+  if (!tokens.includes(token)) tokens.push(token);
+  await env.CONFIG_KV.put(key, JSON.stringify(tokens), { expirationTtl: SESSION_TTL_SEC });
+}
+
+async function unindexUserSession(env: Env, userId: string, token: string): Promise<void> {
+  const key = SESSION_USER_PREFIX + userId;
+  const tokens = parseTokenList(await env.CONFIG_KV.get(key)).filter((item) => item !== token);
+  if (tokens.length === 0) {
+    await env.CONFIG_KV.delete(key);
+    return;
+  }
+  await env.CONFIG_KV.put(key, JSON.stringify(tokens), { expirationTtl: SESSION_TTL_SEC });
 }
 
 /** Create a session for `userId` and return its opaque token. */
@@ -33,12 +62,31 @@ export async function createSession(env: Env, userId: string): Promise<string> {
   await env.CONFIG_KV.put(SESSION_PREFIX + token, JSON.stringify(data), {
     expirationTtl: SESSION_TTL_SEC,
   });
+  await indexUserSession(env, userId, token);
   return token;
+}
+
+// CT-2459: 30s isolate cache for token -> userId ONLY. The User row is
+// still fetched fresh on every request (profile/subscription freshness is
+// the design goal above); this only skips the KV/SQL round trip that maps
+// token to user. Logout in this isolate invalidates immediately via
+// destroySession/destroySessionsForUser; a logout in another isolate takes
+// effect here within the TTL.
+const SESSION_IDENTITY_CACHE_MS = 30_000;
+const tokenUserCache = new Map<string, { userId: string; expiresAtMs: number }>();
+
+/** Test hook: drop the identity cache. */
+export function resetSessionIdentityCacheForTests(): void {
+  tokenUserCache.clear();
 }
 
 /** Resolve a session token to its fresh User (or null if missing/expired). */
 export async function resolveSession(env: Env, token: string | undefined): Promise<User | null> {
   if (!token) return null;
+  const cachedIdentity = tokenUserCache.get(token);
+  if (cachedIdentity && cachedIdentity.expiresAtMs > Date.now()) {
+    return getUserById(env, cachedIdentity.userId);
+  }
   const raw = await env.CONFIG_KV.get(SESSION_PREFIX + token);
   if (!raw) return null;
   let data: SessionData;
@@ -48,12 +96,38 @@ export async function resolveSession(env: Env, token: string | undefined): Promi
     return null;
   }
   if (!data.userId) return null;
+  if (tokenUserCache.size >= 1_000) tokenUserCache.clear();
+  tokenUserCache.set(token, {
+    userId: data.userId,
+    expiresAtMs: Date.now() + SESSION_IDENTITY_CACHE_MS,
+  });
   return getUserById(env, data.userId);
 }
 
 export async function destroySession(env: Env, token: string | undefined): Promise<void> {
   if (!token) return;
+  tokenUserCache.delete(token);
+  const raw = await env.CONFIG_KV.get(SESSION_PREFIX + token);
   await env.CONFIG_KV.delete(SESSION_PREFIX + token);
+  if (!raw) return;
+  try {
+    const data = JSON.parse(raw) as SessionData;
+    if (data.userId) await unindexUserSession(env, data.userId, token);
+  } catch {
+    // Corrupt session payload — the token is already gone.
+  }
+}
+
+/** Revoke every indexed session for `userId`.  Older tokens minted before the
+ * reverse index still become inert once the `users` row is deleted. */
+export async function destroySessionsForUser(env: Env, userId: string): Promise<number> {
+  if (!env.CONFIG_KV) return 0;
+  const key = SESSION_USER_PREFIX + userId;
+  const tokens = parseTokenList(await env.CONFIG_KV.get(key));
+  for (const token of tokens) tokenUserCache.delete(token);
+  await Promise.all(tokens.map((token) => env.CONFIG_KV.delete(SESSION_PREFIX + token)));
+  await env.CONFIG_KV.delete(key);
+  return tokens.length;
 }
 
 /**

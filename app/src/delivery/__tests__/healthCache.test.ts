@@ -56,4 +56,39 @@ describe('GET /health readiness caching', () => {
     expect(third.status).toBe(200);
     expect(probes()).toBe(afterFirst * 2); // TTL expired: one fresh probe pass
   });
+
+  it('publishes Infisical source status without secret values', async () => {
+    const { env } = makeEnv();
+    const app = buildRestRouter();
+    const res = await app.request('http://localhost/health', {}, env);
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      checks?: {
+        secrets?: {
+          enabled?: boolean;
+          sources?: Array<{ name?: string; count?: number }>;
+        };
+      };
+    };
+    expect(body.checks?.secrets).toEqual(expect.objectContaining({ enabled: expect.any(Boolean) }));
+    const blob = JSON.stringify(body.checks?.secrets ?? {});
+    expect(blob).not.toMatch(/secretValue|AGENT_SYNC_TOKEN|sk-|xoxb-/i);
+    expect(Array.isArray(body.checks?.secrets?.sources)).toBe(true);
+  });
+
+  it('publishes Datadog enablement booleans without keys', async () => {
+    const { env } = makeEnv();
+    const app = buildRestRouter();
+    const res = await app.request('http://localhost/health', {}, {
+      ...env,
+      DD_API_KEY: 'secret-api-key-must-not-leak',
+      DD_SITE: 'us5.datadoghq.com',
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      checks?: { datadog?: { logs?: boolean; apm?: boolean; rum?: boolean } };
+    };
+    expect(body.checks?.datadog).toEqual({ logs: true, apm: true, rum: false });
+    expect(JSON.stringify(body)).not.toContain('secret-api-key-must-not-leak');
+  });
 });

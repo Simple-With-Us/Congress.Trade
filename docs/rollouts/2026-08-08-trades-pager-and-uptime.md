@@ -21,7 +21,7 @@
 - Installed `/usr/local/bin/congress-health-recover.sh` + unit on `fleet-hetzner-nbg1` (SSH host `coolify`).
 - `systemctl enable --now congress-health-recover` → **active**.
 - Live container: `apk add curl` so Coolify cmd healthcheck works until next image rebuild.
-- Coolify app `c11c5hdhuczureb6w2pg20p0`: health path `/api/health`, port **5000**, interval 30s, start period 120s, retries 5.
+- Coolify app `<CT_COOLIFY_APP_UUID>`: health path `/api/health`, port **5000**, interval 30s, start period 120s, retries 5.
 
 Watchdog behavior:
 

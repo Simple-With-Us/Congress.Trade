@@ -1,5 +1,9 @@
 # 2026-07-30 — Deno Deploy retirement cleanup (staging preview + Sentry watchlist)
 
+> **Current shape (2026-08):** Deno Deploy stays retired.  Production is
+> Coolify Deno-in-Docker on Hetzner.  `app/DEPLOY.md` and `AGENTS.md` are the
+> live deploy path (the follow-up below about stale `ship.sh` is itself stale).
+
 ## Summary
 
 Owner directive (2026-07-29 23:05): "we aren't using deno-deploy anymore only

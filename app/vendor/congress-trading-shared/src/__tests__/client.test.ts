@@ -391,7 +391,7 @@ describe("CongressTradeClient", () => {
     it("preserves required read provenance and additive transaction fields", async () => {
       const transaction = {
         id: "tx-1", docId: "doc-1", filerId: null, txDate: "2026-01-01", owner: "self",
-        assetName: "Apple", ticker: "AAPL", assetType: "stock", txType: "B",
+        assetName: "Apple", ticker: "AAPL", assetType: "stock", txType: "P",
         amountMin: 1001, amountMax: 15000, estValue: 8000, isOption: false,
         capGainsOver200: false, rawText: "Apple", confidence: 0.9, source: "primary",
         createdAt: "2026-01-02T00:00:00Z", cursorSeq: 42,
@@ -463,14 +463,24 @@ describe("CongressTradeClient", () => {
       expect(result).toEqual([{ filerId: "123", tradeCount: 10 }]);
     });
 
-    it("getMemberPerformance returns performance data", async () => {
+    it("getMemberPerformance returns dual-anchor performance (filing + trade)", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ performance: { tradeCount: 10, winRate: 0.7 } }),
+        json: async () => ({
+          filerId: "filer-1",
+          side: "buys",
+          buyCount: 12,
+          tradeDate: { tradeCount: 12, scoredCount: 10, winRate: 0.7, avgExcess: 0.02 },
+          filingDate: { tradeCount: 12, scoredCount: 9, winRate: 0.66, avgExcess: 0.015, avgAnnualizedExcess: 0.04 },
+          performance: { tradeCount: 12, scoredCount: 10, winRate: 0.7, avgExcess: 0.02 },
+          note: "Buys only.",
+        }),
       });
       const client = mockClient(mockFetch);
       const result = await client.getMemberPerformance("filer-1");
-      expect(result).toEqual({ tradeCount: 10, winRate: 0.7 });
+      expect(result?.filingDate?.avgExcess).toBe(0.015);
+      expect(result?.tradeDate?.avgExcess).toBe(0.02);
+      expect(result?.performance?.winRate).toBe(0.7);
     });
 
     it("getMemberPerformance returns null for empty filerId", async () => {
@@ -481,12 +491,18 @@ describe("CongressTradeClient", () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it("getMemberPerformance accepts explicit null and rejects a missing envelope", async () => {
-      const mockFetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ performance: null }) });
+    it("getMemberPerformance accepts legacy single-leg performance and rejects garbage", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ performance: { tradeCount: 10, winRate: 0.7 } }),
+      });
       const client = mockClient(mockFetch);
-      const result = await client.getMemberPerformance("filer-1");
-      expect(result).toBeNull();
-      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+      const legacy = await client.getMemberPerformance("filer-1");
+      expect(legacy?.performance?.tradeCount).toBe(10);
+      expect(legacy?.tradeDate?.tradeCount).toBe(10);
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ performance: null }) });
+      expect(await client.getMemberPerformance("filer-1")).toBeNull();
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ not: "valid" }) });
       await expect(client.getMemberPerformance("filer-1")).rejects.toThrow("Invalid member performance response");
     });
 
@@ -503,7 +519,7 @@ describe("CongressTradeClient", () => {
     it("getTickerBacktest returns backtest with horizons", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ ticker: "AAPL", filerId: "123", txType: "B", totalBuyEvents: 5, pricedDays: 30, horizons: [{ days: 30, tradeCount: 5, n: 5, medianReturn: 2.5, avgReturn: 3.0, winRate: 0.8, medianExcess: 1.5, avgExcess: 2.0 }] }),
+        json: async () => ({ ticker: "AAPL", filerId: "123", txType: "P", totalBuyEvents: 5, pricedDays: 30, horizons: [{ days: 30, tradeCount: 5, n: 5, medianReturn: 2.5, avgReturn: 3.0, winRate: 0.8, medianExcess: 1.5, avgExcess: 2.0 }] }),
       });
       const client = mockClient(mockFetch);
       const result = await client.getTickerBacktest("AAPL", { window: "90d", horizons: "30,60", filerId: "123" });
@@ -515,7 +531,7 @@ describe("CongressTradeClient", () => {
     it("getTickerBacktest returns null for empty horizons", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ ticker: "AAPL", txType: "B", totalBuyEvents: 0, pricedDays: 0, horizons: [] }),
+        json: async () => ({ ticker: "AAPL", txType: "P", totalBuyEvents: 0, pricedDays: 0, horizons: [] }),
       });
       const client = mockClient(mockFetch);
       const result = await client.getTickerBacktest("AAPL");
@@ -525,7 +541,7 @@ describe("CongressTradeClient", () => {
     it("getConflicts returns conflicts array", async () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({ conflicts: [{ id: "c1", ticker: "AAPL", sector: "Tech", txType: "B", txDate: "2026-01-01", filerId: "123", memberName: "Jane Doe", chamber: "senate", partyBucket: "D", viaCommittees: ["Banking"], estAmountUsd: 50000 }] }),
+        json: async () => ({ conflicts: [{ id: "c1", ticker: "AAPL", sector: "Tech", txType: "P", txDate: "2026-01-01", filerId: "123", memberName: "Jane Doe", chamber: "senate", partyBucket: "D", viaCommittees: ["Banking"], estAmountUsd: 50000 }] }),
       });
       const client = mockClient(mockFetch);
       const result = await client.getConflicts({ chamber: "senate", party: "D" });

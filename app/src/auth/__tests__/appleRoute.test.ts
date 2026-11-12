@@ -100,6 +100,44 @@ async function fakeEnv(overrides: Record<string, unknown> = {}): Promise<Env> {
   } as unknown as Env;
 }
 
+describe('GET /auth/apple/status', () => {
+  it('reports web:false when Sign in with Apple is off', async () => {
+    const app = buildAuthRouter();
+    const env = await fakeEnv({ APPLE_SIGNIN_ENABLED: 'false' });
+    const res = await app.request('http://localhost/apple/status', { method: 'GET' }, env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ enabled: false, web: false });
+  });
+
+  it('reports web:false when enabled but Services ID is missing', async () => {
+    const app = buildAuthRouter();
+    const env = await fakeEnv({ APPLE_SIGNIN_ENABLED: 'true' });
+    const res = await app.request('http://localhost/apple/status', { method: 'GET' }, env);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ enabled: true, web: false });
+  });
+});
+
+describe('GET /auth/apple/start', () => {
+  it('exists and does not 404 when Sign in with Apple is off', async () => {
+    const app = buildAuthRouter();
+    const env = await fakeEnv({ APPLE_SIGNIN_ENABLED: 'false' });
+    const res = await app.request('http://localhost/apple/start', { method: 'GET', headers: { Accept: 'text/html' } }, env);
+    expect(res.status).not.toBe(404);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toContain('auth_error=apple_not_configured');
+  });
+
+  it('exists and does not 404 when web Services ID is missing', async () => {
+    const app = buildAuthRouter();
+    const env = await fakeEnv({ APPLE_SIGNIN_ENABLED: 'true' });
+    const res = await app.request('http://localhost/apple/start', { method: 'GET', headers: { Accept: 'text/html' } }, env);
+    expect(res.status).not.toBe(404);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toContain('auth_error=apple_web_not_configured');
+  });
+});
+
 describe('POST /auth/apple', () => {
   beforeEach(() => {
     verifyAppleIdentityToken.mockReset();

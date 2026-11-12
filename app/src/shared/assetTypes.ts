@@ -429,3 +429,55 @@ function escapeRegExp(value: string): string {
 function sqlQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
+
+/** True when `value` is a House PTR instrument-type code (GS, ST, CS, …). */
+export function isHouseAssetTypeCode(value: string | null | undefined): boolean {
+  const code = (value ?? '').trim().toUpperCase();
+  return code !== '' && Object.prototype.hasOwnProperty.call(HOUSE_ASSET_TYPE_NAMES, code);
+}
+
+/**
+ * House type codes that also happen to be listed tickers (GS, ST, BA, …).
+ * Only treat the ticker as a misfiled type code when the asset *name*
+ * describes that instrument class — a real Goldman Sachs row named
+ * "Goldman Sachs" keeps ticker GS.
+ */
+const HOUSE_TYPE_NAME_HINTS: Record<string, RegExp> = {
+  GS: /\b(treasury|t[\s-]?bill|t[\s-]?note|t[\s-]?bond|us treas|united states treas|government securit|agency (?:debt|bond)|muni(?:cipal)?)\b/i,
+  CS: /\b(note|bond|debenture|corp(?:orate)? securit)\b/i,
+  CT: /\b(crypto|bitcoin|ethereum|\bbtc\b|\beth\b)\b/i,
+  HN: /\b(l\.?p\.?|llc|partners|private equity|hedge fund|venture)\b/i,
+  HE: /\b(l\.?p\.?|llc|partners|private equity|hedge fund|venture)\b/i,
+  OT: /\b(option|call|put)\b/i,
+  OP: /\b(option|call|put)\b/i,
+  BA: /\b(money market|certificate of deposit|\bcd\b|bank account|cash)\b/i,
+  MF: /\b(mutual fund)\b/i,
+  EF: /\b(etf|exchange traded)\b/i,
+};
+
+/**
+ * Models routinely copy the House PTR type column (GS/ST/CS/…) into `ticker`.
+ * Prod H-2025-20026666: four successful reads of the same T-bill, split into
+ * GS|date|B vs TREASURY BILL|date|B because one model used GS as the ticker.
+ */
+export function tickerIsMisfiledHouseTypeCode(
+  ticker: string | null | undefined,
+  assetType: string | null | undefined,
+  assetName: string | null | undefined,
+): boolean {
+  const t = (ticker ?? '').trim().toUpperCase();
+  if (!isHouseAssetTypeCode(t)) return false;
+  const hint = HOUSE_TYPE_NAME_HINTS[t];
+  if (hint && hint.test(assetName ?? '')) return true;
+  const at = (assetType ?? '').trim().toUpperCase();
+  // Same code in both columns AND no conflicting type hint is still a
+  // type-column echo when the name is long descriptive text, not a symbol.
+  if (at === t && (assetName ?? '').trim().length >= 24) return true;
+  return false;
+}
+
+/** Purchase/sale letters that leak into assetType from the tx-type column. */
+export function assetTypeLooksLikeTxType(value: string | null | undefined): boolean {
+  const at = (value ?? '').trim().toUpperCase();
+  return at === 'B' || at === 'S' || at === 'E' || at === 'P';
+}

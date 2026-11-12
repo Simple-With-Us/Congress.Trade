@@ -1,5 +1,9 @@
 # Deno live-ingestion scheduler
 
+> **Current shape (2026-08):** Deno Deploy and Turso are retired.  Production
+> is Coolify Deno-in-Docker on Hetzner with local SQLite + Litestream.  This
+> note is the 2026-07 Deploy-era ingestion fix.
+
 ## Summary
 
 Deno Deploy served the API and ran daily jobs, but its `Deno.cron` handler did not invoke the existing `runWatcher` discovery loop. New House, Senate, and OGE filings therefore were not discovered by the production scheduler. The handler now runs the watcher every minute and flushes the durable ingestion and delivery outboxes on each tick.
