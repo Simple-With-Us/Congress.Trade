@@ -203,6 +203,12 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: node scripts/check-actions-runner-policy.mjs
 
+      - name: Hetzner resource digest ops tests (offline)
+        working-directory: .
+        run: |
+          bash -n scripts/ops/hetzner-resource-digest.sh
+          bash scripts/ops/test-hetzner-resource-digest.sh
+
       # Offline policy table for Coolify compose overlap (#1537 / PR #1964).
       # Does not talk to Docker, Coolify, or the origin.
       - name: Deploy overlap policy tests
