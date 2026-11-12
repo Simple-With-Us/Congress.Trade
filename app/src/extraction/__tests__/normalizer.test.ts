@@ -1788,3 +1788,50 @@ describe('normalize — 278-T row completeness gate', () => {
     expect(result.reviewReason ?? '').not.toContain('oge_rows_incomplete');
   });
 });
+
+describe('vision_degenerate guard (CT-2509)', () => {
+  it('parks degenerate local_mac vision with vision_degenerate and does not publish', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { VISION_DEGENERATE_REASON } = await import('../visionDegenerateGuard.ts');
+    const degenerate = JSON.parse(
+      readFileSync(new URL('../__fixtures__/H-2026-9116403-degenerate-rows.json', import.meta.url), 'utf8'),
+    ) as Array<{
+      assetName: string;
+      ticker: string | null;
+      txType: ParsedTx['txType'];
+      owner: ParsedTx['owner'];
+      txDate: string;
+      amountMin: number;
+      amountMax: number;
+    }>;
+    const parsed: ParsedTx[] = degenerate.map((row) => ({
+      txDate: row.txDate,
+      owner: row.owner,
+      assetName: row.assetName,
+      ticker: row.ticker,
+      assetType: null,
+      txType: row.txType,
+      amountMin: row.amountMin,
+      amountMax: row.amountMax,
+      isOption: false,
+      capGainsOver200: false,
+      rawText: row.assetName,
+      confidence: 0.97,
+    }));
+    const { env, cap } = makeEnv([
+      { ticker: 'TLH', name: 'iShares 10-20 Year Treasury Bond ETF', aliases: '[]' },
+    ]);
+    const result = await normalize(env, filing({ docId: 'H-2026-9116403' }), parsed, {
+      source: 'local_mac',
+      extractor: 'mac_vision_v1',
+      modelVersion: 'fixture',
+    });
+    expect(result.needsReview).toBe(true);
+    expect(result.published).toBe(false);
+    expect(cap.insertedTx).toHaveLength(0);
+    const reasonCell = cap.reviewRows.flat().find(
+      (v) => typeof v === 'string' && (v as string).includes(VISION_DEGENERATE_REASON),
+    );
+    expect(reasonCell).toBeDefined();
+  });
+});
