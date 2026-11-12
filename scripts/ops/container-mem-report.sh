@@ -17,6 +17,10 @@
 # CONTAINER_MEM_CGROUP / CONTAINER_MEM_PROC at a fake tree.
 # CONTAINER_MEM_TOP_RSS (default 5) and CONTAINER_MEM_TOP_RSS_MAX_PROCS
 # (default 250) bound the RSS scan. Above the proc cap, top RSS is skipped.
+# Top RSS comes from cgroup.procs plus VmRSS in /proc/<pid>/status.
+# smem is not run. It is optional, and spawning it is outside this
+# read-only cgroup scan. The /proc read is the cheap path and is what
+# the offline tests fake.
 set -euo pipefail
 
 CONTAINER_MEM_DOCKER="${CONTAINER_MEM_DOCKER:-docker}"
