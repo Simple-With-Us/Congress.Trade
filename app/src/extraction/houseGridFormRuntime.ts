@@ -14,6 +14,7 @@ import {
   type HouseGridFormReader,
   type HouseGridOcrBox,
 } from './houseGridForm.ts';
+import { snapHouseGridRead, type HouseGridSecurityCatalog } from './houseGridAssetSnap.ts';
 
 const PDFTOPPM = 'pdftoppm';
 const TESSERACT = 'tesseract';
@@ -313,7 +314,12 @@ async function runPool<T>(jobs: Array<() => Promise<T>>, limit: number): Promise
   return results;
 }
 
-export function createDenoHouseGridReader(): HouseGridFormReader {
+export interface HouseGridReaderOptions {
+  /** Known securities. Absent or empty leaves OCR names unchanged. */
+  loadCatalog?: () => Promise<HouseGridSecurityCatalog | null>;
+}
+
+export function createDenoHouseGridReader(options: HouseGridReaderOptions = {}): HouseGridFormReader {
   return {
     async read(bytes: ArrayBuffer): Promise<ReturnType<typeof readHouseGridForm> | null> {
       if (typeof Deno === 'undefined') return null;
@@ -398,7 +404,16 @@ export function createDenoHouseGridReader(): HouseGridFormReader {
           pages.push({ image, boxes, page: i + 1 });
         }
         if (pages.length === 0) return null;
-        return readHouseGridForm(pages);
+        const read = readHouseGridForm(pages);
+        if (!options.loadCatalog) return read;
+        try {
+          const catalog = await options.loadCatalog();
+          if (!catalog || catalog.entries.length === 0) return read;
+          return snapHouseGridRead(read, catalog);
+        } catch (err) {
+          console.warn('house grid form: asset snap skipped', (err as Error).message);
+          return read;
+        }
       } catch (err) {
         console.warn('house grid form: local render failed', (err as Error).message);
         return null;

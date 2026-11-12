@@ -769,7 +769,12 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
 
   const visionArbitrated = new ArbitratingExtractor(configuredVision, env, secondary);
   const cheapText = new OpenRouterTextExtractor(env);
-  const housePdf = new HousePdfExtractor(textPdf, visionArbitrated, cheapText, createDenoHouseGridReader());
+  const housePdf = new HousePdfExtractor(
+    textPdf,
+    visionArbitrated,
+    cheapText,
+    createDenoHouseGridReader({ loadCatalog: () => loadHouseGridSecurityCatalog(env) }),
+  );
   const ogePdf = new OgePdfExtractor(ogeText, visionArbitrated);
 
   // ogePdf is ordered before the generic textPdf so executive-chamber PDFs
@@ -785,6 +790,7 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
 // ---------------------------------------------------------------------------
 
 import { createDenoHouseGridReader } from '../extraction/houseGridFormRuntime.ts';
+import { loadHouseGridSecurityCatalog } from '../extraction/houseGridAssetSnap.ts';
 import { SenateHtmlExtractor } from '../extraction/senateHtml.ts';
 import { TextPdfExtractor } from '../extraction/textPdf.ts';
 import { OgeTextExtractor } from '../extraction/ogeText.ts';
