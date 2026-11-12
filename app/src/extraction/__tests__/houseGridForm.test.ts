@@ -13,6 +13,7 @@ import {
   fitColumnLines,
   cleanGridAssetName,
   ownerCodeFromCell,
+  readOwnerCell,
   splitBareTicker,
   readHouseGridForm,
   xTemplateForFit,
@@ -460,6 +461,38 @@ describe('grid row, owner, and date corrections', () => {
     expect(read.transactions[0]?.txDate).toBe('2026-10-22');
     expect(read.transactions[0]?.ticker).toBe('XLE');
     expect(read.transactions[0]?.owner).toBe('joint');
+  });
+
+  it('maps a blank owner cell to self (Khanna-style empty SP/DC/JT)', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: '', asset: 'ISHARES TR RUS 1000 ETF IWB', txDate: '10/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.p, 9] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    expect(read.transactions).toHaveLength(1);
+    expect(read.transactions[0]?.owner).toBe('self');
+    expect(read.transactions[0]?.extractionWarnings ?? []).not.toContain('owner_unread');
+  });
+
+  it('flags owner_unread when the cell has ink but no confident code', () => {
+    const rows: DrawnRow[] = [
+      { y0: 220, y1: 300, owner: '', asset: 'VANGUARD TOTAL STOCK MKT ETF VTI', txDate: '10/22/26', notifDate: '11/01/26', marks: [TYPE_COLUMN.p, 9] },
+    ];
+    const drawn = drawGrid(0.72, 40, rows);
+  const xs = drawn.xs;
+    const ownerLeft = (xs[0] ?? 0) + 8;
+    const ownerRight = (xs[1] ?? 0) - 8;
+    for (let y = rows[0].y0 + 12; y < rows[0].y1 - 8; y += 3) {
+      for (let x = ownerLeft; x < ownerRight; x += 5) {
+        drawn.image.pixels[y * drawn.image.width + x] = 0;
+        drawn.image.pixels[y * drawn.image.width + x + 1] = 0;
+      }
+    }
+    expect(readOwnerCell(drawn.image, xs[0] ?? 0, rows[0].y0, xs[1] ?? 0, rows[0].y1)).toEqual({ kind: 'unread' });
+    const read = readHouseGridForm([{ image: drawn.image, boxes: drawn.boxes, page: 2 }]);
+    expect(read.transactions[0]?.owner).toBeNull();
+    expect(read.transactions[0]?.extractionWarnings).toContain('owner_unread');
+    expect(read.transactions[0]?.confidence ?? 1).toBeLessThan(0.95);
   });
 
   it('reads a stamped DC owner cell when the text box is missing', () => {
