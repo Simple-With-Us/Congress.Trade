@@ -212,12 +212,49 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.parse_size("2GB"), 2_000_000_000)
         self.assertEqual(report.parse_size("12.4kB"), 12400)
         self.assertEqual(report.parse_size("1KiB"), 1024)
+        self.assertIsNone(report.parse_size("N/A"))
+        self.assertIsNone(report.parse_size("n/a"))
+        with self.assertRaises(report.SnapshotError):
+            report.parse_size("")
+        with self.assertRaises(report.SnapshotError):
+            report.parse_size("nope")
         self.assertIsNone(report.parse_links("N/A"))
         self.assertEqual(report.parse_links("2"), 2)
         mapped = report.labels_from("map[coolify.resourceName:congress-trade coolify.managed:true]")
         self.assertEqual(mapped["coolify.resourceName"], "congress-trade")
         paired = report.labels_from("coolify.serviceName=congress-app,coolify.managed=true")
         self.assertEqual(paired["coolify.serviceName"], "congress-app")
+
+    def test_volume_size_na_stays_in_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            snap = Path(tmp)
+            write_snapshot(
+                snap,
+                volumes=[("plugin-data", "0", "N/A"), ("kept", "0", "1MB")],
+                volume_meta=[volume_ls("plugin-data"), volume_ls("kept")],
+                containers=[],
+                bind_sizes={},
+            )
+            previous = {
+                "version": 1,
+                "generated_at": NOW,
+                "volumes": [
+                    {"name": "plugin-data", "bytes": 10},
+                    {"name": "kept", "bytes": 100},
+                ],
+                "bind_mounts": [],
+            }
+            previous_path = snap / "previous.json"
+            previous_path.write_text(json.dumps(previous), encoding="utf-8")
+            built = report.report_from_dir(snap, now=NOW, host="fixture", top=10, previous_path=previous_path)
+        by_name = {row["name"]: row for row in built["volumes"]}
+        self.assertIsNone(by_name["plugin-data"]["bytes"])
+        self.assertTrue(by_name["plugin-data"]["orphan"])
+        self.assertIn("docker volume rm", by_name["plugin-data"]["suggested_rm"])
+        self.assertEqual(by_name["kept"]["bytes"], 1_000_000)
+        self.assertEqual(built["totals"]["volume_bytes"], 1_000_000)
+        self.assertEqual([row["name"] for row in built["top_growers"]], ["kept"])
+        self.assertIn("| plugin-data | unknown |", report.render_markdown(built))
 
     def test_mapping_orphans_and_growth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

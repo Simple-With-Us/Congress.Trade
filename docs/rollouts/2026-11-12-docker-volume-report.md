@@ -19,7 +19,7 @@ Bytes for volumes come from `docker system df -v`.  Bytes for bind mounts come 
 
 A volume is an orphan when no container mounts it.  `N/A` in the LINKS column does not hide that.  A numeric LINKS value that disagrees with the mounts aborts the report before any file is replaced and before any `docker volume rm` line is printed.  Bind mounts are never given a removal command.  The report refuses to size `/` or a path with a `.` or `..` segment.
 
-The first run lists no growers, because there is no previous JSON yet.  Later runs read `latest.json` before replacing it.  A new path counts as growth from zero.  A path whose size is unknown is left out of the ranking.  The default list is the ten largest increases.
+The first run lists no growers, because there is no previous JSON yet.  Later runs read `latest.json` before replacing it.  A new path counts as growth from zero.  A volume SIZE of N/A is stored as unknown bytes and does not abort the report.  A path whose size is unknown is left out of the ranking.  The default list is the ten largest increases.
 
 ## Verification
 

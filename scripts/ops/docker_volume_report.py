@@ -63,7 +63,7 @@ class VolumeRec:
     mountpoint: str
     labels: dict[str, str]
     links: int | None
-    size: int
+    size: int | None
 
 
 @dataclass
@@ -92,10 +92,14 @@ class Owner:
     map_source: str
 
 
-def parse_size(text: str) -> int:
+def parse_size(text: str) -> int | None:
     raw = text.strip().replace(" ", "")
     if not raw:
         raise SnapshotError("empty size")
+    # Docker prints N/A when the volume driver has no usage data. That volume
+    # stays in the report with unknown bytes. A blank or other token still aborts.
+    if raw.upper() == "N/A":
+        return None
     match = _SIZE_RE.match(raw)
     if not match:
         raise SnapshotError("unparsed size")
@@ -568,7 +572,7 @@ def build_report(
 
     volume_rows: list[dict[str, object]] = []
     orphans: list[dict[str, object]] = []
-    for volume in sorted(volumes, key=lambda item: (-item.size, item.name)):
+    for volume in sorted(volumes, key=lambda item: (-(item.size if item.size is not None else -1), item.name)):
         holders = sorted(holders_by_volume[volume.name], key=lambda item: item.name)
         _check_links(volume.name, volume.links, len(holders))
         summary = summarize_owners(_owners_for_volume(volume, holders))
@@ -642,7 +646,7 @@ def build_report(
             "volumes": len(volume_rows),
             "bind_mounts": len(bind_rows),
             "orphans": len(orphans),
-            "volume_bytes": sum(volume.size for volume in volumes),
+            "volume_bytes": sum(volume.size for volume in volumes if volume.size is not None),
             "bind_bytes": sum(nbytes for nbytes, _error in bind_sizes.values() if isinstance(nbytes, int)),
         },
         "volumes": volume_rows,
