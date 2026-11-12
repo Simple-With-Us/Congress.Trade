@@ -33,6 +33,8 @@ import { formatIp, ipInAnyCidr, parseIp, type ParsedIp } from './ip.ts';
 
 export const TCP_PEER_HEADER = 'x-ct-tcp-peer';
 export const ORIGIN_SECRET_HEADER = 'x-ct-origin-secret';
+/** Set only by the retired Workers entry when `request.cf` is present. */
+export const EDGE_RUNTIME_HEADER = 'x-ct-edge-runtime';
 
 const DEFAULT_TRUSTED_PROXY_CIDRS = [
   '127.0.0.0/8',
@@ -88,9 +90,25 @@ export function isCloudflareIp(raw: string | null | undefined): boolean {
 export function stampTcpPeer(req: Request, peer: string | null | undefined): Request {
   const headers = new Headers(req.headers);
   headers.delete(TCP_PEER_HEADER);
+  headers.delete(EDGE_RUNTIME_HEADER);
   const parsed = parseIp(peer);
   if (parsed) headers.set(TCP_PEER_HEADER, formatIp(parsed));
   return new Request(req, { headers });
+}
+
+/**
+ * Retired Workers/preview entry. There is no TCP peer. Drop a client-supplied
+ * peer or edge header. When the runtime attached `request.cf`, the isolate is
+ * on Cloudflare, so mark the request and let `CF-Connecting-IP` identify the
+ * visitor. Without `request.cf` the headers stay untrusted.
+ */
+export function stampWorkersEdge(req: Request): Request {
+  const stripped = stampTcpPeer(req, undefined);
+  const cf = (req as Request & { cf?: unknown }).cf;
+  if (!cf || typeof cf !== 'object') return stripped;
+  const headers = new Headers(stripped.headers);
+  headers.set(EDGE_RUNTIME_HEADER, 'cloudflare');
+  return new Request(stripped, { headers });
 }
 
 export function configFromEnv(env?: OriginLockEnv): OriginLockConfig {
@@ -165,6 +183,7 @@ async function loadConfig(env: Env): Promise<OriginLockConfig> {
 }
 
 function classifyVia(req: Request, peer: ParsedIp | null, config: OriginLockConfig): ViaReason | null {
+  if (req.headers.get(EDGE_RUNTIME_HEADER) === 'cloudflare') return 'cloudflare_peer';
   if (peer && isCloudflareParsed(peer)) return 'cloudflare_peer';
   const asserted = proxyAsserted(req, peer, config);
   if (asserted && isCloudflareParsed(asserted)) return 'cloudflare_via_proxy';
@@ -182,7 +201,9 @@ function selectClientIp(req: Request, peer: ParsedIp | null, via: boolean, confi
     return 'unknown';
   }
   if (peer && isTrustedProxy(peer, config)) {
-    const asserted = headerIp(req, 'x-real-ip');
+    // Same proxy-asserted address as the Cloudflare check: X-Real-IP, else the
+    // rightmost X-Forwarded-For hop. The client-supplied prefix is not used.
+    const asserted = proxyAsserted(req, peer, config);
     return asserted ? formatIp(asserted) : 'unknown';
   }
   return peer ? formatIp(peer) : 'unknown';

@@ -36,7 +36,7 @@ import {
 import { datadogRequestMiddleware } from './shared/datadog.ts';
 import { browserSecurityHeadersMiddleware } from './security/headers.ts';
 import { publicApiGuard } from './security/botDefense.ts';
-import { originLockMiddleware, stampTcpPeer } from './security/originLock.ts';
+import { originLockMiddleware, stampWorkersEdge } from './security/originLock.ts';
 import { mountApiRouters } from './apiRouters.ts';
 
 export { mountApiRouters, buildProductionApp } from './apiRouters.ts';
@@ -169,9 +169,10 @@ const requestAndScheduledWorker = Sentry.withSentry(
   {
     /** HTTP entrypoint. */
     fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
-      // This entry has no TCP peer. Drop a client-supplied peer header so it
-      // cannot impersonate Cloudflare or a health-check source.
-      const sanitized = stampTcpPeer(request, undefined);
+      // No TCP peer on this retired entry. Trust CF-Connecting-IP only when
+      // the Workers runtime attached request.cf. A client-supplied peer or
+      // edge header is removed either way.
+      const sanitized = stampWorkersEdge(request);
       const response = withThirdPartyTelemetry(env, () => app.fetch(sanitized, env, ctx));
       // Flush this request's metered D1 rows after the response settles — the
       // read path is where analytics/scraper scans accrue. Best-effort, never blocks.

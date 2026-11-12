@@ -4,12 +4,14 @@ import { Hono } from 'hono';
 import type { Env } from '../../shared/types.ts';
 import { clientIp } from '../../shared/rateLimit.ts';
 import {
+  EDGE_RUNTIME_HEADER,
   ORIGIN_SECRET_HEADER,
   TCP_PEER_HEADER,
   inspectOrigin,
   isCloudflareIp,
   originLockMiddleware,
   stampTcpPeer,
+  stampWorkersEdge,
 } from '../originLock.ts';
 
 const CF_EDGE = '104.16.1.2';
@@ -258,6 +260,38 @@ describe('clientIp header trust', () => {
       'x-forwarded-for': `${VISITOR}, ${CF_EDGE}`,
     }), PROXY);
     expect(clientIp(req)).toBe(ATTACKER);
+  });
+
+  it('uses the rightmost forwarded hop when a trusted proxy sent no x-real-ip', () => {
+    const first = peer(request('/api/transactions', {
+      'x-forwarded-for': `${VISITOR}, ${ATTACKER}`,
+      'cf-connecting-ip': VISITOR,
+    }), PROXY);
+    const second = peer(request('/api/transactions', {
+      'x-forwarded-for': `${ATTACKER}, 203.0.113.50`,
+    }), PROXY);
+    expect(clientIp(first)).toBe(ATTACKER);
+    expect(clientIp(second)).toBe('203.0.113.50');
+  });
+});
+
+describe('stampWorkersEdge', () => {
+  it('trusts cf-connecting-ip only when the Workers runtime attached request.cf', () => {
+    const plain = request('/api/transactions', {
+      'cf-connecting-ip': VISITOR,
+      [EDGE_RUNTIME_HEADER]: 'cloudflare',
+      [TCP_PEER_HEADER]: CF_EDGE,
+    });
+    const stripped = stampWorkersEdge(plain);
+    expect(stripped.headers.get(EDGE_RUNTIME_HEADER)).toBeNull();
+    expect(stripped.headers.get(TCP_PEER_HEADER)).toBeNull();
+    expect(clientIp(stripped)).toBe('unknown');
+
+    const onEdge = request('/api/transactions', { 'cf-connecting-ip': VISITOR });
+    Object.defineProperty(onEdge, 'cf', { value: { colo: 'DFW' } });
+    const stamped = stampWorkersEdge(onEdge);
+    expect(stamped.headers.get(EDGE_RUNTIME_HEADER)).toBe('cloudflare');
+    expect(clientIp(stamped)).toBe(VISITOR);
   });
 });
 
