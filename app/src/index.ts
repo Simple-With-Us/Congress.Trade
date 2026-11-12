@@ -36,6 +36,7 @@ import {
 import { datadogRequestMiddleware } from './shared/datadog.ts';
 import { browserSecurityHeadersMiddleware } from './security/headers.ts';
 import { publicApiGuard } from './security/botDefense.ts';
+import { originLockMiddleware, stampWorkersEdge } from './security/originLock.ts';
 import { mountApiRouters } from './apiRouters.ts';
 
 export { mountApiRouters, buildProductionApp } from './apiRouters.ts';
@@ -67,6 +68,10 @@ const app = new Hono<{ Bindings: Env }>();
 // including error and redirect responses. HSTS is added only for HTTPS.
 app.use('*', browserSecurityHeadersMiddleware);
 app.use('*', datadogRequestMiddleware());
+// Off unless ORIGIN_LOCK_ENABLED. When on, only Cloudflare-fronted requests
+// (or the origin secret / Authenticated Origin Pulls header) are served.
+// Loopback and docker-network health probes stay open.
+app.use('*', originLockMiddleware);
 
 // Anti-scraping guard for the public data API (user-agent blocklist + per-IP
 // request budget + X-Robots-Tag). Runs before the feature routers; token-gated
@@ -164,7 +169,11 @@ const requestAndScheduledWorker = Sentry.withSentry(
   {
     /** HTTP entrypoint. */
     fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
-      const response = withThirdPartyTelemetry(env, () => app.fetch(request, env, ctx));
+      // No TCP peer on this retired entry. Trust CF-Connecting-IP only when
+      // the Workers runtime attached request.cf. A client-supplied peer or
+      // edge header is removed either way.
+      const sanitized = stampWorkersEdge(request);
+      const response = withThirdPartyTelemetry(env, () => app.fetch(sanitized, env, ctx));
       // Flush this request's metered D1 rows after the response settles — the
       // read path is where analytics/scraper scans accrue. Best-effort, never blocks.
       ctx.waitUntil(Promise.resolve(response).catch(() => undefined).then(() => flushD1Budget(env)));
