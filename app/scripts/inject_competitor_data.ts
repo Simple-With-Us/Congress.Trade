@@ -8,17 +8,14 @@ import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 import { resolveSecret } from "../src/secrets/infisical.ts";
 import {
   assetNameFromCompetitorPayload,
-  resolveExecutiveFilerIdFromName,
 } from "../src/shared/executiveIdentity.ts";
 import {
   chamberFromMemberType,
-  competitorHouseFilerId,
-  competitorQualifiedManualFilerId,
   competitorReporterNames,
   parseCompetitorReporter,
 } from "../src/shared/competitorAttribution.ts";
 import {
-  findExistingFilerForCompetitorReporter,
+  assignCompetitorFilerId,
   type ExistingFilerCandidate,
 } from "../src/shared/competitorFilerMatch.ts";
 
@@ -233,36 +230,27 @@ async function run() {
     chamber: 'house' | 'senate' | 'executive',
     rawObj: any,
   ): { filerId: string; resolvedChamber: 'house' | 'senate' | 'executive' } | null {
-    const execId = resolveExecutiveFilerIdFromName(rawName);
-    if (execId) return { filerId: execId, resolvedChamber: 'executive' };
-
     const parsed = parseCompetitorReporter(rawObj);
-    const existing = findExistingFilerForCompetitorReporter({
+    // Payload chamber only. The provider default is not trusted here; that is
+    // how executives ended up labelled senate. A bare surname returns null.
+    const assigned = assignCompetitorFilerId({
+      rawName,
       names: [...competitorReporterNames(rawObj), rawName],
       chamber: parsed.chamber,
       state: parsed.state,
+      district: parsed.district,
       bioguideId: parsed.bioguideId,
       candidates: existingFilers,
     });
-    if (existing) {
-      const existingChamber = (existing.chamber ?? '').toLowerCase();
-      const resolvedChamber = existingChamber === 'house' || existingChamber === 'senate' || existingChamber === 'executive'
-        ? existingChamber
-        : (parsed.chamber ?? chamber);
-      return { filerId: existing.filerId, resolvedChamber };
-    }
-
-    if (parsed.state && parsed.district) {
-      const houseId = competitorHouseFilerId(rawName, parsed.state, parsed.district);
-      if (houseId) return { filerId: houseId, resolvedChamber: 'house' };
-    }
-
-    // Only a payload-declared chamber is trusted here; the provider default is
-    // NOT — that is how executives ended up labelled 'senate'.
-    const resolvedChamber = parsed.chamber ?? chamber;
-    const qualified = competitorQualifiedManualFilerId(rawName);
-    if (!qualified) return null;
-    return { filerId: qualified, resolvedChamber };
+    if (!assigned) return null;
+    if (assigned.filerId.startsWith('EXEC-')) return { filerId: assigned.filerId, resolvedChamber: 'executive' };
+    if (assigned.filerId.startsWith('house-')) return { filerId: assigned.filerId, resolvedChamber: 'house' };
+    const existing = existingFilers.find((f) => f.filerId === assigned.filerId);
+    const existingChamber = (existing?.chamber ?? '').toLowerCase();
+    const resolvedChamber = existingChamber === 'house' || existingChamber === 'senate' || existingChamber === 'executive'
+      ? existingChamber
+      : (parsed.chamber ?? chamber);
+    return { filerId: assigned.filerId, resolvedChamber };
   }
 
   function processTradeWithFiler(provider: string, rawName: string, chamber: 'house' | 'senate' | 'executive', ticker: string, date: string, typeStr: string, rawObj: any) {

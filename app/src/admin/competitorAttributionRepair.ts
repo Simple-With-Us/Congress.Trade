@@ -16,10 +16,10 @@
  *      disagrees with the assigned filer (different chamber, different
  *      state, or a differing resolved bioguide id —
  *      `competitorReporterMismatch`), the row is reassigned to the correct
- *      filer, minting one if it doesn't exist yet: a curated EXEC-* id when
- *      the name matches a known executive alias, a real
+ *      filer, minting one if it doesn't exist yet: an existing roster or
+ *      EXEC-* id when the full name matches, a real
  *      `house-<state><district>-<slug>` id when office metadata gives
- *      state+district, else the existing `MANUAL-${LASTNAME}` convention.
+ *      state+district, else `MANUAL-<FIRST>-<LAST>`. A bare surname mints nothing.
  *
  *   2. Crypto mis-typed as equity: rows whose raw notes carry the
  *      provider's '[CT]' crypto marker (or an explicit crypto keyword) got
@@ -49,11 +49,8 @@
 import type { Env } from '../shared/types.ts';
 import { all, run } from '../shared/db.ts';
 import { HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
-import { resolveExecutiveFilerIdFromName } from '../shared/executiveIdentity.ts';
 import { fallbackCleanDisplayName } from '../enrichment/identitySync.ts';
 import {
-  competitorHouseFilerId,
-  competitorQualifiedManualFilerId,
   competitorReporterMismatch,
   competitorReporterNames,
   hasCompetitorCryptoMarker,
@@ -61,6 +58,7 @@ import {
   type ParsedCompetitorReporter,
 } from '../shared/competitorAttribution.ts';
 import {
+  assignCompetitorFilerId,
   findExistingFilerForCompetitorReporter,
   isMintedCompetitorFilerId,
   type ExistingFilerCandidate,
@@ -105,23 +103,15 @@ interface CompetitorRow {
 
 function resolveNewFilerId(parsed: ParsedCompetitorReporter, existing: readonly ExistingFilerCandidate[]): string | null {
   if (!parsed.name) return null;
-  const execId = resolveExecutiveFilerIdFromName(parsed.name);
-  if (execId) return execId;
-  if (parsed.state && parsed.district) {
-    const houseId = competitorHouseFilerId(parsed.name, parsed.state, parsed.district);
-    if (houseId) return houseId;
-  }
-  // Ingest guard: never mint a filer from a bare last name when a real filer
-  // already matches, and never mint `MANUAL-<LAST>` for a surname alone.
-  const match = findExistingFilerForCompetitorReporter({
+  return assignCompetitorFilerId({
+    rawName: parsed.name,
     names: [parsed.name],
     chamber: parsed.chamber,
     state: parsed.state,
+    district: parsed.district,
     bioguideId: parsed.bioguideId,
     candidates: existing,
-  });
-  if (match) return match.filerId;
-  return competitorQualifiedManualFilerId(parsed.name);
+  })?.filerId ?? null;
 }
 
 function chamberForFilerId(filerId: string, parsed: ParsedCompetitorReporter): string | null {
