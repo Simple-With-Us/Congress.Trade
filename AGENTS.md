@@ -49,7 +49,7 @@ Recipients stay inside the closing bracket and use the destination's real mentio
 - **CI/CD Runners Policy**: Fleet CI and all GitHub Actions workflows are GitHub-hosted cloud runners only (`ubuntu-latest` for backend/JS/Deno gates, `macos-latest` for iOS builds and shipping). Self-hosted Oracle/Coolify/Mac runners are retired now that the repository is public with free unlimited hosted runner minutes.
 
 
-- **Always Tagged**: Always explicitly identify as AG or Antigravity in Zulip messages and commits to avoid "untagged" ghost work.
+- **Always Tagged**: Use the verified assigned seat and the native session's current fleet header above in Zulip messages and commits; never infer identity from this repository.
 - **Pre-Coding Reservations**: Reserve work on Linear before writing a single line of code, ensuring the rest of the fleet sees the claims.
 - **Chunking**: Break large tasks into smaller, reviewable chunks (like discrete PRs or commits), even if executing them back-to-back. No more giant monolithic batches.
 - **Socialize First**: For cross-app changes (like API SDKs or UX overhauls), socialize the design in #Work-In-Progress before executing.
@@ -438,7 +438,7 @@ Durable, non-obvious notes for running/testing locally (all from `app/`):
   setup fills only missing or empty managed entries. To change an existing
   managed value, deliberately remove or empty that line, then re-run setup;
   unrelated `.dev.vars` bytes remain untouched.
-- **Current credential policy (owner, November 11, 2026):** use scoped Infisical service tokens only for new or replacement bindings, never automation or machine identities.  Infisical is the sole source for secrets and non-user settings; the consumer's bootstrap service token is the standing exception, and necessary environment or file transport is synced from Infisical, never hand-set.  The preceding machine-identity mapping and local-file merge details describe legacy implementation, not permission to provision or bind those credentials.  Preserve a working binding until its replacement is live and verified; this documentation change does not replace the setup script or establish a runtime migration.
+- **Current credential policy (owner, November 11, 2026):** use scoped Infisical service tokens only for new or replacement bindings, never automation or machine identities.  Infisical is the sole source for secrets and non-user settings; the consumer's bootstrap service token is the standing exception, and necessary environment or file transport is synced from Infisical, never hand-set.  The checked source still uses legacy client-ID/secret interfaces in `app/src/secrets/infisical.ts` (`sourceConfigs()` / `login()`), `scripts/merge-local-dev-vars.mjs` and `cloud-setup.sh`; a service-token replacement is pending, as recorded in `INFISICAL.md`.  This source observation does not verify deployed authentication or authorize provisioning or binding new machine identities.  Preserve any working binding until its replacement is merged, live and verified; this docs-only change does not migrate or revoke credentials.
 - Admin/ingest routes (`/api/admin/*`) fail closed.  For local testing,
   `ADMIN_OPEN_IN_DEV="true"` alone is NOT enough: Infisical / image defaults
   can still resolve `SENTRY_ENVIRONMENT="production"` and

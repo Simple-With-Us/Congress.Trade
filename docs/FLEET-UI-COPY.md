@@ -123,8 +123,9 @@ not.
 - Marketing, screenshot captions, TestFlight “What to Test”
 
 **How:**
-- Between sentences in a paragraph: a real U+00A0 plus a space after `.` `!` `?` (owner ruling 2026-10-23, every surface).  Never the `&nbsp;` entity, and never two plain ASCII spaces, which collapse.
-- HTML/JSX/SwiftUI source, by language:  Swift string literals `"\u{00A0} "`;  JS/TS string literals `"\u00A0 "`;  JSX text `{'\u00A0'}` followed by a space, or `&#160;` inside JSX text;  HTML markup source `&#160;` (markup only, never prose);  or a shared helper (ST: `SENTENCE_GAP`).  Never `&nbsp; ` in prose.
+- Between sentences in a paragraph: a real U+00A0 plus a normal space after `.` `!` `?` (owner ruling 2026-10-23), except for the three chat panes below.  Never two plain ASCII spaces, which collapse.
+- Only chat replies in Claude Code's Code tab, MiniMax Code's chat pane and Z Code's chat pane use the `&nbsp;` entity plus a normal space.  Every other human-readable surface, including Apple Notes, uses real U+00A0 plus a normal space; do not use the entity elsewhere.
+- HTML/JSX/SwiftUI source, by language:  Swift string literals `"\u{00A0} "`;  JS/TS string literals `"\u00A0 "`;  JSX text `{'\u00A0'}` followed by a space, or `&#160;` inside JSX text;  HTML markup source `&#160;` (markup only, never prose);  or a shared helper (ST: `SENTENCE_GAP`).  The rendered copy uses the real gap; the entity exception applies only to the three named chat panes.
 - Prefer ONE paragraph for short related sentences over stacked one-liners when
   the owner asked for density (see Socratic proposals empty-state, 2026-08-08)
 - Do not insert spaces after brand periods (`Congress.Trade`), URLs, emails, or `U.S.`

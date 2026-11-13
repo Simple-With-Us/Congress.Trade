@@ -2,14 +2,15 @@
 
 Fleet-wide directive (2026-10-03): **Infisical is the sole source of truth** for this app.  "Truth" means secrets AND env vars AND tunable settings knobs — everything the app's behavior depends on that is not code.  Per-user settings stay in the app's own store and never go in Infisical.
 
-Two spaces between sentences in this file per the owner's prose style.
+Use a real U+00A0 plus a normal space between sentences in this file per the owner's prose style.
 
 ## Infisical project
 
 - Project: **`congress-trade`** (`f61a79de-8d77-4f0b-9361-4b7208598290`), org `jays-services`.
 - Plus imports from the shared project **`shared-at-ct`** (the fleet-wide shared keys listed in `app/docs/config-registry.md` — they MUST live only there; duplicating them on this project shadows the shared row and makes rotation a multi-project chore).
 - Environment: `prod` only (owner 2026-10-10:  `dev` and `staging` are retired).  `INFISICAL_ENV` must be unset or `prod`;  the resolver (`app/src/secrets/infisical.ts`) and `scripts/infisical-secrets-safe.sh` refuse any other value, and the wrapper adds `--env prod` when a call has none (the Infisical CLI defaults to `dev`).
-- Bootstrap identity is the org machine identity (universal-auth client id/secret); only these bootstrap vars stay in process env — they are the chicken-and-egg: `INFISICAL_APP_CLIENT_ID`, `INFISICAL_APP_CLIENT_SECRET`, `INFISICAL_SHARED_CLIENT_ID`, `INFISICAL_SHARED_CLIENT_SECRET`, `INFISICAL_APP_PROJECT_ID`, `INFISICAL_SHARED_PROJECT_ID`, `INFISICAL_ENV`, `INFISICAL_BASE_URL`.
+- **Observed legacy source interface:** `app/src/secrets/infisical.ts` still authenticates through `sourceConfigs()` / `login()` using universal-auth client-ID/secret pairs, and `scripts/merge-local-dev-vars.mjs` maps those pairs.  The documented legacy bootstrap names are `INFISICAL_APP_CLIENT_ID`, `INFISICAL_APP_CLIENT_SECRET`, `INFISICAL_SHARED_CLIENT_ID`, `INFISICAL_SHARED_CLIENT_SECRET`, `INFISICAL_APP_PROJECT_ID`, `INFISICAL_SHARED_PROJECT_ID`, `INFISICAL_ENV` and `INFISICAL_BASE_URL`.  This is source evidence, not verification of deployed authentication or current authorization to create or bind a machine identity.
+- **Current policy and pending migration (owner, November 11, 2026):** new or replacement bindings use scoped Infisical service tokens only, never automation or machine identities.  Infisical is the sole source for secrets and non-user settings; the consumer's bootstrap service token is the standing exception, and necessary environment or file transport is synced from Infisical, never hand-set.  A service-token replacement for the legacy interfaces above remains pending.  Preserve any working binding until its replacement is merged, live and verified; this docs-only change does not migrate or revoke credentials.
 
 ## Runtime contract
 
@@ -30,8 +31,8 @@ Two spaces between sentences in this file per the owner's prose style.
 
 - **Per-user settings:** per-user notification prefs (`users.notification_settings`), per-user session/token rows, UI preferences in browsers — these live in SQLite (`/data/congress-trade/db.sqlite`) and never enter Infisical.
 - **Benchmark lineup settings:** `benchmark_settings_*` DB tables with leases — operational app state with ownership semantics, kept in the app's own store.
-- **Boot-only bindings:** `PORT`, `DENO_KV_PATH`, and the `INFISICAL_*` bootstrap identity — process env by design (Coolify/Docker), listed in `.env.example` without values.
-- **Admin bootstrap tokens:** `ADMIN_TOKEN` / `ADMIN_MAINTENANCE_TOKEN` / `ADMIN_EMAILS` — required to authenticate the very admin surface that edits settings; they stay in process env.
+- **Legacy boot-only source bindings:** `PORT`, `DENO_KV_PATH` and the `INFISICAL_*` bootstrap names are currently read from process env in source and listed in `.env.example` without values.  Those interfaces do not authorize hand-set settings or new machine-identity bindings; current policy and the pending migration above govern replacements.
+- **Admin bootstrap source inputs:** `ADMIN_TOKEN` / `ADMIN_MAINTENANCE_TOKEN` / `ADMIN_EMAILS` authenticate the admin surface in source through process env.  Apart from the consumer's Infisical bootstrap service token, necessary environment transport must be synced from Infisical; this docs-only change does not alter a working binding.
 
 ## Cache / refresh / write-through summary
 
