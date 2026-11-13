@@ -157,7 +157,7 @@ function cacheKey(env: Env): string {
     env.INFISICAL_SHARED_PROJECT_ID || '',
     env.INFISICAL_SHARED_SECRET_PATH || '/',
     env.INFISICAL_APP_PROJECT_ID || '',
-    env.INFISICAL_APP_SECRET_PATH || '/',
+    env.INFISICAL_APP_SECRET_PATH || env.INFISICAL_SECRET_PATH || '/',
   ].join('|');
 }
 
@@ -179,9 +179,9 @@ async function login(
   }, { service: 'secret-management', operation: 'authenticate', dynamicTarget: 'infisical' });
   const body = (await res.json().catch(() => ({}))) as { accessToken?: string; token?: string; message?: string };
   if (!res.ok) throw new Error(`Infisical ${source.name} auth failed: HTTP ${res.status} ${body.message || ''}`.trim());
-  const token = body.accessToken || body.token;
-  if (!token) throw new Error(`Infisical ${source.name} auth failed: no access token`);
-  return token;
+  const authToken = body.accessToken || body.token;
+  if (!authToken) throw new Error(`Infisical ${source.name} auth failed: no access token`);
+  return authToken;
 }
 
 function secretEntries(payload: unknown): Array<{ key: string; value: string }> {

@@ -103,6 +103,132 @@ describe('Infisical runtime secret resolver', () => {
     expect(fetchMock.mock.calls.length).toBeGreaterThan(callsAfterFirst);
   });
 
+  it('separates in-memory cache entries by the effective legacy app secret path', async () => {
+    const appProject = 'app-project-legacy-path-memory';
+    const appPaths: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return Response.json({ accessToken: 'token' });
+      }
+      if (url.includes('/api/v3/secrets/raw')) {
+        const parsed = new URL(url);
+        if (parsed.searchParams.get('workspaceId') === appProject) {
+          const path = parsed.searchParams.get('secretPath') ?? '/';
+          appPaths.push(path);
+          return Response.json({
+            secrets: [{ secretKey: 'FMP_API_KEY', secretValue: path === '/legacy-a' ? 'legacy-a-fmp' : 'legacy-b-fmp' }],
+          });
+        }
+        return Response.json({ secrets: [] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pathA = env({ INFISICAL_APP_PROJECT_ID: appProject, INFISICAL_SECRET_PATH: '/legacy-a' });
+    const pathB = env({ INFISICAL_APP_PROJECT_ID: appProject, INFISICAL_SECRET_PATH: '/legacy-b' });
+    await refreshSecrets(pathA);
+
+    expect(await resolveSecret(pathB, 'FMP_API_KEY')).toEqual({ value: 'legacy-b-fmp', source: 'infisical' });
+    expect(appPaths).toEqual(['/legacy-a', '/legacy-b']);
+  });
+
+  it('isolates encrypted KV cache entries by the effective legacy app secret path across resolver instances', async () => {
+    const appProject = 'app-project-legacy-path-kv';
+    const appPaths: string[] = [];
+    const rows = new Map<string, string>();
+    const kv = {
+      get: vi.fn(async (key: string) => rows.get(key) ?? null),
+      put: vi.fn(async (key: string, value: string) => {
+        rows.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        rows.delete(key);
+      }),
+    } as unknown as KVNamespace;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return Response.json({ accessToken: 'token' });
+      }
+      if (url.includes('/api/v3/secrets/raw')) {
+        const parsed = new URL(url);
+        if (parsed.searchParams.get('workspaceId') === appProject) {
+          const path = parsed.searchParams.get('secretPath') ?? '/';
+          appPaths.push(path);
+          return Response.json({
+            secrets: [{ secretKey: 'FMP_API_KEY', secretValue: path === '/legacy-a' ? 'legacy-a-fmp' : 'legacy-b-fmp' }],
+          });
+        }
+        return Response.json({ secrets: [] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pathA = env({
+      INFISICAL_APP_PROJECT_ID: appProject,
+      INFISICAL_APP_CLIENT_SECRET: 'fixture-key-'.repeat(4),
+      INFISICAL_SECRET_PATH: '/legacy-a',
+      CONFIG_KV: kv,
+    });
+    const pathB = env({
+      INFISICAL_APP_PROJECT_ID: appProject,
+      INFISICAL_APP_CLIENT_SECRET: 'fixture-key-'.repeat(4),
+      INFISICAL_SECRET_PATH: '/legacy-b',
+      CONFIG_KV: kv,
+    });
+
+    const firstResolver = await import('../infisical.ts');
+    await firstResolver.refreshSecrets(pathA);
+    expect(rows.size).toBeGreaterThan(0);
+
+    vi.resetModules();
+    const secondResolver = await import('../infisical.ts');
+    expect(await secondResolver.resolveSecret(pathB, 'FMP_API_KEY')).toEqual({ value: 'legacy-b-fmp', source: 'infisical' });
+    expect(appPaths).toEqual(['/legacy-a', '/legacy-b']);
+    const callsAfterPathB = fetchMock.mock.calls.length;
+
+    vi.resetModules();
+    const restartedResolver = await import('../infisical.ts');
+    expect(await restartedResolver.resolveSecret(pathA, 'FMP_API_KEY')).toEqual({ value: 'legacy-a-fmp', source: 'infisical' });
+    expect(fetchMock.mock.calls.length).toBe(callsAfterPathB);
+  });
+
+  it('prefers the explicit app path and reuses the cache for its legacy alias', async () => {
+    const appProject = 'app-project-explicit-path';
+    const appPaths: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return Response.json({ accessToken: 'token' });
+      }
+      if (url.includes('/api/v3/secrets/raw')) {
+        const parsed = new URL(url);
+        if (parsed.searchParams.get('workspaceId') === appProject) {
+          const path = parsed.searchParams.get('secretPath') ?? '/';
+          appPaths.push(path);
+          return Response.json({ secrets: [{ secretKey: 'FMP_API_KEY', secretValue: 'preferred-fmp' }] });
+        }
+        return Response.json({ secrets: [] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const explicitPath = env({
+      INFISICAL_APP_PROJECT_ID: appProject,
+      INFISICAL_APP_SECRET_PATH: '/preferred',
+      INFISICAL_SECRET_PATH: '/ignored-legacy',
+    });
+    const legacyAlias = env({
+      INFISICAL_APP_PROJECT_ID: appProject,
+      INFISICAL_SECRET_PATH: '/preferred',
+    });
+    await refreshSecrets(explicitPath);
+
+    expect(await resolveSecret(legacyAlias, 'FMP_API_KEY')).toEqual({ value: 'preferred-fmp', source: 'infisical' });
+    expect(appPaths).toEqual(['/preferred']);
+  });
+
   it('does not write KV when the encrypted cache blob would exceed the Deno KV limit', async () => {
     vi.stubGlobal(
       'fetch',
@@ -118,7 +244,7 @@ describe('Infisical runtime secret resolver', () => {
     const kvPut = vi.fn(async () => {});
     const e = env({
       INFISICAL_APP_PROJECT_ID: 'app-project-kv-limit',
-      INFISICAL_APP_CLIENT_SECRET: '01234567890123456789012345678901',
+      INFISICAL_APP_CLIENT_SECRET: 'fixture-key-'.repeat(4),
       CONFIG_KV: { get: vi.fn(), put: kvPut, delete: vi.fn() } as unknown as KVNamespace,
     });
     await refreshSecrets(e);
