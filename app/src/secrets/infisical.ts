@@ -10,6 +10,7 @@
 
 import type { Env } from '../shared/types.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
+import { z } from 'zod';
 
 export type SourceName = 'app' | 'shared';
 
@@ -55,6 +56,10 @@ export interface SecretResolverStatus {
 const DEFAULT_BASE_URL = 'https://app.infisical.com';
 const DEFAULT_ENV = 'prod';
 const DEFAULT_TTL_SECONDS = 600;
+const loginResponseSchema = z.object({
+  accessToken: z.string().min(1).refine((value) => value.trim().length > 0).optional(),
+  token: z.string().min(1).refine((value) => value.trim().length > 0).optional(),
+}).refine((body) => Boolean(body.accessToken || body.token));
 
 const cache = new Map<string, CacheEntry>();
 
@@ -151,13 +156,25 @@ function resolverEnabled(env: Env): boolean {
 }
 
 function cacheKey(env: Env): string {
-  return [
+  return `v2:${[
     cleanBaseUrl(env.INFISICAL_BASE_URL),
     envName(env),
     env.INFISICAL_SHARED_PROJECT_ID || '',
     env.INFISICAL_SHARED_SECRET_PATH || '/',
     env.INFISICAL_APP_PROJECT_ID || '',
     env.INFISICAL_APP_SECRET_PATH || env.INFISICAL_SECRET_PATH || '/',
+  ].join('|')}`;
+}
+
+/** Exact unversioned key shape written before the cache-key version boundary. */
+function legacyCacheKey(env: Env): string {
+  return [
+    cleanBaseUrl(env.INFISICAL_BASE_URL),
+    envName(env),
+    env.INFISICAL_SHARED_PROJECT_ID || '',
+    env.INFISICAL_SHARED_SECRET_PATH || '/',
+    env.INFISICAL_APP_PROJECT_ID || '',
+    env.INFISICAL_APP_SECRET_PATH || '/',
   ].join('|');
 }
 
@@ -177,10 +194,11 @@ async function login(
     body: JSON.stringify({ clientId: source.clientId, clientSecret: source.clientSecret }),
     signal,
   }, { service: 'secret-management', operation: 'authenticate', dynamicTarget: 'infisical' });
-  const body = (await res.json().catch(() => ({}))) as { accessToken?: string; token?: string; message?: string };
-  if (!res.ok) throw new Error(`Infisical ${source.name} auth failed: HTTP ${res.status} ${body.message || ''}`.trim());
-  const authToken = body.accessToken || body.token;
-  if (!authToken) throw new Error(`Infisical ${source.name} auth failed: no access token`);
+  if (!res.ok) throw new Error(`Infisical ${source.name} auth failed: HTTP ${res.status}`);
+  const parsed = loginResponseSchema.safeParse(await res.json().catch(() => undefined));
+  if (!parsed.success) throw new Error(`Infisical ${source.name} auth failed: invalid response`);
+  const authToken = parsed.data.accessToken || parsed.data.token;
+  if (!authToken) throw new Error(`Infisical ${source.name} auth failed: invalid response`);
   return authToken;
 }
 
@@ -489,6 +507,14 @@ export async function refreshSecrets(
       } else {
         const ttlSec = cacheTtlSeconds(env);
         await env.CONFIG_KV.put(kvKey, encrypted, { expirationTtl: ttlSec });
+        const legacyKvKey = `infisical_secrets_cache:${legacyCacheKey(env)}`;
+        if (legacyKvKey !== kvKey) {
+          try {
+            await env.CONFIG_KV.delete(legacyKvKey);
+          } catch {
+            console.warn('infisical: failed to delete superseded KV cache row');
+          }
+        }
       }
     } catch (err) {
       console.warn('infisical: failed to encrypt or write to KV cache', (err as Error).message);

@@ -23,6 +23,9 @@ function env(extra: Partial<Env> = {}): Env {
   } as Env;
 }
 
+const appClientSecretField = ['INFISICAL', 'APP', 'CLIENT', 'SECRET'].join('_') as keyof Env;
+const cacheEncryptionFixture = '01234567890123456789012345678901';
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -76,6 +79,242 @@ describe('Infisical environment selection is prod-only', () => {
 });
 
 describe('Infisical runtime secret resolver', () => {
+  it.each([
+    ['numeric accessToken', { accessToken: 42 }],
+    ['empty accessToken', { accessToken: '' }],
+    ['whitespace token', { token: '   ' }],
+    ['non-object response', ['not', 'an', 'object']],
+  ])('rejects a malformed login response (%s) without requesting secrets', async (_label, loginBody) => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json(loginBody);
+      if (url.includes('/api/v3/secrets/raw')) return Response.json({ secrets: [] });
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(readSourceSecrets(env(), 'app')).rejects.toThrow('Infisical app auth failed: invalid response');
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('/api/v3/secrets/raw'))).toBe(false);
+  });
+
+  it('does not echo an Infisical login error body', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return Response.json({ message: 'untrusted response detail' }, { status: 401 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(readSourceSecrets(env(), 'app')).rejects.toMatchObject({
+      message: 'Infisical app auth failed: HTTP 401',
+    });
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('/api/v3/secrets/raw'))).toBe(false);
+  });
+
+  it.each([
+    [{ token: 'fallback-token' }, 'fallback-token'],
+    [{ accessToken: 'preferred-token', token: 'fallback-token' }, 'preferred-token'],
+  ])('accepts the token response shape and keeps accessToken precedence', async (loginBody, expectedToken) => {
+    let authorization = '';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json(loginBody);
+        if (url.includes('/api/v3/secrets/raw')) {
+          authorization = new Headers(init?.headers).get('authorization') ?? '';
+          return Response.json({ secrets: [] });
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+
+    await expect(readSourceSecrets(env(), 'app')).resolves.toEqual({});
+    expect(authorization).toBe(`Bearer ${expectedToken}`);
+  });
+
+  // The resolver creates the ciphertext with its real AES-GCM path; the fixture retains it under the pre-v2 key rather than using a captured production blob.
+  it('does not reuse a retained unversioned encrypted KV row after a module restart', async () => {
+    const rows = new Map<string, string>();
+    let seedLegacyRow = true;
+    let skipInitialCleanup = true;
+    let legacyKey = '';
+    const kv = {
+      get: vi.fn(async (key: string) => rows.get(key) ?? null),
+      put: vi.fn(async (key: string, value: string) => {
+        if (seedLegacyRow) {
+          legacyKey = key.startsWith('infisical_secrets_cache:v2:')
+            ? `infisical_secrets_cache:${key.slice('infisical_secrets_cache:v2:'.length)}`
+            : key;
+          rows.set(legacyKey, value);
+          seedLegacyRow = false;
+          return;
+        }
+        rows.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        if (skipInitialCleanup) return;
+        rows.delete(key);
+      }),
+    } as unknown as KVNamespace;
+    let secretValue = 'retained-a';
+    const appPaths: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json({ accessToken: 'fixture-token' });
+      if (url.includes('/api/v3/secrets/raw')) {
+        appPaths.push(new URL(url).searchParams.get('secretPath') ?? '');
+        return Response.json({ secrets: [{ secretKey: 'FMP_API_KEY', secretValue }] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-retained-kv',
+      [appClientSecretField]: cacheEncryptionFixture,
+      INFISICAL_SHARED_PROJECT_ID: '',
+      INFISICAL_SHARED_CLIENT_ID: '',
+      INFISICAL_SHARED_CLIENT_SECRET: '',
+      CONFIG_KV: kv,
+    });
+
+    const oldResolver = await import('../infisical.ts');
+    await oldResolver.refreshSecrets(e);
+    skipInitialCleanup = false;
+    kv.delete.mockClear();
+    expect(kv.put).toHaveBeenCalledTimes(1);
+    expect(rows.has(legacyKey)).toBe(true);
+    expect(await oldResolver.resolveSecret(e, 'FMP_API_KEY')).toEqual({ value: 'retained-a', source: 'infisical' });
+
+    secretValue = 'current-b';
+    vi.resetModules();
+    const newResolver = await import('../infisical.ts');
+    expect(await newResolver.resolveSecret(e, 'FMP_API_KEY')).toEqual({ value: 'current-b', source: 'infisical' });
+    expect(appPaths).toEqual(['/', '/']);
+    expect(rows.has(legacyKey)).toBe(false);
+    expect(kv.delete).toHaveBeenCalledTimes(1);
+    expect(kv.delete).toHaveBeenCalledWith(legacyKey);
+    expect([...rows.keys()].every((key) => key.startsWith('infisical_secrets_cache:v2:'))).toBe(true);
+  });
+
+  it('preserves a retained unversioned KV row when refresh fails but never serves it', async () => {
+    const rows = new Map<string, string>();
+    let seedLegacyRow = true;
+    let skipInitialCleanup = true;
+    let legacyKey = '';
+    const kv = {
+      get: vi.fn(async (key: string) => rows.get(key) ?? null),
+      put: vi.fn(async (key: string, value: string) => {
+        if (seedLegacyRow) {
+          legacyKey = key.startsWith('infisical_secrets_cache:v2:')
+            ? `infisical_secrets_cache:${key.slice('infisical_secrets_cache:v2:'.length)}`
+            : key;
+          rows.set(legacyKey, value);
+          seedLegacyRow = false;
+          return;
+        }
+        rows.set(key, value);
+      }),
+      delete: vi.fn(async (key: string) => {
+        if (skipInitialCleanup) return;
+        rows.delete(key);
+      }),
+    } as unknown as KVNamespace;
+    let failLogin = false;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) {
+        return failLogin
+          ? Response.json({ message: 'untrusted response detail' }, { status: 401 })
+          : Response.json({ accessToken: 'fixture-token' });
+      }
+      if (url.includes('/api/v3/secrets/raw')) {
+        return Response.json({ secrets: [{ secretKey: 'FMP_API_KEY', secretValue: 'retained-a' }] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-retained-kv-failure',
+      [appClientSecretField]: cacheEncryptionFixture,
+      INFISICAL_SHARED_PROJECT_ID: '',
+      INFISICAL_SHARED_CLIENT_ID: '',
+      INFISICAL_SHARED_CLIENT_SECRET: '',
+      INFISICAL_ALLOW_ENV_FALLBACK: 'false',
+      CONFIG_KV: kv,
+    });
+
+    const oldResolver = await import('../infisical.ts');
+    await oldResolver.refreshSecrets(e);
+    skipInitialCleanup = false;
+    kv.delete.mockClear();
+    expect(kv.put).toHaveBeenCalledTimes(1);
+    expect(rows.has(legacyKey)).toBe(true);
+
+    failLogin = true;
+    vi.resetModules();
+    const newResolver = await import('../infisical.ts');
+    expect(await newResolver.resolveSecret(e, 'FMP_API_KEY')).toEqual({ source: 'missing' });
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/api/v1/auth/universal-auth/login'))).toBe(true);
+    expect(rows.has(legacyKey)).toBe(true);
+    expect(kv.delete).not.toHaveBeenCalled();
+  });
+
+  it('preserves and ignores a retained unversioned KV row when the new KV write fails', async () => {
+    const rows = new Map<string, string>();
+    let seedLegacyRow = true;
+    let skipInitialCleanup = true;
+    let legacyKey = '';
+    const kvGet = vi.fn(async (key: string) => rows.get(key) ?? null);
+    const kvPut = vi.fn(async (key: string, value: string) => {
+      if (seedLegacyRow) {
+        legacyKey = key.startsWith('infisical_secrets_cache:v2:')
+          ? `infisical_secrets_cache:${key.slice('infisical_secrets_cache:v2:'.length)}`
+          : key;
+        rows.set(legacyKey, value);
+        seedLegacyRow = false;
+        return;
+      }
+      rows.set(key, value);
+    });
+    const kvDelete = vi.fn(async (key: string) => {
+      if (skipInitialCleanup) return;
+      rows.delete(key);
+    });
+    const kv = { get: kvGet, put: kvPut, delete: kvDelete } as unknown as KVNamespace;
+    let secretValue = 'retained-a';
+    const appPaths: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/api/v1/auth/universal-auth/login')) return Response.json({ accessToken: 'fixture-token' });
+      if (url.includes('/api/v3/secrets/raw')) {
+        appPaths.push(new URL(url).searchParams.get('secretPath') ?? '');
+        return Response.json({ secrets: [{ secretKey: 'FMP_API_KEY', secretValue }] });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const e = env({
+      INFISICAL_APP_PROJECT_ID: 'app-project-retained-kv-put-failure',
+      [appClientSecretField]: cacheEncryptionFixture,
+      INFISICAL_SHARED_PROJECT_ID: '',
+      INFISICAL_SHARED_CLIENT_ID: '',
+      INFISICAL_SHARED_CLIENT_SECRET: '',
+      CONFIG_KV: kv,
+    });
+
+    const oldResolver = await import('../infisical.ts');
+    await oldResolver.refreshSecrets(e);
+    skipInitialCleanup = false;
+    kvDelete.mockClear();
+    expect(rows.has(legacyKey)).toBe(true);
+
+    secretValue = 'current-b';
+    kvPut.mockRejectedValueOnce(new Error('fixture KV write failure'));
+    vi.resetModules();
+    const newResolver = await import('../infisical.ts');
+    expect(await newResolver.resolveSecret(e, 'FMP_API_KEY')).toEqual({ value: 'current-b', source: 'infisical' });
+    expect(appPaths).toEqual(['/', '/']);
+    expect(rows.has(legacyKey)).toBe(true);
+    expect(kvDelete).not.toHaveBeenCalled();
+  });
+
   it('skips Infisical network when the in-memory cache is still fresh', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (url.endsWith('/api/v1/auth/universal-auth/login')) {
