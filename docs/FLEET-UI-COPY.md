@@ -51,7 +51,10 @@ Use **sentence case or lowercase** — not Title Case:
 - Market session banner (when shown): stream glyph + **`Market Closed`** / **`Market Open`**
   (not bare `Closed` alone if redundant with a Markets card).
 
-## Times and dates (owner 2026-08-09, amended 2026-08-12)
+## Times And Dates
+
+The current owner-facing writing rule below supersedes older agent timestamp guidance.  Product localization and market/accounting boundaries retain their separate meanings.
+
 - **Product UI renders in the VIEWER's device timezone** — iOS, browser, desktop.  A user in
   another zone reading their own trade times in Central would be the bug, not the fix.
 - **Two deliberate exceptions, both about accounting honesty, not localization:**
@@ -60,11 +63,9 @@ Use **sentence case or lowercase** — not Title Case:
     accounting itself uses (`startOfDayInTimeZone`, `src/lib/db-execution.ts`).  A "today"
     that means a different day than the numbers under it is wrong.
   - **Market-session times** are the market's, not the viewer's: say `9:30 AM ET`, labeled.
-- **Always label the zone** when a time could be read in more than one (`2:41 PM CT`,
+- **Product UI labels the zone** when a time could be read in more than one (`2:41 PM CT`,
   `9:30 AM ET`).  Relative times (`3m ago`) need no label.
-- Owner-facing agent writing (boards, rollouts, Slack, Notes, release notes) is **Central Time,
-  labeled** — that is a coordination rule, not a UI one.  See `/Users/jay/apps/FLEET-PROTOCOL.md`
-  § Timestamps: Central Time.
+- Owner-facing agent writing (boards, rollouts, Zulip, Notes, release notes) uses **America/Chicago, 12-hour `h:mm AM/PM`**, with a normal space before uppercase AM/PM, **no zone label and no adjacent UTC stamp**.  A surface may include its own date context.  This writing rule does not change product localization or market-session labels.  See the current Fleet-OPS handbook and `/Users/jay/apps/FLEET-PROTOCOL.md`.
 
 ## Money
 - Compact suffixes **lowercase**: `$99.8k`, `$1.2m`, `$3.4b`.
