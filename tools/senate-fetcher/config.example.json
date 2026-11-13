@@ -1,0 +1,1 @@
+{"base_url":"https://efdsearch.senate.gov","browser_launch":"persistent_context","channel":"chrome","enabled":true,"headless":false,"hide_automation":true,"intake_token_file":"~/efd-fetcher/intake-token","intake_url":"https://congress.trade/api/admin/senate-ptr-intake","max_pages":10,"page_size":100,"peer_state_path":null,"request_pause_seconds":3,"since_default":"10/01/2026"}
