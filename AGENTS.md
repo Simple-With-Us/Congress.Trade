@@ -49,7 +49,7 @@ Recipients stay inside the closing bracket and use the destination's real mentio
 - **CI/CD Runners Policy**: Fleet CI and all GitHub Actions workflows are GitHub-hosted cloud runners only (`ubuntu-latest` for backend/JS/Deno gates, `macos-latest` for iOS builds and shipping). Self-hosted Oracle/Coolify/Mac runners are retired now that the repository is public with free unlimited hosted runner minutes.
 
 
-- **Always Tagged**: Use the verified assigned seat and the native session's current fleet header above in Zulip messages and commits; never infer identity from this repository.
+- **Always Tagged**: Use the verified assigned seat and the native session's current fleet header above in Zulip messages; never infer identity from this repository.  Commit subjects use the same seat/session/repository prefix, omitting optional recipient routing and platform mentions.
 - **Pre-Coding Reservations**: Reserve work on Linear before writing a single line of code, ensuring the rest of the fleet sees the claims.
 - **Chunking**: Break large tasks into smaller, reviewable chunks (like discrete PRs or commits), even if executing them back-to-back. No more giant monolithic batches.
 - **Socialize First**: For cross-app changes (like API SDKs or UX overhauls), socialize the design in #Work-In-Progress before executing.

@@ -83,7 +83,7 @@ sentence." — not limited to product/UI copy.  HTML must preserve the gap (NBSP
 
 ## Execution Workflow
 
-- **Always Tagged**: Use the verified assigned seat and the native session's current fleet header above in Zulip messages and commits; never infer identity from this repository.
+- **Always Tagged**: Use the verified assigned seat and the native session's current fleet header above in Zulip messages; never infer identity from this repository.  Commit subjects use the same seat/session/repository prefix, omitting optional recipient routing and platform mentions.
 - **Pre-Coding Reservations**: Claim the Linear issue (`simple-board claim`) before writing a single line of code, ensuring the rest of the fleet sees the claims.
 - **Chunking**: Break large tasks into smaller, reviewable chunks (like discrete PRs or commits), even if executing them back-to-back. No more giant monolithic batches.
 - **Socialize First**: For cross-app changes (like API SDKs or UX overhauls), socialize the design in #Work-In-Progress before executing.
