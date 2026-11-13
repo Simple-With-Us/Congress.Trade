@@ -429,7 +429,7 @@ Durable, non-obvious notes for running/testing locally (all from `app/`):
   Provider-backed behavior resolves configuration and API keys from Infisical.
   Do not copy `app/.dev.vars.example` or hardcode provider keys into `.dev.vars`; run
   `bash scripts/cloud-setup.sh` from the repository root.
-- `cloud-setup.sh` safely maps the
+- **Legacy implementation context:** `cloud-setup.sh` maps the
   Infisical app/shared machine identities from explicit environment variables
   or, on a Mac with the CLI installed, `fleet-secrets get NAME`. It also retains only
   the documented early-init/local overrides (`SENTRY_DSN`,
@@ -438,6 +438,7 @@ Durable, non-obvious notes for running/testing locally (all from `app/`):
   setup fills only missing or empty managed entries. To change an existing
   managed value, deliberately remove or empty that line, then re-run setup;
   unrelated `.dev.vars` bytes remain untouched.
+- **Current credential policy (owner, November 11, 2026):** use scoped Infisical service tokens only for new or replacement bindings, never automation or machine identities.  Infisical is the sole source for secrets and non-user settings; the consumer's bootstrap service token is the standing exception, and necessary environment or file transport is synced from Infisical, never hand-set.  The preceding machine-identity mapping and local-file merge details describe legacy implementation, not permission to provision or bind those credentials.  Preserve a working binding until its replacement is live and verified; this documentation change does not replace the setup script or establish a runtime migration.
 - Admin/ingest routes (`/api/admin/*`) fail closed.  For local testing,
   `ADMIN_OPEN_IN_DEV="true"` alone is NOT enough: Infisical / image defaults
   can still resolve `SENTRY_ENVIRONMENT="production"` and
