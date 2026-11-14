@@ -645,13 +645,21 @@ def proxy_route_healthy():
         healthy = (st.get("senate_relay") == "ok"
                    and st.get("senate_efd") == "ok")
         if not healthy:
-            log("proxy gate: route not healthy "
-                f"(senate_relay={st.get('senate_relay')}, "
-                f"senate_efd={st.get('senate_efd')}); fetching")
+            try:
+                log("proxy gate: route not healthy "
+                    f"(senate_relay={st.get('senate_relay')}, "
+                    f"senate_efd={st.get('senate_efd')}); fetching")
+            except Exception:
+                pass
         return healthy
     except Exception as e:
-        log(f"proxy gate: health read failed ({type(e).__name__}); "
-            "fetching (fail open)")
+        # The failure log itself is guarded: a log-write failure must not
+        # escape and break the fail-open contract this handler exists for.
+        try:
+            log(f"proxy gate: health read failed ({type(e).__name__}); "
+                "fetching (fail open)")
+        except Exception:
+            pass
         return False
 
 
