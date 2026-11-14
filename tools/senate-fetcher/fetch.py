@@ -633,13 +633,25 @@ def proxy_route_healthy():
             headers={"User-Agent": "efd-fetcher-gate"})
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.load(r)
-        checks = d.get("checks") or []
+        # The pipeline verdicts live under pipeline.checks; the top-level
+        # "checks" key is an unrelated infrastructure dict (storage,
+        # datadog, secrets) and never carries senate_relay/senate_efd.
+        pipeline = d.get("pipeline") or {}
+        checks = pipeline.get("checks") or []
         if isinstance(checks, dict):
             checks = list(checks.values())
         st = {c.get("id"): c.get("status") for c in checks
               if isinstance(c, dict)}
-        return st.get("senate_relay") == "ok" and st.get("senate_efd") == "ok"
-    except Exception:
+        healthy = (st.get("senate_relay") == "ok"
+                   and st.get("senate_efd") == "ok")
+        if not healthy:
+            log("proxy gate: route not healthy "
+                f"(senate_relay={st.get('senate_relay')}, "
+                f"senate_efd={st.get('senate_efd')}); fetching")
+        return healthy
+    except Exception as e:
+        log(f"proxy gate: health read failed ({type(e).__name__}); "
+            "fetching (fail open)")
         return False
 
 
