@@ -9,8 +9,10 @@ import {
 /**
  * Curated OpenAI models worth probing for disclosure-document benchmarks.
  * GPT-5.5/5.4 are access-dependent fallbacks, not automatic run candidates.
+ * gpt-6-astra added 2026-09-18 (verified live on OpenRouter as openai/gpt-6-astra).
  */
 export const OPENAI_BENCHMARK_ACCESS_MODELS = [
+  'gpt-6-astra',
   'gpt-5.6-terra',
   'gpt-5.6-terra-pro',
   'gpt-5.6-luna',

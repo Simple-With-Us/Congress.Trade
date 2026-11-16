@@ -19,7 +19,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Env, Transaction } from '../../shared/types.ts';
 import { openMigratedD1, type SqliteDatabase } from '../../prices/__tests__/sqliteD1.ts';
-import { generateTradeHash, recordTradeLatencyCandidates } from '../tradeLatency.ts';
+import { backfillTradeLatencyCandidates, generateTradeHash, recordTradeLatencyCandidates } from '../tradeLatency.ts';
 
 let db: SqliteDatabase;
 let env: Env;
@@ -107,6 +107,57 @@ describe('recordTradeLatencyCandidates — inline ct_publish scheduling', () => 
     await recordTradeLatencyCandidates(env, [baseTx({ source: 'seed_dataset' })], '2026-08-16T15:00:00.000Z');
     const rows = db.prepare(`SELECT COUNT(*) AS n FROM latency_price_snapshots`).get() as { n: number };
     expect(rows.n).toBe(0);
+  });
+
+  it('does not schedule ct_publish when the minted transaction is an option', async () => {
+    await recordTradeLatencyCandidates(env, [baseTx({ isOption: true, assetType: 'OP' })], '2026-08-16T15:00:00.000Z');
+    const rows = db.prepare(`SELECT COUNT(*) AS n FROM latency_price_snapshots`).get() as { n: number };
+    expect(rows.n).toBe(0);
+    const candidates = db.prepare(`SELECT COUNT(*) AS n FROM trade_latency_candidates`).get() as { n: number };
+    expect(candidates.n).toBeGreaterThan(0);
+  });
+});
+
+describe('backfillTradeLatencyCandidates — persist option flags into the snapshot gate', () => {
+  function seedLiveTx(opts: {
+    id: string;
+    ticker: string;
+    txDate: string;
+    isOption: number;
+    assetType?: string;
+    assetName?: string;
+  }): void {
+    const nowIso = new Date().toISOString();
+    const filed = nowIso.slice(0, 10);
+    db.prepare(
+      `INSERT OR IGNORE INTO filers (bioguide_id, chamber, full_name) VALUES ('K000001', 'house', 'Ro Khanna')`,
+    ).run();
+    db.prepare(
+      `INSERT OR IGNORE INTO filings (doc_id, chamber, filer_id, filing_type, filed_date, ingest_status, first_seen_at)
+       VALUES ('H-live', 'house', 'K000001', 'P', ?, 'persisted', ?)`,
+    ).run(filed, nowIso);
+    db.prepare(
+      `INSERT INTO transactions
+         (id, doc_id, filer_id, tx_date, owner, asset_name, ticker, asset_type, tx_type,
+          is_option, source, created_at, first_seen_at, filed_date)
+       VALUES (?, 'H-live', 'K000001', ?, 'self', ?, ?, ?, 'P', ?, 'primary', ?, ?, ?)`,
+    ).run(opts.id, opts.txDate, opts.assetName ?? opts.ticker, opts.ticker, opts.assetType ?? null, opts.isOption, nowIso, nowIso, filed);
+  }
+
+  it('does not stamp equity minute snapshots onto an is_option=1 row', async () => {
+    const txDate = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    seedLiveTx({ id: 'tx-opt', ticker: 'AAPL', txDate, isOption: 1, assetType: 'OP', assetName: 'AAPL Call' });
+    seedLiveTx({ id: 'tx-eq', ticker: 'MSFT', txDate, isOption: 0, assetType: 'ST', assetName: 'Microsoft' });
+
+    const result = await backfillTradeLatencyCandidates(env, { limit: 20, days: 7 });
+    expect(result.recorded).toBe(2);
+
+    const optHash = generateTradeHash('Ro Khanna', 'AAPL', txDate, 'P');
+    const eqHash = generateTradeHash('Ro Khanna', 'MSFT', txDate, 'P');
+    const optSnaps = db.prepare(`SELECT COUNT(*) AS n FROM latency_price_snapshots WHERE trade_hash = ?`).get(optHash) as { n: number };
+    const eqSnaps = db.prepare(`SELECT COUNT(*) AS n FROM latency_price_snapshots WHERE trade_hash = ?`).get(eqHash) as { n: number };
+    expect(optSnaps.n).toBe(0);
+    expect(eqSnaps.n).toBeGreaterThan(0);
   });
 });
 

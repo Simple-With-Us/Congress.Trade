@@ -47,7 +47,9 @@ surfaced in `GET /api/admin/diagnostics` (`provider:openrouter`) and
 
 ### Auth, billing, email
 `ADMIN_TOKEN`¹, `INGEST_TOKEN`, `ADMIN_MAINTENANCE_TOKEN`², `ADMIN_EMAILS`, `ACCESS_AUD`,
-`REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL`, `REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET`,
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL`, `REVIEW_QUEUE_PUBLISHER_WEBHOOK_URL_GB` (optional GB Publisher fan-out; same `_SECRET`),
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_AUTH_GB` (optional GB-only `Authorization` header; value includes `Bearer `),
+`REVIEW_QUEUE_PUBLISHER_WEBHOOK_SECRET`,
 `ACCESS_TEAM_DOMAIN`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
 `WEBHOOK_SIGNING_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
 `STRIPE_PRICE_MONTHLY`, `STRIPE_PRICE_ANNUAL`, `STRIPE_TRIAL_DAYS`,
@@ -69,7 +71,7 @@ safe only while a strong client secret exists.
 ### Fleet coordination (shared-at-ct ONLY)
 `AGENT_SYNC_TOKEN`, `AGENT_SYNC_POST_TOKEN` — one pair for every app.
 Rotate in the shared project; never duplicate onto `socratic-trade` or
-`congress-trade` app projects.  Local Mac copy: `~/.secrets/agent-sync.env`.
+`congress-trade` app projects.  Local Mac copy: Infisical `/agent-sync` (`fleet-secrets get`).
 
 ### Integrations
 `APP_B_IMPORT_URL`, `APP_B_INGEST_TOKEN`, `USAGE_MONITOR_ENABLED`,
@@ -100,25 +102,32 @@ application from this repo; reuse an existing Browser RUM app on the
 current Datadog account.
 
 ### Tunables & flags
-- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `FMP_MAX_PER_MINUTE`,
+- Budgets/pacers: `FMP_DAILY_CALL_CAP`, `ST_PEER_MAX_PER_MINUTE`,
   `EDGAR_MAX_PER_MINUTE`
+  - `ST_PEER_MAX_PER_MINUTE` paces every Socratic.Trade peer read (profiles,
+    EOD prices, the price catch-up, the not-covered re-check).  It is clamped to
+    100/min because ST's `peerRead` limit is 120/min for all peer reads;  unset
+    paces at 100/min.  It replaces `FMP_MAX_PER_MINUTE`, which is no longer read.
+    FMP is latency probes only and is never a price source.
 - Providers/routing: `PRICE_PROVIDER`, `APP_BASE_URL`
 - Anti-scrape: `SCRAPE_GUARD_ENABLED`
 - Disclosure-latency race: `DISCLOSURE_LATENCY_WATCH_ENABLED`,
   `DISCLOSURE_LATENCY_PROVIDERS`, `DISCLOSURE_LATENCY_WATCH_LIMIT`,
   legacy `FMP_DISCLOSURE_WATCH_ENABLED` / `FMP_DISCLOSURE_WATCH_LIMIT`,
-  **FMP family (default ON for CT when keys present):** `FMP_LATENCY_PROBE_ENABLED`
-  (explicit false/off disables; grey OFF), `FMP_LATENCY_PATHS` (default **`stable`**
-  only — RapidAPI FMP auth works but **house/senate-latest 404** and **no
-  OGE/executive-latest** as of 2026-09-04; opt in `stable,rapidapi` only if
-  marketplace gains those disclosure endpoints),
+  **FMP family (latency probes only; default ON for CT when keys present):**
+  `FMP_LATENCY_PROBE_ENABLED` (explicit false/off disables; grey OFF),
+  `FMP_LATENCY_PATHS` (congress probes are **stable only**. RapidAPI
+  house/senate-latest **404** as of 2026-09-04 and is not fetched even if
+  listed — it does not replace stable. Dual keys
+  `FMP_LATENCY_API_KEY` + `FMP_LATENCY_API_KEY_2` fail over on 429 / daily cap
+  / 401 / 403),
   optional `FMP_STABLE_BASE_URL` / `FMP_RAPIDAPI_BASE_URL` / `FMP_RAPIDAPI_HOST`,
   `FMP_RAPIDAPI_KEY` **or shared `RAPIDAPI_KEY`** (ST marketplace convention —
   never free-tier `FMP_LATENCY_*` on the RapidAPI host),
-  `FMP_RAPIDAPI_DAILY_CAP` (default 500 HTTP/day for RapidAPI path if enabled),
+  `FMP_RAPIDAPI_DAILY_CAP` is not spent on house/senate probes (those routes 404),
   `FMP_LATENCY_DAILY_CAP` (per free-tier key, default 235), dual free keys
-  `FMP_LATENCY_API_KEY` + `_2` (or `FMP_API_KEY` as slot-2 fallback) **rotate**
-  for ~2× capacity — no known per-IP limit on free tier,
+  `FMP_LATENCY_API_KEY` + `_2` (or `FMP_API_KEY` as slot-2 fallback) **rotate and
+  fail over** (429 / cap / 401 / 403) for ~2× capacity — no known per-IP limit,
   `UW_LATENCY_DAILY_CAP` (default 240 HTTP/day incl. deep-match),
   `QUIVER_LATENCY_DAILY_CAP` (default 360 HTTP/day; 3 calls per probe),
   `UW_DEEP_MATCH_DATES_PER_RUN` (UW deep-match date budget; default `8`).
@@ -321,6 +330,12 @@ current Datadog account.
   Metered dollars persist per day/provider in the D1 `llm_spend` table
   (migration 0049) and surface in `GET /diagnostics` under
   `resourceGovernors.llmSpend`.
+- Webhook quarantine recovery (`delivery/targetCircuit.ts`, an `APP_SETTINGS`
+  knob with env fallback): `DELIVERY_TARGET_QUARANTINE_AUTO_RECOVER` (default
+  off).  When truthy, the scheduled parked flush re-parks live quarantined
+  deliveries for delivery once the target circuit closes and parked headroom
+  opens.  Off, only rows whose transaction is gone or retracted are skipped,
+  and live rows wait for an explicit `POST /api/admin/delivery-requeue-quarantined`.
 
 ² `USAGE_MONITOR_ENVIRONMENT` is Infisical-tunable on its async read paths
 (admin-open check, usage telemetry); the sync local-webhook-target gate in

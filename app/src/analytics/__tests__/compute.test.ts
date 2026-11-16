@@ -180,6 +180,53 @@ describe('aggregateMemberPerformance', () => {
     expect(out.medianExcess).toBeCloseTo(0.05, 5); // median of +0.20 and -0.10
   });
 
+  it('skips stale-priced rows when priceFreshThrough is set', () => {
+    const dual = aggregateMemberDualPerformance(
+      [
+        row({
+          txType: 'P',
+          priceAtTrade: 100,
+          currentPrice: 120,
+          spxAtTrade: 100,
+          currentPriceDate: '2026-07-01',
+          spxNow: 105,
+        }),
+        row({
+          txType: 'P',
+          priceAtTrade: 100,
+          currentPrice: 110,
+          spxAtTrade: 100,
+          currentPriceDate: '2026-08-01',
+          spxNow: 100,
+        }),
+      ],
+      110,
+      { priceFreshThrough: '2026-08-01' },
+    );
+    expect(dual.tradeDate.scoredCount).toBe(1);
+    expect(dual.tradeDate.avgReturn).toBeCloseTo(0.1, 5);
+  });
+
+  it('skips a missing current price date when priceFreshThrough is set', () => {
+    const out = aggregateMemberPerformance(
+      [
+        row({ currentPriceDate: null }),
+        row({ currentPriceDate: '' }),
+        row({
+          currentPriceDate: '2026-08-01',
+          priceAtTrade: 100,
+          currentPrice: 110,
+          spxAtTrade: 100,
+        }),
+      ],
+      100,
+      { priceFreshThrough: '2026-08-01' },
+    );
+    expect(out.tradeCount).toBe(3);
+    expect(out.scoredCount).toBe(1);
+    expect(out.avgReturn).toBeCloseTo(0.1, 5);
+  });
+
   it('leaves excess null (but still scores the return) when no S&P anchor exists', () => {
     const out = aggregateMemberPerformance([row({ spxAtTrade: null })], null);
     expect(out.scoredCount).toBe(1);

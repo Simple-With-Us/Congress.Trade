@@ -5,6 +5,15 @@
 # Display name: Congress.Trade
 # Team: CC8UTF7ATG
 #
+# 2026-09-22 bundle-ID migration (additive only — the iOS bundle ID is unchanged):
+#   App Group (new): group.trade.congress
+#   Associated Domain (new): congress.trade — applinks + webcredentials
+#   `applinks:congress.trade` was already live in the entitlements file from
+#   PR #2370 (added 2026-09-13 alongside the broader audit remediation); this
+#   PR adds the matching `webcredentials:congress.trade` and the new App Group.
+#   Owner action: register the App Group on the existing App ID in the Apple
+#   Developer Portal and host `apple-app-site-association` on congress.trade.
+#
 # Regenerate after editing this file or adding/removing app sources:
 #   cd clients/ios && xcodegen generate
 #
@@ -35,8 +44,13 @@ settings:
     # The ship script passes MARKETING_VERSION / CURRENT_PROJECT_VERSION on the
     # xcodebuild command line. Keep these honest so anyone can answer "what
     # version is this repo at?" without an ASC round trip.
-    MARKETING_VERSION: "1.0.4"
-    CURRENT_PROJECT_VERSION: "4"
+    #
+    # Congress.Trade ships a fixed marketing version (1.1.2, from
+    # fixedMarketingVersion in scripts/ios-fleet/apps.json) with a shared
+    # merge-timestamp build (YYYYMMDDHHMM); the ship overrides both, so the
+    # CURRENT_PROJECT_VERSION below is only a placeholder until the next ship.
+    MARKETING_VERSION: "1.1.2"
+    CURRENT_PROJECT_VERSION: "202610290000"
     DEVELOPMENT_TEAM: CC8UTF7ATG
     CODE_SIGN_STYLE: Automatic
     TARGETED_DEVICE_FAMILY: "1,2"
@@ -48,7 +62,7 @@ settings:
 packages:
   Sentry:
     url: https://github.com/getsentry/sentry-cocoa.git
-    from: "8.44.0"
+    from: "9.33.0"
 
 targets:
   CongressTrade:
@@ -58,6 +72,8 @@ targets:
       - package: Sentry
         product: Sentry
       - sdk: AuthenticationServices.framework
+      - target: CongressTradeWidget
+        embed: true
     sources:
       - path: CongressTrade
         excludes:
@@ -101,7 +117,6 @@ targets:
         SENTRY_DSN: $(SENTRY_DSN)
         UIAppFonts:
           - ZillaSlab-Regular.ttf
-          - ZillaSlab-Bold.ttf
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UIApplicationSupportsIndirectInputEvents: true
@@ -125,6 +140,14 @@ targets:
     # xcodegen REWRITES CongressTrade.entitlements from this block on every
     # `xcodegen generate` — anything added only to the .entitlements file is
     # silently dropped by the next regen. Keep both in sync.
+    #
+    # 2026-09-22 bundle-ID migration — added:
+    #   `webcredentials:congress.trade` under com.apple.developer.associated-domains
+    #     (the existing `applinks:congress.trade` was added by PR #2370 on
+    #     2026-09-13 and is preserved).
+    #   `com.apple.security.application-groups: [group.trade.congress]` — must
+    #     be registered per App ID in the Apple Developer Portal before any
+    #     shared-container `UserDefaults` writes work.
     entitlements:
       path: CongressTrade/CongressTrade.entitlements
       properties:
@@ -136,6 +159,48 @@ targets:
           - Default
         com.apple.developer.associated-domains:
           - applinks:congress.trade
+          # Added 2026-09-22: site-association webcredentials for the
+          # owned-domain pair (Universal Links already covered above).
+          - webcredentials:congress.trade
+        # Added 2026-09-22: App Group for shared-container UserDefaults
+        # between the iOS app and any future extensions (no extensions
+        # ship today; the entitlement is registered proactively so we
+        # don't have to ship a follow-up PR before adding one).
+        com.apple.security.application-groups:
+          - group.trade.congress
+
+
+  CongressTradeWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CongressTradeWidget
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: trade.congress.ios.widget
+        PRODUCT_NAME: "CongressTradeWidget"
+        DEVELOPMENT_TEAM: CC8UTF7ATG
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: CongressTradeWidget/CongressTradeWidget.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: CongressTradeWidget/Info.plist
+        SWIFT_VERSION: "5.0"
+        SKIP_INSTALL: YES
+    # No `info:` block: `info.path` makes XcodeGen rewrite CongressTradeWidget/Info.plist
+    # from `info.properties` on every `xcodegen generate`. With GENERATE_INFOPLIST_FILE = NO
+    # there is no synthesized-key fallback, so the checked-in plist (NSExtension + XPC! bundle
+    # keys) is the single source of truth — same pattern as excluding CongressTrade/Info.plist
+    # from the app target sources while keeping INFOPLIST_FILE.
+    entitlements:
+      path: CongressTradeWidget/CongressTradeWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.trade.congress
 
   CongressTradeTests:
     type: bundle.unit-test

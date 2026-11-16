@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { rateLimit, clientIp, resetMemoryRateLimitForTests } from '../rateLimit.ts';
+import { stampTcpPeer } from '../../security/originLock.ts';
 import type { Env } from '../types.ts';
 
 function fakeEnv(): Env {
@@ -131,41 +132,52 @@ describe('rateLimit auth-bucket same-isolate hardening', () => {
   });
 });
 
+const CF_EDGE = '104.16.1.2';
+
+function fromPeer(peer: string, headers: Record<string, string>): Request {
+  return stampTcpPeer(new Request('https://x', { headers }), peer);
+}
+
 describe('clientIp', () => {
-  it('prefers cf-connecting-ip', () => {
-    const req = new Request('https://x', { headers: { 'cf-connecting-ip': '1.2.3.4' } });
-    expect(clientIp(req)).toBe('1.2.3.4');
+  it('ignores cf-connecting-ip unless the socket peer is Cloudflare', () => {
+    const spoofed = new Request('https://x', { headers: { 'cf-connecting-ip': '1.2.3.4' } });
+    expect(clientIp(spoofed)).toBe('unknown');
+    expect(clientIp(fromPeer(CF_EDGE, { 'cf-connecting-ip': '1.2.3.4' }))).toBe('1.2.3.4');
   });
 
-  it('prefers cf-connecting-ip even when client-supplied headers are present', () => {
-    const req = new Request('https://x', {
-      headers: {
-        'cf-connecting-ip': '1.2.3.4',
-        'x-real-ip': '6.6.6.6',
-        'x-forwarded-for': '6.6.6.6, 7.7.7.7',
-      },
+  it('prefers cf-connecting-ip over client-supplied forwarding headers once the peer is Cloudflare', () => {
+    const req = fromPeer(CF_EDGE, {
+      'cf-connecting-ip': '1.2.3.4',
+      'x-real-ip': '6.6.6.6',
+      'x-forwarded-for': '6.6.6.6, 7.7.7.7',
     });
     // A spoofable header must never override the edge-asserted IP, otherwise a
     // client rotating x-forwarded-for values chooses its own rate-limit key.
     expect(clientIp(req)).toBe('1.2.3.4');
   });
 
-  it('falls back to x-real-ip before x-forwarded-for off-Cloudflare', () => {
-    const req = new Request('https://x', {
-      headers: { 'x-real-ip': '9.9.9.9', 'x-forwarded-for': '6.6.6.6' },
+  it('uses x-real-ip from a trusted proxy and ignores x-forwarded-for when the peer is not Cloudflare', () => {
+    const req = fromPeer('127.0.0.1', {
+      'x-real-ip': '9.9.9.9',
+      'x-forwarded-for': '6.6.6.6',
+      'cf-connecting-ip': '1.2.3.4',
     });
     expect(clientIp(req)).toBe('9.9.9.9');
   });
 
-  it('uses the LAST x-forwarded-for hop (nearest proxy), not the attacker-supplied first', () => {
-    const req = new Request('https://x', {
-      headers: { 'x-forwarded-for': 'spoofed-by-client, 10.0.0.1' },
+  it('uses the LAST x-forwarded-for hop when the socket peer is Cloudflare', () => {
+    const req = fromPeer(CF_EDGE, {
+      'x-forwarded-for': 'spoofed-by-client, 10.0.0.1',
     });
     expect(clientIp(req)).toBe('10.0.0.1');
+    const unstamped = new Request('https://x', {
+      headers: { 'x-forwarded-for': 'spoofed-by-client, 10.0.0.1' },
+    });
+    expect(clientIp(unstamped)).toBe('unknown');
   });
 
   it('ignores empty x-forwarded-for entries', () => {
-    const req = new Request('https://x', { headers: { 'x-forwarded-for': ' , ,10.0.0.2, ' } });
+    const req = fromPeer(CF_EDGE, { 'x-forwarded-for': ' , ,10.0.0.2, ' });
     expect(clientIp(req)).toBe('10.0.0.2');
   });
 

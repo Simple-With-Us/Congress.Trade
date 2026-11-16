@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The autofix request gate in `.github/workflows/codex-autofix-reusable.yml` caps the loop at one run per bot per pull request.  A bot review counts as a request only when it carries the `@codex-autofix` tag (a `workflow_dispatch` run is a request on its own), an accepted run records the bot in a marker issue comment on the pull request, and a later request from the same bot is skipped.  The owner and Sentry are exempt from the cap.  Callers must grant `issues: write` alongside `contents: write` and `pull-requests: write`:  the marker comments are issue comments, and a reusable workflow can only downgrade the permissions its caller grants, so the reusable's own `permissions` block cannot raise them.
+
+### Fixed
+- `.github/workflows/codex-autofix-reusable.yml` no longer uses the org secret `GH_PAT` (owner 2026-10-11).  GitHub rejected the stored token, so checkout failed with `could not read Username for 'https://github.com'`.  Checkout and claude-code-action now use the built-in `GITHUB_TOKEN`.  `GH_PAT` stays declared as an optional, ignored `workflow_call` secret so callers that still pass it do not error;  the caller template and the local caller no longer pass it.  Accepted cost:  pushes made with `GITHUB_TOKEN` do not re-trigger CI or reviewers, so re-push before arming auto-merge.  Callers need `contents: write`, `pull-requests: write` and `issues: write`.  claude-code-action (`ed670b4`) needs nothing else when `github_token` is passed:  no OIDC `id-token: write`, and `use_commit_signing` defaults to false.
+
+### Changed
+- `.github/workflows/codex-autofix-reusable.yml` (display name "Claude Code Autofix (Reusable)") now routes claude-code-action to MiniMax (`https://api.minimax.io/anthropic`, org secret `MINIMAX_API_KEY`) instead of DeepSeek, adds a `model` input (default `MiniMax-M3.1-Flash`), and acts on Codex, Kody, Cursor and the `swu-*` fleet bot reviews by default.  Callers must pass `MINIMAX_API_KEY` and use the shared `pr-autofix-${{ github.repository }}-<PR>` concurrency group (see the workflow header).
+- The autofix actor policy now trusts the `swu-*` fleet bots in addition to Codex, Kody and Cursor:  `.github/workflows/codex-autofix-reusable.yml` (default `allowed_bots`), `.github/workflows/claude-code-autofix.yml` (caller `allowed_bots`) and `.github/workflows/autofix.yml` (fleet reusable caller) name the full fleet bot set, and `.github/pr-autofix-trusted.yml` pins the repository trusted policy to model `MiniMax-M3.1-Flash`.  The two local lists carry each bot with and without GitHub's `[bot]` suffix, because claude-code-action strips the suffix before matching;  the `autofix.yml` fleet caller lists each fleet bot with GitHub's `[bot]` suffix, because that reusable compares the author login exactly.  `claude` stays trusted in every list.  Sentry/Seer is not in the reusable default (docs/rollouts/2026-10-19-sentry-claude-autofix.md keeps it unchanged):  the `claude-code-autofix.yml` caller and the `autofix.yml` fleet-reusable caller both pass Sentry/Seer.
+
+## [2.9.0] — 2026-10-23
+
+### Added
+- `SharePayloadSchema` now carries an optional `schemaVersion` (ST-3853).  `SHARE_PAYLOAD_SCHEMA_VERSION` (currently `1`) is the version senders should stamp, and `SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION` is the version assumed when the field is missing.  `resolveSharePayloadSchemaVersion` and `isSupportedSharePayloadSchemaVersion` let a receiver log or reject a version it does not understand.  The field is optional and any positive integer parses, so current senders and receivers keep working unchanged.
+
+## [2.8.1] — 2026-10-17
+
+### Fixed
+- `buildAiUsage` ignores an explicit `undefined` in `tokens` instead of throwing a ZodError or erasing the count read from the SDK usage (review finding on #378).
+
+## [2.8.0] — 2026-10-17
+
+### Added
+- Canonical AI usage block for usage telemetry v2 (UM-1592):  an optional, strict `ai` field on every v2 event with `model.{requested,served}`, `harness`, `seat`, `tokens.{input,output,cacheRead,cacheWrite5m,cacheWrite1h,reasoning}`, `durationMs`, `ttftMs`, `billingMode` (`subscription`/`payg`/`free`) and `costSource` (`billed`/`estimated`).  Additive:  events without `ai` are unchanged.  Schemas and types in `src/aiUsage.ts`.
+- `buildAiUsage` and `aiTokensFromAnthropicUsage` / `aiTokensFromOpenAiUsage` / `aiTokensFromGeminiUsage` / `aiTokensFromSdkUsage` build the block from Anthropic `usage` (with the `cache_creation` 5-minute/1-hour split), OpenAI Chat Completions and Responses `usage` (cached and reasoning tokens, DeepSeek cache hits) and Gemini `usageMetadata`.  `aiUsageTotalTokens` sums the billed buckets.
+- `docs/ai-usage-schema.md`:  field semantics and per-producer migration instructions.
+
+### Changed
+- `USAGE_TELEMETRY_PRODUCERS` now lists every fleet producer id (botfleet, codecaps, claude-code, openai-codex, grok-build, github-copilot, minimax-code, deepseek-dsh, opencode, fx, antigravity-cli, antigravity-statusline, cursor-agent, cursor-admin, muse, muse-code, gbu, mac-host, fleet-usage-collector, admin-usage-poller, manual-billing-adjustment).
+- `USAGE_TELEMETRY_KNOWN_PROVIDERS` adds minimax, deepseek, xai, moonshot, github-copilot and cursor.
+
+## [2.7.0] — 2026-09-15
+
+### Added
+- `scripts/cloud-setup.sh` (and `.devcontainer/devcontainer.json`) for cold Code Cloud, Codespaces, and throwaway clones — runs `npm ci --include=dev` + `npm run build` idempotently.
+- `AGENTS.md` Fleet Recall pointer that requires a corpus search before re-deriving a lesson and a contribution at closeout (app slug: `congress-trading-shared`).
+- `normalizeSecurityRef` (`src/client.ts`) now also coerces a producer-supplied `marketCapBucket` to `null` when the string is outside the 6-value mega/large/mid/small/micro/nano enum, and truncates a `currentPriceDate` ISO timestamp down to the `YYYY-MM-DD` segment (or `null`) so a single bad row cannot reject the rest of an enrichment batch.
+
+### Changed
+- `CongressTradeClient.createSubscription(clientId, desiredSecret)` — `clientId` is now optional and only added to the POST body when supplied; the field on the wire is left out of legacy authless callers.
+- Dev dep `vitest` bumped from `^4.1.11` to `^5.0.0` (paired `@vitest/coverage-v8` `^4.1.10` → `^5.0.0`); `zod` peer/dev dep moves to `^4.6.2`; ancillary bumps for `@types/node`, `publint`, and `anthropics/claude-code-action`.
+
+### Fixed
+- `scripts/codex-coordination.sh` — `slack_call` removes its temporary auth config file inside the subshell invocation; `filter_history` now runs Python with `-c` so `sys.stdin` consumes the piped Slack JSON instead of capturing a heredoc.
+- `.github/workflows/auto-merge-prs.yml` — never auto-merge public-fork PRs; the workflow stopped dispatching on `pull_request_target`, switches to a same-repo guard, and refuses to arm auto-merge against `GITHUB_TOKEN` (rollout note: `docs/rollouts/2026-09-13-automerge-fork-guard.md`).
+
+## [2.6.0] — 2026-08-23
+
+### Added
+- `tickerLogoPolicy`: shared A/B/C/D company-logo source order (GitHub pack vs
+  logo.dev, light vs dark) plus the 2026-08-23 Congress.Trade top-30 seed map.
+  Apps keep their own serving, disk/KV cache, and admin jury. `sourceOrderFor`
+  accepts a fallback so Socratic.Trade can keep GitHub-first for ungraded names.
+
 ## [2.5.2] — 2026-08-11
 
 ### Changed
@@ -308,7 +362,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Package prepared for install via `prepare` build script and CI.
 - GitHub Actions CI pipeline (typecheck, build, audit).
 
-[Unreleased]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v2.5.2...v2.6.0
+[2.5.2]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v2.5.1...v2.5.2
 [2.0.0]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v1.11.1...v2.0.0
 [1.11.1]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v1.11.0...v1.11.1
 [1.11.0]: https://github.com/jaywedgeworth22/congress-trading-shared/compare/v1.10.0...v1.11.0

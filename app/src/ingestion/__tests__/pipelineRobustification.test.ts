@@ -4,6 +4,13 @@ import { S3BucketShim, D1DatabaseShim } from '../../deno/shims.ts';
 import { ensureBusyTimeout } from '../../shared/db.ts';
 import { sendPushover } from '../../shared/pushover.ts';
 import { OpenRouterVisionExtractor } from '../../extraction/openRouterVision.ts';
+import {
+  clearCronTickOverrun,
+  recordCronTickOverrun,
+  isDenoCronTickHardDeadline,
+  tickOutcomeShouldRecord,
+} from '../../shared/cronDeadlineSignal.ts';
+import type { Env } from '../../shared/types.ts';
 
 describe('R3: Pipeline Robustification', () => {
   describe('1. Discovery Doc-Kind Pre-Classification', () => {
@@ -146,6 +153,83 @@ describe('R3: Pipeline Robustification', () => {
       } finally {
         globalThis.fetch = origFetch;
       }
+    });
+  });
+
+  describe('5. Cron deadline loud-fail and recovery', () => {
+    function kvEnv() {
+      const store = new Map<string, string>();
+      const env = {
+        CONFIG_KV: {
+          get: async (key: string) => {
+            const raw = store.get(key);
+            return raw ? JSON.parse(raw) : null;
+          },
+          put: async (key: string, value: string) => {
+            store.set(key, value);
+          },
+          delete: async (key: string) => {
+            store.delete(key);
+          },
+        },
+      } as unknown as Env;
+      return { env, store };
+    }
+
+    it('suppresses only the minute-tick hard deadline, not other deadline errors', () => {
+      expect(isDenoCronTickHardDeadline('Deno cron tick exceeded 45000ms deadline')).toBe(true);
+      expect(isDenoCronTickHardDeadline('Deno cron tick exceeded 10000ms deadline')).toBe(true);
+      expect(isDenoCronTickHardDeadline('daily lane filer exceeded 120000ms deadline')).toBe(false);
+      expect(isDenoCronTickHardDeadline('exceeded 7000ms deadline')).toBe(false);
+      expect(isDenoCronTickHardDeadline('Deno cron tick nearing 45000ms deadline')).toBe(false);
+      expect(isDenoCronTickHardDeadline('checkPipelineHealth exceeded 8000ms')).toBe(false);
+    });
+
+    it('records a deadline abort and a SQLITE_BUSY skip, and ignores a plain overlap', () => {
+      expect(tickOutcomeShouldRecord({
+        aborted: true,
+        skippedOverlap: false,
+        errors: ['tick: aborted'],
+      })).toBe('tick: aborted');
+      expect(tickOutcomeShouldRecord({
+        aborted: false,
+        skippedOverlap: true,
+        errors: ['tick_singleton_unavailable: SQLITE_BUSY: database is locked'],
+      })).toContain('SQLITE_BUSY');
+      expect(tickOutcomeShouldRecord({
+        aborted: false,
+        skippedOverlap: true,
+        errors: [],
+      })).toBeNull();
+    });
+
+    it('keeps one episode across a racing double record, then clears on a finished tick', async () => {
+      const { env, store } = kvEnv();
+      const now = new Date('2026-10-05T18:00:00.000Z');
+      const first = await recordCronTickOverrun(env, {
+        deadlineMs: 45000,
+        reason: 'Deno cron tick exceeded 45000ms deadline',
+        now,
+      });
+      const second = await recordCronTickOverrun(env, {
+        deadlineMs: 45000,
+        reason: 'Deno cron tick exceeded 45000ms deadline',
+        now: new Date(now.getTime() + 1000),
+      });
+      expect(first?.count).toBe(1);
+      expect(second?.count).toBe(1);
+      expect(store.size).toBe(1);
+
+      const later = await recordCronTickOverrun(env, {
+        deadlineMs: 45000,
+        reason: 'SQLITE_BUSY: database is locked',
+        now: new Date(now.getTime() + 120_000),
+      });
+      expect(later?.count).toBe(2);
+      expect(later?.reason).toContain('SQLITE_BUSY');
+
+      await clearCronTickOverrun(env);
+      expect(store.size).toBe(0);
     });
   });
 });

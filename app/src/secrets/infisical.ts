@@ -10,6 +10,7 @@
 
 import type { Env } from '../shared/types.ts';
 import { trackedFetch } from '../shared/thirdPartyTelemetry.ts';
+import { z } from 'zod';
 
 export type SourceName = 'app' | 'shared';
 
@@ -55,6 +56,10 @@ export interface SecretResolverStatus {
 const DEFAULT_BASE_URL = 'https://app.infisical.com';
 const DEFAULT_ENV = 'prod';
 const DEFAULT_TTL_SECONDS = 600;
+const loginResponseSchema = z.object({
+  accessToken: z.string().min(1).refine((value) => value.trim().length > 0).optional(),
+  token: z.string().min(1).refine((value) => value.trim().length > 0).optional(),
+}).refine((body) => Boolean(body.accessToken || body.token));
 
 const cache = new Map<string, CacheEntry>();
 
@@ -67,11 +72,18 @@ function cacheTtlSeconds(env: Env): number {
   return Number.isFinite(n) && n > 0 ? Math.min(n, 3600) : DEFAULT_TTL_SECONDS;
 }
 
+/**
+ * prod is the only Infisical environment the fleet reads (owner 2026-10-10:
+ * dev and staging are retired).  Unset or blank falls back to prod and
+ * "production" is accepted as an alias;  anything else is refused so a stale
+ * INFISICAL_ENV can never read, or write to, a retired environment.
+ */
 function envName(env: Env): string {
-  const val = (env.INFISICAL_ENV || DEFAULT_ENV).trim();
-  if (val === 'production') return 'prod';
-  if (val === 'development') return 'dev';
-  return val || DEFAULT_ENV;
+  const val = (env.INFISICAL_ENV || '').trim();
+  if (!val || val === DEFAULT_ENV || val === 'production') return DEFAULT_ENV;
+  throw new Error(
+    `INFISICAL_ENV must be "${DEFAULT_ENV}" (dev and staging are retired); got "${val.slice(0, 32)}"`,
+  );
 }
 
 function envFallbackAllowed(env: Env): boolean {
@@ -110,9 +122,9 @@ function sourceConfigs(env: Env): SourceConfig[] {
   const appClientSecret = env.INFISICAL_CLIENT_SECRET || env.INFISICAL_APP_CLIENT_SECRET;
 
   // Merge order: shared first, then app.  App wins on a name collision, so
-  // fleet-wide keys (AGENT_SYNC_TOKEN, AGENT_SYNC_POST_TOKEN) MUST live only
-  // in shared-at-ct.  Duplicating them on the ST/CT app projects shadows the
-  // shared row and makes rotation a three-project chore.
+  // fleet-wide keys (the shared pair in app/docs/config-registry.md) MUST
+  // live only in shared-at-ct.  Duplicating them on the ST/CT app projects
+  // shadows the shared row and makes rotation a three-project chore.
   return [
     {
       name: 'shared',
@@ -144,6 +156,18 @@ function resolverEnabled(env: Env): boolean {
 }
 
 function cacheKey(env: Env): string {
+  return `v2:${[
+    cleanBaseUrl(env.INFISICAL_BASE_URL),
+    envName(env),
+    env.INFISICAL_SHARED_PROJECT_ID || '',
+    env.INFISICAL_SHARED_SECRET_PATH || '/',
+    env.INFISICAL_APP_PROJECT_ID || '',
+    env.INFISICAL_APP_SECRET_PATH || env.INFISICAL_SECRET_PATH || '/',
+  ].join('|')}`;
+}
+
+/** Exact unversioned key shape written before the cache-key version boundary. */
+function legacyCacheKey(env: Env): string {
   return [
     cleanBaseUrl(env.INFISICAL_BASE_URL),
     envName(env),
@@ -170,11 +194,12 @@ async function login(
     body: JSON.stringify({ clientId: source.clientId, clientSecret: source.clientSecret }),
     signal,
   }, { service: 'secret-management', operation: 'authenticate', dynamicTarget: 'infisical' });
-  const body = (await res.json().catch(() => ({}))) as { accessToken?: string; token?: string; message?: string };
-  if (!res.ok) throw new Error(`Infisical ${source.name} auth failed: HTTP ${res.status} ${body.message || ''}`.trim());
-  const token = body.accessToken || body.token;
-  if (!token) throw new Error(`Infisical ${source.name} auth failed: no access token`);
-  return token;
+  if (!res.ok) throw new Error(`Infisical ${source.name} auth failed: HTTP ${res.status}`);
+  const parsed = loginResponseSchema.safeParse(await res.json().catch(() => undefined));
+  if (!parsed.success) throw new Error(`Infisical ${source.name} auth failed: invalid response`);
+  const authToken = parsed.data.accessToken || parsed.data.token;
+  if (!authToken) throw new Error(`Infisical ${source.name} auth failed: invalid response`);
+  return authToken;
 }
 
 function secretEntries(payload: unknown): Array<{ key: string; value: string }> {
@@ -206,13 +231,17 @@ function secretEntries(payload: unknown): Array<{ key: string; value: string }> 
   return entries;
 }
 
+/** Deno KV value limit (bytes).  Encrypted blobs must stay under this. */
+export const INFISICAL_KV_CACHE_MAX_BYTES = 65_536;
+
 async function fetchSourceSecrets(
   baseUrl: string,
   infisicalEnv: string,
   source: SourceConfig,
   includeImports = true,
+  signal?: AbortSignal,
 ): Promise<Record<string, string>> {
-  const token = await login(baseUrl, source);
+  const token = await login(baseUrl, source, signal);
   const params = new URLSearchParams({
     workspaceId: source.projectId || '',
     environment: infisicalEnv,
@@ -222,6 +251,7 @@ async function fetchSourceSecrets(
   });
   const res = await trackedFetch(`${baseUrl}/api/v3/secrets/raw?${params.toString()}`, {
     headers: { authorization: `Bearer ${token}` },
+    signal,
   }, { service: 'secret-management', operation: 'read-secrets', dynamicTarget: 'infisical' });
   const body = (await res.json().catch(() => ({}))) as { message?: string };
   if (!res.ok) throw new Error(`Infisical ${source.name} secrets failed: HTTP ${res.status} ${body.message || ''}`.trim());
@@ -372,6 +402,7 @@ export async function deleteSecret(
 ): Promise<void> {
   const source = configuredSource(env, sourceName);
   const baseUrl = cleanBaseUrl(env.INFISICAL_BASE_URL);
+  const infisicalEnv = envName(env);
   const token = await login(baseUrl, source, options.signal);
   const res = await trackedFetch(`${baseUrl}/api/v3/secrets/raw/${secretKey}`, {
     method: 'DELETE',
@@ -381,7 +412,7 @@ export async function deleteSecret(
     },
     body: JSON.stringify({
       workspaceId: source.projectId,
-      environment: envName(env),
+      environment: infisicalEnv,
       secretPath: source.secretPath || '/',
       type: 'shared',
     }),
@@ -394,10 +425,24 @@ export async function deleteSecret(
   await invalidateSecretCache(env);
 }
 
-export async function refreshSecrets(env: Env): Promise<SecretResolverStatus> {
+export interface RefreshSecretsOptions {
+  /** Bypass in-memory TTL (admin refresh, post-mutation). */
+  force?: boolean;
+  signal?: AbortSignal;
+}
+
+export async function refreshSecrets(
+  env: Env,
+  options: RefreshSecretsOptions = {},
+): Promise<SecretResolverStatus> {
   const key = cacheKey(env);
   const ttlMs = cacheTtlSeconds(env) * 1000;
   const now = Date.now();
+  const existing = cache.get(key);
+  if (!options.force && existing && existing.expiresAt > now) {
+    return statusFromEntry(env, existing);
+  }
+
   const baseUrl = cleanBaseUrl(env.INFISICAL_BASE_URL);
   const infisicalEnv = envName(env);
   const sources = sourceConfigs(env);
@@ -411,7 +456,13 @@ export async function refreshSecrets(env: Env): Promise<SecretResolverStatus> {
       continue;
     }
     try {
-      const sourceValues = await fetchSourceSecrets(baseUrl, infisicalEnv, source);
+      const sourceValues = await fetchSourceSecrets(
+        baseUrl,
+        infisicalEnv,
+        source,
+        true,
+        options.signal,
+      );
       Object.assign(values, sourceValues);
       sourceStatus.push({ name: source.name, configured: true, ok: true, count: Object.keys(sourceValues).length });
     } catch (err) {
@@ -429,15 +480,42 @@ export async function refreshSecrets(env: Env): Promise<SecretResolverStatus> {
     errors,
     sources: sourceStatus,
   };
-  cache.set(key, entry);
+  // Never cache a fetch that produced no values because every configured
+  // source failed (for example the boot-time 5s abort on a slow Infisical):
+  // caching the empty entry for the full TTL would poison the immediate
+  // initSettings reload and every caller until expiry.  Leave any previous
+  // entry untouched and let the next caller retry the fetch instead.
+  if (errors.length === 0 || Object.keys(values).length > 0) {
+    cache.set(key, entry);
+  }
 
   const kvSecret = kvCacheSecret(env);
   if (env.CONFIG_KV && kvSecret && errors.length === 0 && Object.keys(values).length > 0) {
     try {
       const kvKey = `infisical_secrets_cache:${key}`;
-      const encrypted = await encryptData(JSON.stringify(entry), kvSecret);
-      const ttlSec = cacheTtlSeconds(env);
-      await env.CONFIG_KV.put(kvKey, encrypted, { expirationTtl: ttlSec });
+      const plaintext = JSON.stringify(entry);
+      const encrypted = await encryptData(plaintext, kvSecret);
+      if (encrypted.length > INFISICAL_KV_CACHE_MAX_BYTES) {
+        console.warn(
+          'infisical: skipping KV cache write (encrypted payload exceeds Deno KV limit)',
+          {
+            secretCount: Object.keys(values).length,
+            encryptedBytes: encrypted.length,
+            maxBytes: INFISICAL_KV_CACHE_MAX_BYTES,
+          },
+        );
+      } else {
+        const ttlSec = cacheTtlSeconds(env);
+        await env.CONFIG_KV.put(kvKey, encrypted, { expirationTtl: ttlSec });
+        const legacyKvKey = `infisical_secrets_cache:${legacyCacheKey(env)}`;
+        if (legacyKvKey !== kvKey) {
+          try {
+            await env.CONFIG_KV.delete(legacyKvKey);
+          } catch {
+            console.warn('infisical: failed to delete superseded KV cache row');
+          }
+        }
+      }
     } catch (err) {
       console.warn('infisical: failed to encrypt or write to KV cache', (err as Error).message);
     }

@@ -3,9 +3,11 @@
 /**
  * Safely merge local bootstrap inputs into app/.dev.vars.
  *
- * The machine-level secrets file is parsed as data, never sourced or evaluated.
- * Only Infisical machine-identity keys are read from it. Explicit process-env
- * imports are limited to documented bootstrap/early-init/local selectors.
+ * Machine-identity keys come from the process environment first, then (on a Mac
+ * with the CLI installed) from `fleet-secrets get NAME` (Infisical Fleet-OPS).
+ * Cloud and CI have no `fleet-secrets` and use the environment only. Explicit
+ * process-env imports are limited to documented bootstrap/early-init/local
+ * selectors.
  */
 
 import {
@@ -16,6 +18,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -32,21 +35,12 @@ const DEV_VARS_FILE = resolve(
     ? process.env.CT_LOCAL_BOOTSTRAP_TEST_DEV_VARS_FILE
     : resolve(APP_DIR, '.dev.vars'),
 );
-const GLOBAL_API_KEYS_FILE = TEST_PATH_OVERRIDES && process.env.CT_LOCAL_BOOTSTRAP_TEST_GLOBAL_KEYS_FILE
-  ? resolve(process.env.CT_LOCAL_BOOTSTRAP_TEST_GLOBAL_KEYS_FILE)
-  : process.env.HOME?.trim()
-    ? [
-        resolve(process.env.HOME, '.secrets/global-api-keys'),
-        resolve(process.env.HOME, '.secrets/global-api-keys.env'),
-      ].find((p) => {
-        try {
-          const stat = lstatSync(p);
-          return stat.isFile() && !stat.isSymbolicLink();
-        } catch {
-          return false;
-        }
-      }) || null
-    : null;
+// `fleet-secrets` binary used for the Mac-only fallback. Tests may point it at a
+// fake binary; outside test mode it is looked up on PATH. A missing binary means
+// "no fallback" (cloud, CI, keyless checkouts).
+const FLEET_SECRETS_BIN = TEST_PATH_OVERRIDES
+  ? process.env.CT_LOCAL_BOOTSTRAP_TEST_FLEET_SECRETS_BIN || ''
+  : 'fleet-secrets';
 
 const APP_PROJECT_ID = process.env.INFISICAL_APP_PROJECT_ID || process.env.INFISICAL_CT_PROJECT_ID || '';
 const SHARED_PROJECT_ID = process.env.INFISICAL_SHARED_PROJECT_ID || '';
@@ -184,25 +178,37 @@ function unlinkIfPresent(path) {
   }
 }
 
-function readSecureGlobalAssignments() {
-  if (!GLOBAL_API_KEYS_FILE) return new Map();
-  const stat = lstatIfPresent(GLOBAL_API_KEYS_FILE);
-  if (!stat) return new Map();
-  if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new Error('global API keys path must be a regular, non-symlink file');
-  }
-  if ((stat.mode & 0o077) !== 0) {
-    throw new Error('global API keys file must not be readable or writable by group/other');
-  }
-  return parseAssignments(
-    readFileSync(GLOBAL_API_KEYS_FILE, 'utf8'),
-    'global API keys file',
-    GLOBAL_INFISICAL_KEYS,
-  ).entries;
+// Lazy Map-like view over `fleet-secrets get NAME`: one subprocess per key, only
+// when an earlier source did not already supply the value. The first spawn error
+// (binary missing) or fetch/auth failure (exit 4+) disables further lookups;
+// exit 3 means only that key is absent. Values are never logged.
+function fleetSecretsSource() {
+  const cache = new Map();
+  let disabled = !FLEET_SECRETS_BIN;
+  return {
+    get(key) {
+      if (cache.has(key)) return cache.get(key);
+      let entry;
+      if (!disabled) {
+        const result = spawnSync(FLEET_SECRETS_BIN, ['get', key], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 30_000,
+        });
+        if (result.error || (result.status !== 0 && result.status !== 3)) {
+          disabled = true;
+        } else if (result.status === 0 && nonEmpty(result.stdout)) {
+          entry = { value: result.stdout.replace(/[\r\n]+$/, '') };
+        }
+      }
+      cache.set(key, entry);
+      return entry;
+    },
+  };
 }
 
 function sourceValue(source, key) {
-  if (source instanceof Map) return source.get(key)?.value;
+  if (typeof source.get === 'function') return source.get(key)?.value;
   return source[key];
 }
 
@@ -312,20 +318,20 @@ function main() {
     };
   }
 
-  const globalValues = readSecureGlobalAssignments();
+  const globalValues = fleetSecretsSource();
   const appPair = selectCredentialPair([
     ['app/.dev.vars app identity', target.entries, 'INFISICAL_APP_CLIENT_ID', 'INFISICAL_APP_CLIENT_SECRET'],
     ['explicit app environment identity', process.env, 'INFISICAL_APP_CLIENT_ID', 'INFISICAL_APP_CLIENT_SECRET'],
     ['canonical CT environment identity', process.env, 'INFISICAL_CT_CLIENT_ID', 'INFISICAL_CT_CLIENT_SECRET'],
-    ['global app identity', globalValues, 'INFISICAL_APP_CLIENT_ID', 'INFISICAL_APP_CLIENT_SECRET'],
-    ['global canonical CT identity', globalValues, 'INFISICAL_CT_CLIENT_ID', 'INFISICAL_CT_CLIENT_SECRET'],
+    ['fleet-secrets app identity', globalValues, 'INFISICAL_APP_CLIENT_ID', 'INFISICAL_APP_CLIENT_SECRET'],
+    ['fleet-secrets canonical CT identity', globalValues, 'INFISICAL_CT_CLIENT_ID', 'INFISICAL_CT_CLIENT_SECRET'],
   ]);
   const sharedPair = selectCredentialPair([
     ['app/.dev.vars shared identity', target.entries, 'INFISICAL_SHARED_CLIENT_ID', 'INFISICAL_SHARED_CLIENT_SECRET'],
     ['explicit shared environment identity', process.env, 'INFISICAL_SHARED_CLIENT_ID', 'INFISICAL_SHARED_CLIENT_SECRET'],
     ['canonical CT shared environment identity', process.env, 'INFISICAL_CT_SHARED_CLIENT_ID', 'INFISICAL_CT_SHARED_CLIENT_SECRET'],
-    ['global shared identity', globalValues, 'INFISICAL_SHARED_CLIENT_ID', 'INFISICAL_SHARED_CLIENT_SECRET'],
-    ['global canonical CT shared identity', globalValues, 'INFISICAL_CT_SHARED_CLIENT_ID', 'INFISICAL_CT_SHARED_CLIENT_SECRET'],
+    ['fleet-secrets shared identity', globalValues, 'INFISICAL_SHARED_CLIENT_ID', 'INFISICAL_SHARED_CLIENT_SECRET'],
+    ['fleet-secrets canonical CT shared identity', globalValues, 'INFISICAL_CT_SHARED_CLIENT_ID', 'INFISICAL_CT_SHARED_CLIENT_SECRET'],
   ]);
 
   const desired = new Map();

@@ -63,11 +63,18 @@ struct PoliticianDetailView: View {
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                                 
-                                let memberConflicts = store.conflicts.filter { $0.bioguideId == memberId }
-                                if !memberConflicts.isEmpty {
+                                // Matches on `filerId` and shows committee NAMES.
+                                // `bioguideId`/`committeeCode` never existed on
+                                // this endpoint — the model invented them, so
+                                // every decode threw and `store.conflicts` was
+                                // permanently empty; this filter has been
+                                // matching against nothing since it was written.
+                                let memberConflicts = store.conflicts.filter { $0.filerId == memberId }
+                                let committees = Array(Set(memberConflicts.flatMap { $0.committees })).sorted()
+                                if !committees.isEmpty {
                                     HStack {
-                                        ForEach(Array(Set(memberConflicts.map { $0.committeeCode })).sorted(), id: \.self) { code in
-                                            StatusPill(text: code, color: .orange, icon: "exclamationmark.triangle.fill", compact: true)
+                                        ForEach(committees, id: \.self) { name in
+                                            StatusPill(text: name, color: .orange, icon: "exclamationmark.triangle.fill", compact: true)
                                         }
                                     }
                                     .padding(.top, 4)
@@ -91,7 +98,7 @@ struct PoliticianDetailView: View {
                                     }
                                 }
                             } else if isExecutiveChamber(member.chamber) {
-                                Text("Executive filers do not sit on congressional committees.")
+                                Text("Executive branch officials do not sit on congressional committees.")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             } else {
@@ -153,6 +160,14 @@ struct PoliticianDetailView: View {
                                 }
                             }
                             .padding(.horizontal, 16)
+
+                            if let polName = member.name, !polName.isEmpty, polName != "Unknown" {
+                                SeeAllTradesHandoff(
+                                    totalTrades: summary?.totalTrades ?? 0,
+                                    displayedCount: trades.count,
+                                    filter: .politician(polName)
+                                )
+                            }
                         }
                     }
                 }
@@ -268,7 +283,8 @@ struct PoliticianDetailView: View {
     private func fetchMember() async throws -> ClientMemberResponse {
         do {
             return try await store.fetchMember(id: memberId)
-        } catch let error as APIError where error.isRetryable {
+        } catch let error as APIError where error.isRetryable
+            && !TransientRetryPolicy.shouldRetry(error: error, method: "GET") {
             try await Task.sleep(for: .milliseconds(400))
             return try await store.fetchMember(id: memberId)
         }

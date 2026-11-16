@@ -4,7 +4,8 @@
  * for an unknown symbol) just mean "no data" and should be swallowed — but a few
  * statuses mean the *key/plan itself* is broken (invalid key, plan lapsed, or
  * rate-limited because you've effectively dropped to free). Those are surfaced
- * as tagged errors so the daily job can email an alert (see alerts/notify.ts).
+ * as tagged errors.  FMP is used only by the latency probes
+ * (ingestion/tradeLatency.ts), never for prices or enrichment.
  */
 
 /** Statuses that indicate the FMP key/plan is failing (not just "symbol not found"). */
@@ -21,7 +22,3 @@ export function assertFmpTierOk(status: number): void {
   }
 }
 
-/** True when any collected error string carries a tier-failure tag. */
-export function hasFmpTierFailure(errors: string[]): boolean {
-  return errors.some((e) => /FMP_HTTP_(401|402|403|429)/.test(e));
-}

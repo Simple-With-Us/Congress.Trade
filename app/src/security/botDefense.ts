@@ -113,22 +113,68 @@ function truthy(v: string | undefined): boolean {
  * wrangler.toml var as fallback. Unset => guard off, so tests and local dev
  * are unaffected unless they opt in — mirroring DISCLOSURE_LATENCY_WATCH_ENABLED.
  */
+// CT-2459: 60s isolate cache for the guard flag. It was resolved up to 3x
+// per public request (middleware + checkRowBudget + spendRowBudget), each
+// resolution potentially a KV read + AES-GCM decrypt on the single
+// connection. The upstream secret cache already allows 600s staleness, so
+// 60s here changes no operator-visible flip latency in practice.
+const SCRAPE_GUARD_CACHE_MS = 60_000;
+// Keyed by the CONFIG_KV/DB binding identity (per-process singletons in
+// prod; per-test fakes in suites) so one env's flag never leaks into
+// another's. The no-binding fallback slot also pins the env fallback
+// string it was resolved under.
+const scrapeGuardCaches = new WeakMap<object, { value: boolean; atMs: number }>();
+let scrapeGuardFallback: { value: boolean; atMs: number; envFallback: string | undefined } | null = null;
+
 export async function scrapeGuardEnabled(env: Env): Promise<boolean> {
+  const nowMs = Date.now();
+  const binding = ((env as KvEnv).CONFIG_KV ?? (env as { DB?: unknown }).DB) as object | undefined;
+  if (binding && (typeof binding === 'object' || typeof binding === 'function')) {
+    const hit = scrapeGuardCaches.get(binding);
+    if (hit && nowMs - hit.atMs < SCRAPE_GUARD_CACHE_MS) return hit.value;
+  } else if (
+    scrapeGuardFallback &&
+    scrapeGuardFallback.envFallback === env.SCRAPE_GUARD_ENABLED &&
+    nowMs - scrapeGuardFallback.atMs < SCRAPE_GUARD_CACHE_MS
+  ) {
+    return scrapeGuardFallback.value;
+  }
+  let value: boolean;
   try {
     const live = (await resolveSecret(env, 'SCRAPE_GUARD_ENABLED')).value ?? env.SCRAPE_GUARD_ENABLED;
-    return truthy(live);
+    value = truthy(live);
   } catch {
-    return truthy(env.SCRAPE_GUARD_ENABLED);
+    value = truthy(env.SCRAPE_GUARD_ENABLED);
   }
+  if (binding && (typeof binding === 'object' || typeof binding === 'function')) {
+    scrapeGuardCaches.set(binding, { value, atMs: nowMs });
+  } else {
+    scrapeGuardFallback = { value, atMs: nowMs, envFallback: env.SCRAPE_GUARD_ENABLED };
+  }
+  return value;
+}
+
+/** Test hook: drop the cached guard flag + identifier hashes. */
+export function resetBotDefenseCachesForTests(): void {
+  scrapeGuardFallback = null;
+  identifierHashes.clear();
 }
 
 type KvEnv = Env & { CONFIG_KV?: KVNamespace };
 
+// CT-2459: checkRowBudget + spendRowBudget each hashed the same IP per
+// request; memoize per isolate (bounded).
+const identifierHashes = new Map<string, string>();
 async function hashIdentifier(identifier: string): Promise<string> {
+  const hit = identifierHashes.get(identifier);
+  if (hit) return hit;
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identifier));
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0'))
+  const hash = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0'))
     .join('')
     .slice(0, 32);
+  if (identifierHashes.size >= 1_000) identifierHashes.clear();
+  identifierHashes.set(identifier, hash);
+  return hash;
 }
 
 function rowBudgetWindow(nowSec: number): { windowStart: number; retryAfterSec: number } {
@@ -198,7 +244,7 @@ export const publicApiGuard: MiddlewareHandler<{ Bindings: Env }> = async (c, ne
         { 'X-Robots-Tag': 'noindex' },
       );
     }
-    const rl = await rateLimit(c.env, 'pub-api', clientIp(c.req.raw), PUBLIC_API_LIMIT, PUBLIC_API_WINDOW_SEC);
+    const rl = await rateLimit(c.env, 'pub-api', clientIp(c.req.raw, c.env), PUBLIC_API_LIMIT, PUBLIC_API_WINDOW_SEC);
     if (!rl.ok) {
       return c.json({ error: 'too many requests' }, 429, {
         'Retry-After': String(rl.retryAfterSec),

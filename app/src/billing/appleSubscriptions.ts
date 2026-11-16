@@ -100,23 +100,42 @@ export function appleStatusGrantsAccess(status: AppleSubscriptionStatus): boolea
  * `status` back to `active`. A later purchase on the same
  * `originalTransactionId` (new `transactionId` and `purchaseDate` after
  * `revokedAt`) is allowed so a genuine resubscribe can restore without
- * waiting for DID_RENEW.
+ * waiting for DID_RENEW. The same holds for a lapsed ledger row
+ * (`expired` / `billing_retry`): replaying the purchase-time JWS must not
+ * resurrect a subscription Apple already considers dead — otherwise one
+ * stored JWS re-grants Premium forever. A lapse is anchored at the
+ * recorded `expiresDate` rather than `revokedAt`. Legacy lapsed rows can
+ * lack either date; use their persisted last-observed timestamp in that case.
+ * A different transaction id alone is not proof of a new purchase: a historic
+ * signed transaction could also differ from the latest ledger id.
  */
+const REDEEM_GUARDED_STATUSES: ReadonlySet<AppleSubscriptionRecord['status']> = new Set([
+  'revoked',
+  'expired',
+  'billing_retry',
+]);
+
 export function clientRedeemWouldResurrectRevoked(
   existing: AppleSubscriptionRecord | null,
   incoming: { transactionId?: string | null; purchaseDateMs?: number | null },
 ): boolean {
-  if (!existing || existing.status !== 'revoked') return false;
+  if (!existing || !REDEEM_GUARDED_STATUSES.has(existing.status)) return false;
   const incomingTxn = incoming.transactionId ?? '';
   const existingTxn = existing.latestTransactionId ?? '';
   const purchaseMs = incoming.purchaseDateMs ?? Number.NaN;
-  const revokedMs = existing.revokedAt ? Date.parse(existing.revokedAt) : Number.NaN;
+  const anchorMs = existing.revokedAt
+    ? Date.parse(existing.revokedAt)
+    : Date.parse(existing.expiresDate ?? (
+      existing.status === 'expired' || existing.status === 'billing_retry'
+        ? existing.updatedAt
+        : ''
+    ));
   const isNewerPurchase =
     incomingTxn.length > 0 &&
     incomingTxn !== existingTxn &&
     Number.isFinite(purchaseMs) &&
-    Number.isFinite(revokedMs) &&
-    purchaseMs > revokedMs;
+    Number.isFinite(anchorMs) &&
+    purchaseMs > anchorMs;
   return !isNewerPurchase;
 }
 
@@ -172,6 +191,15 @@ export interface UpsertAppleSubscriptionInput {
   autoRenewProductId?: string | null;
   revokedAt?: string | null;
   revocationReason?: number | null;
+  /**
+   * Client redeem paths only: enforce the resurrect guard inside the
+   * UPSERT's own WHERE so a REFUND/REVOKE (or lapse) webhook landing after
+   * the caller's read cannot be clobbered by this write. A guarded current
+   * row makes the UPDATE no-op and returns
+   * `{ ok: false, reason: 'guarded_status' }`. Webhook callers must NOT set
+   * this — DID_RENEW legitimately flips a guarded row back to active.
+   */
+  redeemGuard?: boolean;
   lastNotificationType?: string | null;
   lastNotificationSubtype?: string | null;
 }
@@ -200,6 +228,7 @@ export async function upsertAppleSubscription(
 ): Promise<
   | { ok: true; record: AppleSubscriptionRecord; isNew: boolean }
   | { ok: false; reason: 'owner_mismatch'; ownerId: string }
+  | { ok: false; reason: 'guarded_status' }
 > {
   const existing = await getAppleSubscription(env, input.originalTransactionId);
   if (existing && existing.userId != null && existing.userId !== input.userId) {
@@ -210,7 +239,30 @@ export async function upsertAppleSubscription(
   // subscription, not a renewal/refresh of one we already knew about.
   const isNew = !existing;
   const now = new Date().toISOString();
-  await run(
+  // SQL mirror of clientRedeemWouldResurrectRevoked, so the guard and the
+  // write are one statement (the SELECT+check above is not atomic with this
+  // write — a webhook can land in between). In the upsert grammar
+  // `apple_subscriptions.<col>` is the existing row, `excluded.<col>` the
+  // incoming one. A guarded row yields zero changed rows below.
+  const redeemGuardWhere = input.redeemGuard
+    ? `
+     WHERE NOT (
+       apple_subscriptions.status IN ('revoked', 'expired', 'billing_retry')
+       AND (
+         excluded.latest_transaction_id IS NULL
+         OR excluded.latest_transaction_id = apple_subscriptions.latest_transaction_id
+         OR excluded.purchase_date IS NULL
+         OR NOT (
+           (apple_subscriptions.revoked_at IS NOT NULL AND excluded.purchase_date > apple_subscriptions.revoked_at)
+           OR (apple_subscriptions.revoked_at IS NULL AND apple_subscriptions.expires_date IS NOT NULL AND excluded.purchase_date > apple_subscriptions.expires_date)
+           OR (apple_subscriptions.revoked_at IS NULL AND apple_subscriptions.expires_date IS NULL
+               AND apple_subscriptions.status IN ('expired', 'billing_retry')
+               AND excluded.purchase_date > apple_subscriptions.updated_at)
+         )
+       )
+     )`
+    : '';
+  const writeResult = await run(
     env.DB,
     `INSERT INTO apple_subscriptions (
        original_transaction_id, user_id, product_id, plan, status, environment,
@@ -240,7 +292,7 @@ export async function upsertAppleSubscription(
        revocation_reason = excluded.revocation_reason,
        last_notification_type = COALESCE(excluded.last_notification_type, apple_subscriptions.last_notification_type),
        last_notification_subtype = COALESCE(excluded.last_notification_subtype, apple_subscriptions.last_notification_subtype),
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at${redeemGuardWhere}`,
     [
       input.originalTransactionId,
       input.userId,
@@ -261,6 +313,9 @@ export async function upsertAppleSubscription(
       now,
     ],
   );
+  if (input.redeemGuard && (writeResult?.meta?.changes ?? 0) === 0) {
+    return { ok: false, reason: 'guarded_status' };
+  }
   const record = await getAppleSubscription(env, input.originalTransactionId);
   if (!record) throw new Error('apple subscription upsert failed');
   // Re-check ownership AFTER the write before reporting newness.

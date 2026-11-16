@@ -23,6 +23,10 @@
 
 import type { Env } from '../shared/types.ts';
 import { get } from '../shared/db.ts';
+import {
+  genuineFailureReasonGuardSql,
+  genuineFailureReasonMatchSql,
+} from '../ingestion/terminalFailureReview.ts';
 
 export type ReviewQueueBucket = 'eligible' | 'suppressed' | 'terminal';
 
@@ -37,17 +41,22 @@ export interface ReviewQueueHealthCounts {
 export const DEFAULT_AGREEMENT_ATTEMPT_CAP = 3;
 
 const TERMINAL_REASON_RE =
-  /^(rejected:)|local_vision_exhausted|extraction_row_limit|ocr_unusable|scanned_pdf_vision_spend|form_chrome_only/i;
+  /^(rejected:)|local_vision_exhausted|extraction_row_limit|ocr_unusable|scanned_pdf_vision_spend|form_chrome_only|ingest_failure:|pipeline_failure:|empty_fetch_handoff/i;
 
 /** SQL fragment: row is NOT a parked/rejected terminal class. */
-export const TERMINAL_REVIEW_REASON_EXCLUDE_SQL = `
-  COALESCE(rq.reason, '') NOT LIKE 'rejected:%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%local_vision_exhausted%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%extraction_row_limit%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%ocr_unusable%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%scanned_pdf_vision_spend%'
-  AND COALESCE(rq.reason, '') NOT LIKE '%form_chrome_only%'
+const terminalReviewReasonExcludeSql = (column: string) => `
+  COALESCE(${column}, '') NOT LIKE 'rejected:%'
+  AND COALESCE(${column}, '') NOT LIKE '%local_vision_exhausted%'
+  AND COALESCE(${column}, '') NOT LIKE '%extraction_row_limit%'
+  AND COALESCE(${column}, '') NOT LIKE '%ocr_unusable%'
+  AND COALESCE(${column}, '') NOT LIKE '%scanned_pdf_vision_spend%'
+  AND COALESCE(${column}, '') NOT LIKE '%form_chrome_only%'
+  AND ${genuineFailureReasonGuardSql(column)}
 `.trim();
+
+export const TERMINAL_REVIEW_REASON_EXCLUDE_SQL = terminalReviewReasonExcludeSql('rq.reason');
+/** Same terminal list for statements against a bare review_queue (no alias). */
+export const TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED = terminalReviewReasonExcludeSql('reason');
 
 /** Attempt-capped cascade disagreement — health-terminal, not selector-due. */
 export const ATTEMPT_CAPPED_CASCADE_SQL = `
@@ -110,6 +119,7 @@ export async function countReviewQueueBuckets(
               OR COALESCE(rq.reason, '') LIKE '%ocr_unusable%'
               OR COALESCE(rq.reason, '') LIKE '%scanned_pdf_vision_spend%'
               OR COALESCE(rq.reason, '') LIKE '%form_chrome_only%'
+              OR ${genuineFailureReasonMatchSql('rq.reason')}
               OR (${ATTEMPT_CAPPED_CASCADE_SQL})
             THEN 1 ELSE 0 END) AS terminal
          FROM review_queue rq

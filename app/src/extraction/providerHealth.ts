@@ -57,6 +57,7 @@ import {
   isProvenOpenRouterCredentialRejection,
   providerErrorClassForOpenRouterReply,
 } from './openRouterReply.ts';
+import { isTransientInfrastructureError } from '../shared/transientInfra.ts';
 
 export type ProviderErrorClass =
   | 'billing'
@@ -153,6 +154,9 @@ export function classifyProviderErrorClass(
 ): ProviderErrorClass | null {
   const message = (error ?? '').trim().toLowerCase();
   if (!message) return null;
+  // SQLITE_BUSY and cron-deadline aborts are not a provider timeout.  Classing
+  // them as timeout latches autopilot after two ticks (KILL_SWITCH_CLASSES).
+  if (isTransientInfrastructureError(message)) return 'other';
   // Stale/open circuit is not itself a quota class — classify the wrapped last
   // error.  A wrapper with no last: detail is a leftover cool-down, not quota.
   if (message.includes(OPENROUTER_CIRCUIT_MARKER)) {
@@ -286,6 +290,15 @@ export function isTransientFilesPrepaidError(error: string | null | undefined): 
   if (message.includes('openrouter_key_limit')) return true;
   if (message.includes('files-endpoint prepaid')) return true;
   return false;
+}
+
+export function isTransientInfrastructureHalt(
+  haltReason: string | null | undefined,
+  sampleErrors: string | Record<string, string> | null | undefined = null,
+): boolean {
+  const samples = sampleErrorValues(sampleErrors);
+  if (samples.length > 0) return samples.every((sample) => isTransientInfrastructureError(sample));
+  return isTransientInfrastructureError(haltReason);
 }
 
 export function isTransientFilesPrepaidHalt(

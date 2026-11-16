@@ -474,17 +474,32 @@ class GitHubClient:
         wasteful, but it only happens after a failure and page numbering is
         per_page-relative -- so the size cannot be changed mid-listing without
         silently skipping or duplicating rows.
+
+        All transport-layer exceptions are caught here (not just IncompleteRead)
+        because a large page on a slow link can also manifest as a TimeoutError
+        (60s socket timeout) or a JSONDecodeError (body cut short in a way that
+        Python's http.client doesn't detect as IncompleteRead). The inner
+        http_request retry loop already handles these with backoff; when it
+        exhausts its attempts it re-raises, and we catch them here to apply the
+        same adaptive page-size reduction rather than letting them crash the run.
         """
         per_page = PAGE_SIZE_DEFAULT
         while True:
             try:
                 return self._collect_pages(path, params, per_page)
-            except http.client.IncompleteRead as e:
+            except (
+                http.client.IncompleteRead,
+                http.client.HTTPException,
+                urllib.error.URLError,
+                ConnectionError,
+                TimeoutError,
+                json.JSONDecodeError,
+            ) as e:
                 if per_page <= PAGE_SIZE_MIN:
                     raise
                 per_page = max(PAGE_SIZE_MIN, per_page // 2)
                 print(
-                    f"truncated response on {path} ({e}) -- retrying the whole "
+                    f"transport error on {path} ({type(e).__name__}: {e}) -- retrying the whole "
                     f"listing at per_page={per_page}",
                     file=sys.stderr,
                 )

@@ -30,7 +30,7 @@
 
 import type { Env } from '../shared/types.ts';
 import { get, run } from '../shared/db.ts';
-import { PDFDocument } from 'pdf-lib';
+// CT-2459: pdf-lib dynamic-imported at first use (startup graph trim).
 import { resolveSecrets } from '../secrets/infisical.ts';
 import { keyFor } from './bakeoff.ts';
 import { looksLikePdf } from '../ingestion/classifier.ts';
@@ -98,6 +98,7 @@ export async function computeDocClassSignals(
   let pageCount: number | null = null;
   if (claimsPdf) {
     try {
+      const { PDFDocument } = await import('pdf-lib');
       const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
       pageCount = pdf.getPageCount();
       pdfLoadable = true;

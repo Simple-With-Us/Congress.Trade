@@ -22,6 +22,30 @@ export interface StaticAsset {
 /** Directory containing committed binary assets (relative to this module). */
 const PUBLIC_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../public');
 
+/**
+ * CT-2418: content fingerprint for a generated text asset, used as the `?v=`
+ * cache-busting query on its URL.
+ *
+ * The dashboard CSS and JS are served `immutable` for a year, which is the whole
+ * point (a repeat visit costs nothing) but means a deploy must change something
+ * the client can see. Folding a fingerprint of the bytes into the query string
+ * gives a deploy a fresh immutable URL, so it invalidates exactly the files that
+ * changed instead of stranding returning visitors on last month's CSS.
+ *
+ * FNV-1a 32-bit, not a cryptographic hash: this only has to change when the
+ * content changes, and it has to be synchronous (module-load time, and the
+ * worker has no sync crypto).
+ */
+export function assetVersion(content: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < content.length; i++) {
+    hash ^= content.charCodeAt(i);
+    // 16777619 (FNV prime), kept in 32-bit range without BigInt.
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
 function loadAsset(relativePath: string, contentType: string): StaticAsset {
   const abs = join(PUBLIC_DIR, relativePath);
   const buf = readFileSync(abs);
@@ -49,6 +73,12 @@ export const EAGLE_SPLASH_PNG = loadAsset('assets/eagle-splash.png', 'image/png'
 export const BRAND_LOGO_PNG = loadAsset('assets/brand-logo.png', 'image/png');
 export const BRAND_LOGO_DARK_PNG = loadAsset('assets/brand-logo-dark.png', 'image/png');
 export const BRAND_LOGO_LIGHT_PNG = loadAsset('assets/brand-logo-light.png', 'image/png');
+// CT-2459: header serves 920w lossless WebP (161 KB PNG -> ~43 KB). The PNG
+// routes stay for any external/hotlinked references.
+export const BRAND_LOGO_DARK_WEBP = loadAsset('assets/brand-logo-dark.webp', 'image/webp');
+export const BRAND_LOGO_LIGHT_WEBP = loadAsset('assets/brand-logo-light.webp', 'image/webp');
+export const SWU_LOGO_WEBP = loadAsset('swu-logo-wide.webp', 'image/webp');
+export const SIMPLE_WITH_US_WEBP = loadAsset('assets/simple-with-us.webp', 'image/webp');
 
 // Well-known root icons / social cards (long cache, stable paths).
 // Context-specific OG cards share the site heading lockup (CONGRESS + eagle + TRADE)
@@ -67,7 +97,7 @@ export const APPLE_TOUCH_ICON_PNG = loadAsset('apple-touch-icon.png', 'image/png
 export const FAVICON_PNG = loadAsset('favicon.png', 'image/png');
 
 /** Cache-bust query for og:image URLs. Bump when regenerating social cards. */
-export const OG_IMAGE_VERSION = '23';
+export const OG_IMAGE_VERSION = '24';
 
 /** Absolute path to the public asset root (for tests / tooling). */
 export const PUBLIC_ASSETS_DIR = PUBLIC_DIR;

@@ -39,6 +39,15 @@ describe('executiveTitleFor', () => {
     expect(executiveTitleFor('MANUAL-KHANNA')).toBeNull();
   });
 
+  it('gives a competitor-minted MANUAL-* official filed under chamber=executive the truthful fallback, never a guessed title (85f2170a)', () => {
+    expect(executiveTitleFor('MANUAL-HEGSETH', 'executive')).toBe(DEFAULT_EXECUTIVE_TITLE);
+    // A House member stays title-less even when a chamber is passed.
+    expect(executiveTitleFor('MANUAL-JORDAN', 'house')).toBeNull();
+    expect(executiveTitleFor('MANUAL-JORDAN', 'senate')).toBeNull();
+    // A curated EXEC-* id keeps its curated title regardless of the chamber argument.
+    expect(executiveTitleFor('EXEC-CWRIGHT', 'executive')).toBe('Energy Secretary');
+  });
+
   it('returns null for missing/empty input', () => {
     expect(executiveTitleFor(null)).toBeNull();
     expect(executiveTitleFor(undefined)).toBeNull();

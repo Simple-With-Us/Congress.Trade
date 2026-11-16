@@ -164,12 +164,12 @@ describe('custom App Store banner (reuses the same IOS_APP_STORE_ID switch)', ()
     expect(markup).toMatch(/<button[^>]*aria-label="Dismiss App Store banner"/);
   });
 
-  it('nothing is hardcoded to the real App Store id 6798076688', () => {
+  it('banner gates do not default to the released App Store id', () => {
     expect(appStoreBannerTag({} as never)).toBeNull();
     expect(appStoreBannerHeadExtras({} as never)).toBeNull();
     expect(appStoreBannerMarkup({} as never)).toBeNull();
-    // The literal id must never appear in the module's own source — it is
-    // read from env.IOS_APP_STORE_ID at request time, never a default.
+    // Banner visibility and destination still use the request's configured id;
+    // the released install fallback does not turn banners on by default.
     const markup = appStoreBannerMarkup({ IOS_APP_STORE_ID: '1111111111' } as never)!;
     expect(markup).not.toContain('6798076688');
   });

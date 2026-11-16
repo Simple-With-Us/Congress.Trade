@@ -13,7 +13,7 @@ It is disjoint from the in-flight safety-fix claim on `cursor/prod-incident-audi
 
 ## 1. Method and constraints
 
-**Method.**  Static review of `main` at `be53b3e5` plus current `app/` source, migrations, ship scripts, GitHub workflows, and rollout notes.  Local `npm audit` in `app/` (307 dependencies).  Slack `#agent-sync` claim before work.  Overlap check against open PRs #1964, #1965, #1966, #1967, #1959.
+**Method.**  Static review of `main` at `be53b3e5` plus current `app/` source, migrations, ship scripts, GitHub workflows, and rollout notes.  Local `npm audit` in `app/` (307 dependencies).  Slack `#ag***-s**c` claim before work.  Overlap check against open PRs #1964, #1965, #1966, #1967, #1959.
 
 **Constraints.**
 
@@ -756,7 +756,7 @@ Keep each slice on its own `cursor/<topic>` branch.  Do not steal `cursor/prod-i
 | Check | Result |
 |-------|--------|
 | `git status` / worktrees / open PRs | Clean `main` worktree; no overlapping docs/audits PR |
-| Slack `#agent-sync` claim | Posted 2026-08-17 |
+| Slack `#ag***-s**c` claim | Posted 2026-08-17 |
 | Live admin POST / debug-sql / migrate | **Not run** |
 | Host SSH / Coolify / Infisical write | **Not run** |
 | Secret values printed | **None** |

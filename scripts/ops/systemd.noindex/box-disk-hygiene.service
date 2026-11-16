@@ -1,5 +1,5 @@
 [Unit]
-Description=Coolify box disk hygiene (check free space + safe Docker prune)
+Description=Coolify host health and disk hygiene (RAM, swap, inodes, load, disk, safe Docker prune)
 After=docker.service
 Wants=docker.service
 
@@ -10,8 +10,8 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 SyslogIdentifier=box-disk-hygiene
-# Optional overrides:
-# EnvironmentFile=-/etc/box-disk-hygiene.env
+# The script sources /etc/box-disk-hygiene.env and then
+# /etc/congress-health-recover.env. Do not add a second timer.
 
 [Install]
 WantedBy=multi-user.target

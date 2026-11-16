@@ -23,6 +23,7 @@
  *   deliberately out of scope here.
  */
 import type { Env } from './types.ts';
+import { clientIpFromOrigin, type OriginLockEnv } from '../security/originLock.ts';
 
 export interface RateLimitResult {
   ok: boolean;
@@ -218,22 +219,12 @@ export async function rateLimit(
 /**
  * Best-effort client IP for rate-limit keys.
  *
- * `cf-connecting-ip` is set by Cloudflare itself on every proxied request and
- * cannot be spoofed through the edge, so it always wins. The fallbacks only
- * matter off-Cloudflare (local dev / direct origin hits): `x-real-ip` is set
- * by a fronting reverse proxy, and for `x-forwarded-for` we take the LAST
- * entry — the one appended by the nearest proxy — instead of the first, which
- * is freely attacker-supplied (a client sending its own XFF header could
- * previously choose its own rate-limit identity and rotate it per request).
+ * CF-Connecting-IP and X-Forwarded-For are trusted only once the socket peer
+ * (or a trusted proxy's asserted peer) is Cloudflare, or the origin secret /
+ * Authenticated Origin Pulls check says the edge injected the request.
+ * A direct caller can no longer pick a rate-limit identity by sending those
+ * headers. See src/security/originLock.ts.
  */
-export function clientIp(req: Request): string {
-  const cfIp = req.headers.get('cf-connecting-ip');
-  if (cfIp) return cfIp;
-  const realIp = req.headers.get('x-real-ip');
-  if (realIp) return realIp;
-  const forwarded = (req.headers.get('x-forwarded-for') || '')
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean);
-  return forwarded.length ? forwarded[forwarded.length - 1] : 'unknown';
+export function clientIp(req: Request, env?: OriginLockEnv): string {
+  return clientIpFromOrigin(req, env);
 }

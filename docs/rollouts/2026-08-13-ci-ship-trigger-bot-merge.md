@@ -97,7 +97,7 @@ a hand-merge. That also removes the two copies' divergence for these two files.
 `ensure-tf-ready` now takes `<bundleId> <buildVersion> [marketingVersion]`, polls
 `filter[version]=` until the build this run uploaded actually appears, and only
 then declares compliance on **that** id. It also renders the mandatory
-`AGENT-SYNC.md` "What to Test" note — **opt-in**, defaulting to a dry render into
+`AG***-S**C.md` "What to Test" note — **opt-in**, defaulting to a dry render into
 the ship log (`IOS_TF_RELEASE_NOTES=1` publishes; owner's call, not an agent's).
 
 `bash scripts/ios-fleet/test-ship-seq.sh` still passes **43/43** after the port,

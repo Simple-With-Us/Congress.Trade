@@ -144,12 +144,12 @@ STATE_FILE = os.path.expanduser(
     os.getenv("STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "attempt-state.json"))
 )
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.5")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.6")
 # Cheap VL first. Qwen slugs read raster pages, not PDF `file` (see prefersPageImages).
 DEFAULT_CASCADE_MODELS = (
     "qwen/qwen3-vl-8b-instruct,"
     "qwen/qwen3-vl-30b-a3b-instruct,"
-    "google/gemini-3.7-flash"
+    "google/gemini-3.8-flash"
 )
 OPENROUTER_CASCADE_MODELS = os.getenv("OPENROUTER_CASCADE_MODELS", DEFAULT_CASCADE_MODELS)
 OPENROUTER_CASCADE_MAX_PAGES = max(1, int(os.getenv("OPENROUTER_CASCADE_MAX_PAGES", "8")))

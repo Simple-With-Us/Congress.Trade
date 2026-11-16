@@ -11,7 +11,7 @@
 - **Website:** transparent lockup/mark only (no cream fill) — the UI supplies the background.
 - **Light lockup:** solid black letters on transparent (good on light/cream UI).
 - **Dark lockup:** same art with **white** letters; eagle colors preserved.
-- **iOS AppIcon only:** opaque light-gray full-bleed plate (`eagle-app-icon-light-1024.png` / `source-owner-app-icon-1024x1024.jpg`). Hi-res master: `eagle-app-icon-light-1408.png` / `source-owner-app-icon-1408x1408.jpg`. iOS rejects transparent AppIcon.
+- **iOS AppIcon only:** opaque **white/off-white full-bleed plate** + eagle mark (`eagle-app-icon-light-1024.png`). Hi-res: `eagle-app-icon-light-1408.png`. iOS rejects transparent AppIcon and applies its own squircle — do **not** ship pre-rounded mockups with outer canvas (kept only as `source-owner-app-icon-mockup-rounded-1408x1408.jpg` for reference).
 - **Everywhere else that allows alpha** (web/PWA icons, favicon, apple-touch-icon, splash, in-app BrandLogo): transparent eagle mark — no plate fill.
 - **Social OG cards:** horizontal site-heading lockup (CONGRESS · eagle · TRADE), light plate; context subtitles for Trends / Company / Politician deep links.
 
@@ -25,11 +25,13 @@
 | `eagle-lockup-dark-ui.png` | Website dark type (white text), transparent |
 | `eagle-header-lockup-{light,dark}-*.png` | High-DPI header embeds |
 | `eagle-moneybag-icon-square.png` | Transparent eagle mark (splash / BrandLogo) |
-| `source-owner-app-icon-1024x1024.jpg` | Owner App Store / AppIcon plate (1024×1024) |
-| `source-owner-app-icon-1408x1408.jpg` | Owner app-icon master at 1408×1408 |
-| `eagle-app-icon-light-1024.png` | iOS AppIcon + derived PWA icons |
-| `eagle-app-icon-light-1408.png` | Hi-res app-icon master |
-| `eagle-app-icon-light-{180,192,512}.png` | Derived install / PWA sizes |
+| `source-owner-app-icon-1024x1024.jpg` | Legacy reference only; not the installed AppIcon source |
+| `source-owner-app-icon-1408x1408.jpg` | Legacy reference only; not the installed AppIcon source |
+| `source-owner-app-icon-mockup-rounded-1408x1408.jpg` | Pre-rounded presentation mockup; reference only, never install as AppIcon |
+| `eagle-app-icon-light-1024.png` | Opaque full-bleed iOS AppIcon source |
+| `eagle-app-icon-light-1408.png` | Hi-res opaque full-bleed iOS AppIcon source |
+| `eagle-app-icon-light-{180,192,512}.png` | Plate-filled reference exports; not the transparent web/PWA icons |
+| `eagle-app-icon-1024.png` | Archived navy mockup — **do not use** |
 | `eagle-mark-transparent-*.png` | Transparent mark sizes |
 | `og-image-light-1200x630.png` | Default social card master |
 | `og-image-{trends,company,politician}-1200x630.png` | Context social card masters |
@@ -48,7 +50,7 @@ Older experiments, navy mockups, circle badges, and superseded sizes live in **`
 - Web `app/public/og-image-{trends,company,politician}.png` ← context cards (`?v=22`)
 - iOS `BrandLockup` ← light (black letters) + dark (white letters)
 - iOS `BrandLogo` ← transparent eagle mark (in-app; alpha OK)
-- iOS `AppIcon` ← **opaque** owner 1024×1024 plate (light bg + soft shadow); web icons stay transparent
+- iOS `AppIcon` ← **opaque** `eagle-app-icon-light-1024.png` full-bleed plate only (not the JPG references or rounded mockup); web icons stay transparent
 
 ## Regenerating OG cards
 

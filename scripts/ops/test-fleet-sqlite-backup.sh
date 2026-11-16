@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline tests for fleet-sqlite-backup.sh retention + completeness.
+# Offline tests for fleet-sqlite-backup.sh retention, local zstd, and verify.
 # No Docker, no live DBs, no network.
 #
 #   bash scripts/ops/test-fleet-sqlite-backup.sh
@@ -53,7 +53,9 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/fleet-backup-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
+export FLEET_BACKUP_APPS=socratic,congress
 FLEET_BACKUP_LIB_ONLY=1 . "$SCRIPT"
+backup_apps_selected
 
 # --- dump_is_complete -------------------------------------------------------
 APP="$TMP/socratic"
@@ -148,6 +150,562 @@ age_file "$old_kv" 10
 KEEP_DAYS=7
 prune_by_age
 assert_missing "$old_kv" "KEEP_DAYS deletes aged kv.sqlite copies"
+
+# --- B2 prune: daily + weekly + hard 14-day age cap (Jay 2026-10-30) -------
+# rclone stub backed by a local dir standing in for b2:<bucket>/hetzner/.
+B2_FAKE="$TMP/b2-hetzner"
+rclone() {
+  case "$1" in
+    lsf) ls -1 "$B2_FAKE" 2>/dev/null ;;
+    delete)
+      local inc=""
+      while [ $# -gt 0 ]; do
+        if [ "$1" = "--include" ]; then inc="${2#/}"; shift; fi
+        shift
+      done
+      [ -n "$inc" ] && rm -f "$B2_FAKE/$inc"
+      ;;
+    *) return 0 ;;
+  esac
+}
+# Seed one dump set (db + sha256) per stamp.
+b2_seed() {
+  rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+  local st
+  for st in "$@"; do
+    : > "$B2_FAKE/usage-monitor-${st}.db"
+    : > "$B2_FAKE/usage-monitor-${st}.db.sha256"
+  done
+  # Litestream / qdrant style names must be ignored.
+  : > "$B2_FAKE/generation.snapshot"
+}
+b2_has() { [ -e "$B2_FAKE/usage-monitor-$1.db" ] && echo yes || echo no; }
+b2_stamps_for_days() {
+  # Daily 06:45Z stamps for the N days ending on $1 (YYYY-MM-DD), newest first.
+  local end="$1" n="$2" i
+  for i in $(seq 0 $((n - 1))); do
+    date -u -d "$end - $i days" +%Y%m%dT064500Z
+  done
+}
+
+B2_KEEP_SETS=""
+B2_KEEP_DAILY=3
+B2_KEEP_WEEKLY=2
+B2_MAX_AGE_DAYS=14
+
+# Monday 2026-11-16: Sundays are 11-15 (1d), 11-08 (8d), 11-01 (15d).
+# Pre-cap behaviour kept 11-08 + 11-01 as weeklies (11-15 is a daily) -> 15d.
+# shellcheck disable=SC2046
+b2_seed $(b2_stamps_for_days 2026-11-16 20)
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261116T064500Z >/dev/null
+assert_eq "$(b2_has 20261116T064500Z)" yes "B2 Monday keeps today (daily)"
+assert_eq "$(b2_has 20261115T064500Z)" yes "B2 Monday keeps Sunday 1d (daily)"
+assert_eq "$(b2_has 20261114T064500Z)" yes "B2 Monday keeps Saturday 2d (daily)"
+assert_eq "$(b2_has 20261108T064500Z)" yes "B2 Monday keeps Sunday 8d (weekly)"
+assert_eq "$(b2_has 20261101T064500Z)" no "B2 Monday age-caps Sunday 15d"
+assert_eq "$(ls -1 "$B2_FAKE" | grep -c '\.db$')" 4 "B2 Monday leaves 4 sets"
+assert_exists "$B2_FAKE/generation.snapshot" "B2 prune never touches snapshot files"
+
+# Sunday 2026-11-15: weeklies land at 7d (11-08) and exactly 14d (11-01).
+# shellcheck disable=SC2046
+b2_seed $(b2_stamps_for_days 2026-11-15 20)
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261115T064500Z >/dev/null
+assert_eq "$(b2_has 20261108T064500Z)" yes "B2 Sunday keeps 7d weekly"
+assert_eq "$(b2_has 20261101T064500Z)" yes "B2 Sunday keeps 14d weekly (cap is > 14d)"
+assert_eq "$(b2_has 20261025T064500Z)" no "B2 Sunday drops 21d Sunday"
+assert_eq "$(ls -1 "$B2_FAKE" | grep -c '\.db$')" 5 "B2 Sunday leaves 3 daily + 2 weekly"
+
+# Every day for 6 weeks of daily runs: nothing on B2 is ever > 14 days old,
+# and there are always 3 sets from the last 3 days.
+rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+cap_ok=yes; daily_ok=yes
+for i in $(seq 0 41); do
+  day="$(date -u -d "2026-11-01 + $i days" +%Y-%m-%d)"
+  st="$(date -u -d "$day" +%Y%m%dT064500Z)"
+  : > "$B2_FAKE/usage-monitor-${st}.db"; : > "$B2_FAKE/usage-monitor-${st}.db.sha256"
+  prune_b2_sets usage-monitor jays-usage-monitor-eu "$st" >/dev/null
+  now_e="$(b2_stamp_epoch "$st")"
+  for f in "$B2_FAKE"/*.db; do
+    s2="$(basename "$f" .db)"; s2="${s2#usage-monitor-}"
+    if [ $((now_e - $(b2_stamp_epoch "$s2"))) -gt $((14 * 86400)) ]; then cap_ok=no; fi
+  done
+  if [ "$i" -ge 2 ]; then
+    for d in 0 1 2; do
+      [ "$(b2_has "$(date -u -d "$day - $d days" +%Y%m%dT064500Z)")" = yes ] || daily_ok=no
+    done
+  fi
+done
+assert_eq "$cap_ok" yes "B2 6-week simulation never keeps a set older than 14d"
+assert_eq "$daily_ok" yes "B2 6-week simulation always has the last 3 days"
+
+# Twice-daily lane (ST/CT): dailies are one set per UTC date (3 days, not 1.5),
+# and the two weeklies are two different Sundays.
+rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+for st in 20261115T113000Z 20261115T003000Z 20261114T113000Z 20261114T003000Z \
+          20261113T113000Z 20261113T003000Z 20261108T113000Z 20261108T003000Z \
+          20261101T113000Z 20261101T003000Z; do
+  : > "$B2_FAKE/usage-monitor-${st}.db"
+done
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261115T113000Z >/dev/null
+assert_eq "$(b2_has 20261115T113000Z)" yes "B2 2x/day daily keeps newest of day 0"
+assert_eq "$(b2_has 20261114T113000Z)" yes "B2 2x/day daily keeps newest of day 1"
+assert_eq "$(b2_has 20261113T113000Z)" yes "B2 2x/day daily keeps newest of day 2"
+assert_eq "$(b2_has 20261115T003000Z)" no "B2 2x/day drops older same-day set"
+assert_eq "$(b2_has 20261114T003000Z)" no "B2 2x/day drops older set of day 1"
+assert_eq "$(b2_has 20261108T113000Z)" yes "B2 weekly picks newest stamp of previous Sunday"
+assert_eq "$(b2_has 20261108T003000Z)" no "B2 weekly keeps one set per Sunday"
+assert_eq "$(b2_has 20261101T113000Z)" yes "B2 second weekly is the Sunday 14d back"
+assert_eq "$(b2_has 20261101T003000Z)" no "B2 drops Sunday set older than 14d"
+
+# Legacy B2_KEEP_SETS mode is capped too.
+b2_seed 20261130T064500Z 20261101T064500Z
+B2_KEEP_SETS=2
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+assert_eq "$(b2_has 20261130T064500Z)" yes "B2_KEEP_SETS keeps current set"
+assert_eq "$(b2_has 20261101T064500Z)" no "B2_KEEP_SETS set older than 14d is age-capped"
+B2_KEEP_SETS=""
+
+# Bad B2_MAX_AGE_DAYS never disables the cap.
+for bad in abc 0; do
+  b2_seed 20261130T064500Z 20261115T064500Z
+  B2_MAX_AGE_DAYS="$bad"
+  prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+  assert_eq "$(b2_has 20261115T064500Z)" no "B2_MAX_AGE_DAYS=$bad falls back to 14"
+done
+B2_MAX_AGE_DAYS=14
+
+# Leading-zero B2_MAX_AGE_DAYS is decimal, not octal (Kody #2900).
+b2_seed 20261130T064500Z 20261115T064500Z
+B2_MAX_AGE_DAYS=08
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+assert_eq "$(b2_has 20261115T064500Z)" no "B2_MAX_AGE_DAYS=08 caps at 8 days"
+B2_MAX_AGE_DAYS=14
+
+# --- Central-time gate (Jay 2026-10-30 schedule) -------------------------
+FLEET_BACKUP_CT_HOURS="06,19"
+fleet_backup_ct_gate 06 && r=run || r=skip; assert_eq "$r" run "CT gate runs at 06 CT"
+fleet_backup_ct_gate 19 && r=run || r=skip; assert_eq "$r" run "CT gate runs at 19 CT"
+fleet_backup_ct_gate 05 && r=run || r=skip; assert_eq "$r" skip "CT gate skips off-slot 05 CT"
+fleet_backup_ct_gate 20 && r=run || r=skip; assert_eq "$r" skip "CT gate skips off-slot 20 CT"
+FLEET_BACKUP_CT_HOURS=""
+fleet_backup_ct_gate 05 && r=run || r=skip; assert_eq "$r" run "CT gate unset always runs"
+
+# Host runs on America/Chicago: each lane is one Central-time cron line.
+CRON_FILE="${ROOT_DIR}/scripts/ops/fleet-backups.cron"
+cron_ct_runs() {
+  # $1 = lock name.  Prints Central HH:MM runs from the line's minute/hour fields.
+  local line min hours h
+  line="$(grep "fleet-sqlite-backup-$1.lock" "$CRON_FILE")"
+  min="$(echo "$line" | awk '{print $1}')"
+  hours="$(echo "$line" | awk '{print $2}')"
+  for h in ${hours//,/ }; do printf '%02d:%02d\n' "$((10#$h))" "$((10#$min))"; done | sort | tr '\n' ' '
+}
+assert_eq "$(cron_ct_runs st)" "06:30 19:30 " "cron ST runs 6:30am+7:30pm CT"
+assert_eq "$(cron_ct_runs ct)" "06:00 20:00 " "cron CT runs 6:00am+8:00pm CT"
+assert_eq "$(cron_ct_runs um)" "20:30 " "cron UM runs 8:30pm CT"
+assert_eq "$(grep -c 'FLEET_BACKUP_CT_HOURS=' "$CRON_FILE")" 0 "cron lines carry no UTC-era CT gate"
+grep -q 'FLEET_BACKUP_APPS=socratic .*FLEET_BACKUP_KEEP_COUNT=4' "$CRON_FILE" && r=yes || r=no
+assert_eq "$r" yes "cron ST local keep 4"
+grep -q 'FLEET_BACKUP_APPS=congress .*FLEET_BACKUP_KEEP_COUNT=4' "$CRON_FILE" && r=yes || r=no
+assert_eq "$r" yes "cron CT local keep 4"
+grep -q 'FLEET_BACKUP_APPS=usage-monitor .*FLEET_BACKUP_KEEP_DAYS=2 FLEET_BACKUP_KEEP_COUNT=2' "$CRON_FILE" && r=yes || r=no
+assert_eq "$r" yes "cron UM local keep 2 / 2 days"
+assert_eq "$(grep -c 'B2_KEEP_DAILY=3 B2_KEEP_WEEKLY=2 B2_MAX_AGE_DAYS=14' "$CRON_FILE")" 3 "cron all lanes B2 3+2 with 14d cap"
+
+# --- Log labels: UTC stamp + Central time with offset (Jay 2026-10-30) -----
+assert_eq "$(fleet_ct_label 20261030T113000Z)" "20261030T113000Z (6:30am CDT, -05:00)" "log label CDT"
+assert_eq "$(fleet_ct_label 20261102T123000Z)" "20261102T123000Z (6:30am CST, -06:00)" "log label CST after DST"
+assert_eq "$(fleet_ct_label 20261101T063000Z)" "20261101T063000Z (1:30am CDT, -05:00)" "log label first 1:30am on fall-back night"
+assert_eq "$(fleet_ct_label 20261101T073000Z)" "20261101T073000Z (1:30am CST, -06:00)" "log label second 1:30am on fall-back night"
+assert_eq "$(fleet_ct_label not-a-stamp)" "not-a-stamp" "log label falls back to raw stamp"
+now_label="$(fleet_ct_label)"
+case "$now_label" in
+  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\ \(*\ C[DS]T,\ -0[56]:00\)) r=ok ;;
+  *) r="$now_label" ;;
+esac
+assert_eq "$r" ok "log label default is now"
+grep -q 'start \$(fleet_ct_label "\$STAMP")' "$SCRIPT" && r=yes || r=no
+assert_eq "$r" yes "start line carries Central label"
+grep -q 'done \$(fleet_ct_label "\$STAMP")' "$SCRIPT" && r=yes || r=no
+assert_eq "$r" yes "done line carries Central label"
+grep -q 'STAMP="\$(date -u +%Y%m%dT%H%M%SZ)"' "$SCRIPT" && r=yes || r=no
+assert_eq "$r" yes "file/object stamp stays UTC Z"
+
+# The current set is never deleted even if its stamp parses oddly old.
+b2_seed 20261130T064500Z
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261130T064500Z >/dev/null
+assert_eq "$(b2_has 20261130T064500Z)" yes "B2 prune never deletes the current set"
+
+# --- B2 prune handles mixed plain .db and .db.zst sets (2026-10-30) --------
+rm -rf "$B2_FAKE"; mkdir -p "$B2_FAKE"
+for st in $(b2_stamps_for_days 2026-11-16 10); do
+  if [ "$st" \> 20261112T000000Z ]; then ext=db.zst; else ext=db; fi
+  : > "$B2_FAKE/usage-monitor-${st}.${ext}"; : > "$B2_FAKE/usage-monitor-${st}.db.sha256"
+done
+prune_b2_sets usage-monitor jays-usage-monitor-eu 20261116T064500Z >/dev/null
+assert_exists "$B2_FAKE/usage-monitor-20261116T064500Z.db.zst" "B2 prune keeps newest .zst daily"
+assert_exists "$B2_FAKE/usage-monitor-20261114T064500Z.db.zst" "B2 prune keeps 3rd .zst daily"
+assert_missing "$B2_FAKE/usage-monitor-20261113T064500Z.db.zst" "B2 prune drops 4th .zst set"
+assert_exists "$B2_FAKE/usage-monitor-20261108T064500Z.db" "B2 prune keeps plain .db weekly"
+assert_missing "$B2_FAKE/usage-monitor-20261110T064500Z.db" "B2 prune drops old plain .db set"
+assert_missing "$B2_FAKE/usage-monitor-20261110T064500Z.db.sha256" "B2 prune drops old sha256 sidecar"
+assert_eq "$(ls -1 "$B2_FAKE" | grep -cE '\.db(\.zst)?$')" 4 "B2 mixed prune leaves 3 daily + 1 weekly"
+unset -f rclone
+
+# --- stale .zst from an interrupted run is pruned locally ------------------
+mkdir -p "$ROOT/socratic"
+: > "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst"
+: > "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial"
+prune_incomplete_dumps >/dev/null
+assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst" "stale local .zst pruned"
+assert_missing "$ROOT/socratic/socratic-app-20261101T113000Z.db.zst.partial" "stale local .zst.partial pruned"
+# A finished local .db.zst (sha256 present, no journal) is the retained dump.
+kept_zst="$ROOT/socratic/socratic-app-20261102T113000Z.db.zst"
+printf 'kept-zst\n' > "$kept_zst"
+printf 'deadbeef  %s\n' "${kept_zst%.zst}" > "${kept_zst%.zst}.sha256"
+prune_incomplete_dumps >/dev/null
+assert_exists "$kept_zst" "complete local .db.zst survives prune"
+assert_exists "${kept_zst%.zst}.sha256" "complete local .db.zst keeps sha256"
+
+# --- zstd upload + restore round trip (needs sqlite3 + zstd) ----------------
+if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+  ZD="$TMP/zstd-app"; ZB="$TMP/zstd-b2"; mkdir -p "$ZD" "$ZB"
+  zst_stamp=20261130T113000Z
+  sqlite3 "$ZD/live.db" "PRAGMA journal_mode=WAL; CREATE TABLE t(x TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<20000) INSERT INTO t SELECT printf('row-%08d', i) FROM c;" >/dev/null
+  STAMP="$zst_stamp"
+  fleet_backup_alert() { :; }
+  backup_one "socratic-app" "$ZD/live.db" "$ZD/out" >/dev/null
+  : > "$ZD/out/socratic-app-20261129T113000Z.db"   # older raw dump: never uploaded
+  rclone() {
+    # copy <dir> <remote> --include A [--include B] ...: copy matching basenames.
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$ZB/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null
+  assert_exists "$ZB/socratic-app-${zst_stamp}.db.zst" "zstd upload sends .db.zst"
+  assert_exists "$ZB/socratic-app-${zst_stamp}.db.sha256" "zstd upload sends raw sha256"
+  assert_missing "$ZB/socratic-app-${zst_stamp}.db" "zstd upload does not send raw .db"
+  assert_missing "$ZB/socratic-app-20261129T113000Z.db" "zstd upload only sends this run's set"
+  assert_missing "$ZD/out/socratic-app-${zst_stamp}.db.zst" "local .zst removed after upload"
+  assert_exists "$ZD/out/socratic-app-${zst_stamp}.db" "local raw dump kept"
+  # Restore exactly like an operator would from B2.
+  RD="$TMP/zstd-restore"; mkdir -p "$RD"
+  zstd -q -d "$ZB/socratic-app-${zst_stamp}.db.zst" -o "$RD/socratic-app-${zst_stamp}.db"
+  assert_eq "$(sqlite3 "$RD/socratic-app-${zst_stamp}.db" 'PRAGMA integrity_check;')" ok "restored .zst passes integrity_check"
+  assert_eq "$(sqlite3 "$RD/socratic-app-${zst_stamp}.db" 'SELECT count(*) FROM t;')" 20000 "restored .zst has every row"
+  want_sha="$(awk '{print $1}' "$ZB/socratic-app-${zst_stamp}.db.sha256")"
+  got_sha="$(sha256sum "$RD/socratic-app-${zst_stamp}.db" | awk '{print $1}')"
+  assert_eq "$got_sha" "$want_sha" "restored .zst matches raw-db sha256"
+  # A failed upload keeps the verified .zst for a manual retry.
+  rclone() { return 1; }
+  upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null || true
+  assert_exists "$ZD/out/socratic-app-${zst_stamp}.db.zst" "failed upload keeps local .zst"
+  rm -f "$ZD/out"/*.zst
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$ZB/$n"; break; fi
+      done
+    done
+  }
+  # Disabled or failed compression falls back to the raw set.
+  rm -f "$ZB"/*
+  FLEET_BACKUP_B2_COMPRESS=0 upload_b2_set "$ZD/out" jays-socratic-trade-eu "$zst_stamp" >/dev/null
+  assert_exists "$ZB/socratic-app-${zst_stamp}.db" "compress off uploads raw .db"
+  assert_missing "$ZB/socratic-app-${zst_stamp}.db.zst" "compress off sends no .zst"
+  unset -f rclone
+else
+  echo "skip zstd round trip (sqlite3 or zstd not installed)"
+fi
+
+# --- local zstd dumps: keep count, age, symlink root, verify ----------------
+# Keep counts still apply to .db.zst.  Incomplete files do not take a slot.
+ZAPP="$TMP/zst-keep/socratic"
+mkdir -p "$ZAPP"
+make_kept_zst() {
+  local db="$1" payload="$2"
+  printf '%s\n' "$payload" > "${db}.zst"
+  printf 'side  %s\n' "$db" > "${db}.sha256"
+}
+make_kept_zst "$ZAPP/socratic-app-20261101T000000Z.db" oldest
+make_kept_zst "$ZAPP/socratic-app-20261102T000000Z.db" middle
+make_kept_zst "$ZAPP/socratic-app-20261103T000000Z.db" newest
+age_file "$ZAPP/socratic-app-20261101T000000Z.db.zst" 5
+age_file "$ZAPP/socratic-app-20261102T000000Z.db.zst" 4
+age_file "$ZAPP/socratic-app-20261103T000000Z.db.zst" 3
+journaled_zst="$ZAPP/socratic-app-20261104T000000Z.db"
+make_kept_zst "$journaled_zst" journaled
+printf 'j\n' > "${journaled_zst}-journal"
+nosh_zst="$ZAPP/socratic-app-20261105T000000Z.db"
+printf 'no-sha\n' > "$nosh_zst"
+saved_root="$ROOT"
+ROOT="$TMP/zst-keep"
+KEEP_COUNT=2
+KEEP_DAYS=30
+FLEET_BACKUP_LOCAL_COMPRESS=0
+apply_local_retention >/dev/null
+assert_missing "$nosh_zst" "incomplete plain dump removed and not a keep slot"
+assert_missing "${journaled_zst}.zst" "journaled .zst removed and not a keep slot"
+assert_missing "${journaled_zst}-journal" "journal removed with incomplete .zst"
+assert_missing "$ZAPP/socratic-app-20261101T000000Z.db.zst" "KEEP_COUNT=2 prunes oldest .zst"
+assert_missing "$ZAPP/socratic-app-20261101T000000Z.db.sha256" "KEEP_COUNT prunes sha256 with .zst"
+assert_exists "$ZAPP/socratic-app-20261102T000000Z.db.zst" "KEEP_COUNT=2 keeps newer .zst"
+assert_exists "$ZAPP/socratic-app-20261103T000000Z.db.zst" "KEEP_COUNT=2 keeps newest .zst"
+
+# Aged sha256 must not be treated as an orphan while the .zst payload remains.
+fresh_base="$ZAPP/socratic-app-20261106T000000Z.db"
+make_kept_zst "$fresh_base" fresh
+age_file "${fresh_base}.sha256" 10
+old_base="$ZAPP/socratic-app-20261107T000000Z.db"
+make_kept_zst "$old_base" old
+age_file "${old_base}.zst" 10
+age_file "${old_base}.sha256" 10
+KEEP_DAYS=7
+KEEP_COUNT=10
+apply_local_retention >/dev/null
+assert_exists "${fresh_base}.zst" "KEEP_DAYS keeps fresh .zst"
+assert_exists "${fresh_base}.sha256" "aged sha256 stays while .zst payload exists"
+assert_missing "${old_base}.zst" "KEEP_DAYS deletes .zst older than keep days"
+assert_missing "${old_base}.sha256" "KEEP_DAYS deletes sha256 with aged .zst"
+
+# Symlink chain: /data/backups style.  Resolve before measure and delete.
+phys="$TMP/phys-backups"
+mkdir -p "$phys/socratic" "$TMP/link-hop"
+ln -s "$phys" "$TMP/link-hop/target"
+ln -s "$TMP/link-hop/target" "$TMP/backup-link"
+printf 'measure-me\n' > "$phys/socratic/socratic-app-20261108T000000Z.db"
+printf 'side  x\n' > "$phys/socratic/socratic-app-20261108T000000Z.db.sha256"
+printf 'older\n' > "$phys/socratic/socratic-app-20261107T000000Z.db"
+printf 'side  y\n' > "$phys/socratic/socratic-app-20261107T000000Z.db.sha256"
+age_file "$phys/socratic/socratic-app-20261107T000000Z.db" 2
+age_file "$phys/socratic/socratic-app-20261107T000000Z.db.sha256" 2
+outside="$TMP/outside-live.db"
+printf 'do-not-delete\n' > "$outside"
+ln -s "$outside" "$phys/socratic/socratic-app-20261109T000000Z.db"
+printf 'side  z\n' > "$phys/socratic/socratic-app-20261109T000000Z.db.sha256"
+ROOT="$TMP/backup-link"
+assert_eq "$(resolve_fs_path "$ROOT")" "$(readlink -f "$phys")" "backup root resolves through the symlink chain"
+measure_got="$(measure_path_bytes "$ROOT/socratic/socratic-app-20261108T000000Z.db")"
+measure_want="$(wc -c < "$phys/socratic/socratic-app-20261108T000000Z.db" | tr -d ' ')"
+assert_eq "$measure_got" "$measure_want" "measure uses the resolved file size"
+KEEP_COUNT=1
+KEEP_DAYS=30
+apply_local_retention >/dev/null
+assert_exists "$phys/socratic/socratic-app-20261108T000000Z.db" "keep-count keeps the dump on the physical root"
+assert_missing "$phys/socratic/socratic-app-20261107T000000Z.db" "keep-count deletes the older dump on the physical root"
+assert_exists "$outside" "delete refuses a dump symlink whose target is outside the root"
+[ -L "$TMP/backup-link" ] && r=yes || r=no
+assert_eq "$r" yes "symlink chain itself is not removed"
+[ -L "$phys/socratic/socratic-app-20261109T000000Z.db" ] && r=yes || r=no
+assert_eq "$r" yes "outside dump symlink is left in place"
+rm_dump_set "$phys/socratic/socratic-app-20261109T000000Z.db"
+assert_exists "$outside" "rm_dump_set still refuses the outside target"
+
+# Compression itself never deletes an incomplete dump.
+inc_plain="$phys/socratic/socratic-app-20261110T000000Z.db"
+printf 'incomplete\n' > "$inc_plain"
+journ_plain="$phys/socratic/socratic-app-20261111T000000Z.db"
+printf 'journal-body\n' > "$journ_plain"
+sha256sum "$journ_plain" > "${journ_plain}.sha256"
+printf 'j\n' > "${journ_plain}-journal"
+FLEET_BACKUP_LOCAL_COMPRESS=1
+compress_one_complete_dump "$inc_plain"
+compress_one_complete_dump "$journ_plain"
+assert_exists "$inc_plain" "compress leaves a dump with no sha256"
+assert_missing "${inc_plain}.zst" "compress does not write .zst for a dump with no sha256"
+assert_exists "$journ_plain" "compress leaves a dump that still has a journal"
+assert_exists "${journ_plain}-journal" "compress does not delete the journal"
+assert_missing "${journ_plain}.zst" "compress does not write .zst while a journal exists"
+
+if command -v sqlite3 >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+  good="$phys/socratic/socratic-app-20261112T000000Z.db"
+  sqlite3 "$good" "CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('kept');" >/dev/null
+  sha256sum "$good" > "${good}.sha256"
+  compress_one_complete_dump "$good" >/dev/null
+  assert_missing "$good" "compress removes the plain dump after a matching .zst"
+  assert_exists "${good}.zst" "compress writes .db.zst on the physical root"
+  assert_exists "${good}.sha256" "compress keeps the raw-db sha256"
+  [ -L "$TMP/backup-link" ] && r=yes || r=no
+  assert_eq "$r" yes "compress does not replace the backup symlink"
+  restored="$TMP/restored-good.db"
+  zstd -q -d "${good}.zst" -o "$restored"
+  assert_eq "$(sqlite3 "$restored" 'PRAGMA integrity_check;')" ok "compressed dump decompresses to a clean sqlite file"
+  assert_eq "$(sqlite3 "$restored" 'SELECT x FROM t;')" kept "compressed dump round-trips the row"
+  want_sha="$(awk 'NR==1 { print $1; exit }' "${good}.sha256")"
+  got_sha="$(sha256sum "$restored" | awk '{print $1}')"
+  assert_eq "$got_sha" "$want_sha" "compressed dump matches the raw-db sha256"
+
+  bad_hash="$phys/socratic/socratic-app-20261113T000000Z.db"
+  printf 'not-the-hash\n' > "$bad_hash"
+  printf 'deadbeef  no\n' > "${bad_hash}.sha256"
+  compress_one_complete_dump "$bad_hash" >/dev/null
+  assert_exists "$bad_hash" "sha256 mismatch keeps the plain dump"
+  assert_missing "${bad_hash}.zst" "sha256 mismatch does not leave a .zst"
+
+  FLEET_BACKUP_LOCAL_COMPRESS=0
+  held="$phys/socratic/socratic-app-20261114T000000Z.db"
+  sqlite3 "$held" "CREATE TABLE t(x); INSERT INTO t VALUES (1);" >/dev/null
+  sha256sum "$held" > "${held}.sha256"
+  compress_complete_local_dumps >/dev/null
+  assert_exists "$held" "FLEET_BACKUP_LOCAL_COMPRESS=0 leaves the plain dump"
+  assert_missing "${held}.zst" "FLEET_BACKUP_LOCAL_COMPRESS=0 writes no .zst"
+  FLEET_BACKUP_LOCAL_COMPRESS=1
+
+  # Upload of an already-local .zst keeps that file (it is the retained dump).
+  UROOT="$TMP/upload-parent"
+  UDIR="$UROOT/socratic"
+  mkdir -p "$UDIR"
+  ROOT="$UROOT"
+  ustamp=20261130T120000Z
+  udb="$UDIR/socratic-app-${ustamp}.db"
+  sqlite3 "$udb" "CREATE TABLE t(x); INSERT INTO t VALUES ('up');" >/dev/null
+  sha256sum "$udb" > "${udb}.sha256"
+  compress_one_complete_dump "$udb" >/dev/null
+  UB="$TMP/upload-b2"
+  mkdir -p "$UB"
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$UB/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$UDIR" jays-socratic-trade-eu "$ustamp" >/dev/null
+  assert_exists "$UB/socratic-app-${ustamp}.db.zst" "already-local .zst is what B2 receives"
+  assert_exists "$UB/socratic-app-${ustamp}.db.sha256" "already-local upload sends the raw sha256"
+  assert_missing "$UB/socratic-app-${ustamp}.db" "already-local upload does not send a raw .db"
+  assert_exists "${udb}.zst" "upload keeps the local .db.zst"
+  assert_missing "$udb" "upload does not recreate the plain dump"
+  unset -f rclone
+
+  CROOT="$TMP/congress-upload"
+  CDIR="$CROOT/congress"
+  mkdir -p "$CDIR"
+  ROOT="$CROOT"
+  cstamp=20261130T130000Z
+  cdb="$CDIR/congress-trade-${cstamp}.db"
+  sqlite3 "$cdb" "CREATE TABLE t(x);" >/dev/null
+  sha256sum "$cdb" > "${cdb}.sha256"
+  compress_one_complete_dump "$cdb" >/dev/null
+  kv="$CDIR/kv-${cstamp}.sqlite"
+  sqlite3 "$kv" "CREATE TABLE kv(k TEXT);" >/dev/null
+  UB2="$TMP/upload-b2-congress"
+  mkdir -p "$UB2"
+  rclone() {
+    [ "$1" = copy ] || return 0
+    local src="$2" pats=() f n p
+    shift 3
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--include" ] && { pats+=("$2"); shift; }
+      shift
+    done
+    for f in "$src"/*; do
+      n="$(basename "$f")"
+      for p in "${pats[@]}"; do
+        # shellcheck disable=SC2053
+        if [[ "$n" == $p ]]; then cp "$f" "$UB2/$n"; break; fi
+      done
+    done
+  }
+  upload_b2_set "$CDIR" jays-socratic-trade-eu "$cstamp" >/dev/null
+  assert_exists "$UB2/congress-trade-${cstamp}.db.zst" "fast path uploads local .db.zst"
+  if [ -f "$UB2/kv-${cstamp}.sqlite.zst" ]; then
+    echo "ok   fast path uploads kv as .sqlite.zst"
+  elif [ -f "$UB2/kv-${cstamp}.sqlite" ]; then
+    echo "ok   fast path uploads uncompressed kv sqlite"
+  else
+    echo "FAIL fast path must upload kv-${cstamp}.sqlite set member"
+    fail=1
+  fi
+  unset -f rclone
+
+  reused="$phys/socratic/socratic-app-20261115T000000Z.db"
+  sqlite3 "$reused" "CREATE TABLE t(x); INSERT INTO t VALUES ('z');" >/dev/null
+  sha256sum "$reused" > "${reused}.sha256"
+  zstd -q -f "$reused" -o "${reused}.zst"
+  printf 'j\n' > "${reused}-journal"
+  compress_one_complete_dump "$reused" >/dev/null
+  assert_exists "${reused}.zst" "pre-existing valid .zst survives journal during recheck"
+
+  # Weekly verify accepts the compressed form, including through a symlink root.
+  VERIFY="${ROOT_DIR}/scripts/ops/fleet-backup-verify-weekly.sh"
+  # shellcheck disable=SC1090
+  FLEET_VERIFY_LIB_ONLY=1 . "$VERIFY"
+  VROOT="$TMP/verify-phys"
+  mkdir -p "$VROOT/usage-monitor" "$TMP/verify-scratch" "$TMP/verify-hop"
+  ln -s "$VROOT" "$TMP/verify-hop/target"
+  ln -s "$TMP/verify-hop/target" "$TMP/verify-link"
+  vbase="$VROOT/usage-monitor/usage-monitor-20261111T000000Z.db"
+  sqlite3 "$vbase" "CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (7);" >/dev/null
+  sha256sum "$vbase" > "${vbase}.sha256"
+  zstd -q -f "$vbase" -o "${vbase}.zst"
+  zstd -q -d "${vbase}.zst" -o "$TMP/verify-plain.db"
+  rm -f "$vbase"
+  # Newer incomplete must not hide the complete compressed dump.
+  printf 'partial\n' > "$VROOT/usage-monitor/usage-monitor-20261112T000000Z.db"
+  ROOT="$TMP/verify-link"
+  SCRATCH="$TMP/verify-scratch"
+  FAIL=0
+  FAIL_MSGS=()
+  check_dump usage-monitor >/dev/null
+  assert_eq "$FAIL" 0 "verify accepts a compressed dump through the symlink root"
+  # Bad checksum fails closed after a clean decompress.
+  printf '0000000000000000000000000000000000000000000000000000000000000000  x\n' > "${vbase}.sha256"
+  FAIL=0
+  FAIL_MSGS=()
+  check_dump usage-monitor >/dev/null
+  assert_eq "$FAIL" 1 "verify fails a compressed dump whose sha256 does not match"
+  sha256sum "$TMP/verify-plain.db" > "${vbase}.sha256"
+  printf 'garbage\n' > "${vbase}.zst"
+  FAIL=0
+  FAIL_MSGS=()
+  check_dump usage-monitor >/dev/null
+  assert_eq "$FAIL" 1 "verify fails a compressed dump that does not decompress"
+  pick_root="$TMP/verify-pick"
+  mkdir -p "$pick_root/socratic"
+  ROOT="$pick_root"
+  pick_base="$pick_root/socratic/socratic-app-20261120T000000Z.db"
+  sqlite3 "$pick_base" "CREATE TABLE t(x); INSERT INTO t VALUES (1);" >/dev/null
+  sha256sum "$pick_base" > "${pick_base}.sha256"
+  printf 'not-zstd\n' > "${pick_base}.zst"
+  picked="$(latest_complete_dump socratic | head -1)"
+  assert_eq "$picked" "$pick_base" "latest_complete_dump falls back to .db when .zst fails zstd -t"
+else
+  echo "FAIL compressed dump tests require sqlite3 and zstd"
+  fail=1
+fi
+FLEET_BACKUP_LOCAL_COMPRESS=1
+ROOT="$saved_root"
 
 if [ "$fail" -ne 0 ]; then
   echo "FAILED"

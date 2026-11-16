@@ -5,8 +5,10 @@ that ingests public US STOCK Act trade disclosures (House, Senate, and
 Executive Branch OGE 278-T), extracts and normalizes trades, and serves a
 public dashboard plus REST, webhook, SSE, and APNs delivery.
 
+**From:** [Simple With Us](https://simplewithus.com/)
+
 **Deno Deploy and Turso are retired.**  Production is Coolify Docker on
-the production fleet box (see private `jaywedgeworth22/fleet-ops:ATTACK-MAP.md`; `ssh coolify`), Deno inside
+the production fleet box, Deno inside
 the `congress-app` container, host SQLite at `/data/congress-trade/db.sqlite`
 (Litestream-replicated), Infisical secrets.  Cloudflare DNS routes
 `https://congress.trade`; it is not the application runtime.

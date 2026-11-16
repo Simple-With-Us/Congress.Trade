@@ -44,7 +44,8 @@ export type DatadogRumReason =
   | 'missing-application-id'
   | 'missing-site'
   | 'invalid-site'
-  | 'partial';
+  | 'partial'
+  | 'disabled';
 
 export interface DatadogInitInput {
   DD_API_KEY?: string;
@@ -59,6 +60,11 @@ export interface DatadogInitInput {
   DD_TRACE_AGENT_HOSTNAME?: string;
   DD_TRACE_URL?: string;
   DD_TRACE_SAMPLE_RATE?: string;
+  /** Host tag for APM.  Prefer fleet-hetzner-nbg1 so traces do not mint extra Free hosts. */
+  DD_HOSTNAME?: string;
+  /** Explicit RUM kill switch.  `false`/`0`/`off`/`no` fail-closes even when tokens exist. */
+  DD_RUM_ENABLED?: string;
+  NEXT_PUBLIC_DD_RUM_ENABLED?: string;
   DD_CLIENT_TOKEN?: string;
   DD_RUM_CLIENT_TOKEN?: string;
   NEXT_PUBLIC_DD_CLIENT_TOKEN?: string;
@@ -68,6 +74,18 @@ export interface DatadogInitInput {
   NEXT_PUBLIC_DD_APPLICATION_ID?: string;
   NEXT_PUBLIC_DD_RUM_APPLICATION_ID?: string;
   NEXT_PUBLIC_DD_SITE?: string;
+  /**
+   * Opt-in guard for tracer features that need the removed host agent.
+   * `1`/`true`/`on`/`yes` pins dynamic instrumentation, profiling, and remote
+   * config off when no agent host or URL is configured. Unset leaves init unchanged.
+   */
+  DD_TRACE_AGENTLESS_GUARDS?: string;
+  /** Explicit dynamic instrumentation switch. An explicit value wins over the guard. */
+  DD_DYNAMIC_INSTRUMENTATION_ENABLED?: string;
+  /** Explicit profiler switch. An explicit value wins over the guard. */
+  DD_PROFILING_ENABLED?: string;
+  /** Explicit remote-config switch. An explicit value wins over the guard. */
+  DD_REMOTE_CONFIGURATION_ENABLED?: string;
   SENTRY_ENVIRONMENT?: string;
   USAGE_MONITOR_ENVIRONMENT?: string;
   CT_BUILD_SHA?: string;
@@ -85,6 +103,7 @@ export interface DatadogBackendConfig {
   service: string;
   env: string;
   version?: string;
+  hostname?: string;
   logsIntakeUrl: string;
   tracesIntakeUrl: string;
 }
@@ -121,6 +140,66 @@ const SITE_SET = new Set<string>(DATADOG_SITES);
 function trimOrEmpty(value: string | undefined): string {
   return value?.trim() ?? '';
 }
+
+export function flagOff(value: string | undefined): boolean {
+  const normalized = trimOrEmpty(value).toLowerCase();
+  return normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off';
+}
+
+export function flagOn(value: string | undefined): boolean {
+  const normalized = trimOrEmpty(value).toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+/** Library defaults that talk to a Datadog Agent and do not write symdb-pids. */
+export const AGENT_ONLY_TRACER_ENV = [
+  'DD_DYNAMIC_INSTRUMENTATION_ENABLED',
+  'DD_PROFILING_ENABLED',
+  'DD_REMOTE_CONFIGURATION_ENABLED',
+] as const;
+
+export type AgentOnlyTracerEnv = (typeof AGENT_ONLY_TRACER_ENV)[number];
+
+/**
+ * When `DD_TRACE_AGENTLESS_GUARDS` is on and no agent host or URL is set,
+ * pin the agent-only tracer switches off unless the operator already set them.
+ * Unset guards, or a configured agent, return an empty plan so init is unchanged.
+ */
+export function planAgentlessTracerGuards(args: {
+  guards: string | undefined;
+  agentHost?: string;
+  agentUrl?: string;
+  current: Partial<Record<AgentOnlyTracerEnv, string | undefined>>;
+}): Partial<Record<AgentOnlyTracerEnv, 'false'>> {
+  if (!flagOn(args.guards)) return {};
+  if (firstNonEmpty(args.agentHost, args.agentUrl)) return {};
+  const planned: Partial<Record<AgentOnlyTracerEnv, 'false'>> = {};
+  for (const key of AGENT_ONLY_TRACER_ENV) {
+    if (firstNonEmpty(args.current[key])) continue;
+    planned[key] = 'false';
+  }
+  return planned;
+}
+
+/**
+ * Write the guard plan, then any explicit operator value, onto the process
+ * environment before dd-trace is imported. An Infisical value lives on
+ * `input` and is not necessarily already on `process.env`.
+ */
+export function applyAgentOnlyTracerEnv(
+  env: Record<string, string | undefined>,
+  planned: Partial<Record<AgentOnlyTracerEnv, string | undefined>>,
+  input: Partial<Record<AgentOnlyTracerEnv, string | undefined>> | undefined,
+): void {
+  for (const key of AGENT_ONLY_TRACER_ENV) {
+    const pinned = planned[key];
+    if (pinned) env[key] = pinned;
+    const explicit = firstNonEmpty(input?.[key]);
+    if (explicit) env[key] = explicit;
+  }
+}
+
+export const FLEET_DD_HOSTNAME = 'fleet-hetzner-nbg1';
 
 export function firstNonEmpty(...values: Array<string | undefined>): string {
   for (const value of values) {
@@ -252,12 +331,16 @@ export function resolveDatadogBackend(input: DatadogInitInput | undefined): Data
     service: firstNonEmpty(input?.DD_SERVICE, DATADOG_BACKEND_SERVICE),
     env: resolveDatadogEnvName(input),
     version: resolveDatadogVersion(input),
+    hostname: firstNonEmpty(input?.DD_HOSTNAME) || undefined,
     logsIntakeUrl: datadogLogsIntakeUrl(site),
     tracesIntakeUrl: datadogTracesIntakeUrl(site),
   };
 }
 
 export function resolveDatadogRum(input: DatadogInitInput | undefined): DatadogRumResolution {
+  if (flagOff(input?.DD_RUM_ENABLED) || flagOff(input?.NEXT_PUBLIC_DD_RUM_ENABLED)) {
+    return { enabled: false, reason: 'disabled' };
+  }
   const clientToken = resolveDatadogClientToken(input);
   const applicationId = resolveDatadogApplicationId(input);
   const siteRaw = resolveDatadogSiteRaw(input);
@@ -309,6 +392,9 @@ const DATADOG_RESOLVE_KEYS = [
   'DD_TRACE_AGENT_HOSTNAME',
   'DD_TRACE_URL',
   'DD_TRACE_SAMPLE_RATE',
+  'DD_HOSTNAME',
+  'DD_RUM_ENABLED',
+  'NEXT_PUBLIC_DD_RUM_ENABLED',
   'DD_CLIENT_TOKEN',
   'DD_RUM_CLIENT_TOKEN',
   'NEXT_PUBLIC_DD_CLIENT_TOKEN',
@@ -318,6 +404,10 @@ const DATADOG_RESOLVE_KEYS = [
   'NEXT_PUBLIC_DD_APPLICATION_ID',
   'NEXT_PUBLIC_DD_RUM_APPLICATION_ID',
   'NEXT_PUBLIC_DD_SITE',
+  'DD_TRACE_AGENTLESS_GUARDS',
+  'DD_DYNAMIC_INSTRUMENTATION_ENABLED',
+  'DD_PROFILING_ENABLED',
+  'DD_REMOTE_CONFIGURATION_ENABLED',
 ] as const;
 
 export type DatadogSecretKey = (typeof DATADOG_RESOLVE_KEYS)[number];
@@ -343,6 +433,9 @@ export async function resolveProductionDatadogEnv(
     DD_TRACE_AGENT_HOSTNAME: fromInfisical.DD_TRACE_AGENT_HOSTNAME || env.DD_TRACE_AGENT_HOSTNAME,
     DD_TRACE_URL: fromInfisical.DD_TRACE_URL || env.DD_TRACE_URL,
     DD_TRACE_SAMPLE_RATE: fromInfisical.DD_TRACE_SAMPLE_RATE || env.DD_TRACE_SAMPLE_RATE,
+    DD_HOSTNAME: fromInfisical.DD_HOSTNAME || env.DD_HOSTNAME,
+    DD_RUM_ENABLED: fromInfisical.DD_RUM_ENABLED || env.DD_RUM_ENABLED,
+    NEXT_PUBLIC_DD_RUM_ENABLED: fromInfisical.NEXT_PUBLIC_DD_RUM_ENABLED || env.NEXT_PUBLIC_DD_RUM_ENABLED,
     DD_CLIENT_TOKEN: fromInfisical.DD_CLIENT_TOKEN || env.DD_CLIENT_TOKEN,
     DD_RUM_CLIENT_TOKEN: fromInfisical.DD_RUM_CLIENT_TOKEN || env.DD_RUM_CLIENT_TOKEN,
     NEXT_PUBLIC_DD_CLIENT_TOKEN: fromInfisical.NEXT_PUBLIC_DD_CLIENT_TOKEN || env.NEXT_PUBLIC_DD_CLIENT_TOKEN,
@@ -355,6 +448,13 @@ export async function resolveProductionDatadogEnv(
     NEXT_PUBLIC_DD_RUM_APPLICATION_ID:
       fromInfisical.NEXT_PUBLIC_DD_RUM_APPLICATION_ID || env.NEXT_PUBLIC_DD_RUM_APPLICATION_ID,
     NEXT_PUBLIC_DD_SITE: fromInfisical.NEXT_PUBLIC_DD_SITE || env.NEXT_PUBLIC_DD_SITE,
+    DD_TRACE_AGENTLESS_GUARDS:
+      fromInfisical.DD_TRACE_AGENTLESS_GUARDS || env.DD_TRACE_AGENTLESS_GUARDS,
+    DD_DYNAMIC_INSTRUMENTATION_ENABLED:
+      fromInfisical.DD_DYNAMIC_INSTRUMENTATION_ENABLED || env.DD_DYNAMIC_INSTRUMENTATION_ENABLED,
+    DD_PROFILING_ENABLED: fromInfisical.DD_PROFILING_ENABLED || env.DD_PROFILING_ENABLED,
+    DD_REMOTE_CONFIGURATION_ENABLED:
+      fromInfisical.DD_REMOTE_CONFIGURATION_ENABLED || env.DD_REMOTE_CONFIGURATION_ENABLED,
     SENTRY_ENVIRONMENT: env.SENTRY_ENVIRONMENT,
     USAGE_MONITOR_ENVIRONMENT: env.USAGE_MONITOR_ENVIRONMENT,
     CT_BUILD_SHA: env.CT_BUILD_SHA,

@@ -57,3 +57,35 @@ volume/container greps that the public repo cannot hold (see
 `docs/rollouts/2026-08-31-b2-hetzner-prune.md`).  Apply this diff on top of
 the host copy; do not overwrite wholesale.  Backup the current host file
 first.  Cron wrapper flock can stay; it composes with the in-script lock.
+
+## 2026-09-13 follow-up (CLAUDE): the two flocks never composed
+
+**Symptom.**  No app SQLite dumps landed from 2026-09-07 12:15Z until 2026-09-13 07:30Z.  Every
+6-hourly tick logged `[fleet-backup] SKIP already running (lock held: /var/lock/fleet-sqlite-backup.lock)`
+while `fuser` showed no holder.
+
+**Root cause.**  The 2026-09-06 change added an in-script `exec 9>"$LOCKFILE"; flock -n 9` on the
+same path the cron wrapper already locks with `flock -n /var/lock/fleet-sqlite-backup.lock -c "..."`.
+A flock(2) lock belongs to an open file description, so the script's fresh open() always conflicted
+with the wrapper's lock.  The comment claiming they compose was wrong.  FX's 2026-09-12 rewrite
+(VACUUM INTO, non-zero on failure, alert hook; board cbed4f30 / 93c48e00) kept the bug, was installed
+on the host from an uncommitted lane edit, and its forced test run never executed, so nothing caught it.
+
+**Fix.**  (1) Interim, 2026-09-13 07:30Z: the cron line passes
+`FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup.inner.lock` inside the `flock -c` string so the
+two locks target different files (backup of the cron file: `/etc/cron.d/fleet-backups.bak-claude-20260913`).
+A supervised run and the 12:15Z, 18:15Z, and 2026-09-14 00:15Z ticks all completed with B2 offsite OK.
+(2) This PR: the script stands down its own flock when a caller hands down `FLOCKER=$LOCKFILE` (the
+flock(1) self-lock idiom; util-linux 2.41.3 on the host does not export FLOCKER by itself, so the cron
+line keeps form 1), the wrong comment is replaced, and FX's VACUUM INTO script is captured into the
+repo so git matches the host again.  Manual runs without the env var still take the default lock and
+therefore skip while a cron run holds the wrapper lock, which is the intended single-flight.
+
+**Host state.**  `/usr/local/sbin/fleet-sqlite-backup.sh` = this PR's script (earlier copies kept as
+`.bak-fx-20260912` and `.bak-claude-20260913`).  Cron line:
+`15 */6 * * * root flock -n /var/lock/fleet-sqlite-backup.lock -c "FLEET_BACKUP_LOCKFILE=/var/lock/fleet-sqlite-backup.inner.lock FLEET_BACKUP_KEEP_DAYS=2 FLEET_BACKUP_KEEP_COUNT=2 B2_KEEP_SETS=2 /usr/local/sbin/fleet-sqlite-backup.sh"`.
+The "UUID-pinned greps" caveat in the follow-ups above is historical: the host copy has carried the
+sanitized volume and container greps since PR #2171, and this PR's script is the host copy.
+
+**Credit.**  GROK (single-flight, retention, timeout, 2026-09-06), FX (VACUUM INTO, failure alerting,
+2026-09-12), CLAUDE (lock composition and host verification, 2026-09-13).

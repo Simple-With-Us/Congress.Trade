@@ -28,6 +28,7 @@ This change turns the FMP/Quiver/UnusualWhales latency monitor into a safety net
   is already `persisted`.  See
   `docs/rollouts/2026-08-25-provider-missing-stub-close.md`.  No historic
   backlog sweep; no confirm/merge of stub txs.
-- Add provider-specific official-document recovery: for provider rows exposing House PTR PDF IDs or Senate PTR view IDs, enqueue the official source URL before falling back to synthetic review rows.
+- **Landed (Senate PTR view IDs):** 2026-09-16 enqueue `S-{uuid}` from FMP/provider rows before opening a synthetic stub.  See `docs/rollouts/2026-09-16-fmp-senate-official-enqueue.md`.  House PTR PDF ids still fall back to the stub.
+- Add provider-specific official-document recovery for House PTR PDF IDs (Senate view IDs landed 2026-09-16).
 - Alert on `provider_discovered_missing_official` counts above zero per hour; any nonzero count means official-source discovery or extraction needs attention.
 - Keep R2 entitlement/credentials healthy on Deno so official raw bytes can be reprocessed; otherwise known filings will still be parked in review.

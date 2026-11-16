@@ -1,0 +1,4 @@
+MemTotal:       32706048 kB
+MemAvailable:   13527040 kB
+SwapTotal:      16777212 kB
+SwapFree:       14680064 kB

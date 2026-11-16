@@ -37,7 +37,7 @@
  * both hosts.
  */
 import type { Env } from '../shared/types.ts';
-import { all, get, run } from '../shared/db.ts';
+import { all, get, run, withSqliteLockRetry } from '../shared/db.ts';
 import type { LatencyProbeProviderId } from './scoutHandoff.ts';
 
 export type ProbeLeaseHolder = 'server' | 'mac';
@@ -284,7 +284,9 @@ export async function acquireProbeLease(
 
   let changes = 0;
   try {
-    const res = await run(
+    // Busy writes retry.  The lease still fail-closes if they keep failing.
+    // A non-busy error (missing table, malformed SQL) is one-shot fail-closed.
+    const res = await withSqliteLockRetry(() => run(
       env.DB,
       `INSERT INTO latency_probe_leases
          (provider, holder, holder_id, acquired_at, expires_at,
@@ -329,7 +331,7 @@ export async function acquireProbeLease(
         // epoch-ms tenure can be <= to.
         Number.isFinite(preemptBefore) ? preemptBefore : -1,
       ],
-    );
+    ));
     changes = res?.meta?.changes ?? 0;
   } catch (err) {
     // Fail CLOSED. An unavailable lease table must not silently re-enable the

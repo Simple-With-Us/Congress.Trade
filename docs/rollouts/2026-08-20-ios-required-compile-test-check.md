@@ -60,44 +60,24 @@ the three XCTest failures that painted the unsigned wrapper red, plus the
   contended default DerivedData lock cannot sit until the 45-minute
   timeout and cancel the Mac job.
 
-## Required check (Jay / ASC)
+## Required check (ruleset 20961339)
 
-Agents can POST a context to classic branch protection, but that must wait
-until **this workflow is on `main`**.  Adding `xcodebuild (unsigned)` while
-the old path-filtered workflow is still what other open PRs run would leave
-those PRs waiting on a check that never starts.
+The wrapper job name **`xcodebuild (unsigned)`** is in repository ruleset
+`default-main-protection` (id `20961339`) alongside `typecheck + test` and
+`gitleaks`.  Require the **job** name, not the workflow name (`iOS build
+(Mac runner)`), and not `xcodebuild-mac` or `ios path gate`.
 
-Live `required_status_checks.contexts` after this PR (still):
+`scripts/check-actions-runner-policy.mjs` fails CI when that ruleset drops
+any of the three contexts (uses `GITHUB_TOKEN` + `GITHUB_REPOSITORY` in
+Actions).
 
-- `typecheck + test`
-- `gitleaks`
-
-**Owner step after this lands on `main` and has produced at least one check
-run of that name:**
-
-1. Repo **Settings → Branches → `main`**.
-2. Edit the branch protection rule (or ruleset).
-3. Enable **Require status checks to pass before merging**.
-4. Search for and add **`xcodebuild (unsigned)`** (the wrapper job name).
-5. Save.  Confirm with:
+Confirm live:
 
 ```
-gh api repos/jaywedgeworth22/Congress.Trade/branches/main/protection \
-  --jq '.required_status_checks.contexts'
+gh api repos/Simple-With-Us/Congress.Trade/rulesets/20961339 \
+  --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'
 ```
-
-Expected after the tick: `typecheck + test`, `gitleaks`,
-`xcodebuild (unsigned)`.
-
-Do not require the workflow name (`iOS build (Mac runner)`).  Require the
-**job** name.  Do not require `xcodebuild-mac` or `ios path gate`.
-
-A premature add of `xcodebuild (unsigned)` was posted and immediately
-deleted during this work, before the always-report wrapper existed.
 
 ## Follow-ups
 
-- Jay/ASC ticks `xcodebuild (unsigned)` required after merge.  Until then
-  the workflow still fails and paints the PR red; GitHub will still allow
-  merge.
 - No TestFlight from this change.

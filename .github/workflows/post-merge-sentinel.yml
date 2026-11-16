@@ -1,0 +1,36 @@
+name: Post-merge sentinel
+
+# Re-dispatches the post-merge workflows that never ran for main HEAD (a run
+# GitHub failed before any job started, or no run at all), so an Actions
+# incident can't silently leave a deploy unrecorded (CT-2463).  It reads the
+# Actions API and dispatches on main;  it never re-runs a run that started and
+# never calls production.
+
+on:
+  schedule:
+    - cron: '7,27,47 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: post-merge-sentinel
+  cancel-in-progress: false
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '26'
+      - name: Test the sentinel
+        run: node --test scripts/ops/post-merge-sentinel.node-test.mjs
+      - name: Re-dispatch post-merge runs that never started
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/ops/post-merge-sentinel.mjs

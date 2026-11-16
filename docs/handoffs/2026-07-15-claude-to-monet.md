@@ -3,7 +3,7 @@
 Owner: Jay. Source branch (mine): `claude/antigravity-latency-security-x6lkvb`.
 This note hands you everything still open from a long CLAUDE cloud session.
 `AGENTS.md` is policy; `STATUS.md` is the live snapshot; `docs/EFFORT-LOG.md`
-has the per-effort receipts. Coordinate on Slack `#agent-sync` (`C0BEZDJDNKV`),
+has the per-effort receipts. Coordinate on Slack `#ag***-s**c` (`C0BEZDJDNKV`),
 tag `[Congress.Trade] MONET`.
 
 ---

@@ -1,4 +1,6 @@
-FROM denoland/deno:alpine
+# Pinned to match CI's Deno (npm deno@2.9.3 in .github/workflows/ci.yml) so
+# the tested runtime and the shipped runtime cannot drift (CT-2459).
+FROM denoland/deno:alpine-2.9.3
 
 WORKDIR /app
 
@@ -8,7 +10,20 @@ WORKDIR /app
 # bash/tar/ca-certificates are for scripts/start-with-litestream.sh (Litestream
 # continuous B2 backup, rebuilt 2026-08-12 after the Oracle->Hetzner migration
 # dropped the old host-level systemd unit) and scripts/fetch-litestream.sh.
-RUN apk add --no-cache curl bash tar ca-certificates
+#
+# poppler-utils (pdftoppm) and tesseract-ocr (+ its English traineddata
+# package) are the local OCR toolchain behind the OGE 278-T retry
+# (src/extraction/ogeLocalOcr.ts, CT-2448).  The app runs with
+# --allow-run=pdftoppm,tesseract and shells out to these binaries when
+# a 278-T has no usable text layer.  When they are missing the pass fails
+# closed — the filing parks exactly as it did before — but adding them here is
+# what makes the retry work at all.
+RUN apk add --no-cache curl bash tar ca-certificates \
+      poppler-utils \
+      tesseract-ocr \
+      tesseract-ocr-data-eng \
+    && pdftoppm -v \
+    && tesseract --list-langs | grep -qx eng
 
 # Litestream binary (pinned + sha256-verified) for continuous SQLite -> B2
 # replication. See scripts/fetch-litestream.sh for the pin rationale (0.5.13,
@@ -36,15 +51,40 @@ RUN wget -qO- 'https://artifacts-cli.infisical.com/setup.apk.sh' | sh \
   && apk add --no-cache infisical \
   && infisical --version
 
-# Cache dependencies
-COPY package.json ./
-RUN deno install || true
+# Cache dependencies: manifests + lockfiles first (no ||true -- a failed
+# install must fail the build, not ship a broken image). vendor shared src
+# rides along because deno.json maps an import to it.
+# --frozen: deno.lock was regenerated against the aligned deno.json in
+# CT-2459; a stale lock now fails the build instead of drifting silently.
+COPY package.json package-lock.json deno.json deno.lock ./
+COPY vendor/congress-trading-shared/src ./vendor/congress-trading-shared/src
+RUN deno install --frozen
 
-# Copy source
-COPY . .
+# Copy only what the runtime reads (CT-2459): src, public (ui/assets.ts
+# reads ../../public at module load), migrations, the entrypoint scripts,
+# litestream config. Tests/docs/ops scripts stay out (see .dockerignore).
+# .prod.vars left git tracking on 2026-11-12 (owner decision, after provider
+# secret scanning flagged historical blobs): src/deno/main.ts reads it only
+# as an env fallback and production env comes from Coolify and Infisical, so
+# the image copies it when the build context has one (local builds) and
+# falls back to an empty file on fresh checkouts instead of failing.
+COPY src ./src
+COPY public ./public
+COPY migrations ./migrations
+COPY litestream.yml ./
+RUN --mount=type=bind,source=.,target=/build-context,readonly \
+    if [ -f /build-context/.prod.vars ]; then cp /build-context/.prod.vars ./.prod.vars; else : > ./.prod.vars; fi
+COPY scripts/start-with-litestream.sh ./scripts/start-with-litestream.sh
 
-# Cache source files
-RUN deno cache src/deno/main.ts
+# Cache source files, including lazily dynamic-imported entries that a
+# main-only cache pass can miss at first tick.
+RUN deno cache src/deno/main.ts \
+      src/ingestion/latencyPriceSnapshots.ts \
+      src/extraction/storedRunPublish.ts \
+      src/prices/service.ts \
+      src/ingestion/scoutHandoff.ts \
+      src/ingestion/senateBrowserFetch.ts \
+      src/settings/settingsService.ts
 
 # Build revision, so /api/health can report which commit is actually running.
 # Coolify supplies SOURCE_COMMIT; any other builder can pass --build-arg.

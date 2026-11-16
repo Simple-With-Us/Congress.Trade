@@ -22,7 +22,7 @@ describe('resolveResumeCursor', () => {
     expect(resolveResumeCursor('100', '42')).toBe(100);
   });
 
-  it('treats an explicit since=0 as a real value (replay from the start)', () => {
+  it('treats an explicit since=0 as a real value (catch-up from cursor 0)', () => {
     expect(resolveResumeCursor('0', '42')).toBe(0);
   });
 

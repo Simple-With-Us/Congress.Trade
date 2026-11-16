@@ -142,8 +142,36 @@ export async function getSecurityRef(env: Env, ticker: string): Promise<Security
 const MEMBER_PROFILE_COLS =
   'bioguide_id, chamber, COALESCE(display_name, full_name) AS full_name, party, state, district, committees, photo_url, resolved_bioguide_id';
 
+// CT-2459: 5-minute isolate memo for term -> member resolution. The
+// fallback name search is an unindexed LOWER(full_name) LIKE scan and ran
+// BEFORE the KV cache lookup on member routes, so even cache hits paid
+// 1-3 DB queries per request. Filer profiles change rarely; null results
+// are not memoized (a newly added filer resolves immediately).
+const MEMBER_RESOLVE_CACHE_MS = 5 * 60_000;
+const memberResolveCache = new Map<string, { resolved: ResolvedMember; expiresAtMs: number }>();
+
+/** Test hook: drop the resolve memo. */
+export function resetMemberResolveCacheForTests(): void {
+  memberResolveCache.clear();
+}
+
 export async function resolveMember(env: Env, value: string): Promise<ResolvedMember | null> {
   const term = value.trim();
+  const memoKey = term.toLowerCase();
+  const memo = memberResolveCache.get(memoKey);
+  if (memo && memo.expiresAtMs > Date.now()) return memo.resolved;
+  const resolved = await resolveMemberUncached(env, term);
+  if (resolved) {
+    if (memberResolveCache.size >= 500) memberResolveCache.clear();
+    memberResolveCache.set(memoKey, {
+      resolved,
+      expiresAtMs: Date.now() + MEMBER_RESOLVE_CACHE_MS,
+    });
+  }
+  return resolved;
+}
+
+async function resolveMemberUncached(env: Env, term: string): Promise<ResolvedMember | null> {
   const byId = await get<MemberProfileRow>(
     env.DB,
     `SELECT ${MEMBER_PROFILE_COLS} FROM filers WHERE LOWER(bioguide_id) = LOWER(?) LIMIT 1`,

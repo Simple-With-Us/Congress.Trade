@@ -5,6 +5,9 @@
 
 import type { MiddlewareHandler } from 'hono';
 import {
+  FLEET_DD_HOSTNAME,
+  applyAgentOnlyTracerEnv,
+  planAgentlessTracerGuards,
   resolveDatadogBackend,
   resolveDatadogRum,
   type DatadogBackendConfig,
@@ -88,12 +91,43 @@ export function resetDatadogForTests(): void {
   }
 }
 
-export async function tryInitDdTracer(backend: DatadogBackendConfig): Promise<DdTracer | null> {
+export async function tryInitDdTracer(
+  backend: DatadogBackendConfig,
+  input?: DatadogInitInput,
+): Promise<DdTracer | null> {
   if (activeTracer) return activeTracer;
   try {
+    const proc = (globalThis as any).process;
+    const env = proc?.env as Record<string, string | undefined> | undefined;
+    const current = {
+      DD_DYNAMIC_INSTRUMENTATION_ENABLED:
+        input?.DD_DYNAMIC_INSTRUMENTATION_ENABLED ?? env?.DD_DYNAMIC_INSTRUMENTATION_ENABLED,
+      DD_PROFILING_ENABLED: input?.DD_PROFILING_ENABLED ?? env?.DD_PROFILING_ENABLED,
+      DD_REMOTE_CONFIGURATION_ENABLED:
+        input?.DD_REMOTE_CONFIGURATION_ENABLED ?? env?.DD_REMOTE_CONFIGURATION_ENABLED,
+    };
+    const planned = planAgentlessTracerGuards({
+      guards: input?.DD_TRACE_AGENTLESS_GUARDS ?? env?.DD_TRACE_AGENTLESS_GUARDS,
+      agentHost: backend.agentHost,
+      agentUrl: backend.agentUrl,
+      current,
+    });
+    if (env) applyAgentOnlyTracerEnv(env, planned, input);
+    const hostTag = backend.hostname
+      || proc?.env?.DD_HOSTNAME
+      || ((proc?.env?.COOLIFY_FQDN || proc?.env?.COOLIFY_RESOURCE_UUID) ? FLEET_DD_HOSTNAME : '');
+    if (hostTag && proc?.env) proc.env.DD_HOSTNAME = hostTag;
+    // Agentless dd-trace tags host from os.hostname() (the container id), not DD_HOSTNAME.
+    if (hostTag) {
+      try {
+        const os = await import('node:os');
+        os.hostname = () => hostTag;
+      } catch {
+        // Continue; host tag may stay the container id.
+      }
+    }
     const mod = await import('npm:dd-trace');
     const tracer = (mod.default || mod) as unknown as DdTracer;
-    const proc = (globalThis as any).process;
     if (proc?.env) {
       if (backend.agentUrl) {
         proc.env.DD_TRACE_AGENT_URL = backend.agentUrl;
@@ -152,7 +186,7 @@ export function initProductionDatadog(
   try {
     transport = createDatadogTransport(backend, fetchImpl, { sampleRate: backend.sampleRate });
     if (transport.enabled) hookConsole();
-    void tryInitDdTracer(backend);
+    void tryInitDdTracer(backend, input);
     return {
       logs: Boolean(backend.apiKey),
       apm: true,

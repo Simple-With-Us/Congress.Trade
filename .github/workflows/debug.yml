@@ -1,8 +1,0 @@
-name: Debug
-on: [workflow_dispatch]
-jobs:
-  debug:
-    runs-on: ubuntu-latest
-    steps:
-      - run: docker logs congress-app --tail 200
-      - run: docker logs congress-sqlite-web --tail 200

@@ -1,4 +1,5 @@
 import AuthenticationServices
+import ImageIO
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -175,9 +176,15 @@ enum AppTheme {
     static let primaryGradient = LinearGradient(colors: [.blue, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing)
 
     /// Dark readable ink for filter/header chrome: dropdown chevrons, filter
-    /// glyphs, "3 Months" (and other filter words), the exchange arrows, the
-    /// header ⓘ, and the hamburger.
+    /// glyphs, "3 Months" (and other filter words), the exchange arrows.
     static let glyphGrey = Color(uiColor: .label)
+
+    /// Medium grey for the header hamburger + ⓘ icons only.  Owner 2026-09-21
+    /// punch list: ~30% lighter than `glyphGrey` (so they no longer read as
+    /// near-black text glyphs), iOS `systemGray` — same shade Apple uses for
+    /// secondary toolbar controls.  Kept separate from `glyphGrey` because the
+    /// filter chevrons still want the dark grey for legibility on the page.
+    static let headerIconGrey = Color(uiColor: .systemGray)
 
     /// Near-black ink for words that are not filter chrome — "Done", "Export
     /// CSV", "Subscribe with Apple", sort-field names, rows-per-page.  Filter
@@ -200,6 +207,33 @@ enum AppTheme {
     static let houseColor = Color.blue.opacity(0.8)
     static let senateColor = Color.purple.opacity(0.8)
     static let execColor = Color.orange.opacity(0.8)
+
+    /// Buy / net-positive / ahead — matches web `--buy` / `--good` per theme.
+    static var semanticPositive: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0x22 / 255.0, green: 0xc5 / 255.0, blue: 0x5e / 255.0, alpha: 1.0)
+                : UIColor(red: 0x16 / 255.0, green: 0x65 / 255.0, blue: 0x34 / 255.0, alpha: 1.0)
+        })
+    }
+
+    /// Sell / net-negative / behind — matches web `--sell`.
+    static var semanticNegative: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0xef / 255.0, green: 0x44 / 255.0, blue: 0x44 / 255.0, alpha: 1.0)
+                : UIColor(red: 0x99 / 255.0, green: 0x1b / 255.0, blue: 0x1b / 255.0, alpha: 1.0)
+        })
+    }
+
+    /// Warn / caution / mixed — matches web `--warn` / `--exch` in light mode.
+    static var semanticCaution: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0xf5 / 255.0, green: 0x9e / 255.0, blue: 0x0b / 255.0, alpha: 1.0)
+                : UIColor(red: 0x9a / 255.0, green: 0x34 / 255.0, blue: 0x12 / 255.0, alpha: 1.0)
+        })
+    }
 
     static func border(cornerRadius: CGFloat = 16) -> some View {
         RoundedRectangle(cornerRadius: cornerRadius)
@@ -277,15 +311,106 @@ extension String {
 }
 
 enum MemberPhotoURL {
-    /// First usable absolute URL among the API profile, a Directory-row seed,
-    /// and any already-loaded roster entry. Relative `/api/photos/...` paths
-    /// are ignored: SwiftUI `AsyncImage` cannot resolve them.
+    /// First usable URL among the API profile, a Directory-row seed, and any
+    /// already-loaded roster entry. CT-2459: relative `/api/photos/...`
+    /// paths now resolve against the site origin instead of being dropped
+    /// (rows silently fell back to initials). Non-http(s) results are still
+    /// rejected after resolution.
     static func resolve(_ candidates: String?...) -> URL? {
+        let origin = CongressTradeAPIClient.defaultBaseURL
+            .deletingLastPathComponent() // v1
+            .deletingLastPathComponent() // client
+            .deletingLastPathComponent() // api
         for raw in candidates {
-            guard let raw, !raw.isEmpty, let url = URL(string: raw), url.scheme != nil else { continue }
-            return url
+            guard let raw, !raw.isEmpty else { continue }
+            if let url = URL(string: raw), let scheme = url.scheme,
+               scheme == "http" || scheme == "https" {
+                return url
+            }
+            if raw.hasPrefix("/"), let url = URL(string: raw, relativeTo: origin)?.absoluteURL,
+               url.scheme == "http" || url.scheme == "https" {
+                return url
+            }
         }
         return nil
+    }
+}
+
+/// CT-2459: shared downsampling image cache. Bare `AsyncImage` re-decoded
+/// full-size assets on every scroll-back with no memory cache. This loads
+/// once per URL and pixel size, thumbnail-decodes at display pixels via
+/// ImageIO, and keeps results in a cost-capped NSCache. A previously cached
+/// image renders synchronously (no placeholder flash).
+enum CachedImageLoader {
+    static let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.totalCostLimit = 20 * 1024 * 1024
+        return c
+    }()
+
+    /// CT-2461: the pixel size is part of the key. The same logo shows at
+    /// 22-48pt, so a URL-only key upscaled a small Trends thumbnail in the
+    /// larger feed and detail views.
+    private static func cacheKey(url: URL, maxPixelSize: CGFloat) -> NSString {
+        "\(max(1, Int(maxPixelSize)))|\(url.absoluteString)" as NSString
+    }
+
+    static func cachedImage(for url: URL, maxPixelSize: CGFloat) -> UIImage? {
+        cache.object(forKey: cacheKey(url: url, maxPixelSize: maxPixelSize))
+    }
+
+    /// Image hosts sit behind the same Cloudflare managed challenge as the
+    /// API; a default `URLSession.shared` UA can be 502'd. Carry the Safari
+    /// iOS UA the API client uses.
+    static var session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        ]
+        return URLSession(configuration: configuration)
+    }()
+
+    static func load(url: URL, maxPixelSize: CGFloat) async -> UIImage? {
+        if let hit = cachedImage(for: url, maxPixelSize: maxPixelSize) { return hit }
+        guard let (data, _) = try? await session.data(from: url) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maxPixelSize)),
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        let image = UIImage(cgImage: cg)
+        cache.setObject(image, forKey: cacheKey(url: url, maxPixelSize: maxPixelSize), cost: data.count)
+        return image
+    }
+}
+
+struct CachedAsyncImage: View {
+    let url: URL
+    var pointSize: CGFloat = 48
+    @State private var image: UIImage?
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable()
+            } else {
+                Color.clear
+            }
+        }
+        .task(id: url) {
+            let maxPixelSize = pointSize * displayScale
+            if let hit = CachedImageLoader.cachedImage(for: url, maxPixelSize: maxPixelSize) {
+                image = hit
+                return
+            }
+            image = nil
+            let loaded = await CachedImageLoader.load(url: url, maxPixelSize: maxPixelSize)
+            if !Task.isCancelled { image = loaded }
+        }
     }
 }
 
@@ -304,12 +429,9 @@ struct MemberAvatar: View {
                 .frame(width: size, height: size)
                 .background(AppTheme.card, in: Circle())
             if let photoURL {
-                AsyncImage(url: photoURL) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    }
-                }
-                .frame(width: size, height: size)
+                CachedAsyncImage(url: photoURL, pointSize: size)
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: size, height: size)
             }
         }
         .frame(width: size, height: size)
@@ -323,17 +445,21 @@ struct MetricTile: View {
     let title: String
     let value: String
     var tint: Color? = nil
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
+            // CT-2459: at accessibility sizes the value wraps instead of
+            // shrinking below legibility via minimumScaleFactor.
             Text(value)
                 .font(.subheadline.weight(.bold))
                 .foregroundStyle(tint ?? .primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                .minimumScaleFactor(dynamicTypeSize.isAccessibilitySize ? 1 : 0.75)
+                .fixedSize(horizontal: false, vertical: dynamicTypeSize.isAccessibilitySize)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
@@ -376,11 +502,13 @@ struct FilterChip: View {
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
+                .frame(minHeight: 44)
                 .foregroundStyle(isSelected ? Color.white : Color.primary)
                 .background(
                     isSelected ? Color.accentColor : Color(uiColor: .systemGray5),
                     in: Capsule()
                 )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }
@@ -415,14 +543,21 @@ struct AssetMark: View {
         return components.url
     }
 
+    @State private var logoImage: UIImage?
+    @Environment(\.displayScale) private var displayScale
+
     var body: some View {
         // No monogram / blue-square placeholders: when there is no real logo,
         // take zero space so asset + politician names get the width.
-        if let url = themedLogoURL {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image
+        // CT-2459: served from the shared downsampling cache; a cached logo
+        // appears synchronously on scroll-back instead of re-decoding.
+        // CT-2461: `.task` needs a view that exists before the image does. On
+        // a `Group` holding only `if let logoImage`, it has no child to attach
+        // to, so the load never starts and no logo ever appears.
+        if let themedLogoURL {
+            ZStack {
+                if let logoImage {
+                    Image(uiImage: logoImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .padding(size * 0.12)
@@ -435,9 +570,21 @@ struct AssetMark: View {
                             RoundedRectangle(cornerRadius: size * 0.22)
                                 .stroke(AppTheme.borderColor, lineWidth: 1)
                         )
-                default:
-                    EmptyView()
+                } else {
+                    Color.clear.frame(width: 0, height: 0)
                 }
+            }
+            .task(id: themedLogoURL) {
+                let maxPixelSize = size * displayScale
+                if let hit = CachedImageLoader.cachedImage(for: themedLogoURL, maxPixelSize: maxPixelSize) {
+                    logoImage = hit
+                    return
+                }
+                // Never leave one company's logo on a row reused for another.
+                logoImage = nil
+                let loaded = await CachedImageLoader.load(url: themedLogoURL, maxPixelSize: maxPixelSize)
+                // A cancelled load must not blank a logo a newer task has set.
+                if !Task.isCancelled { logoImage = loaded }
             }
         }
     }
@@ -709,16 +856,33 @@ struct DetailRow: View {
 
 struct NoticeView: View {
     let message: String
+    /// Optional recovery action.  Trends is the app's first screen and a failed
+    /// load leaves it as six "—" tiles, so a notice there with no button is a
+    /// dead end until the user guesses at pull-to-refresh.  Callers that sit
+    /// under an obvious refresh control can leave this nil.
+    var retry: (() -> Void)? = nil
 
     var body: some View {
-        Text(message)
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(AppTheme.border(cornerRadius: 12))
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(message)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let retry {
+                Button("Retry", action: retry)
+                    .font(.footnote.weight(.semibold))
+                    .buttonStyle(.bordered)
+                    .clipShape(Capsule())
+                    .fixedSize()
+                    .accessibilityLabel("Retry")
+                    .accessibilityHint(message)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(AppTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(AppTheme.border(cornerRadius: 12))
     }
 }
 
@@ -849,8 +1013,8 @@ extension String {
 
     var tint: Color {
         switch self {
-        case "S": return .red
-        case "B", "P": return .green
+        case "S": return AppTheme.semanticNegative
+        case "B", "P": return AppTheme.semanticPositive
         default: return .blue
         }
     }
@@ -859,10 +1023,10 @@ extension String {
 extension ClientCommand.Status {
     var tint: Color {
         switch self {
-        case .queued: return .orange
+        case .queued: return AppTheme.semanticCaution
         case .running: return .blue
-        case .succeeded: return .green
-        case .failed: return .red
+        case .succeeded: return AppTheme.semanticPositive
+        case .failed: return AppTheme.semanticNegative
         case .canceled: return .secondary
         }
     }
@@ -961,10 +1125,11 @@ struct HeaderIconButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                // `.title3` (not a fixed point size) so the "slightly larger"
-                // glyph still scales with Dynamic Type.
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(AppTheme.glyphGrey)
+                // Owner 2026-09-21 punch list: 15% smaller than the previous
+                // `.title3` (≈20pt). `.body` (≈17pt) is the closest stock
+                // size and still scales with Dynamic Type.
+                .font(.body.weight(.semibold))
+                .foregroundStyle(AppTheme.headerIconGrey)
                 // minWidth/minHeight (not a fixed frame) so the tap target can
                 // grow past 34pt for large Dynamic Type sizes instead of
                 // clipping the glyph.
@@ -972,7 +1137,7 @@ struct HeaderIconButton: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .tint(AppTheme.glyphGrey)
+        .tint(AppTheme.headerIconGrey)
         .accessibilityLabel(accessibilityLabel)
     }
 }
@@ -992,14 +1157,18 @@ struct HamburgerMenuButton: View {
         Button {
             showMenu = true
         } label: {
+            // Owner 2026-09-21 punch list: matches the header ⓘ — medium
+            // grey (headerIconGrey, iOS systemGray), 15% smaller than the
+            // previous `.title3` (≈20pt).  `.body` is the closest stock size
+            // and still scales with Dynamic Type.
             Image(systemName: "line.3.horizontal")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(AppTheme.glyphGrey)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(AppTheme.headerIconGrey)
                 .frame(minWidth: 34, minHeight: 34)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .tint(AppTheme.glyphGrey)
+        .tint(AppTheme.headerIconGrey)
         .accessibilityLabel("Menu")
         .sheet(isPresented: $showMenu) {
             AccountQuickMenu(isPresented: $showMenu)
@@ -1026,8 +1195,22 @@ struct AccountQuickMenu: View {
     @State private var showPremiumInfo = false
     @State private var showExportSheet = false
     @State private var showDeleteAccountConfirm = false
+    @State private var showBugReportSheet = false
     @State private var isOpeningManageSubscription = false
     @State private var manageSubscriptionError: String?
+
+    /// Listen for the iOS shake gesture (default OFF, gated by
+    /// `shake_to_report_enabled` UserDefaults). Posted from
+    /// `ShakeDetectorViewController.motionEnded` in App.swift; opens the
+    /// same `BugReportSheet` as the account-menu entry so both entry
+    /// points converge on one submission path.
+    private var shakeListener: some View {
+        EmptyView()
+            .onReceive(NotificationCenter.default.publisher(for: .shakeToReport)) { _ in
+                guard UserDefaults.standard.bool(forKey: "shake_to_report_enabled") else { return }
+                showBugReportSheet = true
+            }
+    }
 
     var body: some View {
         NavigationStack {
@@ -1039,6 +1222,18 @@ struct AccountQuickMenu: View {
                         Text(notice)
                             .padding(.top, 6)
                     }
+                }
+                .ctThemedRow()
+                .background(shakeListener)
+
+                // Owner 2026-09-21 ask: shake-to-report toggle, default OFF.
+                // Lives in its own section so the label + hint read cleanly
+                // on the Account sheet, with the existing Report-a-Bug
+                // entry below in the danger zone as the alternate entry point.
+                Section {
+                    ShakeToReportToggle()
+                } footer: {
+                    Text("When on, shaking the device opens a bug-report sheet. Default is off — turn it on if you want one-gest reporting while testing.")
                 }
                 .ctThemedRow()
 
@@ -1086,6 +1281,20 @@ struct AccountQuickMenu: View {
 
                 if store.signedIn || store.hasStoredSessionToken {
                     Section {
+                        // Owner 2026-09-21 ask: Report a Bug above Sign Out.
+                        // Opens Sentry's User Feedback widget (configured
+                        // DSN) so the iOS session breadcrumbs, last-30
+                        // console lines, app version, and account email
+                        // attach automatically — no back-and-forth needed.
+                        Button {
+                            presentBugReportSheet()
+                        } label: {
+                            Label(
+                                "Report a Bug",
+                                systemImage: "ladybug"
+                            )
+                        }
+                        .accessibilityHint("Opens a feedback sheet. The app attaches the last 30 console lines and your account email so we can reproduce the issue.")
                         Button(role: .destructive) {
                             Task { await store.signOut() }
                         } label: {
@@ -1171,6 +1380,21 @@ struct AccountQuickMenu: View {
         } message: {
             Text("This permanently deletes your account, delivery subscriptions, and personal information.  Apple subscriptions must also be cancelled in Settings → Apple ID → Subscriptions.  This cannot be undone.")
         }
+        .sheet(isPresented: $showBugReportSheet) {
+            BugReportSheet()
+                .environmentObject(store)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+    }
+
+    /// Opens the bug-report sheet. Owner 2026-09-21 ask: bug reports go
+    /// through Sentry's User Feedback widget when DSN is configured (the
+    /// widget is invoked from inside `BugReportSheet`), so the operator's
+    /// Sentry issue already carries app version + last-30 console lines +
+    /// current view + account email — no back-and-forth needed.
+    private func presentBugReportSheet() {
+        showBugReportSheet = true
     }
 
     @ViewBuilder
@@ -1259,6 +1483,118 @@ struct AccountQuickMenu: View {
         case .failed(let message):
             manageSubscriptionError = message
         }
+    }
+}
+
+/// Sentry User Feedback sheet. Owner 2026-09-21 ask: this is the entry
+/// point for both the account-menu "Report a Bug" button AND the shake-to-
+/// report gesture on mobile (default off, gated by
+/// `UserDefaults.shakeToReportEnabled`). Both paths converge here so the
+/// Sentry submission carries the same context regardless of entry point.
+struct BugReportSheet: View {
+    @EnvironmentObject private var store: CongressTradeStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var comments = ""
+    @State private var email = ""
+    @State private var submitting = false
+    @State private var submitError: String?
+    @State private var submitted = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("What happened?", text: $comments, axis: .vertical)
+                        .lineLimit(4...10)
+                    TextField("Your email (optional)", text: $email)
+                        .keyboardType(.emailAddress)
+                        .autocapitalization(.none)
+                } footer: {
+                    Text("The app attaches: version, last 30 console lines, current view, and account email (if signed in). Tap Send to forward to the developer's Sentry.")
+                }
+
+                Section {
+                    if let err = submitError {
+                        Text(err).foregroundStyle(.red)
+                    }
+                    if submitted {
+                        Label("Report sent — thank you.", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+            }
+            .navigationTitle("Report a Bug")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(submitted ? "Done" : "Send") {
+                        if submitted { dismiss() } else { Task { await submit() } }
+                    }
+                    .disabled(comments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || submitting)
+                }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func submit() async {
+        submitting = true
+        defer { submitting = false }
+        let payload: [String: Any] = [
+            "comments": comments,
+            "email": email.isEmpty ? (store.signedInUser?.email ?? "guest") : email,
+            "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?",
+            "ios_version": ProcessInfo.processInfo.operatingSystemVersionString,
+            "device": UIDevice.current.model,
+            "view": SentryTelemetry.lastBreadcrumbView ?? "unknown",
+            "submitted_at": ISO8601DateFormatter().string(from: Date()),
+        ]
+        // Send via Sentry's captureUserFeedback if SDK is configured
+        // (DSN set in plist + SentryTelemetry.start() ran). Falls back to
+        // a no-op + console error log when Sentry is unconfigured, so
+        // the button never breaks the surface.
+        let delivered = await SentryTelemetry.captureUserFeedback(
+            comments: comments,
+            email: email.isEmpty ? (store.signedInUser?.email ?? "guest") : email,
+            payload: payload
+        )
+        if delivered {
+            submitted = true
+        } else {
+            submitError = "Couldn't reach the bug-report endpoint. Try again, or email support@congress.trade."
+        }
+    }
+}
+
+/// Owner 2026-09-21 ask: shake-to-report on mobile (default off). Wired
+/// once at the App root via `.onShakeToReport` and only fires when the
+/// user has opted in via Settings → Account → "Shake to Report Bug".
+extension Notification.Name {
+    static let shakeToReport = Notification.Name("CT.shakeToReport")
+    /// Posted by `ShakeToReportToggle` so the root detector can follow the
+    /// opt-in without reading `UserDefaults` on the launch layout turn.
+    static let shakeToReportPreferenceChanged = Notification.Name("CT.shakeToReportPreferenceChanged")
+}
+
+/// Settings row for the shake-to-report opt-in toggle. Lives inside
+/// AccountQuickMenu below the Appearance row so the user can find it
+/// without scrolling past Account actions. Default false. The root
+/// detector installs only after the first frame, and only while this is on.
+struct ShakeToReportToggle: View {
+    @AppStorage(ShakeToReportPreference.defaultsKey) private var enabled: Bool = false
+
+    var body: some View {
+        Toggle("Shake to Report Bug", isOn: $enabled)
+            .accessibilityHint("When on, shaking the device opens a bug-report sheet. Default is off.")
+            .onChange(of: enabled) { _, newValue in
+                NotificationCenter.default.post(
+                    name: .shakeToReportPreferenceChanged,
+                    object: nil,
+                    userInfo: [ShakeToReportPreference.enabledUserInfoKey: newValue]
+                )
+            }
     }
 }
 

@@ -23,10 +23,33 @@ import {
   isDeletedFilingStatus,
   looksLikeHeaderContaminatedAsset,
   looksLikeNothingToReport,
+  looksLikeOgePart7ExplicitNone,
+  dropPtrFormSamplesForPublish,
   looksLikePtrFormSampleAsset,
   looksLikePtrFormSampleRow,
   looksLikeSeeAttachmentPointer,
+  isHouseGridFormExtractor,
 } from './extractRouting.ts';
+import {
+  handCheckReviewReason,
+  isVisionOrOcrExtraction,
+  mergeHandCheckIntoReviewReason,
+  NEEDS_HAND_CHECK_MAC_VISION,
+  NEEDS_HAND_CHECK_SCANNED_VISION,
+  requiresHandCheckBeforePublish,
+} from './handCheckPublish.ts';
+import {
+  assessVisionDegenerate,
+  mergeVisionDegenerateReason,
+  type VisionDegenerateAssessment,
+} from './visionDegenerateGuard.ts';
+import type { ExtractorParseDisposition } from '../extractors/types.ts';
+import {
+  closeUnreadableExecutive,
+  closeVerifiedEmptyExecutive,
+  EXECUTIVE_EMPTY_RESOLUTION_REASON,
+  OGE_TEXT_UNREADABLE_REASON,
+} from './executiveDisposition.ts';
 import { all, batch, fromBool, get, parseJson, run } from '../shared/db.ts';
 import { isValidBracket, matchBracket, nearestBracket } from '../shared/brackets.ts';
 import { canonicalizeAssetType, inferHouseAssetTypeCode, HOUSE_ASSET_TYPE_NAMES } from '../shared/assetTypes.ts';
@@ -45,14 +68,32 @@ import {
   cleanFilerName,
   isJunkAssetString,
   cleanAssetString,
+  namesPlausiblyMatch,
   simplifyCompanyName,
   splitAssetNameDetail,
 } from './nameNormalizer.ts';
 import { resolveContinuousTicker } from '@jaywedgeworth22/congress-trading-shared';
 import { flushDeliveryOutbox } from '../delivery/outbox.ts';
 import { deprecatePredecessorFilingTransactions } from './agreement.ts';
-import { parseAmountRange } from './amounts.ts';
+import { stripOgeRowIndexes } from './ogeRowIndex.ts';
+import { assessOgeRowCompleteness } from './ogeText.ts';
+import {
+  addIssuerName,
+  emptyIssuerNameIndex,
+  loadIssuerNameIndex,
+  resolveTickerByIssuerName,
+  type IssuerNameIndex,
+} from '../enrichment/nameTickerBackfill.ts';
+import { canonicalizeAmountBounds, parseAmountRange } from './amounts.ts';
+import { issuerWords, junkAssetNameReason, normalizeEmbeddedOcrDates, normalizeOcrAssetName, validateTxDate } from './ocrSanity.ts';
+import type { OcrNameResult } from './ocrSanity.ts';
 import { canonicalizeTxType } from '../shared/txType.ts';
+import { parseHousePtrDisclosedName } from './textPdf.ts';
+import {
+  houseMemberNameMismatch,
+  suppressAssetOcrHoldForMemberBleed,
+  type HouseMemberIdentity,
+} from './housePtrMember.ts';
 import {
   PIPELINE_TX_SOURCES_SQL,
   VISION_SUPERSEDE_REASON,
@@ -60,6 +101,8 @@ import {
   isVisionTxSource,
   supersededPipelineSourcesSql,
 } from './sourceSupersede.ts';
+import { proposedMatchesLivePipeline } from '../admin/publishContentHash.ts';
+import { recordReviewRevisionAudit } from '../shared/reviewRevisionAudit.ts';
 
 /**
  * Per-tx confidence at or above this threshold is trusted for auto-publish. If a
@@ -173,6 +216,8 @@ const PENALTY_FUTURE_TX_DATE = 0.7; //    tx_date after the filing's filed_date 
 const PENALTY_MISSING_TX_DATE = 0.7; //   tx_date is missing entirely
 const PENALTY_BAD_TX_TYPE = 0.5; //       tx_type not in {B,S,E}
 const PENALTY_BAD_ASSET_NAME = 0.4; //    parsed asset contains PTR header chrome
+const PENALTY_BAD_TX_DATE = 0.4; //       tx_date is impossible or wildly out of range
+const PENALTY_OCR_HOLD = 0.4; //          asset name has unfixable OCR garble
 
 /** Outcome of normalizing one filing's extracted rows. */
 export interface NormalizeResult {
@@ -186,12 +231,18 @@ export interface NormalizeResult {
   published: boolean;
   /** Review-queue reason when needsReview is true (agreement hard-stop input). */
   reviewReason?: string;
+  /** True when this invocation resolved the filing's review state with
+   *  nothing new to persist (a terminal no-op success, e.g.
+   *  amendment_already_persisted / deleted_rows_applied).  Distinct from a
+   *  lost CAS, which is also needsReview:false / published:false. */
+  settled?: boolean;
 }
 
 interface ReviewSnapshot {
   resolved: number;
   review_revision: number;
   agreement_suppressed_at: string | null;
+  payload: string | null;
 }
 
 export interface FlaggedTx {
@@ -199,16 +250,30 @@ export interface FlaggedTx {
   flags: string[];
 }
 
+/**
+ * Review reason when a 278-T reader produced fewer rows than the source
+ * numbers.  The agreement / stored-run publishers refuse filings parked with
+ * it: a single model read cannot prove it recovered the missing rows.
+ */
+export const OGE_ROWS_INCOMPLETE_REASON = 'oge_rows_incomplete';
+
 /** Flags that force a filing to human review regardless of soft confidence. */
 export const HARD_FAILURE_FLAGS = [
   'no_amount',
   'invalid_amount',
   'bad_tx_type',
+  'suspected_constant_tx_type',
   'bad_asset_name',
   'unreadable_is_option',
   'unreadable_cap_gains',
   'future_tx_date',
   'missing_tx_date',
+  'bad_tx_date',
+  'tx_date_too_old',
+  'tx_date_after_filing_window',
+  'ocr_name_hold',
+  'ocr_date_hold',
+  'grid_type_unmarked',
 ];
 const HARD_FAILURE_FLAG_SET = new Set<string>(HARD_FAILURE_FLAGS);
 
@@ -284,21 +349,72 @@ function rowKeyAssetTypeName(assetType: string | null | undefined, assetTypeName
  * and the admin reprocess path, which recomputes confidence for already-persisted
  * filings and updates the existing rows in place.
  */
+export interface HouseMemberContext {
+  identity: HouseMemberIdentity | null;
+}
+
+async function loadHouseMemberContext(
+  env: Env,
+  filing: Filing,
+  sourceText: string | null | undefined,
+): Promise<HouseMemberContext> {
+  if (filing.chamber !== 'house') return { identity: null };
+  const disclosed = parseHousePtrDisclosedName(sourceText);
+  if (!disclosed || !filing.filerId) return { identity: null };
+  try {
+    const row = await get<{ full_name: string | null; chamber: string | null; state: string | null }>(
+      env.DB,
+      'SELECT full_name, chamber, state FROM filers WHERE bioguide_id = ?',
+      [filing.filerId],
+    );
+    if (!row?.full_name) return { identity: null };
+    return {
+      identity: {
+        disclosedName: disclosed,
+        registeredName: row.full_name,
+        chamber: row.chamber ?? filing.chamber,
+        state: row.state,
+      },
+    };
+  } catch {
+    return { identity: null };
+  }
+}
+
 export async function recomputeTransactions(
   env: Env,
   filing: Filing,
   parsed: ParsedTx[],
   sourceOverride?: TxSource,
+  houseMember?: HouseMemberContext,
 ): Promise<FlaggedTx[]> {
   const nowIso = new Date().toISOString();
   const [resolver, nameIndex] = await Promise.all([loadResolver(env), loadNameIndex(env)]);
-  return parsed.map((p, rowIndex) =>
-    buildTransaction(p, filing, resolver, nowIso, rowIndex, sourceOverride, nameIndex),
+  // Word-level OCR evidence from securities_ref company names, derived once
+  // for the whole filing so per-row scoring stays cheap.
+  const ocrExtraWords = issuerWords(nameIndex.values());
+  // An executive 278-T's "#" column arrives glued onto the asset name on the
+  // scanned path ("3641 Microsoft Corp. Com"); strip it before the resolver sees
+  // the name, when the filing itself shows the pattern (board row 3d31c7b9).
+  const rows = filing.chamber === 'executive' ? stripOgeRowIndexes(parsed) : parsed;
+  const memberCtx = houseMember ?? { identity: null };
+  return rows.map((p, rowIndex) =>
+    buildTransaction(
+      p,
+      filing,
+      resolver,
+      nowIso,
+      rowIndex,
+      sourceOverride,
+      nameIndex,
+      ocrExtraWords,
+      memberCtx,
+    ),
   );
 }
 
 /** securities_master row shape. `aliases` is a JSON string array. */
-interface SecRow {
+export interface SecRow {
   ticker: string;
   name: string | null;
   aliases: string | null;
@@ -330,30 +446,54 @@ export async function normalize(
   env: Env,
   filing: Filing,
   parsed: ParsedTx[],
-  meta?: { extractor?: string; modelVersion?: string | null; source?: TxSource },
+  meta?: {
+    extractor?: string;
+    modelVersion?: string | null;
+    source?: TxSource;
+    /** Full document text.  Zero parsed rows still need this to see Part 7 "None". */
+    sourceText?: string | null;
+    /** Set by ogeText.  `empty` and `unreadable` are different zero-row outcomes. */
+    parseDisposition?: ExtractorParseDisposition;
+    /**
+     * Extra JSON for the review_queue payload when this filing parks.
+     * Used by the local OGE OCR pass to record which rows did not reconcile
+     * (CT-2448) so the parked filing shows what the scan did and did not yield.
+     */
+    reviewPayload?: Record<string, unknown> | null;
+  },
 ): Promise<NormalizeResult> {
   const nowIso = new Date().toISOString();
   const extractorName = meta?.extractor ?? filing.extractor ?? null;
   const modelVersion = meta?.modelVersion ?? filing.modelVersion ?? null;
   const source = meta?.source ?? 'primary';
+  const sourceText = meta?.sourceText ?? null;
 
   // Drop form-chrome rows up front. Pure letterhead OCR floods were parking
   // hundreds of "Clerk of the House…" fakes in review_queue and burning the
   // agreement cascade budget on documents with zero real trades.
-  const usableParsed = parsed.filter((p) =>
+  const usableParsed = dropPtrFormSamplesForPublish(filing.docId, parsed).filter((p) =>
     !looksLikeHeaderContaminatedAsset(p.assetName)
-    && !looksLikePtrFormSampleAsset(p.assetName)
-    && !looksLikePtrFormSampleRow(p)
     && !looksLikeSeeAttachmentPointer(p.assetName)
     && !looksLikeSeeAttachmentPointer(p.rawText)
     && !looksLikeNothingToReport(p.assetName)
   );
   const droppedFormChrome = parsed.length - usableParsed.length;
-  const sawNothingToReport = parsed.some((p) =>
+  let visionDegenerateAssessment: VisionDegenerateAssessment | null = null;
+  const sawOgePart7ExplicitNone = looksLikeOgePart7ExplicitNone(sourceText)
+    || parsed.some((p) =>
+      looksLikeOgePart7ExplicitNone(p.assetName) || looksLikeOgePart7ExplicitNone(p.rawText)
+    );
+  const sawNothingToReport = sawOgePart7ExplicitNone || parsed.some((p) =>
     looksLikeNothingToReport(p.assetName) || looksLikeNothingToReport(p.rawText)
   );
 
-  const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source);
+  const houseMember = await loadHouseMemberContext(env, filing, sourceText);
+  const allFlagged: FlaggedTx[] = await recomputeTransactions(env, filing, usableParsed, source, houseMember);
+  if (isVisionOrOcrExtraction(extractorName, source) && usableParsed.length > 0) {
+    visionDegenerateAssessment = assessVisionDegenerate(usableParsed, {
+      resolvedTickers: allFlagged.map((f) => f.tx.ticker ?? null),
+    });
+  }
   const deletedFlagged = allFlagged.filter((f) => isDeletedFilingStatus(f.tx.filingStatus));
   const flagged = allFlagged.filter((f) => !isDeletedFilingStatus(f.tx.filingStatus));
 
@@ -379,6 +519,10 @@ export async function normalize(
       && !f.flags.includes('no_amount')
       && !f.flags.includes('missing_tx_date'))
     : flagged;
+  // Sibling-publish only: gate on rows that have amounts.  If every row
+  // omitted the checkbox, use the real min (includes the no_amount penalty)
+  // so the filing stays in review.  Substituting the publish threshold here
+  // auto-published all-null-amount extracts after #2143.
   const gateMinConfidence = gateRows.length
     ? Math.min(...gateRows.map((f) => f.tx.confidence))
     : minConfidence;
@@ -403,12 +547,23 @@ export async function normalize(
   // OpenRouter agreement outages cannot strand already-structured rows.
   const confThreshold = confidenceThresholdFor(extractorName, filing.docKind);
 
-  const needsReview =
+  // 278-T completeness: when the source numbers more rows than the reader
+  // produced, publishing would silently drop the unparsed ones (Trump
+  // 09-08-2026 went live with 1,113 of 1,156 rows).  Hold the whole filing.
+  // Measured on usableParsed (the rows that would actually publish), so a
+  // dropped form-chrome/sample row cannot mask a missing real one.
+  const rowCompleteness = filing.chamber === 'executive' && usableParsed.length > 0
+    ? assessOgeRowCompleteness(sourceText, usableParsed)
+    : null;
+  const rowsIncomplete = rowCompleteness !== null && rowCompleteness.missingCount > 0;
+
+  let needsReview =
     flagged.length === 0
     || gateMinConfidence < confThreshold
     || hasHardFailure
     || exceedsPublishLimit
-    || ocrUnusable;
+    || ocrUnusable
+    || rowsIncomplete;
 
   const isAmendment =
     /amend|\(2\)|278t\(\d+\)/i.test(filing.docId) ||
@@ -435,10 +590,20 @@ export async function normalize(
   // a human decision that lands first wins without partial transaction rows.
   const reviewSnapshot = await get<ReviewSnapshot>(
     env.DB,
-    `SELECT resolved, review_revision, agreement_suppressed_at
+    `SELECT resolved, review_revision, agreement_suppressed_at, payload
        FROM review_queue WHERE doc_id = ?`,
     [filing.docId],
   );
+
+  const handCheckRequired = requiresHandCheckBeforePublish(filing, extractorName, source)
+    && reviewSnapshot?.resolved !== 1
+    && flagged.length > 0;
+  if (handCheckRequired) {
+    needsReview = true;
+  }
+  if (visionDegenerateAssessment?.degenerate) {
+    needsReview = true;
+  }
 
   // A completed decision is authoritative unless a later complete vision
   // extract is replacing a truncated confirm on the same doc_id. Replaying
@@ -497,15 +662,48 @@ export async function normalize(
   }
 
   if (needsReview) {
+    // A refused 278-T is not an empty filing.  docClassifier calls every
+    // text_pdf `typed`, so this is the park the empty doc-class path misses.
+    // The row stays open for a human.  It is not resolved in this tick.
+    if (
+      filing.chamber === 'executive'
+      && flagged.length === 0
+      && reviewSnapshot?.resolved !== 1
+      && meta?.parseDisposition === 'unreadable'
+    ) {
+      const closed = await closeUnreadableExecutive(env, filing.docId, {
+        nowIso,
+        respectSuppression: true,
+        insertIfAbsent: true,
+        // Close only the review version we read: a human revision that lands
+        // after the snapshot must win over this stale zero-row parse.
+        reviewRevision: reviewSnapshot?.review_revision ?? null,
+        // CT-2448: carry the local OCR attempt (and the rows it could not
+        // reconcile) into the parked payload so a human sees what was tried.
+        payload: meta?.reviewPayload ?? null,
+      });
+      if (closed) {
+        return {
+          transactions: [],
+          minConfidence: 0,
+          needsReview: true,
+          published: false,
+          reviewReason: OGE_TEXT_UNREADABLE_REASON,
+        };
+      }
+    }
     // Form-sample chrome alone is not NTR.  Example Mega Corp is printed on
     // every House PTR; OCR often reads it and misses the real trades.
     if (flagged.length === 0 && sawNothingToReport) {
+      const resolutionReason = sawOgePart7ExplicitNone
+        ? 'oge_part7_explicit_none'
+        : 'nothing_to_report';
       const closed = await resolveVerifiedEmpty(
         env,
         filing,
         nowIso,
         reviewSnapshot,
-        'nothing_to_report',
+        resolutionReason,
       );
       if (closed) {
         return {
@@ -513,7 +711,34 @@ export async function normalize(
           minConfidence: 0,
           needsReview: false,
           published: false,
-          reviewReason: 'nothing_to_report',
+          reviewReason: resolutionReason,
+        };
+      }
+    }
+    // 278e with no 278-T table and no rows, including a Part 7 that does not
+    // literally say None.  A successful read that already found rows blocks this.
+    if (
+      filing.chamber === 'executive'
+      && flagged.length === 0
+      && reviewSnapshot?.resolved !== 1
+      && meta?.parseDisposition === 'empty'
+    ) {
+      const closed = await closeVerifiedEmptyExecutive(env, filing.docId, {
+        nowIso,
+        respectSuppression: true,
+        insertIfAbsent: true,
+        // Close only the review version we read: a retry-auto that bumps the
+        // revision must not let a stale empty parse close the freshly
+        // released row (same guard as the unreadable branch above).
+        reviewRevision: reviewSnapshot?.review_revision ?? null,
+      });
+      if (closed) {
+        return {
+          transactions: [],
+          minConfidence: 0,
+          needsReview: false,
+          published: false,
+          reviewReason: EXECUTIVE_EMPTY_RESOLUTION_REASON,
         };
       }
     }
@@ -533,12 +758,25 @@ export async function normalize(
           needsReview: false,
           published: false,
           reviewReason: 'deleted_rows_applied',
+          settled: true,
         };
       }
     }
     let reason = exceedsPublishLimit
       ? classifyRowLimitReason(flagged)
       : reviewReason(flagged, minConfidence, confThreshold);
+    if (handCheckRequired && flagged.length > 0) {
+      reason = mergeHandCheckIntoReviewReason(
+        reason,
+        handCheckReviewReason(filing, extractorName, source),
+      );
+    }
+    // A refused text layer that could not be closed still must not be labeled
+    // as an empty extract.  ocr_unusable is already a health terminal and an
+    // agreement hard-stop.
+    if (filing.chamber === 'executive' && meta?.parseDisposition === 'unreadable' && flagged.length === 0) {
+      reason = OGE_TEXT_UNREADABLE_REASON;
+    }
     // When every extracted row was form chrome (or empty after drop), tag the
     // park reason so ops/dashboard can tell OCR letterhead floods from real
     // low-confidence trades — and agreement can skip burning budget on them.
@@ -551,7 +789,12 @@ export async function normalize(
     // hundreds of fake rows for humans/agreement — empty extract_empty class
     // so local-vision pending can re-claim the stored raw copy.
     let reviewFlagged = flagged;
-    if (ocrUnusable && !exceedsPublishLimit) {
+    if (
+      ocrUnusable
+      && !isHouseGridFormExtractor(extractorName)
+      && !exceedsPublishLimit
+      && meta?.parseDisposition !== 'unreadable'
+    ) {
       // Keep dated, non-chrome rows (amendment letters with one real Treasury
       // line). Only wipe when nothing recoverable remains.
       const keepable = flagged.filter((f) =>
@@ -570,6 +813,17 @@ export async function normalize(
         );
       }
     }
+    if (rowsIncomplete && rowCompleteness) {
+      const rest = reason && reason !== 'needs_review' ? `,${reason}` : '';
+      reason = `${OGE_ROWS_INCOMPLETE_REASON}${rest}`;
+      console.warn(
+        `normalize: ${filing.docId} holds ${parsed.length} parsed rows but the source numbers ${rowCompleteness.expectedRows} `
+          + `(${rowCompleteness.missingCount} missing, evidence=${rowCompleteness.evidence}); held for review`,
+      );
+    }
+    if (visionDegenerateAssessment?.degenerate) {
+      reason = mergeVisionDegenerateReason(reason);
+    }
     const routed = await routeToReview(
       env,
       filing,
@@ -583,8 +837,15 @@ export async function normalize(
           exceedsPublishLimit
           || (flagged.length === 0 && droppedFormChrome > 0)
           || ocrUnusable
+          || (filing.chamber === 'executive' && meta?.parseDisposition === 'unreadable')
+          || handCheckRequired
+          || rowsIncomplete
+          || visionDegenerateAssessment?.degenerate
             ? reason
             : undefined,
+        payloadExtras: visionDegenerateAssessment?.degenerate
+          ? { visionDegenerate: visionDegenerateAssessment }
+          : undefined,
       },
       reviewSnapshot,
     );
@@ -620,6 +881,7 @@ export async function normalize(
       needsReview: !closed,
       published: false,
       reviewReason: deletedFlagged.length > 0 ? 'deleted_rows_applied' : 'amendment_already_persisted',
+      settled: closed,
     };
   }
 
@@ -675,6 +937,8 @@ function buildTransaction(
   rowIndex: number,
   sourceOverride?: TxSource,
   nameIndex?: NameIndex,
+  ocrExtraWords?: ReadonlySet<string>,
+  houseMember: HouseMemberContext = { identity: null },
 ): FlaggedTx {
   const placeholders = new Set(['NONE', '--', 'N/A', 'NA', 'NULL', '—']);
   const prepared = prepareExtractedTx(p);
@@ -694,27 +958,49 @@ function buildTransaction(
   // the web surfaces as the "Notes" column.
   const assetDetail = splitAssetNameDetail(rawAssetName, rawTicker);
   const cleanedAssetName = assetDetail.name;
+  // Confident OCR fixes apply to the stored name with an audit note; the
+  // scoring below holds rows whose garble has no confident fix.
+  const ocr = normalizeOcrAssetName(cleanedAssetName, { extraKnownWords: ocrExtraWords });
+  // The split above lifts shape-only maturity suffixes ("Due 02/30/2026")
+  // into the cleaning note before the scan, so an impossible maturity date
+  // would escape the guard and publish in the user-visible Notes column
+  // while the admin path (which scans the raw string) 400s the same row.
+  // Merge date holds from the raw name too; dedupe tokens both scans see.
+  const rawDateHolds = normalizeEmbeddedOcrDates(rawAssetName ?? '').holdReasons.filter(
+    (reason) => !ocr.dateHolds.includes(reason),
+  );
+  const ocrResult: OcrNameResult = rawDateHolds.length > 0
+    ? { ...ocr, dateHolds: [...ocr.dateHolds, ...rawDateHolds] }
+    : ocr;
+  const ocrAssetName = ocrResult.name;
+  const ocrNote = ocrResult.notes.length > 0 ? `normalized OCR artifacts: ${ocrResult.notes.join('; ')}` : null;
   const s = scoreFields(
     p.confidence,
     {
       ticker: rawTicker,
-      assetName: cleanedAssetName,
+      // Score the OCR-repaired name so ticker resolution and the consistency
+      // checks see the canonical issuer, not the garble.
+      assetName: ocrAssetName,
       amountMin: p.amountMin,
       amountMax: p.amountMax,
       txType: p.txType,
       txDate: p.txDate,
       rawText: p.rawText,
+      gridTypeUnmarked: (p.extractionWarnings ?? []).includes('grid_type_unmarked'),
+      ownerUnread: (p.extractionWarnings ?? []).includes('owner_unread'),
     },
     filing.filedDate,
     resolve,
     nameIndex,
+    ocrExtraWords,
+    ocrResult,
   );
   // Models (and local_mac OCR) often leave assetType null even when the PTR
   // line says "Common Stock" or carries a House [ST] code. Infer before
   // category rollup so review UI + feed show ST instead of Unknown.
   const inferredType = inferHouseAssetTypeCode(p.assetType, {
     assetTypeName: p.assetTypeName,
-    assetName: cleanedAssetName,
+    assetName: ocrAssetName,
     rawText: p.rawText,
     isOption: p.isOption,
   });
@@ -728,11 +1014,13 @@ function buildTransaction(
     null;
   const assetType = canonicalizeAssetType(resolvedAssetType, resolvedAssetTypeName, {
     isOption: p.isOption,
-    assetName: cleanedAssetName,
+    assetName: ocrAssetName,
     rawText: p.rawText,
   });
 
   const txSource = sourceOverride ?? (p as { source?: TxSource }).source ?? 'primary';
+
+  let publishConfidence = s.confidence;
 
   const tx: Transaction = {
     id: uuid(),
@@ -740,7 +1028,7 @@ function buildTransaction(
     filerId: filing.filerId,
     txDate: p.txDate,
     owner: normalizeOwner(p.owner),
-    assetName: cleanedAssetName || s.ticker || '(unknown)',
+    assetName: ocrAssetName || s.ticker || '(unknown)',
     ticker: s.ticker,
     assetType: resolvedAssetType,
     assetTypeName: resolvedAssetTypeName,
@@ -757,7 +1045,7 @@ function buildTransaction(
     location: p.location ?? null,
     description: p.description ?? null,
     supplementalText: p.supplementalText ?? null,
-    confidence: s.confidence,
+    confidence: publishConfidence,
     source: txSource,
     rowKey: transactionRowKey(txSource, rowIndex, {
       ...p,
@@ -769,19 +1057,36 @@ function buildTransaction(
     firstSeenAt: filing.firstSeenAt,
     filedDate: filing.filedDate,
     createdAt: nowIso,
-    cleaningNote: assetDetail.note,
+    cleaningNote: [assetDetail.note, ocrNote].filter(Boolean).join('; ') || null,
     // cursor_seq is assigned by the DB trigger on insert.
     cursorSeq: 0,
   };
 
-  return {
-    tx,
-    flags: [
-      ...s.flags,
-      ...(p.extractionWarnings ?? []).filter((flag) =>
-        flag === 'unreadable_is_option' || flag === 'unreadable_cap_gains'),
-    ],
-  };
+  let flags = [
+    ...s.flags,
+    ...(p.extractionWarnings ?? []).filter((flag) =>
+      flag === 'unreadable_is_option'
+        || flag === 'unreadable_cap_gains'
+        || flag === 'suspected_constant_tx_type'
+        || flag === 'owner_unread'),
+  ];
+  const publishedOwner = normalizeOwner(p.owner);
+  if (
+    houseMember.identity
+    && suppressAssetOcrHoldForMemberBleed(ocrAssetName, publishedOwner, houseMember.identity.disclosedName)
+    && flags.includes('ocr_name_hold')
+  ) {
+    flags = flags.filter((flag) => flag !== 'ocr_name_hold');
+    if (s.flags.includes('ocr_name_hold')) {
+      publishConfidence = clamp01(publishConfidence / PENALTY_OCR_HOLD);
+      tx.confidence = publishConfidence;
+    }
+  }
+  if (houseMember.identity && houseMemberNameMismatch(houseMember.identity)) {
+    flags.push('ocr_name_hold');
+  }
+
+  return { tx, flags };
 }
 
 /** Result of applying the shared validation rubric to one row's fields. */
@@ -816,10 +1121,16 @@ export function scoreFields(
     txType: string | null;
     txDate: string | null;
     rawText?: string | null;
+    /** Grid form found no single type mark. Do not invent B/S/E. */
+    gridTypeUnmarked?: boolean;
+    /** Grid or scan could not read the owner cell (not a confident blank). */
+    ownerUnread?: boolean;
   },
   filedDate: string | null,
   resolve: TickerResolver,
   nameIndex?: NameIndex,
+  ocrExtraWords?: ReadonlySet<string>,
+  precomputedOcr?: OcrNameResult,
 ): ScoredFields {
   const flags: string[] = [];
   let confidence = clamp01(base);
@@ -828,7 +1139,8 @@ export function scoreFields(
   if (
     !assetName ||
     /^(?:\(?unknown\)?|n\/?a|none|null|-|unreadable)$/i.test(assetName) ||
-    looksLikeHeaderContaminatedAsset(assetName)
+    looksLikeHeaderContaminatedAsset(assetName) ||
+    junkAssetNameReason(assetName) !== null
   ) {
     flags.push('bad_asset_name');
     confidence *= PENALTY_BAD_ASSET_NAME;
@@ -885,6 +1197,13 @@ export function scoreFields(
   // structured brackets (review-queue flood class, 2026-08-10).
   let amountMin = fields.amountMin;
   let amountMax = fields.amountMax;
+  // "$1,000 - $15,000" style off-by-one lower bounds snap to the canonical
+  // bracket ($1,001) before any other check; see canonicalizeAmountBounds.
+  const canonicalAmount = canonicalizeAmountBounds(amountMin, amountMax);
+  if (canonicalAmount?.changed) {
+    amountMin = canonicalAmount.min;
+    amountMax = canonicalAmount.max;
+  }
 
   if (amountMin === null || amountMin === undefined) {
     flags.push('no_amount');
@@ -920,6 +1239,11 @@ export function scoreFields(
     if (b) {
       amountMin = b.min;
       amountMax = b.max;
+    } else {
+      // No bracket contains the pair (e.g. 1,000 - 20,000 straddles two).
+      // Publishing the raw pair would put a non-canonical amount on the feed.
+      flags.push('invalid_amount');
+      confidence *= PENALTY_INVALID_BRACKET;
     }
   } else {
     flags.push('invalid_amount');
@@ -927,28 +1251,68 @@ export function scoreFields(
   }
 
   // --- tx_type must be B / S / E (Purchase/P/buy → B) ----------------------
+  // A grid row with no x in the type columns is flagged and left untyped.
+  // Other bad labels still fall back to B, which is the historical rubric.
   let txType = (canonicalizeTxType(fields.txType) ?? fields.txType) as TxType;
-  if (!isTxType(txType)) {
+  if (fields.gridTypeUnmarked) {
+    flags.push('grid_type_unmarked');
+    confidence *= PENALTY_BAD_TX_TYPE;
+    txType = '' as TxType;
+  } else if (!isTxType(txType)) {
     flags.push('bad_tx_type');
     confidence *= PENALTY_BAD_TX_TYPE;
     txType = 'B';
   }
 
   // --- tx_date sanity -------------------------------------------------------
-  // Hard-fail only dates that have not happened yet.  A PTR can list a trade
-  // a few days after Clerk's filed_date (signature stamp vs transaction
-  // box) — Pete Sessions H-2025-20033330 signed 2025-10-22 with a 10/24/2025
-  // purchase.  Parking that as future_tx_date hid a real disclosed lot.
-  const today = new Date().toISOString().slice(0, 10);
+  // Shared strict check: impossible, future, and far-too-old dates are hard
+  // failures (held for review, never published).  A trade after the filing
+  // date stays soft (tx_after_filed_date penalty only): the tested rule
+  // publishes after-filed trades, since a PTR can list a trade after Clerk's
+  // filed_date (signature stamp vs transaction box) — Pete Sessions
+  // H-2025-20033330 signed 2025-10-22 with a 10/24/2025 purchase, and parking
+  // that as future_tx_date hid a real disclosed lot.
   if (!fields.txDate) {
     flags.push('missing_tx_date');
     confidence *= PENALTY_MISSING_TX_DATE;
-  } else if (fields.txDate > today) {
-    flags.push('future_tx_date');
-    confidence *= PENALTY_FUTURE_TX_DATE;
-  } else if (filedDate && fields.txDate > filedDate) {
-    flags.push('tx_after_filed_date');
-    confidence *= PENALTY_FUTURE_TX_DATE;
+  } else {
+    const dateCheck = validateTxDate(fields.txDate, { filedDate });
+    if (dateCheck.ok === false) {
+      if (dateCheck.code === 'future_tx_date') {
+        flags.push('future_tx_date');
+        confidence *= PENALTY_FUTURE_TX_DATE;
+      } else if (dateCheck.code === 'bad_tx_date') {
+        flags.push('bad_tx_date');
+        confidence *= PENALTY_BAD_TX_DATE;
+      } else if (dateCheck.code === 'tx_date_after_filing_window') {
+        flags.push('tx_date_after_filing_window');
+        confidence *= PENALTY_BAD_TX_DATE;
+      } else {
+        flags.push('tx_date_too_old');
+        confidence *= PENALTY_BAD_TX_DATE;
+      }
+    } else if (filedDate && fields.txDate > filedDate) {
+      flags.push('tx_after_filed_date');
+      confidence *= PENALTY_FUTURE_TX_DATE;
+    }
+  }
+
+  // --- OCR sanity on the asset name -----------------------------------------
+  // Confident fixes are applied by the caller (buildTransaction); unfixable
+  // garble is a hard failure so the row is held, never published.  Reference
+  // names from securities_ref feed word-level evidence only.  buildTransaction
+  // passes its already-computed result so the scan runs once per row.
+  const ocr = precomputedOcr ?? normalizeOcrAssetName(assetName, { extraKnownWords: ocrExtraWords });
+  if (ocr.dateHolds.length > 0) {
+    flags.push('ocr_date_hold');
+    confidence *= PENALTY_OCR_HOLD;
+  }
+  if (ocr.nameHolds.length > 0) {
+    flags.push('ocr_name_hold');
+    confidence *= PENALTY_OCR_HOLD;
+  }
+  if (fields.ownerUnread) {
+    confidence *= 0.92;
   }
 
   return { confidence: clamp01(confidence), flags, ticker, amountMin, amountMax, txType };
@@ -1009,7 +1373,10 @@ export async function loadResolver(env: Env): Promise<TickerResolver> {
     return resolverCache.resolver;
   }
   const secRows = await all<SecRow>(env.DB, 'SELECT ticker, name, aliases FROM securities_master');
-  const resolver = buildResolver(secRows);
+  // securities_ref carries the enriched, current company names (94%+ of tickered
+  // trades resolve to one); it is what lets a no-ticker description resolve by issuer name.
+  const issuerIndex = await loadIssuerNameIndex(env);
+  const resolver = buildResolver(secRows, issuerIndex);
   resolverCache = { loadedAt: now, resolver };
   return resolver;
 }
@@ -1019,10 +1386,14 @@ export async function loadResolver(env: Env): Promise<TickerResolver> {
  *   1. exact ticker symbol match (case-insensitive),
  *   2. exact alias match (alias JSON array, case-insensitive),
  *   3. exact security name match (case-insensitive).
+ *   4. (no ticker supplied only) unique issuer-name match through the
+ *      legal-form/descriptor-stripped index in enrichment/nameTickerBackfill.ts
+ *      — "Uber Technologies Inc. CMN" -> UBER (board row 16b46688).
  * Returns the canonical ticker, or null when nothing matches.
  */
-function buildResolver(rows: SecRow[]): TickerResolver {
+export function buildResolver(rows: SecRow[], issuerIndex?: IssuerNameIndex): TickerResolver {
   const byTicker = new Map<string, string>();
+  const issuerNames = issuerIndex ?? emptyIssuerNameIndex();
   const byAlias = new Map<string, string>();
   const byName = new Map<string, string>();
   const bySimplifiedName = new Map<string, string>();
@@ -1032,6 +1403,7 @@ function buildResolver(rows: SecRow[]): TickerResolver {
     if (!canonical) continue;
     byTicker.set(canonical, canonical);
     if (r.name) {
+      addIssuerName(issuerNames, canonical, r.name);
       byName.set(r.name.trim().toLowerCase(), canonical);
       const simplified = simplifyCompanyName(r.name);
       if (simplified && !bySimplifiedName.has(simplified)) {
@@ -1069,6 +1441,13 @@ function buildResolver(rows: SecRow[]): TickerResolver {
     if (simplifiedName && bySimplifiedName.has(simplifiedName)) return bySimplifiedName.get(simplifiedName)!;
     if (name && byAlias.has(name)) return byAlias.get(name)!;
     if (name && byName.has(name)) return byName.get(name)!;
+    // No ticker supplied: resolve the description by issuer name.  Only ever when
+    // there is NO ticker input — a row that carries its own (even unlisted)
+    // symbol keeps the deterministic path below and is never re-pointed by name.
+    if (!t) {
+      const byIssuer = resolveTickerByIssuerName(issuerNames, assetName);
+      if (byIssuer) return byIssuer;
+    }
     // Also try the raw ticker as an alias (sometimes asset name lands in ticker).
     const tl = t.toLowerCase();
     if (tl && byAlias.has(tl)) return byAlias.get(tl)!;
@@ -1137,16 +1516,6 @@ export async function loadNameIndex(env: Env): Promise<NameIndex> {
   return index;
 }
 
-/**
- * True when two simplified company names plausibly refer to the same issuer.
- * Exact match or substring containment either direction (tolerates partial
- * historical forms, e.g. "apple computer" vs "apple").
- */
-function namesPlausiblyMatch(a: string, b: string): boolean {
-  if (!a || !b) return true; // nothing to compare against is not evidence of mismatch
-  return a === b || a.includes(b) || b.includes(a);
-}
-
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -1177,8 +1546,12 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
   json_extract(value, '$.cleaningNote')
   FROM json_each(?)`;
 
+function isStoredTxType(txType: string | null | undefined): txType is TxType {
+  return txType === 'B' || txType === 'S' || txType === 'E';
+}
+
 function transactionInsertJson(transactions: Transaction[]): string {
-  return JSON.stringify(transactions.map((tx) => ({
+  return JSON.stringify(transactions.filter((tx) => isStoredTxType(tx.txType)).map((tx) => ({
     id: tx.id,
     docId: tx.docId,
     filerId: tx.filerId,
@@ -1253,6 +1626,13 @@ async function persistNormalizedPublish(
       `refusing to publish ${transactions.length} transactions; limit is ${MAX_PUBLISH_TRANSACTIONS_PER_FILING}`,
     );
   }
+
+  const pipelineMatch = await proposedMatchesLivePipeline(env.DB, docId, transactions);
+  const skipRevisionBump = pipelineMatch.identical;
+  const reviewRevisionSql = skipRevisionBump
+    ? 'review_revision = review_revision'
+    : 'review_revision = review_revision + 1';
+
   const insertRowsJson = transactionInsertJson(transactions);
   const rowKeysJson = JSON.stringify(transactions.map((tx) => tx.rowKey ?? ''));
   const incomingSource = transactions[0]?.source ?? 'primary';
@@ -1376,7 +1756,7 @@ async function persistNormalizedPublish(
                 agreement_suppression_reason = NULL,
                 resolution_kind = 'published',
                 resolution_reason = 'auto_published',
-                review_revision = review_revision + 1
+                ${reviewRevisionSql}
           WHERE doc_id = ? AND resolved = 1 AND review_revision = ?
             AND ${exactLiveSet}`,
         [
@@ -1396,7 +1776,7 @@ async function persistNormalizedPublish(
                 resolution_kind = 'published',
                 resolution_reason = 'auto_published',
                 resolved_at = CURRENT_TIMESTAMP,
-                review_revision = review_revision + 1
+                ${reviewRevisionSql}
           WHERE doc_id = ? AND resolved = 0 AND review_revision = ?
             AND ${exactLiveSet}`,
         [
@@ -1507,8 +1887,32 @@ async function persistNormalizedPublish(
     }
     throw err;
   }
-  if ((results[transitionIndex]?.meta?.changes ?? 0) === 0) {
-    return { published: false, insertedIds: [] };
+  const transitionChanges = results[transitionIndex]?.meta?.changes ?? 0;
+  if (skipRevisionBump) {
+    await recordReviewRevisionAudit(env.DB, {
+      docId,
+      revision: review?.review_revision ?? 1,
+      trigger: 'pipeline_publish_identical_noop',
+      contentHash: pipelineMatch.contentHash,
+      detail: {
+        extractor: metadata.extractor,
+        modelVersion: metadata.modelVersion,
+        resolved: review?.resolved ?? null,
+        transitionChanges,
+      },
+      createdAt: nowIso,
+    });
+  }
+  if (transitionChanges === 0) {
+    const existingIds = skipRevisionBump
+      ? (await all<{ id: string }>(
+        env.DB,
+        `SELECT id FROM transactions
+          WHERE doc_id = ? AND source IN (${PIPELINE_TX_SOURCES_SQL}) AND deprecated_at IS NULL`,
+        [docId],
+      )).map((row) => row.id)
+      : [];
+    return { published: false, insertedIds: existingIds };
   }
 
   const insertedCount = results[0]?.meta?.changes ?? 0;
@@ -1570,10 +1974,40 @@ async function routeToReview(
     extractor: string | null;
     modelVersion: string | null;
     reasonOverride?: string;
+    payloadExtras?: Record<string, unknown>;
   },
   review: ReviewSnapshot | null,
 ): Promise<boolean> {
   const reason = meta.reasonOverride ?? reviewReason(flagged, minConfidence);
+  // A zero-row pass has nothing new to stage. When the existing review holds
+  // staged candidates only in its payload (a terminal close was refused for
+  // exactly that reason), rewriting the payload with an empty candidate list
+  // would let a later zero-row pass close the filing verified-empty and lose
+  // them. Leave the row untouched instead.
+  if (flagged.length === 0 && review && review.resolved !== 1) {
+    try {
+      const staged = JSON.parse(review.payload ?? '{}') as {
+        transactionCount?: unknown;
+        localOcr?: unknown;
+      };
+      // A payload with a localOcr section records a local OCR attempt and the
+      // rows it could not reconcile (CT-2448).  Preserve it for the same
+      // reason staged candidates are preserved: a later zero-row pass must
+      // not erase what the scan actually found.
+      if (
+        (typeof staged.transactionCount === 'number' && staged.transactionCount > 0)
+        || staged.localOcr
+      ) {
+        console.warn(
+          'routeToReview: zero-row pass preserves staged payload candidates:',
+          filing.docId,
+        );
+        return true;
+      }
+    } catch {
+      // Unparseable payload: fall through and rewrite as usual.
+    }
+  }
   const truncated = flagged.length > MAX_PUBLISH_TRANSACTIONS_PER_FILING;
   const payload = JSON.stringify({
     minConfidence,
@@ -1583,7 +2017,12 @@ async function routeToReview(
     truncated,
     transactions: flagged
       .slice(0, MAX_PUBLISH_TRANSACTIONS_PER_FILING)
-      .map((f) => ({ ...f.tx, flags: f.flags })),
+      .map((f) => {
+        const row: Record<string, unknown> = { ...f.tx, flags: f.flags };
+        if (f.flags.includes('grid_type_unmarked')) row.txType = null;
+        return row;
+      }),
+    ...(meta.payloadExtras ?? {}),
   });
   const decisionPayload = JSON.stringify({
     minConfidence,
@@ -1641,16 +2080,18 @@ async function routeToReview(
       ],
     ],
   ]);
-  const entered = (results[0]?.meta?.changes ?? 0) > 0;
-  if (entered && !review) {
+  const queueTouched = (results[0]?.meta?.changes ?? 0) > 0;
+  const handCheckWake = reason.includes(NEEDS_HAND_CHECK_MAC_VISION)
+    || reason.includes(NEEDS_HAND_CHECK_SCANNED_VISION);
+  if (queueTouched && (!review || handCheckWake)) {
     void notifyReviewQueuePublisher(env, {
       docId: filing.docId,
       reason,
-      kind: 'insert',
+      kind: review ? 'reopen' : 'insert',
       at: nowIso,
     });
   }
-  return entered;
+  return queueTouched;
 }
 
 function isAmendedFilingStatus(status: string | null | undefined): boolean {
@@ -1726,7 +2167,7 @@ async function deprecateDeletedMatches(
   return changes;
 }
 
-async function resolveVerifiedEmpty(
+export async function resolveVerifiedEmpty(
   env: Env,
   filing: Filing,
   nowIso: string,

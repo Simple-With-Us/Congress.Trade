@@ -172,9 +172,17 @@ export const EXECUTIVE_TITLE_MAX_LENGTH: number = Object.values(EXECUTIVE_TITLES
  * filers), and {@link DEFAULT_EXECUTIVE_TITLE} for an `EXEC-*` id with no
  * curated entry.
  */
-export function executiveTitleFor(filerId: string | null | undefined): string | null {
+export function executiveTitleFor(
+  filerId: string | null | undefined,
+  chamber?: string | null,
+): string | null {
   if (!filerId) return null;
-  if (!filerId.startsWith('EXEC-')) return null;
+  if (!filerId.startsWith('EXEC-')) {
+    // A non-EXEC id (a competitor-minted MANUAL-* official) that is filed under
+    // chamber='executive' still shows a position — never the bare word
+    // "Executive".  Only the truthful fallback here: no title is guessed.
+    return chamber === 'executive' ? DEFAULT_EXECUTIVE_TITLE : null;
+  }
   return EXECUTIVE_TITLES[filerId] ?? DEFAULT_EXECUTIVE_TITLE;
 }
 

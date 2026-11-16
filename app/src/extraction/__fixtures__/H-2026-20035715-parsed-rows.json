@@ -1,0 +1,28 @@
+[
+  {
+    "assetName": "AIX Ventures Fund II, LP (GLAS Funds, LP)",
+    "ticker": null,
+    "assetType": "HN",
+    "txDate": "2026-10-01",
+    "txType": "S",
+    "owner": "self",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "filingStatus": "New",
+    "subholding": "2012 Trust",
+    "description": "Distribution of $6,923.58"
+  },
+  {
+    "assetName": "Mercato Partners Traverse IV QP, LP (GLAS Funds, LP)",
+    "ticker": null,
+    "assetType": "HN",
+    "txDate": "2026-09-30",
+    "txType": "S",
+    "owner": "self",
+    "amountMin": 1001,
+    "amountMax": 15000,
+    "filingStatus": "New",
+    "subholding": "2012 Trust",
+    "description": "Distribution of $2,375.01"
+  }
+]

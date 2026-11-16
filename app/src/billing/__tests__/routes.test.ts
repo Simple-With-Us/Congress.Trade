@@ -67,9 +67,42 @@ function compareOrder(a: SubscriptionEventState, b: SubscriptionEventState): num
   return a.created - b.created || a.priority - b.priority || a.eventId.localeCompare(b.eventId);
 }
 
+/** Minimal `apple_subscriptions` row (migration 0081) for the IAP ledger seed. */
+interface AppleRow {
+  user_id: string | null;
+  status: string;
+  plan: string;
+  expires_date: string | null;
+  auto_renew_status: number | null;
+  original_transaction_id: string;
+  product_id: string;
+  environment: string | null;
+  latest_transaction_id: string | null;
+  purchase_date: string | null;
+  auto_renew_product_id: string | null;
+  revoked_at: string | null;
+  revocation_reason: number | null;
+  last_notification_type: string | null;
+  last_notification_subtype: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function appleRow(over: Partial<AppleRow> = {}): AppleRow {
+  return {
+    user_id: 'u1', status: 'active', plan: 'monthly', expires_date: null, auto_renew_status: 1,
+    original_transaction_id: 'ot_1', product_id: 'trade.congress.premium.monthly', environment: 'Production',
+    latest_transaction_id: 't_1', purchase_date: null, auto_renew_product_id: null, revoked_at: null,
+    revocation_reason: null, last_notification_type: null, last_notification_subtype: null,
+    created_at: 'now', updated_at: 'now',
+    ...over,
+  };
+}
+
 function fakeEnv(
   over: Record<string, unknown> = {},
   seed: URow[] = [],
+  appleSeed: AppleRow[] = [],
 ): {
   env: Env;
   rows: Map<string, URow>;
@@ -110,6 +143,18 @@ function fakeEnv(
           }
           if (/SELECT \* FROM users WHERE id/i.test(sql)) {
             return ((rows.get(this._p[0] as string) ?? null) as unknown) as T | null;
+          }
+          // activeAppleSubscriptionForUser (billing/appleSubscriptions.ts) — the
+          // second OR term resolveEntitlementAsync consults for Apple-purchased
+          // Premium. Mirrors that query's own status/expiry predicate.
+          if (/FROM apple_subscriptions[\s\S]*WHERE user_id/i.test(sql)) {
+            const [userId, nowIso] = this._p as [string, string];
+            const r = appleSeed.find((x) => (
+              x.user_id === userId
+              && (x.status === 'active' || x.status === 'grace_period')
+              && (x.expires_date === null || x.expires_date > nowIso)
+            ));
+            return ((r ?? null) as unknown) as T | null;
           }
           if (/FROM stripe_subscription_event_state WHERE subscription_id/i.test(sql)) {
             const state = subscriptionEvents.get(this._p[0] as string);
@@ -401,6 +446,90 @@ describe('billing router', () => {
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: 'checkout not configured' });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // --- duplicate-subscription guard (POST /checkout) -----------------------
+  // Stripe opens a SECOND subscription on a customer that already has one, so
+  // every path that reaches the pricing modal while Premium (/pricing,
+  // ?pricing=1, the footer link, the PDF redirect) was a double-billing hole —
+  // and an Apple IAP subscriber buying here would be charged by both stores.
+  describe('POST /checkout duplicate-subscription guard', () => {
+    function checkoutUser(over: Partial<URow> = {}): URow {
+      return {
+        id: 'u1', stripe_customer_id: 'cus_1', subscription_status: null, plan: null,
+        stripe_subscription_id: null, current_period_end: null, cancel_at_period_end: 0, trial_end: null,
+        email: 'u1@x.com', name: null, picture: null, google_sub: null, email_verified: 1,
+        created_at: 'now', last_login_at: null,
+        ...over,
+      };
+    }
+    const sessionKv = {
+      get: async (key: string) => key === 'sess:session-token' ? JSON.stringify({ userId: 'u1' }) : null,
+      put: async () => {},
+      delete: async () => {},
+    };
+    async function postCheckout(seed: URow, appleSeed: AppleRow[] = []): Promise<Response> {
+      const { env } = fakeEnv({ ...BILLING_READY, CONFIG_KV: sessionKv }, [seed], appleSeed);
+      return buildBillingRouter().request('http://localhost/checkout', {
+        method: 'POST',
+        body: JSON.stringify({ plan: 'monthly' }),
+        headers: {
+          cookie: 'ct_session=session-token',
+          'content-type': 'application/json',
+          'Idempotency-Key': 'checkout-guard-1',
+        },
+      }, env);
+    }
+
+    for (const status of ['active', 'trialing'] as const) {
+      it(`refuses a second Stripe checkout while ${status} (409, no Stripe call)`, async () => {
+        const fetchSpy = vi.fn();
+        vi.stubGlobal('fetch', fetchSpy);
+        const res = await postCheckout(checkoutUser({ subscription_status: status, plan: 'monthly' }));
+        expect(res.status).toBe(409);
+        expect(await res.json()).toMatchObject({ error: 'already_subscribed', source: 'stripe', status });
+        expect(fetchSpy).not.toHaveBeenCalled();
+      });
+    }
+
+    it('refuses a Stripe checkout for an Apple IAP subscriber (409, source apple)', async () => {
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+      // Stripe columns empty — Premium comes only from the apple_subscriptions
+      // ledger, which is exactly the cross-store double-billing case.
+      const res = await postCheckout(checkoutUser(), [appleRow()]);
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: 'already_subscribed', source: 'apple' });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('refuses a second checkout while past_due, where the subscription is live but lapsed', async () => {
+      const fetchSpy = vi.fn();
+      vi.stubGlobal('fetch', fetchSpy);
+      const res = await postCheckout(checkoutUser({
+        subscription_status: 'past_due', plan: 'monthly', stripe_subscription_id: 'sub_1',
+      }));
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: 'already_subscribed', status: 'past_due' });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    // The guard must not strand a lapsed user: these statuses are terminal or
+    // never-started, so re-subscribing is legitimate and has to keep working.
+    for (const status of ['canceled', 'incomplete_expired', 'incomplete'] as const) {
+      it(`still allows a fresh checkout after ${status}`, async () => {
+        vi.stubGlobal('fetch', async () => Response.json({ id: 'cs_1', url: 'https://stripe.test/checkout' }));
+        const res = await postCheckout(checkoutUser({ subscription_status: status, plan: 'monthly' }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ url: 'https://stripe.test/checkout' });
+      });
+    }
+
+    it('still allows a checkout when an Apple subscription has expired', async () => {
+      vi.stubGlobal('fetch', async () => Response.json({ id: 'cs_1', url: 'https://stripe.test/checkout' }));
+      const res = await postCheckout(checkoutUser(), [appleRow({ status: 'expired' })]);
+      expect(res.status).toBe(200);
+    });
   });
 
   it('scopes deterministic Stripe idempotency keys to the user and checkout request', async () => {

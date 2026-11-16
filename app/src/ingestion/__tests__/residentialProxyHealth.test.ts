@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { probeResidentialProxyHealth } from '../residentialProxyHealth.ts';
+import {
+  probeResidentialProxyHealth,
+  RESIDENTIAL_PROXY_PROBE_TARGET_URL,
+} from '../residentialProxyHealth.ts';
 
 describe('probeResidentialProxyHealth', () => {
   it('returns unconfigured when no proxy URL is given', async () => {
@@ -8,23 +11,35 @@ describe('probeResidentialProxyHealth', () => {
     expect(result.reachable).toBe(false);
   });
 
-  it('returns reachable true when proxy responds with 200 JSON', async () => {
+  it('tunnels a GET to the probe target through the proxy (never GET {proxy}/health)', async () => {
     const mockFetch = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({ ok: true, service: 'residential-proxy', uptime: 42 }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
+      new Response('<html>OK</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+    );
+
+    const proxyUrl = 'http://100.113.106.39:3128';
+    const result = await probeResidentialProxyHealth(proxyUrl, mockFetch);
+    expect(result.configured).toBe(true);
+    expect(result.reachable).toBe(true);
+    expect(result.status).toBe(200);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const requestedUrl = String(mockFetch.mock.calls[0][0]);
+    expect(requestedUrl).toBe(RESIDENTIAL_PROXY_PROBE_TARGET_URL);
+    expect(requestedUrl).not.toContain('/health');
+    expect(requestedUrl).not.toContain(proxyUrl);
+  });
+
+  it('treats a sub-500 HTTP status from the tunneled request as reachable (proxy spoke)', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response('Not Found', { status: 404 }),
     );
 
     const result = await probeResidentialProxyHealth('http://100.113.106.39:3128', mockFetch);
     expect(result.configured).toBe(true);
     expect(result.reachable).toBe(true);
-    expect(result.service).toBe('residential-proxy');
-    expect(result.uptime).toBe(42);
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(404);
   });
 
-  it('returns reachable false when proxy returns 502', async () => {
+  it('treats a proxy-generated 502 as unreachable (a 5xx means the tunnel failed)', async () => {
     const mockFetch = vi.fn().mockResolvedValue(
       new Response('Bad Gateway', { status: 502 }),
     );
@@ -33,6 +48,7 @@ describe('probeResidentialProxyHealth', () => {
     expect(result.configured).toBe(true);
     expect(result.reachable).toBe(false);
     expect(result.status).toBe(502);
+    expect(result.error).toBe('HTTP 502');
   });
 
   it('handles network error / timeout gracefully', async () => {

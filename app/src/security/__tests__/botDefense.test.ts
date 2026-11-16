@@ -9,6 +9,7 @@ import {
   DAILY_ROW_BUDGET,
   PUBLIC_API_LIMIT,
 } from '../botDefense.ts';
+import { TCP_PEER_HEADER } from '../originLock.ts';
 
 /** Map-backed KV fake so rate-limit counters actually count. */
 function fakeKv() {
@@ -105,7 +106,7 @@ describe('publicApiGuard', () => {
   it('429s an IP past the request budget with Retry-After', async () => {
     const app = guardedApp();
     const env = { SCRAPE_GUARD_ENABLED: 'true', CONFIG_KV: fakeKv() } as never;
-    const headers = { 'user-agent': CHROME_UA, 'cf-connecting-ip': '203.0.113.9' };
+    const headers = { 'user-agent': CHROME_UA, 'cf-connecting-ip': '203.0.113.9', [TCP_PEER_HEADER]: '104.16.1.2' };
     let last: Response | null = null;
     for (let i = 0; i < PUBLIC_API_LIMIT + 1; i++) {
       last = await app.request('http://localhost/api/transactions', { headers }, env);

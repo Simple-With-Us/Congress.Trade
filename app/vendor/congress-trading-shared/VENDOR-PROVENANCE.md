@@ -1,20 +1,26 @@
 # congress-trading-shared provenance
 
-- Upstream: `https://github.com/jaywedgeworth22/congress-trading-shared`
-- Immutable release: `v2.6.0`
-- Commit: `f139d831d852c041cc9f3e87705da7a0b463c3d7`
-- Imported: `2026-08-24`
+- Upstream: `https://github.com/Simple-With-Us/congress-trading-shared`
+- Immutable release: `v2.9.0`
+- Commit: `72febd0475f16de125f1cba93cda9bc09d686862`
+- Imported: `2026-10-23`
 - Imported paths: `src/`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, and `LICENSE`
-- Local source modifications: synced with upstream v2.5.2 (sub-$1,001 STOCK_ACT_BRACKETS tier, TxType B/S/E coercion, IsoDateTimeSchema, TradeEventRowSchema, AnalystRowSchema.asOfTimestamp upstreamed).
+- Docs refresh (2026-10-23): `AGENTS.md` copied from upstream `main` at `9c254844b8e6e8ab8a439e75542a8fbf7bb70340` (#402, the one-rule sentence-gap text).  Upstream `main` differs from `v2.9.0` only in `AGENTS.md`, so `src/` and the imported paths above still match the `v2.9.0` release and the pin check is unchanged.
+- Docs refresh (2026-10-27): `AGENTS.md` coordination stanza edited in place, without regenerating the vendor tree, so the vendored copy carries the canonical fleet shape (`~/apps/FLEET-PROTOCOL.md`, `simple-chat`, `simple-board`, `#Work-In-Progress` work topics named `<ID> <subject>`).  Upstream `main` carries the same canonical shape in its own `AGENTS.md` at a later commit; this is a local wording change to the vendored copy only, and `src/` and the imported paths are untouched, so the pin check is unchanged.
+- Docs-only hand-sync (2026-11-13, AFC-786): `AGENTS.md` coordination, peer-request, fleet-header, sentence-gap and verified-seat text follows the reviewed [CTS PR #422](https://github.com/Simple-With-Us/congress-trading-shared/pull/422) source at `642451281a4922d708f1a9ac048eb94c6377911d`, including the [November 11 peer-request ruling](https://simplewithus.zulipchat.com/#narrow/near/639610865) and the current owner-directed header and three-pane sentence-gap rules.  That reviewed head subsequently merged to upstream main as `d8345a5602eec5532ab7f2d93098212398dcbb24`; this row records the original hand-sync provenance.  The immutable `v2.9.0` source release, commit, imported paths, approved source drift and Deno import-map resolution below remain unchanged.
+- Docs refresh (2026-11-13, AFC-786): `AGENTS.md` refreshed from actual merged upstream main `d3798608734a8c9028b4fcd1d377fbf440fd9adb` ([CTS PR #423](https://github.com/Simple-With-Us/congress-trading-shared/pull/423)).  The only local difference from that upstream file is the Always Tagged commit-prefix clarification below.  The immutable `v2.9.0` release, imported source/package paths, approved drift and Deno import-map resolution remain unchanged.
+- Local source modifications: exactly `APPROVED-DRIFT.patch`, retained from the previous vendor tree, plus the `AGENTS.md` docs refresh recorded above.  The drift patch was regenerated against v2.9.0 with identical +/- content (only hunk offsets and blob ids moved).  The reviewed patch extends `TxSourceSchema` with the ingestion sources `competitor_backfill`, `local_mac`, and `server_cpu`, preserves disclosure/enrichment fields on transaction reads, and includes their schema regression tests. The vendor pin check compares the actual source delta against that patch; the source is not byte-identical to upstream. Earlier drift (sub-$1,001 STOCK_ACT_BRACKETS tier, TxType B/S/E coercion, IsoDateTimeSchema, TradeEventRowSchema, AnalystRowSchema.asOfTimestamp) was upstreamed.  New in this bump (v2.7.1 → v2.8.1): the usage telemetry v2 `ai` block (`src/aiUsage.ts`, UM-1592; 2.8.0) and the `buildAiUsage` explicit-`undefined` tokens fix (2.8.1); the `zod` peer/dev range moves to `^4.6.2` (2.8.0).  New in this bump (v2.8.1 → v2.9.0): optional `schemaVersion` on `SharePayloadSchema` plus its helpers (ST-3853).  The `infisicalSettings` module stays vendored for source parity only — the Deno runtime uses `app/src/secrets/infisical.ts`.
 
-Congress.Trade's Deno import map resolves the package to `src/index.ts`; the
-checked-in `dist/` and root compatibility files are older, unused build
-artifacts and are intentionally outside this source provenance declaration.
+Local documentation clarification (2026-11-13, AFC-786): the root and vendored Always Tagged bullets distinguish the seat/session/repository commit prefix from optional recipient routing and platform mentions.  This clarification adds no identity assignment or runtime behavior and leaves the source release, imported paths and approved drift unchanged.
+
+Congress.Trade's Deno import map resolves the package to `src/index.ts`.
+Upstream dropped the built `dist/` and root compatibility files before v2.8.1;
+this bump removes them from the vendor tree accordingly.
 
 ## Pin plan (issue #1462)
 
 `shared-package-pin-check.yml` verifies the vendored `src/` matches the
-**claimed** tag in `package.json` (`v2.5.2` today).  It does not flag "behind
+**claimed** tag in `package.json` (`v2.9.0` today).  It does not flag "behind
 latest" — a vendor bump is a deliberate act, not an automatic chase.
 
 Current truth vs the 2026-08-06 drift report (vendored v2.0.0 vs shared v2.5.1):
@@ -29,6 +35,6 @@ Current truth vs the 2026-08-06 drift report (vendored v2.0.0 vs shared v2.5.1):
 | ISO-8601 UTC helpers (#247), Apache 2.0 (#254) | In the vendored tree. |
 | Shared CI / Dependabot / effort-log churn | Not CT-relevant. |
 
-Next bump: when shared tags past v2.5.2, copy `src/` + `package.json` +
+Next bump: when shared tags past v2.9.0, copy `src/` + `package.json` +
 `CHANGELOG.md` + `LICENSE`, refresh this file, and keep the pin-check as
 "matches claimed tag".  Do not promote pin-check to "must equal latest".

@@ -63,7 +63,8 @@ function parsedTx(): ParsedTx {
   };
 }
 
-function fakeDb() {
+function fakeDb(opts: { reviewResolved?: number | null } = {}) {
+  const { reviewResolved = null } = opts;
   return {
     prepare(sql: string) {
       return {
@@ -82,6 +83,9 @@ function fakeDb() {
           return { results: [] as T[] };
         },
         async first<T>() {
+          if (/SELECT resolved FROM review_queue/i.test(sql)) {
+            return (reviewResolved === null ? null : { resolved: reviewResolved }) as T | null;
+          }
           return null as T | null;
         },
         async run() {
@@ -133,6 +137,157 @@ describe('admin /reprocess hard failures', () => {
     expect(body.filingsPromoted).toBe(0);
     expect(body.rowsPromoted).toBe(0);
     expect(body.filingsStillInReview).toBe(1);
+    expect(mocks.normalize).not.toHaveBeenCalled();
+  });
+
+  it('routes an executive zero-row read with a parse disposition through normalize', async () => {
+    mocks.extractParsed.mockResolvedValue({
+      filing: {
+        ...filing(),
+        docId: 'E-2026-empty-278e',
+        chamber: 'executive',
+        docKind: 'text_pdf',
+        extractor: 'ogeText',
+      },
+      transactions: [],
+      extractor: 'ogeText',
+      modelVersion: null,
+      raw: 'OGE Form 278e 7. Transactions 8. Liabilities',
+      parseDisposition: 'empty',
+    });
+    // A successful terminal close: normalize() returns needsReview:false.
+    mocks.normalize.mockResolvedValue({
+      transactions: [], minConfidence: 0, needsReview: false, published: false,
+    });
+
+    const res = await app.request(
+      '/reprocess',
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ chamber: 'executive', limit: 1 }),
+      },
+      { ADMIN_TOKEN: 'admin-secret', DB: fakeDb({ reviewResolved: 1 }) } as unknown as Env,
+    );
+
+    expect(res.status).toBe(200);
+    // A settled zero-row read is a success: not counted skippedNoExtract, no
+    // "no extract" error, and ok reflects the clean pass.
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.settledZeroRow).toBe(1);
+    expect(body.skippedNoExtract).toBe(0);
+    expect(body.errors).toEqual([]);
+    expect(mocks.normalize).toHaveBeenCalledTimes(1);
+    const [, normalizeFiling, normalizeRows, normalizeMeta] = mocks.normalize.mock.calls[0] as unknown[];
+    expect(normalizeFiling).toMatchObject({ docId: 'E-2026-empty-278e', chamber: 'executive' });
+    expect(normalizeRows).toEqual([]);
+    expect(normalizeMeta).toMatchObject({
+      extractor: 'ogeText',
+      parseDisposition: 'empty',
+      sourceText: 'OGE Form 278e 7. Transactions 8. Liabilities',
+    });
+  });
+
+  it('counts a refused zero-row close as still in review, not settled', async () => {
+    mocks.extractParsed.mockResolvedValue({
+      filing: {
+        ...filing(),
+        docId: 'E-2026-staged-278e',
+        chamber: 'executive',
+        docKind: 'text_pdf',
+        extractor: 'ogeText',
+      },
+      transactions: [],
+      extractor: 'ogeText',
+      modelVersion: null,
+      raw: 'OGE Form 278e 7. Transactions Apple Inc 8. Liabilities',
+      parseDisposition: 'empty',
+    });
+    // The terminal close is refused and the candidates are staged for review
+    // instead: normalize() returns needsReview:true without throwing.
+    mocks.normalize.mockResolvedValue({
+      transactions: [], minConfidence: 0, needsReview: true, published: false,
+    });
+
+    const res = await app.request(
+      '/reprocess',
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ chamber: 'executive', limit: 1 }),
+      },
+      { ADMIN_TOKEN: 'admin-secret', DB: fakeDb() } as unknown as Env,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.settledZeroRow).toBe(0);
+    expect(body.filingsStillInReview).toBe(1);
+    expect(body.skippedNoExtract).toBe(0);
+    expect(body.errors).toEqual([]);
+  });
+
+  it('counts a both-CAS-lost zero-row read as still in review, not settled', async () => {
+    mocks.extractParsed.mockResolvedValue({
+      filing: {
+        ...filing(),
+        docId: 'E-2026-raced-278e',
+        chamber: 'executive',
+        docKind: 'text_pdf',
+        extractor: 'ogeText',
+      },
+      transactions: [],
+      extractor: 'ogeText',
+      modelVersion: null,
+      raw: 'OGE Form 278e 7. Transactions 8. Liabilities',
+      parseDisposition: 'empty',
+    });
+    // A concurrent revision made BOTH the close and the routeToReview CAS
+    // lose: normalize() returns needsReview:false without settling anything.
+    mocks.normalize.mockResolvedValue({
+      transactions: [], minConfidence: 0, needsReview: false, published: false,
+    });
+
+    const res = await app.request(
+      '/reprocess',
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ chamber: 'executive', limit: 1 }),
+      },
+      { ADMIN_TOKEN: 'admin-secret', DB: fakeDb({ reviewResolved: 0 }) } as unknown as Env,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    // The resolution re-read shows the row is still open: not settled.
+    expect(body.settledZeroRow).toBe(0);
+    expect(body.filingsStillInReview).toBe(1);
+    expect(body.skippedNoExtract).toBe(0);
+    expect(body.errors).toEqual([]);
+  });
+
+  it('does not normalize a zero-row read without a parse disposition (or on dryRun)', async () => {
+    mocks.extractParsed.mockResolvedValue({
+      filing: filing(),
+      transactions: [],
+      extractor: 'visionLlm',
+      modelVersion: 'test-model',
+      raw: '',
+    });
+
+    const res = await app.request(
+      '/reprocess',
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bearer admin-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ chamber: 'house', limit: 1 }),
+      },
+      { ADMIN_TOKEN: 'admin-secret', DB: fakeDb() } as unknown as Env,
+    );
+    expect(res.status).toBe(200);
     expect(mocks.normalize).not.toHaveBeenCalled();
   });
 

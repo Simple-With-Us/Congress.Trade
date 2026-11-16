@@ -8,7 +8,8 @@ struct DeliveryView: View {
     @State private var deliveryMode: DeliveryMode = .sse
     @State private var webhookURL = ""
     @State private var filterChambers: Set<ChamberFilter> = []
-    @State private var membersText = ""
+    @State private var selectedMembers: [MemberDirectoryEntry] = []
+    @State private var showMemberPicker = false
     @State private var showSubscribe = false
     @State private var showExportSheet = false
 
@@ -48,7 +49,7 @@ struct DeliveryView: View {
                     } header: {
                         Text("Premium")
                     } footer: {
-                        Text("CSV files export according to the filters set on the Trades tab.  Premium is $5/month or $50/year, with a 2-week free trial.")
+                        Text("CSV files export according to the filters set on the Trades tab.  Premium plans and any free trial are shown in the App Store purchase sheet.")
                     }
 
                     Section {
@@ -81,9 +82,9 @@ struct DeliveryView: View {
                             DeliveryMethodExplainer()
                                 .padding(.bottom, 2)
 
-                            Picker("Mode", selection: $deliveryMode) {
+                            Picker("Channel", selection: $deliveryMode) {
                                 ForEach(DeliveryMode.allCases) { mode in
-                                    Text(mode.rawValue).tag(mode)
+                                    Text(mode.label).tag(mode)
                                 }
                             }
                             .pickerStyle(.segmented)
@@ -97,7 +98,7 @@ struct DeliveryView: View {
                             }
 
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Chambers")
+                                Text("Branches")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 HStack(spacing: 8) {
@@ -115,15 +116,50 @@ struct DeliveryView: View {
                                         .accessibilityLabel(chamber.label)
                                     }
                                 }
-                                Text("No selection delivers all chambers.")
+                                Text("No selection includes every branch.")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
                             .padding(.vertical, 4)
 
-                            TextField("Members (comma separated, optional)", text: $membersText)
-                                .neverAutocapitalized()
-                                .autocorrectionDisabled()
+                            // Members are picked from the directory and sent as filer ids:
+                            // the server matches on ids, so typed names used to save a
+                            // subscription that could never deliver (board a6058af2).
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Members")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                if selectedMembers.isEmpty {
+                                    Text("No selection delivers every member.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    ForEach(selectedMembers) { member in
+                                        HStack {
+                                            Text(member.fullName ?? member.filerId)
+                                                .font(.subheadline)
+                                            Spacer()
+                                            Button {
+                                                selectedMembers.removeAll { $0.filerId == member.filerId }
+                                            } label: {
+                                                Image(systemName: "xmark.circle.fill")
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .accessibilityLabel("Remove \(member.fullName ?? member.filerId)")
+                                        }
+                                    }
+                                }
+                                Button {
+                                    showMemberPicker = true
+                                } label: {
+                                    Label(
+                                        selectedMembers.isEmpty ? "Choose Members" : "Add or Remove Members",
+                                        systemImage: "person.crop.circle.badge.plus"
+                                    )
+                                }
+                            }
+                            .padding(.vertical, 4)
 
                             Button {
                                 Task {
@@ -131,7 +167,7 @@ struct DeliveryView: View {
                                         mode: deliveryMode,
                                         webhookURL: webhookURL,
                                         chambers: filterChambers,
-                                        members: Self.parseMembers(membersText)
+                                        members: selectedMembers.map(\.filerId)
                                     )
                                 }
                             } label: {
@@ -223,6 +259,13 @@ struct DeliveryView: View {
                 PremiumSheet()
                     .environmentObject(store)
             }
+            .sheet(isPresented: $showMemberPicker) {
+                DeliveryMemberPicker(selection: $selectedMembers)
+                    .environmentObject(store)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                    .iPadFullWidthSheet()
+            }
             .sheet(isPresented: $showExportSheet) {
                 ExportCSVSheet()
                     .environmentObject(store)
@@ -241,12 +284,108 @@ struct DeliveryView: View {
         }
     }
 
-    /// Members are free-text names (not symbols), so no uppercasing.
-    private static func parseMembers(_ text: String) -> [String] {
-        text
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+
+/// Multi-select member picker for a delivery's `members` filter, built on the
+/// People directory (`store.members`, `MemberDirectorySearch`).  Selecting a row
+/// keeps the directory entry so the create call sends its `filerId` — the id the
+/// backend matches trades against.
+struct DeliveryMemberPicker: View {
+    @Binding var selection: [MemberDirectoryEntry]
+    @EnvironmentObject private var store: CongressTradeStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    /// Same cap as the server (`validateSubscriptionFilters`: at most 50 members).
+    static let maxMembers = 50
+
+    private var visibleMembers: [MemberDirectoryEntry] {
+        let matching = store.members.filter { MemberDirectorySearch.matches($0, query: query) }
+        return MemberDirectorySearch.sort(matching, key: .name, ascending: true)
+    }
+
+    private var selectedIDs: Set<String> { Set(selection.map(\.filerId)) }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if store.isLoadingMembers && store.members.isEmpty {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Loading members…").foregroundStyle(.secondary)
+                    }
+                } else if let notice = store.membersNotice, store.members.isEmpty {
+                    NoticeView(message: notice)
+                } else if visibleMembers.isEmpty {
+                    Text("No members match \"\(query)\".").foregroundStyle(.secondary)
+                }
+                ForEach(visibleMembers) { member in
+                    let isSelected = selectedIDs.contains(member.filerId)
+                    Button {
+                        toggle(member)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(member.fullName ?? member.filerId)
+                                    .foregroundStyle(.primary)
+                                let detail = Self.detail(for: member)
+                                if !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if isSelected {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(AppTheme.wordInk)
+                            }
+                        }
+                    }
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+            }
+            .searchable(text: $query, prompt: "Search members")
+            .navigationTitle("Members")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: AppToolbarPlacement.trailing) {
+                    Button("Done") { dismiss() }
+                        .fontWeight(.bold)
+                        .foregroundStyle(AppTheme.wordInk)
+                        .tint(AppTheme.wordInk)
+                }
+            }
+            .task { await store.loadMembersDirectory() }
+        }
+    }
+
+    private func toggle(_ member: MemberDirectoryEntry) {
+        if let index = selection.firstIndex(where: { $0.filerId == member.filerId }) {
+            selection.remove(at: index)
+        } else if selection.count < Self.maxMembers {
+            selection.append(member)
+        }
+    }
+
+    private static func detail(for member: MemberDirectoryEntry) -> String {
+        [member.chamber?.capitalized, member.state, member.party]
+            .compactMap { $0 }
             .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+}
+
+private extension Subscription {
+    var deliveryTitle: String {
+        switch delivery.lowercased() {
+        case "sse":
+            return "Live Stream"
+        case "webhook":
+            return "Webhook"
+        default:
+            return delivery
+        }
     }
 }
 
@@ -257,8 +396,12 @@ struct DeliveryView: View {
 struct DeliveryMethodExplainer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Webhooks: POST new filings to your URL (HMAC signed).")
-            Text("SSE: Live stream over an open connection.")
+            // One POST per transaction, not per filing — a filing with several
+            // trades sends several requests (`app/src/delivery/webhook.ts`
+            // sets X-Tx-Id per POST).  "New filings" read as one-per-filing and
+            // sent integrators dedupe on the wrong key.
+            Text("Webhooks: we send each new trade to your URL, signed.")
+            Text("Live stream: new trades arrive over an open connection.")
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -274,13 +417,19 @@ struct SubscriptionRow: View {
     var body: some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(subscription.delivery.uppercased())
+                Text(subscription.deliveryTitle)
                     .font(.headline)
-                Text(subscription.targetUrl ?? subscription.streamUrl ?? "SSE stream")
+                Text(subscription.targetUrl ?? subscription.streamUrl ?? "Live stream")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                Text("Cursor \(subscription.cursor)")
+                if let members = subscription.memberSummary {
+                    Text(members)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+                Text(subscription.cursor > 0 ? "Caught up through #\(subscription.cursor)" : "Waiting for the first trade")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(.secondary)
             }

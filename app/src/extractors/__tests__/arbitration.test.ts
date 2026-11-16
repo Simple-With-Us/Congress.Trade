@@ -2,9 +2,13 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   ArbitratingExtractor,
   arbitrationRowKey,
+  arbitrationRowKeyAliases,
   buildExtractorPipeline,
+  canonicalArbitrationKeys,
   fieldAgreement,
   HousePdfExtractor,
+  legacyArbitrationRowKey,
+  migrateArbitrationRowKey,
   OgePdfExtractor,
   mergeResults,
   type Extractor,
@@ -69,13 +73,83 @@ function extractor(name: string, out: ExtractorResult): Extractor {
 }
 
 describe('arbitrationRowKey', () => {
-  it('keys on ticker + date + type, uppercased', () => {
-    expect(arbitrationRowKey(tx({ ticker: 'aapl' }))).toBe('AAPL|2026-01-02|B');
+  it('keys on ticker + date + type + owner, uppercased', () => {
+    expect(arbitrationRowKey(tx({ ticker: 'aapl', owner: 'self' }))).toBe('AAPL|2026-01-02|B|SELF');
+    expect(arbitrationRowKey(tx({ ticker: 'aapl', owner: 'spouse' }))).toBe('AAPL|2026-01-02|B|SPOUSE');
+  });
+  it('keeps same-day lots for different owners distinct', () => {
+    const spouse = arbitrationRowKey(tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11' }));
+    const dependent = arbitrationRowKey(tx({ ticker: 'COO', owner: 'dependent', txDate: '2026-09-11' }));
+    expect(spouse).not.toBe(dependent);
+    expect(spouse).toBe('COO|2026-09-11|B|SPOUSE');
+    expect(dependent).toBe('COO|2026-09-11|B|DEPENDENT');
   });
   it('falls back to asset name when no ticker', () => {
-    expect(arbitrationRowKey(tx({ ticker: null, assetName: 'US T-Bill' }))).toBe(
-      'US T-BILL|2026-01-02|B',
+    expect(arbitrationRowKey(tx({ ticker: null, assetName: 'US T-Bill', owner: 'joint' }))).toBe(
+      'US T-BILL|2026-01-02|B|JOINT',
     );
+  });
+  it('omits owner when it is missing so the historical 3-part key is unchanged', () => {
+    expect(arbitrationRowKey(tx({ owner: null }))).toBe('AAPL|2026-01-02|B');
+    expect(legacyArbitrationRowKey(tx({ owner: 'spouse' }))).toBe('AAPL|2026-01-02|B');
+    expect(arbitrationRowKey(tx({ owner: 'not-a-person' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B');
+  });
+  it('normalizes raw owner codes before appending them', () => {
+    expect(arbitrationRowKey(tx({ owner: ' SP ' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(arbitrationRowKey(tx({ owner: 'child' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B|DEPENDENT');
+    expect(arbitrationRowKey(tx({ owner: 'jt' as ParsedTx['owner'] }))).toBe('AAPL|2026-01-02|B|JOINT');
+  });
+  it('migrates a stored 3-part key when owner is known and leaves a current key alone', () => {
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B', 'spouse')).toBe('AAPL|2026-01-02|B|SPOUSE');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B', null)).toBe('AAPL|2026-01-02|B');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B', 'nope')).toBe('AAPL|2026-01-02|B');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B|SELF', 'spouse')).toBe('AAPL|2026-01-02|B|SELF');
+    expect(migrateArbitrationRowKey('AAPL|2026-01-02|B|SELF#2', null)).toBe('AAPL|2026-01-02|B|SELF');
+  });
+  it('lists the current key and the historical alias', () => {
+    expect(arbitrationRowKeyAliases(tx({ owner: 'self' }))).toEqual([
+      'AAPL|2026-01-02|B|SELF',
+      'AAPL|2026-01-02|B',
+    ]);
+    expect(arbitrationRowKeyAliases(tx({ owner: null }))).toEqual(['AAPL|2026-01-02|B']);
+  });
+  it('keeps a single lot on the historical key even when owners disagree or one side omitted owner', () => {
+    const [left, right] = canonicalArbitrationKeys([
+      [tx({ owner: 'self' })],
+      [tx({ owner: 'spouse' })],
+    ]);
+    expect(left).toEqual(['AAPL|2026-01-02|B']);
+    expect(right).toEqual(['AAPL|2026-01-02|B']);
+
+    const [withOwner, missing] = canonicalArbitrationKeys([
+      [tx({ owner: 'spouse' })],
+      [tx({ owner: null })],
+    ]);
+    expect(withOwner).toEqual(['AAPL|2026-01-02|B']);
+    expect(missing).toEqual(['AAPL|2026-01-02|B']);
+  });
+  it('splits a read that contains two owners and does not guess which lot a bare key is', () => {
+    const spouse = tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11' });
+    const dependent = tx({ ticker: 'COO', owner: 'dependent', txDate: '2026-09-11' });
+    const bare = tx({ ticker: 'COO', owner: null, txDate: '2026-09-11' });
+    const [split, other, unmatched] = canonicalArbitrationKeys([
+      [spouse, dependent],
+      [spouse, dependent],
+      [bare],
+    ]);
+    expect(split).toEqual(['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|DEPENDENT']);
+    expect(other).toEqual(split);
+    expect(unmatched).toEqual(['COO|2026-09-11|B']);
+  });
+  it('upgrades a bare key when the prefix has exactly one known owner', () => {
+    const spouse = tx({ ticker: 'COO', owner: 'spouse', txDate: '2026-09-11' });
+    const bare = tx({ ticker: 'COO', owner: null, txDate: '2026-09-11' });
+    const [qualified, upgraded] = canonicalArbitrationKeys([
+      [spouse, bare],
+      [spouse],
+    ]);
+    expect(qualified).toEqual(['COO|2026-09-11|B|SPOUSE', 'COO|2026-09-11|B|SPOUSE']);
+    expect(upgraded).toEqual(['COO|2026-09-11|B|SPOUSE']);
   });
 });
 
@@ -124,6 +198,31 @@ describe('mergeResults', () => {
     // ...but the secondary-only row drags doc confidence below the row confidence.
     expect(merged.confidence).toBeLessThan(merged.transactions[0].confidence);
     expect(merged.raw).toContain('secondaryOnly=1');
+  });
+
+  it('does not let a spouse lot corroborate a dependent lot that shares ticker, date, and type', () => {
+    const primary = result([
+      tx({ ticker: 'COO', owner: 'spouse', confidence: 0.8, txDate: '2026-09-11' }),
+      tx({ ticker: 'COO', owner: 'dependent', confidence: 0.8, txDate: '2026-09-11' }),
+    ]);
+    const secondary = result([
+      tx({ ticker: 'COO', owner: 'dependent', confidence: 0.8, txDate: '2026-09-11' }),
+      tx({ ticker: 'COO', owner: 'spouse', confidence: 0.8, txDate: '2026-09-11' }),
+    ]);
+    const merged = mergeResults(primary, secondary);
+    expect(merged.transactions).toHaveLength(2);
+    expect(merged.transactions.map((row) => row.owner)).toEqual(['spouse', 'dependent']);
+    expect(merged.transactions[0].confidence).toBeCloseTo(0.9, 5);
+    expect(merged.transactions[1].confidence).toBeCloseTo(0.9, 5);
+    expect(merged.raw).toContain('secondaryOnly=0');
+  });
+
+  it('exposes the per-side only counts so downstream empty checks see a contested empty', () => {
+    const merged = mergeResults(result([]), result([tx({ ticker: 'TSLA' })]));
+    expect(merged.transactions).toHaveLength(0);
+    expect(merged.arbitrationCounts).toEqual({ primaryOnly: 0, secondaryOnly: 1 });
+    const agreed = mergeResults(result([]), result([]));
+    expect(agreed.arbitrationCounts).toEqual({ primaryOnly: 0, secondaryOnly: 0 });
   });
 
   it('retains usage and provider request identity for every arbitrated model call', () => {
@@ -429,6 +528,123 @@ describe('OgePdfExtractor', () => {
     await expect(ogePdf.extract({ filing: execText() })).rejects.toThrow('ogeText: no bytes provided');
   });
 
+  it('does not charge vision when a scanned 278e text layer says Part 7 is None', async () => {
+    const bondi = [
+      'OGE Form 278e',
+      '7. Transactions',
+      'None',
+      '8. Liabilities',
+      'None',
+    ].join('\n');
+    const ogeText = extractor('ogeText', result([], { extractor: 'ogeText', raw: bondi }));
+    const visionExtract = vi.fn(async () => result([tx({ ticker: 'XOM' })], { extractor: 'vision' }));
+    const vision = { name: 'vision', canHandle: () => true, extract: visionExtract };
+    const ogePdf = new OgePdfExtractor(ogeText, vision);
+
+    const out = await ogePdf.extract({ filing: execScan() });
+
+    expect(out.extractor).toBe('ogeText');
+    expect(out.transactions).toHaveLength(0);
+    expect(out.raw).toContain('7. Transactions');
+    expect(visionExtract).not.toHaveBeenCalled();
+  });
+
+  it('keeps a refused typed executive PDF on the unreadable disposition and does not spend vision', async () => {
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'unreadable',
+    }));
+    const vision = {
+      name: 'vision',
+      canHandle: () => true,
+      extract: async () => {
+        throw new Error('vision must not run for a refused typed 278-T');
+      },
+    };
+    const ogePdf = new OgePdfExtractor(ogeText, vision);
+    const out = await ogePdf.extract({ filing: execText() });
+    expect(out.parseDisposition).toBe('unreadable');
+    expect(out.transactions).toHaveLength(0);
+  });
+
+  it('keeps a refused scan unreadable when vision also returns nothing', async () => {
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'unreadable',
+    }));
+    const vision = extractor('vision', result([], { extractor: 'vision' }));
+    const ogePdf = new OgePdfExtractor(ogeText, vision);
+    const out = await ogePdf.extract({ filing: execScan() });
+    expect(out.parseDisposition).toBe('unreadable');
+    expect(out.transactions).toHaveLength(0);
+  });
+
+  it('does not restore the empty/unreadable terminal when the arbitrated secondary vision read saw rows', async () => {
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'unreadable',
+    }));
+    // Primary vision finds nothing; the arbitration secondary finds a row.
+    // mergeResults keeps the merged array empty (primary-authoritative) but
+    // marks the doc contested for human review.
+    const primary = extractor('vision-primary', result([], { extractor: 'vision-primary' }));
+    const secondary = extractor('vision-secondary', result([tx({ ticker: 'XOM' })], { extractor: 'vision-secondary' }));
+    const arbitrating = new ArbitratingExtractor(
+      primary,
+      { ARBITRATION_ENABLED: 'true' } as unknown as Env,
+      secondary,
+    );
+    const ogePdf = new OgePdfExtractor(ogeText, arbitrating);
+
+    const out = await ogePdf.extract({ filing: execScan() });
+
+    // The terminal unreadable label must not bury the contested doc.
+    expect(out.parseDisposition).toBeUndefined();
+    expect(out.transactions).toHaveLength(0);
+    expect(out.raw).toContain('secondaryOnly=1');
+  });
+
+  it('restores the terminal state when every arbitrated vision read found nothing', async () => {
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'unreadable',
+    }));
+    const primary = extractor('vision-primary', result([], { extractor: 'vision-primary' }));
+    const secondary = extractor('vision-secondary', result([], { extractor: 'vision-secondary' }));
+    const arbitrating = new ArbitratingExtractor(
+      primary,
+      { ARBITRATION_ENABLED: 'true' } as unknown as Env,
+      secondary,
+    );
+    const ogePdf = new OgePdfExtractor(ogeText, arbitrating);
+
+    const out = await ogePdf.extract({ filing: execScan() });
+
+    expect(out.parseDisposition).toBe('unreadable');
+    expect(out.transactions).toHaveLength(0);
+    expect(out.arbitrationCounts).toEqual({ primaryOnly: 0, secondaryOnly: 0 });
+  });
+
+  it('does not restore the empty terminal on an honest-empty 278e when the arbitrated secondary saw rows', async () => {
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'empty',
+    }));
+    const primary = extractor('vision-primary', result([], { extractor: 'vision-primary' }));
+    const secondary = extractor('vision-secondary', result([tx({ ticker: 'MSFT' })], { extractor: 'vision-secondary' }));
+    const arbitrating = new ArbitratingExtractor(
+      primary,
+      { ARBITRATION_ENABLED: 'true' } as unknown as Env,
+      secondary,
+    );
+    const ogePdf = new OgePdfExtractor(ogeText, arbitrating);
+
+    const out = await ogePdf.extract({ filing: execScan() });
+
+    expect(out.parseDisposition).toBeUndefined();
+    expect(out.raw).toContain('secondaryOnly=1');
+  });
+
   it('does not charge vision for typed executive PDFs that parse to zero rows', async () => {
     const ogeText = extractor('ogeText', result([], { extractor: 'ogeText', raw: 'none' }));
     const vision = {
@@ -444,6 +660,56 @@ describe('OgePdfExtractor', () => {
 
     expect(out.extractor).toBe('ogeText');
     expect(out.transactions).toHaveLength(0);
+  });
+
+  it('strips the terminal disposition when vision never confirmed the read (fail-soft)', async () => {
+    // A garbled scan whose vision fallback throws must not reach normalize()
+    // carrying 'unreadable': rejection requires a successful zero-row vision
+    // read, and this one never happened.
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'unreadable',
+      raw: 'garbled scan text',
+    }));
+    const vision = {
+      name: 'vision',
+      canHandle: () => true,
+      extract: async () => {
+        throw new Error('OPENROUTER_API_KEY is not configured');
+      },
+    };
+    const ogePdf = new OgePdfExtractor(ogeText, vision);
+
+    const out = await ogePdf.extract({ filing: execScan() });
+
+    expect(out.parseDisposition).toBeUndefined();
+    expect(out.transactions).toHaveLength(0);
+    expect(out.raw).toContain('ogePdf vision fail-soft');
+  });
+
+  it('keeps a positively-read empty disposition through vision fail-soft', async () => {
+    // 'empty' is the text layer's own positive evidence (a bounded, readable
+    // empty Part 7); unlike 'unreadable' it needs no vision confirmation, so
+    // the fail-soft must not wipe it.
+    const ogeText = extractor('ogeText', result([], {
+      extractor: 'ogeText',
+      parseDisposition: 'empty',
+      raw: 'OGE Form 278e Part 7. Transactions Part 8. Liabilities',
+    }));
+    const vision = {
+      name: 'vision',
+      canHandle: () => true,
+      extract: async () => {
+        throw new Error('OPENROUTER_API_KEY is not configured');
+      },
+    };
+    const ogePdf = new OgePdfExtractor(ogeText, vision);
+
+    const out = await ogePdf.extract({ filing: execScan() });
+
+    expect(out.parseDisposition).toBe('empty');
+    expect(out.transactions).toHaveLength(0);
+    expect(out.raw).toContain('ogePdf vision fail-soft');
   });
 
   it('rethrows budget/rate-limit IngestRetryError so the queue can back off', async () => {

@@ -15,11 +15,14 @@
  *   is flat and regular, so a dependency-free regex/scan parser is robust and
  *   avoids pulling in fast-xml-parser.
  *
- * LIVE SEARCH (intraday path):
+ * LIVE SEARCH (throttled intraday overlay, on by default every 30 min):
  *   The interactive UI at https://disclosures-clerk.house.gov/FinancialDisclosure
- *   is backed by a search endpoint that surfaces filings INTRADAY, before the
- *   yearly XML refreshes. pollHouseLiveSearch() uses that endpoint as a
- *   fail-soft overlay on top of the daily bulk XML path.
+ *   posts to /FinancialDisclosure/ViewMemberSearchResult, which returns a single
+ *   server-rendered Razor HTML table for the requested FilingYear (client-side
+ *   DataTables paginates the DOM in the browser; the server ignores draw/start/length).
+ *   pollHouseLiveSearch() runs as a fail-soft overlay throttled to once per 30
+ *   minutes so it stays active without competing with the 1-minute 8:00 AM
+ *   bulk-ZIP peak polls.
  *
  * FETCH ORDER: server-first.  Direct Clerk host, then Mac/scout
  * POST /fetch-house if HOUSE_RELAY_URL or INGEST_RELAY_URL is set and
@@ -337,30 +340,25 @@ export function parseHouseSearchHtml(html: string, defaultYear: string): HouseFi
 }
 
 /** Build the POST body for the House live member search. */
-export function buildHouseSearchBody(year: number | string, offset: number = 0, limit: number = 100): URLSearchParams {
+export function buildHouseSearchBody(year: number | string): URLSearchParams {
   const body = new URLSearchParams();
-  // Empty name => all members; FilingYear scopes to the requested year. The form
-  // exposes a few more fields (State/District) that we intentionally leave blank.
+  // Empty name => all members; FilingYear scopes to the requested year.  The
+  // Clerk's ViewMemberSearchResult Razor view only reads LastName, FilingYear,
+  // State, and District, and returns the entire year's HTML table in one response
+  // (client-side DataTables paginates the rendered DOM in the browser).
   body.set('LastName', '');
   body.set('FilingYear', String(year));
   body.set('State', '');
   body.set('District', '');
-  body.set('FilingType', 'P'); // Periodic
-  
-  // DataTables API pagination offset traversal
-  body.set('draw', '1');
-  body.set('start', String(offset));
-  body.set('length', String(limit));
-  
   return body;
 }
 
 /**
- * Poll the House live member search for same-day PTRs. Mirrors fetchHouseIndex's
+ * Poll the House live member search for same-day PTRs.  Mirrors fetchHouseIndex's
  * HouseFiling[] shape so the watcher can treat both sources uniformly.
  *
  * Establishes a session cookie via a GET to the search page, then POSTs the
- * form. Throws on transport/HTTP failure so the watcher's per-source guard can
+ * form.  Throws on transport/HTTP failure so the watcher's per-source guard can
  * fail soft (the bulk XML diff remains authoritative).
  */
 export interface PollHouseLiveSearchOptions {
@@ -383,13 +381,14 @@ export const PUBLIC_RESIDENTIAL_PROXY_RELAYS = [
 ];
 
 /**
- * Poll the House live member search for same-day PTRs. Mirrors fetchHouseIndex's
+ * Poll the House live member search for same-day PTRs.  Mirrors fetchHouseIndex's
  * HouseFiling[] shape so the watcher can treat both sources uniformly.
  *
  * Establishes a session cookie via a GET to the search page, then POSTs the
- * form. Retries up to 3 times per poll tick with rotated User-Agents and
- * zero-config public residential proxy fallbacks when direct fetch fails.
- * Does NOT lock out or disable subsequent ticks if a single poll tick fails.
+ * form once (ViewMemberSearchResult returns all rows for the requested year in
+ * a single unpaginated HTML table).  Retries up to 3 times per poll tick with
+ * rotated User-Agents and zero-config public proxy fallbacks when direct fetch
+ * fails.  Does NOT lock out or disable subsequent ticks if a single poll tick fails.
  */
 export async function pollHouseLiveSearch(
   year: number | string,
@@ -432,10 +431,6 @@ export async function pollHouseLiveSearch(
         accept: 'text/html,*/*',
       };
 
-      if (effectiveProxyUrl) {
-        customHeaders['x-residential-proxy-url'] = effectiveProxyUrl;
-      }
-
       // 1) GET landing page
       const landingTargetUrl = effectiveProxyUrl && effectiveProxyUrl.startsWith('http') && effectiveProxyUrl.includes('url=')
         ? `${effectiveProxyUrl}${encodeURIComponent(`${HOUSE_FD_BASE}/ViewSearch`)}`
@@ -452,7 +447,7 @@ export async function pollHouseLiveSearch(
         await delay(baseDelay * attempt, opts.signal);
       }
 
-      // 2) POST search form
+      // 2) POST search form (returns all rows for FilingYear in a single HTML response)
       const postHeaders: Record<string, string> = {
         ...BROWSER_HEADERS,
         'user-agent': userAgent,
@@ -464,55 +459,23 @@ export async function pollHouseLiveSearch(
         ...(jar.header() ? { cookie: jar.header() } : {}),
       };
 
-      if (effectiveProxyUrl) {
-        postHeaders['x-residential-proxy-url'] = effectiveProxyUrl;
-      }
-
       const postTargetUrl = effectiveProxyUrl && effectiveProxyUrl.startsWith('http') && effectiveProxyUrl.includes('url=')
         ? `${effectiveProxyUrl}${encodeURIComponent(HOUSE_SEARCH_RESULT)}`
         : HOUSE_SEARCH_RESULT;
 
-      let allFilings: HouseFiling[] = [];
-      const seenDocIds = new Set<string>();
-      let offset = 0;
-      const limit = 100;
-      
-      while (true) {
-        const res = await trackedFetch(postTargetUrl, {
-          method: 'POST',
-          headers: postHeaders,
-          body: buildHouseSearchBody(year, offset, limit).toString(),
-          signal: opts.signal,
-        }, { service: 'filing-discovery', operation: 'search-house-filings' }, fetchImpl);
+      const res = await trackedFetch(postTargetUrl, {
+        method: 'POST',
+        headers: postHeaders,
+        body: buildHouseSearchBody(year).toString(),
+        signal: opts.signal,
+      }, { service: 'filing-discovery', operation: 'search-house-filings' }, fetchImpl);
 
-        if (!res.ok) {
-          throw new Error(`house live search -> HTTP ${res.status}`);
-        }
-
-        const html = await res.text();
-        const pageFilings = parseHouseSearchHtml(html, String(year));
-        
-        let newItems = 0;
-        for (const f of pageFilings) {
-          if (!seenDocIds.has(f.docId)) {
-            seenDocIds.add(f.docId);
-            allFilings.push(f);
-            newItems++;
-          }
-        }
-        
-        // If the server ignores offset and returns the whole set, newItems will be 0 on the second iteration
-        if (newItems === 0 || pageFilings.length < limit) {
-          break;
-        }
-        
-        offset += limit;
-        if (baseDelay > 0) {
-          await delay(baseDelay, opts.signal);
-        }
+      if (!res.ok) {
+        throw new Error(`house live search -> HTTP ${res.status}`);
       }
-      
-      return allFilings;
+
+      const html = await res.text();
+      return parseHouseSearchHtml(html, String(year));
     } catch (err) {
       if (opts.signal?.aborted) throw err;
       lastError = err as Error;

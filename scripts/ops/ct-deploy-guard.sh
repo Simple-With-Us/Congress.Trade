@@ -58,6 +58,19 @@ NOTIFY_FILE="$STATE_DIR/last_notify"
 # hold for a full interval, so nothing would ever ship.
 SELF_GRACE_SEC="${SELF_GRACE_SEC:-600}"
 
+# Build a curl -K config for Pushover creds.  Values are escaped for curl's
+# quoted config syntax (backslash, then double quote); values with CR/LF are
+# rejected because they cannot be represented safely on one config line.
+pushover_curl_config() {
+  local t="${PUSHOVER_APP_TOKEN:-}" u="${PUSHOVER_USER_KEY:-}"
+  case "$t$u" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  t=${t//\\/\\\\}; t=${t//\"/\\\"}
+  u=${u//\\/\\\\}; u=${u//\"/\\\"}
+  printf 'form-string = "token=%s"\nform-string = "user=%s"\n' "$t" "$u"
+}
+
 log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
   command -v logger >/dev/null 2>&1 && logger -t "$LOG_TAG" -- "$*" || true
@@ -70,13 +83,18 @@ notify() {
   [[ -f "$NOTIFY_FILE" ]] && last=$(cat "$NOTIFY_FILE" 2>/dev/null || echo 0)
   [[ $(( $(now) - last )) -lt 3600 ]] && return 0
   now > "$NOTIFY_FILE"
+  local _po_cfg
+  if ! _po_cfg=$(pushover_curl_config); then
+    log "warn: pushover config rejected (token/user contains CR/LF); notify skipped"
+    return 0
+  fi
   curl -sS -m 15 -o /dev/null \
-    --form-string "token=${PUSHOVER_APP_TOKEN}" \
-    --form-string "user=${PUSHOVER_USER_KEY}" \
+    -K <(printf '%s\n' "$_po_cfg") \
     --form-string "title=congress.trade deploy guard" \
     --form-string "message=$1" \
     --form-string "priority=1" \
-    https://api.pushover.net/1/messages.json >/dev/null 2>&1 || true
+    https://api.pushover.net/1/messages.json >/dev/null 2>&1 \
+    || log "warn: pushover notify failed (curl exit $?; bad config or network)"
 }
 
 # --- single instance -------------------------------------------------------

@@ -1,5 +1,15 @@
 node_modules/
+**/node_modules/
 dist/
 .git/
 .dev.vars
 .env
+# Tests and docs never run in the image (CT-2459). Runtime file needs were
+# verified by grepping Deno.read*/readFileSync under src/: public/, src/,
+# migrations/, litestream.yml and the two entrypoint scripts only.
+# NOTE: *.vars is deliberately NOT ignored -- .prod.vars removal is
+# owner-gated (src/deno/main.ts fallback).
+**/*.test.ts
+**/__tests__/
+docs/
+coverage/

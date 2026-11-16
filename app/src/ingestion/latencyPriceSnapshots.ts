@@ -36,6 +36,7 @@ import {
   fetchPeerRealtimeQuotes,
   nearestBarAtOrAfter,
 } from '../prices/peerMarketData.ts';
+import { canCaptureMinutePricing } from '../prices/instrumentCapabilities.ts';
 
 export const LATENCY_PRICE_EVENTS = [
   'ct_publish',
@@ -101,6 +102,13 @@ const MAX_BACKFILL_ATTEMPTS = 5;
  */
 export type SnapshotConfidence = 'exact' | 'bracketed' | 'unbounded';
 
+/**
+ * Who supplied the timestamp, independent of precision (`confidence`).
+ *  - `observed` — we witnessed it (our publish clock, or a probe first-seen).
+ *  - `claimed`  — we only have the competitor's purported publish time.
+ */
+export type TimeProvenance = 'observed' | 'claimed';
+
 export function addMs(iso: string, ms: number): string {
   return new Date(Date.parse(iso) + ms).toISOString();
 }
@@ -114,6 +122,10 @@ interface MatchRow {
   provider_published_at: string | null;
   provider_window_start: string | null;
   provider_window_end: string | null;
+  is_option?: number | boolean | null;
+  asset_type?: string | null;
+  asset_type_name?: string | null;
+  asset_name?: string | null;
 }
 
 export interface SnapshotPlanEntry {
@@ -121,23 +133,39 @@ export interface SnapshotPlanEntry {
   dueAt: string;
   confidence: SnapshotConfidence;
   uncertaintySec: number | null;
+  timeProvenance: TimeProvenance;
 }
 
 export function snapshotPlan(row: MatchRow): SnapshotPlanEntry[] {
   const ticker = (row.ticker || '').trim().toUpperCase();
-  if (!ticker || ticker.length > 8) return [];
+  if (!canCaptureMinutePricing({
+    ticker,
+    isOption: row.is_option,
+    assetType: row.asset_type,
+    assetTypeName: row.asset_type_name,
+    assetName: row.asset_name,
+  })) return [];
   const out: SnapshotPlanEntry[] = [];
 
   if (row.congress_first_seen_at) {
-    // Our own publish clock — no bracketing question, always exact.
-    out.push({ event: 'ct_publish', dueAt: row.congress_first_seen_at, confidence: 'exact', uncertaintySec: 0 });
+    // Our own publish clock — no bracketing question, always exact + observed.
+    out.push({
+      event: 'ct_publish',
+      dueAt: row.congress_first_seen_at,
+      confidence: 'exact',
+      uncertaintySec: 0,
+      timeProvenance: 'observed',
+    });
   }
 
   const providerAt = row.provider_first_seen_at || row.provider_published_at;
   if (providerAt) {
     let confidence: SnapshotConfidence;
     let uncertaintySec: number | null;
-    
+    // Observed if we have a probe first-seen; claimed only when the
+    // competitor's purported stamp is the sole anchor.
+    const timeProvenance: TimeProvenance = row.provider_first_seen_at ? 'observed' : 'claimed';
+
     // Confidence is about how certain we are of the true publish time.
     // We use provider_first_seen_at (our observation) for the offsets.
     if (row.provider_window_start) {
@@ -149,16 +177,17 @@ export function snapshotPlan(row: MatchRow): SnapshotPlanEntry[] {
           ? Math.round((endMs - startMs) / 1000)
           : null;
     } else if (row.provider_published_at && providerAt === row.provider_published_at) {
-      // We only have the provider's claimed time, no observation bracket
+      // Point timestamp exists, but it is the competitor's claim unless we
+      // also observed it (handled by timeProvenance above).
       confidence = 'exact';
       uncertaintySec = 0;
     } else {
       confidence = 'unbounded';
       uncertaintySec = null;
     }
-    out.push({ event: 'provider_publish', dueAt: providerAt, confidence, uncertaintySec });
+    out.push({ event: 'provider_publish', dueAt: providerAt, confidence, uncertaintySec, timeProvenance });
     for (const event of FOLLOW_EVENTS) {
-      out.push({ event, dueAt: addMs(providerAt, FOLLOW_MS[event]), confidence, uncertaintySec });
+      out.push({ event, dueAt: addMs(providerAt, FOLLOW_MS[event]), confidence, uncertaintySec, timeProvenance });
     }
   }
 
@@ -185,7 +214,42 @@ export async function scheduleMissingLatencyPriceSnapshots(
     env.DB,
     `SELECT c.trade_hash, c.ticker, c.provider, c.congress_first_seen_at,
             c.provider_first_seen_at, c.provider_published_at,
-            c.provider_window_start, c.provider_window_end
+            c.provider_window_start, c.provider_window_end,
+            (
+              SELECT MAX(CASE WHEN t.is_option = 1 THEN 1 ELSE 0 END)
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+            ) AS is_option,
+            (
+              SELECT t.asset_type
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+               LIMIT 1
+            ) AS asset_type,
+            (
+              SELECT t.asset_type_name
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+               LIMIT 1
+            ) AS asset_type_name,
+            (
+              SELECT t.asset_name
+                FROM transactions t
+               WHERE t.deprecated_at IS NULL
+                 AND t.tx_date IS NOT NULL
+                 AND t.tx_date = c.tx_date
+                 AND UPPER(TRIM(COALESCE(t.ticker, ''))) = UPPER(TRIM(COALESCE(c.ticker, '')))
+               LIMIT 1
+            ) AS asset_name
        FROM trade_latency_candidates c
       WHERE c.status = 'matched'
         AND c.ticker IS NOT NULL
@@ -207,9 +271,9 @@ export async function scheduleMissingLatencyPriceSnapshots(
       await run(
         env.DB,
         `INSERT OR IGNORE INTO latency_price_snapshots
-           (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [row.trade_hash, ticker, row.provider, plan.event, plan.dueAt, createdAt, plan.confidence, plan.uncertaintySec],
+           (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec, time_provenance)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [row.trade_hash, ticker, row.provider, plan.event, plan.dueAt, createdAt, plan.confidence, plan.uncertaintySec, plan.timeProvenance],
       ).catch(() => {});
       scheduled++;
     }
@@ -225,16 +289,32 @@ export async function scheduleMissingLatencyPriceSnapshots(
  */
 export async function scheduleCtPublishSnapshot(
   env: Env,
-  row: { trade_hash: string; ticker: string | null; provider: string; congress_first_seen_at: string },
+  row: {
+    trade_hash: string;
+    ticker: string | null;
+    provider: string;
+    congress_first_seen_at: string;
+    isOption?: boolean | number | null;
+    assetType?: string | null;
+    assetTypeName?: string | null;
+    assetName?: string | null;
+  },
   createdAtIso: string,
 ): Promise<void> {
   const ticker = (row.ticker || '').trim().toUpperCase();
-  if (!ticker || ticker.length > 8 || !row.congress_first_seen_at) return;
+  if (!row.congress_first_seen_at) return;
+  if (!canCaptureMinutePricing({
+    ticker,
+    isOption: row.isOption,
+    assetType: row.assetType,
+    assetTypeName: row.assetTypeName,
+    assetName: row.assetName,
+  })) return;
   await run(
     env.DB,
     `INSERT OR IGNORE INTO latency_price_snapshots
-       (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec)
-     VALUES (?, ?, ?, 'ct_publish', ?, ?, 'exact', 0)`,
+       (trade_hash, ticker, provider, event, due_at, created_at, confidence, due_at_uncertainty_sec, time_provenance)
+     VALUES (?, ?, ?, 'ct_publish', ?, ?, 'exact', 0, 'observed')`,
     [row.trade_hash, ticker, row.provider, row.congress_first_seen_at, createdAtIso],
   ).catch(() => {});
 }

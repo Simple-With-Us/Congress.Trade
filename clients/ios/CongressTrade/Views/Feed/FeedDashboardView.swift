@@ -4,7 +4,13 @@ import UIKit
 
 struct FeedDashboardView: View {
     @EnvironmentObject private var store: CongressTradeStore
-    @Query private var cachedTrades: [ClientTrade]
+    // CT-2459: cursor-desc is the server's feed order — let SwiftData
+    // maintain it instead of starting every view sort from arbitrary order.
+    @Query(sort: \ClientTrade.cursor, order: .reverse) private var cachedTrades: [ClientTrade]
+    /// Memoized sort+filter output (CT-2459). Recomputed only when
+    /// `filterSignature` changes (see `.task(id:)` in body), not on every
+    /// body pass / unrelated store publish.
+    @State private var tradesSnapshot: [ClientTrade] = []
     @State private var searchText = ""
     @State private var filterTask: Task<Void, Never>?
     @State private var selectedTrade: ClientTrade?
@@ -61,7 +67,54 @@ struct FeedDashboardView: View {
         }
     }
 
-    var filteredTrades: [ClientTrade] {
+    /// Everything `computeFilteredTrades` reads, as one comparable token.
+    /// Built by concatenation in small steps — the single array literal
+    /// version timed out CI's Swift type checker (CT-2459).
+    private var filterSignature: String {
+        var sig = String(cachedTrades.count)
+        sig += "|" + (cachedTrades.first?.id ?? "")
+        sig += "|" + (cachedTrades.last?.id ?? "")
+        sig += "|" + searchText
+        sig += "|" + store.feedSortKey.rawValue
+        sig += "|" + store.feedSortDirection.rawValue
+        let chambers: [String] = store.selectedChambers.map(\.rawValue).sorted()
+        sig += "|" + chambers.joined(separator: ",")
+        let parties: [String] = store.selectedParties.map(\.rawValue).sorted()
+        sig += "|" + parties.joined(separator: ",")
+        let types: [String] = store.selectedTradeTypes.map(\.rawValue).sorted()
+        sig += "|" + types.joined(separator: ",")
+        sig += "|" + store.selectedTimeRange.rawValue
+        sig += "|" + String(store.feed?.cursor ?? -1)
+        // Content version: `@Query` rows are mutated in place by poll
+        // upserts, so count/first/last ids alone miss edited amounts,
+        // dates, chambers — the memo would serve the stale arrangement.
+        sig += "|v" + String(Self.feedContentDigest(cachedTrades))
+        return sig
+    }
+
+    /// Digest over every field `computeFilteredTrades` and the sorts read.
+    /// `Hasher` is process-randomized, which is fine here: the digest is
+    /// only ever compared within one run.
+    static func feedContentDigest(_ trades: [ClientTrade]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(trades.count)
+        for trade in trades {
+            hasher.combine(trade.id)
+            hasher.combine(trade.transaction.date)
+            hasher.combine(trade.transaction.type)
+            hasher.combine(trade.transaction.amountMin)
+            hasher.combine(trade.transaction.amountMax)
+            hasher.combine(trade.asset.ticker)
+            hasher.combine(trade.asset.name)
+            hasher.combine(trade.member.name)
+            hasher.combine(trade.member.party)
+            hasher.combine(trade.member.chamber)
+            hasher.combine(trade.member.state)
+        }
+        return hasher.finalize()
+    }
+
+    private func computeFilteredTrades() -> [ClientTrade] {
         let searchNeedle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let chambers = store.selectedChambers
         let filteringChambers = !chambers.isEmpty
@@ -97,7 +150,9 @@ struct FeedDashboardView: View {
 
             // Party is also sent as `party=` CSV; keep a local pass for cache.
             if !parties.isEmpty {
-                guard let bucket = PartyFilter.bucket(for: trade.member.party), parties.contains(bucket) else {
+                // `bucket(for:)` is total: a no-party row is "Other / No party",
+                // matching the server's `party=O` (board efd94c45).
+                guard parties.contains(PartyFilter.bucket(for: trade.member.party)) else {
                     return false
                 }
             }
@@ -120,11 +175,39 @@ struct FeedDashboardView: View {
     /// Status that occupies the search-field slot. Reload wins over Updating
     /// because it is actionable. `nil` shows the typed search field.
     private var tradesSearchSlotStatus: TradesSearchSlotStatus? {
-        if let notice = store.feedNotice,
-           store.isOffline || (!notice.isEmpty && !Self.isBenignCancellationNotice(notice)) {
-            return .reload(message: store.isOffline ? "You are offline." : notice)
+        Self.searchSlotStatus(
+            notice: store.feedNotice,
+            isOffline: store.isOffline,
+            isTradesUpdating: store.isTradesUpdating,
+            isSearchFocused: searchFocused
+        )
+    }
+
+    /// Pure so it can be tested; the view only supplies the four facts.
+    ///
+    /// The `isSearchFocused` clause is the fix for the one-character-per-tap
+    /// bug.  The slot swaps the `TextField` out of the hierarchy whenever this
+    /// returns non-nil, and the first keystroke sets `isApplyingFilters`
+    /// synchronously, so before this the field was destroyed on keystroke one
+    /// and only came back — unfocused — after the server round trip.  While the
+    /// user is typing, an in-flight refresh is reported by a spinner *inside*
+    /// the field instead (see `TradesUnifiedSearchField.isUpdating`), which
+    /// keeps the field, the caret and the keyboard alive.
+    ///
+    /// `.reload` deliberately still wins over focus: it is the only recovery
+    /// control on this tab, and silently swallowing it to preserve a keystroke
+    /// would leave a failed load with no way out.
+    static func searchSlotStatus(
+        notice: String?,
+        isOffline: Bool,
+        isTradesUpdating: Bool,
+        isSearchFocused: Bool
+    ) -> TradesSearchSlotStatus? {
+        if let notice,
+           isOffline || (!notice.isEmpty && !Self.isBenignCancellationNotice(notice)) {
+            return .reload(message: isOffline ? "You are offline." : notice)
         }
-        if store.isTradesUpdating {
+        if isTradesUpdating && !isSearchFocused {
             return .updating
         }
         return nil
@@ -140,10 +223,10 @@ struct FeedDashboardView: View {
     }
 
     var body: some View {
-        // Read once per render. `filteredTrades` re-sorts the whole loaded page
-        // every time it is touched, and the body needs it for the count, the
-        // empty state and the list — three full sorts per frame before this.
-        let trades = filteredTrades
+        // CT-2459: memoized snapshot, recomputed by the `.task(id:)` below
+        // only when an actual filter/sort/cache input changes — not on
+        // every body pass.
+        let trades = tradesSnapshot
         return NavigationStack {
             VStack(spacing: 0) {
                 FeedDisclaimerHeader(disclaimerExpanded: $disclaimerExpanded) {
@@ -154,6 +237,7 @@ struct FeedDashboardView: View {
                             countLabel: tradeCountLabel(showing: trades.count),
                             focused: $searchFocused,
                             status: tradesSearchSlotStatus,
+                            isUpdating: store.isTradesUpdating,
                             onSubmit: { applyUnifiedSearch() },
                             onClear: {
                                 searchText = ""
@@ -169,7 +253,11 @@ struct FeedDashboardView: View {
                             scheduleSearchDebounce()
                         }
                         .onChange(of: tradesSearchSlotStatus) { _, status in
-                            if status != nil { searchFocused = false }
+                            // Only `.reload` takes focus away.  Dropping focus
+                            // on `.updating` was the second half of the
+                            // one-character-per-tap bug: it dismissed the
+                            // keyboard on every keystroke.
+                            if case .reload = status { searchFocused = false }
                         }
                     }
                 }
@@ -349,6 +437,9 @@ struct FeedDashboardView: View {
             .simultaneousGesture(
                 TapGesture().onEnded { searchFocused = false }
             )
+            .task(id: filterSignature) {
+                tradesSnapshot = computeFilteredTrades()
+            }
         }
     }
 
@@ -539,7 +630,14 @@ struct FeedControlBar: View {
                 // Timeframe Filter — stays fully visible (icon+value) at all
                 // times and sits first/top-left (owner punch list item 5).
                 Menu {
-                    ForEach(TimeRange.allCases) { range in
+                    // Owner 2026-09-21 ask: drop "1 Month" (less than 10% of
+                    // 3-Month count, misleading given the 45-day STOCK Act
+                    // reporting window) and "All Time" (5-year retention is
+                    // now the longest available window; "All Time" timed
+                    // out on iOS even when it returned the same count as
+                    // 5 Years). Enum cases stay in place for backward
+                    // compat with persisted UserDefaults.
+                    ForEach(TimeRange.surfaceCases) { range in
                         Button {
                             Task { await store.setTimeRange(range) }
                         } label: {
@@ -1103,10 +1201,10 @@ struct SidesFilterMenuLabel: View {
                 HStack(spacing: 1) {
                     Image(systemName: "arrow.up")
                         .font(.caption2.weight(.heavy))
-                        .foregroundStyle(isOn(.buy) ? Color.green : dimColor)
+                        .foregroundStyle(isOn(.buy) ? AppTheme.semanticPositive : dimColor)
                     Image(systemName: "arrow.down")
                         .font(.caption2.weight(.heavy))
-                        .foregroundStyle(isOn(.sell) ? Color.red : dimColor)
+                        .foregroundStyle(isOn(.sell) ? AppTheme.semanticNegative : dimColor)
                     // Same semi-dark grey as the other filter glyphs (owner
                     // 2026-08-22). Green/red stay on buy/sell because those
                     // colours mean something; exchange does not.
@@ -1179,6 +1277,9 @@ struct TradesUnifiedSearchField: View {
     var countLabel: String? = nil
     var focused: FocusState<Bool>.Binding
     var status: TradesSearchSlotStatus? = nil
+    /// Refresh in flight.  Shown as a spinner inside the field so the field is
+    /// never swapped out from under someone who is typing.
+    var isUpdating: Bool = false
     var onSubmit: () -> Void = {}
     var onClear: () -> Void = {}
     var onReload: () -> Void = {}
@@ -1206,18 +1307,21 @@ struct TradesUnifiedSearchField: View {
                     .contentTransition(.numericText())
                     .lineLimit(1)
                     .fixedSize()
+                    // Without its own label this inherited the container's, so
+                    // the number itself — the only thing it conveys — was never
+                    // announced.
+                    .accessibilityLabel("\(countLabel) matching")
             }
         }
         .animation(.easeInOut(duration: 0.15), value: status)
-        .accessibilityLabel(status == nil
-            ? "Search trades by politician name, ticker, state, or party"
-            : statusAccessibility)
     }
 
     private var searchSlot: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
+                // Decorative twin of the field's own label.
+                .accessibilityHidden(true)
             TextField("Name, ticker, state, or party", text: $text)
                 .neverAutocapitalized()
                 .autocorrectionDisabled()
@@ -1228,6 +1332,17 @@ struct TradesUnifiedSearchField: View {
                     onSubmit()
                     focused.wrappedValue = false
                 }
+                // Labelled here rather than on the enclosing HStack.  A label on
+                // a non-element container is inherited by every child, which is
+                // what made the magnifier, the count and the Reload button all
+                // announce the search field's label.
+                .accessibilityLabel("Search trades by politician name, ticker, state, or party")
+            if isUpdating {
+                ProgressView()
+                    .controlSize(.mini)
+                    .transition(.opacity)
+                    .accessibilityLabel("Updating results")
+            }
             if !text.isEmpty {
                 Button {
                     withAnimation { text = "" }
@@ -1240,6 +1355,7 @@ struct TradesUnifiedSearchField: View {
                 .accessibilityLabel("Clear Search")
             }
         }
+        .animation(.easeInOut(duration: 0.15), value: isUpdating)
     }
 
     @ViewBuilder
@@ -1254,6 +1370,10 @@ struct TradesUnifiedSearchField: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            // One element, announced once, instead of two children that each
+            // inherited the container's label.
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Updating results")
         case .reload(let message):
             HStack(spacing: 8) {
                 Text(message)
@@ -1265,18 +1385,12 @@ struct TradesUnifiedSearchField: View {
                     .font(.caption.weight(.semibold))
                     .buttonStyle(.bordered)
                     .clipShape(Capsule())
+                    // The button used to inherit the container label and so
+                    // announced as "Request failed, button", which says nothing
+                    // about what it does.  The failure text belongs in the hint.
+                    .accessibilityLabel("Reload trades")
+                    .accessibilityHint(message)
             }
-        }
-    }
-
-    private var statusAccessibility: String {
-        switch status {
-        case .updating:
-            return "Updating results"
-        case .reload(let message):
-            return message
-        case .none:
-            return "Search trades"
         }
     }
 }
@@ -1382,8 +1496,7 @@ struct ExportCSVSheet: View {
                     // a device purchase already linked to a DIFFERENT account
                     // (Premium belongs to the account, not the device).
                     if !store.premiumFeatureAccess {
-                        Text("CSV export is a Premium feature ($5/mo or $50/yr, 2-week free trial).  "
-                            + "No account needed to buy.")
+                        Text("CSV export is a Premium feature.  No account needed to buy.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         Button {

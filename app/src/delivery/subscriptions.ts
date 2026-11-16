@@ -10,7 +10,9 @@
 import type { Env, Subscription, SubscriptionFilters, Transaction } from '../shared/types.ts';
 import { all, first, get, run } from '../shared/db.ts';
 import { prefixedId } from '../shared/ids.ts';
-import { mapSubscription, type SubscriptionRow } from './rows.ts';
+import { findMemberCandidates, mapSubscription, pickMemberCandidate, type SubscriptionRow } from './rows.ts';
+import { isDeliveryBackfill } from './deliveryFreshness.ts';
+import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { getUserById } from '../auth/users.ts';
 import { isPremiumUserAsync } from '../billing/entitlement.ts';
 
@@ -142,7 +144,10 @@ export function validateSubscriptionFilters(value: unknown):
   if (value == null) return { ok: true, filters: {} };
   if (typeof value !== 'object' || Array.isArray(value)) return { ok: false, error: 'filters must be an object' };
   const raw = value as Record<string, unknown>;
-  const allowed = new Set(['members', 'tickers', 'chambers', 'minAmount', 'maxAmount', 'sides', 'sectors', 'marketCapBuckets']);
+  const allowed = new Set([
+    'members', 'tickers', 'chambers', 'minAmount', 'maxAmount', 'sides', 'sectors', 'marketCapBuckets',
+    'includeBackfill',
+  ]);
   if (Object.keys(raw).some((key) => !allowed.has(key))) return { ok: false, error: 'filters contain unsupported fields' };
 
   const strings = (key: string, limit: number, maxLength: number): string[] | string => {
@@ -170,13 +175,220 @@ export function validateSubscriptionFilters(value: unknown):
   if (min != null && (typeof min !== 'number' || !Number.isFinite(min) || min < 0)) return { ok: false, error: 'minAmount must be a non-negative number' };
   if (max != null && (typeof max !== 'number' || !Number.isFinite(max) || max < 0)) return { ok: false, error: 'maxAmount must be a non-negative number' };
   if (typeof min === 'number' && typeof max === 'number' && min > max) return { ok: false, error: 'minAmount cannot exceed maxAmount' };
+  const includeBackfill = raw.includeBackfill;
+  if (includeBackfill != null && typeof includeBackfill !== 'boolean') {
+    return { ok: false, error: 'includeBackfill must be a boolean' };
+  }
   return { ok: true, filters: {
     ...(members.length ? { members } : {}), ...(tickersRaw.length ? { tickers: [...new Set(tickersRaw.map((v) => v.toUpperCase()))] } : {}),
     ...(chambers.length ? { chambers: chambers as SubscriptionFilters['chambers'] } : {}),
     ...(typeof min === 'number' ? { minAmount: min } : {}), ...(typeof max === 'number' ? { maxAmount: max } : {}),
     ...(sidesNorm.length ? { sides: sidesNorm as SubscriptionFilters['sides'] } : {}), ...(sectors.length ? { sectors } : {}),
     ...(buckets.length ? { marketCapBuckets: buckets } : {}),
+    ...(includeBackfill === true ? { includeBackfill: true } : {}),
   } };
+}
+
+/**
+ * Both arms declare `error` / `unresolvedMembers` / `filters` (optional) so callers
+ * can read them in the `!ok` branch: this repo's non-strict deno config does not
+ * narrow the union there (the reason older call sites cast to `any`).
+ */
+export type ResolvedSubscriptionFilters =
+  | { ok: true; filters: SubscriptionFilters; error?: undefined; unresolvedMembers?: undefined }
+  | { ok: false; error: string; unresolvedMembers?: string[]; filters?: undefined };
+
+/** Max candidates named in an "ambiguous" error, so the message stays short. */
+const MAX_AMBIGUOUS_CANDIDATES_SHOWN = 4;
+const MEMBER_ID_LOOKUP_CHUNK = 100;
+
+/** `?, ?, ?` placeholders for an IN list. */
+const placeholders = (n: number): string => Array.from({ length: n }, () => '?').join(', ');
+
+/** Run an `IN (...)` lookup in chunks that stay far below SQLite's bound-variable limit. */
+async function chunkedIn<T>(
+  env: Env,
+  sqlFor: (placeholderList: string) => string,
+  values: string[],
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let i = 0; i < values.length; i += MEMBER_ID_LOOKUP_CHUNK) {
+    const chunk = values.slice(i, i + MEMBER_ID_LOOKUP_CHUNK);
+    out.push(...(await all<T>(env.DB, sqlFor(placeholders(chunk.length)), chunk)));
+  }
+  return out;
+}
+
+/**
+ * Resolve the entries of a subscription `members` filter to the filer ids that
+ * {@link matchesFilters} compares against `tx.filerId`.
+ *
+ * An entry is, in order: an existing `filers.bioguide_id` (case-insensitive;
+ * a tombstoned alias maps to its canonical filer, like the read paths), an id
+ * that only exists on transactions (a filer with no `filers` row is still a
+ * member in the `/members` roster), or a member NAME.  A name must identify
+ * exactly one person — exact full/display-name match first, then live filers
+ * over dormant duplicates — because subscribing someone to the wrong politician
+ * is worse than an error.  Anything else is reported back, not stored.
+ */
+export async function resolveSubscriptionMembers(
+  env: Env,
+  entries: string[],
+): Promise<{ ids: string[]; unresolved: string[]; ambiguous: Array<{ input: string; candidates: string[] }> }> {
+  const resolved = new Map<string, string>();
+
+  // 1. Existing filer ids (exact, then upper-cased: bioguide ids are upper case).
+  const idCandidates = [...new Set(entries.flatMap((entry) => [entry, entry.toUpperCase()]))];
+  const idRows = await chunkedIn<{ bioguide_id: string; merged_into: string | null }>(
+    env,
+    (ph) => `SELECT bioguide_id, merged_into FROM filers WHERE bioguide_id IN (${ph})`,
+    idCandidates,
+  );
+  const canonicalById = new Map(idRows.map((row) => [row.bioguide_id, row.merged_into || row.bioguide_id]));
+  for (const entry of entries) {
+    const hit = canonicalById.get(entry) ?? canonicalById.get(entry.toUpperCase());
+    if (hit) resolved.set(entry, hit);
+  }
+
+  // 2. Ids that only exist on transactions (no filers row).
+  const afterIds = entries.filter((entry) => !resolved.has(entry));
+  if (afterIds.length > 0) {
+    const txRows = await chunkedIn<{ filer_id: string }>(
+      env,
+      (ph) => `SELECT DISTINCT filer_id FROM transactions WHERE filer_id IN (${ph})`,
+      afterIds,
+    );
+    const txIds = new Set(txRows.map((row) => row.filer_id));
+    for (const entry of afterIds) if (txIds.has(entry)) resolved.set(entry, entry);
+  }
+
+  // 3. Names.
+  const unresolved: string[] = [];
+  const ambiguous: Array<{ input: string; candidates: string[] }> = [];
+  for (const entry of entries) {
+    if (resolved.has(entry)) continue;
+    const pick = pickMemberCandidate(await findMemberCandidates(env, entry));
+    if (pick.kind === 'match') resolved.set(entry, pick.filerId);
+    else if (pick.kind === 'none') unresolved.push(entry);
+    else {
+      ambiguous.push({
+        input: entry,
+        candidates: pick.candidates
+          .slice(0, MAX_AMBIGUOUS_CANDIDATES_SHOWN)
+          .map((cand) => `${cand.name ?? cand.filerId} (${cand.filerId})`),
+      });
+    }
+  }
+
+  return {
+    ids: [...new Set(entries.map((entry) => resolved.get(entry)).filter((id): id is string => !!id))],
+    unresolved,
+    ambiguous,
+  };
+}
+
+/**
+ * {@link validateSubscriptionFilters} plus member resolution.  EVERY create and
+ * update path must call this one (a test scans for direct callers of the sync
+ * validator): `members` is stored as resolved filer ids, and names that cannot be
+ * resolved to exactly one member are rejected so the caller can answer 400
+ * instead of saving a subscription that silently delivers nothing.
+ */
+export async function validateAndResolveSubscriptionFilters(
+  env: Env,
+  value: unknown,
+): Promise<ResolvedSubscriptionFilters> {
+  const base = validateSubscriptionFilters(value);
+  if (!base.ok) return { ok: false, error: (base as { error: string }).error };
+  const members = base.filters.members;
+  if (!members || members.length === 0) return { ok: true, filters: base.filters };
+
+  const { ids, unresolved, ambiguous } = await resolveSubscriptionMembers(env, members);
+  if (unresolved.length > 0 || ambiguous.length > 0) {
+    const messages: string[] = [];
+    if (unresolved.length > 0) {
+      messages.push(
+        `members not recognized: ${unresolved.map((name) => `"${name}"`).join(', ')}.  ` +
+          "Use a member's full name or filer id (see GET /api/members).",
+      );
+    }
+    for (const item of ambiguous) {
+      messages.push(
+        `"${item.input}" is ambiguous: ${item.candidates.join(', ')}.  Use the full name or the filer id.`,
+      );
+    }
+    return {
+      ok: false,
+      error: messages.join('  '),
+      unresolvedMembers: [...unresolved, ...ambiguous.map((item) => item.input)],
+    };
+  }
+  return { ok: true, filters: { ...base.filters, members: ids } };
+}
+
+/** Owner-facing view of a subscription's `members` filter (see {@link describeSubscriptionMembers}). */
+export interface SubscriptionMemberInfo {
+  /** filer id -> display name, for the ids we can name. */
+  memberLabels: Record<string, string>;
+  /** Stored entries that are not a known filer id, e.g. free-text names saved before names were resolved. */
+  unresolvedMembers: string[];
+}
+
+/**
+ * Names for the filer ids stored in subscriptions' `members` filters, and the
+ * entries that can never match.  Subscriptions created before names were
+ * resolved (board a6058af2) may hold raw text like "Nancy Pelosi": nothing is
+ * rewritten here, but the owner's list flags those entries so they can Edit and
+ * Save (which resolves or rejects them).  Subscriptions without a members
+ * filter are omitted from the result.
+ */
+export async function describeSubscriptionMembers(
+  env: Env,
+  subs: Subscription[],
+): Promise<Map<string, SubscriptionMemberInfo>> {
+  const out = new Map<string, SubscriptionMemberInfo>();
+  const allIds = [...new Set(subs.flatMap((sub) => sub.filters?.members ?? []))];
+  if (allIds.length === 0) return out;
+
+  const labelRows = await chunkedIn<{ id: string; name: string | null }>(
+    env,
+    (ph) => `SELECT f.bioguide_id AS id,
+                    COALESCE(cf.display_name, cf.full_name, f.display_name, f.full_name) AS name
+               FROM filers f
+               LEFT JOIN filers cf ON cf.bioguide_id = f.merged_into
+              WHERE f.bioguide_id IN (${ph})`,
+    allIds,
+  );
+  const known = new Set(labelRows.map((row) => row.id));
+  const labels = new Map<string, string>();
+  for (const row of labelRows) {
+    if (row.name) labels.set(row.id, cleanFilerName(row.name) || row.name);
+  }
+
+  // Ids that exist only on transactions are valid members without a name.
+  const unlabeled = allIds.filter((id) => !known.has(id));
+  if (unlabeled.length > 0) {
+    const txRows = await chunkedIn<{ filer_id: string }>(
+      env,
+      (ph) => `SELECT DISTINCT filer_id FROM transactions WHERE filer_id IN (${ph})`,
+      unlabeled,
+    );
+    for (const row of txRows) known.add(row.filer_id);
+  }
+
+  for (const sub of subs) {
+    const members = sub.filters?.members ?? [];
+    if (members.length === 0) continue;
+    const memberLabels: Record<string, string> = {};
+    const unresolvedMembers: string[] = [];
+    for (const id of members) {
+      const label = labels.get(id);
+      if (label) memberLabels[id] = label;
+      if (!known.has(id)) unresolvedMembers.push(id);
+    }
+    out.set(sub.id, { memberLabels, unresolvedMembers });
+  }
+  return out;
 }
 
 /**
@@ -386,6 +598,9 @@ export async function deleteSubscription(env: Env, id: string): Promise<boolean>
  *
  * Semantics (all clauses are AND-ed; an empty/undefined clause matches all):
  *   - members[]:  filer bioguide id must be in the set (matched by tx.filerId).
+ *                 The set holds ids only: create/update resolve member names via
+ *                 {@link validateAndResolveSubscriptionFilters}, so a raw name here
+ *                 (a row saved before that existed) can never match.
  *   - tickers[]:  tx.ticker must be in the set (case-insensitive).
  *   - chambers[]: NOTE — Transaction carries no chamber column; chamber filtering
  *                 is applied at the query layer (REST join on filings). This
@@ -393,8 +608,14 @@ export async function deleteSubscription(env: Env, id: string): Promise<boolean>
    *                 enforces members/tickers/minAmount. Webhook dispatch resolves
  *                 chamber separately (see webhook.ts).
  *   - minAmount:  tx.amountMin must be >= filter.minAmount.
+ *   - backfill:   dropped unless includeBackfill; freshness is judged as of
+ *                 `freshnessAtMs` (default now).
  */
-export function matchesFilters(tx: Transaction, filters: SubscriptionFilters): boolean {
+export function matchesFilters(
+  tx: Transaction,
+  filters: SubscriptionFilters,
+  freshnessAtMs?: number,
+): boolean {
   if (!filters) return true;
 
   if (filters.members && filters.members.length > 0) {
@@ -421,6 +642,8 @@ export function matchesFilters(tx: Transaction, filters: SubscriptionFilters): b
     if (!side || !filters.sides.includes(side)) return false;
   }
 
+  if (filters.includeBackfill !== true && isDeliveryBackfill(tx, freshnessAtMs)) return false;
+
   return true;
 }
 
@@ -432,6 +655,12 @@ export interface DeliveryContext {
   sector?: string | null;
   /** securities_ref.market_cap_bucket for the tx ticker. */
   marketCapBucket?: string | null;
+  /**
+   * Instant to judge delivery freshness at (default now).  Targeted webhook
+   * retries pass deliveryFreshnessJudgedAtMs so a parked delivery does not
+   * age into backfill while its target circuit is open.
+   */
+  freshnessAtMs?: number;
 }
 
 /**
@@ -445,7 +674,7 @@ export function matchesFiltersWithContext(
   filters: SubscriptionFilters,
   ctx: DeliveryContext,
 ): boolean {
-  if (!matchesFilters(tx, filters)) return false;
+  if (!matchesFilters(tx, filters, ctx.freshnessAtMs)) return false;
   if (filters.chambers && filters.chambers.length > 0) {
     if (!ctx.chamber || !filters.chambers.includes(ctx.chamber as never)) return false;
   }

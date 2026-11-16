@@ -1,5 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Env } from '../../shared/types.ts';
+import { SenateHttpError, SenateProxyEgressError } from '../senateEdgeDeny.ts';
+import { withSenateEfdTransport } from '../senateSource.ts';
 
 const mocks = vi.hoisted(() => ({
   fetchHouseIndex: vi.fn(),
@@ -13,7 +15,8 @@ vi.mock('../houseSource', () => ({
   pollHouseLiveSearch: mocks.pollHouseLiveSearch,
 }));
 
-vi.mock('../senateSource', () => ({
+vi.mock('../senateSource', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../senateSource.ts')>()),
   fetchSenatePtrFilings: mocks.fetchSenatePtrFilings,
 }));
 
@@ -57,12 +60,16 @@ function fakeEnv(
   const env = {
     ...overrides,
     CONFIG_KV: {
-      async get(key: string) {
-        return kv.get(key) ?? null;
+      async get(key: string, type?: string) {
+        const value = kv.get(key) ?? null;
+        return value !== null && type === 'json' ? JSON.parse(value) : value;
       },
       async put(key: string, value: string) {
         kv.set(key, value);
         kvPuts.push([key, value]);
+      },
+      async delete(key: string) {
+        kv.delete(key);
       },
     },
     DB: {
@@ -164,12 +171,49 @@ describe('runWatcher', () => {
     expect(mocks.fetchHouseIndex).not.toHaveBeenCalled();
   });
 
+  it('gives House, Senate, and OGE each a fresh I/O signal', async () => {
+    const { env } = fakeEnv();
+    const signals: AbortSignal[] = [];
+    mocks.fetchHouseIndex.mockImplementation(async (_year: number, opts: { signal?: AbortSignal }) => {
+      expect(opts.signal?.aborted).toBe(false);
+      signals.push(opts.signal!);
+      return [];
+    });
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    mocks.fetchSenatePtrFilings.mockImplementation(async (opts: { signal?: AbortSignal }) => {
+      expect(opts.signal?.aborted).toBe(false);
+      signals.push(opts.signal!);
+      return [];
+    });
+    mocks.pollOgeExecutive.mockImplementation(async (
+      _env: unknown,
+      _now: unknown,
+      _fetchImpl: unknown,
+      opts: { signal?: AbortSignal },
+    ) => {
+      expect(opts.signal?.aborted).toBe(false);
+      signals.push(opts.signal!);
+      return [];
+    });
+
+    const result = await runWatcher(env, new Date('2026-07-04T15:00:00.000Z'));
+
+    expect(result).toMatchObject({ house: 'success', senate: 'success', executive: 'success' });
+    expect(signals).toHaveLength(3);
+    expect(new Set(signals).size).toBe(3);
+    expect(mocks.pollHouseLiveSearch).toHaveBeenCalledWith(
+      2026,
+      expect.any(Function),
+      expect.objectContaining({ signal: signals[0] }),
+    );
+  });
+
   it('threads the tick signal into active source I/O and aborts without recording a failure', async () => {
     const { env, dbRuns } = fakeEnv();
     const controller = new AbortController();
     mocks.fetchHouseIndex.mockImplementationOnce(
       (_year: number | string, opts: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
-        expect(opts.signal).toBe(controller.signal);
+        expect(opts.signal).toBeDefined();
         opts.signal?.addEventListener('abort', () => reject(opts.signal?.reason), { once: true });
         setTimeout(() => controller.abort(new Error('deadline')), 0);
       }),
@@ -195,7 +239,7 @@ describe('runWatcher', () => {
     expect(mocks.pollHouseLiveSearch).toHaveBeenCalledWith(
       2026,
       expect.any(Function),
-      expect.objectContaining({ env, signal: undefined }),
+      expect.objectContaining({ env, signal: expect.any(AbortSignal) }),
     );
     expect(queueSends).toHaveLength(3);
     expect(queueSends).toEqual([
@@ -206,6 +250,23 @@ describe('runWatcher', () => {
 
     const filingInserts = dbRuns.filter((run) => /INSERT OR IGNORE INTO filings/i.test(run.sql));
     expect(filingInserts).toHaveLength(3);
+  });
+
+  it('runs live House search alongside the bulk index on scheduled House polls by default', async () => {
+    const now = new Date('2026-07-04T15:00:00.000Z');
+    const { env, queueSends } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20026001')]);
+    mocks.pollHouseLiveSearch.mockResolvedValueOnce([housePtr('20026002')]);
+    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
+
+    await runWatcher(env, now);
+
+    expect(mocks.fetchHouseIndex).toHaveBeenCalledTimes(1);
+    expect(mocks.pollHouseLiveSearch).toHaveBeenCalledTimes(1);
+    expect(queueSends).toEqual([
+      expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' }),
+      expect.objectContaining({ docId: 'H-2026-20026002', chamber: 'house' }),
+    ]);
   });
 
   it('skips the live House search when explicitly disabled', async () => {
@@ -230,10 +291,39 @@ describe('runWatcher', () => {
     expect(mocks.pollHouseLiveSearch).toHaveBeenCalledWith(
       2026,
       expect.any(Function),
-      expect.objectContaining({ env, signal: undefined }),
+      expect.objectContaining({ env, signal: expect.any(AbortSignal) }),
     );
     expect(queueSends).toEqual([expect.objectContaining({ docId: 'H-2026-20026001', chamber: 'house' })]);
     expect(kvPuts.map(([key]) => key)).toContain('last_poll:house');
+  });
+
+  it('does not discard already-fetched bulk index filings when the per-source timeout fires during live search', async () => {
+    const { env, kvPuts, queueSends, dbRuns } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValueOnce([housePtr('20035652')]);
+    mocks.pollHouseLiveSearch.mockImplementationOnce(async () => {
+      const timeoutErr = new Error('The operation was aborted due to timeout');
+      timeoutErr.name = 'TimeoutError';
+      throw timeoutErr;
+    });
+    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      const result = await runWatcher(env, new Date('2026-10-15T13:01:00.000Z'));
+      expect(result.house).toBe('success');
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(queueSends).toEqual([
+      expect.objectContaining({ docId: 'H-2026-20035652', chamber: 'house' }),
+    ]);
+    expect(kvPuts.map(([key]) => key)).toContain('last_poll:house');
+    const houseAttempts = dbRuns.filter(
+      (run) => /INSERT INTO source_attempts/i.test(run.sql) && run.params[0] === 'house',
+    );
+    expect(houseAttempts).toHaveLength(1);
+    expect(houseAttempts[0].params[2]).toBe('success');
   });
 
   it('isolates a live-search counter KV failure from the authoritative bulk persist', async () => {
@@ -448,6 +538,21 @@ describe('runWatcher', () => {
     expect(senateSince()).toEqual(new Date(SENATE_NOW.getTime() - 13 * 86_400_000));
   });
 
+  it('runs a prompt Senate poll when residential-proxy recovery catch-up is queued', async () => {
+    const { env } = fakeEnv({}, {}, {
+      'senate_deep_sweep:lastdate': '2026-07-16',
+      'last_poll:senate': SENATE_NOW.toISOString(),
+      'residential-proxy:senate-catchup': SENATE_NOW.toISOString(),
+    });
+    quietHouse();
+    mocks.fetchSenatePtrFilings.mockResolvedValueOnce([]);
+
+    const result = await runWatcher(env, SENATE_NOW);
+
+    expect(result.senate).toBe('success');
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+  });
+
   it('does not consume the day\'s deep sweep when the senate poll fails', async () => {
     const { env, kvPuts } = fakeEnv({}, {}, {
       'last_poll:senate': new Date(SENATE_NOW.getTime() - 6 * 3600_000).toISOString(),
@@ -527,7 +632,7 @@ describe('runWatcher', () => {
 
   // --- House live-search failure visibility --------------------------------
   it('escalates to console.error after 12 consecutive live-search failures', async () => {
-    const { env, kv } = fakeEnv({}, {}, {
+    const { env, kv } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' }, {}, {
       'house_live_search:consecutive_failures': '11',
     });
     mocks.fetchHouseIndex.mockResolvedValue([]);
@@ -550,7 +655,7 @@ describe('runWatcher', () => {
   });
 
   it('warns (not errors) on a sub-threshold live-search failure and resets the counter on success', async () => {
-    const { env, kv } = fakeEnv({}, {}, {
+    const { env, kv } = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' }, {}, {
       'house_live_search:consecutive_failures': '4',
     });
     mocks.fetchHouseIndex.mockResolvedValue([]);
@@ -569,10 +674,271 @@ describe('runWatcher', () => {
     }
 
     // A later successful overlay resets the streak.
-    const second = fakeEnv({}, {}, { 'house_live_search:consecutive_failures': '5' });
+    const second = fakeEnv({ HOUSE_LIVE_SEARCH_ENABLED: 'true' }, {}, { 'house_live_search:consecutive_failures': '5' });
     mocks.pollHouseLiveSearch.mockResolvedValueOnce([]);
     await runWatcher(second.env, new Date('2026-07-16T16:00:00.000Z'));
     expect(second.kv.get('house_live_search:consecutive_failures')).toBe('0');
+  });
+});
+
+// CT-2442: eFD's Akamai edge refuses the agreement POST for automated clients.
+// The watcher must back off politely, keep that across restarts, and say what
+// is blocked.  fetchSenatePtrFilings is mocked; fetch itself throws, so nothing
+// here can reach the network.
+describe('runWatcher senate eFD edge deny (CT-2442)', () => {
+  // Monday 10:00 AM.  With no senate success on record, senate is due on every tick.
+  const T0 = new Date('2026-10-26T15:00:00.000Z');
+  const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
+  const BACKOFF_KEY = 'senate_edge_deny:backoff';
+  const edgeDeny = () =>
+    new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost', { body: '<TITLE>Access Denied</TITLE>' });
+
+  let warn: ReturnType<typeof vi.spyOn>;
+  let error: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.pollOgeExecutive.mockResolvedValue(null);
+    mocks.fetchHouseIndex.mockResolvedValue([]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new TypeError('network disabled in tests');
+    }));
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const edgeLines = (spy: ReturnType<typeof vi.spyOn>) =>
+    spy.mock.calls.filter(([msg]) => /senate eFD edge denied/.test(String(msg)));
+
+  it('backs off 60 minutes after an edge deny, doubles up to 6 hours, and resets on success', async () => {
+    const { env, kv, dbRuns } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+
+    const first = await runWatcher(env, T0);
+    expect(first.senate).toBe('failure');
+    expect(first.senateEdgeBackoffUntil).toBe(at(60).toISOString());
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 1, windowMs: 3_600_000 });
+    const receipt = dbRuns.filter((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt.map((r) => [r.params[2], r.params[4]])).toEqual([
+      ['failure', 'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHost) [edge_denied]'],
+    ]);
+
+    // Past the 600 s failure skip, inside the window: no request.
+    const inside = await runWatcher(env, at(30));
+    expect(inside.senate).toBe('skipped');
+    expect(inside.senateCadence?.poll).toBe(true);
+    expect(inside.senateEdgeBackoffUntil).toBe(at(60).toISOString());
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+
+    const second = await runWatcher(env, at(61));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+    expect(second.senateEdgeBackoffUntil).toBe(at(61 + 120).toISOString());
+    await runWatcher(env, at(61 + 119));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+
+    expect((await runWatcher(env, at(181))).senateEdgeBackoffUntil).toBe(at(181 + 240).toISOString());
+    expect((await runWatcher(env, at(421))).senateEdgeBackoffUntil).toBe(at(421 + 360).toISOString());
+    // Capped at 6 hours.
+    expect((await runWatcher(env, at(781))).senateEdgeBackoffUntil).toBe(at(781 + 360).toISOString());
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(5);
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 5, firstDeniedAt: T0.toISOString() });
+
+    // eFD accepts again: success clears the backoff.
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    const ok = await runWatcher(env, at(1141));
+    expect(ok.senate).toBe('success');
+    expect(ok.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+
+    // The next deny starts over at 60 minutes.
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+    const again = await runWatcher(env, at(1141 + 120));
+    expect(again.senateEdgeBackoffUntil).toBe(at(1141 + 120 + 60).toISOString());
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!)).toMatchObject({ consecutive: 1 });
+  });
+
+  it('records the transport that succeeded on the senate source_attempts row', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockResolvedValue(withSenateEfdTransport([], {
+      transport: 'browser-direct',
+      fallback: true,
+    }));
+    const result = await runWatcher(env, T0);
+    expect(result.senate).toBe('success');
+    const receipt = dbRuns.find((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt?.params[2]).toBe('success');
+    expect(receipt?.params[4]).toBe('transport=browser-direct fallback');
+  });
+
+  it('keeps the backoff across a restart (the state lives in CONFIG_KV)', async () => {
+    const first = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+    await runWatcher(first.env, T0);
+
+    const restarted = fakeEnv({}, {}, Object.fromEntries(first.kv));
+    const result = await runWatcher(restarted.env, at(45));
+
+    expect(result.senate).toBe('skipped');
+    expect(result.senateEdgeBackoffUntil).toBe(at(60).toISOString());
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+  });
+
+  it('says what is blocked, at error once per episode, and never claims a Senate bulk path', async () => {
+    const { env } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+    await runWatcher(env, T0);
+    await runWatcher(env, at(61));
+
+    expect(edgeLines(error)).toHaveLength(1);
+    expect(edgeLines(warn)).toHaveLength(1);
+    // One argument: the line itself, built from the classified fields.
+    expect(edgeLines(error)[0]).toHaveLength(1);
+    const line = String(edgeLines(error)[0][0]);
+    expect(line).toContain('Senate PTR discovery and document fetch are blocked while eFD refuses the agreement');
+    expect(line).toContain(`next senate attempt after ${at(60).toISOString()} (60m backoff)`);
+    expect(line).toContain('[source=senate class=edge_denied step="POST /search/home/" status=403 server=AkamaiGHost]');
+    expect(String(edgeLines(warn)[0][0])).toContain('(2 in a row since');
+    expect(edgeLines(warn)[0]).toHaveLength(1);
+
+    // A transient senate failure no longer claims a bulk path either.
+    const other = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(new Error('senate POST report/data/ -> HTTP 429 (server=gunicorn)'));
+    await runWatcher(other.env, T0);
+    expect(warn).toHaveBeenCalledWith(
+      'watcher: senate source degraded (transient, no alternate Senate discovery path):',
+      'senate POST report/data/ -> HTTP 429 (server=gunicorn)',
+    );
+
+    const lines = [...warn.mock.calls, ...error.mock.calls].map(([msg]) => String(msg));
+    expect(lines.some((msg) => /senate/.test(msg) && /bulk path/.test(msg))).toBe(false);
+  });
+
+  it('logs, stores and backs off on the classified fields only, never the raw error text (Kody, #2846)', async () => {
+    const { env, kv, dbRuns } = fakeEnv();
+    // An edge deny whose message carries upstream text and a credential.
+    const raw = new SenateHttpError('POST /search/home/', 403, 'AkamaiGHost\r\n<x>', {
+      body: '<TITLE>Access Denied</TITLE>',
+      detail: 'via http://mango:hunter22@10.99.0.2:8888 <b>upstream page</b>',
+    });
+    expect(raw.message).toContain('hunter22');
+    mocks.fetchSenatePtrFilings.mockRejectedValue(raw);
+
+    await runWatcher(env, T0);
+    await runWatcher(env, at(61));
+
+    const lines = [...edgeLines(error), ...edgeLines(warn)];
+    expect(lines).toHaveLength(2);
+    for (const args of lines) {
+      expect(args).toHaveLength(1);
+      expect(String(args[0])).not.toMatch(/hunter22|mango|upstream page|<x>|\r/);
+      expect(String(args[0])).toContain('server=AkamaiGHostx');
+    }
+    const receipts = dbRuns
+      .filter((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate')
+      .map((r) => r.params[4]);
+    expect(receipts).toEqual([
+      'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]',
+      'senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]',
+    ]);
+    expect(JSON.parse(kv.get(BACKOFF_KEY)!).reason).toBe('senate POST /search/home/ -> HTTP 403 (server=AkamaiGHostx) [edge_denied]');
+  });
+
+  it('scrubs proxy credentials from other senate failure text before logging or storing it', async () => {
+    const PROXY = 'http://mango-user:s3cr3t-pw@10.99.0.2:8888';
+    const { env, dbRuns } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
+    mocks.fetchSenatePtrFilings.mockRejectedValue(
+      new Error(`senate GET /search/ -> HTTP 429 via ${PROXY}/ (auth s3cr3t-pw rejected)`),
+    );
+
+    await runWatcher(env, T0);
+
+    const logged = [...warn.mock.calls, ...error.mock.calls].filter(([msg]) => /senate source/.test(String(msg)));
+    expect(logged).toHaveLength(1);
+    expect(logged[0][1]).toBe('senate GET /search/ -> HTTP 429 via [redacted]/ (auth [redacted] rejected)');
+    const receipt = dbRuns.find((r) => /INSERT INTO source_attempts/i.test(r.sql) && r.params[0] === 'senate');
+    expect(receipt?.params[4]).toBe('senate GET /search/ -> HTTP 429 via [redacted]/ (auth [redacted] rejected)');
+    expect(JSON.stringify([...warn.mock.calls, ...error.mock.calls])).not.toContain('s3cr3t-pw');
+  });
+
+  it('keeps the 600 s failure skip, not the long backoff, for an origin 403', async () => {
+    const { env, kv } = fakeEnv();
+    mocks.fetchSenatePtrFilings.mockRejectedValue(new SenateHttpError('POST report/data/', 403, 'gunicorn'));
+
+    const first = await runWatcher(env, T0);
+    expect(first.senate).toBe('failure');
+    expect(first.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+
+    await runWatcher(env, at(5));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(1);
+    await runWatcher(env, at(11));
+    expect(mocks.fetchSenatePtrFilings).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs a residential-proxy outage at error, not as a transient 403, and does not back off', async () => {
+    const { env, kv } = fakeEnv();
+    const outage = new SenateProxyEgressError(
+      'senate proxy gave no HTTP answer within 3000ms',
+      'senate GET /search/ -> HTTP 403 (server=AkamaiGHost)',
+    );
+    mocks.fetchSenatePtrFilings.mockRejectedValue(outage);
+
+    const result = await runWatcher(env, T0);
+
+    expect(result.senate).toBe('failure');
+    expect(result.senateEdgeBackoffUntil).toBeUndefined();
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+    expect(error).toHaveBeenCalledWith('watcher: senate source failed:', outage.message);
+    expect(warn.mock.calls.some(([msg]) => /senate source degraded/.test(String(msg)))).toBe(false);
+  });
+
+  it('skips the proxied eFD probe while the edge-deny backoff is active, then dials it at most twice a day', async () => {
+    const PROXY = 'http://10.99.0.2:8888';
+    const { env, kv } = fakeEnv({ RESIDENTIAL_PROXY_URL: PROXY } as unknown as Parameters<typeof fakeEnv>[0]);
+    const efdCalls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      // The residential proxy's own liveness hop.
+      if (url === 'http://example.com/') return new Response('ok', { status: 200 });
+      if (url.startsWith('https://efdsearch.senate.gov/')) {
+        efdCalls.push(`${init?.method ?? 'GET'} ${new URL(url).pathname}`);
+        if (url.endsWith('/search/home/')) return new Response('', { status: 302 });
+        return new Response('<input type="hidden" name="csrfmiddlewaretoken" value="t">', {
+          status: 200,
+          headers: { 'set-cookie': 'csrftoken=c; Path=/' },
+        });
+      }
+      throw new TypeError('network disabled in tests');
+    }));
+    mocks.fetchSenatePtrFilings.mockRejectedValue(edgeDeny());
+
+    // The poll is edge-denied, so the probe that runs after it in the same
+    // tick, and on every tick inside the window, sends eFD nothing.
+    await runWatcher(env, T0);
+    expect(kv.has(BACKOFF_KEY)).toBe(true);
+    await runWatcher(env, at(30));
+    expect(efdCalls).toEqual([]);
+
+    // eFD accepts the poll after the window: the backoff clears and the probe dials.
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, at(61));
+    expect(kv.has(BACKOFF_KEY)).toBe(false);
+    expect(efdCalls).toEqual(['GET /search/', 'POST /search/home/']);
+    expect(JSON.parse(kv.get('senate-efd:health')!)).toMatchObject({ state: 'ok', egress: 'proxy' });
+
+    // Then at most twice a day (12h probe interval).
+    await runWatcher(env, at(62));
+    await runWatcher(env, at(61 + 11 * 60));
+    expect(efdCalls).toHaveLength(2);
+    await runWatcher(env, at(61 + 12 * 60));
+    expect(efdCalls).toHaveLength(4);
   });
 });
 
@@ -620,5 +986,201 @@ describe('inHousePriorYearWindow', () => {
     expect(inHousePriorYearWindow(new Date('2026-01-01T00:30:00.000Z'), 14)).toBe(false);
     // Jan 1 15:00 UTC is Jan 1 10:00 ET -> inside.
     expect(inHousePriorYearWindow(new Date('2026-01-01T15:00:00.000Z'), 14)).toBe(true);
+  });
+});
+
+describe('bulk-window discovery alert', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.pollOgeExecutive.mockResolvedValue(null);
+  });
+
+  function disc(docId: string, filedDate: string | null, via: 'live' | 'bulk') {
+    return {
+      docId: `H-2026-${docId}`,
+      chamber: 'house' as const,
+      sourceUrl: `https://example.test/${docId}.pdf`,
+      filedDate,
+      filerName: 'Jane Smith',
+      discoveredVia: via,
+    };
+  }
+
+  it('flags a bulk-discovered filing older than the threshold', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035648', '2026-10-14', 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({
+      docId: 'H-2026-20035648',
+      filerName: 'Jane Smith',
+      filedDate: '2026-10-14',
+      discoveredAt: '2026-10-15T13:12:00.000Z',
+      liveSearchFails: '0',
+    });
+    // Day-only filed_date counts from the END of that day in ET (EDT: 2026-10-15T04:00Z).
+    expect(alerts[0].hoursLate).toBe(9.2);
+  });
+
+  it('does not flag a same-day bulk discovery at the morning refresh (M/D/YYYY filed date)', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    // The House XML reports FilingDate as M/D/YYYY with no time of day.  Read as
+    // midnight UTC this filing would look ~13h late at the ~13:00Z refresh.
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035660', '10/15/2026', 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('treats M/D/YYYY and YYYY-MM-DD filed dates the same', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const now = '2026-10-15T13:12:00.000Z';
+    const us = findStaleBulkDiscoveries([disc('20035661', '10/14/2026', 'bulk')], now, '0');
+    const iso = findStaleBulkDiscoveries([disc('20035661', '2026-10-14', 'bulk')], now, '0');
+    expect(us).toHaveLength(1);
+    expect(us[0].hoursLate).toBe(9.2);
+    expect(iso[0].hoursLate).toBe(us[0].hoursLate);
+  });
+
+  it('measures day-only filed dates against the ET day boundary in both EST and EDT', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    // EST (UTC-5): end of 2026-12-01 ET is 2026-12-02T05:00Z.
+    expect(
+      findStaleBulkDiscoveries([disc('20035662', '2026-12-01', 'bulk')], '2026-12-02T08:00:00.000Z', '0'),
+    ).toHaveLength(0); // 3h after the day ended: under the threshold
+    const est = findStaleBulkDiscoveries([disc('20035662', '2026-12-01', 'bulk')], '2026-12-02T10:00:00.000Z', '0');
+    expect(est).toHaveLength(1);
+    expect(est[0].hoursLate).toBe(5);
+    // EDT (UTC-4): end of 2026-10-14 ET is 2026-10-15T04:00Z.
+    expect(
+      findStaleBulkDiscoveries([disc('20035663', '2026-10-14', 'bulk')], '2026-10-15T07:00:00.000Z', '0'),
+    ).toHaveLength(0);
+    const edt = findStaleBulkDiscoveries([disc('20035663', '2026-10-14', 'bulk')], '2026-10-15T09:00:00.000Z', '0');
+    expect(edt).toHaveLength(1);
+    expect(edt[0].hoursLate).toBe(5);
+  });
+
+  it('stays silent for empty or malformed filed dates and an unparseable discovery time', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const now = '2026-10-15T13:12:00.000Z';
+    expect(findStaleBulkDiscoveries([disc('20035664', '', 'bulk')], now, '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035665', 'not-a-date', 'bulk')], now, '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035666', '13/45/2026', 'bulk')], now, '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035667', '2026-10-01', 'bulk')], '', '0')).toHaveLength(0);
+    expect(findStaleBulkDiscoveries([disc('20035668', '2026-10-01', 'bulk')], 'garbage', '0')).toHaveLength(0);
+  });
+
+  it('stays silent for a bulk-discovered filing under the threshold', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    // Filed 2h before discovery — normal Clerk publication lag
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035649', '2026-10-15T11:12:00.000Z', 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('stays silent for live-search discoveries even when old', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035650', '2026-10-10', 'live')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('stays silent when filed_date is missing', async () => {
+    const { findStaleBulkDiscoveries } = await import('../watcher.ts');
+    const alerts = findStaleBulkDiscoveries(
+      [disc('20035651', null, 'bulk')],
+      '2026-10-15T13:12:00.000Z',
+      '0',
+    );
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('persists discovered_via=bulk for bulk index filings', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValue([{
+      pipelineDocId: 'H-2026-20035648',
+      sourceUrl: 'https://example.test/20035648.pdf',
+      filingDate: '2026-10-14',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    }]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+    const inserts = dbRuns.filter((r) => /INSERT OR IGNORE INTO filings/i.test(r.sql));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].sql).toContain('discovered_via');
+    expect(inserts[0].params[inserts[0].params.length - 1]).toBe('bulk');
+  });
+
+  it('attributes a filing seen by BOTH bulk and live search to live and keeps its bulk filed_date', async () => {
+    const { env, dbRuns } = fakeEnv();
+    const row = {
+      pipelineDocId: 'H-2026-20035670',
+      sourceUrl: 'https://example.test/20035670.pdf',
+      filingDate: '2026-10-14',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    };
+    mocks.fetchHouseIndex.mockResolvedValue([row]);
+    // The live-search HTML carries no FilingDate.
+    mocks.pollHouseLiveSearch.mockResolvedValue([{ ...row, filingDate: '' }]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+      const inserts = dbRuns.filter((r) => /INSERT OR IGNORE INTO filings/i.test(r.sql));
+      expect(inserts).toHaveLength(1);
+      expect(inserts[0].params[3]).toBe('2026-10-14'); // filed_date from the bulk record
+      expect(inserts[0].params[inserts[0].params.length - 1]).toBe('live');
+      expect(errSpy.mock.calls.some((c) => String(c[0]).includes('first discovered via BULK'))).toBe(false);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('logs the stale bulk alert end to end for a bulk-only filing the live search missed', async () => {
+    const { env } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValue([{
+      pipelineDocId: 'H-2026-20035671',
+      sourceUrl: 'https://example.test/20035671.pdf',
+      filingDate: '10/14/2026',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    }]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+      const msgs = errSpy.mock.calls.map((c) => String(c[0]));
+      expect(msgs.some((m) => m.includes('H-2026-20035671') && m.includes('9.2h late'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('persists discovered_via=live for live-search-only filings', async () => {
+    const { env, dbRuns } = fakeEnv();
+    mocks.fetchHouseIndex.mockResolvedValue([]);
+    mocks.pollHouseLiveSearch.mockResolvedValue([{
+      pipelineDocId: 'H-2026-20035650',
+      sourceUrl: 'https://example.test/20035650.pdf',
+      filingDate: '2026-10-10',
+      first: 'Jane', last: 'Smith', stateDst: 'CA01', isPtr: true,
+    }]);
+    mocks.fetchSenatePtrFilings.mockResolvedValue([]);
+    await runWatcher(env, new Date('2026-10-15T13:12:00.000Z'));
+    const inserts = dbRuns.filter((r) => /INSERT OR IGNORE INTO filings/i.test(r.sql));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].params[inserts[0].params.length - 1]).toBe('live');
   });
 });

@@ -896,6 +896,7 @@ describe('durable benchmark admin routes', () => {
     expect(groundTruthQueried).toBe(false);
     expect(selectionSql).toContain("d.source = 'admin'");
     expect(selectionSql).toContain("d.action IN ('confirmed', 'manual')");
+    expect(selectionSql).toContain("'amount_bounds_canonicalize'");
     expect(selectionSql).toContain('ORDER BY d.created_at DESC, d.id DESC');
   });
 
@@ -1380,7 +1381,7 @@ describe('durable benchmark admin routes', () => {
   it('accepts an all-OpenRouter agreement lineup whose underlying vendors are distinct', async () => {
     const lineup = {
       a: { provider: 'llamaparse', model: 'cost-effective' },
-      b: { provider: 'openrouter', model: 'google/gemini-3.7-flash' },
+      b: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
       c: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
     };
     const response = await buildAdminRouter().request('/benchmark/dry-run/H-1', {

@@ -49,7 +49,7 @@ function makeEnv(fx: Fixture): Env {
       if (/strftime\(\?, t\.tx_date\) AS period/i.test(sql) && /AS party/i.test(sql)) {
         return { results: fx.partySplitByPeriod as T[] };
       }
-      if (/AS party,/i.test(sql) && /GROUP BY party/i.test(sql)) {
+      if (/AS party,/i.test(sql) && /GROUP BY \(CASE WHEN/i.test(sql)) {
         return { results: fx.partySplitOverall as T[] };
       }
       if (/AS asset_type_category/i.test(sql)) return { results: fx.sectorBreakdown as T[] };

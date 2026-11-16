@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { isIsoDate } from "./utils";
-import { CONGRESS_EVENT_TYPES } from "./constants";
+import {
+  CONGRESS_EVENT_TYPES,
+  SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION,
+  SHARE_PAYLOAD_SCHEMA_VERSION,
+} from "./constants";
 
 const nullAsUndefined = <T extends z.ZodType>(schema: T) =>
   z.preprocess((value) => value === null ? undefined : value, schema.optional());
@@ -32,6 +36,16 @@ export const TxTypeSchema = z
   .enum(["B", "S", "E", "P"])
   .transform((v): "B" | "S" | "E" => (v === "P" ? "B" : v));
 export type TxType = "B" | "S" | "E";
+
+/** Provenance values ingestion already writes.  Do not add sources that no writer emits. */
+export const TxSourceSchema = z.enum([
+  "primary",
+  "seed_dataset",
+  "manual",
+  "competitor_backfill",
+  "local_mac",
+  "server_cpu",
+]);
 
 export const AssetTypeCategorySchema = z.enum([
   "public_equity",
@@ -133,7 +147,7 @@ export const CongressTransactionSchema = z.object({
   description: z.string().nullable().optional(),
   supplementalText: z.string().nullable().optional(),
   confidence: z.number().optional(),
-  source: z.enum(["primary", "seed_dataset", "manual"]).optional(),
+  source: TxSourceSchema.optional(),
   rowKey: z.string().nullable().optional(),
   createdAt: z.string().optional(),
   cursorSeq: z.number().int().nonnegative().optional(),
@@ -152,13 +166,36 @@ export const CongressTransactionSchema = z.object({
   refCountry: z.string().nullable().optional(),
   refExchangeShort: z.string().nullable().optional(),
   refAssetClass: z.string().nullable().optional(),
+  /** Raw `filers.party`.  Not a display label. */
+  party: z.string().nullable().optional(),
+  bioguideId: z.string().nullable().optional(),
+  pdfUrl: z.string().nullable().optional(),
+  disclosureLagDays: z.number().nullable().optional(),
+  stockActStatus: z.enum(["on_time", "late", "severely_late"]).nullable().optional(),
+  priceAtTrade: z.number().nullable().optional(),
+  spxAtTrade: z.number().nullable().optional(),
+  priceAtFiling: z.number().nullable().optional(),
+  spxAtFiling: z.number().nullable().optional(),
+  /**
+   * One `trade_latency_candidates` row for this trade.  `observedAt` is
+   * `provider_first_seen_at`.  The delta fields are computed, not stored columns.
+   */
+  latency: z.object({
+    provider: z.string().nullable(),
+    observedAt: z.string().nullable(),
+    providerPublishedAt: z.string().nullable(),
+    congressFirstSeenAt: z.string().nullable(),
+    providerDeltaSec: z.number().nullable(),
+    providerPublishedDeltaSec: z.number().nullable(),
+    status: z.string().nullable(),
+  }).nullable().optional(),
 });
 export type CongressTransaction = z.infer<typeof CongressTransactionSchema>;
 
 /** Full transaction row returned by the cursor-paginated REST read endpoint. */
 export const CongressTransactionReadSchema = CongressTransactionSchema.extend({
   confidence: z.number(),
-  source: z.enum(["primary", "seed_dataset", "manual"]),
+  source: TxSourceSchema,
   createdAt: z.string(),
   cursorSeq: z.number().int().nonnegative(),
 });
@@ -299,7 +336,15 @@ export const PriceSeriesSchema = z.object({
 });
 export type PriceSeries = z.infer<typeof PriceSeriesSchema>;
 
+/**
+ * Envelope contract version.  Optional so unversioned senders keep working;  any positive integer
+ * is accepted so a receiver on an older package can see a newer version and decide (log or
+ * reject) via `isSupportedSharePayloadSchemaVersion` instead of failing the whole parse.
+ */
+export const SharePayloadSchemaVersionSchema = z.number().int().positive();
+
 export const SharePayloadSchema = z.object({
+  schemaVersion: SharePayloadSchemaVersionSchema.optional(),
   refs: z.array(SecurityRefInputSchema).optional(),
   spx: z.array(PriceCloseSchema).optional(),
   prices: z.array(PriceSeriesSchema).optional(),
@@ -311,6 +356,23 @@ export const SharePayloadSchema = z.object({
   origin: z.string().optional(),
 });
 export type SharePayload = z.infer<typeof SharePayloadSchema>;
+
+/**
+ * The contract version a share payload was sent with.  Payloads without `schemaVersion` predate
+ * versioning and resolve to `SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION`.
+ */
+export function resolveSharePayloadSchemaVersion(payload: Pick<SharePayload, "schemaVersion">): number {
+  return payload.schemaVersion ?? SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION;
+}
+
+/**
+ * True when this package version understands the payload's contract version (legacy unversioned
+ * payloads included).  Receivers should log or reject a payload for which this returns false.
+ */
+export function isSupportedSharePayloadSchemaVersion(payload: Pick<SharePayload, "schemaVersion">): boolean {
+  const version = resolveSharePayloadSchemaVersion(payload);
+  return version >= SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION && version <= SHARE_PAYLOAD_SCHEMA_VERSION;
+}
 
 export const BundleResponseSchema = z.object({
   ticker: z.string(),
@@ -561,7 +623,7 @@ export const ClientTradeSchema = z.object({
   transaction: ClientTransactionSchema,
   filing: ClientFilingSchema,
   confidence: z.number(),
-  source: z.enum(["primary", "seed_dataset", "manual"]),
+  source: TxSourceSchema,
 });
 export type ClientTrade = z.infer<typeof ClientTradeSchema>;
 

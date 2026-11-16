@@ -41,6 +41,6 @@ secrets, then the repo flipped public under Apache 2.0.
   after verification.
 
 ## Fleet impact
-- History rewrite diverged every local branch/clone — #agent-sync freeze notice
+- History rewrite diverged every local branch/clone — #ag***-s**c freeze notice
   posted before, all-clear + re-clone instructions after. Open PR #1129 (AG)
   needs recreation from a fresh clone.

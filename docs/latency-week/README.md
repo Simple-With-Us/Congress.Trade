@@ -17,7 +17,7 @@ ADMIN_TOKEN="…" python3 scripts/latency-week-tracker.py --admin
 - Appends one JSON object per run to `docs/latency-week/samples/YYYY-MM-DD.jsonl`
   (directory gitignored except this README).
 - Prints a human summary + `ALERT` lines for week-focus anomalies.
-- Exit code `0` if healthy, `2` if any alert fired (for cron / agent-sync).
+- Exit code `0` if healthy, `2` if any alert fired (for cron / ag***-s**c).
 
 ## What we watch
 

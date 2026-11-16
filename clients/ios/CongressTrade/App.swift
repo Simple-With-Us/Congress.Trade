@@ -1,6 +1,8 @@
 import SwiftUI
 import SwiftData
 import OSLog
+import UIKit
+import CoreText
 
 /// Tab identity shared with `TabRouter` so any screen can programmatically
 /// switch tabs.
@@ -148,6 +150,11 @@ struct CongressTradeApp: App {
     @StateObject private var pushManager = PushNotificationManager.shared
     @StateObject private var tabRouter = TabRouter()
     @AppStorage("app_color_scheme") private var appColorScheme = "light"
+    /// Flips true only after `BrandFontWarmup` has built Zilla Slab's
+    /// OpenType tables off the main thread. Until then the root uses the
+    /// system font so the cold-launch layout does not enter
+    /// `OTL::Coverage::SearchFmt2Binary`.
+    @State private var brandFontReady = false
 
     /// Built once, eagerly, instead of via `.modelContainer(for: ClientTrade.self)`
     /// — that convenience modifier has no error path and no recovery, so a store
@@ -157,6 +164,10 @@ struct CongressTradeApp: App {
 
     init() {
         // Native crashes / hangs need the Cocoa SDK before first paint.
+        // sentry-cocoa requires this call on the main thread, so it stays
+        // here. The Zilla warm starts from `.task` after the first frame,
+        // not beside this call — a concurrent `CTLine` holds the Core Text
+        // lock the first layout would wait on.
         SentryTelemetry.start()
     }
 
@@ -168,11 +179,22 @@ struct CongressTradeApp: App {
                 .environmentObject(tabRouter)
                 .modifier(CTPaletteInjector(pref: appColorScheme))
                 .preferredColorScheme(colorScheme)
-                .font(.custom("ZillaSlab-Regular", size: 17, relativeTo: .body))
+                .font(BrandFontLaunch.font(warmedOffMain: brandFontReady))
+                .task {
+                    let warmed = await BrandFontWarmup.waitUntilReady()
+                    if warmed.ranOffMainThread {
+                        brandFontReady = true
+                    }
+                }
                 .onAppear { AppAppearance.apply(appColorScheme) }
                 .onChange(of: appColorScheme) { _, pref in
                     AppAppearance.apply(pref)
                 }
+                // Owner 2026-09-21 ask: shake-to-report, default OFF. The
+                // hook is wired at the App root so every view inherits the
+                // gesture without per-screen plumbing. The detector stays
+                // out of the first frame; see `ShakeToReportCoordinator`.
+                .modifier(ShakeToReportCoordinator())
                 .appUpdatePrompt()
         }
         .modelContainer(tradeCacheContainer)
@@ -479,6 +501,15 @@ struct MainTabView: View {
         .task {
             store.modelContext = modelContext
             if store.feed == nil {
+                // CT-2459: Trends is the landing tab — let its fan-out win
+                // the launch bandwidth instead of racing the feed page +
+                // bootstrap + signed-in probes against it (~17 requests
+                // contended before first useful paint). The SwiftData
+                // cache already paints the Trades list instantly; its
+                // network refresh follows immediately after.
+                if tabRouter.selection == .trends {
+                    await store.refreshTrends()
+                }
                 await store.refresh()
             }
             // Catch-up for a purchase that was charged and finished locally but
@@ -578,6 +609,233 @@ struct MainTabView: View {
 struct FilingSheetTarget: Identifiable, Hashable {
     let docId: String
     var id: String { docId }
+}
+
+// MARK: - Cold-launch font (CT-2435)
+
+/// Zilla Slab's first `CTLine` walks `OTL::Coverage::SearchFmt2Binary` on
+/// whatever thread draws it. Cold-launch hangs sampled that walk on the
+/// main thread while Sentry's current screen was `ShakeDetectorViewController`.
+/// The tables are built on a detached task; the root view applies the face
+/// only after that task has left the main thread.
+enum BrandFontWarmup {
+    static let postScriptName = "ZillaSlab-Regular"
+
+    struct Result: Equatable, Sendable {
+        let ranOffMainThread: Bool
+    }
+
+    private static let lock = NSLock()
+    private static var warmedOffMain = false
+    private static let warmTask: Task<Result, Never> = Task.detached(priority: .userInitiated) {
+        warmTables()
+    }
+
+    static func hasWarmedOffMain() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return warmedOffMain
+    }
+
+    static func waitUntilReady() async -> Result {
+        await warmTask.value
+    }
+
+    /// Loads the face and builds one line so later main-thread layout hits
+    /// warm coverage tables. Returns whether this call itself ran off the
+    /// main thread — a main-thread call does not count as warmed.
+    static func warmTables() -> Result {
+        let offMain = !Thread.isMainThread
+        if UIFont(name: postScriptName, size: 17) == nil,
+           let url = Bundle.main.url(forResource: "ZillaSlab-Regular", withExtension: "ttf") {
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        }
+        let font = UIFont(name: postScriptName, size: 17) ?? UIFont.systemFont(ofSize: 17)
+        let sample = NSAttributedString(string: "Congress.Trade", attributes: [.font: font])
+        _ = CTLineCreateWithAttributedString(sample as CFAttributedString)
+        if offMain {
+            lock.lock()
+            warmedOffMain = true
+            lock.unlock()
+        }
+        return Result(ranOffMainThread: offMain)
+    }
+}
+
+enum BrandFontLaunch {
+    /// The custom face stays off the cold-launch layout turn.
+    static func appliesCustomFont(warmedOffMain: Bool) -> Bool {
+        warmedOffMain
+    }
+
+    static func font(warmedOffMain: Bool) -> Font {
+        if appliesCustomFont(warmedOffMain: warmedOffMain) {
+            return .custom(BrandFontWarmup.postScriptName, size: 17, relativeTo: .body)
+        }
+        return .body
+    }
+}
+
+// MARK: - Shake-to-report (owner 2026-09-21 ask, default OFF)
+
+/// Opt-in flag for shake-to-report. The cold-launch read goes through
+/// `load`, which hops to a detached task. `UserDefaults.standard` from
+/// `updateUIViewController` used to run inside the first SwiftUI layout.
+enum ShakeToReportPreference {
+    static let defaultsKey = "shake_to_report_enabled"
+    static let enabledUserInfoKey = "enabled"
+
+    static func load(suiteName: String? = nil) async -> ShakePreferenceRead {
+        let key = defaultsKey
+        return await Task.detached(priority: .utility) {
+            let defaults: UserDefaults
+            if let suiteName {
+                defaults = UserDefaults(suiteName: suiteName) ?? .standard
+            } else {
+                defaults = .standard
+            }
+            return ShakePreferenceRead(
+                enabled: defaults.bool(forKey: key),
+                readOffMainThread: !Thread.isMainThread
+            )
+        }.value
+    }
+}
+
+struct ShakePreferenceRead: Equatable, Sendable {
+    let enabled: Bool
+    let readOffMainThread: Bool
+}
+
+/// When the UIKit detector may join the window. It stays out until the
+/// first frame has committed and the user has opted in (default off).
+/// Installing it earlier makes `viewDidAppear` call `becomeFirstResponder`
+/// on the same main-thread turn Sentry records as an app hang.
+enum ShakeToReportLaunch {
+    static func shouldInstallDetector(isEnabled: Bool, firstFrameCommitted: Bool) -> Bool {
+        isEnabled && firstFrameCommitted
+    }
+
+    static func schedule(isEnabled: Bool, firstFrameCommitted: Bool) -> ShakeResponderSchedule {
+        if shouldInstallDetector(isEnabled: isEnabled, firstFrameCommitted: firstFrameCommitted) {
+            return .nextMainTurn
+        }
+        return .skip
+    }
+}
+
+enum ShakeResponderSchedule: Equatable {
+    /// Do not touch the responder chain. This is the cold-launch path.
+    case skip
+    /// Arm on the next main turn, after the appearance layout has returned.
+    case nextMainTurn
+}
+
+/// Listens for the iOS shake gesture once launch has settled. Default is
+/// OFF. A zero-size view controller is inserted only after `load` returns,
+/// so the first frame does not host `ShakeDetectorViewController`.
+struct ShakeToReportCoordinator: ViewModifier {
+    @State private var isEnabled = false
+    @State private var firstFrameCommitted = false
+    @State private var preferenceOverridden = false
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                if ShakeToReportLaunch.shouldInstallDetector(
+                    isEnabled: isEnabled,
+                    firstFrameCommitted: firstFrameCommitted
+                ) {
+                    ShakeDetectorHost(isEnabled: isEnabled)
+                        .frame(width: 0, height: 0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .task {
+                let loaded = await ShakeToReportPreference.load()
+                if !preferenceOverridden {
+                    isEnabled = loaded.enabled
+                }
+                firstFrameCommitted = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .shakeToReportPreferenceChanged)) { note in
+                preferenceOverridden = true
+                if let value = note.userInfo?[ShakeToReportPreference.enabledUserInfoKey] as? Bool {
+                    isEnabled = value
+                }
+            }
+    }
+}
+
+private struct ShakeDetectorHost: UIViewControllerRepresentable {
+    let isEnabled: Bool
+
+    func makeUIViewController(context: Context) -> ShakeDetectorViewController {
+        let vc = ShakeDetectorViewController()
+        vc.isShakeEnabled = isEnabled
+        vc.launchFrameCommitted = true
+        return vc
+    }
+
+    func updateUIViewController(_ vc: ShakeDetectorViewController, context: Context) {
+        vc.isShakeEnabled = isEnabled
+        vc.launchFrameCommitted = true
+    }
+}
+
+final class ShakeDetectorViewController: UIViewController {
+    /// Set by the host from the opt-in flag. Init leaves this false so
+    /// constructing the controller does not read `UserDefaults`.
+    var isShakeEnabled = false
+    /// Set by the host, which is inserted only after the first frame.
+    var launchFrameCommitted = false
+
+    override var canBecomeFirstResponder: Bool {
+        responderSchedule() == .nextMainTurn
+    }
+
+    func responderSchedule() -> ShakeResponderSchedule {
+        ShakeToReportLaunch.schedule(
+            isEnabled: isShakeEnabled,
+            firstFrameCommitted: launchFrameCommitted
+        )
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // The host is a zero-size background. An opaque view here would
+        // paint over the first frame if SwiftUI gave it a non-zero slot.
+        view.backgroundColor = .clear
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        switch responderSchedule() {
+        case .skip:
+            return
+        case .nextMainTurn:
+            // The next turn, not this appearance call. `becomeFirstResponder`
+            // here used to extend the cold-launch layout that Core Text was
+            // still measuring.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.responderSchedule() == .nextMainTurn else { return }
+                self.becomeFirstResponder()
+            }
+        }
+    }
+
+    override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
+        super.motionEnded(motion, with: event)
+        guard motion == .motionShake else { return }
+        guard isShakeEnabled else { return }
+        // Single notification post per shake; the Account sheet listens
+        // and presents `BugReportSheet`. Avoids any per-view re-binding.
+        NotificationCenter.default.post(name: .shakeToReport, object: nil)
+        // Light haptic so the user knows the gesture was caught (they
+        // don't see a visual until the sheet appears ~250ms later).
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
 }
 
 // AppUpdatePrompt lives in AppUpdatePrompt.swift, copied from

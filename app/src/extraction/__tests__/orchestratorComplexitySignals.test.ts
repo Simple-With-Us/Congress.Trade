@@ -48,7 +48,7 @@ interface CapturedRun {
   params: unknown[];
 }
 
-function fakeDb(): { db: D1Database; runs: CapturedRun[] } {
+function fakeDb(row: Record<string, unknown> = FILING_ROW): { db: D1Database; runs: CapturedRun[] } {
   const runs: CapturedRun[] = [];
   const db = {
     prepare(sql: string) {
@@ -59,7 +59,7 @@ function fakeDb(): { db: D1Database; runs: CapturedRun[] } {
           return this;
         },
         async first<T>() {
-          if (/FROM filings WHERE doc_id/i.test(sql)) return FILING_ROW as unknown as T;
+          if (/FROM filings WHERE doc_id/i.test(sql)) return row as unknown as T;
           return null as T | null;
         },
         async run() {
@@ -218,5 +218,78 @@ describe('orchestrator complexity signals (raw_bytes / page_count)', () => {
       completionTokens: 17,
       cachedTokens: 3,
     }));
+  });
+});
+
+describe('orchestrator OCR byte retention (CT-2448)', () => {
+  beforeEach(() => {
+    mocks.buildExtractorPipeline.mockReset();
+    mocks.reportAiUsage.mockReset();
+    mocks.buildExtractorPipeline.mockReturnValue([
+      {
+        name: 'textPdf',
+        canHandle: () => true,
+        extract: async () => ({
+          transactions: [],
+          confidence: 0.9,
+          raw: 'text',
+          extractor: 'textPdf',
+        }),
+      },
+    ]);
+  });
+
+  const EXECUTIVE_ROW = {
+    doc_id: 'E-2026-donald-j-trump-08-12-2026-278t',
+    chamber: 'executive',
+    filer_id: 'EXEC-DJT',
+    // Realistic: the watcher stores executive filings with filing_type 'P'.
+    filing_type: 'P',
+    filed_date: '2026-08-12',
+    source_url: 'https://example.test/E-278t.pdf',
+    raw_object_key: 'raw/E-278t.pdf',
+    ingest_status: 'classified',
+    doc_kind: 'text_pdf',
+    extractor: null,
+    model_version: null,
+    confidence: null,
+    first_seen_at: '2026-08-12T00:00:00.000Z',
+    source_updated_at: null,
+    error: null,
+  };
+
+  it('keeps a PDF copy for an executive 278-T when keepBytes is set', async () => {
+    const bytes = new ArrayBuffer(1234);
+    const { db } = fakeDb(EXECUTIVE_ROW);
+    const env = { DB: db, RAW_FILES: fakeRawFiles(bytes) } as unknown as Env;
+
+    const result = await extractParsed(env, EXECUTIVE_ROW.doc_id, undefined, { keepBytes: true });
+
+    expect(result?.bytes).toBeInstanceOf(ArrayBuffer);
+    expect(result?.bytes?.byteLength).toBe(1234);
+    // A copy, not the buffer the extractor may detach.
+    expect(result?.bytes).not.toBe(bytes);
+  });
+
+  it('skips the PDF copy for filings the local OCR pass cannot retry', async () => {
+    const bytes = new ArrayBuffer(1234);
+    const { db } = fakeDb();
+    const env = { DB: db, RAW_FILES: fakeRawFiles(bytes) } as unknown as Env;
+
+    const result = await extractParsed(env, 'H-1', undefined, { keepBytes: true });
+
+    expect(result).not.toBeNull();
+    expect(result?.bytes).toBeUndefined();
+  });
+
+  it('skips the PDF copy without keepBytes even for an executive 278-T', async () => {
+    const bytes = new ArrayBuffer(1234);
+    const { db } = fakeDb(EXECUTIVE_ROW);
+    const env = { DB: db, RAW_FILES: fakeRawFiles(bytes) } as unknown as Env;
+
+    const result = await extractParsed(env, EXECUTIVE_ROW.doc_id);
+
+    expect(result).not.toBeNull();
+    expect(result?.bytes).toBeUndefined();
   });
 });

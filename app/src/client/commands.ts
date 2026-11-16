@@ -171,8 +171,12 @@ async function redeemAppleTransactionForUser(
     latestTransactionId: transaction.transactionId ?? null,
     purchaseDate: transaction.purchaseDate != null ? new Date(Number(transaction.purchaseDate)).toISOString() : null,
     expiresDate: transaction.expiresDate != null ? new Date(Number(transaction.expiresDate)).toISOString() : null,
+    redeemGuard: true,
   });
-  if (!upserted.ok) {
+  if (upserted.ok === false) {
+    if (upserted.reason === 'guarded_status') {
+      throw new ClientInputError('this Apple subscription was refunded or revoked', 400);
+    }
     // Never silently reassign a subscription's Premium grant to a new
     // account — restore-purchases (or claiming an anonymous device purchase)
     // on a shared/second Apple ID or account must surface as a conflict, not
@@ -255,7 +259,7 @@ export async function executeCommand(
         delivery,
         targetUrl: delivery === 'webhook' ? targetUrl : null,
         secret: null,
-        filters: normalizeFilters(input.filters),
+        filters: await normalizeFilters(env, input.filters),
       });
       return { subscription: publicSubscription(sub, true) };
     } catch (err) {
@@ -268,7 +272,7 @@ export async function executeCommand(
     if (!id) throw new ClientInputError('id is required');
     const existing = await getOwnedSubscription(env, user, id);
     const patch: Partial<Pick<Subscription, 'filters' | 'targetUrl' | 'active'>> = {};
-    if (input.filters !== undefined) patch.filters = normalizeFilters(input.filters);
+    if (input.filters !== undefined) patch.filters = await normalizeFilters(env, input.filters);
     if (input.active !== undefined) {
       patch.active = input.active === true;
       if (patch.active && !existing.active) {
