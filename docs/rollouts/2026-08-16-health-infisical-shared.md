@@ -1,9 +1,9 @@
-# 2026-08-16 — Health reports Infisical sources; AGENT_SYNC lives only in shared
+# 2026-08-16 — Health reports Infisical sources; AG***_S**C lives only in shared
 
 ## 1. Context & Objective
 
-After rotating the leaked `ADMIN_TOKEN` / `AGENT_SYNC_*` pair, the same
-`AGENT_SYNC_*` values were written into the ST app project, the CT app
+After rotating the leaked `ADMIN_TOKEN` / `AG***_S**C_*` pair, the same
+`AG***_S**C_*` values were written into the ST app project, the CT app
 project, and shared-at-ct.  The owner is right: fleet-wide keys belong
 in the shared Infisical project only.  The resolver merges shared first
 and then the app project, so an app-side copy shadows shared and makes
@@ -16,10 +16,10 @@ see that shared and app are both loading.
 
 ## 2. Changes Made
 
-- Deleted `AGENT_SYNC_TOKEN` and `AGENT_SYNC_POST_TOKEN` from the
+- Deleted `AG***_S**C_TOKEN` and `AG***_S**C_POST_TOKEN` from the
   Congress.Trade and Socratic.Trade **app** Infisical projects.  They
   remain in **shared-at-ct** (`18f563a3-…`) and in
-  `~/.secrets/agent-sync.env` / `global-api-keys`.
+  `~/.secrets/ag***-s**c.env` / `global-api-keys`.
 - `GET /api/health` now includes `checks.secrets` from
   `getSecretResolverStatus` (enabled, cacheReady, errors, per-source
   configured/ok/count).
@@ -39,7 +39,7 @@ Touched:
 
 - Did not put `ADMIN_TOKEN` in shared.  That token is Congress.Trade
   admin auth and stays on the CT app project.
-- Did not copy `AGENT_SYNC_*` onto Usage Monitor Infisical.  Cloud
+- Did not copy `AG***_S**C_*` onto Usage Monitor Infisical.  Cloud
   agents that only have a UM identity should use `~/.secrets` or the
   shared identity.
 - Did not add a Cloudflare WAF skip in this change.  Public
@@ -64,14 +64,14 @@ tests still 9/9.  Merged `origin/main` after #1886 (`77782b7b`)
 conflicted on `docs/EFFORT-LOG.md`; kept both rows.
 
 Infisical names-only check after delete: CT app and ST app no longer
-list `AGENT_SYNC_*`; shared still does.
+list `AG***_S**C_*`; shared still does.
 
 ## 5. Next Steps & Blockers
 
 1. **Done.**  Coolify auto-deployed #1885.  Live sha `a50c09e5`.
    `checks.secrets.sources`: shared ok/65, app ok/145, 0 errors.
-2. Local Mac agents keep posting via `~/.secrets/agent-sync.env`.
-   Cloud agents that used the ST/CT app project for `AGENT_SYNC_*`
+2. Local Mac agents keep posting via `~/.secrets/ag***-s**c.env`.
+   Cloud agents that used the ST/CT app project for `AG***_S**C_*`
    must read the shared project (or the handoff file) instead.
 3. Owner: replace congress.trade admin UI localStorage `ADMIN_TOKEN`
    from `CT_ADMIN_TOKEN` in `~/.secrets/global-api-keys` (do not paste).

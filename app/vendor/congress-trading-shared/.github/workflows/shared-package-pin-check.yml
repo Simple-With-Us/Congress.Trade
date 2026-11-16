@@ -1,0 +1,47 @@
+name: Shared Package Pin Check (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      expected-ref:
+        required: true
+        type: string
+        description: "The exact tag or SHA expected to be pinned for @jaywedgeworth22/congress-trading-shared"
+
+jobs:
+  check-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repo
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify package-lock.json pin
+        run: |
+          echo "Verifying exact pin for @jaywedgeworth22/congress-trading-shared..."
+          if [ ! -f "package-lock.json" ]; then
+            echo "::error::No package-lock.json found. This check requires a lockfile."
+            exit 1
+          fi
+
+          # Find the resolved URL in package-lock.json for this package
+          RESOLVED=$(cat package-lock.json | jq -r '.packages["node_modules/@jaywedgeworth22/congress-trading-shared"].resolved // .dependencies["@jaywedgeworth22/congress-trading-shared"].resolved // empty')
+          
+          if [ -z "$RESOLVED" ]; then
+            echo "::error::Package @jaywedgeworth22/congress-trading-shared not found in package-lock.json"
+            exit 1
+          fi
+          
+          echo "Resolved reference is: $RESOLVED"
+          
+          # Check if the expected-ref is in the resolved string
+          if [[ "$RESOLVED" == *"${{ inputs.expected-ref }}"* ]]; then
+            echo "Pin check PASSED. Matches expected ref: ${{ inputs.expected-ref }}"
+          else
+            echo "::error::Pin check FAILED. Expected to contain '${{ inputs.expected-ref }}', but found '$RESOLVED'"
+            exit 1
+          fi

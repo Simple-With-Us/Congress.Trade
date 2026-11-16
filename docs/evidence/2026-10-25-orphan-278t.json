@@ -1,0 +1,70 @@
+{
+  "doc_id": "E-2026-donald-j-trump-08-12-2026-278t",
+  "chamber": "executive",
+  "filing_type": "P",
+  "form": "278-T",
+  "filed_date": "2026-08-12",
+  "filer_id": "EXEC-DJT",
+  "fetched_at": "2026-10-25T15:01:35Z",
+  "pdf": {
+    "requested_url": "https://extapps2.oge.gov/201/Presiden.nsf/PAS+Index/2BF91F890F718ACB85258E5B002DE16B/$FILE/Donald-J-Trump-08.12.2026-278T.pdf",
+    "http_status": 200,
+    "http_status_line": "HTTP/1.1 200 OK",
+    "final_url": "https://extapps2.oge.gov/201/Presiden.nsf/PAS+Index/2BF91F890F718ACB85258E5B002DE16B/$FILE/Donald-J-Trump-08.12.2026-278T.pdf",
+    "redirects": 0,
+    "content_type": "application/pdf",
+    "bytes": 26880519,
+    "sha256": "dfa4d453c1008370a001043bad41f1149fbe18b0800588157c10c4631e5476c6",
+    "response_date": "Sun, 25 Oct 2026 15:01:35 GMT",
+    "last_modified": "Sat, 22 Aug 2026 09:09:45 GMT"
+  },
+  "pdfinfo": {
+    "title": "Donald-J-Trump-08.12.2026-278T.pdf",
+    "author": "jmerilos",
+    "creator": "RICOH IM C4510",
+    "producer": "Acrobat Distiller 26.0 (Windows)",
+    "creation_date": "Fri Aug 21 13:48:16 2026 CDT",
+    "pages": 34,
+    "page_size": "612 x 792 pts (letter)",
+    "page_rot": 90,
+    "encrypted": false,
+    "pdf_version": "1.6",
+    "file_size_bytes": 26880519
+  },
+  "text_layer": {
+    "tool": "pdftotext -layout",
+    "output_bytes": 297,
+    "stripped_chars_total": 262,
+    "empty_page_count": 33,
+    "nonempty_pages": [
+      {
+        "page": 1,
+        "stripped_chars": 262
+      }
+    ],
+    "pages_2_through_34": "empty",
+    "page_1_text": "KEITH SONDERLING Digitally signed by KEITH SONDERLING\n                 Date: 2026.08.20 16:24:34 -04'00'\n                                                        8/20/26\n\n\n\n\n                                                                  2*(\u00035HFHLYHG\u001d\u0003\u001b\u0012\u0014\u0016\u0012\u0015\u0013\u0015\u0019\n\f",
+    "result": "pdftotext -layout wrote 297 bytes for the whole file.  Page 1 has 262 non-whitespace characters, and that text is only the Keith Sonderling digital-signature stamp.  Pages 2-34 have 0 characters each (33 empty pages).  The text layer contains no transaction rows.",
+    "extracted_rows": []
+  },
+  "part_7": {
+    "verdict": "Part 7 holds real rows that a human or a vision pass must read.  This filing must not be published as empty, and verified_empty is not justified.",
+    "text_layer_verified_this_pass": "pdftotext -layout wrote 297 bytes for the whole file.  Page 1 has 262 non-whitespace characters, and that text is only the Keith Sonderling digital-signature stamp.  Pages 2-34 have 0 characters each (33 empty pages).  The text layer contains no transaction rows.",
+    "publisher_rendered_page_evidence": "Attributed to BF-PUBLISHER on CT-2447 (2026-10-25), from a reading of the rendered pages.  This pass did not use a vision model and did not re-derive the rendered rows.  The publisher reports that the PDF is a RICOH scan, that the text layer is empty on pages 2-34, and that the rendered pages show transactions #34-66 (page 3) and #397-429 (page 14), on the order of 1100+ real rows.  pdfinfo in this pass agrees on the RICOH IM C4510 creator and on 34 pages.  pdftotext -layout in this pass agrees that pages 2-34 are empty.",
+    "rendered_row_ranges_attributed": [
+      {
+        "page": 3,
+        "rows": "34-66",
+        "tx_type": "purchase",
+        "dates": "2026-06-02 to 2026-06-15"
+      },
+      {
+        "page": 14,
+        "rows": "397-429",
+        "tx_type": "purchase",
+        "dates": "2026-06-15 to 2026-06-16"
+      }
+    ],
+    "scale_attributed": "about 1100+ real rows"
+  }
+}

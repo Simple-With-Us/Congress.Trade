@@ -28,7 +28,14 @@
 
 import { cleanFilerName } from '../extraction/nameNormalizer.ts';
 import { diminutiveEquivalents } from '../enrichment/legislators.ts';
-import { NAME_NOISE_TOKENS, type ParsedCompetitorChamber } from './competitorAttribution.ts';
+import {
+  competitorHouseFilerId,
+  competitorQualifiedManualFilerId,
+  NAME_NOISE_TOKENS,
+  type ParsedCompetitorChamber,
+} from './competitorAttribution.ts';
+import { resolveExecutiveFilerIdFromName } from './executiveIdentity.ts';
+import { applyMemberNameAlias } from './memberIdentity.ts';
 
 export interface ExistingFilerCandidate {
   filerId: string;
@@ -77,6 +84,26 @@ function uniqueOrNull<T extends { filerId: string }>(hits: readonly T[]): T | nu
   return ids.size === 1 ? hits[0] : null;
 }
 
+/** Reporter strings plus curated member aliases ("Maria Elvira" → "Maria Elvira Salazar"). */
+function expandReporterNames(names: readonly string[]): string[] {
+  const out: string[] = [];
+  const add = (raw: string) => {
+    const trimmed = raw.trim();
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+  };
+  for (const name of names) {
+    add(name);
+    add(applyMemberNameAlias(name));
+  }
+  return out;
+}
+
+function stateCompatible(wanted: string, filerState: string | null): boolean {
+  const have = (filerState ?? '').trim().toUpperCase();
+  if (!wanted || !have) return true;
+  return wanted === have;
+}
+
 /**
  * The single existing filer a competitor payload's reporter belongs to, or
  * null when there is no confident, unambiguous match.  See the module doc for
@@ -91,6 +118,7 @@ export function findExistingFilerForCompetitorReporter(args: {
 }): ExistingFilerCandidate | null {
   const real = args.candidates.filter((c) => !isMintedCompetitorFilerId(c.filerId));
   const state = (args.state ?? '').trim().toUpperCase();
+  const names = expandReporterNames(args.names);
 
   if (args.bioguideId) {
     const hits = real.filter(
@@ -100,13 +128,20 @@ export function findExistingFilerForCompetitorReporter(args: {
     if (one) return one;
   }
 
-  const wanted = args.names.map(competitorNameTokens).filter((t) => t.length >= 2);
+  // A curated EXEC-* id wins over a same-name roster row. MANUAL-* rows are
+  // already excluded, so a phantom is never the canonical home.
+  const execHits = real.filter((c) => {
+    if (!chamberCompatible(args.chamber, c.chamber) || !stateCompatible(state, c.state)) return false;
+    return names.some((name) => resolveExecutiveFilerIdFromName(name) === c.filerId);
+  });
+  const execOne = uniqueOrNull(execHits);
+  if (execOne) return execOne;
+
+  const wanted = names.map(competitorNameTokens).filter((t) => t.length >= 2);
   if (wanted.length === 0) return null;
 
   const hits = real.filter((c) => {
-    if (!chamberCompatible(args.chamber, c.chamber)) return false;
-    const cState = (c.state ?? '').trim().toUpperCase();
-    if (state && cState && state !== cState) return false;
+    if (!chamberCompatible(args.chamber, c.chamber) || !stateCompatible(state, c.state)) return false;
     const have = [c.fullName, c.displayName]
       .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
       .map(competitorNameTokens)
@@ -114,4 +149,53 @@ export function findExistingFilerForCompetitorReporter(args: {
     return wanted.some((w) => have.some((h) => competitorNamesMatch(w, h)));
   });
   return uniqueOrNull(hits);
+}
+
+export interface CompetitorFilerAssignment {
+  filerId: string;
+  /** True when the caller must insert this id. An existing roster or EXEC id is never minted. */
+  minted: boolean;
+}
+
+/**
+ * Resolve a competitor reporter onto an existing filer, or mint a qualified id.
+ * Returns null for a bare surname: a last-name-only match never creates a filer
+ * and never attaches to someone who merely shares that surname.
+ */
+export function assignCompetitorFilerId(args: {
+  rawName: string;
+  names?: readonly string[];
+  chamber?: ParsedCompetitorChamber | null;
+  state?: string | null;
+  district?: string | null;
+  bioguideId?: string | null;
+  candidates: readonly ExistingFilerCandidate[];
+}): CompetitorFilerAssignment | null {
+  const names = expandReporterNames(args.names && args.names.length > 0 ? args.names : [args.rawName]);
+  if (!names.includes(args.rawName.trim()) && args.rawName.trim()) names.unshift(args.rawName.trim());
+
+  const existing = findExistingFilerForCompetitorReporter({
+    names,
+    chamber: args.chamber,
+    state: args.state,
+    bioguideId: args.bioguideId,
+    candidates: args.candidates,
+  });
+  if (existing) return { filerId: existing.filerId, minted: false };
+
+  // Refuse before any mint. House slugs and MANUAL-<FIRST>-<LAST> both need
+  // a first and a last; "Delaney" must not become house-ny7-delaney.
+  const qualified = competitorQualifiedManualFilerId(args.rawName);
+  if (!qualified) return null;
+
+  if (args.state && args.district) {
+    const houseId = competitorHouseFilerId(args.rawName, args.state, args.district);
+    if (houseId) {
+      const already = args.candidates.some((c) => c.filerId === houseId);
+      return { filerId: houseId, minted: !already };
+    }
+  }
+
+  const alreadyManual = args.candidates.some((c) => c.filerId === qualified);
+  return { filerId: qualified, minted: !alreadyManual };
 }

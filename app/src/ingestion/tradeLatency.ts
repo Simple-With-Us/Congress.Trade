@@ -72,11 +72,10 @@ type EnvWithWatch = Env & {
   /** @deprecated Latency probes use FMP_LATENCY_API_KEY (+ secondary) only. */
   FMP_API_KEY?: string;
   FMP_DAILY_CALL_CAP?: string;
-  FMP_MAX_PER_MINUTE?: string;
   FMP_DISCLOSURE_WATCH_ENABLED?: string;
   FMP_DISCLOSURE_WATCH_LIMIT?: string;
   UNUSUAL_WHALES_API_KEY?: string;
-  /** Alias used in global-api-keys / Infisical (no underscores in “unusualwhales”). */
+  /** Alias used in Infisical (no underscores in “unusualwhales”). */
   UNUSUALWHALES_API_KEY?: string;
   QUIVER_API_KEY?: string;
   QUIVER_API_TOKEN?: string;
@@ -693,16 +692,42 @@ function fmpHttp429DayKey(slot: FmpLatencyKeySlot, now = new Date()): string {
  * Used for FMP 429 (bandwidth cap) and for 401/403 (unauthorized / wrong plan)
  * so the other key keeps winning selection instead of the dead one.
  */
+export type FmpSlotDaySkipCause = '429' | 'unauthorized';
+
 export async function markFmpSlotHttp429(
   env: Env,
   slot: FmpLatencyKeySlot,
   now = new Date(),
+  cause: FmpSlotDaySkipCause = '429',
 ): Promise<void> {
   try {
-    await env.CONFIG_KV.put(fmpHttp429DayKey(slot, now), '1', { expirationTtl: 172800 });
+    await env.CONFIG_KV.put(fmpHttp429DayKey(slot, now), cause, { expirationTtl: 172800 });
   } catch {
     /* best effort */
   }
+}
+
+export async function readFmpSlotHttp429Cause(
+  env: Env,
+  slot: FmpLatencyKeySlot,
+  now = new Date(),
+): Promise<FmpSlotDaySkipCause | null> {
+  try {
+    const raw = await env.CONFIG_KV.get(fmpHttp429DayKey(slot, now));
+    if (raw === '429' || raw === 'unauthorized') return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** True only for bandwidth-cap (429) day marks — used for self-healing silence, not slot skip. */
+export async function isFmpSlotHttp429DayBan(
+  env: Env,
+  slot: FmpLatencyKeySlot,
+  now = new Date(),
+): Promise<boolean> {
+  return (await readFmpSlotHttp429Cause(env, slot, now)) === '429';
 }
 
 export async function isFmpSlotHttp429(
@@ -1159,6 +1184,16 @@ async function resolveFmpLatencyKeyMaterial(
     return { apiKey, secretName };
   }
   return null;
+}
+
+/** Key slots with configured material (same resolution as {@link selectFmpLatencyKey}). */
+export async function listConfiguredFmpLatencySlots(env: Env): Promise<FmpLatencyKeySlot[]> {
+  const slots: FmpLatencyKeySlot[] = [];
+  const primary = await resolveFmpLatencyKeyMaterial(env, '1');
+  if (primary) slots.push('1');
+  const secondary = await resolveFmpLatencyKeyMaterial(env, '2', primary?.apiKey ?? null);
+  if (secondary) slots.push('2');
+  return slots;
 }
 
 /**
@@ -2377,7 +2412,8 @@ export async function getDisclosureLatencyProviderStatuses(env: Env): Promise<Di
  * Empty set when the disclosure-latency watch itself is off — callers decide
  * how loud "nothing is expected to run" should be.
  */
-export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>> {
+/** Config-intended latency providers (before auth-rejection latch). */
+export async function configExpectedLatencyProviderIds(env: Env): Promise<Set<string>> {
   const envx = env as EnvWithWatch;
   const out = new Set<string>();
   if (!(await enabled(envx))) return out;
@@ -2392,6 +2428,13 @@ export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>>
     }
     out.add(id);
   }
+  return out;
+}
+
+export async function expectedLatencyProviderIds(env: Env): Promise<Set<string>> {
+  const out = await configExpectedLatencyProviderIds(env);
+  const { latencyProvidersWithRejectedCredentials } = await import('./scoutHandoff.ts');
+  for (const id of await latencyProvidersWithRejectedCredentials(env)) out.delete(id);
   return out;
 }
 
@@ -3813,6 +3856,26 @@ async function runProviderProbe(
     }
   };
 
+  const { shouldThrottleAuthRejectedLatencyProbe } = await import('./scoutHandoff.ts');
+  const membershipId = provider.id === 'unusual_whales' || provider.id === 'quiver'
+    ? provider.id
+    : null;
+  if (
+    membershipId
+    && await shouldThrottleAuthRejectedLatencyProbe(env, membershipId, now, { force: opts.force })
+  ) {
+    return {
+      ...base,
+      enabled: false,
+      operationalStatus: 'stopped',
+      reason: `${provider.label} credentials rejected (401/403); next recovery probe after backoff (admin force bypasses)`,
+      fetchedRows: 0,
+      pending: 0,
+      matched: 0,
+      errors,
+    };
+  }
+
   // FMP family: skip HTTP when explicitly OFF (FMP_LATENCY_PROBE_ENABLED=false)
   // or path filtered out of FMP_LATENCY_PATHS. Default is ON for CT.
   if (isFmpFamilyProvider(provider.id) && base.operationalStatus === 'off') {
@@ -3991,7 +4054,7 @@ async function runProviderProbe(
 
   if (!capSkipped && apiKey) {
     let fmpCallsMade = 0;
-    // Dedicated latency pacer — do not share enrichment getSharedFmpPacer state
+    // Dedicated latency pacer — do not share the enrichment getSharedStPeerPacer state
     // with free keys (avoids coupling to enrichment cadence). Simple serial wait.
     let lastFmpCallMs = 0;
     const FMP_LATENCY_MIN_GAP_MS = 350;
@@ -4043,7 +4106,7 @@ async function runProviderProbe(
           const is429 = /FMP_HTTP_429|HTTP_429/.test(msg);
           const isUnauthorized = /FMP_HTTP_(401|403)|HTTP_(401|403)/.test(msg);
           if ((!is429 && !isUnauthorized) || !isFmpStable || !fmpSelection) break;
-          await markFmpSlotHttp429(env, fmpSelection.slot, now);
+          await markFmpSlotHttp429(env, fmpSelection.slot, now, is429 ? '429' : 'unauthorized');
           if (attempt === 0) {
             const retry = await selectFmpLatencyKey(env, now, { force: true, schedule });
             if (retry && retry.slot !== fmpSelection.slot) {

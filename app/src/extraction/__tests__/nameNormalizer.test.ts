@@ -3,6 +3,8 @@ import {
   cleanAssetString,
   cleanFilerName,
   isJunkAssetString,
+  namesPlausiblyMatch,
+  simplifyCompanyName,
   splitAssetNameDetail,
 } from '../nameNormalizer.ts';
 
@@ -202,5 +204,95 @@ describe('splitAssetNameDetail', () => {
     expect(splitAssetNameDetail(null)).toEqual({ name: '', note: null });
     expect(splitAssetNameDetail('Rate/Coupon: 5.0% Matures: 05/01/2026').name).not.toBe('');
     expect(splitAssetNameDetail('ARCC ..', 'ARCC')).toEqual({ name: 'ARCC', note: null });
+  });
+});
+
+describe('namesPlausiblyMatch (ticker ↔ asset consistency)', () => {
+  function matchDisclosureToRef(assetLabel: string, refLabel: string): boolean {
+    return namesPlausiblyMatch(
+      simplifyCompanyName(assetLabel),
+      simplifyCompanyName(refLabel),
+    );
+  }
+
+  const vanguardRef = (longName: string) => longName;
+
+  it('accepts Vanguard ETF disclosure names against typical securities_ref fund titles (CT-2480)', () => {
+    const pairs: Array<[string, string]> = [
+      ['Vanguard Total Stock Market ETF', vanguardRef('Vanguard Total Stock Market Index Fund ETF Shares')],
+      ['Vanguard Growth Index Fund ETF Shares', vanguardRef('Vanguard Growth Index Fund ETF Shares')],
+      ['Vanguard Total International Stock ETF', vanguardRef('Vanguard Total International Stock Index Fund ETF Shares')],
+      ['Vanguard Information Technology Index Fund ETF', vanguardRef('Vanguard Information Technology Index Fund ETF Shares')],
+      ['Vanguard FTSE Emerging Markets ETF', vanguardRef('Vanguard FTSE Emerging Markets Index Fund ETF Shares')],
+      ['Vanguard FTSE Developed Markets ETF', vanguardRef('Vanguard FTSE Developed Markets Index Fund ETF Shares')],
+    ];
+    for (const [asset, ref] of pairs) {
+      expect(matchDisclosureToRef(asset, ref), asset).toBe(true);
+    }
+  });
+
+  it('accepts iShares, SPDR, and Schwab fund naming variants', () => {
+    expect(
+      matchDisclosureToRef(
+        'iShares Core S&P 500 ETF',
+        'iShares Core S&P 500 Index ETF',
+      ),
+    ).toBe(true);
+    expect(
+      matchDisclosureToRef(
+        'SPDR S&P 500 ETF Trust',
+        'SPDR S&P 500 ETF',
+      ),
+    ).toBe(true);
+    expect(
+      matchDisclosureToRef(
+        'Schwab U.S. Broad Market ETF',
+        'Schwab U.S. Broad Market ETF Shares',
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects unrelated issuers', () => {
+    expect(matchDisclosureToRef('Microsoft Corp', 'Apple Inc')).toBe(false);
+    expect(matchDisclosureToRef('Tesla Inc', 'Apple Inc')).toBe(false);
+    expect(
+      matchDisclosureToRef(
+        'Vanguard Total Bond Market ETF',
+        'Vanguard Total Stock Market Index Fund ETF Shares',
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects sibling and opposite funds that share an issuer prefix', () => {
+    expect(
+      matchDisclosureToRef('ProShares UltraPro QQQ', 'ProShares UltraPro Short QQQ'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef('ProShares Ultra QQQ', 'ProShares UltraPro QQQ'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef('ProShares UltraShort QQQ', 'ProShares Ultra QQQ'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef('Vanguard Growth ETF', 'Vanguard Small Cap Growth Index Fund'),
+    ).toBe(false);
+    expect(
+      matchDisclosureToRef(
+        'Direxion Daily S&P 500 Bull 3X Shares',
+        'Direxion Daily S&P 500 Bear 3X Shares',
+      ),
+    ).toBe(false);
+  });
+
+  it('still accepts the same leveraged product when only fund descriptors differ', () => {
+    expect(
+      matchDisclosureToRef('ProShares UltraPro QQQ', 'ProShares UltraPro QQQ ETF'),
+    ).toBe(true);
+    expect(
+      matchDisclosureToRef(
+        'ProShares UltraPro Short QQQ',
+        'ProShares UltraPro Short QQQ ETF',
+      ),
+    ).toBe(true);
   });
 });

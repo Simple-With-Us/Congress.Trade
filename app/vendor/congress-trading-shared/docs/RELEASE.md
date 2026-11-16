@@ -28,7 +28,7 @@ installed package version must agree.
 
 ## 2. Tag the merged commit
 
-Announce the release in `#agent-sync`, then create an annotated tag on the merged `main` commit.
+Announce the release in `#ag***-s**c`, then create an annotated tag on the merged `main` commit.
 Never move or reuse an existing release tag.
 
 ```bash
@@ -53,7 +53,7 @@ mkdir -p "$scratch/home" "$scratch/cache"
 env -u NODE_AUTH_TOKEN -u NPM_TOKEN -u GH_PACKAGES_TOKEN -u GITHUB_TOKEN \
   HOME="$scratch/home" npm_config_cache="$scratch/cache" \
   npm install --prefix "$scratch" \
-  "git+https://github.com/jaywedgeworth22/congress-trading-shared.git#v${version}"
+  "git+https://github.com/Simple-With-Us/congress-trading-shared.git#v${version}"
 test "$(node -p "require('$scratch/node_modules/@jaywedgeworth22/congress-trading-shared/package.json').version")" = "$version"
 node -e "require('$scratch/node_modules/@jaywedgeworth22/congress-trading-shared')"
 (cd "$scratch" && node --input-type=module \
@@ -66,7 +66,7 @@ not prevent `npm pack` or Git dependency installation.
 
 ## 4. Coordinate consumer adoption
 
-Post the immutable tag and verification receipt to `#agent-sync`. Consumer-owned PRs must update
+Post the immutable tag and verification receipt to `#ag***-s**c`. Consumer-owned PRs must update
 both the exact dependency and its lockfile entry, then pass their own gates:
 
 - Congress.Trade: `app/package.json` and `app/package-lock.json`.

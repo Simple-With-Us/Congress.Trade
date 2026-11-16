@@ -69,7 +69,7 @@ universal links, widgets/App Intents) were deliberately deferred.
    `gitleaks` required, conversation resolution on, enforce_admins on.
 3. Scheduled `deploy-deno.yml` cron runs have been failing (all recent runs
    red) — likely why the blocked migrate went unnoticed. Fleet notified in
-   #agent-sync.
+   #ag***-s**c.
 
 ## Verification
 

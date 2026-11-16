@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CONFIG, readIdentity, observeProduction, reportDeploy } from './sentry-report-deploy.mjs';
+import { readFile } from 'node:fs/promises';
+import { CONFIG, readIdentity, observeProduction, reportDeploy, isCoolifyDeployRelevant } from './sentry-report-deploy.mjs';
 const old = '1'.repeat(40), expected = '2'.repeat(40), newer = '3'.repeat(40), foreign = '4'.repeat(40);
 const healthy = (revision) => ({ ok: true, status: 'live', environment: 'production', revision, build: { sha: revision }, checks: { release: { sha: revision } } });
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
@@ -10,6 +11,12 @@ const observe = (values, options = {}) => {
   return observeProduction({ expected, attempts: values.length, intervalMs: 0, sleep: async () => {}, refreshMain: () => {}, isAncestor,
     fetchImpl: async (url, init) => { assert.equal(url.origin, new URL(CONFIG.health).origin); assert.equal(init.headers.Authorization, undefined); assert.equal(init.redirect, 'error'); assert.equal(init.cache, 'no-store'); const value = values[i++]; return value instanceof Response ? value : json(healthy(value)); }, ...options });
 };
+test('production observation defaults use a 60-minute deadline and 180 attempts', async () => {
+  const source = await readFile(new URL('./sentry-report-deploy.mjs', import.meta.url), 'utf8');
+  assert.match(source, /attempts = 180,/);
+  assert.match(source, /deadline = now\(\) \+ 60 \* 60 \* 1000;/);
+});
+
 test('requires healthy, full source identity', () => {
   assert.equal(readIdentity(healthy(expected)), expected);
   for (const body of [null, {ok:false}, healthy('unknown'), healthy(expected.slice(0,12))]) assert.throws(() => readIdentity(body));
@@ -64,4 +71,36 @@ test('pagination finds an older production deployment without posting again',asy
 });
 test('untrusted Sentry pagination cannot forward the token',async()=>{
  let calls=0;await assert.rejects(report(async()=>{calls++;return json([],200,{link:'<https://evil.invalid/steal>; rel="next"; results="true"'});}),/not trusted/);assert.equal(calls,1);
+});
+test('git ancestry distinguishes divergence from execution failures',async()=>{
+ const {gitAncestry}=await import('./sentry-report-deploy.mjs');
+ assert.equal(gitAncestry(expected,newer,()=>({status:0})),true);
+ assert.equal(gitAncestry(expected,newer,()=>({status:1})),false);
+ for(const result of [{status:null},{status:128},{status:1,error:new Error('spawn failed')}]) assert.throws(()=>gitAncestry(expected,newer,()=>result),/execution failed/);
+});
+test('transient refresh failures retry without using stale ancestry',async()=>{
+ let calls=0;const r=await observe([expected,expected],{attempts:3,refreshMain:()=>{if(++calls===1)throw Error('temporary network failure');}});
+ assert.equal(r.revision,expected);assert.equal(calls,3);
+});
+test('persistent ancestry errors fail within bounded observation window',async()=>{
+ await assert.rejects(observe([expected,expected],{isAncestor:()=>{throw Error('execution failure')}}),/Unable to refresh or evaluate main ancestry/);
+});
+test('skips Sentry deploy when the SHA does not change Coolify watch_paths', () => {
+  const spawn = (cmd, args) => {
+    if (cmd === 'git') return { status: 0, stdout: '.github/workflows/ci.yml\nSTATUS.md\n' };
+    if (cmd === 'python3' && args.includes('--from-stdin')) return { status: 1, stdout: 'skip: .github/workflows/ci.yml STATUS.md\n' };
+    return { status: 1 };
+  };
+  assert.equal(isCoolifyDeployRelevant(expected, { spawn }), false);
+});
+test('records a Sentry deploy when the SHA changes app/ or services/', () => {
+  const spawn = (cmd, args) => {
+    if (cmd === 'git') return { status: 0, stdout: 'app/src/index.ts\n' };
+    if (cmd === 'python3' && args.includes('--from-stdin')) return { status: 0, stdout: 'deploy: app/src/index.ts\n' };
+    return { status: 1 };
+  };
+  assert.equal(isCoolifyDeployRelevant(expected, { spawn }), true);
+});
+test('deploy relevance fails closed when git cannot list files', () => {
+  assert.throws(() => isCoolifyDeployRelevant(expected, { spawn: () => ({ status: 128 }) }), /file list/);
 });

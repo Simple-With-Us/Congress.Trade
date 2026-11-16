@@ -1,0 +1,33 @@
+name: Kody Autofix Offline Validation
+
+on:
+  pull_request:
+    paths:
+      - '.github/kody-autofix/**'
+      - '.github/workflows/kody-autofix-reusable.yml'
+      - '.github/workflows/kody-autofix-validation.yml'
+  push:
+    paths:
+      - '.github/kody-autofix/**'
+      - '.github/workflows/kody-autofix-reusable.yml'
+      - '.github/workflows/kody-autofix-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install Trusted Helper Dependencies
+        working-directory: .github/kody-autofix
+        run: npm ci
+      - name: Run Offline Controller And Caller Tests
+        run: node --test .github/kody-autofix/*.node-test.mjs

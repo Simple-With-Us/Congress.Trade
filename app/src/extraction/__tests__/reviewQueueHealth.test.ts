@@ -9,6 +9,11 @@ describe('reviewQueueHealth buckets', () => {
   it('classifies rejected/exhausted reasons as terminal', () => {
     expect(isTerminalReviewReason('rejected: agreement_cascade_unresolved')).toBe(true);
     expect(isTerminalReviewReason('local_vision_exhausted,scanned_pdf_vision_spend')).toBe(true);
+    expect(isTerminalReviewReason('ingest_failure:fetch')).toBe(true);
+    expect(isTerminalReviewReason('pipeline_failure:ocr')).toBe(true);
+    expect(isTerminalReviewReason('form_chrome_only,extract_empty_failure,no_transactions_extracted')).toBe(true);
+    expect(isTerminalReviewReason('extract_empty_failure')).toBe(false);
+    expect(isTerminalReviewReason('empty_fetch_handoff')).toBe(true);
     expect(classifyUnresolvedReviewItem({
       suppressed: true,
       reason: 'rejected: bad_asset_name,low_confidence',

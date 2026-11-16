@@ -43,7 +43,7 @@ docker run --rm \
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `CONGRESS_TRADE_API_URL` | `http://localhost:8787` | App base URL |
-| `ADMIN_TOKEN` | (required in prod) | Admin bearer |
+| `ADMIN_TOKEN` | (optional env) | Admin bearer; if unset, fetched at boot from Infisical (`INFISICAL_APP_*`) |
 | `WORKER_ID` | `server_cpu_1` | Heartbeat id |
 | `POLL_INTERVAL_SEC` | `30` | Poll loop |
 | `OCR_BACKEND` | `tesseract` | `tesseract` \| `surya` \| `doctr` |
@@ -68,6 +68,10 @@ python worker.py --once --pdf /path/to/sample.pdf --doc-id H-TEST
 3. **docTR** (optional extra) — PyTorch CPU; better than Tesseract on noisy type.
 
 Install extras only if needed: `pip install -r requirements-optional.txt`.
+
+## Hand-delivered grid forms
+
+Pages whose vertical rules match a hand-delivered House PTR template are read by `gridform.py` instead of the ink-ratio pass.  Column boundaries are fit per page.  An x glyph is template-matched into the type columns (purchase, sale, sale partial, exchange) and the amount columns.  Asset, owner, and date text still come from the CPU OCR backend.  A row with no single type mark is submitted with `extractionWarnings: ["grid_type_unmarked"]` and an empty `txType`.  It is not stored as a guessed purchase.  When any page matches, the submit extractor is `server_cpu_gridform`.
 
 ## Deterministic checkbox algorithm
 

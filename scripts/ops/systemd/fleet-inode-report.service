@@ -1,0 +1,18 @@
+[Unit]
+Description=Fleet inode usage report (read-only df -i and directory file counts)
+Documentation=file:///usr/local/share/doc/fleet-inode-report.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/inode-usage-report.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fleet-inode-report
+# Optional overrides:
+# EnvironmentFile=-/etc/fleet-inode-report.env
+
+[Install]
+WantedBy=multi-user.target

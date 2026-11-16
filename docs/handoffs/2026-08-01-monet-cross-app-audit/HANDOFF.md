@@ -13,7 +13,7 @@ NO code fixes started. Nothing was changed in any repo except this handoff packa
 
 ## What was done
 
-1. Claim posted to #agent-sync (`[MONET->*]`, ts `1785620598.210579`).
+1. Claim posted to #ag***-s**c (`[MONET->*]`, ts `1785620598.210579`).
 2. A 50-agent audit workflow mapped six subsystems and adversarially verified every
    claimed gap: **39 gaps CONFIRMED, 5 refuted.** Full structured output is in this
    directory: `maps.jsonl` (6 subsystem maps) and `verdicts.jsonl` (44 verdicts).

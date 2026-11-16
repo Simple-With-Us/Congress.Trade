@@ -16,22 +16,43 @@
  * transaction-type code, one or two dates, and an amount bracket.
  */
 
-import { extractText, getDocumentProxy } from 'unpdf';
+// CT-2459: unpdf (pdf.js) dynamic-imported at first use (startup graph trim).
 
 import type { Extractor, ExtractorInput, ExtractorResult } from '../extractors/types.ts';
-import type { Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
+import type { Env, Filing, Owner, ParsedTx, TxType } from '../shared/types.ts';
 import { HOUSE_ASSET_TYPE_NAMES, houseAssetTypeCodePattern } from '../shared/assetTypes.ts';
 import { parseAmountRange } from './amounts.ts';
+import {
+  arbitrateHousePtrParsers,
+  loadHousePtrSecuritiesRefIndex,
+  type HousePtrNameIndex,
+} from './housePtrParserArbitration.ts';
 import { detectOption } from './senateHtml.ts';
 import { ptrColumnTailRe, ptrTailRe } from './ptrTails.ts';
+import { cleanFilerName } from './nameNormalizer.ts';
 
 export { countHousePtrTails } from './ptrTails.ts';
+
+const HOUSE_DISCLOSED_NAME_RE =
+  /Name:\s*Hon\.\s+(.+?)(?=\s+Status:|\s+State\/District:)/i;
+
+/** Member name line from a machine-readable House PTR text layer. */
+export function parseHousePtrDisclosedName(text: string | null | undefined): string | null {
+  if (!text?.trim()) return null;
+  const normalized = text.replace(/\u0000/g, '');
+  const match = HOUSE_DISCLOSED_NAME_RE.exec(normalized);
+  if (!match?.[1]) return null;
+  const name = cleanFilerName(match[1].replace(/\s+/g, ' ').trim());
+  return name || null;
+}
 
 /** Penalty per missing core field (date / amount / type / asset). */
 const MISSING_FIELD_PENALTY = 0.12;
 
 export class TextPdfExtractor implements Extractor {
   readonly name = 'textPdf';
+
+  constructor(private readonly env?: Env) {}
 
   canHandle(f: Filing): boolean {
     return f.docKind === 'text_pdf';
@@ -43,7 +64,8 @@ export class TextPdfExtractor implements Extractor {
     }
 
     const { text, pageCount } = await extractPdfText(input.bytes);
-    const rows = parseHousePtrText(text);
+    const nameIndex = await this.securitiesRefIndex();
+    const rows = parseHousePtrText(text, nameIndex ? { nameIndex } : undefined);
 
     // Document confidence = mean of row confidences (or low if nothing found).
     const docConfidence =
@@ -63,6 +85,16 @@ export class TextPdfExtractor implements Extractor {
       pageCount,
     };
     return result;
+  }
+
+  private async securitiesRefIndex(): Promise<HousePtrNameIndex | undefined> {
+    if (!this.env?.DB) return undefined;
+    try {
+      return await loadHousePtrSecuritiesRefIndex(this.env);
+    } catch (err) {
+      console.warn('[textPdf] securities_ref name index unavailable:', err);
+      return undefined;
+    }
   }
 }
 
@@ -88,6 +120,7 @@ async function extractPdfText(bytes: ArrayBuffer): Promise<PdfTextExtraction> {
   // which reuses the same ArrayBuffer after text extraction. Do not remove the copy
   // (regression guard for Sentry CONGRESS-TRADE-2).
   try {
+    const { extractText, getDocumentProxy } = await import('unpdf');
     const pdf = await getDocumentProxy(new Uint8Array(bytes.slice(0)));
     const { text } = await extractText(pdf, { mergePages: true });
     const pageCount = typeof pdf.numPages === 'number' && Number.isFinite(pdf.numPages) ? pdf.numPages : null;
@@ -147,11 +180,17 @@ const INLINE_RECORD_RE = new RegExp(
   'gi',
 );
 
+/** Optional securities_ref names for parser arbitration. */
+export interface HousePtrParseOptions {
+  /** Ticker to simplified company name (`securities_ref.company_name`). */
+  nameIndex?: HousePtrNameIndex;
+}
+
 /**
  * Parse the merged House PTR text into ParsedTx[]. We segment the text into
  * candidate holding blocks, then pull fields from each block.
  */
-export function parseHousePtrText(text: string): ParsedTx[] {
+export function parseHousePtrText(text: string, options?: HousePtrParseOptions): ParsedTx[] {
   const cleaned = cleanPdfText(text);
   // Electronic PTRs often omit SP/DC/JT on every row after the first. The
   // owner-required INLINE_RECORD_RE then glues those later rows into one
@@ -159,17 +198,13 @@ export function parseHousePtrText(text: string): ParsedTx[] {
   // `[TYPE] P/S/E date date $amount` tail first.
   const tailRows = parseTailRecords(cleaned);
   const columnRows = parseColumnTailRecords(cleaned);
-  const completeCount = (rows: ParsedTx[]) =>
-    rows.filter((row) =>
-      Boolean(row.assetName && row.assetName !== '(unknown)' && row.txDate && row.txType && row.amountMin != null)
-    ).length;
-  // Prefer the `[TYPE] P/S/E date` tail when it already has a complete lineup.
-  // Use the column-order parser only when it recovers more complete rows
-  // (EO.Pdf wraps `[ST]` onto the next line after Type/Date/Amount).
-  if (tailRows.length > 0 && completeCount(tailRows) >= completeCount(columnRows)) {
-    return tailRows;
+  // Both parsers read the same text. Count is not a vote: a page-split row
+  // can make the column parser longer while it shifts Subholding Of and the
+  // next ticker (H-2026-20035788). Scoring and the hold live next to the
+  // parsers so a column-parser fix does not have to re-decide the winner.
+  if (tailRows.length > 0 || columnRows.length > 0) {
+    return arbitrateHousePtrParsers(tailRows, columnRows, options?.nameIndex).rows;
   }
-  if (columnRows.length > 0) return columnRows;
 
   if (HOUSE_TABLE_HEADER_RE.test(cleaned)) {
     const inlineRows = parseInlineRecords(cleaned);
@@ -192,6 +227,20 @@ export function parseHousePtrText(text: string): ParsedTx[] {
   return rows;
 }
 
+/**
+ * True when both House PTR parsers produced rows and they disagree on content.
+ * A filing that disagrees is held. A filing they agree on, or that only one
+ * parser could read, keeps the parser confidence.
+ */
+export function housePtrParsersDisagree(text: string, options?: HousePtrParseOptions): boolean {
+  const cleaned = cleanPdfText(text);
+  return arbitrateHousePtrParsers(
+    parseTailRecords(cleaned),
+    parseColumnTailRecords(cleaned),
+    options?.nameIndex,
+  ).contested;
+}
+
 function cleanPdfText(text: string): string {
   return expandHousePtrLayout(text
     // Some House PDFs expose a text layer with NUL bytes between letters.
@@ -207,6 +256,108 @@ function expandHousePtrLayout(text: string): string {
     .replace(/\bS\s+O\s*:\s*/gi, 'Subholding Of: ');
 }
 
+/**
+ * House PTR detail lines — "Filing Status: ...", "Subholding Of: ...",
+ * "Location: ...", "Description: ..." — plus the letter-spaced forms the form
+ * generator prints ("F S:", "S O:", "L:", "D:").
+ *
+ * The House form prints a row's detail lines UNDER that row, so in the merged
+ * page text they sit after the row's `[ST] P/S/E date $amount` tail and before
+ * the next row's asset line.  A blank Owner column removes the owner code that
+ * used to mark where the next row starts, which glued "Filing Status: New
+ * Subholding Of: ..." onto the next row's asset name and shifted every
+ * subholding one row down.  Split each gap between two tails on the detail
+ * lines themselves instead of on owner codes.
+ */
+const HOUSE_DETAIL_LINE_RE =
+  /^\s*(?:Filing\s+Status|Subholding\s+Of|Location|Description|F\s+S|S\s+O|L|D)\s*:/i;
+
+/**
+ * A House PTR document collapsed to one line, plus the line bookkeeping the
+ * detail-block split needs.
+ */
+interface HousePtrDoc {
+  /** Whole document with every whitespace run collapsed to a single space. */
+  text: string;
+  /** Non-empty source lines, each whitespace-collapsed. */
+  lines: string[];
+  /** Offset of the first character of each line inside `text`. */
+  lineStart: number[];
+  /** Offset just past the last character of each line inside `text`. */
+  lineEnd: number[];
+  /** Index of the line that owns each character of `text`. */
+  lineOf: number[];
+}
+
+function collapseHousePtrLines(text: string): HousePtrDoc {
+  const lines: string[] = [];
+  const lineStart: number[] = [];
+  const lineEnd: number[] = [];
+  const lineOf: number[] = [];
+  let out = '';
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    if (out) {
+      out += ' ';
+      // The separator belongs to the line before it, so a gap that opens at a
+      // line boundary still resolves to the content of the next line.
+      lineOf.push(lines.length - 1);
+      lineEnd[lines.length - 1] = out.length;
+    }
+    lineStart.push(out.length);
+    out += line;
+    lineEnd.push(out.length);
+    for (let i = 0; i < line.length; i += 1) lineOf.push(lines.length);
+    lines.push(line);
+  }
+  return { text: out, lines, lineStart, lineEnd, lineOf };
+}
+
+/** Full House detail label anywhere in a string (asset-name sanity check). */
+const HOUSE_DETAIL_LABEL_IN_NAME_RE = /\b(?:Filing\s+Status|Subholding\s+Of|Location|Description)\s*:/i;
+
+/** A source line that opens a new holding with an explicit owner code. */
+const HOUSE_OWNER_LINE_RE = /^(?:SP|DC|JT|SELF)\s/;
+
+/**
+ * End offset (exclusive) of the run of detail lines at the head of
+ * `gapStart..gapEnd`.  Those lines belong to the row whose tail precedes the
+ * gap, so the text after the run is the next row's asset line.
+ * Returns `gapStart` when the gap holds no detail line at all, and never
+ * returns more than `gapEnd`.
+ */
+function houseDetailBlockEnd(gapStart: number, gapEnd: number, doc: HousePtrDoc): number {
+  if (gapStart >= gapEnd) return gapStart;
+  let end = gapStart;
+  let li = doc.lineOf[gapStart] ?? 0;
+  const lastLine = doc.lineOf[gapEnd - 1] ?? li;
+  // A gap can open mid-line (a tail that stopped at "$344" inside
+  // "$344.99"); that remainder belongs to the tail, not to a detail line.
+  if (gapStart > (doc.lineStart[li] ?? 0)) li += 1;
+  for (; li <= lastLine; li += 1) {
+    // A line that runs into the next tail carries that row's identity, so it
+    // can never be part of this row's detail block.
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (!HOUSE_DETAIL_LINE_RE.test(doc.lines[li] ?? '')) break;
+    end = doc.lineEnd[li] ?? end;
+  }
+  if (end > gapStart) {
+    // A long detail value ("D: ...") can wrap onto unlabeled lines.  When the
+    // next holding opens with an owner code, every line before that one is
+    // still this row's detail block.  Blank-owner (self) rows have no such
+    // anchor, so their block stays at the last labeled line.
+    for (let lj = li; lj <= lastLine; lj += 1) {
+      if ((doc.lineStart[lj] ?? Infinity) >= gapEnd) break;
+      if (HOUSE_OWNER_LINE_RE.test(doc.lines[lj] ?? '')) {
+        end = doc.lineStart[lj] ?? end;
+        break;
+      }
+    }
+  }
+  return Math.min(end, gapEnd);
+}
+
 function joinWrappedAmountRanges(text: string): string {
   return text.replace(
     /(\$[\d,]+)\s*-\s+((?:(?!\$)[\s\S]{0,80}?))(\$[\d,]+)/g,
@@ -220,7 +371,7 @@ function stripHouseTableHeaders(text: string): string {
     .replace(HOUSE_TABLE_HEADER_GLOBAL_RE, ' ');
 }
 
-function stripHousePtrPreamble(prefix: string): string {
+function stripHousePtrPreamble(prefix: string, stripColumnMarker = true): string {
   let s = stripHouseTableHeaders(prefix).replace(/\s+/g, ' ').trim();
   let cut = 0;
   HOUSE_PTR_PREAMBLE_RE.lastIndex = 0;
@@ -230,7 +381,9 @@ function stripHousePtrPreamble(prefix: string): string {
   }
   if (cut > 0) s = s.slice(cut);
   // Leftover column marker from "T ID Owner Asset …" after the header strip.
-  s = s.replace(/^\s*T\s+/, '').trim();
+  // Only a prefix that can still hold the page preamble has one; a row that
+  // starts at its own asset line would lose the "T" of "T Rowe Price …".
+  if (stripColumnMarker) s = s.replace(/^\s*T\s+/, '').trim();
   // Stop before an owner code or a two-token ALL-CAPS asset (munis). Never
   // run to end-of-string — that ate "JT Abbott … (ABT)" on filer-name lines.
   return s.replace(
@@ -248,7 +401,11 @@ function calculateRowConfidence(row: {
   amountMin: number | null;
 }): number {
   const hasOwner = Boolean(row.owner);
-  const hasAsset = Boolean((row.assetName && row.assetName !== '(unknown)') || row.ticker);
+  // A detail label inside the asset name means the row split failed (e.g. a
+  // blank-owner row in a text layer with no line breaks); keep it out of
+  // auto-publish instead of shipping a corrupted name.
+  const gluedDetail = Boolean(row.assetName && HOUSE_DETAIL_LABEL_IN_NAME_RE.test(row.assetName));
+  const hasAsset = !gluedDetail && Boolean((row.assetName && row.assetName !== '(unknown)') || row.ticker);
   const hasTxType = Boolean(row.txType);
   const hasDate = Boolean(row.txDate && /^\d{4}-\d{2}-\d{2}$/.test(row.txDate));
   const hasAmount = row.amountMin !== null;
@@ -269,31 +426,67 @@ function calculateRowConfidence(row: {
   return Math.max(0.3, Math.min(0.94, confidence));
 }
 
+/**
+ * A holding that breaks across a page puts its asset name on both sides of the
+ * repeated table header: "Norwegian Cruise Line Holdings P 10/20/2026
+ * 11/09/2026 $1,001 - $15,000" ends one page and "Ltd. Ordinary Shares (NCLH)
+ * [ST]" opens the next.  Once the header is stripped that is one line with the
+ * `[TYPE]` token after the amount, so the `[TYPE] P/S/E date` tail misses the
+ * row.  Move the trailing asset text back in front of the Type/Date/Amount run
+ * so the row reads in normal tail order.
+ */
+const HOUSE_PAGE_SPLIT_ROW_RE = new RegExp(
+  String.raw`^(?<head>(?!\s*(?:P|S|E)\s)[^\[\]\n]*?\S)\s+` +
+    String.raw`(?<tail>(?:P|S|E)(?:\s*\([^)\n]*\))?\s+\d{1,2}\/\d{1,2}\/\d{2,4}\s+\d{1,2}\/\d{1,2}\/\d{2,4}\s+(?:Over\s+)?\$[\d,]+(?:\s*(?:-|–|—|to)\s*\$[\d,]+|\s*\+)?)` +
+    String.raw`\s+(?<rest>[^\[\]\n]*\[[A-Z]{2,4}\])[ \t]*$`,
+  'gm',
+);
+
+function rejoinPageSplitRows(text: string): string {
+  return text.replace(HOUSE_PAGE_SPLIT_ROW_RE, (_m, head: string, tail: string, rest: string) =>
+    `${head} ${rest.trim()}\n${tail}`);
+}
+
 function parseTailRecords(text: string): ParsedTx[] {
-  const normalized = stripHouseTableHeaders(cleanPdfText(text)).replace(/\s+/g, ' ').trim();
+  const doc = collapseHousePtrLines(rejoinPageSplitRows(stripHouseTableHeaders(cleanPdfText(text))));
+  const normalized = doc.text;
   const matches = [...normalized.matchAll(ptrTailRe())];
   if (matches.length === 0) return [];
 
+  // Tail i owns [tailStart_i, tailEnd_i).  The gap after it holds that row's
+  // detail lines followed by the next row's asset line; split the gap on the
+  // detail lines so each row keeps its own Filing Status / Subholding Of and
+  // its asset name stays free of the previous row's details.
+  const count = matches.length;
+  const tailStart = matches.map((m) => m.index ?? 0);
+  const tailEnd = matches.map((m, i) => (m.index ?? 0) + (matches[i][0]?.length ?? 0));
+  const gapStart: number[] = [0];
+  for (let i = 1; i <= count; i += 1) gapStart.push(tailEnd[i - 1]);
+  const gapEnd: number[] = [...tailStart, normalized.length];
+  const detailEnd = gapStart.map((s, j) => houseDetailBlockEnd(s, gapEnd[j], doc));
+
   const rows: ParsedTx[] = [];
-  for (let i = 0; i < matches.length; i += 1) {
+  for (let i = 0; i < count; i += 1) {
     const m = matches[i];
-    const next = matches[i + 1];
-    const start = m.index ?? 0;
-    const end = next?.index ?? normalized.length;
-    const prevEnd = i > 0
-      ? (matches[i - 1].index ?? 0) + matches[i - 1][0].length
-      : 0;
-    const prefix = normalized.slice(prevEnd, start);
-    const rawText = normalized.slice(prevEnd, end).trim();
+    // Identity: this row's asset line, with any leading detail block removed.
+    const identityStart = detailEnd[i] > gapStart[i] ? detailEnd[i] : gapStart[i];
+    const prefix = normalized.slice(identityStart, tailStart[i]);
+    // Details: this row's own detail block, which the form prints after the
+    // row's tail.  Rows whose block has no "Subholding Of" line get null.
+    const detailsEnd = detailEnd[i + 1] > gapStart[i + 1] ? detailEnd[i + 1] : gapEnd[i + 1];
+    const detailsText = normalized.slice(tailEnd[i], detailsEnd);
+    const rawText = normalized.slice(identityStart, i + 1 < count ? tailStart[i + 1] : normalized.length);
     const groups = m.groups ?? {};
     // Blank Owner is Self on the House form — not "same as the previous row".
     // Carrying SP/DC/JT forward mis-attributes later unmarked (filer) trades.
-    const identity = identityFromPrefix(prefix);
+    // Only the first row's prefix can still hold the preamble and its "T"
+    // column marker; later rows start at their own asset line.
+    const identity = identityFromPrefix(prefix, i === 0);
     const assetType = groups.assetType?.toUpperCase() ?? null;
     const txType = parseTxType(groups.txType ?? '') ?? 'B';
     const txDate = toIsoDate(groups.txDate ?? '');
     const { min, max } = parseAmountRange(groups.amount ?? '');
-    const details = parseHouseRowDetails(rawText);
+    const details = parseHouseRowDetails(detailsText);
     const confidence = calculateRowConfidence({
       owner: identity.owner,
       assetName: identity.assetName,
@@ -322,52 +515,166 @@ function parseTailRecords(text: string): ParsedTx[] {
   return rows;
 }
 
-function parseColumnTailRecords(text: string): ParsedTx[] {
-  const normalized = joinWrappedAmountRanges(
-    stripHouseTableHeaders(cleanPdfText(text)).replace(/\s+/g, ' ').trim(),
-  );
+/**
+ * Ticker and asset-type printed after the amount on an EO.Pdf row, with no
+ * asset-name words of their own: `(OGN) [ST]`, `[CS]`, `8/11/2027 [CS]`.
+ */
+const COLUMN_TRAILING_TOKEN_RE =
+  /^(?:\d{1,2}\/\d{1,2}\/\d{2,4}\s+)?(?:\([A-Z][A-Z0-9.^\/-]{0,9}\)\s*)?\[[A-Z0-9]{2,4}\]$/i;
+
+/** A detail label that may share a line with the amount or a wrapped name. */
+const COLUMN_DETAIL_LABEL_RE =
+  /\b(?:Filing\s+Status|Subholding\s+Of|Location|Description)\s*:|\b(?:L|D)\s*:/i;
+
+/**
+ * Split the text between two column tails (`P/S/E date date $amount`).
+ *
+ * The form prints this row's detail lines after its amount and before the
+ * next row's asset.  EO.Pdf also prints `(TICKER) [TYPE]` (and a wrapped name
+ * fragment) in that same gap, still before the detail lines.  Flattening the
+ * gap onto one string glued each row's Subholding Of onto the next asset and
+ * let the next row's ticker / `[TYPE]` win (H-2026-20035788: a muni took `CF`,
+ * BridgeBio was typed `[GS]`).
+ *
+ * `trailEnd` is the start of this row's detail block.  Text before it belongs
+ * to this row.  `detailEnd` is the end of that block.  Text after it is the
+ * next row's asset.  A gap with no detail line still keeps a ticker/type
+ * token on the amount line or on the following lines, and leaves the next
+ * asset name with the next row.
+ */
+function columnGapSplit(
+  doc: HousePtrDoc,
+  gapStart: number,
+  gapEnd: number,
+): { trailEnd: number; detailEnd: number } {
+  if (gapStart >= gapEnd) return { trailEnd: gapStart, detailEnd: gapStart };
+
+  const finish = (detailAt: number): { trailEnd: number; detailEnd: number } => {
+    const li = doc.lineOf[detailAt] ?? 0;
+    const lineStart = doc.lineStart[li] ?? detailAt;
+    const lineEnd = Math.min(doc.lineEnd[li] ?? gapEnd, gapEnd);
+    if (detailAt > lineStart) {
+      let detailEnd = lineEnd;
+      const more = houseDetailBlockEnd(lineEnd, gapEnd, doc);
+      if (more > detailEnd) detailEnd = more;
+      return { trailEnd: detailAt, detailEnd };
+    }
+    return { trailEnd: detailAt, detailEnd: houseDetailBlockEnd(detailAt, gapEnd, doc) };
+  };
+
+  const lastLine = doc.lineOf[gapEnd - 1] ?? (doc.lineOf[gapStart] ?? 0);
+  let li = doc.lineOf[gapStart] ?? 0;
+  if (gapStart > (doc.lineStart[li] ?? 0)) {
+    const lineEnd = doc.lineEnd[li] ?? gapEnd;
+    const portionEnd = Math.min(lineEnd, gapEnd);
+    const portion = doc.text.slice(gapStart, portionEnd);
+    const rel = portion.search(COLUMN_DETAIL_LABEL_RE);
+    if (rel >= 0 && lineEnd <= gapEnd) return finish(gapStart + rel);
+    // The next tail sits on this same line.  The remainder is that row.
+    if (lineEnd > gapEnd) return { trailEnd: gapStart, detailEnd: gapStart };
+    const token = portion.trim();
+    li += 1;
+    const later = columnDetailLineStart(doc, li, lastLine, gapEnd);
+    if (later != null) return finish(later);
+    const trailEnd = columnTrailingTokenEnd(
+      doc,
+      li,
+      lastLine,
+      gapEnd,
+      COLUMN_TRAILING_TOKEN_RE.test(token) ? portionEnd : gapStart,
+    );
+    return { trailEnd, detailEnd: trailEnd };
+  }
+
+  const later = columnDetailLineStart(doc, li, lastLine, gapEnd);
+  if (later != null) return finish(later);
+  const trailEnd = columnTrailingTokenEnd(doc, li, lastLine, gapEnd, gapStart);
+  return { trailEnd, detailEnd: trailEnd };
+}
+
+/**
+ * End offset of consecutive `(TICKER) [TYPE]` lines in a gap that has no
+ * detail block.  Those lines belong to the row whose amount just ended, even
+ * when they wrap onto their own line.  A line with asset-name words is the
+ * next row and stops the scan.
+ */
+function columnTrailingTokenEnd(
+  doc: HousePtrDoc,
+  li: number,
+  lastLine: number,
+  gapEnd: number,
+  fallback: number,
+): number {
+  let end = fallback;
+  for (; li <= lastLine; li += 1) {
+    const lineStart = doc.lineStart[li] ?? Infinity;
+    if (lineStart >= gapEnd) break;
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (!COLUMN_TRAILING_TOKEN_RE.test((doc.lines[li] ?? '').trim())) break;
+    end = Math.min(doc.lineEnd[li] ?? end, gapEnd);
+  }
+  return end;
+}
+
+function columnDetailLineStart(
+  doc: HousePtrDoc,
+  li: number,
+  lastLine: number,
+  gapEnd: number,
+): number | null {
+  for (; li <= lastLine; li += 1) {
+    if ((doc.lineStart[li] ?? Infinity) >= gapEnd) break;
+    // A line that runs into the next tail is that row's identity.
+    if ((doc.lineEnd[li] ?? Infinity) > gapEnd) break;
+    if (HOUSE_DETAIL_LINE_RE.test(doc.lines[li] ?? '')) return doc.lineStart[li] ?? null;
+  }
+  return null;
+}
+
+/**
+ * Column-order House PTR parser.  Used when `[TYPE]` is not in front of the
+ * `P/S/E date date $amount` run (EO.Pdf wraps it onto the following line), so
+ * `parseTailRecords` under-counts.  `parseHousePtrText` prefers the tail
+ * parser when the two agree.
+ */
+export function parseColumnTailRecords(text: string): ParsedTx[] {
+  const doc = collapseHousePtrLines(joinWrappedAmountRanges(
+    stripHouseTableHeaders(cleanPdfText(text)),
+  ));
+  const normalized = doc.text;
   const matches = [...normalized.matchAll(ptrColumnTailRe())];
   if (matches.length === 0) return [];
+
+  const tailStart = matches.map((m) => m.index ?? 0);
+  const tailEnd = matches.map((m, i) => (m.index ?? 0) + (matches[i][0]?.length ?? 0));
+  const gapEnd = tailStart.slice(1).concat(normalized.length);
+  const splits = tailEnd.map((start, i) => columnGapSplit(doc, start, gapEnd[i]));
 
   const rows: ParsedTx[] = [];
   for (let i = 0; i < matches.length; i += 1) {
     const m = matches[i];
-    const next = matches[i + 1];
-    const start = m.index ?? 0;
-    const end = next?.index ?? normalized.length;
-    const prevEnd = i > 0
-      ? (matches[i - 1].index ?? 0) + (matches[i - 1][0].length)
-      : 0;
-    let prefix = normalized.slice(prevEnd, start);
-    if (i > 0) {
-      prefix = prefix
-        .replace(/^[\s\S]*\b(?:Filing\s+Status|Subholding\s+Of|Location|Description):/i, '')
-        .replace(/^[\s\S]*\bD\s*:\s+/i, '')
-        .replace(/^[A-Za-z][A-Za-z .,&'/-]{0,40}?\s+(?=[A-Z])/i, '')
-        .trim();
-    }
-    let suffix = normalized.slice(start + m[0].length, end);
-    suffix = suffix.replace(/\s+\d{7,}\s+(?:SP|DC|JT|SELF)\b[\s\S]*$/i, '');
-    const identitySlice = suffix
-      .replace(/\b(?:Filing\s+Status|Subholding\s+Of|Location|Description):[\s\S]*$/i, '')
-      .replace(ASSET_TYPE_RE, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const rawText = `${prefix} ${m[0]} ${suffix}`.replace(/\s+/g, ' ').trim();
+    const leadingStart = i === 0 ? 0 : splits[i - 1].detailEnd;
+    const leading = normalized.slice(leadingStart, tailStart[i]);
+    const trailing = normalized.slice(tailEnd[i], splits[i].trailEnd);
+    const detailsText = normalized.slice(splits[i].trailEnd, splits[i].detailEnd);
+    const identityText = `${leading} ${trailing}`.replace(/\s+/g, ' ').trim();
+    const rawText = `${identityText} ${m[0]} ${detailsText}`.replace(/\s+/g, ' ').trim();
     const groups = m.groups ?? {};
-    const identity = identityFromPrefix(`${prefix} ${identitySlice}`);
-    const suffixTicker = normalizeTicker((suffix.match(TICKER_RE) ?? identitySlice.match(TICKER_RE) ?? [])[1] ?? null);
-    const typeMatch = suffix.match(ASSET_TYPE_RE) ?? prefix.match(ASSET_TYPE_RE);
-    const assetType = typeMatch?.[1]?.toUpperCase() ?? groups.assetType?.toUpperCase() ?? null;
+    const identity = identityFromPrefix(identityText, i === 0);
+    const typeMatches = [...identityText.matchAll(new RegExp(ASSET_TYPE_RE.source, 'gi'))];
+    const assetType = typeMatches.at(-1)?.[1]?.toUpperCase() ?? null;
     const txType = parseTxType(groups.txType ?? '') ?? 'B';
     const txDate = toIsoDate(groups.txDate ?? '');
     const { min, max } = parseAmountRange(groups.amount ?? '');
-    const details = parseHouseRowDetails(suffix);
-    const ticker = identity.ticker ?? suffixTicker;
+    const details = parseHouseRowDetails(detailsText);
+    const assetName = identity.assetName
+      .replace(new RegExp(ASSET_TYPE_RE.source, 'gi'), ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || identity.ticker || '(unknown)';
     const confidence = calculateRowConfidence({
       owner: identity.owner,
-      assetName: identity.assetName,
-      ticker,
+      assetName,
+      ticker: identity.ticker,
       txType,
       txDate,
       amountMin: min,
@@ -375,8 +682,8 @@ function parseColumnTailRecords(text: string): ParsedTx[] {
     rows.push({
       txDate,
       owner: identity.owner,
-      assetName: identity.assetName,
-      ticker,
+      assetName,
+      ticker: identity.ticker,
       assetType,
       assetTypeName: assetType ? HOUSE_ASSET_TYPE_NAMES[assetType] ?? null : null,
       txType,
@@ -394,8 +701,9 @@ function parseColumnTailRecords(text: string): ParsedTx[] {
 
 function identityFromPrefix(
   prefix: string,
+  stripColumnMarker = true,
 ): { owner: Owner | null; ticker: string | null; assetName: string } {
-  let s = stripHousePtrPreamble(prefix);
+  let s = stripHousePtrPreamble(prefix, stripColumnMarker);
   s = s.replace(/^\d{7,}\s+/, '');
   const ownerMatches = [...s.matchAll(/\b(SP|DC|JT|SELF)\b/gi)];
   const ownerTok = ownerMatches.at(-1);

@@ -36,6 +36,8 @@ describe('scoped INGEST_TOKEN', () => {
   it('still rejects a bad token on the import endpoint', async () => {
     const res = await post('/securities/import', 'nope', env);
     expect(res.status).toBe(401);
+    const body = (await res.json()) as { reason?: string };
+    expect(body.reason).toBe('ingest_bearer_mismatch_or_admin_required');
   });
 
   it('admin token continues to work on the import endpoint', async () => {

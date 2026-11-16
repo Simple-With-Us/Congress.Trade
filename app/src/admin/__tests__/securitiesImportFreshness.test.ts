@@ -94,6 +94,20 @@ describe('POST /securities/import — price freshness bookkeeping', () => {
     ).not.toContain('IMPT');
   });
 
+  it('marks never-priced tickers unpriceable on an empty closes import', async () => {
+    seedTrade('NOPRICE');
+    await importPrices({ prices: [{ ticker: 'NOPRICE', closes: [] }] });
+    const row = db
+      .prepare(
+        'SELECT latest_price_date, price_unavailable, price_unavailable_reason, price_checked_at FROM securities_ref WHERE ticker = ?',
+      )
+      .get('NOPRICE');
+    expect(row?.latest_price_date).toBeNull();
+    expect(row?.price_unavailable).toBe(1);
+    expect(row?.price_unavailable_reason).toBe('socratic_import_no_price');
+    expect(row?.price_checked_at).toBeTruthy();
+  });
+
   it('leaves latest_price_date UNCHANGED for an import with no closes and no cached rows', async () => {
     seedTrade('NOCLOSE');
     // Pre-existing freshness value with NO cached price_eod rows.

@@ -244,6 +244,28 @@ export function competitorQualifiedManualFilerId(name: string): string | null {
   return `MANUAL-${tokens[0].toUpperCase()}-${tokens[tokens.length - 1].toUpperCase()}`;
 }
 
+/**
+ * Chamber to persist on a newly minted `MANUAL-*` filer.  Only the payload's
+ * own `member_type` / office metadata counts — never a provider feed default
+ * (the old injector used `'senate'` when the House roster did not match).
+ */
+export function chamberForMintedCompetitorInsert(parsed: ParsedCompetitorReporter): ParsedCompetitorChamber | null {
+  return parsed.chamber ?? null;
+}
+
+/**
+ * Chamber when attaching competitor rows to an existing filer whose stored
+ * chamber is missing or unrecognized.
+ */
+export function chamberForMatchedCompetitorFiler(
+  existingChamber: string | null | undefined,
+  parsed: ParsedCompetitorReporter,
+): ParsedCompetitorChamber | null {
+  const c = (existingChamber ?? '').trim().toLowerCase();
+  if (c === 'house' || c === 'senate' || c === 'executive') return c;
+  return parsed.chamber ?? null;
+}
+
 /** Suffix / honorific tokens ignored when reducing a reporter name to first+last. */
 export const NAME_NOISE_TOKENS: ReadonlySet<string> = new Set([
   'jr', 'sr', 'ii', 'iii', 'iv', 'md', 'facs', 'phd', 'hon', 'honorable', 'dr', 'mr', 'mrs', 'ms', 'rep', 'sen',

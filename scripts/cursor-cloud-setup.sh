@@ -43,7 +43,7 @@ deno --version
 
 # 2. app/ npm dependencies. --include=dev forces devDependencies (vitest,
 # eslint, typescript) even if the environment sets NODE_ENV=production, and the
-# vendored @jaywedgeworth22/congress-trading-shared resolves tokenlessly from
+# vendored Simple-With-Us/congress-trading-shared (@jaywedgeworth22/congress-trading-shared import map) resolves tokenlessly from
 # app/vendor via the deno.json import map.
 echo "==> Installing app dependencies (npm ci --include=dev)"
 ( cd "$APP_DIR" && npm ci --include=dev )

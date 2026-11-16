@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep newest local Coolify and fleet sqlite backups on the root disk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/local-backup-retention.sh
+EnvironmentFile=-/etc/fleet-local-backup-retention.env
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+SyslogIdentifier=fleet-local-backup-retention

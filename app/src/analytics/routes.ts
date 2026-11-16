@@ -54,6 +54,9 @@ import {
   buildMemberPerformanceQuery,
   buildMemberStatsQuery,
   buildTickerBacktestCohortQuery,
+  buildBacktestPriceQuery,
+  buildBacktestSpxQuery,
+  buildPricedDaysCountQuery,
   buildMemberTopTickersQuery,
   buildMemberRecentTradesQuery,
   buildPartySplitQuery,
@@ -267,6 +270,28 @@ function meta(f: CommonQuery, extra: Record<string, unknown> = {}): Record<strin
 
 export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   const r = new Hono<{ Bindings: Env }>();
+
+  // CT-2418: every route in this router is public and user-independent (the
+  // router is mounted bare at /api/analytics with no auth middleware), and every
+  // one of them already wraps its work in the server-side `cached()` KV helper.
+  // They just never told Cloudflare, so none of them could ever be served from
+  // the edge and each one re-hit the origin on every repeat view.
+  //
+  // s-maxage=300 / stale-while-revalidate=600 matches PUBLIC_STABLE_CACHE in
+  // delivery/rest.ts, the policy already applied to /api/market/*. Cloudflare's
+  // cache key includes the path, so ?ticker= style path params key naturally and
+  // one entity's response can never be served for another's URL.
+  //
+  // Only sets the header when a route has not already chosen its own, so
+  // /latency-summary keeps its explicit `public, max-age=300`.
+  r.use('*', async (c, next) => {
+    await next();
+    if (c.req.method === 'GET' && c.res.status === 200) {
+      if (!c.res.headers.has('Cache-Control')) {
+        c.res.headers.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
+      }
+    }
+  });
 
   // --- GET /summary -------------------------------------------------------
   r.get('/summary', async (c) => {
@@ -940,19 +965,29 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const key = cacheKey(`backtest:${tickerParam}`, { ...f, filerId, h: useHorizons.join('-') });
     const data = await cached(c.env, key, 600, async () => {
       const cohortQ = buildTickerBacktestCohortQuery(tickerParam, f, filerId);
-      const [cohortRows, priceAsc, spxAsc] = await Promise.all([
-        all<{ tx_date: string }>(c.env.DB, cohortQ.sql, cohortQ.params),
-        all<PriceBar>(c.env.DB, 'SELECT date, close FROM price_eod WHERE ticker = ? ORDER BY date ASC', [tickerParam]),
-        all<PriceBar>(c.env.DB, 'SELECT date, close FROM spx_eod ORDER BY date ASC'),
-      ]);
+      const cohortRows = await all<{ tx_date: string }>(c.env.DB, cohortQ.sql, cohortQ.params);
       const cohortDates = cohortRows.map((row) => str(row.tx_date)).filter((d): d is string => !!d);
+      // CT-2459: bound both series to the cohort window (see builders).
+      const countQ = buildPricedDaysCountQuery(tickerParam);
+      const pricedDaysRow = await first<{ n: number }>(c.env.DB, countQ.sql, countQ.params);
+      let priceAsc: PriceBar[] = [];
+      let spxAsc: PriceBar[] = [];
+      if (cohortDates.length > 0) {
+        const cohortMin = cohortDates.reduce((a, b) => (b < a ? b : a));
+        const priceQ = buildBacktestPriceQuery(tickerParam, cohortMin);
+        const spxQ = buildBacktestSpxQuery(cohortMin);
+        [priceAsc, spxAsc] = await Promise.all([
+          all<PriceBar>(c.env.DB, priceQ.sql, priceQ.params),
+          all<PriceBar>(c.env.DB, spxQ.sql, spxQ.params),
+        ]);
+      }
       const bt = aggregateTickerBacktest(cohortDates, priceAsc, spxAsc, useHorizons);
       return meta(f, {
         ticker: tickerParam,
         filerId: filerId ?? null,
         txType: 'B',
         totalBuyEvents: bt.tradeCount,
-        pricedDays: priceAsc.length,
+        pricedDays: num(pricedDaysRow?.n),
         horizons: bt.horizons,
       });
     });
@@ -1101,6 +1136,10 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
   r.get('/performance/:txId', async (c) => {
     const txId = c.req.param('txId') || '';
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(txId)) return c.json({ error: 'invalid id' }, 400);
+    // CT-2459: this was the one analytics route with no cached() wrapper,
+    // yet a drawer renders it per trade (API-level N+1). Anchors are EOD
+    // prices, so the sibling-standard 600s TTL is safe.
+    const data = await cached(c.env, cacheKey(`performance-v1:${txId}`, {}), 600, async () => {
     const row = await get<Record<string, unknown>>(
       c.env.DB,
       `SELECT t.tx_type, t.is_option, t.ticker, t.tx_date, f.filed_date,
@@ -1113,13 +1152,13 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         WHERE t.id = ?`,
       [txId],
     );
-    if (!row) return c.json({ available: false });
+    if (!row) return { available: false };
     const isOption = num(row.is_option) === 1;
     const priceAtTrade = row.price_at_trade == null ? null : num(row.price_at_trade);
     const currentPrice = row.current_price == null ? null : num(row.current_price);
     const spxAtTrade = row.spx_at_trade == null ? null : num(row.spx_at_trade);
     if (isOption || priceAtTrade == null || currentPrice == null) {
-      return c.json({ available: false, isOption });
+      return { available: false, isOption };
     }
     // The asset's current price is the close on current_price_date, so the S&P's
     // exit leg is the S&P close on or before that SAME day (board row 6c05e09b).
@@ -1129,7 +1168,7 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const staleness = evaluateCurrentPriceStaleness(currentPriceDate);
     // Stale responses drop both performance legs, so skip the S&P lookups.
     if (staleness.stale) {
-      return c.json({
+      return {
         available: true,
         stale: true,
         staleDataAgeDays: staleness.dataAgeDays,
@@ -1145,20 +1184,22 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
         tradeDatePerformance: null,
         filingDatePerformance: null,
         estimatedAmounts: true,
-      });
+      };
     }
     const currentSpx =
       (currentPriceDate ? await closeOnOrBefore(c.env, 'spx_eod', currentPriceDate) : null) ??
       (await latestSpxClose(c.env));
     const perf = computePerformance(priceAtTrade, currentPrice, spxAtTrade, currentSpx);
     const filedDate = str(row.filed_date);
-    const priceAtFiling = await closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker));
-    const spxAtFiling = await closeOnOrBefore(c.env, 'spx_eod', filedDate);
+    const [priceAtFiling, spxAtFiling] = await Promise.all([
+      closeOnOrBefore(c.env, 'price_eod', filedDate, str(row.ticker)),
+      closeOnOrBefore(c.env, 'spx_eod', filedDate),
+    ]);
     const filingPerf =
       priceAtFiling == null || currentSpx == null
         ? null
         : computePerformance(priceAtFiling, currentPrice, spxAtFiling, currentSpx);
-    return c.json({
+    return {
       available: true,
       txType: str(row.tx_type),
       ticker: str(row.ticker),
@@ -1174,7 +1215,9 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
       filingDatePerformance:
         filingPerf == null ? null : { priceAt: priceAtFiling, spxAt: spxAtFiling, ...filingPerf },
       estimatedAmounts: true,
+    };
     });
+    return c.json(data);
   });
 
   // --- GET /member/:filerId (politician deep dive) -----------------------
@@ -1373,9 +1416,17 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const limit = Math.max(1, Math.min(500, Math.floor(Number(q.limit) || 100)));
     const key = cacheKey('conflicts', { ...f, limit });
     const data = await cached(c.env, key, 900, async () => {
-      const built = buildConflictCandidatesQuery({ ...f, limit: 2000 });
-      const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
+      // CT-2459: page candidates instead of always fetching the full
+      // 2000-row window and JS-filtering — when conflicts are dense in the
+      // newest rows the first page already fills the caller's limit. Same
+      // 2000-candidate scan cap as before.
+      const PAGE = 500;
+      const MAX_SCANNED = 2000;
       const conflicts: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < MAX_SCANNED && conflicts.length < limit; offset += PAGE) {
+      const built = buildConflictCandidatesQuery({ ...f, limit: PAGE, offset });
+      const rows = await all<Record<string, unknown>>(c.env.DB, built.sql, built.params);
+      if (rows.length === 0) break;
       for (const row of rows) {
         const committees = parseCommitteeNames(row.committees);
         const m = committeeConflict(committees, str(row.sector));
@@ -1394,6 +1445,8 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           estAmountUsd: usd(bracketMidpoint(num(row.amount_min) || null, num(row.amount_max) || null)),
         });
         if (conflicts.length >= limit) break;
+      }
+      if (rows.length < PAGE) break;
       }
       return meta(f, { count: conflicts.length, conflicts });
     });

@@ -22,15 +22,15 @@ process review.
 
 ## Pre-work coordination
 
-Per `AGENTS.md` / fleet `AGENT-SYNC.md`, substantial work should be claimed in
-Slack `#agent-sync` (workspace channel `C0BEZDJDNKV`) with a first field
+Per `AGENTS.md` / fleet `AG***-S**C.md`, substantial work should be claimed in
+Slack `#ag***-s**c` (workspace channel `C0BEZDJDNKV`) with a first field
 `repo: congress-trade`.
 
 - **Product / implementation precedent:** merged PR #2620
   (`monitor/ct-storekit-localized-price`) — StoreKit localized pricing, no
   hardcoded amounts in iOS UI.
 - **This enforcement PR:** #2619 (`antigravity/ios-remove-hardcoded-prices`).
-- **Slack (#agent-sync, `C0BEZDJDNKV`):** Cursor Cloud posted 2026-10-05 —
+- **Slack (#ag***-s**c, `C0BEZDJDNKV`):** Cursor Cloud posted 2026-10-05 —
   https://simplewithus.slack.com/archives/C0BEZDJDNKV/p1791188437791899
   (`repo: congress-trade`, `[Congress.Trade] CURSOR — PR #2619 Kody process
   closeout`).

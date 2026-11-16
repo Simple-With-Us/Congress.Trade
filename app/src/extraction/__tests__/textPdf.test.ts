@@ -15,7 +15,8 @@ vi.mock('unpdf', () => ({
 }));
 
 import { looksLikeHeaderContaminatedAsset } from '../extractRouting.ts';
-import { countHousePtrTails, parseHousePtrText, TextPdfExtractor } from '../textPdf.ts';
+import { countHousePtrTails, housePtrParsersDisagree, parseHousePtrText, TextPdfExtractor } from '../textPdf.ts';
+import { HOUSE_PTR_PARSER_HOLD_CONFIDENCE } from '../housePtrParserArbitration.ts';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -89,11 +90,12 @@ describe('parseHousePtrText', () => {
   });
 
   it('parses single-line House text without treating the PTR header as an asset', () => {
-    const rows = parseHousePtrText(
+    const text =
       'P T R Clerk of the House of Representatives T ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? ' +
-        'SP Amazon.com, Inc. - Common Stock (AMZN) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New S O: Putnam Investments D: details with AAPL and QQQ shares ' +
-        'DC Apple Inc. - Common Stock (AAPL) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New',
-    );
+      'SP Amazon.com, Inc. - Common Stock (AMZN) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New S O: Putnam Investments D: details with AAPL and QQQ shares ' +
+      'DC Apple Inc. - Common Stock (AAPL) [ST] S (partial) 03/16/2026 03/16/2026 $1,001 - $15,000 F S: New';
+    const rows = parseHousePtrText(text);
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
 
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
@@ -106,13 +108,13 @@ describe('parseHousePtrText', () => {
       txDate: '2026-03-16',
       amountMin: 1001,
       amountMax: 15000,
-      confidence: 1.0,
+      confidence,
     });
     expect(rows[1]).toMatchObject({
       owner: 'dependent',
       assetName: 'Apple Inc. - Common Stock',
       ticker: 'AAPL',
-      confidence: 1.0,
+      confidence,
     });
     expect(rows[0].assetName).not.toContain('Clerk');
   });
@@ -142,13 +144,14 @@ describe('parseHousePtrText', () => {
   });
 
   it('preserves caret preferred-share tickers and normalizes slash tickers', () => {
-    const rows = parseHousePtrText(`
+    const text = `
       Periodic Transaction Report
       SP JPMorgan Chase & Co. Depositary Shares, Series GG (JPM^J) [ST]
       P 05/01/2026 05/02/2026 $1,001 - $15,000
       JT Berkshire Hathaway Inc. (BRK/B) [ST]
       S 05/03/2026 05/04/2026 $15,001 - $50,000
-    `);
+    `;
+    const rows = parseHousePtrText(text);
 
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
@@ -160,7 +163,6 @@ describe('parseHousePtrText', () => {
       txDate: '2026-05-01',
       amountMin: 1001,
       amountMax: 15000,
-      confidence: 1.0,
     });
     expect(rows[1]).toMatchObject({
       owner: 'joint',
@@ -171,8 +173,9 @@ describe('parseHousePtrText', () => {
       txDate: '2026-05-03',
       amountMin: 15001,
       amountMax: 50000,
-      confidence: 1.0,
     });
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
+    expect(rows.every((row) => row.confidence === confidence)).toBe(true);
   });
 
   it('strips truncated single-line House table headers before inline parsing', () => {
@@ -199,11 +202,12 @@ describe('parseHousePtrText', () => {
   });
 
   it('parses Pelosi-style option rows from House PTR text at 1.0 deterministic confidence', () => {
-    const rows = parseHousePtrText(
+    const text =
       'Periodic Transaction Report ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? ' +
-        'SP Intel Corporation - Common Stock (INTC) [OP] P 05/29/2026 05/29/2026 $1,000,001 - $5,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27. ' +
-        'SP Uber Technologies, Inc. Common Stock (UBER) [OP] P 05/29/2026 05/29/2026 $500,001 - $1,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27.',
-    );
+      'SP Intel Corporation - Common Stock (INTC) [OP] P 05/29/2026 05/29/2026 $1,000,001 - $5,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27. ' +
+      'SP Uber Technologies, Inc. Common Stock (UBER) [OP] P 05/29/2026 05/29/2026 $500,001 - $1,000,000 F S: New D: Purchased 200 call options with a strike price of $50 and an expiration date of 3/19/27.';
+    const rows = parseHousePtrText(text);
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
 
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
@@ -216,7 +220,7 @@ describe('parseHousePtrText', () => {
       amountMin: 1000001,
       amountMax: 5000000,
       isOption: true,
-      confidence: 1.0,
+      confidence,
     });
     expect(rows[1]).toMatchObject({
       assetName: 'Uber Technologies, Inc. Common Stock',
@@ -224,19 +228,19 @@ describe('parseHousePtrText', () => {
       amountMin: 500001,
       amountMax: 1000000,
       isOption: true,
-      confidence: 1.0,
+      confidence,
     });
   });
 
   it('anchors inline House rows at owner codes instead of the PTR header', () => {
-    const rows = parseHousePtrText(
+    const text =
       'P T R Clerk of the House of Representatives T ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? ' +
         'SP Austin TX ARPT SYS TRAN [GS] P 05/05/2026 05/31/2026 $50,001 - $100,000 F S: New ' +
         'SP Bonita CA UNI SCH [GS] P 05/05/2026 05/31/2026 $50,001 - $100,000 F S: New ' +
         'SP East Bay CA Muni Util [GS] P 05/06/2026 05/31/2026 $250,001 - Filing ID #20034784 ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? $500,000 F S: New ' +
         'SP EEMA O&M Services Group [OL] P 05/15/2026 05/31/2026 $250,001 - $500,000 F S: New S O: Kent Street Group LLC L: Elverson, PA, US D: Water/Wastewater O&M ' +
-        'SP Energy Northwest WA PWR UTIL [GS] P 05/20/2026 05/31/2026 $500,001 - $1,000,000 F S: New',
-    );
+        'SP Energy Northwest WA PWR UTIL [GS] P 05/20/2026 05/31/2026 $500,001 - $1,000,000 F S: New';
+    const rows = parseHousePtrText(text);
 
     expect(rows).toHaveLength(5);
     expect(rows[0]).toMatchObject({
@@ -247,31 +251,30 @@ describe('parseHousePtrText', () => {
       txDate: '2026-05-05',
       amountMin: 50001,
       amountMax: 100000,
-      confidence: 1.0,
     });
     expect(rows[2]).toMatchObject({
       assetName: 'East Bay CA Muni Util',
       amountMin: 250001,
       amountMax: 500000,
-      confidence: 1.0,
     });
     expect(rows[3]).toMatchObject({
       assetName: 'EEMA O&M Services Group',
       assetType: 'OL',
-      confidence: 1.0,
     });
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
+    expect(rows.every((row) => row.confidence === confidence)).toBe(true);
     expect(rows[0].assetName).not.toContain('Clerk');
     expect(rows[3].assetName).not.toContain('Kent Street Group');
   });
 
   it('parses digit-prefixed House asset-type codes in inline text', () => {
-    const rows = parseHousePtrText(
+    const text =
       'Periodic Transaction Report ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200? ' +
         'SELF 401K Retirement Plan [4K] P 05/01/2026 05/02/2026 $1,001 - $15,000 F S: New ' +
         'SP 529 College Savings Account [5C] P 05/03/2026 05/04/2026 $15,001 - $50,000 F S: New ' +
         'DC 529 Growth Portfolio [5F] S 05/05/2026 05/06/2026 $1,001 - $15,000 F S: New ' +
-        'JT State Prepaid Tuition Plan [5P] P 05/07/2026 05/08/2026 $1,001 - $15,000 F S: New',
-    );
+        'JT State Prepaid Tuition Plan [5P] P 05/07/2026 05/08/2026 $1,001 - $15,000 F S: New';
+    const rows = parseHousePtrText(text);
 
     expect(rows).toHaveLength(4);
     expect(rows.map((row) => row.assetType)).toEqual(['4K', '5C', '5F', '5P']);
@@ -282,7 +285,8 @@ describe('parseHousePtrText', () => {
       '529 Prepaid Tuition Plan',
     ]);
     expect(rows.every((row) => row.ticker === null)).toBe(true);
-    expect(rows.every((row) => row.confidence === 1.0)).toBe(true);
+    const confidence = housePtrParsersDisagree(text) ? HOUSE_PTR_PARSER_HOLD_CONFIDENCE : 1;
+    expect(rows.every((row) => row.confidence === confidence)).toBe(true);
   });
 
   it('parses digit-prefixed House asset-type codes in multiline blocks', () => {

@@ -102,7 +102,17 @@ describe('members filter resolves names to filer ids (a6058af2)', () => {
     expect(membersOf(result)).toEqual(['P000197']);
     if (!result.ok) throw new Error('unreachable');
     // The stored filter now matches the trade; the raw name never could.
-    const tx = { filerId: 'P000197' } as unknown as Transaction;
+    // Dates stay relative: the delivery freshness gate treats filings older
+    // than DELIVERY_FRESH_WINDOW_DAYS as backfill, so a hardcoded date turns
+    // this test stale as the calendar moves.
+    const learned = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    const tx = {
+      filerId: 'P000197',
+      txDate: learned.toISOString().slice(0, 10),
+      filedDate: learned.toISOString().slice(0, 10),
+      firstSeenAt: learned.toISOString(),
+      createdAt: learned.toISOString(),
+    } as unknown as Transaction;
     expect(matchesFilters(tx, result.filters)).toBe(true);
     expect(matchesFilters(tx, { members: ['Nancy Pelosi'] })).toBe(false);
   });

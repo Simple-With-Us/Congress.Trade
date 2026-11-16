@@ -1,11 +1,43 @@
 import { z } from "zod";
 
+import { AiUsageSchema } from "./aiUsage";
+
 export const USAGE_TELEMETRY_SCHEMA_VERSION = 2 as const;
 export const API_USAGE_MONITOR_INGEST_PATH = "/api/ingest/usage";
 export const API_USAGE_MONITOR_HEALTH_PATH = "/api/health";
 export const API_USAGE_MONITOR_READY_PATH = "/api/ready";
 
-export const USAGE_TELEMETRY_PRODUCERS = ["congress-trade", "socratic-trade", "usage-monitor"] as const;
+/**
+ * Known v2 producer ids (the batch `producerId`, persisted as `sourceApp`).  Informational:
+ * the wire schema accepts any producerId, and Usage Monitor authorizes each one by its
+ * scoped ingest token.
+ */
+export const USAGE_TELEMETRY_PRODUCERS = [
+  "congress-trade",
+  "socratic-trade",
+  "usage-monitor",
+  "botfleet",
+  "codecaps",
+  "claude-code",
+  "openai-codex",
+  "grok-build",
+  "github-copilot",
+  "minimax-code",
+  "deepseek-dsh",
+  "opencode",
+  "fx",
+  "antigravity-cli",
+  "antigravity-statusline",
+  "cursor-agent",
+  "cursor-admin",
+  "muse",
+  "muse-code",
+  "gbu",
+  "mac-host",
+  "fleet-usage-collector",
+  "admin-usage-poller",
+  "manual-billing-adjustment",
+] as const;
 export const UsageTelemetryProducerSchema = z.enum(USAGE_TELEMETRY_PRODUCERS);
 
 export const USAGE_TELEMETRY_KNOWN_PROVIDERS = [
@@ -14,6 +46,12 @@ export const USAGE_TELEMETRY_KNOWN_PROVIDERS = [
   "anthropic",
   "google-ai",
   "mistral",
+  "minimax",
+  "deepseek",
+  "xai",
+  "moonshot",
+  "github-copilot",
+  "cursor",
   "finnhub",
   "fmp",
   "unusual-whales",
@@ -124,6 +162,8 @@ const UsageTelemetryMeasurementFields = {
   occurredAt: z.string().datetime().optional(),
   providerRequestId: z.string().trim().min(1).max(200).optional(),
   metadata: UsageTelemetryMetadataSchema.optional(),
+  /** Canonical AI usage (model, tokens, timing, seat, billing).  See `aiUsage.ts` (UM-1592). */
+  ai: AiUsageSchema.optional(),
 } as const;
 
 /** The only v2 event shape sent over the wire. */

@@ -62,7 +62,7 @@ Discovery is healthy.  Extraction is not.  The site can serve the last published
 | **[#1964](https://github.com/jaywedgeworth22/Congress.Trade/pull/1964)** Coolify overlap | **Open**, not installed | Clones `congress-hold` outside the Coolify project and fails Traefik over to it during compose stop-then-start.  **Merge alone does nothing.**  Host systemd install is the actual fix. |
 | #1966 latency corpus | Open | Methodology only.  Does not change probe health. |
 | #1959 scanned-pdf OCR | Draft | Extraction path.  Keepout. |
-| `cursor/prod-incident-audit-f506` | Claimed in `#agent-sync` | Owns review-queue catalog + leftover files-prepaid halt.  Keepout. |
+| `cursor/prod-incident-audit-f506` | Claimed in `#ag***-s**c` | Owns review-queue catalog + leftover files-prepaid halt.  Keepout. |
 
 UptimeRobot incidents at **16:18 CDT** and **16:29 CDT** today match the documented Coolify compose gap (seconds-to-minutes with zero in-project app containers).  This audit did not have Traefik access logs to prove those two flaps were deploys.  The mechanism is proven from 2026-08-12 and 2026-08-14 (~90s gap on `#1863`).
 

@@ -7,6 +7,8 @@ import {
   resolvePeerImportRequestId,
   totalDroppedCount,
   warnPeerImportSchemaDrops,
+  warnPeerImportAuthRejected,
+  warnPeerImportNoAcceptedRows,
 } from '../importReceipt.ts';
 import { SecurityRefInputSchema } from '@jaywedgeworth22/congress-trading-shared';
 
@@ -105,6 +107,46 @@ describe('warnPeerImportSchemaDrops', () => {
       dropped: {},
     });
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('warnPeerImportNoAcceptedRows', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('warns when a payload carried rows but every stream accepted zero', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warnPeerImportNoAcceptedRows({
+      requestId: 'r2',
+      origin: 'socratic',
+      payloadBytes: 50,
+      dropped: { fundamentals: { count: 3, reason: SCHEMA_DROP_REASON } },
+      accepted: {
+        refs: 0,
+        prices: 0,
+        spx: 0,
+        insider: 0,
+        shortVolume: 0,
+        fundamentals: 0,
+        analyst: 0,
+      },
+      rawBody: { fundamentals: [{ ticker: 'X' }, { ticker: 'Y' }] },
+    });
+    expect(warn).toHaveBeenCalled();
+  });
+});
+
+describe('warnPeerImportAuthRejected', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('warns with ingest_bearer_mismatch when a bearer was sent but did not match', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warnPeerImportAuthRejected({
+      path: '/api/admin/securities/import',
+      hasAuthorization: true,
+      ingestTokenConfigured: true,
+      ingestBearerAttempt: true,
+    });
+    expect(warn).toHaveBeenCalled();
   });
 });
 

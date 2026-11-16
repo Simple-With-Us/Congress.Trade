@@ -2,7 +2,7 @@
  * src/admin/filerIdentityDedupe.ts
  *
  * One-time / repeatable backfill that merges `filers` rows which forked for
- * the same real member. Three passes, run in order on every call:
+ * the same real member. Four passes, run in order on every call:
  *
  *   A. Name-key: see shared/filerIdentityMatch.ts for the matching rule —
  *      same chamber + state, first+last name equal modulo a middle
@@ -24,6 +24,14 @@
  *      the state check, after stripping the "20XX ERM" / bare-year / dotted
  *      date-fragment noise that forks one real nominee into several rows
  *      (e.g. "Barbara M Barrett" vs "Barbara M Barrett 2021 ERM").
+ *   D. MANUAL-* phantoms (CT-1362 / CT-1360): a competitor-minted id is
+ *      aliased onto the existing roster or EXEC filer. Known last-name
+ *      guesses (MANUAL-DELANEY → April McClain Delaney, and the other pairs
+ *      in shared/phantomFilerAliases.ts) are pinned. Every other MANUAL-*
+ *      row aliases only when its full name matches exactly one real filer
+ *      on first+last, including middle names and initials. The phantom's
+ *      own chamber and party are ignored and never written back. Rows are
+ *      tombstoned, never deleted.
  *
  * Reversible-safe: NEVER deletes a filer row. The alias row is tombstoned
  * via `merged_into` (migration 0078) and every alias -> canonical rewrite is
@@ -52,8 +60,13 @@
 import type { Env } from '../shared/types.ts';
 import { all, get, run } from '../shared/db.ts';
 import { execNameMatchKey, memberNameMatchKey, sameFilerIdentity } from '../shared/filerIdentityMatch.ts';
-import { isMintedCompetitorFilerId } from '../shared/competitorFilerMatch.ts';
+import {
+  findExistingFilerForCompetitorReporter,
+  isMintedCompetitorFilerId,
+  type ExistingFilerCandidate,
+} from '../shared/competitorFilerMatch.ts';
 import { resolveExecutiveFilerIdFromName } from '../shared/executiveIdentity.ts';
+import { phantomCanonicalId } from '../shared/phantomFilerAliases.ts';
 
 interface FilerRow {
   bioguide_id: string;
@@ -358,6 +371,162 @@ async function runClusterPass(
   return { details, aliasesTombstoned, transactionsMoved, filingsMoved };
 }
 
+/**
+ * Move a MANUAL-* phantom onto `canonical` without copying chamber, party,
+ * state, or district. Live trades that would collide on
+ * (doc_id, source, row_key) are deprecated in place. Idempotent.
+ */
+async function repointPhantomAlias(
+  env: Env,
+  canonical: FilerRow,
+  alias: FilerRow,
+  nowIso: string,
+  opts: { reason: string; dryRun: boolean },
+): Promise<FilerIdentityMergeDetail> {
+  if (opts.dryRun) {
+    const txCount = await get<{ n: number }>(
+      env.DB,
+      'SELECT COUNT(*) AS n FROM transactions WHERE filer_id = ? AND deprecated_at IS NULL',
+      [alias.bioguide_id],
+    );
+    const filCount = await get<{ n: number }>(
+      env.DB,
+      'SELECT COUNT(*) AS n FROM filings WHERE filer_id = ?',
+      [alias.bioguide_id],
+    );
+    return {
+      canonicalId: canonical.bioguide_id,
+      canonicalName: canonical.full_name,
+      aliasIds: [alias.bioguide_id],
+      transactionsMoved: txCount?.n ?? 0,
+      filingsMoved: filCount?.n ?? 0,
+      reason: opts.reason,
+    };
+  }
+
+  await run(
+    env.DB,
+    `UPDATE transactions
+        SET deprecated_at = COALESCE(deprecated_at, ?),
+            deprecated_reason = COALESCE(deprecated_reason, 'phantom-filer-alias-duplicate')
+      WHERE filer_id = ?
+        AND deprecated_at IS NULL
+        AND row_key IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM transactions AS canon
+           WHERE canon.filer_id = ?
+             AND canon.doc_id = transactions.doc_id
+             AND canon.source IS transactions.source
+             AND canon.row_key = transactions.row_key
+             AND canon.deprecated_at IS NULL
+        )`,
+    [nowIso, alias.bioguide_id, canonical.bioguide_id],
+  );
+
+  const txRes = await run(
+    env.DB,
+    `UPDATE transactions
+        SET filer_id = ?
+      WHERE filer_id = ?
+        AND deprecated_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM transactions AS canon
+           WHERE canon.filer_id = ?
+             AND canon.doc_id = transactions.doc_id
+             AND canon.source IS transactions.source
+             AND canon.row_key IS NOT NULL
+             AND canon.row_key = transactions.row_key
+             AND transactions.row_key IS NOT NULL
+             AND canon.deprecated_at IS NULL
+        )`,
+    [canonical.bioguide_id, alias.bioguide_id, canonical.bioguide_id],
+  );
+
+  const filRes = await run(env.DB, 'UPDATE filings SET filer_id = ? WHERE filer_id = ?', [
+    canonical.bioguide_id,
+    alias.bioguide_id,
+  ]);
+
+  await run(env.DB, 'UPDATE filers SET merged_into = ? WHERE bioguide_id = ? AND merged_into IS NULL', [
+    canonical.bioguide_id,
+    alias.bioguide_id,
+  ]);
+
+  await run(
+    env.DB,
+    `INSERT INTO filer_identity_merges (alias_filer_id, canonical_filer_id, chamber, state, reason, merged_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(alias_filer_id) DO UPDATE SET
+       canonical_filer_id = excluded.canonical_filer_id,
+       merged_at = excluded.merged_at`,
+    [alias.bioguide_id, canonical.bioguide_id, canonical.chamber, canonical.state, opts.reason, nowIso],
+  );
+
+  return {
+    canonicalId: canonical.bioguide_id,
+    canonicalName: canonical.full_name,
+    aliasIds: [alias.bioguide_id],
+    transactionsMoved: txRes.meta?.changes ?? 0,
+    filingsMoved: filRes.meta?.changes ?? 0,
+    reason: opts.reason,
+  };
+}
+
+/** Pass D. Only MANUAL-* ids are aliases. Real house/senate/exec rows are never paired with each other here. */
+async function aliasMintedPhantoms(
+  env: Env,
+  nowIso: string,
+  dryRun: boolean,
+  alreadyAliased: ReadonlySet<string>,
+): Promise<ClusterPassResult> {
+  const filers = await loadNonTombstonedFilers(env);
+  const byId = new Map(filers.map((f) => [f.bioguide_id, f]));
+  const candidates: ExistingFilerCandidate[] = filers
+    .filter((f) => !isMintedCompetitorFilerId(f.bioguide_id))
+    .map((f) => ({
+      filerId: f.bioguide_id,
+      fullName: f.full_name,
+      chamber: f.chamber,
+      state: f.state,
+      resolvedBioguideId: f.resolved_bioguide_id,
+    }));
+
+  const details: FilerIdentityMergeDetail[] = [];
+  let aliasesTombstoned = 0;
+  let transactionsMoved = 0;
+  let filingsMoved = 0;
+
+  for (const alias of filers) {
+    if (!isMintedCompetitorFilerId(alias.bioguide_id)) continue;
+    if (alreadyAliased.has(alias.bioguide_id)) continue;
+
+    const pinned = phantomCanonicalId(alias.bioguide_id);
+    let canonical: FilerRow | null = null;
+    let reason = 'phantom-filer-alias';
+    if (pinned) {
+      canonical = byId.get(pinned) ?? null;
+      if (!canonical) continue;
+    } else {
+      const hit = findExistingFilerForCompetitorReporter({
+        names: [alias.full_name ?? ''],
+        candidates,
+      });
+      if (!hit) continue;
+      canonical = byId.get(hit.filerId) ?? null;
+      if (!canonical || canonical.bioguide_id === alias.bioguide_id) continue;
+      reason = 'phantom-name-match';
+    }
+
+    const merged = await repointPhantomAlias(env, canonical, alias, nowIso, { reason, dryRun });
+    transactionsMoved += merged.transactionsMoved;
+    filingsMoved += merged.filingsMoved;
+    aliasesTombstoned += merged.aliasIds.length;
+    details.push(merged);
+  }
+
+  return { details, aliasesTombstoned, transactionsMoved, filingsMoved };
+}
+
 export async function dedupeSplitFilerIdentities(
   env: Env,
   opts: { dryRun?: boolean } = {},
@@ -423,14 +592,20 @@ export async function dedupeSplitFilerIdentities(
       execClusterKey(canonical.full_name) === execClusterKey(alias.full_name),
   );
 
+  const alreadyAliased = new Set<string>();
+  for (const detail of [...passA.details, ...passB.details, ...passC.details]) {
+    for (const aliasId of detail.aliasIds) alreadyAliased.add(aliasId);
+  }
+  const passD = await aliasMintedPhantoms(env, nowIso, dryRun, alreadyAliased);
+
   const resweptRows = dryRun ? 0 : await resweepRecordedMerges(env);
 
-  const details = [...passA.details, ...passB.details, ...passC.details];
+  const details = [...passA.details, ...passB.details, ...passC.details, ...passD.details];
   return {
     clustersFound: details.length,
-    aliasesTombstoned: passA.aliasesTombstoned + passB.aliasesTombstoned + passC.aliasesTombstoned,
-    transactionsMoved: passA.transactionsMoved + passB.transactionsMoved + passC.transactionsMoved,
-    filingsMoved: passA.filingsMoved + passB.filingsMoved + passC.filingsMoved,
+    aliasesTombstoned: passA.aliasesTombstoned + passB.aliasesTombstoned + passC.aliasesTombstoned + passD.aliasesTombstoned,
+    transactionsMoved: passA.transactionsMoved + passB.transactionsMoved + passC.transactionsMoved + passD.transactionsMoved,
+    filingsMoved: passA.filingsMoved + passB.filingsMoved + passC.filingsMoved + passD.filingsMoved,
     resweptRows,
     details,
   };

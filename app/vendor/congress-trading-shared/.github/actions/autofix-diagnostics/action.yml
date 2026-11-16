@@ -1,0 +1,19 @@
+name: Sanitized Autofix Diagnostics
+description: Reduce a failed Claude Code SDK transcript to bounded enums and counts.
+outputs:
+  summary-path:
+    description: Path to sanitized diagnostics JSON inside RUNNER_TEMP.
+    value: ${{ steps.reduce.outputs.summary-path }}
+  status:
+    description: Fixed diagnostics availability code.
+    value: ${{ steps.reduce.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - name: Reduce Claude Code Transcript
+      id: reduce
+      if: always()
+      shell: bash
+      env:
+        RUNNER_TEMP: ${{ runner.temp }}
+      run: node "$GITHUB_ACTION_PATH/reduce.mjs"

@@ -10,13 +10,16 @@ import * as Sentry from '#sentry';
 import worker from '../../index.ts';
 import { DeliveryRetryError, dispatchWebhook } from '../webhook.ts';
 import type { Env, QueueMessage } from '../../shared/types.ts';
+import { freshDeliveryDay, freshDeliveryIso } from './freshDeliveryFixtures.ts';
 
 const txRow = {
-  id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: '2026-06-20', owner: 'self',
+  id: 'tx_1', doc_id: 'doc_1', filer_id: 'bio_1', tx_date: freshDeliveryDay, owner: 'self',
   asset_name: 'Apple Inc.', ticker: 'AAPL', asset_type: 'stock', tx_type: 'B',
   amount_min: 1001, amount_max: 15000, is_option: 0, cap_gains_over_200: 0,
   raw_text: 'AAPL purchase', confidence: 0.99, source: 'primary',
-  created_at: '2026-06-20T00:00:00.000Z', cursor_seq: 42,
+  filed_date: freshDeliveryDay,
+  first_seen_at: freshDeliveryIso,
+  created_at: freshDeliveryIso, cursor_seq: 42,
 };
 
 const subRow = {
@@ -32,7 +35,6 @@ interface DeliveryState {
 
 function publicDnsAndTarget(status = 200) {
   let targetCalls = 0;
-  let targetCancels = 0;
   const deliveryAttempts: string[] = [];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -42,15 +44,26 @@ function publicDnsAndTarget(status = 200) {
     }
     targetCalls += 1;
     deliveryAttempts.push(new Headers(init?.headers).get('X-Delivery-Attempt') ?? '');
-    return new Response(new ReadableStream({
-      start(controller) { controller.enqueue(new TextEncoder().encode(status === 200 ? 'ok' : 'nope')); },
-      cancel() { targetCancels += 1; },
-    }), { status });
+    if (status !== 200) {
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode('nope')); },
+        cancel() {},
+      }), { status });
+    }
+    return new Response(
+      JSON.stringify({
+        receiptVersion: 1,
+        delivered: true,
+        consumed: true,
+        ok: true,
+        applied: 1,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
   });
   return {
     fetchMock,
     targetCalls: () => targetCalls,
-    targetCancels: () => targetCancels,
     deliveryAttempts: () => deliveryAttempts,
   };
 }
@@ -186,7 +199,6 @@ describe('native delivery retry and leases', () => {
     vi.mocked(Sentry.captureException).mockClear();
     const { ack, retry } = await queueOnce(env);
     expect(http.targetCalls()).toBe(1);
-    expect(http.targetCancels()).toBe(1);
     expect(delivery()).toMatchObject({ status: 'failed', attempts: 1, last_error: 'HTTP 503' });
     expect(retry).toHaveBeenCalledWith({ delaySeconds: expect.any(Number) });
     expect(ack).not.toHaveBeenCalled();
@@ -212,7 +224,33 @@ describe('native delivery retry and leases', () => {
     expect(second.ack).toHaveBeenCalledOnce();
     expect(delivery()).toMatchObject({ status: 'delivered', attempts: 3 });
     expect(http.targetCalls()).toBe(1);
-    expect(http.targetCancels()).toBe(1);
+  });
+
+  it('retries when App B returns HTTP 200 but consumed=false', async () => {
+    const { env, delivery } = fakeEnv();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('https://cloudflare-dns.com/dns-query')) {
+        const type = new URL(url).searchParams.get('type');
+        return Response.json({ Status: 0, Answer: type === 'A' ? [{ type: 1, data: '93.184.216.34' }] : [] });
+      }
+      return new Response(
+        JSON.stringify({
+          receiptVersion: 1,
+          delivered: true,
+          consumed: false,
+          ok: false,
+          applied: 0,
+          reason: 'invalid-event',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { ack, retry } = await queueOnce(env);
+    expect(delivery()).toMatchObject({ status: 'failed', attempts: 1, last_error: /consumption failed/ });
+    expect(retry).toHaveBeenCalled();
+    expect(ack).not.toHaveBeenCalled();
   });
 
   it('does not ACK successful delivery until durable outbox completion succeeds', async () => {

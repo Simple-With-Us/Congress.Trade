@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { isIsoDate } from "./utils";
-import { CONGRESS_EVENT_TYPES } from "./constants";
+import {
+  CONGRESS_EVENT_TYPES,
+  SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION,
+  SHARE_PAYLOAD_SCHEMA_VERSION,
+} from "./constants";
 
 const nullAsUndefined = <T extends z.ZodType>(schema: T) =>
   z.preprocess((value) => value === null ? undefined : value, schema.optional());
@@ -332,7 +336,15 @@ export const PriceSeriesSchema = z.object({
 });
 export type PriceSeries = z.infer<typeof PriceSeriesSchema>;
 
+/**
+ * Envelope contract version.  Optional so unversioned senders keep working;  any positive integer
+ * is accepted so a receiver on an older package can see a newer version and decide (log or
+ * reject) via `isSupportedSharePayloadSchemaVersion` instead of failing the whole parse.
+ */
+export const SharePayloadSchemaVersionSchema = z.number().int().positive();
+
 export const SharePayloadSchema = z.object({
+  schemaVersion: SharePayloadSchemaVersionSchema.optional(),
   refs: z.array(SecurityRefInputSchema).optional(),
   spx: z.array(PriceCloseSchema).optional(),
   prices: z.array(PriceSeriesSchema).optional(),
@@ -344,6 +356,23 @@ export const SharePayloadSchema = z.object({
   origin: z.string().optional(),
 });
 export type SharePayload = z.infer<typeof SharePayloadSchema>;
+
+/**
+ * The contract version a share payload was sent with.  Payloads without `schemaVersion` predate
+ * versioning and resolve to `SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION`.
+ */
+export function resolveSharePayloadSchemaVersion(payload: Pick<SharePayload, "schemaVersion">): number {
+  return payload.schemaVersion ?? SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION;
+}
+
+/**
+ * True when this package version understands the payload's contract version (legacy unversioned
+ * payloads included).  Receivers should log or reject a payload for which this returns false.
+ */
+export function isSupportedSharePayloadSchemaVersion(payload: Pick<SharePayload, "schemaVersion">): boolean {
+  const version = resolveSharePayloadSchemaVersion(payload);
+  return version >= SHARE_PAYLOAD_LEGACY_SCHEMA_VERSION && version <= SHARE_PAYLOAD_SCHEMA_VERSION;
+}
 
 export const BundleResponseSchema = z.object({
   ticker: z.string(),

@@ -1,0 +1,571 @@
+// The App Store Connect private key:  how it is validated, and how it is
+// staged for the Apple tools that need a key on disk.
+//
+// AFC-459, revision 2 (Kody rule 42):  a path on disk is not an approved
+// credential source at all, so this module never reads a file.  The approved
+// sources are the process environment, a captured `fleet-secrets get NAME` and
+// bootstrap-only Keychain credentials.  The module therefore validates a key,
+// writes a mode-600 staging copy for altool and Xcode, and builds the
+// allowlisted environment a child process runs with.
+//
+// Everything here is synthetic:  the keys are generated at test time and are
+// never committed, and nothing reaches the network.
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createVerify, generateKeyPairSync } from "node:crypto";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+import { normalizePrivateKey, writePrivateKeyFile, CLIENT_ENV_ALLOWLIST, clientEnvironment } from "./asc-key.mjs";
+import { nextSharedBuild } from "./shared-build.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const helper = join(here, "asc-key.mjs");
+const client = join(here, "asc-api.mjs");
+const root = mkdtempSync(join(tmpdir(), "asc-key-test-"));
+//  A PATH with node and nothing else:  the fleet reader lives in the operator's
+//  own bin directory, and a test must never reach it or Infisical.
+const safePath = [dirname(process.execPath), "/usr/bin", "/bin"].join(":");
+//  Two key pairs:  the first one signs the requests, the second one only ever
+//  appears in a named key file, so a test can tell which key was used.
+const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const keyPem = pair.privateKey.export({ type: "pkcs8", format: "pem" });
+const otherPair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const otherPem = otherPair.privateKey.export({ type: "pkcs8", format: "pem" });
+
+function staged(name, content = keyPem, mode = 0o600) {
+  const path = join(root, name);
+  writeFileSync(path, content);
+  chmodSync(path, mode);
+  return path;
+}
+
+function run(args, stdin = "", env = undefined) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [helper, ...args], {
+      ...(env ? { env } : {}),
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    child.stdin.end(stdin);
+  });
+}
+
+function spawnNode(args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function localServer() {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push({ url: req.url, authorization: req.headers.authorization || "" });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: [] }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({
+      base: `http://127.0.0.1:${server.address().port}`,
+      seen,
+      close: () => server.close()
+    }));
+  });
+}
+
+function jwtKeyId(authorization) {
+  const token = String(authorization || "").replace(/^Bearer /, "");
+  if (!token) return null;
+  return JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString()).kid;
+}
+
+//  True when the request was signed with the given key pair:  the client signs
+//  with the JOSE (r||s) encoding, so the signature is verified the same way.
+function jwtSignedBy(authorization, publicKey) {
+  const token = String(authorization || "").replace(/^Bearer /, "");
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+  const verifier = createVerify("SHA256");
+  verifier.update(`${parts[0]}.${parts[1]}`);
+  verifier.end();
+  return verifier.verify({ key: publicKey, dsaEncoding: "ieee-p1363" }, Buffer.from(parts[2], "base64url"));
+}
+
+test("a generated key is accepted and comes back with a trailing newline", () => {
+  const normalized = normalizePrivateKey(keyPem);
+  assert.ok(normalized, "a real key was refused");
+  assert.ok(normalized.endsWith("\n"), "the key has to end with a newline");
+  assert.equal(normalized.trim(), keyPem.trim());
+});
+
+test("a malformed PEM is refused, because the envelope is not a key", () => {
+  //  A truncated key, an armored block and a mangled export all carry the
+  //  envelope and still fail to parse.  Accepting them would hand the signer
+  //  something it cannot use, and the failure would come back as a stack
+  //  trace instead of a credential error.
+  assert.equal(normalizePrivateKey("-----BEGIN PRIVATE KEY-----\nnot base64 at all\n-----END PRIVATE KEY-----\n"), null); // gitleaks:allow
+  assert.equal(normalizePrivateKey("-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n"), null); // gitleaks:allow
+  assert.equal(normalizePrivateKey(""), null);
+  assert.equal(normalizePrivateKey(undefined), null);
+  assert.equal(normalizePrivateKey("hunter2"), null);
+});
+
+test("the module exports exactly the four approved names", async () => {
+  //  The module is small on purpose:  it validates a key, stages it and builds
+  //  the child's environment.  A reader, an executor or any other way in
+  //  would make a path on disk a credential source again.
+  const mod = await import("./asc-key.mjs");
+  assert.deepEqual(
+    Object.keys(mod).sort(),
+    ["CLIENT_ENV_ALLOWLIST", "clientEnvironment", "normalizePrivateKey", "writePrivateKeyFile"]
+  );
+});
+
+test("the module never reads a key file", () => {
+  const source = readFileSync(helper, "utf8");
+  assert.doesNotMatch(source, /readFileSync/, "the module reads a file");
+  assert.doesNotMatch(source, /O_NOFOLLOW/, "the module opens a file with O_NOFOLLOW");
+  assert.doesNotMatch(source, /readPrivateKeyFile/, "the module exposes a file reader");
+  assert.doesNotMatch(source, /execWithKey/, "the module exposes a key executor");
+});
+
+test("the command line validates a key on stdin and never prints it", async () => {
+  //  A key on stdout is a key in every log that captures it, so the module
+  //  reports whether the key is usable and nothing else.
+  const ok = await run(["validate"], keyPem);
+  assert.equal(ok.code, 0, `the key was refused: ${ok.stderr}`);
+  assert.match(ok.stdout, /is a PEM private key/, `the status was not reported:\n${ok.stdout}`);
+  assert.doesNotMatch(ok.stdout, /PRIVATE KEY/, "the key reached stdout");
+  assert.doesNotMatch(ok.stderr, /PRIVATE KEY/, "the key reached stderr");
+});
+
+test("the command line refuses a value that is not a key", async () => {
+  const bad = await run(["validate"], "not a private key at all");
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /not a PEM private key/);
+  assert.equal(bad.stdout, "", "a refused key must not put anything on stdout");
+});
+
+test("there is no read subcommand and no exec subcommand", async () => {
+  //  Revision 2 removed both:  a path on disk is not an approved credential
+  //  source, so there is nothing for them to do.
+  const path = staged("no-such-command.p8");
+  const read = await run(["read", path]);
+  assert.notEqual(read.code, 0, "the module still has a read subcommand");
+  assert.match(read.stderr, /usage: asc-key\.mjs validate \| write <path>/);
+
+  const exec = await run(["exec", path, "--", process.execPath, "-e", "process.exit(0)"]);
+  assert.notEqual(exec.code, 0, "the module still has an exec subcommand");
+  assert.match(exec.stderr, /usage: asc-key\.mjs validate \| write <path>/);
+});
+
+test("the command line writes a key to a file only its owner can read", async () => {
+  const path = join(root, "written.p8");
+  const result = await run(["write", path], keyPem);
+  assert.equal(result.code, 0, `the write failed: ${result.stderr}`);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(readFileSync(path, "utf8").trim(), keyPem.trim());
+});
+
+test("the command line refuses to write a value that is not a key", async () => {
+  const path = join(root, "refused.p8");
+  const result = await run(["write", path], "not a private key");
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /not a PEM private key/);
+  assert.equal(existsSync(path), false, "a refused key must not leave a file behind");
+});
+
+test("writePrivateKeyFile normalizes the key and refuses anything else", () => {
+  const path = join(root, "direct.p8");
+  const written = writePrivateKeyFile(path, keyPem.replace(/\r\n/g, "\n"));
+  assert.ok(written.pem, `the write failed: ${written.error}`);
+  assert.equal(written.pem.endsWith("\n"), true);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  const refused = writePrivateKeyFile(join(root, "direct-bad.p8"), "hunter2");
+  assert.ok(refused.error, "a value that is not a key was written");
+  assert.match(refused.error, /not a PEM private key/);
+});
+
+test("the child's environment is an allowlist, never a copy of the parent's", () => {
+  //  A wholesale copy hands every credential on the operator's machine to the
+  //  child, including the ones that have nothing to do with App Store Connect.
+  const child = clientEnvironment({
+    PATH: "/usr/bin:/bin",
+    HOME: "/tmp/home",
+    ASC_KEY_ID: "SYNTHETICKEYID1",
+    ASC_ISSUER_ID: "synthetic-issuer",
+    SECRET_TOKEN: "not-for-the-child"
+  });
+  assert.equal(child.PATH, "/usr/bin:/bin");
+  assert.equal(child.HOME, "/tmp/home");
+  assert.equal(child.ASC_KEY_ID, "SYNTHETICKEYID1");
+  assert.equal(child.SECRET_TOKEN, undefined, "a credential crossed over to the child");
+  assert.ok(!Object.keys(child).includes("ASC_KEY_P8"), "the key belongs in no inherited variable");
+  assert.ok(!CLIENT_ENV_ALLOWLIST.includes("ASC_KEY_P8"), "the key must not be an inherited variable");
+  //  The key is added separately, by the caller that owns it.
+  const withKey = clientEnvironment({ PATH: "/usr/bin:/bin" }, { ASC_KEY_P8: keyPem });
+  assert.equal(withKey.ASC_KEY_P8, keyPem);
+});
+
+test("the client takes the key from the environment and ignores a named ASC_KEY_PATH", async () => {
+  //  The environment wins over a named file:  a stale or foreign path in an
+  //  operator's shell must never decide which key signs the request.
+  const server = await localServer();
+  try {
+    const result = await spawnNode([client, "GET", `${server.base}/v1/apps`], {
+      PATH: safePath,
+      HOME: join(root, "home-client"),
+      FLEET_SECRETS_BIN: join(root, "no-fleet-secrets"),
+      ASC_API_BASE: server.base,
+      ASC_KEY_ID: "SYNTHETICKEYID1",
+      ASC_ISSUER_ID: "synthetic-issuer",
+      ASC_KEY_P8: keyPem,
+      ASC_KEY_PATH: staged("named-client.p8", otherPem)
+    });
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.match(result.stderr, /asc-auth: using ASC_KEY_P8 environment/,
+      `the client did not report the environment source:\n${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /ASC_KEY_PATH/, "the client talked about a named path");
+    assert.ok(server.seen.length > 0, "the client never reached App Store Connect");
+    assert.equal(jwtKeyId(server.seen[0].authorization), "SYNTHETICKEYID1");
+    assert.ok(jwtSignedBy(server.seen[0].authorization, pair.publicKey),
+      "the request was not signed with the key from the environment");
+    assert.ok(!jwtSignedBy(server.seen[0].authorization, otherPair.publicKey),
+      "the request was signed with the key from the named file");
+    assert.doesNotMatch(result.stdout + result.stderr, /BEGIN PRIVATE KEY/,
+      "the key reached the client's output");
+  } finally {
+    server.close();
+  }
+});
+
+test("a named ASC_KEY_PATH is not a credential for the client either", async () => {
+  //  With a named file and no key in the environment the client has no
+  //  credential at all:  a path on disk is not an approved source, and the
+  //  refusal says so.
+  const result = await spawnNode([client, "GET", "http://127.0.0.1:1/v1/apps"], {
+    PATH: safePath,
+    HOME: join(root, "home-empty"),
+    FLEET_SECRETS_BIN: join(root, "no-fleet-secrets"),
+    ASC_API_BASE: "http://127.0.0.1:1",
+    ASC_KEY_ID: "SYNTHETICKEYID1",
+    ASC_ISSUER_ID: "synthetic-issuer",
+    ASC_KEY_PATH: staged("named-only.p8", otherPem)
+  });
+  assert.equal(result.code, 1, `expected the refusal exit, got ${result.code}: ${result.stderr}`);
+  assert.match(result.stderr, /no App Store Connect credential found/);
+  assert.match(result.stderr, /A path in ASC_KEY_PATH is not a credential source/);
+});
+
+test("the client source never reads a key path", () => {
+  const source = readFileSync(client, "utf8");
+  assert.doesNotMatch(source, /process\.env\.ASC_KEY_PATH/, "the client reads a named key path");
+  assert.doesNotMatch(source, /fromFile/, "the client still has a file reader");
+});
+
+// ---- plan-release-build / next-shared-build / max-build contract ---------
+// The client pages every build of the app (and of its paired app) and prints
+// nextSharedBuild's result; max-build prints this app and platform's max.
+// These cases drive the real client against a stub App Store Connect on
+// loopback through ASC_API_BASE: generated key, nothing beyond 127.0.0.1.
+
+function stubAsc(handler) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url || "");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(handler(req.url || "")));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({
+      base: `http://127.0.0.1:${server.address().port}`,
+      seen,
+      close: () => server.close()
+    }));
+  });
+}
+
+function stubInventory({ apps, builds, linksFor } = {}) {
+  // apps: { bundleId: appId }; builds: { "appId|PLATFORM": [versions] }.
+  // linksFor: optional ("builds", key) => links object attached to a page.
+  return (rawUrl) => {
+    const url = new URL(rawUrl, "http://stub.invalid");
+    if (url.pathname === "/v1/apps") {
+      const id = (apps || {})[url.searchParams.get("filter[bundleId]")];
+      return id ? { data: [{ id, type: "apps", attributes: {} }] } : { data: [] };
+    }
+    if (url.pathname === "/v1/builds") {
+      const key = `${url.searchParams.get("filter[app]")}|${url.searchParams.get("filter[preReleaseVersion.platform]")}`;
+      const versions = (builds || {})[key] || [];
+      const page = {
+        data: versions.map((v, i) => ({ id: `b-${i}`, type: "builds", attributes: { version: v } }))
+      };
+      if (linksFor) {
+        const links = linksFor("builds", key);
+        if (links !== undefined) page.links = links;
+      }
+      return page;
+    }
+    return { data: [] };
+  };
+}
+
+function stubClientEnv(server, home) {
+  return {
+    PATH: safePath,
+    HOME: home,
+    FLEET_SECRETS_BIN: join(root, "no-fleet-secrets"),
+    ASC_API_BASE: server.base,
+    ASC_KEY_ID: "SYNTHETICKEYID1",
+    ASC_ISSUER_ID: "synthetic-issuer",
+    ASC_KEY_P8: keyPem
+  };
+}
+
+test("next-shared-build prints nextSharedBuild's result for an iOS build, a macOS build and a floor", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["1200"], "app-1|MAC_OS": ["1300"] }
+  }));
+  try {
+    const expected = nextSharedBuild({
+      iosBuilds: ["1200"],
+      macBuilds: ["1300"],
+      extraFloors: [1400],
+      complete: true,
+      mergeStamp: "202610290000"
+    });
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.app", "1400", "--merge-stamp", "202610290000"],
+      stubClientEnv(server, join(root, "home-shared"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), expected.build);
+    assert.match(result.stderr, /next-shared-build: 1 iOS build\(s\) \+ 1 macOS build\(s\) inspected/);
+  } finally {
+    server.close();
+  }
+});
+
+test("plan-release-build is the same command under the canonical name", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["202610190645"], "app-1|MAC_OS": [] }
+  }));
+  try {
+    for (const stampArg of [["--merge-stamp", "202610180000"], ["--merge-stamp=202610180000"]]) {
+      const result = await spawnNode(
+        [client, "plan-release-build", "trade.example.app", ...stampArg],
+        stubClientEnv(server, join(root, "home-plan"))
+      );
+      assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+      assert.equal(result.stdout.trim(), "202610190646");
+      assert.match(result.stderr, /plan-release-build: 1 iOS build\(s\) \+ 0 macOS build\(s\) inspected/);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("plan-release-build refuses a missing or malformed merge stamp", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": [], "app-1|MAC_OS": [] }
+  }));
+  try {
+    for (const args of [
+      [client, "plan-release-build", "trade.example.app"],
+      [client, "plan-release-build", "trade.example.app", "--merge-stamp", "2394"],
+      [client, "plan-release-build", "trade.example.app", "--merge-stamp=012345678901"],
+      [client, "next-shared-build", "trade.example.app", "--merge-stamp", "not-a-stamp"]
+    ]) {
+      const result = await spawnNode(args, stubClientEnv(server, join(root, "home-stamp")));
+      assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stderr}`);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("next-shared-build collects both platforms for the paired app too", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-a", "trade.example.mac": "app-b" },
+    builds: {
+      "app-a|IOS": ["1100"],
+      "app-a|MAC_OS": [],
+      "app-b|IOS": ["202610190645"],
+      "app-b|MAC_OS": ["1200"]
+    }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.app", "trade.example.mac", "--merge-stamp", "202610180000"],
+      stubClientEnv(server, join(root, "home-paired"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "202610190646");
+    const queried = (app, platform) => server.seen.some(
+      (u) => u.includes(`filter[app]=${app}`) && u.includes(`platform]=${platform}`)
+    );
+    assert.ok(queried("app-a", "IOS") && queried("app-a", "MAC_OS"),
+      `the client did not query both platforms for the app:\n${server.seen.join("\n")}`);
+    assert.ok(queried("app-b", "IOS") && queried("app-b", "MAC_OS"),
+      `the client did not query both platforms for the paired app:\n${server.seen.join("\n")}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("next-shared-build refuses malformed pagination", async () => {
+  for (const links of [{ next: 12345 }, { next: { href: "x" } }, "not-an-object", ["x"]]) {
+    const server = await stubAsc(stubInventory({
+      apps: { "trade.example.app": "app-1" },
+      builds: { "app-1|IOS": ["1200"], "app-1|MAC_OS": [] },
+      linksFor: () => links
+    }));
+    try {
+      const result = await spawnNode(
+        [client, "next-shared-build", "trade.example.app", "--merge-stamp", "202610290000"],
+        stubClientEnv(server, join(root, "home-page"))
+      );
+      assert.equal(result.code, 2,
+        `expected exit 2 for links ${JSON.stringify(links)}, got ${result.code}: ${result.stderr}`);
+      assert.match(result.stderr, /next-shared-build: malformed pagination/);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test("next-shared-build unions both platforms across both apps", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.ios": "app-ios", "trade.example.mac": "app-mac" },
+    builds: {
+      "app-ios|IOS": ["1100"],
+      "app-ios|MAC_OS": ["1150"],
+      "app-mac|IOS": ["1200"],
+      "app-mac|MAC_OS": ["202610190645"]
+    }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.ios", "trade.example.mac", "--merge-stamp", "202610180000"],
+      stubClientEnv(server, join(root, "home-union"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "202610190646");
+    assert.match(result.stderr, /next-shared-build: 2 iOS build\(s\) \+ 2 macOS build\(s\) inspected/);
+    const queried = (app, platform) => server.seen.some(
+      (u) => u.includes(`filter[app]=${app}`) && u.includes(`platform]=${platform}`)
+    );
+    assert.ok(queried("app-ios", "IOS") && queried("app-ios", "MAC_OS"),
+      `the client did not query both platforms for the app:\n${server.seen.join("\n")}`);
+    assert.ok(queried("app-mac", "IOS") && queried("app-mac", "MAC_OS"),
+      `the client did not query both platforms for the paired app:\n${server.seen.join("\n")}`);
+  } finally {
+    server.close();
+  }
+});
+
+test("next-shared-build fails closed when pagination exceeds the page cap", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["1200"], "app-1|MAC_OS": [] },
+    linksFor: (kind, key) => {
+      if (kind === "builds" && key === "app-1|IOS") {
+        return { next: "/v1/builds?filter[app]=app-1&filter[preReleaseVersion.platform]=IOS&limit=200&cursor=x" };
+      }
+      return undefined;
+    }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "next-shared-build", "trade.example.app", "--merge-stamp", "202610290000"],
+      stubClientEnv(server, join(root, "home-cap"))
+    );
+    assert.equal(result.code, 2,
+      `expected exit 2 for a truncated inventory, got ${result.code}: ${result.stderr}`);
+    assert.match(result.stderr, /next-shared-build: incomplete pagination/);
+  } finally {
+    server.close();
+  }
+});
+
+test("max-build prints this app and platform's max first component", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: {
+      "app-1|IOS": ["100", "202610190645.1", "1.1.2"],
+      "app-1|MAC_OS": ["209912312359"]
+    }
+  }));
+  try {
+    // The iOS slice only: the higher macOS build is not counted, and the
+    // dotted build counts by its first component.
+    const ios = await spawnNode(
+      [client, "max-build", "trade.example.app", "IOS"],
+      stubClientEnv(server, join(root, "home-max-ios"))
+    );
+    assert.equal(ios.code, 0, `the client failed: ${ios.stderr}`);
+    assert.equal(ios.stdout.trim(), "202610190645");
+    assert.match(ios.stderr, /max-build: 3 build\(s\) inspected on IOS/);
+    const mac = await spawnNode(
+      [client, "max-build", "trade.example.app", "MAC_OS"],
+      stubClientEnv(server, join(root, "home-max-mac"))
+    );
+    assert.equal(mac.code, 0, `the client failed: ${mac.stderr}`);
+    assert.equal(mac.stdout.trim(), "209912312359");
+  } finally {
+    server.close();
+  }
+});
+
+test("max-build prints 0 for an empty slice", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": [], "app-1|MAC_OS": ["1300"] }
+  }));
+  try {
+    const result = await spawnNode(
+      [client, "max-build", "trade.example.app", "IOS"],
+      stubClientEnv(server, join(root, "home-max-empty"))
+    );
+    assert.equal(result.code, 0, `the client failed: ${result.stderr}`);
+    assert.equal(result.stdout.trim(), "0");
+  } finally {
+    server.close();
+  }
+});
+
+test("max-build fails closed on a bad platform, a missing app or a malformed build", async () => {
+  const server = await stubAsc(stubInventory({
+    apps: { "trade.example.app": "app-1" },
+    builds: { "app-1|IOS": ["NaN"], "app-1|MAC_OS": [] }
+  }));
+  try {
+    for (const args of [
+      [client, "max-build", "trade.example.app", "TVOS"],
+      [client, "max-build", "trade.example.app"],
+      [client, "max-build", "trade.example.missing", "IOS"],
+      [client, "max-build", "trade.example.app", "IOS"]
+    ]) {
+      const result = await spawnNode(args, stubClientEnv(server, join(root, "home-max-bad")));
+      assert.equal(result.code, 2, `expected exit 2, got ${result.code}: ${result.stderr}`);
+    }
+  } finally {
+    server.close();
+  }
+});

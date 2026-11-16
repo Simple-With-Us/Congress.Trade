@@ -1,0 +1,86 @@
+name: Autofix Diagnostics Validation
+
+on:
+  pull_request:
+    paths:
+      - '.github/actions/autofix-diagnostics/**'
+      - '.github/autofix-diagnostics-workflow.node-test.mjs'
+      - '.github/workflows/codex-autofix-reusable.yml'
+      - '.github/workflows/autofix-diagnostics-validation.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/actions/autofix-diagnostics/**'
+      - '.github/autofix-diagnostics-workflow.node-test.mjs'
+      - '.github/workflows/codex-autofix-reusable.yml'
+      - '.github/workflows/autofix-diagnostics-validation.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Test Sanitization And Failure Wiring
+        run: node --test .github/actions/autofix-diagnostics/test/reduce.node-test.mjs .github/autofix-diagnostics-workflow.node-test.mjs
+      - name: Simulate A Capped Run Without A Model Call
+        id: fixture
+        continue-on-error: true
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const sentinel = 'SYNTHETIC_PRIVATE_VALUE_DO_NOT_RETAIN';
+          const messages = [
+            { type: 'system', subtype: 'init', session_id: sentinel },
+            { type: 'assistant', message: { content: [
+              { type: 'text', text: sentinel },
+              { type: 'tool_use', id: 'local1', name: 'Bash', input: { command: `npm test -- ${sentinel}` } },
+            ] } },
+            { type: 'user', message: { content: [
+              { type: 'tool_result', tool_use_id: 'local1', is_error: true, content: sentinel },
+            ] } },
+            { type: 'result', subtype: 'error_max_turns', num_turns: 121, duration_ms: 1234, is_error: true, errors: [sentinel] },
+          ];
+          writeFileSync(join(process.env.RUNNER_TEMP, 'claude-execution-output.json'), JSON.stringify(messages), { mode: 0o600 });
+          JS
+          exit 1
+      - name: Summarize After The Simulated Failure
+        if: ${{ always() && steps.fixture.outcome == 'failure' }}
+        id: diagnostics
+        uses: ./.github/actions/autofix-diagnostics
+      - name: Assert Safe Artifact Content
+        if: ${{ always() && steps.fixture.outcome == 'failure' }}
+        env:
+          SUMMARY_PATH: ${{ steps.diagnostics.outputs.summary-path }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const raw = readFileSync(process.env.SUMMARY_PATH, 'utf8');
+          assert(!raw.includes('SYNTHETIC_PRIVATE_VALUE_DO_NOT_RETAIN'));
+          assert(!raw.includes('npm test'));
+          assert(!raw.includes('local1'));
+          assert(raw.includes('error_max_turns'));
+          assert(raw.includes('Bash'));
+          assert(Buffer.byteLength(raw) <= 262144);
+          assert.equal(JSON.parse(raw).result.is_error, true);
+          JS
+      - name: Upload Only The Synthetic Metadata
+        if: ${{ always() && steps.diagnostics.outputs.summary-path != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: autofix-diagnostics-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.diagnostics.outputs.summary-path }}
+          if-no-files-found: error
+          retention-days: 7

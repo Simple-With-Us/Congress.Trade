@@ -14,10 +14,12 @@
 # Override one run with IOS_TF_MIN_INTERVAL_SEC=<seconds> or --force-ship;
 # changing the standing limit means editing DEFAULT_MIN_INTERVAL_SEC.
 #
-# VERSION NUMBERS: MARKETING_VERSION is 1.0.<seq> (+1 every rebuild) and
-# CURRENT_PROJECT_VERSION is a UTC YYYYMMDDHHMM stamp, so App Store Connect
-# shows "1.0.8 (202608121315)" — the parenthetical says when the build was cut
-# instead of repeating the version.
+# VERSION NUMBERS: MARKETING_VERSION is the next patch on the app's train
+# (1.0.<P+1>, where P is the highest patch App Store Connect already holds on
+# that train) and CURRENT_PROJECT_VERSION is the repo commit count, raised
+# above the App Store Connect floor.  The two numbers are independent, so
+# App Store Connect shows "1.0.237 (2360)" instead of "1.0.237 (237)".
+# Owner directive 2026-10-24 (AFC-517); see scripts/ios-fleet/README.md.
 #
 # STABLE XCODE IS MANDATORY (owner, reaffirmed 2026-08-11).
 # Xcode-beta's SDK breaks TestFlight / App Store Connect compatibility: a binary

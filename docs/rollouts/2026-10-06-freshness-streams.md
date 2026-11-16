@@ -39,7 +39,7 @@ npm test
 
 1. Squash-merge #2635 when CI is green.  Coolify applies schema through `POST /api/admin/migrate` (`bash app/scripts/ship.sh`), which includes the same three `CREATE INDEX IF NOT EXISTS` statements.
 2. PR #2638 still owns import-received timestamps.  This PR does not.
-3. No `#agent-sync` permalink was recorded.  This seat had no Slack token, and the suggested channel id was not `C0BEZDJDNKV`.
+3. No `#ag***-s**c` permalink was recorded.  This seat had no Slack token, and the suggested channel id was not `C0BEZDJDNKV`.
 
 ## 6. Zero-Code Findings
 

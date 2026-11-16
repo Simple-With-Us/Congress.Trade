@@ -1,0 +1,19 @@
+Images space usage:
+
+REPOSITORY          TAG       IMAGE ID       CREATED        SIZE      SHARED SIZE   UNIQUE SIZE   CONTAINERS
+coolify/app         latest    abcdef123456   2 weeks ago    1.2GB     0B            1.2GB         1
+
+Containers space usage:
+
+CONTAINER ID   IMAGE           COMMAND   LOCAL VOLUMES   SIZE      CREATED        STATUS    NAMES
+111111111111   coolify/app     "deno"    1               50MB      2 weeks ago    Up        congress-app
+
+Local Volumes space usage:
+
+VOLUME NAME                           LINKS     SIZE
+congress-trade_data                   1         200MB
+
+Build cache usage:
+
+CACHE ID       CACHE TYPE   SIZE      CREATED        LAST USED      USAGE     SHARED
+cache111       regular      500MB     2 weeks ago    2 weeks ago    5         false

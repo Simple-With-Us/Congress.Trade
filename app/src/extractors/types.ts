@@ -11,9 +11,15 @@ import { IngestRetryError } from '../ingestion/fetcher.ts';
 import { resolveSecret } from '../secrets/infisical.ts';
 import {
   classifyHouseExtractRoute,
+  evaluateExtractQuality,
   looksLikeOgePart7ExplicitNone,
   looksLikePlausibleTradeTable,
 } from '../extraction/extractRouting.ts';
+import {
+  HOUSE_GRID_FORM_EXTRACTOR,
+  type HouseGridFormReader,
+  type HouseGridRead,
+} from '../extraction/houseGridForm.ts';
 import { isProvenOpenRouterCredentialRejection } from '../extraction/openRouterReply.ts';
 
 // ---------------------------------------------------------------------------
@@ -22,18 +28,142 @@ import { isProvenOpenRouterCredentialRejection } from '../extraction/openRouterR
 
 const ROW_KEY_CACHE = new WeakMap<ParsedTx, string>();
 
+const ARBITRATION_OWNERS: Readonly<Record<string, string>> = {
+  self: 'SELF',
+  spouse: 'SPOUSE',
+  sp: 'SPOUSE',
+  joint: 'JOINT',
+  jt: 'JOINT',
+  dependent: 'DEPENDENT',
+  child: 'DEPENDENT',
+  dc: 'DEPENDENT',
+};
+
+const ARBITRATION_OWNER_SUFFIX = /^(SELF|SPOUSE|JOINT|DEPENDENT)$/;
+
 /**
- * Stable matching key for a parsed row: ticker (or asset name when no ticker) +
- * transaction date + transaction type. Two extractors that read the same row
- * should produce the same key even if other fields differ slightly.
+ * Owner segment for a row key. Known codes become SELF|SPOUSE|JOINT|DEPENDENT.
+ * Anything else (including a missing owner) stays empty so the historical
+ * 3-part key is unchanged.
+ */
+export function canonicalArbitrationOwner(owner: string | null | undefined): string {
+  const raw = (owner ?? '').trim().toLowerCase();
+  if (!raw) return '';
+  return ARBITRATION_OWNERS[raw] ?? '';
+}
+
+/**
+ * Historical matching key: ticker (or asset name) + date + type. Stored
+ * consensus keys, bake-off rowKeys, and in-flight review payloads use this
+ * shape. Keep producing it when owner is absent so those keys still compare.
+ */
+export function legacyArbitrationRowKey(tx: ParsedTx): string {
+  const sym = (tx.ticker || tx.assetName || '').trim().toUpperCase();
+  return `${sym}|${tx.txDate ?? ''}|${tx.txType}`;
+}
+
+/**
+ * Stable per-row key. Owner is appended when it normalizes to a known code,
+ * so two same-day lots for different people do not share a key. A missing or
+ * unrecognized owner keeps {@link legacyArbitrationRowKey}.
  */
 export function arbitrationRowKey(tx: ParsedTx): string {
   const cached = ROW_KEY_CACHE.get(tx);
   if (cached !== undefined) return cached;
-  const sym = (tx.ticker || tx.assetName || '').trim().toUpperCase();
-  const key = `${sym}|${tx.txDate ?? ''}|${tx.txType}`;
+  const legacy = legacyArbitrationRowKey(tx);
+  const owner = canonicalArbitrationOwner(tx.owner);
+  const key = owner ? `${legacy}|${owner}` : legacy;
   ROW_KEY_CACHE.set(tx, key);
   return key;
+}
+
+export interface ParsedArbitrationRowKey {
+  /** ticker|date|type, with any owner suffix removed. */
+  legacy: string;
+  /** Uppercase owner segment, or null when the key is the historical 3-part form. */
+  owner: string | null;
+}
+
+/** Split a current or historical arbitration key. Occurrence suffixes (`#2`) are ignored. */
+export function parseArbitrationRowKey(stored: string): ParsedArbitrationRowKey {
+  const hash = stored.lastIndexOf('#');
+  const key = hash > 0 && /^\d+$/.test(stored.slice(hash + 1)) ? stored.slice(0, hash) : stored;
+  const parts = key.split('|');
+  const last = parts[parts.length - 1] ?? '';
+  if (parts.length >= 4 && ARBITRATION_OWNER_SUFFIX.test(last)) {
+    return { legacy: parts.slice(0, -1).join('|'), owner: last };
+  }
+  return { legacy: key, owner: null };
+}
+
+/**
+ * Upgrade one stored key. A key that already carries an owner is left alone.
+ * A historical 3-part key gains `|OWNER` only when `owner` normalizes; otherwise
+ * it stays byte-identical to what was stored.
+ */
+export function migrateArbitrationRowKey(stored: string, owner?: string | null): string {
+  const parsed = parseArbitrationRowKey(stored);
+  if (parsed.owner) return parsed.legacy + '|' + parsed.owner;
+  const normalized = canonicalArbitrationOwner(owner);
+  return normalized ? `${parsed.legacy}|${normalized}` : parsed.legacy;
+}
+
+/** Current key, then the historical 3-part key when they differ. */
+export function arbitrationRowKeyAliases(tx: ParsedTx): string[] {
+  const current = arbitrationRowKey(tx);
+  const legacy = legacyArbitrationRowKey(tx);
+  return current === legacy ? [current] : [current, legacy];
+}
+
+/**
+ * Align key groups that may mix historical 3-part keys with owner-qualified
+ * keys.
+ *
+ * - When every group has at most one row for a ticker|date|type prefix, the
+ *   canonical key is the historical 3-part key. A missing owner, or two models
+ *   that disagree on the owner of a single lot, still line up and the owner
+ *   can be voted.
+ * - When any group has two or more rows for that prefix, owner stays in the
+ *   key so spouse and dependent lots do not collapse. A row that omitted owner
+ *   is upgraded only when exactly one owner is present for the prefix.
+ */
+export function canonicalArbitrationKeyGroups(keyGroups: readonly (readonly string[])[]): string[][] {
+  interface PrefixInfo {
+    counts: number[];
+    owners: Set<string>;
+  }
+  const parsed = keyGroups.map((keys) => keys.map((key) => parseArbitrationRowKey(key)));
+  const info = new Map<string, PrefixInfo>();
+  for (let group = 0; group < keyGroups.length; group += 1) {
+    for (let index = 0; index < keyGroups[group].length; index += 1) {
+      const prefix = parsed[group][index].legacy;
+      let slot = info.get(prefix);
+      if (!slot) {
+        slot = { counts: keyGroups.map(() => 0), owners: new Set() };
+        info.set(prefix, slot);
+      }
+      slot.counts[group] += 1;
+      const owner = parsed[group][index].owner;
+      if (owner) slot.owners.add(owner);
+    }
+  }
+  return keyGroups.map((keys, group) => keys.map((key, index) => {
+    const { legacy, owner } = parsed[group][index];
+    const slot = info.get(legacy);
+    if (!slot) return key;
+    const split = slot.counts.some((count) => count > 1);
+    if (!split) return legacy;
+    if (!owner && slot.owners.size === 1) {
+      const only = [...slot.owners][0];
+      return `${legacy}|${only}`;
+    }
+    return owner ? `${legacy}|${owner}` : key;
+  }));
+}
+
+/** {@link canonicalArbitrationKeyGroups} for parsed rows, one list per read. */
+export function canonicalArbitrationKeys(groups: readonly (readonly ParsedTx[])[]): string[][] {
+  return canonicalArbitrationKeyGroups(groups.map((rows) => rows.map((tx) => arbitrationRowKey(tx))));
 }
 
 /** Count how many of the comparable fields two matched rows agree on, out of N. */
@@ -105,12 +235,20 @@ function modelRunsForError(error: object, extractor: string): ExtractorModelRun[
  * blindly injected into the output.
  */
 export function mergeResults(primary: ExtractorResult, secondary: ExtractorResult): ExtractorResult {
+  const keyed = canonicalArbitrationKeys([
+    primary.transactions,
+    secondary.transactions,
+  ]);
+  const primaryKeys = keyed[0] ?? [];
+  const secondaryKeys = keyed[1] ?? [];
   const secByKey = new Map<string, ParsedTx>();
-  for (const tx of secondary.transactions) secByKey.set(arbitrationRowKey(tx), tx);
+  secondary.transactions.forEach((tx, index) => {
+    secByKey.set(secondaryKeys[index], tx);
+  });
 
   const matchedKeys = new Set<string>();
-  const transactions: ParsedTx[] = primary.transactions.map((p) => {
-    const key = arbitrationRowKey(p);
+  const transactions: ParsedTx[] = primary.transactions.map((p, index) => {
+    const key = primaryKeys[index];
     const match = secByKey.get(key);
     if (!match) {
       // Only the primary saw this row — corroboration absent.
@@ -129,7 +267,7 @@ export function mergeResults(primary: ExtractorResult, secondary: ExtractorResul
 
   // Rows present only in the secondary (primary missed them) = contested doc.
   const secondaryOnly = secondary.transactions.filter(
-    (s) => !matchedKeys.has(arbitrationRowKey(s)),
+    (_, index) => !matchedKeys.has(secondaryKeys[index]),
   ).length;
   const primaryOnly = primary.transactions.length - matchedKeys.size;
 
@@ -388,6 +526,7 @@ export class HousePdfExtractor implements Extractor {
     private readonly textPdf: Extractor,
     private readonly visionPdf: Extractor,
     private readonly cheapText?: Extractor,
+    private readonly gridForm?: HouseGridFormReader,
   ) {
     this.name = this.cheapText
       ? `housePdf(${textPdf.name},${this.cheapText.name},${visionPdf.name})`
@@ -408,37 +547,38 @@ export class HousePdfExtractor implements Extractor {
       // Text-layer parsing can fail on image-only or malformed PDFs.
     }
 
-    if (textResult) {
-      if (textResult.transactions.length > 0) {
-        // A cheap read that already failed (letterhead / headers) must not
-        // escalate to Files or the agreement trio. Orchestrator + agreement
-        // consult evaluateExtractQuality on these rows.
-        return textResult;
-      }
-      if (!route.allowFiles) {
-        if (
-          this.cheapText
-          && looksLikePlausibleTradeTable(textResult.raw)
-        ) {
-          try {
-            const cheap = await this.cheapText.extract({
-              ...input,
-              extractedText: textResult.raw,
-            });
-            return cheap;
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            // Proven dead-key rejections must still fail closed.  Garbage /
-            // Unauthorized replies skip this one doc instead of Files.
-            if (isProvenOpenRouterCredentialRejection(message)) throw err;
-            return textResult;
-          }
-        }
-        return textResult;
-      }
+    const textHasRows = (textResult?.transactions.length ?? 0) > 0;
+    const textQualityOk = textHasRows && textResult
+      ? evaluateExtractQuality(textResult.transactions).ok
+      : false;
+    if (textResult && textHasRows && (!route.allowFiles || textQualityOk)) {
+      // A cheap read that already failed (letterhead / headers) must not
+      // escalate to Files or the agreement trio. Orchestrator + agreement
+      // consult evaluateExtractQuality on these rows. A scanned grid whose
+      // text layer is only letterhead still gets the local x-mark stage below.
+      return textResult;
     }
 
     if (!route.allowFiles) {
+      if (
+        textResult
+        && this.cheapText
+        && looksLikePlausibleTradeTable(textResult.raw)
+      ) {
+        try {
+          const cheap = await this.cheapText.extract({
+            ...input,
+            extractedText: textResult.raw,
+          });
+          return cheap;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // Proven dead-key rejections must still fail closed.  Garbage /
+          // Unauthorized replies skip this one doc instead of Files.
+          if (isProvenOpenRouterCredentialRejection(message)) throw err;
+          return textResult;
+        }
+      }
       return textResult ?? {
         transactions: [],
         confidence: 0.2,
@@ -446,8 +586,41 @@ export class HousePdfExtractor implements Extractor {
         extractor: this.textPdf.name,
       };
     }
+
+    const grid = await this.readGridForm(input.bytes, input.filing.filedDate);
+    if (grid?.detected) return houseGridFormResult(grid);
+    if (textResult && textHasRows) return textResult;
     return this.visionPdf.extract(input);
   }
+
+  private async readGridForm(bytes: ArrayBuffer | undefined, filedDate: string | null): Promise<HouseGridRead | null> {
+    if (!this.gridForm || !bytes) return null;
+    try {
+      return await this.gridForm.read(bytes, { filedDate });
+    } catch (err) {
+      console.warn('housePdf: grid form stage failed', (err as Error).message);
+      return null;
+    }
+  }
+}
+
+function houseGridFormResult(grid: HouseGridRead): ExtractorResult {
+  const confidence = grid.transactions.length
+    ? Math.min(...grid.transactions.map((row) => row.confidence))
+    : 0.2;
+  return {
+    transactions: grid.transactions,
+    confidence,
+    raw: JSON.stringify({
+      houseGridForm: {
+        gridPages: grid.gridPages,
+        rows: grid.transactions.length,
+        markedCells: grid.markedCells,
+      },
+    }),
+    extractor: HOUSE_GRID_FORM_EXTRACTOR,
+    parseDisposition: grid.transactions.length ? 'rows' : 'unreadable',
+  };
 }
 
 /**
@@ -568,7 +741,7 @@ function emptyOgeTextResult(): ExtractorResult {
  */
 export function buildExtractorPipeline(env: Env): Extractor[] {
   const senateHtml = new SenateHtmlExtractor(env);
-  const textPdf = new TextPdfExtractor();
+  const textPdf = new TextPdfExtractor(env);
   const ogeText = new OgeTextExtractor();
 
   const geminiVision = new VisionLlmExtractor(env);
@@ -596,7 +769,12 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
 
   const visionArbitrated = new ArbitratingExtractor(configuredVision, env, secondary);
   const cheapText = new OpenRouterTextExtractor(env);
-  const housePdf = new HousePdfExtractor(textPdf, visionArbitrated, cheapText);
+  const housePdf = new HousePdfExtractor(
+    textPdf,
+    visionArbitrated,
+    cheapText,
+    createDenoHouseGridReader({ loadCatalog: () => loadHouseGridSecurityCatalog(env) }),
+  );
   const ogePdf = new OgePdfExtractor(ogeText, visionArbitrated);
 
   // ogePdf is ordered before the generic textPdf so executive-chamber PDFs
@@ -611,6 +789,8 @@ export function buildExtractorPipeline(env: Env): Extractor[] {
 // Re-exported concrete extractor stub classes (implemented by extraction agent)
 // ---------------------------------------------------------------------------
 
+import { createDenoHouseGridReader } from '../extraction/houseGridFormRuntime.ts';
+import { loadHouseGridSecurityCatalog } from '../extraction/houseGridAssetSnap.ts';
 import { SenateHtmlExtractor } from '../extraction/senateHtml.ts';
 import { TextPdfExtractor } from '../extraction/textPdf.ts';
 import { OgeTextExtractor } from '../extraction/ogeText.ts';

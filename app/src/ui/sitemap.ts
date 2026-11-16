@@ -51,9 +51,13 @@ export type SitemapUrl = {
 export function staticSitemapUrls(): SitemapUrl[] {
   return [
     { loc: `${SITE}/`, changefreq: 'hourly' },
+    { loc: `${SITE}/?view=trends`, changefreq: 'hourly' },
     { loc: `${SITE}/?view=trades`, changefreq: 'hourly' },
     { loc: `${SITE}/?view=people`, changefreq: 'daily' },
     { loc: `${SITE}/?view=subs`, changefreq: 'weekly' },
+    { loc: `${SITE}/pricing`, changefreq: 'weekly' },
+    { loc: `${SITE}/terms-of-service`, changefreq: 'monthly' },
+    { loc: `${SITE}/privacy-policy`, changefreq: 'monthly' },
   ];
 }
 

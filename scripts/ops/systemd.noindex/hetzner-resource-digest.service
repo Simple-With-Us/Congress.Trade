@@ -1,0 +1,19 @@
+# Sample unit.  This change does not install or enable it.
+# Host install waits for Jay.
+[Unit]
+Description=Hetzner fleet box daily resource digest (read-only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hetzner-resource-digest.sh
+Environment=HETZNER_DIGEST_STATE_PATH=/var/lib/hetzner-resource-digest/last.json
+Environment=HETZNER_DIGEST_JSON_OUT=/var/lib/hetzner-resource-digest/latest.json
+Environment=HETZNER_DIGEST_MD_OUT=/var/lib/hetzner-resource-digest/latest.md
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+SyslogIdentifier=hetzner-resource-digest
+
+[Install]
+WantedBy=multi-user.target

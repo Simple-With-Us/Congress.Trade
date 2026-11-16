@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { applyOgMeta, escapeAttr, resolveOgMeta } from '../ogMeta.ts';
 import { OG_IMAGE_VERSION } from '../assets.ts';
+import { OG_SHARE_DISCLAIMER_LINE } from '../disclaimers.ts';
 
 describe('resolveOgMeta', () => {
   it('defaults to the home lockup card', () => {
@@ -9,6 +10,8 @@ describe('resolveOgMeta', () => {
     expect(m.title).toBe('Congress.Trade');
     expect(m.imageUrl).toBe(`https://congress.trade/og-image.png?v=${OG_IMAGE_VERSION}`);
     expect(m.url).toBe('https://congress.trade/');
+    expect(m.description).toContain(OG_SHARE_DISCLAIMER_LINE);
+    expect(m.description).not.toMatch(/\bofficial\b/i);
   });
 
   it('uses the Trends card for ?view=trends', () => {
@@ -82,6 +85,29 @@ describe('resolveOgMeta', () => {
       });
       expect(m.context).toBe('company');
       expect(m.title).toBe('NVDA');
+    });
+  });
+
+  describe('LEGALCOMPLIANCE-04: share unfurls carry the non-affiliation line', () => {
+    it('appends the short disclaimer to politician, company, and trade cards', () => {
+      const politician = resolveOgMeta('https://congress.trade/?member=P000197', 'https://congress.trade', {
+        memberDisplayName: 'Nancy Pelosi',
+      });
+      const company = resolveOgMeta('https://congress.trade/?ticker=NVDA', 'https://congress.trade', {
+        tickerResolved: true,
+      });
+      const trade = resolveOgMeta('https://congress.trade/?trade=x', 'https://congress.trade', {
+        tradeSummary: {
+          filerLabel: 'Nancy Pelosi (D-CA-11)',
+          verb: 'bought',
+          assetLabel: 'NVDA',
+          amountBracket: '$1m - $5m',
+          txDateLabel: 'Aug 5, 2026',
+        },
+      });
+      for (const m of [politician, company, trade]) {
+        expect(m.description).toContain(OG_SHARE_DISCLAIMER_LINE);
+      }
     });
   });
 

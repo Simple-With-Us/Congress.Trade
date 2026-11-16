@@ -16,7 +16,7 @@
  */
 
 import type { Env, ParsedTx } from '../shared/types.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { arbitrationRowKey, canonicalArbitrationKeyGroups } from '../extractors/types.ts';
 import {
   SYSTEM_PROMPT,
   EXECUTIVE_SYSTEM_PROMPT,
@@ -189,7 +189,8 @@ export interface CandidateDocResult {
   failure?: ProviderFailureStatus;
   latencyMs: number;
   rowCount: number;
-  /** Stable row keys (ticker/name|date|type) for agreement scoring. */
+  /** Stable row keys (ticker/name|date|type|owner) for agreement scoring.
+   *  A missing owner keeps the historical 3-part key. */
   rowKeys: string[];
   /** Mean per-row extractor confidence in [0,1] (0 when no rows / failed). */
   avgConfidence: number;
@@ -1613,16 +1614,20 @@ export function computeConsensusAgreement(results: CandidateDocResult[]): Map<st
     if (ok.length < 2) continue; // need ≥2 models to form a consensus
 
     // Tally how many models found each key; consensus = found by > half.
+    // Mixed vintages (historical 3-part keys and owner-qualified keys) are
+    // aligned first so a stored key still counts as the same lot.
+    const aligned = canonicalArbitrationKeyGroups(ok.map((r) => r.rowKeys));
     const keyVotes = new Map<string, number>();
-    for (const r of ok) {
-      for (const k of new Set(r.rowKeys)) keyVotes.set(k, (keyVotes.get(k) ?? 0) + 1);
+    for (const keys of aligned) {
+      for (const k of new Set(keys)) keyVotes.set(k, (keyVotes.get(k) ?? 0) + 1);
     }
     const majority = Math.floor(ok.length / 2) + 1;
     const consensus = new Set([...keyVotes].filter(([, v]) => v >= majority).map(([k]) => k));
     if (consensus.size === 0) continue;
 
-    for (const r of ok) {
-      const have = new Set(r.rowKeys);
+    for (let index = 0; index < ok.length; index += 1) {
+      const r = ok[index];
+      const have = new Set(aligned[index]);
       let hit = 0;
       for (const k of consensus) if (have.has(k)) hit++;
       const m = label(r);

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run fleet inode usage report hourly
+Requires=fleet-inode-report.service
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+Unit=fleet-inode-report.service
+
+[Install]
+WantedBy=timers.target

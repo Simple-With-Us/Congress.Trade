@@ -1,5 +1,7 @@
 # 2026-08-10 — Box disk hygiene + health-recover hardening
 
+Host-health checks on this same timer are recorded in `docs/rollouts/2026-11-11-host-health-alerts.md` (CT-2471).  This note stays the record of the original prune thresholds.
+
 ## Summary
 
 Monet hit a **100% full root disk** (15MB free of 150GB) mid-deploy on the Coolify
@@ -17,7 +19,7 @@ This change adds **scheduled disk checks + safe automated Docker prune** and har
 |------|------|
 | `scripts/ops/box-disk-hygiene.sh` | Check `df`, log SQLite/WAL + `docker system df`; light/soft/aggressive prune by thresholds |
 | `scripts/ops/box-disk-hygiene.service` | systemd oneshot |
-| `scripts/ops/box-disk-hygiene.timer` | every 30 min + 5 min after boot |
+| `scripts/ops/box-disk-hygiene.timer` | every 15 min + 5 min after boot |
 | `scripts/ops/congress-health-recover.sh` | label-first container match; name fallback **running only** |
 
 ## Behavior

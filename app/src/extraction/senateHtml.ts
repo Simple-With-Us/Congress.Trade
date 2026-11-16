@@ -244,7 +244,14 @@ function parseTable(table: HTMLElement): { rows: ParsedTx[]; usedHeader: boolean
     if (cells.length === 0) continue;
     if (looksLikeHeader(cells)) continue;
     const tx = rowToParsedTx(cells, map, usedHeader ? CLEAN_CONFIDENCE : FALLBACK_CONFIDENCE);
-    if (tx) rows.push(tx);
+    if (tx) {
+      const detail = splitAssetDetail(trs[i], map.assetName);
+      if (detail) {
+        tx.assetName = detail.name || tx.ticker || '(unknown)';
+        tx.description = detail.description;
+      }
+      rows.push(tx);
+    }
   }
 
   return { rows, usedHeader };
@@ -360,6 +367,37 @@ export function normalizeDate(raw: string): string | null {
 function cellTexts(tr: HTMLElement): string[] {
   const cells = tr.querySelectorAll('th, td');
   return cells.map((c) => c.text.replace(/ /g, ' ').replace(/\s+/g, ' ').trim());
+}
+
+/**
+ * eFD renders non-ticker assets (partnerships, private funds) with muted
+ * detail lines inside the Asset Name cell:
+ *
+ *   MH Built to Last LLC
+ *   <div class="text-muted"><em>Company:</em> MH Built to Last LLC (New York, NY)</div>
+ *   <div class="text-muted"><em>Description:</em> Partnership</div>
+ *
+ * Flattening the cell glued those lines into assetName, and the ':' then
+ * tripped the OCR name hold on a typed HTML filing.  Keep the primary name as
+ * assetName and move the detail lines to description.  Returns null when the
+ * cell has no muted detail lines (the cell text is used as-is).
+ */
+export function splitAssetDetail(
+  tr: HTMLElement,
+  assetCol: number,
+): { name: string; description: string } | null {
+  if (assetCol < 0) return null;
+  const cell = tr.querySelectorAll('th, td')[assetCol];
+  if (!cell) return null;
+  const details = cell.querySelectorAll('.text-muted');
+  if (details.length === 0) return null;
+  const clean = (t: string): string => t.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').replace(/\s+\(/g, ' (').trim();
+  const lines = details.map((d) => clean(d.text)).filter(Boolean);
+  // Strip the muted nodes from a clone so the parsed tree (and the table
+  // serialized into ExtractorResult.raw) keeps the original detail lines.
+  const nameCell = cell.clone() as HTMLElement;
+  for (const d of nameCell.querySelectorAll('.text-muted')) d.remove();
+  return { name: clean(nameCell.text), description: lines.join('; ') };
 }
 
 function looksLikeHeader(cells: string[]): boolean {

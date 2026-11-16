@@ -25,7 +25,8 @@
  * unresolved with reason `extract_empty_failure`, and do NOT escalate tiers
  * (escalating burns budget on a dead extract).  An executive 278e whose
  * deterministic read also found no 278-T table closes as verified_empty
- * instead.  A deterministic refusal (garbled 278-T) closes as unreadable.
+ * instead.  A deterministic refusal (garbled 278-T) parks open as unreadable
+ * for a human.  It is not a terminal reject.
  * Capped-row recovery must not relabel either outcome as
  * agreement_cascade_unresolved.
  *
@@ -75,6 +76,7 @@
 
 import type { Env, ParsedTx, Transaction } from '../shared/types.ts';
 import { all, batch, fromBool, get, run } from '../shared/db.ts';
+import { abortIfSignal } from '../shared/signalAbort.ts';
 import {
   runCandidateOnDoc,
   persistExtractionRun,
@@ -86,16 +88,24 @@ import {
   type CandidateDocResult,
   type CandidateInvocation,
 } from './bakeoff.ts';
-import { arbitrationRowKey } from '../extractors/types.ts';
+import { canonicalArbitrationKeys } from '../extractors/types.ts';
 import {
   recomputeTransactions,
   HARD_FAILURE_FLAGS,
   MAX_PUBLISH_TRANSACTIONS_PER_FILING,
   loadResolver,
   normalize,
+  OGE_ROWS_INCOMPLETE_REASON,
   resolveVerifiedEmpty,
 } from './normalizer.ts';
-import { classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import { assessOgeRowCompleteness, classifyExecutivePdfBytes, pdfBytesLookLikeOgePart7ExplicitNone } from './ogeText.ts';
+import {
+  maybeRecoverOgeRowsViaLocalOcr,
+  ogeLocalOcrAlreadyAttempted,
+  ogeLocalOcrReviewPayload,
+  OGE_LOCAL_OCR_EXTRACTOR,
+} from './ogeLocalOcr.ts';
+import { deprecatePredecessorFilingTransactions } from './amendmentPredecessor.ts';
 import { cleanAssetString } from './nameNormalizer.ts';
 import { prepareExtractedTx } from './prepareTx.ts';
 import { mapFiling, type FilingRow } from '../delivery/rows.ts';
@@ -111,8 +121,13 @@ import { recordProviderHealth } from './providerHealth.ts';
 import {
   shouldSkipAgreementForReviewReason,
   dropJunkAgreementRows,
+  dropPtrFormSamplesForPublish,
   evaluateExtractQuality,
 } from './extractRouting.ts';
+import {
+  handCheckReviewReason,
+  requiresHandCheckBeforePublish,
+} from './handCheckPublish.ts';
 import { notifyReviewQueuePublisher } from '../ingestion/reviewQueueNotify.ts';
 import { shouldRetryFetchStatus } from '../ingestion/fetcher.ts';
 import { TERMINAL_REVIEW_REASON_EXCLUDE_SQL_UNALIASED } from './reviewQueueHealth.ts';
@@ -795,40 +810,16 @@ const CONDITIONAL_BULK_INSERT_TX_SQL = `INSERT OR IGNORE INTO transactions (
     )`;
 
 /**
- * Soft-deprecates live transactions from predecessor filings when an amended filing is published.
+ * Soft-deprecates the live transactions of the filing an amended filing
+ * supersedes.
+ *
+ * CT-2452: the predecessor match used to be "same filer + same filed_date, or
+ * a shared doc-id prefix", which deprecated every sibling PTR filed on the same
+ * day (545 Trump 278-T transactions).  The rule now requires a real
+ * amended-document relationship AND an overlapping reporting period; see
+ * ./amendmentPredecessor.ts for the whole rule and why it fails closed.
  */
-export async function deprecatePredecessorFilingTransactions(
-  db: D1Database,
-  docId: string,
-  filerId: string | null,
-  filedDate: string | null,
-  nowIso: string = new Date().toISOString(),
-): Promise<number> {
-  if (!filerId) return 0;
-  const reason = `superseded by amendment ${docId}`;
-
-  const stmt = `
-    UPDATE transactions
-       SET deprecated_at = ?,
-           deprecated_reason = ?
-     WHERE doc_id IN (
-       SELECT doc_id FROM filings
-        WHERE filer_id = ? AND doc_id <> ?
-          AND ingest_status = 'persisted'
-          AND (
-            (filed_date IS NOT NULL AND filed_date = ?)
-            OR (doc_id LIKE 'E-%' AND SUBSTR(doc_id, 1, 35) = SUBSTR(?, 1, 35))
-          )
-     ) AND deprecated_at IS NULL
-  `;
-  try {
-    const res = await run(db, stmt, [nowIso, reason, filerId, docId, filedDate ?? '', docId]);
-    return res.meta?.changes ?? 0;
-  } catch (err) {
-    console.warn('deprecatePredecessorFilingTransactions failed:', docId, (err as Error).message);
-    return 0;
-  }
-}
+export { deprecatePredecessorFilingTransactions };
 
 /**
  * Persist all rows and resolve the review item in one D1 batch. Every statement
@@ -1075,6 +1066,47 @@ export async function finalizePublish(
   dryRun: boolean,
   audit: CascadeAudit,
 ): Promise<AgreementDocResult> {
+  const filing = mapFiling(frow);
+  const withoutSamples = dropPtrFormSamplesForPublish(docId, parsed);
+  const extractor = frow.extractor ?? filing.extractor ?? null;
+  if (requiresHandCheckBeforePublish(filing, extractor, 'primary')) {
+    return {
+      docId,
+      outcome: 'skipped',
+      tier: audit.tier,
+      reason: handCheckReviewReason(filing, extractor, 'primary'),
+    };
+  }
+  parsed = withoutSamples;
+  // 278-T completeness: a filing parked because the reader dropped numbered
+  // rows is not publishable by a cascade/stored-run read, which cannot prove
+  // it recovered them; neither is a candidate set whose own row numbers skip.
+  if (filing.chamber === 'executive') {
+    const completeness = assessOgeRowCompleteness(null, parsed);
+    let parkedIncomplete = false;
+    try {
+      // Only an OPEN parking counts: a resolved row's reason is history.
+      const review = await get<{ reason: string | null }>(
+        env.DB,
+        'SELECT reason FROM review_queue WHERE doc_id = ? AND resolved = 0',
+        [docId],
+      );
+      parkedIncomplete = String(review?.reason ?? '').split(',').map((t) => t.trim())
+        .includes(OGE_ROWS_INCOMPLETE_REASON);
+    } catch {
+      // Fail closed: an unreadable review row must not let a partial set publish.
+      parkedIncomplete = true;
+    }
+    if (parkedIncomplete || (completeness !== null && completeness.missingCount > 0)) {
+      return {
+        docId,
+        outcome: 'agree_but_hardfail',
+        tier: audit.tier,
+        rowCount: parsed.length,
+        flags: [OGE_ROWS_INCOMPLETE_REASON],
+      };
+    }
+  }
   const filedDate = frow.filed_date?.slice(0, 10) ?? null;
   if (parsed.some((tx) => !isValidTransactionDate(tx.txDate) || (filedDate !== null && tx.txDate! > filedDate))) {
     return {
@@ -1254,8 +1286,9 @@ export async function processAgreementDoc(
     if (part7) return { ...part7, rows: lineupRows() };
     // Every non-dry caller — handleAgreementCheck's tier-1 claim AND the
     // operator /agreement-reprocess route — settles an executive zero-read
-    // here before extract_empty_failure: a real 278e empty / unreadable 278-T
-    // closes itself, and deterministic rows are routed through normalization.
+    // here before extract_empty_failure: a real 278e empty closes itself, an
+    // unreadable 278-T parks for a human, and deterministic rows are routed
+    // through normalization.
     if (!dryRun) {
       const settled = await maybeSettleExecutiveZeroRead(
         env,
@@ -1421,13 +1454,15 @@ export function buildMajorityRows(
     );
     return String(nonEmpty[0].text);
   };
-  const groups = reads.map((read) => {
+  const canonical = canonicalArbitrationKeys(reads.map((read) => read.rows));
+  const groups = reads.map((read, groupIndex) => {
     const grouped = new Map<string, ParsedTx[]>();
-    for (const tx of read.rows) {
+    for (let index = 0; index < read.rows.length; index += 1) {
+      const tx = read.rows[index];
+      const key = canonical[groupIndex][index];
       if (!isValidTransactionDate(tx.txDate)) {
-        return { grouped, error: `invalid_transaction_date:${arbitrationRowKey(tx)}` };
+        return { grouped, error: `invalid_transaction_date:${key}` };
       }
-      const key = arbitrationRowKey(tx);
       const rows = grouped.get(key) ?? [];
       rows.push(tx);
       grouped.set(key, rows);
@@ -1794,7 +1829,55 @@ async function maybeSettleExecutiveZeroRead(
     }
   }
   if (classified.disposition === 'unreadable') {
-    const closed = await closeUnreadableExecutive(env, docId, { respectSuppression: true, claimToken });
+    // CT-2448: try the local tesseract pass before parking.  The stored PDF
+    // bytes are already in hand here, so the pass costs no extra fetch.  When
+    // both reads agree the rows go through normalization exactly like the
+    // deterministic recovery above; when they do not, the filing parks as it
+    // does today with the unreconciled rows listed in the payload.
+    let ocrOutcome = null;
+    try {
+      if (!(await ogeLocalOcrAlreadyAttempted(env, docId))) {
+        ocrOutcome = await maybeRecoverOgeRowsViaLocalOcr(
+          env,
+          {
+            docId,
+            chamber: filing.chamber ?? '',
+            filingType: filing.filing_type ?? null,
+          },
+          bytes,
+          'unreadable',
+        );
+      }
+    } catch (err) {
+      console.warn('executive zero-read: local OCR retry failed:', docId, (err as Error).message);
+    }
+    if (ocrOutcome?.status === 'rows') {
+      try {
+        const norm = await normalize(env, mapFiling(filing), ocrOutcome.rows, {
+          extractor: OGE_LOCAL_OCR_EXTRACTOR,
+          parseDisposition: 'rows',
+        });
+        return {
+          kind: 'rows',
+          needsReview: norm.needsReview,
+          published: norm.published,
+          settled: norm.settled === true,
+          rowCount: norm.transactions.length,
+          reason: norm.reviewReason,
+        };
+      } catch (err) {
+        console.warn(
+          'executive zero-read: local OCR rows failed normalization:',
+          docId,
+          (err as Error).message,
+        );
+      }
+    }
+    const closed = await closeUnreadableExecutive(env, docId, {
+      respectSuppression: true,
+      claimToken,
+      payload: ocrOutcome ? ogeLocalOcrReviewPayload(ocrOutcome) : null,
+    });
     return closed ? { kind: 'unreadable' } : null;
   }
   const closed = await closeVerifiedEmptyExecutive(env, docId, { respectSuppression: true, claimToken });
@@ -2733,11 +2816,12 @@ export async function handleAgreementCheck(
         || flags.includes('auto_resolved_empty')
         || flags.includes('oge_text_unreadable')
       ) {
-        // processAgreementDoc already settled/closed this executive zero-read.
+        // processAgreementDoc already settled this executive zero-read.
+        // Empty is terminal.  Unreadable is parked open for a human.
       } else if (flags.includes('extract_empty_failure')) {
         // Do not escalate empty×empty and do not soft-label as cascade_unresolved.
-        // Executive 278e empty / refused 278-T close themselves; everything
-        // else stays extract_empty_failure.
+        // Executive 278e empty closes itself.  A refused 278-T parks open.
+        // Everything else stays extract_empty_failure.
         const settled = await maybeSettleExecutiveZeroRead(env, docId, async () => {
           const loaded = signal
             ? await loadDocBytes(env, docId, rawObjectKey, signal)
@@ -2796,17 +2880,18 @@ export async function handleAgreementCheck(
 
 /**
  * Reasons capped-row recovery must leave alone: rows already carrying the
- * capped terminal label, and unreadable/OCR terminals (health-terminal
- * already; relabeling them would hide why they closed).
+ * capped terminal label, and unreadable/OCR parks (health-terminal reason
+ * already; relabeling them would hide why they are waiting on a human).
  *
  * Empty failures are NOT excluded.  They are not health-terminal
  * (reviewQueueHealth only treats ocr_unusable etc. as terminal), and once
  * capped the normal selectors reject them, so without this path they sit
  * eligible/unhealthy forever.  An executive empty failure is first re-run
  * through the Part 7 classifier (maybeSettleExecutiveZeroRead) so a real
- * empty 278e or refused 278-T still closes honestly instead of being
- * relabeled; only a read that stays `unconfirmed` (blank, garbled,
- * header-only) gets the human-review label.
+ * empty 278e still closes verified_empty and a refused 278-T parks open
+ * for a human instead of being relabeled; only a read that stays
+ * `unconfirmed` (blank, garbled, header-only) gets the cascade-unresolved
+ * label.
  */
 export const CAPPED_RECOVERY_REASON_EXCLUDE_SQL = `
   COALESCE(reason, '') <> 'agreement_cascade_unresolved'
@@ -2819,7 +2904,7 @@ export const CAPPED_RECOVERY_REASON_EXCLUDE_SQL = `
  * terminal human-review flag. A fresh CAS lease makes this safe under
  * concurrent cron ticks; failures retain the lease and are retried after its
  * 15-minute expiry instead of silently stranding the row at the attempt cap.
- * Unreadable rows are already an honest terminal; do not relabel them.
+ * Unreadable rows are already parked for a human; do not relabel them.
  * Executive empty failures get one more classifier pass before the label.
  */
 async function recoverExpiredCappedReviews(
@@ -2956,7 +3041,9 @@ async function recoverExpiredCappedReviews(
  */
 export async function maybeRunAgreementAutopublish(
   env: Env,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<{ attempted: number; enqueued: number; terminalized: number } | null> {
+  abortIfSignal(opts.signal);
   const e = await resolveAgreementEnv(env);
   if (e.AGREEMENT_AUTOPUBLISH_ENABLED !== 'true') return null;
   const limit = Math.min(Math.max(parseInt(e.AGREEMENT_AUTOPUBLISH_LIMIT || '3', 10) || 3, 1), 10);
@@ -2999,6 +3086,7 @@ export async function maybeRunAgreementAutopublish(
 
   let enqueued = 0;
   for (const d of docs) {
+    abortIfSignal(opts.signal);
     if (await enqueueAgreementCheck(env, d.doc_id, d.raw_object_key)) enqueued++;
   }
   if (docs.length) console.log(`agreement autopublish: enqueued ${enqueued}/${docs.length} checks`);

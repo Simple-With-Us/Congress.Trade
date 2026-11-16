@@ -705,13 +705,58 @@ struct ClientTickerAnalytics: Decodable {
     }
 
     struct Trader: Decodable, Identifiable {
-        var id: String { filerId ?? (fullName ?? UUID().uuidString) }
+        /// Stored at decode time, never recomputed per access. The old
+        /// computed form minted a fresh UUID on every read when both
+        /// `filerId` and `fullName` were nil, so SwiftUI saw a new identity
+        /// each render (row churn, lost state).
+        let id: String
         let filerId: String?
         let fullName: String?
         let partyBucket: String?
         let photoUrl: String?
         let tradeCount: Int?
         let estVolumeUsd: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case filerId, fullName, partyBucket, photoUrl, tradeCount, estVolumeUsd
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            filerId = try container.decodeIfPresent(String.self, forKey: .filerId)
+            fullName = try container.decodeIfPresent(String.self, forKey: .fullName)
+            partyBucket = try container.decodeIfPresent(String.self, forKey: .partyBucket)
+            photoUrl = try container.decodeIfPresent(String.self, forKey: .photoUrl)
+            tradeCount = try container.decodeIfPresent(Int.self, forKey: .tradeCount)
+            estVolumeUsd = try container.decodeIfPresent(Double.self, forKey: .estVolumeUsd)
+            id = Self.stableID(
+                filerId: filerId, fullName: fullName, partyBucket: partyBucket,
+                photoUrl: photoUrl, tradeCount: tradeCount, estVolumeUsd: estVolumeUsd
+            )
+        }
+
+        /// Deterministic across decodes and processes: filer id wins, then a
+        /// normalized name, then an FNV-1a hash of the remaining fields.
+        /// `Hasher` is per-process randomized and must not be used here.
+        static func stableID(
+            filerId: String?, fullName: String?, partyBucket: String?,
+            photoUrl: String?, tradeCount: Int?, estVolumeUsd: Double?
+        ) -> String {
+            if let filerId = filerId?.trimmingCharacters(in: .whitespacesAndNewlines), !filerId.isEmpty {
+                return filerId
+            }
+            if let name = fullName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return "name:\(name.lowercased())"
+            }
+            let seed = [partyBucket ?? "", photoUrl ?? "", tradeCount.map(String.init) ?? "",
+                        estVolumeUsd.map { String($0) } ?? ""].joined(separator: "|")
+            var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+            for byte in seed.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 0x0000_0100_0000_01b3
+            }
+            return "anon:\(String(hash, radix: 16))"
+        }
     }
 
     struct Backtest: Decodable {
@@ -1950,6 +1995,11 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
     let status: String?
     let detail: String?
     let value: Double?
+    /// `st_peer_prices` check only: tickers ST cannot price (CT-2443). Nil for
+    /// scalar values and older servers that do not send it.
+    let notCovered: Int?
+    /// `st_peer_prices` check only: tickers confirmed no longer trading (CT-2466).
+    let terminal: Int?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1957,6 +2007,13 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
         status = FailSoftJSON.string(c, .status)
         detail = FailSoftJSON.string(c, .detail)
         value = FailSoftJSON.double(c, .value)
+        if let nested = try? c.nestedContainer(keyedBy: CheckValueKeys.self, forKey: .value) {
+            notCovered = FailSoftJSON.int(nested, .notCovered)
+            terminal = FailSoftJSON.int(nested, .terminal)
+        } else {
+            notCovered = nil
+            terminal = nil
+        }
     }
 
     var statusLabel: String {
@@ -1972,6 +2029,11 @@ struct PipelineCheck: Decodable, Identifiable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case id, status, detail, value
+    }
+
+    private enum CheckValueKeys: String, CodingKey {
+        case notCovered
+        case terminal
     }
 }
 

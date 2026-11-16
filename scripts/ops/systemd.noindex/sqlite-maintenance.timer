@@ -1,0 +1,16 @@
+# Sample timer.  This change does not install or enable it.
+# Weekly report plus PASSIVE checkpoint only.  Do not enable VACUUM from this timer.
+# Sunday 09:30 in the host timezone (America/Chicago), away from the
+# 06:00 and 20:00 Central backup slots.
+[Unit]
+Description=Weekly Congress.Trade sqlite report and passive WAL checkpoint
+
+[Timer]
+OnCalendar=Sun 09:30:00
+AccuracySec=1min
+RandomizedDelaySec=15min
+Persistent=true
+Unit=sqlite-maintenance.service
+
+[Install]
+WantedBy=timers.target

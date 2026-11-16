@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the sqlite backup restore drill weekly
+Requires=fleet-backup-restore-drill.service
+
+[Timer]
+# Host timezone is America/Chicago. Sunday 09:15 is away from the dump slots
+# (Congress 06:00 and 20:00, Socratic 06:30 and 19:30, Usage-Monitor 20:30).
+OnCalendar=Sun *-*-* 09:15:00
+AccuracySec=15min
+Persistent=true
+Unit=fleet-backup-restore-drill.service
+
+[Install]
+WantedBy=timers.target

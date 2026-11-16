@@ -51,7 +51,10 @@ Use **sentence case or lowercase** — not Title Case:
 - Market session banner (when shown): stream glyph + **`Market Closed`** / **`Market Open`**
   (not bare `Closed` alone if redundant with a Markets card).
 
-## Times and dates (owner 2026-08-09, amended 2026-08-12)
+## Times And Dates
+
+The current owner-facing writing rule below supersedes older agent timestamp guidance.  Product localization and market/accounting boundaries retain their separate meanings.
+
 - **Product UI renders in the VIEWER's device timezone** — iOS, browser, desktop.  A user in
   another zone reading their own trade times in Central would be the bug, not the fix.
 - **Two deliberate exceptions, both about accounting honesty, not localization:**
@@ -60,11 +63,9 @@ Use **sentence case or lowercase** — not Title Case:
     accounting itself uses (`startOfDayInTimeZone`, `src/lib/db-execution.ts`).  A "today"
     that means a different day than the numbers under it is wrong.
   - **Market-session times** are the market's, not the viewer's: say `9:30 AM ET`, labeled.
-- **Always label the zone** when a time could be read in more than one (`2:41 PM CT`,
+- **Product UI labels the zone** when a time could be read in more than one (`2:41 PM CT`,
   `9:30 AM ET`).  Relative times (`3m ago`) need no label.
-- Owner-facing agent writing (boards, rollouts, Slack, Notes, release notes) is **Central Time,
-  labeled** — that is a coordination rule, not a UI one.  See `/Users/jay/apps/AGENT-SYNC.md`
-  § Timestamps: Central Time.
+- Owner-facing agent writing (boards, rollouts, Zulip, Notes, release notes) uses **America/Chicago, 12-hour `h:mm AM/PM`**, with a normal space before uppercase AM/PM, **no zone label and no adjacent UTC stamp**.  A surface may include its own date context.  This writing rule does not change product localization or market-session labels.  See the current Fleet-OPS handbook and `/Users/jay/apps/FLEET-PROTOCOL.md`.
 
 ## Money
 - Compact suffixes **lowercase**: `$99.8k`, `$1.2m`, `$3.4b`.
@@ -102,9 +103,9 @@ Same open icon source as ST: `ticker-logos` / app logo proxy.
 - Code identifiers, API enums, log lines, internal “live stream” engineering labels
   (SSE, live snapshot) unless user-facing product chrome.
 
-## Two spaces between sentences (owner rule 2026-08-08, strengthened 2026-08-10 and 2026-08-14 — ALL agents, ALL contexts)
+## Two spaces between sentences: U+00A0 plus a space (owner rule 2026-08-08, strengthened 2026-08-10 and 2026-08-14 — ALL agents, ALL contexts)
 
-Owner: **two spaces between sentences everywhere, including App Store
+Owner: **two spaces between sentences everywhere (written as a real U+00A0 plus a normal space; commit messages included), including App Store
 submission fields.**  Not optional.  Not “web only.”  Not “UI only.”
 **Every single agent, every app, every surface, forever.**
 
@@ -113,7 +114,7 @@ Caught live 2026-08-14: Congress.Trade App Store **review notes** still said
 already said 2 weeks.  Agents had treated review notes as exempt.  They are
 not.
 
-**Where it applies (non-exhaustive — if a human reads it, use two spaces):**
+**Where it applies (non-exhaustive — if a human reads it, use the gap):**
 - In-app UI strings (web, PWA, iOS native, widgets)
 - **App Store Connect — all of it:** description, promotional text, What’s New,
   **App Review notes**, **subscription / IAP review notes**, subscription
@@ -123,20 +124,19 @@ not.
 - Marketing, screenshot captions, TestFlight “What to Test”
 
 **How:**
-- Between sentences in a paragraph: `end.  Start` (two ASCII spaces after `.` `!` `?`)
-- HTML/JSX/SwiftUI that collapses spaces: use NBSP+space
-  (`&nbsp; ` / `{"\u00A0 "}` / `\u00A0 `) or a shared helper (ST: `SENTENCE_GAP`)
+- Between sentences in a paragraph: a real U+00A0 plus a normal space after `.` `!` `?` (owner ruling 2026-10-23), except for the three chat panes below.  Never two plain ASCII spaces, which collapse.
+- Only chat replies in Claude Code's Code tab, MiniMax Code's chat pane and Z Code's chat pane use the `&nbsp;` entity plus a normal space.  Every other human-readable surface, including Apple Notes, uses real U+00A0 plus a normal space; do not use the entity elsewhere.
+- HTML/JSX/SwiftUI source, by language:  Swift string literals `"\u{00A0} "`;  JS/TS string literals `"\u00A0 "`;  JSX text `{'\u00A0'}` followed by a space, or `&#160;` inside JSX text;  HTML markup source `&#160;` (markup only, never prose);  or a shared helper (ST: `SENTENCE_GAP`).  The rendered copy uses the real gap; the entity exception applies only to the three named chat panes.
 - Prefer ONE paragraph for short related sentences over stacked one-liners when
   the owner asked for density (see Socratic proposals empty-state, 2026-08-08)
 - Do not insert spaces after brand periods (`Congress.Trade`), URLs, emails, or `U.S.`
 
-**Does NOT apply:** code identifiers, commit messages (normal spacing is fine
-for git), log lines, API enums, pure bullet lists of fragments with no
+**Does NOT apply:** code identifiers, log lines, API enums, pure bullet lists of fragments with no
 sentence terminator.
 
 **Agent failure mode:** shipping App Store description, review notes, or UI
 paragraphs with single spaces after periods, or stale trial/corpus copy.
-Fix on sight.  Protocol: `/Users/jay/apps/AGENT-SYNC.md` § Two spaces.
+Fix on sight.  Protocol: `/Users/jay/apps/FLEET-PROTOCOL.md` § Two spaces.
 
 ## Run-once glyph = emoji bolt (owner preference 2026-08-08, Socratic.Trade)
 The Run-once affordance uses the colored emoji ⚡ (U+26A1), not a line-icon Zap —

@@ -118,6 +118,26 @@ describe('repairCompetitorAttribution', () => {
     expect(staleCount.n).toBe(0);
   });
 
+  it('attaches a mismatched executive to the existing EXEC id when no MANUAL row is in the batch', async () => {
+    insertFiler({ id: 'EXEC-CWRIGHT', fullName: 'Chris Wright', chamber: 'executive', state: '' });
+    insertFiler({ id: 'senate-wrong-wright', fullName: 'Someone Else', chamber: 'senate', state: 'ME' });
+    const rawText = JSON.stringify({
+      name: 'Christopher A Wright',
+      member_type: 'executive',
+      Ticker: 'ACME',
+      Transaction: 'Purchase',
+    });
+    const txId = insertCompetitorTx({ filerId: 'senate-wrong-wright', rawText });
+
+    const result = await repairCompetitorAttribution(env, { dryRun: false });
+
+    expect(result.reassigned).toBe(1);
+    expect(result.created).toBe(0);
+    expect(getTx(txId).filer_id).toBe('EXEC-CWRIGHT');
+    const minted = db.prepare("SELECT COUNT(*) AS n FROM filers WHERE bioguide_id LIKE 'MANUAL-%'").get() as { n: number };
+    expect(minted.n).toBe(0);
+  });
+
   it('is a no-op when the raw reporter matches the assigned filer (same chamber + state)', async () => {
     insertFiler({ id: 'house-ga10-michael-collins', fullName: 'Michael Collins', chamber: 'house', state: 'GA', district: '10' });
     const rawText = JSON.stringify({ Representative: 'Michael Collins', District: 'GA10', Ticker: 'ACME' });

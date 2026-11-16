@@ -7,6 +7,7 @@ import { OpenRouterVisionExtractor } from '../../extraction/openRouterVision.ts'
 import {
   clearCronTickOverrun,
   recordCronTickOverrun,
+  isDenoCronTickHardDeadline,
   tickOutcomeShouldRecord,
 } from '../../shared/cronDeadlineSignal.ts';
 import type { Env } from '../../shared/types.ts';
@@ -174,6 +175,15 @@ describe('R3: Pipeline Robustification', () => {
       } as unknown as Env;
       return { env, store };
     }
+
+    it('suppresses only the minute-tick hard deadline, not other deadline errors', () => {
+      expect(isDenoCronTickHardDeadline('Deno cron tick exceeded 45000ms deadline')).toBe(true);
+      expect(isDenoCronTickHardDeadline('Deno cron tick exceeded 10000ms deadline')).toBe(true);
+      expect(isDenoCronTickHardDeadline('daily lane filer exceeded 120000ms deadline')).toBe(false);
+      expect(isDenoCronTickHardDeadline('exceeded 7000ms deadline')).toBe(false);
+      expect(isDenoCronTickHardDeadline('Deno cron tick nearing 45000ms deadline')).toBe(false);
+      expect(isDenoCronTickHardDeadline('checkPipelineHealth exceeded 8000ms')).toBe(false);
+    });
 
     it('records a deadline abort and a SQLITE_BUSY skip, and ignores a plain overlap', () => {
       expect(tickOutcomeShouldRecord({

@@ -24,6 +24,14 @@ export interface CronTickOverrun {
   count: number;
 }
 
+/**
+ * The minute-tick hard race in `deno/main.ts` (`Deno cron tick exceeded Nms deadline`).
+ * Daily lanes throw `daily lane <name> exceeded Nms deadline` and must still reach Sentry.
+ */
+export function isDenoCronTickHardDeadline(message: string): boolean {
+  return /^Deno cron tick exceeded \d+ms deadline$/.test(message);
+}
+
 export function tickOutcomeShouldRecord(input: {
   skippedOverlap: boolean;
   aborted: boolean;

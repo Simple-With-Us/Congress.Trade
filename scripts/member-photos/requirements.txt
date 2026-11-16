@@ -1,5 +1,5 @@
 # Optional but strongly recommended: without OpenCV every crop falls back to the
 # deterministic top-centred framing (safe, but not face-centred).
 Pillow>=10.0
-opencv-python-headless>=4.9,<5
+opencv-python-headless>=5,<6
 numpy>=1.24

@@ -202,3 +202,35 @@ describe('GET /health/senate-relay', () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe('public health responses never collect raw unreadable-doc ids', () => {
+  // Privacy fence for the 278-T unreadable-doc naming (kody review on
+  // claude/salvage-278t-signal): the shared pipeline-health cache behind
+  // every public health endpoint must request counts only, so raw filing
+  // ids can never enter the cached payload served to unauthenticated
+  // callers. The privileged admin surface calls checkPipelineHealth
+  // directly (not through this cache), so it cannot poison it either.
+  it('the shared cache fetcher always passes includeUnreadableDocIds: false', async () => {
+    mockCheckPipelineHealth.mockResolvedValue(
+      health([...otherChecks(), pollCheck('house', 'ok'), pollCheck('senate', 'ok'), pollCheck('executive', 'ok')]),
+    );
+    const res = await app.request('http://localhost/health/polling', {}, makeEnv());
+    expect(res.status).toBe(200);
+    expect(mockCheckPipelineHealth).toHaveBeenCalled();
+    for (const call of mockCheckPipelineHealth.mock.calls) {
+      const opts = call[3] as { includeUnreadableDocIds?: boolean } | undefined;
+      expect(opts?.includeUnreadableDocIds).toBe(false);
+    }
+  });
+
+  it('the latency monitor endpoint is served from the same counts-only cache', async () => {
+    mockCheckPipelineHealth.mockResolvedValue(health([...otherChecks(), latencyCheck('ok')]));
+    const res = await app.request('http://localhost/health/latency', {}, makeEnv());
+    expect(res.status).toBe(200);
+    expect(mockCheckPipelineHealth).toHaveBeenCalled();
+    for (const call of mockCheckPipelineHealth.mock.calls) {
+      const opts = call[3] as { includeUnreadableDocIds?: boolean } | undefined;
+      expect(opts?.includeUnreadableDocIds).toBe(false);
+    }
+  });
+});

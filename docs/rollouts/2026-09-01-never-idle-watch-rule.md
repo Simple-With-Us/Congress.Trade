@@ -28,16 +28,16 @@ This repo:
 
 Outside this repo, the same rule in each file's own voice:
 
-- `/Users/jay/apps/AGENT-SYNC.md` — canonical `## Never idle-watch a PR` section, placed
+- `/Users/jay/apps/AG***-S**C.md` — canonical `## Never idle-watch a PR` section, placed
   right after `## Merge requirements`.  Everything else cross-references it.
-- `/Users/jay/Code/ai-fleet-coordinator/AGENT-SYNC.md` — same section, landed by PR so the
+- `/Users/jay/Code/ai-fleet-coordinator/AG***-S**C.md` — same section, landed by PR so the
   tracked GitHub copy does not drift from the live file.
 - `/Users/jay/.claude/CLAUDE.md` — stanza beside "Always commit + land finished work".
 - `Socratic.Trade` and `Usage-Monitor` `AGENTS.md`.
 
 ## Decisions & Trade-offs
 
-- **Canonical home is AGENT-SYNC.md**, but each repo restates the rule in full enough form
+- **Canonical home is AG***-S**C.md**, but each repo restates the rule in full enough form
   to act on without a second lookup.  An agent that has loaded only this repo's `AGENTS.md`
   must still get the whole behavior, so link-only was rejected.
 - **Bounded waits stay legal.**  The rule bans idle-polling and the *second* wait, not

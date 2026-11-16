@@ -379,3 +379,67 @@ describe('checkPipelineHealth review_resolution_integrity — fires on seeded 73
     }
   });
 });
+
+describe('checkPipelineHealth filing_skips counts a rejected unreadable 278-T (board 5235c003)', () => {
+  function insertDecision(
+    db: SqliteDatabase,
+    id: string,
+    docId: string,
+    action: string,
+    reason: string,
+    createdAt: string,
+  ): void {
+    db.prepare(
+      `INSERT INTO ingestion_decisions (id, doc_id, action, source, reason, created_at)
+       VALUES (?, ?, ?, 'pipeline', ?, ?)`,
+    ).run(id, docId, action, reason, createdAt);
+  }
+
+  it('counts rejected + oge_text_unreadable inside 24h, names the doc once, and leaves an older row out', async () => {
+    const db = await freshMigratedDb();
+    try {
+      const recent = new Date(Date.now() - 60_000).toISOString();
+      const older = new Date(Date.now() - 48 * 3600_000).toISOString();
+      insertDecision(db, 'd1', 'E-2026-donald-j-trump-09-17-2026-278t', 'oge_text_unreadable', 'oge_text_unreadable', recent);
+      insertDecision(db, 'd2', 'E-2026-donald-j-trump-09-17-2026-278t', 'oge_text_unreadable', 'oge_text_unreadable', recent);
+      insertDecision(db, 'd3', 'E-undated-pam-bondi-2026-278term', 'auto_resolved_empty', 'oge_part7_explicit_none', recent);
+      insertDecision(db, 'd4', 'E-other-reject', 'rejected', 'some_other_reason', recent);
+      insertDecision(db, 'd5', 'E-2026-donald-j-trump-09-8-2026-278t', 'oge_text_unreadable', 'oge_text_unreadable', older);
+
+      const env = { DB: d1Database(db) } as unknown as Env;
+      const health = await checkPipelineHealth(env);
+      const check = health.checks.find((c) => c.id === 'filing_skips');
+      expect(check?.status).toBe('critical');
+      expect(health.signals?.filingSkips24h).toBe(3);
+      expect(health.signals?.filingSkipsByAction24h).toMatchObject({
+        extract_empty_failure: 0,
+        auto_resolved_empty: 1,
+        doc_quarantined: 0,
+        oge_text_unreadable: 2,
+      });
+      expect(health.signals?.unreadableExecutiveDocIds).toEqual(['E-2026-donald-j-trump-09-17-2026-278t']);
+      expect(check?.detail).toContain('E-2026-donald-j-trump-09-17-2026-278t');
+      expect(check?.detail).not.toContain('E-2026-donald-j-trump-09-8-2026-278t');
+      expect(check?.detail).not.toContain('E-other-reject');
+          } finally {
+      db.close();
+    }
+  });
+
+  it('does not name a doc or mention reopen when the only skip is explicit-None', async () => {
+    const db = await freshMigratedDb();
+    try {
+      const recent = new Date(Date.now() - 60_000).toISOString();
+      insertDecision(db, 'd-empty', 'E-undated-pam-bondi-2026-278term', 'auto_resolved_empty', 'oge_part7_explicit_none', recent);
+      const env = { DB: d1Database(db) } as unknown as Env;
+      const health = await checkPipelineHealth(env);
+      const check = health.checks.find((c) => c.id === 'filing_skips');
+      expect(check?.status).toBe('critical');
+      expect(health.signals?.filingSkipsByAction24h?.oge_text_unreadable).toBe(0);
+      expect(health.signals?.filingSkipsByAction24h?.auto_resolved_empty).toBe(1);
+      expect(check?.detail).not.toContain('Unreadable docs');
+          } finally {
+      db.close();
+    }
+  });
+});

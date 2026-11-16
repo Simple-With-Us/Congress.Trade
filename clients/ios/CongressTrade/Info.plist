@@ -46,7 +46,6 @@
 	<key>UIAppFonts</key>
 	<array>
 		<string>ZillaSlab-Regular.ttf</string>
-		<string>ZillaSlab-Bold.ttf</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>

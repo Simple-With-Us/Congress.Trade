@@ -58,7 +58,7 @@ jobs:
     outputs:
       ios: ${{ steps.filter.outputs.ios }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Decide whether Mac compile+test must run
         id: filter
@@ -98,7 +98,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Assert stable Xcode (never beta)
         run: bash scripts/ios-assert-stable-xcode.sh
@@ -163,10 +163,19 @@ jobs:
 
       - name: Upload XCTest result bundle
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: congress-trade-ios-xcresult
           path: ${{ runner.temp }}/CongressTrade.xcresult
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload simulator screenshot (visual CI artifact)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: congress-trade-ios-simulator-screenshot
+          path: ${{ runner.temp }}/congress-trade-ios-ci-simulator.png
           if-no-files-found: warn
           retention-days: 14
 

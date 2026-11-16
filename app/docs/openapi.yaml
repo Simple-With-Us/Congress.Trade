@@ -141,6 +141,44 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/BlockedAgent" }
         "429": { $ref: "#/components/responses/RowBudgetExceeded" }
+  /api/transactions/retractions:
+    get:
+      tags: [Feed]
+      summary: Cursor-paged trade.retract feed (transactions taken off the feed)
+      description: |
+        One entry per deprecation of a published transaction (admin
+        unpublish, reject, republish retirement, amendment supersede).
+        Same access as `/api/transactions`: public, CORS-readable, and the
+        same per-IP daily row budget.  Poll forward by feeding `cursor` back
+        as `since` (the retraction cursor, independent of `cursor_seq`).
+        Entries whose transaction was later revived are omitted; the revived
+        row returns through `/api/transactions` with a new `cursorSeq`.
+        Not an alert; consumers should hide or delete the trade, not notify.
+        See docs/trade-retractions.md.
+      operationId: listRetractions
+      parameters:
+        - name: since
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        "200":
+          description: Page of retractions, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [retractions, cursor, hasMore]
+                properties:
+                  retractions:
+                    type: array
+                    items: { $ref: "#/components/schemas/TradeRetraction" }
+                  cursor: { type: integer, description: Largest retraction seq scanned; feed back as `since`. }
+                  hasMore: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RowBudgetExceeded" }
   /api/export/transactions.csv:
     get:
       tags: [Feed]
@@ -167,7 +205,10 @@ paths:
       description: |
         Server-Sent Events stream of `trade.new` events. Resume via `?since=`
         (cursor_seq) or the standard `Last-Event-ID` header; replay is
-        gap-free from the full transactions table. Requires the subscription
+        gap-free from the full transactions table.  Also carries
+        `event: trade.retract` frames (no `id:` line) resumable via
+        `?retractSince=`; the opening `retract-cursor` frame and the
+        `reconnect` frame's `retractSince` give the resume point. Requires the subscription
         secret — as `Authorization: Bearer`, `X-Subscription-Secret`, or the
         `token` query parameter (the query form exists for browser
         EventSource, which cannot set headers).
@@ -184,6 +225,10 @@ paths:
           in: query
           schema: { type: string }
           description: Subscription secret (EventSource fallback).
+        - name: retractSince
+          in: query
+          schema: { type: integer, minimum: 0 }
+          description: Retraction cursor to resume trade.retract frames from (default live tail).
       responses:
         "200":
           description: text/event-stream of trade.new events (id = cursor_seq).
@@ -1316,6 +1361,14 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
   schemas:
+    TradeRetraction:
+      type: object
+      required: [retractSeq, txId, docId, retractedAt]
+      properties:
+        retractSeq: { type: integer, description: Retraction cursor. }
+        txId: { type: string }
+        docId: { type: string }
+        retractedAt: { type: string, description: When the row was deprecated (ISO 8601). }
     Error:
       type: object
       properties:

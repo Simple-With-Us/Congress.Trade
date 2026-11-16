@@ -41,7 +41,7 @@ Consumers pin a package.json dependency directly to an immutable release tag.
 Use the release being adopted by the coordinated consumer PRs:
 
 ```json
-"@jaywedgeworth22/congress-trading-shared": "github:jaywedgeworth22/congress-trading-shared#vX.Y.Z"
+"@jaywedgeworth22/congress-trading-shared": "github:Simple-With-Us/congress-trading-shared#vX.Y.Z"
 ```
 
 Do not point production consumers at `main`, a branch, or an untagged package
@@ -60,7 +60,7 @@ scratch="$(mktemp -d)"
 mkdir -p "$scratch/home" "$scratch/cache"
 env -u NODE_AUTH_TOKEN -u NPM_TOKEN -u GH_PACKAGES_TOKEN -u GITHUB_TOKEN \
   HOME="$scratch/home" npm_config_cache="$scratch/cache" npm install --prefix "$scratch" \
-  "git+https://github.com/jaywedgeworth22/congress-trading-shared.git#<ref>"
+  "git+https://github.com/Simple-With-Us/congress-trading-shared.git#<ref>"
 node -e "require('$scratch/node_modules/@jaywedgeworth22/congress-trading-shared')"
 ```
 

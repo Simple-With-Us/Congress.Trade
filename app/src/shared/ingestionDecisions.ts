@@ -21,7 +21,16 @@ export type IngestionDecisionAction =
    * Agreement/pipeline total extract failure: successful model reads returned
    * zero rows (empty×empty). Loud hard-fail — not soft cascade_unresolved.
    */
-  | 'extract_empty_failure';
+  | 'extract_empty_failure'
+  /**
+   * Executive 278-T whose text layer could not be read.  Parked for a human.
+   * Not a terminal reject: the same reason hid real rows on the Sep 8 Trump
+   * filing.  Counted by the filing-skip alarm.
+   */
+  | 'oge_text_unreadable';
+
+/** Ingestion-decision action for a parked unreadable executive 278-T. */
+export const OGE_TEXT_UNREADABLE_DECISION_ACTION = 'oge_text_unreadable' as const;
 
 export type IngestionDecisionSource = 'pipeline' | 'admin' | 'agreement';
 
