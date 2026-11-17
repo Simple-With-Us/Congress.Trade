@@ -100,6 +100,47 @@ export function createProxiedFetch(
 }
 
 /**
+ * Direct-first fetch with a residential-proxy fallback, for sources that
+ * serve datacenter egress directly (House Clerk, OGE).  The direct attempt
+ * goes first; only when it rejects — fetch rejects solely when no response
+ * was received (network failure, DNS, connect refused, reset) — is the
+ * request retried once through the residential proxy.  A response of any
+ * status is the source answering and is returned as-is, so the caller's
+ * status handling (404 not-yet-published, 403 WAF, 5xx) is unchanged.
+ * Aborted requests are never retried: a caller cancellation (queue lease)
+ * must not turn into a second, proxied request.  When no proxy is
+ * configured, or no distinct proxied path exists in this runtime, this is
+ * the base fetch unchanged.  Senate eFD traffic must NOT use this helper —
+ * eFD denies datacenter IPs, so Senate fetches stay proxy-only via
+ * {@link createProxiedFetch} (CT-2442).
+ */
+export function createDirectFirstFetch(
+  proxyUrl?: string,
+  baseFetch: typeof fetch = globalThis.fetch,
+): typeof fetch {
+  if (!proxyUrl || !proxyUrl.trim()) return baseFetch;
+  const proxiedFetch = createProxiedFetch(proxyUrl, baseFetch);
+  if (proxiedFetch === baseFetch) return baseFetch;
+
+  return async function directFirstFetch(
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    try {
+      return await baseFetch(input, init);
+    } catch (err) {
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      if (signal?.aborted) throw err;
+      console.warn(
+        'proxyFetch: direct fetch failed before a response; retrying via residential proxy:',
+        (err as Error).message ?? String(err),
+      );
+      return proxiedFetch(input, init);
+    }
+  };
+}
+
+/**
  * Formats host, port, username, and password into a standard HTTP proxy URL.
  */
 export function formatProxyUrl(opts: {

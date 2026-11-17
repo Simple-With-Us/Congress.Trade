@@ -35,7 +35,7 @@ import {
 } from './senateSource.ts';
 import { isSenateRelayUnreachable, senateRelayAuthHeaders } from './senateRelayHealth.ts';
 import { isSenateEdgeBackoffActive, readSenateEdgeBackoff } from './senateEdgeDeny.ts';
-import { createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
+import { createDirectFirstFetch, createProxiedFetch, resolveResidentialProxyUrl } from '../shared/proxyFetch.ts';
 
 const UA = 'congress-feed/0.1 (+https://congress.trade)';
 
@@ -260,7 +260,15 @@ export async function fetchFiling(
     // semantics below work unchanged. Found 2026-08-10: the historical
     // backfill discovered ~650 filings whose fetches then all 403'd direct.
     const residentialProxyUrl = resolveResidentialProxyUrl(env);
-    const effectiveFetch = residentialProxyUrl ? createProxiedFetch(residentialProxyUrl, fetch) : fetch;
+    // Senate documents must egress through the residential proxy: eFD
+    // denies datacenter IPs outright.  House and OGE documents are served
+    // to direct egress (the House list check already goes direct), so
+    // fetch those direct-first and fall back to the residential proxy only
+    // when the direct attempt never receives a response — a residential
+    // proxy outage must not stall House/OGE ingestion (CT-2442).
+    const effectiveFetch = row.chamber === 'senate'
+      ? (residentialProxyUrl ? createProxiedFetch(residentialProxyUrl, fetch) : fetch)
+      : createDirectFirstFetch(residentialProxyUrl, fetch);
 
     // Owner 2026-09-09: the Mac Senate relay (`https://scout.jays.services`)
     // is retired (board `ba810d46`).  `resolveResidentialProxyUrl` always
