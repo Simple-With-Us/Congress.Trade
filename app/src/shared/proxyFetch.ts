@@ -100,42 +100,78 @@ export function createProxiedFetch(
 }
 
 /**
+ * How long the direct attempt in {@link createDirectFirstFetch} may take
+ * to produce a response before it counts as never having answered.  Fetch
+ * has no default timeout, and a source edge that silently drops packets
+ * from datacenter egress (a drop, not a refusal) would otherwise hang the
+ * direct attempt until the caller's own signal aborts — the one case that
+ * must not fall back.  The bound covers time to first response, not the
+ * body transfer.
+ */
+export const DIRECT_FIRST_TIMEOUT_MS = 20_000;
+
+/**
  * Direct-first fetch with a residential-proxy fallback, for sources that
  * serve datacenter egress directly (House Clerk, OGE).  The direct attempt
- * goes first; only when it rejects — fetch rejects solely when no response
- * was received (network failure, DNS, connect refused, reset) — is the
- * request retried once through the residential proxy.  A response of any
- * status is the source answering and is returned as-is, so the caller's
- * status handling (404 not-yet-published, 403 WAF, 5xx) is unchanged.
- * Aborted requests are never retried: a caller cancellation (queue lease)
- * must not turn into a second, proxied request.  When no proxy is
- * configured, or no distinct proxied path exists in this runtime, this is
- * the base fetch unchanged.  Senate eFD traffic must NOT use this helper —
- * eFD denies datacenter IPs, so Senate fetches stay proxy-only via
+ * goes first, bounded by {@link DIRECT_FIRST_TIMEOUT_MS}; only when it
+ * rejects — fetch rejects solely when no response was received (network
+ * failure, DNS, connect refused, reset, or that timeout) — is the request
+ * retried once through the residential proxy.  A response of any status
+ * is the source answering and is returned as-is, so the caller's status
+ * handling (404 not-yet-published, 403 WAF, 5xx) is unchanged.  Aborted
+ * requests are never retried: only the caller's own cancellation (queue
+ * lease) suppresses the fallback, never the direct attempt's timeout.
+ * When both attempts fail, the thrown error names both failures and
+ * carries the direct error as its `cause`, so the recorded failure is
+ * never misattributed to the proxy alone.  When no proxy is configured,
+ * or no distinct proxied path exists in this runtime, this is the base
+ * fetch unchanged.  Senate eFD traffic must NOT use this helper — eFD
+ * denies datacenter IPs, so Senate fetches stay proxy-only via
  * {@link createProxiedFetch} (CT-2442).
  */
 export function createDirectFirstFetch(
   proxyUrl?: string,
   baseFetch: typeof fetch = globalThis.fetch,
+  opts?: { directTimeoutMs?: number },
 ): typeof fetch {
   if (!proxyUrl || !proxyUrl.trim()) return baseFetch;
   const proxiedFetch = createProxiedFetch(proxyUrl, baseFetch);
   if (proxiedFetch === baseFetch) return baseFetch;
+  const directTimeoutMs = opts?.directTimeoutMs ?? DIRECT_FIRST_TIMEOUT_MS;
 
   return async function directFirstFetch(
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
+    const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    const timeoutSignal = AbortSignal.timeout(directTimeoutMs);
+    const attemptInit: RequestInit = {
+      ...init,
+      signal: callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal,
+    };
+    let directErr: unknown;
     try {
-      return await baseFetch(input, init);
+      return await baseFetch(input, attemptInit);
     } catch (err) {
-      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-      if (signal?.aborted) throw err;
-      console.warn(
-        'proxyFetch: direct fetch failed before a response; retrying via residential proxy:',
-        (err as Error).message ?? String(err),
+      directErr = err;
+    }
+    // Only a caller cancellation suppresses the fallback; a direct-attempt
+    // timeout means the direct path never answered, so try the proxy.
+    if (callerSignal?.aborted) throw directErr;
+    const directMessage = (directErr as Error).message ?? String(directErr);
+    console.warn(
+      'proxyFetch: direct fetch failed before a response; retrying via residential proxy:',
+      directMessage,
+    );
+    try {
+      return await proxiedFetch(input, init);
+    } catch (proxyErr) {
+      const proxyMessage = (proxyErr as Error).message ?? String(proxyErr);
+      const combined = new Error(
+        `direct fetch failed and proxy fallback failed: ${directMessage}; proxy: ${proxyMessage}`,
       );
-      return proxiedFetch(input, init);
+      (combined as Error & { cause?: unknown }).cause = directErr;
+      throw combined;
     }
   };
 }

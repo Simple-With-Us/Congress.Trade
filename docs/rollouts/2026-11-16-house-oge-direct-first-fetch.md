@@ -20,4 +20,5 @@ The residential proxy outage that began on Sun, Nov 15, 2026 at 4:08 PM blocked 
 ## Follow-Ups
 
 - GB-Publisher's local commit `3c846d1f` on `publisher/house-fetch-direct-fallback` implements the inverse order (proxy first, direct on no-response) for the same paths.  It is superseded by this change and should not be pushed.
-- The Senate eFD Akamai edge deny (CT health `senate_efd` degraded) is a separate eFD-side refusal, not part of this fix.  Senate filings continue to arrive via the Mac fetcher relay while it lasts.
+- The Senate eFD Akamai edge deny (CT health `senate_efd` degraded) is a separate eFD-side refusal, not part of this fix.  Senate document fetches in this app stay on the Mango residential proxy via `createProxiedFetch` (the Mac scout relay was retired on 2026-09-09, board `ba810d46`); the health check’s “Mac fetcher relay” wording refers to the separate Mac eFD fetcher that discovers Senate filings.
+- Post-merge review follow-up (CT#3188): the direct attempt is now bounded by `DIRECT_FIRST_TIMEOUT_MS` so a silently dropped direct connection falls back instead of hanging to the lease abort, and a double failure throws one combined error carrying the direct failure as its `cause`.

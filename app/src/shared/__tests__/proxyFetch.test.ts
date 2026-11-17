@@ -150,6 +150,56 @@ describe('proxyFetch', () => {
       }
     });
 
+    it('falls back to the proxy when the direct attempt hangs past its timeout', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) return Promise.resolve(new Response('via proxy', { status: 200 }));
+          // A hung direct attempt: settles only when its signal aborts.
+          return new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')));
+          });
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-hang.internal:8888',
+          mockFetch as unknown as typeof fetch,
+          { directTimeoutMs: 30 },
+        );
+        const res = await fetcher('http://example.com/doc.pdf');
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe('via proxy');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('throws a combined error naming both failures when the proxy fallback also fails', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) return Promise.reject(new Error('proxy boom'));
+          return Promise.reject(new Error('direct boom'));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-bothfail.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        const err = await fetcher('http://example.com/doc.pdf').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).toContain('direct boom');
+        expect((err as Error).message).toContain('proxy boom');
+        expect(((err as Error & { cause?: Error }).cause as Error).message).toBe('direct boom');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
     it('returns an HTTP error response as-is instead of retrying via the proxy', async () => {
       stubDenoClient();
       try {
