@@ -106,7 +106,8 @@ export function createProxiedFetch(
  * from datacenter egress (a drop, not a refusal) would otherwise hang the
  * direct attempt until the caller's own signal aborts — the one case that
  * must not fall back.  The bound covers time to first response, not the
- * body transfer.
+ * body transfer: the timer is cleared as soon as the attempt settles, so
+ * the signal attached to the returned response can never abort its body.
  */
 export const DIRECT_FIRST_TIMEOUT_MS = 20_000;
 
@@ -144,16 +145,27 @@ export function createDirectFirstFetch(
     init?: RequestInit,
   ): Promise<Response> {
     const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const timeoutSignal = AbortSignal.timeout(directTimeoutMs);
+    // An explicit controller, not AbortSignal.timeout: the timer is
+    // cleared the moment the attempt settles, so the signal attached to a
+    // returned response can never fire later and abort its body stream.
+    const timeoutController = new AbortController();
+    const timer = setTimeout(
+      () => timeoutController.abort(new Error(`direct fetch timed out after ${directTimeoutMs}ms`)),
+      directTimeoutMs,
+    );
     const attemptInit: RequestInit = {
       ...init,
-      signal: callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal,
+      signal: callerSignal
+        ? AbortSignal.any([callerSignal, timeoutController.signal])
+        : timeoutController.signal,
     };
     let directErr: unknown;
     try {
       return await baseFetch(input, attemptInit);
     } catch (err) {
       directErr = err;
+    } finally {
+      clearTimeout(timer);
     }
     // Only a caller cancellation suppresses the fallback; a direct-attempt
     // timeout means the direct path never answered, so try the proxy.
@@ -166,6 +178,9 @@ export function createDirectFirstFetch(
     try {
       return await proxiedFetch(input, init);
     } catch (proxyErr) {
+      // A caller cancellation during the fallback stays a cancellation —
+      // never re-label it as a transport failure.
+      if (callerSignal?.aborted) throw proxyErr;
       const proxyMessage = (proxyErr as Error).message ?? String(proxyErr);
       const combined = new Error(
         `direct fetch failed and proxy fallback failed: ${directMessage}; proxy: ${proxyMessage}`,
