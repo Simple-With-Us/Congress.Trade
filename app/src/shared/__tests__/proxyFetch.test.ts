@@ -205,20 +205,73 @@ describe('proxyFetch', () => {
     it('does not let the direct timeout abort the response body after headers arrive', async () => {
       stubDenoClient();
       try {
-        const mockFetch = vi.fn().mockResolvedValue(new Response('slow body', { status: 200 }));
+        // The body stream honours init.signal the way a real fetch body
+        // does: if the signal aborts, the stream errors.  A mock that
+        // ignored the signal could not catch the timer not being cleared.
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit) => {
+          const signal = init?.signal;
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              let aborted = false;
+              const abort = () => {
+                aborted = true;
+                controller.error(new Error('The operation was aborted'));
+              };
+              if (signal?.aborted) abort();
+              else signal?.addEventListener('abort', abort, { once: true });
+              setTimeout(() => {
+                if (!aborted) {
+                  controller.enqueue(new TextEncoder().encode('slow body'));
+                  controller.close();
+                }
+              }, 50);
+            },
+          });
+          return Promise.resolve(new Response(body, { status: 200 }));
+        });
         const fetcher = createDirectFirstFetch(
           'http://proxy-direct-first-body.internal:8888',
           mockFetch as unknown as typeof fetch,
           { directTimeoutMs: 30 },
         );
         const res = await fetcher('http://example.com/doc.pdf');
-        // Read the body only after the direct-timeout window has passed;
+        // The body lands at 50ms, past the 30ms direct-timeout window;
         // the cleared timer must leave the body stream untouched.
-        await new Promise((resolve) => setTimeout(resolve, 60));
         expect(res.status).toBe(200);
         expect(await res.text()).toBe('slow body');
         expect(mockFetch).toHaveBeenCalledTimes(1);
       } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('bounds the proxy fallback with the same per-attempt timeout', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) {
+            // A stalled proxy attempt: settles only when its signal
+            // aborts, rejecting with the signal's reason like real fetch.
+            return new Promise((_resolve, reject) => {
+              const sig = init?.signal;
+              sig?.addEventListener('abort', () => reject(sig.reason));
+            });
+          }
+          return Promise.reject(new Error('direct boom'));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-stall.internal:8888',
+          mockFetch as unknown as typeof fetch,
+          { directTimeoutMs: 30 },
+        );
+        const err = await fetcher('http://example.com/doc.pdf').catch((e: unknown) => e);
+        if (!(err instanceof Error)) throw new Error('expected the rejection to be an Error');
+        expect(err.message).toContain('direct boom');
+        expect(err.message).toContain('proxy: fetch attempt timed out after 30ms');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
         vi.unstubAllGlobals();
       }
     });
