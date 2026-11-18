@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  createDirectFirstFetch,
   createProxiedFetch,
   DEFAULT_RESIDENTIAL_PROXY_URL,
   getDenoHttpClient,
@@ -78,6 +79,248 @@ describe('proxyFetch', () => {
       warn.mockRestore();
       vi.unstubAllGlobals();
     }
+  });
+
+  describe('createDirectFirstFetch', () => {
+    const stubDenoClient = () =>
+      vi.stubGlobal('Deno', { createHttpClient: () => ({ fakeClient: true }) });
+
+    it('returns baseFetch when no proxyUrl is provided', () => {
+      const mockFetch = vi.fn() as unknown as typeof fetch;
+      expect(createDirectFirstFetch(undefined, mockFetch)).toBe(mockFetch);
+      expect(createDirectFirstFetch('   ', mockFetch)).toBe(mockFetch);
+    });
+
+    it('returns the direct response without touching the proxy when direct succeeds', async () => {
+      stubDenoClient();
+      try {
+        const mockFetch = vi.fn().mockResolvedValue(new Response('direct', { status: 200 }));
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-ok.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        const res = await fetcher('http://example.com/doc.pdf');
+        expect(res.status).toBe(200);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(mockFetch.mock.calls[0][1]?.client).toBeUndefined();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('retries via the residential proxy when the direct attempt never gets a response', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) return Promise.resolve(new Response('via proxy', { status: 200 }));
+          return Promise.reject(new Error('connect ECONNREFUSED 203.0.113.7:443'));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-fallback.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        const res = await fetcher('http://example.com/doc.pdf');
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe('via proxy');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+        expect(mockFetch.mock.calls[1][1]?.client).toEqual({ fakeClient: true });
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('never retries an aborted request via the proxy', async () => {
+      stubDenoClient();
+      try {
+        const controller = new AbortController();
+        controller.abort();
+        const mockFetch = vi.fn().mockRejectedValue(new Error('The operation was aborted'));
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-abort.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        await expect(
+          fetcher('http://example.com/doc.pdf', { signal: controller.signal }),
+        ).rejects.toThrow(/aborted/);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('falls back to the proxy when the direct attempt hangs past its timeout', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) return Promise.resolve(new Response('via proxy', { status: 200 }));
+          // A hung direct attempt: settles only when its signal aborts.
+          return new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')));
+          });
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-hang.internal:8888',
+          mockFetch as unknown as typeof fetch,
+          { directTimeoutMs: 30 },
+        );
+        const res = await fetcher('http://example.com/doc.pdf');
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe('via proxy');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('throws a combined error naming both failures when the proxy fallback also fails', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) return Promise.reject(new Error('proxy boom'));
+          return Promise.reject(new Error('direct boom'));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-bothfail.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        const err = await fetcher('http://example.com/doc.pdf').catch((e: unknown) => e);
+        if (!(err instanceof Error)) throw new Error('expected the rejection to be an Error');
+        expect(err.message).toContain('direct boom');
+        expect(err.message).toContain('proxy boom');
+        const cause = err.cause;
+        if (!(cause instanceof Error)) throw new Error('expected the direct error as cause');
+        expect(cause.message).toBe('direct boom');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('does not let the direct timeout abort the response body after headers arrive', async () => {
+      stubDenoClient();
+      try {
+        // The body stream honours init.signal the way a real fetch body
+        // does: if the signal aborts, the stream errors.  A mock that
+        // ignored the signal could not catch the timer not being cleared.
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit) => {
+          const signal = init?.signal;
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              let aborted = false;
+              const abort = () => {
+                aborted = true;
+                controller.error(new Error('The operation was aborted'));
+              };
+              if (signal?.aborted) abort();
+              else signal?.addEventListener('abort', abort, { once: true });
+              setTimeout(() => {
+                if (!aborted) {
+                  controller.enqueue(new TextEncoder().encode('slow body'));
+                  controller.close();
+                }
+              }, 50);
+            },
+          });
+          return Promise.resolve(new Response(body, { status: 200 }));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-body.internal:8888',
+          mockFetch as unknown as typeof fetch,
+          { directTimeoutMs: 30 },
+        );
+        const res = await fetcher('http://example.com/doc.pdf');
+        // The body lands at 50ms, past the 30ms direct-timeout window;
+        // the cleared timer must leave the body stream untouched.
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe('slow body');
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('bounds the proxy fallback with the same per-attempt timeout', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) {
+            // A stalled proxy attempt: settles only when its signal
+            // aborts, rejecting with the signal's reason like real fetch.
+            return new Promise((_resolve, reject) => {
+              const sig = init?.signal;
+              sig?.addEventListener('abort', () => reject(sig.reason));
+            });
+          }
+          return Promise.reject(new Error('direct boom'));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-stall.internal:8888',
+          mockFetch as unknown as typeof fetch,
+          { directTimeoutMs: 30 },
+        );
+        const err = await fetcher('http://example.com/doc.pdf').catch((e: unknown) => e);
+        if (!(err instanceof Error)) throw new Error('expected the rejection to be an Error');
+        expect(err.message).toContain('direct boom');
+        expect(err.message).toContain('proxy: fetch attempt timed out after 30ms');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('keeps a caller cancellation during the proxy fallback a cancellation', async () => {
+      stubDenoClient();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const controller = new AbortController();
+        const mockFetch = vi.fn().mockImplementation((_input: unknown, init?: RequestInit & { client?: unknown }) => {
+          if (init?.client) {
+            return new Promise((_resolve, reject) => {
+              init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')));
+            });
+          }
+          return Promise.reject(new Error('direct boom'));
+        });
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-cancel.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        const pending = fetcher('http://example.com/doc.pdf', { signal: controller.signal });
+        setTimeout(() => controller.abort(), 10);
+        const err = await pending.catch((e: unknown) => e);
+        if (!(err instanceof Error)) throw new Error('expected the rejection to be an Error');
+        expect(err.message).toBe('The operation was aborted');
+        expect(err.message).not.toContain('proxy fallback failed');
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('returns an HTTP error response as-is instead of retrying via the proxy', async () => {
+      stubDenoClient();
+      try {
+        const mockFetch = vi.fn().mockResolvedValue(new Response('nope', { status: 500 }));
+        const fetcher = createDirectFirstFetch(
+          'http://proxy-direct-first-status.internal:8888',
+          mockFetch as unknown as typeof fetch,
+        );
+        const res = await fetcher('http://example.com/doc.pdf');
+        expect(res.status).toBe(500);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
   });
 
   it('never logs proxy credentials when the Deno client cannot be created (CT-2442)', () => {
