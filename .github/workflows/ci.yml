@@ -196,6 +196,14 @@ jobs:
       - name: Install Deno CLI
         run: npm install --global deno@2.9.3
 
+      # Same check Coolify runs in app/Dockerfile (`RUN deno install --frozen`).
+      # A Renovate bump can leave app/deno.lock stale for Deno 2.9.3 even when
+      # GitHub's npm/tsc jobs are green (CT #3182, #3185). Fail here before merge.
+      # Deno cache is not stored: scripts/check-actions-runner-policy.mjs forbids
+      # actions/cache and `cache:` keys.
+      - name: Deno lockfile is current (frozen install)
+        run: deno install --frozen
+
       - name: Enforce owned-runner workflow policy
         working-directory: .
         env:
