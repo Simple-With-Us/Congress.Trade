@@ -50,12 +50,58 @@ export async function requireAppleIapEnabled(env: Env): Promise<void> {
   if (!enabled) throw new AppleRedeemError('Apple in-app purchases are not enabled yet', 503);
 }
 
+function appleEpochMsToIso(value: unknown): string {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return 'none';
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    // Out-of-range epoch: a logger must never crash the rejection path.
+    return 'none';
+  }
+}
+
+/**
+ * Collapse log-bound text to one truncated printable line. Rejection reasons
+ * can carry attacker-influenced text from an unverified JWS, and signed
+ * payload fields are still external input: embedded CR/LF or ANSI escapes
+ * must not split or forge extra log lines.
+ */
+function singleLogLine(value: unknown, max = 120): string {
+  const text = String(value ?? 'unknown').replace(/[^\x20-\x7e]+/g, ' ');
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+/**
+ * One payload-free line per refused redemption: which check failed plus the
+ * environment / product / expires / revoked fields Apple signed — the minimum
+ * needed to tell "Sandbox purchase expired" from "Production purchase
+ * revoked" in server logs. The JWS itself, transaction ids and every other
+ * transaction field stay out of logs, so a refusal can be diagnosed without
+ * ever persisting a customer's signed transaction.
+ */
+function logAppleRedeemRejection(reason: string, transaction?: AppleTransactionPayload): void {
+  if (!transaction) {
+    console.warn(`apple redeem rejected: ${singleLogLine(reason)}`);
+    return;
+  }
+  console.warn(
+    `apple redeem rejected: ${singleLogLine(reason)};` +
+      ` environment=${singleLogLine(transaction.environment)}` +
+      ` productId=${singleLogLine(transaction.productId)}` +
+      ` expiresAt=${appleEpochMsToIso(transaction.expiresDate)}` +
+      ` revokedAt=${appleEpochMsToIso(transaction.revocationDate)}` +
+      ` revocationReason=${singleLogLine(transaction.revocationReason ?? 'none')}`,
+  );
+}
+
 /**
  * Chain-verify `jws`, then check bundle id, Sandbox policy, a recognized
  * (configured) product id, and that the transaction is currently active.
  * Throws {@link AppleRedeemError} (message + HTTP-ish status) on any failure
  * — callers map that straight to their own error type (`ClientInputError` for
- * commands, a plain JSON error for the anonymous route).
+ * commands, a plain JSON error for the anonymous route). Every rejection is
+ * logged once via {@link logAppleRedeemRejection} before throwing.
  */
 export async function verifyAppleRedemption(env: Env, jws: string): Promise<VerifiedAppleRedemption> {
   if (!jws) throw new AppleRedeemError('signedTransaction is required');
@@ -65,26 +111,36 @@ export async function verifyAppleRedemption(env: Env, jws: string): Promise<Veri
     transaction = await verifyAppleSignedJws<AppleTransactionPayload>(jws);
   } catch (err) {
     const message = err instanceof AppleJwsVerificationError ? err.message : 'invalid Apple transaction';
+    logAppleRedeemRejection(message);
     throw new AppleRedeemError(message);
   }
 
   const expectedBundle = (await resolveSecret(env, 'APPLE_BUNDLE_ID')).value?.trim() || 'trade.congress.ios';
   if (transaction.bundleId && transaction.bundleId !== expectedBundle) {
+    logAppleRedeemRejection('bundleId mismatch', transaction);
     throw new AppleRedeemError('bundleId mismatch');
   }
   // Sandbox is allowed by default (TestFlight / App Review / Mac Designed-for-iPad).
   // Only APPLE_ALLOW_SANDBOX=false refuses. See appleSandboxPurchasesAllowed.
   if (isAppleSandboxEnvironment(transaction.environment) && !(await appleSandboxPurchasesAllowed(env))) {
+    logAppleRedeemRejection('Sandbox Apple purchases are not accepted', transaction);
     throw new AppleRedeemError('Sandbox Apple purchases are not accepted');
   }
   const configuredProducts = await resolveAppleProductIds(env);
   const plan = planFromConfiguredAppleProductId(transaction.productId, configuredProducts);
-  if (!plan) throw new AppleRedeemError('unrecognized Apple product id');
+  if (!plan) {
+    logAppleRedeemRejection('unrecognized Apple product id', transaction);
+    throw new AppleRedeemError('unrecognized Apple product id');
+  }
   if (!appleTransactionIsActive(transaction)) {
+    logAppleRedeemRejection('this Apple transaction is not an active subscription', transaction);
     throw new AppleRedeemError('this Apple transaction is not an active subscription');
   }
   const originalTransactionId = transaction.originalTransactionId || transaction.transactionId;
-  if (!originalTransactionId) throw new AppleRedeemError('missing Apple transaction id');
+  if (!originalTransactionId) {
+    logAppleRedeemRejection('missing Apple transaction id', transaction);
+    throw new AppleRedeemError('missing Apple transaction id');
+  }
 
   return { transaction, plan, originalTransactionId };
 }
