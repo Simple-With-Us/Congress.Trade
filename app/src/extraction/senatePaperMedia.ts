@@ -30,7 +30,7 @@ import {
 } from '../shared/openRouterAttribution.ts';
 
 const EFD_MEDIA_HOST = 'efd-media-public.senate.gov';
-const DEFAULT_MODEL = 'google/gemini-3.5-flash-lite';
+const DEFAULT_MODEL = 'google/gemini-4-hydrogen';
 const PAPER_CONFIDENCE = 0.85;
 
 const PAPER_OCR_PROMPT = `This is page image(s) of a Senate paper PERIODIC DISCLOSURE OF FINANCIAL TRANSACTIONS form.
