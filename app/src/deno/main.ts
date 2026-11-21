@@ -3,7 +3,8 @@ import { createClient } from '@libsql/client';
 import { S3Client } from '@aws-sdk/client-s3';
 import { D1DatabaseShim, KVNamespaceShim, S3BucketShim } from './shims.ts';
 import { DurableQueueAdapter } from './durableQueue.ts';
-import app from '../index.ts';
+import { honoApp } from '../index.ts';
+import { flushD1Budget } from '../shared/d1Budget.ts';
 import type { Env, QueueMessage } from '../shared/types.ts';
 import { resolveSecret, resolveSecrets, refreshSecrets } from '../secrets/infisical.ts';
 import { initSettings, startSettingsRefresh, appSettings } from '../settings/settingsService.ts';
@@ -494,7 +495,31 @@ Deno.serve({ port }, async (req, info) => {
   const peer = 'hostname' in info.remoteAddr ? info.remoteAddr.hostname : undefined;
   const stamped = stampTcpPeer(req, peer);
   try {
-    return await app.fetch(stamped, env, dummyCtx as any);
+    // Call the Hono app directly - NOT the default export of ../index.ts.
+    // That default is the retired Workers adapter: its fetch first runs
+    // stampWorkersEdge(), which deletes the x-ct-tcp-peer header stamped
+    // above (a Workers isolate has no TCP peer, so a client-supplied one
+    // must not survive). In this Deno entry the header carries the real
+    // socket peer, and losing it makes clientIp() return 'unknown' for
+    // every visitor - collapsing all per-IP budgets (the publicApiGuard
+    // request budget and the feed row budget) into one shared bucket that
+    // the whole internet exhausts, after which the public feed 429s for
+    // everyone until the UTC-day window rolls. The two adapter duties
+    // that do apply here - third-party telemetry and the post-response
+    // D1 budget flush - are re-applied around the direct call.
+    const response = await withThirdPartyTelemetry(env, () =>
+      honoApp.fetch(stamped, env, dummyCtx as any)
+    );
+    void Promise.resolve(response)
+      .catch(() => undefined)
+      .then(() => flushD1Budget(env))
+      .catch(() => undefined);
+    return response;
+  } catch (err) {
+    // The Workers adapter's Sentry wrapper used to catch handler throws;
+    // keep an equivalent capture + 500 on this entry.
+    captureException(err);
+    return new Response('Internal Server Error', { status: 500 });
   } finally {
     // Do not await: a 2s flush must not hold the HTTP response.  The
     // long-lived Deno process keeps the envelope fetch alive.
