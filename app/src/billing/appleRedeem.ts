@@ -53,7 +53,23 @@ export async function requireAppleIapEnabled(env: Env): Promise<void> {
 function appleEpochMsToIso(value: unknown): string {
   const ms = Number(value);
   if (!Number.isFinite(ms) || ms <= 0) return 'none';
-  return new Date(ms).toISOString();
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    // Out-of-range epoch: a logger must never crash the rejection path.
+    return 'none';
+  }
+}
+
+/**
+ * Collapse log-bound text to one truncated printable line. Rejection reasons
+ * can carry attacker-influenced text from an unverified JWS, and signed
+ * payload fields are still external input: embedded CR/LF or ANSI escapes
+ * must not split or forge extra log lines.
+ */
+function singleLogLine(value: unknown, max = 120): string {
+  const text = String(value ?? 'unknown').replace(/[^\x20-\x7e]+/g, ' ');
+  return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
 /**
@@ -66,16 +82,16 @@ function appleEpochMsToIso(value: unknown): string {
  */
 function logAppleRedeemRejection(reason: string, transaction?: AppleTransactionPayload): void {
   if (!transaction) {
-    console.warn(`apple redeem rejected: ${reason}`);
+    console.warn(`apple redeem rejected: ${singleLogLine(reason)}`);
     return;
   }
   console.warn(
-    `apple redeem rejected: ${reason};` +
-      ` environment=${transaction.environment ?? 'unknown'}` +
-      ` productId=${transaction.productId ?? 'unknown'}` +
+    `apple redeem rejected: ${singleLogLine(reason)};` +
+      ` environment=${singleLogLine(transaction.environment)}` +
+      ` productId=${singleLogLine(transaction.productId)}` +
       ` expiresAt=${appleEpochMsToIso(transaction.expiresDate)}` +
       ` revokedAt=${appleEpochMsToIso(transaction.revocationDate)}` +
-      ` revocationReason=${transaction.revocationReason ?? 'none'}`,
+      ` revocationReason=${singleLogLine(transaction.revocationReason ?? 'none')}`,
   );
 }
 

@@ -6,11 +6,16 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const verifyAppleSignedJws = vi.fn();
+const mocks = vi.hoisted(() => {
+  const verifyAppleSignedJws = vi.fn();
+  class AppleJwsVerificationError extends Error {}
+  return { verifyAppleSignedJws, AppleJwsVerificationError };
+});
 vi.mock('../../billing/appleJws', () => ({
-  verifyAppleSignedJws: (...args: unknown[]) => verifyAppleSignedJws(...args),
-  AppleJwsVerificationError: class AppleJwsVerificationError extends Error {},
+  verifyAppleSignedJws: (...args: unknown[]) => mocks.verifyAppleSignedJws(...args),
+  AppleJwsVerificationError: mocks.AppleJwsVerificationError,
 }));
+const { verifyAppleSignedJws, AppleJwsVerificationError: AppleJwsVerificationErrorRef } = mocks;
 
 import { AppleRedeemError, verifyAppleRedemption } from '../appleRedeem.ts';
 import type { Env } from '../../shared/types.ts';
@@ -96,6 +101,34 @@ describe('verifyAppleRedemption refusal logging', () => {
       const line = String(warn.mock.calls[0][0]);
       expect(line).toBe('apple redeem rejected: invalid Apple transaction');
       expect(line).not.toContain('a.b.c');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs expiresAt=none instead of crashing on an out-of-range epoch', async () => {
+    verifyAppleSignedJws.mockResolvedValue(transaction({ revocationDate: 1e30, revocationReason: 1 }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(verifyAppleRedemption(env(), 'a.b.c')).rejects.toThrow(/not an active subscription/);
+      const line = String(warn.mock.calls[0][0]);
+      expect(line).toContain('revokedAt=none');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('sanitizes an attacker-influenced rejection reason to a single log line', async () => {
+    verifyAppleSignedJws.mockRejectedValue(
+      new AppleJwsVerificationErrorRef('bad alg\nforged log line\u001b[31mred'),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(verifyAppleRedemption(env(), 'a.b.c')).rejects.toThrow(AppleRedeemError);
+      const line = String(warn.mock.calls[0][0]);
+      expect(line).not.toContain('\n');
+      expect(line).not.toContain('\u001b');
+      expect(line).toContain('apple redeem rejected: bad alg forged log line');
     } finally {
       warn.mockRestore();
     }
