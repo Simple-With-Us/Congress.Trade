@@ -224,4 +224,33 @@ describe('senate fetcher run heartbeat', () => {
     expect(health.level).toBe('warning');
     expect(health.detail).toContain('already stale');
   });
+
+  it('round-trips the first-seen ledger count and surfaces it in health', async () => {
+    const { env } = memEnv();
+    const now = new Date('2026-11-09T18:00:00.000Z');
+    await recordSenateFetcherRun(env, { ...runRecord('2026-11-09T17:50:00.000Z'), firstSeenCount: 7 });
+    const run = await readSenateFetcherRunStatus(env, now);
+    expect(run?.firstSeenCount).toBe(7);
+    const health = evaluateSenateFetcherHealth(run, now);
+    expect(health.firstSeenCount).toBe(7);
+    expect(health.detail).toContain('First-seen logger: 7 stamps so far');
+    expect(health.detail).toContain('waits for ~20');
+  });
+
+  it('treats a missing first-seen count as unreported, not zero', async () => {
+    const { env } = memEnv();
+    const now = new Date('2026-11-09T18:00:00.000Z');
+    await recordSenateFetcherRun(env, runRecord('2026-11-09T17:50:00.000Z'));
+    const run = await readSenateFetcherRunStatus(env, now);
+    const health = evaluateSenateFetcherHealth(run, now);
+    expect(health.firstSeenCount).toBeNull();
+    expect(health.detail).not.toContain('First-seen logger');
+    expect(evaluateSenateFetcherHealth(null, now).firstSeenCount).toBeNull();
+  });
+
+  it('rejects a run record with an invalid first-seen count', async () => {
+    const { env } = memEnv();
+    await recordSenateFetcherRun(env, { ...runRecord(new Date().toISOString()), firstSeenCount: -1 });
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
+  });
 });
