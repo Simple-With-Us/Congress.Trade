@@ -252,5 +252,7 @@ describe('senate fetcher run heartbeat', () => {
     const { env } = memEnv();
     await recordSenateFetcherRun(env, { ...runRecord(new Date().toISOString()), firstSeenCount: -1 });
     expect(await readSenateFetcherRunStatus(env)).toBeNull();
+    await recordSenateFetcherRun(env, { ...runRecord(new Date().toISOString()), firstSeenCount: 7.5 });
+    expect(await readSenateFetcherRunStatus(env)).toBeNull();
   });
 });
