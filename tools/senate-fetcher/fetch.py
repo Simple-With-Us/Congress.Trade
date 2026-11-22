@@ -574,6 +574,30 @@ def post_intake(payload):
     return body
 
 
+def first_seen_count():
+    """Size of the first-seen ledger, merged across both fetcher copies.
+
+    Reads the persisted state files exactly as write_first_seen_report
+    merges them — a URL stamped by both copies counts once — so the
+    number is derived from the logger's own ledger on every call and
+    can never drift from the stamps.  Returns None when no state file
+    is readable (the run report then simply omits the field).
+    """
+    homes = ["/Users/agents/efd-fetcher", os.path.expanduser("~/efd-fetcher")]
+    urls = set()
+    readable = False
+    for home in homes:
+        try:
+            with open(os.path.join(home, "state.json")) as f:
+                s = json.load(f)
+            readable = True
+        except Exception:
+            continue
+        for url in (s.get("first_seen") or {}):
+            urls.add(url)
+    return len(urls) if readable else None
+
+
 def report_run(status, rows, new_count):
     """POST one completed run's heartbeat to Congress.Trade (CT-2462).
 
@@ -590,6 +614,9 @@ def report_run(status, rows, new_count):
     role = "agents" if HOME.startswith("/Users/agents/") else "jay"
     payload = {"ranAt": now().isoformat(timespec="seconds"), "status": status,
                "rows": rows, "newCount": new_count, "role": role}
+    count = first_seen_count()
+    if count is not None:
+        payload["firstSeenCount"] = count
     try:
         with open(os.path.expanduser(INTAKE_TOKEN_FILE)) as f:
             token = f.read().strip()
