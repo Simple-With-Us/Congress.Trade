@@ -220,7 +220,7 @@ function isSenateFetcherRunRecord(raw: unknown): raw is SenateFetcherRunRecord {
     && typeof rec.rows === 'number'
     && typeof rec.newCount === 'number'
     && (rec.firstSeenCount === undefined
-      || (typeof rec.firstSeenCount === 'number' && Number.isFinite(rec.firstSeenCount) && rec.firstSeenCount >= 0))
+      || (typeof rec.firstSeenCount === 'number' && Number.isInteger(rec.firstSeenCount) && rec.firstSeenCount >= 0))
     && (rec.role === 'agents' || rec.role === 'jay');
 }
 
