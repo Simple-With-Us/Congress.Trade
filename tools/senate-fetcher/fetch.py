@@ -600,8 +600,13 @@ def first_seen_count():
             if not isinstance(ledger, dict):
                 continue
             for url, ts in ledger.items():
-                if url not in stamps or ts < stamps[url]:
-                    stamps[url] = ts
+                if not isinstance(ts, str):
+                    continue
+                try:
+                    if url not in stamps or ts < stamps[url]:
+                        stamps[url] = ts
+                except Exception:
+                    continue
         except Exception:
             continue
     if not readable:
