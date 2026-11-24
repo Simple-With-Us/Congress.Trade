@@ -95,7 +95,7 @@ Every run prints the plan it resolved:
 
 ### Fixed marketing version (Congress.Trade)
 
-An app with `fixedMarketingVersion` in `apps.json` (Congress.Trade: `1.1.2`)
+An app with `fixedMarketingVersion` in `apps.json` (Congress.Trade: `1.1.3`)
 does not count its marketing version up per ship. Its build is one shared
 merge-timestamp build across iOS and macOS (owner directive 2026-10-29):
 
