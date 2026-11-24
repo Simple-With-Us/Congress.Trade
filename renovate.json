@@ -5,7 +5,7 @@
   "minimumReleaseAge": "5 days",
   "constraints": {
     "npm": "<12",
-    "deno": "2.9.3"
+    "deno": "v2.9.8"
   },
   "packageRules": [
     {
