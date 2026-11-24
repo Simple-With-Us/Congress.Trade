@@ -1018,7 +1018,7 @@ DEFAULT_MARKETING="$(json_get "$APP_KEY" marketingVersionDefault)"
 # shared-build.mjs).  S is the committer date of HEAD in America/Chicago as
 # YYYYMMDDHHMM; M is the highest first numeric component among every build of
 # the app on iOS and macOS plus every extra floor.
-# apps.json keys: fixedMarketingVersion ("1.1.2"), optional pairedBundleId (the
+# apps.json keys: fixedMarketingVersion ("1.1.3"), optional pairedBundleId (the
 # paired app whose builds join the inventory: the Mac bundle id on an iOS
 # entry, the iOS bundle id on a macOS entry; macBundleId is an accepted alias),
 # optional pairedBuildFeed (a Sparkle appcast URL whose max <sparkle:version>

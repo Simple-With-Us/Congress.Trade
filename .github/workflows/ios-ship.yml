@@ -64,9 +64,9 @@ on:
   workflow_dispatch:
     inputs:
       marketing_version:
-        description: 'Exact marketing version to ship. Defaults to 1.1.2, the version pinned for Congress.Trade in scripts/ios-fleet/apps.json (fixedMarketingVersion); change it only to ship a replacement build in another existing train.'
+        description: 'Exact marketing version to ship. Defaults to 1.1.3, the version pinned for Congress.Trade in scripts/ios-fleet/apps.json (fixedMarketingVersion); change it only to ship a replacement build in another existing train.'
         required: false
-        default: '1.1.2'
+        default: '1.1.3'
   schedule:
     # Twice an hour, offset from Socratic.Trade's '*/30' so the shared Mac
     # runner is not asked to start three fleet ships on the same minute.
