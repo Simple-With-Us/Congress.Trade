@@ -21,7 +21,7 @@ name: iOS TestFlight ship (Mac runner)
 # project.
 #
 # WHY THERE IS A `schedule:` TRIGGER (2026-08-13)
-# ----------------------------------------------------------
+# ----------------------------------------------
 # `push:` alone is not a reliable trigger on this repo. A PR merged by
 # github-actions[bot] (auto-merge armed with GITHUB_TOKEN) lands on main under
 # GitHub's recursion guard and dispatches NOTHING. Measured: PR #1835
@@ -247,10 +247,10 @@ jobs:
             # credential itself crosses the step boundary in the environment
             # (as base64 below), never as a file path.
             if [[ "$name" == "ASC_KEY_ID" ]]; then
-              printf 'APPLEAPI_KEY_ID=%s\n' "$val"  >> "$GITHUB_ENV"
+              printf 'APPLE_API_KEY_ID=%s\n' "$val" >> "$GITHUB_ENV"
             fi
             if [[ "$name" == "ASC_ISSUER_ID" ]]; then
-              printf 'APPLEAPI_ISSUER_ID=%s\n' "$val"  >> "$GITHUB_ENV"
+              printf 'APPLE_API_ISSUER_ID=%s\n' "$val" >> "$GITHUB_ENV"
             fi
           done
           if [ -z "${SENTRY_DSN:-}" ]; then
@@ -280,19 +280,19 @@ jobs:
           # environment, because a path on disk is not an approved credential
           # source (AFC-459).
           key_b64="$(printf '%s' "$key_material" | base64 | tr -d '\n')"
-          printf '::add-mask::%s\n' "${key_b64//%%/%%25'}"
+          printf '::add-mask::%s\n' "${key_b64//'%'/'%25'}"
           printf 'APPLE_API_KEY_P8_BASE64=%s\n' "$key_b64" >> "$GITHUB_ENV"
 
           bash "$GITHUB_WORKSPACE/scripts/ios-appstore-gm-prepare.sh"
           unset key_material key_b64 TOKEN CLIENT_ID CLIENT_SECRET val secret_project secret_path IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD
 
       # ONE plan per release (owner 2026-10-29): the shared merge-timestamp
-      # build max(S, M + 1) is computed here, once, and handled to the ship
+      # build max(S, M + 1) is computed here, once, and handed to the ship
       # step below as --build. The ship script's own fixed-mode plan is the
       # same code path (the same node command with the same merge stamp), for
       # operators running locally without --build. The paired lookup mirrors
       # the ship script (pairedBundleId, then the macBundleId alias), so the
-      # one plan covers the same inventory. Runs onl when the gate
+      # one plan covers the same inventory. Runs only when the gate
       # says ship, so a gated tick plans nothing. Credentials are the ASC
       # trio the previous step loaded into the environment; they are never
       # echoed (only the planned build number is printed, which is not
@@ -302,7 +302,7 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         run: |
           set -euo pipefail
-          stamp="$(TZ=America/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%R%S HEAD)"
+          stamp="$(TZ=America/Chicago git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD)"
           if [[ ! "$stamp" =~ ^[1-9][0-9]{11}$ ]]; then
             echo "::error::merge stamp is not a 12-digit YYYYMMDDHHMM: ${stamp}"
             exit 1
@@ -310,7 +310,7 @@ jobs:
           registry="$GITHUB_WORKSPACE/scripts/ios-fleet/apps.json"
           bundle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"]["bundleId"])' "$registry")"
           paired="$(python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["apps"]["congress"]; print(e.get("pairedBundleId") or e.get("macBundleId") or "")' "$registry")"
-          feed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])))["apps"]["congress"].get("pairedBuildFeed") or "")' "$registry")"
+          feed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["apps"]["congress"].get("pairedBuildFeed") or "")' "$registry")"
           if [ -n "$feed" ]; then
             echo "::error::congress has a pairedBuildFeed floor that this plan step does not fetch; extend it before shipping."
             exit 1
@@ -430,7 +430,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          bundle="$(python3 -c 'import json; print(json.load(open("scripts/ios-fleet/apps.json")))["apps"]["congress"]["bundleId"]')"
+          bundle="$(python3 -c 'import json; print(json.load(open("scripts/ios-fleet/apps.json")))["apps"]["congress"]["bundleId]'))"
           build="${{ steps.buildnum.outputs.build_num }}"
           marketing="${{ steps.buildnum.outputs.marketing }}"
           args=("$bundle" "$build")
