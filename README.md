@@ -31,8 +31,8 @@ production path.  See `AGENTS.md` "Current Shape" and `app/DEPLOY.md`.
 | `app/docker-compose.yml` | Coolify compose project: `congress-app`, `sqlite-web`, `scan-cpu-worker`. |
 | `app/migrations/` | Local schema files.  Production schema is applied via `POST /api/admin/migrate`, not Wrangler D1. |
 | `app/docs/` | Runbooks for auth/billing, preview leftovers, and cross-app FMP data sharing. |
-| `app/scripts/` | Operational scripts.  Some target production, so read headers before running. || `congress-trade-feed-design.md` | Historical design context and product rationale. |
-| `congress_trade_watch.py` | Standalone local House PTR watcher prototype.  It is not the production ingest path. |
+| `app/scripts/` | Operational scripts.  Some target production, so read headers before running. |
+| `congress-trade-feed-design.md` | Historical design context and product rationale. |
 | `dashboard-design.html` | Historical/static UI design artifact.  Current UI lives in `app/src/ui/`. |
 | `AGENTS.md` | Collaboration rules for Codex, Claude, Cursor, Copilot, Antigravity, and other agents. |
 | `CLAUDE.md` | Claude entrypoint that points to the same rules. |
@@ -46,7 +46,7 @@ cd app
 npm ci
 npm run typecheck
 npm test
-npm run dev
+npm start
 ```
 
 Pushes to `main` are built by Coolify from `app/docker-compose.yml`.  The
