@@ -247,10 +247,10 @@ jobs:
             # credential itself crosses the step boundary in the environment
             # (as base64 below), never as a file path.
             if [[ "$name" == "ASC_KEY_ID" ]]; then
-              printf 'APPLE_API_KEY_ID=%s\n' "$val  >> "$GITHUB_ENV"
+              printf 'APPLE_API_KEY_ID=%s\n' "$val" >> "$GITHUB_ENV"
             fi
             if [[ "$name" == "ASC_ISSUER_ID" ]]; then
-              printf 'APPLE_API_ISSUER_ID=%s\n' "$val  >> "$GITHUB_ENV"
+              printf 'APPLE_API_ISSUER_ID=%s\n' "$val" >> "$GITHUB_ENV"
             fi
           done
           if [ -z "${SENTRY_DSN:-}" ]; then
