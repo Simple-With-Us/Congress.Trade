@@ -360,7 +360,8 @@ struct FeedDashboardView: View {
             .onPreferenceChange(TradesScrollOffsetKey.self) { offset in
                 // Two states only (at rest / scrolled), so the feed re-renders
                 // twice per scroll gesture, not on every point of movement.
-                let next: CGFloat = offset < -1 ? 1 : 0
+                // Separate on/off thresholds so it cannot flap at the boundary.
+                let next: CGFloat = tradesFadeAmount == 1 ? (offset < -0.5 ? 1 : 0) : (offset < -4 ? 1 : 0)
                 if next != tradesFadeAmount { tradesFadeAmount = next }
             }
             .mask(
