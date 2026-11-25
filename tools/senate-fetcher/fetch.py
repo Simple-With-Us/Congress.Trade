@@ -574,6 +574,49 @@ def post_intake(payload):
     return body
 
 
+def first_seen_count():
+    """Size of the first-seen ledger, merged across both fetcher copies.
+
+    Reads the persisted state files exactly as write_first_seen_report
+    merges them — a URL stamped by both copies counts once, the earliest
+    stamp wins, and a stamp whose timestamp does not parse is not
+    counted, matching the report's own total — so the number is derived
+    from the logger's own ledger on every call and can never drift from
+    the stamps.  Never raises: malformed state is skipped, and None is
+    returned when no state file is readable at all (the run report then
+    simply omits the field).
+    """
+    homes = ["/Users/agents/efd-fetcher", os.path.expanduser("~/efd-fetcher")]
+    stamps = {}
+    readable = False
+    for home in homes:
+        try:
+            with open(os.path.join(home, "state.json")) as f:
+                s = json.load(f)
+            readable = True
+            if not isinstance(s, dict):
+                continue
+            ledger = s.get("first_seen") or {}
+            if not isinstance(ledger, dict):
+                continue
+            for url, ts in ledger.items():
+                if not isinstance(ts, str):
+                    continue
+                # Only parseable stamps compete, so an unparseable stamp
+                # that sorts earlier cannot evict a valid one for the URL.
+                try:
+                    datetime.datetime.fromisoformat(ts)
+                except Exception:
+                    continue
+                if url not in stamps or ts < stamps[url]:
+                    stamps[url] = ts
+        except Exception:
+            continue
+    if not readable:
+        return None
+    return len(stamps)
+
+
 def report_run(status, rows, new_count):
     """POST one completed run's heartbeat to Congress.Trade (CT-2462).
 
@@ -590,6 +633,9 @@ def report_run(status, rows, new_count):
     role = "agents" if HOME.startswith("/Users/agents/") else "jay"
     payload = {"ranAt": now().isoformat(timespec="seconds"), "status": status,
                "rows": rows, "newCount": new_count, "role": role}
+    count = first_seen_count()
+    if count is not None:
+        payload["firstSeenCount"] = count
     try:
         with open(os.path.expanduser(INTAKE_TOKEN_FILE)) as f:
             token = f.read().strip()

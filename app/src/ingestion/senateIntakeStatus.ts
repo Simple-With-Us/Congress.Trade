@@ -182,6 +182,14 @@ export interface SenateFetcherRunRecord {
   rows: number;
   /** Rows that were new to the fetcher on this run. */
   newCount: number;
+  /**
+   * Size of the fetcher's persisted first-seen ledger (the 2026-11-02
+   * logger), merged across both fetcher copies as readable by the
+   * reporting copy.  Derived from the ledger itself on every run, never
+   * tallied separately, so it cannot drift from the stamps.  Absent on
+   * reports from fetcher builds that predate the field.
+   */
+  firstSeenCount?: number;
   /** Which Mac copy ran: the agents primary or Jay's standby. */
   role: SenateFetcherRole;
 }
@@ -211,6 +219,8 @@ function isSenateFetcherRunRecord(raw: unknown): raw is SenateFetcherRunRecord {
     && (rec.status === 'ok' || rec.status === 'blocked' || rec.status === 'error')
     && typeof rec.rows === 'number'
     && typeof rec.newCount === 'number'
+    && (rec.firstSeenCount === undefined
+      || (typeof rec.firstSeenCount === 'number' && Number.isInteger(rec.firstSeenCount) && rec.firstSeenCount >= 0))
     && (rec.role === 'agents' || rec.role === 'jay');
 }
 
@@ -235,6 +245,8 @@ export interface SenateFetcherHealth {
   detail: string;
   inWindow: boolean;
   seen: boolean;
+  /** The latest run record's first-seen ledger size, or null when unreported. */
+  firstSeenCount: number | null;
 }
 
 function fetcherAgePhrase(ageMs: number): string {
@@ -263,12 +275,17 @@ export function evaluateSenateFetcherHealth(
   now = new Date(),
 ): SenateFetcherHealth {
   const inWindow = senateIntakeInWindow(now);
+  const firstSeenCount = run && typeof run.firstSeenCount === 'number' ? run.firstSeenCount : null;
+  const stampNote = firstSeenCount == null
+    ? ''
+    : ` First-seen logger: ${firstSeenCount} stamps so far; the peak-window decision waits for ~20.`;
   if (!run) {
     if (inWindow) {
       return {
         level: 'warning',
         inWindow,
         seen: false,
+        firstSeenCount,
         detail: `Mac eFD fetcher has not reported a run.\u00A0 ${FETCHER_WINDOW_NOTE}\u00A0 No senate-fetcher:last-run record exists.`,
       };
     }
@@ -276,6 +293,7 @@ export function evaluateSenateFetcherHealth(
       level: 'ok',
       inWindow,
       seen: false,
+      firstSeenCount,
       detail: `Mac eFD fetcher has not reported a run.\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.`,
     };
   }
@@ -285,20 +303,22 @@ export function evaluateSenateFetcherHealth(
     const detail = inWindow
       ? `Mac eFD fetcher run heartbeat is stale (last report ${age}, ${run.status}, ${who}).\u00A0 ${FETCHER_WINDOW_NOTE}`
       : `Mac eFD fetcher run heartbeat was already stale when the 10:00 PM CT window closed (last report ${age}, ${run.status}, ${who}).\u00A0 It stays a warning overnight.`;
-    return { level: 'warning', inWindow, seen: true, detail };
+    return { level: 'warning', inWindow, seen: true, firstSeenCount, detail: detail + stampNote };
   }
   if (!inWindow) {
     return {
       level: 'ok',
       inWindow,
       seen: true,
-      detail: `Mac eFD fetcher last reported ${run.status} ${age} (${who}, ${run.newCount} new rows).\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.`,
+      firstSeenCount,
+      detail: `Mac eFD fetcher last reported ${run.status} ${age} (${who}, ${run.newCount} new rows).\u00A0 Quiet outside the 6:00 AM to 10:00 PM CT fetcher window.${stampNote}`,
     };
   }
   return {
     level: 'ok',
     inWindow,
     seen: true,
-    detail: `Mac eFD fetcher reported ${run.status} ${age} (${who}, ${run.newCount} new rows).\u00A0 A quiet day with no new filings is not a missed run.`,
+    firstSeenCount,
+    detail: `Mac eFD fetcher reported ${run.status} ${age} (${who}, ${run.newCount} new rows).\u00A0 A quiet day with no new filings is not a missed run.${stampNote}`,
   };
 }
