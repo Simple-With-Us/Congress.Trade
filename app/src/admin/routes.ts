@@ -3010,6 +3010,10 @@ export const SenateFetcherRunBodySchema = z.object({
   status: z.enum(['ok', 'blocked', 'error']),
   rows: z.number().int().min(0).max(100_000),
   newCount: z.number().int().min(0).max(100_000),
+  // Optional first-seen ledger size reported by fetcher builds that
+  // derive it from their persisted state (CT-2462 follow-up).  Absent
+  // on reports from older builds; never fabricated here.
+  firstSeenCount: z.number().int().min(0).optional(),
   role: z.enum(['agents', 'jay']),
 });
 export type SenateFetcherRunBody = z.infer<typeof SenateFetcherRunBodySchema>;
@@ -7060,7 +7064,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
   // fetcher-run line.  Auth: full admin, or the scoped SENATE_INTAKE_TOKEN
   // (the same single caller as the intake).  Records only; ingests nothing.
   // Body: { ranAt?: string, status: 'ok'|'blocked'|'error', rows: number,
-  //         newCount: number, role: 'agents'|'jay' }
+  //         newCount: number, firstSeenCount?: number, role: 'agents'|'jay' }
   r.post('/senate-fetcher-run', async (c) => {
     let raw = '';
     try {
@@ -7091,6 +7095,7 @@ export function buildAdminRouter(): Hono<{ Bindings: Env }> {
       status: body.status,
       rows: body.rows,
       newCount: body.newCount,
+      ...(body.firstSeenCount === undefined ? {} : { firstSeenCount: body.firstSeenCount }),
       role: body.role,
     });
     return c.json({ ok: true });
