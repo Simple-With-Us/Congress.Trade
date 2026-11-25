@@ -61,10 +61,10 @@ const geminiRateLimiter = new RateLimiter();
  * Gemini model id. Centralized + documented so it is trivial to bump.
  * NOTE: Flash model ids rotate; if calls start 404-ing, update this to the
  * current Flash generation — the request/response contract below is unchanged
- * across Flash generations. Current as of 2026-09: 'gemini-3.8-flash'.
+ * across Flash generations. Current as of 2026-11: 'gemini-4-hydrogen'.
  * Override via env var VISION_PRIMARY_MODEL.
  */
-const DEFAULT_MODEL = 'gemini-3.8-flash';
+const DEFAULT_MODEL = 'gemini-4-hydrogen';
 
 
 
