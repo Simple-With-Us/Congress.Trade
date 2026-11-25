@@ -757,14 +757,15 @@ struct TrendsView: View {
 
             VStack(spacing: 0) {
                 ForEach(Array(store.conflicts.prefix(8).enumerated()), id: \.element.id) { idx, c in
+                    let photo = conflictPhotoUrl(c)
                     Button {
                         // The route sends no photo for conflict rows; the sheet
                         // resolves one from the roster it already has.
-                        selectedPolitician = MemberSheetTarget(id: c.memberTargetId, name: c.displayName, photoUrl: conflictPhotoUrl(c))
+                        selectedPolitician = MemberSheetTarget(id: c.memberTargetId, name: c.displayName, photoUrl: photo)
                     } label: {
                         HStack(spacing: 10) {
                             MemberAvatar(
-                                photoURL: MemberPhotoURL.resolve(conflictPhotoUrl(c)),
+                                photoURL: MemberPhotoURL.resolve(photo),
                                 name: c.memberName ?? "",
                                 size: 28
                             )

@@ -222,6 +222,8 @@ struct FeedDashboardView: View {
         store.tradeCountSummary(visibleCount: shown, localSearchText: searchText).label
     }
 
+    @State private var tradesFadeAmount: CGFloat = 0
+
     var body: some View {
         // CT-2459: memoized snapshot, recomputed by the `.task(id:)` below
         // only when an actual filter/sort/cache input changes — not on
@@ -268,6 +270,16 @@ struct FeedDashboardView: View {
 
             ScrollView {
                 VStack(spacing: 8) {
+                    Color.clear
+                        .frame(height: 0)
+                        .background(
+                            GeometryReader { g in
+                                Color.clear.preference(
+                                    key: TradesScrollOffsetKey.self,
+                                    value: g.frame(in: .named("tradesScroll")).minY
+                                )
+                            }
+                        )
                     if trades.isEmpty && !store.isRefreshing {
                         ContentUnavailableView {
                             Label(
@@ -342,11 +354,22 @@ struct FeedDashboardView: View {
             .scrollDismissesKeyboard(.interactively)
             // Rows dissolve over the top 0.2 inch (about 32 pt) instead of
             // being cut off hard under the filter strip.
+            // The fade only shows once rows have scrolled under the strip; at
+            // rest the first card stays fully visible.
+            .coordinateSpace(name: "tradesScroll")
+            .onPreferenceChange(TradesScrollOffsetKey.self) { offset in
+                tradesFadeAmount = min(1, max(0, -offset / 16))
+            }
             .mask(
                 VStack(spacing: 0) {
-                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 32)
-                    Rectangle().fill(Color.black)
+                    LinearGradient(
+                        colors: [Color.black.opacity(1 - tradesFadeAmount), .black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                    Rectangle().fill(Color.black).frame(maxWidth: .infinity)
                 }
             )
             }
@@ -1770,4 +1793,10 @@ extension AppTheme {
                 : UIColor(red: 0.992, green: 0.980, blue: 0.953, alpha: 1.0)
         })
     }
+}
+
+/// Scroll offset of the Trades list content, in the "tradesScroll" space.
+private struct TradesScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
