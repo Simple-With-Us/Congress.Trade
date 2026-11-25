@@ -69,7 +69,7 @@ import { IngestRetryError } from '../ingestion/fetcher.ts';
  */
 export const OPENROUTER_GEMINI_FLASH = '~google/gemini-flash-latest';
 /** Pinned 3.7 batch/offline slug (the latest alias has no `:batch` variant). */
-export const OPENROUTER_GEMINI_FLASH_BATCH = 'google/gemini-3.8-flash:batch';
+export const OPENROUTER_GEMINI_FLASH_BATCH = 'google/gemini-4-hydrogen:batch';
 const DEFAULT_MODEL = OPENROUTER_GEMINI_FLASH;
 
 function isOpenRouterGeminiFlashLatest(model: string): boolean {
@@ -150,7 +150,7 @@ export function supportsNativeVision(model: string): boolean {
   // claude-3/4/5 substring test missed every current slug and fell back to a
   // paid mistral-ocr parse for models that read PDFs natively.
   if (/claude-(?:\d|sonnet|haiku|opus)/.test(m)) return true;
-  if (m.includes('gemini-1.5') || m.includes('gemini-2') || m.includes('gemini-3')) return true;
+  if (m.includes('gemini-1.5') || m.includes('gemini-2') || m.includes('gemini-3') || m.includes('gemini-4-hydrogen')) return true;
   // `~google/gemini-flash-latest` has file modality (verified 2026-08-21) but
   // does not contain `gemini-3`, so the generation test above misses it.
   if (/gemini-flash-latest/.test(m)) return true;
