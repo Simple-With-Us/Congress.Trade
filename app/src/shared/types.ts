@@ -608,7 +608,7 @@ export interface Env {
   /** Vision/text LLM key (e.g. Gemini) for scanned-PDF extraction. */
   GEMINI_API_KEY?: string;
   GEMINI_RPM_LIMIT?: string;
-  /** Primary vision model override (defaults to 'gemini-3.8-flash'). */
+  /** Primary vision model override (defaults to 'gemini-4-hydrogen'). */
   VISION_PRIMARY_MODEL?: string;
   /** Secondary arbitration extractor key. Presence enables arbitration. */
   ARBITRATION_API_KEY?: string;
