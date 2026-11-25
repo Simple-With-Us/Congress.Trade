@@ -124,10 +124,10 @@ export const DEFAULT_CANDIDATES: BakeoffCandidate[] = [
   { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash' },
   { provider: 'openrouter', model: 'qwen/qwen3-vl-30b-a3b-instruct' },
   { provider: 'openrouter', model: 'qwen/qwen3-vl-8b-instruct' },
-  { provider: 'openrouter', model: 'google/gemini-4-h  // Flash Lite stays offered (owner, 2026-11-25): it is its own lite class and far cheaper;
+  { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
+  // Flash Lite stays offered (owner, 2026-11-25): it is its own lite class and far cheaper;
   // the Gemini elemental sweep does not remove it. Option only — not a default.
   { provider: 'openrouter', model: 'google/gemini-3.5-flash-lite' },
-ydrogen' },
   { provider: 'openrouter', model: 'amazon/nova-lite-v1' },
   { provider: 'openrouter', model: 'z-ai/glm-4.6v' },
   { provider: 'openrouter', model: '~google/gemini-flash-latest' },
