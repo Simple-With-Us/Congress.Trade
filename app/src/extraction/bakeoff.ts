@@ -127,7 +127,6 @@ export const DEFAULT_CANDIDATES: BakeoffCandidate[] = [
   { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
   { provider: 'openrouter', model: 'amazon/nova-lite-v1' },
   { provider: 'openrouter', model: 'z-ai/glm-4.6v' },
-  { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
   { provider: 'openrouter', model: '~google/gemini-flash-latest' },
   { provider: 'openrouter', model: 'qwen/qwen-2.5-72b-instruct' },
 ];
