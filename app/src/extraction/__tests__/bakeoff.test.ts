@@ -620,7 +620,7 @@ describe('runCandidateOnDoc (openai): token usage capture', () => {
       'z-ai/glm-4.6v',
       '~google/gemini-flash-latest',
       'qwen/qwen-2.5-72b-instruct',
-    ]);   ]);
+    ]);
 
     // Slugs confirmed absent from the live OpenRouter models API must never
     // reappear — every benchmark cell for a dead slug can only fail.
