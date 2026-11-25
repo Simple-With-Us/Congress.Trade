@@ -358,7 +358,10 @@ struct FeedDashboardView: View {
             // rest the first card stays fully visible.
             .coordinateSpace(name: "tradesScroll")
             .onPreferenceChange(TradesScrollOffsetKey.self) { offset in
-                tradesFadeAmount = min(1, max(0, -offset / 16))
+                // Two states only (at rest / scrolled), so the feed re-renders
+                // twice per scroll gesture, not on every point of movement.
+                let next: CGFloat = offset < -1 ? 1 : 0
+                if next != tradesFadeAmount { tradesFadeAmount = next }
             }
             .mask(
                 VStack(spacing: 0) {
