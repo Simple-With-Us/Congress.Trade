@@ -79,7 +79,7 @@ function isOpenRouterGeminiFlashLatest(model: string): boolean {
 
 function isOpenRouterGemini37Flash(model: string): boolean {
   const base = model.trim().replace(/:batch$/i, '').replace(/^~/, '').toLowerCase();
-  return base === 'google/gemini-3.8-flash' || base === 'gemini-3.8-flash';
+  return base === 'google/gemini-3.8-flash' || base === 'gemini-3.8-flash' || base === 'google/gemini-4-hydrogen' || base === 'gemini-4-hydrogen';
 }
 
 /**
