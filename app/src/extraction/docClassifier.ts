@@ -174,11 +174,11 @@ export async function resolveDocClassifierKnobs(env: Env): Promise<DocClassifier
     ])) as DocClassifierSecretEnv;
   } catch {
     // Resolver outage: deterministic tier still works; model tier disabled.
-    return { enabled: false, model: 'google/gemini-3.5-flash-lite', parseEngine: 'cloudflare-ai' };
+    return { enabled: false, model: 'google/gemini-4-hydrogen', parseEngine: 'cloudflare-ai' };
   }
   return {
     enabled: secrets.DOC_CLASSIFIER_ENABLED !== 'false',
-    model: secrets.DOC_CLASSIFIER_MODEL || 'google/gemini-3.5-flash-lite',
+    model: secrets.DOC_CLASSIFIER_MODEL || 'google/gemini-4-hydrogen',
     parseEngine: secrets.DOC_CLASSIFIER_PARSE_ENGINE || 'cloudflare-ai',
   };
 }
