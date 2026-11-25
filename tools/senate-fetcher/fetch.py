@@ -602,23 +602,19 @@ def first_seen_count():
             for url, ts in ledger.items():
                 if not isinstance(ts, str):
                     continue
+                # Only parseable stamps compete, so an unparseable stamp
+                # that sorts earlier cannot evict a valid one for the URL.
                 try:
-                    if url not in stamps or ts < stamps[url]:
-                        stamps[url] = ts
+                    datetime.datetime.fromisoformat(ts)
                 except Exception:
                     continue
+                if url not in stamps or ts < stamps[url]:
+                    stamps[url] = ts
         except Exception:
             continue
     if not readable:
         return None
-    count = 0
-    for ts in stamps.values():
-        try:
-            datetime.datetime.fromisoformat(ts)
-            count += 1
-        except Exception:
-            continue
-    return count
+    return len(stamps)
 
 
 def report_run(status, rows, new_count):
