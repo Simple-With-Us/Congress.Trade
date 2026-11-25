@@ -601,26 +601,26 @@ describe('runCandidateOnDoc (openai): token usage capture', () => {
   it('lists only OpenRouter slugs verified live against the models API', () => {
     const openRouterModels = DEFAULT_CANDIDATES
       .filter((entry) => entry.provider === 'openrouter')
-      .map((entry) => entry.model);
-    expect(openRouterModels).toEqual([
+      .map((entry) => entry.mo    expect(openRouterModels).toEqual([
       'mistral/mistral-ocr-latest',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
-      'anthropic/claude-sonnet-5',
+      'anthropic/claude-sonnet-5-5',
       'anthropic/claude-haiku-4.5',
-      'anthropic/claude-opus-5',
-      'x-ai/grok-4.6',
+      'anthropic/claude-opus-5-5',
+      'x-ai/grok-4.7',
       'deepseek/deepseek-v4-pro',
       'deepseek/deepseek-v4-flash',
       'qwen/qwen3-vl-30b-a3b-instruct',
       'qwen/qwen3-vl-8b-instruct',
+      'google/gemini-4-hydrogen',
+      // Flash Lite stays offered (owner, 2026-11-25): its own lite class, far cheaper.
       'google/gemini-3.5-flash-lite',
       'amazon/nova-lite-v1',
       'z-ai/glm-4.6v',
-      'google/gemini-3.8-flash',
       '~google/gemini-flash-latest',
       'qwen/qwen-2.5-72b-instruct',
-    ]);
+    ]);   ]);
 
     // Slugs confirmed absent from the live OpenRouter models API must never
     // reappear — every benchmark cell for a dead slug can only fail.
