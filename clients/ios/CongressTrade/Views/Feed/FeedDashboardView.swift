@@ -222,6 +222,8 @@ struct FeedDashboardView: View {
         store.tradeCountSummary(visibleCount: shown, localSearchText: searchText).label
     }
 
+    @State private var tradesFadeAmount: CGFloat = 0
+
     var body: some View {
         // CT-2459: memoized snapshot, recomputed by the `.task(id:)` below
         // only when an actual filter/sort/cache input changes — not on
@@ -259,11 +261,25 @@ struct FeedDashboardView: View {
                             // keyboard on every keystroke.
                             if case .reload = status { searchFocused = false }
                         }
+                        // Paging lives in the pinned header, not the scrolling list.
+                        if !trades.isEmpty {
+                            FeedPaginationBar(showSort: true)
+                        }
                     }
                 }
 
             ScrollView {
                 VStack(spacing: 8) {
+                    Color.clear
+                        .frame(height: 0)
+                        .background(
+                            GeometryReader { g in
+                                Color.clear.preference(
+                                    key: TradesScrollOffsetKey.self,
+                                    value: g.frame(in: .named("tradesScroll")).minY
+                                )
+                            }
+                        )
                     if trades.isEmpty && !store.isRefreshing {
                         ContentUnavailableView {
                             Label(
@@ -282,14 +298,6 @@ struct FeedDashboardView: View {
                                 .clipShape(Capsule())
                         }
                         .padding(.top, 40)
-                    }
-
-                    // Same component top and bottom, over the same store — one
-                    // paging code path, so the two bars can never disagree
-                    // (owner: the pagination controls were "way at bottom and
-                    // missing from top of the list of trades").
-                    if !trades.isEmpty {
-                        FeedPaginationBar(showSort: true)
                     }
 
                     if horizontalSizeClass == .regular {
@@ -336,10 +344,6 @@ struct FeedDashboardView: View {
                         }
                     }
 
-                    if !trades.isEmpty {
-                        FeedPaginationBar()
-                    }
-
                     AppLegalFooter()
                         .padding(.top, 8)
                 }
@@ -348,8 +352,32 @@ struct FeedDashboardView: View {
                 .padding(.bottom, 24)
             }
             .scrollDismissesKeyboard(.interactively)
+            // Rows dissolve over the top 0.2 inch (about 32 pt) instead of
+            // being cut off hard under the filter strip.
+            // The fade only shows once rows have scrolled under the strip; at
+            // rest the first card stays fully visible.
+            .coordinateSpace(name: "tradesScroll")
+            .onPreferenceChange(TradesScrollOffsetKey.self) { offset in
+                // Two states only (at rest / scrolled), so the feed re-renders
+                // twice per scroll gesture, not on every point of movement.
+                // Separate on/off thresholds so it cannot flap at the boundary.
+                let next: CGFloat = tradesFadeAmount == 1 ? (offset < -0.5 ? 1 : 0) : (offset < -4 ? 1 : 0)
+                if next != tradesFadeAmount { tradesFadeAmount = next }
             }
-            .background(AppTheme.background)
+            .mask(
+                VStack(spacing: 0) {
+                    LinearGradient(
+                        colors: [Color.black.opacity(1 - tradesFadeAmount), .black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                    Rectangle().fill(Color.black).frame(maxWidth: .infinity)
+                }
+            )
+            }
+            .background(AppTheme.headerChrome)
             .navigationBarTitleDisplayMode(.inline)
             .ctSolidFeedHeader()
             .toolbar {
@@ -1656,12 +1684,12 @@ struct TradeCard: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(AppTheme.tradeCard, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(AppTheme.borderColor.opacity(0.55), lineWidth: 1)
+                .stroke(AppTheme.borderColor.opacity(0.45), lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+        .shadow(color: .black.opacity(0.06), radius: 6, y: 2)
         // Whole-card affordance for everything that is not one of the two
         // sub-destinations: the amount, the date, the badge, the padding.
         //
@@ -1757,4 +1785,22 @@ struct TradeCard: View {
         default: return String(raw.prefix(1)).uppercased()
         }
     }
+}
+
+extension AppTheme {
+    /// Trade rows on the Trades tab: a touch warmer and creamier than the
+    /// white page so each card reads as a card without a blue wash.
+    static var tradeCard: Color {
+        Color(uiColor: UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0.098, green: 0.137, blue: 0.227, alpha: 1.0)
+                : UIColor(red: 0.992, green: 0.980, blue: 0.953, alpha: 1.0)
+        })
+    }
+}
+
+/// Scroll offset of the Trades list content, in the "tradesScroll" space.
+private struct TradesScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
