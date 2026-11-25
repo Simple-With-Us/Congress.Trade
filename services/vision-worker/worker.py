@@ -39,7 +39,7 @@ Env:
   OPENROUTER_MODEL         (default x-ai/grok-4.5) — last cascade step
   OPENROUTER_CASCADE_MODELS  comma list tried AFTER a missed Grok CLI solo
                            pass, before OPENROUTER_MODEL. Default:
-                           qwen/qwen3-vl-8b-instruct,qwen/qwen3-vl-30b-a3b-instruct,google/gemini-3.7-flash
+                           qwen/qwen3-vl-8b-instruct,qwen/qwen3-vl-30b-a3b-instruct,google/gemini-4-hydrogen
   OPENROUTER_CASCADE_MAX_PAGES  cap images sent to VL models (default 8).
                            A hit that did not see every PDF page is not
                            terminal — cascade continues to Gemini/Grok.
@@ -149,7 +149,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-4.6")
 DEFAULT_CASCADE_MODELS = (
     "qwen/qwen3-vl-8b-instruct,"
     "qwen/qwen3-vl-30b-a3b-instruct,"
-    "google/gemini-3.8-flash"
+    "google/gemini-4-hydrogen"
 )
 OPENROUTER_CASCADE_MODELS = os.getenv("OPENROUTER_CASCADE_MODELS", DEFAULT_CASCADE_MODELS)
 OPENROUTER_CASCADE_MAX_PAGES = max(1, int(os.getenv("OPENROUTER_CASCADE_MAX_PAGES", "8")))
