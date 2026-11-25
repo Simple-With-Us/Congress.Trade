@@ -738,6 +738,16 @@ struct TrendsView: View {
         }
     }
 
+    /// The conflicts route sends no photo, so look the member up in the
+    /// people directory by filer id (or, failing that, by exact name).
+    private func conflictPhotoUrl(_ c: ConflictCandidateItem) -> String? {
+        if let id = c.filerId, let m = store.members.first(where: { $0.filerId == id }), let url = m.photoUrl {
+            return url
+        }
+        guard let name = c.memberName?.lowercased() else { return nil }
+        return store.members.first(where: { $0.fullName?.lowercased() == name })?.photoUrl
+    }
+
     private var conflictsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             trendsHeading("Committee Sector Conflicts")
@@ -750,11 +760,11 @@ struct TrendsView: View {
                     Button {
                         // The route sends no photo for conflict rows; the sheet
                         // resolves one from the roster it already has.
-                        selectedPolitician = MemberSheetTarget(id: c.memberTargetId, name: c.displayName, photoUrl: nil)
+                        selectedPolitician = MemberSheetTarget(id: c.memberTargetId, name: c.displayName, photoUrl: conflictPhotoUrl(c))
                     } label: {
                         HStack(spacing: 10) {
                             MemberAvatar(
-                                photoURL: nil,
+                                photoURL: MemberPhotoURL.resolve(conflictPhotoUrl(c)),
                                 name: c.memberName ?? "",
                                 size: 28
                             )
@@ -794,6 +804,7 @@ struct TrendsView: View {
             .padding(.horizontal, 12)
             .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 12))
         }
+        .task { await store.loadMembersDirectory() }
     }
 
     private func timelinessSection(lag: FilingLagResponse) -> some View {
