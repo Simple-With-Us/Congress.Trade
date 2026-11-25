@@ -601,7 +601,8 @@ describe('runCandidateOnDoc (openai): token usage capture', () => {
   it('lists only OpenRouter slugs verified live against the models API', () => {
     const openRouterModels = DEFAULT_CANDIDATES
       .filter((entry) => entry.provider === 'openrouter')
-      .map((entry) => entry.mo    expect(openRouterModels).toEqual([
+      .map((entry) => entry.model);
+    expect(openRouterModels).toEqual([
       'mistral/mistral-ocr-latest',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
