@@ -34,8 +34,8 @@ Kimi CLI was retired (hard provider billing 403). Do not reintroduce it.
 | `GROK_CLI_REASONING_EFFORT` | `medium` | Do not inherit TUI `xhigh` |
 | `GROK_CWD` | `<script>/grok-cwd` | Isolated cwd so `grok -p` does not load `AGENTS.md` |
 | `OPENROUTER_API_KEY` | — | Required for openrouter / auto fallback |
-| `OPENROUTER_MODEL` | `x-ai/grok-4.6` | Last cascade step (native PDF) |
-| `OPENROUTER_CASCADE_MODELS` | `qwen/qwen3-vl-8b-instruct,qwen/qwen3-vl-30b-a3b-instruct,google/gemini-3.8-flash` | Tried after a missed Grok CLI solo pass, before `OPENROUTER_MODEL`. Qwen VL slugs receive raster pages. |
+| `OPENROUTER_MODEL` | `x-ai/grok-4.7` | Last cascade step (native PDF) |
+| `OPENROUTER_CASCADE_MODELS` | `qwen/qwen3-vl-8b-instruct,qwen/qwen3-vl-30b-a3b-instruct,google/gemini-4-hydrogen` | Tried after a missed Grok CLI solo pass, before `OPENROUTER_MODEL`. Qwen VL slugs receive raster pages. |
 | `OPENROUTER_CASCADE_MAX_PAGES` | `8` | Cap images sent to VL models |
 | `CONGRESS_TRADE_API_URL` | `http://localhost:8787` | Use `https://congress.trade` in launchd |
 | `ADMIN_TOKEN` | — | `CT_ADMIN_TOKEN` from Infisical (`fleet-secrets get CT_ADMIN_TOKEN`) |
