@@ -1414,7 +1414,7 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
     const q = c.req.query();
     const f = commonFromQuery(q);
     const limit = Math.max(1, Math.min(500, Math.floor(Number(q.limit) || 100)));
-    const key = cacheKey('conflicts', { ...f, limit });
+    const key = cacheKey('conflicts-v2', { ...f, limit });
     const data = await cached(c.env, key, 900, async () => {
       // CT-2459: page candidates instead of always fetching the full
       // 2000-row window and JS-filtering — when conflicts are dense in the
@@ -1441,6 +1441,7 @@ export function buildAnalyticsRouter(): Hono<{ Bindings: Env }> {
           memberName: filerName(row.full_name),
           chamber: str(row.chamber),
           partyBucket: asPartyBucket(row.party) ?? null,
+          photoUrl: str(row.photo_url),
           viaCommittees: m.viaCommittees,
           estAmountUsd: usd(bracketMidpoint(num(row.amount_min) || null, num(row.amount_max) || null)),
         });

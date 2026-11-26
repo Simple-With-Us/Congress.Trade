@@ -7325,7 +7325,7 @@ describe('Committee Sector Conflicts table (owner 2026-09-08)', () => {
 
   it('opens the politician drawer from any cell except the ticker, which keeps its company link', () => {
     expect(DASHBOARD_SOURCE).toContain("var rowMember = r.filerId ? ' data-member=\"' + esc(r.filerId) + '\"' : '';");
-    expect(DASHBOARD_SOURCE).toContain("return '<tr class=\"row conflict-row\">' +\n        '<td' + rowMember + '><div' + memberAttr + ' title=\"' + esc(name) + '\"><span class=\"name-line\">' + esc(name) + '</span></div></td>' +\n        committeeCellHtml(r.viaCommittees, rowMember) +");
+    expect(DASHBOARD_SOURCE).toContain(`return '<tr class="row conflict-row">' +\n        '<td' + rowMember + '><div' + memberAttr + ' title="' + esc(name) + '">' +\n          memberAvatarHtml(name, r.photoUrl, r.partyBucket, true) +\n          '<span class="name-line">' + esc(name) + '</span></div></td>' +\n        committeeCellHtml(r.viaCommittees, rowMember) +`);
     expect(DASHBOARD_SOURCE).toContain("'<td class=\"muted sector\"' + rowMember + ' title=\"' + esc(r.sector || '') + '\">' + esc(r.sector || '—') + '</td>' +");
     // Asset cell: no data-member, so [data-asset] resolves for the ticker.
     expect(DASHBOARD_SOURCE).toContain("'<td>' + (r.ticker\n          ? '<span class=\"clickable\" data-asset=\"' + esc(r.ticker) + '\">' + esc(asset) + '</span>'");

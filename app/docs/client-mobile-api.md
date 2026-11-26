@@ -577,16 +577,12 @@ were verified live on 2026-08-11 and pinned by
 - **`GET /api/analytics/conflicts`** (+ `window`, `limit`, max 500, default
   100) — Committee Sector Conflicts. `{ count, conflicts[] }`, each `{ id,
   ticker, sector, txType, txDate, filerId, memberName, chamber, partyBucket,
-  viaCommittees[], estAmountUsd }`. The route applies the curated
+  photoUrl, viaCommittees[], estAmountUsd }`. The route applies the curated
   committee→sector map (`app/src/analytics/conflicts.ts`) in the handler, so
   only genuine conflicts are published, and `limit` bounds the *published*
   count.
-  - **Gap:** this envelope has **no `photoUrl`**, unlike every other
-    member-bearing list the phone renders (feed rows, `/api/members`, and the
-    company drawer's top buyers/sellers all carry one). Adding it needs
-    `fl.photo_url` in `buildConflictCandidatesQuery`
-    (`app/src/analytics/builders.ts`) plus a passthrough in the route. Until
-    then a conflicts list must render monograms, not avatars.
+  - `photoUrl` is the same nullable filer portrait used in the member lists.
+    Show initials when it is null, missing, or cannot be loaded.
 - `GET /api/members` (public roster, origin-level — not `/api/client/v1/*`,
   same pattern as `/api/transactions`, `auth/*`, and the logo proxy that
   `APIClient.swift` already calls at `originURL`) returns
