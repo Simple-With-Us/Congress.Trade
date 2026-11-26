@@ -149,7 +149,7 @@ describe('benchmark lineup settings', () => {
     const lineup = validateBenchmarkLineup({
       a: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
       b: { provider: 'openrouter', model: 'openai/gpt-5.6-luna' },
-      c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
+      c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5-5' },
     });
     expect(lineup.a.model).toBe('openai/gpt-5.6-terra');
     expect(lineup.b.model).toBe('openai/gpt-5.6-luna');
