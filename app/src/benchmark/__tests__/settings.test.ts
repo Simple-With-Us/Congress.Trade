@@ -129,7 +129,7 @@ describe('benchmark lineup settings', () => {
     expect(settings.lineup).toEqual({
       a: { provider: 'mistral', model: 'mistral-ocr-latest' },
       b: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-      c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
+      c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5-5' },
     });
     expect(settings.valid).toBe(true);
     expect(settings.version).toMatch(/^[a-f0-9]{64}$/);
