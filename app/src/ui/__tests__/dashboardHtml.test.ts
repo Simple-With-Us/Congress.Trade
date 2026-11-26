@@ -1410,7 +1410,7 @@ describe('DASHBOARD_HTML', () => {
     expect(keys).toContain('openrouter:openai/gpt-5.6-terra');
     expect(keys).toContain('openrouter:deepseek/deepseek-v4-pro');
     expect(keys).toContain('openrouter:deepseek/deepseek-v4-flash');
-    expect(keys).toContain('openrouter:google/gemini-3.8-flash');
+    expect(keys).toContain('openrouter:google/gemini-4-hydrogen');
     expect(keys).toContain('openrouter:~google/gemini-flash-latest');
     expect(keys).toContain('openrouter:anthropic/claude-opus-5');
     expect(keys).toContain('llamaparse:fast');
