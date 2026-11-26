@@ -53,7 +53,7 @@ describe('benchmarkModelCatalog vs benchmarkSelectableCatalog', () => {
 const OLD = {
   a: 'mistral:mistral-ocr-latest',
   b: 'openrouter:openai/gpt-5.6-terra',
-  c: 'openrouter:anthropic/claude-sonnet-5',
+  c: 'openrouter:anthropic/claude-sonnet-5-5',
 };
 
 const NEW = {
