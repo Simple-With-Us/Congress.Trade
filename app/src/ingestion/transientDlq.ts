@@ -431,7 +431,10 @@ export async function requeueTransientFailedDurableJobs(
         continue;
       }
       if (candidate.dedupeKey) {
-        if (seenDedupe.has(candidate.dedupeKey)) continue;
+        if (seenDedupe.has(candidate.dedupeKey)) {
+          skippedCapped += 1;
+          continue;
+        }
         seenDedupe.add(candidate.dedupeKey);
       }
       slowChosen.push({ id: candidate.id });
