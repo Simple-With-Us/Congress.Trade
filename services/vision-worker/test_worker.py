@@ -65,7 +65,7 @@ class CascadeHelpersTest(unittest.TestCase):
     def test_cascade_env_override_dedupes_and_appends_grok(self):
         previous = worker.OPENROUTER_CASCADE_MODELS
         try:
-            worker.OPENROUTER_CASCADE_MODELS = "qwen/qwen3-vl-8b-instruct, x-ai/grok-4.6, qwen/qwen3-vl-8b-instruct"
+            worker.OPENROUTER_CASCADE_MODELS = "qwen/qwen3-vl-8b-instruct, x-ai/grok-4.7, qwen/qwen3-vl-8b-instruct"
             models = worker.cascade_model_list()
             self.assertEqual(models, ["qwen/qwen3-vl-8b-instruct", "x-ai/grok-4.7"])
         finally:
