@@ -135,7 +135,7 @@ export const STANDARD_BENCHMARK_RATE_CARD = [
   },
   {
     provider: 'openrouter',
-    models: ['anthropic/claude-sonnet-5', 'anthropic/claude-sonnet-5-5'],
+    models: ['anthropic/claude-sonnet-5'],
     meter: 'tokens',
     inputUsdPerMillion: 2,
     cachedInputUsdPerMillion: 2, // OpenRouter cache discounts vary, using base for benchmark
