@@ -59,7 +59,7 @@ const OLD = {
 const NEW = {
   a: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
   b: { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
-  c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
+  c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5-5' },
 };
 
 const OLD_ROLES = {
