@@ -51,7 +51,7 @@ class CascadeHelpersTest(unittest.TestCase):
         previous_model = worker.OPENROUTER_MODEL
         try:
             worker.OPENROUTER_CASCADE_MODELS = worker.DEFAULT_CASCADE_MODELS
-            worker.OPENROUTER_MODEL = "x-ai/grok-4.6"
+            worker.OPENROUTER_MODEL = "x-ai/grok-4.7"
             models = worker.cascade_model_list()
             self.assertEqual(models[0], "qwen/qwen3-vl-8b-instruct")
             self.assertEqual(models[1], "qwen/qwen3-vl-30b-a3b-instruct")
