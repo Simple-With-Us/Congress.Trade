@@ -437,8 +437,11 @@ export async function requeueTransientFailedDurableJobs(
         }
         seenDedupe.add(candidate.dedupeKey);
       }
+      if (chosen.length + slowChosen.length >= limit) {
+        skippedCapped += 1;
+        continue;
+      }
       slowChosen.push({ id: candidate.id });
-      if (chosen.length + slowChosen.length >= limit) break;
     }
   }
   const base = {
