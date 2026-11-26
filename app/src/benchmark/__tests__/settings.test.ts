@@ -69,7 +69,7 @@ const OLD_ROLES = {
 
 const NEW_ROLES = {
   primary: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-  failover: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
+  failover: { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
 };
 
 function dependencies(state: Record<string, string>, options: { failOnce?: string } = {}) {
