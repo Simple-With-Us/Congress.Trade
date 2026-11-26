@@ -56,7 +56,7 @@ class CascadeHelpersTest(unittest.TestCase):
             self.assertEqual(models[0], "qwen/qwen3-vl-8b-instruct")
             self.assertEqual(models[1], "qwen/qwen3-vl-30b-a3b-instruct")
             self.assertIn("google/gemini-3.8-flash", models)
-            self.assertEqual(models[-1], "x-ai/grok-4.6")
+            self.assertEqual(models[-1], "x-ai/grok-4.7")
             self.assertEqual(len(models), len(set(models)))
         finally:
             worker.OPENROUTER_CASCADE_MODELS = previous
