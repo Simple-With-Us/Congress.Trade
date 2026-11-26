@@ -391,7 +391,7 @@ describe('benchmark primary/failover role settings', () => {
       writtenKeys: ['AGREEMENT_SENATE_MODEL_A', 'AGREEMENT_SENATE_MODEL_B'],
     });
     expect(state.AGREEMENT_SENATE_MODEL_A).toBe('openrouter:openai/gpt-5.6-terra');
-    expect(state.AGREEMENT_SENATE_MODEL_B).toBe('openrouter:google/gemini-3.8-flash');
+    expect(state.AGREEMENT_SENATE_MODEL_B).toBe('openrouter:google/gemini-4-hydrogen');
   });
 
   it('rejects a stale optimistic version before any write', async () => {
