@@ -643,3 +643,47 @@ describe('repeated per-page table header', () => {
     expect(assessOgeRowCompleteness(text, rows)).toMatchObject({ expectedRows: 5, missingCount: 0 });
   });
 });
+
+describe('blank AMOUNT cell', () => {
+  // Shape of E-2026-douglas-j-burgum-08-31-2026-278t-1 page 3: row 19 has no
+  // amount, so ROW_RE used to run on into row 20 and take its amount.
+  const HEADER = '# DESCRIPTION TYPE DATE NOTIFICATION RECEIVED OVER 30 DAYS AGO AMOUNT';
+  const text = [
+    'Transactions',
+    HEADER,
+    '18 Arthur Ventures Growth IV, LP See Endnote Sale 07/24/2026 No $1,000,001 - $5,000,000',
+    '19 AV VBA Investment 3 Inc (Cloud based software) Sale 07/24/2026 No',
+    '20 Virtual Benefits Administrator (cloud based Sale 07/24/2026 No $100,001 - software) $250,000',
+    '21 CertifID, Inc. (wire fraud security solution) Sale 07/24/2026 No $250,001 - $500,000',
+  ].join(' ');
+
+  it('keeps the blank-amount row and gives the next row its own amount', () => {
+    const rows = parseOgeTransactionRows(text);
+    expect(rows.map((r) => r.rawText.split(' ')[0])).toEqual(['18', '19', '20', '21']);
+    expect(rows[1]).toMatchObject({
+      assetName: 'AV VBA Investment 3 Inc (Cloud based software)',
+      txType: 'S',
+      txDate: '2026-07-24',
+      amountMin: null,
+      amountMax: null,
+    });
+    expect(rows[2].assetName).toBe('Virtual Benefits Administrator (cloud based');
+    expect(rows[2]).toMatchObject({ amountMin: 100001, amountMax: 250000 });
+    expect(rows[3]).toMatchObject({ amountMin: 250001, amountMax: 500000 });
+  });
+
+  it('reports no missing row', () => {
+    // Renumbered from 1 so the whole table is present.
+    const t = text.replace(/\b(18|19|20|21) (?=[A-Z])/g, (n) => `${Number(n) - 17} `);
+    const rows = parseOgeTransactionRows(t);
+    expect(rows).toHaveLength(4);
+    expect(assessOgeRowCompleteness(t, rows)).toMatchObject({ expectedRows: 4, missingCount: 0 });
+  });
+
+  it('leaves a description that only mentions a later row number alone', () => {
+    const t = [HEADER, '1 Acme Sale 01/02/2026 No 7 Holdings Sale 01/03/2026 No $1,001 - $15,000'].join(' ');
+    const rows = parseOgeTransactionRows(t);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ amountMin: 1001 });
+  });
+});

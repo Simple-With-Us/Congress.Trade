@@ -105,6 +105,14 @@ const ROW_RE = new RegExp(
   'gi',
 );
 
+// A 278-T row whose AMOUNT cell is blank (E-2026-douglas-j-burgum-08-31-2026-278t-1
+// row 19) has no "$" suffix, so ROW_RE runs on into the next row and takes
+// that row's type, date and amount.  The swallowed row shows up inside the
+// description as "<type> <date> <Yes|No> <next #>".  Group 1 is the blank row's
+// own description, 2 type, 3 date, 4 notification flag, 5 the next row's "#".
+const BLANK_AMOUNT_ROW_RE =
+  /^(.{1,200}?)\s+(Purchase|Sale|Exchange)\s+(\d{1,2}\/\d{1,2}\/\d{2,4})\s+(Yes|No)\s+(\d{1,5})[\.,:;]?\s/i;
+
 const TX_TYPE_MAP: Record<string, TxType> = {
   purchase: 'B',
   sale: 'S',
@@ -589,9 +597,24 @@ export function scanOgeRows(text: string): OgeRowScan {
         m[5] = m[5].slice(0, amountSpan);
         ROW_RE.lastIndex -= extra;
       }
-      const [matchText, descriptionRaw, typeWord, dateRaw, notification, amountRaw] = m;
+      let [matchText, descriptionRaw, typeWord, dateRaw, notification, amountRaw] = m;
       const indexMatch = /^(\d{1,5})/.exec(matchText);
       const index = indexMatch ? Number(indexMatch[1]) : null;
+      // Split off a blank-amount row that swallowed the next row (see
+      // BLANK_AMOUNT_ROW_RE).  Only when the embedded number is exactly the
+      // next "#", so a description that merely contains a date is left alone.
+      const blank = BLANK_AMOUNT_ROW_RE.exec(descriptionRaw);
+      if (blank && index !== null && Number(blank[5]) === index + 1) {
+        const descStart = m.index + matchText.indexOf(descriptionRaw);
+        const nextRowStart = descStart + blank[0].lastIndexOf(blank[5]);
+        matchText = segment.slice(m.index, descStart + blank[1].length) + ' ' + [blank[2], blank[3], blank[4]].join(' ');
+        descriptionRaw = blank[1];
+        typeWord = blank[2];
+        dateRaw = blank[3];
+        notification = blank[4];
+        amountRaw = '';
+        ROW_RE.lastIndex = nextRowStart;
+      }
       if (index !== null) rowIndexes.push(index);
       const description = descriptionRaw.trim();
       const tickerMatch = TICKER_SUFFIX_RE.exec(description);
