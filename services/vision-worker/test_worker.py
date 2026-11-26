@@ -349,7 +349,7 @@ class TruncatedLocalCliTest(unittest.TestCase):
             worker.OPENROUTER_MODEL = previous_model
 
         self.assertEqual(cli_called["n"], 0)
-        self.assertEqual(called[0], "google/gemini-3.8-flash")
+        self.assertEqual(called[0], "google/gemini-4-hydrogen")
         self.assertNotIn("qwen/qwen3-vl-8b-instruct", called)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["assetName"], "page-20 stock")
