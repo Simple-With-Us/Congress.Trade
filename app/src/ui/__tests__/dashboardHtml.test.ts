@@ -1412,7 +1412,7 @@ describe('DASHBOARD_HTML', () => {
     expect(keys).toContain('openrouter:deepseek/deepseek-v4-flash');
     expect(keys).toContain('openrouter:google/gemini-4-hydrogen');
     expect(keys).toContain('openrouter:~google/gemini-flash-latest');
-    expect(keys).toContain('openrouter:anthropic/claude-opus-5');
+    expect(keys).toContain('openrouter:anthropic/claude-opus-5-5');
     expect(keys).toContain('llamaparse:fast');
     // Dead-on-OpenRouter slugs and the retired GPT-4o family never render.
     expect(DASHBOARD_SOURCE).not.toContain('gpt-4o');
