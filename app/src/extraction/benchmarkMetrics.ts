@@ -567,7 +567,7 @@ export const STANDARD_BENCHMARK_RATE_CARD = [
   },
   {
     provider: 'openrouter',
-    models: ['google/gemini-3.8-flash', '~google/gemini-flash-latest'],
+    models: ['google/gemini-3.8-flash', '~google/gemini-flash-latest', 'google/gemini-4-hydrogen'],
     meter: 'tokens',
     inputUsdPerMillion: 0.375,
     cachedInputUsdPerMillion: 0.0375,
