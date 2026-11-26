@@ -148,7 +148,7 @@ class TruncatedCascadeTest(unittest.TestCase):
 
         self.assertEqual(called[0], "qwen/qwen3-vl-8b-instruct")
         self.assertEqual(called[1], "qwen/qwen3-vl-30b-a3b-instruct")
-        self.assertIn("google/gemini-3.8-flash", called)
+        self.assertIn("google/gemini-4-hydrogen", called)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["assetName"], "page-10 bond")
         self.assertEqual(label, worker.extractor_label_for_model("google/gemini-4-hydrogen"))
