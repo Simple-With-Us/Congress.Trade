@@ -1,3 +1,9 @@
+<p><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="app/public/assets/brand-logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="app/public/assets/brand-logo-light.png">
+  <img src="app/public/assets/brand-logo.png" alt="Congress.Trade logo" height="72">
+</picture></p>
+
 # Congress.Trade
 
 Congress.Trade is a live product at [congress.trade](https://congress.trade)
