@@ -151,7 +151,7 @@ class TruncatedCascadeTest(unittest.TestCase):
         self.assertIn("google/gemini-3.8-flash", called)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["assetName"], "page-10 bond")
-        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.8-flash"))
+        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-4-hydrogen"))
 
     def test_short_qwen_hit_stays_terminal(self):
         previous_key = worker.OPENROUTER_API_KEY
