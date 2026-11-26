@@ -188,7 +188,7 @@ describe('agreement-reprocess', () => {
     const { env, insertedTx } = makeEnv();
     const orModels = JSON.stringify([
       { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-      { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
+      { provider: 'openrouter', model: 'anthropic/claude-sonnet-5-5' },
     ]);
     const res = await app.request('/agreement-reprocess', {
       method: 'POST',
