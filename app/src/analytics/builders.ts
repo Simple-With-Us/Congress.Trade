@@ -944,7 +944,7 @@ export function buildConflictCandidatesQuery(p: CommonFilters & { limit?: number
   const sql =
     'SELECT t.id AS id, t.ticker AS ticker, t.tx_type AS tx_type, t.tx_date AS tx_date, ' +
     `t.filer_id AS filer_id, COALESCE(fl.display_name, fl.full_name) AS full_name, ${CHAMBER_EXPR} AS chamber, fl.party AS party, ` +
-    'fl.committees AS committees, sr.sector AS sector, t.amount_min AS amount_min, t.amount_max AS amount_max ' +
+    'fl.committees AS committees, fl.photo_url AS photo_url, sr.sector AS sector, t.amount_min AS amount_min, t.amount_max AS amount_max ' +
     ANALYTICS_FROM_JOINS +
     'LEFT JOIN securities_ref sr ON sr.ticker = t.ticker ' +
     whereSql(allWhere) +

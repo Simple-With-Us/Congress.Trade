@@ -7187,7 +7187,9 @@ function loadTrConflicts() {
       var side = typeName[r.txType] || r.txType || '—';
       var asset = r.ticker || '—';
       return '<tr class="row conflict-row">' +
-        '<td' + rowMember + '><div' + memberAttr + ' title="' + esc(name) + '"><span class="name-line">' + esc(name) + '</span></div></td>' +
+        '<td' + rowMember + '><div' + memberAttr + ' title="' + esc(name) + '">' +
+          memberAvatarHtml(name, r.photoUrl, r.partyBucket, true) +
+          '<span class="name-line">' + esc(name) + '</span></div></td>' +
         committeeCellHtml(r.viaCommittees, rowMember) +
         '<td class="muted sector"' + rowMember + ' title="' + esc(r.sector || '') + '">' + esc(r.sector || '—') + '</td>' +
         '<td>' + (r.ticker

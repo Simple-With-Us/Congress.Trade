@@ -1291,6 +1291,8 @@ export const DASHBOARD_CSS = /* css */ `
   #view-trends .conflicts-table .c-side { width: 9%; }
   #view-trends .conflicts-table .c-est { width: 10%; }
   #view-trends .conflicts-table td:has(.member-cell) { width: auto; max-width: none; }
+  #view-trends .conflicts-table .member-cell { align-items: center; }
+  #view-trends .conflicts-table .member-cell .name-line { min-width: 0; }
   #view-trends .conflicts-table td { overflow: hidden; text-overflow: ellipsis; }
   #view-trends .conflicts-table td.committees { white-space: normal; line-height: 1.35; }
   #view-trends .conflicts-table .committee-lines { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }

@@ -122,6 +122,7 @@ function fixture(over: Partial<Fixture> = {}): Fixture {
         tx_date: '2026-07-23',
         filer_id: 'house-nj05-josh-gottheimer',
         full_name: 'HON JOSH GOTTHEIMER',
+        photo_url: 'https://example.com/portraits/G000583.jpg',
         chamber: 'house',
         party: 'Democrat',
         committees: JSON.stringify(['House Committee on Financial Services']),
@@ -288,13 +289,19 @@ describe('GET /api/analytics/conflicts', () => {
       memberName: 'Josh Gottheimer',
       chamber: 'house',
       partyBucket: 'D',
+      photoUrl: 'https://example.com/portraits/G000583.jpg',
       viaCommittees: ['House Committee on Financial Services'],
       // Bracket midpoint of $1,001-$15,000, as an estimate.
       estAmountUsd: 8_001,
     });
-    // No photoUrl on this envelope — see app/docs/client-mobile-api.md; a
-    // client rendering avatars here must source them elsewhere.
-    expect(body.conflicts[0]).not.toHaveProperty('photoUrl');
+  });
+
+  it('still publishes a matching trade when the filer has no portrait', async () => {
+    const fx = fixture();
+    const body = await getJson(fixture({
+      conflictCandidates: [{ ...fx.conflictCandidates[0], photo_url: null }],
+    }), '/conflicts');
+    expect(body.conflicts).toEqual([expect.objectContaining({ id: 'c5a654bd', photoUrl: null })]);
   });
 
   it('honors the limit and returns an empty list rather than failing on no data', async () => {
