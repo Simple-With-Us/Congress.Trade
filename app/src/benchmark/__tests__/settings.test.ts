@@ -176,7 +176,7 @@ describe('benchmark lineup settings', () => {
       ],
     });
     expect(state.AGREEMENT_SENATE_MODEL_C).toBe('openrouter:openai/gpt-5.6-terra');
-    expect(state.AGREEMENT_SENATE_MODEL_D).toBe('openrouter:google/gemini-3.8-flash');
+    expect(state.AGREEMENT_SENATE_MODEL_D).toBe('openrouter:google/gemini-4-hydrogen');
     expect(state.AGREEMENT_SENATE_MODEL_E).toBe('openrouter:anthropic/claude-sonnet-5-5');
   });
 
