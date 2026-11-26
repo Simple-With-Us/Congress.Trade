@@ -1,3 +1,7 @@
+## 2026-11-25 ZC — Fleet-Wide PR Title Header Rule ([OPS-1122](https://linear.app/simple-with-us/issue/OPS-1122))
+
+States the owner ruling (November 26, 2026) that every PR title begins with the compact lettered fleet header for the session that opened the PR (`[<SEAT>:` + three U+200A + `<PAIR>.<GEN>.<HOST>]`), then one ASCII space, then the human title; the title header is never omitted and never stacked under a formatter prefix.  PR descriptions and comments keep carrying the header as their first line.  Rollout: `docs/rollouts/2026-11-25-ops-1122-pr-title-headers.md`.  Canonical definition: AI-Fleet-Coordinator `FLEET-PROTOCOL.md`.
+
 ## 2026-11-12 CURSOR — OPS-1003 /tmp symdb-pids
 
 Congress.Trade does not create `/tmp/symdb-pids`.  `tryInitDdTracer` loads `dd-trace` 6.12.0, whose tarball has no `symdb` string, and compose does not mount host `/tmp`.  The public name match is `dd-trace-py`, which this repo does not depend on.  `DD_TRACE_AGENTLESS_GUARDS` is opt-in and off by default.  The tmpfiles policy and the read-only report are in the tree and are not installed.  Rollout: `docs/rollouts/2026-11-12-tmp-symdb-pids.md`.
