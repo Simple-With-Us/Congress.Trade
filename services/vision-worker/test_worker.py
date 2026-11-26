@@ -353,7 +353,7 @@ class TruncatedLocalCliTest(unittest.TestCase):
         self.assertNotIn("qwen/qwen3-vl-8b-instruct", called)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["assetName"], "page-20 stock")
-        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-3.8-flash"))
+        self.assertEqual(label, worker.extractor_label_for_model("google/gemini-4-hydrogen"))
 
     def test_pdf_native_chunk_miss_is_not_terminal(self):
         calls = {"n": 0}
