@@ -147,7 +147,7 @@ export const STANDARD_BENCHMARK_RATE_CARD = [
   },
   {
     provider: 'openrouter',
-    models: ['anthropic/claude-sonnet-5-5'],
+    models: ['anthropic/claude-sonnet-5-5', 'anthropic/claude-sonnet-5.5'],
     meter: 'tokens',
     inputUsdPerMillion: 2,
     cachedInputUsdPerMillion: 0.1,
