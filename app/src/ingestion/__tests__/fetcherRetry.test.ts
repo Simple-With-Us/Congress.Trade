@@ -185,6 +185,76 @@ describe('fetcherRetry', () => {
     expect(errorSql).toMatch(/NOT \(/);
   });
 
+  it('stamps the not-yet-published marker on a 404 inside the window', async () => {
+    const boundParams: unknown[] = [];
+    const env = {
+      RAW_FILES: { put: vi.fn(async () => {}) },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: (...args: unknown[]) => {
+            boundParams.push(...args);
+            return {
+              run: async () => ({ success: true, meta: { changes: 1 } }),
+              first: async () => {
+                if (/AS published/i.test(sql)) return null;
+                if (/review_queue/i.test(sql)) return null;
+                return {
+                  source_url: 'http://test/doc.pdf',
+                  chamber: 'house',
+                  ingest_status: 'error',
+                  first_seen_at: new Date().toISOString(),
+                };
+              },
+            };
+          },
+        }),
+      },
+      INGEST_QUEUE: { send: vi.fn(async () => {}) },
+    } as any;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('missing', { status: 404 })));
+
+    await expect(fetchFiling(env, 'H-2026-20036848')).rejects.toBeInstanceOf(IngestRetryError);
+    await expect(fetchFiling(env, 'H-2026-20036848')).rejects.toThrow('not yet published; will retry');
+    // The marker must reach the filings row: the DLQ slow-retry sweep
+    // classifies the not-yet-published class by matching it there.
+    expect(boundParams.some((param) => typeof param === 'string' && param.includes('not yet published; will retry'))).toBe(true);
+  });
+
+  it('a slow retry that finds the PDF proceeds into ingest', async () => {
+    const put = vi.fn(async () => {});
+    const send = vi.fn(async () => {});
+    const env = {
+      RAW_FILES: { put },
+      DB: {
+        prepare: (sql: string) => ({
+          bind: () => ({
+            run: async () => ({ success: true, meta: { changes: 1 } }),
+            first: async () => {
+              if (/AS published/i.test(sql)) return null;
+              if (/review_queue/i.test(sql)) return null;
+              return {
+                source_url: 'http://test/doc.pdf',
+                chamber: 'house',
+                ingest_status: 'error',
+                first_seen_at: new Date().toISOString(),
+              };
+            },
+          }),
+        }),
+      },
+      INGEST_QUEUE: { send },
+    } as any;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('small filing', {
+      status: 200, headers: { 'content-type': 'application/pdf', 'content-length': '12' },
+    })));
+
+    await expect(fetchFiling(env, 'H-2026-20036848')).resolves.toBeUndefined();
+    expect(put).toHaveBeenCalledWith('raw/H-2026-20036848', expect.any(Uint8Array), {
+      httpMetadata: { contentType: 'application/pdf' },
+    });
+    expect(send).toHaveBeenCalledWith({ type: 'filing.fetched', docId: 'H-2026-20036848' });
+  });
+
   it('does not enqueue extraction when a publish lands mid-fetch', async () => {
     const put = vi.fn(async () => {});
     const send = vi.fn(async () => {});
