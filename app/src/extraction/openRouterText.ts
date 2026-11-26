@@ -41,7 +41,7 @@ import {
   type DocScopedOpenRouterKind,
 } from './openRouterReply.ts';
 
-export const OPENROUTER_TEXT_MODEL_DEFAULT = 'google/gemini-3.5-flash-lite';
+export const OPENROUTER_TEXT_MODEL_DEFAULT = 'google/gemini-4-hydrogen';
 const DEFAULT_CONFIDENCE = 0.55;
 const MAX_TOKENS = 16000;
 const MAX_TEXT_CHARS = 60_000;

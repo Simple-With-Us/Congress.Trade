@@ -221,7 +221,7 @@ describe('ensureDocClass', () => {
     const fetchSpy = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toContain('openrouter.ai');
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      expect(body.model).toBe('google/gemini-3.5-flash-lite');
+      expect(body.model).toBe('google/gemini-4-hydrogen');
       expect(JSON.stringify(body.plugins)).toContain('cloudflare-ai');
       expect(JSON.stringify(body.response_format)).toContain('"enum"');
       return {

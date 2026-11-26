@@ -1381,7 +1381,7 @@ describe('durable benchmark admin routes', () => {
   it('accepts an all-OpenRouter agreement lineup whose underlying vendors are distinct', async () => {
     const lineup = {
       a: { provider: 'llamaparse', model: 'cost-effective' },
-      b: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
+      b: { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
       c: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
     };
     const response = await buildAdminRouter().request('/benchmark/dry-run/H-1', {
