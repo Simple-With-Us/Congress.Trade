@@ -58,7 +58,7 @@ const OLD = {
 
 const NEW = {
   a: { provider: 'openrouter', model: 'openai/gpt-5.6-terra' },
-  b: { provider: 'openrouter', model: 'google/gemini-3.8-flash' },
+  b: { provider: 'openrouter', model: 'google/gemini-4-hydrogen' },
   c: { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
 };
 
