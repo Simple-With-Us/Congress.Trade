@@ -72,6 +72,13 @@ export function isRetryableFilingHttpStatus(status: number): boolean {
 export const FETCH_NOT_PUBLISHED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
+ * Marker embedded in the fetch error text for the not-yet-published class.
+ * transientDlq.ts matches on it to keep these filings on a slow retry
+ * cadence after the fast retry budget exhausts — do not reword casually.
+ */
+export const NOT_YET_PUBLISHED_MARKER = 'not yet published; will retry';
+
+/**
  * Full transient-fetch classification. Beyond the generic retryable statuses:
  * - 403: the Clerk/eFD WAF answers request bursts with short-lived 403s
  *   (observed 2026-08-01 during a backlog drain); a terminal error loses the
@@ -347,7 +354,7 @@ export async function fetchFiling(
     if (headRes && !headRes.ok && headRes.status !== 304 && headRes.status !== 405) {
       const notYetPublished = headRes.status === 404 && shouldRetryFetchStatus(headRes.status, row.first_seen_at, new Date());
       const message = notYetPublished
-        ? `fetcher: HEAD source ${sourceUrl} -> HTTP 404 (not yet published; will retry)`
+        ? `fetcher: HEAD source ${sourceUrl} -> HTTP 404 (${NOT_YET_PUBLISHED_MARKER})`
         : `fetcher: HEAD source ${sourceUrl} -> HTTP ${headRes.status}`;
       await headRes.body?.cancel().catch(() => {});
       await markError(env, docId, message, lease);
@@ -370,7 +377,7 @@ export async function fetchFiling(
     if (!res.ok) {
       const notYetPublished = res.status === 404 && shouldRetryFetchStatus(res.status, row.first_seen_at, new Date());
       const message = notYetPublished
-        ? `fetcher: source ${sourceUrl} -> HTTP 404 (not yet published; will retry)`
+        ? `fetcher: source ${sourceUrl} -> HTTP 404 (${NOT_YET_PUBLISHED_MARKER})`
         : `fetcher: source ${sourceUrl} -> HTTP ${res.status}`;
       await res.body?.cancel().catch(() => {});
       await markError(env, docId, message, lease);
