@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   AUTO_TRANSIENT_DLQ_MAX_CYCLES,
   classifyFailedOutboxRow,
+  isNotYetPublishedDlqError,
   isPoisonDlqError,
   isTransientDlqError,
+  isWithinNotPublishedWindow,
+  NOT_YET_PUBLISHED_SLOW_RETRY_MS,
   requeueTransientFailedDurableJobs,
   requeueTransientFailedIngestionOutbox,
   sweepTransientDeadLetters,
@@ -288,5 +291,323 @@ describe('sweepTransientDeadLetters', () => {
     expect(result.ingestion.requeued).toBe(1);
     expect(result.ingestQueue.requeued + result.deliveryQueue.requeued).toBeGreaterThanOrEqual(1);
     expect(ingestion.store.find((row) => row.doc_id === 'H-busy')?.status).toBe('pending');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Not-yet-published slow retry (2026-11-25): a filing discovered before its
+// PDF was posted 404s with the fetcher's marker, burns the fast retry budget
+// in ~1.6h, and used to strand in the DLQ forever.  The hourly sweep now
+// re-arms that class at +4h (inside the owner's 2–6h band) without
+// consuming the dead-letter cycle budget, bounded by the fetcher's own
+// 7-day not-published window.
+// ---------------------------------------------------------------------------
+
+const MARKER_ERROR = 'fetcher: HEAD source https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20036848.pdf -> HTTP 404 (not yet published; will retry)';
+const BUDGET_ERROR = 'consumer retry budget exhausted; received by ingest-dlq';
+
+interface FilingFactRow {
+  doc_id: string;
+  error: string | null;
+  first_seen_at: string | null;
+}
+
+function filingsAll(filings: FilingFactRow[], params: unknown[]) {
+  const ids = new Set(params.map(String));
+  return {
+    results: filings.filter((fact) => ids.has(fact.doc_id)),
+    meta: { changes: 0 },
+  };
+}
+
+function memoryOutboxSlow(
+  rows: Array<{ doc_id: string; status: string; last_error: string; dead_letter_cycles?: number }>,
+  filings: FilingFactRow[],
+) {
+  const store = rows.map((row) => ({
+    attempts: 6,
+    available_at: null as string | null,
+    ...row,
+    dead_letter_cycles: row.dead_letter_cycles ?? 2,
+  }));
+  const env = {
+    DB: {
+      prepare(sql: string) {
+        return {
+          params: [] as unknown[],
+          bind(...params: unknown[]) { this.params = params; return this; },
+          async all() {
+            if (/FROM filings/.test(sql)) return filingsAll(filings, this.params);
+            const limit = Number(this.params[0] ?? 100);
+            return {
+              results: store.filter((row) => row.status === 'failed').slice(0, limit),
+              meta: { changes: 0 },
+            };
+          },
+          async run() {
+            if (!/UPDATE ingestion_outbox/.test(sql)) {
+              return { success: true, meta: { changes: 0 } };
+            }
+            if (/dead_letter_cycles = dead_letter_cycles \+ 1/.test(sql)) {
+              const docId = String(this.params[2]);
+              const cap = Number(this.params[3]);
+              const row = store.find((entry) => entry.doc_id === docId);
+              if (
+                row
+                && row.status === 'failed'
+                && row.dead_letter_cycles < cap
+                && !row.last_error.startsWith('parked:')
+              ) {
+                row.status = 'pending';
+                row.dead_letter_cycles += 1;
+                row.available_at = String(this.params[0]);
+                return { success: true, meta: { changes: 1 } };
+              }
+              return { success: true, meta: { changes: 0 } };
+            }
+            if (!/dead_letter_cycles/.test(sql)) {
+              // Slow-cadence update: no cycle-counter clause at all.
+              const row = store.find((entry) => entry.doc_id === String(this.params[2]));
+              if (row && row.status === 'failed' && !row.last_error.startsWith('parked:')) {
+                row.status = 'pending';
+                row.available_at = String(this.params[0]);
+                return { success: true, meta: { changes: 1 } };
+              }
+              return { success: true, meta: { changes: 0 } };
+            }
+            const ids = new Set(this.params.slice(2).map(String));
+            let changes = 0;
+            for (const row of store) {
+              if (row.status === 'failed' && ids.has(row.doc_id)) {
+                row.status = 'pending';
+                changes += 1;
+              }
+            }
+            return { success: true, meta: { changes } };
+          },
+        };
+      },
+    },
+  } as unknown as Env;
+  return { env, store };
+}
+
+function memoryDurableSlow(
+  rows: Array<{
+    id: number;
+    last_error: string;
+    dead_letter_cycles?: number;
+    dedupe_key?: string | null;
+    payload?: string | null;
+  }>,
+  filings: FilingFactRow[],
+) {
+  const store = rows.map((row) => ({
+    queue_name: 'ingest',
+    status: 'failed',
+    attempts: 9,
+    dead_letter_pending: 0,
+    available_at: null as string | null,
+    dedupe_key: row.dedupe_key ?? null,
+    payload: row.payload ?? null,
+    ...row,
+    dead_letter_cycles: row.dead_letter_cycles ?? 2,
+  }));
+  const env = {
+    DB: {
+      prepare(sql: string) {
+        return {
+          params: [] as unknown[],
+          bind(...params: unknown[]) { this.params = params; return this; },
+          async all() {
+            if (/FROM filings/.test(sql)) return filingsAll(filings, this.params);
+            const limit = Number(this.params[1] ?? 100);
+            return {
+              results: store
+                .filter((row) => row.queue_name === this.params[0] && row.status === 'failed')
+                .slice(0, limit),
+              meta: { changes: 0 },
+            };
+          },
+          async run() {
+            if (!/UPDATE deno_runtime_queue/.test(sql)) {
+              return { success: true, meta: { changes: 0 } };
+            }
+            if (/last_error = NULL/.test(sql)) {
+              const ids = new Set(this.params.slice(2).map(Number));
+              let changes = 0;
+              for (const row of store) {
+                if (row.status === 'failed' && ids.has(row.id)) {
+                  row.status = 'pending';
+                  changes += 1;
+                }
+              }
+              return { success: true, meta: { changes } };
+            }
+            if (/dead_letter_cycles = dead_letter_cycles \+ 1/.test(sql)) {
+              const id = Number(this.params[2]);
+              const cap = Number(this.params[3]);
+              const row = store.find((entry) => entry.id === id);
+              if (!row || row.status !== 'failed' || row.dead_letter_cycles >= cap) {
+                return { success: true, meta: { changes: 0 } };
+              }
+              row.status = 'pending';
+              row.dead_letter_cycles += 1;
+              row.available_at = String(this.params[0]);
+              return { success: true, meta: { changes: 1 } };
+            }
+            // Slow-cadence update: available_at set, cycle counter untouched.
+            const row = store.find((entry) => entry.id === Number(this.params[2]));
+            if (row && row.status === 'failed') {
+              row.status = 'pending';
+              row.available_at = String(this.params[0]);
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
+          },
+        };
+      },
+    },
+  } as unknown as Env;
+  return { env, store };
+}
+
+describe('not-yet-published slow retry', () => {
+  const now = new Date('2026-11-25T12:00:00.000Z');
+  const recent = '2026-11-24T12:00:00.000Z';
+  const stale = '2026-11-17T12:00:00.000Z';
+  const slowIso = new Date(now.getTime() + NOT_YET_PUBLISHED_SLOW_RETRY_MS).toISOString();
+
+  it('classifies the marker as transient and class-scoped, cadence inside 2–6h', () => {
+    expect(isTransientDlqError(MARKER_ERROR)).toBe(true);
+    expect(isNotYetPublishedDlqError(MARKER_ERROR)).toBe(true);
+    expect(isNotYetPublishedDlqError('fetcher: source https://x.test/d.pdf -> HTTP 404')).toBe(false);
+    expect(isNotYetPublishedDlqError(BUDGET_ERROR)).toBe(false);
+    expect(isNotYetPublishedDlqError('parked: not yet published; will retry')).toBe(false);
+    expect(isWithinNotPublishedWindow(recent, now)).toBe(true);
+    expect(isWithinNotPublishedWindow(stale, now)).toBe(false);
+    expect(isWithinNotPublishedWindow(null, now)).toBe(false);
+    expect(NOT_YET_PUBLISHED_SLOW_RETRY_MS).toBeGreaterThanOrEqual(2 * 3600_000);
+    expect(NOT_YET_PUBLISHED_SLOW_RETRY_MS).toBeLessThanOrEqual(6 * 3600_000);
+  });
+
+  it('outbox: a capped not-yet-published filing re-arms at the slow cadence without consuming cycles', async () => {
+    const { env, store } = memoryOutboxSlow(
+      [{ doc_id: 'H-2026-20036848', status: 'failed', last_error: BUDGET_ERROR, dead_letter_cycles: AUTO_TRANSIENT_DLQ_MAX_CYCLES }],
+      [{ doc_id: 'H-2026-20036848', error: MARKER_ERROR, first_seen_at: recent }],
+    );
+    const applied = await requeueTransientFailedIngestionOutbox(env, { auto: true, now, limit: 10 });
+    expect(applied.requeued).toBe(1);
+    expect(applied.slowRetried).toBe(1);
+    expect(applied.skippedCapped).toBe(0);
+    const row = store.find((entry) => entry.doc_id === 'H-2026-20036848')!;
+    expect(row.status).toBe('pending');
+    expect(row.dead_letter_cycles).toBe(AUTO_TRANSIENT_DLQ_MAX_CYCLES);
+    expect(row.available_at).toBe(slowIso);
+  });
+
+  it('outbox: past the not-published window the same row stays capped and failed', async () => {
+    const { env, store } = memoryOutboxSlow(
+      [{ doc_id: 'H-old', status: 'failed', last_error: BUDGET_ERROR, dead_letter_cycles: AUTO_TRANSIENT_DLQ_MAX_CYCLES }],
+      [{ doc_id: 'H-old', error: MARKER_ERROR, first_seen_at: stale }],
+    );
+    const applied = await requeueTransientFailedIngestionOutbox(env, { auto: true, now, limit: 10 });
+    expect(applied.requeued).toBe(0);
+    expect(applied.slowRetried).toBe(0);
+    expect(applied.skippedCapped).toBe(1);
+    expect(store.find((entry) => entry.doc_id === 'H-old')?.status).toBe('failed');
+  });
+
+  it('outbox: a capped row whose filing failed for another reason stays capped', async () => {
+    const { env, store } = memoryOutboxSlow(
+      [{ doc_id: 'H-parse', status: 'failed', last_error: BUDGET_ERROR, dead_letter_cycles: AUTO_TRANSIENT_DLQ_MAX_CYCLES }],
+      [{ doc_id: 'H-parse', error: 'extraction: unexpected token in pdf stream', first_seen_at: recent }],
+    );
+    const applied = await requeueTransientFailedIngestionOutbox(env, { auto: true, now, limit: 10 });
+    expect(applied.requeued).toBe(0);
+    expect(applied.skippedCapped).toBe(1);
+    expect(store.find((entry) => entry.doc_id === 'H-parse')?.status).toBe('failed');
+  });
+
+  it('durable: a capped marker row re-arms at the slow cadence regardless of cycle count', async () => {
+    const { env, store } = memoryDurableSlow(
+      [{
+        id: 7,
+        last_error: MARKER_ERROR,
+        dead_letter_cycles: 99,
+        dedupe_key: 'ingest:filing.new:H-2026-20036848',
+        payload: JSON.stringify({ type: 'filing.new', docId: 'H-2026-20036848' }),
+      }],
+      [{ doc_id: 'H-2026-20036848', error: MARKER_ERROR, first_seen_at: recent }],
+    );
+    const applied = await requeueTransientFailedDurableJobs(env, { auto: true, now, limit: 10 });
+    expect(applied.requeued).toBe(1);
+    expect(applied.slowRetried).toBe(1);
+    expect(applied.skippedCapped).toBe(0);
+    const row = store.find((entry) => entry.id === 7)!;
+    expect(row.status).toBe('pending');
+    expect(row.dead_letter_cycles).toBe(99);
+    expect(row.available_at).toBe(slowIso);
+  });
+
+  it('durable: a capped marker row past the window stays failed', async () => {
+    const { env, store } = memoryDurableSlow(
+      [{
+        id: 8,
+        last_error: MARKER_ERROR,
+        dead_letter_cycles: 99,
+        payload: JSON.stringify({ type: 'filing.new', docId: 'H-old' }),
+      }],
+      [{ doc_id: 'H-old', error: MARKER_ERROR, first_seen_at: stale }],
+    );
+    const applied = await requeueTransientFailedDurableJobs(env, { auto: true, now, limit: 10 });
+    expect(applied.requeued).toBe(0);
+    expect(applied.skippedCapped).toBe(1);
+    expect(store.find((entry) => entry.id === 8)?.status).toBe('failed');
+  });
+
+  it('durable: a capped non-404 transient failure still dead-letters as before', async () => {
+    const { env, store } = memoryDurableSlow(
+      [{ id: 9, last_error: 'SQLITE_BUSY: database is locked', dead_letter_cycles: 99 }],
+      [],
+    );
+    const applied = await requeueTransientFailedDurableJobs(env, { auto: true, now, limit: 10 });
+    expect(applied.requeued).toBe(0);
+    expect(applied.slowRetried).toBe(0);
+    expect(applied.skippedCapped).toBe(1);
+    expect(store.find((entry) => entry.id === 9)?.status).toBe('failed');
+  });
+
+  it('sweep: slow-retries the class on both the outbox and the durable queue', async () => {
+    const filings: FilingFactRow[] = [
+      { doc_id: 'H-2026-20036848', error: MARKER_ERROR, first_seen_at: recent },
+    ];
+    const ingestion = memoryOutboxSlow(
+      [{ doc_id: 'H-2026-20036848', status: 'failed', last_error: BUDGET_ERROR, dead_letter_cycles: AUTO_TRANSIENT_DLQ_MAX_CYCLES }],
+      filings,
+    );
+    const durable = memoryDurableSlow(
+      [{
+        id: 11,
+        last_error: MARKER_ERROR,
+        dead_letter_cycles: 42,
+        payload: JSON.stringify({ type: 'filing.new', docId: 'H-2026-20036848' }),
+      }],
+      filings,
+    );
+    const env = {
+      DB: {
+        prepare(sql: string) {
+          if (/FROM filings/.test(sql)) return ingestion.env.DB.prepare(sql);
+          if (/ingestion_outbox/.test(sql)) return ingestion.env.DB.prepare(sql);
+          return durable.env.DB.prepare(sql);
+        },
+      },
+    } as unknown as Env;
+    const result = await sweepTransientDeadLetters(env, now);
+    expect(result.ingestion.slowRetried).toBe(1);
+    expect(result.ingestQueue.slowRetried).toBe(1);
+    expect(ingestion.store.find((row) => row.doc_id === 'H-2026-20036848')?.status).toBe('pending');
+    expect(durable.store.find((row) => row.id === 11)?.status).toBe('pending');
   });
 });
