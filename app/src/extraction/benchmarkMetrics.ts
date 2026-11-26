@@ -615,7 +615,7 @@ export const STANDARD_BENCHMARK_RATE_CARD = [
   },
   {
     provider: 'openrouter',
-    models: ['x-ai/grok-4.6', 'x-ai/grok-4.7'],
+    models: ['x-ai/grok-4.6'],
     meter: 'tokens',
     inputUsdPerMillion: 2,
     cachedInputUsdPerMillion: 0.3,
