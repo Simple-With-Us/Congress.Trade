@@ -1,3 +1,5 @@
+<p><img src="app/public/assets/brand-logo.png" alt="Congress.Trade logo" height="72"></p>
+
 # Congress.Trade
 
 Congress.Trade is a live product at [congress.trade](https://congress.trade)
