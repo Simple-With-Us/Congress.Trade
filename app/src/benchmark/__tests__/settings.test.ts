@@ -195,7 +195,7 @@ describe('benchmark lineup settings', () => {
     expect(saved.settings).toMatchObject({ lineup: NEW, valid: true });
     expect(saved.audit).toMatchObject({ readbackVerified: true, rollbackAttempted: false });
     expect(state.AGREEMENT_HOUSE_MODEL_C).toBe('openrouter:openai/gpt-5.6-terra');
-    expect(state.AGREEMENT_HOUSE_MODEL_D).toBe('openrouter:google/gemini-3.8-flash');
+    expect(state.AGREEMENT_HOUSE_MODEL_D).toBe('openrouter:google/gemini-4-hydrogen');
     expect(state.AGREEMENT_HOUSE_MODEL_E).toBe('openrouter:anthropic/claude-sonnet-5-5');
   });
 
