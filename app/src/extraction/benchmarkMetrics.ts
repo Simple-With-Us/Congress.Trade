@@ -619,6 +619,18 @@ export const STANDARD_BENCHMARK_RATE_CARD = [
   },
   {
     provider: 'openrouter',
+    models: ['google/gemini-4-hydrogen:batch'],
+    meter: 'tokens',
+    inputUsdPerMillion: 0.75,
+    cachedInputUsdPerMillion: 0.0375,
+    outputUsdPerMillion: 3.75,
+    version: 'openrouter-static-2026-11-25',
+    effectiveDate: '2026-11-25',
+    sourceUrl: 'https://openrouter.ai/docs#models',
+    note: 'OpenRouter Gemini 4 Hydrogen batch/offline pricing; verified against the live /api/v1/models listing 2026-11-25.',
+  },
+  {
+    provider: 'openrouter',
     models: ['google/gemini-3.8-flash:batch'],
     meter: 'tokens',
     inputUsdPerMillion: 0.1875,
