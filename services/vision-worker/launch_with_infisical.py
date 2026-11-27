@@ -227,14 +227,15 @@ def discover_service_token_project(
     if not workspace:
         raise LauncherError("Infisical service-token metadata missing workspace ID")
     scopes = payload.get("scopes")
-    if isinstance(scopes, list) and scopes:
-        envs = {
-            str(item.get("environment") or "").strip()
-            for item in scopes
-            if isinstance(item, dict)
-        }
-        if environment not in envs:
-            raise LauncherError(f"Infisical service token is not scoped to {environment!r}")
+    if not isinstance(scopes, list) or not scopes:
+        raise LauncherError("Infisical service-token metadata missing scopes")
+    envs = {
+        str(item.get("environment") or "").strip()
+        for item in scopes
+        if isinstance(item, dict)
+    }
+    if environment not in envs:
+        raise LauncherError(f"Infisical service token is not scoped to {environment!r}")
     return workspace
 
 
@@ -345,12 +346,14 @@ def parse_args(argv: Sequence[str]) -> tuple[str | None, bool, list[str]]:
     while i < len(args):
         arg = args[i]
         if arg == "--token-file":
-            if i + 1 >= len(args):
+            if i + 1 >= len(args) or not args[i + 1].strip() or args[i + 1].startswith("--"):
                 raise LauncherError("--token-file requires a path argument")
             token_file = args[i + 1]
             i += 2
         elif arg.startswith("--token-file="):
             token_file = arg.split("=", 1)[1]
+            if not token_file.strip() or token_file.startswith("--"):
+                raise LauncherError("--token-file requires a path argument")
             i += 1
         elif arg == "--check":
             check_only = True

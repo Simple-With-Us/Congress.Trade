@@ -95,9 +95,16 @@ class ArgParsingTests(unittest.TestCase):
         self.assertFalse(check_only)
         self.assertEqual(cmd, ["/path/worker.py"])
 
-    def test_parse_args_rejects_missing_token_file_value(self) -> None:
-        with self.assertRaises(lwi.LauncherError):
-            lwi.parse_args(["/path/worker.py", "--token-file"])
+    def test_parse_args_rejects_missing_empty_or_flag_token_file(self) -> None:
+        for bad in (
+            ["/path/worker.py", "--token-file"],
+            ["/path/worker.py", "--token-file", "--check"],
+            ["/path/worker.py", "--token-file="],
+            ["/path/worker.py", "--token-file=--check"],
+        ):
+            with self.subTest(argv=bad):
+                with self.assertRaises(lwi.LauncherError):
+                    lwi.parse_args(bad)
 
 
 class EnvAndInfisicalTests(unittest.TestCase):
@@ -177,15 +184,19 @@ class EnvAndInfisicalTests(unittest.TestCase):
         self.assertEqual(len(opener.urls), 2)
         self.assertIn("workspaceId=proj-from-token", opener.urls[1])
 
-    def test_discover_rejects_token_not_scoped_to_prod(self) -> None:
-        class FakeOpener:
-            def open(self, req, timeout=0):
-                return _FakeHTTPResponse(
-                    {"workspace": "proj-1", "scopes": [{"environment": "staging", "secretPath": "/"}]}
-                )
+    def test_discover_rejects_token_not_scoped_to_prod_or_missing_scopes(self) -> None:
+        for payload in (
+            {"workspace": "proj-1", "scopes": [{"environment": "staging", "secretPath": "/"}]},
+            {"workspace": "proj-1", "scopes": []},
+            {"workspace": "proj-1"},
+        ):
+            with self.subTest(payload=payload):
+                class FakeOpener:
+                    def open(self, req, timeout=0, p=payload):
+                        return _FakeHTTPResponse(p)
 
-        with self.assertRaises(lwi.LauncherError):
-            lwi.discover_service_token_project("tok-xyz", opener=FakeOpener())
+                with self.assertRaises(lwi.LauncherError):
+                    lwi.discover_service_token_project("tok-xyz", opener=FakeOpener())
 
     def test_no_redirect_handler_refuses_3xx(self) -> None:
         handler = lwi._NoRedirectHandler()
