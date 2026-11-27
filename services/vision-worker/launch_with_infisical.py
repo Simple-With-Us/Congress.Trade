@@ -6,6 +6,10 @@ secret and INFISICAL_* environment variables are stripped before fetching and ar
 never used as fallbacks.  Token custody prefers the macOS Login Keychain entry
 (service "infisical-service-token", account "vision-worker-ct-ro") and falls back
 to a custody-checked 0600 token file for non-GUI daemon sessions (such as pm2).
+
+The Infisical project ID is discovered dynamically from the scoped service
+token's own metadata (`/api/v2/service-token`), so no workspace UUID is
+hardcoded in public source.
 """
 
 from __future__ import annotations
@@ -21,9 +25,9 @@ import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
 
-PROJECT_ID = "f61a79de-8d77-4f0b-9361-4b7208598290"
 ENVIRONMENT = "prod"
 SECRET_PATH = "/"
+INFISICAL_SERVICE_TOKEN_URL = "https://app.infisical.com/api/v2/service-token"
 INFISICAL_RAW_URL = "https://app.infisical.com/api/v3/secrets/raw"
 ALLOWED_HOST = "app.infisical.com"
 HTTP_TIMEOUT_SEC = 15
@@ -98,13 +102,16 @@ def read_custody_token_file(path: os.PathLike[str] | str) -> str:
             raise LauncherError(f"Token file not owned by current user: {token_path}")
         if (stat.S_IMODE(st.st_mode) & 0o077) != 0:
             raise LauncherError(f"Token file permissions must be 0600 or stricter: {token_path}")
-        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        fh = os.fdopen(fd, "r", encoding="utf-8")
+        fd = -1  # fh now owns the descriptor
+        with fh:
             token = fh.read().strip()
     except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise
     if not token:
         raise LauncherError(f"Token file is empty: {token_path}")
@@ -164,47 +171,15 @@ def resolve_service_token(
     )
 
 
-def build_infisical_url(
-    *,
-    project_id: str = PROJECT_ID,
-    environment: str = ENVIRONMENT,
-    secret_path: str = SECRET_PATH,
-    base_url: str = INFISICAL_RAW_URL,
-) -> str:
-    """Build pinned HTTPS URL for Infisical prod secret fetch."""
-    if environment != "prod":
-        raise LauncherError(f"Infisical environment must be 'prod', got {environment!r}")
-    parsed = urllib.parse.urlparse(base_url)
+def _validate_pinned_url(url: str) -> urllib.parse.ParseResult:
+    parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or parsed.hostname != ALLOWED_HOST:
-        raise LauncherError(f"Refusing non-pinned Infisical URL: {base_url}")
-    query = urllib.parse.urlencode({
-        "workspaceId": project_id,
-        "environment": environment,
-        "secretPath": secret_path,
-        "include_imports": "true",
-        "expandSecretReferences": "true",
-    })
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
+        raise LauncherError(f"Refusing non-pinned Infisical URL: {url}")
+    return parsed
 
 
-def fetch_infisical_secrets(
-    token: str,
-    *,
-    project_id: str = PROJECT_ID,
-    environment: str = ENVIRONMENT,
-    secret_path: str = SECRET_PATH,
-    base_url: str = INFISICAL_RAW_URL,
-    opener: urllib.request.OpenerDirector | None = None,
-) -> dict[str, str]:
-    """Fetch raw expanded secrets (including imports) from Infisical prod."""
-    if not token or not token.strip():
-        raise LauncherError("Infisical service token is empty")
-    url = build_infisical_url(
-        project_id=project_id,
-        environment=environment,
-        secret_path=secret_path,
-        base_url=base_url,
-    )
+def _get_json(url: str, token: str, *, opener: urllib.request.OpenerDirector | None = None) -> dict:
+    _validate_pinned_url(url)
     req = urllib.request.Request(
         url,
         headers={
@@ -230,8 +205,93 @@ def fetch_infisical_secrets(
         payload = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise LauncherError("Infisical response was not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise LauncherError("Infisical response was not a JSON object")
+    return payload
 
-    items = payload.get("secrets") if isinstance(payload, dict) else None
+
+def discover_service_token_project(
+    token: str,
+    *,
+    environment: str = ENVIRONMENT,
+    token_info_url: str = INFISICAL_SERVICE_TOKEN_URL,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> str:
+    """Discover the workspace/project ID bound to this scoped Infisical service token."""
+    if environment != "prod":
+        raise LauncherError(f"Infisical environment must be 'prod', got {environment!r}")
+    if not token or not token.strip():
+        raise LauncherError("Infisical service token is empty")
+    payload = _get_json(token_info_url, token, opener=opener)
+    workspace = str(payload.get("workspace") or "").strip()
+    if not workspace:
+        raise LauncherError("Infisical service-token metadata missing workspace ID")
+    scopes = payload.get("scopes")
+    if isinstance(scopes, list) and scopes:
+        envs = {
+            str(item.get("environment") or "").strip()
+            for item in scopes
+            if isinstance(item, dict)
+        }
+        if environment not in envs:
+            raise LauncherError(f"Infisical service token is not scoped to {environment!r}")
+    return workspace
+
+
+def build_infisical_url(
+    *,
+    project_id: str,
+    environment: str = ENVIRONMENT,
+    secret_path: str = SECRET_PATH,
+    base_url: str = INFISICAL_RAW_URL,
+) -> str:
+    """Build pinned HTTPS URL for Infisical prod secret fetch."""
+    if environment != "prod":
+        raise LauncherError(f"Infisical environment must be 'prod', got {environment!r}")
+    if not project_id or not project_id.strip():
+        raise LauncherError("Infisical project ID is empty")
+    parsed = _validate_pinned_url(base_url)
+    query = urllib.parse.urlencode({
+        "workspaceId": project_id.strip(),
+        "environment": environment,
+        "secretPath": secret_path,
+        "include_imports": "true",
+        "expandSecretReferences": "true",
+    })
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
+
+
+def fetch_infisical_secrets(
+    token: str,
+    *,
+    project_id: str | None = None,
+    environment: str = ENVIRONMENT,
+    secret_path: str = SECRET_PATH,
+    base_url: str = INFISICAL_RAW_URL,
+    token_info_url: str = INFISICAL_SERVICE_TOKEN_URL,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> dict[str, str]:
+    """Fetch raw expanded secrets (including imports) from Infisical prod."""
+    if not token or not token.strip():
+        raise LauncherError("Infisical service token is empty")
+    resolved_project = (
+        project_id.strip()
+        if project_id and project_id.strip()
+        else discover_service_token_project(
+            token,
+            environment=environment,
+            token_info_url=token_info_url,
+            opener=opener,
+        )
+    )
+    url = build_infisical_url(
+        project_id=resolved_project,
+        environment=environment,
+        secret_path=secret_path,
+        base_url=base_url,
+    )
+    payload = _get_json(url, token, opener=opener)
+    items = payload.get("secrets")
     if not isinstance(items, list):
         raise LauncherError("Infisical response missing 'secrets' list")
 
@@ -267,25 +327,46 @@ def build_child_env(base_env: Mapping[str, str], fetched_secrets: Mapping[str, s
     missing = [name for name in REQUIRED_ENV_VARS if not child_env.get(name, "").strip()]
     if missing:
         raise LauncherError(f"Missing required Infisical secret(s): {', '.join(missing)}")
+    if (
+        child_env.get("VISION_ENGINE", "").strip().lower() == "openrouter"
+        and not child_env.get("OPENROUTER_API_KEY", "").strip()
+    ):
+        raise LauncherError("OPENROUTER_API_KEY required for VISION_ENGINE=openrouter")
     return child_env
 
 
-def parse_args(argv: Sequence[str]) -> tuple[str | None, list[str]]:
-    """Parse optional `--token-file PATH`, forwarding target script and args."""
+def parse_args(argv: Sequence[str]) -> tuple[str | None, bool, list[str]]:
+    """Parse `--token-file PATH` and `--check` anywhere in argv, forwarding target script/args."""
     args = list(argv)
     token_file: str | None = None
-    if len(args) >= 2 and args[0] == "--token-file":
-        token_file = args[1]
-        args = args[2:]
-    if not args:
+    check_only = False
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--token-file":
+            if i + 1 >= len(args):
+                raise LauncherError("--token-file requires a path argument")
+            token_file = args[i + 1]
+            i += 2
+        elif arg.startswith("--token-file="):
+            token_file = arg.split("=", 1)[1]
+            i += 1
+        elif arg == "--check":
+            check_only = True
+            i += 1
+        else:
+            remaining.append(arg)
+            i += 1
+    if not remaining:
         default_worker = str(pathlib.Path(__file__).resolve().with_name("worker.py"))
-        args = [default_worker]
-    return token_file, args
+        remaining = [default_worker]
+    return token_file, check_only, remaining
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    token_file, worker_cmd = parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        token_file, check_only, worker_cmd = parse_args(sys.argv[1:] if argv is None else argv)
         ambient_infisical_env = os.environ.get("INFISICAL_ENVIRONMENT", "").strip()
         if ambient_infisical_env and ambient_infisical_env != "prod":
             raise LauncherError(
@@ -297,6 +378,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except LauncherError as exc:
         print(f"vision-worker: {exc}", file=sys.stderr)
         return 2
+
+    if check_only:
+        present = [k for k in SECRET_KEY_CANDIDATES if child_env.get(k)]
+        print(f"vision-worker: Infisical check ok (keys set: {', '.join(present)})")
+        return 0
 
     os.execve(sys.executable, [sys.executable, *worker_cmd], child_env)
     return 0

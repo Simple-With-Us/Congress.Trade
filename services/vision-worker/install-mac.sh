@@ -15,8 +15,8 @@ for arg in "$@"; do
       cat <<'EOF'
 Usage: install-mac.sh [--dry-run]
 
-Copies worker.py, launch_with_infisical.py, run-vision-worker.sh,
-requirements.txt, and README.md into $VISION_WORKER_HOME (default: ~/vision-worker).
+Copies worker.py, launch_with_infisical.py, run-vision-worker.sh, and
+README.md into $VISION_WORKER_HOME (default: ~/vision-worker).
 EOF
       exit 0
       ;;
@@ -31,7 +31,6 @@ FILES=(
   "worker.py:644"
   "launch_with_infisical.py:755"
   "run-vision-worker.sh:755"
-  "requirements.txt:644"
   "README.md:644"
 )
 
@@ -70,4 +69,5 @@ echo "Next on Mac:"
 echo "  1. Ensure scoped Infisical service token 'vision-worker-ct-ro' is in Login Keychain"
 echo "     (service 'infisical-service-token', account 'vision-worker-ct-ro') or 0600"
 echo "     ~/.config/infisical/tokens/vision-worker-ct-ro.token for non-GUI pm2 sessions."
-echo "  2. pm2 restart vision-worker || pm2 start ~/Code/AI-Fleet-Coordinator/scripts/pm2-ecosystem.config.cjs --only vision-worker"
+echo "  2. ~/vision-worker/run-vision-worker.sh --check"
+echo "  3. pm2 restart vision-worker || pm2 start ~/Code/AI-Fleet-Coordinator/scripts/pm2-ecosystem.config.cjs --only vision-worker"

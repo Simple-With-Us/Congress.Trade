@@ -9,7 +9,8 @@ transactions to `/api/admin/ingest-local-vision`.
 ## Secrets (Infisical sole source of truth)
 
 `run-vision-worker.sh` invokes `launch_with_infisical.py`, which strips any
-ambient secret / `INFISICAL_*` env vars and fetches secrets directly from
+ambient secret / `INFISICAL_*` env vars, discovers the project ID from the
+scoped service token's own Infisical metadata, and fetches secrets directly from
 Infisical (`congress-trade`, environment `prod`, path `/`, imports expanded).
 There is no `fleet-secrets` dependency and no environment fallback.
 
@@ -39,9 +40,9 @@ Required Infisical secret: `ADMIN_TOKEN` (or `CT_ADMIN_TOKEN`). Optional:
 ## Manual test / status
 
 ```bash
-# Run unit tests for the Infisical launcher:
+# Run offline unit tests for the Infisical launcher:
 python3 -m unittest discover -s services/vision-worker/tests -t services/vision-worker
 
-# One-shot dry check (requires token custody + deployed prod app):
-~/vision-worker/run-vision-worker.sh --once --dry-run
+# Verify token custody and Infisical secret resolution without starting worker.py:
+~/vision-worker/run-vision-worker.sh --check
 ```

@@ -4,7 +4,6 @@ import io
 import json
 import os
 import pathlib
-import stat
 import sys
 import tempfile
 import unittest
@@ -79,10 +78,32 @@ class CustodyTests(unittest.TestCase):
             self.assertEqual(tok, "st.file.token")
 
 
+class ArgParsingTests(unittest.TestCase):
+    def test_parse_args_finds_token_file_and_check_after_worker_path(self) -> None:
+        token_file, check_only, cmd = lwi.parse_args(
+            ["/path/worker.py", "--token-file", "/tmp/tok", "--check"]
+        )
+        self.assertEqual(token_file, "/tmp/tok")
+        self.assertTrue(check_only)
+        self.assertEqual(cmd, ["/path/worker.py"])
+
+    def test_parse_args_supports_equals_form(self) -> None:
+        token_file, check_only, cmd = lwi.parse_args(
+            ["/path/worker.py", "--token-file=/tmp/tok"]
+        )
+        self.assertEqual(token_file, "/tmp/tok")
+        self.assertFalse(check_only)
+        self.assertEqual(cmd, ["/path/worker.py"])
+
+    def test_parse_args_rejects_missing_token_file_value(self) -> None:
+        with self.assertRaises(lwi.LauncherError):
+            lwi.parse_args(["/path/worker.py", "--token-file"])
+
+
 class EnvAndInfisicalTests(unittest.TestCase):
     def test_build_child_env_strips_ambient_secrets_and_infisical_vars(self) -> None:
         base_env = {
-            "PATH": "/usr/bin",
+            "PATH": "/opt/homebrew/bin:/usr/bin",
             "ADMIN_TOKEN": "stale-ambient-admin",
             "CT_ADMIN_TOKEN": "stale-ambient-ct",
             "OPENROUTER_API_KEY": "stale-openrouter",
@@ -96,7 +117,7 @@ class EnvAndInfisicalTests(unittest.TestCase):
             "PUSHOVER_APP_TOKEN": "fresh-push-app",
         }
         child = lwi.build_child_env(base_env, fetched)
-        self.assertEqual(child["PATH"], "/usr/bin")
+        self.assertEqual(child["PATH"], "/opt/homebrew/bin:/usr/bin")
         self.assertEqual(child["ADMIN_TOKEN"], "fresh-admin")
         self.assertEqual(child["OPENROUTER_API_KEY"], "fresh-or")
         self.assertEqual(child["PUSHOVER_APP_TOKEN"], "fresh-push-app")
@@ -110,34 +131,61 @@ class EnvAndInfisicalTests(unittest.TestCase):
         with self.assertRaises(lwi.LauncherError):
             lwi.build_child_env({"ADMIN_TOKEN": "ambient"}, {"OPENROUTER_API_KEY": "or"})
 
+    def test_build_child_env_requires_openrouter_key_when_engine_is_openrouter(self) -> None:
+        with self.assertRaises(lwi.LauncherError):
+            lwi.build_child_env({"VISION_ENGINE": "openrouter"}, {"ADMIN_TOKEN": "fresh-admin"})
+
     def test_build_infisical_url_rejects_non_prod_and_non_pinned_host(self) -> None:
-        url = lwi.build_infisical_url()
+        url = lwi.build_infisical_url(project_id="proj-123")
+        self.assertIn("workspaceId=proj-123", url)
         self.assertIn("environment=prod", url)
         self.assertIn("include_imports=true", url)
         self.assertIn("expandSecretReferences=true", url)
         with self.assertRaises(lwi.LauncherError):
-            lwi.build_infisical_url(environment="dev")
+            lwi.build_infisical_url(project_id="proj-123", environment="dev")
         with self.assertRaises(lwi.LauncherError):
-            lwi.build_infisical_url(base_url="https://evil.example/api/v3/secrets/raw")
+            lwi.build_infisical_url(
+                project_id="proj-123", base_url="https://evil.example/api/v3/secrets/raw"
+            )
 
-    def test_fetch_infisical_secrets_maps_entries(self) -> None:
-        fake_payload = {
-            "secrets": [
-                {"secretKey": "ADMIN_TOKEN", "secretValue": "adm-123"},
-                {"secretKey": "OPENROUTER_API_KEY", "secretValue": "or-456"},
-            ]
-        }
-
+    def test_fetch_infisical_secrets_discovers_project_and_maps_entries(self) -> None:
         class FakeOpener:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
             def open(self, req, timeout=0):
-                self.req = req
-                self.timeout = timeout
-                return _FakeHTTPResponse(fake_payload)
+                self.urls.append(req.full_url)
+                if req.full_url == lwi.INFISICAL_SERVICE_TOKEN_URL:
+                    return _FakeHTTPResponse(
+                        {
+                            "workspace": "proj-from-token",
+                            "scopes": [{"environment": "prod", "secretPath": "/"}],
+                        }
+                    )
+                return _FakeHTTPResponse(
+                    {
+                        "secrets": [
+                            {"secretKey": "ADMIN_TOKEN", "secretValue": "adm-123"},
+                            {"secretKey": "OPENROUTER_API_KEY", "secretValue": "or-456"},
+                        ]
+                    }
+                )
 
         opener = FakeOpener()
         got = lwi.fetch_infisical_secrets("tok-xyz", opener=opener)
         self.assertEqual(got, {"ADMIN_TOKEN": "adm-123", "OPENROUTER_API_KEY": "or-456"})
-        self.assertEqual(opener.req.headers.get("Authorization"), "Bearer tok-xyz")
+        self.assertEqual(len(opener.urls), 2)
+        self.assertIn("workspaceId=proj-from-token", opener.urls[1])
+
+    def test_discover_rejects_token_not_scoped_to_prod(self) -> None:
+        class FakeOpener:
+            def open(self, req, timeout=0):
+                return _FakeHTTPResponse(
+                    {"workspace": "proj-1", "scopes": [{"environment": "staging", "secretPath": "/"}]}
+                )
+
+        with self.assertRaises(lwi.LauncherError):
+            lwi.discover_service_token_project("tok-xyz", opener=FakeOpener())
 
     def test_no_redirect_handler_refuses_3xx(self) -> None:
         handler = lwi._NoRedirectHandler()
@@ -145,6 +193,22 @@ class EnvAndInfisicalTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             handler.redirect_request(req, None, 302, "Found", {}, "https://evil.example/")
         self.assertEqual(ctx.exception.code, 302)
+
+    def test_main_check_mode_reports_key_names_without_values(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(lwi, "resolve_service_token", return_value="tok-xyz"),
+            mock.patch.object(
+                lwi,
+                "fetch_infisical_secrets",
+                return_value={"ADMIN_TOKEN": "secret-admin-value"},
+            ),
+            mock.patch("sys.stdout", stdout),
+        ):
+            rc = lwi.main(["worker.py", "--check"])
+        self.assertEqual(rc, 0)
+        self.assertIn("ADMIN_TOKEN", stdout.getvalue())
+        self.assertNotIn("secret-admin-value", stdout.getvalue())
 
     def test_main_refuses_non_prod_infisical_environment_without_exec(self) -> None:
         stderr = io.StringIO()
