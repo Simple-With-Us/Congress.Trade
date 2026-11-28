@@ -1,19 +1,9 @@
 #!/bin/bash
-# launchd wrapper - each secret comes from the environment first, then from
-# `fleet-secrets get NAME` (Infisical Fleet-OPS).  Never prints them.
+# Launcher wrapper for com.congress.trade.vision-worker (pm2 / launchd).
+# Fetches secrets exclusively from Infisical (prod /) via a scoped service
+# token (`vision-worker-ct-ro`), never from ambient env vars or retired
+# fleet-secrets.
 set -euo pipefail
-
-FLEET_SECRETS_BIN="${FLEET_SECRETS_BIN:-$HOME/.local/bin/fleet-secrets}"
-
-# load_secret NAME: print the value of NAME from `fleet-secrets get`, or nothing
-# when the binary is missing or the key is absent / unreadable.
-load_secret() {
-  local key="$1"
-  if [[ ! -x "$FLEET_SECRETS_BIN" ]]; then
-    return 0
-  fi
-  "$FLEET_SECRETS_BIN" get "$key" 2>/dev/null || true
-}
 
 export CONGRESS_TRADE_API_URL="${CONGRESS_TRADE_API_URL:-https://congress.trade}"
 export WORKER_ID="${WORKER_ID:-local_mac_1}"
@@ -39,37 +29,24 @@ export OPENROUTER_CASCADE_MODELS="${OPENROUTER_CASCADE_MODELS:-qwen/qwen3-vl-8b-
 export OPENROUTER_CASCADE_MAX_PAGES="${OPENROUTER_CASCADE_MAX_PAGES:-8}"
 export OPENROUTER_TIMEOUT_SEC="${OPENROUTER_TIMEOUT_SEC:-600}"
 export PYTHONUNBUFFERED=1
+export PATH="$HOME/.grok/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
 
-if [[ -z "${ADMIN_TOKEN:-}" ]]; then
-  export ADMIN_TOKEN="$(load_secret CT_ADMIN_TOKEN)"
-fi
-if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
-  export OPENROUTER_API_KEY="$(load_secret CT_OPENROUTER_API_KEY)"
-  if [[ -z "${OPENROUTER_API_KEY}" ]]; then
-    export OPENROUTER_API_KEY="$(load_secret OPENROUTER_API_KEY)"
+# Strip ambient secret and Infisical env vars so Infisical stays sole source.
+unset ADMIN_TOKEN CT_ADMIN_TOKEN OPENROUTER_API_KEY CT_OPENROUTER_API_KEY \
+  PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY \
+  INFISICAL_TOKEN INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET \
+  INFISICAL_UNIVERSAL_AUTH_CLIENT_ID INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || true
+
+PYTHON_BIN="${VISION_WORKER_PYTHON:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if [[ -x "${HOME}/vision-worker-venv/bin/python3" ]]; then
+    PYTHON_BIN="${HOME}/vision-worker-venv/bin/python3"
+  else
+    PYTHON_BIN="$(command -v python3 || true)"
+    if [[ -z "${PYTHON_BIN}" ]]; then
+      PYTHON_BIN="/usr/bin/python3"
+    fi
   fi
 fi
-if [[ -z "${PUSHOVER_APP_TOKEN:-}" ]]; then
-  export PUSHOVER_APP_TOKEN="$(load_secret PUSHOVER_APP_TOKEN)"
-fi
-if [[ -z "${PUSHOVER_USER_KEY:-}" ]]; then
-  export PUSHOVER_USER_KEY="$(load_secret PUSHOVER_USER_KEY)"
-fi
 
-if [[ -z "${ADMIN_TOKEN}" ]]; then
-  echo "vision-worker: ADMIN_TOKEN / CT_ADMIN_TOKEN missing" >&2
-  exit 2
-fi
-
-# local_cli does not need OpenRouter; openrouter/auto-with-fallback do.
-if [[ "${VISION_ENGINE}" == "openrouter" && -z "${OPENROUTER_API_KEY}" ]]; then
-  echo "vision-worker: OPENROUTER_API_KEY required for VISION_ENGINE=openrouter" >&2
-  exit 2
-fi
-
-export PATH="$HOME/.grok/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
-PYTHON_BIN="$(command -v python3 || true)"
-if [[ -z "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="/usr/bin/python3"
-fi
-exec "$PYTHON_BIN" "$HERE/worker.py"
+exec "$PYTHON_BIN" "$HERE/launch_with_infisical.py" "$HERE/worker.py" "$@"
