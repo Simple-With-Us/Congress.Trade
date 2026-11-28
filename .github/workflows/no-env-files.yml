@@ -13,7 +13,7 @@ jobs:
     name: No env files
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Fail if an env or vars file is tracked
         env:
           ALLOW_RE: '^\.cursor/infisical\.env$'
